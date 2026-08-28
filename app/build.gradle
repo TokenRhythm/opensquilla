@@ -1,0 +1,97 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    id 'com.chaquo.python'
+}
+
+android {
+    namespace 'ai.opensquilla.app'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'ai.opensquilla.app'
+        minSdk 26
+        targetSdk 35
+        def buildVc = (System.currentTimeMillis() / 1000L) as int
+        versionCode buildVc
+        versionName '0.5.4'
+
+        ndk { abiFilters 'arm64-v8a' }
+
+        python {
+            version '3.12'
+            buildPython 'python3'
+            // OpenSquilla accesses bundled data (migrations, WebUI dist, router
+            // bundle) via real filesystem paths; the virtual AssetFinder breaks
+            // Path.exists(), so extract the whole package to disk.
+            extractPackages 'opensquilla'
+        }
+    }
+
+    chaquopy {
+        defaultConfig {
+            pip {
+                // Core runtime
+                install 'starlette>=0.40'
+                install 'python-multipart>=0.0.20'
+                install 'uvicorn>=0.30'
+                install 'pydantic==2.12.5'
+                install '/root/opensquilla-apk/wheels/pydantic_core-2.41.5-cp312-cp312-android_24_arm64_v8a.whl'
+                install 'pydantic-settings>=2.0'
+                install 'sqlmodel>=0.0.20'
+                install 'sqlalchemy>=2.0'
+                install 'anyio>=4.0'
+                install 'httpx>=0.27'
+                install 'jinja2>=3.1'
+                install 'structlog>=24.0'
+                install 'typer>=0.12'
+                install 'rich>=13.0'
+                install 'websockets>=13.0'
+                install 'aiosqlite>=0.20'
+                install 'apscheduler>=3.10'
+                install 'pyyaml>=6.0'
+                install 'cachetools>=5.3'
+                install 'certifi>=2024.7.4'
+                install 'croniter>=2.0'
+                install 'tomli-w>=1.0'
+                install 'yoyo-migrations>=8.2,<10'
+                install 'questionary>=2.1'
+                // Native deps with Chaquopy prebuilt wheels
+                install 'pillow>=10.0'
+                install 'cryptography>=42'
+                install 'lxml>=5.0'
+                // Parsing / attachments
+                install 'beautifulsoup4>=4.12'
+                install 'html2text>=2024.2'
+                install 'readability-lxml>=0.8'
+                install 'pypdf>=4.0.0'
+                install 'python-docx>=1.1.0'
+                install 'python-pptx>=1.0.0'
+                install 'openpyxl>=3.1.0'
+                install 'reportlab>=4.0.0'
+                // Pure-python channel SDKs (qq-botpy needs aiohttp: skipped)
+                install 'python-telegram-bot>=20.0'
+                install 'lark-oapi>=1.5.3,<2'
+                install 'dingtalk-stream>=0.24.3,<0.25'
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+}
+
+dependencies {
+}

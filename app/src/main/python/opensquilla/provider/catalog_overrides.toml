@@ -1,0 +1,877 @@
+# catalog_overrides.toml — packaged metadata corrections for the layered
+# model catalog (see src/opensquilla/provider/model_catalog.py).
+#
+# Authority order (highest first): user overrides > live provider catalog >
+# THIS FILE (corrections) > models.dev snapshot > synthesized fallback.
+# Merging is per FIELD: a correction fills only fields the higher layers
+# left unset, and is itself overridden field-by-field the same way.
+#
+# Schema — one TOML table per (provider, model-or-glob) pair:
+#
+#   [<provider>."<model-or-glob>"]
+#   display_name = "…"               # str: display_name, family,
+#   reasoning_format = "deepseek"    #      reasoning_format, release_date, status
+#   context_window = 262144          # int: context_window, max_output_tokens
+#   max_output_tokens = 32768
+#   supports_reasoning = true        # bool: supports_reasoning, supports_tools,
+#   supports_vision = false          #       supports_vision (real booleans only)
+#   input_cost_per_mtok = 2.5        # float, USD per MILLION tokens:
+#   output_cost_per_mtok = 10.0      #   input/output/cache_read/cache_write
+#   cache_read_cost_per_mtok = 0.25  #   _cost_per_mtok, quality_prior
+#   quality_prior = 0.7
+#
+# Keys:
+# - <provider> is the lowercased provider id from the provider registry
+#   (e.g. "openrouter", "deepseek", "zhipu"). Corrections apply only when the
+#   caller resolves with that provider; there is no cross-provider table.
+# - "<model-or-glob>" is compared against the lowercased model id. An exact
+#   key is consulted first; every other key in the provider table is then
+#   tried as an fnmatch glob (e.g. "glm-5*", "doubao-seed-1-6-*") in file
+#   order, each filling only fields still unset within this layer.
+# - Field names must match ModelCatalogEntry data fields
+#   (src/opensquilla/provider/catalog_types.py); unknown names or wrongly
+#   typed values are logged and ignored — a bad row degrades, never crashes.
+#
+# Data rows follow — this file started bootstrapped-empty so per-model fixes
+# land here as data instead of as code branches.
+
+# --- window/pricing corrections (canonical budget/pricing rows) ---
+#
+# These rows were originally copied from two in-repo static tables —
+# _STATIC_FALLBACK in src/opensquilla/provider/model_catalog.py (tuples of
+# (max_output_tokens, context_window)) and _KNOWN_MODELS in
+# src/opensquilla/provider/anthropic.py. Both tables have since been RETIRED
+# and deleted; the rows below are now the canonical source of this data.
+#
+# Besides resolve_entry's provider-scoped corrections layer, the legacy
+# token-budget paths (resolve_max_tokens / resolve_context_window in
+# model_catalog.py) consult exact (non-glob) rows carrying
+# context_window/max_output_tokens PROVIDER-AGNOSTICALLY by basename via
+# _corrections_budget_fallback — the slot the retired static table occupied,
+# below the live catalog and the models.dev snapshot. Keep budget rows
+# conservative: over-estimating a window causes silent server-side
+# truncation; under-estimating only triggers compaction earlier.
+
+[moonshot."moonshot-v1-8k"]
+context_window = 8192
+max_output_tokens = 8192
+
+[moonshot."moonshot-v1-32k"]
+context_window = 32768
+max_output_tokens = 32768
+
+[moonshot."moonshot-v1-128k"]
+context_window = 131072
+max_output_tokens = 131072
+
+# anthropic rows: windows, display names, and pricing for the SKUs the
+# Anthropic adapter lists (its list_models resolves these rows through the
+# shared catalog). Per-1k USD costs from the retired adapter table were
+# converted to per-Mtok (x1000) to match the catalog's canonical unit.
+
+[anthropic."claude-opus-4-6"]
+display_name = "Claude Opus 4.6"
+context_window = 200000
+max_output_tokens = 32000
+input_cost_per_mtok = 5.0
+output_cost_per_mtok = 25.0
+
+[anthropic."claude-sonnet-4-6"]
+display_name = "Claude Sonnet 4.6"
+context_window = 200000
+max_output_tokens = 16000
+input_cost_per_mtok = 3.0
+output_cost_per_mtok = 15.0
+
+[anthropic."claude-haiku-4-5-20251001"]
+display_name = "Claude Haiku 4.5"
+context_window = 200000
+max_output_tokens = 8192
+input_cost_per_mtok = 1.0
+output_cost_per_mtok = 5.0
+cache_read_cost_per_mtok = 0.10
+cache_write_cost_per_mtok = 1.25
+
+# openrouter rows: token budgets for the squilla-router tier models the
+# models.dev snapshot does not carry (its openrouter table stores them
+# under these same vendor-qualified ids, but no snapshot table knows the
+# bare basenames). Values are the retired static table's conservative
+# tuples; the provider-agnostic basename fallback serves them for bare and
+# qualified spellings alike.
+
+[openrouter."anthropic/claude-opus-4.8"]
+context_window = 1000000
+max_output_tokens = 128000
+
+[openrouter."anthropic/claude-sonnet-4.6"]
+context_window = 1000000
+max_output_tokens = 128000
+
+[openrouter."x-ai/grok-4.3"]
+context_window = 1000000
+max_output_tokens = 16384
+
+[openrouter."stepfun/step-3.5-flash"]
+context_window = 256000
+max_output_tokens = 16384
+
+# --- capability ladder migration (transcribed from get_capabilities) ---
+#
+# Rows below carry the per-provider capability ladder that used to live as
+# code branches in ModelCatalog.get_capabilities (model_catalog.py). Each
+# row is a verbatim transcription of one prefix rule; the trailing "*" row
+# per provider transcribes that branch's fall-through (the branch returned
+# for EVERY model of its provider, so the catch-all is part of the ladder,
+# not an invention — it deliberately shadows snapshot capability data the
+# ladder never consulted).
+#
+# ORDER MATTERS: the corrections loader consults the exact model key first,
+# then every other key as an fnmatch glob IN FILE ORDER, each filling only
+# fields still unset. More specific prefixes therefore appear before the
+# general ones (qwen3.5* before qwen3*), and the "*" catch-all is last.
+#
+# NOT transcribed, on purpose (host trust stays code in get_capabilities):
+# - the deepseek-in-base_url sniff for provider "openai";
+# - the api.openai.com host guard with its gpt-5/o1/o3/o4 prefix set. A
+#   corrections row is keyed by (provider, model) only and cannot express
+#   "openai dialect at this host, snapshot capabilities elsewhere" — an
+#   [openai."gpt-5*"] row would grant the openai reasoning dialect (and the
+#   wrong vision flag) to arbitrary proxy base URLs.
+
+# dashscope (Qwen): reasoning for qwen3/qwen-plus/qwen-flash/qwen-turbo/
+# qwen-max/qwq prefixes; vision for qwen3.5/qwen3.6/qwen3.7/qwen-vl;
+# tools always.
+
+[dashscope."qwen3.5*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "dashscope"
+
+[dashscope."qwen3.6*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "dashscope"
+
+[dashscope."qwen3.7*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "dashscope"
+
+# qwen-vl-* is vision-only: it matches no reasoning prefix (qwen-vl is not
+# qwen-max/-plus/-flash/-turbo), so the ladder returned vision without
+# reasoning for it.
+[dashscope."qwen-vl*"]
+supports_reasoning = false
+supports_tools = true
+supports_vision = true
+reasoning_format = "none"
+
+[dashscope."qwen3*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "dashscope"
+
+[dashscope."qwen-plus*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "dashscope"
+
+[dashscope."qwen-flash*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "dashscope"
+
+[dashscope."qwen-turbo*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "dashscope"
+
+[dashscope."qwen-max*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "dashscope"
+
+[dashscope."qwq*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "dashscope"
+
+[dashscope."*"]
+supports_reasoning = false
+supports_tools = true
+supports_vision = false
+reasoning_format = "none"
+
+# moonshot (Kimi): reasoning for kimi-k2.5/kimi-k2.6/kimi-k2.7/
+# kimi-k2-thinking prefixes; vision for kimi-k2.5/kimi-k2.6/kimi-k2.7;
+# tools always. (The exact
+# moonshot-v1-* window rows above carry no capability fields, so the "*"
+# row fills their capabilities: non-reasoning, tools on.)
+
+[moonshot."kimi-k2.5*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "moonshot"
+
+[moonshot."kimi-k2.6*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "moonshot"
+
+[moonshot."kimi-k2.7*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "moonshot"
+
+[moonshot."kimi-k2-thinking*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "moonshot"
+
+[moonshot."*"]
+supports_reasoning = false
+supports_tools = true
+supports_vision = false
+reasoning_format = "none"
+
+# Kimi Coding private plan endpoints expose a single coding model through both
+# OpenAI-compatible and Anthropic-compatible shapes. Tool support follows the
+# conservative synthesized default; no structured reasoning dialect is asserted.
+
+[kimi_coding_openai."kimi-for-coding"]
+display_name = "Kimi for Coding"
+supports_tools = true
+supports_vision = false
+
+[kimi_coding_anthropic."kimi-for-coding"]
+display_name = "Kimi for Coding"
+supports_tools = true
+supports_vision = false
+
+# MiniMax direct and compatibility endpoints used by synthesized router
+# presets. Pricing/window fields are intentionally omitted unless verified by
+# provider documentation or a live catalog response with those fields.
+
+[minimax."minimax-m2.7-highspeed"]
+display_name = "MiniMax M2.7 Highspeed"
+supports_tools = true
+supports_vision = false
+
+[minimax."minimax-m3"]
+display_name = "MiniMax M3"
+supports_tools = true
+supports_vision = false
+
+[minimax_cn."minimax-m2.7-highspeed"]
+display_name = "MiniMax M2.7 Highspeed"
+supports_tools = true
+supports_vision = false
+
+[minimax_cn."minimax-m3"]
+display_name = "MiniMax M3"
+supports_tools = true
+supports_vision = false
+
+[minimax_global."minimax-m2.7-highspeed"]
+display_name = "MiniMax M2.7 Highspeed"
+supports_tools = true
+supports_vision = false
+
+[minimax_global."minimax-m3"]
+display_name = "MiniMax M3"
+supports_tools = true
+supports_vision = false
+
+[minimax_openai."minimax-m2.7-highspeed"]
+display_name = "MiniMax M2.7 Highspeed"
+supports_tools = true
+supports_vision = false
+
+[minimax_openai."minimax-m3"]
+display_name = "MiniMax M3"
+supports_tools = true
+supports_vision = false
+
+[minimax_coding_openai."minimax-m2.7"]
+display_name = "MiniMax M2.7"
+supports_tools = true
+supports_vision = false
+
+[minimax_coding_openai."minimax-m3"]
+display_name = "MiniMax M3"
+supports_tools = true
+supports_vision = false
+
+[minimax_coding_anthropic."minimax-m2.7"]
+display_name = "MiniMax M2.7"
+supports_tools = true
+supports_vision = false
+
+[minimax_coding_anthropic."minimax-m3"]
+display_name = "MiniMax M3"
+supports_tools = true
+supports_vision = false
+
+# MiMo coding-plan endpoints.
+
+[mimo_openai."mimo-v2.5"]
+display_name = "MiMo v2.5"
+supports_tools = true
+supports_vision = false
+
+[mimo_openai."mimo-v2.5-pro"]
+display_name = "MiMo v2.5 Pro"
+supports_tools = true
+supports_vision = false
+
+[mimo_anthropic."mimo-v2.5"]
+display_name = "MiMo v2.5"
+supports_tools = true
+supports_vision = false
+
+[mimo_anthropic."mimo-v2.5-pro"]
+display_name = "MiMo v2.5 Pro"
+supports_tools = true
+supports_vision = false
+
+# Baidu Qianfan live-smoked ERNIE 4.5 model ids. Only the VL row asserts
+# vision support.
+
+[qianfan."ernie-4.5-turbo-128k"]
+display_name = "ERNIE 4.5 Turbo 128K"
+supports_tools = true
+supports_vision = false
+
+[qianfan."ernie-4.5-turbo-vl-32k"]
+display_name = "ERNIE 4.5 Turbo VL 32K"
+supports_tools = true
+supports_vision = true
+
+# volcengine (Ark, doubao): doubao-seed-1-6 and -1-8 and the seed-2 line
+# are reasoning models; without 1-6 here the stream path emits no thinking
+# toggle, so reasoning leaks into thinking-disabled requests (verified live
+# 2026-07-02 against doubao-seed-1-6-251015). Any id containing "thinking"
+# also reasons; vision only for the doubao-seed-1-6/1-8/2 prefixes.
+
+[volcengine."doubao-seed-1-6*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "volcengine"
+
+[volcengine."doubao-seed-1-8*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "volcengine"
+
+[volcengine."doubao-seed-2*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "volcengine"
+
+# Substring rule, not a prefix: the ladder checked `"thinking" in model`.
+[volcengine."*thinking*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "volcengine"
+
+[volcengine."*"]
+supports_reasoning = false
+supports_tools = true
+supports_vision = false
+reasoning_format = "none"
+
+[volcengine_coding_plan."doubao-seed-2*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "volcengine"
+
+[volcengine_coding_plan."*"]
+supports_reasoning = false
+supports_tools = true
+supports_vision = false
+reasoning_format = "none"
+
+# byteplus (Ark international): same wire dialect as volcengine
+# ("volcengine" reasoning_format — two providers, one wire spelling).
+# Reasoning AND vision for seed-1-6/seed-1-8/seed-2/kimi-k2-/kimi-k2.
+# prefixes; any id containing "thinking" reasons without vision.
+
+[byteplus."seed-1-6*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "volcengine"
+
+[byteplus."seed-1-8*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "volcengine"
+
+[byteplus."seed-2*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "volcengine"
+
+[byteplus."kimi-k2-*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "volcengine"
+
+[byteplus."kimi-k2.*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "volcengine"
+
+# Substring rule, not a prefix: the ladder checked `"thinking" in model`.
+[byteplus."*thinking*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "volcengine"
+
+[byteplus."*"]
+supports_reasoning = false
+supports_tools = true
+supports_vision = false
+reasoning_format = "none"
+
+# ProviderSpec.reasoning_shape transcriptions. These branches keyed off the
+# provider spec, not model ids — each applied to EVERY model of its
+# provider — so a "*" row expresses each one exactly.
+
+# deepseek (reasoning_shape="deepseek"): every model reasons through the
+# deepseek dialect; the ladder never granted vision here.
+[deepseek."*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "deepseek"
+
+# gemini (reasoning_shape="gemini"): reasoning for Gemini 2.5 and 3.x
+# model families; vision and tools for every model.
+[gemini."gemini-2.5*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "gemini"
+
+[gemini."gemini-3*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "gemini"
+
+[gemini."*"]
+supports_reasoning = false
+supports_tools = true
+supports_vision = true
+reasoning_format = "none"
+
+# zhipu (reasoning_shape="zai"): reasoning for glm-4.5/glm-4.7/glm-5
+# prefixes; the ladder never granted vision here (not even for glm-*v).
+[zhipu."glm-4.5*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "zai"
+
+[zhipu."glm-4.7*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "zai"
+
+[zhipu."glm-5*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "zai"
+
+[zhipu."*"]
+supports_reasoning = false
+supports_tools = true
+supports_vision = false
+reasoning_format = "none"
+
+# tencent_tokenhub (Tencent TokenHub, CN): the hy3 family reasons through
+# the tencent_tokenhub dialect (thinking enable + reasoning_effort
+# low|high) and is text-only. TokenHub also hosts third-party models
+# (DeepSeek, GLM, Kimi, MiniMax, Qwen) whose thinking dialects on this
+# gateway are undocumented, so the catch-all stays conservative: no
+# injected thinking payload, tools on, vision off.
+[tencent_tokenhub."hy3*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "tencent_tokenhub"
+
+[tencent_tokenhub."*"]
+supports_reasoning = false
+supports_tools = true
+supports_vision = false
+reasoning_format = "none"
+
+# tencent_token_plan (Token Plan subscription, same TokenHub gateway
+# dialect): hy3-family rows mirror the tencent_tokenhub table; the
+# General-plan third-party models keep the conservative catch-all.
+[tencent_token_plan."hy3*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "tencent_tokenhub"
+
+[tencent_token_plan."*"]
+supports_reasoning = false
+supports_tools = true
+supports_vision = false
+reasoning_format = "none"
+
+# qwen_token_plan: exact subscription allowlist shared by the OpenAI and
+# Anthropic protocol profiles. The Anthropic profile resolves through this
+# table via model_catalog's corrections alias. Costs stay unset because
+# Credits are subscription quota, not per-token USD billing.
+
+[qwen_token_plan."qwen3.8-max-preview"]
+context_window = 983616
+max_output_tokens = 131072
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "qwen_token_plan_qwen"
+
+[qwen_token_plan."qwen3.7-max"]
+context_window = 1000000
+max_output_tokens = 65536
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "qwen_token_plan_qwen"
+
+[qwen_token_plan."qwen3.7-plus"]
+context_window = 1000000
+max_output_tokens = 65536
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "qwen_token_plan_qwen"
+
+[qwen_token_plan."qwen3.6-plus"]
+context_window = 1000000
+max_output_tokens = 65536
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "qwen_token_plan_qwen"
+
+[qwen_token_plan."qwen3.6-flash"]
+context_window = 1000000
+max_output_tokens = 65536
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "qwen_token_plan_qwen"
+
+[qwen_token_plan."deepseek-v4-pro"]
+context_window = 1000000
+max_output_tokens = 393216
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "qwen_token_plan_deepseek"
+
+[qwen_token_plan."deepseek-v4-flash"]
+context_window = 1000000
+max_output_tokens = 393216
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "qwen_token_plan_deepseek"
+
+[qwen_token_plan."deepseek-v3.2"]
+context_window = 131072
+max_output_tokens = 65536
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "qwen_token_plan"
+
+[qwen_token_plan."kimi-k2.7-code"]
+context_window = 262144
+max_output_tokens = 16384
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "qwen_token_plan_kimi"
+
+[qwen_token_plan."kimi-k2.6"]
+context_window = 262144
+max_output_tokens = 98304
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "qwen_token_plan_kimi"
+
+[qwen_token_plan."kimi-k2.5"]
+context_window = 262144
+max_output_tokens = 32768
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "qwen_token_plan_kimi"
+
+[qwen_token_plan."glm-5.2"]
+context_window = 1000000
+max_output_tokens = 131072
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "qwen_token_plan_glm"
+
+[qwen_token_plan."glm-5.1"]
+context_window = 202752
+max_output_tokens = 131072
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "qwen_token_plan_glm"
+
+[qwen_token_plan."glm-5"]
+context_window = 202752
+max_output_tokens = 16384
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "qwen_token_plan_glm"
+
+[qwen_token_plan."minimax-m2.5"]
+context_window = 196608
+max_output_tokens = 32768
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "qwen_token_plan"
+
+# tokenrhythm (TokenRhythm aggregator, tokenrhythm.studio): not on
+# models.dev, so these rows are the offline metadata for its catalog —
+# the fallback beneath the boot-time live ingest of the platform's public
+# listing (https://tokenrhythm.studio/api/models, keyless; see
+# provider/live_catalog.py). Windows, output limits, and prices below are
+# that listing's published values (refreshed 2026-08; CNY per Mtok
+# converted at ~6.975 CNY/USD) so offline boots budget close to the
+# platform. Every served model streams DeepSeek-style reasoning_content,
+# while the mixed-family catalog keeps reasoning_format="none" so metadata
+# alone cannot grant one request dialect to every model. Exact official V4
+# compatibility rules own their thinking controls and bounded replay without
+# changing this neutral catalog shape. Vision is published for the kimi rows
+# and qwen3.8-max; explicit API declarations remain authoritative.
+
+[tokenrhythm."deepseek-v4-flash"]
+context_window = 1000000
+max_output_tokens = 384000
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "none"
+input_cost_per_mtok = 0.14336917562724014
+output_cost_per_mtok = 0.2867383512544803
+cache_read_cost_per_mtok = 0.02867383512544803
+
+[tokenrhythm."deepseek-v4-flash-0731"]
+context_window = 1000000
+max_output_tokens = 384000
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "none"
+status = "testing"
+input_cost_per_mtok = 0.14336917562724014
+output_cost_per_mtok = 0.2867383512544803
+cache_read_cost_per_mtok = 0.002867383512544803
+
+[tokenrhythm."deepseek-v4-pro"]
+context_window = 1000000
+max_output_tokens = 384000
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "none"
+input_cost_per_mtok = 0.43010752688172044
+output_cost_per_mtok = 0.8602150537634409
+cache_read_cost_per_mtok = 0.0035842293906810036
+
+[tokenrhythm."deepseek-v4-pro-0813"]
+context_window = 1000000
+max_output_tokens = 384000
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "none"
+input_cost_per_mtok = 1.2903225806451613
+output_cost_per_mtok = 3.870967741935484
+cache_read_cost_per_mtok = 0.043010752688172046
+
+[tokenrhythm."glm-5"]
+context_window = 1000000
+max_output_tokens = 128000
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "none"
+input_cost_per_mtok = 0.8602150537634409
+output_cost_per_mtok = 3.154121863799283
+cache_read_cost_per_mtok = 0.21505376344086022
+
+[tokenrhythm."glm-5.1"]
+context_window = 200000
+max_output_tokens = 128000
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "none"
+input_cost_per_mtok = 1.1469534050179212
+output_cost_per_mtok = 4.014336917562724
+cache_read_cost_per_mtok = 0.2867383512544803
+
+[tokenrhythm."glm-5.2"]
+context_window = 1000000
+max_output_tokens = 128000
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "none"
+input_cost_per_mtok = 1.1469534050179212
+output_cost_per_mtok = 4.014336917562724
+cache_read_cost_per_mtok = 0.2867383512544803
+
+# minimax/mimo publish near-window output caps (input + output share the
+# window). These rows preserve those public values exactly; ModelCatalog's
+# TokenRhythm-scoped runtime policy derives the half-window execution budget.
+[tokenrhythm."minimax-m2.5"]
+context_window = 200000
+max_output_tokens = 200000
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "none"
+input_cost_per_mtok = 0.3010752688172043
+output_cost_per_mtok = 1.2043010752688172
+
+[tokenrhythm."minimax-m2.7"]
+context_window = 200000
+max_output_tokens = 192000
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "none"
+input_cost_per_mtok = 0.3010752688172043
+output_cost_per_mtok = 1.2043010752688172
+
+[tokenrhythm."kimi-k2.5"]
+context_window = 256000
+max_output_tokens = 64000
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "none"
+input_cost_per_mtok = 0.5734767025089605
+output_cost_per_mtok = 3.010752688172043
+cache_read_cost_per_mtok = 0.11469534050179211
+
+[tokenrhythm."kimi-k2.6"]
+context_window = 256000
+max_output_tokens = 128000
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "none"
+input_cost_per_mtok = 0.931899641577061
+output_cost_per_mtok = 3.870967741935484
+cache_read_cost_per_mtok = 0.1863799283154122
+
+[tokenrhythm."kimi-k2.7-code"]
+context_window = 256000
+max_output_tokens = 128000
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "none"
+input_cost_per_mtok = 0.931899641577061
+output_cost_per_mtok = 3.870967741935484
+cache_read_cost_per_mtok = 0.1863799283154122
+
+[tokenrhythm."mimo-v2.5-pro"]
+context_window = 256000
+max_output_tokens = 256000
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "none"
+input_cost_per_mtok = 0.43010752688172044
+output_cost_per_mtok = 0.8602150537634409
+
+[tokenrhythm."qwen3.7-max"]
+context_window = 1000000
+max_output_tokens = 131072
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "none"
+input_cost_per_mtok = 0.8602150537634409
+output_cost_per_mtok = 2.5806451612903225
+cache_read_cost_per_mtok = 0.17204301075268819
+
+[tokenrhythm."qwen3.7-flash"]
+context_window = 1000000
+max_output_tokens = 65536
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "none"
+input_cost_per_mtok = 0.03
+output_cost_per_mtok = 0.13
+
+[tokenrhythm."qwen3.8-max"]
+context_window = 1000000
+max_output_tokens = 131072
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "none"
+status = "testing"
+input_cost_per_mtok = 1.7204301075268817
+output_cost_per_mtok = 5.161290322580645
+cache_read_cost_per_mtok = 0.21505376344086022
+
+# Catch-all for models TokenRhythm adds later: everything on this relay
+# so far streams reasoning and takes tools; vision stays off until
+# verified per model. Glob rows never carry budgets — until the boot-time
+# live ingest has run, a newly served model budgets from the snapshot's
+# cross-provider merge, so still add an exact row here (with the
+# platform's published window) per new model for offline boots.
+[tokenrhythm."*"]
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "none"

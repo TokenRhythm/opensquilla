@@ -1,0 +1,36 @@
+# Packaged SquillaRouter tier preset. Loaded by
+# opensquilla.provider.preset_registry; tier data is a stable contract
+# consumed by gateway config validation and must round-trip exactly.
+[preset]
+id = "gemini"
+provider = "gemini"
+label = "Google Gemini"
+description = "Curated Google Gemini router tier ladder (c0-c3)."
+default_model = "gemini-3.5-flash"
+
+[tiers.c0]
+provider = "gemini"
+model = "gemini-3.1-flash-lite"
+description = "Gemini fast route: 3.1 Flash-Lite for low-latency tasks."
+supports_image = false
+
+[tiers.c1]
+provider = "gemini"
+model = "gemini-3.5-flash"
+description = "Gemini balanced route: 3.5 Flash for normal agent work."
+thinking_level = "low"
+supports_image = false
+
+[tiers.c2]
+provider = "gemini"
+model = "gemini-3.1-pro-preview"
+description = "Gemini strong route: 3.1 Pro Preview for complex coding and reasoning."
+thinking_level = "medium"
+supports_image = false
+
+[tiers.c3]
+provider = "gemini"
+model = "gemini-3.1-pro-preview"
+description = "Gemini highest route: 3.1 Pro Preview with high thinking for hardest routes."
+thinking_level = "high"
+supports_image = false

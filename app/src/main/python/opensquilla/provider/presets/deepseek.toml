@@ -1,0 +1,37 @@
+# Packaged SquillaRouter tier preset. Loaded by
+# opensquilla.provider.preset_registry; tier data is a stable contract
+# consumed by gateway config validation and must round-trip exactly.
+[preset]
+id = "deepseek"
+provider = "deepseek"
+label = "DeepSeek"
+description = "Curated DeepSeek router tier ladder (c0-c3)."
+default_model = "deepseek-v4-flash"
+
+[tiers.c0]
+provider = "deepseek"
+model = "deepseek-v4-flash"
+description = "DeepSeek fast route: V4 Flash with no router-requested thinking; request ID pending live smoke."
+thinking_level = "off"
+supports_image = false
+
+[tiers.c1]
+provider = "deepseek"
+model = "deepseek-v4-flash"
+description = "DeepSeek balanced route: V4 Flash with thinking enabled; request ID pending live smoke."
+thinking_level = "low"
+supports_image = false
+
+[tiers.c2]
+provider = "deepseek"
+model = "deepseek-v4-pro"
+description = "DeepSeek strong route: V4 Pro with thinking enabled; request ID pending live smoke."
+thinking_level = "medium"
+supports_image = false
+
+[tiers.c3]
+provider = "deepseek"
+model = "deepseek-v4-pro"
+description = "DeepSeek highest route: same V4 Pro wire behavior until effort-level support is added."
+thinking_level = "high"
+supports_image = false

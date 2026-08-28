@@ -1,0 +1,6 @@
+# Copy this file to local.properties next to gradlew and adjust for your
+# machine. local.properties is git-ignored (per-machine only).
+sdk.dir=/path/to/Android/Sdk
+# ndk.dir=/path/to/Android/ndk/27.0.12077973
+# If aapt2 is provided by a specific build-tools version, point to it:
+# android.aapt2FromMavenOverride=/path/to/build-tools/35.0.0/aapt2

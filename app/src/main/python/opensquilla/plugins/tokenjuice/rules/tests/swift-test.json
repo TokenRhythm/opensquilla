@@ -1,0 +1,66 @@
+{
+  "id": "tests/swift-test",
+  "family": "test-results",
+  "description": "Compact swift test output while preserving compile diagnostics, failing tests, and final summaries.",
+  "match": {
+    "toolNames": ["exec"],
+    "argv0": ["swift"],
+    "argvIncludes": [["test"]]
+  },
+  "transforms": {
+    "stripAnsi": true,
+    "dedupeAdjacent": true,
+    "trimEmptyEdges": true
+  },
+  "filters": {
+    "skipPatterns": [
+      "^\\[\\d+/\\d+\\]\\s+.+$",
+      "^Building for .+\\.\\.\\.$",
+      "^Planning build$",
+      "^Test Case '.+' started\\.$",
+      "^Test Case '.+' passed .+$",
+      "^Test Suite '.+' started at .+$"
+    ],
+    "keepPatterns": [
+      "^.+:\\d+:\\d+: error: .+",
+      "^.+:\\d+:\\d+: warning: .+",
+      "^.+:\\d+: error: .+",
+      "^.+:\\d+: warning: .+",
+      "^error: .+",
+      "^warning: .+",
+      "^note: .+",
+      "^Test Case '.+' failed .+$",
+      "^Test Suite '.+' failed at .+$",
+      "^\\s*Executed \\d+ tests?, with \\d+ failures?.+$",
+      "^Test run with .+ failed.+$",
+      "^[✘✖✗] .+$",
+      "^.+(?:Assertion|Expectation) failed:.+$"
+    ]
+  },
+  "summarize": {
+    "head": 12,
+    "tail": 10
+  },
+  "failure": {
+    "preserveOnFailure": true,
+    "head": 18,
+    "tail": 16
+  },
+  "counters": [
+    {
+      "name": "error",
+      "pattern": "error",
+      "flags": "i"
+    },
+    {
+      "name": "warning",
+      "pattern": "warning",
+      "flags": "i"
+    },
+    {
+      "name": "failed test",
+      "pattern": "(?:^Test Case '.+' failed .+$|^[✘✖✗] .+$)",
+      "flags": "m"
+    }
+  ]
+}

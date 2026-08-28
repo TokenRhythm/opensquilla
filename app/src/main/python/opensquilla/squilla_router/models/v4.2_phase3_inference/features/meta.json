@@ -1,0 +1,11 @@
+{
+  "schema_version": 2,
+  "use_bge": false,
+  "use_context": false,
+  "use_hist": false,
+  "feature_dim": 151,
+  "channel_order": [
+    "HC",
+    "TFIDF"
+  ]
+}

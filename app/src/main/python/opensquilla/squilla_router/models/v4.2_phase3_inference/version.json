@@ -1,0 +1,16 @@
+{
+  "version": "v4",
+  "feature_dim": 390,
+  "channels": [
+    "hc",
+    "tfidf",
+    "ctx",
+    "hist",
+    "bge_x3",
+    "asst_hc",
+    "cont_hc",
+    "reasoning_hc"
+  ],
+  "bge_model": "BAAI/bge-small-zh-v1.5",
+  "bge_backend": "onnx"
+}

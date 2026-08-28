@@ -1,0 +1,81 @@
+# OpenSquilla mobile — working configuration template
+#
+# This mirrors the configuration validated on a real device with the
+# tokenrhythm provider and the Squilla router tier preset. Only the API key
+# is left as a placeholder — fill in your own key, then deploy to:
+#
+#   /data/user/0/ai.opensquilla.app/files/state/config.toml
+#
+# To apply changes: force-stop and relaunch the app (or use the in-app
+# settings). Never commit real API keys.
+
+config_version = 1
+port = 18790
+
+[llm]
+api_key = "YOUR_TOKENRHYTHM_API_KEY"   # get one at https://api.tokenrhythm.ai
+provider = "tokenrhythm"
+
+[llm_ensemble]
+proposer_max_retries = 1
+all_failed_policy = "fallback_single"
+min_successful_proposers = 1
+
+# Android builds do not bundle the desktop V4 ML/ONNX artifact, so the local
+# ML router is disabled by default. The heuristic (default-tier) routing still
+# works and the doctor report stays green.
+[squilla_router]
+enabled = false
+require_router_runtime = false
+preset_binding = "custom"
+
+[squilla_router.tiers.c0]
+provider = "tokenrhythm"
+model = "deepseek-v4-flash-0731"
+description = "Fast DeepSeek V4 Flash 0731 route for trivial chat, short rewrites, extraction, low-risk simple Q&A, and lightweight coding"
+supports_image = false
+thinking_level = "xhigh"
+
+[squilla_router.tiers.c1]
+provider = "tokenrhythm"
+model = "deepseek-v4-pro-0813"
+description = "Default DeepSeek V4 Pro 0813 route for normal agent work, coding assistance, debugging, and moderate analysis"
+supports_image = false
+thinking_level = "xhigh"
+
+[squilla_router.tiers.c2]
+provider = "tokenrhythm"
+model = "glm-5.3"
+description = "Stronger Kimi K2.7 Code route for multi-step coding, structured reasoning, larger context synthesis, and harder analysis"
+supports_image = false
+thinking_level = "xhigh"
+
+[squilla_router.tiers.c3]
+provider = "tokenrhythm"
+model = "mimo-v2.5-pro"
+description = "Highest tier: shared multi-model fusion using the current plan, with the configured direct/fallback model as its single-model fallback"
+supports_image = false
+ensemble_enabled = false
+thinking_level = "high"
+ensemble_selection_mode = ""
+
+[squilla_router.tiers.image_model]
+provider = "tokenrhythm"
+model = "seed-2.1-pro"
+description = "Image model: vision-capable route for user-supplied image attachments, screenshots, diagrams, and visual question answering"
+supports_image = true
+image_only = true
+thinking_level = ""
+
+[image_generation]
+enabled = true
+primary = "tokenrhythm/wan2.7-image"
+binding = "custom"
+
+[image_generation.providers.tokenrhythm]
+api_key_env = ""
+
+# A real sandbox (Bubblewrap) is not available on Android; the gateway falls
+# back to the noop backend. Keep the default and review the doctor notes.
+# [sandbox]
+# level = "L1-standard"

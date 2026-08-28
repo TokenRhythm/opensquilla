@@ -1,0 +1,32 @@
+# Gradle / Android build output
+.gradle/
+build/
+app/build/
+app/.gradle/
+.cxx/
+captures/
+.kotlin/
+.idea/
+
+# Local config (per-machine paths, Android SDK location, signing material)
+local.properties
+local.properties.bak
+*.keystore
+*.jks
+
+# Python / Chaquopy caches
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Release artefacts: the debug APK is intentionally tracked (96 MB, under
+# GitHub's 100 MB per-file limit). Ignore the directory, allow the APK.
+releases/
+!releases/OpenSquilla-mobile-debug.apk

@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="{{ locale }}">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>OpenSquilla Control</title>
+    <link rel="icon" href="{{ asset_base_path }}/static/img/opensquilla-mark.png?v={{ version }}" type="image/png">
+    <link rel="shortcut icon" href="{{ asset_base_path }}/static/img/opensquilla-mark.png?v={{ version }}" type="image/png">
+    <link rel="apple-touch-icon" href="{{ asset_base_path }}/static/img/opensquilla-mark.png?v={{ version }}">
+    <!-- Theme + locale flash prevention: applies the saved choice before the
+         bundle loads. Locale falls back to the server-rendered <html lang>. -->
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem('opensquilla-theme');
+          if (t !== 'dark' && t !== 'light') {
+            t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+          }
+          document.documentElement.setAttribute('data-theme', t);
+        } catch (e) {
+          document.documentElement.setAttribute('data-theme', 'light');
+        }
+        try {
+          var l = localStorage.getItem('opensquilla-locale');
+          if (l === 'en' || l === 'zh-Hans') {
+            document.documentElement.setAttribute('lang', l);
+          }
+        } catch (e) { /* keep server-rendered lang */ }
+      })();
+    </script>
+    {% if link_token %}
+    <!-- Direct operator links seed the gateway connection before the app boots. -->
+    <script>
+      (function () {
+        try {
+          function clearOpenSquillaStorage(storage) {
+            for (var i = storage.length - 1; i >= 0; i -= 1) {
+              var key = storage.key(i);
+              if (key && key.indexOf('opensquilla.chat.draft:') === 0) storage.removeItem(key);
+            }
+          }
+          var token = {{ link_token | tojson | safe }};
+          var wsUrl = {{ ws_url | tojson | safe }};
+          localStorage.removeItem('opensquilla.wsUrl');
+          clearOpenSquillaStorage(localStorage);
+          sessionStorage.removeItem('opensquilla.wsToken');
+          sessionStorage.removeItem('opensquilla.cachedAuth');
+          if (wsUrl) localStorage.setItem('opensquilla.wsUrl', wsUrl);
+          if (token) sessionStorage.setItem('opensquilla.wsToken', token);
+          if (window.history && window.history.replaceState) {
+            var url = new URL(window.location.href);
+            url.searchParams.delete('token');
+            window.history.replaceState(null, '', url.pathname + url.search + url.hash);
+          }
+        } catch (e) { /* connection settings stay editable in the UI */ }
+      })();
+    </script>
+    {% endif %}
+    <!-- Vite build output (hashed filenames, read dynamically from dist/) -->
+    {% for css in vite_css_urls %}<link rel="stylesheet" crossorigin href="{{ css }}">
+    {% endfor %}
+    {% if vite_js_url %}<script type="module" crossorigin src="{{ vite_js_url }}"></script>{% endif %}
+    <!-- Android WebView overlay fix: the composer menus are mounted inside a
+         floating/backdrop-filter container, so the desktop absolute placement
+         is clipped on narrow viewports. Keep this after the Vite CSS so the
+         mobile rules are the final cascade layer. -->
+    <style id="android-mobile-overlay-fix">
+      @media screen and (max-width: 900px) {
+        html { -webkit-text-size-adjust: 100%; }
+        body { overflow-x: hidden; }
+        .composer-model-routing,
+        .composer-run-mode,
+        .composer-add-menu,
+        .chat-more-actions-menu {
+          position: fixed !important;
+          top: 50% !important;
+          right: 12px !important;
+          bottom: auto !important;
+          left: 12px !important;
+          width: auto !important;
+          min-width: 0 !important;
+          max-width: none !important;
+          height: auto !important;
+          max-height: calc(100vh - 24px) !important;
+          margin: 0 !important;
+          padding-left: 16px !important;
+          padding-right: 16px !important;
+          box-sizing: border-box !important;
+          overflow-x: hidden !important;
+          overflow-y: auto !important;
+          transform: translate3d(0, -50%, 0) !important;
+          z-index: 2147483000 !important;
+        }
+        .composer-model-routing *,
+        .composer-run-mode *,
+        .composer-add-menu *,
+        .chat-more-actions-menu * {
+          box-sizing: border-box;
+          max-width: 100%;
+        }
+        /* Android already insets the WebView below the status bar; the app's
+           own safe-area pad is a second, stacked offset that pushes the chat
+           topbar row (sidebar toggle + gateway status) too low. Compress the
+           row so it hugs the top edge without losing 44px touch targets. */
+        .topbar.topbar--chat {
+          margin-top: 0 !important;
+          padding-top: 0 !important;
+          height: calc(56px + env(safe-area-inset-top, 0px)) !important;
+          min-height: calc(56px + env(safe-area-inset-top, 0px)) !important;
+          flex-basis: calc(56px + env(safe-area-inset-top, 0px)) !important;
+        }
+      }
+    </style>
+</head>
+<body>
+    <noscript>
+        <div style="padding:2rem;font-family:system-ui,-apple-system,sans-serif;color:#333;background:#fff;max-width:560px;margin:2rem auto;border:1px solid #ddd;border-radius:8px">
+            <h2 style="margin:0 0 .5rem">JavaScript required</h2>
+            <p style="margin:0;color:#555">OpenSquilla Control needs JavaScript to render the chat, sessions, and configuration views. Please enable it in your browser to continue.</p>
+        </div>
+    </noscript>
+    {% if webui_artifact_missing %}
+    <main role="alert" data-webui-artifact-missing
+          style="padding:2rem;font-family:system-ui,-apple-system,sans-serif;color:#222;background:#fff;max-width:720px;margin:3rem auto;border:1px solid #d8d8d8;border-radius:8px;line-height:1.5">
+        <h1 style="font-size:1.25rem;margin:0 0 .75rem">Control UI assets are unavailable</h1>
+        <p>This installation does not contain a usable Vue build. Release-wheel and Desktop users should reinstall an official package.</p>
+        <p style="margin-bottom:0">When running from a source checkout, build it with <code>cd opensquilla-webui &amp;&amp; npm ci &amp;&amp; npm run build</code>, then reload this page.</p>
+    </main>
+    {% else %}
+    <div id="app"></div>
+    {% endif %}
+
+    <!-- Bootstrap data injected by Jinja2 -->
+    <div id="opensquilla-data"
+         data-version="{{ version }}"
+         data-ws-url="{{ ws_url }}"
+         data-auth-mode="{{ auth_mode }}"
+         data-base-path="{{ base_path }}"
+         data-config-path="{{ config_path }}"
+         data-locale="{{ locale }}"
+         data-update="{{ update | tojson | forceescape }}"
+         style="display:none"></div>
+
+</body>
+</html>

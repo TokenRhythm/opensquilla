@@ -1,0 +1,35 @@
+{
+  "id": "filesystem/git-ls-files",
+  "family": "filesystem-inventory",
+  "description": "Compact git ls-files output while preserving tracked path samples.",
+  "match": {
+    "toolNames": ["exec"],
+    "argv0": ["git"],
+    "gitSubcommands": ["ls-files"]
+  },
+  "transforms": {
+    "stripAnsi": true,
+    "dedupeAdjacent": true,
+    "trimEmptyEdges": true
+  },
+  "summarize": {
+    "head": 8,
+    "tail": 6
+  },
+  "failure": {
+    "preserveOnFailure": true,
+    "head": 12,
+    "tail": 10
+  },
+  "counters": [
+    {
+      "name": "path",
+      "pattern": "^(?!fatal: ).+\\S.*$"
+    },
+    {
+      "name": "error",
+      "pattern": "fatal:|error:",
+      "flags": "i"
+    }
+  ]
+}

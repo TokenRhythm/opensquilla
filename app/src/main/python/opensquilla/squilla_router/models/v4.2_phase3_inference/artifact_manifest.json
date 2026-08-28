@@ -1,0 +1,133 @@
+{
+  "schema_version": 1,
+  "bundle": "src/opensquilla/squilla_router/models/v4.2_phase3_inference",
+  "description": "Checksums and provenance notes for SquillaRouter V4 Phase 3 assets.",
+  "files": [
+    {
+      "path": "bge_onnx/config.json",
+      "size_bytes": 688,
+      "sha256": "a7ef8b7733d4d54670d88617be0a426b56152296844e5ff603ef6fda92633da0",
+      "kind": "json_metadata",
+      "source_note": "Derived from BAAI/bge-small-zh-v1.5; see PROVENANCE.md."
+    },
+    {
+      "path": "bge_onnx/model.onnx",
+      "size_bytes": 23902398,
+      "sha256": "87847793fac866d65b19cee2e73a6b2a2446a1262ab0911b1dbf9b3e9399ef9d",
+      "kind": "onnx_model",
+      "source_note": "Derived from BAAI/bge-small-zh-v1.5; see PROVENANCE.md."
+    },
+    {
+      "path": "bge_onnx/special_tokens_map.json",
+      "size_bytes": 695,
+      "sha256": "5d5b662e421ea9fac075174bb0688ee0d9431699900b90662acd44b2a350503a",
+      "kind": "json_metadata",
+      "source_note": "Derived from BAAI/bge-small-zh-v1.5; see PROVENANCE.md."
+    },
+    {
+      "path": "bge_onnx/tokenizer.json",
+      "size_bytes": 439125,
+      "sha256": "48cea5d44424912a6fd1ea647bf4fe50b55ab8b1e5879c3275f80e339e8fae26",
+      "kind": "json_metadata",
+      "source_note": "Derived from BAAI/bge-small-zh-v1.5; see PROVENANCE.md."
+    },
+    {
+      "path": "bge_onnx/tokenizer_config.json",
+      "size_bytes": 1273,
+      "sha256": "470cff6e0353b08e2a6e9b4f61729ecdc47ccb3ced335fa5520e9ce334572d59",
+      "kind": "json_metadata",
+      "source_note": "Derived from BAAI/bge-small-zh-v1.5; see PROVENANCE.md."
+    },
+    {
+      "path": "bge_onnx/vocab.txt",
+      "size_bytes": 109540,
+      "sha256": "45bbac6b341c319adc98a532532882e91a9cefc0329aa57bac9ae761c27b291c",
+      "kind": "text_asset",
+      "source_note": "Derived from BAAI/bge-small-zh-v1.5; see PROVENANCE.md."
+    },
+    {
+      "path": "features/bge_pca.joblib",
+      "size_bytes": 135059,
+      "sha256": "9ee12bcd481a94516b074160e39f0b909c089393d73ffbf0167d3beba995fc23",
+      "kind": "pickle_joblib_artifact",
+      "source_note": "Router runtime feature extraction artifact."
+    },
+    {
+      "path": "features/config.pkl",
+      "size_bytes": 26,
+      "sha256": "9e1225d053527975dca018deab6e3ae3fea2070ded20cd01ef0e7eea711cce82",
+      "kind": "pickle_joblib_artifact",
+      "source_note": "Router runtime feature extraction artifact."
+    },
+    {
+      "path": "features/meta.json",
+      "size_bytes": 160,
+      "sha256": "fa7c412e32fee37088e03480494e3d0b8ed859b12222e37f22e33aec3778a3de",
+      "kind": "json_metadata",
+      "source_note": "Router runtime feature extraction artifact."
+    },
+    {
+      "path": "features/svd.pkl",
+      "size_bytes": 8003143,
+      "sha256": "5d2af9e78565e58e919fb83c7a01973e394436fd43cf6813c7cd2280aa140172",
+      "kind": "pickle_joblib_artifact",
+      "source_note": "Router runtime feature extraction artifact."
+    },
+    {
+      "path": "features/tfidf.pkl",
+      "size_bytes": 344158,
+      "sha256": "bb90fb1af13ff1b15104d22b8d1dfc712ae32bf8d7db959ca56b3d7c92872293",
+      "kind": "pickle_joblib_artifact",
+      "source_note": "Router runtime feature extraction artifact."
+    },
+    {
+      "path": "inference_manifest.json",
+      "size_bytes": 679,
+      "sha256": "1addef2deddaac2a60800eb631c5878765a49ad100ede4d54022d2d3bf8e2df2",
+      "kind": "json_metadata",
+      "source_note": "Router V4 Phase 3 bundle metadata or runtime configuration."
+    },
+    {
+      "path": "lgbm_aux.bin",
+      "size_bytes": 3481929,
+      "sha256": "e8749e412d2db861928cb9d8a9b39cdd134a4d71091430ffae014337d4b1aed4",
+      "kind": "lightgbm_model",
+      "source_note": "Router runtime LightGBM head artifact."
+    },
+    {
+      "path": "lgbm_main.bin",
+      "size_bytes": 39684725,
+      "sha256": "5f312db09577bbaf30f87358941974eef6edce7f1424d0e9de21cbd38a646d53",
+      "kind": "lightgbm_model",
+      "source_note": "Router runtime LightGBM head artifact."
+    },
+    {
+      "path": "mlp/model.onnx",
+      "size_bytes": 2367544,
+      "sha256": "e7358ac3f827e8f38a6384ba4f7c6f3227c18898ced95d145adb9272c72137d6",
+      "kind": "onnx_model",
+      "source_note": "Router runtime MLP head artifact."
+    },
+    {
+      "path": "mlp/scaler.joblib",
+      "size_bytes": 37447,
+      "sha256": "be1d8d9615ac5d20d26b7287dae485f13804b22fdb42c3aea1e1a9186914b9ee",
+      "kind": "pickle_joblib_artifact",
+      "source_note": "Router runtime MLP head artifact."
+    },
+    {
+      "path": "router.runtime.yaml",
+      "size_bytes": 5078,
+      "sha256": "9c442007c5b45054b10b629d8df67ac3c6d300d039c162efc38467f55ed1ea72",
+      "kind": "yaml_config",
+      "source_note": "Router V4 Phase 3 bundle metadata or runtime configuration."
+    },
+    {
+      "path": "version.json",
+      "size_bytes": 240,
+      "sha256": "806a413d0a8caa5f6b566060c0131b38466e68efce0b09b2d4902f4aef8bfd1c",
+      "kind": "json_metadata",
+      "source_note": "Router V4 Phase 3 bundle metadata or runtime configuration."
+    }
+  ]
+}

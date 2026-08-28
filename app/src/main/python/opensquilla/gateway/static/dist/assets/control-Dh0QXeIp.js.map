@@ -1,0 +1,1 @@
+{"version":3,"file":"control-Dh0QXeIp.js","names":[],"sources":["../../../../../../opensquilla-webui/src/control-runtime.ts"],"sourcesContent":["import './main'\n\ndocument.documentElement.dataset.opensquillaRuntime = 'control'\n"],"mappings":"2BAEA,SAAS,gBAAgB,QAAQ,mBAAqB"}

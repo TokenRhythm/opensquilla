@@ -1,0 +1,77 @@
+{
+  "meta": {
+    "question": "Compose a meta-skill for an analyst workflow combining web research, PDF intelligence, and final docx export into a reusable due-diligence brief workflow",
+    "depth": "thorough",
+    "created_at": "2026-05-26T20:25:00+08:00",
+    "rounds_completed": 0,
+    "rounds_target": 2,
+    "done": false
+  },
+  "subquestions": [
+    {
+      "id": "sq-001",
+      "question": "What is the canonical SKILL.md structure and frontmatter contract (name/description rules, directory layout, three-level loading)?",
+      "coverage": 0,
+      "target_sources": 3,
+      "sources": [],
+      "notes": "Anthropic docs on skill architecture"
+    },
+    {
+      "id": "sq-002",
+      "question": "What tools are available for web research automation (web_search, web_fetch, subagent patterns in OpenSquilla)?",
+      "coverage": 0,
+      "target_sources": 2,
+      "sources": [],
+      "notes": "OpenClaw docs for web tools and sub-agents"
+    },
+    {
+      "id": "sq-003",
+      "question": "What Python libraries are available for PDF intelligence (extraction, table parsing, markdown conversion)?",
+      "coverage": 0,
+      "target_sources": 3,
+      "sources": [],
+      "notes": "pdfplumber, PyMuPDF4LLM, docling"
+    },
+    {
+      "id": "sq-004",
+      "question": "How can python-docx / docxtpl be used to generate formatted Word documents programmatically?",
+      "coverage": 0,
+      "target_sources": 2,
+      "sources": [],
+      "notes": "docxtpl Jinja2 template-based approach"
+    },
+    {
+      "id": "sq-005",
+      "question": "What due diligence report structure is standard (sections, executive summary, financial/legal/operational analysis)?",
+      "coverage": 0,
+      "target_sources": 2,
+      "sources": [],
+      "notes": "DealRoom due diligence report structure"
+    },
+    {
+      "id": "sq-006",
+      "question": "What are collision risks and gate decisions when composing multiple capabilities (fetch races, partial failures, state corruption)?",
+      "coverage": 0,
+      "target_sources": 2,
+      "sources": [],
+      "notes": "Best practices from automation orchestration docs"
+    },
+    {
+      "id": "sq-007",
+      "question": "What triggers and inputs should the meta-skill expose (user phrases, file references, parameters)?",
+      "coverage": 0,
+      "target_sources": 2,
+      "sources": [],
+      "notes": "Skill authoring best practices for description design"
+    },
+    {
+      "id": "sq-008",
+      "question": "What step-graph should the meta-skill define (parallel branches, sequential gates, feedback loops)?",
+      "coverage": 0,
+      "target_sources": 2,
+      "sources": [],
+      "notes": "Subagent orchestration patterns from OpenClaw docs"
+    }
+  ],
+  "findings": {}
+}

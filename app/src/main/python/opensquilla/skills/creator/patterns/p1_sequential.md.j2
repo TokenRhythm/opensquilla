@@ -1,0 +1,106 @@
+---
+name: {{ name | tojson }}
+description: {{ description | tojson }}
+kind: meta
+meta_priority: {{ meta_priority | default(50) }}
+always: false
+triggers:
+{%- for t in triggers %}
+  - {{ t | tojson }}
+{%- endfor %}
+provenance:
+  origin: opensquilla-user
+  license: Apache-2.0
+metadata:
+  opensquilla:
+    risk: "low"
+    read_only: true
+    no_write: true
+    write_access: false
+    network_access: false
+    creator_gates:
+      - "G1 structural lint"
+      - "G2 scheduler dry-run"
+      - "G3 positive trigger smoke"
+      - "G4 unrelated negative smoke"
+      - "acceptance_compare versus highest-tier no-meta baseline"
+      - "runtime_e2e versus highest-tier no-meta baseline"
+composition:
+  steps:
+{%- for step in steps %}
+    - id: {{ step.id }}
+{%- if creator_step_kind is defined %}
+{%- set step_kind = creator_step_kind(step.skill) %}
+{%- else %}
+{%- set step_kind = "agent" %}
+{%- endif %}
+{%- if step_kind in ["skill_exec", "llm_chat"] %}
+      kind: {{ step_kind }}
+{%- endif %}
+      skill: {{ step.skill | tojson }}
+      read_only: true
+      write_access: false
+      network_access: false
+{%- if not loop.first %}
+      depends_on: [{{ steps[loop.index0 - 1].id }}]
+{%- endif %}
+      with:
+{%- if step.with_keys %}
+{%- for k, v in step.with_keys.items() %}
+        {{ k }}: {{ v | tojson }}
+{%- endfor %}
+{%- elif step_kind == "skill_exec" and step.skill == "history-explorer" %}
+        query: "{{ step.task }}: {{ '{{' }} inputs.user_message | xml_escape | truncate(512) {{ '}}' }}"
+        window_days: "30"
+        include: "co_occurrences,meta_usage"
+{%- elif step_kind == "skill_exec" and step.skill == "git-diff" %}
+        mode: cached_fallback_worktree
+        cwd: "{{ '{{' }} inputs.workspace_dir | default('.') {{ '}}' }}"
+{%- else %}
+{%- if loop.first %}
+        task: "{{ step.task }}: {{ '{{' }} inputs.user_message | xml_escape | truncate(512) {{ '}}' }}"
+{%- else %}
+        task: {{ step.task | tojson }}
+        user_request: "{{ '{{' }} inputs.user_message | xml_escape | truncate(1200) {{ '}}' }}"
+        prior_outputs:
+{%- for prev in steps[:loop.index0] %}
+          {{ prev.id }}: "{{ '{{' }} outputs.{{ prev.id }} | truncate(2000) {{ '}}' }}"
+{%- endfor %}
+        upstream: "{{ '{{' }} outputs.{{ steps[loop.index0 - 1].id }} | truncate(2000) {{ '}}' }}"
+{%- endif %}
+{%- endif %}
+{%- endfor %}
+---
+
+# {{ name }} (Meta-Skill, P1 sequential)
+
+{{ description }}
+
+## Execution Flow
+{%- for step in steps %}
+
+{{ loop.index }}. `{{ step.id }}` runs `{{ step.skill }}`.
+   Purpose: {{ step.task }}
+{%- endfor %}
+
+## Expected Output
+
+Return a grounded final deliverable from the ordered step outputs. Cite the
+specific upstream evidence used, keep claims within the user request and
+available step outputs, and do not invent missing facts.
+
+## Safety
+
+This proposal is read-only. It does not request file writes, network access, or
+destructive operations; every generated step carries explicit `read_only`,
+`write_access: false`, and `network_access: false` annotations for gate review.
+
+## Creator Gates
+
+Generated proposals must pass structural lint, scheduler dry-run, positive and
+negative trigger smoke tests, highest-tier no-meta acceptance comparison, and
+runtime E2E comparison before auto-enable eligibility.
+
+## Fallback
+
+LLM should invoke the listed skills in order.

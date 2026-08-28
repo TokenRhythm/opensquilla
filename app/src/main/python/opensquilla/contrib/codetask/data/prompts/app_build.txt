@@ -1,0 +1,90 @@
+You are building a small desktop application FROM SCRATCH in the repository at
+the current working directory. There is no existing app to modify — you create
+the whole project. You prove it works by making it BUILD cleanly.
+
+ENVIRONMENT
+- The repository is your workspace. Read, write, and run shell commands here.
+- Put throwaway notes/scratch under: {scratch_dir} (NOT inside the repo).
+- You have network access and may install npm packages.
+{env_hints}
+TASK
+{task}
+
+STACK (fixed)
+- Electron + Vite + React + TypeScript desktop app.
+- Local data ONLY: store real data in-app (React state plus a local JSON or
+  SQLite file via Electron's filesystem access). NO backend, NO server, NO
+  remote API.
+- No live preview is needed; you will NOT launch the GUI.
+- The runner may already have created the Electron/Vite scaffold for you. If
+  package.json and src/ exist, DO NOT run `npm create` or scaffold again; build
+  the requested app inside the existing scaffold.
+- If the scaffold is missing, scaffold with electron-vite, non-interactively:
+    npm create @quick-start/electron@latest app -- --template react-ts --skip
+  (the `--skip` flag accepts defaults so no interactive prompt is needed;
+  POSIX-only piping like `yes "" | ...` will NOT work under cmd.exe /
+  PowerShell — see the Host OS hint above). Then move the generated project
+  into the repo root (replace any placeholder README). That template already
+  provides an `npm run build` script that type-checks and builds
+  main/preload/renderer, plus an electron-builder config.
+
+HOW TO BUILD IT (methodology — keep it simple)
+1. DO EXACTLY WHAT THE TASK ASKS — nothing more, nothing less.
+2. Write COMPLETE files. Never truncate, never use "..." ellipsis, never write
+   "the rest stays the same" — every file must contain its full content.
+3. Scaffold first, then build the UI in order: app entry, then screens, then
+   smaller components. List the screens/components you need, then create EVERY
+   one of them.
+4. Make buttons and interactions REAL (working state changes, real local data
+   that persists to a local file) — not dead mockups.
+5. Use the styling already in the template; do not invent new build-config
+   files unless the task truly requires it.
+6. Generate everything in this run — do not stop half-way and say you will
+   continue later.
+
+WORK IN BIG BATCHES (do NOT write one file per step — that is far too slow)
+- Each step/tool call is expensive (a full model round-trip). Minimize the
+  NUMBER of steps by doing as much as possible per step, not by writing less.
+- Plan the full file list up front, then create MANY files per step. Prefer
+  the dedicated file-writing tool you have (write_file / create_*) over
+  shell heredocs — the tool is shell-agnostic and works the same on every
+  host OS. Batch many file writes per step rather than one tool call per
+  file. (If you fall back to shell, `cat > path <<'EOF' ... EOF` works under
+  bash but NOT under cmd.exe / PowerShell — see the Host OS hint.)
+- Do scaffold + `npm install` as early as possible so a buildable skeleton with
+  a committed package-lock.json exists before you flesh out the UI — that way a
+  long build still yields something that compiles.
+- Prefer a few large steps over many tiny ones; aim to finish a typical app in
+  well under a dozen tool calls, not fifty.
+
+VERIFICATION (the runner checks you with a FIXED build checklist — make it pass)
+After you finish, the runner independently runs, from the repo root:
+    npm ci
+    npm run build
+    npx electron-builder        # one installer for the HOST OS, target pinned by
+                                # the runner: --mac dmg (.dmg) / --win nsis
+                                # (.exe) / --linux AppImage (.AppImage). You do
+                                # NOT need to configure target lists; just keep a
+                                # valid electron-builder config (appId, product
+                                # name, icons) so dmg/nsis/AppImage can build.
+For these to pass you MUST:
+- Run `npm install` yourself so package-lock.json EXISTS and is committed (the
+  runner uses `npm ci`, which installs strictly from the lockfile and will fail
+  if it is missing or out of date).
+- Ensure `npm run build` type-checks and builds with NO errors.
+- Confirm `npm run build` succeeds. The runner packages one installer for the
+  host OS with the target pinned (`--mac dmg` / `--win nsis` / `--linux
+  AppImage`), so you do NOT need to configure target lists — just keep a valid
+  electron-builder config (appId, product name, icons) so those targets build.
+- Keep every module imported by the MAIN or PRELOAD process in `dependencies`,
+  NEVER `devDependencies`. electron-vite externalizes them (required at runtime,
+  not bundled) and electron-builder prunes `devDependencies` when packaging, so a
+  runtime module left in `devDependencies` builds and packages cleanly but makes
+  the INSTALLED app crash on launch with `Cannot find module`. The scaffold puts
+  `@electron-toolkit/utils` and `@electron-toolkit/preload` in `dependencies` —
+  keep them there if you rewrite package.json.
+- Do NOT commit node_modules, out, or dist.
+
+COMMIT
+Commit your work on the current branch with a clear message. Do not commit
+node_modules, build output, or scratch files.

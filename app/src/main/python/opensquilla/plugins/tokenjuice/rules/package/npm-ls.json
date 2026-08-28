@@ -1,0 +1,32 @@
+{
+  "id": "package/npm-ls",
+  "family": "package-manager",
+  "description": "Compact npm ls output while preserving dependency tree roots, invalid packages, and missing peers.",
+  "match": {
+    "toolNames": ["exec"],
+    "argv0": ["npm"],
+    "argvStartsWithAny": [["npm", "ls"], ["npm", "list"]],
+    "argvIncludesAny": [["ls"], ["list"]]
+  },
+  "transforms": {
+    "stripAnsi": true,
+    "dedupeAdjacent": true,
+    "trimEmptyEdges": true
+  },
+  "summarize": {
+    "head": 12,
+    "tail": 10
+  },
+  "failure": {
+    "preserveOnFailure": true,
+    "head": 18,
+    "tail": 18
+  },
+  "counters": [
+    {
+      "name": "problem",
+      "pattern": "UNMET|invalid|extraneous|missing|npm ERR!",
+      "flags": "i"
+    }
+  ]
+}

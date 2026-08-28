@@ -1,0 +1,42 @@
+{
+  "bundle_version": 1,
+  "source_model_version": "v4",
+  "feature_dim": 390,
+  "route_classes": [
+    "R0",
+    "R1",
+    "R2",
+    "R3"
+  ],
+  "mlp_input_dim": 1536,
+  "temperature": 0.8092449307441711,
+  "per_class_alpha": [
+    0.5,
+    0.05,
+    0.5,
+    0.8500000000000001
+  ],
+  "bge_backend": "onnx",
+  "bge_onnx_dir": "bge_onnx",
+  "feature_channels": [
+    "hc",
+    "tfidf",
+    "ctx",
+    "hist",
+    "bge_x3",
+    "asst_hc",
+    "cont_hc",
+    "reasoning_hc"
+  ],
+  "feature_meta": {
+    "schema_version": 2,
+    "use_bge": false,
+    "use_context": false,
+    "use_hist": false,
+    "feature_dim": 151,
+    "channel_order": [
+      "HC",
+      "TFIDF"
+    ]
+  }
+}

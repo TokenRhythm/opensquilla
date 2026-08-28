@@ -1,0 +1,2 @@
+import{E as e,V as t,gt as n,t as r,x as i}from"./_plugin-vue_export-helper-DGbgGarA.js";import{n as a}from"./vue-i18n-D9qBPC53.js";var o=[`aria-label`],s=r(e({__name:`LoadingSpinner`,setup(e){let{t:r}=a();return(e,a)=>(t(),i(`span`,{class:`loading-spinner`,"aria-label":n(r)(`shared.loading`),role:`status`},null,8,o))}}),[[`__scopeId`,`data-v-204fcd9b`]]);export{s as t};
+//# sourceMappingURL=LoadingSpinner-DvfZpOG9.js.map

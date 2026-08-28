@@ -1,0 +1,69 @@
+{
+  "name": "clawdbot-filesystem",
+  "version": "1.0.2",
+  "description": "Advanced filesystem operations - listing, searching, batch processing, and analysis",
+  "main": "filesystem",
+  "bin": {
+    "filesystem": "./filesystem"
+  },
+  "scripts": {
+    "start": "node filesystem",
+    "test": "node filesystem help",
+    "install-global": "npm link",
+    "uninstall-global": "npm unlink"
+  },
+  "keywords": [
+    "clawdbot",
+    "filesystem",
+    "files",
+    "directories",
+    "search",
+    "batch-operations",
+    "file-management",
+    "cli-tool",
+    "ai-agent",
+    "automation"
+  ],
+  "author": "Clawdbot Community",
+  "license": "MIT",
+  "homepage": "https://clawdhub.com/unknown/clawdbot-filesystem",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gtrusler/clawdbot-filesystem"
+  },
+  "bugs": {
+    "url": "https://github.com/gtrusler/clawdbot-filesystem/issues"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "os": ["darwin", "linux", "win32"],
+  "preferGlobal": true,
+  "files": [
+    "filesystem",
+    "config.json",
+    "SKILL.md",
+    "README.md",
+    "LICENSE.md"
+  ],
+  "clawdbot": {
+    "skill": true,
+    "emoji": "📁",
+    "category": "System Tools",
+    "requires": {
+      "bins": ["node"]
+    },
+    "permissions": {
+      "filesystem": "read-write",
+      "network": "none",
+      "system": "none"
+    },
+    "tags": [
+      "filesystem",
+      "files",
+      "search",
+      "batch-ops",
+      "productivity"
+    ]
+  }
+}

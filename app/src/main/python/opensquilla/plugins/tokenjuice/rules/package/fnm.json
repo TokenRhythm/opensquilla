@@ -1,0 +1,35 @@
+{
+  "id": "package/fnm",
+  "family": "runtime-manager",
+  "description": "Compact fnm output while preserving installs, selected versions, and lookup failures.",
+  "match": {
+    "toolNames": ["exec"],
+    "argv0": ["fnm"]
+  },
+  "transforms": {
+    "stripAnsi": true,
+    "dedupeAdjacent": true,
+    "trimEmptyEdges": true
+  },
+  "summarize": {
+    "head": 10,
+    "tail": 8
+  },
+  "failure": {
+    "preserveOnFailure": true,
+    "head": 14,
+    "tail": 14
+  },
+  "counters": [
+    {
+      "name": "version",
+      "pattern": "Installing|Using|Downloading|v\\d+\\.\\d+\\.\\d+",
+      "flags": "i"
+    },
+    {
+      "name": "error",
+      "pattern": "error|failed|not found",
+      "flags": "i"
+    }
+  ]
+}

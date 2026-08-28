@@ -1,0 +1,16 @@
+{
+  "//": [
+    "This tracked manifest deliberately ships empty — no audio files are committed to the repository.",
+    "To add your own music, create playlist.local.json (gitignored) beside this file, for example:",
+    {
+      "tracks": [
+        { "id": "local-example", "title": "Local example", "src": "my-track.mp3" },
+        { "id": "stream-example", "title": "HTTPS stream example", "src": "https://example.com/track.mp3" }
+      ]
+    },
+    "Track sources must be filenames relative to this directory or absolute HTTPS streams.",
+    "HTTPS streaming contacts the third-party host and exposes ordinary request metadata, including your IP address and browser user agent.",
+    "Keys other than 'tracks' are ignored by the loader. See README.md in this directory for the full format."
+  ],
+  "tracks": []
+}

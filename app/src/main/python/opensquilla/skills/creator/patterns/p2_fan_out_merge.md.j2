@@ -1,0 +1,165 @@
+---
+name: {{ name | tojson }}
+description: {{ description | tojson }}
+kind: meta
+meta_priority: {{ meta_priority | default(50) }}
+always: false
+triggers:
+{%- for t in triggers %}
+  - {{ t | tojson }}
+{%- endfor %}
+provenance:
+  origin: opensquilla-user
+  license: Apache-2.0
+metadata:
+  opensquilla:
+    risk: "low"
+    read_only: true
+    no_write: true
+    write_access: false
+    network_access: false
+    creator_gates:
+      - "G1 structural lint"
+      - "G2 scheduler dry-run"
+      - "G3 positive trigger smoke"
+      - "G4 unrelated negative smoke"
+      - "acceptance_compare versus highest-tier no-meta baseline"
+      - "runtime_e2e versus highest-tier no-meta baseline"
+composition:
+  steps:
+{%- for b in branches %}
+    - id: {{ b.id }}
+{%- if creator_step_kind is defined %}
+{%- set branch_kind = creator_step_kind(b.skill) %}
+{%- else %}
+{%- set branch_kind = "agent" %}
+{%- endif %}
+{%- if branch_kind in ["skill_exec", "llm_chat"] %}
+      kind: {{ branch_kind }}
+{%- endif %}
+      skill: {{ b.skill | tojson }}
+      read_only: true
+      write_access: false
+      network_access: false
+      with:
+{%- if b.with_keys %}
+{%- for k, v in b.with_keys.items() %}
+        {{ k }}: {{ v | tojson }}
+{%- endfor %}
+{%- elif branch_kind == "skill_exec" and b.skill == "history-explorer" %}
+        query: "{{ b.task }}: {{ '{{' }} inputs.user_message | xml_escape | truncate(512) {{ '}}' }}"
+        window_days: "30"
+        include: "co_occurrences,meta_usage"
+{%- elif branch_kind == "skill_exec" and b.skill == "git-diff" %}
+        mode: cached_fallback_worktree
+        cwd: "{{ '{{' }} inputs.workspace_dir | default('.') {{ '}}' }}"
+{%- else %}
+        task: "{{ b.task }}: {{ '{{' }} inputs.user_message | xml_escape | truncate(512) {{ '}}' }}"
+{%- endif %}
+{%- endfor %}
+    - id: {{ merge.id }}
+{%- if creator_step_kind is defined %}
+{%- set merge_kind = creator_step_kind(merge.skill) %}
+{%- else %}
+{%- set merge_kind = "agent" %}
+{%- endif %}
+{%- if merge_kind in ["skill_exec", "llm_chat"] %}
+      kind: {{ merge_kind }}
+{%- endif %}
+      skill: {{ merge.skill | tojson }}
+      read_only: true
+      write_access: false
+      network_access: false
+      depends_on: [{% for b in branches %}{{ b.id }}{% if not loop.last %}, {% endif %}{% endfor %}]
+      with:
+{%- if merge.with_keys %}
+{%- for k, v in merge.with_keys.items() %}
+        {{ k }}: {{ v | tojson }}
+{%- endfor %}
+{%- elif merge_kind == "skill_exec" and merge.skill == "history-explorer" %}
+        query: "{{ merge.task }}: {{ '{{' }} inputs.user_message | xml_escape | truncate(512) {{ '}}' }}"
+        window_days: "30"
+        include: "co_occurrences,meta_usage"
+{%- elif merge_kind == "skill_exec" and merge.skill == "git-diff" %}
+        mode: cached_fallback_worktree
+        cwd: "{{ '{{' }} inputs.workspace_dir | default('.') {{ '}}' }}"
+{%- else %}
+        task: {{ merge.task | tojson }}
+{%- for b in branches %}
+        {{ b.id }}_output: "{{ '{{' }} outputs.{{ b.id }} | truncate(2000) {{ '}}' }}"
+{%- endfor %}
+{%- endif %}
+{%- if tail %}
+    - id: {{ tail.id }}
+{%- if creator_step_kind is defined %}
+{%- set tail_kind = creator_step_kind(tail.skill) %}
+{%- else %}
+{%- set tail_kind = "agent" %}
+{%- endif %}
+{%- if tail_kind in ["skill_exec", "llm_chat"] %}
+      kind: {{ tail_kind }}
+{%- endif %}
+      skill: {{ tail.skill | tojson }}
+      read_only: true
+      write_access: false
+      network_access: false
+      depends_on: [{{ merge.id }}]
+      with:
+{%- if tail.with_keys %}
+{%- for k, v in tail.with_keys.items() %}
+        {{ k }}: {{ v | tojson }}
+{%- endfor %}
+{%- elif tail_kind == "skill_exec" and tail.skill == "history-explorer" %}
+        query: "{{ tail.task }}: {{ '{{' }} inputs.user_message | xml_escape | truncate(512) {{ '}}' }}"
+        window_days: "30"
+        include: "co_occurrences,meta_usage"
+{%- elif tail_kind == "skill_exec" and tail.skill == "git-diff" %}
+        mode: cached_fallback_worktree
+        cwd: "{{ '{{' }} inputs.workspace_dir | default('.') {{ '}}' }}"
+{%- else %}
+        task: {{ tail.task | tojson }}
+        upstream: "{{ '{{' }} outputs.{{ merge.id }} | truncate(2000) {{ '}}' }}"
+{%- endif %}
+{%- endif %}
+---
+
+# {{ name }} (Meta-Skill, P2 fan_out_merge)
+
+{{ description }}
+
+## Execution Flow
+{%- for b in branches %}
+
+- Branch `{{ b.id }}` runs `{{ b.skill }}`.
+  Purpose: {{ b.task }}
+{%- endfor %}
+
+- Merge `{{ merge.id }}` runs `{{ merge.skill }}`.
+  Purpose: {{ merge.task }}
+{%- if tail %}
+
+- Tail `{{ tail.id }}` runs `{{ tail.skill }}`.
+  Purpose: {{ tail.task }}
+{%- endif %}
+
+## Expected Output
+
+Return a grounded final deliverable from the branch and merge outputs. Cite the
+specific upstream evidence used, keep claims within the user request and
+available step outputs, and do not invent missing facts.
+
+## Safety
+
+This proposal is read-only. It does not request file writes, network access, or
+destructive operations; every generated step carries explicit `read_only`,
+`write_access: false`, and `network_access: false` annotations for gate review.
+
+## Creator Gates
+
+Generated proposals must pass structural lint, scheduler dry-run, positive and
+negative trigger smoke tests, highest-tier no-meta acceptance comparison, and
+runtime E2E comparison before auto-enable eligibility.
+
+## Fallback
+
+LLM should invoke the branch skills (in parallel where possible), then call the merge skill to aggregate, then optionally call the tail skill.

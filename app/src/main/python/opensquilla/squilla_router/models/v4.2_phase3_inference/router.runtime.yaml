@@ -1,0 +1,113 @@
+route_classes: [R0, R1, R2, R3]
+
+tier_mapping:
+  R0: S
+  R1: M
+  R2: L
+  R3: XL
+
+tier_registry:
+  S: [deepseek/deepseek-v4-flash]    # Fast direct-answer tier for trivial turns and short acknowledgements.
+  M: [deepseek/deepseek-v4-pro]      # Default general tier for normal Q&A, editing, and bounded coding tasks.
+  L: [z-ai/glm-5.2]                  # Reasoning tier for debugging, multi-step analysis, and structured planning.
+  XL: [anthropic/claude-opus-4.8]    # Highest Opus tier for architecture, high-risk work, and hard recovery turns.
+
+tier_explanations:
+  S:
+    route_class: R0
+    model: deepseek/deepseek-v4-flash
+    intent: "Fast direct answers for trivial turns, acknowledgements, simple rewrites, and short factual responses."
+    expected_controls: "No explicit thinking; P0 prompt hint may shorten responses."
+  M:
+    route_class: R1
+    model: deepseek/deepseek-v4-pro
+    intent: "General-purpose default for routine product, coding, writing, and comparison tasks with bounded complexity."
+    expected_controls: "Light or default thinking; P1 prompt policy unless the task is clearly trivial or high risk."
+  L:
+    route_class: R2
+    model: z-ai/glm-5.2
+    intent: "Reasoning tier for debugging, multi-signal diagnosis, multi-step implementation plans, and non-trivial technical analysis."
+    expected_controls: "High thinking; P1/P2 prompt policy depending on flags and difficulty."
+  XL:
+    route_class: R3
+    model: anthropic/claude-opus-4.8
+    intent: "Highest Opus tier for architecture design, cross-system tradeoffs, high-risk production decisions, and complex recovery turns."
+    expected_controls: "High thinking; P1/P2 prompt policy depending on flags and difficulty."
+
+thresholds:
+  margin_upgrade: 0.10           # v4.1 P0a: tightened from 0.15 to reduce OOD over-routing
+  high_confidence: 0.7
+  r1_rescue:
+    from_r0_max_gap: 0.10        # v4.1 P0a: tightened from 0.20 (sweep winner; +1.45 pp L2)
+  cascade_stage1_threshold: 0.4
+  under_routing_safety: 0.45
+  kv_cache_aware: true
+
+flag_rules:
+  high_risk:
+    keywords_zh: ["生产", "部署", "回滚", "迁移", "删除", "客户", "法务", "财务"]
+    keywords_en: ["deploy", "rollback", "migration", "delete", "overwrite", "production", "customer-facing"]
+  debug:
+    keywords: ["error", "bug", "exception", "traceback", "failed", "root cause", "报错", "根因", "修复"]
+    patterns: ["Traceback \\(most recent", "stderr:", "FAILED"]
+  repo_arch:
+    keywords: ["repo", "codebase", "monorepo", "architecture", "重构", "架构", "module", "dependency"]
+  strict_format:
+    keywords: ["JSON", "YAML", "CSV", "schema", "只返回", "不要解释", "按格式"]
+  long_context:
+    char_threshold: 6000
+    code_block_threshold: 1500
+    log_block_threshold: 1500
+    file_ref_threshold: 2
+
+thinking_mode_rules:
+  T0: {max_class: R0, min_margin: 0.5}
+  T1: {max_class: R1, min_margin: 0.4}
+  T2: {default: true}
+  T3: {min_class: R2, flags: [debug, long_context, high_risk]}
+
+prompt_policies:
+  P0:
+    hint_zh: "直接作答，缩短思考长度，避免无关展开。"
+    hint_en: "Answer directly, keep thinking short, avoid irrelevant expansion."
+    conditions: {max_difficulty: 0.8, min_margin: 0.4, no_flags: [high_risk, strict_format, debug]}
+  P1:
+    hint_zh: ""
+    hint_en: ""
+  P2:
+    hint_zh: "充分分析，覆盖关键约束，避免遗漏。"
+    hint_en: "Analyze thoroughly, cover key constraints, avoid omissions."
+    conditions: {any_flag: [high_risk, long_context, debug, strict_format]}
+
+optuna:
+  alpha: 1.0
+  beta: 0.3
+  gamma: 0.3
+
+context_rules:
+  deep_conversation_threshold: 4
+  heavy_context_tokens: 2000
+  heavy_context_min_class: R1
+  deep_conversation_min_class: R1
+
+trajectory:
+  delta_threshold: 0.3
+  history_max_turns: 5
+
+v4:
+  aux_head_inference: false      # default off; v4.2 needs this true for aux_downgrade
+  bge_model_name: BAAI/bge-small-zh-v1.5
+  bge_backend: onnx              # v4.2: 'onnx' (INT8 quantized) or 'sentence_transformers' (FP32)
+  bge_onnx_dir: bge_onnx
+  pca_dim: 64
+  feature_dim: 390               # v4.2 Phase 3: was 385; +5 dims for reasoning HC channel
+  history_user_max_turns: 4      # how many prior user turns to concat for history channel
+  bge_truncate_tokens: 510       # leave 2 tokens for [CLS]/[SEP]
+  aux_downgrade:                 # v4.2: gate downgrades via aux head's downgrade prob
+    enabled: false               # default off; turn on per-deployment after evaluation
+    threshold: 0.55              # require aux_probs["downgrade"] >= threshold
+    # When enabled and conditions met, force route_idx -= 1 (no effect at R0).
+    # Step fires AFTER margin upgrade; suppressed if margin upgrade just promoted.
+  sticky_tier:                   # v4.2 Phase 1 (deferred): block tier downgrade on short continuation turns
+    enabled: false               # default off — depends on accurate prev_route which router itself produces wrong on R2/R3 failure mode A; revisit after Phase 2 retrain
+    max_user_len: 200            # only applies when current user text length <= this
