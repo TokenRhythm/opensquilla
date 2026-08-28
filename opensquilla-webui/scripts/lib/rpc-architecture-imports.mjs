@@ -287,6 +287,12 @@ export function collectBoundaryArchitectureViolations({
           for (const kind of valueBoundaryKinds(property.initializer, seen)) kinds.add(kind)
         } else if (ts.isShorthandPropertyAssignment(property)) {
           for (const kind of valueBoundaryKinds(property.name, seen)) kinds.add(kind)
+        } else if (
+          ts.isMethodDeclaration(property)
+          || ts.isGetAccessorDeclaration(property)
+          || ts.isSetAccessorDeclaration(property)
+        ) {
+          for (const kind of functionExposureKinds(property, seen)) kinds.add(kind)
         }
       }
       return kinds
@@ -395,6 +401,15 @@ export function collectBoundaryArchitectureViolations({
     )
     const adapter = isGatewayAdapter(rel) && !isTestFile(rel)
     if (adapter && rel !== 'src/adapters/gateway/privateTransports.ts') {
+      function namespaceExportsStoreFactory(name) {
+        const raw = rawSymbol(name)
+        const moduleSymbol = analysis.canonicalSymbol(raw) ?? raw
+        if (!moduleSymbol) return false
+        return checker.getExportsOfModule(moduleSymbol).some(symbol => (
+          symbolOrigin(symbol) === 'RPC store factory'
+        ))
+      }
+
       function checkStoreImports(node) {
         if (
           ts.isImportSpecifier(node)
@@ -403,11 +418,26 @@ export function collectBoundaryArchitectureViolations({
           || ts.isImportEqualsDeclaration(node)
         ) {
           const name = node.name
-          if (name && symbolOrigin(rawSymbol(name)) === 'RPC store factory') {
+          const importsStoreFactory = name && (
+            symbolOrigin(rawSymbol(name)) === 'RPC store factory'
+            || (
+              (ts.isNamespaceImport(node) || ts.isImportEqualsDeclaration(node))
+              && namespaceExportsStoreFactory(name)
+            )
+          )
+          if (importsStoreFactory) {
             failures.push(
               `${rel}: Gateway Adapters must consume the private transport Interface instead of useRpcStore.`,
             )
           }
+        }
+        if (
+          ts.isPropertyAccessExpression(node)
+          && symbolOrigin(rawSymbol(node.name)) === 'RPC store factory'
+        ) {
+          failures.push(
+            `${rel}: Gateway Adapters must consume the private transport Interface instead of useRpcStore.`,
+          )
         }
         const required = requireBoundaryKind(node, rel)
         if (required === 'RPC store factory') {
@@ -442,6 +472,20 @@ export function collectBoundaryArchitectureViolations({
           failures.push(`${rel}: default export exposes ${kind} symbols.`)
         }
       }
+      if (
+        ts.isExportDeclaration(statement)
+        && !statement.moduleSpecifier
+        && statement.exportClause
+        && ts.isNamedExports(statement.exportClause)
+        && !privateBoundaryModule
+      ) {
+        for (const element of statement.exportClause.elements) {
+          const kind = symbolOrigin(rawSymbol(element.propertyName ?? element.name))
+          if (!kind || kind === 'RPC store factory') continue
+          if (kind === 'generated Contract' && generated) continue
+          failures.push(`${rel}: local export exposes ${kind} symbols.`)
+        }
+      }
     }
 
     function checkCjsExports(node) {
@@ -468,6 +512,26 @@ export function collectBoundaryArchitectureViolations({
       ) {
         for (const argument of node.arguments.slice(1)) {
           for (const kind of valueBoundaryKinds(argument)) {
+            if (kind === 'RPC store factory') continue
+            if (kind === 'generated Contract' && generated) continue
+            failures.push(`${rel}: CommonJS export exposes ${kind} symbols.`)
+          }
+        }
+      }
+      if (
+        ts.isCallExpression(node)
+        && ts.isPropertyAccessExpression(node.expression)
+        && node.expression.expression.getText(source) === 'Object'
+        && ['defineProperty', 'defineProperties'].includes(node.expression.name.text)
+        && /^(?:module\.exports|exports)$/.test(
+          node.arguments[0]?.getText(source).replace(/\s/g, '') ?? '',
+        )
+      ) {
+        const descriptor = node.expression.name.text === 'defineProperty'
+          ? node.arguments[2]
+          : node.arguments[1]
+        if (descriptor) {
+          for (const kind of valueBoundaryKinds(descriptor)) {
             if (kind === 'RPC store factory') continue
             if (kind === 'generated Contract' && generated) continue
             failures.push(`${rel}: CommonJS export exposes ${kind} symbols.`)

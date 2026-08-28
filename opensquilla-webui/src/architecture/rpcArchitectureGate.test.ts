@@ -814,6 +814,84 @@ describe('RPC import and symbol provenance', () => {
     ])
   })
 
+  it('tracks client properties through inline and aliased container types only at their property path', () => {
+    const operations = collectRpcTransportOperations({
+      ts,
+      root: fixtureRoot,
+      sources: provenanceSources({
+        'src/lib/rpc.ts': 'export class RpcClient {}',
+        'src/consumer.ts': `
+          import type { RpcClient } from './lib/rpc'
+          type Options = {
+            rpc: RpcClient
+            on(name: string): void
+          }
+          function consumeInline(options: { rpc: RpcClient }) {
+            options.rpc.call('feature.inline')
+          }
+          function consumeAlias(options: Options) {
+            options.rpc.call('feature.alias')
+            options.on('local-event')
+          }
+          void consumeInline
+          void consumeAlias
+        `,
+      }),
+    })
+    expect(operations).toEqual([
+      { rel: 'src/consumer.ts', kind: 'call' },
+      { rel: 'src/consumer.ts', kind: 'call' },
+    ])
+  })
+
+  it('tracks clients stored in class fields and constructor parameter properties', () => {
+    const operations = collectRpcTransportOperations({
+      ts,
+      root: fixtureRoot,
+      sources: provenanceSources({
+        'src/stores/rpc.ts': 'export function useRpcStore() { return {} }',
+        'src/consumer.ts': `
+          import { useRpcStore } from './stores/rpc'
+          class OwnedClient {
+            readonly rpc = useRpcStore()
+            run() { return this.rpc.call('feature.owned') }
+          }
+          class InjectedClient {
+            constructor(private readonly rpc: unknown) {}
+            run() { return this.rpc.on('feature.changed', () => {}) }
+          }
+          void OwnedClient
+          new InjectedClient(useRpcStore()).run()
+        `,
+      }),
+    })
+    expect(operations).toEqual([
+      { rel: 'src/consumer.ts', kind: 'call' },
+      { rel: 'src/consumer.ts', kind: 'on' },
+    ])
+  })
+
+  it('follows RPC arguments through class-field factories', () => {
+    const operations = collectRpcTransportOperations({
+      ts,
+      root: fixtureRoot,
+      sources: provenanceSources({
+        'src/stores/rpc.ts': 'export function useRpcStore() { return {} }',
+        'src/factory.ts': `
+          export class Factory {
+            wrap = (rpc: unknown) => ({ rpc })
+          }
+        `,
+        'src/consumer.ts': `
+          import { useRpcStore } from './stores/rpc'
+          import { Factory } from './factory'
+          new Factory().wrap(useRpcStore()).rpc.call('feature.get')
+        `,
+      }),
+    })
+    expect(operations).toEqual([{ rel: 'src/consumer.ts', kind: 'call' }])
+  })
+
   it('does not classify an unrelated analytics client by receiver spelling', () => {
     const operations = collectRpcTransportOperations({
       ts,
@@ -878,6 +956,32 @@ describe('RPC import and symbol provenance', () => {
       { rel: 'src/wrapper.ts', kind: 'waitForConnection' },
       { rel: 'src/consumer.ts', kind: 'call' },
       { rel: 'src/consumer.ts', kind: 'waitForConnection' },
+    ])
+  })
+
+  it('treats object method shorthand like an equivalent forwarding arrow property', () => {
+    const operations = collectRpcTransportOperations({
+      ts,
+      root: fixtureRoot,
+      sources: provenanceSources({
+        'src/stores/rpc.ts': 'export function useRpcStore() { return {} }',
+        'src/wrapper.ts': `
+          export function wrap(rpc: unknown) {
+            return {
+              call(...args: unknown[]) { return rpc.call(...args) },
+            }
+          }
+        `,
+        'src/consumer.ts': `
+          import { useRpcStore } from './stores/rpc'
+          import { wrap } from './wrapper'
+          wrap(useRpcStore()).call('feature.get')
+        `,
+      }),
+    })
+    expect(operations).toEqual([
+      { rel: 'src/wrapper.ts', kind: 'call' },
+      { rel: 'src/consumer.ts', kind: 'call' },
     ])
   })
 
@@ -1038,7 +1142,9 @@ describe('RPC import and symbol provenance', () => {
     expect(operations).toEqual([])
   })
 
-  it('bounds recursive return shapes by paths the AST can consume', () => {
+  it('bounds branching recursive return shapes by canonical paths the AST consumes', () => {
+    const depth = 20
+    const branchPath = Array.from({ length: depth }, () => 'next').join('.')
     const started = performance.now()
     const operations = collectRpcTransportOperations({
       ts,
@@ -1048,14 +1154,17 @@ describe('RPC import and symbol provenance', () => {
         'src/wrapper.ts': `
           export function wrap(rpc: unknown, depth: number): unknown {
             if (depth <= 0) return { rpc }
-            return { next: wrap(rpc, depth - 1) }
+            return {
+              next: wrap(rpc, depth - 1),
+              alternate: wrap(rpc, depth - 1),
+            }
           }
         `,
         'src/consumer.ts': `
           import { useRpcStore } from './stores/rpc'
           import { wrap } from './wrapper'
-          const wrapped = wrap(useRpcStore(), 2)
-          wrapped.next.next.rpc.call('feature.get')
+          const wrapped = wrap(useRpcStore(), ${depth})
+          wrapped.${branchPath}.rpc.call('feature.get')
         `,
       }),
     })
@@ -1120,6 +1229,72 @@ describe('whole-program boundary export fence', () => {
       'src/adapters/gateway/aliasLeak.ts: default export exposes private Gateway transport symbols.',
       'src/adapters/gateway/classLeak.ts: exported declaration exposes private Gateway transport symbols.',
     ]))
+  })
+
+  it('rejects local ESM export lists and accessor-based CommonJS leaks', () => {
+    const sources = provenanceSources({
+      'src/adapters/gateway/privateTransports.ts': `
+        export interface RpcTransport { request(method: string): unknown }
+        export const PRIVATE_TRANSPORT = 1
+      `,
+      'src/adapters/gateway/localExportLeak.ts': `
+        import {
+          PRIVATE_TRANSPORT as HiddenValue,
+          type RpcTransport as HiddenType,
+        } from './privateTransports'
+        export { HiddenValue as PublicValue }
+        export { type HiddenType as PublicType }
+      `,
+      'src/adapters/gateway/cjsGetterLeak.js': `
+        import { PRIVATE_TRANSPORT } from './privateTransports'
+        module.exports = { get transport() { return PRIVATE_TRANSPORT } }
+      `,
+      'src/adapters/gateway/cjsMethodLeak.js': `
+        import { PRIVATE_TRANSPORT } from './privateTransports'
+        module.exports = { transport() { return PRIVATE_TRANSPORT } }
+      `,
+      'src/adapters/gateway/cjsDefineLeak.js': `
+        import { PRIVATE_TRANSPORT } from './privateTransports'
+        Object.defineProperty(exports, 'transport', {
+          get() { return PRIVATE_TRANSPORT },
+        })
+      `,
+      'src/adapters/gateway/cjsDefinesLeak.js': `
+        import { PRIVATE_TRANSPORT } from './privateTransports'
+        Object.defineProperties(module.exports, {
+          transport: { value: PRIVATE_TRANSPORT },
+        })
+      `,
+    })
+    expect(collectBoundaryArchitectureViolations({
+      ts,
+      root: fixtureRoot,
+      sources,
+    })).toEqual(expect.arrayContaining([
+      'src/adapters/gateway/localExportLeak.ts: local export exposes private Gateway transport symbols.',
+      'src/adapters/gateway/cjsGetterLeak.js: CommonJS export exposes private Gateway transport symbols.',
+      'src/adapters/gateway/cjsMethodLeak.js: CommonJS export exposes private Gateway transport symbols.',
+      'src/adapters/gateway/cjsDefineLeak.js: CommonJS export exposes private Gateway transport symbols.',
+      'src/adapters/gateway/cjsDefinesLeak.js: CommonJS export exposes private Gateway transport symbols.',
+    ]))
+  })
+
+  it('rejects a namespace import of the RPC store through an index barrel', () => {
+    const failures = collectBoundaryArchitectureViolations({
+      ts,
+      root: fixtureRoot,
+      sources: provenanceSources({
+        'src/stores/rpc.ts': 'export function useRpcStore() { return {} }',
+        'src/stores/index.ts': `export * from './rpc'`,
+        'src/adapters/gateway/bypass.ts': `
+          import * as stores from '../../stores'
+          export const bypass = () => stores.useRpcStore()
+        `,
+      }),
+    })
+    expect(failures).toContain(
+      'src/adapters/gateway/bypass.ts: Gateway Adapters must consume the private transport Interface instead of useRpcStore.',
+    )
   })
 
   it('keeps generated-to-generated composition legal', () => {

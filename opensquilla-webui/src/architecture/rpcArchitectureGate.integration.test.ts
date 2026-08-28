@@ -256,6 +256,32 @@ describe('transport architecture gate ledger integration', () => {
     )
   })
 
+  it('rejects a namespace import of useRpcStore through an index barrel', () => {
+    const root = fixture({
+      'src/stores/rpc.ts': 'export function useRpcStore(): any { return {} }',
+      'src/stores/index.ts': `export * from './rpc'`,
+      'src/adapters/gateway/bypass.ts': `
+        import * as stores from '../../stores'
+        export const bypass = () => stores.useRpcStore()
+      `,
+    })
+    expect(evaluateRpcArchitectureGate({ root, debtLanes: [] }).failures).toContain(
+      'src/adapters/gateway/bypass.ts: Gateway Adapters must consume the private transport Interface instead of useRpcStore.',
+    )
+  })
+
+  it('fails fast when the canonical RPC store loses its named ESM seed export', () => {
+    const root = fixture({
+      'src/stores/rpc.ts': `
+        function useRpcStore() { return {} }
+        module.exports.useRpcStore = useRpcStore
+      `,
+    })
+    expect(evaluateRpcArchitectureGate({ root, debtLanes: [] }).failures).toContain(
+      'src/stores/rpc.ts: RPC provenance seed must remain an ESM named export "useRpcStore".',
+    )
+  })
+
   it('rejects function and CommonJS private transport exports from an Adapter', () => {
     const root = fixture({
       'src/adapters/gateway/privateTransports.ts': `

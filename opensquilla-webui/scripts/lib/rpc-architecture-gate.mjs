@@ -71,6 +71,41 @@ function increment(map, key, amount = 1) {
   map.set(key, (map.get(key) ?? 0) + amount)
 }
 
+function hasEsmNamedValueExport(source, name) {
+  for (const statement of source.statements) {
+    if (
+      ts.isExportDeclaration(statement)
+      && !statement.isTypeOnly
+      && statement.exportClause
+      && ts.isNamedExports(statement.exportClause)
+      && statement.exportClause.elements.some(element => (
+        !element.isTypeOnly && element.name.text === name
+      ))
+    ) {
+      return true
+    }
+    const modifiers = ts.canHaveModifiers(statement)
+      ? ts.getModifiers(statement) ?? []
+      : []
+    if (!modifiers.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword)) continue
+    if (
+      (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement))
+      && statement.name?.text === name
+    ) {
+      return true
+    }
+    if (
+      ts.isVariableStatement(statement)
+      && statement.declarationList.declarations.some(declaration => (
+        ts.isIdentifier(declaration.name) && declaration.name.text === name
+      ))
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
 /** Evaluate RPC and HTTP migration debt from one source scan and one ledger. */
 export function evaluateRpcArchitectureGate({
   root = defaultRoot,
@@ -146,6 +181,18 @@ export function evaluateRpcArchitectureGate({
     visit(source)
   }
   const sourceAnalysis = createRpcAnalysisProgram({ ts, root, sources })
+  const canonicalStore = sources.find(({ rel }) => rel === 'src/stores/rpc.ts')
+  if (
+    canonicalStore
+    && (
+      !hasEsmNamedValueExport(canonicalStore.source, 'useRpcStore')
+      || !sourceAnalysis.exportedSymbol('src/stores/rpc.ts', 'useRpcStore')
+    )
+  ) {
+    failures.push(
+      'src/stores/rpc.ts: RPC provenance seed must remain an ESM named export "useRpcStore".',
+    )
+  }
   failures.push(...collectBoundaryArchitectureViolations({
     ts,
     root,

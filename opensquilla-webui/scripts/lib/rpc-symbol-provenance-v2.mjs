@@ -39,7 +39,12 @@ function unwrap(ts, expression) {
 
 function propertyName(ts, node) {
   if (!node) return null
-  if (ts.isIdentifier(node) || ts.isStringLiteralLike(node) || ts.isNumericLiteral(node)) {
+  if (
+    ts.isIdentifier(node)
+    || ts.isPrivateIdentifier(node)
+    || ts.isStringLiteralLike(node)
+    || ts.isNumericLiteral(node)
+  ) {
     return node.text
   }
   return null
@@ -143,6 +148,8 @@ export function collectRpcTransportOperations({ ts, root, sources, analysis: sup
   let nextSymbolId = 1
   const functionIds = new WeakMap()
   let nextFunctionId = 1
+  const classIds = new WeakMap()
+  let nextClassId = 1
 
   function symbolId(symbol) {
     if (!symbol) return null
@@ -163,6 +170,30 @@ export function collectRpcTransportOperations({ ts, root, sources, analysis: sup
       functionIds.set(node, id)
     }
     return id
+  }
+
+  function classId(node) {
+    let id = classIds.get(node)
+    if (!id) {
+      id = nextClassId
+      nextClassId += 1
+      classIds.set(node, id)
+    }
+    return id
+  }
+
+  function enclosingClass(node) {
+    let current = node?.parent ?? null
+    while (current) {
+      if (ts.isClassDeclaration(current) || ts.isClassExpression(current)) return current
+      current = current.parent
+    }
+    return null
+  }
+
+  function instancePath(node) {
+    const owner = enclosingClass(node)
+    return owner ? `c${classId(owner)}` : null
   }
 
   function rawSymbolAt(node) {
@@ -187,6 +218,35 @@ export function collectRpcTransportOperations({ ts, root, sources, analysis: sup
   }
 
   let maxPathDepth = 1
+  const demandedShapePaths = new Set([''])
+
+  function addDemandedPath(parts) {
+    for (let start = 0; start < parts.length; start += 1) {
+      const suffix = parts.slice(start).join('.')
+      if (suffix) demandedShapePaths.add(suffix)
+    }
+  }
+
+  function accessParts(expression) {
+    const access = memberAccess(ts, expression)
+    if (!access) return []
+    return [...accessParts(access.receiver), access.member]
+  }
+
+  function collectBindingPaths(node, prefix = []) {
+    if (!ts.isObjectBindingPattern(node) && !ts.isArrayBindingPattern(node)) return
+    node.elements.forEach((element, index) => {
+      if (!element || ts.isOmittedExpression(element)) return
+      const member = ts.isObjectBindingPattern(node)
+        ? propertyName(ts, element.propertyName ?? element.name)
+        : String(index)
+      if (!member) return
+      const path = [...prefix, member]
+      addDemandedPath(path)
+      collectBindingPaths(element.name, path)
+    })
+  }
+
   function bindingDepth(node, depth = 0) {
     if (!ts.isObjectBindingPattern(node) && !ts.isArrayBindingPattern(node)) return depth
     let maximum = depth
@@ -205,9 +265,11 @@ export function collectRpcTransportOperations({ ts, root, sources, analysis: sup
     function visit(node) {
       if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
         maxPathDepth = Math.max(maxPathDepth, accessDepth(node))
+        addDemandedPath(accessParts(node))
       }
       if (ts.isVariableDeclaration(node) || ts.isParameter(node)) {
         maxPathDepth = Math.max(maxPathDepth, bindingDepth(node.name))
+        collectBindingPaths(node.name)
       }
       ts.forEachChild(node, visit)
     }
@@ -215,7 +277,10 @@ export function collectRpcTransportOperations({ ts, root, sources, analysis: sup
   }
 
   function bounded(path) {
-    return shapeDepth(path) <= maxPathDepth
+    return !path || (
+      shapeDepth(path) <= maxPathDepth
+      && demandedShapePaths.has(path)
+    )
   }
 
   function prependShape(prefix, shape) {
@@ -381,7 +446,11 @@ export function collectRpcTransportOperations({ ts, root, sources, analysis: sup
         return declaration
       }
       if (
-        (ts.isVariableDeclaration(declaration) || ts.isPropertyAssignment(declaration))
+        (
+          ts.isVariableDeclaration(declaration)
+          || ts.isPropertyDeclaration(declaration)
+          || ts.isPropertyAssignment(declaration)
+        )
         && declaration.initializer
       ) {
         const found = callableForExpression(declaration.initializer, nextSeen)
@@ -421,6 +490,7 @@ export function collectRpcTransportOperations({ ts, root, sources, analysis: sup
 
   function pathForExpression(expression) {
     const current = unwrap(ts, expression)
+    if (current.kind === ts.SyntaxKind.ThisKeyword) return instancePath(current)
     if (ts.isIdentifier(current)) {
       const id = symbolId(rawSymbolAt(current))
       return id ? `s${id}` : null
@@ -431,39 +501,105 @@ export function collectRpcTransportOperations({ ts, root, sources, analysis: sup
     return parent ? `${parent}.${access.member}` : null
   }
 
-  function typeContainsOrigin(node, desired, seen = new Set()) {
+  function hasModifier(node, kind) {
+    return Boolean(ts.getModifiers(node)?.some(modifier => modifier.kind === kind))
+  }
+
+  function classStaticPath(owner) {
+    if (owner.name) return pathForExpression(owner.name)
+    if (
+      ts.isClassExpression(owner)
+      && ts.isVariableDeclaration(owner.parent)
+      && ts.isIdentifier(owner.parent.name)
+    ) return pathForExpression(owner.parent.name)
+    return `c${classId(owner)}.static`
+  }
+
+  function classMemberPath(node) {
+    const owner = enclosingClass(node)
+    const name = propertyName(ts, node.name)
+    if (!owner || !name) return null
+    const base = hasModifier(node, ts.SyntaxKind.StaticKeyword)
+      ? classStaticPath(owner)
+      : `c${classId(owner)}`
+    return base ? `${base}.${name}` : null
+  }
+
+  function isConstructorParameterProperty(node) {
+    if (!ts.isParameter(node) || !ts.isConstructorDeclaration(node.parent)) return false
+    return Boolean(ts.getModifiers(node)?.some(modifier => [
+      ts.SyntaxKind.PublicKeyword,
+      ts.SyntaxKind.ProtectedKeyword,
+      ts.SyntaxKind.PrivateKeyword,
+      ts.SyntaxKind.ReadonlyKeyword,
+    ].includes(modifier.kind)))
+  }
+
+  function constructorForExpression(expression, seen = new Set()) {
+    const current = unwrap(ts, expression)
+    const symbolNode = ts.isPropertyAccessExpression(current) ? current.name : current
+    const raw = rawSymbolAt(symbolNode)
+    const symbol = analysis.canonicalSymbol(raw) ?? raw
+    if (!symbol || seen.has(symbol)) return null
+    const nextSeen = new Set(seen).add(symbol)
+    for (const declaration of symbol.declarations ?? []) {
+      let owner = null
+      if (ts.isClassDeclaration(declaration) || ts.isClassExpression(declaration)) {
+        owner = declaration
+      } else if (
+        ts.isVariableDeclaration(declaration)
+        && declaration.initializer
+        && ts.isClassExpression(unwrap(ts, declaration.initializer))
+      ) {
+        owner = unwrap(ts, declaration.initializer)
+      } else if (ts.isExportAssignment(declaration)) {
+        const found = constructorForExpression(declaration.expression, nextSeen)
+        if (found) return found
+      }
+      if (owner) {
+        return owner.members.find(member => ts.isConstructorDeclaration(member)) ?? null
+      }
+    }
+    return null
+  }
+
+  function typeNameSymbol(node) {
+    if (ts.isIdentifier(node)) return rawSymbolAt(node)
+    if (ts.isQualifiedName(node)) return rawSymbolAt(node.right)
+    if (ts.isPropertyAccessExpression(node)) return rawSymbolAt(node.name)
+    return null
+  }
+
+  function typeIsDirectOrigin(node, desired, seen = new Set()) {
     if (!node || seen.has(node)) return false
     const nextSeen = new Set(seen).add(node)
-    let found = false
-    function visit(current) {
-      if (found) return
-      if (ts.isIdentifier(current)) {
-        const symbol = rawSymbolAt(current)
-        if (symbolOrigin(symbol) === desired) {
-          found = true
-          return
-        }
-        const canonical = analysis.canonicalSymbol(symbol)
-        for (const declaration of canonical?.declarations ?? []) {
-          if (ts.isTypeAliasDeclaration(declaration)) {
-            if (typeContainsOrigin(declaration.type, desired, nextSeen)) {
-              found = true
-              return
-            }
-          } else if (ts.isInterfaceDeclaration(declaration)) {
-            for (const heritage of declaration.heritageClauses ?? []) {
-              if (typeContainsOrigin(heritage, desired, nextSeen)) {
-                found = true
-                return
-              }
-            }
+    if (ts.isParenthesizedTypeNode(node) || ts.isTypeOperatorNode(node)) {
+      return typeIsDirectOrigin(node.type, desired, nextSeen)
+    }
+    if (ts.isUnionTypeNode(node) || ts.isIntersectionTypeNode(node)) {
+      return node.types.some(type => typeIsDirectOrigin(type, desired, nextSeen))
+    }
+    const name = ts.isTypeReferenceNode(node)
+      ? node.typeName
+      : ts.isExpressionWithTypeArguments(node)
+        ? node.expression
+        : null
+    if (!name) return false
+    const symbol = typeNameSymbol(name)
+    if (symbolOrigin(symbol) === desired) return true
+    const canonical = analysis.canonicalSymbol(symbol)
+    for (const declaration of canonical?.declarations ?? []) {
+      if (ts.isTypeAliasDeclaration(declaration)) {
+        if (typeIsDirectOrigin(declaration.type, desired, nextSeen)) return true
+      } else if (ts.isInterfaceDeclaration(declaration)) {
+        for (const heritage of declaration.heritageClauses ?? []) {
+          for (const type of heritage.types) {
+            if (typeIsDirectOrigin(type, desired, nextSeen)) return true
           }
         }
       }
-      ts.forEachChild(current, visit)
     }
-    visit(node)
-    return found
+    return false
   }
 
   function clientPropertyPaths(typeNode, depth = 0, seen = new Set()) {
@@ -476,7 +612,7 @@ export function collectRpcTransportOperations({ ts, root, sources, analysis: sup
       const propertyType = declaration?.type
       if (!declaration || !propertyType) continue
       const name = property.getName()
-      if (typeContainsOrigin(propertyType, 'client-type')) {
+      if (typeIsDirectOrigin(propertyType, 'client-type')) {
         result.add(name)
         continue
       }
@@ -577,7 +713,8 @@ export function collectRpcTransportOperations({ ts, root, sources, analysis: sup
     if (isRpcExpression(expression)) return true
     const state = stateForNode(expression)
     const path = pathForExpression(expression)
-    return Boolean(state && path && state.rpcMemberPaths.get(path)?.has(member))
+    if (state && path && state.rpcMemberPaths.get(path)?.has(member)) return true
+    return rpcMemberShapeForExpression(expression).has(encodeMember('', member))
   }
 
   function rpcFunctionMembers(expression) {
@@ -595,7 +732,11 @@ export function collectRpcTransportOperations({ ts, root, sources, analysis: sup
       && TRACKED_RPC_MEMBERS.includes(access.member)
       && isRpcMemberReceiver(access.receiver, access.member)
     ) return new Set([access.member])
-    if (ts.isArrowFunction(current) || ts.isFunctionExpression(current)) {
+    if (
+      ts.isArrowFunction(current)
+      || ts.isFunctionExpression(current)
+      || ts.isMethodDeclaration(current)
+    ) {
       const members = new Set()
       function visit(node) {
         if (ts.isFunctionLike(node) && node !== current) return
@@ -645,10 +786,18 @@ export function collectRpcTransportOperations({ ts, root, sources, analysis: sup
           for (const encoded of rpcMemberShapeForExpression(property.expression)) shape.add(encoded)
           continue
         }
-        if (!ts.isPropertyAssignment(property) && !ts.isShorthandPropertyAssignment(property)) continue
+        if (
+          !ts.isPropertyAssignment(property)
+          && !ts.isShorthandPropertyAssignment(property)
+          && !ts.isMethodDeclaration(property)
+        ) continue
         const name = propertyName(ts, property.name)
         if (!name) continue
-        const value = ts.isShorthandPropertyAssignment(property) ? property.name : property.initializer
+        const value = ts.isShorthandPropertyAssignment(property)
+          ? property.name
+          : ts.isMethodDeclaration(property)
+            ? property
+            : property.initializer
         for (const encoded of prependMemberShape(name, rpcMemberShapeForExpression(value))) {
           shape.add(encoded)
         }
@@ -792,19 +941,59 @@ export function collectRpcTransportOperations({ ts, root, sources, analysis: sup
   // Function.prototype.call on `typeof useRpcStore` is not an RPC operation.
   for (const state of stateByRel.values()) {
     function collectTypedBindings(node) {
-      if ((ts.isParameter(node) || ts.isVariableDeclaration(node)) && node.type) {
-        if (typeContainsOrigin(node.type, 'client-type')) {
-          bindPattern(state, node.name, new Set(['']))
+      if (
+        (
+          ts.isParameter(node)
+          || ts.isVariableDeclaration(node)
+          || ts.isPropertyDeclaration(node)
+        )
+        && node.type
+      ) {
+        if (typeIsDirectOrigin(node.type, 'client-type')) {
+          if (ts.isPropertyDeclaration(node)) {
+            bindShapeAtPath(state, classMemberPath(node), new Set(['']))
+          } else {
+            bindPattern(state, node.name, new Set(['']))
+          }
+        } else if (ts.isPropertyDeclaration(node)) {
+          const path = classMemberPath(node)
+          for (const suffix of clientPropertyPaths(node.type)) {
+            if (path) state.rpcPropertyPaths.add(`${path}.${suffix}`)
+          }
         } else if (ts.isIdentifier(node.name)) {
           const path = pathForExpression(node.name)
           for (const suffix of clientPropertyPaths(node.type)) {
-            state.rpcPropertyPaths.add(`${path}.${suffix}`)
+            if (path) state.rpcPropertyPaths.add(`${path}.${suffix}`)
           }
         }
       }
       ts.forEachChild(node, collectTypedBindings)
     }
     collectTypedBindings(state.source)
+  }
+
+  function bindConstructorParameterProperty(state, node) {
+    if (!isConstructorParameterProperty(node) || !ts.isIdentifier(node.name)) return false
+    const path = classMemberPath(node)
+    let changed = bindShapeAtPath(state, path, rpcShapeForExpression(node.name))
+    changed = bindMemberShapeAtPath(
+      state,
+      path,
+      rpcMemberShapeForExpression(node.name),
+    ) || changed
+    return changed
+  }
+
+  function bindPropertyDeclaration(state, node) {
+    if (!ts.isPropertyDeclaration(node) || !node.initializer) return false
+    const path = classMemberPath(node)
+    let changed = bindShapeAtPath(state, path, rpcShapeForExpression(node.initializer))
+    changed = bindMemberShapeAtPath(
+      state,
+      path,
+      rpcMemberShapeForExpression(node.initializer),
+    ) || changed
+    return changed
   }
 
   function returnExpressions(functionNode) {
@@ -828,6 +1017,8 @@ export function collectRpcTransportOperations({ ts, root, sources, analysis: sup
   function propagateLocal(state) {
     let changed = false
     function visit(node) {
+      changed = bindPropertyDeclaration(state, node) || changed
+      changed = bindConstructorParameterProperty(state, node) || changed
       if (ts.isVariableDeclaration(node) && node.initializer) {
         changed = bindPattern(
           state,
@@ -876,22 +1067,29 @@ export function collectRpcTransportOperations({ ts, root, sources, analysis: sup
 
   function propagateCalls(state) {
     let changed = false
+    function propagateArguments(target, args) {
+      const targetState = target ? stateForNode(target) : null
+      if (!target || !targetState) return false
+      let propagated = false
+      target.parameters.forEach((parameter, index) => {
+        const argument = args?.[index]
+        if (!argument || ts.isSpreadElement(argument)) return
+        propagated = bindPattern(
+          targetState,
+          parameter.name,
+          rpcShapeForExpression(argument),
+          rpcMemberShapeForExpression(argument),
+        ) || propagated
+      })
+      return propagated
+    }
     function visit(node) {
       if (ts.isCallExpression(node)) {
         const target = callableForExpression(node.expression)
-        const targetState = target ? stateForNode(target) : null
-        if (target && targetState) {
-          target.parameters.forEach((parameter, index) => {
-            const argument = node.arguments[index]
-            if (!argument || ts.isSpreadElement(argument)) return
-            changed = bindPattern(
-              targetState,
-              parameter.name,
-              rpcShapeForExpression(argument),
-              rpcMemberShapeForExpression(argument),
-            ) || changed
-          })
-        }
+        changed = propagateArguments(target, node.arguments) || changed
+      } else if (ts.isNewExpression(node)) {
+        const target = constructorForExpression(node.expression)
+        changed = propagateArguments(target, node.arguments) || changed
       }
       ts.forEachChild(node, visit)
     }
