@@ -10,7 +10,7 @@
 - **APK also tracked in repo:** [releases/OpenSquilla-mobile-debug.apk](releases/OpenSquilla-mobile-debug.apk)
 - Min Android: 8.0 (API 26), ABI: arm64-v8a
 - Configuration example: [config.example.toml](config.example.toml)
-- License: MIT, see [LICENSE](LICENSE)
+- License: Apache-2.0, see [LICENSE](LICENSE) — this packaging is a derivative of [opensquilla/opensquilla](https://github.com/opensquilla/opensquilla) (Apache-2.0)
 
 ## What this is
 
@@ -136,5 +136,4 @@ browser to see shared storage.
    and the router are healthy.
 
 ## License
-
-MIT, see [LICENSE](LICENSE).
+Apache-2.0, see [LICENSE](LICENSE). This mobile packaging is a derivative work of [opensquilla/opensquilla](https://github.com/opensquilla/opensquilla) which is licensed under Apache-2.0; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for third-party notices.
