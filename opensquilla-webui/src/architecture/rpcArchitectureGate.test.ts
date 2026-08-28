@@ -567,6 +567,36 @@ describe('HTTP symbol provenance', () => {
     ])
   })
 
+  it('propagates request evidence through a class-field wrapper', () => {
+    const operations = collectHttpBoundaryOperations({
+      ts,
+      root: fixtureRoot,
+      sources: provenanceSources({
+        'src/consumer.ts': `
+          import { Boundary } from './wrapper'
+          const headers = {
+            Authorization: sessionStorage.getItem('opensquilla.wsToken'),
+            'x-opensquilla-session-key': 'session-a',
+          }
+          void new Boundary().send('/api/class-field', { headers })
+        `,
+        'src/wrapper.ts': `
+          export class Boundary {
+            send = (endpoint: string, init: object) => fetch(endpoint, init)
+          }
+        `,
+      }),
+    })
+
+    expect(operations).toEqual([
+      { rel: 'src/wrapper.ts', kind: 'httpRequest' },
+      { rel: 'src/wrapper.ts', kind: 'httpApiEndpoint' },
+      { rel: 'src/wrapper.ts', kind: 'httpAuthToken' },
+      { rel: 'src/wrapper.ts', kind: 'httpAuthorizationHeader' },
+      { rel: 'src/wrapper.ts', kind: 'httpSessionKeyHeader' },
+    ])
+  })
+
   it('counts a Request-to-fetch pipeline once and follows cyclic RequestInit aliases', () => {
     const operations = collectHttpBoundaryOperations({
       ts,
@@ -591,6 +621,34 @@ describe('HTTP symbol provenance', () => {
       { rel: 'src/request.ts', kind: 'httpApiEndpoint' },
       { rel: 'src/request.ts', kind: 'httpAuthToken' },
       { rel: 'src/request.ts', kind: 'httpAuthorizationHeader' },
+    ])
+  })
+
+  it('recognizes standard HeadersInit tuples through aliases', () => {
+    const operations = collectHttpBoundaryOperations({
+      ts,
+      root: fixtureRoot,
+      sources: provenanceSources({
+        'src/headers-tuples.ts': `
+          const AUTH = 'Authorization'
+          const SESSION = 'x-opensquilla-session-key'
+          const tuples = [
+            [AUTH, sessionStorage.getItem('opensquilla.wsToken')],
+            [SESSION, 'session-a'],
+          ] as const
+          const init = tuples
+          const headers = new Headers(init)
+          void fetch('/api/value', { headers })
+        `,
+      }),
+    })
+
+    expect(operations).toEqual([
+      { rel: 'src/headers-tuples.ts', kind: 'httpRequest' },
+      { rel: 'src/headers-tuples.ts', kind: 'httpApiEndpoint' },
+      { rel: 'src/headers-tuples.ts', kind: 'httpAuthToken' },
+      { rel: 'src/headers-tuples.ts', kind: 'httpAuthorizationHeader' },
+      { rel: 'src/headers-tuples.ts', kind: 'httpSessionKeyHeader' },
     ])
   })
 
@@ -650,7 +708,9 @@ describe('HTTP symbol provenance', () => {
           void fetch('data:image/png;base64,AA==')
           void fetch('blob:https://control.example/id')
           void fetch('https://cdn.example/api/image.png')
+          void fetch('//cdn.example/api/image.png')
           void fetch('http://127.0.0.1:8765/api/private')
+          void fetch('http://[::1]:8765/api/private')
           void fetch('/static/../api/private')
           void fetch('/static/%2e%2e/api/private')
           declare const runtimeTarget: string
@@ -660,6 +720,8 @@ describe('HTTP symbol provenance', () => {
     })
 
     expect(operations).toEqual([
+      { rel: 'src/targets.ts', kind: 'httpRequest' },
+      { rel: 'src/targets.ts', kind: 'httpApiEndpoint' },
       { rel: 'src/targets.ts', kind: 'httpRequest' },
       { rel: 'src/targets.ts', kind: 'httpApiEndpoint' },
       { rel: 'src/targets.ts', kind: 'httpRequest' },

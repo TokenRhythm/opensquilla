@@ -82,17 +82,21 @@ function headerTag(name) {
   return null
 }
 
+function isGatewayHost(hostname) {
+  return hostname === 'localhost'
+    || hostname === '0.0.0.0'
+    || hostname === '::1'
+    || hostname === '[::1]'
+    || /^127(?:\.\d{1,3}){3}$/.test(hostname)
+}
+
 function urlTag(value) {
   const candidate = value.trim()
   if (/^(?:data|blob):/i.test(candidate)) return TAG.urlSafe
   try {
     const absolute = new URL(candidate)
     if (absolute.protocol === 'http:' || absolute.protocol === 'https:') {
-      const gatewayHost = absolute.hostname === 'localhost'
-        || absolute.hostname === '0.0.0.0'
-        || absolute.hostname === '::1'
-        || /^127(?:\.\d{1,3}){3}$/.test(absolute.hostname)
-      return gatewayHost && /^\/api(?:\/|$)/.test(absolute.pathname)
+      return isGatewayHost(absolute.hostname) && /^\/api(?:\/|$)/.test(absolute.pathname)
         ? TAG.urlApi
         : TAG.urlSafe
     }
@@ -103,6 +107,11 @@ function urlTag(value) {
   try {
     const normalized = new URL(candidate, 'https://gateway.invalid/')
     const path = normalized.pathname
+    if (normalized.hostname !== 'gateway.invalid') {
+      return isGatewayHost(normalized.hostname) && /^\/api(?:\/|$)/.test(path)
+        ? TAG.urlApi
+        : TAG.urlSafe
+    }
     if (/^\/(?:assets|static)(?:\/|$)/.test(path)) return TAG.urlSafe
     if (/^\/api(?:\/|$)/.test(path)) return TAG.urlApi
     return TAG.urlUnsafe
@@ -389,7 +398,11 @@ export function collectHttpBoundaryOperations({
         return declaration
       }
       if (
-        (ts.isVariableDeclaration(declaration) || ts.isPropertyAssignment(declaration))
+        (
+          ts.isVariableDeclaration(declaration)
+          || ts.isPropertyAssignment(declaration)
+          || ts.isPropertyDeclaration(declaration)
+        )
         && declaration.initializer
       ) {
         const found = callableForExpression(declaration.initializer, nextSeen)
@@ -452,6 +465,54 @@ export function collectHttpBoundaryOperations({
       addShapeValue(shape, '', TAG.urlDynamic)
     }
     return shape
+  }
+
+  function headerTupleSemantics(expression, seenSymbols = new Set(), seenNodes = new Set()) {
+    const current = unwrap(ts, expression)
+    const result = new Set()
+    if (seenNodes.has(current)) return result
+    const nextNodes = new Set(seenNodes).add(current)
+
+    if (ts.isArrayLiteralExpression(current)) {
+      for (const element of current.elements) {
+        if (ts.isSpreadElement(element)) {
+          mergeShape(result, headerTupleSemantics(element.expression, seenSymbols, nextNodes))
+          continue
+        }
+        const tuple = unwrap(ts, element)
+        if (!ts.isArrayLiteralExpression(tuple) || tuple.elements.length === 0) continue
+        const names = constantStrings(tuple.elements[0])
+        if (!names) continue
+        for (const name of names) {
+          const semantic = headerTag(name)
+          if (semantic) addShapeValue(result, '', semantic)
+        }
+      }
+      return result
+    }
+
+    if (ts.isConditionalExpression(current)) {
+      mergeShape(result, headerTupleSemantics(current.whenTrue, seenSymbols, nextNodes))
+      mergeShape(result, headerTupleSemantics(current.whenFalse, seenSymbols, nextNodes))
+      return result
+    }
+
+    if (!ts.isIdentifier(current)) return result
+    const symbol = canonicalSymbolAt(current) ?? rawSymbolAt(current)
+    if (!symbol || seenSymbols.has(symbol)) return result
+    const nextSymbols = new Set(seenSymbols).add(symbol)
+    for (const declaration of symbol.declarations ?? []) {
+      if (
+        (ts.isVariableDeclaration(declaration) || ts.isBindingElement(declaration))
+        && declaration.initializer
+      ) {
+        mergeShape(
+          result,
+          headerTupleSemantics(declaration.initializer, nextSymbols, nextNodes),
+        )
+      }
+    }
+    return result
   }
 
   function expressionShape(expression) {
@@ -540,7 +601,10 @@ export function collectHttpBoundaryOperations({
       const constructorTags = tagsInShape(expressionShape(current.expression))
       if (constructorTags.has(TAG.headersCtor)) {
         addShapeValue(result, '', TAG.headerContainer)
-        if (current.arguments?.[0]) mergeShape(result, expressionShape(current.arguments[0]))
+        if (current.arguments?.[0]) {
+          mergeShape(result, expressionShape(current.arguments[0]))
+          mergeShape(result, headerTupleSemantics(current.arguments[0]))
+        }
       }
       if (constructorTags.has(TAG.requestCtor)) {
         addShapeValue(result, '', TAG.request)
