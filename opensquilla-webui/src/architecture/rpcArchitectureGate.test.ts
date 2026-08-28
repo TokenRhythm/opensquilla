@@ -19,6 +19,8 @@ import {
   privateGatewayTransportImportViolation,
   resolveSourceImport,
 } from '../../scripts/lib/rpc-architecture-imports.mjs'
+import { collectHttpBoundaryOperations } from '../../scripts/lib/http-architecture-provenance.mjs'
+import { exactTransportDebtFailures } from '../../scripts/lib/exact-transport-debt.mjs'
 import { collectRpcTransportOperations } from '../../scripts/lib/rpc-symbol-provenance.mjs'
 
 const fixtureRoot = resolve('rpc-architecture-fixture')
@@ -226,6 +228,140 @@ describe('private Gateway transport import fence', () => {
       importer: 'src/views/SessionsView.js',
       specifier: '@/adapters/gateway/privateTransports',
     })).not.toBeNull()
+  })
+
+  it.each([
+    'src/views/SessionsView.vue',
+    'src/composables/useApprovals.ts',
+    'src/modules/sessionDirectory.ts',
+    'src/stores/app.ts',
+    'src/adapters/platform/nativeHost.ts',
+  ])('keeps the private HTTP transport out of %s', (importer) => {
+    expect(privateGatewayTransportImportViolation({
+      root: fixtureRoot,
+      importer,
+      specifier: '@/adapters/gateway/privateHttpTransport',
+    })).toBe(
+      `${importer}: private Gateway HTTP transport may be imported only by a Gateway Adapter, composition root, or test.`,
+    )
+  })
+
+  it.each([
+    'src/main.ts',
+    'src/adapters/gateway/approvalCenterV4.ts',
+    'src/adapters/gateway/privateHttpTransport.test.ts',
+  ])('allows the HTTP seam at %s', (importer) => {
+    expect(privateGatewayTransportImportViolation({
+      root: fixtureRoot,
+      importer,
+      specifier: '@/adapters/gateway/privateHttpTransport',
+    })).toBeNull()
+  })
+
+  it('does not block a similarly named HTTP helper', () => {
+    expect(privateGatewayTransportImportViolation({
+      root: fixtureRoot,
+      importer: 'src/views/SessionsView.vue',
+      specifier: '@/adapters/gateway/privateHttpTransportFixture',
+    })).toBeNull()
+  })
+
+  it('forbids re-exporting the private HTTP transport from the composition root', () => {
+    expect(boundaryReexportViolation({
+      root: fixtureRoot,
+      importer: 'src/main.ts',
+      specifier: '@/adapters/gateway/privateHttpTransport',
+    })).toBe(
+      'src/main.ts: private Gateway transport modules must not be re-exported through a barrel.',
+    )
+  })
+})
+
+describe('Gateway HTTP boundary debt syntax', () => {
+  it('tracks API path fragments, auth storage, and both protected headers', () => {
+    const operations = collectHttpBoundaryOperations({
+      ts,
+      sources: provenanceSources({
+        'src/consumer.ts': `
+          const endpoint = \`/api/v1/sessions/\${sessionId}\`
+          const token = sessionStorage.getItem('opensquilla.wsToken')
+          const headers = { Authorization: \`Bearer \${token}\` }
+          headers['x-opensquilla-session-key'] = sessionId
+          void fetch(endpoint, { headers })
+        `,
+      }),
+    })
+
+    expect(operations).toEqual([
+      { rel: 'src/consumer.ts', kind: 'httpApiEndpoint' },
+      { rel: 'src/consumer.ts', kind: 'httpAuthToken' },
+      { rel: 'src/consumer.ts', kind: 'httpAuthorizationHeader' },
+      { rel: 'src/consumer.ts', kind: 'httpSessionKeyHeader' },
+    ])
+  })
+
+  it('tracks Headers method syntax and case-insensitive names once each', () => {
+    const operations = collectHttpBoundaryOperations({
+      ts,
+      sources: provenanceSources({
+        'src/consumer.ts': `
+          const headers = new Headers()
+          headers.set('authorization', token)
+          headers.append('X-OpenSquilla-Session-Key', sessionId)
+        `,
+      }),
+    })
+
+    expect(operations).toEqual([
+      { rel: 'src/consumer.ts', kind: 'httpAuthorizationHeader' },
+      { rel: 'src/consumer.ts', kind: 'httpSessionKeyHeader' },
+    ])
+  })
+
+  it('does not count asset, data, blob, external fetches, comments, or regexes', () => {
+    const operations = collectHttpBoundaryOperations({
+      ts,
+      sources: provenanceSources({
+        'src/assets.ts': `
+          // fetch('/api/comment-only')
+          const apiMatcher = /^\\/api\\/v1\\//
+          void apiMatcher
+          void fetch('/assets/logo.svg')
+          void fetch('data:image/png;base64,AA==')
+          void fetch('blob:https://control.example/id')
+          void fetch('https://cdn.example/api/image.png')
+        `,
+      }),
+    })
+
+    expect(operations).toEqual([])
+  })
+
+  it('does not treat similarly named application fields as protected headers', () => {
+    const operations = collectHttpBoundaryOperations({
+      ts,
+      sources: provenanceSources({
+        'src/domain.ts': `
+          const authorizationState = 'ready'
+          const sessionKeyHeaderVisible = true
+          void authorizationState
+          void sessionKeyHeaderVisible
+        `,
+      }),
+    })
+
+    expect(operations).toEqual([])
+  })
+
+  it('rejects both unapproved growth and stale HTTP debt entries', () => {
+    expect(exactTransportDebtFailures(
+      'httpApiEndpoint',
+      new Map([['src/old.ts', 1]]),
+      new Map([['src/new.ts', 1]]),
+    )).toEqual([
+      'src/new.ts: unexpected raw transport httpApiEndpoint (1); add a domain Adapter instead.',
+      'src/old.ts: stale raw transport httpApiEndpoint debt (1); remove it from its lane file.',
+    ])
   })
 })
 

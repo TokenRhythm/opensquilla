@@ -2,6 +2,7 @@ export const lane = 'platform'
 
 export const debt = {
   'src/components/ProjectWorkspacePickerDialog.vue': { call: 3 },
+  'src/components/settings/SetupConnectionPanel.vue': { httpAuthToken: 1 },
   'src/components/settings/DataMigrationPanel.vue': {
     call: 2,
     supportsMethod: 2,

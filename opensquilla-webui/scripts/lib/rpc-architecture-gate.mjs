@@ -15,6 +15,11 @@ import {
   collectRpcTransportOperations,
   TRACKED_RPC_MEMBERS,
 } from './rpc-symbol-provenance.mjs'
+import {
+  collectHttpBoundaryOperations,
+  TRACKED_HTTP_KINDS,
+} from './http-architecture-provenance.mjs'
+import { exactTransportDebtFailures } from './exact-transport-debt.mjs'
 import { transportDebtLanes } from '../rpc-debt/index.mjs'
 
 const root = fileURLToPath(new URL('../..', import.meta.url))
@@ -23,7 +28,10 @@ const require = createRequire(import.meta.url)
 const ts = require('typescript')
 const failures = []
 const trackedKinds = new Set(
-  TRACKED_RPC_MEMBERS.flatMap(member => [member, `${member}Reference`]),
+  [
+    ...TRACKED_RPC_MEMBERS.flatMap(member => [member, `${member}Reference`]),
+    ...TRACKED_HTTP_KINDS,
+  ],
 )
 
 const normalized = path => path.replace(/\\/g, '/')
@@ -143,25 +151,20 @@ for (const operation of collectRpcTransportOperations({
   if (isGatewayAdapter(operation.rel) || isTransportImplementation(operation.rel)) continue
   increment(actualByKind.get(operation.kind), operation.rel)
 }
-
-function compareExactLedger(kind, expected, actual) {
-  for (const [rel, count] of actual) {
-    const approved = expected.get(rel)
-    if (approved === undefined) {
-      failures.push(`${rel}: unexpected raw RPC ${kind} (${count}); add a domain Adapter instead.`)
-    } else if (approved !== count) {
-      failures.push(`${rel}: raw RPC ${kind} count is ${count}; lane debt requires ${approved}.`)
-    }
-  }
-  for (const [rel, count] of expected) {
-    if (!actual.has(rel)) {
-      failures.push(`${rel}: stale raw RPC ${kind} debt (${count}); remove it from its lane file.`)
-    }
-  }
+for (const operation of collectHttpBoundaryOperations({
+  ts,
+  sources: productionSources,
+})) {
+  if (isGatewayAdapter(operation.rel) || isTransportImplementation(operation.rel)) continue
+  increment(actualByKind.get(operation.kind), operation.rel)
 }
 
 for (const kind of trackedKinds) {
-  compareExactLedger(kind, expectedByKind.get(kind), actualByKind.get(kind))
+  failures.push(...exactTransportDebtFailures(
+    kind,
+    expectedByKind.get(kind),
+    actualByKind.get(kind),
+  ))
 }
 
 const debtByLane = new Map(transportDebtLanes.map(({ lane }) => [lane, 0]))
@@ -183,4 +186,4 @@ const total = [...actualByKind.values()]
 const laneSummary = [...debtByLane]
   .map(([lane, count]) => `${lane}=${count}`)
   .join(', ')
-console.log(`RPC architecture guard passed (${total} exact debt operations; ${laneSummary}).`)
+console.log(`Transport architecture guard passed (${total} exact debt operations; ${laneSummary}).`)

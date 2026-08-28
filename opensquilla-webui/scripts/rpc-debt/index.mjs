@@ -13,8 +13,7 @@ export const transportDebtLanes = [
   { lane: independentLane, debt: independentDebt },
 ]
 
-// The review plan's “73 raw event registrations” was a textual estimate.
-// This pinned ledger contains the 70 production `.on` operations whose
-// symbols are proven to originate at the RpcStore/RpcClient boundary. Tests,
-// generated code, Gateway Adapters, and the transport Implementation itself
-// are intentionally outside the migration-debt population.
+// This pinned ledger owns both RPC symbol debt and authored Gateway HTTP
+// boundary details. Static assets, data/blob URLs, external resources, tests,
+// generated code, Gateway Adapters, and transport Implementations are outside
+// the migration-debt population.

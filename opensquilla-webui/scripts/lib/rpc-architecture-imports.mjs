@@ -12,6 +12,10 @@ function isGatewayAdapter(importer) {
   return importer.startsWith('src/adapters/gateway/')
 }
 
+function isCompositionRoot(importer) {
+  return importer === 'src/main.ts'
+}
+
 function isGeneratedContract(importer) {
   return importer.startsWith('src/contracts/generated/')
 }
@@ -51,13 +55,21 @@ export function generatedContractImportViolation({ root, importer, specifier }) 
 export function privateGatewayTransportImportViolation({ root, importer, specifier }) {
   const normalizedImporter = normalized(importer)
   const target = resolveSourceImport(root, normalizedImporter, specifier)
-  const transportModule = resolve(root, 'src/adapters/gateway/privateTransports')
   const normalizedTarget = target?.replace(/\.(?:[cm]?[jt]s)$/, '')
-  if (!normalizedTarget || normalizedTarget !== transportModule) return null
+  const rpcTransportModule = resolve(root, 'src/adapters/gateway/privateTransports')
+  const httpTransportModule = resolve(root, 'src/adapters/gateway/privateHttpTransport')
+  if (
+    !normalizedTarget
+    || (normalizedTarget !== rpcTransportModule && normalizedTarget !== httpTransportModule)
+  ) return null
   if (
     isGatewayAdapter(normalizedImporter)
     || isTestFile(normalizedImporter)
+    || (normalizedTarget === httpTransportModule && isCompositionRoot(normalizedImporter))
   ) return null
+  if (normalizedTarget === httpTransportModule) {
+    return `${normalizedImporter}: private Gateway HTTP transport may be imported only by a Gateway Adapter, composition root, or test.`
+  }
   return `${normalizedImporter}: private Gateway transports may be imported only by a Gateway Adapter or test.`
 }
 
@@ -67,9 +79,12 @@ export function boundaryModuleKind({ root, importer, specifier }) {
   if (!target) return null
   const generatedRoot = resolve(root, 'src/contracts/generated')
   if (isWithin(generatedRoot, target)) return 'generated Contract'
-  const transportModule = resolve(root, 'src/adapters/gateway/privateTransports')
   const normalizedTarget = target.replace(/\.(?:[cm]?[jt]s)$/, '')
-  if (normalizedTarget === transportModule) return 'private Gateway transport'
+  const transportModules = new Set([
+    resolve(root, 'src/adapters/gateway/privateTransports'),
+    resolve(root, 'src/adapters/gateway/privateHttpTransport'),
+  ])
+  if (transportModules.has(normalizedTarget)) return 'private Gateway transport'
   return null
 }
 

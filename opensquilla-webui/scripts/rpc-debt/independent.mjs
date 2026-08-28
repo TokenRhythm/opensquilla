@@ -1,8 +1,19 @@
 export const lane = 'independent'
 
 export const debt = {
-  'src/components/SupportDiagnosticsMenu.vue': { call: 1, waitForConnection: 1 },
-  'src/components/workbench/AppWorkbench.vue': { on: 2 },
+  'src/components/SupportDiagnosticsMenu.vue': {
+    call: 1,
+    waitForConnection: 1,
+    httpApiEndpoint: 1,
+    httpAuthToken: 1,
+    httpAuthorizationHeader: 1,
+  },
+  'src/components/UpdateBanner.vue': {
+    httpApiEndpoint: 1,
+    httpAuthToken: 1,
+    httpAuthorizationHeader: 1,
+  },
+  'src/components/workbench/AppWorkbench.vue': { on: 2, httpAuthToken: 1 },
   'src/composables/chat/useSessionArtifacts.ts': {
     call: 1,
     markMethodUnavailable: 1,
@@ -26,10 +37,12 @@ export const debt = {
   'src/views/LogsView.vue': { call: 2, waitForConnection: 1 },
   'src/views/OverviewView.vue': { call: 3, waitForConnection: 2 },
   'src/views/SkillsView.vue': { call: 1, waitForConnection: 1 },
+  'src/utils/workbench/artifactPreviewLease.ts': { httpApiEndpoint: 2 },
   'src/workbench/artifactDocumentProvider.ts': {
     call: 1,
     markMethodUnavailable: 1,
     supportsMethod: 1,
+    httpApiEndpoint: 1,
   },
   'src/workbench/artifactPromptAnnotationProvider.ts': {
     call: 1,
