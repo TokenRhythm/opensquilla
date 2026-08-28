@@ -23,7 +23,7 @@ ResultT = TypeVar("ResultT")
 Implementation = Callable[[Any, ContextT], Awaitable[ResultT]]
 RegisteredHandler = Callable[[Any, ContextT], Coroutine[Any, Any, ResultT]]
 ParamsObserver = Callable[[Any], tuple[dict[str, Any], ...]]
-ResultValidator = Callable[[Any], None]
+ResultValidator = Callable[[ResultT], object]
 ErrorFactory = Callable[[str, str], Exception]
 GuestAllowedChecker = Callable[[str], bool]
 
@@ -64,7 +64,7 @@ class MethodRegistry[ContextT](Protocol):
 class GatewayContractBinding[ResultT]:
     descriptor: GatewayMethodDescriptor
     observe_params: ParamsObserver
-    validate_result: ResultValidator
+    validate_result: ResultValidator[ResultT]
     result_validation_errors: tuple[type[Exception], ...]
     response_error_message: str
     request_mismatch_event: str
@@ -74,6 +74,12 @@ class GatewayContractBinding[ResultT]:
     def __post_init__(self) -> None:
         if not self.result_validation_errors:
             raise ValueError("result_validation_errors must be explicit")
+        if any(
+            not isinstance(error_type, type)
+            or not issubclass(error_type, Exception)
+            for error_type in self.result_validation_errors
+        ):
+            raise TypeError("result_validation_errors must contain Exception subclasses")
         declared_error_codes: set[str] = set()
         for error in self.descriptor.errors:
             if not isinstance(error, dict):

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from typing import Any, cast
+from typing import Any
 
 from opensquilla.contracts.adapters.sessions_list_contract import (
     SESSIONS_LIST_METHOD,
@@ -27,7 +27,7 @@ _SESSIONS_LIST_DESCRIPTOR = GATEWAY_METHOD_CONTRACTS[SESSIONS_LIST_METHOD]
 _SESSIONS_LIST_BINDING: GatewayContractBinding[dict[str, Any]] = GatewayContractBinding(
     descriptor=_SESSIONS_LIST_DESCRIPTOR,
     observe_params=sessions_list_params_contract_errors,
-    validate_result=cast(Callable[[Any], None], validate_sessions_list_result),
+    validate_result=validate_sessions_list_result,
     result_validation_errors=(SessionsListContractError,),
     response_error_message="sessions.list response violated its v4 contract",
     request_mismatch_event="sessions.list.request_contract_mismatch",

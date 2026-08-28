@@ -48,12 +48,13 @@ def _binding(
     validate_result: Any,
     descriptor: Any | None = None,
     response_error_code: str = "INTERNAL_ERROR",
+    result_validation_errors: Any = (_ContractViolationError,),
 ) -> GatewayContractBinding[Any]:
     return GatewayContractBinding(
         descriptor=descriptor or _descriptor(),
         observe_params=observe_params,
         validate_result=validate_result,
-        result_validation_errors=(_ContractViolationError,),
+        result_validation_errors=result_validation_errors,
         response_error_message="example.query response violated its v4 contract",
         request_mismatch_event="example.query.request_contract_mismatch",
         response_violation_event="example.query.contract_violation",
@@ -246,6 +247,19 @@ def test_response_error_code_must_be_declared_by_generated_descriptor() -> None:
             descriptor=_descriptor(errors=({"code": "UNAVAILABLE"},)),
             observe_params=lambda _params: (),
             validate_result=lambda _result: None,
+        )
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [object, BaseException, "not-a-type"],
+)
+def test_result_validation_errors_require_exception_subclasses(error_type: Any) -> None:
+    with pytest.raises(TypeError, match="must contain Exception subclasses"):
+        _binding(
+            observe_params=lambda _params: (),
+            validate_result=lambda _result: None,
+            result_validation_errors=(error_type,),
         )
 
 
