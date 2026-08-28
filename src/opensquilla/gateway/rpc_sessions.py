@@ -64,6 +64,7 @@ from opensquilla.gateway.compaction_target import (
     validate_gateway_session_deployment_override,
 )
 from opensquilla.gateway.config import effective_agent_stream_idle_timeout_seconds
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.input_normalization import (
     infer_normalized_input_from_attachments,
     materialize_generated_text_attachments,
@@ -2899,6 +2900,7 @@ _handle_sessions_list_contract = register_sessions_list_contract(
     _d,
     _handle_sessions_list,
     internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
 )
 
 

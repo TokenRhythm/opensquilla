@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, cast
 
 from opensquilla.contracts.adapters.sessions_list_contract import (
     SESSIONS_LIST_METHOD,
@@ -16,6 +16,7 @@ from opensquilla.contracts.generated.v4.gateway_contract_registry import (
 )
 from opensquilla.gateway.adapters.contract_method import (
     GatewayContractBinding,
+    GuestAllowedChecker,
     MethodRegistry,
     register_gateway_contract_method,
 )
@@ -23,10 +24,10 @@ from opensquilla.gateway.adapters.contract_method import (
 ErrorFactory = Callable[[str, str], Exception]
 
 _SESSIONS_LIST_DESCRIPTOR = GATEWAY_METHOD_CONTRACTS[SESSIONS_LIST_METHOD]
-_SESSIONS_LIST_BINDING = GatewayContractBinding(
+_SESSIONS_LIST_BINDING: GatewayContractBinding[dict[str, Any]] = GatewayContractBinding(
     descriptor=_SESSIONS_LIST_DESCRIPTOR,
     observe_params=sessions_list_params_contract_errors,
-    validate_result=validate_sessions_list_result,
+    validate_result=cast(Callable[[Any], None], validate_sessions_list_result),
     result_validation_errors=(SessionsListContractError,),
     response_error_message="sessions.list response violated its v4 contract",
     request_mismatch_event="sessions.list.request_contract_mismatch",
@@ -39,10 +40,12 @@ def register_sessions_list_contract[ContextT](
     implementation: Callable[[Any, ContextT], Awaitable[dict[str, Any]]],
     *,
     internal_error: ErrorFactory,
+    guest_allowed_checker: GuestAllowedChecker,
 ) -> Callable[[Any, ContextT], Awaitable[dict[str, Any]]]:
     return register_gateway_contract_method(
         registry,
         _SESSIONS_LIST_BINDING,
         implementation,
         internal_error=internal_error,
+        guest_allowed_checker=guest_allowed_checker,
     )

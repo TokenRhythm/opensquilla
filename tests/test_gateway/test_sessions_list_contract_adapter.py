@@ -28,6 +28,7 @@ from opensquilla.gateway.adapters.sessions_list_contract import (
 from opensquilla.gateway.app import create_gateway_app
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, RpcRegistry, get_dispatcher
 from opensquilla.gateway.rpc_sessions import (
     _handle_sessions_list,
@@ -480,6 +481,7 @@ async def test_gateway_adapter_delegates_once_and_preserves_result_identity() ->
         registry,
         implementation,
         internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
     )
     params = {"limit": "5", "future": True}
     result = await handler(params, cast(RpcContext, object()))
@@ -503,6 +505,7 @@ async def test_gateway_adapter_observes_request_drift_but_preserves_legacy_behav
         registry,
         implementation,
         internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
     )
     params = {"limit": {"legacy": True}}
     with structlog.testing.capture_logs() as logs:
@@ -529,6 +532,7 @@ async def test_gateway_adapter_maps_invalid_implementation_result() -> None:
         registry,
         implementation,
         internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
     )
 
     with pytest.raises(RpcHandlerError) as error:
