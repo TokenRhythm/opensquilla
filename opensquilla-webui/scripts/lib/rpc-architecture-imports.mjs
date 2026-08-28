@@ -548,6 +548,7 @@ export function collectBoundaryArchitectureViolations({
       }
       if (!privateBoundaryModule) {
         for (const kind of transitiveReexportBoundaryKinds(rel, statement)) {
+          if (kind === 'RPC store factory') continue
           if (kind === 'generated Contract' && generated) continue
           failures.push(`${rel}: ${kind} modules must not be re-exported through a barrel.`)
         }

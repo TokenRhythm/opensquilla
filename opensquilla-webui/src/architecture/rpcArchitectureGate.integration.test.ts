@@ -270,6 +270,16 @@ describe('transport architecture gate ledger integration', () => {
     )
   })
 
+  it('allows ordinary store barrels to re-export the RPC factory', () => {
+    const root = fixture({
+      'src/stores/rpc.ts': 'export function useRpcStore() { return {} }',
+      'src/stores/index.ts': `export * from './rpc'`,
+    })
+    expect(evaluateRpcArchitectureGate({ root, debtLanes: [] }).failures).not.toContain(
+      'src/stores/index.ts: RPC store factory modules must not be re-exported through a barrel.',
+    )
+  })
+
   it('fences private symbols returned from exported class expressions', () => {
     const root = fixture({
       'src/adapters/gateway/privateTransports.ts': 'export const hidden = 1',
