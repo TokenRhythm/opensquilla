@@ -835,38 +835,3 @@ export interface MetaRunCompletedPayload extends SessionEventPayload {
   recovered_steps?: string[]
   skipped_steps?: string[]
 }
-
-export interface RpcEventMap {
-  'session.event.answer_generation_reset': AnswerGenerationResetPayload
-  'session.event.text_delta': TextDeltaPayload
-  'session.event.tool_use_start': ToolUsePayload
-  'session.event.tool_use_delta': ToolDeltaPayload
-  'session.event.tool_use_end': ToolEndPayload
-  'session.event.tool_result': ToolResultPayload
-  'session.event.artifact': ArtifactPayload
-  'session.event.artifact_state': ArtifactStateEventPayload
-  'session.event.router_decision': RouterDecisionPayload
-  'session.event.ensemble_progress': EnsembleProgressPayload
-  'session.event.router_control_replay': SessionEventPayload
-  'session.event.state_change': SessionEventPayload
-  'session.event.run_heartbeat': SessionEventPayload
-  'session.event.provider_activity': ProviderActivityPayload
-  'session.event.compaction': CompactionPayload
-  'session.event.goal': SessionEventPayload
-  'session.event.warning': SessionEventPayload
-  'session.event.input_disposition': InputDispositionPayload
-  'session.epoch_changed': SessionEventPayload
-  'sessions.changed': SessionEventPayload
-  'task.queued': SessionEventPayload
-  'task.running': SessionEventPayload
-  'session.event.task_group.waiting': SessionEventPayload
-  'session.event.task_group.synthesizing': SessionEventPayload
-  'session.event.task_group.done': SessionEventPayload
-  'session.event.task_group.failed': SessionEventPayload
-  'session.event.meta_preflight': MetaPreflightPayload
-  'session.event.meta_run_announced': MetaRunAnnouncedPayload
-  'session.event.meta_step_state': MetaStepStatePayload
-  'session.event.meta_run_completed': MetaRunCompletedPayload
-  'session.event.done': SessionDonePayload
-  'session.event.turn_committed': TurnCommittedPayload
-}
