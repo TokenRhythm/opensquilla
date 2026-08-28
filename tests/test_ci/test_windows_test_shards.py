@@ -105,6 +105,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_gateway/test_channel_reply_delivery_guard.py",
     "tests/test_gateway/test_channel_session_and_busy_policy.py",
     "tests/test_gateway/test_capability_runtime.py",
+    "tests/test_gateway/test_contract_method_adapter.py",
     "tests/test_gateway/test_meta_setup_launch_e2e.py",
     "tests/test_gateway/test_rpc_meta_setup.py",
     "tests/test_artifact_validation.py",

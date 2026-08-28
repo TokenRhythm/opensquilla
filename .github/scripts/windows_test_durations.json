@@ -537,6 +537,7 @@
     "tests/test_gateway/test_config_version.py": 1.372,
     "tests/test_gateway/test_config_ws_writer_queue.py": 0.448,
     "tests/test_gateway/test_context_overflow.py": 1.011,
+    "tests/test_gateway/test_contract_method_adapter.py": 0.01,
     "tests/test_gateway/test_control_ui_locale.py": 0.166,
     "tests/test_gateway/test_cron_result_payload.py": 0.01,
     "tests/test_gateway/test_debug_file_logging.py": 0.278,
