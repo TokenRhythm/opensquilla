@@ -168,7 +168,9 @@ export function evaluateRpcArchitectureGate({
   }
   for (const operation of collectHttpBoundaryOperations({
     ts,
+    root,
     sources: productionSources,
+    analysis: sourceAnalysis,
   })) {
     if (isGatewayAdapter(operation.rel) || isRpcTransportImplementation(operation.rel)) continue
     increment(actualByKind.get(operation.kind), operation.rel)

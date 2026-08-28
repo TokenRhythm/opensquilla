@@ -1,4 +1,5 @@
 export type HttpDebtKind =
+  | 'httpRequest'
   | 'httpApiEndpoint'
   | 'httpAuthToken'
   | 'httpAuthorizationHeader'
@@ -13,5 +14,7 @@ export interface HttpBoundarySource {
 
 export function collectHttpBoundaryOperations(input: {
   ts: any
+  root?: string
   sources: readonly HttpBoundarySource[]
+  analysis?: any
 }): Array<{ rel: string; kind: HttpDebtKind }>

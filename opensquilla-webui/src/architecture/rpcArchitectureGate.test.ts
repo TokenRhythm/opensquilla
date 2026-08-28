@@ -291,6 +291,7 @@ describe('Gateway HTTP boundary debt syntax', () => {
     })
 
     expect(operations).toEqual([
+      { rel: 'src/consumer.ts', kind: 'httpRequest' },
       { rel: 'src/consumer.ts', kind: 'httpApiEndpoint' },
       { rel: 'src/consumer.ts', kind: 'httpAuthToken' },
       { rel: 'src/consumer.ts', kind: 'httpAuthorizationHeader' },
@@ -306,11 +307,14 @@ describe('Gateway HTTP boundary debt syntax', () => {
           const headers = new Headers()
           headers.set('authorization', token)
           headers.append('X-OpenSquilla-Session-Key', sessionId)
+          void fetch('/api/value', { headers })
         `,
       }),
     })
 
     expect(operations).toEqual([
+      { rel: 'src/consumer.ts', kind: 'httpRequest' },
+      { rel: 'src/consumer.ts', kind: 'httpApiEndpoint' },
       { rel: 'src/consumer.ts', kind: 'httpAuthorizationHeader' },
       { rel: 'src/consumer.ts', kind: 'httpSessionKeyHeader' },
     ])
@@ -473,6 +477,156 @@ function provenanceSources(entries: Record<string, string>) {
     ),
   }))
 }
+
+describe('HTTP symbol provenance', () => {
+  it('follows global Fetch through objects, nested destructuring, and an imported wrapper', () => {
+    const operations = collectHttpBoundaryOperations({
+      ts,
+      root: fixtureRoot,
+      sources: provenanceSources({
+        'src/wrapper.ts': `
+          export function invoke(client: typeof fetch, endpoint: string, init: RequestInit) {
+            return client(endpoint, init)
+          }
+        `,
+        'src/consumer.ts': `
+          import { invoke } from './wrapper'
+          const platform = { network: { fetch: globalThis.fetch } }
+          const { network: { fetch: request } } = platform
+          const AUTH = 'Authorization'
+          const headers = new Headers()
+          headers.set(AUTH, sessionStorage.getItem('opensquilla.wsToken'))
+          headers.set('x-opensquilla-session-key', 'session-a')
+          void invoke(request, '/api/items', { headers })
+        `,
+      }),
+    })
+
+    expect(operations).toEqual([
+      { rel: 'src/wrapper.ts', kind: 'httpRequest' },
+      { rel: 'src/wrapper.ts', kind: 'httpApiEndpoint' },
+      { rel: 'src/wrapper.ts', kind: 'httpAuthToken' },
+      { rel: 'src/wrapper.ts', kind: 'httpAuthorizationHeader' },
+      { rel: 'src/wrapper.ts', kind: 'httpSessionKeyHeader' },
+    ])
+  })
+
+  it('counts a Request-to-fetch pipeline once and follows cyclic RequestInit aliases', () => {
+    const operations = collectHttpBoundaryOperations({
+      ts,
+      root: fixtureRoot,
+      sources: provenanceSources({
+        'src/request.ts': `
+          const NativeRequest = globalThis.Request
+          const headers = new globalThis.Headers()
+          headers.set('Authorization', sessionStorage.getItem('opensquilla.wsToken'))
+          let left: RequestInit = {}
+          let right: RequestInit = left
+          left = right
+          right = { headers }
+          const request = new NativeRequest('/api/items', left)
+          void globalThis.fetch(request)
+        `,
+      }),
+    })
+
+    expect(operations).toEqual([
+      { rel: 'src/request.ts', kind: 'httpRequest' },
+      { rel: 'src/request.ts', kind: 'httpApiEndpoint' },
+      { rel: 'src/request.ts', kind: 'httpAuthToken' },
+      { rel: 'src/request.ts', kind: 'httpAuthorizationHeader' },
+    ])
+  })
+
+  it('uses lexical symbol identity instead of names from another scope', () => {
+    const operations = collectHttpBoundaryOperations({
+      ts,
+      root: fixtureRoot,
+      sources: provenanceSources({
+        'src/shadowed.ts': `
+          function unrelated(fetch: (value: string) => void, globalThis: { fetch(value: string): void }) {
+            fetch('/api/not-network')
+            globalThis.fetch('/api/not-network-either')
+          }
+          const headers = { Authorization: 'not-attached' }
+          void headers
+          void unrelated
+          void globalThis.fetch('/api/real')
+        `,
+      }),
+    })
+
+    expect(operations).toEqual([
+      { rel: 'src/shadowed.ts', kind: 'httpRequest' },
+      { rel: 'src/shadowed.ts', kind: 'httpApiEndpoint' },
+    ])
+  })
+
+  it('terminates recursive wrappers and counts their authored Fetch site once', () => {
+    const operations = collectHttpBoundaryOperations({
+      ts,
+      root: fixtureRoot,
+      sources: provenanceSources({
+        'src/recursive.ts': `
+          function request(url: string): Promise<Response> {
+            if (!url) return request(url)
+            return fetch(url)
+          }
+          void request('/api/value')
+        `,
+      }),
+    })
+
+    expect(operations).toEqual([
+      { rel: 'src/recursive.ts', kind: 'httpRequest' },
+      { rel: 'src/recursive.ts', kind: 'httpApiEndpoint' },
+    ])
+  })
+
+  it('normalizes traversal, keeps dynamic targets conservative, and exempts proven resources', () => {
+    const operations = collectHttpBoundaryOperations({
+      ts,
+      root: fixtureRoot,
+      sources: provenanceSources({
+        'src/targets.ts': `
+          void fetch('/static/logo.svg')
+          void fetch('/assets/theme.css')
+          void fetch('data:image/png;base64,AA==')
+          void fetch('blob:https://control.example/id')
+          void fetch('https://cdn.example/api/image.png')
+          void fetch('/static/../api/private')
+          void fetch('/static/%2e%2e/api/private')
+          declare const runtimeTarget: string
+          void fetch(runtimeTarget)
+        `,
+      }),
+    })
+
+    expect(operations).toEqual([
+      { rel: 'src/targets.ts', kind: 'httpRequest' },
+      { rel: 'src/targets.ts', kind: 'httpApiEndpoint' },
+      { rel: 'src/targets.ts', kind: 'httpRequest' },
+      { rel: 'src/targets.ts', kind: 'httpApiEndpoint' },
+      { rel: 'src/targets.ts', kind: 'httpRequest' },
+      { rel: 'src/targets.ts', kind: 'httpApiEndpoint' },
+    ])
+  })
+
+  it('does not count Request construction or detached header data without a network call', () => {
+    const operations = collectHttpBoundaryOperations({
+      ts,
+      root: fixtureRoot,
+      sources: provenanceSources({
+        'src/detached.ts': `
+          const headers = { Authorization: sessionStorage.getItem('opensquilla.wsToken') }
+          const request = new Request('/api/items', { headers })
+          void request
+        `,
+      }),
+    })
+    expect(operations).toEqual([])
+  })
+})
 
 describe('RPC import and symbol provenance', () => {
   it('follows renamed factories and store aliases through a barrel', () => {
