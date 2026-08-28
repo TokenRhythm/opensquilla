@@ -227,6 +227,27 @@ function managedBinaryStream(
   lifecycle: ResponseBodyLifecycle,
 ): ReadableStream<Uint8Array> {
   const reader = source.getReader()
+  let readerReleased = false
+  let readerCancelPromise: Promise<void> | undefined
+  function releaseReader(): void {
+    if (readerReleased) return
+    readerReleased = true
+    reader.releaseLock()
+  }
+  async function cancelReader(reason: unknown): Promise<void> {
+    if (!readerCancelPromise) {
+      readerCancelPromise = reader.cancel(reason).then(
+        () => {
+          releaseReader()
+        },
+        cause => {
+          releaseReader()
+          throw cause
+        },
+      )
+    }
+    return readerCancelPromise
+  }
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
@@ -235,20 +256,31 @@ function managedBinaryStream(
         lifecycle.assertActive()
         if (next.done) {
           controller.close()
+          releaseReader()
           lifecycle.release()
         } else {
           controller.enqueue(next.value)
         }
       } catch (cause) {
-        controller.error(
-          cause instanceof HttpTransportError ? cause : lifecycle.transportError(cause),
-        )
+        const error = cause instanceof HttpTransportError
+          ? cause
+          : lifecycle.transportError(cause)
+        controller.error(error)
+        try {
+          await cancelReader(error)
+        } catch {
+          // The stream is already being failed; preserve the stable transport
+          // error even if source cleanup rejects.
+        }
         lifecycle.release()
       }
     },
     async cancel(reason) {
       try {
-        await reader.cancel(reason)
+        await cancelReader(reason)
+      } catch (cause) {
+        if (cause instanceof HttpTransportError) throw cause
+        throw lifecycle.transportError(cause)
       } finally {
         lifecycle.release()
       }
@@ -256,32 +288,61 @@ function managedBinaryStream(
   })
 }
 
-function binaryResponse(response: Response, lifecycle: ResponseBodyLifecycle): HttpBinaryResponse {
+function binaryResponse(initialResponse: Response, lifecycle: ResponseBodyLifecycle): HttpBinaryResponse {
+  let response: Response | null = initialResponse
+  const status = response.status
   const contentType = response.headers.get('content-type')?.trim() || undefined
   const filename = binaryFilename(response.headers.get('content-disposition'))
   const contentLength = binaryContentLength(response.headers.get('content-length'))
   const metadata: HttpBinaryMetadata = {
-    status: response.status,
+    status,
     ...(filename ? { filename } : {}),
     ...(contentLength !== undefined ? { contentLength } : {}),
     ...(contentType ? { contentType } : {}),
   }
+  let body = response.body
+  response = null
   let consumed = false
+  function discardBody(reason: unknown, sourceOverride?: ReadableStream<Uint8Array> | null): void {
+    const source = sourceOverride === undefined ? body : sourceOverride
+    body = null
+    if (source) {
+      try {
+        void source.cancel(reason).catch(() => undefined)
+      } catch {
+        // A body that is already disturbed/closed needs no further cleanup.
+      }
+    }
+    lifecycle.release()
+  }
   function takeStream(): ReadableStream<Uint8Array> | null {
-    lifecycle.assertActive()
+    try {
+      lifecycle.assertActive()
+    } catch (cause) {
+      discardBody(cause)
+      throw cause
+    }
     if (consumed) {
       throw new HttpTransportError(
         'decode',
         'Gateway HTTP binary response has already been consumed.',
-        response.status,
+        status,
       )
     }
     consumed = true
-    if (!response.body) {
+    const source = body
+    body = null
+    if (!source) {
       lifecycle.release()
       return null
     }
-    return managedBinaryStream(response.body, lifecycle)
+    try {
+      return managedBinaryStream(source, lifecycle)
+    } catch (cause) {
+      discardBody(cause, source)
+      if (cause instanceof HttpTransportError) throw cause
+      throw lifecycle.transportError(cause)
+    }
   }
   return {
     metadata,
@@ -437,23 +498,22 @@ export function createPrivateHttpTransport(
         )
       }
 
+      const responseStatus = response.status
       try {
-        const isTimedOut = () => linkedSignal.timedOut()
-        const isAborted = () => requestOptions.signal?.aborted || linkedSignal.signal.aborted
-        const assertActive = () => {
-          if (isTimedOut()) {
-            throw new HttpTransportError('timeout', 'Gateway HTTP request timed out.')
-          }
-          if (isAborted()) {
-            throw new HttpTransportError('aborted', 'Gateway HTTP request was aborted.')
-          }
-        }
-        const decoded = await decoder.decode(response, {
+        const callerSignal = requestOptions.signal
+        const lifecycle: ResponseBodyLifecycle = {
           release: () => linkedSignal.dispose(),
-          assertActive,
+          assertActive() {
+            if (linkedSignal.timedOut()) {
+              throw new HttpTransportError('timeout', 'Gateway HTTP request timed out.')
+            }
+            if (callerSignal?.aborted || linkedSignal.signal.aborted) {
+              throw new HttpTransportError('aborted', 'Gateway HTTP request was aborted.')
+            }
+          },
           transportError(cause) {
             if (cause instanceof HttpTransportError) return cause
-            if (isTimedOut()) {
+            if (linkedSignal.timedOut()) {
               return new HttpTransportError(
                 'timeout',
                 'Gateway HTTP request timed out.',
@@ -462,7 +522,7 @@ export function createPrivateHttpTransport(
                 cause,
               )
             }
-            if (isAborted()) {
+            if (callerSignal?.aborted || linkedSignal.signal.aborted) {
               return new HttpTransportError(
                 'aborted',
                 'Gateway HTTP request was aborted.',
@@ -474,16 +534,14 @@ export function createPrivateHttpTransport(
             return new HttpTransportError(
               'network',
               'Gateway HTTP response body failed.',
-              response.status,
+              responseStatus,
               undefined,
               cause,
             )
           },
-        })
-        // A fetch implementation may resolve headers immediately while its
-        // decoder ignores AbortSignal. Re-check before publishing the value so
-        // a timeout/cancellation cannot be turned into a successful result.
-        assertActive()
+        }
+        const decoded = await decoder.decode(response, lifecycle)
+        lifecycle.assertActive()
         lifecycleTransferred = decoder.ownsBodyLifecycle === true
         return decoded
       } catch (cause) {
@@ -508,7 +566,7 @@ export function createPrivateHttpTransport(
         throw new HttpTransportError(
           'decode',
           decoder.failureMessage,
-          response.status,
+          responseStatus,
           undefined,
           cause,
         )

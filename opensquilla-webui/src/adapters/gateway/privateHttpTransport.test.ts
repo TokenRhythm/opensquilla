@@ -294,6 +294,54 @@ describe('private Gateway HTTP transport', () => {
     await assertion
   })
 
+  it('rechecks timeout after a successful decoder resolves late', async () => {
+    vi.useFakeTimers()
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      json: () => new Promise<unknown>(resolve => {
+        globalThis.setTimeout(() => resolve({ late: true }), 20)
+      }),
+    }) as Response)
+    const transport = createPrivateHttpTransport({
+      baseUrl: 'https://control.example/',
+      fetch: fetchMock,
+      defaultTimeoutMs: 10,
+    })
+
+    const decoding = transport.requestJson('/api/late-body')
+    const assertion = expect(decoding).rejects.toMatchObject({ kind: 'timeout' })
+    await vi.advanceTimersByTimeAsync(20)
+    await assertion
+  })
+
+  it('rechecks caller cancellation after a successful decoder resolves late', async () => {
+    vi.useFakeTimers()
+    const controller = new AbortController()
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      json: () => new Promise<unknown>(resolve => {
+        globalThis.setTimeout(() => resolve({ late: true }), 20)
+      }),
+    }) as Response)
+    const transport = createPrivateHttpTransport({
+      baseUrl: 'https://control.example/',
+      fetch: fetchMock,
+      defaultTimeoutMs: 0,
+    })
+
+    const decoding = transport.requestJson('/api/cancelled-body', {
+      signal: controller.signal,
+    })
+    const assertion = expect(decoding).rejects.toMatchObject({ kind: 'aborted' })
+    controller.abort('route-left')
+    await vi.advanceTimersByTimeAsync(20)
+    await assertion
+  })
+
   it('keeps timeout classification active while a binary stream is consumed', async () => {
     vi.useFakeTimers()
     const fetchMock = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => ({
@@ -330,6 +378,7 @@ describe('private Gateway HTTP transport', () => {
 
     const timedOutBinary = await transport.requestBinary('/api/buffered')
     await vi.advanceTimersByTimeAsync(5)
+    expect(() => timedOutBinary.stream()).toThrowError(HttpTransportError)
     await expect(timedOutBinary.blob()).rejects.toMatchObject({ kind: 'timeout' })
 
     const controller = new AbortController()
@@ -338,7 +387,70 @@ describe('private Gateway HTTP transport', () => {
       timeoutMs: 0,
     })
     controller.abort('route-left')
+    expect(() => abortedBinary.stream()).toThrowError(HttpTransportError)
     await expect(abortedBinary.blob()).rejects.toMatchObject({ kind: 'aborted' })
+  })
+
+  it('releases the underlying binary reader after end-of-stream', async () => {
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('bytes'))
+        controller.close()
+      },
+    })
+    const transport = createPrivateHttpTransport({
+      baseUrl: 'https://control.example/',
+      fetch: vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        body: source,
+      }) as Response),
+    })
+
+    const binary = await transport.requestBinary('/api/reader-release')
+    const stream = binary.stream()
+    expect(stream).toBeInstanceOf(ReadableStream)
+    await expect(new Response(stream).text()).resolves.toBe('bytes')
+    expect(() => source.getReader()).not.toThrow()
+  })
+
+  it('fails a binary read when timeout wins while the body read is pending', async () => {
+    vi.useFakeTimers()
+    let resolveRead: ((result: ReadableStreamReadResult<Uint8Array>) => void) | undefined
+    let cancelCalled = false
+    const reader = {
+      read: () => new Promise<ReadableStreamReadResult<Uint8Array>>(resolve => {
+        resolveRead = resolve
+      }),
+      cancel: async () => {
+        cancelCalled = true
+      },
+      releaseLock: vi.fn(),
+    }
+    const body = { getReader: () => reader } as unknown as ReadableStream<Uint8Array>
+    const transport = createPrivateHttpTransport({
+      baseUrl: 'https://control.example/',
+      fetch: vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        body,
+      }) as Response),
+      defaultTimeoutMs: 10,
+    })
+
+    const binary = await transport.requestBinary('/api/pending-timeout')
+    const stream = binary.stream()
+    expect(stream).toBeInstanceOf(ReadableStream)
+    await vi.advanceTimersByTimeAsync(10)
+    resolveRead?.({ done: false, value: new Uint8Array([1]) })
+
+    await expect(new Response(stream).arrayBuffer()).rejects.toMatchObject({
+      kind: 'timeout',
+    })
+    expect(cancelCalled).toBe(true)
+    expect(reader.releaseLock).toHaveBeenCalled()
   })
 
   it('rejects cross-origin, credentialed, and non-HTTP endpoints before fetch', async () => {
