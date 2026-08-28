@@ -87,7 +87,15 @@ function urlTag(value) {
   if (/^(?:data|blob):/i.test(candidate)) return TAG.urlSafe
   try {
     const absolute = new URL(candidate)
-    if (absolute.protocol === 'http:' || absolute.protocol === 'https:') return TAG.urlSafe
+    if (absolute.protocol === 'http:' || absolute.protocol === 'https:') {
+      const gatewayHost = absolute.hostname === 'localhost'
+        || absolute.hostname === '0.0.0.0'
+        || absolute.hostname === '::1'
+        || /^127(?:\.\d{1,3}){3}$/.test(absolute.hostname)
+      return gatewayHost && /^\/api(?:\/|$)/.test(absolute.pathname)
+        ? TAG.urlApi
+        : TAG.urlSafe
+    }
     return TAG.urlUnsafe
   } catch {
     // Continue with a normalized relative URL.
@@ -161,7 +169,42 @@ export function collectHttpBoundaryOperations({
   const analysis = suppliedAnalysis ?? createRpcAnalysisProgram({ ts, root, sources })
   const { checker } = analysis
   const activeRels = new Set(sources.map(source => source.rel))
-  const entries = analysis.sources.filter(source => activeRels.has(source.rel))
+  const available = analysis.sources.filter(source => activeRels.has(source.rel))
+  const byRel = new Map(available.map(entry => [entry.rel, entry]))
+  const importsByRel = new Map()
+  const sourceSignal = /\b(?:fetch|Request|RequestInit|Headers|sessionStorage)\b|opensquilla\.wsToken|Authorization|x-opensquilla-session-key/
+  const importPattern = /(?:\bfrom\s*|\bimport\s*\(|\brequire\s*\()\s*['"]([^'"]+)['"]/g
+  for (const entry of available) {
+    const dependencies = new Set()
+    for (const match of entry.source.getFullText().matchAll(importPattern)) {
+      const target = analysis.resolveRecord(entry.rel, match[1])
+      if (target && activeRels.has(target.rel)) dependencies.add(target.rel)
+    }
+    importsByRel.set(entry.rel, dependencies)
+  }
+  const selected = new Set(
+    available.filter(entry => sourceSignal.test(entry.source.getFullText())).map(entry => entry.rel),
+  )
+  function containsCallableParameter(entry) {
+    const text = entry.source.getFullText()
+    const signatures = /(?:function\s+[\w$]*\s*|[\w$]+\s*)\(([^)]*)\)\s*(?:=>|\{)/g
+    for (const signature of text.matchAll(signatures)) {
+      for (const raw of signature[1].split(',')) {
+        const identifier = /^\s*([A-Za-z_$][\w$]*)/.exec(raw)?.[1]
+        if (identifier && new RegExp(`\\b${identifier}\\s*\\(`).test(text.slice(signature.index))) {
+          return true
+        }
+      }
+    }
+    return false
+  }
+  for (const rel of [...selected]) {
+    for (const dependency of importsByRel.get(rel) ?? []) {
+      const entry = byRel.get(dependency)
+      if (entry && containsCallableParameter(entry)) selected.add(dependency)
+    }
+  }
+  const entries = [...selected].map(rel => byRel.get(rel)).filter(Boolean)
   const symbols = new WeakMap()
   const functions = new WeakMap()
   let nextSymbol = 1
@@ -681,6 +724,9 @@ export function collectHttpBoundaryOperations({
     if (targetTags.has(TAG.request)) {
       endpoint = selectShape(target, '$endpoint')
       headers = selectShape(selectShape(target, '$init'), 'headers')
+      if (call.arguments[1]) {
+        mergeShape(headers, selectShape(expressionShape(call.arguments[1]), 'headers'))
+      }
     }
     const endpointTags = tagsInShape(endpoint)
     const headerTags = tagsInShape(headers)

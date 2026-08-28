@@ -485,7 +485,7 @@ describe('HTTP symbol provenance', () => {
       root: fixtureRoot,
       sources: provenanceSources({
         'src/wrapper.ts': `
-          export function invoke(client: typeof fetch, endpoint: string, init: RequestInit) {
+          export function invoke(client: (endpoint: string, init: object) => unknown, endpoint: string, init: object) {
             return client(endpoint, init)
           }
         `,
@@ -523,9 +523,9 @@ describe('HTTP symbol provenance', () => {
           let left: RequestInit = {}
           let right: RequestInit = left
           left = right
-          right = { headers }
+          right = left
           const request = new NativeRequest('/api/items', left)
-          void globalThis.fetch(request)
+          void globalThis.fetch(request, { headers })
         `,
       }),
     })
@@ -594,6 +594,7 @@ describe('HTTP symbol provenance', () => {
           void fetch('data:image/png;base64,AA==')
           void fetch('blob:https://control.example/id')
           void fetch('https://cdn.example/api/image.png')
+          void fetch('http://127.0.0.1:8765/api/private')
           void fetch('/static/../api/private')
           void fetch('/static/%2e%2e/api/private')
           declare const runtimeTarget: string
@@ -603,6 +604,8 @@ describe('HTTP symbol provenance', () => {
     })
 
     expect(operations).toEqual([
+      { rel: 'src/targets.ts', kind: 'httpRequest' },
+      { rel: 'src/targets.ts', kind: 'httpApiEndpoint' },
       { rel: 'src/targets.ts', kind: 'httpRequest' },
       { rel: 'src/targets.ts', kind: 'httpApiEndpoint' },
       { rel: 'src/targets.ts', kind: 'httpRequest' },
