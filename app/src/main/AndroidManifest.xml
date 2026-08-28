@@ -1,8 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- Background keeper: the local gateway must survive app switching on
+         Android 12+ (and aggressive OEM killers). Foreground service keeps the
+         process alive; notification permission lets the ongoing notification
+         show; battery-optimization exemption is user-opt-in via dialog. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!-- All-files access: the gateway's file browser reads the real filesystem
          (workspace picker, artifact dir), which is sandboxed to app-private
@@ -14,7 +23,6 @@
         android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
-
     <application
         android:label="@string/app_name"
         android:icon="@mipmap/ic_launcher"
@@ -35,5 +43,16 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Keeps the 127.0.0.1:18790 gateway alive in the background.
+             specialUse has no time limit (dataSync stops after 6h on 14+). -->
+        <service
+            android:name=".GatewayService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Local AI gateway serving the in-app WebView UI (127.0.0.1)" />
+        </service>
     </application>
 </manifest>

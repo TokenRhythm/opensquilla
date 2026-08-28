@@ -135,5 +135,30 @@ browser to see shared storage.
 4. Open Overview and run the built-in doctor report to confirm providers
    and the router are healthy.
 
+## Background keep-alive & permissions
+
+The gateway must stay alive while the app is in the background. The app
+requests/needs the following:
+
+| Permission / setting | Purpose | How it is handled |
+| --- | --- | --- |
+| `FOREGROUND_SERVICE` + `FOREGROUND_SERVICE_SPECIAL_USE` | Foreground service `GatewayService` keeps the process alive when you switch away | Declared in the manifest, started automatically (`specialUse` type — no 6h time limit like `dataSync` on Android 14+) |
+| `POST_NOTIFICATIONS` (Android 13+) | Ongoing "gateway running" notification | Runtime prompt on first launch |
+| Ignore battery optimizations | Doze/app-standby exemption so the local server keeps serving | In-app prompt jumps to the system dialog; user taps Allow |
+| `WAKE_LOCK` | Keep CPU awake while serving | Declared, used by the foreground service |
+
+Notes:
+
+- With the foreground service, switching back and forth **never kills the
+  process or loses your session** — the gateway and WebView survive.
+- On aggressive OEM ROMs (Honor/EMUI, MIUI, ColorOS, etc.) the system may
+  freeze the process while it is in the background. This is **safe**: the
+  process is paused, not killed, and resumes instantly (verified: gateway
+  responds again in ~16 ms once the app returns to the foreground).
+- For maximum reliability on those ROMs, also enable in system settings:
+  **App launch management → manual → "Allow background activity"** (and
+  "Auto-launch" with a notification if present). This cannot be requested
+  from code; it is a one-time user setting.
+
 ## License
 Apache-2.0, see [LICENSE](LICENSE). This mobile packaging is a derivative work of [opensquilla/opensquilla](https://github.com/opensquilla/opensquilla) which is licensed under Apache-2.0; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for third-party notices.

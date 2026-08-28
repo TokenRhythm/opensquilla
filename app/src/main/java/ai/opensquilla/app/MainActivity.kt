@@ -178,7 +178,11 @@ class MainActivity : Activity() {
                 e.printStackTrace()
             }
         }.start()
-
+        // Background keeper: foreground service + notification + battery exemption,
+        // so switching away does not kill the local gateway (Android 12+ / OEM killers).
+        GatewayService.start(this)
+        ensureNotificationPermission()
+        ensureBatteryExemption()
         Thread {
             waitPort("127.0.0.1", port, timeoutMs = 90_000)
             runOnUiThread {
@@ -246,6 +250,46 @@ class MainActivity : Activity() {
                 4210
             )
         }
+    }
+
+    // ── Background keeper onboarding ─────────────────────────────────────────
+    // Android 13+ needs a runtime grant for the ongoing service notification;
+    // battery-optimization exemption must be granted from the system dialog.
+    private fun ensureNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 4211)
+        }
+    }
+
+    private fun ensureBatteryExemption() {
+        val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+        if (pm.isIgnoringBatteryOptimizations(packageName)) return
+        AlertDialog.Builder(this)
+            .setTitle("允许后台常驻")
+            .setMessage(
+                "切换应用后仍能使用 OpenSquilla 本地 AI 网关，需要允许它不受电池优化限制。" +
+                    "\n\n点击「去设置」，将 OpenSquilla 设为「不限制」，然后返回即可。"
+            )
+            .setPositiveButton("去设置") { _, _ ->
+                try {
+                    startActivity(
+                        Intent(
+                            Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                            Uri.parse("package:$packageName")
+                        )
+                    )
+                } catch (e: Exception) {
+                    try {
+                        startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                    } catch (ignored: Exception) {
+                    }
+                }
+            }
+            .setNegativeButton("暂不", null)
+            .show()
     }
 
     private fun statusBarHeightPx(): Int {
