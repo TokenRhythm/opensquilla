@@ -248,7 +248,7 @@ describe('private Gateway HTTP transport', () => {
         headers: new Headers({ 'content-type': 'application/json' }),
         body,
         json: () => { throw new Error('malformed body') },
-      }) as Response),
+      }) as unknown as Response),
     })
 
     await expect(transport.requestJson('/api/unreadable-error')).rejects.toMatchObject({
@@ -339,6 +339,7 @@ describe('private Gateway HTTP transport', () => {
     })
 
     for (const requestOptions of [
+      { method: null },
       { method: 'get', json: { value: true } },
       { method: 'HEAD' },
       { method: 'TRACE' },

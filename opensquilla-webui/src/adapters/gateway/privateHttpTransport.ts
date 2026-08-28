@@ -593,15 +593,19 @@ export function createPrivateHttpTransport(
     let hasJson = false
     let hasForm = false
     let body: BodyInit | undefined
+    let callerSignal: AbortSignal | undefined
+    let timeoutValue: number | undefined
     try {
       if (requestOptions === null || typeof requestOptions !== 'object') {
         throw new HttpTransportError('encode', 'Gateway HTTP request options are invalid.')
       }
-      const requestedMethod = requestOptions.method ?? 'GET'
-      if (!isHttpMethod(requestedMethod)) {
+      callerSignal = requestOptions.signal
+      timeoutValue = requestOptions.timeoutMs
+      const requestedMethod = requestOptions.method
+      if (requestedMethod !== undefined && !isHttpMethod(requestedMethod)) {
         throw new HttpTransportError('encode', 'Gateway HTTP request method is invalid.')
       }
-      method = requestedMethod
+      method = requestedMethod ?? 'GET'
       hasJson = Object.prototype.hasOwnProperty.call(requestOptions, 'json')
       hasForm = Object.prototype.hasOwnProperty.call(requestOptions, 'form')
       if (hasJson && hasForm) {
@@ -671,8 +675,8 @@ export function createPrivateHttpTransport(
     }
 
     const linkedSignal = requestSignal(
-      requestOptions.signal,
-      requestTimeout(requestOptions.timeoutMs, defaultTimeoutMs),
+      callerSignal,
+      requestTimeout(timeoutValue, defaultTimeoutMs),
     )
     let lifecycleTransferred = false
     try {
@@ -696,7 +700,7 @@ export function createPrivateHttpTransport(
             cause,
           )
         }
-        if (requestOptions.signal?.aborted || linkedSignal.signal.aborted) {
+        if (callerSignal?.aborted || linkedSignal.signal.aborted) {
           throw new HttpTransportError(
             'aborted',
             'Gateway HTTP request was aborted.',
@@ -714,8 +718,7 @@ export function createPrivateHttpTransport(
         )
       }
 
-      const callerSignal = requestOptions.signal
-      const responseStatus = response.status
+        const responseStatus = response.status
       const lifecycle: ResponseBodyLifecycle = {
         signal: linkedSignal.signal,
         release: () => linkedSignal.dispose(),
@@ -783,7 +786,7 @@ export function createPrivateHttpTransport(
             cause,
           )
         }
-        if (requestOptions.signal?.aborted || linkedSignal.signal.aborted) {
+        if (callerSignal?.aborted || linkedSignal.signal.aborted) {
           throw new HttpTransportError(
             'aborted',
             'Gateway HTTP request was aborted.',

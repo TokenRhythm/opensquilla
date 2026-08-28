@@ -79,12 +79,13 @@ F2_FOUNDATION_RUNTIME_FILES = (
     "opensquilla-webui/src/adapters/gateway/privateTransports.ts",
     "src/opensquilla/gateway/adapters/contract_method.py",
 )
-# F2 adds two explicitly reviewed HTTP hardening slices on top of the initial
-# 849-line foundation: 58 lines for body lifecycle ownership and 103 lines for
-# filename/method/body validation, less 9 lines from native brand tightening.
+# F2 adds three explicitly reviewed HTTP hardening slices on top of the
+# initial 849-line foundation: 58 lines for body lifecycle ownership, 103
+# lines for filename/method/body validation (less 9 lines from native brand
+# tightening), and 135 lines for cancellation-safe response-body ownership.
 # Keep the allowance explicit so later domain slices cannot hide authored
 # growth behind this infrastructure exception.
-F2_FOUNDATION_RUNTIME_LOC_CEILING = 1_001
+F2_FOUNDATION_RUNTIME_LOC_CEILING = 1_136
 
 # Existing cross-rpc private imports are architectural debt. This exact ledger
 # prevents growth and also fails stale when an import is removed, so reductions
