@@ -416,8 +416,34 @@ jobs:
         if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
         shell: bash
         run: |
-          uv run --no-sync python scripts/contracts/generate_sessions_list_contract.py --check
-          uv run --no-sync python scripts/contracts/generate_sessions_list_contract.py --verify-determinism
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --check
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --verify-determinism
+
+      - name: Run real Gateway Contract toolchain integration
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+        env:
+          OPENSQUILLA_RUN_CONTRACT_TOOLCHAIN_INTEGRATION: "1"
+          PYTHONPATH: "${{ github.workspace }}:${{ github.workspace }}/src"
+        run: >-
+          uv run --no-sync pytest -q
+          --confcutdir=tests/contracts
+          tests/contracts
+
+      - name: Write Linux Gateway Contract hash manifest
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+        run: >-
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py
+          --hash-manifest "${RUNNER_TEMP}/gateway-contract-hashes.json"
+
+      - name: Upload Linux Gateway Contract hash manifest
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-contract-hashes-linux
+          path: ${{ runner.temp }}/gateway-contract-hashes.json
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
 
       - name: Run frontend type checks
         if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
@@ -474,6 +500,67 @@ jobs:
           python scripts/verify_webui_artifact.py \
             --forbid-personal-bgm \
             --wheel "${wheels[0]}"
+
+  gateway-contract-windows:
+    name: Gateway Contract determinism (Windows)
+    needs: [plan-ci, frontend-check]
+    if: >-
+      ${{ always()
+          && needs.plan-ci.result == 'success'
+          && needs.frontend-check.result == 'success'
+          && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+          cache: npm
+          cache-dependency-path: opensquilla-webui/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: opensquilla-webui
+        run: npm ci
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install pinned Contract generators
+        run: uv sync --only-group dev --frozen
+
+      - name: Verify Windows Contract generation and real toolchain
+        env:
+          OPENSQUILLA_RUN_CONTRACT_TOOLCHAIN_INTEGRATION: "1"
+          PYTHONPATH: "${{ github.workspace }};${{ github.workspace }}/src"
+        run: |
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --check
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --verify-determinism
+          uv run --no-sync pytest -q --confcutdir=tests/contracts tests/contracts
+
+      - name: Download Linux Gateway Contract hash manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: gateway-contract-hashes-linux
+          path: ${{ runner.temp }}/gateway-contract-hashes-linux
+
+      - name: Compare Linux and Windows Contract hashes
+        shell: pwsh
+        run: |
+          $windowsManifest = Join-Path $env:RUNNER_TEMP "gateway-contract-hashes-windows.json"
+          $linuxManifest = Join-Path $env:RUNNER_TEMP "gateway-contract-hashes-linux/gateway-contract-hashes.json"
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --hash-manifest $windowsManifest
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --compare-hash-manifests $linuxManifest $windowsManifest
 
   webui-chat-recovery:
     name: WebUI chat recovery
@@ -1879,6 +1966,7 @@ jobs:
       - readme-locale-check
       - frontend-artifact
       - frontend-check
+      - gateway-contract-windows
       - webui-chat-recovery
       - tui-check
       - desktop-check
@@ -1963,6 +2051,7 @@ jobs:
           RESULT_README_LOCALE: ${{ needs.readme-locale-check.result }}
           RESULT_FRONTEND_ARTIFACT: ${{ needs.frontend-artifact.result }}
           RESULT_FRONTEND: ${{ needs.frontend-check.result }}
+          RESULT_CONTRACT_WINDOWS: ${{ needs.gateway-contract-windows.result }}
           RESULT_TUI: ${{ needs.tui-check.result }}
           RESULT_DESKTOP: ${{ needs.desktop-check.result }}
           RESULT_UBUNTU: ${{ needs.ubuntu-quality.result }}

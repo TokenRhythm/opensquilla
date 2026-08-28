@@ -162,6 +162,22 @@ def test_ci_result_gate_accepts_one_shared_frontend_check_for_both_suites() -> N
     assert check_ci_results(env) == []
 
 
+def test_frontend_validation_requires_windows_contract_determinism() -> None:
+    env = _env_for(BASELINE_SUITES | {"frontend-validation"})
+    env["RESULT_CONTRACT_WINDOWS"] = "skipped"
+
+    errors = check_ci_results(env)
+
+    assert any("Gateway Contract determinism on Windows" in error for error in errors)
+
+
+def test_wheel_only_plan_does_not_run_windows_contract_determinism() -> None:
+    env = _env_for(BASELINE_SUITES | {"wheel-webui-roundtrip"})
+
+    assert env["RESULT_CONTRACT_WINDOWS"] == "skipped"
+    assert check_ci_results(env) == []
+
+
 def test_ci_result_gate_checks_frontend_artifact_independently() -> None:
     env = _env_for(
         BASELINE_SUITES | {"frontend-artifact", "webui-chat-recovery"}

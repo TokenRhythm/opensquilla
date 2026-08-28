@@ -79,6 +79,8 @@
     }
   ],
   "weights_seconds": {
+    "tests/contracts/test_gateway_contract_runner.py": 0.01,
+    "tests/contracts/test_gateway_contract_toolchain_integration.py": 0.01,
     "tests/contracts/test_sessions_list_contract.py": 0.01,
     "tests/functional/test_agent_context_boundary_e2e.py": 0.062,
     "tests/functional/test_gateway_attachment_history_e2e.py": 4.616,
