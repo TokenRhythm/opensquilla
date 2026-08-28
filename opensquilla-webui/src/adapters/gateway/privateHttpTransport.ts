@@ -116,6 +116,9 @@ function resolveBaseUrl(value?: string | URL): URL {
 }
 
 function resolveEndpoint(baseUrl: URL, endpoint: string): URL {
+  if (typeof endpoint !== 'string') {
+    throw new HttpTransportError('invalid-endpoint', 'Gateway HTTP endpoint is invalid.')
+  }
   const candidate = endpoint.trim()
   if (!candidate) {
     throw new HttpTransportError('invalid-endpoint', 'Gateway HTTP endpoint is empty.')
