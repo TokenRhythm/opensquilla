@@ -81,9 +81,10 @@ F2_FOUNDATION_RUNTIME_FILES = (
 )
 # F2 adds two explicitly reviewed HTTP hardening slices on top of the initial
 # 849-line foundation: 58 lines for body lifecycle ownership and 103 lines for
-# filename/method/body validation. Keep the allowance explicit so later domain
-# slices cannot hide authored growth behind this infrastructure exception.
-F2_FOUNDATION_RUNTIME_LOC_CEILING = 1_010
+# filename/method/body validation, less 9 lines from native brand tightening.
+# Keep the allowance explicit so later domain slices cannot hide authored
+# growth behind this infrastructure exception.
+F2_FOUNDATION_RUNTIME_LOC_CEILING = 1_001
 
 # Existing cross-rpc private imports are architectural debt. This exact ledger
 # prevents growth and also fails stale when an import is removed, so reductions
