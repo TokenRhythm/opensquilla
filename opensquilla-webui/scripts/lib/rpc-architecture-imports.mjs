@@ -313,6 +313,27 @@ export function collectBoundaryArchitectureViolations({
     if (ts.isArrowFunction(current) || ts.isFunctionExpression(current)) {
       return functionExposureKinds(current, seen)
     }
+    if (ts.isClassExpression(current)) {
+      for (const heritage of current.heritageClauses ?? []) {
+        for (const kind of typeBoundaryKinds(heritage, seen)) kinds.add(kind)
+      }
+      for (const member of current.members) {
+        if (member.type) {
+          for (const kind of typeBoundaryKinds(member.type, seen)) kinds.add(kind)
+        }
+        if (
+          ts.isMethodDeclaration(member)
+          || ts.isConstructorDeclaration(member)
+          || ts.isGetAccessorDeclaration(member)
+          || ts.isSetAccessorDeclaration(member)
+        ) {
+          for (const kind of functionExposureKinds(member, seen)) kinds.add(kind)
+        } else if (member.initializer) {
+          for (const kind of valueBoundaryKinds(member.initializer, seen)) kinds.add(kind)
+        }
+      }
+      return kinds
+    }
     if (ts.isCallExpression(current)) {
       const signature = checker.getResolvedSignature(current)
       const declaration = signature?.declaration
@@ -391,6 +412,45 @@ export function collectBoundaryArchitectureViolations({
       for (const kind of typeBoundaryKinds(statement)) kinds.add(kind)
     }
     return kinds
+  }
+
+  function transitiveReexportBoundaryKinds(rel, statement) {
+    if (
+      !ts.isExportDeclaration(statement)
+      || !statement.moduleSpecifier
+      || !ts.isStringLiteralLike(statement.moduleSpecifier)
+    ) return []
+    // Direct boundary re-exports are reported by the import/reference scan in
+    // the architecture gate.  This pass is for a barrel whose target is an
+    // intermediate module, where a lexical path check would otherwise lose the
+    // private/generated origin.
+    if (boundaryModuleKind({
+      root,
+      importer: rel,
+      specifier: statement.moduleSpecifier.text,
+    })) return []
+    const target = analysis.resolveRecord(rel, statement.moduleSpecifier.text)
+    if (!target) return []
+    const targetSource = sourceByRel.get(target.rel)
+    const targetModule = targetSource ? analysis.symbolAt(targetSource) : null
+    if (!targetModule) return []
+    let exportedSymbols = []
+    if (statement.exportClause && ts.isNamedExports(statement.exportClause)) {
+      exportedSymbols = statement.exportClause.elements
+        .map(element => analysis.exportedSymbol(
+          target.rel,
+          (element.propertyName ?? element.name).text,
+        ))
+        .filter(Boolean)
+    } else {
+      // `export * from` and `export * as ns from` both expose the target
+      // module's exported symbols.  Namespace exports are conservative here:
+      // exposing any private member makes the namespace itself a leak.
+      exportedSymbols = checker.getExportsOfModule(targetModule)
+    }
+    return exportedSymbols
+      .map(symbol => symbolOrigin(symbol))
+      .filter(Boolean)
   }
 
   for (const { rel, source } of analysis.sources) {
@@ -484,6 +544,12 @@ export function collectBoundaryArchitectureViolations({
           if (!kind || kind === 'RPC store factory') continue
           if (kind === 'generated Contract' && generated) continue
           failures.push(`${rel}: local export exposes ${kind} symbols.`)
+        }
+      }
+      if (!privateBoundaryModule) {
+        for (const kind of transitiveReexportBoundaryKinds(rel, statement)) {
+          if (kind === 'generated Contract' && generated) continue
+          failures.push(`${rel}: ${kind} modules must not be re-exported through a barrel.`)
         }
       }
     }

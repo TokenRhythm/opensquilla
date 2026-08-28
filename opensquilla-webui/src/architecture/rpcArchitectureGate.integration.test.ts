@@ -270,6 +270,35 @@ describe('transport architecture gate ledger integration', () => {
     )
   })
 
+  it('fences private symbols returned from exported class expressions', () => {
+    const root = fixture({
+      'src/adapters/gateway/privateTransports.ts': 'export const hidden = 1',
+      'src/adapters/gateway/classExpressionLeak.ts': `
+        import { hidden } from './privateTransports'
+        export const PublicClient = class {
+          field = hidden
+          get() { return hidden }
+        }
+      `,
+    })
+    expect(evaluateRpcArchitectureGate({ root, debtLanes: [] }).failures).toContain(
+      'src/adapters/gateway/classExpressionLeak.ts: exported declaration exposes private Gateway transport symbols.',
+    )
+  })
+
+  it('fences private symbols through multiple ESM barrel re-exports', () => {
+    const root = fixture({
+      'src/adapters/gateway/privateTransports.ts': 'export const hidden = 1',
+      'src/adapters/gateway/index.ts': `export { hidden as h } from './privateTransports'`,
+      'src/adapters/gateway/leak.ts': `export { h as publicHidden } from './index'`,
+    })
+    const failures = evaluateRpcArchitectureGate({ root, debtLanes: [] }).failures
+    expect(failures).toEqual(expect.arrayContaining([
+      'src/adapters/gateway/index.ts: private Gateway transport modules must not be re-exported through a barrel.',
+      'src/adapters/gateway/leak.ts: private Gateway transport modules must not be re-exported through a barrel.',
+    ]))
+  })
+
   it('fails fast when the canonical RPC store loses its named ESM seed export', () => {
     const root = fixture({
       'src/stores/rpc.ts': `
