@@ -30,7 +30,7 @@
 
 ## 最新动态
 
-- 📢 **2026-08-22** —— 技术报告英文版已登陆 aiXiv：[aixiv.260822.000001](https://aixiv.science/abs/aixiv.260822.000001)。如何引用 OpenSquilla 请见[引用](#引用)。
+- 📢 **2026-08-22** —— 技术报告英文版已登陆 aiXiv：[aixiv.260822.000001](https://aixiv.science/abs/aixiv.260822.000001)，中文版已登陆 ChinaXiv：[202608.00176](https://chinaxiv.org/abs/202608.00176)。如何引用 OpenSquilla 请见[引用](#引用)。
 
 - 📢 **2026-08-21** —— 技术报告的 PDF 版本现已收录在本仓库中：[English](docs/report/opensquilla-report-en.pdf) · [中文](docs/report/opensquilla-report-zh.pdf)。
 

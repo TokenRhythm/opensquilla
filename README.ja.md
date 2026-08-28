@@ -30,7 +30,7 @@
 
 ## お知らせ
 
-- 📢 **2026-08-22** — 技術レポートの英語版が aiXiv に公開されました: [aixiv.260822.000001](https://aixiv.science/abs/aixiv.260822.000001)。OpenSquilla の引用方法は[引用](#引用)をご覧ください。
+- 📢 **2026-08-22** — 技術レポートの英語版が aiXiv に公開されました: [aixiv.260822.000001](https://aixiv.science/abs/aixiv.260822.000001)。中国語版は ChinaXiv で公開されています: [202608.00176](https://chinaxiv.org/abs/202608.00176)。OpenSquilla の引用方法は[引用](#引用)をご覧ください。
 
 - 📢 **2026-08-21** — 技術レポートの PDF 版を本リポジトリに収録しました: [English](docs/report/opensquilla-report-en.pdf) · [中文](docs/report/opensquilla-report-zh.pdf)。
 
