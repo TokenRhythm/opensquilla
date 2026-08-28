@@ -14,8 +14,10 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
+import android.view.View
 import android.view.ViewGroup
 import android.view.WindowInsets
+import android.util.Log
 import android.webkit.CookieManager
 import android.webkit.SslErrorHandler
 import android.webkit.URLUtil
@@ -163,17 +165,23 @@ class MainActivity : Activity() {
             insets
         }
         setContentView(root)
-
+        Log.d("SQLaunch", "step1 setContentView done")
         ensureStoragePermissions()
-        if (!Python.isStarted()) {
-            Python.start(AndroidPlatform(this))
-        }
-
-        val py = Python.getInstance()
+        // IMPORTANT: never block the UI thread on Chaquopy init — it takes
+        // seconds on cold start and the window would look frozen (ANR-ish).
+        // Show the loading overlay, boot Python + gateway on a background
+        // thread, then swap to the real page.
+        showLoadingOverlay(root)
         Thread {
             try {
+                if (!Python.isStarted()) {
+                    Python.start(AndroidPlatform(this@MainActivity))
+                }
+                Log.d("SQLaunch", "step3 python started")
+                val py = Python.getInstance()
                 py.getModule("opensquilla_android")
                     .callAttr("serve", filesDir.absolutePath)
+                Log.d("SQLaunch", "step4 serve thread started")
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -181,14 +189,39 @@ class MainActivity : Activity() {
         // Background keeper: foreground service + notification + battery exemption,
         // so switching away does not kill the local gateway (Android 12+ / OEM killers).
         GatewayService.start(this)
+        Log.d("SQLaunch", "step5 gateway service started")
         ensureNotificationPermission()
+        Log.d("SQLaunch", "step6 notification done")
         ensureBatteryExemption()
+        Log.d("SQLaunch", "step7 battery done")
         Thread {
             waitPort("127.0.0.1", port, timeoutMs = 90_000)
+            Log.d("SQLaunch", "step8 port ready, loading url")
             runOnUiThread {
+                loadingView?.visibility = View.GONE
                 webView.loadUrl("http://127.0.0.1:$port/")
+                Log.d("SQLaunch", "step9 loadUrl called")
             }
         }.start()
+    }
+
+    private var loadingView: android.view.View? = null
+
+    private fun showLoadingOverlay(root: android.view.ViewGroup) {
+        loadingView = android.widget.TextView(this).apply {
+            text = "正在启动本地 AI 网关…"
+            setTextColor(Color.parseColor("#8AA0B0"))
+            textSize = 16f
+            gravity = android.view.Gravity.CENTER
+            setBackgroundColor(Color.parseColor("#101418"))
+        }
+        root.addView(
+            loadingView,
+            android.widget.FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {

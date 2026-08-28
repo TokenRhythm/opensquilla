@@ -9,8 +9,6 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
-import com.chaquo.python.Python
-import com.chaquo.python.android.AndroidPlatform
 import java.net.InetSocketAddress
 import java.net.Socket
 
@@ -30,14 +28,9 @@ class GatewayService : Service() {
     override fun onCreate() {
         super.onCreate()
         startForeground(NOTIFICATION_ID, buildNotification())
-        // Python may already be started by the activity; startGuard is idempotent.
-        if (!Python.isStarted()) {
-            try {
-                Python.start(AndroidPlatform(this))
-            } catch (e: Exception) {
-                // Already started elsewhere (races on quick backgrounding).
-            }
-        }
+        // Python is always started by MainActivity's background thread (never on
+        // the UI thread). The service only makes sure the gateway is serving;
+        // it must NOT call Python.start() itself — concurrent init would race.
         ensureGatewayServing()
     }
 
@@ -47,26 +40,17 @@ class GatewayService : Service() {
     }
 
     /**
-     * Ask opensquilla_android.serve() to run the FastAPI gateway, but only if
-     * the port is not already listening. Calling serve() twice would rebind
-     * the port; the health probe keeps this idempotent.
+     * Single-instance guard: MainActivity is the *only* caller of
+     * opensquilla_android.serve() — the service must never start a second
+     * gateway (a concurrent serve would hit the pid-lock and spam
+     * "already_running"). The service only keeps the process foregrounded;
+     * if the port is down we simply schedule a liveness probe.
      */
     private fun ensureGatewayServing() {
-        val py = try {
-            Python.getInstance()
-        } catch (e: Exception) {
+        if (!isPortOpen("127.0.0.1", 18790)) {
+            // MainActivity boots the gateway on its own thread. Nothing to do
+            // here; just re-check later via onStartCommand/START_STICKY.
             return
-        }
-        try {
-            if (isPortOpen("127.0.0.1", 18790)) {
-                // Already serving; nothing to do.
-                return
-            }
-            py.getModule("opensquilla_android")
-                .callAttr("serve", filesDir.absolutePath)
-        } catch (e: Exception) {
-            // serve() may be mid-startup; the gateway thread owns the port.
-            // Ignore and keep the service alive.
         }
     }
 

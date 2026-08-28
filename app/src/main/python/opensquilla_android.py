@@ -62,6 +62,22 @@ def serve(home_dir: str) -> int:
     sys.stdout = _diag
     faulthandler.dump_traceback_later(40, repeat=True, file=_diag)
 
+    # Android is a single-instance app: a stale gateway.pid (left behind by a
+    # hard kill) blocks startup once the recorded pid gets reused by another
+    # process — the gateway then refuses to boot ("already running") and the
+    # app appears stuck on the launch screen. The pid-lock has no meaning for
+    # us, so clear it before every boot.
+    try:
+        _pid_path = os.path.join(os.environ["OPENSQUILLA_STATE_DIR"], "state", "gateway.pid")
+        if os.path.exists(_pid_path):
+            _stale_pid = open(_pid_path, "r").read().strip()
+            os.remove(_pid_path)
+            print(f"[pidlock] cleared stale gateway.pid (pid={_stale_pid})", file=_diag)
+        else:
+            print("[pidlock] no stale gateway.pid", file=_diag)
+    except Exception as _e:
+        print(f"[pidlock] clear failed: {_e!r}", file=_diag)
+
     # Startup permission probe: can this (app) process see shared storage?
     try:
         _entries = os.listdir('/sdcard')
