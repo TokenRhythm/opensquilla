@@ -337,6 +337,7 @@
       "tests/test_cli/test_gateway_bind_preflight.py",
       "tests/test_cli/test_gateway_client_keepalive.py",
       "tests/test_cli/test_gateway_client_malformed_frames.py",
+      "tests/test_cli/test_gateway_client_sessions_contract.py",
       "tests/test_cli/test_gateway_client_steer.py",
       "tests/test_cli/test_gateway_cmd.py",
       "tests/test_cli/test_gateway_reload_cmd.py",

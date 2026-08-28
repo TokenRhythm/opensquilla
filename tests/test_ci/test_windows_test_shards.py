@@ -83,6 +83,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/unit/cli/tui/test_keys_cheatsheet.py",
     "tests/unit/cli/tui/test_opentui_prefs.py",
     "tests/test_cli/test_gateway_client_steer.py",
+    "tests/test_cli/test_gateway_client_sessions_contract.py",
     "tests/test_cli/test_skills_search_cmd.py",
     "tests/test_channels/test_admission_reason_persistence.py",
     "tests/test_channels/test_channel_admission.py",

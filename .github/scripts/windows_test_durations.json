@@ -196,6 +196,7 @@
     "tests/test_cli/test_gateway_bind_preflight.py": 0.01,
     "tests/test_cli/test_gateway_client_keepalive.py": 0.144,
     "tests/test_cli/test_gateway_client_malformed_frames.py": 0.02,
+    "tests/test_cli/test_gateway_client_sessions_contract.py": 0.01,
     "tests/test_cli/test_gateway_client_steer.py": 0.018,
     "tests/test_cli/test_gateway_cmd.py": 3.234,
     "tests/test_cli/test_gateway_reload_cmd.py": 0.34,

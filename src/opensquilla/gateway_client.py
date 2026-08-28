@@ -8,6 +8,7 @@ import uuid
 from typing import Any, cast
 from urllib.parse import urlparse, urlunparse
 
+from opensquilla.contracts.adapters.sessions_list_contract import call_sessions_list
 from opensquilla.contracts.gateway_transport import (
     GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
     GATEWAY_CLIENT_MAX_QUEUE,
@@ -173,7 +174,7 @@ class GatewayRPCClient:
         return {} if payload is None else payload
 
     async def list_sessions(self, limit: int = 50) -> dict[str, Any]:
-        return cast(dict[str, Any], await self.call("sessions.list", {"limit": limit}))
+        return await call_sessions_list(self.call, limit=limit)
 
     async def resolve_session(self, key: str) -> dict[str, Any]:
         return cast(dict[str, Any], await self.call("sessions.resolve", {"key": key}))
