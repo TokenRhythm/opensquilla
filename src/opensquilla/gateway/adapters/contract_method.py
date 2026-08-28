@@ -41,6 +41,9 @@ class GatewayMethodDescriptor(Protocol):
     @property
     def scope(self) -> str: ...
 
+    @property
+    def guest_allowed(self) -> bool: ...
+
 
 class MethodRegistry[ContextT](Protocol):
     """Minimal registry port; no dependency on Gateway dispatcher internals."""
@@ -51,14 +54,6 @@ class MethodRegistry[ContextT](Protocol):
         handler: RegisteredHandler[ContextT, Any],
         scope: str,
     ) -> None: ...
-
-
-@dataclass(frozen=True, slots=True)
-class StaticGatewayMethodDescriptor:
-    """Temporary bridge for methods whose generated F1 descriptor is absent."""
-
-    name: str
-    scope: str
 
 
 @dataclass(frozen=True, slots=True)

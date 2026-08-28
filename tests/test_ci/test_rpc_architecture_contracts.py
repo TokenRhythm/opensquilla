@@ -15,13 +15,13 @@ RPC_CONTEXT = GATEWAY_ROOT / "rpc" / "registry.py"
 GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
     {
         "src/opensquilla/contracts/adapters/sessions_list_contract.py",
+        "src/opensquilla/gateway/adapters/sessions_list_contract.py",
     }
 )
 GENERATED_METADATA_IMPORT_ALLOWLIST = frozenset(
     {
         "src/opensquilla/contracts/adapters/sessions_list_contract.py",
         "src/opensquilla/engine/commands.py",
-        "src/opensquilla/gateway/adapters/sessions_list_contract.py",
         "src/opensquilla/gateway/app.py",
         "src/opensquilla/gateway/guest_rpc_policy.py",
         "src/opensquilla/gateway/rpc_system.py",

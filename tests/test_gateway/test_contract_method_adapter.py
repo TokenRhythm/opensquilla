@@ -23,6 +23,7 @@ def _descriptor() -> Any:
         name="example.query",
         kind="query",
         scope="operator.read",
+        guest_allowed=False,
         idempotency="safe",
         timeout=None,
         capability=None,

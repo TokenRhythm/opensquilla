@@ -11,20 +11,18 @@ from opensquilla.contracts.adapters.sessions_list_contract import (
     sessions_list_params_contract_errors,
     validate_sessions_list_result,
 )
-from opensquilla.contracts.generated.v4.sessions_list_metadata import SESSIONS_LIST_SCOPE
+from opensquilla.contracts.generated.v4.gateway_contract_registry import (
+    GATEWAY_METHOD_CONTRACTS,
+)
 from opensquilla.gateway.adapters.contract_method import (
     GatewayContractBinding,
     MethodRegistry,
-    StaticGatewayMethodDescriptor,
     register_gateway_contract_method,
 )
 
 ErrorFactory = Callable[[str, str], Exception]
 
-_SESSIONS_LIST_DESCRIPTOR = StaticGatewayMethodDescriptor(
-    name=SESSIONS_LIST_METHOD,
-    scope=SESSIONS_LIST_SCOPE,
-)
+_SESSIONS_LIST_DESCRIPTOR = GATEWAY_METHOD_CONTRACTS[SESSIONS_LIST_METHOD]
 _SESSIONS_LIST_BINDING = GatewayContractBinding(
     descriptor=_SESSIONS_LIST_DESCRIPTOR,
     observe_params=sessions_list_params_contract_errors,
