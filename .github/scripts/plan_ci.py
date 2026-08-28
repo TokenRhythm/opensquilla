@@ -1478,6 +1478,13 @@ def plan_changes(
         # Dependency metadata must fail closed even when it is added beneath a
         # documentation directory; docs-only routing is not a trust boundary.
         if _is_docs(path) and not _is_dependency(path):
+            if path == "README.md" or (
+                "/" not in path
+                and path.startswith("README.")
+                and path.endswith(".md")
+            ):
+                suites.add("release-packaging")
+                reasons.add("packaging_changed")
             continue
         all_docs = False
 

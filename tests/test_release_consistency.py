@@ -1072,14 +1072,17 @@ def test_changelog_has_current_release_section_and_unreleased() -> None:
     assert "[Unreleased]" in text, "CHANGELOG.md must retain an [Unreleased] section"
 
 
-def test_readme_release_install_uses_latest_assets_and_pinned_alternative() -> None:
+def test_readme_release_install_uses_versioned_assets_and_pinned_wheel() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
 
-    assert f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-mac-arm64.dmg" in readme
-    assert f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-win-x64.exe" in readme
-    assert "versioned GitHub assets" in readme
-    assert "Alibaba Cloud OSS mirror" in readme
-    assert "Portable archives remain retired" in readme
+    assert (
+        f"releases/download/{CURRENT_TAG}/"
+        f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-mac-arm64.dmg" in readme
+    )
+    assert (
+        f"releases/download/{CURRENT_TAG}/"
+        f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-win-x64.exe" in readme
+    )
     assert "releases/latest/download/OpenSquilla-windows-x64-portable.zip" not in readme
     assert (
         f"releases/download/{CURRENT_TAG}/opensquilla-{CURRENT_VERSION}-py3-none-any.whl" in readme
@@ -1087,6 +1090,24 @@ def test_readme_release_install_uses_latest_assets_and_pinned_alternative() -> N
     assert "opensquilla-latest-py3-none-any.whl" not in readme
     assert "Python wheel installs use versioned wheel filenames" in readme
     assert "Release install commands use published GitHub release assets" in readme
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        Path("README.md"),
+        Path("README.zh-Hans.md"),
+        Path("README.ja.md"),
+        Path("README.fr.md"),
+        Path("README.de.md"),
+        Path("README.es.md"),
+    ],
+)
+def test_readmes_point_to_canonical_release_notes(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+
+    assert "[`CHANGELOG.md`](CHANGELOG.md)" in text, path
+    assert "[`docs/releases/`](docs/releases/)" in text, path
 
 
 def test_all_readmes_default_install_paths_to_the_current_preview() -> None:
