@@ -246,6 +246,7 @@ ignore_missing_imports = true
 
 [dependency-groups]
 dev = [
+    "datamodel-code-generator==0.75.1",
     "laboratory>=1.0.2",
     "syrupy>=5.1.0",
 ]

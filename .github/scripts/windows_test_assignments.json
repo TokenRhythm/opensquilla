@@ -305,6 +305,7 @@
       "tests/unit/test_env_loading.py"
     ],
     "gateway-sqlite": [
+      "tests/contracts/test_sessions_list_contract.py",
       "tests/functional/test_gateway_attachment_history_e2e.py",
       "tests/functional/test_gateway_compaction_e2e.py",
       "tests/functional/test_gateway_non_image_attachment_materialization_e2e.py",

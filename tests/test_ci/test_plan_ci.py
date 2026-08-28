@@ -460,6 +460,22 @@ def test_generic_webui_change_does_not_wake_desktop_matrix(
     assert plan["reason_codes"] == ["webui_changed"]
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "contracts/gateway/v4/sessions/sessions-list.schema.json",
+        "scripts/contracts/generate_sessions_list_contract.py",
+        "src/opensquilla/contracts/generated/v4/sessions_list.py",
+    ],
+)
+def test_gateway_contract_changes_run_deterministic_generation(
+    tmp_path: Path, suite_config: dict[str, Any], path: str
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+
+    assert "frontend-validation" in plan["required_suites"]
+
+
 def test_gateway_change_runs_browser_recovery_without_native_desktop(
     tmp_path: Path, suite_config: dict[str, Any]
 ) -> None:
