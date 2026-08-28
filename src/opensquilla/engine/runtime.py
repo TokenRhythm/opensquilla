@@ -3166,7 +3166,7 @@ class _SelectorFallbackProvider:
         if getattr(active_provider, "execution_context_aware", False):
             primary_chat_kwargs["execution_context"] = execution_context
 
-        def primary_stream_factory() -> AsyncIterator[Any]:
+        def primary_stream_factory() -> AsyncGenerator[Any, None]:
             return _selector_safe_stream(
                 lambda: active_provider.chat(messages, **primary_chat_kwargs),
                 content_started=lambda: emitted_user_visible_content,
@@ -3530,7 +3530,7 @@ class _SelectorFallbackProvider:
                             event,
                         ),
                     )
-                    def fallback_stream_factory() -> AsyncIterator[Any]:
+                    def fallback_stream_factory() -> AsyncGenerator[Any, None]:
                         return _selector_safe_stream(
                             lambda: fallback_provider.chat(
                                 messages,
