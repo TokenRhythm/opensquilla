@@ -64,6 +64,9 @@
     "sessionMoved": "已将会话移至项目",
     "moveSessionFailed": "移动会话失败：{error}",
     "sessionRemoved": "已将会话移出项目",
+    "moveSessionSessionMissing": "该任务已不存在，列表已刷新",
+    "moveSessionWorkspaceMissing": "目标项目已不存在",
+    "moveSessionWorkspaceRemoved": "目标项目已被移除，请选择其他项目",
     "removeSessionFailed": "移出会话失败：{error}"
   },
   "updates": {

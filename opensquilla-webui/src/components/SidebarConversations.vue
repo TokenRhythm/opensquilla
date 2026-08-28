@@ -559,6 +559,12 @@ const menuStyle = ref<Record<string, string>>({})
 const openWorkspaceSubmenuKey = ref('')
 const workspaceSubmenuStyle = ref<Record<string, string>>({})
 const workspaceSubmenuTriggerEl = ref<HTMLElement | null>(null)
+// Function ref on the single open workspace submenu scopes its roving-focus
+// queries (only one submenu renders at a time).
+const openWorkspaceSubmenuEl = ref<HTMLElement | null>(null)
+function setOpenWorkspaceSubmenu(el: Element | ComponentPublicInstance | null) {
+  openWorkspaceSubmenuEl.value = el instanceof HTMLElement ? el : null
+}
 const renamingKey = ref('')
 const renameDraft = ref('')
 // A function ref captures the single active rename input. A string ref inside
@@ -676,6 +682,41 @@ function openWorkspaceSubmenu(row: SidebarDisplayRow, event: Event) {
         : 'translateX(-100%)',
     }
   }
+  // Keyboard-activated opens (Enter/Space produce a detail-0 click) move
+  // focus into the submenu; pointer opens leave focus on the trigger.
+  const keyboardActivated = !(event instanceof MouseEvent) || event.detail === 0
+  if (keyboardActivated) {
+    void nextTick(() => {
+      const first = openWorkspaceSubmenuEl.value
+        ?.querySelectorAll<HTMLElement>('.sidebar-row-menu__item:not(:disabled)')[0]
+      first?.focus()
+    })
+  }
+}
+
+function onWorkspaceSubmenuKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape') {
+    e.preventDefault()
+    e.stopPropagation()
+    const trigger = workspaceSubmenuTriggerEl.value
+    closeWorkspaceSubmenu()
+    nextTick(() => trigger?.focus())
+    return
+  }
+  if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return
+  // Scope roving focus to THIS submenu and skip disabled items (the current
+  // workspace entry), otherwise navigation stalls on unfocusable buttons.
+  const items = Array.from(
+    openWorkspaceSubmenuEl.value?.querySelectorAll<HTMLElement>(
+      '.sidebar-row-menu__item:not(:disabled)',
+    ) ?? [],
+  )
+  if (!items.length) return
+  e.preventDefault()
+  const current = items.indexOf(document.activeElement as HTMLElement)
+  const delta = e.key === 'ArrowDown' ? 1 : -1
+  const next = (current + delta + items.length) % items.length
+  items[next]?.focus()
 }
 
 const sessionPreview = ref<{
@@ -1380,11 +1421,12 @@ function onSelectRow(row: SidebarConversationItem) {
                   <Teleport to="body">
                     <div
                       v-if="openWorkspaceSubmenuKey === row.key"
+                      :ref="setOpenWorkspaceSubmenu"
                       class="sidebar-row-menu sidebar-row-menu--submenu"
                       :style="workspaceSubmenuStyle"
                       role="menu"
                       :aria-label="t('shared.sidebar.moveToProject')"
-                      @keydown="onMenuKeydown"
+                      @keydown="onWorkspaceSubmenuKeydown"
                     >
                       <button
                         v-for="ws in props.workspaces"

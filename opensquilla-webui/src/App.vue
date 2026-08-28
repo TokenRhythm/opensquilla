@@ -1158,6 +1158,29 @@ function onPinSidebarSession(payload: { key: string; pinned: boolean }) {
   writeStoredSessionKeys(SIDEBAR_SESSION_ORDER_KEY, currentOrder)
 }
 
+type RpcErrorShape = { code?: unknown; message?: unknown }
+
+function rpcErrorCode(err: unknown): string {
+  const candidate = err as RpcErrorShape | null
+  return typeof candidate?.code === 'string' ? candidate.code : ''
+}
+
+// Precise copy for the typed moveToWorkspace failure codes; any other
+// rejection (transport, INVALID_PARAMS, WORKSPACE_MOVE_FAILED, …) keeps the
+// generic message with the raw error appended.
+function workspaceMoveFailureMessage(err: unknown, genericMessage: string): string {
+  switch (rpcErrorCode(err)) {
+    case 'SESSION_NOT_FOUND':
+      return t('workspaces.moveSessionSessionMissing')
+    case 'WORKSPACE_NOT_FOUND':
+      return t('workspaces.moveSessionWorkspaceMissing')
+    case 'WORKSPACE_REMOVED':
+      return t('workspaces.moveSessionWorkspaceRemoved')
+    default:
+      return genericMessage
+  }
+}
+
 async function onMoveToWorkspace(payload: { key: string; workspaceId: string }) {
   try {
     await rpcStore.call('sessions.moveToWorkspace', {
@@ -1167,7 +1190,13 @@ async function onMoveToWorkspace(payload: { key: string; workspaceId: string }) 
     await loadSessions()
     pushToast(t('workspaces.sessionMoved'), { tone: 'ok' })
   } catch (err) {
-    pushToast(t('workspaces.moveSessionFailed', { error: errorMessage(err) }), { tone: 'danger' })
+    pushToast(
+      workspaceMoveFailureMessage(
+        err,
+        t('workspaces.moveSessionFailed', { error: errorMessage(err) }),
+      ),
+      { tone: 'danger' },
+    )
   }
 }
 
@@ -1177,7 +1206,13 @@ async function onMoveFromWorkspace(key: string) {
     await loadSessions()
     pushToast(t('workspaces.sessionRemoved'), { tone: 'ok' })
   } catch (err) {
-    pushToast(t('workspaces.removeSessionFailed', { error: errorMessage(err) }), { tone: 'danger' })
+    pushToast(
+      workspaceMoveFailureMessage(
+        err,
+        t('workspaces.removeSessionFailed', { error: errorMessage(err) }),
+      ),
+      { tone: 'danger' },
+    )
   }
 }
 

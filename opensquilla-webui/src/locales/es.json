@@ -64,6 +64,9 @@
     "sessionMoved": "Tarea movida al proyecto",
     "moveSessionFailed": "No se pudo mover la tarea: {error}",
     "sessionRemoved": "Tarea removida del proyecto",
+    "moveSessionSessionMissing": "Esta tarea ya no existe; la lista se ha actualizado",
+    "moveSessionWorkspaceMissing": "Ese proyecto ya no existe",
+    "moveSessionWorkspaceRemoved": "Ese proyecto fue eliminado; elige otro proyecto",
     "removeSessionFailed": "No se pudo remover la tarea del proyecto: {error}"
   },
   "updates": {

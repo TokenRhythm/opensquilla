@@ -64,6 +64,9 @@
     "sessionMoved": "Aufgabe in Projekt verschoben",
     "moveSessionFailed": "Aufgabe konnte nicht verschoben werden: {error}",
     "sessionRemoved": "Aufgabe aus Projekt entfernt",
+    "moveSessionSessionMissing": "Diese Aufgabe existiert nicht mehr; die Liste wurde aktualisiert",
+    "moveSessionWorkspaceMissing": "Dieses Projekt existiert nicht mehr",
+    "moveSessionWorkspaceRemoved": "Dieses Projekt wurde entfernt; bitte ein anderes auswählen",
     "removeSessionFailed": "Aufgabe konnte nicht aus Projekt entfernt werden: {error}"
   },
   "updates": {

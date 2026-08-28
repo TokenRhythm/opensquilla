@@ -64,6 +64,9 @@
     "sessionMoved": "Tâche déplacée vers le projet",
     "moveSessionFailed": "Impossible de déplacer la tâche : {error}",
     "sessionRemoved": "Tâche retirée du projet",
+    "moveSessionSessionMissing": "Cette tâche n'existe plus ; la liste a été actualisée",
+    "moveSessionWorkspaceMissing": "Ce projet n'existe plus",
+    "moveSessionWorkspaceRemoved": "Ce projet a été supprimé; choisissez un autre projet",
     "removeSessionFailed": "Impossible de retirer la tâche du projet : {error}"
   },
   "updates": {

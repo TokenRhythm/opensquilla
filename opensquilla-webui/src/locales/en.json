@@ -64,6 +64,9 @@
     "sessionMoved": "Task moved to project",
     "moveSessionFailed": "Could not move task: {error}",
     "sessionRemoved": "Task removed from project",
+    "moveSessionSessionMissing": "This task no longer exists; the list has been refreshed",
+    "moveSessionWorkspaceMissing": "That project no longer exists",
+    "moveSessionWorkspaceRemoved": "That project was removed; pick another project",
     "removeSessionFailed": "Could not remove task from project: {error}"
   },
   "updates": {

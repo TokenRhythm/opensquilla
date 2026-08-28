@@ -64,6 +64,9 @@
     "sessionMoved": "タスクをプロジェクトに移動しました",
     "moveSessionFailed": "タスクを移動できませんでした: {error}",
     "sessionRemoved": "タスクをプロジェクトから削除しました",
+    "moveSessionSessionMissing": "このタスクはもう存在しません。リストを更新しました",
+    "moveSessionWorkspaceMissing": "そのプロジェクトはもう存在しません",
+    "moveSessionWorkspaceRemoved": "そのプロジェクトは削除されました。他のプロジェクトを選択してください",
     "removeSessionFailed": "プロジェクトからタスクを削除できませんでした: {error}"
   },
   "updates": {
