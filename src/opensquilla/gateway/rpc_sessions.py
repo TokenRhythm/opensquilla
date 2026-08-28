@@ -45,6 +45,9 @@ from opensquilla.engine.steps.router_decision_record import (
     drain_pending_flushes_for_sessions,
 )
 from opensquilla.gateway import attachment_ingest as _attachment_ingest
+from opensquilla.gateway.adapters.sessions_list_contract import (
+    register_sessions_list_contract,
+)
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
 from opensquilla.gateway.artifact_product_errors import (
     ArtifactProductErrorCode,
@@ -2683,7 +2686,6 @@ def _decode_session_list_cursor(value: Any) -> SessionListCursor | None:
     )
 
 
-@_d.method("sessions.list", scope="operator.read")
 async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
     """List all sessions."""
     now_ms = int(time.time() * 1000)
@@ -2891,6 +2893,13 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
             }
         )
     return payload
+
+
+_handle_sessions_list_contract = register_sessions_list_contract(
+    _d,
+    _handle_sessions_list,
+    internal_error=RpcHandlerError,
+)
 
 
 async def _titles_for_keys(

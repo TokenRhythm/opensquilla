@@ -6,6 +6,9 @@ import re
 import secrets
 from typing import Any
 
+from opensquilla.contracts.generated.v4.sessions_list_metadata import (
+    SESSIONS_LIST_METHOD,
+)
 from opensquilla.session.keys import canonicalize_session_key, parse_agent_id
 
 _OWNER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -19,7 +22,7 @@ GUEST_RPC_ALLOWLIST = frozenset(
         "chat.clarify_submit",
         "artifacts.list",
         "artifacts.get",
-        "sessions.list",
+        SESSIONS_LIST_METHOD,
         "sessions.rename",
         "sessions.delete",
         "sessions.bootstrap",
@@ -151,7 +154,7 @@ class GuestRpcPolicy:
             params.pop("initialRoutingMode", None)
             params.pop("initial_routing_mode", None)
 
-        if method == "sessions.list":
+        if method == SESSIONS_LIST_METHOD:
             return params
 
         if method == "chat.send":

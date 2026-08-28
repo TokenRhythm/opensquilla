@@ -643,6 +643,7 @@
     "tests/test_gateway/test_session_model_routing.py": 0.01,
     "tests/test_gateway/test_session_model_routing_rpc.py": 0.01,
     "tests/test_gateway/test_session_streams.py": 0.038,
+    "tests/test_gateway/test_sessions_list_contract_adapter.py": 0.01,
     "tests/test_gateway/test_shutdown_endpoint.py": 0.117,
     "tests/test_gateway/test_shutdown_order.py": 0.625,
     "tests/test_gateway/test_skill_management_service_injection.py": 0.734,
