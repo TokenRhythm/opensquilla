@@ -33,9 +33,15 @@ export interface SessionPage {
 
 export interface SessionCount { value: number; exact: boolean }
 
+export interface SessionDirectoryQueryOptions {
+  signal?: AbortSignal
+}
+
 export interface SessionDirectory {
-  listPage(request: { limit: number; cursor?: string; signal?: AbortSignal }): Promise<SessionPage>
-  count(): Promise<SessionCount | null>
+  listPage(
+    request: { limit: number; cursor?: string } & SessionDirectoryQueryOptions,
+  ): Promise<SessionPage>
+  count(options?: SessionDirectoryQueryOptions): Promise<SessionCount | null>
 }
 
 export const SESSION_DIRECTORY_KEY: InjectionKey<SessionDirectory> = Symbol('SessionDirectory')

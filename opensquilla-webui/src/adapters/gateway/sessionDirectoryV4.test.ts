@@ -26,7 +26,7 @@ interface FixtureDocument {
 
 const callPolicy = {
   timeoutMs: 10_000,
-  timeoutAction: 'reconnect',
+  timeoutAction: 'reject',
   abortAction: 'reject',
 }
 
@@ -167,6 +167,42 @@ describe('v4 SessionDirectory Adapter', () => {
       { limit: 5, view: 'session-list-v1' },
       { ...callPolicy, signal: controller.signal },
     )
+  })
+
+  it('passes caller cancellation through the count query without reconnect ownership', async () => {
+    const controller = new AbortController()
+    const ready = vi.fn().mockResolvedValue(undefined)
+    const requestTransport = vi.fn().mockResolvedValue({ totalCount: 4 })
+    const directory = createV4SessionDirectory({
+      ready,
+      request: requestTransport as SessionDirectoryTransport['request'],
+    })
+
+    await expect(directory.count({ signal: controller.signal })).resolves.toEqual({
+      value: 4,
+      exact: true,
+    })
+
+    expect(ready).toHaveBeenCalledWith({
+      timeoutMs: 10_000,
+      signal: controller.signal,
+      timeoutAction: 'reject',
+      abortAction: 'reject',
+    })
+    expect(requestTransport).toHaveBeenCalledWith(
+      SESSIONS_LIST_METHOD,
+      { limit: 200, view: 'session-count-v1' },
+      { ...callPolicy, signal: controller.signal },
+    )
+  })
+
+  it('propagates genuine transport failures without rewriting them', async () => {
+    const failure = new Error('connection lost')
+    const directory = createV4SessionDirectory({
+      request: vi.fn().mockRejectedValue(failure) as SessionDirectoryTransport['request'],
+    })
+
+    await expect(directory.count()).rejects.toBe(failure)
   })
 
   it('lets callers replace the Adapter at the SessionDirectory seam', async () => {

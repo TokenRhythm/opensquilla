@@ -27,7 +27,7 @@ const SESSION_COUNT_VIEW = 'session-count-v1'
 const SESSION_DIRECTORY_TIMEOUT_MS = 10_000
 const SESSION_DIRECTORY_CALL_OPTIONS: RpcCallOptions = {
   timeoutMs: SESSION_DIRECTORY_TIMEOUT_MS,
-  timeoutAction: 'reconnect',
+  timeoutAction: 'reject',
   abortAction: 'reject',
 }
 
@@ -245,8 +245,11 @@ export function createV4SessionDirectory(
       }
     },
 
-    async count(): Promise<SessionCount | null> {
-      const result = await call({ limit: 200, view: SESSION_COUNT_VIEW })
+    async count(options = {}): Promise<SessionCount | null> {
+      const result = await call(
+        { limit: 200, view: SESSION_COUNT_VIEW },
+        options.signal,
+      )
       const exact = numberValue(result.totalCount, result.total_count)
       if (exact != null && Number.isInteger(exact) && exact >= 0) return { value: exact, exact: true }
       const entries = Array.isArray(result.sessions)
