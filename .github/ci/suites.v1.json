@@ -167,10 +167,15 @@
     },
     "frontend-validation": {
       "execution_inputs": [
+        ".gitattributes",
         "contracts/gateway/v4/**",
         "opensquilla-webui/**",
+        "pyproject.toml",
         "scripts/contracts/**",
-        "src/opensquilla/contracts/generated/v4/**"
+        "src/opensquilla/contracts/generated/v4/**",
+        "tests/contracts/**",
+        "tests/fixtures/contracts/gateway/v4/**",
+        "uv.lock"
       ]
     },
     "wheel-webui-roundtrip": {

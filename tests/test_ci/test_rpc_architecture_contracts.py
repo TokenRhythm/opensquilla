@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_ROOT = ROOT / "src" / "opensquilla"
 GATEWAY_ROOT = PACKAGE_ROOT / "gateway"
 CONTRACT_ROOT = PACKAGE_ROOT / "contracts"
+GENERATED_CONTRACT_ROOT = CONTRACT_ROOT / "generated"
 RPC_CONTEXT = GATEWAY_ROOT / "rpc" / "registry.py"
 GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
     {
@@ -29,8 +30,6 @@ GENERATED_METADATA_IMPORT_ALLOWLIST = frozenset(
 )
 SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
     {
-        "src/opensquilla/contracts/generated/v4/sessions_list.py": 1,
-        "src/opensquilla/contracts/generated/v4/sessions_list_metadata.py": 1,
         # This is a transport concurrency policy registry.  WebSocket is an
         # explicitly frozen file in the first vertical slice, not a second
         # method implementation or payload schema.
@@ -226,9 +225,14 @@ def test_contract_package_remains_a_leaf_module() -> None:
     assert violations == []
 
 
-def test_generated_python_wire_types_are_adapter_only() -> None:
+def _generated_python_wire_consumers() -> set[str]:
     consumers: set[str] = set()
     for path in _python_files(PACKAGE_ROOT):
+        # Generated registries are allowed to compose other generated models.
+        # The boundary enforced below is between generated code and authored
+        # production code, not between files inside the generated package.
+        if path.is_relative_to(GENERATED_CONTRACT_ROOT):
+            continue
         for node in ast.walk(_tree(path)):
             modules = _imported_modules(path, node)
             if any(
@@ -238,7 +242,28 @@ def test_generated_python_wire_types_are_adapter_only() -> None:
             ):
                 consumers.add(_relative(path))
 
+    return consumers
+
+
+def test_generated_python_wire_types_are_adapter_only() -> None:
+    consumers = _generated_python_wire_consumers()
+
     assert consumers == GENERATED_WIRE_IMPORT_ALLOWLIST
+
+
+def test_generated_registry_stays_inside_the_generated_boundary() -> None:
+    registry = GENERATED_CONTRACT_ROOT / "v4" / "gateway_contract_registry.py"
+    imported_modules = {
+        module
+        for node in ast.walk(_tree(registry))
+        for module in _imported_modules(registry, node)
+    }
+
+    assert any(
+        module.startswith("opensquilla.contracts.generated.v4.")
+        for module in imported_modules
+    )
+    assert _relative(registry) not in _generated_python_wire_consumers()
 
 
 def test_schema_derived_method_metadata_consumers_are_exact() -> None:
@@ -261,6 +286,8 @@ def test_schema_derived_method_metadata_consumers_are_exact() -> None:
 def test_sessions_list_authored_literal_debt_is_exact() -> None:
     actual: Counter[str] = Counter()
     for path in _python_files(PACKAGE_ROOT):
+        if path.is_relative_to(GENERATED_CONTRACT_ROOT):
+            continue
         for node in ast.walk(_tree(path)):
             if isinstance(node, ast.Constant) and node.value == "sessions.list":
                 actual[_relative(path)] += 1

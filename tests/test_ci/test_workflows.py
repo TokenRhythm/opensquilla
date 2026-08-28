@@ -681,6 +681,7 @@ def test_ci_rejects_tracked_frontend_dist_and_builds_a_verified_artifact() -> No
 def test_webui_text_and_docker_context_contracts_are_enforced_in_ci() -> None:
     attributes = Path(".gitattributes").read_text(encoding="utf-8").splitlines()
     assert "opensquilla-webui/** text=auto eol=lf" in attributes
+    assert "src/opensquilla/contracts/generated/v4/** text eol=lf" in attributes
 
     workflow = _workflow("ci.yml")
     ubuntu = workflow["jobs"]["ubuntu-quality"]
@@ -1084,6 +1085,11 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     ]
     assert "'frontend-validation'" in jobs["frontend-check"]["if"]
     assert "'wheel-webui-roundtrip'" in jobs["frontend-check"]["if"]
+    assert jobs["gateway-contract-windows"]["needs"] == [
+        "plan-ci",
+        "frontend-check",
+    ]
+    assert "'frontend-validation'" in jobs["gateway-contract-windows"]["if"]
     assert "'tui'" in jobs["tui-check"]["if"]
     assert "'desktop-static'" in jobs["desktop-check"]["if"]
     assert "'python-targeted'" in jobs["ubuntu-quality"]["if"]
@@ -1105,9 +1111,63 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert "macos-recovery" in jobs["ci-result"]["needs"]
     assert "desktop-recovery-e2e" in jobs["ci-result"]["needs"]
     assert "managed-toolchain-artifacts" in jobs["ci-result"]["needs"]
+    assert "gateway-contract-windows" in jobs["ci-result"]["needs"]
     artifact_e2e = jobs["managed-toolchain-artifacts"]
     assert artifact_e2e["uses"] == "./.github/workflows/managed-toolchain-artifacts.yml"
     assert "'managed-toolchain'" in artifact_e2e["if"]
+
+
+def test_gateway_contract_hashes_are_compared_between_linux_and_windows() -> None:
+    jobs = _workflow("ci.yml")["jobs"]
+    linux_steps = jobs["frontend-check"]["steps"]
+    windows = jobs["gateway-contract-windows"]
+    windows_steps = windows["steps"]
+
+    linux_integration = next(
+        step
+        for step in linux_steps
+        if step.get("name") == "Run real Gateway Contract toolchain integration"
+    )
+    linux_manifest = next(
+        step
+        for step in linux_steps
+        if step.get("name") == "Write Linux Gateway Contract hash manifest"
+    )
+    upload = next(
+        step
+        for step in linux_steps
+        if step.get("name") == "Upload Linux Gateway Contract hash manifest"
+    )
+    download = next(
+        step
+        for step in windows_steps
+        if step.get("name") == "Download Linux Gateway Contract hash manifest"
+    )
+    compare = next(
+        step
+        for step in windows_steps
+        if step.get("name") == "Compare Linux and Windows Contract hashes"
+    )
+
+    assert windows["runs-on"] == "windows-latest"
+    assert "tests/contracts" in linux_integration["run"]
+    assert linux_integration["env"]["PYTHONPATH"] == (
+        "${{ github.workspace }}:${{ github.workspace }}/src"
+    )
+    windows_verification = next(
+        step
+        for step in windows_steps
+        if step.get("name") == "Verify Windows Contract generation and real toolchain"
+    )
+    assert "tests/contracts" in windows_verification["run"]
+    assert windows_verification["env"]["PYTHONPATH"] == (
+        "${{ github.workspace }};${{ github.workspace }}/src"
+    )
+    assert "--hash-manifest" in linux_manifest["run"]
+    assert upload["with"]["name"] == "gateway-contract-hashes-linux"
+    assert download["with"]["name"] == upload["with"]["name"]
+    assert "--hash-manifest" in compare["run"]
+    assert "--compare-hash-manifests" in compare["run"]
 
 
 def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> None:
@@ -1126,6 +1186,7 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
         "readme-locale-check",
         "frontend-artifact",
         "frontend-check",
+        "gateway-contract-windows",
         "webui-chat-recovery",
         "tui-check",
         "desktop-check",
@@ -1145,6 +1206,9 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
     assert gate_step["env"]["RESULT_FRONTEND_ARTIFACT"] == (
         "${{ needs.frontend-artifact.result }}"
     )
+    assert gate_step["env"]["RESULT_CONTRACT_WINDOWS"] == (
+        "${{ needs.gateway-contract-windows.result }}"
+    )
     assert gate_step["env"]["RESULT_UBUNTU_FULL"] == "${{ needs.ubuntu-full.result }}"
     assert gate_step["env"]["RESULT_MACOS_RECOVERY"] == (
         "${{ needs.macos-recovery.result }}"
@@ -1163,6 +1227,7 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
         "RESULT_README_LOCALE",
         "RESULT_FRONTEND_ARTIFACT",
         "RESULT_FRONTEND",
+        "RESULT_CONTRACT_WINDOWS",
         "RESULT_TUI",
         "RESULT_DESKTOP",
         "RESULT_UBUNTU",

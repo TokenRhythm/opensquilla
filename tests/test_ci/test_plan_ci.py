@@ -491,8 +491,13 @@ def test_generic_webui_change_does_not_wake_desktop_matrix(
     "path",
     [
         "contracts/gateway/v4/sessions/sessions-list.schema.json",
+        "scripts/contracts/generate_gateway_contracts.py",
         "scripts/contracts/generate_sessions_list_contract.py",
         "src/opensquilla/contracts/generated/v4/sessions_list.py",
+        "tests/contracts/test_gateway_contract_runner.py",
+        "tests/contracts/test_gateway_contract_toolchain_integration.py",
+        "tests/contracts/test_sessions_list_contract.py",
+        "tests/fixtures/contracts/gateway/v4/toolchain/toolchain-ping.schema.json",
     ],
 )
 def test_gateway_contract_changes_run_deterministic_generation(
@@ -500,7 +505,11 @@ def test_gateway_contract_changes_run_deterministic_generation(
 ) -> None:
     plan = _plan(tmp_path, suite_config, path)
 
-    assert "frontend-validation" in plan["required_suites"]
+    assert plan["full_fallback"] is False
+    assert {"frontend-artifact", "frontend-validation"} <= set(
+        plan["required_suites"]
+    )
+    assert plan["reason_codes"] == ["gateway_contract_changed"]
 
 
 def test_gateway_change_runs_browser_recovery_without_native_desktop(
@@ -902,6 +911,7 @@ def test_python_dependency_changes_select_reviewed_full_ecosystem_coverage(
     assert set(plan["required_suites"]) == {
         "desktop-recovery-e2e",
         "frontend-artifact",
+        "frontend-validation",
         "macos-recovery",
         "managed-toolchain",
         "python-full",
@@ -924,9 +934,13 @@ def test_python_dependency_changes_select_reviewed_full_ecosystem_coverage(
         ("macos-latest", "default"),
         ("windows-latest", "default"),
     }
-    assert "frontend-validation" not in plan["required_suites"]
     assert "desktop-static" not in plan["required_suites"]
     assert plan["reason_codes"] == ["python_dependency_changed"]
+
+    contract_inputs = set(
+        suite_config["suites"]["frontend-validation"]["execution_inputs"]
+    )
+    assert {".gitattributes", "pyproject.toml", "uv.lock"} <= contract_inputs
 
 
 @pytest.mark.parametrize(
