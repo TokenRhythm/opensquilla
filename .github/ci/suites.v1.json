@@ -253,6 +253,7 @@
     },
     "release-packaging": {
       "execution_inputs": [
+        "README*.md",
         "README.release.md",
         "RELEASES.md",
         ".github/scripts/prestage-release-to-oss.sh",
