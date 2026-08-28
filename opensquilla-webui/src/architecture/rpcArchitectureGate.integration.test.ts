@@ -80,6 +80,23 @@ describe('transport architecture gate ledger integration', () => {
     )
   })
 
+  it('analyzes RPC provenance from Vue script setup blocks', () => {
+    const root = fixture({
+      'src/stores/rpc.ts': 'export function useRpcStore(): any { return {} }',
+      'src/views/FeatureView.vue': `
+        <template><main /></template>
+        <script setup lang="ts">
+        import { useRpcStore } from '../stores/rpc'
+        const rpc = useRpcStore()
+        rpc.call('feature.get')
+        </script>
+      `,
+    })
+    expect(evaluateRpcArchitectureGate({ root, debtLanes: [] }).failures).toContain(
+      'src/views/FeatureView.vue: unexpected raw transport call (1); add a domain Adapter instead.',
+    )
+  })
+
   it('fails when a paid-down entry remains in the ledger', () => {
     const root = seededFixture('export const value = 1')
     expect(evaluateRpcArchitectureGate({ root, debtLanes: oneCallLane }).failures).toContain(
@@ -137,4 +154,148 @@ describe('transport architecture gate ledger integration', () => {
       'src/adapters/gateway/bypass.ts: Gateway Adapters must consume the private transport Interface instead of useRpcStore.',
     )
   })
+
+  it.each([
+    {
+      label: 'anonymous default return',
+      files: {
+        'src/stores/rpc.ts': 'export function useRpcStore(): any { return {} }',
+        'src/wrapper.ts': `
+          import { useRpcStore } from './stores/rpc'
+          export default () => useRpcStore()
+        `,
+        'src/feature.ts': `
+          import backend from './wrapper'
+          backend().call('feature.get')
+        `,
+      },
+      expected: 'src/feature.ts: unexpected raw transport call (1); add a domain Adapter instead.',
+    },
+    {
+      label: 'index barrel and local factory alias',
+      files: {
+        'src/stores/rpc.ts': 'export function useRpcStore(): any { return {} }',
+        'src/stores/index.ts': `export { useRpcStore } from './rpc'`,
+        'src/feature.ts': `
+          import { useRpcStore } from './stores'
+          const make = useRpcStore
+          make().call('feature.get')
+        `,
+      },
+      expected: 'src/feature.ts: unexpected raw transport call (1); add a domain Adapter instead.',
+    },
+    {
+      label: 'CommonJS bracket member',
+      files: {
+        'src/stores/rpc.ts': 'export function useRpcStore(): any { return {} }',
+        'src/feature.js': `
+          const rpc = require('./stores/rpc')['useRpcStore']()
+          rpc.call('feature.get')
+        `,
+      },
+      expected: 'src/feature.js: unexpected raw transport call (1); add a domain Adapter instead.',
+    },
+    {
+      label: 'nested object and array argument',
+      files: {
+        'src/stores/rpc.ts': 'export function useRpcStore(): any { return {} }',
+        'src/consumer.ts': `
+          export function consume({ nested: [{ rpc }] }: any) {
+            rpc.call('feature.get')
+          }
+        `,
+        'src/feature.ts': `
+          import { useRpcStore } from './stores/rpc'
+          import { consume } from './consumer'
+          consume({ nested: [{ rpc: useRpcStore() }] })
+        `,
+      },
+      expected: 'src/consumer.ts: unexpected raw transport call (1); add a domain Adapter instead.',
+    },
+  ])('rejects an unapproved raw call through $label', ({ files, expected }) => {
+    const root = fixture(files as unknown as Record<string, string>)
+    expect(evaluateRpcArchitectureGate({ root, debtLanes: [] }).failures).toContain(expected)
+  })
+
+  it('does not merge same-named values from separate lexical scopes', () => {
+    const root = seededFixture(`
+      import { useRpcStore } from './stores/rpc'
+      function seed() {
+        const client = useRpcStore()
+        return client
+      }
+      function cacheOnly() {
+        const client = { call(key: string) { return key } }
+        client.call('cache')
+      }
+      function shadowed(useRpcStore: () => { call(key: string): string }) {
+        useRpcStore().call('cache')
+      }
+      void seed
+      void cacheOnly
+      void shadowed
+    `)
+    expect(evaluateRpcArchitectureGate({ root, debtLanes: [] })).toMatchObject({
+      failures: [],
+      rpcTotal: 0,
+    })
+  })
+
+  it('rejects useRpcStore imported into an Adapter through an index barrel', () => {
+    const root = fixture({
+      'src/stores/rpc.ts': 'export function useRpcStore(): any { return {} }',
+      'src/stores/bridge.ts': `export { useRpcStore as backendStore } from './rpc'`,
+      'src/stores/index.ts': `export { backendStore as useRpcStore } from './bridge'`,
+      'src/adapters/gateway/bypass.ts': `
+        import { useRpcStore } from '../../stores'
+        export const bypass = () => useRpcStore()
+      `,
+    })
+    expect(evaluateRpcArchitectureGate({ root, debtLanes: [] }).failures).toContain(
+      'src/adapters/gateway/bypass.ts: Gateway Adapters must consume the private transport Interface instead of useRpcStore.',
+    )
+  })
+
+  it('rejects function and CommonJS private transport exports from an Adapter', () => {
+    const root = fixture({
+      'src/adapters/gateway/privateTransports.ts': `
+        export interface RpcTransport { request(method: string): unknown }
+      `,
+      'src/adapters/gateway/functionLeak.ts': `
+        import type { RpcTransport } from './privateTransports'
+        export function expose(value: RpcTransport): RpcTransport { return value }
+      `,
+      'src/adapters/gateway/cjsLeak.js': `
+        module.exports['transport'] = require('./privateTransports')['RpcTransport']
+      `,
+    })
+    const failures = evaluateRpcArchitectureGate({ root, debtLanes: [] }).failures
+    expect(failures).toEqual(expect.arrayContaining([
+      'src/adapters/gateway/functionLeak.ts: exported declaration exposes private Gateway transport symbols.',
+      'src/adapters/gateway/cjsLeak.js: CommonJS export exposes private Gateway transport symbols.',
+    ]))
+  })
+
+  it('terminates recursive shape analysis while preserving reachable depth', () => {
+    const root = fixture({
+      'src/stores/rpc.ts': 'export function useRpcStore(): any { return {} }',
+      'src/wrapper.ts': `
+        export function wrap(rpc: unknown, depth: number): unknown {
+          if (depth <= 0) return { rpc }
+          return { next: wrap(rpc, depth - 1) }
+        }
+      `,
+      'src/feature.ts': `
+        import { useRpcStore } from './stores/rpc'
+        import { wrap } from './wrapper'
+        const wrapped = wrap(useRpcStore(), 2) as any
+        wrapped.next.next.rpc.call('feature.get')
+      `,
+    })
+    const started = performance.now()
+    expect(evaluateRpcArchitectureGate({ root, debtLanes: [] }).failures).toContain(
+      'src/feature.ts: unexpected raw transport call (1); add a domain Adapter instead.',
+    )
+    expect(performance.now() - started).toBeLessThan(500)
+  }, 1_000)
 })

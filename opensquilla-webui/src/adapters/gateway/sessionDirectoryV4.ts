@@ -1,8 +1,10 @@
 import i18n from '@/i18n'
-import type { RpcCallOptions } from '@/lib/rpc'
+import type {
+  RpcCallOptions,
+  RpcConnectionWaitOptions,
+} from '@/lib/rpc'
 import {
   SESSIONS_LIST_METHOD,
-  type SessionListEntry,
   type SessionRow,
   type SessionsListParams,
   type SessionsListResult,
@@ -19,7 +21,6 @@ import {
   sessionRunStatusLabel,
   summarizeSessionTask,
 } from '@/modules/sessionRunStatus'
-import type { RpcTransport } from './privateTransports'
 
 const SESSION_LIST_VIEW = 'session-list-v1'
 const SESSION_COUNT_VIEW = 'session-count-v1'
@@ -30,8 +31,17 @@ const SESSION_DIRECTORY_CALL_OPTIONS: RpcCallOptions = {
   abortAction: 'reject',
 }
 
-type SessionDirectoryTransport = Pick<RpcTransport, 'request'>
-  & Partial<Pick<RpcTransport, 'ready'>>
+interface SessionDirectoryTransport {
+  request<T = unknown>(
+    method: string,
+    params?: Record<string, unknown>,
+    options?: RpcCallOptions,
+  ): Promise<T>
+  ready?(options?: RpcConnectionWaitOptions & {
+    timeoutMs?: number
+    signal?: AbortSignal
+  }): Promise<void>
+}
 
 const hasOwn = (obj: unknown, field: string) =>
   !!obj && Object.prototype.hasOwnProperty.call(obj, field)
@@ -129,7 +139,7 @@ function normalizeParent(row: SessionRow): SessionItem['parent'] {
   return key || spawnDepth > 0 ? { key, spawnDepth } : null
 }
 
-export function normalizeV4SessionItem(item: SessionListEntry | unknown): SessionItem | null {
+export function normalizeV4SessionItem(item: unknown): SessionItem | null {
   const candidate = typeof item === 'string' ? { key: item } : objectValue(item)
   if (!candidate) return null
   const row = candidate as SessionRow

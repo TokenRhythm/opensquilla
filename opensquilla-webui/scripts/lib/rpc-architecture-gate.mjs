@@ -11,9 +11,9 @@ import {
 } from './http-architecture-provenance.mjs'
 import {
   boundaryReexportViolation,
+  collectBoundaryArchitectureViolations,
   gatewayAdapterRpcStoreImportViolation,
   generatedContractImportViolation,
-  localBoundaryReexportViolations,
   moduleReferenceSpecifier,
   privateGatewayTransportImportViolation,
 } from './rpc-architecture-imports.mjs'
@@ -21,6 +21,7 @@ import {
   collectRpcTransportOperations,
   TRACKED_RPC_MEMBERS,
 } from './rpc-symbol-provenance.mjs'
+import { createRpcAnalysisProgram } from './rpc-typescript-program.mjs'
 import { transportDebtLanes } from '../rpc-debt/index.mjs'
 
 const defaultRoot = fileURLToPath(new URL('../..', import.meta.url))
@@ -109,10 +110,6 @@ export function evaluateRpcArchitectureGate({
   }
 
   for (const { rel, source } of sources) {
-    failures.push(...localBoundaryReexportViolations(ts, source, {
-      root,
-      importer: rel,
-    }))
     function visit(node) {
       const specifier = moduleReferenceSpecifier(ts, node)
       if (specifier) {
@@ -148,6 +145,13 @@ export function evaluateRpcArchitectureGate({
     }
     visit(source)
   }
+  const sourceAnalysis = createRpcAnalysisProgram({ ts, root, sources })
+  failures.push(...collectBoundaryArchitectureViolations({
+    ts,
+    root,
+    sources,
+    analysis: sourceAnalysis,
+  }))
 
   const productionSources = sources.filter(({ rel }) => (
     !isTestFile(rel) && !isGeneratedContract(rel)
@@ -157,6 +161,7 @@ export function evaluateRpcArchitectureGate({
     ts,
     root,
     sources: productionSources,
+    analysis: sourceAnalysis,
   })) {
     if (isRpcTransportImplementation(operation.rel)) continue
     increment(actualByKind.get(operation.kind), operation.rel)

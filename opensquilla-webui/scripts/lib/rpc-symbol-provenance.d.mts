@@ -19,4 +19,5 @@ export function collectRpcTransportOperations(input: {
     rel: string
     source: import('typescript').SourceFile
   }>
+  analysis?: import('./rpc-typescript-program.mjs').RpcAnalysisProgram
 }): RpcTransportOperation[]

@@ -30,17 +30,15 @@ export function boundaryReexportViolation(
   input: GeneratedContractImport,
 ): string | null
 
-export function importedBoundarySymbols(
-  ts: any,
-  source: any,
-  input: Pick<GeneratedContractImport, 'root' | 'importer'>,
-): Map<string, string>
-
-export function localBoundaryReexportViolations(
-  ts: any,
-  source: any,
-  input: Pick<GeneratedContractImport, 'root' | 'importer'>,
-): string[]
+export function collectBoundaryArchitectureViolations(input: {
+  ts: typeof import('typescript')
+  root: string
+  sources: Array<{
+    rel: string
+    source: import('typescript').SourceFile
+  }>
+  analysis?: import('./rpc-typescript-program.mjs').RpcAnalysisProgram
+}): string[]
 
 export function moduleReferenceSpecifier(ts: any, node: any): string | null
 

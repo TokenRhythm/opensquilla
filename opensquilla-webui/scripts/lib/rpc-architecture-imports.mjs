@@ -1,5 +1,7 @@
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 
+import { createRpcAnalysisProgram } from './rpc-typescript-program.mjs'
+
 function normalized(path) {
   return path.replace(/\\/g, '/')
 }
@@ -111,187 +113,372 @@ export function boundaryReexportViolation({ root, importer, specifier }) {
 }
 
 /**
- * Track boundary symbols imported into a module so alias re-exports can be
- * rejected as strictly as direct ``export ... from`` declarations.
+ * Whole-program export and composition fence.  TypeScript symbols retain the
+ * declaration behind barrels and aliases, so private/generated values cannot
+ * be laundered by renaming them and Adapter imports of useRpcStore cannot hide
+ * behind an index module.
  */
-export function importedBoundarySymbols(ts, source, { root, importer }) {
-  const symbols = new Map()
-  for (const statement of source.statements) {
-    if (
-      !ts.isImportDeclaration(statement)
-      || !ts.isStringLiteralLike(statement.moduleSpecifier)
-      || !statement.importClause
-    ) continue
-    const kind = boundaryModuleKind({
-      root,
-      importer,
-      specifier: statement.moduleSpecifier.text,
-    })
-    if (!kind) continue
-    if (statement.importClause.name) symbols.set(statement.importClause.name.text, kind)
-    const bindings = statement.importClause.namedBindings
-    if (bindings && ts.isNamespaceImport(bindings)) {
-      symbols.set(bindings.name.text, kind)
-    } else if (bindings && ts.isNamedImports(bindings)) {
-      for (const element of bindings.elements) symbols.set(element.name.text, kind)
+export function collectBoundaryArchitectureViolations({
+  ts,
+  root,
+  sources,
+  analysis: suppliedAnalysis,
+}) {
+  const analysis = suppliedAnalysis ?? createRpcAnalysisProgram({ ts, root, sources })
+  const { checker } = analysis
+  const failures = []
+  const originBySymbol = new Map()
+  const sourceByRel = new Map(analysis.sources.map(entry => [entry.rel, entry.source]))
+
+  function markExportOrigins(rel, kind, only = null) {
+    const source = sourceByRel.get(rel)
+    const moduleSymbol = source ? analysis.symbolAt(source) : null
+    if (!moduleSymbol) return
+    for (const symbol of checker.getExportsOfModule(moduleSymbol)) {
+      if (only && symbol.getName() !== only) continue
+      originBySymbol.set(symbol, kind)
+      const canonical = analysis.canonicalSymbol(symbol)
+      if (canonical) originBySymbol.set(canonical, kind)
     }
   }
 
-  // Production JavaScript occasionally uses CommonJS even though the WebUI is
-  // otherwise ESM. Treat a literal require() exactly like an import so a .js
-  // barrel cannot launder a private transport or generated wire symbol.
-  function collectRequires(node) {
+  for (const { rel } of analysis.sources) {
+    if (isGeneratedContract(rel)) markExportOrigins(rel, 'generated Contract')
     if (
-      ts.isVariableDeclaration(node)
-      && node.initializer
-      && ts.isCallExpression(node.initializer)
-      && ts.isIdentifier(node.initializer.expression)
-      && node.initializer.expression.text === 'require'
-      && node.initializer.arguments.length === 1
-      && ts.isStringLiteralLike(node.initializer.arguments[0])
+      rel === 'src/adapters/gateway/privateTransports.ts'
+      || rel === 'src/adapters/gateway/privateHttpTransport.ts'
+    ) markExportOrigins(rel, 'private Gateway transport')
+  }
+  markExportOrigins('src/stores/rpc.ts', 'RPC store factory', 'useRpcStore')
+
+  function rawSymbol(node) {
+    if (
+      node
+      && ts.isIdentifier(node)
+      && ts.isShorthandPropertyAssignment(node.parent)
+      && node.parent.name === node
     ) {
-      const kind = boundaryModuleKind({
-        root,
-        importer,
-        specifier: node.initializer.arguments[0].text,
-      })
-      if (kind && ts.isIdentifier(node.name)) symbols.set(node.name.text, kind)
-      if (kind && ts.isObjectBindingPattern(node.name)) {
-        for (const element of node.name.elements) {
-          if (ts.isIdentifier(element.name)) symbols.set(element.name.text, kind)
-        }
+      return checker.getShorthandAssignmentValueSymbol(node.parent)
+        ?? analysis.symbolAt(node)
+    }
+    return analysis.symbolAt(node)
+  }
+
+  function symbolOrigin(symbol, seen = new Set()) {
+    if (!symbol || seen.has(symbol)) return null
+    const nextSeen = new Set(seen).add(symbol)
+    const direct = originBySymbol.get(symbol)
+    if (direct) return direct
+    const canonical = analysis.canonicalSymbol(symbol)
+    if (canonical && canonical !== symbol) {
+      const origin = symbolOrigin(canonical, nextSeen)
+      if (origin) return origin
+    }
+    for (const declaration of symbol.declarations ?? []) {
+      if (ts.isVariableDeclaration(declaration) && declaration.initializer) {
+        const [kind] = valueBoundaryKinds(declaration.initializer, nextSeen)
+        if (kind) return kind
+      }
+      if (ts.isTypeAliasDeclaration(declaration)) {
+        const [kind] = typeBoundaryKinds(declaration.type, nextSeen)
+        if (kind) return kind
+      }
+      if (ts.isInterfaceDeclaration(declaration)) {
+        const [kind] = typeBoundaryKinds(declaration, nextSeen)
+        if (kind) return kind
+      }
+      if (ts.isFunctionDeclaration(declaration) || ts.isMethodDeclaration(declaration)) {
+        const [kind] = functionExposureKinds(declaration, nextSeen)
+        if (kind) return kind
+      }
+      if (ts.isExportAssignment(declaration)) {
+        const [kind] = valueBoundaryKinds(declaration.expression, nextSeen)
+        if (kind) return kind
       }
     }
-    ts.forEachChild(node, collectRequires)
+    return null
   }
-  collectRequires(source)
-  return symbols
-}
 
-function referencedBoundaryKinds(ts, node, symbols) {
-  const kinds = new Set()
-  function visit(current) {
-    if (ts.isIdentifier(current)) {
-      const kind = symbols.get(current.text)
-      if (kind) kinds.add(kind)
+  function typeBoundaryKinds(node, seen = new Set()) {
+    const kinds = new Set()
+    function visit(current) {
+      if (ts.isIdentifier(current)) {
+        const kind = symbolOrigin(rawSymbol(current), seen)
+        if (kind) kinds.add(kind)
+      }
+      ts.forEachChild(current, visit)
     }
-    ts.forEachChild(current, visit)
+    visit(node)
+    return kinds
   }
-  visit(node)
-  return kinds
-}
 
-function exported(ts, node) {
-  return Boolean(ts.getModifiers(node)?.some(modifier => (
-    modifier.kind === ts.SyntaxKind.ExportKeyword
-  )))
-}
+  function requireBoundaryKind(expression, importerRel) {
+    const current = unwrapExpression(ts, expression)
+    let specifier = null
+    let exported = 'default'
+    if (
+      ts.isCallExpression(current)
+      && ts.isIdentifier(current.expression)
+      && current.expression.text === 'require'
+      && current.arguments.length === 1
+      && ts.isStringLiteralLike(current.arguments[0])
+    ) specifier = current.arguments[0].text
+    const access = (
+      ts.isPropertyAccessExpression(current)
+      || (
+        ts.isElementAccessExpression(current)
+        && current.argumentExpression
+        && ts.isStringLiteralLike(current.argumentExpression)
+      )
+    ) ? current : null
+    if (access) {
+      const receiver = unwrapExpression(ts, access.expression)
+      if (
+        ts.isCallExpression(receiver)
+        && ts.isIdentifier(receiver.expression)
+        && receiver.expression.text === 'require'
+        && receiver.arguments.length === 1
+        && ts.isStringLiteralLike(receiver.arguments[0])
+      ) {
+        specifier = receiver.arguments[0].text
+        exported = ts.isPropertyAccessExpression(access)
+          ? access.name.text
+          : access.argumentExpression.text
+      }
+    }
+    if (!specifier) return null
+    const record = analysis.resolveRecord(importerRel, specifier)
+    const symbol = record ? analysis.exportedSymbol(record.rel, exported) : null
+    return symbolOrigin(symbol)
+      ?? (record && isGeneratedContract(record.rel) ? 'generated Contract' : null)
+      ?? (record && (
+        record.rel === 'src/adapters/gateway/privateTransports.ts'
+        || record.rel === 'src/adapters/gateway/privateHttpTransport.ts'
+      ) ? 'private Gateway transport' : null)
+  }
 
-function propagateBoundaryAliases(ts, source, imported) {
-  const symbols = new Map(imported)
-  let changed = true
-  while (changed) {
-    changed = false
-    for (const statement of source.statements) {
-      if (ts.isVariableStatement(statement)) {
-        for (const declaration of statement.declarationList.declarations) {
-          if (!ts.isIdentifier(declaration.name) || !declaration.initializer) continue
-          const [kind] = referencedBoundaryKinds(ts, declaration.initializer, symbols)
-          if (kind && !symbols.has(declaration.name.text)) {
-            symbols.set(declaration.name.text, kind)
-            changed = true
+  function valueBoundaryKinds(expression, seen = new Set()) {
+    const current = unwrapExpression(ts, expression)
+    const kinds = new Set()
+    const stateRel = analysis.relForSource(current.getSourceFile())
+    const required = stateRel ? requireBoundaryKind(current, stateRel) : null
+    if (required) kinds.add(required)
+    if (ts.isIdentifier(current) || ts.isPropertyAccessExpression(current)) {
+      const node = ts.isPropertyAccessExpression(current) ? current.name : current
+      const kind = symbolOrigin(rawSymbol(node), seen)
+      if (kind) kinds.add(kind)
+      return kinds
+    }
+    if (
+      ts.isElementAccessExpression(current)
+      && current.argumentExpression
+      && ts.isStringLiteralLike(current.argumentExpression)
+    ) {
+      const kind = symbolOrigin(rawSymbol(current.argumentExpression), seen)
+        ?? symbolOrigin(rawSymbol(current), seen)
+      if (kind) kinds.add(kind)
+      return kinds
+    }
+    if (ts.isObjectLiteralExpression(current)) {
+      for (const property of current.properties) {
+        if (ts.isSpreadAssignment(property)) {
+          for (const kind of valueBoundaryKinds(property.expression, seen)) kinds.add(kind)
+        } else if (ts.isPropertyAssignment(property)) {
+          for (const kind of valueBoundaryKinds(property.initializer, seen)) kinds.add(kind)
+        } else if (ts.isShorthandPropertyAssignment(property)) {
+          for (const kind of valueBoundaryKinds(property.name, seen)) kinds.add(kind)
+        }
+      }
+      return kinds
+    }
+    if (ts.isArrayLiteralExpression(current)) {
+      for (const element of current.elements) {
+        if (!ts.isSpreadElement(element)) {
+          for (const kind of valueBoundaryKinds(element, seen)) kinds.add(kind)
+        }
+      }
+      return kinds
+    }
+    if (ts.isConditionalExpression(current)) {
+      for (const kind of valueBoundaryKinds(current.whenTrue, seen)) kinds.add(kind)
+      for (const kind of valueBoundaryKinds(current.whenFalse, seen)) kinds.add(kind)
+      return kinds
+    }
+    if (ts.isArrowFunction(current) || ts.isFunctionExpression(current)) {
+      return functionExposureKinds(current, seen)
+    }
+    if (ts.isCallExpression(current)) {
+      const signature = checker.getResolvedSignature(current)
+      const declaration = signature?.declaration
+      if (declaration?.type) {
+        for (const kind of typeBoundaryKinds(declaration.type, seen)) kinds.add(kind)
+      }
+      return kinds
+    }
+    return kinds
+  }
+
+  function functionExposureKinds(node, seen = new Set()) {
+    const kinds = new Set()
+    for (const parameter of node.parameters ?? []) {
+      if (parameter.type) {
+        for (const kind of typeBoundaryKinds(parameter.type, seen)) kinds.add(kind)
+      }
+    }
+    if (node.type) {
+      for (const kind of typeBoundaryKinds(node.type, seen)) kinds.add(kind)
+    }
+    for (const parameter of node.typeParameters ?? []) {
+      if (parameter.constraint) {
+        for (const kind of typeBoundaryKinds(parameter.constraint, seen)) kinds.add(kind)
+      }
+    }
+    if (node.body && !ts.isBlock(node.body)) {
+      for (const kind of valueBoundaryKinds(node.body, seen)) kinds.add(kind)
+      return kinds
+    }
+    function visit(current) {
+      if (ts.isFunctionLike(current) && current !== node) return
+      if (ts.isReturnStatement(current) && current.expression) {
+        for (const kind of valueBoundaryKinds(current.expression, seen)) kinds.add(kind)
+        return
+      }
+      ts.forEachChild(current, visit)
+    }
+    if (node.body) visit(node.body)
+    return kinds
+  }
+
+  function exportedStatementKinds(statement) {
+    const kinds = new Set()
+    if (ts.isVariableStatement(statement)) {
+      for (const declaration of statement.declarationList.declarations) {
+        if (declaration.type) {
+          for (const kind of typeBoundaryKinds(declaration.type)) kinds.add(kind)
+        }
+        if (declaration.initializer) {
+          for (const kind of valueBoundaryKinds(declaration.initializer)) kinds.add(kind)
+        }
+      }
+    } else if (ts.isFunctionDeclaration(statement)) {
+      for (const kind of functionExposureKinds(statement)) kinds.add(kind)
+    } else if (ts.isClassDeclaration(statement)) {
+      for (const heritage of statement.heritageClauses ?? []) {
+        for (const kind of typeBoundaryKinds(heritage)) kinds.add(kind)
+      }
+      for (const member of statement.members) {
+        if (member.type) for (const kind of typeBoundaryKinds(member.type)) kinds.add(kind)
+        if (
+          ts.isMethodDeclaration(member)
+          || ts.isConstructorDeclaration(member)
+          || ts.isGetAccessorDeclaration(member)
+          || ts.isSetAccessorDeclaration(member)
+        ) {
+          for (const kind of functionExposureKinds(member)) kinds.add(kind)
+        } else if (member.initializer) {
+          for (const kind of valueBoundaryKinds(member.initializer)) kinds.add(kind)
+        }
+      }
+    } else if (ts.isTypeAliasDeclaration(statement)) {
+      for (const kind of typeBoundaryKinds(statement.type)) kinds.add(kind)
+    } else if (ts.isInterfaceDeclaration(statement)) {
+      for (const kind of typeBoundaryKinds(statement)) kinds.add(kind)
+    }
+    return kinds
+  }
+
+  for (const { rel, source } of analysis.sources) {
+    const generated = isGeneratedContract(rel)
+    const privateBoundaryModule = (
+      rel === 'src/adapters/gateway/privateTransports.ts'
+      || rel === 'src/adapters/gateway/privateHttpTransport.ts'
+    )
+    const adapter = isGatewayAdapter(rel) && !isTestFile(rel)
+    if (adapter && rel !== 'src/adapters/gateway/privateTransports.ts') {
+      function checkStoreImports(node) {
+        if (
+          ts.isImportSpecifier(node)
+          || ts.isImportClause(node)
+          || ts.isNamespaceImport(node)
+          || ts.isImportEqualsDeclaration(node)
+        ) {
+          const name = node.name
+          if (name && symbolOrigin(rawSymbol(name)) === 'RPC store factory') {
+            failures.push(
+              `${rel}: Gateway Adapters must consume the private transport Interface instead of useRpcStore.`,
+            )
           }
         }
-      } else if (ts.isTypeAliasDeclaration(statement)) {
-        const [kind] = referencedBoundaryKinds(ts, statement.type, symbols)
-        if (kind && !symbols.has(statement.name.text)) {
-          symbols.set(statement.name.text, kind)
-          changed = true
-        }
-      } else if (ts.isInterfaceDeclaration(statement)) {
-        const [kind] = referencedBoundaryKinds(ts, statement, symbols)
-        if (kind && !symbols.has(statement.name.text)) {
-          symbols.set(statement.name.text, kind)
-          changed = true
-        }
-      }
-    }
-  }
-  return symbols
-}
-
-export function localBoundaryReexportViolations(ts, source, { root, importer }) {
-  const imported = importedBoundarySymbols(ts, source, { root, importer })
-  const symbols = propagateBoundaryAliases(ts, source, imported)
-  const failures = []
-  for (const statement of source.statements) {
-    if (
-      ts.isExportDeclaration(statement)
-      && !statement.moduleSpecifier
-      && statement.exportClause
-      && ts.isNamedExports(statement.exportClause)
-    ) {
-      for (const element of statement.exportClause.elements) {
-        const local = (element.propertyName ?? element.name).text
-        const kind = symbols.get(local)
-        if (kind) {
+        const required = requireBoundaryKind(node, rel)
+        if (required === 'RPC store factory') {
           failures.push(
-            `${normalized(importer)}: ${kind} symbol ${local} must not be re-exported through a barrel.`,
+            `${rel}: Gateway Adapters must consume the private transport Interface instead of useRpcStore.`,
           )
         }
+        ts.forEachChild(node, checkStoreImports)
       }
+      checkStoreImports(source)
     }
 
-    if (ts.isVariableStatement(statement) && exported(ts, statement)) {
-      for (const declaration of statement.declarationList.declarations) {
-        if (!ts.isIdentifier(declaration.name) || !declaration.initializer) continue
-        for (const kind of referencedBoundaryKinds(ts, declaration.initializer, symbols)) {
-          failures.push(
-            `${normalized(importer)}: ${kind} symbol ${declaration.name.text} must not be exported through a barrel.`,
-          )
+    for (const statement of source.statements) {
+      const isExported = Boolean(ts.getModifiers(statement)?.some(modifier => (
+        modifier.kind === ts.SyntaxKind.ExportKeyword
+      )))
+      if (isExported && !privateBoundaryModule) {
+        for (const kind of exportedStatementKinds(statement)) {
+          if (kind === 'RPC store factory') continue
+          if (kind === 'generated Contract' && generated) continue
+          if (
+            kind === 'private Gateway transport'
+            && rel === 'src/adapters/gateway/gatewayAdapters.ts'
+          ) continue
+          failures.push(`${rel}: exported declaration exposes ${kind} symbols.`)
+        }
+      }
+      if (ts.isExportAssignment(statement) && !privateBoundaryModule) {
+        for (const kind of valueBoundaryKinds(statement.expression)) {
+          if (kind === 'RPC store factory') continue
+          if (kind === 'generated Contract' && generated) continue
+          failures.push(`${rel}: default export exposes ${kind} symbols.`)
         }
       }
     }
 
-    if (
-      (ts.isTypeAliasDeclaration(statement) || ts.isInterfaceDeclaration(statement))
-      && exported(ts, statement)
-    ) {
-      for (const kind of referencedBoundaryKinds(ts, statement, symbols)) {
-        failures.push(
-          `${normalized(importer)}: ${kind} symbol ${statement.name.text} must not be exported through a barrel.`,
+    function checkCjsExports(node) {
+      if (
+        ts.isBinaryExpression(node)
+        && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+        && /^(?:module\.exports|exports)(?:\.[A-Za-z_$][\w$]*|\[['"][^'"]+['"]\])?$/.test(
+          node.left.getText(source).replace(/\s/g, ''),
         )
+      ) {
+        for (const kind of valueBoundaryKinds(node.right)) {
+          if (kind === 'RPC store factory') continue
+          if (kind === 'generated Contract' && generated) continue
+          failures.push(`${rel}: CommonJS export exposes ${kind} symbols.`)
+        }
       }
-    }
-
-    if (ts.isExportAssignment(statement)) {
-      for (const kind of referencedBoundaryKinds(ts, statement.expression, symbols)) {
-        failures.push(
-          `${normalized(importer)}: ${kind} symbols must not be exported as the default module value.`,
-        )
+      if (
+        ts.isCallExpression(node)
+        && ts.isPropertyAccessExpression(node.expression)
+        && node.expression.expression.getText(source) === 'Object'
+        && node.expression.name.text === 'assign'
+        && node.arguments.length >= 2
+        && /^(?:module\.exports|exports)$/.test(node.arguments[0].getText(source).replace(/\s/g, ''))
+      ) {
+        for (const argument of node.arguments.slice(1)) {
+          for (const kind of valueBoundaryKinds(argument)) {
+            if (kind === 'RPC store factory') continue
+            if (kind === 'generated Contract' && generated) continue
+            failures.push(`${rel}: CommonJS export exposes ${kind} symbols.`)
+          }
+        }
       }
+      ts.forEachChild(node, checkCjsExports)
     }
+    if (!privateBoundaryModule) checkCjsExports(source)
   }
-
-  // CommonJS export assignment for production .js barrels.
-  function visitCommonJsExports(node) {
-    if (
-      ts.isBinaryExpression(node)
-      && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
-      && /^(?:module\.exports|exports(?:\.[A-Za-z_$][\w$]*)?)$/.test(
-        node.left.getText(source).replace(/\s/g, ''),
-      )
-    ) {
-      for (const kind of referencedBoundaryKinds(ts, node.right, symbols)) {
-        failures.push(
-          `${normalized(importer)}: ${kind} symbols must not be exported through a CommonJS barrel.`,
-        )
-      }
-    }
-    ts.forEachChild(node, visitCommonJsExports)
-  }
-  visitCommonJsExports(source)
-  return failures
+  return [...new Set(failures)]
 }
 
 /** Return a statically knowable module reference from TypeScript module syntax. */

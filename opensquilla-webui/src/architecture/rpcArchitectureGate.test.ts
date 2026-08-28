@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   boundaryReexportViolation,
+  collectBoundaryArchitectureViolations,
   callMemberReceiverText,
   callMemberReferenceReceiverText,
   destructuredCallSourceText,
@@ -13,7 +14,6 @@ import {
   isDirectCallMemberReference,
   isKnownNonRpcCallReceiver,
   isRpcCapabilityReceiverText,
-  localBoundaryReexportViolations,
   moduleReferenceSpecifier,
   namedMemberCallReceiverText,
   namedMemberReferenceReceiverText,
@@ -168,39 +168,16 @@ describe('private Gateway transport import fence', () => {
     )
   })
 
-  it('forbids renamed boundary symbols from leaking through a barrel', () => {
-    const parsed = source(`
-      import { RpcTransport as HiddenTransport } from './adapters/gateway/privateTransports'
-      import { SessionRow as HiddenWire } from './contracts/generated/v4/sessionsList'
-      export { HiddenTransport as PublicTransport, HiddenWire }
-    `)
-    expect(localBoundaryReexportViolations(ts, parsed, {
-      root: fixtureRoot,
-      importer: 'src/index.ts',
-    })).toEqual([
-      'src/index.ts: private Gateway transport symbol HiddenTransport must not be re-exported through a barrel.',
-      'src/index.ts: generated Contract symbol HiddenWire must not be re-exported through a barrel.',
-    ])
-  })
-
-  it('applies direct and aliased barrel fences to production JavaScript', () => {
+  it('applies direct barrel fences to production JavaScript', () => {
     const parsed = ts.createSourceFile(
       'barrel.js',
       `
-        import { RpcTransport as HiddenTransport } from './adapters/gateway/privateTransports.js'
-        export { HiddenTransport }
         export { SessionRow } from './contracts/generated/v4/sessionsList.js'
       `,
       ts.ScriptTarget.Latest,
       true,
       ts.ScriptKind.JS,
     )
-    expect(localBoundaryReexportViolations(ts, parsed, {
-      root: fixtureRoot,
-      importer: 'src/barrel.js',
-    })).toEqual([
-      'src/barrel.js: private Gateway transport symbol HiddenTransport must not be re-exported through a barrel.',
-    ])
     const directExport = parsed.statements.find(statement => (
       ts.isExportDeclaration(statement) && statement.moduleSpecifier
     ))
@@ -249,59 +226,6 @@ describe('private Gateway transport import fence', () => {
       importer: 'src/views/ChatView.vue',
       specifier: '@/stores/rpc',
     })).toBeNull()
-  })
-
-  it.each([
-    {
-      label: 'export const through two aliases',
-      code: `
-        import { RpcTransport as Hidden } from './adapters/gateway/privateTransports.js'
-        const first = Hidden
-        const second = first
-        export const PublicTransport = second
-      `,
-    },
-    {
-      label: 'export type alias',
-      code: `
-        import type { RpcTransport as Hidden } from './adapters/gateway/privateTransports.js'
-        type Alias = Hidden
-        export type PublicTransport = Alias
-      `,
-    },
-    {
-      label: 'default export alias',
-      code: `
-        import { RpcTransport as Hidden } from './adapters/gateway/privateTransports.js'
-        const Alias = Hidden
-        export default Alias
-      `,
-    },
-  ])('rejects $label', ({ code }) => {
-    expect(localBoundaryReexportViolations(ts, source(code), {
-      root: fixtureRoot,
-      importer: 'src/barrel.ts',
-    })).toHaveLength(1)
-  })
-
-  it('rejects transitive CommonJS aliases in a production .js barrel', () => {
-    const parsed = ts.createSourceFile(
-      'barrel.js',
-      `
-        const { RpcTransport: Hidden } = require('./adapters/gateway/privateTransports.js')
-        const Alias = Hidden
-        module.exports = { Alias }
-      `,
-      ts.ScriptTarget.Latest,
-      true,
-      ts.ScriptKind.JS,
-    )
-    expect(localBoundaryReexportViolations(ts, parsed, {
-      root: fixtureRoot,
-      importer: 'src/barrel.js',
-    })).toEqual([
-      'src/barrel.js: private Gateway transport symbols must not be exported through a CommonJS barrel.',
-    ])
   })
 
   it.each([
@@ -723,5 +647,215 @@ describe('RPC import and symbol provenance', () => {
       }),
     })
     expect(operations).toEqual([])
+  })
+
+  it.each([
+    {
+      label: 'anonymous default wrapper',
+      files: {
+        'src/stores/rpc.ts': 'export function useRpcStore() { return {} }',
+        'src/wrapper.ts': `
+          import { useRpcStore } from './stores/rpc'
+          export default () => useRpcStore()
+        `,
+        'src/consumer.ts': `
+          import backend from './wrapper'
+          backend().call('feature.get')
+        `,
+      },
+      operationRel: 'src/consumer.ts',
+    },
+    {
+      label: 'local and exported callable aliases',
+      files: {
+        'src/stores/rpc.ts': 'export function useRpcStore() { return {} }',
+        'src/wrapper.ts': `
+          import { useRpcStore } from './stores/rpc'
+          function backend() { return useRpcStore() }
+          const first = backend
+          const second = first
+          export { second as makeBackend }
+        `,
+        'src/consumer.ts': `
+          import { makeBackend } from './wrapper'
+          makeBackend().call('feature.get')
+        `,
+      },
+      operationRel: 'src/consumer.ts',
+    },
+    {
+      label: 'directory index barrel',
+      files: {
+        'src/stores/rpc.ts': 'export function useRpcStore() { return {} }',
+        'src/stores/index.ts': `export { useRpcStore } from './rpc'`,
+        'src/consumer.ts': `
+          import { useRpcStore } from './stores'
+          useRpcStore().call('feature.get')
+        `,
+      },
+      operationRel: 'src/consumer.ts',
+    },
+    {
+      label: 'CommonJS member require',
+      files: {
+        'src/stores/rpc.ts': 'export function useRpcStore() { return {} }',
+        'src/consumer.js': `
+          const rpc = require('./stores/rpc')['useRpcStore']()
+          rpc.call('feature.get')
+        `,
+      },
+      operationRel: 'src/consumer.js',
+    },
+    {
+      label: 'nested object and array destructuring',
+      files: {
+        'src/stores/rpc.ts': 'export function useRpcStore() { return {} }',
+        'src/feature.ts': `
+          export function consume({ nested: [{ rpc }] }) {
+            rpc.call('feature.get')
+          }
+        `,
+        'src/consumer.ts': `
+          import { useRpcStore } from './stores/rpc'
+          import { consume } from './feature'
+          consume({ nested: [{ rpc: useRpcStore() }] })
+        `,
+      },
+      operationRel: 'src/feature.ts',
+    },
+  ])('follows $label through the declaration graph', ({ files, operationRel }) => {
+    expect(collectRpcTransportOperations({
+      ts,
+      root: fixtureRoot,
+      sources: provenanceSources(files as unknown as Record<string, string>),
+    })).toEqual([{ rel: operationRel, kind: 'call' }])
+  })
+
+  it('keeps factory values distinct from clients and respects lexical scope', () => {
+    const operations = collectRpcTransportOperations({
+      ts,
+      root: fixtureRoot,
+      sources: provenanceSources({
+        'src/stores/rpc.ts': 'export function useRpcStore() { return {} }',
+        'src/consumer.ts': `
+          import { useRpcStore } from './stores/rpc'
+          function invokeFactory(factory: typeof useRpcStore) {
+            factory.call(null)
+          }
+          function seed() {
+            const client = useRpcStore()
+            return client
+          }
+          function cacheOnly() {
+            const client = { call(key: string) { return key } }
+            client.call('cache')
+          }
+          function shadowed(useRpcStore: () => { call(key: string): string }) {
+            useRpcStore().call('cache')
+          }
+          void invokeFactory
+          void seed
+          void cacheOnly
+          void shadowed
+        `,
+      }),
+    })
+    expect(operations).toEqual([])
+  })
+
+  it('bounds recursive return shapes by paths the AST can consume', () => {
+    const started = performance.now()
+    const operations = collectRpcTransportOperations({
+      ts,
+      root: fixtureRoot,
+      sources: provenanceSources({
+        'src/stores/rpc.ts': 'export function useRpcStore() { return {} }',
+        'src/wrapper.ts': `
+          export function wrap(rpc: unknown, depth: number): unknown {
+            if (depth <= 0) return { rpc }
+            return { next: wrap(rpc, depth - 1) }
+          }
+        `,
+        'src/consumer.ts': `
+          import { useRpcStore } from './stores/rpc'
+          import { wrap } from './wrapper'
+          const wrapped = wrap(useRpcStore(), 2)
+          wrapped.next.next.rpc.call('feature.get')
+        `,
+      }),
+    })
+    expect(operations).toEqual([{ rel: 'src/consumer.ts', kind: 'call' }])
+    expect(performance.now() - started).toBeLessThan(500)
+  }, 1_000)
+})
+
+describe('whole-program boundary export fence', () => {
+  it('rejects exported function signatures and CommonJS member leaks from an Adapter', () => {
+    const sources = provenanceSources({
+      'src/adapters/gateway/privateTransports.ts': `
+        export interface RpcTransport { request(method: string): unknown }
+        export const PRIVATE_TRANSPORT = 1
+      `,
+      'src/adapters/gateway/functionLeak.ts': `
+        import type { RpcTransport } from './privateTransports'
+        export function expose(value: RpcTransport): RpcTransport { return value }
+      `,
+      'src/adapters/gateway/bodyLeak.ts': `
+        import { PRIVATE_TRANSPORT } from './privateTransports'
+        export function expose() { return PRIVATE_TRANSPORT }
+      `,
+      'src/adapters/gateway/cjsLeak.js': `
+        module.exports['transport'] = require('./privateTransports')['RpcTransport']
+      `,
+      'src/adapters/gateway/cjsAssignLeak.js': `
+        Object.assign(exports, {
+          transport: require('./privateTransports').RpcTransport,
+        })
+      `,
+      'src/adapters/gateway/aliasLeak.ts': `
+        import {
+          PRIVATE_TRANSPORT as HiddenValue,
+          type RpcTransport as HiddenType,
+        } from './privateTransports'
+        const first = HiddenValue
+        const second = first
+        type Alias = HiddenType
+        export const PublicValue = second
+        export type PublicType = Alias
+        export interface PublicInterface extends HiddenType {}
+        export default second
+      `,
+      'src/adapters/gateway/classLeak.ts': `
+        import type { RpcTransport } from './privateTransports'
+        export class PublicTransport {
+          constructor(readonly transport: RpcTransport) {}
+        }
+      `,
+    })
+    expect(collectBoundaryArchitectureViolations({
+      ts,
+      root: fixtureRoot,
+      sources,
+    })).toEqual(expect.arrayContaining([
+      'src/adapters/gateway/functionLeak.ts: exported declaration exposes private Gateway transport symbols.',
+      'src/adapters/gateway/bodyLeak.ts: exported declaration exposes private Gateway transport symbols.',
+      'src/adapters/gateway/cjsLeak.js: CommonJS export exposes private Gateway transport symbols.',
+      'src/adapters/gateway/cjsAssignLeak.js: CommonJS export exposes private Gateway transport symbols.',
+      'src/adapters/gateway/aliasLeak.ts: exported declaration exposes private Gateway transport symbols.',
+      'src/adapters/gateway/aliasLeak.ts: default export exposes private Gateway transport symbols.',
+      'src/adapters/gateway/classLeak.ts: exported declaration exposes private Gateway transport symbols.',
+    ]))
+  })
+
+  it('keeps generated-to-generated composition legal', () => {
+    const failures = collectBoundaryArchitectureViolations({
+      ts,
+      root: fixtureRoot,
+      sources: provenanceSources({
+        'src/contracts/generated/wire.ts': 'export interface Wire { id: string }',
+        'src/contracts/generated/index.ts': `export type { Wire } from './wire'`,
+      }),
+    })
+    expect(failures).toEqual([])
   })
 })
