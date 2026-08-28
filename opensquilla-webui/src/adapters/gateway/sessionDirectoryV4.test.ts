@@ -5,11 +5,12 @@ import { createPinia, setActivePinia } from 'pinia'
 import {
   createV4SessionDirectory,
   normalizeV4SessionItem,
-  type SessionDirectoryTransport,
 } from './sessionDirectoryV4'
 import { SESSIONS_LIST_METHOD } from '@/contracts/generated/v4/sessionsList'
 import type { SessionDirectory } from '@/modules/sessionDirectory'
 import { useSessions } from '@/composables/useSessions'
+
+type SessionDirectoryTransport = Parameters<typeof createV4SessionDirectory>[0]
 
 interface WireFixture {
   type: string

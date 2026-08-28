@@ -86,38 +86,6 @@ function typeReferenceName(ts, node) {
   return null
 }
 
-function functionTypeForMember(ts, member) {
-  if (ts.isMethodSignature(member) || ts.isMethodDeclaration(member)) return member
-  if (
-    ts.isPropertySignature(member)
-    && member.type
-    && ts.isFunctionTypeNode(member.type)
-  ) return member.type
-  return null
-}
-
-function isStringType(ts, node) {
-  return Boolean(node && node.kind === ts.SyntaxKind.StringKeyword)
-}
-
-function isRpcCallMember(ts, member) {
-  if (propertyName(ts, member.name) !== 'call') return false
-  const signature = functionTypeForMember(ts, member)
-  if (!signature || signature.parameters.length < 1) return false
-  return isStringType(ts, signature.parameters[0].type)
-}
-
-function typeLiteralLooksLikeRpc(ts, node, supportTypeNames) {
-  if (!node || !ts.isTypeLiteralNode(node)) return false
-  const names = new Set(node.members.map(member => propertyName(ts, member.name)))
-  if (node.members.some(member => isRpcCallMember(ts, member))) return true
-  if (names.has('waitForConnection') && !names.has('rpc')) return true
-  return node.members.some(member => (
-    propertyName(ts, member.name) === 'on'
-    && typeNodeReferences(ts, member, supportTypeNames)
-  ))
-}
-
 function declarationMembers(ts, declaration) {
   if (ts.isInterfaceDeclaration(declaration)) return declaration.members
   if (
@@ -150,7 +118,14 @@ function sourceModuleMetadata(ts, source) {
   const namespaces = new Map()
   const reexports = new Map()
   const localExports = new Map()
+  const declaredExports = new Map()
   const starReexports = []
+
+  function isExported(node) {
+    return Boolean(ts.getModifiers(node)?.some(modifier => (
+      modifier.kind === ts.SyntaxKind.ExportKeyword
+    )))
+  }
 
   for (const statement of source.statements) {
     if (
@@ -203,8 +178,41 @@ function sourceModuleMetadata(ts, source) {
         )
       }
     }
+
+    if (isExported(statement)) {
+      if (
+        (ts.isFunctionDeclaration(statement)
+          || ts.isClassDeclaration(statement)
+          || ts.isInterfaceDeclaration(statement)
+          || ts.isTypeAliasDeclaration(statement))
+        && statement.name
+      ) {
+        declaredExports.set(statement.name.text, statement.name.text)
+      } else if (ts.isVariableStatement(statement)) {
+        for (const declaration of statement.declarationList.declarations) {
+          if (ts.isIdentifier(declaration.name)) {
+            declaredExports.set(declaration.name.text, declaration.name.text)
+          }
+        }
+      }
+    }
+    if (
+      ts.getModifiers(statement)?.some(modifier => (
+        modifier.kind === ts.SyntaxKind.DefaultKeyword
+      ))
+      && statement.name
+    ) {
+      declaredExports.set('default', statement.name.text)
+    }
   }
-  return { imports, namespaces, reexports, localExports, starReexports }
+  return {
+    imports,
+    namespaces,
+    reexports,
+    localExports,
+    declaredExports,
+    starReexports,
+  }
 }
 
 function requireSpecifier(ts, expression) {
@@ -292,7 +300,48 @@ export function collectRpcTransportOperations({ ts, root, sources }) {
     return null
   }
 
-  const operations = []
+  /** Resolve an exported name to its concrete declaration, through barrels. */
+  function resolveExportBinding(rel, exported, seen = new Set()) {
+    const key = `${rel}::${exported}`
+    if (seen.has(key)) return null
+    const nextSeen = new Set(seen).add(key)
+    const info = metadata.get(rel)
+    if (!info) return null
+
+    const direct = info.reexports.get(exported)
+    if (direct) {
+      const target = resolveModule(rel, direct.specifier)
+      if (target) {
+        const binding = resolveExportBinding(target, direct.imported, nextSeen)
+        if (binding) return binding
+      }
+    }
+
+    const local = info.localExports.get(exported)
+    if (local) {
+      const imported = info.imports.get(local)
+      if (imported) {
+        const target = resolveModule(rel, imported.specifier)
+        if (target) {
+          const binding = resolveExportBinding(target, imported.imported, nextSeen)
+          if (binding) return binding
+        }
+      }
+      return { rel, local }
+    }
+
+    const declared = info.declaredExports.get(exported)
+    if (declared) return { rel, local: declared }
+    for (const specifier of info.starReexports) {
+      const target = resolveModule(rel, specifier)
+      if (!target) continue
+      const binding = resolveExportBinding(target, exported, nextSeen)
+      if (binding) return binding
+    }
+    return null
+  }
+
+  const stateByRel = new Map()
   for (const { rel, source } of sources) {
     const info = metadata.get(rel)
     const importedOrigins = new Map()
@@ -328,11 +377,6 @@ export function collectRpcTransportOperations({ ts, root, sources }) {
     }
     collectRequires(source)
 
-    const supportTypeNames = new Set(
-      [...importedOrigins]
-        .filter(([, origin]) => ['rpc-support-type', 'wire-type', 'client-type'].includes(origin))
-        .map(([name]) => name),
-    )
     const factoryNames = new Set(
       [...importedOrigins]
         .filter(([, origin]) => origin === 'factory')
@@ -343,7 +387,6 @@ export function collectRpcTransportOperations({ ts, root, sources }) {
         .filter(([, origin]) => origin === 'client-type')
         .map(([name]) => name),
     )
-
     const typeDeclarations = new Map()
     function collectTypes(node) {
       if (ts.isInterfaceDeclaration(node) || ts.isTypeAliasDeclaration(node)) {
@@ -353,33 +396,29 @@ export function collectRpcTransportOperations({ ts, root, sources }) {
     }
     collectTypes(source)
 
+    // Only a type that ultimately names the RPC boundary is provenance. A
+    // structurally similar local interface is deliberately not a seed.
     const rpcTypeNames = new Set(clientTypeNames)
-    let changed = true
-    while (changed) {
-      changed = false
+    let typeChanged = true
+    while (typeChanged) {
+      typeChanged = false
       for (const [name, declaration] of typeDeclarations) {
         if (rpcTypeNames.has(name)) continue
-        const members = declarationMembers(ts, declaration)
-        const memberNames = new Set(members.map(member => propertyName(ts, member.name)))
-        const hasDistinctiveMember = (
-          members.some(member => isRpcCallMember(ts, member))
-          || (memberNames.has('waitForConnection') && !memberNames.has('rpc'))
-          || (
-            !memberNames.has('rpc')
-            && members.length <= 8
-            && ['supportsMethod', 'supportsEvent', 'markMethodUnavailable']
-              .some(member => memberNames.has(member))
-          )
+        const knownRpcTypes = new Set([...rpcTypeNames, ...clientTypeNames])
+        const aliasesRpcType = (
+          ts.isTypeAliasDeclaration(declaration)
+          && !ts.isTypeLiteralNode(declaration.type)
+          && typeNodeReferences(ts, declaration.type, knownRpcTypes)
         )
-        const hasEventHandler = members.some(member => (
-          propertyName(ts, member.name) === 'on'
-          && typeNodeReferences(ts, member, supportTypeNames)
-        ))
-        const aliasesRpcType = ts.isTypeAliasDeclaration(declaration)
-          && typeNodeReferences(ts, declaration.type, new Set([...rpcTypeNames, ...factoryNames]))
-        if (hasDistinctiveMember || hasEventHandler || aliasesRpcType) {
+        const extendsRpcType = (
+          ts.isInterfaceDeclaration(declaration)
+          && declaration.heritageClauses?.some(clause => (
+            typeNodeReferences(ts, clause, knownRpcTypes)
+          ))
+        )
+        if (aliasesRpcType || extendsRpcType) {
           rpcTypeNames.add(name)
-          changed = true
+          typeChanged = true
         }
       }
     }
@@ -392,131 +431,530 @@ export function collectRpcTransportOperations({ ts, root, sources }) {
         if (
           property
           && member.type
-          && (
-            typeNodeReferences(ts, member.type, new Set([...rpcTypeNames, ...factoryNames]))
-            || typeLiteralLooksLikeRpc(ts, member.type, supportTypeNames)
-          )
-        ) {
-          properties.add(property)
-        }
+          && typeNodeReferences(ts, member.type, new Set([...rpcTypeNames, ...factoryNames]))
+        ) properties.add(property)
       }
       if (properties.size) rpcPropertiesByType.set(name, properties)
     }
 
-    const rpcObjects = new Set()
-    const rpcPropertyPaths = new Set()
-    const rpcCapabilities = new Map()
-
-    function factoryOriginForExpression(expression) {
-      const current = unwrap(ts, expression)
-      if (ts.isIdentifier(current)) return importedOrigins.get(current.text) ?? null
-      const access = memberAccess(ts, current)
-      if (access && ts.isIdentifier(access.receiver)) {
-        const target = namespaceModules.get(access.receiver.text)
-        return target ? resolveExportOrigin(target, access.member) : null
-      }
-      return null
-    }
-
-    function typeIsRpc(type) {
-      const name = typeReferenceName(ts, type)
-      if (name && rpcTypeNames.has(name)) return true
-      return Boolean(type && (
-        typeNodeReferences(ts, type, new Set([...rpcTypeNames, ...factoryNames]))
-        || typeLiteralLooksLikeRpc(ts, type, supportTypeNames)
-      ))
-    }
-
-    function addTypedBinding(name, type) {
-      if (!type || !ts.isIdentifier(name)) return
-      if (typeIsRpc(type)) rpcObjects.add(name.text)
-      const typeName = typeReferenceName(ts, type)
-      for (const property of rpcPropertiesByType.get(typeName) ?? []) {
-        rpcPropertyPaths.add(`${name.text}.${property}`)
+    const functions = new Map()
+    for (const statement of source.statements) {
+      if (ts.isFunctionDeclaration(statement) && statement.name) {
+        functions.set(statement.name.text, statement)
+      } else if (ts.isVariableStatement(statement)) {
+        for (const declaration of statement.declarationList.declarations) {
+          if (
+            ts.isIdentifier(declaration.name)
+            && declaration.initializer
+            && (
+              ts.isArrowFunction(declaration.initializer)
+              || ts.isFunctionExpression(declaration.initializer)
+            )
+          ) functions.set(declaration.name.text, declaration.initializer)
+        }
       }
     }
 
+    stateByRel.set(rel, {
+      rel,
+      source,
+      info,
+      importedOrigins,
+      namespaceModules,
+      factoryNames,
+      rpcTypeNames,
+      rpcPropertiesByType,
+      functions,
+      rpcObjects: new Set(),
+      rpcPropertyPaths: new Set(),
+      rpcCapabilities: new Map(),
+      returnShapes: new Map(),
+      rpcMemberPaths: new Map(),
+      returnMemberShapes: new Map(),
+    })
+  }
+
+  function resolveCallable(state, expression) {
+    const current = unwrap(ts, expression)
+    if (ts.isIdentifier(current)) {
+      if (state.functions.has(current.text)) {
+        return { state, local: current.text }
+      }
+      const imported = state.info.imports.get(current.text)
+      if (!imported) return null
+      const target = resolveModule(state.rel, imported.specifier)
+      const binding = target
+        ? resolveExportBinding(target, imported.imported)
+        : null
+      const targetState = binding ? stateByRel.get(binding.rel) : null
+      return targetState && targetState.functions.has(binding.local)
+        ? { state: targetState, local: binding.local }
+        : null
+    }
+    const access = memberAccess(ts, current)
+    if (access && ts.isIdentifier(access.receiver)) {
+      const target = state.namespaceModules.get(access.receiver.text)
+      const binding = target ? resolveExportBinding(target, access.member) : null
+      const targetState = binding ? stateByRel.get(binding.rel) : null
+      return targetState && targetState.functions.has(binding.local)
+        ? { state: targetState, local: binding.local }
+        : null
+    }
+    return null
+  }
+
+  function factoryOriginForExpression(state, expression) {
+    const current = unwrap(ts, expression)
+    if (ts.isIdentifier(current)) {
+      return state.importedOrigins.get(current.text) ?? null
+    }
+    const access = memberAccess(ts, current)
+    if (access && ts.isIdentifier(access.receiver)) {
+      const target = state.namespaceModules.get(access.receiver.text)
+      return target ? resolveExportOrigin(target, access.member) : null
+    }
+    return null
+  }
+
+  function typeIsRpc(state, type) {
+    const name = typeReferenceName(ts, type)
+    if (name && state.rpcTypeNames.has(name)) return true
+    if (!type || ts.isTypeLiteralNode(type)) return false
+    return typeNodeReferences(
+      ts,
+      type,
+      new Set([...state.rpcTypeNames, ...state.factoryNames]),
+    )
+  }
+
+  function addSetValue(set, value) {
+    if (value === null || value === undefined || set.has(value)) return false
+    set.add(value)
+    return true
+  }
+
+  function addMapSetValue(map, key, value) {
+    let values = map.get(key)
+    if (!values) {
+      values = new Set()
+      map.set(key, values)
+    }
+    return addSetValue(values, value)
+  }
+
+  function pathShape(state, path) {
+    const shape = new Set()
+    for (const candidate of [...state.rpcObjects, ...state.rpcPropertyPaths]) {
+      if (candidate === path) shape.add('')
+      else if (candidate.startsWith(`${path}.`)) shape.add(candidate.slice(path.length + 1))
+    }
+    return shape
+  }
+
+  function prependShape(prefix, shape) {
+    return new Set([...shape].map(suffix => suffix ? `${prefix}.${suffix}` : prefix))
+  }
+
+  const memberShapeSeparator = '\0'
+
+  function encodeMemberShape(path, member) {
+    return `${path}${memberShapeSeparator}${member}`
+  }
+
+  function decodeMemberShape(encoded) {
+    const separator = encoded.lastIndexOf(memberShapeSeparator)
+    return {
+      path: encoded.slice(0, separator),
+      member: encoded.slice(separator + 1),
+    }
+  }
+
+  function prependMemberShape(prefix, shape) {
+    return new Set([...shape].map((encoded) => {
+      const { path, member } = decodeMemberShape(encoded)
+      return encodeMemberShape(path ? `${prefix}.${path}` : prefix, member)
+    }))
+  }
+
+  function rpcShapeForExpression(state, expression) {
+    const current = unwrap(ts, expression)
+    const path = expressionPath(ts, current)
+    if (path) {
+      const shape = pathShape(state, path)
+      if (shape.size) return shape
+    }
+    if (ts.isCallExpression(current)) {
+      if (factoryOriginForExpression(state, current.expression) === 'factory') {
+        return new Set([''])
+      }
+      const target = resolveCallable(state, current.expression)
+      return target
+        ? new Set(target.state.returnShapes.get(target.local) ?? [])
+        : new Set()
+    }
+    if (ts.isNewExpression(current) && current.expression) {
+      return factoryOriginForExpression(state, current.expression) === 'client-type'
+        ? new Set([''])
+        : new Set()
+    }
+    if (ts.isObjectLiteralExpression(current)) {
+      const shape = new Set()
+      for (const property of current.properties) {
+        if (ts.isSpreadAssignment(property)) {
+          for (const suffix of rpcShapeForExpression(state, property.expression)) {
+            shape.add(suffix)
+          }
+        } else if (
+          ts.isPropertyAssignment(property)
+          || ts.isShorthandPropertyAssignment(property)
+        ) {
+          const name = propertyName(ts, property.name)
+          const initializer = ts.isShorthandPropertyAssignment(property)
+            ? property.name
+            : property.initializer
+          if (!name) continue
+          for (const suffix of prependShape(name, rpcShapeForExpression(state, initializer))) {
+            shape.add(suffix)
+          }
+        }
+      }
+      return shape
+    }
+    if (ts.isConditionalExpression(current)) {
+      return new Set([
+        ...rpcShapeForExpression(state, current.whenTrue),
+        ...rpcShapeForExpression(state, current.whenFalse),
+      ])
+    }
+    return new Set()
+  }
+
+  function isRpcExpression(state, expression) {
+    return rpcShapeForExpression(state, expression).has('')
+  }
+
+  function isRpcMemberReceiver(state, expression, member) {
+    if (isRpcExpression(state, expression)) return true
+    const path = expressionPath(ts, expression)
+    return Boolean(path && state.rpcMemberPaths.get(path)?.has(member))
+  }
+
+  function rpcFunctionMembers(state, expression) {
+    const current = unwrap(ts, expression)
+    if (ts.isIdentifier(current)) {
+      return new Set(state.rpcCapabilities.get(current.text) ?? [])
+    }
+    const direct = memberAccess(ts, current)
+    if (
+      direct
+      && TRACKED_RPC_MEMBERS.includes(direct.member)
+      && isRpcMemberReceiver(state, direct.receiver, direct.member)
+    ) return new Set([direct.member])
+
+    if (ts.isArrowFunction(current) || ts.isFunctionExpression(current)) {
+      const members = new Set()
+      function visit(node) {
+        if (ts.isFunctionLike(node) && node !== current) return
+        const access = memberAccess(ts, node)
+        if (
+          access
+          && TRACKED_RPC_MEMBERS.includes(access.member)
+          && isRpcMemberReceiver(state, access.receiver, access.member)
+        ) members.add(access.member)
+        ts.forEachChild(node, visit)
+      }
+      visit(current)
+      return members
+    }
+    return new Set()
+  }
+
+  function rpcMemberShapeForExpression(state, expression) {
+    const current = unwrap(ts, expression)
+    const path = expressionPath(ts, current)
+    if (path) {
+      const shape = new Set()
+      for (const [candidate, members] of state.rpcMemberPaths) {
+        if (candidate !== path && !candidate.startsWith(`${path}.`)) continue
+        const suffix = candidate === path ? '' : candidate.slice(path.length + 1)
+        for (const member of members) shape.add(encodeMemberShape(suffix, member))
+      }
+      if (shape.size) return shape
+    }
+    if (ts.isCallExpression(current)) {
+      const target = resolveCallable(state, current.expression)
+      return target
+        ? new Set(target.state.returnMemberShapes.get(target.local) ?? [])
+        : new Set()
+    }
+    if (ts.isObjectLiteralExpression(current)) {
+      const shape = new Set()
+      for (const property of current.properties) {
+        if (ts.isSpreadAssignment(property)) {
+          for (const encoded of rpcMemberShapeForExpression(state, property.expression)) {
+            shape.add(encoded)
+          }
+          continue
+        }
+        if (
+          !ts.isPropertyAssignment(property)
+          && !ts.isShorthandPropertyAssignment(property)
+        ) continue
+        const name = propertyName(ts, property.name)
+        const initializer = ts.isShorthandPropertyAssignment(property)
+          ? property.name
+          : property.initializer
+        if (!name) continue
+        for (const encoded of prependMemberShape(
+          name,
+          rpcMemberShapeForExpression(state, initializer),
+        )) shape.add(encoded)
+        if (TRACKED_RPC_MEMBERS.includes(name)) {
+          const forwardedMembers = rpcFunctionMembers(state, initializer)
+          if (forwardedMembers.has(name)) shape.add(encodeMemberShape('', name))
+        }
+      }
+      return shape
+    }
+    if (ts.isConditionalExpression(current)) {
+      return new Set([
+        ...rpcMemberShapeForExpression(state, current.whenTrue),
+        ...rpcMemberShapeForExpression(state, current.whenFalse),
+      ])
+    }
+    return new Set()
+  }
+
+  function bindShapeAtPath(state, path, shape) {
+    let changed = false
+    for (const suffix of shape) {
+      const target = suffix ? `${path}.${suffix}` : path
+      if (suffix) changed = addSetValue(state.rpcPropertyPaths, target) || changed
+      else changed = addSetValue(state.rpcObjects, target) || changed
+    }
+    return changed
+  }
+
+  function bindMemberShapeAtPath(state, path, shape) {
+    let changed = false
+    const grouped = new Map()
+    for (const encoded of shape) {
+      const { path: suffix, member } = decodeMemberShape(encoded)
+      const target = suffix ? `${path}.${suffix}` : path
+      let members = grouped.get(target)
+      if (!members) {
+        members = new Set()
+        grouped.set(target, members)
+      }
+      members.add(member)
+    }
+    for (const [target, incoming] of grouped) {
+      let members = state.rpcMemberPaths.get(target)
+      // A lone callback named supportsMethod/on/etc. is an ordinary option,
+      // not an RPC client. A forwarded `call` capability anchors the receiver
+      // to the RPC boundary; its sibling lifecycle capabilities then inherit
+      // the same provenance. Direct RpcClient objects are tracked separately.
+      if (
+        !incoming.has('call')
+        && !members?.has('call')
+        && !state.rpcObjects.has(target)
+      ) continue
+      if (!members) {
+        members = new Set()
+        state.rpcMemberPaths.set(target, members)
+      }
+      for (const member of incoming) {
+        changed = addSetValue(members, member) || changed
+      }
+    }
+    return changed
+  }
+
+  function bindPattern(state, pattern, shape, memberShape = new Set()) {
+    let changed = false
+    if (ts.isIdentifier(pattern)) {
+      changed = bindShapeAtPath(state, pattern.text, shape) || changed
+      return bindMemberShapeAtPath(state, pattern.text, memberShape) || changed
+    }
+    if (!ts.isObjectBindingPattern(pattern)) return false
+    for (const element of pattern.elements) {
+      if (!ts.isIdentifier(element.name)) continue
+      const member = propertyName(ts, element.propertyName ?? element.name)
+      if (!member) continue
+      if (shape.has('') && TRACKED_RPC_MEMBERS.includes(member)) {
+        let capabilities = state.rpcCapabilities.get(element.name.text)
+        if (!capabilities) {
+          capabilities = new Set()
+          state.rpcCapabilities.set(element.name.text, capabilities)
+        }
+        changed = addSetValue(capabilities, member) || changed
+      }
+      const nestedShape = new Set()
+      for (const suffix of shape) {
+        if (suffix === member) nestedShape.add('')
+        else if (suffix.startsWith(`${member}.`)) nestedShape.add(suffix.slice(member.length + 1))
+      }
+      changed = bindShapeAtPath(state, element.name.text, nestedShape) || changed
+
+      const nestedMemberShape = new Set()
+      for (const encoded of memberShape) {
+        const { path, member: capability } = decodeMemberShape(encoded)
+        if (path === member) nestedMemberShape.add(encodeMemberShape('', capability))
+        else if (path.startsWith(`${member}.`)) {
+          nestedMemberShape.add(encodeMemberShape(path.slice(member.length + 1), capability))
+        }
+        if (path === '' && capability === member) {
+          let capabilities = state.rpcCapabilities.get(element.name.text)
+          if (!capabilities) {
+            capabilities = new Set()
+            state.rpcCapabilities.set(element.name.text, capabilities)
+          }
+          changed = addSetValue(capabilities, capability) || changed
+        }
+      }
+      changed = bindMemberShapeAtPath(
+        state,
+        element.name.text,
+        nestedMemberShape,
+      ) || changed
+    }
+    return changed
+  }
+
+  // Explicit boundary types are initial provenance seeds. Structural types
+  // gain provenance only when a value descended from a seed flows into them.
+  for (const state of stateByRel.values()) {
     function collectTypedBindings(node) {
-      if (ts.isParameter(node) || ts.isVariableDeclaration(node)) {
-        addTypedBinding(node.name, node.type)
+      if ((ts.isParameter(node) || ts.isVariableDeclaration(node)) && node.type) {
+        if (typeIsRpc(state, node.type)) bindPattern(state, node.name, new Set(['']))
+        const typeName = typeReferenceName(ts, node.type)
+        if (ts.isIdentifier(node.name)) {
+          for (const property of state.rpcPropertiesByType.get(typeName) ?? []) {
+            state.rpcPropertyPaths.add(`${node.name.text}.${property}`)
+          }
+        }
       }
       ts.forEachChild(node, collectTypedBindings)
     }
-    collectTypedBindings(source)
+    collectTypedBindings(state.source)
+  }
 
-    function isRpcExpression(expression) {
-      const current = unwrap(ts, expression)
-      if (ts.isIdentifier(current)) return rpcObjects.has(current.text)
-      const path = expressionPath(ts, current)
-      if (path && rpcPropertyPaths.has(path)) return true
-      if (ts.isCallExpression(current)) {
-        return factoryOriginForExpression(current.expression) === 'factory'
-      }
-      if (ts.isNewExpression(current) && current.expression) {
-        return factoryOriginForExpression(current.expression) === 'client-type'
-      }
-      return false
+  function returnExpressions(functionNode) {
+    if (ts.isArrowFunction(functionNode) && !ts.isBlock(functionNode.body)) {
+      return [functionNode.body]
     }
+    if (!functionNode.body || !ts.isBlock(functionNode.body)) return []
+    const expressions = []
+    function visit(node) {
+      if (ts.isFunctionLike(node) && node !== functionNode) return
+      if (ts.isReturnStatement(node) && node.expression) {
+        expressions.push(node.expression)
+        return
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(functionNode.body)
+    return expressions
+  }
 
-    function propagateBindings() {
-      let didChange = false
-      function visit(node) {
-        if (ts.isVariableDeclaration(node) && node.initializer) {
-          if (ts.isIdentifier(node.name) && isRpcExpression(node.initializer)) {
-            if (!rpcObjects.has(node.name.text)) {
-              rpcObjects.add(node.name.text)
-              didChange = true
-            }
-          } else if (ts.isObjectBindingPattern(node.name)) {
-            const sourceIsRpc = isRpcExpression(node.initializer)
-            const sourcePath = expressionPath(ts, node.initializer)
-            for (const element of node.name.elements) {
-              if (!ts.isIdentifier(element.name)) continue
-              const property = propertyName(ts, element.propertyName ?? element.name)
-              if (!property) continue
-              if (sourceIsRpc && TRACKED_RPC_MEMBERS.includes(property)) {
-                if (!rpcCapabilities.has(element.name.text)) {
-                  rpcCapabilities.set(element.name.text, property)
-                  didChange = true
-                }
-              } else if (
-                sourcePath
-                && rpcPropertyPaths.has(`${sourcePath}.${property}`)
-                && !rpcObjects.has(element.name.text)
-              ) {
-                rpcObjects.add(element.name.text)
-                didChange = true
-              }
-            }
+  function propagateLocal(state) {
+    let changed = false
+    function visit(node) {
+      if (ts.isVariableDeclaration(node) && node.initializer) {
+        changed = bindPattern(
+          state,
+          node.name,
+          rpcShapeForExpression(state, node.initializer),
+          rpcMemberShapeForExpression(state, node.initializer),
+        ) || changed
+      }
+      if (
+        ts.isBinaryExpression(node)
+        && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+      ) {
+        const target = expressionPath(ts, node.left)
+        if (target) {
+          changed = bindShapeAtPath(
+            state,
+            target,
+            rpcShapeForExpression(state, node.right),
+          ) || changed
+          changed = bindMemberShapeAtPath(
+            state,
+            target,
+            rpcMemberShapeForExpression(state, node.right),
+          ) || changed
+        }
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(state.source)
+
+    for (const [name, functionNode] of state.functions) {
+      for (const expression of returnExpressions(functionNode)) {
+        for (const suffix of rpcShapeForExpression(state, expression)) {
+          changed = addMapSetValue(state.returnShapes, name, suffix) || changed
+        }
+        for (const encoded of rpcMemberShapeForExpression(state, expression)) {
+          changed = addMapSetValue(state.returnMemberShapes, name, encoded) || changed
+        }
+      }
+    }
+    return changed
+  }
+
+  function propagateCalls(state) {
+    let changed = false
+    function visit(node) {
+      if (ts.isCallExpression(node)) {
+        const target = resolveCallable(state, node.expression)
+        const functionNode = target && target.state.functions.get(target.local)
+        if (target && functionNode) {
+          for (let index = 0; index < functionNode.parameters.length; index += 1) {
+            const argument = node.arguments[index]
+            if (!argument || ts.isSpreadElement(argument)) continue
+            changed = bindPattern(
+              target.state,
+              functionNode.parameters[index].name,
+              rpcShapeForExpression(state, argument),
+              rpcMemberShapeForExpression(state, argument),
+            ) || changed
           }
         }
-        if (
-          ts.isBinaryExpression(node)
-          && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
-          && ts.isIdentifier(node.left)
-          && isRpcExpression(node.right)
-          && !rpcObjects.has(node.left.text)
-        ) {
-          rpcObjects.add(node.left.text)
-          didChange = true
-        }
-        ts.forEachChild(node, visit)
       }
-      visit(source)
-      return didChange
+      ts.forEachChild(node, visit)
     }
-    while (propagateBindings()) {}
+    visit(state.source)
+    return changed
+  }
 
+  // Whole-program fixed point: an RPC seed can be wrapped in an object,
+  // returned by a factory, then passed through several imported composables.
+  // Every reported member must therefore retain a concrete path back to a
+  // store/client seed rather than merely having a compatible shape.
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const state of stateByRel.values()) {
+      changed = propagateLocal(state) || changed
+    }
+    for (const state of stateByRel.values()) {
+      changed = propagateCalls(state) || changed
+    }
+  }
+
+  const operations = []
+  for (const state of stateByRel.values()) {
     function collectMemberOperations(node) {
       const access = memberAccess(ts, node)
       if (
         access
         && TRACKED_RPC_MEMBERS.includes(access.member)
-        && isRpcExpression(access.receiver)
+        && isRpcMemberReceiver(state, access.receiver, access.member)
         && !ts.isTypeOfExpression(node.parent)
       ) {
         operations.push({
-          rel,
+          rel: state.rel,
           kind: isDirectInvocation(ts, node)
             ? access.member
             : `${access.member}Reference`,
@@ -525,25 +963,15 @@ export function collectRpcTransportOperations({ ts, root, sources }) {
       if (
         ts.isBindingElement(node)
         && ts.isObjectBindingPattern(node.parent)
+        && ts.isIdentifier(node.name)
       ) {
-        const owner = node.parent.parent
-        const sourceIsRpc = (
-          ts.isVariableDeclaration(owner)
-          && Boolean(owner.initializer)
-          && isRpcExpression(owner.initializer)
-        ) || (
-          ts.isParameter(owner)
-          && Boolean(owner.type)
-          && typeIsRpc(owner.type)
-        )
-        const member = propertyName(ts, node.propertyName ?? node.name)
-        if (sourceIsRpc && member && TRACKED_RPC_MEMBERS.includes(member)) {
-          operations.push({ rel, kind: `${member}Reference` })
+        for (const member of state.rpcCapabilities.get(node.name.text) ?? []) {
+          operations.push({ rel: state.rel, kind: `${member}Reference` })
         }
       }
       ts.forEachChild(node, collectMemberOperations)
     }
-    collectMemberOperations(source)
+    collectMemberOperations(state.source)
   }
   return operations
 }

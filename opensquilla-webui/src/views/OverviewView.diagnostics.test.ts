@@ -1,7 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { App } from 'vue'
-import type { SessionDirectoryTransport } from '@/adapters/gateway/sessionDirectoryV4'
 
 // Mounted coverage for the Overview diagnostics actions: the conditional
 // "diagnose with agent" hand-off, finding→settings deep links, and the
@@ -152,6 +151,7 @@ async function mountOverview(options: MountOptions = {}) {
 
   const Component = (await import('./OverviewView.vue')).default
   const { createV4SessionDirectory } = await import('@/adapters/gateway/sessionDirectoryV4')
+  type SessionDirectoryTransport = Parameters<typeof createV4SessionDirectory>[0]
   const { SESSION_DIRECTORY_KEY } = await import('@/modules/sessionDirectory')
   const active = ref(true)
   const TestHost = defineComponent({

@@ -30,7 +30,7 @@ const SESSION_DIRECTORY_CALL_OPTIONS: RpcCallOptions = {
   abortAction: 'reject',
 }
 
-export type SessionDirectoryTransport = Pick<RpcTransport, 'request'>
+type SessionDirectoryTransport = Pick<RpcTransport, 'request'>
   & Partial<Pick<RpcTransport, 'ready'>>
 
 const hasOwn = (obj: unknown, field: string) =>

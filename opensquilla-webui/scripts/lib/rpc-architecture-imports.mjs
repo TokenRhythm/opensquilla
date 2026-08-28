@@ -73,6 +73,18 @@ export function privateGatewayTransportImportViolation({ root, importer, specifi
   return `${normalizedImporter}: private Gateway transports may be imported only by a Gateway Adapter or test.`
 }
 
+/** Gateway Adapters consume the private transport Interface, never Pinia directly. */
+export function gatewayAdapterRpcStoreImportViolation({ root, importer, specifier }) {
+  const normalizedImporter = normalized(importer)
+  if (!isGatewayAdapter(normalizedImporter) || isTestFile(normalizedImporter)) return null
+  const target = resolveSourceImport(root, normalizedImporter, specifier)
+  const rpcStoreModule = resolve(root, 'src/stores/rpc')
+  const normalizedTarget = target?.replace(/\.(?:vue|[cm]?[jt]sx?)$/, '')
+  if (!normalizedTarget || normalizedTarget !== rpcStoreModule) return null
+  if (normalizedImporter === 'src/adapters/gateway/privateTransports.ts') return null
+  return `${normalizedImporter}: Gateway Adapters must consume the private transport Interface instead of useRpcStore.`
+}
+
 export function boundaryModuleKind({ root, importer, specifier }) {
   const normalizedImporter = normalized(importer)
   const target = resolveSourceImport(root, normalizedImporter, specifier)
@@ -124,29 +136,161 @@ export function importedBoundarySymbols(ts, source, { root, importer }) {
       for (const element of bindings.elements) symbols.set(element.name.text, kind)
     }
   }
+
+  // Production JavaScript occasionally uses CommonJS even though the WebUI is
+  // otherwise ESM. Treat a literal require() exactly like an import so a .js
+  // barrel cannot launder a private transport or generated wire symbol.
+  function collectRequires(node) {
+    if (
+      ts.isVariableDeclaration(node)
+      && node.initializer
+      && ts.isCallExpression(node.initializer)
+      && ts.isIdentifier(node.initializer.expression)
+      && node.initializer.expression.text === 'require'
+      && node.initializer.arguments.length === 1
+      && ts.isStringLiteralLike(node.initializer.arguments[0])
+    ) {
+      const kind = boundaryModuleKind({
+        root,
+        importer,
+        specifier: node.initializer.arguments[0].text,
+      })
+      if (kind && ts.isIdentifier(node.name)) symbols.set(node.name.text, kind)
+      if (kind && ts.isObjectBindingPattern(node.name)) {
+        for (const element of node.name.elements) {
+          if (ts.isIdentifier(element.name)) symbols.set(element.name.text, kind)
+        }
+      }
+    }
+    ts.forEachChild(node, collectRequires)
+  }
+  collectRequires(source)
+  return symbols
+}
+
+function referencedBoundaryKinds(ts, node, symbols) {
+  const kinds = new Set()
+  function visit(current) {
+    if (ts.isIdentifier(current)) {
+      const kind = symbols.get(current.text)
+      if (kind) kinds.add(kind)
+    }
+    ts.forEachChild(current, visit)
+  }
+  visit(node)
+  return kinds
+}
+
+function exported(ts, node) {
+  return Boolean(ts.getModifiers(node)?.some(modifier => (
+    modifier.kind === ts.SyntaxKind.ExportKeyword
+  )))
+}
+
+function propagateBoundaryAliases(ts, source, imported) {
+  const symbols = new Map(imported)
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const statement of source.statements) {
+      if (ts.isVariableStatement(statement)) {
+        for (const declaration of statement.declarationList.declarations) {
+          if (!ts.isIdentifier(declaration.name) || !declaration.initializer) continue
+          const [kind] = referencedBoundaryKinds(ts, declaration.initializer, symbols)
+          if (kind && !symbols.has(declaration.name.text)) {
+            symbols.set(declaration.name.text, kind)
+            changed = true
+          }
+        }
+      } else if (ts.isTypeAliasDeclaration(statement)) {
+        const [kind] = referencedBoundaryKinds(ts, statement.type, symbols)
+        if (kind && !symbols.has(statement.name.text)) {
+          symbols.set(statement.name.text, kind)
+          changed = true
+        }
+      } else if (ts.isInterfaceDeclaration(statement)) {
+        const [kind] = referencedBoundaryKinds(ts, statement, symbols)
+        if (kind && !symbols.has(statement.name.text)) {
+          symbols.set(statement.name.text, kind)
+          changed = true
+        }
+      }
+    }
+  }
   return symbols
 }
 
 export function localBoundaryReexportViolations(ts, source, { root, importer }) {
   const imported = importedBoundarySymbols(ts, source, { root, importer })
+  const symbols = propagateBoundaryAliases(ts, source, imported)
   const failures = []
   for (const statement of source.statements) {
     if (
-      !ts.isExportDeclaration(statement)
-      || statement.moduleSpecifier
-      || !statement.exportClause
-      || !ts.isNamedExports(statement.exportClause)
-    ) continue
-    for (const element of statement.exportClause.elements) {
-      const local = (element.propertyName ?? element.name).text
-      const kind = imported.get(local)
-      if (kind) {
+      ts.isExportDeclaration(statement)
+      && !statement.moduleSpecifier
+      && statement.exportClause
+      && ts.isNamedExports(statement.exportClause)
+    ) {
+      for (const element of statement.exportClause.elements) {
+        const local = (element.propertyName ?? element.name).text
+        const kind = symbols.get(local)
+        if (kind) {
+          failures.push(
+            `${normalized(importer)}: ${kind} symbol ${local} must not be re-exported through a barrel.`,
+          )
+        }
+      }
+    }
+
+    if (ts.isVariableStatement(statement) && exported(ts, statement)) {
+      for (const declaration of statement.declarationList.declarations) {
+        if (!ts.isIdentifier(declaration.name) || !declaration.initializer) continue
+        for (const kind of referencedBoundaryKinds(ts, declaration.initializer, symbols)) {
+          failures.push(
+            `${normalized(importer)}: ${kind} symbol ${declaration.name.text} must not be exported through a barrel.`,
+          )
+        }
+      }
+    }
+
+    if (
+      (ts.isTypeAliasDeclaration(statement) || ts.isInterfaceDeclaration(statement))
+      && exported(ts, statement)
+    ) {
+      for (const kind of referencedBoundaryKinds(ts, statement, symbols)) {
         failures.push(
-          `${normalized(importer)}: ${kind} symbol ${local} must not be re-exported through a barrel.`,
+          `${normalized(importer)}: ${kind} symbol ${statement.name.text} must not be exported through a barrel.`,
+        )
+      }
+    }
+
+    if (ts.isExportAssignment(statement)) {
+      for (const kind of referencedBoundaryKinds(ts, statement.expression, symbols)) {
+        failures.push(
+          `${normalized(importer)}: ${kind} symbols must not be exported as the default module value.`,
         )
       }
     }
   }
+
+  // CommonJS export assignment for production .js barrels.
+  function visitCommonJsExports(node) {
+    if (
+      ts.isBinaryExpression(node)
+      && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+      && /^(?:module\.exports|exports(?:\.[A-Za-z_$][\w$]*)?)$/.test(
+        node.left.getText(source).replace(/\s/g, ''),
+      )
+    ) {
+      for (const kind of referencedBoundaryKinds(ts, node.right, symbols)) {
+        failures.push(
+          `${normalized(importer)}: ${kind} symbols must not be exported through a CommonJS barrel.`,
+        )
+      }
+    }
+    ts.forEachChild(node, visitCommonJsExports)
+  }
+  visitCommonJsExports(source)
   return failures
 }
 

@@ -18,6 +18,10 @@ export function privateGatewayTransportImportViolation(
   input: GeneratedContractImport,
 ): string | null
 
+export function gatewayAdapterRpcStoreImportViolation(
+  input: GeneratedContractImport,
+): string | null
+
 export function boundaryModuleKind(
   input: GeneratedContractImport,
 ): 'generated Contract' | 'private Gateway transport' | null
