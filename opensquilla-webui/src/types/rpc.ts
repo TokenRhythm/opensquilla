@@ -13,18 +13,6 @@ export interface AgentsListResponse {
   }>
 }
 
-export interface RawSessionThread {
-  id?: string
-  kind?: string
-}
-
-export interface RawSessionChannelContext {
-  name?: string
-  id?: string
-  accountId?: string
-  threadId?: string
-}
-
 export interface RawSessionTask {
   status?: string
   task_id?: string
@@ -41,103 +29,6 @@ export interface RawSessionTask {
   documentMutationOutcome?: Record<string, unknown>
   steer_capability?: import('./chat').ChatSteerCapability
   steerCapability?: import('./chat').ChatSteerCapability
-}
-
-export interface RawSessionCron {
-  id?: string
-  jobId?: string
-  job_id?: string
-  name?: string
-}
-
-export interface RawSessionItem {
-  key?: string
-  session?: string
-  sessionKey?: string
-  sessionId?: string
-  agentId?: string
-  agent_id?: string
-  effectiveAgentId?: string
-  sessionKind?: string
-  surface?: string
-  conversationKind?: string
-  thread?: RawSessionThread | null
-  channelContext?: RawSessionChannelContext | null
-  title?: string
-  subtitle?: string
-  groupLabel?: string
-  workspace?: string
-  workspaceId?: string
-  workspace_id?: string
-  workspaceLabel?: string
-  workspaceDisplayPath?: string
-  updatedAt?: number | string
-  updated_at?: number | string
-  lastActivityAt?: number | string
-  last_activity_at?: number | string
-  messageCount?: number
-  message_count?: number
-  entry_count?: number
-  status?: string
-  runStatus?: string
-  run_status?: string
-  active_task?: RawSessionTask | null
-  activeTask?: RawSessionTask | null
-  last_task?: RawSessionTask | null
-  lastTask?: RawSessionTask | null
-  terminal_status?: string
-  terminalStatus?: string
-  display_name?: string
-  displayName?: string
-  subject?: string
-  derived_title?: string
-  derivedTitle?: string
-  source_kind?: string
-  sourceKind?: string
-  channel_kind?: string
-  channelKind?: string
-  channel_id?: string
-  channelId?: string
-  chat_type?: string
-  chatType?: string
-  group_id?: string
-  groupId?: string
-  last_channel?: string
-  lastChannel?: string
-  last_to?: string
-  lastTo?: string
-  last_account_id?: string
-  lastAccountId?: string
-  last_thread_id?: string
-  lastThreadId?: string
-  delivery_context?: Record<string, unknown>
-  deliveryContext?: Record<string, unknown>
-  origin?: Record<string, unknown>
-  interactive?: boolean
-  model?: string
-  channel?: Record<string, unknown>
-  parent?: Record<string, unknown>
-  forked_from_parent?: boolean
-  forkedFromParent?: boolean
-  cron?: RawSessionCron
-}
-
-export type RawSessionListEntry = RawSessionItem | string
-
-export interface SessionsListResponse {
-  sessions?: RawSessionListEntry[]
-  keys?: RawSessionListEntry[]
-  /** Number of rows returned in this page. */
-  count?: number
-  /** Exact number of sessions visible to the caller, independent of page size. */
-  totalCount?: number
-  total_count?: number
-  /** Whether another stable session-list page is available. */
-  hasMore?: boolean
-  has_more?: boolean
-  /** Opaque keyset cursor for the next session-list page. */
-  nextCursor?: string | null
-  next_cursor?: string | null
 }
 
 export interface ProjectWorkspaceItem {

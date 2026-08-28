@@ -42,7 +42,7 @@
         <span v-if="badge" class="inspect-meta__status" :class="badge.cls">{{ badge.label }}</span>
         <span class="inspect-meta__stats">
           {{ t('sessions.msgCount', { count: item.messageCount != null ? item.messageCount.toLocaleString() : '—' }) }}
-          · {{ t('sessions.inspect.updated', { time: sessionRelTime(item.updatedAt) }) }}<template v-if="costText"> · {{ costText }}</template>
+          · {{ t('sessions.inspect.updated', { time: sessionRelTime(item.updatedAt) }) }}
         </span>
       </div>
 
@@ -238,14 +238,6 @@ const snippetText = computed(() => {
   // Structured payloads (raw JSON tool output) are noise, not a summary.
   if (/^[[{]/.test(text)) return ''
   return text
-})
-
-const costText = computed(() => {
-  const raw = props.item?.raw as Record<string, unknown> | undefined
-  if (!raw) return ''
-  const value = Number(raw['costUsd'] ?? raw['cost_usd'] ?? raw['totalCostUsd'] ?? raw['total_cost_usd'] ?? NaN)
-  if (!Number.isFinite(value)) return ''
-  return `$${value >= 1 ? value.toFixed(2) : value.toFixed(4)}`
 })
 
 function roleTone(role: string): string {
