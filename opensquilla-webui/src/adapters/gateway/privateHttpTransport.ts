@@ -203,23 +203,88 @@ function binaryContentLength(value: string | null): number | undefined {
 
 function binaryFilename(value: string | null): string | undefined {
   if (!value) return undefined
-  const encoded = /filename\*=UTF-8''([^;]+)/i.exec(value)?.[1]
-  const quoted = /filename="([^"]*)"/i.exec(value)?.[1]
-  const plain = /filename=([^;]+)/i.exec(value)?.[1]
-  let candidate = encoded || quoted || plain
-  if (!candidate) return undefined
-  try {
-    if (encoded) candidate = decodeURIComponent(candidate)
-  } catch {
-    return undefined
+  const encoded = /(?:^|;)\s*filename\s*\*\s*=\s*([^;]*)/i.exec(value)?.[1]?.trim()
+  let candidate: string | undefined
+  const extended = encoded && /^([^']*)'[^']*'(.*)$/.exec(encoded)
+  if (extended && /^(?:utf-?8)$/i.test(extended[1].trim())) {
+    try {
+      candidate = decodeURIComponent(extended[2])
+    } catch {
+      // Fall back to filename= when an invalid extended value is present.
+    }
   }
+  if (!candidate) {
+    const plain = /(?:^|;)\s*filename\s*=\s*(?:"((?:\\.|[^"])*)"|([^;]*))/i.exec(value)
+    candidate = plain
+      ? (plain[1] ?? plain[2] ?? '').replace(/\\(["\\])/g, '$1').trim()
+      : undefined
+  }
+  if (!candidate) return undefined
   const sanitized = candidate
-    .replace(/[\\/]/g, '_')
-    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .replace(/^[A-Za-z]:[\\/]+/, '')
+    .replace(/^[A-Za-z]:/, '')
+    .replace(/[\\/:*?"<>|]/g, '_')
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, '')
     .trim()
     .replace(/^\.+/, '')
+    .replace(/[. ]+$/, '')
     .slice(0, 255)
-  return sanitized || undefined
+  if (!sanitized) return undefined
+  const windowsStem = sanitized.split('.')[0].replace(/[. ]+$/, '')
+  return /^(?:con|prn|aux|nul|com(?:[1-9]|[¹²³])|lpt(?:[1-9]|[¹²³])|conin\$|conout\$|clock\$)$/i.test(windowsStem)
+    ? `_${sanitized}`.slice(0, 255)
+    : sanitized
+}
+
+function isHttpMethod(value: unknown): value is HttpMethod {
+  return value === 'GET'
+    || value === 'POST'
+    || value === 'PUT'
+    || value === 'PATCH'
+    || value === 'DELETE'
+}
+
+function isFormBody(value: unknown): value is FormData | URLSearchParams {
+  if (value === null || typeof value !== 'object') return false
+  try {
+    const ownPrototype = Object.getPrototypeOf(value)
+    const tag = Object.prototype.toString.call(value)
+    if (typeof FormData === 'function' && FormData.prototype) {
+      const prototypes = [FormData.prototype]
+      if (tag === '[object FormData]' && ownPrototype && ownPrototype !== Object.prototype) {
+        prototypes.push(ownPrototype as typeof FormData.prototype)
+      }
+      for (const prototype of prototypes) {
+        const has = prototype.has
+        if (typeof has !== 'function') continue
+        try {
+          has.call(value, '')
+          return true
+        } catch {
+          // Try the next realm's prototype or URLSearchParams below.
+        }
+      }
+    }
+    if (typeof URLSearchParams === 'function' && URLSearchParams.prototype) {
+      const prototypes = [URLSearchParams.prototype]
+      if (tag === '[object URLSearchParams]' && ownPrototype && ownPrototype !== Object.prototype) {
+        prototypes.push(ownPrototype as typeof URLSearchParams.prototype)
+      }
+      for (const prototype of prototypes) {
+        const toString = prototype.toString
+        if (typeof toString !== 'function') continue
+        try {
+          toString.call(value)
+          return true
+        } catch {
+          // A spoofed prototype/tag is not a supported form body.
+        }
+      }
+    }
+  } catch {
+    // Proxies and malformed objects are not supported form bodies.
+  }
+  return false
 }
 
 function managedBinaryStream(
@@ -395,6 +460,69 @@ export function createPrivateHttpTransport(
     decoder: ResponseDecoder<T>,
   ): Promise<T> {
     const url = resolveEndpoint(baseUrl, endpoint)
+    let method: HttpMethod = 'GET'
+    let hasJson = false
+    let hasForm = false
+    let body: BodyInit | undefined
+    try {
+      if (requestOptions === null || typeof requestOptions !== 'object') {
+        throw new HttpTransportError('encode', 'Gateway HTTP request options are invalid.')
+      }
+      const requestedMethod = requestOptions.method ?? 'GET'
+      if (!isHttpMethod(requestedMethod)) {
+        throw new HttpTransportError('encode', 'Gateway HTTP request method is invalid.')
+      }
+      method = requestedMethod
+      hasJson = Object.prototype.hasOwnProperty.call(requestOptions, 'json')
+      hasForm = Object.prototype.hasOwnProperty.call(requestOptions, 'form')
+      if (hasJson && hasForm) {
+        throw new HttpTransportError(
+          'encode',
+          'Gateway HTTP request cannot include both JSON and form bodies.',
+        )
+      }
+      if ((hasJson || hasForm) && method === 'GET') {
+        throw new HttpTransportError(
+          'encode',
+          'Gateway HTTP GET requests cannot include a body.',
+        )
+      }
+      if (hasJson) {
+        try {
+          body = JSON.stringify(requestOptions.json)
+        } catch (cause) {
+          throw new HttpTransportError(
+            'encode',
+            'Gateway HTTP request could not be encoded as JSON.',
+            undefined,
+            undefined,
+            cause,
+          )
+        }
+        if (body === undefined) {
+          throw new HttpTransportError(
+            'encode',
+            'Gateway HTTP request could not be encoded as JSON.',
+          )
+        }
+      } else if (hasForm) {
+        const form = requestOptions.form
+        if (!isFormBody(form)) {
+          throw new HttpTransportError('encode', 'Gateway HTTP form body is invalid.')
+        }
+        body = form
+      }
+    } catch (cause) {
+      if (cause instanceof HttpTransportError) throw cause
+      throw new HttpTransportError(
+        'encode',
+        'Gateway HTTP request options could not be encoded.',
+        undefined,
+        undefined,
+        cause,
+      )
+    }
+
     let headers: Headers
     try {
       headers = new Headers()
@@ -402,7 +530,7 @@ export function createPrivateHttpTransport(
       if (token) headers.set('Authorization', `Bearer ${token}`)
       const sessionKey = requestOptions.sessionKey?.trim() ?? ''
       if (sessionKey) headers.set('x-opensquilla-session-key', sessionKey)
-      if ('json' in requestOptions) headers.set('Content-Type', 'application/json')
+      if (hasJson) headers.set('Content-Type', 'application/json')
     } catch (cause) {
       throw new HttpTransportError(
         'encode',
@@ -411,31 +539,6 @@ export function createPrivateHttpTransport(
         undefined,
         cause,
       )
-    }
-
-    let body: BodyInit | undefined
-    const hasBody = 'json' in requestOptions || 'form' in requestOptions
-    const method = requestOptions.method ?? 'GET'
-    if (hasBody && method === 'GET') {
-      throw new HttpTransportError(
-        'encode',
-        'Gateway HTTP GET requests cannot include a body.',
-      )
-    }
-    if ('json' in requestOptions) {
-      try {
-        body = JSON.stringify(requestOptions.json)
-      } catch (cause) {
-        throw new HttpTransportError(
-          'encode',
-          'Gateway HTTP request could not be encoded as JSON.',
-          undefined,
-          undefined,
-          cause,
-        )
-      }
-    } else if ('form' in requestOptions) {
-      body = requestOptions.form
     }
 
     const linkedSignal = requestSignal(

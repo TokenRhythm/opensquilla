@@ -69,9 +69,16 @@ describe('private Gateway HTTP transport', () => {
       form,
     })
 
+    const params = new URLSearchParams('name=payload')
+    await transport.requestJson('/api/v1/files/query', {
+      method: 'POST',
+      form: params,
+    })
+
     const init = requestInit(fetchMock)
     expect(init.body).toBe(form)
     expect(new Headers(init.headers).has('content-type')).toBe(false)
+    expect(fetchMock.mock.calls[1]?.[1]?.body).toBe(params)
   })
 
   it('decodes successful blobs without exposing Response to callers', async () => {
@@ -115,6 +122,30 @@ describe('private Gateway HTTP transport', () => {
     expect(stream).toBeInstanceOf(ReadableStream)
     expect(await new Response(stream).text()).toBe('streamed-bytes')
     await expect(binary.blob()).rejects.toMatchObject({ kind: 'decode' })
+  })
+
+  it('parses RFC5987 filenames and neutralizes Windows path hazards', async () => {
+    const cases = [
+      ["attachment; filename *= UTF-8''b%C3%BCndel.zip", 'bündel.zip'],
+      ["attachment; filename=\"ok.zip\"; filename*=UTF-8''%E0%A4%ZZ", 'ok.zip'],
+      ['attachment; filename="C:\\logs\\report.zip"', 'logs_report.zip'],
+      ['attachment; filename="report.zip:payload"', 'report.zip_payload'],
+      ['attachment; filename="CON.txt"', '_CON.txt'],
+      ['attachment; filename="CON .txt"', '_CON .txt'],
+      ['attachment; filename="COM¹.txt"', '_COM¹.txt'],
+    ] as const
+
+    for (const [contentDisposition, filename] of cases) {
+      const transport = createPrivateHttpTransport({
+        baseUrl: 'https://control.example/',
+        fetch: vi.fn(async () => new Response('x', {
+          headers: { 'content-disposition': contentDisposition },
+        })),
+      })
+      const binary = await transport.requestBinary('/api/filename')
+      expect(binary.metadata.filename).toBe(filename)
+      await binary.blob()
+    }
   })
 
   it('maps HTTP status and safe response payload into one stable error', async () => {
@@ -212,6 +243,30 @@ describe('private Gateway HTTP transport', () => {
       method: 'GET',
       json: { value: true },
     } as never)).rejects.toMatchObject({ kind: 'encode' })
+  })
+
+  it('rejects invalid runtime methods and ambiguous or invalid body shapes', async () => {
+    const fetchMock = vi.fn()
+    const transport = createPrivateHttpTransport({
+      baseUrl: 'https://control.example/',
+      fetch: fetchMock,
+    })
+
+    for (const requestOptions of [
+      { method: 'get', json: { value: true } },
+      { method: 'HEAD' },
+      { method: 'TRACE' },
+      { method: 'GET', form: new URLSearchParams('value=true') },
+      { method: 'POST', json: {}, form: new FormData() },
+      { method: 'POST', form: undefined },
+      { method: 'POST', json: undefined },
+      { method: 'POST', form: Object.create(FormData.prototype) },
+      { method: 'POST', form: { [Symbol.toStringTag]: 'FormData' } },
+    ]) {
+      await expect(transport.requestJson('/api/value', requestOptions as never))
+        .rejects.toMatchObject({ kind: 'encode' })
+    }
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 
   it('normalizes auth-source and header construction failures', async () => {
