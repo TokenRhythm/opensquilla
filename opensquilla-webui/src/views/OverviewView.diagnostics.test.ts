@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { App } from 'vue'
+import type { SessionDirectoryRpc } from '@/adapters/gateway/sessionDirectoryV4'
 
 // Mounted coverage for the Overview diagnostics actions: the conditional
 // "diagnose with agent" hand-off, finding→settings deep links, and the
@@ -150,6 +151,8 @@ async function mountOverview(options: MountOptions = {}) {
   i18n.global.locale.value = 'en'
 
   const Component = (await import('./OverviewView.vue')).default
+  const { createV4SessionDirectory } = await import('@/adapters/gateway/sessionDirectoryV4')
+  const { SESSION_DIRECTORY_KEY } = await import('@/modules/sessionDirectory')
   const active = ref(true)
   const TestHost = defineComponent({
     name: 'OverviewTestHost',
@@ -168,6 +171,10 @@ async function mountOverview(options: MountOptions = {}) {
   }))
   app.use(pinia)
   app.use(i18n)
+  app.provide(SESSION_DIRECTORY_KEY, createV4SessionDirectory({
+    call: rpcCall,
+    waitForConnection: vi.fn(async () => {}),
+  } as unknown as SessionDirectoryRpc))
   app.mount(el)
   mountedApps.push({ app, el })
 
@@ -270,6 +277,42 @@ describe('OverviewView status lifecycle', () => {
     })
     await flush()
     const card = el.querySelector('[title="Total sessions across all statuses"]')
+    expect(card?.querySelector('.control-stat__value')?.textContent).toBe('201')
+  })
+
+  it('lets an authoritative stored-session count decrease after deletion', async () => {
+    const { el, flush } = await mountOverview({
+      sessionsListHandler: (callIndex) => ({
+        sessions: [{ key: 'agent:main:webchat:remaining', title: 'Remaining' }],
+        count: callIndex === 0 ? 200 : 1,
+        totalCount: callIndex === 0 ? 201 : 1,
+      }),
+    })
+    await flush()
+    const card = el.querySelector('[title="Total sessions across all statuses"]')
+    expect(card?.querySelector('.control-stat__value')?.textContent).toBe('201')
+
+    el.querySelector<HTMLButtonElement>('.ov-status-actions .btn--ghost')!.click()
+    await flush()
+
+    expect(card?.querySelector('.control-stat__value')?.textContent).toBe('1')
+  })
+
+  it('treats a legacy bounded page as a lower bound, not an exact decrease', async () => {
+    const { el, flush } = await mountOverview({
+      sessionsListHandler: (callIndex) => (
+        callIndex === 0
+          ? { sessions: [], count: 200, totalCount: 201 }
+          : { keys: ['agent:main:webchat:remaining'], count: 1 }
+      ),
+    })
+    await flush()
+    const card = el.querySelector('[title="Total sessions across all statuses"]')
+    expect(card?.querySelector('.control-stat__value')?.textContent).toBe('201')
+
+    el.querySelector<HTMLButtonElement>('.ov-status-actions .btn--ghost')!.click()
+    await flush()
+
     expect(card?.querySelector('.control-stat__value')?.textContent).toBe('201')
   })
 

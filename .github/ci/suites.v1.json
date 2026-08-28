@@ -167,7 +167,10 @@
     },
     "frontend-validation": {
       "execution_inputs": [
-        "opensquilla-webui/**"
+        "contracts/gateway/v4/**",
+        "opensquilla-webui/**",
+        "scripts/contracts/**",
+        "src/opensquilla/contracts/generated/v4/**"
       ]
     },
     "wheel-webui-roundtrip": {

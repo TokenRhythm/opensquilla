@@ -99,7 +99,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { inject, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import UsageSummaryStats from '@/components/usage/UsageSummaryStats.vue'
 import UsageChart from '@/components/usage/UsageChart.vue'
@@ -109,8 +109,12 @@ import Icon from '@/components/Icon.vue'
 import ErrorState from '@/components/ErrorState.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import { useUsageData } from '@/composables/usage/useUsageData'
+import { SESSION_DIRECTORY_KEY } from '@/modules/sessionDirectory'
 
 const { t } = useI18n()
+const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
+if (!injectedSessionDirectory) throw new Error('SessionDirectory was not provided')
+const sessionDirectory = injectedSessionDirectory
 
 const {
   currency,
@@ -160,7 +164,7 @@ const {
   rowBreakdownTotalTokens,
   rowBreakdownTotalCost,
   rowBreakdownAnyProrated,
-} = useUsageData()
+} = useUsageData(sessionDirectory)
 
 // Manual refresh shows a busy state; loadData (also the poll/mount handler) now
 // returns the refresh promise, so a local flag spans just the user-driven load.

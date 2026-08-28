@@ -3,17 +3,17 @@ import i18n from '@/i18n'
 import zhHans from '@/locales/zh-Hans.json'
 import {
   arrangeSidebarSections,
-  normalizeSessionItem,
   type SessionItem,
   type SidebarSection,
 } from './useSessions'
-import type { RawSessionItem } from '@/types/rpc'
+import { normalizeV4SessionItem } from '@/adapters/gateway/sessionDirectoryV4'
+import type { SessionRow } from '@/contracts/generated/v4/sessionsList'
 
 // Build real SessionItems through the production normalizer so the test
 // exercises the same sessionKind/surface/parent derivation the sidebar sees,
 // rather than hand-rolling the normalized shape.
-function session(raw: RawSessionItem): SessionItem {
-  const item = normalizeSessionItem(raw)
+function session(raw: SessionRow): SessionItem {
+  const item = normalizeV4SessionItem(raw)
   if (!item) throw new Error(`fixture did not normalize: ${JSON.stringify(raw)}`)
   return item
 }
@@ -159,7 +159,7 @@ describe('arrangeSidebarSections — subagent nesting', () => {
         key: 'agent:main:subagent:child',
         title: 'Subagent task',
         updatedAt: 150,
-        parent: { key: parentKey, title: 'Parent chat', spawnDepth: 1 },
+        parent: { key: parentKey, taskId: 'task-child', spawnDepth: 1 },
       }),
     ])
 
@@ -177,7 +177,7 @@ describe('arrangeSidebarSections — subagent nesting', () => {
         key: 'agent:main:subagent:orphan',
         title: 'Orphan task',
         updatedAt: 120,
-        parent: { key: 'agent:main:webchat:gone', title: 'Gone parent', spawnDepth: 1 },
+        parent: { key: 'agent:main:webchat:gone', taskId: 'task-orphan', spawnDepth: 1 },
       }),
     ])
 
@@ -197,14 +197,14 @@ describe('arrangeSidebarSections — subagent nesting', () => {
         title: `${parentTitle} (2)`,
         updatedAt: 200,
         forked_from_parent: true,
-        parent: { key: parentKey, title: parentTitle },
+        parent: { key: parentKey, spawnDepth: 0 },
       }),
       session({
         key: 'agent:main:webchat:fork-2',
         title: `${parentTitle} (3)`,
         updatedAt: 300,
         forked_from_parent: true,
-        parent: { key: parentKey, title: parentTitle },
+        parent: { key: parentKey, spawnDepth: 0 },
       }),
     ])
 
@@ -226,7 +226,7 @@ describe('arrangeSidebarSections — workspace grouping', () => {
         workspace: '/repo/project1',
         workspaceLabel: 'project1',
         workspaceDisplayPath: '/repo/project1',
-      } as RawSessionItem),
+      } as SessionRow),
       session({
         key: 'agent:main:webchat:project1-session2',
         title: 'Session 2',
@@ -234,7 +234,7 @@ describe('arrangeSidebarSections — workspace grouping', () => {
         workspace: '/repo/project1',
         workspaceLabel: 'project1',
         workspaceDisplayPath: '/repo/project1',
-      } as RawSessionItem),
+      } as SessionRow),
       session({
         key: 'agent:main:webchat:project2-session3',
         title: 'Session 3',
@@ -242,7 +242,7 @@ describe('arrangeSidebarSections — workspace grouping', () => {
         workspace: '/repo/project2',
         workspaceLabel: 'project2',
         workspaceDisplayPath: '/repo/project2',
-      } as RawSessionItem),
+      } as SessionRow),
       session({
         key: 'agent:main:webchat:session4',
         title: 'Session 4',
@@ -274,15 +274,15 @@ describe('arrangeSidebarSections — workspace grouping', () => {
         updatedAt: 200,
         workspace: '/repo/project',
         workspaceLabel: 'project',
-      } as RawSessionItem),
+      } as SessionRow),
       session({
         key: 'agent:main:subagent:workspace-child',
         title: 'Subagent task',
         updatedAt: 150,
         workspace: '/repo/project',
         workspaceLabel: 'project',
-        parent: { key: parentKey, title: 'Parent chat', spawnDepth: 1 },
-      } as RawSessionItem),
+        parent: { key: parentKey, taskId: 'task-workspace-child', spawnDepth: 1 },
+      } as SessionRow),
     ])
 
     expect(sectionFor(sections, 'chats').rows.map(r => ({

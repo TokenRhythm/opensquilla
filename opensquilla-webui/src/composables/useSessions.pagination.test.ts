@@ -2,8 +2,18 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
 
 import { useRpcStore } from '@/stores/rpc'
-import type { SessionsListResponse } from '@/types/rpc'
+import type { SessionListEntry } from '@/contracts/generated/v4/sessionsList'
+import { createV4SessionDirectory } from '@/adapters/gateway/sessionDirectoryV4'
 import { sessionMatches, useSessions } from './useSessions'
+
+interface SessionPageFixture {
+  sessions?: SessionListEntry[]
+  keys?: SessionListEntry[]
+  hasMore?: boolean
+  has_more?: boolean
+  nextCursor?: string | null
+  next_cursor?: string | null
+}
 
 function rows(start: number, end: number) {
   return Array.from({ length: end - start }, (_, offset) => ({
@@ -24,7 +34,7 @@ describe('useSessions pagination', () => {
     setActivePinia(createPinia())
   })
 
-  function setup(responses: Array<SessionsListResponse | Promise<SessionsListResponse>>) {
+  function setup(responses: Array<SessionPageFixture | Promise<SessionPageFixture>>) {
     const rpc = useRpcStore()
     vi.spyOn(rpc, 'waitForConnection').mockResolvedValue()
     const call = vi.spyOn(rpc, 'call').mockImplementation(async () => {
@@ -32,7 +42,7 @@ describe('useSessions pagination', () => {
       if (!response) throw new Error('unexpected sessions.list call')
       return await response
     })
-    return { rpc, call, sessions: useSessions() }
+    return { rpc, call, sessions: useSessions(createV4SessionDirectory(rpc)) }
   }
 
   it('loads all 401 sessions across three pages and de-duplicates page boundaries', async () => {
@@ -51,19 +61,19 @@ describe('useSessions pagination', () => {
 
     expect(sessions.sessionsList.value).toHaveLength(401)
     expect(new Set(
-      sessions.sessionsList.value.map(row => typeof row === 'string' ? row : row.key),
+      sessions.sessionsList.value.map(row => row.key),
     ).size).toBe(401)
     expect(sessions.hasMore.value).toBe(false)
     expect(call).toHaveBeenNthCalledWith(2, 'sessions.list', {
       limit: 200,
       view: 'session-list-v1',
       cursor: 'cursor-1',
-    })
+    }, expect.objectContaining({ signal: expect.any(AbortSignal) }))
     expect(call).toHaveBeenNthCalledWith(3, 'sessions.list', {
       limit: 200,
       view: 'session-list-v1',
       cursor: 'cursor-2',
-    })
+    }, expect.objectContaining({ signal: expect.any(AbortSignal) }))
     expect(sessionMatches(
       sessions.allSessions.value[sessions.allSessions.value.length - 1]!,
       'task 400',
@@ -93,12 +103,12 @@ describe('useSessions pagination', () => {
       limit: 200,
       view: 'session-list-v1',
       cursor: 'new-cursor-1',
-    })
+    }, expect.objectContaining({ signal: expect.any(AbortSignal) }))
     expect(call).toHaveBeenNthCalledWith(6, 'sessions.list', {
       limit: 200,
       view: 'session-list-v1',
       cursor: 'new-cursor-2',
-    })
+    }, expect.objectContaining({ signal: expect.any(AbortSignal) }))
   })
 
   it('keeps the last complete multi-page snapshot when a refresh page fails', async () => {
@@ -123,8 +133,8 @@ describe('useSessions pagination', () => {
   })
 
   it('discards an append from an old traversal when a concurrent refresh wins', async () => {
-    const stalePage = deferred<SessionsListResponse>()
-    const { sessions } = setup([
+    const stalePage = deferred<SessionPageFixture>()
+    const { call, sessions } = setup([
       { sessions: rows(0, 200), has_more: true, next_cursor: 'old-cursor-1' },
       { sessions: rows(200, 400), has_more: true, next_cursor: 'old-cursor-2' },
       stalePage.promise,
@@ -135,7 +145,7 @@ describe('useSessions pagination', () => {
     await sessions.loadSessions()
     await sessions.loadMoreSessions()
     const append = sessions.loadMoreSessions()
-    await Promise.resolve()
+    await vi.waitFor(() => expect(call).toHaveBeenCalledTimes(3))
 
     await sessions.loadSessions()
     stalePage.resolve({
@@ -147,7 +157,7 @@ describe('useSessions pagination', () => {
 
     expect(sessions.sessionsList.value).toHaveLength(400)
     expect(sessions.sessionsList.value.some(
-      item => (typeof item === 'string' ? item : item.key)?.includes('stale'),
+      item => item.key.includes('stale'),
     )).toBe(false)
     expect(sessions.hasMore.value).toBe(true)
   })
@@ -169,7 +179,7 @@ describe('useSessions pagination', () => {
     await staleRefresh
 
     expect(call).toHaveBeenCalledTimes(1)
-    expect(sessions.sessionsList.value).toEqual([
+    expect(sessions.sessionsList.value.map(({ key, title }) => ({ key, title }))).toEqual([
       { key: 'agent:main:webchat:current', title: 'Current' },
     ])
   })
@@ -193,7 +203,7 @@ describe('useSessions pagination', () => {
     await staleAppend
 
     expect(call).toHaveBeenCalledTimes(2)
-    expect(sessions.sessionsList.value).toEqual([
+    expect(sessions.sessionsList.value.map(({ key, title }) => ({ key, title }))).toEqual([
       { key: 'agent:main:webchat:current', title: 'Current' },
     ])
   })
@@ -205,7 +215,7 @@ describe('useSessions pagination', () => {
     await sessions.loadSessions()
     await sessions.loadMoreSessions()
 
-    expect(sessions.sessionsList.value).toEqual(legacyKeys)
+    expect(sessions.sessionsList.value.map(item => item.key)).toEqual(legacyKeys)
     expect(sessions.hasMore.value).toBe(false)
     expect(call).toHaveBeenCalledTimes(1)
   })
@@ -274,8 +284,8 @@ describe('useSessions pagination', () => {
   })
 
   it('discards a late append after refresh resets the traversal', async () => {
-    const latePage = deferred<SessionsListResponse>()
-    const { sessions } = setup([
+    const latePage = deferred<SessionPageFixture>()
+    const { call, sessions } = setup([
       { sessions: rows(0, 200), has_more: true, next_cursor: 'cursor-1' },
       latePage.promise,
       { sessions: [{ key: 'agent:main:webchat:refreshed', title: 'Refreshed' }] },
@@ -283,12 +293,12 @@ describe('useSessions pagination', () => {
     await sessions.loadSessions()
 
     const append = sessions.loadMoreSessions()
-    await Promise.resolve()
+    await vi.waitFor(() => expect(call).toHaveBeenCalledTimes(2))
     await sessions.loadSessions()
     latePage.resolve({ sessions: rows(200, 201), has_more: false })
     await append
 
-    expect(sessions.sessionsList.value).toEqual([
+    expect(sessions.sessionsList.value.map(({ key, title }) => ({ key, title }))).toEqual([
       { key: 'agent:main:webchat:refreshed', title: 'Refreshed' },
     ])
   })

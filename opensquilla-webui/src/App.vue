@@ -446,13 +446,14 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, inject, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { routeTitle } from './router'
 import { getPlatform } from '@/platform'
 import { useAppStore, type ThemeMode, type PendingApproval } from './stores/app'
 import { useRpcStore } from './stores/rpc'
+import { SESSION_DIRECTORY_KEY } from './modules/sessionDirectory'
 import {
   arrangeSidebarSections,
   useSessions,
@@ -534,6 +535,9 @@ import {
 
 const appStore = useAppStore()
 const rpcStore = useRpcStore()
+const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
+if (!injectedSessionDirectory) throw new Error('SessionDirectory was not provided')
+const sessionDirectory = injectedSessionDirectory
 const shortcutsStore = useShortcutsStore()
 const artifactImageLightbox = provideArtifactImageLightbox()
 const { t } = useI18n()
@@ -628,9 +632,7 @@ const {
   hasMore,
   loadSessions,
   loadMoreSessions,
-} = useSessions(
-  optionalSessionRpcCallOptions,
-)
+} = useSessions(sessionDirectory)
 const { bottomRoutes, workNav } = useNavigation()
 // Axis-B: the active expressive skin for the routed content area (meta.skin).
 const { skinId, variants } = useSurfaceSkin()
@@ -934,7 +936,7 @@ function sidebarConversationTitle(item: SessionItem): string {
 
 // A draft / current-session row the backend list does not yet carry. The
 // sidebar arranger reads only a handful of fields off the SessionItem, so a
-// synthetic chat row carries just those plus a stub `raw` (no parent → root).
+// synthetic chat row carries canonical defaults for the remaining fields.
 function syntheticChatSession(
   key: string,
   effectiveAgentId: string,
@@ -960,19 +962,16 @@ function syntheticChatSession(
     sessionKind: 'chat',
     surface: 'webchat',
     conversationKind: 'direct',
-    threadLabel: '',
-    channelContext: null,
     status: 'idle',
-    visualStatus: 'idle',
     runStatus: 'idle',
     runLabel: 'Idle',
     messageCount: null,
     updatedAt,
-    interactive: true,
+    model: '',
+    parent: null,
     provisional: project?.provisional,
     forkedFromParent: false,
-    contractGaps: [],
-    raw: { key },
+    hasContractGaps: false,
   }
 }
 

@@ -24,6 +24,10 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from opensquilla.contracts.generated.v4.sessions_list_metadata import (
+    SESSIONS_LIST_METHOD,
+)
+
 # ---------------------------------------------------------------------------
 # Scope constants
 # ---------------------------------------------------------------------------
@@ -117,7 +121,7 @@ METHOD_SCOPES: dict[str, str] = {
     "config.effective": READ_SCOPE,
     "config.schema.lookup": READ_SCOPE,
     "sessions.get": READ_SCOPE,
-    "sessions.list": READ_SCOPE,
+    SESSIONS_LIST_METHOD: READ_SCOPE,
     "sessions.search": READ_SCOPE,
     "sessions.preview": READ_SCOPE,
     "sessions.resolve": READ_SCOPE,

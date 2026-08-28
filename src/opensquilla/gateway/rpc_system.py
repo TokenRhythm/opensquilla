@@ -5,6 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, NoReturn
 
+from opensquilla.contracts.generated.v4.sessions_list_metadata import (
+    SESSIONS_LIST_METHOD,
+)
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, RpcUnavailableError, get_dispatcher
 from opensquilla.gateway.rpc_memory import memory_health_from_durable_ledger
@@ -23,7 +26,7 @@ _AGENT_WAIT_SUPPORTED_PARAMS = [
 _AGENT_WAIT_AVAILABLE_METHODS = [
     "agents.list",
     "agents.files.list",
-    "sessions.list",
+    SESSIONS_LIST_METHOD,
     "sessions.get",
     "tools.catalog",
 ]

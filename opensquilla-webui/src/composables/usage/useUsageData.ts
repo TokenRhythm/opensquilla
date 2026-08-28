@@ -16,12 +16,8 @@ import {
 } from '@/composables/usage/taskDisplayName'
 import { formatUsageCost, effectiveCnyPerUsd } from '@/composables/usage/nativeBilling'
 import { buildUsageCsv } from '@/composables/usage/usageCsv'
-import {
-  SESSION_LIST_VIEW,
-  itemKey,
-  normalizeSessionItem,
-} from '@/composables/useSessions'
 import { useRpcStore } from '@/stores/rpc'
+import type { SessionDirectory } from '@/modules/sessionDirectory'
 import { downloadText } from '@/utils/browser'
 import i18n from '@/i18n'
 import type {
@@ -34,7 +30,6 @@ import type {
   UsageSnapshot,
   UsageStatusData,
 } from '@/types/usage'
-import type { RawSessionListEntry, SessionsListResponse } from '@/types/rpc'
 
 const t = i18n.global.t
 
@@ -67,7 +62,7 @@ const TABLE_COLUMN_KEYS: Array<{ key: string; labelKey: string }> = [
 
 const SORTABLE_COLS = ['session', 'updated_at', 'input_tokens', 'output_tokens', 'cost_usd', 'model']
 
-export function useUsageData() {
+export function useUsageData(sessionDirectory: SessionDirectory) {
 // ---------------------------------------------------------------------------
 // Stores & Router
 // ---------------------------------------------------------------------------
@@ -435,17 +430,10 @@ function sortVal(row: SessionRow, key: string): string | number {
 async function requestTaskTitles(): Promise<Map<string, string>> {
   if (typeof rpc.call !== 'function') return taskTitles.value
   try {
-    if (typeof rpc.waitForConnection === 'function') await rpc.waitForConnection()
-    const data = await rpc.call<SessionsListResponse>(
-      'sessions.list',
-      { limit: 200, view: SESSION_LIST_VIEW },
-    )
-    const rawItems: RawSessionListEntry[] = data?.sessions || data?.keys || []
+    const page = await sessionDirectory.listPage({ limit: 200 })
     const titles = new Map<string, string>()
-    rawItems.forEach(raw => {
-      const key = itemKey(raw)
-      const item = normalizeSessionItem(raw)
-      if (key && item && isUsableTaskName(item.title, key)) titles.set(key, item.title)
+    page.items.forEach(item => {
+      if (isUsableTaskName(item.title, item.key)) titles.set(item.key, item.title)
     })
     return titles
   } catch {

@@ -126,7 +126,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onActivated, onDeactivated, onUnmounted, ref } from 'vue'
+import { computed, inject, onActivated, onDeactivated, onUnmounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { useRpcStore } from '@/stores/rpc'
@@ -143,7 +143,6 @@ import SessionsLedger from '@/components/sessions/SessionsLedger.vue'
 import SessionInspectDrawer from '@/components/sessions/SessionInspectDrawer.vue'
 import {
   arrangeSessionLedger,
-  itemKey,
   sessionMatches,
   sessionParentKey,
   useSessions,
@@ -155,6 +154,7 @@ import {
   LOCAL_SESSIONS_DELETED_EVENT,
 } from '@/utils/sessionSync'
 import { sessionAgentIdentity } from '@/components/sessions/sessionDisplay'
+import { SESSION_DIRECTORY_KEY } from '@/modules/sessionDirectory'
 
 type FilterId = 'all' | 'chats' | 'automations' | 'channels'
 
@@ -187,6 +187,9 @@ const SESSIONS_VIEW_SYNC_SOURCE = 'sessions-view'
 const { t } = useI18n()
 const router = useRouter()
 const rpc = useRpcStore()
+const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
+if (!injectedSessionDirectory) throw new Error('SessionDirectory was not provided')
+const sessionDirectory = injectedSessionDirectory
 const { confirm } = useConfirm()
 const {
   sessionsList,
@@ -198,7 +201,7 @@ const {
   sessionListError,
   loadSessions,
   loadMoreSessions,
-} = useSessions()
+} = useSessions(sessionDirectory)
 
 const filter = ref<FilterId>('all')
 const search = ref('')
@@ -379,7 +382,7 @@ function scheduleSessionRefresh() {
 
 function applyLocalDeletedSessions(keys: Set<string>) {
   if (keys.size === 0) return
-  sessionsList.value = sessionsList.value.filter(item => !keys.has(itemKey(item)))
+  sessionsList.value = sessionsList.value.filter(item => !keys.has(item.key))
   pendingApprovals.value = pendingApprovals.value.filter(key => !keys.has(key))
   if (inspectKey.value && keys.has(inspectKey.value)) closeInspect()
 }

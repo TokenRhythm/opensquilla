@@ -396,6 +396,29 @@ jobs:
         working-directory: opensquilla-webui
         run: npm ci
 
+      - name: Set up Python for Contract generation
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv for Contract generation
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install pinned Contract generators
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+        run: uv sync --only-group dev --frozen
+
+      - name: Verify deterministic Contract generation
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+        shell: bash
+        run: |
+          uv run --no-sync python scripts/contracts/generate_sessions_list_contract.py --check
+          uv run --no-sync python scripts/contracts/generate_sessions_list_contract.py --verify-determinism
+
       - name: Run frontend type checks
         if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
         working-directory: opensquilla-webui

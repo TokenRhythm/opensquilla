@@ -68,6 +68,7 @@ OFFLINE_MARKER_EXCLUSIONS = {
     "tests/test_skills/test_meta_skill_creator_smoke_live.py",
 }
 RECENTLY_ADDED_ACTIVE_TESTS = {
+    "tests/contracts/test_sessions_list_contract.py",
     "tests/test_artifact_session/test_html_anchors.py",
     "tests/test_ci/test_plan_ci.py",
     "tests/test_git_runtime.py",
@@ -82,6 +83,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/unit/cli/tui/test_keys_cheatsheet.py",
     "tests/unit/cli/tui/test_opentui_prefs.py",
     "tests/test_cli/test_gateway_client_steer.py",
+    "tests/test_cli/test_gateway_client_sessions_contract.py",
     "tests/test_cli/test_skills_search_cmd.py",
     "tests/test_channels/test_admission_reason_persistence.py",
     "tests/test_channels/test_channel_admission.py",
@@ -107,6 +109,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_ci/test_dockerignore_context.py",
     "tests/test_ci/test_migration_v022.py",
     "tests/test_ci/test_session_storage_connection_contract.py",
+    "tests/test_ci/test_rpc_architecture_contracts.py",
     "tests/test_desktop/test_onboarding_main_process_flow_contract.py",
     "tests/test_channels/test_stream_terminal_routing.py",
     "tests/test_engine/test_agent_canonical_text_contract.py",
@@ -128,6 +131,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_gateway/test_memory_repair_storage_gate.py",
     "tests/test_gateway/test_p1a_exact_abort_contract.py",
     "tests/test_gateway/test_rpc_ingress_validation.py",
+    "tests/test_gateway/test_sessions_list_contract_adapter.py",
     "tests/test_gateway/test_rpc_llm_profiles.py",
     "tests/test_gateway/test_rpc_capability_reset.py",
     "tests/test_gateway/test_rpc_provider_credential_clear.py",

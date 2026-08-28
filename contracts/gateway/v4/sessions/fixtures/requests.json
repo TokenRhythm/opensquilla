@@ -1,0 +1,158 @@
+{
+  "format_version": 1,
+  "kind": "request",
+  "cases": [
+    {
+      "id": "request.params-omitted",
+      "coverage": "params-omitted",
+      "expectation": "exact",
+      "wire": {
+        "type": "req",
+        "id": "request.params-omitted",
+        "method": "sessions.list"
+      },
+      "expected_outcome": "response.empty-legacy"
+    },
+    {
+      "id": "request.params-null",
+      "coverage": "params-null",
+      "expectation": "exact",
+      "wire": {
+        "type": "req",
+        "id": "request.params-null",
+        "method": "sessions.list",
+        "params": null
+      },
+      "expected_outcome": "response.empty-legacy"
+    },
+    {
+      "id": "request.params-empty-object",
+      "coverage": "params-empty-object",
+      "expectation": "exact",
+      "wire": {
+        "type": "req",
+        "id": "request.params-empty-object",
+        "method": "sessions.list",
+        "params": {}
+      },
+      "expected_outcome": "response.empty-legacy"
+    },
+    {
+      "id": "request.legacy-limit",
+      "coverage": "legacy-limit",
+      "expectation": "exact",
+      "wire": {
+        "type": "req",
+        "id": "request.legacy-limit",
+        "method": "sessions.list",
+        "params": {
+          "limit": 50
+        }
+      },
+      "client_provenance": [
+        "src/opensquilla/gateway_client.py",
+        "src/opensquilla/cli/gateway_client.py"
+      ]
+    },
+    {
+      "id": "request.legacy-boolean-limit",
+      "coverage": "legacy-boolean-limit",
+      "expectation": "exact",
+      "wire": {
+        "type": "req",
+        "id": "request.legacy-boolean-limit",
+        "method": "sessions.list",
+        "params": {
+          "limit": true
+        }
+      },
+      "compatibility_note": "Python bool is an int subclass and the v4 handler has historically forwarded this value to legacy storage adapters."
+    },
+    {
+      "id": "request.page-first",
+      "coverage": "page-first",
+      "expectation": "exact",
+      "wire": {
+        "type": "req",
+        "id": "request.page-first",
+        "method": "sessions.list",
+        "params": {
+          "limit": 1,
+          "view": "session-list-v1"
+        }
+      }
+    },
+    {
+      "id": "request.page-cursor",
+      "coverage": "page-cursor",
+      "expectation": "exact",
+      "wire": {
+        "type": "req",
+        "id": "request.page-cursor",
+        "method": "sessions.list",
+        "params": {
+          "limit": 1,
+          "view": "session-list-v1",
+          "cursor": "eyJ2IjoxLCJhIjoxNzAwMDAwMDAwMDAwLCJ1IjoxNzAwMDAwMDAwMDAwLCJrIjoiYWdlbnQ6bWFpbjp3ZWJjaGF0OnNlc3Npb24tYyJ9"
+        }
+      }
+    },
+    {
+      "id": "request.count",
+      "coverage": "count",
+      "expectation": "exact",
+      "wire": {
+        "type": "req",
+        "id": "request.count",
+        "method": "sessions.list",
+        "params": {
+          "limit": 200,
+          "view": "session-count-v1"
+        }
+      }
+    },
+    {
+      "id": "request.unknown-view",
+      "coverage": "unknown-view",
+      "expectation": "exact",
+      "wire": {
+        "type": "req",
+        "id": "request.unknown-view",
+        "method": "sessions.list",
+        "params": {
+          "limit": 5,
+          "view": "session-list-v-next",
+          "future_option": true
+        }
+      },
+      "expected_behavior": "legacy-list"
+    },
+    {
+      "id": "request.falsy-empty-array",
+      "coverage": "falsy-empty-array",
+      "expectation": "exact",
+      "wire": {
+        "type": "req",
+        "id": "request.falsy-empty-array",
+        "method": "sessions.list",
+        "params": []
+      },
+      "expected_behavior": "legacy-list",
+      "compatibility_note": "The current handler uses params or {}, so an empty array is accepted as an empty request."
+    },
+    {
+      "id": "request.truthy-non-object",
+      "coverage": "truthy-non-object",
+      "expectation": "exact",
+      "wire": {
+        "type": "req",
+        "id": "request.truthy-non-object",
+        "method": "sessions.list",
+        "params": [
+          1
+        ]
+      },
+      "expected_outcome": "error.truthy-non-object-internal"
+    }
+  ]
+}
