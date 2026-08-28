@@ -103,12 +103,30 @@
            topbar row (sidebar toggle + gateway status) too low. Compress the
            row so it hugs the top edge without losing 44px touch targets. */
         .topbar.topbar--chat {
-          margin-top: 0 !important;
+          margin: 0 !important;
           padding-top: 0 !important;
           height: calc(56px + env(safe-area-inset-top, 0px)) !important;
           min-height: calc(56px + env(safe-area-inset-top, 0px)) !important;
           flex-basis: calc(56px + env(safe-area-inset-top, 0px)) !important;
+          border: 0 !important;
+          border-radius: 0 !important;
+          background: var(--bg-surface) !important;
         }
+        /* The native shell and chat surface are one continuous plane. Do not
+           leave the desktop panel's rounded top-left corner to reveal the
+           native window behind it. */
+        #app-main.main--chat,
+        #app-main.main--chat .content--chat,
+        #app-main.main--chat .chat {
+          background: var(--bg-surface) !important;
+        }
+        /* The chat panel fills the Android viewport, so its desktop outer
+           rounding must not expose the layer behind it. Child controls keep
+           their own radius because this rule targets the panel only. */
+        #app-main.main--chat .chat {
+          border-radius: 0 !important;
+        }
+
       }
     </style>
 </head>

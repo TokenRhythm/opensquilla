@@ -1,8 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <style name="AppTheme" parent="android:Theme.Material.NoActionBar">
-        <item name="android:windowBackground">@android:color/black</item>
-        <item name="android:statusBarColor">#101418</item>
-        <item name="android:navigationBarColor">#101418</item>
+        <!-- The chat shell uses the dark surface token (#202022). Keep the
+             native bars/window on that same surface so no black or lighter
+             strip shows through before/around the WebView. -->
+        <item name="android:windowBackground">#202022</item>
+        <item name="android:statusBarColor">#202022</item>
+        <item name="android:navigationBarColor">#202022</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:windowNoTitle">true</item>
     </style>
 </resources>

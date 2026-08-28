@@ -38,10 +38,20 @@ class MainActivity : Activity() {
     private val fileChooserRequestCode = 4201
     private lateinit var webView: WebView
     private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
+    private val shellColor = Color.parseColor("#202022")
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Keep the native system bars and the WebView shell on the same dark
+        // surface. Otherwise Android's black window leaks above the rounded
+        // web panel as a visible horizontal strip.
+        window.statusBarColor = shellColor
+        window.navigationBarColor = shellColor
+        if (Build.VERSION.SDK_INT >= 29) {
+            window.isNavigationBarContrastEnforced = false
+        }
 
         webView = WebView(this).apply {
             layoutParams = ViewGroup.LayoutParams(
@@ -54,7 +64,7 @@ class MainActivity : Activity() {
             settings.allowFileAccess = false
             settings.allowContentAccess = false
             settings.mediaPlaybackRequiresUserGesture = false
-            setBackgroundColor(Color.parseColor("#101418"))
+            setBackgroundColor(shellColor)
 
             webViewClient = object : WebViewClient() {
                 override fun shouldOverrideUrlLoading(
@@ -129,7 +139,11 @@ class MainActivity : Activity() {
         // Chromium renders content across the whole WebView bounds and ignores
         // View padding, so edge-to-edge insets must be applied to a container
         // around the WebView instead of the WebView itself.
-        val root = android.widget.FrameLayout(this)
+        val root = android.widget.FrameLayout(this).apply {
+            // Also cover the native layer behind WebView corners; the default
+            // window background must never leak through as black.
+            setBackgroundColor(shellColor)
+        }
         root.addView(
             webView,
             android.widget.FrameLayout.LayoutParams(
@@ -213,7 +227,7 @@ class MainActivity : Activity() {
             setTextColor(Color.parseColor("#8AA0B0"))
             textSize = 16f
             gravity = android.view.Gravity.CENTER
-            setBackgroundColor(Color.parseColor("#101418"))
+            setBackgroundColor(shellColor)
         }
         root.addView(
             loadingView,
