@@ -1,0 +1,26 @@
+{
+  "format_version": 1,
+  "kind": "sessions-bootstrap-history-characterization",
+  "cases": [
+    {
+      "id": "bootstrap.history-alias-forwarding",
+      "request": {
+        "key": "agent:main:webchat:bootstrap-characterization",
+        "limit": 17,
+        "before": "8|8",
+        "after": "2|2",
+        "include_canonical": false,
+        "include_summaries": false
+      },
+      "expected_history": {
+        "sessionKey": "agent:main:webchat:bootstrap-characterization",
+        "limit": 17,
+        "before": "8|8",
+        "after": "2|2",
+        "includeCanonical": false,
+        "includeSummaries": false
+      },
+      "expected_order": ["stream_cursor", "history"]
+    }
+  ]
+}
