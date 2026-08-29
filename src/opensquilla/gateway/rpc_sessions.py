@@ -50,6 +50,13 @@ from opensquilla.engine.steps.router_decision_record import (
     drain_pending_flushes_for_sessions,
 )
 from opensquilla.gateway import attachment_ingest as _attachment_ingest
+from opensquilla.gateway.adapters.session_preview import (
+    SystemClock,
+    build_session_preview_application,
+    preview_params_from_v4,
+    preview_query_from_v4_values,
+    preview_result_to_v4,
+)
 from opensquilla.gateway.adapters.sessions_list_contract import (
     register_sessions_list_contract,
 )
@@ -11411,9 +11418,11 @@ async def _handle_sessions_messages_unsubscribe(params: dict | None, ctx: RpcCon
 
 @_d.method("sessions.preview", scope="operator.read")
 async def _handle_sessions_preview(params: dict | None, ctx: RpcContext) -> dict:
-    keys = (params or {}).get("keys")
-    limit = (params or {}).get("limit", 50)
-    now_ms = int(time.time() * 1000)
+    # Preserve the legacy order: a truthy non-mapping params value raises from
+    # ``.get`` before an unavailable manager can produce an empty response.
+    raw_keys, raw_limit = preview_params_from_v4(params)
+    clock = SystemClock()
+    now_ms = clock.now_ms()
 
     if ctx.session_manager is None:
         return {"ts": now_ms, "previews": []}
@@ -11422,47 +11431,17 @@ async def _handle_sessions_preview(params: dict | None, ctx: RpcContext) -> dict
     if storage is None:
         return {"ts": now_ms, "previews": []}
 
+    application = build_session_preview_application(storage, clock=clock)
+
     # Preview is an interactive read. Keep storage lock acquisition bounded
     # while preserving the existing key/list selection and response shape.
     with bounded_interactive_storage_reads():
-        if keys:
-            sessions = []
-            for k in keys:
-                s = await storage.get_session(k)
-                if s is not None:
-                    sessions.append(s)
-        else:
-            sessions = await storage.list_sessions(limit=limit)
+        # Key iteration stays inside the same bounded section as the old
+        # handler; malformed iterables therefore fail at the same point.
+        query = preview_query_from_v4_values(raw_keys, raw_limit)
+        result = await application.preview(query)
 
-        session_ids = [
-            str(getattr(session, "session_id", "") or "") for session in sessions
-        ]
-        last_messages = await storage.list_last_transcript_content_batch(
-            session_ids,
-            max_chars=120,
-        )
-
-    previews = []
-    for s in sessions:
-        session_id = str(getattr(s, "session_id", "") or "")
-        title = (
-            getattr(s, "display_name", None)
-            or getattr(s, "derived_title", None)
-            or session_id[:8]
-        )
-        last_message = last_messages.get(session_id, "")
-        if not isinstance(last_message, str):
-            last_message = ""
-        previews.append(
-            {
-                "key": s.session_key,
-                "title": title,
-                "lastMessage": last_message,
-                "updatedAt": getattr(s, "updated_at", now_ms),
-            }
-        )
-
-    return {"ts": now_ms, "previews": previews}
+    return preview_result_to_v4(result)
 
 
 async def _handle_sessions_resolve(params: dict | None, ctx: RpcContext) -> dict:
