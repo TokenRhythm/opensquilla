@@ -1,7 +1,6 @@
 export const lane = 'session-chat'
 
 export const debt = {
-  'src/components/CommandPalette.vue': { call: 1 },
   'src/components/chat/PromptCacheKeepaliveDialog.vue': { call: 2 },
   'src/composables/chat/sessionBootstrapAdmission.ts': { waitForConnection: 2 },
   'src/composables/chat/useChatApprovals.ts': {

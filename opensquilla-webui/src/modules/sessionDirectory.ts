@@ -45,6 +45,14 @@ export interface ResolvedSession {
   id: string
 }
 
+export type SessionSearchSessionHit = { key: string; title: string; surface: string | null }
+export type SessionSearchMessageHit = { key: string; title: string; snippet: string; createdAt: number | null }
+export type SessionSearchResult = {
+  sessions: SessionSearchSessionHit[]
+  messages: SessionSearchMessageHit[]
+}
+export type SessionSearchRequest = RequestOptions & { query: string; limit?: number }
+
 export type SessionDirectoryErrorCode =
   | 'not-found'
   | 'unsupported'
@@ -75,6 +83,7 @@ export interface SessionDirectory {
   ): Promise<SessionPage>
   count(options?: SessionDirectoryQueryOptions): Promise<SessionCount | null>
   resolve(request: { key: string } & RequestOptions): Promise<ResolvedSession>
+  search(request: SessionSearchRequest): Promise<SessionSearchResult>
 }
 
 export const SESSION_DIRECTORY_KEY: InjectionKey<SessionDirectory> = Symbol('SessionDirectory')

@@ -12,12 +12,20 @@ import {
   type SessionsResolveResult,
 } from '@/contracts/generated/v4/sessionsResolve'
 import { validateSessionsResolveResult } from '@/contracts/generated/v4/sessionsResolveValidators.mjs'
+import {
+  SESSIONS_SEARCH_METHOD,
+  type SessionsSearchParams,
+  type SessionsSearchResult as SessionsSearchWireResult,
+} from '@/contracts/generated/v4/sessionsSearch'
+import { validateSessionsSearchResult } from '@/contracts/generated/v4/sessionsSearchValidators.mjs'
 import type {
   ResolvedSession,
   SessionCount,
   SessionDirectory,
   SessionItem,
   SessionPage,
+  SessionSearchRequest,
+  SessionSearchResult,
 } from '@/modules/sessionDirectory'
 import { SessionDirectoryError } from '@/modules/sessionDirectory'
 import {
@@ -259,19 +267,25 @@ export function normalizeV4SessionItem(item: unknown): SessionItem | null {
 export function createV4SessionDirectory(
   transport: SessionDirectoryTransport,
 ): SessionDirectory {
+  async function requestWithPolicy<T>(
+    method: string,
+    params: Record<string, unknown>,
+    signal: AbortSignal | undefined,
+    abortMessage: string,
+  ): Promise<T> {
+    const options = signal ? { ...SESSION_DIRECTORY_CALL_OPTIONS, signal } : SESSION_DIRECTORY_CALL_OPTIONS
+    await transport.ready?.({ ...options, timeoutAction: 'reject', abortAction: 'reject' })
+    if (signal?.aborted) throw signal.reason || new Error(abortMessage)
+    return transport.request<T>(method, params, options)
+  }
+
   async function call(params: SessionsListParams, signal?: AbortSignal) {
-    const options = signal
-      ? { ...SESSION_DIRECTORY_CALL_OPTIONS, signal }
-      : SESSION_DIRECTORY_CALL_OPTIONS
-    await transport.ready?.(
-      {
-        timeoutMs: options.timeoutMs,
-        signal: options.signal,
-        timeoutAction: 'reject', abortAction: 'reject',
-      },
+    const result = await requestWithPolicy<Partial<SessionsListResult>>(
+      SESSIONS_LIST_METHOD,
+      params,
+      signal,
+      'Session directory request aborted',
     )
-    if (signal?.aborted) throw signal.reason || new Error('Session directory request aborted')
-    const result = await transport.request(SESSIONS_LIST_METHOD, params, options)
     return objectValue(result) as Partial<SessionsListResult> || {}
   }
 
@@ -317,31 +331,17 @@ export function createV4SessionDirectory(
 
     async resolve(request): Promise<ResolvedSession> {
       const params: SessionsResolveParams = { key: request.key }
-      const options = request.signal
-        ? { ...SESSION_DIRECTORY_CALL_OPTIONS, signal: request.signal }
-        : SESSION_DIRECTORY_CALL_OPTIONS
       try {
-        await transport.ready?.({
-          timeoutMs: options.timeoutMs,
-          signal: options.signal,
-          timeoutAction: 'reject',
-          abortAction: 'reject',
-        })
-        if (request.signal?.aborted) {
-          throw request.signal.reason || new Error('Session resolution request aborted')
-        }
-        const raw = await transport.request(
+        const raw = await requestWithPolicy<SessionsResolveResult>(
           SESSIONS_RESOLVE_METHOD,
           params,
-          options,
+          request.signal,
+          'Session resolution request aborted',
         )
-        if (!validateSessionsResolveResult(raw)) {
-          throw new SessionDirectoryError(
-            'unavailable',
-            'sessions.resolve returned an invalid response',
-          )
-        }
-        const result = raw as SessionsResolveResult
+        if (!validateSessionsResolveResult(raw)) throw new SessionDirectoryError(
+          'unavailable', 'sessions.resolve returned an invalid response',
+        )
+        const result = raw
         if (
           typeof result.session_key !== 'string'
           || typeof result.session_id !== 'string'
@@ -354,6 +354,32 @@ export function createV4SessionDirectory(
         return {
           key: result.session_key,
           id: result.session_id,
+        }
+      } catch (error) {
+        if (isAbort(error, request.signal)) throw error
+        throw sessionDirectoryError(error)
+      }
+    },
+
+    async search(request: SessionSearchRequest): Promise<SessionSearchResult> {
+      try {
+        const params: SessionsSearchParams = { query: request.query }
+        if (request.limit !== undefined) params.limit = request.limit
+        const raw = await requestWithPolicy<SessionsSearchWireResult>(
+          SESSIONS_SEARCH_METHOD,
+          params,
+          request.signal,
+          'Session search request aborted',
+        )
+        if (!validateSessionsSearchResult(raw)) throw new SessionDirectoryError(
+          'unavailable', 'sessions.search returned an invalid response',
+        )
+        const wire = raw
+        return {
+          sessions: wire.sessions.map(({ key, title, surface }) => ({ key, title, surface })),
+          messages: wire.messages.map(({ key, title, snippet, createdAt }) => ({
+            key, title, snippet, createdAt: numberValue(createdAt),
+          })),
         }
       } catch (error) {
         if (isAbort(error, request.signal)) throw error
