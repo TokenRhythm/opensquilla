@@ -440,14 +440,35 @@ jobs:
           overwrite: true
 
   build-desktop-windows:
-    name: Build unsigned Windows Electron installer
+    name: Build and verify signed Windows Electron installer
     needs: build-control-ui
     # Keep the v0.5.3 upgrade baseline on the OS generation it shipped on.
     # The legacy NSIS installer can crash with 0xC0000005 on Windows Server 2025
     # before the candidate installer or profile-preservation checks run.
     runs-on: windows-2022
     timeout-minutes: 150
+    environment:
+      name: windows-code-signing
     steps:
+      - name: Reject untrusted signing invocation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ('${{ github.event_name }}' -eq 'push') {
+            if ('${{ github.ref_type }}' -ne 'tag' -or '${{ github.ref_name }}' -notlike 'v*') {
+              throw 'Windows signing on push is restricted to v* tags.'
+            }
+          } elseif ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            if ('${{ github.ref_type }}' -ne 'branch') {
+              throw 'Manually dispatched signing jobs must use a branch workflow ref.'
+            }
+            if ('${{ env.RELEASE_TAG }}' -ne '' -and '${{ github.ref }}' -ne 'refs/heads/main') {
+              throw 'Existing-tag release uploads must be dispatched from main.'
+            }
+          } else {
+            throw 'Unsupported Windows signing event.'
+          }
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -482,6 +503,69 @@ jobs:
           cache: npm
           cache-dependency-path: desktop/electron/package-lock.json
 
+      - name: Configure DigiCert KeyLocker credentials
+        shell: pwsh
+        env:
+          SM_HOST_SECRET: ${{ secrets.SM_HOST }}
+          SM_API_KEY_SECRET: ${{ secrets.SM_API_KEY }}
+          SM_CLIENT_CERT_FILE_B64_SECRET: ${{ secrets.SM_CLIENT_CERT_FILE_B64 }}
+          SM_CLIENT_CERT_PASSWORD_SECRET: ${{ secrets.SM_CLIENT_CERT_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @(
+            'SM_HOST_SECRET',
+            'SM_API_KEY_SECRET',
+            'SM_CLIENT_CERT_FILE_B64_SECRET',
+            'SM_CLIENT_CERT_PASSWORD_SECRET'
+          )) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Required windows-code-signing environment secret is missing: $name"
+            }
+          }
+          $clientCertificate = Join-Path $env:RUNNER_TEMP 'digicert-client-auth.p12'
+          [IO.File]::WriteAllBytes(
+            $clientCertificate,
+            [Convert]::FromBase64String($env:SM_CLIENT_CERT_FILE_B64_SECRET)
+          )
+          "SM_HOST=$env:SM_HOST_SECRET" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SM_API_KEY=$env:SM_API_KEY_SECRET" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SM_CLIENT_CERT_FILE=$clientCertificate" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SM_CLIENT_CERT_PASSWORD=$env:SM_CLIENT_CERT_PASSWORD_SECRET" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install and initialize DigiCert KeyLocker KSP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = Join-Path $env:RUNNER_TEMP 'Keylockertools-windows-x64.msi'
+          Invoke-WebRequest `
+            -Uri 'https://one.digicert.com/signingmanager/api-ui/v1/releases/Keylockertools-windows-x64.msi/download' `
+            -Headers @{ 'x-api-key' = $env:SM_API_KEY } `
+            -OutFile $msi
+          $install = Start-Process msiexec.exe `
+            -ArgumentList @('/i', $msi, '/quiet', '/qn', '/norestart') `
+            -Wait -PassThru
+          if ($install.ExitCode -notin @(0, 3010)) {
+            throw "DigiCert KeyLocker tools installation failed with exit code $($install.ExitCode)."
+          }
+          $smctl = Get-ChildItem 'C:/Program Files/DigiCert' -Filter smctl.exe -Recurse -File |
+            Select-Object -First 1
+          if ($null -eq $smctl) { throw 'smctl.exe was not installed.' }
+          $signTool = Get-ChildItem 'C:/Program Files (x86)/Windows Kits/10/bin' `
+            -Filter signtool.exe -Recurse -File |
+            Where-Object { $_.Directory.Name -eq 'x64' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if ($null -eq $signTool) { throw 'x64 signtool.exe was not found.' }
+          $smctl.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          $signTool.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "SIGNTOOL_PATH=$($signTool.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          & $smctl.FullName windows ksp list
+          if ($LASTEXITCODE -ne 0) { throw 'DigiCert KSP registration check failed.' }
+          & $smctl.FullName keypair ls
+          if ($LASTEXITCODE -ne 0) { throw 'DigiCert KeyLocker keypair access check failed.' }
+          & $smctl.FullName windows certsync
+          if ($LASTEXITCODE -ne 0) { throw 'DigiCert certificate synchronization failed.' }
+
       - name: Install Electron dependencies
         working-directory: desktop/electron
         run: npm ci
@@ -496,16 +580,20 @@ jobs:
         working-directory: desktop/electron
         run: node ../../.github/scripts/verify-sandbox-package.mjs --release-source
 
-      - name: Build unsigned Windows installer
+      - name: Build signed Windows installer
         working-directory: desktop/electron
-        shell: bash
-        env:
-          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        shell: pwsh
         run: |
-          set -euo pipefail
           npm run build:gateway
+          if ($LASTEXITCODE -ne 0) { throw 'Gateway build failed.' }
           npm run build
-          npx electron-builder --win --publish never
+          if ($LASTEXITCODE -ne 0) { throw 'Electron build failed.' }
+          node scripts/build-signed-windows.cjs
+          if ($LASTEXITCODE -ne 0) { throw 'Signed Windows packaging failed.' }
+
+      - name: Verify Windows Authenticode signatures and timestamps
+        shell: pwsh
+        run: .github/scripts/verify-windows-signatures.ps1
 
       - name: Verify Electron package
         working-directory: desktop/electron
@@ -555,6 +643,16 @@ jobs:
             -CandidateInstaller $candidates[0].FullName `
             -Label built-candidate `
             -VerifyLongRunningUpdateBanner
+
+      - name: Remove DigiCert client authentication material
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          if ($env:SM_CLIENT_CERT_FILE -and (Test-Path -LiteralPath $env:SM_CLIENT_CERT_FILE)) {
+            Remove-Item -LiteralPath $env:SM_CLIENT_CERT_FILE -Force
+          }
+          $msi = Join-Path $env:RUNNER_TEMP 'Keylockertools-windows-x64.msi'
+          if (Test-Path -LiteralPath $msi) { Remove-Item -LiteralPath $msi -Force }
 
       - name: List Windows artifacts
         shell: bash

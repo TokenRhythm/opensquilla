@@ -76,15 +76,16 @@ npm run dist
 
 ## Windows Release Signing
 
-Windows release builds are currently unsigned. The release workflow builds the
-NSIS installer with electron-builder and uploads the unsigned `.exe`,
-`.blockmap`, and `latest.yml` artifacts together so updater metadata matches
-the exact installer bytes.
+Windows release builds are signed through DigiCert KeyLocker. The release
+workflow uses the protected `windows-code-signing` environment for manually
+dispatched test artifacts and `v*` release tags. Missing credentials, signing
+failures, and signature-policy mismatches fail the Windows build.
 
-Do not sign the `.exe` after `latest.yml` is emitted; that changes the
-installer bytes and invalidates the updater hash. If Windows code signing is
-enabled later, it must run inside the release build before updater metadata,
-blockmaps, and `SHA256SUMS` are finalized. See
+Signing runs inside electron-builder before updater metadata, blockmaps, and
+`SHA256SUMS` are finalized, so those files describe the signed installer bytes.
+The expected public certificate identity and timestamp endpoint are defined in
+`.github/signing/windows-signing-policy.json`; credentials remain GitHub
+environment secrets. See
 [`docs/code-signing-policy.md`](../../docs/code-signing-policy.md) for the
 current policy.
 
