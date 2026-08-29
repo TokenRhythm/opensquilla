@@ -649,6 +649,7 @@
     "tests/test_gateway/test_sandbox_v2_routes.py": 0.148,
     "tests/test_gateway/test_search_runtime_config_gateway.py": 0.01,
     "tests/test_gateway/test_security_headers.py": 0.037,
+    "tests/test_application/test_session_history.py": 0.01,
     "tests/test_gateway/test_session_model_routing.py": 0.01,
     "tests/test_gateway/test_session_model_routing_rpc.py": 0.01,
     "tests/test_gateway/test_chat_history_characterization.py": 0.01,
