@@ -584,6 +584,7 @@
       "tests/test_gateway/test_security_headers.py",
       "tests/test_gateway/test_session_model_routing.py",
       "tests/test_gateway/test_session_model_routing_rpc.py",
+      "tests/test_gateway/test_session_preview_adapter.py",
       "tests/test_gateway/test_session_streams.py",
       "tests/test_gateway/test_sessions_list_contract_adapter.py",
       "tests/test_gateway/test_sessions_resolve_contract_adapter.py",

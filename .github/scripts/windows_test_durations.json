@@ -651,6 +651,7 @@
     "tests/test_gateway/test_security_headers.py": 0.037,
     "tests/test_gateway/test_session_model_routing.py": 0.01,
     "tests/test_gateway/test_session_model_routing_rpc.py": 0.01,
+    "tests/test_gateway/test_session_preview_adapter.py": 0.01,
     "tests/test_gateway/test_session_streams.py": 0.038,
     "tests/test_gateway/test_sessions_list_contract_adapter.py": 0.01,
     "tests/test_gateway/test_sessions_resolve_contract_adapter.py": 0.01,
