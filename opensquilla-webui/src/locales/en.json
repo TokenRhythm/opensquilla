@@ -60,7 +60,14 @@
     "removeBody": "{name} will disappear from the sidebar. Its task history and files will be preserved.",
     "removeBodyWithCronJobs": "{name} will disappear from the sidebar. {count} linked scheduled task(s) will be paused and kept until you rebind or delete them. Task history and files will be preserved.",
     "removeConfirm": "Remove project",
-    "removeFailed": "Could not remove the project: {error}"
+    "removeFailed": "Could not remove the project: {error}",
+    "sessionMoved": "Task moved to project",
+    "moveSessionFailed": "Could not move task: {error}",
+    "sessionRemoved": "Task removed from project",
+    "moveSessionSessionMissing": "This task no longer exists; the list has been refreshed",
+    "moveSessionWorkspaceMissing": "That project no longer exists",
+    "moveSessionWorkspaceRemoved": "That project was removed; pick another project",
+    "removeSessionFailed": "Could not remove task from project: {error}"
   },
   "updates": {
     "available": "OpenSquilla {version} is available",
@@ -4365,7 +4372,10 @@
       "bulkDeleteConfirm": "Delete selected",
       "bulkDeleteDone": "Deleted {count} tasks",
       "bulkDeletePartial": "{count} tasks failed to delete",
-      "bulkDeleteFailed": "Failed to delete selected tasks"
+      "bulkDeleteFailed": "Failed to delete selected tasks",
+      "moveToProject": "Move to project",
+      "moveFromProject": "Remove from project",
+      "newProject": "New project…"
     },
     "setupBanner": {
       "ariaLabel": "Gateway setup needed",

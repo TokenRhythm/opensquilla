@@ -60,7 +60,14 @@
     "removeBody": "{name} 将从侧栏消失，但任务历史和文件都会保留。",
     "removeBodyWithCronJobs": "{name} 将从侧栏消失。关联的 {count} 个定时任务会被暂停并保留，等待重新绑定或删除；任务历史和文件都会保留。",
     "removeConfirm": "移除项目",
-    "removeFailed": "无法移除项目：{error}"
+    "removeFailed": "无法移除项目：{error}",
+    "sessionMoved": "已将会话移至项目",
+    "moveSessionFailed": "移动会话失败：{error}",
+    "sessionRemoved": "已将会话移出项目",
+    "moveSessionSessionMissing": "该任务已不存在，列表已刷新",
+    "moveSessionWorkspaceMissing": "目标项目已不存在",
+    "moveSessionWorkspaceRemoved": "目标项目已被移除，请选择其他项目",
+    "removeSessionFailed": "移出会话失败：{error}"
   },
   "updates": {
     "available": "OpenSquilla {version} 已发布",
@@ -4365,7 +4372,10 @@
       "bulkDeleteConfirm": "删除已选",
       "bulkDeleteDone": "已删除 {count} 个任务",
       "bulkDeletePartial": "{count} 个任务删除失败",
-      "bulkDeleteFailed": "删除已选任务失败"
+      "bulkDeleteFailed": "删除已选任务失败",
+      "moveToProject": "移至项目",
+      "moveFromProject": "从项目移出",
+      "newProject": "新项目…"
     },
     "setupBanner": {
       "ariaLabel": "需要设置网关",

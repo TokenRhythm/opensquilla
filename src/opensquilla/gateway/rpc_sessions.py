@@ -196,6 +196,8 @@ from opensquilla.session.storage import (
     TaskCollectionUnavailableError,
     TurnAcceptanceResult,
     TurnIngressConflictError,
+    WorkspaceNotFoundError,
+    WorkspaceRemovedError,
     bounded_interactive_storage_reads,
 )
 from opensquilla.session.terminal_reply import (
@@ -9582,6 +9584,93 @@ async def _handle_sessions_rename(params: dict | None, ctx: RpcContext) -> dict:
         key=key,
         storage=storage,
     )
+
+
+@_d.method("sessions.moveToWorkspace", scope="operator.write")
+async def _handle_sessions_move_to_workspace(
+    params: dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    """Move a session to another project workspace, or remove it from one.
+
+    Pass ``workspaceId`` to bind the session to that workspace; pass
+    ``null`` (or omit it) to remove the session from its current workspace.
+    """
+
+    if not isinstance(params, dict):
+        raise RpcHandlerError("INVALID_PARAMS", "params object required")
+    key = _require_key(params)
+
+    if ctx.session_manager is None:
+        raise KeyError("No session manager available")
+    storage = get_session_storage(ctx.session_manager)
+    if storage is None:
+        raise KeyError("No session storage available")
+
+    raw_workspace_id = params.get("workspaceId", params.get("workspace_id"))
+    workspace_id: str | None = None
+    if raw_workspace_id is not None:
+        if not isinstance(raw_workspace_id, str) or not raw_workspace_id.strip():
+            raise RpcHandlerError(
+                "INVALID_PARAMS",
+                "workspaceId must be a non-empty string or null",
+            )
+        workspace_id = raw_workspace_id.strip()
+
+    # Bind atomically: session lookup, workspace validation, and the update
+    # all happen inside one write transaction, so a concurrently removed
+    # workspace can no longer slip between validation and binding.
+    try:
+        changed = await storage.bind_session_workspace_atomic(
+            session_key=key, workspace_id=workspace_id
+        )
+    except WorkspaceNotFoundError as exc:
+        # NOTE: must precede the KeyError clause — WorkspaceNotFoundError is a
+        # KeyError subclass, and except clauses match in order.
+        raise RpcHandlerError(
+            "WORKSPACE_NOT_FOUND",
+            "Project workspace not found",
+            details={"workspaceId": workspace_id},
+        ) from exc
+    except KeyError as exc:
+        raise RpcHandlerError(
+            "SESSION_NOT_FOUND",
+            f"Session not found: {key}",
+        ) from exc
+    except WorkspaceRemovedError as exc:
+        raise RpcHandlerError(
+            "WORKSPACE_REMOVED",
+            "Project workspace has been removed",
+            details={"workspaceId": workspace_id},
+        ) from exc
+    except StorageBusyError as exc:
+        raise RpcHandlerError(
+            "WORKSPACE_MOVE_FAILED",
+            f"Failed to move session to workspace: {exc}",
+            details={"workspaceId": workspace_id},
+            retryable=True,
+            retry_after_ms=exc.retry_after_ms,
+        ) from exc
+    except Exception as exc:
+        raise RpcHandlerError(
+            "WORKSPACE_MOVE_FAILED",
+            f"Failed to move session to workspace: {exc}",
+            details={"workspaceId": workspace_id},
+        ) from exc
+
+    if changed:
+        await _emit_to_subscribers(
+            ctx,
+            key,
+            "sessions.changed",
+            build_sessions_changed_payload(
+                key,
+                "moved",
+                workspaceId=workspace_id,
+            ),
+        )
+
+    return {"key": key, "workspaceId": workspace_id, "changed": changed}
 
 
 @_d.method("sessions.reset", scope="operator.write")

@@ -91,6 +91,7 @@
       :search-hint="commandPaletteHint"
       :can-manage-projects="rpcStore.canManageProjectWorkspaces"
       :can-create-projects="rpcStore.canChooseProject"
+      :workspaces="sidebarWorkspaces"
       @select="switchToSession"
       @refresh="loadSidebarData"
       @load-more="loadMoreSessions"
@@ -99,6 +100,8 @@
       @bulk-delete="onBulkDeleteSessions"
       @reorder="onReorderSidebarSession"
       @session-pin="onPinSidebarSession"
+      @move-to-workspace="onMoveToWorkspace"
+      @move-from-workspace="onMoveFromWorkspace"
       @new-chat="startNewChatInstant"
       @new-project="openProjectCreator"
       @new-project-task="startProjectTask"
@@ -1086,6 +1089,12 @@ const sidebarPinnedSessionKeys = ref<string[]>(readStoredSessionKeys(SIDEBAR_PIN
 // Collapsible family sections (Chats / Channels / Automations). Row titles and
 // agent names are resolved here so the raw-session-id scrub and the display-name
 // lookup stay in App.vue; subagents indent under their parent via the helper.
+const sidebarWorkspaces = computed(() =>
+  rpcStore.canManageProjectWorkspaces && projectWorkspaces.hasLoaded.value
+    ? projectWorkspaces.workspaces.value.map(w => ({ id: w.id, name: w.name }))
+    : [],
+)
+
 const sidebarSections = computed((): SidebarSection[] => {
   const byKey = new Map(sidebarSessionItems.value.map(item => [item.key, item]))
   return arrangeSidebarSections(
@@ -1147,6 +1156,64 @@ function onPinSidebarSession(payload: { key: string; pinned: boolean }) {
   currentOrder.unshift(payload.key)
   sidebarSessionOrder.value = currentOrder
   writeStoredSessionKeys(SIDEBAR_SESSION_ORDER_KEY, currentOrder)
+}
+
+type RpcErrorShape = { code?: unknown; message?: unknown }
+
+function rpcErrorCode(err: unknown): string {
+  const candidate = err as RpcErrorShape | null
+  return typeof candidate?.code === 'string' ? candidate.code : ''
+}
+
+// Precise copy for the typed moveToWorkspace failure codes; any other
+// rejection (transport, INVALID_PARAMS, WORKSPACE_MOVE_FAILED, …) keeps the
+// generic message with the raw error appended.
+function workspaceMoveFailureMessage(err: unknown, genericMessage: string): string {
+  switch (rpcErrorCode(err)) {
+    case 'SESSION_NOT_FOUND':
+      return t('workspaces.moveSessionSessionMissing')
+    case 'WORKSPACE_NOT_FOUND':
+      return t('workspaces.moveSessionWorkspaceMissing')
+    case 'WORKSPACE_REMOVED':
+      return t('workspaces.moveSessionWorkspaceRemoved')
+    default:
+      return genericMessage
+  }
+}
+
+async function onMoveToWorkspace(payload: { key: string; workspaceId: string }) {
+  try {
+    await rpcStore.call('sessions.moveToWorkspace', {
+      key: payload.key,
+      workspaceId: payload.workspaceId,
+    })
+    await loadSessions()
+    pushToast(t('workspaces.sessionMoved'), { tone: 'ok' })
+  } catch (err) {
+    pushToast(
+      workspaceMoveFailureMessage(
+        err,
+        t('workspaces.moveSessionFailed', { error: errorMessage(err) }),
+      ),
+      { tone: 'danger' },
+    )
+  }
+}
+
+async function onMoveFromWorkspace(key: string) {
+  try {
+    await rpcStore.call('sessions.moveToWorkspace', { key, workspaceId: null })
+    await loadSessions()
+    pushToast(t('workspaces.sessionRemoved'), { tone: 'ok' })
+  } catch (err) {
+    pushToast(
+      workspaceMoveFailureMessage(
+        err,
+        t('workspaces.removeSessionFailed', { error: errorMessage(err) }),
+      ),
+      { tone: 'danger' },
+    )
+  }
 }
 
 let appAutomaticRpcMounted = false

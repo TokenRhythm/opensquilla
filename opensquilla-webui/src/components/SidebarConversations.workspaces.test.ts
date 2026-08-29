@@ -79,6 +79,9 @@ function i18n() {
             statusLabel: '{status}',
             rename: 'Rename',
             delete: 'Delete',
+            moveToProject: 'Move to project',
+            moveFromProject: 'Remove from project',
+            newProject: 'New project',
           },
         },
         workspaces: {
@@ -123,6 +126,8 @@ async function mountSidebar(
     projectRemove: vi.fn(),
     reorder: vi.fn(),
     sessionPin: vi.fn(),
+    moveToWorkspace: vi.fn(),
+    moveFromWorkspace: vi.fn(),
   }
   const host = document.createElement('div')
   document.body.appendChild(host)
@@ -136,6 +141,11 @@ async function mountSidebar(
     searchHint: 'Ctrl+K',
     canManageProjects,
     canCreateProjects,
+    workspaces: [
+      { id: 'project-a', name: 'Project A' },
+      { id: 'project-b', name: 'Project B' },
+      { id: 'project-c', name: 'Project C' },
+    ],
     onSelect: events.select,
     onNewProject: events.newProject,
     onNewProjectTask: events.newProjectTask,
@@ -145,6 +155,8 @@ async function mountSidebar(
     onProjectRemove: events.projectRemove,
     onReorder: events.reorder,
     onSessionPin: events.sessionPin,
+    onMoveToWorkspace: events.moveToWorkspace,
+    onMoveFromWorkspace: events.moveFromWorkspace,
   }))
   const app = createApp(Root)
   app.use(i18n())
@@ -736,6 +748,115 @@ describe('SidebarConversations project workspaces', () => {
       .toContain('Project task')
     expect(host.querySelector('[data-session-key="agent:main:webchat:running"]')?.textContent)
       .toContain('Running')
+  })
+
+  async function openWorkspaceSubmenuForTask(host: HTMLElement) {
+    const row = host.querySelector<HTMLElement>('[data-session-key="agent:main:webchat:task-a"]')
+    row?.querySelector<HTMLButtonElement>('.sidebar-row-menu-btn')?.click()
+    await nextTick()
+    const moveBtn = Array.from(
+      document.body.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
+    ).find(btn => btn.textContent?.includes('Move to project'))
+    moveBtn?.click()
+    await nextTick()
+  }
+
+  it('marks the current workspace disabled but still selectable others in the submenu', async () => {
+    const { host, events } = await mountSidebar([projectRow(), taskRow()])
+    await openWorkspaceSubmenuForTask(host)
+    await nextTick()
+
+    const submenu = document.body.querySelector<HTMLElement>('.sidebar-row-menu--submenu')
+    expect(submenu).toBeTruthy()
+    expect(submenu?.getAttribute('role')).toBe('menu')
+
+    const items = Array.from(
+      submenu?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]') ?? [],
+    )
+    // current workspace disabled + --current class; others enabled
+    const current = items.find(btn => btn.textContent?.includes('Project A'))
+    expect(current?.disabled).toBe(true)
+    expect(current?.classList.contains('sidebar-row-menu__item--current')).toBe(true)
+    const target = items.find(btn => btn.textContent?.includes('Project B'))
+    expect(target?.disabled).toBe(false)
+
+    target?.click()
+    expect(events.moveToWorkspace).toHaveBeenCalledWith({
+      key: 'agent:main:webchat:task-a',
+      workspaceId: 'project-b',
+    })
+    await nextTick()
+    expect(document.body.querySelector('.sidebar-row-menu--submenu')).toBeNull()
+  })
+
+  it('roving focus in the submenu skips the disabled current workspace', async () => {
+    const { host } = await mountSidebar([projectRow(), taskRow()])
+    await openWorkspaceSubmenuForTask(host)
+    await nextTick()
+
+    const submenu = document.body.querySelector<HTMLElement>('.sidebar-row-menu--submenu')
+    const items = Array.from(
+      submenu?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)') ?? [],
+    )
+    expect(items.length).toBeGreaterThan(0)
+    items[0]?.focus()
+    expect(document.activeElement).toBe(items[0])
+
+    submenu?.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }))
+    await nextTick()
+    // Project A (current, disabled) must be skipped; focus lands on next enabled
+    const enabledItems = Array.from(
+      submenu?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)') ?? [],
+    )
+    expect(document.activeElement).toBe(enabledItems[1])
+
+    submenu?.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true }))
+    await nextTick()
+    expect(document.activeElement).toBe(enabledItems[0])
+  })
+
+  it('escape closes only the submenu and restores focus to its trigger', async () => {
+    const { host } = await mountSidebar([projectRow(), taskRow()])
+    await openWorkspaceSubmenuForTask(host)
+    await nextTick()
+
+    const trigger = Array.from(
+      document.body.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
+    ).find(btn => btn.textContent?.includes('Move to project'))
+    expect(trigger).toBeTruthy()
+    const submenu = document.body.querySelector<HTMLElement>('.sidebar-row-menu--submenu')
+    expect(submenu).toBeTruthy()
+
+    submenu?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await nextTick()
+
+    expect(document.body.querySelector('.sidebar-row-menu--submenu')).toBeNull()
+    // The session row menu (a .sidebar-row-menu without the submenu class) stays open.
+    expect(document.body.querySelector('.sidebar-row-menu:not(.sidebar-row-menu--submenu)')).toBeTruthy()
+    expect(document.activeElement).toBe(trigger)
+    expect(trigger?.getAttribute('aria-expanded')).toBe('false')
+  })
+
+  it('exposes move-to-project and remove-from-project menu items with aria semantics', async () => {
+    const { host, events } = await mountSidebar([projectRow(), taskRow()])
+    const row = host.querySelector<HTMLElement>('[data-session-key="agent:main:webchat:task-a"]')
+    row?.querySelector<HTMLButtonElement>('.sidebar-row-menu-btn')?.click()
+    await nextTick()
+
+    const moveBtn = Array.from(
+      document.body.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
+    ).find(btn => btn.textContent?.includes('Move to project'))
+    expect(moveBtn?.getAttribute('aria-haspopup')).toBe('true')
+    // Submenu not opened yet: trigger reports collapsed.
+    expect(moveBtn?.getAttribute('aria-expanded')).toBe('false')
+
+    const removeBtn = Array.from(
+      document.body.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
+    ).find(btn => btn.textContent?.includes('Remove from project'))
+    expect(removeBtn).toBeTruthy()
+
+    removeBtn?.click()
+    expect(events.moveFromWorkspace).toHaveBeenCalledWith('agent:main:webchat:task-a')
   })
 
 })

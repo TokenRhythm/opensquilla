@@ -225,6 +225,18 @@ class ProjectSessionSnapshotMismatchError(RuntimeError):
     """Raised when a locked project-session snapshot changed before deletion."""
 
 
+class WorkspaceNotFoundError(KeyError):
+    """Raised when a referenced project workspace row does not exist."""
+
+
+class WorkspaceRemovedError(RuntimeError):
+    """Raised when a referenced project workspace has a non-null removed_at.
+
+    Binding a live session to a removed workspace is refused (fail closed);
+    unbinding (``workspace_id=None``) stays allowed.
+    """
+
+
 @dataclass(frozen=True)
 class ResetArchiveSnapshot:
     """Pre-reset session state captured under the acceptance write transaction."""
@@ -4808,6 +4820,61 @@ class SessionStorage:
             )
             if int(cursor.rowcount or 0) == 0:
                 raise KeyError(f"Session not found: {session_key}")
+
+    async def bind_session_workspace_atomic(
+        self,
+        session_key: str,
+        workspace_id: str | None,
+    ) -> bool:
+        """Bind a session to a workspace atomically and report whether it changed.
+
+        All validation happens inside a single ``BEGIN IMMEDIATE`` write
+        transaction, so a concurrently removed workspace can no longer slip
+        between a "does it exist" check and the binding write (the TOCTOU
+        window of the previous check-then-bind handler flow).
+
+        - Raises ``KeyError`` when the session row does not exist.
+        - Raises ``WorkspaceNotFoundError`` when ``workspace_id`` is not None
+          and no workspace row exists.
+        - Raises ``WorkspaceRemovedError`` when the target workspace row is
+          soft-deleted (``removed_at`` set); fail closed. Unbinding
+          (``workspace_id=None``) is always allowed.
+        - Returns ``False`` without writing when the session already points at
+          the target (idempotent no-op, including unbind of an unbound
+          session); returns ``True`` after a real change.
+        """
+
+        session_key = canonicalize_session_key(session_key)
+        async with self._write_transaction("bind_session_workspace_atomic") as conn:
+            async with conn.execute(
+                "SELECT workspace_id FROM sessions WHERE session_key = ?",
+                (session_key,),
+            ) as cursor:
+                session_row = await cursor.fetchone()
+            if session_row is None:
+                raise KeyError(f"Session not found: {session_key}")
+            old_workspace_id = session_row["workspace_id"]
+            if workspace_id is not None:
+                async with conn.execute(
+                    "SELECT removed_at FROM project_workspaces WHERE workspace_id = ?",
+                    (workspace_id,),
+                ) as cursor:
+                    workspace_row = await cursor.fetchone()
+                if workspace_row is None:
+                    raise WorkspaceNotFoundError(
+                        f"Project workspace not found: {workspace_id}"
+                    )
+                if workspace_row["removed_at"] is not None:
+                    raise WorkspaceRemovedError(
+                        f"Project workspace removed: {workspace_id}"
+                    )
+            if old_workspace_id == workspace_id:
+                return False
+            await conn.execute(
+                "UPDATE sessions SET workspace_id = ? WHERE session_key = ?",
+                (workspace_id, session_key),
+            )
+            return True
 
     @_serialized_read
     async def list_legacy_project_workspace_candidates(
