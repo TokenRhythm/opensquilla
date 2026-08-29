@@ -455,6 +455,7 @@ import { useAppStore, type ThemeMode, type PendingApproval } from './stores/app'
 import { useRpcStore } from './stores/rpc'
 import { SESSION_DIRECTORY_KEY } from './modules/sessionDirectory'
 import { SESSION_DIRECTORY_CHANGES_KEY } from './modules/sessionDirectoryChanges'
+import { SESSION_LIFECYCLE_KEY } from './modules/sessionLifecycle'
 import {
   arrangeSidebarSections,
   useSessions,
@@ -541,6 +542,9 @@ const sessionDirectory = injectedSessionDirectory
 const injectedSessionDirectoryChanges = inject(SESSION_DIRECTORY_CHANGES_KEY)
 if (!injectedSessionDirectoryChanges) throw new Error('SessionDirectoryChanges was not provided')
 const sessionDirectoryChanges = injectedSessionDirectoryChanges
+const injectedSessionLifecycle = inject(SESSION_LIFECYCLE_KEY)
+if (!injectedSessionLifecycle) throw new Error('SessionLifecycle was not provided')
+const sessionLifecycle = injectedSessionLifecycle
 const shortcutsStore = useShortcutsStore()
 const artifactImageLightbox = provideArtifactImageLightbox()
 const { t } = useI18n()
@@ -600,11 +604,6 @@ function setSidebarCssWidth(width: number) {
 watch(sidebarEffectiveWidth, width => {
   if (!sidebarResizeActive.value) setSidebarCssWidth(width)
 }, { immediate: true })
-
-interface DeleteSessionsResponse {
-  deleted?: string[]
-  errors?: string[]
-}
 
 const APP_SESSION_SYNC_SOURCE = 'app-sidebar'
 
@@ -1538,9 +1537,9 @@ function switchToSession(key: string, source = 'app.switchToSession') {
   router.push({ path: '/chat', query: { session: key } })
 }
 
-// Optimistic rename: show the new title immediately, then persist via
-// sessions.rename (display_name is the top-precedence title) and reload so the
-// backend's canonical title wins. The override clears once the reload lands.
+// Optimistic rename: show the new title immediately, then persist through the
+// SessionLifecycle seam and reload so the backend's canonical title wins. The
+// override clears once the reload lands.
 async function onRenameSession({ key, title }: { key: string; title: string }) {
   const next = title.trim()
   if (!key || !next) return
@@ -1548,10 +1547,10 @@ async function onRenameSession({ key, title }: { key: string; title: string }) {
   const local = localChatSessions.value[key]
   if (local) localChatSessions.value[key] = { ...local, title: next }
   try {
-    await rpcStore.call('sessions.rename', { key, displayName: next })
+    await sessionLifecycle.rename({ key, title: next })
     pushToast('Session renamed', { tone: 'ok' })
   } catch (err: unknown) {
-    console.warn('[App] sessions.rename error:', errorMessage(err))
+    console.warn('[App] session rename error:', errorMessage(err))
     pushToast('Failed to rename session', { tone: 'danger' })
   } finally {
     await loadSessions()
@@ -1583,13 +1582,13 @@ function handleLocalSessionsDeleted(event: Event) {
   scheduleSessionRefresh()
 }
 
-async function deleteSessions(keys: string[]): Promise<DeleteSessionsResponse | null> {
+async function deleteSessions(keys: string[]) {
   const uniqueKeys = [...new Set(keys.map(key => key.trim()).filter(Boolean))]
   if (uniqueKeys.length === 0) return null
   try {
-    return await rpcStore.call<DeleteSessionsResponse>('sessions.delete', { keys: uniqueKeys })
+    return await sessionLifecycle.remove(uniqueKeys)
   } catch (err: unknown) {
-    console.warn('[App] sessions.delete error:', errorMessage(err))
+    console.warn('[App] session deletion error:', errorMessage(err))
     return null
   }
 }
@@ -1604,7 +1603,7 @@ async function onBulkDeleteSessions(keys: string[]) {
   const result = await deleteSessions(uniqueKeys)
   const deleted = new Set(result?.deleted || [])
   if (!result || deleted.size === 0) {
-    console.warn('[App] sessions.delete reported failure:', result?.errors)
+    console.warn('[App] session deletion reported failure:', result?.errors)
     pushToast(t('shared.sidebar.bulkDeleteFailed'), { tone: 'danger' })
     return
   }
@@ -1615,7 +1614,7 @@ async function onBulkDeleteSessions(keys: string[]) {
   const failedCount = Math.max(0, uniqueKeys.length - deleted.size)
   pushToast(t('shared.sidebar.bulkDeleteDone', { count: deleted.size }), { tone: 'ok' })
   if (failedCount > 0 || (result.errors?.length || 0) > 0) {
-    console.warn('[App] sessions.delete partial failure:', result.errors)
+    console.warn('[App] session deletion partial failure:', result.errors)
     pushToast(t('shared.sidebar.bulkDeletePartial', { count: failedCount || result.errors?.length || 0 }), { tone: 'danger' })
   }
   await loadSessions()
@@ -1629,7 +1628,7 @@ async function onDeleteSession(key: string) {
   const wasCurrent = key === currentSessionKey.value
   const result = await deleteSessions([key])
   if (!result?.deleted?.includes(key)) {
-    console.warn('[App] sessions.delete reported failure:', result?.errors)
+    console.warn('[App] session deletion reported failure:', result?.errors)
     pushToast('Failed to delete session', { tone: 'danger' })
     return
   }

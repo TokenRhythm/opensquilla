@@ -6,8 +6,14 @@ import re
 import secrets
 from typing import Any
 
+from opensquilla.contracts.generated.v4.sessions_delete_metadata import (
+    SESSIONS_DELETE_METHOD,
+)
 from opensquilla.contracts.generated.v4.sessions_list_metadata import (
     SESSIONS_LIST_METHOD,
+)
+from opensquilla.contracts.generated.v4.sessions_rename_metadata import (
+    SESSIONS_RENAME_METHOD,
 )
 from opensquilla.session.keys import canonicalize_session_key, parse_agent_id
 
@@ -23,8 +29,8 @@ GUEST_RPC_ALLOWLIST = frozenset(
         "artifacts.list",
         "artifacts.get",
         SESSIONS_LIST_METHOD,
-        "sessions.rename",
-        "sessions.delete",
+        SESSIONS_RENAME_METHOD,
+        SESSIONS_DELETE_METHOD,
         "sessions.bootstrap",
         "sessions.messages.subscribe",
         "sessions.messages.hydrate",
@@ -46,7 +52,7 @@ _SESSION_KEY_FIELDS = {
     "chat.abort": ("sessionKey", "key"),
     "chat.clarify_submit": ("sessionKey", "key"),
     "sessions.bootstrap": ("key", "sessionKey"),
-    "sessions.rename": ("key", "sessionKey"),
+    SESSIONS_RENAME_METHOD: ("key", "sessionKey"),
     "sessions.messages.subscribe": ("key", "sessionKey"),
     "sessions.messages.hydrate": ("key", "sessionKey"),
     "sessions.messages.snapshot": ("key", "sessionKey"),
@@ -184,7 +190,7 @@ class GuestRpcPolicy:
             normalized["_source"] = normalized_source
             return normalized
 
-        if method == "sessions.delete":
+        if method == SESSIONS_DELETE_METHOD:
             if not isinstance(params, dict):
                 raise GuestRpcPolicyError("Guest session key is required")
             raw_keys = params.get("keys")

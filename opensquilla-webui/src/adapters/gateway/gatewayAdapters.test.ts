@@ -20,7 +20,11 @@ describe('Gateway Adapter composition', () => {
       waitForConnection: vi.fn(async () => undefined),
     })
 
-    expect(Object.keys(adapters)).toEqual(['sessionDirectory', 'sessionDirectoryChanges'])
+    expect(Object.keys(adapters)).toEqual([
+      'sessionDirectory',
+      'sessionDirectoryChanges',
+      'sessionLifecycle',
+    ])
     expect(adapters).not.toHaveProperty('rpc')
     expect(adapters).not.toHaveProperty('events')
     await expect(adapters.sessionDirectory.listPage({ limit: 10 })).resolves.toEqual({

@@ -2,7 +2,7 @@ export const lane = 'shared-foundation'
 
 export const debt = {
   'src/App.vue': {
-    call: 5,
+    call: 3,
     on: 6,
     httpRequest: 1,
     httpApiEndpoint: 1,

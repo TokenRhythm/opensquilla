@@ -156,16 +156,12 @@ import {
 import { sessionAgentIdentity } from '@/components/sessions/sessionDisplay'
 import { SESSION_DIRECTORY_KEY } from '@/modules/sessionDirectory'
 import { SESSION_DIRECTORY_CHANGES_KEY } from '@/modules/sessionDirectoryChanges'
+import { SESSION_LIFECYCLE_KEY } from '@/modules/sessionLifecycle'
 
 type FilterId = 'all' | 'chats' | 'automations' | 'channels'
 
 interface AgentsListResponse {
   agents?: Array<{ id?: string; name?: string }>
-}
-
-interface DeleteResponse {
-  deleted?: string[]
-  errors?: unknown[]
 }
 
 const FILTER_CHIPS: Array<{ id: FilterId; labelKey: string }> = [
@@ -194,6 +190,9 @@ const sessionDirectory = injectedSessionDirectory
 const injectedSessionDirectoryChanges = inject(SESSION_DIRECTORY_CHANGES_KEY)
 if (!injectedSessionDirectoryChanges) throw new Error('SessionDirectoryChanges was not provided')
 const sessionDirectoryChanges = injectedSessionDirectoryChanges
+const injectedSessionLifecycle = inject(SESSION_LIFECYCLE_KEY)
+if (!injectedSessionLifecycle) throw new Error('SessionLifecycle was not provided')
+const sessionLifecycle = injectedSessionLifecycle
 const { confirm } = useConfirm()
 const {
   sessionsList,
@@ -464,9 +463,9 @@ async function removeSession(item: SessionItem) {
   if (!ok) {
     return
   }
-  let result: DeleteResponse | null = null
+  let result: Awaited<ReturnType<typeof sessionLifecycle.remove>> | null = null
   try {
-    result = await rpc.call<DeleteResponse>('sessions.delete', { keys: [item.key] })
+    result = await sessionLifecycle.remove([item.key])
   } catch (err) {
     console.warn('Delete failed: ' + (err instanceof Error ? err.message : String(err)))
     return

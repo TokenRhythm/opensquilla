@@ -18,7 +18,7 @@ describe('ChatView Goal and Plan composer mode exclusivity', () => {
     const provisionalGuard = source.indexOf(
       "pendingSessionIntent.value !== 'new_chat'",
     )
-    const createSession = source.indexOf("rpc.call<{ key?: string }>('sessions.create'")
+    const createSession = source.indexOf('sessionLifecycle.create({')
     const captureRouting = source.indexOf('const draftInitialRoutingMode = initialRoutingMode.value')
     const persistRouting = source.indexOf("rpc.call('sessions.routing.set'")
     const preserveAgent = source.indexOf('agentId: agentIdFromSessionKey(sourceKey)')
