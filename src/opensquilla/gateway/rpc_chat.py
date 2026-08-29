@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import structlog
 
+from opensquilla.application.session_history import SessionHistoryQuery
 from opensquilla.artifact_session import (
     ArtifactSessionService,
     MutationAttempt,
@@ -19,12 +20,12 @@ from opensquilla.artifact_session import (
     document_mutation_outcome_from_attempt,
 )
 from opensquilla.chat.conversation import ChatSendRequest, sessions_send_params
-from opensquilla.chat.flattened_tool_markers import (
-    has_flattened_used_tool_line,
-    is_flattened_tool_result_dump,
-)
 from opensquilla.chat.history import transcript_entries_to_chat_messages
 from opensquilla.chat.source import chat_source_metadata
+from opensquilla.gateway.adapters.session_history import (
+    SessionHistoryStorageAdapter,
+    parse_history_cursor,
+)
 from opensquilla.gateway.compaction_target import (
     effective_session_model,
     resolve_gateway_compaction_target,
@@ -553,53 +554,6 @@ def _chat_history_cursor(entry: object | None) -> str | None:
     return f"{created_at}|{stable_id}"
 
 
-def _chat_history_cursor_index(entries: list[object], cursor: object) -> int | None:
-    raw = str(cursor or "").strip()
-    if not raw:
-        return None
-    for idx, entry in enumerate(entries):
-        if _chat_history_cursor(entry) == raw:
-            return idx
-    return None
-
-
-def _chat_history_cursor_key(cursor: object) -> tuple[int, int] | None:
-    raw = str(cursor or "").strip()
-    if not raw or "|" not in raw:
-        return None
-    created_at, stable_id = raw.split("|", 1)
-    try:
-        return int(created_at), int(stable_id)
-    except ValueError:
-        return None
-
-
-def _chat_history_page(
-    entries: list[object],
-    *,
-    limit: int,
-    before: object = None,
-    after: object = None,
-) -> tuple[list[object], bool]:
-    if not entries:
-        return [], False
-    before_idx = _chat_history_cursor_index(entries, before)
-    if before_idx is not None:
-        end = before_idx
-        start = max(0, end - limit)
-        return entries[start:end], start > 0
-
-    after_idx = _chat_history_cursor_index(entries, after)
-    if after_idx is not None:
-        start = min(len(entries), after_idx + 1)
-        end = min(len(entries), start + limit)
-        return entries[start:end], end < len(entries)
-
-    if len(entries) <= limit:
-        return entries, False
-    return entries[-limit:], True
-
-
 def _session_summary_to_chat_payload(summary: object) -> dict[str, Any]:
     return {
         "id": getattr(summary, "id", None),
@@ -643,168 +597,6 @@ def _annotate_transcript_attachment_downloads(
     return messages
 
 
-def _canonical_page_parts(page: object) -> tuple[list[object], bool, bool]:
-    if isinstance(page, dict):
-        entries = page.get("entries")
-        has_more = page.get("has_more", False)
-        canonical_complete = page.get("canonical_complete", True)
-    elif isinstance(page, tuple):
-        entries = page[0] if page else None
-        has_more = page[1] if len(page) > 1 else False
-        canonical_complete = page[2] if len(page) > 2 else True
-    else:
-        entries = getattr(page, "entries", None)
-        has_more = getattr(page, "has_more", False)
-        canonical_complete = getattr(page, "canonical_complete", True)
-    if entries is None:
-        raise TypeError("canonical transcript page is missing entries")
-    return list(entries), bool(has_more), bool(canonical_complete)
-
-
-async def _load_chat_history_page(
-    mgr: object,
-    session_key: str,
-    *,
-    limit: int,
-    before: object = None,
-    after: object = None,
-    include_canonical: bool,
-) -> tuple[list[object], bool, bool, bool]:
-    if include_canonical:
-        page_getter = getattr(mgr, "get_canonical_transcript_page", None)
-        if callable(page_getter):
-            try:
-                page = await page_getter(
-                    session_key,
-                    limit=limit,
-                    before=_chat_history_cursor_key(before),
-                    after=_chat_history_cursor_key(after),
-                )
-                entries, has_more, canonical_complete = _canonical_page_parts(page)
-                return entries, has_more, True, canonical_complete
-            except StorageBusyError:
-                raise
-            except Exception:  # noqa: BLE001 - fall back to active transcript
-                pass
-        else:
-            getter = getattr(mgr, "get_canonical_transcript", None)
-            if callable(getter):
-                try:
-                    transcript = list(await getter(session_key))
-                    entries, has_more = _chat_history_page(
-                        transcript,
-                        limit=limit,
-                        before=before,
-                        after=after,
-                    )
-                    return entries, has_more, True, True
-                except StorageBusyError:
-                    raise
-                except Exception:  # noqa: BLE001 - fall back to active transcript
-                    pass
-    transcript_getter = getattr(mgr, "get_transcript", None)
-    if not callable(transcript_getter):
-        return [], False, False, False
-    transcript = await transcript_getter(session_key)
-    entries, has_more = _chat_history_page(
-        list(transcript or []),
-        limit=limit,
-        before=before,
-        after=after,
-    )
-    return entries, has_more, False, False
-
-
-def _needs_legacy_tool_lookbehind(entry: object | None) -> bool:
-    if entry is None or getattr(entry, "tool_call_id", None):
-        return False
-    role = str(getattr(entry, "role", "") or "").lower()
-    content = str(getattr(entry, "content", "") or "")
-    return role in {"tool", "user"} and is_flattened_tool_result_dump(content)
-
-
-def _needs_legacy_tool_lookahead(entry: object | None) -> bool:
-    if entry is None or getattr(entry, "tool_calls", None):
-        return False
-    role = str(getattr(entry, "role", "") or "").lower()
-    content = str(getattr(entry, "content", "") or "")
-    return role == "assistant" and has_flattened_used_tool_line(content)
-
-
-async def _load_legacy_tool_projection_context(
-    mgr: object,
-    session_key: str,
-    entries: list[object],
-    *,
-    canonical_available: bool,
-) -> tuple[object | None, object | None]:
-    """Load at most one adjacent row per page edge for legacy projection.
-
-    The selected page remains the pagination/accounting unit. These bounded
-    reads only provide enough context to recognize a marker/result pair split
-    by a page boundary; neither row is added to the response page.
-    """
-
-    if not entries or not canonical_available:
-        return None, None
-    page_getter = getattr(mgr, "get_canonical_transcript_page", None)
-    if not callable(page_getter):
-        return None, None
-
-    previous_entry = None
-    next_entry = None
-    oldest_cursor = _chat_history_cursor_key(_chat_history_cursor(entries[0]))
-    newest_cursor = _chat_history_cursor_key(_chat_history_cursor(entries[-1]))
-    if _needs_legacy_tool_lookbehind(entries[0]) and oldest_cursor is not None:
-        try:
-            page = await page_getter(
-                session_key,
-                limit=1,
-                before=oldest_cursor,
-                after=None,
-            )
-            candidates, _has_more, _complete = _canonical_page_parts(page)
-        except StorageBusyError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - optional read-time projection
-            log.warning(
-                "chat_history_legacy_projection_context_unavailable",
-                edge="before",
-                error_type=type(exc).__name__,
-            )
-            return None, None
-        if candidates:
-            candidate = candidates[-1]
-            candidate_cursor = _chat_history_cursor_key(_chat_history_cursor(candidate))
-            if candidate_cursor is not None and candidate_cursor < oldest_cursor:
-                previous_entry = candidate
-
-    if _needs_legacy_tool_lookahead(entries[-1]) and newest_cursor is not None:
-        try:
-            page = await page_getter(
-                session_key,
-                limit=1,
-                before=None,
-                after=newest_cursor,
-            )
-            candidates, _has_more, _complete = _canonical_page_parts(page)
-        except StorageBusyError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - optional read-time projection
-            log.warning(
-                "chat_history_legacy_projection_context_unavailable",
-                edge="after",
-                error_type=type(exc).__name__,
-            )
-            return None, None
-        if candidates:
-            candidate = candidates[0]
-            candidate_cursor = _chat_history_cursor_key(_chat_history_cursor(candidate))
-            if candidate_cursor is not None and candidate_cursor > newest_cursor:
-                next_entry = candidate
-    return previous_entry, next_entry
-
-
 async def _project_missing_history_usage(
     mgr: object,
     session_key: str,
@@ -838,7 +630,7 @@ async def _project_missing_history_usage(
     # A page is a contiguous keyset slice, so only rows after its last cursor
     # can hold a turn's terminal assistant row. Probing that suffix keeps the
     # newest page — the common read — from touching transcript rows at all.
-    page_cursor = _chat_history_cursor_key(_chat_history_cursor(entries[-1]))
+    page_cursor = parse_history_cursor(_chat_history_cursor(entries[-1]))
 
     continuing: set[str] = set()
     try:
@@ -1350,6 +1142,15 @@ async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
     )
 
     mgr = _require_chat_session_manager(ctx)
+    history_adapter = SessionHistoryStorageAdapter(mgr)
+    history_application = history_adapter.application()
+    history_query = SessionHistoryQuery(
+        session_key=session_key,
+        limit=limit,
+        before=parse_history_cursor(before),
+        after=parse_history_cursor(after),
+        include_canonical=include_canonical,
+    )
 
     async def _load_page() -> tuple[
         list[object],
@@ -1359,28 +1160,19 @@ async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
         object | None,
         object | None,
     ]:
-        entries, has_more, canonical_available, canonical_complete = (
-            await _load_chat_history_page(
-                mgr,
-                session_key,
-                limit=limit,
-                before=before,
-                after=after,
-                include_canonical=include_canonical,
-            )
-        )
+        page = await history_application.read_page(history_query)
+        entries = list(page.entries)
         entries = await _project_missing_history_usage(mgr, session_key, entries)
-        previous_entry, next_entry = await _load_legacy_tool_projection_context(
-            mgr,
+        previous_entry, next_entry = await history_adapter.load_legacy_tool_projection_context(
             session_key,
             entries,
-            canonical_available=canonical_available,
+            canonical_available=page.canonical_available,
         )
         return (
             entries,
-            has_more,
-            canonical_available,
-            canonical_complete,
+            page.has_more,
+            page.canonical_available,
+            page.canonical_complete,
             previous_entry,
             next_entry,
         )

@@ -584,6 +584,7 @@
       "tests/test_gateway/test_sandbox_v2_routes.py",
       "tests/test_gateway/test_search_runtime_config_gateway.py",
       "tests/test_gateway/test_security_headers.py",
+      "tests/test_gateway/test_session_history_adapter.py",
       "tests/test_gateway/test_session_model_routing.py",
       "tests/test_gateway/test_session_model_routing_rpc.py",
       "tests/test_gateway/test_session_preview_adapter.py",
