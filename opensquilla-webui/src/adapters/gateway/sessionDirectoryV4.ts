@@ -11,7 +11,7 @@ import {
   type SessionsResolveParams,
   type SessionsResolveResult,
 } from '@/contracts/generated/v4/sessionsResolve'
-import { validateSessionsResolveResult } from '@/contracts/generated/v4/sessionsResolveValidators.cjs'
+import { validateSessionsResolveResult } from '@/contracts/generated/v4/sessionsResolveValidators.mjs'
 import type {
   ResolvedSession,
   SessionCount,

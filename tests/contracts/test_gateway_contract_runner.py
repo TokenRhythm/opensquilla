@@ -383,7 +383,7 @@ def test_generic_renderer_derives_all_adapter_only_artifacts(
     monkeypatch.setattr(
         runner,
         "_capture",
-        lambda command, env, purpose: "exports.validateSessionsResolveRequestFrame = true\n",
+        lambda command, env, purpose: "export const validateSessionsResolveRequestFrame = true\n",
     )
 
     rendered = runner.render_generic(spec)
@@ -392,8 +392,8 @@ def test_generic_renderer_derives_all_adapter_only_artifacts(
         "sessions_resolve.py",
         "sessions_resolve_metadata.py",
         "sessionsResolve.ts",
-        "sessionsResolveValidators.cjs",
-        "sessionsResolveValidators.d.cts",
+        "sessionsResolveValidators.mjs",
+        "sessionsResolveValidators.d.mts",
     }
     combined = "\n".join(rendered.values())
     assert "SESSIONS_RESOLVE_METHOD" in combined

@@ -1,5 +1,4 @@
 import { readFileSync } from 'node:fs'
-import { createRequire } from 'node:module'
 import { describe, expect, it } from 'vitest'
 import type {
   SessionsResolveParams,
@@ -15,8 +14,7 @@ interface FixtureDocument {
   cases: Array<{ id: string, wire?: unknown }>
 }
 
-const require = createRequire(import.meta.url)
-const validators = require('./generated/v4/sessionsResolveValidators.cjs') as {
+const validators = await import('./generated/v4/sessionsResolveValidators.mjs') as {
   validateSessionsResolveRequestFrame: ContractValidator
   validateSessionsResolveResponseFrame: ContractValidator
   validateSessionsResolveResult: ContractValidator

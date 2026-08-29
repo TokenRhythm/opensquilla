@@ -106,12 +106,19 @@ class ContractSpec:
 
     @property
     def outputs(self) -> tuple[Path, ...]:
+        # Generic validators are imported by the browser-side Vite adapter.
+        # They must be native ESM: Vite intentionally does not transform
+        # source-tree .cjs files during dev, so a named import would leave the
+        # browser with a CommonJS module that has no exports.  The legacy
+        # sessions.list generator remains byte-for-byte CJS compatible.
+        validator_suffix = "Validators.cjs" if self.uses_legacy_generator else "Validators.mjs"
+        declaration_suffix = ".d.cts" if self.uses_legacy_generator else ".d.mts"
         return (
             PYTHON_OUTPUT_ROOT / f"{self.python_stem}.py",
             PYTHON_OUTPUT_ROOT / f"{self.python_stem}_metadata.py",
             TYPESCRIPT_OUTPUT_ROOT / f"{self.typescript_stem}.ts",
-            TYPESCRIPT_OUTPUT_ROOT / f"{self.typescript_stem}Validators.cjs",
-            TYPESCRIPT_OUTPUT_ROOT / f"{self.typescript_stem}Validators.d.cts",
+            TYPESCRIPT_OUTPUT_ROOT / f"{self.typescript_stem}{validator_suffix}",
+            TYPESCRIPT_OUTPUT_ROOT / f"{self.typescript_stem}Validators{declaration_suffix}",
         )
 
     @property
@@ -1189,7 +1196,7 @@ def render_generic(spec: ContractSpec) -> dict[Path, str]:
             purpose=f"TypeScript generation for {spec.wire_name}",
         )
         validator = _capture(
-            ["node", str(AJV_GENERATOR), str(spec.schema)],
+            ["node", str(AJV_GENERATOR), str(spec.schema), "--esm"],
             env=env,
             purpose=f"validator generation for {spec.wire_name}",
         )
