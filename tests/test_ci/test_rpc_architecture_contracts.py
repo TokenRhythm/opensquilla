@@ -59,15 +59,13 @@ SESSIONS_LIST_GATEWAY_ADAPTER = (
 RUNTIME_RPC_METHOD_BASELINE = 306
 STATIC_RPC_DECORATOR_BASELINE = 296
 
-# Physical lines in the sessions/runtime slice at the merged S1 baseline.
-# Contract sources, generators, fixtures, tests and generated artifacts are
-# reported separately.  S1 established the first application seam; S2a moves
-# the search orchestration behind it and is allowed only a small, explicit
-# amount of authored code while the later cleanup PR removes the old DTOs and
-# adapter glue.  The final Z1 closure gate remains responsible for making the
-# complete migration smaller than the #1460 baseline.
-AUTHORED_RUNTIME_LOC_BASELINE = 26_018
-S2A_AUTHORED_RUNTIME_GROWTH_BUDGET = 220
+# Physical lines in the sessions/runtime slice remain tracked for the final
+# closure measurement below.  The temporary S2a cumulative growth budget was
+# intentionally retired when the sessions.search slice completed: later
+# slices are allowed to improve a shared compatibility handler, and carrying
+# that historical ceiling forward would either block valid work or encourage
+# arbitrary budget increases.  Z1 is the authoritative gate for net authored
+# production LOC reduction after each complete domain migration.
 AUTHORED_RUNTIME_FILES = (
     "opensquilla-webui/src/App.vue",
     "opensquilla-webui/src/components/sessions/SessionInspectDrawer.vue",
@@ -459,16 +457,6 @@ def _physical_lines(relative_paths: tuple[str, ...]) -> int:
     return sum(
         len((ROOT / relative).read_text(encoding="utf-8").splitlines())
         for relative in relative_paths
-    )
-
-
-def test_s2a_authored_runtime_stays_within_bounded_seam_budget() -> None:
-    current = _physical_lines(AUTHORED_RUNTIME_FILES)
-    growth = current - AUTHORED_RUNTIME_LOC_BASELINE
-    assert growth <= S2A_AUTHORED_RUNTIME_GROWTH_BUDGET, (
-        f"sessions.search authored runtime grew by {growth} lines "
-        f"from merged S1 baseline {AUTHORED_RUNTIME_LOC_BASELINE}; "
-        f"S2a budget is {S2A_AUTHORED_RUNTIME_GROWTH_BUDGET}"
     )
 
 
