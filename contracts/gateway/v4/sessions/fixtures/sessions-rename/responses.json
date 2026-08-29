@@ -1,0 +1,12 @@
+{
+  "format_version": 1,
+  "kind": "response",
+  "cases": [
+    {
+      "id": "response.renamed",
+      "coverage": "canonical-patch-result",
+      "expectation": "exact",
+      "wire": { "type": "res", "id": "rename-1", "ok": true, "payload": { "key": "agent:main:webchat:abc123", "updated": ["displayName"] }, "error": null }
+    }
+  ]
+}

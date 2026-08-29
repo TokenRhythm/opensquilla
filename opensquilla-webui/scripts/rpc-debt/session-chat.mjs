@@ -81,7 +81,7 @@ export const debt = {
     httpSessionKeyHeader: 1,
   },
   'src/views/ChatView.vue': {
-    call: 7,
+    call: 6,
     on: 1,
     supportsEvent: 1,
     supportsMethod: 14,
@@ -93,7 +93,7 @@ export const debt = {
     httpSessionKeyHeader: 1,
   },
   'src/views/SessionsView.vue': {
-    call: 2,
+    call: 1,
     on: 5,
     httpRequest: 1,
     httpApiEndpoint: 1,

@@ -1079,7 +1079,7 @@ export function useChatGoals(options: UseChatGoalsOptions) {
   watch(options.sessionKey, () => {
     disarm()
     // The Goal host intentionally switches provisional drafts after
-    // sessions.create. Preserve the outer admission until ensureSessionKey
+    // session materialization. Preserve the outer admission until ensureSessionKey
     // returns; its key fences distinguish that switch from stale navigation.
     resetGeneration(true)
   }, { flush: 'sync' })

@@ -50,6 +50,23 @@ SESSIONS_CHANGED_METADATA_IMPORT_ALLOWLIST = frozenset(
         "src/opensquilla/contracts/adapters/sessions_changed_contract.py",
     }
 )
+SESSIONS_CREATE_METADATA_IMPORT_ALLOWLIST = frozenset(
+    {
+        "src/opensquilla/gateway/scopes.py",
+    }
+)
+SESSIONS_RENAME_METADATA_IMPORT_ALLOWLIST = frozenset(
+    {
+        "src/opensquilla/gateway/guest_rpc_policy.py",
+        "src/opensquilla/gateway/scopes.py",
+    }
+)
+SESSIONS_DELETE_METADATA_IMPORT_ALLOWLIST = frozenset(
+    {
+        "src/opensquilla/gateway/guest_rpc_policy.py",
+        "src/opensquilla/gateway/scopes.py",
+    }
+)
 SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
     {
         # This is a transport concurrency policy registry.  WebSocket is an
@@ -83,7 +100,9 @@ AUTHORED_RUNTIME_FILES = (
     "opensquilla-webui/src/views/SessionsView.vue",
     "opensquilla-webui/src/views/UsageView.vue",
     "opensquilla-webui/src/adapters/gateway/sessionDirectoryV4.ts",
+    "opensquilla-webui/src/adapters/gateway/sessionLifecycleV4.ts",
     "opensquilla-webui/src/modules/sessionDirectory.ts",
+    "opensquilla-webui/src/modules/sessionLifecycle.ts",
     "opensquilla-webui/src/modules/sessionRunStatus.ts",
     "src/opensquilla/cli/gateway_client.py",
     "src/opensquilla/contracts/adapters/sessions_list_contract.py",
@@ -114,8 +133,11 @@ F2_FOUNDATION_RUNTIME_FILES = (
 # 3 lines for hostile request-option normalization and 3 lines for endpoint
 # input normalization.
 # Keep the allowance explicit so later domain slices cannot hide authored
-# growth behind this infrastructure exception.
-F2_FOUNDATION_RUNTIME_LOC_CEILING = 1_142
+# growth behind this infrastructure exception.  Session-directory changes and
+# lifecycle now each register one reviewed domain Adapter in the composition
+# root; the 12-line increase is the deliberate cumulative seam cost for those
+# two slices, not an open-ended budget.
+F2_FOUNDATION_RUNTIME_LOC_CEILING = 1_154
 
 # Existing cross-rpc private imports are architectural debt. This exact ledger
 # prevents growth and also fails stale when an import is removed, so reductions
@@ -313,67 +335,49 @@ def test_generated_registry_stays_inside_the_generated_boundary() -> None:
 
 
 def test_schema_derived_method_metadata_consumers_are_exact() -> None:
-    consumers: set[str] = set()
-    for path in _python_files(PACKAGE_ROOT):
-        for node in ast.walk(_tree(path)):
-            if any(
-                module
-                == "opensquilla.contracts.generated.v4.sessions_list_metadata"
-                for module in _imported_modules(path, node)
-            ):
-                consumers.add(_relative(path))
-
-    unexpected = consumers - GENERATED_METADATA_IMPORT_ALLOWLIST
-    stale = GENERATED_METADATA_IMPORT_ALLOWLIST - consumers
-    assert unexpected == set(), f"unexpected sessions.list metadata imports: {unexpected}"
-    assert stale == set(), f"stale sessions.list metadata import allowlist: {stale}"
-
-    resolve_consumers = set()
-    for path in _python_files(PACKAGE_ROOT):
-        for node in ast.walk(_tree(path)):
-            if any(
-                module
-                == "opensquilla.contracts.generated.v4.sessions_resolve_metadata"
-                for module in _imported_modules(path, node)
-            ):
-                resolve_consumers.add(_relative(path))
-
-    unexpected = resolve_consumers - SESSIONS_RESOLVE_METADATA_IMPORT_ALLOWLIST
-    stale = SESSIONS_RESOLVE_METADATA_IMPORT_ALLOWLIST - resolve_consumers
-    assert unexpected == set(), f"unexpected sessions.resolve metadata imports: {unexpected}"
-    assert stale == set(), f"stale sessions.resolve metadata import allowlist: {stale}"
-
-    search_consumers = set()
-    for path in _python_files(PACKAGE_ROOT):
-        for node in ast.walk(_tree(path)):
-            if any(
-                module
-                == "opensquilla.contracts.generated.v4.sessions_search_metadata"
-                for module in _imported_modules(path, node)
-            ):
-                search_consumers.add(_relative(path))
-
-    unexpected = search_consumers - SESSIONS_SEARCH_METADATA_IMPORT_ALLOWLIST
-    stale = SESSIONS_SEARCH_METADATA_IMPORT_ALLOWLIST - search_consumers
-    assert unexpected == set(), f"unexpected sessions.search metadata imports: {unexpected}"
-    assert stale == set(), f"stale sessions.search metadata import allowlist: {stale}"
-
-    changed_consumers = set()
-    for path in _python_files(PACKAGE_ROOT):
-        for node in ast.walk(_tree(path)):
-            if any(
-                module
-                == "opensquilla.contracts.generated.v4.sessions_changed_metadata"
-                for module in _imported_modules(path, node)
-            ):
-                changed_consumers.add(_relative(path))
-
-    unexpected = changed_consumers - SESSIONS_CHANGED_METADATA_IMPORT_ALLOWLIST
-    stale = SESSIONS_CHANGED_METADATA_IMPORT_ALLOWLIST - changed_consumers
-    assert unexpected == set(), (
-        f"unexpected sessions.changed metadata imports: {unexpected}"
-    )
-    assert stale == set(), f"stale sessions.changed metadata import allowlist: {stale}"
+    allowlists = {
+        "sessions.list": (
+            "opensquilla.contracts.generated.v4.sessions_list_metadata",
+            GENERATED_METADATA_IMPORT_ALLOWLIST,
+        ),
+        "sessions.resolve": (
+            "opensquilla.contracts.generated.v4.sessions_resolve_metadata",
+            SESSIONS_RESOLVE_METADATA_IMPORT_ALLOWLIST,
+        ),
+        "sessions.search": (
+            "opensquilla.contracts.generated.v4.sessions_search_metadata",
+            SESSIONS_SEARCH_METADATA_IMPORT_ALLOWLIST,
+        ),
+        "sessions.changed": (
+            "opensquilla.contracts.generated.v4.sessions_changed_metadata",
+            SESSIONS_CHANGED_METADATA_IMPORT_ALLOWLIST,
+        ),
+        "sessions.create": (
+            "opensquilla.contracts.generated.v4.sessions_create_metadata",
+            SESSIONS_CREATE_METADATA_IMPORT_ALLOWLIST,
+        ),
+        "sessions.rename": (
+            "opensquilla.contracts.generated.v4.sessions_rename_metadata",
+            SESSIONS_RENAME_METADATA_IMPORT_ALLOWLIST,
+        ),
+        "sessions.delete": (
+            "opensquilla.contracts.generated.v4.sessions_delete_metadata",
+            SESSIONS_DELETE_METADATA_IMPORT_ALLOWLIST,
+        ),
+    }
+    for method, (module_name, allowlist) in allowlists.items():
+        consumers = {
+            _relative(path)
+            for path in _python_files(PACKAGE_ROOT)
+            for node in ast.walk(_tree(path))
+            if module_name in _imported_modules(path, node)
+        }
+        unexpected = consumers - allowlist
+        stale = allowlist - consumers
+        assert unexpected == set(), (
+            f"unexpected {method} metadata imports: {unexpected}"
+        )
+        assert stale == set(), f"stale {method} metadata import allowlist: {stale}"
 
 
 def test_sessions_list_authored_literal_debt_is_exact() -> None:

@@ -27,4 +27,10 @@ describe('SessionsView deletion contract', () => {
     expect(handler).toContain("if (state === 'connected') scheduleSessionRefresh()")
     expect(activation).toContain("rpc.on('_state', handleConnectionState)")
   })
+
+  it('routes deletion through the domain lifecycle seam', () => {
+    expect(sessionsViewSource).toContain('SESSION_LIFECYCLE_KEY')
+    expect(sessionsViewSource).toContain('sessionLifecycle.remove([item.key])')
+    expect(sessionsViewSource).not.toContain("rpc.call<DeleteResponse>('sessions.delete'")
+  })
 })

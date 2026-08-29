@@ -806,6 +806,7 @@ import {
   SESSION_DIRECTORY_KEY,
   SessionDirectoryError,
 } from '@/modules/sessionDirectory'
+import { SESSION_LIFECYCLE_KEY } from '@/modules/sessionLifecycle'
 import { useRpcCall } from '@/composables/useRpc'
 import { useAppStore } from '@/stores/app'
 import { useSandboxSetupStore } from '@/stores/sandboxSetup'
@@ -1166,6 +1167,9 @@ const rpc = useRpcStore()
 const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
 if (!injectedSessionDirectory) throw new Error('SessionDirectory was not provided')
 const sessionDirectory = injectedSessionDirectory
+const injectedSessionLifecycle = inject(SESSION_LIFECYCLE_KEY)
+if (!injectedSessionLifecycle) throw new Error('SessionLifecycle was not provided')
+const sessionLifecycle = injectedSessionLifecycle
 
 async function resolveCreatedSessionAvailability(sessionKey: string): Promise<boolean> {
   try {
@@ -3009,12 +3013,12 @@ const chatGoals = useChatGoals({
     const sourceIntent = pendingSessionIntent.value
     const workspaceId = pendingWorkspaceId.value
     const draftInitialRoutingMode = initialRoutingMode.value
-    const created = await rpc.call<{ key?: string }>('sessions.create', {
+    const created = await sessionLifecycle.create({
       agentId: agentIdFromSessionKey(sourceKey),
       kind: 'webchat',
       ...(workspaceId ? { workspaceId } : {}),
     })
-    const key = String(created?.key || '').trim()
+    const key = created.key.trim()
     if (!key) throw new Error('failed to create a session for the goal')
     // Creating the durable row may outlive this draft. Never let its completion
     // navigate the operator away from the session/project they chose meanwhile.
