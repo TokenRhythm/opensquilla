@@ -56,6 +56,9 @@ from opensquilla.gateway.adapters.sessions_list_contract import (
 from opensquilla.gateway.adapters.sessions_resolve_contract import (
     register_sessions_resolve_contract,
 )
+from opensquilla.gateway.adapters.sessions_search_contract import (
+    register_sessions_search_contract,
+)
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
 from opensquilla.gateway.artifact_product_errors import (
     ArtifactProductErrorCode,
@@ -2924,7 +2927,6 @@ async def _titles_for_keys(
     return out
 
 
-@_d.method("sessions.search", scope="operator.read")
 async def _handle_sessions_search(params: dict | None, ctx: RpcContext) -> dict:
     """Search sessions by title and by transcript content.
 
@@ -2999,6 +3001,14 @@ async def _handle_sessions_search(params: dict | None, ctx: RpcContext) -> dict:
         "query": result.query,
         "ts": result.ts,
     }
+
+
+_handle_sessions_search_contract = register_sessions_search_contract(
+    _d,
+    _handle_sessions_search,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 @_d.method("sessions.create", scope="operator.write")

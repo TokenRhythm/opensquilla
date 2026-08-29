@@ -18,6 +18,8 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         "src/opensquilla/gateway/adapters/sessions_list_contract.py",
         "src/opensquilla/contracts/adapters/sessions_resolve_contract.py",
         "src/opensquilla/gateway/adapters/sessions_resolve_contract.py",
+        "src/opensquilla/contracts/adapters/sessions_search_contract.py",
+        "src/opensquilla/gateway/adapters/sessions_search_contract.py",
     }
 )
 GENERATED_METADATA_IMPORT_ALLOWLIST = frozenset(
@@ -36,6 +38,12 @@ SESSIONS_RESOLVE_METADATA_IMPORT_ALLOWLIST = frozenset(
         "src/opensquilla/gateway/scopes.py",
     }
 )
+SESSIONS_SEARCH_METADATA_IMPORT_ALLOWLIST = frozenset(
+    {
+        "src/opensquilla/contracts/adapters/sessions_search_contract.py",
+        "src/opensquilla/gateway/scopes.py",
+    }
+)
 SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
     {
         # This is a transport concurrency policy registry.  WebSocket is an
@@ -49,7 +57,7 @@ SESSIONS_LIST_GATEWAY_ADAPTER = (
     PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
 )
 RUNTIME_RPC_METHOD_BASELINE = 306
-STATIC_RPC_DECORATOR_BASELINE = 297
+STATIC_RPC_DECORATOR_BASELINE = 296
 
 # Physical lines in the sessions/runtime slice at the merged S1 baseline.
 # Contract sources, generators, fixtures, tests and generated artifacts are
@@ -330,6 +338,21 @@ def test_schema_derived_method_metadata_consumers_are_exact() -> None:
     stale = SESSIONS_RESOLVE_METADATA_IMPORT_ALLOWLIST - resolve_consumers
     assert unexpected == set(), f"unexpected sessions.resolve metadata imports: {unexpected}"
     assert stale == set(), f"stale sessions.resolve metadata import allowlist: {stale}"
+
+    search_consumers = set()
+    for path in _python_files(PACKAGE_ROOT):
+        for node in ast.walk(_tree(path)):
+            if any(
+                module
+                == "opensquilla.contracts.generated.v4.sessions_search_metadata"
+                for module in _imported_modules(path, node)
+            ):
+                search_consumers.add(_relative(path))
+
+    unexpected = search_consumers - SESSIONS_SEARCH_METADATA_IMPORT_ALLOWLIST
+    stale = SESSIONS_SEARCH_METADATA_IMPORT_ALLOWLIST - search_consumers
+    assert unexpected == set(), f"unexpected sessions.search metadata imports: {unexpected}"
+    assert stale == set(), f"stale sessions.search metadata import allowlist: {stale}"
 
 
 def test_sessions_list_authored_literal_debt_is_exact() -> None:

@@ -1,0 +1,68 @@
+{
+  "format_version": 1,
+  "kind": "error",
+  "cases": [
+    {
+      "id": "error.unauthorized",
+      "coverage": "UNAUTHORIZED",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "search-unauthorized",
+        "ok": false,
+        "payload": null,
+        "error": {
+          "code": "UNAUTHORIZED",
+          "message": "Insufficient scope for method: sessions.search: missing operator.read",
+          "details": null,
+          "retryable": false,
+          "retry_after_ms": null,
+          "accepted": null
+        }
+      }
+    },
+    {
+      "id": "error.storage-busy",
+      "coverage": "STORAGE_BUSY",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "search-busy",
+        "ok": false,
+        "payload": null,
+        "error": {
+          "code": "STORAGE_BUSY",
+          "message": "Session storage is temporarily busy. Retry this operation.",
+          "details": {
+            "operation": "sessions.search",
+            "waited_ms": 125,
+            "stage": "read_gate",
+            "resource": "session_storage_operation_lock"
+          },
+          "retryable": true,
+          "retry_after_ms": 250,
+          "accepted": null
+        }
+      }
+    },
+    {
+      "id": "error.internal-contract",
+      "coverage": "INTERNAL_ERROR",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "search-internal",
+        "ok": false,
+        "payload": null,
+        "error": {
+          "code": "INTERNAL_ERROR",
+          "message": "sessions.search response violated its v4 contract",
+          "details": null,
+          "retryable": false,
+          "retry_after_ms": null,
+          "accepted": null
+        }
+      }
+    }
+  ]
+}
