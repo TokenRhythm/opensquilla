@@ -73,6 +73,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/contracts/test_sessions_list_contract.py",
     "tests/contracts/test_sessions_resolve_contract.py",
     "tests/contracts/test_sessions_search_contract.py",
+    "tests/test_application/test_session_transcript.py",
     "tests/test_artifact_session/test_html_anchors.py",
     "tests/test_ci/test_plan_ci.py",
     "tests/test_git_runtime.py",
