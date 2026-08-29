@@ -5,10 +5,11 @@ transcript extraction slice.  It intentionally has no Gateway/RPC, transport,
 wire-alias, or concrete persistence imports.  The Gateway remains responsible
 for adapting v4 frames to these values until the later extraction slices.
 
-S4a exercises only the preview use case.  History cursors, reader ports, and
-page DTOs are deliberately deferred to S4c, after the real ``chat.history``
-call sites have been characterized; defining them here would create
-speculative surface area.
+S4a exercises only the preview use case.  The history cursor, reader ports,
+and page DTOs now live in the separate :mod:`session_history` module after
+the real ``chat.history`` call sites were characterized; keeping them in a
+separate module prevents preview and history concerns from growing one
+another's interface.
 """
 
 from __future__ import annotations
