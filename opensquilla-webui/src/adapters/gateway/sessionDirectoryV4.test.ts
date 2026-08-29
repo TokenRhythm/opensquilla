@@ -7,6 +7,7 @@ import {
   normalizeV4SessionItem,
 } from './sessionDirectoryV4'
 import { SESSIONS_LIST_METHOD } from '@/contracts/generated/v4/sessionsList'
+import { SESSIONS_RESOLVE_METHOD } from '@/contracts/generated/v4/sessionsResolve'
 import type { SessionDirectory } from '@/modules/sessionDirectory'
 import { useSessions } from '@/composables/useSessions'
 
@@ -145,6 +146,77 @@ describe('v4 SessionDirectory Adapter', () => {
     await expect(legacyDirectory.count()).resolves.toEqual({ value: 2, exact: false })
   })
 
+  it('resolves a session through the typed Adapter and preserves v4 call policy', async () => {
+    const ready = vi.fn().mockResolvedValue(undefined)
+    const requestTransport = vi.fn().mockResolvedValue({
+      session_key: 'agent:main:webchat:default',
+      session_id: 'session-default',
+      future: { retained: true },
+    })
+    const directory = createV4SessionDirectory({
+      ready,
+      request: requestTransport as SessionDirectoryTransport['request'],
+    })
+    const controller = new AbortController()
+
+    await expect(directory.resolve({
+      key: 'session-default',
+      signal: controller.signal,
+    })).resolves.toEqual({
+      key: 'agent:main:webchat:default',
+      id: 'session-default',
+    })
+
+    expect(ready).toHaveBeenCalledWith({
+      timeoutMs: 10_000,
+      signal: controller.signal,
+      timeoutAction: 'reject',
+      abortAction: 'reject',
+    })
+    expect(requestTransport).toHaveBeenCalledWith(
+      SESSIONS_RESOLVE_METHOD,
+      { key: 'session-default' },
+      { ...callPolicy, signal: controller.signal },
+    )
+  })
+
+  it('maps legacy Gateway errors to domain error codes', async () => {
+    const failure = Object.assign(new Error('missing'), { code: 'NOT_FOUND' })
+    const directory = createV4SessionDirectory({
+      request: vi.fn().mockRejectedValue(failure) as SessionDirectoryTransport['request'],
+    })
+
+    await expect(directory.resolve({ key: 'missing' })).rejects.toMatchObject({
+      name: 'SessionDirectoryError',
+      code: 'not-found',
+    })
+  })
+
+  it('rejects a malformed resolve result at the domain boundary', async () => {
+    const directory = createV4SessionDirectory({
+      request: vi.fn().mockResolvedValue({ session_key: 'only-key' }) as
+        SessionDirectoryTransport['request'],
+    })
+
+    await expect(directory.resolve({ key: 'missing-id' })).rejects.toMatchObject({
+      name: 'SessionDirectoryError',
+      code: 'unavailable',
+    })
+  })
+
+  it('preserves caller cancellation instead of translating it to a transport error', async () => {
+    const controller = new AbortController()
+    const abortError = Object.assign(new Error('cancelled'), { name: 'AbortError' })
+    const directory = createV4SessionDirectory({
+      request: vi.fn().mockRejectedValue(abortError) as SessionDirectoryTransport['request'],
+    })
+
+    await expect(directory.resolve({
+      key: 'session-1',
+      signal: controller.signal,
+    })).rejects.toBe(abortError)
+  })
+
   it('owns its v4 readiness, timeout, and abort policy', async () => {
     const controller = new AbortController()
     const ready = vi.fn().mockResolvedValue(undefined)
@@ -216,6 +288,10 @@ describe('v4 SessionDirectory Adapter', () => {
         nextCursor: null,
       }),
       count: vi.fn().mockResolvedValue({ value: 2, exact: true }),
+      resolve: vi.fn().mockResolvedValue({
+        key: first.key,
+        id: 'session-one',
+      }),
     }
     setActivePinia(createPinia())
     const sessions = useSessions(directory)

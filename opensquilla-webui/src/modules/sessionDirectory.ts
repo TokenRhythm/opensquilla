@@ -33,8 +33,40 @@ export interface SessionPage {
 
 export interface SessionCount { value: number; exact: boolean }
 
-export interface SessionDirectoryQueryOptions {
+export interface RequestOptions {
   signal?: AbortSignal
+}
+
+/** Backwards-compatible name for existing query callers. */
+export type SessionDirectoryQueryOptions = RequestOptions
+
+export interface ResolvedSession {
+  key: string
+  id: string
+}
+
+export type SessionDirectoryErrorCode =
+  | 'not-found'
+  | 'unsupported'
+  | 'forbidden'
+  | 'conflict'
+  | 'unavailable'
+  | 'invalid'
+
+export class SessionDirectoryError extends Error {
+  readonly code: SessionDirectoryErrorCode
+  readonly cause?: unknown
+
+  constructor(
+    code: SessionDirectoryErrorCode,
+    message: string,
+    options?: { cause?: unknown },
+  ) {
+    super(message)
+    this.name = 'SessionDirectoryError'
+    this.code = code
+    this.cause = options?.cause
+  }
 }
 
 export interface SessionDirectory {
@@ -42,6 +74,7 @@ export interface SessionDirectory {
     request: { limit: number; cursor?: string } & SessionDirectoryQueryOptions,
   ): Promise<SessionPage>
   count(options?: SessionDirectoryQueryOptions): Promise<SessionCount | null>
+  resolve(request: { key: string } & RequestOptions): Promise<ResolvedSession>
 }
 
 export const SESSION_DIRECTORY_KEY: InjectionKey<SessionDirectory> = Symbol('SessionDirectory')

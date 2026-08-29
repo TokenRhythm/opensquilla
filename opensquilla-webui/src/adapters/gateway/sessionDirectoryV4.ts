@@ -1,20 +1,25 @@
 import i18n from '@/i18n'
-import type {
-  RpcCallOptions,
-  RpcConnectionWaitOptions,
-} from '@/lib/rpc'
+import type { RpcCallOptions } from '@/lib/rpc'
 import {
   SESSIONS_LIST_METHOD,
   type SessionRow,
   type SessionsListParams,
   type SessionsListResult,
 } from '@/contracts/generated/v4/sessionsList'
+import {
+  SESSIONS_RESOLVE_METHOD,
+  type SessionsResolveParams,
+  type SessionsResolveResult,
+} from '@/contracts/generated/v4/sessionsResolve'
+import { validateSessionsResolveResult } from '@/contracts/generated/v4/sessionsResolveValidators.cjs'
 import type {
+  ResolvedSession,
   SessionCount,
   SessionDirectory,
   SessionItem,
   SessionPage,
 } from '@/modules/sessionDirectory'
+import { SessionDirectoryError } from '@/modules/sessionDirectory'
 import {
   normalizeSessionRunStatus,
   resolveSessionRunStatus,
@@ -31,16 +36,63 @@ const SESSION_DIRECTORY_CALL_OPTIONS: RpcCallOptions = {
   abortAction: 'reject',
 }
 
+// Keep the Adapter's public factory signature independent of the private
+// transport implementation.  The composition root passes the richer F2
+// transport structurally; exposing RpcTransport here would leak a private
+// Gateway symbol through an exported declaration and violate the boundary
+// Gate.  This narrow port is intentionally limited to the operations this
+// domain Adapter owns.
 interface SessionDirectoryTransport {
   request<T = unknown>(
     method: string,
     params?: Record<string, unknown>,
     options?: RpcCallOptions,
   ): Promise<T>
-  ready?(options?: RpcConnectionWaitOptions & {
+  ready?(options?: {
     timeoutMs?: number
     signal?: AbortSignal
+    timeoutAction?: 'reject' | 'reconnect'
+    abortAction?: 'reject' | 'reconnect'
   }): Promise<void>
+}
+
+function rpcErrorCode(error: unknown): string {
+  if (!error || typeof error !== 'object') return ''
+  const candidate = error as {
+    code?: unknown
+    data?: { code?: unknown }
+  }
+  const code = candidate.code ?? candidate.data?.code
+  return typeof code === 'string' ? code.toUpperCase() : ''
+}
+
+function sessionDirectoryError(error: unknown): SessionDirectoryError {
+  if (error instanceof SessionDirectoryError) return error
+  const code = rpcErrorCode(error)
+  const message = error instanceof Error
+    ? error.message
+    : 'Session directory request failed'
+  if (code === 'NOT_FOUND' || code === 'SESSION_NOT_FOUND') {
+    return new SessionDirectoryError('not-found', message, { cause: error })
+  }
+  if (code === 'METHOD_NOT_FOUND' || code === 'UNSUPPORTED') {
+    return new SessionDirectoryError('unsupported', message, { cause: error })
+  }
+  if (code === 'UNAUTHORIZED' || code === 'FORBIDDEN') {
+    return new SessionDirectoryError('forbidden', message, { cause: error })
+  }
+  if (code === 'CONFLICT') {
+    return new SessionDirectoryError('conflict', message, { cause: error })
+  }
+  if (code === 'INVALID_REQUEST' || code === 'INVALID_PARAMS') {
+    return new SessionDirectoryError('invalid', message, { cause: error })
+  }
+  return new SessionDirectoryError('unavailable', message, { cause: error })
+}
+
+function isAbort(error: unknown, signal?: AbortSignal): boolean {
+  return signal?.aborted === true
+    || (error instanceof Error && error.name === 'AbortError')
 }
 
 const hasOwn = (obj: unknown, field: string) =>
@@ -261,6 +313,52 @@ export function createV4SessionDirectory(
         0,
       )
       return { value, exact: false }
+    },
+
+    async resolve(request): Promise<ResolvedSession> {
+      const params: SessionsResolveParams = { key: request.key }
+      const options = request.signal
+        ? { ...SESSION_DIRECTORY_CALL_OPTIONS, signal: request.signal }
+        : SESSION_DIRECTORY_CALL_OPTIONS
+      try {
+        await transport.ready?.({
+          timeoutMs: options.timeoutMs,
+          signal: options.signal,
+          timeoutAction: 'reject',
+          abortAction: 'reject',
+        })
+        if (request.signal?.aborted) {
+          throw request.signal.reason || new Error('Session resolution request aborted')
+        }
+        const raw = await transport.request(
+          SESSIONS_RESOLVE_METHOD,
+          params,
+          options,
+        )
+        if (!validateSessionsResolveResult(raw)) {
+          throw new SessionDirectoryError(
+            'unavailable',
+            'sessions.resolve returned an invalid response',
+          )
+        }
+        const result = raw as SessionsResolveResult
+        if (
+          typeof result.session_key !== 'string'
+          || typeof result.session_id !== 'string'
+        ) {
+          throw new SessionDirectoryError(
+            'unavailable',
+            'sessions.resolve returned an invalid response',
+          )
+        }
+        return {
+          key: result.session_key,
+          id: result.session_id,
+        }
+      } catch (error) {
+        if (isAbort(error, request.signal)) throw error
+        throw sessionDirectoryError(error)
+      }
     },
   }
 }

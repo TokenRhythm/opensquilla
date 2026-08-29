@@ -16,6 +16,8 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
     {
         "src/opensquilla/contracts/adapters/sessions_list_contract.py",
         "src/opensquilla/gateway/adapters/sessions_list_contract.py",
+        "src/opensquilla/contracts/adapters/sessions_resolve_contract.py",
+        "src/opensquilla/gateway/adapters/sessions_resolve_contract.py",
     }
 )
 GENERATED_METADATA_IMPORT_ALLOWLIST = frozenset(
@@ -28,6 +30,12 @@ GENERATED_METADATA_IMPORT_ALLOWLIST = frozenset(
         "src/opensquilla/gateway/scopes.py",
     }
 )
+SESSIONS_RESOLVE_METADATA_IMPORT_ALLOWLIST = frozenset(
+    {
+        "src/opensquilla/contracts/adapters/sessions_resolve_contract.py",
+        "src/opensquilla/gateway/scopes.py",
+    }
+)
 SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
     {
         # This is a transport concurrency policy registry.  WebSocket is an
@@ -36,18 +44,23 @@ SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
         "src/opensquilla/gateway/websocket.py": 1,
     }
 )
+SESSIONS_RESOLVE_LITERAL_ALLOWLIST: Counter[str] = Counter()
 SESSIONS_LIST_GATEWAY_ADAPTER = (
     PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
 )
 RUNTIME_RPC_METHOD_BASELINE = 306
-STATIC_RPC_DECORATOR_BASELINE = 298
+STATIC_RPC_DECORATOR_BASELINE = 297
 
-# Physical lines in the sessions.list runtime slice after F1 merged at
-# f53746bd6. F2 is an explicitly approved foundation phase, so its bounded
-# connection-ownership and registration hardening is accounted for separately
-# instead of weakening the later domain-slice deletion gate.
-AUTHORED_RUNTIME_LOC_AFTER_F1 = 25_524
-F2_AUTHORED_RUNTIME_GROWTH_BUDGET = 66
+# Physical lines in the sessions/runtime slice at the merged F2 baseline.
+# Contract sources, generators, fixtures, tests and generated artifacts are
+# reported separately.  F2 established the first private transport seam; the
+# S1 seam is allowed a bounded amount of authored code while it moves resolve
+# out of the legacy handler.  The budget includes every new authored runtime
+# file (application Port, two adapters and the neutral key helper); generated
+# code, fixtures and tests remain separate.  The final Z1 closure gate remains
+# responsible for making the complete migration smaller than the #1460 baseline.
+AUTHORED_RUNTIME_LOC_BASELINE = 25_590
+S1_AUTHORED_RUNTIME_GROWTH_BUDGET = 450
 AUTHORED_RUNTIME_FILES = (
     "opensquilla-webui/src/App.vue",
     "opensquilla-webui/src/components/sessions/SessionInspectDrawer.vue",
@@ -63,14 +76,18 @@ AUTHORED_RUNTIME_FILES = (
     "opensquilla-webui/src/modules/sessionRunStatus.ts",
     "src/opensquilla/cli/gateway_client.py",
     "src/opensquilla/contracts/adapters/sessions_list_contract.py",
+    "src/opensquilla/contracts/adapters/sessions_resolve_contract.py",
     "src/opensquilla/engine/commands.py",
     "src/opensquilla/gateway/adapters/sessions_list_contract.py",
+    "src/opensquilla/gateway/adapters/sessions_resolve_contract.py",
     "src/opensquilla/gateway/app.py",
     "src/opensquilla/gateway/guest_rpc_policy.py",
     "src/opensquilla/gateway/rpc_sessions.py",
     "src/opensquilla/gateway/rpc_system.py",
     "src/opensquilla/gateway/scopes.py",
     "src/opensquilla/gateway_client.py",
+    "src/opensquilla/application/session_directory.py",
+    "src/opensquilla/session_key.py",
 )
 
 F2_FOUNDATION_RUNTIME_FILES = (
@@ -300,6 +317,21 @@ def test_schema_derived_method_metadata_consumers_are_exact() -> None:
     assert unexpected == set(), f"unexpected sessions.list metadata imports: {unexpected}"
     assert stale == set(), f"stale sessions.list metadata import allowlist: {stale}"
 
+    resolve_consumers = set()
+    for path in _python_files(PACKAGE_ROOT):
+        for node in ast.walk(_tree(path)):
+            if any(
+                module
+                == "opensquilla.contracts.generated.v4.sessions_resolve_metadata"
+                for module in _imported_modules(path, node)
+            ):
+                resolve_consumers.add(_relative(path))
+
+    unexpected = resolve_consumers - SESSIONS_RESOLVE_METADATA_IMPORT_ALLOWLIST
+    stale = SESSIONS_RESOLVE_METADATA_IMPORT_ALLOWLIST - resolve_consumers
+    assert unexpected == set(), f"unexpected sessions.resolve metadata imports: {unexpected}"
+    assert stale == set(), f"stale sessions.resolve metadata import allowlist: {stale}"
+
 
 def test_sessions_list_authored_literal_debt_is_exact() -> None:
     actual: Counter[str] = Counter()
@@ -314,6 +346,21 @@ def test_sessions_list_authored_literal_debt_is_exact() -> None:
     stale = SESSIONS_LIST_LITERAL_ALLOWLIST - actual
     assert unexpected == Counter(), f"unexpected sessions.list literals: {unexpected}"
     assert stale == Counter(), f"stale sessions.list literal allowlist: {stale}"
+
+
+def test_sessions_resolve_authored_literal_debt_is_exact() -> None:
+    actual: Counter[str] = Counter()
+    for path in _python_files(PACKAGE_ROOT):
+        if path.is_relative_to(GENERATED_CONTRACT_ROOT):
+            continue
+        for node in ast.walk(_tree(path)):
+            if isinstance(node, ast.Constant) and node.value == "sessions.resolve":
+                actual[_relative(path)] += 1
+
+    unexpected = actual - SESSIONS_RESOLVE_LITERAL_ALLOWLIST
+    stale = SESSIONS_RESOLVE_LITERAL_ALLOWLIST - actual
+    assert unexpected == Counter(), f"unexpected sessions.resolve literals: {unexpected}"
+    assert stale == Counter(), f"stale sessions.resolve literal allowlist: {stale}"
 
 
 def _module_name(path: Path) -> str:
@@ -351,29 +398,28 @@ def _reaches(graph: dict[str, set[str]], start: str, target: str) -> bool:
     return False
 
 
-def test_sessions_list_gateway_adapter_does_not_join_a_gateway_cycle() -> None:
+def test_contract_gateway_adapters_do_not_join_a_gateway_cycle() -> None:
     graph = _module_import_graph()
-    adapter = _module_name(SESSIONS_LIST_GATEWAY_ADAPTER)
-    cycle_edges = sorted(
-        dependency
-        for dependency in graph[adapter]
-        if _reaches(graph, dependency, adapter)
-    )
-    gateway_dependencies = sorted(
-        dependency
-        for dependency in graph[adapter]
-        if dependency.startswith("opensquilla.gateway")
-    )
-    assert gateway_dependencies == [
-        "opensquilla.gateway.adapters.contract_method"
-    ], (
-        "sessions.list Gateway Adapter may depend only on the generic "
-        f"registration Adapter: {gateway_dependencies}"
-    )
-    assert cycle_edges == [], (
-        "sessions.list Gateway Adapter joined a Python import cycle: "
-        f"{cycle_edges}"
-    )
+    resolve_adapter = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_resolve_contract.py"
+    for adapter_path in (SESSIONS_LIST_GATEWAY_ADAPTER, resolve_adapter):
+        adapter = _module_name(adapter_path)
+        cycle_edges = sorted(
+            dependency
+            for dependency in graph[adapter]
+            if _reaches(graph, dependency, adapter)
+        )
+        gateway_dependencies = sorted(
+            dependency
+            for dependency in graph[adapter]
+            if dependency.startswith("opensquilla.gateway")
+        )
+        assert gateway_dependencies == [
+            "opensquilla.gateway.adapters.contract_method"
+        ], (
+            f"{adapter} may depend only on the generic registration Adapter: "
+            f"{gateway_dependencies}"
+        )
+        assert cycle_edges == [], f"{adapter} joined a Python import cycle: {cycle_edges}"
 
 
 def test_rpc_context_does_not_grow_past_pinned_main() -> None:
@@ -394,12 +440,13 @@ def _physical_lines(relative_paths: tuple[str, ...]) -> int:
     )
 
 
-def test_f2_sessions_list_runtime_growth_stays_within_explicit_budget() -> None:
+def test_s1_authored_runtime_stays_within_bounded_seam_budget() -> None:
     current = _physical_lines(AUTHORED_RUNTIME_FILES)
-    growth = current - AUTHORED_RUNTIME_LOC_AFTER_F1
-    assert growth <= F2_AUTHORED_RUNTIME_GROWTH_BUDGET, (
-        f"F2 sessions.list runtime grew by {growth} lines; "
-        f"the explicit foundation budget is {F2_AUTHORED_RUNTIME_GROWTH_BUDGET}"
+    growth = current - AUTHORED_RUNTIME_LOC_BASELINE
+    assert growth <= S1_AUTHORED_RUNTIME_GROWTH_BUDGET, (
+        f"sessions.resolve authored runtime grew by {growth} lines "
+        f"from merged F2 baseline {AUTHORED_RUNTIME_LOC_BASELINE}; "
+        f"S1 budget is {S1_AUTHORED_RUNTIME_GROWTH_BUDGET}"
     )
 
 
@@ -436,7 +483,7 @@ def _method_registration_sites() -> list[tuple[str, str, str]]:
     return sites
 
 
-def test_static_rpc_decorator_sites_are_exact_and_sessions_list_is_generic_registered() -> None:
+def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_registered() -> None:
     sites = _method_registration_sites()
     assert len(sites) == STATIC_RPC_DECORATOR_BASELINE
     assert [
@@ -444,9 +491,14 @@ def test_static_rpc_decorator_sites_are_exact_and_sessions_list_is_generic_regis
         for site in sites
         if site[2] in {"sessions.list", "SESSIONS_LIST_METHOD"}
     ] == []
+    assert [
+        site
+        for site in sites
+        if site[2] in {"sessions.resolve", "SESSIONS_RESOLVE_METHOD"}
+    ] == []
 
 
-def test_runtime_rpc_surface_is_exact_and_sessions_list_uses_contract_adapter() -> None:
+def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter() -> None:
     from opensquilla.contracts.generated.v4.sessions_list_metadata import (
         SESSIONS_LIST_METHOD,
         SESSIONS_LIST_SCOPE,
@@ -462,6 +514,18 @@ def test_runtime_rpc_surface_is_exact_and_sessions_list_uses_contract_adapter() 
     assert entry is not None
     assert entry.name == SESSIONS_LIST_METHOD
     assert entry.required_scope == SESSIONS_LIST_SCOPE
+    assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
+    assert entry.handler.__name__ == "handle_contract_method"
+
+    from opensquilla.contracts.generated.v4.sessions_resolve_metadata import (
+        SESSIONS_RESOLVE_METHOD,
+        SESSIONS_RESOLVE_SCOPE,
+    )
+
+    entry = registry.get_entry(SESSIONS_RESOLVE_METHOD)
+    assert entry is not None
+    assert entry.name == SESSIONS_RESOLVE_METHOD
+    assert entry.required_scope == SESSIONS_RESOLVE_SCOPE
     assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
     assert entry.handler.__name__ == "handle_contract_method"
 

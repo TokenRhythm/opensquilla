@@ -10763,7 +10763,10 @@ class TestSessionsResolve:
 
         assert res.ok is False
         assert res.error.code == "INVALID_REQUEST"
-        assert "Ambiguous session id" in res.error.message
+        assert res.error.message == (
+            "Ambiguous session id 'abc'; matches: "
+            "agent:default:abc123, agent:bench:abc999"
+        )
 
     @pytest.mark.asyncio
     async def test_resolve_not_found(self, dispatcher, ctx_with_sessions):
@@ -10772,6 +10775,56 @@ class TestSessionsResolve:
         )
         assert res.ok is False
         assert res.error.code == "NOT_FOUND"
+        assert res.error.message == "'Session not found: nonexistent'"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("params", "message"),
+        [
+            (None, "params.key is required"),
+            ({}, "params.key is required"),
+            ({"key": 42}, "params.key must be a string"),
+        ],
+    )
+    async def test_resolve_preserves_invalid_request_messages(
+        self,
+        dispatcher,
+        ctx_with_sessions,
+        params,
+        message,
+    ):
+        res = await dispatcher.dispatch("r1", "sessions.resolve", params, ctx_with_sessions)
+
+        assert res.ok is False
+        assert res.error.code == "INVALID_REQUEST"
+        assert res.error.message == message
+
+    @pytest.mark.asyncio
+    async def test_resolve_preserves_missing_manager_error(self, dispatcher, ctx_no_manager):
+        res = await dispatcher.dispatch(
+            "r1", "sessions.resolve", {"key": "abc"}, ctx_no_manager
+        )
+
+        assert res.ok is False
+        assert res.error.code == "NOT_FOUND"
+        assert res.error.message == "'No session manager available'"
+
+    @pytest.mark.asyncio
+    async def test_resolve_requires_operator_read_scope(self, dispatcher, session):
+        ctx = make_ctx(
+            scopes=[],
+            session_manager=FakeSessionManager([session]),
+        )
+
+        res = await dispatcher.dispatch(
+            "r1", "sessions.resolve", {"key": session.session_key}, ctx
+        )
+
+        assert res.ok is False
+        assert res.error.code == "UNAUTHORIZED"
+        assert res.error.message == (
+            "Insufficient scope for method: sessions.resolve: missing operator.read"
+        )
 
     @pytest.mark.asyncio
     async def test_scope_enforcement(self, dispatcher, session):

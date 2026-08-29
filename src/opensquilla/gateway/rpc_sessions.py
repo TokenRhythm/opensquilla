@@ -22,6 +22,10 @@ from typing import TYPE_CHECKING, Any, NoReturn, cast
 import structlog
 
 from opensquilla.agents.scope import default_workspace_dir, resolve_agent_workspace_dir
+from opensquilla.application.session_directory import (
+    SessionDirectory,
+    _resolve_session_record_for_bootstrap,
+)
 from opensquilla.artifacts import enrich_artifact_event_dict
 from opensquilla.attachment_refs import (
     PENDING_CHAT_INPUT_MATERIAL_STORE,
@@ -47,6 +51,9 @@ from opensquilla.engine.steps.router_decision_record import (
 from opensquilla.gateway import attachment_ingest as _attachment_ingest
 from opensquilla.gateway.adapters.sessions_list_contract import (
     register_sessions_list_contract,
+)
+from opensquilla.gateway.adapters.sessions_resolve_contract import (
+    register_sessions_resolve_contract,
 )
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
 from opensquilla.gateway.artifact_product_errors import (
@@ -2580,31 +2587,6 @@ def _derive_source_metadata(session: Any) -> dict[str, Any]:
         "channel_id": getattr(session, "last_to", None),
         "channelId": getattr(session, "last_to", None),
     }
-
-
-async def _resolve_session_node(storage: Any, key: str) -> Any:
-    session = await storage.get_session(key)
-    if session is not None:
-        return session
-
-    sessions = await storage.list_sessions(limit=500)
-    matches: list[Any] = []
-    for candidate in sessions:
-        values = [
-            getattr(candidate, "session_key", ""),
-            getattr(candidate, "session_id", ""),
-            getattr(candidate, "display_name", "") or "",
-            getattr(candidate, "derived_title", "") or "",
-        ]
-        if any(str(value) == key or str(value).startswith(key) for value in values if value):
-            matches.append(candidate)
-
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
-        candidates = ", ".join(str(getattr(match, "session_key", "")) for match in matches[:5])
-        raise ValueError(f"Ambiguous session id {key!r}; matches: {candidates}")
-    raise KeyError(f"Session not found: {key}")
 
 
 _SESSION_COUNT_VIEW = "session-count-v1"
@@ -11521,7 +11503,6 @@ async def _handle_sessions_preview(params: dict | None, ctx: RpcContext) -> dict
     return {"ts": now_ms, "previews": previews}
 
 
-@_d.method("sessions.resolve", scope="operator.read")
 async def _handle_sessions_resolve(params: dict | None, ctx: RpcContext) -> dict:
     key = _require_key(params)
 
@@ -11532,19 +11513,27 @@ async def _handle_sessions_resolve(params: dict | None, ctx: RpcContext) -> dict
     if storage is None:
         raise KeyError("No session storage available")
 
-    session = await _resolve_session_node(storage, key)
+    resolution = await SessionDirectory(storage).resolve(key)
 
     return {
-        "session_key": session.session_key,
-        "session_id": session.session_id,
-        "status": session.status,
-        "agent_id": session.agent_id,
-        "model": getattr(session, "model", None),
-        "workspaceId": getattr(session, "workspace_id", None),
-        "projectWorkspaceDeferred": bool(getattr(session, "workspace_id", None)),
-        "created_at": session.created_at,
-        "updated_at": session.updated_at,
+        "session_key": resolution.key,
+        "session_id": resolution.session_id,
+        "status": resolution.status,
+        "agent_id": resolution.agent_id,
+        "model": resolution.model,
+        "workspaceId": resolution.workspace_id,
+        "projectWorkspaceDeferred": bool(resolution.workspace_id),
+        "created_at": resolution.created_at,
+        "updated_at": resolution.updated_at,
     }
+
+
+_handle_sessions_resolve_contract = register_sessions_resolve_contract(
+    _d,
+    _handle_sessions_resolve,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 async def _bootstrap_epoch(
@@ -12427,7 +12416,7 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
     if storage is None:
         raise KeyError("No session storage available")
 
-    session = await _resolve_session_node(storage, key)
+    session = await _resolve_session_record_for_bootstrap(storage, key)
     session_key = canonicalize_session_key(session.session_key)
     # Capture the cursor before the slower durable reads below.  A client that
     # subscribes from this cursor may see duplicate state (deduped by stable

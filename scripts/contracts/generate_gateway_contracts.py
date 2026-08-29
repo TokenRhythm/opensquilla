@@ -10,6 +10,7 @@ reviewed generated artifacts.  New Contracts use the generic JSON Schema
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import importlib.util
 import json
@@ -493,6 +494,442 @@ def _normalise(spec: ContractSpec, text: str, *, prefix: str) -> str:
     return _header(spec, prefix) + lint_directive + "\n" + body
 
 
+def _schema_allows_null(
+    schema: object,
+    definitions: dict[str, Any],
+    *,
+    seen_refs: frozenset[str] = frozenset(),
+) -> bool:
+    """Return whether JSON Schema validation accepts an explicit ``null``.
+
+    ``datamodel-code-generator`` represents every non-required property as a
+    ``T | None = None`` field.  That is not equivalent to JSON Schema when the
+    property is optional-but-non-nullable: omission is valid, while an
+    explicit ``null`` is not.  This small evaluator only answers the one
+    question needed by the deterministic Python post-processor below; it is
+    deliberately not a second JSON Schema validator.
+    """
+
+    if not isinstance(schema, dict):
+        # A missing assertion (for example ``{}``) places no restriction on
+        # null in JSON Schema.
+        return True
+
+    allows = True
+
+    reference = schema.get("$ref")
+    if isinstance(reference, str) and reference.startswith("#/$defs/"):
+        name = reference.removeprefix("#/$defs/")
+        if name in seen_refs:
+            # Recursive definitions cannot establish a stricter nullability
+            # guarantee at this point.  Keep the generated optional union.
+            return True
+        target = definitions.get(name)
+        if target is None:
+            return True
+        allows = allows and _schema_allows_null(
+            target,
+            definitions,
+            seen_refs=seen_refs | {name},
+        )
+
+    if "const" in schema:
+        allows = allows and schema["const"] is None
+
+    enum = schema.get("enum")
+    if isinstance(enum, list):
+        allows = allows and any(value is None for value in enum)
+
+    declared_type = schema.get("type")
+    if isinstance(declared_type, str):
+        allows = allows and declared_type == "null"
+    elif isinstance(declared_type, list):
+        allows = allows and "null" in declared_type
+
+    for keyword in ("anyOf", "oneOf"):
+        branches = schema.get(keyword)
+        if isinstance(branches, list):
+            branch_results = [
+                _schema_allows_null(branch, definitions, seen_refs=seen_refs)
+                for branch in branches
+            ]
+            if keyword == "oneOf":
+                allows = allows and sum(branch_results) == 1
+            else:
+                allows = allows and any(branch_results)
+
+    all_of = schema.get("allOf")
+    if isinstance(all_of, list):
+        allows = allows and all(
+            _schema_allows_null(branch, definitions, seen_refs=seen_refs)
+            for branch in all_of
+        )
+
+    negated = schema.get("not")
+    if isinstance(negated, dict):
+        allows = allows and not _schema_allows_null(
+            negated,
+            definitions,
+            seen_refs=seen_refs,
+        )
+
+    return allows
+
+
+def _optional_non_nullable_fields(spec: ContractSpec) -> frozenset[str]:
+    """Find result properties where omission is valid but ``null`` is not."""
+
+    result_schema = spec.document.get("$defs", {}).get(spec.target("result"))
+    if not isinstance(result_schema, dict):
+        return frozenset()
+    properties = result_schema.get("properties")
+    if not isinstance(properties, dict):
+        return frozenset()
+    required = result_schema.get("required")
+    required_names = set(required) if isinstance(required, list) else set()
+    definitions = spec.document.get("$defs", {})
+    if not isinstance(definitions, dict):
+        return frozenset()
+    return frozenset(
+        name
+        for name, property_schema in properties.items()
+        if isinstance(name, str)
+        and name not in required_names
+        and not _schema_allows_null(property_schema, definitions)
+    )
+
+
+def _is_none_annotation(node: ast.expr) -> bool:
+    return isinstance(node, ast.Constant) and node.value is None
+
+
+def _union_parts(node: ast.expr) -> list[ast.expr]:
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return [*_union_parts(node.left), *_union_parts(node.right)]
+    if isinstance(node, ast.Subscript):
+        value = node.value
+        is_union = (
+            isinstance(value, ast.Name) and value.id == "Union"
+        ) or (
+            isinstance(value, ast.Attribute)
+            and isinstance(value.value, ast.Name)
+            and value.value.id == "typing"
+            and value.attr == "Union"
+        )
+        if is_union:
+            arguments = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+            return [part for argument in arguments for part in _union_parts(argument)]
+    return [node]
+
+
+def _annotation_without_none(node: ast.expr) -> str | None:
+    """Render a generated annotation after removing a top-level ``None``."""
+
+    parts = _union_parts(node)
+    if len(parts) == 1 or not any(_is_none_annotation(part) for part in parts):
+        return None
+    remaining = [part for part in parts if not _is_none_annotation(part)]
+    if not remaining:
+        return "Any"
+    return " | ".join(ast.unparse(part) for part in remaining)
+
+
+def _source_offset(lines: list[str], lineno: int, column: int) -> int:
+    return sum(len(line) for line in lines[: lineno - 1]) + column
+
+
+def _field_wire_name(node: ast.AnnAssign) -> str | None:
+    if not isinstance(node.target, ast.Name):
+        return None
+    value = node.value
+    if (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "Field"
+    ):
+        for keyword in value.keywords:
+            if keyword.arg == "alias" and isinstance(keyword.value, ast.Constant):
+                if isinstance(keyword.value.value, str):
+                    return keyword.value.value
+    return node.target.id
+
+
+def _normalise_optional_non_nullable_defaults(spec: ContractSpec, text: str) -> str:
+    """Make generated Pydantic omission/null semantics match the source schema.
+
+    The transformation is source-driven and deterministic.  It changes only
+    result fields identified by the Contract schema and leaves all other
+    generated classes untouched.  ``T = None`` is intentional: Pydantic 2.x
+    treats the field as omittable while validating an explicitly supplied
+    value against the non-nullable ``T`` annotation, without raising the
+    repository's minimum Pydantic version.
+    """
+
+    fields = _optional_non_nullable_fields(spec)
+    if not fields:
+        return text
+    tree = ast.parse(text)
+    result_name = spec.target("result")
+    result_classes = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef) and node.name == result_name
+    ]
+    if not result_classes:
+        # Test doubles and future generators may emit a target under a
+        # different shape; do not make an otherwise valid renderer fail.
+        return text
+
+    lines = text.splitlines(keepends=True)
+    replacements: list[tuple[int, int, str]] = []
+    for result_class in result_classes:
+        for field in result_class.body:
+            if not isinstance(field, ast.AnnAssign):
+                continue
+            wire_name = _field_wire_name(field)
+            if wire_name not in fields or field.value is None:
+                continue
+            annotation = _annotation_without_none(field.annotation)
+            if annotation is None:
+                annotation = ast.get_source_segment(text, field.annotation)
+            if not annotation:
+                continue
+            annotation_end_lineno = field.annotation.end_lineno
+            annotation_end_col_offset = field.annotation.end_col_offset
+            value_end_lineno = field.value.end_lineno
+            value_end_col_offset = field.value.end_col_offset
+            value_lineno = field.value.lineno
+            if (
+                annotation_end_lineno is None
+                or annotation_end_col_offset is None
+                or value_end_lineno is None
+                or value_end_col_offset is None
+                or value_lineno is None
+            ):
+                continue
+            start = _source_offset(
+                lines,
+                field.annotation.lineno,
+                field.annotation.col_offset,
+            )
+            end = _source_offset(
+                lines,
+                annotation_end_lineno,
+                annotation_end_col_offset,
+            )
+            # Replace only the annotation.  Keeping the generated default
+            # expression intact preserves Field(alias=...), constraints and
+            # other metadata that a future Contract may declare.  The
+            # generated ``None`` default is valid Pydantic runtime metadata
+            # but is intentionally incompatible with the non-nullable static
+            # annotation, so keep the suppression local to this generated
+            # field rather than weakening the repository-wide mypy gate.
+            replacements.append((start, end, annotation))
+
+            value_end = _source_offset(
+                lines,
+                value_end_lineno,
+                value_end_col_offset,
+            )
+            line_end = text.find("\n", value_end)
+            if line_end < 0:
+                line_end = len(text)
+            line = text[_source_offset(lines, value_lineno, 0) : line_end]
+            if "# type: ignore[assignment]" not in line:
+                replacements.append(
+                    (line_end, line_end, "  # type: ignore[assignment]")
+                )
+
+    for start, end, replacement in reversed(replacements):
+        text = text[:start] + replacement + text[end:]
+    return text
+
+
+def _schema_contains_json_number(
+    schema: object,
+    definitions: dict[str, Any],
+    *,
+    seen_refs: frozenset[str] = frozenset(),
+) -> bool:
+    """Return whether a schema branch contains a JSON-Schema number."""
+
+    if not isinstance(schema, dict):
+        return False
+    reference = schema.get("$ref")
+    if isinstance(reference, str) and reference.startswith("#/$defs/"):
+        name = reference.removeprefix("#/$defs/")
+        if name in seen_refs:
+            return False
+        target = definitions.get(name)
+        return _schema_contains_json_number(
+            target,
+            definitions,
+            seen_refs=seen_refs | {name},
+        )
+    declared_type = schema.get("type")
+    if (isinstance(declared_type, str) and declared_type in {"integer", "number"}) or (
+        isinstance(declared_type, list)
+        and {"integer", "number"}.intersection(declared_type)
+    ):
+        return True
+    for keyword in ("anyOf", "oneOf", "allOf", "prefixItems"):
+        branches = schema.get(keyword)
+        if isinstance(branches, list) and any(
+            _schema_contains_json_number(branch, definitions, seen_refs=seen_refs)
+            for branch in branches
+        ):
+            return True
+    properties = schema.get("properties")
+    if isinstance(properties, dict) and any(
+        _schema_contains_json_number(property_schema, definitions, seen_refs=seen_refs)
+        for property_schema in properties.values()
+    ):
+        return True
+    additional = schema.get("additionalProperties")
+    if _schema_contains_json_number(additional, definitions, seen_refs=seen_refs):
+        return True
+    items = schema.get("items")
+    return _schema_contains_json_number(items, definitions, seen_refs=seen_refs)
+
+
+def _normalise_json_number_types(spec: ContractSpec, text: str) -> str:
+    """Align generated Python number validation with JSON Schema/AJV.
+
+    JSON Schema's ``number`` accepts finite JSON numbers and ``integer`` also
+    accepts an integral value represented as ``1.0`` (AJV's behavior).
+    Pydantic's strict scalar types otherwise coerce or reject those values.
+    Generated Contracts use validated unions so both runtimes accept the same
+    values while preserving the original numeric tree on dump.  This is only
+    applied to generic generated Contracts; the reviewed legacy ``sessions.list``
+    generator remains byte-for-byte frozen.
+    """
+
+    definitions = spec.document.get("$defs", {})
+    if not isinstance(definitions, dict):
+        return text
+    has_number = _schema_contains_json_number(spec.document, definitions) or any(
+        _schema_contains_json_number(definition, definitions)
+        for definition in definitions.values()
+    )
+    if not has_number:
+        return text
+    has_strict_int = bool(re.search(r"\bStrictInt\b", text))
+    has_strict_float = bool(re.search(r"\bStrictFloat\b", text))
+    if not has_strict_int and not has_strict_float:
+        return text
+    if "_JsonInteger = Annotated" in text or "_JsonNumber = Annotated" in text:
+        return text
+
+    original = text
+    marker = "\n\nclass "
+    if marker not in text:
+        return original
+
+    typing_import = re.search(r"^from typing import ([^\n]+)$", text, flags=re.MULTILINE)
+    if typing_import is None:
+        raise ContractConfigurationError(
+            f"{spec.schema}: generated Python imports changed; cannot install "
+            "the JSON number compatibility validator"
+        )
+
+    typing_names = typing_import.group(1)
+    if "Annotated" not in {
+        name.strip() for name in typing_names.split(",")
+    }:
+        text = (
+            text[: typing_import.start(1)]
+            + "Annotated, "
+            + typing_names
+            + text[typing_import.end(1) :]
+        )
+
+    # Re-scan after changing the typing import: source offsets from the old
+    # string are no longer valid when the inserted name changes its length.
+    pydantic_import = re.search(
+        r"^from pydantic import \(\n(?P<body>.*?)\n\)$",
+        text,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    if pydantic_import is None:
+        raise ContractConfigurationError(
+            f"{spec.schema}: generated Pydantic imports changed; cannot install "
+            "the JSON number compatibility validator"
+        )
+    pydantic_body = pydantic_import.group("body")
+    if "BeforeValidator" not in {
+        line.strip().rstrip(",") for line in pydantic_body.splitlines()
+    }:
+        updated_body = "    BeforeValidator,\n" + pydantic_body
+        text = (
+            text[: pydantic_import.start("body")]
+            + updated_body
+            + text[pydantic_import.end("body") :]
+        )
+    pydantic_import = re.search(
+        r"^from pydantic import \(\n(?P<body>.*?)\n\)$",
+        text,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    if pydantic_import is None:
+        raise ContractConfigurationError(
+            f"{spec.schema}: generated Pydantic imports changed while installing "
+            "the JSON number compatibility validator"
+        )
+    pydantic_body = pydantic_import.group("body")
+    if "WithJsonSchema" not in {
+        line.strip().rstrip(",") for line in pydantic_body.splitlines()
+    }:
+        updated_body = "    WithJsonSchema,\n" + pydantic_body
+        text = (
+            text[: pydantic_import.start("body")]
+            + updated_body
+            + text[pydantic_import.end("body") :]
+        )
+    text = re.sub(r"^\s*StrictInt,\n", "", text, count=1, flags=re.MULTILINE)
+    text = re.sub(r"^\s*StrictFloat,\n", "", text, count=1, flags=re.MULTILINE)
+    text = re.sub(r"\bStrictInt\b", "_JsonInteger", text)
+    text = re.sub(r"\bStrictFloat\b", "_JsonNumber", text)
+    if "_JsonInteger" not in text and "_JsonNumber" not in text:
+        return original
+    helper_parts = [
+        "\n\ndef _validate_json_number(value: Any) -> int | float:\n",
+        "    if type(value) is int:\n",
+        "        return value\n",
+        "    if type(value) is float and value == value and abs(value) != float('inf'):\n",
+        "        return value\n",
+        "    raise ValueError('expected a finite JSON number')\n",
+    ]
+    if has_strict_int:
+        helper_parts.extend(
+            [
+                "\n\ndef _validate_json_integer(value: Any) -> int | float:\n",
+                "    if type(value) is int:\n",
+                "        return value\n",
+                "    if type(value) is float and value.is_integer():\n",
+                "        return value\n",
+                "    raise ValueError('expected an integral JSON number')\n",
+            ]
+        )
+    if has_strict_float:
+        helper_parts.append(
+        "\n\n_JsonNumber = Annotated[\n"
+        "    int | float,\n"
+        "    BeforeValidator(_validate_json_number),\n"
+        "    WithJsonSchema({'type': 'number'}),\n"
+        "]"
+        )
+    if has_strict_int:
+        helper_parts.append(
+            "\n\n_JsonInteger = Annotated[\n"
+            "    int | float,\n"
+            "    BeforeValidator(_validate_json_integer),\n"
+            "    WithJsonSchema({'type': 'integer'}),\n"
+            "]"
+        )
+    helper = "".join(helper_parts)
+    return text.replace(marker, helper + marker, 1)
+
+
 def _registration_header(specs: tuple[ContractSpec, ...]) -> str:
     sources = b"\0".join(
         spec.relative_schema.as_posix().encode("utf-8")
@@ -759,10 +1196,15 @@ def render_generic(spec: ContractSpec) -> dict[Path, str]:
         python_output, metadata_output, typescript_output, validator_output, declarations_output = (
             spec.outputs
         )
+        python_source = _normalise_json_number_types(
+            spec,
+            python_tmp.read_text(encoding="utf-8"),
+        )
+        python_source = _normalise_optional_non_nullable_defaults(spec, python_source)
         return {
             python_output: _normalise(
                 spec,
-                python_tmp.read_text(encoding="utf-8"),
+                python_source,
                 prefix="#",
             ),
             metadata_output: _python_metadata(spec),

@@ -405,6 +405,147 @@ def test_generic_renderer_derives_all_adapter_only_artifacts(
     )
 
 
+def test_python_renderer_preserves_optional_non_nullable_semantics(
+    tmp_path: Path,
+) -> None:
+    document = _method_schema("sessions.resolve")
+    result_name = "SessionsResolveResult"
+    document["$defs"][result_name] = {
+        "type": "object",
+        "required": ["session_key"],
+        "properties": {
+            "session_key": {"type": "string"},
+            "status": {"type": "string"},
+            "model": {"type": ["string", "null"]},
+        },
+    }
+    schema = _write_schema(
+        tmp_path,
+        "sessions/sessions-resolve.schema.json",
+        document,
+    )
+    spec = runner.load_contract(schema, contract_root=tmp_path)
+    generated = (
+        "class SessionsResolveResult(BaseModel):\n"
+        "    session_key: StrictStr\n"
+        "    status: StrictStr | None = None\n"
+        "    model: StrictStr | None = None\n"
+        "\n"
+        "class OtherModel(BaseModel):\n"
+        "    status: StrictStr | None = None\n"
+    )
+
+    rendered = runner._normalise_optional_non_nullable_defaults(spec, generated)
+
+    assert "    status: StrictStr = None  # type: ignore[assignment]" in rendered
+    assert "    model: StrictStr | None = None" in rendered
+    assert "class OtherModel(BaseModel):\n    status: StrictStr | None = None" in rendered
+
+
+def test_python_renderer_keeps_field_alias_metadata_when_tightening_nullability(
+    tmp_path: Path,
+) -> None:
+    document = _method_schema("sessions.resolve")
+    result_name = "SessionsResolveResult"
+    document["$defs"][result_name] = {
+        "type": "object",
+        "properties": {"wireStatus": {"type": "string"}},
+    }
+    schema = _write_schema(
+        tmp_path,
+        "sessions/sessions-resolve.schema.json",
+        document,
+    )
+    spec = runner.load_contract(schema, contract_root=tmp_path)
+    generated = (
+        "from pydantic import BaseModel, Field\n\n"
+        "class SessionsResolveResult(BaseModel):\n"
+        "    status: StrictStr | None = Field(None, alias='wireStatus')\n"
+    )
+
+    rendered = runner._normalise_optional_non_nullable_defaults(spec, generated)
+
+    assert (
+        "status: StrictStr = Field(None, alias='wireStatus')  # type: ignore[assignment]"
+        in rendered
+    )
+
+
+def test_python_renderer_aligns_json_integer_acceptance_with_ajv(
+    tmp_path: Path,
+) -> None:
+    document = _method_schema("sessions.resolve")
+    result_name = "SessionsResolveResult"
+    document["$defs"][result_name] = {
+        "type": "object",
+        "properties": {"created_at": {"type": "integer"}},
+    }
+    schema = _write_schema(
+        tmp_path,
+        "sessions/sessions-resolve.schema.json",
+        document,
+    )
+    spec = runner.load_contract(schema, contract_root=tmp_path)
+    generated = (
+        "from typing import Any, Literal\n"
+        "from pydantic import (\n"
+        "    BaseModel,\n"
+        "    StrictInt,\n"
+        ")\n\n"
+        "class SessionsResolveResult(BaseModel):\n"
+        "    created_at: StrictInt\n"
+    )
+
+    rendered = runner._normalise_json_number_types(spec, generated)
+
+    assert "_JsonInteger = Annotated[" in rendered
+    assert "    int | float," in rendered
+    assert "created_at: _JsonInteger" in rendered
+    assert "StrictInt" not in rendered
+
+
+def test_python_number_postprocessor_is_shape_guarded_and_executable(
+    tmp_path: Path,
+) -> None:
+    document = _method_schema("sessions.resolve")
+    result_name = "SessionsResolveResult"
+    document["$defs"][result_name] = {
+        "type": "object",
+        "properties": {"score": {"type": "number"}},
+    }
+    schema = _write_schema(
+        tmp_path,
+        "sessions/sessions-resolve.schema.json",
+        document,
+    )
+    spec = runner.load_contract(schema, contract_root=tmp_path)
+    # Deliberately omit Literal and keep the import block on one line to guard
+    # against offset-sensitive source rewriting.
+    generated = (
+        "from __future__ import annotations\n\n"
+        "from typing import Any\n"
+        "from pydantic import (\n"
+        "    BaseModel,\n"
+        "    StrictFloat,\n"
+        ")\n\n"
+        "class SessionsResolveResult(BaseModel):\n"
+        "    score: StrictFloat\n"
+    )
+
+    rendered = runner._normalise_json_number_types(spec, generated)
+    namespace: dict[str, Any] = {}
+    exec(rendered, namespace)
+    model = namespace["SessionsResolveResult"]
+    model.model_rebuild(_types_namespace=namespace)
+
+    assert model.model_validate({"score": 1}).score == 1
+    assert model.model_validate({"score": 1.5}).score == 1.5
+    with pytest.raises(ValueError):
+        model.model_validate({"score": float("nan")})
+    assert "StrictFloat" not in rendered
+    assert "BeforeValidator" in rendered
+
+
 def test_registration_descriptor_exposes_uniform_validation_models() -> None:
     specs = runner.discover_contracts()
 

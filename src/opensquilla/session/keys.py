@@ -7,6 +7,7 @@ from enum import StrEnum
 from functools import lru_cache
 
 from opensquilla.agent_ids import normalize_agent_id, normalize_id_segment
+from opensquilla.session_key import canonicalize_session_key
 
 # Prototype-poisoning keys blocked for account_id normalization
 _POISONING_KEYS = frozenset({"__proto__", "constructor", "prototype", "hasownproperty"})
@@ -41,23 +42,6 @@ def build_main_key(agent_id: str = "main") -> str:
 def build_webchat_key(agent_id: str = "main") -> str:
     """Return the canonical WebChat default session key for an agent."""
     return f"agent:{normalize_agent_id(agent_id)}:webchat:default"
-
-
-def canonicalize_session_key(session_key: str | None) -> str:
-    """Normalize legacy session-key aliases without changing conversation scope."""
-    key = str(session_key or "").strip()
-    if not key:
-        return ""
-    if key == "webchat:default":
-        return build_webchat_key()
-    if key.startswith("subagent:agent:"):
-        return f"subagent:{canonicalize_session_key(key[len('subagent:') :])}"
-    if key.startswith("agent:"):
-        parts = key.split(":")
-        if len(parts) >= 2:
-            parts[1] = normalize_agent_id(parts[1])
-            return ":".join(parts)
-    return key
 
 
 def build_direct_key(
