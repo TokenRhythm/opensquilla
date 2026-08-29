@@ -71,6 +71,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_gateway/test_chat_history_characterization.py",
     "tests/contracts/test_gateway_contract_runner.py",
     "tests/contracts/test_gateway_contract_toolchain_integration.py",
+    "tests/contracts/test_sessions_changed_contract.py",
     "tests/contracts/test_sessions_list_contract.py",
     "tests/contracts/test_sessions_resolve_contract.py",
     "tests/contracts/test_sessions_search_contract.py",

@@ -491,12 +491,16 @@ def test_generic_webui_change_does_not_wake_desktop_matrix(
     "path",
     [
         "contracts/gateway/v4/sessions/sessions-list.schema.json",
+        "contracts/gateway/v4/sessions/sessions-changed.schema.json",
+        "opensquilla-webui/src/contracts/generated/v4/sessionsChanged.ts",
         "scripts/contracts/generate_gateway_contracts.py",
         "scripts/contracts/generate_sessions_list_contract.py",
         "src/opensquilla/contracts/generated/v4/sessions_list.py",
+        "src/opensquilla/contracts/generated/v4/sessions_changed.py",
         "tests/contracts/test_gateway_contract_runner.py",
         "tests/contracts/test_gateway_contract_toolchain_integration.py",
         "tests/contracts/test_sessions_list_contract.py",
+        "tests/contracts/test_sessions_changed_contract.py",
         "tests/fixtures/contracts/gateway/v4/toolchain/toolchain-ping.schema.json",
     ],
 )

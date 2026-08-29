@@ -583,10 +583,16 @@ def _schema_allows_null(
     return allows
 
 
-def _optional_non_nullable_fields(spec: ContractSpec) -> frozenset[str]:
-    """Find result properties where omission is valid but ``null`` is not."""
+def _optional_non_nullable_fields_for_definition(
+    spec: ContractSpec,
+    definition_name: str,
+) -> frozenset[str]:
+    """Find optional, non-nullable properties in one generated definition."""
 
-    result_schema = spec.document.get("$defs", {}).get(spec.target("result"))
+    definitions = spec.document.get("$defs", {})
+    if not isinstance(definitions, dict):
+        return frozenset()
+    result_schema = definitions.get(definition_name)
     if not isinstance(result_schema, dict):
         return frozenset()
     properties = result_schema.get("properties")
@@ -604,6 +610,48 @@ def _optional_non_nullable_fields(spec: ContractSpec) -> frozenset[str]:
         and name not in required_names
         and not _schema_allows_null(property_schema, definitions)
     )
+
+
+def _optional_non_nullable_fields(spec: ContractSpec) -> frozenset[str]:
+    """Find method result properties where omission is valid but ``null`` is not."""
+
+    if spec.contract_type != "method":
+        return frozenset()
+    return _optional_non_nullable_fields_for_definition(spec, spec.target("result"))
+
+
+def _reachable_definition_names(spec: ContractSpec, root_name: str) -> tuple[str, ...]:
+    """Return generated definitions reachable from an event frame or payload."""
+
+    definitions = spec.document.get("$defs", {})
+    if not isinstance(definitions, dict):
+        return ()
+    seen: set[str] = set()
+
+    def visit(schema: object) -> None:
+        if not isinstance(schema, dict):
+            return
+        reference = schema.get("$ref")
+        if isinstance(reference, str) and reference.startswith("#/$defs/"):
+            name = reference.removeprefix("#/$defs/")
+            if name in seen:
+                return
+            seen.add(name)
+            visit(definitions.get(name))
+        for keyword in ("anyOf", "oneOf", "allOf", "prefixItems"):
+            branches = schema.get(keyword)
+            if isinstance(branches, list):
+                for branch in branches:
+                    visit(branch)
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            for property_schema in properties.values():
+                visit(property_schema)
+        visit(schema.get("items"))
+        visit(schema.get("additionalProperties"))
+
+    visit({"$ref": f"#/$defs/{root_name}"})
+    return tuple(sorted(seen))
 
 
 def _is_none_annotation(node: ast.expr) -> bool:
@@ -664,33 +712,45 @@ def _field_wire_name(node: ast.AnnAssign) -> str | None:
 def _normalise_optional_non_nullable_defaults(spec: ContractSpec, text: str) -> str:
     """Make generated Pydantic omission/null semantics match the source schema.
 
-    The transformation is source-driven and deterministic.  It changes only
-    result fields identified by the Contract schema and leaves all other
-    generated classes untouched.  ``T = None`` is intentional: Pydantic 2.x
-    treats the field as omittable while validating an explicitly supplied
-    value against the non-nullable ``T`` annotation, without raising the
-    repository's minimum Pydantic version.
+    The transformation is source-driven and deterministic.  Method Contracts
+    are restricted to their result definition; event Contracts walk the frame
+    or payload union and touch only reachable definitions.  ``T = None`` is
+    intentional: Pydantic 2.x treats the field as omittable while validating
+    an explicitly supplied value against the non-nullable ``T`` annotation,
+    without raising the repository's minimum Pydantic version.
     """
 
-    fields = _optional_non_nullable_fields(spec)
-    if not fields:
+    if spec.contract_type == "method":
+        target_fields = {
+            spec.target("result"): _optional_non_nullable_fields(spec),
+        }
+    else:
+        target_role = spec.targets[0][0]
+        target_fields = {
+            definition: _optional_non_nullable_fields_for_definition(spec, definition)
+            for definition in _reachable_definition_names(spec, spec.target(target_role))
+        }
+    target_fields = {
+        definition: fields for definition, fields in target_fields.items() if fields
+    }
+    if not target_fields:
         return text
     tree = ast.parse(text)
-    result_name = spec.target("result")
-    result_classes = [
+    target_classes = [
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.ClassDef) and node.name == result_name
+        if isinstance(node, ast.ClassDef) and node.name in target_fields
     ]
-    if not result_classes:
+    if not target_classes:
         # Test doubles and future generators may emit a target under a
         # different shape; do not make an otherwise valid renderer fail.
         return text
 
     lines = text.splitlines(keepends=True)
     replacements: list[tuple[int, int, str]] = []
-    for result_class in result_classes:
-        for field in result_class.body:
+    for target_class in target_classes:
+        fields = target_fields[target_class.name]
+        for field in target_class.body:
             if not isinstance(field, ast.AnnAssign):
                 continue
             wire_name = _field_wire_name(field)
@@ -834,66 +894,63 @@ def _normalise_json_number_types(spec: ContractSpec, text: str) -> str:
 
     typing_import = re.search(r"^from typing import ([^\n]+)$", text, flags=re.MULTILINE)
     if typing_import is None:
-        raise ContractConfigurationError(
-            f"{spec.schema}: generated Python imports changed; cannot install "
-            "the JSON number compatibility validator"
+        # Tiny generated schemas may not need a typing import until this
+        # post-processor introduces ``Annotated`` and ``Any`` helpers.
+        future_import = re.search(
+            r"^from __future__ import annotations\n",
+            text,
+            flags=re.MULTILINE,
         )
+        if future_import is None:
+            raise ContractConfigurationError(
+                f"{spec.schema}: generated Python imports changed; cannot install "
+                "the JSON number compatibility validator"
+            )
+        insertion = future_import.end()
+        text = text[:insertion] + "\nfrom typing import Annotated, Any\n" + text[insertion:]
+    else:
+        typing_names = typing_import.group(1)
+        names = [name.strip() for name in typing_names.split(",")]
+        for required_name in ("Annotated", "Any"):
+            if required_name not in names:
+                names.insert(0, required_name)
+        replacement = "from typing import " + ", ".join(names)
+        text = text[: typing_import.start()] + replacement + text[typing_import.end() :]
 
-    typing_names = typing_import.group(1)
-    if "Annotated" not in {
-        name.strip() for name in typing_names.split(",")
-    }:
-        text = (
-            text[: typing_import.start(1)]
-            + "Annotated, "
-            + typing_names
-            + text[typing_import.end(1) :]
-        )
-
-    # Re-scan after changing the typing import: source offsets from the old
-    # string are no longer valid when the inserted name changes its length.
-    pydantic_import = re.search(
+    # datamodel-code-generator emits a one-line import for small schemas and
+    # a parenthesised block for larger ones.  Canonicalise both forms before
+    # replacing StrictInt/StrictFloat so the post-processor remains stable as
+    # a Contract grows or shrinks.
+    pydantic_block = re.search(
         r"^from pydantic import \(\n(?P<body>.*?)\n\)$",
         text,
         flags=re.MULTILINE | re.DOTALL,
     )
-    if pydantic_import is None:
-        raise ContractConfigurationError(
-            f"{spec.schema}: generated Pydantic imports changed; cannot install "
-            "the JSON number compatibility validator"
+    if pydantic_block is not None:
+        names = [line.strip().rstrip(",") for line in pydantic_block.group("body").splitlines()]
+        start, end = pydantic_block.start(), pydantic_block.end()
+    else:
+        pydantic_line = re.search(
+            r"^from pydantic import (?P<body>[^\n]+)$",
+            text,
+            flags=re.MULTILINE,
         )
-    pydantic_body = pydantic_import.group("body")
-    if "BeforeValidator" not in {
-        line.strip().rstrip(",") for line in pydantic_body.splitlines()
-    }:
-        updated_body = "    BeforeValidator,\n" + pydantic_body
-        text = (
-            text[: pydantic_import.start("body")]
-            + updated_body
-            + text[pydantic_import.end("body") :]
-        )
-    pydantic_import = re.search(
-        r"^from pydantic import \(\n(?P<body>.*?)\n\)$",
-        text,
-        flags=re.MULTILINE | re.DOTALL,
-    )
-    if pydantic_import is None:
-        raise ContractConfigurationError(
-            f"{spec.schema}: generated Pydantic imports changed while installing "
-            "the JSON number compatibility validator"
-        )
-    pydantic_body = pydantic_import.group("body")
-    if "WithJsonSchema" not in {
-        line.strip().rstrip(",") for line in pydantic_body.splitlines()
-    }:
-        updated_body = "    WithJsonSchema,\n" + pydantic_body
-        text = (
-            text[: pydantic_import.start("body")]
-            + updated_body
-            + text[pydantic_import.end("body") :]
-        )
-    text = re.sub(r"^\s*StrictInt,\n", "", text, count=1, flags=re.MULTILINE)
-    text = re.sub(r"^\s*StrictFloat,\n", "", text, count=1, flags=re.MULTILINE)
+        if pydantic_line is None:
+            raise ContractConfigurationError(
+                f"{spec.schema}: generated Pydantic imports changed; cannot install "
+                "the JSON number compatibility validator"
+            )
+        names = [name.strip() for name in pydantic_line.group("body").split(",")]
+        start, end = pydantic_line.start(), pydantic_line.end()
+
+    names = [name for name in names if name not in {"StrictInt", "StrictFloat"}]
+    for required_name in ("WithJsonSchema", "BeforeValidator"):
+        if required_name not in names:
+            names.insert(0, required_name)
+    replacement = "from pydantic import (\n" + "".join(
+        f"    {name},\n" for name in names
+    ) + ")"
+    text = text[:start] + replacement + text[end:]
     text = re.sub(r"\bStrictInt\b", "_JsonInteger", text)
     text = re.sub(r"\bStrictFloat\b", "_JsonNumber", text)
     if "_JsonInteger" not in text and "_JsonNumber" not in text:
@@ -1086,6 +1143,7 @@ def _python_metadata(spec: ContractSpec) -> str:
         )
     else:
         lines.append(f"{prefix}_EVENT: Final = {spec.wire_name!r}")
+        lines.append(f"{prefix}_SCHEMA_VERSION: Final = {spec.metadata['schemaVersion']!r}")
         lines.append(f"{prefix}_EVENT_METADATA: Final = {spec.metadata!r}")
     return _normalise(spec, "\n".join(lines) + "\n", prefix="#")
 
@@ -1111,6 +1169,10 @@ def _typescript_metadata(spec: ContractSpec, text: str) -> str:
         )
     else:
         lines.append(f"export const {prefix}_EVENT = {_json_literal(spec.wire_name)} as const")
+        lines.append(
+            f"export const {prefix}_SCHEMA_VERSION = "
+            f"{_json_literal(spec.metadata['schemaVersion'])} as const"
+        )
         lines.append(
             f"export const {prefix}_EVENT_METADATA = {_json_literal(spec.metadata)} as const"
         )

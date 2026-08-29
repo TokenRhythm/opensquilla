@@ -38,6 +38,10 @@ from starlette.applications import Starlette
 from opensquilla.agents.scope import resolve_agent_model, resolve_agent_workspace_dir
 from opensquilla.artifacts import enrich_artifact_event_dict
 from opensquilla.asyncio_utils import create_background_task
+from opensquilla.contracts.adapters.sessions_changed_contract import (
+    SESSIONS_CHANGED_EVENT,
+    observe_sessions_changed_payload,
+)
 from opensquilla.engine.usage import UsageTracker as _UsageTracker
 from opensquilla.gateway.app import create_gateway_app
 from opensquilla.gateway.config import (
@@ -4729,6 +4733,11 @@ async def start_gateway_server(
                 return
 
             _registry = get_registry()
+            if event_name == SESSIONS_CHANGED_EVENT:
+                payload = observe_sessions_changed_payload(
+                    payload,
+                    source="gateway.boot",
+                )
             stream_payload = (
                 get_session_streams().record(session_key, event_name, payload)
                 if event_name.startswith("session.event.")
