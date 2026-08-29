@@ -654,6 +654,7 @@
     "tests/test_gateway/test_session_model_routing_rpc.py": 0.01,
     "tests/test_gateway/test_chat_history_characterization.py": 0.01,
     "tests/test_gateway/test_session_preview_adapter.py": 0.01,
+    "tests/test_gateway/test_session_history_adapter.py": 0.01,
     "tests/test_gateway/test_session_streams.py": 0.038,
     "tests/test_gateway/test_sessions_bootstrap_history_characterization.py": 0.01,
     "tests/test_gateway/test_sessions_list_contract_adapter.py": 0.01,
