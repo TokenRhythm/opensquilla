@@ -7,6 +7,7 @@ import { useAppStore } from './stores/app'
 import { useRpcStore } from './stores/rpc'
 import { createGatewayAdapters } from './adapters/gateway/gatewayAdapters'
 import { SESSION_DIRECTORY_KEY } from './modules/sessionDirectory'
+import { SESSION_DIRECTORY_CHANGES_KEY } from './modules/sessionDirectoryChanges'
 import 'katex/dist/katex.min.css'
 import './assets/base.css'
 import './themes/tokens' // eagerly bundles every value theme's token block
@@ -30,6 +31,10 @@ const gatewayAdapters = createGatewayAdapters(rpcStore)
 app.provide(
   SESSION_DIRECTORY_KEY,
   gatewayAdapters.sessionDirectory,
+)
+app.provide(
+  SESSION_DIRECTORY_CHANGES_KEY,
+  gatewayAdapters.sessionDirectoryChanges,
 )
 router.afterEach(() => {
   rpcStore.applyLinkTokenFromUrl()

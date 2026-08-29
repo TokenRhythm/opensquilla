@@ -1,17 +1,25 @@
 import type { SessionDirectory } from '@/modules/sessionDirectory'
+import type { SessionDirectoryChanges } from '@/modules/sessionDirectoryChanges'
 import { createPrivateGatewayTransports } from './privateTransports'
 import { createV4SessionDirectory } from './sessionDirectoryV4'
+import { createV4SessionDirectoryChanges } from './sessionDirectoryChangesV4'
 
 type RpcStoreTransportSource = Parameters<typeof createPrivateGatewayTransports>[0]
 
 export interface GatewayAdapters {
   readonly sessionDirectory: SessionDirectory
+  readonly sessionDirectoryChanges: SessionDirectoryChanges
 }
 
 /** Wire Gateway-backed domain Adapters without leaking generic transports. */
 export function createGatewayAdapters(source: RpcStoreTransportSource): GatewayAdapters {
   const transports = createPrivateGatewayTransports(source)
+  const sessionDirectory = createV4SessionDirectory(transports.rpc)
   return {
-    sessionDirectory: createV4SessionDirectory(transports.rpc),
+    sessionDirectory,
+    sessionDirectoryChanges: createV4SessionDirectoryChanges(
+      transports.rpc,
+      transports.events,
+    ),
   }
 }

@@ -66,7 +66,6 @@ export const debt = {
     waitForConnectionReference: 1,
   },
   'src/composables/sessions/useSessionInspect.ts': { call: 3, waitForConnection: 1 },
-  'src/composables/useSessionListSubscription.ts': { call: 4, on: 2 },
   'src/utils/chat/artifactAccess.ts': {
     httpRequest: 2,
     httpApiEndpoint: 2,
@@ -95,7 +94,7 @@ export const debt = {
   },
   'src/views/SessionsView.vue': {
     call: 2,
-    on: 6,
+    on: 5,
     httpRequest: 1,
     httpApiEndpoint: 1,
     httpAuthToken: 1,

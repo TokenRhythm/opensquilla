@@ -454,6 +454,7 @@ import { getPlatform } from '@/platform'
 import { useAppStore, type ThemeMode, type PendingApproval } from './stores/app'
 import { useRpcStore } from './stores/rpc'
 import { SESSION_DIRECTORY_KEY } from './modules/sessionDirectory'
+import { SESSION_DIRECTORY_CHANGES_KEY } from './modules/sessionDirectoryChanges'
 import {
   arrangeSidebarSections,
   useSessions,
@@ -496,7 +497,6 @@ import {
   type ChatRouteHeaderHostHandle,
 } from './composables/chat/useChatRouteHeaderBridge'
 import { useAgentOptions } from './composables/useAgentOptions'
-import { useSessionListSubscription } from './composables/useSessionListSubscription'
 import { useSessionTaskAttention } from './composables/useSessionTaskAttention'
 import { useToasts } from './composables/useToasts'
 import { useConfirm } from './composables/useConfirm'
@@ -538,6 +538,9 @@ const rpcStore = useRpcStore()
 const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
 if (!injectedSessionDirectory) throw new Error('SessionDirectory was not provided')
 const sessionDirectory = injectedSessionDirectory
+const injectedSessionDirectoryChanges = inject(SESSION_DIRECTORY_CHANGES_KEY)
+if (!injectedSessionDirectoryChanges) throw new Error('SessionDirectoryChanges was not provided')
+const sessionDirectoryChanges = injectedSessionDirectoryChanges
 const shortcutsStore = useShortcutsStore()
 const artifactImageLightbox = provideArtifactImageLightbox()
 const { t } = useI18n()
@@ -1718,20 +1721,12 @@ function refreshSidebarDataWhenAdmitted(): void | Promise<void> {
   return loadSidebarData()
 }
 
-const sessionListSubscription = useSessionListSubscription({
-  rpc: rpcStore,
-  callOptions: optionalSessionRpcCallOptions,
-  isConnected: () => rpcStore.isConnected,
-  isAdmitted: () => optionalSessionRpcAllowed.value,
-  refresh: refreshSidebarDataWhenAdmitted,
-  scheduleRefresh: scheduleSessionRefresh,
-  onChanged: payload => {
-    sessionTaskAttention.handleSessionsChanged(payload, {
-      currentSessionKey: currentSessionKey.value,
-      currentSessionVisible: currentSessionIsVisible(),
-    })
-  },
-  warn: (message, error) => console.warn(`[App] ${message}:`, errorMessage(error)),
+const sessionDirectoryChangesSubscription = sessionDirectoryChanges.subscribe(change => {
+  scheduleSessionRefresh()
+  sessionTaskAttention.handleSessionDirectoryChange(change, {
+    currentSessionKey: currentSessionKey.value,
+    currentSessionVisible: currentSessionIsVisible(),
+  })
 })
 
 function subscribeCronEventsWhenAdmitted() {
@@ -1746,7 +1741,7 @@ function subscribeCronEventsWhenAdmitted() {
 function resumeAutomaticAppRpc() {
   if (!appAutomaticRpcMounted || !optionalSessionRpcAllowed.value) return
   subscribeCronEventsWhenAdmitted()
-  sessionListSubscription.resume()
+  void sessionDirectoryChanges.resume()
   if (!appAutomaticRpcStarted) {
     appAutomaticRpcStarted = true
     void loadAgents()
@@ -1762,7 +1757,15 @@ watch(optionalSessionRpcAllowed, admitted => {
 watch(
   () => rpcStore.state,
   state => {
-    if (state === 'connected') subscribeCronEventsWhenAdmitted()
+    if (state !== 'connected') return
+    subscribeCronEventsWhenAdmitted()
+    if (!appAutomaticRpcMounted || !optionalSessionRpcAllowed.value) return
+    // The event stream is live-only. Rebind the logical lease and refresh a
+    // complete directory snapshot after every physical reconnect so events
+    // missed during the gap cannot leave the sidebar stale.
+    void sessionDirectoryChanges.resume().then(() => {
+      if (appAutomaticRpcStarted) void refreshSidebarDataWhenAdmitted()
+    })
   },
 )
 
@@ -1983,7 +1986,6 @@ onMounted(() => {
   window.addEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
   window.addEventListener('focus', markCurrentSessionReadIfVisible)
   document.addEventListener('visibilitychange', markCurrentSessionReadIfVisible)
-  sessionListSubscription.subscribe()
   resumeAutomaticAppRpc()
   // Keep the approval badge/count live app-wide, not just on the Approvals page.
   subscribeApprovals()
@@ -1999,7 +2001,8 @@ onUnmounted(() => {
   window.removeEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
   window.removeEventListener('focus', markCurrentSessionReadIfVisible)
   document.removeEventListener('visibilitychange', markCurrentSessionReadIfVisible)
-  sessionListSubscription.cleanup()
+  sessionDirectoryChangesSubscription.close()
+  sessionDirectoryChanges.dispose()
   unsubscribeApprovals()
   unsubscribeCronFinished?.()
   unsubscribeCronFinished = null
