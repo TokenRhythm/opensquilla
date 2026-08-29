@@ -8,6 +8,7 @@ import {
 } from './sessionDirectoryV4'
 import { SESSIONS_LIST_METHOD } from '@/contracts/generated/v4/sessionsList'
 import { SESSIONS_RESOLVE_METHOD } from '@/contracts/generated/v4/sessionsResolve'
+import { SESSIONS_SEARCH_METHOD } from '@/contracts/generated/v4/sessionsSearch'
 import type { SessionDirectory } from '@/modules/sessionDirectory'
 import { useSessions } from '@/composables/useSessions'
 
@@ -217,6 +218,134 @@ describe('v4 SessionDirectory Adapter', () => {
     })).rejects.toBe(abortError)
   })
 
+  it('searches through the typed Adapter and preserves the v4 call policy', async () => {
+    const ready = vi.fn().mockResolvedValue(undefined)
+    const requestTransport = vi.fn().mockResolvedValue({
+      sessions: [{
+        key: 'agent:main:s1',
+        title: 'Deploy planning',
+        effectiveAgentId: 'main',
+        surface: 'webchat',
+        updatedAt: 1700000000000,
+        extension: { retained: true },
+      }],
+      messages: [{
+        key: 'agent:main:s2',
+        title: 'Grocery list',
+        role: 'user',
+        snippet: 'buy >>>milk<<< today',
+        createdAt: 1700000000001,
+        future_field: 'ignored by the domain projection',
+      }],
+      query: 'milk',
+      ts: 1700000000002,
+      delivery_context: { source: 'search-index' },
+    })
+    const directory = createV4SessionDirectory({
+      ready,
+      request: requestTransport as SessionDirectoryTransport['request'],
+    })
+    const controller = new AbortController()
+
+    await expect(directory.search({
+      query: 'milk',
+      limit: 12,
+      signal: controller.signal,
+    })).resolves.toEqual({
+      sessions: [{
+        key: 'agent:main:s1',
+        title: 'Deploy planning',
+        surface: 'webchat',
+      }],
+      messages: [{
+        key: 'agent:main:s2',
+        title: 'Grocery list',
+        snippet: 'buy >>>milk<<< today',
+        createdAt: 1700000000001,
+      }],
+    })
+    expect(ready).toHaveBeenCalledWith({
+      timeoutMs: 10_000,
+      signal: controller.signal,
+      timeoutAction: 'reject',
+      abortAction: 'reject',
+    })
+    expect(requestTransport).toHaveBeenCalledWith(
+      SESSIONS_SEARCH_METHOD,
+      { query: 'milk', limit: 12 },
+      { ...callPolicy, signal: controller.signal },
+    )
+  })
+
+  it('accepts the legacy string timestamp while keeping search domain fields narrow', async () => {
+    const directory = createV4SessionDirectory({
+      request: vi.fn().mockResolvedValue({
+        sessions: [{
+          key: 'agent:main:legacy', title: 'Legacy', effectiveAgentId: null,
+          surface: null, updatedAt: null, future: true,
+        }],
+        messages: [{
+          key: 'agent:main:legacy', title: 'Legacy', role: null,
+          snippet: 'legacy result', createdAt: '1700000000000',
+        }],
+        query: 'legacy', ts: 1700000000002,
+      }) as SessionDirectoryTransport['request'],
+    })
+
+    await expect(directory.search({ query: 'legacy' })).resolves.toEqual({
+      sessions: [{ key: 'agent:main:legacy', title: 'Legacy', surface: null }],
+      messages: [{
+        key: 'agent:main:legacy', title: 'Legacy',
+        snippet: 'legacy result', createdAt: 1700000000000,
+      }],
+    })
+  })
+
+  it('maps search Gateway errors and rejects malformed results at the seam', async () => {
+    const failure = Object.assign(new Error('not allowed'), { code: 'UNAUTHORIZED' })
+    const denied = createV4SessionDirectory({
+      request: vi.fn().mockRejectedValue(failure) as SessionDirectoryTransport['request'],
+    })
+    await expect(denied.search({ query: 'secret' })).rejects.toMatchObject({
+      name: 'SessionDirectoryError',
+      code: 'forbidden',
+    })
+
+    const malformed = createV4SessionDirectory({
+      request: vi.fn().mockResolvedValue({ sessions: [], messages: [] }) as
+        SessionDirectoryTransport['request'],
+    })
+    await expect(malformed.search({ query: 'milk' })).rejects.toMatchObject({
+      name: 'SessionDirectoryError',
+      code: 'unavailable',
+    })
+  })
+
+  it('maps an unavailable legacy search method to the domain error', async () => {
+    const failure = Object.assign(new Error('method missing'), { code: 'METHOD_NOT_FOUND' })
+    const directory = createV4SessionDirectory({
+      request: vi.fn().mockRejectedValue(failure) as SessionDirectoryTransport['request'],
+    })
+
+    await expect(directory.search({ query: 'milk' })).rejects.toMatchObject({
+      name: 'SessionDirectoryError',
+      code: 'unsupported',
+    })
+  })
+
+  it('preserves caller cancellation for search requests', async () => {
+    const controller = new AbortController()
+    const abortError = Object.assign(new Error('cancelled'), { name: 'AbortError' })
+    const directory = createV4SessionDirectory({
+      request: vi.fn().mockRejectedValue(abortError) as SessionDirectoryTransport['request'],
+    })
+
+    await expect(directory.search({
+      query: 'milk',
+      signal: controller.signal,
+    })).rejects.toBe(abortError)
+  })
+
   it('owns its v4 readiness, timeout, and abort policy', async () => {
     const controller = new AbortController()
     const ready = vi.fn().mockResolvedValue(undefined)
@@ -292,6 +421,7 @@ describe('v4 SessionDirectory Adapter', () => {
         key: first.key,
         id: 'session-one',
       }),
+      search: vi.fn().mockResolvedValue({ sessions: [], messages: [] }),
     }
     setActivePinia(createPinia())
     const sessions = useSessions(directory)

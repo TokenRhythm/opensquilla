@@ -67,33 +67,6 @@ export interface ProjectWorkspaceHistoryDeleteResponse {
   deletedSessionKeys?: string[]
 }
 
-/** One title/subject match from `sessions.search`. */
-export interface SessionSearchHit {
-  key: string
-  title: string
-  effectiveAgentId?: string | null
-  surface?: string | null
-  updatedAt?: number | null
-}
-
-/** One transcript (full-text) match from `sessions.search`. The snippet wraps
- *  matched terms in `>>>`/`<<<` delimiters (highlighted by the renderer). */
-export interface MessageSearchHit {
-  key: string
-  title: string
-  role?: string | null
-  snippet: string
-  createdAt?: number | null
-  effectiveAgentId?: string | null
-}
-
-export interface SessionsSearchResponse {
-  sessions?: SessionSearchHit[]
-  messages?: MessageSearchHit[]
-  query?: string
-  ts?: number
-}
-
 export interface ArtifactPayload {
   id?: string
   key?: string

@@ -176,6 +176,15 @@ export function evaluateRpcArchitectureGate({
       ) {
         failures.push(`${rel}: sessions.list wire literal is allowed only in its Contract Adapter.`)
       }
+      if (
+        ts.isStringLiteralLike(node)
+        && node.text === 'sessions.search'
+        && !isGatewayAdapter(rel)
+        && !isTestFile(rel)
+        && !isGeneratedContract(rel)
+      ) {
+        failures.push(`${rel}: sessions.search wire literal is allowed only in its Contract Adapter.`)
+      }
       ts.forEachChild(node, visit)
     }
     visit(source)

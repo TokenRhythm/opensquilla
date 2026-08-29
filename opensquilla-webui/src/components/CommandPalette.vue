@@ -87,18 +87,22 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, inject, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import Icon from './Icon.vue'
 import { useDialogA11y } from '@/composables/useDialogA11y'
 import { useBgm } from '@/composables/useBgm'
 import { getWorkNavigationSection } from '@/router/nav'
-import { useRpcStore } from '@/stores/rpc'
+import {
+  SESSION_DIRECTORY_KEY,
+  type SessionDirectory,
+  type SessionSearchMessageHit,
+  type SessionSearchSessionHit,
+} from '@/modules/sessionDirectory'
 import { highlightFtsSnippet } from '@/utils/searchSnippet'
 import type { SidebarSection } from '@/composables/useSessions'
 import type { IconName } from '@/utils/icons'
-import type { MessageSearchHit, SessionSearchHit, SessionsSearchResponse } from '@/types/rpc'
 
 const props = defineProps<{
   open: boolean
@@ -121,7 +125,9 @@ const emit = defineEmits<{
 
 const { t } = useI18n()
 const router = useRouter()
-const rpcStore = useRpcStore()
+const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
+if (!injectedSessionDirectory) throw new Error('SessionDirectory was not provided')
+const sessionDirectory: SessionDirectory = injectedSessionDirectory
 const { enabled: bgmEnabled, setEnabled: setBgmEnabled } = useBgm()
 
 const dialogRef = ref<HTMLElement | null>(null)
@@ -297,10 +303,10 @@ const filtered = computed<Command[]>(() => {
 
 // ---------------------------------------------------------------------------
 // Conversation search — async, debounced, server-side over titles + transcript
-// content (sessions.search). Results append below the static nav/action groups.
+// content. Results append below the static nav/action groups.
 // ---------------------------------------------------------------------------
-const sessionHits = ref<SessionSearchHit[]>([])
-const messageHits = ref<MessageSearchHit[]>([])
+const sessionHits = ref<SessionSearchSessionHit[]>([])
+const messageHits = ref<SessionSearchMessageHit[]>([])
 const searching = ref(false)
 let debounceTimer: ReturnType<typeof setTimeout> | null = null
 // Monotonic token so a slow response from an earlier keystroke can't overwrite
@@ -317,7 +323,7 @@ async function runSearch(q: string) {
   const token = ++searchToken
   searching.value = true
   try {
-    const res = await rpcStore.call<SessionsSearchResponse>('sessions.search', { query: q, limit: 12 })
+    const res = await sessionDirectory.search({ query: q, limit: 12 })
     if (token !== searchToken) return
     sessionHits.value = res?.sessions ?? []
     messageHits.value = res?.messages ?? []

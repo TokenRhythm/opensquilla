@@ -93,6 +93,7 @@ function mountUsageData() {
     listPage: vi.fn().mockResolvedValue({ items: [], hasMore: false, nextCursor: null }),
     count: vi.fn().mockResolvedValue({ value: 0, exact: true }),
     resolve: vi.fn().mockResolvedValue({ key: 'agent:main:webchat:default', id: 'default' }),
+    search: vi.fn().mockResolvedValue({ sessions: [], messages: [] }),
   }
   const api = scope.run(() => useUsageData(directory))!
   return { api, directory, scope }

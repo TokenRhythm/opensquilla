@@ -97,6 +97,16 @@ describe('transport architecture gate ledger integration', () => {
     )
   })
 
+  it('keeps sessions.search wire literals inside the Contract Adapter', () => {
+    const root = seededFixture(`
+      import { useRpcStore } from './stores/rpc'
+      useRpcStore().call('sessions.search')
+    `)
+    expect(evaluateRpcArchitectureGate({ root, debtLanes: oneCallLane }).failures).toContain(
+      'src/feature.ts: sessions.search wire literal is allowed only in its Contract Adapter.',
+    )
+  })
+
   it('fails when a paid-down entry remains in the ledger', () => {
     const root = seededFixture('export const value = 1')
     expect(evaluateRpcArchitectureGate({ root, debtLanes: oneCallLane }).failures).toContain(
