@@ -333,6 +333,7 @@ class FakeStorage:
         self.memory_durable_receipts: list[Any] = []
         self.list_agent_tasks_calls: list[str | None] = []
         self.list_agent_tasks_for_sessions_calls: list[tuple[str, ...]] = []
+        self.last_transcript_content_batch_calls: list[tuple[tuple[str, ...], int]] = []
 
     async def list_sessions(self, limit: int | None = None) -> list[FakeSession]:
         result = list(self._sessions.values())
@@ -371,6 +372,24 @@ class FakeStorage:
         if limit is not None:
             rows = rows[:limit]
         return rows
+
+    async def list_last_transcript_content_batch(
+        self,
+        session_ids: list[str],
+        *,
+        max_chars: int = 120,
+    ) -> dict[str, str]:
+        self.last_transcript_content_batch_calls.append((tuple(session_ids), max_chars))
+        result: dict[str, str] = {session_id: "" for session_id in session_ids}
+        for session_id in session_ids:
+            for entry in reversed(self._transcripts.get(session_id, [])):
+                if (
+                    getattr(entry, "role", None) in ("user", "assistant")
+                    and getattr(entry, "content", None)
+                ):
+                    result[session_id] = str(entry.content)[:max_chars]
+                    break
+        return result
 
     async def list_user_transcript_content_batch(
         self,
@@ -10673,6 +10692,53 @@ class TestSessionsPreview:
         )
         assert res.ok is True
         assert len(res.payload["previews"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_preview_uses_one_bounded_latest_message_projection(
+        self,
+        dispatcher,
+    ):
+        session = FakeSession(session_key="agent:main:preview", session_id="preview-id")
+        manager = FakeSessionManager([session])
+        manager._storage._transcripts[session.session_id] = [
+            SimpleNamespace(role="system", content="ignore this"),
+            SimpleNamespace(role="user", content="older message"),
+            SimpleNamespace(role="assistant", content="newest message"),
+        ]
+
+        async def fail_full_transcript_read(*args, **kwargs):
+            raise AssertionError("sessions.preview must not load the full transcript")
+
+        manager._storage.get_transcript = fail_full_transcript_read
+        ctx = make_ctx(session_manager=manager)
+
+        res = await dispatcher.dispatch("r1", "sessions.preview", None, ctx)
+
+        assert res.ok is True
+        assert res.payload["previews"][0]["lastMessage"] == "newest message"
+        assert manager._storage.last_transcript_content_batch_calls == [
+            ((session.session_id,), 120)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_preview_does_not_hide_projection_failures(
+        self,
+        dispatcher,
+        ctx_with_sessions,
+    ):
+        async def fail_projection(*args, **kwargs):
+            raise RuntimeError("projection failed")
+
+        ctx_with_sessions.session_manager._storage.list_last_transcript_content_batch = (
+            fail_projection
+        )
+
+        res = await dispatcher.dispatch("r1", "sessions.preview", None, ctx_with_sessions)
+
+        assert res.ok is False
+        assert res.error is not None
+        assert res.error.code == "INTERNAL_ERROR"
+        assert "projection failed" in res.error.message
 
     @pytest.mark.asyncio
     async def test_preview_no_manager(self, dispatcher, ctx_no_manager):

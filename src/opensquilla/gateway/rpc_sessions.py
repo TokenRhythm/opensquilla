@@ -11422,38 +11422,42 @@ async def _handle_sessions_preview(params: dict | None, ctx: RpcContext) -> dict
     if storage is None:
         return {"ts": now_ms, "previews": []}
 
-    if keys:
-        sessions = []
-        for k in keys:
-            s = await storage.get_session(k)
-            if s is not None:
-                sessions.append(s)
-    else:
-        sessions = await storage.list_sessions(limit=limit)
+    # Preview is an interactive read. Keep storage lock acquisition bounded
+    # while preserving the existing key/list selection and response shape.
+    with bounded_interactive_storage_reads():
+        if keys:
+            sessions = []
+            for k in keys:
+                s = await storage.get_session(k)
+                if s is not None:
+                    sessions.append(s)
+        else:
+            sessions = await storage.list_sessions(limit=limit)
+
+        session_ids = [
+            str(getattr(session, "session_id", "") or "") for session in sessions
+        ]
+        last_messages = await storage.list_last_transcript_content_batch(
+            session_ids,
+            max_chars=120,
+        )
 
     previews = []
     for s in sessions:
+        session_id = str(getattr(s, "session_id", "") or "")
         title = (
             getattr(s, "display_name", None)
             or getattr(s, "derived_title", None)
-            or s.session_id[:8]
+            or session_id[:8]
         )
-        last_msg = ""
-        try:
-            transcript = await storage.get_transcript(s.session_id, limit=-1)
-            if transcript:
-                # Find the last user or assistant message for preview
-                for entry in reversed(transcript):
-                    if entry.role in ("user", "assistant") and entry.content:
-                        last_msg = entry.content[:120]
-                        break
-        except Exception:
-            pass
+        last_message = last_messages.get(session_id, "")
+        if not isinstance(last_message, str):
+            last_message = ""
         previews.append(
             {
                 "key": s.session_key,
                 "title": title,
-                "lastMessage": last_msg,
+                "lastMessage": last_message,
                 "updatedAt": getattr(s, "updated_at", now_ms),
             }
         )
