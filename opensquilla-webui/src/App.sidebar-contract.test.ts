@@ -52,8 +52,8 @@ describe('App sidebar chrome contract', () => {
   it('bounds automatic sidebar RPCs after chat bootstrap admission', () => {
     expect(appSource).toContain('useSessions(sessionDirectory)')
     expect(appSource).toContain('useAgentOptions(optionalSessionRpcCallOptions)')
-    expect(appSource).toContain(
-      'useSessionListSubscription({\n  rpc: rpcStore,\n  callOptions: optionalSessionRpcCallOptions,',
-    )
+    expect(appSource).toContain('SESSION_DIRECTORY_CHANGES_KEY')
+    expect(appSource).toContain('sessionDirectoryChanges.resume()')
+    expect(appSource).not.toContain('useSessionListSubscription')
   })
 })

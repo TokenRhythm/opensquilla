@@ -155,6 +155,7 @@ import {
 } from '@/utils/sessionSync'
 import { sessionAgentIdentity } from '@/components/sessions/sessionDisplay'
 import { SESSION_DIRECTORY_KEY } from '@/modules/sessionDirectory'
+import { SESSION_DIRECTORY_CHANGES_KEY } from '@/modules/sessionDirectoryChanges'
 
 type FilterId = 'all' | 'chats' | 'automations' | 'channels'
 
@@ -190,6 +191,9 @@ const rpc = useRpcStore()
 const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
 if (!injectedSessionDirectory) throw new Error('SessionDirectory was not provided')
 const sessionDirectory = injectedSessionDirectory
+const injectedSessionDirectoryChanges = inject(SESSION_DIRECTORY_CHANGES_KEY)
+if (!injectedSessionDirectoryChanges) throw new Error('SessionDirectoryChanges was not provided')
+const sessionDirectoryChanges = injectedSessionDirectoryChanges
 const { confirm } = useConfirm()
 const {
   sessionsList,
@@ -500,8 +504,11 @@ onActivated(() => {
   loadAll()
   window.removeEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
   window.addEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
+  const directoryChangesSubscription = sessionDirectoryChanges.subscribe(() => {
+    scheduleSessionRefresh()
+  })
   unsubs = [
-    rpc.on('sessions.changed', scheduleSessionRefresh),
+    () => directoryChangesSubscription.close(),
     rpc.on('exec.approval.requested', handleApprovalPush),
     rpc.on('exec.approval.resolved', handleApprovalPush),
     rpc.on('plugin.approval.requested', handleApprovalPush),
