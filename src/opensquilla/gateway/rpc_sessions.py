@@ -24,6 +24,7 @@ import structlog
 from opensquilla.agents.scope import default_workspace_dir, resolve_agent_workspace_dir
 from opensquilla.application.session_directory import (
     SessionDirectory,
+    SessionSearchProjection,
     _resolve_session_record_for_bootstrap,
 )
 from opensquilla.artifacts import enrich_artifact_event_dict
@@ -2936,16 +2937,12 @@ async def _handle_sessions_search(params: dict | None, ctx: RpcContext) -> dict:
     way ``sessions.list`` derives them so results read like the sidebar.
     """
     now_ms = int(time.time() * 1000)
-    query = ""
-    limit = 20
+    raw_query: object = ""
+    raw_limit: object = 20
     if isinstance(params, dict):
-        query = str(params.get("query") or "").strip()
-        try:
-            limit = int(params.get("limit", 20))
-        except (TypeError, ValueError):
-            limit = 20
-    limit = max(1, min(limit, 50))
-
+        raw_query = params.get("query")
+        raw_limit = params.get("limit", 20)
+    query, _ = SessionDirectory.normalize_search_input(raw_query, raw_limit)
     empty = {"sessions": [], "messages": [], "query": query, "ts": now_ms}
     if not query or ctx.session_manager is None:
         return empty
@@ -2953,104 +2950,55 @@ async def _handle_sessions_search(params: dict | None, ctx: RpcContext) -> dict:
     if storage is None:
         return empty
 
-    # Title hits.
-    # Prefer the dedicated global query (matches every session, builds view rows
-    # only for the matches). Fall back to a bounded recent scan for storage
-    # doubles that don't implement it.
-    title_search = getattr(storage, "search_sessions_by_title", None)
-    if callable(title_search):
-        title_sessions = await title_search(query, limit)
-    else:
-        needle = query.lower()
-        recent = await storage.list_sessions(limit=200)
-        title_sessions = [
-            s
-            for s in recent
-            if needle
-            in " ".join(
-                p
-                for p in (
-                    str(getattr(s, "display_name", "") or ""),
-                    str(getattr(s, "derived_title", "") or ""),
-                    str(getattr(s, "subject", "") or ""),
-                )
-                if p
-            ).lower()
-        ][:limit]
-
-    transcript_titles = await _list_transcript_titles(storage, title_sessions)
-    session_hits: list[dict[str, Any]] = []
-    title_keys: set[str] = set()
     channel_types = _channel_types_from_config(getattr(ctx, "config", None))
-    for s in title_sessions:
+
+    def project(session: Any, transcript_title: str) -> SessionSearchProjection:
         view = build_session_view_item(
-            s,
+            session,
             entry_count=0,
             task_rows=[],
             now_ms=now_ms,
-            transcript_title=transcript_titles.get(getattr(s, "session_id", ""), ""),
+            transcript_title=transcript_title,
             channel_types=channel_types,
         )
-        title_keys.add(canonicalize_session_key(s.session_key))
-        session_hits.append(
-            {
-                "key": s.session_key,
-                "title": str(view.get("title") or ""),
-                "effectiveAgentId": view.get("effectiveAgentId"),
-                "surface": view.get("surface"),
-                "updatedAt": view.get("updatedAt"),
-            }
+        return SessionSearchProjection(
+            title=str(view.get("title") or ""),
+            effective_agent_id=view.get("effectiveAgentId"),
+            surface=view.get("surface"),
+            updated_at=view.get("updatedAt"),
         )
 
-    # Content hits.
-    # ASCII queries use the ranked, indexed FTS path. Non-ASCII queries (CJK and
-    # other scripts the FTS tokenizer can't segment) use a substring LIKE scan,
-    # the only option for them. ASCII deliberately has NO LIKE fallback so a
-    # common keystroke can never trigger an unbounded full-table content scan.
-    has_like = hasattr(storage, "search_transcript_like")
-    non_ascii = any(ord(ch) > 127 for ch in query)
-    rows: list[dict[str, Any]] = []
-    try:
-        if non_ascii:
-            if has_like:
-                rows = await storage.search_transcript_like(query, limit=limit)
-        else:
-            rows = await storage.search_transcript(query, limit=limit)
-    except Exception:
-        log.warning("sessions.search.transcript_failed", exc_info=True)
-        rows = []
-
-    # One row per session, never repeating a session already shown as a title
-    # hit, enriched with the session title via a small bounded lookup.
-    pending: list[tuple[str, str, dict[str, Any]]] = []
-    content_keys: set[str] = set()
-    for row in rows:
-        raw_key = str(row.get("session_key") or "")
-        canon = canonicalize_session_key(raw_key)
-        if not canon or canon in title_keys or canon in content_keys:
-            continue
-        content_keys.add(canon)
-        pending.append((raw_key, canon, row))
-
-    title_map = await _titles_for_keys(
-        storage,
-        [canon for _, canon, _ in pending],
-        now_ms,
-        channel_types=channel_types,
+    result = await SessionDirectory(storage).search(
+        raw_query,
+        raw_limit,
+        now_ms=now_ms,
+        project=project,
+        derive_transcript_title=derive_transcript_title,
     )
-    message_hits: list[dict[str, Any]] = []
-    for raw_key, canon, row in pending:
-        message_hits.append(
+    return {
+        "sessions": [
             {
-                "key": raw_key,
-                "title": title_map.get(canon, ""),
-                "role": row.get("role"),
-                "snippet": row.get("snippet") or "",
-                "createdAt": row.get("created_at"),
+                "key": hit.key,
+                "title": hit.projection.title,
+                "effectiveAgentId": hit.projection.effective_agent_id,
+                "surface": hit.projection.surface,
+                "updatedAt": hit.projection.updated_at,
             }
-        )
-
-    return {"sessions": session_hits, "messages": message_hits, "query": query, "ts": now_ms}
+            for hit in result.sessions
+        ],
+        "messages": [
+            {
+                "key": hit.key,
+                "title": hit.title,
+                "role": hit.role,
+                "snippet": hit.snippet,
+                "createdAt": hit.created_at,
+            }
+            for hit in result.messages
+        ],
+        "query": result.query,
+        "ts": result.ts,
+    }
 
 
 @_d.method("sessions.create", scope="operator.write")
