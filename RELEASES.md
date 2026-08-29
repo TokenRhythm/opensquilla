@@ -55,11 +55,13 @@ If a backport moves `:latest`, rerun the container workflow from the newest tag
 to restore the intended ordering. The fixed release tag is the rollback and
 reproducibility contract.
 
-The Windows desktop installer is currently unsigned; release notes and download
-sections must link to `docs/code-signing-policy.md` until a signing workflow is
-approved and enabled. Windows browser downloads may carry Mark-of-the-Web, and
-SmartScreen, Smart App Control, enterprise policy, and unsigned binary
-reputation must be checked on a real Windows machine before broad promotion.
+The Windows desktop release workflow must Authenticode sign each new installer
+through the approval-gated DigiCert KeyLocker environment. Release notes and
+download sections must link to `docs/code-signing-policy.md`. Windows browser
+downloads may carry Mark-of-the-Web, and SmartScreen, Smart App Control,
+enterprise policy, signer identity, and timestamp verification must be checked
+on a real Windows machine before broad promotion. Historical releases retain
+their original signing status.
 
 GitHub source archives remain available for code review and developer
 reference; source installs should use `git clone` plus Git LFS. Python wheel

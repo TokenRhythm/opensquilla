@@ -190,9 +190,9 @@ and user agent, to those hosts and network intermediaries. Desktop updater
 requests override electron-updater's per-install staging header with one fixed,
 non-user-specific value; OpenSquilla
 does not use that header for device identification or staged rollout. Release
-checksums are published in `SHA256SUMS` when release assets are generated. For
-unsigned Windows builds, OpenSquilla fetches the canonical `SHA256SUMS` from the
-matching GitHub Release, streams the installer from the selected source into an
+checksums are published in `SHA256SUMS` when release assets are generated. On
+Windows, OpenSquilla fetches the canonical `SHA256SUMS` from the matching GitHub
+Release, streams the selected installer from the selected source into an
 application-owned directory, and reveals it only after SHA-256 verification.
 The app does not automatically execute that installer.
 

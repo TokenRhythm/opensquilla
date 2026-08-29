@@ -161,7 +161,7 @@ try {
   const nativeEnabled = await page.evaluate(
     () => window.opensquillaDesktop?.isAutoUpdateEnabled?.(),
   )
-  assert.equal(nativeEnabled, false, 'unsigned Windows must use the passive update banner')
+  assert.equal(nativeEnabled, false, 'managed Windows updates must use the passive update banner')
   assert.equal(
     await page.locator('[data-testid="update-banner"]').count(),
     0,

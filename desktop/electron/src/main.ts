@@ -9786,9 +9786,9 @@ function stopGateway(): void {
 // ── Desktop updates ──────────────────────────────────────────────────────────
 // macOS release builds are Developer-ID signed + notarized and ship the zip +
 // latest-mac.yml feed that Squirrel.Mac consumes, so in-place auto-update is
-// safe. Windows builds are currently unsigned, so the desktop shell discovers
-// the release but opens its exact versioned NSIS installer for an explicit
-// manual install. OPENSQUILLA_DESKTOP_ENABLE_WIN_UPDATE=1 opts in to native
+// safe. Windows keeps explicit manual installation even when an installer has
+// an Authenticode signature: the shell discovers and reveals the exact
+// versioned NSIS installer. OPENSQUILLA_DESKTOP_ENABLE_WIN_UPDATE=1 opts in to native
 // Windows updating for local tests only; OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE
 // disables all shell-managed discovery.
 const { autoUpdater } = electronUpdater
@@ -11331,7 +11331,7 @@ async function applyDownloadedUpdate(): Promise<void> {
 
 // Lets the gateway-served Control UI know whether this desktop owns update
 // discovery. Discovery ownership and native installation are deliberately separate:
-// unsigned Windows builds use the managed exact-installer flow, while macOS
+// Windows builds use the managed exact-installer flow, while macOS
 // can install the verified archive in place.
 ipcMain.handle('desktop:update:managed', () => desktopUpdateManaged() || mockUpdateVersion() !== null)
 ipcMain.handle('desktop:update:supported', () => nativeAutoUpdateEnabled())

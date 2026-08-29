@@ -76,8 +76,8 @@ npm run dist
 
 ## Windows Release Signing
 
-Windows release builds are signed through DigiCert KeyLocker. The release
-workflow uses the protected `windows-code-signing` environment for manually
+The release workflow signs new Windows builds through DigiCert KeyLocker. It
+uses the protected `windows-code-signing` environment for manually
 dispatched test artifacts and `v*` release tags. Missing credentials, signing
 failures, and signature-policy mismatches fail the Windows build.
 

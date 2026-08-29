@@ -5,12 +5,13 @@ artifacts and the rules for the signing workflow.
 
 ## Current Status
 
-Windows release builds are signed through DigiCert KeyLocker with the Beijing
-TokenRhythm Technologies Co., Ltd. public code-signing certificate. The
-protected `windows-code-signing` GitHub environment gates access to CI
-credentials. Manually dispatched test artifacts from `main` and `v*` release
-tags fail closed when credentials are unavailable, signing fails, or the
-resulting Authenticode identity and timestamp do not match policy.
+The Release Assets workflow signs new Windows builds through DigiCert KeyLocker
+with the Beijing TokenRhythm Technologies Co., Ltd. public code-signing
+certificate. The protected `windows-code-signing` GitHub environment gates
+access to CI credentials. Manually dispatched test artifacts from approved
+branches and `v*` release tags fail closed when credentials are unavailable,
+signing fails, or the resulting Authenticode identity and timestamp do not
+match policy. Historical release assets retain their original signing status.
 
 macOS release packaging is handled separately through the Apple signing and
 notarization path configured by maintainers for macOS artifacts. This document's

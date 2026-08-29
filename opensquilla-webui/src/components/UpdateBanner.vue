@@ -11,7 +11,7 @@ import { getPlatform } from '@/platform'
 //
 // Suppressed wherever the desktop shell manages update discovery and actions.
 // That includes native electron-updater on macOS and the versioned manual
-// installer flow on unsigned Windows. Browser surfaces keep this passive banner;
+// installer flow on Windows. Browser surfaces keep this passive banner;
 // older Windows shells without the managed capability retain their legacy banner.
 
 const { t } = useI18n()
