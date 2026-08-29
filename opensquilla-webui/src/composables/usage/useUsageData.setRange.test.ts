@@ -92,6 +92,7 @@ function mountUsageData() {
   const directory: SessionDirectory = {
     listPage: vi.fn().mockResolvedValue({ items: [], hasMore: false, nextCursor: null }),
     count: vi.fn().mockResolvedValue({ value: 0, exact: true }),
+    resolve: vi.fn().mockResolvedValue({ key: 'agent:main:webchat:default', id: 'default' }),
   }
   const api = scope.run(() => useUsageData(directory))!
   return { api, directory, scope }

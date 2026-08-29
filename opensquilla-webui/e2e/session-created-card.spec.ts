@@ -234,7 +234,10 @@ async function mockSessionCreatedHistory(
             'Session not found',
           ))
         } else {
-          ws.send(response(frame.id as string | number | undefined, { session_key: key }))
+          ws.send(response(frame.id as string | number | undefined, {
+            session_key: key,
+            session_id: key.split(':').at(-1) || key,
+          }))
         }
         return
       }

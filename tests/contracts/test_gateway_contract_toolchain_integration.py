@@ -124,14 +124,19 @@ def test_generic_contract_toolchain_is_real_and_deterministic(tmp_path: Path) ->
         text=True,
     )
 
-    validator_path = tmp_path / "toolchainPingValidators.cjs"
+    validator_source = _artifact(first, "toolchainPingValidators.mjs")
+    # ESM output is imported directly by Vite/browser code.  AJV must not
+    # leave a CommonJS runtime require in that artifact.
+    assert "require(" not in validator_source
+    validator_path = tmp_path / "toolchainPingValidators.mjs"
     validator_path.write_text(
-        _artifact(first, "toolchainPingValidators.cjs"),
+        validator_source,
         encoding="utf-8",
     )
-    node_check = tmp_path / "verify-toolchain.cjs"
+    node_check = tmp_path / "verify-toolchain.mjs"
     node_check.write_text(
-        "const validators = require(process.argv[2])\n"
+        "import { pathToFileURL } from 'node:url'\n"
+        "const validators = await import(pathToFileURL(process.argv[2]).href)\n"
         f"const valid = {json.dumps(valid_request)}\n"
         "if (!validators.validateToolchainPingRequestFrame(valid)) process.exit(11)\n"
         "const wrong = {...valid, method: 'wrong'}\n"

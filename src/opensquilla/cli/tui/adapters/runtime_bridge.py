@@ -30,6 +30,9 @@ from opensquilla.cli.tui.adapters import runtime_helpers as _runtime_helpers
 from opensquilla.cli.tui.adapters import slash_bridge as _slash_bridge
 from opensquilla.cli.tui.backend.contracts import TuiOutputHandle
 from opensquilla.cli.ui import ACCENT, console, error_panel
+from opensquilla.contracts.adapters.sessions_resolve_contract import (
+    SESSIONS_RESOLVE_METHOD,
+)
 from opensquilla.engine.commands import Surface
 
 if TYPE_CHECKING:
@@ -390,7 +393,7 @@ async def run_gateway_chat(
         if (
             session_id
             and (exc.code or "").upper() == "NOT_FOUND"
-            and exc.method in {"sessions.bootstrap", "sessions.resolve"}
+            and exc.method in {"sessions.bootstrap", SESSIONS_RESOLVE_METHOD}
         ):
             message = (
                 f"Session '{session_id}' was not found. Run `opensquilla sessions list` "

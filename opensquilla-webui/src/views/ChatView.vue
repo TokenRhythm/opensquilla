@@ -797,11 +797,15 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, nextTick, watch, watchEffect } from 'vue'
+import { ref, computed, inject, onMounted, onUnmounted, nextTick, watch, watchEffect } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { useRpcStore } from '@/stores/rpc'
+import {
+  SESSION_DIRECTORY_KEY,
+  SessionDirectoryError,
+} from '@/modules/sessionDirectory'
 import { useRpcCall } from '@/composables/useRpc'
 import { useAppStore } from '@/stores/app'
 import { useSandboxSetupStore } from '@/stores/sandboxSetup'
@@ -920,7 +924,6 @@ import {
  } from '@/composables/chat/useChatSessionBootstrap'
  import {
    autoSendDraftIsUnchanged,
-   rpcErrorCode,
  } from '@/composables/chat/sessionBootstrapContract'
 import {
   acquireSessionBootstrapAdmission,
@@ -1160,14 +1163,16 @@ const toolResultModal = ref<{
 /* ── Stores / Router ───────────────────────────────────────────────── */
 
 const rpc = useRpcStore()
+const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
+if (!injectedSessionDirectory) throw new Error('SessionDirectory was not provided')
+const sessionDirectory = injectedSessionDirectory
 
 async function resolveCreatedSessionAvailability(sessionKey: string): Promise<boolean> {
   try {
-    await rpc.call('sessions.resolve', { key: sessionKey })
+    await sessionDirectory.resolve({ key: sessionKey })
     return true
   } catch (error: unknown) {
-    const code = rpcErrorCode(error)
-    if (code === 'NOT_FOUND' || code === 'SESSION_NOT_FOUND') return false
+    if (error instanceof SessionDirectoryError && error.code === 'not-found') return false
     throw error
   }
 }
