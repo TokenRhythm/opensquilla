@@ -101,6 +101,7 @@
     "tests/test_application/test_approval_patterns.py": 0.017,
     "tests/test_application/test_approval_rpc.py": 0.086,
     "tests/test_application/test_session_directory.py": 0.01,
+    "tests/test_application/test_session_transcript.py": 0.01,
     "tests/test_application/test_wizard.py": 0.01,
     "tests/test_artifact_bundles.py": 0.662,
     "tests/test_artifact_session/test_candidate_loop.py": 0.01,

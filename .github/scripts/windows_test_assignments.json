@@ -320,6 +320,7 @@
       "tests/integration/cli/tui_real_terminal/test_visual_layout_matrix.py",
       "tests/test_application/test_approval_patterns.py",
       "tests/test_application/test_session_directory.py",
+      "tests/test_application/test_session_transcript.py",
       "tests/test_attachment_workspace.py",
       "tests/test_bundled_voice_skills.py",
       "tests/test_channels/test_approval_i18n.py",
