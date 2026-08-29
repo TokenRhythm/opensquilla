@@ -134,9 +134,9 @@ class SessionDirectory:
 
         ``project`` is the only presentation hook.  It is supplied by the
         Gateway adapter and returns a small domain projection; the application
-        module never imports Gateway view or RPC code.  Search failures are
-        isolated per source: a title failure or transcript index failure
-        degrades to an empty result, matching the v4 behaviour.
+        module never imports Gateway view or RPC code.  Transcript index and
+        enrichment failures remain best-effort, while title-index failures
+        retain the historical propagation semantics of the v4 handler.
         """
 
         normalized_query, normalized_limit = self.normalize_search_input(query, limit)
