@@ -20,6 +20,7 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         "src/opensquilla/gateway/adapters/sessions_resolve_contract.py",
         "src/opensquilla/contracts/adapters/sessions_search_contract.py",
         "src/opensquilla/gateway/adapters/sessions_search_contract.py",
+        "src/opensquilla/contracts/adapters/sessions_changed_contract.py",
     }
 )
 GENERATED_METADATA_IMPORT_ALLOWLIST = frozenset(
@@ -42,6 +43,11 @@ SESSIONS_SEARCH_METADATA_IMPORT_ALLOWLIST = frozenset(
     {
         "src/opensquilla/contracts/adapters/sessions_search_contract.py",
         "src/opensquilla/gateway/scopes.py",
+    }
+)
+SESSIONS_CHANGED_METADATA_IMPORT_ALLOWLIST = frozenset(
+    {
+        "src/opensquilla/contracts/adapters/sessions_changed_contract.py",
     }
 )
 SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
@@ -351,6 +357,23 @@ def test_schema_derived_method_metadata_consumers_are_exact() -> None:
     stale = SESSIONS_SEARCH_METADATA_IMPORT_ALLOWLIST - search_consumers
     assert unexpected == set(), f"unexpected sessions.search metadata imports: {unexpected}"
     assert stale == set(), f"stale sessions.search metadata import allowlist: {stale}"
+
+    changed_consumers = set()
+    for path in _python_files(PACKAGE_ROOT):
+        for node in ast.walk(_tree(path)):
+            if any(
+                module
+                == "opensquilla.contracts.generated.v4.sessions_changed_metadata"
+                for module in _imported_modules(path, node)
+            ):
+                changed_consumers.add(_relative(path))
+
+    unexpected = changed_consumers - SESSIONS_CHANGED_METADATA_IMPORT_ALLOWLIST
+    stale = SESSIONS_CHANGED_METADATA_IMPORT_ALLOWLIST - changed_consumers
+    assert unexpected == set(), (
+        f"unexpected sessions.changed metadata imports: {unexpected}"
+    )
+    assert stale == set(), f"stale sessions.changed metadata import allowlist: {stale}"
 
 
 def test_sessions_list_authored_literal_debt_is_exact() -> None:

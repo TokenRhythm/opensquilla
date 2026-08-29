@@ -38,6 +38,10 @@ from opensquilla.attachment_refs import (
     read_pending_chat_input_promotions,
     transcript_material_path,
 )
+from opensquilla.contracts.adapters.sessions_changed_contract import (
+    SESSIONS_CHANGED_EVENT,
+    observe_sessions_changed_payload,
+)
 from opensquilla.engine.cache_break_monitor import (
     cancel_active_compactions,
     compaction_terminal_status,
@@ -8867,6 +8871,12 @@ async def _prepare_session_event_payload(
                     prepared["epoch"] = epoch
                 except Exception:
                     pass  # best-effort; never block event delivery
+    if event_name == SESSIONS_CHANGED_EVENT:
+        prepared = observe_sessions_changed_payload(
+            prepared,
+            source="gateway.rpc_sessions",
+            allow_legacy=False,
+        )
     return prepared
 
 

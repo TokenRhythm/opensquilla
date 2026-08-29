@@ -114,6 +114,7 @@ _TUI_DEPENDENCY_FILENAMES: Final = _NODE_DEPENDENCY_FILENAMES | {
 _TUI_HOST_COMPANION_TEST: Final = "tests/test_packaging/test_tui_host_companion.py"
 _GATEWAY_CONTRACT_PREFIXES: Final = (
     "contracts/gateway/v4/",
+    "opensquilla-webui/src/contracts/generated/v4/",
     "scripts/contracts/",
     "src/opensquilla/contracts/generated/v4/",
     "tests/contracts/",

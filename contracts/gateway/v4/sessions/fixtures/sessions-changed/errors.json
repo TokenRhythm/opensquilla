@@ -1,0 +1,74 @@
+{
+  "format": 1,
+  "cases": [
+    {
+      "id": "missing-key",
+      "coverage": "required-identity",
+      "expectation": "reject",
+      "wire": {
+        "schema_version": 1,
+        "reason": "created"
+      }
+    },
+    {
+      "id": "wrong-schema-version",
+      "coverage": "version-fencing",
+      "expectation": "reject",
+      "wire": {
+        "schema_version": 2,
+        "key": "agent:main:bad",
+        "reason": "created"
+      }
+    },
+    {
+      "id": "non-integral-schema-version",
+      "coverage": "version-fencing",
+      "expectation": "reject",
+      "wire": {
+        "schema_version": 1.5,
+        "key": "agent:main:bad",
+        "reason": "created"
+      }
+    },
+    {
+      "id": "boolean-schema-version",
+      "coverage": "version-type",
+      "expectation": "reject",
+      "wire": {
+        "schema_version": true,
+        "key": "agent:main:bad",
+        "reason": "created"
+      }
+    },
+    {
+      "id": "legacy-explicit-null-version",
+      "coverage": "legacy-version-discriminator",
+      "expectation": "reject",
+      "wire": {
+        "schema_version": null,
+        "key": "agent:main:bad",
+        "reason": "created"
+      }
+    },
+    {
+      "id": "non-string-reason",
+      "coverage": "identity-types",
+      "expectation": "reject",
+      "wire": {
+        "key": "agent:main:bad",
+        "reason": 7
+      }
+    },
+    {
+      "id": "null-run-status",
+      "coverage": "optional-non-nullable",
+      "expectation": "reject",
+      "wire": {
+        "schema_version": 1,
+        "key": "agent:main:bad",
+        "reason": "created",
+        "run_status": null
+      }
+    }
+  ]
+}

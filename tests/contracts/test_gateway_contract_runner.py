@@ -133,6 +133,47 @@ def test_event_contract_rejects_boolean_schema_version(tmp_path: Path) -> None:
         runner.load_contract(schema, contract_root=tmp_path)
 
 
+def test_event_python_renderer_tightens_reachable_optional_fields() -> None:
+    spec = next(
+        spec
+        for spec in runner.discover_contracts()
+        if spec.wire_name == "sessions.changed"
+    )
+    generated = (
+        "from pydantic import BaseModel\n\n"
+        "class SessionsChangedCanonicalPayload(BaseModel):\n"
+        "    schema_version: StrictInt\n"
+        "    run_status: StrictStr | None = None\n\n"
+        "class SessionsChangedLegacyPayload(BaseModel):\n"
+        "    run_status: StrictStr | None = None\n"
+    )
+
+    rendered = runner._normalise_optional_non_nullable_defaults(spec, generated)
+
+    assert rendered.count("run_status: StrictStr = None  # type: ignore[assignment]") == 2
+
+
+def test_json_number_renderer_accepts_one_line_pydantic_imports() -> None:
+    spec = next(
+        spec
+        for spec in runner.discover_contracts()
+        if spec.wire_name == "sessions.changed"
+    )
+    generated = (
+        "from __future__ import annotations\n"
+        "\n"
+        "from pydantic import BaseModel, StrictInt\n\n"
+        "class SessionsChangedCanonicalPayload(BaseModel):\n"
+        "    schema_version: StrictInt = Field(..., ge=1, le=1)\n"
+    )
+
+    rendered = runner._normalise_json_number_types(spec, generated)
+
+    assert "from typing import Annotated, Any" in rendered
+    assert "_JsonInteger = Annotated[" in rendered
+    assert "schema_version: _JsonInteger" in rendered
+
+
 def test_duplicate_wire_names_are_rejected(tmp_path: Path) -> None:
     _write_schema(tmp_path, "a/first.schema.json", _method_schema("sessions.resolve"))
     duplicate = _method_schema("sessions.resolve")
