@@ -26,6 +26,8 @@ import {
 } from '@/composables/chat/sessionBootstrapContract'
 
 type RpcClient = {
+  readonly connectionGeneration?: number
+  readonly policy?: Record<string, unknown> | null
   waitForConnection: (
     timeoutMs?: number,
     signal?: AbortSignal,
@@ -36,6 +38,24 @@ type RpcClient = {
     params?: Record<string, unknown>,
     options?: RpcCallOptions,
   ) => Promise<T>
+  recoverConnectionGeneration?: (
+    expectedGeneration: number,
+    reason: string,
+  ) => boolean
+}
+
+export type SessionSubscriptionLeaseState =
+  | 'acquiring'
+  | 'active'
+  | 'releasing'
+  | 'retired'
+
+interface SessionSubscriptionLease {
+  token: symbol
+  key: string
+  state: SessionSubscriptionLeaseState
+  socketGeneration: number | null
+  releasePromise: Promise<void> | null
 }
 
 export interface UseChatSessionSubscriptionOptions {
@@ -51,7 +71,10 @@ export interface UseChatSessionSubscriptionOptions {
   ownershipHydrationRequired?: () => boolean
   acceptanceStopPending?: Ref<boolean>
   sessionRunStatus: (source: ChatRunStatusSource | null | undefined) => ChatRunStatus
-  startStreaming: () => void
+  startStreaming: (
+    activityStartedAt?: number | string | null,
+    recordInitialActivity?: boolean,
+  ) => void
   /** Adopt durable task timing even when snapshot replay already opened the bubble. */
   reconcileStreamTaskClock?: (snapshot: {
     sessionKey: string
@@ -117,16 +140,78 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     bootstrapGeneration: number
     bootstrapAttempt: number
     token: symbol
+    lease: SessionSubscriptionLease
     outcome: Promise<SessionSubscriptionOutcome>
   } | null = null
+  const subscriptionLeases = new Set<SessionSubscriptionLease>()
+  let activeLease: SessionSubscriptionLease | null = null
   let activeController: AbortController | null = null
   let activeMetadataController: AbortController | null = null
   let metadataHydrationSequence = 0
+
+  function detachedHydrationAdvertised(): boolean {
+    const methods = options.rpc.policy?.concurrent_optional_read_methods
+    return Array.isArray(methods) && methods.includes('sessions.messages.hydrate')
+  }
+
+  function hydrationCallOptions(
+    bootstrap: SessionBootstrapPhaseContext,
+  ): RpcCallOptions {
+    const callOptions = phaseCallOptions(bootstrap, 'sessions.messages.hydrate')
+    if (detachedHydrationAdvertised()) callOptions.timeoutAction = 'reject'
+    return callOptions
+  }
+
+  function retireLease(lease: SessionSubscriptionLease) {
+    lease.state = 'retired'
+    subscriptionLeases.delete(lease)
+    if (activeLease === lease) activeLease = null
+  }
+
+  function retireLeasesFromPriorGenerations() {
+    const currentGeneration = options.rpc.connectionGeneration
+    if (typeof currentGeneration !== 'number') return
+    for (const lease of subscriptionLeases) {
+      if (
+        lease.socketGeneration !== null
+        && lease.socketGeneration !== currentGeneration
+      ) {
+        retireLease(lease)
+      }
+    }
+  }
+
+  function activateLease(lease: SessionSubscriptionLease) {
+    if (lease.state !== 'acquiring') return
+    // Gateway registration is a set keyed by (connection, session). A newer
+    // successful acquire for the same key subsumes earlier non-releasing
+    // leases, while a closing A1 remains distinct from a later A2 acquire.
+    for (const candidate of subscriptionLeases) {
+      if (
+        candidate !== lease
+        && candidate.key === lease.key
+        && (candidate.state === 'acquiring' || candidate.state === 'active')
+      ) {
+        retireLease(candidate)
+      }
+    }
+    lease.state = 'active'
+    activeLease = lease
+  }
+
+  function latestReleasableLease(key: string): SessionSubscriptionLease | null {
+    const matches = [...subscriptionLeases].filter(lease => (
+      lease.key === key
+      && (lease.state === 'acquiring' || lease.state === 'active')
+    ))
+    return matches.length > 0 ? matches[matches.length - 1]! : null
+  }
 
   function subscribeSession(
     bootstrap?: SessionBootstrapPhaseContext,
   ): Promise<SessionSubscriptionOutcome> {
     if (!options.sessionKey.value) return Promise.resolve(UNAVAILABLE_SUBSCRIPTION)
+    retireLeasesFromPriorGenerations()
     if (options.ownershipHydrationRequired?.() !== false) {
       options.taskOwnership?.beginHydration()
     }
@@ -154,11 +239,21 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       ? { ...bootstrap, signal: controller.signal }
       : undefined
     const token = Symbol('session-subscription')
+    const lease: SessionSubscriptionLease = {
+      token,
+      key,
+      state: 'acquiring',
+      socketGeneration: null,
+      releasePromise: null,
+    }
+    subscriptionLeases.add(lease)
+    activeLease = lease
     const outcome = runSubscription(
       key,
       sinceStreamGeneration,
       sinceStreamSeq,
       token,
+      lease,
       controller,
       attemptContext,
     ).finally(() => {
@@ -171,6 +266,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       bootstrapGeneration,
       bootstrapAttempt,
       token,
+      lease,
       outcome,
     }
     return outcome
@@ -281,14 +377,29 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     if (runModeLock && typeof runModeLock === 'object') {
       options.onRunModeLock?.(runModeLock)
     }
-    options.onSnapshot?.(res)
-    options.taskOwnership?.applySnapshot(res, true)
+    const rawActiveTask = res.active_task || res.activeTask || null
+    const rawActiveTaskId = chatTaskId(rawActiveTask)
+    const rawRunStatus = String(res.run_status || res.runStatus || '').toLowerCase()
+    const settledLiveTask = LIVE_RUN_STATES.includes(rawRunStatus)
+      && Boolean(rawActiveTaskId)
+      && options.taskOwnership?.isSettled(rawActiveTaskId) === true
+    const effectiveSnapshot = settledLiveTask
+      ? {
+          ...res,
+          run_status: 'idle' as const,
+          runStatus: 'idle' as const,
+          active_task: null,
+          activeTask: null,
+        }
+      : res
+    options.onSnapshot?.(effectiveSnapshot)
+    options.taskOwnership?.applySnapshot(effectiveSnapshot, true)
     // Do not clear an acceptance-result-unknown Stop from an idle snapshot.
     // The subscription can race ahead of the original ingress commit, so only
     // the matching send transaction (receipt/rejection) or an explicit session
     // reset may release that latch.  Its idempotent replay must still inherit
     // the Stop intent and abort the exact accepted task once the receipt exists.
-    applySessionRunState(res)
+    applySessionRunState(effectiveSnapshot)
     // A pending inline interrupt is newer, stronger evidence than an idle
     // subscription snapshot that raced with the approval request.
     if (
@@ -301,17 +412,21 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       })
     }
     const liveTaskSnapshot = LIVE_RUN_STATES.includes(options.runStatus.value.status)
-    reconcileActiveTaskGroups(res)
+    if (!settledLiveTask) reconcileActiveTaskGroups(res)
     if (liveTaskSnapshot && !options.isStreaming.value) {
-      options.startStreaming()
+      const activeTask = (effectiveSnapshot.active_task || effectiveSnapshot.activeTask) as {
+        started_at?: number | string | null
+        startedAt?: number | string | null
+      } | null | undefined
+      options.startStreaming(activeTask?.started_at ?? activeTask?.startedAt)
       // startStreaming establishes the live bubble with a generic running
       // placeholder. Restore the authoritative active-task payload (including
       // steer_capability) that came from hydration instead of waiting for a
       // later task.running event to repair it.
-      applySessionRunState(res)
+      applySessionRunState(effectiveSnapshot)
     }
     if (liveTaskSnapshot) {
-      const activeTask = (res.active_task || res.activeTask) as {
+      const activeTask = (effectiveSnapshot.active_task || effectiveSnapshot.activeTask) as {
         task_id?: string
         taskId?: string
         started_at?: number | string | null
@@ -379,7 +494,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         const hydration = await options.rpc.call<SessionMessagesSubscribeResponse>(
           'sessions.messages.hydrate',
           { key },
-          phaseCallOptions(hydrationContext, 'sessions.messages.hydrate'),
+          hydrationCallOptions(hydrationContext),
         )
         if (
           attempt !== subscriptionAttempt
@@ -418,6 +533,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     sinceStreamGeneration: string | null,
     sinceStreamSeq: number,
     token: symbol,
+    lease: SessionSubscriptionLease,
     controller: AbortController,
     bootstrap?: SessionBootstrapPhaseContext,
   ): Promise<SessionSubscriptionOutcome> {
@@ -471,22 +587,27 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       const subscribeCallOptions = bootstrap
         ? {
             ...phaseCallOptions(bootstrap, 'sessions.messages.subscribe'),
+            // Once subscribe reaches WebSocket.send(), its server-side
+            // registration must remain correlated until it settles. Route
+            // cancellation is represented by the bootstrap epoch instead of
+            // deleting this wire request from RpcClient's pending map.
+            signal: undefined,
             onSent: (socketGeneration: number) => {
+              lease.socketGeneration = socketGeneration
               subscribeSocketGeneration = socketGeneration
               markLiveFramesSent()
             },
           }
-        : undefined
-      const subscribePromise = bootstrap
-        ? options.rpc.call<SessionMessagesSubscribeResponse>(
-            'sessions.messages.subscribe',
-            params,
-            subscribeCallOptions,
-          )
-        : options.rpc.call<SessionMessagesSubscribeResponse>(
-            'sessions.messages.subscribe',
-            params,
-          )
+        : {
+            onSent: (socketGeneration: number) => {
+              lease.socketGeneration = socketGeneration
+            },
+          }
+      const subscribePromise = options.rpc.call<SessionMessagesSubscribeResponse>(
+        'sessions.messages.subscribe',
+        params,
+        subscribeCallOptions,
+      )
       // Pipeline the in-memory snapshot directly behind subscribe. Only after
       // both frames are on the wire may history enter the serialized queue:
       // subscribe → snapshot → history. Slow storage metadata is deferred.
@@ -519,6 +640,18 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         subscribePromise,
         snapshotPromise,
       ] as const)
+      if (
+        subscribeResult.status === 'fulfilled'
+        && subscribeResult.value?.subscribed !== false
+        && lease.state === 'acquiring'
+      ) {
+        activateLease(lease)
+      } else if (
+        subscribeResult.status === 'rejected'
+        && lease.state === 'acquiring'
+      ) {
+        retireLease(lease)
+      }
       if (attempt !== subscriptionAttempt || key !== options.sessionKey.value) {
         return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
       }
@@ -526,6 +659,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       if (subscribeResult.status === 'rejected') throw subscribeResult.reason
       const res = subscribeResult.value
       if (res && res.subscribed === false) {
+        retireLease(lease)
         throw new Error('No subscription manager available')
       }
       const generationReset = reconcileSubscriptionGeneration(
@@ -568,9 +702,15 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
             // snapshot response. Never reset the live surface behind them.
             && snapshot.current_stream_seq >= options.lastStreamSeq.value
           ) {
-            onLiveSnapshot?.(snapshot)
+            const snapshotTaskId = typeof snapshot.task_id === 'string'
+              ? snapshot.task_id
+              : ''
+            const settledSnapshot = Boolean(
+              snapshotTaskId && options.taskOwnership?.isSettled(snapshotTaskId),
+            )
+            if (!settledSnapshot) onLiveSnapshot?.(snapshot)
             options.lastStreamSeq.value = Math.max(0, snapshot.current_stream_seq)
-            snapshotTaskLive = Boolean(snapshot.task_id)
+            snapshotTaskLive = Boolean(snapshot.task_id) && !settledSnapshot
           }
         }
       }
@@ -625,6 +765,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         backgroundOnly: false,
       }
     } catch (err: unknown) {
+      if (lease.state === 'acquiring') retireLease(lease)
       console.warn('Session stream subscription failed:', err instanceof Error ? err.message : err)
       const cancelled = (
         attempt !== subscriptionAttempt
@@ -685,8 +826,10 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         Math.max(1, deadlineAt - Date.now()),
         controller.signal,
         {
-          timeoutAction: callOptions.timeoutAction ?? 'reconnect',
-          abortAction: callOptions.abortAction ?? 'reconnect',
+          // Metadata admission is only a waiter until the request is sent.
+          // Handshake health belongs to RpcClient's generation watchdogs.
+          timeoutAction: 'reject',
+          abortAction: 'reject',
         },
       )
       if (!isCurrent()) return false
@@ -697,8 +840,9 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
           ...callOptions,
           timeoutMs: Math.max(1, deadlineAt - Date.now()),
           signal: controller.signal,
-          timeoutAction: callOptions.timeoutAction ?? 'reconnect',
-          abortAction: callOptions.abortAction ?? 'reconnect',
+          timeoutAction: callOptions.timeoutAction
+            ?? (detachedHydrationAdvertised() ? 'reject' : 'reconnect'),
+          abortAction: callOptions.abortAction ?? 'reject',
         },
       )
       if (!isCurrent()) return false
@@ -743,19 +887,68 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
   async function unsubscribeSession(key = options.sessionKey.value) {
     cancelActiveSubscription()
     if (!key) return
-    try {
-      await options.rpc.call(
-        'sessions.messages.unsubscribe',
-        { key },
-        {
-          timeoutMs: 2_000,
-          timeoutAction: 'reject',
-          abortAction: 'reject',
-        },
+    retireLeasesFromPriorGenerations()
+    const lease = latestReleasableLease(key)
+    if (!lease) return
+    if (lease.releasePromise) return lease.releasePromise
+    lease.state = 'releasing'
+    if (activeLease === lease) activeLease = null
+    const expectedGeneration = lease.socketGeneration
+    const currentGeneration = options.rpc.connectionGeneration
+    // No subscribe frame was sent, or the physical connection that owned it
+    // has already gone away. Gateway disconnect cleanup is authoritative; an
+    // unsubscribe must never leak onto a replacement generation.
+    if (
+      expectedGeneration === null
+      || (
+        typeof currentGeneration === 'number'
+        && currentGeneration !== expectedGeneration
       )
-    } catch {
-      // Unsubscribe is best-effort during route changes and unmount.
+    ) {
+      retireLease(lease)
+      return
     }
+    const release = (async () => {
+      try {
+        await options.rpc.call(
+          'sessions.messages.unsubscribe',
+          { key },
+          {
+            timeoutMs: SESSION_PHASE_ATTEMPT_BUDGET_MS,
+            timeoutAction: 'reject',
+            abortAction: 'reject',
+            expectedGeneration,
+          },
+        )
+      } catch (cause) {
+        // A request-local timeout or abort is ambiguous: the serialized frame
+        // may still complete after the UI waiter stops observing it. Only an
+        // explicit Gateway rejection proves the release failed. Recover that
+        // exact generation in the explicit-failure case; the generation fence
+        // prevents a late cleanup from killing a replacement socket.
+        if (
+          !isRpcTimeout(cause)
+          && !isRpcAbort(cause)
+          && (
+            options.rpc.connectionGeneration === expectedGeneration
+            || options.rpc.connectionGeneration === undefined
+          )
+        ) {
+          options.rpc.recoverConnectionGeneration?.(
+            expectedGeneration,
+            'Failed to release the previous session subscription',
+          )
+        }
+        console.warn(
+          'Session stream unsubscribe failed:',
+          cause instanceof Error ? cause.message : cause,
+        )
+      } finally {
+        retireLease(lease)
+      }
+    })()
+    lease.releasePromise = release
+    return release
   }
 
   function applySessionRunState(source: ChatRunStatusSource | null | undefined) {

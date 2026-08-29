@@ -333,6 +333,7 @@ class FakeStorage:
         self.memory_durable_receipts: list[Any] = []
         self.list_agent_tasks_calls: list[str | None] = []
         self.list_agent_tasks_for_sessions_calls: list[tuple[str, ...]] = []
+        self.last_transcript_content_batch_calls: list[tuple[tuple[str, ...], int]] = []
 
     async def list_sessions(self, limit: int | None = None) -> list[FakeSession]:
         result = list(self._sessions.values())
@@ -371,6 +372,24 @@ class FakeStorage:
         if limit is not None:
             rows = rows[:limit]
         return rows
+
+    async def list_last_transcript_content_batch(
+        self,
+        session_ids: list[str],
+        *,
+        max_chars: int = 120,
+    ) -> dict[str, str]:
+        self.last_transcript_content_batch_calls.append((tuple(session_ids), max_chars))
+        result: dict[str, str] = {session_id: "" for session_id in session_ids}
+        for session_id in session_ids:
+            for entry in reversed(self._transcripts.get(session_id, [])):
+                if (
+                    getattr(entry, "role", None) in ("user", "assistant")
+                    and getattr(entry, "content", None)
+                ):
+                    result[session_id] = str(entry.content)[:max_chars]
+                    break
+        return result
 
     async def list_user_transcript_content_batch(
         self,
@@ -7067,6 +7086,40 @@ class TestSessionsDelete:
         } == set(matching_ids)
 
     @pytest.mark.asyncio
+    async def test_delete_evicts_only_the_deleted_session_stream(
+        self,
+        dispatcher,
+        session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        sibling_key = "agent:main:subagent:delete-stream-sibling"
+        streams = SessionStreamRegistry()
+        streams.record(
+            session.session_key,
+            "task.failed",
+            {"task_id": "task-deleted", "status": "failed"},
+        )
+        streams.record(
+            sibling_key,
+            "task.failed",
+            {"task_id": "task-sibling", "status": "failed"},
+        )
+        monkeypatch.setattr(rpc_sessions, "get_session_streams", lambda: streams)
+
+        res = await dispatcher.dispatch(
+            "delete-stream-eviction",
+            "sessions.delete",
+            {"key": session.session_key},
+            make_ctx(session_manager=FakeSessionManager([session])),
+        )
+
+        assert res.ok is True
+        assert streams.replay(session.session_key, 0).events == []
+        assert [
+            event.event_name for event in streams.replay(sibling_key, 0).events
+        ] == ["task.failed"]
+
+    @pytest.mark.asyncio
     async def test_delete_holds_lifecycle_fences_through_cleanup(
         self,
         dispatcher,
@@ -8764,6 +8817,36 @@ class TestSessionsSubscribe:
 
 
 class TestSessionsMessagesSubscribe:
+    @pytest.mark.asyncio
+    async def test_missing_subagent_is_rejected_before_replaying_failed_task(
+        self,
+        dispatcher,
+    ):
+        key = "agent:main:subagent:missing-replay"
+        streams = get_session_streams()
+        streams.record(
+            key,
+            "task.failed",
+            {"task_id": "task-missing", "status": "failed"},
+        )
+        subscriptions = SubscriptionManager()
+        try:
+            response = await dispatcher.dispatch(
+                "missing-subagent-subscribe",
+                "sessions.messages.subscribe",
+                {"key": key, "since_stream_seq": 0},
+                make_ctx(
+                    session_manager=FakeSessionManager([]),
+                    subscription_manager=subscriptions,
+                ),
+            )
+
+            assert response.ok is False
+            assert response.error.code == "SESSION_NOT_FOUND"
+            assert subscriptions.get_message_subscribers(key) == set()
+        finally:
+            streams.evict(key)
+
     @pytest.mark.asyncio
     async def test_messages_hydrate_uses_bounded_interactive_storage_scope(
         self,
@@ -10611,6 +10694,53 @@ class TestSessionsPreview:
         assert len(res.payload["previews"]) == 1
 
     @pytest.mark.asyncio
+    async def test_preview_uses_one_bounded_latest_message_projection(
+        self,
+        dispatcher,
+    ):
+        session = FakeSession(session_key="agent:main:preview", session_id="preview-id")
+        manager = FakeSessionManager([session])
+        manager._storage._transcripts[session.session_id] = [
+            SimpleNamespace(role="system", content="ignore this"),
+            SimpleNamespace(role="user", content="older message"),
+            SimpleNamespace(role="assistant", content="newest message"),
+        ]
+
+        async def fail_full_transcript_read(*args, **kwargs):
+            raise AssertionError("sessions.preview must not load the full transcript")
+
+        manager._storage.get_transcript = fail_full_transcript_read
+        ctx = make_ctx(session_manager=manager)
+
+        res = await dispatcher.dispatch("r1", "sessions.preview", None, ctx)
+
+        assert res.ok is True
+        assert res.payload["previews"][0]["lastMessage"] == "newest message"
+        assert manager._storage.last_transcript_content_batch_calls == [
+            ((session.session_id,), 120)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_preview_does_not_hide_projection_failures(
+        self,
+        dispatcher,
+        ctx_with_sessions,
+    ):
+        async def fail_projection(*args, **kwargs):
+            raise RuntimeError("projection failed")
+
+        ctx_with_sessions.session_manager._storage.list_last_transcript_content_batch = (
+            fail_projection
+        )
+
+        res = await dispatcher.dispatch("r1", "sessions.preview", None, ctx_with_sessions)
+
+        assert res.ok is False
+        assert res.error is not None
+        assert res.error.code == "INTERNAL_ERROR"
+        assert "projection failed" in res.error.message
+
+    @pytest.mark.asyncio
     async def test_preview_no_manager(self, dispatcher, ctx_no_manager):
         res = await dispatcher.dispatch("r1", "sessions.preview", None, ctx_no_manager)
         assert res.ok is True
@@ -10699,7 +10829,10 @@ class TestSessionsResolve:
 
         assert res.ok is False
         assert res.error.code == "INVALID_REQUEST"
-        assert "Ambiguous session id" in res.error.message
+        assert res.error.message == (
+            "Ambiguous session id 'abc'; matches: "
+            "agent:default:abc123, agent:bench:abc999"
+        )
 
     @pytest.mark.asyncio
     async def test_resolve_not_found(self, dispatcher, ctx_with_sessions):
@@ -10708,6 +10841,56 @@ class TestSessionsResolve:
         )
         assert res.ok is False
         assert res.error.code == "NOT_FOUND"
+        assert res.error.message == "'Session not found: nonexistent'"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("params", "message"),
+        [
+            (None, "params.key is required"),
+            ({}, "params.key is required"),
+            ({"key": 42}, "params.key must be a string"),
+        ],
+    )
+    async def test_resolve_preserves_invalid_request_messages(
+        self,
+        dispatcher,
+        ctx_with_sessions,
+        params,
+        message,
+    ):
+        res = await dispatcher.dispatch("r1", "sessions.resolve", params, ctx_with_sessions)
+
+        assert res.ok is False
+        assert res.error.code == "INVALID_REQUEST"
+        assert res.error.message == message
+
+    @pytest.mark.asyncio
+    async def test_resolve_preserves_missing_manager_error(self, dispatcher, ctx_no_manager):
+        res = await dispatcher.dispatch(
+            "r1", "sessions.resolve", {"key": "abc"}, ctx_no_manager
+        )
+
+        assert res.ok is False
+        assert res.error.code == "NOT_FOUND"
+        assert res.error.message == "'No session manager available'"
+
+    @pytest.mark.asyncio
+    async def test_resolve_requires_operator_read_scope(self, dispatcher, session):
+        ctx = make_ctx(
+            scopes=[],
+            session_manager=FakeSessionManager([session]),
+        )
+
+        res = await dispatcher.dispatch(
+            "r1", "sessions.resolve", {"key": session.session_key}, ctx
+        )
+
+        assert res.ok is False
+        assert res.error.code == "UNAUTHORIZED"
+        assert res.error.message == (
+            "Insufficient scope for method: sessions.resolve: missing operator.read"
+        )
 
     @pytest.mark.asyncio
     async def test_scope_enforcement(self, dispatcher, session):
@@ -10894,6 +11077,69 @@ class TestSessionsBootstrap:
         assert res.payload["runtime"]["model_routing"]["mode"] == "router"
         assert res.payload["epoch"] == 3
         assert res.payload["stream_cursor"] == stream["stream_seq"]
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_overlays_live_llm_for_session_direct_image_capability(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        class _Catalog:
+            def resolve_deployment_vision_support(self, *_args, **_kwargs) -> str:
+                return "supported"
+
+        monkeypatch.setattr(
+            "opensquilla.provider.model_catalog.shared_catalog",
+            lambda: _Catalog(),
+        )
+        key = "agent:main:webchat:bootstrap-direct-vision"
+        session = FakeSession(session_key=key, session_id="bootstrap-direct-vision")
+        manager = FakeSessionManager([session])
+
+        async def get_session_routing(
+            candidate: str,
+            *,
+            fallback_mode: str,
+        ) -> dict[str, Any]:
+            assert candidate == key
+            assert fallback_mode == "ensemble"
+            return {
+                "mode": "direct",
+                "revision": 3,
+                "source": "session",
+                "initialized": True,
+            }
+
+        manager.get_session_routing = get_session_routing  # type: ignore[attr-defined]
+        ctx = make_ctx(
+            session_manager=manager,
+            config=GatewayConfig(
+                workspace_dir=str(tmp_path / "workspace"),
+                llm={"provider": "openrouter", "model": "direct-vision"},
+                llm_ensemble={
+                    "enabled": True,
+                    "selection_mode": "static_openrouter_b5",
+                },
+                squilla_router={"enabled": False, "rollout_phase": "observe"},
+            ),
+        )
+
+        res = await dispatcher.dispatch(
+            "bootstrap-direct-vision",
+            "sessions.bootstrap",
+            {"key": key},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert res.payload["routing"]["mode"] == "direct"
+        assert res.payload["routing"]["revision"] == 3
+        assert res.payload["runtime"]["model_routing"]["mode"] == "direct"
+        assert res.payload["runtime"]["model_routing"]["image_input"] == {
+            "admission": "allowed",
+            "reason": "model_vision_supported",
+        }
 
     @pytest.mark.asyncio
     async def test_legacy_bootstrap_preserves_transcript_larger_than_one_mib(

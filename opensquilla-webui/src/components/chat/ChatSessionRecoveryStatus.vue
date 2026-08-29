@@ -26,7 +26,7 @@
       <span v-if="description">{{ description }}</span>
     </span>
     <button
-      v-if="isFailure"
+      v-if="isRetryableFailure"
       type="button"
       class="chat-session-recovery-status__retry btn btn--ghost"
       data-testid="chat-session-recovery-retry"
@@ -46,6 +46,7 @@ import type { ChatSessionRecoveryState } from '@/utils/chat/sessionLoadState'
 
 const props = defineProps<{
   state: ChatSessionRecoveryState
+  transportState?: 'disconnected' | 'connecting' | 'connected'
 }>()
 
 const emit = defineEmits<{
@@ -55,6 +56,11 @@ const emit = defineEmits<{
 const { t } = useI18n()
 const statusRef = ref<HTMLElement | null>(null)
 const isFailure = computed(() => (
+  props.state === 'history-error'
+  || props.state === 'live-degraded'
+  || props.state === 'session-missing'
+))
+const isRetryableFailure = computed(() => (
   props.state === 'history-error' || props.state === 'live-degraded'
 ))
 const isBusy = computed(() => !isFailure.value)
@@ -67,9 +73,15 @@ const title = computed(() => {
     case 'history-error':
       return t('chat.loadSessionFailed')
     case 'live-connecting':
-      return t('chat.liveConnecting')
+      return t(
+        props.transportState === 'connected'
+          ? 'chat.liveConnectingConnected'
+          : 'chat.gatewayReconnecting',
+      )
     case 'live-degraded':
       return t('chat.liveUnavailable')
+    case 'session-missing':
+      return t('chat.sessionCreated.missing')
   }
 })
 const description = computed(() => {
@@ -83,9 +95,15 @@ const description = computed(() => {
     case 'live-connecting':
       return ''
     case 'live-degraded':
-      return t('chat.liveUnavailableDescription')
-  }
-})
+      return t(
+        props.transportState === 'connected'
+          ? 'chat.liveUnavailableConnectedDescription'
+          : 'chat.liveUnavailableDescription',
+      )
+    case 'session-missing':
+      return ''
+    }
+  })
 const action = computed(() => (
   props.state === 'live-degraded'
     ? t('chat.reconnectLive')
@@ -122,7 +140,8 @@ function requestRetry() {
 }
 
 .chat-session-recovery-status--history-error,
-.chat-session-recovery-status--live-degraded {
+.chat-session-recovery-status--live-degraded,
+.chat-session-recovery-status--session-missing {
   background: color-mix(in srgb, var(--warn) 8%, var(--bg-surface));
   border-color: color-mix(in srgb, var(--warn) 35%, var(--border));
 }

@@ -86,6 +86,31 @@ async def test_session_history_supports_optional_cursors_without_changing_defaul
 
 
 @pytest.mark.asyncio
+async def test_list_sessions_uses_shared_contract_adapter_without_changing_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GatewayRPCClient()
+    calls: list[tuple[str, dict[str, object]]] = []
+    expected: dict[str, object] = {
+        "sessions": [],
+        "count": 0,
+        "ts": 1,
+        "future": {"kept": True},
+    }
+
+    async def fake_call(method: str, params: dict[str, object]) -> dict[str, object]:
+        calls.append((method, params))
+        return expected
+
+    monkeypatch.setattr(client, "call", fake_call)
+
+    result = await client.list_sessions(limit=23)
+
+    assert calls == [("sessions.list", {"limit": 23})]
+    assert result is expected
+
+
+@pytest.mark.asyncio
 async def test_gateway_connect_closes_socket_after_bad_handshake(monkeypatch) -> None:
     class BadHandshakeWebSocket(_SilentWebSocket):
         async def recv(self) -> str:

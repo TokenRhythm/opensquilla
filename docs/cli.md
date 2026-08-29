@@ -245,7 +245,7 @@ Raw config:
 
 ```sh
 opensquilla config get llm.provider
-opensquilla config set gateway.port 18791
+opensquilla config set port 18791
 ```
 
 More detail:

@@ -5,6 +5,7 @@ import {
   shouldCanonicalizeInitialDraftRoute,
   useChatSessionRoute,
 } from './useChatSessionRoute'
+import { RECENT_DRAFT_SESSION_KEY } from './useChatDraftPersistence'
 
 const { routeMock, routerMock } = vi.hoisted(() => ({
   routeMock: {
@@ -48,6 +49,78 @@ describe('useChatSessionRoute', () => {
 
     expect(route.draftAgentId()).toBe('main')
     expect(route.resolveInitialSession().sessionKey).toMatch(/^agent:main:webchat:[a-z0-9]+$/)
+  })
+
+  it('recovers a provisional new-task draft on a cold /chat/new entry', () => {
+    const key = 'agent:main:webchat:cold-draft'
+    localStorage.setItem(`opensquilla.chat.draft:${key}`, 'unfinished task')
+    localStorage.setItem(RECENT_DRAFT_SESSION_KEY, key)
+    const route = useChatSessionRoute(ref(''))
+
+    expect(route.resolveInitialSession()).toEqual({
+      sessionKey: key,
+      hasUrlSession: false,
+      draft: true,
+      recoveredDraft: true,
+    })
+  })
+
+  it('recovers an existing active session draft as a routable session', () => {
+    const key = 'agent:main:webchat:existing'
+    localStorage.setItem('opensquilla_active_session', key)
+    localStorage.setItem(`opensquilla.chat.draft:${key}`, 'unfinished reply')
+    localStorage.setItem(RECENT_DRAFT_SESSION_KEY, key)
+    const route = useChatSessionRoute(ref(''))
+
+    expect(route.resolveInitialSession()).toEqual({
+      sessionKey: key,
+      hasUrlSession: false,
+      draft: false,
+      recoveredDraft: true,
+    })
+  })
+
+  it('does not recover a previous draft for an explicit new task', () => {
+    const key = 'agent:main:webchat:previous'
+    localStorage.setItem(`opensquilla.chat.draft:${key}`, 'do not restore')
+    localStorage.setItem(RECENT_DRAFT_SESSION_KEY, key)
+    const route = useChatSessionRoute(ref(''))
+
+    const initial = route.resolveInitialSession({ recoverDraft: false })
+
+    expect(initial.sessionKey).not.toBe(key)
+    expect(initial).toMatchObject({ draft: true, recoveredDraft: false })
+  })
+
+  it('does not recover a draft after it was sent or cleared', () => {
+    const key = 'agent:main:webchat:sent'
+    localStorage.setItem(RECENT_DRAFT_SESSION_KEY, key)
+    const route = useChatSessionRoute(ref(''))
+
+    const initial = route.resolveInitialSession()
+
+    expect(initial.sessionKey).not.toBe(key)
+    expect(initial.recoveredDraft).toBe(false)
+    expect(localStorage.getItem(RECENT_DRAFT_SESSION_KEY)).toBeNull()
+  })
+
+  it('does not let Agent or project draft entries recover an unrelated recent draft', () => {
+    const key = 'agent:main:webchat:previous'
+    localStorage.setItem(`opensquilla.chat.draft:${key}`, 'do not restore')
+    localStorage.setItem(RECENT_DRAFT_SESSION_KEY, key)
+    routeMock.query = { agent: 'research' }
+    const route = useChatSessionRoute(ref(''))
+
+    expect(route.resolveInitialSession()).toMatchObject({
+      sessionKey: expect.stringMatching(/^agent:research:webchat:/),
+      recoveredDraft: false,
+    })
+
+    routeMock.query = { agent: 'main', project: 'project-a' }
+    expect(route.resolveInitialSession()).toMatchObject({
+      sessionKey: expect.stringMatching(/^agent:main:webchat:/),
+      recoveredDraft: false,
+    })
   })
 
   it('keeps only the project id in a project draft route and can return to a default draft', () => {

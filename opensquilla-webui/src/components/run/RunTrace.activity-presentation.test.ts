@@ -9,6 +9,7 @@ import type {
   ChatToolCallGroup,
   ChatToolCallRenderItem,
 } from '@/types/chat'
+import { BROWSER_WORKBENCH_OPEN_EVENT } from '@/workbench/browserItems'
 import runTraceSource from './RunTrace.vue?raw'
 
 const mountedApps: App[] = []
@@ -72,6 +73,7 @@ async function mountTimeline(
   items: ChatStreamTimelineItem[],
   options: {
     presentation?: 'activity'
+    groupOpen?: boolean
     itemOpen?: boolean
     onShowResult?: (content: string, title: string, context?: unknown) => void
     toolStatusText?: (call: ChatToolCallRenderItem) => string
@@ -85,7 +87,7 @@ async function mountTimeline(
       return () => h(ToolCallTimeline, {
         items,
         ...(options.presentation ? { presentation: options.presentation } : {}),
-        isToolGroupOpen: () => false,
+        isToolGroupOpen: () => options.groupOpen === true,
         isToolItemOpen: () => options.itemOpen === true,
         toolGroupStatusText: (toolGroup: ChatToolCallGroup) => {
           if (toolGroup.isRunning) return 'Running'
@@ -400,6 +402,110 @@ describe('RunTrace activity presentation', () => {
     expect(el.querySelector('.activity-tool-details')).toBeNull()
   })
 
+  it('keeps search URLs collapsed without exposing invocation details', async () => {
+    const inputRaw = JSON.stringify({ query: 'AI news today 2026-08-26' })
+    const el = await mountTimeline([
+      group('web.search', [
+        call('search-call', {
+          name: 'web_search',
+          inputRaw,
+          inputPreview: inputRaw,
+          sources: [{ url: 'https://example.test/result', title: 'Result' }],
+          result: JSON.stringify({
+            ok: true,
+            provider_attempts: [{ provider: 'brave', status: 'success' }],
+          }),
+        }),
+      ]),
+    ], { presentation: 'activity' })
+
+    const row = el.querySelector('.tool-row')
+    expect(row?.getAttribute('aria-expanded')).toBe('false')
+    expect(el.querySelector('.step-chevron')).not.toBeNull()
+    expect(el.querySelector('.tool-row-targets')).toBeNull()
+    expect(el.querySelector('.tool-row-body')).toBeNull()
+    expect(el.querySelector('.activity-tool-details')).toBeNull()
+    expect(el.textContent).not.toMatch(/INPUT|RESULT|provider_attempts/)
+  })
+
+  it('lists web-search result URLs as side-browser targets without exposing the query', async () => {
+    const opened: string[] = []
+    const onOpen = (event: Event) => {
+      opened.push((event as CustomEvent<{ url: string }>).detail.url)
+    }
+    window.addEventListener(BROWSER_WORKBENCH_OPEN_EVENT, onOpen)
+
+    const searchCall = (id: string, urls: string[]) => call(id, {
+      name: 'web_search',
+      inputRaw: '{}',
+      inputPreview: '',
+      sources: urls.map(url => ({ url, title: id })),
+      presentation: {
+        category: 'search',
+        primaryArguments: [],
+        argumentDisplay: 'primary',
+        lifecycleDisplay: 'boundary',
+      },
+    })
+    const el = await mountTimeline([
+      group('web.search', [
+        searchCall('first result', [
+          'https://example.test/one',
+          'https://example.test/two',
+        ]),
+        searchCall('second result', ['https://docs.example.test/three']),
+      ]),
+    ], { presentation: 'activity', groupOpen: true, itemOpen: true })
+
+    try {
+      const groupRow = el.querySelector('.tool-row--group')
+      const memberRows = el.querySelectorAll('.tool-row--member')
+      const urlTargets = el.querySelectorAll<HTMLButtonElement>('.tool-row-target--url')
+
+      expect(groupRow?.getAttribute('aria-expanded')).toBe('true')
+      expect(memberRows).toHaveLength(2)
+      expect(Array.from(memberRows).every(row => row.getAttribute('aria-expanded') === 'true')).toBe(true)
+      expect(urlTargets).toHaveLength(3)
+      expect(urlTargets[0]?.textContent).toContain('example.test/one')
+      expect(memberRows[0]?.textContent).toContain('2 results')
+      expect(el.textContent).not.toMatch(/INPUT|RESULT|query|provider_attempts/)
+      expect(el.querySelector('.activity-tool-details')).toBeNull()
+
+      urlTargets[0]?.click()
+      expect(opened).toEqual(['https://example.test/one'])
+    } finally {
+      window.removeEventListener(BROWSER_WORKBENCH_OPEN_EVENT, onOpen)
+    }
+  })
+
+  it('shows a file-read path as plain text without making it clickable or expandable', async () => {
+    const inputRaw = JSON.stringify({ path: 'src/App.vue' })
+    const el = await mountTimeline([
+      group('file.inspect', [call('read-file', {
+        name: 'read_file',
+        inputRaw,
+        inputPreview: inputRaw,
+        result: 'private file contents',
+        resultPreview: 'private file contents',
+        presentation: {
+          category: 'file_read',
+          primaryArguments: ['path'],
+          argumentDisplay: 'primary',
+          lifecycleDisplay: 'boundary',
+        },
+      })]),
+    ], { presentation: 'activity', itemOpen: true })
+
+    const row = el.querySelector('.tool-row')
+    const path = el.querySelector('.tool-row-target--path')
+    expect(row?.hasAttribute('aria-expanded')).toBe(false)
+    expect(path?.tagName).toBe('SPAN')
+    expect(path?.textContent).toBe('src/App.vue')
+    expect(el.querySelector('.tool-row-target--url')).toBeNull()
+    expect(el.querySelector('.activity-tool-details')).toBeNull()
+    expect(el.textContent).not.toMatch(/INPUT|RESULT|private file contents/)
+  })
+
   it.each([undefined, 'activity' as const])(
     'removes successful document disclosure in %s presentation',
     async (presentation) => {
@@ -509,15 +615,13 @@ describe('RunTrace activity presentation', () => {
     },
   )
 
-  it('shows long activity details in one bounded preview and preserves raw forwarding', async () => {
-    const result = 'file contents\n'.repeat(30)
+  it('shows long generic-tool details in one bounded preview and preserves raw forwarding', async () => {
+    const result = 'custom tool result\n'.repeat(30)
     const onShowResult = vi.fn()
-    // A read-shaped call: content-size summaries are reserved for read
-    // operations, so this is the compact-summary path.
     const el = await mountTimeline([
       group('long-result-group', [
         call('long-result', {
-          name: 'read_file',
+          name: 'custom_tool',
           result,
           resultPreview: result.slice(0, 200),
         }),
@@ -535,7 +639,7 @@ describe('RunTrace activity presentation', () => {
     )
     expect(details).not.toBeNull()
     expect(details?.classList.contains('activity-tool-details--bounded')).toBe(true)
-    expect(window?.textContent).toContain('file contents')
+    expect(window?.textContent).toContain('custom tool result')
     expect(window?.textContent).toContain('view full')
     expect(el.querySelector('.activity-tool-details__summary')).toBeNull()
     expect(el.querySelectorAll('.activity-tool-details__window')).toHaveLength(1)
@@ -550,7 +654,7 @@ describe('RunTrace activity presentation', () => {
       `INPUT\n{}\n\nRESULT\n${result.trim()}`,
       'long-result-group · details',
       {
-        toolName: 'read_file',
+        toolName: 'custom_tool',
         inputRaw: '{}',
         section: undefined,
       },

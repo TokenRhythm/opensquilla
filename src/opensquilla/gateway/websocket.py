@@ -89,6 +89,7 @@ _CONCURRENT_OPTIONAL_READ_METHODS: frozenset[str] = frozenset(
         "onboarding.status",
         "sandbox.run_mode.preference.get",
         "sessions.list",
+        "sessions.messages.hydrate",
         "usage.status",
         "workspaces.list",
     }
@@ -361,6 +362,16 @@ class WsConnection:
                 meta=meta,
             )
             self._enqueue_frame(frame)
+            # A producer can emit hundreds of tool/text deltas through an
+            # await chain whose queue fast path never actually suspends. Give
+            # the healthy writer a chance to drain at half capacity before a
+            # cooperative burst mistakes event-loop starvation for a slow
+            # consumer and force-closes the connection at the hard limit.
+            if (
+                not self._closing
+                and self._outbox.qsize() >= max(1, self._writer_queue_maxsize // 2)
+            ):
+                await asyncio.sleep(0)
             return
         # Legacy direct-send path (pre-auth, kill-switch off, or post-stop).
         async with self._send_lock:
@@ -1274,16 +1285,22 @@ async def _message_loop(
                 raw = await ws.receive_text()
         except WebSocketDisconnect:
             return
+        except RuntimeError:
+            if (
+                conn._closing
+                or ws.application_state != WebSocketState.CONNECTED
+                or ws.client_state != WebSocketState.CONNECTED
+            ):
+                return
+            raise
         except TimeoutError:
             log.warning(
                 "gateway.client_ws_keepalive_timeout",
                 conn_id=conn.conn_id,
                 timeout_s=keepalive_timeout,
             )
-            try:
-                await ws.close(code=1011)
-            except Exception:  # noqa: BLE001
-                pass
+            await conn._stop_writer()
+            await conn.close(code=1011)
             return
 
         try:

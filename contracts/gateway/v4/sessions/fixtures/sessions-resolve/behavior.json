@@ -1,0 +1,36 @@
+{
+  "format_version": 1,
+  "kind": "behavior",
+  "cases": [
+    {
+      "id": "behavior.exact-first",
+      "coverage": "lookup-order",
+      "expectation": "exact",
+      "invariant": "storage.get_session(canonical_key) wins before any fuzzy scan"
+    },
+    {
+      "id": "behavior.unique-fallback",
+      "coverage": "bounded-fallback",
+      "expectation": "exact",
+      "invariant": "at most 500 sessions are scanned and a session_key, session_id, display_name or derived_title exact-or-prefix match is accepted only when unique"
+    },
+    {
+      "id": "behavior.ambiguous",
+      "coverage": "ambiguity",
+      "expectation": "exact",
+      "invariant": "multiple matches produce INVALID_REQUEST and list at most five session keys"
+    },
+    {
+      "id": "behavior.workspace",
+      "coverage": "workspace-projection",
+      "expectation": "exact",
+      "invariant": "workspaceId is returned without path validation and projectWorkspaceDeferred is its truthiness"
+    },
+    {
+      "id": "behavior.scope",
+      "coverage": "permissions",
+      "expectation": "exact",
+      "invariant": "operator.read is required and anonymous guests are not allowed"
+    }
+  ]
+}

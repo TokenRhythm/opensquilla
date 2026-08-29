@@ -4851,6 +4851,56 @@ describe('useSetupCatalog configured provider management', () => {
     app.unmount()
   })
 
+  it('turns the Router off instead of surfacing router_provider_conflict when active removal would leave a foreign tier', async () => {
+    const status = {
+      ...statusWithDeepSeek(),
+      llmProfileStatus: statusWithDeepSeek().llmProfileStatus.map(profile => (
+        profile.provider === 'deepseek'
+          ? { ...profile, primaryEligible: true, primaryBlockReason: '' }
+          : profile
+      )),
+    }
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return { providers }
+      if (method === 'onboarding.status') return status
+      if (method === 'channels.status') return { channels: [] }
+      // A custom Router whose tiers still name the *current* primary (openai).
+      // Removing openai promotes deepseek, which the backend would reject with
+      // router_provider_conflict while cross-provider routing is off. The client
+      // must mirror activateProvider and send routerAction: 'disable' instead.
+      if (method === 'config.get') {
+        return {
+          ...configWithProfiles('deepseek'),
+          squilla_router: {
+            enabled: true,
+            cross_provider_tiers: false,
+            preset_binding: 'custom',
+            tiers: { c0: { provider: 'openai', model: 'gpt-4.1-mini' } },
+          },
+          llm_ensemble: { enabled: false },
+        }
+      }
+      if (method === 'onboarding.models.discover') {
+        return { ok: true, source: 'none', models: [] }
+      }
+      if (method === 'onboarding.llmProfile.active.remove') return { changed: true }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    await api.removeProviderProfile('openai')
+
+    expect(rpcCall).toHaveBeenCalledWith('onboarding.llmProfile.active.remove', {
+      providerId: 'openai',
+      replacementProviderId: 'deepseek',
+      routerAction: 'disable',
+    })
+    expect(pushToast).toHaveBeenCalledWith(
+      'OpenAI was removed. Model Routing was turned off because its saved tiers use another provider.',
+    )
+    app.unmount()
+  })
+
   it('requests the OpenRouter image default when active removal promotes that profile', async () => {
     const openrouter = {
       providerId: 'openrouter',

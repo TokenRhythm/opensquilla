@@ -6,6 +6,9 @@ import re
 import secrets
 from typing import Any
 
+from opensquilla.contracts.generated.v4.sessions_list_metadata import (
+    SESSIONS_LIST_METHOD,
+)
 from opensquilla.session.keys import canonicalize_session_key, parse_agent_id
 
 _OWNER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -19,7 +22,7 @@ GUEST_RPC_ALLOWLIST = frozenset(
         "chat.clarify_submit",
         "artifacts.list",
         "artifacts.get",
-        "sessions.list",
+        SESSIONS_LIST_METHOD,
         "sessions.rename",
         "sessions.delete",
         "sessions.bootstrap",
@@ -59,6 +62,15 @@ _SESSION_KEY_FIELDS = {
 
 class GuestRpcPolicyError(PermissionError):
     """Raised when an anonymous guest crosses the RPC ownership boundary."""
+
+
+def is_guest_rpc_method_allowed(method: str) -> bool:
+    """Return the legacy allowlist decision used for Contract drift checks.
+
+    Ownership and sanitization stay in ``GuestRpcPolicy`` until contracted.
+    """
+
+    return method in GUEST_RPC_ALLOWLIST
 
 
 def _guest_namespace_parts(session_key: object) -> tuple[str, str] | None:
@@ -134,7 +146,7 @@ class GuestRpcPolicy:
 
         if not cls.is_guest(ctx):
             return params
-        if method not in GUEST_RPC_ALLOWLIST:
+        if not is_guest_rpc_method_allowed(method):
             raise GuestRpcPolicyError("Anonymous guest RPC method is not allowed")
 
         owner_id = getattr(ctx.principal, "guest_owner_id", None)
@@ -151,7 +163,7 @@ class GuestRpcPolicy:
             params.pop("initialRoutingMode", None)
             params.pop("initial_routing_mode", None)
 
-        if method == "sessions.list":
+        if method == SESSIONS_LIST_METHOD:
             return params
 
         if method == "chat.send":
@@ -210,4 +222,5 @@ __all__ = [
     "GuestRpcPolicyError",
     "guest_owned_session_key",
     "guest_owns_session_key",
+    "is_guest_rpc_method_allowed",
 ]

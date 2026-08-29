@@ -1,4 +1,4 @@
-"""Tests for SessionStorage count contracts.
+"""Tests for SessionStorage count and bounded preview contracts.
 
 Pins the transcript batch contract used by rpc_sessions.list and the exact
 stored-session total used by the Overview KPI. Behaviour requirements:
@@ -6,6 +6,7 @@ stored-session total used by the Overview KPI. Behaviour requirements:
 - Single id matches the legacy single-id path.
 - Many ids (>500) chunk correctly and still return one entry per id.
 - Sessions with no transcript entries are explicitly mapped to 0, not absent.
+- Preview reads return only the newest eligible message and stay character-bounded.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from opensquilla.gateway.guest_rpc_policy import guest_owned_session_key
-from opensquilla.session.models import SessionNode
+from opensquilla.session.models import SessionNode, TranscriptEntry
 from opensquilla.session.storage import SessionStorage
 
 
@@ -99,6 +100,114 @@ async def test_batch_count_chunks_above_500(storage: SessionStorage) -> None:
     for sid in all_ids:
         if sid not in counts:
             assert result[sid] == 0
+
+
+async def test_last_transcript_content_batch_returns_bounded_latest_message(
+    storage: SessionStorage,
+) -> None:
+    await _seed_session(storage, "sid-preview", 0)
+    await storage.append_transcript_entry(
+        TranscriptEntry(
+            session_id="sid-preview",
+            session_key="agent:test:sid-preview",
+            message_id="system-old",
+            role="system",
+            content="system content should not be shown",
+            created_at=1,
+        )
+    )
+    await storage.append_transcript_entry(
+        TranscriptEntry(
+            session_id="sid-preview",
+            session_key="agent:test:sid-preview",
+            message_id="user-old",
+            role="user",
+            content="older user message",
+            created_at=2,
+        )
+    )
+    await storage.append_transcript_entry(
+        TranscriptEntry(
+            session_id="sid-preview",
+            session_key="agent:test:sid-preview",
+            message_id="assistant-new",
+            role="assistant",
+            content="newest assistant message " + ("x" * 200),
+            created_at=3,
+        )
+    )
+    await storage.append_transcript_entry(
+        TranscriptEntry(
+            session_id="sid-preview",
+            session_key="agent:test:sid-preview",
+            message_id="empty-latest",
+            role="user",
+            content="",
+            created_at=4,
+        )
+    )
+
+    result = await storage.list_last_transcript_content_batch(
+        ["sid-preview", "missing"],
+        max_chars=10,
+    )
+
+    assert result == {
+        "sid-preview": "newest ass",
+        "missing": "",
+    }
+
+
+async def test_last_transcript_content_batch_uses_id_as_tie_breaker(
+    storage: SessionStorage,
+) -> None:
+    await _seed_session(storage, "sid-tie", 0)
+    for message_id, content in (("tie-a", "first"), ("tie-b", "second")):
+        await storage.append_transcript_entry(
+            TranscriptEntry(
+                session_id="sid-tie",
+                session_key="agent:test:sid-tie",
+                message_id=message_id,
+                role="user",
+                content=content,
+                created_at=10,
+            )
+        )
+
+    result = await storage.list_last_transcript_content_batch(["sid-tie"])
+
+    assert result["sid-tie"] == "second"
+
+
+async def test_last_transcript_content_batch_chunks_large_session_lists(
+    storage: SessionStorage,
+) -> None:
+    session_ids = [f"sid-{index}" for index in range(301)]
+    await storage.append_transcript_entry(
+        TranscriptEntry(
+            session_id=session_ids[0],
+            session_key="agent:test:sid-0",
+            role="assistant",
+            content="first chunk",
+            created_at=1,
+        )
+    )
+    await storage.append_transcript_entry(
+        TranscriptEntry(
+            session_id=session_ids[-1],
+            session_key=f"agent:test:{session_ids[-1]}",
+            role="user",
+            content="second chunk",
+            created_at=1,
+        )
+    )
+
+    result = await storage.list_last_transcript_content_batch(session_ids)
+
+    assert len(result) == len(session_ids)
+    assert result[session_ids[0]] == "first chunk"
+    assert result[session_ids[-1]] == "second chunk"
+    assert result[session_ids[1]] == ""
 
 
 async def test_session_count_can_scope_to_one_guest_owner(

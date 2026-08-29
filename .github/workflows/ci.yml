@@ -108,6 +108,9 @@ jobs:
             echo "- Artifact: \`${ARTIFACT_NAME}\`"
             echo "- Queue base/head/tree: \`${QUEUE_BASE_SHA}\` / \`${QUEUE_HEAD_SHA}\` / \`${QUEUE_TREE_SHA}\`"
             echo "- Combined-tree domain smokes: \`${COMBINED_SMOKE_SUITES}\`"
+            if [[ "${REASON_CODE}" == "tree_mismatch" ]]; then
+              echo "- Fast-path note: the PR evidence does not match this queue tree, so this entry runs the full fail-closed matrix. If main advanced, refresh the PR against the latest main and wait for a new green PR CI run before requeueing. Reuse is always decided against the future entry's exact base and tree."
+            fi
             if [[ -n "${SOURCE_RUN_ID}" ]]; then
               echo "- Source run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}"
             fi
@@ -167,9 +170,15 @@ jobs:
               if [[ "${CI_OPTIMIZATION_MODE}" == "legacy" ]]; then
                 printf '.ci/run-all\n' > "${changed_files}"
               else
-                git diff --no-renames --name-only \
-                  "${{ github.event.pull_request.base.sha }}" \
-                  "${{ github.event.pull_request.head.sha }}" > "${changed_files}"
+                base_sha="${{ github.event.pull_request.base.sha }}"
+                head_sha="${{ github.event.pull_request.head.sha }}"
+                if git diff --merge-base --no-renames --name-only \
+                  "${base_sha}" "${head_sha}" -- > "${changed_files}"; then
+                  echo "Planning PR-owned changes from the merge base."
+                else
+                  echo "Unable to derive the PR-owned change set; running the full fail-closed matrix." >&2
+                  printf '.ci/run-all\n' > "${changed_files}"
+                fi
               fi
               ;;
             merge_group)
@@ -387,6 +396,55 @@ jobs:
         working-directory: opensquilla-webui
         run: npm ci
 
+      - name: Set up Python for Contract generation
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv for Contract generation
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install pinned Contract generators
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+        run: uv sync --only-group dev --frozen
+
+      - name: Verify deterministic Contract generation
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+        shell: bash
+        run: |
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --check
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --verify-determinism
+
+      - name: Run real Gateway Contract toolchain integration
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+        env:
+          OPENSQUILLA_RUN_CONTRACT_TOOLCHAIN_INTEGRATION: "1"
+          PYTHONPATH: "${{ github.workspace }}:${{ github.workspace }}/src"
+        run: >-
+          uv run --no-sync pytest -q
+          --confcutdir=tests/contracts
+          tests/contracts
+
+      - name: Write Linux Gateway Contract hash manifest
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+        run: >-
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py
+          --hash-manifest "${RUNNER_TEMP}/gateway-contract-hashes.json"
+
+      - name: Upload Linux Gateway Contract hash manifest
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-contract-hashes-linux
+          path: ${{ runner.temp }}/gateway-contract-hashes.json
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
       - name: Run frontend type checks
         if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
         working-directory: opensquilla-webui
@@ -442,6 +500,67 @@ jobs:
           python scripts/verify_webui_artifact.py \
             --forbid-personal-bgm \
             --wheel "${wheels[0]}"
+
+  gateway-contract-windows:
+    name: Gateway Contract determinism (Windows)
+    needs: [plan-ci, frontend-check]
+    if: >-
+      ${{ always()
+          && needs.plan-ci.result == 'success'
+          && needs.frontend-check.result == 'success'
+          && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+          cache: npm
+          cache-dependency-path: opensquilla-webui/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: opensquilla-webui
+        run: npm ci
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install pinned Contract generators
+        run: uv sync --only-group dev --frozen
+
+      - name: Verify Windows Contract generation and real toolchain
+        env:
+          OPENSQUILLA_RUN_CONTRACT_TOOLCHAIN_INTEGRATION: "1"
+          PYTHONPATH: "${{ github.workspace }};${{ github.workspace }}/src"
+        run: |
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --check
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --verify-determinism
+          uv run --no-sync pytest -q --confcutdir=tests/contracts tests/contracts
+
+      - name: Download Linux Gateway Contract hash manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: gateway-contract-hashes-linux
+          path: ${{ runner.temp }}/gateway-contract-hashes-linux
+
+      - name: Compare Linux and Windows Contract hashes
+        shell: pwsh
+        run: |
+          $windowsManifest = Join-Path $env:RUNNER_TEMP "gateway-contract-hashes-windows.json"
+          $linuxManifest = Join-Path $env:RUNNER_TEMP "gateway-contract-hashes-linux/gateway-contract-hashes.json"
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --hash-manifest $windowsManifest
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --compare-hash-manifests $linuxManifest $windowsManifest
 
   webui-chat-recovery:
     name: WebUI chat recovery
@@ -520,6 +639,7 @@ jobs:
           composer-paste.spec.ts
           history-hydration.spec.ts
           session-created-card.spec.ts
+          session-switch-transport.spec.ts
           goal-mode.spec.ts
           queue-steer.spec.ts
           share.spec.ts
@@ -1358,6 +1478,28 @@ jobs:
                   ),
               },
               {
+                  "id": "windows-loopback-no-buffer-space-v1",
+                  "os": "Windows",
+                  "cases": {"offline-document-workbench-e2e"},
+                  "pattern": re.compile(
+                      r"^electronApplication\.evaluate: Error: "
+                      r"ERR_NO_BUFFER_SPACE \(-176\) loading "
+                      r"'http://127\.0\.0\.1:\d+/one'$",
+                      re.MULTILINE,
+                  ),
+                  # Chromium reports the socket-allocation failure first; the
+                  # outer Workbench runner then reports the exact failed child.
+                  # Remove only that wrapper so any separate assertion, crash,
+                  # or product error still blocks the retry below.
+                  "companion_patterns": (
+                      re.compile(
+                          r"^Error: .*test-native-workbench-v2-electron\.mjs "
+                          r"failed with exit code 1$",
+                          re.MULTILINE,
+                      ),
+                  ),
+              },
+              {
                   "id": "macos-electron-foreground-prerequisite-v1",
                   "os": "macOS",
                   "cases": {"offline-document-workbench-e2e"},
@@ -1824,6 +1966,7 @@ jobs:
       - readme-locale-check
       - frontend-artifact
       - frontend-check
+      - gateway-contract-windows
       - webui-chat-recovery
       - tui-check
       - desktop-check
@@ -1908,6 +2051,7 @@ jobs:
           RESULT_README_LOCALE: ${{ needs.readme-locale-check.result }}
           RESULT_FRONTEND_ARTIFACT: ${{ needs.frontend-artifact.result }}
           RESULT_FRONTEND: ${{ needs.frontend-check.result }}
+          RESULT_CONTRACT_WINDOWS: ${{ needs.gateway-contract-windows.result }}
           RESULT_TUI: ${{ needs.tui-check.result }}
           RESULT_DESKTOP: ${{ needs.desktop-check.result }}
           RESULT_UBUNTU: ${{ needs.ubuntu-quality.result }}

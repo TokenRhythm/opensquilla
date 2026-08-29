@@ -1,0 +1,402 @@
+{
+  "format_version": 1,
+  "kind": "response",
+  "clock_ms": 1700000000000,
+  "cases": [
+    {
+      "id": "response.empty-legacy",
+      "coverage": "empty-legacy",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "response.empty-legacy",
+        "ok": true,
+        "payload": {
+          "sessions": [],
+          "count": 0,
+          "ts": 1700000000000
+        },
+        "error": null
+      }
+    },
+    {
+      "id": "response.empty-page",
+      "coverage": "empty-page",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "response.empty-page",
+        "ok": true,
+        "payload": {
+          "sessions": [],
+          "count": 0,
+          "ts": 1700000000000,
+          "has_more": false,
+          "hasMore": false,
+          "next_cursor": null,
+          "nextCursor": null
+        },
+        "error": null
+      }
+    },
+    {
+      "id": "response.count-201",
+      "coverage": "count",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "response.count-201",
+        "ok": true,
+        "payload": {
+          "sessions": [],
+          "count": 0,
+          "totalCount": 201,
+          "total_count": 201,
+          "ts": 1700000000000
+        },
+        "error": null
+      },
+      "source": "tests/test_gateway/test_rpc_sessions.py:test_count_view_returns_exact_total_beyond_list_page_limit"
+    },
+    {
+      "id": "response.full-open-row",
+      "coverage": "full-open-row",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "response.full-open-row",
+        "ok": true,
+        "payload": {
+          "sessions": [
+            {
+              "key": "agent:main:webchat:default",
+              "agent_id": "main",
+              "agentId": "main",
+              "status": "idle",
+              "model": "openai/gpt-5",
+              "updated_at": 1699999999000,
+              "updatedAt": 1699999999000,
+              "display_name": "Planning chat",
+              "displayName": "Planning chat",
+              "channel": null,
+              "chat_type": "unknown",
+              "chatType": "unknown",
+              "group_id": null,
+              "groupId": null,
+              "subject": null,
+              "last_channel": null,
+              "lastChannel": null,
+              "last_to": null,
+              "lastTo": null,
+              "last_account_id": null,
+              "lastAccountId": null,
+              "last_thread_id": null,
+              "lastThreadId": null,
+              "delivery_context": {
+                "channel_id": "browser"
+              },
+              "deliveryContext": {
+                "channel_id": "browser"
+              },
+              "parent_session_key": null,
+              "parentSessionKey": null,
+              "spawned_by": null,
+              "spawnedBy": null,
+              "spawn_depth": 0,
+              "spawnDepth": 0,
+              "forked_from_parent": false,
+              "forkedFromParent": false,
+              "origin": {
+                "kind": "webchat",
+                "extension": {
+                  "future": true
+                }
+              },
+              "workspace_id": null,
+              "workspaceId": null,
+              "message_count": 0,
+              "entry_count": 0,
+              "size_bytes": null,
+              "source_kind": "webchat",
+              "sourceKind": "webchat",
+              "channel_kind": "webchat",
+              "channelKind": "webchat",
+              "channel_id": null,
+              "channelId": null,
+              "tasks": [],
+              "active_task": null,
+              "last_task": null,
+              "run_status": "idle",
+              "sessionId": "session-default",
+              "effectiveAgentId": "main",
+              "sessionKind": "chat",
+              "surface": "webchat",
+              "conversationKind": "direct",
+              "thread": null,
+              "title": "Planning chat",
+              "subtitle": "main",
+              "groupLabel": "Web chat",
+              "lastActivityAt": 1699999999000,
+              "messageCount": 0,
+              "runStatus": "idle",
+              "interactive": true,
+              "channelContext": null,
+              "parent": null,
+              "cron": null
+            }
+          ],
+          "count": 1,
+          "ts": 1700000000000
+        },
+        "error": null
+      },
+      "setup": {
+        "clock_ms": 1700000000000,
+        "session": {
+          "session_key": "agent:main:webchat:default",
+          "session_id": "session-default",
+          "status": "idle",
+          "updated_at": 1699999999000,
+          "display_name": "Planning chat",
+          "model": "openai/gpt-5",
+          "delivery_context": {
+            "channel_id": "browser"
+          },
+          "origin": {
+            "kind": "webchat",
+            "extension": {
+              "future": true
+            }
+          }
+        }
+      },
+      "compatibility_note": "The origin.extension field is intentionally unknown to the current UI contract and must survive an adapter round trip."
+    },
+    {
+      "id": "response.current-task-parent",
+      "coverage": "current-nonempty-task-parent",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "response.current-task-parent",
+        "ok": true,
+        "payload": {
+          "sessions": [
+            {
+              "key": "agent:main:subagent:child",
+              "agent_id": "main",
+              "agentId": "main",
+              "status": "killed",
+              "model": "openai/gpt-5",
+              "updated_at": 900,
+              "updatedAt": 900,
+              "display_name": "Inspect checkout failures",
+              "displayName": "Inspect checkout failures",
+              "channel": null,
+              "chat_type": "unknown",
+              "chatType": "unknown",
+              "group_id": null,
+              "groupId": null,
+              "subject": null,
+              "last_channel": null,
+              "lastChannel": null,
+              "last_to": null,
+              "lastTo": null,
+              "last_account_id": null,
+              "lastAccountId": null,
+              "last_thread_id": null,
+              "lastThreadId": null,
+              "delivery_context": null,
+              "deliveryContext": null,
+              "parent_session_key": "agent:main:webchat:parent",
+              "parentSessionKey": "agent:main:webchat:parent",
+              "spawned_by": "task-parent",
+              "spawnedBy": "task-parent",
+              "spawn_depth": 1,
+              "spawnDepth": 1,
+              "forked_from_parent": true,
+              "forkedFromParent": true,
+              "origin": {
+                "kind": "subagent",
+                "spawnDepth": 1
+              },
+              "workspace_id": null,
+              "workspaceId": null,
+              "message_count": 0,
+              "entry_count": 0,
+              "size_bytes": null,
+              "source_kind": "subagent",
+              "sourceKind": "subagent",
+              "channel_kind": "subagent",
+              "channelKind": "subagent",
+              "channel_id": null,
+              "channelId": null,
+              "tasks": [
+                {
+                  "task_id": "task-42",
+                  "turn_id": "turn-42",
+                  "status": "cancelled",
+                  "queue_mode": "followup",
+                  "run_kind": "web_turn",
+                  "source_kind": "webui",
+                  "created_at": 1000,
+                  "started_at": 2000,
+                  "client_message_id": "client-42",
+                  "user_message_id": "message-42",
+                  "surface_id": "webui",
+                  "session_id": "session-child",
+                  "turn_outcome": {
+                    "turn_id": "turn-42",
+                    "task_id": "task-42",
+                    "status": "cancelled",
+                    "kind": "stopped",
+                    "reason": "user"
+                  },
+                  "steer_capability": {
+                    "mode": "disabled"
+                  },
+                  "cancel_requested": true,
+                  "finished_at": 6000,
+                  "terminal_reason": "cancelled_by_user",
+                  "terminal_message": "The task was cancelled before it finished."
+                }
+              ],
+              "active_task": null,
+              "last_task": {
+                "task_id": "task-42",
+                "turn_id": "turn-42",
+                "status": "cancelled",
+                "queue_mode": "followup",
+                "run_kind": "web_turn",
+                "source_kind": "webui",
+                "created_at": 1000,
+                "started_at": 2000,
+                "client_message_id": "client-42",
+                "user_message_id": "message-42",
+                "surface_id": "webui",
+                "session_id": "session-child",
+                "turn_outcome": {
+                  "turn_id": "turn-42",
+                  "task_id": "task-42",
+                  "status": "cancelled",
+                  "kind": "stopped",
+                  "reason": "user"
+                },
+                "steer_capability": {
+                  "mode": "disabled"
+                },
+                "cancel_requested": true,
+                "finished_at": 6000,
+                "terminal_reason": "cancelled_by_user",
+                "terminal_message": "The task was cancelled before it finished."
+              },
+              "run_status": "cancelled",
+              "sessionId": "session-child",
+              "effectiveAgentId": "main",
+              "sessionKind": "task",
+              "surface": "subagent",
+              "conversationKind": "unknown",
+              "thread": null,
+              "title": "Inspect checkout failures",
+              "subtitle": "Spawned from Web chat",
+              "groupLabel": "Subagents",
+              "lastActivityAt": 900,
+              "messageCount": 0,
+              "runStatus": "cancelled",
+              "interactive": false,
+              "channelContext": null,
+              "parent": {
+                "key": "agent:main:webchat:parent",
+                "taskId": "task-parent",
+                "spawnDepth": 1
+              },
+              "cron": null
+            }
+          ],
+          "count": 1,
+          "ts": 1700000000000
+        },
+        "error": null
+      },
+      "setup": {
+        "clock_ms": 1700000000000,
+        "session": {
+          "session_key": "agent:main:subagent:child",
+          "session_id": "session-child",
+          "agent_id": "main",
+          "created_at": 500,
+          "updated_at": 900,
+          "started_at": 500,
+          "status": "killed",
+          "display_name": "Inspect checkout failures",
+          "model": "openai/gpt-5",
+          "parent_session_key": "agent:main:webchat:parent",
+          "spawned_by": "task-parent",
+          "spawn_depth": 1,
+          "forked_from_parent": true,
+          "origin": {
+            "kind": "subagent",
+            "spawnDepth": 1
+          }
+        },
+        "task": {
+          "task_id": "task-42",
+          "status": "cancelled",
+          "queue_mode": "followup",
+          "run_kind": "web_turn",
+          "source_kind": "webui",
+          "created_at": 1000,
+          "updated_at": 6000,
+          "started_at": 2000,
+          "finished_at": 6000,
+          "terminal_reason": "cancelled_by_user",
+          "error_class": null,
+          "error_message": null,
+          "details": {
+            "turn_id": "turn-42",
+            "client_message_id": "client-42",
+            "user_message_id": "message-42",
+            "surface_id": "webui",
+            "session_id": "session-child",
+            "turn_outcome": {
+              "turn_id": "turn-42",
+              "task_id": "task-42",
+              "status": "cancelled",
+              "kind": "stopped",
+              "reason": "user"
+            },
+            "steer_capability": {
+              "mode": "disabled"
+            },
+            "cancellation_requested": {
+              "source": "user"
+            }
+          }
+        }
+      },
+      "source": "src/opensquilla/gateway/rpc_sessions.py:_handle_sessions_list + _task_summary; src/opensquilla/gateway/session_view.py:build_session_view_item"
+    },
+    {
+      "id": "response.legacy-string-channel",
+      "coverage": "legacy-string-channel",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "response.legacy-string-channel",
+        "ok": true,
+        "payload": {
+          "sessions": [
+            {
+              "key": "agent:main:slack:legacy",
+              "channel": "slack"
+            }
+          ],
+          "count": 1,
+          "ts": 1700000000000
+        },
+        "error": null
+      },
+      "compatibility_note": "Legacy session rows use both channel-name strings and expanded channel objects."
+    }
+  ]
+}

@@ -1173,8 +1173,14 @@ def chat(
 @app.command("reset")
 def reset_cmd(
     key: str = typer.Option(..., "--key", help="Session key to reset."),
-    gateway_url: str = typer.Option(
-        "http://localhost:18791", "--gateway", envvar="OPENSQUILLA_GATEWAY_URL"
+    gateway_url: str | None = typer.Option(
+        None,
+        "--gateway",
+        envvar="OPENSQUILLA_GATEWAY_URL",
+        help=(
+            "Gateway to reset against. Defaults to the selected profile's "
+            "configured gateway, or ws://localhost:18791/ws when none is configured."
+        ),
     ),
 ) -> None:
     """Reset a session, flushing its memory synchronously.
@@ -1185,12 +1191,21 @@ def reset_cmd(
     import asyncio
 
     from opensquilla.cli.gateway_client import GatewayClient, GatewayRPCError
+    from opensquilla.cli.gateway_rpc import default_gateway_url
     from opensquilla.cli.url_utils import normalize_gateway_url
+
+    # Explicit `--gateway` and `OPENSQUILLA_GATEWAY_URL` both arrive here as a
+    # value, so they keep outranking everything, exactly as before. What the
+    # literal default used to swallow is the step below it: the gateway the
+    # selected profile actually configured. `reset` mutates session state, so
+    # aiming it at the wrong gateway is not a lookup that fails — it flushes
+    # and rotates whatever session key matches on 127.0.0.1:18791.
+    target_url = normalize_gateway_url(gateway_url) if gateway_url else default_gateway_url()
 
     async def _go():
         client = GatewayClient()
         try:
-            await client.connect(normalize_gateway_url(gateway_url))
+            await client.connect(target_url)
             return await client.reset_session(key)
         finally:
             await client.close()

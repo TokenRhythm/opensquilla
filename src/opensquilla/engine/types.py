@@ -177,6 +177,7 @@ class ToolUseStartEvent:
     # "unstamped" — clients fall back to their own clock.
     started_at: int = 0
     generation_epoch: int = 0
+    tool_presentation: dict[str, Any] | None = None
 
 
 @dataclass
@@ -202,6 +203,7 @@ class ToolUseEndEvent:
     arguments: dict[str, Any] = field(default_factory=dict)
     synthetic_from_text: bool = False
     generation_epoch: int = 0
+    tool_presentation: dict[str, Any] | None = None
 
 
 @dataclass
@@ -215,6 +217,7 @@ class ToolResultEvent:
     execution_status: ExecutionStatus | None = None
     effect_outcome: ToolEffectOutcome | None = None
     generation_epoch: int = 0
+    tool_presentation: dict[str, Any] | None = None
 
 
 @dataclass

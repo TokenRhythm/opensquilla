@@ -1,9 +1,9 @@
 // @vitest-environment happy-dom
 import { describe, expect, it, vi } from 'vitest'
-import { nextTick, ref, type Ref } from 'vue'
+import { nextTick, ref, watch, type Ref } from 'vue'
 
 import { useChatHistory } from './useChatHistory'
-import type { ChatMessage } from '@/types/chat'
+import type { ChatMessage, ChatTurnOutcome } from '@/types/chat'
 import type { ChatHistoryResponse } from '@/types/rpc'
 import { RpcTimeoutError } from '@/lib/rpc'
 
@@ -11,10 +11,13 @@ function makeHistory(autoScroll = true, overrides: {
   response?: ChatHistoryResponse
   messages?: ChatMessage[]
   preserveLiveTail?: boolean
+  autoScroll?: Ref<boolean>
   sessionKey?: Ref<string>
   scrollEpoch?: Ref<number>
+  canApplyViewportCorrection?: () => boolean
   threadRef?: Ref<HTMLElement | null>
   concurrentHistoryReads?: boolean
+  onTerminalTask?: (outcome: ChatTurnOutcome) => void
 } = {}) {
   const response: ChatHistoryResponse = overrides.response || {
     messages: [
@@ -48,10 +51,12 @@ function makeHistory(autoScroll = true, overrides: {
     lastHeaderRole: ref(''),
     lastHeaderDay: ref(''),
     preserveLiveTail: ref(overrides.preserveLiveTail ?? false),
-    autoScroll: ref(autoScroll),
+    autoScroll: overrides.autoScroll ?? ref(autoScroll),
     scrollEpoch: overrides.scrollEpoch,
+    canApplyViewportCorrection: overrides.canApplyViewportCorrection,
     stripTimePrefix: text => text,
     scrollToBottom,
+    onTerminalTask: overrides.onTerminalTask,
   })
   return { api, rpc, scrollToBottom, messages }
 }
@@ -63,6 +68,148 @@ function historyMessage(id: string): NonNullable<ChatHistoryResponse['messages']
     role: 'assistant',
     text: id,
     timestamp: `2026-07-06T00:00:${id.replace(/\D/g, '').padStart(2, '0')}Z`,
+  }
+}
+
+function makeLiveEdgeRecovery(overrides: {
+  scrollEpoch?: Ref<number>
+  canApplyViewportCorrection?: () => boolean
+  onCommit: (context: {
+    autoScroll: Ref<boolean>
+    thread: HTMLElement
+  }) => void
+}) {
+  const autoScroll = ref(true)
+  const thread = document.createElement('div')
+  Object.defineProperties(thread, {
+    clientHeight: { configurable: true, value: 300 },
+    scrollHeight: { configurable: true, value: 12_000 },
+    scrollTop: { configurable: true, value: 11_700, writable: true },
+  })
+  document.body.append(thread)
+  const { api, messages } = makeHistory(true, {
+    autoScroll,
+    scrollEpoch: overrides.scrollEpoch,
+    canApplyViewportCorrection: overrides.canApplyViewportCorrection,
+    threadRef: ref<HTMLElement | null>(thread),
+    messages: [{
+      role: 'assistant',
+      text: 'message 0320',
+      ts: '2026-07-06T00:05:20Z',
+      messageId: 'm-320',
+      restoredFromHistory: true,
+    }],
+    response: {
+      messages: [historyMessage('m-320')],
+      has_more: true,
+      oldest_cursor: 'cursor-320',
+      newest_cursor: 'cursor-320',
+      canonical_available: true,
+    },
+  })
+  const stopRender = watch(
+    messages,
+    () => overrides.onCommit({ autoScroll, thread }),
+    { flush: 'sync' },
+  )
+  return {
+    api,
+    autoScroll,
+    thread,
+    cleanup: () => {
+      stopRender()
+      thread.remove()
+    },
+  }
+}
+
+function makeReaderAnchorRecovery(overrides: {
+  canApplyViewportCorrection?: () => boolean
+  pendingImage?: boolean
+  onCommit?: () => void
+} = {}) {
+  const thread = document.createElement('div')
+  let messageContentTop = 1_040
+  let emitPendingImageLoad = () => {}
+  Object.defineProperties(thread, {
+    clientHeight: { configurable: true, value: 300 },
+    scrollHeight: { configurable: true, value: 1_400 },
+    scrollTop: { configurable: true, value: 1_000, writable: true },
+  })
+  thread.getBoundingClientRect = () => ({
+    top: 0,
+    bottom: 300,
+    left: 0,
+    right: 600,
+    width: 600,
+    height: 300,
+    x: 0,
+    y: 0,
+    toJSON: () => ({}),
+  })
+  const renderAnchor = () => {
+    const anchor = document.createElement('article')
+    anchor.dataset.messageId = 'm-320'
+    if (overrides.pendingImage) {
+      const image = document.createElement('img')
+      Object.defineProperty(image, 'complete', { configurable: true, value: false })
+      emitPendingImageLoad = () => image.dispatchEvent(new Event('load'))
+      anchor.append(image)
+    }
+    anchor.getBoundingClientRect = () => {
+      const top = messageContentTop - thread.scrollTop
+      return {
+        top,
+        bottom: top + 40,
+        left: 0,
+        right: 600,
+        width: 600,
+        height: 40,
+        x: 0,
+        y: top,
+        toJSON: () => ({}),
+      }
+    }
+    thread.replaceChildren(anchor)
+  }
+  renderAnchor()
+  document.body.append(thread)
+
+  const { api, messages } = makeHistory(false, {
+    canApplyViewportCorrection: overrides.canApplyViewportCorrection,
+    threadRef: ref<HTMLElement | null>(thread),
+    messages: [{
+      role: 'assistant',
+      text: 'message 0320',
+      ts: '2026-07-06T00:05:20Z',
+      messageId: 'm-320',
+      restoredFromHistory: true,
+    }],
+    response: {
+      messages: [historyMessage('m-320')],
+      has_more: true,
+      oldest_cursor: 'cursor-320',
+      newest_cursor: 'cursor-320',
+      canonical_available: true,
+    },
+  })
+  const stopRender = watch(messages, () => {
+    // Model Electron replacing the long-history window before the browser
+    // has a chance to preserve its native scroll anchor.
+    thread.scrollTop = 0
+    renderAnchor()
+    overrides.onCommit?.()
+  }, { flush: 'sync' })
+
+  return {
+    api,
+    thread,
+    emitPendingImageLoad: () => emitPendingImageLoad(),
+    setMessageContentTop: (top: number) => { messageContentTop = top },
+    cleanup: () => {
+      stopRender()
+      thread.remove()
+    },
   }
 }
 
@@ -710,7 +857,7 @@ describe('useChatHistory canonical pagination', () => {
     )
   })
 
-  it('recycles a legacy serial Gateway when history is abandoned', async () => {
+  it('keeps legacy timeout recovery while making history cancellation local', async () => {
     const { api, rpc } = makeHistory(true, {
       concurrentHistoryReads: false,
     })
@@ -731,7 +878,7 @@ describe('useChatHistory canonical pagination', () => {
       expect.any(Object),
       expect.objectContaining({
         timeoutAction: 'reconnect',
-        abortAction: 'reconnect',
+        abortAction: 'reject',
       }),
     )
   })
@@ -827,6 +974,21 @@ describe('useChatHistory canonical pagination', () => {
       retrying: false,
       loadEarlierError: false,
       recoveryError: false,
+    })
+  })
+
+  it('classifies a missing session separately from a retryable history failure', async () => {
+    const { api, rpc } = makeHistory()
+    rpc.call.mockRejectedValueOnce(Object.assign(new Error('missing'), {
+      code: 'NOT_FOUND',
+    }))
+
+    await api.loadHistory()
+
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'error',
+      recoveryError: true,
+      sessionMissing: true,
     })
   })
 
@@ -2024,6 +2186,151 @@ describe('useChatHistory scroll anchoring', () => {
     expect(scrollToBottom).toHaveBeenCalledTimes(1)
   })
 
+  it('keeps the visible durable message anchored across a recovery refresh', async () => {
+    const harness = makeReaderAnchorRecovery()
+
+    try {
+      await harness.api.loadHistory()
+      await nextTick()
+
+      expect(harness.thread.scrollTop).toBe(1_000)
+    } finally {
+      harness.cleanup()
+    }
+  })
+
+  it('does not restore a reader anchor during application-owned history navigation', async () => {
+    const navigationActive = ref(false)
+    const harness = makeReaderAnchorRecovery({
+      canApplyViewportCorrection: () => !navigationActive.value,
+      onCommit: () => { navigationActive.value = true },
+    })
+
+    try {
+      await harness.api.loadHistory()
+      await nextTick()
+
+      expect(harness.thread.scrollTop).toBe(0)
+    } finally {
+      harness.cleanup()
+    }
+  })
+
+  it('stops late anchor stabilization when application-owned navigation starts', async () => {
+    const navigationActive = ref(false)
+    const harness = makeReaderAnchorRecovery({
+      canApplyViewportCorrection: () => !navigationActive.value,
+      pendingImage: true,
+    })
+
+    try {
+      await harness.api.loadHistory()
+      await nextTick()
+      expect(harness.thread.scrollTop).toBe(1_000)
+
+      navigationActive.value = true
+      harness.setMessageContentTop(1_140)
+      harness.emitPendingImageLoad()
+      await Promise.resolve()
+
+      expect(harness.thread.scrollTop).toBe(1_000)
+    } finally {
+      harness.cleanup()
+    }
+  })
+
+  it('keeps live-edge ownership when a recovery refresh resets layout scroll', async () => {
+    const harness = makeLiveEdgeRecovery({
+      onCommit: ({ autoScroll, thread }) => {
+        // Model the long-history virtualizer clamping the old viewport before
+        // its replacement rows are measured.
+        thread.scrollTop = 0
+        autoScroll.value = false
+      },
+    })
+
+    try {
+      await harness.api.loadHistory()
+      await nextTick()
+      await nextTick()
+
+      expect(harness.autoScroll.value).toBe(true)
+      expect(harness.thread.scrollTop).toBe(12_000)
+    } finally {
+      harness.cleanup()
+    }
+  })
+
+  it('cancels a stale live-edge correction when the viewport epoch changes', async () => {
+    const scrollEpoch = ref(1)
+    const harness = makeLiveEdgeRecovery({
+      scrollEpoch,
+      onCommit: ({ autoScroll, thread }) => {
+        thread.scrollTop = 0
+        autoScroll.value = false
+        scrollEpoch.value += 1
+      },
+    })
+
+    try {
+      const outcome = await harness.api.loadHistory()
+      await nextTick()
+
+      expect(outcome).toMatchObject({ ok: false, cancelled: true })
+      expect(harness.autoScroll.value).toBe(false)
+      expect(harness.thread.scrollTop).toBe(0)
+    } finally {
+      harness.cleanup()
+    }
+  })
+
+  it('does not reclaim the live edge after fresh reader input', async () => {
+    const harness = makeLiveEdgeRecovery({
+      onCommit: ({ autoScroll, thread }) => {
+        thread.scrollTop = 6_000
+        autoScroll.value = false
+        // A real input event cannot interleave the synchronous message commit.
+        // Queue it immediately afterwards, while the layout handoff is waiting
+        // for Vue's next DOM flush.
+        queueMicrotask(() => thread.dispatchEvent(new Event('wheel')))
+      },
+    })
+
+    try {
+      const outcome = await harness.api.loadHistory()
+      await nextTick()
+
+      expect(outcome).toMatchObject({ ok: true })
+      expect(harness.autoScroll.value).toBe(false)
+      expect(harness.thread.scrollTop).toBe(6_000)
+    } finally {
+      harness.cleanup()
+    }
+  })
+
+  it('does not reclaim the live edge during application-owned history navigation', async () => {
+    const navigationActive = ref(false)
+    const harness = makeLiveEdgeRecovery({
+      canApplyViewportCorrection: () => !navigationActive.value,
+      onCommit: ({ autoScroll, thread }) => {
+        navigationActive.value = true
+        thread.scrollTop = 6_000
+        autoScroll.value = false
+      },
+    })
+
+    try {
+      const outcome = await harness.api.loadHistory()
+      await nextTick()
+
+      expect(outcome).toMatchObject({ ok: true })
+      expect(harness.autoScroll.value).toBe(false)
+      expect(harness.thread.scrollTop).toBe(6_000)
+    } finally {
+      harness.cleanup()
+    }
+  })
+
   it('drops a delayed prepend when the reused chat viewport enters a new epoch', async () => {
     let resolveEarlier!: (value: ChatHistoryResponse) => void
     const earlier = new Promise<ChatHistoryResponse>(resolve => { resolveEarlier = resolve })
@@ -2176,6 +2483,69 @@ describe('useChatHistory optimistic local rows', () => {
       cancellationSource: 'webui_stop',
       acceptedRoutingMode: 'ensemble',
     })
+  })
+
+  it('restores terminal activity without an assistant transcript row', async () => {
+    const onTerminalTask = vi.fn()
+    const { api, messages } = makeHistory(true, {
+      onTerminalTask,
+      response: {
+        messages: [{
+          id: 'user-cancelled',
+          message_id: 'user-cancelled',
+          role: 'user',
+          text: 'stop after the retry',
+          timestamp: '2026-07-07T10:00:00Z',
+          turn_context: { turn_id: 'turn-cancelled' },
+        }],
+        turn_outcomes: [{
+          turn_id: 'turn-cancelled',
+          task_id: 'task-cancelled',
+          status: 'cancelled',
+          finished_at: 2_000,
+          activity_snapshot: {
+            version: 2,
+            task_id: 'task-cancelled',
+            turn_id: 'turn-cancelled',
+            complete: true,
+            reasoning_utf16_length: 0,
+            entries: [
+              {
+                type: 'phase', id: 'provider:requesting:1', order: 1,
+                kind: 'provider', phase: 'requesting', at: 1_000, ended_at: 1_200,
+              },
+              {
+                type: 'phase', id: 'provider:retry_wait:2', order: 2,
+                kind: 'provider', phase: 'retry_wait', reason: 'rate_limited',
+                retry_after_ms: 500, at: 1_200, ended_at: 2_000,
+              },
+            ],
+          },
+          outcome: { kind: 'cancelled', cancellation_source: 'webui_stop' },
+        }],
+        has_more: false,
+        canonical_complete: true,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'assistant'])
+    expect(messages.value[1]).toMatchObject({
+      text: '',
+      turnId: 'turn-cancelled',
+      messageId: 'terminal-activity:task-cancelled',
+      activitySnapshot: { version: 2, complete: true },
+      activitySnapshotIncomplete: false,
+      statusHistory: [
+        expect.objectContaining({ action: 'provider:requesting', activityOrder: 1 }),
+        expect.objectContaining({ action: 'provider:rate_limited:1', activityOrder: 2 }),
+      ],
+    })
+    expect(onTerminalTask).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: 'task-cancelled',
+      status: 'cancelled',
+    }))
   })
 
   it('restores usage barrier activity and its retryable error from terminal history', async () => {
@@ -3133,7 +3503,7 @@ describe('useChatHistory safe local-tail synchronization', () => {
       expect(rpc.call).toHaveBeenCalledTimes(3)
       expect(rpc.call.mock.calls[2]?.[2]).toMatchObject({
         timeoutAction: 'reconnect',
-        abortAction: 'reconnect',
+        abortAction: 'reject',
       })
       expect(messages.value.map(message => message.messageId)).toEqual([
         'user-a',
@@ -3207,7 +3577,7 @@ describe('useChatHistory safe local-tail synchronization', () => {
 
       expect(rpc.call.mock.calls[2]?.[2]).toMatchObject({
         timeoutAction: 'reconnect',
-        abortAction: 'reconnect',
+        abortAction: 'reject',
       })
       expect(messages.value.map(message => message.text)).toEqual([
         'm1',

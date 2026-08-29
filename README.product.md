@@ -136,7 +136,7 @@ opensquilla configure search --search-provider duckduckgo
 opensquilla configure search --search-provider tavily --api-key-env TAVILY_API_KEY
 opensquilla configure channels
 opensquilla config get llm.provider
-opensquilla config set gateway.port 18791
+opensquilla config set port 18791
 ```
 
 See [`docs/configuration.md`](docs/configuration.md) for details.

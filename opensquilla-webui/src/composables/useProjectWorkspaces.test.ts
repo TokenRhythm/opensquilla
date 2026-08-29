@@ -65,6 +65,87 @@ describe('useProjectWorkspaces', () => {
     expect(projects.hasLoaded.value).toBe(true)
   })
 
+  it('does not let a late superseded list replace the latest workspace state', async () => {
+    const rpc = useRpcStore()
+    connectOwner(rpc)
+    let resolveFirst!: (value: unknown) => void
+    let resolveSecond!: (value: unknown) => void
+    const firstResponse = new Promise(resolve => { resolveFirst = resolve })
+    const secondResponse = new Promise(resolve => { resolveSecond = resolve })
+    const call = vi.fn()
+      .mockReturnValueOnce(firstResponse)
+      .mockReturnValueOnce(secondResponse)
+    rpc.client = { call } as never
+    const projects = useProjectWorkspaces()
+
+    const first = projects.loadWorkspaces()
+    const second = projects.loadWorkspaces()
+    resolveSecond({
+      workspaces: [{
+        id: 'workspace-b',
+        name: 'Workspace B',
+        path: '/repo/b',
+        taskCount: 1,
+        available: true,
+      }],
+    })
+    await expect(second).resolves.toEqual([
+      expect.objectContaining({ id: 'workspace-b' }),
+    ])
+    resolveFirst({
+      workspaces: [{
+        id: 'workspace-a',
+        name: 'Workspace A',
+        path: '/repo/a',
+        taskCount: 1,
+        available: true,
+      }],
+    })
+    await expect(first).resolves.toEqual([
+      expect.objectContaining({ id: 'workspace-a' }),
+    ])
+
+    expect(projects.workspaces.value.map(item => item.id)).toEqual(['workspace-b'])
+    expect(projects.error.value).toBeNull()
+    expect(projects.isLoading.value).toBe(false)
+  })
+
+  it('does not let a superseded abort clear loading or publish an error for the target', async () => {
+    const rpc = useRpcStore()
+    connectOwner(rpc)
+    let rejectFirst!: (cause: unknown) => void
+    let resolveSecond!: (value: unknown) => void
+    const firstResponse = new Promise((_resolve, reject) => { rejectFirst = reject })
+    const secondResponse = new Promise(resolve => { resolveSecond = resolve })
+    const call = vi.fn()
+      .mockReturnValueOnce(firstResponse)
+      .mockReturnValueOnce(secondResponse)
+    rpc.client = { call } as never
+    const projects = useProjectWorkspaces()
+
+    const first = projects.loadWorkspaces().catch((cause: unknown) => cause)
+    const second = projects.loadWorkspaces()
+    rejectFirst(new Error('A navigation was aborted'))
+    await expect(first).resolves.toBeInstanceOf(Error)
+
+    expect(projects.isLoading.value).toBe(true)
+    expect(projects.error.value).toBeNull()
+
+    resolveSecond({
+      workspaces: [{
+        id: 'workspace-b',
+        name: 'Workspace B',
+        path: '/repo/b',
+        taskCount: 1,
+        available: true,
+      }],
+    })
+    await second
+    expect(projects.workspaces.value.map(item => item.id)).toEqual(['workspace-b'])
+    expect(projects.error.value).toBeNull()
+    expect(projects.isLoading.value).toBe(false)
+  })
+
   it('calls lifecycle RPCs and refreshes the canonical list', async () => {
     const rpc = useRpcStore()
     connectOwner(rpc)

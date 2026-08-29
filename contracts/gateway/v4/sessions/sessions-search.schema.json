@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opensquilla.dev/contracts/gateway/v4/sessions/sessions-search.schema.json",
+  "title": "OpenSquilla sessions.search Contract",
+  "description": "Language-neutral Contract for the v4 sessions.search query. Generated wire types may be imported only by Gateway adapters and Contract tests.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "request": { "$ref": "#/$defs/SessionsSearchRequestFrame" },
+    "response": { "$ref": "#/$defs/SessionsSearchResponseFrame" }
+  },
+  "x-opensquilla-wire": {
+    "protocol": "opensquilla-websocket-json",
+    "version": 4,
+    "compatibility": "exact-json-tree"
+  },
+  "x-opensquilla-codegen": {
+    "python": { "tool": "datamodel-code-generator", "version": "0.75.1", "target": "pydantic_v2.BaseModel" },
+    "typescript": { "tool": "json-schema-to-typescript", "version": "15.0.4" },
+    "runtimeValidation": { "tool": "ajv", "version": "8.17.1", "mode": "standalone-adapter-only" }
+  },
+  "x-opensquilla-method": {
+    "name": "sessions.search",
+    "kind": "query",
+    "scope": "operator.read",
+    "guestAllowed": false,
+    "idempotency": "read-only",
+    "timeout": { "policy": "caller" },
+    "capability": { "kind": "method-availability", "name": "sessions.search" },
+    "request": "#/$defs/SessionsSearchRequestFrame",
+    "params": "#/$defs/SessionsSearchParams",
+    "response": "#/$defs/SessionsSearchResponseFrame",
+    "result": "#/$defs/SessionsSearchResult",
+    "errors": [
+      { "code": "UNAUTHORIZED" },
+      { "code": "STORAGE_BUSY", "retryable": true, "retryAfterMs": true, "details": true },
+      { "code": "INTERNAL_ERROR" }
+    ]
+  },
+  "$defs": {
+    "NullableString": { "type": ["string", "null"] },
+    "NullableInteger": { "type": ["integer", "null"] },
+    "SessionsSearchParams": {
+      "title": "sessions.search params",
+      "description": "The Gateway historically coerces query and limit values and accepts omitted or null params.",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "query": { "type": ["string", "null"] },
+        "limit": { "type": ["integer", "string", "boolean", "null"] }
+      }
+    },
+    "SessionsSearchLegacyNonObjectParams": {
+      "description": "v4 ReqFrame.params is Any. Legacy non-object values retain the existing empty-search behavior.",
+      "anyOf": [
+        { "type": "array", "items": {} },
+        { "type": "string" },
+        { "type": "number" },
+        { "type": "boolean" }
+      ]
+    },
+    "SessionsSearchRequestFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "method"],
+      "properties": {
+        "type": { "const": "req" },
+        "id": { "type": "string" },
+        "method": { "const": "sessions.search" },
+        "params": {
+          "anyOf": [
+            { "$ref": "#/$defs/SessionsSearchParams" },
+            { "$ref": "#/$defs/SessionsSearchLegacyNonObjectParams" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "SessionsSearchSessionHit": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["key", "title", "effectiveAgentId", "surface", "updatedAt"],
+      "properties": {
+        "key": { "type": "string" },
+        "title": { "type": "string" },
+        "effectiveAgentId": { "type": ["string", "null"] },
+        "surface": { "type": ["string", "null"] },
+        "updatedAt": { "type": ["integer", "null"] }
+      }
+    },
+    "SessionsSearchMessageHit": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["key", "title", "role", "snippet", "createdAt"],
+      "properties": {
+        "key": { "type": "string" },
+        "title": { "type": "string" },
+        "role": {},
+        "snippet": { "type": "string" },
+        "createdAt": { "type": ["integer", "string", "null"] }
+      }
+    },
+    "SessionsSearchResult": {
+      "description": "Published v4 session title and transcript search projection.",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["sessions", "messages", "query", "ts"],
+      "properties": {
+        "sessions": { "type": "array", "items": { "$ref": "#/$defs/SessionsSearchSessionHit" } },
+        "messages": { "type": "array", "items": { "$ref": "#/$defs/SessionsSearchMessageHit" } },
+        "query": { "type": "string" },
+        "ts": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "RpcError": {
+      "type": "object", "additionalProperties": true, "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string" }, "message": { "type": "string" }, "details": {},
+        "retryable": { "type": ["boolean", "null"] },
+        "retry_after_ms": { "type": ["integer", "null"] },
+        "accepted": { "type": ["boolean", "null"] }
+      }
+    },
+    "SessionsSearchOkResponseFrame": {
+      "type": "object", "additionalProperties": false, "required": ["type", "id", "ok", "payload"],
+      "properties": {
+        "type": { "const": "res" }, "id": { "type": "string" }, "ok": { "const": true },
+        "payload": { "$ref": "#/$defs/SessionsSearchResult" }, "error": { "type": "null" }
+      }
+    },
+    "SessionsSearchErrorResponseFrame": {
+      "type": "object", "additionalProperties": false, "required": ["type", "id", "ok", "error"],
+      "properties": {
+        "type": { "const": "res" }, "id": { "type": "string" }, "ok": { "const": false },
+        "payload": { "type": "null" }, "error": { "$ref": "#/$defs/RpcError" }
+      }
+    },
+    "SessionsSearchResponseFrame": {
+      "oneOf": [
+        { "$ref": "#/$defs/SessionsSearchOkResponseFrame" },
+        { "$ref": "#/$defs/SessionsSearchErrorResponseFrame" }
+      ]
+    }
+  }
+}

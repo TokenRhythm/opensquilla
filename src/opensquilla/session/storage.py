@@ -14533,6 +14533,61 @@ class SessionStorage:
                     result.setdefault(sid, []).append(content)
         return result
 
+    @_serialized_read
+    async def list_last_transcript_content_batch(
+        self,
+        session_ids: list[str],
+        *,
+        max_chars: int = 120,
+    ) -> dict[str, str]:
+        """Return one bounded preview message for each active session.
+
+        The session preview endpoint only needs the newest non-empty user or
+        assistant message.  Selecting that row in SQLite avoids materializing
+        every transcript entry (and keeps the result bounded even when a
+        single message is very large).  This intentionally reads the active
+        transcript table only, matching the historical ``get_transcript``
+        path used by ``sessions.preview``.
+
+        Missing or empty transcripts are returned explicitly as ``""`` so the
+        caller can preserve the legacy wire shape without another lookup.
+        Chunks stay below SQLite's variable limit when a caller previews many
+        sessions at once.
+        """
+        if not session_ids:
+            return {}
+
+        bounded_chars = max(0, int(max_chars))
+        chunk = 300
+        result: dict[str, str] = {session_id: "" for session_id in session_ids}
+        for index in range(0, len(session_ids), chunk):
+            batch = session_ids[index : index + chunk]
+            placeholders = ",".join("?" for _ in batch)
+            sql = f"""
+                SELECT latest.session_id, substr(entry.content, 1, ?) AS content
+                FROM (
+                    SELECT
+                        session_id,
+                        id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY session_id
+                            ORDER BY created_at DESC, id DESC
+                        ) AS rn
+                    FROM transcript_entries
+                    WHERE session_id IN ({placeholders})
+                        AND role IN ('user', 'assistant')
+                        AND COALESCE(content, '') != ''
+                ) AS latest
+                JOIN transcript_entries AS entry ON entry.id = latest.id
+                WHERE latest.rn = 1
+            """
+            async with self.conn.execute(sql, [bounded_chars, *batch]) as cur:
+                rows = await cur.fetchall()
+            for session_id, content in rows:
+                if isinstance(content, str):
+                    result[session_id] = content
+        return result
+
     async def delete_transcript(self, session_id: str) -> None:
         async with self._write_transaction("delete_transcript") as conn:
             await conn.execute(

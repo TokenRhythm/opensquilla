@@ -8,6 +8,7 @@ import {
 } from '@/lib/rpc'
 import type { DesktopGatewayConnection } from '@/platform/types'
 import { getPlatform } from '@/platform'
+import { recordRpcTransportDiag } from '@/utils/chat/sessionNavigationDiag'
 
 const WS_URL_KEY = 'opensquilla.wsUrl'
 const WS_TOKEN_KEY = 'opensquilla.wsToken'
@@ -86,6 +87,10 @@ export const useRpcStore = defineStore('rpc', () => {
   const events = ref<string[]>([])
   const unavailableMethods = ref<Set<string>>(new Set())
   const error = ref<string | null>(null)
+  // RpcClient is stored as a class instance and several callbacks retain the
+  // raw object, so its private generation mutations are not Vue-reactive.
+  // Mirror the value explicitly at every transport/state boundary.
+  const connectionGeneration = ref(0)
   let desktopConnectionRevision = -1
   let desktopConnectionKey = ''
   let desktopAuthToken = ''
@@ -164,6 +169,7 @@ export const useRpcStore = defineStore('rpc', () => {
     client.value = rpc
 
     rpc.on('_state', (s: 'disconnected' | 'connecting' | 'connected') => {
+      connectionGeneration.value = rpc.connectionGeneration
       state.value = s
       if (s !== 'connected') {
         clearConnectionIdentity()
@@ -188,6 +194,11 @@ export const useRpcStore = defineStore('rpc', () => {
 
     rpc.on('_gap', (detail: unknown) => {
       console.warn('[RPC] Sequence gap detected:', detail)
+    })
+
+    rpc.on('_transport', (detail: unknown) => {
+      connectionGeneration.value = rpc.connectionGeneration
+      recordRpcTransportDiag(detail)
     })
 
     const gatewayPlatform = getPlatform().gateway
@@ -286,6 +297,13 @@ export const useRpcStore = defineStore('rpc', () => {
     return client.value.waitForConnection(timeoutMs, signal, actions)
   }
 
+  function recoverConnectionGeneration(
+    expectedGeneration: number,
+    reason: string,
+  ): boolean {
+    return client.value?.recoverConnectionGeneration(expectedGeneration, reason) ?? false
+  }
+
   return {
     client,
     state,
@@ -294,6 +312,7 @@ export const useRpcStore = defineStore('rpc', () => {
     methods,
     events,
     error,
+    connectionGeneration,
     isConnected,
     isConnecting,
     isLocalOwner,
@@ -309,5 +328,6 @@ export const useRpcStore = defineStore('rpc', () => {
     call,
     on,
     waitForConnection,
+    recoverConnectionGeneration,
   }
 })

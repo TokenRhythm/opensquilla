@@ -448,6 +448,76 @@ def model_routing_snapshot(config: Any) -> dict[str, Any]:
     }
 
 
+def model_routing_snapshot_for_mode(
+    config: Any,
+    mode: ModelRoutingMode | str,
+) -> dict[str, Any]:
+    """Project the public routing snapshot for one mode without mutating config.
+
+    Acceptance snapshots intentionally freeze only the routing-owned subtrees.
+    Overlay them onto the live config before deriving public capabilities so
+    Direct and Router still see the active deployment's non-public ``llm``
+    authority while the returned snapshot remains secret-free.
+    """
+
+    captured = capture_model_routing_config(config, session_mode=mode)
+    overlay_live_config = getattr(captured, "overlay_live_config", None)
+    effective_config = (
+        overlay_live_config(config) if callable(overlay_live_config) else captured
+    )
+    return model_routing_snapshot(effective_config)
+
+
+def model_routing_capabilities_by_mode(config: Any) -> dict[str, dict[str, Any]]:
+    """Return a complete, independently fault-tolerant capability matrix."""
+
+    capabilities: dict[str, dict[str, Any]] = {}
+    for mode in ("direct", "router", "ensemble"):
+        try:
+            snapshot = model_routing_snapshot_for_mode(config, mode)
+            image_input = snapshot.get("image_input")
+            if not isinstance(image_input, dict):
+                raise ValueError("image_input capability is unavailable")
+            admission = image_input.get("admission")
+            reason = image_input.get("reason")
+            if admission not in {"allowed", "blocked", "unknown"}:
+                raise ValueError("image_input admission is invalid")
+            if not isinstance(reason, str) or not reason:
+                raise ValueError("image_input reason is invalid")
+            capabilities[mode] = {
+                "image_input": {
+                    "admission": admission,
+                    "reason": reason,
+                }
+            }
+        except Exception:  # noqa: BLE001 - isolate one failed mode projection
+            capabilities[mode] = {
+                "image_input": {
+                    "admission": "unknown",
+                    "reason": "capability_unknown",
+                }
+            }
+    return capabilities
+
+
+def model_routing_public_snapshot(config: Any) -> dict[str, Any]:
+    """Return the additive operator-facing snapshot including all mode capabilities."""
+
+    snapshot = model_routing_snapshot(config)
+    capabilities_by_mode = model_routing_capabilities_by_mode(config)
+    current_capabilities = capabilities_by_mode.get(str(snapshot.get("mode")), {})
+    current_image_input = current_capabilities.get("image_input")
+    return {
+        **snapshot,
+        # Preserve the legacy scalar while making it a projection of the
+        # canonical current mode.  This matters for Router observe configs,
+        # whose internal snapshot deliberately retains router diagnostics even
+        # though their public/effective mode is Direct.
+        "image_input": current_image_input or snapshot["image_input"],
+        "capabilities_by_mode": capabilities_by_mode,
+    }
+
+
 def model_routing_patches(
     config: Any,
     mode: str,
@@ -830,12 +900,13 @@ async def broadcast_model_routing_changed(
     *,
     source: str,
     config: Any | None = None,
+    snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Broadcast the canonical snapshot to every readable operator surface."""
 
     active_config = config if config is not None else getattr(ctx, "config", None)
-    snapshot = model_routing_snapshot(active_config)
-    payload = {**snapshot, "source": source}
+    public_snapshot = snapshot or model_routing_public_snapshot(active_config)
+    payload = {**public_snapshot, "source": source}
     subscription_manager = getattr(ctx, "subscription_manager", None)
     if subscription_manager is None:
         return payload
@@ -870,13 +941,14 @@ async def broadcast_model_routing_changed_if_needed(
     """
 
     active_config = config if config is not None else getattr(ctx, "config", None)
-    current = model_routing_snapshot(active_config)
+    current = model_routing_public_snapshot(active_config)
     if current == previous:
         return None
     return await broadcast_model_routing_changed(
         ctx,
         source=source,
         config=active_config,
+        snapshot=current,
     )
 
 
@@ -887,9 +959,12 @@ __all__ = [
     "broadcast_model_routing_changed_if_needed",
     "capture_model_routing_config",
     "durable_model_routing_config_snapshot",
+    "model_routing_capabilities_by_mode",
     "model_routing_mode_for_write",
     "model_routing_patches",
+    "model_routing_public_snapshot",
     "model_routing_snapshot",
+    "model_routing_snapshot_for_mode",
     "reconcile_model_routing_write",
     "restore_durable_model_routing_config_snapshot",
 ]

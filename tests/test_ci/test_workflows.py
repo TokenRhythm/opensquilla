@@ -185,6 +185,148 @@ def test_default_ci_blocks_pull_requests_and_main_pushes() -> None:
     assert "nightly" not in pull_request_case.lower()
 
 
+def test_pr_change_selection_uses_merge_base_and_ignores_base_only_changes(
+    tmp_path: Path,
+) -> None:
+    workflow = _workflow("ci.yml")
+    checkout = next(
+        step
+        for step in workflow["jobs"]["plan-ci"]["steps"]
+        if step.get("uses") == "actions/checkout@v4"
+    )
+    assert checkout["with"]["fetch-depth"] == 0
+
+    text = (WORKFLOW_DIR / "ci.yml").read_text(encoding="utf-8")
+    pull_request_case = text.split("            pull_request)", 1)[1].split(
+        "              ;;", 1
+    )[0]
+    assert "git diff --merge-base --no-renames --name-only" in pull_request_case
+    assert '"${base_sha}" "${head_sha}" -- > "${changed_files}"' in pull_request_case
+    assert "Unable to derive the PR-owned change set" in pull_request_case
+    assert 'printf \'.ci/run-all\\n\' > "${changed_files}"' in pull_request_case
+
+    executable_case = (
+        'changed_files="${CHANGED_FILES}"\n'
+        + pull_request_case.replace(
+            "${{ github.event.pull_request.base.sha }}", "${BASE_SHA}"
+        ).replace("${{ github.event.pull_request.head.sha }}", "${HEAD_SHA}")
+    )
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
+    def select_changed_files(base_sha: str, head_sha: str) -> list[str]:
+        changed_files = tmp_path / "changed-files.txt"
+        changed_files.write_text("stale partial result\n", encoding="utf-8")
+        env = os.environ.copy()
+        env.update(
+            {
+                "BASE_SHA": base_sha,
+                "CHANGED_FILES": changed_files.as_posix(),
+                "CI_OPTIMIZATION_MODE": "enforce",
+                "HEAD_SHA": head_sha,
+            }
+        )
+        result = subprocess.run(
+            [_bash_executable(), "-euo", "pipefail", "-c", executable_case],
+            cwd=repo,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        return changed_files.read_text(encoding="utf-8").splitlines()
+
+    def plan_changed_files(paths: list[str]) -> dict:
+        planner_input = tmp_path / "planner-input.txt"
+        planner_input.write_text("\n".join(paths) + "\n", encoding="utf-8")
+        result = subprocess.run(
+            [
+                sys.executable,
+                ".github/scripts/plan_ci.py",
+                planner_input.as_posix(),
+                "--repo",
+                ".",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return json.loads(result.stdout)
+
+    git("init", "-b", "main")
+    git("config", "user.name", "CI Test")
+    git("config", "user.email", "ci@example.invalid")
+    (repo / "README.md").write_text("baseline\n", encoding="utf-8")
+    git("add", "README.md")
+    git("commit", "-m", "baseline")
+
+    git("switch", "-c", "feature")
+    feature_path = repo / "src/opensquilla/cli/config_cmd.py"
+    feature_path.parent.mkdir(parents=True)
+    feature_path.write_text("FEATURE = True\n", encoding="utf-8")
+    git("add", feature_path.relative_to(repo).as_posix())
+    git("commit", "-m", "feature change")
+    head_sha = git("rev-parse", "HEAD")
+
+    git("switch", "main")
+    base_only_path = repo / ".github/ci/trust-policy.v1.json"
+    base_only_path.parent.mkdir(parents=True)
+    base_only_path.write_text("{}\n", encoding="utf-8")
+    git("add", base_only_path.relative_to(repo).as_posix())
+    git("commit", "-m", "base-only CI policy change")
+    base_sha = git("rev-parse", "HEAD")
+
+    changed = select_changed_files(base_sha, head_sha)
+    assert changed == ["src/opensquilla/cli/config_cmd.py"]
+    plan = plan_changed_files(changed)
+    assert plan["full_fallback"] is False
+    assert plan["reason_codes"] == ["python_targeted"]
+
+    two_tree_changed = git(
+        "diff",
+        "--no-renames",
+        "--name-only",
+        base_sha,
+        head_sha,
+    ).splitlines()
+    assert ".github/ci/trust-policy.v1.json" in two_tree_changed
+    two_tree_plan = plan_changed_files(two_tree_changed)
+    assert two_tree_plan["full_fallback"] is True
+    assert "ci_policy_changed" in two_tree_plan["reason_codes"]
+
+    git("switch", "--orphan", "unrelated")
+    unrelated_path = repo / "unrelated.txt"
+    unrelated_path.write_text("unrelated history\n", encoding="utf-8")
+    git("add", "unrelated.txt")
+    git("commit", "-m", "unrelated root")
+    unrelated_sha = git("rev-parse", "HEAD")
+    git("switch", "main")
+
+    assert select_changed_files(base_sha, unrelated_sha) == [".ci/run-all"]
+
+
+def test_queue_summary_explains_tree_mismatch_fallback() -> None:
+    text = (WORKFLOW_DIR / "ci.yml").read_text(encoding="utf-8")
+
+    assert 'if [[ "${REASON_CODE}" == "tree_mismatch" ]]' in text
+    assert "this entry runs the full fail-closed matrix" in text
+    assert "If main advanced" in text
+    assert "wait for a new green PR CI run before requeueing" in text
+    assert "future entry's exact base and tree" in text
+
+
 def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
     workflow = _workflow("ci.yml")
     jobs = workflow["jobs"]
@@ -539,6 +681,7 @@ def test_ci_rejects_tracked_frontend_dist_and_builds_a_verified_artifact() -> No
 def test_webui_text_and_docker_context_contracts_are_enforced_in_ci() -> None:
     attributes = Path(".gitattributes").read_text(encoding="utf-8").splitlines()
     assert "opensquilla-webui/** text=auto eol=lf" in attributes
+    assert "src/opensquilla/contracts/generated/v4/** text eol=lf" in attributes
 
     workflow = _workflow("ci.yml")
     ubuntu = workflow["jobs"]["ubuntu-quality"]
@@ -942,6 +1085,11 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     ]
     assert "'frontend-validation'" in jobs["frontend-check"]["if"]
     assert "'wheel-webui-roundtrip'" in jobs["frontend-check"]["if"]
+    assert jobs["gateway-contract-windows"]["needs"] == [
+        "plan-ci",
+        "frontend-check",
+    ]
+    assert "'frontend-validation'" in jobs["gateway-contract-windows"]["if"]
     assert "'tui'" in jobs["tui-check"]["if"]
     assert "'desktop-static'" in jobs["desktop-check"]["if"]
     assert "'python-targeted'" in jobs["ubuntu-quality"]["if"]
@@ -963,9 +1111,63 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert "macos-recovery" in jobs["ci-result"]["needs"]
     assert "desktop-recovery-e2e" in jobs["ci-result"]["needs"]
     assert "managed-toolchain-artifacts" in jobs["ci-result"]["needs"]
+    assert "gateway-contract-windows" in jobs["ci-result"]["needs"]
     artifact_e2e = jobs["managed-toolchain-artifacts"]
     assert artifact_e2e["uses"] == "./.github/workflows/managed-toolchain-artifacts.yml"
     assert "'managed-toolchain'" in artifact_e2e["if"]
+
+
+def test_gateway_contract_hashes_are_compared_between_linux_and_windows() -> None:
+    jobs = _workflow("ci.yml")["jobs"]
+    linux_steps = jobs["frontend-check"]["steps"]
+    windows = jobs["gateway-contract-windows"]
+    windows_steps = windows["steps"]
+
+    linux_integration = next(
+        step
+        for step in linux_steps
+        if step.get("name") == "Run real Gateway Contract toolchain integration"
+    )
+    linux_manifest = next(
+        step
+        for step in linux_steps
+        if step.get("name") == "Write Linux Gateway Contract hash manifest"
+    )
+    upload = next(
+        step
+        for step in linux_steps
+        if step.get("name") == "Upload Linux Gateway Contract hash manifest"
+    )
+    download = next(
+        step
+        for step in windows_steps
+        if step.get("name") == "Download Linux Gateway Contract hash manifest"
+    )
+    compare = next(
+        step
+        for step in windows_steps
+        if step.get("name") == "Compare Linux and Windows Contract hashes"
+    )
+
+    assert windows["runs-on"] == "windows-latest"
+    assert "tests/contracts" in linux_integration["run"]
+    assert linux_integration["env"]["PYTHONPATH"] == (
+        "${{ github.workspace }}:${{ github.workspace }}/src"
+    )
+    windows_verification = next(
+        step
+        for step in windows_steps
+        if step.get("name") == "Verify Windows Contract generation and real toolchain"
+    )
+    assert "tests/contracts" in windows_verification["run"]
+    assert windows_verification["env"]["PYTHONPATH"] == (
+        "${{ github.workspace }};${{ github.workspace }}/src"
+    )
+    assert "--hash-manifest" in linux_manifest["run"]
+    assert upload["with"]["name"] == "gateway-contract-hashes-linux"
+    assert download["with"]["name"] == upload["with"]["name"]
+    assert "--hash-manifest" in compare["run"]
+    assert "--compare-hash-manifests" in compare["run"]
 
 
 def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> None:
@@ -984,6 +1186,7 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
         "readme-locale-check",
         "frontend-artifact",
         "frontend-check",
+        "gateway-contract-windows",
         "webui-chat-recovery",
         "tui-check",
         "desktop-check",
@@ -1003,6 +1206,9 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
     assert gate_step["env"]["RESULT_FRONTEND_ARTIFACT"] == (
         "${{ needs.frontend-artifact.result }}"
     )
+    assert gate_step["env"]["RESULT_CONTRACT_WINDOWS"] == (
+        "${{ needs.gateway-contract-windows.result }}"
+    )
     assert gate_step["env"]["RESULT_UBUNTU_FULL"] == "${{ needs.ubuntu-full.result }}"
     assert gate_step["env"]["RESULT_MACOS_RECOVERY"] == (
         "${{ needs.macos-recovery.result }}"
@@ -1021,6 +1227,7 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
         "RESULT_README_LOCALE",
         "RESULT_FRONTEND_ARTIFACT",
         "RESULT_FRONTEND",
+        "RESULT_CONTRACT_WINDOWS",
         "RESULT_TUI",
         "RESULT_DESKTOP",
         "RESULT_UBUNTU",
@@ -1142,6 +1349,7 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     )
     assert '"windows-delete-helper-handoff-timeout-v1"' in run["run"]
     assert '"windows-isolated-acl-worker-timeout-v1"' in run["run"]
+    assert '"windows-loopback-no-buffer-space-v1"' in run["run"]
     assert '"macos-electron-foreground-prerequisite-v1"' in run["run"]
     assert '"cases": {"desktop-cleanup-flow"}' in run["run"]
     assert '"cases": {"offline-document-workbench-e2e"}' in run["run"]
@@ -1197,6 +1405,18 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
             "FAILED tests/synthetic.py - AssertionError: isolated Windows ACL hardening "
             "timed out: stdout='synthetic'\n",
             "windows-isolated-acl-worker-timeout-v1",
+        ),
+        (
+            "offline-document-workbench-e2e",
+            "Windows",
+            "electronApplication.evaluate: Error: "
+            "ERR_NO_BUFFER_SPACE (-176) loading 'http://127.0.0.1:54108/one'\n"
+            "    at synthetic_allowed_stack (native-workbench.mjs:1:1)\n"
+            "Error: C:\\synthetic\\node.exe "
+            "D:\\synthetic\\test-native-workbench-v2-electron.mjs failed with exit "
+            "code 1\n"
+            "    at synthetic_outer_stack (offline-workbench.mjs:1:1)\n",
+            "windows-loopback-no-buffer-space-v1",
         ),
         (
             "offline-document-workbench-e2e",
@@ -1258,6 +1478,61 @@ def test_desktop_retry_classifier_accepts_only_structured_infrastructure_signatu
     records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
     assert records[-1]["classification"] == "non_retryable"
     assert records[-1]["retryable"] is False
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "electronApplication.evaluate: Error: "
+        "ERR_NO_BUFFER_SPACE (-176) loading 'http://127.0.0.1:54108/two'\n",
+        "electronApplication.evaluate: Error: "
+        "ERR_NO_BUFFER_SPACE (-176) loading 'http://localhost:54108/one'\n",
+        "electronApplication.evaluate: Error: "
+        "ERR_CONNECTION_RESET (-101) loading 'http://127.0.0.1:54108/one'\n",
+        "electronApplication.evaluate: Error: "
+        "ERR_NO_BUFFER_SPACE (-176) loading 'http://127.0.0.1:54108/one'\n"
+        "Error: C:\\synthetic\\node.exe "
+        "D:\\synthetic\\test-native-workbench-v2-electron.mjs failed with exit "
+        "code 1\n"
+        "AssertionError: saved document content did not match\n",
+    ),
+)
+def test_desktop_retry_classifier_rejects_similar_windows_loopback_failures(
+    tmp_path: Path,
+    message: str,
+) -> None:
+    run = next(
+        step["run"]
+        for step in _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]["steps"]
+        if step.get("name") == "Run compiled Desktop recovery flows"
+    )
+    classifier = run.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    log = tmp_path / "attempt-1.log"
+    output = tmp_path / "classifications.jsonl"
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    log.write_text(message, encoding="utf-8")
+
+    rejected = subprocess.run(
+        [
+            sys.executable,
+            "-",
+            "offline-document-workbench-e2e",
+            "Windows",
+            str(log),
+            str(output),
+            str(evidence),
+        ],
+        input=classifier,
+        text=True,
+        check=False,
+    )
+
+    assert rejected.returncode == 1
+    record = json.loads(output.read_text(encoding="utf-8"))
+    assert record["classification"] == "non_retryable"
+    assert record["retryable"] is False
+    assert list(evidence.iterdir()) == []
 
 
 def test_desktop_retry_classifier_rejects_generic_product_failures(tmp_path: Path) -> None:
@@ -1459,6 +1734,7 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
         "history-hydration.spec.ts",
         "queue-steer.spec.ts",
         "session-created-card.spec.ts",
+        "session-switch-transport.spec.ts",
         "share.spec.ts",
     }
     assert selected_specs == required_specs

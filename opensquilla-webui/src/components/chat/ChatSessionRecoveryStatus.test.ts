@@ -8,7 +8,11 @@ import ChatSessionRecoveryStatus from './ChatSessionRecoveryStatus.vue'
 
 const apps: App<Element>[] = []
 
-async function mountState(state: ChatSessionRecoveryState, onRetry = vi.fn()) {
+async function mountState(
+  state: ChatSessionRecoveryState,
+  onRetry = vi.fn(),
+  transportState: 'disconnected' | 'connecting' | 'connected' = 'connected',
+) {
   const host = document.createElement('div')
   host.className = 'chat-thread'
   host.tabIndex = 0
@@ -16,6 +20,7 @@ async function mountState(state: ChatSessionRecoveryState, onRetry = vi.fn()) {
   const app = createApp({
     setup: () => () => h(ChatSessionRecoveryStatus, {
       state,
+      transportState,
       onRetry,
     }),
   })
@@ -78,10 +83,20 @@ describe('ChatSessionRecoveryStatus', () => {
     const retry = host.querySelector('[data-testid="chat-session-recovery-retry"]') as HTMLButtonElement
 
     expect(status?.textContent).toContain('Live updates are temporarily unavailable')
-    expect(status?.textContent).toContain('History remains available.')
+    expect(status?.textContent).toContain('The Gateway is connected and history remains available.')
     expect(status?.getAttribute('data-recovery-state')).toBe('live-degraded')
     expect(retry.textContent).toContain('Reconnect')
     retry.click()
     expect(onRetry).toHaveBeenCalledOnce()
+  })
+
+  it('distinguishes session recovery on a healthy socket from a real reconnect', async () => {
+    const connected = await mountState('live-connecting')
+    expect(connected.host.textContent).toContain(
+      'Gateway connected. Restoring live updates for this session',
+    )
+
+    const reconnecting = await mountState('live-connecting', vi.fn(), 'connecting')
+    expect(reconnecting.host.textContent).toContain('Reconnecting to the Gateway')
   })
 })

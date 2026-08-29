@@ -1,6 +1,9 @@
 import { computed, ref, watch, type Ref } from 'vue'
 import type {
   GatewayModelRoutingMode,
+  ImageInputCapability,
+  ImageInputAdmission,
+  ModelRoutingCapabilitiesByMode,
   ModelRoutingMode,
 } from '@/types/modelRouting'
 import {
@@ -11,11 +14,21 @@ import type {
   SessionMessagesSubscribeResponse,
   SessionRoutingSnapshot,
 } from '@/types/rpc'
+import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
+import { SESSION_PHASE_ATTEMPT_BUDGET_MS } from './sessionBootstrapContract'
 
 type RpcClient = {
-  call: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
+  call: <T = unknown>(
+    method: string,
+    params?: Record<string, unknown>,
+    options?: RpcCallOptions,
+  ) => Promise<T>
   on: (event: string, handler: (payload: unknown) => void) => () => void
-  waitForConnection?: () => Promise<void>
+  waitForConnection?: (
+    timeoutMs?: number,
+    signal?: AbortSignal,
+    actions?: RpcConnectionWaitOptions,
+  ) => Promise<void>
 }
 
 type RoutingResponse = SessionRoutingSnapshot & Record<string, unknown>
@@ -24,6 +37,9 @@ export interface UseChatSessionRoutingOptions {
   rpc: RpcClient
   sessionKey: Ref<string>
   globalMode: Readonly<Ref<ModelRoutingMode>>
+  globalImageInputAdmission: Readonly<Ref<ImageInputAdmission>>
+  globalImageInputAdmissionReason: Readonly<Ref<string>>
+  capabilitiesByMode: Readonly<Ref<ModelRoutingCapabilitiesByMode | null>>
   available?: Readonly<Ref<boolean>>
   isStreaming: Readonly<Ref<boolean>>
   isDraft: () => boolean
@@ -108,6 +124,23 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
       ? modelRoutingModeToGateway(mode.value)
       : null
   ))
+  const effectiveImageInputCapability = computed<ImageInputCapability>(() => {
+    const sessionMode = modelRoutingModeToGateway(mode.value)
+    const capabilitiesByMode = options.capabilitiesByMode.value
+    if (capabilitiesByMode) return capabilitiesByMode[sessionMode].image_input
+    if (sessionMode === modelRoutingModeToGateway(options.globalMode.value)) {
+      return {
+        admission: options.globalImageInputAdmission.value,
+        reason: options.globalImageInputAdmissionReason.value,
+      }
+    }
+    return {
+      admission: 'unknown',
+      reason: 'capability_unknown',
+    }
+  })
+  const imageInputAdmission = computed(() => effectiveImageInputCapability.value.admission)
+  const imageInputAdmissionReason = computed(() => effectiveImageInputCapability.value.reason)
 
   function reset() {
     generation += 1
@@ -145,8 +178,20 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
     const requestGeneration = generation
     if (!isAvailable() || !key || options.isDraft()) return false
     try {
-      await options.rpc.waitForConnection?.()
-      const response = await options.rpc.call<RoutingResponse>('sessions.routing.get', { sessionKey: key })
+      await options.rpc.waitForConnection?.(
+        SESSION_PHASE_ATTEMPT_BUDGET_MS,
+        undefined,
+        { timeoutAction: 'reject', abortAction: 'reject' },
+      )
+      const response = await options.rpc.call<RoutingResponse>(
+        'sessions.routing.get',
+        { sessionKey: key },
+        {
+          timeoutMs: SESSION_PHASE_ATTEMPT_BUDGET_MS,
+          timeoutAction: 'reject',
+          abortAction: 'reject',
+        },
+      )
       if (
         requestGeneration !== generation
         || key !== options.sessionKey.value
@@ -251,7 +296,6 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
 
   watch(options.sessionKey, () => {
     reset()
-    void load()
   }, { flush: 'sync', immediate: true })
   watch(options.globalMode, nextMode => {
     // Drafts have no durable session setting yet. Their first send captures
@@ -259,7 +303,7 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
     if (options.isDraft() && !busy.value && !draftModeSelected.value) mode.value = nextMode
   })
   if (options.available) {
-    watch(options.available, available => {
+    watch(options.available, () => {
       // Capability/connection loss must cancel an in-flight mutation without
       // erasing an explicit new-chat choice or a read-only bootstrap snapshot.
       // `available` gates active get/set calls, not snapshots already delivered
@@ -268,14 +312,10 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
       mutationOwner = null
       busy.value = false
       modeAppliesNextTurn.value = false
-      if (available) void load()
     }, { flush: 'sync' })
   }
   watch(options.isStreaming, streaming => {
     if (!streaming) modeAppliesNextTurn.value = false
-  })
-  watch(() => options.isDraft(), draft => {
-    if (!draft) void load()
   })
 
   return {
@@ -285,6 +325,9 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
     modeAppliesNextTurn,
     hasAuthoritativeSnapshot,
     initialRoutingMode,
+    effectiveImageInputCapability,
+    imageInputAdmission,
+    imageInputAdmissionReason,
     applyBootstrap,
     load,
     reset,

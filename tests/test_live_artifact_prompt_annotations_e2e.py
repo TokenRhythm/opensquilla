@@ -44,6 +44,52 @@ def _load_module():
 e2e = _load_module()
 
 
+def _router_bundle_is_hydrated(bundle: Path | None = None) -> bool:
+    """Return whether the checked-out Router bundle contains real LFS assets."""
+
+    if bundle is None:
+        bundle = (
+            e2e.SRC_DIR
+            / "opensquilla"
+            / "squilla_router"
+            / "models"
+            / "v4.2_phase3_inference"
+        )
+    manifest_path = bundle / "artifact_manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+
+    pointer_prefix = b"version https://git-lfs.github.com/spec/v1"
+    for entry in manifest.get("files", []):
+        raw_path = entry.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            continue
+        path = bundle / raw_path
+        try:
+            with path.open("rb") as handle:
+                if handle.read(len(pointer_prefix)) == pointer_prefix:
+                    return False
+        except OSError:
+            return False
+    return True
+
+
+def test_router_bundle_hydration_guard_detects_lfs_pointer(tmp_path: Path) -> None:
+    manifest = {"files": [{"path": "model.onnx"}]}
+    (tmp_path / "artifact_manifest.json").write_text(
+        json.dumps(manifest),
+        encoding="utf-8",
+    )
+    model = tmp_path / "model.onnx"
+    model.write_bytes(b"version https://git-lfs.github.com/spec/v1\n")
+    assert _router_bundle_is_hydrated(tmp_path) is False
+
+    model.write_bytes(b"hydrated-router-model")
+    assert _router_bundle_is_hydrated(tmp_path) is True
+
+
 class _DeterministicArtifactProvider:
     """Local OpenAI-compatible fixture for one real Direct mutation turn."""
 
@@ -440,30 +486,31 @@ def test_isolated_home_environment_supports_path_home_in_child(tmp_path: Path) -
     assert env["USERPROFILE"] == str(isolated_home.resolve())
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Windows isolated-profile ACL smoke")
-def test_isolated_home_environment_supports_windows_acl_hardening(tmp_path: Path) -> None:
+@pytest.mark.skipif(os.name != "nt", reason="Windows isolated-profile migration smoke")
+def test_isolated_home_environment_supports_lightweight_sandbox_migration(
+    tmp_path: Path,
+) -> None:
     isolated_home = tmp_path / "user-state"
     isolated_home.mkdir()
-    protected = tmp_path / "protected"
-    protected.mkdir()
+    config = isolated_home / "config.toml"
+    config.write_text('[sandbox]\nrun_mode = "trusted"\n', encoding="utf-8")
     env = e2e._worker_environment("synthetic-rotated-key")
     e2e._apply_isolated_home_environment(env, isolated_home)
     env["PYTHONPATH"] = str(e2e.SRC_DIR)
     code = (
         "from pathlib import Path; import sys; "
-        "from opensquilla.sandbox.upgrade_migration import "
-        "_current_windows_user_sid, _protect_private_path; "
-        "print('acl-child-imported', flush=True); "
-        "sid = _current_windows_user_sid(); "
-        "print(f'acl-child-sid={sid}', flush=True); "
-        "_protect_private_path(Path(sys.argv[1]), directory=True, "
-        "windows_user_sid=sid); "
-        "print('acl-child-protected', flush=True)"
+        "from opensquilla.sandbox.upgrade_migration import SandboxUpgradeCoordinator; "
+        "report = SandboxUpgradeCoordinator(Path(sys.argv[1])).run(); "
+        "assert report.ok, report; "
+        "assert report.status == 'committed', report; "
+        "assert 'run_mode = \"safe\"' in "
+        "(Path(sys.argv[1]) / 'config.toml').read_text(encoding='utf-8'); "
+        "print('sandbox-migration-complete', flush=True)"
     )
 
     try:
         subprocess.run(
-            [sys.executable, "-c", code, str(protected)],
+            [sys.executable, "-c", code, str(isolated_home)],
             check=True,
             capture_output=True,
             env=env,
@@ -472,12 +519,12 @@ def test_isolated_home_environment_supports_windows_acl_hardening(tmp_path: Path
         )
     except subprocess.TimeoutExpired as exc:
         raise AssertionError(
-            f"isolated Windows ACL hardening timed out: stdout={exc.stdout!r} "
+            f"isolated Windows sandbox migration timed out: stdout={exc.stdout!r} "
             f"stderr={exc.stderr!r}"
         ) from exc
     except subprocess.CalledProcessError as exc:
         raise AssertionError(
-            f"isolated Windows ACL hardening failed: stdout={exc.stdout!r} "
+            f"isolated Windows sandbox migration failed: stdout={exc.stdout!r} "
             f"stderr={exc.stderr!r}"
         ) from exc
 
@@ -1147,6 +1194,9 @@ async def test_owned_gateway_html_workbench_lifecycle_is_offline_and_immutable(
 async def test_owned_gateway_mutations_use_real_rpc_and_local_provider(
     tmp_path: Path,
 ) -> None:
+    if not _router_bundle_is_hydrated():
+        pytest.skip("Squilla Router Git LFS assets are not hydrated in this checkout")
+
     provider = _DeterministicArtifactProvider()
     provider.start()
     driver = e2e.GatewayCertificationDriver(

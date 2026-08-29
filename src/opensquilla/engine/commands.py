@@ -13,6 +13,10 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from opensquilla.contracts.generated.v4.sessions_list_metadata import (
+    SESSIONS_LIST_METHOD,
+)
+
 
 class Surface(StrEnum):
     """Chat surface that may render a slash command.
@@ -636,7 +640,7 @@ _COMMANDS: tuple[CommandDef, ...] = (
         name="/sessions",
         usage="/sessions [limit]",
         description="List recent sessions.",
-        execution={_T: _local("sessions.list")},
+        execution={_T: _local(SESSIONS_LIST_METHOD)},
         category=CommandCategory.NAVIGATION,
         busy_policy=CommandBusyPolicy.IMMEDIATE,
         presentation=CommandPresentation.PICKER,

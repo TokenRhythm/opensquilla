@@ -550,6 +550,17 @@ function nativeWorkbenchFailureReason(event: NativeWorkbenchSurfaceEvent): strin
 }
 
 let gatewayStartPromise: Promise<GatewayState> | null = null
+const GATEWAY_UNEXPECTED_EXIT_RESTART_DELAYS_MS = [1_000, 2_000, 4_000] as const
+interface GatewayReadyAuthority {
+  profileKey: string
+  openFlowRevision: number
+}
+const gatewayReadyProcesses = new WeakMap<ChildProcessWithoutNullStreams, GatewayReadyAuthority>()
+let gatewayUnexpectedExitRestartGeneration = 0
+let gatewayUnexpectedExitRestartAttempt = 0
+let gatewayUnexpectedExitRestartTimer: NodeJS.Timeout | null = null
+let gatewayUnexpectedExitRestartProfileKey: string | null = null
+let gatewayUnexpectedExitRestartOpenFlowRevision = 0
 let onboardingSaveTelemetryAttempt = 0
 const onboardingFlows = new OnboardingFlowCoordinator<
   OnboardingPayload,
@@ -586,6 +597,7 @@ let gatewayConnectionRevision = 0
 let gatewayConnectionInstanceId: string | null = null
 
 function invalidateDesktopOpenFlow(): number {
+  cancelGatewayUnexpectedExitRestart('desktop open flow invalidated')
   desktopOpenFlowRevision += 1
   return desktopOpenFlowRevision
 }
@@ -3156,11 +3168,13 @@ async function loadDesktopSettings(): Promise<DesktopSettingsSnapshot> {
 }
 
 async function saveDesktopSettings(payload: DesktopSettingsPayload): Promise<DesktopSettingsSnapshot> {
+  cancelGatewayUnexpectedExitRestart('desktop settings save started')
   const connection = await saveDesktopCredential(payload)
   return settingsSnapshot(connection)
 }
 
 function clearReusableGatewayState(): void {
+  cancelGatewayUnexpectedExitRestart('Gateway state cleared')
   artifactPreviewLeaseBroker.clear()
   gatewayState.url = ''
   gatewayState.port = 0
@@ -8490,6 +8504,7 @@ async function resumeOwnedGatewayStartup(
 
   gatewayState.status = 'ready'
   gatewayState.error = undefined
+  markGatewayProcessReady(child)
   sendBootStatus('control')
   publishGatewayConnection()
   return gatewayState
@@ -8582,7 +8597,16 @@ async function recoverVerifiedOrphanGatewayBeforeSpawn(
 async function startGateway(): Promise<GatewayState> {
   const startupRevision = desktopOpenFlowRevision
   const startupProfileKey = desktopProfileKey()
-  const isCurrent = () => desktopOpenAuthorityIsCurrent(startupRevision, startupProfileKey)
+  const startupUnexpectedExitRestartGeneration = gatewayUnexpectedExitRestartProfileKey === null
+    ? null
+    : gatewayUnexpectedExitRestartGeneration
+  const isCurrent = () => (
+    desktopOpenAuthorityIsCurrent(startupRevision, startupProfileKey)
+    && (
+      startupUnexpectedExitRestartGeneration === null
+      || startupUnexpectedExitRestartGeneration === gatewayUnexpectedExitRestartGeneration
+    )
+  )
   const reusableGateway = forceOnboardingOnNextStartup
     ? null
     : await reuseHealthyGatewayState(isCurrent)
@@ -8773,6 +8797,10 @@ async function startGateway(): Promise<GatewayState> {
       windowsHide: true,
     }
   )
+  let childSpawnSucceeded = false
+  child.once('spawn', () => {
+    childSpawnSucceeded = true
+  })
   gatewayProcess = child
   gatewayProcessOwnershipContexts.set(child, {
     nonce: gatewayInstanceNonce,
@@ -8803,10 +8831,13 @@ async function startGateway(): Promise<GatewayState> {
   // stable OPENSQUILLA_PROFILE_IN_USE marker printed immediately before exit.
   child.once('close', (code, signal) => {
     const message = `gateway exited code=${code ?? 'null'} signal=${signal ?? 'null'}`
+    const abnormalExit = signal !== null || (code !== null && code !== 0)
     const portConflictExit = gatewayExitLooksLikePortInUse(gatewayOutputTail)
     const exitMessage = portConflictExit ? `${message}\nGateway port is already in use.` : message
     const classifiedMessage = classifyGatewayExitMessage(exitMessage, gatewayOutputTail)
     const isCurrentGateway = gatewayProcess === child
+    const childReadyAuthority = gatewayReadyProcesses.get(child) ?? null
+    const childWasReady = childReadyAuthority !== null
     if (isCurrentGateway) gatewayProcess = null
     writeLogLine(`\n[desktop] ${message}\n`)
     // Release the append fd; without this every (re)start leaks one open handle
@@ -8818,17 +8849,23 @@ async function startGateway(): Promise<GatewayState> {
       publishGatewayConnection()
       return
     }
-    gatewayState.status = 'error'
-    gatewayState.error = classifiedMessage
     childExitMessage = classifiedMessage
-    if (portConflictExit && !hasExplicitGatewayPort()) {
+    if (!childWasReady && portConflictExit && !hasExplicitGatewayPort()) {
       gatewayState.status = 'stopped'
       gatewayState.error = undefined
       publishGatewayConnection()
       return
     }
-    sendBootError(gatewayState.error)
-    publishGatewayConnection()
+    if (abnormalExit) {
+      if (scheduleGatewayUnexpectedExitRestart(
+        classifiedMessage,
+        childWasReady,
+        childReadyAuthority,
+      )) return
+    } else {
+      cancelGatewayUnexpectedExitRestart('Gateway exited normally')
+    }
+    publishTerminalGatewayExitError(classifiedMessage)
   })
 
   // A failed spawn (uv missing in dev, non-executable bundled binary) emits
@@ -8837,6 +8874,15 @@ async function startGateway(): Promise<GatewayState> {
   child.once('error', (err) => {
     const message = `gateway failed to start: ${err instanceof Error ? err.message : String(err)}`
     const isCurrentGateway = gatewayProcess === child
+    // ChildProcess also uses 'error' for failed kill/send operations after a
+    // successful spawn. Only a pre-spawn error proves there is no live child;
+    // an eventual close remains the sole exit authority for a started process.
+    if (childSpawnSucceeded) {
+      if (isCurrentGateway) {
+        desktopLog('gateway_child_process_error', { pid: child.pid, error: message })
+      }
+      return
+    }
     if (isCurrentGateway) gatewayProcess = null
     closeLogStream()
     if (!isCurrentGateway) return
@@ -8846,10 +8892,8 @@ async function startGateway(): Promise<GatewayState> {
       publishGatewayConnection()
       return
     }
-    gatewayState.status = 'error'
-    gatewayState.error = message
-    sendBootError(message)
-    publishGatewayConnection()
+    if (scheduleGatewayUnexpectedExitRestart(message, gatewayReadyProcesses.has(child))) return
+    publishTerminalGatewayExitError(message)
   })
 
   sendBootStatus('gateway-health')
@@ -8879,6 +8923,7 @@ async function startGateway(): Promise<GatewayState> {
   sendBootStatus('control')
   gatewayState.status = 'ready'
   gatewayState.error = undefined
+  markGatewayProcessReady(child)
   publishGatewayConnection()
   return gatewayState
 }
@@ -9113,6 +9158,135 @@ async function createMainWindow(): Promise<BrowserWindow> {
 
 function currentMainWindow(): BrowserWindow | null {
   return mainWindow && !mainWindow.isDestroyed() ? mainWindow : null
+}
+
+function invalidateGatewayUnexpectedExitRestart(): void {
+  gatewayUnexpectedExitRestartGeneration += 1
+  if (gatewayUnexpectedExitRestartTimer) clearTimeout(gatewayUnexpectedExitRestartTimer)
+  gatewayUnexpectedExitRestartTimer = null
+  gatewayUnexpectedExitRestartAttempt = 0
+  gatewayUnexpectedExitRestartProfileKey = null
+  gatewayUnexpectedExitRestartOpenFlowRevision = 0
+}
+
+function cancelGatewayUnexpectedExitRestart(reason: string): void {
+  const active = gatewayUnexpectedExitRestartProfileKey !== null
+    || gatewayUnexpectedExitRestartTimer !== null
+    || gatewayUnexpectedExitRestartAttempt > 0
+  if (active) {
+    desktopLog('gateway_unexpected_exit_restart_cancelled', {
+      attempt: gatewayUnexpectedExitRestartAttempt,
+      reason,
+    })
+  }
+  invalidateGatewayUnexpectedExitRestart()
+}
+
+function gatewayUnexpectedExitRestartAuthorityIsCurrent(generation: number): boolean {
+  return generation === gatewayUnexpectedExitRestartGeneration
+    && gatewayUnexpectedExitRestartProfileKey !== null
+    && !isQuitting
+    && !updateApplying
+    && appExitPhase === 'running'
+    && !desktopWriters.closed
+    && desktopOpenFlowRevision === gatewayUnexpectedExitRestartOpenFlowRevision
+    && desktopProfileKey() === gatewayUnexpectedExitRestartProfileKey
+}
+
+function publishTerminalGatewayExitError(message: string): void {
+  gatewayState.status = 'error'
+  gatewayState.error = message
+  sendBootError(message)
+  publishGatewayConnection()
+}
+
+function markGatewayProcessReady(child: ChildProcessWithoutNullStreams): void {
+  gatewayReadyProcesses.set(child, {
+    profileKey: desktopProfileKey(),
+    openFlowRevision: desktopOpenFlowRevision,
+  })
+  if (gatewayUnexpectedExitRestartProfileKey !== null) {
+    desktopLog('gateway_unexpected_exit_restart_ready', {
+      attempt: gatewayUnexpectedExitRestartAttempt,
+      pid: child.pid,
+      port: gatewayState.port,
+    })
+  }
+  invalidateGatewayUnexpectedExitRestart()
+}
+
+function scheduleGatewayUnexpectedExitRestart(
+  message: string,
+  startNewSeries: boolean,
+  readyAuthority: GatewayReadyAuthority | null = null,
+): boolean {
+  if (!startNewSeries && gatewayUnexpectedExitRestartProfileKey === null) return false
+  if (startNewSeries && gatewayUnexpectedExitRestartProfileKey === null) {
+    if (
+      !readyAuthority
+      || readyAuthority.profileKey !== desktopProfileKey()
+      || readyAuthority.openFlowRevision !== desktopOpenFlowRevision
+    ) return false
+    gatewayUnexpectedExitRestartGeneration += 1
+    gatewayUnexpectedExitRestartProfileKey = readyAuthority.profileKey
+    gatewayUnexpectedExitRestartOpenFlowRevision = readyAuthority.openFlowRevision
+  }
+
+  const generation = gatewayUnexpectedExitRestartGeneration
+  if (!gatewayUnexpectedExitRestartAuthorityIsCurrent(generation)) {
+    cancelGatewayUnexpectedExitRestart('lifecycle authority changed')
+    return false
+  }
+  if (gatewayUnexpectedExitRestartTimer) return true
+
+  if (gatewayUnexpectedExitRestartAttempt >= GATEWAY_UNEXPECTED_EXIT_RESTART_DELAYS_MS.length) {
+    desktopLog('gateway_unexpected_exit_restart_exhausted', {
+      attempts: gatewayUnexpectedExitRestartAttempt,
+      error: message,
+    })
+    invalidateGatewayUnexpectedExitRestart()
+    publishTerminalGatewayExitError(message)
+    return true
+  }
+
+  const attempt = gatewayUnexpectedExitRestartAttempt + 1
+  const delayMs = GATEWAY_UNEXPECTED_EXIT_RESTART_DELAYS_MS[attempt - 1]
+  gatewayUnexpectedExitRestartAttempt = attempt
+  gatewayState.status = 'starting'
+  gatewayState.error = undefined
+  sendBootStatus('gateway-start')
+  publishGatewayConnection()
+  desktopLog('gateway_unexpected_exit_restart_scheduled', {
+    attempt,
+    delayMs,
+    error: message,
+  })
+
+  gatewayUnexpectedExitRestartTimer = setTimeout(() => {
+    if (generation !== gatewayUnexpectedExitRestartGeneration) return
+    gatewayUnexpectedExitRestartTimer = null
+    if (!gatewayUnexpectedExitRestartAuthorityIsCurrent(generation)) {
+      cancelGatewayUnexpectedExitRestart('lifecycle authority changed before restart')
+      return
+    }
+    desktopLog('gateway_unexpected_exit_restart_attempt', { attempt })
+    void ensureGatewayStarted().then((gateway) => {
+      // Owned children reset the series at the exact ready publication point.
+      // Keep this fallback for a healthy reusable result without a child handle.
+      if (
+        gatewayUnexpectedExitRestartAuthorityIsCurrent(generation)
+        && gateway.status === 'ready'
+      ) {
+        invalidateGatewayUnexpectedExitRestart()
+      }
+    }).catch((error) => {
+      if (!gatewayUnexpectedExitRestartAuthorityIsCurrent(generation)) return
+      const retryMessage = error instanceof Error ? error.message : String(error)
+      scheduleGatewayUnexpectedExitRestart(retryMessage, false)
+    })
+  }, delayMs)
+  gatewayUnexpectedExitRestartTimer.unref()
+  return true
 }
 
 function ensureGatewayStarted(): Promise<GatewayState> {
@@ -9562,6 +9736,7 @@ function terminateGatewayProcess(
 }
 
 function stopGateway(): void {
+  cancelGatewayUnexpectedExitRestart('Gateway stop requested')
   artifactPreviewLeaseBroker.clear()
   if (!gatewayProcess || !gatewayState.owned) return
   const child = gatewayProcess
@@ -10998,6 +11173,7 @@ async function waitForGatewayProcessExit(
 async function stopAndJoinAllLifecycleOwnedGateways(
   stopCurrentProcess: (child: ChildProcessWithoutNullStreams) => void = () => stopGateway(),
 ): Promise<boolean> {
+  cancelGatewayUnexpectedExitRestart('Gateway stop/join requested')
   return await stopAndJoinLifecycleProcesses({
     currentProcess: () => (
       gatewayProcess && gatewayState.owned && !hasGatewayProcessExited(gatewayProcess)
@@ -12932,6 +13108,7 @@ ipcMain.handle('desktop:migration:run', async (
   }
 
   publishDesktopMigrationProgress('applying')
+  cancelGatewayUnexpectedExitRestart('profile migration started')
   isQuitting = true
   try {
     // Quiesce the owned gateway before the CLI writes (the uninstall-run
@@ -13237,6 +13414,22 @@ async function performOnboardingSave(
         'onboarding_inactive',
         'OpenSquilla setup is no longer active.',
       ))
+    }
+
+    // Validate credential-backed providers before entering writer admission:
+    // a rejected draft must never reach credential/config persistence. Keep
+    // keyless providers such as Ollama on their existing local-first path.
+    const provider = PROVIDER_BY_ID.get(normalizeProvider(payload.provider))
+    if (provider?.requiresApiKey) {
+      try {
+        const probe = await probeOnboardingProvider(payload)
+        if (!probe.ok) {
+          throw new Error(probe.message || 'Configuration verification failed.')
+        }
+      } catch (error) {
+        if (flow.state === 'saving') flow.state = 'editing'
+        throw error
+      }
     }
 
     let finishWriter: (() => void) | null = null

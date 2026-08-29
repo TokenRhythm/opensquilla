@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 from urllib.parse import urlparse
 
+from opensquilla.contracts.adapters.sessions_list_contract import call_sessions_list
+from opensquilla.contracts.adapters.sessions_resolve_contract import call_sessions_resolve
 from opensquilla.contracts.gateway_transport import (
     ANSWER_GENERATION_RESET_CAPABILITY,
     GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
@@ -689,7 +691,7 @@ class GatewayClient:
         return cast(str, result["key"])
 
     async def list_sessions(self, limit: int = 50) -> dict[str, Any]:
-        return cast(dict[str, Any], await self._call("sessions.list", {"limit": limit}))
+        return await call_sessions_list(self._call, limit=limit)
 
     async def preview_sessions(
         self,
@@ -702,7 +704,7 @@ class GatewayClient:
         return cast(dict[str, Any], await self._call("sessions.preview", params))
 
     async def resolve_session(self, key: str) -> dict[str, Any]:
-        return cast(dict[str, Any], await self._call("sessions.resolve", {"key": key}))
+        return await call_sessions_resolve(self._call, key=key)
 
     async def bootstrap_session(
         self,

@@ -112,6 +112,13 @@ _TUI_DEPENDENCY_FILENAMES: Final = _NODE_DEPENDENCY_FILENAMES | {
     "bun.lock",
 }
 _TUI_HOST_COMPANION_TEST: Final = "tests/test_packaging/test_tui_host_companion.py"
+_GATEWAY_CONTRACT_PREFIXES: Final = (
+    "contracts/gateway/v4/",
+    "scripts/contracts/",
+    "src/opensquilla/contracts/generated/v4/",
+    "tests/contracts/",
+    "tests/fixtures/contracts/gateway/v4/",
+)
 _SKILL_HUB_TESTS: Final = frozenset(
     {
         "tests/test_skills_manifest.py",
@@ -657,6 +664,10 @@ def _is_dependency(path: str) -> bool:
         and lowered.endswith((".in", ".txt"))
         or lowered.endswith((".csproj", ".fsproj", ".vbproj"))
     )
+
+
+def _is_gateway_contract_input(path: str) -> bool:
+    return path.startswith(_GATEWAY_CONTRACT_PREFIXES)
 
 
 def _is_skill_hub_input(path: str) -> bool:
@@ -1478,6 +1489,13 @@ def plan_changes(
         # Dependency metadata must fail closed even when it is added beneath a
         # documentation directory; docs-only routing is not a trust boundary.
         if _is_docs(path) and not _is_dependency(path):
+            if path == "README.md" or (
+                "/" not in path
+                and path.startswith("README.")
+                and path.endswith(".md")
+            ):
+                suites.add("release-packaging")
+                reasons.add("packaging_changed")
             continue
         all_docs = False
 
@@ -1497,6 +1515,7 @@ def plan_changes(
                 {
                     "desktop-recovery-e2e",
                     "frontend-artifact",
+                    "frontend-validation",
                     "macos-recovery",
                     "managed-toolchain",
                     "python-full",
@@ -1544,6 +1563,11 @@ def plan_changes(
         if _is_dependency(path):
             full_fallback = True
             reasons.add("unknown_dependency_manifest")
+            continue
+
+        if _is_gateway_contract_input(path):
+            suites.update({"frontend-artifact", "frontend-validation"})
+            reasons.add("gateway_contract_changed")
             continue
 
         if path == ".github/scripts/windows_test_durations.json":

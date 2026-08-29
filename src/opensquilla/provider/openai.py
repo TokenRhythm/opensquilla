@@ -25,6 +25,7 @@ from opensquilla.execution_status import compact_provider_status, derive_is_erro
 from opensquilla.safety.secret_redaction import redact_secret_text
 from opensquilla.secrets import clean_header_secret
 
+from ._openai_compat_url import _versioned_api_url
 from .app_attribution import is_provider_app_host, provider_app_headers
 from .candidate_artifact import (
     CandidateArtifactBuilder,
@@ -200,25 +201,6 @@ _OPENAI_STREAM_NOOP_CHOICE_KEYS = frozenset(
     {"index", "delta", "finish_reason", "native_finish_reason"}
 )
 _OPENAI_STREAM_NOOP_DELTA_KEYS = frozenset({"content", "role"})
-# Some OpenAI-compatible API roots carry a non-integer version segment before
-# an adapter namespace.  Gemini's documented compatibility root is
-# ``/v1beta/openai``: appending our canonical ``/v1`` again produces the
-# nonexistent ``/v1beta/openai/v1/chat/completions`` endpoint.  Treat these
-# roots exactly like the existing ``/v1`` ... ``/vN`` forms.
-_VERSIONED_BASE_URL_RE = re.compile(
-    r"/v\d+(?:(?:alpha|beta)\d*)?(?:/openai)?$",
-)
-
-
-def _versioned_api_url(base_url: str, path: str) -> str:
-    """Join a canonical ``/v1/...`` path to an API root without duplication."""
-
-    base = base_url.rstrip("/")
-    if path.startswith("/v1/") and _VERSIONED_BASE_URL_RE.search(base):
-        return f"{base}{path[3:]}"
-    return f"{base}{path}"
-
-
 _EPHEMERAL_CACHE_CONTROL: dict[str, str] = {"type": "ephemeral"}
 _DASHSCOPE_MAX_CACHE_MARKERS = 4
 _DASHSCOPE_CACHE_MARKER_ROLES = {"system", "user", "assistant", "tool"}
@@ -3051,8 +3033,13 @@ class OpenAIProvider:
         # Keep configured deployment identity separate from the adapter family
         # (``provider_name``) and wire dialect (``_provider_kind``).  A
         # DashScope or DeepSeek instance still needs OpenAI-family behavior,
-        # but must never be attributed to OpenAI in telemetry.
-        self.provider_id = (provider_id or self.provider_name).strip()
+        # but must never be attributed to OpenAI in telemetry.  Direct
+        # construction (tests, ad-hoc embedding) falls back to the dialect
+        # rather than to ``provider_name``: this adapter serves every
+        # OpenAI-compatible dialect, so ``provider_name`` would attribute a
+        # DashScope or OpenRouter instance to OpenAI, which is exactly what
+        # this field exists to prevent.
+        self.provider_id = (provider_id or self._provider_kind).strip()
         self._compat = compat or compat_policy_for_kind(self._provider_kind)
         self._replay_provider_state = replay_provider_state
         self._provider_routing: Mapping[str, str] = provider_routing or {}
@@ -6190,7 +6177,7 @@ class OpenAIProvider:
                             reasoning = published_capabilities.reasoning
                         result.append(
                             ModelInfo(
-                                provider=self._provider_kind,
+                                provider=self.provider_id,
                                 model_id=model.model_id,
                                 display_name=model.display_name,
                                 context_window=(
@@ -6250,7 +6237,7 @@ class OpenAIProvider:
                 else:
                     models = [
                         ModelInfo(
-                            provider=self._provider_kind,
+                            provider=self.provider_id,
                             model_id=m["id"],
                             display_name=m.get("name", m.get("id", "")),
                             context_window=m.get("context_length", 0),

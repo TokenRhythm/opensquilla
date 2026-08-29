@@ -279,10 +279,13 @@ export class TurnAccumulator {
     input: string,
     running: boolean,
     activityOrder?: number,
+    authoritativeInput = false,
+    presentation?: ChatToolCall['presentation'],
   ): ChatToolCall {
     const existing = this.toolCallsById.get(toolId)
     if (existing) {
-      if (input) this.replaceToolInput(existing, input)
+      if (input || authoritativeInput) this.replaceToolInput(existing, input)
+      if (presentation) existing.presentation = presentation
       return existing
     }
 
@@ -319,6 +322,7 @@ export class TurnAccumulator {
       resultPreview: '',
       isOpen: false,
       activityOrder,
+      presentation,
     }
     this.toolCalls.push(call)
     this.toolCallsById.set(toolId, call)
@@ -360,6 +364,8 @@ export class TurnAccumulator {
           frame.input,
           true,
           frame.activityOrder,
+          frame.authoritativeInput,
+          frame.presentation,
         )
         break
       }
@@ -387,6 +393,8 @@ export class TurnAccumulator {
           frame.input,
           false,
           frame.activityOrder,
+          frame.authoritativeInput,
+          frame.presentation,
         )
         if (!frame.input) this.finalizeToolInput(call)
         call.isRunning = false
@@ -725,14 +733,17 @@ export function foldTurn(
     input: string,
     running: boolean,
     activityOrder?: number,
+    authoritativeInput = false,
+    presentation?: ChatToolCall['presentation'],
   ): ChatToolCall {
     const existing = toolCallsById.get(toolId)
     if (existing) {
-      if (input) {
+      if (input || authoritativeInput) {
         existing.inputRaw = input
         existing.inputPreview = truncateToolPreview(input, 200)
         existing.displayName = toolDisplayName(existing.name, input)
       }
+      if (presentation) existing.presentation = presentation
       return existing
     }
 
@@ -760,6 +771,7 @@ export function foldTurn(
       resultPreview: '',
       isOpen: false,
       activityOrder,
+      presentation,
     }
     toolCalls.push(call)
     toolCallsById.set(toolId, call)
@@ -801,6 +813,8 @@ export function foldTurn(
           frame.input,
           true,
           frame.activityOrder,
+          frame.authoritativeInput,
+          frame.presentation,
         )
         break
       }
@@ -822,6 +836,8 @@ export function foldTurn(
           frame.input,
           false,
           frame.activityOrder,
+          frame.authoritativeInput,
+          frame.presentation,
         )
         tc.isRunning = false
         tc.status = frame.isError ? 'error' : 'success'

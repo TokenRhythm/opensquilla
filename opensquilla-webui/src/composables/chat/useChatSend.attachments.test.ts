@@ -34,6 +34,7 @@ import {
   listPendingMetaDiscards,
   persistPendingMetaDiscard,
 } from '@/utils/chat/metaDiscardOutbox'
+import { RpcTransportError } from '@/lib/rpc'
 import type {
   PendingInputWal,
   ResponseHandoffWalRecord,
@@ -3041,7 +3042,7 @@ describe('useChatSend attachment payloads', () => {
     expect(pendingAttachments.value).toEqual([failed])
   })
 
-  it('restores an unknown-acceptance send for idempotent retry', async () => {
+  it('keeps an accepted=null send out of the composer and replays its exact identity', async () => {
     const ready: Attachment = {
       kind: 'staged',
       local_id: 1,
@@ -3051,27 +3052,38 @@ describe('useChatSend attachment payloads', () => {
     }
     const pendingAttachments = ref<Attachment[]>([ready])
     const pendingSessionIntent = ref<string | null>('NEW')
-    const pendingForkBeforeMessageId = ref<string | null>('msg-B')
     const rpc = {
-      call: vi.fn().mockRejectedValue(new Error('network down')),
+      call: vi.fn()
+        .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+        .mockResolvedValueOnce({
+          sessionKey: 'agent:main:webchat:test',
+          task_id: 'task-replayed',
+        }),
     }
     const { api, options } = makeOptions({
       rpc,
       pendingAttachments,
       pendingSessionIntent,
-      pendingForkBeforeMessageId,
     })
 
     await api.onSend()
 
-    expect(pendingAttachments.value).toEqual([ready])
-    expect(options.inputText.value).toBe('hello')
+    const firstParams = rpc.call.mock.calls[0]?.[1]
+    expect(pendingAttachments.value).toEqual([])
+    expect(options.inputText.value).toBe('')
     expect(pendingSessionIntent.value).toBe('NEW')
-    expect(pendingForkBeforeMessageId.value).toBe('msg-B')
+    expect(options.messages.value.filter(message => message.role === 'user')).toHaveLength(1)
     expect(options.messages.value[options.messages.value.length - 1]).toMatchObject({
       role: 'error',
-      text: 'Send failed: network down',
+      text: 'Send failed: Connection closed',
     })
+
+    await api.onSend()
+
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(firstParams)
+    expect(options.messages.value.filter(message => message.role === 'user')).toHaveLength(1)
+    expect(options.inputText.value).toBe('')
+    expect(pendingSessionIntent.value).toBeNull()
   })
 
   it('sends pending fork target and clears it after chat.send is accepted', async () => {
@@ -4078,13 +4090,13 @@ describe('useChatSend attachment payloads', () => {
     expect(secondParams).not.toHaveProperty('collaborationMode')
   })
 
-  it('replays an unknown-acceptance draft with its original mode and request id', async () => {
+  it('replays an unknown-acceptance attempt with its original mode and request id', async () => {
     const inputText = ref('inspect and plan')
     const pendingSessionIntent = ref<string | null>('new_chat')
     const initialCollaborationMode = ref<CollaborationMode>('plan')
     const rpc = {
       call: vi.fn()
-        .mockRejectedValueOnce(new Error('response lost'))
+        .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
         .mockResolvedValueOnce({
           sessionKey: 'agent:main:webchat:test',
           task_id: 'task-plan',
@@ -4118,7 +4130,7 @@ describe('useChatSend attachment payloads', () => {
     const initialCollaborationMode = ref<CollaborationMode>('plan')
     const rpc = {
       call: vi.fn()
-        .mockRejectedValueOnce(new Error('response lost'))
+        .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
         .mockResolvedValueOnce({
           sessionKey: 'agent:main:webchat:test',
           task_id: 'task-plan',
@@ -6810,7 +6822,7 @@ describe('useChatSend Ensemble image guard', () => {
     expect(pendingAttachments.value).toEqual([image])
   })
 
-  it('blocks a recovered image retry after the user switches to Ensemble', async () => {
+  it('blocks a recovered image retry without restoring it after switching to Ensemble', async () => {
     const image = readyAttachment('image/jpg', { name: 'photo.jpg' })
     const pendingAttachments = ref<Attachment[]>([image])
     const modelRoutingMode = ref<'off' | 'llm_ensemble'>('off')
@@ -6826,8 +6838,8 @@ describe('useChatSend Ensemble image guard', () => {
     await api.onSend()
 
     expect(rpc.call).toHaveBeenCalledOnce()
-    expect(options.inputText.value).toBe('hello')
-    expect(pendingAttachments.value).toEqual([image])
+    expect(options.inputText.value).toBe('')
+    expect(pendingAttachments.value).toEqual([])
   })
 
   it('preserves an auto-drained queued image after routing switches to Ensemble', async () => {

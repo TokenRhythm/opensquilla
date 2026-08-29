@@ -2254,6 +2254,12 @@ class GoalService:
 
         key = canonicalize_session_key(session_key)
         async with self._lock(key):
+            # The unsubscribe observer runs asynchronously. The same
+            # connection may establish a replacement subscription before this
+            # callback acquires the Goal transition lock, making the old loss
+            # notification stale for transport-authority purposes.
+            if conn_id in self._subscriptions.get_message_subscribers(key):
+                return
             lease = self._leases.get(key)
             if lease is None or lease.owner_connection_id != conn_id:
                 return

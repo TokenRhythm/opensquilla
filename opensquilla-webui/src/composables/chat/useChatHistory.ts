@@ -2,6 +2,7 @@ import { nextTick, ref, type Ref } from 'vue'
 import type {
   ChatMessage,
   ChatTimelineSegment,
+  ChatTurnOutcome,
   ChatUsagePayload,
   RawToolCallPayload,
 } from '@/types/chat'
@@ -22,6 +23,7 @@ import {
 } from '@/utils/chat/historyMerge'
 import {
   captureVisibleMessageAnchor,
+  createScrollHandoffGuard,
   restoreMessageAnchor,
   stabilizeMessageAnchor,
 } from '@/utils/chat/scrollAnchor'
@@ -33,6 +35,7 @@ import {
   isRpcAbort,
   phaseCallOptions,
   phaseTimeoutMs,
+  rpcErrorCode,
   type SessionBootstrapPhaseContext,
   type SessionPhaseResult,
 } from '@/composables/chat/sessionBootstrapContract'
@@ -62,12 +65,15 @@ type RpcClient = {
 }
 
 function historyTerminationActions(rpc: RpcClient) {
-  const action = rpc.policy?.concurrent_history_reads === true
+  const timeoutAction = rpc.policy?.concurrent_history_reads === true
     ? 'reject' as const
     : 'reconnect' as const
   return {
-    timeoutAction: action,
-    abortAction: action,
+    // A request that was actually sent to a legacy serial Gateway may need a
+    // bounded reconnect to escape a stuck handler. Navigation cancellation is
+    // request-local and must never own the shared WebSocket lifecycle.
+    timeoutAction,
+    abortAction: 'reject' as const,
   }
 }
 
@@ -445,11 +451,13 @@ function attachHistoryTurnOutcomes(
     }
   })
 
-  // A pre-provider barrier may fail before an assistant transcript row exists.
-  // Materialize one status-only assistant row from the terminal task snapshot
-  // so refresh and reconnect show the completed route/activity trace.
+  // A terminal task may finish before an assistant transcript row exists.
+  // Materialize one activity-only assistant row so refresh and reconnect keep
+  // the durable route/activity trace inspectable.
   for (const outcome of outcomes) {
-    if (!isUsageAccountingBarrier(outcome.errorClass) || !outcome.statusHistory?.length) continue
+    const legacyUsageActivity = isUsageAccountingBarrier(outcome.errorClass)
+      && Boolean(outcome.statusHistory?.length)
+    if (!outcome.activitySnapshot && !legacyUsageActivity) continue
     if (enriched.some(message => message.turnId === outcome.turnId && message.role === 'assistant')) continue
     const turnIndexes = enriched.flatMap((message, index) =>
       message.turnId === outcome.turnId ? [index] : [],
@@ -457,16 +465,34 @@ function attachHistoryTurnOutcomes(
     if (!turnIndexes.length) continue
     const firstTerminalIndex = turnIndexes.find(index => enriched[index]?.role === 'error')
     const insertionIndex = firstTerminalIndex ?? Math.max(...turnIndexes) + 1
-    enriched.splice(insertionIndex, 0, {
+    const activityOnlyMessage: ChatMessage = {
       role: 'assistant',
       text: '',
       ts: outcome.finishedAt ?? null,
       turnId: outcome.turnId,
       turnOutcome: outcome,
-      statusHistory: outcome.statusHistory.map(entry => ({ ...entry })),
+      statusHistory: (outcome.statusHistory || []).map(entry => ({ ...entry })),
       messageId: `terminal-activity:${outcome.taskId || outcome.turnId}`,
       restoredFromHistory: true,
-    })
+    }
+    if (outcome.activitySnapshot) {
+      const snapshotReasoningBlocks = outcome.activitySnapshot.complete
+        ? activityReasoningBlocks(outcome.activitySnapshot, '')
+        : undefined
+      const snapshotComplete = Boolean(
+        outcome.activitySnapshot.complete
+        && snapshotReasoningBlocks !== undefined
+        && activitySnapshotMatchesMessage(outcome.activitySnapshot, activityOnlyMessage),
+      )
+      activityOnlyMessage.activitySnapshot = snapshotComplete
+        ? outcome.activitySnapshot
+        : { ...outcome.activitySnapshot, complete: false }
+      activityOnlyMessage.activitySnapshotIncomplete = !snapshotComplete
+      if (snapshotComplete) {
+        activityOnlyMessage.reasoningBlocks = snapshotReasoningBlocks?.map(block => ({ ...block }))
+      }
+    }
+    enriched.splice(insertionIndex, 0, activityOnlyMessage)
   }
 
   // The task outcome is the durable authority for a pre-provider usage
@@ -651,8 +677,11 @@ export interface UseChatHistoryOptions {
   autoScroll?: Ref<boolean>
   /** Invalidates deferred anchor work when the reused chat viewport changes session. */
   scrollEpoch?: Ref<number>
+  /** Lets application-owned navigation take precedence over deferred viewport corrections. */
+  canApplyViewportCorrection?: () => boolean
   stripTimePrefix: (text: string) => string
   scrollToBottom: () => void
+  onTerminalTask?: (outcome: ChatTurnOutcome) => void
 }
 
 export interface ChatHistoryState {
@@ -668,6 +697,7 @@ export interface ChatHistoryState {
   initialLoadStatus: InitialHistoryLoadStatus
   loadEarlierError: boolean
   recoveryError: boolean
+  sessionMissing: boolean
 }
 
 interface HistoryLoadParams {
@@ -727,7 +757,22 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     initialLoadStatus: 'pending',
     loadEarlierError: false,
     recoveryError: false,
+    sessionMissing: false,
   })
+
+  function notifyTerminalTasks(data: ChatHistoryResponse) {
+    if (!options.onTerminalTask) return
+    for (const raw of data.turn_outcomes || []) {
+      const outcome = normalizeTurnOutcome(raw)
+      if (
+        outcome?.taskId
+        && ['succeeded', 'failed', 'cancelled', 'timeout', 'abandoned', 'interrupted']
+          .includes(outcome.status.toLowerCase())
+      ) {
+        options.onTerminalTask(outcome)
+      }
+    }
+  }
 
   function cancelAnchorStabilization() {
     const stop = stopAnchorStabilization
@@ -882,6 +927,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         : initialLoadError ? 'error' : 'ready',
       loadEarlierError: false,
       recoveryError: prepend ? historyState.value.recoveryError : initialLoadError,
+      sessionMissing: false,
     }
   }
 
@@ -910,6 +956,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       initialLoadStatus: 'pending',
       loadEarlierError: false,
       recoveryError: false,
+      sessionMissing: false,
     }
     return crossedSession
   }
@@ -986,9 +1033,9 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       await options.rpc.waitForConnection(
         phaseTimeoutMs(bootstrap, 'chat.history'),
         bootstrap.signal,
-        nonReconnecting
-          ? nonReconnectingHistoryActions()
-          : historyTerminationActions(options.rpc),
+        // Waiting has not enqueued a history handler. Let the transport-owned
+        // handshake watchdog decide whether this generation is unhealthy.
+        nonReconnectingHistoryActions(),
       )
       if (!isCurrentRequest()) {
         if (requestSeq === historyRequestSeq) {
@@ -1043,6 +1090,8 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           return { ok: !historyState.value.recoveryError }
         }
       }
+
+      if (canonicalAvailable !== false) notifyTerminalTasks(data)
 
       const summaryIds = summaryCompactionIds(data)
       let mapped = attachHistoryTurnOutcomes(
@@ -1123,6 +1172,8 @@ export function useChatHistory(options: UseChatHistoryOptions) {
             flushPendingHistorySync()
             return { ok: false }
           }
+
+          notifyTerminalTasks(bridgeData)
 
           const page = attachHistoryTurnOutcomes(
             (bridgeData.messages || []).map(message =>
@@ -1235,9 +1286,12 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         return { ok: true }
       }
 
-      const prependContainer = params.prepend ? options.threadRef?.value ?? null : null
-      const prependAnchor = captureVisibleMessageAnchor(prependContainer)
-      const prependFallbackHeight = prependAnchor ? 0 : prependContainer?.scrollHeight ?? 0
+      const followingLiveEdge = !params.prepend && (options.autoScroll?.value ?? true)
+      const historyContainer = options.threadRef?.value ?? null
+      const visibleAnchor = !followingLiveEdge
+        ? captureVisibleMessageAnchor(historyContainer)
+        : null
+      const prependFallbackHeight = visibleAnchor ? 0 : historyContainer?.scrollHeight ?? 0
       if (params.prepend) {
         const existing = new Set(previousTranscript.map(messageKey))
         const transcript = interleaveHistoryModelCallSegments(
@@ -1281,29 +1335,68 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       options.lastHeaderRole.value = ''
       options.lastHeaderDay.value = ''
 
-      if (params.prepend) {
+      if (visibleAnchor) {
         await nextTick()
         if (!isCurrentRequest()) return { ok: false, cancelled: true }
-        if (prependAnchor) {
-          restoreMessageAnchor(prependAnchor)
-          stopAnchorStabilization = stabilizeMessageAnchor(prependAnchor, {
+        if (
+          (options.canApplyViewportCorrection?.() ?? true)
+          && restoreMessageAnchor(visibleAnchor)
+        ) {
+          stopAnchorStabilization = stabilizeMessageAnchor(visibleAnchor, {
             isCurrent: () => options.sessionKey.value === key
               && historySessionKey.value === key
               && historyRequestSeq === requestSeq
               && requestScrollEpoch === (options.scrollEpoch?.value ?? 0)
-              && options.threadRef?.value === prependContainer,
-          })
-        } else if (prependContainer) {
-          applyProgrammaticScroll(prependContainer, () => {
-            prependContainer.scrollTop += Math.max(
-              0,
-              prependContainer.scrollHeight - prependFallbackHeight,
-            )
+              && options.threadRef?.value === historyContainer
+              && (options.canApplyViewportCorrection?.() ?? true),
           })
         }
-      } else if (options.autoScroll?.value ?? true) {
+      } else if (params.prepend && historyContainer) {
         await nextTick()
-        options.scrollToBottom()
+        if (!isCurrentRequest()) return { ok: false, cancelled: true }
+        applyProgrammaticScroll(historyContainer, () => {
+          historyContainer.scrollTop += Math.max(
+            0,
+            historyContainer.scrollHeight - prependFallbackHeight,
+          )
+        })
+      } else if (followingLiveEdge) {
+        // Message assignment is one synchronous commit. Install the input
+        // guard immediately afterwards and before yielding to layout.
+        const liveEdgeGuard = historyContainer
+          ? createScrollHandoffGuard(historyContainer)
+          : null
+        try {
+          await nextTick()
+          if (!isCurrentRequest()) return { ok: false, cancelled: true }
+          if (
+            !liveEdgeGuard?.isCancelled()
+            && (options.canApplyViewportCorrection?.() ?? true)
+            && (
+              !historyContainer
+              || (
+                historyContainer.isConnected
+                && options.threadRef?.value === historyContainer
+              )
+            )
+          ) {
+            // The long-history virtualizer may clamp scrollTop while replacing
+            // its rows. That layout event is not reader intent, so restore the
+            // live-edge ownership captured before the commit and mark the
+            // correction as application-owned.
+            if (options.autoScroll) options.autoScroll.value = true
+            if (historyContainer) {
+              applyProgrammaticScroll(historyContainer, () => {
+                historyContainer.scrollTop = historyContainer.scrollHeight
+              })
+              liveEdgeGuard?.acceptCurrentPosition()
+            } else {
+              options.scrollToBottom()
+            }
+          }
+        } finally {
+          liveEdgeGuard?.dispose()
+        }
       }
       // Keep reconnect catch-up moving even when no later live event arrives.
       // Each scheduled request is still bounded to MAX_FORWARD_BRIDGE_PAGES,
@@ -1346,6 +1439,8 @@ export function useChatHistory(options: UseChatHistoryOptions) {
             : historyState.value.initialLoadStatus,
           loadEarlierError: Boolean(params.prepend),
           recoveryError: !params.prepend,
+          sessionMissing: !params.prepend
+            && ['NOT_FOUND', 'SESSION_NOT_FOUND'].includes(rpcErrorCode(error)),
         }
         flushPendingHistorySync()
       }

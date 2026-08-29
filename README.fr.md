@@ -30,7 +30,7 @@
 
 ## Actualités
 
-- 📢 **2026-08-22** — La version anglaise de notre rapport technique est désormais disponible sur aiXiv : [aixiv.260822.000001](https://aixiv.science/abs/aixiv.260822.000001). Voir [Citation](#citation) pour savoir comment citer OpenSquilla.
+- 📢 **2026-08-22** — La version anglaise de notre rapport technique est désormais disponible sur aiXiv : [aixiv.260822.000001](https://aixiv.science/abs/aixiv.260822.000001), et la version chinoise sur ChinaXiv : [202608.00176](https://chinaxiv.org/abs/202608.00176). Voir [Citation](#citation) pour savoir comment citer OpenSquilla.
 
 - 📢 **2026-08-21** — Les versions PDF de notre rapport technique sont désormais disponibles dans ce dépôt : [English](docs/report/opensquilla-report-en.pdf) · [中文](docs/report/opensquilla-report-zh.pdf).
 
@@ -645,87 +645,9 @@ paramètres de concurrence se trouvent dans `opensquilla.toml.example`.
 
 ---
 
-## Nouveautés de la 0.4.1
+## Notes de version
 
-OpenSquilla 0.4.1 est une version de maintenance pour la ligne bureau et Control UI :
-
-- **Fiabilité du bureau** - les vérifications de la passerelle empaquetée couvrent
-  désormais le mode Coding, `code-task` et le démarrage de SquillaRouter, et la gestion
-  des fenêtres/artefacts de bureau est plus stable.
-- **Prise en charge client en six langues** - la Control UI et le client de bureau
-  prennent en charge l'anglais, le chinois simplifié, le japonais, le français,
-  l'allemand et l'espagnol sur les surfaces de premier affichage et de réglages.
-- **Mode Coding et empaquetage du routeur** - les builds de bureau échouent rapidement
-  si les ressources du routeur sont manquantes ou encore des pointeurs Git LFS, ce qui
-  évite des paquets de release dégradés.
-- **Télémétrie et finitions Windows** - la télémétrie d'installation ignore les
-  environnements CI et de test, et les ressources de bureau Windows utilisent le logo
-  OpenSquilla.
-- **Gouvernance de la ligne principale** - les pull requests ordinaires et
-  l'intégration des releases sont alignées autour de `main`, les branches de
-  mainteneur étant réservées aux travaux de release, hotfix, staging, intégration et
-  bac à sable.
-
-Notes complètes : [`CHANGELOG.md`](CHANGELOG.md) ·
-[`docs/releases/0.4.1.md`](docs/releases/0.4.1.md).
-
-## Nouveautés de la 0.2.1
-
-OpenSquilla 0.2.1 est une version de maintenance axée sur le démarrage des paquets de
-release et la fiabilité des Agents à longue durée d'exécution :
-
-- **Démarrage de la version portable Windows** — le lanceur portable détecte et amorce
-  mieux l'environnement d'exécution Visual C++ requis par le routeur ONNX intégré.
-- **Tours d'Agent à longue durée** — les sessions WebUI à forte intensité d'outils se
-  rétablissent plus proprement après des résultats d'outils surdimensionnés, des appels
-  d'outils mal formés, des transferts de livraison d'artefacts et des réponses finales
-  dégradées.
-- **Sortie WebUI plus propre** — les marqueurs d'artefacts générés sont tenus à l'écart
-  de la relecture de chat normale tandis que les fichiers livrés restent visibles.
-- **Score de rappel de la mémoire** — les vecteurs d'embedding locaux et compatibles
-  OpenAI sont normalisés avant la recherche sémantique, et les fortes correspondances
-  de mots-clés restent exploitables lorsque les scores vectoriels sont faibles.
-
-Notes complètes : [`CHANGELOG.md`](CHANGELOG.md) ·
-[notes de version](https://opensquilla.ai/news/).
-
-## Nouveautés de la 0.2.0
-
-Cette version étend OpenSquilla à la migration, au chat en CLI, aux canaux, à la
-planification et aux travaux d'outils de longue durée :
-
-- **Voie de migration depuis des répertoires personnels d'Agent existants** —
-  `opensquilla migrate` prévisualise et applique les imports depuis des répertoires
-  personnels OpenClaw/Hermes existants, y compris la mémoire, les fichiers de persona,
-  les compétences, la configuration MCP/canal, la gestion des conflits et les rapports
-  de migration.
-- **CLI de chat utilisable** — `opensquilla chat` dispose d'une interface terminal
-  stable, d'une sortie en streaming, d'une saisie mise en file d'attente, d'une
-  découverte du mode slash, de bandeaux d'outils/de statut, et d'un comportement
-  d'invite en direct plus déterministe.
-- **Automatisation cron multi-surface** — les tâches cron couvrent désormais les
-  planifications structurées, les exécutions exactes/à intervalle/cron tenant compte du
-  fuseau horaire, la livraison par canal ou webhook, les destinations en cas d'échec,
-  les exécutions manuelles, ainsi que la parité WebUI/CLI/RPC.
-- **Meilleurs canaux Feishu et Discord** — les adaptateurs de canal exposent des
-  métadonnées de capacité plus claires, une gestion des messages privés/de groupe plus
-  sûre, des chemins de fichiers et d'artefacts natifs, et un comportement amélioré des
-  pièces jointes/fils, tandis que les actions privilégiées restent à portée limitée.
-- **Tours de longue durée plus robustes** — les tours échoués sont tenus à l'écart de la
-  relecture du fournisseur, les appels d'outils mal formés sont gérés plus sûrement, et
-  les nouvelles tentatives soumises à approbation attendent les décisions de
-  l'opérateur.
-- **Budget de contexte et d'outils plus intelligent** — la compaction selon le budget du
-  fournisseur, la préservation du cache de prompt, des résultats d'outils bornés et une
-  concurrence consciente des effets de bord rendent les grandes sessions à forte
-  intensité d'outils plus prévisibles.
-- **Finitions de la Web UI et des releases** — l'ordonnancement par récence, la mise en
-  page des tableaux, les contrôles mobiles, les notifications en double, les formulaires
-  de configuration, les URL de release et les voies d'installation sont resserrés pour
-  la 0.2.0.
-
-Notes complètes : [`CHANGELOG.md`](CHANGELOG.md) ·
-[notes de version](https://opensquilla.ai/news/).
+Les détails de chaque version se trouvent dans [`CHANGELOG.md`](CHANGELOG.md) et [`docs/releases/`](docs/releases/).
 
 ---
 

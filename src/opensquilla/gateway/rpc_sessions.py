@@ -22,6 +22,11 @@ from typing import TYPE_CHECKING, Any, NoReturn, cast
 import structlog
 
 from opensquilla.agents.scope import default_workspace_dir, resolve_agent_workspace_dir
+from opensquilla.application.session_directory import (
+    SessionDirectory,
+    SessionSearchProjection,
+    _resolve_session_record_for_bootstrap,
+)
 from opensquilla.artifacts import enrich_artifact_event_dict
 from opensquilla.attachment_refs import (
     PENDING_CHAT_INPUT_MATERIAL_STORE,
@@ -45,6 +50,22 @@ from opensquilla.engine.steps.router_decision_record import (
     drain_pending_flushes_for_sessions,
 )
 from opensquilla.gateway import attachment_ingest as _attachment_ingest
+from opensquilla.gateway.adapters.session_preview import (
+    SystemClock,
+    build_session_preview_application,
+    preview_params_from_v4,
+    preview_query_from_v4_values,
+    preview_result_to_v4,
+)
+from opensquilla.gateway.adapters.sessions_list_contract import (
+    register_sessions_list_contract,
+)
+from opensquilla.gateway.adapters.sessions_resolve_contract import (
+    register_sessions_resolve_contract,
+)
+from opensquilla.gateway.adapters.sessions_search_contract import (
+    register_sessions_search_contract,
+)
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
 from opensquilla.gateway.artifact_product_errors import (
     ArtifactProductErrorCode,
@@ -61,6 +82,7 @@ from opensquilla.gateway.compaction_target import (
     validate_gateway_session_deployment_override,
 )
 from opensquilla.gateway.config import effective_agent_stream_idle_timeout_seconds
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.input_normalization import (
     infer_normalized_input_from_attachments,
     materialize_generated_text_attachments,
@@ -2578,31 +2600,6 @@ def _derive_source_metadata(session: Any) -> dict[str, Any]:
     }
 
 
-async def _resolve_session_node(storage: Any, key: str) -> Any:
-    session = await storage.get_session(key)
-    if session is not None:
-        return session
-
-    sessions = await storage.list_sessions(limit=500)
-    matches: list[Any] = []
-    for candidate in sessions:
-        values = [
-            getattr(candidate, "session_key", ""),
-            getattr(candidate, "session_id", ""),
-            getattr(candidate, "display_name", "") or "",
-            getattr(candidate, "derived_title", "") or "",
-        ]
-        if any(str(value) == key or str(value).startswith(key) for value in values if value):
-            matches.append(candidate)
-
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
-        candidates = ", ".join(str(getattr(match, "session_key", "")) for match in matches[:5])
-        raise ValueError(f"Ambiguous session id {key!r}; matches: {candidates}")
-    raise KeyError(f"Session not found: {key}")
-
-
 _SESSION_COUNT_VIEW = "session-count-v1"
 _SESSION_LIST_VIEW = "session-list-v1"
 _SESSION_LIST_CURSOR_VERSION = 1
@@ -2683,7 +2680,6 @@ def _decode_session_list_cursor(value: Any) -> SessionListCursor | None:
     )
 
 
-@_d.method("sessions.list", scope="operator.read")
 async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
     """List all sessions."""
     now_ms = int(time.time() * 1000)
@@ -2893,6 +2889,14 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
     return payload
 
 
+_handle_sessions_list_contract = register_sessions_list_contract(
+    _d,
+    _handle_sessions_list,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
 async def _titles_for_keys(
     storage: Any,
     keys: list[str],
@@ -2930,7 +2934,6 @@ async def _titles_for_keys(
     return out
 
 
-@_d.method("sessions.search", scope="operator.read")
 async def _handle_sessions_search(params: dict | None, ctx: RpcContext) -> dict:
     """Search sessions by title and by transcript content.
 
@@ -2943,16 +2946,12 @@ async def _handle_sessions_search(params: dict | None, ctx: RpcContext) -> dict:
     way ``sessions.list`` derives them so results read like the sidebar.
     """
     now_ms = int(time.time() * 1000)
-    query = ""
-    limit = 20
+    raw_query: object = ""
+    raw_limit: object = 20
     if isinstance(params, dict):
-        query = str(params.get("query") or "").strip()
-        try:
-            limit = int(params.get("limit", 20))
-        except (TypeError, ValueError):
-            limit = 20
-    limit = max(1, min(limit, 50))
-
+        raw_query = params.get("query")
+        raw_limit = params.get("limit", 20)
+    query, _ = SessionDirectory.normalize_search_input(raw_query, raw_limit)
     empty = {"sessions": [], "messages": [], "query": query, "ts": now_ms}
     if not query or ctx.session_manager is None:
         return empty
@@ -2960,104 +2959,63 @@ async def _handle_sessions_search(params: dict | None, ctx: RpcContext) -> dict:
     if storage is None:
         return empty
 
-    # Title hits.
-    # Prefer the dedicated global query (matches every session, builds view rows
-    # only for the matches). Fall back to a bounded recent scan for storage
-    # doubles that don't implement it.
-    title_search = getattr(storage, "search_sessions_by_title", None)
-    if callable(title_search):
-        title_sessions = await title_search(query, limit)
-    else:
-        needle = query.lower()
-        recent = await storage.list_sessions(limit=200)
-        title_sessions = [
-            s
-            for s in recent
-            if needle
-            in " ".join(
-                p
-                for p in (
-                    str(getattr(s, "display_name", "") or ""),
-                    str(getattr(s, "derived_title", "") or ""),
-                    str(getattr(s, "subject", "") or ""),
-                )
-                if p
-            ).lower()
-        ][:limit]
-
-    transcript_titles = await _list_transcript_titles(storage, title_sessions)
-    session_hits: list[dict[str, Any]] = []
-    title_keys: set[str] = set()
     channel_types = _channel_types_from_config(getattr(ctx, "config", None))
-    for s in title_sessions:
+
+    def project(session: Any, transcript_title: str) -> SessionSearchProjection:
         view = build_session_view_item(
-            s,
+            session,
             entry_count=0,
             task_rows=[],
             now_ms=now_ms,
-            transcript_title=transcript_titles.get(getattr(s, "session_id", ""), ""),
+            transcript_title=transcript_title,
             channel_types=channel_types,
         )
-        title_keys.add(canonicalize_session_key(s.session_key))
-        session_hits.append(
-            {
-                "key": s.session_key,
-                "title": str(view.get("title") or ""),
-                "effectiveAgentId": view.get("effectiveAgentId"),
-                "surface": view.get("surface"),
-                "updatedAt": view.get("updatedAt"),
-            }
+        return SessionSearchProjection(
+            title=str(view.get("title") or ""),
+            effective_agent_id=view.get("effectiveAgentId"),
+            surface=view.get("surface"),
+            updated_at=view.get("updatedAt"),
         )
 
-    # Content hits.
-    # ASCII queries use the ranked, indexed FTS path. Non-ASCII queries (CJK and
-    # other scripts the FTS tokenizer can't segment) use a substring LIKE scan,
-    # the only option for them. ASCII deliberately has NO LIKE fallback so a
-    # common keystroke can never trigger an unbounded full-table content scan.
-    has_like = hasattr(storage, "search_transcript_like")
-    non_ascii = any(ord(ch) > 127 for ch in query)
-    rows: list[dict[str, Any]] = []
-    try:
-        if non_ascii:
-            if has_like:
-                rows = await storage.search_transcript_like(query, limit=limit)
-        else:
-            rows = await storage.search_transcript(query, limit=limit)
-    except Exception:
-        log.warning("sessions.search.transcript_failed", exc_info=True)
-        rows = []
-
-    # One row per session, never repeating a session already shown as a title
-    # hit, enriched with the session title via a small bounded lookup.
-    pending: list[tuple[str, str, dict[str, Any]]] = []
-    content_keys: set[str] = set()
-    for row in rows:
-        raw_key = str(row.get("session_key") or "")
-        canon = canonicalize_session_key(raw_key)
-        if not canon or canon in title_keys or canon in content_keys:
-            continue
-        content_keys.add(canon)
-        pending.append((raw_key, canon, row))
-
-    title_map = await _titles_for_keys(
-        storage,
-        [canon for _, canon, _ in pending],
-        now_ms,
-        channel_types=channel_types,
+    result = await SessionDirectory(storage).search(
+        raw_query,
+        raw_limit,
+        now_ms=now_ms,
+        project=project,
+        derive_transcript_title=derive_transcript_title,
     )
-    message_hits: list[dict[str, Any]] = []
-    for raw_key, canon, row in pending:
-        message_hits.append(
+    return {
+        "sessions": [
             {
-                "key": raw_key,
-                "title": title_map.get(canon, ""),
-                "role": row.get("role"),
-                "snippet": row.get("snippet") or "",
-                "createdAt": row.get("created_at"),
+                "key": hit.key,
+                "title": hit.projection.title,
+                "effectiveAgentId": hit.projection.effective_agent_id,
+                "surface": hit.projection.surface,
+                "updatedAt": hit.projection.updated_at,
             }
-        )
+            for hit in result.sessions
+        ],
+        "messages": [
+            {
+                "key": hit.key,
+                "title": hit.title,
+                "role": hit.role,
+                "snippet": hit.snippet,
+                "createdAt": hit.created_at,
+            }
+            for hit in result.messages
+        ],
+        "query": result.query,
+        "ts": result.ts,
+    }
 
-    return {"sessions": session_hits, "messages": message_hits, "query": query, "ts": now_ms}
+
+_handle_sessions_search_contract = register_sessions_search_contract(
+    _d,
+    _handle_sessions_search,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 @_d.method("sessions.create", scope="operator.write")
@@ -10029,6 +9987,7 @@ async def _delete_session_with_lifecycle(
 
         get_approval_queue().expire_pending_for_session(canonical_key)
         await storage.delete_session(canonical_key)
+        get_session_streams().evict(canonical_key)
         for pending_input_id, session_ids in pending_material_owners.items():
             _cleanup_pending_input_scopes(
                 ctx=ctx,
@@ -11364,6 +11323,16 @@ async def _hydrate_sessions_messages_metadata(
 @_d.method("sessions.messages.subscribe", scope="operator.read")
 async def _handle_sessions_messages_subscribe(params: dict | None, ctx: RpcContext) -> dict:
     key = _require_key(params)
+    if ":subagent:" in key:
+        storage = get_session_storage(getattr(ctx, "session_manager", None))
+        session = await storage.get_session(key) if storage is not None else None
+        if session is None:
+            raise RpcHandlerError(
+                "SESSION_NOT_FOUND",
+                "Session was deleted or does not exist.",
+                retryable=False,
+                accepted=False,
+            )
     fast_ack = (params or {}).get("fast_ack") is True
     subscription_mgr = getattr(ctx, "subscription_manager", None)
     registered_new = False
@@ -11449,9 +11418,11 @@ async def _handle_sessions_messages_unsubscribe(params: dict | None, ctx: RpcCon
 
 @_d.method("sessions.preview", scope="operator.read")
 async def _handle_sessions_preview(params: dict | None, ctx: RpcContext) -> dict:
-    keys = (params or {}).get("keys")
-    limit = (params or {}).get("limit", 50)
-    now_ms = int(time.time() * 1000)
+    # Preserve the legacy order: a truthy non-mapping params value raises from
+    # ``.get`` before an unavailable manager can produce an empty response.
+    raw_keys, raw_limit = preview_params_from_v4(params)
+    clock = SystemClock()
+    now_ms = clock.now_ms()
 
     if ctx.session_manager is None:
         return {"ts": now_ms, "previews": []}
@@ -11460,46 +11431,19 @@ async def _handle_sessions_preview(params: dict | None, ctx: RpcContext) -> dict
     if storage is None:
         return {"ts": now_ms, "previews": []}
 
-    if keys:
-        sessions = []
-        for k in keys:
-            s = await storage.get_session(k)
-            if s is not None:
-                sessions.append(s)
-    else:
-        sessions = await storage.list_sessions(limit=limit)
+    application = build_session_preview_application(storage, clock=clock)
 
-    previews = []
-    for s in sessions:
-        title = (
-            getattr(s, "display_name", None)
-            or getattr(s, "derived_title", None)
-            or s.session_id[:8]
-        )
-        last_msg = ""
-        try:
-            transcript = await storage.get_transcript(s.session_id, limit=-1)
-            if transcript:
-                # Find the last user or assistant message for preview
-                for entry in reversed(transcript):
-                    if entry.role in ("user", "assistant") and entry.content:
-                        last_msg = entry.content[:120]
-                        break
-        except Exception:
-            pass
-        previews.append(
-            {
-                "key": s.session_key,
-                "title": title,
-                "lastMessage": last_msg,
-                "updatedAt": getattr(s, "updated_at", now_ms),
-            }
-        )
+    # Preview is an interactive read. Keep storage lock acquisition bounded
+    # while preserving the existing key/list selection and response shape.
+    with bounded_interactive_storage_reads():
+        # Key iteration stays inside the same bounded section as the old
+        # handler; malformed iterables therefore fail at the same point.
+        query = preview_query_from_v4_values(raw_keys, raw_limit)
+        result = await application.preview(query)
 
-    return {"ts": now_ms, "previews": previews}
+    return preview_result_to_v4(result)
 
 
-@_d.method("sessions.resolve", scope="operator.read")
 async def _handle_sessions_resolve(params: dict | None, ctx: RpcContext) -> dict:
     key = _require_key(params)
 
@@ -11510,19 +11454,27 @@ async def _handle_sessions_resolve(params: dict | None, ctx: RpcContext) -> dict
     if storage is None:
         raise KeyError("No session storage available")
 
-    session = await _resolve_session_node(storage, key)
+    resolution = await SessionDirectory(storage).resolve(key)
 
     return {
-        "session_key": session.session_key,
-        "session_id": session.session_id,
-        "status": session.status,
-        "agent_id": session.agent_id,
-        "model": getattr(session, "model", None),
-        "workspaceId": getattr(session, "workspace_id", None),
-        "projectWorkspaceDeferred": bool(getattr(session, "workspace_id", None)),
-        "created_at": session.created_at,
-        "updated_at": session.updated_at,
+        "session_key": resolution.key,
+        "session_id": resolution.session_id,
+        "status": resolution.status,
+        "agent_id": resolution.agent_id,
+        "model": resolution.model,
+        "workspaceId": resolution.workspace_id,
+        "projectWorkspaceDeferred": bool(resolution.workspace_id),
+        "created_at": resolution.created_at,
+        "updated_at": resolution.updated_at,
     }
+
+
+_handle_sessions_resolve_contract = register_sessions_resolve_contract(
+    _d,
+    _handle_sessions_resolve,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 async def _bootstrap_epoch(
@@ -12405,7 +12357,7 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
     if storage is None:
         raise KeyError("No session storage available")
 
-    session = await _resolve_session_node(storage, key)
+    session = await _resolve_session_record_for_bootstrap(storage, key)
     session_key = canonicalize_session_key(session.session_key)
     # Capture the cursor before the slower durable reads below.  A client that
     # subscribes from this cursor may see duplicate state (deduped by stable
@@ -12494,6 +12446,12 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
         session_routing_revision=routing["revision"],
         session_routing_source=routing["source"],
     )
+    overlay_live_config = getattr(effective_routing_config, "overlay_live_config", None)
+    effective_runtime_config = (
+        overlay_live_config(ctx.config)
+        if callable(overlay_live_config)
+        else effective_routing_config
+    )
 
     metadata: dict[str, Any] = {
         "session_key": session_key,
@@ -12538,7 +12496,7 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
             "running_count": running_count,
         },
         "runtime": {
-            "model_routing": model_routing_snapshot(effective_routing_config),
+            "model_routing": model_routing_snapshot(effective_runtime_config),
         },
         "routing": routing,
         "collaboration": _plan_collaboration_snapshot(session),

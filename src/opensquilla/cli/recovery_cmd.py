@@ -61,7 +61,7 @@ def sandbox_upgrade_status(
     home: Path = typer.Option(..., "--home", exists=True, file_okay=False),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Inspect the retained sandbox-upgrade journal without changing it."""
+    """Inspect optional sandbox normalization without changing the profile."""
     # Keep the ordinary recovery process below the runtime import boundary.
     # ``opensquilla.sandbox`` exposes a broad public surface at package import
     # time; only this diagnostic command needs the migration implementation.
@@ -71,9 +71,10 @@ def sandbox_upgrade_status(
     if json_output:
         typer.echo(json.dumps(report.to_dict(), ensure_ascii=False, sort_keys=True))
     else:
-        typer.echo(f"{report.status}: {'ready' if report.ok else 'recovery required'}")
-        typer.echo(f"journal: {report.journal_path}")
-        typer.echo(f"snapshot: {report.snapshot_path or '-'}")
+        typer.echo(f"{report.status}: {'ready' if report.ok else 'retry pending'}")
+        legacy_journal = report.journal_path if report.journal_path.exists() else "-"
+        typer.echo(f"legacy journal: {legacy_journal}")
+        typer.echo(f"legacy snapshot: {report.snapshot_path or '-'}")
         if report.error:
             typer.echo(report.error, err=True)
     if not report.ok:

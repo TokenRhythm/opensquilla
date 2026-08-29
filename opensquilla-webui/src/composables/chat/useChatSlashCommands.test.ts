@@ -118,8 +118,8 @@ describe('useChatSlashCommands plan compatibility', () => {
       2_000,
       undefined,
       {
-        timeoutAction: 'reconnect',
-        abortAction: 'reconnect',
+        timeoutAction: 'reject',
+        abortAction: 'reject',
       },
     )
     expect(rpc.call).toHaveBeenCalledWith(

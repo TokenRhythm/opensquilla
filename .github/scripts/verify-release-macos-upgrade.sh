@@ -22,6 +22,7 @@ user_data="${sandbox}/user-data/OpenSquilla"
 profile="${user_data}/opensquilla"
 probe="${GITHUB_WORKSPACE}/.github/scripts/verify-release-profile-preservation.py"
 external_sentinels="${sandbox}/synthetic-system-tools"
+session_recovery_smoke="${GITHUB_WORKSPACE}/desktop/electron/scripts/test-packaged-session-recovery.mjs"
 old_asset="OpenSquilla-0.5.3-mac-arm64.dmg"
 mkdir -p "${old_dir}" "${old_mount}" "${candidate_mount}" "${install_root}" "${user_data}"
 
@@ -75,6 +76,13 @@ kill -0 "${app_pid}"
 kill "${app_pid}" || true
 wait "${app_pid}" || true
 app_pid=""
+
+node "${session_recovery_smoke}" \
+  --executable "${app_binary}" \
+  --user-data-dir "${user_data}" \
+  --session-key agent:main:webchat:release-recovery-long-session \
+  --switch-session-key agent:main:webchat:release-recovery-switch-session \
+  --label "${label}"
 
 gateway_binary="$(find \
   "${install_root}/OpenSquilla.app/Contents/Resources/runtime/gateway" \

@@ -125,7 +125,7 @@ describe('useSessionArtifacts', () => {
       expect.objectContaining({
         timeoutMs: 10_000,
         timeoutAction: 'reconnect',
-        abortAction: 'reconnect',
+        abortAction: 'reject',
         signal: expect.any(AbortSignal),
       }),
     )
@@ -140,14 +140,14 @@ describe('useSessionArtifacts', () => {
       expect.objectContaining({
         timeoutMs: 10_000,
         timeoutAction: 'reconnect',
-        abortAction: 'reconnect',
+        abortAction: 'reject',
         signal: expect.any(AbortSignal),
       }),
     )
     expect(rpc.waitForConnection).toHaveBeenCalledWith(
       10_000,
       expect.any(AbortSignal),
-      { timeoutAction: 'reconnect', abortAction: 'reconnect' },
+      { timeoutAction: 'reject', abortAction: 'reject' },
     )
     expect(api.artifacts.value.map(artifact => artifact.id)).toEqual([
       'art-1',
@@ -278,7 +278,7 @@ describe('useSessionArtifacts', () => {
     expect(callMock.mock.calls[1]?.[2]).toMatchObject({
       timeoutMs: 10_000,
       timeoutAction: 'reconnect',
-      abortAction: 'reconnect',
+      abortAction: 'reject',
     })
     expect(api.artifacts.value.map(artifact => artifact.id)).toEqual(['art-index'])
     expect(api.indexAvailable.value).toBe(false)

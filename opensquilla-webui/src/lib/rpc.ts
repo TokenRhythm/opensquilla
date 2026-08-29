@@ -27,6 +27,8 @@ export interface RpcCallOptions {
   signal?: AbortSignal;
   timeoutAction?: RpcTerminationAction;
   abortAction?: RpcTerminationAction;
+  /** Reject before send unless the current socket still owns this generation. */
+  expectedGeneration?: number;
   /** Called synchronously only after the request frame is accepted by send(). */
   onSent?: (socketGeneration: number) => void;
 }
@@ -88,6 +90,10 @@ export interface RpcFrame {
   error?: string | RpcErrorDetail;
   protocol?: number;
   policy?: Record<string, unknown>;
+  server?: {
+    version?: string;
+    conn_id?: string;
+  };
   features?: {
     methods?: string[];
     events?: string[];
@@ -102,6 +108,8 @@ export type RpcEventHandler = {
 }['bivarianceHack'];
 
 const RECONNECT_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 15_000] as const;
+const CONNECT_CHALLENGE_TIMEOUT_MS = 15_000;
+const CONNECT_HELLO_TIMEOUT_MS = 45_000;
 const WAKE_DEBOUNCE_MS = 100;
 const WAKE_PROBE_TIMEOUT_MS = 3_000;
 
@@ -174,6 +182,10 @@ export class RpcClient {
   private _wakeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   private _wakeProbeTimer: ReturnType<typeof setTimeout> | null = null;
   private _wakeProbeGeneration: number | null = null;
+  private _challengeWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
+  private _challengeWatchdogGeneration: number | null = null;
+  private _helloWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
+  private _helloWatchdogGeneration: number | null = null;
   private _lifecycleWatchStarted = false;
 
   private readonly _handleWakeSignal = (event: Event): void => {
@@ -192,10 +204,15 @@ export class RpcClient {
     this._token = token || null;
     this._guestSessionKey = this._guestSessionKey || loadGuestSessionKey();
     this._autoReconnect = true;
+    this._reconnectAttempt = 0;
     this._startLifecycleWatch();
     this._clearReconnectTimer();
     if (this._ws) {
-      this._retireCurrentSocket(new RpcTransportError('Connection replaced', null), false);
+      this._retireCurrentSocket(
+        new RpcTransportError('Connection replaced', null),
+        false,
+        'connection_replaced'
+      );
     }
     this._doConnect();
   }
@@ -204,7 +221,11 @@ export class RpcClient {
     this._autoReconnect = false;
     this._stopLifecycleWatch();
     this._clearReconnectTimer();
-    this._retireCurrentSocket(new RpcTransportError('Disconnected', null), false);
+    this._retireCurrentSocket(
+      new RpcTransportError('Disconnected', null),
+      false,
+      'client_disconnect'
+    );
     this._rejectAllPending(new RpcTransportError('Disconnected', null));
     this._setState('disconnected');
   }
@@ -225,6 +246,18 @@ export class RpcClient {
         reject(new RpcAbortError(method));
         return;
       }
+      if (
+        options.expectedGeneration !== undefined
+        && options.expectedGeneration !== generation
+      ) {
+        reject(
+          new RpcTransportError(
+            `Connection generation changed before ${method} was sent`,
+            false
+          )
+        );
+        return;
+      }
 
       const id = String(++this._reqId);
       const pending: PendingRequest = {
@@ -243,7 +276,8 @@ export class RpcClient {
         if (this._terminationAction(method, action) === 'reconnect') {
           this._recycleConnection(
             generation,
-            new Error(`Connection recycled after ${method} terminated`)
+            new Error(`Connection recycled after ${method} terminated`),
+            error instanceof RpcTimeoutError ? 'request_timeout' : 'request_abort'
           );
         }
       };
@@ -288,7 +322,7 @@ export class RpcClient {
           false
         );
         this._rejectPending(id, sendError, generation);
-        this._recycleConnection(generation, sendError);
+        this._recycleConnection(generation, sendError, 'request_send_failure');
         return;
       }
       try {
@@ -322,8 +356,31 @@ export class RpcClient {
     return this._state;
   }
 
+  get connectionGeneration(): number {
+    return this._socketGeneration;
+  }
+
   get policy(): Record<string, unknown> {
     return this._policy || {};
+  }
+
+  /**
+   * Recover a connection whose server-side state may no longer be consistent.
+   *
+   * The generation fence prevents cleanup from an obsolete session lease from
+   * retiring a replacement socket that it never owned.
+   */
+  recoverConnectionGeneration(
+    expectedGeneration: number,
+    reason: string = 'Connection consistency recovery requested'
+  ): boolean {
+    if (!this._ws || expectedGeneration !== this._socketGeneration) return false;
+    this._recycleConnection(
+      expectedGeneration,
+      new Error(reason),
+      'generation_consistency_recovery'
+    );
+    return true;
   }
 
   waitForConnection(
@@ -372,7 +429,10 @@ export class RpcClient {
           if (this._state !== 'connected') {
             this._recycleConnection(
               this._socketGeneration,
-              new Error('Connection recycled after waitForConnection terminated')
+              new Error('Connection recycled after waitForConnection terminated'),
+              error instanceof RpcTimeoutError
+                ? 'connection_wait_timeout'
+                : 'connection_wait_abort'
             );
           }
         }
@@ -408,6 +468,10 @@ export class RpcClient {
     this._lastFrameAt = Date.now();
     this._stopTickWatch();
     const generation = ++this._socketGeneration;
+    this._emitTransport('connect_start', generation, {
+      reason: 'connect_requested',
+    });
+    if (!this._autoReconnect || generation !== this._socketGeneration || this._ws) return;
     let socket: WebSocket;
     try {
       socket = new WebSocket(this._url);
@@ -418,6 +482,7 @@ export class RpcClient {
       return;
     }
     this._ws = socket;
+    this._armChallengeWatchdog(socket, generation);
     let handshakeRequestId: string | null = null;
 
     socket.onopen = () => {
@@ -437,6 +502,12 @@ export class RpcClient {
 
       // Handshake: server sends connect.challenge, we reply with connect request
       if (data.type === 'event' && data.event === 'connect.challenge') {
+        if (handshakeRequestId) return;
+        this._clearChallengeWatchdog(generation);
+        this._emitTransport('challenge', generation, {
+          reason: 'server_challenge',
+        });
+        if (!this._isCurrentSocket(socket, generation)) return;
         const authParams = {
           auth: {
             ...(this._token ? { token: this._token } : {}),
@@ -444,12 +515,15 @@ export class RpcClient {
           },
         };
         const id = String(++this._reqId);
-        if (handshakeRequestId) return;
         handshakeRequestId = id;
         this._pending.set(id, {
           resolve: () => {},
           reject: (_err: Error) => {
-            this._recycleConnection(generation, new Error('Connect handshake failed'));
+            this._recycleConnection(
+              generation,
+              new Error('Connect handshake failed'),
+              'connect_request_failure'
+            );
           },
           method: 'connect',
           generation,
@@ -475,11 +549,12 @@ export class RpcClient {
               },
             })
           );
+          this._armHelloWatchdog(socket, generation);
         } catch (error) {
           const sendError =
             error instanceof Error ? error : new Error('Failed to send connect request');
           this._rejectPending(id, sendError, generation);
-          this._recycleConnection(generation, sendError);
+          this._recycleConnection(generation, sendError, 'connect_send_failure');
         }
         return;
       }
@@ -490,6 +565,14 @@ export class RpcClient {
         // onmessage is generation/socket fenced above, and _clearWakeProbe
         // refuses to clear a deadline owned by any replacement generation.
         this._clearWakeProbe(generation);
+        this._clearHandshakeWatchdogs(generation);
+        this._emitTransport('hello', generation, {
+          reason: 'authenticated',
+          ...(typeof data.server?.conn_id === 'string'
+            ? { connId: data.server.conn_id }
+            : {}),
+        });
+        if (!this._isCurrentSocket(socket, generation)) return;
         this._policy = data.policy || null;
         const serverGuestSessionKey = data.auth?.guestSessionKey;
         if (
@@ -541,9 +624,16 @@ export class RpcClient {
       }
     };
 
-    socket.onclose = () => {
+    socket.onclose = (event: CloseEvent) => {
+      if (!this._isCurrentSocket(socket, generation)) return;
+      this._emitTransport('close', generation, {
+        code: event?.code ?? 1006,
+        reason: event?.reason || 'socket_closed',
+        wasClean: event?.wasClean ?? false,
+      });
       if (!this._isCurrentSocket(socket, generation)) return;
       this._ws = null;
+      this._clearHandshakeWatchdogs(generation);
       ++this._socketGeneration;
       this._clearWakeProbe(generation);
       this._stopPing();
@@ -561,6 +651,101 @@ export class RpcClient {
 
   private _isCurrentSocket(socket: WebSocket, generation: number): boolean {
     return this._ws === socket && this._socketGeneration === generation;
+  }
+
+  private _armChallengeWatchdog(socket: WebSocket, generation: number): void {
+    this._clearChallengeWatchdog();
+    this._challengeWatchdogGeneration = generation;
+    this._challengeWatchdogTimer = setTimeout(() => {
+      if (!this._isCurrentSocket(socket, generation) || this._state !== 'connecting') {
+        return;
+      }
+      this._failHandshake(
+        socket,
+        generation,
+        'connect_challenge_timeout',
+        'Timed out waiting for connect challenge'
+      );
+    }, CONNECT_CHALLENGE_TIMEOUT_MS);
+  }
+
+  private _armHelloWatchdog(socket: WebSocket, generation: number): void {
+    this._clearHelloWatchdog();
+    this._helloWatchdogGeneration = generation;
+    this._helloWatchdogTimer = setTimeout(() => {
+      if (!this._isCurrentSocket(socket, generation) || this._state !== 'connecting') {
+        return;
+      }
+      this._failHandshake(
+        socket,
+        generation,
+        'connect_hello_timeout',
+        'Timed out waiting for connect hello'
+      );
+    }, CONNECT_HELLO_TIMEOUT_MS);
+  }
+
+  private _failHandshake(
+    socket: WebSocket,
+    generation: number,
+    reason: string,
+    message: string
+  ): void {
+    if (!this._isCurrentSocket(socket, generation)) return;
+    this._emitTransport('watchdog_timeout', generation, { reason });
+    if (!this._isCurrentSocket(socket, generation)) return;
+    this._emit('_gap', { reason, generation });
+    if (!this._isCurrentSocket(socket, generation)) return;
+    this._retireCurrentSocket(new Error(message), false, reason);
+    this._scheduleReconnect();
+  }
+
+  private _clearChallengeWatchdog(generation?: number): void {
+    if (
+      generation !== undefined
+      && this._challengeWatchdogGeneration !== null
+      && this._challengeWatchdogGeneration !== generation
+    ) {
+      return;
+    }
+    if (this._challengeWatchdogTimer !== null) {
+      clearTimeout(this._challengeWatchdogTimer);
+      this._challengeWatchdogTimer = null;
+    }
+    this._challengeWatchdogGeneration = null;
+  }
+
+  private _clearHelloWatchdog(generation?: number): void {
+    if (
+      generation !== undefined
+      && this._helloWatchdogGeneration !== null
+      && this._helloWatchdogGeneration !== generation
+    ) {
+      return;
+    }
+    if (this._helloWatchdogTimer !== null) {
+      clearTimeout(this._helloWatchdogTimer);
+      this._helloWatchdogTimer = null;
+    }
+    this._helloWatchdogGeneration = null;
+  }
+
+  private _clearHandshakeWatchdogs(generation?: number): void {
+    this._clearChallengeWatchdog(generation);
+    this._clearHelloWatchdog(generation);
+  }
+
+  private _emitTransport(
+    phase: string,
+    generation: number,
+    detail: Record<string, unknown> = {}
+  ): void {
+    this._emit('_transport', {
+      phase,
+      generation,
+      reconnectAttempt: this._reconnectAttempt,
+      ...detail,
+    });
   }
 
   private _terminationAction(
@@ -626,10 +811,20 @@ export class RpcClient {
     }
   }
 
-  private _retireCurrentSocket(error: Error, reconnect: boolean): void {
+  private _retireCurrentSocket(
+    error: Error,
+    reconnect: boolean,
+    reason: string = 'internal_retire'
+  ): void {
     const socket = this._ws;
     const generation = this._socketGeneration;
     this._clearWakeProbe(generation);
+    this._clearHandshakeWatchdogs(generation);
+    this._emitTransport('retire', generation, { reason });
+    // Diagnostic listeners are isolated, but they may still deliberately
+    // replace the connection. Never let this retirement continue onto a socket
+    // installed by such a listener.
+    if (this._ws !== socket || this._socketGeneration !== generation) return;
     if (!socket) {
       this._stopPing();
       this._stopTickWatch();
@@ -654,9 +849,13 @@ export class RpcClient {
     if (reconnect) this._scheduleReconnect(true);
   }
 
-  private _recycleConnection(generation: number, error: Error): void {
+  private _recycleConnection(
+    generation: number,
+    error: Error,
+    reason: string = 'transport_recovery'
+  ): void {
     if (generation !== this._socketGeneration) return;
-    this._retireCurrentSocket(error, true);
+    this._retireCurrentSocket(error, true, reason);
   }
 
   private _clearReconnectTimer(): void {
@@ -727,6 +926,9 @@ export class RpcClient {
 
   private _runWakeProbe(): void {
     if (!this._autoReconnect) return;
+    // A real browser wake is an explicit recovery trigger. Preserve the
+    // finite reconnect contract from #1433 by granting a fresh budget here;
+    // ordinary close/retry cycles still stop after 1/2/4/8/15 seconds.
     this._reconnectAttempt = 0;
 
     let socket = this._ws;
@@ -745,12 +947,22 @@ export class RpcClient {
       } catch (error) {
         this._recycleConnection(
           generation,
-          error instanceof Error ? error : new Error('Wake probe send failed')
+          error instanceof Error ? error : new Error('Wake probe send failed'),
+          'wake_probe_send_failure'
         );
         return;
       }
-    } else if (socket.readyState !== WebSocket.CONNECTING) {
-      this._recycleConnection(generation, new Error('Connection stale after wake'));
+    } else if (socket.readyState === WebSocket.CONNECTING) {
+      // A newly created replacement is already fenced by the 15 second
+      // challenge and 45 second Hello watchdogs. A 3 second wake probe here
+      // would misclassify a valid slow handshake as a stale open connection.
+      return;
+    } else {
+      this._recycleConnection(
+        generation,
+        new Error('Connection stale after wake'),
+        'wake_socket_stale'
+      );
       return;
     }
     this._armWakeProbe(socket, generation);
@@ -763,7 +975,11 @@ export class RpcClient {
       if (!this._isCurrentSocket(socket, generation)) return;
       this._clearWakeProbe(generation);
       this._emit('_gap', { reason: 'wake_probe_timeout' });
-      this._retireCurrentSocket(new Error('Wake probe timed out'), true);
+      this._retireCurrentSocket(
+        new Error('Wake probe timed out'),
+        true,
+        'wake_probe_timeout'
+      );
     }, WAKE_PROBE_TIMEOUT_MS);
   }
 
@@ -826,11 +1042,18 @@ export class RpcClient {
   private _scheduleReconnect(immediate: boolean = false): void {
     if (!this._autoReconnect) return;
     this._clearReconnectTimer();
+    if (!immediate && this._reconnectAttempt >= RECONNECT_BACKOFF_MS.length) return;
     const delay = immediate
       ? 0
-      : RECONNECT_BACKOFF_MS[
-          Math.min(this._reconnectAttempt, RECONNECT_BACKOFF_MS.length - 1)
-        ];
+      : RECONNECT_BACKOFF_MS[this._reconnectAttempt];
+    this._emitTransport('reconnect_scheduled', this._socketGeneration, {
+      reason: immediate ? 'immediate_recovery' : 'transport_backoff',
+      reconnectAttempt: immediate
+        ? this._reconnectAttempt
+        : this._reconnectAttempt + 1,
+      delay,
+    });
+    if (!this._autoReconnect || this._ws) return;
     this._reconnectTimer = setTimeout(() => {
       this._reconnectTimer = null;
       if (!this._autoReconnect || this._ws) return;

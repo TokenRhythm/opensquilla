@@ -25,7 +25,7 @@
 
 ## News
 
-- 📢 **2026-08-22** — The English version of our technical report is now on aiXiv: [aixiv.260822.000001](https://aixiv.science/abs/aixiv.260822.000001). See [Citation](#citation) for how to cite OpenSquilla.
+- 📢 **2026-08-22** — The English version of our technical report is now on aiXiv: [aixiv.260822.000001](https://aixiv.science/abs/aixiv.260822.000001), and the Chinese version is on ChinaXiv: [202608.00176](https://chinaxiv.org/abs/202608.00176). See [Citation](#citation) for how to cite OpenSquilla.
 
 - 📢 **2026-08-21** — PDF versions of our technical report are now available in this repo: [English](docs/report/opensquilla-report-en.pdf) · [中文](docs/report/opensquilla-report-zh.pdf).
 
@@ -698,77 +698,10 @@ settings live in `opensquilla.toml.example`.
 
 ---
 
-## What's New in 0.5.0
+## Release Notes
 
-OpenSquilla 0.5.0 is the first stable release of the 0.5 line, collecting
-Previews 1-4 and the fixes since:
-
-- **Model Ensemble and multi-provider routing** - one turn can run across
-  several models with preset or custom lineups, provider management keeps
-  verified provider state across restarts, and on-device routing keeps
-  classification local.
-- **Safe upgrades and profile protection** - guarded migration previews,
-  profile recovery, and Windows profile-data preservation on uninstall.
-- **Desktop maturity** - signed and notarized macOS builds with in-app
-  updates, gateway boot recovery, and fail-closed restarts.
-- **Usage and cost reporting** - daily usage summaries on a durable ledger
-  with exact billing arithmetic.
-- **Download options** - versioned GitHub assets, multi-architecture GHCR
-  images, and an Alibaba Cloud OSS mirror with stable download aliases.
-  Windows Portable archives remain retired.
-
-Full notes: [`CHANGELOG.md`](CHANGELOG.md) ·
-[`docs/releases/0.5.0.md`](docs/releases/0.5.0.md).
-
-## What's New in 0.2.1
-
-OpenSquilla 0.2.1 is a maintenance release focused on release-package
-startup and long-running agent reliability:
-
-- **Windows portable startup** — the portable launcher better detects and
-  bootstraps the Visual C++ runtime needed by the bundled ONNX router.
-- **Long-running agent turns** — tool-heavy WebUI sessions recover more
-  cleanly from oversized tool results, malformed tool calls, artifact
-  delivery handoffs, and degraded final responses.
-- **Cleaner WebUI output** — generated artifact markers are kept out of
-  normal chat replay while delivered files remain visible.
-- **Memory recall scoring** — local and OpenAI-compatible embedding vectors
-  are normalized before semantic search, and strong keyword matches remain
-  usable when vector scores are low.
-
-Full notes: [`CHANGELOG.md`](CHANGELOG.md) ·
-[release notes](https://opensquilla.ai/news/).
-
-## What's New in 0.2.0
-
-This release expands OpenSquilla across migration, CLI chat, channels,
-scheduling, and long-running tool work:
-
-- **Migration path from existing agent homes** — `opensquilla migrate` previews
-  and applies imports from existing OpenClaw/Hermes homes, including memory,
-  persona files, skills, MCP/channel config, conflict handling, and migration
-  reports.
-- **Usable chat CLI** — `opensquilla chat` has a stable terminal UI, streaming
-  output, queued input, slash-mode discovery, tool/status strips, and more
-  deterministic live prompt behavior.
-- **Cross-surface cron automation** — cron jobs now cover structured schedules,
-  timezone-aware exact/every/cron runs, channel or webhook delivery, failure
-  destinations, manual runs, and WebUI/CLI/RPC parity.
-- **Better Feishu and Discord channels** — channel adapters expose clearer
-  capability metadata, safer DM/group handling, native file and artifact paths,
-  and improved attachment/thread behavior while privileged actions stay scoped.
-- **Sturdier long-running turns** — failed turns are kept out of provider
-  replay, malformed tool calls are handled more safely, and approval-gated
-  retries wait for operator decisions.
-- **Smarter context and tool budgeting** — provider-budget compaction, prompt
-  cache preservation, bounded tool results, and side-effect-aware concurrency
-  make large tool-heavy sessions more predictable.
-- **Web UI and release polish** — recency ordering, table layout, mobile
-  controls, duplicate notifications, setup forms, release URLs, and install
-  paths are tightened for 0.2.0.
-
-Full notes: [`CHANGELOG.md`](CHANGELOG.md) ·
-[release notes](https://opensquilla.ai/news/).
+Per-version highlights live in [`CHANGELOG.md`](CHANGELOG.md) and
+[`docs/releases/`](docs/releases/).
 
 ---
 

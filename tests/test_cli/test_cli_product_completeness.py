@@ -197,6 +197,17 @@ def test_models_list_table_warns_about_provider_listing_errors(monkeypatch):
     assert "auth_invalid" in result.stderr
 
 
+def test_config_port_docs_use_public_top_level_key() -> None:
+    root = Path(__file__).resolve().parents[2]
+    expected = "opensquilla config set port 18791"
+    invalid = "opensquilla config set gateway.port"
+
+    for relative_path in ("docs/cli.md", "README.product.md"):
+        text = (root / relative_path).read_text(encoding="utf-8")
+        assert expected in text, relative_path
+        assert invalid not in text, relative_path
+
+
 def test_config_get_honors_env_path_and_redacts(tmp_path: Path, monkeypatch):
     target = tmp_path / "opensquilla.toml"
     target.write_text(

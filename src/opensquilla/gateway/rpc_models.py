@@ -8,7 +8,7 @@ from typing import Any
 
 from opensquilla.gateway.model_routing import (
     model_routing_patches,
-    model_routing_snapshot,
+    model_routing_public_snapshot,
 )
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.provider.model_catalog import ModelCatalog
@@ -262,7 +262,7 @@ async def _handle_models_routing_get(
 ) -> dict[str, Any]:
     if ctx.config is None:
         raise ValueError("No config available")
-    return model_routing_snapshot(ctx.config)
+    return model_routing_public_snapshot(ctx.config)
 
 
 @_d.method("models.routing.set", scope="operator.write")
@@ -284,7 +284,7 @@ async def _handle_models_routing_set(
         ctx,
     )
     return {
-        **model_routing_snapshot(ctx.config),
+        **model_routing_public_snapshot(ctx.config),
         "patched": list(patch_result.get("patched") or []),
         "restart_required": bool(
             patch_result.get("restartRequired", patch_result.get("restart_required", False))

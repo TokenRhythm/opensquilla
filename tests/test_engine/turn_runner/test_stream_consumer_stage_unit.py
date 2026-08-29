@@ -52,6 +52,7 @@ from opensquilla.engine.types import (
     TextDeltaEvent,
     ThinkingEvent,
     ToolResultEvent,
+    ToolUseEndEvent,
     ToolUseStartEvent,
     WarningEvent,
 )
@@ -65,6 +66,43 @@ from opensquilla.tools.types import ToolContext
 # ---------------------------------------------------------------------------
 # Recording fakes
 # ---------------------------------------------------------------------------
+
+
+def test_tool_presentation_enrichment_is_best_effort() -> None:
+    event = ToolUseStartEvent(tool_use_id="tool-1", tool_name="read_file")
+    presentation = {
+        "category": "file_read",
+        "primaryArguments": ["path"],
+        "argumentDisplay": "primary",
+        "lifecycleDisplay": "boundary",
+    }
+
+    enriched = StreamConsumerStage._with_tool_presentation(
+        event,
+        SimpleNamespace(tool_presentation_payload=lambda _name: presentation),
+    )
+
+    assert enriched is not event
+    assert enriched.tool_presentation == presentation
+
+
+def test_tool_presentation_enrichment_never_breaks_execution() -> None:
+    event = ToolUseStartEvent(tool_use_id="tool-1", tool_name="read_file")
+
+    def fail(_name: str) -> dict[str, Any]:
+        raise ValueError("invalid presentation rule")
+
+    enriched = StreamConsumerStage._with_tool_presentation(
+        event,
+        SimpleNamespace(tool_presentation_payload=fail),
+    )
+
+    assert enriched.tool_presentation == {
+        "category": "generic",
+        "primaryArguments": [],
+        "argumentDisplay": "primary",
+        "lifecycleDisplay": "boundary",
+    }
 
 
 @dataclass
@@ -755,7 +793,7 @@ def test_tool_use_start_handler_preserves_canonical_details_text_segment() -> No
     assert state.turn_segments[0] == {
         "type": "text",
         "text": expected,
-        "presentation": "answer",
+        "presentation": "intermediate",
     }
     assert "".join(state.final_text_parts) == expected
 
@@ -774,11 +812,47 @@ def test_tool_use_start_handler_flushes_text_and_appends_segment() -> None:
         state,
     )
     assert state.turn_segments == [
-        {"type": "text", "text": "pre", "presentation": "answer"},
+        {"type": "text", "text": "pre", "presentation": "intermediate"},
         {"type": "tool_use", "tool_use_id": "t1", "name": "echo", "input": ""},
     ]
     assert state.current_text_parts == []
     assert state.final_text_parts == ["pre"]  # unchanged when not synthetic
+
+
+@pytest.mark.asyncio
+async def test_tool_use_end_persists_input_before_execution_result() -> None:
+    state = _make_state()
+    presentation = {
+        "category": "file_read",
+        "primaryArguments": ["path"],
+        "argumentDisplay": "primary",
+        "lifecycleDisplay": "boundary",
+    }
+    stage, _recordings = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                ToolUseStartEvent(tool_use_id="read-1", tool_name="read_file"),
+                ToolUseEndEvent(
+                    tool_use_id="read-1",
+                    tool_name="read_file",
+                    arguments={"path": "src/app.py", "offset": 500},
+                    tool_presentation=presentation,
+                ),
+            ]
+        )
+    )
+
+    await _drain(stage, _make_input(state=state))
+
+    assert state.turn_segments == [
+        {
+            "type": "tool_use",
+            "tool_use_id": "read-1",
+            "name": "read_file",
+            "input": {"path": "src/app.py", "offset": 500},
+            "tool_presentation": presentation,
+        }
+    ]
 
 
 def test_tool_result_handler_projects_large_write_file_arguments() -> None:
@@ -2113,7 +2187,7 @@ async def test_system_event_normalization_preserves_text_around_tool_boundary(
     assert inp.state.turn_segments[0] == {
         "type": "text",
         "text": "Preparing.",
-        "presentation": "answer",
+        "presentation": "intermediate",
     }
     assert inp.state.current_text_parts == ["Finished."]
     assert "NO_REPLY" not in str(inp.state.turn_segments)
@@ -2192,7 +2266,7 @@ async def test_system_event_removes_bare_marker_after_tool_without_newline() -> 
     assert inp.state.turn_segments[0] == {
         "type": "text",
         "text": "Visible body.",
-        "presentation": "answer",
+        "presentation": "intermediate",
     }
     assert inp.state.current_text_parts == []
     assert inp.state.final_text_parts == ["Visible body."]
@@ -2932,7 +3006,7 @@ async def test_outer_stage_persists_literal_text_before_native_tool_segment() ->
     await _drain(stage, _make_input(state=state))
 
     assert state.turn_segments[:2] == [
-        {"type": "text", "text": literal, "presentation": "answer"},
+        {"type": "text", "text": literal, "presentation": "intermediate"},
         {
             "type": "tool_use",
             "tool_use_id": "native-1",

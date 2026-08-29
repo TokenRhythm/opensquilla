@@ -167,7 +167,15 @@
     },
     "frontend-validation": {
       "execution_inputs": [
-        "opensquilla-webui/**"
+        ".gitattributes",
+        "contracts/gateway/v4/**",
+        "opensquilla-webui/**",
+        "pyproject.toml",
+        "scripts/contracts/**",
+        "src/opensquilla/contracts/generated/v4/**",
+        "tests/contracts/**",
+        "tests/fixtures/contracts/gateway/v4/**",
+        "uv.lock"
       ]
     },
     "wheel-webui-roundtrip": {
@@ -250,6 +258,7 @@
     },
     "release-packaging": {
       "execution_inputs": [
+        "README*.md",
         "README.release.md",
         "RELEASES.md",
         ".github/scripts/prestage-release-to-oss.sh",

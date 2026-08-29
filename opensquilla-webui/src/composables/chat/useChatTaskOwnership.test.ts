@@ -132,4 +132,19 @@ describe('useChatTaskOwnership', () => {
     expect(ownership.runningTaskId.value).toBe('task-A')
     expect([...ownership.queuedTaskIds.value]).toEqual(['task-B'])
   })
+
+  it('does not restore a task that terminal history already settled', () => {
+    const ownership = useChatTaskOwnership()
+    ownership.noteTerminal('task-settled')
+
+    ownership.applySnapshot({
+      run_status: 'running',
+      active_task: { task_id: 'task-settled', status: 'running' },
+      tasks: [{ task_id: 'task-settled', status: 'running' }],
+    } as never, true)
+
+    expect(ownership.isSettled('task-settled')).toBe(true)
+    expect(ownership.runningTaskId.value).toBe('')
+    expect(ownership.hasAuthoritativeWork.value).toBe(false)
+  })
 })

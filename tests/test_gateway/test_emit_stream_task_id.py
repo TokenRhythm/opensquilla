@@ -24,6 +24,9 @@ from opensquilla.engine.types import (
     ThinkingEndEvent,
     ThinkingEvent,
     ThinkingStartEvent,
+    ToolResultEvent,
+    ToolUseDeltaEvent,
+    ToolUseEndEvent,
     ToolUseStartEvent,
 )
 from opensquilla.gateway.boot import (
@@ -98,6 +101,72 @@ async def test_emit_stamps_task_id_on_every_stream_event() -> None:
     assert all(payload.get("task_id") == "task-A" for _, _, payload in emitted)
     assert emitted[-1][2]["model_call_id"] == "1.2"
     assert emitted[-1][2]["iteration"] == 1
+
+
+@pytest.mark.asyncio
+async def test_public_stream_collapses_tool_arguments_to_authoritative_boundaries() -> None:
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+    presentation = {
+        "category": "network_read",
+        "primaryArguments": ["url"],
+        "argumentDisplay": "primary",
+        "lifecycleDisplay": "boundary",
+    }
+
+    async def _stream():
+        yield ToolUseStartEvent(
+            tool_use_id="fetch-1",
+            tool_name="http_request",
+            tool_presentation=presentation,
+        )
+        for _ in range(600):
+            yield ToolUseDeltaEvent(
+                tool_use_id="fetch-1",
+                json_fragment="x" * 100,
+            )
+        arguments = {
+            "url": "https://example.test/report",
+            "headers": {"Authorization": "secret"},
+            "body": "private request body",
+        }
+        yield ToolUseEndEvent(
+            tool_use_id="fetch-1",
+            tool_name="http_request",
+            arguments=arguments,
+            tool_presentation=presentation,
+        )
+        yield ToolResultEvent(
+            tool_use_id="fetch-1",
+            tool_name="http_request",
+            result="ok",
+            arguments=arguments,
+            tool_presentation=presentation,
+        )
+
+    async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        emitted.append((session_key, event_name, payload))
+
+    await _emit_task_runtime_stream_events(
+        _stream(),
+        SESSION,
+        _emitter,
+        idle_timeout=5.0,
+        heartbeat_interval=0.0,
+        task_id="task-A",
+    )
+
+    assert [name for _, name, _ in emitted] == [
+        "session.event.tool_use_start",
+        "session.event.tool_use_end",
+        "session.event.tool_result",
+    ]
+    assert emitted[1][2]["arguments"] == {
+        "url": "https://example.test/report"
+    }
+    assert emitted[1][2]["input"] == {"url": "https://example.test/report"}
+    assert emitted[2][2]["arguments"] == {
+        "url": "https://example.test/report"
+    }
 
 
 @pytest.mark.asyncio

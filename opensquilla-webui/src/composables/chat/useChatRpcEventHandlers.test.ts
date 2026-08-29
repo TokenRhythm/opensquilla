@@ -214,6 +214,38 @@ describe('useChatRpcEventHandlers route-card ownership', () => {
 })
 
 describe('useChatRpcEventHandlers live snapshot restoration', () => {
+  it('starts restored activity at the earliest server event timestamp', () => {
+    const harness = createHarness()
+    harness.stream.isStreaming.value = false
+    try {
+      harness.api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: 'task-clock',
+        current_stream_seq: 2,
+        events: [
+          {
+            event: 'session.event.provider_activity',
+            payload: {
+              session_key: 'agent:main:test', task_id: 'task-clock',
+              stream_seq: 1, emitted_at: 2_000, phase: 'requesting',
+            },
+          },
+          {
+            event: 'session.event.thinking',
+            payload: {
+              session_key: 'agent:main:test', task_id: 'task-clock',
+              stream_seq: 2, emitted_at: 3_000, text: 'reasoning',
+            },
+          },
+        ],
+      })
+
+      expect(harness.stream.startStreaming).toHaveBeenCalledWith(2_000, false)
+    } finally {
+      harness.stop()
+    }
+  })
+
   it('replays a committed tool timeline including its authoritative end', () => {
     const { api, stream, stop } = createHarness()
     try {
@@ -2609,6 +2641,47 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
       api.handlers.onConnectionState('connected')
       expect(stream.resetStreamIdleTimer).toHaveBeenCalledTimes(1)
       expect(stream.resetStreamIdleTimer).toHaveBeenCalledWith({ progress: false })
+    } finally {
+      stop()
+    }
+  })
+
+  it('does not run source-session recovery side effects while a handoff defers transport state', async () => {
+    const deferredRun = {
+      generation: 7,
+      criticalRequestsQueued: Promise.resolve(),
+      history: Promise.resolve({ ok: true }),
+      live: Promise.resolve({
+        authoritative: true,
+        live: true,
+        backgroundOnly: false,
+      }),
+      deferred: true,
+    }
+    const {
+      api,
+      subscribeSession,
+      onSessionSubscribed,
+      loadCurrentSessionUsage,
+      refreshRunModePreference,
+      stream,
+      stop,
+    } = createHarness({
+      handleSessionConnectionState: () => deferredRun,
+    })
+
+    try {
+      vi.mocked(stream.resetStreamIdleTimer).mockClear()
+      api.handlers.onConnectionState('disconnected')
+      api.handlers.onConnectionState('connected')
+      await Promise.resolve()
+      await Promise.resolve()
+
+      expect(subscribeSession).not.toHaveBeenCalled()
+      expect(onSessionSubscribed).not.toHaveBeenCalled()
+      expect(loadCurrentSessionUsage).not.toHaveBeenCalled()
+      expect(refreshRunModePreference).not.toHaveBeenCalled()
+      expect(stream.resetStreamIdleTimer).not.toHaveBeenCalled()
     } finally {
       stop()
     }

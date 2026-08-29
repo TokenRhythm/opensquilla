@@ -187,15 +187,14 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, onActivated, onDeactivated } from 'vue'
+import { ref, computed, inject, onMounted, onUnmounted, onActivated, onDeactivated } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { useRpcStore } from '@/stores/rpc'
 import { useRequest } from '@/composables/useRequest'
 import { requestUsageSnapshot } from '@/composables/usage/useUsageQuery'
 import { effectiveCnyPerUsd } from '@/composables/usage/nativeBilling'
-import { normalizeSessionItem } from '@/composables/useSessions'
-import type { SessionsListResponse } from '@/types/rpc'
+import { SESSION_DIRECTORY_KEY } from '@/modules/sessionDirectory'
 import type { UsageSnapshot } from '@/types/usage'
 import { useToasts } from '@/composables/useToasts'
 import { isOwnedGatewayConnection } from '@/composables/useCliInvocation'
@@ -290,6 +289,9 @@ interface ProvidersStatusData {
 const { t } = useI18n()
 const router = useRouter()
 const rpc = useRpcStore()
+const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
+if (!injectedSessionDirectory) throw new Error('SessionDirectory was not provided')
+const sessionDirectory = injectedSessionDirectory
 const { pushToast } = useToasts()
 const platform = usePlatform()
 
@@ -298,8 +300,6 @@ const platform = usePlatform()
 // ---------------------------------------------------------------------------
 
 const HIDDEN_EVIDENCE_KEYS = new Set(['restart_required', 'restartRequired'])
-const SESSION_COUNT_VIEW = 'session-count-v1'
-
 // Per-panel useRequest instances
 const { data: statusData, refresh: refreshStatus } = useRequest<StatusData>(
   'status',
@@ -308,6 +308,34 @@ const { data: statusData, refresh: refreshStatus } = useRequest<StatusData>(
 )
 const usageData = ref<UsageData | null>(null)
 const usageSnapshot = ref<UsageSnapshot | null>(null)
+
+interface UsageLoadEpoch {
+  id: number
+  signal: AbortSignal
+}
+
+let usageLoadEpochId = 0
+let usageLoadController: AbortController | null = null
+
+function beginUsageLoadEpoch(): UsageLoadEpoch {
+  usageLoadController?.abort()
+  const controller = new AbortController()
+  usageLoadController = controller
+  usageLoadEpochId += 1
+  return { id: usageLoadEpochId, signal: controller.signal }
+}
+
+function cancelUsageLoadEpoch() {
+  usageLoadEpochId += 1
+  usageLoadController?.abort()
+  usageLoadController = null
+}
+
+function isCurrentUsageLoadEpoch(epoch: UsageLoadEpoch): boolean {
+  return usageLoadEpochId === epoch.id
+    && usageLoadController?.signal === epoch.signal
+    && !epoch.signal.aborted
+}
 
 // Derived display values from status panel
 const uptime = computed<string>(() => {
@@ -340,7 +368,7 @@ const costLine = computed<string>(() => {
   return cur === 'CNY' ? `${cny} · ${usd}` : `${usd} · ${cny}`
 })
 
-async function refreshUsage(): Promise<UsageData | null> {
+async function refreshUsage(epoch: UsageLoadEpoch): Promise<UsageData | null> {
   try {
     const snapshot = await requestUsageSnapshot(rpc, 'all', {
       days: false,
@@ -348,7 +376,7 @@ async function refreshUsage(): Promise<UsageData | null> {
       sessions: false,
       cachedSnapshot: usageSnapshot.value,
     })
-    usageSnapshot.value = snapshot
+    if (!isCurrentUsageLoadEpoch(epoch)) return null
     // "Total sessions" counts every session the storage knows about, matching
     // the Sessions page. The ledger's sessionCount only covers sessions that
     // produced usage records, so a session created without a provider call
@@ -358,37 +386,33 @@ async function refreshUsage(): Promise<UsageData | null> {
       snapshot.totals.sessions,
     )
     try {
-      const list = await rpc.call<SessionsListResponse>('sessions.list', {
-        limit: 200,
-        view: SESSION_COUNT_VIEW,
-      })
-      const exactCount = list?.totalCount ?? list?.total_count
-      if (Number.isInteger(exactCount) && Number(exactCount) >= 0) {
-        totalSessions = Number(exactCount)
-      } else {
-        // Older gateways return a bounded list and may use the legacy `keys`
-        // field. Treat it as another lower bound without discarding a newer
-        // ledger or last-known exact count.
-        const legacyRows = list?.sessions ?? list?.keys
-        if (Array.isArray(legacyRows)) {
-          const validRows = legacyRows.filter(
-            (item) => normalizeSessionItem(item) !== null,
-          )
-          totalSessions = Math.max(totalSessions, validRows.length)
-        }
+      const directoryCount = await sessionDirectory.count({ signal: epoch.signal })
+      if (!isCurrentUsageLoadEpoch(epoch)) return null
+      if (directoryCount?.exact) {
+        // The count view is authoritative and may legitimately decrease after
+        // deletion. Do not pin it to a stale cached or usage-ledger value.
+        totalSessions = directoryCount.value
+      } else if (directoryCount) {
+        // Legacy gateways return at most one bounded page. That value is only
+        // a lower bound, so retain the strongest lower bound we already have.
+        totalSessions = Math.max(totalSessions, directoryCount.value)
       }
     } catch {
+      if (!isCurrentUsageLoadEpoch(epoch)) return null
       // Preserve the last exact total while the ledger remains a lower-bound
-      // fallback during a transient sessions.list failure.
+      // fallback during a transient session-directory failure.
     }
+    if (!isCurrentUsageLoadEpoch(epoch)) return null
     const result = {
       totalSessions,
       totalTokens: snapshot.totals.totalTokens,
       totalCostUsd: snapshot.totals.cost,
     }
+    usageSnapshot.value = snapshot
     usageData.value = result
     return result
   } catch {
+    if (!isCurrentUsageLoadEpoch(epoch)) return null
     // Overview usage is an optional KPI. Preserve the last good value while
     // the primary Usage page provides a retryable error state.
     return null
@@ -584,10 +608,12 @@ async function loadChannelStats() {
 
 onDeactivated(() => {
   stopTimers()
+  cancelUsageLoadEpoch()
 })
 
 onUnmounted(() => {
   stopTimers()
+  cancelUsageLoadEpoch()
   clearCopiedCommandTimer()
 })
 
@@ -772,9 +798,10 @@ interface DataLoadOptions {
 }
 
 async function loadData({ deep, silentHealth }: DataLoadOptions) {
+  const usageEpoch = beginUsageLoadEpoch()
   await Promise.all([
     refreshStatus(),
-    refreshUsage(),
+    refreshUsage(usageEpoch),
     loadHealth({ deep, silent: silentHealth }),
   ])
 }

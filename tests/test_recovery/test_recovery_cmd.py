@@ -205,6 +205,33 @@ def test_inspect_command_emits_fixed_json_protocol(tmp_path: Path) -> None:
     assert payload["effective_workspace"] == str(workspace)
 
 
+def test_sandbox_upgrade_status_treats_missing_snapshot_as_non_blocking(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "opensquilla"
+    home.mkdir()
+    (home / "config.toml").write_text(
+        '[sandbox]\nrun_mode = "safe"\n',
+        encoding="utf-8",
+    )
+    (home / ".sandbox-upgrade-v2.json").write_text(
+        json.dumps({"migrationVersion": 2, "status": "committed"}),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        recovery_app,
+        ["sandbox-upgrade-status", "--home", str(home), "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["status"] == "legacy_artifacts_present"
+    assert payload["snapshotPath"] is None
+    assert payload["error"] is None
+
+
 def test_recover_config_command_repairs_corrupt_config_over_json_protocol(
     tmp_path: Path,
     monkeypatch,

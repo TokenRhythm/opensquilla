@@ -19,6 +19,7 @@ async function captureActivityScreenshot(page: Page, name: string) {
 
 interface ActivityFixture {
   failed?: boolean
+  searchTargets?: boolean
 }
 
 interface ControlledActivityLifecycleFixture {
@@ -35,6 +36,7 @@ function wsEvent(event: string, payload: unknown) {
 }
 
 async function mockActivityHistory(page: Page, fixture: ActivityFixture = {}) {
+  const isSearchFixture = fixture.searchTargets === true
   await page.routeWebSocket(/\/ws$/, ws => {
     ws.onMessage(message => {
       let frame: Record<string, unknown>
@@ -61,11 +63,21 @@ async function mockActivityHistory(page: Page, fixture: ActivityFixture = {}) {
               timestamp: Math.floor(Date.now() / 1000) - 30,
               reasoning_content: 'I compared the available evidence before answering.',
               tool_calls: [{
-                tool_use_id: 'activity-search',
-                name: 'web_search',
+                tool_use_id: isSearchFixture ? 'activity-search' : 'activity-tool',
+                name: isSearchFixture ? 'web_search' : 'custom_tool',
                 groupId: 'activity-group',
-                input: { query: 'OpenSquilla activity' },
-                result: fixture.failed ? 'Search service unavailable' : 'One verified result',
+                input: isSearchFixture
+                  ? { query: 'private search query' }
+                  : { name: 'OpenSquilla activity' },
+                result: fixture.failed ? 'Tool unavailable' : 'One verified result',
+                ...(isSearchFixture
+                  ? {
+                      sources: [
+                        { url: 'https://example.test/one', title: 'First result' },
+                        { url: 'https://docs.example.test/two', title: 'Second result' },
+                      ],
+                    }
+                  : {}),
                 is_error: fixture.failed === true,
                 execution_status: { status: fixture.failed ? 'error' : 'success' },
               }],
@@ -430,7 +442,7 @@ test.describe('Completed assistant activity disclosure', () => {
     await expect(processPrefix).toBeHidden()
     await expect(page.getByText('Non-canonical streamed suffix.')).toHaveCount(0)
 
-    const row = activity.locator('.tool-row[data-op="web.search"]')
+    const row = activity.locator('.tool-row[data-op="tool.custom.tool"]')
     await expect(row).toBeHidden()
 
     const summary = activity.locator('.assistant-activity__summary')
@@ -551,6 +563,35 @@ test.describe('Completed assistant activity disclosure', () => {
     await expect(answer).toBeVisible()
   })
 
+  test('keeps web-search URLs collapsed without exposing invocation parameters', async ({ page }) => {
+    await mockActivityHistory(page, { searchTargets: true })
+    await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(`${SESSION_KEY}-search`))
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+
+    const activity = page.getByTestId('assistant-activity')
+    const summary = activity.locator('.assistant-activity__summary')
+    await summary.press('Enter')
+
+    const row = activity.locator('.tool-row[data-op="web.search"]')
+    const targets = activity.locator('.tool-row-target--url')
+    await expect(row).toHaveAttribute('aria-expanded', 'false')
+    await expect(targets).toHaveCount(0)
+    await expect(activity).not.toContainText('private search query')
+    await expect(activity).not.toContainText('INPUT')
+    await expect(activity).not.toContainText('RESULT')
+
+    await row.press('Enter')
+    await expect(row).toHaveAttribute('aria-expanded', 'true')
+    await expect(targets).toHaveCount(2)
+    await expect(targets.nth(0)).toContainText('https://example.test/one')
+    await expect(targets.nth(1)).toContainText('https://docs.example.test/two')
+    await expect(activity).not.toContainText('private search query')
+
+    await row.press('Space')
+    await expect(row).toHaveAttribute('aria-expanded', 'false')
+    await expect(targets).toHaveCount(0)
+  })
+
   test('omits failed work from the activity disclosure', async ({ page }) => {
     await mockActivityHistory(page, { failed: true })
     await page.setViewportSize({ width: 320, height: 844 })
@@ -568,7 +609,7 @@ test.describe('Completed assistant activity disclosure', () => {
     await summary.press('Enter')
     await expect(activity).toHaveAttribute('data-share-expanded', 'true')
     await expect(errorRow).toHaveCount(0)
-    await expect(activity).not.toContainText('Search service unavailable')
+    await expect(activity).not.toContainText('Tool unavailable')
     await expect(activity.locator('.tool-row-section--error')).toHaveCount(0)
     await expect(
       page.getByText('The canonical answer is complete.', { exact: true }),
@@ -683,9 +724,12 @@ test.describe('Live assistant activity lifecycle', () => {
     })
     const inspectRow = liveActivity.locator('.tool-row[data-op="file.inspect"]')
     await expect(inspectRow).toBeVisible()
-    await expect(inspectRow).toHaveAttribute('aria-expanded', 'false')
-    await expect(inspectRow.locator('.tool-row__activity-arrow')).toHaveCount(1)
+    await expect(inspectRow).not.toHaveAttribute('aria-expanded', /.+/)
+    await expect(inspectRow.locator('.tool-row__activity-arrow')).toHaveCount(0)
     await expect(inspectRow.locator('.tool-row__bullet')).toHaveCount(0)
+    const inspectPath = liveActivity.locator('.tool-row-target--path')
+    await expect(inspectPath).toHaveText('…/chat.ts')
+    await expect(inspectPath).not.toHaveAttribute('role', 'button')
     await expect(liveActivity).not.toContainText('/private/project/chat.ts')
     await expect(liveStatus).toHaveText('Working')
     // A cluster still in flight reads in the present tense; it settles into

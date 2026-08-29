@@ -79,7 +79,10 @@ export interface ChatRpcStreamApi {
   isStreaming: Ref<boolean>
   streamBubble: Ref<boolean>
   streamHasVisibleOutput: Ref<boolean>
-  startStreaming: () => void
+  startStreaming: (
+    activityStartedAt?: number | string | null,
+    recordInitialActivity?: boolean,
+  ) => void
   endStreaming: (opts?: { reason?: string, suppressed?: boolean }) => void
   checkpointForUserMessage?: (turnId: string, boundaryKey?: string) => void
   acknowledgeSteerBoundary?: (
@@ -942,13 +945,19 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         }]
       })
       .sort(comparePendingReplayEntries)
+    const restoredStartedAt = replayEntries.reduce<number | undefined>((earliest, entry) => {
+      if (entry.kind !== 'stream') return earliest
+      const startedAt = explicitActivityStartedAt(entry.payload)
+      if (startedAt === undefined) return earliest
+      return earliest === undefined ? startedAt : Math.min(earliest, startedAt)
+    }, undefined)
     // Open/reset the live reducer before accepting the first authoritative
     // snapshot frame. startStreaming() clears the prior turn log, including
     // its accepted activity-order context; doing that from the first event
     // handler would therefore erase that frame's stream_seq and force the
     // entire restored turn onto the legacy reordered renderer.
     if (replayEntries.length > 0 && !stream.isStreaming.value) {
-      stream.startStreaming()
+      stream.startStreaming(restoredStartedAt, false)
     }
     for (const entry of replayEntries) {
       if (entry.kind !== 'stream') continue
@@ -1395,13 +1404,17 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   }
 
   function activityStartedAt(payload: StreamEventEnvelope): number {
+    return explicitActivityStartedAt(payload) ?? Date.now()
+  }
+
+  function explicitActivityStartedAt(payload: StreamEventEnvelope): number | undefined {
     const value = Number(
       payload.started_at
       ?? payload.startedAt
       ?? payload.emitted_at
       ?? payload.emittedAt,
     )
-    return Number.isFinite(value) && value > 0 ? value : Date.now()
+    return Number.isFinite(value) && value > 0 ? value : undefined
   }
 
   function recordActivityPhase(label: string, key = label) {
@@ -2538,6 +2551,12 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   function handleRpcConnectionState(state: string) {
     const stateGeneration = ++connectionStateGeneration
     const recovery = options.handleSessionConnectionState?.(state)
+    if (recovery?.deferred) {
+      // Navigation owns only the logical subscription epoch. While its target
+      // is unresolved, physical state changes must not restart source-session
+      // bootstrap, metadata, usage, or run-mode RPCs on a replacement socket.
+      return
+    }
     if (state === 'connected') {
       clearConnectionLostStatus()
       stream.hideThinkingIndicator()

@@ -795,7 +795,7 @@ class OllamaProvider:
                 data = resp.json()
                 return [
                     ModelInfo(
-                        provider=self.provider_name,
+                        provider=self.provider_id,
                         model_id=m["name"],
                         display_name=m.get("name", ""),
                         context_window=m.get("details", {}).get("context_length", 0),

@@ -9,6 +9,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
 
+from opensquilla.contracts.tool_presentation import ToolPresentationCategory
 from opensquilla.contracts.turn_execution import SurfaceCapabilities
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
 
@@ -448,6 +449,10 @@ class ToolSpec:
     # Trusted declaration that itemless arrays have textual wire semantics.
     # Provider policy still decides whether a request needs the projection.
     allow_string_item_schema_projection: bool = False
+    # Optional semantic declaration consumed only by UI presentation policy.
+    # It never changes provider schemas, validation, authorization, or execution.
+    # Appended for positional compatibility with embedded ToolSpec callers.
+    presentation_category: ToolPresentationCategory | None = None
 
 
 # Registered tool implementation: async fn that accepts keyword args and returns str.

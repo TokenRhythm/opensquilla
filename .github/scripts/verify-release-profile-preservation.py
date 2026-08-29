@@ -13,6 +13,8 @@ from pathlib import Path
 _LABEL_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,80}")
 LONG_SESSION_KEY = "agent:main:webchat:release-recovery-long-session"
 LONG_SESSION_ID = "release-recovery-long-session"
+SWITCH_SESSION_KEY = "agent:main:webchat:release-recovery-switch-session"
+SWITCH_SESSION_ID = "release-recovery-switch-session"
 LONG_SESSION_MESSAGE_COUNT = 320
 _LONG_SESSION_BASE_TIMESTAMP_MS = 1_700_000_000_000
 _RUNTIME_PACK_SENTINEL = b"synthetic retained Runtime Pack payload\n"
@@ -283,6 +285,31 @@ def seed_profile(home: Path, label: str, *, external_root: Path | None = None) -
                 f"Synthetic retained long session ({label})",
             ),
         )
+        connection.execute(
+            """
+            INSERT INTO sessions (
+                session_key,
+                session_id,
+                created_at,
+                updated_at,
+                status,
+                chat_type,
+                label,
+                display_name,
+                channel,
+                agent_id,
+                schema_version
+            ) VALUES (?, ?, ?, ?, 'done', 'direct', ?, ?, 'webchat', 'main', 8)
+            """,
+            (
+                SWITCH_SESSION_KEY,
+                SWITCH_SESSION_ID,
+                _LONG_SESSION_BASE_TIMESTAMP_MS - 2_000,
+                _LONG_SESSION_BASE_TIMESTAMP_MS - 1_000,
+                f"Synthetic retained switch session ({label})",
+                f"Synthetic retained switch session ({label})",
+            ),
+        )
         connection.executemany(
             """
             INSERT INTO transcript_entries (
@@ -363,6 +390,10 @@ def verify_profile(
             "SELECT session_id, label FROM sessions WHERE session_key = ?",
             (LONG_SESSION_KEY,),
         ).fetchone()
+        switch_session_row = connection.execute(
+            "SELECT session_id, label FROM sessions WHERE session_key = ?",
+            (SWITCH_SESSION_KEY,),
+        ).fetchone()
         history_row = connection.execute(
             """
             SELECT
@@ -405,6 +436,14 @@ def verify_profile(
     )
     if session_row != expected_session:
         raise AssertionError(f"sessions.db long-session row changed: {session_row!r}")
+    expected_switch_session = (
+        SWITCH_SESSION_ID,
+        f"Synthetic retained switch session ({label})",
+    )
+    if switch_session_row != expected_switch_session:
+        raise AssertionError(
+            f"sessions.db switch-session row changed: {switch_session_row!r}"
+        )
     expected_history = (
         LONG_SESSION_MESSAGE_COUNT,
         "release-recovery-message-0001",

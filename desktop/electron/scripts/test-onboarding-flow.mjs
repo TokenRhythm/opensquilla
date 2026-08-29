@@ -1,5 +1,6 @@
 import { strict as assert } from 'node:assert'
 import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
+import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -38,6 +39,81 @@ async function waitFor(check, label, timeoutMs = 60_000) {
   }
   const suffix = lastError ? ` Last error: ${lastError.message || lastError}` : ''
   throw new Error(`Timed out waiting for ${label}.${suffix}`)
+}
+
+async function fileExists(path) {
+  try {
+    await readFile(path)
+    return true
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false
+    throw error
+  }
+}
+
+async function startOnboardingProbeServer(initialMode = 'success') {
+  let mode = initialMode
+  const requests = []
+  const server = createServer((request, response) => {
+    const body = []
+    request.on('data', (chunk) => body.push(chunk))
+    request.on('end', () => {
+      requests.push({
+        method: request.method,
+        url: request.url,
+        authorization: request.headers.authorization || '',
+        body: Buffer.concat(body).toString('utf8'),
+      })
+      if (mode === 'reject') {
+        response.writeHead(401, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({
+          error: {
+            message: 'Synthetic credential rejected.',
+            type: 'authentication_error',
+            code: 'invalid_api_key',
+          },
+        }))
+        return
+      }
+      response.writeHead(200, { 'content-type': 'text/event-stream' })
+      response.end([
+        'data: {"id":"chatcmpl-onboarding-test","object":"chat.completion.chunk","created":0,"model":"synthetic-model","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}',
+        '',
+        'data: {"id":"chatcmpl-onboarding-test","object":"chat.completion.chunk","created":0,"model":"synthetic-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}',
+        '',
+        'data: [DONE]',
+        '',
+      ].join('\n'))
+    })
+  })
+  await new Promise((resolveListen, rejectListen) => {
+    const onError = (error) => rejectListen(error)
+    server.once('error', onError)
+    server.listen(0, '127.0.0.1', () => {
+      server.off('error', onError)
+      resolveListen()
+    })
+  })
+  const address = server.address()
+  assert.ok(address && typeof address !== 'string')
+  return {
+    baseUrl: `http://127.0.0.1:${address.port}/v1`,
+    requests,
+    setMode(nextMode) {
+      mode = nextMode
+    },
+    async close() {
+      await new Promise((resolveClose, rejectClose) => {
+        server.close((error) => (error ? rejectClose(error) : resolveClose()))
+      })
+    },
+  }
+}
+
+async function setOnboardingBaseUrl(page, baseUrl) {
+  await page.locator('#baseUrl').evaluate((input, value) => {
+    input.value = value
+  }, baseUrl)
 }
 
 async function readOnboardingTelemetry(userDataDir) {
@@ -635,6 +711,74 @@ async function verifySubmitFeedbackAndSingleFlight() {
 
 await verifySubmitFeedbackAndSingleFlight()
 
+async function verifyProbeBeforePersistenceAndRetry() {
+  const probeServer = await startOnboardingProbeServer('reject')
+  const { app, userDataDir, userDataRoot } = await launchIsolatedOnboarding(
+    'opensquilla-electron-onboarding-probe-test-',
+  )
+  const credentialPath = join(userDataDir, 'desktop-credential.json')
+  const configPath = join(userDataDir, 'opensquilla', 'config.toml')
+  const syntheticKey = 'synthetic-probe-retry-key'
+  try {
+    const page = await setupWindow(app)
+    await page.locator('#providerSelectToggle').click()
+    await page.locator('[data-provider-option="openai"]').click()
+    await page.locator('#apiKey').fill(syntheticKey)
+    await setOnboardingBaseUrl(page, probeServer.baseUrl)
+    const submittedModel = await page.locator('#model').inputValue()
+
+    await page.locator('#finish').click()
+    const errorText = await waitFor(async () => {
+      const text = (await page.locator('#error').innerText()).trim()
+      const formReady = await page.locator('#setup-form').getAttribute('aria-busy') === 'false'
+      return text && formReady && !await page.locator('#finish').isDisabled() ? text : null
+    }, 'rejected provider probe to restore onboarding editing')
+    assert.match(errorText, /401|authentication|credential|API key/i)
+    assert.equal(errorText.includes(syntheticKey), false, 'probe errors must redact the submitted key')
+    assert.equal(await page.locator('#apiKey').inputValue(), syntheticKey)
+    assert.equal(await fileExists(credentialPath), false, 'a rejected probe must not persist credentials')
+    assert.equal(await fileExists(configPath), false, 'a rejected probe must not persist config')
+    const failedTrace = await waitFor(async () => {
+      const records = await readOnboardingTelemetry(userDataDir)
+      return records.find((record) => (
+        record.event === 'onboarding_save_finished' && record.outcome === 'threw'
+      )) || null
+    }, 'rejected provider probe timing trace')
+    assert.equal(failedTrace.writerAdmitted, false)
+    assert.equal(failedTrace.settingsPersistedConfirmed, false)
+    assert.equal(probeServer.requests.length, 1)
+    assert.equal(probeServer.requests[0].method, 'POST')
+    assert.equal(probeServer.requests[0].url, '/v1/chat/completions')
+    assert.equal(probeServer.requests[0].authorization, `Bearer ${syntheticKey}`)
+    assert.equal(JSON.parse(probeServer.requests[0].body).model, submittedModel)
+
+    probeServer.setMode('success')
+    await page.locator('#finish').click()
+    const saved = await waitFor(async () => {
+      if (!await fileExists(credentialPath) || !await fileExists(configPath)) return null
+      return JSON.parse(await readFile(credentialPath, 'utf8'))
+    }, 'successful retry to persist onboarding settings')
+    assert.equal(saved.provider, 'openai')
+    assert.equal(saved.model, submittedModel)
+    assert.equal(saved.baseUrl, probeServer.baseUrl)
+    assert.equal(probeServer.requests.length, 2, 'retry must perform a fresh provider probe')
+    assert.equal(probeServer.requests[1].authorization, `Bearer ${syntheticKey}`)
+    assert.equal(JSON.parse(probeServer.requests[1].body).model, submittedModel)
+  } catch (error) {
+    const desktopLog = await readFile(join(userDataDir, 'logs', 'desktop.log'), 'utf8')
+      .catch(() => '<desktop log unavailable>')
+    throw new Error(`${error?.message || error}\nDesktop log:\n${desktopLog}`, { cause: error })
+  } finally {
+    await app.close().catch(() => {})
+    await probeServer.close().catch(() => {})
+    await rm(userDataRoot, { recursive: true, force: true }).catch(() => {})
+  }
+}
+
+await verifyProbeBeforePersistenceAndRetry()
+
+const successfulProbeServer = await startOnboardingProbeServer()
+
 const { app, userDataDir, userDataRoot } = await launchIsolatedOnboarding(
   'opensquilla-electron-onboarding-test-',
 )
@@ -965,6 +1109,7 @@ try {
   assert.equal(await page.locator('#searchKeyLabel').isVisible(), false)
   assert.equal(await page.locator('#searchApiKeyError').innerText(), '')
   assert.equal(await page.locator('#apiKey').inputValue(), 'synthetic-tokenrhythm-key')
+  await setOnboardingBaseUrl(page, successfulProbeServer.baseUrl)
   await page.locator('#finish').click()
 
   const saved = await waitFor(async () => {
@@ -1005,6 +1150,13 @@ try {
   assert.match(config, /\[squilla_router\.tiers\.c3\][\s\S]*?model = "glm-5.2"[\s\S]*?ensemble_enabled = true/)
   assert.doesNotMatch(config, /thinking_level\s*=/)
   assert.match(config, /\[llm_ensemble\]\nenabled = false/)
+  assert.equal(successfulProbeServer.requests.length, 1)
+  assert.equal(successfulProbeServer.requests[0].url, '/v1/chat/completions')
+  assert.equal(
+    successfulProbeServer.requests[0].authorization,
+    'Bearer synthetic-tokenrhythm-key',
+  )
+  assert.equal(JSON.parse(successfulProbeServer.requests[0].body).model, credential.model)
 
   const readyConnection = await waitFor(async () => {
     const connection = await desktopPage.evaluate(
@@ -1124,5 +1276,6 @@ try {
   }, null, 2))
 } finally {
   await app.close().catch(() => {})
+  await successfulProbeServer.close().catch(() => {})
   await rm(userDataRoot, { recursive: true, force: true }).catch(() => {})
 }
