@@ -30,7 +30,7 @@
 
 ## Neuigkeiten
 
-- 📢 **2026-08-22** — Die englische Version unseres technischen Berichts ist jetzt auf aiXiv verfügbar: [aixiv.260822.000001](https://aixiv.science/abs/aixiv.260822.000001). Wie man OpenSquilla zitiert, steht unter [Zitieren](#zitieren).
+- 📢 **2026-08-22** — Die englische Version unseres technischen Berichts ist jetzt auf aiXiv verfügbar: [aixiv.260822.000001](https://aixiv.science/abs/aixiv.260822.000001), die chinesische Version auf ChinaXiv: [202608.00176](https://chinaxiv.org/abs/202608.00176). Wie man OpenSquilla zitiert, steht unter [Zitieren](#zitieren).
 
 - 📢 **2026-08-21** — PDF-Versionen unseres technischen Berichts sind jetzt in diesem Repository verfügbar: [English](docs/report/opensquilla-report-en.pdf) · [中文](docs/report/opensquilla-report-zh.pdf).
 
