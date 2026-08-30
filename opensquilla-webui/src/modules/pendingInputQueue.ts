@@ -3,7 +3,24 @@ import type { Attachment } from '@/types/chat'
 
 /** Domain-facing representation of a durable pending-input row. */
 export interface PendingInputServerItem {
-  readonly [key: string]: unknown
+  readonly pendingInputId: string
+  readonly clientRequestId: string
+  readonly clientMessageId: string
+  readonly message?: string
+  readonly displayText?: string
+  readonly attachments?: readonly PendingInputServerAttachment[]
+  readonly position?: number
+  readonly revision?: number
+  readonly requestFingerprint?: string
+  readonly promptAnnotationIds?: readonly string[]
+  readonly intent?: string | null
+  readonly confirmedPlainText?: boolean
+}
+
+export interface PendingInputServerAttachment {
+  readonly name: string
+  readonly mime: string
+  readonly size?: number
 }
 
 export interface PendingInputEnqueueRequest {
@@ -21,9 +38,7 @@ export interface PendingInputEnqueueRequest {
 }
 
 export interface PendingInputEnqueueResult {
-  readonly [key: string]: unknown
   requestFingerprint?: string
-  request_fingerprint?: string
   revision?: number
   position?: number
 }
@@ -43,7 +58,7 @@ export interface PendingInputReorderRequest {
 }
 
 export interface PendingInputReorderResult {
-  items?: PendingInputServerItem[]
+  items: PendingInputServerItem[]
 }
 
 /**

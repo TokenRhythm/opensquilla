@@ -41,4 +41,96 @@ describe('pending input queue v4 adapter', () => {
     await adapter.waitForConnection?.({ timeoutMs: 1000 })
     expect(ready).toHaveBeenCalledWith({ timeoutMs: 1000 })
   })
+
+  it('projects legacy aliases and attachment metadata into canonical domain rows', async () => {
+    const request = vi.fn(async (method: string) => {
+      if (method.endsWith('.list')) {
+        return {
+          items: [{
+            pending_input_id: 'p-legacy',
+            client_request_id: 'r-legacy',
+            client_message_id: 'm-legacy',
+            message: 'queued message',
+            display_text: 'queued display',
+            request_fingerprint: 'fp-legacy',
+            prompt_annotation_ids: ['annotation-1'],
+            intent: 'follow_up',
+            confirmedPlainText: true,
+            position: 3,
+            revision: 7,
+            attachments: [{
+              name: 'notes.txt',
+              type: 'text/plain',
+              size: 12,
+              file_uuid: 'must-not-cross-domain-seam',
+            }],
+          }],
+        }
+      }
+      return {}
+    })
+    const adapter = createV4PendingInputQueue({
+      request: request as unknown as <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>,
+      supports: () => true,
+    })
+
+    await expect(adapter.list('s')).resolves.toEqual([{
+      pendingInputId: 'p-legacy',
+      clientRequestId: 'r-legacy',
+      clientMessageId: 'm-legacy',
+      message: 'queued message',
+      displayText: 'queued display',
+      requestFingerprint: 'fp-legacy',
+      promptAnnotationIds: ['annotation-1'],
+      intent: 'follow_up',
+      confirmedPlainText: true,
+      position: 3,
+      revision: 7,
+      attachments: [{ name: 'notes.txt', mime: 'text/plain', size: 12 }],
+    }])
+  })
+
+  it('fails closed on malformed v4 responses in every operation', async () => {
+    let response: unknown = { requestFingerprint: 'fp', revision: 1 }
+    const request = vi.fn(async () => response)
+    const adapter = createV4PendingInputQueue({
+      request: request as unknown as <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>,
+      supports: () => true,
+    })
+    const enqueue = {
+      key: 's',
+      pendingInputId: 'p1',
+      message: 'hello',
+      attachments: [],
+    }
+
+    await expect(adapter.enqueue(enqueue)).resolves.toMatchObject({
+      requestFingerprint: 'fp',
+      revision: 1,
+    })
+
+    response = { requestFingerprint: 'fp' }
+    await expect(adapter.enqueue(enqueue)).rejects.toThrow('Invalid pending enqueue response')
+
+    response = { items: 'not-an-array' }
+    await expect(adapter.list('s')).rejects.toThrow('Invalid pending list response')
+
+    response = { items: [{ pendingInputId: 'p1' }] }
+    await expect(adapter.list('s')).rejects.toThrow('Invalid pending list response')
+
+    response = { items: null }
+    await expect(adapter.reorder({ key: 's', items: [] }))
+      .rejects.toThrow('Invalid pending reorder response')
+
+    response = { items: [{ pendingInputId: 'p1' }] }
+    await expect(adapter.reorder({ key: 's', items: [] }))
+      .rejects.toThrow('Invalid pending reorder response')
+
+    response = null
+    await expect(adapter.cancel({ key: 's', pendingInputId: 'p1' }))
+      .rejects.toThrow('Invalid pending cancel response')
+
+    response = undefined
+    await expect(adapter.cancel({ key: 's', pendingInputId: 'p1' })).resolves.toBeUndefined()
+  })
 })

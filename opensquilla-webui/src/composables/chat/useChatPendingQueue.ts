@@ -18,7 +18,10 @@ import type {
   PendingInputWalRecord,
   PendingInputWalState,
 } from '@/utils/chat/pendingInputWal'
-import type { PendingInputQueuePort } from '@/modules/pendingInputQueue'
+import type {
+  PendingInputQueuePort,
+  PendingInputServerItem,
+} from '@/modules/pendingInputQueue'
 import { snapshotSteerRequest } from './useChatSteerDelivery'
 
 const MAX_PENDING = 5
@@ -444,30 +447,15 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     }
   }
 
-  function attachmentsFromServerItem(serverItem: Record<string, unknown>): Attachment[] {
-    const rawAttachments = Array.isArray(serverItem.attachments)
-      ? serverItem.attachments
-      : []
-    return rawAttachments.flatMap((rawAttachment, index) => {
-      if (!rawAttachment || typeof rawAttachment !== 'object') return []
-      const attachment = rawAttachment as Record<string, unknown>
-      const name = typeof attachment.name === 'string'
-        ? attachment.name
-        : 'attachment'
-      const mime = typeof attachment.mime === 'string'
-        ? attachment.mime
-        : typeof attachment.type === 'string'
-          ? attachment.type
-          : 'application/octet-stream'
-      return [{
-        kind: 'staged' as const,
-        local_id: -(index + 1),
-        name,
-        mime,
-        durable_material: true as const,
-        ...(typeof attachment.size === 'number' ? { size: attachment.size } : {}),
-      }]
-    })
+  function attachmentsFromServerItem(serverItem: PendingInputServerItem): Attachment[] {
+    return (serverItem.attachments || []).map((attachment, index) => ({
+      kind: 'staged' as const,
+      local_id: -(index + 1),
+      name: attachment.name,
+      mime: attachment.mime,
+      durable_material: true as const,
+      ...(typeof attachment.size === 'number' ? { size: attachment.size } : {}),
+    }))
   }
 
   async function ensureServerStaged(item: ChatPendingItem): Promise<void> {
@@ -553,7 +541,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
               await options.pendingInputWal!.delete(pendingInputId).catch(() => {})
               return
             }
-            const fingerprint = response.requestFingerprint ?? response.request_fingerprint
+            const fingerprint = response.requestFingerprint
             const revision = response.revision
             if (typeof fingerprint !== 'string' || !fingerprint) {
               throw new Error('Gateway returned an invalid pending-input acknowledgement')
@@ -727,16 +715,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       const serverItems = Array.isArray(response.items) ? response.items : []
       const serverIds = new Set<string>()
       for (const serverItem of serverItems) {
-        const pendingInputId = String(
-          serverItem.pendingInputId || serverItem.pending_input_id || '',
-        )
-        const clientRequestId = String(
-          serverItem.clientRequestId || serverItem.client_request_id || '',
-        )
-        const clientMessageId = String(
-          serverItem.clientMessageId || serverItem.client_message_id || '',
-        )
-        if (!pendingInputId || !clientRequestId || !clientMessageId) continue
+        const pendingInputId = serverItem.pendingInputId
+        const clientRequestId = serverItem.clientRequestId
+        const clientMessageId = serverItem.clientMessageId
         if (wasRemoved(sessionKey, pendingInputId)) {
           void cancelServerIdentity(sessionKey, pendingInputId).catch(() => {})
           continue
@@ -751,16 +732,12 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
             pendingUiId: pendingInputId,
             text: typeof serverItem.displayText === 'string'
               ? serverItem.displayText
-              : String(serverItem.message || ''),
+              : serverItem.message || '',
             attachments: serverAttachments,
             intent: typeof serverItem.intent === 'string' ? serverItem.intent : null,
-            ...(normalizePromptAnnotationIds(
-              serverItem.promptAnnotationIds || serverItem.prompt_annotation_ids,
-            ).length
+            ...(normalizePromptAnnotationIds(serverItem.promptAnnotationIds).length
               ? {
-                  promptAnnotationIds: normalizePromptAnnotationIds(
-                    serverItem.promptAnnotationIds || serverItem.prompt_annotation_ids,
-                  ),
+                  promptAnnotationIds: normalizePromptAnnotationIds(serverItem.promptAnnotationIds),
                 }
               : {}),
             ...(serverItem.confirmedPlainText === true ? { confirmedPlainText: true } : {}),
@@ -784,15 +761,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           // snapshot with safe server-owned metadata before marking it staged.
           item.attachments = serverAttachments
         }
-        const serverPromptAnnotationIds = normalizePromptAnnotationIds(
-          serverItem.promptAnnotationIds || serverItem.prompt_annotation_ids,
-        )
+        const serverPromptAnnotationIds = normalizePromptAnnotationIds(serverItem.promptAnnotationIds)
         if (serverPromptAnnotationIds.length > 0) {
           item.promptAnnotationIds = serverPromptAnnotationIds
         }
-        item.pendingRequestFingerprint = String(
-          serverItem.requestFingerprint || serverItem.request_fingerprint || '',
-        ) || undefined
+        item.pendingRequestFingerprint = serverItem.requestFingerprint
         item.pendingServerRevision = typeof serverItem.revision === 'number'
           ? serverItem.revision
           : 1
@@ -1864,24 +1837,24 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   }
 
   async function applyServerReorderItems(
-    rawItems: Array<Record<string, unknown>>,
+    items: PendingInputServerItem[],
   ): Promise<void> {
     const byId = new Map(
-      rawItems.map(raw => [String(raw.pendingInputId || raw.pending_input_id || ''), raw]),
+      items.map(item => [item.pendingInputId, item]),
     )
-    const orderedIds = rawItems
+    const orderedIds = items
       .slice()
       .sort((left, right) => Number(left.position) - Number(right.position))
-      .map(raw => String(raw.pendingInputId || raw.pending_input_id || ''))
+      .map(item => item.pendingInputId)
     if (
       orderedIds.length !== pendingQueue.value.length
       || orderedIds.some(id => !id || !byId.has(id))
     ) throw new Error('Gateway returned an incomplete pending order')
     restorePendingOrder(orderedIds)
     for (const item of pendingQueue.value) {
-      const raw = byId.get(item.pendingInputId || '')!
-      item.pendingPosition = Number(raw.position)
-      item.pendingServerRevision = Number(raw.revision)
+      const serverItem = byId.get(item.pendingInputId || '')!
+      item.pendingPosition = Number(serverItem.position)
+      item.pendingServerRevision = Number(serverItem.revision)
       item.pendingWalRevision = (item.pendingWalRevision ?? 0) + 1
     }
     if (!options.pendingInputWal?.putMany) {
@@ -1904,7 +1877,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       const serverOrder = items
         .slice()
         .sort((left, right) => Number(left.position) - Number(right.position))
-        .map(item => String(item.pendingInputId || item.pending_input_id || ''))
+        .map(item => item.pendingInputId)
       await applyServerReorderItems(items)
       if (serverOrder.some((id, index) => id !== expectedOrder[index])) {
         options.onPendingPersistenceError?.('order_conflict')
