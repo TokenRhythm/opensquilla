@@ -937,6 +937,7 @@ import {
 } from '@/composables/chat/sessionBootstrapAdmission'
 import { useChatSessionRuntime } from '@/composables/chat/useChatSessionRuntime'
 import { useChatSessionSubscription } from '@/composables/chat/useChatSessionSubscription'
+import { createConversationRuntime } from '@/modules/conversationRuntime'
 import {
   useChatSlashCommands,
   type DurableMetaDraft,
@@ -1630,6 +1631,10 @@ const runStatus = ref<ChatRunStatus>({ status: 'idle', label: t('chat.status.idl
 // Epoch / seq
 const currentEpoch = ref(0)
 const lastStreamSeq = ref(0)
+// One transport-independent cursor policy is shared by the subscription and
+// event adapters.  The refs remain the reactive projection consumed by older
+// composables until the later ConversationRuntime migration removes them.
+const conversationRuntime = createConversationRuntime()
 const activeTaskGroups = ref<Set<string>>(new Set())
 // Task id whose output the live stream renders; binds late events to the
 // current turn so a prior task can't leak into it (issue 344).
@@ -2514,6 +2519,7 @@ let applyPendingUserInputSnapshot: typeof chatPlans.applyBootstrap = () => {}
 let applyGoalSnapshot: (snapshot: SessionMessagesSubscribeResponse) => void = () => {}
 const chatSessionSubscription = useChatSessionSubscription({
   rpc,
+  conversationRuntime,
   sessionKey,
   lastStreamSeq,
   runStatus,
@@ -3765,9 +3771,11 @@ function onPlanQuestionnaireTouchEnd() {
 }
 
 const rpcEventHandlers = useChatRpcEventHandlers({
+  conversationRuntime,
   sessionKey,
   currentEpoch,
   lastStreamSeq,
+  streamGeneration,
   observeStreamGeneration,
   activeTaskGroups,
   taskOwnership,

@@ -54,6 +54,10 @@ from opensquilla.engine.steps.router_decision_record import (
     drain_pending_flushes_for_sessions,
 )
 from opensquilla.gateway import attachment_ingest as _attachment_ingest
+from opensquilla.gateway.adapters.conversation_runtime import (
+    build_v4_conversation_snapshot_application,
+    snapshot_result_to_v4,
+)
 from opensquilla.gateway.adapters.session_preview import (
     SystemClock,
     build_session_preview_application,
@@ -11381,40 +11385,18 @@ async def _handle_sessions_messages_hydrate(params: dict | None, ctx: RpcContext
 async def _handle_sessions_messages_snapshot(params: dict | None, ctx: RpcContext) -> dict:
     """Return a compact active-turn base before a client subscribes for deltas."""
 
-    from opensquilla.gateway.protocol import project_session_event_for_client
     from opensquilla.gateway.websocket import get_registry
 
     key = _require_key(params)
-    snapshot = get_session_streams().live_snapshot(key)
     connection = get_registry().get(ctx.conn_id)
     client_caps: frozenset[str] = getattr(connection, "client_caps", frozenset())
-    projected_events = []
-    for event in snapshot.events:
-        projected = project_session_event_for_client(
-            event.event_name,
-            event.payload,
-            client_caps=client_caps,
-        )
-        if projected is not None:
-            projected_events.append(projected)
-    projected_terminal = any(
-        event_payload.get("terminal") is True
-        for _event_name, event_payload in projected_events
-        if isinstance(event_payload, dict)
+    application = build_v4_conversation_snapshot_application(
+        get_session_streams(),
     )
-    return {
-        "key": key,
-        "task_id": None if projected_terminal else snapshot.task_id,
-        "stream_generation": snapshot.stream_generation,
-        "current_stream_seq": snapshot.current_stream_seq,
-        "events": [
-            {
-                "event": event_name,
-                "payload": dict(event_payload),
-            }
-            for event_name, event_payload in projected_events
-        ],
-    }
+    return snapshot_result_to_v4(
+        key,
+        application.read(key, client_caps=client_caps),
+    )
 
 
 @_d.method("sessions.messages.unsubscribe", scope="operator.read")
