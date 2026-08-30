@@ -89,6 +89,16 @@ def test_windows_installer_stops_when_native_install_command_fails() -> None:
     assert "exit $installExitCode" in ps1
 
 
+def test_windows_source_installer_preflights_running_opensquilla() -> None:
+    ps1 = SOURCE_PS1.read_text(encoding="utf-8")
+
+    assert "function Assert-OpenSquillaNotRunning" in ps1
+    assert "Get-CimInstance Win32_Process" in ps1
+    assert "install_source.ps1: OpenSquilla is running" in ps1
+    assert "Stop it before upgrading" in ps1
+    assert "Assert-OpenSquillaNotRunning" in ps1
+
+
 def test_install_script_banners_are_ascii_for_windows_terminals() -> None:
     scripts = [
         RELEASE_PS1.read_text(encoding="utf-8"),

@@ -300,6 +300,34 @@ function Install-WindowsVCRedistIfNeeded {
     Write-Warning 'After installing, reopen PowerShell and restart OpenSquilla.'
 }
 
+function Assert-OpenSquillaNotRunning {
+    if (-not $script:isWindowsHost) {
+        return
+    }
+
+    try {
+        $running = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+            $_.ProcessId -ne $PID -and
+            $_.CommandLine -and
+            $_.CommandLine -match '(?i)opensquilla' -and
+            $_.CommandLine -notmatch '(?i)install_source\.ps1'
+        })
+    } catch {
+        Write-Warning 'install_source.ps1: could not inspect running processes; continuing with the installer.'
+        return
+    }
+
+    if ($running.Count -eq 0) {
+        return
+    }
+
+    $details = @($running | ForEach-Object {
+        $name = if ($_.Name) { $_.Name } else { 'unknown process' }
+        "$name (PID $($_.ProcessId))"
+    }) -join ', '
+    Write-Error "install_source.ps1: OpenSquilla is running ($details). Stop it before upgrading so the existing CLI remains recoverable if installation cannot replace locked files."
+}
+
 # --- installer selection ----------------------------------------------------
 
 $installer = $null
@@ -454,6 +482,7 @@ if ($dryRun) {
 
 # --- execute ---------------------------------------------------------------
 
+Assert-OpenSquillaNotRunning
 Test-SquillaRouterAssets
 Build-WebUI
 Install-WindowsVCRedistIfNeeded
