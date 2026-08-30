@@ -26,9 +26,8 @@ on:
         default: true
       windows_source_run_id:
         description: >-
-          Run holding a Windows installer artifact. Use a SignPath Test Signing run
-          for a signed installer, or a Release Assets run for the unsigned one.
-          Leave empty to skip the Windows job.
+          Approval-gated Release Assets run holding a signed Windows installer
+          artifact. Leave empty to skip the Windows job.
         required: false
         default: ""
       windows_artifact_name:

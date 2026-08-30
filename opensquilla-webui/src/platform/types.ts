@@ -530,13 +530,13 @@ export interface Platform {
    * returns false; desktop returns the shell's live native-update capability,
    * including runtime guards such as macOS requiring /Applications.
    * Presentation ownership is intentionally reported separately by
-   * desktopUpdateManaged(), since unsigned Windows can discover an update and
+   * desktopUpdateManaged(), since Windows can discover an update and
    * open a manual installer without applying it natively.
    */
   nativeAutoUpdateEnabled: () => Promise<boolean>
   /**
    * Whether the desktop shell owns update discovery and presentation, including
-   * manual versioned installers on unsigned Windows builds. This is deliberately
+   * manual versioned installers on Windows builds. This is deliberately
    * separate from nativeAutoUpdateEnabled so the passive gateway banner does not
    * duplicate the shell-managed Windows notice.
    */

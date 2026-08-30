@@ -28,6 +28,7 @@ $sessionRecoverySmoke = Join-Path $PWD 'desktop\electron\scripts\test-packaged-s
 $realUpdateDriver = Join-Path $PWD 'desktop\electron\scripts\test-packaged-real-update-flow.mjs'
 $realUpdateResult = Join-Path $sandbox 'real-update-result.json'
 $externalSentinels = Join-Path $sandbox 'synthetic-system-tools'
+$signatureVerifier = Join-Path $PWD '.github\scripts\verify-windows-signatures.ps1'
 $expectedInstalledVersion = ''
 $env:APPDATA = $appData
 $env:LOCALAPPDATA = $localAppData
@@ -159,6 +160,11 @@ try {
   if (-not (Test-Path -LiteralPath $app -PathType Leaf)) {
     throw 'Candidate installation did not publish OpenSquilla.exe.'
   }
+  & $signatureVerifier -InstallerPath $candidate -InstalledRoot $installDir
+  if ($LASTEXITCODE -ne 0) {
+    throw 'Candidate or installed Windows Authenticode verification failed.'
+  }
+
   if ($expectedInstalledVersion) {
     $actualProductVersion = ([Diagnostics.FileVersionInfo]::GetVersionInfo($app)).ProductVersion
     if (-not $actualProductVersion) {

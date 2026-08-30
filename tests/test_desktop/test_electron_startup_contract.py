@@ -2813,15 +2813,16 @@ def test_windows_release_workflow_fails_fast_after_gateway_build_failure() -> No
     workflow = _read(".github/workflows/wheelhouse-release.yml")
     windows_build = _section(
         workflow,
-        "      - name: Build unsigned Windows installer",
+        "      - name: Build signed Windows installer",
         "      - name: Verify Electron package",
     )
 
-    assert "shell: bash" in windows_build
-    assert "set -euo pipefail" in windows_build
+    assert "shell: pwsh" in windows_build
+    assert "if ($LASTEXITCODE -ne 0) { throw 'Gateway build failed.' }" in windows_build
     assert windows_build.index("npm run build:gateway") < windows_build.index(
         "          npm run build\n"
     )
+    assert "node scripts/build-signed-windows.cjs" in windows_build
 
 
 def test_desktop_native_artifact_open_allows_active_documents_with_file_extensions() -> None:
@@ -3269,7 +3270,7 @@ def test_desktop_orphan_recovery_has_a_real_electron_process_flow() -> None:
 def test_desktop_dual_source_update_resolver_wires_static_channels() -> None:
     # Stable and same-base preview discovery uses a rate-limit-free static OSS
     # manifest. Versioned assets then use a strict OSS/GitHub generic feed with
-    # runtime fallback; unsigned Windows verifies an exact versioned installer
+    # runtime fallback; Windows verifies an exact versioned installer
     # against the release SHA256SUMS (OSS mirror first, canonical GitHub
     # Release as fail-over) before revealing it.
     main_ts = _read("desktop/electron/src/main.ts")

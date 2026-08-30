@@ -4,7 +4,7 @@ import { createWebPlatform } from './web'
 import { createDesktopPlatform } from './desktop'
 
 // Native installation and shell-owned update presentation are separate
-// capabilities: unsigned Windows uses a managed manual-installer flow, while an
+// capabilities: Windows uses a managed manual-installer flow, while an
 // older Windows shell still falls back to the passive gateway banner.
 
 function setDesktopApi(api: unknown): void {
@@ -25,7 +25,7 @@ describe('nativeAutoUpdateEnabled', () => {
     expect(await createDesktopPlatform().nativeAutoUpdateEnabled()).toBe(true)
   })
 
-  it('mirrors the shell when native update is OFF (unsigned Windows) → banner shown', async () => {
+  it('mirrors the shell when native update is OFF (managed Windows) → banner shown', async () => {
     setDesktopApi({ isAutoUpdateEnabled: async () => false })
     expect(await createDesktopPlatform().nativeAutoUpdateEnabled()).toBe(false)
   })
@@ -50,7 +50,7 @@ describe('desktopUpdateManaged', () => {
     expect(await createWebPlatform().desktopUpdateManaged()).toBe(false)
   })
 
-  it('is true for a managed unsigned Windows shell without native installation', async () => {
+  it('is true for a managed Windows shell without native installation', async () => {
     setDesktopApi({
       isAutoUpdateEnabled: async () => false,
       isDesktopUpdateManaged: async () => true,
