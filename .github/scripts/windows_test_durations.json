@@ -3,7 +3,7 @@
   "schema_version": 1,
   "source_runs": [
     {
-      "assignment_sha256": "28060706ffde5d4aeb36285be1618e114be2026f7bb48a4dc21098fc4e98eafe",
+      "assignment_sha256": "49b9f33477caa0e6fae8f85c170c7ef8d9300212c23b5d806b0377f55b98494e",
       "attempts": {
         "core": 1,
         "desktop-installer-contracts": 1,
@@ -28,7 +28,7 @@
       "weighted_file_count": 1307
     },
     {
-      "assignment_sha256": "28060706ffde5d4aeb36285be1618e114be2026f7bb48a4dc21098fc4e98eafe",
+      "assignment_sha256": "49b9f33477caa0e6fae8f85c170c7ef8d9300212c23b5d806b0377f55b98494e",
       "attempts": {
         "core": 1,
         "desktop-installer-contracts": 1,
@@ -53,7 +53,7 @@
       "weighted_file_count": 1307
     },
     {
-      "assignment_sha256": "28060706ffde5d4aeb36285be1618e114be2026f7bb48a4dc21098fc4e98eafe",
+      "assignment_sha256": "49b9f33477caa0e6fae8f85c170c7ef8d9300212c23b5d806b0377f55b98494e",
       "attempts": {
         "core": 1,
         "desktop-installer-contracts": 1,
@@ -79,6 +79,7 @@
     }
   ],
   "weights_seconds": {
+    "tests/contracts/test_approval_center_contract.py": 0.01,
     "tests/contracts/test_conversation_events_contract.py": 0.01,
     "tests/contracts/test_gateway_contract_runner.py": 0.01,
     "tests/contracts/test_gateway_contract_toolchain_integration.py": 0.01,
