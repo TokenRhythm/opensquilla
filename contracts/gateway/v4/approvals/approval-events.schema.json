@@ -46,7 +46,6 @@
         { "required": ["approvalId"] }
       ],
       "properties": {
-        "schema_version": { "type": ["integer", "null"], "enum": [1, null] },
         "approval_id": { "type": "string" },
         "approvalId": { "type": "string" },
         "namespace": { "enum": ["exec", "plugin"] },

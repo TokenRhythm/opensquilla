@@ -91,9 +91,10 @@ APPROVAL_METHOD_ALIASES: dict[str, str] = {
     "plugin.approval.extend": EXEC_APPROVAL_EXTEND_METHOD,
 }
 
+_wire_names = APPROVAL_EVENTS_EVENT_METADATA.get("wireNames", ())
 APPROVAL_EVENT_WIRE_NAMES = frozenset(
     name
-    for name in APPROVAL_EVENTS_EVENT_METADATA.get("wireNames", ())
+    for name in (_wire_names if isinstance(_wire_names, (list, tuple)) else ())
     if isinstance(name, str)
 )
 
@@ -319,7 +320,7 @@ def _number_alias(value: Mapping[str, Any], *names: str) -> int | float | None:
         raise ApprovalCenterContractError(
             f"{APPROVAL_EVENTS_EVENT} {names[0]} must be finite"
         )
-    return candidate
+    return cast(int | float, candidate)
 
 
 def _integer_alias(value: Mapping[str, Any], *names: str) -> int | None:
@@ -407,10 +408,13 @@ def validate_approval_event_payload(
         raise ApprovalCenterContractError(
             f"{APPROVAL_EVENTS_EVENT} payload must be a JSON object"
         )
-    if not any(
-        isinstance(payload.get(name), str) and payload.get(name).strip()
-        for name in ("approval_id", "approvalId")
-    ):
+    has_approval_id = False
+    for name in ("approval_id", "approvalId"):
+        candidate = payload.get(name)
+        if isinstance(candidate, str) and candidate.strip():
+            has_approval_id = True
+            break
+    if not has_approval_id:
         raise ApprovalCenterContractError(
             f"{APPROVAL_EVENTS_EVENT} payload requires approval_id or approvalId"
         )
