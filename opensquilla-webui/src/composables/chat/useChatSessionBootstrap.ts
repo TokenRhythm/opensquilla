@@ -14,15 +14,15 @@ import {
   type SessionLivePhase,
   type SessionPhaseResult,
 } from '@/composables/chat/sessionBootstrapContract'
+import {
+  createConversationBootstrapPhase,
+  createConversationBootstrapCoordinator,
+  type ConversationBootstrapPhase,
+  type ConversationBootstrapHandoffOutcome,
+  type ConversationBootstrapRunToken,
+} from '@/modules/conversationBootstrapCoordinator'
 
-interface PhaseRuntime<T> {
-  attempts: number
-  deadlineAt: number
-  running: boolean
-  promise: Promise<T>
-  result: T | null
-  skipSnapshot: boolean
-}
+type PhaseRuntime<T> = ConversationBootstrapPhase<T>
 
 interface CriticalRequestQueue {
   promise: Promise<void>
@@ -35,11 +35,7 @@ interface CriticalRequestQueue {
   historyTerminal: boolean
 }
 
-interface ActiveBootstrap {
-  generation: number
-  key: string
-  includeHistory: boolean
-  controller: AbortController
+interface ActiveBootstrapState {
   criticalQueue: CriticalRequestQueue
   liveQueueSequence: number
   liveQueueWaiters: Set<{
@@ -54,6 +50,8 @@ interface ActiveBootstrap {
   history: PhaseRuntime<SessionPhaseResult>
   live: PhaseRuntime<SessionSubscriptionOutcome>
 }
+
+type ActiveBootstrap = ConversationBootstrapRunToken & ActiveBootstrapState
 
 export interface SessionBootstrapRun {
   generation: number
@@ -86,75 +84,45 @@ const UNAVAILABLE_LIVE_RESULT: SessionSubscriptionOutcome = {
 }
 
 function historyRuntime(deadlineAt: number): PhaseRuntime<SessionPhaseResult> {
-  return {
-    attempts: 0,
-    deadlineAt,
-    running: false,
-    promise: Promise.resolve(EMPTY_HISTORY_RESULT),
-    result: null,
-    skipSnapshot: false,
-  }
+  return createConversationBootstrapPhase(deadlineAt, EMPTY_HISTORY_RESULT)
 }
 
 function liveRuntime(deadlineAt: number): PhaseRuntime<SessionSubscriptionOutcome> {
-  return {
-    attempts: 0,
-    deadlineAt,
-    running: false,
-    promise: Promise.resolve(UNAVAILABLE_LIVE_RESULT),
-    result: null,
-    skipSnapshot: false,
-  }
+  return createConversationBootstrapPhase(deadlineAt, UNAVAILABLE_LIVE_RESULT)
 }
 
 export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions) {
   const historyPhase = ref<SessionHistoryPhase>('idle')
   const livePhase = ref<SessionLivePhase>('idle')
-  let generation = 0
   let active: ActiveBootstrap | null = null
-  // A successful live phase arms exactly one new automatic recovery budget
-  // for the next external disconnect. A terminal recovery stays terminal
-  // across the RpcClient's background reconnect cycles until the user retries.
-  let connectionRecoveryArmed = false
-  let pendingHandoff: { targetKey: string; epoch: number } | null = null
-  let deferredConnectionStates: Array<{
-    state: string
-    includeHistory: boolean
-  }> = []
+  const ownership = createConversationBootstrapCoordinator<ActiveBootstrap>({
+    budgetMs: SESSION_BOOTSTRAP_BUDGET_MS,
+  })
 
   function setSessionHandoffTarget(
     targetKey: string | null,
     epoch: number,
-    outcome: 'committed' | 'unchanged' | 'failed' | 'superseded' = 'failed',
+    outcome: ConversationBootstrapHandoffOutcome = 'failed',
   ): SessionBootstrapRun | undefined {
     if (targetKey) {
-      if (!pendingHandoff || epoch >= pendingHandoff.epoch) {
-        pendingHandoff = { targetKey, epoch }
-      }
+      ownership.setHandoffTarget(targetKey, epoch)
       return
     }
-    if (pendingHandoff && epoch < pendingHandoff.epoch) return
-    pendingHandoff = null
-    const deferred = deferredConnectionStates
-    deferredConnectionStates = []
+    const resolution = ownership.resolveHandoff(epoch, outcome)
+    if (!resolution.accepted) return
     // A committed target starts its own bootstrap before the handoff closes.
     // Replaying older transport transitions would duplicate or preempt that B
     // registration. A rollback keeps A, so replay is required there.
     if (outcome === 'committed') return
     let resumed: SessionBootstrapRun | undefined
-    for (const event of deferred) {
+    for (const event of resolution.deferred) {
       resumed = handleConnectionState(event.state, event.includeHistory) ?? resumed
     }
     return resumed
   }
 
   function isCurrent(run: ActiveBootstrap): boolean {
-    return (
-      active === run
-      && generation === run.generation
-      && options.sessionKey.value === run.key
-      && !run.controller.signal.aborted
-    )
+    return ownership.isCurrent(run, options.sessionKey.value)
   }
 
   function contextFor(
@@ -420,7 +388,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
         if (lastResult.skipSnapshotOnRetry) phase.skipSnapshot = true
         if (lastResult.authoritative) {
           livePhase.value = 'ready'
-          connectionRecoveryArmed = true
+          ownership.armRecovery()
           return lastResult
         }
         if (
@@ -485,12 +453,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
   }
 
   function createRun(key: string, includeHistory: boolean): ActiveBootstrap {
-    const deadlineAt = Date.now() + SESSION_BOOTSTRAP_BUDGET_MS
-    const run: ActiveBootstrap = {
-      generation: ++generation,
-      key,
-      includeHistory,
-      controller: new AbortController(),
+    const run = ownership.start(key, includeHistory, token => ({
       criticalQueue: createCriticalQueue(includeHistory),
       liveQueueSequence: 0,
       liveQueueWaiters: new Set(),
@@ -499,12 +462,10 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
       lateReplacementRecoveryUsed: false,
       lateReplacementHistoryRecoveryPhase: null,
       lateReplacementHistoryRecoveryUsed: false,
-      history: historyRuntime(deadlineAt),
-      live: liveRuntime(deadlineAt),
-    }
-    active?.controller.abort()
+      history: historyRuntime(token.deadlineAt),
+      live: liveRuntime(token.deadlineAt),
+    }))
     active = run
-    connectionRecoveryArmed = false
     return run
   }
 
@@ -525,7 +486,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     const includeHistory = optionsForStart.includeHistory !== false
     if (!key) {
       return {
-        generation,
+        generation: ownership.generation,
         criticalRequestsQueued: Promise.resolve(),
         history: Promise.resolve(EMPTY_HISTORY_RESULT),
         live: Promise.resolve(UNAVAILABLE_LIVE_RESULT),
@@ -646,11 +607,8 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
   }
 
   function cancelSessionBootstrap(unsubscribe = true) {
-    const cancelled = active
-    ++generation
+    const cancelled = ownership.cancel() ?? active
     active = null
-    connectionRecoveryArmed = false
-    cancelled?.controller.abort()
     if (cancelled) {
       cancelled.criticalQueue.resolve()
       for (const waiter of cancelled.liveQueueWaiters) waiter.resolve(false)
@@ -682,27 +640,17 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     includeHistory = true,
   ): SessionBootstrapRun | undefined {
     if (
-      pendingHandoff
-      && pendingHandoff.targetKey !== options.sessionKey.value
+      ownership.shouldDeferConnectionState(options.sessionKey.value)
     ) {
       // Transport events may race a delayed queue/adoption handoff. Keep the
       // source run intact and replay only the latest physical state after the
       // handoff commits or rolls back; never restart source A while B is the
       // declared target.
-      const previous = deferredConnectionStates[deferredConnectionStates.length - 1]
-      if (state === 'disconnected') {
-        // A later outage supersedes any already-deferred flap. Retain only the
-        // transition needed to recover the eventual target exactly once.
-        deferredConnectionStates = [{ state, includeHistory }]
-      } else if (previous?.state === state) {
-        previous.includeHistory ||= includeHistory
-      } else {
-        deferredConnectionStates.push({ state, includeHistory })
-      }
+      ownership.deferConnectionState(state, includeHistory)
       return active
         ? { ...publicRun(active), deferred: true }
         : {
-            generation,
+            generation: ownership.generation,
             criticalRequestsQueued: Promise.resolve(),
             history: Promise.resolve(EMPTY_HISTORY_RESULT),
             live: Promise.resolve(UNAVAILABLE_LIVE_RESULT),
@@ -743,14 +691,16 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
           }
           run.live.promise = runLivePhase(run)
         }
-        if (liveWillRecover) connectionRecoveryArmed = false
+        if (liveWillRecover) ownership.disarmRecovery()
         return publicRun(run)
       }
       // Once a recovery budget reaches a terminal degraded state, background
       // reconnect churn must not turn the honest terminal state back into an
       // endless "connecting" indicator. Only an authoritative live phase can
       // arm a fresh outage budget.
-      if (!connectionRecoveryArmed) return currentRun ? publicRun(run) : undefined
+      if (!ownership.consumeRecoveryBudget()) {
+        return currentRun ? publicRun(run) : undefined
+      }
       // This is a new outage after an authoritative connection. Start its
       // wall-clock budget immediately; do not wait indefinitely for _state
       // "connected" before the coordinator begins counting.
