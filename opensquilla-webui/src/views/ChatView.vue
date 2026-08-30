@@ -936,8 +936,18 @@ import {
   sandboxSetupRpcCallOptions,
 } from '@/composables/chat/sessionBootstrapAdmission'
 import { useChatSessionRuntime } from '@/composables/chat/useChatSessionRuntime'
-import { useChatSessionSubscription } from '@/composables/chat/useChatSessionSubscription'
-import { createConversationRuntime } from '@/modules/conversationRuntime'
+import {
+  useChatSessionSubscription,
+  type SessionSubscriptionOutcome,
+} from '@/composables/chat/useChatSessionSubscription'
+import {
+  createConversationSessionRuntime,
+} from '@/modules/conversationSessionRuntime'
+import {
+  createConversationEventTransport,
+  conversationEventSessionKey,
+  type ConversationEventTransportMessage,
+} from '@/adapters/gateway/conversationEventTransport'
 import {
   useChatSlashCommands,
   type DurableMetaDraft,
@@ -1631,10 +1641,17 @@ const runStatus = ref<ChatRunStatus>({ status: 'idle', label: t('chat.status.idl
 // Epoch / seq
 const currentEpoch = ref(0)
 const lastStreamSeq = ref(0)
-// One transport-independent cursor policy is shared by the subscription and
-// event adapters.  The refs remain the reactive projection consumed by older
-// composables until the later ConversationRuntime migration removes them.
-const conversationRuntime = createConversationRuntime()
+// One Conversation owner is shared by the subscription and event adapters.
+// Its cursor policy remains projected into legacy refs, while the event source
+// and subscription leases stay behind the transport-neutral runtime seam.
+const conversationSessionRuntime = createConversationSessionRuntime<
+  ConversationEventTransportMessage,
+  SessionSubscriptionOutcome
+>({
+  source: createConversationEventTransport(rpc),
+  events: { sessionKey: conversationEventSessionKey },
+})
+const conversationRuntime = conversationSessionRuntime.cursor
 const activeTaskGroups = ref<Set<string>>(new Set())
 // Task id whose output the live stream renders; binds late events to the
 // current turn so a prior task can't leak into it (issue 344).
@@ -2519,7 +2536,7 @@ let applyPendingUserInputSnapshot: typeof chatPlans.applyBootstrap = () => {}
 let applyGoalSnapshot: (snapshot: SessionMessagesSubscribeResponse) => void = () => {}
 const chatSessionSubscription = useChatSessionSubscription({
   rpc,
-  conversationRuntime,
+  conversationSessionRuntime: conversationSessionRuntime,
   sessionKey,
   lastStreamSeq,
   runStatus,
@@ -4089,6 +4106,7 @@ const chatRpcSubscriptions = useChatRpcSubscriptions(rpc, {
   },
 }, {
   getSessionKey: () => sessionKey.value,
+  runtime: conversationSessionRuntime,
 })
 
 // Session switches drop the previous session's stall tracking entirely.
@@ -6753,6 +6771,7 @@ onUnmounted(() => {
   metaDraftRecovery.invalidate()
   draftProjectHydration.invalidate()
   cancelSessionBootstrap()
+  conversationSessionRuntime.dispose()
   pendingSessionOptionalReads = null
   releaseOptionalRpcAdmission?.()
   releaseOptionalRpcAdmission = null

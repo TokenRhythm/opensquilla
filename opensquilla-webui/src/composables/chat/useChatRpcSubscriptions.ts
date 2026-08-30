@@ -2,7 +2,9 @@ import type { RpcEventHandler } from '@/lib/rpc'
 import {
   createConversationEventHub,
   type ConversationEventHandle,
+  type ConversationEventHub,
 } from '@/modules/conversationEventHub'
+import type { ConversationSessionRuntime } from '@/modules/conversationSessionRuntime'
 import {
   createConversationEventTransport,
   conversationEventSessionKey,
@@ -19,7 +21,9 @@ type RpcSubscriptionClient = {
  *
  * The bridge intentionally has no wire event names or payload DTOs. The v4
  * adapter owns those details and emits one decoded message; this small bridge
- * remains until ConversationRuntime.open() owns the subscription lifecycle.
+ * remains as a compatibility bridge while the composition root owns a shared
+ * ConversationSessionRuntime. It never creates a second source when that
+ * runtime is supplied.
  */
 export type ChatRpcSubscriptionHandlers = {
   onEvent: (message: ConversationEventTransportMessage) => void
@@ -31,6 +35,8 @@ export type ChatRpcSubscriptionHandlers = {
 export interface ChatRpcSubscriptionOptions {
   /** Return the currently visible session key for logical event fencing. */
   getSessionKey?: () => string
+  /** Shared runtime owner; avoids a second event source for this composition root. */
+  runtime?: Pick<ConversationSessionRuntime<ConversationEventTransportMessage, never>, 'events'>
 }
 
 export function useChatRpcSubscriptions(
@@ -38,10 +44,11 @@ export function useChatRpcSubscriptions(
   handlers: ChatRpcSubscriptionHandlers,
   options: ChatRpcSubscriptionOptions = {},
 ) {
-  const transport = createConversationEventTransport(rpc)
-  const hub = createConversationEventHub(transport, {
-    sessionKey: conversationEventSessionKey,
-  })
+  const hub: ConversationEventHub<ConversationEventTransportMessage> =
+    options.runtime?.events
+    ?? createConversationEventHub(createConversationEventTransport(rpc), {
+      sessionKey: conversationEventSessionKey,
+    })
   let activeHandle: ConversationEventHandle<ConversationEventTransportMessage> | null = null
   let activeKey = ''
   let detachEvent: (() => void) | null = null

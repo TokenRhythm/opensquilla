@@ -13,6 +13,7 @@ import {
   createConversationRuntime,
   type ConversationRuntime,
 } from '@/modules/conversationRuntime'
+import type { ConversationSessionRuntime } from '@/modules/conversationSessionRuntime'
 import {
   createConversationSubscriptionLifecycle,
   type ConversationSubscriptionAttempt,
@@ -57,6 +58,11 @@ export interface UseChatSessionSubscriptionOptions {
   rpc: RpcClient
   /** Shared domain policy; omitted callers receive an equivalent local seam. */
   conversationRuntime?: ConversationRuntime
+  /** Shared Conversation owner; preferred over the legacy cursor-only option. */
+  conversationSessionRuntime?: Pick<
+    ConversationSessionRuntime<unknown, SessionSubscriptionOutcome>,
+    'cursor' | 'subscriptions'
+  >
   sessionKey: Ref<string>
   lastStreamSeq: Ref<number>
   runStatus: Ref<ChatRunStatus>
@@ -129,8 +135,11 @@ const UNAVAILABLE_SUBSCRIPTION: SessionSubscriptionOutcome = {
 export function useChatSessionSubscription(options: UseChatSessionSubscriptionOptions) {
   const isHydrating = ref(false)
   const streamGeneration = ref<string | null>(null)
-  const conversationRuntime = options.conversationRuntime ?? createConversationRuntime()
-  const subscriptionLifecycle = createConversationSubscriptionLifecycle<SessionSubscriptionOutcome>()
+  const conversationRuntime = options.conversationSessionRuntime?.cursor
+    ?? options.conversationRuntime
+    ?? createConversationRuntime()
+  const subscriptionLifecycle = options.conversationSessionRuntime?.subscriptions
+    ?? createConversationSubscriptionLifecycle<SessionSubscriptionOutcome>()
   let activeMetadataController: AbortController | null = null
   let metadataHydrationSequence = 0
 
