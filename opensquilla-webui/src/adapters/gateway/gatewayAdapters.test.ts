@@ -31,6 +31,7 @@ describe('Gateway Adapter composition', () => {
       'sessionRouting',
       'turnCommands',
       'pendingInputQueue',
+      'approvalCenter',
     ])
     expect(adapters).not.toHaveProperty('rpc')
     expect(adapters).not.toHaveProperty('events')

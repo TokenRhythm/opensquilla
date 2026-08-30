@@ -22,6 +22,9 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         "src/opensquilla/gateway/adapters/sessions_search_contract.py",
         "src/opensquilla/contracts/adapters/sessions_changed_contract.py",
         "src/opensquilla/contracts/adapters/conversation_events.py",
+        # S16-A keeps approval wire models at the dormant ApprovalCenter
+        # boundary; no Gateway handler or UI consumer may import them yet.
+        "src/opensquilla/contracts/adapters/approval_center_contract.py",
     }
 )
 GENERATED_METADATA_IMPORT_ALLOWLIST = frozenset(
@@ -143,11 +146,13 @@ F2_FOUNDATION_RUNTIME_FILES = (
 # lifecycle now each register one reviewed domain Adapter in the composition
 # root; the 12-line increase is the deliberate cumulative seam cost for those
 # two slices. Session routing adds one more adapter registration and its typed
-# composition-root seam (4 lines), and TurnCommands adds the same 4-line
-# composition seam. PendingInputQueue adds its typed adapter registration and
-# module provision (5 lines). Keep every reviewed increment explicit rather
-# than turning the foundation exception into an open-ended budget.
-F2_FOUNDATION_RUNTIME_LOC_CEILING = 1_167
+# composition-root seam (4 lines), TurnCommands adds the same 4-line
+# composition seam, and PendingInputQueue adds its typed adapter registration
+# and module provision (5 lines). ApprovalCenter adds the HTTP-backed adapter
+# seam and its composition entry (21 lines). Keep every reviewed increment
+# explicit rather than turning the foundation exception into an open-ended
+# budget.
+F2_FOUNDATION_RUNTIME_LOC_CEILING = 1_188
 
 # Existing cross-rpc private imports are architectural debt. This exact ledger
 # prevents growth and also fails stale when an import is removed, so reductions

@@ -3,11 +3,7 @@ export const lane = 'shared-foundation'
 export const debt = {
   'src/App.vue': {
     call: 3,
-    on: 6,
-    httpRequest: 1,
-    httpApiEndpoint: 1,
-    httpAuthToken: 1,
-    httpAuthorizationHeader: 1,
+    on: 1,
   },
   'src/composables/useBgm.ts': {
     httpRequest: 1,

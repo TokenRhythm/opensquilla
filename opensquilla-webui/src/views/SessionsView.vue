@@ -157,6 +157,7 @@ import { sessionAgentIdentity } from '@/components/sessions/sessionDisplay'
 import { SESSION_DIRECTORY_KEY } from '@/modules/sessionDirectory'
 import { SESSION_DIRECTORY_CHANGES_KEY } from '@/modules/sessionDirectoryChanges'
 import { SESSION_LIFECYCLE_KEY } from '@/modules/sessionLifecycle'
+import { APPROVAL_CENTER_KEY, type ApprovalEvent } from '@/modules/approvalCenter'
 
 type FilterId = 'all' | 'chats' | 'automations' | 'channels'
 
@@ -193,6 +194,9 @@ const sessionDirectoryChanges = injectedSessionDirectoryChanges
 const injectedSessionLifecycle = inject(SESSION_LIFECYCLE_KEY)
 if (!injectedSessionLifecycle) throw new Error('SessionLifecycle was not provided')
 const sessionLifecycle = injectedSessionLifecycle
+const injectedApprovalCenter = inject(APPROVAL_CENTER_KEY)
+if (!injectedApprovalCenter) throw new Error('ApprovalCenter was not provided')
+const approvalCenter = injectedApprovalCenter
 const { confirm } = useConfirm()
 const {
   sessionsList,
@@ -312,22 +316,11 @@ async function loadAgents() {
   }
 }
 
-function approvalAuthHeaders(): Record<string, string> {
-  const headers: Record<string, string> = {}
-  try {
-    const token = sessionStorage.getItem('opensquilla.wsToken') || ''
-    if (token) headers['Authorization'] = `Bearer ${token}`
-  } catch { /* ignore */ }
-  return headers
-}
-
 async function refreshApprovals() {
   try {
-    const res = await fetch('/api/approvals', { headers: approvalAuthHeaders() })
-    if (!res.ok) return
-    const data = await res.json() as { pending?: Array<{ sessionKey?: string }> }
-    pendingApprovals.value = (data.pending || [])
-      .map(item => String(item.sessionKey || '').trim())
+    const snapshot = await approvalCenter.snapshot()
+    pendingApprovals.value = snapshot.pending
+      .map(item => item.sessionKey.trim())
       .filter(Boolean)
   } catch {
     // Strip keeps the last known count.
@@ -397,12 +390,12 @@ function handleLocalSessionsDeleted(event: Event) {
   scheduleSessionRefresh()
 }
 
-function handleApprovalPush() {
+function handleApprovalPush(_event: ApprovalEvent) {
   void refreshApprovals()
 }
 
-function handleConnectionState(state: unknown) {
-  if (state === 'connected') scheduleSessionRefresh()
+function handleApprovalAvailability(state: 'available' | 'recovering' | 'unavailable') {
+  if (state === 'available') scheduleSessionRefresh()
 }
 
 // ---------------------------------------------------------------------------
@@ -506,13 +499,12 @@ onActivated(() => {
   const directoryChangesSubscription = sessionDirectoryChanges.subscribe(() => {
     scheduleSessionRefresh()
   })
+  const approvalSubscription = approvalCenter.subscribe(handleApprovalPush)
+  const approvalAvailabilitySubscription = approvalCenter.subscribeAvailability(handleApprovalAvailability)
   unsubs = [
     () => directoryChangesSubscription.close(),
-    rpc.on('exec.approval.requested', handleApprovalPush),
-    rpc.on('exec.approval.resolved', handleApprovalPush),
-    rpc.on('plugin.approval.requested', handleApprovalPush),
-    rpc.on('plugin.approval.resolved', handleApprovalPush),
-    rpc.on('_state', handleConnectionState),
+    () => approvalSubscription.close(),
+    () => approvalAvailabilitySubscription.close(),
   ]
   pollTimer = setInterval(loadAll, FALLBACK_POLL_MS)
 })

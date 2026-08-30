@@ -16,21 +16,30 @@ describe('SessionsView deletion contract', () => {
     )
   })
 
-  it('resets session pagination after the RPC connection recovers', () => {
-    const handlerStart = sessionsViewSource.indexOf('function handleConnectionState')
+  it('resets session pagination after the approval transport recovers', () => {
+    const handlerStart = sessionsViewSource.indexOf('function handleApprovalAvailability')
     const handlerEnd = sessionsViewSource.indexOf('// ---------------------------------------------------------------------------', handlerStart)
     const handler = sessionsViewSource.slice(handlerStart, handlerEnd)
     const activationStart = sessionsViewSource.indexOf('onActivated(() =>')
     const activationEnd = sessionsViewSource.indexOf('onDeactivated(', activationStart)
     const activation = sessionsViewSource.slice(activationStart, activationEnd)
 
-    expect(handler).toContain("if (state === 'connected') scheduleSessionRefresh()")
-    expect(activation).toContain("rpc.on('_state', handleConnectionState)")
+    expect(handler).toContain("if (state === 'available') scheduleSessionRefresh()")
+    expect(activation).toContain('approvalCenter.subscribeAvailability(handleApprovalAvailability)')
   })
 
   it('routes deletion through the domain lifecycle seam', () => {
     expect(sessionsViewSource).toContain('SESSION_LIFECYCLE_KEY')
     expect(sessionsViewSource).toContain('sessionLifecycle.remove([item.key])')
     expect(sessionsViewSource).not.toContain("rpc.call<DeleteResponse>('sessions.delete'")
+  })
+
+  it('keeps approval snapshot and events behind ApprovalCenter', () => {
+    expect(sessionsViewSource).toContain('APPROVAL_CENTER_KEY')
+    expect(sessionsViewSource).toContain('approvalCenter.snapshot()')
+    expect(sessionsViewSource).toContain('approvalCenter.subscribe(handleApprovalPush)')
+    expect(sessionsViewSource).not.toContain("fetch('/api/approvals'")
+    expect(sessionsViewSource).not.toContain("rpc.on('exec.approval")
+    expect(sessionsViewSource).not.toContain("rpc.on('plugin.approval")
   })
 })
