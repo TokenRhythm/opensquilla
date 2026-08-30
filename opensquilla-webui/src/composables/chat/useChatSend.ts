@@ -19,14 +19,15 @@ import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import type { SandboxRunMode } from '@/types/sandbox'
 import { normalizeSandboxRunMode } from '@/types/sandbox'
 import type {
-  ChatDocumentContext,
-  ChatSendParams,
-  ChatSendResponse,
-  SessionSteerV2Params,
-} from '@/types/rpc'
+  TurnDocumentContext,
+  TurnSendParams,
+  TurnSendSource,
+} from '@/modules/turnCommands'
 import type {
   TurnSendRequest,
   TurnCancelRequest,
+  TurnSendResponse,
+  TurnSteerRequest,
   TurnCommands,
 } from '@/modules/turnCommands'
 import type { ChatRpcStreamApi } from '@/composables/chat/useChatRpcEventHandlers'
@@ -88,6 +89,80 @@ type RpcClient = {
   call: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
 }
 
+/**
+ * The pending-steer WAL and delivery helper still store the historical v4
+ * identity spellings. Keep that persistence shape private to this composable
+ * while the TurnCommands Module uses canonical names. This type is a
+ * transitional storage seam, not a public application contract.
+ */
+interface PersistedTurnSteerRequest {
+  key: string
+  message: string
+  expected_turn_id: string
+  client_request_id: string
+  client_message_id: string
+  pendingInputId?: string
+  requestFingerprint?: string
+  expectedRevision?: number
+  surface_id?: string
+  _source?: TurnSendSource
+  [key: string]: unknown
+}
+
+function toCanonicalTurnSteerRequest(
+  params: PersistedTurnSteerRequest,
+): TurnSteerRequest {
+  return {
+    key: params.key,
+    message: params.message,
+    expectedTurnId: params.expected_turn_id,
+    clientRequestId: params.client_request_id,
+    clientMessageId: params.client_message_id,
+    ...(params.pendingInputId !== undefined
+      ? { pendingInputId: params.pendingInputId }
+      : {}),
+    ...(params.requestFingerprint !== undefined
+      ? { requestFingerprint: params.requestFingerprint }
+      : {}),
+    ...(params.expectedRevision !== undefined
+      ? { expectedRevision: params.expectedRevision }
+      : {}),
+    ...(params.surface_id !== undefined ? { surfaceId: params.surface_id } : {}),
+    ...(params._source !== undefined ? { source: params._source } : {}),
+  }
+}
+
+function toPersistedTurnSteerRequest(
+  request: TurnSteerRequest,
+): PersistedTurnSteerRequest {
+  const {
+    key,
+    message,
+    expectedTurnId,
+    clientRequestId,
+    clientMessageId,
+    pendingInputId,
+    requestFingerprint,
+    expectedRevision,
+    surfaceId,
+    source,
+    ...extensions
+  } = request
+  return {
+    ...extensions,
+    key,
+    message,
+    expected_turn_id: expectedTurnId,
+    client_request_id: clientRequestId,
+    client_message_id: clientMessageId,
+    ...(pendingInputId !== undefined ? { pendingInputId } : {}),
+    ...(requestFingerprint !== undefined ? { requestFingerprint } : {}),
+    ...(expectedRevision !== undefined ? { expectedRevision } : {}),
+    ...(surfaceId !== undefined ? { surface_id: surfaceId } : {}),
+    ...(source !== undefined ? { _source: source } : {}),
+  }
+}
+
 interface SendAttempt {
   clientRequestId: string
   clientMessageId: string
@@ -96,7 +171,7 @@ interface SendAttempt {
   promptAnnotationIds: string[]
   promptAnnotations: PromptAnnotationSnapshot[]
   promptAnnotationsAcknowledged?: boolean
-  documentContext: ChatDocumentContext | null
+  documentContext: TurnDocumentContext | null
   queueMode?: 'steer'
   text: string
   attachments: SendableAttachment[]
@@ -109,7 +184,7 @@ interface SendAttempt {
   handoffWalOwnerId?: string
   handoffWalRevision?: number
   replayCoordinationKey?: string
-  params: ChatSendParams
+  params: TurnSendParams
   requiresIdempotentReplay?: boolean
   // A Stop issued before durable acceptance is known belongs to this exact
   // idempotent request, not to whichever session happens to be visible later.
@@ -135,7 +210,7 @@ interface ExplicitSendPayload {
   forkBeforeMessageId: string | null
   workspaceId?: string | null
   initialCollaborationMode?: CollaborationMode | null
-  documentContext?: ChatDocumentContext | null
+  documentContext?: TurnDocumentContext | null
   initialRoutingMode?: GatewayModelRoutingMode | null
 }
 
@@ -143,7 +218,7 @@ interface ComposerSnapshot {
   revision: number | null
   inputText: string
   promptAnnotationIds: string[]
-  documentContext: ChatDocumentContext | null
+  documentContext: TurnDocumentContext | null
   attachmentRefs: Attachment[]
   payloadAttachments: Attachment[]
   intent: string | null
@@ -243,7 +318,7 @@ function errorCode(err: unknown): string | undefined {
 }
 
 function paramsHaveArtifactContext(
-  params: Pick<ChatSendParams, 'promptAnnotationIds' | 'documentContext'>,
+  params: Pick<TurnSendParams, 'promptAnnotationIds' | 'documentContext'>,
 ): boolean {
   return Boolean(params.promptAnnotationIds?.length || params.documentContext)
 }
@@ -317,20 +392,19 @@ const TERMINAL_TASK_STATUSES = new Set([
   'abandoned',
 ])
 
-function terminalResponseStatus(response: ChatSendResponse | null | undefined): string {
-  const status = String(response?.task_status || response?.taskStatus || '').toLowerCase()
+function terminalResponseStatus(response: TurnSendResponse | null | undefined): string {
+  const status = String(response?.taskStatus || '').toLowerCase()
   return TERMINAL_TASK_STATUSES.has(status) ? status : ''
 }
 
-function terminalReplayMessage(response: ChatSendResponse, status: string): string {
-  const supplied = response.terminal_message || response.terminalMessage ||
-    response.terminal_reason || response.terminalReason || response.reason
+function terminalReplayMessage(response: TurnSendResponse, status: string): string {
+  const supplied = response.terminalMessage || response.terminalReason || response.reason
   if (typeof supplied === 'string' && supplied.trim()) return supplied.trim()
   return taskTerminalMessage(status, {})
 }
 
-function terminalReplayErrorCode(response: ChatSendResponse, status: string): string {
-  const reason = response.terminal_reason || response.terminalReason || response.reason
+function terminalReplayErrorCode(response: TurnSendResponse, status: string): string {
+  const reason = response.terminalReason || response.reason
   const normalized = typeof reason === 'string' ? reason.trim().toLowerCase() : ''
   return /^[a-z][a-z0-9_.-]*$/.test(normalized) ? normalized : status
 }
@@ -350,7 +424,7 @@ function sameSendableAttachments(
   })
 }
 
-function normalizeDocumentContext(value: unknown): ChatDocumentContext | null {
+function normalizeDocumentContext(value: unknown): TurnDocumentContext | null {
   if (!value || typeof value !== 'object') return null
   const raw = value as Record<string, unknown>
   const documentId = typeof raw.documentId === 'string' ? raw.documentId.trim() : ''
@@ -361,8 +435,8 @@ function normalizeDocumentContext(value: unknown): ChatDocumentContext | null {
 }
 
 function sameDocumentContext(
-  left: ChatDocumentContext | null,
-  right: ChatDocumentContext | null,
+  left: TurnDocumentContext | null,
+  right: TurnDocumentContext | null,
 ): boolean {
   return left?.documentId === right?.documentId
     && left?.headRevisionId === right?.headRevisionId
@@ -373,7 +447,7 @@ function matchesRecoveredDraft(
   input: {
     requestSessionKey: string
     promptAnnotationIds: readonly string[]
-    documentContext: ChatDocumentContext | null
+    documentContext: TurnDocumentContext | null
     text: string
     attachments: SendableAttachment[]
     intent: string | null
@@ -397,7 +471,7 @@ function matchesRecoveredDraft(
   )
 }
 
-function chatSourceMetadata(options: UseChatSendOptions): ChatSendParams['_source'] {
+function chatSourceMetadata(options: UseChatSendOptions): TurnSendSource {
   const elevated = options.normalizeElevatedMode(options.elevatedMode.value)
   return {
     ...(elevated ? { elevated } : {}),
@@ -443,12 +517,12 @@ export interface UseChatSendOptions {
     requestSessionKey?: string,
   ) => void
   /** Synchronous, session-scoped identity used to avoid replaying against another document/head. */
-  currentDocumentContext?: (sessionKey: string) => ChatDocumentContext | null
+  currentDocumentContext?: (sessionKey: string) => TurnDocumentContext | null
   /** Flushes the active editor and returns the exact head to bind to a fresh send. */
   prepareDocumentContextForSend?: (
     sessionKey: string,
     options?: { isCurrent?: () => boolean },
-  ) => Promise<ChatDocumentContext | null | false>
+  ) => Promise<TurnDocumentContext | null | false>
   pendingWorkspaceId?: Ref<string | null>
   sendBlockedReason?: Readonly<Ref<string | null>>
   /** Transport/admission-only gate used by exact replays after unknown acceptance. */
@@ -604,10 +678,8 @@ export function useChatSend(options: UseChatSendOptions) {
       .slice(0, 16)
   }
 
-  function acceptedPromptAnnotationIds(response: ChatSendResponse): string[] {
-    const values = response.acceptedPromptAnnotationIds
-      || response.accepted_prompt_annotation_ids
-      || []
+  function acceptedPromptAnnotationIds(response: TurnSendResponse): string[] {
+    const values = response.acceptedPromptAnnotationIds || []
     return Array.isArray(values)
       ? values
           .map(value => String(value || '').trim())
@@ -618,7 +690,7 @@ export function useChatSend(options: UseChatSendOptions) {
 
   function acknowledgeAttemptPromptAnnotations(
     attempt: SendAttempt,
-    response: ChatSendResponse,
+    response: TurnSendResponse,
   ) {
     if (
       attempt.promptAnnotationIds.length === 0
@@ -648,7 +720,6 @@ export function useChatSend(options: UseChatSendOptions) {
     // render race. Keep the legacy three-argument call when they are equal.
     const acceptedSessionKey = String(
       response.sessionKey
-        || response.session_key
         || attempt.acceptedSessionKey
         || attempt.requestSessionKey,
     ).trim() || attempt.requestSessionKey
@@ -803,8 +874,8 @@ export function useChatSend(options: UseChatSendOptions) {
     ).trim()
   }
 
-  function taskAcceptanceStatus(response: ChatSendResponse | null | undefined): string {
-    return String(response?.task_status || response?.taskStatus || '').trim().toLowerCase()
+  function taskAcceptanceStatus(response: TurnSendResponse | null | undefined): string {
+    return String(response?.taskStatus || '').trim().toLowerCase()
   }
 
   function hasAuthoritativeWork(): boolean {
@@ -814,7 +885,7 @@ export function useChatSend(options: UseChatSendOptions) {
   }
 
   function noteAcceptedTask(
-    response: ChatSendResponse | null | undefined,
+    response: TurnSendResponse | null | undefined,
     requestSessionKey: string,
   ): {
     taskId: string
@@ -1035,7 +1106,7 @@ export function useChatSend(options: UseChatSendOptions) {
 
   async function settleRecoveredAcceptance(
     attempt: SendAttempt,
-    response: ChatSendResponse,
+    response: TurnSendResponse,
   ): Promise<boolean> {
     acknowledgeAttemptPromptAnnotations(attempt, response)
     attempt.acceptanceResolved = true
@@ -1794,15 +1865,15 @@ export function useChatSend(options: UseChatSendOptions) {
     )
   }
 
-  function acceptedTaskId(response: ChatSendResponse | null | undefined): string {
-    return response?.task_id || response?.taskId || ''
+  function acceptedTaskId(response: TurnSendResponse | null | undefined): string {
+    return response?.taskId || ''
   }
 
   function bindAcceptedUserMessage(
     clientMessageId: string,
-    response: ChatSendResponse | null | undefined,
+    response: TurnSendResponse | null | undefined,
   ) {
-    const messageId = response?.user_message_id || response?.message_id || ''
+    const messageId = response?.userMessageId || response?.messageId || ''
     bindUserMessageId(clientMessageId, messageId)
     const turnId = acceptedTaskId(response)
     if (!turnId) return
@@ -1858,7 +1929,7 @@ export function useChatSend(options: UseChatSendOptions) {
   }
 
   function handleTerminalResponse(
-    response: ChatSendResponse,
+    response: TurnSendResponse,
     freshSendToken: FreshSendToken | null,
     optionsForResponse: { finishFreshStream: boolean; forceFreshStream?: boolean },
   ): boolean {
@@ -1897,7 +1968,7 @@ export function useChatSend(options: UseChatSendOptions) {
   }
 
   function abortStaleAcceptedTask(
-    response: ChatSendResponse | null | undefined,
+    response: TurnSendResponse | null | undefined,
     requestSessionKey: string,
     force = false,
   ) {
@@ -2002,12 +2073,12 @@ export function useChatSend(options: UseChatSendOptions) {
     if (durablePending && !pendingIdentity && !recovered?.request.pendingInputId) {
       return recovered ? 'retryable_failure' : 'not_sent'
     }
-    const freshParams: SessionSteerV2Params = {
+    const freshCanonicalParams: TurnSteerRequest = {
       key: requestSessionKey,
       message: text.trim(),
-      expected_turn_id: expectedTurnId,
-      client_request_id: pendingIdentity?.clientRequestId || createClientRequestId(),
-      client_message_id: pendingIdentity?.clientMessageId || createClientMessageId(),
+      expectedTurnId,
+      clientRequestId: pendingIdentity?.clientRequestId || createClientRequestId(),
+      clientMessageId: pendingIdentity?.clientMessageId || createClientMessageId(),
       ...(pendingIdentity
         ? {
             pendingInputId: pendingIdentity.pendingInputId,
@@ -2015,9 +2086,12 @@ export function useChatSend(options: UseChatSendOptions) {
             expectedRevision: pendingIdentity.expectedRevision,
           }
         : {}),
-      surface_id: 'webui',
-      _source: chatSourceMetadata(options),
+      surfaceId: 'webui',
+      source: chatSourceMetadata(options),
     }
+    // The queue/WAL still snapshots the historical v4 shape. Keep that
+    // persistence conversion local until the pending-input lane migrates.
+    const freshParams = toPersistedTurnSteerRequest(freshCanonicalParams)
     if (recovered && recovered.request.key !== requestSessionKey) {
       return 'retryable_failure'
     }
@@ -2054,7 +2128,7 @@ export function useChatSend(options: UseChatSendOptions) {
       pendingItem.steerAttempt = activeAttempt
     }
     try {
-      const response = await options.turnCommands.steer(params)
+      const response = await options.turnCommands.steer(toCanonicalTurnSteerRequest(params))
       const sessionChanged = options.sessionKey.value !== requestSessionKey
       if (sessionChanged && response.accepted === true) {
         options.steerDelivery.acknowledgeAcceptedOffscreen(pendingItem)
@@ -2065,7 +2139,7 @@ export function useChatSend(options: UseChatSendOptions) {
           options.steerDelivery.reject(pendingItem)
           return 'accepted'
         }
-        if (response.fallback_safe === true) {
+        if (response.fallbackSafe === true) {
           options.steerDelivery.fallback(pendingItem)
           return 'deferred'
         }
@@ -2077,7 +2151,7 @@ export function useChatSend(options: UseChatSendOptions) {
           )
         ) {
           options.steerDelivery.markRetryable(pendingItem, 'retryable_rejected', {
-            code: response.failure_code,
+            code: response.failureCode,
           })
           return 'retryable_failure'
         }
@@ -2096,7 +2170,7 @@ export function useChatSend(options: UseChatSendOptions) {
       // or matching history row may independently prove durability.
       if (response.accepted !== true) {
         options.steerDelivery.markRetryable(pendingItem, 'acceptance_unknown', {
-          code: response.failure_code,
+          code: response.failureCode,
         })
         if (!sessionChanged) options.scheduleHistorySync()
         return 'retryable_failure'
@@ -2105,14 +2179,14 @@ export function useChatSend(options: UseChatSendOptions) {
         clientRequestId: params.client_request_id,
         clientMessageId: params.client_message_id,
         expectedTurnId: params.expected_turn_id,
-        userMessageId: String(response.user_message_id || ''),
+        userMessageId: String(response.userMessageId || ''),
         disposition: response.disposition || 'steering',
         revision: response.revision,
-        turnId: response.turn_id,
-        promotedTurnId: response.promoted_turn_id,
-        promotedFromTurnId: response.promoted_from_turn_id,
-        appliedIteration: response.applied_iteration,
-        modelCallId: response.model_call_id,
+        turnId: response.turnId,
+        promotedTurnId: response.promotedTurnId,
+        promotedFromTurnId: response.promotedFromTurnId,
+        appliedIteration: response.appliedIteration,
+        modelCallId: response.modelCallId,
       }, pendingItem)
       return 'accepted'
     } catch (error: unknown) {
@@ -2765,7 +2839,7 @@ export function useChatSend(options: UseChatSendOptions) {
       && requestedDocumentContext
       && options.prepareDocumentContextForSend
     ) {
-      let prepared: ChatDocumentContext | null | false
+      let prepared: TurnDocumentContext | null | false
       try {
         prepared = await options.prepareDocumentContextForSend(
           requestSessionKey,
@@ -2856,7 +2930,7 @@ export function useChatSend(options: UseChatSendOptions) {
       const clientMessageId = durablePendingItem?.pendingClientMessageId
         || sendOpts.replayCoordination?.clientMessageId
         || createClientMessageId()
-      const params: ChatSendParams = {
+      const params: TurnSendParams = {
         clientRequestId: durablePendingItem?.pendingClientRequestId
           || sendOpts.replayCoordination?.clientRequestId
           || createClientRequestId(),
@@ -2876,7 +2950,7 @@ export function useChatSend(options: UseChatSendOptions) {
       } else if (attemptDocumentContext) {
         params.documentContext = { ...attemptDocumentContext }
       }
-      params._source = chatSourceMetadata(options)
+      params.source = chatSourceMetadata(options)
       if (intent) params.intent = intent
       if (intent === 'new_chat' && workspaceId) params.workspaceId = workspaceId
       if (initialCollaborationMode === 'plan') {
@@ -3062,7 +3136,7 @@ export function useChatSend(options: UseChatSendOptions) {
       attempt.acceptedTaskId = acceptedTaskId(res)
       attempt.acceptedSessionKey = res?.sessionKey || requestSessionKey
       if (!commitAcceptedVisibleReplay({
-        messageId: res?.user_message_id || res?.message_id || '',
+        messageId: res?.userMessageId || res?.messageId || '',
         turnId: acceptedTaskId(res),
       })) {
         options.scheduleHistorySync()
@@ -3771,7 +3845,7 @@ export function useChatSend(options: UseChatSendOptions) {
       options.scrollToBottom()
     }
 
-    const params: ChatSendParams = {
+    const params: TurnSendParams = {
       clientRequestId: stableClientRequestId,
       clientMessageId,
       message: providerText,
@@ -3784,7 +3858,7 @@ export function useChatSend(options: UseChatSendOptions) {
     if (hiddenSessionIntent) params.intent = hiddenSessionIntent
     if (hiddenInitialRoutingMode) params.initialRoutingMode = hiddenInitialRoutingMode
     if (displayText && displayText !== providerText) params.displayText = displayText
-    params._source = chatSourceMetadata(options)
+    params.source = chatSourceMetadata(options)
 
     // Hidden controls preserve the composer and render their own outbox-backed
     // bubble, but their acceptance/Stop identity is otherwise the same as an

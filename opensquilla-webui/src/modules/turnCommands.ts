@@ -1,19 +1,94 @@
 import type { InjectionKey } from 'vue'
-
-// S13 deliberately keeps the existing command payload/response shapes so the
-// migration changes ownership, not wire semantics. These type-only imports are
-// a temporary seam: S14 replaces them with generated Contract/domain shapes
-// and removes the corresponding declarations from types/rpc.ts.
-import type {
-  ChatSendParams,
-  ChatSendResponse,
-  SessionSteerV2Params,
-  SessionSteerV2Response,
-} from '@/types/rpc'
+import type { GatewayModelRoutingMode } from '@/types/modelRouting'
+import type { CollaborationMode } from '@/types/plans'
+import type { SandboxRunMode } from '@/types/sandbox'
 
 /** Options shared by turn commands without exposing transport details. */
 export interface TurnCommandRequestOptions {
   signal?: AbortSignal
+}
+
+/** Exact editable document head bound to one turn admission. */
+export interface TurnDocumentContext {
+  documentId: string
+  headRevisionId: string
+}
+
+/** Source policy attached to a turn without exposing the v4 `_source` alias. */
+export interface TurnSendSource {
+  elevated?: string
+  runMode?: SandboxRunMode
+  noMemoryCapture?: boolean
+  [key: string]: unknown
+}
+
+/** Serialized attachment fields owned by the turn domain, not the v4 wire. */
+export interface TurnSendAttachment {
+  type: string
+  mime: string
+  name: string
+  data?: string
+  file_uuid?: string
+  size?: number
+}
+
+/**
+ * Domain input for a new turn.
+ *
+ * This is intentionally not a generated wire type. The Gateway adapter owns
+ * field aliases and validation; the Module exposes semantic names while
+ * retaining additive options for forward compatibility.
+ */
+export interface TurnSendParams {
+  message: string
+  sessionKey: string
+  /** Stable idempotency key for one logical send attempt. */
+  clientRequestId?: string
+  /** Stable client identity for reconciling the optimistic user row. */
+  clientMessageId?: string
+  /** Ordered durable drafts consumed atomically with this chat ingress. */
+  promptAnnotationIds?: string[]
+  /** Current editable document head made available only to this turn. */
+  documentContext?: TurnDocumentContext
+  /** Source policy; the v4 Adapter maps this to `_source`. */
+  source?: TurnSendSource
+  intent?: string
+  workspaceId?: string
+  collaborationMode?: CollaborationMode
+  initialRoutingMode?: GatewayModelRoutingMode
+  forkBeforeMessageId?: string
+  displayText?: string
+  attachments?: TurnSendAttachment[]
+  /** Explicit admission mode used by ordinary and queued sends. */
+  queueMode?: string
+  [key: string]: unknown
+}
+
+/**
+ * Fields consumed by the WebUI after a turn is accepted.
+ *
+ * The v4 Adapter normalizes the historical snake_case spellings into these
+ * names.  Additive fields that have no domain meaning are retained in
+ * `metadata`; they are deliberately not spread onto this interface so wire
+ * aliases cannot become an accidental application API.
+ */
+export interface TurnSendResponse {
+  ok?: boolean
+  status?: string
+  sessionKey?: string
+  key?: string
+  messageId?: string
+  userMessageId?: string
+  clientMessageId?: string
+  taskId?: string
+  replayed?: boolean
+  instantAccept?: boolean
+  taskStatus?: string
+  terminalReason?: string
+  terminalMessage?: string
+  reason?: string
+  acceptedPromptAnnotationIds?: string[]
+  metadata?: Readonly<Record<string, unknown>>
 }
 
 /** The two admission paths currently used by the WebUI. */
@@ -24,12 +99,65 @@ export interface PendingInputDispatchRequest {
   requestFingerprint: string
 }
 
+/** Domain request for same-turn or durable steer admission. */
+export interface TurnSteerRequest {
+  key: string
+  message: string
+  expectedTurnId: string
+  clientRequestId: string
+  clientMessageId: string
+  pendingInputId?: string
+  requestFingerprint?: string
+  expectedRevision?: number
+  surfaceId?: string
+  source?: { [key: string]: unknown }
+  [key: string]: unknown
+}
+
+export type TurnSteerDisposition =
+  | 'steering'
+  | 'applied'
+  | 'promoted'
+  | 'cancelled'
+  | 'rejected'
+
+/** Fields consumed by the WebUI's steer delivery state machine. */
+export interface TurnSteerResponse {
+  status?: string
+  accepted?: boolean
+  replayed?: boolean
+  key?: string
+  sessionKey?: string
+  sessionId?: string
+  expectedTurnId?: string
+  taskId?: string
+  turnId?: string
+  userMessageId?: string
+  clientRequestId?: string
+  clientMessageId?: string
+  surfaceId?: string
+  disposition?: TurnSteerDisposition
+  revision?: number
+  promotedTurnId?: string
+  promotedFromTurnId?: string
+  activeTurnId?: string
+  appliedIteration?: number
+  modelCallId?: string
+  fallbackSafe?: boolean
+  failureCode?: string
+  retryable?: boolean
+  recovery?: string
+  reason?: string
+  steerCapability?: { [key: string]: unknown }
+  metadata?: Readonly<Record<string, unknown>>
+}
+
 /**
  * A request whose acceptance may need to be replayed after a lost response.
  * `kind` is an application concern; v4 method names stay in the Adapter.
  */
 export type TurnSendRequest =
-  | { kind: 'new-turn'; params: ChatSendParams }
+  | { kind: 'new-turn'; params: TurnSendParams }
   | { kind: 'pending-input'; params: PendingInputDispatchRequest }
 
 export interface TurnCancelRequest {
@@ -40,9 +168,12 @@ export interface TurnCancelRequest {
 }
 
 export interface TurnCancelResponse {
+  status?: string
   aborted?: boolean
+  sessionKey?: string
+  taskId?: string
   reason?: string
-  [key: string]: unknown
+  metadata?: Readonly<Record<string, unknown>>
 }
 
 export type TurnCommandCapability = 'same-turn-steer' | 'durable-steer'
@@ -54,23 +185,22 @@ export type TurnCommandCapability = 'same-turn-steer' | 'durable-steer'
  * which v4 alias carries a request. `send` covers both ordinary turn
  * admission and dispatch of an already durable pending input: both are one
  * domain operation (make this logical input eligible for execution), while
- * the Adapter selects the transport route. The transitional response types
- * still mirror the existing wire shape; S14 will replace them with generated
- * Contract types after the command semantics are stable.
+ * the Adapter selects the transport route. Response types are owned by this
+ * Module; generated wire types remain confined to the Adapter.
  */
 export interface TurnCommands {
   send(
     request: TurnSendRequest,
     options?: TurnCommandRequestOptions,
-  ): Promise<ChatSendResponse>
+  ): Promise<TurnSendResponse>
   cancel(
     request: TurnCancelRequest,
     options?: TurnCommandRequestOptions,
   ): Promise<TurnCancelResponse>
   steer(
-    request: SessionSteerV2Params,
+    request: TurnSteerRequest,
     options?: TurnCommandRequestOptions,
-  ): Promise<SessionSteerV2Response>
+  ): Promise<TurnSteerResponse>
   supports(capability: TurnCommandCapability): boolean
 }
 

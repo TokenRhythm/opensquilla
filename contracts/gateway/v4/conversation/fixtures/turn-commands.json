@@ -1,0 +1,288 @@
+{
+  "format_version": 1,
+  "kind": "command",
+  "description": "Golden v4 request/result trees shared by the five TurnCommands Contracts.",
+  "cases": [
+    {
+      "id": "chat.send.full",
+      "method": "chat.send",
+      "request": {
+        "type": "req",
+        "id": "send-full",
+        "method": "chat.send",
+        "params": {
+          "message": "hello",
+          "sessionKey": "agent:main:webchat:default",
+          "clientRequestId": "request-1",
+          "client_message_id": "message-1",
+          "promptAnnotationIds": ["annotation-1"],
+          "document_context": {"documentId": "doc-1", "headRevisionId": "rev-1"},
+          "attachments": [],
+          "future_option": {"enabled": true}
+        }
+      },
+      "result": {
+        "ok": true,
+        "status": "accepted",
+        "sessionKey": "agent:main:webchat:default",
+        "task_id": "task-1",
+        "replayed": false,
+        "acceptedPromptAnnotationIds": ["annotation-1"],
+        "future_result": {"trace": "kept"}
+      },
+      "response": {
+        "type": "res",
+        "id": "send-full",
+        "ok": true,
+        "payload": {
+          "ok": true,
+          "status": "accepted",
+          "sessionKey": "agent:main:webchat:default",
+          "task_id": "task-1",
+          "replayed": false,
+          "acceptedPromptAnnotationIds": ["annotation-1"],
+          "future_result": {"trace": "kept"}
+        },
+        "error": null
+      }
+    },
+    {
+      "id": "chat.send.legacy-params-null",
+      "method": "chat.send",
+      "request": {
+        "type": "req",
+        "id": "send-legacy",
+        "method": "chat.send",
+        "params": null
+      },
+      "result": {
+        "ok": true,
+        "sessionKey": "agent:main:webchat:default",
+        "instant_accept": true
+      },
+      "response": {
+        "type": "res",
+        "id": "send-legacy",
+        "ok": true,
+        "payload": {
+          "ok": true,
+          "sessionKey": "agent:main:webchat:default",
+          "instant_accept": true
+        },
+        "error": null
+      }
+    },
+    {
+      "id": "chat.abort.task",
+      "method": "chat.abort",
+      "request": {
+        "type": "req",
+        "id": "abort-task",
+        "method": "chat.abort",
+        "params": {
+          "session_key": "agent:main:webchat:default",
+          "taskId": "task-1",
+          "scope": "task",
+          "source": "webui_stop"
+        }
+      },
+      "result": {
+        "ok": true,
+        "sessionKey": "agent:main:webchat:default",
+        "aborted": true,
+        "cancelled_tasks": 1
+      },
+      "response": {
+        "type": "res",
+        "id": "abort-task",
+        "ok": true,
+        "payload": {
+          "ok": true,
+          "sessionKey": "agent:main:webchat:default",
+          "aborted": true,
+          "cancelled_tasks": 1
+        },
+        "error": null
+      }
+    },
+    {
+      "id": "pending-dispatch.full",
+      "method": "sessions.pending_inputs.dispatch",
+      "request": {
+        "type": "req",
+        "id": "dispatch-1",
+        "method": "sessions.pending_inputs.dispatch",
+        "params": {
+          "key": "agent:main:webchat:default",
+          "pendingInputId": "pending-1",
+          "clientRequestId": "request-2",
+          "requestFingerprint": "sha256:fingerprint-1",
+          "surface_id": "webui",
+          "future_option": "kept"
+        }
+      },
+      "result": {
+        "status": "accepted",
+        "accepted": true,
+        "replayed": false,
+        "key": "agent:main:webchat:default",
+        "task_id": "task-2",
+        "client_message_id": "message-2",
+        "future_result": 42
+      },
+      "response": {
+        "type": "res",
+        "id": "dispatch-1",
+        "ok": true,
+        "payload": {
+          "status": "accepted",
+          "accepted": true,
+          "replayed": false,
+          "key": "agent:main:webchat:default",
+          "task_id": "task-2",
+          "client_message_id": "message-2",
+          "future_result": 42
+        },
+        "error": null
+      }
+    },
+    {
+      "id": "steer-v2.snake-identities",
+      "method": "sessions.steer.v2",
+      "request": {
+        "type": "req",
+        "id": "steer-1",
+        "method": "sessions.steer.v2",
+        "params": {
+          "key": "agent:main:webchat:default",
+          "message": "adjust",
+          "expected_turn_id": "turn-1",
+          "client_request_id": "request-3",
+          "client_message_id": "message-3",
+          "surface_id": "webui",
+          "_source": {"run_mode": "safe"}
+        }
+      },
+      "result": {
+        "status": "accepted",
+        "accepted": true,
+        "replayed": false,
+        "key": "agent:main:webchat:default",
+        "session_key": "agent:main:webchat:default",
+        "task_id": "turn-1",
+        "turn_id": "turn-1",
+        "client_request_id": "request-3",
+        "client_message_id": "message-3",
+        "disposition": "steering",
+        "revision": 1,
+        "fallback_safe": true,
+        "future_result": {"acceptedAt": 1700000000000}
+      },
+      "response": {
+        "type": "res",
+        "id": "steer-1",
+        "ok": true,
+        "payload": {
+          "status": "accepted",
+          "accepted": true,
+          "replayed": false,
+          "key": "agent:main:webchat:default",
+          "session_key": "agent:main:webchat:default",
+          "task_id": "turn-1",
+          "turn_id": "turn-1",
+          "client_request_id": "request-3",
+          "client_message_id": "message-3",
+          "disposition": "steering",
+          "revision": 1,
+          "fallback_safe": true,
+          "future_result": {"acceptedAt": 1700000000000}
+        },
+        "error": null
+      }
+    },
+    {
+      "id": "pending-steer.full",
+      "method": "sessions.pending_inputs.steer",
+      "request": {
+        "type": "req",
+        "id": "pending-steer-1",
+        "method": "sessions.pending_inputs.steer",
+        "params": {
+          "key": "agent:main:webchat:default",
+          "pendingInputId": "pending-2",
+          "clientRequestId": "request-4",
+          "clientMessageId": "message-4",
+          "requestFingerprint": "sha256:fingerprint-2",
+          "expectedRevision": 2,
+          "expected_turn_id": "turn-1",
+          "message": "queued adjustment",
+          "surfaceId": "webui"
+        }
+      },
+      "result": {
+        "status": "accepted",
+        "accepted": true,
+        "replayed": true,
+        "key": "agent:main:webchat:default",
+        "session_key": "agent:main:webchat:default",
+        "turn_id": "turn-1",
+        "client_request_id": "request-4",
+        "client_message_id": "message-4",
+        "disposition": "promoted",
+        "revision": 2,
+        "promoted_turn_id": "turn-2",
+        "fallback_safe": true
+      },
+      "response": {
+        "type": "res",
+        "id": "pending-steer-1",
+        "ok": true,
+        "payload": {
+          "status": "accepted",
+          "accepted": true,
+          "replayed": true,
+          "key": "agent:main:webchat:default",
+          "session_key": "agent:main:webchat:default",
+          "turn_id": "turn-1",
+          "client_request_id": "request-4",
+          "client_message_id": "message-4",
+          "disposition": "promoted",
+          "revision": 2,
+          "promoted_turn_id": "turn-2",
+          "fallback_safe": true
+        },
+        "error": null
+      }
+    },
+    {
+      "id": "command.error.storage-busy",
+      "method": "sessions.steer.v2",
+      "request": {
+        "type": "req",
+        "id": "steer-error",
+        "method": "sessions.steer.v2",
+        "params": {
+          "key": "agent:main:webchat:default",
+          "message": "retry",
+          "expected_turn_id": "turn-1",
+          "client_request_id": "request-5",
+          "client_message_id": "message-5"
+        }
+      },
+      "error_response": {
+        "type": "res",
+        "id": "steer-error",
+        "ok": false,
+        "payload": null,
+        "error": {
+          "code": "STORAGE_BUSY",
+          "message": "Session storage is temporarily busy. Retry this operation.",
+          "details": {"operation": "sessions.steer.v2"},
+          "retryable": true,
+          "retry_after_ms": 250,
+          "accepted": false
+        }
+      }
+    }
+  ]
+}
