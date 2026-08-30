@@ -807,6 +807,7 @@ import {
   SessionDirectoryError,
 } from '@/modules/sessionDirectory'
 import { SESSION_LIFECYCLE_KEY } from '@/modules/sessionLifecycle'
+import { PENDING_INPUT_QUEUE_KEY } from '@/modules/pendingInputQueue'
 import { useRpcCall } from '@/composables/useRpc'
 import { useAppStore } from '@/stores/app'
 import { useSandboxSetupStore } from '@/stores/sandboxSetup'
@@ -1177,6 +1178,7 @@ const toolResultModal = ref<{
 /* ── Stores / Router ───────────────────────────────────────────────── */
 
 const rpc = useRpcStore()
+const pendingInputQueue = inject(PENDING_INPUT_QUEUE_KEY, null)
 const sessionRouting = inject(SESSION_ROUTING_KEY) as SessionRouting | undefined
 if (!sessionRouting) throw new Error('SessionRouting was not provided')
 const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
@@ -1883,8 +1885,7 @@ const chatPendingQueue = useChatPendingQueue({
   resetInputHistory: () => resetComposerInputHistory(),
   hasComposer: () => Boolean(composerRef.value),
   pendingInputWal,
-  rpc,
-  supportsMethod: method => rpc.supportsMethod(method),
+  pendingInputQueue,
   connectionState: computed(() => rpc.state),
   prepareAttachmentsForSend,
   onPendingPersistenceError: reason => {

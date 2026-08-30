@@ -11,6 +11,7 @@ import { SESSION_DIRECTORY_CHANGES_KEY } from './modules/sessionDirectoryChanges
 import { SESSION_LIFECYCLE_KEY } from './modules/sessionLifecycle'
 import { SESSION_ROUTING_KEY } from './modules/sessionRouting'
 import { TURN_COMMANDS_KEY } from './modules/turnCommands'
+import { PENDING_INPUT_QUEUE_KEY } from './modules/pendingInputQueue'
 import 'katex/dist/katex.min.css'
 import './assets/base.css'
 import './themes/tokens' // eagerly bundles every value theme's token block
@@ -45,6 +46,7 @@ app.provide(
 )
 app.provide(SESSION_ROUTING_KEY, gatewayAdapters.sessionRouting)
 app.provide(TURN_COMMANDS_KEY, gatewayAdapters.turnCommands)
+app.provide(PENDING_INPUT_QUEUE_KEY, gatewayAdapters.pendingInputQueue)
 router.afterEach(() => {
   rpcStore.applyLinkTokenFromUrl()
 })

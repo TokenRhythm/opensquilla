@@ -18,6 +18,7 @@ import type {
   PendingInputWalRecord,
   PendingInputWalState,
 } from '@/utils/chat/pendingInputWal'
+import type { PendingInputQueuePort } from '@/modules/pendingInputQueue'
 import { snapshotSteerRequest } from './useChatSteerDelivery'
 
 const MAX_PENDING = 5
@@ -128,10 +129,7 @@ export interface UseChatPendingQueueOptions {
   resetInputHistory: () => void
   hasComposer: () => boolean
   pendingInputWal?: PendingInputWal | null
-  rpc?: {
-    call: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
-  }
-  supportsMethod?: (method: string) => boolean
+  pendingInputQueue?: PendingInputQueuePort | null
   connectionState?: Readonly<Ref<string>>
   prepareAttachmentsForSend?: (options: {
     attachments: Attachment[]
@@ -159,6 +157,7 @@ export interface UseChatPendingQueueOptions {
 }
 
 export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
+  const pendingInputQueue = options.pendingInputQueue
   const pendingQueue = ref<ChatPendingItem[]>([])
   const parkedQueues = new Map<string, ChatPendingItem[]>()
   let pendingDrainTimer: ReturnType<typeof setTimeout> | null = null
@@ -236,16 +235,13 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   })
 
   function supportsServerQueue(): boolean {
-    return Boolean(
-      options.rpc
-      && options.supportsMethod?.('sessions.pending_inputs.enqueue'),
-    )
+    return pendingInputQueue?.supportsQueue() === true
   }
 
   function supportsServerReorder(): boolean {
     return Boolean(
       supportsServerQueue()
-      && options.supportsMethod?.('sessions.pending_inputs.reorder')
+      && pendingInputQueue?.supportsReorder()
       && (!options.connectionState || options.connectionState.value === 'connected'),
     )
   }
@@ -370,7 +366,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
 
   async function cancelServerIdentity(sessionKey: string, pendingInputId: string) {
     if (!supportsServerQueue()) return
-    await options.rpc!.call('sessions.pending_inputs.cancel', {
+    await pendingInputQueue!.cancel({
       key: sessionKey,
       pendingInputId,
     })
@@ -530,9 +526,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
             // IndexedDB-only draft when the next Gateway is older/offline.
             item.pendingMayHaveServerCopy = true
             await writeWalItem(item, 'saving')
-            const response = await options.rpc!.call<Record<string, unknown>>(
-              'sessions.pending_inputs.enqueue',
-              {
+            const response = await pendingInputQueue!.enqueue({
                 key: item.ownerSessionKey || options.sessionKey.value,
                 pendingInputId,
                 clientRequestId: item.pendingClientRequestId,
@@ -550,8 +544,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
                 ...(Number.isSafeInteger(item.pendingPosition)
                   ? { position: item.pendingPosition }
                   : {}),
-              },
-            )
+              })
             if (wasRemoved(sessionKey, pendingInputId)) {
               // A peer may cancel while this enqueue response is in flight.
               // Cancel again after the ACK so an enqueue that committed after
@@ -685,12 +678,20 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     if (!supportsServerQueue()) {
       for (const item of [...pendingQueue.value]) {
         if (!durableItem(item) || item.ownerSessionKey !== sessionKey) continue
+        const pendingInputId = item.pendingInputId!
+        // A snapshot can race the WAL write and the enqueue itself. Keep an
+        // in-flight/saving row visible until its owner settles; otherwise an
+        // empty list response would tombstone a perfectly valid local item.
+        const saving = item.pendingPersistenceState === 'saving'
+        const stagingInFlight = stagingOperations.has(pendingInputId)
         if (
-          !walIds.has(item.pendingInputId!)
-          && !locallyCreatingIds.has(item.pendingInputId!)
+          !walIds.has(pendingInputId)
+          && !locallyCreatingIds.has(pendingInputId)
+          && !saving
+          && !stagingInFlight
         ) {
-          rememberRemoval(sessionKey, item.pendingInputId!)
-          removePendingIdentity(sessionKey, item.pendingInputId!)
+          rememberRemoval(sessionKey, pendingInputId)
+          removePendingIdentity(sessionKey, pendingInputId)
           continue
         }
         // A cancellation WAL is a durable delete intent, never a draft to
@@ -719,10 +720,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     }
 
     try {
-      const response = await options.rpc!.call<{ items?: Array<Record<string, unknown>> }>(
-        'sessions.pending_inputs.list',
-        { key: sessionKey },
-      )
+      const response = { items: await pendingInputQueue!.list(sessionKey) }
       if (disposed || generation !== hydrateGeneration || options.sessionKey.value !== sessionKey) {
         return
       }
@@ -810,12 +808,19 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       for (const item of [...pendingQueue.value]) {
         if (!durableItem(item) || item.ownerSessionKey !== sessionKey) continue
         if (serverIds.has(item.pendingInputId!)) continue
+        const pendingInputId = item.pendingInputId!
+        // The list snapshot may have started before the WAL write or enqueue
+        // completed. Preserve an in-flight row until its owner settles.
+        const saving = item.pendingPersistenceState === 'saving'
+        const stagingInFlight = stagingOperations.has(pendingInputId)
         if (
-          !walIds.has(item.pendingInputId!)
-          && !locallyCreatingIds.has(item.pendingInputId!)
+          !walIds.has(pendingInputId)
+          && !locallyCreatingIds.has(pendingInputId)
+          && !saving
+          && !stagingInFlight
         ) {
-          rememberRemoval(sessionKey, item.pendingInputId!)
-          removePendingIdentity(sessionKey, item.pendingInputId!)
+          rememberRemoval(sessionKey, pendingInputId)
+          removePendingIdentity(sessionKey, pendingInputId)
           continue
         }
         if (item.pendingPersistenceState === 'cancelling') {
@@ -1167,9 +1172,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       // connected to a queue-capable Gateway must attempt the server tombstone
       // before its local WAL is removed. Otherwise a deleted chip can reappear
       // on the next hydrate.
-      await options.rpc!.call('sessions.pending_inputs.cancel', {
+      await pendingInputQueue!.cancel({
         key: item.ownerSessionKey || options.sessionKey.value,
-        pendingInputId: item.pendingInputId,
+        pendingInputId: item.pendingInputId!,
         ...(previousState === 'staged' && item.pendingServerRevision
           ? { expectedRevision: item.pendingServerRevision }
           : {}),
@@ -1891,13 +1896,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   }
 
   async function recoverServerReorder(): Promise<boolean> {
-    if (!options.rpc || !supportsServerQueue()) return false
+    if (!pendingInputQueue || !supportsServerQueue()) return false
     const expectedOrder = pendingQueue.value.map(item => item.pendingInputId)
     try {
-      const response = await options.rpc.call<{ items?: Array<Record<string, unknown>> }>(
-        'sessions.pending_inputs.list',
-        { key: options.sessionKey.value },
-      )
+      const response = { items: await pendingInputQueue.list(options.sessionKey.value) }
       const items = Array.isArray(response.items) ? response.items : []
       const serverOrder = items
         .slice()
@@ -1981,16 +1983,13 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       return
     }
     try {
-      const response = await options.rpc!.call<{ items?: Array<Record<string, unknown>> }>(
-        'sessions.pending_inputs.reorder',
-        {
+      const response = await pendingInputQueue!.reorder({
           key: options.sessionKey.value,
           items: pendingQueue.value.map(item => ({
             pendingInputId: item.pendingInputId,
             expectedRevision: item.pendingServerRevision,
           })),
-        },
-      )
+        })
       await applyServerReorderItems(Array.isArray(response.items) ? response.items : [])
       broadcastChange(options.sessionKey.value)
       finishPendingReorder()

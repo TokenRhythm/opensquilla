@@ -39,7 +39,6 @@ export const debt = {
     supportsMethod: 1,
     waitForConnection: 1,
   },
-  'src/composables/chat/useChatPendingQueue.ts': { call: 6 },
   'src/composables/chat/useChatPlans.ts': { call: 4, on: 6 },
   'src/composables/chat/useChatRouteFeedback.ts': { call: 1 },
   'src/composables/chat/useChatRunModePreference.ts': { call: 4 },
@@ -83,7 +82,7 @@ export const debt = {
     supportsEvent: 1,
     // Turn capability probes are owned by TurnCommands; the remaining
     // method probes belong to non-Turn domains and migrate independently.
-    supportsMethod: 10,
+    supportsMethod: 9,
     waitForConnection: 2,
     httpRequest: 1,
     httpApiEndpoint: 1,

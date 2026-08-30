@@ -92,7 +92,6 @@ describe('chat send session handoff', () => {
         resetInputHistory: vi.fn(),
         hasComposer: () => true,
         pendingInputWal,
-        supportsMethod: () => false,
       })
 
       // The child terminal replay can precede both history hydration and the
@@ -200,7 +199,6 @@ describe('chat send session handoff', () => {
       dispatchHiddenControl: (item, ownerSessionKey) =>
         dispatchHiddenControl(item, ownerSessionKey),
       pendingInputWal,
-      supportsMethod: () => false,
     })
     inputText.value = 'existing parent follow-up'
     await pendingQueueRuntime.enqueuePendingInput(
