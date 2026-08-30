@@ -1,5 +1,5 @@
 import type { Attachment } from '@/types/chat'
-import type { ChatSendParams } from '@/types/rpc'
+import type { TurnSendParams } from '@/modules/turnCommands'
 
 const DATABASE_NAME = 'opensquilla-chat-pending-inputs'
 const DATABASE_VERSION = 2
@@ -47,7 +47,7 @@ export interface ResponseHandoffWalRecord {
   requestSessionKey: string
   clientRequestId: string
   clientMessageId: string
-  params: ChatSendParams
+  params: TurnSendParams
   composerText: string
   recoveryAttachments: Attachment[]
   /** A protocol-owned replay must never be restored into the user composer. */
@@ -180,7 +180,7 @@ function isPendingInputWalRecord(value: unknown): value is PendingInputWalRecord
 function isResponseHandoffWalRecord(value: unknown): value is ResponseHandoffWalRecord {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   const record = value as Partial<ResponseHandoffWalRecord>
-  const params = record.params as Partial<ChatSendParams> | undefined
+  const params = record.params as Partial<TurnSendParams> | undefined
   return record.schemaVersion === 1
     && typeof record.ownerRequestId === 'string'
     && record.ownerRequestId.length > 0
