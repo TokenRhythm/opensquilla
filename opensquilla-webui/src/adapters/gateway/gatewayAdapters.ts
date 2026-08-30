@@ -14,6 +14,8 @@ import { createV4PendingInputQueue } from './pendingInputQueueV4'
 import { createApprovalCenterV4 } from './approvalCenterV4'
 import type { ApprovalCenter } from '@/modules/approvalCenter'
 import type { HttpRequestOptions } from './privateHttpTransport'
+import type { GoalCenter } from '@/modules/goalCenter'
+import { createV4GoalCenter } from './goalCenterV4'
 
 type RpcStoreTransportSource = Parameters<typeof createPrivateGatewayTransports>[0]
 
@@ -25,6 +27,7 @@ export interface GatewayAdapters {
   readonly turnCommands: TurnCommands
   readonly pendingInputQueue: PendingInputQueuePort
   readonly approvalCenter: ApprovalCenter
+  readonly goalCenter: GoalCenter
 }
 
 interface GatewayHttpSource {
@@ -58,6 +61,7 @@ export function createGatewayAdapters(
     turnCommands: createV4TurnCommands(transports.rpc),
     pendingInputQueue: createV4PendingInputQueue(transports.rpc),
     approvalCenter: createApprovalCenterV4(transports.rpc, transports.events, { http }),
+    goalCenter: createV4GoalCenter(transports.rpc),
   }
   return adapters
 }
