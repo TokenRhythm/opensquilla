@@ -38,6 +38,7 @@ function createHarness(options: {
   getCompactionPlacement?: (compactionId: string) => 'activity' | 'standalone' | undefined
   observeStreamGeneration?: (payload: unknown) => boolean
   supportsTurnCommitted?: boolean
+  onTaskCancelled?: (taskId: string) => void
 } = {}) {
   const messages = ref<ChatMessage[]>(options.messages ?? [])
   const sessionKey = ref('agent:main:test')
@@ -91,6 +92,7 @@ function createHarness(options: {
   const loadCurrentSessionUsage = vi.fn(options.loadCurrentSessionUsage ?? (() => {}))
   const refreshRunModePreference = vi.fn(options.refreshRunModePreference ?? (() => {}))
   const restoreSteerIntoComposer = vi.fn(options.restoreSteerIntoComposer ?? (() => {}))
+  const onTaskCancelled = vi.fn(options.onTaskCancelled ?? (() => {}))
   const scope = effectScope()
   const rawApi = scope.run(() => useChatRpcEventHandlers({
     sessionKey,
@@ -138,6 +140,7 @@ function createHarness(options: {
     handleSessionConnectionState,
     loadCurrentSessionUsage,
     refreshRunModePreference,
+    onTaskCancelled,
   }))!
   const api = {
     ...rawApi,
@@ -180,6 +183,7 @@ function createHarness(options: {
     loadCurrentSessionUsage,
     refreshRunModePreference,
     restoreSteerIntoComposer,
+    onTaskCancelled,
     stop: () => scope.stop(),
   }
 }
@@ -1826,6 +1830,41 @@ describe('useChatRpcEventHandlers task group lifecycle', () => {
 
       expect(activeTaskGroups.value.size).toBe(0)
       expect(stream.endStreaming).toHaveBeenCalled()
+    } finally {
+      stop()
+    }
+  })
+
+  it('notifies the UI to settle plan-owned presentation when the foreground task is cancelled', () => {
+    const { api, onTaskCancelled, stop } = createHarness()
+    try {
+      api.bindActiveStreamTask('task-stop-1')
+      api.handlers.onAny('task.cancelled', {
+        session_key: 'agent:main:test',
+        task_id: 'task-stop-1',
+        stream_seq: 1,
+        generation_epoch: 0,
+      })
+
+      expect(onTaskCancelled).toHaveBeenCalledWith('task-stop-1')
+    } finally {
+      stop()
+    }
+  })
+
+  it('settles plan-owned presentation when cancellation arrives as an aborted done receipt', () => {
+    const { api, onTaskCancelled, stop } = createHarness()
+    try {
+      api.bindActiveStreamTask('task-stop-2')
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        task_id: 'task-stop-2',
+        stream_seq: 1,
+        generation_epoch: 0,
+        reason: 'aborted',
+      })
+
+      expect(onTaskCancelled).toHaveBeenCalledWith('task-stop-2')
     } finally {
       stop()
     }
