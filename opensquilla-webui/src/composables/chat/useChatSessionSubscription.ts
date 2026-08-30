@@ -13,6 +13,7 @@ import {
   createConversationRuntime,
   type ConversationRuntime,
 } from '@/modules/conversationRuntime'
+import { createConversationSubscriptionLeaseRegistry } from '@/modules/conversationSubscriptionLease'
 import { conversationCursorSignal } from '@/utils/chat/streamEvents'
 import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
 import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
@@ -47,20 +48,6 @@ type RpcClient = {
     expectedGeneration: number,
     reason: string,
   ) => boolean
-}
-
-export type SessionSubscriptionLeaseState =
-  | 'acquiring'
-  | 'active'
-  | 'releasing'
-  | 'retired'
-
-interface SessionSubscriptionLease {
-  token: symbol
-  key: string
-  state: SessionSubscriptionLeaseState
-  socketGeneration: number | null
-  releasePromise: Promise<void> | null
 }
 
 export interface UseChatSessionSubscriptionOptions {
@@ -140,6 +127,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
   const isHydrating = ref(false)
   const streamGeneration = ref<string | null>(null)
   const conversationRuntime = options.conversationRuntime ?? createConversationRuntime()
+  const subscriptionLeases = createConversationSubscriptionLeaseRegistry()
   let subscriptionAttempt = 0
   let activeSubscription: {
     key: string
@@ -148,11 +136,9 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     bootstrapGeneration: number
     bootstrapAttempt: number
     token: symbol
-    lease: SessionSubscriptionLease
+    lease: ReturnType<typeof subscriptionLeases.acquire>
     outcome: Promise<SessionSubscriptionOutcome>
   } | null = null
-  const subscriptionLeases = new Set<SessionSubscriptionLease>()
-  let activeLease: SessionSubscriptionLease | null = null
   let activeController: AbortController | null = null
   let activeMetadataController: AbortController | null = null
   let metadataHydrationSequence = 0
@@ -182,49 +168,8 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     return callOptions
   }
 
-  function retireLease(lease: SessionSubscriptionLease) {
-    lease.state = 'retired'
-    subscriptionLeases.delete(lease)
-    if (activeLease === lease) activeLease = null
-  }
-
   function retireLeasesFromPriorGenerations() {
-    const currentGeneration = options.rpc.connectionGeneration
-    if (typeof currentGeneration !== 'number') return
-    for (const lease of subscriptionLeases) {
-      if (
-        lease.socketGeneration !== null
-        && lease.socketGeneration !== currentGeneration
-      ) {
-        retireLease(lease)
-      }
-    }
-  }
-
-  function activateLease(lease: SessionSubscriptionLease) {
-    if (lease.state !== 'acquiring') return
-    // Gateway registration is a set keyed by (connection, session). A newer
-    // successful acquire for the same key subsumes earlier non-releasing
-    // leases, while a closing A1 remains distinct from a later A2 acquire.
-    for (const candidate of subscriptionLeases) {
-      if (
-        candidate !== lease
-        && candidate.key === lease.key
-        && (candidate.state === 'acquiring' || candidate.state === 'active')
-      ) {
-        retireLease(candidate)
-      }
-    }
-    lease.state = 'active'
-    activeLease = lease
-  }
-
-  function latestReleasableLease(key: string): SessionSubscriptionLease | null {
-    const matches = [...subscriptionLeases].filter(lease => (
-      lease.key === key
-      && (lease.state === 'acquiring' || lease.state === 'active')
-    ))
-    return matches.length > 0 ? matches[matches.length - 1]! : null
+    subscriptionLeases.retirePriorGenerations(options.rpc.connectionGeneration)
   }
 
   function subscribeSession(
@@ -258,21 +203,12 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     const attemptContext = bootstrap
       ? { ...bootstrap, signal: controller.signal }
       : undefined
-    const token = Symbol('session-subscription')
-    const lease: SessionSubscriptionLease = {
-      token,
-      key,
-      state: 'acquiring',
-      socketGeneration: null,
-      releasePromise: null,
-    }
-    subscriptionLeases.add(lease)
-    activeLease = lease
+    const lease = subscriptionLeases.acquire(key)
     const outcome = runSubscription(
       key,
       sinceStreamGeneration,
       sinceStreamSeq,
-      token,
+      lease.token,
       lease,
       controller,
       attemptContext,
@@ -285,7 +221,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       sinceStreamSeq,
       bootstrapGeneration,
       bootstrapAttempt,
-      token,
+      token: lease.token,
       lease,
       outcome,
     }
@@ -520,7 +456,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     sinceStreamGeneration: string | null,
     sinceStreamSeq: number,
     token: symbol,
-    lease: SessionSubscriptionLease,
+    lease: ReturnType<typeof subscriptionLeases.acquire>,
     controller: AbortController,
     bootstrap?: SessionBootstrapPhaseContext,
   ): Promise<SessionSubscriptionOutcome> {
@@ -632,12 +568,12 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         && subscribeResult.value?.subscribed !== false
         && lease.state === 'acquiring'
       ) {
-        activateLease(lease)
+        subscriptionLeases.activate(lease)
       } else if (
         subscribeResult.status === 'rejected'
         && lease.state === 'acquiring'
       ) {
-        retireLease(lease)
+        subscriptionLeases.retire(lease)
       }
       if (attempt !== subscriptionAttempt || key !== options.sessionKey.value) {
         return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
@@ -646,7 +582,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       if (subscribeResult.status === 'rejected') throw subscribeResult.reason
       const res = subscribeResult.value
       if (res && res.subscribed === false) {
-        retireLease(lease)
+        subscriptionLeases.retire(lease)
         throw new Error('No subscription manager available')
       }
       const generationReset = reconcileSubscriptionGeneration(
@@ -750,7 +686,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         backgroundOnly: false,
       }
     } catch (err: unknown) {
-      if (lease.state === 'acquiring') retireLease(lease)
+      if (lease.state === 'acquiring') subscriptionLeases.retire(lease)
       console.warn('Session stream subscription failed:', err instanceof Error ? err.message : err)
       const cancelled = (
         attempt !== subscriptionAttempt
@@ -873,11 +809,11 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     cancelActiveSubscription()
     if (!key) return
     retireLeasesFromPriorGenerations()
-    const lease = latestReleasableLease(key)
+    const lease = subscriptionLeases.latestReleasable(key)
     if (!lease) return
     if (lease.releasePromise) return lease.releasePromise
     lease.state = 'releasing'
-    if (activeLease === lease) activeLease = null
+    subscriptionLeases.clearActive(lease)
     const expectedGeneration = lease.socketGeneration
     const currentGeneration = options.rpc.connectionGeneration
     // No subscribe frame was sent, or the physical connection that owned it
@@ -890,7 +826,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         && currentGeneration !== expectedGeneration
       )
     ) {
-      retireLease(lease)
+      subscriptionLeases.retire(lease)
       return
     }
     const release = (async () => {
@@ -929,7 +865,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
           cause instanceof Error ? cause.message : cause,
         )
       } finally {
-        retireLease(lease)
+        subscriptionLeases.retire(lease)
       }
     })()
     lease.releasePromise = release
