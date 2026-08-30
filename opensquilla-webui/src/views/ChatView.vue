@@ -874,6 +874,7 @@ import { useChatSessionRouting } from '@/composables/chat/useChatSessionRouting'
 import { SESSION_ROUTING_KEY, type SessionRouting } from '@/modules/sessionRouting'
 import { TURN_COMMANDS_KEY, type TurnCommands } from '@/modules/turnCommands'
 import { APPROVAL_CENTER_KEY, type ApprovalCenter } from '@/modules/approvalCenter'
+import { GOAL_CENTER_KEY, type GoalCenter } from '@/modules/goalCenter'
 import { useChatHistory } from '@/composables/chat/useChatHistory'
 import { useChatMarkdownExport } from '@/composables/chat/useChatMarkdownExport'
 import { useChatMessageActions } from '@/composables/chat/useChatMessageActions'
@@ -1194,6 +1195,9 @@ const turnCommands: TurnCommands = injectedTurnCommands
 const injectedApprovalCenter = inject(APPROVAL_CENTER_KEY)
 if (!injectedApprovalCenter) throw new Error('ApprovalCenter was not provided')
 const approvalCenter: ApprovalCenter = injectedApprovalCenter
+const injectedGoalCenter = inject(GOAL_CENTER_KEY)
+if (!injectedGoalCenter) throw new Error('GoalCenter was not provided')
+const goalCenter: GoalCenter = injectedGoalCenter
 
 async function resolveCreatedSessionAvailability(sessionKey: string): Promise<boolean> {
   try {
@@ -3030,6 +3034,7 @@ function projectAcceptedGoalMessage({
 
 const chatGoals = useChatGoals({
   rpc,
+  goalCenter,
   sessionKey,
   currentEpoch,
   streamGeneration,

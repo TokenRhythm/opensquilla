@@ -103,6 +103,11 @@ function harness(continuityStorage?: GoalContinuityStorage) {
       return () => handlers.delete(event)
     }),
   }
+  const goalCenter = {
+    available: () => true,
+    status: async (sessionKey: string) => ({ sessionKey, sessionId: SESSION_ID, epoch: 1, goal: goalPayload() }),
+    set: async (input: { sessionKey: string; objective: string; clientRequestId: string; clientMessageId: string }) => rpc.call('goals.set', input),
+  }
   const sessionKey = ref(SESSION_KEY)
   const currentEpoch = ref(0)
   const notify = vi.fn()
@@ -111,6 +116,7 @@ function harness(continuityStorage?: GoalContinuityStorage) {
   const ensureSubscribed = vi.fn(async () => true)
   const api = useChatGoals({
     rpc,
+    goalCenter,
     sessionKey,
     currentEpoch,
     ensureSessionKey,

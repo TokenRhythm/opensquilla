@@ -1,0 +1,73 @@
+from __future__ import annotations
+
+import pytest
+
+from opensquilla.contracts.adapters.goals_contract import (
+    GoalsContractError,
+    validate_goals_set_params,
+    validate_goals_set_result,
+    validate_goals_status_params,
+    validate_goals_status_result,
+)
+
+
+def test_status_accepts_legacy_session_key_alias() -> None:
+    assert (
+        validate_goals_status_params({"session_key": "agent:demo"})["session_key"] == "agent:demo"
+    )
+
+
+def test_status_result_preserves_nullable_goal_and_extensions() -> None:
+    result = validate_goals_status_result(
+        {
+            "sessionKey": "agent:demo",
+            "sessionId": "s1",
+            "epoch": 2,
+            "goal": None,
+            "future": {"v": 1},
+        }
+    )
+    assert result["goal"] is None
+    assert result["future"] == {"v": 1}
+
+
+def test_set_requires_uuid_v4_and_objective() -> None:
+    with pytest.raises(GoalsContractError):
+        validate_goals_set_params(
+            {
+                "sessionKey": "agent:demo",
+                "objective": "ship",
+                "clientRequestId": "bad",
+                "clientMessageId": "bad",
+            }
+        )
+
+
+def test_set_accepts_legacy_snake_case_aliases() -> None:
+    result = validate_goals_set_params(
+        {
+            "session_key": "agent:demo",
+            "message": "ship",
+            "client_request_id": "550e8400-e29b-41d4-a716-446655440000",
+            "client_message_id": "550e8400-e29b-41d4-a716-446655440001",
+        }
+    )
+    assert result["message"] == "ship"
+
+
+def test_set_accepts_camel_wire_response_and_unknown_fields() -> None:
+    result = validate_goals_set_result(
+        {
+            "sessionKey": "agent:demo",
+            "accepted": True,
+            "goal": {"status": "active", "goalId": "g1"},
+            "extra": "kept",
+        }
+    )
+    assert result["goal"]["goalId"] == "g1"
+    assert result["extra"] == "kept"
+
+
+def test_set_rejects_missing_acceptance_shape() -> None:
+    with pytest.raises(GoalsContractError, match="acceptance outcome"):
+        validate_goals_set_result({"accepted": True})

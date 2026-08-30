@@ -10,6 +10,7 @@
     "core": [
       "tests/contracts/test_approval_center_contract.py",
       "tests/contracts/test_conversation_events_contract.py",
+      "tests/contracts/test_goals_contract.py",
       "tests/functional/test_agent_context_boundary_e2e.py",
       "tests/integration/cli/tui_real_terminal/test_lab_script.py",
       "tests/integration/cli/tui_real_terminal/test_targets.py",
