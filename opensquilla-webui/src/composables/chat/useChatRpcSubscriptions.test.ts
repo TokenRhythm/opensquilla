@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import { useChatRpcSubscriptions } from './useChatRpcSubscriptions'
 import type { RpcEventHandler } from '@/lib/rpc'
+import { createConversationEventHub } from '@/modules/conversationEventHub'
+import type { ConversationEventTransportMessage } from '@/adapters/gateway/conversationEventTransport'
 
 function rpcHarness() {
   const listeners = new Map<string, Set<RpcEventHandler>>()
@@ -97,6 +99,41 @@ describe('useChatRpcSubscriptions', () => {
     }, {})
     expect(event).toHaveBeenCalledTimes(1)
     expect(rpc.count('*')).toBe(1)
+    bridge.unsubscribe()
+  })
+
+  it('uses the composition runtime source instead of creating another RPC listener', () => {
+    const rpc = rpcHarness()
+    const sourceState: {
+      emit: ((message: ConversationEventTransportMessage) => void) | null
+    } = { emit: null }
+    const hub = createConversationEventHub<ConversationEventTransportMessage>({
+      subscribe(handlers) {
+        sourceState.emit = handlers.onEvent ?? null
+        return () => { sourceState.emit = null }
+      },
+    }, {
+      sessionKey: message => (
+        message.kind === 'conversation' ? message.decoded.sessionKey : null
+      ),
+    })
+    const event = vi.fn()
+    const bridge = useChatRpcSubscriptions(
+      rpc,
+      { onEvent: event },
+      { runtime: { events: hub }, getSessionKey: () => 'agent:main:a' },
+    )
+    bridge.subscribe()
+
+    expect(rpc.count('*')).toBe(0)
+    sourceState.emit?.({
+      kind: 'sessions-changed',
+      wireName: 'sessions.changed',
+      decoded: null,
+      payload: {},
+      meta: {},
+    })
+    expect(event).toHaveBeenCalledOnce()
     bridge.unsubscribe()
   })
 })
