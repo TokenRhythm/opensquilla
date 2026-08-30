@@ -873,6 +873,7 @@ import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
 import { useChatSessionRouting } from '@/composables/chat/useChatSessionRouting'
 import { SESSION_ROUTING_KEY, type SessionRouting } from '@/modules/sessionRouting'
 import { TURN_COMMANDS_KEY, type TurnCommands } from '@/modules/turnCommands'
+import { APPROVAL_CENTER_KEY, type ApprovalCenter } from '@/modules/approvalCenter'
 import { useChatHistory } from '@/composables/chat/useChatHistory'
 import { useChatMarkdownExport } from '@/composables/chat/useChatMarkdownExport'
 import { useChatMessageActions } from '@/composables/chat/useChatMessageActions'
@@ -1190,6 +1191,9 @@ const sessionLifecycle = injectedSessionLifecycle
 const injectedTurnCommands = inject(TURN_COMMANDS_KEY)
 if (!injectedTurnCommands) throw new Error('TurnCommands was not provided')
 const turnCommands: TurnCommands = injectedTurnCommands
+const injectedApprovalCenter = inject(APPROVAL_CENTER_KEY)
+if (!injectedApprovalCenter) throw new Error('ApprovalCenter was not provided')
+const approvalCenter: ApprovalCenter = injectedApprovalCenter
 
 async function resolveCreatedSessionAvailability(sessionKey: string): Promise<boolean> {
   try {
@@ -3689,6 +3693,7 @@ async function steerPendingMessage(pendingUiId: string) {
 
 const chatApprovals = useChatApprovals({
   rpc,
+  approvalCenter,
   sessionKey,
   runStatus,
   stream: { isStreaming, appendInterruptFrame, ensureInterruptBubble },

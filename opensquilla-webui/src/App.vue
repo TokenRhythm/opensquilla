@@ -456,6 +456,7 @@ import { useRpcStore } from './stores/rpc'
 import { SESSION_DIRECTORY_KEY } from './modules/sessionDirectory'
 import { SESSION_DIRECTORY_CHANGES_KEY } from './modules/sessionDirectoryChanges'
 import { SESSION_LIFECYCLE_KEY } from './modules/sessionLifecycle'
+import { APPROVAL_CENTER_KEY, type ApprovalEvent, type ApprovalItem, type ApprovalSubscription } from './modules/approvalCenter'
 import {
   arrangeSidebarSections,
   useSessions,
@@ -510,7 +511,6 @@ import { normalizeAgentId } from './utils/chat/sessionKeys'
 import { effectiveChatConnectionState } from './utils/chat/chatConnectionState'
 import { reminderToastPreview } from './utils/cron/notifications'
 import { installSessionNavigationDiagConsole, recordSessionNavigationDiag } from './utils/chat/sessionNavigationDiag'
-import type { RpcEventHandler } from '@/lib/rpc'
 import { isMacPlatform } from './utils/browser'
 import { useShortcutsStore } from './stores/shortcuts'
 import { bindingMatches, formatBinding } from './utils/keychord'
@@ -545,6 +545,9 @@ const sessionDirectoryChanges = injectedSessionDirectoryChanges
 const injectedSessionLifecycle = inject(SESSION_LIFECYCLE_KEY)
 if (!injectedSessionLifecycle) throw new Error('SessionLifecycle was not provided')
 const sessionLifecycle = injectedSessionLifecycle
+const injectedApprovalCenter = inject(APPROVAL_CENTER_KEY)
+if (!injectedApprovalCenter) throw new Error('ApprovalCenter was not provided')
+const approvalCenter = injectedApprovalCenter
 const shortcutsStore = useShortcutsStore()
 const artifactImageLightbox = provideArtifactImageLightbox()
 const { t } = useI18n()
@@ -1849,49 +1852,16 @@ function errorMessage(err: unknown): string {
 // socket (e.g. a reload while one is already pending).
 // ---------------------------------------------------------------------------
 
-interface ApprovalPushPayload {
-  approval_id?: string
-  approvalId?: string
-  session_key?: string
-  sessionKey?: string
-  tool_name?: string
-  toolName?: string
-  command?: string
-}
+const approvalSubscriptions: ApprovalSubscription[] = []
 
-interface ApprovalSnapshotItem {
-  id?: string
-  sessionKey?: string
-  toolName?: string
-  pluginId?: string
-  actionKind?: string
-  command?: string
-  argv?: string[]
-}
-
-const rpcApprovalUnsubs: Array<() => void> = []
-
-function approvalAuthHeaders(): Record<string, string> {
-  const headers: Record<string, string> = {}
-  try {
-    const token = sessionStorage.getItem('opensquilla.wsToken') || ''
-    if (token) headers['Authorization'] = `Bearer ${token}`
-  } catch { /* ignore */ }
-  return headers
-}
-
-function snapshotItemToPending(item: ApprovalSnapshotItem): PendingApproval | null {
-  const approvalId = String(item.id || '').trim()
+function approvalItemToPending(item: ApprovalItem): PendingApproval | null {
+  const approvalId = item.id.trim()
   if (!approvalId) return null
-  let command = String(item.command || '')
-  if (!command && Array.isArray(item.argv) && item.argv.length > 0) {
-    command = item.argv.map(String).join(' ')
-  }
   return {
     approvalId,
-    sessionKey: String(item.sessionKey || ''),
-    tool: String(item.toolName || item.pluginId || item.actionKind || 'Unknown tool'),
-    command,
+    sessionKey: item.sessionKey,
+    tool: item.toolName || 'Unknown tool',
+    command: item.command,
   }
 }
 
@@ -1900,11 +1870,9 @@ function snapshotItemToPending(item: ApprovalSnapshotItem): PendingApproval | nu
 // snapshot is ordered oldest-first, which the deep-link relies on.
 async function seedPendingApprovals() {
   try {
-    const res = await fetch('/api/approvals', { headers: approvalAuthHeaders() })
-    if (!res.ok) throw new Error('HTTP ' + res.status)
-    const data = await res.json() as { pending?: ApprovalSnapshotItem[] }
-    const items = (data.pending || [])
-      .map(snapshotItemToPending)
+    const snapshot = await approvalCenter.snapshot()
+    const items = snapshot.pending
+      .map(approvalItemToPending)
       .filter((item): item is PendingApproval => item !== null)
     appStore.setPendingApprovals(items)
   } catch (err) {
@@ -1912,26 +1880,21 @@ async function seedPendingApprovals() {
   }
 }
 
-function onApprovalRequested(payload: ApprovalPushPayload) {
-  const approvalId = String(payload.approval_id || payload.approvalId || '').trim()
-  if (!approvalId) return
-  appStore.upsertPendingApproval({
-    approvalId,
-    sessionKey: String(payload.session_key || payload.sessionKey || ''),
-    tool: String(payload.tool_name || payload.toolName || 'Unknown tool'),
-    command: String(payload.command || ''),
-  })
-}
-
-function onApprovalResolved(payload: ApprovalPushPayload) {
-  const approvalId = String(payload.approval_id || payload.approvalId || '').trim()
-  if (approvalId) appStore.removePendingApproval(approvalId)
+function onApprovalEvent(event: ApprovalEvent) {
+  if (event.kind === 'resolved') {
+    appStore.removePendingApproval(event.approvalId)
+    return
+  }
+  if (event.approval) {
+    const item = approvalItemToPending(event.approval)
+    if (item) appStore.upsertPendingApproval(item)
+  }
 }
 
 // Reconnect re-seeds the list (recovers approvals that arrived while the socket
 // was down); the push events keep it live thereafter.
-function onApprovalConnectionState(state: unknown) {
-  if (state !== 'connected') {
+function onApprovalAvailability(state: 'available' | 'recovering' | 'unavailable') {
+  if (state !== 'available') {
     appStore.setPendingApprovals([])
     return
   }
@@ -1939,18 +1902,15 @@ function onApprovalConnectionState(state: unknown) {
 }
 
 function subscribeApprovals() {
-  rpcApprovalUnsubs.push(
-    rpcStore.on('exec.approval.requested', onApprovalRequested as RpcEventHandler),
-    rpcStore.on('exec.approval.resolved', onApprovalResolved as RpcEventHandler),
-    rpcStore.on('plugin.approval.requested', onApprovalRequested as RpcEventHandler),
-    rpcStore.on('plugin.approval.resolved', onApprovalResolved as RpcEventHandler),
-    rpcStore.on('_state', onApprovalConnectionState as RpcEventHandler),
+  approvalSubscriptions.push(
+    approvalCenter.subscribe(onApprovalEvent),
+    approvalCenter.subscribeAvailability(onApprovalAvailability),
   )
 }
 
 function unsubscribeApprovals() {
-  rpcApprovalUnsubs.forEach(unsub => unsub())
-  rpcApprovalUnsubs.length = 0
+  approvalSubscriptions.splice(0).forEach(subscription => subscription.close())
+  approvalCenter.dispose()
 }
 
 // ---------------------------------------------------------------------------
@@ -1989,9 +1949,9 @@ onMounted(() => {
   // Keep the approval badge/count live app-wide, not just on the Approvals page.
   subscribeApprovals()
   unsubscribeCronFinished = rpcStore.on('cron.run.finished', handleCronRunFinished)
-  // Seed now in case the socket is already connected (the `_state` listener
-  // covers later reconnects); recovers a request pending before mount.
-  if (rpcStore.isConnected) void seedPendingApprovals()
+  // Seed now in case an approval was pending before mount. Availability events
+  // re-seed after reconnects and clear stale data while transport recovers.
+  void seedPendingApprovals()
 })
 
 onUnmounted(() => {

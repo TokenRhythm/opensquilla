@@ -1,13 +1,12 @@
 import { ref } from 'vue'
 import { afterEach, describe, it, expect, vi } from 'vitest'
 import {
-  approvalChoiceForDecision,
-  buildApprovalResolveBody,
   formatCountdown,
   resolutionFromPayload,
   resolutionFromResolveResponse,
   useChatApprovals,
 } from './useChatApprovals'
+import { approvalChoiceForDecision } from '@/modules/approvalCenter'
 import type { ChatApprovalEntry } from './useChatApprovals'
 import type { InterruptViewState } from '@/types/parts'
 
@@ -52,6 +51,24 @@ function approvalHarness(statusResponse: Record<string, unknown> = {
 }) {
   const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map())
   const approvals = useChatApprovals({
+    approvalCenter: {
+      snapshot: vi.fn(async () => ({ pending: [], mode: 'prompt' as const })),
+      status: vi.fn(async () => ({
+        id: 'approval-1', namespace: 'exec' as const, pending: statusResponse.pending === true,
+        resolutionInProgress: statusResponse.resolutionInProgress === true,
+        resolved: statusResponse.resolved === true, approved: statusResponse.approved === true,
+        resolution: String(statusResponse.resolution || ''), consumed: false, deadline: null,
+        ...(statusResponse.found === undefined ? {} : { found: statusResponse.found === true }),
+      })),
+      resolve: vi.fn(async () => {
+        const response = await fetch('/api/approvals/resolve', { method: 'POST' })
+        return await response.json() as Record<string, unknown>
+      }),
+      extend: vi.fn(async () => ({ id: 'approval-1', namespace: 'exec' as const, pending: true, resolutionInProgress: false, resolved: false, approved: false, resolution: '', consumed: false, deadline: null })),
+      subscribe: vi.fn(() => ({ close: vi.fn() })),
+      subscribeAvailability: vi.fn(() => ({ close: vi.fn() })),
+      dispose: vi.fn(),
+    },
     rpc: {
       call: vi.fn(async () => statusResponse) as <T = unknown>(
         method: string,
@@ -241,37 +258,5 @@ describe('approvalChoiceForDecision', () => {
     expect(approvalChoiceForDecision('allow-once')).toBe('allow_once')
     expect(approvalChoiceForDecision('allow-always')).toBe('allow_same_type')
     expect(approvalChoiceForDecision('deny')).toBe('deny')
-  })
-})
-
-describe('buildApprovalResolveBody', () => {
-  it('sends only id, namespace, approved, and choice for a plain approve', () => {
-    const body = buildApprovalResolveBody('ap-1', 'exec', 'allow-once')
-    expect(body).toEqual({ id: 'ap-1', namespace: 'exec', approved: true, choice: 'allow_once' })
-  })
-
-  it('never carries the removed allowAlways / rememberIntent params', () => {
-    for (const decision of ['allow-once', 'allow-always', 'deny'] as const) {
-      const body = buildApprovalResolveBody('ap', 'exec', decision)
-      expect(body).not.toHaveProperty('allowAlways')
-      expect(body).not.toHaveProperty('rememberIntent')
-    }
-  })
-
-  it('marks a deny as not approved and keeps the deny choice', () => {
-    const body = buildApprovalResolveBody('ap-2', 'exec', 'deny')
-    expect(body.approved).toBe(false)
-    expect(body.choice).toBe('deny')
-  })
-
-  it('expresses a sandbox allow-same-type through the choice alone', () => {
-    const body = buildApprovalResolveBody('ap-3', 'exec', 'allow-always')
-    expect(body.approved).toBe(true)
-    expect(body.choice).toBe('allow_same_type')
-    expect(body).not.toHaveProperty('allowAlways')
-  })
-
-  it('defaults a blank namespace to exec', () => {
-    expect(buildApprovalResolveBody('ap-4', '', 'allow-once').namespace).toBe('exec')
   })
 })

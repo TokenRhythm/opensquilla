@@ -56,4 +56,14 @@ describe('App sidebar chrome contract', () => {
     expect(appSource).toContain('sessionDirectoryChanges.resume()')
     expect(appSource).not.toContain('useSessionListSubscription')
   })
+
+  it('keeps app-wide approval awareness behind ApprovalCenter', () => {
+    expect(appSource).toContain('APPROVAL_CENTER_KEY')
+    expect(appSource).toContain('approvalCenter.snapshot()')
+    expect(appSource).toContain('approvalCenter.subscribe(onApprovalEvent)')
+    expect(appSource).not.toContain("fetch('/api/approvals'")
+    expect(appSource).not.toContain("rpcStore.on('exec.approval")
+    expect(appSource).not.toContain("rpcStore.on('plugin.approval")
+    expect(appSource).not.toContain("rpcStore.on('_state', onApproval")
+  })
 })

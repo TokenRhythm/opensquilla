@@ -11,6 +11,9 @@ import { createV4SessionLifecycle } from './sessionLifecycleV4'
 import { createV4SessionRouting } from './sessionRoutingV4'
 import { createV4TurnCommands } from './turnCommandsV4'
 import { createV4PendingInputQueue } from './pendingInputQueueV4'
+import { createApprovalCenterV4 } from './approvalCenterV4'
+import type { ApprovalCenter } from '@/modules/approvalCenter'
+import type { HttpRequestOptions } from './privateHttpTransport'
 
 type RpcStoreTransportSource = Parameters<typeof createPrivateGatewayTransports>[0]
 
@@ -21,11 +24,28 @@ export interface GatewayAdapters {
   readonly sessionRouting: SessionRouting
   readonly turnCommands: TurnCommands
   readonly pendingInputQueue: PendingInputQueuePort
+  readonly approvalCenter: ApprovalCenter
+}
+
+interface GatewayHttpSource {
+  requestJson<T = unknown>(endpoint: string, options?: HttpRequestOptions): Promise<T>
+}
+
+export interface GatewayAdapterOptions {
+  http?: GatewayHttpSource
 }
 
 /** Wire Gateway-backed domain Adapters without leaking generic transports. */
-export function createGatewayAdapters(source: RpcStoreTransportSource): GatewayAdapters {
+export function createGatewayAdapters(
+  source: RpcStoreTransportSource,
+  options: GatewayAdapterOptions = {},
+): GatewayAdapters {
   const transports = createPrivateGatewayTransports(source)
+  const http = options.http ?? {
+    requestJson: async () => {
+      throw new Error('Gateway HTTP transport is unavailable.')
+    },
+  }
   const sessionDirectory = createV4SessionDirectory(transports.rpc)
   const adapters: GatewayAdapters = {
     sessionDirectory,
@@ -37,6 +57,7 @@ export function createGatewayAdapters(source: RpcStoreTransportSource): GatewayA
     sessionRouting: createV4SessionRouting(transports.rpc, transports.events),
     turnCommands: createV4TurnCommands(transports.rpc),
     pendingInputQueue: createV4PendingInputQueue(transports.rpc),
+    approvalCenter: createApprovalCenterV4(transports.rpc, transports.events, { http }),
   }
   return adapters
 }

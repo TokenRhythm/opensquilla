@@ -4,12 +4,8 @@ export const debt = {
   'src/components/chat/PromptCacheKeepaliveDialog.vue': { call: 2 },
   'src/composables/chat/sessionBootstrapAdmission.ts': { waitForConnection: 2 },
   'src/composables/chat/useChatApprovals.ts': {
-    call: 3,
-    on: 8,
-    httpRequest: 3,
-    httpApiEndpoint: 3,
-    httpAuthToken: 3,
-    httpAuthorizationHeader: 3,
+    call: 1,
+    on: 1,
   },
   'src/composables/chat/useChatAttachments.ts': {
     httpRequest: 1,
@@ -92,10 +88,5 @@ export const debt = {
   },
   'src/views/SessionsView.vue': {
     call: 1,
-    on: 5,
-    httpRequest: 1,
-    httpApiEndpoint: 1,
-    httpAuthToken: 1,
-    httpAuthorizationHeader: 1,
   },
 }
