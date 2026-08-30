@@ -1181,7 +1181,13 @@ async def stream_response_gateway(
                         )
             except (KeyboardInterrupt, asyncio.CancelledError):
                 stream_deps.cancel_clearer()
-                await client.abort_session(session_key)
+                try:
+                    await client.abort_session(session_key)
+                except Exception:
+                    # The gateway connection may already be gone (that is
+                    # often why the user interrupted). The turn is still
+                    # cancelled locally so the REPL can re-prompt.
+                    pass
                 cancelled = True
             except Exception:
                 await _finish_text_delta_stream(
