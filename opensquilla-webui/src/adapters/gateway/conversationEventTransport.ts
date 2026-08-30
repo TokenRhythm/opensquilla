@@ -1,4 +1,5 @@
 import type { RpcEventHandler } from '@/lib/rpc'
+import type { ConversationEventSourceHandlers } from '@/modules/conversationEventHub'
 import {
   decodeConversationEvent,
   type DecodedConversationEvent,
@@ -37,13 +38,32 @@ export type ConversationEventTransportMessage =
       error: unknown
     }
 
-export interface ConversationEventTransportHandlers {
+export interface ConversationEventTransportHandlers
+  extends ConversationEventSourceHandlers<ConversationEventTransportMessage> {
   /** One typed ingress for the Conversation reducer/application seam. */
-  onEvent?: (message: ConversationEventTransportMessage) => void
-  /** Preserve raw observation for diagnostics and watchdogs only. */
-  onAny?: (rawEvent: string, rawPayload: unknown) => void
-  onConnectionState?: (state: string) => void
-  onDecodeError?: (error: unknown, rawEvent: string, rawPayload: unknown) => void
+}
+
+/**
+ * Extract the positive session identity at the adapter edge. Aliases stay
+ * here; the hub can then fence a keyed handle without teaching the domain
+ * module about JSON-RPC field spellings. Directory invalidations are global by
+ * design and therefore return null.
+ */
+export function conversationEventSessionKey(
+  message: ConversationEventTransportMessage,
+): string | null {
+  if (message.kind === 'sessions-changed') return null
+  if (message.kind === 'conversation' && message.decoded.sessionKey) {
+    return message.decoded.sessionKey
+  }
+  const payload = message.payload
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null
+  const value = payload as Record<string, unknown>
+  for (const name of ['key', 'session_key', 'sessionKey']) {
+    const candidate = value[name]
+    if (typeof candidate === 'string' && candidate) return candidate
+  }
+  return null
 }
 
 type RpcSubscriptionClient = {
