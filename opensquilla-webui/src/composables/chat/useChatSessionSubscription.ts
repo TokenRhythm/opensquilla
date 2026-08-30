@@ -9,6 +9,11 @@ import type {
   SessionMessagesSubscribeParams,
   SessionMessagesSubscribeResponse,
 } from '@/types/rpc'
+import {
+  createConversationRuntime,
+  type ConversationRuntime,
+} from '@/modules/conversationRuntime'
+import { conversationCursorSignal } from '@/utils/chat/streamEvents'
 import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
 import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
 import { chatTaskId } from '@/composables/chat/useChatTaskOwnership'
@@ -60,6 +65,8 @@ interface SessionSubscriptionLease {
 
 export interface UseChatSessionSubscriptionOptions {
   rpc: RpcClient
+  /** Shared domain policy; omitted callers receive an equivalent local seam. */
+  conversationRuntime?: ConversationRuntime
   sessionKey: Ref<string>
   lastStreamSeq: Ref<number>
   runStatus: Ref<ChatRunStatus>
@@ -132,6 +139,7 @@ const UNAVAILABLE_SUBSCRIPTION: SessionSubscriptionOutcome = {
 export function useChatSessionSubscription(options: UseChatSessionSubscriptionOptions) {
   const isHydrating = ref(false)
   const streamGeneration = ref<string | null>(null)
+  const conversationRuntime = options.conversationRuntime ?? createConversationRuntime()
   let subscriptionAttempt = 0
   let activeSubscription: {
     key: string
@@ -148,6 +156,18 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
   let activeController: AbortController | null = null
   let activeMetadataController: AbortController | null = null
   let metadataHydrationSequence = 0
+
+  function cursor() {
+    return conversationRuntime.createCursor(options.sessionKey.value, {
+      streamGeneration: streamGeneration.value,
+      streamSeq: options.lastStreamSeq.value,
+    })
+  }
+
+  function syncCursor(next: ReturnType<ConversationRuntime['createCursor']>) {
+    streamGeneration.value = next.streamGeneration
+    options.lastStreamSeq.value = next.streamSeq
+  }
 
   function detachedHydrationAdvertised(): boolean {
     const methods = options.rpc.policy?.concurrent_optional_read_methods
@@ -274,13 +294,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
 
   function generationFrom(source: unknown): string | null {
     if (typeof source === 'string') return source || null
-    if (!source || typeof source !== 'object') return null
-    const envelope = source as {
-      stream_generation?: unknown
-      streamGeneration?: unknown
-    }
-    const value = envelope.stream_generation ?? envelope.streamGeneration
-    return typeof value === 'string' && value ? value : null
+    return conversationCursorSignal(source).streamGeneration ?? null
   }
 
   /**
@@ -289,32 +303,13 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
    * sequence numbers are accepted instead of compared with the retired stream.
    */
   function observeStreamGeneration(source: unknown): boolean {
-    const generation = generationFrom(source)
-    if (!generation || generation === streamGeneration.value) return false
-    const previous = streamGeneration.value
-    streamGeneration.value = generation
-    if (previous === null) {
-      // A page can survive an in-place upgrade from a legacy Gateway which did
-      // not expose generations.  In that case the client owns a numeric cursor
-      // but cannot prove it belongs to the newly observed stream.  Reset when
-      // the new stream is visibly behind, or explicitly reports a generation
-      // gap; otherwise merely adopt the generation (the ordinary first
-      // subscribe response has an equal/current cursor).
-      const envelope = source && typeof source === 'object'
-        ? source as {
-            current_stream_seq?: unknown
-            replay_gap_reason?: unknown
-            stream_seq?: unknown
-          }
-        : null
-      const sequence = envelope?.stream_seq ?? envelope?.current_stream_seq
-      const newStreamIsBehind = typeof sequence === 'number'
-        && Number.isFinite(sequence)
-        && sequence < options.lastStreamSeq.value
-      const generationGap = envelope?.replay_gap_reason === 'stream_generation_changed'
-      if (!newStreamIsBehind && !generationGap) return false
-    }
-    options.lastStreamSeq.value = 0
+    const transition = conversationRuntime.observeGeneration(
+      cursor(),
+      conversationCursorSignal(source),
+    )
+    if (!transition.changed) return false
+    syncCursor(transition.cursor)
+    if (!transition.reset) return false
     options.resetStreamLiveTurnState()
     return true
   }
@@ -335,8 +330,8 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     // A mixed-version reconnect can land on an older Gateway which ignores
     // generation fields. Treat that capability downgrade as a new stream so
     // its lower sequence numbers are not hidden behind the modern cursor.
-    streamGeneration.value = null
-    options.lastStreamSeq.value = 0
+    const reset = conversationRuntime.reset(cursor())
+    syncCursor(reset)
     options.resetStreamLiveTurnState()
     return true
   }
@@ -345,21 +340,13 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     res: SessionMessagesSubscribeResponse,
     generationReset: boolean,
   ) {
-    const current = typeof res.current_stream_seq === 'number'
-      && Number.isFinite(res.current_stream_seq)
-      ? Math.max(0, res.current_stream_seq)
-      : null
-    if (res.replay_complete === false || generationReset) {
-      if (current !== null) {
-        options.lastStreamSeq.value = generationReset
-          && options.lastStreamSeq.value === 0
-          ? current
-          : Math.max(options.lastStreamSeq.value, current)
-      }
-      options.loadHistory()
-    } else if (current !== null) {
-      options.lastStreamSeq.value = Math.max(options.lastStreamSeq.value, current)
-    }
+    const transition = conversationRuntime.applyReplayCursor(
+      cursor(),
+      conversationCursorSignal(res),
+      generationReset,
+    )
+    syncCursor(transition.cursor)
+    if (transition.requiresHistory) options.loadHistory()
   }
 
   function applyHydratedSubscriptionState(
@@ -688,19 +675,17 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
           // bounded replay protocol so mixed-version client updates still work.
         } else {
           const snapshot = snapshotResult.value
-          const snapshotGeneration = generationFrom(snapshot)
+          const snapshotDecision = conversationRuntime.acceptSnapshot(
+            cursor(),
+            conversationCursorSignal(snapshot),
+          )
           if (
             snapshot?.key === key
             && Array.isArray(snapshot.events)
             && typeof snapshot.current_stream_seq === 'number'
-            && (
-              !snapshotGeneration
-              || !streamGeneration.value
-              || snapshotGeneration === streamGeneration.value
-            )
             // Events delivered after registration are newer than a late
             // snapshot response. Never reset the live surface behind them.
-            && snapshot.current_stream_seq >= options.lastStreamSeq.value
+            && snapshotDecision.accepted
           ) {
             const snapshotTaskId = typeof snapshot.task_id === 'string'
               ? snapshot.task_id
@@ -709,7 +694,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
               snapshotTaskId && options.taskOwnership?.isSettled(snapshotTaskId),
             )
             if (!settledSnapshot) onLiveSnapshot?.(snapshot)
-            options.lastStreamSeq.value = Math.max(0, snapshot.current_stream_seq)
+            syncCursor(snapshotDecision.cursor)
             snapshotTaskLive = Boolean(snapshot.task_id) && !settledSnapshot
           }
         }

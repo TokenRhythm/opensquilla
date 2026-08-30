@@ -44,11 +44,9 @@ import {
   FINISHED_STREAM_TASK_ID,
   PENDING_STREAM_TASK_ID,
   STOPPED_STREAM_TASK_ID,
-  acceptStreamSeq as decideStreamSeq,
   activeTaskGroupRunState as buildActiveTaskGroupRunState,
   isCurrentSessionPayload as payloadIsCurrentSession,
   isCurrentTaskPayload as payloadIsCurrentTask,
-  isStaleEpoch as payloadIsStaleEpoch,
   payloadTaskId,
   sessionChangeIsTerminal as payloadSessionChangeIsTerminal,
   sessionErrorMessage as eventSessionErrorMessage,
@@ -64,6 +62,11 @@ import {
   type ChatSteerDeliveryApi,
 } from './useChatSteerDelivery'
 import type { ChatStreamModelCallIdentity } from './useChatStream'
+import {
+  createConversationRuntime,
+  type ConversationRuntime,
+} from '@/modules/conversationRuntime'
+import { conversationCursorSignal } from '@/utils/chat/streamEvents'
 
 export interface ChatUsageAccumulator {
   input: number
@@ -133,9 +136,12 @@ type ChatCompactionPlacement = 'activity' | 'standalone'
 type ChatCompactionPresentationResult = boolean | ChatCompactionPlacement | void
 
 export interface UseChatRpcEventHandlersOptions {
+  /** Shared transport-independent conversation cursor policy. */
+  conversationRuntime?: ConversationRuntime
   sessionKey: Ref<string>
   currentEpoch: Ref<number>
   lastStreamSeq: Ref<number>
+  streamGeneration?: Ref<string | null>
   observeStreamGeneration?: (payload: unknown) => boolean
   activeTaskGroups: Ref<Set<string>>
   taskOwnership?: ChatTaskOwnershipApi
@@ -416,6 +422,22 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     usageModel,
     stream,
   } = options
+  const conversationRuntime = options.conversationRuntime ?? createConversationRuntime()
+  const streamGeneration = options.streamGeneration ?? ref<string | null>(null)
+
+  function cursor() {
+    return conversationRuntime.createCursor(sessionKey.value, {
+      sessionEpoch: currentEpoch.value,
+      streamGeneration: streamGeneration.value,
+      streamSeq: lastStreamSeq.value,
+    })
+  }
+
+  function syncCursor(next: ReturnType<ConversationRuntime['createCursor']>) {
+    currentEpoch.value = next.sessionEpoch
+    lastStreamSeq.value = next.streamSeq
+    streamGeneration.value = next.streamGeneration
+  }
   const steerDelivery = options.steerDelivery || useChatSteerDelivery({
     sessionKey,
     activeTurnId: activeStreamTaskId,
@@ -976,7 +998,10 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       typeof snapshot.current_stream_seq === 'number'
       && Number.isFinite(snapshot.current_stream_seq)
     ) {
-      lastStreamSeq.value = Math.max(0, snapshot.current_stream_seq)
+      syncCursor(conversationRuntime.restoreSnapshot(
+        cursor(),
+        conversationCursorSignal(snapshot),
+      ))
     }
   }
 
@@ -1373,7 +1398,10 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   onScopeDispose(clearTurnCommitTracking)
 
   function isStaleEpoch(payload: StreamEventEnvelope): boolean {
-    return payloadIsStaleEpoch(payload, currentEpoch.value)
+    return conversationRuntime.isStaleEpoch(
+      cursor(),
+      conversationCursorSignal(payload).sessionEpoch,
+    )
   }
 
   function isCurrentSessionPayload(payload: StreamEventEnvelope): boolean {
@@ -1388,10 +1416,21 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   }
 
   function acceptStreamSeq(payload: StreamEventEnvelope): boolean {
+    const signal = conversationCursorSignal(payload)
     options.observeStreamGeneration?.(payload)
-    const decision = decideStreamSeq(payload, sessionKey.value, lastStreamSeq.value)
+    let current = cursor()
+    if (!options.observeStreamGeneration) {
+      const generation = conversationRuntime.observeGeneration(current, signal)
+      current = generation.cursor
+      if (generation.reset) stream.resetLiveTurnState?.()
+    }
+    const decision = conversationRuntime.acceptEvent(current, signal, {
+      observeGeneration: false,
+    })
+    // The subscription adapter may already have reset the live reducer. Keep
+    // the cursor mirror in sync without triggering a second reset.
+    syncCursor(decision.cursor)
     if (decision.accepted) {
-      lastStreamSeq.value = decision.nextStreamSeq
       const rawOrder = payload.stream_seq ?? payload.streamSeq
       stream.setAcceptedActivityOrder?.(
         typeof rawOrder === 'number' && Number.isSafeInteger(rawOrder) && rawOrder > 0
@@ -1992,10 +2031,13 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   }
 
   function handleRpcEpochChanged(payload: SessionEventPayload) {
-    const ep = payload?.epoch
-    if (typeof ep === 'number' && Number.isFinite(ep) && ep > currentEpoch.value) {
+    const transition = conversationRuntime.advanceEpoch(
+      cursor(),
+      conversationCursorSignal(payload).sessionEpoch,
+    )
+    if (transition.changed) {
       activeTaskGroups.value.clear()
-      currentEpoch.value = ep
+      syncCursor(transition.cursor)
     }
   }
 

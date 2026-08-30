@@ -1,8 +1,58 @@
 import type { SessionEventPayload, StreamEventEnvelope } from '@/types/rpc'
+import {
+  createConversationRuntime,
+  type ConversationCursorSignal,
+} from '@/modules/conversationRuntime'
 
 export interface StreamSeqDecision {
   accepted: boolean
   nextStreamSeq: number
+}
+
+/**
+ * Translate legacy v4 spellings at the transport edge.  ConversationRuntime
+ * intentionally accepts only these canonical facts, so aliases do not leak
+ * into domain Modules.  Invalid optional cursor values are omitted to retain
+ * the v4 client's historical leniency for unversioned events.
+ */
+export function conversationCursorSignal(source: unknown): ConversationCursorSignal {
+  const value = source && typeof source === 'object'
+    ? source as Record<string, unknown>
+    : {}
+  const text = (...keys: string[]): string | undefined => {
+    for (const key of keys) {
+      const candidate = value[key]
+      // Do not trim legacy identifiers at this compatibility edge. The old
+      // helpers compared the first truthy wire spelling byte-for-byte; domain
+      // Contract validation can tighten this in a later versioned adapter.
+      if (typeof candidate === 'string' && candidate) return candidate
+    }
+    return undefined
+  }
+  const numberValue = (...keys: string[]): number | undefined => {
+    for (const key of keys) {
+      const candidate = value[key]
+      if (
+        typeof candidate === 'number'
+        && Number.isFinite(candidate)
+      ) return candidate
+    }
+    return undefined
+  }
+  const signal: ConversationCursorSignal = {
+    sessionKey: text('key', 'session_key', 'sessionKey'),
+    sessionEpoch: numberValue('epoch'),
+    streamGeneration: text('stream_generation', 'streamGeneration'),
+    streamSeq: numberValue('stream_seq', 'streamSeq'),
+    currentStreamSeq: numberValue('current_stream_seq', 'currentStreamSeq'),
+    replayComplete: typeof value.replay_complete === 'boolean'
+      ? value.replay_complete
+      : typeof value.replayComplete === 'boolean'
+        ? value.replayComplete
+        : undefined,
+    replayGapReason: text('replay_gap_reason', 'replayGapReason'),
+  }
+  return signal
 }
 
 export type NormalizeRunStatus = (status: string) => string
@@ -15,12 +65,15 @@ export const STOPPED_STREAM_TASK_ID = '__opensquilla_stopped_stream_task__'
 // reopening an empty work card after the answer has already completed.
 export const FINISHED_STREAM_TASK_ID = '__opensquilla_finished_stream_task__'
 
+const cursorRuntime = createConversationRuntime()
+
 export function payloadSessionKey(payload: StreamEventEnvelope | null | undefined): string {
   return payload?.key || payload?.session_key || payload?.sessionKey || ''
 }
 
 export function isCurrentSessionPayload(payload: StreamEventEnvelope | null | undefined, sessionKey: string): boolean {
-  const key = payloadSessionKey(payload)
+  const signal = conversationCursorSignal(payload)
+  const key = signal.sessionKey || ''
   return !key || !sessionKey || key === sessionKey
 }
 
@@ -54,9 +107,10 @@ export function isCurrentTaskPayload(
 }
 
 export function isStaleEpoch(payload: StreamEventEnvelope | null | undefined, currentEpoch: number): boolean {
-  const ep = payload?.epoch
-  if (typeof ep !== 'number' || !Number.isFinite(ep)) return false
-  return ep < currentEpoch
+  return cursorRuntime.isStaleEpoch(
+    cursorRuntime.createCursor('', { sessionEpoch: currentEpoch }),
+    conversationCursorSignal(payload).sessionEpoch,
+  )
 }
 
 export function acceptStreamSeq(
@@ -64,17 +118,15 @@ export function acceptStreamSeq(
   sessionKey: string,
   lastStreamSeq: number,
 ): StreamSeqDecision {
-  if (!isCurrentSessionPayload(payload, sessionKey)) {
-    return { accepted: false, nextStreamSeq: lastStreamSeq }
+  const decision = cursorRuntime.acceptEvent(
+    cursorRuntime.createCursor(sessionKey, { streamSeq: lastStreamSeq }),
+    conversationCursorSignal(payload),
+    { observeGeneration: false },
+  )
+  return {
+    accepted: decision.accepted,
+    nextStreamSeq: decision.cursor.streamSeq,
   }
-  const seq = payload?.stream_seq
-  if (typeof seq !== 'number' || !Number.isFinite(seq)) {
-    return { accepted: true, nextStreamSeq: lastStreamSeq }
-  }
-  if (seq <= lastStreamSeq) {
-    return { accepted: false, nextStreamSeq: lastStreamSeq }
-  }
-  return { accepted: true, nextStreamSeq: seq }
 }
 
 export function taskGroupId(payload: SessionEventPayload | null | undefined): string {
