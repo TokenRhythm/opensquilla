@@ -258,25 +258,6 @@ class RoutingHistoryStore:
             )
             return list(history)
 
-    def mark_execution_kind(
-        self,
-        session_key: str,
-        turn_index: int,
-        execution_kind: str,
-    ) -> bool:
-        """Attach the settled physical execution mode to one routed turn."""
-        if not session_key or turn_index < 0 or execution_kind not in {"single", "ensemble"}:
-            return False
-        with self._lock:
-            entries = self._entries.get(session_key)
-            if not entries:
-                return False
-            for entry in reversed(entries):
-                if entry.get("turn_index") == turn_index:
-                    entry["executed_kind"] = execution_kind
-                    return True
-        return False
-
     def clear(self) -> None:
         with self._lock:
             self._entries.clear()
@@ -288,15 +269,6 @@ class RoutingHistoryStore:
 
 
 _history_store = RoutingHistoryStore()
-
-
-def mark_routing_history_execution(
-    session_key: str,
-    turn_index: int,
-    execution_kind: str,
-) -> bool:
-    """Record a completed turn's physical mode for the next routing decision."""
-    return _history_store.mark_execution_kind(session_key, turn_index, execution_kind)
 
 
 def seed_routing_history(

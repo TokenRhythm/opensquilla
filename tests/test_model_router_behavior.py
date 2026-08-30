@@ -1,10 +1,8 @@
 import logging
-from types import SimpleNamespace
 
 import pytest
 
 from opensquilla.engine.pipeline import TurnContext
-from opensquilla.engine.routing.policy import anti_downgrade
 from opensquilla.engine.steps import squilla_router as squilla_router_step
 from opensquilla.engine.steps.squilla_router import (
     apply_squilla_router,
@@ -2183,31 +2181,3 @@ async def test_runtime_router_complex_request_applies_deep_thinking_without_p2_p
         "Analyze thoroughly, cover key constraints, avoid omissions."
     )
     assert "[RESPONSE_POLICY:" not in routed.message
-
-
-def test_anti_downgrade_does_not_hold_an_ensemble_tier() -> None:
-    result = anti_downgrade(
-        "c0",
-        router_cfg=SimpleNamespace(kv_cache_anti_downgrade_enabled=True),
-        valid_tiers=["c0", "c1", "c2", "c3"],
-        previous_tier="c3",
-        previous_execution_kind="ensemble",
-    )
-
-    assert result.tier == "c0"
-    assert result.applied is False
-
-
-def test_routing_history_records_settled_execution_kind() -> None:
-    squilla_router_step._history_store.append(
-        "ensemble-history",
-        {"turn_index": 4, "final_tier": "c3"},
-    )
-
-    assert squilla_router_step.mark_routing_history_execution(
-        "ensemble-history", 4, "ensemble"
-    )
-    history = squilla_router_step._history_store.get("ensemble-history")
-
-    assert history is not None
-    assert history[-1]["executed_kind"] == "ensemble"

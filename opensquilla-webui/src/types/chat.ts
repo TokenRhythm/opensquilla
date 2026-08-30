@@ -541,7 +541,6 @@ export interface ChatEnsembleMeta {
   profile: string
   modelCount: number
   totalCandidates: number
-  successfulProposers?: number
   requestCount: number
   fallbackUsed: boolean
   fallbackReason: string

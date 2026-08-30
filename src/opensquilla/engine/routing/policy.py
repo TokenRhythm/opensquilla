@@ -309,17 +309,10 @@ def anti_downgrade(
     router_cfg: object,
     valid_tiers: list[str],
     previous_tier: str | None,
-    previous_execution_kind: str | None = None,
 ) -> AntiDowngradeResult:
-    """Hold a recent single-model tier when routing would drop below it.
-
-    A multi-model ensemble has no single reusable KV cache.  Holding its tier
-    therefore turns an otherwise cheap follow-up into another full ensemble
-    run, without providing the cache benefit this guard is meant to preserve.
-    """
+    """Hold the previous turn's tier when routing would drop below it."""
     if (
         getattr(router_cfg, "kv_cache_anti_downgrade_enabled", True)
-        and previous_execution_kind != "ensemble"
         and previous_tier in valid_tiers
         and _tier_index(tier, valid_tiers) >= 0
         and _tier_index(previous_tier or "", valid_tiers) > _tier_index(tier, valid_tiers)
@@ -1137,11 +1130,6 @@ class RoutingPolicyEngine:
         )
         previous_entry = previous_final_entry(inputs.routing_history, now, window)
         previous_tier = previous_final_tier(previous_entry)
-        previous_execution_kind = (
-            str(previous_entry.get("executed_kind") or "").strip().lower()
-            if isinstance(previous_entry, dict)
-            else None
-        )
         previous_route_class = None
         if previous_entry:
             previous_route_class = previous_entry.get("final_route_class") or previous_entry.get(
@@ -1163,7 +1151,6 @@ class RoutingPolicyEngine:
             router_cfg=inputs.router_cfg,
             valid_tiers=inputs.valid_tiers,
             previous_tier=previous_tier,
-            previous_execution_kind=previous_execution_kind,
         )
         final_tier = downgrade.tier
 

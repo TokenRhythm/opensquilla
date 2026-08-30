@@ -232,7 +232,6 @@ const candidateCount = computed(() => {
   return proposers || ensemble.value?.modelCount || ensembleModels.value.length
 })
 const totalCandidates = computed(() => ensemble.value?.totalCandidates || 0)
-const successfulProposers = computed(() => ensemble.value?.successfulProposers || 0)
 const hasKnownCandidateCount = computed(() => candidateCount.value > 0)
 const emptyTraceLabel = computed(() =>
   isEnsembleHandoff.value
@@ -251,11 +250,7 @@ const gridStyle = computed<Record<string, string>>(() => {
 const ensembleStatusLabel = computed(() => {
   if (isEnsembleHandoff.value) return t('chat.routerFx.ensembleHandedOff')
   if (!hasEnsembleModels.value) return t('chat.routerFx.ensembleSelecting')
-  if (isEnsembleDone.value) {
-    return t('chat.routerFx.ensembleDone', {
-      count: successfulProposers.value || candidateCount.value,
-    })
-  }
+  if (isEnsembleDone.value) return t('chat.routerFx.ensembleDone', { count: candidateCount.value })
   return t('chat.routerFx.ensembleRunning', { count: candidateCount.value })
 })
 const ensembleMetaLabel = computed(() =>
