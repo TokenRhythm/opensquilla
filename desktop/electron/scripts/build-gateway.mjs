@@ -10,7 +10,10 @@ const runtimeGatewayDir = join(packageRoot, 'runtime', 'gateway')
 const pyinstallerWorkDir = join(packageRoot, '.pyinstaller')
 const entryPath = join(scriptDir, 'gateway-entry.py')
 const caRuntimeHookPath = join(scriptDir, 'pyinstaller_runtime_hooks', 'ensure_ca_trust.py')
-const controlUiDistDir = join(repoRoot, 'src', 'opensquilla', 'gateway', 'static', 'dist')
+// The WebUI package owns its generated output.  Desktop packaging consumes
+// that verified artifact and copies it to the shared runtime location below;
+// PyInstaller must not treat the Python source tree as a Vite output folder.
+const controlUiDistDir = join(repoRoot, 'opensquilla-webui', 'dist')
 const controlUiVerifier = join(repoRoot, 'opensquilla-webui', 'scripts', 'verify-dist.mjs')
 const routerBundleDir = join(repoRoot, 'src', 'opensquilla', 'squilla_router', 'models', 'v4.2_phase3_inference')
 const addDataSeparator = process.platform === 'win32' ? ';' : ':'
@@ -258,9 +261,8 @@ function externalizeControlUiArtifact() {
   cpSync(controlUiDistDir, sharedDistDir, { recursive: true })
 
   // --collect-all opensquilla is intentionally retained for the rest of the
-  // package data. PyInstaller therefore stages static/dist inside the frozen
-  // app first; remove only that duplicate after copying the verified artifact
-  // to the shared Desktop location.
+  // package data. The WebUI is deliberately not added to that collection: the
+  // verified artifact lives once at the shared Desktop location.
   for (const manifestPath of findFilesByName(runtimeGatewayDir, 'webui-artifact-manifest.json')) {
     const artifactDir = dirname(manifestPath)
     if (resolve(artifactDir) === resolve(sharedDistDir)) continue
@@ -369,8 +371,6 @@ const args = [
   caRuntimeHookPath,
   '--add-data',
   `${join(repoRoot, 'migrations')}${addDataSeparator}opensquilla/_migrations`,
-  '--add-data',
-  `${controlUiDistDir}${addDataSeparator}opensquilla/gateway/static/dist`,
   ...lightgbmBinaryArgs,
   ...macOpenMpBinaryArgs,
   entryPath,

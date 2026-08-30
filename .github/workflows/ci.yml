@@ -328,7 +328,7 @@ jobs:
       - name: Verify generated dist is not tracked
         shell: bash
         run: |
-          tracked="$(git ls-files 'src/opensquilla/gateway/static/dist/**')"
+          tracked="$(git ls-files 'opensquilla-webui/dist/**' 'src/opensquilla/gateway/static/dist/**')"
           if [[ -n "${tracked}" ]]; then
             echo "ERROR: generated Web UI dist must not be committed:" >&2
             printf '%s\n' "${tracked}" >&2
@@ -343,11 +343,15 @@ jobs:
           # strips harmless Finder metadata before the manifest is written.
           printf 'CI-only Finder metadata\n' > public/.DS_Store
           npm run build:artifact
-          if [[ -e ../src/opensquilla/gateway/static/dist/.DS_Store ]]; then
+          if [[ -e dist/.DS_Store || -e ../src/opensquilla/gateway/static/dist/.DS_Store ]]; then
             echo "ERROR: Finder metadata survived WebUI artifact normalization" >&2
             exit 1
           fi
           npm run verify:release-dist
+
+      - name: Verify staged backend copy
+        working-directory: opensquilla-webui
+        run: node scripts/stage-dist.mjs --check
 
       - name: Upload verified frontend artifact
         uses: actions/upload-artifact@v4
@@ -355,7 +359,7 @@ jobs:
           # Stable across rerun attempts: "re-run failed jobs" does not rerun
           # an already-successful producer, so consumers must reuse its name.
           name: opensquilla-webui-dist
-          path: src/opensquilla/gateway/static/dist/
+          path: opensquilla-webui/dist/
           if-no-files-found: error
           # GitHub permits reruns for 30 days; keep the producer artifact for
           # the full window so a failed-only consumer rerun can still reuse it.
@@ -381,10 +385,9 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: opensquilla-webui-dist
-          path: src/opensquilla/gateway/static/dist/
+          path: opensquilla-webui/dist/
 
       - name: Set up Node.js
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
         uses: actions/setup-node@v4
         with:
           node-version-file: opensquilla-webui/.node-version
@@ -395,6 +398,10 @@ jobs:
         if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
         working-directory: opensquilla-webui
         run: npm ci
+
+      - name: Stage verified frontend artifact for Python consumers
+        working-directory: opensquilla-webui
+        run: node scripts/stage-dist.mjs
 
       - name: Set up Python for Contract generation
         if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
@@ -499,6 +506,7 @@ jobs:
           fi
           python scripts/verify_webui_artifact.py \
             --forbid-personal-bgm \
+            --dist src/opensquilla/gateway/static/dist \
             --wheel "${wheels[0]}"
 
   gateway-contract-windows:
@@ -580,7 +588,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: opensquilla-webui-dist
-          path: src/opensquilla/gateway/static/dist/
+          path: opensquilla-webui/dist/
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -605,6 +613,10 @@ jobs:
       - name: Install frontend dependencies
         working-directory: opensquilla-webui
         run: npm ci
+
+      - name: Stage verified frontend artifact for Gateway
+        working-directory: opensquilla-webui
+        run: node scripts/stage-dist.mjs
 
       - name: Resolve Playwright browser revision
         id: playwright-browser
@@ -1265,7 +1277,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: opensquilla-webui-dist
-          path: src/opensquilla/gateway/static/dist/
+          path: opensquilla-webui/dist/
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -1286,9 +1298,13 @@ jobs:
             desktop/electron/package-lock.json
             opensquilla-webui/package-lock.json
 
+      - name: Stage verified frontend artifact for Desktop
+        working-directory: opensquilla-webui
+        run: node scripts/stage-dist.mjs
+
       - name: Verify downloaded frontend artifact on consumer OS
         shell: bash
-        run: node opensquilla-webui/scripts/verify-dist.mjs src/opensquilla/gateway/static/dist
+        run: node opensquilla-webui/scripts/verify-dist.mjs opensquilla-webui/dist
 
       - name: Restore Electron binary cache
         id: electron-cache

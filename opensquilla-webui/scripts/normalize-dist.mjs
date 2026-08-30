@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
-const distDir = resolve(import.meta.dirname, '../../src/opensquilla/gateway/static/dist')
+const distDir = resolve(import.meta.dirname, '../dist')
 const textFilePattern = /\.(css|html|js|map)$/
 
 function normalizeNewlines(value) {

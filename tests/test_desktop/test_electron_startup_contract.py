@@ -2726,6 +2726,7 @@ def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None
     assert "assertRuntimeSetReady" not in build_gateway
     assert "fetch-bundled-runtimes.mjs" not in build_gateway
     assert "function externalizeControlUiArtifact()" in build_gateway
+    assert "join(repoRoot, 'opensquilla-webui', 'dist')" in build_gateway
     assert "join(runtimeGatewayDir, 'control-ui-dist')" in build_gateway
     assert "cpSync(controlUiDistDir, sharedDistDir" in build_gateway
     assert "exactly one shared Web UI artifact" in build_gateway
