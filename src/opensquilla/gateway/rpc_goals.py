@@ -6,6 +6,11 @@ import uuid
 from collections.abc import Awaitable
 from typing import Any, cast
 
+from opensquilla.gateway.adapters.goals_contract import (
+    register_goals_set_contract,
+    register_goals_status_contract,
+)
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.rpc import (
     RpcContext,
     RpcHandlerError,
@@ -195,13 +200,20 @@ async def _handle_goals_capabilities(params: dict | None, ctx: RpcContext) -> di
     }
 
 
-@_d.method("goals.status", scope="operator.read")
 async def _handle_goals_status(params: dict | None, ctx: RpcContext) -> dict:
     service = _goal_service(ctx)
     return await _translate_goal_errors(
         service.status(_session_key(params)),
         service=service,
     )
+
+
+_handle_goals_status_contract = register_goals_status_contract(
+    _d,
+    _handle_goals_status,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 def _uuid_v4_param(params: dict | None, *names: str) -> str:
@@ -232,7 +244,6 @@ def _objective_param(params: dict | None) -> str:
         ) from exc
 
 
-@_d.method("goals.set", scope="operator.write")
 async def _handle_goals_set(params: dict | None, ctx: RpcContext) -> dict:
     service = _goal_service(ctx)
     objective = _objective_param(params)
@@ -259,6 +270,14 @@ async def _handle_goals_set(params: dict | None, ctx: RpcContext) -> dict:
         ),
         service=service,
     )
+
+
+_handle_goals_set_contract = register_goals_set_contract(
+    _d,
+    _handle_goals_set,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 def _mutation_params(params: dict | None) -> tuple[str, str, int, str]:

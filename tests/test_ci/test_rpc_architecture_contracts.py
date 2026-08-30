@@ -26,8 +26,10 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         # boundary; no Gateway handler or UI consumer may import them yet.
         "src/opensquilla/contracts/adapters/approval_center_contract.py",
         # S17 keeps the two migrated Goal operations behind GoalCenter; the
-        # remaining Goal mutations stay on the legacy path.
+        # remaining Goal mutations stay on the legacy path.  S18 adds the
+        # Gateway registration boundary without changing their implementation.
         "src/opensquilla/contracts/adapters/goals_contract.py",
+        "src/opensquilla/gateway/adapters/goals_contract.py",
     }
 )
 GENERATED_METADATA_IMPORT_ALLOWLIST = frozenset(
@@ -50,6 +52,11 @@ SESSIONS_SEARCH_METADATA_IMPORT_ALLOWLIST = frozenset(
     {
         "src/opensquilla/contracts/adapters/sessions_search_contract.py",
         "src/opensquilla/gateway/scopes.py",
+    }
+)
+GOALS_METADATA_IMPORT_ALLOWLIST = frozenset(
+    {
+        "src/opensquilla/contracts/adapters/goals_contract.py",
     }
 )
 SESSIONS_CHANGED_METADATA_IMPORT_ALLOWLIST = frozenset(
@@ -92,7 +99,7 @@ SESSIONS_LIST_GATEWAY_ADAPTER = (
     PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
 )
 RUNTIME_RPC_METHOD_BASELINE = 306
-STATIC_RPC_DECORATOR_BASELINE = 296
+STATIC_RPC_DECORATOR_BASELINE = 294
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
 # closure measurement below.  The temporary S2a cumulative growth budget was
@@ -387,6 +394,14 @@ def test_schema_derived_method_metadata_consumers_are_exact() -> None:
             "opensquilla.contracts.generated.v4.sessions_delete_metadata",
             SESSIONS_DELETE_METADATA_IMPORT_ALLOWLIST,
         ),
+        "goals.status": (
+            "opensquilla.contracts.generated.v4.goals_status_metadata",
+            GOALS_METADATA_IMPORT_ALLOWLIST,
+        ),
+        "goals.set": (
+            "opensquilla.contracts.generated.v4.goals_set_metadata",
+            GOALS_METADATA_IMPORT_ALLOWLIST,
+        ),
     }
     for method, (module_name, allowlist) in allowlists.items():
         consumers = {
@@ -471,7 +486,8 @@ def _reaches(graph: dict[str, set[str]], start: str, target: str) -> bool:
 def test_contract_gateway_adapters_do_not_join_a_gateway_cycle() -> None:
     graph = _module_import_graph()
     resolve_adapter = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_resolve_contract.py"
-    for adapter_path in (SESSIONS_LIST_GATEWAY_ADAPTER, resolve_adapter):
+    goals_adapter = PACKAGE_ROOT / "gateway" / "adapters" / "goals_contract.py"
+    for adapter_path in (SESSIONS_LIST_GATEWAY_ADAPTER, resolve_adapter, goals_adapter):
         adapter = _module_name(adapter_path)
         cycle_edges = sorted(
             dependency
@@ -556,6 +572,11 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
         for site in sites
         if site[2] in {"sessions.resolve", "SESSIONS_RESOLVE_METHOD"}
     ] == []
+    assert [
+        site
+        for site in sites
+        if site[2] in {"goals.status", "goals.set", "GOALS_STATUS_METHOD", "GOALS_SET_METHOD"}
+    ] == []
 
 
 def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter() -> None:
@@ -588,6 +609,26 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
     assert entry.required_scope == SESSIONS_RESOLVE_SCOPE
     assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
     assert entry.handler.__name__ == "handle_contract_method"
+
+    from opensquilla.contracts.generated.v4.goals_set_metadata import (
+        GOALS_SET_METHOD,
+        GOALS_SET_SCOPE,
+    )
+    from opensquilla.contracts.generated.v4.goals_status_metadata import (
+        GOALS_STATUS_METHOD,
+        GOALS_STATUS_SCOPE,
+    )
+
+    for method, scope in (
+        (GOALS_STATUS_METHOD, GOALS_STATUS_SCOPE),
+        (GOALS_SET_METHOD, GOALS_SET_SCOPE),
+    ):
+        entry = registry.get_entry(method)
+        assert entry is not None
+        assert entry.name == method
+        assert entry.required_scope == scope
+        assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
+        assert entry.handler.__name__ == "handle_contract_method"
 
 
 def test_cross_rpc_private_import_debt_is_exact() -> None:

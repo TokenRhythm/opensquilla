@@ -17,6 +17,10 @@ import pytest
 
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.start_turn import reserve_turn_via_runtime
+from opensquilla.gateway.adapters.goals_contract import (
+    register_goals_set_contract,
+    register_goals_status_contract,
+)
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.boot import dispatch_task_runtime_turn
 from opensquilla.gateway.config import (
@@ -26,9 +30,10 @@ from opensquilla.gateway.config import (
     SquillaRouterConfig,
 )
 from opensquilla.gateway.goal_service import GoalService
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.project_workspace_runtime import AcceptedRunModeOverride
 from opensquilla.gateway.routing import build_web_route_envelope
-from opensquilla.gateway.rpc import RpcContext, RpcHandlerError
+from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, RpcRegistry
 from opensquilla.gateway.rpc_config import _notify_goal_config_changed
 from opensquilla.gateway.rpc_goals import (
     _handle_goals_capabilities,
@@ -4920,3 +4925,76 @@ async def test_running_goal_edit_adopts_revision_in_same_task_without_transcript
         )
         assert await stack.runtime.has_session_work(SOURCE_KEY) is False
         assert await _table_count(stack.storage, "agent_tasks") == 1
+
+
+@pytest.mark.asyncio
+async def test_goal_contract_adapters_register_one_handler_per_operation() -> None:
+    registry = RpcRegistry()
+    status_result = {
+        "sessionKey": SOURCE_KEY,
+        "sessionId": "session-id",
+        "epoch": 0,
+        "goal": None,
+    }
+    set_result = {
+        "accepted": True,
+        "goal": {"status": "active"},
+    }
+    observed: list[tuple[str, Any]] = []
+
+    async def status_implementation(params: Any, _ctx: Any) -> dict[str, Any]:
+        observed.append(("status", params))
+        return status_result
+
+    async def set_implementation(params: Any, _ctx: Any) -> dict[str, Any]:
+        observed.append(("set", params))
+        return set_result
+
+    status_handler = register_goals_status_contract(
+        registry,
+        status_implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+    set_handler = register_goals_set_contract(
+        registry,
+        set_implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+
+    assert await status_handler({"session_key": SOURCE_KEY}, object()) is status_result
+    assert await set_handler({"session_key": SOURCE_KEY, "message": "ship"}, object()) is set_result
+    assert observed == [
+        ("status", {"session_key": SOURCE_KEY}),
+        ("set", {"session_key": SOURCE_KEY, "message": "ship"}),
+    ]
+    assert registry.get_entry("goals.status") is not None
+    assert registry.get_entry("goals.set") is not None
+    assert registry.get_entry("goals.status").handler is status_handler
+    assert registry.get_entry("goals.set").handler is set_handler
+
+
+@pytest.mark.asyncio
+async def test_goal_contract_adapter_maps_invalid_result_without_running_twice() -> None:
+    registry = RpcRegistry()
+    calls = 0
+
+    async def implementation(_params: Any, _ctx: Any) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        return {"accepted": True}
+
+    handler = register_goals_set_contract(
+        registry,
+        implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+
+    with pytest.raises(RpcHandlerError) as error:
+        await handler({"sessionKey": SOURCE_KEY}, object())
+
+    assert calls == 1
+    assert error.value.code == "INTERNAL_ERROR"
+    assert error.value.message == "goals.set response violated its v4 contract"
