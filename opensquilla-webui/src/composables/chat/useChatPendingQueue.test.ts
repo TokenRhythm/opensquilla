@@ -5,6 +5,8 @@ import {
   useChatPendingQueue,
   type UseChatPendingQueueOptions,
 } from './useChatPendingQueue'
+import { createLegacyPendingInputQueue } from '@/adapters/gateway/pendingInputQueueV4'
+import type { PendingInputQueuePort } from '@/modules/pendingInputQueue'
 import type { Attachment, ChatPendingItem, HiddenControlDispatchResult } from '@/types/chat'
 import {
   createPendingInputWal,
@@ -12,6 +14,15 @@ import {
   type PendingInputWalRecord,
   type ResponseHandoffWalRecord,
 } from '@/utils/chat/pendingInputWal'
+
+type LegacyQueueRpc = {
+  call: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
+}
+
+type QueueTestOverrides = Partial<UseChatPendingQueueOptions> & {
+  rpc?: LegacyQueueRpc
+  supportsMethod?: (method: string) => boolean
+}
 
 function makeQueue(
   dispatchPendingItem?: (item: ChatPendingItem, ownerSessionKey: string) => Promise<
@@ -23,7 +34,7 @@ function makeQueue(
     ownerSessionKey: string,
   ) => Promise<'accepted' | 'deferred' | 'not_sent' | 'retryable_failure'>,
   onHiddenControlDispatchResult?: (result: HiddenControlDispatchResult) => void | boolean,
-  overrides: Partial<UseChatPendingQueueOptions> = {},
+  overrides: QueueTestOverrides = {},
 ) {
   const sessionKey = ref('agent:main:webchat:test')
   const inputText = ref('')
@@ -32,6 +43,21 @@ function makeQueue(
   const isStreaming = ref(false)
   const sendCurrentInput = vi.fn()
   const defaultWal = memoryWal().wal
+  const {
+    rpc,
+    supportsMethod,
+    pendingInputQueue,
+    ...safeOverrides
+  } = overrides
+  const compatibilityQueue: PendingInputQueuePort | null = pendingInputQueue
+    ?? (rpc
+      ? createLegacyPendingInputQueue({
+          request: <T = unknown>(method: string, params?: Record<string, unknown>) => (
+            rpc.call<T>(method, params)
+          ),
+          supports: supportsMethod,
+        })
+      : null)
   const queue = useChatPendingQueue({
     sessionKey,
     inputText,
@@ -47,8 +73,8 @@ function makeQueue(
     dispatchHiddenControl,
     onHiddenControlDispatchResult,
     pendingInputWal: defaultWal,
-    supportsMethod: () => false,
-    ...overrides,
+    pendingInputQueue: compatibilityQueue,
+    ...safeOverrides,
   })
 
   return {
@@ -484,7 +510,7 @@ describe('useChatPendingQueue delivery state', () => {
         throw new Error(`unexpected method: ${method}`)
       },
     )
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         rpcCall(method, params) as Promise<T>
       ),
@@ -557,7 +583,7 @@ describe('useChatPendingQueue delivery state', () => {
         throw new Error(`unexpected method: ${method}`)
       },
     )
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         rpcCall(method, params) as Promise<T>
       ),
@@ -621,7 +647,7 @@ describe('useChatPendingQueue delivery state', () => {
         throw new Error(`unexpected method: ${method}`)
       },
     )
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         rpcCall(method, params) as Promise<T>
       ),
@@ -678,7 +704,7 @@ describe('useChatPendingQueue delivery state', () => {
         throw new Error(`unexpected method: ${method}`)
       },
     )
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         rpcCall(method, params) as Promise<T>
       ),
@@ -734,7 +760,7 @@ describe('useChatPendingQueue delivery state', () => {
       }
       throw new Error(`unexpected method: ${method}`)
     })
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => {
         void params
         return rpcCall(method) as Promise<T>
@@ -774,7 +800,7 @@ describe('useChatPendingQueue delivery state', () => {
       }
       throw new Error(`unexpected method: ${method}`)
     })
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => {
         void params
         return rpcCall(method) as Promise<T>
@@ -840,7 +866,7 @@ describe('useChatPendingQueue delivery state', () => {
         }],
       }
     })
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         rpcCall(method, params) as Promise<T>
       ),
@@ -883,7 +909,7 @@ describe('useChatPendingQueue delivery state', () => {
         throw new Error(`unexpected method: ${method}`)
       },
     )
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         rpcCall(method, params) as Promise<T>
       ),
@@ -934,7 +960,7 @@ describe('useChatPendingQueue delivery state', () => {
       }
       throw new Error(`unexpected method: ${method}`)
     })
-    const initialRpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const initialRpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         initialRpcCall(method, params) as Promise<T>
       ),
@@ -1006,7 +1032,7 @@ describe('useChatPendingQueue delivery state', () => {
       }
       throw new Error(`unexpected method: ${method}`)
     })
-    const restoredRpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const restoredRpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         restoredRpcCall(method, params) as Promise<T>
       ),
@@ -1170,7 +1196,7 @@ describe('useChatPendingQueue delivery state', () => {
       }
       throw new Error(`unexpected method: ${method}`)
     })
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => {
         void params
         return rpcCall(method) as Promise<T>
@@ -1260,7 +1286,7 @@ describe('useChatPendingQueue delivery state', () => {
       }
       throw new Error(`unexpected method: ${method}`)
     })
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => {
         void params
         return rpcCall(method) as Promise<T>
@@ -1367,7 +1393,7 @@ describe('useChatPendingQueue delivery state', () => {
       }
       throw new Error(`unexpected method: ${method}`)
     })
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => {
         void params
         return rpcCall(method) as Promise<T>
@@ -1529,7 +1555,7 @@ describe('useChatPendingQueue delivery state', () => {
         items: key === sessionB ? structuredClone(serverRows) : [],
       }
     })
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         rpcCall(method, params) as Promise<T>
       ),
@@ -2379,8 +2405,8 @@ describe('useChatPendingQueue delivery state', () => {
         }
         return {}
       })
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
-      call: rpcCall as unknown as NonNullable<UseChatPendingQueueOptions['rpc']>['call'],
+    const rpc: LegacyQueueRpc = {
+      call: rpcCall as unknown as LegacyQueueRpc['call'],
     }
     const first = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,

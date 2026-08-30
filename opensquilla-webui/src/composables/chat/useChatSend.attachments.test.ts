@@ -3,6 +3,7 @@ import { effectScope, nextTick, ref, watch } from 'vue'
 
 import { useChatSend, type UseChatSendOptions } from './useChatSend'
 import { createV4TurnCommandsFromRpcClient } from '@/adapters/gateway/turnCommandsV4'
+import { createLegacyPendingInputQueue } from '@/adapters/gateway/pendingInputQueueV4'
 import { useChatRpcEventHandlers } from './useChatRpcEventHandlers'
 import {
   snapshotSteerRequest,
@@ -6885,7 +6886,6 @@ describe('useChatSend Ensemble image guard', () => {
           delete: async pendingInputId => { pendingRecords.delete(pendingInputId) },
           close: () => {},
         },
-        supportsMethod: () => false,
       })
       const { api, options, rpc } = makeOptions({
         inputText,
@@ -7195,6 +7195,12 @@ describe('useChatSend slash-prefixed input fall-through', () => {
           rpcCall(method, params) as Promise<T>
         ),
       }
+      const pendingInputQueue = createLegacyPendingInputQueue({
+        request: <T = unknown>(method: string, params?: Record<string, unknown>) => (
+          rpc.call<T>(method, params)
+        ),
+        supports: method => method.startsWith('sessions.pending_inputs.'),
+      })
       let sendApi!: ReturnType<typeof useChatSend>
       const pending = useChatPendingQueue({
         sessionKey,
@@ -7215,8 +7221,7 @@ describe('useChatSend slash-prefixed input fall-through', () => {
           delete: async pendingInputId => { pendingRecords.delete(pendingInputId) },
           close: () => {},
         },
-        rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        pendingInputQueue,
         dispatchPendingItem: (item, ownerSessionKey) => (
           sendApi.sendQueuedFollowup(item, ownerSessionKey)
         ),
@@ -7313,6 +7318,12 @@ describe('useChatSend slash-prefixed input fall-through', () => {
           rpcCall(method, params) as Promise<T>
         ),
       }
+      const pendingInputQueue = createLegacyPendingInputQueue({
+        request: <T = unknown>(method: string, params?: Record<string, unknown>) => (
+          rpc.call<T>(method, params)
+        ),
+        supports: method => method.startsWith('sessions.pending_inputs.'),
+      })
       let sendApi!: ReturnType<typeof useChatSend>
       const pending = useChatPendingQueue({
         sessionKey,
@@ -7333,8 +7344,7 @@ describe('useChatSend slash-prefixed input fall-through', () => {
           delete: async pendingInputId => { pendingRecords.delete(pendingInputId) },
           close: () => {},
         },
-        rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        pendingInputQueue,
         dispatchPendingItem: (item, ownerSessionKey) => (
           sendApi.sendQueuedFollowup(item, ownerSessionKey)
         ),
@@ -7840,7 +7850,6 @@ describe('useChatSend slash-prefixed input fall-through', () => {
             delete: async pendingInputId => { pendingRecords.delete(pendingInputId) },
             close: () => {},
           },
-          supportsMethod: () => false,
           dispatchPendingItem: (item, ownerSessionKey) => (
             sendApi.sendQueuedFollowup(item, ownerSessionKey)
           ),

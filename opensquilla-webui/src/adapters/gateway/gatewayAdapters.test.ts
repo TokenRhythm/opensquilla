@@ -5,7 +5,11 @@ import { createGatewayAdapters } from './gatewayAdapters'
 
 describe('Gateway Adapter composition', () => {
   it('exposes domain Modules without exposing the private transports', async () => {
-    const call = vi.fn(async () => ({ sessions: [] })) as <T = unknown>(
+    const call = vi.fn(async (method: string) => (
+      method === 'sessions.pending_inputs.list'
+        ? { items: [] }
+        : { sessions: [] }
+    )) as <T = unknown>(
       method: string,
       params?: Record<string, unknown>,
       options?: RpcCallOptions,
@@ -26,6 +30,7 @@ describe('Gateway Adapter composition', () => {
       'sessionLifecycle',
       'sessionRouting',
       'turnCommands',
+      'pendingInputQueue',
     ])
     expect(adapters).not.toHaveProperty('rpc')
     expect(adapters).not.toHaveProperty('events')
@@ -46,5 +51,7 @@ describe('Gateway Adapter composition', () => {
       { sessionKey: 'agent:main:test', source: 'test' },
       undefined,
     )
+
+    await expect(adapters.pendingInputQueue.list('agent:main:test')).resolves.toEqual([])
   })
 })
