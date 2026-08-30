@@ -1286,7 +1286,7 @@ function bootPagePath(): string {
 function desktopRendererDistPath(): string {
   return app.isPackaged
     ? join(packagedRuntimeRoot(), 'gateway', 'control-ui-dist')
-    : join(repoRoot, 'src', 'opensquilla', 'gateway', 'static', 'dist')
+    : join(repoRoot, 'opensquilla-webui', 'dist')
 }
 
 function desktopGatewayUnavailableResponse(): Response {

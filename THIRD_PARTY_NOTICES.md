@@ -24,8 +24,9 @@ It covers:
 ## Web UI dependencies and bundled fonts
 
 OpenSquilla builds the Vue Control UI from npm dependencies and locally bundled
-fonts. Release artifacts contain the generated browser assets under
-`src/opensquilla/gateway/static/dist/`; the dependency sources and exact
+fonts. Release artifacts contain the generated browser assets from the
+source-owned `opensquilla-webui/dist/` tree (staged into
+`src/opensquilla/gateway/static/dist/` for Python packages); the dependency sources and exact
 resolved versions are recorded by `opensquilla-webui/package.json` and
 `opensquilla-webui/package-lock.json`.
 

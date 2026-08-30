@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "npm run typecheck && npm run build:artifact",
-    "build:artifact": "vite build && node scripts/normalize-dist.mjs && node scripts/check-theme-bundle.mjs && node scripts/check-runtime-bundle.mjs && node scripts/verify-dist.mjs --write",
+    "build:artifact": "vite build && node scripts/normalize-dist.mjs && node scripts/check-theme-bundle.mjs && node scripts/check-runtime-bundle.mjs && node scripts/verify-dist.mjs --write && node scripts/stage-dist.mjs",
     "verify:dist": "node scripts/verify-dist.mjs",
     "verify:release-dist": "node scripts/verify-dist.mjs --forbid-personal-bgm",
     "preview": "vite preview",
