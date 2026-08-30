@@ -465,9 +465,10 @@ describe('RouterFxStrip ensemble panel', () => {
     expect(el.querySelector('[data-testid="router-ensemble-toggle"]')?.getAttribute('aria-busy')).toBe('true')
 
     message.routerSettled = true
+    if (message.ensemble) message.ensemble.successfulProposers = 1
     await nextTick()
 
-    expect(el.textContent).toContain('2 candidates synthesized')
+    expect(el.textContent).toContain('1 candidates synthesized')
     expect(el.querySelector('.router-fx-ensemble__dot.done')).toBeTruthy()
     expect(el.querySelector('.router-fx-ensemble__scan')).toBeFalsy()
     expect(el.querySelector('[data-testid="router-ensemble-toggle"]')?.getAttribute('aria-busy')).toBe('false')

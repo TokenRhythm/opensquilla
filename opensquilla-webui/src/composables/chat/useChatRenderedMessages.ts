@@ -970,6 +970,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       profile: String(trace?.profile || breakdown[0]?.profile || 'llm_ensemble'),
       modelCount: uniqueModels.size || models.length || numeric(trace?.selected_candidate_count) || numeric(trace?.total_candidates),
       totalCandidates: numeric(trace?.total_candidates),
+      successfulProposers: numeric(trace?.successful_proposers),
       // A settled trace may include display-only rows for members whose
       // provider request never started. Keep the trace's physical request
       // count authoritative, with actual usage rows as the legacy lower bound.

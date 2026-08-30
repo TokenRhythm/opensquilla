@@ -293,6 +293,12 @@ def _complete_pending_record(
     try:
         ensemble_enabled = bool(metadata.get("ensemble_enabled"))
         record["executed_kind"] = "ensemble" if ensemble_enabled else "single"
+        session_key = record.get("session_key")
+        turn_index = record.get("turn_index")
+        if isinstance(session_key, str) and isinstance(turn_index, int):
+            from opensquilla.engine.steps.squilla_router import mark_routing_history_execution
+
+            mark_routing_history_execution(session_key, turn_index, record["executed_kind"])
         profile = None
         if ensemble_enabled and isinstance(ensemble_trace, Mapping):
             profile = _token(ensemble_trace.get("profile"))
@@ -489,6 +495,9 @@ def rehydrate_history_from_writer(
                     "final_route_class": route_class_for_tier(final_tier or proposed_tier or ""),
                     "rehydrated": True,
                 }
+                executed_kind = row.get("executed_kind")
+                if executed_kind in {"single", "ensemble"}:
+                    entry["executed_kind"] = executed_kind
                 entries.append(entry)
             if entries:
                 entries_by_session[session_key] = entries
