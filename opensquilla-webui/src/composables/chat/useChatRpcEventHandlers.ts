@@ -186,6 +186,7 @@ export interface UseChatRpcEventHandlersOptions {
   handleSessionConnectionState?: (state: string) => SessionBootstrapRun | undefined
   loadCurrentSessionUsage: () => void
   refreshRunModePreference?: () => void | Promise<void>
+  onTaskCancelled?: (taskId: string) => void
 }
 
 type ChatDoneUsageFields = {
@@ -2287,6 +2288,13 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       && payloadTaskId(payloadObj) === activeStreamTaskId.value,
     )
     if (!terminalMatchesStop && !terminalMatchesRenderOwner && !isCurrentTaskPayload(payloadObj)) return
+    const cancelledByDoneReceipt = (
+      (rawEvent === 'session.event.done' || rawEvent === 'chat.done')
+      && payloadObj.reason === 'aborted'
+    )
+    if ((terminalStatus === 'cancelled' || cancelledByDoneReceipt) && terminalTaskId) {
+      options.onTaskCancelled?.(terminalTaskId)
+    }
     if (terminalStatus) {
       if (!isCurrentSessionPayload(payloadObj)) return
       const terminalRunStatus = terminalStatus === 'succeeded' ? 'idle' : terminalStatus === 'abandoned' ? 'interrupted' : terminalStatus

@@ -1067,6 +1067,22 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     resetClarifyPresentation()
   }
 
+  /**
+   * A cancelled task makes its request_user_input frame unanswerable at the
+   * Gateway.  Resolve the local card as unavailable as well, so it cannot keep
+   * the composer locked or invite the user to submit a request that no longer
+   * exists.
+   */
+  function cancelPendingClarify() {
+    const request = pendingClarify.value
+    if (!request) return
+    const key = clarifyFrameKey(request)
+    clarifySubmitAttempts.delete(key)
+    setInterruptState(key, { resolution: 'unavailable', busy: false, error: '' })
+    pendingClarify.value = null
+    resetClarifyPresentation()
+  }
+
   function applyUserInputBootstrap(snapshot: {
     pendingUserInputs?: unknown[]
     pending_user_inputs?: unknown[]
@@ -1146,6 +1162,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     extendInterrupt,
     submitClarify,
     dismissClarify,
+    cancelPendingClarify,
     applyUserInputBootstrap,
     subscribe,
     cleanup,

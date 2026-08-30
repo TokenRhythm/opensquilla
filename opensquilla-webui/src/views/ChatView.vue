@@ -3668,6 +3668,7 @@ const {
   extendInterrupt,
   submitClarify,
   dismissClarify,
+  cancelPendingClarify,
   applyUserInputBootstrap,
 } = chatApprovals
 applyPendingUserInputSnapshot = applyUserInputBootstrap
@@ -3795,6 +3796,10 @@ const rpcEventHandlers = useChatRpcEventHandlers({
     handleSessionConnectionState(state, !isDraftRoute()),
   loadCurrentSessionUsage,
   refreshRunModePreference: refreshPostBootstrapMetadata,
+  onTaskCancelled: taskId => {
+    chatPlans.settleActiveRunForCancelledTask(taskId)
+    cancelPendingClarify()
+  },
 })
 bindActiveStreamTask = rpcEventHandlers.bindActiveStreamTask
 restoreLiveTurnSnapshot = rpcEventHandlers.restoreLiveTurnSnapshot

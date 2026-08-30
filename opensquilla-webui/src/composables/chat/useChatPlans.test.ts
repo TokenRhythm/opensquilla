@@ -633,6 +633,23 @@ describe('useChatPlans', () => {
     expect(api.activePlanRun.value?.status).toBe('cancelled')
   })
 
+  it('settles the visible run when its active task is stopped outside the Plan ribbon', () => {
+    const { api } = harness()
+    api.applyBootstrap({
+      key: SESSION_ONE,
+      currentPlan: revision(),
+      activePlanRun: run('running', { activeTaskId: 'task-stop-1' }) as never,
+    })
+
+    expect(api.settleActiveRunForCancelledTask('task-stop-1')).toBe(true)
+    expect(api.activePlanRun.value).toMatchObject({
+      status: 'cancelled',
+      terminalReason: 'cancelled_by_user',
+      currentStepId: undefined,
+      steps: [{ status: 'skipped', reason: 'cancelled_by_user' }],
+    })
+  })
+
   it('keeps a newer epoch cancellation locked when the old cancellation returns late', async () => {
     const { api, currentEpoch, rpc } = harness()
     api.applyBootstrap({
