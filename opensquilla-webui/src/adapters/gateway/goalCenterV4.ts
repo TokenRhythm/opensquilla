@@ -59,7 +59,13 @@ function optionsFor(signal: AbortSignal | undefined): RpcCallOptions | undefined
 
 export function createV4GoalCenter(transport: GoalCenterTransport): GoalCenter {
   return {
-    available(operation = 'status') { return transport.supports?.(operation === 'set' ? GOALS_SET_METHOD : GOALS_STATUS_METHOD) ?? true },
+    available(operation = 'status') {
+      if (!transport.supports) return true
+      if (operation === 'goal-mode') {
+        return transport.supports(GOALS_SET_METHOD) && transport.supports('goals.capabilities')
+      }
+      return transport.supports(operation === 'set' ? GOALS_SET_METHOD : GOALS_STATUS_METHOD)
+    },
     async status(sessionKey, options): Promise<GoalStatusResult> {
       const params: GoalStatusParams = { sessionKey }
       if (!validateGoalStatusParams(params)) throw new GoalCenterError('invalid', 'goals.status params violated Contract')

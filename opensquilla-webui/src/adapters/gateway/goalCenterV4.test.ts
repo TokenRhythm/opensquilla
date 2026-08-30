@@ -14,6 +14,15 @@ function transport(response: unknown, supported = true) {
 }
 
 describe('createV4GoalCenter', () => {
+  it('keeps goal-mode availability behind the semantic module boundary', () => {
+    const source = {
+      supports: (method: string) => method === 'goals.set' || method === 'goals.capabilities',
+      request: async <T>(_method: string, _params?: Record<string, unknown>) => undefined as T,
+    }
+    const center = createV4GoalCenter(source)
+    expect(center.available('goal-mode')).toBe(true)
+  })
+
   it('validates and projects goals.status without exposing wire aliases', async () => {
     const source = transport({ session_key: 'agent:demo', session_id: 's1', epoch: 2, goal: { status: 'active', goal_id: 'g1', objective: 'ship', session_key: 'agent:demo', session_id: 's1', epoch: 2, state_revision: 3, objective_revision: 1, progress_revision: 0, active_task_id: null, source_user_message_id: 'm1', turns_started: 2, usage: { total_tokens: 4 } } })
     const center = createV4GoalCenter(source)

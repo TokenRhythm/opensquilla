@@ -4414,10 +4414,7 @@ const planUiAvailable = computed(() =>
   rpc.supportsMethod('plans.setMode')
   && rpc.supportsMethod('plans.capabilities'),
 )
-const goalUiAvailable = computed(() =>
-  rpc.supportsMethod('goals.set')
-  && rpc.supportsMethod('goals.capabilities'),
-)
+const goalUiAvailable = computed(() => goalCenter.available('goal-mode'))
 const goalComposerExisting = computed(() => (
   currentGoalRun.value !== null
   && !goalStatusIsTerminal(currentGoalRun.value.status)
