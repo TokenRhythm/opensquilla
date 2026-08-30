@@ -20,7 +20,7 @@ describe('ChatView Goal and Plan composer mode exclusivity', () => {
     )
     const createSession = source.indexOf('sessionLifecycle.create({')
     const captureRouting = source.indexOf('const draftInitialRoutingMode = initialRoutingMode.value')
-    const persistRouting = source.indexOf("rpc.call('sessions.routing.set'")
+    const persistRouting = source.indexOf('await sessionRouting.set({')
     const preserveAgent = source.indexOf('agentId: agentIdFromSessionKey(sourceKey)')
     const preserveProject = source.indexOf('...(workspaceId ? { workspaceId } : {})')
     const staleNavigationFence = source.indexOf('sessionKey.value !== sourceKey')
