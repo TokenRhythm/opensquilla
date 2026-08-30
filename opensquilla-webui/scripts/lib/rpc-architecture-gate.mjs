@@ -41,6 +41,9 @@ const isRpcTransportImplementation = rel => (
   rel === 'src/stores/rpc.ts'
   || rel === 'src/lib/rpc.ts'
   || rel === 'src/adapters/gateway/privateTransports.ts'
+  // This adapter is the private wildcard listener for the v4 event stream;
+  // exposing its raw `on` calls to a composable would defeat the seam.
+  || rel === 'src/adapters/gateway/conversationEventTransport.ts'
 )
 
 function scriptBody(rel, body) {

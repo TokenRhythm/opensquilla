@@ -16,10 +16,13 @@ import type {
   ToolUsePayload,
   WarningPayload,
 } from '@/types/rpc'
-import type { RpcEventHandler } from '@/lib/rpc'
+import {
+  createConversationEventTransport,
+  type ConversationEventTransportHandlers,
+} from '@/adapters/gateway/conversationEventTransport'
 
 type RpcSubscriptionClient = {
-  on(event: string, handler: RpcEventHandler): () => void
+  on(event: string, handler: (...args: unknown[]) => void): () => void
 }
 
 export type ChatRpcSubscriptionHandlers = {
@@ -57,46 +60,57 @@ export function useChatRpcSubscriptions(
   rpc: RpcSubscriptionClient,
   handlers: ChatRpcSubscriptionHandlers,
 ) {
-  let unsubs: Array<() => void> = []
+  const transport = createConversationEventTransport(rpc)
+  let unsubscribeTransport: (() => void) | null = null
+
+  function payloadHandler<T>(
+    handler: (payload: T, meta?: unknown) => void,
+  ) {
+    return (payload: unknown, meta?: unknown) => handler(payload as T, meta)
+  }
+
+  function transportHandlers(): ConversationEventTransportHandlers {
+    return {
+      onAnswerGenerationReset: payloadHandler(handlers.onAnswerGenerationReset),
+      onTextDelta: payloadHandler(handlers.onTextDelta),
+      onToolUseStart: payloadHandler(handlers.onToolUseStart),
+      onToolUseDelta: payloadHandler(handlers.onToolUseDelta),
+      onToolUseEnd: payloadHandler(handlers.onToolUseEnd),
+      onToolResult: payloadHandler(handlers.onToolResult),
+      onArtifact: payloadHandler(handlers.onArtifact),
+      onStateChange: payloadHandler(handlers.onStateChange),
+      onRunHeartbeat: payloadHandler(handlers.onRunHeartbeat),
+      onProviderActivity: payloadHandler(handlers.onProviderActivity),
+      onCompaction: payloadHandler(handlers.onCompaction),
+      onWarning: payloadHandler(handlers.onWarning),
+      onInputDisposition: payloadHandler(handlers.onInputDisposition),
+      onCronResult: payloadHandler(handlers.onCronResult),
+      onSubagentCompletion: payloadHandler(handlers.onSubagentCompletion),
+      onEpochChanged: payloadHandler(handlers.onEpochChanged),
+      onSessionsChanged: payloadHandler(handlers.onSessionsChanged),
+      onTaskQueued: payloadHandler(handlers.onTaskQueued),
+      onTaskRunning: payloadHandler(handlers.onTaskRunning),
+      onTaskGroupWaiting: payloadHandler(handlers.onTaskGroupWaiting),
+      onTaskGroupSynthesizing: payloadHandler(handlers.onTaskGroupSynthesizing),
+      onTaskGroupDone: payloadHandler(handlers.onTaskGroupDone),
+      onTaskGroupFailed: payloadHandler(handlers.onTaskGroupFailed),
+      onRouterDecision: payloadHandler(handlers.onRouterDecision),
+      onEnsembleProgress: payloadHandler(handlers.onEnsembleProgress),
+      onRouterControlReplay: payloadHandler(handlers.onRouterControlReplay),
+      onAny: handlers.onAny,
+      onConnectionState: handlers.onConnectionState,
+    }
+  }
 
   function subscribe(): () => void {
     unsubscribe()
-    unsubs = [
-      rpc.on('session.event.answer_generation_reset', handlers.onAnswerGenerationReset),
-      rpc.on('session.event.text_delta', handlers.onTextDelta),
-      rpc.on('session.event.tool_use_start', handlers.onToolUseStart),
-      rpc.on('session.event.tool_use_delta', handlers.onToolUseDelta),
-      rpc.on('session.event.tool_use_end', handlers.onToolUseEnd),
-      rpc.on('session.event.tool_result', handlers.onToolResult),
-      rpc.on('session.event.artifact', handlers.onArtifact),
-      rpc.on('session.event.state_change', handlers.onStateChange),
-      rpc.on('session.event.run_heartbeat', handlers.onRunHeartbeat),
-      rpc.on('session.event.provider_activity', handlers.onProviderActivity),
-      rpc.on('session.event.compaction', handlers.onCompaction),
-      rpc.on('session.event.warning', handlers.onWarning),
-      rpc.on('session.event.input_disposition', handlers.onInputDisposition),
-      rpc.on('session.event.cron_result', handlers.onCronResult),
-      rpc.on('session.event.subagent_completion', handlers.onSubagentCompletion),
-      rpc.on('session.epoch_changed', handlers.onEpochChanged),
-      rpc.on('sessions.changed', handlers.onSessionsChanged),
-      rpc.on('task.queued', handlers.onTaskQueued),
-      rpc.on('task.running', handlers.onTaskRunning),
-      rpc.on('session.event.task_group.waiting', handlers.onTaskGroupWaiting),
-      rpc.on('session.event.task_group.synthesizing', handlers.onTaskGroupSynthesizing),
-      rpc.on('session.event.task_group.done', handlers.onTaskGroupDone),
-      rpc.on('session.event.task_group.failed', handlers.onTaskGroupFailed),
-      rpc.on('session.event.router_decision', handlers.onRouterDecision),
-      rpc.on('session.event.ensemble_progress', handlers.onEnsembleProgress),
-      rpc.on('session.event.router_control_replay', handlers.onRouterControlReplay),
-      rpc.on('*', handlers.onAny),
-      rpc.on('_state', handlers.onConnectionState),
-    ]
+    unsubscribeTransport = transport.subscribe(transportHandlers())
     return unsubscribe
   }
 
   function unsubscribe() {
-    unsubs.forEach(fn => fn())
-    unsubs = []
+    unsubscribeTransport?.()
+    unsubscribeTransport = null
   }
 
   return {
