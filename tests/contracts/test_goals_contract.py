@@ -4,11 +4,31 @@ import pytest
 
 from opensquilla.contracts.adapters.goals_contract import (
     GoalsContractError,
+    goals_set_params_contract_errors,
+    goals_status_params_contract_errors,
     validate_goals_set_params,
     validate_goals_set_result,
     validate_goals_status_params,
     validate_goals_status_result,
 )
+
+
+def test_status_observer_reports_drift_without_raising() -> None:
+    assert goals_status_params_contract_errors({"session_key": "agent:demo"}) == ()
+    assert goals_status_params_contract_errors({"sessionKey": 1})
+    assert goals_status_params_contract_errors(None) == ()
+
+
+def test_set_observer_accepts_legacy_shape_and_reports_invalid_values() -> None:
+    assert goals_set_params_contract_errors(
+        {
+            "session_key": "agent:demo",
+            "message": "ship",
+            "client_request_id": "550e8400-e29b-41d4-a716-446655440000",
+            "client_message_id": "550e8400-e29b-41d4-a716-446655440001",
+        }
+    ) == ()
+    assert goals_set_params_contract_errors({"sessionKey": "agent:demo"})
 
 
 def test_status_accepts_legacy_session_key_alias() -> None:
