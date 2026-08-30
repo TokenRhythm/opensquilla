@@ -169,6 +169,58 @@ async def test_waterline_no_alert_when_auto_compaction_takes_over() -> None:
 
 
 @pytest.mark.asyncio
+async def test_waterline_alert_used_excludes_second_checkpoint_add() -> None:
+    """Exact-value regression for the double-count fix.
+
+    ``durable_history_tokens`` already contains the checkpoint payload
+    (callers sum checkpoint + transcript entries). At 750/1000 the alert
+    must fire at 75%. Under the previous double-add (used = 750 + 500 =
+    1250 >= the 850 auto line) the helper went silent -- which is exactly
+    the reviewer's inflated-accounting symptom, just past the auto line.
+    """
+
+    sm = _RecordingSessionManager([])
+    runner = _runner(sm)
+
+    await runner._emit_context_waterline_alert(
+        "user:session",
+        durable_history_tokens=750,
+        checkpoint_tokens=500,
+        history_window_tokens=1000,
+    )
+
+    alerts = _alert_contents(sm)
+    assert len(alerts) == 1
+    assert "75%" in alerts[0]
+
+
+@pytest.mark.asyncio
+async def test_waterline_alert_exact_numeric_boundaries() -> None:
+    """Pin the emission band to exact token counts: silent below 700,
+    alerting at 700..849, silent at the 850 auto line."""
+
+    sm = _RecordingSessionManager([])
+    runner = _runner(sm)
+
+    async def used_for(durable: int) -> list[str]:
+        runner._context_waterline_alerted_sessions.discard("user:session")
+        sm.append_message_calls.clear()
+        await runner._emit_context_waterline_alert(
+            "user:session",
+            durable_history_tokens=durable,
+            checkpoint_tokens=0,
+            history_window_tokens=1000,
+        )
+        return _alert_contents(sm)
+
+    assert await used_for(699) == []
+    assert len(await used_for(700)) == 1
+    # 849 still fires (85%); 850 == the auto line stays silent.
+    assert "85%" in (await used_for(849))[0]
+    assert await used_for(850) == []
+
+
+@pytest.mark.asyncio
 async def test_waterline_alert_failure_never_breaks_the_turn() -> None:
     """A raising session manager must not propagate out of preflight."""
 

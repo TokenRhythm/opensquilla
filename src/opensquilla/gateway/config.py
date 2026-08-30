@@ -1406,6 +1406,10 @@ class AgentTokenSavingConfig(BaseSettings):
     tool_result_fresh_diagnostic_inline_max_chars: int = Field(default=64_000, ge=0)
     tool_result_dispatch_max_chars: int = Field(default=0, ge=0)
     tool_result_dispatch_turn_max_chars: int = Field(default=0, ge=0)
+    # Context-waterline projection of oversized historical tool results in
+    # the provider request view. Opt-in: changes the shared turn path.
+    tool_result_history_projection_enabled: bool = Field(default=False)
+    tool_result_history_projection_keep_recent_turns: int = Field(default=3, ge=0)
     tool_result_store_full_trace: bool = Field(default=False)
     tool_result_store_max_bytes: int = Field(default=8 * 1024 * 1024, ge=0)
     tool_result_store_disk_budget_bytes: int = Field(default=256 * 1024 * 1024, ge=0)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -61,13 +62,35 @@ def _config(tmp_path: Any, **overrides: Any) -> AgentConfig:
         "tool_result_store_session_key": "agent:main:session-1",
         "tool_result_store_agent_id": "main",
         "tool_result_provider_request_max_chars": 4_000,
+        # Tests exercise the projection itself; production defaults to off.
+        "tool_result_history_projection_enabled": True,
         "tool_result_history_projection_keep_recent_turns": 1,
     }
     values.update(overrides)
     return AgentConfig(**values)
 
 
-def _history_messages(big_content: str, *, is_error: bool = False) -> list[Message]:
+def _exec_status(status: str) -> dict[str, Any]:
+    """Full ExecutionStatus shape required by ContentBlockToolResult."""
+
+    return {
+        "version": 1,
+        "status": status,
+        "exit_code": None,
+        "timed_out": status == "timeout",
+        "truncated": False,
+        "reason": None,
+        "source": "tool_runtime",
+        "preservation_class": "normal",
+    }
+
+
+def _history_messages(
+    big_content: str,
+    *,
+    is_error: bool = False,
+    execution_status: Any = None,
+) -> list[Message]:
     """Two completed turns; the bulky result sits in the older exchange."""
 
     return [
@@ -89,6 +112,7 @@ def _history_messages(big_content: str, *, is_error: bool = False) -> list[Messa
                     tool_use_id="tool-old",
                     content=big_content,
                     is_error=is_error,
+                    execution_status=execution_status,
                 )
             ],
         ),
@@ -125,6 +149,109 @@ def _request_texts(messages: list[Any]) -> list[str]:
 
 
 _BIG_CONTENT = "pytest output\n" + ("x" * 50_000)
+
+
+@pytest.mark.asyncio
+async def test_history_waterline_disabled_by_default(tmp_path: Any) -> None:
+    """Without the explicit opt-in the shared turn path is untouched."""
+
+    config = _config(tmp_path)
+    config.tool_result_history_projection_enabled = False
+    agent = Agent(
+        provider=_Provider(),
+        config=config,
+        tool_definitions=[_tool_def("retrieve_tool_result")],
+        tool_handler=_unused_tool_handler,
+    )
+    messages = _history_messages(_BIG_CONTENT)
+
+    agent._remember_provider_visible_tool_results(list(messages))
+
+    request_messages = _assemble(agent, messages)
+
+    for text in _request_texts(request_messages):
+        assert not text.startswith("[tool_result_projection]")
+    assert "history_waterline_projection_applied" not in agent.config.metadata
+
+
+@pytest.mark.asyncio
+async def test_history_waterline_never_projects_failed_results(tmp_path: Any) -> None:
+    """Error outputs carry the only copy of diagnostics: stay inline."""
+
+    for kwargs in ({"is_error": True}, {"execution_status": {"status": "error"}}):
+        agent = Agent(
+            provider=_Provider(),
+            config=_config(tmp_path),
+            tool_definitions=[_tool_def("retrieve_tool_result")],
+            tool_handler=_unused_tool_handler,
+        )
+        messages = _history_messages(_BIG_CONTENT, execution_status=_exec_status("error"))
+
+        agent._remember_provider_visible_tool_results(list(messages))
+        request_messages = _assemble(agent, messages)
+
+        for text in _request_texts(request_messages):
+            assert not text.startswith("[tool_result_projection]"), (
+                f"failed result must stay inline: {kwargs}"
+            )
+        assert "history_waterline_projection_applied" not in agent.config.metadata
+
+
+@pytest.mark.asyncio
+async def test_history_waterline_skips_non_success_execution_status(
+    tmp_path: Any,
+) -> None:
+    """denied/cancelled/timeout/unavailable-class statuses stay inline."""
+
+    for status in ("timeout", "cancelled", "unknown"):
+        agent = Agent(
+            provider=_Provider(),
+            config=_config(tmp_path),
+            tool_definitions=[_tool_def("retrieve_tool_result")],
+            tool_handler=_unused_tool_handler,
+        )
+        messages = _history_messages(
+            _BIG_CONTENT,
+            execution_status=_exec_status(status),
+        )
+
+        agent._remember_provider_visible_tool_results(list(messages))
+        request_messages = _assemble(agent, messages)
+
+        for text in _request_texts(request_messages):
+            assert not text.startswith("[tool_result_projection]"), (
+                f"status={status} must stay inline"
+            )
+
+
+@pytest.mark.asyncio
+async def test_history_waterline_requires_verifiable_recovery_source(
+    tmp_path: Any,
+    monkeypatch,
+) -> None:
+    """A stored handle that cannot be read back blocks the projection."""
+
+    agent = Agent(
+        provider=_Provider(),
+        config=_config(tmp_path),
+        tool_definitions=[_tool_def("retrieve_tool_result")],
+        tool_handler=_unused_tool_handler,
+    )
+
+    def broken_read(handle: str, *, session_id: str) -> Any:
+        raise OSError("store unavailable")
+
+    monkeypatch.setattr(
+        "opensquilla.engine.agent.ToolResultStore",
+        lambda _dir: SimpleNamespace(read=broken_read),
+    )
+    messages = _history_messages(_BIG_CONTENT)
+
+    agent._remember_provider_visible_tool_results(list(messages))
+    request_messages = _assemble(agent, messages)
+
+    for text in _request_texts(request_messages):
+        assert not text.startswith("[tool_result_projection]")
 
 
 @pytest.mark.asyncio

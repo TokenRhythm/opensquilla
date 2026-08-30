@@ -811,6 +811,10 @@ class AgentConfig:
     # provider request view once history spans more than this many completed
     # assistant turns. 0 disables the pass. This bounds monotonic history
     # growth without waiting for request-level budget pressure.
+    # Off by default: the shared turn path changes provider-visible history
+    # for every provider call, so operators opt in explicitly (gateway
+    # [agent_token_saving] tool_result_history_projection_enabled).
+    tool_result_history_projection_enabled: bool = False
     tool_result_history_projection_keep_recent_turns: int = 3
     tool_failure_loop_block_threshold: int = 3
     repeated_tool_call_recovery_threshold: int = 0

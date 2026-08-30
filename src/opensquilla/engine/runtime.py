@@ -13174,11 +13174,18 @@ class TurnRunner:
         until an overflow error. Latched per session; cleared by durable
         compaction or when pressure drops back under the line. Best effort:
         never blocks the turn.
+
+        ``durable_history_tokens`` already includes the checkpoint projection
+        (callers sum checkpoint + transcript entries); it is used as-is so
+        the same payload is never counted twice.
         """
 
         try:
             window = int(history_window_tokens)
-            used = max(0, int(durable_history_tokens)) + max(0, int(checkpoint_tokens))
+            # durable_history_tokens already includes the checkpoint projection
+            # (callers sum checkpoint + transcript entries); use it as-is so the
+            # same payload is never counted twice.
+            used = max(0, int(durable_history_tokens))
             if window <= 0 or used <= 0:
                 return
             alert_line = int(window * self._context_waterline_alert_ratio())
