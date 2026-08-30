@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { effectScope, nextTick, ref, watch } from 'vue'
 
 import { useChatSend, type UseChatSendOptions } from './useChatSend'
+import { createV4TurnCommandsFromRpcClient } from '@/adapters/gateway/turnCommandsV4'
 import { useChatRpcEventHandlers } from './useChatRpcEventHandlers'
 import {
   snapshotSteerRequest,
@@ -111,6 +112,9 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
   const rpc = {
     call: vi.fn().mockResolvedValue({ sessionKey: 'agent:main:webchat:test' }),
   }
+  const turnCommands = overrides.turnCommands ?? createV4TurnCommandsFromRpcClient(
+    rpc as unknown as UseChatSendOptions['rpc'],
+  )
   const stream: UseChatSendOptions['stream'] = {
     isStreaming: ref(false),
     streamBubble: ref(false),
@@ -162,6 +166,7 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
     })
   const options: UseChatSendOptions = {
     rpc,
+    turnCommands,
     inputText: ref('hello'),
     messages,
     sessionKey: ref('agent:main:webchat:test'),
@@ -201,6 +206,12 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
     autoResizeTextarea: vi.fn(),
     scrollToBottom: vi.fn(),
     ...overrides,
+  }
+  if (!overrides.turnCommands) {
+    options.turnCommands = createV4TurnCommandsFromRpcClient(
+      options.rpc,
+      options.supportsMethod,
+    )
   }
   return { api: useChatSend(options), options, rpc, stream, pendingQueue }
 }

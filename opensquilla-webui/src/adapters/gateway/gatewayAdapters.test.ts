@@ -25,6 +25,7 @@ describe('Gateway Adapter composition', () => {
       'sessionDirectoryChanges',
       'sessionLifecycle',
       'sessionRouting',
+      'turnCommands',
     ])
     expect(adapters).not.toHaveProperty('rpc')
     expect(adapters).not.toHaveProperty('events')
@@ -38,5 +39,12 @@ describe('Gateway Adapter composition', () => {
     await adapters.sessionDirectoryChanges.resume()
     expect(call).toHaveBeenCalledTimes(2)
     changesSubscription.close()
+
+    await adapters.turnCommands.cancel({ sessionKey: 'agent:main:test', source: 'test' })
+    expect(call).toHaveBeenLastCalledWith(
+      'chat.abort',
+      { sessionKey: 'agent:main:test', source: 'test' },
+      undefined,
+    )
   })
 })

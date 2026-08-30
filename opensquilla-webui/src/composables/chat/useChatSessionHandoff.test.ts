@@ -12,6 +12,7 @@ import {
   type ChatSendOutcome,
   type UseChatSendOptions,
 } from './useChatSend'
+import { createV4TurnCommandsFromRpcClient } from '@/adapters/gateway/turnCommandsV4'
 import { useChatSessionRuntime } from './useChatSessionRuntime'
 import { useChatSteerDelivery } from './useChatSteerDelivery'
 import type {
@@ -280,6 +281,7 @@ describe('chat send session handoff', () => {
         resolveSend = resolve as (value: unknown) => void
       })) as UseChatSendOptions['rpc']['call'],
     }
+    const turnCommands = createV4TurnCommandsFromRpcClient(rpc)
     const scheduleHistorySync = vi.fn()
     const steerDelivery = useChatSteerDelivery({
       messages,
@@ -289,6 +291,7 @@ describe('chat send session handoff', () => {
     })
     const send = useChatSend({
       rpc,
+      turnCommands,
       inputText,
       messages,
       sessionKey,
