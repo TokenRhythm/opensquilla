@@ -26,6 +26,7 @@ describe('Gateway Adapter composition', () => {
       'sessionLifecycle',
       'sessionRouting',
       'turnCommands',
+      'pendingInputQueue',
     ])
     expect(adapters).not.toHaveProperty('rpc')
     expect(adapters).not.toHaveProperty('events')
@@ -46,5 +47,7 @@ describe('Gateway Adapter composition', () => {
       { sessionKey: 'agent:main:test', source: 'test' },
       undefined,
     )
+
+    await expect(adapters.pendingInputQueue.list({ sessionKey: 'agent:main:test' })).resolves.toEqual([])
   })
 })
