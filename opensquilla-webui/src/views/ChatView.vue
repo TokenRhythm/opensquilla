@@ -4087,6 +4087,8 @@ const chatRpcSubscriptions = useChatRpcSubscriptions(rpc, {
       stallWatchdog.noteEvent(rawEvent, payloadObj)
     }
   },
+}, {
+  getSessionKey: () => sessionKey.value,
 })
 
 // Session switches drop the previous session's stall tracking entirely.
@@ -4094,6 +4096,10 @@ watch(sessionKey, () => {
   stallWatchdog.reset()
   clearAssistantActivityExpansionState()
 })
+
+// Keep event delivery fenced to the visible logical session. The hub swaps
+// only its handle; the shared WebSocket and diagnostic listeners stay alive.
+watch(sessionKey, key => chatRpcSubscriptions.setSessionKey(key))
 
 // MetaSkill run UI: preflight checkpoint + run-progress ribbon, driven by the
 // four session.event.meta_* frames (delivered via the '*' wildcard, so this

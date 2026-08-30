@@ -13,7 +13,10 @@ import {
   createConversationRuntime,
   type ConversationRuntime,
 } from '@/modules/conversationRuntime'
-import { createConversationSubscriptionLeaseRegistry } from '@/modules/conversationSubscriptionLease'
+import {
+  createConversationSubscriptionLifecycle,
+  type ConversationSubscriptionAttempt,
+} from '@/modules/conversationSubscriptionLifecycle'
 import { conversationCursorSignal } from '@/utils/chat/streamEvents'
 import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
 import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
@@ -127,19 +130,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
   const isHydrating = ref(false)
   const streamGeneration = ref<string | null>(null)
   const conversationRuntime = options.conversationRuntime ?? createConversationRuntime()
-  const subscriptionLeases = createConversationSubscriptionLeaseRegistry()
-  let subscriptionAttempt = 0
-  let activeSubscription: {
-    key: string
-    sinceStreamGeneration: string | null
-    sinceStreamSeq: number
-    bootstrapGeneration: number
-    bootstrapAttempt: number
-    token: symbol
-    lease: ReturnType<typeof subscriptionLeases.acquire>
-    outcome: Promise<SessionSubscriptionOutcome>
-  } | null = null
-  let activeController: AbortController | null = null
+  const subscriptionLifecycle = createConversationSubscriptionLifecycle<SessionSubscriptionOutcome>()
   let activeMetadataController: AbortController | null = null
   let metadataHydrationSequence = 0
 
@@ -169,7 +160,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
   }
 
   function retireLeasesFromPriorGenerations() {
-    subscriptionLeases.retirePriorGenerations(options.rpc.connectionGeneration)
+    subscriptionLifecycle.retirePriorGenerations(options.rpc.connectionGeneration)
   }
 
   function subscribeSession(
@@ -183,49 +174,23 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     const key = options.sessionKey.value
     const sinceStreamGeneration = streamGeneration.value
     const sinceStreamSeq = options.lastStreamSeq.value
-    const bootstrapGeneration = bootstrap?.generation ?? -1
-    const bootstrapAttempt = bootstrap?.attempt ?? -1
-    if (
-      activeSubscription?.key === key
-      && activeSubscription.sinceStreamGeneration === sinceStreamGeneration
-      && activeSubscription.sinceStreamSeq === sinceStreamSeq
-      && activeSubscription.bootstrapGeneration === bootstrapGeneration
-      && activeSubscription.bootstrapAttempt === bootstrapAttempt
-    ) {
-      return activeSubscription.outcome
-    }
-    activeController?.abort()
-    const controller = new AbortController()
-    activeController = controller
-    const relayAbort = () => controller.abort()
-    if (bootstrap?.signal.aborted) controller.abort()
-    else bootstrap?.signal.addEventListener('abort', relayAbort, { once: true })
-    const attemptContext = bootstrap
-      ? { ...bootstrap, signal: controller.signal }
-      : undefined
-    const lease = subscriptionLeases.acquire(key)
-    const outcome = runSubscription(
+    const identity = {
       key,
       sinceStreamGeneration,
       sinceStreamSeq,
-      lease.token,
-      lease,
-      controller,
-      attemptContext,
-    ).finally(() => {
-      bootstrap?.signal.removeEventListener('abort', relayAbort)
-    })
-    activeSubscription = {
-      key,
-      sinceStreamGeneration,
-      sinceStreamSeq,
-      bootstrapGeneration,
-      bootstrapAttempt,
-      token: lease.token,
-      lease,
-      outcome,
+      bootstrapGeneration: bootstrap?.generation ?? -1,
+      bootstrapAttempt: bootstrap?.attempt ?? -1,
     }
-    return outcome
+    return subscriptionLifecycle.start(
+      identity,
+      bootstrap?.signal,
+      attempt => runSubscription(
+        attempt,
+        bootstrap
+          ? { ...bootstrap, signal: attempt.controller.signal }
+          : undefined,
+      ),
+    )
   }
 
   function generationFrom(source: unknown): string | null {
@@ -390,7 +355,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
 
   function scheduleDeferredHydration(
     key: string,
-    attempt: number,
+    attemptContext: ConversationSubscriptionAttempt,
     metadataHydration: number,
     metadataGeneration: number | undefined,
     bootstrap: SessionBootstrapPhaseContext,
@@ -399,7 +364,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       try {
         await bootstrap.waitForCriticalRequestsQueued?.()
         if (
-          attempt !== subscriptionAttempt
+          !subscriptionLifecycle.isCurrent(attemptContext, key)
           || metadataHydration !== metadataHydrationSequence
           || key !== options.sessionKey.value
           || bootstrap.signal.aborted
@@ -420,7 +385,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
           hydrationCallOptions(hydrationContext),
         )
         if (
-          attempt !== subscriptionAttempt
+          !subscriptionLifecycle.isCurrent(attemptContext, key)
           || metadataHydration !== metadataHydrationSequence
           || key !== options.sessionKey.value
           || bootstrap.signal.aborted
@@ -434,7 +399,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         applyHydratedSubscriptionState(key, metadataGeneration, hydration)
       } catch (cause) {
         if (
-          attempt === subscriptionAttempt
+          subscriptionLifecycle.isCurrent(attemptContext, key)
           && metadataHydration === metadataHydrationSequence
           && key === options.sessionKey.value
           && !bootstrap.signal.aborted
@@ -452,15 +417,15 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
   }
 
   async function runSubscription(
-    key: string,
-    sinceStreamGeneration: string | null,
-    sinceStreamSeq: number,
-    token: symbol,
-    lease: ReturnType<typeof subscriptionLeases.acquire>,
-    controller: AbortController,
+    attemptContext: ConversationSubscriptionAttempt,
     bootstrap?: SessionBootstrapPhaseContext,
   ): Promise<SessionSubscriptionOutcome> {
-    const attempt = ++subscriptionAttempt
+    const {
+      key,
+      sinceStreamGeneration,
+      sinceStreamSeq,
+      lease,
+    } = attemptContext
     const metadataHydration = ++metadataHydrationSequence
     const metadataGeneration = options.beginSessionMetadataResolution?.(key)
     let skipSnapshotOnRetry = Boolean(bootstrap?.skipSnapshot)
@@ -475,7 +440,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       } else {
         await options.rpc.waitForConnection()
       }
-      if (attempt !== subscriptionAttempt || key !== options.sessionKey.value) {
+      if (!subscriptionLifecycle.isCurrent(attemptContext, key)) {
         return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
       }
       const params: SessionMessagesSubscribeParams = {
@@ -568,21 +533,21 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         && subscribeResult.value?.subscribed !== false
         && lease.state === 'acquiring'
       ) {
-        subscriptionLeases.activate(lease)
+        subscriptionLifecycle.leases.activate(lease)
       } else if (
         subscribeResult.status === 'rejected'
         && lease.state === 'acquiring'
       ) {
-        subscriptionLeases.retire(lease)
+        subscriptionLifecycle.leases.retire(lease)
       }
-      if (attempt !== subscriptionAttempt || key !== options.sessionKey.value) {
+      if (!subscriptionLifecycle.isCurrent(attemptContext, key)) {
         return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
       }
 
       if (subscribeResult.status === 'rejected') throw subscribeResult.reason
       const res = subscribeResult.value
       if (res && res.subscribed === false) {
-        subscriptionLeases.retire(lease)
+        subscriptionLifecycle.leases.retire(lease)
         throw new Error('No subscription manager available')
       }
       const generationReset = reconcileSubscriptionGeneration(
@@ -650,7 +615,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       if (bootstrap) {
         scheduleDeferredHydration(
           key,
-          attempt,
+          attemptContext,
           metadataHydration,
           metadataGeneration,
           bootstrap,
@@ -686,10 +651,10 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         backgroundOnly: false,
       }
     } catch (err: unknown) {
-      if (lease.state === 'acquiring') subscriptionLeases.retire(lease)
+      if (lease.state === 'acquiring') subscriptionLifecycle.leases.retire(lease)
       console.warn('Session stream subscription failed:', err instanceof Error ? err.message : err)
       const cancelled = (
-        attempt !== subscriptionAttempt
+        !subscriptionLifecycle.isCurrent(attemptContext, key)
         || key !== options.sessionKey.value
         || bootstrap?.signal.aborted
         || isRpcAbort(err)
@@ -698,7 +663,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         metadataGeneration !== undefined
         && !cancelled
         && (!bootstrap || bootstrap.attempt === 1)
-        && attempt === subscriptionAttempt
+        && subscriptionLifecycle.isCurrent(attemptContext, key)
         && key === options.sessionKey.value
       ) {
         options.onSessionMetadataError?.(key, metadataGeneration)
@@ -710,9 +675,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         skipSnapshotOnRetry,
       }
     } finally {
-      if (attempt === subscriptionAttempt) isHydrating.value = false
-      if (activeSubscription?.token === token) activeSubscription = null
-      if (activeController === controller) activeController = null
+      if (subscriptionLifecycle.isCurrent(attemptContext, key)) isHydrating.value = false
     }
   }
 
@@ -795,13 +758,10 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
   }
 
   function cancelActiveSubscription() {
-    ++subscriptionAttempt
+    subscriptionLifecycle.cancel()
     ++metadataHydrationSequence
-    activeController?.abort()
-    activeController = null
     activeMetadataController?.abort()
     activeMetadataController = null
-    activeSubscription = null
     isHydrating.value = false
   }
 
@@ -809,11 +769,11 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     cancelActiveSubscription()
     if (!key) return
     retireLeasesFromPriorGenerations()
-    const lease = subscriptionLeases.latestReleasable(key)
+    const lease = subscriptionLifecycle.leases.latestReleasable(key)
     if (!lease) return
     if (lease.releasePromise) return lease.releasePromise
     lease.state = 'releasing'
-    subscriptionLeases.clearActive(lease)
+    subscriptionLifecycle.leases.clearActive(lease)
     const expectedGeneration = lease.socketGeneration
     const currentGeneration = options.rpc.connectionGeneration
     // No subscribe frame was sent, or the physical connection that owned it
@@ -826,7 +786,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         && currentGeneration !== expectedGeneration
       )
     ) {
-      subscriptionLeases.retire(lease)
+      subscriptionLifecycle.leases.retire(lease)
       return
     }
     const release = (async () => {
@@ -865,7 +825,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
           cause instanceof Error ? cause.message : cause,
         )
       } finally {
-        subscriptionLeases.retire(lease)
+        subscriptionLifecycle.leases.retire(lease)
       }
     })()
     lease.releasePromise = release
