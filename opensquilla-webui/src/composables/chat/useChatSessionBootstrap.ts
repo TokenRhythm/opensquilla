@@ -15,33 +15,21 @@ import {
   type SessionPhaseResult,
 } from '@/composables/chat/sessionBootstrapContract'
 import {
+  createConversationBootstrapCriticalQueue,
   createConversationBootstrapPhase,
   createConversationBootstrapCoordinator,
+  rearmConversationBootstrapCriticalQueue,
   type ConversationBootstrapPhase,
+  type ConversationBootstrapCriticalQueue,
   type ConversationBootstrapHandoffOutcome,
   type ConversationBootstrapRunToken,
+  waitForConversationBootstrapRetry,
 } from '@/modules/conversationBootstrapCoordinator'
 
 type PhaseRuntime<T> = ConversationBootstrapPhase<T>
 
-interface CriticalRequestQueue {
-  promise: Promise<void>
-  resolve: () => void
-  released: boolean
-  historyRequired: boolean
-  liveSocketGeneration: number | null
-  historySocketGeneration: number | null
-  liveTerminal: boolean
-  historyTerminal: boolean
-}
-
 interface ActiveBootstrapState {
-  criticalQueue: CriticalRequestQueue
-  liveQueueSequence: number
-  liveQueueWaiters: Set<{
-    minimum: number
-    resolve: (ready: boolean) => void
-  }>
+  criticalQueue: ConversationBootstrapCriticalQueue
   freshLiveOutageForHistoryRetry: boolean
   awaitingReplacementConnection: boolean
   lateReplacementRecoveryUsed: boolean
@@ -155,49 +143,12 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     }
   }
 
-  function releaseCriticalRequestsIfReady(run: ActiveBootstrap) {
-    const queue = run.criticalQueue
-    if (queue.released) return
-    const liveQueued = queue.liveSocketGeneration !== null
-    const historyQueued = (
-      !queue.historyRequired
-      || queue.historySocketGeneration !== null
-    )
-    const queuedOnSameSocket = (
-      liveQueued
-      && historyQueued
-      && (
-        !queue.historyRequired
-        || queue.liveSocketGeneration === queue.historySocketGeneration
-      )
-    )
-    const terminalWithoutQueue = (
-      (queue.liveTerminal || (queue.historyRequired && queue.historyTerminal))
-      && (liveQueued || queue.liveTerminal)
-      && (
-        !queue.historyRequired
-        || historyQueued
-        || queue.historyTerminal
-      )
-    )
-    if (!queuedOnSameSocket && !terminalWithoutQueue) return
-    queue.released = true
-    queue.resolve()
-  }
-
   function markLiveSubscribeSent(
     run: ActiveBootstrap,
     socketGeneration: number,
   ) {
     if (!isCurrent(run)) return
-    run.criticalQueue.liveSocketGeneration = socketGeneration
-    run.liveQueueSequence += 1
-    for (const waiter of [...run.liveQueueWaiters]) {
-      if (run.liveQueueSequence < waiter.minimum) continue
-      run.liveQueueWaiters.delete(waiter)
-      waiter.resolve(true)
-    }
-    releaseCriticalRequestsIfReady(run)
+    run.criticalQueue.markLiveSubscribeSent(socketGeneration)
     tryRecoverHistoryOnLateReplacement(run)
   }
 
@@ -206,39 +157,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     socketGeneration: number,
   ) {
     if (!isCurrent(run)) return
-    run.criticalQueue.historySocketGeneration = socketGeneration
-    releaseCriticalRequestsIfReady(run)
-  }
-
-  async function waitForLiveSubscribeSent(
-    run: ActiveBootstrap,
-    minimum: number,
-    deadlineAt: number,
-  ): Promise<boolean> {
-    if (!isCurrent(run)) return false
-    if (run.liveQueueSequence >= minimum) return true
-    const remaining = deadlineAt - Date.now()
-    if (remaining <= 0) return false
-    return new Promise(resolve => {
-      let settled = false
-      const waiter = {
-        minimum,
-        resolve: (ready: boolean) => finish(ready),
-      }
-      const finish = (ready: boolean) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        run.controller.signal.removeEventListener('abort', onAbort)
-        run.liveQueueWaiters.delete(waiter)
-        resolve(ready)
-      }
-      const onAbort = () => finish(false)
-      const timer = setTimeout(() => finish(false), remaining)
-      run.liveQueueWaiters.add(waiter)
-      run.controller.signal.addEventListener('abort', onAbort, { once: true })
-      if (run.liveQueueSequence >= minimum) finish(true)
-    })
+    run.criticalQueue.markHistoryRequestSent(socketGeneration)
   }
 
   function requiresFreshLiveQueue(error: unknown): boolean {
@@ -251,27 +170,16 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     )
   }
 
-  async function waitBeforeRetry(
+  function waitBeforeRetry(
     error: unknown,
     run: ActiveBootstrap,
     deadlineAt: number,
   ): Promise<boolean> {
-    const remaining = deadlineAt - Date.now()
-    if (remaining <= 0 || !isCurrent(run)) return false
-    const delayMs = Math.min(retryAfterMs(error), remaining)
-    if (delayMs <= 0) return true
-    return new Promise(resolve => {
-      let settled = false
-      const finish = (ready: boolean) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        run.controller.signal.removeEventListener('abort', onAbort)
-        resolve(ready)
-      }
-      const onAbort = () => finish(false)
-      const timer = setTimeout(() => finish(isCurrent(run)), delayMs)
-      run.controller.signal.addEventListener('abort', onAbort, { once: true })
+    return waitForConversationBootstrapRetry({
+      delayMs: retryAfterMs(error),
+      deadlineAt,
+      signal: run.controller.signal,
+      isCurrent: () => isCurrent(run),
     })
   }
 
@@ -297,17 +205,18 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
         ok: false,
         error: new RpcTimeoutError('chat.history', 0),
       }
-      let requiredLiveQueueSequence = Math.max(1, run.liveQueueSequence)
+      let requiredLiveQueueSequence = Math.max(1, run.criticalQueue.liveQueueSequence)
       while (phase.attempts < maxAttempts && isCurrent(run)) {
         if (Date.now() >= phase.deadlineAt) break
-        if (!await waitForLiveSubscribeSent(
-          run,
+        if (!await run.criticalQueue.waitForLiveSubscribeSent(
           requiredLiveQueueSequence,
           phase.deadlineAt,
+          run.controller.signal,
+          () => isCurrent(run),
         )) {
           break
         }
-        const liveQueueSequenceForAttempt = run.liveQueueSequence
+        const liveQueueSequenceForAttempt = run.criticalQueue.liveQueueSequence
         const attempt = phase.attempts as 0 | 1
         phase.attempts += 1
         const context = contextFor(run, phase, attempt)
@@ -348,8 +257,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     }).finally(() => {
       // A disconnected or exhausted phase may terminate before it can send.
       // Optional UI traffic must not remain globally blocked in that case.
-      run.criticalQueue.historyTerminal = true
-      releaseCriticalRequestsIfReady(run)
+      run.criticalQueue.markHistoryTerminal()
       phase.running = false
       tryRecoverHistoryOnLateReplacement(run)
     })
@@ -404,59 +312,15 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     })().finally(() => {
       // Match the history fallback above: failure to queue a critical request
       // is terminal for this attempt, not a reason to freeze the whole app.
-      run.criticalQueue.liveTerminal = true
-      releaseCriticalRequestsIfReady(run)
+      run.criticalQueue.markLiveTerminal()
       phase.running = false
     })
     return phase.promise
   }
 
-  function createCriticalQueue(
-    historyRequired: boolean,
-    liveSocketGeneration: number | null = null,
-  ): CriticalRequestQueue {
-    let resolve = () => {}
-    const promise = new Promise<void>(done => {
-      resolve = done
-    })
-    return {
-      promise,
-      resolve,
-      released: false,
-      historyRequired,
-      liveSocketGeneration,
-      historySocketGeneration: null,
-      liveTerminal: false,
-      historyTerminal: !historyRequired,
-    }
-  }
-
-  function rearmCriticalQueue(
-    run: ActiveBootstrap,
-    historyRequired: boolean,
-    liveSocketGeneration: number | null = null,
-  ) {
-    const previousQueue = run.criticalQueue
-    const replacementQueue = createCriticalQueue(
-      historyRequired,
-      liveSocketGeneration,
-    )
-    run.criticalQueue = replacementQueue
-    // Existing consumers hold the previous promise. Keep it pending across a
-    // same-run reconnect and release it only after the replacement socket has
-    // queued its critical frames. Repeated reconnects form a chain to the
-    // newest epoch; cancellation resolves the current epoch and unwinds it.
-    void replacementQueue.promise.then(() => {
-      previousQueue.released = true
-      previousQueue.resolve()
-    })
-  }
-
   function createRun(key: string, includeHistory: boolean): ActiveBootstrap {
     const run = ownership.start(key, includeHistory, token => ({
-      criticalQueue: createCriticalQueue(includeHistory),
-      liveQueueSequence: 0,
-      liveQueueWaiters: new Set(),
+      criticalQueue: createConversationBootstrapCriticalQueue(includeHistory),
       freshLiveOutageForHistoryRetry: false,
       awaitingReplacementConnection: false,
       lateReplacementRecoveryUsed: false,
@@ -505,7 +369,11 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
         const liveSocketGeneration =
           active.criticalQueue.liveSocketGeneration
         active.includeHistory = true
-        rearmCriticalQueue(active, true, liveSocketGeneration)
+        active.criticalQueue = rearmConversationBootstrapCriticalQueue(
+          active.criticalQueue,
+          true,
+          liveSocketGeneration,
+        )
         active.history = historyRuntime(active.live.deadlineAt)
         active.history.promise = runHistoryPhase(active, false)
       }
@@ -590,7 +458,11 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     run.lateReplacementHistoryRecoveryUsed = true
     run.lateReplacementHistoryRecoveryPhase = null
     resetHistoryPhaseForRetry(run)
-    rearmCriticalQueue(run, true, liveSocketGeneration)
+    run.criticalQueue = rearmConversationBootstrapCriticalQueue(
+      run.criticalQueue,
+      true,
+      liveSocketGeneration,
+    )
     run.history.promise = runHistoryPhase(run, true, 1)
   }
 
@@ -610,9 +482,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     const cancelled = ownership.cancel() ?? active
     active = null
     if (cancelled) {
-      cancelled.criticalQueue.resolve()
-      for (const waiter of cancelled.liveQueueWaiters) waiter.resolve(false)
-      cancelled.liveQueueWaiters.clear()
+      cancelled.criticalQueue.cancel()
     }
     options.cancelHistory()
     options.cancelSubscription()
@@ -669,8 +539,8 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
         const liveWillRecover = run.live.running || liveWasReady
         if (liveWillRecover) {
           run.awaitingReplacementConnection = true
-          rearmCriticalQueue(
-            run,
+          run.criticalQueue = rearmConversationBootstrapCriticalQueue(
+            run.criticalQueue,
             run.includeHistory && run.history.running,
           )
           livePhase.value = 'connecting'
@@ -734,7 +604,10 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
           )
         ) return
         run.lateReplacementRecoveryUsed = true
-        rearmCriticalQueue(run, false)
+        run.criticalQueue = rearmConversationBootstrapCriticalQueue(
+          run.criticalQueue,
+          false,
+        )
         // This is a continuation of the same outage, not a user-initiated
         // retry. Grant exactly one attempt on the authenticated socket. The
         // connected event can win a route-switch race before the new run sees
@@ -771,7 +644,10 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
       // Keep an independently terminal history phase intact: restarting the
       // whole bootstrap here can hide its actionable error behind a fresh
       // loading state while replacement sockets continue to arrive.
-      rearmCriticalQueue(run, false)
+      run.criticalQueue = rearmConversationBootstrapCriticalQueue(
+        run.criticalQueue,
+        false,
+      )
       resetLivePhaseForManualRetry(run)
       run.live.promise = runLivePhase(run)
       armHistoryRecoveryForLateReplacement(run)

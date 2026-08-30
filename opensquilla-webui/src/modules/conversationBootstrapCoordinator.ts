@@ -34,6 +34,246 @@ export interface ConversationBootstrapPhase<T> {
   skipSnapshot: boolean
 }
 
+export interface ConversationBootstrapCriticalQueue {
+  /** Resolves after the critical frames are queued on a compatible socket. */
+  readonly promise: Promise<void>
+  readonly historyRequired: boolean
+  readonly liveSocketGeneration: number | null
+  readonly historySocketGeneration: number | null
+  readonly liveQueueSequence: number
+  readonly released: boolean
+  markLiveSubscribeSent(socketGeneration: number): void
+  markHistoryRequestSent(socketGeneration: number): void
+  markLiveTerminal(): void
+  markHistoryTerminal(): void
+  /** Resolve this queue and every waiter when the owning run is cancelled. */
+  cancel(): void
+  waitForLiveSubscribeSent(
+    minimum: number,
+    deadlineAt: number,
+    signal: AbortSignal,
+    isCurrent: () => boolean,
+  ): Promise<boolean>
+  /** Used internally to bridge an older queue to its replacement epoch. */
+  release(): void
+}
+
+interface CriticalQueueSequenceLedger {
+  sequence: number
+  waiters: Set<{
+    minimum: number
+    resolve: (ready: boolean) => void
+  }>
+}
+
+const queueSequenceLedgers = new WeakMap<object, CriticalQueueSequenceLedger>()
+
+export interface ConversationBootstrapRetryWaitOptions {
+  delayMs: number
+  deadlineAt: number
+  signal: AbortSignal
+  isCurrent: () => boolean
+}
+
+/**
+ * Wait for a bounded retry without coupling the timer to an RPC client.
+ * `isCurrent` is supplied by the owner because a route key can change before
+ * the transport emits its cancellation event.
+ */
+export function waitForConversationBootstrapRetry(
+  options: ConversationBootstrapRetryWaitOptions,
+): Promise<boolean> {
+  const remaining = options.deadlineAt - Date.now()
+  if (remaining <= 0 || !options.isCurrent()) return Promise.resolve(false)
+  // Keep the caller's retry policy intact while bounding it by the absolute
+  // bootstrap deadline (the legacy wrapper used the same min operation).
+  const delayMs = Math.min(Math.max(0, options.delayMs), remaining)
+  if (delayMs <= 0) return Promise.resolve(true)
+  return new Promise(resolve => {
+    let settled = false
+    const finish = (ready: boolean) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      options.signal.removeEventListener('abort', onAbort)
+      resolve(ready)
+    }
+    const onAbort = () => finish(false)
+    const timer = setTimeout(
+      () => finish(options.isCurrent()),
+      delayMs,
+    )
+    options.signal.addEventListener('abort', onAbort, { once: true })
+    if (options.signal.aborted) finish(false)
+  })
+}
+
+/**
+ * Build the critical-frame barrier shared by history and live phases.
+ * A queue releases only when live (and, when required, history) has been
+ * placed on the same socket, or when the phase has terminated without being
+ * able to queue.  This keeps optional reads from blocking live delivery.
+ */
+export function createConversationBootstrapCriticalQueue(
+  historyRequired: boolean,
+  liveSocketGeneration: number | null = null,
+  initialLiveQueueSequence = 0,
+  sequenceLedger?: CriticalQueueSequenceLedger,
+): ConversationBootstrapCriticalQueue {
+  let resolvePromise: () => void = () => {}
+  const promise = new Promise<void>(resolve => {
+    resolvePromise = resolve
+  })
+  let released = false
+  let historySocketGeneration: number | null = null
+  let liveTerminal = false
+  let historyTerminal = !historyRequired
+  const ledger = sequenceLedger ?? {
+    sequence: Math.max(0, initialLiveQueueSequence),
+    waiters: new Set<{
+      minimum: number
+      resolve: (ready: boolean) => void
+    }>(),
+  }
+
+  function releaseIfReady() {
+    if (released) return
+    const liveQueued = liveSocketGeneration !== null
+    const historyQueued = (
+      !historyRequired
+      || historySocketGeneration !== null
+    )
+    const queuedOnSameSocket = (
+      liveQueued
+      && historyQueued
+      && (
+        !historyRequired
+        || liveSocketGeneration === historySocketGeneration
+      )
+    )
+    const terminalWithoutQueue = (
+      (liveTerminal || (historyRequired && historyTerminal))
+      && (liveQueued || liveTerminal)
+      && (
+        !historyRequired
+        || historyQueued
+        || historyTerminal
+      )
+    )
+    if (!queuedOnSameSocket && !terminalWithoutQueue) return
+    released = true
+    resolvePromise()
+  }
+
+  function release() {
+    if (released) return
+    released = true
+    resolvePromise()
+  }
+
+  function cancel() {
+    release()
+    for (const waiter of ledger.waiters) waiter.resolve(false)
+    ledger.waiters.clear()
+  }
+
+  const queue: ConversationBootstrapCriticalQueue = {
+    promise,
+    get historyRequired() {
+      return historyRequired
+    },
+    get liveSocketGeneration() {
+      return liveSocketGeneration
+    },
+    get historySocketGeneration() {
+      return historySocketGeneration
+    },
+    get liveQueueSequence() {
+      return ledger.sequence
+    },
+    get released() {
+      return released
+    },
+    markLiveSubscribeSent(socketGeneration) {
+      liveSocketGeneration = socketGeneration
+      ledger.sequence += 1
+      for (const waiter of [...ledger.waiters]) {
+        if (ledger.sequence < waiter.minimum) continue
+        ledger.waiters.delete(waiter)
+        waiter.resolve(true)
+      }
+      releaseIfReady()
+    },
+    markHistoryRequestSent(socketGeneration) {
+      historySocketGeneration = socketGeneration
+      releaseIfReady()
+    },
+    markLiveTerminal() {
+      liveTerminal = true
+      releaseIfReady()
+    },
+    markHistoryTerminal() {
+      historyTerminal = true
+      releaseIfReady()
+    },
+    cancel,
+    release,
+    waitForLiveSubscribeSent(minimum, deadlineAt, signal, isCurrent) {
+      if (!isCurrent() || signal.aborted) return Promise.resolve(false)
+      if (ledger.sequence >= minimum) return Promise.resolve(true)
+      const remaining = deadlineAt - Date.now()
+      if (remaining <= 0) return Promise.resolve(false)
+      return new Promise(resolve => {
+        let settled = false
+        const waiter = {
+          minimum,
+          resolve: (ready: boolean) => finish(ready),
+        }
+        const finish = (ready: boolean) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          signal.removeEventListener('abort', onAbort)
+          ledger.waiters.delete(waiter)
+          resolve(ready)
+        }
+        const onAbort = () => finish(false)
+        // A timeout means that this queue epoch never observed the required
+        // live frame.  It must stay a negative result even when ownership is
+        // still current; callers use that distinction to stop the phase
+        // rather than treating an unqueued request as ready.
+        const timer = setTimeout(() => finish(false), remaining)
+        ledger.waiters.add(waiter)
+        signal.addEventListener('abort', onAbort, { once: true })
+        if (signal.aborted || !isCurrent()) finish(false)
+        else if (ledger.sequence >= minimum) finish(true)
+      })
+    },
+  }
+  queueSequenceLedgers.set(queue, ledger)
+  return queue
+}
+
+/**
+ * Start a replacement socket epoch while preserving consumers waiting on the
+ * predecessor promise.  Once the replacement barrier opens, the predecessor
+ * opens as well; cancellation of the replacement unwinds both promises.
+ */
+export function rearmConversationBootstrapCriticalQueue(
+  previous: ConversationBootstrapCriticalQueue,
+  historyRequired: boolean,
+  liveSocketGeneration: number | null = null,
+): ConversationBootstrapCriticalQueue {
+  const replacement = createConversationBootstrapCriticalQueue(
+    historyRequired,
+    liveSocketGeneration,
+    previous.liveQueueSequence,
+    queueSequenceLedgers.get(previous),
+  )
+  void replacement.promise.then(() => previous.release())
+  return replacement
+}
+
 /**
  * Initialise a phase without importing a transport or reactive state layer.
  * The execution callback remains in the wrapper until a later slice moves
