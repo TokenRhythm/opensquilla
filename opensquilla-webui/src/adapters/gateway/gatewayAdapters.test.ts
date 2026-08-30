@@ -48,6 +48,6 @@ describe('Gateway Adapter composition', () => {
       undefined,
     )
 
-    await expect(adapters.pendingInputQueue.list({ sessionKey: 'agent:main:test' })).resolves.toEqual([])
+    await expect(adapters.pendingInputQueue.list('agent:main:test')).resolves.toEqual([])
   })
 })
