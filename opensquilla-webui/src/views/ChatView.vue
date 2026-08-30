@@ -870,6 +870,7 @@ import { useChatDraftPersistence } from '@/composables/chat/useChatDraftPersiste
 import { useChatElevatedMode } from '@/composables/chat/useChatElevatedMode'
 import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
 import { useChatSessionRouting } from '@/composables/chat/useChatSessionRouting'
+import { SESSION_ROUTING_KEY, type SessionRouting } from '@/modules/sessionRouting'
 import { useChatHistory } from '@/composables/chat/useChatHistory'
 import { useChatMarkdownExport } from '@/composables/chat/useChatMarkdownExport'
 import { useChatMessageActions } from '@/composables/chat/useChatMessageActions'
@@ -1164,6 +1165,8 @@ const toolResultModal = ref<{
 /* ── Stores / Router ───────────────────────────────────────────────── */
 
 const rpc = useRpcStore()
+const sessionRouting = inject(SESSION_ROUTING_KEY) as SessionRouting | undefined
+if (!sessionRouting) throw new Error('SessionRouting was not provided')
 const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
 if (!injectedSessionDirectory) throw new Error('SessionDirectory was not provided')
 const sessionDirectory = injectedSessionDirectory
@@ -2082,11 +2085,10 @@ const sessionRoutingAvailable = computed(() => {
   const auth = rpc.auth as RpcAuthPayload | null
   return rpc.state === 'connected'
     && auth?.principal?.authState === 'authenticated'
-    && rpc.supportsMethod('sessions.routing.get')
-    && rpc.supportsMethod('sessions.routing.set')
+    && sessionRouting.available()
 })
 const chatSessionRouting = useChatSessionRouting({
-  rpc,
+  routing: sessionRouting,
   sessionKey,
   globalMode: globalModelRoutingMode,
   globalImageInputAdmission,
@@ -3028,7 +3030,7 @@ const chatGoals = useChatGoals({
       || pendingWorkspaceId.value !== workspaceId
     ) return ''
     if (draftInitialRoutingMode) {
-      await rpc.call('sessions.routing.set', {
+      await sessionRouting.set({
         sessionKey: key,
         mode: draftInitialRoutingMode,
         expectedRevision: 0,

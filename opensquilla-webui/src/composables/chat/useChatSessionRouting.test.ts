@@ -2,12 +2,12 @@ import { ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import { useChatSessionRouting } from './useChatSessionRouting'
-import { SESSION_PHASE_ATTEMPT_BUDGET_MS } from './sessionBootstrapContract'
 import type {
   ImageInputAdmission,
   ModelRoutingCapabilitiesByMode,
   ModelRoutingMode,
 } from '@/types/modelRouting'
+import type { SessionRouting } from '@/modules/sessionRouting'
 
 const SESSION_ONE = 'agent:main:webchat:one'
 const SESSION_TWO = 'agent:main:webchat:two'
@@ -41,6 +41,16 @@ function harness(options: {
       return vi.fn()
     }),
   }
+  const routing = {
+    available: () => true,
+    get: (key: string, options?: { signal?: AbortSignal }) => options
+      ? rpc.call('sessions.routing.get', { sessionKey: key }, options)
+      : rpc.call('sessions.routing.get', { sessionKey: key }),
+    set: (input: { sessionKey: string; mode: string; expectedRevision: number }, options?: { signal?: AbortSignal }) => options
+      ? rpc.call('sessions.routing.set', input, options)
+      : rpc.call('sessions.routing.set', input),
+    subscribe: (handler: (payload: unknown) => void) => ({ close: rpc.on('sessions.routing.changed', handler) }),
+  } as unknown as SessionRouting
   const sessionKey = ref(SESSION_ONE)
   const globalMode = ref<ModelRoutingMode>(options.globalMode ?? 'off')
   const globalImageInputAdmission = ref<ImageInputAdmission>(
@@ -57,7 +67,7 @@ function harness(options: {
   const available = ref(options.available !== false)
   const notifyError = vi.fn()
   const api = useChatSessionRouting({
-    rpc,
+    routing,
     sessionKey,
     globalMode,
     globalImageInputAdmission,
@@ -109,15 +119,7 @@ describe('useChatSessionRouting', () => {
 
     await api.load()
 
-    expect(rpc.call).toHaveBeenCalledWith(
-      'sessions.routing.get',
-      { sessionKey: SESSION_ONE },
-      {
-        timeoutMs: SESSION_PHASE_ATTEMPT_BUDGET_MS,
-        timeoutAction: 'reject',
-        abortAction: 'reject',
-      },
-    )
+    expect(rpc.call).toHaveBeenCalledWith('sessions.routing.get', { sessionKey: SESSION_ONE })
     expect(api.mode.value).toBe('llm_ensemble')
     expect(api.revision.value).toBe(0)
     expect(api.hasAuthoritativeSnapshot.value).toBe(true)
@@ -260,7 +262,13 @@ describe('useChatSessionRouting', () => {
       on: vi.fn(() => vi.fn()),
     }
     const api = useChatSessionRouting({
-      rpc,
+      routing: {
+        available: () => true,
+        get: key => rpc.call('sessions.routing.get', { sessionKey: key }),
+        set: input => rpc.call('sessions.routing.set', input as unknown as Record<string, unknown>),
+        subscribe: _handler => ({ close: rpc.on() }),
+        dispose: () => undefined,
+      },
       sessionKey: ref(SESSION_ONE),
       globalMode: ref<ModelRoutingMode>('off'),
       globalImageInputAdmission: ref<ImageInputAdmission>('unknown'),

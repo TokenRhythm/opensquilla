@@ -24,6 +24,7 @@ describe('Gateway Adapter composition', () => {
       'sessionDirectory',
       'sessionDirectoryChanges',
       'sessionLifecycle',
+      'sessionRouting',
     ])
     expect(adapters).not.toHaveProperty('rpc')
     expect(adapters).not.toHaveProperty('events')

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opensquilla.dev/contracts/gateway/v4/sessions/sessions-routing-set.schema.json",
+  "title": "OpenSquilla sessions.routing.set Contract",
+  "description": "Language-neutral Contract for the v4 per-session routing CAS command. Generated wire types are adapter-only.",
+  "type": "object", "additionalProperties": false,
+  "properties": {"request": {"$ref": "#/$defs/RequestFrame"}, "response": {"$ref": "#/$defs/ResponseFrame"}},
+  "x-opensquilla-wire": {"protocol": "opensquilla-websocket-json", "version": 4, "compatibility": "exact-json-tree"},
+  "x-opensquilla-codegen": {"python": {"tool": "datamodel-code-generator", "version": "0.75.1", "target": "pydantic_v2.BaseModel"}, "typescript": {"tool": "json-schema-to-typescript", "version": "15.0.4"}, "runtimeValidation": {"tool": "ajv", "version": "8.17.1", "mode": "standalone-adapter-only"}},
+  "x-opensquilla-method": {"name": "sessions.routing.set", "kind": "command", "scope": "operator.write", "guestAllowed": false, "idempotency": "non-idempotent", "timeout": {"policy": "caller"}, "capability": {"kind": "method-availability", "name": "sessions.routing.set"}, "request": "#/$defs/RequestFrame", "params": "#/$defs/Params", "response": "#/$defs/ResponseFrame", "result": "#/$defs/Result", "errors": [{"code": "INVALID_REQUEST"}, {"code": "UNAUTHORIZED"}, {"code": "NOT_FOUND"}, {"code": "SESSION_ROUTING_CHANGED", "retryable": true, "details": true}, {"code": "UNAVAILABLE"}, {"code": "STORAGE_BUSY", "retryable": true}, {"code": "INTERNAL_ERROR"}]},
+  "$defs": {
+    "Params": {"type": "object", "additionalProperties": true, "properties": {"sessionKey": {"type": "string"}, "session_key": {"type": "string"}, "key": {"type": "string"}, "mode": {"type": "string", "enum": ["direct", "router", "ensemble"]}, "expectedRevision": {"type": "integer", "minimum": 0}, "expected_revision": {"type": "integer", "minimum": 0}}, "allOf": [{"anyOf": [{"required": ["sessionKey"]}, {"required": ["session_key"]}, {"required": ["key"]}]}, {"required": ["mode"]}, {"anyOf": [{"required": ["expectedRevision"]}, {"required": ["expected_revision"]}]}]},
+    "LegacyParams": {"anyOf": [{"type": "array", "items": {}}, {"type": "string"}, {"type": "number"}, {"type": "boolean"}]},
+    "RequestFrame": {"type": "object", "additionalProperties": false, "required": ["type", "id", "method"], "properties": {"type": {"const": "req"}, "id": {"type": "string"}, "method": {"const": "sessions.routing.set"}, "params": {"anyOf": [{"$ref": "#/$defs/Params"}, {"$ref": "#/$defs/LegacyParams"}, {"type": "null"}]}}},
+    "Result": {"type": "object", "additionalProperties": true, "required": ["mode", "revision", "source", "initialized", "appliesTo"], "properties": {"mode": {"type": "string", "enum": ["direct", "router", "ensemble"]}, "revision": {"type": "integer", "minimum": 0}, "source": {"type": "string"}, "initialized": {"type": "boolean"}, "appliesTo": {"type": "string"}}},
+    "RpcError": {"type": "object", "additionalProperties": true, "required": ["code", "message"], "properties": {"code": {"type": "string"}, "message": {"type": "string"}, "details": {}, "retryable": {"type": ["boolean", "null"]}, "accepted": {"type": ["boolean", "null"]}}},
+    "ResponseFrame": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["type", "id", "ok", "payload"], "properties": {"type": {"const": "res"}, "id": {"type": "string"}, "ok": {"const": true}, "payload": {"$ref": "#/$defs/Result"}, "error": {"type": "null"}}}, {"type": "object", "additionalProperties": false, "required": ["type", "id", "ok", "error"], "properties": {"type": {"const": "res"}, "id": {"type": "string"}, "ok": {"const": false}, "payload": {"type": "null"}, "error": {"$ref": "#/$defs/RpcError"}}}]}
+  }
+}
