@@ -4073,16 +4073,19 @@ const stallWatchdog = useChatStallWatchdog({ isStreaming, streamIdleGraceMs: str
 const { stallActive, stallSeconds } = stallWatchdog
 
 const chatRpcSubscriptions = useChatRpcSubscriptions(rpc, {
-  ...rpcEventHandlers.handlers,
+  // The private v4 adapter emits one validated event message. The reducer
+  // owns named projections and the legacy wildcard terminal path behind that
+  // single ingress, so the view no longer wires event names itself.
+  onEvent: rpcEventHandlers.onConversationEvent,
+  onConnectionState: rpcEventHandlers.handlers.onConnectionState,
   // The wildcard handler is the one funnel that sees every gateway event with
   // its name; feed the active session's events to the watchdog before the
-  // regular handler consumes them (same session filter as existing handlers).
+  // regular reducer consumes them (same session filter as existing handlers).
   onAny: (rawEvent, rawPayload) => {
     const payloadObj = (rawPayload && typeof rawPayload === 'object' ? rawPayload : {}) as SessionEventPayload
     if (payloadIsCurrentSession(payloadObj, sessionKey.value)) {
       stallWatchdog.noteEvent(rawEvent, payloadObj)
     }
-    rpcEventHandlers.handlers.onAny(rawEvent, rawPayload)
   },
 })
 

@@ -29,7 +29,7 @@ import type {
   TurnCommittedPayload,
   WarningPayload,
 } from '@/types/rpc'
-import type { ChatRpcSubscriptionHandlers } from '@/composables/chat/useChatRpcSubscriptions'
+import type { ConversationEventTransportMessage } from '@/adapters/gateway/conversationEventTransport'
 import {
   isAuthoritativeSessionSubscription,
   type SessionSubscriptionOutcome,
@@ -2578,6 +2578,124 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     }
   }
 
+  /**
+   * Consume the single decoded ingress emitted by the private v4 adapter.
+   *
+   * The reducer deliberately remains unchanged in this slice: named handlers
+   * run first, followed by the legacy wildcard path, matching the listener
+   * order that existed before the transport seam. `wireName` is retained only
+   * for that compatibility path; new consumers can rely on `decoded.name` and
+   * its validated metadata without knowing how the frame was transported.
+   */
+  function handleConversationEvent(message: ConversationEventTransportMessage) {
+    if (message.kind === 'sessions-changed') {
+      handleRpcSessionsChanged(message.payload as SessionEventPayload)
+      handleRpcAny(message.wireName, message.payload)
+      return
+    }
+
+    if (message.kind === 'invalid') {
+      // Keep the pre-contract wildcard behavior for malformed or unrelated
+      // frames. The adapter has already quarantined the decode error, but an
+      // older event that the reducer knows how to handle must not disappear
+      // during the migration.
+      handleRpcAny(message.wireName, message.payload)
+      return
+    }
+
+    const event = message.decoded
+    if (event.kind === 'known') {
+      switch (event.name) {
+        case 'session.event.answer_generation_reset':
+          handleRpcAnswerGenerationReset(message.payload as AnswerGenerationResetPayload)
+          break
+        case 'session.event.text_delta':
+          handleRpcTextDelta(message.payload as TextDeltaPayload)
+          break
+        case 'session.event.tool_use_start':
+          handleRpcToolUseStart(message.payload as ToolUsePayload)
+          break
+        case 'session.event.tool_use_delta':
+          handleRpcToolUseDelta(message.payload as ToolDeltaPayload)
+          break
+        case 'session.event.tool_use_end':
+          handleRpcToolUseEnd(message.payload as ToolEndPayload)
+          break
+        case 'session.event.tool_result':
+          handleRpcToolResult(message.payload as ToolResultPayload)
+          break
+        case 'session.event.artifact':
+          handleRpcArtifact(message.payload as ArtifactPayload)
+          break
+        case 'session.event.state_change':
+          handleRpcStateChange(message.payload as SessionEventPayload)
+          break
+        case 'session.event.run_heartbeat':
+          handleRpcRunHeartbeat(message.payload as SessionEventPayload)
+          break
+        case 'session.event.provider_activity':
+          handleRpcProviderActivity(message.payload as ProviderActivityPayload)
+          break
+        case 'session.event.compaction':
+          handleRpcCompaction(message.payload as CompactionPayload, message.meta)
+          break
+        case 'session.event.warning':
+          handleRpcWarning(message.payload as WarningPayload)
+          break
+        case 'session.event.input_disposition':
+          handleRpcInputDisposition(message.payload as InputDispositionPayload)
+          break
+        case 'session.event.cron_result':
+          handleRpcCronResult(message.payload as CronResultPayload)
+          break
+        case 'session.event.subagent_completion':
+          handleRpcSubagentCompletion(message.payload as SubagentCompletionPayload)
+          break
+        case 'session.epoch_changed':
+          handleRpcEpochChanged(message.payload as SessionEventPayload)
+          break
+        case 'task.queued':
+          handleRpcTaskQueued(message.payload as SessionEventPayload)
+          break
+        case 'task.running':
+          handleRpcTaskRunning(message.payload as SessionEventPayload)
+          break
+        case 'session.event.task_group.waiting':
+          handleRpcTaskGroupWaiting(message.payload as SessionEventPayload)
+          break
+        case 'session.event.task_group.synthesizing':
+          handleRpcTaskGroupSynthesizing(message.payload as SessionEventPayload)
+          break
+        case 'session.event.task_group.done':
+          handleRpcTaskGroupDone(message.payload as SessionEventPayload)
+          break
+        case 'session.event.task_group.failed':
+          handleRpcTaskGroupFailed(message.payload as SessionEventPayload)
+          break
+        case 'session.event.router_decision':
+          handleRpcRouterDecision(message.payload as RouterDecisionPayload)
+          break
+        case 'session.event.ensemble_progress':
+          handleRpcEnsembleProgress(message.payload as EnsembleProgressPayload)
+          break
+        case 'session.event.router_control_replay':
+          handleRpcRouterControlReplay(message.payload as SessionEventPayload)
+          break
+        default:
+          // Thinking, terminal, approval and future additive events are owned
+          // by the wildcard reducer below until their domain projections are
+          // split into dedicated modules.
+          break
+      }
+    }
+
+    // Preserve the old wildcard path for terminal/task lifecycle events and
+    // for the reducer's cross-cutting sequence/ownership checks. This call is
+    // intentionally after the named projection, matching RpcClient listener
+    // registration order before S12.
+    handleRpcAny(message.wireName, message.payload)
+  }
+
   let connectionLostNoted = false
   let connectionLostNotice: ChatMessage | null = null
   let connectionStateGeneration = 0
@@ -2656,7 +2774,10 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     }
   }
 
-  const handlers: ChatRpcSubscriptionHandlers = {
+  // Keep this object as a test-friendly compatibility surface for the reducer
+  // unit tests. Production ingress uses `onConversationEvent` below, so this
+  // object no longer defines the transport contract.
+  const handlers = {
     onAnswerGenerationReset: handleRpcAnswerGenerationReset,
     onTextDelta: handleRpcTextDelta,
     onToolUseStart: handleRpcToolUseStart,
@@ -2689,6 +2810,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
 
   return {
     handlers,
+    onConversationEvent: handleConversationEvent,
     bindActiveStreamTask,
     restoreLiveTurnSnapshot,
     streamThinkingText,

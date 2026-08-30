@@ -37,38 +37,57 @@ describe('conversation event transport adapter', () => {
 
   it('decodes aliases before dispatch while preserving raw wildcard observation', () => {
     const { rpc, transport } = harness()
-    const text = vi.fn()
+    const event = vi.fn()
     const any = vi.fn()
-    transport.subscribe({ onTextDelta: text, onAny: any })
+    transport.subscribe({ onEvent: event, onAny: any })
 
     const payload = { sessionKey: 'agent:main:alpha', streamSeq: 3, text: 'hi' }
     rpc.emit('*', 'text_delta', payload, { replayed: false })
 
-    expect(text).toHaveBeenCalledWith(payload, { replayed: false })
+    expect(event).toHaveBeenCalledTimes(1)
+    expect(event.mock.calls[0]?.[0]).toMatchObject({
+      kind: 'conversation',
+      wireName: 'text_delta',
+      payload,
+      meta: { replayed: false },
+      decoded: { kind: 'known', name: 'session.event.text_delta', legacy: true },
+    })
     expect(any).toHaveBeenCalledWith('text_delta', payload)
   })
 
   it('keeps directory changes in the same listener without treating them as conversation frames', () => {
     const { rpc, transport } = harness()
-    const changed = vi.fn()
+    const event = vi.fn()
     const any = vi.fn()
-    transport.subscribe({ onSessionsChanged: changed, onAny: any })
+    transport.subscribe({ onEvent: event, onAny: any })
     const payload = { key: 'agent:main:alpha', reason: 'renamed' }
 
     rpc.emit('*', 'sessions.changed', payload, {})
 
-    expect(changed).toHaveBeenCalledWith(payload, {})
+    expect(event).toHaveBeenCalledWith({
+      kind: 'sessions-changed',
+      wireName: 'sessions.changed',
+      decoded: null,
+      payload,
+      meta: {},
+    })
     expect(any).toHaveBeenCalledWith('sessions.changed', payload)
   })
 
   it('quarantines malformed frames but does not break the wildcard stream', () => {
     const { rpc, transport } = harness()
+    const event = vi.fn()
     const error = vi.fn()
     const any = vi.fn()
-    transport.subscribe({ onDecodeError: error, onAny: any })
+    transport.subscribe({ onEvent: event, onDecodeError: error, onAny: any })
 
     rpc.emit('*', 'presence', { value: true }, {})
 
+    expect(event).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'invalid',
+      wireName: 'presence',
+      payload: { value: true },
+    }))
     expect(error).toHaveBeenCalledTimes(1)
     expect(any).toHaveBeenCalledWith('presence', { value: true })
   })
@@ -83,4 +102,3 @@ describe('conversation event transport adapter', () => {
     expect(state).toHaveBeenCalledWith('connected')
   })
 })
-
