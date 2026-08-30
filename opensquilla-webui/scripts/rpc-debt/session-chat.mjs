@@ -42,7 +42,6 @@ export const debt = {
   'src/composables/chat/useChatPendingQueue.ts': { call: 6 },
   'src/composables/chat/useChatPlans.ts': { call: 4, on: 6 },
   'src/composables/chat/useChatRouteFeedback.ts': { call: 1 },
-  'src/composables/chat/useChatRpcSubscriptions.ts': { on: 28 },
   'src/composables/chat/useChatRunModePreference.ts': { call: 4 },
   'src/composables/chat/useChatSend.ts': { call: 9 },
   'src/composables/chat/useChatSessionSubscription.ts': { call: 7, waitForConnection: 3 },
