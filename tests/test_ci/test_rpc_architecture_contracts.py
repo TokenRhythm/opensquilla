@@ -143,9 +143,10 @@ F2_FOUNDATION_RUNTIME_FILES = (
 # lifecycle now each register one reviewed domain Adapter in the composition
 # root; the 12-line increase is the deliberate cumulative seam cost for those
 # two slices. Session routing adds one more adapter registration and its typed
-# composition-root seam (4 lines); keep this allowance explicit rather than
-# turning the foundation exception into an open-ended budget.
-F2_FOUNDATION_RUNTIME_LOC_CEILING = 1_158
+# composition-root seam (4 lines), and TurnCommands adds the same 4-line
+# composition seam. Keep both reviewed increments explicit rather than turning
+# the foundation exception into an open-ended budget.
+F2_FOUNDATION_RUNTIME_LOC_CEILING = 1_162
 
 # Existing cross-rpc private imports are architectural debt. This exact ledger
 # prevents growth and also fails stale when an import is removed, so reductions

@@ -619,7 +619,7 @@
       :reorder-pending="pendingQueueReorderPending"
       :image-blocked-message="queuedImageSendBlockedMessage"
       :steer-available="sameTurnSteerAvailable"
-      :durable-steer-available="rpc.supportsMethod('sessions.pending_inputs.steer')"
+      :durable-steer-available="turnCommands.supports('durable-steer')"
       :steer-unavailable-message="sameTurnSteerUnavailableMessage"
       @clear="clearPendingQueue"
       @edit="editPendingMessage"
@@ -871,6 +871,7 @@ import { useChatElevatedMode } from '@/composables/chat/useChatElevatedMode'
 import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
 import { useChatSessionRouting } from '@/composables/chat/useChatSessionRouting'
 import { SESSION_ROUTING_KEY, type SessionRouting } from '@/modules/sessionRouting'
+import { TURN_COMMANDS_KEY, type TurnCommands } from '@/modules/turnCommands'
 import { useChatHistory } from '@/composables/chat/useChatHistory'
 import { useChatMarkdownExport } from '@/composables/chat/useChatMarkdownExport'
 import { useChatMessageActions } from '@/composables/chat/useChatMessageActions'
@@ -1184,6 +1185,9 @@ const sessionDirectory = injectedSessionDirectory
 const injectedSessionLifecycle = inject(SESSION_LIFECYCLE_KEY)
 if (!injectedSessionLifecycle) throw new Error('SessionLifecycle was not provided')
 const sessionLifecycle = injectedSessionLifecycle
+const injectedTurnCommands = inject(TURN_COMMANDS_KEY)
+if (!injectedTurnCommands) throw new Error('TurnCommands was not provided')
+const turnCommands: TurnCommands = injectedTurnCommands
 
 async function resolveCreatedSessionAvailability(sessionKey: string): Promise<boolean> {
   try {
@@ -3260,7 +3264,7 @@ resetComposerInputHistory = chatComposerShortcuts.resetInputHistory
 
 const chatSend = useChatSend({
   rpc,
-  supportsMethod: method => rpc.supportsMethod(method),
+  turnCommands,
   activeSteerCapability,
   inputText,
   messages,
@@ -3582,7 +3586,7 @@ const sameTurnSteerUnavailableMessage = computed(() => {
   if (sameTurnSteerAvailable.value) return ''
   const reason = steerUnavailableReason({
     isStreaming: isStreaming.value,
-    methodAvailable: rpc.supportsMethod('sessions.steer.v2'),
+    methodAvailable: turnCommands.supports('same-turn-steer'),
     modelRoutingMode: modelRoutingMode.value,
     capability: activeSteerCapability.value,
     activeTaskId: activeStreamTaskId.value,

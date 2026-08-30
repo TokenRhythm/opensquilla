@@ -23,8 +23,12 @@ import type {
   ChatSendParams,
   ChatSendResponse,
   SessionSteerV2Params,
-  SessionSteerV2Response,
 } from '@/types/rpc'
+import type {
+  TurnSendRequest,
+  TurnCancelRequest,
+  TurnCommands,
+} from '@/modules/turnCommands'
 import type { ChatRpcStreamApi } from '@/composables/chat/useChatRpcEventHandlers'
 import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
 import type {
@@ -110,9 +114,8 @@ interface SendAttempt {
   // A Stop issued before durable acceptance is known belongs to this exact
   // idempotent request, not to whichever session happens to be visible later.
   stopRequested?: boolean
-  acceptanceRpc?: {
-    method: 'chat.send' | 'sessions.pending_inputs.dispatch'
-    params: Record<string, unknown>
+  acceptanceRequest?: {
+    request: TurnSendRequest
   }
   acceptanceResolved?: boolean
   acceptanceInFlight?: boolean
@@ -404,6 +407,13 @@ function chatSourceMetadata(options: UseChatSendOptions): ChatSendParams['_sourc
 
 export interface UseChatSendOptions {
   rpc: RpcClient
+  /** Semantic command port; v4 method aliases live in the Gateway Adapter. */
+  turnCommands: TurnCommands
+  /**
+   * @deprecated Test-only bridge for legacy harnesses; TurnCommands owns all
+   * turn capability checks in production. Remove with the S14 command
+   * Contract migration.
+   */
   supportsMethod?: (method: string) => boolean
   activeSteerCapability?: Readonly<Ref<ChatSteerCapability | null>>
   inputText: Ref<string>
@@ -836,7 +846,7 @@ export function useChatSend(options: UseChatSendOptions) {
     const activeTaskId = String(options.activeStreamTaskId.value || '').trim()
     const inputKinds = capability?.input_kinds
     return Boolean(
-      options.supportsMethod?.('sessions.steer.v2')
+      options.turnCommands.supports('same-turn-steer')
       && capability?.mode === 'same_turn'
       && expectedTurnId
       && activeTaskId === expectedTurnId
@@ -980,12 +990,12 @@ export function useChatSend(options: UseChatSendOptions) {
       const isCurrentRequest = options.sessionKey.value === attempt.requestSessionKey
       if (isCurrentRequest) options.taskOwnership?.requestStop(taskId)
       try {
-        const abort = await options.rpc.call<{ aborted?: boolean, reason?: string }>('chat.abort', {
+        const abort = await options.turnCommands.cancel({
           sessionKey: attempt.acceptedSessionKey || attempt.requestSessionKey,
           taskId,
           source: 'webui_stop',
           scope: 'task',
-        })
+        } satisfies TurnCancelRequest)
         if (abort?.aborted !== true) {
           if (isCurrentRequest) {
             await options.reconcileTaskOwnership?.()
@@ -1074,7 +1084,7 @@ export function useChatSend(options: UseChatSendOptions) {
   }
 
   function scheduleAcceptanceRecovery(attempt: SendAttempt) {
-    if ((attempt.acceptanceResolved && !attempt.stopRequested) || !attempt.acceptanceRpc) return
+    if ((attempt.acceptanceResolved && !attempt.stopRequested) || !attempt.acceptanceRequest) return
     const key = acceptanceAttemptKey(attempt)
     if (acceptanceRecoveryWorkers.has(key)) return
 
@@ -1093,9 +1103,8 @@ export function useChatSend(options: UseChatSendOptions) {
         if (attempt.acceptanceInFlight) continue
         attempt.acceptanceInFlight = true
         try {
-          const response = await options.rpc.call<ChatSendResponse>(
-            attempt.acceptanceRpc!.method,
-            attempt.acceptanceRpc!.params,
+          const response = await options.turnCommands.send(
+            attempt.acceptanceRequest!.request,
           )
           if (await settleRecoveredAcceptance(attempt, response)) return
         } catch (error: unknown) {
@@ -1694,10 +1703,10 @@ export function useChatSend(options: UseChatSendOptions) {
         let refreshedExpiredAttachments = false
         while (true) {
           try {
-            const response = await options.rpc.call<ChatSendResponse>(
-              'chat.send',
-              replayRecord.params,
-            )
+            const response = await options.turnCommands.send({
+              kind: 'new-turn',
+              params: replayRecord.params,
+            })
             const targetSessionKey = response.sessionKey || replayRecord.requestSessionKey
             await finalizeRecoveredHandoff(replayRecord, targetSessionKey)
             break
@@ -1896,7 +1905,7 @@ export function useChatSend(options: UseChatSendOptions) {
     const taskId = acceptedTaskId(response)
     if (!taskId && !force) return
     const acceptedSessionKey = response?.sessionKey || requestSessionKey
-    const params: Record<string, string> = {
+    const params: TurnCancelRequest = {
       sessionKey: acceptedSessionKey,
       source: force ? 'webui_stop' : 'webui_stale_send',
     }
@@ -1905,7 +1914,7 @@ export function useChatSend(options: UseChatSendOptions) {
     // instead of falling back to the legacy whole-session abort surface.
     if (force) params.scope = 'task'
     if (taskId) params.taskId = taskId
-    options.rpc.call<{ aborted?: boolean }>('chat.abort', params)
+    options.turnCommands.cancel(params)
       .then((response) => {
         if (force && !taskId) {
           void options.reconcileTaskOwnership?.()
@@ -1937,7 +1946,7 @@ export function useChatSend(options: UseChatSendOptions) {
       ? options.steerDelivery.attemptForItem(pendingItem)
       : null
     if (!requestSessionKey || !text.trim()) return 'not_sent'
-    if (!options.supportsMethod?.('sessions.steer.v2')) {
+    if (!options.turnCommands.supports('same-turn-steer')) {
       return recovered ? 'retryable_failure' : 'not_sent'
     }
     const durablePending = Boolean(
@@ -1953,7 +1962,7 @@ export function useChatSend(options: UseChatSendOptions) {
     )
     if (
       durablePending
-      && !options.supportsMethod?.('sessions.pending_inputs.steer')
+      && !options.turnCommands.supports('durable-steer')
     ) {
       return recovered ? 'retryable_failure' : 'not_sent'
     }
@@ -2045,12 +2054,7 @@ export function useChatSend(options: UseChatSendOptions) {
       pendingItem.steerAttempt = activeAttempt
     }
     try {
-      const response = await options.rpc.call<SessionSteerV2Response>(
-        params.pendingInputId
-          ? 'sessions.pending_inputs.steer'
-          : 'sessions.steer.v2',
-        params as unknown as Record<string, unknown>,
-      )
+      const response = await options.turnCommands.steer(params)
       const sessionChanged = options.sessionKey.value !== requestSessionKey
       if (sessionChanged && response.accepted === true) {
         options.steerDelivery.acknowledgeAcceptedOffscreen(pendingItem)
@@ -3034,25 +3038,25 @@ export function useChatSend(options: UseChatSendOptions) {
 
     try {
       const stagedPendingItem = serverStagedPendingItem
-      const acceptanceRpc = attempt.acceptanceRpc || {
-        method: stagedPendingItem
-          ? 'sessions.pending_inputs.dispatch' as const
-          : 'chat.send' as const,
-        params: stagedPendingItem
+      const acceptanceRequest = attempt.acceptanceRequest?.request || (
+        stagedPendingItem
           ? {
-              key: requestSessionKey,
-              pendingInputId: stagedPendingItem.pendingInputId,
-              clientRequestId: stagedPendingItem.pendingClientRequestId,
-              requestFingerprint: stagedPendingItem.pendingRequestFingerprint,
+              kind: 'pending-input' as const,
+              params: {
+                key: requestSessionKey,
+                pendingInputId: stagedPendingItem.pendingInputId!,
+                clientRequestId: stagedPendingItem.pendingClientRequestId!,
+                requestFingerprint: stagedPendingItem.pendingRequestFingerprint!,
+              },
             }
-          : attempt.params as unknown as Record<string, unknown>,
-      }
-      attempt.acceptanceRpc = acceptanceRpc
-      attempt.acceptanceInFlight = true
-      const res = await options.rpc.call<ChatSendResponse>(
-        acceptanceRpc.method,
-        acceptanceRpc.params,
+          : {
+              kind: 'new-turn' as const,
+              params: attempt.params,
+            }
       )
+      attempt.acceptanceRequest = { request: acceptanceRequest }
+      attempt.acceptanceInFlight = true
+      const res = await options.turnCommands.send(acceptanceRequest)
       acknowledgeAttemptPromptAnnotations(attempt, res)
       attempt.acceptanceResolved = true
       attempt.acceptedTaskId = acceptedTaskId(res)
@@ -3576,7 +3580,7 @@ export function useChatSend(options: UseChatSendOptions) {
         message.steerStopRequested = true
       }
     }
-    const abortParams: Record<string, string> = {
+    const abortParams: TurnCancelRequest = {
       sessionKey: abortSessionKey,
       source: 'webui_stop',
     }
@@ -3585,7 +3589,7 @@ export function useChatSend(options: UseChatSendOptions) {
     // intentionally retains legacy session-tree cancellation semantics.
     if (stoppedTurnId || taskAcceptancePending) abortParams.scope = 'task'
     if (stoppedTurnId) abortParams.taskId = stoppedTurnId
-    options.rpc.call<{ aborted?: boolean, reason?: string }>('chat.abort', abortParams)
+    options.turnCommands.cancel(abortParams)
       .then((response) => {
         if (response?.aborted === true) {
           options.scheduleHistorySync()
@@ -3803,9 +3807,11 @@ export function useChatSend(options: UseChatSendOptions) {
       workspaceId: null,
       params,
       hiddenControl: true,
-      acceptanceRpc: {
-        method: 'chat.send',
-        params: params as unknown as Record<string, unknown>,
+      acceptanceRequest: {
+        request: {
+          kind: 'new-turn',
+          params,
+        },
       },
     }
 
@@ -3822,7 +3828,10 @@ export function useChatSend(options: UseChatSendOptions) {
 
     try {
       attempt.acceptanceInFlight = true
-      const res = await options.rpc.call<ChatSendResponse>('chat.send', params)
+      const res = await options.turnCommands.send({
+        kind: 'new-turn',
+        params,
+      })
       attempt.acceptanceResolved = true
       attempt.acceptedTaskId = acceptedTaskId(res)
       attempt.acceptedSessionKey = res?.sessionKey || requestSessionKey

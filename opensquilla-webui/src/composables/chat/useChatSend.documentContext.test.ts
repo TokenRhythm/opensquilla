@@ -5,6 +5,7 @@ import type { ChatMessage } from '@/types/chat'
 import type { ChatDocumentContext } from '@/types/rpc'
 import type { UseChatSendOptions } from './useChatSend'
 import { useChatSend } from './useChatSend'
+import { createV4TurnCommandsFromRpcClient } from '@/adapters/gateway/turnCommandsV4'
 
 const SESSION_KEY = 'agent:main:webchat:document-context'
 
@@ -39,6 +40,9 @@ function createHarness(overrides: Partial<UseChatSendOptions> = {}) {
   }
   const options: UseChatSendOptions = {
     rpc,
+    turnCommands: createV4TurnCommandsFromRpcClient(
+      rpc as unknown as UseChatSendOptions['rpc'],
+    ),
     inputText: ref('Update the title and accent color.'),
     messages: ref<ChatMessage[]>([]),
     sessionKey: ref(SESSION_KEY),
@@ -86,6 +90,12 @@ function createHarness(overrides: Partial<UseChatSendOptions> = {}) {
     autoResizeTextarea: vi.fn(),
     scrollToBottom: vi.fn(),
     ...overrides,
+  }
+  if (!overrides.turnCommands) {
+    options.turnCommands = createV4TurnCommandsFromRpcClient(
+      options.rpc,
+      options.supportsMethod,
+    )
   }
   return { api: useChatSend(options), options, rpc }
 }

@@ -43,7 +43,10 @@ export const debt = {
   'src/composables/chat/useChatPlans.ts': { call: 4, on: 6 },
   'src/composables/chat/useChatRouteFeedback.ts': { call: 1 },
   'src/composables/chat/useChatRunModePreference.ts': { call: 4 },
-  'src/composables/chat/useChatSend.ts': { call: 9 },
+  // TurnCommands now owns send/cancel/steer method selection.  The one
+  // remaining call is the unrelated meta-draft compatibility path, which is
+  // intentionally deferred to the Meta domain slice.
+  'src/composables/chat/useChatSend.ts': { call: 1 },
   'src/composables/chat/useChatSessionSubscription.ts': { call: 7, waitForConnection: 3 },
   'src/composables/chat/useChatSlashCommands.ts': { call: 6 },
   'src/composables/chat/useChatUsageWidget.ts': { call: 2 },
@@ -78,7 +81,9 @@ export const debt = {
     call: 5,
     on: 1,
     supportsEvent: 1,
-    supportsMethod: 12,
+    // Turn capability probes are owned by TurnCommands; the remaining
+    // method probes belong to non-Turn domains and migrate independently.
+    supportsMethod: 10,
     waitForConnection: 2,
     httpRequest: 1,
     httpApiEndpoint: 1,
