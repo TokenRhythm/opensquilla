@@ -12,6 +12,7 @@ import {
   FINISHED_STREAM_TASK_ID,
   PENDING_STREAM_TASK_ID,
 } from '@/utils/chat/streamEvents'
+import { decodeConversationEvent } from '@/adapters/gateway/conversationEventsV4'
 
 function createHarness(options: {
   messages?: ChatMessage[]
@@ -209,6 +210,39 @@ describe('useChatRpcEventHandlers route-card ownership', () => {
       })
     } finally {
       stop()
+    }
+  })
+})
+
+describe('useChatRpcEventHandlers decoded conversation ingress', () => {
+  it('routes a validated event through the named projection and wildcard reducer once', () => {
+    const harness = createHarness()
+    const payload = {
+      session_key: 'agent:main:test',
+      turn_id: 'turn-decoded',
+      stream_seq: 1,
+      text: 'decoded answer',
+      model_call_id: 'call-1',
+      iteration: 1,
+    }
+    try {
+      harness.api.onConversationEvent({
+        kind: 'conversation',
+        wireName: 'session.event.text_delta',
+        decoded: decodeConversationEvent('session.event.text_delta', payload, {}),
+        payload,
+        meta: {},
+      })
+
+      expect(harness.stream.appendDelta).toHaveBeenCalledTimes(1)
+      expect(harness.stream.appendDelta).toHaveBeenCalledWith(
+        'decoded answer',
+        undefined,
+        { modelCallId: 'call-1', iteration: 1 },
+      )
+      expect(harness.lastStreamSeq.value).toBe(1)
+    } finally {
+      harness.stop()
     }
   })
 })
