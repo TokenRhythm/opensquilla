@@ -21,6 +21,7 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         "src/opensquilla/contracts/adapters/sessions_search_contract.py",
         "src/opensquilla/gateway/adapters/sessions_search_contract.py",
         "src/opensquilla/contracts/adapters/sessions_changed_contract.py",
+        "src/opensquilla/contracts/adapters/conversation_events.py",
     }
 )
 GENERATED_METADATA_IMPORT_ALLOWLIST = frozenset(
@@ -48,6 +49,11 @@ SESSIONS_SEARCH_METADATA_IMPORT_ALLOWLIST = frozenset(
 SESSIONS_CHANGED_METADATA_IMPORT_ALLOWLIST = frozenset(
     {
         "src/opensquilla/contracts/adapters/sessions_changed_contract.py",
+    }
+)
+CONVERSATION_EVENTS_METADATA_IMPORT_ALLOWLIST = frozenset(
+    {
+        "src/opensquilla/contracts/adapters/conversation_events.py",
     }
 )
 SESSIONS_CREATE_METADATA_IMPORT_ALLOWLIST = frozenset(
@@ -353,6 +359,10 @@ def test_schema_derived_method_metadata_consumers_are_exact() -> None:
         "sessions.changed": (
             "opensquilla.contracts.generated.v4.sessions_changed_metadata",
             SESSIONS_CHANGED_METADATA_IMPORT_ALLOWLIST,
+        ),
+        "conversation.events": (
+            "opensquilla.contracts.generated.v4.conversation_events_metadata",
+            CONVERSATION_EVENTS_METADATA_IMPORT_ALLOWLIST,
         ),
         "sessions.create": (
             "opensquilla.contracts.generated.v4.sessions_create_metadata",
