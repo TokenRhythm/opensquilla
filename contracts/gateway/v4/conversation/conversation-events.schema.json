@@ -141,16 +141,12 @@
         }
       }
     },
-    "ConversationEventPayload": {
-      "title": "common conversation event payload",
+    "ConversationEventIdentityPayload": {
+      "title": "common conversation event identity payload",
       "description": "Common identity and replay fields are documented here; event-specific fields remain open so old and additive producers keep their exact payload.",
       "type": "object",
       "additionalProperties": true,
       "properties": {
-        "schema_version": {
-          "type": ["integer", "null"],
-          "minimum": 1
-        },
         "key": {
           "type": ["string", "null"],
           "minLength": 1
@@ -209,6 +205,25 @@
         }
       }
     },
+    "ConversationEventPayload": {
+      "title": "common conversation event payload",
+      "description": "Common identity, replay and version fields are documented here; event-specific fields remain open so old and additive producers keep their exact payload.",
+      "allOf": [
+        {
+          "$ref": "#/$defs/ConversationEventIdentityPayload"
+        },
+        {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "schema_version": {
+              "type": ["integer", "null"],
+              "minimum": 1
+            }
+          }
+        }
+      ]
+    },
     "ConversationEventCanonicalPayload": {
       "title": "canonical conversation event payload",
       "description": "Versioned conversation payload. Event-specific fields remain open, but canonical producers must carry schema_version=1.",
@@ -232,24 +247,16 @@
       "description": "Older v4 producers omit schema_version. The decoder also retains primitive and null payloads as legacy values for exact wire compatibility.",
       "allOf": [
         {
-          "$ref": "#/$defs/ConversationEventPayload"
+          "$ref": "#/$defs/ConversationEventIdentityPayload"
         },
         {
           "type": "object",
-          "anyOf": [
-            {
-              "not": {
-                "required": ["schema_version"]
-              }
-            },
-            {
-              "properties": {
-                "schema_version": {
-                  "type": "null"
-                }
-              }
+          "additionalProperties": true,
+          "properties": {
+            "schema_version": {
+              "type": "null"
             }
-          ]
+          }
         }
       ]
     }
