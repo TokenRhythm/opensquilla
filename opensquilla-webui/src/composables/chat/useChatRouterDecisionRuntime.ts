@@ -34,6 +34,8 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     messageId: string
   } | null>(null)
   let localRouterMessageSeq = 0
+  let routerReplayGeneration = 0
+  const provisionalRouterMessageGenerations = new Map<string, number>()
 
   // Router and ensemble events can arrive throughout a long streamed answer.
   // They should follow the live edge only while the reader has elected to stay
@@ -43,6 +45,7 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
   }
 
   function handleRouterControlReplay() {
+    routerReplayGeneration += 1
     if (!options.isStreaming.value) options.startStreaming()
     pendingRouterDecision.value = null
     options.resetStreamForRouterReplay()
@@ -168,6 +171,27 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     const turnId = payloadTurnId(payload)
     const acceptedDecision = freezeAcceptedRoutingMode(decision, turnId)
     if (options.messages.value.some(message => message.messageId === messageId)) return
+
+    if (turnId) {
+      for (let i = options.messages.value.length - 1; i >= 0; i--) {
+        const message = options.messages.value[i]
+        const provisionalMessageId = message.messageId || ''
+        if (
+          message.role === 'router'
+          && message.provenanceKind === 'router_decision'
+          && provisionalMessageId.startsWith(`router-${options.sessionKey.value}-`)
+          && message.turnId === turnId
+          && provisionalRouterMessageGenerations.get(provisionalMessageId) === routerReplayGeneration
+        ) {
+          message.routerDecision = acceptedDecision
+          message.messageId = messageId
+          message.turnId = turnId
+          provisionalRouterMessageGenerations.delete(provisionalMessageId)
+          scrollToBottomIfFollowing()
+          return
+        }
+      }
+    }
 
     options.messages.value.push({
       role: 'router',
@@ -303,6 +327,7 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
       ...(turnId ? { turnId } : {}),
     }
     options.messages.value.push(message)
+    provisionalRouterMessageGenerations.set(message.messageId!, routerReplayGeneration)
     return message
   }
 
@@ -343,7 +368,7 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     let target = findLiveRouterMessage(turnId)
 
     if (!target) {
-      options.messages.value.push({
+      const provisionalMessage: ChatMessage = {
         role: 'router',
         text: '',
         ts: new Date().toISOString(),
@@ -352,7 +377,9 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
         messageId: `router-${options.sessionKey.value}-ensemble`,
         ensemble: emptyEnsemble(),
         ...(turnId ? { turnId } : {}),
-      })
+      }
+      options.messages.value.push(provisionalMessage)
+      provisionalRouterMessageGenerations.set(provisionalMessage.messageId!, routerReplayGeneration)
       // Re-read through the reactive array so nested mutations below trigger.
       target = options.messages.value[options.messages.value.length - 1]
     }
