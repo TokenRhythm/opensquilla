@@ -3,7 +3,7 @@
   "schema_version": 1,
   "source_runs": [
     {
-      "assignment_sha256": "49b9f33477caa0e6fae8f85c170c7ef8d9300212c23b5d806b0377f55b98494e",
+      "assignment_sha256": "b68d0aa5389729f3ea25a81580b6a755674e5a1a46ca1b8b4394d8d48a646555",
       "attempts": {
         "core": 1,
         "desktop-installer-contracts": 1,
@@ -25,10 +25,10 @@
         "runner_os": "Windows"
       },
       "sha": "9bd99e1deecc3a2634f324634e1b36ab0143d56f",
-      "weighted_file_count": 1307
+      "weighted_file_count": 1308
     },
     {
-      "assignment_sha256": "49b9f33477caa0e6fae8f85c170c7ef8d9300212c23b5d806b0377f55b98494e",
+      "assignment_sha256": "b68d0aa5389729f3ea25a81580b6a755674e5a1a46ca1b8b4394d8d48a646555",
       "attempts": {
         "core": 1,
         "desktop-installer-contracts": 1,
@@ -50,10 +50,10 @@
         "runner_os": "Windows"
       },
       "sha": "9bd99e1deecc3a2634f324634e1b36ab0143d56f",
-      "weighted_file_count": 1307
+      "weighted_file_count": 1308
     },
     {
-      "assignment_sha256": "49b9f33477caa0e6fae8f85c170c7ef8d9300212c23b5d806b0377f55b98494e",
+      "assignment_sha256": "b68d0aa5389729f3ea25a81580b6a755674e5a1a46ca1b8b4394d8d48a646555",
       "attempts": {
         "core": 1,
         "desktop-installer-contracts": 1,
@@ -75,7 +75,7 @@
         "runner_os": "Windows"
       },
       "sha": "9bd99e1deecc3a2634f324634e1b36ab0143d56f",
-      "weighted_file_count": 1307
+      "weighted_file_count": 1308
     }
   ],
   "weights_seconds": {
@@ -83,6 +83,7 @@
     "tests/contracts/test_conversation_events_contract.py": 0.01,
     "tests/contracts/test_gateway_contract_runner.py": 0.01,
     "tests/contracts/test_gateway_contract_toolchain_integration.py": 0.01,
+    "tests/contracts/test_goals_contract.py": 0.01,
     "tests/contracts/test_sessions_changed_contract.py": 0.01,
     "tests/contracts/test_sessions_directory_subscription_contract.py": 0.01,
     "tests/contracts/test_sessions_lifecycle_contract.py": 0.01,

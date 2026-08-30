@@ -32,6 +32,7 @@ describe('Gateway Adapter composition', () => {
       'turnCommands',
       'pendingInputQueue',
       'approvalCenter',
+      'goalCenter',
     ])
     expect(adapters).not.toHaveProperty('rpc')
     expect(adapters).not.toHaveProperty('events')
