@@ -31,6 +31,7 @@ export interface PlanEvent {
 }
 
 export interface PlanCenter {
+  available(operation?: 'mode' | 'mutations'): boolean
   setMode(sessionKey: string, mode: CollaborationMode, expectedRevision: number, options?: PlanRequestOptions): Promise<PlanMutationResult>
   revise(sessionKey: string, request: PlanRevisionRequest, clientRequestId: string, options?: PlanRequestOptions): Promise<PlanMutationResult>
   implement(sessionKey: string, target: PlanCardActionTarget, clientRequestId: string, options?: PlanRequestOptions & { intent?: string }): Promise<PlanMutationResult>

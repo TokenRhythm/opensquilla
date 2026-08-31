@@ -60,6 +60,7 @@ function harness({ draft = false }: { draft?: boolean } = {}) {
     }),
   }
   const planCenter = {
+    available: () => true,
     setMode: (sessionKey: string, mode: string, expectedRevision: number) => rpc.call('plans.setMode', { sessionKey, mode, expectedRevision }),
     revise: (sessionKey: string, request: { revisionId: string; prompt: string }, clientRequestId: string) => rpc.call('plans.revise', { sessionKey, planRevisionId: request.revisionId, prompt: request.prompt, clientRequestId }),
     implement: (sessionKey: string, target: { revisionId: string }, clientRequestId: string, options?: { intent?: string }) => rpc.call('plans.implement', { sessionKey, planRevisionId: target.revisionId, clientRequestId, ...(options?.intent ? { intent: options.intent } : {}) }),

@@ -520,6 +520,7 @@ describe('PlanRunRibbon', () => {
     const handlers = new Map<string, (...args: unknown[]) => void>()
     const plans = useChatPlans({
       planCenter: {
+        available: () => true,
         setMode: vi.fn(), revise: vi.fn(), implement: vi.fn(), cancelRun: vi.fn(),
         subscribe: vi.fn((listener: (event: any) => void) => {
           const names = ['session.event.collaboration_mode', 'session.event.plan_revision', 'session.event.plan_run']

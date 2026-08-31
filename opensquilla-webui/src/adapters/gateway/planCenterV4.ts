@@ -4,6 +4,7 @@ import type { PlanCenter, PlanEvent, PlanMutationResult } from '@/modules/planCe
 
 interface PlanTransport {
   request<T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions): Promise<T>
+  supports?(method: string): boolean
 }
 interface PlanEvents { subscribe(event: string, handler: RpcEventHandler): { close(): void } }
 type JsonObject = Record<string, unknown>
@@ -19,6 +20,14 @@ function optionsFor(signal?: AbortSignal): RpcCallOptions | undefined {
 function normalizeResult(value: unknown): PlanMutationResult {
   const source = object(value)
   return {
+    available(operation = 'mutations') {
+      if (!transport.supports) return true
+      if (operation === 'mode') return transport.supports('plans.setMode') && transport.supports('plans.capabilities')
+      return transport.supports('plans.setMode')
+        && transport.supports('plans.revise')
+        && transport.supports('plans.implement')
+        && transport.supports('plans.cancelRun')
+    },
     ...source,
     accepted: typeof source.accepted === 'boolean' ? source.accepted : undefined,
     replayed: typeof source.replayed === 'boolean' ? source.replayed : undefined,

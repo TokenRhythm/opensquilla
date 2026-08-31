@@ -76,7 +76,7 @@ export const debt = {
     supportsEvent: 1,
     // Turn capability probes are owned by TurnCommands; Goal mode probes are
     // owned by GoalCenter; the remaining method probes migrate independently.
-    supportsMethod: 7,
+    supportsMethod: 5,
     waitForConnection: 2,
     httpRequest: 1,
     httpApiEndpoint: 1,

@@ -4419,8 +4419,7 @@ const composerHasSendContent = computed(() =>
 // A mixed-version gateway may know plans.setMode but not the atomic first-send
 // contract. Hide Plan rather than claim a read-only turn that would run Default.
 const planUiAvailable = computed(() =>
-  rpc.supportsMethod('plans.setMode')
-  && rpc.supportsMethod('plans.capabilities'),
+  planCenter.available('mode'),
 )
 const goalUiAvailable = computed(() => goalCenter.available('goal-mode'))
 const goalComposerExisting = computed(() => (
