@@ -1,5 +1,8 @@
 ---
 name: meta-security-review-bundle
+visibility: experimental
+invocation: experimental_internal
+disable-model-invocation: true
 description: "Compose three independent security gates over a candidate operation — policy/governance review, secret/credential scan, and audit-log emit — then arbitrate the verdicts with a strict priority rule (governance DENY > scanner WARN > ALLOW). Use when reviewing a proposed code change, script, or environment manipulation for safety."
 kind: meta
 meta_priority: 75

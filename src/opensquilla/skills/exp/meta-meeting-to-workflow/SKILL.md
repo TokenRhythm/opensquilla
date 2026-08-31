@@ -1,5 +1,8 @@
 ---
 name: meta-meeting-to-workflow
+visibility: experimental
+invocation: experimental_internal
+disable-model-invocation: true
 description: "Use this meta-skill instead of answering directly when the user has meeting notes, transcripts, recordings, or rough discussion notes and wants them converted into decisions, owners, follow-ups, tasks, issues, or shareable minutes through multi-skill orchestration."
 kind: meta
 meta_priority: 66

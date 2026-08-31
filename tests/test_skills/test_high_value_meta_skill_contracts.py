@@ -172,25 +172,23 @@ def _long_ten_shot_script() -> str:
     return script
 
 
-def test_high_value_meta_skill_descriptions_signal_orchestration_priority(
+def test_stable_meta_skill_descriptions_are_concise_and_routeable(
     tmp_path: Path,
 ) -> None:
     loader = _loader(tmp_path)
     names = {
         "meta-paper-write",
-        "meta-pdf-intelligence",
-        "meta-stack-trace-investigator",
-        "meta-travel-planner",
+        "meta-short-drama",
         "meta-skill-creator",
-        "meta-migration-assistant",
     }
 
     for name in names:
         spec = loader.get_by_name(name)
         assert spec is not None, name
         description = spec.description.lower()
-        assert "multi-skill orchestration" in description, name
-        assert "instead of answering directly" in description, name
+        assert description.startswith(("create ", "create or propose ")), name
+        assert "do not use" in description, name
+        assert len(description.split()) <= 50, name
 
 
 def test_paper_meta_skill_has_pre_compile_quality_gates(tmp_path: Path) -> None:
@@ -423,7 +421,7 @@ def test_pdf_intelligence_has_inline_fallback_and_final_synthesis(
 
 
 @pytest.mark.asyncio
-async def test_pdf_intelligence_matches_lived_chinese_pdf_request(
+async def test_retired_pdf_intelligence_does_not_auto_route(
     tmp_path: Path,
 ) -> None:
     loader = _loader(tmp_path)
@@ -445,9 +443,9 @@ async def test_pdf_intelligence_matches_lived_chinese_pdf_request(
 
     out = await meta_resolution(ctx)  # type: ignore[arg-type]
 
-    assert out.metadata["meta_match"].plan.name == "meta-pdf-intelligence"
-    assert out.metadata["meta_match_trigger"].lower() == "看一下这个 pdf"
-    assert 'call `meta_invoke(name="meta-pdf-intelligence")`' in out.system_prompt[1]
+    assert "meta_match" not in out.metadata
+    assert "meta_match_trigger" not in out.metadata
+    assert "meta-pdf-intelligence" not in out.system_prompt[1]
 
 
 def test_stack_trace_investigator_supports_language_routing_and_degraded_output(

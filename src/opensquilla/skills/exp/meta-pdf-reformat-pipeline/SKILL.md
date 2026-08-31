@@ -1,5 +1,8 @@
 ---
 name: meta-pdf-reformat-pipeline
+visibility: experimental
+invocation: experimental_internal
+disable-model-invocation: true
 description: "Modernize a legacy PDF: structural extraction → natural-language rewrite of problem pages → audit summary → re-merge into the final PDF."
 kind: meta
 meta_priority: 45

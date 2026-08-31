@@ -16,8 +16,6 @@ Behaviour (post-hard-takeover-removal)
   forced to choose ``meta_invoke``. This keeps execution observable through
   the normal tool path while preventing routed models from bypassing the
   meta DAG with ordinary tools after a deterministic trigger match.
-* Semantic-only matches remain advisory: they inject the hint and leave tool
-  choice automatic so retrieval false positives do not hard-start a DAG.
 * Any parse error on a meta-skill is logged and skipped — the rest of the
   turn falls back to normal handling (fail-open).
 """
@@ -35,6 +33,7 @@ from typing import Any
 import structlog
 
 from opensquilla.engine.pipeline import TurnContext
+from opensquilla.skills.catalog_policy import is_invokable_meta
 from opensquilla.skills.meta.clarify_autofill import (
     autofill_required_clarify_fields,
     is_empty_clarify_submission,
@@ -47,8 +46,6 @@ from opensquilla.skills.meta.inputs import (
 )
 from opensquilla.skills.meta.parser import MetaPlanError, parse_meta_plan
 from opensquilla.skills.meta.types import MetaMatch
-from opensquilla.skills.retrieval import HybridRetriever
-from opensquilla.skills.types import SkillSpec
 
 log = structlog.get_logger(__name__)
 
@@ -81,8 +78,16 @@ log = structlog.get_logger(__name__)
 _STICKY_TTL_SECONDS = 1800.0
 _STICKY_MAX_USES = 3
 _STICKY_CANCEL_KEYWORDS = (
-    "取消", "算了", "别写了", "不写了", "停止",
-    "cancel", "stop", "nevermind", "never mind", "forget it",
+    "取消",
+    "算了",
+    "别写了",
+    "不写了",
+    "停止",
+    "cancel",
+    "stop",
+    "nevermind",
+    "never mind",
+    "forget it",
 )
 _sticky_lock = threading.Lock()
 _meta_sticky_cache: dict[str, dict[str, Any]] = {}
@@ -208,6 +213,7 @@ def _chat_pending_fields(schema, awaiting):
     has not been prompted for yet.
     """
     import json as _json
+
     try:
         filled = _json.loads(awaiting.awaiting_filled_json or "{}")
     except Exception:  # noqa: BLE001
@@ -234,10 +240,7 @@ def _clip_context_value(value: Any, *, max_chars: int = 2000) -> Any:
             return value
         return value[:max_chars] + "...[truncated]"
     if isinstance(value, dict):
-        return {
-            str(k): _clip_context_value(v, max_chars=max_chars)
-            for k, v in value.items()
-        }
+        return {str(k): _clip_context_value(v, max_chars=max_chars) for k, v in value.items()}
     if isinstance(value, list):
         return [_clip_context_value(v, max_chars=max_chars) for v in value[:20]]
     if isinstance(value, (int, float, bool)) or value is None:
@@ -246,7 +249,9 @@ def _clip_context_value(value: Any, *, max_chars: int = 2000) -> Any:
 
 
 def _clarify_extract_context(
-    awaiting, active_fields, ctx: TurnContext | None = None,
+    awaiting,
+    active_fields,
+    ctx: TurnContext | None = None,
 ) -> dict[str, Any]:
     """Build bounded prior context for nl_extract reference resolution.
 
@@ -377,7 +382,7 @@ def _conversation_history_from_router_metadata(
     # Take the last (3 - 1) = 2 user turns so the assembled list
     # interleave doesn't exceed the 3-turn slice when an assistant
     # reply is also present.
-    tail = list(user_texts)[-(_CONVERSATION_HISTORY_TURNS - 1):]
+    tail = list(user_texts)[-(_CONVERSATION_HISTORY_TURNS - 1) :]
     history: list[Mapping[str, Any]] = []
     for text in tail:
         if isinstance(text, str) and text.strip():
@@ -677,55 +682,6 @@ def _first_matching_trigger(triggers: list[str], message_lower: str) -> str:
     return ""  # unreachable when caller already verified ``any(...)``
 
 
-_SEMANTIC_WORKFLOW_CUES = (
-    "pdf",
-    "document",
-    "doc",
-    "report",
-    "research",
-    "summarize",
-    "summary",
-    "analyze",
-    "analysis",
-    "review",
-    "migration",
-    "migrate",
-    "upgrade",
-    "travel",
-    "trip",
-    "itinerary",
-    "skill",
-    "workflow",
-    "文件",
-    "文档",
-    "报告",
-    "调研",
-    "研究",
-    "总结",
-    "分析",
-    "看看",
-    "看一下",
-    "读一下",
-    "迁移",
-    "升级",
-    "旅行",
-    "行程",
-    "技能",
-    "流程",
-)
-
-
-def _has_semantic_workflow_cue(query: str) -> bool:
-    """Keep semantic fallback from turning every utterance into a meta hint."""
-
-    text = query.lower().strip()
-    if not text:
-        return False
-    if re.search(r"\.(pdf|docx?|md|txt|csv|json)\b", text):
-        return True
-    return any(cue in text for cue in _SEMANTIC_WORKFLOW_CUES)
-
-
 _SKILL_MARKETPLACE_SUBJECT_CUES = (
     "skill",
     "skills",
@@ -761,49 +717,6 @@ def _is_skill_marketplace_intent(query: str) -> bool:
     return has_subject and has_action
 
 
-def _semantic_meta_candidate(
-    ctx: TurnContext,
-    candidates: list[tuple[int, str, object, SkillSpec]],
-) -> tuple[int, str, object, str] | None:
-    """Return the best meta-skill candidate from retrieval, if any.
-
-    Trigger matching is the high-precision path. This fallback keeps the
-    product behavior soft: retrieval only chooses which meta-skill to hint;
-    the outer LLM still decides whether invoking the DAG fits the user intent.
-    """
-
-    if not candidates:
-        return None
-    query = (
-        getattr(ctx, "semantic_message", None)
-        or getattr(ctx, "raw_message", None)
-        or getattr(ctx, "message", "")
-        or ""
-    )
-    if not str(query).strip():
-        return None
-    query = _trigger_match_text(str(query))
-    if not str(query).strip():
-        return None
-    if not _has_semantic_workflow_cue(str(query)):
-        return None
-
-    retriever = HybridRetriever(strategy="hybrid")
-    specs = [spec for _priority, _name, _plan, spec in candidates]
-    try:
-        ranked = retriever.retrieve(specs, str(query), top_k=1)
-    except Exception as exc:  # noqa: BLE001 - fail open; triggers still work.
-        log.warning("meta_resolution.semantic_match_failed", error=str(exc))
-        return None
-    if not ranked:
-        return None
-    chosen_name = getattr(ranked[0], "name", "")
-    for priority, name, plan, _spec in candidates:
-        if name == chosen_name:
-            return (priority, name, plan, "semantic")
-    return None
-
-
 def _build_hint(
     skill_name: str,
     trigger_phrase: str,
@@ -825,50 +738,25 @@ def _build_hint(
     of the candidates fits (D4) — the substring matcher is not the
     final arbiter of intent.
     """
-    mode = "hint" if activation_mode == "hint" else "recommend"
-    if mode == "hint":
-        lead = (
-            f"The user message is semantically similar to the meta-skill "
-            f"`{skill_name}`. Treat this as a candidate, not a command."
-        )
-        action = (
-            f"First decide whether the user is asking for the end-to-end "
-            f"meta-skill deliverable. If yes, call "
-            f"`meta_invoke(name=\"{skill_name}\")` as the first action; the "
-            f"framework will drive the DAG and the deliverable becomes the "
-            f"assistant reply. Do not emit explanatory text before calling "
-            f"`meta_invoke`. Do not answer directly in that case. Do not call "
-            f"ordinary tools before `meta_invoke`; the meta-skill will call "
-            f"its own sub-skills internally. If a direct answer is more "
-            f"appropriate because the user is only asking a quick question or "
-            f"asking about the meta-skill itself, ignore this candidate and "
-            f"answer normally."
-        )
-    else:
-        if trigger_phrase == "semantic":
-            evidence = (
-                f"The previous turn selected `{skill_name}` by semantic "
-                "similarity and this turn is a sticky continuation."
-            )
-        else:
-            evidence = (
-                f'The user message contains the phrase "{trigger_phrase}", '
-                f"which is a registered trigger for the meta-skill `{skill_name}`."
-            )
-        lead = evidence
-        action = (
-            f"For a concrete deliverable request that matches this meta-skill, "
-            f"call `meta_invoke(name=\"{skill_name}\")` as the next action. "
-            f"Concrete deliverable "
-            f"requests include asking for an audit, review, decision brief, "
-            f"plan, comparison, extraction, report, rollback plan, or other "
-            f"multi-step work product. Do not emit explanatory text before "
-            f"calling `meta_invoke`. Do not answer directly or call ordinary "
-            f"tools such as web/search/http/file tools before `meta_invoke` "
-            f"in that case; the meta-skill DAG will call any required "
-            f"sub-skills internally and its deliverable becomes the assistant "
-            f"reply."
-        )
+    mode = "recommend"
+    evidence = (
+        f'The user message contains the phrase "{trigger_phrase}", '
+        f"which is a registered trigger for the meta-skill `{skill_name}`."
+    )
+    lead = evidence
+    action = (
+        f"For a concrete deliverable request that matches this meta-skill, "
+        f'call `meta_invoke(name="{skill_name}")` as the next action. '
+        f"Concrete deliverable "
+        f"requests include asking for an audit, review, decision brief, "
+        f"plan, comparison, extraction, report, rollback plan, or other "
+        f"multi-step work product. Do not emit explanatory text before "
+        f"calling `meta_invoke`. Do not answer directly or call ordinary "
+        f"tools such as web/search/http/file tools before `meta_invoke` "
+        f"in that case; the meta-skill DAG will call any required "
+        f"sub-skills internally and its deliverable becomes the assistant "
+        f"reply."
+    )
     lines = [
         "\n\n## Meta-skill activation guidance",
         f"Activation mode: {mode}",
@@ -880,15 +768,13 @@ def _build_hint(
     ]
     if candidates and len(candidates) > 1:
         lines.append("")
-        lines.append(
-            "Other candidates also matched (in priority order, winner first):"
-        )
+        lines.append("Other candidates also matched (in priority order, winner first):")
         for prio, name, phrase in candidates:
             marker = " ← chosen" if name == skill_name else ""
             lines.append(f"  • `{name}` (priority {prio}, trigger {phrase!r}){marker}")
         lines.append(
             "If one of the runner-ups fits the user's intent better, call "
-            "`meta_invoke(name=\"<runner-up name>\")` instead of the chosen one."
+            '`meta_invoke(name="<runner-up name>")` instead of the chosen one.'
         )
     lines.append("")
     lines.append(
@@ -920,7 +806,8 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
     if writer is not None and session_id:
         try:
             awaiting = await asyncio.to_thread(
-                writer.peek_awaiting, session_id=session_id,
+                writer.peek_awaiting,
+                session_id=session_id,
             )
         except Exception as exc:  # noqa: BLE001 — fail-open
             log.warning("meta_resolution.peek_awaiting_failed", error=str(exc))
@@ -939,7 +826,8 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
 
             if now - awaiting.awaiting_since > schema.timeout_hours * 3600:
                 await asyncio.to_thread(
-                    writer.mark_expired, run_id=awaiting.run_id,
+                    writer.mark_expired,
+                    run_id=awaiting.run_id,
                 )
                 ctx.metadata["meta_clarify_expired"] = awaiting
                 return ctx
@@ -1037,9 +925,7 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
                                     reason="user_cancel_nl",
                                 )
                                 ctx.metadata["meta_clarify_cancelled"] = awaiting
-                                ctx.metadata["meta_clarify_cancel_reason"] = (
-                                    "user_cancel_nl"
-                                )
+                                ctx.metadata["meta_clarify_cancel_reason"] = "user_cancel_nl"
                                 return ctx
 
                             # Always merge any new fields into the
@@ -1076,7 +962,8 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
                                 )
 
                             missing_required = [
-                                f.name for f in schema.fields
+                                f.name
+                                for f in schema.fields
                                 if f.required and f.name not in cumulative
                             ]
 
@@ -1118,9 +1005,7 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
                                 # workflow moves forward on its own.
                                 parsed, errors = cumulative, []
             if not parsed and (
-                not schema.nl_extract
-                or not nl_attempted
-                or is_structured_clarify_form
+                not schema.nl_extract or not nl_attempted or is_structured_clarify_form
             ):
                 # Bug-X + Bug-Y mirror for the deterministic path: the
                 # parser's ``_check_required`` only sees this turn's
@@ -1136,15 +1021,15 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
                 effective_schema = schema
                 if previously_filled:
                     from dataclasses import replace
+
                     relaxed_fields = tuple(
-                        replace(f, required=False)
-                        if f.name in previously_filled
-                        else f
+                        replace(f, required=False) if f.name in previously_filled else f
                         for f in schema.fields
                     )
                     effective_schema = replace(schema, fields=relaxed_fields)
                 parsed, errors = parse_clarify_reply(
-                    reply_text, effective_schema,
+                    reply_text,
+                    effective_schema,
                     surface=getattr(ctx, "surface_kind", "unknown"),
                 )
                 if not errors and parsed and previously_filled:
@@ -1164,9 +1049,8 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
                 if not partial_errors and partial:
                     parsed = {**previously_filled, **partial}
             candidate_fields = {**previously_filled, **parsed}
-            infer_optional_fields = (
-                is_structured_clarify_form
-                and is_empty_clarify_submission(candidate_fields)
+            infer_optional_fields = is_structured_clarify_form and is_empty_clarify_submission(
+                candidate_fields
             )
             if infer_optional_fields or _clarify_errors_allow_autofill(errors):
                 try:
@@ -1198,9 +1082,7 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
                 parsed = filled_auto
                 if not missing_after_autofill:
                     errors = []
-                ctx.metadata["meta_clarify_autofilled_fields"] = sorted(
-                    completed_auto.keys()
-                )
+                ctx.metadata["meta_clarify_autofilled_fields"] = sorted(completed_auto.keys())
             elif infer_optional_fields and not missing_after_autofill:
                 parsed = filled_auto
                 errors = []
@@ -1216,9 +1098,7 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
                         reason="parse_failure_limit",
                     )
                     ctx.metadata["meta_clarify_cancelled"] = awaiting
-                    ctx.metadata["meta_clarify_cancel_reason"] = (
-                        "parse_failure_limit"
-                    )
+                    ctx.metadata["meta_clarify_cancel_reason"] = "parse_failure_limit"
                     return ctx
                 ctx.metadata["meta_clarify_errors"] = errors
                 ctx.metadata["meta_clarify_reprompt"] = awaiting
@@ -1242,7 +1122,7 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
 
     # Manual-only mode: automatic activation is disabled. Resume of an in-flight
     # run is handled by the awaiting branch above and still works; here we
-    # short-circuit BEFORE any fresh keyword/semantic matching, soft-hint
+    # short-circuit before fresh registered-trigger matching and soft hints
     # injection, model upgrade, or sticky-cache write, so meta-skills only run
     # via the explicit /meta command.
     from opensquilla.skills.meta.enabled import is_meta_auto_trigger_enabled
@@ -1264,7 +1144,7 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
             log.warning("meta_resolution.load_failed", error=str(exc))
             return ctx
 
-    # Use the normalized current user intent for semantic trigger work.
+    # Use the normalized current user intent for registered trigger matching.
     # Raw/page-dump material can still live in ``ctx.message`` on some direct
     # paths after input normalization, but meta triggers and templates should
     # see the same semantic text. Long pasted chat/page dumps are narrowed to
@@ -1289,9 +1169,8 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
         _sticky_drop(session_id)
 
     matched: list[tuple[int, str, object, str]] = []
-    semantic_candidates: list[tuple[int, str, object, SkillSpec]] = []
     for spec in all_skills:
-        if getattr(spec, "kind", "skill") != "meta":
+        if not is_invokable_meta(spec):
             continue
         if getattr(spec, "disable_model_invocation", False):
             continue
@@ -1307,10 +1186,7 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
             continue
         if plan is None:
             continue
-        semantic_candidates.append((plan.priority, plan.name, plan, spec))
-        if any(
-            isinstance(t, str) and t and _trigger_matches(t, message_lower) for t in triggers
-        ):
+        if any(isinstance(t, str) and t and _trigger_matches(t, message_lower) for t in triggers):
             trigger_phrase = _first_matching_trigger(triggers, message_lower)
             matched.append((plan.priority, plan.name, plan, trigger_phrase))
 
@@ -1331,11 +1207,7 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
         # stays on the toolbox and trigger-originated tool_choice stays forced.
         sticky = _sticky_get(session_id)
         if sticky is None:
-            semantic_match = _semantic_meta_candidate(ctx, semantic_candidates)
-            if semantic_match is None:
-                return ctx
-            matched.append(semantic_match)
-            ctx.metadata["meta_match_source"] = "semantic"
+            return ctx
         else:
             for spec in all_skills:
                 if (
@@ -1377,8 +1249,7 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
     # overlap and the substring matcher's pick may not be the user's
     # intent (D1 + D2).
     candidate_digest: list[tuple[int, str, str]] = [
-        (int(prio), str(name), str(phrase))
-        for prio, name, _plan, phrase in matched
+        (int(prio), str(name), str(phrase)) for prio, name, _plan, phrase in matched
     ]
 
     match = MetaMatch(
@@ -1392,7 +1263,7 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
     ctx.metadata["meta_match"] = match
     ctx.metadata["meta_match_trigger"] = chosen_trigger
     ctx.metadata["meta_match_candidates"] = candidate_digest
-    activation_mode = "hint" if str(chosen_trigger) == "semantic" else "recommend"
+    activation_mode = "recommend"
     ctx.metadata["meta_activation_mode"] = activation_mode
     if sticky_replay:
         ctx.metadata["meta_match_sticky"] = True
@@ -1435,7 +1306,7 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
     # ── Soft-hint injection ────────────────────────────────────────────
     # Append to the uncached suffix slot of system_prompt so cache
     # breakpoints upstream stay stable across turns. Both str and tuple
-    # shapes are handled the same way as in skills_filter.py. Skipped
+    # shapes are handled the same way as in skill_catalog_projection.py. Skipped
     # silently when ctx has no system_prompt attribute (some unit tests
     # construct ctx as a bare SimpleNamespace).
     skill_name = getattr(chosen_plan, "name", "")

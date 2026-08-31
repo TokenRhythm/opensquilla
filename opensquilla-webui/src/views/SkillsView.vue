@@ -196,7 +196,7 @@
 </template>
 
 <script setup lang="ts">
-import { nextTick, onActivated, onDeactivated, onUnmounted, ref } from 'vue'
+import { inject, nextTick, onActivated, onDeactivated, onUnmounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ControlSwitch from '@/components/ControlSwitch.vue'
@@ -212,6 +212,10 @@ import { createSkillMutationGate } from '@/composables/skills/useSkillMutationGa
 import { useSkillRegistry } from '@/composables/skills/useSkillRegistry'
 import { skillLayerHelp, skillLayerLabel, useSkillsCatalog } from '@/composables/skills/useSkillsCatalog'
 import { useToasts } from '@/composables/useToasts'
+import {
+  META_SKILL_CATALOG_KEY,
+  unavailableMetaSkillCatalog,
+} from '@/modules/metaSkillCatalog'
 import { useRpcStore } from '@/stores/rpc'
 import type { Proposal, Skill } from '@/types/skills'
 
@@ -237,6 +241,7 @@ const { t } = useI18n()
 const skillsOverviewOpen = ref(false)
 const { pushToast } = useToasts()
 const rpc = useRpcStore()
+const metaSkillCatalog = inject(META_SKILL_CATALOG_KEY, unavailableMetaSkillCatalog)
 const addSkillOpen = ref(false)
 const reloading = ref(false)
 const selectedProposal = ref<Proposal | null>(null)
@@ -260,7 +265,7 @@ const {
   disableAutoEnabled,
 } = proposalsModel
 
-const catalog = useSkillsCatalog(rpc, {
+const catalog = useSkillsCatalog(rpc, metaSkillCatalog, {
   proposals,
   autoEnabledSkills,
   proposalsSettings,
@@ -356,7 +361,7 @@ const {
   uninstallSkill,
 } = registry
 
-const skillDetail = useSkillDetailController({ rpc, installDeps })
+const skillDetail = useSkillDetailController({ rpc, metaSkillCatalog, installDeps })
 const {
   selectedSkill,
   selectedSkillLoading,

@@ -10,10 +10,12 @@ from opensquilla.gateway.rpc.registry import RpcContext
 from opensquilla.gateway.rpc_meta_runs import _handle_meta_list
 from opensquilla.skills.meta.readiness import MetaSkillReadiness
 from opensquilla.skills.types import (
+    SkillInvocation,
     SkillLayer,
     SkillPlatformMeta,
     SkillRequires,
     SkillSpec,
+    SkillVisibility,
 )
 
 
@@ -33,6 +35,8 @@ def _make_spec(
         content="",
         kind=kind,
         disable_model_invocation=disable_model_invocation,
+        visibility=(SkillVisibility.META if kind == "meta" else SkillVisibility.PUBLIC),
+        invocation=(SkillInvocation.META_ONLY if kind == "meta" else SkillInvocation.DIRECT),
     )
 
 
@@ -65,38 +69,11 @@ def test_meta_list_returns_only_invokable_meta_skills() -> None:
     payload = asyncio.run(_handle_meta_list(None, ctx))
 
     assert "disabled" not in payload
-    assert payload["skills"] == [
-        {
-            "name": "alpha-meta",
-            "description": "Alpha meta-skill",
-            "ready": True,
-            "status": "ready",
-            "missing_bins": [],
-            "missing_env": [],
-            "missing_env_any": [],
-            "missing_skills": [],
-            "missing_capabilities": [],
-            "missing_provider_capabilities": [],
-            "reasons": [],
-            "setup_actions": [],
-            "manual_setup_actions": [],
-        },
-        {
-            "name": "beta-meta",
-            "description": "Beta meta-skill",
-            "ready": True,
-            "status": "ready",
-            "missing_bins": [],
-            "missing_env": [],
-            "missing_env_any": [],
-            "missing_skills": [],
-            "missing_capabilities": [],
-            "missing_provider_capabilities": [],
-            "reasons": [],
-            "setup_actions": [],
-            "manual_setup_actions": [],
-        },
-    ]
+    assert [row["name"] for row in payload["skills"]] == ["alpha-meta", "beta-meta"]
+    assert all(row["ready"] is True for row in payload["skills"])
+    assert all(row["visibility"] == "meta" for row in payload["skills"])
+    assert all(row["invocation"] == "meta_only" for row in payload["skills"])
+    assert all("content" not in row for row in payload["skills"])
 
 
 def test_meta_list_disabled_when_master_gate_off() -> None:

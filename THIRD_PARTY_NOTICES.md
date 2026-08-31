@@ -329,13 +329,8 @@ in a package-local provenance file.
 
 - Component: SKILL.md frontmatter and instruction text for these bundled skills:
   - `sub-agent`
-- `cron`
   - `github`
-  - `nano-pdf`
   - `skill-creator`
-  - `summarize`
-  - `tmux`
-  - `weather`
 - Upstream project: https://github.com/openclaw/openclaw
 - License: MIT
 - Copyright notice: Copyright (c) 2025 Peter Steinberger
@@ -378,72 +373,41 @@ SOFTWARE.
 These bundled skill descriptors are authored and maintained by OpenSquilla and
 are released under OpenSquilla's repository license (Apache-2.0; see `LICENSE`):
 
-- `cron`
 - `code-task`
 - `AwesomeWebpageMetaSkill`
 - `awesome-webpage-image-download`
 - `awesome-webpage-research`
 - `deep-research`
 - `docx`
-- `git-diff`
 - `github`
 - `history-explorer`
-- `html-to-pdf`
-- `http-fetch`
-- `latex-compile`
-- `memory`
 - `meta-kid-project-planner`
 - `meta-paper-write`
 - `meta-short-drama`
 - `meta-skill-creator`
 - `multi-search-engine`
-- `nano-pdf`
 - `openrouter-video-generator`
-- `paper-abstract-author`
 - `paper-artifact-runtime`
 - `paper-citation-integrity-gate`
-- `paper-citation-planner`
 - `paper-delivery-summary`
-- `paper-experiment-stub`
 - `paper-latex-sanitizer`
 - `paper-length-gate`
-- `paper-outline-author`
-- `paper-plot-stub`
-- `paper-preference-planner`
 - `paper-quality-gate`
 - `paper-refbib-stub`
-- `paper-revision-author`
 - `paper-section-author`
 - `paper-source-readiness-gate`
-- `paper-source-curator`
 - `pdf-toolkit`
 - `pptx`
 - `skill-creator`
-- `skill-creator-linter`
-- `skill-creator-proposals`
-- `skill-creator-smoke-test`
 - `short-drama-delivery-audit`
 - `short-drama-review-normalizer`
-- `stack-trace-generic-probe`
-- `stack-trace-go-probe`
-- `stack-trace-js-probe`
-- `stack-trace-python-probe`
-- `stack-trace-rust-probe`
 - `sub-agent`
 - `srt-from-script`
 - `subtitle-burner`
-- `summarize`
 - `text-file-read`
 - `title-card-image`
-- `tmux`
 - `video-still-animator`
-- `weather`
 - `xlsx`
-- `advanced-dubbing-studio`
-- `music-and-singing-studio`
-- `voice-clone-lab`
-- `voice-conversion-studio`
-- `voiceover-studio`
 
 ## tokenjuice adapted reduction rules
 
@@ -527,7 +491,6 @@ SOFTWARE.
   - `deep-research`
   - `docx`
   - `html-coder`
-  - `html-to-pdf`
   - `multi-search-engine`
   - `nano-banana-pro`
   - `nano-banana-pro-openrouter`

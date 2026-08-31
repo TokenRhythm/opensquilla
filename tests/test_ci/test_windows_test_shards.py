@@ -252,7 +252,6 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_tools/test_run_mode_full_host_fallback.py",
     "tests/test_tools/test_workspace_write_deny_effects.py",
     "tests/test_engine/test_goal_context_prompt.py",
-    "tests/test_engine/test_goal_routing_hint.py",
     "tests/test_gateway/test_goal_rpc.py",
     "tests/test_migrations/test_v033_goal_runs.py",
     "tests/test_migrations/test_v034_goal_message_anchor.py",

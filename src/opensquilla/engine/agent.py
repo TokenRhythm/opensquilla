@@ -364,10 +364,7 @@ def _normalize_uncommitted_candidate_outcome(
 
     state = getattr(controller, "state", None)
     state_status = str(getattr(state, "status", "") or "")
-    if (
-        state_status not in _OPEN_CANDIDATE_STATUSES
-        or not getattr(state, "candidate_sha256", None)
-    ):
+    if state_status not in _OPEN_CANDIDATE_STATUSES or not getattr(state, "candidate_sha256", None):
         return None if outcome is None else dict(outcome)
     current = str((outcome or {}).get("status", "") or "")
     if current in _TERMINAL_CANDIDATE_OUTCOME_STATUSES:
@@ -426,6 +423,7 @@ def _resolve_turn_objective_reminder() -> tuple[bool, int]:
         + ", or trim:<positive integer>"
     )
 
+
 _PROVIDER_OUTPUT_TRUNCATED_REPLY = build_terminal_reply(
     {
         "status": "failed",
@@ -469,22 +467,14 @@ def _plan_run_steps_ready_for_delivery(run: Any) -> bool:
     if not steps:
         return False
     statuses = [
-        str(
-            step.get("status")
-            if isinstance(step, Mapping)
-            else getattr(step, "status", "")
-        )
+        str(step.get("status") if isinstance(step, Mapping) else getattr(step, "status", ""))
         for step in steps
     ]
     return all(status in {"completed", "skipped"} for status in statuses)
 
 
 def _plan_run_checkpoint_enters_delivery_phase(result: ToolResult | None) -> bool:
-    if (
-        result is None
-        or result.tool_name != "plan_run_checkpoint"
-        or result.is_error
-    ):
+    if result is None or result.tool_name != "plan_run_checkpoint" or result.is_error:
         return False
     try:
         payload = json.loads(result.content)
@@ -768,9 +758,7 @@ def _progress_watchdog_guidance_message(reason: str, details: Mapping[str, Any])
 
     count = details.get("count")
     count_text = f" Count: {count}." if isinstance(count, int) and count > 0 else ""
-    workspace_change_likely_required = bool(
-        details.get("workspace_change_likely_required")
-    )
+    workspace_change_likely_required = bool(details.get("workspace_change_likely_required"))
     failure_summary = str(details.get("failure_anchor_summary") or "").strip()
     if len(failure_summary) > 700:
         failure_summary = failure_summary[:697].rstrip() + "..."
@@ -870,9 +858,7 @@ def _cost_source_for_usage(
     return "unavailable"
 
 
-_ESTIMATE_COST_SOURCES = frozenset(
-    {"opensquilla_estimate", "opensquilla_static_estimate"}
-)
+_ESTIMATE_COST_SOURCES = frozenset({"opensquilla_estimate", "opensquilla_static_estimate"})
 
 
 def _cost_component_flags(
@@ -895,12 +881,7 @@ def _cost_component_flags(
     )
     estimated = source in _ESTIMATE_COST_SOURCES or cost_usd > billed_cost + 1e-12
     missing = max(0, int(missing_cost_entries or 0))
-    if (
-        infer_missing
-        and source == "unavailable"
-        and estimate_basis != "free"
-        and missing == 0
-    ):
+    if infer_missing and source == "unavailable" and estimate_basis != "free" and missing == 0:
         missing = 1
     return billed, estimated, missing
 
@@ -926,9 +907,7 @@ def _classify_cost_components(
         return "provider_billed"
     if has_estimate:
         return (
-            estimate_source
-            if estimate_source in _ESTIMATE_COST_SOURCES
-            else "opensquilla_estimate"
+            estimate_source if estimate_source in _ESTIMATE_COST_SOURCES else "opensquilla_estimate"
         )
     return "unavailable"
 
@@ -1060,12 +1039,8 @@ def _add_subagent_usage_to_tracker(
             )
             tracker.add(
                 session_key,
-                input_tokens=_usage_int(
-                    row.get("input_tokens", row.get("inputTokens", 0))
-                ),
-                output_tokens=_usage_int(
-                    row.get("output_tokens", row.get("outputTokens", 0))
-                ),
+                input_tokens=_usage_int(row.get("input_tokens", row.get("inputTokens", 0))),
+                output_tokens=_usage_int(row.get("output_tokens", row.get("outputTokens", 0))),
                 model_id=str(row.get("model") or usage.model or ""),
                 cache_read_tokens=_usage_int(cache_read or 0),
                 cache_write_tokens=_usage_int(
@@ -1082,9 +1057,7 @@ def _add_subagent_usage_to_tracker(
                 ),
                 provider=str(row.get("provider") or usage.provider or ""),
                 cost_source=str(
-                    row.get("cost_source")
-                    or row.get("costSource")
-                    or usage.cost_source
+                    row.get("cost_source") or row.get("costSource") or usage.cost_source
                 ),
             )
     current_session_usage = tracker.get(session_key)
@@ -1122,9 +1095,7 @@ def _with_model_usage_cost_fields(rows: list[dict[str, Any]]) -> list[dict[str, 
                     model_id=model_id,
                     provider=str(item.get("provider") or ""),
                     input_tokens=_usage_int(item.get("input_tokens") or item.get("inputTokens")),
-                    output_tokens=_usage_int(
-                        item.get("output_tokens") or item.get("outputTokens")
-                    ),
+                    output_tokens=_usage_int(item.get("output_tokens") or item.get("outputTokens")),
                     billed_cost=_usage_float(
                         item.get("billed_cost")
                         or item.get("billedCost")
@@ -1139,9 +1110,9 @@ def _with_model_usage_cost_fields(rows: list[dict[str, Any]]) -> list[dict[str, 
                     cache_write_tokens=_usage_int(item.get("cache_write_tokens") or 0),
                     has_billed_receipt=(
                         True
-                        if str(
-                            item.get("cost_source") or item.get("costSource") or ""
-                        ).strip().lower()
+                        if str(item.get("cost_source") or item.get("costSource") or "")
+                        .strip()
+                        .lower()
                         in {"provider_billed", "openrouter_usage"}
                         else None
                     ),
@@ -1210,9 +1181,7 @@ def _summarize_model_usage_breakdown(rows: list[dict[str, Any]]) -> list[dict[st
         target["request_count"] += max(1, _usage_int(row.get("request_count") or 1))
         components_by_key[key].append(
             _cost_component_flags(
-                cost_source=str(
-                    row.get("cost_source") or row.get("costSource") or "none"
-                ),
+                cost_source=str(row.get("cost_source") or row.get("costSource") or "none"),
                 cost_usd=_usage_float(row.get("cost_usd") or row.get("costUsd")),
                 billed_cost=_usage_float(
                     row.get("billed_cost")
@@ -1222,12 +1191,7 @@ def _summarize_model_usage_breakdown(rows: list[dict[str, Any]]) -> list[dict[st
                 ),
                 missing_cost_entries=row_missing_cost_entries,
                 estimate_basis=(
-                    str(
-                        row.get("estimate_basis")
-                        or row.get("estimateBasis")
-                        or ""
-                    )
-                    or None
+                    str(row.get("estimate_basis") or row.get("estimateBasis") or "") or None
                 ),
             )
         )
@@ -1391,11 +1355,12 @@ def _projection_signal_pattern() -> re.Pattern[str]:
         compiled = re.compile(raw)
     except re.error as exc:
         raise ValueError(
-            f"{_PROJECTION_SIGNAL_PATTERNS_ENV} must be a valid regular "
-            f"expression: {exc}"
+            f"{_PROJECTION_SIGNAL_PATTERNS_ENV} must be a valid regular expression: {exc}"
         ) from exc
     _PROJECTION_SIGNAL_PATTERN_CACHE[raw] = compiled
     return compiled
+
+
 _PROVIDER_CONTEXT_REPAIR_PROMPT = (
     "A previous tool call was rejected because it reused provider-only compacted "
     "tool arguments. Regenerate the complete tool arguments from the available "
@@ -1431,9 +1396,7 @@ _MID_BUDGET_NO_DIFF_NUDGE_TEMPLATE = (
     "file and make the smallest reasonable edit now, then refine it with the "
     "remaining time instead of leaving the whole budget to analysis."
 )
-_MID_BUDGET_NO_DIFF_NUDGE_PREFIX = _MID_BUDGET_NO_DIFF_NUDGE_TEMPLATE.split(
-    "{percent}", 1
-)[0]
+_MID_BUDGET_NO_DIFF_NUDGE_PREFIX = _MID_BUDGET_NO_DIFF_NUDGE_TEMPLATE.split("{percent}", 1)[0]
 _REASONING_ONLY_ACT_NOW_DIRECTIVE = (
     "Your previous response was internal reasoning only, so nothing was "
     "delivered or executed. Act now: issue the tool call that carries out "
@@ -1796,6 +1759,7 @@ async def _review_pending_elevation_if_configured(
         return None
 
     from opensquilla.gateway.approval_queue import get_approval_queue
+
     queue = get_approval_queue()
     try:
         entry = queue.get(approval_id)
@@ -1823,9 +1787,7 @@ async def _review_pending_elevation_if_configured(
                 "humanActionable": True,
                 "reviewStatus": "human_confirmation_required",
                 "reviewSource": "standard_mode_policy",
-                "reviewRationale": (
-                    "Standard mode requires explicit user approval for elevation."
-                ),
+                "reviewRationale": ("Standard mode requires explicit user approval for elevation."),
             }
         )
         try:
@@ -1852,9 +1814,7 @@ async def _review_pending_elevation_if_configured(
             "fingerprint": fingerprint,
             "humanActionable": False,
             "reviewer": "deterministic_rules",
-            "action": (
-                suspended_action.audit_payload() if suspended_action is not None else None
-            ),
+            "action": (suspended_action.audit_payload() if suspended_action is not None else None),
         },
     )
 
@@ -2046,9 +2006,7 @@ async def _review_pending_elevation_if_configured(
         outcome=assessment.outcome,
         source=review_source,
         status=(
-            "human_confirmation_required"
-            if requires_human_confirmation
-            else assessment.status
+            "human_confirmation_required" if requires_human_confirmation else assessment.status
         ),
     )
     return None if requires_human_confirmation else assessment
@@ -2101,9 +2059,7 @@ def _artifact_event_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
     kwargs = {key: value for key, value in normalized.items() if key in allowed}
     # artifact_payload exposes the public thumbnail_url; carry the boolean signal onto
     # the event dataclass so downstream serializers can rebuild the variant URL.
-    kwargs["has_thumbnail"] = bool(
-        payload.get("has_thumbnail") or normalized.get("thumbnail_url")
-    )
+    kwargs["has_thumbnail"] = bool(payload.get("has_thumbnail") or normalized.get("thumbnail_url"))
     return kwargs
 
 
@@ -2196,10 +2152,9 @@ def _is_runtime_nudge_message(message: Message) -> bool:
 
     if message.role != "user" or not isinstance(message.content, str):
         return False
-    return (
-        message.content.startswith(_MID_BUDGET_NO_DIFF_NUDGE_PREFIX)
-        or message.content.startswith(_ENDGAME_FIX_DIRECTIVE_PREFIX)
-    )
+    return message.content.startswith(
+        _MID_BUDGET_NO_DIFF_NUDGE_PREFIX
+    ) or message.content.startswith(_ENDGAME_FIX_DIRECTIVE_PREFIX)
 
 
 def _tail_has_tool_result_ignoring_nudges(messages: list[Message]) -> bool:
@@ -2423,9 +2378,7 @@ def _safe_provider_terminal_message(
         ProviderFailureKind.POLICY_REFUSAL: (
             "The model provider refused this request under its policy."
         ),
-        ProviderFailureKind.EMPTY_RESPONSE: (
-            "The model provider returned an empty response."
-        ),
+        ProviderFailureKind.EMPTY_RESPONSE: ("The model provider returned an empty response."),
         ProviderFailureKind.MALFORMED_RESPONSE: (
             "The model provider returned an invalid response."
         ),
@@ -2627,9 +2580,7 @@ class _MessageCountRequestView:
         materialized = self.materialize(canonical_before)
         if removed_count > len(materialized):
             raise ValueError("canonical cleanup exceeds the request view")
-        rebased_messages = (
-            materialized[:-removed_count] if removed_count else materialized
-        )
+        rebased_messages = materialized[:-removed_count] if removed_count else materialized
         return _MessageCountRequestView(
             messages=rebased_messages,
             canonical_tail_start=len(canonical_after),
@@ -2719,12 +2670,8 @@ def _chat_config_with_thinking_disabled(chat_cfg: ChatConfig) -> ChatConfig:
         model_vision_support=chat_cfg.model_vision_support,
         thinking_level=ThinkingLevel.OFF,
         provider_request_max_chars=chat_cfg.provider_request_max_chars,
-        context_window_tokens_global_override=(
-            chat_cfg.context_window_tokens_global_override
-        ),
-        provider_request_max_chars_explicit_cap=(
-            chat_cfg.provider_request_max_chars_explicit_cap
-        ),
+        context_window_tokens_global_override=(chat_cfg.context_window_tokens_global_override),
+        provider_request_max_chars_explicit_cap=(chat_cfg.provider_request_max_chars_explicit_cap),
         tool_choice=chat_cfg.tool_choice,
     )
 
@@ -2974,10 +2921,8 @@ class Agent:
                 ),
             )
         if tool_context is not None and (
-            tool_context.source_diff_preservation_mode
-            != self.config.source_diff_preservation_mode
-            or tool_context.source_diff_candidate_mode
-            != self.config.source_diff_candidate_mode
+            tool_context.source_diff_preservation_mode != self.config.source_diff_preservation_mode
+            or tool_context.source_diff_candidate_mode != self.config.source_diff_candidate_mode
         ):
             tool_context = replace(
                 tool_context,
@@ -2987,8 +2932,7 @@ class Agent:
         if tool_context is not None:
             tool_context = self._apply_configured_tool_result_budget(tool_context)
             tool_context.tool_result_retrieval_available = bool(
-                tool_context.tool_result_store_dir
-                and self._tool_result_recovery_available()
+                tool_context.tool_result_store_dir and self._tool_result_recovery_available()
             )
             tool_context.validate_path_roots()
         self._tool_context: ToolContext | None = tool_context
@@ -3052,9 +2996,7 @@ class Agent:
         self._durable_consumer_model_id = self.config.model_id
         self._durable_consumer_window_tokens = self.config.context_window_tokens
         self._durable_consumer_max_output_tokens = self.config.max_tokens
-        self._durable_consumer_model_capabilities = (
-            self.config.model_capabilities
-        )
+        self._durable_consumer_model_capabilities = self.config.model_capabilities
         self._durable_consumer_provider_request_max_chars = (
             self.config.provider_request_proof_max_chars
         )
@@ -3221,9 +3163,7 @@ class Agent:
             return
         self._pending_durable_compaction_event = CompactionEvent(
             compaction_id=outcome.compaction_id,
-            compaction_deadline_at_monotonic=(
-                outcome.compaction_deadline_at_monotonic
-            ),
+            compaction_deadline_at_monotonic=(outcome.compaction_deadline_at_monotonic),
             compaction_timeout_seconds=outcome.compaction_timeout_seconds,
             summary=outcome.summary,
             summary_payload=outcome.summary_payload,
@@ -3277,9 +3217,7 @@ class Agent:
         return parsed if parsed > 0 else None
 
     def _configured_tool_result_budget_policy(self) -> ToolResultBudgetPolicy | None:
-        single_limit = self._positive_int(
-            getattr(self.config, "tool_result_dispatch_max_chars", 0)
-        )
+        single_limit = self._positive_int(getattr(self.config, "tool_result_dispatch_max_chars", 0))
         turn_limit = self._positive_int(
             getattr(self.config, "tool_result_dispatch_turn_max_chars", 0)
         )
@@ -3312,10 +3250,7 @@ class Agent:
                 self._provider_request_correlation,
             ):
                 active = current_tool_context.get()
-                if (
-                    active is not None
-                    and getattr(active, "on_runtime_event", None) is not None
-                ):
+                if active is not None and getattr(active, "on_runtime_event", None) is not None:
                     return await tool_handler(tc)
                 token = current_tool_context.set(tool_context)
                 try:
@@ -3380,13 +3315,10 @@ class Agent:
         """Build the same baseline request config used by the physical turn."""
 
         resolved_capabilities = (
-            model_capabilities
-            if model_capabilities is not None
-            else self.config.model_capabilities
+            model_capabilities if model_capabilities is not None else self.config.model_capabilities
         )
-        if (
-            resolved_capabilities is not None
-            and not isinstance(resolved_capabilities, ModelCapabilities)
+        if resolved_capabilities is not None and not isinstance(
+            resolved_capabilities, ModelCapabilities
         ):
             # Catalog extensions and older test doubles may expose a
             # capability-shaped object rather than the concrete dataclass.
@@ -3406,19 +3338,14 @@ class Agent:
                     supports_streaming=bool(
                         getattr(resolved_capabilities, "supports_streaming", True)
                     ),
-                    supports_vision=bool(
-                        getattr(resolved_capabilities, "supports_vision", False)
-                    ),
+                    supports_vision=bool(getattr(resolved_capabilities, "supports_vision", False)),
                     reasoning_format=str(
-                        getattr(resolved_capabilities, "reasoning_format", "none")
-                        or "none"
+                        getattr(resolved_capabilities, "reasoning_format", "none") or "none"
                     ),
                 )
             except Exception:  # noqa: BLE001 - admission can omit unknown hints
                 resolved_capabilities = None
-        thinking_enabled, thinking_budget = self.config.resolve_thinking(
-            active_user_message
-        )
+        thinking_enabled, thinking_budget = self.config.resolve_thinking(active_user_message)
         output_tokens = max(
             1,
             int(max_output_tokens or self.config.max_tokens or 1),
@@ -3435,17 +3362,17 @@ class Agent:
         ):
             proof_budget = self._provider_request_proof_max_chars()
         else:
-            proof_budget = ContextBudgetGovernor.from_values(
-                context_window_tokens=max(1, int(context_window_tokens)),
-                max_output_tokens=output_tokens,
-                thinking_budget_tokens=(
-                    thinking_budget if thinking_enabled else 0
-                ),
-                context_overflow_threshold=(
-                    self.config.context_overflow_threshold
-                ),
-                provider_request_proof_max_chars=explicit_proof_budget,
-            ).snapshot().provider_request_max_chars
+            proof_budget = (
+                ContextBudgetGovernor.from_values(
+                    context_window_tokens=max(1, int(context_window_tokens)),
+                    max_output_tokens=output_tokens,
+                    thinking_budget_tokens=(thinking_budget if thinking_enabled else 0),
+                    context_overflow_threshold=(self.config.context_overflow_threshold),
+                    provider_request_proof_max_chars=explicit_proof_budget,
+                )
+                .snapshot()
+                .provider_request_max_chars
+            )
         return ChatConfig(
             max_tokens=output_tokens,
             temperature=self.config.temperature,
@@ -3464,14 +3391,10 @@ class Agent:
             cache_mode=self.config.cache_mode,
             output_json_schema=self.config.output_json_schema,
             output_json_schema_strict=self.config.output_json_schema_strict,
-            model_capabilities=(
-                resolved_capabilities
-            ),
+            model_capabilities=(resolved_capabilities),
             model_vision_support=self.config.model_vision_support,
             thinking_level=(
-                self.config.thinking
-                if isinstance(self.config.thinking, ThinkingLevel)
-                else None
+                self.config.thinking if isinstance(self.config.thinking, ThinkingLevel) else None
             ),
             provider_request_max_chars=proof_budget,
             context_window_tokens_global_override=(
@@ -3511,22 +3434,26 @@ class Agent:
             int(self._durable_consumer_provider_request_max_chars or 0),
         )
         if proof_budget <= 0:
-            proof_budget = ContextBudgetGovernor.from_values(
-                context_window_tokens=max(
-                    1,
-                    int(self._durable_consumer_window_tokens or 0),
-                ),
-                max_output_tokens=max_output_tokens,
-                thinking_budget_tokens=(
-                    max(
-                        0,
-                        int(active_config.thinking_budget_tokens or 0),
-                    )
-                    if active_config.thinking
-                    else 0
-                ),
-                context_overflow_threshold=self.config.context_overflow_threshold,
-            ).snapshot().provider_request_max_chars
+            proof_budget = (
+                ContextBudgetGovernor.from_values(
+                    context_window_tokens=max(
+                        1,
+                        int(self._durable_consumer_window_tokens or 0),
+                    ),
+                    max_output_tokens=max_output_tokens,
+                    thinking_budget_tokens=(
+                        max(
+                            0,
+                            int(active_config.thinking_budget_tokens or 0),
+                        )
+                        if active_config.thinking
+                        else 0
+                    ),
+                    context_overflow_threshold=self.config.context_overflow_threshold,
+                )
+                .snapshot()
+                .provider_request_max_chars
+            )
         stable_config = active_config.model_copy(
             update={
                 "max_tokens": max_output_tokens,
@@ -3561,8 +3488,7 @@ class Agent:
                     (
                         index
                         for index, entry in enumerate(entries)
-                        if str(entry.get("message_id") or "")
-                        == bound_user_message_id
+                        if str(entry.get("message_id") or "") == bound_user_message_id
                     ),
                     None,
                 )
@@ -3572,8 +3498,7 @@ class Agent:
                 skip_indexes = {
                     index
                     for index, entry in enumerate(entries)
-                    if index >= bound_index
-                    and str(entry.get("role") or "") == "user"
+                    if index >= bound_index and str(entry.get("role") or "") == "user"
                 }
             else:
                 for index in range(len(entries) - 1, -1, -1):
@@ -3599,9 +3524,7 @@ class Agent:
                 )
             )
 
-        thinking_enabled, _thinking_budget = self.config.resolve_thinking(
-            active_user_message
-        )
+        thinking_enabled, _thinking_budget = self.config.resolve_thinking(active_user_message)
         effective_capabilities = (
             consumer_model_capabilities
             if consumer_model_capabilities is not None
@@ -3645,9 +3568,7 @@ class Agent:
             history,
             preserve_images=preserve_historical_images,
         )
-        return repair_tool_pairing(
-            limit_turns(history, self.config.max_history_turns)
-        )
+        return repair_tool_pairing(limit_turns(history, self.config.max_history_turns))
 
     def _assemble_compaction_consumer_request(
         self,
@@ -3682,9 +3603,7 @@ class Agent:
         if attachment_messages:
             turn_messages.extend(attachment_messages)
         elif active_user_message:
-            turn_messages.append(
-                Message(role="user", content=active_user_message)
-            )
+            turn_messages.append(Message(role="user", content=active_user_message))
 
         summary_context = (
             format_compaction_summary_context([replay_summary])
@@ -3694,9 +3613,7 @@ class Agent:
         existing_context: str | None = self.config.request_context_prompt
         request_context: str | None
         if summary_context and existing_context and existing_context.strip():
-            request_context = (
-                f"{summary_context.strip()}\n\n{existing_context.strip()}"
-            )
+            request_context = f"{summary_context.strip()}\n\n{existing_context.strip()}"
         elif summary_context:
             request_context = summary_context.strip()
         else:
@@ -3751,9 +3668,7 @@ class Agent:
             context_window_tokens=context_window_tokens,
             max_output_tokens=max_output_tokens,
             model_capabilities=consumer_model_capabilities,
-            provider_request_proof_max_chars=(
-                consumer_provider_request_max_chars
-            ),
+            provider_request_proof_max_chars=(consumer_provider_request_max_chars),
         )
         active_user_index = _active_user_message_index_for_request(
             request_messages,
@@ -3806,9 +3721,7 @@ class Agent:
             max_output_tokens=max_output_tokens,
             consumer_model_id=consumer_model_id,
             consumer_model_capabilities=consumer_model_capabilities,
-            consumer_provider_request_max_chars=(
-                consumer_provider_request_max_chars
-            ),
+            consumer_provider_request_max_chars=(consumer_provider_request_max_chars),
         )
         metadata = provider_metadata(consumer_provider)
         fingerprint_payload = {
@@ -3816,9 +3729,7 @@ class Agent:
             "model": metadata.model,
             "consumer_model_id": consumer_model_id or metadata.model,
             "context_window_tokens": int(context_window_tokens),
-            "max_output_tokens": int(
-                max_output_tokens or self.config.max_tokens or 0
-            ),
+            "max_output_tokens": int(max_output_tokens or self.config.max_tokens or 0),
             "system_sha256": hashlib.sha256(
                 (self.config.system_prompt or "").encode("utf-8")
             ).hexdigest(),
@@ -3830,9 +3741,7 @@ class Agent:
                     separators=(",", ":"),
                 ).encode("utf-8")
             ).hexdigest(),
-            "active_user_sha256": hashlib.sha256(
-                active_user_message.encode("utf-8")
-            ).hexdigest(),
+            "active_user_sha256": hashlib.sha256(active_user_message.encode("utf-8")).hexdigest(),
             "attachments_sha256": hashlib.sha256(
                 json.dumps(
                     self._live_request_jsonable(attachment_messages or []),
@@ -3890,9 +3799,7 @@ class Agent:
                 max_output_tokens=max_output_tokens,
                 consumer_model_id=consumer_model_id,
                 consumer_model_capabilities=consumer_model_capabilities,
-                consumer_provider_request_max_chars=(
-                    consumer_provider_request_max_chars
-                ),
+                consumer_provider_request_max_chars=(consumer_provider_request_max_chars),
             )
             return bool(projection is not None and projection.fits)
 
@@ -3921,14 +3828,8 @@ class Agent:
         candidate and is therefore not double-counted here.
         """
 
-        effective_window = int(
-            context_window_tokens or self.config.context_window_tokens
-        )
-        exact_provider = (
-            consumer_provider
-            if consumer_provider is not None
-            else self.provider
-        )
+        effective_window = int(context_window_tokens or self.config.context_window_tokens)
+        exact_provider = consumer_provider if consumer_provider is not None else self.provider
         if exact_provider is not None and (attachment_messages or not attachments):
             projection = self._project_compaction_consumer_request(
                 consumer_provider=exact_provider,
@@ -3938,16 +3839,12 @@ class Agent:
                 active_user_in_history=False,
                 bound_user_message_id=None,
                 attachment_messages=attachment_messages,
-                runtime_context_message=(
-                    self._freeze_preflight_runtime_context_message()
-                ),
+                runtime_context_message=(self._freeze_preflight_runtime_context_message()),
                 context_window_tokens=effective_window,
                 max_output_tokens=consumer_max_output_tokens,
                 consumer_model_id=consumer_model_id,
                 consumer_model_capabilities=consumer_model_capabilities,
-                consumer_provider_request_max_chars=(
-                    consumer_provider_request_max_chars
-                ),
+                consumer_provider_request_max_chars=(consumer_provider_request_max_chars),
             )
             if projection is not None:
                 proof = projection.proof
@@ -3975,9 +3872,7 @@ class Agent:
         skills_message = self._skills_context_message()
         if skills_message is not None:
             fixed_messages.append(skills_message)
-        request_context_message = self._request_context_message(
-            self.config.request_context_prompt
-        )
+        request_context_message = self._request_context_message(self.config.request_context_prompt)
         if request_context_message is None:
             # Durable compaction creates this request-scoped wrapper even when
             # the turn had no pre-existing request context. Reserve the
@@ -3987,9 +3882,7 @@ class Agent:
             )
         if request_context_message is not None:
             fixed_messages.append(request_context_message)
-        fixed_messages.append(
-            self._runtime_context_message(self._runtime_context_block())
-        )
+        fixed_messages.append(self._runtime_context_message(self._runtime_context_block()))
         turn_objective = self._turn_objective_message(
             active_user_message,
             enabled=self._turn_objective_reminder_enabled,
@@ -4025,9 +3918,7 @@ class Agent:
             "max_tokens": self.config.max_tokens,
         }
         if self.config.output_json_schema is not None:
-            payload["response_format"] = self._live_request_jsonable(
-                self.config.output_json_schema
-            )
+            payload["response_format"] = self._live_request_jsonable(self.config.output_json_schema)
         proof_budget = self._provider_request_proof_max_chars()
         if context_window_tokens is not None:
             try:
@@ -4037,18 +3928,20 @@ class Agent:
             except Exception:  # noqa: BLE001 - lightweight config compatibility
                 thinking_enabled = False
                 thinking_budget = 0
-            proof_budget = ContextBudgetGovernor.from_values(
-                context_window_tokens=context_window_tokens,
-                max_output_tokens=(
-                    consumer_max_output_tokens or self.config.max_tokens
-                ),
-                thinking_budget_tokens=thinking_budget if thinking_enabled else 0,
-                context_overflow_threshold=self.config.context_overflow_threshold,
-                provider_request_proof_max_chars=max(
-                    0,
-                    int(consumer_provider_request_max_chars or 0),
-                ),
-            ).snapshot().provider_request_max_chars
+            proof_budget = (
+                ContextBudgetGovernor.from_values(
+                    context_window_tokens=context_window_tokens,
+                    max_output_tokens=(consumer_max_output_tokens or self.config.max_tokens),
+                    thinking_budget_tokens=thinking_budget if thinking_enabled else 0,
+                    context_overflow_threshold=self.config.context_overflow_threshold,
+                    provider_request_proof_max_chars=max(
+                        0,
+                        int(consumer_provider_request_max_chars or 0),
+                    ),
+                )
+                .snapshot()
+                .provider_request_max_chars
+            )
         try:
             proof = prove_provider_payload(
                 payload,
@@ -4299,8 +4192,7 @@ class Agent:
                 "reasoning_chars": len(reasoning_content or ""),
                 "session_key": self._session_key,
                 "agent_id": (
-                    self.config.tool_result_store_agent_id
-                    or self.config.metadata.get("agent_id")
+                    self.config.tool_result_store_agent_id or self.config.metadata.get("agent_id")
                 ),
             },
         )
@@ -4361,9 +4253,7 @@ class Agent:
             return False
         capabilities = self.config.model_capabilities
         supports_tools = (
-            getattr(capabilities, "supports_tools", None)
-            if capabilities is not None
-            else None
+            getattr(capabilities, "supports_tools", None) if capabilities is not None else None
         )
         handler_tools: frozenset[str] = getattr(
             self._raw_tool_handler,
@@ -4427,19 +4317,13 @@ class Agent:
         and ``retrieve_tool_result`` addresses the same bucket by ``session_id``.
         """
 
-        return bool(
-            record.session_id == session_id
-            and record.sha256 == sha256
-        )
+        return bool(record.session_id == session_id and record.sha256 == sha256)
 
     @staticmethod
     def _provider_schema_has_tool_result_retrieval(
         tools: list[ToolDefinition] | None,
     ) -> bool:
-        return bool(
-            tools
-            and any(tool.name == "retrieve_tool_result" for tool in tools)
-        )
+        return bool(tools and any(tool.name == "retrieve_tool_result" for tool in tools))
 
     def _verified_tool_result_references(
         self,
@@ -4471,10 +4355,7 @@ class Agent:
                 if handle in records_by_handle:
                     record = records_by_handle[handle]
                 else:
-                    if (
-                        len(records_by_handle)
-                        >= _MAX_HISTORICAL_TOOL_RESULT_REFERENCE_PROBES
-                    ):
+                    if len(records_by_handle) >= _MAX_HISTORICAL_TOOL_RESULT_REFERENCE_PROBES:
                         return frozenset(verified)
                     try:
                         record = store.read(handle, session_id=session_id)
@@ -4514,11 +4395,7 @@ class Agent:
                 if not isinstance(block, ContentBlockToolResult):
                     next_content.append(block)
                     continue
-                content = (
-                    block.content
-                    if isinstance(block.content, str)
-                    else str(block.content)
-                )
+                content = block.content if isinstance(block.content, str) else str(block.content)
                 reference = recoverable_tool_result_reference(content)
                 if reference is None:
                     next_content.append(block)
@@ -4839,9 +4716,7 @@ class Agent:
             if tool.name in target_names:
                 input_schema = payload.get("input_schema") or {}
                 properties = (
-                    input_schema.get("properties")
-                    if isinstance(input_schema, dict)
-                    else {}
+                    input_schema.get("properties") if isinstance(input_schema, dict) else {}
                 )
                 target_schemas[tool.name] = {
                     "schema_hash": schema_hashes[tool.name],
@@ -4869,9 +4744,7 @@ class Agent:
                 "sent_to_provider": bool(tools),
                 "tool_count": len(tool_names),
                 "tool_names": tool_names,
-                "target_tool_visible": {
-                    name: name in set(tool_names) for name in target_names
-                },
+                "target_tool_visible": {name: name in set(tool_names) for name in target_names},
                 "target_schemas": target_schemas,
                 "schema_hashes": schema_hashes,
             },
@@ -5018,9 +4891,7 @@ class Agent:
             ):
                 continue
             digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-            by_digest.setdefault(digest, []).append(
-                (message_index, block_index, block, content)
-            )
+            by_digest.setdefault(digest, []).append((message_index, block_index, block, content))
 
         replacements: dict[tuple[int, int], ContentBlockToolResult] = {}
         survivor_ids: set[str] = set()
@@ -5086,13 +4957,11 @@ class Agent:
             )
 
         self.config.metadata["provider_history_dedup_applied"] = True
-        self.config.metadata["provider_history_dedup_elided"] = (
-            self.config.metadata.get("provider_history_dedup_elided", 0)
-            + len(replacements)
-        )
+        self.config.metadata["provider_history_dedup_elided"] = self.config.metadata.get(
+            "provider_history_dedup_elided", 0
+        ) + len(replacements)
         self.config.metadata["provider_history_dedup_chars_saved"] = (
-            self.config.metadata.get("provider_history_dedup_chars_saved", 0)
-            + chars_saved
+            self.config.metadata.get("provider_history_dedup_chars_saved", 0) + chars_saved
         )
         self._write_turn_call_log(
             "provider_history_dedup",
@@ -5705,9 +5574,9 @@ class Agent:
         if record:
             self.config.metadata["tool_argument_provider_view_summaries_applied"] = True
             metadata_key = "tool_argument_provider_view_summaries"
-            self.config.metadata[metadata_key] = self.config.metadata.get(
-                metadata_key, 0
-            ) + len(replacements)
+            self.config.metadata[metadata_key] = self.config.metadata.get(metadata_key, 0) + len(
+                replacements
+            )
             self._write_turn_call_log(
                 "tool_argument_provider_view_summary",
                 sanitized_tool_uses=len(replacements),
@@ -5738,8 +5607,7 @@ class Agent:
         if cached is not None:
             try:
                 meta_path = (
-                    store._record_dir(cached.handle, session_id=session_id)
-                    / TOOL_RESULT_META_NAME
+                    store._record_dir(cached.handle, session_id=session_id) / TOOL_RESULT_META_NAME
                 )
             except ValueError:
                 meta_path = None
@@ -6573,9 +6441,7 @@ class Agent:
         return await start_usage_call(
             scope,
             provider=str(
-                self.config.provider_id
-                or getattr(self.provider, "provider_name", "")
-                or ""
+                self.config.provider_id or getattr(self.provider, "provider_name", "") or ""
             ),
             model=str(self.config.model_id or ""),
         )
@@ -6657,6 +6523,7 @@ class Agent:
             clear_sandbox_approval_denials,
             prune_once_mount_grants,
         )
+
         self._prompt_cache_keepalive_candidate = None
         self._active_artifact_writer_intent_id = None
         self._artifact_writer_rejected_proposal_digests.clear()
@@ -6712,9 +6579,7 @@ class Agent:
                     session_key=self._session_key,
                     exc_info=True,
                 )
-            writer_cleanup = asyncio.create_task(
-                self._finalize_unresolved_artifact_writer_intent()
-            )
+            writer_cleanup = asyncio.create_task(self._finalize_unresolved_artifact_writer_intent())
             writer_cleanup_cancelled = False
             while not writer_cleanup.done():
                 try:
@@ -6792,9 +6657,7 @@ class Agent:
         reasoning_block_index = 0
         reasoning_started_at_ms = 0
         generation_epoch = (
-            self._execution_context.generation_epoch
-            if self._execution_context is not None
-            else 0
+            self._execution_context.generation_epoch if self._execution_context is not None else 0
         )
         last_provider_sequence = -1
 
@@ -6817,9 +6680,7 @@ class Agent:
             return
         meta_replay_error = metadata.pop("meta_replay_error", None)
         if meta_replay_error is not None:
-            async for ev in self._emit_terminal_text(
-                str(meta_replay_error), iterations=0
-            ):
+            async for ev in self._emit_terminal_text(str(meta_replay_error), iterations=0):
                 yield ev
             return
         meta_replay = metadata.get("meta_replay")
@@ -6844,14 +6705,10 @@ class Agent:
             return
         meta_launch = metadata.get("meta_launch")
         if meta_launch is not None:
-            launch_name = (
-                meta_launch.get("name") if isinstance(meta_launch, dict) else None
-            )
+            launch_name = meta_launch.get("name") if isinstance(meta_launch, dict) else None
             if launch_name:
                 launch_request = (
-                    meta_launch.get("request")
-                    if isinstance(meta_launch, dict)
-                    else None
+                    meta_launch.get("request") if isinstance(meta_launch, dict) else None
                 )
                 launch_events = (
                     self._run_meta_launch(launch_name, user_request=launch_request)
@@ -6876,9 +6733,7 @@ class Agent:
         image_admission_error = image_input_admission_error(
             extra_messages or [],
             vision_support=(
-                "unsupported"
-                if forced_image_rejection
-                else self.config.model_vision_support
+                "unsupported" if forced_image_rejection else self.config.model_vision_support
             ),
         )
         if forced_image_rejection or image_admission_error is not None:
@@ -7218,9 +7073,7 @@ class Agent:
 
         def _document_mutation_response_locale() -> str:
             configured = str(
-                self.config.metadata.get("locale")
-                or self.config.metadata.get("language")
-                or "en"
+                self.config.metadata.get("locale") or self.config.metadata.get("language") or "en"
             ).strip()
             if not re.fullmatch(
                 r"[A-Za-z]{2,3}(?:[-_][A-Za-z0-9]{2,8})*",
@@ -7296,8 +7149,7 @@ class Agent:
                         "aktualisiert."
                     ),
                     "conflict": (
-                        "Das Dokument wurde geändert; aktualisieren Sie es vor einem "
-                        "neuen Versuch."
+                        "Das Dokument wurde geändert; aktualisieren Sie es vor einem neuen Versuch."
                     ),
                     "ambiguous": (
                         "Das Änderungsergebnis ist ungewiss; aktualisieren Sie die "
@@ -7309,12 +7161,9 @@ class Agent:
                 "es": {
                     "applied": "Se aplicaron los cambios del documento.",
                     "discarded": (
-                        "Se descartaron los cambios del documento; la página no se "
-                        "actualizó."
+                        "Se descartaron los cambios del documento; la página no se actualizó."
                     ),
-                    "conflict": (
-                        "El documento cambió; actualízalo antes de volver a intentarlo."
-                    ),
+                    "conflict": ("El documento cambió; actualízalo antes de volver a intentarlo."),
                     "ambiguous": (
                         "El resultado del cambio es incierto; actualiza y verifica la versión."
                     ),
@@ -7327,12 +7176,8 @@ class Agent:
                         "Les modifications du document ont été abandonnées ; la page "
                         "n’a pas été mise à jour."
                     ),
-                    "conflict": (
-                        "Le document a changé ; actualisez-le avant de réessayer."
-                    ),
-                    "ambiguous": (
-                        "Le résultat est incertain ; actualisez et vérifiez la version."
-                    ),
+                    "conflict": ("Le document a changé ; actualisez-le avant de réessayer."),
+                    "ambiguous": ("Le résultat est incertain ; actualisez et vérifiez la version."),
                     "not_applied": "Les modifications du document n’ont pas été appliquées.",
                     "not_attempted": "Le document n’a pas été modifié.",
                 },
@@ -7347,6 +7192,7 @@ class Agent:
             }
             messages = translations.get(language, translations["en"])
             return messages.get(status, messages["not_attempted"])
+
         placeholder_offense_iterations = 0
         deadline_wrapup_armed = False
         deadline_wrapup_message: Message | None = None
@@ -7361,9 +7207,7 @@ class Agent:
         text_only_tool_recovery_injections = 0
         text_only_tool_recovery_pending = False
         plan_run_reconciliation_attempts = 0
-        attached_plan_run_id = str(
-            getattr(self._tool_context, "plan_run_id", "") or ""
-        ).strip()
+        attached_plan_run_id = str(getattr(self._tool_context, "plan_run_id", "") or "").strip()
         plan_run_delivery_only = _plan_run_steps_ready_for_delivery(
             getattr(self._tool_context, "plan_run", None)
         )
@@ -7383,9 +7227,7 @@ class Agent:
         post_write_focused_verification_observed = False
         post_write_focused_verification_success_observed = False
         last_post_write_failed_verification: dict[str, Any] | None = None
-        finalize_evidence_strict = bool(
-            getattr(self.config, "finalize_evidence_strict", False)
-        )
+        finalize_evidence_strict = bool(getattr(self.config, "finalize_evidence_strict", False))
         finalize_evidence_tracker = (
             FinalizeEvidenceTracker(strict=finalize_evidence_strict)
             if (
@@ -7395,9 +7237,9 @@ class Agent:
             else None
         )
         finalize_evidence_gate_keys: set[str] = set()
-        submit_review_enabled = bool(
-            getattr(self.config, "submit_review_enabled", False)
-        ) and not attached_plan_run_id
+        submit_review_enabled = (
+            bool(getattr(self.config, "submit_review_enabled", False)) and not attached_plan_run_id
+        )
         submit_review_state = SubmitReviewState()
         submit_review_diff_max_chars = int(
             getattr(self.config, "submit_review_diff_max_chars", 20000)
@@ -7406,16 +7248,12 @@ class Agent:
             getattr(self.config, "patch_hygiene_block_mode", "off") or "off"
         )
         patch_hygiene_block_keys: set[str] = set()
-        scratch_verify_mirror_enabled = bool(
-            getattr(self.config, "scratch_verify_mirror", False)
-        )
+        scratch_verify_mirror_enabled = bool(getattr(self.config, "scratch_verify_mirror", False))
         if self._tool_context is not None:
             # Rides the ToolContext in place (endgame_git_freeze precedent):
             # deny messages append the verify-mirror guidance only while on,
             # and the flag is reset each turn because the context outlives it.
-            self._tool_context.scratch_verify_mirror_active = (
-                scratch_verify_mirror_enabled
-            )
+            self._tool_context.scratch_verify_mirror_active = scratch_verify_mirror_enabled
         finalize_variant_challenge_enabled = bool(
             getattr(self.config, "finalize_variant_challenge", False)
         )
@@ -7497,8 +7335,7 @@ class Agent:
             RuntimeDiagnosticsObserver(
                 session_key=self._session_key,
                 agent_id=(
-                    self.config.tool_result_store_agent_id
-                    or self.config.metadata.get("agent_id")
+                    self.config.tool_result_store_agent_id or self.config.metadata.get("agent_id")
                 ),
             )
             if self.config.runtime_events_path or runtime_recovery_mode == "warn_model"
@@ -7521,9 +7358,7 @@ class Agent:
                 15.0,
                 max(1.0, float(self.config.timeout) * 0.1),
             )
-            document_mutation_summary_deadline_candidate = (
-                _total_deadline - summary_reserve_seconds
-            )
+            document_mutation_summary_deadline_candidate = _total_deadline - summary_reserve_seconds
 
         # Endgame git freeze: once remaining wall clock drops below the margin,
         # the shell tools block workspace-reverting git commands outright so
@@ -7573,10 +7408,7 @@ class Agent:
             nonlocal max_iterations_deadline_extension_logged
             extend_seconds = max(
                 0,
-                int(
-                    getattr(self.config, "max_iterations_deadline_extend_seconds", 0)
-                    or 0
-                ),
+                int(getattr(self.config, "max_iterations_deadline_extend_seconds", 0) or 0),
             )
             if (
                 extend_seconds <= 0
@@ -7651,11 +7483,7 @@ class Agent:
                 code="artifact_model_tools_capability_unknown",
                 artifact_operation_class=artifact_operation,
             )
-        if (
-            artifact_requires_tools
-            and self.tool_definitions
-            and not tools_supported
-        ):
+        if artifact_requires_tools and self.tool_definitions and not tools_supported:
             self._write_turn_call_log(
                 "turn_policy_decision",
                 action="reject",
@@ -7869,12 +7697,8 @@ class Agent:
 
             if message_count_request_view is not None:
                 base_messages = message_count_request_view.materialize(turn_messages)
-                request_context_index = (
-                    message_count_request_view.request_context_insert_index
-                )
-                runtime_context_index = (
-                    message_count_request_view.runtime_context_insert_index
-                )
+                request_context_index = message_count_request_view.request_context_insert_index
+                runtime_context_index = message_count_request_view.runtime_context_insert_index
             else:
                 base_messages = turn_messages
                 request_context_index = request_context_insert_index
@@ -7933,10 +7757,7 @@ class Agent:
                 return False
             pending_message = Message(
                 role="user",
-                content=[
-                    ContentBlockText(text=pending_input)
-                    for pending_input in pending_preview
-                ],
+                content=[ContentBlockText(text=pending_input) for pending_input in pending_preview],
             )
             if not _continuation_request_fits(pending_message):
                 return False
@@ -7957,9 +7778,7 @@ class Agent:
                 current_goal_context = GoalTurnContext.from_task_detail(
                     getattr(self._tool_context, "goal_context", None)
                 )
-                next_goal_context = GoalTurnContext.from_task_detail(
-                    claimed_goal_context
-                )
+                next_goal_context = GoalTurnContext.from_task_detail(claimed_goal_context)
                 if (
                     self._tool_context is not None
                     and current_goal_context is not None
@@ -7991,10 +7810,7 @@ class Agent:
                 return False
             staged_pending_input_message = Message(
                 role="user",
-                content=[
-                    ContentBlockText(text=pending_input)
-                    for pending_input in pending_inputs
-                ],
+                content=[ContentBlockText(text=pending_input) for pending_input in pending_inputs],
             )
             turn_messages.append(staged_pending_input_message)
             pending_input_batch_staged = True
@@ -8027,22 +7843,15 @@ class Agent:
                 None,
             )
             applied_goal_context = (
-                take_applied_goal_context()
-                if callable(take_applied_goal_context)
-                else None
+                take_applied_goal_context() if callable(take_applied_goal_context) else None
             )
-            if (
-                staged_claimed_goal_context is not None
-                and isinstance(applied_goal_context, Mapping)
+            if staged_claimed_goal_context is not None and isinstance(
+                applied_goal_context, Mapping
             ):
                 from opensquilla.session.goals import GoalTurnContext
 
-                staged_context = GoalTurnContext.from_task_detail(
-                    staged_claimed_goal_context
-                )
-                applied_context = GoalTurnContext.from_task_detail(
-                    applied_goal_context
-                )
+                staged_context = GoalTurnContext.from_task_detail(staged_claimed_goal_context)
+                applied_context = GoalTurnContext.from_task_detail(applied_goal_context)
                 current_context = GoalTurnContext.from_task_detail(
                     getattr(self._tool_context, "goal_context", None)
                 )
@@ -8055,8 +7864,7 @@ class Agent:
                     and applied_context.epoch == current_context.epoch
                     and applied_context.goal_id == current_context.goal_id
                     and applied_context.task_id == current_context.task_id
-                    and applied_context.objective_revision
-                    >= current_context.objective_revision
+                    and applied_context.objective_revision >= current_context.objective_revision
                 ):
                     self._tool_context.goal_context = dict(applied_goal_context)
                     turn_objective_message = self._goal_objective_message(
@@ -8164,9 +7972,7 @@ class Agent:
                 if goal_terminal_final_response_pending:
                     terminal_headroom_error = _turn_budget_error()
                     if terminal_headroom_error is None:
-                        terminal_headroom_error = _turn_llm_call_budget_error(
-                            turn_llm_calls + 1
-                        )
+                        terminal_headroom_error = _turn_llm_call_budget_error(turn_llm_calls + 1)
                     if terminal_headroom_error is not None:
                         _finish_goal_terminal_without_provider(
                             reason=terminal_headroom_error.message,
@@ -8218,9 +8024,7 @@ class Agent:
                             if not prior_outcome or prior_outcome.get("retryPolicy") == "same_turn":
                                 document_mutation_outcome = {
                                     "version": 1,
-                                    "status": str(
-                                        prior_outcome.get("status") or "not_attempted"
-                                    ),
+                                    "status": str(prior_outcome.get("status") or "not_attempted"),
                                     "phase": str(prior_outcome.get("phase") or "proposal"),
                                     "retryPolicy": "new_turn",
                                     "code": "document_mutation_iteration_budget_exhausted",
@@ -8357,10 +8161,7 @@ class Agent:
                 # calls rather than a single long reasoning stream.
                 thinking_off_margin_seconds = max(
                     0,
-                    int(
-                        getattr(self.config, "deadline_thinking_off_margin_seconds", 0)
-                        or 0
-                    ),
+                    int(getattr(self.config, "deadline_thinking_off_margin_seconds", 0) or 0),
                 )
                 if (
                     thinking_off_margin_seconds > 0
@@ -8375,9 +8176,7 @@ class Agent:
                         reason="deadline_margin",
                         code="deadline_thinking_off",
                         iteration=iterations,
-                        remaining_seconds=int(
-                            max(0.0, _total_deadline - _loop.time())
-                        ),
+                        remaining_seconds=int(max(0.0, _total_deadline - _loop.time())),
                         margin_seconds=thinking_off_margin_seconds,
                     )
                     # The turn-call log is a raw debug stream that run
@@ -8394,9 +8193,7 @@ class Agent:
                             "action": "disable_thinking_until_deadline",
                             "reason": "deadline_margin",
                             "iteration": iterations,
-                            "remaining_seconds": int(
-                                max(0.0, _total_deadline - _loop.time())
-                            ),
+                            "remaining_seconds": int(max(0.0, _total_deadline - _loop.time())),
                             "margin_seconds": thinking_off_margin_seconds,
                             "session_key": self._session_key,
                             "agent_id": (
@@ -8448,9 +8245,7 @@ class Agent:
                     # reasoning-only retry; the second budgeted retry gives the
                     # directive one delivery attempt of its own.
                     reasoning_only_retries=(
-                        2
-                        if bool(getattr(self.config, "reasoning_only_act_now", False))
-                        else 1
+                        2 if bool(getattr(self.config, "reasoning_only_act_now", False)) else 1
                     ),
                 )
                 _attempt_retries_used = _retry_policy.used_attempts()
@@ -8556,15 +8351,11 @@ class Agent:
                         provider_tools_for_call,
                         workspace_edit_gate_details,
                         recovery_read_paths=workspace_edit_gate_recovery_read_paths,
-                        recovery_reads_remaining=(
-                            workspace_edit_gate_recovery_reads_remaining
-                        ),
+                        recovery_reads_remaining=(workspace_edit_gate_recovery_reads_remaining),
                     )
                     if plan_run_delivery_only:
-                        provider_tools_for_call = (
-                            self._plan_run_delivery_tool_definitions(
-                                provider_tools_for_call
-                            )
+                        provider_tools_for_call = self._plan_run_delivery_tool_definitions(
+                            provider_tools_for_call
                         )
                     tools_supported_for_call = (
                         tools_supported
@@ -8641,9 +8432,7 @@ class Agent:
                     ]
                     base_recovery_available = self._tool_result_recovery_available()
                     call_retrieval_available = bool(
-                        self._provider_schema_has_tool_result_retrieval(
-                            provider_tools_for_call
-                        )
+                        self._provider_schema_has_tool_result_retrieval(provider_tools_for_call)
                         and base_recovery_available
                     )
                     call_recovery_downgraded = False
@@ -8665,12 +8454,8 @@ class Agent:
                             restored_request_turn_messages is not request_turn_messages
                         )
                         request_turn_messages = restored_request_turn_messages
-                    previous_call_retrieval = (
-                        self._provider_call_tool_result_retrieval_available
-                    )
-                    self._provider_call_tool_result_retrieval_available = (
-                        call_retrieval_available
-                    )
+                    previous_call_retrieval = self._provider_call_tool_result_retrieval_available
+                    self._provider_call_tool_result_retrieval_available = call_retrieval_available
                     try:
                         if (
                             document_mutation_finalization_pending
@@ -8679,10 +8464,8 @@ class Agent:
                             # Outcome-only request view: never replay this turn's
                             # source pages, grants, runtime paths, or tool pairs into
                             # the final response call.
-                            request_messages, request_sanitize_result = (
-                                sanitize_session_messages(
-                                    _document_mutation_finalization_request()
-                                )
+                            request_messages, request_sanitize_result = sanitize_session_messages(
+                                _document_mutation_finalization_request()
                             )
                         else:
                             (
@@ -8740,17 +8523,13 @@ class Agent:
                             yield TextDeltaEvent(text=response_text)
                         else:
                             if terminal_error.code == IMAGE_INPUT_UNSUPPORTED_CODE:
-                                exact_image_count = count_provider_image_blocks(
-                                    request_messages
-                                )
+                                exact_image_count = count_provider_image_blocks(request_messages)
                                 self.config.metadata["image_input_mode"] = "rejected"
                                 self.config.metadata.setdefault(
                                     "image_input_reason",
                                     "model_vision_unsupported",
                                 )
-                                self.config.metadata["image_input_count"] = (
-                                    exact_image_count
-                                )
+                                self.config.metadata["image_input_count"] = exact_image_count
                                 self.config.metadata.setdefault(
                                     "image_input_stage",
                                     "primary",
@@ -8763,8 +8542,7 @@ class Agent:
                                         or "model_vision_unsupported"
                                     ),
                                     stage=str(
-                                        self.config.metadata.get("image_input_stage")
-                                        or "primary"
+                                        self.config.metadata.get("image_input_stage") or "primary"
                                     ),
                                     image_count=int(
                                         self.config.metadata.get("image_input_count") or 0
@@ -8838,9 +8616,7 @@ class Agent:
                         )
                         if _call_attempt == 0:
                             self.config.metadata["identical_request_loop_perturbations"] = (
-                                self.config.metadata.get(
-                                    "identical_request_loop_perturbations", 0
-                                )
+                                self.config.metadata.get("identical_request_loop_perturbations", 0)
                                 + 1
                             )
                             self._write_turn_call_log(
@@ -8867,12 +8643,8 @@ class Agent:
                     # available call. ``document_mutation_finalization_attempted``
                     # closes this exception before provider I/O, so it cannot
                     # admit a retry or a second summary.
-                    next_call_budget_error = _turn_llm_call_budget_error(
-                        turn_llm_calls + 1
-                    )
-                    terminal_error = (
-                        None if reserved_document_finalizer else next_call_budget_error
-                    )
+                    next_call_budget_error = _turn_llm_call_budget_error(turn_llm_calls + 1)
+                    terminal_error = None if reserved_document_finalizer else next_call_budget_error
                     if reserved_document_finalizer and next_call_budget_error is not None:
                         self._write_turn_call_log(
                             "turn_policy_decision",
@@ -8929,14 +8701,9 @@ class Agent:
                         workspace_edit_gate_details,
                         provider_tools_for_call,
                         recovery_read_paths=workspace_edit_gate_recovery_read_paths,
-                        recovery_reads_remaining=(
-                            workspace_edit_gate_recovery_reads_remaining
-                        ),
+                        recovery_reads_remaining=(workspace_edit_gate_recovery_reads_remaining),
                     )
-                    if (
-                        self._artifact_mutation_turn_active()
-                        and document_mutation_attempted
-                    ):
+                    if self._artifact_mutation_turn_active() and document_mutation_attempted:
                         call_chat_cfg = call_chat_cfg.model_copy(
                             update={
                                 "max_tokens": max(
@@ -8970,9 +8737,7 @@ class Agent:
                             }
                         )
                     if goal_terminal_final_response_pending:
-                        call_chat_cfg = call_chat_cfg.model_copy(
-                            update={"tool_choice": None}
-                        )
+                        call_chat_cfg = call_chat_cfg.model_copy(update={"tool_choice": None})
                     forced_tool_choice = self.config.metadata.get("meta_match_tool_choice")
                     if (
                         forced_tool_choice is not None
@@ -9001,9 +8766,7 @@ class Agent:
                     if self._provider_request_correlation is not None:
                         call_chat_cfg = call_chat_cfg.model_copy(
                             update={
-                                "provider_request_correlation": (
-                                    self._provider_request_correlation
-                                )
+                                "provider_request_correlation": (self._provider_request_correlation)
                             }
                         )
                     active_user_message_index = _active_user_message_index_for_request(
@@ -9012,11 +8775,7 @@ class Agent:
                     )
                     if active_user_message_index is not None:
                         call_chat_cfg = call_chat_cfg.model_copy(
-                            update={
-                                "active_user_message_index": (
-                                    active_user_message_index
-                                )
-                            }
+                            update={"active_user_message_index": (active_user_message_index)}
                         )
 
                     if call_recovery_downgraded and not bool(
@@ -9059,8 +8818,7 @@ class Agent:
                             )
                             char_limit = budget.provider_request_max_chars
                             restored_request_fits = bool(
-                                estimated_tokens <= token_limit
-                                and estimated_chars <= char_limit
+                                estimated_tokens <= token_limit and estimated_chars <= char_limit
                             )
                             admission_source = "conservative_local_projection"
                         if not restored_request_fits:
@@ -9077,9 +8835,7 @@ class Agent:
                                     code=terminal_error.code,
                                 )
                                 assistant_text_parts.append(response_text)
-                                provider_done_for_log = ProviderDoneEvent(
-                                    stop_reason="stop"
-                                )
+                                provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
                                 _got_done_event = True
                                 _got_error = False
                                 terminal_error = None
@@ -9118,17 +8874,13 @@ class Agent:
                         document_mutation_finalization_attempted = True
                     ensemble_request_count_baseline: int | None = None
                     if ensemble_continuation_provider is self.provider:
-                        ensemble_request_count_baseline = (
-                            ensemble_continuation_request_count
-                        )
+                        ensemble_request_count_baseline = ensemble_continuation_request_count
                     ensemble_continuation_request_count = None
                     ensemble_continuation_provider = None
                     if (
                         ensemble_request_count_baseline is None
                         and self._execution_context is not None
-                        and getattr(
-                            self.provider, "execution_context_aware", False
-                        )
+                        and getattr(self.provider, "execution_context_aware", False)
                     ):
                         continuation_snapshot = (
                             self._execution_context.ensemble_continuation_snapshot
@@ -9187,8 +8939,7 @@ class Agent:
                         except UsageAccountingUnavailableError as exc:
                             exc.bind_replay_safety(
                                 no_prior_irreversible_effect=(
-                                    turn_llm_calls == 1
-                                    and not turn_irreversible_effect_started
+                                    turn_llm_calls == 1 and not turn_irreversible_effect_started
                                 )
                             )
                             raise
@@ -9246,8 +8997,7 @@ class Agent:
                             ) from None
                         raw_stream = guard_provider_text_stream(raw_stream)
                         pending_install_deadline: float | None = (
-                            self._pending_durable_compaction_event
-                            .compaction_deadline_at_monotonic
+                            self._pending_durable_compaction_event.compaction_deadline_at_monotonic
                             if self._pending_durable_compaction_event is not None
                             else None
                         )
@@ -9320,9 +9070,7 @@ class Agent:
                                         raw_code=raw_terminal_code,
                                         message=raw_ev.terminal_error_message,
                                     )
-                                    terminal_failure_kind = (
-                                        classified_terminal_failure.value
-                                    )
+                                    terminal_failure_kind = classified_terminal_failure.value
                                     terminal_error_code = safe_provider_failure_code(
                                         raw_terminal_code,
                                         terminal_failure_kind,
@@ -9332,19 +9080,15 @@ class Agent:
                                         raw_terminal_code,
                                     )
                                 if self._execution_context is not None:
-                                    reset_event = (
-                                        self._execution_context.begin_generation_reset(
-                                            raw_ev.from_role,
-                                            raw_ev.to_role,
-                                            raw_ev.safe_reason,
-                                            terminal=raw_ev.terminal,
-                                            terminal_text_snapshot=(
-                                                raw_ev.terminal_text_snapshot
-                                            ),
-                                            terminal_error_message=terminal_error_message,
-                                            terminal_error_code=terminal_error_code,
-                                            terminal_failure_kind=terminal_failure_kind,
-                                        )
+                                    reset_event = self._execution_context.begin_generation_reset(
+                                        raw_ev.from_role,
+                                        raw_ev.to_role,
+                                        raw_ev.safe_reason,
+                                        terminal=raw_ev.terminal,
+                                        terminal_text_snapshot=(raw_ev.terminal_text_snapshot),
+                                        terminal_error_message=terminal_error_message,
+                                        terminal_error_code=terminal_error_code,
+                                        terminal_failure_kind=terminal_failure_kind,
                                     )
                                 else:
                                     reset_event = AnswerGenerationResetEvent(
@@ -9355,9 +9099,7 @@ class Agent:
                                         safe_reason=raw_ev.safe_reason,
                                         sequence=last_provider_sequence + 1,
                                         terminal=raw_ev.terminal,
-                                        terminal_text_snapshot=(
-                                            raw_ev.terminal_text_snapshot
-                                        ),
+                                        terminal_text_snapshot=(raw_ev.terminal_text_snapshot),
                                         terminal_error_message=terminal_error_message,
                                         terminal_error_code=terminal_error_code,
                                         terminal_failure_kind=terminal_failure_kind,
@@ -9396,9 +9138,7 @@ class Agent:
                                     total_output_tokens += terminal_usage.output_tokens
                                     total_reasoning_tokens += terminal_usage.reasoning_tokens
                                     total_cached_tokens += terminal_usage.cache_read_tokens
-                                    total_cache_write_tokens += (
-                                        terminal_usage.cache_write_tokens
-                                    )
+                                    total_cache_write_tokens += terminal_usage.cache_write_tokens
                                     total_billed_cost += (
                                         terminal_usage.billed_cost_nanos / 1_000_000_000
                                     )
@@ -9428,8 +9168,7 @@ class Agent:
                                                 cache_read_tokens=item.cache_read_tokens,
                                                 cache_write_tokens=item.cache_write_tokens,
                                                 billed_cost=(
-                                                    item.billed_cost_nanos
-                                                    / 1_000_000_000
+                                                    item.billed_cost_nanos / 1_000_000_000
                                                 ),
                                                 provider=item.provider,
                                                 cost_source=item.cost_source,
@@ -9456,14 +9195,9 @@ class Agent:
                                             raw_ev.terminal_error_message
                                             or "fixed provider final failure"
                                         ),
-                                        code=(
-                                            raw_ev.terminal_error_code
-                                            or "ensemble_fixed_error"
-                                        ),
+                                        code=(raw_ev.terminal_error_code or "ensemble_fixed_error"),
                                         model_usage_breakdown=terminal_rows,
-                                        usage_missing_count=(
-                                            raw_ev.usage_missing_count
-                                        ),
+                                        usage_missing_count=(raw_ev.usage_missing_count),
                                     )
                                     usage_unknown_reason = provider_error_usage_reason(
                                         provider_error_for_log.code
@@ -9507,14 +9241,11 @@ class Agent:
                                 if event_sequence <= last_provider_sequence:
                                     continue
                                 last_provider_sequence = event_sequence
-                            if (
-                                self._execution_context is not None
-                                and not bool(
-                                    getattr(
-                                        raw_ev,
-                                        "_turn_execution_accepted",
-                                        False,
-                                    )
+                            if self._execution_context is not None and not bool(
+                                getattr(
+                                    raw_ev,
+                                    "_turn_execution_accepted",
+                                    False,
                                 )
                             ):
                                 if isinstance(raw_ev, ProviderHeartbeatEvent):
@@ -9557,14 +9288,11 @@ class Agent:
                             if first_event_at is None:
                                 first_event_at = time.monotonic()
                             if isinstance(raw_ev, ProviderDomainActivityEvent):
-                                activity_phase = _normalize_provider_activity_phase(
-                                    raw_ev.phase
-                                )
+                                activity_phase = _normalize_provider_activity_phase(raw_ev.phase)
                                 if activity_phase == "reasoning":
                                     if reasoning_activity_started_at_ms == 0:
                                         reasoning_activity_started_at_ms = (
-                                            max(0, raw_ev.started_at)
-                                            or time.time_ns() // 1_000_000
+                                            max(0, raw_ev.started_at) or time.time_ns() // 1_000_000
                                         )
                                     last_reasoning_activity_pulse_at = time.monotonic()
                                 yield ProviderActivityEvent(
@@ -9663,9 +9391,7 @@ class Agent:
                                 now_monotonic = time.monotonic()
                                 first_reasoning_activity = reasoning_activity_started_at_ms == 0
                                 if first_reasoning_activity:
-                                    reasoning_activity_started_at_ms = (
-                                        time.time_ns() // 1_000_000
-                                    )
+                                    reasoning_activity_started_at_ms = time.time_ns() // 1_000_000
                                 if (
                                     first_reasoning_activity
                                     or now_monotonic - last_reasoning_activity_pulse_at
@@ -9719,12 +9445,8 @@ class Agent:
                                     and not goal_terminal_final_response_pending
                                     and not max_iterations_finalization_pending
                                     and not post_write_convergence_finalization_pending
-                                    and (
-                                        not turn_messages
-                                        or turn_messages[-1].role != "assistant"
-                                    )
-                                    and _loop.time()
-                                    > _total_deadline - wrapup_margin_seconds
+                                    and (not turn_messages or turn_messages[-1].role != "assistant")
+                                    and _loop.time() > _total_deadline - wrapup_margin_seconds
                                 ):
                                     # The wrap-up directive arms only at
                                     # iteration boundaries, so a reasoning-only
@@ -9736,15 +9458,11 @@ class Agent:
                                     # reasoning prefix was running into the hard
                                     # kill anyway. One-shot: arming makes this
                                     # branch unreachable afterwards.
-                                    remaining_seconds = max(
-                                        0.0, _total_deadline - _loop.time()
-                                    )
+                                    remaining_seconds = max(0.0, _total_deadline - _loop.time())
                                     deadline_wrapup_message = Message(
                                         role="user",
                                         content=_DEADLINE_WRAPUP_DIRECTIVE_TEMPLATE.format(
-                                            minutes=max(
-                                                1, int(remaining_seconds // 60)
-                                            ),
+                                            minutes=max(1, int(remaining_seconds // 60)),
                                         ),
                                     )
                                     deadline_wrapup_armed = True
@@ -9775,25 +9493,15 @@ class Agent:
                                             self.config.runtime_events_path,
                                             {
                                                 "feature": "deadline_wrapup",
-                                                "name": (
-                                                    "deadline_wrapup"
-                                                    ".sticky_thinking_off"
-                                                ),
-                                                "action": (
-                                                    "disable_thinking"
-                                                    "_until_deadline"
-                                                ),
-                                                "reason": (
-                                                    "reasoning_stream_preempt"
-                                                ),
+                                                "name": ("deadline_wrapup.sticky_thinking_off"),
+                                                "action": ("disable_thinking_until_deadline"),
+                                                "reason": ("reasoning_stream_preempt"),
                                                 "iteration": iterations,
                                                 "attempt": _call_attempt,
                                                 "session_key": self._session_key,
                                                 "agent_id": (
                                                     self.config.tool_result_store_agent_id
-                                                    or self.config.metadata.get(
-                                                        "agent_id"
-                                                    )
+                                                    or self.config.metadata.get("agent_id")
                                                 ),
                                             },
                                         )
@@ -9815,12 +9523,9 @@ class Agent:
                                     and not _reasoning_cap_preempt_done
                                     and not goal_terminal_final_response_pending
                                 ):
-                                    attempt_reasoning_stream_chars += len(
-                                        raw_ev.text or ""
-                                    )
+                                    attempt_reasoning_stream_chars += len(raw_ev.text or "")
                                     if (
-                                        attempt_reasoning_stream_chars
-                                        > _reasoning_stream_char_cap
+                                        attempt_reasoning_stream_chars > _reasoning_stream_char_cap
                                         and not attempt_user_visible_emitted
                                         and not pending_tools
                                         and not tool_calls
@@ -9847,9 +9552,7 @@ class Agent:
                                             code="reasoning_cap_preempt",
                                             iteration=iterations,
                                             attempt=_call_attempt,
-                                            reasoning_chars=(
-                                                attempt_reasoning_stream_chars
-                                            ),
+                                            reasoning_chars=(attempt_reasoning_stream_chars),
                                             cap_chars=_reasoning_stream_char_cap,
                                         )
                                         # The turn-call log is a raw debug
@@ -9865,23 +9568,15 @@ class Agent:
                                                 "feature": "reasoning_cap",
                                                 "name": "reasoning_cap.preempt",
                                                 "action": "retry_without_thinking",
-                                                "reason": (
-                                                    "reasoning_stream_char_cap"
-                                                ),
+                                                "reason": ("reasoning_stream_char_cap"),
                                                 "iteration": iterations,
                                                 "attempt": _call_attempt,
-                                                "reasoning_chars": (
-                                                    attempt_reasoning_stream_chars
-                                                ),
-                                                "cap_chars": (
-                                                    _reasoning_stream_char_cap
-                                                ),
+                                                "reasoning_chars": (attempt_reasoning_stream_chars),
+                                                "cap_chars": (_reasoning_stream_char_cap),
                                                 "session_key": self._session_key,
                                                 "agent_id": (
                                                     self.config.tool_result_store_agent_id
-                                                    or self.config.metadata.get(
-                                                        "agent_id"
-                                                    )
+                                                    or self.config.metadata.get("agent_id")
                                                 ),
                                             },
                                         )
@@ -9924,11 +9619,9 @@ class Agent:
                                     pending_tool_events.clear()
                                     tool_argument_heartbeat_chars.clear()
                                     break
-                                writer_reservation = (
-                                    await self._reserve_artifact_writer_intent(
-                                        tool_use_id=raw_ev.tool_use_id,
-                                        tool_name=raw_ev.tool_name,
-                                    )
+                                writer_reservation = await self._reserve_artifact_writer_intent(
+                                    tool_use_id=raw_ev.tool_use_id,
+                                    tool_name=raw_ev.tool_name,
                                 )
                                 if writer_reservation is not None:
                                     document_mutation_attempted = True
@@ -9944,9 +9637,7 @@ class Agent:
                                                 "parallel_document_writers"
                                             )
                                         else:
-                                            guarded_writer_stream_failure = (
-                                                "writer_intent_rejected"
-                                            )
+                                            guarded_writer_stream_failure = "writer_intent_rejected"
                                     else:
                                         guarded_writer_intent_id = raw_ev.tool_use_id
                                     guarded_writer_ids.append(raw_ev.tool_use_id)
@@ -10029,9 +9720,7 @@ class Agent:
                                     )
                                     yield RunHeartbeatEvent(
                                         phase="llm_tool_arguments",
-                                        elapsed_ms=int(
-                                            (time.monotonic() - call_started_at) * 1000
-                                        ),
+                                        elapsed_ms=int((time.monotonic() - call_started_at) * 1000),
                                         idle_ms=0,
                                         # Keep the pending tool identity private
                                         # until a legal DoneEvent commits the
@@ -10056,10 +9745,7 @@ class Agent:
                                         ignored_post_delivery_tool_use = True
                                     continue
                                 end_tool_use_id = raw_ev.tool_use_id
-                                if (
-                                    isinstance(end_tool_use_id, str)
-                                    and end_tool_use_id.strip()
-                                ):
+                                if isinstance(end_tool_use_id, str) and end_tool_use_id.strip():
                                     acc = pending_tools.pop(end_tool_use_id, None)
                                     tool_argument_heartbeat_chars.pop(end_tool_use_id, None)
                                 else:
@@ -10175,19 +9861,13 @@ class Agent:
                                                     or ""
                                                 ),
                                                 model=str(
-                                                    raw_ev.model
-                                                    or self.config.model_id
-                                                    or ""
+                                                    raw_ev.model or self.config.model_id or ""
                                                 ),
                                                 messages=keepalive_stable_history,
                                                 tools=tuple(
-                                                    copy.deepcopy(
-                                                        provider_tools_for_call or []
-                                                    )
+                                                    copy.deepcopy(provider_tools_for_call or [])
                                                 ),
-                                                config=call_chat_cfg.model_copy(
-                                                    deep=True
-                                                ),
+                                                config=call_chat_cfg.model_copy(deep=True),
                                             )
                                         )
                                     except Exception:
@@ -10270,23 +9950,29 @@ class Agent:
                                     ]
                                 )
                                 for usage_source_row in usage_source_rows:
-                                    usage_source = str(
-                                        usage_source_row.get("cost_source")
-                                        or usage_source_row.get("costSource")
-                                        or "none"
-                                    ).strip().lower()
+                                    usage_source = (
+                                        str(
+                                            usage_source_row.get("cost_source")
+                                            or usage_source_row.get("costSource")
+                                            or "none"
+                                        )
+                                        .strip()
+                                        .lower()
+                                    )
                                     usage_receipt = usage_source_row.get(
                                         "billing_receipt",
                                         usage_source_row.get("billingReceipt"),
                                     )
                                     if isinstance(usage_receipt, dict):
-                                        receipt_status = str(
-                                            usage_receipt.get("status") or ""
-                                        ).strip().lower()
+                                        receipt_status = (
+                                            str(usage_receipt.get("status") or "").strip().lower()
+                                        )
                                     else:
-                                        receipt_status = str(
-                                            getattr(usage_receipt, "status", "") or ""
-                                        ).strip().lower()
+                                        receipt_status = (
+                                            str(getattr(usage_receipt, "status", "") or "")
+                                            .strip()
+                                            .lower()
+                                        )
                                     legacy_billed_cost = _usage_float(
                                         usage_source_row.get(
                                             "billed_cost",
@@ -10297,7 +9983,8 @@ class Agent:
                                         total_provider_billed_entries += 1
                                         total_unbilled_entries += 1
                                     elif (
-                                        usage_source in {
+                                        usage_source
+                                        in {
                                             "provider_billed",
                                             "openrouter_usage",
                                         }
@@ -10386,11 +10073,9 @@ class Agent:
                                         )
                                 ensemble_trace = getattr(raw_ev, "ensemble_trace", None)
                                 if isinstance(ensemble_trace, dict):
-                                    ensemble_request_count_baseline = (
-                                        _merge_ensemble_request_count(
-                                            ensemble_trace,
-                                            ensemble_request_count_baseline,
-                                        )
+                                    ensemble_request_count_baseline = _merge_ensemble_request_count(
+                                        ensemble_trace,
+                                        ensemble_request_count_baseline,
                                     )
                                     if tool_calls:
                                         ensemble_continuation_request_count = (
@@ -10401,9 +10086,7 @@ class Agent:
                             elif isinstance(raw_ev, ProviderErrorEvent):
                                 provider_error_for_log = raw_ev
                                 pending_tool_events.clear()
-                                usage_unknown_reason = provider_error_usage_reason(
-                                    raw_ev.code
-                                )
+                                usage_unknown_reason = provider_error_usage_reason(raw_ev.code)
                                 known_usage_receipt = has_known_provider_usage_receipt(raw_ev)
                                 error_usage: UsageCallResult | None = None
                                 if known_usage_receipt and not cost_receipt_counted:
@@ -10451,21 +10134,13 @@ class Agent:
                                     total_output_tokens += error_usage.output_tokens
                                     total_reasoning_tokens += error_usage.reasoning_tokens
                                     total_cached_tokens += error_usage.cache_read_tokens
-                                    total_cache_write_tokens += (
-                                        error_usage.cache_write_tokens
+                                    total_cache_write_tokens += error_usage.cache_write_tokens
+                                    total_missing_cost_entries += error_usage.missing_usage_entries
+                                    canonical_error_rows = _normalized_usage_breakdown_rows(
+                                        raw_ev,
+                                        error_usage,
                                     )
-                                    total_missing_cost_entries += (
-                                        error_usage.missing_usage_entries
-                                    )
-                                    canonical_error_rows = (
-                                        _normalized_usage_breakdown_rows(
-                                            raw_ev,
-                                            error_usage,
-                                        )
-                                    )
-                                    turn_model_usage_breakdown.extend(
-                                        canonical_error_rows
-                                    )
+                                    turn_model_usage_breakdown.extend(canonical_error_rows)
                                     for usage_item in error_usage.items:
                                         usage_model = usage_item.model or "unknown"
                                         if usage_item.cost_source == "mixed":
@@ -10481,15 +10156,10 @@ class Agent:
                                                 input_tokens=usage_item.input_tokens,
                                                 output_tokens=usage_item.output_tokens,
                                                 model_id=usage_model,
-                                                cache_read_tokens=(
-                                                    usage_item.cache_read_tokens
-                                                ),
-                                                cache_write_tokens=(
-                                                    usage_item.cache_write_tokens
-                                                ),
+                                                cache_read_tokens=(usage_item.cache_read_tokens),
+                                                cache_write_tokens=(usage_item.cache_write_tokens),
                                                 billed_cost=(
-                                                    usage_item.billed_cost_nanos
-                                                    / 1_000_000_000
+                                                    usage_item.billed_cost_nanos / 1_000_000_000
                                                 ),
                                                 provider=usage_item.provider,
                                                 cost_source=usage_item.cost_source,
@@ -10653,8 +10323,7 @@ class Agent:
                             None,
                         )
                         pending_install_timeout = (
-                            enforced_stream_deadline
-                            == pending_install_deadline
+                            enforced_stream_deadline == pending_install_deadline
                             if enforced_stream_deadline is not None
                             else (
                                 pending_install_deadline is not None
@@ -10688,8 +10357,7 @@ class Agent:
                         mutation_summary_timeout = (
                             document_mutation_summary_deadline is not None
                             and document_mutation_attempted
-                            and enforced_stream_deadline
-                            == document_mutation_summary_deadline
+                            and enforced_stream_deadline == document_mutation_summary_deadline
                             and not document_mutation_finalization_pending
                             and not document_mutation_finalization_attempted
                         )
@@ -10706,9 +10374,7 @@ class Agent:
                             prior_outcome = dict(document_mutation_outcome or {})
                             document_mutation_outcome = {
                                 "version": 1,
-                                "status": str(
-                                    prior_outcome.get("status") or "not_attempted"
-                                ),
+                                "status": str(prior_outcome.get("status") or "not_attempted"),
                                 "phase": str(prior_outcome.get("phase") or "proposal"),
                                 "retryPolicy": "new_turn",
                                 "code": "document_mutation_time_budget_exhausted",
@@ -10761,12 +10427,8 @@ class Agent:
                                 prior_outcome = dict(document_mutation_outcome or {})
                                 document_mutation_outcome = {
                                     "version": 1,
-                                    "status": str(
-                                        prior_outcome.get("status") or "not_attempted"
-                                    ),
-                                    "phase": str(
-                                        prior_outcome.get("phase") or "proposal"
-                                    ),
+                                    "status": str(prior_outcome.get("status") or "not_attempted"),
+                                    "phase": str(prior_outcome.get("phase") or "proposal"),
                                     "retryPolicy": "new_turn",
                                     "code": "document_mutation_provider_timeout",
                                 }
@@ -10852,8 +10514,7 @@ class Agent:
                             yield reasoning_end
                         exc.bind_replay_safety(
                             no_prior_irreversible_effect=(
-                                turn_llm_calls == 1
-                                and not turn_irreversible_effect_started
+                                turn_llm_calls == 1 and not turn_irreversible_effect_started
                             )
                         )
                         raise
@@ -10921,9 +10582,7 @@ class Agent:
                             )
                             document_mutation_outcome = {
                                 "version": 1,
-                                "status": str(
-                                    prior_outcome.get("status") or "not_attempted"
-                                ),
+                                "status": str(prior_outcome.get("status") or "not_attempted"),
                                 "phase": str(prior_outcome.get("phase") or "proposal"),
                                 "retryPolicy": "new_turn",
                                 "code": outcome_code,
@@ -10958,10 +10617,7 @@ class Agent:
                                 "The connection to the model provider ended before "
                                 "the response completed."
                                 if attempt_irreversible_output_emitted
-                                else (
-                                    "The connection to the model provider was "
-                                    "interrupted."
-                                )
+                                else ("The connection to the model provider was interrupted.")
                             ),
                             code=(
                                 "response_incomplete"
@@ -10977,14 +10633,11 @@ class Agent:
                                 usage_call,
                                 usage_unknown_reason,
                             )
-                        if (
-                            reasoning_only_act_now_for_call is not None
-                            and not bool(
-                                getattr(
-                                    self.config,
-                                    "reasoning_only_act_now",
-                                    False,
-                                )
+                        if reasoning_only_act_now_for_call is not None and not bool(
+                            getattr(
+                                self.config,
+                                "reasoning_only_act_now",
+                                False,
                             )
                         ):
                             reasoning_only_act_now_message = None
@@ -11059,23 +10712,13 @@ class Agent:
                         self._write_turn_call_log("llm_response", **response_payload)
 
                     # -- after async for (retry loop level) --
-                    if (
-                        provider_error_for_log is not None
-                        and self._execution_context is not None
-                    ):
+                    if provider_error_for_log is not None and self._execution_context is not None:
                         # A provider/protocol failure invalidates every tool
                         # fragment from this attempt, including the terminal
                         # attempt where no retry will run.
-                        self._execution_context.drop_pending_tool_buffers(
-                            "provider_error"
-                        )
-                    elif (
-                        not _got_done_event
-                        and self._execution_context is not None
-                    ):
-                        self._execution_context.drop_pending_tool_buffers(
-                            "stream_without_done"
-                        )
+                        self._execution_context.drop_pending_tool_buffers("provider_error")
+                    elif not _got_done_event and self._execution_context is not None:
+                        self._execution_context.drop_pending_tool_buffers("stream_without_done")
                     if terminal_generation_reset_event is not None:
                         terminal_error = ErrorEvent(
                             message=(
@@ -11090,15 +10733,11 @@ class Agent:
                                 terminal_generation_reset_event.terminal_failure_kind
                                 or ProviderFailureKind.UNKNOWN.value
                             ),
-                            generation_epoch=(
-                                terminal_generation_reset_event.new_generation_epoch
-                            ),
+                            generation_epoch=(terminal_generation_reset_event.new_generation_epoch),
                         )
                         break
                     terminal_error = (
-                        None
-                        if goal_terminal_final_response_pending
-                        else _turn_budget_error()
+                        None if goal_terminal_final_response_pending else _turn_budget_error()
                     )
                     if (
                         terminal_error is not None
@@ -11193,8 +10832,7 @@ class Agent:
                             )
                             or (
                                 reasoning_only_act_now_for_call is not None
-                                and request_turn_messages[-1]
-                                is reasoning_only_act_now_for_call
+                                and request_turn_messages[-1] is reasoning_only_act_now_for_call
                             )
                         )
                     ):
@@ -11269,8 +10907,7 @@ class Agent:
                         await self._fail_artifact_writer_intent(
                             guarded_writer_intent_id,
                             failure_code=(
-                                guarded_writer_stream_failure
-                                or "writer_arguments_incomplete"
+                                guarded_writer_stream_failure or "writer_arguments_incomplete"
                             ),
                         )
                         document_mutation_outcome = {
@@ -11389,10 +11026,8 @@ class Agent:
                         )
                         if (
                             large_context_invalid
-                            and attempt_classification.kind
-                            == _ProviderAttemptKind.REASONING_ONLY
-                            and (attempt_classification.stop_reason or "").lower()
-                            == "length"
+                            and attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY
+                            and (attempt_classification.stop_reason or "").lower() == "length"
                         ):
                             _thinking_fallback_done = True
                             _disable_thinking_for_next_provider_call = True
@@ -11642,18 +11277,15 @@ class Agent:
                             ):
                                 _attempt_retries_used[_ProviderAttemptKind.REASONING_ONLY] += 1
                                 if (
-                                    (
-                                        not thinking_enabled
-                                        or bool(
-                                            getattr(
-                                                self.config,
-                                                "reasoning_only_act_now",
-                                                False,
-                                            )
+                                    not thinking_enabled
+                                    or bool(
+                                        getattr(
+                                            self.config,
+                                            "reasoning_only_act_now",
+                                            False,
                                         )
                                     )
-                                    and reasoning_only_act_now_message is None
-                                ):
+                                ) and reasoning_only_act_now_message is None:
                                     reasoning_only_act_now_message = (
                                         self._new_reasoning_only_act_now_message(
                                             iteration=iterations,
@@ -11663,14 +11295,12 @@ class Agent:
                                         )
                                     )
                                 disable_thinking = (
-                                    (attempt_classification.stop_reason or "").lower()
-                                    == "length"
-                                    or bool(
-                                        getattr(
-                                            self.config,
-                                            "reasoning_only_thinking_fallback",
-                                            False,
-                                        )
+                                    attempt_classification.stop_reason or ""
+                                ).lower() == "length" or bool(
+                                    getattr(
+                                        self.config,
+                                        "reasoning_only_thinking_fallback",
+                                        False,
                                     )
                                 )
                                 if disable_thinking:
@@ -11680,9 +11310,7 @@ class Agent:
                                     "provider.large_context_visible_retry",
                                     session_key=self._session_key,
                                     model=last_actual_model or self.config.model_id or "",
-                                    provider=self._provider_log_identity(
-                                        last_actual_provider
-                                    ),
+                                    provider=self._provider_log_identity(last_actual_provider),
                                     classification=attempt_classification.kind.value,
                                     iteration=iterations,
                                     call_attempt=_call_attempt,
@@ -11707,11 +11335,7 @@ class Agent:
                                 ).lower() == "length"
                                 if reasoning_output_budget_exhausted:
                                     self._log_reasoning_output_budget_exhausted(
-                                        model=(
-                                            last_actual_model
-                                            or self.config.model_id
-                                            or ""
-                                        ),
+                                        model=(last_actual_model or self.config.model_id or ""),
                                         observed_provider=last_actual_provider,
                                         configured_max_tokens=max(
                                             0,
@@ -11745,9 +11369,7 @@ class Agent:
                                             + (
                                                 "retrying once with thinking disabled."
                                                 if disable_thinking
-                                                else (
-                                                    "retrying once to request visible content."
-                                                )
+                                                else ("retrying once to request visible content.")
                                             )
                                         ),
                                     )
@@ -11814,18 +11436,15 @@ class Agent:
                         ):
                             _attempt_retries_used[_ProviderAttemptKind.REASONING_ONLY] += 1
                             if (
-                                (
-                                    not thinking_enabled
-                                    or bool(
-                                        getattr(
-                                            self.config,
-                                            "reasoning_only_act_now",
-                                            False,
-                                        )
+                                not thinking_enabled
+                                or bool(
+                                    getattr(
+                                        self.config,
+                                        "reasoning_only_act_now",
+                                        False,
                                     )
                                 )
-                                and reasoning_only_act_now_message is None
-                            ):
+                            ) and reasoning_only_act_now_message is None:
                                 reasoning_only_act_now_message = (
                                     self._new_reasoning_only_act_now_message(
                                         iteration=iterations,
@@ -12053,9 +11672,7 @@ class Agent:
                             and not _invalid_response_fallback_done
                             and self._switch_to_invalid_response_fallback(
                                 attempt_classification.kind.value,
-                                requires_vision=(
-                                    self._count_image_blocks(request_messages) > 0
-                                ),
+                                requires_vision=(self._count_image_blocks(request_messages) > 0),
                                 requires_tools=bool(provider_tools_for_call),
                             )
                         ):
@@ -12281,15 +11898,11 @@ class Agent:
                         message_limit_proof = provider_error.message_limit_proof
                         if message_limit_proof is not None:
                             proof_log = {
-                                "actual_wire_messages": (
-                                    message_limit_proof.actual_wire_messages
-                                ),
+                                "actual_wire_messages": (message_limit_proof.actual_wire_messages),
                                 "limit": message_limit_proof.limit,
                                 "logical_messages": message_limit_proof.logical_messages,
                                 "system_messages": message_limit_proof.system_messages,
-                                "tool_result_messages": (
-                                    message_limit_proof.tool_result_messages
-                                ),
+                                "tool_result_messages": (message_limit_proof.tool_result_messages),
                                 "provider_kind": message_limit_proof.provider_kind,
                                 "model": message_limit_proof.model,
                                 "base_host": message_limit_proof.base_host,
@@ -12325,28 +11938,21 @@ class Agent:
                                 break
 
                             _message_limit_recovery_done = True
-                            recovery_outcome, recovery_reason = (
-                                await self._recover_provider_message_count_limit(
-                                    base_request_turn_messages,
-                                    request_suffix_messages=request_suffix_messages,
-                                    proof=message_limit_proof,
-                                    config=call_chat_cfg,
-                                    identical_request_perturbed=(
-                                        identical_request_action == "perturb"
-                                    ),
-                                    request_context_message=request_context_message,
-                                    request_context_insert_index=(
-                                        active_request_context_insert_index
-                                    ),
-                                    runtime_context_message=runtime_context_message,
-                                    runtime_context_insert_index=(
-                                        active_runtime_context_insert_index
-                                    ),
-                                    turn_objective_message=turn_objective_message,
-                                    protected_turn_start_index=(
-                                        active_protected_turn_start_index
-                                    ),
-                                )
+                            (
+                                recovery_outcome,
+                                recovery_reason,
+                            ) = await self._recover_provider_message_count_limit(
+                                base_request_turn_messages,
+                                request_suffix_messages=request_suffix_messages,
+                                proof=message_limit_proof,
+                                config=call_chat_cfg,
+                                identical_request_perturbed=(identical_request_action == "perturb"),
+                                request_context_message=request_context_message,
+                                request_context_insert_index=(active_request_context_insert_index),
+                                runtime_context_message=runtime_context_message,
+                                runtime_context_insert_index=(active_runtime_context_insert_index),
+                                turn_objective_message=turn_objective_message,
+                                protected_turn_start_index=(active_protected_turn_start_index),
                             )
                             if recovery_outcome is None:
                                 _log.warning(
@@ -12388,16 +11994,12 @@ class Agent:
                                 **proof_log,
                                 "target_wire_messages": (
                                     message_limit_proof.limit
-                                    - self._message_count_headroom(
-                                        message_limit_proof.limit
-                                    )
+                                    - self._message_count_headroom(message_limit_proof.limit)
                                 ),
                                 "projected_wire_messages": (
                                     recovery_outcome.projected_wire_messages
                                 ),
-                                "removed_logical_messages": (
-                                    recovery_outcome.removed_count
-                                ),
+                                "removed_logical_messages": (recovery_outcome.removed_count),
                             }
                             _log.info(
                                 "provider_request_message_limit_recovery_success",
@@ -12551,29 +12153,24 @@ class Agent:
                             continue
                         if failure_kind == ProviderFailureKind.CONTEXT_OVERFLOW:
                             self._record_provider_context_overflow_reason(provider_error)
-                            provider_budget_proof = (
-                                self._provider_request_budget_proof(provider_error)
+                            provider_budget_proof = self._provider_request_budget_proof(
+                                provider_error
                             )
                             durable_projection = None
                             durable_consumer_overflow_proven: bool | None = None
                             if provider_error.code == "provider_request_budget_exhausted":
-                                durable_projection = (
-                                    self._project_durable_consumer_final_request(
-                                        request_messages,
-                                        tools=provider_tools_for_call,
-                                        active_config=call_chat_cfg,
-                                    )
+                                durable_projection = self._project_durable_consumer_final_request(
+                                    request_messages,
+                                    tools=provider_tools_for_call,
+                                    active_config=call_chat_cfg,
                                 )
                                 durable_consumer_overflow_proven = bool(
-                                    durable_projection is not None
-                                    and not durable_projection.fits
+                                    durable_projection is not None and not durable_projection.fits
                                 )
                                 live_turn_recovery_possible = (
                                     self._live_turn_compaction_boundary(
                                         turn_messages,
-                                        protected_turn_start_index=(
-                                            current_turn_start_index
-                                        ),
+                                        protected_turn_start_index=(current_turn_start_index),
                                     )
                                     is not None
                                 )
@@ -12623,9 +12220,7 @@ class Agent:
                                 )
                                 self._write_turn_call_log(
                                     "provider_request_budget_recovery_refused",
-                                    reason=(
-                                        "provider_native_overflow_after_final_admission"
-                                    ),
+                                    reason=("provider_native_overflow_after_final_admission"),
                                     iteration=iterations,
                                     attempt=_call_attempt,
                                 )
@@ -12647,9 +12242,7 @@ class Agent:
                                 # automatic compaction into a no-op.
                                 compaction_budget_proof = durable_projection.proof
                             provider_request_window_tokens = self._positive_int(
-                                (compaction_budget_proof or {}).get(
-                                    "effective_proof_token_budget"
-                                )
+                                (compaction_budget_proof or {}).get("effective_proof_token_budget")
                             )
                             provider_compaction_window_tokens = (
                                 max(
@@ -12660,19 +12253,13 @@ class Agent:
                                 else None
                             )
                             provider_request_window_chars = self._positive_int(
-                                (compaction_budget_proof or {}).get(
-                                    "effective_proof_budget"
-                                )
+                                (compaction_budget_proof or {}).get("effective_proof_budget")
                             )
                             provider_estimated_tokens = self._positive_int(
-                                (compaction_budget_proof or {}).get(
-                                    "estimated_tokens"
-                                )
+                                (compaction_budget_proof or {}).get("estimated_tokens")
                             )
                             provider_estimated_chars = self._positive_int(
-                                (compaction_budget_proof or {}).get(
-                                    "estimated_chars"
-                                )
+                                (compaction_budget_proof or {}).get("estimated_chars")
                             )
                             provider_compaction_refusal_reason = (
                                 self._last_compaction_refusal_reason
@@ -12710,9 +12297,7 @@ class Agent:
                                 request_window_tokens=provider_request_window_tokens,
                                 request_window_chars=provider_request_window_chars,
                                 estimated_context_chars=provider_estimated_chars,
-                                durable_consumer_overflow_proven=(
-                                    durable_consumer_overflow_proven
-                                ),
+                                durable_consumer_overflow_proven=(durable_consumer_overflow_proven),
                             )
                             if overflow_outcome is None:
                                 yield self._transition(AgentState.ERROR)
@@ -12747,21 +12332,15 @@ class Agent:
                                     next_request_messages = (
                                         await self._provider_request_messages_async(
                                             overflow_outcome.messages,
-                                            request_context_message=(
-                                                request_context_message
-                                            ),
+                                            request_context_message=(request_context_message),
                                             request_context_insert_index=(
                                                 next_request_context_insert_index
                                             ),
-                                            runtime_context_message=(
-                                                runtime_context_message
-                                            ),
+                                            runtime_context_message=(runtime_context_message),
                                             runtime_context_insert_index=(
                                                 next_runtime_context_insert_index
                                             ),
-                                            turn_objective_message=(
-                                                turn_objective_message
-                                            ),
+                                            turn_objective_message=(turn_objective_message),
                                         )
                                     )
                                 else:
@@ -12769,21 +12348,15 @@ class Agent:
                                         next_request_messages = (
                                             await self._provider_request_messages_async(
                                                 overflow_outcome.messages,
-                                                request_context_message=(
-                                                    request_context_message
-                                                ),
+                                                request_context_message=(request_context_message),
                                                 request_context_insert_index=(
                                                     next_request_context_insert_index
                                                 ),
-                                                runtime_context_message=(
-                                                    runtime_context_message
-                                                ),
+                                                runtime_context_message=(runtime_context_message),
                                                 runtime_context_insert_index=(
                                                     next_runtime_context_insert_index
                                                 ),
-                                                turn_objective_message=(
-                                                    turn_objective_message
-                                                ),
+                                                turn_objective_message=(turn_objective_message),
                                             )
                                         )
                             except asyncio.CancelledError:
@@ -12830,20 +12403,12 @@ class Agent:
                                 terminal_error = self._context_overflow_error()
                                 yield terminal_error
                                 break
-                            next_active_user_index = (
-                                _active_user_message_index_for_request(
-                                    next_request_messages,
-                                    current_user_text=(
-                                        self._current_turn_message or ""
-                                    ),
-                                )
+                            next_active_user_index = _active_user_message_index_for_request(
+                                next_request_messages,
+                                current_user_text=(self._current_turn_message or ""),
                             )
                             next_chat_cfg = call_chat_cfg.model_copy(
-                                update={
-                                    "active_user_message_index": (
-                                        next_active_user_index
-                                    )
-                                }
+                                update={"active_user_message_index": (next_active_user_index)}
                             )
                             stable_live_recovery: CompactionOutcome | None = None
                             if durable_consumer_overflow_proven is True:
@@ -12869,15 +12434,11 @@ class Agent:
                                         if durable_next_projection is not None
                                         else None
                                     ),
-                                    estimated_tokens=admission_proof.get(
-                                        "estimated_tokens"
-                                    ),
+                                    estimated_tokens=admission_proof.get("estimated_tokens"),
                                     effective_token_budget=admission_proof.get(
                                         "effective_proof_token_budget"
                                     ),
-                                    estimated_chars=admission_proof.get(
-                                        "estimated_chars"
-                                    ),
+                                    estimated_chars=admission_proof.get("estimated_chars"),
                                     effective_char_budget=admission_proof.get(
                                         "effective_proof_budget"
                                     ),
@@ -12889,20 +12450,12 @@ class Agent:
                                 ):
                                     stable_protected_start = (
                                         overflow_outcome.protected_turn_start_index
-                                        if (
-                                            overflow_outcome
-                                            .protected_turn_start_index
-                                            is not None
-                                        )
+                                        if (overflow_outcome.protected_turn_start_index is not None)
                                         else current_turn_start_index
                                     )
                                     stable_source_messages = overflow_outcome.messages
-                                    stable_source_request_index = (
-                                        next_request_context_insert_index
-                                    )
-                                    stable_source_runtime_index = (
-                                        next_runtime_context_insert_index
-                                    )
+                                    stable_source_request_index = next_request_context_insert_index
+                                    stable_source_runtime_index = next_runtime_context_insert_index
                                     stable_keep_recent_rounds = 2
                                     if overflow_outcome.ephemeral_only:
                                         # The first request-scoped summary keeps
@@ -12911,27 +12464,17 @@ class Agent:
                                         # same compaction deadline/call budget by
                                         # summarizing one more completed round.
                                         stable_source_messages = turn_messages
-                                        stable_protected_start = (
-                                            current_turn_start_index
-                                        )
-                                        stable_source_request_index = (
-                                            request_context_insert_index
-                                        )
-                                        stable_source_runtime_index = (
-                                            runtime_context_insert_index
-                                        )
+                                        stable_protected_start = current_turn_start_index
+                                        stable_source_request_index = request_context_insert_index
+                                        stable_source_runtime_index = runtime_context_insert_index
                                         stable_keep_recent_rounds = 1
                                     if (
                                         next_active_user_index is not None
                                         and durable_next_projection is not None
                                         and self._live_turn_compaction_boundary(
                                             stable_source_messages,
-                                            protected_turn_start_index=(
-                                                stable_protected_start
-                                            ),
-                                            keep_recent_rounds=(
-                                                stable_keep_recent_rounds
-                                            ),
+                                            protected_turn_start_index=(stable_protected_start),
+                                            keep_recent_rounds=(stable_keep_recent_rounds),
                                         )
                                         is not None
                                     ):
@@ -12955,9 +12498,7 @@ class Agent:
                                                     context_window_chars=(
                                                         provider_request_window_chars
                                                     ),
-                                                    keep_recent_rounds=(
-                                                        stable_keep_recent_rounds
-                                                    ),
+                                                    keep_recent_rounds=(stable_keep_recent_rounds),
                                                     request_context_insert_index=(
                                                         stable_source_request_index
                                                     ),
@@ -12965,8 +12506,7 @@ class Agent:
                                                         stable_source_runtime_index
                                                     ),
                                                     shared_compaction_config=(
-                                                        overflow_outcome
-                                                        .runtime_compaction_config
+                                                        overflow_outcome.runtime_compaction_config
                                                     ),
                                                 )
                                             )
@@ -12980,21 +12520,17 @@ class Agent:
                                             )
                                     if stable_live_recovery is not None:
                                         stable_live_request_index = (
-                                            stable_live_recovery
-                                            .request_context_insert_index
+                                            stable_live_recovery.request_context_insert_index
                                             if (
-                                                stable_live_recovery
-                                                .request_context_insert_index
+                                                stable_live_recovery.request_context_insert_index
                                                 is not None
                                             )
                                             else next_request_context_insert_index
                                         )
                                         stable_live_runtime_index = (
-                                            stable_live_recovery
-                                            .runtime_context_insert_index
+                                            stable_live_recovery.runtime_context_insert_index
                                             if (
-                                                stable_live_recovery
-                                                .runtime_context_insert_index
+                                                stable_live_recovery.runtime_context_insert_index
                                                 is not None
                                             )
                                             else next_runtime_context_insert_index
@@ -13002,21 +12538,15 @@ class Agent:
                                         stable_live_request_messages = (
                                             await self._provider_request_messages_async(
                                                 stable_live_recovery.messages,
-                                                request_context_message=(
-                                                    request_context_message
-                                                ),
+                                                request_context_message=(request_context_message),
                                                 request_context_insert_index=(
                                                     stable_live_request_index
                                                 ),
-                                                runtime_context_message=(
-                                                    runtime_context_message
-                                                ),
+                                                runtime_context_message=(runtime_context_message),
                                                 runtime_context_insert_index=(
                                                     stable_live_runtime_index
                                                 ),
-                                                turn_objective_message=(
-                                                    turn_objective_message
-                                                ),
+                                                turn_objective_message=(turn_objective_message),
                                             )
                                         )
                                         stable_live_active_user_index = (
@@ -13027,22 +12557,18 @@ class Agent:
                                                 ),
                                             )
                                         )
-                                        stable_live_chat_cfg = (
-                                            call_chat_cfg.model_copy(
-                                                update={
-                                                    "active_user_message_index": (
-                                                        stable_live_active_user_index
-                                                    )
-                                                }
-                                            )
+                                        stable_live_chat_cfg = call_chat_cfg.model_copy(
+                                            update={
+                                                "active_user_message_index": (
+                                                    stable_live_active_user_index
+                                                )
+                                            }
                                         )
                                         stable_live_projection = (
                                             self._project_durable_consumer_final_request(
                                                 stable_live_request_messages,
                                                 tools=provider_tools_for_call,
-                                                active_config=(
-                                                    stable_live_chat_cfg
-                                                ),
+                                                active_config=(stable_live_chat_cfg),
                                             )
                                         )
                                         if (
@@ -13050,16 +12576,10 @@ class Agent:
                                             and stable_live_projection is not None
                                             and stable_live_projection.fits
                                         ):
-                                            next_request_messages = (
-                                                stable_live_request_messages
-                                            )
-                                            next_active_user_index = (
-                                                stable_live_active_user_index
-                                            )
+                                            next_request_messages = stable_live_request_messages
+                                            next_active_user_index = stable_live_active_user_index
                                             next_chat_cfg = stable_live_chat_cfg
-                                            durable_next_projection = (
-                                                stable_live_projection
-                                            )
+                                            durable_next_projection = stable_live_projection
                                         else:
                                             stable_live_recovery = None
                                     if (
@@ -13072,20 +12592,14 @@ class Agent:
                                         )
                                         self._terminalize_pending_durable_compaction(
                                             status="failed",
-                                            reason=(
-                                                "compaction_consumer_admission_failed"
-                                            ),
+                                            reason=("compaction_consumer_admission_failed"),
                                         )
                                         yield self._transition(AgentState.ERROR)
-                                        terminal_error = (
-                                            self._context_overflow_error()
-                                        )
+                                        terminal_error = self._context_overflow_error()
                                         yield terminal_error
                                         break
                                 if not overflow_outcome.ephemeral_only:
-                                    pending_event = (
-                                        self._pending_durable_compaction_event
-                                    )
+                                    pending_event = self._pending_durable_compaction_event
                                     if pending_event is None:
                                         self._last_compaction_refusal_reason = (
                                             "compaction_consumer_admission_failed"
@@ -13102,16 +12616,9 @@ class Agent:
                                     self._pending_durable_compaction_event = None
                                     yield pending_event
                                     turn_messages = overflow_outcome.messages
-                                    request_context_insert_index = (
-                                        next_request_context_insert_index
-                                    )
-                                    runtime_context_insert_index = (
-                                        next_runtime_context_insert_index
-                                    )
-                                    if (
-                                        overflow_outcome.protected_turn_start_index
-                                        is not None
-                                    ):
+                                    request_context_insert_index = next_request_context_insert_index
+                                    runtime_context_insert_index = next_runtime_context_insert_index
+                                    if overflow_outcome.protected_turn_start_index is not None:
                                         current_turn_start_index = (
                                             overflow_outcome.protected_turn_start_index
                                         )
@@ -13128,41 +12635,33 @@ class Agent:
                                 and next_projection is not None
                                 and next_projection.fits
                             ):
-                                message_count_request_view = (
-                                    _MessageCountRequestView(
-                                        messages=stable_live_recovery.messages,
-                                        canonical_tail_start=len(turn_messages),
-                                        request_context_insert_index=(
-                                            stable_live_recovery
-                                            .request_context_insert_index
-                                            if (
-                                                stable_live_recovery
-                                                .request_context_insert_index
-                                                is not None
-                                            )
-                                            else next_request_context_insert_index
-                                        ),
-                                        runtime_context_insert_index=(
-                                            stable_live_recovery
-                                            .runtime_context_insert_index
-                                            if (
-                                                stable_live_recovery
-                                                .runtime_context_insert_index
-                                                is not None
-                                            )
-                                            else next_runtime_context_insert_index
-                                        ),
-                                        protected_turn_start_index=(
-                                            stable_live_recovery
-                                            .protected_turn_start_index
-                                            if (
-                                                stable_live_recovery
-                                                .protected_turn_start_index
-                                                is not None
-                                            )
-                                            else current_turn_start_index
-                                        ),
-                                    )
+                                message_count_request_view = _MessageCountRequestView(
+                                    messages=stable_live_recovery.messages,
+                                    canonical_tail_start=len(turn_messages),
+                                    request_context_insert_index=(
+                                        stable_live_recovery.request_context_insert_index
+                                        if (
+                                            stable_live_recovery.request_context_insert_index
+                                            is not None
+                                        )
+                                        else next_request_context_insert_index
+                                    ),
+                                    runtime_context_insert_index=(
+                                        stable_live_recovery.runtime_context_insert_index
+                                        if (
+                                            stable_live_recovery.runtime_context_insert_index
+                                            is not None
+                                        )
+                                        else next_runtime_context_insert_index
+                                    ),
+                                    protected_turn_start_index=(
+                                        stable_live_recovery.protected_turn_start_index
+                                        if (
+                                            stable_live_recovery.protected_turn_start_index
+                                            is not None
+                                        )
+                                        else current_turn_start_index
+                                    ),
                                 )
                                 self._last_compaction_refusal_reason = None
                                 _call_attempt += 1
@@ -13175,27 +12674,18 @@ class Agent:
                                 routed_recovery = stable_live_recovery
                                 routed_protected_start = (
                                     overflow_outcome.protected_turn_start_index
-                                    if overflow_outcome.protected_turn_start_index
-                                    is not None
+                                    if overflow_outcome.protected_turn_start_index is not None
                                     else current_turn_start_index
                                 )
                                 routed_source_messages = overflow_outcome.messages
-                                routed_source_request_index = (
-                                    next_request_context_insert_index
-                                )
-                                routed_source_runtime_index = (
-                                    next_runtime_context_insert_index
-                                )
+                                routed_source_request_index = next_request_context_insert_index
+                                routed_source_runtime_index = next_runtime_context_insert_index
                                 routed_keep_recent_rounds = 2
                                 if overflow_outcome.ephemeral_only:
                                     routed_source_messages = turn_messages
                                     routed_protected_start = current_turn_start_index
-                                    routed_source_request_index = (
-                                        request_context_insert_index
-                                    )
-                                    routed_source_runtime_index = (
-                                        runtime_context_insert_index
-                                    )
+                                    routed_source_request_index = request_context_insert_index
+                                    routed_source_runtime_index = runtime_context_insert_index
                                     routed_keep_recent_rounds = 1
                                 if (
                                     routed_recovery is None
@@ -13207,12 +12697,8 @@ class Agent:
                                     )
                                     and self._live_turn_compaction_boundary(
                                         routed_source_messages,
-                                        protected_turn_start_index=(
-                                            routed_protected_start
-                                        ),
-                                        keep_recent_rounds=(
-                                            routed_keep_recent_rounds
-                                        ),
+                                        protected_turn_start_index=(routed_protected_start),
+                                        keep_recent_rounds=(routed_keep_recent_rounds),
                                     )
                                     is not None
                                 ):
@@ -13220,9 +12706,7 @@ class Agent:
                                         routed_recovery = (
                                             await self._recover_live_turn_request_overflow(
                                                 routed_source_messages,
-                                                protected_turn_start_index=(
-                                                    routed_protected_start
-                                                ),
+                                                protected_turn_start_index=(routed_protected_start),
                                                 context_window_tokens=(
                                                     provider_request_window_tokens
                                                     or self.config.context_window_tokens
@@ -13230,9 +12714,7 @@ class Agent:
                                                 context_window_chars=(
                                                     provider_request_window_chars
                                                 ),
-                                                keep_recent_rounds=(
-                                                    routed_keep_recent_rounds
-                                                ),
+                                                keep_recent_rounds=(routed_keep_recent_rounds),
                                                 request_context_insert_index=(
                                                     routed_source_request_index
                                                 ),
@@ -13240,8 +12722,7 @@ class Agent:
                                                     routed_source_runtime_index
                                                 ),
                                                 shared_compaction_config=(
-                                                    overflow_outcome
-                                                    .runtime_compaction_config
+                                                    overflow_outcome.runtime_compaction_config
                                                 ),
                                             )
                                         )
@@ -13257,94 +12738,62 @@ class Agent:
                                     routed_request_index = (
                                         routed_recovery.request_context_insert_index
                                         if (
-                                            routed_recovery
-                                            .request_context_insert_index
-                                            is not None
+                                            routed_recovery.request_context_insert_index is not None
                                         )
                                         else next_request_context_insert_index
                                     )
                                     routed_runtime_index = (
                                         routed_recovery.runtime_context_insert_index
                                         if (
-                                            routed_recovery
-                                            .runtime_context_insert_index
-                                            is not None
+                                            routed_recovery.runtime_context_insert_index is not None
                                         )
                                         else next_runtime_context_insert_index
                                     )
                                     routed_request_messages = (
                                         await self._provider_request_messages_async(
                                             routed_recovery.messages,
-                                            request_context_message=(
-                                                request_context_message
-                                            ),
-                                            request_context_insert_index=(
-                                                routed_request_index
-                                            ),
-                                            runtime_context_message=(
-                                                runtime_context_message
-                                            ),
-                                            runtime_context_insert_index=(
-                                                routed_runtime_index
-                                            ),
-                                            turn_objective_message=(
-                                                turn_objective_message
-                                            ),
+                                            request_context_message=(request_context_message),
+                                            request_context_insert_index=(routed_request_index),
+                                            runtime_context_message=(runtime_context_message),
+                                            runtime_context_insert_index=(routed_runtime_index),
+                                            turn_objective_message=(turn_objective_message),
                                         )
                                     )
                                     routed_active_user_index = (
                                         _active_user_message_index_for_request(
                                             routed_request_messages,
-                                            current_user_text=(
-                                                self._current_turn_message or ""
-                                            ),
+                                            current_user_text=(self._current_turn_message or ""),
                                         )
                                     )
                                     routed_chat_cfg = call_chat_cfg.model_copy(
                                         update={
-                                            "active_user_message_index": (
-                                                routed_active_user_index
-                                            )
+                                            "active_user_message_index": (routed_active_user_index)
                                         }
                                     )
-                                    routed_projection = (
-                                        project_provider_final_request(
-                                            self.provider,
-                                            routed_request_messages,
-                                            provider_tools_for_call,
-                                            routed_chat_cfg,
-                                        )
+                                    routed_projection = project_provider_final_request(
+                                        self.provider,
+                                        routed_request_messages,
+                                        provider_tools_for_call,
+                                        routed_chat_cfg,
                                     )
                                     if (
                                         routed_active_user_index is not None
                                         and routed_projection is not None
                                         and routed_projection.fits
                                     ):
-                                        message_count_request_view = (
-                                            _MessageCountRequestView(
-                                                messages=(
-                                                    routed_recovery.messages
-                                                ),
-                                                canonical_tail_start=len(
-                                                    turn_messages
-                                                ),
-                                                request_context_insert_index=(
-                                                    routed_request_index
-                                                ),
-                                                runtime_context_insert_index=(
-                                                    routed_runtime_index
-                                                ),
-                                                protected_turn_start_index=(
-                                                    routed_recovery
-                                                    .protected_turn_start_index
-                                                    if (
-                                                        routed_recovery
-                                                        .protected_turn_start_index
-                                                        is not None
-                                                    )
-                                                    else current_turn_start_index
-                                                ),
-                                            )
+                                        message_count_request_view = _MessageCountRequestView(
+                                            messages=(routed_recovery.messages),
+                                            canonical_tail_start=len(turn_messages),
+                                            request_context_insert_index=(routed_request_index),
+                                            runtime_context_insert_index=(routed_runtime_index),
+                                            protected_turn_start_index=(
+                                                routed_recovery.protected_turn_start_index
+                                                if (
+                                                    routed_recovery.protected_turn_start_index
+                                                    is not None
+                                                )
+                                                else current_turn_start_index
+                                            ),
                                         )
                                         self._last_compaction_refusal_reason = None
                                         _call_attempt += 1
@@ -13374,26 +12823,18 @@ class Agent:
                                     ),
                                     protected_turn_start_index=(
                                         overflow_outcome.protected_turn_start_index
-                                        if overflow_outcome.protected_turn_start_index
-                                        is not None
+                                        if overflow_outcome.protected_turn_start_index is not None
                                         else current_turn_start_index
                                     ),
                                 )
                             else:
                                 turn_messages = overflow_outcome.messages
-                                request_context_insert_index = (
-                                    next_request_context_insert_index
-                                )
-                                runtime_context_insert_index = (
-                                    next_runtime_context_insert_index
-                                )
-                                if (
-                                    overflow_outcome.protected_turn_start_index
-                                    is not None
-                                ):
+                                request_context_insert_index = next_request_context_insert_index
+                                runtime_context_insert_index = next_runtime_context_insert_index
+                                if overflow_outcome.protected_turn_start_index is not None:
                                     current_turn_start_index = (
                                         overflow_outcome.protected_turn_start_index
-                                )
+                                    )
                                 message_count_request_view = None
                             _call_attempt += 1
                             continue
@@ -13655,9 +13096,7 @@ class Agent:
                             "text_only_tool_recovery_mode",
                             "off",
                         )
-                        self.config.metadata[
-                            "text_only_tool_recovery_next_action_errors"
-                        ] = (
+                        self.config.metadata["text_only_tool_recovery_next_action_errors"] = (
                             self.config.metadata.get(
                                 "text_only_tool_recovery_next_action_errors",
                                 0,
@@ -13783,11 +13222,7 @@ class Agent:
                         "off",
                     )
                     next_action = (
-                        "tool_call"
-                        if tool_calls
-                        else "text"
-                        if visible_text.strip()
-                        else "empty"
+                        "tool_call" if tool_calls else "text" if visible_text.strip() else "empty"
                     )
                     metadata_key: str | None
                     metadata_key = f"text_only_tool_recovery_next_action_{next_action}s"
@@ -13825,22 +13260,16 @@ class Agent:
                 preflight_tool_results: dict[str, ToolResult] = {}
                 terminal_projection_preflight_error = False
                 writer_calls = [
-                    tc
-                    for tc in tool_calls
-                    if tc.tool_name in _PROMPT_ANNOTATION_WRITER_TOOLS
+                    tc for tc in tool_calls if tc.tool_name in _PROMPT_ANNOTATION_WRITER_TOOLS
                 ]
                 candidate_controller = getattr(
                     self._tool_context,
                     "artifact_candidate_loop_controller",
                     None,
                 )
-                finish_calls = [
-                    tc for tc in tool_calls if tc.tool_name == "document_finish"
-                ]
+                finish_calls = [tc for tc in tool_calls if tc.tool_name == "document_finish"]
                 browser_calls = [
-                    tc
-                    for tc in tool_calls
-                    if tc.tool_name.startswith("document_browser_")
+                    tc for tc in tool_calls if tc.tool_name.startswith("document_browser_")
                 ]
                 # A finish decision is a lifecycle boundary, never another
                 # sibling operation in the same provider response.  Reject
@@ -13851,16 +13280,11 @@ class Agent:
                     candidate_controller is not None
                     and (
                         len(finish_calls) > 1
-                        or (
-                            finish_calls
-                            and (writer_calls or browser_calls)
-                        )
+                        or (finish_calls and (writer_calls or browser_calls))
                         or (writer_calls and browser_calls)
                     )
                 )
-                if candidate_controller is not None and (
-                    writer_calls or candidate_batch_conflict
-                ):
+                if candidate_controller is not None and (writer_calls or candidate_batch_conflict):
                     # Preflight rejection happens before dispatch installs the
                     # tool contextvar. Invalidate any prior browser receipt
                     # here as well, so a blocked writer batch cannot be
@@ -13914,16 +13338,13 @@ class Agent:
                                 reason=rejection_reason,
                             ),
                         )
-                        preflight_tool_results[rejected_call.tool_use_id] = (
-                            await self._reject_artifact_writer_preflight(
-                                rejected_call,
-                                batch_result,
-                                failure_code=rejection_reason,
-                                force_finalize=(
-                                    not candidate_batch_conflict
-                                    and len(writer_calls) > 1
-                                ),
-                            )
+                        preflight_tool_results[
+                            rejected_call.tool_use_id
+                        ] = await self._reject_artifact_writer_preflight(
+                            rejected_call,
+                            batch_result,
+                            failure_code=rejection_reason,
+                            force_finalize=(not candidate_batch_conflict and len(writer_calls) > 1),
                         )
                         continue
                     preflight_tool_results[rejected_call.tool_use_id] = ToolResult(
@@ -13991,8 +13412,7 @@ class Agent:
                 if (
                     len(tool_calls) == 1
                     and repeat_threshold > 0
-                    and tool_calls[0].tool_name
-                    in self._repeated_tool_call_recovery_tool_names()
+                    and tool_calls[0].tool_name in self._repeated_tool_call_recovery_tool_names()
                 ):
                     current_repeat_key = self._tool_call_repeat_key(tool_calls[0])
                     current_workspace_write_count = len(self._effective_workspace_write_records())
@@ -14218,17 +13638,13 @@ class Agent:
                     if plan_run_reconciliation is not None:
                         if visible_text and final_text_parts:
                             final_text_parts.pop()
-                        if (
-                            plan_run_reconciliation_attempts
-                            < _PLAN_RUN_RECONCILIATION_LIMIT
-                        ):
+                        if plan_run_reconciliation_attempts < _PLAN_RUN_RECONCILIATION_LIMIT:
                             plan_run_reconciliation_attempts += 1
                             turn_messages.append(
                                 Message(role="user", content=plan_run_reconciliation)
                             )
                             self.config.metadata["plan_run_reconciliations"] = (
-                                self.config.metadata.get("plan_run_reconciliations", 0)
-                                + 1
+                                self.config.metadata.get("plan_run_reconciliations", 0) + 1
                             )
                             self._write_turn_call_log(
                                 "plan_run_reconciliation",
@@ -14285,8 +13701,7 @@ class Agent:
                         )
                         should_inject_text_only = (
                             text_only_mode == "warn_model"
-                            and text_only_tool_recovery_injections
-                            < _TEXT_ONLY_TOOL_RECOVERY_LIMIT
+                            and text_only_tool_recovery_injections < _TEXT_ONLY_TOOL_RECOVERY_LIMIT
                         )
                         decision = RuntimeRecoveryDecision(
                             action="nudge" if should_inject_text_only else "observe",
@@ -14374,10 +13789,8 @@ class Agent:
                                 failed_tool_finalization["recovery_key"] = recovery_key
                         if failed_tool_finalization is not None:
                             recovery_message: str | None
-                            recovery_message = (
-                                self._failed_tool_finalization_recovery_message(
-                                    failed_tool_finalization
-                                )
+                            recovery_message = self._failed_tool_finalization_recovery_message(
+                                failed_tool_finalization
                             )
                             self._record_tool_loop_runtime_event(
                                 reason=str(failed_tool_finalization["reason"]),
@@ -14478,12 +13891,8 @@ class Agent:
                                 finalize_evidence_gate_keys.add(gate_key)
                                 if visible_text and final_text_parts:
                                     final_text_parts.pop()
-                                turn_messages.append(
-                                    Message(role="user", content=gate_message)
-                                )
-                                self.config.metadata[
-                                    "finalize_evidence_gate_recoveries"
-                                ] = (
+                                turn_messages.append(Message(role="user", content=gate_message))
+                                self.config.metadata["finalize_evidence_gate_recoveries"] = (
                                     self.config.metadata.get(
                                         "finalize_evidence_gate_recoveries",
                                         0,
@@ -14514,8 +13923,8 @@ class Agent:
                     ):
                         hygiene_status = await self._workspace_git_status_porcelain()
                         if patch_hygiene_block_mode == "protected_paths":
-                            hygiene_offending_paths = (
-                                self._porcelain_status_protected_paths(hygiene_status)
+                            hygiene_offending_paths = self._porcelain_status_protected_paths(
+                                hygiene_status
                             )
                             hygiene_reason = "protected_paths_in_final_diff"
                         else:
@@ -14524,9 +13933,7 @@ class Agent:
                             )
                             hygiene_reason = "test_paths_in_final_diff"
                         if hygiene_offending_paths:
-                            hygiene_key = _patch_hygiene_block_key(
-                                hygiene_offending_paths
-                            )
+                            hygiene_key = _patch_hygiene_block_key(hygiene_offending_paths)
                             # Same headroom rule as the evidence gate: never
                             # spend the run's last LLM call or deadline slack
                             # on a challenge.
@@ -14551,10 +13958,8 @@ class Agent:
                             if hygiene_suppressed:
                                 hygiene_message = None
                             elif patch_hygiene_block_mode == "protected_paths":
-                                hygiene_message = (
-                                    _patch_hygiene_block_protected_message(
-                                        hygiene_offending_paths
-                                    )
+                                hygiene_message = _patch_hygiene_block_protected_message(
+                                    hygiene_offending_paths
                                 )
                             else:
                                 hygiene_message = _patch_hygiene_block_message(
@@ -14570,21 +13975,15 @@ class Agent:
                                 recovery_key=hygiene_key,
                                 details={
                                     "offending_paths": hygiene_offending_paths[:20],
-                                    "offending_path_count": len(
-                                        hygiene_offending_paths
-                                    ),
+                                    "offending_path_count": len(hygiene_offending_paths),
                                 },
                             )
                             if hygiene_message is not None:
                                 patch_hygiene_block_keys.add(hygiene_key)
                                 if visible_text and final_text_parts:
                                     final_text_parts.pop()
-                                turn_messages.append(
-                                    Message(role="user", content=hygiene_message)
-                                )
-                                self.config.metadata[
-                                    "patch_hygiene_block_recoveries"
-                                ] = (
+                                turn_messages.append(Message(role="user", content=hygiene_message))
+                                self.config.metadata["patch_hygiene_block_recoveries"] = (
                                     self.config.metadata.get(
                                         "patch_hygiene_block_recoveries",
                                         0,
@@ -14597,12 +13996,8 @@ class Agent:
                                     mode=patch_hygiene_block_mode,
                                     reason=hygiene_reason,
                                     details={
-                                        "offending_paths": hygiene_offending_paths[
-                                            :20
-                                        ],
-                                        "offending_path_count": len(
-                                            hygiene_offending_paths
-                                        ),
+                                        "offending_paths": hygiene_offending_paths[:20],
+                                        "offending_path_count": len(hygiene_offending_paths),
                                     },
                                 )
                                 if patch_hygiene_block_mode == "protected_paths":
@@ -14641,13 +14036,9 @@ class Agent:
                                 _total_deadline is None or _loop.time() < _total_deadline
                             )
                             variant_message = (
-                                _finalize_variant_challenge_message()
-                                if variant_headroom
-                                else None
+                                _finalize_variant_challenge_message() if variant_headroom else None
                             )
-                            self.config.metadata[
-                                "finalize_variant_challenge_detections"
-                            ] = (
+                            self.config.metadata["finalize_variant_challenge_detections"] = (
                                 self.config.metadata.get(
                                     "finalize_variant_challenge_detections",
                                     0,
@@ -14669,12 +14060,8 @@ class Agent:
                                 finalize_variant_challenge_fired = True
                                 if visible_text and final_text_parts:
                                     final_text_parts.pop()
-                                turn_messages.append(
-                                    Message(role="user", content=variant_message)
-                                )
-                                self.config.metadata[
-                                    "finalize_variant_challenge_recoveries"
-                                ] = (
+                                turn_messages.append(Message(role="user", content=variant_message))
+                                self.config.metadata["finalize_variant_challenge_recoveries"] = (
                                     self.config.metadata.get(
                                         "finalize_variant_challenge_recoveries",
                                         0,
@@ -14764,9 +14151,7 @@ class Agent:
                     ):
                         submit_implicit_headroom_ok = _turn_llm_call_budget_error(
                             turn_llm_calls + 1
-                        ) is None and (
-                            _total_deadline is None or _loop.time() < _total_deadline
-                        )
+                        ) is None and (_total_deadline is None or _loop.time() < _total_deadline)
                         implicit_capture = await self._workspace_submit_review_capture()
                         if implicit_capture is None:
                             self._record_runtime_event(
@@ -14968,9 +14353,7 @@ class Agent:
                         tc.tool_use_id,
                         STOP_CANCEL_GRACE_SECONDS,
                     )
-                    tool_effect_observations_by_id[tc.tool_use_id] = (
-                        self._tool_effect_observation()
-                    )
+                    tool_effect_observations_by_id[tc.tool_use_id] = self._tool_effect_observation()
                     tool_timeout = _cap_timeout_by_deadlines(
                         self._tool_execution_timeout(execution_tc)
                     )
@@ -14978,9 +14361,7 @@ class Agent:
                     if (
                         tc.tool_name == "apply_patch"
                         and self._tool_call_string_arg(tc, "path") is not None
-                        and not (
-                            self._tool_call_string_arg(tc, "patch") or ""
-                        ).strip()
+                        and not (self._tool_call_string_arg(tc, "patch") or "").strip()
                         and execution_tc is tc
                     ):
                         snapshot_failure = ToolResult(
@@ -15009,9 +14390,7 @@ class Agent:
                         execution_tc,
                         workspace_edit_gate_details,
                         recovery_read_paths=workspace_edit_gate_recovery_read_paths,
-                        recovery_reads_remaining=(
-                            workspace_edit_gate_recovery_reads_remaining
-                        ),
+                        recovery_reads_remaining=(workspace_edit_gate_recovery_reads_remaining),
                     )
                     diagnostic_retrieval_gate_result = (
                         self._projected_diagnostic_retrieval_gate_tool_result(execution_tc)
@@ -15023,9 +14402,7 @@ class Agent:
                             provider_call_count=turn_llm_calls,
                             tool_name=tc.tool_name,
                             gate_details=dict(workspace_edit_gate_details or {}),
-                            workspace_write_count=len(
-                                self._effective_workspace_write_records()
-                            ),
+                            workspace_write_count=len(self._effective_workspace_write_records()),
                             injected_to_model=True,
                         )
                         res = gate_result
@@ -15035,9 +14412,7 @@ class Agent:
                             iteration=iterations,
                             provider_call_count=turn_llm_calls,
                             tool_name=tc.tool_name,
-                            workspace_write_count=len(
-                                self._effective_workspace_write_records()
-                            ),
+                            workspace_write_count=len(self._effective_workspace_write_records()),
                             injected_to_model=True,
                         )
                         res = diagnostic_retrieval_gate_result
@@ -15048,9 +14423,7 @@ class Agent:
                         cancellation_started = False
                         try:
                             turn_irreversible_effect_started = True
-                            execution_task = asyncio.create_task(
-                                self._execute_tool(execution_tc)
-                            )
+                            execution_task = asyncio.create_task(self._execute_tool(execution_tc))
                             done, _pending = await asyncio.wait(
                                 {execution_task},
                                 timeout=tool_timeout,
@@ -15158,9 +14531,7 @@ class Agent:
                                 iteration=iterations,
                                 provider_call_count=turn_llm_calls,
                                 tool_name=tc.tool_name,
-                                target_paths=sorted(
-                                    workspace_edit_gate_recovery_read_paths
-                                ),
+                                target_paths=sorted(workspace_edit_gate_recovery_read_paths),
                                 injected_to_model=False,
                             )
                     elif gate_recovery_read:
@@ -15301,9 +14672,7 @@ class Agent:
                         raise
                     finally:
                         cleanup_tasks = {
-                            task: self._tool_cancellation_policy(
-                                task_to_tool_call[task]
-                            )
+                            task: self._tool_cancellation_policy(task_to_tool_call[task])
                             for task in pending
                         }
                         try:
@@ -15318,15 +14687,12 @@ class Agent:
                                 result = results_by_id.get(tc.tool_use_id)
                                 if (
                                     result is None
-                                    or self._tool_cancellation_policy(tc)
-                                    != "must_settle"
+                                    or self._tool_cancellation_policy(tc) != "must_settle"
                                     or result.execution_status is None
                                     or result.execution_status.get("status") != "timeout"
                                 ):
                                     continue
-                                before = tool_effect_observations_by_id.get(
-                                    tc.tool_use_id
-                                )
+                                before = tool_effect_observations_by_id.get(tc.tool_use_id)
                                 if (
                                     before is not None
                                     and self._tool_effect_observation() != before
@@ -15450,17 +14816,13 @@ class Agent:
 
                 for tc in tool_calls:
                     if dispatch_boundary is not None:
-                        results_by_id[tc.tool_use_id] = (
-                            _not_executed_after_dispatch_boundary(
-                                tc,
-                                dispatch_boundary,
-                            )
+                        results_by_id[tc.tool_use_id] = _not_executed_after_dispatch_boundary(
+                            tc,
+                            dispatch_boundary,
                         )
                         continue
                     if plan_run_delivery_only and tc.tool_name != "publish_artifact":
-                        results_by_id[tc.tool_use_id] = (
-                            _not_executed_during_plan_delivery(tc)
-                        )
+                        results_by_id[tc.tool_use_id] = _not_executed_during_plan_delivery(tc)
                         continue
                     if attached_plan_run_id and tc.tool_name == "submit":
                         results_by_id[tc.tool_use_id] = ToolResult(
@@ -15535,9 +14897,7 @@ class Agent:
                         )
                         submit_headroom_ok = _turn_llm_call_budget_error(
                             turn_llm_calls + 1
-                        ) is None and (
-                            _total_deadline is None or _loop.time() < _total_deadline
-                        )
+                        ) is None and (_total_deadline is None or _loop.time() < _total_deadline)
                         submit_action = evaluate_explicit_submit(
                             submit_review_state,
                             diff_empty=submit_diff_empty,
@@ -15688,9 +15048,7 @@ class Agent:
                         "user_input_provider",
                         None,
                     )
-                    task_id = str(
-                        getattr(self._tool_context, "task_id", "") or ""
-                    ).strip()
+                    task_id = str(getattr(self._tool_context, "task_id", "") or "").strip()
                     if (
                         pending_user_input is not None
                         and user_input_provider is not None
@@ -15725,9 +15083,7 @@ class Agent:
                             generation_epoch=generation_epoch,
                         )
                         try:
-                            answers = await user_input_provider.wait_for_response(
-                                request_id
-                            )
+                            answers = await user_input_provider.wait_for_response(request_id)
                         except asyncio.CancelledError:
                             user_input_provider.cancel_request(request_id)
                             raise
@@ -15820,9 +15176,7 @@ class Agent:
                             if not approval_entry.approved:
                                 suspended.deny(str(pending_approval["approval_id"]))
                                 resolution = str(approval_entry.resolution or "")
-                                reviewer = str(
-                                    approval_entry.params.get("reviewer") or "user"
-                                )
+                                reviewer = str(approval_entry.params.get("reviewer") or "user")
                                 resolution_source = str(
                                     approval_entry.params.get("resolutionSource") or ""
                                 )
@@ -15831,8 +15185,7 @@ class Agent:
                                     and reviewer == "user"
                                     and resolution_source
                                     in {"", "user", "user_web", "user_channel"}
-                                    and approval_entry.params.get("humanActionable")
-                                    is not False
+                                    and approval_entry.params.get("humanActionable") is not False
                                 )
                                 rationale = str(
                                     approval_entry.params.get("reviewRationale") or ""
@@ -15862,11 +15215,9 @@ class Agent:
                                     is_error=False,
                                     terminates_turn=explicit_human_denial,
                                 )
-                                projected_result = (
-                                    await self._project_tool_result_for_delivery(
-                                        result,
-                                        tool_call=tc,
-                                    )
+                                projected_result = await self._project_tool_result_for_delivery(
+                                    result,
+                                    tool_call=tc,
                                 )
                                 yield ToolResultEvent(
                                     tool_use_id=projected_result.tool_use_id,
@@ -15885,9 +15236,7 @@ class Agent:
                                     turn_yielded = True
                                 break
 
-                            resumed_call = suspended.approve(
-                                str(pending_approval["approval_id"])
-                            )
+                            resumed_call = suspended.approve(str(pending_approval["approval_id"]))
                             result = await _run_one(suspended.begin_execution())
                             suspended.complete()
                             result_tool_call = resumed_call
@@ -15925,9 +15274,7 @@ class Agent:
                             effect_outcome=projected_result.effect_outcome,
                             generation_epoch=generation_epoch,
                         )
-                        replay_event = router_control_replay_event_from_payload(
-                            result.content
-                        )
+                        replay_event = router_control_replay_event_from_payload(result.content)
                         if replay_event is not None:
                             yield replay_event
                     executed_results.append(result)
@@ -16031,8 +15378,7 @@ class Agent:
                 actual_tool_errors = [
                     result
                     for result in executed_results
-                    if result.is_error
-                    and not self._is_not_executed_after_dispatch_boundary(result)
+                    if result.is_error and not self._is_not_executed_after_dispatch_boundary(result)
                 ]
                 turn_tool_errors += len(actual_tool_errors)
                 first_tool_error = next(
@@ -16061,8 +15407,8 @@ class Agent:
                     for tc, result in zip(tool_calls, executed_results, strict=False):
                         executed_tc = executed_tool_calls_by_id.get(tc.tool_use_id, tc)
                         if tc.tool_name in _GATE_WRITE_TOOL_NAMES:
-                            for write_path, is_scratch in (
-                                self._finalize_evidence_write_targets(executed_tc)
+                            for write_path, is_scratch in self._finalize_evidence_write_targets(
+                                executed_tc
                             ):
                                 finalize_evidence_tracker.observe_write(
                                     write_path,
@@ -16087,10 +15433,8 @@ class Agent:
                         )
                         gate_evidence_credit = True
                         if scratch_verify_mirror_enabled:
-                            gate_evidence_credit = (
-                                self._scratch_verify_mirror_evidence_credit(
-                                    gate_command
-                                )
+                            gate_evidence_credit = self._scratch_verify_mirror_evidence_credit(
+                                gate_command
                             )
                             if not gate_evidence_credit:
                                 self._record_runtime_event(
@@ -16107,9 +15451,7 @@ class Agent:
                             timed_out=gate_timed_out,
                             status_reason=gate_status_reason,
                             failure_anchors=(
-                                self._failure_anchor_lines(gate_result_text)
-                                if gate_red
-                                else []
+                                self._failure_anchor_lines(gate_result_text) if gate_red else []
                             ),
                             iteration=iterations,
                             evidence_credit=gate_evidence_credit,
@@ -16136,9 +15478,7 @@ class Agent:
                             current_focused_verification_observed = True
                             post_write_focused_verification_observed = True
                             result_text = self._tool_result_text_for_anchor(result.content)
-                            verification_state = (
-                                self._classify_focused_verification_result(result)
-                            )
+                            verification_state = self._classify_focused_verification_result(result)
                             self._record_runtime_event(
                                 "focused_verification.classified",
                                 feature="verification",
@@ -16157,17 +15497,14 @@ class Agent:
                             elif result.is_error or self._tool_result_has_failure_signal(
                                 result_text
                             ):
-                                execution_status: Mapping[str, Any] = (
-                                    result.execution_status or {}
-                                )
+                                execution_status: Mapping[str, Any] = result.execution_status or {}
                                 status_reason = ""
                                 if isinstance(execution_status, Mapping):
                                     status_reason = str(execution_status.get("reason") or "")
                                 post_write_focused_verification_success_observed = False
                                 last_post_write_failed_verification = {
                                     "reason": (
-                                        "final_response_after_failed_focused_"
-                                        "verification_with_diff"
+                                        "final_response_after_failed_focused_verification_with_diff"
                                     ),
                                     "tool_name": result.tool_name,
                                     "command": command[:500],
@@ -16193,10 +15530,7 @@ class Agent:
                     recent_failure_anchor_summaries[:] = recent_failure_anchor_summaries[-3:]
                 runtime_diff_paths: list[str] | None = None
                 runtime_diff_fingerprint: str | None = None
-                if (
-                    runtime_diagnostics is not None
-                    or post_write_convergence_tracker is not None
-                ):
+                if runtime_diagnostics is not None or post_write_convergence_tracker is not None:
                     self._runtime_git_state = GitRunState.OK
                     runtime_diff_paths = self._workspace_diff_paths_for_runtime_event()
                     if runtime_diff_paths is not None:
@@ -16204,13 +15538,11 @@ class Agent:
                             self._workspace_diff_fingerprint_for_runtime_event()
                         )
                 runtime_git_observed = bool(
-                    runtime_diff_paths is not None
-                    and self._runtime_git_state is GitRunState.OK
+                    runtime_diff_paths is not None and self._runtime_git_state is GitRunState.OK
                 )
                 if (
-                    (runtime_diagnostics is not None or post_write_convergence_tracker is not None)
-                    and not runtime_git_observed
-                ):
+                    runtime_diagnostics is not None or post_write_convergence_tracker is not None
+                ) and not runtime_git_observed:
                     self._record_runtime_git_observation_skip(
                         consumers=(
                             "runtime_diagnostics",
@@ -16257,24 +15589,20 @@ class Agent:
                             or successful_source_context_tool_result
                         )
                     )
-                    post_write_convergence_decision = (
-                        post_write_convergence_tracker.observe(
-                            PostWriteConvergenceObservation(
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                workspace_write_count=workspace_write_count,
-                                changed_receipt_count=mutation_receipt_counts[
-                                    "changed_receipt_count"
-                                ],
-                                diff_fingerprint=runtime_diff_fingerprint,
-                                diff_paths=runtime_diff_paths,
-                                focused_verification_success_observed=(
-                                    post_write_focused_verification_success_observed
-                                ),
-                                continued_activity_after_verification=(
-                                    continued_activity_after_verification
-                                ),
-                            )
+                    post_write_convergence_decision = post_write_convergence_tracker.observe(
+                        PostWriteConvergenceObservation(
+                            iteration=iterations,
+                            provider_call_count=turn_llm_calls,
+                            workspace_write_count=workspace_write_count,
+                            changed_receipt_count=mutation_receipt_counts["changed_receipt_count"],
+                            diff_fingerprint=runtime_diff_fingerprint,
+                            diff_paths=runtime_diff_paths,
+                            focused_verification_success_observed=(
+                                post_write_focused_verification_success_observed
+                            ),
+                            continued_activity_after_verification=(
+                                continued_activity_after_verification
+                            ),
                         )
                     )
                     if (
@@ -16360,15 +15688,9 @@ class Agent:
                             user_visible_output=bool("".join(final_text_parts).strip()),
                             artifact_completed=bool(terminal_artifacts),
                             workspace_write_count=workspace_write_count,
-                            changed_receipt_count=mutation_receipt_counts[
-                                "changed_receipt_count"
-                            ],
-                            noop_receipt_count=mutation_receipt_counts[
-                                "noop_receipt_count"
-                            ],
-                            partial_receipt_count=mutation_receipt_counts[
-                                "partial_receipt_count"
-                            ],
+                            changed_receipt_count=mutation_receipt_counts["changed_receipt_count"],
+                            noop_receipt_count=mutation_receipt_counts["noop_receipt_count"],
+                            partial_receipt_count=mutation_receipt_counts["partial_receipt_count"],
                             workspace_change_likely_required=(
                                 self._turn_likely_requires_workspace_change("")
                             ),
@@ -16446,10 +15768,7 @@ class Agent:
                             code="progress_watchdog_blocked",
                         )
                 source_loop_recovery_guidance: str | None = None
-                if (
-                    accepted_goal_terminal_status is None
-                    and progress_watchdog_guidance is None
-                ):
+                if accepted_goal_terminal_status is None and progress_watchdog_guidance is None:
                     source_loop_recovery = source_loop_recovery_decision(
                         global_mode=runtime_recovery_mode,
                         diagnostic_events=runtime_diagnostic_events,
@@ -16465,9 +15784,7 @@ class Agent:
                             workspace_write_count=workspace_write_count,
                             source_context_signature=source_context_signature,
                         )
-                        recovery_event_key = source_loop_recovery.details.get(
-                            "recovery_event_key"
-                        )
+                        recovery_event_key = source_loop_recovery.details.get("recovery_event_key")
                         if isinstance(recovery_event_key, str) and recovery_event_key:
                             source_loop_recovery_attempted_keys.add(recovery_event_key)
                         else:
@@ -16481,10 +15798,7 @@ class Agent:
                             reason=source_loop_recovery.reason,
                             details=source_loop_recovery.details,
                         )
-                        if (
-                            source_loop_recovery.action == "nudge"
-                            and source_loop_recovery.message
-                        ):
+                        if source_loop_recovery.action == "nudge" and source_loop_recovery.message:
                             source_loop_recovery_guidance = source_loop_recovery.message
                             runtime_recovery_scaffolding_pending = True
                             self.config.metadata["source_loop_recoveries"] = (
@@ -16498,9 +15812,7 @@ class Agent:
                                 ),
                             )
                 budget_error = (
-                    None
-                    if accepted_goal_terminal_status is not None
-                    else _turn_budget_error()
+                    None if accepted_goal_terminal_status is not None else _turn_budget_error()
                 )
                 if terminal_error is None:
                     terminal_error = budget_error
@@ -16566,10 +15878,7 @@ class Agent:
                     break
 
                 # Per-iteration deadline check after tool execution
-                if (
-                    accepted_goal_terminal_status is None
-                    and _loop.time() > tool_deadline
-                ):
+                if accepted_goal_terminal_status is None and _loop.time() > tool_deadline:
                     if (
                         self._artifact_mutation_turn_active()
                         and document_mutation_attempted
@@ -16582,9 +15891,7 @@ class Agent:
                         ):
                             document_mutation_outcome = {
                                 "version": 1,
-                                "status": str(
-                                    prior_outcome.get("status") or "not_attempted"
-                                ),
+                                "status": str(prior_outcome.get("status") or "not_attempted"),
                                 "phase": str(prior_outcome.get("phase") or "proposal"),
                                 "retryPolicy": "new_turn",
                                 "code": "document_mutation_iteration_timeout",
@@ -16705,10 +16012,7 @@ class Agent:
                 # not trigger a late directive.
                 endgame_fix_margin_seconds = max(
                     0,
-                    int(
-                        getattr(self.config, "endgame_fix_directive_margin_seconds", 0)
-                        or 0
-                    ),
+                    int(getattr(self.config, "endgame_fix_directive_margin_seconds", 0) or 0),
                 )
                 if (
                     endgame_fix_margin_seconds > 0
@@ -16771,15 +16075,11 @@ class Agent:
                     placeholder_offense_iterations += 1
                     placeholder_escalation_threshold = max(
                         0,
-                        int(
-                            getattr(self.config, "placeholder_escalation_threshold", 0)
-                            or 0
-                        ),
+                        int(getattr(self.config, "placeholder_escalation_threshold", 0) or 0),
                     )
                     if (
                         placeholder_escalation_threshold > 0
-                        and placeholder_offense_iterations
-                        >= placeholder_escalation_threshold
+                        and placeholder_offense_iterations >= placeholder_escalation_threshold
                     ):
                         turn_messages.append(
                             Message(
@@ -16846,10 +16146,7 @@ class Agent:
                     reason=f"Agent turn timed out after {self.config.timeout}s",
                     code="agent_runtime_timeout",
                 )
-            elif (
-                self._artifact_mutation_turn_active()
-                and document_mutation_attempted
-            ):
+            elif self._artifact_mutation_turn_active() and document_mutation_attempted:
                 if document_mutation_outcome is None:
                     document_mutation_outcome = {
                         "version": 1,
@@ -16887,10 +16184,7 @@ class Agent:
                 item for item in turn_messages if item is not staged_pending_input_message
             ]
 
-        if (
-            self._artifact_mutation_turn_active()
-            and document_mutation_attempted
-        ):
+        if self._artifact_mutation_turn_active() and document_mutation_attempted:
             if document_mutation_outcome is None:
                 document_mutation_outcome = {
                     "version": 1,
@@ -16912,8 +16206,7 @@ class Agent:
                 and candidate_status in {"open", *_OPEN_CANDIDATE_STATUSES}
             )
             candidate_terminal_without_commit = bool(
-                candidate_controller is not None
-                and candidate_status in {"discarded", "ambiguous"}
+                candidate_controller is not None and candidate_status in {"discarded", "ambiguous"}
             )
             if candidate_is_open:
                 # ``run_turn`` emits DoneEvent before its outer cleanup rejects
@@ -16921,15 +16214,11 @@ class Agent:
                 # terminal, truthful outcome here; otherwise a provider's
                 # earlier "updated" narration could survive as the public
                 # answer even though no durable revision exists.
-                normalized_candidate_outcome = (
-                    _normalize_uncommitted_candidate_outcome(
-                        document_mutation_outcome,
-                        candidate_controller,
-                    )
+                normalized_candidate_outcome = _normalize_uncommitted_candidate_outcome(
+                    document_mutation_outcome,
+                    candidate_controller,
                 )
-                normalized_status = str(
-                    (normalized_candidate_outcome or {}).get("status") or ""
-                )
+                normalized_status = str((normalized_candidate_outcome or {}).get("status") or "")
                 if normalized_status not in _TERMINAL_CANDIDATE_OUTCOME_STATUSES:
                     unresolved_finish = bool(
                         getattr(
@@ -16967,13 +16256,10 @@ class Agent:
                             "text was replaced with the authoritative outcome."
                         ),
                     )
-            candidate_outcome_status = str(
-                (document_mutation_outcome or {}).get("status") or ""
-            )
+            candidate_outcome_status = str((document_mutation_outcome or {}).get("status") or "")
             if (
-                (candidate_is_open or candidate_terminal_without_commit)
-                and candidate_outcome_status != "applied"
-            ):
+                candidate_is_open or candidate_terminal_without_commit
+            ) and candidate_outcome_status != "applied":
                 authoritative_final_text = _document_mutation_fallback_text()
                 if current_final_text != authoritative_final_text:
                     current_final_text = authoritative_final_text
@@ -17089,14 +16375,11 @@ class Agent:
 
         error_usage_report_rows: list[dict[str, Any]] = []
         if turn_has_error_usage_receipt and turn_model_usage_breakdown:
-            error_usage_report_rows = _with_model_usage_cost_fields(
-                turn_model_usage_breakdown
-            )
+            error_usage_report_rows = _with_model_usage_cost_fields(turn_model_usage_breakdown)
             # Reuse the per-member price resolution below instead of resolving
             # the same rows again during final summarization.
             turn_model_usage_breakdown = [
-                {**row, "_opensquilla_reported_cost": True}
-                for row in error_usage_report_rows
+                {**row, "_opensquilla_reported_cost": True} for row in error_usage_report_rows
             ]
 
         turn_usage_delta = (
@@ -17154,21 +16437,15 @@ class Agent:
                     or row.get("billedCost")
                 )
                 report_estimated_cost += max(0.0, row_cost - row_billed)
-                row_basis = str(
-                    row.get("estimate_basis") or row.get("estimateBasis") or ""
-                ).strip()
+                row_basis = str(row.get("estimate_basis") or row.get("estimateBasis") or "").strip()
                 if row_basis:
                     report_estimate_bases.add(row_basis)
                 report_components.append(
                     _cost_component_flags(
-                        cost_source=str(
-                            row.get("cost_source") or row.get("costSource") or "none"
-                        ),
+                        cost_source=str(row.get("cost_source") or row.get("costSource") or "none"),
                         cost_usd=row_cost,
                         billed_cost=row_billed,
-                        missing_cost_entries=_usage_int(
-                            row.get("missing_cost_entries") or 0
-                        ),
+                        missing_cost_entries=_usage_int(row.get("missing_cost_entries") or 0),
                         estimate_basis=row_basis or None,
                     )
                 )
@@ -17202,15 +16479,13 @@ class Agent:
             or done_billed_cost
             or total_provider_billed_entries
         )
-        has_billed_component, has_estimated_component, missing_cost_entries = (
-            _cost_component_flags(
-                cost_source=cost_source,
-                cost_usd=done_cost,
-                billed_cost=done_billed_cost,
-                missing_cost_entries=total_missing_cost_entries,
-                estimate_basis=estimate_basis,
-                infer_missing=parent_has_usage,
-            )
+        has_billed_component, has_estimated_component, missing_cost_entries = _cost_component_flags(
+            cost_source=cost_source,
+            cost_usd=done_cost,
+            billed_cost=done_billed_cost,
+            missing_cost_entries=total_missing_cost_entries,
+            estimate_basis=estimate_basis,
+            infer_missing=parent_has_usage,
         )
         estimate_bases = (
             [estimate_basis]
@@ -17224,9 +16499,7 @@ class Agent:
             and not has_estimated_component
         )
         estimate_source = (
-            cost_source
-            if cost_source in _ESTIMATE_COST_SOURCES
-            else "opensquilla_estimate"
+            cost_source if cost_source in _ESTIMATE_COST_SOURCES else "opensquilla_estimate"
         )
         parent_breakdown_rows: list[dict[str, Any]] = []
         if parent_has_usage and not turn_model_usage_breakdown and done_model:
@@ -17264,9 +16537,7 @@ class Agent:
         )
         await self._write_patch_evidence_ledger(
             final_status=(
-                "ok"
-                if terminal_error is None
-                else (terminal_error.code or "agent_error")
+                "ok" if terminal_error is None else (terminal_error.code or "agent_error")
             ),
             iterations=iterations,
             provider_call_count=turn_llm_calls,
@@ -17279,10 +16550,7 @@ class Agent:
                 if runtime_diff_paths is not None
                 else None
             )
-            if (
-                runtime_diff_paths is not None
-                and self._runtime_git_state is GitRunState.OK
-            ):
+            if runtime_diff_paths is not None and self._runtime_git_state is GitRunState.OK:
                 for runtime_event in runtime_diagnostics.observe_finish_error(
                     iteration=iterations,
                     provider_call_count=turn_llm_calls,
@@ -17295,9 +16563,7 @@ class Agent:
                 ):
                     append_runtime_event(self.config.runtime_events_path, runtime_event)
             else:
-                self._record_runtime_git_observation_skip(
-                    consumers=("runtime_diagnostics_finish",)
-                )
+                self._record_runtime_git_observation_skip(consumers=("runtime_diagnostics_finish",))
         if bool(getattr(self.config, "final_diff_salvage", False)):
             # Last engine-controlled moment before the runner collects the
             # patch from the worktree: if prior source writes ended in an
@@ -17359,10 +16625,7 @@ class Agent:
             has_billed_component |= child_billed
             has_estimated_component |= child_estimated
             missing_cost_entries += child_missing
-            if (
-                child_estimated
-                and child_usage.estimate_basis not in {None, "free"}
-            ):
+            if child_estimated and child_usage.estimate_basis not in {None, "free"}:
                 estimate_bases.append(child_usage.estimate_basis)
             has_free_cost_component |= bool(
                 child_usage.has_usage
@@ -17616,9 +16879,7 @@ class Agent:
         if not workspace_dir.exists():
             return []
         self._runtime_git_state = GitRunState.OK
-        ignored_state, ignored_paths = self._workspace_ignored_diff_paths_observed(
-            workspace_dir
-        )
+        ignored_state, ignored_paths = self._workspace_ignored_diff_paths_observed(workspace_dir)
         if ignored_state is not GitRunState.OK:
             self._runtime_git_state = ignored_state
             return None
@@ -17672,9 +16933,7 @@ class Agent:
             return False
         name = Path(normalized).name.lower()
         return any(
-            name == prefix
-            or name.startswith(f"{prefix}.")
-            or name.startswith(f"{prefix}_")
+            name == prefix or name.startswith(f"{prefix}.") or name.startswith(f"{prefix}_")
             for prefix in _SUSPICIOUS_NEW_WORKSPACE_WRITE_PREFIXES
         )
 
@@ -17710,8 +16969,7 @@ class Agent:
         return [
             receipt
             for receipt in self._workspace_mutation_receipts()
-            if receipt.get("changed") is True
-            and receipt.get("classification") != "scratch"
+            if receipt.get("changed") is True and receipt.get("classification") != "scratch"
         ]
 
     def _workspace_mutation_receipt_counts(self) -> dict[str, int]:
@@ -17722,9 +16980,7 @@ class Agent:
         ]
         return {
             "changed_receipt_count": len(self._changed_workspace_mutation_receipts()),
-            "noop_receipt_count": sum(
-                1 for receipt in receipts if receipt.get("changed") is False
-            ),
+            "noop_receipt_count": sum(1 for receipt in receipts if receipt.get("changed") is False),
             "partial_receipt_count": sum(
                 1 for receipt in receipts if receipt.get("partial") is True
             ),
@@ -17818,9 +17074,7 @@ class Agent:
             "changed_files": self._relative_paths_from_records(self._workspace_write_records()),
             "mutation_records": self._workspace_mutation_records(),
             "hint_text_sha256": (
-                hashlib.sha256(hint_text.encode("utf-8")).hexdigest()
-                if hint_text
-                else None
+                hashlib.sha256(hint_text.encode("utf-8")).hexdigest() if hint_text else None
             ),
             "trigger_confidence": "final_diff_contract_gate",
         }
@@ -17884,9 +17138,7 @@ class Agent:
         applied: list[dict[str, Any]] = []
         handled_paths: set[str] = set()
         for candidate in reversed(candidates):
-            paths = [
-                path for path in candidate.get("paths", []) if isinstance(path, str) and path
-            ]
+            paths = [path for path in candidate.get("paths", []) if isinstance(path, str) and path]
             if not paths or paths[0] in handled_paths:
                 continue
             path = paths[0]
@@ -18069,10 +17321,7 @@ class Agent:
         scratch_dir = getattr(ctx, "scratch_dir", None) if ctx is not None else None
         if not scratch_dir:
             return None
-        return (
-            Path(scratch_dir).expanduser().resolve(strict=False)
-            / _VERIFY_MIRROR_DIR_NAME
-        )
+        return Path(scratch_dir).expanduser().resolve(strict=False) / _VERIFY_MIRROR_DIR_NAME
 
     @staticmethod
     def _command_references_verify_mirror(command: str, mirror_root: Path) -> bool:
@@ -18112,9 +17361,7 @@ class Agent:
         """
 
         mirror_root = self._scratch_verify_mirror_root()
-        if mirror_root is None or not self._command_references_verify_mirror(
-            command, mirror_root
-        ):
+        if mirror_root is None or not self._command_references_verify_mirror(command, mirror_root):
             return True
         if not mirror_root.is_dir():
             return True
@@ -18181,9 +17428,7 @@ class Agent:
             )
             if not result.ok:
                 return result.state, None
-            gitlink_state, gitlink_paths = self._workspace_gitlink_paths_observed(
-                workspace
-            )
+            gitlink_state, gitlink_paths = self._workspace_gitlink_paths_observed(workspace)
             if gitlink_state is not GitRunState.OK:
                 return gitlink_state, None
             return (
@@ -18265,9 +17510,7 @@ class Agent:
                 if not worktree_result.ok:
                     return worktree_result.state, None
                 diff_text = cached_result.stdout_text + worktree_result.stdout_text
-            ignored_state, ignored_paths = self._workspace_ignored_diff_paths_observed(
-                workspace
-            )
+            ignored_state, ignored_paths = self._workspace_ignored_diff_paths_observed(workspace)
             if ignored_state is not GitRunState.OK:
                 return ignored_state, None
             file_index = self._filter_ignored_porcelain_status(
@@ -18282,11 +17525,7 @@ class Agent:
 
     @staticmethod
     def _submit_review_git_unavailable_payload(state: GitRunState) -> dict[str, Any]:
-        code = (
-            "GIT_NOT_REPOSITORY"
-            if state is GitRunState.NOT_REPOSITORY
-            else "GIT_UNAVAILABLE"
-        )
+        code = "GIT_NOT_REPOSITORY" if state is GitRunState.NOT_REPOSITORY else "GIT_UNAVAILABLE"
         return {
             "status": "unavailable",
             "code": code,
@@ -18310,11 +17549,7 @@ class Agent:
         raw_status_line = line.rstrip()
         if not raw_status_line.strip():
             return None
-        text = (
-            raw_status_line[3:].strip()
-            if len(raw_status_line) > 3
-            else raw_status_line.strip()
-        )
+        text = raw_status_line[3:].strip() if len(raw_status_line) > 3 else raw_status_line.strip()
         if " -> " in text:
             text = text.split(" -> ", 1)[1].strip()
         return _normalize_workspace_relative_path(text) or None
@@ -18343,11 +17578,7 @@ class Agent:
                 continue
             raw = line.rstrip()
             text = raw[3:].strip() if len(raw) > 3 else raw.strip()
-            sides = (
-                [side.strip() for side in text.split(" -> ", 1)]
-                if " -> " in text
-                else [text]
-            )
+            sides = [side.strip() for side in text.split(" -> ", 1)] if " -> " in text else [text]
             for side in sides:
                 path = _normalize_workspace_relative_path(side)
                 if not path:
@@ -18383,11 +17614,7 @@ class Agent:
                 continue
             raw = line.rstrip()
             text = raw[3:].strip() if len(raw) > 3 else raw.strip()
-            sides = (
-                [side.strip() for side in text.split(" -> ", 1)]
-                if " -> " in text
-                else [text]
-            )
+            sides = [side.strip() for side in text.split(" -> ", 1)] if " -> " in text else [text]
             for side in sides:
                 path = _normalize_workspace_relative_path(side)
                 if not path:
@@ -18595,11 +17822,7 @@ class Agent:
             )
         tool_name = str(details.get("tool_name") or "a tool")
         status_reason = str(details.get("execution_status_reason") or "").strip()
-        reason_text = (
-            f" Reason: {status_reason}."
-            if status_reason
-            else ""
-        )
+        reason_text = f" Reason: {status_reason}." if status_reason else ""
         anchors = details.get("failure_anchors")
         anchor_text = ""
         if isinstance(anchors, list) and anchors:
@@ -18952,8 +18175,8 @@ class Agent:
             )
         if tc.tool_name not in {"edit_file", "write_file", "write_scratch"}:
             return None
-        scratch_target, claimed_scratch = (
-            self._workspace_edit_gate_external_scratch_repro_target(tc)
+        scratch_target, claimed_scratch = self._workspace_edit_gate_external_scratch_repro_target(
+            tc
         )
         if tc.tool_name == "write_scratch":
             if scratch_target is not None:
@@ -18993,15 +18216,12 @@ class Agent:
             return False
         name = resolved_path.name.lower()
         suspicious_name = any(
-            name == prefix
-            or name.startswith(f"{prefix}.")
-            or name.startswith(f"{prefix}_")
+            name == prefix or name.startswith(f"{prefix}.") or name.startswith(f"{prefix}_")
             for prefix in _SUSPICIOUS_NEW_WORKSPACE_WRITE_PREFIXES
         )
         content = (self._tool_call_string_arg(tc, "content") or "").lower()
         suspicious_content = any(
-            marker in content
-            for marker in _SUSPICIOUS_NEW_WORKSPACE_WRITE_CONTENT_MARKERS
+            marker in content for marker in _SUSPICIOUS_NEW_WORKSPACE_WRITE_CONTENT_MARKERS
         )
         return suspicious_name or suspicious_content
 
@@ -19038,9 +18258,8 @@ class Agent:
     ) -> ToolResult | None:
         if gate_details is None:
             return None
-        if (
-            recovery_reads_remaining > 0
-            and self._workspace_edit_gate_allows_recovery_read(tc, recovery_read_paths)
+        if recovery_reads_remaining > 0 and self._workspace_edit_gate_allows_recovery_read(
+            tc, recovery_read_paths
         ):
             return None
         scratch_target, _ = self._workspace_edit_gate_external_scratch_repro_target(tc)
@@ -19050,9 +18269,7 @@ class Agent:
             tc.tool_name in _WORKSPACE_EDIT_TOOL_NAMES or tc.tool_name == "write_scratch"
         )
         edit_block_detail = (
-            self._workspace_edit_gate_edit_block_detail(tc)
-            if gate_write_tool
-            else None
+            self._workspace_edit_gate_edit_block_detail(tc) if gate_write_tool else None
         )
         if gate_write_tool and edit_block_detail is None:
             return None
@@ -19105,9 +18322,7 @@ class Agent:
 
         if not tools:
             return None
-        delivery_tools = [
-            tool for tool in tools if tool.name == "publish_artifact"
-        ]
+        delivery_tools = [tool for tool in tools if tool.name == "publish_artifact"]
         return delivery_tools or None
 
     def _workspace_edit_gate_system_prompt(
@@ -19222,14 +18437,10 @@ class Agent:
         return (tc.tool_name, hashlib.sha256(payload.encode("utf-8")).hexdigest())
 
     def _repeated_tool_call_recovery_tool_names(self) -> frozenset[str]:
-        extra_tools = (
-            getattr(self.config, "repeated_tool_call_recovery_extra_tools", None) or ()
-        )
+        extra_tools = getattr(self.config, "repeated_tool_call_recovery_extra_tools", None) or ()
         if not extra_tools:
             return _REPEATED_TOOL_CALL_RECOVERY_TOOL_NAMES
-        return _REPEATED_TOOL_CALL_RECOVERY_TOOL_NAMES | {
-            str(name) for name in extra_tools
-        }
+        return _REPEATED_TOOL_CALL_RECOVERY_TOOL_NAMES | {str(name) for name in extra_tools}
 
     @staticmethod
     def _tool_call_arguments_preview(tc: ToolCall, *, max_chars: int = 400) -> str:
@@ -19270,8 +18481,7 @@ class Agent:
             payload["session_key"] = self._session_key
         if payload.get("agent_id") is None:
             payload["agent_id"] = (
-                self.config.tool_result_store_agent_id
-                or self.config.metadata.get("agent_id")
+                self.config.tool_result_store_agent_id or self.config.metadata.get("agent_id")
             )
         append_runtime_event(self.config.runtime_events_path, payload)
 
@@ -19424,9 +18634,7 @@ class Agent:
             "diff_observed": runtime_diff_paths is not None,
             "verification_commands": self._verification_commands_for_runtime_event(),
             "hint_text_sha256": (
-                hashlib.sha256(hint_text.encode("utf-8")).hexdigest()
-                if hint_text
-                else None
+                hashlib.sha256(hint_text.encode("utf-8")).hexdigest() if hint_text else None
             ),
             "trigger_confidence": "post_write_convergence_gate",
             "details": evidence,
@@ -19453,9 +18661,7 @@ class Agent:
             self._runtime_git_state = GitRunState.NOT_REPOSITORY
             return None
         self._runtime_git_state = GitRunState.OK
-        ignored_state, ignored_paths = self._workspace_ignored_diff_paths_observed(
-            workspace_dir
-        )
+        ignored_state, ignored_paths = self._workspace_ignored_diff_paths_observed(workspace_dir)
         if ignored_state is not GitRunState.OK:
             self._runtime_git_state = ignored_state
             return None
@@ -19487,9 +18693,7 @@ class Agent:
         workspace_dir = self._workspace_dir_for_status()
         if workspace_dir is None:
             return []
-        gitlink_state, ignored_paths = self._workspace_gitlink_paths_observed(
-            workspace_dir
-        )
+        gitlink_state, ignored_paths = self._workspace_gitlink_paths_observed(workspace_dir)
         if gitlink_state is not GitRunState.OK:
             return None
         ignored_paths |= self._workspace_internal_diagnostic_paths(workspace_dir)
@@ -19528,8 +18732,8 @@ class Agent:
             if not raw_path:
                 continue
             try:
-                relative = Path(raw_path).expanduser().resolve(strict=False).relative_to(
-                    workspace_dir
+                relative = (
+                    Path(raw_path).expanduser().resolve(strict=False).relative_to(workspace_dir)
                 )
             except ValueError:
                 continue
@@ -19557,8 +18761,8 @@ class Agent:
             payload_parts.append(f"$ git {' '.join(args)}\n")
             stdout = result.stdout_text
             if args[0] == "status":
-                ignored_state, ignored_paths = (
-                    self._workspace_ignored_diff_paths_observed(workspace_dir)
+                ignored_state, ignored_paths = self._workspace_ignored_diff_paths_observed(
+                    workspace_dir
                 )
                 if ignored_state is not GitRunState.OK:
                     self._runtime_git_state = ignored_state
@@ -19644,10 +18848,9 @@ class Agent:
         text = Agent._tool_result_text_for_anchor(result.content)
         if result.is_error or Agent._tool_result_has_failure_signal(text):
             return "failure"
-        if (
-            Agent._tool_result_has_validation_success_signal(text)
-            or _PLAIN_PASSED_SUMMARY_RE.search(text)
-        ):
+        if Agent._tool_result_has_validation_success_signal(
+            text
+        ) or _PLAIN_PASSED_SUMMARY_RE.search(text):
             return "success"
         return "unknown"
 
@@ -19748,11 +18951,7 @@ class Agent:
         close_state: dict[str, bool] | None = None,
     ) -> AsyncIterator[Any]:
         while True:
-            dynamic_deadline = (
-                deadline_provider()
-                if deadline_provider is not None
-                else None
-            )
+            dynamic_deadline = deadline_provider() if deadline_provider is not None else None
             active_deadline = total_deadline
             if dynamic_deadline is not None:
                 active_deadline = (
@@ -19817,8 +19016,7 @@ class Agent:
             if not done:
                 await _cancel_provider_pull(grace_seconds=TIMEOUT_CANCEL_GRACE_SECONDS)
                 if total_deadline_limits_wait or (
-                    active_deadline is not None
-                    and loop.time() >= active_deadline
+                    active_deadline is not None and loop.time() >= active_deadline
                 ):
                     assert active_deadline is not None
                     raise _provider_stream_deadline_timeout(
@@ -19839,9 +19037,7 @@ class Agent:
             except Exception as exc:  # noqa: BLE001 - provider boundary
                 # TimeoutError raised *by the provider* is different from
                 # the deadline timeouts raised above by this wrapper.
-                raise _RaisedProviderBoundaryError(
-                    timeout=isinstance(exc, TimeoutError)
-                ) from None
+                raise _RaisedProviderBoundaryError(timeout=isinstance(exc, TimeoutError)) from None
             yield event
 
     @staticmethod
@@ -20054,9 +19250,7 @@ class Agent:
             turn_objective_message=turn_objective_message,
         )
         if identical_request_perturbed:
-            request_messages = self._append_identical_request_loop_nudge(
-                request_messages
-            )
+            request_messages = self._append_identical_request_loop_nudge(request_messages)
         return project_provider_message_count(
             self.provider,
             request_messages,
@@ -20145,9 +19339,7 @@ class Agent:
                 return True
             raw_status = getattr(block, "execution_status", None)
             if isinstance(raw_status, dict):
-                raw_status_name = str(
-                    raw_status.get("status") or ""
-                ).strip().lower()
+                raw_status_name = str(raw_status.get("status") or "").strip().lower()
                 if raw_status_name in unresolved_markers | {
                     "error",
                     "failed",
@@ -20164,8 +19356,7 @@ class Agent:
                     return True
                 if normalized_name == "unknown" and (
                     normalized_status["source"] != "legacy"
-                    or normalized_status["reason"]
-                    not in {None, "legacy_missing_status"}
+                    or normalized_status["reason"] not in {None, "legacy_missing_status"}
                     or normalized_status["preservation_class"] == "ephemeral"
                 ):
                     return True
@@ -20176,9 +19367,11 @@ class Agent:
                 parsed = json.loads(raw)
             except (TypeError, json.JSONDecodeError):
                 continue
-            if isinstance(parsed, dict) and str(
-                parsed.get("status") or parsed.get("execution_status") or ""
-            ).lower() in unresolved_markers:
+            if (
+                isinstance(parsed, dict)
+                and str(parsed.get("status") or parsed.get("execution_status") or "").lower()
+                in unresolved_markers
+            ):
                 return True
         return False
 
@@ -20225,20 +19418,14 @@ class Agent:
             )
             group = messages[start:end]
             has_result = any(_message_has_tool_result(message) for message in group)
-            unresolved = (
-                _message_has_tool_use(messages[start])
-                and not has_result
-            )
+            unresolved = _message_has_tool_use(messages[start]) and not has_result
             critical = unresolved or any(
-                self._tool_result_requires_raw_preservation(message)
-                for message in group
+                self._tool_result_requires_raw_preservation(message) for message in group
             )
             rounds.append((start, end, critical))
 
         keep_round = max(0, len(rounds) - protected_round_count)
-        critical_rounds = [
-            index for index, (_, _, critical) in enumerate(rounds) if critical
-        ]
+        critical_rounds = [index for index, (_, _, critical) in enumerate(rounds) if critical]
         if critical_rounds:
             keep_round = min(keep_round, min(critical_rounds))
         if keep_round <= 0:
@@ -20277,9 +19464,7 @@ class Agent:
         """Summarize completed live rounds into an ephemeral provider view."""
 
         if self._restricted_auxiliary_compaction_disabled():
-            self._last_compaction_refusal_reason = (
-                "restricted_turn_compaction_disabled"
-            )
+            self._last_compaction_refusal_reason = "restricted_turn_compaction_disabled"
             return None
 
         boundary = self._live_turn_compaction_boundary(
@@ -20317,9 +19502,7 @@ class Agent:
             result = await compact_context(
                 CompactionRequest(
                     session_id="agent-live-turn-request-view",
-                    entries=self._message_count_compaction_entries(
-                        summary_messages
-                    ),
+                    entries=self._message_count_compaction_entries(summary_messages),
                     context_window_tokens=context_window_tokens,
                     context_window_chars=context_window_chars,
                     config=config,
@@ -20338,25 +19521,15 @@ class Agent:
         finally:
             if shared_compaction_config is not None:
                 config.protect_semantic_tail = original_protect_semantic_tail
-                config.protected_recent_messages = (
-                    original_protected_recent_messages
-                )
+                config.protected_recent_messages = original_protected_recent_messages
         replacement_applied = bool(
-            result.removed_count > 0
-            or getattr(result, "replaced_previous_summary", False)
+            result.removed_count > 0 or getattr(result, "replaced_previous_summary", False)
         )
         # Rejected candidates intentionally keep their structured payload for
         # diagnostics. They are not installed state and must never be replayed
         # ahead of the unchanged raw history.
-        replay_summary = (
-            compaction_replay_summary(result)
-            if replacement_applied
-            else ""
-        )
-        if (
-            result.removed_count != len(summary_messages)
-            or not replay_summary
-        ):
+        replay_summary = compaction_replay_summary(result) if replacement_applied else ""
+        if result.removed_count != len(summary_messages) or not replay_summary:
             return None
 
         projected = [
@@ -20533,9 +19706,7 @@ class Agent:
         """
 
         if self._restricted_auxiliary_compaction_disabled():
-            self._last_compaction_refusal_reason = (
-                "restricted_turn_compaction_disabled"
-            )
+            self._last_compaction_refusal_reason = "restricted_turn_compaction_disabled"
             return None, "restricted_turn_compaction_disabled"
 
         limit = int(proof.limit)
@@ -20647,20 +19818,14 @@ class Agent:
         except Exception:  # noqa: BLE001 - refusal is surfaced as a stable terminal state
             return None, "summary_failed"
         replacement_applied = bool(
-            result.removed_count > 0
-            or getattr(result, "replaced_previous_summary", False)
+            result.removed_count > 0 or getattr(result, "replaced_previous_summary", False)
         )
         # Quality/coverage rejection returns the candidate payload for
         # diagnostics, but it is not installed state. Replaying that payload
         # while retaining the full raw history would make the request larger.
-        replay_summary = (
-            compaction_replay_summary(result)
-            if replacement_applied
-            else ""
-        )
+        replay_summary = compaction_replay_summary(result) if replacement_applied else ""
         kept_start_index = int(
-            getattr(result, "kept_start_index", result.removed_count)
-            or result.removed_count
+            getattr(result, "kept_start_index", result.removed_count) or result.removed_count
         )
         if (
             result.removed_count != selected_cut
@@ -20776,8 +19941,7 @@ class Agent:
 
         ctx = self._tool_context or current_tool_context.get()
         return bool(
-            self.config.restricted_turn
-            or (ctx is not None and ctx.exclusive_tools is not None)
+            self.config.restricted_turn or (ctx is not None and ctx.exclusive_tools is not None)
         )
 
     def _restricted_auxiliary_compaction_disabled(self) -> bool:
@@ -20901,9 +20065,8 @@ class Agent:
                         reason=reason,
                         exc_info=True,
                     )
-        if (
-            str(getattr(candidate_state, "status", "")) == "committed"
-            and not bool(getattr(ctx, "_artifact_source_patched_emitted", False))
+        if str(getattr(candidate_state, "status", "")) == "committed" and not bool(
+            getattr(ctx, "_artifact_source_patched_emitted", False)
         ):
             emitter = getattr(ctx, "artifact_event_emitter", None)
             service = getattr(ctx, "artifact_session", None)
@@ -20915,8 +20078,10 @@ class Agent:
             list_audit = getattr(service, "list_audit_events", None)
             if callable(emitter) and isinstance(document_id, str):
                 try:
-                    if callable(exact_audit) and isinstance(revision_id, str) and isinstance(
-                        change_set_id, str
+                    if (
+                        callable(exact_audit)
+                        and isinstance(revision_id, str)
+                        and isinstance(change_set_id, str)
                     ):
                         latest = await asyncio.shield(
                             exact_audit(
@@ -20997,9 +20162,7 @@ class Agent:
                 try:
                     preview_handle = getattr(controller, "preview_handle", None)
                     if isinstance(preview_handle, str):
-                        restored = bool(
-                            await asyncio.shield(restore(preview_handle))
-                        )
+                        restored = bool(await asyncio.shield(restore(preview_handle)))
                 except Exception:  # noqa: BLE001 - a later UI refresh may retry
                     logger.warning(
                         "agent.candidate_preview_commit_cleanup_retry_failed",
@@ -21043,15 +20206,16 @@ class Agent:
         state = getattr(controller, "state", None)
         state_status = str(getattr(state, "status", ""))
         change_set = getattr(controller, "change_set", None)
-        has_open_draft = (
-            state_status == "open"
-            and getattr(change_set, "status", None) == "draft"
-        )
-        if state_status not in {
-            "candidate_staged",
-            "verification_passed",
-            "verification_failed",
-        } and not has_open_draft:
+        has_open_draft = state_status == "open" and getattr(change_set, "status", None) == "draft"
+        if (
+            state_status
+            not in {
+                "candidate_staged",
+                "verification_passed",
+                "verification_failed",
+            }
+            and not has_open_draft
+        ):
             return
         try:
             from opensquilla.artifact_session import Actor, ActorKind
@@ -21089,9 +20253,7 @@ class Agent:
                     except asyncio.CancelledError:
                         raise
                     except Exception:
-                        if bool(
-                            getattr(controller, "discard_blocked_by_other_finish", False)
-                        ):
+                        if bool(getattr(controller, "discard_blocked_by_other_finish", False)):
                             logger.info(
                                 "agent.candidate_loop_cleanup_deferred_to_finish_owner",
                                 session_key=self._session_key,
@@ -21110,9 +20272,7 @@ class Agent:
                         except Exception:
                             raise
                         refreshed_state = getattr(controller, "state", None)
-                        refreshed_status = str(
-                            getattr(refreshed_state, "status", "") or ""
-                        )
+                        refreshed_status = str(getattr(refreshed_state, "status", "") or "")
                         refreshed_change_set = getattr(controller, "change_set", None)
                         refreshed_open_draft = (
                             refreshed_status == "open"
@@ -21120,11 +20280,15 @@ class Agent:
                         )
                         if refreshed_status in {"committed", "discarded"}:
                             break
-                        if refreshed_status not in {
-                            "candidate_staged",
-                            "verification_passed",
-                            "verification_failed",
-                        } and not refreshed_open_draft:
+                        if (
+                            refreshed_status
+                            not in {
+                                "candidate_staged",
+                                "verification_passed",
+                                "verification_failed",
+                            }
+                            and not refreshed_open_draft
+                        ):
                             raise
             # Never delete the physical candidate unless the durable
             # ChangeSet is confirmed REJECTED.  A discard CAS can race a
@@ -21134,18 +20298,14 @@ class Agent:
             # the artifact.  The restart cleanup journal handles unresolved
             # drafts safely on a later pass.
             final_candidate_state = getattr(controller, "state", None)
-            final_candidate_status = str(
-                getattr(final_candidate_state, "status", "") or ""
-            )
+            final_candidate_status = str(getattr(final_candidate_state, "status", "") or "")
             final_change_set = getattr(controller, "change_set", None)
             final_change_set_status = getattr(final_change_set, "status", "")
             final_change_set_status = str(
-                getattr(final_change_set_status, "value", final_change_set_status)
-                or ""
+                getattr(final_change_set_status, "value", final_change_set_status) or ""
             ).lower()
             confirmed_rejected = (
-                final_candidate_status == "discarded"
-                and final_change_set_status == "rejected"
+                final_candidate_status == "discarded" and final_change_set_status == "rejected"
             )
             if candidate_blob is not None and confirmed_rejected:
                 try:
@@ -21178,9 +20338,7 @@ class Agent:
                 try:
                     preview_handle = getattr(controller, "preview_handle", None)
                     if isinstance(preview_handle, str):
-                        restored = bool(
-                            await asyncio.shield(restore(preview_handle))
-                        )
+                        restored = bool(await asyncio.shield(restore(preview_handle)))
                 except Exception:  # noqa: BLE001 - fallback retirement still runs
                     logger.warning(
                         "agent.candidate_preview_restore_failed",
@@ -21238,11 +20396,7 @@ class Agent:
         if tool_name not in _PROMPT_ANNOTATION_WRITER_TOOLS:
             return None
         ctx = self._tool_context or current_tool_context.get()
-        if (
-            ctx is None
-            or ctx.surfaced_tools is None
-            or tool_name not in ctx.surfaced_tools
-        ):
+        if ctx is None or ctx.surfaced_tools is None or tool_name not in ctx.surfaced_tools:
             return None
         # Candidate-loop writers are staged in the turn-scoped draft
         # controller. They must not be routed through the legacy
@@ -21377,8 +20531,7 @@ class Agent:
             None,
         )
         if (
-            controller is None
-            and candidate_controller is None
+            controller is None and candidate_controller is None
         ) or tool_call.tool_name not in _PROMPT_ANNOTATION_WRITER_TOOLS:
             return result
         if candidate_controller is not None:
@@ -21560,10 +20713,9 @@ class Agent:
             if not isinstance(message.content, list):
                 continue
             for block in message.content:
-                if (
-                    isinstance(block, ContentBlockToolUse)
-                    and Agent._has_provider_context_replay_marker(block.input)
-                ):
+                if isinstance(
+                    block, ContentBlockToolUse
+                ) and Agent._has_provider_context_replay_marker(block.input):
                     return True
         return False
 
@@ -21860,9 +21012,7 @@ class Agent:
             # Never project canonical PromptAnnotation history into an
             # auxiliary summarizer. The persisted transcript remains intact;
             # the caller returns a bounded primary-request overflow error.
-            self._last_compaction_refusal_reason = (
-                "restricted_turn_compaction_disabled"
-            )
+            self._last_compaction_refusal_reason = "restricted_turn_compaction_disabled"
             logger.warning(
                 "compaction.restricted_turn_skipped",
                 estimated_context_tokens=estimated_context_tokens,
@@ -21877,8 +21027,7 @@ class Agent:
         )
         request_scoped_only = durable_consumer_overflow_proven is False
         routed_window_is_narrower = (
-            durable_window_tokens > window_tokens
-            and durable_consumer_overflow_proven is not True
+            durable_window_tokens > window_tokens and durable_consumer_overflow_proven is not True
         )
         if request_scoped_only or routed_window_is_narrower:
             # A temporary route/member window is request scope. Preflight has
@@ -21913,16 +21062,12 @@ class Agent:
                     ephemeral = None
                 if ephemeral is not None:
                     return ephemeral
-            self._last_compaction_refusal_reason = (
-                "provider_request_budget_exhausted"
-            )
+            self._last_compaction_refusal_reason = "provider_request_budget_exhausted"
             logger.warning(
                 "compaction.durable_rewrite_refused_for_routed_window",
                 routed_context_window_tokens=window_tokens,
                 durable_context_window_tokens=durable_window_tokens,
-                durable_consumer_overflow_proven=(
-                    durable_consumer_overflow_proven
-                ),
+                durable_consumer_overflow_proven=(durable_consumer_overflow_proven),
                 protected_turn_start_index=protected_turn_start_index,
             )
             return None
@@ -21934,9 +21079,7 @@ class Agent:
             )
             protected_tail_tokens = sum(
                 int(entry["token_count"])
-                for entry in self._message_count_compaction_entries(
-                    messages[protected_tail_start:]
-                )
+                for entry in self._message_count_compaction_entries(messages[protected_tail_start:])
             )
             protected_tail_chars = len(
                 json.dumps(
@@ -21950,13 +21093,9 @@ class Agent:
                 )
             )
             protected_tail_over_character_budget = bool(
-                char_threshold is not None
-                and protected_tail_chars > char_threshold
+                char_threshold is not None and protected_tail_chars > char_threshold
             )
-            if (
-                protected_tail_tokens > threshold
-                or protected_tail_over_character_budget
-            ):
+            if protected_tail_tokens > threshold or protected_tail_over_character_budget:
                 try:
                     ephemeral = await self._recover_live_turn_request_overflow(
                         messages,
@@ -21983,11 +21122,7 @@ class Agent:
                     protected_tail_tokens=protected_tail_tokens,
                     protected_tail_chars=protected_tail_chars,
                     threshold_tokens=int(threshold),
-                    threshold_chars=(
-                        int(char_threshold)
-                        if char_threshold is not None
-                        else None
-                    ),
+                    threshold_chars=(int(char_threshold) if char_threshold is not None else None),
                     context_window_tokens=pressure_window_tokens,
                     protected_message_count=len(messages) - protected_tail_start,
                 )
@@ -22219,9 +21354,7 @@ class Agent:
                 real_tokens = get_approx_tokens(m.content)
             else:
                 flat = _flatten_content_blocks(m.content)
-                real_tokens = get_approx_tokens(
-                    json.dumps(Agent._live_request_jsonable(m.content))
-                )
+                real_tokens = get_approx_tokens(json.dumps(Agent._live_request_jsonable(m.content)))
             entries.append(
                 {
                     "role": m.role,
@@ -22300,24 +21433,17 @@ class Agent:
             return None  # signal failure
 
         replacement_applied = bool(
-            result.removed_count > 0
-            or getattr(result, "replaced_previous_summary", False)
+            result.removed_count > 0 or getattr(result, "replaced_previous_summary", False)
         )
         # Quality/coverage rejection returns the candidate payload for
         # diagnostics, but it is not installed state. Replaying that payload
         # while retaining the full raw history would make the request larger.
-        replay_summary = (
-            compaction_replay_summary(result)
-            if replacement_applied
-            else ""
-        )
+        replay_summary = compaction_replay_summary(result) if replacement_applied else ""
         kept_start_index = int(
-            getattr(result, "kept_start_index", result.removed_count)
-            or result.removed_count
+            getattr(result, "kept_start_index", result.removed_count) or result.removed_count
         )
         if protected_start is not None and (
-            int(result.removed_count) > protected_start
-            or kept_start_index > protected_start
+            int(result.removed_count) > protected_start or kept_start_index > protected_start
         ):
             logger.warning(
                 "compaction.protected_tail_change_rejected",
@@ -22531,9 +21657,7 @@ class Agent:
             summary=str(getattr(result, "summary", "") or ""),
             summary_payload=getattr(result, "summary_payload", None),
             summary_format=str(getattr(result, "summary_format", "text") or "text"),
-            coverage_status=str(
-                getattr(result, "coverage_status", "unknown") or "unknown"
-            ),
+            coverage_status=str(getattr(result, "coverage_status", "unknown") or "unknown"),
             missing_obligations=getattr(result, "missing_obligations", None),
             critical_carry_forward=getattr(
                 result,
@@ -22844,9 +21968,7 @@ class Agent:
             and last_blocked_result_index == len(projected_messages) - 1
         )
         if repair_prompt_appended:
-            projected_messages.append(
-                Message(role="user", content=_PROVIDER_CONTEXT_REPAIR_PROMPT)
-            )
+            projected_messages.append(Message(role="user", content=_PROVIDER_CONTEXT_REPAIR_PROMPT))
 
         if record:
             self.config.metadata["tool_argument_projection_replay_feedback"] = (
@@ -23306,9 +22428,11 @@ class Agent:
             logger.warning("agent.meta_skill_view_coerce_failed", skill=name, error=str(exc))
             return tc
 
+        from opensquilla.skills.catalog_policy import is_invokable_meta
+
         if (
             skill_spec is None
-            or getattr(skill_spec, "kind", "skill") != "meta"
+            or not is_invokable_meta(skill_spec)
             or getattr(skill_spec, "disable_model_invocation", False)
         ):
             return tc
@@ -23368,21 +22492,18 @@ class Agent:
             usage_execution_context=self._usage_execution_context,
             provider_request_correlation=meta_correlation,
         )
-        llm_chat = (
-            getattr(self, "_test_llm_chat_override", None)
-            or (
-                make_llm_chat_from_provider(
-                    provider=self.provider,
-                    base_config=self.config,
-                    usage_tracker=self._usage_tracker,
-                    session_key=self._session_key,
-                    usage_event_sink=self._usage_event_sink,
-                    usage_execution_context=self._usage_execution_context,
-                    provider_request_correlation=meta_correlation,
-                )
-                if self.provider is not None
-                else None
+        llm_chat = getattr(self, "_test_llm_chat_override", None) or (
+            make_llm_chat_from_provider(
+                provider=self.provider,
+                base_config=self.config,
+                usage_tracker=self._usage_tracker,
+                session_key=self._session_key,
+                usage_event_sink=self._usage_event_sink,
+                usage_execution_context=self._usage_execution_context,
+                provider_request_correlation=meta_correlation,
             )
+            if self.provider is not None
+            else None
         )
         tool_invoker = (
             make_tool_invoker_from_handler(
@@ -23396,11 +22517,7 @@ class Agent:
         runtime_env_provider = (self.config.metadata or {}).get(
             META_SKILL_RUNTIME_ENV_PROVIDER_METADATA_KEY
         )
-        if (
-            callable(runtime_env_provider)
-            and parent_spec is not None
-            and plan is not None
-        ):
+        if callable(runtime_env_provider) and parent_spec is not None and plan is not None:
             try:
                 resolved_runtime_env = runtime_env_provider(parent_spec, plan)
             except Exception as exc:  # noqa: BLE001 - credential resolution fails closed
@@ -23603,7 +22720,9 @@ class Agent:
                     return
 
             skill_spec = skill_loader.get_by_name(name)
-            if skill_spec is None or getattr(skill_spec, "kind", "skill") != "meta":
+            from opensquilla.skills.catalog_policy import is_invokable_meta
+
+            if skill_spec is None or not is_invokable_meta(skill_spec):
                 yield ToolResult(
                     tool_use_id=tc.tool_use_id,
                     tool_name="meta_invoke",
@@ -23856,9 +22975,7 @@ class Agent:
         resume_plan: Any = None
         try:
             claim_run_id = str(getattr(claim, "run_id", "") or "")
-            claim_snapshot = str(
-                getattr(claim, "plan_snapshot_json", "") or ""
-            )
+            claim_snapshot = str(getattr(claim, "plan_snapshot_json", "") or "")
             resume_record = await asyncio.to_thread(
                 self._meta_run_writer.get_run,
                 claim_run_id,
@@ -23868,23 +22985,17 @@ class Agent:
                 and claim_snapshot
                 and self._session_key
                 and resume_record is not None
-                and str(getattr(resume_record, "run_id", "") or "")
-                == claim_run_id
-                and str(getattr(resume_record, "session_key", "") or "")
-                == self._session_key
-                and str(getattr(resume_record, "plan_snapshot_json", "") or "")
-                == claim_snapshot
+                and str(getattr(resume_record, "run_id", "") or "") == claim_run_id
+                and str(getattr(resume_record, "session_key", "") or "") == self._session_key
+                and str(getattr(resume_record, "plan_snapshot_json", "") or "") == claim_snapshot
             ):
                 from opensquilla.skills.meta.plan_serde import from_jsonable
 
                 resume_plan = from_jsonable(json.loads(claim_snapshot))
-                candidate_parent = skill_loader.get_by_name(
-                    resume_record.meta_skill_name
-                )
+                candidate_parent = skill_loader.get_by_name(resume_record.meta_skill_name)
                 if (
                     candidate_parent is not None
-                    and getattr(resume_plan, "name", None)
-                    == resume_record.meta_skill_name
+                    and getattr(resume_plan, "name", None) == resume_record.meta_skill_name
                 ):
                     parent_spec = candidate_parent
         except Exception as exc:  # noqa: BLE001 - capability grant fails closed
@@ -24049,10 +23160,7 @@ class Agent:
             if (
                 replay_record is None
                 or replay_record.meta_skill_name != name
-                or (
-                    replay_record.session_key
-                    and replay_record.session_key != self._session_key
-                )
+                or (replay_record.session_key and replay_record.session_key != self._session_key)
                 or replay_record.status != "failed"
                 or not replay_record.failed_step_id
             ):
@@ -24094,10 +23202,11 @@ class Agent:
                 return
 
         skill_spec = skill_loader.get_by_name(name)
-        if skill_spec is None or getattr(skill_spec, "kind", "skill") != "meta":
+        from opensquilla.skills.catalog_policy import is_invokable_meta
+
+        if skill_spec is None or (replay_record is None and not is_invokable_meta(skill_spec)):
             async for ev in self._emit_terminal_text(
-                f"{name!r} is not a meta-skill. Type /meta to list available "
-                "meta-skills.",
+                f"{name!r} is not a meta-skill. Type /meta to list available meta-skills.",
                 iterations=0,
             ):
                 yield ev
@@ -24108,8 +23217,7 @@ class Agent:
         # path available lets upgrades finish already-started work without
         # making the retired skill discoverable or allowing a new run.
         retired_replay = bool(
-            replay_record is not None
-            and getattr(skill_spec, "disable_model_invocation", False)
+            replay_record is not None and getattr(skill_spec, "disable_model_invocation", False)
         )
         if getattr(skill_spec, "disable_model_invocation", False) and not retired_replay:
             description = str(getattr(skill_spec, "description", "")).strip().lower()
@@ -24119,9 +23227,7 @@ class Agent:
                     f"{name!r} has been retired and is not available for new runs. "
                     "Previously saved runs remain available for inspection, resume, or replay."
                 )
-            async for ev in self._emit_terminal_text(
-                unavailable_message, iterations=0
-            ):
+            async for ev in self._emit_terminal_text(unavailable_message, iterations=0):
                 yield ev
             return
 
@@ -24294,9 +23400,7 @@ class Agent:
                 # no pending fallback alias.  The alias map is meaningful only
                 # for the narrow "retry failed fallback" recovery path.
                 if replay_failover_aliases:
-                    replay_kwargs["replay_failover_aliases"] = (
-                        replay_failover_aliases
-                    )
+                    replay_kwargs["replay_failover_aliases"] = replay_failover_aliases
             async for ev in orch.iter_events(match, **replay_kwargs):
                 if isinstance(ev, MetaResult):
                     result = ev
@@ -24305,9 +23409,7 @@ class Agent:
                     final_text_parts.append(ev.text)
                 yield ev
         except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "agent.meta_launch_failed", extra={"error": str(exc), "name": name}
-            )
+            logger.warning("agent.meta_launch_failed", extra={"error": str(exc), "name": name})
             yield DoneEvent(text="", input_tokens=0, output_tokens=0, iterations=0)
             return
         finally:
@@ -24381,17 +23483,22 @@ class Agent:
         soft_progress = metadata.pop("meta_clarify_soft_progress", None)
         if proceed_blocked is not None:
             return self._render_clarify_progress(
-                proceed_blocked, proceed_blocked=True,
+                proceed_blocked,
+                proceed_blocked=True,
             ), True
         if soft_progress is not None:
             return self._render_clarify_progress(
-                soft_progress, proceed_blocked=False,
+                soft_progress,
+                proceed_blocked=False,
             ), True
 
         return None
 
     def _render_clarify_progress(
-        self, payload: Any, *, proceed_blocked: bool,
+        self,
+        payload: Any,
+        *,
+        proceed_blocked: bool,
     ) -> str:
         """Render soft-clarify progress without exposing internal state."""
         data = payload if isinstance(payload, dict) else {}
@@ -24405,11 +23512,7 @@ class Agent:
         lines: list[str] = []
         if proceed_blocked:
             if missing:
-                lines.append(
-                    "现在还不能开始，还需要补充："
-                    + "、".join(missing)
-                    + "。"
-                )
+                lines.append("现在还不能开始，还需要补充：" + "、".join(missing) + "。")
             else:
                 lines.append("现在还不能开始，还需要补充必填信息。")
             if filled_summary:
@@ -24618,9 +23721,7 @@ class Agent:
                 "Publish the material as an artifact or workspace file and pass "
                 "a focused reference instead of copying the full parent context."
             )
-        reference_slice_limit = subagent_task_reference_slice_limit_chars(
-            child_target
-        )
+        reference_slice_limit = subagent_task_reference_slice_limit_chars(child_target)
         if reference_slice_limit < 1:
             raise ValueError(
                 "Subagent deployment has no safe capacity for a referenced "
@@ -24635,8 +23736,7 @@ class Agent:
             )
 
         has_retrieval_tool = any(
-            definition.name == "retrieve_tool_result"
-            for definition in child_tool_definitions
+            definition.name == "retrieve_tool_result" for definition in child_tool_definitions
         )
         if not has_retrieval_tool and self._tool_registry is not None:
             if child_context.surfaced_tools is None:
@@ -24728,8 +23828,7 @@ class Agent:
         parent_sandbox_mounts = [
             dict(item)
             for item in (getattr(parent_ctx, "sandbox_mounts", None) or [])
-            if isinstance(item, dict)
-            and normalize_scope(item.get("scope"), "chat") != "once"
+            if isinstance(item, dict) and normalize_scope(item.get("scope"), "chat") != "once"
         ]
         parent_run_mode = getattr(parent_ctx, "run_mode", None)
         if parent_run_mode is None:
@@ -24764,14 +23863,10 @@ class Agent:
                     else None
                 ),
                 session_id=(
-                    parent_usage_context.session_id
-                    if parent_usage_context is not None
-                    else None
+                    parent_usage_context.session_id if parent_usage_context is not None else None
                 ),
                 session_epoch=(
-                    parent_usage_context.session_epoch
-                    if parent_usage_context is not None
-                    else 0
+                    parent_usage_context.session_epoch if parent_usage_context is not None else 0
                 ),
                 agent_id=(
                     parent_usage_context.agent_id
@@ -24812,9 +23907,7 @@ class Agent:
             if self.config.runtime_events_path
             else None,
             sandbox_policy=(
-                self._tool_context.sandbox_policy
-                if self._tool_context is not None
-                else None
+                self._tool_context.sandbox_policy if self._tool_context is not None else None
             ),
         )
         self._prepare_subagent_execution_task(
@@ -24899,9 +23992,7 @@ class Agent:
                 self.config.tool_result_fresh_diagnostic_inline_max_chars
             ),
             tool_result_dispatch_max_chars=self.config.tool_result_dispatch_max_chars,
-            tool_result_dispatch_turn_max_chars=(
-                self.config.tool_result_dispatch_turn_max_chars
-            ),
+            tool_result_dispatch_turn_max_chars=(self.config.tool_result_dispatch_turn_max_chars),
             tool_result_provider_request_max_chars=(
                 self.config.tool_result_provider_request_max_chars
             ),
@@ -24919,18 +24010,12 @@ class Agent:
             placeholder_escalation_threshold=self.config.placeholder_escalation_threshold,
             deadline_wrapup_margin_seconds=self.config.deadline_wrapup_margin_seconds,
             reasoning_only_thinking_fallback=self.config.reasoning_only_thinking_fallback,
-            provider_error_thinking_fallback=(
-                self.config.provider_error_thinking_fallback
-            ),
-            deadline_thinking_off_margin_seconds=(
-                self.config.deadline_thinking_off_margin_seconds
-            ),
+            provider_error_thinking_fallback=(self.config.provider_error_thinking_fallback),
+            deadline_thinking_off_margin_seconds=(self.config.deadline_thinking_off_margin_seconds),
             reasoning_stream_char_cap=self.config.reasoning_stream_char_cap,
             patch_hygiene_block_mode=self.config.patch_hygiene_block_mode,
             final_diff_salvage=self.config.final_diff_salvage,
-            endgame_git_freeze_margin_seconds=(
-                self.config.endgame_git_freeze_margin_seconds
-            ),
+            endgame_git_freeze_margin_seconds=(self.config.endgame_git_freeze_margin_seconds),
             max_iterations_deadline_extend_seconds=(
                 self.config.max_iterations_deadline_extend_seconds
             ),
@@ -24938,12 +24023,8 @@ class Agent:
             endgame_git_freeze_instrumentation_exempt=(
                 self.config.endgame_git_freeze_instrumentation_exempt
             ),
-            deadline_wrapup_sticky_thinking_off=(
-                self.config.deadline_wrapup_sticky_thinking_off
-            ),
-            endgame_fix_directive_margin_seconds=(
-                self.config.endgame_fix_directive_margin_seconds
-            ),
+            deadline_wrapup_sticky_thinking_off=(self.config.deadline_wrapup_sticky_thinking_off),
+            endgame_fix_directive_margin_seconds=(self.config.endgame_fix_directive_margin_seconds),
             reasoning_only_act_now=self.config.reasoning_only_act_now,
             mid_budget_no_diff_nudge=self.config.mid_budget_no_diff_nudge,
             repeated_tool_call_recovery_threshold=(
@@ -24953,9 +24034,7 @@ class Agent:
                 self.config.repeated_tool_call_recovery_extra_tools
             ),
             provider_history_dedup_enabled=self.config.provider_history_dedup_enabled,
-            provider_history_dedup_min_repeats=(
-                self.config.provider_history_dedup_min_repeats
-            ),
+            provider_history_dedup_min_repeats=(self.config.provider_history_dedup_min_repeats),
             projection_signal_hints=self.config.projection_signal_hints,
             progress_watchdog_mode=self.config.progress_watchdog_mode,
             progress_watchdog_repeated_tool_error_threshold=(

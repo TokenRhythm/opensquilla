@@ -1,5 +1,8 @@
 ---
 name: meta-scheduled-morning-digest
+visibility: experimental
+invocation: experimental_internal
+disable-model-invocation: true
 description: "Compose a morning digest combining local weather, news for the user's interest topic, a structured summary, and a memory note."
 kind: meta
 meta_priority: 40

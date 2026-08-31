@@ -37,9 +37,9 @@ def _seed_history(log_dir: Path) -> Path:
     now = datetime.now(UTC).isoformat()
     rows: list[dict[str, object]] = []
     chains = [
-        (["history-explorer", "summarize"], 7),
-        (["multi-search-engine", "summarize"], 4),
-        (["weather", "summarize"], 2),
+        (["history-explorer", "docx"], 7),
+        (["deep-research", "docx"], 4),
+        (["github", "docx"], 2),
     ]
     for chain, count in chains:
         for _ in range(count):
@@ -445,7 +445,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-freq", type=int, default=3)
     parser.add_argument("--top-k", type=int, default=2)
     parser.add_argument("--auto-enable", action="store_true")
-    parser.add_argument("--auto-enable-max-risk", default="low")
+    parser.add_argument("--auto-enable-max-risk", default="medium")
     return parser
 
 

@@ -314,7 +314,7 @@ async def enforce_coding_mode(ctx: TurnContext) -> TurnContext:
 
     missing_tools = _missing_code_task_tools(ctx)
     if missing_tools:
-        # `filter_skills` independently gates the manifest on the same three
+        # `resolve_skill_catalog` independently gates the manifest on the same three
         # tools. Do not leave a conflicting, mandatory code-task instruction
         # on restricted callers such as ordinary channel users.
         ctx.metadata["enforce_coding_mode__applied"] = False
@@ -335,8 +335,8 @@ async def enforce_coding_mode(ctx: TurnContext) -> TurnContext:
         new_suffix = f"{suffix}{directive}" if suffix else directive
         ctx.system_prompt = (base, new_suffix)
 
-    # Pin code-task so a relevance filter (when filter_enabled) cannot drop its
-    # description from <available_skills>; filter_skills honors this metadata.
+    # Pin code-task so a tight metadata budget keeps its description in
+    # <available_skills>; resolve_skill_catalog honors this metadata.
     ctx.metadata["pinned_skills"] = list({*ctx.metadata.get("pinned_skills", []), "code-task"})
     ctx.metadata["coding_mode"] = True
     log.info("coding_mode.enforced")

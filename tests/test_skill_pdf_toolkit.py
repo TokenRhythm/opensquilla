@@ -24,8 +24,10 @@ def test_skill_loads() -> None:
     assert spec is not None
     assert spec.name == "pdf-toolkit"
     description = spec.description.lower()
-    assert "nano-pdf" in description, (
-        "description must explicitly distinguish from sibling nano-pdf skill"
+    assert "single public pdf entry" in description
+    assert all(
+        operation in description
+        for operation in ("extract", "merge", "split", "fill", "generate")
     )
 
 

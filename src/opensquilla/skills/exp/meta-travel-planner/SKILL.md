@@ -1,5 +1,8 @@
 ---
 name: meta-travel-planner
+visibility: experimental
+invocation: experimental_internal
+disable-model-invocation: true
 description: "Use this meta-skill instead of answering directly when the user needs a trip plan, travel itinerary, business-trip schedule, or day-by-day travel brief that benefits from multi-skill orchestration across preference inference, weather, place search, constraint extraction, itinerary drafting, variants, and optional artifact guidance."
 kind: meta
 meta_priority: 50

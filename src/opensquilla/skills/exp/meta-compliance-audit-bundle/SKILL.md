@@ -1,5 +1,8 @@
 ---
 name: meta-compliance-audit-bundle
+visibility: experimental
+invocation: experimental_internal
+disable-model-invocation: true
 description: "Auditable compliance bundle: deep-research with citations → signable .docx report → read-only PDF archive → memory note of audit findings."
 kind: meta
 meta_priority: 45

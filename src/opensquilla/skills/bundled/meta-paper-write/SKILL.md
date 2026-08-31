@@ -1,6 +1,8 @@
 ---
 name: meta-paper-write
-description: "Use this meta-skill instead of answering directly when the current user asks to draft or produce a new academic/research paper or LaTeX manuscript. It uses multi-skill orchestration for manuscript workflows that need source search, citation planning, experiment or figure/table placeholders, drafting, length checks, citation integrity, and LaTeX/PDF compilation. Ordinary paper requests use a compact draft path; explicit full/PDF/long-form requests use the full manuscript path. Do not use it to repair or compile an existing manuscript, or for web research reports, slide decks, document decisions, or generic plotting."
+visibility: meta
+invocation: meta_only
+description: "Create a new academic paper or LaTeX manuscript through a citation-aware drafting and validation DAG; explicit full/PDF requests include artifact compilation. Do not use for repairing an existing manuscript, generic research reports, slides, or plotting."
 description_zh: "当用户要求起草或产出新的学术/研究论文或 LaTeX 手稿时，使用此元技能而非直接回答。它通过多技能编排处理来源搜索、引用规划、实验或图表占位、起草、篇幅检查、引用完整性及 LaTeX/PDF 编译。普通请求走精简起草路径，明确要求完整/PDF/长篇时走完整手稿路径。不用于修复或编译现有手稿，也不用于网页研究报告、幻灯片、文档决策或通用绘图。"
 kind: meta
 meta_priority: 50

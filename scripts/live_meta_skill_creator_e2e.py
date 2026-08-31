@@ -19,14 +19,14 @@ from opensquilla.skills.creator import proposer
 
 DEFAULT_HISTORY = {
     "co_occurrences": [
-        {"skills": ["history-explorer", "summarize"], "freq": 8},
+        {"skills": ["history-explorer", "docx"], "freq": 8},
     ],
     "note": "Prefer a two-step read-and-summarize workflow using low-risk skills.",
 }
 DEFAULT_INTENT = (
     "Create a meta-skill that first uses history-explorer to inspect recent "
-    "OpenSquilla decision history for a query, then uses summarize to produce "
-    "a concise operational summary. Use only history-explorer and summarize."
+    "OpenSquilla decision history for a query, then uses docx to produce "
+    "a concise operational brief. Use only history-explorer and docx."
 )
 
 
@@ -53,7 +53,7 @@ def run_live_meta_skill_creator_e2e(
     provider: str | None = None,
     model: str | None = None,
     auto_enable: bool = True,
-    auto_enable_max_risk: str = "low",
+    auto_enable_max_risk: str = "medium",
 ) -> dict[str, Any]:
     """Run fill_slots -> assemble -> lint -> smoke -> persist/auto-enable."""
     previous_provider = os.environ.get("OPENSQUILLA_LLM_PROVIDER")
@@ -141,7 +141,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--history-summary", default=None)
     p.add_argument("--user-intent", default=DEFAULT_INTENT)
     p.add_argument("--no-auto-enable", action="store_true")
-    p.add_argument("--auto-enable-max-risk", default="low")
+    p.add_argument("--auto-enable-max-risk", default="medium")
     return p
 
 

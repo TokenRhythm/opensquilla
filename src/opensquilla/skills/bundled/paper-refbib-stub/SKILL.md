@@ -1,5 +1,9 @@
 ---
 name: paper-refbib-stub
+visibility: internal
+invocation: meta_only
+owner_meta_skills:
+  - meta-paper-write
 description: "Convert normalized multi-search-engine results to minimal BibTeX, preserving real DOI, author, publication year, arXiv ID, source URL, and provenance metadata when available. Unknown years are omitted and duplicate DOI records collapse to one entry."
 description_zh: "将规范化的 multi-search-engine 结果转换为最小 BibTeX；在可用时保留真实 DOI、作者、出版年份、arXiv ID、来源 URL 和溯源元数据。未知年份不写入，重复 DOI 合并为一条。"
 user-invocable: false

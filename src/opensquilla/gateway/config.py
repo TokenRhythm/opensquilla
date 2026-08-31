@@ -30,6 +30,7 @@ from opensquilla.gateway.config_migration import (
     LATEST_CONFIG_VERSION,
     ConfigParseError,
     backup_and_write_migrated_config,
+    handle_deprecated_skill_filter_env,
     migrate_config_payload,
 )
 from opensquilla.paths import default_opensquilla_home, native_io_path
@@ -264,19 +265,11 @@ class SkillsConfig(BaseSettings):
     # every skill API. Default OFF — coding mode is opt-in.
     coding_mode: bool = False
     max_skills_prompt_chars: int = 8000
-    filter_enabled: bool = False
-    filter_top_k: int = 5
     # "system" = full system prompt (default)
     # "user_context" = ephemeral user-role context, after history and before current user
     # "user_message" = legacy compact system-prompt index
     injection_mode: str = "system"
 
-    # Relevance filtering is opt-in. Keep the default path dependency-free.
-    filter_strategy: Literal["lexical", "semantic", "hybrid"] = "lexical"
-    filter_lexical_top_n: int = 20
-    filter_semantic_top_n: int = 20
-    filter_rrf_k: int = 60
-    filter_embedding_model: str = "BAAI/bge-small-zh-v1.5"
 
 
 class ToolsConfig(BaseModel):
@@ -2804,6 +2797,7 @@ class GatewayConfig(BaseSettings):
         )
 
     def model_post_init(self, __context: Any) -> None:
+        handle_deprecated_skill_filter_env()
         self._apply_concurrency_env_overrides()
 
     def _apply_concurrency_env_overrides(self) -> None:

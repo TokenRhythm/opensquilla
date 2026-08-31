@@ -2,16 +2,10 @@
 
 from __future__ import annotations
 
-import json
-import subprocess
-import sys
 from pathlib import Path
 
 from opensquilla.skills.loader import SkillLoader
-
-REPO = Path(__file__).resolve().parents[2]
-_BUNDLED = REPO / "src" / "opensquilla" / "skills" / "bundled"
-PROPOSALS = _BUNDLED / "skill-creator-proposals" / "scripts" / "proposals.py"
+from opensquilla.skills.proposals_lib import accept_proposal, write_proposal
 
 VALID_SKILL_MD = """---
 name: accept-flow-test-skill
@@ -25,39 +19,31 @@ provenance:
 composition:
   steps:
     - id: only
-      skill: summarize
+      skill: docx
       with:
         task: "{{ inputs.user_message | xml_escape | truncate(512) }}"
 ---
 """
 
 
-def _run(args: list[str], stdin: str | None = None) -> dict:
-    proc = subprocess.run(args, input=stdin, capture_output=True, text=True, check=True)
-    return json.loads(proc.stdout)
+def _write(home: Path, skill_md: str) -> dict:
+    return write_proposal(
+        home,
+        skill_md,
+        {"G1": {"passed": True}, "G2": {"passed": True}},
+        {"G3": {"passed": True}, "G4": {"passed": True}},
+    )
 
 
 def test_accept_flow_moves_to_skills_dir_and_loader_picks_up(tmp_path: Path) -> None:
     home = tmp_path / ".opensquilla"
 
     # Step 1: write proposal (eligible)
-    out = _run([
-        sys.executable, str(PROPOSALS),
-        "--action", "write_proposal",
-        "--home", str(home),
-        "--skill-md-inline", VALID_SKILL_MD,
-        "--lint-result", '{"G1": {"passed": true}, "G2": {"passed": true}}',
-        "--smoke-result", '{"G3": {"passed": true}, "G4": {"passed": true}}',
-    ])
+    out = _write(home, VALID_SKILL_MD)
     proposal_id = out["proposal_id"]
 
     # Step 2: accept
-    out = _run([
-        sys.executable, str(PROPOSALS),
-        "--action", "accept",
-        "--home", str(home),
-        "--proposal-id", proposal_id,
-    ])
+    out = accept_proposal(home, proposal_id)
     assert out["status"] == "ok"
     skill_path = Path(out["skill_path"])
     assert skill_path.is_dir()
@@ -94,7 +80,7 @@ provenance:
 composition:
   steps:
     - id: only
-      skill: summarize
+      skill: docx
       with:
         task: "{{ inputs.user_message | xml_escape | truncate(512) }}"
 ---
@@ -107,22 +93,10 @@ def test_accept_quoted_name_from_tojson_template(tmp_path: Path) -> None:
     output); the previous regex only matched bare `name: synth-pipeline`."""
     home = tmp_path / ".opensquilla"
 
-    out = _run([
-        sys.executable, str(PROPOSALS),
-        "--action", "write_proposal",
-        "--home", str(home),
-        "--skill-md-inline", QUOTED_NAME_SKILL_MD,
-        "--lint-result", '{"G1": {"passed": true}, "G2": {"passed": true}}',
-        "--smoke-result", '{"G3": {"passed": true}, "G4": {"passed": true}}',
-    ])
+    out = _write(home, QUOTED_NAME_SKILL_MD)
     proposal_id = out["proposal_id"]
 
-    out = _run([
-        sys.executable, str(PROPOSALS),
-        "--action", "accept",
-        "--home", str(home),
-        "--proposal-id", proposal_id,
-    ])
+    out = accept_proposal(home, proposal_id)
     assert out["status"] == "ok", (
         f"accept failed with quoted name; got: {out}"
     )

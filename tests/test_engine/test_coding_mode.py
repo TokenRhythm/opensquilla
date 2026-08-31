@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from opensquilla.engine.steps.coding_mode import enforce_coding_mode
-from opensquilla.engine.steps.skills_filter import _eligibility_ctx
+from opensquilla.engine.steps.skill_catalog_projection import _eligibility_ctx
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc_config import _SAFE_WRITE_PATCH_PATHS
 from opensquilla.skills.eligibility import (

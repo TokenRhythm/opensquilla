@@ -1,7 +1,9 @@
 ---
 name: pdf-toolkit
-description: "Structured `.pdf` operations: extract text/tables, merge pages from multiple PDFs, split a PDF by page ranges, fill PDF form fields, and generate fresh PDFs from JSON. Trigger when the user wants programmatic PDF work without natural-language rewriting — examples: pull tables from a report, combine three PDFs, extract pages 5-12, fill a tax form, or build a new PDF from data. Distinct from `nano-pdf`, which uses an LLM to rewrite a page from a sentence; this skill is deterministic byte-level work via pypdf, pdfplumber, and reportlab."
-description_zh: "结构化的 .pdf 操作：提取文本/表格、合并多个PDF的页面、按页码范围拆分PDF、填写PDF表单字段以及从JSON生成新PDF。当用户需要无需自然语言改写的程序化PDF处理时触发，例如从报告提取表格、合并三个PDF、提取第5-12页、填写税表或用数据构建新PDF。区别于用LLM改写页面的 nano-pdf；本技能通过pypdf、pdfplumber和reportlab进行确定性的字节级处理。"
+visibility: public
+invocation: direct
+description: "Structured `.pdf` operations: extract text/tables, merge pages from multiple PDFs, split a PDF by page ranges, fill PDF form fields, and generate fresh PDFs from JSON. Trigger when the user wants deterministic programmatic PDF work — examples: pull tables from a report, combine three PDFs, extract pages 5-12, fill a tax form, or build a new PDF from data. This is the single public PDF entry and uses pypdf, pdfplumber, and reportlab."
+description_zh: "结构化的 .pdf 操作：提取文本/表格、合并多个PDF的页面、按页码范围拆分PDF、填写PDF表单字段以及从JSON生成新PDF。当用户需要确定性的程序化PDF处理时触发，例如从报告提取表格、合并三个PDF、提取第5-12页、填写税表或用数据构建新PDF。本技能是唯一公开的 PDF 入口，通过 pypdf、pdfplumber 和 reportlab 执行。"
 homepage: https://pypdf.readthedocs.io/
 provenance:
   origin: clawhub-mit0
@@ -36,9 +38,9 @@ metadata:
 # pdf-toolkit
 
 Deterministic, structural PDF operations. Use this skill for programmatic
-work where you know exactly what you want done. Use the sibling `nano-pdf`
-skill instead when the task is "rewrite this page to say X" — `nano-pdf`
-applies a natural-language edit; `pdf-toolkit` applies an explicit operation.
+work where you know exactly what you want done. For a natural-language rewrite,
+first draft the replacement content with ordinary reasoning, then use the
+explicit extract/generate/merge operations here to create the final PDF.
 
 ## Decide the operation
 
@@ -176,15 +178,12 @@ For tables, headers/footers, and multi-column layouts, switch to
 
 ---
 
-## Boundary with `nano-pdf`
+## Natural-language changes
 
-`nano-pdf` (sibling bundled skill) wraps an LLM that takes a page index and
-a natural-language instruction. Use it when the change is "fix the typo on
-page 1" or "make the title shorter". Use **this** skill when the change is
-"merge these three PDFs", "extract the tables", or "fill the form". The two
-do not overlap: if you find yourself reaching for `nano-pdf` to do a merge,
-switch to `pdf-toolkit`; if you reach here to "rewrite page 5 to be friendlier",
-switch back.
+This public entry deliberately keeps the PDF mutation step deterministic. For
+requests such as "make the title shorter", inspect the source page, draft the
+replacement text with the model, and generate a new document with the reviewed
+content. Do not claim that arbitrary in-place page rewriting is available.
 
 ---
 

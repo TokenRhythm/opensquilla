@@ -90,6 +90,20 @@ DEPRECATED_AGENT_TOKEN_SAVING_LEAVES: frozenset[str] = frozenset(
     k.removeprefix("agent_token_saving.")
     for k in DEPRECATED_AGENT_TOKEN_SAVING_FIELDS
 )
+DEPRECATED_SKILL_FILTER_LEAVES: frozenset[str] = frozenset(
+    {
+        "filter_enabled",
+        "filter_top_k",
+        "filter_strategy",
+        "filter_lexical_top_n",
+        "filter_semantic_top_n",
+        "filter_rrf_k",
+        "filter_embedding_model",
+    }
+)
+DEPRECATED_SKILL_FILTER_FIELDS: frozenset[str] = frozenset(
+    f"skills.{leaf}" for leaf in DEPRECATED_SKILL_FILTER_LEAVES
+)
 _LEGACY_LLM_ENSEMBLE_TIMEOUT_SECONDS = frozenset({120.0, 300.0})
 _DEFAULT_LLM_ENSEMBLE_TIMEOUT_SECONDS = 3600.0
 
@@ -109,6 +123,8 @@ _LEGACY_MEMORY_FIELDS_SEEN: set[str] = set()
 _LEGACY_AGENT_TOKEN_SAVING_FIELDS_WARN_LOCK = threading.Lock()
 _LEGACY_AGENT_TOKEN_SAVING_FIELDS_WARNED = False
 _LEGACY_AGENT_TOKEN_SAVING_FIELDS_SEEN: set[str] = set()
+_LEGACY_SKILL_FILTER_WARN_LOCK = threading.Lock()
+_LEGACY_SKILL_FILTER_WARNED = False
 
 
 @dataclass(frozen=True)
@@ -230,6 +246,51 @@ def handle_deprecated_agent_token_saving_fields(
         )
 
 
+def _handle_deprecated_skill_filter_fields(
+    found: dict[str, object],
+    source: str,
+) -> None:
+    """Log value shapes and issue one process warning for removed filter keys."""
+
+    global _LEGACY_SKILL_FILTER_WARNED
+    if not found:
+        return
+    with _LEGACY_SKILL_FILTER_WARN_LOCK:
+        should_warn = not _LEGACY_SKILL_FILTER_WARNED
+        _LEGACY_SKILL_FILTER_WARNED = True
+    _write_legacy_field_log(found, source)
+    if not should_warn:
+        return
+    fields = ", ".join(sorted(found))
+    message = (
+        "OpenSquilla: removed Skill relevance-filter configuration was ignored "
+        f"and will be cleaned during config rewrite ({fields}); the Skill "
+        "catalog now uses deterministic eligibility and visibility projection."
+    )
+    warnings.warn(message, DeprecationWarning, stacklevel=6)
+    logging.getLogger(__name__).warning(message)
+
+
+def handle_deprecated_skill_filter_env() -> None:
+    """Ignore and warn for legacy filter environment variables.
+
+    Values are never parsed or logged. Both the historical nested SkillsConfig
+    prefix and the top-level nested-settings spelling are recognized.
+    """
+
+    found: dict[str, object] = {}
+    for leaf in sorted(DEPRECATED_SKILL_FILTER_LEAVES):
+        upper = leaf.upper()
+        for env_name in (
+            f"OPENSQUILLA_SKILLS_{upper}",
+            f"OPENSQUILLA_GATEWAY_SKILLS__{upper}",
+        ):
+            if env_name in os.environ:
+                found[env_name] = os.environ[env_name]
+    if found:
+        _handle_deprecated_skill_filter_fields(found, "environment")
+
+
 def _write_legacy_field_log(found: dict[str, object], source: str) -> None:
     try:
         logs_dir = default_opensquilla_home() / "logs"
@@ -323,6 +384,7 @@ def migrate_config_payload(
         builder,
         emit_diagnostics=emit_diagnostics,
     )
+    _normalize_skill_filter_fields(builder, emit_diagnostics=emit_diagnostics)
     _clamp_search_max_results(builder)
     _park_unknown_channel_entries(builder, emit_diagnostics=emit_diagnostics)
     _disable_unverifiable_feishu_webhook_entries(builder)
@@ -454,6 +516,31 @@ def _normalize_agent_token_saving_fields(
                 "agent_token_saving.tool_result_compression_* was removed; "
                 "tokenjuice projection is now the built-in tool-result path"
             )
+
+
+def _normalize_skill_filter_fields(
+    builder: _MigrationBuilder,
+    *,
+    emit_diagnostics: bool,
+) -> None:
+    """Always-run compatibility strip for removed ``skills.filter_*`` keys."""
+
+    skills = builder.payload.get("skills")
+    if not isinstance(skills, dict):
+        return
+    removed: dict[str, object] = {}
+    for leaf in sorted(DEPRECATED_SKILL_FILTER_LEAVES):
+        if leaf in skills:
+            removed[f"skills.{leaf}"] = skills.pop(leaf)
+    if not removed:
+        return
+    builder.removed_fields.extend(sorted(removed))
+    builder.warnings.append(
+        "removed Skill relevance-filter configuration was discarded; "
+        "catalog projection is deterministic"
+    )
+    if emit_diagnostics:
+        _handle_deprecated_skill_filter_fields(removed, "config_migration")
 
 
 def _clamp_search_max_results(builder: _MigrationBuilder) -> None:

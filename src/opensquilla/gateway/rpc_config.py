@@ -630,10 +630,6 @@ def _prune_readonly_paths(patch: dict[str, Any]) -> dict[str, Any]:
 
 _SAFE_WRITE_PATCH_PATHS = frozenset(
     {
-        "skills.filter_enabled",
-        "skills.filter_lexical_top_n",
-        "skills.filter_semantic_top_n",
-        "skills.filter_rrf_k",
         "skills.disabled",
         "skills.coding_mode",
         "llm_ensemble.enabled",
@@ -911,7 +907,7 @@ async def _handle_config_patch(
     redacted_paths: set[str] = set()
     force_persist_paths: set[tuple[str, ...]] = set()
 
-    # Apply dot-path patches (e.g. {"skills.filter_enabled": true})
+    # Apply allowlisted dot-path patches.
     for path, value in dot_patches.items():
         if _path_is_or_contains_readonly(path):
             continue

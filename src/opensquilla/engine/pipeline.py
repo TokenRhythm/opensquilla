@@ -69,7 +69,7 @@ async def run_pipeline(ctx: TurnContext, steps: list[TurnStep]) -> TurnContext:
 
     * success path — ``applied=True`` plus any step-published hints
       (``routed_tier``, ``routing_source``, ``routing_confidence``,
-      ``filtered_skill_ids``).
+      ``skill_catalog_ids``).
     * fail-open path — the step raised; we roll back ``ctx.metadata`` to a
       pre-step snapshot and record ``applied=False`` with
       ``fallback_reason=str(exc)``.
@@ -106,17 +106,17 @@ async def run_pipeline(ctx: TurnContext, steps: list[TurnStep]) -> TurnContext:
             routed_tier = ctx.metadata.get("routed_tier")
             routing_source = cast(RoutingSource, ctx.metadata.get("routing_source", "none"))
             confidence = ctx.metadata.get("routing_confidence")
-            filtered_skill_ids = None
-        elif step_name == "filter_skills":
+            skill_catalog_ids = None
+        elif step_name == "resolve_skill_catalog":
             routed_tier = None
             routing_source = "none"
             confidence = None
-            filtered_skill_ids = ctx.metadata.get("filtered_skill_ids")
+            skill_catalog_ids = ctx.metadata.get("skill_catalog_ids")
         else:
             routed_tier = None
             routing_source = "none"
             confidence = None
-            filtered_skill_ids = None
+            skill_catalog_ids = None
 
         records = ctx.metadata.setdefault("pipeline_steps", records)
         records.append(
@@ -124,7 +124,7 @@ async def run_pipeline(ctx: TurnContext, steps: list[TurnStep]) -> TurnContext:
                 step_name=step_name,
                 applied=applied,
                 routed_tier=routed_tier,
-                filtered_skill_ids=filtered_skill_ids,
+                skill_catalog_ids=skill_catalog_ids,
                 routing_source=routing_source,
                 confidence=confidence,
                 fallback_reason=None,

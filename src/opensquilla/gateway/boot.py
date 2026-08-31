@@ -2748,57 +2748,6 @@ def build_flush_service(
     )
 
 
-def emit_skill_filter_banner(skills_cfg: Any) -> None:
-    """One-line startup warning when the ONNX embedding backend is
-    unreachable but a non-lexical filter strategy is configured.
-
-    Required runtime: ``onnxruntime`` + ``tokenizers`` +
-    the bundled v4 BGE ONNX dir (or a configured override). All three
-    ship via ``uv sync --extra recommended``. The previous non-ONNX
-    fallback was removed — there is now exactly one backend.
-
-    The banner fires only when filter_enabled=true, strategy ≠ lexical,
-    AND the ONNX path is incomplete. Uses stdlib :mod:`logging` so
-    operators see it on the standard ``WARNING`` logger and so tests
-    can assert on it via ``caplog``.
-    """
-    import importlib.util
-    import logging
-
-    log_std = logging.getLogger("opensquilla.gateway.boot")
-
-    if not getattr(skills_cfg, "filter_enabled", False):
-        return
-    if getattr(skills_cfg, "filter_strategy", "lexical") == "lexical":
-        return
-
-    onnx_ok = False
-    try:
-        if (
-            importlib.util.find_spec("onnxruntime") is not None
-            and importlib.util.find_spec("tokenizers") is not None
-        ):
-            from opensquilla.memory.embedding import LocalEmbeddingProvider
-
-            model_name = getattr(
-                skills_cfg, "filter_embedding_model", LocalEmbeddingProvider.DEFAULT_MODEL
-            )
-            onnx_ok = LocalEmbeddingProvider._bundled_onnx_dir(model_name) is not None
-    except ImportError:
-        onnx_ok = False
-
-    if onnx_ok:
-        return
-
-    log_std.warning(
-        "ONNX embedding backend not available; filter_strategy=%r will run "
-        "lexical-only. Install via `uv sync --extra recommended` to get "
-        "onnxruntime + tokenizers, and verify the bundled BGE ONNX dir "
-        "is present.",
-        getattr(skills_cfg, "filter_strategy", "lexical"),
-    )
-
-
 def _squilla_router_bundle_dir(router_cfg: Any) -> Path:
     configured = getattr(router_cfg, "v4_bundle_dir", None)
     if configured:
@@ -4172,9 +4121,6 @@ async def start_gateway_server(
     else:
         log.info("gateway.control_ui.disabled")
 
-    # Surface lexical degradation when the operator enabled filter_enabled=true
-    # with a strategy that needs the local ONNX embedding backend.
-    emit_skill_filter_banner(config.skills)
     startup_phase_started_at = _log_gateway_startup_phase(
         "config",
         startup_started_at=startup_started_at,

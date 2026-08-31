@@ -743,7 +743,7 @@ async def test_explicit_model_equal_to_routed_keeps_savings() -> None:
 
 
 @pytest.mark.asyncio
-async def test_case05_pipeline_filter_skills_metadata_merge() -> None:
+async def test_case05_pipeline_resolve_skill_catalog_metadata_merge() -> None:
     assembler = _RecordingPromptAssembler(metadata_to_emit={"skill_count": 2})
     executor = _RecordingPipelineExecutor(
         turn=_make_turn(metadata={"skills_prompt_chars": 1234}),

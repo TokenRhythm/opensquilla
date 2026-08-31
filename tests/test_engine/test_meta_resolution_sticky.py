@@ -377,29 +377,6 @@ async def test_no_sticky_when_skill_was_removed():
 
 
 @pytest.mark.asyncio
-async def test_skill_marketplace_intent_skips_semantic_meta_fallback(monkeypatch):
-    skills = [_meta_spec(name="meta-skill-creator", triggers=("create a meta-skill",))]
-    semantic_called = False
-
-    def fake_semantic_candidate(ctx, candidates):
-        nonlocal semantic_called
-        semantic_called = True
-        priority, name, plan, _spec = candidates[0]
-        return (priority, name, plan, "semantic")
-
-    monkeypatch.setattr(mr, "_semantic_meta_candidate", fake_semantic_candidate)
-
-    out = await meta_resolution(_ctx(
-        message="I want to install skills",
-        session_id="S-I",
-        skills=skills,
-    ))
-
-    assert semantic_called is False
-    assert "meta_match" not in out.metadata
-
-
-@pytest.mark.asyncio
 async def test_skill_marketplace_intent_clears_sticky_replay():
     skills = [_meta_spec(name="meta-paper-write", triggers=("帮我写篇论文",))]
     await meta_resolution(_ctx(
@@ -435,29 +412,6 @@ async def test_meta_skill_discussion_clears_sticky_replay():
 
     assert "meta_match" not in out.metadata
     assert mr._sticky_get("S-META-DISCUSS") is None
-
-
-@pytest.mark.asyncio
-async def test_meta_skill_discussion_skips_semantic_fallback(monkeypatch):
-    skills = [_meta_spec(name="AwesomeWebpageMetaSkill", triggers=("生成图文音视频网页",))]
-    semantic_called = False
-
-    def fake_semantic_candidate(ctx, candidates):
-        nonlocal semantic_called
-        semantic_called = True
-        priority, name, plan, _spec = candidates[0]
-        return (priority, name, plan, "semantic")
-
-    monkeypatch.setattr(mr, "_semantic_meta_candidate", fake_semantic_candidate)
-
-    out = await meta_resolution(_ctx(
-        message="你最后生成的时候调用了meta skills吗，怎么生成的好差",
-        session_id="S-META-SEMANTIC",
-        skills=skills,
-    ))
-
-    assert semantic_called is False
-    assert "meta_match" not in out.metadata
 
 
 @pytest.mark.asyncio
