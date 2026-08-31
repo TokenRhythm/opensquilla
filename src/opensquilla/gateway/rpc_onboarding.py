@@ -30,6 +30,7 @@ from opensquilla.onboarding.redaction import is_redacted_secret_sentinel
 from opensquilla.search.types import DEFAULT_SEARCH_MAX_RESULTS
 
 if TYPE_CHECKING:
+    from opensquilla.application.setup_workflow import SetupWorkflow
     from opensquilla.onboarding.config_store import CredentialBackupRedaction
     from opensquilla.onboarding.probe import ProviderProbeResult
 
@@ -419,7 +420,7 @@ async def _read_onboarding_catalog(_ctx: RpcContext) -> dict[str, Any]:
     return setup_catalog_payload()
 
 
-def _setup_workflow(ctx: RpcContext):
+def _setup_workflow(ctx: RpcContext) -> SetupWorkflow:
     from opensquilla.application.setup_workflow import SetupWorkflow
     from opensquilla.gateway.adapters.setup_workflow import (
         RpcContextSetupWorkflowPort,

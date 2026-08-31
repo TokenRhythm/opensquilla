@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from opensquilla.gateway.model_routing import (
     model_routing_patches,
@@ -12,6 +12,11 @@ from opensquilla.gateway.model_routing import (
 )
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.provider.model_catalog import ModelCatalog
+
+if TYPE_CHECKING:
+    from opensquilla.application.provider_configuration import (
+        ModelRouting as ApplicationModelRouting,
+    )
 
 _d = get_dispatcher()
 
@@ -294,7 +299,7 @@ async def _write_model_routing(
     }
 
 
-def _model_routing(ctx: RpcContext):
+def _model_routing(ctx: RpcContext) -> ApplicationModelRouting:
     from opensquilla.application.provider_configuration import ModelRouting
     from opensquilla.gateway.adapters.provider_configuration import (
         RpcContextModelRoutingPort,

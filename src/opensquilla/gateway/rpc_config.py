@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import copy
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -32,6 +32,9 @@ from opensquilla.gateway.model_routing import (
 )
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.paths import default_opensquilla_home
+
+if TYPE_CHECKING:
+    from opensquilla.application.app_settings import AppSettings
 
 log = structlog.get_logger(__name__)
 
@@ -1032,7 +1035,7 @@ async def _execute_config_patch(
     return response
 
 
-def _app_settings(ctx: RpcContext):
+def _app_settings(ctx: RpcContext) -> AppSettings:
     from opensquilla.application.app_settings import AppSettings
     from opensquilla.gateway.adapters.app_settings import RpcContextAppSettingsPort
 
