@@ -7,6 +7,7 @@ from collections.abc import Awaitable
 from typing import Any, cast
 
 from opensquilla.gateway.adapters.goals_contract import (
+    register_goals_capabilities_contract,
     register_goals_set_contract,
     register_goals_status_contract,
 )
@@ -173,7 +174,6 @@ async def _translate_goal_errors(
         ) from exc
 
 
-@_d.method("goals.capabilities", scope="operator.read")
 async def _handle_goals_capabilities(params: dict | None, ctx: RpcContext) -> dict:
     # The key is accepted so callers can use a uniform session-scoped request;
     # capabilities themselves are process/config scoped and have no side effects.
@@ -198,6 +198,14 @@ async def _handle_goals_capabilities(params: dict | None, ctx: RpcContext) -> di
             "goals.clear",
         ],
     }
+
+
+_handle_goals_capabilities_contract = register_goals_capabilities_contract(
+    _d,
+    _handle_goals_capabilities,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 async def _handle_goals_status(params: dict | None, ctx: RpcContext) -> dict:

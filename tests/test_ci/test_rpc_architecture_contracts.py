@@ -99,7 +99,7 @@ SESSIONS_LIST_GATEWAY_ADAPTER = (
     PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
 )
 RUNTIME_RPC_METHOD_BASELINE = 306
-STATIC_RPC_DECORATOR_BASELINE = 294
+STATIC_RPC_DECORATOR_BASELINE = 293
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
 # closure measurement below.  The temporary S2a cumulative growth budget was
@@ -402,6 +402,10 @@ def test_schema_derived_method_metadata_consumers_are_exact() -> None:
             "opensquilla.contracts.generated.v4.goals_set_metadata",
             GOALS_METADATA_IMPORT_ALLOWLIST,
         ),
+        "goals.capabilities": (
+            "opensquilla.contracts.generated.v4.goals_capabilities_metadata",
+            GOALS_METADATA_IMPORT_ALLOWLIST,
+        ),
     }
     for method, (module_name, allowlist) in allowlists.items():
         consumers = {
@@ -575,7 +579,15 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
     assert [
         site
         for site in sites
-        if site[2] in {"goals.status", "goals.set", "GOALS_STATUS_METHOD", "GOALS_SET_METHOD"}
+        if site[2]
+        in {
+            "goals.status",
+            "goals.set",
+            "goals.capabilities",
+            "GOALS_STATUS_METHOD",
+            "GOALS_SET_METHOD",
+            "GOALS_CAPABILITIES_METHOD",
+        }
     ] == []
 
 
@@ -610,6 +622,10 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
     assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
     assert entry.handler.__name__ == "handle_contract_method"
 
+    from opensquilla.contracts.generated.v4.goals_capabilities_metadata import (
+        GOALS_CAPABILITIES_METHOD,
+        GOALS_CAPABILITIES_SCOPE,
+    )
     from opensquilla.contracts.generated.v4.goals_set_metadata import (
         GOALS_SET_METHOD,
         GOALS_SET_SCOPE,
@@ -622,6 +638,7 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
     for method, scope in (
         (GOALS_STATUS_METHOD, GOALS_STATUS_SCOPE),
         (GOALS_SET_METHOD, GOALS_SET_SCOPE),
+        (GOALS_CAPABILITIES_METHOD, GOALS_CAPABILITIES_SCOPE),
     ):
         entry = registry.get_entry(method)
         assert entry is not None

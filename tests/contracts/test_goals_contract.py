@@ -4,13 +4,44 @@ import pytest
 
 from opensquilla.contracts.adapters.goals_contract import (
     GoalsContractError,
+    goals_capabilities_params_contract_errors,
     goals_set_params_contract_errors,
     goals_status_params_contract_errors,
+    validate_goals_capabilities_result,
     validate_goals_set_params,
     validate_goals_set_result,
     validate_goals_status_params,
     validate_goals_status_result,
 )
+
+
+def test_capabilities_observer_preserves_optional_and_legacy_request_shapes() -> None:
+    assert goals_capabilities_params_contract_errors(None) == ()
+    assert goals_capabilities_params_contract_errors({"session_key": "agent:demo"}) == ()
+    assert goals_capabilities_params_contract_errors({"sessionKey": 1})
+    assert goals_capabilities_params_contract_errors("legacy") == ()
+
+
+def test_capabilities_result_requires_canonical_fields_and_keeps_extensions() -> None:
+    result = validate_goals_capabilities_result(
+        {
+            "supported": True,
+            "executionEnabled": False,
+            "maxTurns": 50,
+            "runtimeBudgetSeconds": 3600,
+            "methods": ["goals.set"],
+            "future": {"v": 1},
+        }
+    )
+    assert result["methods"] == ["goals.set"]
+    assert result["future"] == {"v": 1}
+
+
+def test_capabilities_result_rejects_legacy_nested_shape_at_gateway_boundary() -> None:
+    with pytest.raises(GoalsContractError, match="goals.capabilities"):
+        validate_goals_capabilities_result(
+            {"capabilities": {"executionEnabled": True}}
+        )
 
 
 def test_status_observer_reports_drift_without_raising() -> None:

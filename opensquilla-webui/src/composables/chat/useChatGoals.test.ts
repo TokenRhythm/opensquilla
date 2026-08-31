@@ -105,6 +105,13 @@ function harness(continuityStorage?: GoalContinuityStorage) {
   }
   const goalCenter = {
     available: () => true,
+    capabilities: async () => ({
+      supported: true,
+      executionEnabled: true,
+      maxTurns: 50,
+      runtimeBudgetSeconds: 3600,
+      methods: ['goals.set'],
+    }),
     status: async (sessionKey: string) => ({ sessionKey, sessionId: SESSION_ID, epoch: 1, goal: goalPayload() }),
     set: async (input: { sessionKey: string; objective: string; clientRequestId: string; clientMessageId: string }) => rpc.call('goals.set', input),
   }

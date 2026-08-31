@@ -64,6 +64,15 @@ export interface GoalSetResult {
   readonly continuityToken?: string
 }
 
+/** Process-scoped Goal feature flags projected out of the v4 wire shape. */
+export interface GoalCapabilities {
+  readonly supported: boolean
+  readonly executionEnabled: boolean
+  readonly maxTurns: number
+  readonly runtimeBudgetSeconds: number
+  readonly methods: readonly string[]
+}
+
 export type GoalCenterErrorCode = 'not-found' | 'unsupported' | 'forbidden' | 'conflict' | 'unavailable' | 'invalid'
 
 export class GoalCenterError extends Error {
@@ -84,6 +93,7 @@ export class GoalCenterError extends Error {
 export interface GoalCenter {
   /** Report whether the requested Goal UX operation is available. */
   available(operation?: 'status' | 'set' | 'goal-mode'): boolean
+  capabilities(options?: { signal?: AbortSignal }): Promise<GoalCapabilities>
   status(sessionKey: string, options?: { signal?: AbortSignal }): Promise<GoalStatusResult>
   set(input: GoalSetInput, options?: { signal?: AbortSignal }): Promise<GoalSetResult>
 }
