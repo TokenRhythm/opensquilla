@@ -5,7 +5,7 @@ import { GOALS_SET_METHOD, type Params as GoalSetParams, type Result as GoalSetW
 import { validateParams as validateGoalSetParams, validateResult as validateGoalSetResult } from '@/contracts/generated/v4/goalsSetValidators.mjs'
 import { GOALS_STATUS_METHOD, type Params as GoalStatusParams, type Result as GoalStatusWireResult } from '@/contracts/generated/v4/goalsStatus'
 import { validateParams as validateGoalStatusParams, validateResult as validateGoalStatusResult } from '@/contracts/generated/v4/goalsStatusValidators.mjs'
-import type { GoalCapabilities, GoalCenter, GoalSetResult, GoalStatusResult } from '@/modules/goalCenter'
+import type { GoalCapabilities, GoalCenter, GoalMutationInput, GoalMutationResult, GoalSetResult, GoalStatusResult } from '@/modules/goalCenter'
 import { GoalCenterError } from '@/modules/goalCenter'
 import { projectGoalSnapshot } from './goalSnapshotProjection'
 import { mapGoalError } from './goalErrorMapping'
@@ -21,6 +21,42 @@ const integer = (...values: unknown[]): number | undefined => values.find(value 
 function optionsFor(signal: AbortSignal | undefined): RpcCallOptions | undefined { return signal ? { signal, abortAction: 'reject', timeoutAction: 'reject' } : undefined }
 
 export function createV4GoalCenter(transport: GoalCenterTransport): GoalCenter {
+    const mutate = async (
+      method: 'goals.edit' | 'goals.pause' | 'goals.resume' | 'goals.clear',
+      input: GoalMutationInput & { objective?: string },
+      options?: { signal?: AbortSignal },
+    ): Promise<GoalMutationResult> => {
+      const params: Record<string, unknown> = {
+        sessionKey: input.sessionKey,
+        expectedGoalId: input.expectedGoalId,
+        expectedStateRevision: input.expectedStateRevision,
+        clientRequestId: input.clientRequestId,
+        ...(input.sourceKind ? { sourceKind: input.sourceKind } : {}),
+        ...(input.objective !== undefined ? { objective: input.objective } : {}),
+      }
+      try {
+        const raw = await transport.request<Record<string, unknown>>(method, params, optionsFor(options?.signal))
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+          throw new Error(`${method} returned an invalid response`)
+        }
+        const sessionKey = text(raw.sessionKey, raw.session_key)
+        const sessionId = text(raw.sessionId, raw.session_id)
+        const epoch = integer(raw.epoch)
+        return {
+          ...raw,
+          sessionKey,
+          sessionId,
+          epoch,
+          clientRequestId: text(raw.clientRequestId, raw.client_request_id) ?? input.clientRequestId,
+          taskId: text(raw.taskId, raw.task_id) ?? null,
+          userMessageId: text(raw.userMessageId, raw.user_message_id) ?? null,
+          previousGoalId: text(raw.previousGoalId, raw.previous_goal_id) ?? null,
+          goal: projectGoalSnapshot(raw.goal),
+          accepted: raw.accepted === undefined ? undefined : raw.accepted === true,
+          continuityToken: text(raw.continuityToken, raw.continuity_token),
+        }
+      } catch (error) { throw mapGoalError(error) }
+    }
   return {
     available(operation = 'status') {
       if (!transport.supports) return true
@@ -83,5 +119,9 @@ export function createV4GoalCenter(transport: GoalCenterTransport): GoalCenter {
         }
       } catch (error) { throw mapGoalError(error) }
     },
+    edit(input, options) { return mutate('goals.edit', input, options) },
+    pause(input, options) { return mutate('goals.pause', input, options) },
+    resume(input, options) { return mutate('goals.resume', input, options) },
+    clear(input, options) { return mutate('goals.clear', input, options) },
   }
 }

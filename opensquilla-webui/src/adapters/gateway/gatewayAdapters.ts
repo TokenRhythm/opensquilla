@@ -18,6 +18,8 @@ import type { GoalCenter } from '@/modules/goalCenter'
 import { createV4GoalCenter } from './goalCenterV4'
 import { createV4GoalContinuity } from './goalContinuityV4'
 import type { GoalContinuity } from '@/modules/goalContinuity'
+import type { PlanCenter } from '@/modules/planCenter'
+import { createV4PlanCenter } from './planCenterV4'
 
 type RpcStoreTransportSource = Parameters<typeof createPrivateGatewayTransports>[0]
 
@@ -31,6 +33,7 @@ export interface GatewayAdapters {
   readonly approvalCenter: ApprovalCenter
   readonly goalCenter: GoalCenter
   readonly goalContinuity: GoalContinuity
+  readonly planCenter: PlanCenter
 }
 
 interface GatewayHttpSource {
@@ -66,6 +69,7 @@ export function createGatewayAdapters(
     approvalCenter: createApprovalCenterV4(transports.rpc, transports.events, { http }),
     goalCenter: createV4GoalCenter(transports.rpc),
     goalContinuity: createV4GoalContinuity(transports.rpc, transports.events),
+    planCenter: createV4PlanCenter(transports.rpc, transports.events),
   }
   return adapters
 }
