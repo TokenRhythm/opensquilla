@@ -1186,45 +1186,20 @@ def _desktop_ownership_profile_home(config: GatewayConfig) -> Path:
 
 
 async def _ensure_sandbox_setup_on_boot(config: GatewayConfig) -> Any | None:
-    """Inspect sandbox readiness without elevating during gateway startup."""
-
+    """Initialize the existing sandbox after gateway readiness, without self-tests."""
     if not config.sandbox.auto_setup:
         log.info("boot.sandbox_setup_auto_disabled")
         return None
 
-    from opensquilla.sandbox.setup_runtime import (
-        current_sandbox_capability_report,
-        current_sandbox_setup_runtime_status,
-    )
+    from opensquilla.sandbox.setup_runtime import initialize_sandbox_runtime
 
-    result = await current_sandbox_setup_runtime_status(config)
+    result = await initialize_sandbox_runtime(config)
     log.info(
-        "boot.sandbox_setup_status_completed",
+        "boot.sandbox_initialization_completed",
         state=result.state.value,
         platform=result.platform,
-        requires_admin=result.requires_admin,
         detail=result.detail,
     )
-    if result.state.value == "ready":
-        try:
-            capability = await current_sandbox_capability_report(config)
-            log.info(
-                "boot.sandbox_capability_prewarm_completed",
-                available=getattr(capability, "available", False),
-                backend=getattr(capability, "backend", ""),
-                code=getattr(capability, "code", ""),
-            )
-        except Exception as exc:  # noqa: BLE001 - startup prewarm is best-effort.
-            log.warning(
-                "boot.sandbox_capability_prewarm_failed",
-                error=str(exc),
-            )
-    else:
-        log.info(
-            "boot.sandbox_setup_deferred",
-            state=result.state.value,
-            platform=result.platform,
-        )
     return result
 
 
@@ -2955,6 +2930,7 @@ async def build_services(
     session_db_path: str = ":memory:",
     extra_agent_ids: list[str] | None = None,
     seed_agent_workspaces: bool = True,
+    defer_sandbox_startup: bool = False,
 ) -> ServiceContainer:
     """Initialize reusable services without any gateway-specific side effects.
 
@@ -3077,13 +3053,12 @@ async def build_services(
             sandbox_settings,
             workspace=Path(config.workspace_dir) if config.workspace_dir else None,
             default_run_mode=config_run_mode(config),
+            defer_backend=defer_sandbox_startup,
         )
         log.info(
             "build_services.sandbox_ready",
             **effective.effective.as_dict(),
         )
-        if getattr(effective.effective, "sandbox_enabled", True) and sandbox_settings.auto_setup:
-            sandbox_setup_task = create_background_task(_ensure_sandbox_setup_on_boot(config))
     except Exception as e:  # pragma: no cover - boot diagnostics only
         log.exception("build_services.sandbox_configure_failed", error=str(e))
         raise
@@ -4260,6 +4235,7 @@ async def start_gateway_server(
             tool_registry=tool_registry,
             usage_tracker=usage_tracker,
             session_db_path=str(_state_path(config, "sessions.db")),
+            defer_sandbox_startup=run,
         )
     except BaseException:
         _pid_lock.release()
@@ -5299,6 +5275,8 @@ async def start_gateway_server(
             duration_ms=_elapsed_monotonic_ms(gateway_ready_wait_started_at, ready_at),
             startup_elapsed_ms=_elapsed_monotonic_ms(startup_started_at, ready_at),
         )
+        if config.sandbox.auto_setup:
+            svc.sandbox_setup_task = create_background_task(_ensure_sandbox_setup_on_boot(config))
         _start_post_ready_observability()
 
     server_handle = GatewayServer(app=app, config=config)

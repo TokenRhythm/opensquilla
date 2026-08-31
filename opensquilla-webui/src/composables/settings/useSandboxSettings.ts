@@ -30,6 +30,7 @@ export type SandboxPolicySection = 'files' | 'commands' | 'network' | 'runtimes'
 export type { SandboxSetupOutcome } from '@/composables/sandboxSetupCoordinator'
 
 const SECTION_SAVE_DELAY_MS = 500
+const SANDBOX_STARTUP_POLL_MS = 1_000
 const RUNTIME_STATUS_POLL_MS = 750
 const RUNTIME_STATUS_RETRY_MS = 5_000
 const RUNTIME_COMPONENT_IDS = ['python', 'node', 'gitBash'] as const
@@ -261,6 +262,8 @@ export function useSandboxSettings() {
   let runtimeStatusRequestGeneration = 0
   let runtimeViewActive = false
   let runtimePollTimer: ReturnType<typeof setTimeout> | null = null
+  let sandboxStartupPollTimer: ReturnType<typeof setTimeout> | null = null
+  let sandboxStartupPending = false
 
   const ready = computed(() => Boolean(baseline.value && draft.value))
   const canRequestSandboxSetup = computed(() => (
@@ -349,12 +352,27 @@ export function useSandboxSettings() {
   }
 
   async function loadSandboxReadiness(): Promise<void> {
-    if (!platform.capabilities.isDesktop) {
-      await loadCapability()
-      return
+    if (disposed) return
+    if (sandboxStartupPollTimer) {
+      clearTimeout(sandboxStartupPollTimer)
+      sandboxStartupPollTimer = null
     }
     const status = await loadSetupStatus()
-    if (status === null || status.state === 'ready') await loadCapability()
+    if (disposed) return
+    const report = status === null || status.state === 'ready' ? await loadCapability() : null
+    if (disposed) return
+    if (status && status.state !== 'ready') capability.value = null
+    if (status !== null) sandboxStartupPending = status.state === 'setting_up'
+    else if (report !== null) sandboxStartupPending = report.code === 'setting_up'
+    // These reads only follow an initialization already in progress. Failed or
+    // unavailable states stop polling; transport errors retain the last known
+    // pending state. Reads never trigger setup or another initialization attempt.
+    if (sandboxStartupPending) {
+      sandboxStartupPollTimer = setTimeout(() => {
+        sandboxStartupPollTimer = null
+        void loadSandboxReadiness()
+      }, SANDBOX_STARTUP_POLL_MS)
+    }
   }
 
   async function ensureSandboxSetupForSafeMode(): Promise<boolean> {
@@ -380,6 +398,7 @@ export function useSandboxSettings() {
     capabilityRequestGeneration += 1
     runtimeStatusRequestGeneration += 1
     if (runtimePollTimer) clearTimeout(runtimePollTimer)
+    if (sandboxStartupPollTimer) clearTimeout(sandboxStartupPollTimer)
     for (const timer of Object.values(sectionSaveTimers)) {
       if (timer) clearTimeout(timer)
     }
