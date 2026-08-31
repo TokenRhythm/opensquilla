@@ -593,6 +593,7 @@
       "tests/test_gateway/test_runtime_override_provenance.py",
       "tests/test_gateway/test_sandbox_protocol_codec.py",
       "tests/test_gateway/test_sandbox_v2_routes.py",
+      "tests/test_gateway/test_search_operator_run_context.py",
       "tests/test_gateway/test_search_runtime_config_gateway.py",
       "tests/test_gateway/test_security_headers.py",
       "tests/test_gateway/test_session_history_adapter.py",

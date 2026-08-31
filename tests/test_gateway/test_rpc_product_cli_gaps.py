@@ -1694,9 +1694,16 @@ async def test_search_status_and_query_return_structured_payloads():
 
 
 @pytest.mark.asyncio
-async def test_search_status_reports_the_precondition_that_denies_query(tmp_path):
+async def test_search_status_reports_the_verdict_the_query_will_meet(tmp_path):
+    """Readiness and the query must agree, whichever way the posture resolves.
+
+    This pinned ``networkReady is False`` while the operator RPC had no Run
+    Context to reach the managed proxy with. #1202 gave it one, so under this
+    posture both sides now succeed; the contract being protected is the
+    agreement, not the refusal that used to satisfy it.
+    """
     from opensquilla.sandbox.config import SandboxSettings
-    from opensquilla.sandbox.integration import configure_runtime
+    from opensquilla.sandbox.integration import configure_runtime, reset_runtime
 
     register_provider(
         "fake_search_ok",
@@ -1712,23 +1719,27 @@ async def test_search_status_reports_the_precondition_that_denies_query(tmp_path
         ),
         workspace=tmp_path,
     )
-
-    status = await get_dispatcher().dispatch("r1", "search.status", {}, _ctx())
-    query = await get_dispatcher().dispatch(
-        "r2",
-        "search.query",
-        {"query": "hello", "limit": 2},
-        _ctx(),
-    )
+    try:
+        status = await get_dispatcher().dispatch("r1", "search.status", {}, _ctx())
+        query = await get_dispatcher().dispatch(
+            "r2",
+            "search.query",
+            {"query": "hello", "limit": 2},
+            _ctx(),
+        )
+    finally:
+        # The runtime is process-global; leaving this posture configured makes
+        # every later test in this module run under it.
+        reset_runtime()
 
     assert status.error is None, status.error
-    assert status.payload["networkReady"] is False
-    reason = status.payload["networkBlockedReason"]
-    assert "Run Context grants" in reason
     assert query.error is None, query.error
-    assert query.payload["ok"] is False
-    assert query.payload["error"]["kind"] == "policy_denied"
-    assert query.payload["error"]["message"] == reason
+    assert status.payload["networkReady"] is query.payload["ok"]
+    if not status.payload["networkReady"]:
+        reason = status.payload["networkBlockedReason"]
+        assert "Run Context grants" in reason
+        assert query.payload["error"]["kind"] == "policy_denied"
+        assert query.payload["error"]["message"] == reason
 
 
 @pytest.mark.asyncio
