@@ -23,6 +23,35 @@ describe('createV4GoalCenter', () => {
     expect(center.available('goal-mode')).toBe(true)
   })
 
+  it('validates and projects process-scoped goal capabilities', async () => {
+    const source = transport({
+      supported: true,
+      executionEnabled: false,
+      maxTurns: 50,
+      runtimeBudgetSeconds: 3600,
+      methods: ['goals.status'],
+      future: { version: 2 },
+    })
+    const center = createV4GoalCenter(source)
+
+    await expect(center.capabilities()).resolves.toEqual({
+      supported: true,
+      executionEnabled: false,
+      maxTurns: 50,
+      runtimeBudgetSeconds: 3600,
+      methods: ['goals.status'],
+    })
+    expect(source.requests[0]).toEqual({
+      method: 'goals.capabilities',
+      params: undefined,
+    })
+  })
+
+  it('rejects an incomplete capability response at the adapter boundary', async () => {
+    const source = transport({ supported: true, executionEnabled: true })
+    await expect(createV4GoalCenter(source).capabilities()).rejects.toThrow('invalid response')
+  })
+
   it('validates and projects goals.status without exposing wire aliases', async () => {
     const source = transport({ session_key: 'agent:demo', session_id: 's1', epoch: 2, goal: { status: 'active', goal_id: 'g1', objective: 'ship', session_key: 'agent:demo', session_id: 's1', epoch: 2, state_revision: 3, objective_revision: 1, progress_revision: 0, active_task_id: null, source_user_message_id: 'm1', turns_started: 2, usage: { total_tokens: 4 } } })
     const center = createV4GoalCenter(source)

@@ -12,6 +12,18 @@ from typing import Any, cast
 
 from pydantic import ValidationError
 
+from opensquilla.contracts.generated.v4.goals_capabilities import (
+    LegacyNonObjectParams as GoalsCapabilitiesLegacyNonObjectParams,
+)
+from opensquilla.contracts.generated.v4.goals_capabilities import (
+    Params as GoalsCapabilitiesParams,
+)
+from opensquilla.contracts.generated.v4.goals_capabilities import (
+    Result as GoalsCapabilitiesResult,
+)
+from opensquilla.contracts.generated.v4.goals_capabilities_metadata import (
+    GOALS_CAPABILITIES_METHOD,
+)
 from opensquilla.contracts.generated.v4.goals_set import (
     LegacyNonObjectParams as GoalsSetLegacyNonObjectParams,
 )
@@ -55,6 +67,21 @@ def goals_status_params_contract_errors(params: Any) -> tuple[dict[str, Any], ..
     return ()
 
 
+def goals_capabilities_params_contract_errors(
+    params: Any,
+) -> tuple[dict[str, Any], ...]:
+    """Observe capability-query request drift without changing v4 errors."""
+
+    try:
+        if isinstance(params, Mapping):
+            GoalsCapabilitiesParams.model_validate(dict(params))
+        elif params is not None:
+            GoalsCapabilitiesLegacyNonObjectParams.model_validate(params)
+    except ValidationError as exc:
+        return _errors(exc)
+    return ()
+
+
 def goals_set_params_contract_errors(params: Any) -> tuple[dict[str, Any], ...]:
     """Observe set request drift while forwarding legacy values unchanged."""
 
@@ -92,6 +119,22 @@ def validate_goals_status_result(payload: Any) -> dict[str, Any]:
         raise GoalsContractError(
             f"{GOALS_STATUS_METHOD} result violated Contract: {_errors(exc)}"
         ) from exc
+
+
+def validate_goals_capabilities_result(payload: Any) -> dict[str, Any]:
+    """Validate the canonical top-level capability projection and preserve extensions."""
+
+    if not isinstance(payload, Mapping):
+        raise GoalsContractError(
+            f"{GOALS_CAPABILITIES_METHOD} result must be a JSON object"
+        )
+    try:
+        GoalsCapabilitiesResult.model_validate(dict(payload))
+    except ValidationError as exc:
+        raise GoalsContractError(
+            f"{GOALS_CAPABILITIES_METHOD} result violated Contract: {_errors(exc)}"
+        ) from exc
+    return dict(payload)
 
 
 def validate_goals_set_params(params: Any) -> dict[str, Any]:

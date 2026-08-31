@@ -1,9 +1,11 @@
 import type { RpcCallOptions } from '@/lib/rpc'
+import { GOALS_CAPABILITIES_METHOD, type Result as GoalCapabilitiesWireResult } from '@/contracts/generated/v4/goalsCapabilities'
+import { validateResult as validateGoalCapabilitiesResult } from '@/contracts/generated/v4/goalsCapabilitiesValidators.mjs'
 import { GOALS_SET_METHOD, type Params as GoalSetParams, type Result as GoalSetWireResult } from '@/contracts/generated/v4/goalsSet'
 import { validateParams as validateGoalSetParams, validateResult as validateGoalSetResult } from '@/contracts/generated/v4/goalsSetValidators.mjs'
 import { GOALS_STATUS_METHOD, type Params as GoalStatusParams, type Result as GoalStatusWireResult } from '@/contracts/generated/v4/goalsStatus'
 import { validateParams as validateGoalStatusParams, validateResult as validateGoalStatusResult } from '@/contracts/generated/v4/goalsStatusValidators.mjs'
-import type { GoalCenter, GoalSetResult, GoalSnapshot, GoalStatusResult } from '@/modules/goalCenter'
+import type { GoalCapabilities, GoalCenter, GoalSetResult, GoalSnapshot, GoalStatusResult } from '@/modules/goalCenter'
 import { GoalCenterError } from '@/modules/goalCenter'
 
 interface GoalCenterTransport {
@@ -62,9 +64,28 @@ export function createV4GoalCenter(transport: GoalCenterTransport): GoalCenter {
     available(operation = 'status') {
       if (!transport.supports) return true
       if (operation === 'goal-mode') {
-        return transport.supports(GOALS_SET_METHOD) && transport.supports('goals.capabilities')
+        return transport.supports(GOALS_SET_METHOD) && transport.supports(GOALS_CAPABILITIES_METHOD)
       }
       return transport.supports(operation === 'set' ? GOALS_SET_METHOD : GOALS_STATUS_METHOD)
+    },
+    async capabilities(options): Promise<GoalCapabilities> {
+      try {
+        const raw = await transport.request<GoalCapabilitiesWireResult>(
+          GOALS_CAPABILITIES_METHOD,
+          undefined,
+          optionsFor(options?.signal),
+        )
+        if (!validateGoalCapabilitiesResult(raw)) {
+          throw new Error('goals.capabilities returned an invalid response')
+        }
+        return {
+          supported: raw.supported,
+          executionEnabled: raw.executionEnabled,
+          maxTurns: raw.maxTurns,
+          runtimeBudgetSeconds: raw.runtimeBudgetSeconds,
+          methods: [...raw.methods],
+        }
+      } catch (error) { throw mapError(error) }
     },
     async status(sessionKey, options): Promise<GoalStatusResult> {
       const params: GoalStatusParams = { sessionKey }
