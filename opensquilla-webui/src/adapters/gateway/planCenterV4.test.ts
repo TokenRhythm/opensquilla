@@ -3,7 +3,7 @@ import { createV4PlanCenter } from './planCenterV4'
 
 describe('createV4PlanCenter', () => {
   it('keeps v4 method names inside the adapter', async () => {
-    const request = vi.fn(async () => ({ sessionKey: 'agent:main:webchat:one', accepted: true }))
+    const request = vi.fn(async (_method: string, _params?: Record<string, unknown>, _options?: unknown) => ({ sessionKey: 'agent:main:webchat:one', accepted: true })) as unknown as (<T = unknown>(method: string, params?: Record<string, unknown>, options?: unknown) => Promise<T>)
     const center = createV4PlanCenter({ request }, { subscribe: vi.fn(() => ({ close: vi.fn() })) })
     await expect(center.setMode('agent:main:webchat:one', 'plan', 2)).resolves.toMatchObject({ accepted: true })
     expect(request).toHaveBeenCalledWith('plans.setMode', {
