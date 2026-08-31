@@ -17,6 +17,7 @@ import { APPROVAL_CENTER_KEY } from './modules/approvalCenter'
 import { GOAL_CENTER_KEY } from './modules/goalCenter'
 import { GOAL_CONTINUITY_KEY } from './modules/goalContinuity'
 import { PLAN_CENTER_KEY } from './modules/planCenter'
+import { META_RUN_CENTER_KEY } from './modules/metaRunCenter'
 import 'katex/dist/katex.min.css'
 import './assets/base.css'
 import './themes/tokens' // eagerly bundles every value theme's token block
@@ -58,6 +59,7 @@ app.provide(APPROVAL_CENTER_KEY, gatewayAdapters.approvalCenter)
 app.provide(GOAL_CENTER_KEY, gatewayAdapters.goalCenter)
 app.provide(GOAL_CONTINUITY_KEY, gatewayAdapters.goalContinuity)
 app.provide(PLAN_CENTER_KEY, gatewayAdapters.planCenter)
+app.provide(META_RUN_CENTER_KEY, gatewayAdapters.metaRunCenter)
 router.afterEach(() => {
   rpcStore.applyLinkTokenFromUrl()
 })

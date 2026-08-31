@@ -917,6 +917,7 @@ import { useMetaRuns } from '@/composables/chat/useMetaRuns'
 import { useMetaSkillSetup } from '@/composables/chat/useMetaSkillSetup'
 import { useChatPlans } from '@/composables/chat/useChatPlans'
 import { PLAN_CENTER_KEY, type PlanCenter } from '@/modules/planCenter'
+import { META_RUN_CENTER_KEY, type MetaRunCenter } from '@/modules/metaRunCenter'
 import { runStatusLabelText as sessionRunStatusLabelText } from '@/composables/useSessions'
 import {
   shouldCanonicalizeInitialDraftRoute,
@@ -1010,7 +1011,6 @@ import {
 } from '@/utils/chat/steerAvailability'
 import type {
   ArtifactPayload,
-  MetaDraftDiscardResponse,
   SessionEventPayload,
   SessionMessagesSnapshotResponse,
   SessionMessagesSubscribeResponse,
@@ -1206,6 +1206,9 @@ const planCenter: PlanCenter = injectedPlanCenter
 const injectedGoalContinuity = inject(GOAL_CONTINUITY_KEY)
 if (!injectedGoalContinuity) throw new Error('GoalContinuity was not provided')
 const goalContinuity: GoalContinuity = injectedGoalContinuity
+const injectedMetaRunCenter = inject(META_RUN_CENTER_KEY)
+if (!injectedMetaRunCenter) throw new Error('MetaRunCenter was not provided')
+const metaRunCenter: MetaRunCenter = injectedMetaRunCenter
 
 async function resolveCreatedSessionAvailability(sessionKey: string): Promise<boolean> {
   try {
@@ -2939,7 +2942,7 @@ async function switchToSession(nextSessionKey: string) {
 }
 
 const metaSkillSetup = useMetaSkillSetup({
-  rpc,
+  metaRunCenter,
   currentSessionKey: sessionKey,
   dispatchHidden: (providerText: string, displayText: string, clientRequestId?: string) => (
     dispatchHiddenForMeta(providerText, displayText, clientRequestId)
@@ -2947,15 +2950,15 @@ const metaSkillSetup = useMetaSkillSetup({
   autoRestore: false,
   restoreDraft: restoreMetaLaunchDraft,
   discardDraft: async (draftSessionKey: string, clientRequestId: string) => {
-    const result = await rpc.call<MetaDraftDiscardResponse>('meta.drafts.discard', {
+    const result = await metaRunCenter.discardDraft({
       sessionKey: draftSessionKey,
       clientRequestId,
     })
-    if (result?.accepted === true) {
+    if (result.accepted === true) {
       forgetHiddenControlOutbox(draftSessionKey, clientRequestId)
       return 'accepted'
     }
-    if (result?.discarded !== true) return 'unconfirmed'
+    if (result.discarded !== true) return 'unconfirmed'
     // Only after the server confirms atomic discard may the setup flow restore
     // plain composer text. Remove the matching browser hidden-control copy too,
     // otherwise a later session restore could replay the old stable id beside
@@ -3178,6 +3181,7 @@ const goalOutcomeHasMessageAnchor = computed(() => (
 
 const chatSlashCommands = useChatSlashCommands({
   rpc,
+  metaRunCenter,
   catalogCallOptions: optionalSessionRpcCallOptions,
   inputText,
   sessionKey,
@@ -3468,7 +3472,7 @@ async function restoreDurableMetaControls(
     pendingDiscardIds.add(requestId)
   }
   const serverDrafts = (prefetchedServerDrafts
-    ?? await listServerMetaDrafts(rpc, { sessionKey: targetSessionKey }))
+    ?? await listServerMetaDrafts(metaRunCenter, { sessionKey: targetSessionKey }))
     .filter(draft => !pendingDiscardIds.has(draft.clientRequestId))
   if (!isCurrent()) return
   restoreDeferredMetaDrafts(
@@ -3556,7 +3560,7 @@ function isPristineDraftForRecovery(expectedSessionKey: string, agentId: string)
 
 const metaDraftRecovery = createChatMetaDraftRecovery({
   currentSessionKey: () => sessionKey.value,
-  listDrafts: query => queryServerMetaDrafts(rpc, query),
+  listDrafts: query => queryServerMetaDrafts(metaRunCenter, query),
   isPristineDraft: isPristineDraftForRecovery,
   rebindDraftSession,
   onAuthoritativeSubscription: handleAuthoritativeSessionSubscription,
@@ -4146,7 +4150,7 @@ watch(sessionKey, key => chatRpcSubscriptions.setSessionKey(key))
 // four session.event.meta_* frames (delivered via the '*' wildcard, so this
 // controller must not re-consume stream_seq).
 const metaRuns = useMetaRuns({
-  rpc,
+  metaRunCenter,
   sessionKey,
   currentEpoch,
   lastStreamSeq,

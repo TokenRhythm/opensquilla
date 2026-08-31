@@ -20,6 +20,8 @@ import { createV4GoalContinuity } from './goalContinuityV4'
 import type { GoalContinuity } from '@/modules/goalContinuity'
 import type { PlanCenter } from '@/modules/planCenter'
 import { createV4PlanCenter } from './planCenterV4'
+import type { MetaRunCenter } from '@/modules/metaRunCenter'
+import { createV4MetaRunCenter } from './metaRunCenterV4'
 
 type RpcStoreTransportSource = Parameters<typeof createPrivateGatewayTransports>[0]
 
@@ -34,6 +36,7 @@ export interface GatewayAdapters {
   readonly goalCenter: GoalCenter
   readonly goalContinuity: GoalContinuity
   readonly planCenter: PlanCenter
+  readonly metaRunCenter: MetaRunCenter
 }
 
 interface GatewayHttpSource {
@@ -70,6 +73,7 @@ export function createGatewayAdapters(
     goalCenter: createV4GoalCenter(transports.rpc),
     goalContinuity: createV4GoalContinuity(transports.rpc, transports.events),
     planCenter: createV4PlanCenter(transports.rpc, transports.events),
+    metaRunCenter: createV4MetaRunCenter(transports.rpc, transports.events),
   }
   return adapters
 }
