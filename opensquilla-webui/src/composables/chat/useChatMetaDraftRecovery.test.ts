@@ -4,10 +4,10 @@ import {
   createChatMetaDraftRecovery,
   listServerMetaDrafts,
   queryServerMetaDrafts,
-  type MetaDraftListRpc,
   type MetaDraftListResult,
 } from './useChatMetaDraftRecovery'
 import type { DurableMetaDraft } from './useChatSlashCommands'
+import type { MetaRunCenter } from '@/modules/metaRunCenter'
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -27,12 +27,18 @@ function draft(sessionKey = 'agent:main:webchat:server-draft'): DurableMetaDraft
   }
 }
 
-function rpcHarness(overrides: Partial<MetaDraftListRpc> = {}): MetaDraftListRpc {
+function centerHarness(overrides: Partial<MetaRunCenter> = {}): MetaRunCenter {
   return {
-    waitForConnection: vi.fn(async () => {}),
-    supportsMethod: vi.fn(() => true),
-    markMethodUnavailable: vi.fn(),
-    call: vi.fn(async () => ({ ok: true, durable: true, drafts: [] })),
+    launch: vi.fn(async () => ({ ok: true })),
+    listDrafts: vi.fn(async () => ({ drafts: [], durable: true })),
+    discardDraft: vi.fn(async () => ({ discarded: true, accepted: false })),
+    recover: vi.fn(async () => null),
+    confirmPreflight: vi.fn(async () => ({})),
+    replay: vi.fn(async () => ({})),
+    setupPlan: vi.fn(async () => ({})),
+    setupStatus: vi.fn(async () => ({})),
+    setupInstall: vi.fn(async () => ({})),
+    subscribe: vi.fn(() => ({ close: vi.fn() })),
     ...overrides,
   }
 }
@@ -46,29 +52,26 @@ function result(
 
 describe('listServerMetaDrafts', () => {
   it('does not call an older gateway that does not advertise the method', async () => {
-    const rpc = rpcHarness({ supportsMethod: vi.fn(() => false) })
+    const center = centerHarness({ listDrafts: vi.fn(async () => ({ drafts: [], durable: false })) })
 
-    await expect(listServerMetaDrafts(rpc, { agentId: 'main' })).resolves.toEqual([])
+    await expect(listServerMetaDrafts(center, { agentId: 'main' })).resolves.toEqual([])
 
-    expect(rpc.waitForConnection).toHaveBeenCalledWith(15_000)
-    expect(rpc.call).not.toHaveBeenCalled()
+    expect(center.listDrafts).toHaveBeenCalledWith({ agentId: 'main' })
   })
 
   it('marks a falsely advertised method unavailable', async () => {
     const error = Object.assign(new Error('method not found'), { code: 'METHOD_NOT_FOUND' })
-    const rpc = rpcHarness({ call: vi.fn(async () => { throw error }) })
+    const center = centerHarness({ listDrafts: vi.fn(async () => { throw error }) })
 
-    await expect(listServerMetaDrafts(rpc, { agentId: 'main' })).resolves.toEqual([])
-
-    expect(rpc.markMethodUnavailable).toHaveBeenCalledWith('meta.drafts.list')
+    await expect(listServerMetaDrafts(center, { agentId: 'main' })).resolves.toEqual([])
   })
 
   it('classifies a transient connection failure as retryable', async () => {
-    const rpc = rpcHarness({
-      waitForConnection: vi.fn(async () => { throw new Error('connection timed out') }),
+    const center = centerHarness({
+      listDrafts: vi.fn(async () => { throw new Error('connection timed out') }),
     })
 
-    await expect(queryServerMetaDrafts(rpc, { agentId: 'main' })).resolves.toEqual(
+    await expect(queryServerMetaDrafts(center, { agentId: 'main' })).resolves.toEqual(
       result([], true),
     )
   })

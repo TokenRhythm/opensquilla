@@ -2,6 +2,7 @@ import { nextTick, ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import { useMetaRuns } from './useMetaRuns'
+import type { MetaRunCenter } from '@/modules/metaRunCenter'
 import { counterText, ribbonCopy } from '@/utils/chat/metaRibbon'
 
 type RpcCall = (
@@ -20,17 +21,79 @@ function makeOptions(
   const sessionKey = ref('agent:main:replay-session')
   const handlers = new Map<string, (...args: unknown[]) => void>()
   const lastStreamSeq = ref(0)
-  const api = useMetaRuns({
-    rpc: {
-      call: <T = unknown>(
-        method: string,
-        params?: Record<string, unknown>,
-      ): Promise<T> => call(method, params) as Promise<T>,
-      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
-        handlers.set(event, handler)
-        return () => handlers.delete(event)
-      }),
+  const metaRunCenter: MetaRunCenter = {
+    launch: async () => ({ ok: true }),
+    listDrafts: async () => ({ drafts: [], durable: true }),
+    discardDraft: async () => ({ discarded: true, accepted: false }),
+    recover: async (sessionKey) => {
+      const raw = await call('meta.runs.recovery', { sessionKey }) as { recovery?: Record<string, unknown> }
+      const recovery = raw?.recovery
+      if (!recovery) return null
+      return {
+        announced: recovery.announced as Record<string, unknown> | undefined,
+        stepStates: Array.isArray(recovery.step_states)
+          ? recovery.step_states as Record<string, unknown>[] : [],
+        completed: recovery.completed as Record<string, unknown> | undefined,
+      }
     },
+    confirmPreflight: async (input) => await call('meta.runs.confirm_preflight', {
+      sessionKey: input.sessionKey,
+      runId: input.runId,
+      run_id: input.runId,
+      interpretedRequest: input.interpretedRequest,
+      fields: input.fields,
+      useDefaults: input.useDefaults,
+    }) as { message?: string },
+    replay: async (input) => {
+      const raw = await call('meta.runs.replay', {
+        sessionKey: input.sessionKey,
+        runId: input.runId,
+        run_id: input.runId,
+        mode: input.mode,
+        ...(input.action ? { action: input.action } : {}),
+        ...(input.stepId ? { stepId: input.stepId } : {}),
+        ...(input.prepareLive ? { prepareLive: true } : {}),
+        ...(input.replayToken ? { replayToken: input.replayToken } : {}),
+      }) as Record<string, unknown>
+      const source = (raw?.replay && typeof raw.replay === 'object'
+        ? raw.replay : raw) as Record<string, unknown>
+      const live = (source.live_replay && typeof source.live_replay === 'object'
+        ? source.live_replay : {}) as Record<string, unknown>
+      return {
+        message: typeof source.message === 'string' ? source.message : undefined,
+        launchText: typeof source.launch_text === 'string' ? source.launch_text : undefined,
+        displayText: typeof source.display_text === 'string' ? source.display_text : undefined,
+        liveReplay: {
+          available: live.available === true,
+          replayToken: typeof live.replay_token === 'string' ? live.replay_token : undefined,
+          committed: live.committed === true,
+        },
+      }
+    },
+    setupPlan: async () => ({}),
+    setupStatus: async () => ({}),
+    setupInstall: async () => ({}),
+    subscribe: (listener) => {
+      const bindings = [
+        ['session.event.meta_preflight', 'preflight'],
+        ['session.event.meta_run_announced', 'run-announced'],
+        ['session.event.meta_step_state', 'step-state'],
+        ['session.event.meta_run_completed', 'run-completed'],
+      ] as const
+      for (const [name, kind] of bindings) {
+        handlers.set(name, (...args) => listener({
+          kind,
+          payload: (args[0] || {}) as Record<string, unknown>,
+          sessionKey: null,
+          streamSeq: null,
+          streamGeneration: null,
+        }))
+      }
+      return { close: () => bindings.forEach(([name]) => handlers.delete(name)) }
+    },
+  }
+  const api = useMetaRuns({
+    metaRunCenter,
     sessionKey,
     currentEpoch: ref(1),
     lastStreamSeq,

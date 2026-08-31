@@ -3,6 +3,7 @@ import { ref } from 'vue'
 
 import type { MetaSetupJob, MetaSetupReadiness } from '@/types/metaSetup'
 import type { HiddenControlDispatchResult } from '@/types/chat'
+import type { MetaRunCenter } from '@/modules/metaRunCenter'
 import {
   META_SETUP_PROVIDER_HANDOFF_TTL_MS,
   metaSetupLaunchStorageKey,
@@ -92,13 +93,44 @@ function harness(
     clientRequestId,
     sessionKey: currentSessionKey.value,
   })))
-  const api = useMetaSkillSetup({
-    rpc: {
-      call: async <T = unknown>(method: string, params?: Record<string, unknown>) => (
-        await call(method, params) as T
-      ),
-      waitForConnection: options.waitForConnection,
+  const metaRunCenter: MetaRunCenter = {
+    launch: async (input) => {
+      await options.waitForConnection?.(15_000)
+      const raw = await call('meta.run', input) as Record<string, unknown>
+      return {
+        ok: raw.ok === true,
+        error: typeof raw.error === 'string' ? raw.error : undefined,
+        drafted: raw.drafted === true,
+        setupRequired: raw.setup_required === true,
+        readiness: raw.readiness as MetaSetupReadiness | undefined,
+      }
     },
+    listDrafts: async () => ({ drafts: [], durable: true }),
+    discardDraft: async () => ({ discarded: true, accepted: false }),
+    recover: async () => null,
+    confirmPreflight: async () => ({}),
+    replay: async () => ({}),
+    setupPlan: async name => {
+      await options.waitForConnection?.(15_000)
+      return await call('meta.setup.plan', { name }) as Record<string, unknown>
+    },
+    setupStatus: async input => {
+      await options.waitForConnection?.(15_000)
+      return await call('meta.setup.status', input) as Record<string, unknown>
+    },
+    setupInstall: async input => {
+      await options.waitForConnection?.(15_000)
+      return await call('meta.setup.install', {
+        name: input.name,
+        sessionKey: input.sessionKey,
+        confirmed: input.confirmed,
+        action_ids: input.actionIds,
+      }) as Record<string, unknown>
+    },
+    subscribe: vi.fn(() => ({ close: vi.fn() })),
+  }
+  const api = useMetaSkillSetup({
+    metaRunCenter,
     currentSessionKey,
     dispatchHidden,
     pollIntervalMs: 750,

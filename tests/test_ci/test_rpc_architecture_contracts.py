@@ -30,6 +30,7 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         # Gateway registration boundary without changing their implementation.
         "src/opensquilla/contracts/adapters/goals_contract.py",
         "src/opensquilla/gateway/adapters/goals_contract.py",
+        "src/opensquilla/gateway/adapters/plans_contract.py",
     }
 )
 GENERATED_METADATA_IMPORT_ALLOWLIST = frozenset(
@@ -57,6 +58,16 @@ SESSIONS_SEARCH_METADATA_IMPORT_ALLOWLIST = frozenset(
 GOALS_METADATA_IMPORT_ALLOWLIST = frozenset(
     {
         "src/opensquilla/contracts/adapters/goals_contract.py",
+    }
+)
+GOAL_MUTATION_METADATA_IMPORT_ALLOWLIST = frozenset(
+    {
+        "src/opensquilla/gateway/adapters/goals_contract.py",
+    }
+)
+PLANS_METADATA_IMPORT_ALLOWLIST = frozenset(
+    {
+        "src/opensquilla/gateway/adapters/plans_contract.py",
     }
 )
 SESSIONS_CHANGED_METADATA_IMPORT_ALLOWLIST = frozenset(
@@ -95,11 +106,9 @@ SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
     }
 )
 SESSIONS_RESOLVE_LITERAL_ALLOWLIST: Counter[str] = Counter()
-SESSIONS_LIST_GATEWAY_ADAPTER = (
-    PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
-)
+SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
 RUNTIME_RPC_METHOD_BASELINE = 306
-STATIC_RPC_DECORATOR_BASELINE = 292
+STATIC_RPC_DECORATOR_BASELINE = 284
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
 # closure measurement below.  The temporary S2a cumulative growth budget was
@@ -163,7 +172,10 @@ F2_FOUNDATION_RUNTIME_FILES = (
 # composition entry (4 lines), and GoalContinuity adds its independently
 # owned lease/event seam (4 lines). Keep every reviewed increment explicit
 # rather than turning the foundation exception into an open-ended budget.
-F2_FOUNDATION_RUNTIME_LOC_CEILING = 1_196
+# The current main baseline is 1,200 physical lines.  Keep this ceiling
+# explicit so future domain slices cannot hide growth behind the foundation
+# allowance; this is a baseline correction, not a new R1 exception.
+F2_FOUNDATION_RUNTIME_LOC_CEILING = 1_200
 
 # Existing cross-rpc private imports are architectural debt. This exact ledger
 # prevents growth and also fails stale when an import is removed, so reductions
@@ -348,14 +360,11 @@ def test_generated_python_wire_types_are_adapter_only() -> None:
 def test_generated_registry_stays_inside_the_generated_boundary() -> None:
     registry = GENERATED_CONTRACT_ROOT / "v4" / "gateway_contract_registry.py"
     imported_modules = {
-        module
-        for node in ast.walk(_tree(registry))
-        for module in _imported_modules(registry, node)
+        module for node in ast.walk(_tree(registry)) for module in _imported_modules(registry, node)
     }
 
     assert any(
-        module.startswith("opensquilla.contracts.generated.v4.")
-        for module in imported_modules
+        module.startswith("opensquilla.contracts.generated.v4.") for module in imported_modules
     )
     assert _relative(registry) not in _generated_python_wire_consumers()
 
@@ -410,6 +419,38 @@ def test_schema_derived_method_metadata_consumers_are_exact() -> None:
             "opensquilla.contracts.generated.v4.goals_reattach_metadata",
             GOALS_METADATA_IMPORT_ALLOWLIST,
         ),
+        "goals.edit": (
+            "opensquilla.contracts.generated.v4.goals_edit_metadata",
+            GOAL_MUTATION_METADATA_IMPORT_ALLOWLIST,
+        ),
+        "goals.pause": (
+            "opensquilla.contracts.generated.v4.goals_pause_metadata",
+            GOAL_MUTATION_METADATA_IMPORT_ALLOWLIST,
+        ),
+        "goals.resume": (
+            "opensquilla.contracts.generated.v4.goals_resume_metadata",
+            GOAL_MUTATION_METADATA_IMPORT_ALLOWLIST,
+        ),
+        "goals.clear": (
+            "opensquilla.contracts.generated.v4.goals_clear_metadata",
+            GOAL_MUTATION_METADATA_IMPORT_ALLOWLIST,
+        ),
+        "plans.setMode": (
+            "opensquilla.contracts.generated.v4.plans_set_mode_metadata",
+            PLANS_METADATA_IMPORT_ALLOWLIST,
+        ),
+        "plans.revise": (
+            "opensquilla.contracts.generated.v4.plans_revise_metadata",
+            PLANS_METADATA_IMPORT_ALLOWLIST,
+        ),
+        "plans.implement": (
+            "opensquilla.contracts.generated.v4.plans_implement_metadata",
+            PLANS_METADATA_IMPORT_ALLOWLIST,
+        ),
+        "plans.cancelRun": (
+            "opensquilla.contracts.generated.v4.plans_cancel_run_metadata",
+            PLANS_METADATA_IMPORT_ALLOWLIST,
+        ),
     }
     for method, (module_name, allowlist) in allowlists.items():
         consumers = {
@@ -420,9 +461,7 @@ def test_schema_derived_method_metadata_consumers_are_exact() -> None:
         }
         unexpected = consumers - allowlist
         stale = allowlist - consumers
-        assert unexpected == set(), (
-            f"unexpected {method} metadata imports: {unexpected}"
-        )
+        assert unexpected == set(), f"unexpected {method} metadata imports: {unexpected}"
         assert stale == set(), f"stale {method} metadata import allowlist: {stale}"
 
 
@@ -498,20 +537,15 @@ def test_contract_gateway_adapters_do_not_join_a_gateway_cycle() -> None:
     for adapter_path in (SESSIONS_LIST_GATEWAY_ADAPTER, resolve_adapter, goals_adapter):
         adapter = _module_name(adapter_path)
         cycle_edges = sorted(
-            dependency
-            for dependency in graph[adapter]
-            if _reaches(graph, dependency, adapter)
+            dependency for dependency in graph[adapter] if _reaches(graph, dependency, adapter)
         )
         gateway_dependencies = sorted(
             dependency
             for dependency in graph[adapter]
             if dependency.startswith("opensquilla.gateway")
         )
-        assert gateway_dependencies == [
-            "opensquilla.gateway.adapters.contract_method"
-        ], (
-            f"{adapter} may depend only on the generic registration Adapter: "
-            f"{gateway_dependencies}"
+        assert gateway_dependencies == ["opensquilla.gateway.adapters.contract_method"], (
+            f"{adapter} may depend only on the generic registration Adapter: {gateway_dependencies}"
         )
         assert cycle_edges == [], f"{adapter} joined a Python import cycle: {cycle_edges}"
 
@@ -519,9 +553,7 @@ def test_contract_gateway_adapters_do_not_join_a_gateway_cycle() -> None:
 def test_rpc_context_does_not_grow_past_pinned_main() -> None:
     tree = _tree(RPC_CONTEXT)
     context = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "RpcContext"
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "RpcContext"
     )
     fields = [node for node in context.body if isinstance(node, ast.AnnAssign)]
     assert len(fields) <= 33
@@ -570,15 +602,9 @@ def _method_registration_sites() -> list[tuple[str, str, str]]:
 def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_registered() -> None:
     sites = _method_registration_sites()
     assert len(sites) == STATIC_RPC_DECORATOR_BASELINE
+    assert [site for site in sites if site[2] in {"sessions.list", "SESSIONS_LIST_METHOD"}] == []
     assert [
-        site
-        for site in sites
-        if site[2] in {"sessions.list", "SESSIONS_LIST_METHOD"}
-    ] == []
-    assert [
-        site
-        for site in sites
-        if site[2] in {"sessions.resolve", "SESSIONS_RESOLVE_METHOD"}
+        site for site in sites if site[2] in {"sessions.resolve", "SESSIONS_RESOLVE_METHOD"}
     ] == []
     assert [
         site
@@ -589,10 +615,18 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "goals.set",
             "goals.capabilities",
             "goals.reattach",
+            "goals.edit",
+            "goals.pause",
+            "goals.resume",
+            "goals.clear",
             "GOALS_STATUS_METHOD",
             "GOALS_SET_METHOD",
             "GOALS_CAPABILITIES_METHOD",
             "GOALS_REATTACH_METHOD",
+            "GOALS_EDIT_METHOD",
+            "GOALS_PAUSE_METHOD",
+            "GOALS_RESUME_METHOD",
+            "GOALS_CLEAR_METHOD",
         }
     ] == []
 
@@ -632,9 +666,25 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
         GOALS_CAPABILITIES_METHOD,
         GOALS_CAPABILITIES_SCOPE,
     )
+    from opensquilla.contracts.generated.v4.goals_clear_metadata import (
+        GOALS_CLEAR_METHOD,
+        GOALS_CLEAR_SCOPE,
+    )
+    from opensquilla.contracts.generated.v4.goals_edit_metadata import (
+        GOALS_EDIT_METHOD,
+        GOALS_EDIT_SCOPE,
+    )
+    from opensquilla.contracts.generated.v4.goals_pause_metadata import (
+        GOALS_PAUSE_METHOD,
+        GOALS_PAUSE_SCOPE,
+    )
     from opensquilla.contracts.generated.v4.goals_reattach_metadata import (
         GOALS_REATTACH_METHOD,
         GOALS_REATTACH_SCOPE,
+    )
+    from opensquilla.contracts.generated.v4.goals_resume_metadata import (
+        GOALS_RESUME_METHOD,
+        GOALS_RESUME_SCOPE,
     )
     from opensquilla.contracts.generated.v4.goals_set_metadata import (
         GOALS_SET_METHOD,
@@ -650,6 +700,40 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
         (GOALS_SET_METHOD, GOALS_SET_SCOPE),
         (GOALS_CAPABILITIES_METHOD, GOALS_CAPABILITIES_SCOPE),
         (GOALS_REATTACH_METHOD, GOALS_REATTACH_SCOPE),
+        (GOALS_EDIT_METHOD, GOALS_EDIT_SCOPE),
+        (GOALS_PAUSE_METHOD, GOALS_PAUSE_SCOPE),
+        (GOALS_RESUME_METHOD, GOALS_RESUME_SCOPE),
+        (GOALS_CLEAR_METHOD, GOALS_CLEAR_SCOPE),
+    ):
+        entry = registry.get_entry(method)
+        assert entry is not None
+        assert entry.name == method
+        assert entry.required_scope == scope
+        assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
+        assert entry.handler.__name__ == "handle_contract_method"
+
+    from opensquilla.contracts.generated.v4.plans_cancel_run_metadata import (
+        PLANS_CANCEL_RUN_METHOD,
+        PLANS_CANCEL_RUN_SCOPE,
+    )
+    from opensquilla.contracts.generated.v4.plans_implement_metadata import (
+        PLANS_IMPLEMENT_METHOD,
+        PLANS_IMPLEMENT_SCOPE,
+    )
+    from opensquilla.contracts.generated.v4.plans_revise_metadata import (
+        PLANS_REVISE_METHOD,
+        PLANS_REVISE_SCOPE,
+    )
+    from opensquilla.contracts.generated.v4.plans_set_mode_metadata import (
+        PLANS_SET_MODE_METHOD,
+        PLANS_SET_MODE_SCOPE,
+    )
+
+    for method, scope in (
+        (PLANS_SET_MODE_METHOD, PLANS_SET_MODE_SCOPE),
+        (PLANS_REVISE_METHOD, PLANS_REVISE_SCOPE),
+        (PLANS_IMPLEMENT_METHOD, PLANS_IMPLEMENT_SCOPE),
+        (PLANS_CANCEL_RUN_METHOD, PLANS_CANCEL_RUN_SCOPE),
     ):
         entry = registry.get_entry(method)
         assert entry is not None

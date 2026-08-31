@@ -58,6 +58,12 @@ from opensquilla.gateway.adapters.conversation_runtime import (
     build_v4_conversation_snapshot_application,
     snapshot_result_to_v4,
 )
+from opensquilla.gateway.adapters.plans_contract import (
+    register_plans_cancel_run_contract,
+    register_plans_implement_contract,
+    register_plans_revise_contract,
+    register_plans_set_mode_contract,
+)
 from opensquilla.gateway.adapters.session_preview import (
     SystemClock,
     build_session_preview_application,
@@ -11737,7 +11743,6 @@ async def _handle_sessions_routing_set(
     return event
 
 
-@_d.method("plans.setMode", scope="operator.write")
 async def _handle_plans_set_mode(
     params: dict | None,
     ctx: RpcContext,
@@ -11882,7 +11887,6 @@ async def _handle_plans_set_mode(
     return {"sessionKey": key, "collaboration": snapshot}
 
 
-@_d.method("plans.implement", scope="operator.write")
 async def _handle_plans_implement(
     params: dict | None,
     ctx: RpcContext,
@@ -12081,7 +12085,6 @@ async def _handle_plans_implement(
     }
 
 
-@_d.method("plans.revise", scope="operator.write")
 async def _handle_plans_revise(
     params: dict | None,
     ctx: RpcContext,
@@ -12188,7 +12191,6 @@ async def _handle_plans_revise(
     return {**result, "sessionKey": key, "collaboration": collaboration}
 
 
-@_d.method("plans.cancelRun", scope="operator.write")
 async def _handle_plans_cancel_run(params: dict | None, ctx: RpcContext) -> dict:
     key = _require_plan_session_key(params)
     run_id = _optional_string_param(params, "runId", "run_id")
@@ -12335,6 +12337,32 @@ async def _handle_plans_cancel_run(params: dict | None, ctx: RpcContext) -> dict
         {"session_key": key, "plan_run": snapshot},
     )
     return {"sessionKey": key, "planRun": snapshot}
+
+
+_handle_plans_set_mode_contract = register_plans_set_mode_contract(
+    _d,
+    _handle_plans_set_mode,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_plans_implement_contract = register_plans_implement_contract(
+    _d,
+    _handle_plans_implement,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_plans_revise_contract = register_plans_revise_contract(
+    _d,
+    _handle_plans_revise,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_plans_cancel_run_contract = register_plans_cancel_run_contract(
+    _d,
+    _handle_plans_cancel_run,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 @_d.method("sessions.bootstrap", scope="operator.read")

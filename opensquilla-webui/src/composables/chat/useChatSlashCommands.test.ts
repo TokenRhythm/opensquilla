@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { parseMetaCommandInvocation, useChatSlashCommands } from './useChatSlashCommands'
 import type { RpcCallOptions } from '@/lib/rpc'
+import type { MetaRunCenter } from '@/modules/metaRunCenter'
+import type { MetaSetupReadiness } from '@/types/metaSetup'
 
 function deferred() {
   let resolve!: () => void
@@ -23,6 +25,27 @@ function harness(
     waitForConnection: vi.fn(() => waitForConnection),
     call: vi.fn().mockResolvedValue({ commands }),
   }
+  const metaRunCenter: MetaRunCenter = {
+    launch: vi.fn(async input => {
+      const raw = await rpc.call('meta.run', input) as Record<string, unknown>
+      return {
+        ok: raw.ok === true,
+        error: typeof raw.error === 'string' ? raw.error : undefined,
+        drafted: raw.drafted === true,
+        setupRequired: raw.setup_required === true,
+        readiness: raw.readiness as MetaSetupReadiness | undefined,
+      }
+    }),
+    listDrafts: vi.fn(async () => ({ drafts: [], durable: true })),
+    discardDraft: vi.fn(async () => ({ discarded: true, accepted: false })),
+    recover: vi.fn(async () => null),
+    confirmPreflight: vi.fn(async () => ({})),
+    replay: vi.fn(async () => ({})),
+    setupPlan: vi.fn(async () => ({})),
+    setupStatus: vi.fn(async () => ({})),
+    setupInstall: vi.fn(async () => ({})),
+    subscribe: vi.fn(() => ({ close: vi.fn() })),
+  }
   const activatePlanMode = vi.fn(async () => true)
   const codingModeEnabled = ref(false)
   const setCodingModeEnabled = vi.fn(async (enabled: boolean) => {
@@ -41,6 +64,7 @@ function harness(
   const goalClear = vi.fn(async () => true)
   const api = useChatSlashCommands({
     rpc,
+    metaRunCenter,
     catalogCallOptions,
     inputText,
     sessionKey: ref('agent:main:webchat:test'),

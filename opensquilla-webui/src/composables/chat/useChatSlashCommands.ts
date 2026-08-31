@@ -1,6 +1,7 @@
 import { computed, ref, type Ref } from 'vue'
 import i18n from '@/i18n'
 import type { RpcCallOptions, RpcClientError, RpcConnectionWaitOptions } from '@/lib/rpc'
+import type { MetaRunCenter } from '@/modules/metaRunCenter'
 import type { HiddenControlDispatchResult } from '@/types/chat'
 import type { MetaSetupReadiness } from '@/types/metaSetup'
 import type { MetaLaunchDraftPayload } from '@/types/rpc'
@@ -104,6 +105,8 @@ const SUPPORTED_WEB_SLASH_ACTIONS = new Set([
 
 export interface UseChatSlashCommandsOptions {
   rpc: RpcClient
+  /** Domain seam for MetaSkill launch; wire method names stay in its adapter. */
+  metaRunCenter?: MetaRunCenter
   catalogCallOptions?: RpcCallOptions
   inputText: Ref<string>
   sessionKey: Ref<string>
@@ -356,13 +359,8 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       options.notify(i18n.global.t('chat.metaRuns.couldNotRunSkillError', { error }))
     }
     try {
-      const result = await options.rpc.call<{
-        ok?: boolean
-        error?: string
-        drafted?: boolean
-        setup_required?: boolean
-        readiness?: MetaSetupReadiness
-      }>('meta.run', {
+      if (!options.metaRunCenter) throw new Error('MetaRunCenter is unavailable')
+      const result = await options.metaRunCenter.launch({
         name: skillName,
         sessionKey: originatingSessionKey,
         clientRequestId,
@@ -389,7 +387,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
         }
         return dispatchResult?.status === 'queued' ? 'queued' : 'accepted'
       }
-      if (result?.setup_required) {
+      if (result?.setupRequired) {
         const readiness = result.readiness || {}
         if (options.requestMetaSetup) {
           const disposition = await options.requestMetaSetup(

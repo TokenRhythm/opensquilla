@@ -5,6 +5,7 @@ import { createApp, defineComponent, h, nextTick, ref } from 'vue'
 import i18n from '@/i18n'
 import { useMetaSkillSetup, type MetaSetupStorage } from '@/composables/chat/useMetaSkillSetup'
 import type { MetaSetupReadiness } from '@/types/metaSetup'
+import type { MetaRunCenter } from '@/modules/metaRunCenter'
 import MetaSkillSetupCard from './MetaSkillSetupCard.vue'
 
 const SESSION = 'agent:main:webchat:manual-setup-flow'
@@ -62,15 +63,26 @@ describe('MetaSkill setup manual recovery flow', () => {
       clientRequestId,
       sessionKey: SESSION,
     }))
+    const metaRunCenter: MetaRunCenter = {
+      launch: vi.fn(async input => {
+        const result = await call('meta.run', input) as { ok?: boolean }
+        return { ok: result.ok === true }
+      }),
+      listDrafts: vi.fn(async () => ({ drafts: [], durable: true })),
+      discardDraft: vi.fn(async () => ({ discarded: true, accepted: false })),
+      recover: vi.fn(async () => null),
+      confirmPreflight: vi.fn(async () => ({})),
+      replay: vi.fn(async () => ({})),
+      setupPlan: vi.fn(async () => ({})),
+      setupStatus: vi.fn(async () => ({})),
+      setupInstall: vi.fn(async () => ({})),
+      subscribe: vi.fn(() => ({ close: vi.fn() })),
+    }
 
     const Host = defineComponent({
       setup() {
         const setup = useMetaSkillSetup({
-          rpc: {
-            call: async <T = unknown>(method: string, params?: Record<string, unknown>) => (
-              await call(method, params) as T
-            ),
-          },
+          metaRunCenter,
           currentSessionKey: ref(SESSION),
           dispatchHidden,
           storage: memoryStorage(),

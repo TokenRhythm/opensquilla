@@ -519,11 +519,16 @@ describe('PlanRunRibbon', () => {
     const sessionKey = ref('agent:main:webchat:ribbon-order')
     const handlers = new Map<string, (...args: unknown[]) => void>()
     const plans = useChatPlans({
-      rpc: {
-        call: vi.fn(),
-        on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
-          handlers.set(event, handler)
-          return vi.fn()
+      planCenter: {
+        available: () => true,
+        setMode: vi.fn(), revise: vi.fn(), implement: vi.fn(), cancelRun: vi.fn(),
+        subscribe: vi.fn((listener: (event: any) => void) => {
+          const names = ['session.event.collaboration_mode', 'session.event.plan_revision', 'session.event.plan_run']
+          names.forEach(name => handlers.set(name, (payload: unknown) => {
+            const source = payload as Record<string, unknown>
+            listener({ kind: name.endsWith('run') ? 'run' : name.endsWith('revision') ? 'revision' : 'collaboration', sessionKey: source.session_key, collaboration: source.collaboration, plan: source.plan_revision, run: source.plan_run })
+          }))
+          return { close: () => undefined }
         }),
       },
       sessionKey,
