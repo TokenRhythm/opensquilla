@@ -916,6 +916,7 @@ import { useArtifactImageLightbox } from '@/composables/chat/useArtifactImageLig
 import { useMetaRuns } from '@/composables/chat/useMetaRuns'
 import { useMetaSkillSetup } from '@/composables/chat/useMetaSkillSetup'
 import { useChatPlans } from '@/composables/chat/useChatPlans'
+import { PLAN_CENTER_KEY, type PlanCenter } from '@/modules/planCenter'
 import { runStatusLabelText as sessionRunStatusLabelText } from '@/composables/useSessions'
 import {
   shouldCanonicalizeInitialDraftRoute,
@@ -1199,6 +1200,9 @@ const approvalCenter: ApprovalCenter = injectedApprovalCenter
 const injectedGoalCenter = inject(GOAL_CENTER_KEY)
 if (!injectedGoalCenter) throw new Error('GoalCenter was not provided')
 const goalCenter: GoalCenter = injectedGoalCenter
+const injectedPlanCenter = inject(PLAN_CENTER_KEY)
+if (!injectedPlanCenter) throw new Error('PlanCenter was not provided')
+const planCenter: PlanCenter = injectedPlanCenter
 const injectedGoalContinuity = inject(GOAL_CONTINUITY_KEY)
 if (!injectedGoalContinuity) throw new Error('GoalContinuity was not provided')
 const goalContinuity: GoalContinuity = injectedGoalContinuity
@@ -2235,7 +2239,7 @@ const { answerRevealOpen, revealNow } = useChatAnswerReveal({
 let switchToPlanSession: (key: string) => void | Promise<unknown> = () => {}
 let planMutationAccepted: () => void = () => {}
 const chatPlans = useChatPlans({
-  rpc,
+  planCenter,
   sessionKey,
   currentEpoch,
   isStreaming,
@@ -3037,7 +3041,6 @@ function projectAcceptedGoalMessage({
 }
 
 const chatGoals = useChatGoals({
-  rpc,
   goalCenter,
   goalContinuity,
   sessionKey,

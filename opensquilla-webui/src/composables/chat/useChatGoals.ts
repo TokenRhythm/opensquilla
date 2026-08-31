@@ -93,15 +93,7 @@ export interface GoalContinuityStorage {
   removeItem: (key: string) => void
 }
 
-type RpcClient = {
-  call: <T = unknown>(
-    method: string,
-    params?: Record<string, unknown>,
-  ) => Promise<T>
-}
-
 export interface UseChatGoalsOptions {
-  rpc: RpcClient
   /** Domain GoalCenter owns goals.status/set wire mapping. */
   goalCenter: GoalCenter
   /** Domain GoalContinuity owns lease reattachment and Goal event decoding. */
@@ -1026,13 +1018,22 @@ export function useChatGoals(options: UseChatGoalsOptions) {
     mutationOwner = owner
     busy.value = true
     try {
-      const response = await options.rpc.call<GoalMutationResponse>(method, {
+      const input = {
         sessionKey: key,
         clientRequestId: createClientRequestId(),
         expectedGoalId: current.goalId,
         expectedStateRevision: current.stateRevision,
         ...params,
-      })
+      }
+      const response = await (
+        method === 'goals.edit'
+          ? options.goalCenter.edit(input as never)
+          : method === 'goals.pause'
+            ? options.goalCenter.pause(input)
+            : method === 'goals.resume'
+              ? options.goalCenter.resume(input)
+              : options.goalCenter.clear(input)
+      )
       if (owner !== mutationOwner || key !== options.sessionKey.value) return false
       const applied = applyMutationResponse(response)
       if ((method === 'goals.resume' || method === 'goals.edit') && applied) {
