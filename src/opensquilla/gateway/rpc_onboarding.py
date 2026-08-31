@@ -1184,9 +1184,56 @@ async def _llm_profile_draft_models_discover(params: Any, ctx: RpcContext) -> di
     return result.to_payload()
 
 
+async def _connectivity_probe_via_discovery(
+    *,
+    provider_id: str,
+    api_key: str,
+    api_key_env: str,
+    base_url: str,
+    proxy: str,
+    allow_default_api_key_env: bool,
+) -> ProviderProbeResult:
+    """Verify a provider config without a model id via the model-list endpoint.
+
+    ``discover_provider_models`` builds the same throwaway provider as the chat
+    probe but needs no bound model, so it answers "is this key/URL/proxy
+    reachable?" before the user knows any model id. The discovery outcome is
+    adapted back onto the frozen ``onboarding.provider.probe`` envelope so
+    clients keep a single result shape: ``ok``/``failureKind``/``message`` map
+    across, while the chat-only timing fields stay 0/None (no chat round-trip
+    happened). An ``ok`` discovery that simply lists nothing still counts as
+    reachable — the credentials verified even if the endpoint has no catalog.
+    """
+    from opensquilla.onboarding.probe import (
+        ProviderProbeResult,
+        discover_provider_models,
+    )
+
+    listing = await discover_provider_models(
+        provider_id=provider_id,
+        api_key=api_key,
+        api_key_env=api_key_env,
+        base_url=base_url,
+        proxy=proxy,
+        allow_default_api_key_env=allow_default_api_key_env,
+    )
+    return ProviderProbeResult(
+        ok=listing.ok,
+        provider_id=provider_id,
+        model="",
+        failure_kind=listing.failure_kind,
+        message=listing.detail,
+    )
+
+
 @_d.method("onboarding.provider.probe", scope="operator.admin")
 async def _provider_probe(params: Any, ctx: RpcContext) -> dict[str, Any]:
-    """Live one-token probe of a candidate provider config (nothing is saved)."""
+    """Live probe of a candidate provider config (nothing is saved).
+
+    With a model id this runs a one-token chat turn; with an empty model it
+    falls back to the model-list endpoint so reachability can be verified
+    before any model is chosen (#792).
+    """
     provider_id = _require(params, "providerId")
     p = params if isinstance(params, dict) else {}
     cfg = _active_config(ctx)
@@ -1219,19 +1266,33 @@ async def _provider_probe(params: Any, ctx: RpcContext) -> dict[str, Any]:
         if not proxy:
             proxy = str(getattr(cfg.llm, "proxy", "") or "")
     model = str(p.get("model", "") or "")
+    allow_default_api_key_env = not same_provider or reuse_stored_credentials
     with _validation_error("onboarding.provider.invalid"):
-        result = await _usage_accounted_provider_probe(
-            ctx,
-            provider_id=str(provider_id),
-            model=model,
-            api_key=api_key,
-            api_key_env=api_key_env,
-            base_url=base_url,
-            proxy=proxy,
-            allow_default_api_key_env=(
-                not same_provider or reuse_stored_credentials
-            ),
-        )
+        if model.strip():
+            result = await _usage_accounted_provider_probe(
+                ctx,
+                provider_id=str(provider_id),
+                model=model,
+                api_key=api_key,
+                api_key_env=api_key_env,
+                base_url=base_url,
+                proxy=proxy,
+                allow_default_api_key_env=allow_default_api_key_env,
+            )
+        else:
+            # No model id yet: verify reachability with the model-list
+            # endpoint instead of a chat turn. This breaks the chicken-and-egg
+            # bind where a user must guess a valid model before they can
+            # confirm the API key / base URL / proxy are even reachable, and
+            # before discovery can fetch the model list. (#792)
+            result = await _connectivity_probe_via_discovery(
+                provider_id=str(provider_id),
+                api_key=api_key,
+                api_key_env=api_key_env,
+                base_url=base_url,
+                proxy=proxy,
+                allow_default_api_key_env=allow_default_api_key_env,
+            )
     saved_model = str(getattr(cfg.llm, "model", "") or "").strip()
     if (
         same_provider

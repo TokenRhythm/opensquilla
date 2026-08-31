@@ -1950,6 +1950,62 @@ async def test_models_discover_unverified_provider_stays_empty_without_build(
 
 
 @pytest.mark.asyncio
+async def test_provider_probe_without_model_verifies_via_model_list(
+    tmp_path, monkeypatch
+):
+    """An empty model probes reachability through the model-list endpoint
+    instead of raising ``Model is required`` (#792)."""
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
+    _stub_openai_transport(
+        monkeypatch,
+        httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=b'{"data": [{"id": "gpt-x", "context_length": 32000}]}',
+        ),
+    )
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "onboarding.provider.probe",
+        {"providerId": "openrouter", "apiKey": "sk-test"},
+        _admin_ctx(),
+    )
+    assert res.error is None, res.error
+    assert res.payload["ok"] is True
+    assert res.payload["model"] == ""
+    assert res.payload["failureKind"] == ""
+    # No chat round-trip happened; the chat-only timings stay at their
+    # never-reached-the-network sentinels.
+    assert res.payload["latencyMs"] == 0
+    assert res.payload["firstResponseMs"] is None
+
+
+@pytest.mark.asyncio
+async def test_provider_probe_without_model_reports_auth_failure(
+    tmp_path, monkeypatch
+):
+    """A model-less probe surfaces a bad key through the same envelope."""
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
+    _stub_openai_transport(
+        monkeypatch,
+        httpx.Response(
+            401,
+            headers={"content-type": "application/json"},
+            content=b'{"error": {"message": "Incorrect API key provided"}}',
+        ),
+    )
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "onboarding.provider.probe",
+        {"providerId": "openrouter", "apiKey": "sk-bad"},
+        _admin_ctx(),
+    )
+    assert res.error is None, res.error
+    assert res.payload["ok"] is False
+    assert res.payload["failureKind"] == "auth_invalid"
+
+
+@pytest.mark.asyncio
 async def test_image_models_discover_requires_admin_scope(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
 
