@@ -104,6 +104,7 @@ const emit = defineEmits<{
   (e: 'new-project-task', workspaceId: string): void
   (e: 'project-pin', payload: { workspaceId: string; pinned: boolean }): void
   (e: 'project-edit', workspaceId: string): void
+  (e: 'view-workspace-files', workspaceId: string): void
   (e: 'project-delete-history', workspaceId: string): void
   (e: 'project-remove', workspaceId: string): void
   (e: 'search'): void
@@ -238,6 +239,11 @@ function startProjectTask(row: SidebarConversationItem) {
   collapsed.value = next
   writeSidebarCollapsedState(next)
   emit('new-project-task', row.workspaceId)
+}
+
+function viewWorkspaceFiles(row: SidebarConversationItem) {
+  if (!row.workspaceId || row.workspaceAvailable === false) return
+  emit('view-workspace-files', row.workspaceId)
 }
 
 function filterCollapsedProjectRows<T extends SidebarConversationItem>(rows: T[]): T[] {
@@ -1119,6 +1125,21 @@ function onSelectRow(row: SidebarConversationItem) {
                       @click.stop="startProjectTask(row)"
                     >
                       <Icon name="plus" :size="13" />
+                    </button>
+                    <button
+                      type="button"
+                      class="sidebar-project-action sidebar-project-action--view-files"
+                      data-testid="project-workspace-view-files"
+                      :aria-label="row.workspaceAvailable === false
+                        ? t('workspaces.unavailableProjectCannotStartTask')
+                        : t('fileTree.viewFiles')"
+                      :title="row.workspaceAvailable === false
+                        ? t('workspaces.unavailableProjectCannotStartTask')
+                        : t('fileTree.viewFiles')"
+                      :disabled="row.workspaceAvailable === false"
+                      @click.stop="viewWorkspaceFiles(row)"
+                    >
+                      <Icon name="folder" :size="13" />
                     </button>
                     <button
                       type="button"

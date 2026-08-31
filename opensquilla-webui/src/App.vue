@@ -77,8 +77,10 @@
 
     <SidebarSetupBanner />
 
-    <!-- Recent conversations -->
+    <!-- Recent conversations (kept mounted while the file-tree view is
+         active so scroll/selection state survives the swap) -->
     <SidebarConversations
+      v-show="sidebarView === 'tasks'"
       :sections="sidebarSections"
       :session-order="sidebarSessionOrder"
       :error="sessionListError"
@@ -104,9 +106,19 @@
       @new-project-task="startProjectTask"
       @project-pin="onProjectPin"
       @project-edit="openProjectEditor"
+      @view-workspace-files="viewWorkspaceFiles"
       @project-delete-history="onProjectDeleteHistory"
       @project-remove="onProjectRemove"
       @search="openCommandPalette"
+    />
+
+    <!-- Workspace file tree (swaps the conversation list in place) -->
+    <SidebarFileTree
+      v-if="fileTreeWorkspace"
+      :workspace="fileTreeWorkspace"
+      @close="closeWorkspaceFiles"
+      @preview="onFileTreePreview"
+      @attach="onFileTreeAttach"
     />
 
     <!-- Fixed footer: settings + connection state -->
@@ -476,6 +488,11 @@ import DesktopUpdateIndicator from './components/DesktopUpdateIndicator.vue'
 import ChatSystemStatus from './components/chat/ChatSystemStatus.vue'
 import ChatHeaderActions from './components/chat/ChatHeaderActions.vue'
 import SidebarConversations from './components/SidebarConversations.vue'
+import SidebarFileTree from './components/SidebarFileTree.vue'
+import type { FileTreeWorkspace } from './stores/fileTree'
+import { useWorkbenchStore } from './workbench/store'
+import { createWorkspaceFileWorkbenchItem } from './workbench/workspaceFileItems'
+import { requestWorkspaceFileAttach } from './workbench/workspaceFileAttachEvent'
 import SidebarSetupBanner from './components/SidebarSetupBanner.vue'
 import SidebarResizer from './components/SidebarResizer.vue'
 import CommandPalette from './components/CommandPalette.vue'
@@ -548,6 +565,7 @@ const sessionLifecycle = injectedSessionLifecycle
 const injectedApprovalCenter = inject(APPROVAL_CENTER_KEY)
 if (!injectedApprovalCenter) throw new Error('ApprovalCenter was not provided')
 const approvalCenter = injectedApprovalCenter
+const workbenchStore = useWorkbenchStore()
 const shortcutsStore = useShortcutsStore()
 const artifactImageLightbox = provideArtifactImageLightbox()
 const { t } = useI18n()
@@ -1287,6 +1305,54 @@ function startProjectTask(workspaceId: string) {
   void router.push({
     path: '/chat/new',
     query: { agent: 'main', project: workspaceId },
+  })
+}
+
+// ---- Workspace file-tree sidebar view -----------------------------------
+// The sidebar swaps its body between the task/conversation list and the
+// file tree of a project workspace. The list component is kept mounted
+// (v-show) so scroll position and selection state survive the swap.
+const fileTreeWorkspace = ref<FileTreeWorkspace | null>(null)
+const sidebarView = computed<'tasks' | 'files'>(() =>
+  fileTreeWorkspace.value ? 'files' : 'tasks',
+)
+
+function viewWorkspaceFiles(workspaceId: string) {
+  const item = projectWorkspaces.byId.value.get(workspaceId)
+  if (!item || !item.available) return
+  handleNavClick()
+  fileTreeWorkspace.value = { id: item.id, name: item.name, path: item.path }
+}
+
+function closeWorkspaceFiles() {
+  fileTreeWorkspace.value = null
+}
+
+function onFileTreePreview(payload: { workspace: FileTreeWorkspace; path: string }) {
+  const item = createWorkspaceFileWorkbenchItem({
+    workspaceId: payload.workspace.id,
+    workspaceName: payload.workspace.name,
+    workspacePath: payload.workspace.path,
+    path: payload.path,
+  })
+  workbenchStore.openItem(item)
+  workbenchStore.setExpanded(true)
+}
+
+function onFileTreeAttach(payload: {
+  workspace: FileTreeWorkspace
+  path: string
+  name: string
+  size?: number
+}) {
+  // The visible ChatView owns the composer attachment channel; it listens for
+  // this event and stages the file through the normal upload pipeline.
+  requestWorkspaceFileAttach({
+    workspaceId: payload.workspace.id,
+    workspacePath: payload.workspace.path,
+    path: payload.path,
+    name: payload.name,
+    size: payload.size,
   })
 }
 

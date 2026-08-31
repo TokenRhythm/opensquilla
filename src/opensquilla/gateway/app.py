@@ -922,6 +922,15 @@ def create_gateway_app(
         )
         set_upload_store(_upload_store)
     register_upload_routes(app, config=config, store=_upload_store)
+    from opensquilla.gateway.files_api import (  # noqa: PLC0415
+        register_workspace_files_routes,
+    )
+
+    register_workspace_files_routes(
+        app,
+        config=config,
+        session_manager=session_manager,
+    )
     from opensquilla.gateway.artifacts import register_artifact_routes  # noqa: PLC0415
     from opensquilla.gateway.attachments import register_attachment_routes  # noqa: PLC0415
     from opensquilla.gateway.audio_transcription import (  # noqa: PLC0415

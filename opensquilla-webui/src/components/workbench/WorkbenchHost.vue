@@ -5,6 +5,7 @@
     id="workbench-panel"
     ref="hostRef"
     class="workbench-host"
+    tabindex="-1"
     :class="`workbench-host--${layoutMode}`"
     :style="hostStyle"
     :role="layoutMode === 'mobile-dialog' ? 'dialog' : 'complementary'"
@@ -68,25 +69,68 @@
             <Icon name="x" :size="13" aria-hidden="true" />
           </button>
         </div>
+        <button
+          class="workbench-host__tabs-overflow"
+          type="button"
+          :aria-label="tabOverflowLabel"
+          :aria-expanded="tabMenuOpen ? 'true' : 'false'"
+          data-testid="workbench-tab-overflow"
+          @click="toggleTabMenu"
+        >
+          <Icon name="chevronDown" :size="13" aria-hidden="true" />
+        </button>
       </div>
 
       <div v-else class="workbench-host__single-title">
         <slot name="title" :item="store.activeItem">
           <span class="workbench-host__title">{{ store.activeItem?.title }}</span>
         </slot>
+        <button
+          class="workbench-host__single-close"
+          type="button"
+          :aria-label="`${closeItemLabel}: ${store.activeItem?.title ?? ''}`"
+          data-testid="workbench-single-close"
+          @click="store.activeItem && closeWorkbenchItem(store.activeItem.id)"
+        >
+          <Icon name="x" :size="13" aria-hidden="true" />
+        </button>
       </div>
 
       <div class="workbench-host__actions">
         <slot name="actions" :item="store.activeItem" />
+      </div>
+
+      <!-- Listed outside the scrollable strip (it would be clipped there) and
+           outside the tabs/single-title v-if/v-else pair (an element between
+           the two would break the v-else pairing and render the single-title
+           identity unconditionally). -->
+      <div
+        v-if="tabMenuOpen"
+        ref="tabMenuRef"
+        class="workbench-host__tab-menu"
+        role="menu"
+        data-workbench-tab-menu
+        :aria-label="tabOverflowLabel"
+      >
         <button
-          v-if="store.activeItem"
-          ref="closeButtonRef"
-          class="workbench-host__icon-button"
+          v-for="item in store.items"
+          :key="item.id"
+          class="workbench-host__tab-menu-item"
+          :class="{ 'is-active': item.id === store.activeItemId }"
+          role="menuitem"
           type="button"
-          :aria-label="collapseLabel"
-          @click="collapseWorkbench"
+          @click="selectTabFromMenu(item.id)"
         >
-          <Icon name="x" :size="17" aria-hidden="true" />
+          {{ item.title }}
+        </button>
+        <div class="workbench-host__tab-menu-divider" role="separator" />
+        <button
+          class="workbench-host__tab-menu-item"
+          role="menuitem"
+          type="button"
+          @click="collapseFromMenu"
+        >
+          {{ collapseLabel }}
         </button>
       </div>
     </header>
@@ -181,6 +225,7 @@ const props = withDefaults(defineProps<{
   closeItemLabel?: string
   resizeLabel?: string
   pixelsLabel?: string
+  tabOverflowLabel?: string
   beforeCloseItem?: (item: WorkbenchItem) => boolean | Promise<boolean>
 }>(), {
   enabled: true,
@@ -195,6 +240,7 @@ const props = withDefaults(defineProps<{
   closeItemLabel: 'Close tab',
   resizeLabel: 'Resize workbench',
   pixelsLabel: 'pixels',
+  tabOverflowLabel: 'All tabs',
 })
 
 const emit = defineEmits<{
@@ -208,10 +254,46 @@ const store = useWorkbenchStore()
 const hostRef = ref<HTMLElement | null>(null)
 const surfaceRef = ref<HTMLElement | null>(null)
 const resizerRef = ref<WorkbenchResizerHandle | null>(null)
-const closeButtonRef = ref<HTMLButtonElement | null>(null)
 const viewportWidth = ref(typeof window === 'undefined' ? 0 : window.innerWidth)
 const containerWidth = ref(0)
 const containerRect = ref({ top: 0, right: viewportWidth.value, height: 0 })
+
+// Tab overflow dropdown: the strip scrolls horizontally with its scrollbar
+// hidden, so tabs pushed out of view are otherwise unreachable.
+const tabMenuOpen = ref(false)
+const tabMenuRef = ref<HTMLElement | null>(null)
+
+function toggleTabMenu() {
+  tabMenuOpen.value = !tabMenuOpen.value
+  if (tabMenuOpen.value) {
+    void nextTick(() => {
+      tabMenuRef.value
+        ?.querySelector('.is-active')
+        ?.scrollIntoView({ block: 'nearest' })
+    })
+  }
+}
+
+function selectTabFromMenu(id: string) {
+  tabMenuOpen.value = false
+  store.activateItem(id)
+}
+
+function collapseFromMenu() {
+  tabMenuOpen.value = false
+  collapseWorkbench()
+}
+
+function onTabMenuMousedown(event: MouseEvent) {
+  if (!tabMenuOpen.value) return
+  const target = event.target as Element | null
+  if (target?.closest('[data-workbench-tab-menu], .workbench-host__tabs-overflow')) return
+  tabMenuOpen.value = false
+}
+
+function onTabMenuKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape') tabMenuOpen.value = false
+}
 const detectedCoarseOnly = ref(false)
 const previewWidth = ref<number | null>(null)
 let coarseQuery: MediaQueryList | null = null
@@ -268,7 +350,9 @@ useDialogA11y(
   mobileDialogOpen,
   collapseWorkbench,
   {
-    initialFocus: closeButtonRef,
+    // No initialFocus: the dialog always contains focusable controls (tab
+    // strip buttons or the single-title close), so the composable's
+    // first-focusable fallback applies and the focus trap stays consistent.
     occludesNativeSurface: false,
   },
 )
@@ -297,11 +381,10 @@ async function closeWorkbenchItem(id: string) {
     return
   }
   void nextTick(() => {
-    const activeTab = hostRef.value?.querySelector<HTMLElement>(
+    const focusTarget = hostRef.value?.querySelector<HTMLElement>(
       '[role="tab"][aria-selected="true"]',
-    )
-    ;(activeTab || closeButtonRef.value)
-      ?.focus({ preventScroll: true })
+    ) ?? hostRef.value
+    focusTarget?.focus({ preventScroll: true })
   })
 }
 
@@ -461,14 +544,10 @@ watch([hostRef, surfaceRef], () => {
   scheduleSurfaceRect()
 }, { flush: 'post' })
 
-watch(shouldRender, (visible, previous) => {
-  if (visible && !previous && layoutMode.value === 'mobile-dialog') {
-    void nextTick(() => closeButtonRef.value?.focus({ preventScroll: true }))
-  }
-})
-
 onMounted(() => {
   window.addEventListener('resize', updateViewportWidth)
+  window.addEventListener('mousedown', onTabMenuMousedown)
+  window.addEventListener('keydown', onTabMenuKeydown)
   window.addEventListener('scroll', measureContainer, true)
   coarseQuery = window.matchMedia?.('(pointer: coarse) and (hover: none)') ?? null
   if (coarseQuery) {
@@ -492,6 +571,8 @@ onMounted(() => {
 onBeforeUnmount(() => {
   window.removeEventListener('resize', updateViewportWidth)
   window.removeEventListener('scroll', measureContainer, true)
+  window.removeEventListener('mousedown', onTabMenuMousedown)
+  window.removeEventListener('keydown', onTabMenuKeydown)
   coarseQuery?.removeEventListener?.('change', updateCoarseOnly)
   surfaceObserver?.disconnect()
   containerObserver?.disconnect()
@@ -548,6 +629,7 @@ onBeforeUnmount(() => {
 }
 
 .workbench-host__chrome {
+  position: relative;
   display: flex;
   min-height: 48px;
   align-items: center;
@@ -563,6 +645,75 @@ onBeforeUnmount(() => {
   gap: 2px;
   overflow-x: auto;
   scrollbar-width: none;
+}
+
+/* Pinned to the strip's visible right edge: margin-left eats the spare
+ * space when tabs don't fill the strip, sticky keeps it visible when the
+ * strip scrolls horizontally. */
+.workbench-host__tabs-overflow {
+  position: sticky;
+  right: 0;
+  margin-left: auto;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 26px;
+  border: 0;
+  background: var(--bg-surface);
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+}
+
+.workbench-host__tabs-overflow:hover,
+.workbench-host__tabs-overflow:focus-visible {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.workbench-host__tab-menu {
+  position: absolute;
+  top: 100%;
+  right: var(--sp-3);
+  z-index: 1100;
+  min-width: 180px;
+  max-height: 280px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  padding: 4px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-md);
+}
+
+.workbench-host__tab-menu-item {
+  display: block;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  text-align: start;
+  padding: 6px 10px;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.workbench-host__tab-menu-item:hover,
+.workbench-host__tab-menu-item:focus-visible {
+  background: var(--bg-hover);
+}
+
+.workbench-host__tab-menu-item.is-active {
+  background: var(--bg-hover);
+  font-weight: 600;
 }
 
 .workbench-host__tabs::-webkit-scrollbar {
@@ -635,8 +786,37 @@ onBeforeUnmount(() => {
 }
 
 .workbench-host__single-title {
+  display: flex;
   min-width: 0;
   flex: 1;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.workbench-host__single-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+}
+
+.workbench-host__single-close:hover,
+.workbench-host__single-close:focus-visible {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.workbench-host__tab-menu-divider {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--border);
 }
 
 .workbench-host__title {

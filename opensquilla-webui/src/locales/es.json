@@ -146,12 +146,36 @@
     "empty": "No hay una vista previa disponible para este elemento.",
     "itemLimitReached": "Ya hay ocho vistas previas aisladas abiertas. Cierra una antes de abrir otra.",
     "resources": {
-      "title": "Archivos", "count": "Archivos ({count})", "empty": "Aún no hay archivos ni enlaces.",
-      "groups": { "files": "Archivos", "links": "Enlaces", "attachments": "Archivos", "documents": "Archivos", "deliverables": "Archivos", "urls": "Enlaces" },
-      "open": "Abrir {name}", "preparing": "Preparando el editor…", "retry": "Reintentar", "preview": "Vista previa de {name}", "download": "Descargar {name}", "edit": "Editar una copia de {name}", "publish": "Publicar {name}",
-      "imported": "Ya puedes editar {name}.", "published": "Ya puedes compartir {name}.",
-      "publishUnavailable": "Este documento no tiene una revisión actual publicable.", "actionFailed": "La acción del área de trabajo falló.",
-      "unavailableReasons": { "htmlEncodingUnsupported": "Este HTML no es UTF-8 válido y no se puede previsualizar ni editar de forma segura.", "htmlValidationFailed": "No se pudo validar este HTML para una vista previa o edición seguras.", "htmlEditTooLarge": "Este HTML es demasiado grande para editarlo en la aplicación. Aún puedes descargarlo.", "htmlPreviewTooLarge": "Este HTML es demasiado grande para previsualizarlo de forma segura. Aún puedes descargarlo.", "officeAdapterNotAvailable": "La edición de Office aún no está disponible.", "unsupported": "Esta acción no está disponible para este recurso." }
+      "title": "Archivos",
+      "count": "Archivos ({count})",
+      "empty": "Aún no hay archivos ni enlaces.",
+      "groups": {
+        "files": "Archivos",
+        "links": "Enlaces",
+        "attachments": "Archivos",
+        "documents": "Archivos",
+        "deliverables": "Archivos",
+        "urls": "Enlaces"
+      },
+      "open": "Abrir {name}",
+      "preparing": "Preparando el editor…",
+      "retry": "Reintentar",
+      "preview": "Vista previa de {name}",
+      "download": "Descargar {name}",
+      "edit": "Editar una copia de {name}",
+      "publish": "Publicar {name}",
+      "imported": "Ya puedes editar {name}.",
+      "published": "Ya puedes compartir {name}.",
+      "publishUnavailable": "Este documento no tiene una revisión actual publicable.",
+      "actionFailed": "La acción del área de trabajo falló.",
+      "unavailableReasons": {
+        "htmlEncodingUnsupported": "Este HTML no es UTF-8 válido y no se puede previsualizar ni editar de forma segura.",
+        "htmlValidationFailed": "No se pudo validar este HTML para una vista previa o edición seguras.",
+        "htmlEditTooLarge": "Este HTML es demasiado grande para editarlo en la aplicación. Aún puedes descargarlo.",
+        "htmlPreviewTooLarge": "Este HTML es demasiado grande para previsualizarlo de forma segura. Aún puedes descargarlo.",
+        "officeAdapterNotAvailable": "La edición de Office aún no está disponible.",
+        "unsupported": "Esta acción no está disponible para este recurso."
+      }
     },
     "browser": {
       "back": "Atrás",
@@ -166,11 +190,32 @@
       "failedDetail": "Vuelve a cargar el navegador aislado para continuar."
     },
     "artifactAnnotation": {
-      "start": "Anotar vista previa", "stop": "Dejar de anotar", "selectElement": "Selecciona un elemento de la página para anotar", "selectElementShort": "Selecciona elemento", "unavailable": "La anotación de vista previa no está disponible.", "desktopEditingOnly": "Selecciona y edita elementos de la página con IA en la aplicación de escritorio.",
-      "createFailed": "No se pudo adjuntar el elemento seleccionado.", "elementChanged": "El elemento seleccionado cambió antes de adjuntarse. Vuelva a seleccionarlo en la vista previa actual.", "rearmFailed": "El modo de anotación se detuvo porque no se pudo reiniciar el selector. Vuelva a activarlo para intentarlo de nuevo.", "updateFailed": "No se pudo guardar el borrador de anotación.", "discardFailed": "No se pudo descartar la anotación. Seguirá abierta para volver a intentarlo.", "closeFailed": "No se pudo cerrar el editor de anotaciones. Inténtelo de nuevo.", "replacementCleanupFailed": "Se conservó la anotación nueva, pero no se pudo eliminar el borrador anterior.",
+      "start": "Anotar vista previa",
+      "stop": "Dejar de anotar",
+      "selectElement": "Selecciona un elemento de la página para anotar",
+      "selectElementShort": "Selecciona elemento",
+      "unavailable": "La anotación de vista previa no está disponible.",
+      "desktopEditingOnly": "Selecciona y edita elementos de la página con IA en la aplicación de escritorio.",
+      "createFailed": "No se pudo adjuntar el elemento seleccionado.",
+      "elementChanged": "El elemento seleccionado cambió antes de adjuntarse. Vuelva a seleccionarlo en la vista previa actual.",
+      "rearmFailed": "El modo de anotación se detuvo porque no se pudo reiniciar el selector. Vuelva a activarlo para intentarlo de nuevo.",
+      "updateFailed": "No se pudo guardar el borrador de anotación.",
+      "discardFailed": "No se pudo descartar la anotación. Seguirá abierta para volver a intentarlo.",
+      "closeFailed": "No se pudo cerrar el editor de anotaciones. Inténtelo de nuevo.",
+      "replacementCleanupFailed": "Se conservó la anotación nueva, pero no se pudo eliminar el borrador anterior.",
       "overlayFallback": "Continúa la anotación a continuación.",
-      "fallbackTitle": "Continuar anotación", "fallbackDetail": "La vista previa está oculta temporalmente. Tu anotación sigue aquí.", "frozenPreview": "Vista previa de la zona seleccionada",
-      "placeholder": "Describe el cambio para esta zona…", "newlineHint": "{shortcut} para una línea nueva", "keepDraft": "Conservar anotación", "submit": "Añadir anotación", "contextLabel": "Selección actual", "bodyLabel": "Anotación de página", "emptyBody": "Describe el cambio solicitado.", "reselectHint": "Selecciona la zona correspondiente de la página.", "reuseHint": "Se copió la solicitud de cambio. Selecciona la zona correspondiente de la página."
+      "fallbackTitle": "Continuar anotación",
+      "fallbackDetail": "La vista previa está oculta temporalmente. Tu anotación sigue aquí.",
+      "frozenPreview": "Vista previa de la zona seleccionada",
+      "placeholder": "Describe el cambio para esta zona…",
+      "newlineHint": "{shortcut} para una línea nueva",
+      "keepDraft": "Conservar anotación",
+      "submit": "Añadir anotación",
+      "contextLabel": "Selección actual",
+      "bodyLabel": "Anotación de página",
+      "emptyBody": "Describe el cambio solicitado.",
+      "reselectHint": "Selecciona la zona correspondiente de la página.",
+      "reuseHint": "Se copió la solicitud de cambio. Selecciona la zona correspondiente de la página."
     },
     "artifactPreview": {
       "refresh": "Actualizar vista previa",
@@ -292,8 +337,15 @@
       "unsavedSourceCopied": "Código sin guardar copiado",
       "copyUnsavedSourceFailed": "No se pudo copiar el código sin guardar.",
       "discardAndLoadLatest": "Descartar y cargar la última versión",
-      "sourceStatus": {"ready":"Listo","saving":"Guardando…","dirty":"Sin guardar","saved":"Guardado","error":"Requiere atención"}
-    }
+      "sourceStatus": {
+        "ready": "Listo",
+        "saving": "Guardando…",
+        "dirty": "Sin guardar",
+        "saved": "Guardado",
+        "error": "Requiere atención"
+      }
+    },
+    "tabOverflow": "Todas las pestañas"
   },
   "nav": {
     "chat": "Tarea",
@@ -489,9 +541,18 @@
       "retryFailedTitle": "No se pudo regenerar la vista previa",
       "retryFailedDescription": "Esta solicitud de regeneración no se completó. El resultado anterior sigue sin adoptarse y no se modificó ningún archivo. Inténtalo de nuevo o descarta la importación.",
       "jobStates": {
-        "cancelled": {"title": "Generación de vista previa cancelada", "description": "La fuente aislada se conserva durante 24 horas. La regeneración puede hacer hasta dos llamadas al modelo porque un resultado que no supere la validación puede reintentarse una vez; el resultado puede variar."},
-        "interrupted": {"title": "Generación de vista previa interrumpida", "description": "OpenSquilla se reinició durante el procesamiento del modelo. La fuente aislada sigue disponible. La regeneración puede hacer hasta dos llamadas al modelo debido a un reintento interno."},
-        "failed": {"title": "Error al generar la vista previa", "description": "Este intento no produjo una vista previa validada y revisable. No se adoptó ninguna decisión de importación ni se modificó ningún archivo. La fuente aislada se conservó; la regeneración puede hacer hasta dos llamadas al modelo."}
+        "cancelled": {
+          "title": "Generación de vista previa cancelada",
+          "description": "La fuente aislada se conserva durante 24 horas. La regeneración puede hacer hasta dos llamadas al modelo porque un resultado que no supere la validación puede reintentarse una vez; el resultado puede variar."
+        },
+        "interrupted": {
+          "title": "Generación de vista previa interrumpida",
+          "description": "OpenSquilla se reinició durante el procesamiento del modelo. La fuente aislada sigue disponible. La regeneración puede hacer hasta dos llamadas al modelo debido a un reintento interno."
+        },
+        "failed": {
+          "title": "Error al generar la vista previa",
+          "description": "Este intento no produjo una vista previa validada y revisable. No se adoptó ninguna decisión de importación ni se modificó ningún archivo. La fuente aislada se conservó; la regeneración puede hacer hasta dos llamadas al modelo."
+        }
       },
       "modelAnalysisTitle": "Análisis del modelo (contrástalo con los cambios de archivos)",
       "previewTitle": "Revisar todos los cambios de archivos",
@@ -557,53 +618,135 @@
       "available": "Modo seguro disponible",
       "unavailable": "Modo seguro no disponible",
       "builtin": "Integrado",
-      "actions": { "add": "Añadir", "remove": "Quitar", "retry": "Reintentar", "copy": "Copiar", "saving": "Guardando…", "redetect": "Volver a detectar" },
+      "actions": {
+        "add": "Añadir",
+        "remove": "Quitar",
+        "retry": "Reintentar",
+        "copy": "Copiar",
+        "saving": "Guardando…",
+        "redetect": "Volver a detectar"
+      },
       "mode": {
-        "title": "Modo de acceso predeterminado", "description": "Elige el modo inicial de las tareas nuevas. Seguro no se puede seleccionar si falla la comprobación.",
-        "default": "Modo predeterminado", "safe": "Seguro", "full": "Acceso completo", "resetWarning": "Volver a mostrar el aviso al iniciar"
+        "title": "Modo de acceso predeterminado",
+        "description": "Elige el modo inicial de las tareas nuevas. Seguro no se puede seleccionar si falla la comprobación.",
+        "default": "Modo predeterminado",
+        "safe": "Seguro",
+        "full": "Acceso completo",
+        "resetWarning": "Volver a mostrar el aviso al iniciar"
       },
       "setup": {
-        "title": "Configurar el modo Seguro", "description": "OpenSquilla necesita una autorización de administrador para crear una cuenta aislada y configurar la protección de archivos y red.", "descriptionWithDuration": "OpenSquilla necesita una autorización de administrador para crear una cuenta aislada y configurar las protecciones. La primera configuración suele tardar unos 20–30 segundos. Mantén OpenSquilla abierto.",
-        "continue": "Continuar", "configuring": "Configurando…", "requestingApproval": "Confirma el aviso de Windows para continuar.", "configuringProtection": "OpenSquilla está completando la configuración del modo Seguro. Mantén la aplicación abierta.", "takingLonger": "La primera configuración puede tardar unos minutos. La verificación se ejecutará automáticamente.", "elapsed": "{seconds} s transcurridos", "cancelled": "Configuración cancelada. El acceso completo no cambia; puedes volver a intentarlo.",
-        "failed": "No se pudo configurar el modo Seguro. El acceso completo no cambia.", "verificationFailed": "La configuración terminó, pero falló la comprobación de seguridad. El acceso completo no cambia.",
-        "runInBackground": "Configurar en segundo plano", "readyToast": "El modo Seguro está listo.", "failedToast": "No se pudo completar la configuración del modo Seguro. Vuelve a intentarlo desde el modo Seguro."
+        "title": "Configurar el modo Seguro",
+        "description": "OpenSquilla necesita una autorización de administrador para crear una cuenta aislada y configurar la protección de archivos y red.",
+        "descriptionWithDuration": "OpenSquilla necesita una autorización de administrador para crear una cuenta aislada y configurar las protecciones. La primera configuración suele tardar unos 20–30 segundos. Mantén OpenSquilla abierto.",
+        "continue": "Continuar",
+        "configuring": "Configurando…",
+        "requestingApproval": "Confirma el aviso de Windows para continuar.",
+        "configuringProtection": "OpenSquilla está completando la configuración del modo Seguro. Mantén la aplicación abierta.",
+        "takingLonger": "La primera configuración puede tardar unos minutos. La verificación se ejecutará automáticamente.",
+        "elapsed": "{seconds} s transcurridos",
+        "cancelled": "Configuración cancelada. El acceso completo no cambia; puedes volver a intentarlo.",
+        "failed": "No se pudo configurar el modo Seguro. El acceso completo no cambia.",
+        "verificationFailed": "La configuración terminó, pero falló la comprobación de seguridad. El acceso completo no cambia.",
+        "runInBackground": "Configurar en segundo plano",
+        "readyToast": "El modo Seguro está listo.",
+        "failedToast": "No se pudo completar la configuración del modo Seguro. Vuelve a intentarlo desde el modo Seguro."
       },
       "files": {
-        "title": "Seguridad de archivos", "description": "Los archivos normales son legibles. Los cambios en rutas protegidas requieren aprobación.", "readsAllowed": "Lectura permitida",
-        "customPath": "Ruta protegida personalizada", "pathPlaceholder": "Añadir ruta protegida", "backupTitle": "Crear copia antes de cambios destructivos",
-        "backupDescription": "Crea copias recuperables antes de eliminar o modificar archivos existentes y borra automáticamente las más antiguas cuando hace falta espacio.", "quota": "Límite de copias",
+        "title": "Seguridad de archivos",
+        "description": "Los archivos normales son legibles. Los cambios en rutas protegidas requieren aprobación.",
+        "readsAllowed": "Lectura permitida",
+        "customPath": "Ruta protegida personalizada",
+        "pathPlaceholder": "Añadir ruta protegida",
+        "backupTitle": "Crear copia antes de cambios destructivos",
+        "backupDescription": "Crea copias recuperables antes de eliminar o modificar archivos existentes y borra automáticamente las más antiguas cuando hace falta espacio.",
+        "quota": "Límite de copias",
         "recursiveWarning": "Sin copia, eliminar o reemplazar puede ser irrecuperable. Si la copia sigue fallando tras borrar las antiguas, OpenSquilla vuelve a pedir confirmación."
       },
       "commands": {
-        "title": "Seguridad de comandos", "description": "Los comandos se ejecutan automáticamente; operaciones como git push requieren aprobación.",
-        "systemTools": "Herramientas del sistema", "systemToolsAuto": "Permitir automáticamente", "systemToolsPrompt": "Preguntar antes", "systemToolsDisabled": "Desactivado",
-        "approvalPrefixes": "Prefijos que requieren aprobación", "autoPrefixes": "Prefijos siempre permitidos", "prefixPlaceholder": "Por ejemplo: git push"
+        "title": "Seguridad de comandos",
+        "description": "Los comandos se ejecutan automáticamente; operaciones como git push requieren aprobación.",
+        "systemTools": "Herramientas del sistema",
+        "systemToolsAuto": "Permitir automáticamente",
+        "systemToolsPrompt": "Preguntar antes",
+        "systemToolsDisabled": "Desactivado",
+        "approvalPrefixes": "Prefijos que requieren aprobación",
+        "autoPrefixes": "Prefijos siempre permitidos",
+        "prefixPlaceholder": "Por ejemplo: git push"
       },
       "network": {
-        "title": "Seguridad de red", "description": "La red pública se permite por defecto y se mantienen las protecciones SSRF y de metadatos.",
-        "blockAll": "Bloquear toda la red", "blockAllDescription": "Los dominios permitidos siguen siendo excepciones.", "allowDomains": "Dominios permitidos", "denyDomains": "Dominios rechazados"
+        "title": "Seguridad de red",
+        "description": "La red pública se permite por defecto y se mantienen las protecciones SSRF y de metadatos.",
+        "blockAll": "Bloquear toda la red",
+        "blockAllDescription": "Los dominios permitidos siguen siendo excepciones.",
+        "allowDomains": "Dominios permitidos",
+        "denyDomains": "Dominios rechazados"
       },
       "runtimes": {
-        "title": "Paquetes de ejecución", "description": "Las descargas se activan automáticamente. Seguro prioriza los paquetes instalados; Acceso completo mantiene primero las herramientas del sistema.", "target": "Destino de ejecución",
-        "allowRuntime": "Permitir {runtime}", "progress": "Descarga de {runtime}: {progress}%",
+        "title": "Paquetes de ejecución",
+        "description": "Las descargas se activan automáticamente. Seguro prioriza los paquetes instalados; Acceso completo mantiene primero las herramientas del sistema.",
+        "target": "Destino de ejecución",
+        "allowRuntime": "Permitir {runtime}",
+        "progress": "Descarga de {runtime}: {progress}%",
         "states": {
-          "unknown": "Estado no disponible", "notInstalled": "No instalado", "disabled": "No activado", "installed": "Instalado", "installedVersion": "Instalado · {version}", "updatePaused": "Actualización en pausa",
-          "unsupported": "No disponible para este sistema", "corrupt": "Requiere reparación", "queued": "Esperando la descarga", "downloading": "Descargando", "downloadingProgress": "Descargando · {progress}%",
-          "verifying": "Verificando la descarga", "extracting": "Instalando", "probing": "Comprobando el entorno", "activating": "Finalizando la instalación", "cancelling": "Cancelando", "queuedRemoval": "Esperando para eliminar", "removing": "Eliminando",
-          "cancelled": "Descarga cancelada", "failed": "Error de descarga", "removeFailed": "Error al eliminar", "removeInterrupted": "Eliminación interrumpida", "interrupted": "Descarga pausada"
+          "unknown": "Estado no disponible",
+          "notInstalled": "No instalado",
+          "disabled": "No activado",
+          "installed": "Instalado",
+          "installedVersion": "Instalado · {version}",
+          "updatePaused": "Actualización en pausa",
+          "unsupported": "No disponible para este sistema",
+          "corrupt": "Requiere reparación",
+          "queued": "Esperando la descarga",
+          "downloading": "Descargando",
+          "downloadingProgress": "Descargando · {progress}%",
+          "verifying": "Verificando la descarga",
+          "extracting": "Instalando",
+          "probing": "Comprobando el entorno",
+          "activating": "Finalizando la instalación",
+          "cancelling": "Cancelando",
+          "queuedRemoval": "Esperando para eliminar",
+          "removing": "Eliminando",
+          "cancelled": "Descarga cancelada",
+          "failed": "Error de descarga",
+          "removeFailed": "Error al eliminar",
+          "removeInterrupted": "Eliminación interrumpida",
+          "interrupted": "Descarga pausada"
         },
-        "actions": { "enable": "Activar", "download": "Descargar", "cancel": "Cancelar", "discardDownload": "Descartar descarga", "resume": "Continuar", "retry": "Reintentar", "repair": "Reparar", "remove": "Eliminar", "retryRemove": "Reintentar eliminación" },
-        "sources": { "oss": "OSS de Pekín", "github": "Versiones de GitHub" }
+        "actions": {
+          "enable": "Activar",
+          "download": "Descargar",
+          "cancel": "Cancelar",
+          "discardDownload": "Descartar descarga",
+          "resume": "Continuar",
+          "retry": "Reintentar",
+          "repair": "Reparar",
+          "remove": "Eliminar",
+          "retryRemove": "Reintentar eliminación"
+        },
+        "sources": {
+          "oss": "OSS de Pekín",
+          "github": "Versiones de GitHub"
+        }
       },
       "lan": {
-        "listen": "Escuchar en la red local", "listenDescription": "Se enlaza a todas las interfaces locales tras reiniciar; los pares públicos siguen bloqueados.",
-        "allowedCidrs": "CIDR de clientes permitidos", "cidrDescription": "Opcional. Vacío permite loopback, RFC1918 e IPv6 ULA; solo se puede restringir ese rango.",
+        "listen": "Escuchar en la red local",
+        "listenDescription": "Se enlaza a todas las interfaces locales tras reiniciar; los pares públicos siguen bloqueados.",
+        "allowedCidrs": "CIDR de clientes permitidos",
+        "cidrDescription": "Opcional. Vacío permite loopback, RFC1918 e IPv6 ULA; solo se puede restringir ese rango.",
         "restartRequired": "Reinicia OpenSquilla para aplicar el cambio.",
-        "title": "Acceso Web y tokens con nombre", "description": "El acceso Web remoto sin un token válido usa el modo seguro de invitado; los tokens con nombre conceden los permisos configurados.",
-        "guest": "Sin token o token incorrecto:", "guestDescription": " modo seguro de invitado: los archivos normales se pueden leer, solo se puede escribir en el espacio de trabajo predeterminado y no se pueden leer credenciales.",
-        "authenticated": "Token válido:", "authenticatedDescription": " puede usar Seguro o Acceso completo según sus capacidades.",
-        "tokenName": "Nombre del token, por ejemplo Portátil", "hostExecute": "Permitir host / Acceso completo", "createToken": "Crear token",
-        "copyNow": "Cópialo ahora. No volverá a mostrarse.", "fullCapable": "Seguro y Acceso completo", "safeOnly": "Solo Seguro", "revoke": "Revocar"
+        "title": "Acceso Web y tokens con nombre",
+        "description": "El acceso Web remoto sin un token válido usa el modo seguro de invitado; los tokens con nombre conceden los permisos configurados.",
+        "guest": "Sin token o token incorrecto:",
+        "guestDescription": " modo seguro de invitado: los archivos normales se pueden leer, solo se puede escribir en el espacio de trabajo predeterminado y no se pueden leer credenciales.",
+        "authenticated": "Token válido:",
+        "authenticatedDescription": " puede usar Seguro o Acceso completo según sus capacidades.",
+        "tokenName": "Nombre del token, por ejemplo Portátil",
+        "hostExecute": "Permitir host / Acceso completo",
+        "createToken": "Crear token",
+        "copyNow": "Cópialo ahora. No volverá a mostrarse.",
+        "fullCapable": "Seguro y Acceso completo",
+        "safeOnly": "Solo Seguro",
+        "revoke": "Revocar"
       }
     },
     "dialog": {
@@ -2541,15 +2684,60 @@
       "galleryEyebrow": "PLANTILLAS DE AUTOMATIZACIÓN",
       "bulkDeleteConfirm": "¿Eliminar las {count} automatizaciones seleccionadas? Esta acción no se puede deshacer.",
       "templates": {
-        "ai-daily": { "title": "Resumen diario de noticias de IA", "description": "Resume las noticias importantes de IA de las últimas 24 horas con fuentes verificadas.", "category": "Noticias", "schedule": "Cada día a las 08:00" },
-        "weekly-report": { "title": "Revisión semanal del trabajo", "description": "Resume avances, riesgos, entregas y prioridades de la próxima semana.", "category": "Productividad", "schedule": "Viernes a las 17:30" },
-        "english-five": { "title": "Cinco palabras en inglés al día", "description": "Crea una lección breve de vocabulario con ejemplos y un cuestionario.", "category": "Aprendizaje", "schedule": "Cada día a las 09:00" },
-        "project-risk": { "title": "Revisión de riesgos del proyecto", "description": "Revisa retrasos, errores y asuntos abiertos y propone acciones.", "category": "Proyectos", "schedule": "Laborables a las 10:00" },
-        "knowledge-review": { "title": "Revisión semanal de conocimientos", "description": "Organiza notas y reuniones nuevas y prepara una lista de seguimiento.", "category": "Conocimiento", "schedule": "Domingo a las 18:00" },
-        "daily-idea": { "title": "Idea y curiosidad del día", "description": "Comparte un dato fiable y una pequeña idea práctica.", "category": "Estilo de vida", "schedule": "Cada día a las 12:00" },
-        "bedtime-story": { "title": "Cuento diario para dormir", "description": "Escribe un cuento corto, cálido e imaginativo para leer en familia.", "category": "Familia", "schedule": "Cada día a las 20:30" },
-        "classic-movie": { "title": "Recomendación de cine clásico", "description": "Recomienda una película clásica reconocida con introducción sin spoilers.", "category": "Entretenimiento", "schedule": "Sábado a las 19:00" },
-        "today-in-history": { "title": "Tal día como hoy", "description": "Presenta un acontecimiento histórico fiable de ciencia, cultura o sociedad.", "category": "Conocimiento diario", "schedule": "Cada día a las 08:30" }
+        "ai-daily": {
+          "title": "Resumen diario de noticias de IA",
+          "description": "Resume las noticias importantes de IA de las últimas 24 horas con fuentes verificadas.",
+          "category": "Noticias",
+          "schedule": "Cada día a las 08:00"
+        },
+        "weekly-report": {
+          "title": "Revisión semanal del trabajo",
+          "description": "Resume avances, riesgos, entregas y prioridades de la próxima semana.",
+          "category": "Productividad",
+          "schedule": "Viernes a las 17:30"
+        },
+        "english-five": {
+          "title": "Cinco palabras en inglés al día",
+          "description": "Crea una lección breve de vocabulario con ejemplos y un cuestionario.",
+          "category": "Aprendizaje",
+          "schedule": "Cada día a las 09:00"
+        },
+        "project-risk": {
+          "title": "Revisión de riesgos del proyecto",
+          "description": "Revisa retrasos, errores y asuntos abiertos y propone acciones.",
+          "category": "Proyectos",
+          "schedule": "Laborables a las 10:00"
+        },
+        "knowledge-review": {
+          "title": "Revisión semanal de conocimientos",
+          "description": "Organiza notas y reuniones nuevas y prepara una lista de seguimiento.",
+          "category": "Conocimiento",
+          "schedule": "Domingo a las 18:00"
+        },
+        "daily-idea": {
+          "title": "Idea y curiosidad del día",
+          "description": "Comparte un dato fiable y una pequeña idea práctica.",
+          "category": "Estilo de vida",
+          "schedule": "Cada día a las 12:00"
+        },
+        "bedtime-story": {
+          "title": "Cuento diario para dormir",
+          "description": "Escribe un cuento corto, cálido e imaginativo para leer en familia.",
+          "category": "Familia",
+          "schedule": "Cada día a las 20:30"
+        },
+        "classic-movie": {
+          "title": "Recomendación de cine clásico",
+          "description": "Recomienda una película clásica reconocida con introducción sin spoilers.",
+          "category": "Entretenimiento",
+          "schedule": "Sábado a las 19:00"
+        },
+        "today-in-history": {
+          "title": "Tal día como hoy",
+          "description": "Presenta un acontecimiento histórico fiable de ciencia, cultura o sociedad.",
+          "category": "Conocimiento diario",
+          "schedule": "Cada día a las 08:30"
+        }
       }
     },
     "deleteDialog": {
@@ -2671,39 +2859,39 @@
       "fdChannel": "Un canal",
       "fdWebhook": "Un webhook",
       "enabled": "Activada",
-      "saveSchedule": "Guardar programación"
-      ,"friendlyNamePlaceholder": "Ejemplo: Organizar los comentarios de clientes cada día"
-      ,"friendlyTypeCron": "Repetir a una hora programada"
-      ,"friendlyTypeEvery": "Repetir a intervalo fijo"
-      ,"friendlyTypeAt": "Ejecutar una vez a una hora específica"
-      ,"executionFrequency": "Frecuencia"
-      ,"daily": "Cada día"
-      ,"weekdays": "Días laborables"
-      ,"weekly": "Cada semana"
-      ,"monthly": "Cada mes"
-      ,"customAdvancedTime": "Programación avanzada"
-      ,"weekday": "Día de la semana"
-      ,"date": "Fecha"
-      ,"monthlyDay": "Día {day} de cada mes"
-      ,"specificTime": "Hora"
-      ,"customTimeHint": "Usa una regla horaria más flexible."
-      ,"openAdvancedTime": "Abrir programación avanzada"
-      ,"everyHowOften": "Repetir cada"
-      ,"timeUnit": "Unidad de tiempo"
-      ,"minutes": "Minutos"
-      ,"hours": "Horas"
-      ,"days": "Días"
-      ,"dateAndTime": "Fecha y hora"
-      ,"friendlyMessagePlaceholder": "Ejemplo: Resumir los comentarios de clientes de hoy y sugerir próximos pasos"
-      ,"moreRuntimeSettings": "Más ajustes de ejecución (opcional)"
-      ,"advancedTimeHint": "Úsalo solo si el selector de hora anterior no es suficiente."
-      ,"timezoneSimpleHint": "Normalmente no es necesario cambiarlo."
-      ,"projectWorkspace": "Espacio de trabajo del proyecto"
-      ,"defaultWorkspace": "Usar el espacio de trabajo predeterminado"
-      ,"noWorkspace": "Sin espacio de proyecto"
-      ,"workspaceUnavailable": "{name} (no disponible)"
-      ,"workspaceRequiredHint": "Elige el proyecto que debe revisar esta tarea. La tarea trabajará únicamente dentro de ese proyecto."
-      ,"workspaceOptionalHint": "Opcional. Elige «Sin espacio de proyecto» para tareas generales o un proyecto cuando necesite sus archivos."
+      "saveSchedule": "Guardar programación",
+      "friendlyNamePlaceholder": "Ejemplo: Organizar los comentarios de clientes cada día",
+      "friendlyTypeCron": "Repetir a una hora programada",
+      "friendlyTypeEvery": "Repetir a intervalo fijo",
+      "friendlyTypeAt": "Ejecutar una vez a una hora específica",
+      "executionFrequency": "Frecuencia",
+      "daily": "Cada día",
+      "weekdays": "Días laborables",
+      "weekly": "Cada semana",
+      "monthly": "Cada mes",
+      "customAdvancedTime": "Programación avanzada",
+      "weekday": "Día de la semana",
+      "date": "Fecha",
+      "monthlyDay": "Día {day} de cada mes",
+      "specificTime": "Hora",
+      "customTimeHint": "Usa una regla horaria más flexible.",
+      "openAdvancedTime": "Abrir programación avanzada",
+      "everyHowOften": "Repetir cada",
+      "timeUnit": "Unidad de tiempo",
+      "minutes": "Minutos",
+      "hours": "Horas",
+      "days": "Días",
+      "dateAndTime": "Fecha y hora",
+      "friendlyMessagePlaceholder": "Ejemplo: Resumir los comentarios de clientes de hoy y sugerir próximos pasos",
+      "moreRuntimeSettings": "Más ajustes de ejecución (opcional)",
+      "advancedTimeHint": "Úsalo solo si el selector de hora anterior no es suficiente.",
+      "timezoneSimpleHint": "Normalmente no es necesario cambiarlo.",
+      "projectWorkspace": "Espacio de trabajo del proyecto",
+      "defaultWorkspace": "Usar el espacio de trabajo predeterminado",
+      "noWorkspace": "Sin espacio de proyecto",
+      "workspaceUnavailable": "{name} (no disponible)",
+      "workspaceRequiredHint": "Elige el proyecto que debe revisar esta tarea. La tarea trabajará únicamente dentro de ese proyecto.",
+      "workspaceOptionalHint": "Opcional. Elige «Sin espacio de proyecto» para tareas generales o un proyecto cuando necesite sus archivos."
     },
     "form": {
       "cronPreviewPlaceholder": "Introduce una expresión cron de 5 campos para previsualizar",
@@ -3338,9 +3526,18 @@
       "planTitle": "Plan de conservación",
       "planSummary": "Aproximadamente cada {interval} min · hasta unas {count} solicitudes · pausa tras {duration} min.",
       "costWarning": "Las solicitudes reales al proveedor pueden generar costes de tokens; no aparecen en el chat ni ejecutan herramientas.",
-      "statusLabel": "Estado", "targetLabel": "Proveedor / modelo", "lastHitLabel": "Últimos tokens en caché",
+      "statusLabel": "Estado",
+      "targetLabel": "Proveedor / modelo",
+      "lastHitLabel": "Últimos tokens en caché",
       "autoPauseLabel": "Pausa automática",
-      "states": { "off": "Desactivado", "waiting": "Esperando un prefijo estable", "scheduled": "Programado", "probing": "Sondeando", "paused": "Límite de inactividad alcanzado; esperando el siguiente mensaje", "stopped": "Detenido tras fallo" }
+      "states": {
+        "off": "Desactivado",
+        "waiting": "Esperando un prefijo estable",
+        "scheduled": "Programado",
+        "probing": "Sondeando",
+        "paused": "Límite de inactividad alcanzado; esperando el siguiente mensaje",
+        "stopped": "Detenido tras fallo"
+      }
     },
     "send": "Enviar",
     "sendQueues": "Enviar (se pone en cola hasta después de la respuesta actual)",
@@ -3351,18 +3548,57 @@
     "stoppingResponse": "Deteniendo de forma segura… Los mensajes nuevos se pondrán en cola.",
     "messageToSend": "Mensaje que enviar",
     "promptAnnotations": {
-      "label": "Anotaciones", "draftLabel": "Anotaciones de página pendientes", "sentLabel": "Anotaciones de página", "element": "Zona seleccionada",
+      "label": "Anotaciones",
+      "draftLabel": "Anotaciones de página pendientes",
+      "sentLabel": "Anotaciones de página",
+      "element": "Zona seleccionada",
       "targetLabel": "{kind}: {text}",
-      "targetKinds": { "heading": "Título", "button": "Botón", "link": "Enlace", "image": "Imagen", "input": "Campo", "form": "Formulario", "section": "Sección", "list": "Lista", "table": "Tabla", "text": "Texto", "region": "Zona", "element": "Zona seleccionada" },
-      "emptyDraft": "Añadir una instrucción", "stale": "No se pudo localizar esta zona en la página actual",
+      "targetKinds": {
+        "heading": "Título",
+        "button": "Botón",
+        "link": "Enlace",
+        "image": "Imagen",
+        "input": "Campo",
+        "form": "Formulario",
+        "section": "Sección",
+        "list": "Lista",
+        "table": "Tabla",
+        "text": "Texto",
+        "region": "Zona",
+        "element": "Zona seleccionada"
+      },
+      "emptyDraft": "Añadir una instrucción",
+      "stale": "No se pudo localizar esta zona en la página actual",
       "editingBlocked": "Añade o cancela la anotación que estás editando antes de enviar.",
       "staleBlocked": "No se pudo localizar esta zona en la página actual. Aun así, puedes enviarla a la IA.",
-      "emptyBlocked": "Completa todas las instrucciones del artefacto.", "tooLongBlocked": "Acorta las instrucciones a 16 KiB de texto UTF-8 antes de enviarlas.", "editLabel": "Editar instrucción del artefacto",
-      "removeLabel": "Eliminar instrucción del artefacto", "updateFailed": "No se pudo guardar la instrucción del artefacto.",
-      "discardFailed": "No se pudo eliminar la instrucción del artefacto.", "focusUnavailable": "No se pudo localizar esta zona en la página actual. Aun así, puedes enviarla a la IA.",
-      "reuseLabel": "Copiar como anotación nueva", "reuseDescription": "Copia la solicitud de cambio y elige su objetivo en la página.", "reuseUnavailable": "No se pudo copiar esta solicitud de cambio. Abre la página correspondiente y elige su objetivo.", "applyPrompt": "Aplica las anotaciones de página adjuntas.",
-      "status": { "unknown": "No se pudo actualizar la página", "not_attempted": "No se pudo actualizar la página", "applied": "Página actualizada", "appliedCorrected": "Página actualizada", "not_applied": "No se pudo actualizar la página", "conflict": "No se pudo actualizar la página", "ambiguous": "Comprobando la actualización" },
-      "statusDetail": { "unknown": "Abre la página para comprobarlo.", "not_attempted": "La página no se actualizó.", "applied": "", "not_applied": "Inténtalo de nuevo.", "conflict": "Abre la página e inténtalo de nuevo.", "ambiguous": "Abre la página para comprobarlo antes de reintentarlo." }
+      "emptyBlocked": "Completa todas las instrucciones del artefacto.",
+      "tooLongBlocked": "Acorta las instrucciones a 16 KiB de texto UTF-8 antes de enviarlas.",
+      "editLabel": "Editar instrucción del artefacto",
+      "removeLabel": "Eliminar instrucción del artefacto",
+      "updateFailed": "No se pudo guardar la instrucción del artefacto.",
+      "discardFailed": "No se pudo eliminar la instrucción del artefacto.",
+      "focusUnavailable": "No se pudo localizar esta zona en la página actual. Aun así, puedes enviarla a la IA.",
+      "reuseLabel": "Copiar como anotación nueva",
+      "reuseDescription": "Copia la solicitud de cambio y elige su objetivo en la página.",
+      "reuseUnavailable": "No se pudo copiar esta solicitud de cambio. Abre la página correspondiente y elige su objetivo.",
+      "applyPrompt": "Aplica las anotaciones de página adjuntas.",
+      "status": {
+        "unknown": "No se pudo actualizar la página",
+        "not_attempted": "No se pudo actualizar la página",
+        "applied": "Página actualizada",
+        "appliedCorrected": "Página actualizada",
+        "not_applied": "No se pudo actualizar la página",
+        "conflict": "No se pudo actualizar la página",
+        "ambiguous": "Comprobando la actualización"
+      },
+      "statusDetail": {
+        "unknown": "Abre la página para comprobarlo.",
+        "not_attempted": "La página no se actualizó.",
+        "applied": "",
+        "not_applied": "Inténtalo de nuevo.",
+        "conflict": "Abre la página e inténtalo de nuevo.",
+        "ambiguous": "Abre la página para comprobarlo antes de reintentarlo."
+      }
     },
     "placeholder": "Envía un mensaje...",
     "placeholderCompact": "Mensaje...",
@@ -3460,7 +3696,7 @@
     "audioUnsupported": "Este navegador no puede reproducir este formato de audio. Descarga el archivo en su lugar.",
     "playVideo": "Reproducir vídeo",
     "videoLoadFailed": "No se pudo cargar el vídeo.",
-    "videoUnsupported": "Este navegador no puede reproducir este formato de vídeo. Descarga el archivo en su lugar.",
+    "videoUnsupported": "Este navegador no puede reproducir este vídeo. Descárgalo en su lugar.",
     "previewOf": "Vista previa: {title}",
     "closePreview": "Cerrar vista previa",
     "previousImage": "Imagen anterior",
@@ -3469,7 +3705,6 @@
     "previewDownload": "Descargar vista previa",
     "previewTimedOut": "Se agotó el tiempo de la vista previa.",
     "previewFailed": "No se pudo cargar la vista previa.",
-    "videoUnsupported": "Este navegador no puede reproducir este vídeo. Descárgalo en su lugar.",
     "loadVideoPreview": "Cargar vista previa del vídeo",
     "loadVideoPreviewFor": "Cargar vista previa del vídeo {title}",
     "videoPreviewLoading": "Cargando la vista previa del vídeo. Puedes cancelar la descarga.",
@@ -4380,5 +4615,23 @@
       "copyFailed": "No se pudo copiar el comando",
       "copyLabel": "Copiar el comando de reinicio del gateway"
     }
+  },
+  "fileTree": {
+    "backToTasks": "Volver a tareas",
+    "refresh": "Actualizar",
+    "retry": "Reintentar",
+    "empty": "Este espacio de trabajo no tiene archivos visibles.",
+    "loading": "Cargando archivos…",
+    "viewFiles": "Ver archivos",
+    "attachToChat": "Adjuntar al chat",
+    "copyPath": "Copiar ruta",
+    "previewTruncated": "vista previa limitada a 1 MB",
+    "binaryNotPreviewable": "Los archivos binarios no se pueden previsualizar.",
+    "attachTooLarge": "{name} supera 1 MB y no se puede adjuntar desde el árbol de archivos.",
+    "attachFailed": "No se pudo adjuntar {name}.",
+    "attachUnsupported": "{name} no es un archivo de texto adjuntable desde el árbol de archivos.",
+    "attached": "{name} adjunto al compositor.",
+    "ctxCopy": "Copiar",
+    "ctxAttach": "Añadir a la conversación"
   }
 }

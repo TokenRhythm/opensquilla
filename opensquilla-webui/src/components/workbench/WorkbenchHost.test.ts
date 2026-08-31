@@ -229,7 +229,7 @@ describe('WorkbenchHost', () => {
     expect(mounted.store.activeItemId).toBe('one')
   })
 
-  it('moves focus to the collapse control when closing from two tabs to one', async () => {
+  it('keeps focus on a connected element when closing from two tabs to one', async () => {
     const mounted = await mountHost(1200)
     mounted.store.openItem(item('two'))
     await nextTick()
@@ -243,9 +243,9 @@ describe('WorkbenchHost', () => {
 
     expect(mounted.store.items).toHaveLength(1)
     expect(mounted.host.querySelector('[role="tablist"]')).toBeNull()
-    expect(document.activeElement).toBe(
-      mounted.host.querySelector('[aria-label="Collapse workbench"]'),
-    )
+    // The desktop collapse control was removed; the closed tab's button must
+    // not keep focus dangling on a detached node.
+    expect(mounted.host.contains(document.activeElement)).toBe(true)
   })
 
   it('keeps a tab mounted when its pending source save rejects close', async () => {
@@ -263,7 +263,7 @@ describe('WorkbenchHost', () => {
     expect(mounted.store.activeItemId).toBe('two')
   })
 
-  it('uses one desktop collapse control and preserves open tabs', async () => {
+  it('renders no desktop collapse control; the menu and single-tab close collapse it instead', async () => {
     const mounted = await mountHost(1200)
     mounted.store.openItem(item('two'))
     await nextTick()
@@ -271,16 +271,21 @@ describe('WorkbenchHost', () => {
 
     expect(panel.querySelector('[aria-label="Close tab: one.html"]')).not.toBeNull()
     expect(panel.querySelector('[aria-label="Close tab: two.html"]')).not.toBeNull()
-    const collapse = panel.querySelector<HTMLButtonElement>(
-      '[aria-label="Collapse workbench"]',
-    )!
-    collapse.click()
+    expect(panel.querySelector('[aria-label="Collapse workbench"]')).toBeNull()
+
+    // Two tabs: close one through the tab strip…
+    panel.querySelector<HTMLButtonElement>('[aria-label="Close tab: one.html"]')?.click()
+    await nextTick()
+    expect(mounted.store.items).toHaveLength(1)
+
+    // …the last tab closes through the single-title close control.
+    panel.querySelector<HTMLButtonElement>('[data-testid="workbench-single-close"]')?.click()
     await nextTick()
 
-    expect(mounted.store.items).toHaveLength(2)
+    expect(mounted.store.items).toHaveLength(0)
     expect(mounted.store.expanded).toBe(false)
-    expect(mounted.host.querySelector('[data-testid="workbench-host"]')).not.toBeNull()
-    expect(panel.style.display).toBe('none')
+    // Emptied workbench is unmounted by its host rather than left hidden.
+    expect(mounted.host.querySelector('[data-testid="workbench-host"]')).toBeNull()
   })
 
   it('keeps inactive retained panels mounted and removes them from the accessibility tree', async () => {
@@ -353,14 +358,12 @@ describe('WorkbenchHost', () => {
     await nextTick()
 
     const panel = mounted.host.querySelector<HTMLElement>('[data-testid="workbench-host"]')!
-    const collapse = panel.querySelector<HTMLButtonElement>(
-      '[aria-label="Collapse workbench"]',
-    )!
 
     expect(panel.getAttribute('role')).toBe('dialog')
     expect(hasOpenDialogLayer()).toBe(true)
-    expect(document.activeElement).toBe(collapse)
-    expect(panel.querySelectorAll('[aria-label="Collapse workbench"]')).toHaveLength(1)
+    // Initial focus lands on the first focusable element inside the dialog.
+    expect(panel.contains(document.activeElement)).toBe(true)
+    expect(panel.querySelectorAll('[aria-label="Collapse workbench"]')).toHaveLength(0)
 
     const tab = new KeyboardEvent('keydown', {
       key: 'Tab',
@@ -369,7 +372,7 @@ describe('WorkbenchHost', () => {
     })
     document.dispatchEvent(tab)
     expect(tab.defaultPrevented).toBe(true)
-    expect(document.activeElement).toBe(collapse)
+    expect(panel.contains(document.activeElement)).toBe(true)
 
     document.dispatchEvent(new KeyboardEvent('keydown', {
       key: 'Escape',

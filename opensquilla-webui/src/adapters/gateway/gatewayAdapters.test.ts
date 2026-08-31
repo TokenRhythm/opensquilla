@@ -33,6 +33,7 @@ describe('Gateway Adapter composition', () => {
       'pendingInputQueue',
       'approvalCenter',
       'goalCenter',
+      'workspaceFiles',
     ])
     expect(adapters).not.toHaveProperty('rpc')
     expect(adapters).not.toHaveProperty('events')

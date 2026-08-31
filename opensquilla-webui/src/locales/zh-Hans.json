@@ -146,12 +146,36 @@
     "empty": "此项目没有可用的预览。",
     "itemLimitReached": "已打开 8 个隔离预览。请先关闭一个再继续。",
     "resources": {
-      "title": "文件", "count": "文件（{count}）", "empty": "暂无文件或链接。",
-      "groups": { "files": "文件", "links": "链接", "attachments": "文件", "documents": "文件", "deliverables": "文件", "urls": "链接" },
-      "open": "打开 {name}", "preparing": "正在准备编辑器…", "retry": "重试", "preview": "预览 {name}", "download": "下载 {name}", "edit": "创建 {name} 的可编辑副本", "publish": "发布 {name}",
-      "imported": "{name} 已可编辑。", "published": "{name} 已可分享。",
-      "publishUnavailable": "此文档没有可发布的当前版本。", "actionFailed": "工作台操作失败。",
-      "unavailableReasons": { "htmlEncodingUnsupported": "此 HTML 不是有效的 UTF-8，无法安全预览或编辑。", "htmlValidationFailed": "此 HTML 未通过安全校验，无法预览或编辑。", "htmlEditTooLarge": "此 HTML 过大，无法在应用内编辑；仍可下载。", "htmlPreviewTooLarge": "此 HTML 过大，无法在应用内安全预览；仍可下载。", "officeAdapterNotAvailable": "Office 编辑能力尚未启用。", "unsupported": "此资源暂不支持此操作。" }
+      "title": "文件",
+      "count": "文件（{count}）",
+      "empty": "暂无文件或链接。",
+      "groups": {
+        "files": "文件",
+        "links": "链接",
+        "attachments": "文件",
+        "documents": "文件",
+        "deliverables": "文件",
+        "urls": "链接"
+      },
+      "open": "打开 {name}",
+      "preparing": "正在准备编辑器…",
+      "retry": "重试",
+      "preview": "预览 {name}",
+      "download": "下载 {name}",
+      "edit": "创建 {name} 的可编辑副本",
+      "publish": "发布 {name}",
+      "imported": "{name} 已可编辑。",
+      "published": "{name} 已可分享。",
+      "publishUnavailable": "此文档没有可发布的当前版本。",
+      "actionFailed": "工作台操作失败。",
+      "unavailableReasons": {
+        "htmlEncodingUnsupported": "此 HTML 不是有效的 UTF-8，无法安全预览或编辑。",
+        "htmlValidationFailed": "此 HTML 未通过安全校验，无法预览或编辑。",
+        "htmlEditTooLarge": "此 HTML 过大，无法在应用内编辑；仍可下载。",
+        "htmlPreviewTooLarge": "此 HTML 过大，无法在应用内安全预览；仍可下载。",
+        "officeAdapterNotAvailable": "Office 编辑能力尚未启用。",
+        "unsupported": "此资源暂不支持此操作。"
+      }
     },
     "browser": {
       "back": "后退",
@@ -166,11 +190,32 @@
       "failedDetail": "重新加载隔离浏览器以继续。"
     },
     "artifactAnnotation": {
-      "start": "批注预览", "stop": "退出批注模式", "selectElement": "选择页面元素进行批注", "selectElementShort": "选择元素", "unavailable": "当前无法使用预览批注。", "desktopEditingOnly": "请在桌面客户端中选择页面元素并让 AI 编辑。",
-      "createFailed": "无法附加所选页面元素。", "elementChanged": "所选元素在附加前发生了变化，请在当前预览中重新选择。", "rearmFailed": "元素选择器无法重新启动，批注模式已退出。请重新开启批注模式后再试。", "updateFailed": "无法保存批注草稿。", "discardFailed": "无法丢弃该批注。编辑框将保持打开，请重试。", "closeFailed": "无法关闭批注编辑框。请重试后再选择其他元素。", "replacementCleanupFailed": "新批注已保留，但无法删除之前的草稿。",
+      "start": "批注预览",
+      "stop": "退出批注模式",
+      "selectElement": "选择页面元素进行批注",
+      "selectElementShort": "选择元素",
+      "unavailable": "当前无法使用预览批注。",
+      "desktopEditingOnly": "请在桌面客户端中选择页面元素并让 AI 编辑。",
+      "createFailed": "无法附加所选页面元素。",
+      "elementChanged": "所选元素在附加前发生了变化，请在当前预览中重新选择。",
+      "rearmFailed": "元素选择器无法重新启动，批注模式已退出。请重新开启批注模式后再试。",
+      "updateFailed": "无法保存批注草稿。",
+      "discardFailed": "无法丢弃该批注。编辑框将保持打开，请重试。",
+      "closeFailed": "无法关闭批注编辑框。请重试后再选择其他元素。",
+      "replacementCleanupFailed": "新批注已保留，但无法删除之前的草稿。",
       "overlayFallback": "请在下方继续编辑批注。",
-      "fallbackTitle": "继续编辑批注", "fallbackDetail": "预览暂时隐藏，你的批注仍在。", "frozenPreview": "所选页面区域的预览",
-      "placeholder": "描述希望对这个区域进行的修改…", "newlineHint": "{shortcut} 换行", "keepDraft": "保留批注", "submit": "添加批注", "contextLabel": "当前选区", "bodyLabel": "页面批注", "emptyBody": "请描述希望的修改。", "reselectHint": "请在页面中选择对应区域。", "reuseHint": "已复制修改要求，请在页面中选择对应区域。"
+      "fallbackTitle": "继续编辑批注",
+      "fallbackDetail": "预览暂时隐藏，你的批注仍在。",
+      "frozenPreview": "所选页面区域的预览",
+      "placeholder": "描述希望对这个区域进行的修改…",
+      "newlineHint": "{shortcut} 换行",
+      "keepDraft": "保留批注",
+      "submit": "添加批注",
+      "contextLabel": "当前选区",
+      "bodyLabel": "页面批注",
+      "emptyBody": "请描述希望的修改。",
+      "reselectHint": "请在页面中选择对应区域。",
+      "reuseHint": "已复制修改要求，请在页面中选择对应区域。"
     },
     "artifactPreview": {
       "refresh": "刷新预览",
@@ -299,7 +344,8 @@
         "saved": "已保存",
         "error": "需要处理"
       }
-    }
+    },
+    "tabOverflow": "全部页签"
   },
   "nav": {
     "chat": "任务",
@@ -495,9 +541,18 @@
       "retryFailedTitle": "未能重新生成预览",
       "retryFailedDescription": "本次重新生成请求未成功。上一次处理结果仍未被采纳，也没有修改文件；可以再次尝试或丢弃导入。",
       "jobStates": {
-        "cancelled": {"title": "已取消生成预览", "description": "隔离原文会保留 24 小时。重新生成时若首个结果未通过校验，会自动重试一次，因此最多调用模型两次，结果可能不同。"},
-        "interrupted": {"title": "预览生成已中断", "description": "模型处理期间 OpenSquilla 发生重启。隔离原文仍可用；重新生成时若首个结果未通过校验，会自动重试一次，因此最多调用模型两次。"},
-        "failed": {"title": "本次预览生成失败", "description": "本次处理没有生成通过校验且可核对的预览。未采纳任何导入判断，也未修改任何文件。隔离原文已保留；重新生成最多调用模型两次，结果可能不同。"}
+        "cancelled": {
+          "title": "已取消生成预览",
+          "description": "隔离原文会保留 24 小时。重新生成时若首个结果未通过校验，会自动重试一次，因此最多调用模型两次，结果可能不同。"
+        },
+        "interrupted": {
+          "title": "预览生成已中断",
+          "description": "模型处理期间 OpenSquilla 发生重启。隔离原文仍可用；重新生成时若首个结果未通过校验，会自动重试一次，因此最多调用模型两次。"
+        },
+        "failed": {
+          "title": "本次预览生成失败",
+          "description": "本次处理没有生成通过校验且可核对的预览。未采纳任何导入判断，也未修改任何文件。隔离原文已保留；重新生成最多调用模型两次，结果可能不同。"
+        }
       },
       "modelAnalysisTitle": "模型分析（请以文件差异为准）",
       "previewTitle": "核对每一处文件变更",
@@ -2629,15 +2684,60 @@
       "galleryEyebrow": "自动化模板库",
       "bulkDeleteConfirm": "确定删除选中的 {count} 个自动化任务吗？此操作无法撤销。",
       "templates": {
-        "ai-daily": { "title": "每日 AI 资讯简报", "description": "检索过去 24 小时的重要 AI 新闻，去重并生成带来源链接的简报。", "category": "资讯与情报", "schedule": "每天 08:00" },
-        "weekly-report": { "title": "每周工作复盘", "description": "汇总本周任务与交付，提炼进展、风险和下周优先事项。", "category": "效率办公", "schedule": "每周五 17:30" },
-        "english-five": { "title": "每天 5 个英语单词", "description": "结合例句与小测验，生成轻量、可坚持的英语学习卡片。", "category": "学习成长", "schedule": "每天 09:00" },
-        "project-risk": { "title": "项目风险巡检", "description": "检查延期事项、异常日志与待处理问题，输出风险等级和建议。", "category": "项目研发", "schedule": "工作日 10:00" },
-        "knowledge-review": { "title": "知识库周回顾", "description": "整理本周新增笔记与会议纪要，补充标签并生成待消化清单。", "category": "知识管理", "schedule": "每周日 18:00" },
-        "daily-idea": { "title": "每日灵感与冷知识", "description": "每天送上一条可靠、有出处的知识和一个可行动的小灵感。", "category": "轻松生活", "schedule": "每天 12:00" },
-        "bedtime-story": { "title": "每日儿童睡前故事", "description": "生成一篇温暖、有启发、适合亲子共读的短篇故事。", "category": "亲子陪伴", "schedule": "每天 20:30" },
-        "classic-movie": { "title": "经典电影推荐", "description": "每周推荐一部高质量经典电影，并附无剧透导读。", "category": "休闲娱乐", "schedule": "每周六 19:00" },
-        "today-in-history": { "title": "历史上的今天", "description": "从科技、文化与社会领域挑选一件可靠的历史事件。", "category": "每日知识", "schedule": "每天 08:30" }
+        "ai-daily": {
+          "title": "每日 AI 资讯简报",
+          "description": "检索过去 24 小时的重要 AI 新闻，去重并生成带来源链接的简报。",
+          "category": "资讯与情报",
+          "schedule": "每天 08:00"
+        },
+        "weekly-report": {
+          "title": "每周工作复盘",
+          "description": "汇总本周任务与交付，提炼进展、风险和下周优先事项。",
+          "category": "效率办公",
+          "schedule": "每周五 17:30"
+        },
+        "english-five": {
+          "title": "每天 5 个英语单词",
+          "description": "结合例句与小测验，生成轻量、可坚持的英语学习卡片。",
+          "category": "学习成长",
+          "schedule": "每天 09:00"
+        },
+        "project-risk": {
+          "title": "项目风险巡检",
+          "description": "检查延期事项、异常日志与待处理问题，输出风险等级和建议。",
+          "category": "项目研发",
+          "schedule": "工作日 10:00"
+        },
+        "knowledge-review": {
+          "title": "知识库周回顾",
+          "description": "整理本周新增笔记与会议纪要，补充标签并生成待消化清单。",
+          "category": "知识管理",
+          "schedule": "每周日 18:00"
+        },
+        "daily-idea": {
+          "title": "每日灵感与冷知识",
+          "description": "每天送上一条可靠、有出处的知识和一个可行动的小灵感。",
+          "category": "轻松生活",
+          "schedule": "每天 12:00"
+        },
+        "bedtime-story": {
+          "title": "每日儿童睡前故事",
+          "description": "生成一篇温暖、有启发、适合亲子共读的短篇故事。",
+          "category": "亲子陪伴",
+          "schedule": "每天 20:30"
+        },
+        "classic-movie": {
+          "title": "经典电影推荐",
+          "description": "每周推荐一部高质量经典电影，并附无剧透导读。",
+          "category": "休闲娱乐",
+          "schedule": "每周六 19:00"
+        },
+        "today-in-history": {
+          "title": "历史上的今天",
+          "description": "从科技、文化与社会领域挑选一件可靠的历史事件。",
+          "category": "每日知识",
+          "schedule": "每天 08:30"
+        }
       }
     },
     "deleteDialog": {
@@ -2759,39 +2859,39 @@
       "fdChannel": "一个渠道",
       "fdWebhook": "一个 webhook",
       "enabled": "已启用",
-      "saveSchedule": "保存定时任务"
-      ,"friendlyNamePlaceholder": "例如：每天整理客户反馈"
-      ,"friendlyTypeCron": "按固定时间重复"
-      ,"friendlyTypeEvery": "每隔一段时间执行"
-      ,"friendlyTypeAt": "只在指定时间执行一次"
-      ,"executionFrequency": "执行频率"
-      ,"daily": "每天"
-      ,"weekdays": "每个工作日"
-      ,"weekly": "每周"
-      ,"monthly": "每月"
-      ,"customAdvancedTime": "自定义高级时间"
-      ,"weekday": "星期"
-      ,"date": "日期"
-      ,"monthlyDay": "每月 {day} 日"
-      ,"specificTime": "具体时间"
-      ,"customTimeHint": "可输入更灵活的时间规则。"
-      ,"openAdvancedTime": "打开高级时间设置"
-      ,"everyHowOften": "每隔多久执行"
-      ,"timeUnit": "时间单位"
-      ,"minutes": "分钟"
-      ,"hours": "小时"
-      ,"days": "天"
-      ,"dateAndTime": "执行日期和时间"
-      ,"friendlyMessagePlaceholder": "例如：整理今天收到的客户反馈，归纳主要问题并给出处理建议"
-      ,"moreRuntimeSettings": "更多运行设置（可选）"
-      ,"advancedTimeHint": "仅在上面的时间选择无法满足需求时使用。"
-      ,"timezoneSimpleHint": "通常无需修改。"
-      ,"projectWorkspace": "项目空间"
-      ,"defaultWorkspace": "使用默认工作区"
-      ,"noWorkspace": "无项目空间"
-      ,"workspaceUnavailable": "{name}（不可用）"
-      ,"workspaceRequiredHint": "请选择该任务要检查的项目。任务只会在所选项目中读取和处理文件。"
-      ,"workspaceOptionalHint": "可选。通用任务可选择“无项目空间”；需要读取项目文件时请选择对应项目。"
+      "saveSchedule": "保存定时任务",
+      "friendlyNamePlaceholder": "例如：每天整理客户反馈",
+      "friendlyTypeCron": "按固定时间重复",
+      "friendlyTypeEvery": "每隔一段时间执行",
+      "friendlyTypeAt": "只在指定时间执行一次",
+      "executionFrequency": "执行频率",
+      "daily": "每天",
+      "weekdays": "每个工作日",
+      "weekly": "每周",
+      "monthly": "每月",
+      "customAdvancedTime": "自定义高级时间",
+      "weekday": "星期",
+      "date": "日期",
+      "monthlyDay": "每月 {day} 日",
+      "specificTime": "具体时间",
+      "customTimeHint": "可输入更灵活的时间规则。",
+      "openAdvancedTime": "打开高级时间设置",
+      "everyHowOften": "每隔多久执行",
+      "timeUnit": "时间单位",
+      "minutes": "分钟",
+      "hours": "小时",
+      "days": "天",
+      "dateAndTime": "执行日期和时间",
+      "friendlyMessagePlaceholder": "例如：整理今天收到的客户反馈，归纳主要问题并给出处理建议",
+      "moreRuntimeSettings": "更多运行设置（可选）",
+      "advancedTimeHint": "仅在上面的时间选择无法满足需求时使用。",
+      "timezoneSimpleHint": "通常无需修改。",
+      "projectWorkspace": "项目空间",
+      "defaultWorkspace": "使用默认工作区",
+      "noWorkspace": "无项目空间",
+      "workspaceUnavailable": "{name}（不可用）",
+      "workspaceRequiredHint": "请选择该任务要检查的项目。任务只会在所选项目中读取和处理文件。",
+      "workspaceOptionalHint": "可选。通用任务可选择“无项目空间”；需要读取项目文件时请选择对应项目。"
     },
     "form": {
       "cronPreviewPlaceholder": "输入 5 字段的 cron 表达式以预览",
@@ -3430,7 +3530,14 @@
       "targetLabel": "供应商 / 模型",
       "lastHitLabel": "上次缓存命中 token",
       "autoPauseLabel": "自动暂停",
-      "states": { "off": "已关闭", "waiting": "等待稳定前缀", "scheduled": "已计划", "probing": "正在探测", "paused": "空闲超时，等待下一条消息", "stopped": "未命中或出错后已停止" }
+      "states": {
+        "off": "已关闭",
+        "waiting": "等待稳定前缀",
+        "scheduled": "已计划",
+        "probing": "正在探测",
+        "paused": "空闲超时，等待下一条消息",
+        "stopped": "未命中或出错后已停止"
+      }
     },
     "send": "发送",
     "sendQueues": "发送（排队等待当前回复结束）",
@@ -3441,18 +3548,57 @@
     "stoppingResponse": "正在安全停止… 新消息将进入队列。",
     "messageToSend": "要发送的消息",
     "promptAnnotations": {
-      "label": "批注", "draftLabel": "待发送的页面批注", "sentLabel": "页面批注", "element": "选中的区域",
+      "label": "批注",
+      "draftLabel": "待发送的页面批注",
+      "sentLabel": "页面批注",
+      "element": "选中的区域",
       "targetLabel": "{kind}：{text}",
-      "targetKinds": { "heading": "标题", "button": "按钮", "link": "链接", "image": "图片", "input": "输入框", "form": "表单", "section": "区块", "list": "列表", "table": "表格", "text": "文字", "region": "区域", "element": "选中的区域" },
-      "emptyDraft": "输入修改要求", "stale": "无法在当前页面定位这部分内容",
+      "targetKinds": {
+        "heading": "标题",
+        "button": "按钮",
+        "link": "链接",
+        "image": "图片",
+        "input": "输入框",
+        "form": "表单",
+        "section": "区块",
+        "list": "列表",
+        "table": "表格",
+        "text": "文字",
+        "region": "区域",
+        "element": "选中的区域"
+      },
+      "emptyDraft": "输入修改要求",
+      "stale": "无法在当前页面定位这部分内容",
       "editingBlocked": "请先添加或取消正在编辑的批注，再发送消息。",
       "staleBlocked": "无法在当前页面定位这部分内容，仍可直接发送给 AI。",
-      "emptyBlocked": "请先完成所有交付件批注，再发送消息。", "tooLongBlocked": "交付件批注的 UTF-8 内容不能超过 16 KiB，请缩短后再发送。", "editLabel": "编辑交付件批注",
-      "removeLabel": "删除交付件批注", "updateFailed": "无法保存交付件批注。",
-      "discardFailed": "无法删除交付件批注。", "focusUnavailable": "无法在当前页面定位这部分内容，仍可直接发送给 AI。",
-      "reuseLabel": "复制为新批注", "reuseDescription": "复制修改要求，并在页面中选择目标。", "reuseUnavailable": "无法复制这条修改要求，请打开对应页面并选择目标。", "applyPrompt": "请按照附带的页面批注完成修改。",
-      "status": { "unknown": "未能更新页面", "not_attempted": "未能更新页面", "applied": "页面已更新", "appliedCorrected": "页面已更新", "not_applied": "未能更新页面", "conflict": "未能更新页面", "ambiguous": "正在确认" },
-      "statusDetail": { "unknown": "请打开页面检查。", "not_attempted": "未更新页面。", "applied": "", "not_applied": "请重试。", "conflict": "请打开最新页面后重试。", "ambiguous": "重试前请先打开页面检查。" }
+      "emptyBlocked": "请先完成所有交付件批注，再发送消息。",
+      "tooLongBlocked": "交付件批注的 UTF-8 内容不能超过 16 KiB，请缩短后再发送。",
+      "editLabel": "编辑交付件批注",
+      "removeLabel": "删除交付件批注",
+      "updateFailed": "无法保存交付件批注。",
+      "discardFailed": "无法删除交付件批注。",
+      "focusUnavailable": "无法在当前页面定位这部分内容，仍可直接发送给 AI。",
+      "reuseLabel": "复制为新批注",
+      "reuseDescription": "复制修改要求，并在页面中选择目标。",
+      "reuseUnavailable": "无法复制这条修改要求，请打开对应页面并选择目标。",
+      "applyPrompt": "请按照附带的页面批注完成修改。",
+      "status": {
+        "unknown": "未能更新页面",
+        "not_attempted": "未能更新页面",
+        "applied": "页面已更新",
+        "appliedCorrected": "页面已更新",
+        "not_applied": "未能更新页面",
+        "conflict": "未能更新页面",
+        "ambiguous": "正在确认"
+      },
+      "statusDetail": {
+        "unknown": "请打开页面检查。",
+        "not_attempted": "未更新页面。",
+        "applied": "",
+        "not_applied": "请重试。",
+        "conflict": "请打开最新页面后重试。",
+        "ambiguous": "重试前请先打开页面检查。"
+      }
     },
     "placeholder": "发送消息……",
     "placeholderCompact": "消息……",
@@ -3550,7 +3696,7 @@
     "audioUnsupported": "此浏览器无法播放这种音频格式，请改为下载文件。",
     "playVideo": "播放视频",
     "videoLoadFailed": "无法加载视频。",
-    "videoUnsupported": "此浏览器无法播放这种视频格式，请改为下载文件。",
+    "videoUnsupported": "此浏览器无法播放该视频。请改为下载。",
     "previewOf": "预览：{title}",
     "closePreview": "关闭预览",
     "previousImage": "上一张图片",
@@ -3559,7 +3705,6 @@
     "previewDownload": "预览下载",
     "previewTimedOut": "预览超时。",
     "previewFailed": "预览加载失败。",
-    "videoUnsupported": "此浏览器无法播放该视频。请改为下载。",
     "loadVideoPreview": "加载视频预览",
     "loadVideoPreviewFor": "加载视频预览 {title}",
     "videoPreviewLoading": "正在加载视频预览。下载过程中可以取消。",
@@ -4470,5 +4615,23 @@
       "copyFailed": "无法复制命令",
       "copyLabel": "复制网关重启命令"
     }
+  },
+  "fileTree": {
+    "backToTasks": "返回任务",
+    "refresh": "刷新",
+    "retry": "重试",
+    "empty": "此工作空间没有可见文件。",
+    "loading": "正在加载文件…",
+    "viewFiles": "查看文件",
+    "attachToChat": "附加到对话",
+    "copyPath": "复制路径",
+    "previewTruncated": "预览仅限 1 MB",
+    "binaryNotPreviewable": "二进制文件无法预览。",
+    "attachTooLarge": "{name} 超过 1 MB，无法从文件树附加。",
+    "attachFailed": "无法附加 {name}。",
+    "attachUnsupported": "{name} 不是文本文件，无法从文件树附加。",
+    "attached": "{name} 已附加到输入框。",
+    "ctxCopy": "复制",
+    "ctxAttach": "添加到对话"
   }
 }

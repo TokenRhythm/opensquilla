@@ -146,12 +146,36 @@
     "empty": "Aucun aperçu n’est disponible pour cet élément.",
     "itemLimitReached": "Huit aperçus isolés sont déjà ouverts. Fermez-en un avant d’en ouvrir un autre.",
     "resources": {
-      "title": "Fichiers", "count": "Fichiers ({count})", "empty": "Aucun fichier ni lien pour le moment.",
-      "groups": { "files": "Fichiers", "links": "Liens", "attachments": "Fichiers", "documents": "Fichiers", "deliverables": "Fichiers", "urls": "Liens" },
-      "open": "Ouvrir {name}", "preparing": "Préparation de l’éditeur…", "retry": "Réessayer", "preview": "Aperçu de {name}", "download": "Télécharger {name}", "edit": "Modifier une copie de {name}", "publish": "Publier {name}",
-      "imported": "{name} peut maintenant être modifié.", "published": "{name} peut maintenant être partagé.",
-      "publishUnavailable": "Ce document n’a pas de révision actuelle publiable.", "actionFailed": "L’action de l’espace de travail a échoué.",
-      "unavailableReasons": { "htmlEncodingUnsupported": "Ce HTML n’est pas un UTF-8 valide et ne peut pas être prévisualisé ou modifié en toute sécurité.", "htmlValidationFailed": "Ce HTML n’a pas pu être validé pour une prévisualisation ou une modification sûre.", "htmlEditTooLarge": "Ce HTML est trop volumineux pour être modifié dans l’application. Vous pouvez toujours le télécharger.", "htmlPreviewTooLarge": "Ce HTML est trop volumineux pour être prévisualisé en toute sécurité. Vous pouvez toujours le télécharger.", "officeAdapterNotAvailable": "L’édition Office n’est pas encore disponible.", "unsupported": "Cette action n’est pas disponible pour cette ressource." }
+      "title": "Fichiers",
+      "count": "Fichiers ({count})",
+      "empty": "Aucun fichier ni lien pour le moment.",
+      "groups": {
+        "files": "Fichiers",
+        "links": "Liens",
+        "attachments": "Fichiers",
+        "documents": "Fichiers",
+        "deliverables": "Fichiers",
+        "urls": "Liens"
+      },
+      "open": "Ouvrir {name}",
+      "preparing": "Préparation de l’éditeur…",
+      "retry": "Réessayer",
+      "preview": "Aperçu de {name}",
+      "download": "Télécharger {name}",
+      "edit": "Modifier une copie de {name}",
+      "publish": "Publier {name}",
+      "imported": "{name} peut maintenant être modifié.",
+      "published": "{name} peut maintenant être partagé.",
+      "publishUnavailable": "Ce document n’a pas de révision actuelle publiable.",
+      "actionFailed": "L’action de l’espace de travail a échoué.",
+      "unavailableReasons": {
+        "htmlEncodingUnsupported": "Ce HTML n’est pas un UTF-8 valide et ne peut pas être prévisualisé ou modifié en toute sécurité.",
+        "htmlValidationFailed": "Ce HTML n’a pas pu être validé pour une prévisualisation ou une modification sûre.",
+        "htmlEditTooLarge": "Ce HTML est trop volumineux pour être modifié dans l’application. Vous pouvez toujours le télécharger.",
+        "htmlPreviewTooLarge": "Ce HTML est trop volumineux pour être prévisualisé en toute sécurité. Vous pouvez toujours le télécharger.",
+        "officeAdapterNotAvailable": "L’édition Office n’est pas encore disponible.",
+        "unsupported": "Cette action n’est pas disponible pour cette ressource."
+      }
     },
     "browser": {
       "back": "Précédent",
@@ -166,11 +190,32 @@
       "failedDetail": "Rechargez le navigateur isolé pour continuer."
     },
     "artifactAnnotation": {
-      "start": "Annoter l’aperçu", "stop": "Arrêter l’annotation", "selectElement": "Sélectionnez un élément de page à annoter", "selectElementShort": "Choisir un élément", "unavailable": "L’annotation de l’aperçu est indisponible.", "desktopEditingOnly": "Sélectionnez et modifiez les éléments de la page avec l’IA dans l’application de bureau.",
-      "createFailed": "L’élément sélectionné n’a pas pu être joint.", "elementChanged": "L’élément sélectionné a changé avant d’être joint. Sélectionnez-le à nouveau dans l’aperçu actuel.", "rearmFailed": "Le mode annotation s’est arrêté, car le sélecteur n’a pas pu redémarrer. Réactivez-le pour réessayer.", "updateFailed": "Le brouillon d’annotation n’a pas pu être enregistré.", "discardFailed": "L’annotation n’a pas pu être supprimée. Elle reste ouverte pour réessayer.", "closeFailed": "L’éditeur d’annotation n’a pas pu être fermé. Réessayez.", "replacementCleanupFailed": "La nouvelle annotation a été conservée, mais l’ancien brouillon n’a pas pu être supprimé.",
+      "start": "Annoter l’aperçu",
+      "stop": "Arrêter l’annotation",
+      "selectElement": "Sélectionnez un élément de page à annoter",
+      "selectElementShort": "Choisir un élément",
+      "unavailable": "L’annotation de l’aperçu est indisponible.",
+      "desktopEditingOnly": "Sélectionnez et modifiez les éléments de la page avec l’IA dans l’application de bureau.",
+      "createFailed": "L’élément sélectionné n’a pas pu être joint.",
+      "elementChanged": "L’élément sélectionné a changé avant d’être joint. Sélectionnez-le à nouveau dans l’aperçu actuel.",
+      "rearmFailed": "Le mode annotation s’est arrêté, car le sélecteur n’a pas pu redémarrer. Réactivez-le pour réessayer.",
+      "updateFailed": "Le brouillon d’annotation n’a pas pu être enregistré.",
+      "discardFailed": "L’annotation n’a pas pu être supprimée. Elle reste ouverte pour réessayer.",
+      "closeFailed": "L’éditeur d’annotation n’a pas pu être fermé. Réessayez.",
+      "replacementCleanupFailed": "La nouvelle annotation a été conservée, mais l’ancien brouillon n’a pas pu être supprimé.",
       "overlayFallback": "Continuez l’annotation ci-dessous.",
-      "fallbackTitle": "Continuer l’annotation", "fallbackDetail": "L’aperçu est temporairement masqué. Votre annotation est toujours là.", "frozenPreview": "Aperçu de la zone de page sélectionnée",
-      "placeholder": "Décrivez la modification de cette zone…", "newlineHint": "{shortcut} pour aller à la ligne", "keepDraft": "Conserver l’annotation", "submit": "Ajouter l’annotation", "contextLabel": "Sélection actuelle", "bodyLabel": "Annotation de page", "emptyBody": "Décrivez la modification souhaitée.", "reselectHint": "Sélectionnez la zone correspondante sur la page.", "reuseHint": "La demande de modification a été copiée. Sélectionnez la zone correspondante sur la page."
+      "fallbackTitle": "Continuer l’annotation",
+      "fallbackDetail": "L’aperçu est temporairement masqué. Votre annotation est toujours là.",
+      "frozenPreview": "Aperçu de la zone de page sélectionnée",
+      "placeholder": "Décrivez la modification de cette zone…",
+      "newlineHint": "{shortcut} pour aller à la ligne",
+      "keepDraft": "Conserver l’annotation",
+      "submit": "Ajouter l’annotation",
+      "contextLabel": "Sélection actuelle",
+      "bodyLabel": "Annotation de page",
+      "emptyBody": "Décrivez la modification souhaitée.",
+      "reselectHint": "Sélectionnez la zone correspondante sur la page.",
+      "reuseHint": "La demande de modification a été copiée. Sélectionnez la zone correspondante sur la page."
     },
     "artifactPreview": {
       "refresh": "Actualiser l’aperçu",
@@ -292,8 +337,15 @@
       "unsavedSourceCopied": "Source non enregistrée copiée",
       "copyUnsavedSourceFailed": "Impossible de copier la source non enregistrée.",
       "discardAndLoadLatest": "Ignorer et charger la dernière version",
-      "sourceStatus": {"ready":"Prêt","saving":"Enregistrement…","dirty":"Non enregistré","saved":"Enregistré","error":"Action requise"}
-    }
+      "sourceStatus": {
+        "ready": "Prêt",
+        "saving": "Enregistrement…",
+        "dirty": "Non enregistré",
+        "saved": "Enregistré",
+        "error": "Action requise"
+      }
+    },
+    "tabOverflow": "Tous les onglets"
   },
   "nav": {
     "chat": "Tâche",
@@ -489,9 +541,18 @@
       "retryFailedTitle": "L’aperçu n’a pas pu être régénéré",
       "retryFailedDescription": "Cette demande de régénération n’a pas abouti. Le résultat précédent reste non adopté et aucun fichier n’a été modifié. Réessayez ou supprimez l’import.",
       "jobStates": {
-        "cancelled": {"title": "Génération de l’aperçu annulée", "description": "La source isolée est conservée pendant 24 heures. La régénération peut effectuer jusqu’à deux appels au modèle, car un résultat qui ne passe pas la validation peut être réessayé une fois ; le résultat peut différer."},
-        "interrupted": {"title": "Génération de l’aperçu interrompue", "description": "OpenSquilla a redémarré pendant le traitement du modèle. La source isolée reste disponible. La régénération peut effectuer jusqu’à deux appels au modèle en raison d’un nouvel essai interne."},
-        "failed": {"title": "Échec de la génération de l’aperçu", "description": "Cette tentative n’a produit aucun aperçu validé et vérifiable. Aucune décision d’import n’a été adoptée et aucun fichier n’a été modifié. La source isolée a été conservée ; la régénération peut effectuer jusqu’à deux appels au modèle."}
+        "cancelled": {
+          "title": "Génération de l’aperçu annulée",
+          "description": "La source isolée est conservée pendant 24 heures. La régénération peut effectuer jusqu’à deux appels au modèle, car un résultat qui ne passe pas la validation peut être réessayé une fois ; le résultat peut différer."
+        },
+        "interrupted": {
+          "title": "Génération de l’aperçu interrompue",
+          "description": "OpenSquilla a redémarré pendant le traitement du modèle. La source isolée reste disponible. La régénération peut effectuer jusqu’à deux appels au modèle en raison d’un nouvel essai interne."
+        },
+        "failed": {
+          "title": "Échec de la génération de l’aperçu",
+          "description": "Cette tentative n’a produit aucun aperçu validé et vérifiable. Aucune décision d’import n’a été adoptée et aucun fichier n’a été modifié. La source isolée a été conservée ; la régénération peut effectuer jusqu’à deux appels au modèle."
+        }
       },
       "modelAnalysisTitle": "Analyse du modèle (à vérifier avec les modifications de fichiers)",
       "previewTitle": "Vérifier chaque modification",
@@ -557,53 +618,135 @@
       "available": "Mode sûr disponible",
       "unavailable": "Mode sûr indisponible",
       "builtin": "Intégré",
-      "actions": { "add": "Ajouter", "remove": "Retirer", "retry": "Réessayer", "copy": "Copier", "saving": "Enregistrement…", "redetect": "Détecter à nouveau" },
+      "actions": {
+        "add": "Ajouter",
+        "remove": "Retirer",
+        "retry": "Réessayer",
+        "copy": "Copier",
+        "saving": "Enregistrement…",
+        "redetect": "Détecter à nouveau"
+      },
       "mode": {
-        "title": "Mode d’accès par défaut", "description": "Choisissez le mode initial des nouvelles tâches. Le mode sûr reste indisponible si la vérification échoue.",
-        "default": "Mode par défaut", "safe": "Sûr", "full": "Accès complet", "resetWarning": "Réafficher l’avertissement au démarrage"
+        "title": "Mode d’accès par défaut",
+        "description": "Choisissez le mode initial des nouvelles tâches. Le mode sûr reste indisponible si la vérification échoue.",
+        "default": "Mode par défaut",
+        "safe": "Sûr",
+        "full": "Accès complet",
+        "resetWarning": "Réafficher l’avertissement au démarrage"
       },
       "setup": {
-        "title": "Configurer le mode sûr", "description": "OpenSquilla a besoin d’une autorisation administrateur pour créer un compte isolé et configurer la protection des fichiers et du réseau.", "descriptionWithDuration": "OpenSquilla a besoin d’une autorisation administrateur pour créer un compte isolé et configurer les protections. La première configuration prend généralement environ 20 à 30 secondes. Gardez OpenSquilla ouvert.",
-        "continue": "Continuer", "configuring": "Configuration…", "requestingApproval": "Confirmez l’invite Windows pour continuer.", "configuringProtection": "OpenSquilla termine la configuration du mode sûr. Gardez l’application ouverte.", "takingLonger": "La première configuration peut prendre quelques minutes. La vérification se lancera automatiquement.", "elapsed": "{seconds} s écoulées", "cancelled": "Configuration annulée. L’accès complet reste inchangé ; vous pouvez réessayer.",
-        "failed": "Le mode sûr n’a pas pu être configuré. L’accès complet reste inchangé.", "verificationFailed": "La configuration est terminée, mais la vérification de sécurité a échoué. L’accès complet reste inchangé.",
-        "runInBackground": "Configurer en arrière-plan", "readyToast": "Le mode sûr est prêt.", "failedToast": "La configuration du mode sûr n’a pas pu se terminer. Réessayez depuis le mode sûr."
+        "title": "Configurer le mode sûr",
+        "description": "OpenSquilla a besoin d’une autorisation administrateur pour créer un compte isolé et configurer la protection des fichiers et du réseau.",
+        "descriptionWithDuration": "OpenSquilla a besoin d’une autorisation administrateur pour créer un compte isolé et configurer les protections. La première configuration prend généralement environ 20 à 30 secondes. Gardez OpenSquilla ouvert.",
+        "continue": "Continuer",
+        "configuring": "Configuration…",
+        "requestingApproval": "Confirmez l’invite Windows pour continuer.",
+        "configuringProtection": "OpenSquilla termine la configuration du mode sûr. Gardez l’application ouverte.",
+        "takingLonger": "La première configuration peut prendre quelques minutes. La vérification se lancera automatiquement.",
+        "elapsed": "{seconds} s écoulées",
+        "cancelled": "Configuration annulée. L’accès complet reste inchangé ; vous pouvez réessayer.",
+        "failed": "Le mode sûr n’a pas pu être configuré. L’accès complet reste inchangé.",
+        "verificationFailed": "La configuration est terminée, mais la vérification de sécurité a échoué. L’accès complet reste inchangé.",
+        "runInBackground": "Configurer en arrière-plan",
+        "readyToast": "Le mode sûr est prêt.",
+        "failedToast": "La configuration du mode sûr n’a pas pu se terminer. Réessayez depuis le mode sûr."
       },
       "files": {
-        "title": "Sécurité des fichiers", "description": "Les fichiers ordinaires sont lisibles. Les mutations des chemins protégés exigent une approbation.", "readsAllowed": "Lecture autorisée",
-        "customPath": "Chemin protégé personnalisé", "pathPlaceholder": "Ajouter un chemin protégé", "backupTitle": "Sauvegarder avant les modifications destructrices",
-        "backupDescription": "Crée des copies récupérables avant de supprimer ou modifier des fichiers existants et efface automatiquement les plus anciennes si nécessaire.", "quota": "Limite des sauvegardes",
+        "title": "Sécurité des fichiers",
+        "description": "Les fichiers ordinaires sont lisibles. Les mutations des chemins protégés exigent une approbation.",
+        "readsAllowed": "Lecture autorisée",
+        "customPath": "Chemin protégé personnalisé",
+        "pathPlaceholder": "Ajouter un chemin protégé",
+        "backupTitle": "Sauvegarder avant les modifications destructrices",
+        "backupDescription": "Crée des copies récupérables avant de supprimer ou modifier des fichiers existants et efface automatiquement les plus anciennes si nécessaire.",
+        "quota": "Limite des sauvegardes",
         "recursiveWarning": "Sans sauvegarde, une suppression ou un remplacement peut être irrécupérable. Si la sauvegarde échoue encore après le nettoyage, OpenSquilla demande une nouvelle confirmation."
       },
       "commands": {
-        "title": "Sécurité des commandes", "description": "Les commandes s'exécutent automatiquement ; les opérations comme git push exigent une approbation.",
-        "systemTools": "Outils système", "systemToolsAuto": "Autoriser automatiquement", "systemToolsPrompt": "Demander avant", "systemToolsDisabled": "Désactivé",
-        "approvalPrefixes": "Préfixes exigeant une approbation", "autoPrefixes": "Préfixes toujours autorisés", "prefixPlaceholder": "Par exemple : git push"
+        "title": "Sécurité des commandes",
+        "description": "Les commandes s'exécutent automatiquement ; les opérations comme git push exigent une approbation.",
+        "systemTools": "Outils système",
+        "systemToolsAuto": "Autoriser automatiquement",
+        "systemToolsPrompt": "Demander avant",
+        "systemToolsDisabled": "Désactivé",
+        "approvalPrefixes": "Préfixes exigeant une approbation",
+        "autoPrefixes": "Préfixes toujours autorisés",
+        "prefixPlaceholder": "Par exemple : git push"
       },
       "network": {
-        "title": "Sécurité réseau", "description": "Le réseau public est autorisé par défaut, avec les protections SSRF et métadonnées.",
-        "blockAll": "Bloquer tout le réseau", "blockAllDescription": "Les domaines autorisés restent des exceptions.", "allowDomains": "Domaines autorisés", "denyDomains": "Domaines refusés"
+        "title": "Sécurité réseau",
+        "description": "Le réseau public est autorisé par défaut, avec les protections SSRF et métadonnées.",
+        "blockAll": "Bloquer tout le réseau",
+        "blockAllDescription": "Les domaines autorisés restent des exceptions.",
+        "allowDomains": "Domaines autorisés",
+        "denyDomains": "Domaines refusés"
       },
       "runtimes": {
-        "title": "Paquets d'exécution", "description": "Les téléchargements sont activés automatiquement. Sûr les privilégie ; Accès complet conserve la priorité aux outils de l'hôte.", "target": "Cible d'exécution",
-        "allowRuntime": "Autoriser {runtime}", "progress": "Téléchargement de {runtime} : {progress}%",
+        "title": "Paquets d'exécution",
+        "description": "Les téléchargements sont activés automatiquement. Sûr les privilégie ; Accès complet conserve la priorité aux outils de l'hôte.",
+        "target": "Cible d'exécution",
+        "allowRuntime": "Autoriser {runtime}",
+        "progress": "Téléchargement de {runtime} : {progress}%",
         "states": {
-          "unknown": "État indisponible", "notInstalled": "Non installé", "disabled": "Non activé", "installed": "Installé", "installedVersion": "Installé · {version}", "updatePaused": "Mise à jour en pause",
-          "unsupported": "Indisponible pour ce système", "corrupt": "Réparation requise", "queued": "En attente de téléchargement", "downloading": "Téléchargement", "downloadingProgress": "Téléchargement · {progress}%",
-          "verifying": "Vérification du téléchargement", "extracting": "Installation", "probing": "Vérification de l'environnement", "activating": "Finalisation de l'installation", "cancelling": "Annulation", "queuedRemoval": "En attente de suppression", "removing": "Suppression",
-          "cancelled": "Téléchargement annulé", "failed": "Échec du téléchargement", "removeFailed": "Échec de la suppression", "removeInterrupted": "Suppression interrompue", "interrupted": "Téléchargement suspendu"
+          "unknown": "État indisponible",
+          "notInstalled": "Non installé",
+          "disabled": "Non activé",
+          "installed": "Installé",
+          "installedVersion": "Installé · {version}",
+          "updatePaused": "Mise à jour en pause",
+          "unsupported": "Indisponible pour ce système",
+          "corrupt": "Réparation requise",
+          "queued": "En attente de téléchargement",
+          "downloading": "Téléchargement",
+          "downloadingProgress": "Téléchargement · {progress}%",
+          "verifying": "Vérification du téléchargement",
+          "extracting": "Installation",
+          "probing": "Vérification de l'environnement",
+          "activating": "Finalisation de l'installation",
+          "cancelling": "Annulation",
+          "queuedRemoval": "En attente de suppression",
+          "removing": "Suppression",
+          "cancelled": "Téléchargement annulé",
+          "failed": "Échec du téléchargement",
+          "removeFailed": "Échec de la suppression",
+          "removeInterrupted": "Suppression interrompue",
+          "interrupted": "Téléchargement suspendu"
         },
-        "actions": { "enable": "Activer", "download": "Télécharger", "cancel": "Annuler", "discardDownload": "Supprimer le téléchargement", "resume": "Reprendre", "retry": "Réessayer", "repair": "Réparer", "remove": "Supprimer", "retryRemove": "Réessayer la suppression" },
-        "sources": { "oss": "OSS de Pékin", "github": "Versions GitHub" }
+        "actions": {
+          "enable": "Activer",
+          "download": "Télécharger",
+          "cancel": "Annuler",
+          "discardDownload": "Supprimer le téléchargement",
+          "resume": "Reprendre",
+          "retry": "Réessayer",
+          "repair": "Réparer",
+          "remove": "Supprimer",
+          "retryRemove": "Réessayer la suppression"
+        },
+        "sources": {
+          "oss": "OSS de Pékin",
+          "github": "Versions GitHub"
+        }
       },
       "lan": {
-        "listen": "Écouter sur le réseau local", "listenDescription": "Lie toutes les interfaces locales après redémarrage ; les pairs publics restent refusés.",
-        "allowedCidrs": "CIDR clients autorisés", "cidrDescription": "Facultatif. Vide autorise loopback, RFC1918 et IPv6 ULA ; les entrées ne peuvent que réduire cette plage.",
+        "listen": "Écouter sur le réseau local",
+        "listenDescription": "Lie toutes les interfaces locales après redémarrage ; les pairs publics restent refusés.",
+        "allowedCidrs": "CIDR clients autorisés",
+        "cidrDescription": "Facultatif. Vide autorise loopback, RFC1918 et IPv6 ULA ; les entrées ne peuvent que réduire cette plage.",
         "restartRequired": "Redémarrez OpenSquilla pour appliquer la modification.",
-        "title": "Accès Web et jetons nommés", "description": "L'accès Web distant sans jeton valide utilise le mode sûr invité ; les jetons nommés accordent les droits configurés.",
-        "guest": "Jeton absent ou incorrect :", "guestDescription": " mode sûr invité : les fichiers ordinaires sont lisibles, seul l'espace de travail par défaut est modifiable et les identifiants sont illisibles.",
-        "authenticated": "Jeton valide :", "authenticatedDescription": " peut utiliser Sûr ou Accès complet selon ses capacités.",
-        "tokenName": "Nom du jeton, par ex. Portable", "hostExecute": "Autoriser l'hôte / Accès complet", "createToken": "Créer le jeton",
-        "copyNow": "Copiez-le maintenant. Il ne sera plus affiché.", "fullCapable": "Sûr et Accès complet", "safeOnly": "Sûr uniquement", "revoke": "Révoquer"
+        "title": "Accès Web et jetons nommés",
+        "description": "L'accès Web distant sans jeton valide utilise le mode sûr invité ; les jetons nommés accordent les droits configurés.",
+        "guest": "Jeton absent ou incorrect :",
+        "guestDescription": " mode sûr invité : les fichiers ordinaires sont lisibles, seul l'espace de travail par défaut est modifiable et les identifiants sont illisibles.",
+        "authenticated": "Jeton valide :",
+        "authenticatedDescription": " peut utiliser Sûr ou Accès complet selon ses capacités.",
+        "tokenName": "Nom du jeton, par ex. Portable",
+        "hostExecute": "Autoriser l'hôte / Accès complet",
+        "createToken": "Créer le jeton",
+        "copyNow": "Copiez-le maintenant. Il ne sera plus affiché.",
+        "fullCapable": "Sûr et Accès complet",
+        "safeOnly": "Sûr uniquement",
+        "revoke": "Révoquer"
       }
     },
     "dialog": {
@@ -2541,15 +2684,60 @@
       "galleryEyebrow": "MODÈLES D’AUTOMATISATION",
       "bulkDeleteConfirm": "Supprimer les {count} automatisations sélectionnées ? Cette action est irréversible.",
       "templates": {
-        "ai-daily": { "title": "Brief quotidien sur l’IA", "description": "Résume les actualités IA importantes des dernières 24 heures avec des sources vérifiées.", "category": "Actualités", "schedule": "Chaque jour à 08:00" },
-        "weekly-report": { "title": "Bilan de travail hebdomadaire", "description": "Résume les progrès, risques, livrables et priorités de la semaine suivante.", "category": "Productivité", "schedule": "Vendredi à 17:30" },
-        "english-five": { "title": "Cinq mots anglais par jour", "description": "Crée une leçon de vocabulaire légère avec exemples et petit quiz.", "category": "Apprentissage", "schedule": "Chaque jour à 09:00" },
-        "project-risk": { "title": "Contrôle des risques projet", "description": "Examine les retards, erreurs et problèmes ouverts, puis propose des actions.", "category": "Projets", "schedule": "En semaine à 10:00" },
-        "knowledge-review": { "title": "Revue hebdomadaire des connaissances", "description": "Organise les nouvelles notes et réunions et prépare une liste de suivi.", "category": "Connaissances", "schedule": "Dimanche à 18:00" },
-        "daily-idea": { "title": "Idée et anecdote du jour", "description": "Partage un fait fiable et une petite idée concrète.", "category": "Mode de vie", "schedule": "Chaque jour à 12:00" },
-        "bedtime-story": { "title": "Histoire du soir quotidienne", "description": "Écrit une histoire courte, chaleureuse et imaginative à lire en famille.", "category": "Famille", "schedule": "Chaque jour à 20:30" },
-        "classic-movie": { "title": "Recommandation de film classique", "description": "Recommande un grand classique avec une introduction sans divulgâcher.", "category": "Divertissement", "schedule": "Samedi à 19:00" },
-        "today-in-history": { "title": "Aujourd’hui dans l’histoire", "description": "Présente un événement historique fiable lié aux sciences, à la culture ou à la société.", "category": "Culture quotidienne", "schedule": "Chaque jour à 08:30" }
+        "ai-daily": {
+          "title": "Brief quotidien sur l’IA",
+          "description": "Résume les actualités IA importantes des dernières 24 heures avec des sources vérifiées.",
+          "category": "Actualités",
+          "schedule": "Chaque jour à 08:00"
+        },
+        "weekly-report": {
+          "title": "Bilan de travail hebdomadaire",
+          "description": "Résume les progrès, risques, livrables et priorités de la semaine suivante.",
+          "category": "Productivité",
+          "schedule": "Vendredi à 17:30"
+        },
+        "english-five": {
+          "title": "Cinq mots anglais par jour",
+          "description": "Crée une leçon de vocabulaire légère avec exemples et petit quiz.",
+          "category": "Apprentissage",
+          "schedule": "Chaque jour à 09:00"
+        },
+        "project-risk": {
+          "title": "Contrôle des risques projet",
+          "description": "Examine les retards, erreurs et problèmes ouverts, puis propose des actions.",
+          "category": "Projets",
+          "schedule": "En semaine à 10:00"
+        },
+        "knowledge-review": {
+          "title": "Revue hebdomadaire des connaissances",
+          "description": "Organise les nouvelles notes et réunions et prépare une liste de suivi.",
+          "category": "Connaissances",
+          "schedule": "Dimanche à 18:00"
+        },
+        "daily-idea": {
+          "title": "Idée et anecdote du jour",
+          "description": "Partage un fait fiable et une petite idée concrète.",
+          "category": "Mode de vie",
+          "schedule": "Chaque jour à 12:00"
+        },
+        "bedtime-story": {
+          "title": "Histoire du soir quotidienne",
+          "description": "Écrit une histoire courte, chaleureuse et imaginative à lire en famille.",
+          "category": "Famille",
+          "schedule": "Chaque jour à 20:30"
+        },
+        "classic-movie": {
+          "title": "Recommandation de film classique",
+          "description": "Recommande un grand classique avec une introduction sans divulgâcher.",
+          "category": "Divertissement",
+          "schedule": "Samedi à 19:00"
+        },
+        "today-in-history": {
+          "title": "Aujourd’hui dans l’histoire",
+          "description": "Présente un événement historique fiable lié aux sciences, à la culture ou à la société.",
+          "category": "Culture quotidienne",
+          "schedule": "Chaque jour à 08:30"
+        }
       }
     },
     "deleteDialog": {
@@ -2671,39 +2859,39 @@
       "fdChannel": "Un canal",
       "fdWebhook": "Un webhook",
       "enabled": "Activé",
-      "saveSchedule": "Enregistrer la planification"
-      ,"friendlyNamePlaceholder": "Exemple : Organiser les retours clients chaque jour"
-      ,"friendlyTypeCron": "Répéter à une heure définie"
-      ,"friendlyTypeEvery": "Répéter à intervalle fixe"
-      ,"friendlyTypeAt": "Exécuter une seule fois"
-      ,"executionFrequency": "Fréquence"
-      ,"daily": "Chaque jour"
-      ,"weekdays": "Jours ouvrés"
-      ,"weekly": "Chaque semaine"
-      ,"monthly": "Chaque mois"
-      ,"customAdvancedTime": "Planification avancée"
-      ,"weekday": "Jour de la semaine"
-      ,"date": "Date"
-      ,"monthlyDay": "Le {day} de chaque mois"
-      ,"specificTime": "Heure"
-      ,"customTimeHint": "Utilisez une règle horaire plus flexible."
-      ,"openAdvancedTime": "Ouvrir la planification avancée"
-      ,"everyHowOften": "Répéter toutes les"
-      ,"timeUnit": "Unité de temps"
-      ,"minutes": "Minutes"
-      ,"hours": "Heures"
-      ,"days": "Jours"
-      ,"dateAndTime": "Date et heure"
-      ,"friendlyMessagePlaceholder": "Exemple : Résumer les retours clients du jour et proposer les prochaines étapes"
-      ,"moreRuntimeSettings": "Autres paramètres d’exécution (facultatif)"
-      ,"advancedTimeHint": "À utiliser uniquement si le sélecteur ci-dessus ne suffit pas."
-      ,"timezoneSimpleHint": "Il n’est généralement pas nécessaire de modifier ce réglage."
-      ,"projectWorkspace": "Espace de travail du projet"
-      ,"defaultWorkspace": "Utiliser l’espace de travail par défaut"
-      ,"noWorkspace": "Aucun espace de projet"
-      ,"workspaceUnavailable": "{name} (indisponible)"
-      ,"workspaceRequiredHint": "Choisissez le projet à examiner. La tâche travaillera uniquement dans ce projet."
-      ,"workspaceOptionalHint": "Facultatif. Choisissez « Aucun espace de projet » pour une tâche générale, ou un projet si ses fichiers sont nécessaires."
+      "saveSchedule": "Enregistrer la planification",
+      "friendlyNamePlaceholder": "Exemple : Organiser les retours clients chaque jour",
+      "friendlyTypeCron": "Répéter à une heure définie",
+      "friendlyTypeEvery": "Répéter à intervalle fixe",
+      "friendlyTypeAt": "Exécuter une seule fois",
+      "executionFrequency": "Fréquence",
+      "daily": "Chaque jour",
+      "weekdays": "Jours ouvrés",
+      "weekly": "Chaque semaine",
+      "monthly": "Chaque mois",
+      "customAdvancedTime": "Planification avancée",
+      "weekday": "Jour de la semaine",
+      "date": "Date",
+      "monthlyDay": "Le {day} de chaque mois",
+      "specificTime": "Heure",
+      "customTimeHint": "Utilisez une règle horaire plus flexible.",
+      "openAdvancedTime": "Ouvrir la planification avancée",
+      "everyHowOften": "Répéter toutes les",
+      "timeUnit": "Unité de temps",
+      "minutes": "Minutes",
+      "hours": "Heures",
+      "days": "Jours",
+      "dateAndTime": "Date et heure",
+      "friendlyMessagePlaceholder": "Exemple : Résumer les retours clients du jour et proposer les prochaines étapes",
+      "moreRuntimeSettings": "Autres paramètres d’exécution (facultatif)",
+      "advancedTimeHint": "À utiliser uniquement si le sélecteur ci-dessus ne suffit pas.",
+      "timezoneSimpleHint": "Il n’est généralement pas nécessaire de modifier ce réglage.",
+      "projectWorkspace": "Espace de travail du projet",
+      "defaultWorkspace": "Utiliser l’espace de travail par défaut",
+      "noWorkspace": "Aucun espace de projet",
+      "workspaceUnavailable": "{name} (indisponible)",
+      "workspaceRequiredHint": "Choisissez le projet à examiner. La tâche travaillera uniquement dans ce projet.",
+      "workspaceOptionalHint": "Facultatif. Choisissez « Aucun espace de projet » pour une tâche générale, ou un projet si ses fichiers sont nécessaires."
     },
     "form": {
       "cronPreviewPlaceholder": "Saisissez une expression cron à 5 champs pour la prévisualiser",
@@ -3338,9 +3526,18 @@
       "planTitle": "Plan de maintien",
       "planSummary": "Environ toutes les {interval} min · jusqu’à {count} requêtes · pause après {duration} min.",
       "costWarning": "Les requêtes réelles au fournisseur peuvent coûter des tokens ; elles n’apparaissent pas dans la discussion et n’exécutent aucun outil.",
-      "statusLabel": "État", "targetLabel": "Fournisseur / modèle", "lastHitLabel": "Derniers tokens en cache",
+      "statusLabel": "État",
+      "targetLabel": "Fournisseur / modèle",
+      "lastHitLabel": "Derniers tokens en cache",
       "autoPauseLabel": "Pause automatique",
-      "states": { "off": "Désactivé", "waiting": "En attente d'un préfixe stable", "scheduled": "Planifié", "probing": "Sonde en cours", "paused": "Limite d'inactivité atteinte ; attente du prochain message", "stopped": "Arrêté après échec" }
+      "states": {
+        "off": "Désactivé",
+        "waiting": "En attente d'un préfixe stable",
+        "scheduled": "Planifié",
+        "probing": "Sonde en cours",
+        "paused": "Limite d'inactivité atteinte ; attente du prochain message",
+        "stopped": "Arrêté après échec"
+      }
     },
     "send": "Envoyer",
     "sendQueues": "Envoyer (mise en file après la réponse actuelle)",
@@ -3351,18 +3548,57 @@
     "stoppingResponse": "Arrêt sécurisé en cours… Les nouveaux messages seront mis en file.",
     "messageToSend": "Message à envoyer",
     "promptAnnotations": {
-      "label": "Annotations", "draftLabel": "Annotations de page en attente", "sentLabel": "Annotations de page", "element": "Zone sélectionnée",
+      "label": "Annotations",
+      "draftLabel": "Annotations de page en attente",
+      "sentLabel": "Annotations de page",
+      "element": "Zone sélectionnée",
       "targetLabel": "{kind} : {text}",
-      "targetKinds": { "heading": "Titre", "button": "Bouton", "link": "Lien", "image": "Image", "input": "Champ", "form": "Formulaire", "section": "Section", "list": "Liste", "table": "Tableau", "text": "Texte", "region": "Zone", "element": "Zone sélectionnée" },
-      "emptyDraft": "Ajouter une instruction", "stale": "Cette zone est introuvable sur la page actuelle",
+      "targetKinds": {
+        "heading": "Titre",
+        "button": "Bouton",
+        "link": "Lien",
+        "image": "Image",
+        "input": "Champ",
+        "form": "Formulaire",
+        "section": "Section",
+        "list": "Liste",
+        "table": "Tableau",
+        "text": "Texte",
+        "region": "Zone",
+        "element": "Zone sélectionnée"
+      },
+      "emptyDraft": "Ajouter une instruction",
+      "stale": "Cette zone est introuvable sur la page actuelle",
       "editingBlocked": "Ajoutez ou annulez l’annotation en cours de modification avant d’envoyer.",
       "staleBlocked": "Cette zone est introuvable sur la page actuelle. Vous pouvez tout de même l’envoyer à l’IA.",
-      "emptyBlocked": "Terminez chaque instruction d’artefact.", "tooLongBlocked": "Réduisez les instructions à 16 Kio de texte UTF-8 avant l’envoi.", "editLabel": "Modifier l’instruction d’artefact",
-      "removeLabel": "Supprimer l’instruction d’artefact", "updateFailed": "L’instruction d’artefact n’a pas pu être enregistrée.",
-      "discardFailed": "L’instruction d’artefact n’a pas pu être supprimée.", "focusUnavailable": "Cette zone est introuvable sur la page actuelle. Vous pouvez tout de même l’envoyer à l’IA.",
-      "reuseLabel": "Copier comme nouvelle annotation", "reuseDescription": "Copie la demande de modification ; choisissez ensuite sa cible sur la page.", "reuseUnavailable": "Cette demande de modification n’a pas pu être copiée. Ouvrez la page correspondante et choisissez sa cible.", "applyPrompt": "Appliquez les annotations de page jointes.",
-      "status": { "unknown": "La page n’a pas pu être mise à jour", "not_attempted": "La page n’a pas pu être mise à jour", "applied": "Page mise à jour", "appliedCorrected": "Page mise à jour", "not_applied": "La page n’a pas pu être mise à jour", "conflict": "La page n’a pas pu être mise à jour", "ambiguous": "Vérification de la mise à jour" },
-      "statusDetail": { "unknown": "Ouvrez la page pour vérifier.", "not_attempted": "La page n’a pas été mise à jour.", "applied": "", "not_applied": "Réessayez.", "conflict": "Ouvrez la page et réessayez.", "ambiguous": "Ouvrez la page pour vérifier avant de réessayer." }
+      "emptyBlocked": "Terminez chaque instruction d’artefact.",
+      "tooLongBlocked": "Réduisez les instructions à 16 Kio de texte UTF-8 avant l’envoi.",
+      "editLabel": "Modifier l’instruction d’artefact",
+      "removeLabel": "Supprimer l’instruction d’artefact",
+      "updateFailed": "L’instruction d’artefact n’a pas pu être enregistrée.",
+      "discardFailed": "L’instruction d’artefact n’a pas pu être supprimée.",
+      "focusUnavailable": "Cette zone est introuvable sur la page actuelle. Vous pouvez tout de même l’envoyer à l’IA.",
+      "reuseLabel": "Copier comme nouvelle annotation",
+      "reuseDescription": "Copie la demande de modification ; choisissez ensuite sa cible sur la page.",
+      "reuseUnavailable": "Cette demande de modification n’a pas pu être copiée. Ouvrez la page correspondante et choisissez sa cible.",
+      "applyPrompt": "Appliquez les annotations de page jointes.",
+      "status": {
+        "unknown": "La page n’a pas pu être mise à jour",
+        "not_attempted": "La page n’a pas pu être mise à jour",
+        "applied": "Page mise à jour",
+        "appliedCorrected": "Page mise à jour",
+        "not_applied": "La page n’a pas pu être mise à jour",
+        "conflict": "La page n’a pas pu être mise à jour",
+        "ambiguous": "Vérification de la mise à jour"
+      },
+      "statusDetail": {
+        "unknown": "Ouvrez la page pour vérifier.",
+        "not_attempted": "La page n’a pas été mise à jour.",
+        "applied": "",
+        "not_applied": "Réessayez.",
+        "conflict": "Ouvrez la page et réessayez.",
+        "ambiguous": "Ouvrez la page pour vérifier avant de réessayer."
+      }
     },
     "placeholder": "Envoyer un message...",
     "placeholderCompact": "Message...",
@@ -3460,7 +3696,7 @@
     "audioUnsupported": "Ce navigateur ne peut pas lire ce format audio. Téléchargez plutôt le fichier.",
     "playVideo": "Lire la vidéo",
     "videoLoadFailed": "Impossible de charger la vidéo.",
-    "videoUnsupported": "Ce navigateur ne peut pas lire ce format vidéo. Téléchargez plutôt le fichier.",
+    "videoUnsupported": "Ce navigateur ne peut pas lire cette vidéo. Téléchargez-la à la place.",
     "previewOf": "Aperçu : {title}",
     "closePreview": "Fermer l'aperçu",
     "previousImage": "Image précédente",
@@ -3469,7 +3705,6 @@
     "previewDownload": "Télécharger l'aperçu",
     "previewTimedOut": "L'aperçu a expiré.",
     "previewFailed": "Échec du chargement de l'aperçu.",
-    "videoUnsupported": "Ce navigateur ne peut pas lire cette vidéo. Téléchargez-la à la place.",
     "loadVideoPreview": "Charger l’aperçu vidéo",
     "loadVideoPreviewFor": "Charger l’aperçu vidéo de {title}",
     "videoPreviewLoading": "Chargement de l’aperçu vidéo. Vous pouvez annuler le téléchargement.",
@@ -4380,5 +4615,23 @@
       "copyFailed": "Impossible de copier la commande",
       "copyLabel": "Copier la commande de redémarrage de la passerelle"
     }
+  },
+  "fileTree": {
+    "backToTasks": "Retour aux tâches",
+    "refresh": "Actualiser",
+    "retry": "Réessayer",
+    "empty": "Aucun fichier visible dans cet espace de travail.",
+    "loading": "Chargement des fichiers…",
+    "viewFiles": "Voir les fichiers",
+    "attachToChat": "Joindre au chat",
+    "copyPath": "Copier le chemin",
+    "previewTruncated": "aperçu limité à 1 Mo",
+    "binaryNotPreviewable": "Les fichiers binaires ne peuvent pas être présentés.",
+    "attachTooLarge": "{name} dépasse 1 Mo et ne peut pas être joint depuis l’arborescence.",
+    "attachFailed": "Impossible de joindre {name}.",
+    "attachUnsupported": "{name} n’est pas un fichier texte joignable depuis l’arborescence.",
+    "attached": "{name} ajouté au composeur.",
+    "ctxCopy": "Copier",
+    "ctxAttach": "Ajouter à la conversation"
   }
 }

@@ -815,6 +815,10 @@ import { useArtifactPromptAnnotationsStore } from '@/stores/artifactPromptAnnota
 import { useWorkbenchDocumentContextStore } from '@/stores/workbenchDocumentContext'
 import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
 import { useWorkbenchStore } from '@/workbench/store'
+import {
+  WORKSPACE_FILE_ATTACH_EVENT,
+  type WorkspaceFileAttachDetail,
+} from '@/workbench/workspaceFileAttachEvent'
 import { usePlatform } from '@/platform'
 import { createRpcArtifactPromptAnnotationProvider } from '@/workbench/artifactPromptAnnotationProvider'
 import {
@@ -875,6 +879,7 @@ import { SESSION_ROUTING_KEY, type SessionRouting } from '@/modules/sessionRouti
 import { TURN_COMMANDS_KEY, type TurnCommands } from '@/modules/turnCommands'
 import { APPROVAL_CENTER_KEY, type ApprovalCenter } from '@/modules/approvalCenter'
 import { GOAL_CENTER_KEY, type GoalCenter } from '@/modules/goalCenter'
+import { WORKSPACE_FILES_KEY } from '@/modules/workspaceFiles'
 import { useChatHistory } from '@/composables/chat/useChatHistory'
 import { useChatMarkdownExport } from '@/composables/chat/useChatMarkdownExport'
 import { useChatMessageActions } from '@/composables/chat/useChatMessageActions'
@@ -1198,6 +1203,9 @@ const approvalCenter: ApprovalCenter = injectedApprovalCenter
 const injectedGoalCenter = inject(GOAL_CENTER_KEY)
 if (!injectedGoalCenter) throw new Error('GoalCenter was not provided')
 const goalCenter: GoalCenter = injectedGoalCenter
+// Read-only workspace file access is optional here: only the file-attach
+// flow needs it, and drafts without a workspace never touch it.
+const workspaceFiles = inject(WORKSPACE_FILES_KEY, null)
 
 async function resolveCreatedSessionAvailability(sessionKey: string): Promise<boolean> {
   try {
@@ -6557,6 +6565,52 @@ function bindBottomIntersectionObserver() {
   bottomIntersectionObserver.observe(sentinel)
 }
 
+function onWorkspaceFileAttach(event: Event) {
+  const detail = (event as CustomEvent<WorkspaceFileAttachDetail>).detail
+  if (!detail?.workspaceId || !detail.path) return
+  void attachWorkspaceFileToComposer(detail)
+}
+
+async function attachWorkspaceFileToComposer(detail: WorkspaceFileAttachDetail) {
+  // Bounded content reads can truncate; the attachment pipeline must never
+  // silently stage a partial file.
+  const contentCap = 1 * 1024 * 1024
+  if (typeof detail.size === 'number' && detail.size > contentCap) {
+    pushToast(t('fileTree.attachTooLarge', { name: detail.name }), { tone: 'warn' })
+    return
+  }
+  // An inline payload (editor selection snippet) skips the content API —
+  // fetching would return the whole file, not the selected slice.
+  if (typeof detail.content === 'string') {
+    const snippet = new Blob([detail.content], { type: 'text/plain' })
+    if (snippet.size > contentCap) {
+      pushToast(t('fileTree.attachTooLarge', { name: detail.name }), { tone: 'warn' })
+      return
+    }
+    const file = new File([snippet], detail.name, { type: 'text/plain' })
+    await addAttachments([file])
+    pushToast(t('fileTree.attached', { name: detail.name }), { tone: 'info' })
+    return
+  }
+  if (!workspaceFiles) {
+    pushToast(t('fileTree.attachFailed', { name: detail.name }), { tone: 'warn' })
+    return
+  }
+  try {
+    const body = await workspaceFiles.readFile(detail.workspaceId, detail.path)
+    if (body.binary || body.truncated || body.content === null) {
+      pushToast(t('fileTree.attachUnsupported', { name: detail.name }), { tone: 'warn' })
+      return
+    }
+    const blob = new Blob([body.content], { type: 'text/plain' })
+    const file = new File([blob], detail.name, { type: 'text/plain' })
+    await addAttachments([file])
+    pushToast(t('fileTree.attached', { name: detail.name }), { tone: 'info' })
+  } catch {
+    pushToast(t('fileTree.attachFailed', { name: detail.name }), { tone: 'warn' })
+  }
+}
+
 onMounted(async () => {
   chatViewActive = true
   chatViewDisposed = false
@@ -6564,6 +6618,7 @@ onMounted(async () => {
   // source-less pointer marker from leaking into a later navigation gesture.
   window.addEventListener('pointerup', onThreadPointerEnd)
   window.addEventListener('pointercancel', onThreadPointerEnd)
+  window.addEventListener(WORKSPACE_FILE_ATTACH_EVENT, onWorkspaceFileAttach)
   bindBottomIntersectionObserver()
   const initialRouteFullPath = route.fullPath
   const initialHistoryState = window.history.state as Record<string, unknown> | null
@@ -6773,6 +6828,7 @@ watch(
 onUnmounted(() => {
   window.removeEventListener('pointerup', onThreadPointerEnd)
   window.removeEventListener('pointercancel', onThreadPointerEnd)
+  window.removeEventListener(WORKSPACE_FILE_ATTACH_EVENT, onWorkspaceFileAttach)
   chatRouteHeaderRegistration.release()
   chatViewActive = false
   appStore.setChatLivePhase('idle')

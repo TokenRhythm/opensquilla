@@ -10,6 +10,7 @@
     :close-item-label="t('workbench.closeItem')"
     :resize-label="t('workbench.resize')"
     :pixels-label="t('workbench.pixels')"
+    :tab-overflow-label="t('workbench.tabOverflow')"
     :before-close-item="beforeCloseItem"
     @collapsed="restoreWorkbenchFocus"
     @emptied="restoreWorkbenchFocus"
@@ -263,6 +264,7 @@ import type {
 } from '@/workbench/types'
 import { createArtifactWorkbenchDefinitions } from './artifactWorkbenchProvider'
 import { createBrowserWorkbenchDefinition } from './browserWorkbenchProvider'
+import { createWorkspaceFileWorkbenchDefinition } from './workspaceFileWorkbenchProvider'
 import { createWorkbenchResourceCollectionDefinition } from './workbenchResourceCollectionProvider'
 import WorkbenchHost from './WorkbenchHost.vue'
 import { fetchArtifactBlob } from '@/utils/chat/artifactAccess'
@@ -453,6 +455,7 @@ workbenchPanelRegistry.register(createBrowserWorkbenchDefinition({
   platform,
   t: (key, params) => String(t(key, params || {})),
 }), { replace: true })
+workbenchPanelRegistry.register(createWorkspaceFileWorkbenchDefinition(), { replace: true })
 detachRuntime = attachWorkbenchRuntime(store, runtimeManager)
 const promptAnnotationAcceptanceQueue = new PromptAnnotationAcceptanceQueue()
 let promptAnnotationAcceptanceFlush: Promise<void> | null = null

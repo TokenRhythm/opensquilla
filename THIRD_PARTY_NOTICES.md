@@ -3,6 +3,10 @@
 This file records third-party attribution for assets bundled with OpenSquilla.
 It covers:
 
+- The workspace file-tree features in `opensquilla-webui/` (file tree model,
+  lazy per-directory loading store, and virtualized row layout), which are
+  adapted from anomalyco/opencode (MIT) — see the section below.
+
 - The bundled skill descriptors under `src/opensquilla/skills/bundled/`, which
   include OpenClaw-derived MIT descriptors and OpenSquilla-original descriptors.
 - The bundled pptx skill references the python-pptx and PptxGenJS libraries;
@@ -648,3 +652,38 @@ The SquillaRouter bundle contains `.pkl` and `.joblib` artifacts used by the
 current V4 Phase 3 runtime. Treat these artifacts as executable-code-equivalent
 inputs: load only assets shipped with a trusted OpenSquilla release or assets
 whose checksums match `artifact_manifest.json`.
+
+## Workspace File Tree (adapted from anomalyco/opencode)
+
+The Web UI's workspace file-tree model, virtualized row layout, and lazy
+per-directory loading store are adapted (re-implemented for Vue 3 / Pinia and
+OpenSquilla types) from [anomalyco/opencode](https://github.com/anomalyco/opencode),
+MIT License, Copyright (c) 2025 opencode:
+
+- `opensquilla-webui/src/lib/fileTreeModel.ts` ← `packages/app/src/components/file-tree-v2-model.ts`
+- `opensquilla-webui/src/stores/fileTree.ts` ← `packages/app/src/context/file/tree-store.ts`
+- `opensquilla-webui/src/components/SidebarFileTree.vue` ← `packages/app/src/components/file-tree-v2.tsx` (render approach)
+
+Full MIT license text:
+
+    MIT License
+
+    Copyright (c) 2025 opencode
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.

@@ -107,6 +107,39 @@ describe('workbench store', () => {
     expect(store.activeItemId).toBe('preview-new')
   })
 
+  it('evicts workspace file panels at the same bounded limit', () => {
+    // Every keep-alive file panel holds a live Monaco editor, so the bound
+    // that caps artifact previews must cap file tabs too.
+    const store = useWorkbenchStore()
+    const disposed: string[] = []
+    store.onLifecycle(event => {
+      if (event.type === 'dispose') {
+        disposed.push(`${event.item.id}:${event.reason}`)
+      }
+    })
+    const fileItem = (id: string): WorkbenchItem => ({
+      id: `ws-file:ws-1:${id}`,
+      kind: 'file',
+      title: id,
+      scope: { type: 'workspace', id: 'ws-1' },
+      hostKind: 'dom',
+      retention: 'keep-alive',
+      payload: { workspaceId: 'ws-1', path: id },
+    })
+
+    for (let index = 0; index < WORKBENCH_PREVIEW_ITEM_LIMIT; index += 1) {
+      store.openItem(fileItem(`f${index}.md`))
+    }
+    store.activateItem('ws-file:ws-1:f0.md')
+    store.openItem(fileItem('f-new.md'))
+
+    expect(store.items).toHaveLength(WORKBENCH_PREVIEW_ITEM_LIMIT)
+    expect(store.items.some(candidate => candidate.id === 'ws-file:ws-1:f0.md')).toBe(true)
+    expect(store.items.some(candidate => candidate.id === 'ws-file:ws-1:f1.md')).toBe(false)
+    expect(disposed).toContain('ws-file:ws-1:f1.md:evicted')
+    expect(store.activeItemId).toBe('ws-file:ws-1:f-new.md')
+  })
+
   it('refuses a ninth native surface without evicting a hidden item', () => {
     const store = useWorkbenchStore()
     const nativeItem = (id: string): WorkbenchItem => ({

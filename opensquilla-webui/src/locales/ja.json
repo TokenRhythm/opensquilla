@@ -146,12 +146,36 @@
     "empty": "この項目には利用できるプレビューがありません。",
     "itemLimitReached": "隔離プレビューが 8 件開いています。別のプレビューを開く前に 1 件閉じてください。",
     "resources": {
-      "title": "ファイル", "count": "ファイル（{count}）", "empty": "ファイルまたはリンクはまだありません。",
-      "groups": { "files": "ファイル", "links": "リンク", "attachments": "ファイル", "documents": "ファイル", "deliverables": "ファイル", "urls": "リンク" },
-      "open": "{name} を開く", "preparing": "エディターを準備しています…", "retry": "再試行", "preview": "{name} をプレビュー", "download": "{name} をダウンロード", "edit": "{name} のコピーを編集", "publish": "{name} を公開",
-      "imported": "{name} を編集できます。", "published": "{name} を共有できます。",
-      "publishUnavailable": "このドキュメントには公開可能な現在のリビジョンがありません。", "actionFailed": "ワークベンチ操作に失敗しました。",
-      "unavailableReasons": { "htmlEncodingUnsupported": "この HTML は有効な UTF-8 ではないため、安全にプレビューまたは編集できません。", "htmlValidationFailed": "この HTML は安全なプレビューまたは編集の検証に失敗しました。", "htmlEditTooLarge": "この HTML はアプリ内で編集するには大きすぎます。ダウンロードは引き続き可能です。", "htmlPreviewTooLarge": "この HTML はアプリ内で安全にプレビューするには大きすぎます。ダウンロードは引き続き可能です。", "officeAdapterNotAvailable": "Office の編集機能はまだ利用できません。", "unsupported": "この操作はこのリソースでは利用できません。" }
+      "title": "ファイル",
+      "count": "ファイル（{count}）",
+      "empty": "ファイルまたはリンクはまだありません。",
+      "groups": {
+        "files": "ファイル",
+        "links": "リンク",
+        "attachments": "ファイル",
+        "documents": "ファイル",
+        "deliverables": "ファイル",
+        "urls": "リンク"
+      },
+      "open": "{name} を開く",
+      "preparing": "エディターを準備しています…",
+      "retry": "再試行",
+      "preview": "{name} をプレビュー",
+      "download": "{name} をダウンロード",
+      "edit": "{name} のコピーを編集",
+      "publish": "{name} を公開",
+      "imported": "{name} を編集できます。",
+      "published": "{name} を共有できます。",
+      "publishUnavailable": "このドキュメントには公開可能な現在のリビジョンがありません。",
+      "actionFailed": "ワークベンチ操作に失敗しました。",
+      "unavailableReasons": {
+        "htmlEncodingUnsupported": "この HTML は有効な UTF-8 ではないため、安全にプレビューまたは編集できません。",
+        "htmlValidationFailed": "この HTML は安全なプレビューまたは編集の検証に失敗しました。",
+        "htmlEditTooLarge": "この HTML はアプリ内で編集するには大きすぎます。ダウンロードは引き続き可能です。",
+        "htmlPreviewTooLarge": "この HTML はアプリ内で安全にプレビューするには大きすぎます。ダウンロードは引き続き可能です。",
+        "officeAdapterNotAvailable": "Office の編集機能はまだ利用できません。",
+        "unsupported": "この操作はこのリソースでは利用できません。"
+      }
     },
     "browser": {
       "back": "戻る",
@@ -166,11 +190,32 @@
       "failedDetail": "隔離ブラウザーを再読み込みして続行してください。"
     },
     "artifactAnnotation": {
-      "start": "プレビューに注釈", "stop": "注釈を終了", "selectElement": "注釈するページ要素を選択", "selectElementShort": "要素を選択", "unavailable": "プレビュー注釈は利用できません。", "desktopEditingOnly": "ページ要素の選択と AI 編集はデスクトップアプリで利用できます。",
-      "createFailed": "選択した要素を添付できませんでした。", "elementChanged": "添付前に選択した要素が変更されました。現在のプレビューでもう一度選択してください。", "rearmFailed": "要素ピッカーを再起動できなかったため、注釈モードを終了しました。もう一度有効にしてください。", "updateFailed": "注釈の下書きを保存できませんでした。", "discardFailed": "注釈を破棄できませんでした。再試行できるよう開いたままにします。", "closeFailed": "注釈エディターを閉じられませんでした。もう一度お試しください。", "replacementCleanupFailed": "新しい注釈は保持されましたが、以前の下書きを削除できませんでした。",
+      "start": "プレビューに注釈",
+      "stop": "注釈を終了",
+      "selectElement": "注釈するページ要素を選択",
+      "selectElementShort": "要素を選択",
+      "unavailable": "プレビュー注釈は利用できません。",
+      "desktopEditingOnly": "ページ要素の選択と AI 編集はデスクトップアプリで利用できます。",
+      "createFailed": "選択した要素を添付できませんでした。",
+      "elementChanged": "添付前に選択した要素が変更されました。現在のプレビューでもう一度選択してください。",
+      "rearmFailed": "要素ピッカーを再起動できなかったため、注釈モードを終了しました。もう一度有効にしてください。",
+      "updateFailed": "注釈の下書きを保存できませんでした。",
+      "discardFailed": "注釈を破棄できませんでした。再試行できるよう開いたままにします。",
+      "closeFailed": "注釈エディターを閉じられませんでした。もう一度お試しください。",
+      "replacementCleanupFailed": "新しい注釈は保持されましたが、以前の下書きを削除できませんでした。",
       "overlayFallback": "以下で注釈を続けてください。",
-      "fallbackTitle": "注釈を続ける", "fallbackDetail": "プレビューは一時的に非表示です。注釈は保持されています。", "frozenPreview": "選択したページ領域のプレビュー",
-      "placeholder": "この領域の変更内容を入力…", "newlineHint": "{shortcut} で改行", "keepDraft": "注釈を保持", "submit": "注釈を追加", "contextLabel": "現在の選択", "bodyLabel": "ページの注釈", "emptyBody": "希望する変更を記入してください。", "reselectHint": "ページ上の対応する領域を選択してください。", "reuseHint": "変更要求をコピーしました。対応する領域を選択してください。"
+      "fallbackTitle": "注釈を続ける",
+      "fallbackDetail": "プレビューは一時的に非表示です。注釈は保持されています。",
+      "frozenPreview": "選択したページ領域のプレビュー",
+      "placeholder": "この領域の変更内容を入力…",
+      "newlineHint": "{shortcut} で改行",
+      "keepDraft": "注釈を保持",
+      "submit": "注釈を追加",
+      "contextLabel": "現在の選択",
+      "bodyLabel": "ページの注釈",
+      "emptyBody": "希望する変更を記入してください。",
+      "reselectHint": "ページ上の対応する領域を選択してください。",
+      "reuseHint": "変更要求をコピーしました。対応する領域を選択してください。"
     },
     "artifactPreview": {
       "refresh": "プレビューを更新",
@@ -292,8 +337,15 @@
       "unsavedSourceCopied": "未保存のソースをコピーしました",
       "copyUnsavedSourceFailed": "未保存のソースをコピーできませんでした。",
       "discardAndLoadLatest": "破棄して最新版を読み込む",
-      "sourceStatus": {"ready":"準備完了","saving":"保存中…","dirty":"未保存","saved":"保存済み","error":"確認が必要"}
-    }
+      "sourceStatus": {
+        "ready": "準備完了",
+        "saving": "保存中…",
+        "dirty": "未保存",
+        "saved": "保存済み",
+        "error": "確認が必要"
+      }
+    },
+    "tabOverflow": "すべてのタブ"
   },
   "nav": {
     "chat": "タスク",
@@ -489,9 +541,18 @@
       "retryFailedTitle": "プレビューを再生成できませんでした",
       "retryFailedDescription": "今回の再生成リクエストは完了しませんでした。以前の結果は採用されておらず、ファイルも変更されていません。再試行するか、インポートを破棄してください。",
       "jobStates": {
-        "cancelled": {"title": "プレビュー生成をキャンセルしました", "description": "隔離された元データは24時間保持されます。再生成では、検証に合格しない結果を1回だけ再試行できるため、モデルを最大2回呼び出し、結果が異なる場合があります。"},
-        "interrupted": {"title": "プレビュー生成が中断されました", "description": "モデル処理中に OpenSquilla が再起動しました。隔離された元データは引き続き利用できます。再生成では内部再試行によりモデルを最大2回呼び出す場合があります。"},
-        "failed": {"title": "プレビュー生成に失敗しました", "description": "この試行では検証済みで確認可能なプレビューを生成できませんでした。インポート判断は採用されず、ファイルも変更されていません。隔離された元データは保持され、再生成ではモデルを最大2回呼び出す場合があります。"}
+        "cancelled": {
+          "title": "プレビュー生成をキャンセルしました",
+          "description": "隔離された元データは24時間保持されます。再生成では、検証に合格しない結果を1回だけ再試行できるため、モデルを最大2回呼び出し、結果が異なる場合があります。"
+        },
+        "interrupted": {
+          "title": "プレビュー生成が中断されました",
+          "description": "モデル処理中に OpenSquilla が再起動しました。隔離された元データは引き続き利用できます。再生成では内部再試行によりモデルを最大2回呼び出す場合があります。"
+        },
+        "failed": {
+          "title": "プレビュー生成に失敗しました",
+          "description": "この試行では検証済みで確認可能なプレビューを生成できませんでした。インポート判断は採用されず、ファイルも変更されていません。隔離された元データは保持され、再生成ではモデルを最大2回呼び出す場合があります。"
+        }
       },
       "modelAnalysisTitle": "モデル分析（ファイル変更と照合してください）",
       "previewTitle": "すべてのファイル変更を確認",
@@ -557,53 +618,135 @@
       "available": "安全モード利用可能",
       "unavailable": "安全モード利用不可",
       "builtin": "組み込み",
-      "actions": { "add": "追加", "remove": "削除", "retry": "再試行", "copy": "コピー", "saving": "保存中…", "redetect": "再検出" },
+      "actions": {
+        "add": "追加",
+        "remove": "削除",
+        "retry": "再試行",
+        "copy": "コピー",
+        "saving": "保存中…",
+        "redetect": "再検出"
+      },
       "mode": {
-        "title": "既定のアクセスモード", "description": "新しいタスクの開始モードを選びます。能力検証に失敗した場合、Safe は選択できません。",
-        "default": "既定モード", "safe": "Safe", "full": "完全アクセス", "resetWarning": "起動時の警告を再表示"
+        "title": "既定のアクセスモード",
+        "description": "新しいタスクの開始モードを選びます。能力検証に失敗した場合、Safe は選択できません。",
+        "default": "既定モード",
+        "safe": "Safe",
+        "full": "完全アクセス",
+        "resetWarning": "起動時の警告を再表示"
       },
       "setup": {
-        "title": "Safe モードを設定", "description": "OpenSquilla は、分離アカウントとファイル・ネットワーク保護を設定するために、一度だけ管理者の承認を必要とします。", "descriptionWithDuration": "OpenSquilla は、分離アカウントと安全保護を設定するために、一度だけ管理者の承認を必要とします。初回設定には通常約 20～30 秒かかります。設定中は OpenSquilla を開いたままにしてください。",
-        "continue": "続ける", "configuring": "設定中…", "requestingApproval": "続行するには、Windows の確認画面で承認してください。", "configuringProtection": "OpenSquilla が Safe モードの設定を完了しています。アプリは開いたままにしてください。", "takingLonger": "初回設定には数分かかる場合があります。確認は自動的に実行されます。", "elapsed": "経過 {seconds} 秒", "cancelled": "設定をキャンセルしました。完全アクセスは変更されていません。いつでも再試行できます。",
-        "failed": "Safe モードを設定できませんでした。完全アクセスは変更されていません。", "verificationFailed": "設定は完了しましたが、安全性の確認に失敗しました。完全アクセスは変更されていません。",
-        "runInBackground": "バックグラウンドで設定", "readyToast": "Safe モードの準備ができました。", "failedToast": "Safe モードの設定を完了できませんでした。Safe モードから再試行してください。"
+        "title": "Safe モードを設定",
+        "description": "OpenSquilla は、分離アカウントとファイル・ネットワーク保護を設定するために、一度だけ管理者の承認を必要とします。",
+        "descriptionWithDuration": "OpenSquilla は、分離アカウントと安全保護を設定するために、一度だけ管理者の承認を必要とします。初回設定には通常約 20～30 秒かかります。設定中は OpenSquilla を開いたままにしてください。",
+        "continue": "続ける",
+        "configuring": "設定中…",
+        "requestingApproval": "続行するには、Windows の確認画面で承認してください。",
+        "configuringProtection": "OpenSquilla が Safe モードの設定を完了しています。アプリは開いたままにしてください。",
+        "takingLonger": "初回設定には数分かかる場合があります。確認は自動的に実行されます。",
+        "elapsed": "経過 {seconds} 秒",
+        "cancelled": "設定をキャンセルしました。完全アクセスは変更されていません。いつでも再試行できます。",
+        "failed": "Safe モードを設定できませんでした。完全アクセスは変更されていません。",
+        "verificationFailed": "設定は完了しましたが、安全性の確認に失敗しました。完全アクセスは変更されていません。",
+        "runInBackground": "バックグラウンドで設定",
+        "readyToast": "Safe モードの準備ができました。",
+        "failedToast": "Safe モードの設定を完了できませんでした。Safe モードから再試行してください。"
       },
       "files": {
-        "title": "ファイル保護", "description": "通常のファイルは読み取り可能です。保護パスの変更には承認が必要です。", "readsAllowed": "読み取り許可",
-        "customPath": "カスタム保護パス", "pathPlaceholder": "保護パスを追加", "backupTitle": "破壊的なファイル変更の前にバックアップ",
-        "backupDescription": "既存ファイルの削除や変更前に復元可能なコピーを作成し、必要に応じて古いバックアップを自動削除します。", "quota": "バックアップ容量上限",
+        "title": "ファイル保護",
+        "description": "通常のファイルは読み取り可能です。保護パスの変更には承認が必要です。",
+        "readsAllowed": "読み取り許可",
+        "customPath": "カスタム保護パス",
+        "pathPlaceholder": "保護パスを追加",
+        "backupTitle": "破壊的なファイル変更の前にバックアップ",
+        "backupDescription": "既存ファイルの削除や変更前に復元可能なコピーを作成し、必要に応じて古いバックアップを自動削除します。",
+        "quota": "バックアップ容量上限",
         "recursiveWarning": "バックアップがない削除や上書きは復元できない場合があります。古いコピーを削除してもバックアップできない場合は、続行前に再確認します。"
       },
       "commands": {
-        "title": "コマンド保護", "description": "コマンドは原則自動実行され、git push など影響の大きい操作だけ承認を求めます。",
-        "systemTools": "システムツール", "systemToolsAuto": "自動許可", "systemToolsPrompt": "事前確認", "systemToolsDisabled": "無効",
-        "approvalPrefixes": "承認が必要なコマンド接頭辞", "autoPrefixes": "常に自動許可する接頭辞", "prefixPlaceholder": "例: git push"
+        "title": "コマンド保護",
+        "description": "コマンドは原則自動実行され、git push など影響の大きい操作だけ承認を求めます。",
+        "systemTools": "システムツール",
+        "systemToolsAuto": "自動許可",
+        "systemToolsPrompt": "事前確認",
+        "systemToolsDisabled": "無効",
+        "approvalPrefixes": "承認が必要なコマンド接頭辞",
+        "autoPrefixes": "常に自動許可する接頭辞",
+        "prefixPlaceholder": "例: git push"
       },
       "network": {
-        "title": "ネットワーク保護", "description": "公開ネットワークは既定で許可し、SSRF とメタデータ保護を維持します。",
-        "blockAll": "すべてのネットワークを遮断", "blockAllDescription": "許可ドメインだけを例外にします。", "allowDomains": "許可ドメイン", "denyDomains": "拒否ドメイン"
+        "title": "ネットワーク保護",
+        "description": "公開ネットワークは既定で許可し、SSRF とメタデータ保護を維持します。",
+        "blockAll": "すべてのネットワークを遮断",
+        "blockAllDescription": "許可ドメインだけを例外にします。",
+        "allowDomains": "許可ドメイン",
+        "denyDomains": "拒否ドメイン"
       },
       "runtimes": {
-        "title": "ランタイムパック", "description": "ダウンロード後は自動的に有効になります。安全モードはインストール済みパックを優先し、フルアクセスはホストツールを優先します。", "target": "ランタイム対象",
-        "allowRuntime": "{runtime} を許可", "progress": "{runtime} のダウンロード：{progress}%",
+        "title": "ランタイムパック",
+        "description": "ダウンロード後は自動的に有効になります。安全モードはインストール済みパックを優先し、フルアクセスはホストツールを優先します。",
+        "target": "ランタイム対象",
+        "allowRuntime": "{runtime} を許可",
+        "progress": "{runtime} のダウンロード：{progress}%",
         "states": {
-          "unknown": "状態を取得できません", "notInstalled": "未インストール", "disabled": "無効", "installed": "インストール済み", "installedVersion": "インストール済み · {version}", "updatePaused": "更新を一時停止",
-          "unsupported": "このシステムでは利用できません", "corrupt": "修復が必要です", "queued": "ダウンロード待ち", "downloading": "ダウンロード中", "downloadingProgress": "ダウンロード中 · {progress}%",
-          "verifying": "ダウンロードを検証中", "extracting": "インストール中", "probing": "ランタイムを確認中", "activating": "インストールを完了中", "cancelling": "キャンセル中", "queuedRemoval": "削除待ち", "removing": "削除中",
-          "cancelled": "ダウンロードをキャンセルしました", "failed": "ダウンロードに失敗しました", "removeFailed": "削除に失敗しました", "removeInterrupted": "削除が中断されました", "interrupted": "ダウンロードを一時停止しました"
+          "unknown": "状態を取得できません",
+          "notInstalled": "未インストール",
+          "disabled": "無効",
+          "installed": "インストール済み",
+          "installedVersion": "インストール済み · {version}",
+          "updatePaused": "更新を一時停止",
+          "unsupported": "このシステムでは利用できません",
+          "corrupt": "修復が必要です",
+          "queued": "ダウンロード待ち",
+          "downloading": "ダウンロード中",
+          "downloadingProgress": "ダウンロード中 · {progress}%",
+          "verifying": "ダウンロードを検証中",
+          "extracting": "インストール中",
+          "probing": "ランタイムを確認中",
+          "activating": "インストールを完了中",
+          "cancelling": "キャンセル中",
+          "queuedRemoval": "削除待ち",
+          "removing": "削除中",
+          "cancelled": "ダウンロードをキャンセルしました",
+          "failed": "ダウンロードに失敗しました",
+          "removeFailed": "削除に失敗しました",
+          "removeInterrupted": "削除が中断されました",
+          "interrupted": "ダウンロードを一時停止しました"
         },
-        "actions": { "enable": "有効にする", "download": "ダウンロード", "cancel": "キャンセル", "discardDownload": "ダウンロードを削除", "resume": "再開", "retry": "再試行", "repair": "修復", "remove": "削除", "retryRemove": "削除を再試行" },
-        "sources": { "oss": "北京 OSS", "github": "GitHub リリース" }
+        "actions": {
+          "enable": "有効にする",
+          "download": "ダウンロード",
+          "cancel": "キャンセル",
+          "discardDownload": "ダウンロードを削除",
+          "resume": "再開",
+          "retry": "再試行",
+          "repair": "修復",
+          "remove": "削除",
+          "retryRemove": "削除を再試行"
+        },
+        "sources": {
+          "oss": "北京 OSS",
+          "github": "GitHub リリース"
+        }
       },
       "lan": {
-        "listen": "ローカルネットワークで待ち受ける", "listenDescription": "再起動後に全ローカルインターフェイスへバインドします。公開ピアは引き続き拒否されます。",
-        "allowedCidrs": "許可するクライアント CIDR", "cidrDescription": "任意。空欄では loopback、RFC1918、IPv6 ULA を許可し、指定時は範囲を狭めることだけができます。",
+        "listen": "ローカルネットワークで待ち受ける",
+        "listenDescription": "再起動後に全ローカルインターフェイスへバインドします。公開ピアは引き続き拒否されます。",
+        "allowedCidrs": "許可するクライアント CIDR",
+        "cidrDescription": "任意。空欄では loopback、RFC1918、IPv6 ULA を許可し、指定時は範囲を狭めることだけができます。",
         "restartRequired": "変更を適用するには OpenSquilla を再起動してください。",
-        "title": "Web アクセスと名前付きトークン", "description": "有効なトークンのないリモート Web アクセスはゲスト安全モードを使用し、名前付きトークンは設定された権限を付与します。",
-        "guest": "トークンなし・誤り:", "guestDescription": " ゲスト安全モード：通常ファイルは読み取り可能、書き込みは既定ワークスペースのみ、認証情報ファイルは読み取り不可です。",
-        "authenticated": "有効なトークン:", "authenticatedDescription": " 権限に応じて安全またはフルアクセスを利用できます。",
-        "tokenName": "トークン名（例: Laptop）", "hostExecute": "ホスト実行 / フルアクセスを許可", "createToken": "トークンを作成",
-        "copyNow": "今すぐコピーしてください。再表示されません。", "fullCapable": "安全とフルアクセス", "safeOnly": "安全のみ", "revoke": "無効化"
+        "title": "Web アクセスと名前付きトークン",
+        "description": "有効なトークンのないリモート Web アクセスはゲスト安全モードを使用し、名前付きトークンは設定された権限を付与します。",
+        "guest": "トークンなし・誤り:",
+        "guestDescription": " ゲスト安全モード：通常ファイルは読み取り可能、書き込みは既定ワークスペースのみ、認証情報ファイルは読み取り不可です。",
+        "authenticated": "有効なトークン:",
+        "authenticatedDescription": " 権限に応じて安全またはフルアクセスを利用できます。",
+        "tokenName": "トークン名（例: Laptop）",
+        "hostExecute": "ホスト実行 / フルアクセスを許可",
+        "createToken": "トークンを作成",
+        "copyNow": "今すぐコピーしてください。再表示されません。",
+        "fullCapable": "安全とフルアクセス",
+        "safeOnly": "安全のみ",
+        "revoke": "無効化"
       }
     },
     "dialog": {
@@ -2541,15 +2684,60 @@
       "galleryEyebrow": "自動化テンプレート",
       "bulkDeleteConfirm": "選択した {count} 件の自動化を削除しますか？この操作は取り消せません。",
       "templates": {
-        "ai-daily": { "title": "毎日のAIニュース要約", "description": "過去24時間の重要なAIニュースを信頼できるリンク付きでまとめます。", "category": "ニュース", "schedule": "毎日 08:00" },
-        "weekly-report": { "title": "週間業務レビュー", "description": "進捗、リスク、成果物、翌週の優先事項を整理します。", "category": "生産性", "schedule": "金曜日 17:30" },
-        "english-five": { "title": "毎日5つの英単語", "description": "例文と短いクイズ付きの軽量な語彙レッスンを作成します。", "category": "学習", "schedule": "毎日 09:00" },
-        "project-risk": { "title": "プロジェクトリスク確認", "description": "遅延、エラー、未解決事項を確認し、リスクと提案を報告します。", "category": "プロジェクト", "schedule": "平日 10:00" },
-        "knowledge-review": { "title": "週間ナレッジレビュー", "description": "新しいメモや会議記録を整理し、次に読む項目をまとめます。", "category": "ナレッジ", "schedule": "日曜日 18:00" },
-        "daily-idea": { "title": "今日のアイデアと豆知識", "description": "信頼できる豆知識と実行しやすい小さなアイデアを届けます。", "category": "ライフスタイル", "schedule": "毎日 12:00" },
-        "bedtime-story": { "title": "毎日の読み聞かせ物語", "description": "親子で読める温かく想像力豊かな短編物語を作ります。", "category": "家族", "schedule": "毎日 20:30" },
-        "classic-movie": { "title": "名作映画のおすすめ", "description": "高評価の名作映画をネタバレなしで紹介します。", "category": "エンタメ", "schedule": "土曜日 19:00" },
-        "today-in-history": { "title": "歴史上の今日", "description": "科学、文化、社会から信頼できる歴史的出来事を紹介します。", "category": "毎日の知識", "schedule": "毎日 08:30" }
+        "ai-daily": {
+          "title": "毎日のAIニュース要約",
+          "description": "過去24時間の重要なAIニュースを信頼できるリンク付きでまとめます。",
+          "category": "ニュース",
+          "schedule": "毎日 08:00"
+        },
+        "weekly-report": {
+          "title": "週間業務レビュー",
+          "description": "進捗、リスク、成果物、翌週の優先事項を整理します。",
+          "category": "生産性",
+          "schedule": "金曜日 17:30"
+        },
+        "english-five": {
+          "title": "毎日5つの英単語",
+          "description": "例文と短いクイズ付きの軽量な語彙レッスンを作成します。",
+          "category": "学習",
+          "schedule": "毎日 09:00"
+        },
+        "project-risk": {
+          "title": "プロジェクトリスク確認",
+          "description": "遅延、エラー、未解決事項を確認し、リスクと提案を報告します。",
+          "category": "プロジェクト",
+          "schedule": "平日 10:00"
+        },
+        "knowledge-review": {
+          "title": "週間ナレッジレビュー",
+          "description": "新しいメモや会議記録を整理し、次に読む項目をまとめます。",
+          "category": "ナレッジ",
+          "schedule": "日曜日 18:00"
+        },
+        "daily-idea": {
+          "title": "今日のアイデアと豆知識",
+          "description": "信頼できる豆知識と実行しやすい小さなアイデアを届けます。",
+          "category": "ライフスタイル",
+          "schedule": "毎日 12:00"
+        },
+        "bedtime-story": {
+          "title": "毎日の読み聞かせ物語",
+          "description": "親子で読める温かく想像力豊かな短編物語を作ります。",
+          "category": "家族",
+          "schedule": "毎日 20:30"
+        },
+        "classic-movie": {
+          "title": "名作映画のおすすめ",
+          "description": "高評価の名作映画をネタバレなしで紹介します。",
+          "category": "エンタメ",
+          "schedule": "土曜日 19:00"
+        },
+        "today-in-history": {
+          "title": "歴史上の今日",
+          "description": "科学、文化、社会から信頼できる歴史的出来事を紹介します。",
+          "category": "毎日の知識",
+          "schedule": "毎日 08:30"
+        }
       }
     },
     "deleteDialog": {
@@ -2671,39 +2859,39 @@
       "fdChannel": "チャンネル",
       "fdWebhook": "Webhook",
       "enabled": "有効",
-      "saveSchedule": "スケジュールを保存"
-      ,"friendlyNamePlaceholder": "例：毎日顧客フィードバックを整理"
-      ,"friendlyTypeCron": "指定時刻に繰り返す"
-      ,"friendlyTypeEvery": "一定間隔で繰り返す"
-      ,"friendlyTypeAt": "指定時刻に一度だけ実行"
-      ,"executionFrequency": "実行頻度"
-      ,"daily": "毎日"
-      ,"weekdays": "平日"
-      ,"weekly": "毎週"
-      ,"monthly": "毎月"
-      ,"customAdvancedTime": "高度なスケジュール"
-      ,"weekday": "曜日"
-      ,"date": "日付"
-      ,"monthlyDay": "毎月 {day} 日"
-      ,"specificTime": "時刻"
-      ,"customTimeHint": "より柔軟な時間ルールを使用できます。"
-      ,"openAdvancedTime": "高度な時間設定を開く"
-      ,"everyHowOften": "実行間隔"
-      ,"timeUnit": "時間単位"
-      ,"minutes": "分"
-      ,"hours": "時間"
-      ,"days": "日"
-      ,"dateAndTime": "実行日時"
-      ,"friendlyMessagePlaceholder": "例：今日の顧客フィードバックを整理し、次の対応を提案"
-      ,"moreRuntimeSettings": "その他の実行設定（任意）"
-      ,"advancedTimeHint": "上の時間選択で対応できない場合にのみ使用します。"
-      ,"timezoneSimpleHint": "通常は変更不要です。"
-      ,"projectWorkspace": "プロジェクトワークスペース"
-      ,"defaultWorkspace": "既定のワークスペースを使用"
-      ,"noWorkspace": "プロジェクトワークスペースなし"
-      ,"workspaceUnavailable": "{name}（利用不可）"
-      ,"workspaceRequiredHint": "このタスクが確認するプロジェクトを選択してください。タスクは選択したプロジェクト内だけを処理します。"
-      ,"workspaceOptionalHint": "任意。一般的なタスクは「プロジェクトワークスペースなし」を選び、ファイルが必要な場合はプロジェクトを選択します。"
+      "saveSchedule": "スケジュールを保存",
+      "friendlyNamePlaceholder": "例：毎日顧客フィードバックを整理",
+      "friendlyTypeCron": "指定時刻に繰り返す",
+      "friendlyTypeEvery": "一定間隔で繰り返す",
+      "friendlyTypeAt": "指定時刻に一度だけ実行",
+      "executionFrequency": "実行頻度",
+      "daily": "毎日",
+      "weekdays": "平日",
+      "weekly": "毎週",
+      "monthly": "毎月",
+      "customAdvancedTime": "高度なスケジュール",
+      "weekday": "曜日",
+      "date": "日付",
+      "monthlyDay": "毎月 {day} 日",
+      "specificTime": "時刻",
+      "customTimeHint": "より柔軟な時間ルールを使用できます。",
+      "openAdvancedTime": "高度な時間設定を開く",
+      "everyHowOften": "実行間隔",
+      "timeUnit": "時間単位",
+      "minutes": "分",
+      "hours": "時間",
+      "days": "日",
+      "dateAndTime": "実行日時",
+      "friendlyMessagePlaceholder": "例：今日の顧客フィードバックを整理し、次の対応を提案",
+      "moreRuntimeSettings": "その他の実行設定（任意）",
+      "advancedTimeHint": "上の時間選択で対応できない場合にのみ使用します。",
+      "timezoneSimpleHint": "通常は変更不要です。",
+      "projectWorkspace": "プロジェクトワークスペース",
+      "defaultWorkspace": "既定のワークスペースを使用",
+      "noWorkspace": "プロジェクトワークスペースなし",
+      "workspaceUnavailable": "{name}（利用不可）",
+      "workspaceRequiredHint": "このタスクが確認するプロジェクトを選択してください。タスクは選択したプロジェクト内だけを処理します。",
+      "workspaceOptionalHint": "任意。一般的なタスクは「プロジェクトワークスペースなし」を選び、ファイルが必要な場合はプロジェクトを選択します。"
     },
     "form": {
       "cronPreviewPlaceholder": "プレビューするには 5 フィールドの cron 式を入力してください",
@@ -3338,9 +3526,18 @@
       "planTitle": "保活プラン",
       "planSummary": "約 {interval} 分ごと · 最大約 {count} 回 · {duration} 分後に一時停止。",
       "costWarning": "実際のプロバイダーリクエストにはトークン料金が発生する場合があります。会話には追加されず、ツールも実行しません。",
-      "statusLabel": "状態", "targetLabel": "プロバイダー / モデル", "lastHitLabel": "前回のキャッシュトークン",
+      "statusLabel": "状態",
+      "targetLabel": "プロバイダー / モデル",
+      "lastHitLabel": "前回のキャッシュトークン",
       "autoPauseLabel": "自動一時停止",
-      "states": { "off": "オフ", "waiting": "安定したプレフィックスを待機", "scheduled": "予定済み", "probing": "プローブ中", "paused": "アイドル上限に到達；次のメッセージを待機中", "stopped": "失敗後に停止" }
+      "states": {
+        "off": "オフ",
+        "waiting": "安定したプレフィックスを待機",
+        "scheduled": "予定済み",
+        "probing": "プローブ中",
+        "paused": "アイドル上限に到達；次のメッセージを待機中",
+        "stopped": "失敗後に停止"
+      }
     },
     "send": "送信",
     "sendQueues": "送信（現在の応答後にキューへ追加）",
@@ -3351,18 +3548,57 @@
     "stoppingResponse": "安全に停止しています… 新しいメッセージはキューに入ります。",
     "messageToSend": "送信するメッセージ",
     "promptAnnotations": {
-      "label": "注釈", "draftLabel": "保留中のページ注釈", "sentLabel": "ページ注釈", "element": "選択した領域",
+      "label": "注釈",
+      "draftLabel": "保留中のページ注釈",
+      "sentLabel": "ページ注釈",
+      "element": "選択した領域",
       "targetLabel": "{kind}：{text}",
-      "targetKinds": { "heading": "見出し", "button": "ボタン", "link": "リンク", "image": "画像", "input": "入力欄", "form": "フォーム", "section": "セクション", "list": "リスト", "table": "表", "text": "テキスト", "region": "領域", "element": "選択した領域" },
-      "emptyDraft": "指示を追加", "stale": "現在のページでこの部分を特定できません",
+      "targetKinds": {
+        "heading": "見出し",
+        "button": "ボタン",
+        "link": "リンク",
+        "image": "画像",
+        "input": "入力欄",
+        "form": "フォーム",
+        "section": "セクション",
+        "list": "リスト",
+        "table": "表",
+        "text": "テキスト",
+        "region": "領域",
+        "element": "選択した領域"
+      },
+      "emptyDraft": "指示を追加",
+      "stale": "現在のページでこの部分を特定できません",
       "editingBlocked": "編集中の注釈を追加またはキャンセルしてから送信してください。",
       "staleBlocked": "現在のページでこの部分を特定できませんが、そのまま AI に送信できます。",
-      "emptyBlocked": "すべての成果物指示を完成してください。", "tooLongBlocked": "成果物指示を UTF-8 で 16 KiB 以内に短くしてから送信してください。", "editLabel": "成果物指示を編集",
-      "removeLabel": "成果物指示を削除", "updateFailed": "成果物指示を保存できませんでした。",
-      "discardFailed": "成果物指示を削除できませんでした。", "focusUnavailable": "現在のページでこの部分を特定できませんが、そのまま AI に送信できます。",
-      "reuseLabel": "新しい注釈としてコピー", "reuseDescription": "変更要求をコピーし、ページ上で対象を選択します。", "reuseUnavailable": "この変更要求をコピーできませんでした。対応するページを開いて対象を選択してください。", "applyPrompt": "添付されたページ注釈を適用してください。",
-      "status": { "unknown": "ページを更新できませんでした", "not_attempted": "ページを更新できませんでした", "applied": "ページを更新しました", "appliedCorrected": "ページを更新しました", "not_applied": "ページを更新できませんでした", "conflict": "ページを更新できませんでした", "ambiguous": "更新を確認中" },
-      "statusDetail": { "unknown": "ページを開いて確認してください。", "not_attempted": "ページは更新されませんでした。", "applied": "", "not_applied": "もう一度お試しください。", "conflict": "ページを開いてもう一度お試しください。", "ambiguous": "再試行する前にページを開いて確認してください。" }
+      "emptyBlocked": "すべての成果物指示を完成してください。",
+      "tooLongBlocked": "成果物指示を UTF-8 で 16 KiB 以内に短くしてから送信してください。",
+      "editLabel": "成果物指示を編集",
+      "removeLabel": "成果物指示を削除",
+      "updateFailed": "成果物指示を保存できませんでした。",
+      "discardFailed": "成果物指示を削除できませんでした。",
+      "focusUnavailable": "現在のページでこの部分を特定できませんが、そのまま AI に送信できます。",
+      "reuseLabel": "新しい注釈としてコピー",
+      "reuseDescription": "変更要求をコピーし、ページ上で対象を選択します。",
+      "reuseUnavailable": "この変更要求をコピーできませんでした。対応するページを開いて対象を選択してください。",
+      "applyPrompt": "添付されたページ注釈を適用してください。",
+      "status": {
+        "unknown": "ページを更新できませんでした",
+        "not_attempted": "ページを更新できませんでした",
+        "applied": "ページを更新しました",
+        "appliedCorrected": "ページを更新しました",
+        "not_applied": "ページを更新できませんでした",
+        "conflict": "ページを更新できませんでした",
+        "ambiguous": "更新を確認中"
+      },
+      "statusDetail": {
+        "unknown": "ページを開いて確認してください。",
+        "not_attempted": "ページは更新されませんでした。",
+        "applied": "",
+        "not_applied": "もう一度お試しください。",
+        "conflict": "ページを開いてもう一度お試しください。",
+        "ambiguous": "再試行する前にページを開いて確認してください。"
+      }
     },
     "placeholder": "メッセージを送信...",
     "placeholderCompact": "メッセージ...",
@@ -3460,7 +3696,7 @@
     "audioUnsupported": "このブラウザではこの音声形式を再生できません。代わりにファイルをダウンロードしてください。",
     "playVideo": "動画を再生",
     "videoLoadFailed": "動画を読み込めませんでした。",
-    "videoUnsupported": "このブラウザではこの動画形式を再生できません。代わりにファイルをダウンロードしてください。",
+    "videoUnsupported": "このブラウザーでは動画を再生できません。代わりにダウンロードしてください。",
     "previewOf": "プレビュー: {title}",
     "closePreview": "プレビューを閉じる",
     "previousImage": "前の画像",
@@ -3469,7 +3705,6 @@
     "previewDownload": "プレビューのダウンロード",
     "previewTimedOut": "プレビューがタイムアウトしました。",
     "previewFailed": "プレビューの読み込みに失敗しました。",
-    "videoUnsupported": "このブラウザーでは動画を再生できません。代わりにダウンロードしてください。",
     "loadVideoPreview": "動画プレビューを読み込む",
     "loadVideoPreviewFor": "{title} の動画プレビューを読み込む",
     "videoPreviewLoading": "動画プレビューを読み込んでいます。ダウンロード中にキャンセルできます。",
@@ -4380,5 +4615,23 @@
       "copyFailed": "コマンドをコピーできませんでした",
       "copyLabel": "ゲートウェイ再起動コマンドをコピー"
     }
+  },
+  "fileTree": {
+    "backToTasks": "タスクに戻る",
+    "refresh": "更新",
+    "retry": "再試行",
+    "empty": "表示できるファイルがありません。",
+    "loading": "ファイルを読み込み中…",
+    "viewFiles": "ファイルを表示",
+    "attachToChat": "チャトに添付",
+    "copyPath": "パスをコピー",
+    "previewTruncated": "プレビューは 1 MB 以内",
+    "binaryNotPreviewable": "ビンラリファイルはプレビューできません。",
+    "attachTooLarge": "{name} は 1 MB を超えており、ファイルツリによって添付できません。",
+    "attachFailed": "{name} を添付できませんでした。",
+    "attachUnsupported": "{name} はテキストではないため、ファイルツリによって添付できません。",
+    "attached": "{name} を入力フィードに添付しました。",
+    "ctxCopy": "コピー",
+    "ctxAttach": "会話に追加"
   }
 }
