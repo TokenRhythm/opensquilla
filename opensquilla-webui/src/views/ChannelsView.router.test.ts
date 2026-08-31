@@ -178,6 +178,14 @@ async function mountWithRealRouter(options: { webHistory?: boolean } = {}) {
   const el = document.createElement('div')
   document.body.appendChild(el)
   const application = createApp(AppShell)
+  const { APP_SETTINGS_KEY } = await import('@/modules/appSettings')
+  const { SETUP_WORKFLOW_KEY } = await import('@/modules/setupWorkflow')
+  application.provide(APP_SETTINGS_KEY, {
+    read: async (path: string) => await rpcCall('config.get', { path }),
+  } as unknown as import('@/modules/appSettings').AppSettings)
+  application.provide(SETUP_WORKFLOW_KEY, {
+    catalog: async () => await rpcCall('onboarding.catalog'),
+  } as unknown as import('@/modules/setupWorkflow').SetupWorkflow)
   application.use(i18n)
   application.use(router)
   await router.push('/channels')
