@@ -172,10 +172,11 @@ F2_FOUNDATION_RUNTIME_FILES = (
 # composition entry (4 lines), and GoalContinuity adds its independently
 # owned lease/event seam (4 lines). Keep every reviewed increment explicit
 # rather than turning the foundation exception into an open-ended budget.
-# The current main baseline is 1,200 physical lines.  Keep this ceiling
-# explicit so future domain slices cannot hide growth behind the foundation
-# allowance; this is a baseline correction, not a new R1 exception.
-F2_FOUNDATION_RUNTIME_LOC_CEILING = 1_200
+# PlanCenter adds its typed composition seam (4 lines, #1521), MetaRunCenter
+# adds the same seam (4 lines, #1523), and AppSettings, ProviderConfiguration,
+# and SetupWorkflow each add 4 lines (#1525). These five registrations bring
+# the 1,196-line foundation to 1,216; no sandbox runtime allowance is added.
+F2_FOUNDATION_RUNTIME_LOC_CEILING = 1_216
 
 # Existing cross-rpc private imports are architectural debt. This exact ledger
 # prevents growth and also fails stale when an import is removed, so reductions
