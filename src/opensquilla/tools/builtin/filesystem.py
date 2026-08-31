@@ -23,7 +23,6 @@ from xml.etree import ElementTree as ET
 
 import structlog
 
-from opensquilla.sandbox.backend.unavailable import UnavailableBackend
 from opensquilla.sandbox.backup_vault import BackupReceiptSummary, summarize_backup_receipts
 from opensquilla.sandbox.destructive_backup import DestructiveBackupGate
 from opensquilla.sandbox.directory_listing import format_directory_entry
@@ -886,15 +885,6 @@ async def _run_sandbox_operation_if_required(
                 filesystem=filesystem_permissions,
             ),
         )
-    if (
-        trusted_sandbox_active()
-        and ctx is not None
-        and ctx.is_owner
-        and runtime is not None
-        and isinstance(runtime.backend, UnavailableBackend)
-        and operation.kind not in {"create_source", "edit_source"}
-    ):
-        return None
     return await SandboxOperationRuntime(
         runtime,
         host_execution_active=full_host_access_active() or host_execution_active,

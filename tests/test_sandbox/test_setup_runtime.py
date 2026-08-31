@@ -19,7 +19,7 @@ def reset_setup_runtime_state():
 
 
 @pytest.mark.asyncio
-async def test_status_reports_setting_up_while_auto_setup_is_running(monkeypatch) -> None:
+async def test_status_reports_setting_up_while_setup_is_running(monkeypatch) -> None:
     from opensquilla.sandbox import setup_runtime
 
     entered = asyncio.Event()
@@ -54,7 +54,7 @@ async def test_status_reports_setting_up_while_auto_setup_is_running(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_auto_setup_failure_remains_visible_after_setup_finishes(monkeypatch) -> None:
+async def test_setup_failure_remains_visible_after_setup_finishes(monkeypatch) -> None:
     from opensquilla.sandbox import setup_runtime
 
     config = SimpleNamespace()
@@ -84,7 +84,7 @@ async def test_auto_setup_failure_remains_visible_after_setup_finishes(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_windows_auto_setup_promotes_runtime_backend_after_setup(monkeypatch) -> None:
+async def test_windows_setup_promotes_runtime_backend_after_setup(monkeypatch) -> None:
     from opensquilla.sandbox import integration, setup_runtime
 
     config = SimpleNamespace()
@@ -113,7 +113,7 @@ async def test_windows_auto_setup_promotes_runtime_backend_after_setup(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_windows_auto_setup_reports_failed_when_runtime_cannot_be_promoted(
+async def test_windows_setup_reports_failed_when_runtime_cannot_be_promoted(
     monkeypatch,
 ) -> None:
     from opensquilla.sandbox import integration, setup_runtime

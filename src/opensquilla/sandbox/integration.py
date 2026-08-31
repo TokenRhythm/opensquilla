@@ -249,7 +249,7 @@ def configure_runtime(
         from opensquilla.sandbox.setup_runtime import mark_sandbox_startup_pending
 
         backend = UnavailableBackend("Sandbox initialization has not completed.")
-        mark_sandbox_startup_pending(enabled=settings.auto_setup)
+        mark_sandbox_startup_pending()
     else:
         try:
             backend = select_backend(settings)

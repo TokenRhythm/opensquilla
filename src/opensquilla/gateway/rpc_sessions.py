@@ -151,6 +151,7 @@ from opensquilla.sandbox.mode_resolver import ModeResolutionError, ResolvedMode,
 from opensquilla.sandbox.run_context import (
     RUN_CONTEXT_ORIGIN_KEY,
     RunContext,
+    resolve_default_run_mode,
 )
 from opensquilla.sandbox.run_mode_policy import (
     coerce_run_mode_for_principal,
@@ -4862,6 +4863,8 @@ async def _handle_sessions_send_impl_inner(
     guest_profile = None
     guest_safe = _is_remote_web_guest(ctx.principal, source_hint)
     capability_report = None
+    accepted_run_mode_override = None
+    accepted_run_mode_origin: dict[str, Any] | None = None
     if guest_safe:
         capability_report = await current_sandbox_capability_report(ctx.config)
         try:
@@ -4896,14 +4899,26 @@ async def _handle_sessions_send_impl_inner(
             )
         except ProjectWorkspaceStateError as exc:
             raise _project_workspace_error(exc) from exc
-    if authoritative_guard is not None:
-        workspace_guard = authoritative_guard
-    run_context = replace(
-        run_context,
-        run_mode=coerce_run_mode_for_principal(run_context.run_mode, ctx.principal),
-    )
-    accepted_run_mode_override = None
-    accepted_run_mode_origin: dict[str, Any] | None = None
+        if authoritative_guard is not None:
+            workspace_guard = authoritative_guard
+        if not guest_safe and principal_has_host_execute(ctx.principal):
+            global_mode, global_source = await resolve_default_run_mode(
+                ctx.session_manager,
+                ctx.config,
+            )
+            accepted_run_mode_override = AcceptedRunModeOverride(
+                run_mode=global_mode,
+                run_mode_source="operator_default",
+                source=global_source,
+            )
+            run_context = apply_accepted_run_mode_override(
+                run_context,
+                accepted_run_mode_override,
+            )
+        run_context = replace(
+            run_context,
+            run_mode=coerce_run_mode_for_principal(run_context.run_mode, ctx.principal),
+        )
     if run_mode_hint is not None:
         accepted_run_mode_override = AcceptedRunModeOverride(
             run_mode=run_mode_hint,
@@ -4951,16 +4966,6 @@ async def _handle_sessions_send_impl_inner(
         if guest_profile is not None:
             guest_profile.cleanup()
 
-    if mode_resolution.effective_mode is not run_context.run_mode:
-        accepted_run_mode_override = AcceptedRunModeOverride(
-            run_mode=mode_resolution.effective_mode,
-            run_mode_source=run_context.run_mode_source,
-            source="capability_fallback",
-        )
-        run_context = apply_accepted_run_mode_override(
-            run_context,
-            accepted_run_mode_override,
-        )
     workspace_dir = run_context.workspace or workspace_dir
     host_execute_allowed = principal_has_host_execute(ctx.principal)
     if source_hint.get("caller_kind") == "cli" or source_hint.get("channel_kind") == "cli":

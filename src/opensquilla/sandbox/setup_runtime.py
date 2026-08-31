@@ -19,7 +19,7 @@ _LAST_RESULT: SetupResult | None = None
 _GENERATION = 0
 
 
-def mark_sandbox_startup_pending(*, enabled: bool) -> None:
+def mark_sandbox_startup_pending() -> None:
     """Publish passive status before the gateway schedules initialization."""
     global _GENERATION, _LAST_RESULT, _SETTING_UP
 
@@ -27,13 +27,9 @@ def mark_sandbox_startup_pending(*, enabled: bool) -> None:
     _SETTING_UP = False
 
     _LAST_RESULT = SetupResult(
-        state=SandboxSetupState.SETTING_UP if enabled else SandboxSetupState.NOT_SETUP,
+        state=SandboxSetupState.SETTING_UP,
         platform=sys.platform,
-        message=(
-            "Sandbox initialization will start when the gateway is ready."
-            if enabled
-            else "Automatic sandbox initialization is disabled."
-        ),
+        message="Sandbox initialization will start when the gateway is ready.",
     )
 
 

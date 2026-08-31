@@ -53,7 +53,6 @@ async def test_build_services_wires_media_root_into_session_manager(
     config = GatewayConfig(
         memory={"flush_enabled": False},
         attachments={"media_root": str(media)},
-        sandbox={"auto_setup": False},
     )
 
     services = await build_services(
@@ -107,7 +106,6 @@ async def test_build_services_continues_when_optional_sandbox_migration_fails(
         config=GatewayConfig(
             config_path=str(config_path),
             memory={"flush_enabled": False},
-            sandbox={"auto_setup": False},
         ),
         session_db_path=":memory:",
         seed_agent_workspaces=False,
@@ -160,7 +158,6 @@ async def test_build_services_reconciles_artifact_mutations_before_ready(
         config=GatewayConfig(
             memory={"flush_enabled": False},
             attachments={"media_root": str(media)},
-            sandbox={"auto_setup": False},
         ),
         session_db_path=":memory:",
         seed_agent_workspaces=False,

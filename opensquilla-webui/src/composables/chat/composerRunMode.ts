@@ -2,13 +2,11 @@ import type { SandboxRunMode, SandboxSetupStatusPayload } from '@/types/sandbox'
 
 export function effectiveComposerRunMode(
   preference: SandboxRunMode,
-  setupStatus: SandboxSetupStatusPayload | null,
+  _setupStatus: SandboxSetupStatusPayload | null,
   activeLock: SandboxRunMode | null,
-  setupResolved = true,
+  _setupResolved = true,
 ): SandboxRunMode {
   if (activeLock) return activeLock
-  if (!setupResolved) return 'full'
-  if (preference === 'safe' && setupStatus && setupStatus.state !== 'ready') return 'full'
   return preference
 }
 

@@ -176,7 +176,6 @@ async def test_live_router_enable_after_disabled_boot_persists_decisions(
         channels={"channels": []},
         mcp={"enabled": False},
         memory={"flush_enabled": False},
-        sandbox={"auto_setup": False},
         squilla_router={"enabled": False},
     )
     config.config_path = str(config_path)

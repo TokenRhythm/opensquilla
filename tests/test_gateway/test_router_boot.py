@@ -1073,34 +1073,6 @@ async def test_boot_sandbox_setup_initializes_without_capability_probes(
 
 
 @pytest.mark.asyncio
-async def test_boot_sandbox_setup_can_be_disabled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from opensquilla.gateway import boot
-
-    async def fail_if_called(config: GatewayConfig) -> object:
-        raise AssertionError("sandbox.auto_setup=false must not inspect setup")
-
-    monkeypatch.setattr(
-        "opensquilla.sandbox.setup_runtime.initialize_sandbox_runtime",
-        fail_if_called,
-    )
-
-    result = await boot._ensure_sandbox_setup_on_boot(
-        GatewayConfig(
-            sandbox={
-                "auto_setup": False,
-                "run_mode": "trusted",
-                "sandbox": True,
-                "security_grading": True,
-            },
-        )
-    )
-
-    assert result is None
-
-
-@pytest.mark.asyncio
 async def test_boot_sandbox_failure_keeps_gateway_available(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1212,6 +1184,65 @@ async def test_build_services_defers_sandbox_startup_until_gateway_ready(
 
 
 @pytest.mark.asyncio
+async def test_embedded_gateway_defers_sandbox_until_inprocess_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.gateway import boot
+    from opensquilla.sandbox.setup_state import SandboxSetupState, SetupResult
+
+    initialized = asyncio.Event()
+
+    def unexpected_backend_selection(_settings: SandboxSettings, **_kwargs: Any) -> Any:
+        raise AssertionError("embedded gateway startup must defer sandbox selection")
+
+    async def fake_initialize(config: GatewayConfig) -> SetupResult:
+        assert config.state_dir == str(tmp_path / "state")
+        initialized.set()
+        return SetupResult(
+            state=SandboxSetupState.READY,
+            platform="test",
+            message="Sandbox initialized.",
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.sandbox.integration.select_backend",
+        unexpected_backend_selection,
+    )
+    monkeypatch.setattr(
+        "opensquilla.sandbox.setup_runtime.initialize_sandbox_runtime",
+        fake_initialize,
+    )
+    monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
+    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
+    monkeypatch.setattr(
+        "opensquilla.gateway.pidlock.GatewayPidLock.acquire",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.pidlock.GatewayPidLock.release",
+        lambda self: None,
+    )
+
+    config = GatewayConfig(
+        state_dir=str(tmp_path / "state"),
+        workspace_dir=str(tmp_path / "workspace"),
+        control_ui={"enabled": False},
+        channels={"channels": []},
+        mcp={"enabled": False},
+        memory={"flush_enabled": False},
+    )
+
+    server = await boot.start_gateway_server(config=config, run=False)
+    try:
+        await asyncio.wait_for(initialized.wait(), timeout=1.0)
+        assert server.app.state.gateway_ready is True
+        assert server._services.sandbox_setup_task is not None
+    finally:
+        await server.close()
+
+
+@pytest.mark.asyncio
 async def test_service_container_close_cancels_owned_sandbox_setup_task() -> None:
     from opensquilla.gateway import boot
 
@@ -1284,7 +1315,6 @@ async def test_bare_full_default_boots_full_capability(
         channels={"channels": []},
         mcp={"enabled": False},
         memory={"flush_enabled": False},
-        sandbox={"auto_setup": False},
     )
 
     services = await boot.build_services(
@@ -2440,7 +2470,6 @@ async def test_build_services_registers_session_search_tool(
         channels={"channels": []},
         mcp={"enabled": False},
         memory={"flush_enabled": False},
-        sandbox={"auto_setup": False},
     )
 
     services = await build_services(
@@ -2562,7 +2591,6 @@ async def test_build_services_fails_fast_for_explicit_remote_memory_without_key(
         state_dir=str(tmp_path / "state"),
         workspace_dir=str(tmp_path / "workspace"),
         memory={"embedding": {"provider": "openai"}},
-        sandbox={"auto_setup": False},
     )
 
     with pytest.raises(ValueError, match="memory.embedding.remote.api_key"):

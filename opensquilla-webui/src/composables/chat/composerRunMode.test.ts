@@ -8,13 +8,13 @@ import {
 
 describe('effectiveComposerRunMode', () => {
   it.each(['not_setup', 'setting_up', 'failed', 'unavailable'] as const)(
-    'soft-lands a stale Safe preference in Full Access while setup is %s',
+    'never turns a saved Safe preference into Full Access while setup is %s',
     (state) => {
       expect(effectiveComposerRunMode(
         'safe',
         { state, platform: 'win32', message: '', requiresAdmin: true },
         null,
-      )).toBe('full')
+      )).toBe('safe')
     },
   )
 
@@ -30,8 +30,8 @@ describe('effectiveComposerRunMode', () => {
     expect(effectiveComposerRunMode('safe', null, null)).toBe('safe')
   })
 
-  it('shows Full Access until the initial setup check resolves', () => {
-    expect(effectiveComposerRunMode('safe', null, null, false)).toBe('full')
+  it('never turns Safe into Full Access before the initial setup check resolves', () => {
+    expect(effectiveComposerRunMode('safe', null, null, false)).toBe('safe')
   })
 
   it('preserves an active task lock even if setup status changes', () => {

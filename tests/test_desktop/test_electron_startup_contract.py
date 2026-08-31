@@ -1754,8 +1754,9 @@ def test_desktop_gateway_exit_classifies_newer_config_validation_errors() -> Non
 
     assert "const GATEWAY_OUTPUT_TAIL_MAX_CHARS = 12_000" in main_ts
     assert "const NEWER_CONFIG_DIAGNOSTIC_FIELDS = [" in main_ts
-    for field in ["'llm_ensemble'", "'privacy'", "'sandbox.auto_setup'", "'llm_profiles'"]:
+    for field in ["'llm_ensemble'", "'privacy'", "'llm_profiles'"]:
         assert field in main_ts
+    assert "'sandbox.auto_setup'" not in main_ts
     assert (
         "function classifyGatewayExitMessage(message: string, outputTail: string): string"
         in main_ts

@@ -8286,7 +8286,6 @@ const GATEWAY_OUTPUT_TAIL_MAX_CHARS = 12_000
 const NEWER_CONFIG_DIAGNOSTIC_FIELDS = [
   'llm_ensemble',
   'privacy',
-  'sandbox.auto_setup',
   'llm_profiles',
 ] as const
 

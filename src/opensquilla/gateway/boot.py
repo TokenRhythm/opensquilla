@@ -1187,10 +1187,6 @@ def _desktop_ownership_profile_home(config: GatewayConfig) -> Path:
 
 async def _ensure_sandbox_setup_on_boot(config: GatewayConfig) -> Any | None:
     """Initialize the existing sandbox after gateway readiness, without self-tests."""
-    if not config.sandbox.auto_setup:
-        log.info("boot.sandbox_setup_auto_disabled")
-        return None
-
     from opensquilla.sandbox.setup_runtime import initialize_sandbox_runtime
 
     result = await initialize_sandbox_runtime(config)
@@ -4235,7 +4231,7 @@ async def start_gateway_server(
             tool_registry=tool_registry,
             usage_tracker=usage_tracker,
             session_db_path=str(_state_path(config, "sessions.db")),
-            defer_sandbox_startup=run,
+            defer_sandbox_startup=True,
         )
     except BaseException:
         _pid_lock.release()
@@ -4471,6 +4467,35 @@ async def start_gateway_server(
             run_kind=run_kind,
         )
 
+    async def _validate_task_acceptance(
+        envelope: Any,
+        accepted_run_mode_override: Any | None,
+    ) -> None:
+        from opensquilla.gateway.project_workspace_runtime import (
+            AcceptedRunModeOverride,
+        )
+        from opensquilla.run_mode import RunMode, config_run_mode, normalize_run_mode
+        from opensquilla.sandbox.mode_resolver import ModeResolutionError
+        from opensquilla.sandbox.setup_runtime import current_sandbox_capability_report
+
+        host_execute = _task_runtime_envelope_host_execute(envelope)
+        if isinstance(accepted_run_mode_override, AcceptedRunModeOverride):
+            desired_mode = accepted_run_mode_override.run_mode
+        else:
+            raw_mode = getattr(envelope, "metadata", {}).get("run_mode")
+            desired_mode = (
+                normalize_run_mode(raw_mode)
+                if raw_mode is not None
+                else config_run_mode(config) if host_execute else RunMode.SAFE
+            )
+        if desired_mode is RunMode.FULL:
+            if not host_execute:
+                raise ModeResolutionError("host_capability_required")
+            return
+        capability = await current_sandbox_capability_report(config)
+        if not capability.available:
+            raise ModeResolutionError("sandbox_unavailable")
+
     session_lifecycle_listener = _make_task_session_lifecycle_listener(
         session_manager=svc.session_manager,
         event_emitter=runtime_event_bridge.emit,
@@ -4488,6 +4513,7 @@ async def start_gateway_server(
         ),
         turn_hard_deadline_s=_task_runtime_turn_hard_deadline_s(config),
         accepted_config_provider=_capture_task_accepted_config,
+        acceptance_validator=_validate_task_acceptance,
         pending_overflow_policy=getattr(
             config.task_runtime, "pending_overflow_policy", "reject_newest"
         ),
@@ -5230,7 +5256,9 @@ async def start_gateway_server(
         startup_started_at=startup_started_at,
         phase_started_at=startup_phase_started_at,
     )
-    listener_ready = False
+    # Embedded ``run=False`` callers have no listener to wait for. Their
+    # in-process app readiness is the final startup boundary.
+    listener_ready = not run
     runtime_state_ready = False
     gateway_ready_phase_emitted = False
     post_ready_observability_started = False
@@ -5275,8 +5303,9 @@ async def start_gateway_server(
             duration_ms=_elapsed_monotonic_ms(gateway_ready_wait_started_at, ready_at),
             startup_elapsed_ms=_elapsed_monotonic_ms(startup_started_at, ready_at),
         )
-        if config.sandbox.auto_setup:
-            svc.sandbox_setup_task = create_background_task(_ensure_sandbox_setup_on_boot(config))
+        svc.sandbox_setup_task = create_background_task(
+            _ensure_sandbox_setup_on_boot(config)
+        )
         _start_post_ready_observability()
 
     server_handle = GatewayServer(app=app, config=config)
@@ -5452,10 +5481,6 @@ async def start_gateway_server(
         phase_started_at=startup_phase_started_at,
     )
     _publish_gateway_ready_if_complete()
-    if not run:
-        # Embedders/tests without a network listener still retain the existing
-        # telemetry lifecycle, but only after in-process readiness is visible.
-        _start_post_ready_observability()
     usage_storage = get_session_storage(svc.session_manager)
     if usage_storage is not None and hasattr(usage_storage, "get_usage_backfill_batch"):
         from opensquilla.gateway.usage_backfill import run_usage_backfill

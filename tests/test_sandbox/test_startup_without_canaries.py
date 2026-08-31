@@ -68,6 +68,10 @@ def test_deferred_runtime_does_not_check_or_select_backend(monkeypatch):
     assert runtime.backend.available() is False
 
 
+def test_sandbox_settings_no_longer_exposes_auto_setup() -> None:
+    assert "auto_setup" not in SandboxSettings.model_fields
+
+
 async def test_initialized_status_is_cached_without_rechecking_host(monkeypatch):
     result = SetupResult(SandboxSetupState.READY, "win32", "Sandbox initialized.")
     monkeypatch.setattr(setup_runtime, "_LAST_RESULT", result)
@@ -111,10 +115,10 @@ async def test_startup_failure_does_not_install_repair_or_retry(monkeypatch):
 
 
 async def test_full_access_remains_authorized_when_sandbox_startup_fails(monkeypatch):
-    from opensquilla.sandbox.mode_resolver import resolve_mode
+    from opensquilla.sandbox.mode_resolver import ModeResolutionError, resolve_mode
     from opensquilla.sandbox.run_mode import RunMode
 
-    setup_runtime.mark_sandbox_startup_pending(enabled=True)
+    setup_runtime.mark_sandbox_startup_pending()
 
     async def fail():
         raise RuntimeError("sandbox startup failed")
@@ -124,11 +128,8 @@ async def test_full_access_remains_authorized_when_sandbox_startup_fails(monkeyp
     report = await setup_runtime.current_sandbox_capability_report(SimpleNamespace())
     host = SimpleNamespace(capabilities={"host.execute"})
     assert resolve_mode(RunMode.FULL, host, report).effective_mode is RunMode.FULL
-    # Preserve the existing global mode fallback when initialization fails.
-    resolved = resolve_mode(RunMode.SAFE, host, report)
-    assert resolved.desired_mode is RunMode.SAFE
-    assert resolved.effective_mode is RunMode.FULL
-    assert resolved.fallback_reason == "setup_failed"
+    with pytest.raises(ModeResolutionError, match="sandbox_unavailable"):
+        resolve_mode(RunMode.SAFE, host, report)
 
 
 async def test_late_backend_initialization_cannot_replace_a_new_runtime(monkeypatch):
@@ -177,7 +178,7 @@ def test_linux_startup_selection_does_not_run_namespace_self_tests(monkeypatch):
 
 
 async def test_automatic_initialization_does_not_inspect_runtime_capabilities(monkeypatch):
-    setup_runtime.mark_sandbox_startup_pending(enabled=True)
+    setup_runtime.mark_sandbox_startup_pending()
 
     async def unexpected_status(_config):
         raise AssertionError("startup must not run login or filesystem canaries")
@@ -198,7 +199,7 @@ async def test_retired_startup_cannot_overwrite_new_status(monkeypatch):
 
     entered = asyncio.Event()
     release = asyncio.Event()
-    setup_runtime.mark_sandbox_startup_pending(enabled=True)
+    setup_runtime.mark_sandbox_startup_pending()
 
     async def initialize():
         entered.set()
@@ -209,7 +210,7 @@ async def test_retired_startup_cannot_overwrite_new_status(monkeypatch):
     task = asyncio.create_task(setup_runtime.initialize_sandbox_runtime(SimpleNamespace()))
     await asyncio.wait_for(entered.wait(), 1)
     setup_runtime.reset_sandbox_setup_runtime_state()
-    setup_runtime.mark_sandbox_startup_pending(enabled=True)
+    setup_runtime.mark_sandbox_startup_pending()
     release.set()
     with pytest.raises(asyncio.CancelledError):
         await task
