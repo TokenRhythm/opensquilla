@@ -3436,6 +3436,7 @@
     "sendQueues": "Send (queues for after current response)",
     "sendSteers": "Send (steers the current response now)",
     "sendQueuesUntilCompaction": "Send (queues until compaction finishes)",
+    "cronSessionReadOnly": "Cron sessions are read-only and cannot receive new turns.",
     "stopResponse": "Stop current response",
     "stopResponseEsc": "Stop current response (Esc)",
     "stoppingResponse": "Stopping safely… New messages will be queued.",

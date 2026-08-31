@@ -545,6 +545,13 @@
          composer instead of pinning it to the bottom, so the menu must not
          anchor to the chat container's bottom edge. -->
     <div class="chat-composer-dock">
+    <div
+      v-if="isCronSession"
+      class="chat-composer-read-only"
+      role="status"
+      aria-live="polite"
+    >{{ t('chat.cronSessionReadOnly') }}</div>
+    <template v-else>
     <!-- Durable execution progress belongs to the work surface, not to the
          transcript. Keeping it immediately above the composer also lets a
          execution surfaces reuse this dock across multiple turns. -->
@@ -747,6 +754,7 @@
       @close="projectPickerOpen = false"
       @choose="chooseProjectPath"
     />
+    </template>
     </div>
 
     <ToolResultModal
@@ -805,6 +813,7 @@ import { useRpcStore } from '@/stores/rpc'
 import {
   SESSION_DIRECTORY_KEY,
   SessionDirectoryError,
+  isCronSessionKey,
 } from '@/modules/sessionDirectory'
 import { SESSION_LIFECYCLE_KEY } from '@/modules/sessionLifecycle'
 import { PENDING_INPUT_QUEUE_KEY } from '@/modules/pendingInputQueue'
@@ -1275,6 +1284,7 @@ function cancelActiveProjectValidation() {
 const isCompactViewport = useMediaQuery('(max-width: 480px)')
 const isDesktopViewport = useMediaQuery('(min-width: 769px)')
 const landingAgentId = computed(() => agentIdFromSessionKey(sessionKey.value))
+const isCronSession = computed(() => isCronSessionKey(sessionKey.value))
 // True when the current draft opened with prefilled composer text (Sessions
 // Hub task input); the landing suggestion chips stay out of the way then.
 const landingPrefilled = ref(false)
@@ -7124,5 +7134,11 @@ watch(
   width: 100%;
   height: 1px;
   pointer-events: none;
+}
+
+.chat-composer-read-only {
+  padding: 0.75rem 1rem;
+  color: var(--text-muted);
+  text-align: center;
 }
 </style>

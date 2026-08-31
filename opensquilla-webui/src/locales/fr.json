@@ -3346,6 +3346,7 @@
     "sendQueues": "Envoyer (mise en file après la réponse actuelle)",
     "sendSteers": "Envoyer (réoriente la réponse actuelle maintenant)",
     "sendQueuesUntilCompaction": "Envoyer (mise en file jusqu'à la fin du compactage)",
+    "cronSessionReadOnly": "Les sessions Cron sont en lecture seule et ne peuvent pas recevoir de nouveaux tours.",
     "stopResponse": "Arrêter la réponse actuelle",
     "stopResponseEsc": "Arrêter la réponse actuelle (Échap)",
     "stoppingResponse": "Arrêt sécurisé en cours… Les nouveaux messages seront mis en file.",

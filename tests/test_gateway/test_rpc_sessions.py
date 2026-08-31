@@ -3789,6 +3789,28 @@ class TestSessionsSend:
         assert res.error.code == "NOT_FOUND"
 
     @pytest.mark.asyncio
+    async def test_send_rejects_cron_session_before_acceptance(self, dispatcher):
+        cron_session = FakeSession(
+            session_key="cron:job-1:run:1",
+            session_id="cron-run-1",
+            origin={"kind": "cron"},
+        )
+        manager = FakeSessionManager([cron_session])
+        ctx = make_ctx(session_manager=manager, turn_runner=_RecordingTurnRunner())
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.send",
+            {"key": cron_session.session_key, "message": "Unexpected follow-up"},
+            ctx,
+        )
+
+        assert res.ok is False
+        assert res.error.code == "SESSION_NOT_INTERACTIVE"
+        assert manager.applied_intents == []
+        assert manager.created_messages == []
+
+    @pytest.mark.asyncio
     async def test_send_rejects_too_many_attachments(self, dispatcher, ctx_with_sessions, session):
         # The per-turn cap is 10; 11 must be rejected.
         res = await dispatcher.dispatch(
