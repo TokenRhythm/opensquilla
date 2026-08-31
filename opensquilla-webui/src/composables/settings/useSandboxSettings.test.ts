@@ -178,6 +178,19 @@ afterEach(() => {
 })
 
 describe('useSandboxSettings auto-save', () => {
+  it.each(['failed', 'unavailable', 'setting_up'] as const)(
+    'does not offer first-time setup for %s', async setupState => {
+      const { call, scope, settings } = await createSandboxSettings({ desktop: true, setupState })
+      await settings.load()
+      await settle()
+      expect(settings.sandboxSetupStatus.value?.state).toBe(setupState)
+      expect(settings.canRequestSandboxSetup.value).toBe(false)
+      expect(await settings.ensureSandboxSetupForSafeMode()).toBe(false)
+      expect(call.mock.calls.some(([method]) => method === 'sandbox.setup.ensure')).toBe(false)
+      scope.stop()
+    },
+  )
+
   it('persists a default mode selection without a separate save action', async () => {
     const { call, scope, settings } = await createSandboxSettings()
     await settings.load()

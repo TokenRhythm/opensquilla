@@ -57,6 +57,52 @@ async def test_capability_status_never_executes_canaries(monkeypatch, refresh):
     assert report.capabilities == frozenset()
 
 
+@pytest.mark.parametrize(
+    ("marker_exists", "apis_available", "expected"),
+    [
+        (False, True, SandboxSetupState.NOT_SETUP),
+        (True, True, SandboxSetupState.FAILED),
+        (False, False, SandboxSetupState.FAILED),
+    ],
+)
+async def test_windows_startup_distinguishes_first_setup_from_failure(
+    monkeypatch, tmp_path, marker_exists, apis_available, expected
+):
+    from opensquilla.sandbox import backend
+    from opensquilla.sandbox.backend import windows_default_setup, windows_default_support
+
+    marker_path = tmp_path / "setup_marker.json"
+    if marker_exists:
+        marker_path.write_text("{}", encoding="utf-8")
+    checks = []
+
+    def passive_support(*, verify_runtime):
+        checks.append(verify_runtime)
+        return SimpleNamespace(
+            default_backend_available=False,
+            proxy_allowlist_enforced=False,
+            ctypes_available=apis_available,
+            token_api_available=apis_available,
+            acl_api_available=apis_available,
+        )
+
+    monkeypatch.setattr(backend.sys, "platform", "win32")
+    monkeypatch.setattr(windows_default_setup, "default_setup_marker_path", lambda: marker_path)
+    monkeypatch.setattr(windows_default_support, "probe_windows_default_support", passive_support)
+    integration.configure_runtime(SandboxSettings(sandbox=True), defer_backend=True)
+
+    result = await setup_runtime.initialize_sandbox_runtime(SimpleNamespace())
+    assert result.state is expected
+    assert isinstance(integration.get_runtime().backend, UnavailableBackend)
+    assert await setup_runtime.current_sandbox_setup_runtime_status(SimpleNamespace()) is result
+    assert await setup_runtime.initialize_sandbox_runtime(SimpleNamespace()) is result
+    report = await setup_runtime.current_sandbox_capability_report(
+        SimpleNamespace(), force_refresh=True
+    )
+    assert report.available is False
+    assert checks == [False]
+
+
 def test_deferred_runtime_does_not_check_or_select_backend(monkeypatch):
     def unexpected_selection(_settings):
         raise AssertionError("gateway construction must not initialize the sandbox")

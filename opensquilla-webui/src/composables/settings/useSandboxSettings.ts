@@ -239,9 +239,6 @@ export function useSandboxSettings() {
   const defaultRunMode = ref<SandboxRunMode>('full')
   const defaultRunModePending = ref(false)
   const defaultRunModeError = ref('')
-  const sandboxWarningSuppressed = ref(false)
-  const desktopWarningPreferenceAvailable = ref(false)
-  const desktopPreferencePending = ref(false)
   const sectionPending = reactive<Record<SandboxPolicySection, boolean>>({
     files: false,
     commands: false,
@@ -269,10 +266,7 @@ export function useSandboxSettings() {
   const canRequestSandboxSetup = computed(() => (
     platform.capabilities.isDesktop
     && capability.value?.setupSupported !== false
-    && (
-      sandboxSetupStatus.value?.state === 'not_setup'
-      || sandboxSetupStatus.value?.state === 'failed'
-    )
+    && sandboxSetupStatus.value?.state === 'not_setup'
   ))
 
   function sectionDirty(section: SandboxPolicySection): boolean {
@@ -304,7 +298,6 @@ export function useSandboxSettings() {
       defaultRunMode.value = loadedRunMode
       void loadRuntimeStatus()
       void loadSandboxReadiness()
-      void loadDesktopPreference()
     } catch (error) {
       loadError.value = errorMessage(error)
     } finally {
@@ -583,20 +576,6 @@ export function useSandboxSettings() {
     return runRuntimeAction('sandbox.runtime.discard_download', componentId, { componentId })
   }
 
-  async function loadDesktopPreference(): Promise<void> {
-    const desktop = platform.settings
-    if (typeof desktop.getDesktopPreferences !== 'function') return
-    desktopWarningPreferenceAvailable.value = true
-    try {
-      const preferences = await desktop.getDesktopPreferences()
-      sandboxWarningSuppressed.value = Boolean(
-        preferences.sandboxUnavailableWarningSuppressed,
-      )
-    } catch {
-      desktopWarningPreferenceAvailable.value = false
-    }
-  }
-
   function queueSave<T>(operation: () => Promise<T>): Promise<T> {
     const queued = saveQueue.then(operation)
     saveQueue = queued.then(() => undefined, () => undefined)
@@ -655,22 +634,6 @@ export function useSandboxSettings() {
     defaultRunModeSequence += 1
     defaultRunMode.value = defaultRunModeBaseline.value
     defaultRunModeError.value = ''
-  }
-
-  async function resetSandboxUnavailableWarning(): Promise<void> {
-    const desktop = platform.settings
-    if (typeof desktop.saveDesktopPreferences !== 'function') return
-    desktopPreferencePending.value = true
-    try {
-      const preferences = await desktop.saveDesktopPreferences({
-        sandboxUnavailableWarningSuppressed: false,
-      })
-      sandboxWarningSuppressed.value = Boolean(
-        preferences.sandboxUnavailableWarningSuppressed,
-      )
-    } finally {
-      desktopPreferencePending.value = false
-    }
   }
 
   async function performSectionSave(section: SandboxPolicySection): Promise<boolean> {
@@ -793,9 +756,6 @@ export function useSandboxSettings() {
     defaultRunModeBaseline,
     defaultRunModePending,
     defaultRunModeError,
-    sandboxWarningSuppressed,
-    desktopWarningPreferenceAvailable,
-    desktopPreferencePending,
     sectionPending,
     sectionError,
     sectionDirty,
@@ -814,7 +774,6 @@ export function useSandboxSettings() {
     adoptSavedDefaultRunMode,
     saveDefaultRunMode,
     discardDefaultRunMode,
-    resetSandboxUnavailableWarning,
     scheduleSectionSave,
     flushSectionSave,
     saveSection,

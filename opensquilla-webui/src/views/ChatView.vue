@@ -1614,12 +1614,6 @@ const sandboxSetupRecovery = useSandboxSetupRecovery({
   connectionState: computed(() => rpc.state),
   runMode: requestedRunMode,
   autoRefresh: false,
-  onUnavailable: async (status) => {
-    await platform.settings.reportSandboxUnavailable?.({
-      state: status.state,
-      ...(status.message ? { message: status.message } : {}),
-    })
-  },
 })
 const {
   status: sandboxSetupStatus,
@@ -1636,14 +1630,15 @@ const composerAllowedRunModes = computed<SandboxRunMode[]>(() => {
   }
   const status = sandboxSetupStatus.value
   if (
-    status !== null
-    && status.state !== 'ready'
+    status === null
+    || status.state !== 'ready'
   ) {
     return allowedRunModes.value.filter((mode) => mode !== 'safe')
   }
   return allowedRunModes.value
 })
-const composerSafeSetupAvailable = computed(() => sandboxSetupRecovery.canSetup.value)
+const composerSafeSetupAvailable = computed(() =>
+  !sandboxSetupPending.value && sandboxSetupRecovery.canSetup.value)
 const composerSandboxSetupOpen = ref(false)
 
 async function refreshPostBootstrapMetadata() {
@@ -4717,10 +4712,10 @@ function cancelComposerSandboxSetup(): void {
 async function confirmComposerSandboxSetup(): Promise<void> {
   if (sandboxSetupPending.value) return
   const ready = await sandboxSetupStore.startSafeSetup()
+  await sandboxSetupRecovery.refresh()
   if (ready) {
     composerSandboxSetupOpen.value = false
     await refreshRunModePreference()
-    await sandboxSetupRecovery.refresh()
   }
 }
 

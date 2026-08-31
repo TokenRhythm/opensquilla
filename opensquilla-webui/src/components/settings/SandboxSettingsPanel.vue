@@ -708,8 +708,8 @@ async function continueSandboxSetup(): Promise<void> {
   if (ready) {
     sandboxSetupConfirmOpen.value = false
     if (sandboxSetupIntendedMode.value === 'safe') adoptSavedDefaultRunMode('safe')
-    await load()
   }
+  await load()
 }
 
 function runSandboxSetupInBackground(): void {

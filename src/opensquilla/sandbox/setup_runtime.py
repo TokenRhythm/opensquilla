@@ -12,6 +12,7 @@ from opensquilla.sandbox.setup_state import (
     SetupResult,
     ensure_sandbox_setup,
 )
+from opensquilla.sandbox.types import SandboxSetupRequiredError
 
 _LOCK = asyncio.Lock()
 _SETTING_UP = False
@@ -99,6 +100,7 @@ async def initialize_sandbox_runtime(config: Any) -> SetupResult:
     async with _LOCK:
         _require_current_generation(generation)
         if _LAST_RESULT is not None and _LAST_RESULT.state in {
+            SandboxSetupState.NOT_SETUP,
             SandboxSetupState.READY,
             SandboxSetupState.FAILED,
             SandboxSetupState.UNAVAILABLE,
@@ -114,6 +116,15 @@ async def initialize_sandbox_runtime(config: Any) -> SetupResult:
                 state=SandboxSetupState.READY,
                 platform=sys.platform,
                 message="Sandbox initialized.",
+            )
+        except SandboxSetupRequiredError as exc:
+            _require_current_generation(generation)
+            result = SetupResult(
+                state=SandboxSetupState.NOT_SETUP,
+                platform=sys.platform,
+                message="Sandbox setup has not been completed.",
+                requires_admin=sys.platform.startswith("win"),
+                detail=str(exc),
             )
         except Exception as exc:  # noqa: BLE001 - failure disables only the sandbox
             _require_current_generation(generation)

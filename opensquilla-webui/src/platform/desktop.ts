@@ -552,13 +552,6 @@ export function createDesktopPlatform(): Platform {
             ),
           }
         : {}),
-      ...(typeof window.opensquillaDesktop?.reportSandboxUnavailable === 'function'
-        ? {
-            reportSandboxUnavailable: (payload) => (
-              requireDesktopApi().reportSandboxUnavailable!(payload)
-            ),
-          }
-        : {}),
     },
     onboarding: {
       getDefaults: () => requireDesktopApi().getOnboardingDefaults(),

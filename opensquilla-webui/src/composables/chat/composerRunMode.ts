@@ -18,9 +18,10 @@ export function composerRunModeSelectionAction(
   canSetup: boolean,
   setupResolved = true,
 ): ComposerRunModeSelectionAction {
-  if (mode === 'safe' && !setupResolved) return 'ignore'
-  if (mode === 'full' || setupStatus === null || setupStatus.state === 'ready') return 'persist'
-  return canSetup ? 'setup' : 'ignore'
+  if (mode === 'full') return 'persist'
+  if (!setupResolved || setupStatus === null) return 'ignore'
+  if (setupStatus.state === 'ready') return 'persist'
+  return setupStatus.state === 'not_setup' && canSetup ? 'setup' : 'ignore'
 }
 
 export async function completeComposerSafeSetup(

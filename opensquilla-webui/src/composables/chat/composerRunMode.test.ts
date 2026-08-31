@@ -56,6 +56,19 @@ describe('effectiveComposerRunMode', () => {
     expect(composerRunModeSelectionAction('full', null, false, false)).toBe('persist')
   })
 
+  it.each(['failed', 'unavailable', 'setting_up'] as const)(
+    'ignores Safe selection when setup is %s even if setup availability is stale',
+    state => {
+      const status = { state, platform: 'win32', message: '', requiresAdmin: false }
+      expect(composerRunModeSelectionAction('safe', status, true)).toBe('ignore')
+      expect(composerRunModeSelectionAction('full', status, true)).toBe('persist')
+    },
+  )
+
+  it('does not select Safe without an authoritative status', () => {
+    expect(composerRunModeSelectionAction('safe', null, false)).toBe('ignore')
+  })
+
   it('persists Safe only after setup succeeds', async () => {
     const persist = vi.fn().mockResolvedValue(undefined)
 

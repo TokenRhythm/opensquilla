@@ -489,9 +489,6 @@ export interface PlatformSettingsApi {
       sandboxUnavailableWarningSuppressed?: boolean
     },
   ) => Promise<DesktopPreferences>
-  reportSandboxUnavailable?: (
-    payload: { state: 'failed' | 'unavailable'; message?: string },
-  ) => Promise<{ shown: boolean; suppressed: boolean }>
 }
 
 export interface PlatformOnboardingApi {

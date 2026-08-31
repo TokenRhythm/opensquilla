@@ -29,7 +29,7 @@ from opensquilla.sandbox.backend.seatbelt import SeatbeltBackend
 from opensquilla.sandbox.backend.unavailable import UnavailableBackend
 from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
 from opensquilla.sandbox.config import SandboxSettings
-from opensquilla.sandbox.types import SandboxBackendError
+from opensquilla.sandbox.types import SandboxBackendError, SandboxSetupRequiredError
 
 log = logging.getLogger(__name__)
 
@@ -87,11 +87,19 @@ def _backend_available(backend: Backend, *, verify_runtime: bool) -> bool:
     if isinstance(backend, BubblewrapBackend):
         return sys.platform.startswith("linux") and shutil.which("bwrap") is not None
     if isinstance(backend, WindowsDefaultBackend):
+        from opensquilla.sandbox.backend.windows_default_setup import default_setup_marker_path
         from opensquilla.sandbox.backend.windows_default_support import (
             probe_windows_default_support,
         )
 
         support = probe_windows_default_support(verify_runtime=False)
+        if (
+            support.ctypes_available
+            and support.token_api_available
+            and support.acl_api_available
+            and not default_setup_marker_path().exists()
+        ):
+            raise SandboxSetupRequiredError("Windows sandbox has not been set up yet.")
         return support.default_backend_available and support.proxy_allowlist_enforced
     return backend.available()
 
