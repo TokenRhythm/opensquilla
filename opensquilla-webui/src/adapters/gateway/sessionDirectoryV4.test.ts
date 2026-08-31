@@ -10,6 +10,7 @@ import { SESSIONS_LIST_METHOD } from '@/contracts/generated/v4/sessionsList'
 import { SESSIONS_RESOLVE_METHOD } from '@/contracts/generated/v4/sessionsResolve'
 import { SESSIONS_SEARCH_METHOD } from '@/contracts/generated/v4/sessionsSearch'
 import type { SessionDirectory } from '@/modules/sessionDirectory'
+import { isCronSessionKey } from '@/modules/sessionDirectory'
 import { useSessions } from '@/composables/useSessions'
 
 type SessionDirectoryTransport = Parameters<typeof createV4SessionDirectory>[0]
@@ -44,6 +45,12 @@ function fixtureCase(document: string, caseId: string): WireFixture {
 }
 
 describe('v4 SessionDirectory Adapter', () => {
+  it('recognizes isolated cron session keys as read-only', () => {
+    expect(isCronSessionKey('cron:job-1:run:1')).toBe(true)
+    expect(isCronSessionKey(' CRON:job-1:run:1 ')).toBe(true)
+    expect(isCronSessionKey('agent:main:webchat:one')).toBe(false)
+  })
+
   it('uses the pinned legacy Gateway wire without requiring a new envelope', async () => {
     const request = fixtureCase('requests.json', 'request.page-first')
     const response = fixtureCase('responses.json', 'response.empty-page')

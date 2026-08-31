@@ -3346,6 +3346,7 @@
     "sendQueues": "送信（現在の応答後にキューへ追加）",
     "sendSteers": "送信（現在の応答を今すぐ誘導）",
     "sendQueuesUntilCompaction": "送信（圧縮の完了までキューへ追加）",
+    "cronSessionReadOnly": "Cron セッションは読み取り専用で、新しいターンを受け付けません。",
     "stopResponse": "現在の応答を停止",
     "stopResponseEsc": "現在の応答を停止（Esc）",
     "stoppingResponse": "安全に停止しています… 新しいメッセージはキューに入ります。",

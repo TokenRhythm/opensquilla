@@ -25,6 +25,11 @@ export interface SessionItem {
   hasContractGaps: boolean
 }
 
+/** Cron runs are isolated, scheduled sessions and are intentionally read-only. */
+export function isCronSessionKey(key: string): boolean {
+  return key.trim().toLowerCase().startsWith('cron:')
+}
+
 export interface SessionPage {
   items: SessionItem[]
   hasMore: boolean
