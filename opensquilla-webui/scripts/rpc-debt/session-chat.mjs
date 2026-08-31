@@ -27,9 +27,9 @@ export const debt = {
     supportsMethod: 1,
     waitForConnection: 2,
   },
-  // GoalCenter now owns goals.status/set; legacy mutation/reattach calls and
-  // the goal event listener remain until the next Goals event slice.
-  'src/composables/chat/useChatGoals.ts': { call: 3, on: 1 },
+  // GoalCenter owns goals.status/set and GoalContinuity owns reattach/events;
+  // the four edit/pause/resume/clear mutations remain on the legacy path.
+  'src/composables/chat/useChatGoals.ts': { call: 1 },
   'src/composables/chat/useChatHistory.ts': { call: 1, waitForConnection: 1 },
   'src/composables/chat/useChatMetaDraftRecovery.ts': {
     call: 1,

@@ -19,6 +19,7 @@ from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.start_turn import reserve_turn_via_runtime
 from opensquilla.gateway.adapters.goals_contract import (
     register_goals_capabilities_contract,
+    register_goals_reattach_contract,
     register_goals_set_contract,
     register_goals_status_contract,
 )
@@ -4948,6 +4949,24 @@ async def test_goal_contract_adapters_register_one_handler_per_operation() -> No
         "runtimeBudgetSeconds": 3600,
         "methods": ["goals.set"],
     }
+    reattach_result = {
+        "accepted": True,
+        "sessionKey": SOURCE_KEY,
+        "sessionId": "session-id",
+        "epoch": 0,
+        "goal": {
+            "status": "active",
+            "goalId": "g1",
+            "sessionKey": SOURCE_KEY,
+            "sessionId": "session-id",
+            "epoch": 0,
+            "objective": "ship",
+            "stateRevision": 1,
+            "objectiveRevision": 1,
+            "progressRevision": 0,
+        },
+        "continuityToken": "token",
+    }
     observed: list[tuple[str, Any]] = []
 
     async def status_implementation(params: Any, _ctx: Any) -> dict[str, Any]:
@@ -4961,6 +4980,10 @@ async def test_goal_contract_adapters_register_one_handler_per_operation() -> No
     async def capabilities_implementation(params: Any, _ctx: Any) -> dict[str, Any]:
         observed.append(("capabilities", params))
         return capabilities_result
+
+    async def reattach_implementation(params: Any, _ctx: Any) -> dict[str, Any]:
+        observed.append(("reattach", params))
+        return reattach_result
 
     status_handler = register_goals_status_contract(
         registry,
@@ -4980,21 +5003,43 @@ async def test_goal_contract_adapters_register_one_handler_per_operation() -> No
         internal_error=RpcHandlerError,
         guest_allowed_checker=is_guest_rpc_method_allowed,
     )
+    reattach_handler = register_goals_reattach_contract(
+        registry,
+        reattach_implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
 
     assert await status_handler({"session_key": SOURCE_KEY}, object()) is status_result
     assert await set_handler({"session_key": SOURCE_KEY, "message": "ship"}, object()) is set_result
     assert await capabilities_handler({"session_key": SOURCE_KEY}, object()) is capabilities_result
+    assert await reattach_handler({
+        "session_key": SOURCE_KEY,
+        "session_id": "session-id",
+        "epoch": 0,
+        "expected_goal_id": "g1",
+        "continuity_token": "token",
+    }, object()) is reattach_result
     assert observed == [
         ("status", {"session_key": SOURCE_KEY}),
         ("set", {"session_key": SOURCE_KEY, "message": "ship"}),
         ("capabilities", {"session_key": SOURCE_KEY}),
+        ("reattach", {
+            "session_key": SOURCE_KEY,
+            "session_id": "session-id",
+            "epoch": 0,
+            "expected_goal_id": "g1",
+            "continuity_token": "token",
+        }),
     ]
     assert registry.get_entry("goals.status") is not None
     assert registry.get_entry("goals.set") is not None
     assert registry.get_entry("goals.capabilities") is not None
+    assert registry.get_entry("goals.reattach") is not None
     assert registry.get_entry("goals.status").handler is status_handler
     assert registry.get_entry("goals.set").handler is set_handler
     assert registry.get_entry("goals.capabilities").handler is capabilities_handler
+    assert registry.get_entry("goals.reattach").handler is reattach_handler
 
 
 @pytest.mark.asyncio
@@ -5045,3 +5090,34 @@ async def test_goal_contract_adapter_maps_invalid_result_without_running_twice()
     assert calls == 1
     assert error.value.code == "INTERNAL_ERROR"
     assert error.value.message == "goals.set response violated its v4 contract"
+
+
+@pytest.mark.asyncio
+async def test_goal_reattach_contract_maps_invalid_result_without_running_twice() -> None:
+    registry = RpcRegistry()
+    calls = 0
+
+    async def implementation(_params: Any, _ctx: Any) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        return {"accepted": True}
+
+    handler = register_goals_reattach_contract(
+        registry,
+        implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+
+    with pytest.raises(RpcHandlerError) as error:
+        await handler({
+            "sessionKey": SOURCE_KEY,
+            "sessionId": "session-id",
+            "epoch": 0,
+            "expectedGoalId": "g1",
+            "continuityToken": "token",
+        }, object())
+
+    assert calls == 1
+    assert error.value.code == "INTERNAL_ERROR"
+    assert error.value.message == "goals.reattach response violated its v4 contract"
