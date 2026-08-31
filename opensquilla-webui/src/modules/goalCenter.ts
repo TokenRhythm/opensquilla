@@ -82,7 +82,8 @@ export class GoalCenterError extends Error {
 }
 
 export interface GoalCenter {
-  available(operation?: 'status' | 'set'): boolean
+  /** Report whether the requested Goal UX operation is available. */
+  available(operation?: 'status' | 'set' | 'goal-mode'): boolean
   status(sessionKey: string, options?: { signal?: AbortSignal }): Promise<GoalStatusResult>
   set(input: GoalSetInput, options?: { signal?: AbortSignal }): Promise<GoalSetResult>
 }
