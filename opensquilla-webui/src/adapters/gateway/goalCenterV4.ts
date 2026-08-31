@@ -3,6 +3,14 @@ import { GOALS_CAPABILITIES_METHOD, type Result as GoalCapabilitiesWireResult } 
 import { validateResult as validateGoalCapabilitiesResult } from '@/contracts/generated/v4/goalsCapabilitiesValidators.mjs'
 import { GOALS_SET_METHOD, type Params as GoalSetParams, type Result as GoalSetWireResult } from '@/contracts/generated/v4/goalsSet'
 import { validateParams as validateGoalSetParams, validateResult as validateGoalSetResult } from '@/contracts/generated/v4/goalsSetValidators.mjs'
+import { GOALS_EDIT_METHOD } from '@/contracts/generated/v4/goalsEdit'
+import { validateResult as validateGoalEditResult } from '@/contracts/generated/v4/goalsEditValidators.mjs'
+import { GOALS_PAUSE_METHOD } from '@/contracts/generated/v4/goalsPause'
+import { validateResult as validateGoalPauseResult } from '@/contracts/generated/v4/goalsPauseValidators.mjs'
+import { GOALS_RESUME_METHOD } from '@/contracts/generated/v4/goalsResume'
+import { validateResult as validateGoalResumeResult } from '@/contracts/generated/v4/goalsResumeValidators.mjs'
+import { GOALS_CLEAR_METHOD } from '@/contracts/generated/v4/goalsClear'
+import { validateResult as validateGoalClearResult } from '@/contracts/generated/v4/goalsClearValidators.mjs'
 import { GOALS_STATUS_METHOD, type Params as GoalStatusParams, type Result as GoalStatusWireResult } from '@/contracts/generated/v4/goalsStatus'
 import { validateParams as validateGoalStatusParams, validateResult as validateGoalStatusResult } from '@/contracts/generated/v4/goalsStatusValidators.mjs'
 import type { GoalCapabilities, GoalCenter, GoalMutationInput, GoalMutationResult, GoalSetResult, GoalStatusResult } from '@/modules/goalCenter'
@@ -13,6 +21,13 @@ import { mapGoalError } from './goalErrorMapping'
 interface GoalCenterTransport {
   request<T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions): Promise<T>
   supports?(method: string): boolean
+}
+
+const mutationValidators: Record<string, (value: unknown) => boolean> = {
+  [GOALS_EDIT_METHOD]: validateGoalEditResult,
+  [GOALS_PAUSE_METHOD]: validateGoalPauseResult,
+  [GOALS_RESUME_METHOD]: validateGoalResumeResult,
+  [GOALS_CLEAR_METHOD]: validateGoalClearResult,
 }
 
 const text = (...values: unknown[]): string | undefined => values.find(value => typeof value === 'string' && value.trim()) as string | undefined
@@ -36,7 +51,7 @@ export function createV4GoalCenter(transport: GoalCenterTransport): GoalCenter {
       }
       try {
         const raw = await transport.request<Record<string, unknown>>(method, params, optionsFor(options?.signal))
-        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw) || !mutationValidators[method](raw)) {
           throw new Error(`${method} returned an invalid response`)
         }
         const sessionKey = text(raw.sessionKey, raw.session_key)

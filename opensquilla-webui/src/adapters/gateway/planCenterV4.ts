@@ -1,6 +1,14 @@
 import type { RpcCallOptions, RpcEventHandler } from '@/lib/rpc'
 import type { PlanCardActionTarget, PlanRevisionRequest } from '@/types/plans'
 import type { PlanCenter, PlanEvent, PlanMutationResult } from '@/modules/planCenter'
+import { PLANS_SET_MODE_METHOD } from '@/contracts/generated/v4/plansSetMode'
+import { validateResult as validateSetModeResult } from '@/contracts/generated/v4/plansSetModeValidators.mjs'
+import { PLANS_REVISE_METHOD } from '@/contracts/generated/v4/plansRevise'
+import { validateResult as validateReviseResult } from '@/contracts/generated/v4/plansReviseValidators.mjs'
+import { PLANS_IMPLEMENT_METHOD } from '@/contracts/generated/v4/plansImplement'
+import { validateResult as validateImplementResult } from '@/contracts/generated/v4/plansImplementValidators.mjs'
+import { PLANS_CANCEL_RUN_METHOD } from '@/contracts/generated/v4/plansCancelRun'
+import { validateResult as validateCancelRunResult } from '@/contracts/generated/v4/plansCancelRunValidators.mjs'
 
 interface PlanTransport {
   request<T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions): Promise<T>
@@ -20,14 +28,6 @@ function optionsFor(signal?: AbortSignal): RpcCallOptions | undefined {
 function normalizeResult(value: unknown): PlanMutationResult {
   const source = object(value)
   return {
-    available(operation = 'mutations') {
-      if (!transport.supports) return true
-      if (operation === 'mode') return transport.supports('plans.setMode') && transport.supports('plans.capabilities')
-      return transport.supports('plans.setMode')
-        && transport.supports('plans.revise')
-        && transport.supports('plans.implement')
-        && transport.supports('plans.cancelRun')
-    },
     ...source,
     accepted: typeof source.accepted === 'boolean' ? source.accepted : undefined,
     replayed: typeof source.replayed === 'boolean' ? source.replayed : undefined,
@@ -38,6 +38,19 @@ function normalizeResult(value: unknown): PlanMutationResult {
     planRun: (source.planRun ?? source.plan_run) as PlanMutationResult['planRun'],
     activePlanRun: (source.activePlanRun ?? source.active_plan_run ?? source.planRun ?? source.plan_run) as PlanMutationResult['activePlanRun'],
   }
+}
+
+function requestResult<T>(
+  transport: PlanTransport,
+  method: string,
+  validator: (value: unknown) => boolean,
+  params: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<PlanMutationResult> {
+  return transport.request<T>(method, params, optionsFor(signal)).then(value => {
+    if (!validator(value)) throw new Error(`${method} returned an invalid response`)
+    return normalizeResult(value)
+  })
 }
 
 function event(kind: PlanEvent['kind'], payload: unknown): PlanEvent {
@@ -53,25 +66,33 @@ function event(kind: PlanEvent['kind'], payload: unknown): PlanEvent {
 
 export function createV4PlanCenter(transport: PlanTransport, events: PlanEvents): PlanCenter {
   return {
+    available(operation = 'mutations') {
+      if (!transport.supports) return true
+      if (operation === 'mode') return transport.supports(PLANS_SET_MODE_METHOD) && transport.supports('plans.capabilities')
+      return transport.supports(PLANS_SET_MODE_METHOD)
+        && transport.supports(PLANS_REVISE_METHOD)
+        && transport.supports(PLANS_IMPLEMENT_METHOD)
+        && transport.supports(PLANS_CANCEL_RUN_METHOD)
+    },
     setMode(sessionKey, mode, expectedRevision, options) {
-      return transport.request('plans.setMode', { sessionKey, mode, expectedRevision }, optionsFor(options?.signal)).then(normalizeResult)
+      return requestResult(transport, PLANS_SET_MODE_METHOD, validateSetModeResult, { sessionKey, mode, expectedRevision }, options?.signal)
     },
     revise(sessionKey, request: PlanRevisionRequest, clientRequestId, options) {
-      return transport.request('plans.revise', {
+      return requestResult(transport, PLANS_REVISE_METHOD, validateReviseResult, {
         sessionKey, planRevisionId: request.revisionId, prompt: request.prompt.trim(), clientRequestId,
-      }, optionsFor(options?.signal)).then(normalizeResult)
+      }, options?.signal)
     },
     implement(sessionKey, target: PlanCardActionTarget, clientRequestId, options) {
-      return transport.request('plans.implement', {
+      return requestResult(transport, PLANS_IMPLEMENT_METHOD, validateImplementResult, {
         sessionKey, planRevisionId: target.revisionId, clientRequestId,
         ...(options?.intent ? { intent: options.intent } : {}),
-      }, optionsFor(options?.signal)).then(normalizeResult)
+      }, options?.signal)
     },
     cancelRun(sessionKey, runId, expectedStateRevision, options) {
-      return transport.request('plans.cancelRun', {
+      return requestResult(transport, PLANS_CANCEL_RUN_METHOD, validateCancelRunResult, {
         sessionKey, runId,
         ...(expectedStateRevision !== undefined ? { expectedStateRevision } : {}),
-      }, optionsFor(options?.signal)).then(normalizeResult)
+      }, options?.signal)
     },
     subscribe(listener) {
       const subscriptions = [
