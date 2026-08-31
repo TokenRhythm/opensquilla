@@ -6,7 +6,7 @@ unit-tested with a JS runner here, so we lock the SPA source text:
 
 - meta-skills are offered as Tab-completable **argument candidates** in the
   slash menu (not a toast), via the command's ``argumentChoices``;
-- selecting ``/meta <skill>`` runs it through ``meta.run`` + a hidden turn.
+- selecting ``/meta <skill>`` runs it through ``MetaRunCenter`` + a hidden turn.
 
 The contract intentionally targets the maintained Vue source rather than a
 generated browser bundle.
@@ -39,8 +39,10 @@ def test_meta_run_path_uses_meta_run_rpc() -> None:
     case_body = text[text.index(case_marker):]
     helper_body = text[text.index(helper_marker):text.index(helper_end)]
     assert "runMetaInvocation" in case_body, "meta.menu must use the durable invocation path"
-    assert "meta.run" in helper_body, "running a chosen meta-skill must call the meta.run RPC"
-    assert "sessionKey" in helper_body, "meta.run must pass the session key"
+    assert "options.metaRunCenter.launch" in helper_body, (
+        "running a chosen meta-skill must use the MetaRunCenter domain adapter"
+    )
+    assert "sessionKey" in helper_body, "MetaRunCenter.launch must pass the session key"
     assert "dispatchHidden" in helper_body, "running a meta-skill must trigger a hidden turn"
-    assert "setup_required" in helper_body, "setup failures must not start a turn"
+    assert "result?.setupRequired" in helper_body, "setup failures must not start a turn"
     assert "readiness.missing_bins" in helper_body, "setup must identify missing binaries"
