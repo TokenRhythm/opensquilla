@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick, ref } from 'vue'
 import i18n from '@/i18n'
 import zhHans from '@/locales/zh-Hans.json'
+import { SETUP_WORKFLOW_KEY, type SetupWorkflow } from '@/modules/setupWorkflow'
 import EmptyStateChips from './EmptyStateChips.vue'
 
 vi.mock('@/composables/useRpc', () => ({
@@ -25,6 +26,9 @@ async function mountChips(props: {
     agentId: 'main',
     ...props,
   })
+  app.provide(SETUP_WORKFLOW_KEY, {
+    status: async () => ({}),
+  } as SetupWorkflow)
   app.use(i18n)
   app.mount(el)
   await nextTick()

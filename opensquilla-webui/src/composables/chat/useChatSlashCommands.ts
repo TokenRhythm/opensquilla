@@ -1,10 +1,9 @@
 import { computed, ref, type Ref } from 'vue'
 import i18n from '@/i18n'
 import type { RpcCallOptions, RpcClientError, RpcConnectionWaitOptions } from '@/lib/rpc'
-import type { MetaRunCenter } from '@/modules/metaRunCenter'
+import type { MetaLaunchDraftPayload, MetaRunCenter } from '@/modules/metaRunCenter'
 import type { HiddenControlDispatchResult } from '@/types/chat'
 import type { MetaSetupReadiness } from '@/types/metaSetup'
-import type { MetaLaunchDraftPayload } from '@/types/rpc'
 import { createClientRequestId } from '@/utils/chat/messageIdentity'
 import {
   waitForSessionRpcConnection,

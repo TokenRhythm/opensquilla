@@ -4,6 +4,7 @@ import { createApp, defineComponent, nextTick, ref, type App } from 'vue'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import i18n from '@/i18n'
 import SettingsDialog from './SettingsDialog.vue'
+import { MIGRATION_OPERATIONS_KEY } from '@/modules/migrationOperations'
 
 const mounted: App[] = []
 const mocks = vi.hoisted(() => ({
@@ -112,6 +113,15 @@ async function mountDialog(path: '/settings/advanced' | '/settings/dataMigration
   const app = createApp(SettingsDialog)
   app.use(router)
   app.use(i18n)
+  app.provide(MIGRATION_OPERATIONS_KEY, {
+    listSources: vi.fn(async () => ({
+      schemaVersion: 1 as const,
+      mode: 'preview_only' as const,
+      capabilities: { discover: false, preview: false, apply: false, manualSource: false },
+      candidates: [],
+    })),
+    preview: vi.fn(async () => { throw new Error('unsupported') }),
+  })
   app.mount(el)
   mounted.push(app)
   await settle()

@@ -4,6 +4,7 @@ import { useRpcStore } from '@/stores/rpc'
 import { useToasts } from '@/composables/useToasts'
 import { useConfirm } from '@/composables/useConfirm'
 import { approvePairingParams, errorMessage, withPendingKey } from '@/composables/channels/shared'
+import type { AppSettings } from '@/modules/appSettings'
 
 // Members state for one selected channel: pairing requests, approved access,
 // and channel-admin standing. Owned by the /channels view (state survives tab
@@ -38,7 +39,7 @@ export function bootstrapAsAdminDefault(
   return approvedCount === 0 && adminCount === 0
 }
 
-export function useChannelMembers() {
+export function useChannelMembers(appSettings: AppSettings) {
   const rpc = useRpcStore()
   const { pushToast } = useToasts()
   const { confirm } = useConfirm()
@@ -150,9 +151,7 @@ export function useChannelMembers() {
   // the list for the selected channel.
   async function loadChannelAdmins(name: string, id: number): Promise<void> {
     try {
-      const map = await rpc.call<Record<string, unknown> | null>('config.get', {
-        path: 'channel_admin_senders',
-      })
+      const map = await appSettings.read('channel_admin_senders')
       if (activeName.value !== name || id !== requestId) return
       const list = map && typeof map === 'object' ? (map as Record<string, unknown>)[name] : undefined
       adminSenders.value = Array.isArray(list) ? list.map(String) : []

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
 import { useRpcStore } from '@/stores/rpc'
+import type { WorkspaceCatalog } from '@/modules/workspaceCatalog'
 import { useProjectWorkspaces } from './useProjectWorkspaces'
 
 const PROJECT_METHODS = [
@@ -18,6 +19,31 @@ function connectOwner(rpc: ReturnType<typeof useRpcStore>) {
   rpc.methods = PROJECT_METHODS
 }
 
+function catalogFromRpc(rpc: ReturnType<typeof useRpcStore>): WorkspaceCatalog {
+  const call = (method: string, params?: Record<string, unknown>) =>
+    rpc.client!.call(method, params)
+  return {
+    list: async () => ((await call('workspaces.list', undefined) as { workspaces?: unknown }).workspaces ?? []) as never,
+    open: async path => {
+      const result = await call('workspaces.open', { path, trusted: true }) as { workspace?: unknown }
+      return result.workspace as never
+    },
+    rename: async (id, name) => {
+      const result = await call('workspaces.update', { workspaceId: id, name }) as { workspace?: unknown }
+      return result.workspace as never
+    },
+    setPinned: async (id, pinned) => {
+      const result = await call('workspaces.pin', { workspaceId: id, pinned }) as { workspace?: unknown }
+      return result.workspace as never
+    },
+    remove: async id => { await call('workspaces.remove', { workspaceId: id }) },
+    deleteHistory: async id => await call('workspaces.history.delete', { workspaceId: id }) as never,
+    listPath: async () => { throw new Error('not used') },
+    createDirectory: async () => { throw new Error('not used') },
+    pickPath: async () => { throw new Error('not used') },
+  }
+}
+
 describe('useProjectWorkspaces', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
@@ -29,7 +55,7 @@ describe('useProjectWorkspaces', () => {
     rpc.client = {
       call: vi.fn().mockRejectedValue(new Error('owner scope required')),
     } as never
-    const projects = useProjectWorkspaces()
+    const projects = useProjectWorkspaces(catalogFromRpc(rpc))
 
     await expect(projects.loadWorkspaces()).rejects.toThrow('owner scope required')
 
@@ -54,7 +80,7 @@ describe('useProjectWorkspaces', () => {
         },
       ],
     }) } as never
-    const projects = useProjectWorkspaces()
+    const projects = useProjectWorkspaces(catalogFromRpc(rpc))
 
     await projects.loadWorkspaces()
 
@@ -76,7 +102,7 @@ describe('useProjectWorkspaces', () => {
       .mockReturnValueOnce(firstResponse)
       .mockReturnValueOnce(secondResponse)
     rpc.client = { call } as never
-    const projects = useProjectWorkspaces()
+    const projects = useProjectWorkspaces(catalogFromRpc(rpc))
 
     const first = projects.loadWorkspaces()
     const second = projects.loadWorkspaces()
@@ -121,7 +147,7 @@ describe('useProjectWorkspaces', () => {
       .mockReturnValueOnce(firstResponse)
       .mockReturnValueOnce(secondResponse)
     rpc.client = { call } as never
-    const projects = useProjectWorkspaces()
+    const projects = useProjectWorkspaces(catalogFromRpc(rpc))
 
     const first = projects.loadWorkspaces().catch((cause: unknown) => cause)
     const second = projects.loadWorkspaces()
@@ -153,7 +179,7 @@ describe('useProjectWorkspaces', () => {
       .mockResolvedValueOnce({ workspace: { id: 'a' } })
       .mockResolvedValue({ workspaces: [] })
     rpc.client = { call } as never
-    const projects = useProjectWorkspaces()
+    const projects = useProjectWorkspaces(catalogFromRpc(rpc))
 
     await projects.openWorkspace('/repo/a')
 
@@ -176,7 +202,7 @@ describe('useProjectWorkspaces', () => {
       })
       .mockResolvedValueOnce({ workspaces: [] })
     rpc.client = { call } as never
-    const projects = useProjectWorkspaces()
+    const projects = useProjectWorkspaces(catalogFromRpc(rpc))
 
     const result = await projects.deleteWorkspaceHistory('a')
 
@@ -199,7 +225,7 @@ describe('useProjectWorkspaces', () => {
       })
       .mockRejectedValueOnce(new Error('refresh unavailable'))
     rpc.client = { call } as never
-    const projects = useProjectWorkspaces()
+    const projects = useProjectWorkspaces(catalogFromRpc(rpc))
 
     const result = await projects.deleteWorkspaceHistory('a')
 
@@ -223,7 +249,7 @@ describe('useProjectWorkspaces', () => {
       .mockResolvedValueOnce({ workspaceId: 'remove-me' })
       .mockRejectedValueOnce(new Error('refresh unavailable'))
     rpc.client = { call } as never
-    const projects = useProjectWorkspaces()
+    const projects = useProjectWorkspaces(catalogFromRpc(rpc))
     await projects.loadWorkspaces()
 
     await expect(projects.removeWorkspace('remove-me')).resolves.toBeUndefined()
@@ -244,7 +270,7 @@ describe('useProjectWorkspaces', () => {
     rpc.methods = PROJECT_METHODS
     const call = vi.fn()
     rpc.client = { call } as never
-    const projects = useProjectWorkspaces()
+    const projects = useProjectWorkspaces(catalogFromRpc(rpc))
 
     await expect(projects.loadWorkspaces()).resolves.toEqual([])
     await expect(projects.openWorkspace('/repo/a')).rejects.toThrow(
@@ -272,7 +298,7 @@ describe('useProjectWorkspaces', () => {
         }],
       }),
     } as never
-    const projects = useProjectWorkspaces()
+    const projects = useProjectWorkspaces(catalogFromRpc(rpc))
     await projects.loadWorkspaces()
 
     rpc.auth = { principal: { isOwner: false } }

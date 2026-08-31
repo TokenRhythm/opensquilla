@@ -1,5 +1,6 @@
 import { computed, ref } from 'vue'
 import { useRpcStore } from '@/stores/rpc'
+import type { AppSettings } from '@/modules/appSettings'
 
 /** Config slice + status consumed by the Settings › Advanced
  *  "memory & self-learning" group. Dream and self-learning are separate
@@ -44,7 +45,7 @@ export interface SelfLearningStatus {
   error?: string
 }
 
-export function useMemoryLearningSettings() {
+export function useMemoryLearningSettings(appSettings: AppSettings) {
   const rpc = useRpcStore()
 
   const loaded = ref(false)
@@ -66,8 +67,7 @@ export function useMemoryLearningSettings() {
 
   async function load(): Promise<void> {
     try {
-      await rpc.waitForConnection()
-      const cfg = await rpc.call<MemoryLearningConfig>('config.get')
+      const cfg = await appSettings.readAll() as MemoryLearningConfig
       dreamEnabled.value = cfg?.memory?.dream?.enabled === true
       dreamAutoSchedule.value = cfg?.memory?.dream?.auto_schedule === true
       selfLearningEnabled.value = cfg?.squilla_router?.self_learning?.enabled === true
@@ -96,9 +96,9 @@ export function useMemoryLearningSettings() {
     const prev = selfLearningEnabled.value
     selfLearningEnabled.value = on
     try {
-      const res = await rpc.call<PatchResponse>('config.patch.safe', {
-        patches: { 'squilla_router.self_learning.enabled': on },
-      })
+      const res = await appSettings.patchSafe([
+        { path: 'squilla_router.self_learning.enabled', value: on },
+      ]) as PatchResponse
       if (res?.linked?.length) {
         // The backend enabled the dream chain alongside; mirror it.
         dreamEnabled.value = true
@@ -127,9 +127,10 @@ export function useMemoryLearningSettings() {
     dreamAutoSchedule.value = on
     dreamLinkedOn.value = false // the user has now touched it themselves
     try {
-      const res = await rpc.call<PatchResponse>('config.patch.safe', {
-        patches: { 'memory.dream.enabled': on, 'memory.dream.auto_schedule': on },
-      })
+      const res = await appSettings.patchSafe([
+        { path: 'memory.dream.enabled', value: on },
+        { path: 'memory.dream.auto_schedule', value: on },
+      ]) as PatchResponse
       if (res?.restartRequired) restartRequired.value = true
       if (selfLearningEnabled.value) void refreshStatus()
       return true

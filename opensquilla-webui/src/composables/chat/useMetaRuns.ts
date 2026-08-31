@@ -1,13 +1,13 @@
 import { reactive, ref, watch, type Ref } from 'vue'
 import i18n from '@/i18n'
-import type { MetaRunCenter } from '@/modules/metaRunCenter'
 import type {
   MetaPreflightPayload,
   MetaRunAnnouncedPayload,
   MetaRunCompletedPayload,
+  MetaRunCenter,
+  MetaSessionEventPayload,
   MetaStepStatePayload,
-  SessionEventPayload,
-} from '@/types/rpc'
+} from '@/modules/metaRunCenter'
 import { isCurrentSessionPayload, isStaleEpoch } from '@/utils/chat/streamEvents'
 import {
   completeRun,
@@ -114,7 +114,7 @@ export function useMetaRuns(options: UseMetaRunsOptions) {
     if (!ribbonOrder.value.includes(runId)) ribbonOrder.value = [...ribbonOrder.value, runId]
   }
 
-  function gatePayload(payload: SessionEventPayload | null | undefined): boolean {
+  function gatePayload(payload: MetaSessionEventPayload | null | undefined): boolean {
     if (!payload || typeof payload !== 'object') return false
     if (isStaleEpoch(payload, currentEpoch.value)) return false
     if (!isCurrentSessionPayload(payload, sessionKey.value)) return false

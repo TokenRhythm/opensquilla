@@ -391,6 +391,14 @@ async function mountChannelsView(options: {
       return () => h(KeepAlive, null, [h(Component)])
     },
   }))
+  const { APP_SETTINGS_KEY } = await import('@/modules/appSettings')
+  const { SETUP_WORKFLOW_KEY } = await import('@/modules/setupWorkflow')
+  app.provide(APP_SETTINGS_KEY, {
+    read: async (path: string) => await rpcCall('config.get', { path }),
+  } as unknown as import('@/modules/appSettings').AppSettings)
+  app.provide(SETUP_WORKFLOW_KEY, {
+    catalog: async () => await rpcCall('onboarding.catalog'),
+  } as unknown as import('@/modules/setupWorkflow').SetupWorkflow)
   app.use(i18n)
   app.mount(el)
   await nextTick()

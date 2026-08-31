@@ -52,7 +52,7 @@ export const debt = {
   },
   'src/views/AgentsView.vue': { call: 3 },
   'src/views/LogsView.vue': { call: 2, waitForConnection: 1 },
-  'src/views/OverviewView.vue': { call: 3, waitForConnection: 2 },
+  'src/views/OverviewView.vue': { call: 2, waitForConnection: 1 },
   'src/views/SkillsView.vue': { call: 1, waitForConnection: 1 },
   'src/utils/workbench/artifactPreviewLease.ts': {
     httpRequest: 3,

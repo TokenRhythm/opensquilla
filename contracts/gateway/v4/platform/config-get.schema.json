@@ -10,7 +10,14 @@
   "x-opensquilla-method": {"name": "config.get", "kind": "query", "scope": "operator.read", "guestAllowed": false, "idempotency": "read-only", "timeout": {"policy": "transport"}, "capability": {"kind": "method-availability", "name": "config.get"}, "request": "#/$defs/RequestFrame", "params": "#/$defs/Params", "response": "#/$defs/ResponseFrame", "result": "#/$defs/Result", "errors": [{"code": "INVALID_REQUEST"}, {"code": "UNAUTHORIZED"}, {"code": "UNAVAILABLE", "retryable": true}, {"code": "INTERNAL_ERROR"}]},
   "$defs": {
     "Params": {"type": "object", "additionalProperties": true, "properties": {"path": {"type": "string"}}},
-    "Result": {"type": "object", "additionalProperties": true},
+    "Result": {"anyOf": [
+      {"type": "object", "additionalProperties": true},
+      {"type": "array"},
+      {"type": "string"},
+      {"type": "number"},
+      {"type": "boolean"},
+      {"type": "null"}
+    ]},
     "RpcError": {"type": "object", "additionalProperties": true},
     "RequestFrame": {"type": "object", "additionalProperties": true, "required": ["type", "id", "method"], "properties": {"type": {"const": "req"}, "id": {"type": "string"}, "method": {"const": "config.get"}}},
     "ResponseFrame": {"type": "object", "additionalProperties": true, "required": ["type", "id", "ok"], "properties": {"type": {"const": "res"}, "id": {"type": "string"}, "ok": {"type": "boolean"}, "payload": {"$ref": "#/$defs/Result"}, "error": {"$ref": "#/$defs/RpcError"}}}

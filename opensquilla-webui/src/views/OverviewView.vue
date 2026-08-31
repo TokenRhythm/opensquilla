@@ -195,6 +195,7 @@ import { useRequest } from '@/composables/useRequest'
 import { requestUsageSnapshot } from '@/composables/usage/useUsageQuery'
 import { effectiveCnyPerUsd } from '@/composables/usage/nativeBilling'
 import { SESSION_DIRECTORY_KEY } from '@/modules/sessionDirectory'
+import { PROVIDER_CONFIGURATION_KEY, type ProviderStatusRow } from '@/modules/providerConfiguration'
 import type { UsageSnapshot } from '@/types/usage'
 import { useToasts } from '@/composables/useToasts'
 import { isOwnedGatewayConnection } from '@/composables/useCliInvocation'
@@ -265,23 +266,6 @@ interface UsageData {
   totalCostUsd?: number
 }
 
-// providers.status row — only the fields the overview reads. `latency` is a
-// newer optional TTFT summary; older gateways omit it entirely.
-interface ProviderStatusRow {
-  providerId?: string
-  active?: boolean
-  latency?: {
-    p50TtftMs?: number | null
-    p95TtftMs?: number | null
-    samples?: number | null
-    windowMinutes?: number | null
-  } | null
-}
-
-interface ProvidersStatusData {
-  providers?: ProviderStatusRow[]
-}
-
 // ---------------------------------------------------------------------------
 // Stores & Router
 // ---------------------------------------------------------------------------
@@ -292,6 +276,9 @@ const rpc = useRpcStore()
 const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
 if (!injectedSessionDirectory) throw new Error('SessionDirectory was not provided')
 const sessionDirectory = injectedSessionDirectory
+const injectedProviderConfiguration = inject(PROVIDER_CONFIGURATION_KEY)
+if (!injectedProviderConfiguration) throw new Error('ProviderConfiguration was not provided')
+const providerConfiguration = injectedProviderConfiguration
 const { pushToast } = useToasts()
 const platform = usePlatform()
 
@@ -685,9 +672,8 @@ async function loadHealth({ deep, silent = false }: HealthLoadOptions) {
 
 async function loadProviderStatus() {
   try {
-    await rpc.waitForConnection()
-    const data = await rpc.call<ProvidersStatusData>('providers.status', {})
-    providerRows.value = Array.isArray(data?.providers) ? data.providers : []
+    const data = await providerConfiguration.status()
+    providerRows.value = [...data.providers]
   } catch {
     // Latency is optional telemetry; the overview must render without it.
   }

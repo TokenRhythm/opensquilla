@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opensquilla.dev/contracts/gateway/v4/platform/migration-sources-list.schema.json",
+  "title": "OpenSquilla migration.sources.list Contract",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {"request": {"$ref": "#/$defs/RequestFrame"}, "response": {"$ref": "#/$defs/ResponseFrame"}},
+  "x-opensquilla-wire": {"protocol": "opensquilla-websocket-json", "version": 4, "compatibility": "exact-json-tree"},
+  "x-opensquilla-codegen": {"python": {"tool": "datamodel-code-generator", "version": "0.75.1", "target": "pydantic_v2.BaseModel"}, "typescript": {"tool": "json-schema-to-typescript", "version": "15.0.4"}, "runtimeValidation": {"tool": "ajv", "version": "8.17.1", "mode": "standalone-adapter-only"}},
+  "x-opensquilla-method": {"name": "migration.sources.list", "kind": "query", "scope": "operator.admin", "guestAllowed": false, "idempotency": "read-only", "timeout": {"policy": "transport"}, "capability": {"kind": "method-availability", "name": "migration.sources.list"}, "request": "#/$defs/RequestFrame", "params": "#/$defs/Params", "response": "#/$defs/ResponseFrame", "result": "#/$defs/Result", "errors": [{"code": "INVALID_REQUEST"}, {"code": "UNAUTHORIZED"}, {"code": "UNAVAILABLE", "retryable": true}, {"code": "INTERNAL_ERROR"}]},
+  "$defs": {
+    "Params": {"type": "object", "additionalProperties": false},
+    "Candidate": {"type": "object", "additionalProperties": false, "required": ["candidateId", "sourceKind", "version", "estimatedActivityAt", "sessionCount", "sizeBytes", "previouslyImported"], "properties": {"candidateId": {"type": "string", "minLength": 1}, "sourceKind": {"type": "string"}, "version": {"anyOf": [{"type": "string"}, {"type": "null"}]}, "estimatedActivityAt": {"anyOf": [{"type": "string"}, {"type": "null"}]}, "sessionCount": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]}, "sizeBytes": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]}, "previouslyImported": {"type": "boolean"}}},
+    "Capabilities": {"type": "object", "additionalProperties": false, "required": ["discover", "preview", "apply", "manualSource"], "properties": {"discover": {"type": "boolean"}, "preview": {"type": "boolean"}, "apply": {"type": "boolean"}, "manualSource": {"type": "boolean"}}},
+    "Result": {"type": "object", "additionalProperties": false, "required": ["schemaVersion", "mode", "capabilities", "candidates"], "properties": {"schemaVersion": {"const": 1}, "mode": {"const": "preview_only"}, "capabilities": {"$ref": "#/$defs/Capabilities"}, "candidates": {"type": "array", "items": {"$ref": "#/$defs/Candidate"}}}},
+    "RpcError": {"type": "object", "additionalProperties": true},
+    "RequestFrame": {"type": "object", "additionalProperties": true, "required": ["type", "id", "method"], "properties": {"type": {"const": "req"}, "id": {"type": "string"}, "method": {"const": "migration.sources.list"}}},
+    "ResponseFrame": {"type": "object", "additionalProperties": true, "required": ["type", "id", "ok"], "properties": {"type": {"const": "res"}, "id": {"type": "string"}, "ok": {"type": "boolean"}, "payload": {"$ref": "#/$defs/Result"}, "error": {"$ref": "#/$defs/RpcError"}}}
+  }
+}

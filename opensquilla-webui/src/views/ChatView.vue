@@ -808,7 +808,10 @@ import {
 } from '@/modules/sessionDirectory'
 import { SESSION_LIFECYCLE_KEY } from '@/modules/sessionLifecycle'
 import { PENDING_INPUT_QUEUE_KEY } from '@/modules/pendingInputQueue'
-import { useRpcCall } from '@/composables/useRpc'
+import { APP_SETTINGS_KEY } from '@/modules/appSettings'
+import { PROVIDER_CONFIGURATION_KEY } from '@/modules/providerConfiguration'
+import { SETUP_WORKFLOW_KEY } from '@/modules/setupWorkflow'
+import { useSetupStatus } from '@/composables/setup/useSetupStatus'
 import { useAppStore } from '@/stores/app'
 import { useSandboxSetupStore } from '@/stores/sandboxSetup'
 import { useArtifactPromptAnnotationsStore } from '@/stores/artifactPromptAnnotations'
@@ -1209,6 +1212,12 @@ const goalContinuity: GoalContinuity = injectedGoalContinuity
 const injectedMetaRunCenter = inject(META_RUN_CENTER_KEY)
 if (!injectedMetaRunCenter) throw new Error('MetaRunCenter was not provided')
 const metaRunCenter: MetaRunCenter = injectedMetaRunCenter
+const injectedAppSettings = inject(APP_SETTINGS_KEY)
+if (!injectedAppSettings) throw new Error('AppSettings was not provided')
+const injectedProviderConfiguration = inject(PROVIDER_CONFIGURATION_KEY)
+if (!injectedProviderConfiguration) throw new Error('ProviderConfiguration was not provided')
+const injectedSetupWorkflow = inject(SETUP_WORKFLOW_KEY)
+if (!injectedSetupWorkflow) throw new Error('SetupWorkflow was not provided')
 
 async function resolveCreatedSessionAvailability(sessionKey: string): Promise<boolean> {
   try {
@@ -2106,6 +2115,8 @@ const {
 
 const chatFeatureToggles = useChatFeatureToggles({
   rpc,
+  appSettings: injectedAppSettings,
+  modelRouting: injectedProviderConfiguration,
   readCallOptions: optionalSessionRpcCallOptions,
   setGlobalElevatedMode,
   loadCurrentSessionUsage,
@@ -2511,11 +2522,9 @@ const {
 // (including env-var keys the browser can't see), so audioConfigured is a true
 // "voice will work" signal — this keeps the button from being clicked into a
 // guaranteed failure. It's the same snapshot the empty-state chips read.
-const voiceCapability = useRpcCall<{ audioConfigured?: boolean }>(
-  'onboarding.status',
-  undefined,
-  { callOptions: optionalSessionRpcCallOptions },
-)
+const voiceCapability = useSetupStatus<{ audioConfigured?: boolean }>(injectedSetupWorkflow, {
+  allowed: optionalSessionRpcAllowed,
+})
 const voiceReady = computed(() => voiceCapability.data.value?.audioConfigured === true)
 
 const chatMessageActions = useChatMessageActions({
