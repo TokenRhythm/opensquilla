@@ -8,6 +8,7 @@ from typing import Any, cast
 
 from opensquilla.gateway.adapters.goals_contract import (
     register_goals_capabilities_contract,
+    register_goals_reattach_contract,
     register_goals_set_contract,
     register_goals_status_contract,
 )
@@ -361,7 +362,6 @@ async def _handle_goals_resume(params: dict | None, ctx: RpcContext) -> dict:
     )
 
 
-@_d.method("goals.reattach", scope="operator.write")
 async def _handle_goals_reattach(params: dict | None, ctx: RpcContext) -> dict:
     service = _goal_service(ctx)
     session_id = _string_param(params, "sessionId", "session_id")
@@ -394,6 +394,14 @@ async def _handle_goals_reattach(params: dict | None, ctx: RpcContext) -> dict:
         ),
         service=service,
     )
+
+
+_handle_goals_reattach_contract = register_goals_reattach_contract(
+    _d,
+    _handle_goals_reattach,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 @_d.method("goals.clear", scope="operator.write")

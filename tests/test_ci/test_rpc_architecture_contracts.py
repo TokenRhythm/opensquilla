@@ -99,7 +99,7 @@ SESSIONS_LIST_GATEWAY_ADAPTER = (
     PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
 )
 RUNTIME_RPC_METHOD_BASELINE = 306
-STATIC_RPC_DECORATOR_BASELINE = 293
+STATIC_RPC_DECORATOR_BASELINE = 292
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
 # closure measurement below.  The temporary S2a cumulative growth budget was
@@ -160,10 +160,10 @@ F2_FOUNDATION_RUNTIME_FILES = (
 # composition seam, and PendingInputQueue adds its typed adapter registration
 # and module provision (5 lines). ApprovalCenter adds the HTTP-backed adapter
 # seam and its composition entry (21 lines). GoalCenter adds its typed
-# composition entry (4 lines). Keep every reviewed increment
-# explicit rather than turning the foundation exception into an open-ended
-# budget.
-F2_FOUNDATION_RUNTIME_LOC_CEILING = 1_192
+# composition entry (4 lines), and GoalContinuity adds its independently
+# owned lease/event seam (4 lines). Keep every reviewed increment explicit
+# rather than turning the foundation exception into an open-ended budget.
+F2_FOUNDATION_RUNTIME_LOC_CEILING = 1_196
 
 # Existing cross-rpc private imports are architectural debt. This exact ledger
 # prevents growth and also fails stale when an import is removed, so reductions
@@ -406,6 +406,10 @@ def test_schema_derived_method_metadata_consumers_are_exact() -> None:
             "opensquilla.contracts.generated.v4.goals_capabilities_metadata",
             GOALS_METADATA_IMPORT_ALLOWLIST,
         ),
+        "goals.reattach": (
+            "opensquilla.contracts.generated.v4.goals_reattach_metadata",
+            GOALS_METADATA_IMPORT_ALLOWLIST,
+        ),
     }
     for method, (module_name, allowlist) in allowlists.items():
         consumers = {
@@ -584,9 +588,11 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "goals.status",
             "goals.set",
             "goals.capabilities",
+            "goals.reattach",
             "GOALS_STATUS_METHOD",
             "GOALS_SET_METHOD",
             "GOALS_CAPABILITIES_METHOD",
+            "GOALS_REATTACH_METHOD",
         }
     ] == []
 
@@ -626,6 +632,10 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
         GOALS_CAPABILITIES_METHOD,
         GOALS_CAPABILITIES_SCOPE,
     )
+    from opensquilla.contracts.generated.v4.goals_reattach_metadata import (
+        GOALS_REATTACH_METHOD,
+        GOALS_REATTACH_SCOPE,
+    )
     from opensquilla.contracts.generated.v4.goals_set_metadata import (
         GOALS_SET_METHOD,
         GOALS_SET_SCOPE,
@@ -639,6 +649,7 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
         (GOALS_STATUS_METHOD, GOALS_STATUS_SCOPE),
         (GOALS_SET_METHOD, GOALS_SET_SCOPE),
         (GOALS_CAPABILITIES_METHOD, GOALS_CAPABILITIES_SCOPE),
+        (GOALS_REATTACH_METHOD, GOALS_REATTACH_SCOPE),
     ):
         entry = registry.get_entry(method)
         assert entry is not None

@@ -6,6 +6,7 @@ import {
   useChatGoals,
   type GoalContinuityStorage,
 } from './useChatGoals'
+import type { GoalEvent, GoalReattachInput } from '@/modules/goalContinuity'
 
 const SESSION_KEY = 'agent:main:webchat:test'
 const SESSION_ID = 'session-1'
@@ -96,12 +97,34 @@ function mutation(goal: unknown, extra: Record<string, unknown> = {}) {
 
 function harness(continuityStorage?: GoalContinuityStorage) {
   const handlers = new Map<string, (...args: unknown[]) => void>()
+  const toGoalEvent = (value: unknown): GoalEvent => {
+    const source = (value && typeof value === 'object' && !Array.isArray(value))
+      ? value as Record<string, unknown>
+      : {}
+    const nested = Object.prototype.hasOwnProperty.call(source, 'goal')
+      ? source.goal
+      : source
+    const goal = nested && typeof nested === 'object' && !Array.isArray(nested)
+      ? nested as Record<string, unknown>
+      : null
+    const text = (...values: unknown[]) => values.find(item => typeof item === 'string') as string | null ?? null
+    const integer = (...values: unknown[]) => values.find(item => typeof item === 'number') as number | null ?? null
+    return {
+      eventType: text(source.eventType, source.event_type) as GoalEvent['eventType'] ?? 'updated',
+      sessionKey: text(source.sessionKey, source.session_key, source.key, goal?.sessionKey, goal?.session_key),
+      sessionId: text(source.sessionId, source.session_id, goal?.sessionId, goal?.session_id),
+      epoch: integer(source.epoch, source.sessionEpoch, source.session_epoch, goal?.epoch),
+      streamSeq: integer(source.streamSeq, source.stream_seq),
+      streamGeneration: text(source.streamGeneration, source.stream_generation),
+      stateRevision: integer(source.stateRevision, source.state_revision, goal?.stateRevision, goal?.state_revision),
+      progressRevision: integer(source.progressRevision, source.progress_revision, goal?.progressRevision, goal?.progress_revision),
+      objectiveRevision: integer(source.objectiveRevision, source.objective_revision, goal?.objectiveRevision, goal?.objective_revision),
+      previousGoalId: text(source.previousGoalId, source.previous_goal_id),
+      goal: goal as GoalEvent['goal'],
+    }
+  }
   const rpc = {
     call: vi.fn().mockResolvedValue(mutation(goalPayload())),
-    on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
-      handlers.set(event, handler)
-      return () => handlers.delete(event)
-    }),
   }
   const goalCenter = {
     available: () => true,
@@ -115,6 +138,15 @@ function harness(continuityStorage?: GoalContinuityStorage) {
     status: async (sessionKey: string) => ({ sessionKey, sessionId: SESSION_ID, epoch: 1, goal: goalPayload() }),
     set: async (input: { sessionKey: string; objective: string; clientRequestId: string; clientMessageId: string }) => rpc.call('goals.set', input),
   }
+  const goalContinuity = {
+    reattach: vi.fn((input: GoalReattachInput) => rpc.call('goals.reattach', input)),
+    subscribe: vi.fn((listener: (event: GoalEvent) => void) => {
+      const handler = (payload: unknown) => listener(toGoalEvent(payload))
+      handlers.set('session.event.goal', handler)
+      return { close: () => handlers.delete('session.event.goal') }
+    }),
+    dispose: vi.fn(),
+  }
   const sessionKey = ref(SESSION_KEY)
   const currentEpoch = ref(0)
   const notify = vi.fn()
@@ -124,6 +156,7 @@ function harness(continuityStorage?: GoalContinuityStorage) {
   const api = useChatGoals({
     rpc,
     goalCenter,
+    goalContinuity,
     sessionKey,
     currentEpoch,
     ensureSessionKey,
@@ -139,6 +172,7 @@ function harness(continuityStorage?: GoalContinuityStorage) {
     currentEpoch,
     notify,
     handlers,
+    goalContinuity,
     ensureSessionKey,
     ensureSubscribed,
     onSetAccepted,
@@ -163,7 +197,7 @@ describe('useChatGoals', () => {
   it('starts from the mutation response after subscription without watchers or polling', async () => {
     vi.useFakeTimers()
     try {
-      const { api, rpc, ensureSubscribed, onSetAccepted } = harness()
+      const { api, rpc, goalContinuity, ensureSubscribed, onSetAccepted } = harness()
       const started = await api.startGoal('  Refactor the module  ')
 
       expect(started).toBe(true)
@@ -194,9 +228,7 @@ describe('useChatGoals', () => {
 
       await vi.advanceTimersByTimeAsync(15_000)
       expect(rpc.call).toHaveBeenCalledTimes(1)
-      expect(rpc.on).toHaveBeenCalledWith('session.event.goal', expect.any(Function))
-      expect(rpc.on).not.toHaveBeenCalledWith('session.event.goal_run', expect.anything())
-      expect(rpc.on).not.toHaveBeenCalledWith('session.event.plan_run', expect.anything())
+      expect(goalContinuity.subscribe).toHaveBeenCalledWith(expect.any(Function))
     } finally {
       vi.useRealTimers()
     }
@@ -422,7 +454,7 @@ describe('useChatGoals', () => {
       goalSnapshotStreamSeq: 4,
       goal: detached,
     })).toBe(true)
-    expect(refreshed.rpc.call).toHaveBeenCalledWith('goals.reattach', {
+    expect(refreshed.goalContinuity.reattach).toHaveBeenCalledWith({
       sessionKey: SESSION_KEY,
       sessionId: SESSION_ID,
       epoch: 1,
@@ -580,7 +612,7 @@ describe('useChatGoals', () => {
       continuityToken: 'continuity-token-2',
     }))
     expect(await refreshed.api.takeOverConnection()).toBe(true)
-    expect(refreshed.rpc.call).toHaveBeenLastCalledWith('goals.reattach', {
+    expect(refreshed.goalContinuity.reattach).toHaveBeenLastCalledWith({
       sessionKey: SESSION_KEY,
       sessionId: SESSION_ID,
       epoch: 1,
