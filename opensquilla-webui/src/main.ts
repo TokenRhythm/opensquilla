@@ -21,6 +21,8 @@ import { META_RUN_CENTER_KEY } from './modules/metaRunCenter'
 import { APP_SETTINGS_KEY } from './modules/appSettings'
 import { PROVIDER_CONFIGURATION_KEY } from './modules/providerConfiguration'
 import { SETUP_WORKFLOW_KEY } from './modules/setupWorkflow'
+import { MIGRATION_OPERATIONS_KEY } from './modules/migrationOperations'
+import { WORKSPACE_CATALOG_KEY } from './modules/workspaceCatalog'
 import 'katex/dist/katex.min.css'
 import './assets/base.css'
 import './themes/tokens' // eagerly bundles every value theme's token block
@@ -72,6 +74,8 @@ app.provide(META_RUN_CENTER_KEY, gatewayAdapters.metaRunCenter)
 app.provide(APP_SETTINGS_KEY, gatewayAdapters.appSettings)
 app.provide(PROVIDER_CONFIGURATION_KEY, gatewayAdapters.providerConfiguration)
 app.provide(SETUP_WORKFLOW_KEY, gatewayAdapters.setupWorkflow)
+app.provide(MIGRATION_OPERATIONS_KEY, gatewayAdapters.migrationOperations)
+app.provide(WORKSPACE_CATALOG_KEY, gatewayAdapters.workspaceCatalog)
 router.afterEach(() => {
   rpcStore.applyLinkTokenFromUrl()
 })

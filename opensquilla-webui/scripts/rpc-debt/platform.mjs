@@ -1,12 +1,6 @@
 export const lane = 'platform'
 
 export const debt = {
-  'src/components/ProjectWorkspacePickerDialog.vue': { call: 3 },
-  'src/components/settings/DataMigrationPanel.vue': {
-    call: 2,
-    supportsMethod: 2,
-    waitForConnection: 1,
-  },
   'src/components/settings/SettingsMemoryPanel.vue': {
     call: 9,
     markMethodUnavailable: 4,

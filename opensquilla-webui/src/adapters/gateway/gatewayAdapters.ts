@@ -28,6 +28,10 @@ import type { ProviderConfiguration } from '@/modules/providerConfiguration'
 import { createV4ProviderConfiguration } from './providerConfigurationV4'
 import type { SetupWorkflow } from '@/modules/setupWorkflow'
 import { createV4SetupWorkflow } from './setupWorkflowV4'
+import type { MigrationOperations } from '@/modules/migrationOperations'
+import { createV4MigrationOperations } from './migrationOperationsV4'
+import type { WorkspaceCatalog } from '@/modules/workspaceCatalog'
+import { createV4WorkspaceCatalog } from './workspaceCatalogV4'
 
 type RpcStoreTransportSource = Parameters<typeof createPrivateGatewayTransports>[0]
 
@@ -46,6 +50,8 @@ export interface GatewayAdapters {
   readonly appSettings: AppSettings
   readonly providerConfiguration: ProviderConfiguration
   readonly setupWorkflow: SetupWorkflow
+  readonly migrationOperations: MigrationOperations
+  readonly workspaceCatalog: WorkspaceCatalog
 }
 
 interface GatewayHttpSource {
@@ -86,6 +92,8 @@ export function createGatewayAdapters(
     appSettings: createV4AppSettings(transports.rpc),
     providerConfiguration: createV4ProviderConfiguration(transports.rpc),
     setupWorkflow: createV4SetupWorkflow(transports.rpc),
+    migrationOperations: createV4MigrationOperations(transports.rpc),
+    workspaceCatalog: createV4WorkspaceCatalog(transports.rpc),
   }
   return adapters
 }
