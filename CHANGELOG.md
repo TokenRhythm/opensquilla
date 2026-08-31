@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Attachment turns in long sessions can now use one bounded automatic history
+  compaction when removable history is the only known capacity pressure, while
+  the current turn and its attachments remain protected. Deployments with
+  unknown context limits and Ensemble routes continue to fail closed with
+  actionable guidance.
+
 ## [0.5.4] - 2026-08-25
 
 ### Added

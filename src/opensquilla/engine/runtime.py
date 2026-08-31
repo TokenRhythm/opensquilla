@@ -5487,6 +5487,11 @@ class TurnRunner:
             # or ensemble wrapping changes ``provider`` for this one turn.
             durable_base_consumer_provider = provider
             cloned_selector = pt_out.cloned_selector
+            pre_router_provider_config = (
+                getattr(cloned_selector, "current_config", None)
+                if cloned_selector is not None
+                else None
+            )
             tool_defs = pt_out.tool_defs
             tool_handler = pt_out.tool_handler
             tool_context = pt_out.effective_tool_context
@@ -6000,8 +6005,16 @@ class TurnRunner:
             stable_consumer_proof_max_chars = (
                 agent.config.provider_request_proof_max_chars
             )
+            capacity_retry_pending = bool(
+                turn.metadata.get("large_context_capacity_retry_pending") is True
+            )
+            compaction_consumer_provider = (
+                provider
+                if capacity_retry_pending
+                else durable_base_consumer_provider
+            )
             stable_consumer_metadata = provider_metadata(
-                durable_base_consumer_provider
+                compaction_consumer_provider
             )
             llm_cfg = (
                 getattr(self._config, "llm", None)
@@ -6011,6 +6024,7 @@ class TurnRunner:
             if (
                 bool(turn.metadata.get("routing_applied", False))
                 and self._model_catalog is not None
+                and not capacity_retry_pending
             ):
                 (
                     base_provider,
@@ -6064,7 +6078,10 @@ class TurnRunner:
             stable_compaction_window_tokens = _durable_compaction_window_tokens(
                 compaction_context_window_tokens,
                 stable_consumer_window_tokens=stable_consumer_window_tokens,
-                routing_applied=bool(turn.metadata.get("routing_applied", False)),
+                routing_applied=bool(
+                    turn.metadata.get("routing_applied", False)
+                    and not capacity_retry_pending
+                ),
             )
             if stable_compaction_window_tokens != compaction_context_window_tokens:
                 log.info(
@@ -6080,7 +6097,7 @@ class TurnRunner:
             )
             if callable(bind_durable_consumer):
                 bind_durable_consumer(
-                    provider=durable_base_consumer_provider,
+                    provider=compaction_consumer_provider,
                     model_id=stable_consumer_model_id,
                     context_window_tokens=stable_consumer_window_tokens,
                     max_output_tokens=stable_consumer_max_output_tokens,
@@ -6122,7 +6139,7 @@ class TurnRunner:
                     attachments=attachments,
                     attachment_messages=extra_msgs,
                     context_window_tokens=compaction_context_window_tokens,
-                    consumer_provider=durable_base_consumer_provider,
+                    consumer_provider=compaction_consumer_provider,
                     consumer_max_output_tokens=(
                         stable_consumer_max_output_tokens
                     ),
@@ -6136,7 +6153,7 @@ class TurnRunner:
                     consumer_admission,
                     consumer_admission_fingerprint,
                 ) = build_consumer_admission(
-                    consumer_provider=durable_base_consumer_provider,
+                    consumer_provider=compaction_consumer_provider,
                     active_user_message=effective_runtime_message,
                     active_user_in_history=history_has_persisted_user,
                     bound_user_message_id=bound_user_message_id,
@@ -6201,6 +6218,81 @@ class TurnRunner:
                 )
             ch_out = ch_outcome.require_output()
             agent.config.request_context_prompt = ch_out.final_request_context_prompt
+            if turn.metadata.get("large_context_capacity_retry_pending") is True:
+                turn.metadata["large_context_capacity_compaction_t3_status"] = (
+                    ch_out.t3_upgrade_status
+                )
+                turn.metadata["large_context_capacity_compaction_preflight_invoked"] = (
+                    ch_out.preflight_invoked
+                )
+                retry_history_capacity = (
+                    await self._router_history_capacity_for_request(
+                        session_key,
+                        RouterHistoryReplayRequest(
+                            exclude_last_user=(
+                                history_has_persisted_user or persist_input
+                            ),
+                            bound_user_message_id=bound_user_message_id,
+                            transcript_snapshot=transcript_snapshot,
+                        ),
+                        max_history_turns=self._route_history_turn_limit(
+                            turn.metadata
+                        ),
+                        preserve_image_attachments=(
+                            turn.metadata.get("image_route_reason")
+                            in {"current_turn", "gate_history"}
+                        ),
+                        reachable_provider_kinds=(
+                            self._route_capacity_provider_kinds(
+                                turn,
+                                initial_provider_config=pre_router_provider_config,
+                            )
+                        ),
+                    )
+                )
+                turn.metadata["routing_history_capacity_estimated_tokens"] = max(
+                    0,
+                    int(
+                        retry_history_capacity.get(
+                            "history_capacity_estimated_tokens"
+                        )
+                        or 0
+                    ),
+                )
+                turn.metadata["routing_history_capacity_message_count"] = max(
+                    0,
+                    int(
+                        retry_history_capacity.get(
+                            "history_capacity_message_count"
+                        )
+                        or 0
+                    ),
+                )
+                turn.metadata["routing_history_capacity_estimate_complete"] = (
+                    retry_history_capacity.get(
+                        "history_capacity_estimate_complete"
+                    )
+                    is True
+                )
+                from opensquilla.engine.selector_override import (
+                    require_current_selector_capacity,
+                )
+                from opensquilla.engine.steps.squilla_router import (
+                    finalize_squilla_router_capacity,
+                )
+
+                turn = await finalize_squilla_router_capacity(
+                    turn,
+                    retry_after_compaction=True,
+                )
+                require_current_selector_capacity(
+                    cloned_selector,
+                    turn.metadata,
+                    reason=(
+                        "The final model deployment does not have proven capacity "
+                        "for this attachment request after automatic compaction."
+                    ),
+                )
 
             compaction_source_entries: tuple[Any, ...] | None = None
             compaction_source_preimage: tuple[tuple[Any, ...], ...] | None = None
@@ -6855,6 +6947,10 @@ class TurnRunner:
                 fallback_error_class="agent_error",
                 fallback_error_message=str(exc) or "Agent error",
             )
+            from opensquilla.engine.capacity_admission import (
+                LargeContextCapacityError,
+            )
+
             if provider_boundary_failure_kind:
                 event_code = safe_provider_failure_code(
                     str(getattr(exc, "code", "") or ""),
@@ -6864,6 +6960,13 @@ class TurnRunner:
                 error_message = safe_provider_failure_message(
                     provider_boundary_failure_kind
                 )
+            elif isinstance(exc, LargeContextCapacityError):
+                event_code = str(
+                    getattr(exc, "code", "attachment_capacity_unavailable")
+                    or "attachment_capacity_unavailable"
+                )
+                error_code = event_code
+                error_message = str(exc)
             elif isinstance(exc, UsageAccountingUnavailableError):
                 event_code = str(
                     getattr(exc, "code", UsageAccountingUnavailableError.code)
@@ -9409,7 +9512,36 @@ class TurnRunner:
         # prompt/tool boundary outside the generic fail-open pipeline wrapper.
         # An unexpected estimator failure must stop the turn rather than leave
         # an attachment route with unbounded selector fallbacks.
-        turn = await finalize_squilla_router_capacity(turn)
+        turn = await finalize_squilla_router_capacity(
+            turn,
+            allow_compaction_retry=bool(
+                router_history_replay_request is not None
+                and cloned_selector is not None
+                and self._session_manager is not None
+                and not bool(
+                    getattr(
+                        getattr(turn.config, "llm_ensemble", None),
+                        "enabled",
+                        False,
+                    )
+                )
+            ),
+        )
+        if turn.metadata.get("large_context_capacity_blocked") is True:
+            from opensquilla.engine.selector_override import (
+                require_current_selector_capacity,
+            )
+
+            # Fixed-baseline Ensemble paths intentionally skip the normal
+            # model-override call below. Enforce the finalized attachment
+            # capacity block before any such path can reach a provider.
+            require_current_selector_capacity(
+                cloned_selector,
+                turn.metadata,
+                reason=(
+                    "No deployment has proven capacity for this attachment request."
+                ),
+            )
 
         # Image routing is a capability boundary, not an Ensemble activation.
         # This applies to the dedicated image row and to any text tier selected

@@ -272,6 +272,23 @@ async def _upload_png(app: Any) -> str:
     return file_uuid
 
 
+async def _upload_text(app: Any) -> str:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post(
+            "/api/v1/files/upload",
+            files={"file": ("capacity.txt", b"capacity material", "text/plain")},
+        )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    file_uuid = payload.get("file_uuid")
+    assert isinstance(file_uuid, str) and file_uuid.startswith("u-")
+    return file_uuid
+
+
 async def _send_session_turn(
     *,
     ctx: RpcContext,
@@ -359,6 +376,16 @@ def _event_payloads(sink: _EventSink, event_name: str) -> list[dict[str, Any]]:
 
 def _file_uuid_attachment(file_uuid: str) -> dict[str, str]:
     return {"file_uuid": file_uuid, "mime": "image/png", "name": "first.png"}
+
+
+def _assert_persisted_png_attachment(entry: Any) -> None:
+    persisted = json.loads(entry.content)
+    attachments = persisted.get("attachments")
+    assert isinstance(attachments, list) and len(attachments) == 1
+    attachment = attachments[0]
+    assert attachment["mime"] == "image/png"
+    assert attachment["name"] == "first.png"
+    assert attachment["sha256_ref"] == hashlib.sha256(_PNG_BYTES).hexdigest()
 
 
 def _deterministic_png_payload(*, seed: str, size: int = 80_000) -> bytes:
@@ -805,6 +832,659 @@ async def test_gateway_current_image_capacity_uses_route_limited_media_history(
     assert persisted is not None
     assert persisted.session_id == session.session_id
     assert persisted.compaction_count == 0
+
+
+@pytest.mark.asyncio
+async def test_gateway_known_history_pressure_compacts_once_then_readmits(
+    _e2e_stack: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A known image deployment may bind only long enough to compact and retry."""
+
+    manager: SessionManager = _e2e_stack["manager"]
+    runner: TurnRunner = _e2e_stack["runner"]
+    subscription_manager: SubscriptionManager = _e2e_stack[
+        "subscription_manager"
+    ]
+    sink: _EventSink = _e2e_stack["sink"]
+    text_provider: _RecordingProvider = _e2e_stack["text_provider"]
+    gate_provider: _RecordingProvider = _e2e_stack["gate_provider"]
+    vision_provider: _RecordingProvider = _e2e_stack["vision_provider"]
+    key = "agent:main:attachment-capacity-compaction-retry"
+    await manager.create(session_key=key, agent_id="main")
+    subscription_manager.subscribe_messages(sink.conn_id, key)
+
+    # Keep the durable rows small; the route-capacity port below supplies the
+    # deterministic before/after estimates so this orchestration regression
+    # does not spend minutes tokenizing a synthetic megabyte-scale transcript.
+    await manager.append_message(key, "user", "historical user")
+    await manager.append_message(
+        key,
+        "assistant",
+        "historical assistant",
+    )
+
+    from opensquilla.provider.model_catalog import ModelCatalog
+
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            f"{_PROVIDER_ID}/{_VISION_MODEL}": {
+                "context_window": 128_000,
+                "max_output_tokens": 1_024,
+            }
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+
+    order: list[str] = []
+    capacity_results: list[dict[str, Any]] = []
+    capacity_observations: list[tuple[int, bool, int]] = []
+
+    async def _record_router_capacity(
+        _session_key: str,
+        request: Any,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        assert kwargs["max_history_turns"] == 1
+        assert kwargs["preserve_image_attachments"] is True
+        snapshot = request.transcript_snapshot
+        assert snapshot is not None
+        entries = list(await snapshot.get_entries())
+        has_historical_entries = any(
+            str(getattr(entry, "content", "")).startswith("historical")
+            for entry in entries
+        )
+        capacity_observations.append(
+            (snapshot.generation, has_historical_entries, len(entries))
+        )
+        result = {
+            "history_capacity_estimated_tokens": (
+                200_000 if has_historical_entries else 0
+            ),
+            "history_capacity_message_count": 2 if has_historical_entries else 0,
+            "history_capacity_estimate_complete": True,
+        }
+        order.append("capacity")
+        capacity_results.append(dict(result))
+        return result
+
+    monkeypatch.setattr(
+        runner,
+        "_router_history_capacity_for_request",
+        _record_router_capacity,
+    )
+    preflight_calls = 0
+    snapshot_generations: list[tuple[int, int]] = []
+    run_preflight = runner._maybe_preflight_compact
+
+    async def _record_real_preflight(
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        nonlocal preflight_calls
+        preflight_calls += 1
+        snapshot = kwargs.get("transcript_snapshot")
+        assert snapshot is not None
+        generation_before = snapshot.generation
+        await run_preflight(*args, **kwargs)
+        snapshot_generations.append((generation_before, snapshot.generation))
+
+    monkeypatch.setattr(
+        runner,
+        "_maybe_preflight_compact",
+        _record_real_preflight,
+    )
+
+    from opensquilla.session import compaction as compaction_module
+    from opensquilla.session.compaction import CompactionResult
+
+    estimate_replay_tokens = compaction_module.estimate_entry_model_replay_tokens
+
+    def _force_historical_token_pressure(entry: Any) -> int:
+        if str(getattr(entry, "content", "")).startswith("historical"):
+            return 100_000
+        return estimate_replay_tokens(entry)
+
+    monkeypatch.setattr(
+        compaction_module,
+        "estimate_entry_model_replay_tokens",
+        _force_historical_token_pressure,
+    )
+    checkpoint_calls = 0
+
+    async def _record_safe_checkpoint(*_args: Any, **_kwargs: Any) -> bool:
+        nonlocal checkpoint_calls
+        checkpoint_calls += 1
+        return True
+
+    monkeypatch.setattr(
+        runner,
+        "_record_checkpoint_before_compaction",
+        _record_safe_checkpoint,
+    )
+    compact_calls = 0
+
+    async def _install_compacted_history(
+        session_key: str,
+        _context_window_tokens: int,
+        _config: Any,
+        **kwargs: Any,
+    ) -> CompactionResult:
+        nonlocal compact_calls
+        compact_calls += 1
+        order.append("compact")
+        truncated = await manager.truncate(session_key, max_messages=1)
+        assert truncated["truncated"] is True
+        return CompactionResult(
+            summary="Compacted historical context.",
+            kept_entries=[],
+            removed_count=2,
+            chunks_processed=1,
+        )
+
+    monkeypatch.setattr(
+        manager,
+        "compact_with_result",
+        _install_compacted_history,
+    )
+    original_vision_chat = vision_provider.chat
+
+    async def _guarded_vision_chat(
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        order.append("provider")
+        assert preflight_calls == 1
+        assert order.count("capacity") == 2
+        async for event in original_vision_chat(messages, tools, config):
+            yield event
+
+    monkeypatch.setattr(vision_provider, "chat", _guarded_vision_chat)
+
+    captured_turns: list[Any] = []
+    original_bootstrap = runner._agent_bootstrap_stage.run
+
+    async def _capture_turn(inp: Any) -> Any:
+        captured_turns.append(inp.turn)
+        return await original_bootstrap(inp)
+
+    monkeypatch.setattr(runner._agent_bootstrap_stage, "run", _capture_turn)
+
+    file_uuid = await _upload_png(_e2e_stack["app"])
+    await _send_session_turn(
+        ctx=_e2e_stack["ctx"],
+        key=key,
+        sink=sink,
+        message="Describe only the current image after compacting old history.",
+        attachments=[_file_uuid_attachment(file_uuid)],
+    )
+
+    assert order == ["capacity", "compact", "capacity", "provider"]
+    assert preflight_calls == 1
+    assert checkpoint_calls == 1
+    assert compact_calls == 1
+    assert snapshot_generations == [(0, 1)]
+    assert capacity_observations[0][:2] == (0, True)
+    assert capacity_observations[1][:2] == (1, False)
+    assert capacity_observations[0][2] > capacity_observations[1][2]
+    assert len(capacity_results) == 2
+    assert (
+        capacity_results[0]["history_capacity_estimated_tokens"]
+        > capacity_results[1]["history_capacity_estimated_tokens"]
+    )
+    assert len(text_provider.calls) == 0
+    assert len(gate_provider.calls) == 0
+    assert len(vision_provider.calls) == 1
+    assert captured_turns
+    turn_metadata = captured_turns[-1].metadata
+    assert turn_metadata["large_context_capacity_retry_attempted"] is True
+    assert turn_metadata["large_context_capacity_retry_succeeded"] is True
+    assert turn_metadata["large_context_capacity_retry_pending"] is False
+    assert turn_metadata["large_context_capacity_status"] == "fits"
+    assert turn_metadata["large_context_capacity_provisional_model"] == _VISION_MODEL
+    assert turn_metadata["large_context_capacity_compaction_preflight_invoked"] is True
+    assert not _event_payloads(sink, "session.event.error")
+    sent_messages = vision_provider.calls[0]["messages"]
+    assert _message_has_image(sent_messages[-1])
+    sent_images = _message_image_blocks(sent_messages[-1])
+    assert len(sent_images) == 1
+    assert base64.b64decode(sent_images[0].data) == _PNG_BYTES
+    persisted_transcript = await manager.get_transcript(key)
+    persisted_user_rows = [
+        entry for entry in persisted_transcript if entry.role == "user"
+    ]
+    assert len(persisted_user_rows) == 1
+    _assert_persisted_png_attachment(persisted_user_rows[0])
+
+
+@pytest.mark.asyncio
+async def test_gateway_post_compaction_capacity_failure_never_calls_provider(
+    _e2e_stack: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager: SessionManager = _e2e_stack["manager"]
+    runner: TurnRunner = _e2e_stack["runner"]
+    subscription_manager: SubscriptionManager = _e2e_stack[
+        "subscription_manager"
+    ]
+    sink: _EventSink = _e2e_stack["sink"]
+    text_provider: _RecordingProvider = _e2e_stack["text_provider"]
+    gate_provider: _RecordingProvider = _e2e_stack["gate_provider"]
+    vision_provider: _RecordingProvider = _e2e_stack["vision_provider"]
+    key = "agent:main:attachment-capacity-compaction-insufficient"
+    await manager.create(session_key=key, agent_id="main")
+    subscription_manager.subscribe_messages(sink.conn_id, key)
+    await manager.append_message(key, "user", "historical user")
+    await manager.append_message(key, "assistant", "historical assistant")
+
+    from opensquilla.provider.model_catalog import ModelCatalog
+
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            f"{_PROVIDER_ID}/{_VISION_MODEL}": {
+                "context_window": 128_000,
+                "max_output_tokens": 1_024,
+            }
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+
+    order: list[str] = []
+    capacity_calls = 0
+    capacity_observations: list[tuple[int, int, int]] = []
+
+    async def _still_too_large(
+        _session_key: str,
+        request: Any,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        nonlocal capacity_calls
+        capacity_calls += 1
+        snapshot = request.transcript_snapshot
+        assert snapshot is not None
+        entries = list(await snapshot.get_entries())
+        historical_entry_count = sum(
+            str(getattr(entry, "content", "")).startswith("historical")
+            for entry in entries
+        )
+        capacity_observations.append(
+            (snapshot.generation, historical_entry_count, len(entries))
+        )
+        order.append("capacity")
+        return {
+            "history_capacity_estimated_tokens": (
+                200_000 if historical_entry_count > 1 else 150_000
+            ),
+            "history_capacity_message_count": historical_entry_count,
+            "history_capacity_estimate_complete": True,
+        }
+
+    monkeypatch.setattr(
+        runner,
+        "_router_history_capacity_for_request",
+        _still_too_large,
+    )
+    preflight_calls = 0
+    snapshot_generations: list[tuple[int, int]] = []
+    run_preflight = runner._maybe_preflight_compact
+
+    async def _record_real_preflight(
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        nonlocal preflight_calls
+        preflight_calls += 1
+        snapshot = kwargs.get("transcript_snapshot")
+        assert snapshot is not None
+        generation_before = snapshot.generation
+        await run_preflight(*args, **kwargs)
+        snapshot_generations.append((generation_before, snapshot.generation))
+
+    monkeypatch.setattr(
+        runner,
+        "_maybe_preflight_compact",
+        _record_real_preflight,
+    )
+
+    from opensquilla.session import compaction as compaction_module
+    from opensquilla.session.compaction import CompactionResult
+
+    estimate_replay_tokens = compaction_module.estimate_entry_model_replay_tokens
+
+    def _force_historical_token_pressure(entry: Any) -> int:
+        if str(getattr(entry, "content", "")).startswith("historical"):
+            return 100_000
+        return estimate_replay_tokens(entry)
+
+    monkeypatch.setattr(
+        compaction_module,
+        "estimate_entry_model_replay_tokens",
+        _force_historical_token_pressure,
+    )
+    checkpoint_calls = 0
+
+    async def _record_safe_checkpoint(*_args: Any, **_kwargs: Any) -> bool:
+        nonlocal checkpoint_calls
+        checkpoint_calls += 1
+        return True
+
+    monkeypatch.setattr(
+        runner,
+        "_record_checkpoint_before_compaction",
+        _record_safe_checkpoint,
+    )
+    compact_calls = 0
+
+    async def _install_insufficient_compacted_history(
+        session_key: str,
+        _context_window_tokens: int,
+        _config: Any,
+        **_kwargs: Any,
+    ) -> CompactionResult:
+        nonlocal compact_calls
+        compact_calls += 1
+        order.append("compact")
+        truncated = await manager.truncate(session_key, max_messages=2)
+        assert truncated["truncated"] is True
+        return CompactionResult(
+            summary="Compacted historical context.",
+            kept_entries=[],
+            removed_count=1,
+            chunks_processed=1,
+        )
+
+    monkeypatch.setattr(
+        manager,
+        "compact_with_result",
+        _install_insufficient_compacted_history,
+    )
+    captured_turns: list[Any] = []
+    original_bootstrap = runner._agent_bootstrap_stage.run
+
+    async def _capture_turn(inp: Any) -> Any:
+        captured_turns.append(inp.turn)
+        return await original_bootstrap(inp)
+
+    monkeypatch.setattr(runner._agent_bootstrap_stage, "run", _capture_turn)
+
+    file_uuid = await _upload_png(_e2e_stack["app"])
+    event_count_before = len(sink.events)
+    await _send_session_turn(
+        ctx=_e2e_stack["ctx"],
+        key=key,
+        sink=sink,
+        message="Describe the current image after trying to compact old history.",
+        attachments=[_file_uuid_attachment(file_uuid)],
+        expected_error_code="attachment_capacity_too_large",
+    )
+
+    assert order == ["capacity", "compact", "capacity"]
+    assert capacity_calls == 2
+    assert preflight_calls == 1
+    assert checkpoint_calls == 1
+    assert compact_calls == 1
+    assert snapshot_generations == [(0, 1)]
+    assert capacity_observations[0][:2] == (0, 2)
+    assert capacity_observations[1][:2] == (1, 1)
+    assert capacity_observations[0][2] > capacity_observations[1][2]
+    assert len(text_provider.calls) == 0
+    assert len(gate_provider.calls) == 0
+    assert len(vision_provider.calls) == 0
+    errors = [
+        payload
+        for event, payload in sink.events[event_count_before:]
+        if event == "session.event.error"
+    ]
+    assert errors[-1]["code"] == "attachment_capacity_too_large"
+    assert "/compact" in errors[-1]["message"]
+    assert "llm.context_window_tokens" not in errors[-1]["message"]
+    assert captured_turns
+    turn_metadata = captured_turns[-1].metadata
+    assert turn_metadata["large_context_capacity_retry_attempted"] is True
+    assert turn_metadata["large_context_capacity_retry_pending"] is False
+    assert turn_metadata["large_context_capacity_blocked"] is True
+    assert turn_metadata["large_context_capacity_status"] == (
+        "known_capacity_request_too_large"
+    )
+    persisted_transcript = await manager.get_transcript(key)
+    persisted_user_rows = [
+        entry for entry in persisted_transcript if entry.role == "user"
+    ]
+    assert len(persisted_user_rows) == 1
+    _assert_persisted_png_attachment(persisted_user_rows[0])
+
+
+@pytest.mark.asyncio
+async def test_gateway_capacity_unknown_uses_stable_code_without_provider_call(
+    _e2e_stack: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config: GatewayConfig = _e2e_stack["config"]
+    manager: SessionManager = _e2e_stack["manager"]
+    runner: TurnRunner = _e2e_stack["runner"]
+    subscription_manager: SubscriptionManager = _e2e_stack[
+        "subscription_manager"
+    ]
+    sink: _EventSink = _e2e_stack["sink"]
+    text_provider: _RecordingProvider = _e2e_stack["text_provider"]
+    gate_provider: _RecordingProvider = _e2e_stack["gate_provider"]
+    vision_provider: _RecordingProvider = _e2e_stack["vision_provider"]
+    unknown_model = "catalog-unknown-vision"
+    config.squilla_router.tiers["image_model"]["model"] = unknown_model
+    config.llm.context_window_tokens = 0
+
+    from opensquilla.provider.model_catalog import ModelCatalog
+
+    monkeypatch.setattr(
+        "opensquilla.provider.model_catalog._shared_catalog",
+        ModelCatalog(),
+    )
+    runtime_catalog = runner._model_catalog
+    assert runtime_catalog is not None
+    monkeypatch.setattr(
+        runtime_catalog,
+        "get_capabilities",
+        lambda _model_id, **_kwargs: ModelCapabilities(supports_vision=True),
+    )
+    monkeypatch.setattr(
+        runtime_catalog,
+        "resolve_vision_support",
+        lambda _model_id, **_kwargs: "supported",
+    )
+    key = "agent:main:attachment-capacity-unknown"
+    await manager.create(session_key=key, agent_id="main")
+    subscription_manager.subscribe_messages(sink.conn_id, key)
+    captured_turns: list[Any] = []
+    finalize_capacity = squilla_router_step.finalize_squilla_router_capacity
+
+    async def _capture_finalized_turn(turn: Any, **kwargs: Any) -> Any:
+        finalized = await finalize_capacity(turn, **kwargs)
+        captured_turns.append(finalized)
+        return finalized
+
+    monkeypatch.setattr(
+        "opensquilla.engine.steps.finalize_squilla_router_capacity",
+        _capture_finalized_turn,
+    )
+
+    file_uuid = await _upload_png(_e2e_stack["app"])
+    event_count_before = len(sink.events)
+    await _send_session_turn(
+        ctx=_e2e_stack["ctx"],
+        key=key,
+        sink=sink,
+        message="Describe the current image.",
+        attachments=[_file_uuid_attachment(file_uuid)],
+        expected_error_code="attachment_capacity_unknown",
+    )
+
+    errors = [
+        payload
+        for event, payload in sink.events[event_count_before:]
+        if event == "session.event.error"
+    ]
+    expected_reply = (
+        "OpenSquilla could not verify the selected attachment deployment's context "
+        "capacity. For a custom or catalog-unknown model, set "
+        "llm.context_window_tokens to the deployment's verified context limit."
+    )
+    assert errors[-1]["code"] == "attachment_capacity_unknown"
+    assert errors[-1]["message"] == expected_reply
+    assert errors[-1]["terminal_message"] == expected_reply
+    assert "internal" not in errors[-1]["message"].lower()
+    assert len(text_provider.calls) == 0
+    assert len(gate_provider.calls) == 0
+    assert len(vision_provider.calls) == 0
+    assert captured_turns
+    turn_metadata = captured_turns[-1].metadata
+    assert turn_metadata["large_context_capacity_blocked"] is True
+    assert turn_metadata["large_context_capacity_status"] == "capacity_unknown"
+    assert "large_context_capacity_retry_pending" not in turn_metadata
+    assert "llm.context_window_tokens" in turn_metadata[
+        "large_context_capacity_block_reason"
+    ]
+    persisted_transcript = await manager.get_transcript(key)
+    persisted_user_rows = [
+        entry for entry in persisted_transcript if entry.role == "user"
+    ]
+    assert len(persisted_user_rows) == 1
+    _assert_persisted_png_attachment(persisted_user_rows[0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ensemble_scope", ["global", "tier"])
+async def test_gateway_ensemble_capacity_block_never_reaches_provider(
+    _e2e_stack: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    ensemble_scope: str,
+) -> None:
+    config: GatewayConfig = _e2e_stack["config"]
+    manager: SessionManager = _e2e_stack["manager"]
+    runner: TurnRunner = _e2e_stack["runner"]
+    subscription_manager: SubscriptionManager = _e2e_stack[
+        "subscription_manager"
+    ]
+    sink: _EventSink = _e2e_stack["sink"]
+    text_provider: _RecordingProvider = _e2e_stack["text_provider"]
+    gate_provider: _RecordingProvider = _e2e_stack["gate_provider"]
+    vision_provider: _RecordingProvider = _e2e_stack["vision_provider"]
+    usage_sink: _UsageSink = _e2e_stack["usage_sink"]
+    tier_name = "c0" if ensemble_scope == "global" else "c3"
+    tier: dict[str, Any] = {
+        "provider": _PROVIDER_ID,
+        "model": _TEXT_MODEL,
+        "supports_image": False,
+    }
+    if ensemble_scope == "global":
+        config.llm_ensemble.enabled = True
+        config.llm_ensemble.selection_mode = "static_openrouter_b5"
+    else:
+        tier["ensemble_enabled"] = True
+    config.squilla_router.tiers = {tier_name: tier}
+    config.squilla_router.default_tier = tier_name
+    monkeypatch.setattr(
+        squilla_router_step,
+        "_get_strategy",
+        lambda _config: _TextTierStrategy(),
+    )
+
+    from opensquilla.provider.model_catalog import ModelCatalog
+
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            f"{_PROVIDER_ID}/{_TEXT_MODEL}": {
+                "context_window": 32_000,
+                "max_output_tokens": 4_000,
+            }
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    capacity_calls = 0
+
+    async def _history_pressure(
+        _session_key: str,
+        request: Any,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        nonlocal capacity_calls
+        capacity_calls += 1
+        assert request.transcript_snapshot is not None
+        return {
+            "history_capacity_estimated_tokens": 30_000,
+            "history_capacity_message_count": 2,
+            "history_capacity_estimate_complete": True,
+        }
+
+    monkeypatch.setattr(
+        runner,
+        "_router_history_capacity_for_request",
+        _history_pressure,
+    )
+    preflight_calls = 0
+    run_preflight = runner._maybe_preflight_compact
+
+    async def _record_preflight(*args: Any, **kwargs: Any) -> None:
+        nonlocal preflight_calls
+        preflight_calls += 1
+        await run_preflight(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_maybe_preflight_compact", _record_preflight)
+    captured_turns: list[Any] = []
+    finalize_capacity = squilla_router_step.finalize_squilla_router_capacity
+
+    async def _capture_finalized_turn(turn: Any, **kwargs: Any) -> Any:
+        finalized = await finalize_capacity(turn, **kwargs)
+        captured_turns.append(finalized)
+        return finalized
+
+    monkeypatch.setattr(
+        "opensquilla.engine.steps.finalize_squilla_router_capacity",
+        _capture_finalized_turn,
+    )
+    key = f"agent:main:attachment-capacity-{ensemble_scope}-ensemble"
+    await manager.create(session_key=key, agent_id="main")
+    subscription_manager.subscribe_messages(sink.conn_id, key)
+
+    file_uuid = await _upload_text(_e2e_stack["app"])
+    event_count_before = len(sink.events)
+    await _send_session_turn(
+        ctx=_e2e_stack["ctx"],
+        key=key,
+        sink=sink,
+        message="Use the current text attachment.",
+        attachments=[
+            {
+                "file_uuid": file_uuid,
+                "mime": "text/plain",
+                "name": "capacity.txt",
+            }
+        ],
+        expected_error_code="attachment_capacity_too_large",
+    )
+
+    errors = [
+        payload
+        for event, payload in sink.events[event_count_before:]
+        if event == "session.event.error"
+    ]
+    assert errors[-1]["code"] == "attachment_capacity_too_large"
+    assert capacity_calls == 1
+    assert preflight_calls == 0
+    assert len(text_provider.calls) == 0
+    assert len(gate_provider.calls) == 0
+    assert len(vision_provider.calls) == 0
+    assert usage_sink.started == []
+    assert captured_turns
+    turn_metadata = captured_turns[-1].metadata
+    assert turn_metadata["large_context_capacity_blocked"] is True
+    assert turn_metadata["large_context_capacity_status"] == (
+        "known_capacity_request_too_large"
+    )
+    assert "large_context_capacity_retry_pending" not in turn_metadata
 
 
 @pytest.mark.asyncio

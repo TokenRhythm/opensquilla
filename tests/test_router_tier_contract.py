@@ -13,10 +13,14 @@ import pytest
 from opensquilla.context_budget import CHARS_PER_TOKEN, ContextBudgetGovernor
 from opensquilla.engine.capacity_admission import (
     LargeContextCapacityError,
+    assess_model_request_capacity,
     model_has_request_capacity,
 )
 from opensquilla.engine.routing import RoutingDecision
-from opensquilla.engine.selector_override import apply_model_override
+from opensquilla.engine.selector_override import (
+    apply_model_override,
+    require_current_selector_capacity,
+)
 from opensquilla.engine.steps.squilla_router import (
     _apply_provider_mismatch_veto,
     _flag_tier_provider_mismatch,
@@ -863,6 +867,109 @@ def test_complete_request_capacity_boundary_and_unknown_model_fail_closed(
         request_input_tokens=1,
         thinking_budget_tokens=0,
     )
+
+
+def test_capacity_assessment_distinguishes_known_too_large_from_unknown(
+    monkeypatch,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openai/known-model": {
+                "context_window": 32_000,
+                "max_output_tokens": 4_000,
+            }
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+
+    known = assess_model_request_capacity(
+        provider="openai",
+        model="known-model",
+        material_tokens=1,
+        request_input_tokens=100_000,
+        thinking_budget_tokens=0,
+    )
+    unknown = assess_model_request_capacity(
+        provider="openai",
+        model="unknown-model",
+        material_tokens=1,
+        request_input_tokens=100_000,
+        thinking_budget_tokens=0,
+    )
+
+    assert known.status == "known_capacity_request_too_large"
+    assert known.safe_input_tokens is not None
+    assert known.required_input_tokens == 100_000
+    assert unknown.status == "capacity_unknown"
+    assert unknown.safe_input_tokens is None
+
+
+def test_selector_allows_only_pre_retry_binding_for_exact_known_deployment(
+    monkeypatch,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openai/history-bound": {
+                "context_window": 32_000,
+                "max_output_tokens": 4_000,
+            }
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    safe_input_tokens = (
+        ContextBudgetGovernor.from_values(
+            context_window_tokens=32_000,
+            max_output_tokens=4_000,
+            thinking_budget_tokens=0,
+            context_overflow_threshold=0.85,
+        ).snapshot().provider_request_max_chars
+        // CHARS_PER_TOKEN
+    )
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig(
+                "openai",
+                "history-bound",
+                api_key="test-key",
+            )
+        )
+    )
+    metadata = {
+        "routing_applied": True,
+        "large_context_capacity_required": True,
+        "large_context_material_tokens": 1_000,
+        "large_context_request_input_tokens": safe_input_tokens + 1_000,
+        "large_context_history_tokens": 2_000,
+        "large_context_thinking_budget_tokens": 0,
+        "large_context_capacity_retry_pending": True,
+        "large_context_capacity_provisional_provider": "openai",
+        "large_context_capacity_provisional_model": "history-bound",
+        "routed_model": "history-bound",
+    }
+
+    apply_model_override(
+        selector,
+        "history-bound",
+        turn_metadata=metadata,
+        realign_routed_model=False,
+    )
+
+    assert metadata["large_context_capacity_provisional_bound"] is True
+    assert selector.current_config.model == "history-bound"
+
+    metadata["large_context_capacity_retry_attempted"] = True
+    metadata["large_context_capacity_retry_pending"] = False
+    with pytest.raises(LargeContextCapacityError, match="/compact"):
+        require_current_selector_capacity(
+            selector,
+            metadata,
+            reason="The post-compaction deployment is still too large.",
+        )
+    assert "llm.context_window_tokens" not in metadata[
+        "large_context_capacity_block_reason"
+    ]
 
 
 def test_complete_attachment_request_filters_every_fallback_without_large_floor(

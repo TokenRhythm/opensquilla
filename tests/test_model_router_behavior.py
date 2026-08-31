@@ -693,6 +693,372 @@ async def test_same_attachment_fits_short_history_but_long_history_is_filtered(
 
 
 @pytest.mark.asyncio
+async def test_known_history_pressure_gets_one_fixed_tier_compaction_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_strategy(monkeypatch, "c0", 0.91, {"route_class": "R0"})
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openrouter/history-bound": {
+                "context_window": 32_000,
+                "max_output_tokens": 4_000,
+            }
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    ctx = make_context(
+        "Use the supplied material.",
+        attachments=[{"type": "text/plain"}],
+    )
+    ctx.config.squilla_router.tiers = {
+        "c0": {
+            "provider": "openrouter",
+            "model": "history-bound",
+            "thinking_level": "off",
+        }
+    }
+    ctx.metadata["attachment_material_estimated_tokens"] = 4_000
+    ctx.metadata["routing_history_capacity_estimated_tokens"] = 30_000
+    ctx.metadata["routing_history_capacity_message_count"] = 12
+
+    provisional = await finalize_squilla_router_capacity(
+        await apply_squilla_router(ctx),
+        allow_compaction_retry=True,
+    )
+
+    assert provisional.metadata["large_context_capacity_retry_pending"] is True
+    assert provisional.metadata["large_context_capacity_status"] == (
+        "known_capacity_request_too_large"
+    )
+    assert provisional.metadata["large_context_capacity_provisional_tier"] == "c0"
+    assert provisional.metadata["large_context_capacity_provisional_model"] == (
+        "history-bound"
+    )
+    assert "large_context_capacity_blocked" not in provisional.metadata
+
+    provisional.metadata["routing_history_capacity_estimated_tokens"] = 1_000
+    provisional.metadata["routing_history_capacity_message_count"] = 2
+    admitted = await finalize_squilla_router_capacity(
+        provisional,
+        retry_after_compaction=True,
+    )
+
+    assert admitted.metadata["large_context_capacity_retry_attempted"] is True
+    assert admitted.metadata["large_context_capacity_retry_pending"] is False
+    assert admitted.metadata["large_context_capacity_retry_succeeded"] is True
+    assert admitted.metadata["large_context_capacity_status"] == "fits"
+    assert admitted.metadata["routed_tier"] == "c0"
+    assert admitted.model == "history-bound"
+
+
+@pytest.mark.asyncio
+async def test_multi_candidate_retry_rechecks_only_largest_provisional_tier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_strategy(monkeypatch, "c0", 0.91, {"route_class": "R0"})
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openrouter/history-tight": {
+                "context_window": 32_000,
+                "max_output_tokens": 4_000,
+            },
+            "openrouter/history-wide": {
+                "context_window": 64_000,
+                "max_output_tokens": 4_000,
+            },
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    assessed_models: list[str] = []
+    assess_capacity = squilla_router_step.assess_model_request_capacity
+
+    def _record_assessed_model(**kwargs: object):
+        assessed_models.append(str(kwargs.get("model") or ""))
+        return assess_capacity(**kwargs)
+
+    monkeypatch.setattr(
+        squilla_router_step,
+        "assess_model_request_capacity",
+        _record_assessed_model,
+    )
+    ctx = make_context(
+        "Use the supplied material.",
+        attachments=[{"type": "text/plain"}],
+    )
+    ctx.config.squilla_router.tiers = {
+        "c0": {
+            "provider": "openrouter",
+            "model": "history-tight",
+            "thinking_level": "off",
+        },
+        "c1": {
+            "provider": "openrouter",
+            "model": "history-wide",
+            "thinking_level": "off",
+        },
+    }
+    ctx.metadata["attachment_material_estimated_tokens"] = 4_000
+    ctx.metadata["routing_history_capacity_estimated_tokens"] = 70_000
+    ctx.metadata["routing_history_capacity_message_count"] = 20
+
+    provisional = await finalize_squilla_router_capacity(
+        await apply_squilla_router(ctx),
+        allow_compaction_retry=True,
+    )
+
+    assert provisional.metadata["large_context_capacity_retry_pending"] is True
+    assert provisional.metadata["large_context_capacity_provisional_tier"] == "c1"
+    assert provisional.metadata["large_context_capacity_provisional_provider"] == (
+        "openrouter"
+    )
+    assert provisional.metadata["large_context_capacity_provisional_model"] == (
+        "history-wide"
+    )
+
+    provisional.metadata["routing_history_capacity_estimated_tokens"] = 1_000
+    provisional.metadata["routing_history_capacity_message_count"] = 2
+    assessed_models.clear()
+    admitted = await finalize_squilla_router_capacity(
+        provisional,
+        retry_after_compaction=True,
+    )
+
+    assert assessed_models == ["history-wide"]
+    assert admitted.metadata["large_context_capacity_retry_succeeded"] is True
+    assert admitted.metadata["routed_tier"] == "c1"
+    assert admitted.model == "history-wide"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ensemble_scope", ["global", "tier"])
+async def test_ensemble_route_never_schedules_attachment_compaction_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    ensemble_scope: str,
+) -> None:
+    tier_name = "c0" if ensemble_scope == "global" else "c3"
+    fake_strategy(monkeypatch, tier_name, 0.91, {"route_class": "R0"})
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openrouter/history-bound": {
+                "context_window": 32_000,
+                "max_output_tokens": 4_000,
+            }
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    ctx = make_context(
+        "Use the supplied material.",
+        attachments=[{"type": "text/plain"}],
+    )
+    tier = {
+        "provider": "openrouter",
+        "model": "history-bound",
+        "thinking_level": "off",
+    }
+    if ensemble_scope == "global":
+        ctx.config.llm_ensemble.enabled = True
+    else:
+        tier["ensemble_enabled"] = True
+    ctx.config.squilla_router.tiers = {tier_name: tier}
+    ctx.metadata["attachment_material_estimated_tokens"] = 4_000
+    ctx.metadata["routing_history_capacity_estimated_tokens"] = 30_000
+    ctx.metadata["routing_history_capacity_message_count"] = 12
+
+    blocked = await finalize_squilla_router_capacity(
+        await apply_squilla_router(ctx),
+        allow_compaction_retry=True,
+    )
+
+    assert blocked.metadata["large_context_capacity_blocked"] is True
+    assert blocked.metadata["large_context_capacity_status"] == (
+        "known_capacity_request_too_large"
+    )
+    assert "large_context_capacity_retry_pending" not in blocked.metadata
+
+
+@pytest.mark.asyncio
+async def test_post_compaction_retry_still_too_large_fails_actionably(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_strategy(monkeypatch, "c0", 0.91, {"route_class": "R0"})
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openrouter/history-bound": {
+                "context_window": 32_000,
+                "max_output_tokens": 4_000,
+            }
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    ctx = make_context(
+        "Use the supplied material.",
+        attachments=[{"type": "text/plain"}],
+    )
+    ctx.config.squilla_router.tiers = {
+        "c0": {
+            "provider": "openrouter",
+            "model": "history-bound",
+            "thinking_level": "off",
+        }
+    }
+    ctx.metadata["attachment_material_estimated_tokens"] = 4_000
+    ctx.metadata["routing_history_capacity_estimated_tokens"] = 30_000
+
+    provisional = await finalize_squilla_router_capacity(
+        await apply_squilla_router(ctx),
+        allow_compaction_retry=True,
+    )
+    assert provisional.metadata["large_context_capacity_retry_pending"] is True
+
+    provisional.metadata["routing_history_capacity_estimated_tokens"] = 25_000
+    blocked = await finalize_squilla_router_capacity(
+        provisional,
+        retry_after_compaction=True,
+    )
+
+    assert blocked.metadata["large_context_capacity_retry_attempted"] is True
+    assert blocked.metadata["large_context_capacity_retry_pending"] is False
+    assert blocked.metadata["large_context_capacity_blocked"] is True
+    assert blocked.metadata["large_context_capacity_status"] == (
+        "known_capacity_request_too_large"
+    )
+    assert "/compact" in blocked.metadata["large_context_capacity_block_reason"]
+    assert "llm.context_window_tokens" not in blocked.metadata[
+        "large_context_capacity_block_reason"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_disabled_compaction_does_not_get_provisional_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_strategy(monkeypatch, "c0", 0.91, {"route_class": "R0"})
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openrouter/history-bound": {
+                "context_window": 32_000,
+                "max_output_tokens": 4_000,
+            }
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    ctx = make_context(
+        "Use the supplied material.",
+        attachments=[{"type": "text/plain"}],
+    )
+    ctx.config.compaction.enabled = False
+    ctx.config.squilla_router.tiers = {
+        "c0": {
+            "provider": "openrouter",
+            "model": "history-bound",
+            "thinking_level": "off",
+        }
+    }
+    ctx.metadata["attachment_material_estimated_tokens"] = 4_000
+    ctx.metadata["routing_history_capacity_estimated_tokens"] = 30_000
+
+    blocked = await finalize_squilla_router_capacity(
+        await apply_squilla_router(ctx),
+        allow_compaction_retry=True,
+    )
+
+    assert blocked.metadata["large_context_capacity_blocked"] is True
+    assert "large_context_capacity_retry_pending" not in blocked.metadata
+    assert blocked.metadata["large_context_capacity_status"] == (
+        "known_capacity_request_too_large"
+    )
+
+
+@pytest.mark.asyncio
+async def test_known_fixed_envelope_does_not_schedule_compaction_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_strategy(monkeypatch, "c0", 0.91, {"route_class": "R0"})
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openrouter/fixed-too-large": {
+                "context_window": 32_000,
+                "max_output_tokens": 4_000,
+            }
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    ctx = make_context(
+        "Use the supplied material.",
+        attachments=[{"type": "text/plain"}],
+    )
+    ctx.config.squilla_router.tiers = {
+        "c0": {
+            "provider": "openrouter",
+            "model": "fixed-too-large",
+            "thinking_level": "off",
+        }
+    }
+    ctx.system_prompt = "s" * 100_000
+    ctx.metadata["attachment_material_estimated_tokens"] = 8_000
+    ctx.metadata["routing_history_capacity_estimated_tokens"] = 1_000
+
+    routed = await finalize_squilla_router_capacity(
+        await apply_squilla_router(ctx),
+        allow_compaction_retry=True,
+    )
+
+    assert routed.metadata["large_context_capacity_blocked"] is True
+    assert routed.metadata["large_context_capacity_status"] == (
+        "known_capacity_request_too_large"
+    )
+    assert "large_context_capacity_retry_pending" not in routed.metadata
+    assert "/compact" in routed.metadata["large_context_capacity_block_reason"]
+    assert "llm.context_window_tokens" not in routed.metadata[
+        "large_context_capacity_block_reason"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_capacity_unknown_never_gets_compaction_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_strategy(monkeypatch, "c0", 0.91, {"route_class": "R0"})
+    monkeypatch.setattr(
+        "opensquilla.provider.model_catalog._shared_catalog",
+        ModelCatalog(),
+    )
+    ctx = make_context(
+        "Use the supplied material.",
+        attachments=[{"type": "text/plain"}],
+    )
+    ctx.config.llm.provider = "custom"
+    ctx.config.llm.context_window_tokens = 0
+    ctx.config.squilla_router.tiers = {
+        "c0": {
+            "provider": "custom",
+            "model": "unknown-history-model",
+            "thinking_level": "off",
+        }
+    }
+    ctx.metadata["attachment_material_estimated_tokens"] = 4_000
+    ctx.metadata["routing_history_capacity_estimated_tokens"] = 30_000
+
+    routed = await finalize_squilla_router_capacity(
+        await apply_squilla_router(ctx),
+        allow_compaction_retry=True,
+    )
+
+    assert routed.metadata["large_context_capacity_blocked"] is True
+    assert routed.metadata["large_context_capacity_status"] == "capacity_unknown"
+    assert "large_context_capacity_retry_pending" not in routed.metadata
+    assert "llm.context_window_tokens" in routed.metadata[
+        "large_context_capacity_block_reason"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_catalog_unknown_custom_attachment_config_has_actionable_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
