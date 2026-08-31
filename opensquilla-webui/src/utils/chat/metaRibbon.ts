@@ -7,7 +7,7 @@ import type {
   MetaRunCompletedPayload,
   MetaStepRescue,
   MetaStepStatePayload,
-} from '@/types/rpc'
+} from '@/modules/metaRunCenter'
 
 export type MetaStepState =
   | 'pending'

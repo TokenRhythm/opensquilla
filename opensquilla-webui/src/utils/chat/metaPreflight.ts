@@ -5,7 +5,7 @@
 import type {
   MetaPreflightFieldSpec,
   MetaPreflightPayload,
-} from '@/types/rpc'
+} from '@/modules/metaRunCenter'
 
 export type MetaPreflightLanguage = 'zh' | 'en'
 
