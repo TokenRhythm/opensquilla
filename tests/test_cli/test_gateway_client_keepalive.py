@@ -60,6 +60,11 @@ class _BrokenSendWebSocket:
         raise RuntimeError("socket already closed")
 
 
+def test_gateway_client_uses_a_bounded_default_rpc_timeout() -> None:
+    assert GatewayClient().request_timeout_s == 30.0
+    assert GatewayClient(request_timeout_s=None).request_timeout_s is None
+
+
 async def _wait_for(predicate, *, timeout: float = 1.0) -> None:
     deadline = asyncio.get_running_loop().time() + timeout
     while not predicate():
@@ -290,6 +295,155 @@ async def test_call_after_send_failure_raises_clear_connection_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_call_times_out_without_marking_the_connection_failed() -> None:
+    ws = _FakeWebSocket()
+    client = GatewayClient(request_timeout_s=0.01)
+    client._ws = ws  # noqa: SLF001
+
+    with pytest.raises(
+        TimeoutError,
+        match=r"sessions\.list timed out after 0\.01s",
+    ):
+        await client._call("sessions.list", {"limit": 1})  # noqa: SLF001
+
+    assert client._pending == {}  # noqa: SLF001
+    assert client._connection_error is None  # noqa: SLF001
+    assert client._ws is ws  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_call_cancellation_cleans_up_pending_response() -> None:
+    ws = _FakeWebSocket()
+    client = GatewayClient()
+    client._ws = ws  # noqa: SLF001
+
+    call_task = asyncio.create_task(
+        client._call("sessions.list", {"limit": 1})  # noqa: SLF001
+    )
+    await _wait_for(lambda: bool(ws.sent))
+    request_id = json.loads(ws.sent[0])["id"]
+    response_future = client._pending[request_id]  # noqa: SLF001
+
+    call_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call_task
+
+    assert request_id not in client._pending  # noqa: SLF001
+    assert response_future.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_close_wakes_pending_rpc() -> None:
+    ws = _FakeWebSocket()
+    client = GatewayClient()
+    client._ws = ws  # noqa: SLF001
+
+    call_task = asyncio.create_task(
+        client._call("sessions.list", {"limit": 1})  # noqa: SLF001
+    )
+    await _wait_for(lambda: bool(ws.sent))
+
+    await client.close()
+
+    with pytest.raises(ConnectionError, match="closed before the RPC response"):
+        await call_task
+    assert client._pending == {}  # noqa: SLF001
+    assert ws.closed is True
+
+
+@pytest.mark.asyncio
+async def test_late_response_after_timeout_is_ignored_and_connection_remains_usable() -> None:
+    ws = _FakeWebSocket()
+    client = GatewayClient(request_timeout_s=0.01)
+    client._ws = ws  # noqa: SLF001
+    listener_task = asyncio.create_task(client._listen())  # noqa: SLF001
+    client._listener_task = listener_task  # noqa: SLF001
+
+    try:
+        with pytest.raises(TimeoutError, match=r"sessions\.list timed out"):
+            await client._call("sessions.list", {"limit": 1})  # noqa: SLF001
+        timed_out_request = json.loads(ws.sent[0])
+
+        await ws.iter_queue.put(
+            json.dumps(
+                {
+                    "type": "res",
+                    "id": timed_out_request["id"],
+                    "ok": True,
+                    "payload": {"late": True},
+                }
+            )
+        )
+
+        client.request_timeout_s = None
+        next_call = asyncio.create_task(
+            client._call("sessions.list", {"limit": 2})  # noqa: SLF001
+        )
+        await _wait_for(lambda: len(ws.sent) == 2)
+        next_request = json.loads(ws.sent[1])
+        await ws.iter_queue.put(
+            json.dumps(
+                {
+                    "type": "res",
+                    "id": next_request["id"],
+                    "ok": True,
+                    "payload": {"sessions": []},
+                }
+            )
+        )
+
+        assert await asyncio.wait_for(next_call, timeout=0.1) == {"sessions": []}
+        assert client._pending == {}  # noqa: SLF001
+        assert client._connection_error is None  # noqa: SLF001
+        assert listener_task.done() is False
+    finally:
+        client._closing = True  # noqa: SLF001
+        await ws.iter_queue.put(_STOP)
+        await listener_task
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_response_wait_does_not_block_replacement_subscribe() -> None:
+    ws = _FakeWebSocket()
+    client = GatewayClient(request_timeout_s=None)
+    client._ws = ws  # noqa: SLF001
+    session_key = "agent:main:replacement"
+    client._server_session_subscriptions.add(session_key)  # noqa: SLF001
+    original = client._new_event_subscription(session_key=session_key)  # noqa: SLF001
+
+    close_task = asyncio.create_task(original.close())
+    await _wait_for(lambda: len(ws.sent) == 1)
+    replacement_task = asyncio.create_task(client.subscribe_session_events(session_key))
+    await _wait_for(lambda: len(ws.sent) == 2)
+
+    requests = [json.loads(payload) for payload in ws.sent]
+    assert [request["method"] for request in requests] == [
+        "sessions.messages.unsubscribe",
+        "sessions.messages.subscribe",
+    ]
+    subscribe_id = requests[1]["id"]
+    client._pending[subscribe_id].set_result(  # noqa: SLF001
+        {
+            "type": "res",
+            "id": subscribe_id,
+            "ok": True,
+            "payload": {"replay_complete": True, "current_stream_seq": 0},
+        }
+    )
+    replacement = await asyncio.wait_for(replacement_task, timeout=0.1)
+
+    unsubscribe_id = requests[0]["id"]
+    client._pending[unsubscribe_id].set_result(  # noqa: SLF001
+        {"type": "res", "id": unsubscribe_id, "ok": True, "payload": {}}
+    )
+    await asyncio.wait_for(close_task, timeout=0.1)
+    assert client._pending == {}  # noqa: SLF001
+
+    client._closing = True  # noqa: SLF001
+    await replacement.close()
+
+
+@pytest.mark.asyncio
 async def test_call_preserves_gateway_error_details_for_safe_fallback_decisions() -> None:
     ws = _FakeWebSocket()
     client = GatewayClient()
@@ -321,6 +475,7 @@ async def test_call_preserves_gateway_error_details_for_safe_fallback_decisions(
         "fallback_safe": False,
         "orphan_message_id": "message-orphan",
     }
+    assert client._pending == {}  # noqa: SLF001
 
 
 @pytest.mark.asyncio
