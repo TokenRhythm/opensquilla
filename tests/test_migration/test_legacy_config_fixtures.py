@@ -108,13 +108,22 @@ def test_cli_01_era_migrates_with_expected_strips() -> None:
     assert cfg.port == 18790
 
 
-def test_modern_era_configs_load_without_changes() -> None:
+def test_modern_era_configs_strip_retired_skill_filter_settings() -> None:
     for era in ("cli-0.3", "cli-0.4", "cli-0.5"):
         data = tomllib.loads(
             (FIXTURES_ROOT / era / "config.toml").read_text(encoding="utf-8")
         )
         result = migrate_config_payload(data)
-        assert not result.changed, (era, result.changes, result.removed_fields)
+        assert result.changed, (era, result.changes, result.removed_fields)
+        assert set(result.removed_fields) == {
+            "skills.filter_embedding_model",
+            "skills.filter_enabled",
+            "skills.filter_lexical_top_n",
+            "skills.filter_rrf_k",
+            "skills.filter_semantic_top_n",
+            "skills.filter_strategy",
+            "skills.filter_top_k",
+        }
 
 
 def test_desktop_eras_canonicalize_legacy_tier_keys() -> None:

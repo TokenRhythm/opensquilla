@@ -34,6 +34,7 @@ describe('Gateway Adapter composition', () => {
       'approvalCenter',
       'goalCenter',
       'goalContinuity',
+      'metaSkillCatalog',
     ])
     expect(adapters).not.toHaveProperty('rpc')
     expect(adapters).not.toHaveProperty('events')

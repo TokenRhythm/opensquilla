@@ -20,11 +20,13 @@ import yaml
 
 from opensquilla.skills.types import (
     SkillInstallSpec,
+    SkillInvocation,
     SkillLayer,
     SkillPlatformMeta,
     SkillProvenance,
     SkillRequires,
     SkillSpec,
+    SkillVisibility,
 )
 
 MAX_SKILL_FILE_BYTES = 256_000
@@ -68,6 +70,10 @@ _UNSUPPORTED_DIALECT_FIELDS = frozenset(
         "eval-prompts",
         "preference-keys",
         "policy-tags",
+        "visibility",
+        "invocation",
+        "owner-meta-skills",
+        "owner_meta_skills",
     }
 )
 _DEGRADED_DIALECT_FIELDS = frozenset({"allowed-tools", "allowedtools"})
@@ -652,7 +658,9 @@ def compile_skill_manifest(
     policy_tags = _string_list(frontmatter.get("policy_tags", []))
 
     file_path = os.path.abspath(skill_file)
-    return SkillSpec(
+    default_visibility = "meta" if kind == "meta" else "public"
+    default_invocation = "meta_only" if kind == "meta" else "direct"
+    spec = SkillSpec(
         name=name,
         description=description,
         description_zh=str(description_zh),
@@ -683,7 +691,19 @@ def compile_skill_manifest(
         policy_tags=policy_tags,
         entrypoint=entrypoint,
         instance_id=skill_instance_id(layer=layer, file_path=file_path),
+        visibility=SkillVisibility(str(frontmatter.get("visibility", default_visibility))),
+        invocation=SkillInvocation(str(frontmatter.get("invocation", default_invocation))),
+        owner_meta_skills=_string_list(frontmatter.get("owner_meta_skills", [])),
     )
+    if layer is SkillLayer.BUNDLED:
+        from opensquilla.skills.catalog_policy import (
+            classify_packaged_bundled,
+            is_packaged_bundled_path,
+        )
+
+        if is_packaged_bundled_path(skill_dir):
+            classify_packaged_bundled(spec)
+    return spec
 
 
 def _diagnostic(

@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, defineComponent, h } from 'vue'
+import type { MetaSkillCatalog } from '@/modules/metaSkillCatalog'
 import type { Skill, SkillDependencyInstallOutcome } from '@/types/skills'
 import {
   useSkillDetailController,
@@ -36,13 +37,28 @@ function completeOutcome(): SkillDependencyInstallOutcome {
   }
 }
 
-function mountController(options: Parameters<typeof useSkillDetailController>[0]) {
+type ControllerOptions = Parameters<typeof useSkillDetailController>[0]
+type TestControllerOptions = Omit<ControllerOptions, 'metaSkillCatalog'> & {
+  metaSkillCatalog?: MetaSkillCatalog
+}
+
+function mountController(options: TestControllerOptions) {
   let controller!: SkillDetailController
   const host = document.createElement('div')
   document.body.appendChild(host)
   const app = createApp(defineComponent({
     setup() {
-      controller = useSkillDetailController(options)
+      controller = useSkillDetailController({
+        ...options,
+        metaSkillCatalog: options.metaSkillCatalog || {
+          async list() {
+            return []
+          },
+          async inspect() {
+            throw new Error('MetaSkill catalog is unavailable in this test.')
+          },
+        },
+      })
       return () => h('div')
     },
   }))
@@ -60,6 +76,28 @@ afterEach(() => {
 })
 
 describe('useSkillDetailController', () => {
+  it('loads MetaSkill detail through the typed catalog port', async () => {
+    const call = vi.fn()
+    const inspect = vi.fn(async () => ({
+      name: 'meta-paper-write',
+      kind: 'meta',
+      dependencies: [{ name: 'paper-section-author' }],
+    }) as Skill)
+    const installDeps = vi.fn(async () => completeOutcome())
+    const { controller, unmount } = mountController({
+      rpc: { call },
+      metaSkillCatalog: { list: vi.fn(async () => []), inspect },
+      installDeps,
+    })
+
+    await controller.openSkill({ name: 'meta-paper-write', kind: 'meta' })
+
+    expect(inspect).toHaveBeenCalledWith('meta-paper-write')
+    expect(call).not.toHaveBeenCalled()
+    expect(controller.selectedSkill.value?.sub_skills).toEqual(['paper-section-author'])
+    unmount()
+  })
+
   it('passes the selected lifecycle identity and fences same-name candidate responses', async () => {
     const managed = deferred<Skill>()
     const workspace = deferred<Skill>()

@@ -829,7 +829,7 @@ def test_publish_writes_snapshot_without_reentering_loader(
     assert [skill.name for skill in loader.snapshot().skills] == ["alpha"]
 
 
-def test_snapshot_v12_is_invalid_and_v15_round_trips_atomically(tmp_path: Path) -> None:
+def test_snapshot_v12_is_invalid_and_v16_round_trips_atomically(tmp_path: Path) -> None:
     root = tmp_path / "skills"
     _write_skill(root, "alpha")
     snapshot_path = tmp_path / "snapshot.json"
@@ -840,7 +840,7 @@ def test_snapshot_v12_is_invalid_and_v15_round_trips_atomically(tmp_path: Path) 
     loader.load_all()
     loader.save_snapshot()
     data = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    assert data["version"] == 15
+    assert data["version"] == 16
     assert all("mtime_ns" in entry for entry in data["manifest"].values())
     assert all("tree_state" in entry for entry in data["manifest"].values())
     assert data["skills"][0]["tree_digest"]

@@ -735,10 +735,10 @@ metadata:
     loader = SkillLoader(bundled_dir=tmp_path, snapshot_path=tmp_path / "snapshot.json")
     ctx = RpcContext(conn_id="test", skill_loader=loader)
 
-    from opensquilla.engine.steps import skills_filter
+    from opensquilla.engine.steps import skill_catalog_projection
 
-    skills_filter._elig_ctx.has_bin_cache["helper"] = False
-    skills_filter._elig_ctx.env_cache["HELPER_TOKEN"] = None
+    skill_catalog_projection._elig_ctx.has_bin_cache["helper"] = False
+    skill_catalog_projection._elig_ctx.env_cache["HELPER_TOKEN"] = None
 
     async def fake_install_deps(_specs: list[object]) -> list[DepResult]:
         return [DepResult(kind="uv", identifier="helper", success=True, message="Installed")]
@@ -753,8 +753,8 @@ metadata:
     assert result["success"] is True
     assert result["missing_still"]["env_any"] == [["OPENROUTER_API_KEY", "ARK_API_KEY"]]
     assert loader._dirty is False
-    assert skills_filter._elig_ctx.has_bin_cache == {}
-    assert skills_filter._elig_ctx.env_cache == {}
+    assert skill_catalog_projection._elig_ctx.has_bin_cache == {}
+    assert skill_catalog_projection._elig_ctx.env_cache == {}
 
 
 @pytest.mark.asyncio
@@ -1072,7 +1072,10 @@ composition:
     loader = SkillLoader(managed_dir=managed_dir, snapshot_path=tmp_path / "snapshot.json")
     ctx = RpcContext(conn_id="test", skill_loader=loader)
 
-    listed = await rpc_skills._handle_skills_list(None, ctx)
+    from opensquilla.gateway.rpc_meta_runs import _handle_meta_inspect
 
-    row = next(skill for skill in listed["skills"] if skill["name"] == "parent-meta")
-    assert row["dependency_summary"]["sub_skill_dependencies"]["missing_count"] == 1
+    listed = await rpc_skills._handle_skills_list(None, ctx)
+    assert "parent-meta" not in {skill["name"] for skill in listed["skills"]}
+    detail = await _handle_meta_inspect({"name": "parent-meta"}, ctx)
+    assert [item["name"] for item in detail["dependencies"]] == ["child-needs-bin"]
+    assert detail["ready"] is False

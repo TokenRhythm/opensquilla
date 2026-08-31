@@ -19,17 +19,21 @@ describe('SkillGroup lifecycle compatibility', () => {
     const rpc = {
       waitForConnection: vi.fn(async () => {}),
       call: vi.fn(async () => ({
-        skills: [{
-          name: 'legacy-community-skill',
-          description: 'Loaded from an older Gateway response',
-          layer: 'managed',
-          status: 'ready',
-          eligible: true,
-        }],
-      })),
+          skills: [{
+            name: 'legacy-community-skill',
+            description: 'Loaded from an older Gateway response',
+            layer: 'managed',
+            status: 'ready',
+            eligible: true,
+          }],
+        })),
     } as unknown as ReturnType<typeof useRpcStore>
+    const metaSkillCatalog = {
+      list: vi.fn(async () => { throw new Error('method not found') }),
+      inspect: vi.fn(),
+    }
     const loadProposals = vi.fn(async () => {})
-    const catalog = useSkillsCatalog(rpc, {
+    const catalog = useSkillsCatalog(rpc, metaSkillCatalog, {
       proposals: ref([]),
       autoEnabledSkills: ref([]),
       proposalsSettings: ref({
@@ -44,6 +48,7 @@ describe('SkillGroup lifecycle compatibility', () => {
 
     await expect(catalog.loadData()).resolves.toBe(true)
     expect(rpc.call).toHaveBeenCalledWith('skills.list', { includeLifecycle: true })
+    expect(metaSkillCatalog.list).toHaveBeenCalledOnce()
     expect(loadProposals).toHaveBeenCalledOnce()
     expect(catalog.allSkills.value).toHaveLength(1)
     expect(catalog.allSkills.value[0]?.lifecycle).toBeUndefined()

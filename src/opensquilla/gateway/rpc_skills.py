@@ -12,9 +12,12 @@ from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
 
-from opensquilla.gateway.rpc import RpcContext, get_dispatcher
+from opensquilla.gateway.protocol import ERROR_UNAUTHORIZED
+from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
+from opensquilla.gateway.scopes import ADMIN_SCOPE
 from opensquilla.paths import default_opensquilla_home
 from opensquilla.skills.capability_runtime import trusted_capability_consumers_for_meta_plan
+from opensquilla.skills.catalog_policy import is_public_ordinary, project_public_catalog
 from opensquilla.skills.dependency_summary import build_dependency_summary
 from opensquilla.skills.eligibility import (
     EligibilityContext,
@@ -64,9 +67,7 @@ _deps_locks: weakref.WeakValueDictionary[tuple[str, str], asyncio.Lock] = (
 )
 
 _ACTIVE_SKILL_INSTALLS_STATE_KEY = "_active_skill_installs"
-_PENDING_SKILL_INSTALL_CANCELLATIONS_STATE_KEY = (
-    "_pending_skill_install_cancellations"
-)
+_PENDING_SKILL_INSTALL_CANCELLATIONS_STATE_KEY = "_pending_skill_install_cancellations"
 _MAX_PENDING_SKILL_INSTALL_CANCELLATIONS_PER_CONNECTION = 8
 _MAX_PENDING_SKILL_INSTALL_CANCELLATIONS = 256
 
@@ -279,9 +280,7 @@ def _recovery_required_payload(
 
     state = getattr(ctx, "skill_management_state", None)
     startup_diagnostics = (
-        tuple(state.get("recovery_diagnostics", ()))
-        if isinstance(state, dict)
-        else ()
+        tuple(state.get("recovery_diagnostics", ())) if isinstance(state, dict) else ()
     )
     # A legacy/degraded startup may still have no management service. In that
     # case RPC must synthesize a fail-closed response from retained diagnostics.
@@ -582,11 +581,12 @@ def _skill_to_dict(
         "os": list(meta.os) if meta else [],
         "disabled": report.disabled,
         "user_invocable": bool(getattr(spec, "user_invocable", False)),
-        "disable_model_invocation": bool(
-            getattr(spec, "disable_model_invocation", False)
-        ),
+        "disable_model_invocation": bool(getattr(spec, "disable_model_invocation", False)),
         "install": install_entries,
         "kind": kind,
+        "visibility": str(getattr(spec, "visibility", "public")),
+        "invocation_mode": str(getattr(spec, "invocation", "direct")),
+        "owner_meta_skills": list(getattr(spec, "owner_meta_skills", []) or []),
         "sub_skills": sub_skills,
         "provider_check_at_launch": _provider_check_at_launch(
             spec,
@@ -801,11 +801,7 @@ def _lifecycle_rows(
         if path_key in represented_paths:
             continue
         spec = next(
-            (
-                item
-                for item in candidates
-                if _path_key(getattr(item, "base_dir", "")) == path_key
-            ),
+            (item for item in candidates if _path_key(getattr(item, "base_dir", "")) == path_key),
             None,
         )
         if spec is not None:
@@ -849,7 +845,7 @@ def _lifecycle_rows(
 
 @_d.method("skills.status", scope="operator.read")
 async def _handle_skills_status(params: dict | None, ctx: RpcContext) -> list[dict[str, Any]]:
-    """Return all skills with their eligibility status."""
+    """Return public Skills, with an owner/admin-only internal diagnostic view."""
     loader = _get_loader(ctx)
     if loader is None:
         return []
@@ -858,12 +854,22 @@ async def _handle_skills_status(params: dict | None, ctx: RpcContext) -> list[di
     # Operator gate: skills governed by the coding-mode toggle (code-task) are
     # hidden from the skill manager when the toggle is OFF — unreachable through
     # every skill API, not just the agent prompt (codex review).
-    skills = [
-        s
-        for s in await _catalog_skills(loader, reason="rpc.skills.status")
-        if is_skill_available_live(s.name)
-    ]
-    skill_index = {skill.name: skill for skill in skills}
+    all_skills = await _catalog_skills(loader, reason="rpc.skills.status")
+    skill_index = {skill.name: skill for skill in all_skills}
+    include_internal = bool(isinstance(params, dict) and params.get("include_internal") is True)
+    if include_internal:
+        if not (ctx.principal.is_owner or ADMIN_SCOPE in ctx.principal.scopes):
+            raise RpcHandlerError(
+                ERROR_UNAUTHORIZED,
+                "internal Skill diagnostics require the local owner or an administrator",
+            )
+        skills = [s for s in all_skills if is_skill_available_live(s.name)]
+    else:
+        skills = project_public_catalog(
+            all_skills,
+            coding_mode=is_skill_available_live("code-task"),
+            include_stable_meta=False,
+        )
     return [
         _skill_to_dict(
             skill,
@@ -888,11 +894,11 @@ async def _read_skills_list(params: dict | None, ctx: RpcContext) -> dict[str, A
     all_skills = snapshot.skills
     skill_index = {skill.name: skill for skill in all_skills}
     # Operator gate: coding-mode-gated skills (code-task when OFF) stay out.
-    skills = [
-        skill
-        for skill in all_skills
-        if skill.user_invocable and is_skill_available_live(skill.name)
-    ]
+    skills = project_public_catalog(
+        all_skills,
+        coding_mode=is_skill_available_live("code-task"),
+        include_stable_meta=False,
+    )
     if isinstance(params, dict) and params.get("includeLifecycle") is True:
         return {
             "skills": _lifecycle_rows(
@@ -1025,6 +1031,20 @@ async def _read_skills_get(params: dict | None, ctx: RpcContext) -> dict[str, An
         # never returned while the toggle is OFF (codex review).
         raise KeyError(f"Skill not found: {resolved_name}")
 
+    # Exact managed lifecycle identities remain inspectable for install,
+    # rollback, and shadow diagnostics. Ordinary winner lookup is the public
+    # Skill surface and must not reveal Meta roots or internal dependencies.
+    exact_lookup = bool(instance_id or install_id)
+    if (
+        skill is not None
+        and not exact_lookup
+        and not is_public_ordinary(
+            skill,
+            coding_mode=is_skill_available_live("code-task"),
+        )
+    ):
+        raise KeyError(f"Skill not found: {resolved_name}")
+
     # An install may be present in the managed store yet rejected by the
     # production loader. Exact lifecycle callers must see that Doctor item,
     # never an unrelated winner with the same manifest name.
@@ -1044,7 +1064,6 @@ async def _read_skills_get(params: dict | None, ctx: RpcContext) -> dict[str, An
     result["content"] = skill.content
     result["file_path"] = skill.file_path
     result["base_dir"] = skill.base_dir
-    exact_lookup = bool(instance_id or install_id)
     if exact_lookup:
         result["instance_id"] = getattr(skill, "instance_id", "")
         result["install_id"] = doctor_item.install_id if doctor_item is not None else ""
@@ -1074,9 +1093,7 @@ async def _read_skills_get(params: dict | None, ctx: RpcContext) -> dict[str, An
                     "active": doctor_item.active,
                     "instruction_usable": doctor_item.instruction_usable,
                     "lifecycle": doctor_item.lifecycle.to_dict(),
-                    "diagnostics": [
-                        item.to_dict() for item in doctor_item.diagnostics
-                    ],
+                    "diagnostics": [item.to_dict() for item in doctor_item.diagnostics],
                     "invocation": doctor_item.lifecycle.invocation.to_dict(),
                 }
             )
@@ -1105,9 +1122,7 @@ async def _read_skills_get(params: dict | None, ctx: RpcContext) -> dict[str, An
                     ),
                     "instruction_usable": lifecycle.usable is True,
                     "lifecycle": lifecycle.to_dict(),
-                    "diagnostics": [
-                        item.to_dict() for item in lifecycle_diagnostics
-                    ],
+                    "diagnostics": [item.to_dict() for item in lifecycle_diagnostics],
                     "invocation": lifecycle.invocation.to_dict(),
                 }
             )
@@ -1198,7 +1213,7 @@ async def _handle_skills_reload(params: dict | None, ctx: RpcContext) -> dict[st
     if loader is None:
         return _reload_failure_payload("No skill loader configured", loader=None)
 
-    from opensquilla.engine.steps.skills_filter import (
+    from opensquilla.engine.steps.skill_catalog_projection import (
         invalidate_skill_eligibility_cache,
     )
 
@@ -1223,13 +1238,9 @@ async def _handle_skills_install(params: dict | None, ctx: RpcContext) -> dict[s
     if not isinstance(params, dict) or "identifier" not in params:
         raise ValueError("params.identifier is required")
     operation_id = _skill_install_operation_id(params)
-    operation_key = (
-        _skill_install_operation_key(ctx, operation_id) if operation_id else None
-    )
+    operation_key = _skill_install_operation_key(ctx, operation_id) if operation_id else None
     active_installs = _active_skill_installs(ctx) if operation_key else None
-    pending_cancellations = (
-        _pending_skill_install_cancellations(ctx) if operation_key else None
-    )
+    pending_cancellations = _pending_skill_install_cancellations(ctx) if operation_key else None
     if operation_key and pending_cancellations is not None:
         if operation_key in pending_cancellations:
             pending_cancellations.discard(operation_key)
@@ -1299,9 +1310,10 @@ async def _run_skill_install(params: dict[str, Any], ctx: RpcContext) -> dict[st
                 name=str(identifier),
             )
         )
-    if not isinstance(installer, SkillManagementService) and force and (
-        not risk_confirmation
-        or not supports_keyword_argument(install, "risk_confirmation")
+    if (
+        not isinstance(installer, SkillManagementService)
+        and force
+        and (not risk_confirmation or not supports_keyword_argument(install, "risk_confirmation"))
     ):
         return _install_result_to_dict(
             unsupported_installer_result(
@@ -1409,9 +1421,12 @@ async def _handle_skills_update(params: dict | None, ctx: RpcContext) -> dict[st
                 install_id=install_id,
             )
             return {**_install_result_to_dict(unsupported), "results": []}
-        if not isinstance(installer, SkillManagementService) and force and (
-            not risk_confirmation
-            or not supports_keyword_argument(update, "risk_confirmation")
+        if (
+            not isinstance(installer, SkillManagementService)
+            and force
+            and (
+                not risk_confirmation or not supports_keyword_argument(update, "risk_confirmation")
+            )
         ):
             unsupported = unsupported_installer_result(
                 operation="update",
@@ -1443,9 +1458,7 @@ async def _handle_skills_update(params: dict | None, ctx: RpcContext) -> dict[st
             "success": False,
             "message": f"Skill update unavailable: {exc}",
         }
-    return {
-        "results": [_install_result_to_dict(r) for r in results]
-    }
+    return {"results": [_install_result_to_dict(r) for r in results]}
 
 
 @_d.method("skills.uninstall", scope="operator.admin")
@@ -1654,7 +1667,7 @@ async def _handle_skills_deps_install(params: dict | None, ctx: RpcContext) -> d
         results = await install_deps([spec])
         r = results[0]
         if r.success:
-            from opensquilla.engine.steps.skills_filter import (
+            from opensquilla.engine.steps.skill_catalog_projection import (
                 invalidate_skill_eligibility_cache,
             )
 
@@ -1676,6 +1689,7 @@ async def _handle_skills_deps_install(params: dict | None, ctx: RpcContext) -> d
 # ---------------------------------------------------------------------------
 # Default router/installer (lazy init)
 # ---------------------------------------------------------------------------
+
 
 def _get_default_router():
     return get_default_skill_router()

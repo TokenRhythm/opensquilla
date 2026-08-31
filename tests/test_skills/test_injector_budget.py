@@ -9,13 +9,22 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from opensquilla.skills.filter import build_skills_prompt
 from opensquilla.skills.injector import (
     DEFAULT_DESCRIPTION_LIMIT,
     SkillInjector,
     _truncate_text,
 )
 from opensquilla.skills.types import SkillLayer, SkillSpec
+
+
+def build_skills_prompt(
+    skills: list[SkillSpec], *, include_location: bool = False
+) -> str:
+    return SkillInjector().inject_full(
+        "",
+        skills,
+        include_location=include_location,
+    )
 
 
 def _skill(

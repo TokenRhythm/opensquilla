@@ -1,5 +1,6 @@
 import { onUnmounted, ref, type Ref } from 'vue'
 import i18n from '@/i18n'
+import type { MetaSkillCatalog } from '@/modules/metaSkillCatalog'
 import type { Skill, SkillDependencyInstallOutcome } from '@/types/skills'
 import {
   installActionsForCurrentDependencies,
@@ -14,6 +15,7 @@ interface SkillDetailRpc {
 
 interface SkillDetailControllerOptions {
   rpc: SkillDetailRpc
+  metaSkillCatalog: MetaSkillCatalog
   installDeps: (
     name: string,
     installId: string,
@@ -68,6 +70,18 @@ export function useSkillDetailController(
   }
 
   async function fetchLatest(seed: Skill): Promise<Skill> {
+    if (seed.kind === 'meta' || seed.kind === 'meta_sop') {
+      const detail = await options.metaSkillCatalog.inspect(seed.name)
+      const subSkills = (detail.dependencies || []).map(item => item.name)
+      return normalizeSkill({
+        ...seed,
+        ...detail,
+        name: seed.name,
+        kind: 'meta',
+        layer: seed.layer || 'bundled',
+        sub_skills: subSkills,
+      })
+    }
     const params: Record<string, unknown> = {
       name: seed.name,
       includeLifecycle: true,

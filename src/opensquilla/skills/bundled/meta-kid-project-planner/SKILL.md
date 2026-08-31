@@ -1,5 +1,7 @@
 ---
 name: meta-kid-project-planner
+visibility: tombstone
+invocation: historical_only
 description: "Retired compatibility definition for historical meta-kid-project-planner runs. It is not available for discovery, automatic activation, or new invocation; its plan remains bundled only so persisted and in-flight run snapshots can be inspected, resumed, or replayed safely."
 description_zh: "为历史 meta-kid-project-planner 运行保留的兼容定义。它不参与发现、自动激活或新调用；计划继续内置，仅用于安全检查、恢复或重放已持久化及正在运行的快照。"
 kind: meta

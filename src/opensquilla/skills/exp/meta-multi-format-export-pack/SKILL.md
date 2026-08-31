@@ -1,5 +1,8 @@
 ---
 name: meta-multi-format-export-pack
+visibility: experimental
+invocation: experimental_internal
+disable-model-invocation: true
 description: "From one piece of source content, render four deliverables: .docx report, .pptx slides, .xlsx data, and an HTML/PDF public version."
 kind: meta
 meta_priority: 60

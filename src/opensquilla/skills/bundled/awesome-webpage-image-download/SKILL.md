@@ -1,5 +1,9 @@
 ---
 name: awesome-webpage-image-download
+visibility: internal
+invocation: meta_only
+owner_meta_skills:
+  - AwesomeWebpageMetaSkill
 description: "Deterministic image downloader for AwesomeWebpageMetaSkill search results. Use as skill_exec to fetch candidate image URLs into the configured local project tree without sandboxed shell curl."
 description_zh: "为AwesomeWebpageMetaSkill搜索结果提供确定性的图片下载器。作为skill_exec使用，将候选图片URL抓取到配置的本地项目目录，无需沙箱内的shell curl。"
 homepage: ""

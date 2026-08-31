@@ -1,5 +1,8 @@
 ---
 name: meta-content-publish-pipeline
+visibility: experimental
+invocation: experimental_internal
+disable-model-invocation: true
 description: "Use this meta-skill instead of answering directly when the user wants to turn an idea, research, notes, talk, or document into publishable blog, social, Xiaohongshu, Zhihu, slide, newsletter, or short-video content through multi-skill orchestration."
 kind: meta
 meta_priority: 57

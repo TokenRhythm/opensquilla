@@ -1,5 +1,9 @@
 ---
 name: paper-quality-gate
+visibility: internal
+invocation: meta_only
+owner_meta_skills:
+  - meta-paper-write
 description: "Deterministic pre-compile gate for meta-paper-write. Enforces length/citation verdicts and rejects unsupported empirical-result claims when no user evidence was supplied."
 user-invocable: false
 disable-model-invocation: true
