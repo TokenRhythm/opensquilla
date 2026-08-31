@@ -27,9 +27,6 @@ export const debt = {
     supportsMethod: 1,
     waitForConnection: 2,
   },
-  // GoalCenter owns goals.status/set and GoalContinuity owns reattach/events;
-  // the four edit/pause/resume/clear mutations remain on the legacy path.
-  'src/composables/chat/useChatGoals.ts': { call: 1 },
   'src/composables/chat/useChatHistory.ts': { call: 1, waitForConnection: 1 },
   'src/composables/chat/useChatMetaDraftRecovery.ts': {
     call: 1,
@@ -37,7 +34,6 @@ export const debt = {
     supportsMethod: 1,
     waitForConnection: 1,
   },
-  'src/composables/chat/useChatPlans.ts': { call: 4, on: 6 },
   'src/composables/chat/useChatRouteFeedback.ts': { call: 1 },
   'src/composables/chat/useChatRunModePreference.ts': { call: 4 },
   // TurnCommands now owns send/cancel/steer method selection.  The one
@@ -80,7 +76,7 @@ export const debt = {
     supportsEvent: 1,
     // Turn capability probes are owned by TurnCommands; Goal mode probes are
     // owned by GoalCenter; the remaining method probes migrate independently.
-    supportsMethod: 7,
+    supportsMethod: 5,
     waitForConnection: 2,
     httpRequest: 1,
     httpApiEndpoint: 1,

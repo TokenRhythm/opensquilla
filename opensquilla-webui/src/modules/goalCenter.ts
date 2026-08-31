@@ -64,6 +64,20 @@ export interface GoalSetResult {
   readonly continuityToken?: string
 }
 
+/** Common optimistic-concurrency input for Goal mutations. */
+export interface GoalMutationInput {
+  readonly sessionKey: string
+  readonly expectedGoalId: string
+  readonly expectedStateRevision: number
+  readonly clientRequestId: string
+  readonly sourceKind?: 'web' | 'cli'
+}
+
+export interface GoalMutationResult extends GoalSetResult {
+  readonly accepted?: boolean
+  readonly goal?: GoalSnapshot | null
+}
+
 /** Process-scoped Goal feature flags projected out of the v4 wire shape. */
 export interface GoalCapabilities {
   readonly supported: boolean
@@ -96,6 +110,10 @@ export interface GoalCenter {
   capabilities(options?: { signal?: AbortSignal }): Promise<GoalCapabilities>
   status(sessionKey: string, options?: { signal?: AbortSignal }): Promise<GoalStatusResult>
   set(input: GoalSetInput, options?: { signal?: AbortSignal }): Promise<GoalSetResult>
+  edit(input: GoalMutationInput & { objective: string }, options?: { signal?: AbortSignal }): Promise<GoalMutationResult>
+  pause(input: GoalMutationInput, options?: { signal?: AbortSignal }): Promise<GoalMutationResult>
+  resume(input: GoalMutationInput, options?: { signal?: AbortSignal }): Promise<GoalMutationResult>
+  clear(input: GoalMutationInput, options?: { signal?: AbortSignal }): Promise<GoalMutationResult>
 }
 
 export const GOAL_CENTER_KEY: InjectionKey<GoalCenter> = Symbol('GoalCenter')

@@ -16,6 +16,7 @@ import { PENDING_INPUT_QUEUE_KEY } from './modules/pendingInputQueue'
 import { APPROVAL_CENTER_KEY } from './modules/approvalCenter'
 import { GOAL_CENTER_KEY } from './modules/goalCenter'
 import { GOAL_CONTINUITY_KEY } from './modules/goalContinuity'
+import { PLAN_CENTER_KEY } from './modules/planCenter'
 import 'katex/dist/katex.min.css'
 import './assets/base.css'
 import './themes/tokens' // eagerly bundles every value theme's token block
@@ -56,6 +57,7 @@ app.provide(PENDING_INPUT_QUEUE_KEY, gatewayAdapters.pendingInputQueue)
 app.provide(APPROVAL_CENTER_KEY, gatewayAdapters.approvalCenter)
 app.provide(GOAL_CENTER_KEY, gatewayAdapters.goalCenter)
 app.provide(GOAL_CONTINUITY_KEY, gatewayAdapters.goalContinuity)
+app.provide(PLAN_CENTER_KEY, gatewayAdapters.planCenter)
 router.afterEach(() => {
   rpcStore.applyLinkTokenFromUrl()
 })
