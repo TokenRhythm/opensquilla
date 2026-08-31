@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import copy
-from typing import Any, cast
+from typing import Any
 
 import structlog
 
@@ -880,12 +880,10 @@ async def _handle_config_set(params: dict | None, ctx: RpcContext) -> dict[str, 
     return response
 
 
-@_d.method("config.patch", scope="operator.admin")
-async def _handle_config_patch(
+async def _execute_config_patch(
     params: dict | None,
     ctx: RpcContext,
-    *,
-    _model_routing_source: str = "config.patch",
+    model_routing_source: str = "config.patch",
 ) -> dict[str, Any]:
     if not isinstance(params, dict):
         raise ValueError("params.patch or params.patches is required")
@@ -1026,12 +1024,53 @@ async def _handle_config_patch(
     model_routing = await broadcast_model_routing_changed_if_needed(
         ctx,
         previous=old_model_routing,
-        source=_model_routing_source,
+        source=model_routing_source,
         config=new_config,
     )
     if model_routing is not None:
         response["model_routing"] = model_routing
     return response
+
+
+def _app_settings(ctx: RpcContext):
+    from opensquilla.application.app_settings import AppSettings
+    from opensquilla.gateway.adapters.app_settings import RpcContextAppSettingsPort
+
+    port = RpcContextAppSettingsPort(
+        ctx,
+        patch_runner=_execute_config_patch,
+        effective_reader=_execute_config_effective,
+    )
+    return AppSettings(port, port)
+
+
+@_d.method("config.patch", scope="operator.admin")
+async def _handle_config_patch(
+    params: dict | None,
+    ctx: RpcContext,
+    *,
+    _model_routing_source: str = "config.patch",
+) -> dict[str, Any]:
+    from opensquilla.application.app_settings import SettingChange
+
+    if not isinstance(params, dict):
+        raise ValueError("params.patch or params.patches is required")
+    patch_data = params.get("patch") or {}
+    dot_patches = params.get("patches") or {}
+    if not isinstance(patch_data, dict) or not isinstance(dot_patches, dict):
+        raise ValueError("params.patch and params.patches must be objects")
+    if not patch_data and not dot_patches:
+        raise ValueError("params.patch or params.patches is required")
+    if patch_data and dot_patches:
+        # Preserve the legacy combined mutation shape. New domain consumers
+        # deliberately choose either semantic merge or dotted changes.
+        return await _execute_config_patch(params, ctx, _model_routing_source)
+    settings = _app_settings(ctx)
+    if patch_data:
+        return await settings.merge(patch_data)
+    return await settings.patch(
+        [SettingChange(path, value) for path, value in dot_patches.items()]
+    )
 
 
 @_d.method("config.patch.safe", scope="operator.write")
@@ -1046,17 +1085,16 @@ async def _handle_config_patch_safe(params: dict | None, ctx: RpcContext) -> dic
     if not dot_patches:
         raise ValueError("params.patches is required")
 
+    if not isinstance(dot_patches, dict):
+        raise ValueError("params.patches must be an object")
     unsafe_paths = sorted(set(dot_patches) - _SAFE_WRITE_PATCH_PATHS)
     if unsafe_paths:
         raise ValueError(f"Path is not safe for operator.write: {unsafe_paths[0]}")
 
-    return cast(
-        dict[str, Any],
-        await _handle_config_patch(
-            params,
-            ctx,
-            _model_routing_source="config.patch.safe",
-        ),
+    from opensquilla.application.app_settings import SettingChange
+
+    return await _app_settings(ctx).patch_safe(
+        [SettingChange(path, value) for path, value in dot_patches.items()]
     )
 
 
@@ -1340,8 +1378,7 @@ async def _handle_config_schema_lookup(params: dict | None, ctx: RpcContext) -> 
     }
 
 
-@_d.method("config.effective", scope="operator.read")
-async def _handle_config_effective(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def _execute_config_effective(ctx: RpcContext) -> dict[str, Any]:
     """Effective LLM routing values with per-field provenance.
 
     Wire shape (public contract, frozen by
@@ -1376,3 +1413,11 @@ async def _handle_config_effective(params: dict | None, ctx: RpcContext) -> dict
             "source": field.source,
         }
     return {"fields": fields}
+
+
+@_d.method("config.effective", scope="operator.read")
+async def _handle_config_effective(
+    _params: dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    return await _app_settings(ctx).read_effective()

@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { AppSettings, SettingChange } from '@/modules/appSettings'
 
 const rpcCall = vi.fn()
 const waitForConnection = vi.fn().mockResolvedValue(undefined)
@@ -8,6 +9,17 @@ vi.mock('@/stores/rpc', () => ({
 }))
 
 import { useMemoryLearningSettings } from './useMemoryLearningSettings'
+
+const appSettings = {
+  readAll: () => rpcCall('config.get'),
+  read: () => Promise.resolve(null),
+  readEffective: () => Promise.resolve({ fields: {} }),
+  patch: () => Promise.resolve({}),
+  patchSafe: (changes: readonly SettingChange[]) => rpcCall('config.patch.safe', {
+    patches: Object.fromEntries(changes.map(change => [change.path, change.value])),
+  }),
+  merge: () => Promise.resolve({}),
+} satisfies AppSettings
 
 describe('useMemoryLearningSettings', () => {
   beforeEach(() => {
@@ -24,7 +36,7 @@ describe('useMemoryLearningSettings', () => {
       }
       return {}
     })
-    const ml = useMemoryLearningSettings()
+    const ml = useMemoryLearningSettings(appSettings)
     await ml.load()
 
     expect(ml.dreamEnabled.value).toBe(true)
@@ -43,7 +55,7 @@ describe('useMemoryLearningSettings', () => {
       if (method === 'router.selflearning.status') return { enabled: true }
       return {}
     })
-    const ml = useMemoryLearningSettings()
+    const ml = useMemoryLearningSettings(appSettings)
 
     const ok = await ml.setSelfLearning(true)
 
@@ -66,7 +78,7 @@ describe('useMemoryLearningSettings', () => {
       if (method === 'router.selflearning.status') return { enabled: true }
       return {}
     })
-    const ml = useMemoryLearningSettings()
+    const ml = useMemoryLearningSettings(appSettings)
 
     await ml.setSelfLearning(true)
 
@@ -84,7 +96,7 @@ describe('useMemoryLearningSettings', () => {
       if (method === 'router.selflearning.status') return { enabled: true }
       return {}
     })
-    const ml = useMemoryLearningSettings()
+    const ml = useMemoryLearningSettings(appSettings)
     await ml.load()
 
     await ml.setDream(false)
@@ -101,7 +113,7 @@ describe('useMemoryLearningSettings', () => {
       if (method === 'config.patch.safe') throw new Error('denied')
       return {}
     })
-    const ml = useMemoryLearningSettings()
+    const ml = useMemoryLearningSettings(appSettings)
 
     const ok = await ml.setSelfLearning(true)
 

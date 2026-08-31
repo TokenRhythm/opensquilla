@@ -182,11 +182,7 @@ def _list_error_to_wire(err: Any) -> dict[str, Any]:
     }
 
 
-@_d.method("models.list", scope="operator.read")
-async def _handle_models_list(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    provider_filter = (params or {}).get("provider")
-    capabilities_filter: list[str] | None = (params or {}).get("capabilities")
-
+async def _load_models(ctx: RpcContext) -> dict[str, Any]:
     models: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     if ctx.provider_selector is not None and getattr(
@@ -245,33 +241,39 @@ async def _handle_models_list(params: dict | None, ctx: RpcContext) -> dict[str,
         except Exception:
             pass
 
-    if provider_filter:
-        models = [m for m in models if m["provider"] == provider_filter]
-
-    if capabilities_filter:
-        required = set(capabilities_filter)
-        models = [m for m in models if required.issubset(set(m["capabilities"]))]
-
     return {"models": models, "errors": errors}
 
 
-@_d.method("models.routing.get", scope="operator.read")
-async def _handle_models_routing_get(
-    _params: dict | None,
-    ctx: RpcContext,
-) -> dict[str, Any]:
+@_d.method("models.list", scope="operator.read")
+async def _handle_models_list(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    from opensquilla.application.provider_configuration import ModelCatalog
+    from opensquilla.gateway.adapters.provider_configuration import (
+        RpcContextModelCatalogPort,
+    )
+
+    if params is not None and not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    query = params or {}
+    capabilities = query.get("capabilities")
+    if capabilities is not None and not isinstance(capabilities, list):
+        raise ValueError("params.capabilities must be an array")
+    catalog = ModelCatalog(RpcContextModelCatalogPort(ctx, _load_models))
+    return await catalog.query(
+        provider_id=query.get("provider"),
+        capabilities=capabilities,
+    )
+
+
+async def _read_model_routing(ctx: RpcContext) -> dict[str, Any]:
     if ctx.config is None:
         raise ValueError("No config available")
     return model_routing_public_snapshot(ctx.config)
 
 
-@_d.method("models.routing.set", scope="operator.write")
-async def _handle_models_routing_set(
-    params: dict | None,
+async def _write_model_routing(
+    mode: str,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    if not isinstance(params, dict) or not isinstance(params.get("mode"), str):
-        raise ValueError("params.mode is required")
     if ctx.config is None:
         raise ValueError("No config available")
 
@@ -280,7 +282,7 @@ async def _handle_models_routing_set(
     from opensquilla.gateway.rpc_config import _handle_config_patch_safe
 
     patch_result = await _handle_config_patch_safe(
-        {"patches": model_routing_patches(ctx.config, params["mode"])},
+        {"patches": model_routing_patches(ctx.config, mode)},
         ctx,
     )
     return {
@@ -290,3 +292,36 @@ async def _handle_models_routing_set(
             patch_result.get("restartRequired", patch_result.get("restart_required", False))
         ),
     }
+
+
+def _model_routing(ctx: RpcContext):
+    from opensquilla.application.provider_configuration import ModelRouting
+    from opensquilla.gateway.adapters.provider_configuration import (
+        RpcContextModelRoutingPort,
+    )
+
+    return ModelRouting(
+        RpcContextModelRoutingPort(
+            ctx,
+            reader=_read_model_routing,
+            writer=_write_model_routing,
+        )
+    )
+
+
+@_d.method("models.routing.get", scope="operator.read")
+async def _handle_models_routing_get(
+    _params: dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    return await _model_routing(ctx).read()
+
+
+@_d.method("models.routing.set", scope="operator.write")
+async def _handle_models_routing_set(
+    params: dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    if not isinstance(params, dict) or not isinstance(params.get("mode"), str):
+        raise ValueError("params.mode is required")
+    return await _model_routing(ctx).set_mode(params["mode"])

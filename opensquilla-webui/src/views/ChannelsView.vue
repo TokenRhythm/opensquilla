@@ -464,7 +464,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onActivated, onDeactivated, onUnmounted, ref, watch } from 'vue'
+import { computed, inject, nextTick, onActivated, onDeactivated, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import { useRpcStore } from '@/stores/rpc'
@@ -518,6 +518,8 @@ import {
   statusPresentation,
   type ChannelStatusKey,
 } from '@/lib/channelStatus'
+import { APP_SETTINGS_KEY } from '@/modules/appSettings'
+import { SETUP_WORKFLOW_KEY } from '@/modules/setupWorkflow'
 
 interface ChannelsStatusResponse { channels?: Channel[] }
 type DetailTab = 'overview' | 'pairings' | 'configuration' | 'diagnostics'
@@ -532,6 +534,11 @@ const SECTIONS: SectionId[] = ['pairings', 'configuration', 'diagnostics']
 // the inline platform gallery IS the page; ≥1 channel → the enroll strip closes
 // the fleet front page. No per-count add-card or header button.
 const { t, locale } = useI18n()
+const injectedAppSettings = inject(APP_SETTINGS_KEY)
+if (!injectedAppSettings) throw new Error('AppSettings was not provided')
+const appSettings = injectedAppSettings
+const setupWorkflow = inject(SETUP_WORKFLOW_KEY)
+if (!setupWorkflow) throw new Error('SetupWorkflow was not provided')
 const { localizeLabel } = useChannelCatalogI18n()
 function enrollLabel(spec: ChannelEditorSpec): string {
   return localizeLabel(spec.type, spec.label)
@@ -550,7 +557,7 @@ const probeResults = ref<Record<string, ProbeResult>>({})
 // In-place configuration editor: draft state is owned by the view (not the
 // section body), so scrolling to Members/Diagnostics keeps an unsaved draft
 // alive and the Configuration sidenav dot stays lit.
-const editor = useChannelEditor()
+const editor = useChannelEditor(setupWorkflow)
 const editMode = ref(false)
 const editorSaving = ref(false)
 /** Discard-guard verdict: true = discard the draft and proceed, false = the
@@ -562,14 +569,14 @@ type DiscardVerdict = boolean | 'superseded'
 const discardRequest = ref<{ resolve: (verdict: DiscardVerdict) => void } | null>(null)
 // Compose takeover: a SECOND editor instance so an add-channel draft can
 // never cross-contaminate the selected channel's edit draft.
-const composeEditor = useChannelEditor()
+const composeEditor = useChannelEditor(setupWorkflow)
 const composeMode = ref(false)
 const composeType = ref('')
 const composeSaving = ref(false)
 const composeDiscardRequest = ref<{ resolve: (verdict: DiscardVerdict) => void } | null>(null)
 // Members (pairings + channel admins) for the drilled-in channel — state owned
 // here so it survives section scrolling; ChannelMembersPanel renders it.
-const members = useChannelMembers()
+const members = useChannelMembers(appSettings)
 
 const { data: channelsData, loading, error, execute, refresh } = useRequest<ChannelsStatusResponse>(
   'channels.status', undefined, { immediate: false, errorLabel: t('console.channels.loadFailed') },
@@ -855,8 +862,8 @@ async function loadHomeFacts(only?: string[]): Promise<void> {
     // {} = known-empty (no admins configured anywhere); null = unknown (the
     // read failed) — the two must not be conflated, or a transient failure
     // would zero the admin count and re-arm the first-pairing bootstrap.
-    const adminsPromise: Promise<Record<string, unknown> | null> = rpc
-      .call<Record<string, unknown> | null>('config.get', { path: 'channel_admin_senders' })
+    const adminsPromise: Promise<Record<string, unknown> | null> = appSettings
+      .read('channel_admin_senders')
       .then(map => record(map))
       .catch(() => null)
     const pairingsByName = await Promise.all(names.map(async name => {

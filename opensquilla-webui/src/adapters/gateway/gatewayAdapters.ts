@@ -84,7 +84,7 @@ export function createGatewayAdapters(
     planCenter: createV4PlanCenter(transports.rpc, transports.events),
     metaRunCenter: createV4MetaRunCenter(transports.rpc, transports.events),
     appSettings: createV4AppSettings(transports.rpc),
-    providerConfiguration: createV4ProviderConfiguration(transports.rpc, transports.events),
+    providerConfiguration: createV4ProviderConfiguration(transports.rpc),
     setupWorkflow: createV4SetupWorkflow(transports.rpc),
   }
   return adapters

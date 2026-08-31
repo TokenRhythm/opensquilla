@@ -160,6 +160,7 @@ async function mountOverview(options: MountOptions = {}) {
   const { createV4SessionDirectory } = await import('@/adapters/gateway/sessionDirectoryV4')
   type SessionDirectoryTransport = Parameters<typeof createV4SessionDirectory>[0]
   const { SESSION_DIRECTORY_KEY } = await import('@/modules/sessionDirectory')
+  const { PROVIDER_CONFIGURATION_KEY } = await import('@/modules/providerConfiguration')
   const active = ref(true)
   const TestHost = defineComponent({
     name: 'OverviewTestHost',
@@ -182,6 +183,39 @@ async function mountOverview(options: MountOptions = {}) {
     request: rpcCall,
     ready: vi.fn(async () => {}),
   } as unknown as SessionDirectoryTransport))
+  app.provide(PROVIDER_CONFIGURATION_KEY, {
+    status: vi.fn(async () => {
+      const rawResponse = await rpcCall('providers.status', {}) as unknown
+      const raw = rawResponse && typeof rawResponse === 'object'
+        ? rawResponse as { providers?: unknown[] }
+        : { providers: [] }
+      const providers = Array.isArray(raw.providers)
+        ? raw.providers
+          .filter((row): row is Record<string, unknown> => Boolean(row && typeof row === 'object'))
+          .map(row => ({
+            providerId: String(row.providerId ?? ''),
+            active: row.active === true,
+            configured: row.configured === true,
+            buildable: row.buildable !== false,
+            model: typeof row.model === 'string' ? row.model : null,
+            requiresApiKey: row.requiresApiKey === true,
+            apiKeyEnv: typeof row.apiKeyEnv === 'string' ? row.apiKeyEnv : null,
+            apiKeyConfigured: row.apiKeyConfigured === true,
+            apiKeyShape: typeof row.apiKeyShape === 'string' ? row.apiKeyShape : null,
+            baseUrlConfigured: row.baseUrlConfigured === true,
+            error: typeof row.error === 'string' ? row.error : null,
+            modelProbe: typeof row.modelProbe === 'string' ? row.modelProbe : null,
+            latency: row.latency && typeof row.latency === 'object' ? row.latency as Record<string, unknown> : null,
+          }))
+        : []
+      return {
+        activeProvider: providers.find(row => row.active)?.providerId || null,
+        providerResolution: {},
+        providers,
+        count: providers.length,
+      }
+    }),
+  } as unknown as import('@/modules/providerConfiguration').ProviderConfiguration)
   app.mount(el)
   mountedApps.push({ app, el })
 

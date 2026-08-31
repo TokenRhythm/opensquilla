@@ -39,6 +39,91 @@ async function mountCatalog() {
       return () => null
     },
   })
+  const { APP_SETTINGS_KEY } = await import('@/modules/appSettings')
+  const { SETUP_WORKFLOW_KEY } = await import('@/modules/setupWorkflow')
+  const { PROVIDER_CONFIGURATION_KEY } = await import('@/modules/providerConfiguration')
+  app.provide(APP_SETTINGS_KEY, {
+    readAll: async () => await rpcCall('config.get') as import('@/modules/appSettings').SettingsObject,
+    read: async () => null,
+    readEffective: async () => await rpcCall('config.effective') as import('@/modules/appSettings').EffectiveSettings,
+    patch: async (changes: readonly { path: string; value: unknown }[]) => await rpcCall(
+      'config.patch',
+      { patches: Object.fromEntries(changes.map(change => [change.path, change.value])) },
+    ) as import('@/modules/appSettings').SettingsMutation,
+    patchSafe: async (changes: readonly { path: string; value: unknown }[]) => await rpcCall(
+      'config.patch.safe',
+      { patches: Object.fromEntries(changes.map(change => [change.path, change.value])) },
+    ) as import('@/modules/appSettings').SettingsMutation,
+    merge: async (patch: Record<string, unknown>) => await rpcCall(
+      'config.patch',
+      { patch },
+    ) as import('@/modules/appSettings').SettingsMutation,
+  } as unknown as import('@/modules/appSettings').AppSettings)
+  app.provide(SETUP_WORKFLOW_KEY, {
+    capabilities: {
+      get profileLifecycle() {
+        return supportsMethod('onboarding.llmProfile.upsert')
+      },
+      get primaryProviderRemoval() {
+        return supportsMethod('onboarding.llmProfile.active.remove')
+      },
+      get imageModelDiscovery() {
+        return supportsMethod('onboarding.imageGeneration.models.discover')
+      },
+    },
+    catalog: async () => await rpcCall('onboarding.catalog'),
+    status: async () => await rpcCall('onboarding.status'),
+    discoverImageGenerationModels: (providerId: string) => rpcCall(
+      'onboarding.imageGeneration.models.discover',
+      { providerId },
+    ),
+    provider: {
+      configure: async (payload: Record<string, unknown>) => await rpcCall('onboarding.provider.configure', payload),
+      probe: (payload: Record<string, unknown>) => rpcCall('onboarding.provider.probe', payload),
+      discoverModels: (payload: Record<string, unknown>) => rpcCall('onboarding.models.discover', payload),
+      credentialReveal: async (providerId: string) => await rpcCall('onboarding.provider.credential.reveal', { providerId }),
+      credentialClear: async (providerId: string) => await rpcCall('onboarding.provider.credential.clear', { providerId }),
+    },
+    profile: {
+      upsert: async (payload: Record<string, unknown>) => await rpcCall('onboarding.llmProfile.upsert', payload),
+      activate: async (payload: Record<string, unknown>) => await rpcCall('onboarding.llmProfile.activate', payload),
+      probe: (payload: Record<string, unknown>) => rpcCall('onboarding.llmProfile.probe', payload),
+      probeDraft: (payload: Record<string, unknown>) => rpcCall('onboarding.llmProfile.draft.probe', payload),
+      discoverModels: (payload: Record<string, unknown>) => rpcCall(
+        'onboarding.llmProfile.models.discover',
+        payload,
+      ).catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error)
+          if (!/method.*not found|unknown method|not registered/i.test(message)) throw error
+          return rpcCall('onboarding.models.discover', payload)
+        }),
+      discoverDraftModels: (payload: Record<string, unknown>) => rpcCall('onboarding.llmProfile.draft.models.discover', payload),
+      remove: async (providerId: string) => await rpcCall('onboarding.llmProfile.remove', { providerId }),
+      removeActive: async (payload: Record<string, unknown>) => await rpcCall('onboarding.llmProfile.active.remove', payload),
+      credentialClear: async (providerId: string) => await rpcCall('onboarding.llmProfile.credential.clear', { providerId }),
+    },
+    capability: {
+      configure: async (name: string, payload: Record<string, unknown>) => await rpcCall({
+        router: 'onboarding.router.configure',
+        ensemble: 'onboarding.ensemble.configure',
+        search: 'onboarding.search.configure',
+        imageGeneration: 'onboarding.imageGeneration.configure',
+        memory_embedding: 'onboarding.memory_embedding.configure',
+        audio: 'onboarding.audio.configure',
+      }[name] || name, payload),
+      reset: async (name: string) => await rpcCall('onboarding.capability.reset', {
+        capabilityId: name === 'imageGeneration' ? 'image_generation' : name,
+      }),
+    },
+  } as unknown as import('@/modules/setupWorkflow').SetupWorkflow)
+  app.provide(PROVIDER_CONFIGURATION_KEY, {
+    catalog: async () => [],
+    list: async () => ({ models: [], errors: [] }),
+    status: async () => ({ activeProvider: null, providerResolution: {}, providers: [], count: 0 }),
+    get: async () => ({ mode: 'direct' }),
+    setRouting: async (mode: string) => await rpcCall('models.routing.set', { mode }),
+    credentials: { reveal: async () => ({}), clear: async () => ({}) },
+  } as unknown as import('@/modules/providerConfiguration').ProviderConfiguration)
   app.mount(el)
   await nextTick()
   await Promise.resolve()
@@ -4402,8 +4487,9 @@ describe('useSetupCatalog configured provider management', () => {
       providerId: 'openai',
       model: 'gpt-4.1-mini',
     })
-    expect(api.routerPanel.value.discoveredModelsByProvider.deepseek?.models[0]?.id)
-      .toBe('deepseek-chat')
+    await vi.waitFor(() => expect(
+      api.routerPanel.value.discoveredModelsByProvider.deepseek?.models[0]?.id,
+    ).toBe('deepseek-chat'))
     app.unmount()
   })
 

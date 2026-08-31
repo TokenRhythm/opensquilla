@@ -21,12 +21,9 @@ export const debt = {
     httpRequest: 1,
     httpApiEndpoint: 1,
   },
-  'src/composables/chat/useChatFeatureToggles.ts': {
-    call: 7,
-    on: 1,
-    supportsMethod: 1,
-    waitForConnection: 2,
-  },
+  // Config and routing access now flows through the AppSettings and
+  // ProviderConfiguration domain seams. Event subscription remains below.
+  'src/composables/chat/useChatFeatureToggles.ts': { on: 1 },
   'src/composables/chat/useChatHistory.ts': { call: 1, waitForConnection: 1 },
   'src/composables/chat/useChatRouteFeedback.ts': { call: 1 },
   'src/composables/chat/useChatRunModePreference.ts': { call: 4 },

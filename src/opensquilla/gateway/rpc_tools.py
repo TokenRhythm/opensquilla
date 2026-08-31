@@ -226,15 +226,13 @@ async def _model_probe(provider_id: str, ctx: RpcContext) -> dict[str, Any]:
         }
 
 
-@_d.method("providers.status", scope="operator.read")
-async def _handle_providers_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def _read_providers_status(
+    provider_filter: str | None,
+    probe_models: bool,
+    ctx: RpcContext,
+) -> dict[str, Any]:
     from opensquilla.onboarding.provider_specs import list_provider_setup_specs
     from opensquilla.provider.selector import ProviderBuildError, build_provider
-
-    if params is not None and not isinstance(params, dict):
-        raise ValueError("params must be an object")
-    provider_filter = (params or {}).get("provider")
-    probe_models = bool((params or {}).get("probeModels", False))
 
     specs = list_provider_setup_specs()
     by_id = {spec.provider_id: spec for spec in specs}
@@ -385,6 +383,25 @@ async def _handle_providers_status(params: dict | None, ctx: RpcContext) -> dict
         "providers": rows,
         "count": len(rows),
     }
+
+
+@_d.method("providers.status", scope="operator.read")
+async def _handle_providers_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    from opensquilla.application.provider_configuration import ProviderStatus
+    from opensquilla.gateway.adapters.provider_configuration import (
+        RpcContextProviderStatusPort,
+    )
+
+    if params is not None and not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    query = params or {}
+    status = ProviderStatus(
+        RpcContextProviderStatusPort(ctx, _read_providers_status)
+    )
+    return await status.read(
+        provider_id=query.get("provider"),
+        probe_models=bool(query.get("probeModels", False)),
+    )
 
 
 @_d.method("search.status", scope="operator.read")

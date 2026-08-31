@@ -1,4 +1,4 @@
-import { createApp } from 'vue'
+import { createApp, watch } from 'vue'
 import { createPinia } from 'pinia'
 import App from './App.vue'
 import { router } from './router'
@@ -42,6 +42,12 @@ const rpcStore = useRpcStore()
 rpcStore.init()
 const gatewayAdapters = createGatewayAdapters(rpcStore, {
   http: createPrivateHttpTransport(),
+})
+appStore.bindAppSettings(gatewayAdapters.appSettings)
+watch(() => rpcStore.state, (state) => {
+  if (state === 'connected' && appStore.pendingChannelNoticeLocale) {
+    void appStore.syncLocaleToGateway()
+  }
 })
 app.provide(
   SESSION_DIRECTORY_KEY,

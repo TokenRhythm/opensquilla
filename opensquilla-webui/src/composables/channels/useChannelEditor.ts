@@ -3,12 +3,12 @@ import i18n from '@/i18n'
 import { useRpcStore } from '@/stores/rpc'
 import { errorMessage } from '@/composables/channels/shared'
 import { useSetupChannelsForm } from '@/composables/setup/useSetupChannelsForm'
+import type { SetupCatalogPort } from '@/modules/setupWorkflow'
 import {
   REDACTED_SENTINEL,
   parseUpsertOutcome,
   probeChannelEntry,
   upsertChannelEntry,
-  type ChannelRpcCaller,
   type ChannelSaveOutcome,
 } from '@/composables/setup/channelRpc'
 
@@ -87,15 +87,17 @@ let catalogCache: ChannelEditorSpec[] | null = null
 let catalogInflight: Promise<ChannelEditorSpec[]> | null = null
 
 export function ensureChannelCatalog(
-  rpc: ChannelRpcCaller,
+  setupCatalog: SetupCatalogPort,
   opts: { refresh?: boolean } = {},
 ): Promise<ChannelEditorSpec[]> {
   if (!opts.refresh && catalogCache) return Promise.resolve(catalogCache)
   if (!catalogInflight) {
-    catalogInflight = rpc
-      .call<{ channels?: ChannelEditorSpec[] }>('onboarding.catalog')
+    catalogInflight = setupCatalog
+      .catalog()
       .then(res => {
-        catalogCache = res?.channels || []
+        catalogCache = (res?.channels || []).map(
+          entry => entry as unknown as ChannelEditorSpec,
+        )
         return catalogCache
       })
       .finally(() => {
@@ -128,7 +130,7 @@ export function suggestChannelName(type: string, existingNames: string[]): strin
   return `${base}-${existingNames.length + 1}`
 }
 
-export function useChannelEditor() {
+export function useChannelEditor(setupCatalog: SetupCatalogPort) {
   const rpc = useRpcStore()
   const form = useSetupChannelsForm()
 
@@ -157,10 +159,7 @@ export function useChannelEditor() {
   const panel = form.createPanel(specFields)
 
   async function ensureCatalog(refresh = false): Promise<ChannelEditorSpec[]> {
-    // Cold-load guard: panels can mount before the WS handshake completes;
-    // waiting here turns a hard "not connected" error into a short defer.
-    await rpc.waitForConnection()
-    const channels = await ensureChannelCatalog(rpc, { refresh })
+    const channels = await ensureChannelCatalog(setupCatalog, { refresh })
     catalog.value = channels
     return channels
   }

@@ -778,3 +778,25 @@ def test_cross_rpc_private_import_debt_is_exact() -> None:
     stale = APPROVED_PRIVATE_RPC_IMPORTS - actual
     assert unexpected == Counter(), f"unexpected private RPC imports: {unexpected}"
     assert stale == Counter(), f"stale private RPC import allowlist: {stale}"
+
+
+def test_r3_application_modules_do_not_depend_on_gateway_context() -> None:
+    violations: list[str] = []
+    for relative in R3_APPLICATION_MODULE_FILES:
+        path = ROOT / relative
+        tree = _tree(path)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
+                "opensquilla.gateway"
+            ):
+                violations.append(f"{relative}:{node.lineno}: imports {node.module}")
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.startswith("opensquilla.gateway"):
+                        violations.append(f"{relative}:{node.lineno}: imports {alias.name}")
+            elif isinstance(node, ast.Name) and node.id == "RpcContext":
+                violations.append(f"{relative}:{node.lineno}: references RpcContext")
+
+    assert violations == [], "R3 Application Modules crossed the Gateway seam:\n" + "\n".join(
+        violations
+    )
