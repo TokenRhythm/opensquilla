@@ -1,5 +1,0 @@
-{
-  "cases": [
-    {"id": "cas-applied", "coverage": "accepted CAS response", "expectation": "exact", "wire": {"type": "res", "id": "set-1", "ok": true, "payload": {"key": "agent:main:webchat:one", "sessionKey": "agent:main:webchat:one", "mode": "router", "revision": 1, "source": "session", "initialized": true, "appliesTo": "next_accepted_turn"}}}
-  ]
-}

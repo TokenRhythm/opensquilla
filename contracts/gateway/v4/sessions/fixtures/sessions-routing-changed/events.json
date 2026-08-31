@@ -1,5 +1,0 @@
-{
-  "cases": [
-    {"id": "changed-live", "coverage": "live-only changed event", "expectation": "exact", "wire": {"key": "agent:main:webchat:one", "sessionKey": "agent:main:webchat:one", "routing": {"mode": "ensemble", "revision": 2, "source": "session", "initialized": true, "appliesTo": "next_accepted_turn"}, "mode": "ensemble", "revision": 2}}
-  ]
-}

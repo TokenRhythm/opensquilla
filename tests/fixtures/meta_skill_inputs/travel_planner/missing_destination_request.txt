@@ -1,3 +1,0 @@
-Use meta-travel-planner to plan a relaxed food-and-museum trip for next month.
-We are two adults and want good public transport, but I have not chosen the
-destination or trip length yet.

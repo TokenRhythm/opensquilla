@@ -1,9 +1,0 @@
-{
-  "format_version": 1,
-  "kind": "behavior",
-  "cases": [
-    { "id": "behavior.trim", "coverage": "displayName is trimmed before persistence", "expectation": "exact" },
-    { "id": "behavior.bound", "coverage": "displayName is bounded at 512 characters", "expectation": "exact" },
-    { "id": "behavior.no-admin-patch", "coverage": "deployment fields remain rejected", "expectation": "exact" }
-  ]
-}

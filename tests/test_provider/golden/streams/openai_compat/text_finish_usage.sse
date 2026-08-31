@@ -1,8 +1,0 @@
-data: {"id": "chatcmpl-test-000", "object": "chat.completion.chunk", "model": "gpt-test-1", "choices": [{"index": 0, "delta": {"role": "assistant", "content": "Hel"}, "finish_reason": null}]}
-
-data: {"id": "chatcmpl-test-000", "object": "chat.completion.chunk", "model": "gpt-test-1", "choices": [{"index": 0, "delta": {"content": "lo!"}, "finish_reason": null}]}
-
-data: {"id": "chatcmpl-test-000", "object": "chat.completion.chunk", "model": "gpt-test-1", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 12, "completion_tokens": 5}}
-
-data: [DONE]
-

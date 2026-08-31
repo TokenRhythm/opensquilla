@@ -1,6 +1,0 @@
-{
-  "cases": [
-    {"id": "cas-camel", "coverage": "canonical CAS update", "expectation": "exact", "wire": {"type": "req", "id": "set-1", "method": "sessions.routing.set", "params": {"sessionKey": "agent:main:webchat:one", "mode": "router", "expectedRevision": 0}}},
-    {"id": "cas-legacy-alias", "coverage": "legacy snake_case aliases", "expectation": "exact", "wire": {"type": "req", "id": "set-2", "method": "sessions.routing.set", "params": {"session_key": "agent:main:webchat:one", "mode": "ensemble", "expected_revision": 1}}}
-  ]
-}

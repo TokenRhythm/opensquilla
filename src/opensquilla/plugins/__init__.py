@@ -1,1 +1,0 @@
-"""Built-in OpenSquilla plugins."""

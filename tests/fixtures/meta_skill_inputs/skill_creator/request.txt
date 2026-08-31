@@ -1,6 +1,0 @@
-Use meta-skill-creator to design a meta-skill named release-readiness-brief.
-It should orchestrate git-diff, test-result summarization, risk review, and
-final release-note drafting. The final output should be a concise Markdown
-brief for a maintainer deciding whether a branch is ready to merge. Trigger
-phrases should include "release readiness brief" and "merge readiness report".
-Do not auto-persist; return a preview first.

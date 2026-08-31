@@ -1,3 +1,0 @@
-/* Route changes are intentionally immediate. Page-level fades and movement
-   make data-heavy views feel slower even when the next view is already ready.
-   Local controls, popovers, and settings sections keep their own feedback. */

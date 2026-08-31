@@ -1,2 +1,0 @@
-state_dir = {{STATE_DIR_TOML}}
-workspace_dir = {{LEGACY_WORKSPACE_TOML}}

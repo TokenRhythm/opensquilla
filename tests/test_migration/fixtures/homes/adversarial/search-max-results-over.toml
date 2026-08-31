@@ -1,6 +1,0 @@
-# Clamp fixture: legacy out-of-range search_max_results must coerce, not fail.
-search_max_results = 50
-
-[llm]
-provider = "openrouter"
-model = "dummy/model"

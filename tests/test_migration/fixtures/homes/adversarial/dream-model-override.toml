@@ -1,9 +1,0 @@
-# Gap fixture: memory.dream.model_override was a legal field through 0.2.x,
-# removed in 0.3.0 with extra='forbid' and (until this fix) no migration strip.
-[llm]
-provider = "openrouter"
-model = "dummy/model"
-
-[memory.dream]
-enabled = false
-model_override = "dummy-legacy-dream-model"

@@ -1,9 +1,0 @@
-{
-  "name": "cjs-to-esm-fixture",
-  "version": "0.1.0",
-  "main": "src/index.cjs",
-  "scripts": {
-    "test": "node test/consumer.cjs"
-  },
-  "dependencies": {}
-}
