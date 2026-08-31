@@ -372,7 +372,7 @@ def _canonicalize_reattach_aliases(
 
     is_result = result
     normalized = dict(values)
-    aliases = (
+    aliases: tuple[tuple[str, ...], ...] = (
         ("sessionKey", "session_key", "key"),
         ("sessionId", "session_id"),
         ("epoch", "sessionEpoch", "session_epoch"),
