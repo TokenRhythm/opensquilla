@@ -24,6 +24,7 @@
 import { computed, inject } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useSetupStatus } from '@/composables/setup/useSetupStatus'
+import { optionalSessionRpcAllowed } from '@/composables/chat/sessionBootstrapAdmission'
 import { SETUP_WORKFLOW_KEY } from '@/modules/setupWorkflow'
 
 const { t } = useI18n()
@@ -67,7 +68,9 @@ const FALLBACK_CHIPS = computed(() => [
 
 const setupWorkflow = inject(SETUP_WORKFLOW_KEY)
 if (!setupWorkflow) throw new Error('SetupWorkflow was not provided')
-const capabilityStatus = useSetupStatus<CapabilityStatus>(setupWorkflow)
+const capabilityStatus = useSetupStatus<CapabilityStatus>(setupWorkflow, {
+  allowed: optionalSessionRpcAllowed,
+})
 
 const greeting = computed(() => {
   const hour = new Date().getHours()

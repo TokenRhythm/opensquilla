@@ -2522,7 +2522,9 @@ const {
 // (including env-var keys the browser can't see), so audioConfigured is a true
 // "voice will work" signal — this keeps the button from being clicked into a
 // guaranteed failure. It's the same snapshot the empty-state chips read.
-const voiceCapability = useSetupStatus<{ audioConfigured?: boolean }>(injectedSetupWorkflow)
+const voiceCapability = useSetupStatus<{ audioConfigured?: boolean }>(injectedSetupWorkflow, {
+  allowed: optionalSessionRpcAllowed,
+})
 const voiceReady = computed(() => voiceCapability.data.value?.audioConfigured === true)
 
 const chatMessageActions = useChatMessageActions({

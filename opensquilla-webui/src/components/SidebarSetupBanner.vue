@@ -18,7 +18,9 @@ const { t } = useI18n()
 const router = useRouter()
 const setupWorkflow = inject(SETUP_WORKFLOW_KEY)
 if (!setupWorkflow) throw new Error('SetupWorkflow was not provided')
-const { data: status, loading, execute } = useSetupStatus<ReadinessStatus>(setupWorkflow)
+const { data: status, loading, execute } = useSetupStatus<ReadinessStatus>(setupWorkflow, {
+  allowed: optionalSessionRpcAllowed,
+})
 const { needsAction, actionCount } = useReadinessSummary(status)
 
 // This banner outlives the Settings dialog (it is mounted once in App.vue), so
