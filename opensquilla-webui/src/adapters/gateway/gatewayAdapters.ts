@@ -22,6 +22,12 @@ import type { PlanCenter } from '@/modules/planCenter'
 import { createV4PlanCenter } from './planCenterV4'
 import type { MetaRunCenter } from '@/modules/metaRunCenter'
 import { createV4MetaRunCenter } from './metaRunCenterV4'
+import type { AppSettings } from '@/modules/appSettings'
+import { createV4AppSettings } from './appSettingsV4'
+import type { ProviderConfiguration } from '@/modules/providerConfiguration'
+import { createV4ProviderConfiguration } from './providerConfigurationV4'
+import type { SetupWorkflow } from '@/modules/setupWorkflow'
+import { createV4SetupWorkflow } from './setupWorkflowV4'
 
 type RpcStoreTransportSource = Parameters<typeof createPrivateGatewayTransports>[0]
 
@@ -37,6 +43,9 @@ export interface GatewayAdapters {
   readonly goalContinuity: GoalContinuity
   readonly planCenter: PlanCenter
   readonly metaRunCenter: MetaRunCenter
+  readonly appSettings: AppSettings
+  readonly providerConfiguration: ProviderConfiguration
+  readonly setupWorkflow: SetupWorkflow
 }
 
 interface GatewayHttpSource {
@@ -74,6 +83,9 @@ export function createGatewayAdapters(
     goalContinuity: createV4GoalContinuity(transports.rpc, transports.events),
     planCenter: createV4PlanCenter(transports.rpc, transports.events),
     metaRunCenter: createV4MetaRunCenter(transports.rpc, transports.events),
+    appSettings: createV4AppSettings(transports.rpc),
+    providerConfiguration: createV4ProviderConfiguration(transports.rpc, transports.events),
+    setupWorkflow: createV4SetupWorkflow(transports.rpc),
   }
   return adapters
 }

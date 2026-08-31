@@ -36,6 +36,9 @@ describe('Gateway Adapter composition', () => {
       'goalContinuity',
       'planCenter',
       'metaRunCenter',
+      'appSettings',
+      'providerConfiguration',
+      'setupWorkflow',
     ])
     expect(adapters).not.toHaveProperty('rpc')
     expect(adapters).not.toHaveProperty('events')
