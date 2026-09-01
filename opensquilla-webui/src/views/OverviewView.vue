@@ -190,13 +190,13 @@
 import { ref, computed, inject, onMounted, onUnmounted, onActivated, onDeactivated } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
-import { useRpcStore } from '@/stores/rpc'
 import { useRequest } from '@/composables/useRequest'
 import { requestUsageSnapshot } from '@/composables/usage/useUsageQuery'
 import { effectiveCnyPerUsd } from '@/composables/usage/nativeBilling'
 import { SESSION_DIRECTORY_KEY } from '@/modules/sessionDirectory'
 import { PROVIDER_CONFIGURATION_KEY, type ProviderStatusRow } from '@/modules/providerConfiguration'
 import { OBSERVABILITY_KEY } from '@/modules/observability'
+import { CHANNEL_ADMINISTRATION_KEY } from '@/modules/channelAdministration'
 import type { UsageSnapshot } from '@/types/usage'
 import { useToasts } from '@/composables/useToasts'
 import { isOwnedGatewayConnection } from '@/composables/useCliInvocation'
@@ -273,7 +273,6 @@ interface UsageData {
 
 const { t } = useI18n()
 const router = useRouter()
-const rpc = useRpcStore()
 const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
 if (!injectedSessionDirectory) throw new Error('SessionDirectory was not provided')
 const sessionDirectory = injectedSessionDirectory
@@ -283,6 +282,9 @@ const providerConfiguration = injectedProviderConfiguration
 const injectedObservability = inject(OBSERVABILITY_KEY)
 if (!injectedObservability) throw new Error('Observability was not provided')
 const observability = injectedObservability
+const injectedChannelAdministration = inject(CHANNEL_ADMINISTRATION_KEY)
+if (!injectedChannelAdministration) throw new Error('ChannelAdministration was not provided')
+const channelAdministration = injectedChannelAdministration
 const { pushToast } = useToasts()
 const platform = usePlatform()
 
@@ -584,8 +586,7 @@ const channelChipHint = computed(() => {
 
 async function loadChannelStats() {
   try {
-    const res = await rpc.call<{ channels?: Array<{ status?: string; configured?: boolean; pendingPairings?: number }> }>('channels.status')
-    const rows = (res.channels || []).filter(ch => ch && ch.configured !== false)
+    const rows = (await channelAdministration.status()).filter(ch => ch && ch.configured !== false)
     channelStats.value = {
       total: rows.length,
       connected: rows.filter(ch => ch.status === 'connected').length,

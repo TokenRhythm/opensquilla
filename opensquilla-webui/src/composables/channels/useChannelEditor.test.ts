@@ -6,17 +6,42 @@ import {
   useChannelEditor,
 } from './useChannelEditor'
 import type { SetupCatalogPort } from '@/modules/setupWorkflow'
+import type { ChannelAdministration } from '@/modules/channelAdministration'
+import type { ChannelSetup } from '@/modules/channelSetup'
 
-// Module-level rpc mock: every editor instance in this file talks to this fake.
 const rpcCall = vi.fn()
-vi.mock('@/stores/rpc', () => ({
-  useRpcStore: () => ({ call: rpcCall, waitForConnection: async () => {} }),
-}))
 
 const setupCatalog = {
   catalog: () => rpcCall('onboarding.catalog'),
   discoverImageGenerationModels: () => Promise.resolve({ ok: false }),
 } satisfies SetupCatalogPort
+
+const channelAdministration = {
+  ready: async () => undefined,
+  get: (name: string) => rpcCall('channels.get', { name }),
+} as ChannelAdministration
+
+const channelSetup = {
+  probeDraft: (entry: Record<string, unknown>) => rpcCall('onboarding.channel.probe', { entry }),
+  upsert: async (entry: Record<string, unknown>) => {
+    const result = await rpcCall('onboarding.channel.upsert', { entry }) as {
+      changed?: boolean
+      restartRequired?: boolean
+      liveApply?: Record<string, string> | null
+    }
+    const name = String(entry.name || '')
+    return {
+      name,
+      changed: result.changed !== false,
+      restartRequired: result.restartRequired !== false,
+      liveApplyFailed: result.liveApply?.[name] === 'failed',
+    }
+  },
+} as ChannelSetup
+
+function createEditor() {
+  return useChannelEditor(setupCatalog, channelAdministration, channelSetup)
+}
 
 const SLACK_SPEC = {
   type: 'slack',
@@ -69,7 +94,7 @@ beforeEach(() => {
 
 describe('useChannelEditor', () => {
   it('open() hydrates from channels.get + catalog and starts clean', async () => {
-    const editor = useChannelEditor(setupCatalog)
+    const editor = createEditor()
     await editor.open('team-slack')
     expect(editor.phase.value).toBe('active')
     expect(editor.canEdit.value).toBe(true)
@@ -82,11 +107,11 @@ describe('useChannelEditor', () => {
   })
 
   it('caches the catalog at module scope and refetches only on refresh', async () => {
-    const first = useChannelEditor(setupCatalog)
+    const first = createEditor()
     await first.open('team-slack')
     expect(catalogCalls()).toBe(1)
 
-    const second = useChannelEditor(setupCatalog)
+    const second = createEditor()
     await second.open('team-slack')
     expect(catalogCalls()).toBe(1)
 
@@ -104,7 +129,7 @@ describe('useChannelEditor', () => {
   })
 
   it('tracks edited fields against the loaded baseline, in spec order', async () => {
-    const editor = useChannelEditor(setupCatalog)
+    const editor = createEditor()
     await editor.open('team-slack')
     editor.updateField('slack_channel_id', 'C42')
     editor.updateField('connection_mode', 'socket')
@@ -115,7 +140,7 @@ describe('useChannelEditor', () => {
   })
 
   it('testDraft probes the current draft without any redaction sentinel', async () => {
-    const editor = useChannelEditor(setupCatalog)
+    const editor = createEditor()
     await editor.open('team-slack')
     editor.updateField('slack_channel_id', 'C42')
     const ok = await editor.testDraft()
@@ -130,7 +155,7 @@ describe('useChannelEditor', () => {
   })
 
   it('save() probes then upserts and resets the baseline from the reseed', async () => {
-    const editor = useChannelEditor(setupCatalog)
+    const editor = createEditor()
     await editor.open('team-slack')
     editor.updateField('slack_channel_id', 'C42')
     expect(editor.form.isDirty.value).toBe(true)
@@ -154,7 +179,7 @@ describe('useChannelEditor', () => {
         throw new Error('invalid channel entry: token: Field required')
       },
     })
-    const editor = useChannelEditor(setupCatalog)
+    const editor = createEditor()
     await editor.open('team-slack')
     editor.updateField('slack_channel_id', 'C42')
 
@@ -171,7 +196,7 @@ describe('useChannelEditor', () => {
   })
 
   it('secret replace → cancel round-trip keeps the payload sentinel-free', async () => {
-    const editor = useChannelEditor(setupCatalog)
+    const editor = createEditor()
     await editor.open('team-slack')
 
     editor.replaceSecret('token')
@@ -192,7 +217,7 @@ describe('useChannelEditor', () => {
   })
 
   it('startCompose seeds an empty draft from spec defaults and saves without reseeding', async () => {
-    const editor = useChannelEditor(setupCatalog)
+    const editor = createEditor()
     await editor.startCompose('slack')
     expect(editor.phase.value).toBe('active')
     expect(editor.canEdit.value).toBe(true)
@@ -217,7 +242,7 @@ describe('useChannelEditor', () => {
   })
 
   it('startCompose seeds a unique suggested name that does not read dirty', async () => {
-    const editor = useChannelEditor(setupCatalog)
+    const editor = createEditor()
     await editor.startCompose('slack', { existingNames: ['feishu', 'ops-bot'] })
     const nameRow = editor.panel.value.channelFields.find(row => row.field.name === 'name')
     expect(nameRow?.value).toBe('slack')
@@ -227,7 +252,7 @@ describe('useChannelEditor', () => {
   })
 
   it('startCompose increments the suggestion past existing names of ANY type', async () => {
-    const editor = useChannelEditor(setupCatalog)
+    const editor = createEditor()
     // A non-slack channel literally named "slack" still collides — the name
     // is the global identity key and upsert would overwrite it.
     await editor.startCompose('slack', { existingNames: ['Slack', 'slack-2', 'feishu'] })
@@ -236,7 +261,7 @@ describe('useChannelEditor', () => {
   })
 
   it('startCompose leaves the name blank when the caller has no name list yet', async () => {
-    const editor = useChannelEditor(setupCatalog)
+    const editor = createEditor()
     await editor.startCompose('slack')
     const nameRow = editor.panel.value.channelFields.find(row => row.field.name === 'name')
     expect(nameRow?.value).toBe('')
@@ -248,7 +273,7 @@ describe('useChannelEditor', () => {
         throw new Error('catalog down')
       },
     })
-    const editor = useChannelEditor(setupCatalog)
+    const editor = createEditor()
     await editor.loadCatalog()
     expect(editor.catalogError.value).toContain('catalog down')
     expect(editor.catalog.value).toEqual([])
@@ -266,7 +291,7 @@ describe('useChannelEditor', () => {
         secretFields: [],
       }),
     })
-    const editor = useChannelEditor(setupCatalog)
+    const editor = createEditor()
     await editor.open('mystery')
     expect(editor.phase.value).toBe('active')
     expect(editor.canEdit.value).toBe(false)
@@ -282,7 +307,7 @@ describe('useChannelEditor', () => {
         throw new Error('boom')
       },
     })
-    const editor = useChannelEditor(setupCatalog)
+    const editor = createEditor()
     await editor.open('team-slack')
     expect(editor.phase.value).toBe('error')
     expect(editor.loadError.value).toContain('boom')
