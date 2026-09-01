@@ -190,7 +190,6 @@
 import { ref, computed, inject, onMounted, onUnmounted, onActivated, onDeactivated } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
-import { useRequest } from '@/composables/useRequest'
 import { requestUsageSnapshot } from '@/composables/usage/useUsageQuery'
 import { effectiveCnyPerUsd } from '@/composables/usage/nativeBilling'
 import { SESSION_DIRECTORY_KEY } from '@/modules/sessionDirectory'
@@ -293,12 +292,16 @@ const platform = usePlatform()
 // ---------------------------------------------------------------------------
 
 const HIDDEN_EVIDENCE_KEYS = new Set(['restart_required', 'restartRequired'])
-// Per-panel useRequest instances
-const { data: statusData, refresh: refreshStatus } = useRequest<StatusData>(
-  'status',
-  undefined,
-  { errorLabel: 'Failed to load status', immediate: false },
-)
+const statusData = ref<StatusData | null>(null)
+async function refreshStatus(): Promise<StatusData | null> {
+  try {
+    const result = await observability.gatewayStatus() as StatusData
+    statusData.value = result
+    return result
+  } catch {
+    return null
+  }
+}
 const usageData = ref<UsageData | null>(null)
 const usageSnapshot = ref<UsageSnapshot | null>(null)
 

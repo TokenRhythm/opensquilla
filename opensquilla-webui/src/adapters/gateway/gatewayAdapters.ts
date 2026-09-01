@@ -50,6 +50,10 @@ import type { ChannelSetup } from '@/modules/channelSetup'
 import { createV4ChannelSetup } from './channelSetupV4'
 import type { ArtifactWorkbench } from '@/modules/artifactWorkbench'
 import { createV4ArtifactWorkbench } from './artifactWorkbenchV4'
+import type { MemoryProfileImport } from '@/modules/memoryProfileImport'
+import { createV4MemoryProfileImport } from './memoryProfileImportV4'
+import type { AudioTranscription } from '@/modules/audioTranscription'
+import { createV4AudioTranscription } from './audioTranscriptionV4'
 
 type RpcStoreTransportSource = Parameters<typeof createPrivateGatewayTransports>[0]
 
@@ -79,6 +83,8 @@ export interface GatewayAdapters {
   readonly channelAdministration: ChannelAdministration
   readonly channelSetup: ChannelSetup
   readonly artifactWorkbench: ArtifactWorkbench
+  readonly memoryProfileImport: MemoryProfileImport
+  readonly audioTranscription: AudioTranscription
 }
 
 export interface GatewayAdapterOptions {
@@ -135,6 +141,8 @@ export function createGatewayAdapters(
     channelAdministration: createV4ChannelAdministration(transports.rpc, transports.events),
     channelSetup: createV4ChannelSetup(transports.rpc),
     artifactWorkbench: createV4ArtifactWorkbench(transports.rpc, transports.events, http),
+    memoryProfileImport: createV4MemoryProfileImport(transports.rpc),
+    audioTranscription: createV4AudioTranscription(http),
   }
   return adapters
 }

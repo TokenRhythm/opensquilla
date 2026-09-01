@@ -136,12 +136,6 @@ async function createSandboxSettings(options: {
     }
     throw new Error(`unexpected method: ${method} ${JSON.stringify(params)}`)
   })
-  vi.doMock('@/stores/rpc', () => ({
-    useRpcStore: () => ({
-      waitForConnection: vi.fn(async () => {}),
-      call,
-    }),
-  }))
   vi.doMock('@/platform', () => ({
     usePlatform: () => ({
       capabilities: { isDesktop: options.desktop === true },
@@ -152,10 +146,19 @@ async function createSandboxSettings(options: {
     useToasts: () => ({ pushToast }),
   }))
 
-  const { effectScope } = await import('vue')
+  const { createApp, effectScope, h } = await import('vue')
+  const { SANDBOX_RUNTIME_KEY } = await import('@/modules/sandboxRuntime')
+  const { createV4SandboxRuntime } = await import('@/adapters/gateway/sandboxRuntimeV4')
   const { useSandboxSettings } = await import('./useSandboxSettings')
+  const app = createApp({ render: () => h('div') })
+  app.provide(SANDBOX_RUNTIME_KEY, createV4SandboxRuntime({
+    request: async (method, params) => params === undefined
+      ? await call(method)
+      : await call(method, params),
+    ready: vi.fn(async () => undefined),
+  }))
   const scope: EffectScope = effectScope()
-  const settings = scope.run(() => useSandboxSettings())!
+  const settings = app.runWithContext(() => scope.run(() => useSandboxSettings()))!
   return { call, pushToast, scope, settings }
 }
 
@@ -164,7 +167,6 @@ function capabilityCalls(call: ReturnType<typeof vi.fn>) {
 }
 
 afterEach(() => {
-  vi.doUnmock('@/stores/rpc')
   vi.doUnmock('@/platform')
   vi.doUnmock('@/composables/useToasts')
   vi.restoreAllMocks()
@@ -406,7 +408,7 @@ describe('useSandboxSettings capability checks', () => {
     await settings.loadCapability(true)
 
     expect(capabilityCalls(call)).toEqual([
-      ['sandbox.capability.status', undefined],
+      ['sandbox.capability.status'],
       ['sandbox.capability.status', { refresh: true }],
     ])
     await vi.advanceTimersByTimeAsync(60_000)

@@ -1,8 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { App } from 'vue'
-import { SANDBOX_RUNTIME_KEY } from '@/modules/sandboxRuntime'
-import { createV4SandboxRuntime } from '@/adapters/gateway/sandboxRuntimeV4'
 import type { SandboxRuntimePackStatus } from '@/types/sandbox'
 
 const mounted: App[] = []
@@ -230,6 +228,8 @@ async function mountPanel(options: {
   const { createApp } = await import('vue')
   const { createPinia } = await import('pinia')
   const i18n = (await import('@/i18n')).default
+  const { SANDBOX_RUNTIME_KEY } = await import('@/modules/sandboxRuntime')
+  const { createV4SandboxRuntime } = await import('@/adapters/gateway/sandboxRuntimeV4')
   i18n.global.locale.value = 'en'
   const Component = (await import('./SandboxSettingsPanel.vue')).default
   const el = document.createElement('div')

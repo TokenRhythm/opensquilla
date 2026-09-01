@@ -1,10 +1,9 @@
-import { computed, hasInjectionContext, inject, onScopeDispose, reactive, ref } from 'vue'
+import { computed, inject, onScopeDispose, reactive, ref } from 'vue'
 
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
 import type { RpcClientError } from '@/lib/rpc'
 import { usePlatform } from '@/platform'
-import { useRpcStore } from '@/stores/rpc'
 import {
   ensureSandboxReady,
   normalizeSandboxSetupStatus,
@@ -25,8 +24,7 @@ import type {
   SandboxRuntimeSource,
   SandboxSetupStatusPayload,
 } from '@/types/sandbox'
-import { SANDBOX_RUNTIME_KEY, type SandboxRuntime } from '@/modules/sandboxRuntime'
-import { createV4SandboxRuntime } from '@/adapters/gateway/sandboxRuntimeV4'
+import { SANDBOX_RUNTIME_KEY } from '@/modules/sandboxRuntime'
 
 export type SandboxPolicySection = 'files' | 'commands' | 'network' | 'runtimes'
 export type { SandboxSetupOutcome } from '@/composables/sandboxSetupCoordinator'
@@ -206,17 +204,9 @@ function currentPolicyFromConflict(error: unknown): SandboxPolicy | null {
 }
 
 export function useSandboxSettings() {
-  const rpc = useRpcStore()
-  const sandbox: SandboxRuntime = (hasInjectionContext() ? inject(SANDBOX_RUNTIME_KEY, null) : null)
-    ?? createV4SandboxRuntime({
-      request: (method, params) => rpc.call(
-        method,
-        ...(params === undefined && method !== 'sandbox.capability.status'
-          ? []
-          : [params]),
-      ),
-      ready: () => rpc.waitForConnection(),
-    })
+  const injectedSandbox = inject(SANDBOX_RUNTIME_KEY)
+  if (!injectedSandbox) throw new Error('SandboxRuntime was not provided')
+  const sandbox = injectedSandbox
   const platform = usePlatform()
   const { pushToast } = useToasts()
   const loading = ref(false)

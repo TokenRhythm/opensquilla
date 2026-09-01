@@ -50,6 +50,8 @@ describe('Gateway Adapter composition', () => {
       'channelAdministration',
       'channelSetup',
       'artifactWorkbench',
+      'memoryProfileImport',
+      'audioTranscription',
     ])
     expect(adapters).not.toHaveProperty('rpc')
     expect(adapters).not.toHaveProperty('events')

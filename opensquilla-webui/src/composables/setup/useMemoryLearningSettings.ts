@@ -1,6 +1,6 @@
 import { computed, ref } from 'vue'
-import { useRpcStore } from '@/stores/rpc'
 import type { AppSettings } from '@/modules/appSettings'
+import type { Observability, SelfLearningStatus } from '@/modules/observability'
 
 /** Config slice + status consumed by the Settings › Advanced
  *  "memory & self-learning" group. Dream and self-learning are separate
@@ -20,33 +20,12 @@ interface PatchResponse {
   linkedLive?: boolean
 }
 
-export interface SelfLearningStatus {
-  enabled?: boolean
-  captureEnabled?: boolean
-  trainingReachable?: boolean
-  dream?: { enabled?: boolean; autoSchedule?: boolean; killSwitchActive?: boolean }
-  activeModel?: { kind?: string; version?: string | null; promotedAt?: string | null }
-  samples?: {
-    total?: number
-    highValue?: number
-    requiredHighValue?: number
-    complaintRate?: number
-    lastCapturedAt?: string | null
-    feedback?: { up?: number; down?: number; downSingle?: number }
-  } | null
-  gate?: {
-    wouldTrain?: boolean
-    reason?: string
-    lastAttemptAt?: string | null
-    lastTrainedAt?: string | null
-    killSwitchActive?: boolean
-  } | null
-  lastReceipt?: { kind?: string; version?: string | null; reason?: string | null } | null
-  error?: string
-}
+export type { SelfLearningStatus } from '@/modules/observability'
 
-export function useMemoryLearningSettings(appSettings: AppSettings) {
-  const rpc = useRpcStore()
+export function useMemoryLearningSettings(
+  appSettings: AppSettings,
+  observability: Pick<Observability, 'selfLearningStatus'>,
+) {
 
   const loaded = ref(false)
   const dreamEnabled = ref(false)
@@ -82,7 +61,7 @@ export function useMemoryLearningSettings(appSettings: AppSettings) {
     if (statusLoading.value) return
     statusLoading.value = true
     try {
-      status.value = await rpc.call<SelfLearningStatus>('router.selflearning.status')
+      status.value = await observability.selfLearningStatus()
     } catch {
       status.value = null
     } finally {

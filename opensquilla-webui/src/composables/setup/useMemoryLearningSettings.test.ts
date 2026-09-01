@@ -21,6 +21,10 @@ const appSettings = {
   merge: () => Promise.resolve({}),
 } satisfies AppSettings
 
+const observability = {
+  selfLearningStatus: () => rpcCall('router.selflearning.status'),
+}
+
 describe('useMemoryLearningSettings', () => {
   beforeEach(() => {
     rpcCall.mockReset()
@@ -36,7 +40,7 @@ describe('useMemoryLearningSettings', () => {
       }
       return {}
     })
-    const ml = useMemoryLearningSettings(appSettings)
+    const ml = useMemoryLearningSettings(appSettings, observability)
     await ml.load()
 
     expect(ml.dreamEnabled.value).toBe(true)
@@ -55,7 +59,7 @@ describe('useMemoryLearningSettings', () => {
       if (method === 'router.selflearning.status') return { enabled: true }
       return {}
     })
-    const ml = useMemoryLearningSettings(appSettings)
+    const ml = useMemoryLearningSettings(appSettings, observability)
 
     const ok = await ml.setSelfLearning(true)
 
@@ -78,7 +82,7 @@ describe('useMemoryLearningSettings', () => {
       if (method === 'router.selflearning.status') return { enabled: true }
       return {}
     })
-    const ml = useMemoryLearningSettings(appSettings)
+    const ml = useMemoryLearningSettings(appSettings, observability)
 
     await ml.setSelfLearning(true)
 
@@ -96,7 +100,7 @@ describe('useMemoryLearningSettings', () => {
       if (method === 'router.selflearning.status') return { enabled: true }
       return {}
     })
-    const ml = useMemoryLearningSettings(appSettings)
+    const ml = useMemoryLearningSettings(appSettings, observability)
     await ml.load()
 
     await ml.setDream(false)
@@ -113,7 +117,7 @@ describe('useMemoryLearningSettings', () => {
       if (method === 'config.patch.safe') throw new Error('denied')
       return {}
     })
-    const ml = useMemoryLearningSettings(appSettings)
+    const ml = useMemoryLearningSettings(appSettings, observability)
 
     const ok = await ml.setSelfLearning(true)
 

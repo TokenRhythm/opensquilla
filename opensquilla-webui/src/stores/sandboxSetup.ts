@@ -7,7 +7,6 @@ import {
   ensureSandboxReady,
   type SandboxSetupOutcome,
 } from '@/composables/sandboxSetupCoordinator'
-import { useRpcStore } from '@/stores/rpc'
 import type {
   SandboxRunMode,
   SandboxSetupStatusPayload,
@@ -15,8 +14,9 @@ import type {
 import { SANDBOX_RUNTIME_KEY } from '@/modules/sandboxRuntime'
 
 export const useSandboxSetupStore = defineStore('sandboxSetup', () => {
-  const rpc = useRpcStore()
-  const sandbox = inject(SANDBOX_RUNTIME_KEY, null)
+  const injectedSandbox = inject(SANDBOX_RUNTIME_KEY)
+  if (!injectedSandbox) throw new Error('SandboxRuntime was not provided')
+  const sandbox = injectedSandbox
   const { pushToast } = useToasts()
   const ensuring = ref(false)
   const outcome = ref<SandboxSetupOutcome>('idle')
@@ -35,9 +35,11 @@ export const useSandboxSetupStore = defineStore('sandboxSetup', () => {
   async function runSetup(): Promise<boolean> {
     try {
       const result = await ensureSandboxReady(
-        sandbox ?? ((method, params) => rpc.call(method, params)),
-        null,
-        () => rpc.waitForConnection(10_000),
+        {
+          ensureSetup: () => sandbox.ensureSetup(),
+          setupStatus: () => sandbox.setupStatus(),
+          capability: () => sandbox.capability({ refresh: true }),
+        },
       )
       status.value = result.status
       outcome.value = result.outcome
@@ -48,8 +50,7 @@ export const useSandboxSetupStore = defineStore('sandboxSetup', () => {
         return false
       }
       if (intendedMode.value === 'safe') {
-        if (sandbox) await sandbox.setRunMode('safe')
-        else await rpc.call('sandbox.run_mode.preference.set', { runMode: 'safe' })
+        await sandbox.setRunMode('safe')
       }
       pushToast(String(i18n.global.t('settings.sandbox.setup.readyToast')), {
         tone: 'ok',

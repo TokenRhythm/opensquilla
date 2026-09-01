@@ -1,21 +1,22 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, shallowRef } from 'vue'
+import { computed, inject, nextTick, onMounted, onUnmounted, ref, shallowRef } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import { copyTextWithFallback } from '@/utils/browser'
-import { useRpcStore } from '@/stores/rpc'
+import {
+  MEMORY_PROFILE_IMPORT_KEY,
+  MemoryProfileImportError,
+  type MemoryImportAnalysisPhase as AnalysisPhase,
+  type MemoryImportInfo as ImportInfo,
+  type MemoryImportJob as ImportJob,
+  type MemoryImportPreview as ImportPreview,
+  type MemoryImportRecent as RecentImport,
+  type MemoryImportDiffFile as ImportDiffFile,
+  type MemoryImportTarget as ImportTarget,
+} from '@/modules/memoryProfileImport'
 
-const INFO_METHOD = 'memory.import.info'
-const START_METHOD = 'memory.import.start'
-const STATUS_METHOD = 'memory.import.status'
-const CANCEL_METHOD = 'memory.import.cancel'
-const RETRY_METHOD = 'memory.import.retry'
-const APPLY_METHOD = 'memory.import.apply'
-const UNDO_METHOD = 'memory.import.undo'
-const DISCARD_METHOD = 'memory.import.discard'
 const EXPORT_PROMPT_VERSION = 'profile-export-v1'
-const CLIENT_SCHEMA_VERSION = 1
 const CLIENT_INPUT_LIMIT_BYTES = 256 * 1024
 
 type PanelState =
@@ -29,83 +30,12 @@ type PanelState =
   | 'success'
   | 'stale-undo'
   | 'error'
-type AnalysisPhase = 'reading' | 'model' | 'diff'
-type ImportTarget = 'USER' | 'MEMORY' | 'IMPORT'
 type Operation = 'info' | 'copy' | 'preview' | 'apply' | 'undo'
-type JobStatus = 'queued' | 'analyzing' | 'cancelling' | 'cancelled'
-  | 'interrupted' | 'ready' | 'failed' | 'applied' | 'discarded'
-
-interface ImportInfo {
-  schemaVersion: number
-  available: boolean
-  provider: string
-  model: string
-  isLocal: boolean
-  maxInputBytes: number
-  promptVersion: string
-  recentImport: RecentImport | null
-  draftJob: ImportJob | null
-}
-
-interface RecentImport {
-  receiptId: string
-  batchId: string
-  appliedAt: string
-  summary: string[]
-  provider: string
-  model: string
-  status: string
-  indexStatus: string
-  fileCount: number
-  targets: ImportTarget[]
-}
-
-interface ImportDiffFile {
-  target: ImportTarget
-  displayName: string
-  relativePath: string
-  status: 'created' | 'modified' | 'deleted'
-  additions: number
-  deletions: number
-  diff: string
-}
-
-interface ImportPreview {
-  schemaVersion: number
-  previewId: string
-  batchId: string
-  candidateHash: string
-  provider: string
-  model: string
-  summary: string[]
-  decisionCounts: {
-    applied: number
-    duplicate: number
-    unresolved: number
-  }
-  files: ImportDiffFile[]
-}
-
-interface ImportJob {
-  schemaVersion: number
-  jobId: string
-  batchId: string
-  status: JobStatus
-  stage: AnalysisPhase
-  provider: string
-  model: string
-  startedAt: string
-  canRetry: boolean
-  errorCode: string
-  preview: ImportPreview | null
-}
-
-interface RpcError extends Error {
-  code?: string
-}
 
 const { t, tm, locale } = useI18n()
-const rpc = useRpcStore()
+const injectedMemoryImport = inject(MEMORY_PROFILE_IMPORT_KEY)
+if (!injectedMemoryImport) throw new Error('MemoryProfileImport was not provided')
+const memoryImport = injectedMemoryImport
 const state = ref<PanelState>('loading')
 const phase = ref<AnalysisPhase>('reading')
 const rawText = ref('')
@@ -214,142 +144,20 @@ const pausedMessage = computed(() => {
   return t(`settings.memoryImport.jobStates.${current?.status || 'failed'}.description`)
 })
 
-function objectValue(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' ? value as Record<string, unknown> : {}
-}
-
-function textValue(value: unknown): string {
-  return typeof value === 'string' ? value : ''
-}
-
-function numberValue(value: unknown): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : 0
-}
-
-function stringList(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : []
-}
-
-function normalizeRecent(value: unknown): RecentImport | null {
-  const data = objectValue(value)
-  const receiptId = textValue(data.receiptId)
-  if (!receiptId) return null
-  return {
-    receiptId,
-    batchId: textValue(data.batchId),
-    appliedAt: textValue(data.appliedAt),
-    summary: stringList(data.summary),
-    provider: textValue(data.provider),
-    model: textValue(data.model),
-    status: textValue(data.status) || 'applied',
-    indexStatus: textValue(data.indexStatus),
-    fileCount: numberValue(data.fileCount),
-    targets: Array.isArray(data.targets)
-      ? data.targets.map(normalizeTarget).filter((target): target is ImportTarget => target !== null)
-      : [],
-  }
-}
-
-function normalizeInfo(value: unknown): ImportInfo {
-  const data = objectValue(value)
-  return {
-    schemaVersion: numberValue(data.schemaVersion),
-    available: data.available === true,
-    provider: textValue(data.provider),
-    model: textValue(data.model),
-    isLocal: data.isLocal === true || data.isLoopback === true || data.isLocalEndpoint === true,
-    maxInputBytes: numberValue(data.maxInputBytes ?? data.maxRawBytes) || CLIENT_INPUT_LIMIT_BYTES,
-    promptVersion: textValue(data.promptVersion),
-    recentImport: normalizeRecent(data.recentImport),
-    draftJob: normalizeJob(data.draftJob),
-  }
-}
-
-function normalizeTarget(value: unknown): ImportTarget | null {
-  if (value === 'USER' || value === 'MEMORY' || value === 'IMPORT') return value
-  return null
-}
-
-function normalizePreview(value: unknown): ImportPreview | null {
-  const data = objectValue(value)
-  const counts = objectValue(data.decisionCounts)
-  const files: ImportDiffFile[] = []
-  if (Array.isArray(data.files)) {
-    for (const entry of data.files) {
-      const file = objectValue(entry)
-      const target = normalizeTarget(file.target ?? file.logicalTarget)
-      const diff = textValue(file.diff)
-      if (!target || !diff) continue
-      files.push({
-        target,
-        displayName: textValue(file.displayName),
-        relativePath: textValue(file.relativePath),
-        status: file.status === 'created' || file.status === 'deleted' ? file.status : 'modified',
-        additions: numberValue(file.additions),
-        deletions: numberValue(file.deletions),
-        diff,
-      })
-    }
-  }
-  const normalized: ImportPreview = {
-    schemaVersion: numberValue(data.schemaVersion),
-    previewId: textValue(data.previewId),
-    batchId: textValue(data.batchId),
-    candidateHash: textValue(data.candidateHash),
-    provider: textValue(data.provider),
-    model: textValue(data.model),
-    summary: stringList(data.summary),
-    decisionCounts: {
-      applied: numberValue(counts.applied),
-      duplicate: numberValue(counts.duplicate),
-      unresolved: numberValue(counts.unresolved),
-    },
-    files,
-  }
-  return normalized.previewId && normalized.candidateHash ? normalized : null
-}
-
-function normalizeJob(value: unknown): ImportJob | null {
-  const data = objectValue(value)
-  const jobId = textValue(data.jobId)
-  if (!jobId) return null
-  const status = textValue(data.status) as JobStatus
-  if (![
-    'queued',
-    'analyzing',
-    'cancelling',
-    'cancelled',
-    'interrupted',
-    'ready',
-    'failed',
-    'applied',
-    'discarded',
-  ].includes(status)) return null
-  const stageValue = textValue(data.stage)
-  return {
-    schemaVersion: numberValue(data.schemaVersion),
-    jobId,
-    batchId: textValue(data.batchId),
-    status,
-    stage: stageValue === 'model' || stageValue === 'diff' ? stageValue : 'reading',
-    provider: textValue(data.provider),
-    model: textValue(data.model),
-    startedAt: textValue(data.startedAt),
-    canRetry: data.canRetry === true,
-    errorCode: textValue(data.errorCode),
-    preview: normalizePreview(data.preview),
-  }
-}
-
 function rpcErrorCode(error: unknown): string {
-  return textValue((error as RpcError | undefined)?.code)
+  return error instanceof MemoryProfileImportError ? error.code : ''
 }
 
 function isMethodMissing(error: unknown): boolean {
-  return rpcErrorCode(error) === 'METHOD_NOT_FOUND'
-    || /method not found|unknown method|not registered/i.test(
-      error instanceof Error ? error.message : String(error),
-    )
+  return error instanceof MemoryProfileImportError && error.kind === 'unsupported'
+}
+
+function providerExpectation() {
+  return {
+    provider: info.value?.provider || '',
+    model: info.value?.model || '',
+    isLocal: info.value?.isLocal === true,
+  }
 }
 
 function createRequestId(): string {
@@ -428,19 +236,7 @@ async function loadInfo() {
   previewErrorVisible.value = false
   retryErrorVisible.value = false
   try {
-    await rpc.waitForConnection(8000)
-    if (!rpc.supportsMethod(INFO_METHOD)) {
-      state.value = 'unsupported'
-      return
-    }
-    const result = normalizeInfo(await rpc.call(INFO_METHOD, {
-      schemaVersion: CLIENT_SCHEMA_VERSION,
-      agentId: 'main',
-    }))
-    if (result.schemaVersion !== CLIENT_SCHEMA_VERSION) {
-      state.value = 'unsupported'
-      return
-    }
+    const result = await memoryImport.info()
     info.value = result
     recentImport.value = result.recentImport
     if (result.draftJob) {
@@ -450,7 +246,6 @@ async function loadInfo() {
     }
   } catch (error) {
     if (isMethodMissing(error)) {
-      rpc.markMethodUnavailable(INFO_METHOD)
       state.value = 'unsupported'
       return
     }
@@ -478,10 +273,6 @@ async function copyPrompt() {
 async function requestPreview() {
   submitAttempted.value = true
   if (inputError.value || !info.value?.available) return
-  if (!rpc.supportsMethod(START_METHOD) || !rpc.supportsMethod(STATUS_METHOD)) {
-    state.value = 'unsupported'
-    return
-  }
 
   const analyzingEntered = waitForNextStateEnter()
   phase.value = 'reading'
@@ -495,26 +286,16 @@ async function requestPreview() {
   await analyzingEntered
 
   try {
-    const result = normalizeJob(await rpc.call(START_METHOD, {
-      schemaVersion: CLIENT_SCHEMA_VERSION,
-      agentId: 'main',
+    const result = await memoryImport.start({
       rawText: rawText.value,
-      uiLocale: locale.value,
+      locale: locale.value,
       exportPromptVersion: EXPORT_PROMPT_VERSION,
-      expectedProvider: info.value.provider,
-      expectedModel: info.value.model,
-      expectedIsLocal: info.value.isLocal,
       clientRequestId: previewRequestId.value,
-    }))
-    if (!result || result.schemaVersion !== CLIENT_SCHEMA_VERSION) {
-      throw Object.assign(new Error('Invalid profile import job'), {
-        code: 'MEMORY_IMPORT_INVALID_OUTPUT',
-      })
-    }
+      expected: providerExpectation(),
+    })
     await handleJob(result)
   } catch (error) {
     if (isMethodMissing(error)) {
-      rpc.markMethodUnavailable(START_METHOD)
       state.value = 'unsupported'
       return
     }
@@ -552,12 +333,7 @@ async function pollJob() {
   const current = importJob.value
   if (!current || document.hidden) return
   try {
-    const result = normalizeJob(await rpc.call(STATUS_METHOD, {
-      schemaVersion: CLIENT_SCHEMA_VERSION,
-      agentId: 'main',
-      jobId: current.jobId,
-    }))
-    if (!result) throw new Error('Invalid profile import job status')
+    const result = await memoryImport.status(current.jobId)
     await handleJob(result)
   } catch (error) {
     errorCode.value = rpcErrorCode(error)
@@ -600,13 +376,8 @@ async function cancelImport() {
   if (!current || busy.value) return
   busy.value = true
   try {
-    const result = normalizeJob(await rpc.call(CANCEL_METHOD, {
-      schemaVersion: CLIENT_SCHEMA_VERSION,
-      agentId: 'main',
-      jobId: current.jobId,
-      clientRequestId: createRequestId(),
-    }))
-    if (result) await handleJob(result)
+    const result = await memoryImport.cancel(current.jobId, createRequestId())
+    await handleJob(result)
   } finally {
     busy.value = false
   }
@@ -618,20 +389,11 @@ async function retryImport() {
   busy.value = true
   retryErrorVisible.value = false
   try {
-    const result = normalizeJob(await rpc.call(RETRY_METHOD, {
-      schemaVersion: CLIENT_SCHEMA_VERSION,
-      agentId: 'main',
-      jobId: current.jobId,
-      clientRequestId: createRequestId(),
-      expectedProvider: info.value.provider,
-      expectedModel: info.value.model,
-      expectedIsLocal: info.value.isLocal,
-    }))
-    if (!result || result.schemaVersion !== CLIENT_SCHEMA_VERSION) {
-      throw Object.assign(new Error('Invalid profile import retry job'), {
-        code: 'MEMORY_IMPORT_INVALID_OUTPUT',
-      })
-    }
+    const result = await memoryImport.retry(
+      current.jobId,
+      createRequestId(),
+      providerExpectation(),
+    )
     await handleJob(result)
   } catch {
     retryErrorVisible.value = true
@@ -645,11 +407,7 @@ async function discardJob() {
   if (!current || busy.value) return
   busy.value = true
   try {
-    await rpc.call(DISCARD_METHOD, {
-      schemaVersion: CLIENT_SCHEMA_VERSION,
-      agentId: 'main',
-      jobId: current.jobId,
-    })
+    await memoryImport.discard({ jobId: current.jobId })
     clearJobTimers()
     importJob.value = null
     preview.value = null
@@ -663,16 +421,10 @@ async function discardJob() {
 
 async function discardPreview() {
   const previewId = preview.value?.previewId
-  if (!previewId || !rpc.supportsMethod(DISCARD_METHOD)) return
+  if (!previewId) return
   try {
-    await rpc.call(DISCARD_METHOD, {
-      schemaVersion: CLIENT_SCHEMA_VERSION,
-      agentId: 'main',
-      previewId,
-    })
-  } catch (error) {
-    if (isMethodMissing(error)) rpc.markMethodUnavailable(DISCARD_METHOD)
-  }
+    await memoryImport.discard({ previewId })
+  } catch {}
 }
 
 async function backFromPreview() {
@@ -691,41 +443,17 @@ async function backFromPreview() {
 async function applyPreview() {
   const current = preview.value
   if (!current || busy.value) return
-  if (!rpc.supportsMethod(APPLY_METHOD)) {
-    state.value = 'unsupported'
-    return
-  }
   busy.value = true
   lastOperation.value = 'apply'
   errorCode.value = ''
   if (!applyIdempotencyKey.value) applyIdempotencyKey.value = createRequestId()
   const isNoChangeImport = previewMode.value === 'import' && current.files.length === 0
   try {
-    const data = objectValue(await rpc.call(APPLY_METHOD, {
-      schemaVersion: CLIENT_SCHEMA_VERSION,
-      agentId: 'main',
-      previewId: current.previewId,
-      candidateHash: current.candidateHash,
+    recentImport.value = await memoryImport.apply({
+      preview: current,
       idempotencyKey: applyIdempotencyKey.value,
-    }))
-    if (Number(data.schemaVersion) !== CLIENT_SCHEMA_VERSION) {
-      throw Object.assign(new Error('Invalid profile import apply result'), {
-        code: 'MEMORY_IMPORT_INVALID_OUTPUT',
-      })
-    }
-    const returnedRecent = normalizeRecent(data.recentImport)
-    recentImport.value = returnedRecent || {
-      receiptId: textValue(data.receiptId),
-      batchId: textValue(data.batchId) || current.batchId,
-      appliedAt: textValue(data.appliedAt) || new Date().toISOString(),
-      summary: current.summary,
-      provider: current.provider,
-      model: current.model,
-      status: previewMode.value === 'undo' ? 'undone' : 'applied',
-      indexStatus: textValue(data.indexStatus),
-      fileCount: current.files.length,
-      targets: Array.from(new Set(current.files.map(file => file.target))),
-    }
+      kind: previewMode.value,
+    })
     successKind.value = previewMode.value
     state.value = isNoChangeImport ? 'no-change' : 'success'
     rawText.value = ''
@@ -761,57 +489,25 @@ async function applyPreview() {
 async function undoRecent() {
   const recent = recentImport.value
   if (!recent?.receiptId || busy.value) return
-  if (!rpc.supportsMethod(UNDO_METHOD)) {
-    state.value = 'unsupported'
-    return
-  }
   busy.value = true
   lastOperation.value = 'undo'
   errorCode.value = ''
   if (!undoRequestId.value) undoRequestId.value = createRequestId()
   try {
-    const data = objectValue(await rpc.call(UNDO_METHOD, {
-      schemaVersion: CLIENT_SCHEMA_VERSION,
-      agentId: 'main',
-      receiptId: recent.receiptId,
+    const result = await memoryImport.undo({
+      recent,
       clientRequestId: undoRequestId.value,
-      expectedProvider: info.value?.provider,
-      expectedModel: info.value?.model,
-      expectedIsLocal: info.value?.isLocal,
-    }))
-    if (Number(data.schemaVersion) !== CLIENT_SCHEMA_VERSION) {
-      throw Object.assign(new Error('Invalid profile import undo result'), {
-        code: 'MEMORY_IMPORT_INVALID_OUTPUT',
-      })
-    }
-    const status = textValue(data.status)
-    if (status === 'undone' || status === 'alreadyUndone') {
-      recentImport.value = {
-        ...recent,
-        status: 'undone',
-        indexStatus: textValue(data.indexStatus),
-      }
+      expected: providerExpectation(),
+    })
+    if (result.kind === 'completed') {
+      recentImport.value = result.recentImport
       successKind.value = 'undo'
       state.value = 'success'
       undoRequestId.value = ''
       return
     }
-    if (status === 'reviewRequired') {
-      const result = normalizePreview(data.preview)
-      if (!result) {
-        throw Object.assign(new Error('Invalid undo preview'), {
-          code: 'MEMORY_IMPORT_INVALID_OUTPUT',
-        })
-      }
-      if (
-        result.provider !== info.value?.provider
-        || result.model !== info.value?.model
-      ) {
-        throw Object.assign(new Error('Undo preview model changed'), {
-          code: 'MEMORY_IMPORT_INVALID_OUTPUT',
-        })
-      }
-      preview.value = result
+    if (result.kind === 'review-required') {
+      preview.value = result.preview
       previewMode.value = 'undo'
       applyIdempotencyKey.value = createRequestId()
       undoRequestId.value = ''
@@ -821,12 +517,8 @@ async function undoRecent() {
       focusPreviewHeadingAfterTransition()
       return
     }
-    throw Object.assign(new Error('Invalid undo result'), {
-      code: 'MEMORY_IMPORT_INVALID_OUTPUT',
-    })
   } catch (error) {
     if (isMethodMissing(error)) {
-      rpc.markMethodUnavailable(UNDO_METHOD)
       state.value = 'unsupported'
       return
     }

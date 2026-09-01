@@ -1,5 +1,5 @@
 import { computed, ref } from 'vue'
-import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
+import type { RpcCallOptions } from '@/lib/rpc'
 
 const activeHolds = ref(0)
 let primedRelease: (() => void) | null = null
@@ -42,32 +42,6 @@ export const runModeWriteRpcCallOptions: RpcCallOptions = {
   timeoutMs: 5_000,
   timeoutAction: 'reject',
   abortAction: 'reject',
-}
-
-type OptionalSessionRpcClient = {
-  waitForConnection: (
-    timeoutMs?: number,
-    signal?: AbortSignal,
-    actions?: RpcConnectionWaitOptions,
-  ) => Promise<unknown>
-}
-
-export function waitForSessionRpcConnection(
-  rpc: OptionalSessionRpcClient,
-  callOptions?: RpcCallOptions,
-): Promise<unknown> {
-  if (!callOptions) return rpc.waitForConnection()
-  return rpc.waitForConnection(
-    callOptions.timeoutMs,
-    callOptions.signal,
-    {
-      // The transport-owned challenge/Hello watchdogs decide when a handshake
-      // is unhealthy. Optional UI waiters timing out or being superseded must
-      // not preempt those generation-fenced watchdogs.
-      timeoutAction: 'reject',
-      abortAction: 'reject',
-    },
-  )
 }
 
 function createSessionBootstrapAdmission(): () => void {
