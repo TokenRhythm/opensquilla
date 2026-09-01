@@ -276,16 +276,26 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     const currentMessages = options.messages.value
     if (
       options.sessionKey.value !== restore.sessionKey
-      || toRaw(currentMessages) !== restore.editingMessages
-      || currentMessages.length !== restore.editingMessageOwners.length
-      || currentMessages.some(
-        (message, index) => toRaw(message) !== restore.editingMessageOwners[index],
-      )
       || options.pendingForkBeforeMessageId.value !== restore.forkBeforeMessageId
     ) {
       return false
     }
     editGeneration.value += 1
+    const stillOwnsTranscript = (
+      toRaw(currentMessages) === restore.editingMessages
+      && currentMessages.length === restore.editingMessageOwners.length
+      && currentMessages.every(
+        (message, index) => toRaw(message) === restore.editingMessageOwners[index],
+      )
+    )
+    if (!stillOwnsTranscript) {
+      // A same-session history refresh can replace the array while an edit-owned
+      // send is awaiting preflight. The authoritative transcript must win, but
+      // the abandoned edit must not leave either that send generation or its
+      // fork anchor live for the next ordinary draft.
+      options.pendingForkBeforeMessageId.value = null
+      return false
+    }
     options.pendingForkBeforeMessageId.value = restore.previousForkBeforeMessageId
     options.messages.value = restore.messages
     options.inputText.value = restore.inputText

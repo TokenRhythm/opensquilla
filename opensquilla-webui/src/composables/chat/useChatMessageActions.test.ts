@@ -234,8 +234,8 @@ describe('useChatMessageActions branching edits', () => {
     expect(options.inputText.value).toBe('session B draft')
   })
 
-  it('does not restore after another transcript owner replaces the edit state', () => {
-    const { api, options } = makeOptions([
+  it('retires the edit owner without restoring over a replacement transcript', () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
       { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
       { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
     ])
@@ -254,12 +254,14 @@ describe('useChatMessageActions branching edits', () => {
     options.inputText.value = 'new owner draft'
 
     expect(api.cancelEdit()).toBe(false)
+    expect(api.editGeneration.value).toBe(2)
+    expect(pendingForkBeforeMessageId.value).toBeNull()
     expect(options.messages.value.map(message => message.text)).toEqual(['new owner'])
     expect(options.inputText.value).toBe('new owner draft')
   })
 
-  it('does not restore after the edit transcript is replaced in place', () => {
-    const { api, options } = makeOptions([
+  it('retires the edit owner when transcript items are replaced in place', () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
       { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
       { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
       { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
@@ -279,6 +281,8 @@ describe('useChatMessageActions branching edits', () => {
     options.inputText.value = 'new owner draft'
 
     expect(api.cancelEdit()).toBe(false)
+    expect(api.editGeneration.value).toBe(2)
+    expect(pendingForkBeforeMessageId.value).toBeNull()
     expect(options.messages.value).toBe(currentOwner)
     expect(options.messages.value.map(message => message.text)).toEqual([
       'new same-session row', 'ack A',

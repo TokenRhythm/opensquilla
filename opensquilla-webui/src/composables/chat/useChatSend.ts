@@ -2442,6 +2442,12 @@ export function useChatSend(options: UseChatSendOptions) {
           await dispatchSteerV2(text, { composerSnapshot })
           return
         }
+        // A queued item has no fork anchor, so treating a message edit as an
+        // ordinary follow-up would silently change its meaning. It would also
+        // let async queue persistence outlive Escape and deliver after the
+        // transcript was restored. Keep the edit in the composer until the
+        // authoritative run settles, when it can use the normal fork send.
+        if (composerSnapshot.forkBeforeMessageId) return
         // Surface a full queue instead of silently dropping the send: the draft is
         // preserved (enqueue returns false before clearing the composer).
         const composerChanged = !composerMatchesSnapshot(composerSnapshot)
