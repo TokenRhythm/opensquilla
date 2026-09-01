@@ -38,7 +38,7 @@ export function normalizeSandboxSetupStatus(payload: unknown): SandboxSetupStatu
 export async function ensureSandboxReady(
   operations: SandboxSetupOperations,
   verifyCapability: (() => Promise<Pick<SandboxCapabilityReport, 'available'> | null>) | null = null,
-  waitForConnection: SandboxSetupConnectionWait | null = null,
+  ready: SandboxSetupConnectionWait | null = null,
 ): Promise<SandboxSetupResult> {
   const finish = async (status: SandboxSetupStatusPayload): Promise<SandboxSetupResult> => {
     if (status.state !== 'ready') {
@@ -63,12 +63,12 @@ export async function ensureSandboxReady(
     if (!status) return { ready: false, status: null, outcome: 'failed' }
     return await finish(status)
   } catch {
-    if (!waitForConnection) return { ready: false, status: null, outcome: 'failed' }
+    if (!ready) return { ready: false, status: null, outcome: 'failed' }
     try {
       // The elevated Windows helper can finish successfully after the browser's
       // original response socket has gone away. Reconnect and ask the Gateway
       // for authoritative state instead of making the user repeat UAC.
-      await waitForConnection()
+      await ready()
       const status = normalizeSandboxSetupStatus(
         await operations.setupStatus(),
       )

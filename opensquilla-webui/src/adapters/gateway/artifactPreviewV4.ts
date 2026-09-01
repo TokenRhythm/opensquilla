@@ -1,4 +1,12 @@
 import { onUnmounted, ref, shallowRef } from 'vue'
+import type { ArtifactPayload } from '@/types/artifacts'
+import {
+  artifactAccessHeaders,
+  artifactAccessUrl,
+  artifactThumbnailAccessUrl,
+  isSameOriginArtifactUrl,
+  runtimeArtifactBaseOrigin,
+} from './artifactAccessV4'
 
 /**
  * Shared preview loader for artifact thumbnails and full images.
@@ -22,12 +30,12 @@ export type ArtifactPreviewState = 'idle' | 'loading' | 'loaded' | 'timeout' | '
 export type ArtifactPreviewErrorCode = 'network' | 'too_large' | 'unsupported' | null
 
 export interface ArtifactPreviewOptions {
-  /** Loader resolving the URL to fetch (thumbnail for grids, full for lightbox). */
-  resolveUrl: () => string
-  /** Request headers (auth) for same-origin fetches. */
-  headers?: () => Record<string, string>
-  /** Whether the resolved URL is same-origin (drives credentials mode). */
-  sameOrigin?: (url: string) => boolean
+  /** Semantic artifact whose bytes the Gateway Adapter resolves and authenticates. */
+  artifact: () => ArtifactPayload
+  /** Session scope used by the authenticated artifact endpoint. */
+  sessionKey?: () => string | undefined
+  /** Prefer the backend-provided thumbnail when one exists. */
+  variant?: 'content' | 'thumbnail'
   /** Full-size previews participate in the bounded LRU; thumbnails do not. */
   fullSize?: boolean
   /** Per-attempt timeout in ms. */
@@ -97,12 +105,6 @@ function untrackFullUrl(token: string) {
   fullLru.delete(token)
 }
 
-function defaultSameOrigin(url: string): boolean {
-  try {
-    return new URL(url, window.location.origin).origin === window.location.origin
-  } catch { return false }
-}
-
 let tokenSeq = 0
 
 export interface ArtifactPreviewController {
@@ -138,7 +140,6 @@ export function createArtifactPreview(options: ArtifactPreviewOptions): Artifact
     ? options.maxBytes
     : Number.POSITIVE_INFINITY
   const fullSize = options.fullSize === true
-  const sameOriginFn = options.sameOrigin ?? defaultSameOrigin
   const lruToken = `preview-${(tokenSeq += 1)}`
 
   let attempt = 0
@@ -163,7 +164,11 @@ export function createArtifactPreview(options: ArtifactPreviewOptions): Artifact
   async function run() {
     if (disposed || inFlight) return
     if (state.value === 'loaded' && objectUrl.value) return
-    const url = options.resolveUrl()
+    const artifact = options.artifact()
+    const baseOrigin = runtimeArtifactBaseOrigin()
+    const url = options.variant === 'thumbnail'
+      ? artifactThumbnailAccessUrl(artifact, baseOrigin)
+      : artifactAccessUrl(artifact, baseOrigin)
     if (!url) {
       state.value = 'error'
       errorCode.value = 'network'
@@ -188,13 +193,16 @@ export function createArtifactPreview(options: ArtifactPreviewOptions): Artifact
     let timedOut = false
 
     try {
-      const isSame = sameOriginFn(url)
+      const isSame = isSameOriginArtifactUrl(url, baseOrigin)
       if (options.requireSameOrigin && !isSame) {
         throw new ArtifactPreviewLoadError('network', 'Cross-origin preview is not allowed')
       }
       const response = await fetch(url, {
         method: 'GET',
-        headers: isSame && options.headers ? options.headers() : {},
+        headers: artifactAccessHeaders(url, {
+          baseOrigin,
+          sessionKey: options.sessionKey?.(),
+        }),
         credentials: isSame ? 'same-origin' : 'omit',
         signal: controller.signal,
         redirect: 'error',

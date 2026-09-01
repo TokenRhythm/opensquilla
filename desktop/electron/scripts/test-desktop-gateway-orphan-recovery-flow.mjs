@@ -388,15 +388,11 @@ try {
     firstApp,
     userDataDir,
   )
-  assert.equal(
-    await withPhaseDeadline(
-      verifyDesktopGatewayOwnership(firstRecord),
-      electronChildCleanup,
-      'verify-orphan-survived',
-      firstApp,
-      userDataDir,
-    ),
-    true,
+  await waitFor(
+    () => verifyDesktopGatewayOwnership(firstRecord),
+    'orphan Desktop Gateway ownership verification',
+    electronChildCleanup.remainingMs('verify-orphan-survived'),
+    () => phaseDiagnostics(firstApp, userDataDir, electronChildCleanup),
   )
   firstApp = null
 

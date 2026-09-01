@@ -1,6 +1,9 @@
 import type { NativeWorkbenchApi, PlatformId } from '@/platform/types'
-import type { ArtifactPayload } from '@/types/rpc'
-import { artifactAccessHeaders } from '@/utils/chat/artifactAccess'
+import type { ArtifactPayload } from '@/types/artifacts'
+import {
+  artifactAccessHeaders,
+  runtimeArtifactAuthToken,
+} from './artifactAccessV4'
 
 export type ArtifactPreviewMode = 'full' | 'offline'
 export type ArtifactPreviewCollectionStatus = 'complete' | 'partial' | 'not_applicable'
@@ -94,6 +97,12 @@ function controlHeaders(
     ...artifactAccessHeaders(url, context),
     ...(includeJson ? { 'Content-Type': 'application/json' } : {}),
   }
+}
+
+function resolvedAuthToken(context: ArtifactPreviewLeaseContext): string {
+  return context.authToken === undefined
+    ? runtimeArtifactAuthToken()
+    : context.authToken
 }
 
 function previewLeaseUrl(
@@ -283,6 +292,7 @@ export async function createArtifactPreviewLease(
     }
     const broker = context.nativeBroker?.createArtifactPreviewLease
     if (!broker) throw desktopBrokerUnavailable()
+    const authToken = resolvedAuthToken(context)
     let result
     try {
       result = await broker({
@@ -290,7 +300,7 @@ export async function createArtifactPreviewLease(
         artifactId,
         mode,
         scopeId: context.sessionKey || '',
-        ...(context.authToken ? { authToken: context.authToken } : {}),
+        ...(authToken ? { authToken } : {}),
       })
     } catch {
       throw desktopBrokerUnavailable()
@@ -316,13 +326,14 @@ export async function renewArtifactPreviewLease(
   const broker = context.nativeBroker?.renewArtifactPreviewLease
   if (context.nativeBroker) {
     if (!broker) throw desktopBrokerUnavailable()
+    const authToken = resolvedAuthToken(context)
     let result
     try {
       result = await broker({
         version: 1,
         leaseId,
         scopeId: context.sessionKey || '',
-        ...(context.authToken ? { authToken: context.authToken } : {}),
+        ...(authToken ? { authToken } : {}),
       })
     } catch {
       throw desktopBrokerUnavailable()
@@ -347,13 +358,14 @@ export async function revokeArtifactPreviewLease(
   const broker = context.nativeBroker?.revokeArtifactPreviewLease
   if (context.nativeBroker) {
     if (!broker) throw desktopBrokerUnavailable()
+    const authToken = resolvedAuthToken(context)
     let result
     try {
       result = await broker({
         version: 1,
         leaseId,
         scopeId: context.sessionKey || '',
-        ...(context.authToken ? { authToken: context.authToken } : {}),
+        ...(authToken ? { authToken } : {}),
       })
     } catch {
       throw desktopBrokerUnavailable()

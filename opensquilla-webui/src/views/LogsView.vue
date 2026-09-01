@@ -221,7 +221,7 @@ import SupportDiagnosticsMenu from '@/components/SupportDiagnosticsMenu.vue'
 import { useRunTrace } from '@/composables/run/useRunTrace'
 import { nodeStepsFromHistoryMessage } from '@/components/run/runTrace'
 import type { NodeStep, RunTraceSummary } from '@/types/runTrace'
-import type { ChatHistoryMessage } from '@/types/rpc'
+import type { ChatHistoryMessage } from '@/types/chat'
 
 // ---------------------------------------------------------------------------
 // Types

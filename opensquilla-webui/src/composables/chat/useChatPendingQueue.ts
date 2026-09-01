@@ -5,7 +5,7 @@ import type {
   HiddenControlDispatchResult,
   PendingSteerPhase,
 } from '@/types/chat'
-import type { SessionSteerV2Params } from '@/types/rpc'
+import type { SessionSteerV2Params } from '@/types/chat'
 import { isControlInput } from '@/utils/chat/inputSemantics'
 import { createClientMessageId, createClientRequestId } from '@/utils/chat/messageIdentity'
 import {

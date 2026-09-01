@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import {
   artifactAccessHeaders,
   artifactAccessUrl,
@@ -10,7 +10,7 @@ import {
   isActiveDocumentArtifactCandidate,
   openArtifactBlobUrl,
   openArtifactViaGateway,
-} from './artifactAccess'
+} from '@/adapters/gateway/artifactAccessV4'
 
 function artifact(overrides: Partial<ArtifactPayload> = {}): ArtifactPayload {
   return {

@@ -16,6 +16,7 @@ import type {
 import type { ChatPart } from '@/types/parts'
 import AssistantMessage from './AssistantMessage.vue'
 import { ARTIFACT_WORKBENCH_KEY, type ArtifactWorkbench } from '@/modules/artifactWorkbench'
+import { GATEWAY_ACCESS_KEY, type GatewayAccess } from '@/modules/gatewayAccess'
 import { createV4ArtifactContentAccess } from '@/adapters/gateway/artifactAccessV4'
 
 const mountedApps: App[] = []
@@ -276,6 +277,9 @@ function mountMessage(
   mountedApps.push(app)
   app.use(i18n)
   app.use(createPinia())
+  app.provide(GATEWAY_ACCESS_KEY, {
+    isLocalOwner: false,
+  } as GatewayAccess)
   app.provide(ARTIFACT_WORKBENCH_KEY, {
     content: createV4ArtifactContentAccess(),
   } as ArtifactWorkbench)

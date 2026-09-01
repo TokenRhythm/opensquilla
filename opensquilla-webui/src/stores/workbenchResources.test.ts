@@ -2,7 +2,7 @@ import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { WorkbenchResource } from '@/types/workbenchResources'
-import type { WorkbenchResourceProvider } from '@/workbench/workbenchResourceProvider'
+import type { WorkbenchResourceProvider } from '@/modules/artifactWorkbench'
 import { useWorkbenchResourcesStore } from './workbenchResources'
 
 const attachment: WorkbenchResource = {

@@ -2,12 +2,16 @@ import { ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import type { ChatMessage } from '@/types/chat'
-import type { ChatDocumentContext } from '@/types/rpc'
-import type { UseChatSendOptions } from './useChatSend'
+import type { ChatDocumentContext } from '@/types/chat'
+import type { UseChatSendOptions as DomainUseChatSendOptions } from './useChatSend'
 import { useChatSend } from './useChatSend'
 import { createV4TurnCommandsFromRpcClient } from '@/adapters/gateway/turnCommandsV4'
 
 const SESSION_KEY = 'agent:main:webchat:document-context'
+
+interface UseChatSendOptions extends DomainUseChatSendOptions {
+  rpc: { call: any }
+}
 
 function createHarness(overrides: Partial<UseChatSendOptions> = {}) {
   const rpc = {
@@ -41,7 +45,7 @@ function createHarness(overrides: Partial<UseChatSendOptions> = {}) {
   const options: UseChatSendOptions = {
     rpc,
     turnCommands: createV4TurnCommandsFromRpcClient(
-      rpc as unknown as UseChatSendOptions['rpc'],
+      rpc as Parameters<typeof createV4TurnCommandsFromRpcClient>[0],
     ),
     inputText: ref('Update the title and accent color.'),
     messages: ref<ChatMessage[]>([]),
@@ -92,10 +96,7 @@ function createHarness(overrides: Partial<UseChatSendOptions> = {}) {
     ...overrides,
   }
   if (!overrides.turnCommands) {
-    options.turnCommands = createV4TurnCommandsFromRpcClient(
-      options.rpc,
-      options.supportsMethod,
-    )
+    options.turnCommands = createV4TurnCommandsFromRpcClient(options.rpc)
   }
   return { api: useChatSend(options), options, rpc }
 }

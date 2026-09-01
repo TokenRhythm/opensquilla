@@ -9,19 +9,19 @@ import type { Observability } from '@/modules/observability'
 import { createV4Observability } from '@/adapters/gateway/observabilityV4'
 
 type RpcCall = <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
-type TestObservability = Observability & { markMethodUnavailable: ReturnType<typeof vi.fn> }
+type TestObservability = Observability & { rememberUnsupportedMethod: ReturnType<typeof vi.fn> }
 
 function rpcWith(call: RpcCall, supports = true): TestObservability {
-  const markMethodUnavailable = vi.fn()
+  const rememberUnsupportedMethod = vi.fn()
   return Object.assign(createV4Observability({
     request: call,
     ready: vi.fn(async () => {}),
     supports: vi.fn(() => supports),
-    markUnsupported: markMethodUnavailable,
+    markUnsupported: rememberUnsupportedMethod,
   }, {
     requestJson: vi.fn(),
     requestBinary: vi.fn(),
-  }), { markMethodUnavailable })
+  }), { rememberUnsupportedMethod })
 }
 
 describe('usage.query compatibility client', () => {
@@ -276,7 +276,7 @@ describe('usage.query compatibility client', () => {
 
     const result = await requestUsageSnapshot(rpc, '7', { timezone: 'UTC' })
 
-    expect(rpc.markMethodUnavailable).toHaveBeenCalledWith('usage.query')
+    expect(rpc.rememberUnsupportedMethod).toHaveBeenCalledWith('usage.query')
     expect(call).toHaveBeenNthCalledWith(1, 'usage.query', expect.any(Object), expect.any(Object))
     expect(call).toHaveBeenNthCalledWith(2, 'usage.status', undefined, expect.any(Object))
     expect(result.mode).toBe('session_approximation')

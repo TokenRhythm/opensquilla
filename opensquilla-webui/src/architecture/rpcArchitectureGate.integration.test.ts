@@ -107,6 +107,22 @@ describe('transport architecture gate ledger integration', () => {
     )
   })
 
+  it.each([
+    'session.event.text_delta',
+    'task.succeeded',
+  ])('keeps %s wire literals inside Gateway Adapters', (wireName) => {
+    const root = seededFixture(`export const leakedEvent = '${wireName}'`, {
+      'src/adapters/gateway/eventsV4.ts': `export const wireEvent = '${wireName}'`,
+    })
+    const failures = evaluateRpcArchitectureGate({ root, debtLanes: [] }).failures
+
+    expect(failures).toContain(
+      `src/feature.ts: ${wireName} wire literal is allowed only in a Gateway Adapter, generated Contract, or test.`,
+    )
+    expect(failures.some(failure => failure.includes('src/adapters/gateway/eventsV4.ts')))
+      .toBe(false)
+  })
+
   it('fails when a paid-down entry remains in the ledger', () => {
     const root = seededFixture('export const value = 1')
     expect(evaluateRpcArchitectureGate({ root, debtLanes: oneCallLane }).failures).toContain(

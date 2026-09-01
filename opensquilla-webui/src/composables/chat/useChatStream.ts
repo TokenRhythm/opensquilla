@@ -12,13 +12,13 @@ import type {
   RawToolCallPayload,
 } from '@/types/chat'
 import type {
-  ArtifactPayload,
   CompactionPayload,
   ToolDeltaPayload,
   ToolEndPayload,
   ToolResultPayload,
   ToolUsePayload,
-} from '@/types/rpc'
+} from '@/types/chat'
+import type { ArtifactPayload } from '@/types/artifacts'
 import type {
   InterruptApprovalData,
   InterruptClarifyData,
@@ -115,8 +115,8 @@ export interface UseChatStreamOptions {
    *  interrupt part is stamped with its resolution/busy/error. The approvals
    *  composable owns the map; the stream only forwards it to the turn log. */
   interruptState?: Ref<ReadonlyMap<string, InterruptViewState>>
-  /** Current hello policy. Read lazily so reconnects can replace the timeout. */
-  rpcPolicy?: () => Record<string, unknown> | null | undefined
+  /** Adapter-projected stream idle timeout. Read lazily across reconnects. */
+  streamIdleTimeoutMs?: () => number | null | undefined
 }
 
 export interface StreamTaskClockSnapshot {
@@ -140,10 +140,9 @@ function normalizedTaskStartedAt(value: unknown): number | null {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null
 }
 
-export function streamIdleTimeoutFromPolicy(policy: Record<string, unknown> | null | undefined): number {
-  const raw = policy?.webui_stream_idle_grace_ms
-  return typeof raw === 'number' && Number.isFinite(raw) && raw > 0
-    ? raw
+export function resolvedStreamIdleTimeoutMs(value: number | null | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? value
     : DEFAULT_STREAM_IDLE_TIMEOUT_MS
 }
 
@@ -1215,7 +1214,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     // progress, however, and must not hide a 20s provider-progress stall.
     lastStreamEventAt = Date.now()
     if (opts.progress !== false) noteStreamSignal()
-    const nextTimeoutMs = streamIdleTimeoutFromPolicy(options.rpcPolicy?.())
+    const nextTimeoutMs = resolvedStreamIdleTimeoutMs(options.streamIdleTimeoutMs?.())
     streamIdleTimeoutMs.value = nextTimeoutMs
     if (
       !isStreaming.value

@@ -1,14 +1,13 @@
 import { reactive, ref, watch, type Ref } from 'vue'
 import i18n from '@/i18n'
 import type {
+  MetaEvent,
   MetaPreflightPayload,
   MetaRunAnnouncedPayload,
   MetaRunCompletedPayload,
   MetaRunCenter,
-  MetaSessionEventPayload,
   MetaStepStatePayload,
 } from '@/modules/metaRunCenter'
-import { isCurrentSessionPayload, isStaleEpoch } from '@/utils/chat/streamEvents'
 import {
   completeRun,
   createRibbon,
@@ -28,16 +27,16 @@ import type {
 /**
  * Self-contained controller for the MetaSkill run UI, mirroring
  * useChatApprovals. Owns the four `session.event.meta_*` subscriptions, the
- * per-run_id state Maps, the action handlers, and the confirm/replay RPC.
+ * per-run state Maps, the action handlers, and the confirm/replay RPC.
  *
- * Seq gating: the `*` wildcard (handleRpcAny) advances the shared lastStreamSeq
+ * Seq gating: the semantic conversation ingress advances the shared lastStreamSeq
  * for every session.event.* and runs AFTER these exact meta handlers, so this
  * controller must NOT call acceptStreamSeq (advancing twice would drop the next
- * frame). Instead gatePayload reads the pre-frame cursor read-only and drops
+ * frame). Instead gateEvent reads the projected pre-frame cursor and drops
  * stale/duplicate frames (seq <= lastStreamSeq) — without this, a replayed
- * meta_run_announced (e.g. on reconnect) would recreate the ribbon and reset it
- * to all-pending. It also gates on isStaleEpoch + isCurrentSessionPayload and
- * is a no-op on an unknown run_id (preserved from the vanilla modules).
+ * run announcement (e.g. on reconnect) would recreate the ribbon and reset it
+ * to all-pending. It also gates on the shared session/epoch cursor semantics and
+ * is a no-op on an unknown run (preserved from the vanilla modules).
  */
 
 export interface MetaPreflightEntry {
@@ -59,7 +58,7 @@ export interface UseMetaRunsOptions {
   sessionKey: Ref<string>
   currentEpoch: Ref<number>
   /**
-   * Shared stream-seq cursor (the same ref advanced by handleRpcAny for every
+   * Shared stream-seq cursor (the same ref advanced by conversation ingress for every
    * session.event.*). Used read-only here to drop stale/duplicate meta frames.
    */
   lastStreamSeq: Ref<number>
@@ -102,7 +101,7 @@ export interface UseMetaRunsOptions {
 export function useMetaRuns(options: UseMetaRunsOptions) {
   const { metaRunCenter, sessionKey, currentEpoch, lastStreamSeq } = options
 
-  // Reactive Maps keyed by run_id. ribbonOrder keeps render order stable.
+  // Reactive Maps keyed by run ID. ribbonOrder keeps render order stable.
   const ribbons = ref<Map<string, MetaRibbonState>>(new Map())
   const preflights = ref<Map<string, MetaPreflightEntry>>(new Map())
   const ribbonOrder = ref<string[]>([])
@@ -114,18 +113,17 @@ export function useMetaRuns(options: UseMetaRunsOptions) {
     if (!ribbonOrder.value.includes(runId)) ribbonOrder.value = [...ribbonOrder.value, runId]
   }
 
-  function gatePayload(payload: MetaSessionEventPayload | null | undefined): boolean {
-    if (!payload || typeof payload !== 'object') return false
-    if (isStaleEpoch(payload, currentEpoch.value)) return false
-    if (!isCurrentSessionPayload(payload, sessionKey.value)) return false
-    options.observeStreamGeneration?.(payload)
+  function gateEvent(event: MetaEvent): boolean {
+    if (event.sessionEpoch !== null && event.sessionEpoch < currentEpoch.value) return false
+    if (event.sessionKey && sessionKey.value && event.sessionKey !== sessionKey.value) return false
+    options.observeStreamGeneration?.(event)
     // Drop stale/duplicate stream frames (e.g. replayed on reconnect). Without
     // this, a re-delivered meta_run_announced would reset the ribbon to
-    // all-pending and lose progress. The wildcard handleRpcAny advances
+    // all-pending and lose progress. The semantic conversation ingress advances
     // lastStreamSeq for every session.event.* and runs AFTER the exact meta
     // handlers, so we read the pre-frame cursor here (read-only, never advance).
-    // Frames without a numeric stream_seq are accepted, matching acceptStreamSeq.
-    const seq = payload.stream_seq
+    // Frames without a numeric streamSeq are accepted, matching acceptStreamSeq.
+    const seq = event.streamSeq
     if (typeof seq === 'number' && Number.isFinite(seq) && seq <= lastStreamSeq.value) return false
     return true
   }
@@ -133,7 +131,6 @@ export function useMetaRuns(options: UseMetaRunsOptions) {
   /* ── Event handlers ──────────────────────────────────────────────── */
 
   function onPreflight(payload: MetaPreflightPayload) {
-    if (!gatePayload(payload)) return
     const state = reactive(createPreflight(payload)) as MetaPreflightState
     if (!state.runId) return
     noteRunId(state.runId)
@@ -143,8 +140,7 @@ export function useMetaRuns(options: UseMetaRunsOptions) {
   }
 
   function onRunAnnounced(payload: MetaRunAnnouncedPayload) {
-    if (!gatePayload(payload)) return
-    const runId = payload.run_id || ''
+    const runId = payload.runId || ''
     // A run's compiled DAG is immutable. Duplicate announce frames can be
     // replayed after reconnect; never let them reset live progress or a
     // durable terminal recovery snapshot back to all-pending.
@@ -161,16 +157,14 @@ export function useMetaRuns(options: UseMetaRunsOptions) {
   }
 
   function onStepState(payload: MetaStepStatePayload) {
-    if (!gatePayload(payload)) return
-    const runId = payload.run_id || ''
+    const runId = payload.runId || ''
     const ribbon = ribbons.value.get(runId)
     if (!ribbon) return // out-of-order / unknown run — tolerate
     updateStep(ribbon, payload)
   }
 
   function onRunCompleted(payload: MetaRunCompletedPayload) {
-    if (!gatePayload(payload)) return
-    const runId = payload.run_id || ''
+    const runId = payload.runId || ''
     const ribbon = ribbons.value.get(runId)
     if (!ribbon) return
     completeRun(ribbon, payload)
@@ -196,11 +190,11 @@ export function useMetaRuns(options: UseMetaRunsOptions) {
           || sessionKey.value !== targetSessionKey
         ) return
         const announced = recovery?.announced
-        if (!announced?.run_id) return
+        if (!announced?.runId) return
 
-        const ribbon = reactive(createRibbon(announced as MetaRunAnnouncedPayload)) as MetaRibbonState
-        for (const stepState of recovery?.stepStates || []) updateStep(ribbon, stepState as MetaStepStatePayload)
-        if (recovery?.completed) completeRun(ribbon, recovery.completed as MetaRunCompletedPayload)
+        const ribbon = reactive(createRibbon(announced)) as MetaRibbonState
+        for (const stepState of recovery?.stepStates || []) updateStep(ribbon, stepState)
+        if (recovery?.completed) completeRun(ribbon, recovery.completed)
         noteRunId(ribbon.runId)
         const next = new Map(ribbons.value)
         // A same-run live ribbon can be partial when the socket drops just
@@ -438,10 +432,11 @@ export function useMetaRuns(options: UseMetaRunsOptions) {
 
   function subscribe(): () => void {
     const subscription = metaRunCenter.subscribe(event => {
-      if (event.kind === 'preflight') onPreflight(event.payload as MetaPreflightPayload)
-      else if (event.kind === 'run-announced') onRunAnnounced(event.payload as MetaRunAnnouncedPayload)
-      else if (event.kind === 'step-state') onStepState(event.payload as MetaStepStatePayload)
-      else onRunCompleted(event.payload as MetaRunCompletedPayload)
+      if (!gateEvent(event)) return
+      if (event.kind === 'preflight') onPreflight(event.payload)
+      else if (event.kind === 'run-announced') onRunAnnounced(event.payload)
+      else if (event.kind === 'step-state') onStepState(event.payload)
+      else onRunCompleted(event.payload)
     })
     return () => subscription.close()
   }

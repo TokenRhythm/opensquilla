@@ -6,7 +6,7 @@ import type {
   DocumentMutationRetryPolicy,
   DocumentMutationStatus,
 } from '@/types/chat'
-import type { ChatHistoryTurnOutcome } from '@/types/rpc'
+import type { ChatHistoryTurnOutcome } from '@/types/chat'
 import {
   isUsageAccountingBarrier,
   terminalActivityStatusHistory,

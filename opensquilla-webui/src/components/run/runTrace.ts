@@ -3,7 +3,7 @@ import type {
   ChatStreamTimelineItem,
   ChatToolCallRenderItem,
 } from '@/types/chat'
-import type { ChatHistoryMessage } from '@/types/rpc'
+import type { ChatHistoryMessage } from '@/types/chat'
 import type { ToolPartState } from '@/types/parts'
 import { toolState } from '@/utils/chat/toParts'
 import {

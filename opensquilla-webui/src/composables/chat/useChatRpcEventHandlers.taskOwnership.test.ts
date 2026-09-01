@@ -12,6 +12,7 @@ import {
   type UseChatRpcEventHandlersOptions,
 } from './useChatRpcEventHandlers'
 import { chatTaskId, useChatTaskOwnership } from './useChatTaskOwnership'
+import { conversationSemanticEventKind } from '@/adapters/gateway/conversationEventsV4'
 
 const SESSION = 'agent:main:webchat:task-ownership'
 
@@ -131,7 +132,16 @@ function makeHarness({ supportsTurnCommitted = false } = {}) {
     loadCurrentSessionUsage: vi.fn(),
   }
   const scope = effectScope()
-  const api = scope.run(() => useChatRpcEventHandlers(options))!
+  const rawApi = scope.run(() => useChatRpcEventHandlers(options))!
+  const api = {
+    ...rawApi,
+    handlers: {
+      ...rawApi.handlers,
+      onWireEventFixture: (eventName: string, payload: unknown) => {
+        rawApi.handlers.onSemanticEvent(conversationSemanticEventKind(eventName), payload)
+      },
+    },
+  }
   return { api, options, stream, activeStreamTaskId, taskOwnership, scope }
 }
 
@@ -179,7 +189,7 @@ describe('task ownership event races', () => {
       expect(activeStreamTaskId.value).toBe('task-A')
       expect(stream.appendDelta).not.toHaveBeenCalled()
 
-      api.handlers.onAny(event, {
+      api.handlers.onWireEventFixture(event, {
         task_id: 'task-A',
         session_key: SESSION,
         stream_seq: 11,
@@ -302,7 +312,7 @@ describe('task ownership event races', () => {
     const { api, options, stream, activeStreamTaskId, taskOwnership, scope } = makeHarness()
     taskOwnership.noteQueued('task-B')
 
-    api.handlers.onAny('session.event.done', {
+    api.handlers.onWireEventFixture('session.event.done', {
       task_id: 'task-A',
       session_key: SESSION,
       stream_seq: 1,
@@ -336,7 +346,7 @@ describe('task ownership event races', () => {
     expect(taskOwnership.beginStop()).toBe('task-A')
     api.handlers.onTaskRunning({ task_id: 'task-B', session_key: SESSION })
 
-    api.handlers.onAny('task.cancelled', {
+    api.handlers.onWireEventFixture('task.cancelled', {
       task_id: 'task-A',
       session_key: SESSION,
       terminal_message: 'A stopped',
@@ -364,7 +374,7 @@ describe('task ownership event races', () => {
     const { api, options, stream, activeStreamTaskId, taskOwnership, scope } = makeHarness()
     taskOwnership.noteQueued('task-B')
 
-    api.handlers.onAny('task.cancelled', {
+    api.handlers.onWireEventFixture('task.cancelled', {
       task_id: 'task-B',
       session_key: SESSION,
       terminal_message: 'B was cancelled while queued',
@@ -417,7 +427,7 @@ describe('task ownership event races', () => {
     const { api, options, stream, activeStreamTaskId, taskOwnership, scope } = makeHarness()
     taskOwnership.noteQueued('task-B')
 
-    api.handlers.onAny('task.cancelled', {
+    api.handlers.onWireEventFixture('task.cancelled', {
       task_id: 'task-B',
       session_key: SESSION,
       terminal_message: 'B was cancelled while queued',
@@ -450,7 +460,7 @@ describe('task ownership event races', () => {
       stream_seq: 10,
       text: 'complete B answer',
     })
-    api.handlers.onAny('session.event.done', {
+    api.handlers.onWireEventFixture('session.event.done', {
       task_id: 'task-B',
       session_key: SESSION,
       stream_seq: 11,
@@ -462,7 +472,7 @@ describe('task ownership event races', () => {
     expect(stream.appendDelta).not.toHaveBeenCalled()
     expect(stream.endStreaming).not.toHaveBeenCalled()
 
-    api.handlers.onAny('session.event.done', {
+    api.handlers.onWireEventFixture('session.event.done', {
       task_id: 'task-A',
       session_key: SESSION,
       stream_seq: 12,
@@ -498,7 +508,7 @@ describe('task ownership event races', () => {
 
     expect(options.queueRouterDecision).not.toHaveBeenCalled()
 
-    api.handlers.onAny('session.event.done', {
+    api.handlers.onWireEventFixture('session.event.done', {
       task_id: 'task-A',
       session_key: SESSION,
       stream_seq: 11,
@@ -522,7 +532,7 @@ describe('task ownership event races', () => {
     stream.isStreaming.value = false
     expect(taskOwnership.beginStop()).toBe('task-B')
 
-    api.handlers.onAny('task.cancelled', {
+    api.handlers.onWireEventFixture('task.cancelled', {
       task_id: 'task-B',
       session_key: SESSION,
       terminal_message: 'queued task cancelled',
@@ -593,7 +603,7 @@ describe('task ownership event races', () => {
     const { api, options, stream, activeStreamTaskId, taskOwnership, scope } = makeHarness()
     options.currentEpoch.value = 5
 
-    api.handlers.onAny('task.cancelled', {
+    api.handlers.onWireEventFixture('task.cancelled', {
       task_id: 'task-A',
       session_key: SESSION,
       epoch: 4,
@@ -636,7 +646,7 @@ describe('task ownership event races', () => {
     const { api, options, stream, activeStreamTaskId, taskOwnership, scope } = makeHarness()
     options.currentEpoch.value = 5
 
-    api.handlers.onAny('session.event.approval_required', {
+    api.handlers.onWireEventFixture('session.event.approval_required', {
       task_id: 'task-B-old-epoch',
       session_key: SESSION,
       epoch: 4,
@@ -660,7 +670,7 @@ describe('task ownership event races', () => {
       scope,
     } = makeHarness({ supportsTurnCommitted: true })
 
-    api.handlers.onAny('session.event.done', {
+    api.handlers.onWireEventFixture('session.event.done', {
       task_id: 'task-A',
       turn_id: 'turn-A',
       session_key: SESSION,
@@ -680,7 +690,7 @@ describe('task ownership event races', () => {
     vi.mocked(options.scheduleHistorySync).mockClear()
     const noteTerminal = vi.spyOn(taskOwnership, 'noteTerminal')
 
-    api.handlers.onAny('session.event.turn_committed', {
+    api.handlers.onWireEventFixture('session.event.turn_committed', {
       schema_version: 1,
       task_id: 'task-A',
       turn_id: 'turn-A',

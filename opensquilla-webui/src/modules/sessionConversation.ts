@@ -1,19 +1,98 @@
 import type { InjectionKey } from 'vue'
 import type {
   ChatHistoryResponse,
-  SessionMessagesSnapshotResponse,
-  SessionMessagesSubscribeParams,
-  SessionMessagesSubscribeResponse,
-  SessionProjectWorkspaceSnapshot,
-} from '@/types/rpc'
-import type { RpcCallOptions, RpcConnectionWaitOptions, RpcEventHandler } from '@/lib/rpc'
+  SessionEventPayload,
+} from '@/types/chat'
+import type { ConversationSemanticEventKind } from './conversationEvents'
 import type { PromptCacheKeepaliveStatus } from '@/types/promptCacheKeepalive'
 
-/** Transport-independent options shared by session conversation reads. */
-export type SessionConversationRequestOptions = Pick<
-  RpcCallOptions,
-  'signal' | 'timeoutMs' | 'timeoutAction' | 'abortAction' | 'expectedGeneration' | 'onSent'
->
+export interface SessionMessagesSubscribeParams {
+  key: string
+  since_stream_generation?: string
+  since_stream_seq?: number
+  [key: string]: unknown
+}
+
+export interface SessionLiveSnapshotEvent {
+  event: ConversationSemanticEventKind
+  payload: SessionEventPayload
+}
+
+export interface SessionMessagesSnapshotResponse {
+  key: string
+  task_id?: string | null
+  stream_generation?: string
+  current_stream_seq?: number
+  events?: SessionLiveSnapshotEvent[]
+}
+
+export interface SessionProjectWorkspaceSnapshot {
+  id: string
+  name: string
+  path: string
+  available: boolean
+  removed: boolean
+  availabilityReason?: string
+}
+
+/** Durable, session-owned model routing selection. */
+export interface SessionRoutingSnapshot {
+  key?: string
+  sessionKey?: string
+  session_key?: string
+  mode?: import('@/types/modelRouting').GatewayModelRoutingMode
+  revision?: number
+  source?: 'session' | 'legacy_initialized' | string
+}
+
+export interface SessionMessagesSubscribeResponse extends SessionEventPayload {
+  subscribed?: boolean
+  hydration_complete?: boolean
+  hydrationComplete?: boolean
+  deferred_fields?: string[]
+  deferredFields?: string[]
+  projectWorkspaceDeferred?: boolean
+  project_workspace_deferred?: boolean
+  replay_complete?: boolean
+  current_stream_seq?: number
+  active_task_group_ids?: string[]
+  activeTaskGroupIds?: string[]
+  run_mode_lock?: {
+    locked?: boolean
+    runMode?: 'safe' | 'full'
+    source?: string
+  }
+  runModeLock?: {
+    locked?: boolean
+    runMode?: 'safe' | 'full'
+    source?: string
+  }
+  workspaceId?: string
+  projectWorkspace?: SessionProjectWorkspaceSnapshot | null
+  routing?: SessionRoutingSnapshot
+  modelRouting?: SessionRoutingSnapshot
+  model_routing?: SessionRoutingSnapshot
+  collaboration?: import('@/types/plans').CollaborationSnapshot
+  currentPlan?: import('@/types/plans').PlanRevisionSnapshot | null
+  current_plan?: unknown
+  activePlanRun?: import('@/types/plans').PlanRunSnapshot | null
+  active_plan_run?: unknown
+  goal?: unknown
+  goalSnapshotStreamSeq?: number | null
+  goal_snapshot_stream_seq?: number | null
+  pendingUserInputs?: unknown[]
+  pending_user_inputs?: unknown[]
+}
+
+/** Application request policy; the Adapter maps it to v4 transport options. */
+export interface SessionConversationRequestOptions {
+  signal?: AbortSignal
+  timeoutMs?: number
+  timeoutAction?: 'reject' | 'reconnect'
+  abortAction?: 'reject' | 'reconnect'
+  expectedGeneration?: number
+  onSent?: (transportGeneration: number) => void
+}
 
 export interface SessionHistoryRequest {
   sessionKey: string
@@ -148,7 +227,7 @@ export interface SessionConversationSubscription {
  * runtime/cursor modules remain responsible for ordering and replay policy.
  */
 export interface SessionConversation {
-  ready(options?: SessionConversationRequestOptions & RpcConnectionWaitOptions): Promise<void>
+  ready(options?: SessionConversationRequestOptions): Promise<void>
   subscribe(
     params: SessionMessagesSubscribeParams,
     options?: SessionConversationRequestOptions,
@@ -209,9 +288,8 @@ export interface SessionConversation {
     params: Record<string, unknown>,
     options?: SessionConversationRequestOptions,
   ): Promise<Record<string, unknown>>
-  subscribeToolResults(listener: RpcEventHandler): SessionConversationSubscription
+  subscribeToolResults(listener: (...args: unknown[]) => void): SessionConversationSubscription
   subscribeRoutingChanged(listener: (snapshot: unknown) => void): SessionConversationSubscription
-  supportsEvent(capability: 'turn-committed'): boolean
   supports(capability: SessionConversationCapability): boolean
 }
 

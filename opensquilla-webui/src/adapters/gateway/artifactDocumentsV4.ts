@@ -29,7 +29,7 @@ import type {
   ArtifactRevisionSource,
   ArtifactSourceSnapshot,
 } from '@/types/artifactDocuments'
-import type { ArtifactPayload, ArtifactsGetResponse } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import { isOfficeArtifact } from '@/utils/chat/artifacts'
 
 export { isOfficeArtifact } from '@/utils/chat/artifacts'
@@ -56,13 +56,17 @@ export const ARTIFACT_DOCUMENT_RPC_METHODS = {
 } as const
 
 type ArtifactDocumentRpc = {
-  supportsMethod?: (method: string) => boolean
-  markMethodUnavailable?: (method: string) => void
+  hasRpcMethod?: (method: string) => boolean
+  rememberUnsupportedMethod?: (method: string) => void
   call: <T = unknown>(
     method: string,
     params?: Record<string, unknown>,
     options?: RpcCallOptions,
   ) => Promise<T>
+}
+
+interface ArtifactsGetResponse {
+  artifact?: ArtifactPayload | null
 }
 
 const DOCUMENT_KINDS = new Set<ArtifactDocumentKind>([
@@ -688,7 +692,7 @@ export function createRpcArtifactDocumentProvider(
 ): ArtifactDocumentProvider {
   let cachedCapabilities: ArtifactEditCapabilities | null = null
 
-  const supports = (method: string) => rpc.supportsMethod?.(method) !== false
+  const supports = (method: string) => rpc.hasRpcMethod?.(method) !== false
 
   async function optionalCall<T>(
     method: string,
@@ -700,7 +704,7 @@ export function createRpcArtifactDocumentProvider(
       return await rpc.call<T>(method, params, signalOptions(signal))
     } catch (error) {
       if (!methodNotFound(error)) throw error
-      rpc.markMethodUnavailable?.(method)
+      rpc.rememberUnsupportedMethod?.(method)
       return null
     }
   }
@@ -1105,7 +1109,7 @@ export function createV4ArtifactDocuments(
     call: <T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions) => (
       transport.request<T>(method, params, options)
     ),
-    supportsMethod: method => transport.supports(method),
-    markMethodUnavailable: method => transport.markUnsupported(method),
+    hasRpcMethod: method => transport.supports(method),
+    rememberUnsupportedMethod: method => transport.markUnsupported(method),
   })
 }

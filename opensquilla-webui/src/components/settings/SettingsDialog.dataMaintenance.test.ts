@@ -26,8 +26,8 @@ vi.mock('@/components/settings/SettingsAdvancedPanel.vue', () => ({
 }))
 vi.mock('@/stores/rpc', () => ({
   useRpcStore: () => ({
-    waitForConnection: vi.fn(async () => {}),
-    supportsMethod: vi.fn(() => false),
+    ready: vi.fn(async () => {}),
+    hasRpcMethod: vi.fn(() => false),
     call: vi.fn(),
     isConnected: true,
     isConnecting: false,

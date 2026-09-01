@@ -50,10 +50,10 @@ interface RpcStoreTransportSource {
     options?: RpcCallOptions,
   ): Promise<T>
   on(event: string, handler: RpcEventHandler): () => void
-  supportsMethod(method: string): boolean
-  supportsEvent(event: string): boolean
-  markMethodUnavailable(method: string): void
-  waitForConnection(
+  hasRpcMethod(method: string): boolean
+  hasRpcEvent(event: string): boolean
+  rememberUnsupportedMethod(method: string): void
+  ready(
     timeoutMs?: number,
     signal?: AbortSignal,
     actions?: RpcConnectionWaitOptions,
@@ -70,7 +70,7 @@ export function createPrivateGatewayTransports(
         return source.call(method, params, options)
       },
       ready(options) {
-        return source.waitForConnection(
+        return source.ready(
           options?.timeoutMs,
           options?.signal,
           options ? {
@@ -80,10 +80,10 @@ export function createPrivateGatewayTransports(
         )
       },
       supports(method) {
-        return source.supportsMethod(method)
+        return source.hasRpcMethod(method)
       },
       markUnsupported(method) {
-        source.markMethodUnavailable(method)
+        source.rememberUnsupportedMethod(method)
       },
       get generation() {
         return source.connectionGeneration
@@ -102,7 +102,7 @@ export function createPrivateGatewayTransports(
         }
       },
       supports(event) {
-        return source.supportsEvent(event)
+        return source.hasRpcEvent(event)
       },
     },
   }

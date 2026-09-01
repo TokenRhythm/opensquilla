@@ -88,14 +88,14 @@ describe('sandboxSetupCoordinator', () => {
       .mockRejectedValueOnce(new Error('Connection recycled after sandbox.setup.ensure terminated'))
       .mockResolvedValueOnce({ state: 'ready', platform: 'win32' })
       .mockResolvedValueOnce({ available: true })
-    const waitForConnection = vi.fn().mockResolvedValue(undefined)
+    const ready = vi.fn().mockResolvedValue(undefined)
 
-    await expect(ensureSandboxReady(operations(call), null, waitForConnection)).resolves.toMatchObject({
+    await expect(ensureSandboxReady(operations(call), null, ready)).resolves.toMatchObject({
       ready: true,
       outcome: 'ready',
       status: { state: 'ready' },
     })
-    expect(waitForConnection).toHaveBeenCalledOnce()
+    expect(ready).toHaveBeenCalledOnce()
     expect(call).toHaveBeenNthCalledWith(1, 'sandbox.setup.ensure')
     expect(call).toHaveBeenNthCalledWith(2, 'sandbox.setup.status')
     expect(call).toHaveBeenNthCalledWith(3, 'sandbox.capability.status', { refresh: true })

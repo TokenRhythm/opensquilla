@@ -14,7 +14,7 @@ import type {
   ArtifactSourcePatchResult,
   ArtifactSourceSnapshot,
 } from '@/types/artifactDocuments'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import type { DisplayAttachment } from '@/types/chat'
 import type {
   DocumentImportResponse,

@@ -2,8 +2,6 @@ import { hasInjectionContext, inject, reactive } from 'vue'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
 import { SESSION_CONVERSATION_KEY, type SessionConversation } from '@/modules/sessionConversation'
-import { createLegacySessionConversation } from '@/adapters/gateway/sessionConversationV4'
-import { useRpcStore } from '@/stores/rpc'
 
 export type RouteFeedbackRating = 'up' | 'down'
 
@@ -21,10 +19,7 @@ export function useChatRouteFeedback(conversation?: SessionConversation) {
 
   function resolveConversation(): SessionConversation {
     if (sessionConversation) return sessionConversation
-    sessionConversation = createLegacySessionConversation(
-      useRpcStore() as Parameters<typeof createLegacySessionConversation>[0],
-    )
-    return sessionConversation
+    throw new Error('SessionConversation was not provided')
   }
 
   function ratingFor(decisionId: string | undefined): RouteFeedbackRating | undefined {

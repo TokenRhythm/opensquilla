@@ -383,7 +383,7 @@ export class RpcClient {
     return true;
   }
 
-  waitForConnection(
+  ready(
     timeoutMs: number = 30000,
     signal?: AbortSignal,
     actions: RpcConnectionWaitOptions = {}
@@ -392,7 +392,7 @@ export class RpcClient {
       // No wait and no request ever started, so this caller owns no socket to
       // recycle. Retiring the current connection here could kill a newer
       // session's healthy generation.
-      return Promise.reject(new RpcAbortError('waitForConnection'));
+      return Promise.reject(new RpcAbortError('ready'));
     }
     if (this._state === 'connected') return Promise.resolve();
 
@@ -429,7 +429,7 @@ export class RpcClient {
           if (this._state !== 'connected') {
             this._recycleConnection(
               this._socketGeneration,
-              new Error('Connection recycled after waitForConnection terminated'),
+              new Error('Connection recycled after ready terminated'),
               error instanceof RpcTimeoutError
                 ? 'connection_wait_timeout'
                 : 'connection_wait_abort'
@@ -439,7 +439,7 @@ export class RpcClient {
       };
       const onAbort = (): void => {
         finish(
-          new RpcAbortError('waitForConnection'),
+          new RpcAbortError('ready'),
           actions.abortAction || 'reject'
         );
       };
@@ -453,7 +453,7 @@ export class RpcClient {
       if (timeoutMs > 0 && Number.isFinite(timeoutMs)) {
         timer = setTimeout(() => {
           finish(
-            new RpcTimeoutError('waitForConnection', timeoutMs),
+            new RpcTimeoutError('ready', timeoutMs),
             actions.timeoutAction || 'reject'
           );
         }, timeoutMs);

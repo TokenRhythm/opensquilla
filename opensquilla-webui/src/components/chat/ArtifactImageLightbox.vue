@@ -115,11 +115,10 @@ import { useArtifactImageLightbox } from '@/composables/chat/useArtifactImageLig
 import { useDialogLayer } from '@/composables/useDialogA11y'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { useToasts } from '@/composables/useToasts'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import { ARTIFACT_WORKBENCH_KEY } from '@/modules/artifactWorkbench'
 import {
   artifactCategory,
-  artifactDownloadUrl,
   artifactFileTitle,
 } from '@/utils/chat/artifacts'
 import { downloadBlob } from '@/utils/browser'
@@ -178,32 +177,6 @@ const canGoNextImage = computed(() =>
   activeImageIndex.value >= 0
   && activeImageIndex.value < navigationVisualArtifacts.value.length - 1)
 
-function readAuthToken(): string {
-  if (typeof sessionStorage === 'undefined') return ''
-  try {
-    return sessionStorage.getItem('opensquilla.wsToken') || ''
-  } catch {
-    return ''
-  }
-}
-
-function sameOrigin(url: string): boolean {
-  try {
-    return new URL(url, window.location.origin).origin === window.location.origin
-  } catch {
-    return false
-  }
-}
-
-function previewHeaders(url: string, sessionKey: string): Record<string, string> {
-  if (!sameOrigin(url)) return {}
-  const headers: Record<string, string> = {}
-  if (sessionKey) headers['x-opensquilla-session-key'] = sessionKey
-  const authToken = readAuthToken()
-  if (authToken) headers.Authorization = `Bearer ${authToken}`
-  return headers
-}
-
 function disposeFull() {
   stopFullState?.()
   stopFullState = null
@@ -216,14 +189,10 @@ function disposeFull() {
 
 function loadFull(artifact: ArtifactPayload, sessionKey: string) {
   disposeFull()
-  const url = artifactDownloadUrl(artifact, window.location.origin, {
-    sessionKey,
-    includeSessionKey: false,
-  })
   fullController = createArtifactPreview({
-    resolveUrl: () => url,
-    headers: () => previewHeaders(url, sessionKey),
-    sameOrigin,
+    artifact: () => artifact,
+    sessionKey: () => sessionKey,
+    variant: 'content',
     fullSize: true,
   })
   const preview = fullController

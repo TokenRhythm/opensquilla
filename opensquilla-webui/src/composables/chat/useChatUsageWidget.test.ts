@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { useChatUsageWidget } from './useChatUsageWidget'
 import type { RpcCallOptions } from '@/lib/rpc'
+import { sessionConversationFromTestRpc } from '@/testing/sessionConversation.test-helper'
 
 describe('useChatUsageWidget background reads', () => {
   it('uses the injected bounded options without changing its public loader', async () => {
@@ -12,7 +13,7 @@ describe('useChatUsageWidget background reads', () => {
       abortAction: 'reconnect',
     }
     const rpc = {
-      waitForConnection: vi.fn().mockResolvedValue(undefined),
+      ready: vi.fn().mockResolvedValue(undefined),
       call: vi.fn().mockResolvedValue({
         sessions: [{
           sessionKey: 'agent:main:webchat:usage',
@@ -22,7 +23,7 @@ describe('useChatUsageWidget background reads', () => {
       }),
     }
     const api = useChatUsageWidget({
-      rpc,
+      sessionConversation: sessionConversationFromTestRpc(rpc),
       readCallOptions,
       sessionKey: ref('agent:main:webchat:usage'),
       tokenVizEnabled: () => false,
@@ -30,7 +31,7 @@ describe('useChatUsageWidget background reads', () => {
 
     await api.loadCurrentSessionUsage()
 
-    expect(rpc.waitForConnection).toHaveBeenCalledWith(
+    expect(rpc.ready).toHaveBeenCalledWith(
       2_000,
       undefined,
       {

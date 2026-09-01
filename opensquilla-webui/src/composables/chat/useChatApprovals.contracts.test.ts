@@ -3,6 +3,7 @@ import { effectScope, ref } from 'vue'
 import type { RpcEventHandler } from '@/lib/rpc'
 import type { InterruptViewState } from '@/types/parts'
 import { projectApprovalDisplayArgs } from '@/adapters/gateway/approvalCenterV4Contract'
+import { sessionConversationFromTestRpc } from '@/testing/sessionConversation.test-helper'
 import {
   useChatApprovals,
 } from './useChatApprovals'
@@ -83,7 +84,7 @@ async function harness(statusResult: unknown = { found: true, pending: true, res
   }
   const approvals = scope.run(() => useChatApprovals({
     approvalCenter,
-    rpc: {
+    sessionConversation: sessionConversationFromTestRpc({
       call: rpcCall as <T = unknown>(
         method: string,
         params?: Record<string, unknown>,
@@ -92,7 +93,7 @@ async function harness(statusResult: unknown = { found: true, pending: true, res
         handlers.set(event, handler)
         return () => handlers.delete(event)
       }),
-    },
+    }),
     sessionKey: ref('agent:main:web'),
     runStatus: ref({ status: 'idle', label: '', task: null }),
     stream: {

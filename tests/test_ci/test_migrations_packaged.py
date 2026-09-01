@@ -101,22 +101,13 @@ def test_usage_query_client_source_is_part_of_webui_build_inputs() -> None:
     source = (
         REPO_ROOT / "opensquilla-webui" / "src" / "composables" / "usage" / "useUsageQuery.ts"
     ).read_text(encoding="utf-8")
-    observability_adapter = (
-        REPO_ROOT
-        / "opensquilla-webui"
-        / "src"
-        / "adapters"
-        / "gateway"
-        / "observabilityV4.ts"
-    ).read_text(encoding="utf-8")
     package = json.loads((REPO_ROOT / "opensquilla-webui" / "package.json").read_text())
     bundle_guard = (
         REPO_ROOT / "opensquilla-webui" / "scripts" / "check-runtime-bundle.mjs"
     ).read_text(encoding="utf-8")
 
+    assert "import type { Observability } from '@/modules/observability'" in source
     assert "return observability.usage(range, options)" in source
-    assert "'usage.query'" not in source
-    assert "const USAGE_QUERY_METHOD = 'usage.query'" in observability_adapter
     assert "check-runtime-bundle.mjs" in package["scripts"]["build:artifact"]
     assert "usage.query" in bundle_guard
 

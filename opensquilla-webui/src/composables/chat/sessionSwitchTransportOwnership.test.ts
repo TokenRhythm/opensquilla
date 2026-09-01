@@ -12,9 +12,28 @@ import { acceptStreamSeq } from '@/utils/chat/streamEvents'
 import { useChatSessionBootstrap } from './useChatSessionBootstrap'
 import { useChatSessionRuntime } from './useChatSessionRuntime'
 import {
-  useChatSessionSubscription,
-  type UseChatSessionSubscriptionOptions,
+  useChatSessionSubscription as useProductionChatSessionSubscription,
+  type UseChatSessionSubscriptionOptions as ProductionSubscriptionOptions,
 } from './useChatSessionSubscription'
+import {
+  gatewayAccessFromTestRpc,
+  sessionConversationFromTestRpc,
+  type SessionConversationTestRpc,
+} from '@/testing/sessionConversation.test-helper'
+
+type UseChatSessionSubscriptionOptions = Omit<
+  ProductionSubscriptionOptions,
+  'sessionConversation' | 'gatewayAccess'
+> & { rpc: SessionConversationTestRpc }
+
+function useChatSessionSubscription(options: UseChatSessionSubscriptionOptions) {
+  const { rpc, ...domainOptions } = options
+  return useProductionChatSessionSubscription({
+    ...domainOptions,
+    sessionConversation: sessionConversationFromTestRpc(rpc),
+    gatewayAccess: gatewayAccessFromTestRpc(rpc),
+  })
+}
 
 const SESSION_A = 'agent:main:webchat:a'
 const SESSION_B = 'agent:main:webchat:b'
@@ -211,8 +230,8 @@ function createHarness(options: {
   const subscriptionRpc: UseChatSessionSubscriptionOptions['rpc'] = {
     get connectionGeneration() { return rpc.connectionGeneration },
     get policy() { return rpc.policy },
-    waitForConnection: (timeoutMs, signal, actions) => (
-      rpc.waitForConnection(timeoutMs, signal, actions)
+    ready: (timeoutMs, signal, actions) => (
+      rpc.ready(timeoutMs, signal, actions)
     ),
     call: <T = unknown>(
       method: string,
@@ -861,7 +880,7 @@ describe('session switch transport ownership', () => {
     const initialGeneration = rpc.connectionGeneration
 
     const waitController = new AbortController()
-    const waiting = rpc.waitForConnection(
+    const waiting = rpc.ready(
       7_000,
       waitController.signal,
       { timeoutAction: 'reject', abortAction: 'reject' },

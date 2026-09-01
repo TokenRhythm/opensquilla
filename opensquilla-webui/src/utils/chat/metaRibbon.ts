@@ -193,17 +193,17 @@ export function stateIcon(state: MetaStepState): string {
   return STATE_GLYPH[state] || '○'
 }
 
-/** Build a fresh ribbon state from a meta_run_announced payload. */
+/** Build a fresh ribbon state from a projected Meta run announcement. */
 export function createRibbon(announce: MetaRunAnnouncedPayload): MetaRibbonState {
   return {
-    runId: announce.run_id || '',
-    metaSkillName: announce.meta_skill_name || '',
-    language: detectLanguage(announce.language || announce.user_language || announce.meta_language),
+    runId: announce.runId || '',
+    metaSkillName: announce.metaSkillName || '',
+    language: detectLanguage(announce.language || announce.userLanguage || announce.metaLanguage),
     steps: (announce.steps || []).map((s) => ({
       id: s.id || '',
       label: s.label || humanizeStepId(s.id),
       kind: s.kind || '',
-      dependsOn: s.depends_on || [],
+      dependsOn: s.dependsOn || [],
       state: 'pending' as MetaStepState,
       statusText: '',
       error: '',
@@ -215,26 +215,26 @@ export function createRibbon(announce: MetaRunAnnouncedPayload): MetaRibbonState
   }
 }
 
-/** Apply a meta_step_state event in place; no-op on unknown step. */
+/** Apply a projected Meta step state in place; no-op on unknown step. */
 export function updateStep(state: MetaRibbonState, event: MetaStepStatePayload): MetaRibbonState {
-  const step = state.steps.find((s) => s.id === event.step_id)
+  const step = state.steps.find((s) => s.id === event.stepId)
   if (!step) return state
   step.state = normalizeStateClass(event.state)
-  if (event.status_text != null) step.statusText = event.status_text
+  if (event.statusText != null) step.statusText = event.statusText
   if (event.error) step.error = event.error
-  if (event.substitute_for) step.substituteFor = event.substitute_for
+  if (event.substituteFor) step.substituteFor = event.substituteFor
   if (event.rescue) step.rescue = event.rescue
   return state
 }
 
-/** Apply a meta_run_completed event in place. */
+/** Apply a projected Meta run completion in place. */
 export function completeRun(state: MetaRibbonState, event: MetaRunCompletedPayload): MetaRibbonState {
   const copy = ribbonCopy(state.language)
   state.runOutcome = normalizeRunOutcome(event.outcome)
-  const completed = new Set(event.completed_steps || [])
-  const failed = new Set(event.failed_steps || [])
-  const recovered = new Set(event.recovered_steps || [])
-  const skipped = new Set(event.skipped_steps || [])
+  const completed = new Set(event.completedSteps || [])
+  const failed = new Set(event.failedSteps || [])
+  const recovered = new Set(event.recoveredSteps || [])
+  const skipped = new Set(event.skippedSteps || [])
   state.steps.forEach((step) => {
     if (recovered.has(step.id)) {
       step.state = 'substituted'

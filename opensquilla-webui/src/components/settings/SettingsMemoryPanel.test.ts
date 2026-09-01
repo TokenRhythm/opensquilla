@@ -89,9 +89,9 @@ async function mountPanel(options: {
     return {}
   })
   const rpc = {
-    waitForConnection: vi.fn(async () => {}),
-    supportsMethod: vi.fn((method: string) => methods.includes(method)),
-    markMethodUnavailable: vi.fn(),
+    ready: vi.fn(async () => {}),
+    hasRpcMethod: vi.fn((method: string) => methods.includes(method)),
+    rememberUnsupportedMethod: vi.fn(),
     call,
   }
   vi.doMock('@/stores/rpc', () => ({ useRpcStore: () => rpc }))
@@ -112,9 +112,9 @@ async function mountPanel(options: {
   const app = createApp(Component)
   app.use(i18n)
   app.provide(MEMORY_PROFILE_IMPORT_KEY, createV4MemoryProfileImport({
-    ready: async () => rpc.waitForConnection(),
-    supports: rpc.supportsMethod,
-    markUnsupported: rpc.markMethodUnavailable,
+    ready: async () => rpc.ready(),
+    supports: rpc.hasRpcMethod,
+    markUnsupported: rpc.rememberUnsupportedMethod,
     request: async <T = unknown>(method: string, params?: Record<string, unknown>) => (
       await (call as unknown as (
         method: string,

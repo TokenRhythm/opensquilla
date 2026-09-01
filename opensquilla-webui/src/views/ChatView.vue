@@ -147,14 +147,14 @@
           v-else-if="!forkTransition && visibleHistoryRecoveryState"
           :key="`${sessionKey}:history`"
           :state="visibleHistoryRecoveryState"
-          :transport-state="rpc.state"
+          :transport-state="gatewayConnectionState"
           @retry="retryHistory"
         />
         <ChatSessionRecoveryStatus
           v-if="!forkTransition && liveRecoveryState"
           :key="`${sessionKey}:live`"
           :state="liveRecoveryState"
-          :transport-state="rpc.state"
+          :transport-state="gatewayConnectionState"
           @retry="retryLive"
         />
         <div
@@ -192,7 +192,6 @@
           :session-key="forkTransition?.parentKey || sessionKey"
           :scroll-container="threadRef"
           :virtualization-disabled="Boolean(forkTransition)"
-          :auth-token="readAuthToken()"
           :artifact-navigation-items="sessionArtifacts"
           :workbench-enabled="workbenchEnabled"
           :workbench-resource-preview-enabled="attachmentWorkbenchPreviewEnabled"
@@ -427,7 +426,6 @@
               :artifacts="liveArtifacts"
               :navigation-artifacts="sessionArtifacts"
               :session-key="sessionKey"
-              :auth-token="readAuthToken()"
               :prefer-workbench="workbenchEnabled"
               @download="downloadArtifact"
               @open="openArtifact"
@@ -689,7 +687,7 @@
       :project-status-message="activeProjectStatusMessage"
       :prompt-annotations="activePromptAnnotations"
       :can-close-project="isDraftRoute() && pendingWorkspaceId !== null"
-      :can-choose-project="rpc.canChooseProject"
+      :can-choose-project="gatewayAccess.canChooseProject"
       :plan-mode-available="planUiAvailable"
       :collaboration-mode="collaboration.mode"
       :plan-mode-busy="planModeBusy"
@@ -739,9 +737,9 @@
       @confirm="void confirmComposerSandboxSetup()"
     />
     <ProjectWorkspacePickerDialog
-      v-if="rpc.canChooseProject"
+      v-if="gatewayAccess.canChooseProject"
       :open="projectPickerOpen"
-      :enabled="rpc.canChooseProject"
+      :enabled="gatewayAccess.canChooseProject"
       :session-key="sessionKey"
       :initial-path="activeWorkspace?.path"
       @close="projectPickerOpen = false"
@@ -761,7 +759,6 @@
       :open="deliverablesOpen"
       :artifacts="sessionArtifacts"
       :session-key="sessionKey"
-      :auth-token="readAuthToken()"
       @close="closeDeliverables"
       @download="downloadArtifact"
     />
@@ -801,7 +798,7 @@ import { ref, computed, inject, onMounted, onUnmounted, nextTick, watch, watchEf
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
-import { useRpcStore } from '@/stores/rpc'
+import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 import {
   SESSION_DIRECTORY_KEY,
   SessionDirectoryError,
@@ -930,7 +927,6 @@ import {
 } from '@/composables/chat/useChatSessionRoute'
 import {
   useChatRunModePreference,
-  type RunModePolicy,
 } from '@/composables/chat/useChatRunModePreference'
  import {
    useChatSessionBootstrap,
@@ -954,10 +950,10 @@ import {
   createConversationSessionRuntime,
 } from '@/modules/conversationSessionRuntime'
 import {
-  createConversationEventTransport,
+  CONVERSATION_EVENTS_KEY,
   conversationEventSessionKey,
-  type ConversationEventTransportMessage,
-} from '@/adapters/gateway/conversationEventTransport'
+  type ConversationEvent,
+} from '@/modules/conversationEvents'
 import {
   useChatSlashCommands,
   type DurableMetaDraft,
@@ -1012,12 +1008,11 @@ import {
   steerUnavailableReason,
   type SteerUnavailableReason,
 } from '@/utils/chat/steerAvailability'
+import type { ArtifactPayload } from '@/types/artifacts'
 import type {
-  ArtifactPayload,
-  SessionEventPayload,
   SessionMessagesSnapshotResponse,
   SessionMessagesSubscribeResponse,
-} from '@/types/rpc'
+} from '@/modules/sessionConversation'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import {
   isRecognizedSandboxRunMode,
@@ -1097,7 +1092,6 @@ import {
   FINISHED_STREAM_TASK_ID,
   PENDING_STREAM_TASK_ID,
   STOPPED_STREAM_TASK_ID,
-  isCurrentSessionPayload as payloadIsCurrentSession,
 } from '@/utils/chat/streamEvents'
 import { copyTextWithFallback, copyImageToClipboard, downloadBlob, shareCopyImageSupported } from '@/utils/browser'
 import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
@@ -1154,13 +1148,6 @@ interface ChatComposerHandle {
 
 type Message = ChatMessage
 
-interface RpcAuthPayload {
-  runModePolicy?: RunModePolicy
-  principal?: {
-    authState?: string
-  }
-}
-
 /* ── Constants ─────────────────────────────────────────────────────── */
 
 const CHAT_RUN_STATUS_VALUES: ChatRunStatusState[] = [
@@ -1182,7 +1169,12 @@ const toolResultModal = ref<{
 
 /* ── Stores / Router ───────────────────────────────────────────────── */
 
-const rpc = useRpcStore()
+const injectedGatewayAccess = inject(GATEWAY_ACCESS_KEY)
+if (!injectedGatewayAccess) throw new Error('GatewayAccess was not provided')
+const gatewayAccess = injectedGatewayAccess
+const gatewayConnectionState = computed(() => gatewayAccess.availability === 'available'
+  ? 'connected'
+  : gatewayAccess.availability === 'preparing' ? 'connecting' : 'disconnected')
 const pendingInputQueue = inject(PENDING_INPUT_QUEUE_KEY, null)
 const sessionRouting = inject(SESSION_ROUTING_KEY) as SessionRouting | undefined
 if (!sessionRouting) throw new Error('SessionRouting was not provided')
@@ -1215,6 +1207,8 @@ if (!injectedAppSettings) throw new Error('AppSettings was not provided')
 const injectedSessionConversation = inject(SESSION_CONVERSATION_KEY)
 if (!injectedSessionConversation) throw new Error('SessionConversation was not provided')
 const sessionConversation: SessionConversation = injectedSessionConversation
+const conversationEvents = inject(CONVERSATION_EVENTS_KEY)
+if (!conversationEvents) throw new Error('ConversationEvents was not provided')
 const injectedProviderConfiguration = inject(PROVIDER_CONFIGURATION_KEY)
 const injectedSandboxRuntime = inject(SANDBOX_RUNTIME_KEY)
 if (!injectedSandboxRuntime) throw new Error('SandboxRuntime was not provided')
@@ -1607,10 +1601,7 @@ const {
   applyRunModePreferenceChanged,
 } = useChatRunModePreference({
   sandbox: injectedSandboxRuntime,
-  runModePolicy: () => {
-    const auth = rpc.auth as RpcAuthPayload | null
-    return auth?.runModePolicy
-  },
+  runModePolicy: () => gatewayAccess.runModePolicy,
 })
 async function refreshRunModePreference() {
   try {
@@ -1629,7 +1620,7 @@ const requestedRunMode = computed<SandboxRunMode>(
 
 const sandboxSetupRecovery = useSandboxSetupRecovery({
   sandbox: injectedSandboxRuntime,
-  connectionState: computed(() => rpc.state),
+  connectionState: gatewayConnectionState,
   runMode: requestedRunMode,
   autoRefresh: false,
 })
@@ -1661,7 +1652,7 @@ const composerSandboxSetupOpen = ref(false)
 
 async function refreshPostBootstrapMetadata() {
   await refreshRunModePreference()
-  if (!chatViewDisposed && rpc.state === 'connected') {
+  if (!chatViewDisposed && gatewayAccess.isAvailable) {
     await sandboxSetupRecovery.refresh()
   }
 }
@@ -1676,10 +1667,10 @@ const lastStreamSeq = ref(0)
 // Its cursor policy remains projected into legacy refs, while the event source
 // and subscription leases stay behind the transport-neutral runtime seam.
 const conversationSessionRuntime = createConversationSessionRuntime<
-  ConversationEventTransportMessage,
+  ConversationEvent,
   SessionSubscriptionOutcome
 >({
-  source: createConversationEventTransport(rpc),
+  source: conversationEvents,
   events: { sessionKey: conversationEventSessionKey },
 })
 const conversationRuntime = conversationSessionRuntime.cursor
@@ -1780,7 +1771,7 @@ const chatStream = useChatStream({
   stripGeneratedArtifactMarkers,
   scrollToBottom,
   interruptState,
-  rpcPolicy: () => rpc.policy,
+  streamIdleTimeoutMs: () => gatewayAccess.streamIdleTimeoutMs,
 })
 const {
   isStreaming,
@@ -1815,8 +1806,8 @@ const {
   completeReasoningPresentation,
 } = chatStream
 watch(
-  () => rpc.state,
-  state => setStreamConnectionAvailable(state === 'connected'),
+  () => gatewayAccess.isAvailable,
+  available => setStreamConnectionAvailable(available),
   { immediate: true },
 )
 const chatAttachments = useChatAttachments(artifactWorkbench.content)
@@ -1908,7 +1899,7 @@ const chatPendingQueue = useChatPendingQueue({
   hasComposer: () => Boolean(composerRef.value),
   pendingInputWal,
   pendingInputQueue,
-  connectionState: computed(() => rpc.state),
+  connectionState: gatewayConnectionState,
   prepareAttachmentsForSend,
   onPendingPersistenceError: reason => {
     const message = reason === 'order_conflict'
@@ -2078,7 +2069,6 @@ watch(compactStatus, (status) => {
 }, { flush: 'sync' })
 
 const chatUsageWidget = useChatUsageWidget({
-  rpc,
   sessionConversation,
   readCallOptions: optionalSessionRpcCallOptions,
   sessionKey,
@@ -2109,7 +2099,6 @@ const {
 } = chatSessionRoute
 
 const chatFeatureToggles = useChatFeatureToggles({
-  rpc,
   sessionConversation,
   appSettings: injectedAppSettings,
   modelRouting: injectedProviderConfiguration,
@@ -2135,9 +2124,8 @@ const {
 } = chatFeatureToggles
 
 const sessionRoutingAvailable = computed(() => {
-  const auth = rpc.auth as RpcAuthPayload | null
-  return rpc.state === 'connected'
-    && auth?.principal?.authState === 'authenticated'
+  return gatewayAccess.isAvailable
+    && gatewayAccess.isAuthenticated
     && sessionRouting.available()
 })
 const chatSessionRouting = useChatSessionRouting({
@@ -2329,8 +2317,8 @@ const preserveHistoryLiveTail = computed(() =>
 )
 
 const chatHistory = useChatHistory({
-  rpc,
   sessionConversation,
+  concurrentHistoryReads: () => gatewayAccess.concurrentHistoryReads,
   sessionKey,
   messages,
   threadRef,
@@ -2565,8 +2553,8 @@ async function handleRegenerateMessage(
 let applyPendingUserInputSnapshot: typeof chatPlans.applyBootstrap = () => {}
 let applyGoalSnapshot: (snapshot: SessionMessagesSubscribeResponse) => void = () => {}
 const chatSessionSubscription = useChatSessionSubscription({
-  rpc,
   sessionConversation,
+  gatewayAccess,
   conversationSessionRuntime: conversationSessionRuntime,
   sessionKey,
   lastStreamSeq,
@@ -3187,7 +3175,6 @@ const goalOutcomeHasMessageAnchor = computed(() => (
 ))
 
 const chatSlashCommands = useChatSlashCommands({
-  rpc,
   sessionConversation,
   metaRunCenter,
   catalogCallOptions: optionalSessionRpcCallOptions,
@@ -3293,7 +3280,6 @@ const {
 resetComposerInputHistory = chatComposerShortcuts.resetInputHistory
 
 const chatSend = useChatSend({
-  rpc,
   metaRunCenter,
   turnCommands,
   activeSteerCapability,
@@ -3436,9 +3422,9 @@ const {
 sendUsageBarrierReplay = dispatchUsageBarrierReplay
 void recoverResponseHandoffs()
 watch(
-  [() => rpc.state, sessionKey],
+  [() => gatewayAccess.availability, sessionKey],
   ([state]) => {
-    if (state === 'connected') void recoverResponseHandoffs()
+    if (state === 'available') void recoverResponseHandoffs()
   },
 )
 async function onSend(
@@ -3718,7 +3704,6 @@ async function steerPendingMessage(pendingUiId: string) {
 }
 
 const chatApprovals = useChatApprovals({
-  rpc,
   sessionConversation,
   approvalCenter,
   sessionKey,
@@ -3854,7 +3839,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   showCompactionToast,
   getCompactionPlacement: id => getCompactionPlacement(id) || undefined,
   showWarningToast: message => pushToast(message || t('chat.warning.default'), { tone: 'warn', duration: 5000 }),
-  supportsTurnCommitted: () => sessionConversation.supportsEvent('turn-committed'),
+  supportsTurnCommitted: () => sessionConversation.supports('turn-committed'),
   scheduleHistorySync,
   schedulePendingDrainAfterTerminal,
   popAllPendingIntoComposer,
@@ -4126,21 +4111,21 @@ watch(isStreaming, (streaming, wasStreaming) => {
 const stallWatchdog = useChatStallWatchdog({ isStreaming, streamIdleGraceMs: streamIdleTimeoutMs })
 const { stallActive, stallSeconds } = stallWatchdog
 
-const chatRpcSubscriptions = useChatRpcSubscriptions(rpc, {
-  // The private v4 adapter emits one validated event message. The reducer
-  // owns named projections and the legacy wildcard terminal path behind that
-  // single ingress, so the view no longer wires event names itself.
-  onEvent: rpcEventHandlers.onConversationEvent,
-  onConnectionState: rpcEventHandlers.handlers.onConnectionState,
-  // The wildcard handler is the one funnel that sees every gateway event with
-  // its name; feed the active session's events to the watchdog before the
-  // regular reducer consumes them (same session filter as existing handlers).
-  onAny: (rawEvent, rawPayload) => {
-    const payloadObj = (rawPayload && typeof rawPayload === 'object' ? rawPayload : {}) as SessionEventPayload
-    if (payloadIsCurrentSession(payloadObj, sessionKey.value)) {
-      stallWatchdog.noteEvent(rawEvent, payloadObj)
+const chatRpcSubscriptions = useChatRpcSubscriptions({
+  // The private v4 adapter emits one semantic message. Feed that projection to
+  // both business consumers without exposing protocol names in the view.
+  onEvent: (message) => {
+    if (message.kind === 'conversation') {
+      stallWatchdog.noteEvent(message.event.semanticKind, message.payload)
+    } else if (message.kind === 'approval') {
+      stallWatchdog.noteEvent(
+        message.action === 'requested' ? 'approval-requested' : 'approval-resolved',
+        message.payload,
+      )
     }
+    rpcEventHandlers.onConversationEvent(message)
   },
+  onConnectionState: rpcEventHandlers.handlers.onConnectionState,
 }, {
   getSessionKey: () => sessionKey.value,
   runtime: conversationSessionRuntime,
@@ -4683,14 +4668,6 @@ const shareableMessageCount = computed(() => renderedMessages.value.filter(isSha
 const selectedShareCount = computed(() => selectedShareMessageIds.value.size)
 
 /* ── Helpers ───────────────────────────────────────────────────────── */
-
-function readAuthToken(): string {
-  try {
-    return sessionStorage.getItem('opensquilla.wsToken') || ''
-  } catch {
-    return ''
-  }
-}
 
 function reportRunModePersistenceError(cause: unknown): void {
   const detail = cause instanceof Error ? cause.message : String(cause)
@@ -6350,7 +6327,7 @@ function consumeDraftPrefill() {
 
 async function chooseProjectPath(path: string) {
   projectPickerOpen.value = false
-  if (!rpc.canChooseProject) return
+  if (!gatewayAccess.canChooseProject) return
   const trusted = await confirm({
     title: t('workspaces.trustTitle'),
     body: t('workspaces.trustBody', { path }),
@@ -6374,7 +6351,7 @@ async function chooseProjectPath(path: string) {
 }
 
 function openProjectPicker() {
-  if (!rpc.canChooseProject) return
+  if (!gatewayAccess.canChooseProject) return
   projectPickerOpen.value = true
 }
 
@@ -6415,7 +6392,7 @@ async function validateActiveProjectBeforeSend(): Promise<string | null> {
       workspaceId = boundWorkspaceId.value
     }
     if (!workspaceId) return activeWorkspaceSendBlockedReason.value
-    if (!rpc.canManageProjectWorkspaces) {
+    if (!gatewayAccess.canManageProjectWorkspaces) {
       return activeWorkspaceSendBlockedReason.value
     }
     const workspaces = await projectWorkspaces.loadWorkspaces({
@@ -6464,7 +6441,7 @@ async function syncDraftProjectFromRoute(generation: number): Promise<boolean> {
     activeProjectWorkspace.clearDraft()
     return true
   }
-  if (!rpc.canChooseProject) {
+  if (!gatewayAccess.canChooseProject) {
     activeProjectWorkspace.clearDraft()
     freshTaskDraft.requestFreshTask(draftAgentId())
     goToDraft({
@@ -6946,7 +6923,7 @@ watch(freshTaskDraft.request, request => {
   // outgoing composer and cannot recreate the discarded recovery pointer.
   inputText.value = ''
   draftPersistence.clearDraft(sessionKey.value)
-  if (request.workspaceId && rpc.canChooseProject) {
+  if (request.workspaceId && gatewayAccess.canChooseProject) {
     const workspace = projectWorkspaces.byId.value.get(request.workspaceId)
     if (workspace) {
       activeProjectWorkspace.beginProjectDraft(activeSnapshot(workspace))
@@ -6961,7 +6938,7 @@ watch(freshTaskDraft.request, request => {
 })
 
 watch(projectWorkspaces.workspaces, workspaces => {
-  if (!rpc.canManageProjectWorkspaces) return
+  if (!gatewayAccess.canManageProjectWorkspaces) return
   const workspaceId = boundWorkspaceId.value
   if (!workspaceId) return
   const workspace = workspaces.find(item => item.id === workspaceId) || null
@@ -6971,7 +6948,7 @@ watch(projectWorkspaces.workspaces, workspaces => {
 })
 
 watch(
-  () => rpc.canChooseProject,
+  () => gatewayAccess.canChooseProject,
   allowed => {
     if (allowed) return
     projectPickerOpen.value = false
@@ -7058,8 +7035,8 @@ watch(sessionKey, () => {
 
 // Hello refreshes method capabilities on reconnect. Retry the durable index
 // for the current Session then; older gateways simply remain on history/live.
-watch(() => rpc.state, (state, previous) => {
-  if (state !== 'connected' || previous === 'connected') return
+watch(() => gatewayAccess.availability, (state, previous) => {
+  if (state !== 'available' || previous === 'available') return
   void loadFeatureToggles()
   if (
     sessionKey.value

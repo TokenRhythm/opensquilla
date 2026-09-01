@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import type { ChatStreamTimelineItem } from '@/types/chat'
-import type { ChatHistoryMessage } from '@/types/rpc'
+import type { ChatHistoryMessage } from '@/types/chat'
 import { nodeStepsFromHistoryMessage, nodeStepsFromTimeline } from './runTrace'
 
 describe('run trace tool identity', () => {

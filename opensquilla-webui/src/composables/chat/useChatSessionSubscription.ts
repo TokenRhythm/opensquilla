@@ -8,7 +8,7 @@ import type {
   SessionMessagesSnapshotResponse,
   SessionMessagesSubscribeParams,
   SessionMessagesSubscribeResponse,
-} from '@/types/rpc'
+} from '@/modules/sessionConversation'
 import {
   createConversationRuntime,
   type ConversationRuntime,
@@ -19,11 +19,13 @@ import {
   type ConversationSubscriptionAttempt,
 } from '@/modules/conversationSubscriptionLifecycle'
 import { conversationCursorSignal } from '@/utils/chat/streamEvents'
-import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
 import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
 import { chatTaskId } from '@/composables/chat/useChatTaskOwnership'
-import type { SessionConversation } from '@/modules/sessionConversation'
-import { createLegacySessionConversation } from '@/adapters/gateway/sessionConversationV4'
+import type {
+  SessionConversation,
+  SessionConversationRequestOptions,
+} from '@/modules/sessionConversation'
+import type { GatewayAccess } from '@/modules/gatewayAccess'
 import {
   SESSION_PHASE_ATTEMPT_BUDGET_MS,
   SESSION_SNAPSHOT_BUDGET_MS,
@@ -37,28 +39,12 @@ import {
   type SessionBootstrapPhaseContext,
 } from '@/composables/chat/sessionBootstrapContract'
 
-type RpcClient = {
-  readonly connectionGeneration?: number
-  readonly policy?: Record<string, unknown> | null
-  waitForConnection?: (
-    timeoutMs?: number,
-    signal?: AbortSignal,
-    actions?: RpcConnectionWaitOptions,
-  ) => Promise<void>
-  call?: <T = unknown>(
-    method: string,
-    params?: Record<string, unknown>,
-    options?: RpcCallOptions,
-  ) => Promise<T>
-  recoverConnectionGeneration?: (
-    expectedGeneration: number,
-    reason: string,
-  ) => boolean
-}
-
 export interface UseChatSessionSubscriptionOptions {
-  rpc: RpcClient
-  sessionConversation?: SessionConversation
+  sessionConversation: SessionConversation
+  gatewayAccess: Pick<
+    GatewayAccess,
+    'detachedSessionHydration' | 'subscriptionEpoch' | 'recoverSubscriptionEpoch'
+  >
   /** Shared domain policy; omitted callers receive an equivalent local seam. */
   conversationRuntime?: ConversationRuntime
   /** Shared Conversation owner; preferred over the legacy cursor-only option. */
@@ -136,8 +122,7 @@ const UNAVAILABLE_SUBSCRIPTION: SessionSubscriptionOutcome = {
 }
 
 export function useChatSessionSubscription(options: UseChatSessionSubscriptionOptions) {
-  const conversation: SessionConversation = options.sessionConversation
-    ?? createLegacySessionConversation(options.rpc as Parameters<typeof createLegacySessionConversation>[0])
+  const conversation = options.sessionConversation
   const isHydrating = ref(false)
   const streamGeneration = ref<string | null>(null)
   const conversationRuntime = options.conversationSessionRuntime?.cursor
@@ -161,20 +146,19 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
   }
 
   function detachedHydrationAdvertised(): boolean {
-    const methods = options.rpc.policy?.concurrent_optional_read_methods
-    return Array.isArray(methods) && methods.includes('sessions.messages.hydrate')
+    return options.gatewayAccess.detachedSessionHydration
   }
 
   function hydrationCallOptions(
     bootstrap: SessionBootstrapPhaseContext,
-  ): RpcCallOptions {
+  ): SessionConversationRequestOptions {
     const callOptions = phaseCallOptions(bootstrap, 'sessions.messages.hydrate')
     if (detachedHydrationAdvertised()) callOptions.timeoutAction = 'reject'
     return callOptions
   }
 
   function retireLeasesFromPriorGenerations() {
-    subscriptionLifecycle.retirePriorGenerations(options.rpc.connectionGeneration)
+    subscriptionLifecycle.retirePriorGenerations(options.gatewayAccess.subscriptionEpoch)
   }
 
   function subscribeSession(
@@ -682,7 +666,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
   }
 
   async function retrySessionMetadata(
-    callOptions: RpcCallOptions = {},
+    callOptions: SessionConversationRequestOptions = {},
   ): Promise<boolean> {
     const key = options.sessionKey.value
     if (!key) return false
@@ -769,7 +753,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     lease.state = 'releasing'
     subscriptionLifecycle.leases.clearActive(lease)
     const expectedGeneration = lease.socketGeneration
-    const currentGeneration = options.rpc.connectionGeneration
+    const currentGeneration = options.gatewayAccess.subscriptionEpoch
     // No subscribe frame was sent, or the physical connection that owned it
     // has already gone away. Gateway disconnect cleanup is authoritative; an
     // unsubscribe must never leak onto a replacement generation.
@@ -801,11 +785,10 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
           !isRpcTimeout(cause)
           && !isRpcAbort(cause)
           && (
-            options.rpc.connectionGeneration === expectedGeneration
-            || options.rpc.connectionGeneration === undefined
+            options.gatewayAccess.subscriptionEpoch === expectedGeneration
           )
         ) {
-          options.rpc.recoverConnectionGeneration?.(
+          options.gatewayAccess.recoverSubscriptionEpoch(
             expectedGeneration,
             'Failed to release the previous session subscription',
           )

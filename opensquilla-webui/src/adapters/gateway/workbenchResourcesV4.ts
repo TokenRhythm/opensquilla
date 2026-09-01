@@ -6,7 +6,7 @@ interface V4RpcTransport {
   supports(method: string): boolean
   markUnsupported(method: string): void
 }
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import type {
   DocumentOperationReceipt,
   DocumentPublication,
@@ -34,8 +34,8 @@ export const WORKBENCH_RESOURCE_RPC_METHODS = {
 } as const
 
 type WorkbenchResourceRpc = {
-  supportsMethod?: (method: string) => boolean
-  markMethodUnavailable?: (method: string) => void
+  hasRpcMethod?: (method: string) => boolean
+  rememberUnsupportedMethod?: (method: string) => void
   call: (
     method: string,
     params?: Record<string, unknown>,
@@ -243,7 +243,7 @@ function isMethodNotFound(error: unknown): boolean {
 export function createRpcWorkbenchResourceProvider(
   rpc: WorkbenchResourceRpc,
 ): WorkbenchResourceProvider {
-  const supports = (method: string) => rpc.supportsMethod?.(method) !== false
+  const supports = (method: string) => rpc.hasRpcMethod?.(method) !== false
 
   async function call<T>(
     method: string,
@@ -254,7 +254,7 @@ export function createRpcWorkbenchResourceProvider(
     try {
       return await rpc.call(method, params, { signal, timeoutMs: 15_000 }) as T
     } catch (error) {
-      if (isMethodNotFound(error)) rpc.markMethodUnavailable?.(method)
+      if (isMethodNotFound(error)) rpc.rememberUnsupportedMethod?.(method)
       throw error
     }
   }
@@ -593,7 +593,7 @@ export function createV4WorkbenchResources(
 ): WorkbenchResourceProvider {
   return createRpcWorkbenchResourceProvider({
     call: (method, params, options) => transport.request(method, params, options),
-    supportsMethod: method => transport.supports(method),
-    markMethodUnavailable: method => transport.markUnsupported(method),
+    hasRpcMethod: method => transport.supports(method),
+    rememberUnsupportedMethod: method => transport.markUnsupported(method),
   })
 }

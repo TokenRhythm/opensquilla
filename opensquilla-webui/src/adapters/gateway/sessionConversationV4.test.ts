@@ -16,7 +16,13 @@ describe('SessionConversation v4 adapter', () => {
     request
       .mockResolvedValueOnce({ subscribed: true, hydration_complete: true })
       .mockResolvedValueOnce({ messages: [], has_more: false })
-      .mockResolvedValueOnce({ key: 'agent:main:webchat:test', events: [] })
+      .mockResolvedValueOnce({
+        key: 'agent:main:webchat:test',
+        events: [{
+          event: 'session.event.text_delta',
+          payload: { session_key: 'agent:main:webchat:test', text: 'hello' },
+        }],
+      })
 
     await api.subscribe({ key: 'agent:main:webchat:test', since_stream_seq: 4 })
     await api.history({
@@ -25,7 +31,7 @@ describe('SessionConversation v4 adapter', () => {
       includeCanonical: true,
       includeSummaries: false,
     })
-    await api.snapshot('agent:main:webchat:test')
+    const snapshot = await api.snapshot('agent:main:webchat:test')
 
     expect(request.mock.calls.map(([method, params]) => [method, params])).toEqual([
       ['sessions.messages.subscribe', { key: 'agent:main:webchat:test', since_stream_seq: 4 }],
@@ -37,6 +43,10 @@ describe('SessionConversation v4 adapter', () => {
       }],
       ['sessions.messages.snapshot', { key: 'agent:main:webchat:test' }],
     ])
+    expect(snapshot.events?.[0]).toMatchObject({
+      event: 'text-delta',
+      payload: { session_key: 'agent:main:webchat:test', text: 'hello' },
+    })
   })
 
   it('selects through-turn fork only when that capability is advertised', async () => {

@@ -1,9 +1,13 @@
 import type { RpcCallOptions, RpcEventHandler, RpcConnectionWaitOptions } from '@/lib/rpc'
 import type {
   ChatHistoryResponse,
+  SessionEventPayload,
+} from '@/types/chat'
+import type {
   SessionMessagesSnapshotResponse,
   SessionMessagesSubscribeResponse,
-} from '@/types/rpc'
+} from '@/modules/sessionConversation'
+import { conversationSemanticEventKind } from './conversationEventsV4'
 import type { PromptCacheKeepaliveStatus } from '@/types/promptCacheKeepalive'
 import type {
   RouteFeedbackRating,
@@ -76,6 +80,27 @@ function objectResult<T extends object>(value: unknown, method: string): T {
   return value as T
 }
 
+type WireSessionMessagesSnapshotResponse = Omit<SessionMessagesSnapshotResponse, 'events'> & {
+  events?: Array<{ event?: unknown, payload?: unknown }>
+}
+
+function semanticSnapshotResult(value: unknown): SessionMessagesSnapshotResponse {
+  const snapshot = objectResult<WireSessionMessagesSnapshotResponse>(value, METHODS.snapshot)
+  const { events, ...base } = snapshot
+  if (!Array.isArray(events)) return base
+  return {
+    ...base,
+    events: events.map(entry => ({
+      event: conversationSemanticEventKind(String(entry?.event || '')),
+      payload: (
+        entry?.payload && typeof entry.payload === 'object' && !Array.isArray(entry.payload)
+          ? entry.payload
+          : {}
+      ) as SessionEventPayload,
+    })),
+  }
+}
+
 function normalizeHistoryParams(request: SessionHistoryRequest): Record<string, unknown> {
   const params: Record<string, unknown> = {
     sessionKey: request.sessionKey,
@@ -88,7 +113,7 @@ function normalizeHistoryParams(request: SessionHistoryRequest): Record<string, 
   return params
 }
 
-function supportsMethod(
+function hasRpcMethod(
   rpc: SessionConversationRpcTransport,
   method: string,
 ): boolean {
@@ -127,9 +152,8 @@ export function createV4SessionConversation(
       METHODS.hydrate,
     ),
 
-    snapshot: async (key, options) => objectResult<SessionMessagesSnapshotResponse>(
+    snapshot: async (key, options) => semanticSnapshotResult(
       await request(METHODS.snapshot, { key }, options),
-      METHODS.snapshot,
     ),
 
     unsubscribe: async (key, options) => {
@@ -156,7 +180,7 @@ export function createV4SessionConversation(
       if (forkRequest.beforeMessageId) params.beforeMessageId = forkRequest.beforeMessageId
       if (forkRequest.throughTurnId) {
         params.throughTurnId = forkRequest.throughTurnId
-        const method = supportsMethod(rpc, METHODS.forkThroughTurn)
+        const method = hasRpcMethod(rpc, METHODS.forkThroughTurn)
           ? METHODS.forkThroughTurn
           : METHODS.fork
         return objectResult<SessionForkResult>(await request(method, params, options), method)
@@ -228,13 +252,10 @@ export function createV4SessionConversation(
       })
     },
 
-    supportsEvent(capability: 'turn-committed'): boolean {
-      return capability === 'turn-committed'
-        ? events.supports?.('session.event.turn_committed') !== false
-        : false
-    },
-
     supports(capability: SessionConversationCapability): boolean {
+      if (capability === 'turn-committed') {
+        return events.supports?.('session.event.turn_committed') !== false
+      }
       const method = capability === 'messages' ? METHODS.subscribe
         : capability === 'history' ? METHODS.history
           : capability === 'preview' ? METHODS.preview
@@ -246,54 +267,7 @@ export function createV4SessionConversation(
                       : capability === 'slash-catalog' ? METHODS.commands
                         : capability === 'route-feedback' ? METHODS.feedback
                           : METHODS.promptStatus
-      return supportsMethod(rpc, method)
+      return hasRpcMethod(rpc, method)
     },
   }
-}
-
-/**
- * Test/legacy embedding bridge. Production composition injects the typed
- * adapter from `gatewayAdapters`; this bridge keeps older composable fixtures
- * source-compatible while they migrate to the domain seam.
- */
-export function createLegacySessionConversation(source: {
-  call<T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions): Promise<T>
-  waitForConnection?: (
-    timeoutMs?: number,
-    signal?: AbortSignal,
-    actions?: RpcConnectionWaitOptions,
-  ) => Promise<void>
-  on?: (event: string, handler: RpcEventHandler) => (() => void)
-  supportsMethod?: (method: string) => boolean
-  supportsEvent?: (event: string) => boolean
-}): SessionConversation {
-  return createV4SessionConversation(
-    {
-      request: (method, params, options) => options === undefined
-        ? source.call(method, params)
-        : source.call(method, params, options),
-      ready: options => {
-        if (!source.waitForConnection) return Promise.resolve()
-        if (!options) {
-          return source.waitForConnection()
-        }
-        return source.waitForConnection(
-          options.timeoutMs,
-          options.signal,
-          {
-            timeoutAction: 'reject',
-            abortAction: 'reject',
-          },
-        )
-      },
-      supports: source.supportsMethod,
-    },
-    {
-      subscribe: (event, handler) => {
-        const close = source.on?.(event, handler)
-        return { close: close ?? (() => {}) }
-      },
-      supports: source.supportsEvent,
-    },
-  )
 }

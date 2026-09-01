@@ -525,7 +525,7 @@ describe('RpcClient', () => {
     const timeoutClient = new RpcClient()
     timeoutClient.connect('ws://rpc.test')
     const timedWait = timeoutClient
-      .waitForConnection(25)
+      .ready(25)
       .catch((error: unknown) => error)
 
     await vi.advanceTimersByTimeAsync(25)
@@ -533,7 +533,7 @@ describe('RpcClient', () => {
     expect(timeoutError).toBeInstanceOf(RpcTimeoutError)
     expect(timeoutError).toMatchObject({
       code: 'RPC_TIMEOUT',
-      method: 'waitForConnection',
+      method: 'ready',
       timeoutMs: 25,
     })
     timeoutClient.disconnect()
@@ -542,7 +542,7 @@ describe('RpcClient', () => {
     const controller = new AbortController()
     abortClient.connect('ws://rpc.test')
     const abortedWait = abortClient
-      .waitForConnection(30_000, controller.signal)
+      .ready(30_000, controller.signal)
       .catch((error: unknown) => error)
     controller.abort()
 
@@ -550,7 +550,7 @@ describe('RpcClient', () => {
     expect(abortError).toBeInstanceOf(RpcAbortError)
     expect(abortError).toMatchObject({
       code: 'RPC_ABORTED',
-      method: 'waitForConnection',
+      method: 'ready',
     })
     abortClient.disconnect()
   })
@@ -563,7 +563,7 @@ describe('RpcClient', () => {
     controller.abort()
 
     await expect(
-      client.waitForConnection(
+      client.ready(
         30_000,
         controller.signal,
         { abortAction: 'reconnect' },
@@ -581,7 +581,7 @@ describe('RpcClient', () => {
     establishConnection(firstSocket)
     firstSocket.close()
 
-    const timedWait = client.waitForConnection(
+    const timedWait = client.ready(
       1_025,
       undefined,
       { timeoutAction: 'reconnect' },
@@ -600,7 +600,7 @@ describe('RpcClient', () => {
     const retrySocket = MockWebSocket.instances[2]
     expect(retrySocket).toBeDefined()
     establishConnection(retrySocket)
-    await expect(client.waitForConnection(25)).resolves.toBeUndefined()
+    await expect(client.ready(25)).resolves.toBeUndefined()
     client.disconnect()
   })
 
@@ -1113,7 +1113,7 @@ describe('RpcClient', () => {
     client.connect('ws://rpc.test')
     const firstSocket = MockWebSocket.instances[0]
     const timedWait = client
-      .waitForConnection(
+      .ready(
         25,
         undefined,
         { timeoutAction: 'reconnect' },
@@ -1129,7 +1129,7 @@ describe('RpcClient', () => {
 
     const secondSocket = MockWebSocket.instances[1]
     establishConnection(secondSocket)
-    await expect(client.waitForConnection(25)).resolves.toBeUndefined()
+    await expect(client.ready(25)).resolves.toBeUndefined()
     expect(client.state).toBe('connected')
     client.disconnect()
   })
