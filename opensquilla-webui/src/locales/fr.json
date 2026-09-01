@@ -559,7 +559,7 @@
       "builtin": "Intégré",
       "actions": { "add": "Ajouter", "remove": "Retirer", "retry": "Réessayer", "copy": "Copier", "saving": "Enregistrement…", "redetect": "Détecter à nouveau" },
       "mode": {
-        "title": "Mode d’accès par défaut", "description": "Choisissez le mode initial des nouvelles tâches. Le mode sûr reste indisponible si la vérification échoue.",
+        "title": "Mode d’accès par défaut", "description": "Définissez le mode d’accès global. La première sélection du mode sûr ouvre la configuration du bac à sable. Ce mode est désactivé si l’initialisation échoue ou si le bac à sable n’est pas pris en charge.",
         "default": "Mode par défaut", "safe": "Sûr", "full": "Accès complet", "resetWarning": "Réafficher l’avertissement au démarrage"
       },
       "setup": {

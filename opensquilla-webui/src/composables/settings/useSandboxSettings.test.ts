@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { EffectScope } from 'vue'
-import type { SandboxPolicy, SandboxRuntimePackStatus } from '@/types/sandbox'
+import type {
+  SandboxPolicy,
+  SandboxRuntimePackStatus,
+  SandboxSetupStatusPayload,
+} from '@/types/sandbox'
 
 const policy: SandboxPolicy = {
   schemaVersion: 2,
@@ -71,7 +75,8 @@ async function createSandboxSettings(options: {
   desktop?: boolean
   capabilityError?: boolean
   capabilityResult?: unknown
-  setupState?: 'not_setup' | 'ready'
+  setupState?: SandboxSetupStatusPayload['state']
+  setupStatus?: () => SandboxSetupStatusPayload
   policyUpdate?: (params: Record<string, unknown>) => unknown | Promise<unknown>
   runModeSetError?: Error
   runtimeStatus?: unknown | (() => unknown | Promise<unknown>)
@@ -108,6 +113,7 @@ async function createSandboxSettings(options: {
       return options.capabilityResult ?? unavailableReport
     }
     if (method === 'sandbox.setup.status') {
+      if (options.setupStatus) return options.setupStatus()
       const state = options.setupState ?? 'not_setup'
       return {
         state,
@@ -174,6 +180,19 @@ afterEach(() => {
 })
 
 describe('useSandboxSettings auto-save', () => {
+  it.each(['failed', 'unavailable', 'setting_up'] as const)(
+    'does not offer first-time setup for %s', async setupState => {
+      const { call, scope, settings } = await createSandboxSettings({ desktop: true, setupState })
+      await settings.load()
+      await settle()
+      expect(settings.sandboxSetupStatus.value?.state).toBe(setupState)
+      expect(settings.canRequestSandboxSetup.value).toBe(false)
+      expect(await settings.ensureSandboxSetupForSafeMode()).toBe(false)
+      expect(call.mock.calls.some(([method]) => method === 'sandbox.setup.ensure')).toBe(false)
+      scope.stop()
+    },
+  )
+
   it('persists a default mode selection without a separate save action', async () => {
     const { call, scope, settings } = await createSandboxSettings()
     await settings.load()
@@ -379,6 +398,100 @@ describe('useSandboxSettings auto-save', () => {
 })
 
 describe('useSandboxSettings capability checks', () => {
+  it.each(['ready', 'failed'] as const)(
+    'updates a pending startup to %s without reopening settings or retrying initialization',
+    async (finalState) => {
+      vi.useFakeTimers()
+      let state: SandboxSetupStatusPayload['state'] = 'setting_up'
+      const { call, scope, settings } = await createSandboxSettings({
+        desktop: true,
+        setupStatus: () => ({ state, platform: 'win32', message: '', requiresAdmin: false }),
+        capabilityResult: {
+          ...unavailableReport, available: true, code: 'ready', probeVersion: 0, capabilities: [],
+        },
+      })
+      await settings.load()
+      await settle()
+      expect(settings.sandboxSetupStatus.value?.state).toBe('setting_up')
+      state = finalState
+      await vi.advanceTimersByTimeAsync(1_000)
+      await settle()
+      expect(settings.sandboxSetupStatus.value?.state).toBe(finalState)
+      expect(settings.capability.value?.available === true).toBe(finalState === 'ready')
+      const statusCalls = () => call.mock.calls.filter(([method]) => method === 'sandbox.setup.status')
+      const completedReads = statusCalls().length
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(statusCalls()).toHaveLength(completedReads)
+      expect(call.mock.calls.some(([method]) => method === 'sandbox.setup.ensure')).toBe(false)
+      scope.stop()
+    },
+  )
+
+  it('stops reading pending startup status when settings closes', async () => {
+    vi.useFakeTimers()
+    const { call, scope, settings } = await createSandboxSettings({
+      desktop: true, setupState: 'setting_up',
+    })
+    await settings.load()
+    await settle()
+    scope.stop()
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(call.mock.calls.filter(([method]) => method === 'sandbox.setup.status')).toHaveLength(1)
+  })
+
+  it('follows pending startup in a browser without initiating setup', async () => {
+    vi.useFakeTimers()
+    let initialized = false
+    const { call, scope, settings } = await createSandboxSettings({
+      get capabilityResult() {
+        return {
+          ...unavailableReport,
+          available: initialized,
+          code: initialized ? 'ready' : 'setting_up',
+          probeVersion: 0,
+        }
+      },
+    })
+    await settings.load()
+    await settle()
+    expect(settings.capability.value?.available).toBe(false)
+    initialized = true
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(settings.capability.value?.available).toBe(true)
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(capabilityCalls(call)).toHaveLength(2)
+    expect(call.mock.calls.some(([method]) => method === 'sandbox.setup.ensure')).toBe(false)
+    scope.stop()
+  })
+
+  it('keeps following pending startup across a transient connection failure', async () => {
+    vi.useFakeTimers()
+    let state: SandboxSetupStatusPayload['state'] = 'setting_up'
+    let disconnected = false
+    const { call, scope, settings } = await createSandboxSettings({
+      desktop: true,
+      setupStatus: () => {
+        if (disconnected) throw new Error('connection interrupted')
+        return { state, platform: 'win32', message: '', requiresAdmin: false }
+      },
+      get capabilityResult() {
+        if (disconnected) throw new Error('connection interrupted')
+        return { ...unavailableReport, available: true, code: 'ready', probeVersion: 0 }
+      },
+    })
+    await settings.load()
+    await settle()
+    disconnected = true
+    await vi.advanceTimersByTimeAsync(1_000)
+    disconnected = false
+    state = 'ready'
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(settings.sandboxSetupStatus.value?.state).toBe('ready')
+    expect(settings.capability.value?.available).toBe(true)
+    expect(call.mock.calls.some(([method]) => method === 'sandbox.setup.ensure')).toBe(false)
+    scope.stop()
+  })
+
   it.each([
     ['unavailable report', { capabilityResult: unavailableReport }],
     ['failed report', { capabilityError: true }],

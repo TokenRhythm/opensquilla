@@ -539,7 +539,11 @@ class GoalService:
             ResolvedMode,
             resolve_mode,
         )
-        from opensquilla.sandbox.run_mode_policy import coerce_run_mode_for_principal
+        from opensquilla.sandbox.run_context import resolve_default_run_mode
+        from opensquilla.sandbox.run_mode_policy import (
+            coerce_run_mode_for_principal,
+            principal_has_host_execute,
+        )
         from opensquilla.sandbox.setup_runtime import current_sandbox_capability_report
 
         agent_id = str(getattr(session, "agent_id", "") or parse_agent_id(session.session_key))
@@ -558,6 +562,23 @@ class GoalService:
                 owner=bool(getattr(principal, "is_owner", False)),
             ) from exc
 
+        accepted_run_mode_override = None
+        if principal_has_host_execute(principal):
+            global_mode, global_source = await resolve_default_run_mode(
+                self._session_manager,
+                self._config,
+            )
+            accepted_run_mode_override = AcceptedRunModeOverride(
+                run_mode=global_mode,
+                run_mode_source="operator_default",
+                source=global_source,
+            )
+            run_context = replace(
+                run_context,
+                run_mode=global_mode,
+                run_mode_source="operator_default",
+                source=global_source,
+            )
         run_context = replace(
             run_context,
             run_mode=coerce_run_mode_for_principal(run_context.run_mode, principal),
@@ -579,18 +600,6 @@ class GoalService:
                     details={"reason": exc.code, **capability.to_payload()},
                     accepted=False,
                 ) from exc
-        accepted_run_mode_override = None
-        if resolution.effective_mode is not run_context.run_mode:
-            accepted_run_mode_override = AcceptedRunModeOverride(
-                run_mode=resolution.effective_mode,
-                run_mode_source=run_context.run_mode_source,
-                source="capability_fallback",
-            )
-            run_context = replace(
-                run_context,
-                run_mode=resolution.effective_mode,
-                source="capability_fallback",
-            )
         apply_run_context_route_metadata(
             envelope,
             run_context,

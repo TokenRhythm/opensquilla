@@ -1114,7 +1114,7 @@ async def _require_sandbox_setup_ready_for_mode(ctx: RpcContext, run_mode: Any) 
     if not report.available:
         raise RpcHandlerError(
             "SANDBOX_CAPABILITY_UNAVAILABLE",
-            "Safe mode cannot be enabled because live sandbox verification failed.",
+            "Safe mode cannot be enabled because sandbox initialization is not ready.",
             details=report.to_payload(),
         )
 

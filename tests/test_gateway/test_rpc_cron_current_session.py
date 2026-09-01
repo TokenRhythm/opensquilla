@@ -182,6 +182,12 @@ class _FakeTaskRuntime:
         return self.record
 
 
+class _RejectingTaskRuntime(_FakeTaskRuntime):
+    async def validate_acceptance(self, route_envelope, accepted_run_mode_override=None):
+        del route_envelope, accepted_run_mode_override
+        raise RuntimeError("sandbox_unavailable")
+
+
 class _RecordingDeliveryChain:
     def __init__(self) -> None:
         self.deliveries = []
@@ -713,6 +719,33 @@ async def test_current_session_agent_run_uses_bound_session_transcript_without_f
         {"role": "assistant", "content": "drink logged"},
     ]
     assert forward_calls == []
+
+
+@pytest.mark.asyncio
+async def test_cron_safe_admission_failure_happens_before_session_or_message_persistence() -> None:
+    session_manager = _FakeSessionManager()
+    task_runtime = _RejectingTaskRuntime(SimpleNamespace(status="failed"))
+    job = CronJob(
+        id="safe-unavailable",
+        name="Safe unavailable",
+        handler_key="agent_run",
+        payload={"kind": AGENT_TURN_KIND, "task": "do not accept", "agent_id": "main"},
+        session_target=SessionTarget.CURRENT,
+        session_key=SESSION_KEY,
+        run_mode="safe",
+    )
+    handler = make_agent_run_handler(
+        DeliveryChain(),
+        task_runtime_ref=lambda: task_runtime,
+        session_manager_ref=lambda: session_manager,
+    )
+
+    with pytest.raises(RuntimeError, match="sandbox_unavailable"):
+        await handler(job)
+
+    assert session_manager.created == []
+    assert await session_manager.read_transcript(SESSION_KEY) == []
+    assert task_runtime.enqueued == []
 
 
 @pytest.mark.asyncio

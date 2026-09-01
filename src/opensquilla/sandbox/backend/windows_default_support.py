@@ -50,6 +50,7 @@ def probe_windows_default_support(
     *,
     home: Path | None = None,
     proxy_ports: tuple[int, ...] = (),
+    verify_runtime: bool = True,
 ) -> WindowsDefaultSupport:
     is_windows = sys.platform.startswith("win")
     if not is_windows:
@@ -69,8 +70,20 @@ def probe_windows_default_support(
     acl_ready = ctypes_ready and _acl_api_available()
     marker_path = default_setup_marker_path(home)
     setup_ready = setup_marker_is_current(marker_path)
-    identity_ready = setup_ready and _offline_identity_ready(marker_path)
-    storage_ready = setup_ready and _persistent_storage_ready(marker_path)
+    if verify_runtime:
+        identity_ready = setup_ready and _offline_identity_ready(marker_path)
+        storage_ready = setup_ready and _persistent_storage_ready(marker_path)
+    else:
+        marker = read_setup_marker(marker_path)
+        network = marker.network if marker is not None else None
+        identity_ready = bool(
+            setup_ready
+            and network is not None
+            and network.offline_user_sid
+            and network.offline_username
+            and network.protected_password
+        )
+        storage_ready = setup_ready and _persistent_storage_ready(marker_path, verify_runtime=False)
     if not proxy_ports:
         marker = read_setup_marker(marker_path)
         if marker is not None and marker.network is not None:
@@ -97,7 +110,7 @@ def _offline_identity_ready(marker_path: Path) -> bool:
     return setup_marker_identity_ready(marker_path)
 
 
-def _persistent_storage_ready(marker_path: Path) -> bool:
+def _persistent_storage_ready(marker_path: Path, *, verify_runtime: bool = True) -> bool:
     opensquilla_root = marker_path.parent.parent
     roots = (
         marker_path.parent,
@@ -106,6 +119,8 @@ def _persistent_storage_ready(marker_path: Path) -> bool:
     )
     if any(not root.is_dir() or not os.access(root, os.W_OK) for root in roots):
         return False
+    if not verify_runtime:
+        return True
     for candidate in (
         marker_path.parent / ".cap_sids.json.lock",
         marker_path.parent / "cap_sids.json",

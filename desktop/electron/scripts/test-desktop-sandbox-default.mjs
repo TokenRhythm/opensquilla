@@ -4,8 +4,8 @@ import { freshDesktopSandboxConfigLines } from '../dist/desktop-sandbox-default.
 
 assert.deepEqual(
   freshDesktopSandboxConfigLines(null, 'darwin'),
-  ['[sandbox]', 'run_mode = "safe"', ''],
-  'a new macOS profile should start in Safe mode',
+  ['[sandbox]', 'run_mode = "full"', ''],
+  'a new macOS profile should start in Full access',
 )
 
 assert.deepEqual(

@@ -1324,6 +1324,7 @@
       "tests/test_sandbox/test_setup_runtime.py",
       "tests/test_sandbox/test_setup_state.py",
       "tests/test_sandbox/test_stale_approval_authority.py",
+      "tests/test_sandbox/test_startup_without_canaries.py",
       "tests/test_sandbox/test_tool_runtime_descriptors.py",
       "tests/test_sandbox/test_trusted_sandbox_execution.py",
       "tests/test_sandbox/test_windows_default_backend.py",

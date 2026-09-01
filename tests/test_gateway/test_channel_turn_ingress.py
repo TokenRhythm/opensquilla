@@ -21,6 +21,7 @@ from opensquilla.gateway._debounce import _DefaultDebounceCoordinator
 from opensquilla.gateway.attachment_ingest import AttachmentIngestResult
 from opensquilla.gateway.channel_dispatch import (
     _accept_channel_runtime_turn,
+    _apply_saved_channel_run_context,
     _channel_ingress_identity,
     _channel_native_request_id,
     _deliver_runtime_channel_reply,
@@ -386,6 +387,70 @@ async def test_channel_turn_atomically_creates_delivery_session_message_task_and
             "agent_tasks": 1,
             "turn_ingress_receipts": 1,
         }
+
+
+@pytest.mark.asyncio
+async def test_channel_safe_admission_failure_leaves_no_durable_state(
+    tmp_path: Path,
+) -> None:
+    async with _open_stack(tmp_path / "sessions.db") as stack:
+        from opensquilla.sandbox.mode_resolver import ModeResolutionError
+
+        async def reject_safe(_envelope: Any, _override: Any | None) -> None:
+            raise ModeResolutionError("sandbox_unavailable")
+
+        stack.runtime._acceptance_validator = reject_safe
+
+        with pytest.raises(ModeResolutionError, match="sandbox_unavailable"):
+            await _accept(
+                stack,
+                "must not be accepted without a sandbox",
+                config=GatewayConfig(sandbox={"run_mode": "safe"}),
+            )
+
+        assert _table_counts(stack.db_path) == {
+            "sessions": 0,
+            "transcript_entries": 0,
+            "agent_tasks": 0,
+            "turn_ingress_receipts": 0,
+        }
+        _assert_no_runtime_acceptance_state(stack.runtime)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("principal_is_owner", "saved_mode", "expected_mode"),
+    [(True, "safe", "full"), (False, "full", "safe")],
+)
+async def test_channel_next_turn_uses_global_mode_with_non_owner_safe_floor(
+    tmp_path: Path,
+    principal_is_owner: bool,
+    saved_mode: str,
+    expected_mode: str,
+) -> None:
+    async with _open_stack(tmp_path / "sessions.db") as stack:
+        await stack.manager.create(
+            SESSION_KEY,
+            agent_id="main",
+            origin={
+                "sandbox_run_context": {
+                    "run_mode": saved_mode,
+                    "workspace": None,
+                }
+            },
+        )
+        msg = _message("use the current global mode")
+        route = _route(msg)
+
+        await _apply_saved_channel_run_context(
+            route,
+            session_manager=stack.manager,
+            config=GatewayConfig(sandbox={"run_mode": "full"}),
+            workspace_dir=None,
+            principal_is_owner=principal_is_owner,
+        )
+
+        assert route.metadata["run_mode"] == expected_mode
 
 
 @pytest.mark.asyncio
