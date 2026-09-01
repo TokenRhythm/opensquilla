@@ -1,4 +1,4 @@
-import { inject, reactive } from 'vue'
+import { hasInjectionContext, inject, reactive } from 'vue'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
 import { SESSION_CONVERSATION_KEY, type SessionConversation } from '@/modules/sessionConversation'
@@ -16,9 +16,16 @@ const inFlight = reactive(new Set<string>())
 
 export function useChatRouteFeedback(conversation?: SessionConversation) {
   const { pushToast } = useToasts()
-  const sessionConversation = conversation
-    ?? inject(SESSION_CONVERSATION_KEY)
-    ?? createLegacySessionConversation(useRpcStore() as Parameters<typeof createLegacySessionConversation>[0])
+  let sessionConversation = conversation
+    ?? (hasInjectionContext() ? inject(SESSION_CONVERSATION_KEY, null) : null)
+
+  function resolveConversation(): SessionConversation {
+    if (sessionConversation) return sessionConversation
+    sessionConversation = createLegacySessionConversation(
+      useRpcStore() as Parameters<typeof createLegacySessionConversation>[0],
+    )
+    return sessionConversation
+  }
 
   function ratingFor(decisionId: string | undefined): RouteFeedbackRating | undefined {
     return decisionId ? selected.get(decisionId) : undefined
@@ -40,7 +47,7 @@ export function useChatRouteFeedback(conversation?: SessionConversation) {
 
     inFlight.add(decisionId)
     try {
-      const res = await sessionConversation.submitRouteFeedback(decisionId, effective)
+      const res = await resolveConversation().submitRouteFeedback(decisionId, effective)
       if (!res?.accepted) {
         rollback(decisionId, previous)
         pushToast(
