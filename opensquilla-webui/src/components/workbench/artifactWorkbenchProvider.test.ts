@@ -16,7 +16,31 @@ import type {
   WorkbenchPanelRenderState,
   WorkbenchRuntimeContext,
 } from '@/workbench/types'
-import { createArtifactWorkbenchDefinitions } from './artifactWorkbenchProvider'
+import type { ArtifactContentAccess } from '@/modules/artifactWorkbench'
+import { createV4ArtifactContentAccess } from '@/adapters/gateway/artifactAccessV4'
+import {
+  createArtifactWorkbenchDefinitions as createDefinitions,
+  type ArtifactWorkbenchProviderOptions,
+} from './artifactWorkbenchProvider'
+
+const testArtifactContent: ArtifactContentAccess = {
+  ...createV4ArtifactContentAccess(),
+  fetchAttachment: vi.fn(async () => ({
+    ok: false as const,
+    status: 0,
+    source: 'none' as const,
+    url: '',
+    message: 'not used',
+  })),
+  uploadAttachment: vi.fn(async () => ({ fileUuid: 'test-file' })),
+}
+
+function createArtifactWorkbenchDefinitions(
+  options: Omit<ArtifactWorkbenchProviderOptions, 'artifactContent'>
+    & Partial<Pick<ArtifactWorkbenchProviderOptions, 'artifactContent'>>,
+) {
+  return createDefinitions({ artifactContent: testArtifactContent, ...options })
+}
 
 const artifact: ArtifactPayload = {
   id: 'artifact-1',

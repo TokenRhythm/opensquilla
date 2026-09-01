@@ -11,12 +11,10 @@ describe('ChatView prompt annotation focus and reuse', () => {
     expect(start).toBeGreaterThan(-1)
     expect(source).toContain('appStore.features.documentWorkbenchResources === true')
     expect(source).toContain('|| promptAnnotationsEnabled.value')
-    expect(source).toContain("rpc.supportsMethod('workbench.resources.list')")
-    expect(source).toContain("rpc.supportsMethod('workbench.resources.get')")
     expect(source).toContain('const attachmentWorkbenchPreviewEnabled = computed(')
-    expect(source).toContain("rpc.supportsMethod('workbench.resources.get')")
+    expect(source).toContain('artifactWorkbench.resources.available()')
     expect(source).toContain('const attachmentWorkbenchEditEnabled = computed(')
-    expect(source).toContain("rpc.supportsMethod('documents.import')")
+    expect(source).toContain('artifactWorkbench.resources.canImportDocuments()')
     expect(chatViewSource).toContain(
       ':workbench-resource-preview-enabled="attachmentWorkbenchPreviewEnabled"',
     )

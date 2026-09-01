@@ -49,6 +49,7 @@ describe('Gateway Adapter composition', () => {
       'cronScheduler',
       'channelAdministration',
       'channelSetup',
+      'artifactWorkbench',
     ])
     expect(adapters).not.toHaveProperty('rpc')
     expect(adapters).not.toHaveProperty('events')

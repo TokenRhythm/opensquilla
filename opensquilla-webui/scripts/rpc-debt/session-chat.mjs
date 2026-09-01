@@ -3,16 +3,8 @@ export const lane = 'session-chat'
 export const debt = {
   'src/composables/chat/sessionBootstrapAdmission.ts': { waitForConnection: 2 },
   'src/composables/chat/useChatApprovals.ts': {},
-  'src/composables/chat/useChatAttachments.ts': {
-    httpRequest: 1,
-    httpApiEndpoint: 1,
-    httpAuthToken: 1,
-    httpAuthorizationHeader: 1,
-  },
-  'src/composables/chat/useArtifactPreview.ts': {
-    httpRequest: 1,
-    httpApiEndpoint: 1,
-  },
+  'src/composables/chat/useChatAttachments.ts': {},
+  'src/composables/chat/useArtifactPreview.ts': {},
   'src/composables/chat/useChatElevatedMode.ts': {
     httpRequest: 1,
     httpApiEndpoint: 1,
@@ -35,28 +27,9 @@ export const debt = {
     httpAuthorizationHeader: 1,
   },
   'src/composables/sessions/useSessionInspect.ts': {},
-  'src/utils/chat/artifactAccess.ts': {
-    httpRequest: 2,
-    httpApiEndpoint: 2,
-    httpAuthToken: 2,
-    httpAuthorizationHeader: 2,
-    httpSessionKeyHeader: 2,
-  },
-  'src/utils/chat/attachmentAccess.ts': {
-    httpRequest: 1,
-    httpApiEndpoint: 1,
-    httpAuthToken: 1,
-    httpAuthorizationHeader: 1,
-    httpSessionKeyHeader: 1,
-  },
+  'src/utils/chat/artifactAccess.ts': {},
+  'src/utils/chat/attachmentAccess.ts': {},
   'src/views/ChatView.vue': {
-    // Workbench/document capability probes and attachment HTTP remain owned by
-    // the ArtifactWorkbench slice; all session transport calls are migrated.
-    supportsMethod: 3,
-    httpRequest: 1,
-    httpApiEndpoint: 1,
-    httpAuthToken: 1,
-    httpAuthorizationHeader: 1,
-    httpSessionKeyHeader: 1,
+    // Session transport and Workbench capability probes are domain-owned.
   },
 }

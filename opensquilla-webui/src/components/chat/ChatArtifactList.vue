@@ -147,7 +147,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onUnmounted, watch } from 'vue'
+import { computed, inject, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ArtifactChip from '@/components/chat/ArtifactChip.vue'
@@ -161,11 +161,9 @@ import {
   type ArtifactPreviewState,
 } from '@/composables/chat/useArtifactPreview'
 import {
-  fetchArtifactBlob,
   isActiveDocumentArtifactCandidate,
-  openArtifactBlobUrl,
-  openArtifactViaGateway,
 } from '@/utils/chat/artifactAccess'
+import { ARTIFACT_WORKBENCH_KEY } from '@/modules/artifactWorkbench'
 import { usePlatform } from '@/platform'
 import { useRpcStore } from '@/stores/rpc'
 import {
@@ -198,6 +196,9 @@ const { t } = useI18n()
 const { pushToast } = useToasts()
 const platform = usePlatform()
 const rpcStore = useRpcStore()
+const injectedArtifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
+if (!injectedArtifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
+const artifactWorkbench = injectedArtifactWorkbench
 
 const visualArtifacts = computed(() => props.artifacts.filter(artifact => artifactCategory(artifact) === 'visual'))
 const audioArtifacts = computed(() => props.artifacts.filter(artifact => artifactCategory(artifact) === 'audio'))
@@ -316,10 +317,8 @@ async function openFile(artifact: ArtifactPayload) {
     return
   }
   if (platform.capabilities.canOpenArtifactsNatively && platform.files.openArtifact) {
-    const fetched = await fetchArtifactBlob(artifact, {
-      baseOrigin: window.location.origin,
+    const fetched = await artifactWorkbench.content.fetchArtifact(artifact, {
       sessionKey: props.sessionKey,
-      authToken: props.authToken,
     })
     if (!fetched.ok) {
       pushToast(fetched.message, { tone: 'danger' })
@@ -339,20 +338,16 @@ async function openFile(artifact: ArtifactPayload) {
   }
 
   if (isActiveDocumentArtifactCandidate(artifact)) {
-    const result = await openArtifactViaGateway(artifact, {
-      baseOrigin: window.location.origin,
+    const result = await artifactWorkbench.content.openArtifact(artifact, {
       sessionKey: props.sessionKey,
-      authToken: props.authToken,
     })
     if (result.ok) return
     pushToast(result.message, { tone: 'danger' })
     return
   }
 
-  const result = await openArtifactBlobUrl(artifact, {
-    baseOrigin: window.location.origin,
+  const result = await artifactWorkbench.content.openArtifactBlob(artifact, {
     sessionKey: props.sessionKey,
-    authToken: props.authToken,
   })
   if (result.ok) return
   pushToast(result.message, { tone: 'danger' })
