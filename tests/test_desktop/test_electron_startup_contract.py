@@ -3225,6 +3225,8 @@ def test_desktop_orphan_recovery_has_a_real_electron_process_flow() -> None:
     )
     assert "firstMain.kill('SIGKILL')" in script
     assert "verifyDesktopGatewayOwnership(firstRecord)" in script
+    assert "'orphan Desktop Gateway ownership verification'" in script
+    assert "electronChildCleanup.remainingMs('verify-orphan-survived')" in script
     assert "await launchDesktop(" in script
     assert "loaded.record.pid === firstRecord.pid" in script
     assert "verifyDesktopGatewayOwnership(loaded.record)" in script
