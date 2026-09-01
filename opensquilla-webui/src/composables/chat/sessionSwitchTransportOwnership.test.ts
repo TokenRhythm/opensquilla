@@ -13,27 +13,15 @@ import { useChatSessionBootstrap } from './useChatSessionBootstrap'
 import { useChatSessionRuntime } from './useChatSessionRuntime'
 import {
   useChatSessionSubscription as useProductionChatSessionSubscription,
-  type UseChatSessionSubscriptionOptions as ProductionSubscriptionOptions,
 } from './useChatSessionSubscription'
+import type { SessionBootstrapPhaseContext } from './sessionBootstrapContract'
+import { createV4SessionReadPort } from '@/adapters/gateway/sessionReadPortV4'
+import { createConversationRuntime } from '@/modules/conversationRuntime'
+import { createConversationSubscriptionLifecycle } from '@/modules/conversationSubscriptionLifecycle'
 import {
-  gatewayAccessFromTestRpc,
-  sessionConversationFromTestRpc,
-  type SessionConversationTestRpc,
-} from '@/testing/sessionConversation.test-helper'
-
-type UseChatSessionSubscriptionOptions = Omit<
-  ProductionSubscriptionOptions,
-  'sessionConversation' | 'gatewayAccess'
-> & { rpc: SessionConversationTestRpc }
-
-function useChatSessionSubscription(options: UseChatSessionSubscriptionOptions) {
-  const { rpc, ...domainOptions } = options
-  return useProductionChatSessionSubscription({
-    ...domainOptions,
-    sessionConversation: sessionConversationFromTestRpc(rpc),
-    gatewayAccess: gatewayAccessFromTestRpc(rpc),
-  })
-}
+  createSessionReadLifecycle,
+  type SessionReadPortLease,
+} from '@/modules/sessionReadLifecycle'
 
 const SESSION_A = 'agent:main:webchat:a'
 const SESSION_B = 'agent:main:webchat:b'
@@ -146,13 +134,34 @@ function subscribePayload(
   overrides: Record<string, unknown> = {},
 ) {
   return {
+    workspaceId: null,
+    projectWorkspace: { marker },
+    projectWorkspaceDeferred: false,
+    active_task_group_ids: [],
+    run_mode_lock: { locked: false },
+    pendingUserInputs: [],
+    collaboration: null,
+    routing: null,
+    currentPlan: null,
+    activePlanRun: null,
+    goal: null,
+    goalSnapshotStreamSeq: null,
+    tasks: [],
+    active_task: null,
+    last_task: null,
+    queued_task_ids: [],
+    epoch: null,
+    deferred_fields: [],
     key,
     marker,
     subscribed: true,
     hydration_complete: true,
     run_status: 'idle',
+    stream_generation: 'test-stream-generation',
     current_stream_seq: 0,
     replay_complete: true,
+    replay_gap_reason: null,
+    replayed_count: 0,
     ...overrides,
   }
 }
@@ -161,8 +170,29 @@ function snapshotPayload(key: string, marker = key) {
   return {
     key,
     marker,
-    events: [],
+    task_id: null,
+    stream_generation: 'test-stream-generation',
+    events: [{
+      event: 'session.event.state_changed',
+      payload: { marker },
+    }],
     current_stream_seq: 0,
+  }
+}
+
+function historyPayload() {
+  return {
+    messages: [],
+    has_more: false,
+    oldest_cursor: null,
+    newest_cursor: null,
+    history_scope: 'complete',
+    loaded_count: 0,
+    page_size: 100,
+    canonical_available: true,
+    canonical_complete: true,
+    compaction_summaries: [],
+    turn_outcomes: [],
   }
 }
 
@@ -227,24 +257,43 @@ function createHarness(options: {
   const metadataErrors: string[] = []
   let metadataGeneration = 0
 
-  const subscriptionRpc: UseChatSessionSubscriptionOptions['rpc'] = {
-    get connectionGeneration() { return rpc.connectionGeneration },
-    get policy() { return rpc.policy },
-    ready: (timeoutMs, signal, actions) => (
-      rpc.ready(timeoutMs, signal, actions)
-    ),
-    call: <T = unknown>(
-      method: string,
-      params?: Record<string, unknown>,
-      callOptions?: RpcCallOptions,
-    ) => rpc.call(method, params, callOptions) as Promise<T>,
-    recoverConnectionGeneration: (generation, reason) => (
-      rpc.recoverConnectionGeneration(generation, reason)
-    ),
-  }
+  const conversationRuntime = createConversationRuntime()
+  const sessionReadLifecycle = createSessionReadLifecycle({
+    port: createV4SessionReadPort({
+      request: <T = unknown>(method: string, params?: Record<string, unknown>, callOptions?: RpcCallOptions) => {
+        const key = String(params?.key ?? params?.sessionKey ?? sessionKey.value)
+        if (method === 'sessions.messages.snapshot' && !options.snapshots) {
+          callOptions?.onSent?.(rpc.connectionGeneration)
+          return Promise.resolve(snapshotPayload(key) as T)
+        }
+        if (method === 'chat.history') {
+          callOptions?.onSent?.(rpc.connectionGeneration)
+          return Promise.resolve(historyPayload() as T)
+        }
+        return rpc.call(method, params, callOptions) as Promise<T>
+      },
+      ready: readyOptions => rpc.ready(
+        readyOptions?.timeoutMs,
+        readyOptions?.signal,
+        {
+          timeoutAction: readyOptions?.timeoutAction,
+          abortAction: readyOptions?.abortAction,
+        },
+      ),
+      get generation() { return rpc.connectionGeneration },
+    }, {
+      concurrentHistoryReads: () => {
+        const methods = rpc.policy?.concurrent_optional_read_methods
+        return Array.isArray(methods) && methods.includes('chat.history')
+      },
+    }),
+    runtime: conversationRuntime,
+    subscriptions: createConversationSubscriptionLifecycle<SessionReadPortLease>(),
+  })
 
-  const subscription = useChatSessionSubscription({
-    rpc: subscriptionRpc,
+  const subscription = useProductionChatSessionSubscription({
+    sessionReadLeaseReader: sessionReadLifecycle,
+    conversationRuntime,
     sessionKey,
     lastStreamSeq,
     runStatus,
@@ -266,28 +315,40 @@ function createHarness(options: {
     },
     onSessionMetadataError: key => { metadataErrors.push(key) },
     onSnapshot: payload => {
-      appliedSnapshots.push(payload as Record<string, unknown>)
+      appliedSnapshots.push({
+        ...(payload as unknown as Record<string, unknown>),
+        marker: payload.additional.marker,
+      })
     },
     ...(options.snapshots
       ? {
           onLiveSnapshot: payload => {
-            liveSnapshots.push(payload as unknown as Record<string, unknown>)
+            liveSnapshots.push({
+              ...(payload as unknown as Record<string, unknown>),
+              marker: payload.events[0]?.payload.marker,
+            })
           },
         }
       : {}),
   })
 
-  const loadHistory = vi.fn(async context => {
-    context.markHistoryRequestSent?.(rpc.connectionGeneration)
+  const loadHistory = vi.fn(async (context: SessionBootstrapPhaseContext) => {
+    const lease = sessionReadLifecycle.current()
+    if (!lease) return { ok: false, error: new Error('Session read lease is unavailable') }
+    await lease.history.latest({
+      signal: context.signal,
+      deadlineAt: context.attemptDeadlineAt,
+      budgetMs: Math.max(1, context.attemptDeadlineAt - Date.now()),
+    })
     return { ok: true }
   })
   const bootstrap = useChatSessionBootstrap({
     sessionKey,
+    sessionReadLifecycle,
     loadHistory,
     subscribeSession: subscription.subscribeSession,
     cancelHistory: vi.fn(),
     cancelSubscription: subscription.cancelActiveSubscription,
-    unsubscribeSession: subscription.unsubscribeSession,
   })
 
   const persistSession = vi.fn((key: string) => { sessionKey.value = key })
@@ -617,7 +678,7 @@ describe('session switch transport ownership', () => {
     // The public lease behavior is the externally observable invariant: one
     // final A2 release is emitted, and a second release finds no reusable A1.
     const beforeRelease = requests(harness.socket).length
-    const releaseA2 = harness.subscription.unsubscribeSession(SESSION_A)
+    harness.bootstrap.cancelSessionBootstrap()
     await vi.waitFor(() => {
       expect(requests(harness.socket)).toHaveLength(beforeRelease + 1)
     })
@@ -627,8 +688,8 @@ describe('session switch transport ownership', () => {
       SESSION_A,
     ])
     reply(harness.socket, releaseFrame, { unsubscribed: true })
-    await releaseA2
-    await harness.subscription.unsubscribeSession(SESSION_A)
+    await flushMicrotasks()
+    harness.bootstrap.cancelSessionBootstrap()
     expect(requests(harness.socket)).toHaveLength(beforeRelease + 1)
   })
 
@@ -799,14 +860,14 @@ describe('session switch transport ownership', () => {
       // With no production-only debug hook, one releasable lease is proven by
       // exactly one generation-pinned release; a second call emits nothing.
       const beforeRelease = requests(harness.socket).length
-      const release = harness.subscription.unsubscribeSession(SESSION_A)
+      harness.bootstrap.cancelSessionBootstrap()
       await flushMicrotasks()
       const releaseFrames = requests(harness.socket).slice(beforeRelease)
       expect(releaseFrames).toHaveLength(1)
       expect(releaseFrames[0]?.params.key).toBe(SESSION_A)
       reply(harness.socket, releaseFrames[0]!, { unsubscribed: true })
-      await release
-      await harness.subscription.unsubscribeSession(SESSION_A)
+      await flushMicrotasks()
+      harness.bootstrap.cancelSessionBootstrap()
       expect(requests(harness.socket)).toHaveLength(beforeRelease + 1)
 
       harness.rpc.disconnect()

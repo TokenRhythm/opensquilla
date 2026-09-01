@@ -4,54 +4,28 @@ import type {
   ChatRunStatusSource,
 } from '@/types/chat'
 import type {
-  SessionProjectWorkspaceSnapshot,
-  SessionMessagesSnapshotResponse,
-  SessionMessagesSubscribeParams,
-  SessionMessagesSubscribeResponse,
-} from '@/modules/sessionConversation'
-import {
-  createConversationRuntime,
-  type ConversationRuntime,
-} from '@/modules/conversationRuntime'
-import type { ConversationSessionRuntime } from '@/modules/conversationSessionRuntime'
-import {
-  createConversationSubscriptionLifecycle,
-  type ConversationSubscriptionAttempt,
-} from '@/modules/conversationSubscriptionLifecycle'
+  SessionReadActivity,
+  SessionReadLease,
+  SessionReadLeaseReader,
+  SessionReadMetadata,
+  SessionReadRunModeLock,
+  SessionReadSnapshot,
+} from '@/modules/sessionReadLifecycle'
+import type { ConversationRuntime } from '@/modules/conversationRuntime'
 import { conversationCursorSignal } from '@/utils/chat/streamEvents'
 import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
 import { chatTaskId } from '@/composables/chat/useChatTaskOwnership'
-import type {
-  SessionConversation,
-  SessionConversationRequestOptions,
-} from '@/modules/sessionConversation'
-import type { GatewayAccess } from '@/modules/gatewayAccess'
 import {
   SESSION_PHASE_ATTEMPT_BUDGET_MS,
-  SESSION_SNAPSHOT_BUDGET_MS,
   isRpcAbort,
-  isRpcTimeout,
-  isStorageBusy,
-  phaseCallOptions,
-  phaseConnectionWaitOptions,
-  phaseTimeoutMs,
-  rpcErrorCode,
   type SessionBootstrapPhaseContext,
 } from '@/composables/chat/sessionBootstrapContract'
 
 export interface UseChatSessionSubscriptionOptions {
-  sessionConversation: SessionConversation
-  gatewayAccess: Pick<
-    GatewayAccess,
-    'detachedSessionHydration' | 'subscriptionEpoch' | 'recoverSubscriptionEpoch'
-  >
-  /** Shared domain policy; omitted callers receive an equivalent local seam. */
-  conversationRuntime?: ConversationRuntime
-  /** Shared Conversation owner; preferred over the legacy cursor-only option. */
-  conversationSessionRuntime?: Pick<
-    ConversationSessionRuntime<unknown, SessionSubscriptionOutcome>,
-    'cursor' | 'subscriptions'
-  >
+  /** The bootstrap owner supplies the one lease shared by live and history consumers. */
+  sessionReadLeaseReader: SessionReadLeaseReader
+  /** Shared domain cursor policy used by the existing live-event projection. */
+  conversationRuntime: ConversationRuntime
   sessionKey: Ref<string>
   lastStreamSeq: Ref<number>
   runStatus: Ref<ChatRunStatus>
@@ -76,22 +50,22 @@ export interface UseChatSessionSubscriptionOptions {
   loadHistory: () => void | Promise<unknown>
   resetStreamIdleTimer: () => void
   resetStreamLiveTurnState: () => void
-  onLiveSnapshot?: (snapshot: SessionMessagesSnapshotResponse) => void
+  onLiveSnapshot?: (snapshot: SessionReadSnapshot) => void
   onAuthoritativeIdle?: () => void
-  onRunModeLock?: (
-    lock: NonNullable<SessionMessagesSubscribeResponse['run_mode_lock']>,
-  ) => void
+  onRunModeLock?: (lock: SessionReadRunModeLock) => void
   beginSessionMetadataResolution?: (key: string) => number
   onSessionMetadata?: (
     key: string,
     generation: number,
-    metadata: {
-      workspaceId?: string
-      projectWorkspace?: SessionProjectWorkspaceSnapshot | null
-    },
+    metadata: SessionReadMetadata,
   ) => void
   onSessionMetadataError?: (key: string, generation: number) => void
-  onSnapshot?: (snapshot: SessionMessagesSubscribeResponse) => void
+  onSnapshot?: (snapshot: SessionReadMetadata) => void
+}
+
+export interface SessionMetadataRetryOptions {
+  signal?: AbortSignal
+  timeoutMs?: number
 }
 
 const LIVE_RUN_STATES = ['queued', 'running', 'approval_pending']
@@ -121,15 +95,46 @@ const UNAVAILABLE_SUBSCRIPTION: SessionSubscriptionOutcome = {
   backgroundOnly: false,
 }
 
+function localAbortError(message: string): Error {
+  const error = new Error(message)
+  error.name = 'AbortError'
+  return error
+}
+
+function waitForMetadataRetry<T>(
+  operation: Promise<T>,
+  signal: AbortSignal,
+  timeoutMs: number,
+): Promise<T> {
+  if (signal.aborted) return Promise.reject(localAbortError('Metadata retry was cancelled.'))
+  return new Promise<T>((resolve, reject) => {
+    let settled = false
+    const finish = (callback: () => void) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      signal.removeEventListener('abort', abort)
+      callback()
+    }
+    const abort = () => finish(() => reject(localAbortError('Metadata retry was cancelled.')))
+    const timer = setTimeout(
+      () => finish(() => reject(new Error('Session metadata recovery timed out.'))),
+      timeoutMs,
+    )
+    signal.addEventListener('abort', abort, { once: true })
+    operation.then(
+      value => finish(() => resolve(value)),
+      error => finish(() => reject(error)),
+    )
+  })
+}
+
 export function useChatSessionSubscription(options: UseChatSessionSubscriptionOptions) {
-  const conversation = options.sessionConversation
   const isHydrating = ref(false)
   const streamGeneration = ref<string | null>(null)
-  const conversationRuntime = options.conversationSessionRuntime?.cursor
-    ?? options.conversationRuntime
-    ?? createConversationRuntime()
-  const subscriptionLifecycle = options.conversationSessionRuntime?.subscriptions
-    ?? createConversationSubscriptionLifecycle<SessionSubscriptionOutcome>()
+  const conversationRuntime = options.conversationRuntime
+  let activeSubscriptionController: AbortController | null = null
+  let subscriptionSequence = 0
   let activeMetadataController: AbortController | null = null
   let metadataHydrationSequence = 0
 
@@ -145,55 +150,30 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     options.lastStreamSeq.value = next.streamSeq
   }
 
-  function detachedHydrationAdvertised(): boolean {
-    return options.gatewayAccess.detachedSessionHydration
-  }
-
-  function hydrationCallOptions(
-    bootstrap: SessionBootstrapPhaseContext,
-  ): SessionConversationRequestOptions {
-    const callOptions = phaseCallOptions(bootstrap, 'sessions.messages.hydrate')
-    if (detachedHydrationAdvertised()) callOptions.timeoutAction = 'reject'
-    return callOptions
-  }
-
-  function retireLeasesFromPriorGenerations() {
-    subscriptionLifecycle.retirePriorGenerations(options.gatewayAccess.subscriptionEpoch)
-  }
-
   function subscribeSession(
     bootstrap?: SessionBootstrapPhaseContext,
   ): Promise<SessionSubscriptionOutcome> {
     if (!options.sessionKey.value) return Promise.resolve(UNAVAILABLE_SUBSCRIPTION)
-    retireLeasesFromPriorGenerations()
     if (options.ownershipHydrationRequired?.() !== false) {
       options.taskOwnership?.beginHydration()
     }
     const key = options.sessionKey.value
-    const sinceStreamGeneration = streamGeneration.value
-    const sinceStreamSeq = options.lastStreamSeq.value
-    const identity = {
-      key,
-      sinceStreamGeneration,
-      sinceStreamSeq,
-      bootstrapGeneration: bootstrap?.generation ?? -1,
-      bootstrapAttempt: bootstrap?.attempt ?? -1,
-    }
-    return subscriptionLifecycle.start(
-      identity,
-      bootstrap?.signal,
-      attempt => runSubscription(
-        attempt,
-        bootstrap
-          ? { ...bootstrap, signal: attempt.controller.signal }
-          : undefined,
-      ),
-    )
-  }
-
-  function generationFrom(source: unknown): string | null {
-    if (typeof source === 'string') return source || null
-    return conversationCursorSignal(source).streamGeneration ?? null
+    const lease = options.sessionReadLeaseReader.current()
+    if (!lease) return Promise.resolve(UNAVAILABLE_SUBSCRIPTION)
+    const sequence = ++subscriptionSequence
+    activeSubscriptionController?.abort()
+    const controller = new AbortController()
+    activeSubscriptionController = controller
+    const relayAbort = () => controller.abort()
+    if (bootstrap?.signal.aborted) controller.abort()
+    else bootstrap?.signal.addEventListener('abort', relayAbort, { once: true })
+    return runSubscription(lease, key, sequence, controller.signal, bootstrap)
+      .finally(() => {
+        bootstrap?.signal.removeEventListener('abort', relayAbort)
+        if (activeSubscriptionController === controller) {
+          activeSubscriptionController = null
+        }
+      })
   }
 
   /**
@@ -213,79 +193,35 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     return true
   }
 
-  function reconcileSubscriptionGeneration(
-    res: SessionMessagesSubscribeResponse,
-    sinceStreamGeneration: string | null,
-  ): boolean {
-    const received = generationFrom(res)
-    // Keep the ACK envelope intact: the legacy -> generation-aware upgrade
-    // path needs its current sequence/replay-gap fields to decide whether a
-    // pre-existing numeric cursor belongs to the retired stream. Passing only
-    // the generation string would adopt the generation while still rejecting
-    // every low-sequence event from the restarted Gateway.
-    if (received) return observeStreamGeneration(res)
-    if (sinceStreamGeneration === null) return false
-
-    // A mixed-version reconnect can land on an older Gateway which ignores
-    // generation fields. Treat that capability downgrade as a new stream so
-    // its lower sequence numbers are not hidden behind the modern cursor.
-    const reset = conversationRuntime.reset(cursor())
-    syncCursor(reset)
-    options.resetStreamLiveTurnState()
-    return true
-  }
-
-  function applyReplayCursor(
-    res: SessionMessagesSubscribeResponse,
-    generationReset: boolean,
-  ) {
-    const transition = conversationRuntime.applyReplayCursor(
-      cursor(),
-      conversationCursorSignal(res),
-      generationReset,
-    )
-    syncCursor(transition.cursor)
-    if (transition.requiresHistory) options.loadHistory()
-  }
-
   function applyHydratedSubscriptionState(
     key: string,
     metadataGeneration: number | undefined,
-    res: SessionMessagesSubscribeResponse,
+    metadata: SessionReadMetadata,
+    activity: SessionReadActivity = 'unknown',
   ): SessionSubscriptionOutcome {
     if (metadataGeneration !== undefined) {
-      options.onSessionMetadata?.(key, metadataGeneration, {
-        workspaceId: res.workspaceId,
-        projectWorkspace: res.projectWorkspace,
-      })
+      options.onSessionMetadata?.(key, metadataGeneration, metadata)
     }
-    const runModeLock = res.run_mode_lock || res.runModeLock
-    if (runModeLock && typeof runModeLock === 'object') {
-      options.onRunModeLock?.(runModeLock)
-    }
-    const rawActiveTask = res.active_task || res.activeTask || null
+    options.onRunModeLock?.(metadata.runModeLock)
+    const source = metadataRunStatusSource(metadata)
+    const rawActiveTask = source.activeTask || null
     const rawActiveTaskId = chatTaskId(rawActiveTask)
-    const rawRunStatus = String(res.run_status || res.runStatus || '').toLowerCase()
+    const rawRunStatus = metadata.runStatus.toLowerCase()
     const settledLiveTask = LIVE_RUN_STATES.includes(rawRunStatus)
       && Boolean(rawActiveTaskId)
       && options.taskOwnership?.isSettled(rawActiveTaskId) === true
-    const effectiveSnapshot = settledLiveTask
-      ? {
-          ...res,
-          run_status: 'idle' as const,
-          runStatus: 'idle' as const,
-          active_task: null,
-          activeTask: null,
-        }
-      : res
-    options.onSnapshot?.(effectiveSnapshot)
-    options.taskOwnership?.applySnapshot(effectiveSnapshot, true)
+    const effectiveMetadata = settledLiveTask
+      ? { ...metadata, runStatus: 'idle', activeTask: null }
+      : metadata
+    const effectiveSource = metadataRunStatusSource(effectiveMetadata)
+    options.onSnapshot?.(effectiveMetadata)
+    options.taskOwnership?.applySnapshot(effectiveSource, true)
     // Do not clear an acceptance-result-unknown Stop from an idle snapshot.
     // The subscription can race ahead of the original ingress commit, so only
     // the matching send transaction (receipt/rejection) or an explicit session
     // reset may release that latch.  Its idempotent replay must still inherit
     // the Stop intent and abort the exact accepted task once the receipt exists.
-    applySessionRunState(effectiveSnapshot)
+    applySessionRunState(effectiveSource)
     // A pending inline interrupt is newer, stronger evidence than an idle
     // subscription snapshot that raced with the approval request.
     if (
@@ -298,9 +234,9 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       })
     }
     const liveTaskSnapshot = LIVE_RUN_STATES.includes(options.runStatus.value.status)
-    if (!settledLiveTask) reconcileActiveTaskGroups(res)
+    if (!settledLiveTask) reconcileActiveTaskGroups(metadata)
     if (liveTaskSnapshot && !options.isStreaming.value) {
-      const activeTask = (effectiveSnapshot.active_task || effectiveSnapshot.activeTask) as {
+      const activeTask = effectiveMetadata.activeTask as {
         started_at?: number | string | null
         startedAt?: number | string | null
       } | null | undefined
@@ -309,10 +245,10 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       // placeholder. Restore the authoritative active-task payload (including
       // steer_capability) that came from hydration instead of waiting for a
       // later task.running event to repair it.
-      applySessionRunState(effectiveSnapshot)
+      applySessionRunState(effectiveSource)
     }
     if (liveTaskSnapshot) {
-      const activeTask = (effectiveSnapshot.active_task || effectiveSnapshot.activeTask) as {
+      const activeTask = effectiveMetadata.activeTask as {
         task_id?: string
         taskId?: string
         started_at?: number | string | null
@@ -340,8 +276,12 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       options.resetStreamLiveTurnState()
     }
     if (options.isStreaming.value) options.resetStreamIdleTimer()
-    const taskOrInterruptLive = liveTaskSnapshot || options.hasActiveInterrupt.value
-    const groupLive = options.activeTaskGroups.value.size > 0
+    const taskOrInterruptLive = (
+      liveTaskSnapshot
+      || options.hasActiveInterrupt.value
+      || (activity === 'foreground' && !settledLiveTask)
+    )
+    const groupLive = options.activeTaskGroups.value.size > 0 || activity === 'background'
     const outcome = {
       authoritative: true,
       live: taskOrInterruptLive || groupLive,
@@ -351,278 +291,119 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     return outcome
   }
 
-  function scheduleDeferredHydration(
+  function metadataRunStatusSource(metadata: SessionReadMetadata): ChatRunStatusSource {
+    return {
+      runStatus: metadata.runStatus,
+      activeTask: metadata.activeTask,
+      lastTask: metadata.lastTask,
+      tasks: metadata.tasks,
+      queuedTaskIds: metadata.queuedTaskIds,
+    } as unknown as ChatRunStatusSource
+  }
+
+  function isCurrentSubscription(
+    lease: SessionReadLease,
     key: string,
-    attemptContext: ConversationSubscriptionAttempt,
+    sequence: number,
+    signal?: AbortSignal,
+  ): boolean {
+    return sequence === subscriptionSequence
+      && key === options.sessionKey.value
+      && options.sessionReadLeaseReader.current() === lease
+      && signal?.aborted !== true
+  }
+
+  function scheduleMetadataHydration(
+    lease: SessionReadLease,
+    key: string,
+    sequence: number,
     metadataHydration: number,
     metadataGeneration: number | undefined,
-    bootstrap: SessionBootstrapPhaseContext,
-  ) {
-    void (async () => {
-      try {
-        await bootstrap.waitForCriticalRequestsQueued?.()
-        if (
-          !subscriptionLifecycle.isCurrent(attemptContext, key)
-          || metadataHydration !== metadataHydrationSequence
-          || key !== options.sessionKey.value
-          || bootstrap.signal.aborted
-        ) return
-        // Storage-backed metadata is deliberately outside the critical
-        // history/live bootstrap. Once their request frames are queued it
-        // receives its own bounded window; slow history must not keep a healthy
-        // project session permanently unresolved.
-        const hydrationDeadlineAt = Date.now() + SESSION_PHASE_ATTEMPT_BUDGET_MS
-        const hydrationContext = {
-          ...bootstrap,
-          deadlineAt: hydrationDeadlineAt,
-          attemptDeadlineAt: hydrationDeadlineAt,
-        }
-        const hydration = await conversation.hydrate(
-          key,
-          hydrationCallOptions(hydrationContext),
-        )
-        if (
-          !subscriptionLifecycle.isCurrent(attemptContext, key)
-          || metadataHydration !== metadataHydrationSequence
-          || key !== options.sessionKey.value
-          || bootstrap.signal.aborted
-        ) return
-        const complete = (
-          hydration.hydration_complete
-          ?? hydration.hydrationComplete
-          ?? true
-        ) !== false
-        if (!complete) throw new Error('Session state hydration remained incomplete')
-        applyHydratedSubscriptionState(key, metadataGeneration, hydration)
-      } catch (cause) {
-        if (
-          subscriptionLifecycle.isCurrent(attemptContext, key)
-          && metadataHydration === metadataHydrationSequence
-          && key === options.sessionKey.value
-          && !bootstrap.signal.aborted
-        ) {
-          if (metadataGeneration !== undefined) {
-            options.onSessionMetadataError?.(key, metadataGeneration)
-          }
-          console.warn(
-            'Session metadata hydration failed:',
-            cause instanceof Error ? cause.message : cause,
-          )
-        }
+    activity: SessionReadActivity,
+    signal: AbortSignal,
+  ): void {
+    void lease.metadata.then((metadata) => {
+      if (
+        !isCurrentSubscription(lease, key, sequence, signal)
+        || metadataHydration !== metadataHydrationSequence
+      ) return
+      if (!metadata.hydrationComplete) {
+        throw new Error('Session state hydration remained incomplete')
       }
-    })()
+      applyHydratedSubscriptionState(key, metadataGeneration, metadata, activity)
+    }).catch((cause) => {
+      if (
+        !isCurrentSubscription(lease, key, sequence, signal)
+        || metadataHydration !== metadataHydrationSequence
+      ) return
+      if (metadataGeneration !== undefined) {
+        options.onSessionMetadataError?.(key, metadataGeneration)
+      }
+      console.warn(
+        'Session metadata hydration failed:',
+        cause instanceof Error ? cause.message : cause,
+      )
+    })
   }
 
   async function runSubscription(
-    attemptContext: ConversationSubscriptionAttempt,
+    lease: SessionReadLease,
+    key: string,
+    sequence: number,
+    signal: AbortSignal,
     bootstrap?: SessionBootstrapPhaseContext,
   ): Promise<SessionSubscriptionOutcome> {
-    const {
-      key,
-      sinceStreamGeneration,
-      sinceStreamSeq,
-      lease,
-    } = attemptContext
     const metadataHydration = ++metadataHydrationSequence
     const metadataGeneration = options.beginSessionMetadataResolution?.(key)
-    let skipSnapshotOnRetry = Boolean(bootstrap?.skipSnapshot)
-    if (sinceStreamSeq === 0) isHydrating.value = true
+    if (options.lastStreamSeq.value === 0) isHydrating.value = true
     try {
-      if (bootstrap) {
-        await conversation.ready({
-          timeoutMs: phaseTimeoutMs(bootstrap, 'sessions.messages.subscribe'),
-          signal: bootstrap.signal,
-          ...phaseConnectionWaitOptions(),
-        })
-      } else {
-        await conversation.ready()
-      }
-      if (!subscriptionLifecycle.isCurrent(attemptContext, key)) {
+      if (signal.aborted || !isCurrentSubscription(lease, key, sequence, signal)) {
         return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
       }
-      const params: SessionMessagesSubscribeParams = {
-        key,
-        ...(sinceStreamGeneration
-          ? { since_stream_generation: sinceStreamGeneration }
-          : {}),
-        since_stream_seq: sinceStreamSeq,
-        fast_ack: true,
-      }
-      const onLiveSnapshot = options.onLiveSnapshot
-      const snapshotRequired = Boolean(
-        onLiveSnapshot && !bootstrap?.skipSnapshot,
-      )
-      let subscribeSocketGeneration: number | null = null
-      let snapshotSocketGeneration: number | null = null
-      let liveFramesMarked = false
-      const markLiveFramesSent = () => {
-        if (
-          !bootstrap
-          || liveFramesMarked
-          || subscribeSocketGeneration === null
-          || (snapshotRequired && snapshotSocketGeneration === null)
-          || (
-            snapshotSocketGeneration !== null
-            && snapshotSocketGeneration !== subscribeSocketGeneration
-          )
-        ) return
-        liveFramesMarked = true
-        bootstrap.markLiveSubscribeSent?.(subscribeSocketGeneration)
-      }
-      const subscribeCallOptions = bootstrap
-        ? {
-            ...phaseCallOptions(bootstrap, 'sessions.messages.subscribe'),
-            // Once subscribe reaches WebSocket.send(), its server-side
-            // registration must remain correlated until it settles. Route
-            // cancellation is represented by the bootstrap epoch instead of
-            // deleting this wire request from RpcClient's pending map.
-            signal: undefined,
-            onSent: (socketGeneration: number) => {
-              lease.socketGeneration = socketGeneration
-              subscribeSocketGeneration = socketGeneration
-              markLiveFramesSent()
-            },
-          }
-        : {
-            onSent: (socketGeneration: number) => {
-              lease.socketGeneration = socketGeneration
-            },
-          }
-      const subscribePromise = conversation.subscribe(params, subscribeCallOptions)
-      // Pipeline the in-memory snapshot directly behind subscribe. Only after
-      // both frames are on the wire may history enter the serialized queue:
-      // subscribe → snapshot → history. Slow storage metadata is deferred.
-      const snapshotPromise = snapshotRequired
-        ? (
-            bootstrap
-              ? conversation.snapshot(
-                  key,
-                  {
-                    ...phaseCallOptions(
-                      bootstrap,
-                      'sessions.messages.snapshot',
-                      SESSION_SNAPSHOT_BUDGET_MS,
-                    ),
-                    onSent: (socketGeneration: number) => {
-                      snapshotSocketGeneration = socketGeneration
-                      markLiveFramesSent()
-                    },
-                  },
-                )
-              : conversation.snapshot(key)
-          )
-        : null
-
-      const [subscribeResult, snapshotResult] = await Promise.allSettled([
-        subscribePromise,
-        snapshotPromise,
-      ] as const)
-      if (
-        subscribeResult.status === 'fulfilled'
-        && subscribeResult.value?.subscribed !== false
-        && lease.state === 'acquiring'
-      ) {
-        subscriptionLifecycle.leases.activate(lease)
-      } else if (
-        subscribeResult.status === 'rejected'
-        && lease.state === 'acquiring'
-      ) {
-        subscriptionLifecycle.leases.retire(lease)
-      }
-      if (!subscriptionLifecycle.isCurrent(attemptContext, key)) {
+      const live = await lease.live
+      if (!isCurrentSubscription(lease, key, sequence, signal)) {
         return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
       }
-
-      if (subscribeResult.status === 'rejected') throw subscribeResult.reason
-      const res = subscribeResult.value
-      if (res && res.subscribed === false) {
-        subscriptionLifecycle.leases.retire(lease)
-        throw new Error('No subscription manager available')
-      }
-      const generationReset = reconcileSubscriptionGeneration(
-        res,
-        sinceStreamGeneration,
-      )
-
       let snapshotTaskLive = false
-      if (snapshotPromise) {
-        skipSnapshotOnRetry = true
-        if (snapshotResult.status === 'rejected') {
-          const error = snapshotResult.reason
-          if (
-            bootstrap
-            && (
-              bootstrap.signal.aborted
-              || isRpcAbort(error)
-              || isRpcTimeout(error)
-              || isStorageBusy(error)
-              || rpcErrorCode(error) !== 'METHOD_NOT_FOUND'
-            )
-          ) {
-            throw error
-          }
-          // Older gateways do not expose the snapshot RPC. Continue with the
-          // bounded replay protocol so mixed-version client updates still work.
-        } else {
-          const snapshot = snapshotResult.value
-          const snapshotDecision = conversationRuntime.acceptSnapshot(
-            cursor(),
-            conversationCursorSignal(snapshot),
-          )
-          if (
-            snapshot?.key === key
-            && Array.isArray(snapshot.events)
-            && typeof snapshot.current_stream_seq === 'number'
-            // Events delivered after registration are newer than a late
-            // snapshot response. Never reset the live surface behind them.
-            && snapshotDecision.accepted
-          ) {
-            const snapshotTaskId = typeof snapshot.task_id === 'string'
-              ? snapshot.task_id
-              : ''
-            const settledSnapshot = Boolean(
-              snapshotTaskId && options.taskOwnership?.isSettled(snapshotTaskId),
-            )
-            if (!settledSnapshot) onLiveSnapshot?.(snapshot)
-            syncCursor(snapshotDecision.cursor)
-            snapshotTaskLive = Boolean(snapshot.task_id) && !settledSnapshot
-          }
-        }
-      }
-      applyReplayCursor(res, generationReset)
-      const hydrationComplete = (
-        res.hydration_complete
-        ?? res.hydrationComplete
-        ?? true
-      ) !== false
-      if (hydrationComplete) {
-        return applyHydratedSubscriptionState(key, metadataGeneration, res)
-      }
-      if (options.ownershipHydrationRequired?.() !== false) {
-        options.taskOwnership?.applySnapshot(res, false)
-      }
-      if (bootstrap) {
-        scheduleDeferredHydration(
-          key,
-          attemptContext,
-          metadataHydration,
-          metadataGeneration,
-          bootstrap,
+      const snapshot = live.snapshot
+      if (snapshot?.sessionKey === key) {
+        const snapshotTaskId = snapshot.taskId || ''
+        const settledSnapshot = Boolean(
+          snapshotTaskId && options.taskOwnership?.isSettled(snapshotTaskId),
         )
-      } else {
-        const hydration = await conversation.hydrate(key)
-        const complete = (
-          hydration.hydration_complete
-          ?? hydration.hydrationComplete
-          ?? true
-        ) !== false
-        if (!complete) throw new Error('Session state hydration remained incomplete')
+        if (!settledSnapshot) options.onLiveSnapshot?.(snapshot)
+        snapshotTaskLive = Boolean(snapshotTaskId) && !settledSnapshot
+      }
+      if (live.reloadRequired) {
+        if (live.reloadRequired === 'generationChanged') {
+          syncCursor(conversationRuntime.reset(cursor()))
+          options.resetStreamLiveTurnState()
+        }
+        void options.loadHistory()
+      }
+      if (live.initialMetadata.hydrationComplete) {
         return applyHydratedSubscriptionState(
           key,
           metadataGeneration,
-          { ...res, ...hydration },
+          live.initialMetadata,
+          live.activity,
         )
       }
+      if (options.ownershipHydrationRequired?.() !== false) {
+        options.taskOwnership?.applySnapshot(
+          metadataRunStatusSource(live.initialMetadata),
+          false,
+        )
+      }
+      scheduleMetadataHydration(
+        lease,
+        key,
+        sequence,
+        metadataHydration,
+        metadataGeneration,
+        live.activity,
+        signal,
+      )
       // Fast ACK is authoritative for delivery registration. Deferred storage
       // metadata may refine task/workspace state later but cannot make history
       // or the real-time channel non-terminal.
@@ -630,26 +411,25 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         snapshotTaskLive
         || options.isStreaming.value
         || options.hasActiveInterrupt.value
+        || live.activity === 'foreground'
       )
       return {
         authoritative: true,
-        live: taskOrInterruptLive,
-        backgroundOnly: false,
+        live: taskOrInterruptLive || live.activity === 'background',
+        backgroundOnly: live.activity === 'background' && !taskOrInterruptLive,
       }
     } catch (err: unknown) {
-      if (lease.state === 'acquiring') subscriptionLifecycle.leases.retire(lease)
       console.warn('Session stream subscription failed:', err instanceof Error ? err.message : err)
       const cancelled = (
-        !subscriptionLifecycle.isCurrent(attemptContext, key)
-        || key !== options.sessionKey.value
-        || bootstrap?.signal.aborted
+        !isCurrentSubscription(lease, key, sequence)
+        || signal.aborted
         || isRpcAbort(err)
       )
       if (
         metadataGeneration !== undefined
         && !cancelled
         && (!bootstrap || bootstrap.attempt === 1)
-        && subscriptionLifecycle.isCurrent(attemptContext, key)
+        && isCurrentSubscription(lease, key, sequence)
         && key === options.sessionKey.value
       ) {
         options.onSessionMetadataError?.(key, metadataGeneration)
@@ -658,62 +438,51 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         ...UNAVAILABLE_SUBSCRIPTION,
         error: err,
         cancelled,
-        skipSnapshotOnRetry,
       }
     } finally {
-      if (subscriptionLifecycle.isCurrent(attemptContext, key)) isHydrating.value = false
+      if (isCurrentSubscription(lease, key, sequence)) isHydrating.value = false
     }
   }
 
   async function retrySessionMetadata(
-    callOptions: SessionConversationRequestOptions = {},
+    retryOptions: SessionMetadataRetryOptions = {},
   ): Promise<boolean> {
     const key = options.sessionKey.value
     if (!key) return false
+    const lease = options.sessionReadLeaseReader.current()
+    if (!lease) return false
 
     const metadataHydration = ++metadataHydrationSequence
     const metadataGeneration = options.beginSessionMetadataResolution?.(key)
     activeMetadataController?.abort()
     const controller = new AbortController()
     activeMetadataController = controller
-    const externalSignal = callOptions.signal
+    const externalSignal = retryOptions.signal
     const relayAbort = () => controller.abort()
     if (externalSignal?.aborted) controller.abort()
     else externalSignal?.addEventListener('abort', relayAbort, { once: true })
 
-    const deadlineAt = Date.now() + Math.max(
+    const timeoutMs = Math.max(
       1,
-      callOptions.timeoutMs ?? SESSION_PHASE_ATTEMPT_BUDGET_MS,
+      retryOptions.timeoutMs ?? SESSION_PHASE_ATTEMPT_BUDGET_MS,
     )
     const isCurrent = () => (
       metadataHydration === metadataHydrationSequence
       && key === options.sessionKey.value
+      && options.sessionReadLeaseReader.current() === lease
       && !controller.signal.aborted
     )
 
     try {
-      await conversation.ready({
-        timeoutMs: Math.max(1, deadlineAt - Date.now()),
-        signal: controller.signal,
-        timeoutAction: 'reject',
-        abortAction: 'reject',
-      })
+      const hydration = await waitForMetadataRetry(
+        lease.retryMetadata(),
+        controller.signal,
+        timeoutMs,
+      )
       if (!isCurrent()) return false
-      const hydration = await conversation.hydrate(key, {
-        ...callOptions,
-        timeoutMs: Math.max(1, deadlineAt - Date.now()),
-        signal: controller.signal,
-        timeoutAction: callOptions.timeoutAction
-          ?? (detachedHydrationAdvertised() ? 'reject' : 'reconnect'),
-        abortAction: callOptions.abortAction ?? 'reject',
-      })
-      if (!isCurrent()) return false
-      const complete = (
-        hydration.hydration_complete
-        ?? hydration.hydrationComplete
-        ?? true
-      ) !== false
-      if (!complete) throw new Error('Session state hydration remained incomplete')
+      if (!hydration.hydrationComplete) {
+        throw new Error('Session state hydration remained incomplete')
+      }
       applyHydratedSubscriptionState(key, metadataGeneration, hydration)
       return true
     } catch (cause) {
@@ -736,8 +505,10 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
   }
 
   function cancelActiveSubscription() {
-    subscriptionLifecycle.cancel()
+    ++subscriptionSequence
     ++metadataHydrationSequence
+    activeSubscriptionController?.abort()
+    activeSubscriptionController = null
     activeMetadataController?.abort()
     activeMetadataController = null
     isHydrating.value = false
@@ -745,64 +516,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
 
   async function unsubscribeSession(key = options.sessionKey.value) {
     cancelActiveSubscription()
-    if (!key) return
-    retireLeasesFromPriorGenerations()
-    const lease = subscriptionLifecycle.leases.latestReleasable(key)
-    if (!lease) return
-    if (lease.releasePromise) return lease.releasePromise
-    lease.state = 'releasing'
-    subscriptionLifecycle.leases.clearActive(lease)
-    const expectedGeneration = lease.socketGeneration
-    const currentGeneration = options.gatewayAccess.subscriptionEpoch
-    // No subscribe frame was sent, or the physical connection that owned it
-    // has already gone away. Gateway disconnect cleanup is authoritative; an
-    // unsubscribe must never leak onto a replacement generation.
-    if (
-      expectedGeneration === null
-      || (
-        typeof currentGeneration === 'number'
-        && currentGeneration !== expectedGeneration
-      )
-    ) {
-      subscriptionLifecycle.leases.retire(lease)
-      return
-    }
-    const release = (async () => {
-      try {
-        await conversation.unsubscribe(key, {
-          timeoutMs: SESSION_PHASE_ATTEMPT_BUDGET_MS,
-          timeoutAction: 'reject',
-          abortAction: 'reject',
-          expectedGeneration,
-        })
-      } catch (cause) {
-        // A request-local timeout or abort is ambiguous: the serialized frame
-        // may still complete after the UI waiter stops observing it. Only an
-        // explicit Gateway rejection proves the release failed. Recover that
-        // exact generation in the explicit-failure case; the generation fence
-        // prevents a late cleanup from killing a replacement socket.
-        if (
-          !isRpcTimeout(cause)
-          && !isRpcAbort(cause)
-          && (
-            options.gatewayAccess.subscriptionEpoch === expectedGeneration
-          )
-        ) {
-          options.gatewayAccess.recoverSubscriptionEpoch(
-            expectedGeneration,
-            'Failed to release the previous session subscription',
-          )
-        }
-        console.warn(
-          'Session stream unsubscribe failed:',
-          cause instanceof Error ? cause.message : cause,
-        )
-      } finally {
-        subscriptionLifecycle.leases.retire(lease)
-      }
-    })()
-    lease.releasePromise = release
-    return release
+    void key
   }
 
   function applySessionRunState(source: ChatRunStatusSource | null | undefined) {
@@ -844,12 +558,8 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     options.runStatus.value = next
   }
 
-  function reconcileActiveTaskGroups(res: SessionMessagesSubscribeResponse) {
-    const snapshot = res.active_task_group_ids || res.activeTaskGroupIds
-    if (!Array.isArray(snapshot)) return
-    options.activeTaskGroups.value = new Set(
-      snapshot.filter((groupId): groupId is string => typeof groupId === 'string' && Boolean(groupId)),
-    )
+  function reconcileActiveTaskGroups(metadata: SessionReadMetadata) {
+    options.activeTaskGroups.value = new Set(metadata.activeTaskGroupIds.filter(Boolean))
     if (options.activeTaskGroups.value.size === 0) return
     applySessionRunState({
       run_status: 'running',

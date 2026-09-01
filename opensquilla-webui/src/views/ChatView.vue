@@ -944,11 +944,16 @@ import {
 import { useChatSessionRuntime } from '@/composables/chat/useChatSessionRuntime'
 import {
   useChatSessionSubscription,
-  type SessionSubscriptionOutcome,
 } from '@/composables/chat/useChatSessionSubscription'
 import {
   createConversationSessionRuntime,
 } from '@/modules/conversationSessionRuntime'
+import {
+  SESSION_READ_LIFECYCLE_FACTORY_KEY,
+  type SessionReadMetadata,
+  type SessionReadPortLease,
+  type SessionReadSnapshot,
+} from '@/modules/sessionReadLifecycle'
 import {
   CONVERSATION_EVENTS_KEY,
   conversationEventSessionKey,
@@ -1009,10 +1014,6 @@ import {
   type SteerUnavailableReason,
 } from '@/utils/chat/steerAvailability'
 import type { ArtifactPayload } from '@/types/artifacts'
-import type {
-  SessionMessagesSnapshotResponse,
-  SessionMessagesSubscribeResponse,
-} from '@/modules/sessionConversation'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import {
   isRecognizedSandboxRunMode,
@@ -1209,6 +1210,8 @@ if (!injectedSessionConversation) throw new Error('SessionConversation was not p
 const sessionConversation: SessionConversation = injectedSessionConversation
 const conversationEvents = inject(CONVERSATION_EVENTS_KEY)
 if (!conversationEvents) throw new Error('ConversationEvents was not provided')
+const sessionReadLifecycleFactory = inject(SESSION_READ_LIFECYCLE_FACTORY_KEY)
+if (!sessionReadLifecycleFactory) throw new Error('SessionReadLifecycleFactory was not provided')
 const injectedProviderConfiguration = inject(PROVIDER_CONFIGURATION_KEY)
 const injectedSandboxRuntime = inject(SANDBOX_RUNTIME_KEY)
 if (!injectedSandboxRuntime) throw new Error('SandboxRuntime was not provided')
@@ -1668,12 +1671,16 @@ const lastStreamSeq = ref(0)
 // and subscription leases stay behind the transport-neutral runtime seam.
 const conversationSessionRuntime = createConversationSessionRuntime<
   ConversationEvent,
-  SessionSubscriptionOutcome
+  SessionReadPortLease
 >({
   source: conversationEvents,
   events: { sessionKey: conversationEventSessionKey },
 })
 const conversationRuntime = conversationSessionRuntime.cursor
+const sessionReadLifecycle = sessionReadLifecycleFactory.create({
+  cursor: conversationRuntime,
+  subscriptions: conversationSessionRuntime.subscriptions,
+})
 const activeTaskGroups = ref<Set<string>>(new Set())
 // Task id whose output the live stream renders; binds late events to the
 // current turn so a prior task can't leak into it (issue 344).
@@ -1688,7 +1695,26 @@ const isStopPending = computed(() => (
   || acceptanceRecoveryPending.value
 ))
 let bindActiveStreamTask = (taskId: string) => { activeStreamTaskId.value = taskId }
-let restoreLiveTurnSnapshot = (_snapshot: SessionMessagesSnapshotResponse) => {}
+let restoreLiveTurnSnapshot = (_snapshot: SessionReadSnapshot) => {}
+
+function projectWorkspaceFromSessionRead(
+  value: SessionReadMetadata['projectWorkspace'],
+): ActiveProjectWorkspaceSnapshot | null {
+  if (!value) return null
+  const id = typeof value.id === 'string' ? value.id : ''
+  if (!id) return null
+  const availabilityReason = typeof value.availabilityReason === 'string'
+    ? value.availabilityReason
+    : undefined
+  return {
+    id,
+    name: typeof value.name === 'string' ? value.name : '',
+    path: typeof value.path === 'string' ? value.path : '',
+    available: value.available === true,
+    removed: value.removed === true,
+    ...(availabilityReason ? { availabilityReason } : {}),
+  }
+}
 
 // Pending session intent
 const pendingSessionIntent = ref<string | null>(null)
@@ -2317,8 +2343,7 @@ const preserveHistoryLiveTail = computed(() =>
 )
 
 const chatHistory = useChatHistory({
-  sessionConversation,
-  concurrentHistoryReads: () => gatewayAccess.concurrentHistoryReads,
+  sessionReadLeaseReader: sessionReadLifecycle,
   sessionKey,
   messages,
   threadRef,
@@ -2550,12 +2575,11 @@ async function handleRegenerateMessage(
   settle?.(accepted)
 }
 
-let applyPendingUserInputSnapshot: typeof chatPlans.applyBootstrap = () => {}
-let applyGoalSnapshot: (snapshot: SessionMessagesSubscribeResponse) => void = () => {}
+let applyPendingUserInputSnapshot: (snapshot: SessionReadMetadata) => void = () => {}
+let applyGoalSnapshot: (snapshot: SessionReadMetadata) => void = () => {}
 const chatSessionSubscription = useChatSessionSubscription({
-  sessionConversation,
-  gatewayAccess,
-  conversationSessionRuntime: conversationSessionRuntime,
+  sessionReadLeaseReader: sessionReadLifecycle,
+  conversationRuntime,
   sessionKey,
   lastStreamSeq,
   runStatus,
@@ -2601,7 +2625,10 @@ const chatSessionSubscription = useChatSessionSubscription({
       : activeProjectWorkspace.beginSessionResolution(key),
   onSessionMetadata: (key, generation, metadata) => {
     if (generation < 0) return
-    activeProjectWorkspace.applySessionSnapshot(key, generation, metadata)
+    activeProjectWorkspace.applySessionSnapshot(key, generation, {
+      workspaceId: metadata.workspaceId ?? undefined,
+      projectWorkspace: projectWorkspaceFromSessionRead(metadata.projectWorkspace),
+    })
   },
   onSessionMetadataError: (key, generation) => {
     if (generation < 0) return
@@ -2617,7 +2644,6 @@ const chatSessionSubscription = useChatSessionSubscription({
 const {
   subscribeSession,
   retrySessionMetadata,
-  unsubscribeSession,
   cancelActiveSubscription,
   streamGeneration,
   observeStreamGeneration,
@@ -2626,6 +2652,7 @@ applySessionRunState = chatSessionSubscription.applySessionRunState
 
 const chatSessionBootstrap = useChatSessionBootstrap({
   sessionKey,
+  sessionReadLifecycle,
   loadHistory: async (context, retry) => (
     retry
       ? await retryHistoryRequest(context)
@@ -2634,7 +2661,6 @@ const chatSessionBootstrap = useChatSessionBootstrap({
   subscribeSession,
   cancelHistory: cancelActiveHistory,
   cancelSubscription: cancelActiveSubscription,
-  unsubscribeSession,
 })
 const {
   livePhase,
@@ -3726,7 +3752,9 @@ const {
   dismissClarify,
   applyUserInputBootstrap,
 } = chatApprovals
-applyPendingUserInputSnapshot = applyUserInputBootstrap
+applyPendingUserInputSnapshot = snapshot => applyUserInputBootstrap({
+  pendingUserInputs: [...snapshot.pendingUserInputs],
+})
 
 const dockedPlanQuestionnaire = computed(() => (
   pendingClarify.value?.presentation === 'plan_questionnaire_v1'
@@ -6380,8 +6408,6 @@ async function validateActiveProjectBeforeSend(): Promise<string | null> {
       const recovered = await retrySessionMetadata({
         timeoutMs: Math.max(1, deadlineAt - Date.now()),
         signal: controller.signal,
-        timeoutAction: 'reconnect',
-        abortAction: 'reject',
       })
       if (!recovered) {
         if (!controller.signal.aborted && sessionKey.value === key) {
