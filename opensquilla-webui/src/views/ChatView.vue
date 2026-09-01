@@ -810,6 +810,7 @@ import { SESSION_LIFECYCLE_KEY } from '@/modules/sessionLifecycle'
 import { PENDING_INPUT_QUEUE_KEY } from '@/modules/pendingInputQueue'
 import { APP_SETTINGS_KEY } from '@/modules/appSettings'
 import { PROVIDER_CONFIGURATION_KEY } from '@/modules/providerConfiguration'
+import { SANDBOX_RUNTIME_KEY } from '@/modules/sandboxRuntime'
 import { SETUP_WORKFLOW_KEY } from '@/modules/setupWorkflow'
 import { useSetupStatus } from '@/composables/setup/useSetupStatus'
 import { useAppStore } from '@/stores/app'
@@ -943,7 +944,6 @@ import {
   optionalSessionRpcAllowed,
   optionalSessionRpcCallOptions,
   runModeWriteRpcCallOptions,
-  sandboxSetupRpcCallOptions,
 } from '@/composables/chat/sessionBootstrapAdmission'
 import { useChatSessionRuntime } from '@/composables/chat/useChatSessionRuntime'
 import {
@@ -1215,6 +1215,7 @@ const metaRunCenter: MetaRunCenter = injectedMetaRunCenter
 const injectedAppSettings = inject(APP_SETTINGS_KEY)
 if (!injectedAppSettings) throw new Error('AppSettings was not provided')
 const injectedProviderConfiguration = inject(PROVIDER_CONFIGURATION_KEY)
+const injectedSandboxRuntime = inject(SANDBOX_RUNTIME_KEY)
 if (!injectedProviderConfiguration) throw new Error('ProviderConfiguration was not provided')
 const injectedSetupWorkflow = inject(SETUP_WORKFLOW_KEY)
 if (!injectedSetupWorkflow) throw new Error('SetupWorkflow was not provided')
@@ -1599,6 +1600,7 @@ const {
   applyRunModePreferenceChanged,
 } = useChatRunModePreference({
   rpc,
+  sandbox: injectedSandboxRuntime,
   hydrateCallOptions: optionalSessionRpcCallOptions,
   writeCallOptions: runModeWriteRpcCallOptions,
   runModePolicy: () => {
@@ -1622,11 +1624,7 @@ const requestedRunMode = computed<SandboxRunMode>(
 )
 
 const sandboxSetupRecovery = useSandboxSetupRecovery({
-  rpc: {
-    call: (method, params) =>
-      rpc.call(method, params, sandboxSetupRpcCallOptions),
-    waitForConnection: () => rpc.waitForConnection(10_000),
-  },
+  sandbox: injectedSandboxRuntime,
   connectionState: computed(() => rpc.state),
   runMode: requestedRunMode,
   autoRefresh: false,
@@ -5557,7 +5555,7 @@ async function resumeSandbox() {
   const key = sessionKey.value
   if (!key) return
   try {
-    await rpc.call('sandbox.resume', { sessionKey: key })
+    await injectedSandboxRuntime?.resume(key)
     messages.value.push({
       role: 'system',
       text: t('chat.sandboxResumed'),
@@ -6632,10 +6630,9 @@ onMounted(async () => {
   // Load elevated mode
   loadElevatedMode()
 
-  unsubs.push(rpc.on(
-    'sandbox.run_mode.preference.changed',
+  unsubs.push(injectedSandboxRuntime?.subscribeRunModePreferenceChanged(
     payload => applyRunModePreferenceChanged(payload),
-  ))
+  ) ?? (() => undefined))
 
   // Register event handlers before sessions.messages.subscribe can replay
   // buffered events, then start the two critical phases before any optional

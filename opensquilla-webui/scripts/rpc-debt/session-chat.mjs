@@ -55,13 +55,12 @@ export const debt = {
     httpSessionKeyHeader: 1,
   },
   'src/views/ChatView.vue': {
-    call: 4,
-    on: 1,
+    call: 2,
     supportsEvent: 1,
     // Turn capability probes are owned by TurnCommands; Goal mode probes are
     // owned by GoalCenter; the remaining method probes migrate independently.
     supportsMethod: 5,
-    waitForConnection: 2,
+    waitForConnection: 1,
     httpRequest: 1,
     httpApiEndpoint: 1,
     httpAuthToken: 1,

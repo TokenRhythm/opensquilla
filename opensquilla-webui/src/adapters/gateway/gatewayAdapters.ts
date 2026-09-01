@@ -32,6 +32,8 @@ import type { MigrationOperations } from '@/modules/migrationOperations'
 import { createV4MigrationOperations } from './migrationOperationsV4'
 import type { WorkspaceCatalog } from '@/modules/workspaceCatalog'
 import { createV4WorkspaceCatalog } from './workspaceCatalogV4'
+import type { SandboxRuntime } from '@/modules/sandboxRuntime'
+import { createV4SandboxRuntime } from './sandboxRuntimeV4'
 
 type RpcStoreTransportSource = Parameters<typeof createPrivateGatewayTransports>[0]
 
@@ -52,6 +54,7 @@ export interface GatewayAdapters {
   readonly setupWorkflow: SetupWorkflow
   readonly migrationOperations: MigrationOperations
   readonly workspaceCatalog: WorkspaceCatalog
+  readonly sandboxRuntime: SandboxRuntime
 }
 
 interface GatewayHttpSource {
@@ -94,6 +97,10 @@ export function createGatewayAdapters(
     setupWorkflow: createV4SetupWorkflow(transports.rpc),
     migrationOperations: createV4MigrationOperations(transports.rpc),
     workspaceCatalog: createV4WorkspaceCatalog(transports.rpc),
+    sandboxRuntime: createV4SandboxRuntime({
+      ...transports.rpc,
+      subscribe: (event, handler) => transports.events.subscribe(event, handler),
+    }),
   }
   return adapters
 }
