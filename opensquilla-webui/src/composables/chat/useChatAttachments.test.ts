@@ -346,9 +346,10 @@ describe('useChatAttachments', () => {
   it('does not let retired refresh cleanup release same-id work in the next session', async () => {
     const sessionAUpload = deferred<unknown>()
     const sessionBUpload = deferred<unknown>()
-    vi.stubGlobal('fetch', vi.fn()
+    const fetchMock = vi.fn()
       .mockImplementationOnce(() => sessionAUpload.promise)
-      .mockImplementationOnce(() => sessionBUpload.promise))
+      .mockImplementationOnce(() => sessionBUpload.promise)
+    vi.stubGlobal('fetch', fetchMock)
     const attachments = useTestChatAttachments()
     const sessionAFile = stagedPdf('session-a-refresh.pdf')
     attachments.pendingAttachments.value = [{
@@ -381,6 +382,12 @@ describe('useChatAttachments', () => {
     expect(attachments.pendingAttachments.value).toMatchObject([
       { name: 'session-b-refresh.pdf', file_uuid: 'file-b-expired' },
     ])
+    await expect(attachments.prepareAttachmentsForSend({
+      ownership: 'composer',
+      attachments: attachments.pendingAttachments.value.map(attachment => ({ ...attachment })),
+      isCurrent: () => true,
+    })).resolves.toBe(false)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
 
     sessionBUpload.resolve(successfulUploadResponse('file-b-fresh'))
     await expect(preparingSessionB).resolves.toBe(true)
@@ -389,6 +396,58 @@ describe('useChatAttachments', () => {
       { name: 'session-b-refresh.pdf', file_uuid: 'file-b-fresh' },
     ])
     expect(pushToast).not.toHaveBeenCalled()
+  })
+
+  it('serializes cloned composer snapshots within one attachment generation', async () => {
+    const firstUpload = deferred<unknown>()
+    const releasedUpload = deferred<unknown>()
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(() => firstUpload.promise)
+      .mockImplementationOnce(() => releasedUpload.promise)
+    vi.stubGlobal('fetch', fetchMock)
+    const attachments = useTestChatAttachments()
+    const sourceFile = stagedPdf('composer-refresh.pdf')
+    const source: Attachment = {
+      kind: 'staged',
+      local_id: 1,
+      name: sourceFile.name,
+      mime: sourceFile.type,
+      file_uuid: 'file-expired',
+      expires_at: 0,
+      file: sourceFile,
+    }
+    const firstSnapshot = [{ ...source }]
+    const secondSnapshot = [{ ...source }]
+
+    const firstPreparation = attachments.prepareAttachmentsForSend({
+      ownership: 'composer',
+      attachments: firstSnapshot,
+      isCurrent: () => true,
+    })
+    await expect(attachments.prepareAttachmentsForSend({
+      ownership: 'composer',
+      attachments: secondSnapshot,
+      isCurrent: () => true,
+    })).resolves.toBe(false)
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(attachments.hasPendingAttachmentWork()).toBe(true)
+    firstUpload.resolve(successfulUploadResponse('file-first-fresh'))
+    await expect(firstPreparation).resolves.toBe(true)
+    expect(firstSnapshot).toMatchObject([{ file_uuid: 'file-first-fresh' }])
+    expect(secondSnapshot).toMatchObject([{ file_uuid: 'file-expired' }])
+    expect(attachments.hasPendingAttachmentWork()).toBe(false)
+
+    const preparationAfterRelease = attachments.prepareAttachmentsForSend({
+      ownership: 'composer',
+      attachments: secondSnapshot,
+      isCurrent: () => true,
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    releasedUpload.resolve(successfulUploadResponse('file-second-fresh'))
+    await expect(preparationAfterRelease).resolves.toBe(true)
+    expect(secondSnapshot).toMatchObject([{ file_uuid: 'file-second-fresh' }])
+    expect(attachments.hasPendingAttachmentWork()).toBe(false)
   })
 
   it('keeps a detached handoff refresh alive when the visible composer retires', async () => {

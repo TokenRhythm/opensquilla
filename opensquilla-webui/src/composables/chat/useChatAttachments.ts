@@ -122,6 +122,10 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess) {
   const composerRefreshInFlightCount = ref(0)
   const attachmentIntakeInFlightCount = ref(0)
   let attachmentGeneration = 0
+  // Composer send snapshots clone both the array and its attachment objects.
+  // Exclude them at the draft-generation boundary; detached queue/handoff
+  // collections intentionally keep the per-collection identity lane below.
+  let composerPreparationInFlight: { generation: number } | null = null
   const attachmentWorkBusy = computed(() =>
     attachmentIntakeInFlightCount.value > 0
     || composerRefreshInFlightCount.value > 0
@@ -285,6 +289,7 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess) {
   function retireAttachments() {
     attachmentGeneration += 1
     refreshInFlightByCollection.delete(pendingAttachments.value)
+    composerPreparationInFlight = null
     pendingAttachments.value = []
     composerRefreshInFlightCount.value = 0
     attachmentIntakeInFlightCount.value = 0
@@ -339,68 +344,80 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess) {
       (!composerOwned || isAttachmentGenerationCurrent(generation)) && isCurrent()
     )
     const attachments = options.attachments ?? pendingAttachments.value
+    const composerPreparation = composerOwned ? { generation } : null
+    if (
+      composerPreparation
+      && composerPreparationInFlight?.generation === generation
+    ) return false
+    if (composerPreparation) composerPreparationInFlight = composerPreparation
     let refreshInFlightAttachments = refreshInFlightByCollection.get(attachments)
     if (!refreshInFlightAttachments) {
       refreshInFlightAttachments = new Set<Attachment>()
       refreshInFlightByCollection.set(attachments, refreshInFlightAttachments)
     }
-    const staged = [...attachments].filter(stagedUploadNeedsRefresh)
-    for (const attachment of staged) {
-      if (!preparationIsCurrent()) return false
-      if (refreshInFlightAttachments.has(attachment)) return false
-      const idx = attachments.indexOf(attachment)
-      if (idx < 0 || attachments[idx].kind !== 'staged') continue
-      if (!attachment.file) {
-        attachments[idx] = {
-          kind: 'failed',
-          local_id: attachment.local_id,
-          name: attachment.name,
-          mime: attachment.mime,
-          size: attachment.size,
-          error: 'Upload expired; select the file again',
+    try {
+      const staged = [...attachments].filter(stagedUploadNeedsRefresh)
+      for (const attachment of staged) {
+        if (!preparationIsCurrent()) return false
+        if (refreshInFlightAttachments.has(attachment)) return false
+        const idx = attachments.indexOf(attachment)
+        if (idx < 0 || attachments[idx].kind !== 'staged') continue
+        if (!attachment.file) {
+          attachments[idx] = {
+            kind: 'failed',
+            local_id: attachment.local_id,
+            name: attachment.name,
+            mime: attachment.mime,
+            size: attachment.size,
+            error: 'Upload expired; select the file again',
+          }
+          pushToast(`Upload expired for ${attachment.name}: select the file again`, { tone: 'danger' })
+          return false
         }
-        pushToast(`Upload expired for ${attachment.name}: select the file again`, { tone: 'danger' })
-        return false
+        refreshInFlightAttachments.add(attachment)
+        if (composerOwned) composerRefreshInFlightCount.value += 1
+        try {
+          const meta = await uploadAttachmentFile(attachment.file, attachment.mime)
+          if (!preparationIsCurrent()) return false
+          const currentIdx = attachments.indexOf(attachment)
+          if (currentIdx < 0 || attachments[currentIdx].kind !== 'staged') continue
+          attachments[currentIdx] = {
+            kind: 'staged',
+            local_id: attachment.local_id,
+            name: attachment.name,
+            mime: attachment.mime,
+            size: attachment.size,
+            file_uuid: meta.fileUuid,
+            expires_at: meta.expiresAt,
+            ttl_seconds: meta.ttlSeconds,
+            file: attachment.file,
+          }
+        } catch (err: unknown) {
+          if (!preparationIsCurrent()) return false
+          const message = uploadFailureMessage(err)
+          markAttachmentFailed(
+            attachment.local_id,
+            attachment.file,
+            attachment.mime,
+            message,
+            attachments,
+            attachment,
+          )
+          pushToast(`${i18n.global.t('chat.toast.uploadFailed', { name: attachment.name })}: ${message}`, { tone: 'danger' })
+          return false
+        } finally {
+          const removed = refreshInFlightAttachments.delete(attachment)
+          if (composerOwned && removed && isAttachmentGenerationCurrent(generation)) {
+            composerRefreshInFlightCount.value = Math.max(0, composerRefreshInFlightCount.value - 1)
+          }
+        }
       }
-      refreshInFlightAttachments.add(attachment)
-      if (composerOwned) composerRefreshInFlightCount.value += 1
-      try {
-        const meta = await uploadAttachmentFile(attachment.file, attachment.mime)
-        if (!preparationIsCurrent()) return false
-        const currentIdx = attachments.indexOf(attachment)
-        if (currentIdx < 0 || attachments[currentIdx].kind !== 'staged') continue
-        attachments[currentIdx] = {
-          kind: 'staged',
-          local_id: attachment.local_id,
-          name: attachment.name,
-          mime: attachment.mime,
-          size: attachment.size,
-          file_uuid: meta.fileUuid,
-          expires_at: meta.expiresAt,
-          ttl_seconds: meta.ttlSeconds,
-          file: attachment.file,
-        }
-      } catch (err: unknown) {
-        if (!preparationIsCurrent()) return false
-        const message = uploadFailureMessage(err)
-        markAttachmentFailed(
-          attachment.local_id,
-          attachment.file,
-          attachment.mime,
-          message,
-          attachments,
-          attachment,
-        )
-        pushToast(`${i18n.global.t('chat.toast.uploadFailed', { name: attachment.name })}: ${message}`, { tone: 'danger' })
-        return false
-      } finally {
-        const removed = refreshInFlightAttachments.delete(attachment)
-        if (composerOwned && removed && isAttachmentGenerationCurrent(generation)) {
-          composerRefreshInFlightCount.value = Math.max(0, composerRefreshInFlightCount.value - 1)
-        }
+      return true
+    } finally {
+      if (composerPreparationInFlight === composerPreparation) {
+        composerPreparationInFlight = null
       }
     }
-    return true
   }
 
   function activeAttachmentCount(): number {

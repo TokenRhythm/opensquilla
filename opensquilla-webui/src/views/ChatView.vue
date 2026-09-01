@@ -942,6 +942,7 @@ import {
   optionalSessionRpcCallOptions,
 } from '@/composables/chat/sessionBootstrapAdmission'
 import { useChatSessionRuntime } from '@/composables/chat/useChatSessionRuntime'
+import { switchChatViewSession } from '@/views/chatViewSessionNavigation'
 import {
   useChatSessionSubscription,
   type SessionSubscriptionOutcome,
@@ -2931,19 +2932,19 @@ const {
 switchToPlanSession = switchToSession
 
 async function switchToSession(nextSessionKey: string) {
-  const outcome = await switchRuntimeToSession(nextSessionKey)
-  if (outcome?.authoritative) {
-    await handleAuthoritativeSessionSubscription(nextSessionKey)
-  }
-  return outcome
+  return switchChatViewSession(
+    nextSessionKey,
+    switchRuntimeToSession,
+    handleAuthoritativeSessionSubscription,
+  )
 }
 
 async function adoptMaterializedSession(nextSessionKey: string) {
-  const outcome = await adoptRuntimeMaterializedSession(nextSessionKey)
-  if (outcome?.authoritative) {
-    await handleAuthoritativeSessionSubscription(nextSessionKey)
-  }
-  return outcome
+  return switchChatViewSession(
+    nextSessionKey,
+    adoptRuntimeMaterializedSession,
+    handleAuthoritativeSessionSubscription,
+  )
 }
 
 const metaSkillSetup = useMetaSkillSetup({
