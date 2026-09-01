@@ -1898,6 +1898,22 @@ describe('useChatRpcEventHandlers task group lifecycle', () => {
     }
   })
 
+  it('passes succeeded terminal state from the authoritative session projection', () => {
+    const { api, onTaskTerminal, stop } = createHarness()
+    try {
+      api.handlers.onSessionsChanged({
+        session_key: 'agent:main:test',
+        reason: 'task_terminal',
+        run_status: 'idle',
+        last_task: { task_id: 'task-succeeded-1', status: 'succeeded' },
+      })
+
+      expect(onTaskTerminal).toHaveBeenCalledWith('task-succeeded-1', 'succeeded')
+    } finally {
+      stop()
+    }
+  })
+
   it('passes a terminal to its domain owner before rejecting a different render owner', () => {
     const { api, onTaskTerminal, stop } = createHarness()
     try {

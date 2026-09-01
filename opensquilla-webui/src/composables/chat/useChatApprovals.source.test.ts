@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import source from './useChatApprovals.ts?raw'
+import chatViewSource from '@/views/ChatView.vue?raw'
 
 describe('useChatApprovals clarify submit source contract', () => {
   it('can submit a recovered inline clarify request without pendingClarify', () => {
@@ -24,5 +25,20 @@ describe('useChatApprovals clarify submit source contract', () => {
     expect(repliedState).toBeGreaterThan(awaitAck)
     expect(source).toContain('clarifySubmitted.value = false')
     expect(source).toContain('setInterruptState(key, { resolution: null, busy: false, error: message })')
+  })
+
+  it('routes live, reconnect, and history terminal owners through one settlement path', () => {
+    expect(chatViewSource).toContain(
+      'const terminalTask = terminalTaskFromRunState(snapshot)',
+    )
+    expect(chatViewSource).toContain(
+      'if (terminalStatus) settleTaskTerminalPresentation(taskId, terminalStatus)',
+    )
+    expect(chatViewSource).toContain(
+      'settleTaskTerminalPresentation(terminalTask.taskId, terminalTask.status)',
+    )
+    expect(chatViewSource).toContain(
+      'settleTaskTerminalPresentation(taskId, status)',
+    )
   })
 })

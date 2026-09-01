@@ -56,7 +56,7 @@ import {
   taskGroupId as eventTaskGroupId,
   taskTerminalAsSessionEvent as normalizeTaskTerminalEvent,
   taskTerminalStatus as eventTaskTerminalStatus,
-  type TaskSettlementStatus,
+  taskTerminalStatusFromValue as taskSettlementStatus,
   type TaskTerminalStatus,
 } from '@/utils/chat/streamEvents'
 import { localizedChatErrorMessage } from '@/utils/chat/errors'
@@ -305,28 +305,6 @@ const TASK_TERMINAL_STATUSES = new Set([
   'abandoned',
   'interrupted',
 ])
-
-const TASK_SETTLEMENT_STATUSES = new Set<TaskSettlementStatus>([
-  'failed',
-  'cancelled',
-  'timeout',
-  'abandoned',
-  'interrupted',
-])
-
-function taskSettlementStatus(value: unknown): TaskSettlementStatus | '' {
-  const normalized = String(value || '').trim().toLowerCase()
-  const compatible = normalized === 'error'
-    ? 'failed'
-    : normalized === 'killed'
-      ? 'cancelled'
-      : normalized === 'timed_out'
-        ? 'timeout'
-        : normalized
-  return TASK_SETTLEMENT_STATUSES.has(compatible as TaskSettlementStatus)
-    ? compatible as TaskSettlementStatus
-    : ''
-}
 
 type LiveThinking = {
   text: string

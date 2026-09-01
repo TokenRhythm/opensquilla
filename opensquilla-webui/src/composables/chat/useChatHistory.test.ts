@@ -2550,6 +2550,30 @@ describe('useChatHistory optimistic local rows', () => {
     }))
   })
 
+  it('notifies terminal direct turns that have no TaskRuntime id', async () => {
+    const onTerminalTask = vi.fn()
+    const { api } = makeHistory(true, {
+      onTerminalTask,
+      response: {
+        messages: [],
+        turn_outcomes: [{
+          turn_id: 'direct-terminal-turn',
+          status: 'succeeded',
+          finished_at: 2_000,
+        }],
+        has_more: false,
+        canonical_complete: true,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(onTerminalTask).toHaveBeenCalledWith(expect.objectContaining({
+      turnId: 'direct-terminal-turn',
+      status: 'succeeded',
+    }))
+  })
+
   it('restores usage barrier activity and its retryable error from terminal history', async () => {
     const { api, messages } = makeHistory(true, {
       response: {

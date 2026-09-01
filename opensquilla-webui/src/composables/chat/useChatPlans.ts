@@ -182,6 +182,7 @@ export function useChatPlans(options: UseChatPlansOptions) {
   let acceptedEpoch = 0
   let modeMutationOwner: symbol | null = null
   let actionMutationOwner: symbol | null = null
+  let settledTaskFence: { runId: string; taskId: string } | null = null
 
   function clearPlanState() {
     // Reset/session changes invalidate in-flight UI mutations. Their delayed
@@ -191,6 +192,7 @@ export function useChatPlans(options: UseChatPlansOptions) {
     collaboration.value = { mode: 'default', revision: 0 }
     currentPlan.value = null
     activePlanRun.value = null
+    settledTaskFence = null
     modeBusy.value = false
     pendingAction.value = null
     modeAppliesNextTurn.value = false
@@ -277,9 +279,14 @@ export function useChatPlans(options: UseChatPlansOptions) {
       !run
       || !currentPlan.value
       || run.planRevisionId !== currentPlan.value.revisionId
+      || (
+        settledTaskFence?.runId === run.runId
+        && settledTaskFence.taskId === run.activeTaskId
+      )
       || !shouldAdoptPlanRun(run, activePlanRun.value)
     ) return false
     activePlanRun.value = run
+    if (settledTaskFence?.runId === run.runId) settledTaskFence = null
     return true
   }
 
@@ -532,9 +539,12 @@ export function useChatPlans(options: UseChatPlansOptions) {
   }
 
   /**
-   * A task terminal can arrive before the matching plan-run event reaches this
-   * surface. Settle only the run owned by that exact task and retain its
-   * terminal state as a local monotonic fence against delayed active updates.
+   * A task terminal arrives before TaskRuntime settles its attached PlanRun.
+   * Release the exact task owner immediately for presentation, but do not
+   * invent a terminal run: running implementations are persisted as resumable
+   * paused runs. The owner fence rejects delayed pre-terminal run events until
+   * the authoritative owner-free paused/cancelled snapshot replaces this
+   * transient projection.
    */
   function settleActiveRunForTerminalTask(
     taskId: string,
@@ -543,17 +553,13 @@ export function useChatPlans(options: UseChatPlansOptions) {
     const run = activePlanRun.value
     if (!run || !taskId || run.activeTaskId !== taskId) return false
     if (!['queued', 'running', 'paused', 'blocked'].includes(run.status)) return false
-    const terminalReason = taskStatus === 'cancelled' ? 'cancelled_by_user' : taskStatus
+    const settlementReason = taskStatus === 'cancelled' ? 'cancelled_by_user' : taskStatus
+    settledTaskFence = { runId: run.runId, taskId }
     activePlanRun.value = {
       ...run,
-      status: 'cancelled',
-      currentStepId: undefined,
+      status: 'paused',
       activeTaskId: undefined,
-      terminalReason,
-      finishedAt: run.finishedAt ?? Date.now(),
-      steps: run.steps.map(step => step.status === 'in_progress'
-        ? { ...step, status: 'skipped', reason: terminalReason }
-        : step),
+      pauseReason: settlementReason,
     }
     return true
   }

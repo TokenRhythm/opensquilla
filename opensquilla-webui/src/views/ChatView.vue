@@ -1092,6 +1092,8 @@ import {
   FINISHED_STREAM_TASK_ID,
   PENDING_STREAM_TASK_ID,
   STOPPED_STREAM_TASK_ID,
+  taskTerminalStatusFromValue,
+  type TaskTerminalStatus,
 } from '@/utils/chat/streamEvents'
 import { copyTextWithFallback, copyImageToClipboard, downloadBlob, shareCopyImageSupported } from '@/utils/browser'
 import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
@@ -2331,8 +2333,10 @@ const chatHistory = useChatHistory({
   stripTimePrefix,
   scrollToBottom,
   onTerminalTask: outcome => {
-    const taskId = outcome.taskId || ''
+    const taskId = outcome.taskId || outcome.turnId || ''
     if (!taskId) return
+    const terminalStatus = taskTerminalStatusFromValue(outcome.status)
+    if (terminalStatus) settleTaskTerminalPresentation(taskId, terminalStatus)
     taskOwnership.noteTerminal(taskId)
     const ownsLiveStream = activeStreamTaskId.value === taskId
     const ownsRunStatus = chatTaskId(runStatus.value.task) === taskId
@@ -2550,6 +2554,17 @@ async function handleRegenerateMessage(
   settle?.(accepted)
 }
 
+function terminalTaskFromRunState(source: ChatRunStatusSource) {
+  const task = source.last_task || source.lastTask || source.active_task || source.activeTask
+  const taskId = chatTaskId(task)
+  const status = taskTerminalStatusFromValue(task?.status)
+  return taskId && status ? { taskId, status } : null
+}
+
+let settleTaskTerminalPresentation: (
+  taskId: string,
+  status: TaskTerminalStatus,
+) => void = () => {}
 let applyPendingUserInputSnapshot: typeof chatPlans.applyBootstrap = () => {}
 let applyGoalSnapshot: (snapshot: SessionMessagesSubscribeResponse) => void = () => {}
 const chatSessionSubscription = useChatSessionSubscription({
@@ -2608,10 +2623,14 @@ const chatSessionSubscription = useChatSessionSubscription({
     activeProjectWorkspace.failSessionResolution(key, generation)
   },
   onSnapshot: snapshot => {
+    const terminalTask = terminalTaskFromRunState(snapshot)
     chatSessionRouting.applyBootstrap(snapshot)
     chatPlans.applyBootstrap(snapshot)
     applyGoalSnapshot(snapshot)
     applyPendingUserInputSnapshot(snapshot)
+    if (terminalTask) {
+      settleTaskTerminalPresentation(terminalTask.taskId, terminalTask.status)
+    }
   },
 })
 const {
@@ -3731,6 +3750,12 @@ const {
   applyUserInputBootstrap,
 } = chatApprovals
 applyPendingUserInputSnapshot = applyUserInputBootstrap
+settleTaskTerminalPresentation = (taskId, status) => {
+  if (status !== 'succeeded') {
+    chatPlans.settleActiveRunForTerminalTask(taskId, status)
+  }
+  settlePendingClarifyForTerminalTask(taskId, status)
+}
 
 const dockedPlanQuestionnaire = computed(() => (
   pendingClarify.value?.presentation === 'plan_questionnaire_v1'
@@ -3858,10 +3883,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   loadCurrentSessionUsage,
   refreshRunModePreference: refreshPostBootstrapMetadata,
   onTaskTerminal: (taskId, status) => {
-    if (status !== 'succeeded') {
-      chatPlans.settleActiveRunForTerminalTask(taskId, status)
-    }
-    settlePendingClarifyForTerminalTask(taskId, status)
+    settleTaskTerminalPresentation(taskId, status)
   },
 })
 bindActiveStreamTask = rpcEventHandlers.bindActiveStreamTask

@@ -753,7 +753,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     for (const raw of data.turn_outcomes || []) {
       const outcome = normalizeTurnOutcome(raw)
       if (
-        outcome?.taskId
+        (outcome?.taskId || outcome?.turnId)
         && ['succeeded', 'failed', 'cancelled', 'timeout', 'abandoned', 'interrupted']
           .includes(outcome.status.toLowerCase())
       ) {

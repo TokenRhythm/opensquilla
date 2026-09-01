@@ -67,6 +67,31 @@ export type TaskSettlementStatus =
 
 export type TaskTerminalStatus = 'succeeded' | TaskSettlementStatus
 
+const TASK_TERMINAL_STATUS_VALUES = new Set<TaskTerminalStatus>([
+  'succeeded',
+  'failed',
+  'cancelled',
+  'timeout',
+  'abandoned',
+  'interrupted',
+])
+
+export function taskTerminalStatusFromValue(value: unknown): TaskTerminalStatus | '' {
+  const normalized = String(value || '').trim().toLowerCase()
+  const compatible = normalized === 'success' || normalized === 'complete'
+    ? 'succeeded'
+    : normalized === 'error'
+      ? 'failed'
+      : normalized === 'killed'
+        ? 'cancelled'
+        : normalized === 'timed_out'
+          ? 'timeout'
+          : normalized
+  return TASK_TERMINAL_STATUS_VALUES.has(compatible as TaskTerminalStatus)
+    ? compatible as TaskTerminalStatus
+    : ''
+}
+
 export const PENDING_STREAM_TASK_ID = '__opensquilla_pending_stream_task__'
 export const STOPPED_STREAM_TASK_ID = '__opensquilla_stopped_stream_task__'
 // Tombstone left after a terminal event closes the live turn. Unlike an empty
