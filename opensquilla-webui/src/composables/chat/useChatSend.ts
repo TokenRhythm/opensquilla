@@ -224,6 +224,7 @@ interface ComposerSnapshot {
   initialCollaborationMode: CollaborationMode | null
   initialRoutingMode: GatewayModelRoutingMode | null
   queueOwnerRequestId: string | null
+  messageEditGeneration: number | null
 }
 
 interface DispatchSendOptions {
@@ -495,6 +496,8 @@ export interface UseChatSendOptions {
   runMode: Ref<SandboxRunMode>
   pendingAttachments: Ref<Attachment[]>
   composerRevision?: Readonly<Ref<number>>
+  /** Invalidates a composer send when its message-edit owner is cancelled or replaced. */
+  messageEditGeneration?: Readonly<Ref<number>>
   pendingSessionIntent: Ref<string | null>
   initialCollaborationMode: Readonly<Ref<CollaborationMode>>
   initialRoutingMode: Readonly<Ref<GatewayModelRoutingMode | null>>
@@ -791,7 +794,13 @@ export function useChatSend(options: UseChatSendOptions) {
       queueOwnerRequestId: queueOwnerContext?.sessionKey === options.sessionKey.value
         ? queueOwnerContext.ownerRequestId
         : null,
+      messageEditGeneration: options.messageEditGeneration?.value ?? null,
     }
+  }
+
+  function messageEditOwnerMatchesSnapshot(snapshot: ComposerSnapshot): boolean {
+    return snapshot.messageEditGeneration === null
+      || options.messageEditGeneration?.value === snapshot.messageEditGeneration
   }
 
   function queueOwnerMatchesSnapshot(snapshot: ComposerSnapshot): boolean {
@@ -2287,6 +2296,7 @@ export function useChatSend(options: UseChatSendOptions) {
         if (await refreshedActiveProjectBlocksSend()) return
       }
       if (options.sessionKey.value !== requestSessionKey) return
+      if (!messageEditOwnerMatchesSnapshot(composerSnapshot)) return
       if (replayBlockedReason?.value) return
       await dispatchSend(exactReplayAttempt.text, {
         composerText,
@@ -2294,6 +2304,7 @@ export function useChatSend(options: UseChatSendOptions) {
         queueMode: exactReplayAttempt.queueMode,
         retryAttempt: exactReplayAttempt,
         idempotentReplay: true,
+        preDispatchGuard: () => messageEditOwnerMatchesSnapshot(composerSnapshot),
       })
       return
     }
@@ -2308,6 +2319,7 @@ export function useChatSend(options: UseChatSendOptions) {
         if (await refreshedActiveProjectBlocksSend()) return
       }
       if (options.sessionKey.value !== requestSessionKey) return
+      if (!messageEditOwnerMatchesSnapshot(composerSnapshot)) return
       if (!queueOwnerMatchesSnapshot(composerSnapshot)) return
       if (options.sendBlockedReason?.value) return
       if (
@@ -2350,6 +2362,7 @@ export function useChatSend(options: UseChatSendOptions) {
         payload: payloadFromSnapshot(composerSnapshot),
         composerSnapshot,
         cancelIfComposerChanged: invocation.cancelIfComposerChanged,
+        preDispatchGuard: () => messageEditOwnerMatchesSnapshot(composerSnapshot),
       })
       return
     }
@@ -2362,6 +2375,7 @@ export function useChatSend(options: UseChatSendOptions) {
     if (slashClassification !== null) {
       if (
         options.sessionKey.value !== requestSessionKey
+        || !messageEditOwnerMatchesSnapshot(composerSnapshot)
         || !composerMatchesSnapshot(composerSnapshot)
         || !queueOwnerMatchesSnapshot(composerSnapshot)
         || Boolean(options.sendBlockedReason?.value)
@@ -2373,6 +2387,7 @@ export function useChatSend(options: UseChatSendOptions) {
       ) return
       if (
         options.sessionKey.value !== requestSessionKey
+        || !messageEditOwnerMatchesSnapshot(composerSnapshot)
         || !composerMatchesSnapshot(composerSnapshot)
         || !queueOwnerMatchesSnapshot(composerSnapshot)
         || Boolean(options.sendBlockedReason?.value)
@@ -2488,6 +2503,7 @@ export function useChatSend(options: UseChatSendOptions) {
       payload: payloadFromSnapshot(composerSnapshot),
       composerSnapshot,
       cancelIfComposerChanged: invocation.cancelIfComposerChanged,
+      preDispatchGuard: () => messageEditOwnerMatchesSnapshot(composerSnapshot),
     })
   }
 
@@ -2788,6 +2804,7 @@ export function useChatSend(options: UseChatSendOptions) {
         { isCurrent: () => options.sessionKey.value === requestSessionKey },
       )
       if (!ready || options.sessionKey.value !== requestSessionKey) return 'not_sent'
+      if (!preDispatchAllowed()) return 'not_sent'
       if (options.sendBlockedReason?.value) return 'not_sent'
       if (
         JSON.stringify(currentPromptAnnotationIds())

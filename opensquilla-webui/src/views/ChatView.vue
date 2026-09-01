@@ -2570,6 +2570,7 @@ const {
   regenerateMessage,
   editMessage,
   cancelEdit,
+  editGeneration,
 } = chatMessageActions
 
 async function handleRegenerateMessage(
@@ -3341,6 +3342,7 @@ const chatSend = useChatSend({
   runMode,
   pendingAttachments,
   composerRevision,
+  messageEditGeneration: editGeneration,
   pendingSessionIntent,
   pendingWorkspaceId,
   sendBlockedReason: effectiveSendBlockedReason,

@@ -2209,6 +2209,67 @@ describe('useChatSend attachment payloads', () => {
     expect(options.messages.value).toEqual([])
   })
 
+  it('abandons an edited send when Escape cancels it during project validation', async () => {
+    const sessionKey = ref('agent:main:webchat:test')
+    const messages = ref<ChatMessage[]>([
+      { role: 'user', text: 'original question', ts: null, messageId: 'msg-original' },
+      { role: 'assistant', text: 'original answer', ts: null, messageId: 'msg-answer' },
+    ])
+    const inputText = ref('unrelated draft')
+    const pendingForkBeforeMessageId = ref<string | null>(null)
+    const messageActions = useChatMessageActions({
+      sessionKey,
+      messages,
+      inputText,
+      isStreaming: ref(false),
+      sanitizeCopyText: text => text,
+      stripTimePrefix: text => text,
+      autoResizeTextarea: vi.fn(),
+      sendCurrentInput: vi.fn(),
+      sendUsageBarrierReplay: vi.fn(async () => false),
+      focusComposer: vi.fn(),
+      pendingForkBeforeMessageId,
+    })
+    messageActions.editMessage({
+      role: 'user',
+      displayRole: 'user',
+      roleLabel: 'User',
+      text: 'original question',
+      timeStr: '',
+      showHeader: false,
+      sourceIndex: 0,
+      messageId: 'msg-original',
+    })
+
+    let finishPreflight!: () => void
+    const validateActiveProjectBeforeSend = vi.fn(() => new Promise<string | null>(
+      resolve => {
+        finishPreflight = () => resolve(null)
+      },
+    ))
+    const { api, rpc } = makeOptions({
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      messageEditGeneration: messageActions.editGeneration,
+      validateActiveProjectBeforeSend,
+    })
+
+    const send = api.onSend()
+    await vi.waitFor(() => expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce())
+    expect(messageActions.cancelEdit()).toBe(true)
+    finishPreflight()
+    await send
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(messages.value.map(message => message.text)).toEqual([
+      'original question', 'original answer',
+    ])
+    expect(inputText.value).toBe('unrelated draft')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+  })
+
   it('sends the clicked snapshot without clearing edits made during project validation', async () => {
     const originalAttachment: Attachment = {
       kind: 'staged',

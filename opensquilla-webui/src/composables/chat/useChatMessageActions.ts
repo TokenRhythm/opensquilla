@@ -1,4 +1,4 @@
-import { nextTick, toRaw, watch, type Ref } from 'vue'
+import { nextTick, ref, toRaw, watch, type Ref } from 'vue'
 import type {
   ChatMessage,
   ChatRenderedMessage,
@@ -69,12 +69,14 @@ interface EditRestorePoint {
 
 export function useChatMessageActions(options: UseChatMessageActionsOptions) {
   let editRestorePoint: EditRestorePoint | null = null
+  const editGeneration = ref(0)
 
   // Session transitions replace the transcript and composer domain. Retire the
   // old restore point synchronously so even an immediate switch back cannot
   // revive state captured before the boundary.
   watch(options.sessionKey, () => {
     editRestorePoint = null
+    editGeneration.value += 1
   }, { flush: 'sync' })
 
   function copyableMessageText(message: ChatRenderedMessage): string {
@@ -233,6 +235,7 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     }
     const text = sourceMessage.text || ''
     const editingMessages = options.messages.value.slice(0, msgIndex)
+    editGeneration.value += 1
     // Everything below this line is undone by `cancelEdit`. Entering edit mode
     // is not a decision the user has confirmed — the transcript shrinks to
     // nothing on the first click, and until #1372 there was no way back:
@@ -282,6 +285,7 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     ) {
       return false
     }
+    editGeneration.value += 1
     options.pendingForkBeforeMessageId.value = restore.previousForkBeforeMessageId
     options.messages.value = restore.messages
     options.inputText.value = restore.inputText
@@ -294,5 +298,6 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     regenerateMessage,
     editMessage,
     cancelEdit,
+    editGeneration,
   }
 }
