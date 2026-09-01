@@ -130,8 +130,11 @@ useDocumentEvent('keydown', event => {
             <Icon name="download" :size="14" aria-hidden="true" />
             <span>{{ manualInstall ? t('updates.desktop.downloadInstaller') : t('updates.desktop.download') }}</span>
           </button>
+          <!-- Manual installs relaunch through the same handoff: the desktop
+               drains its gateway, starts the verified installer, and exits. -->
           <button
-            v-if="status === 'downloaded' && update.state.value.installMode === 'native'"
+            v-if="status === 'downloaded'
+              && (update.state.value.installMode === 'native' || update.state.value.installMode === 'manual')"
             type="button"
             class="btn btn--primary"
             data-testid="desktop-update-relaunch"

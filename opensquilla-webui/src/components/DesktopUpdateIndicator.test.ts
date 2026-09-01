@@ -151,7 +151,7 @@ describe('DesktopUpdateIndicator', () => {
     app.unmount()
   })
 
-  it('reveals a verified Windows installer without offering native relaunch', async () => {
+  it('reveals a verified Windows installer and offers the relaunch handoff', async () => {
     const api = desktopUpdateApi({
       status: 'downloaded',
       canNativeInstall: false,
@@ -165,11 +165,14 @@ describe('DesktopUpdateIndicator', () => {
     ;(el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement).click()
     await settle()
     expect(document.body.textContent).toContain('Verified installer ready')
-    expect(document.querySelector('[data-testid="desktop-update-relaunch"]')).toBeNull()
-    ;(document.querySelector('[data-testid="desktop-update-show-installer"]') as HTMLButtonElement).click()
+    expect(document.querySelector('[data-testid="desktop-update-show-installer"]')).not.toBeNull()
+
+    // Manual mode shares the native relaunch handoff: drain, install, exit.
+    // (Click before any mocked action response replaces the state.)
+    ;(document.querySelector('[data-testid="desktop-update-relaunch"]') as HTMLButtonElement).click()
     await settle()
 
-    expect(api.downloadUpdate).toHaveBeenCalledTimes(1)
+    expect(api.relaunchToUpdate).toHaveBeenCalledTimes(1)
     app.unmount()
   })
 

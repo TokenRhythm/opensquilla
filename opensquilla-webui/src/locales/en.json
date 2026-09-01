@@ -77,7 +77,7 @@
       "availableDesc": "Download it when you're ready. OpenSquilla will install it only after you relaunch.",
       "manualAvailableDesc": "Download the versioned Windows installer. Windows will ask you to complete the installation.",
       "manualDownloadedTitle": "Verified installer ready",
-      "manualDownloadedDesc": "OpenSquilla {version} was verified against the canonical GitHub checksum and shown in its folder. Run the installer when ready.",
+      "manualDownloadedDesc": "OpenSquilla {version} was verified against the canonical GitHub checksum. Relaunch closes OpenSquilla and runs the installer for you, or run it yourself from its folder.",
       "downloadedTitle": "Ready to install",
       "downloadedDesc": "Relaunch OpenSquilla to finish updating to {version}.",
       "downloadingTitle": "Downloading update",

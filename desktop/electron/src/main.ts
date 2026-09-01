@@ -21,6 +21,7 @@ import {
   type DesktopProfilePaths,
 } from './desktop-profile-context.js'
 import { DesktopWriterAdmission } from './desktop-writer-admission.js'
+import { manualHandoffBlocker, manualInstallerLaunchPlan } from './manual-update-handoff.js'
 import {
   createDesktopGatewayInstanceNonce,
   desktopGatewayAuthToken,
@@ -11189,9 +11190,13 @@ async function stopAndJoinAllLifecycleOwnedGateways(
 function restoreDownloadedUpdateRetryState(
   pendingVersion: string | null,
   writerAdmissionToken: symbol | null = null,
+  mode: 'native' | 'manual' = 'native',
 ): boolean {
   if (writerAdmissionToken) desktopWriters.reopen(writerAdmissionToken)
-  downloadedUpdateVersion = pendingVersion
+  // The manual flow keys its retry state on verifiedManualInstallerPath
+  // (still set — it is only cleared once the installer has been spawned);
+  // assigning downloadedUpdateVersion would wrongly arm the native path.
+  if (mode === 'native') downloadedUpdateVersion = pendingVersion
   updateApplying = false
   updateInstallHandoffReady = false
   isQuitting = false
@@ -11216,7 +11221,16 @@ function restoreDownloadedUpdateRetryState(
 async function applyDownloadedUpdate(): Promise<void> {
   if (updateApplying) return
   if (isQuitting || desktopWriters.closed) return
-  if (!mockDownloadedUpdate && !downloadedUpdateVersion) return
+  const manualReady = !mockDownloadedUpdate && manualHandoffBlocker({
+    installMode: desktopUpdateInstallMode(),
+    status: desktopUpdateStatus,
+    verifiedInstallerPath: verifiedManualInstallerPath,
+    updateApplying,
+    quitting: isQuitting,
+    writersClosed: desktopWriters.closed,
+  }) === null
+  if (!manualReady && !mockDownloadedUpdate && !downloadedUpdateVersion) return
+  if (manualReady) return applyVerifiedManualInstaller()
 
   if (mockDownloadedUpdate) {
     const version = downloadedUpdateVersion || mockUpdateVersion() || app.getVersion()
@@ -11325,6 +11339,101 @@ async function applyDownloadedUpdate(): Promise<void> {
     // swallowed as intentional (isQuitting was true). restoreDownloadedUpdateRetryState
     // cleared isQuitting, so bring the runtime back up instead of leaving the
     // window stranded on the dead gateway's Control UI.
+    if (!quitResumed) void openOrResumeDesktopApp()
+  }
+}
+
+// Manual-mode (unsigned Windows) counterpart of the native handoff above.
+// Historically the desktop only revealed the verified installer and left it
+// to the user to run against a still-live app: the NSIS process check then
+// force-stopped the app and every process under the install directory — no
+// graceful gateway drain — and an instance it could not stop (elevated,
+// hung, or hidden in the tray) dead-ended the update in a "cannot be
+// closed" retry dialog. Reuse the exact native drain (writers, then owned
+// gateway, joined) and only then start the installer and quit, so the
+// installer finds nothing to close and nothing holding runtime files.
+async function applyVerifiedManualInstaller(): Promise<void> {
+  const installerPath = verifiedManualInstallerPath
+  if (!installerPath) return
+  const pendingVersion = desktopUpdateLatestVersion
+  updateApplying = true
+  setAppExitPhase('deferred', 'preparing downloaded update')
+  const updateWriterAdmission = desktopWriters.close('apply downloaded update')
+  await waitForDesktopWriterOperations()
+  createApplicationMenu()
+  setDesktopUpdateState({
+    status: 'applying',
+    latestVersion: pendingVersion,
+    progress: 100,
+    error: null,
+  })
+  isQuitting = true
+  setAppExitPhase('draining', 'stopping Gateway for downloaded update')
+  const exited = await stopAndJoinAllLifecycleOwnedGateways((child) => {
+    updateGatewayShutdownProcess = child
+    // We stay alive and await the exit below, so let the gateway take its
+    // Windows HTTP graceful drain instead of an immediate TerminateProcess.
+    allowGracefulShutdownWhileQuitting = true
+    try {
+      stopGateway()
+    } finally {
+      allowGracefulShutdownWhileQuitting = false
+    }
+  })
+  // Same re-read as the native path: no await between this check and the
+  // spawn below, so a child already stopping cannot be skipped.
+  if (!exited || liveLifecycleOwnedGatewayProcesses().length > 0) {
+    const quitResumed = restoreDownloadedUpdateRetryState(
+      pendingVersion,
+      updateWriterAdmission,
+      'manual',
+    )
+    if (!quitResumed) {
+      void showUpdateDialog({
+        type: 'error',
+        buttons: ['OK'],
+        title: desktopT('update.errorTitle'),
+        message: desktopT('update.errorTitle'),
+        detail: desktopT('update.gatewayShutdownTimeout'),
+      })
+    }
+    return
+  }
+  updateGatewayShutdownProcess = null
+  try {
+    const plan = manualInstallerLaunchPlan(installerPath)
+    const installer = spawn(plan.command, plan.args, plan.options)
+    // A detached spawn reports failure (missing/blocked installer file)
+    // asynchronously; wait for the definitive spawn/error signal so a
+    // failed launch restores the retry state instead of quitting into
+    // nothing.
+    await new Promise<void>((resolveSpawn, rejectSpawn) => {
+      installer.once('spawn', () => resolveSpawn())
+      installer.once('error', rejectSpawn)
+    })
+    installer.unref()
+    verifiedManualInstallerPath = null
+    updateInstallHandoffReady = true
+    setAppExitPhase('committed', 'handing off to manual installer')
+    app.quit()
+  } catch (err) {
+    console.error('[updater] failed to start verified manual installer', err)
+    const quitResumed = restoreDownloadedUpdateRetryState(
+      pendingVersion,
+      updateWriterAdmission,
+      'manual',
+    )
+    if (!quitResumed) {
+      void showUpdateDialog({
+        type: 'error',
+        buttons: ['OK'],
+        title: desktopT('update.errorTitle'),
+        message: desktopT('update.errorTitle'),
+        detail: desktopT('update.installFailed'),
+      })
+    }
+    // Mirror the native catch: the owned gateway was stopped for the failed
+    // handoff, so bring the runtime back up rather than stranding the window.
     if (!quitResumed) void openOrResumeDesktopApp()
   }
 }

@@ -77,7 +77,7 @@
       "availableDesc": "Descárgala cuando estés listo. OpenSquilla la instalará solo después de reiniciar.",
       "manualAvailableDesc": "Descarga el instalador de Windows correspondiente a esta versión. Windows te guiará para completar la instalación.",
       "manualDownloadedTitle": "Instalador verificado listo",
-      "manualDownloadedDesc": "OpenSquilla {version} se verificó con la suma de comprobación oficial de GitHub y se mostró en su carpeta. Ejecuta el instalador cuando estés listo.",
+      "manualDownloadedDesc": "OpenSquilla {version} se verificó con la suma de comprobación oficial de GitHub. Reiniciar cierra OpenSquilla y ejecuta el instalador; también puedes ejecutarlo tú mismo desde su carpeta.",
       "downloadedTitle": "Lista para instalar",
       "downloadedDesc": "Reinicia OpenSquilla para terminar la actualización a {version}.",
       "downloadingTitle": "Descargando actualización",

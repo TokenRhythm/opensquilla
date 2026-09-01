@@ -63,7 +63,13 @@ const description = computed(() => {
 const showDownload = computed(() => state.value.canCheck && state.value.installMode !== 'unsupported' && (
   status.value === 'available' || (manualInstall.value && status.value === 'downloaded')
 ))
-const showRelaunch = computed(() => state.value.installMode === 'native' && status.value === 'downloaded')
+// Manual (unsigned Windows) installs hand off through the same relaunch
+// action: the desktop drains its gateway, starts the verified installer,
+// and exits — so the installer never has to force-close a live app.
+const showRelaunch = computed(() => (
+  (state.value.installMode === 'native' || state.value.installMode === 'manual')
+  && status.value === 'downloaded'
+))
 const showLater = computed(() => state.value.canCheck && (status.value === 'available' || status.value === 'downloaded' || status.value === 'error'))
 </script>
 
