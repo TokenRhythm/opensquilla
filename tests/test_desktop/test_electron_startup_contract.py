@@ -2800,10 +2800,15 @@ def test_desktop_gateway_bundle_collects_usage_ledger_and_verifies_query_ui() ->
     build_script = _read("desktop/electron/scripts/build-gateway.mjs")
     migration = ROOT / "migrations" / "V021__usage_ledger.py"
     usage_query = _read("opensquilla-webui/src/composables/usage/useUsageQuery.ts")
+    observability_adapter = _read(
+        "opensquilla-webui/src/adapters/gateway/observabilityV4.ts"
+    )
 
     assert "'--collect-all',\n  'opensquilla'," in build_script
     assert migration.is_file()
-    assert "const USAGE_QUERY_METHOD = 'usage.query'" in usage_query
+    assert "return observability.usage(range, options)" in usage_query
+    assert "'usage.query'" not in usage_query
+    assert "const USAGE_QUERY_METHOD = 'usage.query'" in observability_adapter
     assert "controlUiVerifier" in build_script
     assert "spawnSync(process.execPath, [controlUiVerifier, controlUiDistDir]" in build_script
     assert build_script.index("\nassertControlUiArtifactReady()\n") < build_script.index(
