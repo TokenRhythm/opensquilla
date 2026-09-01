@@ -10,6 +10,37 @@ vi.mock('@/composables/useToasts', () => ({
   useToasts: () => ({ pushToast }),
 }))
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
+
+class ControlledFileReader {
+  static instances: ControlledFileReader[] = []
+
+  result: string | ArrayBuffer | null = null
+  onload: ((event: ProgressEvent<FileReader>) => void) | null = null
+  onerror: ((event: ProgressEvent<FileReader>) => void) | null = null
+
+  readAsDataURL(_blob: Blob) {
+    ControlledFileReader.instances.push(this)
+  }
+
+  succeed(dataUrl: string) {
+    this.result = dataUrl
+    this.onload?.({ target: this } as unknown as ProgressEvent<FileReader>)
+  }
+
+  fail() {
+    this.onerror?.({ target: this } as unknown as ProgressEvent<FileReader>)
+  }
+}
+
 function stagedPdf(name = 'paper.pdf') {
   return new File([new Uint8Array(2_000_001)], name, { type: 'application/pdf' })
 }
@@ -32,6 +63,16 @@ function successfulUploadResponse(fileUuid = 'file-1') {
     status: 200,
     json: async () => ({ file_uuid: fileUuid }),
     text: async () => '',
+  }
+}
+
+function nextSessionAttachment(localId: number): Attachment {
+  return {
+    kind: 'inline',
+    local_id: localId,
+    name: 'session-b.txt',
+    mime: 'text/plain',
+    data: 'Qg==',
   }
 }
 
@@ -98,6 +139,7 @@ function useTestChatAttachments() {
 describe('useChatAttachments', () => {
   beforeEach(() => {
     pushToast.mockClear()
+    ControlledFileReader.instances = []
     vi.stubGlobal('sessionStorage', {
       getItem: vi.fn((key: string) => key === 'opensquilla.wsToken' ? 'token-123' : null),
     })
@@ -105,6 +147,169 @@ describe('useChatAttachments', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals()
+  })
+
+  it.each([
+    ['successful', (sniff: ReturnType<typeof deferred<ArrayBuffer>>) => {
+      sniff.resolve(new TextEncoder().encode('session A text').buffer)
+    }],
+    ['failed', (sniff: ReturnType<typeof deferred<ArrayBuffer>>) => {
+      sniff.reject(new Error('sniff failed'))
+    }],
+  ])('ignores a delayed %s MIME sniff after attachments retire', async (_outcome, settle) => {
+    vi.stubGlobal('FileReader', ControlledFileReader)
+    const attachments = useTestChatAttachments()
+    const sniff = deferred<ArrayBuffer>()
+    const file = new File(['session A'], 'draft.unknown', { type: 'application/x-unknown' })
+    Object.defineProperty(file, 'arrayBuffer', {
+      configurable: true,
+      value: vi.fn(() => sniff.promise),
+    })
+
+    const adding = attachments.addAttachment(file)
+    expect(attachments.pendingAttachments.value).toEqual([])
+
+    attachments.retireAttachments()
+    const sessionBAttachment = nextSessionAttachment(1)
+    attachments.pendingAttachments.value = [sessionBAttachment]
+    settle(sniff)
+    await adding
+
+    expect(ControlledFileReader.instances).toHaveLength(0)
+    expect(attachments.pendingAttachments.value).toEqual([sessionBAttachment])
+    expect(pushToast).not.toHaveBeenCalled()
+  })
+
+  it.each(['load', 'error'] as const)(
+    'ignores a delayed FileReader %s callback after attachments retire',
+    async outcome => {
+      vi.stubGlobal('FileReader', ControlledFileReader)
+      const attachments = useTestChatAttachments()
+
+      await attachments.addAttachment(
+        new File(['session A'], 'draft.txt', { type: 'text/plain' }),
+      )
+
+      expect(ControlledFileReader.instances).toHaveLength(1)
+      const reader = ControlledFileReader.instances[0]!
+      const localId = attachments.pendingAttachments.value[0]!.local_id
+      attachments.retireAttachments()
+      const sessionBAttachment = nextSessionAttachment(localId)
+      attachments.pendingAttachments.value = [sessionBAttachment]
+
+      if (outcome === 'load') reader.succeed('data:text/plain;base64,QQ==')
+      else reader.fail()
+
+      expect(attachments.pendingAttachments.value).toEqual([sessionBAttachment])
+      expect(pushToast).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each(['success', 'failure'] as const)(
+    'ignores a delayed staged upload %s after attachments retire',
+    async outcome => {
+      const upload = deferred<unknown>()
+      vi.stubGlobal('fetch', vi.fn(() => upload.promise))
+      const attachments = useTestChatAttachments()
+
+      await attachments.addAttachment(stagedPdf('session-a.pdf'))
+
+      expect(attachments.pendingAttachments.value).toMatchObject([
+        { kind: 'uploading', name: 'session-a.pdf' },
+      ])
+      const localId = attachments.pendingAttachments.value[0]!.local_id
+      attachments.retireAttachments()
+      const sessionBAttachment = nextSessionAttachment(localId)
+      attachments.pendingAttachments.value = [sessionBAttachment]
+
+      if (outcome === 'success') upload.resolve(successfulUploadResponse('file-session-a'))
+      else upload.reject(new Error('late upload failure'))
+      await flushUpload()
+
+      expect(attachments.pendingAttachments.value).toEqual([sessionBAttachment])
+      expect(pushToast).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each(['success', 'failure'] as const)(
+    'retires delayed staged refresh %s state without touching the next session',
+    async outcome => {
+      const upload = deferred<unknown>()
+      vi.stubGlobal('fetch', vi.fn(() => upload.promise))
+      const attachments = useTestChatAttachments()
+      const sessionAFile = stagedPdf('session-a-refresh.pdf')
+      attachments.pendingAttachments.value = [{
+        kind: 'staged',
+        local_id: 1,
+        name: sessionAFile.name,
+        mime: sessionAFile.type,
+        file_uuid: 'file-expired',
+        expires_at: Date.now() / 1000 - 1,
+        file: sessionAFile,
+      }]
+
+      const preparing = attachments.prepareAttachmentsForSend()
+      expect(attachments.hasPendingAttachmentWork()).toBe(true)
+      attachments.retireAttachments()
+      const sessionBAttachment = nextSessionAttachment(1)
+      attachments.pendingAttachments.value = [sessionBAttachment]
+
+      if (outcome === 'success') upload.resolve(successfulUploadResponse('file-session-a-fresh'))
+      else upload.reject(new Error('late refresh failure'))
+
+      await expect(preparing).resolves.toBe(false)
+      expect(attachments.hasPendingAttachmentWork()).toBe(false)
+      expect(attachments.pendingAttachments.value).toEqual([sessionBAttachment])
+      expect(pushToast).not.toHaveBeenCalled()
+    },
+  )
+
+  it('does not let retired refresh cleanup release same-id work in the next session', async () => {
+    const sessionAUpload = deferred<unknown>()
+    const sessionBUpload = deferred<unknown>()
+    vi.stubGlobal('fetch', vi.fn()
+      .mockImplementationOnce(() => sessionAUpload.promise)
+      .mockImplementationOnce(() => sessionBUpload.promise))
+    const attachments = useTestChatAttachments()
+    const sessionAFile = stagedPdf('session-a-refresh.pdf')
+    attachments.pendingAttachments.value = [{
+      kind: 'staged',
+      local_id: 1,
+      name: sessionAFile.name,
+      mime: sessionAFile.type,
+      file_uuid: 'file-a-expired',
+      expires_at: Date.now() / 1000 - 1,
+      file: sessionAFile,
+    }]
+
+    const preparingSessionA = attachments.prepareAttachmentsForSend()
+    attachments.retireAttachments()
+    const sessionBFile = stagedPdf('session-b-refresh.pdf')
+    attachments.pendingAttachments.value = [{
+      kind: 'staged',
+      local_id: 1,
+      name: sessionBFile.name,
+      mime: sessionBFile.type,
+      file_uuid: 'file-b-expired',
+      expires_at: Date.now() / 1000 - 1,
+      file: sessionBFile,
+    }]
+    const preparingSessionB = attachments.prepareAttachmentsForSend()
+
+    sessionAUpload.resolve(successfulUploadResponse('file-a-fresh'))
+    await expect(preparingSessionA).resolves.toBe(false)
+    expect(attachments.hasPendingAttachmentWork()).toBe(true)
+    expect(attachments.pendingAttachments.value).toMatchObject([
+      { name: 'session-b-refresh.pdf', file_uuid: 'file-b-expired' },
+    ])
+
+    sessionBUpload.resolve(successfulUploadResponse('file-b-fresh'))
+    await expect(preparingSessionB).resolves.toBe(true)
+    expect(attachments.hasPendingAttachmentWork()).toBe(false)
+    expect(attachments.pendingAttachments.value).toMatchObject([
+      { name: 'session-b-refresh.pdf', file_uuid: 'file-b-fresh' },
+    ])
+    expect(pushToast).not.toHaveBeenCalled()
   })
 
   it('accepts every file type in a mixed batch (opaque binaries included)', async () => {

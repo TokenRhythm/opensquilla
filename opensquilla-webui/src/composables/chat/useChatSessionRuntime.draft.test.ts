@@ -9,6 +9,7 @@ describe('useChatSessionRuntime project drafts', () => {
   it('clears composer state when an explicit new task replaces an empty draft', () => {
     const sessionKey = ref('agent:main:webchat:project-a-draft')
     const resetDraftComposer = vi.fn()
+    const retireAttachments = vi.fn()
     const taskOwnership = useChatTaskOwnership()
     taskOwnership.noteRunning('task-project-a')
     const activeStreamTaskId = ref('task-project-a')
@@ -62,6 +63,7 @@ describe('useChatSessionRuntime project drafts', () => {
       resetSavingsPopupCooldown: vi.fn(),
       restoreWidgetState: vi.fn(),
       resetStreamLiveTurnState: vi.fn(),
+      retireAttachments,
       resetDraftComposer,
     })
 
@@ -69,6 +71,7 @@ describe('useChatSessionRuntime project drafts', () => {
 
     expect(sessionKey.value).toBe('agent:main:webchat:project-b-draft')
     expect(resetDraftComposer).toHaveBeenCalledOnce()
+    expect(retireAttachments).toHaveBeenCalledOnce()
     expect(taskOwnership.runningTaskId.value).toBe('')
     expect(taskOwnership.queuedTaskIds.value.size).toBe(0)
     expect(taskOwnership.hydrationResolved.value).toBe(true)

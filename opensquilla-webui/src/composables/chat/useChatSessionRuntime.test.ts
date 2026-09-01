@@ -23,6 +23,7 @@ describe('useChatSessionRuntime Meta draft recovery', () => {
     const switchPendingQueue = vi.fn()
     const persistSession = vi.fn((key: string) => { sessionKey.value = key })
     const cancelSessionBootstrap = vi.fn()
+    const retireAttachments = vi.fn()
     const liveOutcome = {
       authoritative: true,
       live: false,
@@ -61,6 +62,7 @@ describe('useChatSessionRuntime Meta draft recovery', () => {
       resetSavingsPopupCooldown: vi.fn(),
       restoreWidgetState: vi.fn(),
       resetStreamLiveTurnState: vi.fn(),
+      retireAttachments,
     })
 
     await expect(runtime.rebindDraftSession(
@@ -78,6 +80,7 @@ describe('useChatSessionRuntime Meta draft recovery', () => {
     )
     expect(startSessionBootstrap).toHaveBeenCalledWith({ includeHistory: false })
     expect(persistSession).not.toHaveBeenCalled()
+    expect(retireAttachments).not.toHaveBeenCalled()
   })
 
   it('does not rebind after the draft ownership guard fails', async () => {
@@ -126,6 +129,7 @@ describe('useChatSessionRuntime Meta draft recovery', () => {
     const persistSession = vi.fn((key: string) => { sessionKey.value = key })
     const setSessionHandoffTarget = vi.fn()
     const beginSessionResolution = vi.fn()
+    const retireAttachments = vi.fn()
     const runtime = useChatSessionRuntime({
       sessionKey,
       messages: ref<ChatMessage[]>([]),
@@ -164,12 +168,14 @@ describe('useChatSessionRuntime Meta draft recovery', () => {
       resetSavingsPopupCooldown: vi.fn(),
       restoreWidgetState: vi.fn(),
       resetStreamLiveTurnState: vi.fn(),
+      retireAttachments,
     })
 
     const switching = runtime.switchToSession('agent:main:webchat:b')
     expect(sessionKey.value).toBe('agent:main:webchat:a')
     expect(cancelSessionBootstrap).not.toHaveBeenCalled()
     expect(beginSessionResolution).not.toHaveBeenCalled()
+    expect(retireAttachments).not.toHaveBeenCalled()
 
     finishQueue()
     await switching
@@ -187,6 +193,7 @@ describe('useChatSessionRuntime Meta draft recovery', () => {
       1,
     )
     expect(setSessionHandoffTarget).toHaveBeenLastCalledWith(null, 1, 'committed')
+    expect(retireAttachments).toHaveBeenCalledOnce()
   })
 
   it('supersedes delayed A to B when navigation returns to A', async () => {
@@ -196,6 +203,7 @@ describe('useChatSessionRuntime Meta draft recovery', () => {
     const cancelSessionBootstrap = vi.fn()
     const persistSession = vi.fn((key: string) => { sessionKey.value = key })
     const beginSessionResolution = vi.fn()
+    const retireAttachments = vi.fn()
     const switchPendingQueue = vi.fn((
       _key: string,
       shouldCommit?: () => boolean,
@@ -229,6 +237,7 @@ describe('useChatSessionRuntime Meta draft recovery', () => {
       resetSavingsPopupCooldown: vi.fn(),
       restoreWidgetState: vi.fn(),
       resetStreamLiveTurnState: vi.fn(),
+      retireAttachments,
     })
 
     const toB = runtime.switchToSession('agent:main:webchat:b')
@@ -243,6 +252,7 @@ describe('useChatSessionRuntime Meta draft recovery', () => {
     expect(cancelSessionBootstrap).not.toHaveBeenCalled()
     expect(beginSessionResolution).not.toHaveBeenCalled()
     expect(persistSession).not.toHaveBeenCalled()
+    expect(retireAttachments).not.toHaveBeenCalled()
     const commitGuard = switchPendingQueue.mock.calls[0]?.[1]
     expect(commitGuard?.()).toBe(false)
   })
@@ -251,6 +261,7 @@ describe('useChatSessionRuntime Meta draft recovery', () => {
     const sessionKey = ref('agent:main:webchat:a')
     const cancelSessionBootstrap = vi.fn()
     const beginSessionResolution = vi.fn()
+    const retireAttachments = vi.fn()
     const failure = new Error('queue adoption failed')
     const runtime = useChatSessionRuntime({
       sessionKey,
@@ -280,11 +291,65 @@ describe('useChatSessionRuntime Meta draft recovery', () => {
       resetSavingsPopupCooldown: vi.fn(),
       restoreWidgetState: vi.fn(),
       resetStreamLiveTurnState: vi.fn(),
+      retireAttachments,
     })
 
     await expect(runtime.switchToSession('agent:main:webchat:b')).rejects.toBe(failure)
     expect(sessionKey.value).toBe('agent:main:webchat:a')
     expect(cancelSessionBootstrap).not.toHaveBeenCalled()
     expect(beginSessionResolution).not.toHaveBeenCalled()
+    expect(retireAttachments).not.toHaveBeenCalled()
+  })
+
+  it('preserves attachments for same-key navigation and response handoff', async () => {
+    const sessionKey = ref('agent:main:webchat:a')
+    const retireAttachments = vi.fn()
+    const runtime = useChatSessionRuntime({
+      sessionKey,
+      messages: ref<ChatMessage[]>([]),
+      pendingSessionIntent: ref(null),
+      routerDecisionPending: ref(null),
+      currentEpoch: ref(0),
+      lastStreamSeq: ref(0),
+      activeTaskGroups: ref(new Set<string>()),
+      aborted: ref(false),
+      lastHeaderRole: ref(''),
+      lastHeaderDay: ref(''),
+      usageAccum: ref(emptyUsage()),
+      usageModel: ref(''),
+      createSessionKey: () => '',
+      persistSession: key => { sessionKey.value = key },
+      cancelSessionBootstrap: vi.fn(),
+      startSessionBootstrap: vi.fn(() => ({
+        generation: 1,
+        criticalRequestsQueued: Promise.resolve(),
+        history: Promise.resolve({ ok: true }),
+        live: Promise.resolve({
+          authoritative: true,
+          live: false,
+          backgroundOnly: false,
+        }),
+      })),
+      loadCurrentSessionUsage: vi.fn(),
+      applySessionRunState: vi.fn(),
+      setCompactInFlight: vi.fn(),
+      hideCompactStatus: vi.fn(),
+      clearPendingQueue: vi.fn(),
+      switchPendingQueue: vi.fn(),
+      adoptPendingQueue: vi.fn(),
+      resetSavingsPopupCooldown: vi.fn(),
+      restoreWidgetState: vi.fn(),
+      resetStreamLiveTurnState: vi.fn(),
+      retireAttachments,
+    })
+
+    await runtime.switchToSession('agent:main:webchat:a')
+    await runtime.adoptResponseSession('agent:main:webchat:b', 'request-a')
+
+    expect(sessionKey.value).toBe('agent:main:webchat:b')
+    expect(retireAttachments).not.toHaveBeenCalled()
+
+    await runtime.switchToSession('agent:main:webchat:a')
+    expect(retireAttachments).toHaveBeenCalledOnce()
   })
 })
