@@ -1680,7 +1680,9 @@ def test_v1_editor_failure_evidence_is_captured_before_desktop_shutdown() -> Non
     failure_capture = script.index(
         "failureEvidence = await captureFailureEvidence", finally_block
     )
-    app_close = script.index("await diagnosticCall('Electron shutdown'", finally_block)
+    app_close = script.index(
+        "await closeDesktopApp(app, 'final-electron-shutdown')", finally_block
+    )
 
     assert durable_check < failure_capture < app_close
     assert "async function diagnosticCall" in script
