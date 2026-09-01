@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Browser extensions can now reach a loopback gateway when their exact
+  custom-scheme origin (for example `chrome-extension://<id>`) is listed in
+  `cors.allowed_origins`. The origin guard treats a listed non-http(s) origin
+  like the registered Desktop origin: exact match only, loopback listeners
+  only, and the `"*"` wildcard is never accepted.
+
 ## [0.5.4] - 2026-08-25
 
 ### Added

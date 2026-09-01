@@ -95,6 +95,20 @@ that entry. OpenSquilla intentionally does not trust arbitrary `Host` values on
 a wildcard listener, because doing so would permit DNS rebinding; `"*"` is not
 accepted for this purpose.
 
+A browser extension connects with a custom-scheme Origin such as
+`chrome-extension://<id>`, which the plain CORS list cannot express. To let a
+local extension reach a loopback gateway — from the CLI-managed gateway or the
+desktop app's — list its exact origin in `cors.allowed_origins`:
+
+```toml
+[cors]
+allowed_origins = ["chrome-extension://<extension-id>"]
+```
+
+Find the id on the extension's detail page in `chrome://extensions`. The match
+is exact, `"*"` is not accepted, and a listed extension origin is honored only
+while the gateway is bound to loopback; remote listeners reject it.
+
 ## Configuration Path
 
 Use a specific config file:

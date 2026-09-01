@@ -20,12 +20,14 @@ from pathlib import Path
 
 import pytest
 import structlog.testing
+from starlette.datastructures import URL
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from opensquilla.gateway.app import create_gateway_app
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.origin_guard import websocket_origin_allowed
 
 # A loopback peer on a loopback-bound, no-auth gateway is the proven owner
 # (see gateway.auth.OpenScopeResolver).
@@ -238,6 +240,141 @@ def test_desktop_renderer_origin_is_exact_and_loopback_only() -> None:
             headers={"Origin": "opensquilla-app://desktop"},
         )
     assert remote.status_code == 403
+
+
+# ── Operator-listed browser extension origins ───────────────────────────────
+
+# A syntactically valid but obviously fake extension origin (the all-"a" id
+# is the conventional placeholder; no real extension owns it). It is not an
+# http(s) origin, so the parse-based allowlist path can never accept it; only
+# the explicit custom-scheme door can.
+_EXTENSION_ORIGIN = "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+
+def test_listed_extension_origin_passes_on_loopback() -> None:
+    # An operator who connects a local browser extension lists its exact
+    # origin; the same loopback-only courtesy as the registered Desktop origin.
+    config = GatewayConfig()
+    config.cors.allowed_origins = [_EXTENSION_ORIGIN]
+    with _client(config) as client:
+        response = client.post(
+            "/api/approvals/settings",
+            json={"mode": "prompt"},
+            headers={"Origin": _EXTENSION_ORIGIN},
+        )
+
+    assert response.status_code == 200, response.text
+
+
+def test_unlisted_extension_origin_is_rejected() -> None:
+    with _client() as client:
+        response = client.post(
+            "/api/approvals/settings",
+            json={"mode": "prompt"},
+            headers={"Origin": _EXTENSION_ORIGIN},
+        )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "FORBIDDEN_ORIGIN"
+
+
+def test_extension_origin_allowlist_matches_exactly() -> None:
+    # Listing one extension id must not admit a neighboring or spoofed id.
+    config = GatewayConfig()
+    config.cors.allowed_origins = [_EXTENSION_ORIGIN]
+    with _client(config) as client:
+        response = client.post(
+            "/api/approvals/settings",
+            json={"mode": "prompt"},
+            headers={"Origin": "chrome-extension://zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"},
+        )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "FORBIDDEN_ORIGIN"
+
+
+def test_wildcard_does_not_admit_extension_origins() -> None:
+    # "*" never bypasses the guard, and it must not start admitting
+    # custom-scheme origins either.
+    config = GatewayConfig()
+    config.cors.allowed_origins = ["*"]
+    with _client(config) as client:
+        response = client.post(
+            "/api/approvals/settings",
+            json={"mode": "prompt"},
+            headers={"Origin": _EXTENSION_ORIGIN},
+        )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "FORBIDDEN_ORIGIN"
+
+
+def test_listed_extension_origin_never_reaches_a_remote_listener() -> None:
+    # The extension door is loopback-only, exactly like the Desktop origin.
+    config = GatewayConfig()
+    config.host = "0.0.0.0"
+    config.cors.allowed_origins = [_EXTENSION_ORIGIN]
+    with TestClient(
+        create_gateway_app(config),
+        base_url="http://192.0.2.10:18791",
+        client=("192.0.2.20", 51000),
+    ) as remote_client:
+        response = remote_client.post(
+            "/api/approvals/settings",
+            json={"mode": "prompt"},
+            headers={"Origin": _EXTENSION_ORIGIN},
+        )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "FORBIDDEN_ORIGIN"
+
+
+def test_listed_null_origin_stays_rejected() -> None:
+    # The opaque "null" origin stays rejected even if someone lists it.
+    config = GatewayConfig()
+    config.cors.allowed_origins = ["null"]
+    with _client(config) as client:
+        response = client.post(
+            "/api/approvals/settings",
+            json={"mode": "prompt"},
+            headers={"Origin": "null"},
+        )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "FORBIDDEN_ORIGIN"
+
+
+class _StubWebSocket:
+    """Minimal stand-in for the starlette WebSocket surface the guard reads."""
+
+    def __init__(self, headers: dict[str, str], url: URL) -> None:
+        self.headers = headers
+        self.url = url
+
+
+def test_listed_extension_origin_passes_the_ws_handshake_on_loopback() -> None:
+    # The real extension client attaches the Origin on the WebSocket upgrade;
+    # the handshake must accept the listed origin over ws:// loopback.
+    config = GatewayConfig()
+    config.cors.allowed_origins = [_EXTENSION_ORIGIN]
+    ws = _StubWebSocket({"origin": _EXTENSION_ORIGIN}, URL("ws://127.0.0.1:18791/ws"))
+
+    assert websocket_origin_allowed(ws, config) is True
+
+
+def test_unlisted_extension_origin_fails_the_ws_handshake() -> None:
+    ws = _StubWebSocket({"origin": _EXTENSION_ORIGIN}, URL("ws://127.0.0.1:18791/ws"))
+
+    assert websocket_origin_allowed(ws, GatewayConfig()) is False
+
+
+def test_listed_extension_origin_ws_handshake_rejected_on_remote() -> None:
+    config = GatewayConfig()
+    config.host = "0.0.0.0"
+    config.cors.allowed_origins = [_EXTENSION_ORIGIN]
+    ws = _StubWebSocket({"origin": _EXTENSION_ORIGIN}, URL("ws://192.0.2.10:18791/ws"))
+
+    assert websocket_origin_allowed(ws, config) is False
 
 
 def test_shared_middleware_guards_dynamically_registered_mutation_routes() -> None:
