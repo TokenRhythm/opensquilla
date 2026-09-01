@@ -13,6 +13,10 @@ from opensquilla.gateway.adapters.session_history import (
     canonical_page_parts,
     parse_history_cursor,
 )
+from opensquilla.session.history_cursor import (
+    HistoryCursorInvalidatedError,
+    HistoryCursorInvalidError,
+)
 from opensquilla.session.storage import StorageBusyError
 
 
@@ -26,12 +30,28 @@ def row(index: int, *, role: str = "user", content: str | None = None) -> Simple
     )
 
 
-def test_parse_history_cursor_keeps_legacy_unpositioned_cases() -> None:
+def test_parse_history_cursor_distinguishes_absent_and_valid_values() -> None:
     assert parse_history_cursor(None) is None
-    assert parse_history_cursor("") is None
-    assert parse_history_cursor("not-a-cursor") is None
-    assert parse_history_cursor("1|not-an-int") is None
     assert parse_history_cursor(" 2|7 ") == (2, 7)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "   ",
+        "not-a-cursor",
+        "1|not-an-int",
+        "1|2|3",
+        "-1|2",
+        "1|-2",
+        f"{1 << 63}|1",
+        f"1|{1 << 63}",
+    ],
+)
+def test_parse_history_cursor_rejects_invalid_values(value: object) -> None:
+    with pytest.raises(HistoryCursorInvalidError):
+        parse_history_cursor(value)
 
 
 def test_canonical_page_parts_accepts_legacy_shapes() -> None:
@@ -158,6 +178,25 @@ async def test_adapter_preserves_storage_busy_error() -> None:
             SessionHistoryQuery(
                 session_key="agent:main:webchat:history",
                 limit=1,
+            )
+        )
+    assert manager.active_calls == []
+
+
+@pytest.mark.asyncio
+async def test_adapter_preserves_cursor_invalidation_without_active_fallback() -> None:
+    class InvalidatedManager(CanonicalManager):
+        async def get_canonical_transcript_page(self, *args: Any, **kwargs: Any) -> object:
+            raise HistoryCursorInvalidatedError("anchor missing")
+
+    manager = InvalidatedManager(None)
+    adapter = SessionHistoryStorageAdapter(manager)
+    with pytest.raises(HistoryCursorInvalidatedError):
+        await adapter.application().read_page(
+            SessionHistoryQuery(
+                session_key="agent:main:webchat:history",
+                limit=1,
+                before=(2, 2),
             )
         )
     assert manager.active_calls == []

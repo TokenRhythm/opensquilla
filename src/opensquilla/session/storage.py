@@ -55,6 +55,7 @@ from opensquilla.session.goals import (
     normalize_goal_progress,
     normalize_goal_reason,
 )
+from opensquilla.session.history_cursor import HistoryCursorInvalidatedError
 from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id, parse_agent_id
 from opensquilla.session.models import (
     AgentTaskRecord,
@@ -14147,26 +14148,28 @@ class SessionStorage:
 
         Each source CTE is bounded to ``limit + 1`` rows and both are merged in
         one SQLite read snapshot. ``before`` keeps its historical precedence
-        over ``after`` when both cursors exist; an unknown cursor is ignored,
-        matching the legacy list-pagination path.
+        over ``after`` when both cursors exist. A supplied cursor must identify
+        an anchor in this session; missing, foreign, or deleted anchors fail
+        closed instead of being treated as an unpositioned latest read.
         """
         page_size = max(1, int(limit))
         fetch_size = page_size + 1
 
-        resolved_before = before
-        if resolved_before is not None and not await self._canonical_transcript_cursor_exists(
-            session_id,
-            resolved_before,
-        ):
-            resolved_before = None
+        cursor = before
+        ascending = False
+        if cursor is not None:
+            if not await self._canonical_transcript_cursor_exists(session_id, cursor):
+                raise HistoryCursorInvalidatedError(
+                    "history cursor no longer anchors this session"
+                )
+        elif after is not None:
+            cursor = after
+            if not await self._canonical_transcript_cursor_exists(session_id, cursor):
+                raise HistoryCursorInvalidatedError(
+                    "history cursor no longer anchors this session"
+                )
+            ascending = True
 
-        resolved_after = None
-        if resolved_before is None and after is not None:
-            if await self._canonical_transcript_cursor_exists(session_id, after):
-                resolved_after = after
-
-        cursor = resolved_before or resolved_after
-        ascending = resolved_after is not None
         comparator = ">" if ascending else "<"
         direction = "ASC" if ascending else "DESC"
 

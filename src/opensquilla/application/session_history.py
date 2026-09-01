@@ -5,10 +5,10 @@ projection.  This module owns the storage-independent part that is safe to
 extract first: choosing a canonical page when it is available and applying
 the same keyset pagination policy to an active transcript fallback.
 
-Adapters translate concrete storage failures into ``None`` for an unavailable
-canonical reader (while preserving retryable failures), and translate legacy
-wire cursors into :class:`HistoryCursor` values.  No RPC, WebSocket, Gateway,
-or persistence type is allowed to cross this boundary.
+Adapters translate unexpected concrete storage failures into ``None`` for an
+unavailable canonical reader, while preserving retryable and cursor-domain
+failures, and translate legacy wire cursors into :class:`HistoryCursor` values.
+No RPC, WebSocket, Gateway, or persistence type is allowed to cross this boundary.
 """
 
 from __future__ import annotations
@@ -17,7 +17,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
 
-type HistoryCursor = tuple[int, int]
+from opensquilla.session.history_cursor import (
+    HistoryCursor,
+    HistoryCursorInvalidatedError,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,9 +28,8 @@ class SessionHistoryQuery:
     """Normalized input for one history page read.
 
     ``before`` takes precedence over ``after`` when both are present.  The
-    Gateway adapter is responsible for preserving legacy malformed-value
-    behavior before constructing this value; the application receives a
-    positive limit and parsed cursors only.
+    Gateway adapter rejects malformed wire values before constructing this
+    value; the application receives a positive limit and parsed cursors only.
     """
 
     session_key: str
@@ -52,8 +54,8 @@ class CanonicalHistoryReader(Protocol):
 
     Returning ``None`` means that the canonical projection is unavailable and
     the application should use the active transcript reader.  Implementations
-    must still raise retryable storage failures instead of converting them to
-    ``None`` so the Gateway can retain its existing error semantics.
+    must still raise retryable storage failures and cursor invalidations instead
+    of converting them to ``None`` so the Gateway can retain explicit errors.
     """
 
     async def read_canonical_page(
@@ -87,6 +89,7 @@ class SessionHistoryApplication:
     async def read_page(self, query: SessionHistoryQuery) -> HistoryPage:
         """Prefer canonical storage, then apply the legacy fallback policy."""
 
+        effective_after = None if query.before is not None else query.after
         if query.include_canonical and self._canonical is not None:
             # The Port deliberately decides which implementation failures are
             # recoverable.  Any exception that reaches here (for example a
@@ -95,7 +98,7 @@ class SessionHistoryApplication:
                 query.session_key,
                 limit=query.limit,
                 before=query.before,
-                after=query.after,
+                after=effective_after,
             )
             if canonical_page is not None:
                 return HistoryPage(
@@ -112,7 +115,7 @@ class SessionHistoryApplication:
             transcript,
             limit=query.limit,
             before=query.before,
-            after=query.after,
+            after=effective_after,
         )
         return HistoryPage(
             entries=entries,
@@ -144,26 +147,34 @@ def paginate_transcript(
 ) -> tuple[tuple[object, ...], bool]:
     """Apply the current active-transcript keyset policy.
 
-    A missing cursor is treated as an unpositioned read, matching the legacy
-    handler.  When both cursors are supplied, ``before`` wins.  The caller
-    supplies a positive ``limit`` after v4 compatibility normalization.
+    Only an absent cursor is treated as an unpositioned read. When both
+    cursors are supplied, ``before`` wins and ``after`` is ignored. A parsed
+    cursor that does not identify an entry raises a typed invalidation error
+    instead of silently returning the latest window.
     """
 
     rows = tuple(entries)
-    if not rows:
-        return (), False
-
-    before_index = _cursor_index(rows, before)
-    if before_index is not None:
+    if before is not None:
+        before_index = _cursor_index(rows, before)
+        if before_index is None:
+            raise HistoryCursorInvalidatedError(
+                "history cursor no longer anchors this session"
+            )
         start = max(0, before_index - limit)
         return rows[start:before_index], start > 0
 
-    after_index = _cursor_index(rows, after)
-    if after_index is not None:
+    if after is not None:
+        after_index = _cursor_index(rows, after)
+        if after_index is None:
+            raise HistoryCursorInvalidatedError(
+                "history cursor no longer anchors this session"
+            )
         start = min(len(rows), after_index + 1)
         end = min(len(rows), start + limit)
         return rows[start:end], end < len(rows)
 
+    if not rows:
+        return (), False
     if len(rows) <= limit:
         return rows, False
     return rows[-limit:], True

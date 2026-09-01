@@ -20,6 +20,7 @@ from opensquilla.session.context_view import (
     build_compaction_context_records,
     format_compaction_summary_context,
 )
+from opensquilla.session.history_cursor import HistoryCursorInvalidatedError
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import (
     AgentTaskRecord,
@@ -3926,6 +3927,79 @@ async def test_inline_compaction_rejects_stale_source_without_partial_install(ma
         (node.session_id,),
     ) as cur:
         assert (await cur.fetchone())[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_canonical_transcript_page_rejects_cross_session_cursor(manager):
+    first = await manager.create("agent:main:webchat:cursor-a")
+    second = await manager.create("agent:main:webchat:cursor-b")
+    await manager.append_message(first.session_key, "user", "first session")
+    await manager.append_message(second.session_key, "user", "second session")
+    anchor = (await manager.get_transcript(first.session_key))[0]
+    assert anchor.id is not None
+
+    cursor = (anchor.created_at, anchor.id)
+    with pytest.raises(HistoryCursorInvalidatedError):
+        await manager.get_canonical_transcript_page(
+            second.session_key,
+            limit=10,
+            before=cursor,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("direction", ["before", "after"])
+async def test_canonical_transcript_page_rejects_unknown_cursor(manager, direction: str):
+    node = await manager.create(f"agent:main:webchat:cursor-unknown-{direction}")
+    await manager.append_message(node.session_key, "user", "known")
+
+    with pytest.raises(HistoryCursorInvalidatedError):
+        await manager.get_canonical_transcript_page(
+            node.session_key,
+            limit=10,
+            **{direction: (9_999_999, 9_999_999)},
+        )
+
+
+@pytest.mark.asyncio
+async def test_canonical_transcript_page_rejects_deleted_anchor(manager):
+    node = await manager.create("agent:main:webchat:cursor-deleted")
+    await manager.append_message(
+        node.session_key,
+        "user",
+        "deleted anchor",
+        message_id="deleted-cursor-anchor",
+    )
+    anchor = (await manager.get_transcript(node.session_key))[0]
+    assert anchor.id is not None
+    cursor = (anchor.created_at, anchor.id)
+    assert await manager.remove_message(node.session_key, anchor.message_id) is True
+
+    with pytest.raises(HistoryCursorInvalidatedError):
+        await manager.get_canonical_transcript_page(
+            node.session_key,
+            limit=10,
+            after=cursor,
+        )
+
+
+@pytest.mark.asyncio
+async def test_canonical_transcript_page_before_ignores_unknown_after(manager):
+    node = await manager.create("agent:main:webchat:cursor-before-precedence")
+    for index in range(3):
+        await manager.append_message(node.session_key, "user", f"message {index}")
+    entries = await manager.get_transcript(node.session_key)
+    anchor = entries[-1]
+    assert anchor.id is not None
+
+    page = await manager.get_canonical_transcript_page(
+        node.session_key,
+        limit=10,
+        before=(anchor.created_at, anchor.id),
+        after=(9_999_999, 9_999_999),
+    )
+
+    assert [entry.content for entry in page.entries] == ["message 0", "message 1"]
 
 
 @pytest.mark.asyncio

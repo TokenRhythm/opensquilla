@@ -263,7 +263,7 @@ async def test_chat_history_request_cases_preserve_v4_wire_behavior(request_case
         assert manager.canonical_calls == []
     if request_case == "request.before-after":
         assert manager.canonical_calls[0]["before"] == (3, 3)
-        assert manager.canonical_calls[0]["after"] == (1, 1)
+        assert manager.canonical_calls[0]["after"] is None
     if request_case == "request.default-null":
         assert manager.active_calls == ["agent:main:webchat:default"]
 

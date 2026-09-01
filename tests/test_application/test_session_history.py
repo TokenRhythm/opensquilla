@@ -13,6 +13,7 @@ from opensquilla.application.session_history import (
     SessionHistoryQuery,
     paginate_transcript,
 )
+from opensquilla.session.history_cursor import HistoryCursorInvalidatedError
 
 
 def entry(index: int) -> SimpleNamespace:
@@ -92,7 +93,7 @@ async def test_canonical_page_is_preferred_and_metadata_is_normalized() -> None:
             "session_key": "agent:main:webchat:history",
             "limit": 2,
             "before": (3, 3),
-            "after": (1, 1),
+            "after": None,
         }
     ]
 
@@ -164,16 +165,31 @@ async def test_reader_failures_are_not_silently_swallowed() -> None:
     assert active.calls == []
 
 
-def test_paginate_transcript_preserves_latest_window_and_after_cursor() -> None:
+def test_paginate_transcript_preserves_latest_window_and_valid_cursors() -> None:
     rows = [entry(index) for index in range(1, 6)]
 
     latest, latest_more = paginate_transcript(rows, limit=2)
     forward, forward_more = paginate_transcript(rows, limit=2, after=(2, 2))
-    missing, missing_more = paginate_transcript(rows, limit=2, after=(99, 99))
+    backward, backward_more = paginate_transcript(
+        rows,
+        limit=2,
+        before=(4, 4),
+        after=(99, 99),
+    )
 
     assert [getattr(row, "id") for row in latest] == [4, 5]
     assert latest_more is True
     assert [getattr(row, "id") for row in forward] == [3, 4]
     assert forward_more is True
-    assert [getattr(row, "id") for row in missing] == [4, 5]
-    assert missing_more is True
+    assert [getattr(row, "id") for row in backward] == [2, 3]
+    assert backward_more is True
+
+
+@pytest.mark.parametrize("direction", ["before", "after"])
+def test_paginate_transcript_rejects_missing_cursor(direction: str) -> None:
+    kwargs = {direction: (99, 99)}
+
+    with pytest.raises(HistoryCursorInvalidatedError):
+        paginate_transcript([entry(1)], limit=2, **kwargs)
+    with pytest.raises(HistoryCursorInvalidatedError):
+        paginate_transcript([], limit=2, **kwargs)

@@ -15,6 +15,7 @@ from opensquilla.artifact_session import (
 )
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.rpc_chat import _handle_chat_history
+from opensquilla.session.history_cursor import HistoryCursorInvalidatedError
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import (
     AgentTaskRecord,
@@ -1645,6 +1646,44 @@ async def test_chat_history_before_cursor_returns_older_page() -> None:
 
 
 @pytest.mark.asyncio
+async def test_chat_history_before_cursor_ignores_malformed_after() -> None:
+    mgr = _FakePagedSessionManager(
+        [_entry(4)],
+        page=SimpleNamespace(
+            entries=[_entry(2), _entry(3)],
+            has_more=True,
+            canonical_complete=True,
+        ),
+    )
+
+    result = await _handle_chat_history(
+        {
+            "sessionKey": "agent:main:webchat:test",
+            "limit": 2,
+            "before": "4|4",
+            "after": "not-a-cursor",
+            "includeSummaries": False,
+        },
+        RpcContext(
+            conn_id="test",
+            principal=SimpleNamespace(role="operator"),
+            session_manager=mgr,
+        ),
+    )
+
+    assert [message["text"] for message in result["messages"]] == [
+        "message 2",
+        "message 3",
+    ]
+    assert mgr.page_calls == [
+        (
+            "agent:main:webchat:test",
+            {"limit": 2, "before": (4, 4), "after": None},
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_chat_history_uses_canonical_transcript_when_available() -> None:
     active_entries = [_entry(3)]
     canonical_entries = [_entry(1), _entry(2), _entry(3)]
@@ -1891,6 +1930,57 @@ async def test_chat_history_busy_maps_to_retryable_wire_envelope(
     assert response.error.details["waited_ms"] >= 0
     assert response.error.details["stage"] == "lock_acquire"
     assert response.error.details["resource"] == "session_mutation_lock"
+
+
+@pytest.mark.asyncio
+async def test_chat_history_cursor_failures_map_to_stable_wire_codes() -> None:
+    cases = [
+        (
+            "invalid-empty",
+            {"before": ""},
+            _FakeSessionManager([_entry(1)], canonical_entries=[_entry(1)]),
+            "HISTORY_CURSOR_INVALID",
+        ),
+        (
+            "invalid-null",
+            {"after": None},
+            _FakeSessionManager([_entry(1)], canonical_entries=[_entry(1)]),
+            "HISTORY_CURSOR_INVALID",
+        ),
+        (
+            "invalidated",
+            {"after": "1|1"},
+            _FakePagedSessionManager(
+                [_entry(1)],
+                page_exception=HistoryCursorInvalidatedError("anchor missing"),
+            ),
+            "HISTORY_CURSOR_INVALIDATED",
+        ),
+    ]
+
+    for label, cursor_params, manager, expected_code in cases:
+        response = await get_dispatcher().dispatch(
+            f"history-wire-{label}",
+            "chat.history",
+            {
+                "sessionKey": "agent:main:webchat:test",
+                "includeSummaries": False,
+                **cursor_params,
+            },
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(
+                    role="operator",
+                    scopes=frozenset({"operator.read"}),
+                ),
+                session_manager=manager,
+            ),
+        )
+
+        assert response.ok is False
+        assert response.error is not None
+        assert response.error.code == expected_code
+        assert response.error.retryable is False
 
 
 @pytest.mark.asyncio

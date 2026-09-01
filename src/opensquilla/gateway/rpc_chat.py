@@ -12,7 +12,7 @@ from uuid import uuid4
 
 import structlog
 
-from opensquilla.application.session_history import SessionHistoryQuery
+from opensquilla.application.session_history import SessionHistoryQuery, cursor_for_entry
 from opensquilla.artifact_session import (
     ArtifactSessionService,
     MutationAttempt,
@@ -33,7 +33,12 @@ from opensquilla.gateway.compaction_target import (
 )
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.context_overflow import apply_context_overflow_policy
-from opensquilla.gateway.rpc import RpcContext, RpcUnavailableError, get_dispatcher
+from opensquilla.gateway.rpc import (
+    RpcContext,
+    RpcHandlerError,
+    RpcUnavailableError,
+    get_dispatcher,
+)
 from opensquilla.gateway.session_services import get_session_lock, get_session_storage
 from opensquilla.gateway.terminal_activity import (
     is_usage_accounting_barrier,
@@ -48,6 +53,10 @@ from opensquilla.observability.network_policy import (
 from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.session.compaction import build_compaction_config_from_provider
 from opensquilla.session.compaction_lifecycle import new_compaction_id
+from opensquilla.session.history_cursor import (
+    HistoryCursorInvalidatedError,
+    HistoryCursorInvalidError,
+)
 from opensquilla.session.keys import build_webchat_key, canonicalize_session_key, parse_agent_id
 from opensquilla.session.storage import (
     StorageBusyError,
@@ -630,7 +639,7 @@ async def _project_missing_history_usage(
     # A page is a contiguous keyset slice, so only rows after its last cursor
     # can hold a turn's terminal assistant row. Probing that suffix keeps the
     # newest page — the common read — from touching transcript rows at all.
-    page_cursor = parse_history_cursor(_chat_history_cursor(entries[-1]))
+    page_cursor = cursor_for_entry(entries[-1])
 
     continuing: set[str] = set()
     try:
@@ -1144,11 +1153,30 @@ async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
     mgr = _require_chat_session_manager(ctx)
     history_adapter = SessionHistoryStorageAdapter(mgr)
     history_application = history_adapter.application()
+    try:
+        if "before" in raw_params:
+            parsed_before = parse_history_cursor(before)
+            if parsed_before is None:
+                raise HistoryCursorInvalidError("history cursor must not be null")
+            parsed_after = None
+        elif "after" in raw_params:
+            parsed_before = None
+            parsed_after = parse_history_cursor(after)
+            if parsed_after is None:
+                raise HistoryCursorInvalidError("history cursor must not be null")
+        else:
+            parsed_before = None
+            parsed_after = None
+    except HistoryCursorInvalidError as exc:
+        raise RpcHandlerError(
+            "HISTORY_CURSOR_INVALID",
+            "The history cursor is invalid. Reload history from the latest page.",
+        ) from exc
     history_query = SessionHistoryQuery(
         session_key=session_key,
         limit=limit,
-        before=parse_history_cursor(before),
-        after=parse_history_cursor(after),
+        before=parsed_before,
+        after=parsed_after,
         include_canonical=include_canonical,
     )
 
@@ -1222,6 +1250,16 @@ async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
                 finally:
                     if acquired:
                         history_lock.release()
+    except HistoryCursorInvalidError as exc:
+        raise RpcHandlerError(
+            "HISTORY_CURSOR_INVALID",
+            "The history cursor is invalid. Reload history from the latest page.",
+        ) from exc
+    except HistoryCursorInvalidatedError as exc:
+        raise RpcHandlerError(
+            "HISTORY_CURSOR_INVALIDATED",
+            "The history cursor no longer belongs to this session. Reload from the latest page.",
+        ) from exc
     except KeyError:
         if _is_webchat_session_key(session_key):
             return _empty_chat_history_payload(limit)
