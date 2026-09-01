@@ -16,6 +16,8 @@ import type {
   ApprovalItem,
   ApprovalDecision,
 } from '@/modules/approvalCenter'
+import type { SessionConversation } from '@/modules/sessionConversation'
+import { createLegacySessionConversation } from '@/adapters/gateway/sessionConversationV4'
 
 const MAX_RESOLVED_OUTCOMES = 4
 
@@ -95,8 +97,6 @@ interface ApprovalResolveResponse {
  * `warning`, `argv`, and `actionKind`, which the hydration fetch backfills.
  */
 type ApprovalsRpcClient = {
-  call: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
-  on: (event: string, handler: RpcEventHandler) => () => void
 }
 
 /**
@@ -117,7 +117,8 @@ export interface ApprovalsStreamSurface {
 }
 
 export interface UseChatApprovalsOptions {
-  rpc: ApprovalsRpcClient
+  rpc?: ApprovalsRpcClient
+  sessionConversation?: SessionConversation
   approvalCenter: ApprovalCenter
   sessionKey: Ref<string>
   runStatus: Ref<ChatRunStatus>
@@ -204,7 +205,9 @@ function parseClarifyRequest(payload: ToolResultPayload): ChatClarifyRequest | n
  * derived from that stream event and submitted through `chat.clarify_submit`.
  */
 export function useChatApprovals(options: UseChatApprovalsOptions) {
-  const { rpc, approvalCenter, sessionKey, stream, interruptState } = options
+  const { approvalCenter, sessionKey, stream, interruptState } = options
+  const conversation: SessionConversation = options.sessionConversation
+    ?? createLegacySessionConversation(options.rpc as Parameters<typeof createLegacySessionConversation>[0])
 
   const approvalEntries = ref<ChatApprovalEntry[]>([])
   const approvalBusyIds = ref<Set<string>>(new Set())
@@ -684,9 +687,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
 
   /** Register stream listeners; returns the unsubscribe function. */
   function subscribe(): () => void {
-    const unsubs = [
-      rpc.on('session.event.tool_result', handleToolResult as RpcEventHandler),
-    ]
+    const toolResultSubscription = conversation.subscribeToolResults(handleToolResult as RpcEventHandler)
     const approvalEvents = approvalCenter.subscribe(event => {
       if (event.kind === 'requested') handleApprovalRequested(event)
       else if (event.kind === 'updated') handleApprovalUpdated(event)
@@ -697,7 +698,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     // before the listeners attached.
     hydrateApprovals()
     return () => {
-      unsubs.forEach(unsub => unsub())
+      toolResultSubscription.close()
       approvalEvents.close()
       connection.close()
       stopFallbackPoll()
@@ -725,7 +726,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     if (request.requestId) params.request_id = request.requestId
     if (request.runId) params.run_id = request.runId
     try {
-      await rpc.call('chat.clarify_submit', params)
+      await conversation.submitClarify(params)
       clarifySubmitAttempts.delete(key)
       setInterruptState(key, { resolution: 'replied', busy: false })
       // request_id submissions resolve the exact paused tool call in the same

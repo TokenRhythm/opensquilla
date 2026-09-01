@@ -34,6 +34,8 @@ import type { WorkspaceCatalog } from '@/modules/workspaceCatalog'
 import { createV4WorkspaceCatalog } from './workspaceCatalogV4'
 import type { SandboxRuntime } from '@/modules/sandboxRuntime'
 import { createV4SandboxRuntime } from './sandboxRuntimeV4'
+import type { SessionConversation } from '@/modules/sessionConversation'
+import { createV4SessionConversation } from './sessionConversationV4'
 
 type RpcStoreTransportSource = Parameters<typeof createPrivateGatewayTransports>[0]
 
@@ -55,6 +57,7 @@ export interface GatewayAdapters {
   readonly migrationOperations: MigrationOperations
   readonly workspaceCatalog: WorkspaceCatalog
   readonly sandboxRuntime: SandboxRuntime
+  readonly sessionConversation: SessionConversation
 }
 
 interface GatewayHttpSource {
@@ -101,6 +104,7 @@ export function createGatewayAdapters(
       ...transports.rpc,
       subscribe: (event, handler) => transports.events.subscribe(event, handler),
     }),
+    sessionConversation: createV4SessionConversation(transports.rpc, transports.events),
   }
   return adapters
 }

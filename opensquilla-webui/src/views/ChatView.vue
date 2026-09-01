@@ -876,6 +876,7 @@ import { useChatElevatedMode } from '@/composables/chat/useChatElevatedMode'
 import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
 import { useChatSessionRouting } from '@/composables/chat/useChatSessionRouting'
 import { SESSION_ROUTING_KEY, type SessionRouting } from '@/modules/sessionRouting'
+import { SESSION_CONVERSATION_KEY, type SessionConversation } from '@/modules/sessionConversation'
 import { TURN_COMMANDS_KEY, type TurnCommands } from '@/modules/turnCommands'
 import { APPROVAL_CENTER_KEY, type ApprovalCenter } from '@/modules/approvalCenter'
 import { GOAL_CENTER_KEY, type GoalCenter } from '@/modules/goalCenter'
@@ -1003,7 +1004,6 @@ import {
   createForkTransitionLifetime,
   forkNavigationPhase,
   forkRouteHandoffAction,
-  forkRpcRequest,
   snapshotForkPreviewMessages,
   validatedForkChildKey,
   type ForkRpcResponse,
@@ -1214,6 +1214,9 @@ if (!injectedMetaRunCenter) throw new Error('MetaRunCenter was not provided')
 const metaRunCenter: MetaRunCenter = injectedMetaRunCenter
 const injectedAppSettings = inject(APP_SETTINGS_KEY)
 if (!injectedAppSettings) throw new Error('AppSettings was not provided')
+const injectedSessionConversation = inject(SESSION_CONVERSATION_KEY)
+if (!injectedSessionConversation) throw new Error('SessionConversation was not provided')
+const sessionConversation: SessionConversation = injectedSessionConversation
 const injectedProviderConfiguration = inject(PROVIDER_CONFIGURATION_KEY)
 const injectedSandboxRuntime = inject(SANDBOX_RUNTIME_KEY)
 if (!injectedProviderConfiguration) throw new Error('ProviderConfiguration was not provided')
@@ -1459,8 +1462,7 @@ async function reusePromptAnnotation(annotation: PromptAnnotationSnapshot) {
 const promptCacheKeepaliveOpen = ref(false)
 const promptCacheKeepaliveStatus = ref<PromptCacheKeepaliveStatus | null>(null)
 const promptCacheKeepaliveAvailable = computed(() => (
-  rpc.supportsMethod('sessions.promptCacheKeepalive.status')
-  && rpc.supportsMethod('sessions.promptCacheKeepalive.set')
+  sessionConversation.supports('prompt-cache-keepalive')
 ))
 const workbenchEnabled = computed(() => appStore.features.artifactWorkbench === true)
 const promptAnnotationDesktopAvailable = computed(() => (
@@ -1722,10 +1724,7 @@ async function refreshPromptCacheKeepaliveStatus() {
     || !promptCacheKeepaliveSessionReady.value
   ) return
   try {
-    const next = await rpc.call<PromptCacheKeepaliveStatus>(
-      'sessions.promptCacheKeepalive.status',
-      { key },
-    )
+    const next = await sessionConversation.promptCacheStatus(key)
     if (sessionKey.value === key) promptCacheKeepaliveStatus.value = next
   } catch {
     // The settings dialog owns actionable RPC errors. Menu refresh is best effort.
@@ -2083,6 +2082,7 @@ watch(compactStatus, (status) => {
 
 const chatUsageWidget = useChatUsageWidget({
   rpc,
+  sessionConversation,
   readCallOptions: optionalSessionRpcCallOptions,
   sessionKey,
   tokenVizEnabled: () => appStore.features.tokenViz,
@@ -2113,6 +2113,7 @@ const {
 
 const chatFeatureToggles = useChatFeatureToggles({
   rpc,
+  sessionConversation,
   appSettings: injectedAppSettings,
   modelRouting: injectedProviderConfiguration,
   readCallOptions: optionalSessionRpcCallOptions,
@@ -2332,6 +2333,7 @@ const preserveHistoryLiveTail = computed(() =>
 
 const chatHistory = useChatHistory({
   rpc,
+  sessionConversation,
   sessionKey,
   messages,
   threadRef,
@@ -2567,6 +2569,7 @@ let applyPendingUserInputSnapshot: typeof chatPlans.applyBootstrap = () => {}
 let applyGoalSnapshot: (snapshot: SessionMessagesSubscribeResponse) => void = () => {}
 const chatSessionSubscription = useChatSessionSubscription({
   rpc,
+  sessionConversation,
   conversationSessionRuntime: conversationSessionRuntime,
   sessionKey,
   lastStreamSeq,
@@ -3188,6 +3191,7 @@ const goalOutcomeHasMessageAnchor = computed(() => (
 
 const chatSlashCommands = useChatSlashCommands({
   rpc,
+  sessionConversation,
   metaRunCenter,
   catalogCallOptions: optionalSessionRpcCallOptions,
   inputText,
@@ -3717,6 +3721,7 @@ async function steerPendingMessage(pendingUiId: string) {
 
 const chatApprovals = useChatApprovals({
   rpc,
+  sessionConversation,
   approvalCenter,
   sessionKey,
   runStatus,
@@ -3851,7 +3856,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   showCompactionToast,
   getCompactionPlacement: id => getCompactionPlacement(id) || undefined,
   showWarningToast: message => pushToast(message || t('chat.warning.default'), { tone: 'warn', duration: 5000 }),
-  supportsTurnCommitted: () => rpc.supportsEvent('session.event.turn_committed'),
+  supportsTurnCommitted: () => sessionConversation.supportsEvent('turn-committed'),
   scheduleHistorySync,
   schedulePendingDrainAfterTerminal,
   popAllPendingIntoComposer,
@@ -5513,8 +5518,10 @@ async function forkConversation(throughTurnId?: string) {
     previewMessages: snapshotForkPreviewMessages(renderedMessages.value, normalizedTurnId),
   }
   try {
-    const request = forkRpcRequest(parentKey, normalizedTurnId)
-    const res = await rpc.call<ForkRpcResponse>(request.method, request.params)
+    const res = await sessionConversation.fork({
+      key: parentKey,
+      ...(normalizedTurnId ? { throughTurnId: normalizedTurnId } : {}),
+    }) as ForkRpcResponse
     if (!isForkTransitionActive(generation)) return
     const childKey = validatedForkChildKey(res, normalizedTurnId)
     if (sessionKey.value !== parentKey) {
@@ -6493,11 +6500,12 @@ async function syncDraftProjectFromRoute(generation: number): Promise<boolean> {
   const controller = draftProjectHydration.createController(generation)
   if (!controller) return false
   try {
-    await rpc.waitForConnection(
-      Math.max(1, deadlineAt - Date.now()),
-      controller.signal,
-      { timeoutAction: 'reject', abortAction: 'reject' },
-    )
+    await sessionConversation.ready({
+      timeoutMs: Math.max(1, deadlineAt - Date.now()),
+      signal: controller.signal,
+      timeoutAction: 'reject',
+      abortAction: 'reject',
+    })
     if (!draftProjectHydrationIsCurrent(generation, workspaceId)) return false
     await projectWorkspaces.loadWorkspaces({
       timeoutMs: Math.max(1, deadlineAt - Date.now()),

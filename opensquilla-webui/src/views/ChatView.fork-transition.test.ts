@@ -19,7 +19,9 @@ describe('chat fork hand-off contract', () => {
     expect(messageListSource).toContain("@fork=\"$emit('forkConversation', forkThroughTurnId(entry.index))\"")
     expect(transitionSource).toContain("method: 'sessions.forkThroughTurn'")
     expect(transitionSource).toContain("params: { key: parentKey, throughTurnId }")
-    expect(chatViewSource).toContain('rpc.call<ForkRpcResponse>(request.method, request.params)')
+    expect(chatViewSource).toContain('sessionConversation.fork({')
+    expect(chatViewSource).toContain('throughTurnId: normalizedTurnId')
+    expect(chatViewSource).not.toContain('rpc.call<ForkRpcResponse>')
     expect(chatViewSource).toContain('validatedForkChildKey(res, normalizedTurnId)')
     expect(chatViewSource.indexOf('validatedForkChildKey(res, normalizedTurnId)')).toBeLessThan(
       chatViewSource.indexOf('query: { session: childKey }'),

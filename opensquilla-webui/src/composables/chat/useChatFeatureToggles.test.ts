@@ -7,6 +7,7 @@ import type {
   ModelRoutingCapabilitiesByMode,
   ModelRoutingMode,
 } from '@/types/modelRouting'
+import { createLegacySessionConversation } from '@/adapters/gateway/sessionConversationV4'
 
 type RpcResult = Record<string, unknown> | Error | Promise<unknown>
 
@@ -83,6 +84,7 @@ function createHarness(options: {
   }
   const api = useChatFeatureToggles({
     rpc,
+    sessionConversation: createLegacySessionConversation(rpc),
     appSettings: {
       readAll: vi.fn(async () => {
         return await rpcRequest('config.get', undefined, options.readCallOptions) as import('@/modules/appSettings').SettingsObject

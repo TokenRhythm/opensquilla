@@ -40,6 +40,8 @@ import {
   type SessionPhaseResult,
 } from '@/composables/chat/sessionBootstrapContract'
 import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
+import type { SessionConversation } from '@/modules/sessionConversation'
+import { createLegacySessionConversation } from '@/adapters/gateway/sessionConversationV4'
 import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
 import {
   activityReasoningBlocks,
@@ -52,12 +54,12 @@ import { normalizePromptAnnotationSnapshot } from '@/workbench/artifactPromptAnn
 
 type RpcClient = {
   policy?: Record<string, unknown> | null
-  waitForConnection: (
+  waitForConnection?: (
     timeoutMs?: number,
     signal?: AbortSignal,
     actions?: RpcConnectionWaitOptions,
   ) => Promise<void>
-  call: <T = unknown>(
+  call?: <T = unknown>(
     method: string,
     params?: Record<string, unknown>,
     options?: RpcCallOptions,
@@ -668,6 +670,7 @@ function preserveAcceptedEnsembleRouterRows(
 
 export interface UseChatHistoryOptions {
   rpc: RpcClient
+  sessionConversation?: SessionConversation
   sessionKey: Ref<string>
   messages: Ref<ChatMessage[]>
   threadRef?: Ref<HTMLElement | null>
@@ -723,6 +726,8 @@ type FailedHistoryRequest =
 const MAX_FORWARD_BRIDGE_PAGES = 2
 
 export function useChatHistory(options: UseChatHistoryOptions) {
+  const conversation: SessionConversation = options.sessionConversation
+    ?? createLegacySessionConversation(options.rpc as Parameters<typeof createLegacySessionConversation>[0])
   let historySyncTimer: ReturnType<typeof setTimeout> | null = null
   let historyRequestSeq = 0
   let preserveLocalTailGeneration = 0
@@ -971,18 +976,17 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       // History is background content. A slow read may fail independently,
       // without recycling a Gateway that advertises concurrent reads. Legacy
       // serial Gateways still need a fresh connection to escape a stuck read.
-      ...(nonReconnecting
+        ...(nonReconnecting
         ? nonReconnectingHistoryActions()
         : historyTerminationActions(options.rpc)),
       onSent: (socketGeneration: number) => {
         bootstrap.markHistoryRequestSent?.(socketGeneration)
       },
     }
-    const response = options.rpc.call<T>(
-      'chat.history',
-      request,
+    const response = conversation.history(
+      request as { sessionKey: string; limit?: number; before?: string | number | null; includeCanonical?: boolean; includeSummaries?: boolean },
       callOptions,
-    )
+    ) as Promise<T>
     return response
   }
 
@@ -1030,13 +1034,11 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       historyState.value = historyStateBeforeLoad
     }
     try {
-      await options.rpc.waitForConnection(
-        phaseTimeoutMs(bootstrap, 'chat.history'),
-        bootstrap.signal,
-        // Waiting has not enqueued a history handler. Let the transport-owned
-        // handshake watchdog decide whether this generation is unhealthy.
-        nonReconnectingHistoryActions(),
-      )
+      await conversation.ready({
+        timeoutMs: phaseTimeoutMs(bootstrap, 'chat.history'),
+        signal: bootstrap.signal,
+        ...nonReconnectingHistoryActions(),
+      })
       if (!isCurrentRequest()) {
         if (requestSeq === historyRequestSeq) {
           historyState.value = {
