@@ -78,6 +78,7 @@ export interface UseChatSessionRuntimeOptions {
   resetSavingsPopupCooldown: () => void
   restoreWidgetState: () => void
   resetStreamLiveTurnState: () => void
+  retireAttachments?: () => void
   resetDraftComposer?: () => void
 }
 
@@ -216,6 +217,7 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
       return
     }
 
+    if (pendingQueuePolicy.kind === 'navigate') options.retireAttachments?.()
     // Commit is deliberately synchronous from the logical cancellation
     // through the next bootstrap. unsubscribeSession sends its generation-
     // pinned frame before cancelSessionBootstrap returns, so B never waits for
@@ -340,6 +342,7 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
       finishHandoff(epoch, 'superseded')
       return
     }
+    options.retireAttachments?.()
     options.cancelSessionBootstrap()
     resetCompactState()
     options.sessionKey.value = key
