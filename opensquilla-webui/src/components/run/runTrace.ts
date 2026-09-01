@@ -3,7 +3,7 @@ import type {
   ChatStreamTimelineItem,
   ChatToolCallRenderItem,
 } from '@/types/chat'
-import type { ChatHistoryMessage } from '@/types/chat'
+import type { SessionReadMessage } from '@/modules/sessionReadLifecycle'
 import type { ToolPartState } from '@/types/parts'
 import { toolState } from '@/utils/chat/toParts'
 import {
@@ -75,8 +75,7 @@ function stepFromRenderItem(
  *  tools via isInternalToolName — toolPills does not, but RunTrace shows
  *  input/output so internals must not leak. Unnamed entries (normalizeToolName
  *  returns '') are skipped, matching the chat path. */
-export function nodeStepsFromHistoryMessage(msg: ChatHistoryMessage): NodeStep[] {
-  if (!Array.isArray(msg.tool_calls)) return []
+export function nodeStepsFromToolCalls(toolCalls: readonly unknown[]): NodeStep[] {
 
   interface Pending {
     id: string
@@ -89,7 +88,7 @@ export function nodeStepsFromHistoryMessage(msg: ChatHistoryMessage): NodeStep[]
   const order: string[] = []
   let anonymous = 0
 
-  for (const entry of msg.tool_calls) {
+  for (const entry of toolCalls) {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue
     const record = entry as Record<string, unknown>
     const type = String(record.type || '')
@@ -148,6 +147,19 @@ export function nodeStepsFromHistoryMessage(msg: ChatHistoryMessage): NodeStep[]
     })
   }
   return steps
+}
+
+export function nodeStepsFromHistoryMessage(
+  msg: Readonly<{ tool_calls?: readonly unknown[] }>,
+): NodeStep[] {
+  return Array.isArray(msg.tool_calls) ? nodeStepsFromToolCalls(msg.tool_calls) : []
+}
+
+/** Domain-history variant used by read-only session inspection surfaces. */
+export function nodeStepsFromSessionReadMessage(
+  msg: Pick<SessionReadMessage, 'toolCalls'>,
+): NodeStep[] {
+  return nodeStepsFromToolCalls(msg.toolCalls)
 }
 
 /** Compose flat NodeStep[] → render tree (group → members). Single pass: steps

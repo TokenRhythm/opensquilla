@@ -31,6 +31,9 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         "src/opensquilla/contracts/adapters/goals_contract.py",
         "src/opensquilla/gateway/adapters/goals_contract.py",
         "src/opensquilla/gateway/adapters/plans_contract.py",
+        # Session read Contracts are consumed only by the Gateway registration
+        # Adapter; Application Modules and handlers receive domain values.
+        "src/opensquilla/gateway/adapters/session_read_contract.py",
     }
 )
 GENERATED_METADATA_IMPORT_ALLOWLIST = frozenset(
@@ -108,7 +111,7 @@ SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
 SESSIONS_RESOLVE_LITERAL_ALLOWLIST: Counter[str] = Counter()
 SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
 RUNTIME_RPC_METHOD_BASELINE = 306
-STATIC_RPC_DECORATOR_BASELINE = 284
+STATIC_RPC_DECORATOR_BASELINE = 278
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
 # closure measurement below.  The temporary S2a cumulative growth budget was
@@ -185,6 +188,7 @@ WEBUI_LEGACY_TRANSPORT_IDENTIFIERS = (
 R3_APPLICATION_MODULE_FILES = (
     "src/opensquilla/application/app_settings.py",
     "src/opensquilla/application/provider_configuration.py",
+    "src/opensquilla/application/session_read.py",
     "src/opensquilla/application/setup_workflow.py",
 )
 
@@ -703,6 +707,19 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "GOALS_CLEAR_METHOD",
         }
     ] == []
+    assert [
+        site
+        for site in sites
+        if site[2]
+        in {
+            "chat.history",
+            "sessions.messages.subscribe",
+            "sessions.messages.hydrate",
+            "sessions.messages.snapshot",
+            "sessions.messages.unsubscribe",
+            "sessions.preview",
+        }
+    ] == []
 
 
 def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter() -> None:
@@ -735,6 +752,46 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
     assert entry.required_scope == SESSIONS_RESOLVE_SCOPE
     assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
     assert entry.handler.__name__ == "handle_contract_method"
+
+    from opensquilla.contracts.generated.v4.chat_history_metadata import (
+        CHAT_HISTORY_METHOD,
+        CHAT_HISTORY_SCOPE,
+    )
+    from opensquilla.contracts.generated.v4.sessions_messages_hydrate_metadata import (
+        SESSIONS_MESSAGES_HYDRATE_METHOD,
+        SESSIONS_MESSAGES_HYDRATE_SCOPE,
+    )
+    from opensquilla.contracts.generated.v4.sessions_messages_snapshot_metadata import (
+        SESSIONS_MESSAGES_SNAPSHOT_METHOD,
+        SESSIONS_MESSAGES_SNAPSHOT_SCOPE,
+    )
+    from opensquilla.contracts.generated.v4.sessions_messages_subscribe_metadata import (
+        SESSIONS_MESSAGES_SUBSCRIBE_METHOD,
+        SESSIONS_MESSAGES_SUBSCRIBE_SCOPE,
+    )
+    from opensquilla.contracts.generated.v4.sessions_messages_unsubscribe_metadata import (
+        SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD,
+        SESSIONS_MESSAGES_UNSUBSCRIBE_SCOPE,
+    )
+    from opensquilla.contracts.generated.v4.sessions_preview_metadata import (
+        SESSIONS_PREVIEW_METHOD,
+        SESSIONS_PREVIEW_SCOPE,
+    )
+
+    for method, scope in (
+        (CHAT_HISTORY_METHOD, CHAT_HISTORY_SCOPE),
+        (SESSIONS_MESSAGES_SUBSCRIBE_METHOD, SESSIONS_MESSAGES_SUBSCRIBE_SCOPE),
+        (SESSIONS_MESSAGES_HYDRATE_METHOD, SESSIONS_MESSAGES_HYDRATE_SCOPE),
+        (SESSIONS_MESSAGES_SNAPSHOT_METHOD, SESSIONS_MESSAGES_SNAPSHOT_SCOPE),
+        (SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD, SESSIONS_MESSAGES_UNSUBSCRIBE_SCOPE),
+        (SESSIONS_PREVIEW_METHOD, SESSIONS_PREVIEW_SCOPE),
+    ):
+        entry = registry.get_entry(method)
+        assert entry is not None
+        assert entry.name == method
+        assert entry.required_scope == scope
+        assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
+        assert entry.handler.__name__ == "handle_contract_method"
 
     from opensquilla.contracts.generated.v4.goals_capabilities_metadata import (
         GOALS_CAPABILITIES_METHOD,

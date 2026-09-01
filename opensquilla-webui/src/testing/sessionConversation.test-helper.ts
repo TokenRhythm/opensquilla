@@ -1,11 +1,8 @@
 import { createV4SessionConversation } from '@/adapters/gateway/sessionConversationV4'
 import type { RpcCallOptions, RpcConnectionWaitOptions, RpcEventHandler } from '@/lib/rpc'
-import type { GatewayAccess } from '@/modules/gatewayAccess'
 import type { SessionConversation } from '@/modules/sessionConversation'
 
 export interface SessionConversationTestRpc {
-  readonly connectionGeneration?: number
-  readonly policy?: Record<string, unknown> | null
   ready?(
     timeoutMs?: number,
     signal?: AbortSignal,
@@ -19,7 +16,6 @@ export interface SessionConversationTestRpc {
   on?(event: string, handler: RpcEventHandler): (() => void) | void
   hasRpcMethod?(method: string): boolean
   hasRpcEvent?(event: string): boolean
-  recoverConnectionGeneration?(expectedGeneration: number, reason: string): boolean
 }
 
 function unconfigured(method: keyof SessionConversation): never {
@@ -32,13 +28,6 @@ export function sessionConversationTestDouble(
 ): SessionConversation {
   return {
     ready: async () => {},
-    subscribe: async () => unconfigured('subscribe'),
-    hydrate: async () => unconfigured('hydrate'),
-    snapshot: async () => unconfigured('snapshot'),
-    unsubscribe: async () => unconfigured('unsubscribe'),
-    history: async () => unconfigured('history'),
-    preview: async () => unconfigured('preview'),
-    abort: async () => unconfigured('abort'),
     fork: async () => unconfigured('fork'),
     reset: async () => unconfigured('reset'),
     compact: async () => unconfigured('compact'),
@@ -85,27 +74,4 @@ export function sessionConversationFromTestRpc(
       supports: event => rpc.hasRpcEvent?.(event) !== false,
     },
   )
-}
-
-export function gatewayAccessFromTestRpc(
-  rpc: Pick<
-    SessionConversationTestRpc,
-    'connectionGeneration' | 'policy' | 'recoverConnectionGeneration'
-  >,
-): Pick<
-  GatewayAccess,
-  'detachedSessionHydration' | 'subscriptionEpoch' | 'recoverSubscriptionEpoch'
-> {
-  return {
-    get detachedSessionHydration() {
-      const methods = rpc.policy?.concurrent_optional_read_methods
-      return Array.isArray(methods) && methods.includes('sessions.messages.hydrate')
-    },
-    get subscriptionEpoch() {
-      return rpc.connectionGeneration ?? 0
-    },
-    recoverSubscriptionEpoch(expectedEpoch, reason) {
-      return rpc.recoverConnectionGeneration?.(expectedEpoch, reason) ?? false
-    },
-  }
 }

@@ -1,5 +1,7 @@
 import { test, expect, type Page } from '@playwright/test'
 
+import { chatHistoryPayload } from './support/session-read-fixtures'
+
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2eshare'
 const SYSTEM_ONLY_SESSION_KEY = 'agent:main:webchat:e2esharesysonly'
@@ -57,6 +59,9 @@ interface SeedHistoryOptions {
 // withMessages=false the thread holds a single system message: the header
 // renders but no bubble is shareable.
 async function seedHistory(page: Page, withMessages: boolean, options: SeedHistoryOptions = {}) {
+  await page.addInitScript(() => {
+    window.localStorage.setItem('opensquilla-locale', 'en')
+  })
   await page.routeWebSocket(/\/ws$/, ws => {
     const server = ws.connectToServer()
     const historyIds = new Set<string>()
@@ -122,9 +127,13 @@ async function seedHistory(page: Page, withMessages: boolean, options: SeedHisto
               timestamp: now - 60,
             })
           }
-          frame.payload = {
+          const upstreamPayload = frame.payload && typeof frame.payload === 'object'
+            ? frame.payload as Record<string, unknown>
+            : {}
+          frame.payload = chatHistoryPayload(messages, {
+            ...upstreamPayload,
             messages,
-            has_more: false,
+            loaded_count: messages.length,
             ...(options.includeTurnOutcome
               ? {
                   turn_outcomes: [{
@@ -136,7 +145,7 @@ async function seedHistory(page: Page, withMessages: boolean, options: SeedHisto
                   }],
                 }
               : {}),
-          }
+          })
           ws.send(JSON.stringify(frame))
           return
         }
