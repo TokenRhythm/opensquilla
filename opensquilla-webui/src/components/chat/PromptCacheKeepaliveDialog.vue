@@ -169,12 +169,14 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, inject, nextTick, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import ControlSwitch from '@/components/ControlSwitch.vue'
 import Icon from '@/components/Icon.vue'
 import { useDialogA11y } from '@/composables/useDialogA11y'
 import { useToasts } from '@/composables/useToasts'
+import { SESSION_CONVERSATION_KEY } from '@/modules/sessionConversation'
+import { createLegacySessionConversation } from '@/adapters/gateway/sessionConversationV4'
 import { useRpcStore } from '@/stores/rpc'
 import type {
   PromptCacheKeepaliveStatus,
@@ -188,7 +190,9 @@ const emit = defineEmits<{
 }>()
 const { t } = useI18n()
 const { pushToast } = useToasts()
-const rpc = useRpcStore()
+const sessionConversation = inject(SESSION_CONVERSATION_KEY)
+const conversation = sessionConversation
+  ?? createLegacySessionConversation(useRpcStore() as Parameters<typeof createLegacySessionConversation>[0])
 const dialogRef = ref<HTMLElement | null>(null)
 const closeButtonRef = ref<HTMLElement | null>(null)
 const loading = ref(false)
@@ -239,10 +243,7 @@ async function load() {
   loading.value = true
   error.value = ''
   try {
-    const next = await rpc.call<PromptCacheKeepaliveStatus>(
-      'sessions.promptCacheKeepalive.status',
-      { key: props.sessionKey },
-    )
+    const next = await conversation.promptCacheStatus(props.sessionKey)
     status.value = next
     draftEnabled.value = next.enabled
     draftTtlMinutes.value = Math.max(5, Math.round(next.ttlSeconds / 60))
@@ -272,15 +273,12 @@ async function save() {
     const idleTimeoutSeconds = Number.isInteger(draftIdleTimeoutMinutes.value)
       ? Math.round(draftIdleTimeoutMinutes.value * 60)
       : (status.value?.idleTimeoutSeconds || 3_600)
-    const next = await rpc.call<PromptCacheKeepaliveStatus>(
-      'sessions.promptCacheKeepalive.set',
-      {
-        key: savedSessionKey,
-        enabled: draftEnabled.value,
-        ttlSeconds,
-        idleTimeoutSeconds,
-      },
-    )
+    const next = await conversation.setPromptCacheStatus({
+      key: savedSessionKey,
+      enabled: draftEnabled.value,
+      ttlSeconds,
+      idleTimeoutSeconds,
+    })
     status.value = next
     emit('saved', { sessionKey: savedSessionKey, status: next })
     pushToast(t(next.enabled

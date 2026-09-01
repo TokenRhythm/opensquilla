@@ -1,15 +1,11 @@
-import { reactive } from 'vue'
+import { inject, reactive } from 'vue'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
+import { SESSION_CONVERSATION_KEY, type SessionConversation } from '@/modules/sessionConversation'
+import { createLegacySessionConversation } from '@/adapters/gateway/sessionConversationV4'
 import { useRpcStore } from '@/stores/rpc'
 
 export type RouteFeedbackRating = 'up' | 'down'
-
-interface FeedbackSubmitResponse {
-  accepted?: boolean
-  recorded?: string
-  reason?: string
-}
 
 // Per-decision selected state for the whole view. Keyed by decisionId (not
 // message index) so history reloads and regenerates keep ratings attached to
@@ -18,8 +14,11 @@ interface FeedbackSubmitResponse {
 const selected = reactive(new Map<string, RouteFeedbackRating>())
 const inFlight = reactive(new Set<string>())
 
-export function useChatRouteFeedback() {
+export function useChatRouteFeedback(conversation?: SessionConversation) {
   const { pushToast } = useToasts()
+  const sessionConversation = conversation
+    ?? inject(SESSION_CONVERSATION_KEY)
+    ?? createLegacySessionConversation(useRpcStore() as Parameters<typeof createLegacySessionConversation>[0])
 
   function ratingFor(decisionId: string | undefined): RouteFeedbackRating | undefined {
     return decisionId ? selected.get(decisionId) : undefined
@@ -41,13 +40,7 @@ export function useChatRouteFeedback() {
 
     inFlight.add(decisionId)
     try {
-      // Resolved lazily: message components mount in Pinia-free contexts
-      // (share view, unit fixtures) where no rating can ever be cast.
-      const rpc = useRpcStore()
-      const res = await rpc.call<FeedbackSubmitResponse>('router.feedback.submit', {
-        decisionId,
-        rating: effective,
-      })
+      const res = await sessionConversation.submitRouteFeedback(decisionId, effective)
       if (!res?.accepted) {
         rollback(decisionId, previous)
         pushToast(
