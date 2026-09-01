@@ -588,7 +588,9 @@ def test_z1_authored_runtime_is_smaller_than_platform_baseline() -> None:
 
 def test_z1_webui_legacy_transport_surface_is_closed() -> None:
     legacy_rpc_types = WEBUI_SOURCE_ROOT / "types" / "rpc.ts"
-    assert not legacy_rpc_types.exists(), "types/rpc.ts must be deleted after domain ownership closes"
+    assert not legacy_rpc_types.exists(), (
+        "types/rpc.ts must be deleted after domain ownership closes"
+    )
 
     forbidden_identifiers: dict[str, list[str]] = {}
     raw_store_imports: list[str] = []
