@@ -58,6 +58,15 @@ export function conversationCursorSignal(source: unknown): ConversationCursorSig
 
 export type NormalizeRunStatus = (status: string) => string
 
+export type TaskSettlementStatus =
+  | 'failed'
+  | 'cancelled'
+  | 'timeout'
+  | 'abandoned'
+  | 'interrupted'
+
+export type TaskTerminalStatus = 'succeeded' | TaskSettlementStatus
+
 export const PENDING_STREAM_TASK_ID = '__opensquilla_pending_stream_task__'
 export const STOPPED_STREAM_TASK_ID = '__opensquilla_stopped_stream_task__'
 // Tombstone left after a terminal event closes the live turn. Unlike an empty
@@ -154,8 +163,10 @@ export function sessionChangeIsTerminal(
   return ['failed', 'timeout', 'cancelled', 'interrupted'].includes(runStatus)
 }
 
-export function taskTerminalStatus(event: ConversationSemanticEventKind): string {
-  const statusByKind: Partial<Record<ConversationSemanticEventKind, string>> = {
+export function taskTerminalStatus(
+  event: ConversationSemanticEventKind,
+): TaskTerminalStatus | '' {
+  const statusByKind: Partial<Record<ConversationSemanticEventKind, TaskTerminalStatus>> = {
     'task-succeeded': 'succeeded',
     'task-failed': 'failed',
     'task-timed-out': 'timeout',

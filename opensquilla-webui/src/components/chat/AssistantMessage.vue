@@ -649,7 +649,8 @@ const planParts = computed(
 const hasPlan = computed(() => planParts.value.length > 0)
 const standaloneInterruptParts = computed(() =>
   interruptParts.value.filter(part => (
-    !timelineResolvedInterruptKeys.value.has(part.key)
+    !(part.interruptKind === 'clarify' && part.resolution === 'unavailable')
+    && !timelineResolvedInterruptKeys.value.has(part.key)
     && !(
       hasPlan.value
       && part.interruptKind === 'clarify'
@@ -916,11 +917,21 @@ function withoutFailedActivity(
   })
 }
 
+function withoutUnavailableClarifies(
+  items: ChatStreamTimelineItem[],
+): ChatStreamTimelineItem[] {
+  return items.filter(item => !(
+    item.type === 'interrupt'
+    && item.part.interruptKind === 'clarify'
+    && item.part.resolution === 'unavailable'
+  ))
+}
+
 const visibleActivityItems = computed(() =>
-  withoutFailedActivity(activityProjection.value.activityItems),
+  withoutUnavailableClarifies(withoutFailedActivity(activityProjection.value.activityItems)),
 )
 const visibleLegacyTimelineItems = computed(() =>
-  withoutFailedActivity(props.message.timelineItems ?? []),
+  withoutUnavailableClarifies(withoutFailedActivity(props.message.timelineItems ?? [])),
 )
 const visibleActivityCallKeys = computed(() => new Set(
   visibleActivityItems.value.flatMap(item =>

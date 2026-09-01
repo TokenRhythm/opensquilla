@@ -3707,6 +3707,9 @@ const chatApprovals = useChatApprovals({
   sessionConversation,
   approvalCenter,
   sessionKey,
+  currentEpoch,
+  streamGeneration,
+  observeStreamGeneration,
   runStatus,
   stream: { isStreaming, appendInterruptFrame, ensureInterruptBubble },
   interruptState,
@@ -3724,7 +3727,7 @@ const {
   extendInterrupt,
   submitClarify,
   dismissClarify,
-  cancelPendingClarify,
+  settlePendingClarifyForTerminalTask,
   applyUserInputBootstrap,
 } = chatApprovals
 applyPendingUserInputSnapshot = applyUserInputBootstrap
@@ -3854,9 +3857,11 @@ const rpcEventHandlers = useChatRpcEventHandlers({
     handleSessionConnectionState(state, !isDraftRoute()),
   loadCurrentSessionUsage,
   refreshRunModePreference: refreshPostBootstrapMetadata,
-  onTaskCancelled: taskId => {
-    chatPlans.settleActiveRunForCancelledTask(taskId)
-    cancelPendingClarify()
+  onTaskTerminal: (taskId, status) => {
+    if (status !== 'succeeded') {
+      chatPlans.settleActiveRunForTerminalTask(taskId, status)
+    }
+    settlePendingClarifyForTerminalTask(taskId, status)
   },
 })
 bindActiveStreamTask = rpcEventHandlers.bindActiveStreamTask

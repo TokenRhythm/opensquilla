@@ -647,22 +647,79 @@ describe('useChatPlans', () => {
     expect(api.activePlanRun.value?.status).toBe('cancelled')
   })
 
-  it('settles the visible run when its active task is stopped outside the Plan ribbon', () => {
+  it.each([
+    ['cancelled', 'cancelled_by_user'],
+    ['timeout', 'timeout'],
+    ['failed', 'failed'],
+    ['abandoned', 'abandoned'],
+    ['interrupted', 'interrupted'],
+  ] as const)(
+    'settles the visible run when its owner becomes %s',
+    (taskStatus, terminalReason) => {
+      const { api } = harness()
+      api.applyBootstrap({
+        key: SESSION_ONE,
+        currentPlan: revision(),
+        activePlanRun: run('running', { activeTaskId: 'task-terminal-1' }) as never,
+      })
+
+      expect(api.settleActiveRunForTerminalTask('task-terminal-1', taskStatus)).toBe(true)
+      expect(api.activePlanRun.value).toMatchObject({
+        status: 'cancelled',
+        terminalReason,
+        currentStepId: undefined,
+        steps: [{ status: 'skipped', reason: terminalReason }],
+      })
+      expect(api.activePlanRun.value?.activeTaskId).toBeUndefined()
+    },
+  )
+
+  it('ignores another task terminal and keeps repeated settlement idempotent', () => {
     const { api } = harness()
     api.applyBootstrap({
       key: SESSION_ONE,
       currentPlan: revision(),
-      activePlanRun: run('running', { activeTaskId: 'task-stop-1' }) as never,
+      activePlanRun: run('running', { activeTaskId: 'task-owner' }) as never,
     })
 
-    expect(api.settleActiveRunForCancelledTask('task-stop-1')).toBe(true)
-    expect(api.activePlanRun.value).toMatchObject({
-      status: 'cancelled',
-      terminalReason: 'cancelled_by_user',
-      currentStepId: undefined,
-      steps: [{ status: 'skipped', reason: 'cancelled_by_user' }],
-    })
+    expect(api.settleActiveRunForTerminalTask('task-other', 'timeout')).toBe(false)
+    expect(api.activePlanRun.value?.status).toBe('running')
+    expect(api.settleActiveRunForTerminalTask('task-owner', 'failed')).toBe(true)
+    const settled = api.activePlanRun.value
+    expect(api.settleActiveRunForTerminalTask('task-owner', 'cancelled')).toBe(false)
+    expect(api.activePlanRun.value).toBe(settled)
   })
+
+  it.each(['running', 'paused'] as const)(
+    'does not resurrect a terminal run from a delayed %s event',
+    (delayedStatus) => {
+      const { api, handlers } = harness()
+      api.applyBootstrap({
+        key: SESSION_ONE,
+        currentPlan: revision(),
+        activePlanRun: run('running', {
+          activeTaskId: 'task-terminal',
+          stateRevision: 4,
+        }) as never,
+      })
+      api.subscribe()
+      expect(api.settleActiveRunForTerminalTask('task-terminal', 'timeout')).toBe(true)
+
+      handlers.get('session.event.plan_run')?.({
+        session_key: SESSION_ONE,
+        plan_run: run(delayedStatus, {
+          activeTaskId: 'task-terminal',
+          stateRevision: 99,
+          updatedAt: 999,
+        }),
+      })
+
+      expect(api.activePlanRun.value).toMatchObject({
+        status: 'cancelled',
+        terminalReason: 'timeout',
+      })
+    },
+  )
 
   it('keeps a newer epoch cancellation locked when the old cancellation returns late', async () => {
     const { api, currentEpoch, rpc } = harness()

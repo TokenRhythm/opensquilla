@@ -7,7 +7,12 @@ import type {
   InterruptViewState,
 } from '@/types/parts'
 import { clarifyRequestFromValue, userInputOutcomeFromValue } from '@/utils/chat/clarify'
-import { isCurrentSessionPayload } from '@/utils/chat/streamEvents'
+import {
+  conversationCursorSignal,
+  isCurrentSessionPayload,
+  isStaleEpoch,
+  type TaskTerminalStatus,
+} from '@/utils/chat/streamEvents'
 import type {
   ApprovalCenter,
   ApprovalAvailability,
@@ -81,6 +86,12 @@ export interface ChatClarifyRequest {
   step: string
 }
 
+interface ActiveClarifyRequest {
+  request: ChatClarifyRequest
+  observedStreamSeq?: number
+  observedStreamGeneration?: string
+}
+
 interface ApprovalResolveResponse {
   approved?: boolean
   resolved?: boolean
@@ -115,6 +126,12 @@ export interface UseChatApprovalsOptions {
   sessionConversation: SessionConversation
   approvalCenter: ApprovalCenter
   sessionKey: Ref<string>
+  /** Current session epoch, used to reject replay from a retired reset. */
+  currentEpoch?: Readonly<Ref<number>>
+  /** Current transport cursor namespace, used to order reconnect hydration. */
+  streamGeneration?: Readonly<Ref<string | null>>
+  /** Atomically adopt a new transport namespace before appending its frame. */
+  observeStreamGeneration?: (source: unknown) => boolean
   runStatus: Ref<ChatRunStatus>
   /** The live-turn stream surface that hosts interrupt frames. */
   stream: ApprovalsStreamSurface
@@ -208,11 +225,80 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   const clarifySubmitted = ref(false)
   const clarifyBusy = ref(false)
   const clarifyError = ref('')
-  // A request-scoped submit can cross the Gateway boundary even when its RPC
-  // acknowledgement is lost. Keep that uncertainty until either the submit
-  // response/tool outcome settles it or an authoritative reconnect snapshot
-  // confirms that the request is no longer pending.
-  const clarifySubmitAttempts = new Set<string>()
+  // The dock presents one questionnaire at a time, but a task may have more
+  // than one paused tool call represented by inline frames. Track every known
+  // unresolved request so task settlement and reconnect reconciliation cannot
+  // leave an older frame actionable.
+  const activeClarifyRequests = new Map<string, ActiveClarifyRequest>()
+  // A legacy Meta clarify resumes through a new chat.send turn. Its run_id is
+  // a Meta-run identifier, not a TaskRuntime task id, so retain the exact task
+  // returned by the successful RPC instead of comparing those ID domains.
+  const retainedClarifyTaskOwners = new Map<string, string>()
+  // A very short continuation can terminate before its chat.send acceptance
+  // response reaches this client. Retain a bounded terminal ledger so the late
+  // ACK cannot install a stale retained receipt.
+  const terminalClarifyTaskIds = new Set<string>()
+  let acceptedClarifyStreamGeneration = String(
+    options.streamGeneration?.value || '',
+  ).trim()
+  const retiredClarifyStreamGenerations = new Set<string>()
+
+  function rememberTerminalClarifyTask(taskId: string) {
+    terminalClarifyTaskIds.delete(taskId)
+    terminalClarifyTaskIds.add(taskId)
+    if (terminalClarifyTaskIds.size <= 128) return
+    const oldest = terminalClarifyTaskIds.values().next().value
+    if (oldest) terminalClarifyTaskIds.delete(oldest)
+  }
+
+  function retireClarifyStreamGeneration(generation: string) {
+    if (!generation) return
+    retiredClarifyStreamGenerations.delete(generation)
+    retiredClarifyStreamGenerations.add(generation)
+    if (retiredClarifyStreamGenerations.size <= 16) return
+    const oldest = retiredClarifyStreamGenerations.values().next().value
+    if (oldest) retiredClarifyStreamGenerations.delete(oldest)
+  }
+
+  function syncClarifyStreamGenerationFromShared() {
+    const shared = String(options.streamGeneration?.value || '').trim()
+    if (
+      !shared
+      || shared === acceptedClarifyStreamGeneration
+      || retiredClarifyStreamGenerations.has(shared)
+    ) return
+    retireClarifyStreamGeneration(acceptedClarifyStreamGeneration)
+    acceptedClarifyStreamGeneration = shared
+  }
+
+  function acceptsClarifyStreamGeneration(source: unknown): boolean {
+    const incoming = String(
+      conversationCursorSignal(source).streamGeneration || '',
+    ).trim()
+    if (!incoming) return true
+
+    // Exact RPC listeners run before the wildcard lane advances the shared
+    // cursor. Treat the first unseen generation as the new namespace here so
+    // its first questionnaire is not dropped, while remembering the prior
+    // namespace so a late replay can never roll this ingress backwards.
+    syncClarifyStreamGenerationFromShared()
+    if (incoming === acceptedClarifyStreamGeneration) return true
+    if (retiredClarifyStreamGenerations.has(incoming)) return false
+    retireClarifyStreamGeneration(acceptedClarifyStreamGeneration)
+    acceptedClarifyStreamGeneration = incoming
+    // RpcClient dispatches exact listeners before the wildcard conversation
+    // lane. Advance/reset the shared cursor now so that later wildcard handling
+    // cannot clear the interrupt frame we are about to append.
+    const observedSource = source && typeof source === 'object'
+      ? {
+          ...(source as Record<string, unknown>),
+          stream_generation: incoming,
+          streamGeneration: incoming,
+        }
+      : { streamGeneration: incoming }
+    options.observeStreamGeneration?.(observedSource)
+    return true
+  }
 
   // Resolution view-state for inline interrupt parts is the shared `interruptState`
   // ref (keyed by approval id, or the clarify composite key). The fold reads it to
@@ -248,6 +334,81 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     clarifySubmitted.value = false
     clarifyBusy.value = false
     clarifyError.value = ''
+  }
+
+  function streamSeqFrom(value: Record<string, unknown>): number | undefined {
+    const raw = value.stream_seq ?? value.streamSeq
+    if (raw === null || raw === undefined || raw === '' || typeof raw === 'boolean') {
+      return undefined
+    }
+    const sequence = Number(raw)
+    return Number.isSafeInteger(sequence) && sequence >= 0 ? sequence : undefined
+  }
+
+  function streamGenerationFrom(value: Record<string, unknown>): string | undefined {
+    const explicit = String(value.stream_generation ?? value.streamGeneration ?? '').trim()
+    if (explicit) return explicit
+    return acceptedClarifyStreamGeneration
+      || String(options.streamGeneration?.value || '').trim()
+      || undefined
+  }
+
+  function rememberActiveClarify(
+    key: string,
+    request: ChatClarifyRequest,
+    observedStreamSeq?: number,
+    observedStreamGeneration?: string,
+  ) {
+    const prior = activeClarifyRequests.get(key)
+    const priorSequence = prior?.observedStreamSeq
+    const priorGeneration = prior?.observedStreamGeneration
+    const currentGeneration = acceptedClarifyStreamGeneration
+      || String(options.streamGeneration?.value || '').trim()
+    const priorIsCurrent = Boolean(
+      currentGeneration && priorGeneration === currentGeneration,
+    )
+    const incomingIsCurrent = Boolean(
+      currentGeneration && observedStreamGeneration === currentGeneration,
+    )
+    const sameGeneration = !priorGeneration
+      || !observedStreamGeneration
+      || priorGeneration === observedStreamGeneration
+    const keepPrior = Boolean(prior) && (
+      (priorIsCurrent && observedStreamGeneration && !incomingIsCurrent)
+      || (
+        sameGeneration
+        && priorSequence !== undefined
+        && observedStreamSeq !== undefined
+        && priorSequence > observedStreamSeq
+      )
+    )
+    const nextGeneration = keepPrior
+      ? priorGeneration
+      : observedStreamGeneration ?? priorGeneration
+    const nextSequence = keepPrior
+      ? priorSequence
+      : sameGeneration
+        ? priorSequence === undefined
+          ? observedStreamSeq
+          : observedStreamSeq === undefined
+            ? priorSequence
+            : Math.max(priorSequence, observedStreamSeq)
+        : observedStreamSeq
+    const active: ActiveClarifyRequest = {
+      request: keepPrior && prior ? prior.request : request,
+      ...(nextSequence !== undefined ? { observedStreamSeq: nextSequence } : {}),
+      ...(nextGeneration ? { observedStreamGeneration: nextGeneration } : {}),
+    }
+    activeClarifyRequests.set(key, active)
+    return active
+  }
+
+  function presentPendingClarify(request: ChatClarifyRequest, key: string) {
+    pendingClarify.value = request
+    const state = interruptState.value.get(key)
+    clarifySubmitted.value = state?.resolution === 'replied'
+    clarifyBusy.value = state?.busy === true
+    clarifyError.value = state?.error || ''
   }
 
   function pendingClarifyMatches(key: string): boolean {
@@ -566,11 +727,21 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   function handleToolResult(payload: ToolResultPayload) {
     if (!payload || typeof payload !== 'object') return
     if (!isCurrentSessionPayload(payload, sessionKey.value)) return
+    if (
+      options.currentEpoch
+      && isStaleEpoch(payload, options.currentEpoch.value)
+    ) return
+    if (!acceptsClarifyStreamGeneration(payload)) return
     const outcome = userInputOutcomeFromValue(payload.result)
     if (outcome) {
-      clarifySubmitAttempts.delete(outcome.requestId)
+      activeClarifyRequests.delete(outcome.requestId)
+      const priorResolution = interruptState.value.get(outcome.requestId)?.resolution
       setInterruptState(outcome.requestId, {
-        resolution: 'replied',
+        // A positive acknowledgement dominates later expiry/cancellation
+        // replays, while a late authoritative answer may upgrade unavailable.
+        resolution: outcome.status === 'answered' || priorResolution === 'replied'
+          ? 'replied'
+          : 'unavailable',
         busy: false,
         error: '',
       })
@@ -581,11 +752,19 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     if (!request) return
     const key = clarifyFrameKey(request)
     // Tool-result replay and reconnect delivery can surface the paused half
-    // after its terminal outcome. Never resurrect an already-settled request or
-    // let a duplicate paused event undo optimistic submit feedback.
-    if (interruptState.value.get(key)?.resolution === 'replied') return
-    pendingClarify.value = request
-    resetClarifyPresentation()
+    // after its terminal outcome. Never resurrect an already-settled request.
+    if (interruptState.value.get(key)?.resolution) return
+    const payloadRecord = payload as Record<string, unknown>
+    const active = rememberActiveClarify(
+      key,
+      request,
+      streamSeqFrom(payloadRecord),
+      streamGenerationFrom(payloadRecord),
+    )
+    // A duplicate paused result can race an in-flight submit. Re-select the
+    // request from its own state so switching between multiple forms cannot
+    // erase a request-scoped busy/error fence.
+    presentPendingClarify(active.request, key)
     // Mirror the clarify into the turn log so it folds into an inline interrupt
     // part. The clarify keeps no approval id, so the runId|step composite keys it.
     const clarifyData: InterruptClarifyData = {
@@ -705,49 +884,72 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     requestOverride?: ChatClarifyRequest,
   ) {
     const request = requestOverride || pendingClarify.value
-    if (clarifyBusy.value || !request) return
+    if (!request) return
     const key = clarifyFrameKey(request)
-    if (interruptState.value.get(key)?.resolution === 'replied') return
+    const currentState = interruptState.value.get(key)
+    if (currentState?.resolution || currentState?.busy) return
     if (!requestOverride && clarifySubmitted.value) return
+    const submittedSessionKey = sessionKey.value
     const controlsPendingPresentation = pendingClarifyMatches(key)
     if (controlsPendingPresentation) {
       clarifyBusy.value = true
-      clarifySubmitted.value = true
+      clarifySubmitted.value = false
       clarifyError.value = ''
     }
-    if (request.requestId) clarifySubmitAttempts.add(key)
-    setInterruptState(key, { resolution: 'replied', busy: true, error: '' })
+    rememberActiveClarify(key, request, undefined, streamGenerationFrom({}))
+    setInterruptState(key, { resolution: null, busy: true, error: '' })
     const params: Record<string, unknown> = { sessionKey: sessionKey.value, fields }
     if (request.requestId) params.request_id = request.requestId
     if (request.runId) params.run_id = request.runId
     try {
-      await conversation.submitClarify(params)
-      clarifySubmitAttempts.delete(key)
+      const response = await conversation.submitClarify(params)
+      if (submittedSessionKey !== sessionKey.value) return
+      activeClarifyRequests.delete(key)
+      let legacyOwnerAlreadyTerminal = false
+      if (!request.requestId) {
+        const acceptedTaskId = String(
+          response.task_id
+          ?? response.taskId
+          ?? response.turn_id
+          ?? response.turnId
+          ?? '',
+        ).trim()
+        legacyOwnerAlreadyTerminal = Boolean(
+          acceptedTaskId && terminalClarifyTaskIds.has(acceptedTaskId),
+        )
+        if (acceptedTaskId && !legacyOwnerAlreadyTerminal) {
+          retainedClarifyTaskOwners.set(key, acceptedTaskId)
+        }
+      }
       setInterruptState(key, { resolution: 'replied', busy: false })
+      if (pendingClarifyMatches(key)) clarifySubmitted.value = true
       // request_id submissions resolve the exact paused tool call in the same
       // turn. A successful RPC is therefore authoritative and can release the
       // dock/composer immediately. Legacy clarifications create a new chat turn
       // and intentionally retain their existing submitted receipt.
-      if (request.requestId) clearPendingClarify(key)
+      if (request.requestId || legacyOwnerAlreadyTerminal) clearPendingClarify(key)
     } catch (err) {
+      if (submittedSessionKey !== sessionKey.value) return
       const message = 'Send failed — ' + (err instanceof Error ? err.message : String(err))
       const stillPending = pendingClarifyMatches(key)
       // A terminal tool result or authoritative empty snapshot can win the
       // race with a rejected/lost RPC acknowledgement. Never reopen that
       // already-settled request from the late rejection.
       const terminalConfirmed = !stillPending
-        && interruptState.value.get(key)?.resolution === 'replied'
+        && interruptState.value.get(key)?.resolution != null
       if (stillPending) {
         clarifySubmitted.value = false
         clarifyError.value = message
       }
       if (terminalConfirmed) {
-        clarifySubmitAttempts.delete(key)
+        activeClarifyRequests.delete(key)
       } else {
         setInterruptState(key, { resolution: null, busy: false, error: message })
       }
     } finally {
-      if (pendingClarifyMatches(key)) clarifyBusy.value = false
+      if (submittedSessionKey === sessionKey.value && pendingClarifyMatches(key)) {
+        clarifyBusy.value = false
+      }
     }
   }
 
@@ -756,56 +958,124 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     resetClarifyPresentation()
   }
 
-  /**
-   * A cancelled task makes its request_user_input frame unanswerable at the
-   * Gateway.  Resolve the local card as unavailable as well, so it cannot keep
-   * the composer locked or invite the user to submit a request that no longer
-   * exists.
-   */
-  function cancelPendingClarify() {
-    const request = pendingClarify.value
-    if (!request) return
-    const key = clarifyFrameKey(request)
-    clarifySubmitAttempts.delete(key)
-    setInterruptState(key, { resolution: 'unavailable', busy: false, error: '' })
-    pendingClarify.value = null
-    resetClarifyPresentation()
+  /** Settle only the structured input owned by the authoritative terminal task. */
+  function settlePendingClarifyForTerminalTask(
+    taskId: string,
+    _taskStatus: TaskTerminalStatus,
+  ) {
+    if (!taskId) return false
+    rememberTerminalClarifyTask(taskId)
+    let settled = false
+    for (const [key, active] of activeClarifyRequests) {
+      // Broker-owned structured requests stamp run_id with their TaskRuntime
+      // owner. Legacy Meta run ids use a different identity domain and are
+      // correlated only after their continuation RPC returns a task id below.
+      if (!active.request.requestId) continue
+      if (active.request.runId !== taskId) continue
+      activeClarifyRequests.delete(key)
+      if (interruptState.value.get(key)?.resolution !== 'replied') {
+        setInterruptState(key, { resolution: 'unavailable', busy: false, error: '' })
+      }
+      clearPendingClarify(key)
+      settled = true
+    }
+    for (const [key, ownerTaskId] of retainedClarifyTaskOwners) {
+      if (ownerTaskId !== taskId) continue
+      retainedClarifyTaskOwners.delete(key)
+      if (interruptState.value.get(key)?.resolution !== 'replied') {
+        setInterruptState(key, { resolution: 'unavailable', busy: false, error: '' })
+      }
+      activeClarifyRequests.delete(key)
+      clearPendingClarify(key)
+      settled = true
+    }
+    return settled
   }
 
   function applyUserInputBootstrap(snapshot: {
     pendingUserInputs?: unknown[]
     pending_user_inputs?: unknown[]
+    goalSnapshotStreamSeq?: number | null
+    goal_snapshot_stream_seq?: number | null
+    streamGeneration?: string
+    stream_generation?: string
+    deferredFields?: string[]
+    deferred_fields?: string[]
   }) {
     const hasAuthoritativePendingList = Object.prototype.hasOwnProperty.call(
       snapshot,
       'pendingUserInputs',
     ) || Object.prototype.hasOwnProperty.call(snapshot, 'pending_user_inputs')
     if (!hasAuthoritativePendingList) return
+    const deferred = snapshot.deferredFields ?? snapshot.deferred_fields
+    if (Array.isArray(deferred) && deferred.some(field => (
+      field === 'pendingUserInputs' || field === 'pending_user_inputs'
+    ))) return
+    // Reject a retired namespace before either negative reconciliation or
+    // positive additions can mutate the current dock/inline state.
+    if (!acceptsClarifyStreamGeneration(snapshot)) return
 
     const pending = snapshot.pendingUserInputs || snapshot.pending_user_inputs || []
     const requests = pending
       .map(value => clarifyRequestFromValue(value))
       .filter((request): request is ChatClarifyRequest => request != null)
     const pendingKeys = new Set(requests.map(request => clarifyFrameKey(request)))
-    const current = pendingClarify.value
-    if (current?.requestId) {
-      const currentKey = clarifyFrameKey(current)
-      if (clarifySubmitAttempts.has(currentKey) && !pendingKeys.has(currentKey)) {
-        clarifySubmitAttempts.delete(currentKey)
-        setInterruptState(currentKey, { resolution: 'replied', busy: false, error: '' })
-        clearPendingClarify(currentKey)
-      }
+    const snapshotStreamSeq = streamSeqFrom({
+      streamSeq: snapshot.goalSnapshotStreamSeq ?? snapshot.goal_snapshot_stream_seq,
+    })
+    const snapshotStreamGeneration = streamGenerationFrom(snapshot)
+    for (const [key, active] of activeClarifyRequests) {
+      if (pendingKeys.has(key)) continue
+      // pendingUserInputs is authoritative only for broker-owned structured
+      // requests. Legacy Meta clarifies are resumed by a follow-up chat turn
+      // and never appear in this snapshot.
+      if (!active.request.requestId) continue
+      // Hydration captures this cursor before reading pending inputs. A live
+      // request observed after that cursor is newer than an absent entry in
+      // this snapshot and must survive until an equal/newer snapshot arrives.
+      const activeGeneration = active.observedStreamGeneration
+      const currentGeneration = acceptedClarifyStreamGeneration
+        || String(options.streamGeneration?.value || '').trim()
+      if (activeGeneration && snapshotStreamGeneration && activeGeneration !== snapshotStreamGeneration) {
+        // Only the subscription's current generation may supersede state from
+        // another cursor namespace. An old hydrate that arrives after a new
+        // live event cannot compare its numeric sequence to that event.
+        if (
+          !currentGeneration
+          || activeGeneration === currentGeneration
+          || snapshotStreamGeneration !== currentGeneration
+        ) continue
+      } else if (
+        snapshotStreamSeq !== undefined
+        && active.observedStreamSeq !== undefined
+        && active.observedStreamSeq > snapshotStreamSeq
+      ) continue
+      activeClarifyRequests.delete(key)
+      const priorResolution = interruptState.value.get(key)?.resolution
+      setInterruptState(key, {
+        resolution: priorResolution === 'replied' ? 'replied' : 'unavailable',
+        busy: false,
+        error: '',
+      })
+      clearPendingClarify(key)
     }
 
     for (const request of requests) {
       const key = clarifyFrameKey(request)
-      if (interruptState.value.get(key)?.resolution === 'replied') continue
-      const sameRequest = pendingClarifyMatches(key)
-      pendingClarify.value = request
+      if (interruptState.value.get(key)?.resolution) {
+        activeClarifyRequests.delete(key)
+        continue
+      }
+      const active = rememberActiveClarify(
+        key,
+        request,
+        snapshotStreamSeq,
+        snapshotStreamGeneration,
+      )
+      if (!interruptState.value.has(key)) setInterruptState(key, {})
       // Do not make an in-flight submission actionable again just because a
       // racing snapshot still contains its pre-submit pending record.
-      if (!sameRequest || !clarifyBusy.value) resetClarifyPresentation()
-      if (!interruptState.value.has(key)) setInterruptState(key, {})
+      presentPendingClarify(active.request, key)
       if (!stream.isStreaming.value) stream.ensureInterruptBubble()
       stream.appendInterruptFrame({
         interruptKind: 'clarify',
@@ -827,7 +1097,12 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     interruptState.value = new Map()
     interruptNamespaces.clear()
     interruptApprovals.clear()
-    clarifySubmitAttempts.clear()
+    activeClarifyRequests.clear()
+    retainedClarifyTaskOwners.clear()
+    terminalClarifyTaskIds.clear()
+    // Stream generations belong to the Gateway transport, not one session;
+    // keep retired namespaces fenced across navigation.
+    syncClarifyStreamGenerationFromShared()
     legacyPushBackfills.clear()
     dismissClarify()
     if (key) hydrateApprovals()
@@ -851,7 +1126,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     extendInterrupt,
     submitClarify,
     dismissClarify,
-    cancelPendingClarify,
+    settlePendingClarifyForTerminalTask,
     applyUserInputBootstrap,
     subscribe,
     cleanup,

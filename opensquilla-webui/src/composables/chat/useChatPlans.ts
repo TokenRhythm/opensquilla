@@ -11,6 +11,7 @@ import type {
 import type { SessionMessagesSubscribeResponse } from '@/modules/sessionConversation'
 import type { PlanCenter } from '@/modules/planCenter'
 import { createClientRequestId } from '@/utils/chat/messageIdentity'
+import type { TaskSettlementStatus } from '@/utils/chat/streamEvents'
 import {
   normalizeCollaborationSnapshot,
   normalizePlanRevisionSnapshot,
@@ -531,22 +532,27 @@ export function useChatPlans(options: UseChatPlansOptions) {
   }
 
   /**
-   * The generic Stop control can cancel the task before the plan-run event
-   * reaches this surface. Do not leave that run presenting as active in the
-   * meantime; a delayed authoritative plan-run event may still enrich it.
+   * A task terminal can arrive before the matching plan-run event reaches this
+   * surface. Settle only the run owned by that exact task and retain its
+   * terminal state as a local monotonic fence against delayed active updates.
    */
-  function settleActiveRunForCancelledTask(taskId: string) {
+  function settleActiveRunForTerminalTask(
+    taskId: string,
+    taskStatus: TaskSettlementStatus,
+  ) {
     const run = activePlanRun.value
     if (!run || !taskId || run.activeTaskId !== taskId) return false
     if (!['queued', 'running', 'paused', 'blocked'].includes(run.status)) return false
+    const terminalReason = taskStatus === 'cancelled' ? 'cancelled_by_user' : taskStatus
     activePlanRun.value = {
       ...run,
       status: 'cancelled',
       currentStepId: undefined,
-      terminalReason: 'cancelled_by_user',
+      activeTaskId: undefined,
+      terminalReason,
       finishedAt: run.finishedAt ?? Date.now(),
       steps: run.steps.map(step => step.status === 'in_progress'
-        ? { ...step, status: 'skipped', reason: 'cancelled_by_user' }
+        ? { ...step, status: 'skipped', reason: terminalReason }
         : step),
     }
     return true
@@ -575,6 +581,6 @@ export function useChatPlans(options: UseChatPlansOptions) {
     revise,
     implement,
     cancelRun,
-    settleActiveRunForCancelledTask,
+    settleActiveRunForTerminalTask,
   }
 }

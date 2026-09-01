@@ -37,9 +37,10 @@ import {
 } from '@/utils/chat/routerTiers'
 import { normalizeRouterTierSnapshot } from '@/utils/chat/routerTierSnapshot'
 import { clarifyRequestFromValue, userInputOutcomeFromValue } from '@/utils/chat/clarify'
+import { turnOutcomePresentation } from '@/utils/chat/turnOutcome'
 import type { RouterVisualMode } from '@/utils/chat/routerVisualMode'
 import type { ModelRoutingMode } from '@/types/modelRouting'
-import type { InterruptViewState } from '@/types/parts'
+import type { InterruptClarifyData, InterruptViewState } from '@/types/parts'
 import { toParts, toolState, type ToPartsInterrupt } from '@/utils/chat/toParts'
 import { toSources } from '@/utils/chat/toSources'
 import { createdSessionFromToolCall } from '@/utils/chat/createdSessions'
@@ -129,7 +130,10 @@ function clarifyInterruptFromValue(value: unknown): ToPartsInterrupt | null {
   }
 }
 
-function historicalClarifyInterrupts(segments: RawToolCallPayload[] | undefined): ToPartsInterrupt[] {
+function historicalClarifyInterrupts(
+  segments: RawToolCallPayload[] | undefined,
+  terminalTaskId = '',
+): ToPartsInterrupt[] {
   if (!Array.isArray(segments) || !segments.length) return []
   const inputByToolId = new Map<string, unknown>()
   const out: ToPartsInterrupt[] = []
@@ -143,10 +147,14 @@ function historicalClarifyInterrupts(segments: RawToolCallPayload[] | undefined)
       return
     }
     const existing = out[existingIndex]
+    const incomingResolution = interrupt.resolution === 'unavailable'
+      && existing.resolution === 'replied'
+      ? 'replied'
+      : interrupt.resolution
     out[existingIndex] = {
       ...existing,
       data: { ...existing.data, ...interrupt.data },
-      ...(interrupt.resolution ? { resolution: interrupt.resolution } : {}),
+      ...(incomingResolution ? { resolution: incomingResolution } : {}),
     } as ToPartsInterrupt
   }
 
@@ -168,16 +176,31 @@ function historicalClarifyInterrupts(segments: RawToolCallPayload[] | undefined)
     if (fromMatchingInput) {
       upsert({
         ...fromMatchingInput,
-        ...(outcome ? { resolution: 'replied' } : {}),
+        ...(outcome
+          ? { resolution: outcome.status === 'answered' ? 'replied' : 'unavailable' }
+          : {}),
       })
     } else if (outcome) {
       const existingIndex = indexByApprovalId.get(outcome.requestId)
       if (existingIndex != null) {
-        out[existingIndex] = { ...out[existingIndex], resolution: 'replied' }
+        const priorResolution = out[existingIndex].resolution
+        out[existingIndex] = {
+          ...out[existingIndex],
+          resolution: outcome.status === 'answered' || priorResolution === 'replied'
+            ? 'replied'
+            : 'unavailable',
+        }
       }
     }
   }
-  return out
+  if (!terminalTaskId) return out
+  return out.map(interrupt => (
+    interrupt.kind === 'clarify'
+    && (interrupt.data as InterruptClarifyData).runId === terminalTaskId
+    && !interrupt.resolution
+      ? { ...interrupt, resolution: 'unavailable' }
+      : interrupt
+  ))
 }
 
 function terminatesPriorAssistant(message: ChatMessage, priorAssistant?: ChatMessage): boolean {
@@ -512,6 +535,11 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       }))
       const isPlanMessage = msg.role === 'assistant' && planRevisions.length > 0
       const normalizedToolCalls = normalizeToolCalls(msg.tool_calls)
+      const terminalClarifyTaskId = msg.turnOutcome
+        && msg.turnOutcome.taskId
+        && turnOutcomePresentation(msg.turnOutcome) !== 'completed'
+        ? msg.turnOutcome.taskId
+        : ''
       const assistantRawText = msg.role === 'assistant'
         ? options.stripGeneratedArtifactMarkers(msg.text)
         : msg.text
@@ -590,7 +618,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
             options.renderMarkdown,
             toolCallGroups,
             ownerKey,
-            historicalClarifyInterrupts(msg.tool_calls),
+            historicalClarifyInterrupts(msg.tool_calls, terminalClarifyTaskId),
             options.interruptState?.value,
           )
         : []

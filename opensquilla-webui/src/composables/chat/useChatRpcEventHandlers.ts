@@ -56,6 +56,8 @@ import {
   taskGroupId as eventTaskGroupId,
   taskTerminalAsSessionEvent as normalizeTaskTerminalEvent,
   taskTerminalStatus as eventTaskTerminalStatus,
+  type TaskSettlementStatus,
+  type TaskTerminalStatus,
 } from '@/utils/chat/streamEvents'
 import { localizedChatErrorMessage } from '@/utils/chat/errors'
 import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
@@ -195,7 +197,7 @@ export interface UseChatRpcEventHandlersOptions {
   handleSessionConnectionState?: (state: string) => SessionBootstrapRun | undefined
   loadCurrentSessionUsage: () => void
   refreshRunModePreference?: () => void | Promise<void>
-  onTaskCancelled?: (taskId: string) => void
+  onTaskTerminal?: (taskId: string, status: TaskTerminalStatus) => void
 }
 
 type ChatDoneUsageFields = {
@@ -303,6 +305,28 @@ const TASK_TERMINAL_STATUSES = new Set([
   'abandoned',
   'interrupted',
 ])
+
+const TASK_SETTLEMENT_STATUSES = new Set<TaskSettlementStatus>([
+  'failed',
+  'cancelled',
+  'timeout',
+  'abandoned',
+  'interrupted',
+])
+
+function taskSettlementStatus(value: unknown): TaskSettlementStatus | '' {
+  const normalized = String(value || '').trim().toLowerCase()
+  const compatible = normalized === 'error'
+    ? 'failed'
+    : normalized === 'killed'
+      ? 'cancelled'
+      : normalized === 'timed_out'
+        ? 'timeout'
+        : normalized
+  return TASK_SETTLEMENT_STATUSES.has(compatible as TaskSettlementStatus)
+    ? compatible as TaskSettlementStatus
+    : ''
+}
 
 type LiveThinking = {
   text: string
@@ -1567,6 +1591,31 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       : null
   }
 
+  function eventTaskSettlementStatus(
+    eventKind: ConversationSemanticEventKind,
+    payload: SessionEventPayload,
+  ): TaskTerminalStatus | '' {
+    const compactStatus = eventTaskTerminalStatus(eventKind)
+    if (compactStatus) return compactStatus
+
+    const lastTask = (payload.last_task || payload.lastTask) as { status?: unknown } | undefined
+    const rawPayloadStatus = String(
+      payload.run_status
+      || payload.runStatus
+      || payload.status
+      || '',
+    )
+    const payloadStatus = taskSettlementStatus(rawPayloadStatus)
+      || taskSettlementStatus(options.normalizeRunStatus(rawPayloadStatus))
+      || taskSettlementStatus(lastTask?.status)
+    if (eventKind === 'turn-completed' && payload.reason === 'aborted') {
+      return payloadStatus || 'cancelled'
+    }
+    if (eventKind === 'turn-completed') return payloadStatus || 'succeeded'
+    if (eventKind === 'turn-failed') return payloadStatus || 'failed'
+    return ''
+  }
+
   function isStoppedCancelledTerminalEvent(terminalStatus: string, payload: SessionEventPayload): boolean {
     const taskId = payloadTaskId(payload)
     return Boolean(
@@ -2050,6 +2099,12 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     const changedTask = (payload.changed_task || payload.changedTask) as ChatRunStatusSource['active_task']
     const changedTaskStatus = String(changedTask?.status || '').toLowerCase()
     if (changedTaskStatus === 'queued') options.taskOwnership?.noteQueued(changedTask || '')
+    const payloadTerminalTask = terminalSessionChangeTask(payload)
+    const payloadTerminalTaskId = chatTaskId(payloadTerminalTask)
+    const payloadTerminalStatus = taskSettlementStatus(payloadTerminalTask?.status)
+    if (payloadTerminalTaskId && payloadTerminalStatus) {
+      options.onTaskTerminal?.(payloadTerminalTaskId, payloadTerminalStatus)
+    }
     // changed_task describes which lifecycle row changed; it is deliberately
     // non-authoritative when Gateway snapshot generation failed. Only the
     // direct task.running event or an active_task/run_status projection may
@@ -2065,8 +2120,6 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       sessionChangeIsTerminal(payload) &&
       bufferPendingTerminalEvent({ kind: 'session-change', payload })
     ) return
-    const payloadTerminalTask = terminalSessionChangeTask(payload)
-    const payloadTerminalTaskId = chatTaskId(payloadTerminalTask)
     const activeProjection = (payload.active_task || payload.activeTask) as ChatRunStatusSource['active_task']
     const carriesSettledContinuation = Boolean(
       sessionChangeIsTerminal(payload)
@@ -2251,6 +2304,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         )
       ) {
         if (!acceptStreamSeq(payloadObj)) return
+        options.onTaskTerminal?.(succeededTaskId, 'succeeded')
         if (
           awaitingCommitTaskIds.value.has(succeededTaskId)
           && rememberTrackedTask(taskSucceededSyncedIds, succeededTaskId)
@@ -2277,6 +2331,15 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     // name. Without this, a successor whose done frame was buffered behind A
     // remains marked running after replay and blocks every future drain.
     const terminalTaskId = terminalEvent ? payloadTaskId(payloadObj) : ''
+    const terminalOwnerId = terminalTaskId || (
+      terminalEvent
+        ? String(payloadObj.turn_id ?? payloadObj.turnId ?? '').trim()
+        : ''
+    )
+    const settlementStatus = eventTaskSettlementStatus(eventKind, payloadObj)
+    if (terminalOwnerId && settlementStatus) {
+      options.onTaskTerminal?.(terminalOwnerId, settlementStatus)
+    }
     if (
       terminalStatus
       && terminalStatus !== 'succeeded'
@@ -2335,13 +2398,6 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       && payloadTaskId(payloadObj) === activeStreamTaskId.value,
     )
     if (!terminalMatchesStop && !terminalMatchesRenderOwner && !isCurrentTaskPayload(payloadObj)) return
-    const cancelledByDoneReceipt = (
-      (rawEvent === 'session.event.done' || rawEvent === 'chat.done')
-      && payloadObj.reason === 'aborted'
-    )
-    if ((terminalStatus === 'cancelled' || cancelledByDoneReceipt) && terminalTaskId) {
-      options.onTaskCancelled?.(terminalTaskId)
-    }
     if (terminalStatus) {
       if (!isCurrentSessionPayload(payloadObj)) return
       const terminalRunStatus = terminalStatus === 'succeeded' ? 'idle' : terminalStatus === 'abandoned' ? 'interrupted' : terminalStatus

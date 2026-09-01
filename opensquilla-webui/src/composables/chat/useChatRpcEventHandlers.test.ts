@@ -38,7 +38,7 @@ function createHarness(options: {
   getCompactionPlacement?: (compactionId: string) => 'activity' | 'standalone' | undefined
   observeStreamGeneration?: (payload: unknown) => boolean
   supportsTurnCommitted?: boolean
-  onTaskCancelled?: (taskId: string) => void
+  onTaskTerminal?: (taskId: string, status: string) => void
 } = {}) {
   const messages = ref<ChatMessage[]>(options.messages ?? [])
   const sessionKey = ref('agent:main:test')
@@ -92,7 +92,7 @@ function createHarness(options: {
   const loadCurrentSessionUsage = vi.fn(options.loadCurrentSessionUsage ?? (() => {}))
   const refreshRunModePreference = vi.fn(options.refreshRunModePreference ?? (() => {}))
   const restoreSteerIntoComposer = vi.fn(options.restoreSteerIntoComposer ?? (() => {}))
-  const onTaskCancelled = vi.fn(options.onTaskCancelled ?? (() => {}))
+  const onTaskTerminal = vi.fn(options.onTaskTerminal ?? (() => {}))
   const scope = effectScope()
   const rawApi = scope.run(() => useChatRpcEventHandlers({
     sessionKey,
@@ -140,7 +140,7 @@ function createHarness(options: {
     handleSessionConnectionState,
     loadCurrentSessionUsage,
     refreshRunModePreference,
-    onTaskCancelled,
+    onTaskTerminal,
   }))!
   const api = {
     ...rawApi,
@@ -183,7 +183,7 @@ function createHarness(options: {
     loadCurrentSessionUsage,
     refreshRunModePreference,
     restoreSteerIntoComposer,
-    onTaskCancelled,
+    onTaskTerminal,
     stop: () => scope.stop(),
   }
 }
@@ -1835,36 +1835,121 @@ describe('useChatRpcEventHandlers task group lifecycle', () => {
     }
   })
 
-  it('notifies the UI to settle plan-owned presentation when the foreground task is cancelled', () => {
-    const { api, onTaskCancelled, stop } = createHarness()
+  it.each([
+    ['task.succeeded', 'succeeded', {}],
+    ['task.cancelled', 'cancelled', {}],
+    ['task.timeout', 'timeout', {}],
+    ['task.failed', 'failed', {}],
+    ['task.abandoned', 'abandoned', {}],
+    ['session.event.error', 'failed', {}],
+    ['session.event.done', 'cancelled', { reason: 'aborted' }],
+    ['session.event.error', 'cancelled', { status: 'killed' }],
+    ['session.event.error', 'timeout', { status: 'timed_out' }],
+  ])(
+    'passes the authoritative %s settlement to terminal presentation owners',
+    (event, expectedStatus, extra) => {
+      const { api, onTaskTerminal, stop } = createHarness()
+      try {
+        api.bindActiveStreamTask('task-terminal-1')
+        api.handlers.onWireEventFixture(event, {
+          session_key: 'agent:main:test',
+          task_id: 'task-terminal-1',
+          stream_seq: 1,
+          generation_epoch: 0,
+          ...extra,
+        })
+
+        expect(onTaskTerminal).toHaveBeenCalledWith('task-terminal-1', expectedStatus)
+      } finally {
+        stop()
+      }
+    },
+  )
+
+  it('uses a direct turn id to settle presentation without TaskRuntime', () => {
+    const { api, onTaskTerminal, stop } = createHarness()
     try {
-      api.bindActiveStreamTask('task-stop-1')
-      api.handlers.onAny('task.cancelled', {
+      api.handlers.onWireEventFixture('session.event.done', {
         session_key: 'agent:main:test',
-        task_id: 'task-stop-1',
+        turn_id: 'direct-turn-1',
         stream_seq: 1,
         generation_epoch: 0,
       })
 
-      expect(onTaskCancelled).toHaveBeenCalledWith('task-stop-1')
+      expect(onTaskTerminal).toHaveBeenCalledWith('direct-turn-1', 'succeeded')
     } finally {
       stop()
     }
   })
 
-  it('settles plan-owned presentation when cancellation arrives as an aborted done receipt', () => {
-    const { api, onTaskCancelled, stop } = createHarness()
+  it('passes interrupted terminal state from the authoritative session projection', () => {
+    const { api, onTaskTerminal, stop } = createHarness()
     try {
-      api.bindActiveStreamTask('task-stop-2')
-      api.handlers.onAny('session.event.done', {
+      api.handlers.onSessionsChanged({
         session_key: 'agent:main:test',
-        task_id: 'task-stop-2',
-        stream_seq: 1,
-        generation_epoch: 0,
-        reason: 'aborted',
+        reason: 'task_terminal',
+        run_status: 'interrupted',
+        last_task: { task_id: 'task-interrupted-1', status: 'interrupted' },
       })
 
-      expect(onTaskCancelled).toHaveBeenCalledWith('task-stop-2')
+      expect(onTaskTerminal).toHaveBeenCalledWith('task-interrupted-1', 'interrupted')
+    } finally {
+      stop()
+    }
+  })
+
+  it('passes a terminal to its domain owner before rejecting a different render owner', () => {
+    const { api, onTaskTerminal, stop } = createHarness()
+    try {
+      api.bindActiveStreamTask('task-rendered')
+      api.handlers.onWireEventFixture('task.timeout', {
+        session_key: 'agent:main:test',
+        task_id: 'task-plan-owner',
+        stream_seq: 1,
+        generation_epoch: 0,
+      })
+
+      expect(onTaskTerminal).toHaveBeenCalledWith('task-plan-owner', 'timeout')
+    } finally {
+      stop()
+    }
+  })
+
+  it('passes a terminal to its domain owner before buffering pending task acceptance', () => {
+    const { api, onTaskTerminal, stop } = createHarness()
+    try {
+      api.bindActiveStreamTask(PENDING_STREAM_TASK_ID)
+      api.handlers.onWireEventFixture('task.timeout', {
+        session_key: 'agent:main:test',
+        task_id: 'task-pending-acceptance',
+        stream_seq: 1,
+        generation_epoch: 0,
+      })
+
+      expect(onTaskTerminal).toHaveBeenCalledWith('task-pending-acceptance', 'timeout')
+    } finally {
+      stop()
+    }
+  })
+
+  it('rejects foreign-session and stale-epoch terminal settlements', () => {
+    const { api, onTaskTerminal, stop } = createHarness()
+    try {
+      api.handlers.onWireEventFixture('task.failed', {
+        session_key: 'agent:other:test',
+        task_id: 'task-foreign',
+        stream_seq: 1,
+        generation_epoch: 0,
+      })
+      api.handlers.onWireEventFixture('task.timeout', {
+        session_key: 'agent:main:test',
+        task_id: 'task-stale',
+        epoch: -1,
+        stream_seq: 2,
+        generation_epoch: 0,
+      })
+
+      expect(onTaskTerminal).not.toHaveBeenCalled()
     } finally {
       stop()
     }

@@ -10,9 +10,18 @@ describe('useChatApprovals clarify submit source contract', () => {
     expect(source).toContain('if (request.runId) params.run_id = request.runId')
   })
 
-  it('optimistically acknowledges the click before the backend finishes', () => {
-    expect(source).toContain('clarifySubmitted.value = true')
-    expect(source).toContain("setInterruptState(key, { resolution: 'replied', busy: true, error: '' })")
+  it('keeps the request busy until the backend acknowledges it', () => {
+    const awaitAck = source.indexOf('await conversation.submitClarify(params)')
+    const pendingState = source.indexOf(
+      "setInterruptState(key, { resolution: null, busy: true, error: '' })",
+    )
+    const repliedState = source.indexOf(
+      "setInterruptState(key, { resolution: 'replied', busy: false })",
+    )
+
+    expect(pendingState).toBeGreaterThan(-1)
+    expect(pendingState).toBeLessThan(awaitAck)
+    expect(repliedState).toBeGreaterThan(awaitAck)
     expect(source).toContain('clarifySubmitted.value = false')
     expect(source).toContain('setInterruptState(key, { resolution: null, busy: false, error: message })')
   })
