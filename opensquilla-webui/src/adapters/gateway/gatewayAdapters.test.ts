@@ -41,6 +41,7 @@ describe('Gateway Adapter composition', () => {
       'setupWorkflow',
       'migrationOperations',
       'workspaceCatalog',
+      'sandboxRuntime',
     ])
     expect(adapters).not.toHaveProperty('rpc')
     expect(adapters).not.toHaveProperty('events')

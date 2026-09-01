@@ -23,6 +23,7 @@ import { PROVIDER_CONFIGURATION_KEY } from './modules/providerConfiguration'
 import { SETUP_WORKFLOW_KEY } from './modules/setupWorkflow'
 import { MIGRATION_OPERATIONS_KEY } from './modules/migrationOperations'
 import { WORKSPACE_CATALOG_KEY } from './modules/workspaceCatalog'
+import { SANDBOX_RUNTIME_KEY } from './modules/sandboxRuntime'
 import 'katex/dist/katex.min.css'
 import './assets/base.css'
 import './themes/tokens' // eagerly bundles every value theme's token block
@@ -76,6 +77,7 @@ app.provide(PROVIDER_CONFIGURATION_KEY, gatewayAdapters.providerConfiguration)
 app.provide(SETUP_WORKFLOW_KEY, gatewayAdapters.setupWorkflow)
 app.provide(MIGRATION_OPERATIONS_KEY, gatewayAdapters.migrationOperations)
 app.provide(WORKSPACE_CATALOG_KEY, gatewayAdapters.workspaceCatalog)
+app.provide(SANDBOX_RUNTIME_KEY, gatewayAdapters.sandboxRuntime)
 router.afterEach(() => {
   rpcStore.applyLinkTokenFromUrl()
 })

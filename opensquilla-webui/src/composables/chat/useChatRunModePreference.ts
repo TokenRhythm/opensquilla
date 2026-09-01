@@ -4,6 +4,7 @@ import {
   waitForSessionRpcConnection,
 } from '@/composables/chat/sessionBootstrapAdmission'
 import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
+import type { SandboxRuntime } from '@/modules/sandboxRuntime'
 import {
   SANDBOX_RUN_MODES,
   isRecognizedSandboxRunMode,
@@ -24,6 +25,7 @@ interface UseChatRunModePreferenceOptions {
   rpc: RunModePreferenceRpc
   hydrateCallOptions?: RpcCallOptions
   writeCallOptions?: RpcCallOptions
+  sandbox?: Pick<SandboxRuntime, 'runModePreference' | 'setRunMode'>
 }
 
 interface RunModePreferenceRpc {
@@ -162,13 +164,15 @@ export function useChatRunModePreference(options: UseChatRunModePreferenceOption
 
   async function hydrateRunModePreference(): Promise<SandboxRunMode> {
     await waitForSessionRpcConnection(options.rpc, options.hydrateCallOptions)
-    const payload = options.hydrateCallOptions
-      ? await options.rpc.call(
-          'sandbox.run_mode.preference.get',
-          undefined,
-          options.hydrateCallOptions,
-        )
-      : await options.rpc.call('sandbox.run_mode.preference.get')
+    const payload = options.sandbox
+      ? await options.sandbox.runModePreference()
+      : options.hydrateCallOptions
+        ? await options.rpc.call(
+            'sandbox.run_mode.preference.get',
+            undefined,
+            options.hydrateCallOptions,
+          )
+        : await options.rpc.call('sandbox.run_mode.preference.get')
     const source = payload && typeof payload === 'object'
       ? (payload as Record<string, unknown>).source
       : null
@@ -194,15 +198,17 @@ export function useChatRunModePreference(options: UseChatRunModePreferenceOption
 
     try {
       await waitForSessionRpcConnection(options.rpc, options.writeCallOptions)
-      const payload = options.writeCallOptions
-        ? await options.rpc.call(
-            'sandbox.run_mode.preference.set',
-            { runMode: requested },
-            options.writeCallOptions,
-          )
-        : await options.rpc.call('sandbox.run_mode.preference.set', {
-            runMode: requested,
-          })
+      const payload = options.sandbox
+        ? await options.sandbox.setRunMode(requested)
+        : options.writeCallOptions
+          ? await options.rpc.call(
+              'sandbox.run_mode.preference.set',
+              { runMode: requested },
+              options.writeCallOptions,
+            )
+          : await options.rpc.call('sandbox.run_mode.preference.set', {
+              runMode: requested,
+            })
       if (sequence !== writeSequence) return runMode.value
       return applyConfirmedPreference(
         modeFromPayload(payload),

@@ -8,6 +8,7 @@ import type {
   SandboxRunMode,
   SandboxSetupStatusPayload,
 } from '@/types/sandbox'
+import type { SandboxRuntime } from '@/modules/sandboxRuntime'
 
 const SETUP_POLL_MS = 2000
 
@@ -17,7 +18,8 @@ type SandboxSetupRpc = {
 }
 
 export interface UseSandboxSetupRecoveryOptions {
-  rpc: SandboxSetupRpc
+  rpc?: SandboxSetupRpc
+  sandbox?: Pick<SandboxRuntime, 'setupStatus' | 'ensureSetup' | 'capability'>
   connectionState: Ref<string>
   runMode: Ref<SandboxRunMode>
   autoRefresh?: boolean
@@ -38,6 +40,11 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
   let pollTimer: ReturnType<typeof setTimeout> | null = null
   let lastState = ''
   let lastUnavailableFingerprint = ''
+
+  function legacyCall(method: string, params?: Record<string, unknown>): Promise<unknown> {
+    if (!options.rpc) return Promise.reject(new Error('Sandbox runtime is unavailable.'))
+    return params === undefined ? options.rpc.call(method) : options.rpc.call(method, params)
+  }
 
   const active = computed(() => options.connectionState.value === 'connected')
   const visible = computed(() =>
@@ -92,7 +99,9 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
     loading.value = status.value === null
     clearPoll()
     try {
-      const payload = normalizeSandboxSetupStatus(await options.rpc.call('sandbox.setup.status'))
+      const payload = normalizeSandboxSetupStatus(
+        await (options.sandbox ? options.sandbox.setupStatus() : legacyCall('sandbox.setup.status')),
+      )
       if (generation !== requestGeneration) return
       if (!payload) {
         // Keep following an already-authoritative setting_up state when a
@@ -128,9 +137,9 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
     clearPoll()
     try {
       const result = await ensureSandboxReady(
-        options.rpc.call,
+        options.sandbox ?? legacyCall,
         null,
-        options.rpc.waitForConnection ?? null,
+        options.rpc?.waitForConnection ?? null,
       )
       if (generation !== requestGeneration) return false
       if (result.status) applyStatus(result.status)
