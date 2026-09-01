@@ -2729,15 +2729,18 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         // potentially slow history response before refreshing independent UI.
         const criticalRequestsQueued = recovery?.criticalRequestsQueued
           ?? Promise.resolve()
-        void criticalRequestsQueued.then(() => {
-          if (
-            connectionStateGeneration === stateGeneration
-            && sessionKey.value === connectedSessionKey
-          ) {
-            options.loadCurrentSessionUsage()
-            void options.refreshRunModePreference?.()
-          }
-        })
+        void criticalRequestsQueued.then(
+          () => {
+            if (
+              connectionStateGeneration === stateGeneration
+              && sessionKey.value === connectedSessionKey
+            ) {
+              options.loadCurrentSessionUsage()
+              void options.refreshRunModePreference?.()
+            }
+          },
+          () => {},
+        )
       }
       if (!recovery) {
         options.loadCurrentSessionUsage()

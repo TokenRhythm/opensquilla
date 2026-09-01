@@ -1941,7 +1941,10 @@ def test_dev_gateway_runtime_is_process_tree_aware_on_termination() -> None:
     assert "detached: runtime.mode === 'dev' && process.platform !== 'win32'" in start
     assert "if (runtime.mode === 'dev') gatewayProcessTreeChildren.add(child)" in start
     assert "gatewayProcessTreeChildren.has(child)" in terminate
-    assert "spawnSync('taskkill', ['/pid', String(pid), '/t', '/f']" in terminate
+    assert "terminateWindowsProcessTree({" in terminate
+    assert "timeoutMs: WINDOWS_PROCESS_TREE_KILL_TIMEOUT_MS" in terminate
+    assert "gatewayProcessTreeTerminations.has(child)" in terminate
+    assert "gateway_process_tree_termination_failed" in terminate
     assert "process.kill(-pid, signal)" in terminate
     assert "child.kill(signal)" in terminate
 
@@ -3254,6 +3257,12 @@ def test_desktop_orphan_recovery_has_a_real_electron_process_flow() -> None:
     assert "createPhaseBudget('hard-crash-exit', CRASH_EXIT_BUDGET_MS)" in script
     assert "const WINDOWS_ELECTRON_CHILD_CLEANUP_COMMAND_TIMEOUT_MS = 20_000" in script
     assert "const WINDOWS_ELECTRON_CHILD_CLEANUP_BUDGET_MS = 30_000" in script
+    assert "const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000" in script
+    assert "closeElectronWithDeadline" in script
+    assert "'successful-electron-shutdown'" in script
+    assert "'finally-second-electron-shutdown'" in script
+    assert "'finally-first-electron-shutdown'" in script
+    assert "await secondApp.close()" not in script
     assert (
         "createPhaseBudget(\n"
         "    'windows-electron-child-cleanup',\n"
@@ -3269,6 +3278,26 @@ def test_desktop_orphan_recovery_has_a_real_electron_process_flow() -> None:
     assert "DESKTOP_E2E_PROCESS_EXITED:" in script
     assert "if (flowSucceeded && stillLive.length === 0)" in script
     assert "async function waitFor(check, label, timeoutMs = 60_000)" not in script
+
+
+def test_desktop_e2e_shutdown_helpers_bound_windows_cleanup_without_masking_failures() -> None:
+    v1_flow = _read("desktop/electron/scripts/test-v1-html-agent-edit-e2e.mjs")
+    helper = _read("desktop/electron/scripts/e2e-shutdown-helpers.mjs")
+
+    assert "const PROVIDER_SHUTDOWN_TIMEOUT_MS = 15_000" in v1_flow
+    assert "trackHttpServerConnections(server)" in v1_flow
+    assert "closeHttpServerWithDeadline(server, connections" in v1_flow
+    assert "phase: 'run-error-before-cleanup'" in v1_flow
+    assert v1_flow.index("phase: 'run-error-before-cleanup'") < v1_flow.index(
+        "await provider?.close()"
+    )
+    assert "server.closeIdleConnections?.()" in helper
+    assert "server.closeAllConnections?.()" in helper
+    assert "for (const socket of sockets) socket.destroy()" in helper
+    assert "terminateWindowsProcessTree" in helper
+    assert "child.kill('SIGKILL')" in helper
+    assert "forced process exit" in helper
+    assert "desktop_e2e_electron_shutdown_failed" in helper
 
 
 def test_desktop_dual_source_update_resolver_wires_static_channels() -> None:
@@ -4028,6 +4057,16 @@ def test_consolidation_e2e_waits_for_primary_route_and_emits_renderer_diagnostic
     assert "page.on('pageerror'" in source
     assert "windows=${JSON.stringify(windows)}" in control
     assert "gatewayLogTail: gatewayLog.slice(-8_000)" in source
+    assert "const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000" in source
+    assert "closeElectronWithDeadline" in source
+    assert "closeActiveApp('consolidated-primary-electron-shutdown')" in source
+    assert "closeActiveApp('completed-receipt-electron-shutdown')" in source
+    assert "closeActiveApp('config-only-electron-shutdown')" in source
+    assert "closeActiveApp('credential-only-electron-shutdown')" in source
+    assert "closeActiveApp('invalid-credential-electron-shutdown')" in source
+    assert "closeActiveApp('finally-profile-electron-shutdown'" in source
+    assert "await app.close()" not in source
+    assert "await app?.close()" not in source
 
 
 def test_consolidation_e2e_covers_receipt_replay_and_inactive_state_archival() -> None:

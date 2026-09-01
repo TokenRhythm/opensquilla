@@ -18,6 +18,11 @@ import { dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { _electron as electron } from 'playwright'
+import {
+  closeElectronWithDeadline,
+  closeHttpServerWithDeadline,
+  trackHttpServerConnections,
+} from './e2e-shutdown-helpers.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
@@ -34,6 +39,8 @@ const newerCredentialMarker = 'synthetic-newest-recovery-credential'
 const observedRendererPages = new WeakSet()
 const rendererDiagnostics = []
 const PROFILE_CLI_TIMEOUT_MS = 120_000
+const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000
+const PROVIDER_SHUTDOWN_TIMEOUT_MS = 15_000
 
 async function waitFor(check, label, timeoutMs = 120_000) {
   const startedAt = Date.now()
@@ -153,6 +160,7 @@ async function startFakeProvider() {
     response.writeHead(404, { 'content-type': 'application/json' })
     response.end(JSON.stringify({ error: { message: 'synthetic endpoint not found' } }))
   })
+  const connections = trackHttpServerConnections(server)
   await new Promise((resolveListen, rejectListen) => {
     server.once('error', rejectListen)
     server.listen(0, '127.0.0.1', resolveListen)
@@ -161,8 +169,9 @@ async function startFakeProvider() {
   assert(address && typeof address === 'object')
   return {
     port: address.port,
-    close: () => new Promise((resolveClose, rejectClose) => {
-      server.close((error) => error ? rejectClose(error) : resolveClose())
+    close: () => closeHttpServerWithDeadline(server, connections, {
+      label: 'Profile consolidation provider shutdown',
+      timeoutMs: PROVIDER_SHUTDOWN_TIMEOUT_MS,
     }),
   }
 }
@@ -298,6 +307,46 @@ const recoveryProfiles = join(userData, 'recovery-profiles')
 const contextPath = join(userData, 'desktop-profile-context.json')
 const fakeProvider = await startFakeProvider()
 let app
+let activeAppUserData = userData
+
+async function profileShutdownDiagnostics(targetApp, profileUserData, phase) {
+  const windows = await Promise.all(targetApp.windows().map(async page => ({
+    url: page.url(),
+    title: await page.title().catch(() => ''),
+    body: await page.locator('body').innerText({ timeout: 1_000 }).catch(() => '').then(
+      value => value.slice(0, 1_500),
+    ),
+  }))).catch(error => [{ diagnosticError: error?.message || String(error) }])
+  const desktopLog = await readFile(
+    join(profileUserData, 'logs', 'desktop.log'),
+    'utf8',
+  ).catch(() => '')
+  const gatewayLog = await readFile(
+    join(profileUserData, 'logs', 'gateway.log'),
+    'utf8',
+  ).catch(() => '')
+  return {
+    phase,
+    windows,
+    desktopLogTail: desktopLog.slice(-8_000),
+    gatewayLogTail: gatewayLog.slice(-8_000),
+    rendererDiagnostics: rendererDiagnostics.slice(-30),
+  }
+}
+
+async function closeActiveApp(phase, { failOnError = true } = {}) {
+  if (!app) return
+  const targetApp = app
+  const profileUserData = activeAppUserData
+  app = undefined
+  const result = await closeElectronWithDeadline({
+    app: targetApp,
+    phase,
+    timeoutMs: ELECTRON_SHUTDOWN_TIMEOUT_MS,
+    diagnostics: () => profileShutdownDiagnostics(targetApp, profileUserData, phase),
+  })
+  if (result.error && failOnError) throw result.error
+}
 
 try {
   await mkdir(userData, { recursive: true })
@@ -368,6 +417,7 @@ try {
     'pending',
   )
 
+  activeAppUserData = userData
   app = await electron.launch({
     args: ['--use-mock-keychain', `--user-data-dir=${userData}`, packageRoot],
     env: launchEnvironment(isolatedHome),
@@ -511,13 +561,13 @@ try {
     await page.screenshot({ path: screenshotPath })
   }
 
-  await app.close()
-  app = undefined
+  await closeActiveApp('consolidated-primary-electron-shutdown')
 
   // A completed receipt is never replayed. If the user later removes the
   // primary credential, startup must offer normal onboarding instead of
   // resurrecting the archived historical secret.
   await rm(primaryCredential)
+  activeAppUserData = userData
   app = await electron.launch({
     args: ['--use-mock-keychain', `--user-data-dir=${userData}`, packageRoot],
     env: launchEnvironment(isolatedHome),
@@ -539,8 +589,7 @@ try {
     1,
   )
 
-  await app.close()
-  app = undefined
+  await closeActiveApp('completed-receipt-electron-shutdown')
 
   // A recovery may be the newest valid configuration source without carrying
   // a Desktop credential. Consolidation still succeeds, consumes the legacy
@@ -558,6 +607,7 @@ try {
     omitCredential: true,
     modifiedAt: new Date('2026-07-22T00:00:00.000Z'),
   })
+  activeAppUserData = configOnlyUserData
   app = await electron.launch({
     args: ['--use-mock-keychain', `--user-data-dir=${configOnlyUserData}`, packageRoot],
     env: launchEnvironment(configOnlyHome),
@@ -588,8 +638,7 @@ try {
     'not_required',
   )
 
-  await app.close()
-  app = undefined
+  await closeActiveApp('config-only-electron-shutdown')
 
   // A credential-only recovery still contains enough provider authority for
   // Electron to generate a canonical primary config. The config and
@@ -613,6 +662,7 @@ try {
     omitConfig: true,
     modifiedAt: new Date('2026-07-22T12:00:00.000Z'),
   })
+  activeAppUserData = credentialOnlyUserData
   app = await electron.launch({
     args: ['--use-mock-keychain', `--user-data-dir=${credentialOnlyUserData}`, packageRoot],
     env: launchEnvironment(credentialOnlyHome),
@@ -656,8 +706,7 @@ try {
     'complete',
   )
 
-  await app.close()
-  app = undefined
+  await closeActiveApp('credential-only-electron-shutdown')
 
   // Corrupt historical credential bytes are archived and reported, but they
   // must not make startup permanently fail. The copied primary configuration
@@ -675,6 +724,7 @@ try {
     credentialBytes: '{ definitely-not-valid-json',
     modifiedAt: new Date('2026-07-23T00:00:00.000Z'),
   })
+  activeAppUserData = invalidUserData
   app = await electron.launch({
     args: ['--use-mock-keychain', `--user-data-dir=${invalidUserData}`, packageRoot],
     env: launchEnvironment(invalidHome),
@@ -712,6 +762,8 @@ try {
     'complete',
   )
 
+  await closeActiveApp('invalid-credential-electron-shutdown')
+
   console.log(JSON.stringify({
     ok: true,
     activeProfile: 'primary',
@@ -729,13 +781,15 @@ try {
   const desktopLog = await readFile(join(userData, 'logs', 'desktop.log'), 'utf8').catch(() => '')
   const gatewayLog = await readFile(join(userData, 'logs', 'gateway.log'), 'utf8').catch(() => '')
   console.error(JSON.stringify({
+    phase: 'run-error-before-cleanup',
+    error: String(error?.stack || error),
     desktopLogTail: desktopLog.slice(-8_000),
     gatewayLogTail: gatewayLog.slice(-8_000),
     rendererDiagnostics: rendererDiagnostics.slice(-30),
   }, null, 2))
   throw error
 } finally {
-  await app?.close().catch(() => {})
+  await closeActiveApp('finally-profile-electron-shutdown', { failOnError: false })
   await fakeProvider.close().catch(() => {})
   await rm(root, { recursive: true, force: true }).catch(() => {})
 }

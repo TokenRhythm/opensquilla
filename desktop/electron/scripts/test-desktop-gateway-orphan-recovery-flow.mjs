@@ -15,6 +15,7 @@ import {
   waitForDesktopGatewayOwnershipRelease,
 } from '../dist/desktop-gateway-ownership.js'
 import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
+import { closeElectronWithDeadline } from './e2e-shutdown-helpers.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
@@ -35,6 +36,7 @@ const ORPHAN_RECOVERY_STARTUP_BUDGET_MS = (
 )
 const GATEWAY_CHILD_CRASH_RECOVERY_BUDGET_MS = INITIAL_DESKTOP_STARTUP_BUDGET_MS + 10_000
 const CRASH_EXIT_BUDGET_MS = 15_000
+const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000
 const WINDOWS_ELECTRON_CHILD_CLEANUP_COMMAND_TIMEOUT_MS = 20_000
 const WINDOWS_ELECTRON_CHILD_CLEANUP_BUDGET_MS = 30_000
 
@@ -113,6 +115,16 @@ async function phaseDiagnostics(app, userDataDir, phase) {
     windows,
     ownership: await ownershipDiagnostics(userDataDir),
   }
+}
+
+async function closeDesktopForPhase(app, userDataDir, phaseName) {
+  const phase = createPhaseBudget(phaseName, ELECTRON_SHUTDOWN_TIMEOUT_MS)
+  return closeElectronWithDeadline({
+    app,
+    phase: phase.name,
+    timeoutMs: phase.timeoutMs,
+    diagnostics: () => phaseDiagnostics(app, userDataDir, phase),
+  })
 }
 
 async function phaseError(message, app, userDataDir, phase, cause = null) {
@@ -497,8 +509,13 @@ try {
     'crashed-gateway-process-exit',
   ), () => phaseDiagnostics(secondApp, userDataDir, childCrashRecovery))
 
-  await secondApp.close()
+  const successShutdown = await closeDesktopForPhase(
+    secondApp,
+    userDataDir,
+    'successful-electron-shutdown',
+  )
   secondApp = null
+  if (successShutdown.error) throw successShutdown.error
   assert.equal(
     await waitForDesktopGatewayOwnershipRelease(secondOwnershipDir, thirdRecord, {
       timeoutMs: 15_000,
@@ -515,8 +532,16 @@ try {
   }))
   flowSucceeded = true
 } finally {
-  if (secondApp) await secondApp.close().catch(() => null)
-  if (firstApp) await firstApp.close().catch(() => null)
+  if (secondApp) {
+    const app = secondApp
+    secondApp = null
+    await closeDesktopForPhase(app, userDataDir, 'finally-second-electron-shutdown')
+  }
+  if (firstApp) {
+    const app = firstApp
+    firstApp = null
+    await closeDesktopForPhase(app, userDataDir, 'finally-first-electron-shutdown')
+  }
   for (const { ownershipDir, record } of ownedInstances.reverse()) {
     if (processAlive(record.pid) && await verifyDesktopGatewayOwnership(record).catch(() => false)) {
       await requestVerifiedDesktopGatewayShutdown(record).catch(() => false)

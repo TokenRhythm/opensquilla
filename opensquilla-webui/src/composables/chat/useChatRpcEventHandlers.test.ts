@@ -2833,6 +2833,39 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
       harness.stop()
     }
   })
+
+  it('does not leak an expected admission rejection from a superseded reconnect run', async () => {
+    let rejectCriticalRequestsQueued!: (error: Error) => void
+    const criticalRequestsQueued = new Promise<void>((_resolve, reject) => {
+      rejectCriticalRequestsQueued = reject
+    })
+    const run: SessionBootstrapRun = {
+      generation: 2,
+      criticalRequestsQueued,
+      history: Promise.resolve({ ok: false }),
+      live: Promise.resolve({
+        authoritative: false,
+        live: false,
+        backgroundOnly: false,
+        cancelled: true,
+      }),
+    }
+    const harness = createHarness({
+      handleSessionConnectionState: () => run,
+    })
+
+    try {
+      harness.api.handlers.onConnectionState('connected')
+      rejectCriticalRequestsQueued(new Error('superseded session read lease'))
+      await criticalRequestsQueued.catch(() => {})
+      await Promise.resolve()
+
+      expect(harness.loadCurrentSessionUsage).not.toHaveBeenCalled()
+      expect(harness.refreshRunModePreference).not.toHaveBeenCalled()
+    } finally {
+      harness.stop()
+    }
+  })
 })
 
 describe('useChatRpcEventHandlers durable turn receipts', () => {

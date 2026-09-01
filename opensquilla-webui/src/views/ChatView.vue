@@ -2713,20 +2713,23 @@ function schedulePostBootstrapMetadata(
   key: string,
 ) {
   if (postBootstrapMetadataStarted) return
-  void run.criticalRequestsQueued.then(() => {
-    if (
-      postBootstrapMetadataStarted
-      || chatViewDisposed
-      || sessionKey.value !== key
-      || !isSessionBootstrapCurrent(run.generation, key)
-    ) return
-    postBootstrapMetadataStarted = true
-    void refreshPostBootstrapMetadata()
-    void loadFeatureToggles().then(() => {
-      if (!chatViewDisposed) unsubs.push(bindFeatureRefresh(scheduleHistorySync))
-    })
-    loadSlashCommands()
-  })
+  void run.criticalRequestsQueued.then(
+    () => {
+      if (
+        postBootstrapMetadataStarted
+        || chatViewDisposed
+        || sessionKey.value !== key
+        || !isSessionBootstrapCurrent(run.generation, key)
+      ) return
+      postBootstrapMetadataStarted = true
+      void refreshPostBootstrapMetadata()
+      void loadFeatureToggles().then(() => {
+        if (!chatViewDisposed) unsubs.push(bindFeatureRefresh(scheduleHistorySync))
+      })
+      loadSlashCommands()
+    },
+    () => {},
+  )
 }
 
 function bindSessionBootstrapRun<T extends SessionBootstrapRun>(run: T, key: string): T {
@@ -2735,15 +2738,18 @@ function bindSessionBootstrapRun<T extends SessionBootstrapRun>(run: T, key: str
   // omit it, so queue a bounded fallback only after the critical live/history
   // frames. A session-key watcher must never put routing.get in front of the
   // target subscribe during a same-socket handoff.
-  void tracked.criticalRequestsQueued.then(() => {
-    if (
-      chatViewDisposed
-      || sessionKey.value !== key
-      || !isSessionBootstrapCurrent(tracked.generation, key)
-      || chatSessionRouting.hasAuthoritativeSnapshot.value
-    ) return
-    void chatSessionRouting.load()
-  })
+  void tracked.criticalRequestsQueued.then(
+    () => {
+      if (
+        chatViewDisposed
+        || sessionKey.value !== key
+        || !isSessionBootstrapCurrent(tracked.generation, key)
+        || chatSessionRouting.hasAuthoritativeSnapshot.value
+      ) return
+      void chatSessionRouting.load()
+    },
+    () => {},
+  )
   schedulePostBootstrapMetadata(tracked, key)
   return tracked
 }
@@ -2766,15 +2772,18 @@ function resumeSessionBootstrap(run: SessionBootstrapRun) {
       && isSessionBootstrapCurrent(tracked.generation, key)
     ) void handleAuthoritativeSessionSubscription(key)
   }).catch(() => {})
-  void tracked.criticalRequestsQueued.then(() => {
-    if (
-      chatViewDisposed
-      || sessionKey.value !== key
-      || !isSessionBootstrapCurrent(tracked.generation, key)
-    ) return
-    void loadCurrentSessionUsage()
-    void refreshPostBootstrapMetadata()
-  })
+  void tracked.criticalRequestsQueued.then(
+    () => {
+      if (
+        chatViewDisposed
+        || sessionKey.value !== key
+        || !isSessionBootstrapCurrent(tracked.generation, key)
+      ) return
+      void loadCurrentSessionUsage()
+      void refreshPostBootstrapMetadata()
+    },
+    () => {},
+  )
 }
 
 function retryHistory() {

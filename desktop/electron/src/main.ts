@@ -21,6 +21,7 @@ import {
   type DesktopProfilePaths,
 } from './desktop-profile-context.js'
 import { DesktopWriterAdmission } from './desktop-writer-admission.js'
+import { terminateWindowsProcessTree } from './windows-process-tree.js'
 import {
   createDesktopGatewayInstanceNonce,
   desktopGatewayAuthToken,
@@ -583,6 +584,10 @@ let desktopCleanupBusy = false
 // userData handles.
 let pendingDeleteAllHelper: ChildProcess | null = null
 const gatewayProcessTreeChildren = new WeakSet<ChildProcessWithoutNullStreams>()
+const gatewayProcessTreeTerminations = new WeakMap<
+  ChildProcessWithoutNullStreams,
+  Promise<boolean>
+>()
 const desktopWriters = new DesktopWriterAdmission()
 let desktopOpenFlowRevision = 0
 let desktopOpenFlowPromise: Promise<void> | null = null
@@ -9496,6 +9501,8 @@ const GATEWAY_SHUTDOWN_KILL_AFTER_MS = 75_000
 // Short SIGKILL backstop after a hard terminate (TerminateProcess / SIGTERM)
 // when the graceful path was skipped or already overran its deadline.
 const GATEWAY_HARD_KILL_BACKSTOP_MS = 5_000
+// Keep Windows process-tree cleanup inside the existing hard-kill backstop.
+const WINDOWS_PROCESS_TREE_KILL_TIMEOUT_MS = 5_000
 const UPDATE_GATEWAY_EXIT_TIMEOUT_MS = GATEWAY_SHUTDOWN_KILL_AFTER_MS + GATEWAY_HARD_KILL_BACKSTOP_MS
 
 // Ask the gateway to shut down gracefully over its owner-only HTTP endpoint,
@@ -9625,11 +9632,25 @@ function terminateGatewayProcess(
   const pid = child.pid
   if (pid && gatewayProcessTreeChildren.has(child)) {
     if (process.platform === 'win32') {
-      const result = spawnSync('taskkill', ['/pid', String(pid), '/t', '/f'], {
-        stdio: 'ignore',
-        windowsHide: true,
+      if (gatewayProcessTreeTerminations.has(child)) return
+      const termination = terminateWindowsProcessTree({
+        pid,
+        timeoutMs: WINDOWS_PROCESS_TREE_KILL_TIMEOUT_MS,
+        fallback: () => {
+          if (!hasGatewayProcessExited(child)) child.kill(signal)
+        },
+        onFailure: failure => desktopLog('gateway_process_tree_termination_failed', {
+          ...failure,
+          requestedSignal: signal,
+        }),
       })
-      if (result.status === 0) return
+      gatewayProcessTreeTerminations.set(child, termination)
+      void termination.finally(() => {
+        if (gatewayProcessTreeTerminations.get(child) === termination) {
+          gatewayProcessTreeTerminations.delete(child)
+        }
+      })
+      return
     } else {
       try {
         process.kill(-pid, signal)
