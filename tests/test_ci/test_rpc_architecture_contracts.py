@@ -147,6 +147,7 @@ AUTHORED_RUNTIME_FILES = (
     "src/opensquilla/application/session_directory.py",
     "src/opensquilla/session_key.py",
 )
+AUTHORED_RUNTIME_LOC_BASELINE = 26_507
 
 F2_TRANSPORT_FOUNDATION_FILES = (
     "opensquilla-webui/src/adapters/gateway/privateHttpTransport.ts",
@@ -171,6 +172,15 @@ F2_GATEWAY_COMPOSITION_ROOT = (
 # import gate.  The three stable Transport files totalled 1,125 physical lines
 # on the reviewed #1525 baseline.
 F2_TRANSPORT_FOUNDATION_LOC_CEILING = 1_125
+
+WEBUI_SOURCE_ROOT = ROOT / "opensquilla-webui" / "src"
+WEBUI_LEGACY_TRANSPORT_IDENTIFIERS = (
+    "supportsMethod",
+    "supportsEvent",
+    "waitForConnection",
+    "markMethodUnavailable",
+    "createLegacySessionConversation",
+)
 
 R3_APPLICATION_MODULE_FILES = (
     "src/opensquilla/application/app_settings.py",
@@ -564,6 +574,49 @@ def _physical_lines(relative_paths: tuple[str, ...]) -> int:
     return sum(
         len((ROOT / relative).read_text(encoding="utf-8").splitlines())
         for relative in relative_paths
+        if (ROOT / relative).is_file()
+    )
+
+
+def test_z1_authored_runtime_is_smaller_than_platform_baseline() -> None:
+    current = _physical_lines(AUTHORED_RUNTIME_FILES)
+    assert current < AUTHORED_RUNTIME_LOC_BASELINE, (
+        f"Z1 authored runtime is {current} lines; complete domain migration must remain below "
+        f"the reviewed #1525 baseline of {AUTHORED_RUNTIME_LOC_BASELINE}"
+    )
+
+
+def test_z1_webui_legacy_transport_surface_is_closed() -> None:
+    legacy_rpc_types = WEBUI_SOURCE_ROOT / "types" / "rpc.ts"
+    assert not legacy_rpc_types.exists(), "types/rpc.ts must be deleted after domain ownership closes"
+
+    forbidden_identifiers: dict[str, list[str]] = {}
+    raw_store_imports: list[str] = []
+    for path in sorted(WEBUI_SOURCE_ROOT.rglob("*")):
+        if not path.is_file() or path.suffix not in {".ts", ".tsx", ".js", ".jsx", ".vue"}:
+            continue
+        relative = path.relative_to(WEBUI_SOURCE_ROOT).as_posix()
+        if ".test." in path.name or ".spec." in path.name:
+            continue
+        if relative.startswith("contracts/generated/"):
+            continue
+        source = path.read_text(encoding="utf-8")
+        leaked = [name for name in WEBUI_LEGACY_TRANSPORT_IDENTIFIERS if name in source]
+        if leaked:
+            forbidden_identifiers[relative] = leaked
+        if (
+            ("@/stores/rpc" in source or "./stores/rpc" in source or "../stores/rpc" in source)
+            and relative not in {"main.ts", "stores/rpc.ts"}
+        ):
+            raw_store_imports.append(relative)
+
+    assert forbidden_identifiers == {}, (
+        "legacy generic transport capabilities must stay deleted from production WebUI: "
+        f"{forbidden_identifiers}"
+    )
+    assert raw_store_imports == [], (
+        "useRpcStore is private to the composition root and transport implementation: "
+        f"{raw_store_imports}"
     )
 
 

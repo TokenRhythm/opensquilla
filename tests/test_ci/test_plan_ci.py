@@ -510,10 +510,44 @@ def test_gateway_contract_changes_run_deterministic_generation(
     plan = _plan(tmp_path, suite_config, path)
 
     assert plan["full_fallback"] is False
-    assert {"frontend-artifact", "frontend-validation"} <= set(
+    assert {
+        "frontend-artifact",
+        "frontend-validation",
+        "python-targeted",
+    } <= set(
         plan["required_suites"]
     )
+    assert {
+        "tests/test_ci/test_architecture_import_contracts.py",
+        "tests/test_ci/test_rpc_architecture_contracts.py",
+    } <= set(plan["python_targets"])
     assert plan["reason_codes"] == ["gateway_contract_changed"]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "opensquilla-webui/scripts/lib/rpc-architecture-gate.mjs",
+        "opensquilla-webui/scripts/rpc-debt/session-chat.mjs",
+        "opensquilla-webui/src/adapters/gateway/sessionConversationV4.ts",
+        "opensquilla-webui/src/modules/sessionConversation.ts",
+        "opensquilla-webui/src/platform/desktop.ts",
+        "opensquilla-webui/src/types/chat.ts",
+        "src/opensquilla/gateway/adapters/sessions_list_contract.py",
+    ],
+)
+def test_webui_boundary_changes_run_python_architecture_contracts(
+    tmp_path: Path,
+    suite_config: dict[str, Any],
+    path: str,
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+
+    assert "python-targeted" in plan["required_suites"]
+    assert {
+        "tests/test_ci/test_architecture_import_contracts.py",
+        "tests/test_ci/test_rpc_architecture_contracts.py",
+    } <= set(plan["python_targets"])
 
 
 def test_gateway_change_runs_browser_recovery_without_native_desktop(

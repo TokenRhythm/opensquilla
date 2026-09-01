@@ -21,16 +21,49 @@ function assertPresent(rel, pattern, message) {
 }
 
 assertAbsent(
-  'src/utils/chat/artifacts.ts',
+  'src/adapters/gateway/artifactAccessV4.ts',
   /\btoken\??:\s*string|searchParams\.set\(['"]token['"]|includeSessionKey\s*!==\s*false/,
   'artifact URLs must not carry bearer tokens or default session keys in query params.',
 )
 
 assertPresent(
-  'src/utils/chat/artifacts.ts',
+  'src/adapters/gateway/artifactAccessV4.ts',
   /searchParams\.delete\(['"]token['"]\)[\s\S]+searchParams\.delete\(['"]sessionKey['"]\)[\s\S]+searchParams\.delete\(['"]session_key['"]\)/,
   'artifact URL sanitizer must strip sensitive same-origin query params.',
 )
+
+for (const rel of [
+  'src/views/ChatView.vue',
+  'src/components/workbench/AppWorkbench.vue',
+  'src/components/workbench/ArtifactDocumentPanel.vue',
+  'src/components/workbench/ArtifactPreviewPanel.vue',
+  'src/components/workbench/artifactWorkbenchProvider.ts',
+  'src/components/chat/ArtifactImageLightbox.vue',
+  'src/components/chat/AssistantMessage.vue',
+  'src/components/chat/AudioArtifactCard.vue',
+  'src/components/chat/ChatArtifactList.vue',
+  'src/components/chat/ChatMessageList.vue',
+  'src/components/chat/DeliverablesDrawer.vue',
+  'src/components/chat/VideoArtifactCard.vue',
+]) {
+  assertAbsent(
+    rel,
+    /\bauthToken\b|opensquilla\.wsToken|artifact(?:Download|Preview|Thumbnail)Url|artifactAccessHeaders/,
+    'artifact consumers must use semantic artifact/session requests without HTTP credentials.',
+  )
+}
+
+for (const rel of [
+  'src/workbench/workbenchResourceProvider.ts',
+  'src/workbench/artifactDocumentProvider.ts',
+  'src/workbench/artifactPromptAnnotationProvider.ts',
+]) {
+  assertAbsent(
+    rel,
+    /\b[A-Z_]+_RPC_METHODS\b|\bcreateRpc[A-Z]/,
+    'business provider barrels must not re-export Gateway wire helpers.',
+  )
+}
 
 assertAbsent(
   'src/composables/chat/useChatMarkdownExport.ts',
