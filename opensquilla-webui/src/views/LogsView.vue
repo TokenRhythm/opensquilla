@@ -209,10 +209,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, onActivated, onDeactivated, watch, nextTick } from 'vue'
+import { ref, computed, inject, onMounted, onUnmounted, onActivated, onDeactivated, watch, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { RouterLink } from 'vue-router'
-import { useRpcStore } from '@/stores/rpc'
+import { OBSERVABILITY_KEY, type GatewayLogStatus } from '@/modules/observability'
 import { useFixedWindow } from '@/composables/useFixedWindow'
 import Icon from '@/components/Icon.vue'
 import ControlSwitch from '@/components/ControlSwitch.vue'
@@ -234,41 +234,6 @@ interface LogLine {
   raw?: string
 }
 
-interface LogTailResponse {
-  lines?: LogEntry[]
-  entries?: LogEntry[]
-  cursor?: number
-}
-
-interface LogEntry {
-  level?: string
-  lvl?: string
-  message?: string
-  msg?: string
-  timestamp?: string | number
-  ts?: string | number
-  raw?: string
-  [key: string]: unknown
-}
-
-interface LogStatus {
-  gateway_file_log?: {
-    enabled?: boolean
-    path?: string
-  }
-  raw_turn_call_log?: {
-    enabled?: boolean
-    source?: string
-    directory?: {
-      path?: string
-    }
-  }
-  diagnostics_enabled?: {
-    effective?: boolean
-    detail?: string
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -287,14 +252,16 @@ const WINDOW_MIN_WIDTH = '(min-width: 481px)'
 // ---------------------------------------------------------------------------
 
 const { t } = useI18n()
-const rpc = useRpcStore()
+const injectedObservability = inject(OBSERVABILITY_KEY)
+if (!injectedObservability) throw new Error('Observability was not provided')
+const observability = injectedObservability
 const allLines = ref<LogLine[]>([])
 const cursor = ref(0)
 const searchText = ref('')
 const debouncedSearch = ref('')
 let searchTimer: ReturnType<typeof setTimeout> | null = null
 const autoFollow = ref(true)
-const status = ref<LogStatus | null>(null)
+const status = ref<GatewayLogStatus | null>(null)
 const activeLevels = ref<Set<string>>(new Set(DEFAULT_LEVELS))
 const displayRef = ref<HTMLElement | null>(null)
 const loadState = ref<'loading' | 'ready' | 'error'>('loading')
@@ -509,8 +476,6 @@ async function loadData() {
   stopPolling()
   loadState.value = 'loading'
   try {
-    await rpc.waitForConnection()
-    if (!isActive) return
     cursor.value = 0
     allLines.value = []
     await loadStatus()
@@ -527,7 +492,7 @@ async function loadData() {
 async function loadStatus() {
   if (!isActive) return
   try {
-    status.value = await rpc.call<LogStatus>('logs.status', {})
+    status.value = await observability.logStatus()
   } catch {
     status.value = null
   }
@@ -536,14 +501,12 @@ async function loadStatus() {
 async function poll() {
   if (!isActive) return
   if (pollInFlight) return
-  const rpcClient = rpc.client
-  if (!rpcClient) return
   if (document.hidden) return
   pollInFlight = true
   try {
-    const data = await rpc.call<LogTailResponse>('logs.tail', { limit: 500, cursor: cursor.value, level: null })
+    const data = await observability.tailLogs({ limit: 500, cursor: cursor.value, level: null })
     if (!isActive) return
-    const lines: LogEntry[] = data.lines || data.entries || []
+    const lines = data.entries
     if (lines.length > 0) {
       if (data.cursor != null) {
         cursor.value = data.cursor

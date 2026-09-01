@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { KeepAlive, computed, createApp, defineComponent, h, nextTick, ref } from 'vue'
 import { createMemoryHistory, createRouter } from 'vue-router'
+import { OBSERVABILITY_KEY } from '@/modules/observability'
 
 const rpcMocks = vi.hoisted(() => ({
   call: vi.fn(),
@@ -129,6 +130,20 @@ async function mountLogs(): Promise<MountedLogs> {
   await router.push('/logs')
   await router.isReady()
   app.use(router)
+  app.provide(OBSERVABILITY_KEY, {
+    logStatus: () => rpcMocks.call('logs.status', {}),
+    async tailLogs(options: { cursor: number; limit?: number; level?: string | null }) {
+      const data = await rpcMocks.call('logs.tail', {
+        cursor: options.cursor,
+        limit: options.limit ?? 500,
+        level: options.level ?? null,
+      })
+      return {
+        entries: data.lines || data.entries || [],
+        cursor: data.cursor ?? null,
+      }
+    },
+  } as never)
   app.mount(el)
   const result: MountedLogs = {
     el,
