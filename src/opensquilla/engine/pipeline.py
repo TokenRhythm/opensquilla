@@ -107,16 +107,19 @@ async def run_pipeline(ctx: TurnContext, steps: list[TurnStep]) -> TurnContext:
             routing_source = cast(RoutingSource, ctx.metadata.get("routing_source", "none"))
             confidence = ctx.metadata.get("routing_confidence")
             filtered_skill_ids = None
+            filtered_skill_reasons = None
         elif step_name == "filter_skills":
             routed_tier = None
             routing_source = "none"
             confidence = None
             filtered_skill_ids = ctx.metadata.get("filtered_skill_ids")
+            filtered_skill_reasons = ctx.metadata.get("filtered_skill_reasons")
         else:
             routed_tier = None
             routing_source = "none"
             confidence = None
             filtered_skill_ids = None
+            filtered_skill_reasons = None
 
         records = ctx.metadata.setdefault("pipeline_steps", records)
         records.append(
@@ -125,6 +128,7 @@ async def run_pipeline(ctx: TurnContext, steps: list[TurnStep]) -> TurnContext:
                 applied=applied,
                 routed_tier=routed_tier,
                 filtered_skill_ids=filtered_skill_ids,
+                filtered_skill_reasons=filtered_skill_reasons,
                 routing_source=routing_source,
                 confidence=confidence,
                 fallback_reason=None,
