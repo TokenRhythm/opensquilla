@@ -59,7 +59,4 @@ export const debt = {
     httpAuthorizationHeader: 1,
     httpSessionKeyHeader: 1,
   },
-  'src/views/SessionsView.vue': {
-    call: 1,
-  },
 }

@@ -1,20 +1,6 @@
 export const lane = 'independent'
 
 export const debt = {
-  'src/components/SupportDiagnosticsMenu.vue': {
-    call: 1,
-    waitForConnection: 1,
-    httpRequest: 1,
-    httpApiEndpoint: 1,
-    httpAuthToken: 1,
-    httpAuthorizationHeader: 1,
-  },
-  'src/components/UpdateBanner.vue': {
-    httpRequest: 1,
-    httpApiEndpoint: 1,
-    httpAuthToken: 1,
-    httpAuthorizationHeader: 1,
-  },
   'src/components/workbench/AppWorkbench.vue': {
     on: 2,
     httpRequest: 1,
@@ -32,17 +18,6 @@ export const debt = {
   'src/composables/cron/useCronForm.ts': { call: 1 },
   'src/composables/cron/useCronJobs.ts': { call: 3, on: 1, waitForConnection: 1 },
   'src/composables/cron/useCronRuns.ts': { call: 1 },
-  'src/composables/skills/useSkillDetailController.ts': { call: 1 },
-  'src/composables/skills/useSkillProposals.ts': { call: 10 },
-  'src/composables/skills/useSkillRegistry.ts': { call: 5, supportsMethod: 1 },
-  'src/composables/skills/useSkillsCatalog.ts': { call: 1, waitForConnection: 1 },
-  'src/composables/usage/useUsageQuery.ts': {
-    call: 3,
-    markMethodUnavailable: 2,
-    supportsMethod: 1,
-    waitForConnection: 1,
-  },
-  'src/composables/useAgentOptions.ts': { call: 2 },
   'src/composables/workbench/useArtifactPreviewResource.ts': {
     httpRequest: 1,
     httpApiEndpoint: 1,
@@ -50,10 +25,7 @@ export const debt = {
     httpAuthorizationHeader: 1,
     httpSessionKeyHeader: 1,
   },
-  'src/views/AgentsView.vue': { call: 3 },
-  'src/views/LogsView.vue': { call: 2, waitForConnection: 1 },
-  'src/views/OverviewView.vue': { call: 2, waitForConnection: 1 },
-  'src/views/SkillsView.vue': { call: 1, waitForConnection: 1 },
+  'src/views/OverviewView.vue': { call: 1 },
   'src/utils/workbench/artifactPreviewLease.ts': {
     httpRequest: 3,
     httpApiEndpoint: 3,
