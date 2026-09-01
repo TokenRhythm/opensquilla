@@ -16,8 +16,8 @@ import {
 } from '@/composables/usage/taskDisplayName'
 import { formatUsageCost, effectiveCnyPerUsd } from '@/composables/usage/nativeBilling'
 import { buildUsageCsv } from '@/composables/usage/usageCsv'
-import { useRpcStore } from '@/stores/rpc'
 import type { SessionDirectory } from '@/modules/sessionDirectory'
+import type { Observability } from '@/modules/observability'
 import { downloadText } from '@/utils/browser'
 import i18n from '@/i18n'
 import type {
@@ -62,14 +62,15 @@ const TABLE_COLUMN_KEYS: Array<{ key: string; labelKey: string }> = [
 
 const SORTABLE_COLS = ['session', 'updated_at', 'input_tokens', 'output_tokens', 'cost_usd', 'model']
 
-export function useUsageData(sessionDirectory: SessionDirectory) {
+export function useUsageData(
+  sessionDirectory: SessionDirectory,
+  observability: Observability,
+) {
 // ---------------------------------------------------------------------------
 // Stores & Router
 // ---------------------------------------------------------------------------
 
 const router = useRouter()
-const rpc = useRpcStore()
-
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -299,7 +300,7 @@ async function requestLoad(): Promise<LoadOutcome> {
   try {
     const [snapshot, nextTaskTitles] = await Promise.all([
       requestUsageSnapshot(
-        rpc,
+        observability,
         range.value as UsageRangeSelection,
         { cachedSnapshot: usageSnapshot.value },
       ),
@@ -428,7 +429,6 @@ function sortVal(row: SessionRow, key: string): string | number {
 }
 
 async function requestTaskTitles(): Promise<Map<string, string>> {
-  if (typeof rpc.call !== 'function') return taskTitles.value
   try {
     const page = await sessionDirectory.listPage({ limit: 200 })
     const titles = new Map<string, string>()

@@ -161,6 +161,8 @@ async function mountOverview(options: MountOptions = {}) {
   type SessionDirectoryTransport = Parameters<typeof createV4SessionDirectory>[0]
   const { SESSION_DIRECTORY_KEY } = await import('@/modules/sessionDirectory')
   const { PROVIDER_CONFIGURATION_KEY } = await import('@/modules/providerConfiguration')
+  const { OBSERVABILITY_KEY } = await import('@/modules/observability')
+  const { createV4Observability } = await import('@/adapters/gateway/observabilityV4')
   const active = ref(true)
   const TestHost = defineComponent({
     name: 'OverviewTestHost',
@@ -216,6 +218,15 @@ async function mountOverview(options: MountOptions = {}) {
       }
     }),
   } as unknown as import('@/modules/providerConfiguration').ProviderConfiguration)
+  app.provide(OBSERVABILITY_KEY, createV4Observability({
+    request: rpcCall,
+    ready: vi.fn(async () => {}),
+    supports: vi.fn(() => true),
+    markUnsupported: vi.fn(),
+  }, {
+    requestJson: vi.fn(),
+    requestBinary: vi.fn(),
+  }))
   app.mount(el)
   mountedApps.push({ app, el })
 
@@ -331,7 +342,7 @@ describe('OverviewView status lifecycle', () => {
   })
 
   it('lets an authoritative stored-session count decrease after deletion', async () => {
-    const { el, flush } = await mountOverview({
+    const { el, flush, rpcCall } = await mountOverview({
       sessionsListHandler: (callIndex) => ({
         sessions: [{ key: 'agent:main:webchat:remaining', title: 'Remaining' }],
         count: callIndex === 0 ? 200 : 1,
@@ -343,6 +354,9 @@ describe('OverviewView status lifecycle', () => {
     expect(card?.querySelector('.control-stat__value')?.textContent).toBe('201')
 
     el.querySelector<HTMLButtonElement>('.ov-status-actions .btn--ghost')!.click()
+    await vi.waitFor(() => {
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'sessions.list')).toHaveLength(2)
+    })
     await flush()
 
     expect(card?.querySelector('.control-stat__value')?.textContent).toBe('1')

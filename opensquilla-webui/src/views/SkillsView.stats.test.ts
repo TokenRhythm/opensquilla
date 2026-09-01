@@ -20,7 +20,7 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
   const setStatusFilter = vi.fn()
   const loadData = vi.fn(async () => loadDataResult)
   const scrollIntoView = vi.fn()
-  const rpcCall = vi.fn(async () => reloadResult)
+  const rpcCall = vi.fn(async (_method: string) => reloadResult)
   const waitForConnection = vi.fn(async () => {})
   const pushToast = vi.fn()
 
@@ -205,6 +205,10 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
   const app = createApp(Root)
   app.use(pinia)
   app.use(i18n)
+  const { SKILL_CATALOG_KEY } = await import('@/modules/skillCatalog')
+  app.provide(SKILL_CATALOG_KEY, {
+    reload: () => rpcCall('skills.reload'),
+  } as never)
   app.mount(el)
   await nextTick()
 

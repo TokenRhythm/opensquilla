@@ -4,16 +4,24 @@ import {
   normalizeUsageQueryResponse,
   requestUsageSnapshot,
   usagePresetForRange,
-  type UsageRpc,
 } from './useUsageQuery'
+import type { Observability } from '@/modules/observability'
+import { createV4Observability } from '@/adapters/gateway/observabilityV4'
 
-function rpcWith(call: UsageRpc['call'], supports = true): UsageRpc {
-  return {
-    supportsMethod: vi.fn(() => supports),
-    markMethodUnavailable: vi.fn(),
-    waitForConnection: vi.fn(async () => {}),
-    call,
-  }
+type RpcCall = <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
+type TestObservability = Observability & { markMethodUnavailable: ReturnType<typeof vi.fn> }
+
+function rpcWith(call: RpcCall, supports = true): TestObservability {
+  const markMethodUnavailable = vi.fn()
+  return Object.assign(createV4Observability({
+    request: call,
+    ready: vi.fn(async () => {}),
+    supports: vi.fn(() => supports),
+    markUnsupported: markMethodUnavailable,
+  }, {
+    requestJson: vi.fn(),
+    requestBinary: vi.fn(),
+  }), { markMethodUnavailable })
 }
 
 describe('usage.query compatibility client', () => {
@@ -51,7 +59,7 @@ describe('usage.query compatibility client', () => {
         days: [],
         coverage: { status: 'complete' },
       }
-    }) as UsageRpc['call']
+    }) as RpcCall
     const rpc = rpcWith(call)
 
     const result = await requestUsageSnapshot(rpc, '7', { timezone: 'Asia/Shanghai' })
@@ -61,7 +69,7 @@ describe('usage.query compatibility client', () => {
       range: { preset: 'last_7_calendar_days' },
       timezone: 'Asia/Shanghai',
       include: { days: true, models: true, sessions: true },
-    })
+    }, expect.any(Object))
     expect(result.mode).toBe('ledger_exact')
     expect(result.totals.cost).toBeCloseTo(0.0092, 9)
   })
@@ -235,7 +243,7 @@ describe('usage.query compatibility client', () => {
         legacyUnattributed: { includedInTotals: true, totals: { costNanos: 2_000_000 } },
       },
       sessions: [],
-    })) as UsageRpc['call']
+    })) as RpcCall
 
     const result = await requestUsageSnapshot(rpcWith(call), 'all', { timezone: 'UTC' })
 
@@ -249,7 +257,7 @@ describe('usage.query compatibility client', () => {
     const call = vi.fn(async (method: string) => {
       expect(method).toBe('usage.status')
       return { totalSessions: 2, totalTokens: 7, totalCostUsd: 0.4, sessions: [] }
-    }) as UsageRpc['call']
+    }) as RpcCall
 
     const result = await requestUsageSnapshot(rpcWith(call, false), 'all', { timezone: 'UTC' })
 
@@ -263,14 +271,14 @@ describe('usage.query compatibility client', () => {
     const call = vi.fn(async (method: string) => {
       if (method === 'usage.query') throw missing
       return { sessions: [] }
-    }) as UsageRpc['call']
+    }) as RpcCall
     const rpc = rpcWith(call)
 
     const result = await requestUsageSnapshot(rpc, '7', { timezone: 'UTC' })
 
     expect(rpc.markMethodUnavailable).toHaveBeenCalledWith('usage.query')
-    expect(call).toHaveBeenNthCalledWith(1, 'usage.query', expect.any(Object))
-    expect(call).toHaveBeenNthCalledWith(2, 'usage.status')
+    expect(call).toHaveBeenNthCalledWith(1, 'usage.query', expect.any(Object), expect.any(Object))
+    expect(call).toHaveBeenNthCalledWith(2, 'usage.status', undefined, expect.any(Object))
     expect(result.mode).toBe('session_approximation')
   })
 
@@ -287,7 +295,7 @@ describe('usage.query compatibility client', () => {
         totals: { costNanos: 1_000_000 },
         coverage: { status: 'complete' },
       }
-    }) as UsageRpc['call']
+    }) as RpcCall
 
     const result = await requestUsageSnapshot(rpcWith(call), 'today', {
       timezone: 'Mars/Olympus',
@@ -296,10 +304,10 @@ describe('usage.query compatibility client', () => {
     expect(call).toHaveBeenCalledTimes(2)
     expect(call).toHaveBeenNthCalledWith(1, 'usage.query', expect.objectContaining({
       timezone: 'Mars/Olympus',
-    }))
+    }), expect.any(Object))
     expect(call).toHaveBeenNthCalledWith(2, 'usage.query', expect.objectContaining({
       timezone: 'UTC',
-    }))
+    }), expect.any(Object))
     expect(result.source).toBe('usage_ledger')
     expect(result.timezone).toBe('UTC')
     expect(result.timezoneFallback).toEqual({
@@ -318,15 +326,15 @@ describe('usage.query compatibility client', () => {
     })
     const call = vi.fn(async (method: string) => {
       throw new Error(method === 'usage.query' ? 'query temporarily unavailable' : 'gateway busy')
-    }) as UsageRpc['call']
+    }) as RpcCall
 
     const result = await requestUsageSnapshot(rpcWith(call), '7', {
       timezone: 'Asia/Shanghai',
       cachedSnapshot: cached,
     })
 
-    expect(call).toHaveBeenNthCalledWith(1, 'usage.query', expect.any(Object))
-    expect(call).toHaveBeenNthCalledWith(2, 'usage.status')
+    expect(call).toHaveBeenNthCalledWith(1, 'usage.query', expect.any(Object), expect.any(Object))
+    expect(call).toHaveBeenNthCalledWith(2, 'usage.status', undefined, expect.any(Object))
     expect(result).toBe(cached)
   })
 
@@ -340,7 +348,7 @@ describe('usage.query compatibility client', () => {
     const call = vi.fn(async (method: string) => {
       if (method === 'usage.query') throw new Error('query temporarily unavailable')
       return { totalCostUsd: 99, sessions: [] }
-    }) as UsageRpc['call']
+    }) as RpcCall
 
     const result = await requestUsageSnapshot(rpcWith(call), 'all', {
       timezone: 'UTC',

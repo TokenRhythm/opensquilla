@@ -8,18 +8,10 @@ import { useUsageData } from './useUsageData'
 import { requestUsageSnapshot } from './useUsageQuery'
 import type { UsageSnapshot } from '@/types/usage'
 import type { SessionDirectory } from '@/modules/sessionDirectory'
-
-const rpcTransport = vi.hoisted(() => ({
-  call: vi.fn(),
-  waitForConnection: vi.fn(async () => {}),
-}))
+import type { Observability } from '@/modules/observability'
 
 vi.mock('vue-router', () => ({
   useRouter: () => ({ push: vi.fn() }),
-}))
-
-vi.mock('@/stores/rpc', () => ({
-  useRpcStore: () => rpcTransport,
 }))
 
 vi.mock('./useUsageQuery', () => ({
@@ -95,7 +87,7 @@ function mountUsageData() {
     resolve: vi.fn().mockResolvedValue({ key: 'agent:main:webchat:default', id: 'default' }),
     search: vi.fn().mockResolvedValue({ sessions: [], messages: [] }),
   }
-  const api = scope.run(() => useUsageData(directory))!
+  const api = scope.run(() => useUsageData(directory, {} as Observability))!
   return { api, directory, scope }
 }
 
@@ -112,8 +104,6 @@ beforeEach(() => {
   i18n.global.locale.value = 'en'
   localStorage.setItem(RANGE_KEY, '7')
   vi.mocked(requestUsageSnapshot).mockReset()
-  rpcTransport.call.mockReset()
-  rpcTransport.waitForConnection.mockClear()
 })
 
 afterEach(() => {
@@ -132,7 +122,6 @@ describe('useUsageData range selection under concurrent refreshes', () => {
     await api.loadData()
 
     expect(directory.listPage).toHaveBeenCalledWith({ limit: 200 })
-    expect(rpcTransport.waitForConnection).not.toHaveBeenCalled()
   })
 
   it('does not describe complete all-time task totals as a date-range approximation', async () => {

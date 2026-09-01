@@ -196,6 +196,7 @@ import { requestUsageSnapshot } from '@/composables/usage/useUsageQuery'
 import { effectiveCnyPerUsd } from '@/composables/usage/nativeBilling'
 import { SESSION_DIRECTORY_KEY } from '@/modules/sessionDirectory'
 import { PROVIDER_CONFIGURATION_KEY, type ProviderStatusRow } from '@/modules/providerConfiguration'
+import { OBSERVABILITY_KEY } from '@/modules/observability'
 import type { UsageSnapshot } from '@/types/usage'
 import { useToasts } from '@/composables/useToasts'
 import { isOwnedGatewayConnection } from '@/composables/useCliInvocation'
@@ -279,6 +280,9 @@ const sessionDirectory = injectedSessionDirectory
 const injectedProviderConfiguration = inject(PROVIDER_CONFIGURATION_KEY)
 if (!injectedProviderConfiguration) throw new Error('ProviderConfiguration was not provided')
 const providerConfiguration = injectedProviderConfiguration
+const injectedObservability = inject(OBSERVABILITY_KEY)
+if (!injectedObservability) throw new Error('Observability was not provided')
+const observability = injectedObservability
 const { pushToast } = useToasts()
 const platform = usePlatform()
 
@@ -357,7 +361,7 @@ const costLine = computed<string>(() => {
 
 async function refreshUsage(epoch: UsageLoadEpoch): Promise<UsageData | null> {
   try {
-    const snapshot = await requestUsageSnapshot(rpc, 'all', {
+    const snapshot = await requestUsageSnapshot(observability, 'all', {
       days: false,
       models: false,
       sessions: false,
@@ -655,8 +659,7 @@ async function loadHealth({ deep, silent = false }: HealthLoadOptions) {
   }
 
   try {
-    await rpc.waitForConnection()
-    const response = await rpc.call<HealthReport>('doctor.status', { agentId: 'main', deep })
+    const response = await observability.readiness({ agentId: 'main', deep }) as HealthReport
     const data = withoutLegacyMigrationFinding(response)
     if (!data.gatewayUrl) data.gatewayUrl = gatewayContextUrl()
     healthError.value = null
