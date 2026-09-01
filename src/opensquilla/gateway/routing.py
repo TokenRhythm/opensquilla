@@ -286,6 +286,8 @@ def build_cron_route_envelope(
     session_key: str,
     agent_id: str | None = None,
     delivery: Any | None = None,
+    session_id: str | None = None,
+    session_epoch: int | None = None,
 ) -> RouteEnvelope:
     """Build a route for scheduler-originated agent work or delivery."""
     resolved_delivery = delivery if delivery is not None else getattr(job, "delivery", None)
@@ -351,6 +353,7 @@ def build_cron_route_envelope(
         source_name="cron",
         agent_id=_agent_id(agent_id, session_key),
         session_key=session_key,
+        session_id=session_id,
         sender_id=sender_id,
         channel_type="cron",
         channel_name="cron",
@@ -360,6 +363,7 @@ def build_cron_route_envelope(
         delivery_context=delivery_context,
         metadata=metadata,
         interaction_mode=InteractionMode.UNATTENDED,
+        session_epoch=session_epoch,
     )
 
 
@@ -368,6 +372,8 @@ def build_subagent_route_envelope(
     session_key: str,
     parent_session_key: str,
     agent_id: str | None = None,
+    session_id: str | None = None,
+    session_epoch: int | None = None,
     run_id: str | None = None,
     parent_task_id: str | None = None,
     spawn_depth: int = 0,
@@ -456,6 +462,7 @@ def build_subagent_route_envelope(
         source_name="subagent",
         agent_id=_agent_id(agent_id, session_key),
         session_key=session_key,
+        session_id=session_id,
         channel_type="subagent",
         channel_name="subagent",
         channel_id=run_id,
@@ -468,6 +475,7 @@ def build_subagent_route_envelope(
         metadata=metadata,
         interaction_mode=InteractionMode.UNATTENDED,
         sandbox_run_context_fresh=run_context_payload is not None,
+        session_epoch=session_epoch,
     )
 
 

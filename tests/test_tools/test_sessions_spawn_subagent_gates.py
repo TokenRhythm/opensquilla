@@ -120,6 +120,7 @@ class _StubTaskRuntime:
         *,
         task_id=None,
         provider_request_correlation=None,
+        persisted_user_message_id=None,
     ):
         self.enqueued.append(
             {
@@ -129,6 +130,7 @@ class _StubTaskRuntime:
                 "run_kind": run_kind,
                 "task_id": task_id,
                 "provider_request_correlation": provider_request_correlation,
+                "persisted_user_message_id": persisted_user_message_id,
             }
         )
 
@@ -586,6 +588,54 @@ async def test_sessions_spawn_reuses_run_id_as_task_and_provider_execution() -> 
     assert correlation.turn_id == root.turn_id
     assert correlation.execution_id == run_id
     assert correlation.call_kind == "subagent.chat"
+
+
+@pytest.mark.asyncio
+async def test_sessions_spawn_freezes_child_owner_across_persist_enqueue_reset() -> None:
+    class RotatingSessionManager(_StubSessionManager):
+        def __init__(self) -> None:
+            super().__init__(
+                {
+                    "caller": {"id": "caller", "enabled": True},
+                    "worker": {"id": "worker", "enabled": True},
+                }
+            )
+            self.admitted = SimpleNamespace(session_id="child-owner-old", epoch=2)
+            self.current = self.admitted
+            self.append_owner = None
+
+        async def create(self, **kwargs):
+            self.created.append(kwargs)
+            return self.admitted
+
+        async def append_message(self, *args, **kwargs):
+            self.append_owner = (
+                kwargs.get("expected_session_id"),
+                kwargs.get("expected_session_epoch"),
+            )
+            # Deterministically model reset after old-owner persistence but
+            # before sessions_spawn reaches TaskRuntime.enqueue.
+            self.current = SimpleNamespace(session_id="child-owner-new", epoch=3)
+            return SimpleNamespace(message_id="child-input-old")
+
+    manager = RotatingSessionManager()
+    runtime = _StubTaskRuntime()
+    sessions_tool.set_session_manager(manager)
+    sessions_tool.set_task_runtime(runtime)
+    token = current_tool_context.set(_ctx())
+    try:
+        await sessions_tool.sessions_spawn(agent_id="worker", task="fenced child")
+    finally:
+        current_tool_context.reset(token)
+
+    envelope = runtime.enqueued[0]["envelope"]
+    assert manager.append_owner == ("child-owner-old", 2)
+    assert (manager.current.session_id, manager.current.epoch) == (
+        "child-owner-new",
+        3,
+    )
+    assert (envelope.session_id, envelope.session_epoch) == ("child-owner-old", 2)
+    assert runtime.enqueued[0]["persisted_user_message_id"] == "child-input-old"
 
 
 # ── model fallback chain ────────────────────────────────────────────────

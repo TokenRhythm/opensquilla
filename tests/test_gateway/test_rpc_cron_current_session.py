@@ -96,7 +96,11 @@ class _FakeSessionManager:
         if provenance is not None:
             row["provenance"] = provenance
         self.rows.setdefault(session_key, []).append(row)
-        return SimpleNamespace(role=role, content=content)
+        return SimpleNamespace(
+            role=role,
+            content=content,
+            message_id=f"message-{len(self.rows[session_key])}",
+        )
 
     async def read_transcript(self, session_key):
         return list(self.rows.get(session_key, []))
@@ -166,13 +170,22 @@ class _FakeTaskRuntime:
         self.record = record
         self.enqueued = []
 
-    async def enqueue(self, route_envelope, task, *, mode, run_kind):
+    async def enqueue(
+        self,
+        route_envelope,
+        task,
+        *,
+        mode,
+        run_kind,
+        persisted_user_message_id=None,
+    ):
         self.enqueued.append(
             {
                 "route_envelope": route_envelope,
                 "task": task,
                 "mode": mode,
                 "run_kind": run_kind,
+                "persisted_user_message_id": persisted_user_message_id,
             }
         )
         return SimpleNamespace(task_id="task-1")
@@ -746,6 +759,69 @@ async def test_cron_safe_admission_failure_happens_before_session_or_message_per
     assert session_manager.created == []
     assert await session_manager.read_transcript(SESSION_KEY) == []
     assert task_runtime.enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_cron_runtime_envelope_freezes_owner_across_persist_enqueue_reset() -> None:
+    class RotatingSessionManager(_FakeSessionManager):
+        def __init__(self) -> None:
+            super().__init__()
+            self.admitted = SimpleNamespace(session_id="cron-owner-old", epoch=4)
+            self.current = self.admitted
+            self.append_owner = None
+
+        async def get_or_create(self, **kwargs):
+            self.created.append(kwargs)
+            return self.admitted, False
+
+        async def append_message(
+            self,
+            session_key,
+            role,
+            content,
+            provenance=None,
+            *,
+            expected_session_id=None,
+            expected_session_epoch=None,
+        ):
+            self.append_owner = (expected_session_id, expected_session_epoch)
+            persisted = await super().append_message(
+                session_key,
+                role,
+                content,
+                provenance=provenance,
+            )
+            # Deterministically model reset after old-owner persistence but
+            # before the handler reaches TaskRuntime.enqueue.
+            self.current = SimpleNamespace(session_id="cron-owner-new", epoch=5)
+            return persisted
+
+    session_manager = RotatingSessionManager()
+    task_runtime = _FakeTaskRuntime(SimpleNamespace(status="succeeded"))
+    job = CronJob(
+        id="owner-race",
+        name="Owner race",
+        handler_key="agent_run",
+        payload={"kind": AGENT_TURN_KIND, "task": "fenced task", "agent_id": "main"},
+        session_target=SessionTarget.CURRENT,
+        session_key=SESSION_KEY,
+    )
+    handler = make_agent_run_handler(
+        DeliveryChain(),
+        task_runtime_ref=lambda: task_runtime,
+        session_manager_ref=lambda: session_manager,
+    )
+
+    await handler(job)
+
+    envelope = task_runtime.enqueued[0]["route_envelope"]
+    assert session_manager.append_owner == ("cron-owner-old", 4)
+    assert (session_manager.current.session_id, session_manager.current.epoch) == (
+        "cron-owner-new",
+        5,
+    )
+    assert (envelope.session_id, envelope.session_epoch) == ("cron-owner-old", 4)
+    assert task_runtime.enqueued[0]["persisted_user_message_id"] == "message-1"
 
 
 @pytest.mark.asyncio

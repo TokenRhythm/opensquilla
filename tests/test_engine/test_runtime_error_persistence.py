@@ -258,6 +258,47 @@ async def test_task_owned_no_provider_error_append_keeps_frozen_session_owner() 
 
 
 @pytest.mark.asyncio
+async def test_standalone_turn_rejects_stale_owner_before_provider_dispatch() -> None:
+    class ReplacementSessionManager(_RecordingSessionManager):
+        async def get_session(self, session_key: str) -> SimpleNamespace:
+            current = await super().get_session(session_key)
+            current.session_id = "session-new"
+            current.epoch = 8
+            return current
+
+    class RecordingProvider(_SingleReplyProvider):
+        def __init__(self) -> None:
+            self.chat_calls = 0
+
+        def chat(self, messages, tools=None, config=None):
+            self.chat_calls += 1
+            return super().chat(messages, tools=tools, config=config)
+
+    manager = ReplacementSessionManager()
+    provider = RecordingProvider()
+    runner = TurnRunner(
+        provider_selector=_ProviderSelector(provider),
+        session_manager=manager,
+        config=SimpleNamespace(context_window_tokens=100_000),
+    )
+
+    with pytest.raises(StaleEpochError, match="before provider dispatch"):
+        async for _event in runner.run(
+            "hello",
+            "agent:main:webchat:test",
+            ToolContext(is_owner=True, caller_kind=CallerKind.WEB),
+            history_has_persisted_user=False,
+            no_memory_capture=True,
+            expected_session_id="session-old",
+            expected_session_epoch=7,
+        ):
+            pass
+
+    assert provider.chat_calls == 0
+    assert manager.append_calls == []
+
+
+@pytest.mark.asyncio
 async def test_task_owned_context_exhaustion_skips_compaction_and_keeps_owner() -> None:
     manager = _RecordingSessionManager()
     runner = TurnRunner(

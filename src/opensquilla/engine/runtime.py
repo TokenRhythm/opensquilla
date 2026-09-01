@@ -5219,6 +5219,25 @@ class TurnRunner:
         current_task = asyncio.current_task()
         owner_map = _SESSION_LOCK_OWNER.get(None)
         _caller_holds_lock = owner_map is not None and id(lock) in owner_map
+
+        async def validate_standalone_owner() -> None:
+            if not owner_supplied or self._session_manager is None:
+                return
+            get_session = getattr(self._session_manager, "get_session", None)
+            if not callable(get_session):
+                # Compatibility-only managers remain protected at each
+                # transcript append, but cannot offer a pre-provider check.
+                return
+            current = await get_session(session_key)
+            if (
+                current is None
+                or getattr(current, "session_id", None) != expected_session_id
+                or getattr(current, "epoch", None) != expected_session_epoch
+            ):
+                raise StaleEpochError(
+                    "Turn session owner changed before provider dispatch"
+                )
+
         if _caller_holds_lock:
             # Same call chain already serializes this turn.
             try:
@@ -5273,6 +5292,10 @@ class TurnRunner:
                 await execution_context.close()
         else:
             async with lock:
+                # Standalone/legacy runners do not have TaskRuntime's durable
+                # admission CAS. Validate while holding the same session lock
+                # that reset must acquire, before resolving any provider/tools.
+                await validate_standalone_owner()
                 # Record this Task as the lock owner in the ContextVar so that
                 # any nested call to run() within the same Task can detect re-entry.
                 _map: dict[int, asyncio.Task[Any]] = dict(owner_map or {})

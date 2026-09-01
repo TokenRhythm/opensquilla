@@ -269,32 +269,32 @@ def _storage_owner_cas_kwargs(
     operation: Any,
     envelope: RouteEnvelope,
 ) -> dict[str, Any]:
-    """Build compatible recovery-CAS kwargs without downgrading modern owners."""
+    """Build compatible owner-CAS kwargs without downgrading modern owners."""
 
     session_id = getattr(envelope, "session_id", None)
     session_epoch = getattr(envelope, "session_epoch", None)
+    if session_epoch is None:
+        if not isinstance(session_id, str) or not session_id:
+            return {}
+        if _accepts_keyword_arg(operation, "expected_session_id"):
+            return {"expected_session_id": session_id}
+        return {}
+
     supports_session_id = _accepts_keyword_arg(operation, "expected_session_id")
-    supports_session_epoch = _accepts_keyword_arg(
-        operation,
-        "expected_session_epoch",
-    )
-    if session_epoch is not None:
-        if (
-            not isinstance(session_id, str)
-            or not session_id
-            or not supports_session_id
-            or not supports_session_epoch
-        ):
-            raise RuntimeError(
-                "Modern recovery requires an exact session-owner storage CAS"
-            )
-        return {
-            "expected_session_id": session_id,
-            "expected_session_epoch": session_epoch,
-        }
-    if isinstance(session_id, str) and session_id and supports_session_id:
-        return {"expected_session_id": session_id}
-    return {}
+    supports_session_epoch = _accepts_keyword_arg(operation, "expected_session_epoch")
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or not supports_session_id
+        or not supports_session_epoch
+    ):
+        raise RuntimeError(
+            "Modern task ownership requires an exact session-owner storage CAS"
+        )
+    return {
+        "expected_session_id": session_id,
+        "expected_session_epoch": session_epoch,
+    }
 
 
 def _accepts_keyword_arg(callable_obj: Any, name: str) -> bool:
@@ -2162,7 +2162,18 @@ class TaskRuntime:
         try:
             if self._accepted_config_provider is not None:
                 await self.freeze_acceptance(reservation)
-            await self._storage.create_agent_task(reservation.task_record)
+            # ``enqueue`` holds the per-session admission gate across this
+            # owner CAS, task commit, and activation. Reset takes the same
+            # gate, so either the old task becomes visible for drain or this
+            # transaction observes the replacement owner and rejects it.
+            create_agent_task = self._storage.create_agent_task
+            await create_agent_task(
+                reservation.task_record,
+                **_storage_owner_cas_kwargs(
+                    create_agent_task,
+                    reservation.runtime_task.envelope,
+                ),
+            )
         except asyncio.CancelledError:
             # The shared storage layer may finish COMMIT after its caller is
             # cancelled. Settle the operation, read back by task_id, and cross
@@ -5572,7 +5583,14 @@ class TaskRuntime:
                     )
                     return None
             else:
-                await self._storage.create_agent_task(reservation.task_record)
+                create_agent_task = self._storage.create_agent_task
+                await create_agent_task(
+                    reservation.task_record,
+                    **_storage_owner_cas_kwargs(
+                        create_agent_task,
+                        reservation.runtime_task.envelope,
+                    ),
+                )
             promotion_committed = True
             promoted_task_id = reservation.task_id
         except Exception as exc:  # noqa: BLE001 - accepted input must leave evidence

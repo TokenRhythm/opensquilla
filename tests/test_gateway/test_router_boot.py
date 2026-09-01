@@ -66,7 +66,7 @@ from opensquilla.scheduler.types import CronJob, JobStatus
 from opensquilla.session.compaction import CompactionConfig
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import SessionIntent
-from opensquilla.session.storage import SessionStorage
+from opensquilla.session.storage import SessionStorage, StaleEpochError
 from opensquilla.tools.registry import ToolRegistry
 from opensquilla.tools.types import CallerKind, ToolContext, ToolSpec
 
@@ -717,6 +717,48 @@ def test_build_task_runtime_run_kwargs_omits_legacy_session_owner() -> None:
 
     assert "expected_session_id" not in kwargs
     assert "expected_session_epoch" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_task_runtime_rejects_stale_internal_owner_before_provider_dispatch() -> None:
+    class Storage:
+        async def get_session(self, _session_key: str) -> Any:
+            return SimpleNamespace(session_id="replacement-session", epoch=8)
+
+    class RecordingTurnRunner:
+        def __init__(self) -> None:
+            self.called = False
+
+        async def run(self, *_args: Any, **_kwargs: Any):
+            self.called = True
+            yield DoneEvent()
+
+    envelope = build_cron_route_envelope(
+        SimpleNamespace(id="owner-race", name="owner race"),
+        session_key="cron:owner-race",
+        session_id="admitted-session",
+        session_epoch=7,
+    )
+    run = SimpleNamespace(
+        agent_id="main",
+        task_id="task-owner-race",
+        session_key=envelope.session_key,
+        session_id=envelope.session_id,
+        session_epoch=envelope.session_epoch,
+        envelope=envelope,
+    )
+    runner = RecordingTurnRunner()
+
+    with pytest.raises(StaleEpochError, match="changed before provider dispatch"):
+        await dispatch_task_runtime_turn(
+            run,
+            config=GatewayConfig(),
+            session_manager=SimpleNamespace(_storage=Storage()),
+            turn_runner=runner,
+            event_emitter=lambda *_args, **_kwargs: None,
+        )
+
+    assert runner.called is False
 
 
 def test_build_task_runtime_run_kwargs_forwards_provider_correlation() -> None:

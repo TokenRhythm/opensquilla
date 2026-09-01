@@ -50,7 +50,15 @@ class _Storage:
         self.release_terminal = release_terminal
         self.timeline = timeline if timeline is not None else []
 
-    async def create_agent_task(self, record: AgentTaskRecord) -> None:
+    async def create_agent_task(
+        self,
+        record: AgentTaskRecord,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> None:
+        assert expected_session_id == "session-turn-committed"
+        assert expected_session_epoch == 4
         self.records[record.task_id] = record
 
     async def get_agent_task(self, task_id: str) -> AgentTaskRecord | None:

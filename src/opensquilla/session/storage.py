@@ -1558,7 +1558,7 @@ def _validate_optional_session_owner(
     session_id: str | None,
     session_epoch: int | None,
 ) -> None:
-    """Validate a recovery CAS owner while allowing legacy id-only callers."""
+    """Validate an optional owner CAS while allowing legacy id-only callers."""
 
     if session_id is not None and (
         not isinstance(session_id, str) or not session_id
@@ -1581,7 +1581,7 @@ async def _matches_session_owner_on_conn(
     session_id: str | None,
     session_epoch: int | None,
 ) -> bool:
-    """Return whether the current row still matches a supplied recovery owner."""
+    """Return whether the current row still matches a supplied durable owner."""
 
     if session_id is None:
         return True
@@ -8883,10 +8883,31 @@ class SessionStorage:
             values,
         )
 
-    async def create_agent_task(self, task: AgentTaskRecord) -> AgentTaskRecord:
+    async def create_agent_task(
+        self,
+        task: AgentTaskRecord,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> AgentTaskRecord:
+        """Create a task only while its admitted session owner is current."""
+
         task.session_key = canonicalize_session_key(task.session_key)
         task.agent_id = normalize_agent_id(task.agent_id)
+        _validate_optional_session_owner(
+            session_id=expected_session_id,
+            session_epoch=expected_session_epoch,
+        )
         async with self._write_transaction("create_agent_task") as conn:
+            if not await _matches_session_owner_on_conn(
+                conn,
+                session_key=task.session_key,
+                session_id=expected_session_id,
+                session_epoch=expected_session_epoch,
+            ):
+                raise StaleEpochError(
+                    "Task session owner changed before durable admission"
+                )
             await self._insert_agent_task(conn, task)
         return task
 

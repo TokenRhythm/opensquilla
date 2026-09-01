@@ -27,7 +27,8 @@ from opensquilla.gateway.task_runtime import (
     TaskRuntime,
 )
 from opensquilla.sandbox.run_mode import RunMode
-from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus
+from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus, SessionNode
+from opensquilla.session.storage import SessionStorage, StaleEpochError
 
 
 @dataclass
@@ -36,7 +37,14 @@ class _TrackingStorage:
     create_calls: list[str] = field(default_factory=list)
     update_calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
 
-    async def create_agent_task(self, record: AgentTaskRecord) -> None:
+    async def create_agent_task(
+        self,
+        record: AgentTaskRecord,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> None:
+        del expected_session_id, expected_session_epoch
         self.create_calls.append(record.task_id)
         self.records[record.task_id] = record
 
@@ -84,6 +92,48 @@ def _envelope(
 
 async def _noop_turn_handler(_run: Any) -> None:
     return
+
+
+@pytest.mark.asyncio
+async def test_direct_enqueue_rejects_stale_owner_before_task_activation(tmp_path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "stale-owner.db"))
+    key = "agent:main:webchat:stale-runtime-owner"
+    admitted = SessionNode(
+        session_key=key,
+        session_id="runtime-owner-old",
+        epoch=0,
+    )
+    await storage.upsert_session(admitted)
+    replacement = admitted.model_copy(deep=True)
+    replacement.session_id = "runtime-owner-new"
+    replacement.epoch = 1
+    await storage.upsert_session(replacement)
+    handler_started = asyncio.Event()
+
+    async def handler(_run: Any) -> None:
+        handler_started.set()
+
+    runtime = TaskRuntime(storage=storage, turn_handler=handler)
+    task_id = "stale-owner-runtime-task"
+    try:
+        with pytest.raises(StaleEpochError, match="durable admission"):
+            await runtime.enqueue(
+                _envelope(
+                    key,
+                    session_id=admitted.session_id,
+                    session_epoch=0,
+                ),
+                "must not execute",
+                task_id=task_id,
+            )
+
+        assert await storage.get_agent_task(task_id) is None
+        assert handler_started.is_set() is False
+        assert runtime._tasks == {}
+        assert runtime._reservations_by_session == {}
+    finally:
+        await runtime.shutdown(graceful=True, timeout=1.0)
+        await storage.close()
 
 
 @pytest.mark.asyncio

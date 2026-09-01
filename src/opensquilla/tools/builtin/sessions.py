@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import json
 import uuid
+from dataclasses import replace
+from typing import Any
 
 import structlog
 
@@ -33,6 +36,39 @@ _VALID_STATUSES = ("running", "done", "failed", "killed", "timeout")
 _TERMINAL_STATUSES = ("done", "failed", "killed", "timeout")
 _MAX_SPAWN_DEPTH = MAX_SPAWN_DEPTH
 _MAX_SESSION_TITLE_CHARS = 512
+
+
+def _durable_session_owner(value: object) -> tuple[str, int] | None:
+    """Extract a complete owner from a modern SessionManager create result."""
+
+    if isinstance(value, dict):
+        session_id = value.get("session_id")
+        session_epoch = value.get("epoch")
+    else:
+        session_id = getattr(value, "session_id", None)
+        session_epoch = getattr(value, "epoch", None)
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(session_epoch, int)
+        or isinstance(session_epoch, bool)
+        or session_epoch < 0
+    ):
+        return None
+    return session_id, session_epoch
+
+
+def _accepts_keyword_arg(call: Any, name: str) -> bool:
+    """Return whether a compatibility runtime accepts one keyword."""
+
+    try:
+        parameters = inspect.signature(call).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD or parameter.name == name
+        for parameter in parameters
+    )
 
 # Subagent grounding also has a per-turn system-prompt fallback in
 # engine.steps.inject_subagent_grounding. Keep this spawn prompt text in
@@ -622,10 +658,36 @@ async def sessions_spawn(
                         f"'{parent_session_key}'"
                     )
             create = getattr(mgr, "create", None) or getattr(mgr, "create_session")
-            await create(
+            created_session = await create(
                 **create_kwargs,
             )
-            await mgr.append_message(session_key, role="user", content=grounded_task)
+            session_owner = _durable_session_owner(created_session)
+            append_kwargs: dict[str, object] = {}
+            if session_owner is not None:
+                append_kwargs = {
+                    "expected_session_id": session_owner[0],
+                    "expected_session_epoch": session_owner[1],
+                }
+            persisted_input = await mgr.append_message(
+                session_key,
+                role="user",
+                content=grounded_task,
+                **append_kwargs,
+            )
+            if session_owner is not None:
+                envelope = replace(
+                    envelope,
+                    session_id=session_owner[0],
+                    session_epoch=session_owner[1],
+                )
+        persisted_user_message_id = getattr(persisted_input, "message_id", None)
+        enqueue_kwargs: dict[str, object] = {}
+        if (
+            isinstance(persisted_user_message_id, str)
+            and persisted_user_message_id
+            and _accepts_keyword_arg(runtime.enqueue, "persisted_user_message_id")
+        ):
+            enqueue_kwargs["persisted_user_message_id"] = persisted_user_message_id
         handle = await runtime.enqueue(
             envelope,
             grounded_task,
@@ -633,6 +695,7 @@ async def sessions_spawn(
             run_kind="subagent",
             task_id=subagent_run_id,
             provider_request_correlation=provider_request_correlation,
+            **enqueue_kwargs,
         )
         return json.dumps(
             {

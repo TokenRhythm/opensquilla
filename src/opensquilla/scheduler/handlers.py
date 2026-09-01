@@ -7,7 +7,7 @@ import inspect
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 from typing import Any
 
 import structlog
@@ -29,6 +29,7 @@ from opensquilla.scheduler.types import (
     SessionTarget,
 )
 from opensquilla.session.keys import build_main_key
+from opensquilla.session.storage import StaleEpochError
 from opensquilla.session.terminal_reply import (
     build_terminal_reply,
     is_context_payload_too_large,
@@ -40,6 +41,40 @@ log = structlog.get_logger(__name__)
 
 WorkspaceResolver = Callable[[str], tuple[str | None, bool]]
 DefaultElevatedResolver = Callable[[], str | None]
+
+
+def _durable_session_owner(value: Any) -> tuple[str, int] | None:
+    """Extract an exact owner from SessionManager lifecycle return values."""
+
+    candidate = value[0] if isinstance(value, tuple) and value else value
+    if isinstance(candidate, dict):
+        session_id = candidate.get("session_id")
+        session_epoch = candidate.get("epoch")
+    else:
+        session_id = getattr(candidate, "session_id", None)
+        session_epoch = getattr(candidate, "epoch", None)
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(session_epoch, int)
+        or isinstance(session_epoch, bool)
+        or session_epoch < 0
+    ):
+        return None
+    return session_id, session_epoch
+
+
+def _accepts_keyword_arg(call: Any, name: str) -> bool:
+    """Return whether a compatibility adapter accepts one keyword."""
+
+    try:
+        parameters = inspect.signature(call).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD or parameter.name == name
+        for parameter in parameters
+    )
 
 
 def _resolve_default_elevated(
@@ -240,6 +275,8 @@ def make_agent_run_handler(
             return HandlerResult()
 
         route_envelope = None
+        session_owner: tuple[str, int] | None = None
+        persisted_user_message_id: str | None = None
         if task_runtime is not None:
             from opensquilla.scheduler.routing import build_cron_route_envelope
 
@@ -259,11 +296,18 @@ def make_agent_run_handler(
             raise RuntimeError("project workspace storage is unavailable")
         if sm is not None:
             try:
-                await sm.get_or_create(
+                session_result = await sm.get_or_create(
                     session_key=session_key,
                     agent_id=agent_id,
                     display_name=f"Cron: {job.name[:50]}",
                 )
+                session_owner = _durable_session_owner(session_result)
+                if session_owner is not None and route_envelope is not None:
+                    route_envelope = replace(
+                        route_envelope,
+                        session_id=session_owner[0],
+                        session_epoch=session_owner[1],
+                    )
                 if isinstance(workspace_id, str) and workspace_id:
                     storage = getattr(sm, "_storage", None)
                     if storage is None or not hasattr(storage, "bind_session_workspace"):
@@ -279,9 +323,30 @@ def make_agent_run_handler(
                         )
                         bound_workspace_dir = str(validated.canonical_path)
                     await storage.bind_session_workspace(session_key, workspace_id)
-                _persisted = await sm.append_message(session_key, role="user", content=task)
+                append_kwargs: dict[str, Any] = {}
+                if session_owner is not None:
+                    append_kwargs = {
+                        "expected_session_id": session_owner[0],
+                        "expected_session_epoch": session_owner[1],
+                    }
+                _persisted = await sm.append_message(
+                    session_key,
+                    role="user",
+                    content=task,
+                    **append_kwargs,
+                )
                 if _persisted is not None and isinstance(_persisted.content, str):
                     task = _persisted.content
+                persisted_message_id = getattr(_persisted, "message_id", None)
+                if isinstance(persisted_message_id, str) and persisted_message_id:
+                    persisted_user_message_id = persisted_message_id
+            except StaleEpochError:
+                log.warning(
+                    "agent_run_handler.stale_session_owner",
+                    job_id=job.id,
+                    session_key=session_key,
+                )
+                raise
             except Exception:
                 log.warning(
                     "agent_run_handler.session_setup_failed",
@@ -318,11 +383,23 @@ def make_agent_run_handler(
 
                 transcript_watermark = await _transcript_watermark(sm, session_key)
                 assert route_envelope is not None
+                enqueue_kwargs: dict[str, Any] = {}
+                if (
+                    persisted_user_message_id is not None
+                    and _accepts_keyword_arg(
+                        task_runtime.enqueue,
+                        "persisted_user_message_id",
+                    )
+                ):
+                    enqueue_kwargs["persisted_user_message_id"] = (
+                        persisted_user_message_id
+                    )
                 handle = await task_runtime.enqueue(
                     route_envelope,
                     task,
                     mode="followup",
                     run_kind="cron_turn",
+                    **enqueue_kwargs,
                 )
                 try:
                     record = await task_runtime.wait(handle.task_id, timeout=job.timeout_seconds)
@@ -365,15 +442,27 @@ def make_agent_run_handler(
                     workspace_dir_override=bound_workspace_dir,
                     default_elevated=default_elevated,
                 )
+                run_kwargs: dict[str, Any] = {
+                    "tool_context": tool_context,
+                    "agent_id": agent_id,
+                    "timeout": job.timeout_seconds,
+                    "run_kind": "cron_turn",
+                    "input_provenance": {"kind": "cron_job", "job_id": job.id},
+                }
+                if (
+                    session_owner is not None
+                    and _accepts_keyword_arg(turn_runner.run, "expected_session_id")
+                    and _accepts_keyword_arg(turn_runner.run, "expected_session_epoch")
+                ):
+                    run_kwargs.update(
+                        expected_session_id=session_owner[0],
+                        expected_session_epoch=session_owner[1],
+                    )
                 async for event in wrap_stream(
                     turn_runner.run(
                         message=task,
                         session_key=session_key,
-                        tool_context=tool_context,
-                        agent_id=agent_id,
-                        timeout=job.timeout_seconds,
-                        run_kind="cron_turn",
-                        input_provenance={"kind": "cron_job", "job_id": job.id},
+                        **run_kwargs,
                     ),
                     idle_timeout=None,
                 ):
