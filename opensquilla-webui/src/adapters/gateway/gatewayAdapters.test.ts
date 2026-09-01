@@ -46,6 +46,9 @@ describe('Gateway Adapter composition', () => {
       'observability',
       'skillCatalog',
       'agentCatalog',
+      'cronScheduler',
+      'channelAdministration',
+      'channelSetup',
     ])
     expect(adapters).not.toHaveProperty('rpc')
     expect(adapters).not.toHaveProperty('events')

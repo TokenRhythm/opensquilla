@@ -42,6 +42,12 @@ import type { SkillCatalog } from '@/modules/skillCatalog'
 import { createV4SkillCatalog } from './skillCatalogV4'
 import type { AgentCatalog } from '@/modules/agentCatalog'
 import { createV4AgentCatalog } from './agentCatalogV4'
+import type { CronScheduler } from '@/modules/cronScheduler'
+import { createV4CronScheduler } from './cronSchedulerV4'
+import type { ChannelAdministration } from '@/modules/channelAdministration'
+import { createV4ChannelAdministration } from './channelAdministrationV4'
+import type { ChannelSetup } from '@/modules/channelSetup'
+import { createV4ChannelSetup } from './channelSetupV4'
 
 type RpcStoreTransportSource = Parameters<typeof createPrivateGatewayTransports>[0]
 
@@ -67,6 +73,9 @@ export interface GatewayAdapters {
   readonly observability: Observability
   readonly skillCatalog: SkillCatalog
   readonly agentCatalog: AgentCatalog
+  readonly cronScheduler: CronScheduler
+  readonly channelAdministration: ChannelAdministration
+  readonly channelSetup: ChannelSetup
 }
 
 export interface GatewayAdapterOptions {
@@ -119,6 +128,9 @@ export function createGatewayAdapters(
     observability: createV4Observability(transports.rpc, http),
     skillCatalog: createV4SkillCatalog(transports.rpc),
     agentCatalog: createV4AgentCatalog(transports.rpc),
+    cronScheduler: createV4CronScheduler(transports.rpc, transports.events),
+    channelAdministration: createV4ChannelAdministration(transports.rpc, transports.events),
+    channelSetup: createV4ChannelSetup(transports.rpc),
   }
   return adapters
 }
