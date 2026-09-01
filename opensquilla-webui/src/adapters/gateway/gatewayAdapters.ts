@@ -48,6 +48,8 @@ import type { ChannelAdministration } from '@/modules/channelAdministration'
 import { createV4ChannelAdministration } from './channelAdministrationV4'
 import type { ChannelSetup } from '@/modules/channelSetup'
 import { createV4ChannelSetup } from './channelSetupV4'
+import type { ArtifactWorkbench } from '@/modules/artifactWorkbench'
+import { createV4ArtifactWorkbench } from './artifactWorkbenchV4'
 
 type RpcStoreTransportSource = Parameters<typeof createPrivateGatewayTransports>[0]
 
@@ -76,6 +78,7 @@ export interface GatewayAdapters {
   readonly cronScheduler: CronScheduler
   readonly channelAdministration: ChannelAdministration
   readonly channelSetup: ChannelSetup
+  readonly artifactWorkbench: ArtifactWorkbench
 }
 
 export interface GatewayAdapterOptions {
@@ -131,6 +134,7 @@ export function createGatewayAdapters(
     cronScheduler: createV4CronScheduler(transports.rpc, transports.events),
     channelAdministration: createV4ChannelAdministration(transports.rpc, transports.events),
     channelSetup: createV4ChannelSetup(transports.rpc),
+    artifactWorkbench: createV4ArtifactWorkbench(transports.rpc, transports.events, http),
   }
   return adapters
 }

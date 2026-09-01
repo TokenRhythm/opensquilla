@@ -29,6 +29,7 @@ import { OBSERVABILITY_KEY } from './modules/observability'
 import { SKILL_CATALOG_KEY } from './modules/skillCatalog'
 import { AGENT_CATALOG_KEY } from './modules/agentCatalog'
 import { CRON_SCHEDULER_KEY } from './modules/cronScheduler'
+import { ARTIFACT_WORKBENCH_KEY } from './modules/artifactWorkbench'
 import { CHANNEL_ADMINISTRATION_KEY } from './modules/channelAdministration'
 import { CHANNEL_SETUP_KEY } from './modules/channelSetup'
 import 'katex/dist/katex.min.css'
@@ -92,6 +93,7 @@ app.provide(AGENT_CATALOG_KEY, gatewayAdapters.agentCatalog)
 app.provide(CRON_SCHEDULER_KEY, gatewayAdapters.cronScheduler)
 app.provide(CHANNEL_ADMINISTRATION_KEY, gatewayAdapters.channelAdministration)
 app.provide(CHANNEL_SETUP_KEY, gatewayAdapters.channelSetup)
+app.provide(ARTIFACT_WORKBENCH_KEY, gatewayAdapters.artifactWorkbench)
 router.afterEach(() => {
   rpcStore.applyLinkTokenFromUrl()
 })
