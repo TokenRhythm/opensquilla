@@ -4,6 +4,8 @@ import { createApp, nextTick } from 'vue'
 import { createPinia, setActivePinia } from 'pinia'
 import i18n from '@/i18n'
 import type { ArtifactPayload } from '@/types/rpc'
+import { ARTIFACT_WORKBENCH_KEY, type ArtifactWorkbench } from '@/modules/artifactWorkbench'
+import { createV4ArtifactContentAccess } from '@/adapters/gateway/artifactAccessV4'
 import ChatArtifactList from './ChatArtifactList.vue'
 
 const videoArtifact: ArtifactPayload = {
@@ -37,6 +39,9 @@ async function mountList(
   })
   app.use(pinia)
   app.use(i18n)
+  app.provide(ARTIFACT_WORKBENCH_KEY, {
+    content: createV4ArtifactContentAccess(),
+  } as ArtifactWorkbench)
   app.mount(el)
   await settle()
   return { app, el, onDownload }

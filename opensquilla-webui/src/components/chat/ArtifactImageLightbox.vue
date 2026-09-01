@@ -103,7 +103,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
+import { computed, inject, nextTick, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import {
@@ -116,7 +116,7 @@ import { useDialogLayer } from '@/composables/useDialogA11y'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { useToasts } from '@/composables/useToasts'
 import type { ArtifactPayload } from '@/types/rpc'
-import { fetchArtifactBlob } from '@/utils/chat/artifactAccess'
+import { ARTIFACT_WORKBENCH_KEY } from '@/modules/artifactWorkbench'
 import {
   artifactCategory,
   artifactDownloadUrl,
@@ -127,6 +127,9 @@ import { downloadBlob } from '@/utils/browser'
 const { t } = useI18n()
 const { pushToast } = useToasts()
 const controller = useArtifactImageLightbox()
+const injectedArtifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
+if (!injectedArtifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
+const artifactWorkbench = injectedArtifactWorkbench
 const active = computed(() => controller.request.value?.artifact ?? null)
 const isOpen = computed(() => active.value !== null)
 const lightboxIsTopmost = useDialogLayer(isOpen)
@@ -309,9 +312,7 @@ function onLightboxKeydown(event: KeyboardEvent) {
 async function downloadActive() {
   const request = controller.request.value
   if (!request) return
-  const result = await fetchArtifactBlob(request.artifact, {
-    authToken: readAuthToken(),
-    baseOrigin: window.location.origin,
+  const result = await artifactWorkbench.content.fetchArtifact(request.artifact, {
     sessionKey: request.sessionKey,
   })
   if (!result.ok) {

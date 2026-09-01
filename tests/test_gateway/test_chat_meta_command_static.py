@@ -6,8 +6,7 @@ checks complement the frontend behavior tests:
 
 - meta-skills are offered as Tab-completable **argument candidates** in the
   slash menu (not a toast), via the command's ``argumentChoices``;
-- selecting ``/meta <skill>`` uses MetaRunCenter + a hidden turn; the adapter's
-  frontend tests cover the underlying ``meta.run`` transport contract.
+- selecting ``/meta <skill>`` runs it through ``MetaRunCenter`` + a hidden turn.
 
 The contract intentionally targets the maintained Vue source rather than a
 generated browser bundle.
@@ -40,9 +39,11 @@ def test_meta_run_path_uses_meta_run_center() -> None:
     case_body = text[text.index(case_marker):]
     helper_body = text[text.index(helper_marker):text.index(helper_end)]
     assert "runMetaInvocation" in case_body, "meta.menu must use the durable invocation path"
-    assert "options.metaRunCenter.launch(" in helper_body, "meta-skills must use MetaRunCenter"
+    assert "options.metaRunCenter.launch" in helper_body, (
+        "running a chosen meta-skill must use the MetaRunCenter domain adapter"
+    )
+    assert "sessionKey" in helper_body, "MetaRunCenter.launch must pass the session key"
     assert "meta.run" not in helper_body, "the composable must not own the wire method"
-    assert "sessionKey" in helper_body, "launch must pass the session key"
     assert "dispatchHidden" in helper_body, "running a meta-skill must trigger a hidden turn"
     assert "result?.setupRequired" in helper_body, "setup failures must not start a turn"
     assert "readiness.missing_bins" in helper_body, "setup must identify missing binaries"

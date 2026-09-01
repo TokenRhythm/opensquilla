@@ -39,6 +39,19 @@ describe('Gateway Adapter composition', () => {
       'appSettings',
       'providerConfiguration',
       'setupWorkflow',
+      'migrationOperations',
+      'workspaceCatalog',
+      'sandboxRuntime',
+      'sessionConversation',
+      'observability',
+      'skillCatalog',
+      'agentCatalog',
+      'cronScheduler',
+      'channelAdministration',
+      'channelSetup',
+      'artifactWorkbench',
+      'memoryProfileImport',
+      'audioTranscription',
     ])
     expect(adapters).not.toHaveProperty('rpc')
     expect(adapters).not.toHaveProperty('events')

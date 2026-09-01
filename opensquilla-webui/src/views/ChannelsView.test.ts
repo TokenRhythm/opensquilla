@@ -145,7 +145,7 @@ async function mountChannelsView(options: {
 } = {}) {
   vi.resetModules()
 
-  const { KeepAlive, createApp, defineComponent, h, nextTick, ref } = await import('vue')
+  const { KeepAlive, createApp, defineComponent, h, nextTick, ref, watch } = await import('vue')
   const i18nModule = await import('@/i18n')
   const i18n = i18nModule.default
   const locale = (options.locale || 'en') as 'en'
@@ -199,8 +199,9 @@ async function mountChannelsView(options: {
   ]
   const adminSendersMap: Record<string, string[]> = { ...(options.adminSenders || {}) }
   const rows = options.channelRows ?? channelRows
-  const execute = vi.fn(async () => ({ channels: rows }))
-  const refresh = vi.fn(async () => ({ channels: rows }))
+  const channelsData = ref<{ channels: Array<Record<string, unknown>> }>({ channels: rows })
+  const execute = vi.fn(async () => ({ channels: channelsData.value.channels }))
+  const refresh = vi.fn(async () => ({ channels: channelsData.value.channels }))
   // Catalog slice mirroring the backend field-spec shape (groups, secrets,
   // show_when, advanced) for the in-place configuration editor.
   const slackSpec = {
@@ -252,6 +253,7 @@ async function mountChannelsView(options: {
     ],
   }
   const rpcCall = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+    if (method === 'channels.status') return { channels: channelsData.value.channels }
     if (method === 'onboarding.catalog') {
       return { channels: [slackSpec, feishuSpec, matrixSpec] }
     }
@@ -263,7 +265,11 @@ async function mountChannelsView(options: {
       const entry = params?.entry as Record<string, unknown> | undefined
       return { changed: true, restartRequired: true, entry: { name: entry?.name } }
     }
-    if (method === 'onboarding.channel.enable' || method === 'onboarding.channel.disable') {
+    if (
+      method === 'onboarding.channel.enable'
+      || method === 'onboarding.channel.disable'
+      || method === 'onboarding.channel.remove'
+    ) {
       return { changed: true, restartRequired: true }
     }
     if (method === 'channels.probe') {
@@ -349,7 +355,6 @@ async function mountChannelsView(options: {
   const replace = vi.fn(async (_to: { query?: Record<string, unknown> }) => {})
   // Mutable status snapshot: tests drive the 30s-poll divergence path by
   // swapping this ref's value.
-  const channelsData = ref<{ channels: Array<Record<string, unknown>> }>({ channels: rows })
   vi.doMock('vue-router', () => ({
     useRouter: () => ({ push, replace }),
     useRoute: () => ({ path: '/channels', query: { ...(options.routeQuery || {}) }, hash: '' }),
@@ -391,6 +396,37 @@ async function mountChannelsView(options: {
       return () => h(KeepAlive, null, [h(Component)])
     },
   }))
+  const { APP_SETTINGS_KEY } = await import('@/modules/appSettings')
+  const { SETUP_WORKFLOW_KEY } = await import('@/modules/setupWorkflow')
+  const { CHANNEL_ADMINISTRATION_KEY } = await import('@/modules/channelAdministration')
+  const { CHANNEL_SETUP_KEY } = await import('@/modules/channelSetup')
+  const { createV4ChannelAdministration } = await import('@/adapters/gateway/channelAdministrationV4')
+  const { createV4ChannelSetup } = await import('@/adapters/gateway/channelSetupV4')
+  app.provide(APP_SETTINGS_KEY, {
+    read: async (path: string) => await rpcCall('config.get', { path }),
+  } as unknown as import('@/modules/appSettings').AppSettings)
+  app.provide(SETUP_WORKFLOW_KEY, {
+    catalog: async () => await rpcCall('onboarding.catalog'),
+  } as unknown as import('@/modules/setupWorkflow').SetupWorkflow)
+  let emitStatus: () => void = () => undefined
+  const channelAdministration = createV4ChannelAdministration({
+    request: rpcCall as never,
+    ready: vi.fn(async () => undefined),
+  }, {
+    subscribe: vi.fn((_event: string, handler: (payload: unknown) => void) => {
+      emitStatus = () => handler(undefined)
+      return { close: vi.fn() }
+    }),
+  })
+  app.provide(CHANNEL_ADMINISTRATION_KEY, {
+    ...channelAdministration,
+    status: async () => {
+      await refresh()
+      return channelAdministration.status()
+    },
+  })
+  app.provide(CHANNEL_SETUP_KEY, createV4ChannelSetup({ request: rpcCall as never }))
+  watch(channelsData, () => emitStatus())
   app.use(i18n)
   app.mount(el)
   await nextTick()

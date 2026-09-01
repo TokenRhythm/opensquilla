@@ -79,7 +79,7 @@ const runtimePackStatus: SandboxRuntimePackStatus = {
 }
 
 async function settle() {
-  for (let index = 0; index < 8; index++) await Promise.resolve()
+  for (let index = 0; index < 32; index++) await Promise.resolve()
 }
 
 async function mountPanel(options: {
@@ -228,6 +228,8 @@ async function mountPanel(options: {
   const { createApp } = await import('vue')
   const { createPinia } = await import('pinia')
   const i18n = (await import('@/i18n')).default
+  const { SANDBOX_RUNTIME_KEY } = await import('@/modules/sandboxRuntime')
+  const { createV4SandboxRuntime } = await import('@/adapters/gateway/sandboxRuntimeV4')
   i18n.global.locale.value = 'en'
   const Component = (await import('./SandboxSettingsPanel.vue')).default
   const el = document.createElement('div')
@@ -235,6 +237,13 @@ async function mountPanel(options: {
   const app = createApp(Component)
   app.use(createPinia())
   app.use(i18n)
+  app.provide(SANDBOX_RUNTIME_KEY, createV4SandboxRuntime({
+    request: (method, params) => (
+      params === undefined && method !== 'sandbox.capability.status'
+        ? call(method)
+        : call(method, params)
+    ),
+  }))
   app.mount(el)
   mounted.push(app)
   await settle()

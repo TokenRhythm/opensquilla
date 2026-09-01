@@ -558,6 +558,61 @@ export function createDesktopPlatform(): Platform {
       save: (payload) => requireDesktopApi().saveOnboarding(payload),
       cancel: () => requireDesktopApi().cancelOnboarding(),
     },
+    migration: {
+      ...(typeof window.opensquillaDesktop?.getRecoveryState === 'function'
+        ? { getRecoveryState: () => requireDesktopApi().getRecoveryState!() }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.retryProfileConsolidation === 'function'
+        ? { retryProfileConsolidation: () => requireDesktopApi().retryProfileConsolidation!() }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.chooseLegacyAgentDataLocation === 'function'
+        ? { chooseLegacyAgentDataLocation: (payload) => requireDesktopApi().chooseLegacyAgentDataLocation!(payload) }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.migrationSummary === 'function'
+        ? { migrationSummary: (payload) => requireDesktopApi().migrationSummary!(payload) }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.migrationBrowseSource === 'function'
+        ? { migrationBrowseSource: (payload: { kind: string }) => requireDesktopApi().migrationBrowseSource!(payload as Parameters<NonNullable<OpenSquillaDesktopApi['migrationBrowseSource']>>[0]) }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.migrationRun === 'function'
+        ? { migrationRun: (payload) => requireDesktopApi().migrationRun!(payload) }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.migrationTakeLastResult === 'function'
+        ? { migrationTakeLastResult: () => requireDesktopApi().migrationTakeLastResult!() }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.migrationPeekLastResult === 'function'
+        ? { migrationPeekLastResult: () => requireDesktopApi().migrationPeekLastResult!() }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.migrationDismissLastResult === 'function'
+        ? { migrationDismissLastResult: () => requireDesktopApi().migrationDismissLastResult!() }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.revealRecoveryPath === 'function'
+        ? { revealRecoveryPath: (payload) => requireDesktopApi().revealRecoveryPath!(payload) }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.onMigrationProgress === 'function'
+        ? { onMigrationProgress: (callback) => requireDesktopApi().onMigrationProgress!(callback) }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.inspectDesktopCleanup === 'function'
+        ? { inspectDesktopCleanup: (payload: { mode: string }) => requireDesktopApi().inspectDesktopCleanup!(payload as Parameters<NonNullable<OpenSquillaDesktopApi['inspectDesktopCleanup']>>[0]) }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.discardDesktopCleanup === 'function'
+        ? { discardDesktopCleanup: (payload) => requireDesktopApi().discardDesktopCleanup!(payload) }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.applyDesktopCleanup === 'function'
+        ? { applyDesktopCleanup: (payload) => requireDesktopApi().applyDesktopCleanup!(payload) }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.revealDesktopUserData === 'function'
+        ? { revealDesktopUserData: () => requireDesktopApi().revealDesktopUserData!() }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.abandonCleanupTransaction === 'function'
+        ? { abandonCleanupTransaction: () => requireDesktopApi().abandonCleanupTransaction!() }
+        : {}),
+    },
+    window: {
+      ...(typeof window.opensquillaDesktop?.onWindowHidden === 'function'
+        ? { onHidden: (callback) => requireDesktopApi().onWindowHidden!(callback) }
+        : {}),
+    },
     files: {
       openArtifact: (payload) => requireDesktopApi().openArtifact(payload),
       async chooseProjectDirectory(request) {

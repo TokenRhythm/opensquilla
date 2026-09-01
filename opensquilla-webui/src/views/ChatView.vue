@@ -808,7 +808,12 @@ import {
 } from '@/modules/sessionDirectory'
 import { SESSION_LIFECYCLE_KEY } from '@/modules/sessionLifecycle'
 import { PENDING_INPUT_QUEUE_KEY } from '@/modules/pendingInputQueue'
-import { useRpcCall } from '@/composables/useRpc'
+import { APP_SETTINGS_KEY } from '@/modules/appSettings'
+import { PROVIDER_CONFIGURATION_KEY } from '@/modules/providerConfiguration'
+import { SANDBOX_RUNTIME_KEY } from '@/modules/sandboxRuntime'
+import { SETUP_WORKFLOW_KEY } from '@/modules/setupWorkflow'
+import { ARTIFACT_WORKBENCH_KEY } from '@/modules/artifactWorkbench'
+import { useSetupStatus } from '@/composables/setup/useSetupStatus'
 import { useAppStore } from '@/stores/app'
 import { useSandboxSetupStore } from '@/stores/sandboxSetup'
 import { useArtifactPromptAnnotationsStore } from '@/stores/artifactPromptAnnotations'
@@ -816,7 +821,6 @@ import { useWorkbenchDocumentContextStore } from '@/stores/workbenchDocumentCont
 import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
 import { useWorkbenchStore } from '@/workbench/store'
 import { usePlatform } from '@/platform'
-import { createRpcArtifactPromptAnnotationProvider } from '@/workbench/artifactPromptAnnotationProvider'
 import {
   focusArtifactPromptAnnotation,
   notifyArtifactPromptAnnotationsAccepted,
@@ -872,6 +876,7 @@ import { useChatElevatedMode } from '@/composables/chat/useChatElevatedMode'
 import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
 import { useChatSessionRouting } from '@/composables/chat/useChatSessionRouting'
 import { SESSION_ROUTING_KEY, type SessionRouting } from '@/modules/sessionRouting'
+import { SESSION_CONVERSATION_KEY, type SessionConversation } from '@/modules/sessionConversation'
 import { TURN_COMMANDS_KEY, type TurnCommands } from '@/modules/turnCommands'
 import { APPROVAL_CENTER_KEY, type ApprovalCenter } from '@/modules/approvalCenter'
 import { GOAL_CENTER_KEY, type GoalCenter } from '@/modules/goalCenter'
@@ -939,8 +944,6 @@ import {
   claimSessionBootstrapAdmission,
   optionalSessionRpcAllowed,
   optionalSessionRpcCallOptions,
-  runModeWriteRpcCallOptions,
-  sandboxSetupRpcCallOptions,
 } from '@/composables/chat/sessionBootstrapAdmission'
 import { useChatSessionRuntime } from '@/composables/chat/useChatSessionRuntime'
 import {
@@ -965,6 +968,7 @@ import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
 import { useChatUsageWidget } from '@/composables/chat/useChatUsageWidget'
 import { useSessionArtifacts } from '@/composables/chat/useSessionArtifacts'
 import { useVoiceInput } from '@/composables/chat/useVoiceInput'
+import { AUDIO_TRANSCRIPTION_KEY } from '@/modules/audioTranscription'
 import { navigateMetaSetupProviderSettings } from '@/composables/chat/metaSetupProviderNavigation'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { hasOpenDialogLayer } from '@/composables/useDialogA11y'
@@ -1000,7 +1004,6 @@ import {
   createForkTransitionLifetime,
   forkNavigationPhase,
   forkRouteHandoffAction,
-  forkRpcRequest,
   snapshotForkPreviewMessages,
   validatedForkChildKey,
   type ForkRpcResponse,
@@ -1041,7 +1044,6 @@ import type {
 } from '@/types/plans'
 import {
   artifactCategory,
-  artifactDownloadUrl,
   isInlineMediaArtifact,
   isOfficeArtifact,
 } from '@/utils/chat/artifacts'
@@ -1068,7 +1070,6 @@ import {
   artifactWorkbenchPreviewKind,
 } from '@/utils/workbench/artifactPreview'
 import { findArtifactCard, focusArtifactInTranscript } from '@/utils/chat/artifactFocus'
-import { fetchDisplayAttachmentBlob } from '@/utils/chat/attachmentAccess'
 import { classifyArtifactProductError } from '@/utils/artifactProductErrors'
 import {
   persistDeferredMetaDraft,
@@ -1209,6 +1210,23 @@ const goalContinuity: GoalContinuity = injectedGoalContinuity
 const injectedMetaRunCenter = inject(META_RUN_CENTER_KEY)
 if (!injectedMetaRunCenter) throw new Error('MetaRunCenter was not provided')
 const metaRunCenter: MetaRunCenter = injectedMetaRunCenter
+const injectedAppSettings = inject(APP_SETTINGS_KEY)
+if (!injectedAppSettings) throw new Error('AppSettings was not provided')
+const injectedSessionConversation = inject(SESSION_CONVERSATION_KEY)
+if (!injectedSessionConversation) throw new Error('SessionConversation was not provided')
+const sessionConversation: SessionConversation = injectedSessionConversation
+const injectedProviderConfiguration = inject(PROVIDER_CONFIGURATION_KEY)
+const injectedSandboxRuntime = inject(SANDBOX_RUNTIME_KEY)
+if (!injectedSandboxRuntime) throw new Error('SandboxRuntime was not provided')
+const injectedAudioTranscription = inject(AUDIO_TRANSCRIPTION_KEY)
+if (!injectedAudioTranscription) throw new Error('AudioTranscription was not provided')
+if (!injectedProviderConfiguration) throw new Error('ProviderConfiguration was not provided')
+const injectedSetupWorkflow = inject(SETUP_WORKFLOW_KEY)
+if (!injectedSetupWorkflow) throw new Error('SetupWorkflow was not provided')
+const injectedArtifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
+if (!injectedArtifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
+const artifactWorkbench = injectedArtifactWorkbench
+if (!injectedArtifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
 
 async function resolveCreatedSessionAvailability(sessionKey: string): Promise<boolean> {
   try {
@@ -1246,7 +1264,7 @@ function artifactPreviewItemForExplicitOpen(
 const artifactPromptAnnotationsStore = useArtifactPromptAnnotationsStore()
 const workbenchDocumentContextStore = useWorkbenchDocumentContextStore()
 const workbenchResourcesStore = useWorkbenchResourcesStore()
-const artifactPromptAnnotationProvider = createRpcArtifactPromptAnnotationProvider(rpc)
+const artifactPromptAnnotationProvider = artifactWorkbench.promptAnnotations
 artifactPromptAnnotationsStore.setProvider(artifactPromptAnnotationProvider)
 const artifactImageLightbox = useArtifactImageLightbox()
 const platform = usePlatform()
@@ -1356,12 +1374,11 @@ const workbenchResourcesEnabled = computed(() => (
 const attachmentWorkbenchPreviewEnabled = computed(() => (
   workbenchEnabled.value
   && workbenchResourcesEnabled.value
-  && rpc.supportsMethod('workbench.resources.list')
-  && rpc.supportsMethod('workbench.resources.get')
+  && artifactWorkbench.resources.available()
 ))
 const attachmentWorkbenchEditEnabled = computed(() => (
   attachmentWorkbenchPreviewEnabled.value
-  && rpc.supportsMethod('documents.import')
+  && artifactWorkbench.resources.canImportDocuments()
 ))
 const activePromptAnnotations = computed(() =>
   promptAnnotationsEnabled.value
@@ -1449,8 +1466,7 @@ async function reusePromptAnnotation(annotation: PromptAnnotationSnapshot) {
 const promptCacheKeepaliveOpen = ref(false)
 const promptCacheKeepaliveStatus = ref<PromptCacheKeepaliveStatus | null>(null)
 const promptCacheKeepaliveAvailable = computed(() => (
-  rpc.supportsMethod('sessions.promptCacheKeepalive.status')
-  && rpc.supportsMethod('sessions.promptCacheKeepalive.set')
+  sessionConversation.supports('prompt-cache-keepalive')
 ))
 const workbenchEnabled = computed(() => appStore.features.artifactWorkbench === true)
 const promptAnnotationDesktopAvailable = computed(() => (
@@ -1571,6 +1587,7 @@ const copySupported = shareCopyImageSupported()
 
 const chatElevatedMode = useChatElevatedMode({
   sessionKey,
+  approvalCenter,
 })
 // Persist the composer draft per session so a refresh / session switch / crash
 // before the backend accepts a send cannot silently lose typed text (issue 248).
@@ -1589,9 +1606,7 @@ const {
   setGlobalRunMode,
   applyRunModePreferenceChanged,
 } = useChatRunModePreference({
-  rpc,
-  hydrateCallOptions: optionalSessionRpcCallOptions,
-  writeCallOptions: runModeWriteRpcCallOptions,
+  sandbox: injectedSandboxRuntime,
   runModePolicy: () => {
     const auth = rpc.auth as RpcAuthPayload | null
     return auth?.runModePolicy
@@ -1613,11 +1628,7 @@ const requestedRunMode = computed<SandboxRunMode>(
 )
 
 const sandboxSetupRecovery = useSandboxSetupRecovery({
-  rpc: {
-    call: (method, params) =>
-      rpc.call(method, params, sandboxSetupRpcCallOptions),
-    waitForConnection: () => rpc.waitForConnection(10_000),
-  },
+  sandbox: injectedSandboxRuntime,
   connectionState: computed(() => rpc.state),
   runMode: requestedRunMode,
   autoRefresh: false,
@@ -1710,10 +1721,7 @@ async function refreshPromptCacheKeepaliveStatus() {
     || !promptCacheKeepaliveSessionReady.value
   ) return
   try {
-    const next = await rpc.call<PromptCacheKeepaliveStatus>(
-      'sessions.promptCacheKeepalive.status',
-      { key },
-    )
+    const next = await sessionConversation.promptCacheStatus(key)
     if (sessionKey.value === key) promptCacheKeepaliveStatus.value = next
   } catch {
     // The settings dialog owns actionable RPC errors. Menu refresh is best effort.
@@ -1811,7 +1819,7 @@ watch(
   state => setStreamConnectionAvailable(state === 'connected'),
   { immediate: true },
 )
-const chatAttachments = useChatAttachments()
+const chatAttachments = useChatAttachments(artifactWorkbench.content)
 const {
   pendingAttachments,
   attachmentWorkBusy,
@@ -2071,6 +2079,7 @@ watch(compactStatus, (status) => {
 
 const chatUsageWidget = useChatUsageWidget({
   rpc,
+  sessionConversation,
   readCallOptions: optionalSessionRpcCallOptions,
   sessionKey,
   tokenVizEnabled: () => appStore.features.tokenViz,
@@ -2101,6 +2110,9 @@ const {
 
 const chatFeatureToggles = useChatFeatureToggles({
   rpc,
+  sessionConversation,
+  appSettings: injectedAppSettings,
+  modelRouting: injectedProviderConfiguration,
   readCallOptions: optionalSessionRpcCallOptions,
   setGlobalElevatedMode,
   loadCurrentSessionUsage,
@@ -2318,6 +2330,7 @@ const preserveHistoryLiveTail = computed(() =>
 
 const chatHistory = useChatHistory({
   rpc,
+  sessionConversation,
   sessionKey,
   messages,
   threadRef,
@@ -2480,7 +2493,7 @@ const steerDelivery = useChatSteerDelivery({
 // history. History and the in-flight ArtifactEvent stream remain live fallback
 // sources for mixed-version gateways and list-refresh races.
 const chatSessionArtifacts = useSessionArtifacts({
-  rpc,
+  catalog: artifactWorkbench.artifacts,
   sessionKey,
   messages,
   streamArtifacts,
@@ -2493,7 +2506,7 @@ const {
   cleanup: cleanupSessionArtifacts,
 } = chatSessionArtifacts
 
-const voiceInput = useVoiceInput()
+const voiceInput = useVoiceInput(injectedAudioTranscription)
 const {
   voiceBusy,
   voiceRecording,
@@ -2506,11 +2519,9 @@ const {
 // (including env-var keys the browser can't see), so audioConfigured is a true
 // "voice will work" signal — this keeps the button from being clicked into a
 // guaranteed failure. It's the same snapshot the empty-state chips read.
-const voiceCapability = useRpcCall<{ audioConfigured?: boolean }>(
-  'onboarding.status',
-  undefined,
-  { callOptions: optionalSessionRpcCallOptions },
-)
+const voiceCapability = useSetupStatus<{ audioConfigured?: boolean }>(injectedSetupWorkflow, {
+  allowed: optionalSessionRpcAllowed,
+})
 const voiceReady = computed(() => voiceCapability.data.value?.audioConfigured === true)
 
 const chatMessageActions = useChatMessageActions({
@@ -2555,6 +2566,7 @@ let applyPendingUserInputSnapshot: typeof chatPlans.applyBootstrap = () => {}
 let applyGoalSnapshot: (snapshot: SessionMessagesSubscribeResponse) => void = () => {}
 const chatSessionSubscription = useChatSessionSubscription({
   rpc,
+  sessionConversation,
   conversationSessionRuntime: conversationSessionRuntime,
   sessionKey,
   lastStreamSeq,
@@ -3176,6 +3188,7 @@ const goalOutcomeHasMessageAnchor = computed(() => (
 
 const chatSlashCommands = useChatSlashCommands({
   rpc,
+  sessionConversation,
   metaRunCenter,
   catalogCallOptions: optionalSessionRpcCallOptions,
   inputText,
@@ -3281,6 +3294,7 @@ resetComposerInputHistory = chatComposerShortcuts.resetInputHistory
 
 const chatSend = useChatSend({
   rpc,
+  metaRunCenter,
   turnCommands,
   activeSteerCapability,
   inputText,
@@ -3705,6 +3719,7 @@ async function steerPendingMessage(pendingUiId: string) {
 
 const chatApprovals = useChatApprovals({
   rpc,
+  sessionConversation,
   approvalCenter,
   sessionKey,
   runStatus,
@@ -3839,7 +3854,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   showCompactionToast,
   getCompactionPlacement: id => getCompactionPlacement(id) || undefined,
   showWarningToast: message => pushToast(message || t('chat.warning.default'), { tone: 'warn', duration: 5000 }),
-  supportsTurnCommitted: () => rpc.supportsEvent('session.event.turn_committed'),
+  supportsTurnCommitted: () => sessionConversation.supportsEvent('turn-committed'),
   scheduleHistorySync,
   schedulePendingDrainAfterTerminal,
   popAllPendingIntoComposer,
@@ -4863,10 +4878,8 @@ function subagentBody(text: string): string {
 /* ── Artifacts ─────────────────────────────────────────────────────── */
 
 async function downloadAttachment(attachment: DisplayAttachment): Promise<boolean> {
-  const result = await fetchDisplayAttachmentBlob(attachment, {
-    baseOrigin: window.location.origin,
+  const result = await artifactWorkbench.content.fetchAttachment(attachment, {
     sessionKey: sessionKey.value,
-    authToken: readAuthToken(),
   })
   if (!result.ok) {
     if (result.status > 0) {
@@ -5023,28 +5036,15 @@ async function downloadArtifact(artifact: ArtifactPayload) {
   // A published delivery is an immutable snapshot. Document-head downloads
   // are separate workbench actions and must not change what this chat card
   // resolves to after later edits.
-  const token = readAuthToken()
-  const url = artifactDownloadUrl(artifact, window.location.origin, {
-    sessionKey: sessionKey.value,
-    includeSessionKey: false,
-  })
-  if (!url) return
   try {
-    const headers: Record<string, string> = {}
-    const sameOrigin = new URL(url, window.location.origin).origin === window.location.origin
-    if (sameOrigin && sessionKey.value) headers['x-opensquilla-session-key'] = sessionKey.value
-    if (sameOrigin && token) headers.Authorization = `Bearer ${token}`
-    const response = await fetch(url, {
-      method: 'GET',
-      headers,
-      credentials: sameOrigin ? 'same-origin' : 'omit',
+    const result = await artifactWorkbench.content.fetchArtifact(artifact, {
+      sessionKey: sessionKey.value,
     })
-    if (!response.ok) {
-      pushToast(t('chat.toast.downloadFailedHttp', { status: response.status }), { tone: 'danger' })
+    if (!result.ok) {
+      pushToast(t('chat.toast.downloadFailedHttp', { status: result.status }), { tone: 'danger' })
       return
     }
-    const blob = await response.blob()
-    downloadBlob(blob, artifact.name || 'artifact')
+    downloadBlob(result.blob, artifact.name || 'artifact')
   } catch (err) {
     console.warn('Download failed:', err)
     pushToast(t('chat.toast.downloadFailed'), { tone: 'danger' })
@@ -5501,8 +5501,10 @@ async function forkConversation(throughTurnId?: string) {
     previewMessages: snapshotForkPreviewMessages(renderedMessages.value, normalizedTurnId),
   }
   try {
-    const request = forkRpcRequest(parentKey, normalizedTurnId)
-    const res = await rpc.call<ForkRpcResponse>(request.method, request.params)
+    const res = await sessionConversation.fork({
+      key: parentKey,
+      ...(normalizedTurnId ? { throughTurnId: normalizedTurnId } : {}),
+    }) as ForkRpcResponse
     if (!isForkTransitionActive(generation)) return
     const childKey = validatedForkChildKey(res, normalizedTurnId)
     if (sessionKey.value !== parentKey) {
@@ -5543,7 +5545,7 @@ async function resumeSandbox() {
   const key = sessionKey.value
   if (!key) return
   try {
-    await rpc.call('sandbox.resume', { sessionKey: key })
+    await injectedSandboxRuntime?.resume(key)
     messages.value.push({
       role: 'system',
       text: t('chat.sandboxResumed'),
@@ -6481,11 +6483,12 @@ async function syncDraftProjectFromRoute(generation: number): Promise<boolean> {
   const controller = draftProjectHydration.createController(generation)
   if (!controller) return false
   try {
-    await rpc.waitForConnection(
-      Math.max(1, deadlineAt - Date.now()),
-      controller.signal,
-      { timeoutAction: 'reject', abortAction: 'reject' },
-    )
+    await sessionConversation.ready({
+      timeoutMs: Math.max(1, deadlineAt - Date.now()),
+      signal: controller.signal,
+      timeoutAction: 'reject',
+      abortAction: 'reject',
+    })
     if (!draftProjectHydrationIsCurrent(generation, workspaceId)) return false
     await projectWorkspaces.loadWorkspaces({
       timeoutMs: Math.max(1, deadlineAt - Date.now()),
@@ -6618,10 +6621,9 @@ onMounted(async () => {
   // Load elevated mode
   loadElevatedMode()
 
-  unsubs.push(rpc.on(
-    'sandbox.run_mode.preference.changed',
+  unsubs.push(injectedSandboxRuntime?.subscribeRunModePreferenceChanged(
     payload => applyRunModePreferenceChanged(payload),
-  ))
+  ) ?? (() => undefined))
 
   // Register event handlers before sessions.messages.subscribe can replay
   // buffered events, then start the two critical phases before any optional

@@ -464,10 +464,9 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onActivated, onDeactivated, onUnmounted, ref, watch } from 'vue'
+import { computed, inject, nextTick, onActivated, onDeactivated, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
-import { useRpcStore } from '@/stores/rpc'
 import Icon from '@/components/Icon.vue'
 import ChannelStatusPill from '@/components/ChannelStatusPill.vue'
 import ChannelAlerts from '@/components/channels/ChannelAlerts.vue'
@@ -479,13 +478,12 @@ import ChannelTypeGallery from '@/components/channels/ChannelTypeGallery.vue'
 import ErrorState from '@/components/ErrorState.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import PendingRestartBanner from '@/components/PendingRestartBanner.vue'
-import { useRequest } from '@/composables/useRequest'
 import { usePendingRestart } from '@/composables/usePendingRestart'
 import { useToasts } from '@/composables/useToasts'
 import { useConfirm } from '@/composables/useConfirm'
 import { useChannelEditor, type ChannelEditorSpec } from '@/composables/channels/useChannelEditor'
 import { bootstrapAsAdminDefault, useChannelMembers, type ChannelPairing } from '@/composables/channels/useChannelMembers'
-import { approvePairingParams, errorMessage, withPendingKey } from '@/composables/channels/shared'
+import { errorMessage, withPendingKey } from '@/composables/channels/shared'
 import { useChannelCatalogI18n } from '@/composables/setup/useChannelCatalogI18n'
 import { orderChannelSpecs } from '@/composables/setup/channelPlatformOrder'
 import ChannelMembersPanel from '@/components/channels/ChannelMembersPanel.vue'
@@ -518,8 +516,14 @@ import {
   statusPresentation,
   type ChannelStatusKey,
 } from '@/lib/channelStatus'
+import { APP_SETTINGS_KEY } from '@/modules/appSettings'
+import { SETUP_WORKFLOW_KEY } from '@/modules/setupWorkflow'
+import {
+  CHANNEL_ADMINISTRATION_KEY,
+  type ChannelStatusSubscription,
+} from '@/modules/channelAdministration'
+import { CHANNEL_SETUP_KEY } from '@/modules/channelSetup'
 
-interface ChannelsStatusResponse { channels?: Channel[] }
 type DetailTab = 'overview' | 'pairings' | 'configuration' | 'diagnostics'
 type SectionId = 'pairings' | 'configuration' | 'diagnostics'
 
@@ -532,11 +536,21 @@ const SECTIONS: SectionId[] = ['pairings', 'configuration', 'diagnostics']
 // the inline platform gallery IS the page; ≥1 channel → the enroll strip closes
 // the fleet front page. No per-count add-card or header button.
 const { t, locale } = useI18n()
+const injectedAppSettings = inject(APP_SETTINGS_KEY)
+if (!injectedAppSettings) throw new Error('AppSettings was not provided')
+const appSettings = injectedAppSettings
+const setupWorkflow = inject(SETUP_WORKFLOW_KEY)
+if (!setupWorkflow) throw new Error('SetupWorkflow was not provided')
+const injectedChannelAdministration = inject(CHANNEL_ADMINISTRATION_KEY)
+if (!injectedChannelAdministration) throw new Error('ChannelAdministration was not provided')
+const channelAdministration = injectedChannelAdministration
+const injectedChannelSetup = inject(CHANNEL_SETUP_KEY)
+if (!injectedChannelSetup) throw new Error('ChannelSetup was not provided')
+const channelSetup = injectedChannelSetup
 const { localizeLabel } = useChannelCatalogI18n()
 function enrollLabel(spec: ChannelEditorSpec): string {
   return localizeLabel(spec.type, spec.label)
 }
-const rpc = useRpcStore()
 const router = useRouter()
 const route = useRoute()
 const { pushToast } = useToasts()
@@ -550,7 +564,7 @@ const probeResults = ref<Record<string, ProbeResult>>({})
 // In-place configuration editor: draft state is owned by the view (not the
 // section body), so scrolling to Members/Diagnostics keeps an unsaved draft
 // alive and the Configuration sidenav dot stays lit.
-const editor = useChannelEditor()
+const editor = useChannelEditor(setupWorkflow, channelAdministration, channelSetup)
 const editMode = ref(false)
 const editorSaving = ref(false)
 /** Discard-guard verdict: true = discard the draft and proceed, false = the
@@ -562,28 +576,41 @@ type DiscardVerdict = boolean | 'superseded'
 const discardRequest = ref<{ resolve: (verdict: DiscardVerdict) => void } | null>(null)
 // Compose takeover: a SECOND editor instance so an add-channel draft can
 // never cross-contaminate the selected channel's edit draft.
-const composeEditor = useChannelEditor()
+const composeEditor = useChannelEditor(setupWorkflow, channelAdministration, channelSetup)
 const composeMode = ref(false)
 const composeType = ref('')
 const composeSaving = ref(false)
 const composeDiscardRequest = ref<{ resolve: (verdict: DiscardVerdict) => void } | null>(null)
 // Members (pairings + channel admins) for the drilled-in channel — state owned
 // here so it survives section scrolling; ChannelMembersPanel renders it.
-const members = useChannelMembers()
+const members = useChannelMembers(appSettings, channelAdministration)
+const channelsData = ref<readonly Channel[] | null>(null)
+const loading = ref(false)
+const error = ref<string | null>(null)
 
-const { data: channelsData, loading, error, execute, refresh } = useRequest<ChannelsStatusResponse>(
-  'channels.status', undefined, { immediate: false, errorLabel: t('console.channels.loadFailed') },
-)
+async function refresh(): Promise<void> {
+  loading.value = true
+  error.value = null
+  try {
+    channelsData.value = await channelAdministration.status()
+  } catch (err) {
+    error.value = t('console.channels.loadFailed', { error: errorMessage(err) })
+  } finally {
+    loading.value = false
+  }
+}
+
+const execute = refresh
 
 const channels = computed<Channel[]>(() => {
-  const raw = (channelsData.value?.channels || []).filter(ch => ch && ch.configured !== false)
+  const raw = (channelsData.value || []).filter(ch => ch && ch.configured !== false)
   return [...raw].sort(
     (a, b) => STATUS_SEVERITY[presentationFor(a).key] - STATUS_SEVERITY[presentationFor(b).key],
   )
 })
 // Channels running in this gateway process but absent from config.
 const unconfiguredChannels = computed<Channel[]>(() =>
-  (channelsData.value?.channels || []).filter(ch => ch && ch.configured === false))
+  (channelsData.value || []).filter(ch => ch && ch.configured === false))
 const selectedChannel = computed(() => channels.value.find(ch => channelKey(ch) === selectedName.value) || null)
 const selectedProbe = computed(() =>
   selectedChannel.value ? probeResults.value[channelKey(selectedChannel.value)] : undefined)
@@ -655,7 +682,7 @@ watch(addTier, () => { void composeEditor.loadCatalog() }, { immediate: true })
 
 const loadData = refresh
 let pollTimer: ReturnType<typeof setInterval> | null = null
-let unsubs: Array<() => void> = []
+let statusSubscriptions: ChannelStatusSubscription[] = []
 let activatedOnce = false
 const refreshing = ref(false)
 const lastUpdatedAt = ref<number | null>(null)
@@ -675,8 +702,8 @@ async function manualRefresh(): Promise<void> {
 }
 
 function teardownLive() {
-  unsubs.forEach(unsub => unsub())
-  unsubs = []
+  statusSubscriptions.forEach(subscription => subscription.close())
+  statusSubscriptions = []
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
   document.removeEventListener('keydown', onDocumentKeydown)
   detachScrollSpy()
@@ -718,7 +745,7 @@ onActivated(() => {
   // a newer field-spec snapshot lands.
   void editor.refreshCatalog()
   void loadHomeFacts()
-  unsubs = [rpc.on('channel.status', () => { void refresh() })]
+  statusSubscriptions = [channelAdministration.subscribeStatus(() => { void refresh() })]
   pollTimer = setInterval(() => {
     void refresh().then(() => { if (!error.value) lastUpdatedAt.value = Date.now() })
   }, 30000)
@@ -803,7 +830,7 @@ function statusText(ch: Channel): string {
 // Clear pending-restart entries the moment a status snapshot proves the
 // restart happened. Reconcile against RAW rows (incl. configured:false).
 watch(channelsData, data => {
-  pendingRestart.reconcile(data?.channels || [])
+  pendingRestart.reconcile([...(data || [])])
   // The 30s poll (and channel.status events) must surface new pairing
   // requests: refetch facts for exactly the channels whose freshly reported
   // pending count no longer matches the cached facts (or whose facts fetch
@@ -851,18 +878,18 @@ async function loadHomeFacts(only?: string[]): Promise<void> {
   if (names.length === 0) return
   const id = ++homeFactsRequest
   try {
-    await rpc.waitForConnection()
+    await channelAdministration.ready()
     // {} = known-empty (no admins configured anywhere); null = unknown (the
     // read failed) — the two must not be conflated, or a transient failure
     // would zero the admin count and re-arm the first-pairing bootstrap.
-    const adminsPromise: Promise<Record<string, unknown> | null> = rpc
-      .call<Record<string, unknown> | null>('config.get', { path: 'channel_admin_senders' })
+    const adminsPromise: Promise<Record<string, unknown> | null> = appSettings
+      .read('channel_admin_senders')
       .then(map => record(map))
       .catch(() => null)
     const pairingsByName = await Promise.all(names.map(async name => {
       try {
-        const res = await rpc.call<{ pairings?: ChannelPairing[] }>('channels.pairings', { channelName: name })
-        return [name, (res?.pairings || []).filter(pairing => pairing.channelName === name)] as const
+        const rows = await channelAdministration.listPairings(name)
+        return [name, [...rows]] as const
       } catch {
         return [name, null] as const
       }
@@ -963,8 +990,11 @@ async function approvePairing(name: string, pairing: ChannelPairing | null, asAd
   const sender = pairing.senderName || pairing.senderId
   await withPendingKey(pendingActions, `${name}:pairing`, async () => {
     try {
-      const res = await rpc.call<{ adminGranted?: boolean; warnings?: string[] }>(
-        'channels.pairing.approve', approvePairingParams(name, pairing.pairingId, asAdmin))
+      const res = await channelAdministration.approvePairing(
+        name,
+        pairing.pairingId,
+        asAdmin,
+      )
       // The backend commits the approval even when the admin grant fails
       // (adminGranted:false + warnings) — surface that instead of falsely
       // toasting an admin success.
@@ -989,7 +1019,7 @@ async function rejectPairing(name: string, pairing: ChannelPairing | null): Prom
   const sender = pairing.senderName || pairing.senderId
   await withPendingKey(pendingActions, `${name}:pairing`, async () => {
     try {
-      await rpc.call('channels.pairing.revoke', { channelName: name, pairingId: pairing.pairingId })
+      await channelAdministration.revokePairing(name, pairing.pairingId)
       pushToast(t('console.channels.home.rejectSuccess', { sender }), { tone: 'ok' })
     } catch (err) {
       pushToast(t('console.channels.home.rejectFailed', { sender, error: errorMessage(err) }), { tone: 'danger' })
@@ -1181,7 +1211,7 @@ async function requestExitCompose(): Promise<void> {
  *  suggestion — undefined while channels.status has not answered yet, so the
  *  editor skips seeding rather than suggesting against a blind list. */
 function existingChannelNames(): string[] | undefined {
-  const rows = channelsData.value?.channels
+  const rows = channelsData.value
   if (!rows) return undefined
   return rows.filter(Boolean).map(ch => channelKey(ch))
 }
@@ -1451,9 +1481,9 @@ async function removeChannel(ch: Channel): Promise<void> {
   if (!ok) return
   await withAction(ch, 'remove', async () => {
     try {
-      const res = await rpc.call<{ changed?: boolean; restartRequired?: boolean }>('onboarding.channel.remove', { name })
-      if (res?.changed !== false && res?.restartRequired !== false) pendingRestart.record(name, 'remove')
-      pushToast(t(res?.restartRequired === false ? 'setup.toast.channelRemovedLive' : 'setup.toast.channelRemoved'), { tone: 'ok' })
+      const outcome = await channelSetup.remove(name)
+      if (outcome.changed && outcome.restartRequired) pendingRestart.record(name, 'remove')
+      pushToast(t(outcome.restartRequired ? 'setup.toast.channelRemoved' : 'setup.toast.channelRemovedLive'), { tone: 'ok' })
       // The entry is gone; any in-flight draft is moot — close without guard.
       forceCloseDetail()
       await refresh()
@@ -1684,7 +1714,7 @@ function actionPending(ch: Channel, action: string): boolean { return pendingAct
 async function probeChannel(ch: Channel): Promise<void> {
   await withAction(ch, 'probe', async () => {
     try {
-      const result = await rpc.call<ProbeResult>('channels.probe', { name: channelKey(ch) })
+      const result = await channelAdministration.probe(channelKey(ch))
       probeResults.value = { ...probeResults.value, [channelKey(ch)]: result }
       if (result.status === 'verified') {
         pushToast(t('console.channels.toastProbePassed', { name: channelKey(ch), ms: result.latencyMs ?? 0 }), { tone: 'ok' })
@@ -1714,7 +1744,7 @@ function probeTitle(probe: ProbeResult): string {
 async function restartChannel(ch: Channel): Promise<void> {
   await withAction(ch, 'restart', async () => {
     try {
-      await rpc.call('channels.restart', { name: channelKey(ch) })
+      await channelAdministration.restart(channelKey(ch))
       pushToast(t('console.channels.toastRestarted', { name: channelKey(ch) }), { tone: 'ok' })
       await refresh()
     } catch (err) {
@@ -1727,9 +1757,9 @@ async function toggleChannel(ch: Channel): Promise<void> {
   await withAction(ch, 'toggle', async () => {
     const enabling = ch.enabled === false
     try {
-      const res = await rpc.call<{ changed?: boolean; restartRequired?: boolean; liveApply?: Record<string, string> | null }>(`onboarding.channel.${enabling ? 'enable' : 'disable'}`, { name: channelKey(ch) })
-      if (res?.changed !== false && res?.restartRequired !== false) pendingRestart.record(channelKey(ch), enabling ? 'enable' : 'disable')
-      if (enabling && res?.liveApply?.[channelKey(ch)] === 'failed') {
+      const outcome = await channelSetup.setEnabled(channelKey(ch), enabling)
+      if (outcome.changed && outcome.restartRequired) pendingRestart.record(channelKey(ch), enabling ? 'enable' : 'disable')
+      if (enabling && outcome.liveApplyFailed) {
         pushToast(t('setup.toast.channelStartFailed'), { tone: 'danger' })
       } else {
         pushToast(t(enabling ? 'console.channels.toastEnabled' : 'console.channels.toastDisabled', { name: channelKey(ch) }), { tone: 'ok' })

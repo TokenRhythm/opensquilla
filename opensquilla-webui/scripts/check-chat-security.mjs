@@ -51,13 +51,13 @@ assertPresent(
 )
 
 assertPresent(
-  'src/utils/chat/attachmentAccess.ts',
+  'src/adapters/gateway/attachmentAccessV4.ts',
   /url\.protocol !== 'http:'[\s\S]+url\.protocol !== 'https:'[\s\S]+url\.origin !== base\.origin/,
   'attachment downloads must reject non-HTTP(S) and cross-origin staged URLs.',
 )
 
 assertPresent(
-  'src/utils/chat/attachmentAccess.ts',
+  'src/adapters/gateway/attachmentAccessV4.ts',
   /CREDENTIAL_QUERY_KEYS[\s\S]+url\.searchParams\.delete\(key\)/,
   'attachment downloads must strip token and session query credentials.',
 )

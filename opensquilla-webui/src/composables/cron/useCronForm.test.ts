@@ -5,6 +5,7 @@ import { effectScope } from 'vue'
 
 import { useCronForm } from './useCronForm'
 import { DEFAULT_CRON_EXPRESSION } from '@/utils/cron/schedule'
+import type { CronScheduler } from '@/modules/cronScheduler'
 
 const rpcCall = vi.fn()
 const toasts: { message: string; tone?: string }[] = []
@@ -13,9 +14,10 @@ vi.mock('vue-router', () => ({
   useRoute: () => ({ query: {} }),
 }))
 
-vi.mock('@/stores/rpc', () => ({
-  useRpcStore: () => ({ call: rpcCall }),
-}))
+const scheduler = {
+  saveJob: (input: Record<string, unknown>, options: { existing: boolean }) =>
+    rpcCall(options.existing ? 'cron.update' : 'cron.create', input),
+} as CronScheduler
 
 vi.mock('@/composables/useToasts', () => ({
   useToasts: () => ({
@@ -35,7 +37,7 @@ vi.mock('@/composables/useProjectWorkspaces', () => ({
 
 function mountForm() {
   const scope = effectScope()
-  const api = scope.run(() => useCronForm({ afterSaved: vi.fn() }))!
+  const api = scope.run(() => useCronForm(scheduler, { afterSaved: vi.fn() }))!
   return { api, dispose: () => scope.stop() }
 }
 

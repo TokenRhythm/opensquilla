@@ -28,6 +28,7 @@ describe('workbench resources store', () => {
   it('loads read-only projections without manufacturing fallback resources', async () => {
     const provider: WorkbenchResourceProvider = {
       available: () => true,
+      canImportDocuments: () => true,
       list: vi.fn(async () => ({ resources: [attachment], totalCount: 1 })),
       get: vi.fn(),
       importDocument: vi.fn(),
@@ -50,6 +51,7 @@ describe('workbench resources store', () => {
     }
     const provider: WorkbenchResourceProvider = {
       available: () => true,
+      canImportDocuments: () => true,
       list: vi.fn(async () => ({ resources: [attachment], totalCount: 1 })),
       get: vi.fn(async () => resolved),
       importDocument: vi.fn(),
@@ -124,6 +126,7 @@ describe('workbench resources store', () => {
     }
     const provider: WorkbenchResourceProvider = {
       available: () => true,
+      canImportDocuments: () => true,
       list: vi.fn(async () => ({
         resources: [bound, document, sameHashUnbound],
         totalCount: 3,

@@ -81,6 +81,9 @@ async function mountOverview(options: MountOptions = {}) {
     params?: unknown,
     callOptions?: { signal?: AbortSignal },
   ) => {
+    if (method === 'status') {
+      return { ready: true, version: 'test' }
+    }
     if (method === 'doctor.status') {
       if (options.report === null) throw new Error('doctor unavailable')
       if (options.doctorHandler) {
@@ -125,22 +128,6 @@ async function mountOverview(options: MountOptions = {}) {
       markMethodUnavailable: vi.fn(),
     }),
   }))
-  const useRequestMethods: string[] = []
-  vi.doMock('@/composables/useRequest', async () => {
-    const { ref } = await import('vue')
-    return {
-      useRequest: (method: string) => {
-        useRequestMethods.push(method)
-        return {
-          data: ref(null),
-          error: ref(null),
-          loading: ref(false),
-          execute: vi.fn(async () => null),
-          refresh: vi.fn(async () => null),
-        }
-      },
-    }
-  })
   vi.doMock('@/composables/useToasts', () => ({ useToasts: () => ({ pushToast }) }))
   vi.doMock('@/utils/browser', () => ({ copyTextWithFallback: copyText }))
   vi.doMock('@/components/Icon.vue', () => ({
@@ -160,6 +147,10 @@ async function mountOverview(options: MountOptions = {}) {
   const { createV4SessionDirectory } = await import('@/adapters/gateway/sessionDirectoryV4')
   type SessionDirectoryTransport = Parameters<typeof createV4SessionDirectory>[0]
   const { SESSION_DIRECTORY_KEY } = await import('@/modules/sessionDirectory')
+  const { PROVIDER_CONFIGURATION_KEY } = await import('@/modules/providerConfiguration')
+  const { OBSERVABILITY_KEY } = await import('@/modules/observability')
+  const { CHANNEL_ADMINISTRATION_KEY } = await import('@/modules/channelAdministration')
+  const { createV4Observability } = await import('@/adapters/gateway/observabilityV4')
   const active = ref(true)
   const TestHost = defineComponent({
     name: 'OverviewTestHost',
@@ -182,6 +173,51 @@ async function mountOverview(options: MountOptions = {}) {
     request: rpcCall,
     ready: vi.fn(async () => {}),
   } as unknown as SessionDirectoryTransport))
+  app.provide(PROVIDER_CONFIGURATION_KEY, {
+    status: vi.fn(async () => {
+      const rawResponse = await rpcCall('providers.status', {}) as unknown
+      const raw = rawResponse && typeof rawResponse === 'object'
+        ? rawResponse as { providers?: unknown[] }
+        : { providers: [] }
+      const providers = Array.isArray(raw.providers)
+        ? raw.providers
+          .filter((row): row is Record<string, unknown> => Boolean(row && typeof row === 'object'))
+          .map(row => ({
+            providerId: String(row.providerId ?? ''),
+            active: row.active === true,
+            configured: row.configured === true,
+            buildable: row.buildable !== false,
+            model: typeof row.model === 'string' ? row.model : null,
+            requiresApiKey: row.requiresApiKey === true,
+            apiKeyEnv: typeof row.apiKeyEnv === 'string' ? row.apiKeyEnv : null,
+            apiKeyConfigured: row.apiKeyConfigured === true,
+            apiKeyShape: typeof row.apiKeyShape === 'string' ? row.apiKeyShape : null,
+            baseUrlConfigured: row.baseUrlConfigured === true,
+            error: typeof row.error === 'string' ? row.error : null,
+            modelProbe: typeof row.modelProbe === 'string' ? row.modelProbe : null,
+            latency: row.latency && typeof row.latency === 'object' ? row.latency as Record<string, unknown> : null,
+          }))
+        : []
+      return {
+        activeProvider: providers.find(row => row.active)?.providerId || null,
+        providerResolution: {},
+        providers,
+        count: providers.length,
+      }
+    }),
+  } as unknown as import('@/modules/providerConfiguration').ProviderConfiguration)
+  app.provide(OBSERVABILITY_KEY, createV4Observability({
+    request: rpcCall,
+    ready: vi.fn(async () => {}),
+    supports: vi.fn(() => true),
+    markUnsupported: vi.fn(),
+  }, {
+    requestJson: vi.fn(),
+    requestBinary: vi.fn(),
+  }))
+  app.provide(CHANNEL_ADMINISTRATION_KEY, {
+    status: vi.fn(async () => []),
+  } as unknown as import('@/modules/channelAdministration').ChannelAdministration)
   app.mount(el)
   mountedApps.push({ app, el })
 
@@ -211,7 +247,6 @@ async function mountOverview(options: MountOptions = {}) {
     copyText,
     rpcCall,
     rpcOn,
-    useRequestMethods,
     flush,
     setActive,
     unmount,
@@ -232,7 +267,6 @@ afterEach(() => {
   }
   vi.doUnmock('vue-router')
   vi.doUnmock('@/stores/rpc')
-  vi.doUnmock('@/composables/useRequest')
   vi.doUnmock('@/composables/useToasts')
   vi.doUnmock('@/utils/browser')
   vi.doUnmock('@/components/Icon.vue')
@@ -248,13 +282,13 @@ const DIAGNOSE_SELECTOR = '[title="Diagnose with agent"]'
 
 describe('OverviewView status lifecycle', () => {
   it('drops the old activity panels and their data sources', async () => {
-    const { el, rpcCall, rpcOn, useRequestMethods } = await mountOverview()
+    const { el, rpcCall, rpcOn } = await mountOverview()
 
     expect(el.querySelector('.ov-grid')).toBeNull()
     expect(el.querySelector('.ov-recent')).toBeNull()
     expect(el.querySelector('.conn-pill')).toBeNull()
     expect(el.querySelector('.ov-event-log')).toBeNull()
-    expect(useRequestMethods).toEqual(['status'])
+    expect(rpcCall).toHaveBeenCalledWith('status', {}, expect.any(Object))
     // The Total sessions KPI reads sessions.list (same source as the Sessions
     // page) so sessions without usage records still count.
     const sessionsListCalls = rpcCall.mock.calls.filter(
@@ -297,7 +331,7 @@ describe('OverviewView status lifecycle', () => {
   })
 
   it('lets an authoritative stored-session count decrease after deletion', async () => {
-    const { el, flush } = await mountOverview({
+    const { el, flush, rpcCall } = await mountOverview({
       sessionsListHandler: (callIndex) => ({
         sessions: [{ key: 'agent:main:webchat:remaining', title: 'Remaining' }],
         count: callIndex === 0 ? 200 : 1,
@@ -309,6 +343,9 @@ describe('OverviewView status lifecycle', () => {
     expect(card?.querySelector('.control-stat__value')?.textContent).toBe('201')
 
     el.querySelector<HTMLButtonElement>('.ov-status-actions .btn--ghost')!.click()
+    await vi.waitFor(() => {
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'sessions.list')).toHaveLength(2)
+    })
     await flush()
 
     expect(card?.querySelector('.control-stat__value')?.textContent).toBe('1')

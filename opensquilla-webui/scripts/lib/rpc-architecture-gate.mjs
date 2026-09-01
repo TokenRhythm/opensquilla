@@ -37,6 +37,7 @@ const normalized = path => path.replace(/\\/g, '/')
 const isTestFile = rel => /\.(test|spec)\.(?:[cm]?[jt]sx?)$/.test(rel)
 const isGatewayAdapter = rel => rel.startsWith('src/adapters/gateway/')
 const isGeneratedContract = rel => rel.startsWith('src/contracts/generated/')
+const isStaticAssetTransportImplementation = rel => rel === 'src/platform/staticAssets.ts'
 const isRpcTransportImplementation = rel => (
   rel === 'src/stores/rpc.ts'
   || rel === 'src/lib/rpc.ts'
@@ -44,6 +45,9 @@ const isRpcTransportImplementation = rel => (
   // This adapter is the private wildcard listener for the v4 event stream;
   // exposing its raw `on` calls to a composable would defeat the seam.
   || rel === 'src/adapters/gateway/conversationEventTransport.ts'
+  // Compatibility bridge used by legacy/test embeddings; production callers
+  // receive the typed SessionConversation from the composition root.
+  || rel === 'src/adapters/gateway/sessionConversationV4.ts'
 )
 
 function scriptBody(rel, body) {
@@ -231,7 +235,11 @@ export function evaluateRpcArchitectureGate({
     sources: productionSources,
     analysis: sourceAnalysis,
   })) {
-    if (isGatewayAdapter(operation.rel) || isRpcTransportImplementation(operation.rel)) continue
+    if (
+      isGatewayAdapter(operation.rel)
+      || isRpcTransportImplementation(operation.rel)
+      || isStaticAssetTransportImplementation(operation.rel)
+    ) continue
     increment(actualByKind.get(operation.kind), operation.rel)
   }
 

@@ -21,10 +21,11 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, inject } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { useRpcCall } from '@/composables/useRpc'
-import { optionalSessionRpcCallOptions } from '@/composables/chat/sessionBootstrapAdmission'
+import { useSetupStatus } from '@/composables/setup/useSetupStatus'
+import { optionalSessionRpcAllowed } from '@/composables/chat/sessionBootstrapAdmission'
+import { SETUP_WORKFLOW_KEY } from '@/modules/setupWorkflow'
 
 const { t } = useI18n()
 
@@ -65,11 +66,11 @@ const FALLBACK_CHIPS = computed(() => [
   ordinaryChip(t('chat.chips.planWeek')),
 ])
 
-const capabilityStatus = useRpcCall<CapabilityStatus>(
-  'onboarding.status',
-  undefined,
-  { callOptions: optionalSessionRpcCallOptions },
-)
+const setupWorkflow = inject(SETUP_WORKFLOW_KEY)
+if (!setupWorkflow) throw new Error('SetupWorkflow was not provided')
+const capabilityStatus = useSetupStatus<CapabilityStatus>(setupWorkflow, {
+  allowed: optionalSessionRpcAllowed,
+})
 
 const greeting = computed(() => {
   const hour = new Date().getHours()

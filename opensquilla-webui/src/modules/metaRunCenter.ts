@@ -17,6 +17,9 @@ export interface MetaDraftListResult {
   readonly durable: boolean
 }
 
+/** Legacy name kept as a domain alias while older composables migrate. */
+export type MetaLaunchDraftPayload = MetaDraft
+
 export interface MetaDraftQuery {
   readonly sessionKey?: string
   readonly agentId?: string
@@ -79,6 +82,97 @@ export interface MetaReplay {
 }
 
 export type MetaEventKind = 'preflight' | 'run-announced' | 'step-state' | 'run-completed'
+
+/** Domain projections consumed by the Meta UI; wire snake_case aliases stay in the Adapter. */
+export interface MetaPreflightFieldSpec {
+  name?: string
+  label?: string
+  title?: string
+  type?: string
+  kind?: string
+  multiline?: boolean
+  required?: boolean
+  default?: unknown
+  description?: string
+  help?: string
+  hint?: string
+  options?: unknown[]
+  choices?: unknown[]
+}
+
+export interface MetaPreflightPayload extends MetaSessionEventPayload {
+  run_id?: string
+  meta_skill_name?: string
+  language?: string
+  interpreted_request?: string
+  missing_fields?: string[]
+  assumptions?: string[]
+  request_template?: {
+    language?: string
+    outcome?: string
+    deliverable?: string
+    fields?: MetaPreflightFieldSpec[]
+  }
+  can_skip?: boolean
+  requires_confirmation?: boolean
+}
+
+export interface MetaRunStepSpec {
+  id?: string
+  label?: string
+  kind?: string
+  depends_on?: string[]
+}
+
+export interface MetaRunAnnouncedPayload extends MetaSessionEventPayload {
+  run_id?: string
+  meta_skill_name?: string
+  language?: string
+  user_language?: string
+  meta_language?: string
+  steps?: MetaRunStepSpec[]
+  total?: number
+}
+
+export interface MetaStepRescueAction {
+  id?: string
+  label?: string
+}
+
+export interface MetaStepRescue {
+  actions?: MetaStepRescueAction[]
+}
+
+export interface MetaStepStatePayload extends MetaSessionEventPayload {
+  run_id?: string
+  step_id?: string
+  state?: string
+  status_text?: string | null
+  error?: string
+  substitute_for?: string | null
+  rescue?: MetaStepRescue
+}
+
+export interface MetaRunCompletedPayload extends MetaSessionEventPayload {
+  run_id?: string
+  outcome?: string
+  completed_steps?: string[]
+  failed_steps?: string[]
+  recovered_steps?: string[]
+  skipped_steps?: string[]
+}
+
+export interface MetaSessionEventPayload {
+  key?: string
+  session_key?: string
+  sessionKey?: string
+  epoch?: number
+  stream_seq?: number
+  streamSeq?: number
+  stream_generation?: string
+  streamGeneration?: string
+  [key: string]: unknown
+}
 
 /** Canonical event projection; session and sequence fencing stays in the adapter. */
 export interface MetaEvent {

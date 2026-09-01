@@ -10,11 +10,13 @@ import stat
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from opensquilla.agents.scope import resolve_agent_workspace_dir
+from opensquilla.application.sandbox_runtime import SandboxRuntime
 from opensquilla.gateway.project_workspace_runtime import (
     authoritative_project_run_context,
     map_project_workspace_error,
@@ -688,15 +690,84 @@ def _explain_messages(status: dict[str, Any]) -> list[dict[str, str]]:
     ]
 
 
+def _sandbox_application(ctx: RpcContext) -> SandboxRuntime:
+    """Compose the transport-neutral SandboxRuntime Module for this request."""
+    from opensquilla.gateway.adapters.sandbox_runtime import RpcContextSandboxRuntimePort
+
+    async def status(c: RpcContext) -> Mapping[str, Any]:
+        return status_payload(c.config)
+
+    async def setup_status(c: RpcContext) -> Mapping[str, Any]:
+        return (await current_sandbox_setup_runtime_status(c.config)).to_payload()
+
+    async def ensure_setup(c: RpcContext) -> Mapping[str, Any]:
+        return (await ensure_sandbox_setup_auto(c.config)).to_payload()
+
+    async def capability(c: RpcContext, refresh: bool) -> Mapping[str, Any]:
+        report = await current_sandbox_capability_report(c.config, force_refresh=refresh)
+        return report.to_payload()
+
+    async def policy(c: RpcContext) -> Mapping[str, Any]:
+        return _sandbox_policy_store(c).read().to_public_dict()
+
+    async def policy_defaults(c: RpcContext) -> Mapping[str, Any]:
+        # Legacy defaults remain implemented by the existing handler; this
+        # Port is deliberately narrow and does not hash runtime payloads.
+        return {"builtinDenyWritePaths": [str(path) for path in builtin_deny_write_paths()]}
+
+    async def policy_update(
+        c: RpcContext,
+        base: int,
+        value: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        try:
+            return _sandbox_policy_store(c).compare_and_swap(base, dict(value)).to_public_dict()
+        except PolicyVersionConflict as exc:
+            raise RpcHandlerError(
+                "POLICY_VERSION_CONFLICT",
+                "The sandbox policy changed in another client.",
+                details={"currentPolicy": exc.current_policy.to_public_dict()},
+            ) from exc
+
+    async def run_mode(c: RpcContext) -> Mapping[str, Any]:
+        mode, source = await resolve_default_run_mode(c.session_manager, c.config)
+        mode = coerce_run_mode_for_principal(mode, c.principal)
+        return {"runMode": mode.value, "source": source}
+
+    async def run_mode_write(c: RpcContext, mode: str) -> Mapping[str, Any]:
+        await _require_sandbox_setup_ready_for_mode(c, mode)
+        storage = _runtime_preference_storage(c)
+        confirmed = await storage.set_runtime_preference(RUN_MODE_PREFERENCE_KEY, mode)
+        payload = {"runMode": confirmed, "source": "preference"}
+        await _run_mode_preference_registry().broadcast(_RUN_MODE_PREFERENCE_CHANGED_EVENT, payload)
+        return payload
+
+    async def runtime_status(c: RpcContext) -> Mapping[str, Any]:
+        return await _runtime_status_payload(c)
+
+    return SandboxRuntime(RpcContextSandboxRuntimePort(
+        ctx,
+        status=status,
+        setup_status=setup_status,
+        ensure_setup=ensure_setup,
+        capability=capability,
+        policy=policy,
+        policy_defaults=policy_defaults,
+        policy_update=policy_update,
+        run_mode=run_mode,
+        run_mode_write=run_mode_write,
+        runtime_status=runtime_status,
+    ))
+
+
 @_d.method("sandbox.status", scope="operator.read")
 async def _handle_sandbox_status(params: dict | None, ctx: RpcContext) -> dict:
-    return status_payload(ctx.config)
+    return await _sandbox_application(ctx).status()
 
 
 @_d.method("sandbox.setup.status", scope="operator.read")
 async def _handle_sandbox_setup_status(params: dict | None, ctx: RpcContext) -> dict:
-    result = await current_sandbox_setup_runtime_status(ctx.config)
-    return result.to_payload()
+    return await _sandbox_application(ctx).setup_status()
 
 
 @_d.method("sandbox.capability.status", scope="operator.read")
@@ -706,18 +777,14 @@ async def _handle_sandbox_capability_status(params: dict | None, ctx: RpcContext
     refresh = (params or {}).get("refresh", False)
     if not isinstance(refresh, bool):
         raise ValueError("params.refresh must be a boolean")
-    report = await current_sandbox_capability_report(
-        ctx.config,
-        force_refresh=refresh,
-    )
-    return report.to_payload()
+    return await _sandbox_application(ctx).capability(refresh=refresh)
 
 
 @_d.method("sandbox.policy.get", scope="operator.read")
 async def _handle_sandbox_policy_get(params: dict | None, ctx: RpcContext) -> dict:
     if params is not None and not isinstance(params, dict):
         raise ValueError("params must be an object")
-    return _sandbox_policy_store(ctx).read().to_public_dict()
+    return await _sandbox_application(ctx).policy()
 
 
 @_d.method("sandbox.policy.defaults", scope="operator.read")
@@ -823,7 +890,7 @@ async def _runtime_status_payload(ctx: RpcContext) -> dict[str, object]:
 async def _handle_sandbox_runtime_status(params: dict | None, ctx: RpcContext) -> dict:
     if params is not None and not isinstance(params, dict):
         raise ValueError("params must be an object")
-    return await _runtime_status_payload(ctx)
+    return await _sandbox_application(ctx).runtime_status()
 
 
 @_d.method("sandbox.runtime.install", scope="operator.admin")
@@ -923,15 +990,7 @@ async def _handle_sandbox_policy_update(params: dict | None, ctx: RpcContext) ->
     policy = values.get("policy")
     if not isinstance(policy, dict):
         raise ValueError("params.policy must be an object")
-    try:
-        saved = _sandbox_policy_store(ctx).compare_and_swap(base_version, policy)
-    except PolicyVersionConflict as exc:
-        raise RpcHandlerError(
-            "POLICY_VERSION_CONFLICT",
-            "The sandbox policy changed in another client.",
-            details={"currentPolicy": exc.current_policy.to_public_dict()},
-        ) from exc
-    return saved.to_public_dict()
+    return await _sandbox_application(ctx).update_policy(base_version, policy)
 
 
 @_d.method("sandbox.tokens.list", scope="operator.read")
@@ -988,8 +1047,7 @@ async def _handle_sandbox_token_revoke(params: dict | None, ctx: RpcContext) -> 
 @_d.method("sandbox.setup.ensure", scope="operator.write")
 async def _handle_sandbox_setup_ensure(params: dict | None, ctx: RpcContext) -> dict:
     _require_owner(ctx, "sandbox.setup.ensure")
-    result = await ensure_sandbox_setup_auto(ctx.config)
-    return result.to_payload()
+    return await _sandbox_application(ctx).ensure_setup()
 
 
 @_d.method("sandbox.explain", scope="operator.read")
@@ -1068,9 +1126,7 @@ async def _handle_run_mode_preference_get(
 ) -> dict[str, str]:
     if params is not None and not isinstance(params, dict):
         raise ValueError("params must be an object")
-    mode, source = await resolve_default_run_mode(ctx.session_manager, ctx.config)
-    mode = coerce_run_mode_for_principal(mode, ctx.principal)
-    return {"runMode": mode.value, "source": source}
+    return await _sandbox_application(ctx).run_mode()
 
 
 @_d.method("sandbox.run_mode.preference.set", scope="operator.write")
@@ -1081,18 +1137,7 @@ async def _handle_run_mode_preference_set(
     _require_owner(ctx, "sandbox.run_mode.preference.set")
     params = _require_params(params)
     mode = normalize_run_mode(params.get("runMode"))
-    await _require_sandbox_setup_ready_for_mode(ctx, mode)
-    storage = _runtime_preference_storage(ctx)
-    confirmed = await storage.set_runtime_preference(
-        RUN_MODE_PREFERENCE_KEY,
-        mode.value,
-    )
-    payload = {"runMode": confirmed, "source": "preference"}
-    await _run_mode_preference_registry().broadcast(
-        _RUN_MODE_PREFERENCE_CHANGED_EVENT,
-        payload,
-    )
-    return payload
+    return await _sandbox_application(ctx).set_run_mode(mode.value)
 
 
 @_d.method("sandbox.run_context.get", scope="operator.read")

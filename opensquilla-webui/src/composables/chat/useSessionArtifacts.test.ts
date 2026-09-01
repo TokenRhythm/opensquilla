@@ -2,9 +2,10 @@ import { nextTick, ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
+import type { ArtifactCatalog } from '@/modules/artifactWorkbench'
 import type { ChatMessage } from '@/types/chat'
 import type { ArtifactsListResponse, ArtifactPayload } from '@/types/rpc'
-import { useSessionArtifacts } from './useSessionArtifacts'
+import { mergeArtifactSources, useSessionArtifacts } from './useSessionArtifacts'
 
 type RpcCall = <T = unknown>(
   method: string,
@@ -37,11 +38,70 @@ function makeHarness(options: {
   const callMock = vi.fn(options.call || (async () => ({ artifacts: [], has_more: false })))
   const rpc = {
     waitForConnection: vi.fn(options.waitForConnection || (async () => {})),
-    supportsMethod: vi.fn(() => options.supported ?? true),
+    supportsMethod: vi.fn((_method: string) => options.supported ?? true),
     markMethodUnavailable: vi.fn(),
     call: callMock as unknown as RpcCall,
   }
-  const api = useSessionArtifacts({ rpc, sessionKey, messages, streamArtifacts })
+  const catalog: ArtifactCatalog = {
+    async listSession(key, request = {}) {
+      try {
+        await rpc.waitForConnection(10_000, request.signal, {
+          timeoutAction: 'reject',
+          abortAction: 'reject',
+        })
+      } catch (error) {
+        if (error && typeof error === 'object') {
+          ;(error as { artifactCatalogPhase?: string }).artifactCatalogPhase = 'connect'
+        }
+        throw error
+      }
+      if (!rpc.supportsMethod('artifacts.list')) return null
+      const visited = new Set<string>()
+      let before: string | null = null
+      let collected: ArtifactPayload[] = []
+      try {
+        for (;;) {
+          const response: ArtifactsListResponse = await rpc.call<ArtifactsListResponse>(
+            'artifacts.list',
+            {
+              sessionKey: key,
+              limit: request.limit ?? 200,
+              ...(before === null ? {} : { before }),
+            },
+            {
+              timeoutMs: 10_000,
+              timeoutAction: 'reconnect',
+              abortAction: 'reject',
+              signal: request.signal,
+            },
+          )
+          const page = Array.isArray(response.artifacts) ? response.artifacts : []
+          collected = mergeArtifactSources(page, collected)
+          if (!Boolean(response.has_more ?? response.hasMore)) return collected
+          const cursor: unknown = response.oldest_cursor ?? response.oldestCursor
+          if (typeof cursor !== 'string' || page.length === 0 || visited.has(cursor)) {
+            throw new Error('Artifact pagination did not provide an advancing cursor')
+          }
+          visited.add(cursor)
+          before = cursor
+        }
+      } catch (error) {
+        const code = (error as { code?: unknown } | null)?.code
+        if (
+          code === 'METHOD_NOT_FOUND'
+          || /method not found/i.test(error instanceof Error ? error.message : String(error))
+        ) {
+          rpc.markMethodUnavailable('artifacts.list')
+          return null
+        }
+        if (error && typeof error === 'object') {
+          ;(error as { artifactCatalogPhase?: string }).artifactCatalogPhase = 'list'
+        }
+        throw error
+      }
+    },
+  }
+  const api = useSessionArtifacts({ catalog, sessionKey, messages, streamArtifacts })
   return { api, callMock, messages, rpc, sessionKey, streamArtifacts }
 }
 

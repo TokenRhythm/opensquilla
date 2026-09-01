@@ -528,6 +528,12 @@ import {
   optionalSessionRpcCallOptions,
 } from './composables/chat/sessionBootstrapAdmission'
 import { markCronFinishNotified } from './utils/cron/notifications'
+import { AGENT_CATALOG_KEY } from './modules/agentCatalog'
+import {
+  CRON_SCHEDULER_KEY,
+  type CronRunFinished,
+  type CronSubscription,
+} from './modules/cronScheduler'
 import {
   buildChatSessionTitles,
   isSensibleChatTitle,
@@ -548,6 +554,12 @@ const sessionLifecycle = injectedSessionLifecycle
 const injectedApprovalCenter = inject(APPROVAL_CENTER_KEY)
 if (!injectedApprovalCenter) throw new Error('ApprovalCenter was not provided')
 const approvalCenter = injectedApprovalCenter
+const injectedAgentCatalog = inject(AGENT_CATALOG_KEY)
+if (!injectedAgentCatalog) throw new Error('AgentCatalog was not provided')
+const agentCatalog = injectedAgentCatalog
+const injectedCronScheduler = inject(CRON_SCHEDULER_KEY)
+if (!injectedCronScheduler) throw new Error('CronScheduler was not provided')
+const cronScheduler = injectedCronScheduler
 const shortcutsStore = useShortcutsStore()
 const artifactImageLightbox = provideArtifactImageLightbox()
 const { t } = useI18n()
@@ -681,21 +693,9 @@ const { enabled: bgmEnabled } = useBgm()
 const desktopUpdate = useDesktopUpdate()
 const webConfigEnabled = getPlatform().capabilities.hasWebConfig
 
-interface AppCronRunFinishedPayload {
-  jobId?: string
-  jobName?: string
-  payloadKind?: string
-  runId?: string
-  sessionKey?: string
-  summary?: string
-  success?: boolean
-}
+let cronFinishedSubscription: CronSubscription | null = null
 
-let unsubscribeCronFinished: (() => void) | null = null
-
-function handleCronRunFinished(payload: unknown) {
-  if (!payload || typeof payload !== 'object') return
-  const event = payload as AppCronRunFinishedPayload
+function handleCronRunFinished(event: CronRunFinished) {
   const runId = typeof event.runId === 'string' ? event.runId : ''
   const jobName = event.jobName?.trim() || t('cronSkills.jobs.unnamedTask')
   markCronFinishNotified(runId)
@@ -735,7 +735,7 @@ function handleCronRunFinished(payload: unknown) {
 installSessionNavigationDiagConsole()
 
 // Shared agents.list state + fetch (singleton) for sidebar session metadata.
-const { agents, loadAgents } = useAgentOptions(optionalSessionRpcCallOptions)
+const { agents, loadAgents } = useAgentOptions(agentCatalog, optionalSessionRpcCallOptions)
 const mobileKeyboardOpen = ref(false)
 const commandPaletteOpen = ref(false)
 const localChatSessions = ref<Record<string, { effectiveAgentId: string; title: string; updatedAt: number }>>({})
@@ -1467,10 +1467,7 @@ async function onProjectRemove(workspaceId: string) {
   if (!project) return
   let affectedCronJobs = 0
   try {
-    const jobs = await rpcStore.call<Array<{ workspaceId?: string }>>(
-      'cron.list',
-      {},
-    )
+    const jobs = await cronScheduler.listJobs()
     affectedCronJobs = (jobs || []).filter(
       job => job.workspaceId === workspaceId,
     ).length
@@ -1737,7 +1734,7 @@ function subscribeCronEventsWhenAdmitted() {
     || !optionalSessionRpcAllowed.value
     || !rpcStore.isConnected
   ) return
-  void rpcStore.call('cron.subscribe', {}).catch(() => undefined)
+  void cronScheduler.resumeEvents().catch(() => undefined)
 }
 
 function resumeAutomaticAppRpc() {
@@ -1948,7 +1945,7 @@ onMounted(() => {
   resumeAutomaticAppRpc()
   // Keep the approval badge/count live app-wide, not just on the Approvals page.
   subscribeApprovals()
-  unsubscribeCronFinished = rpcStore.on('cron.run.finished', handleCronRunFinished)
+  cronFinishedSubscription = cronScheduler.subscribe(handleCronRunFinished)
   // Seed now in case an approval was pending before mount. Availability events
   // re-seed after reconnects and clear stale data while transport recovers.
   void seedPendingApprovals()
@@ -1963,9 +1960,8 @@ onUnmounted(() => {
   sessionDirectoryChangesSubscription.close()
   sessionDirectoryChanges.dispose()
   unsubscribeApprovals()
-  unsubscribeCronFinished?.()
-  unsubscribeCronFinished = null
-  void rpcStore.call('cron.unsubscribe', {}).catch(() => undefined)
+  cronFinishedSubscription?.close()
+  cronFinishedSubscription = null
   if (titleDebounce) {
     clearTimeout(titleDebounce)
     titleDebounce = null

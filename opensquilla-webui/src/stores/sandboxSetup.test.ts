@@ -1,13 +1,12 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { createPinia, setActivePinia } from 'pinia'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createPinia } from 'pinia'
+import { createApp, type App } from 'vue'
+import { SANDBOX_RUNTIME_KEY } from '@/modules/sandboxRuntime'
+import { createV4SandboxRuntime } from '@/adapters/gateway/sandboxRuntimeV4'
+import { useSandboxSetupStore } from './sandboxSetup'
 
 const call = vi.hoisted(() => vi.fn())
-const waitForConnection = vi.hoisted(() => vi.fn(async () => {}))
 const pushToast = vi.hoisted(() => vi.fn())
-
-vi.mock('@/stores/rpc', () => ({
-  useRpcStore: () => ({ call, waitForConnection }),
-}))
 
 vi.mock('@/composables/useToasts', () => ({
   useToasts: () => ({ pushToast }),
@@ -43,11 +42,26 @@ function readyStatus() {
   }
 }
 
+const apps: App[] = []
+
+function createStore() {
+  const app = createApp({ template: '<div />' })
+  const pinia = createPinia()
+  app.use(pinia)
+  app.provide(SANDBOX_RUNTIME_KEY, createV4SandboxRuntime({
+    request: (method, params) => call(method, params),
+  }))
+  apps.push(app)
+  return app.runWithContext(() => useSandboxSetupStore(pinia))
+}
+
 beforeEach(() => {
-  setActivePinia(createPinia())
   call.mockReset()
-  waitForConnection.mockClear()
   pushToast.mockClear()
+})
+
+afterEach(() => {
+  while (apps.length) apps.pop()!.unmount()
 })
 
 describe('sandbox setup store', () => {
@@ -62,8 +76,7 @@ describe('sandbox setup store', () => {
       if (method === 'sandbox.run_mode.preference.set') return { runMode: params?.runMode }
       throw new Error(`unexpected method: ${method}`)
     })
-    const { useSandboxSetupStore } = await import('./sandboxSetup')
-    const store = useSandboxSetupStore()
+    const store = createStore()
 
     const first = store.startSafeSetup()
     const second = store.startSafeSetup()
@@ -88,8 +101,7 @@ describe('sandbox setup store', () => {
       if (method === 'sandbox.capability.status') return { available: true }
       throw new Error(`unexpected method: ${method}`)
     })
-    const { useSandboxSetupStore } = await import('./sandboxSetup')
-    const store = useSandboxSetupStore()
+    const store = createStore()
 
     const pending = store.startSafeSetup()
     store.noteRunModeSelection('full')
@@ -106,8 +118,7 @@ describe('sandbox setup store', () => {
       if (method === 'sandbox.capability.status') return { available: false }
       throw new Error(`unexpected method: ${method}`)
     })
-    const { useSandboxSetupStore } = await import('./sandboxSetup')
-    const store = useSandboxSetupStore()
+    const store = createStore()
 
     await expect(store.startSafeSetup()).resolves.toBe(false)
 
@@ -127,8 +138,7 @@ describe('sandbox setup store', () => {
       if (method === 'sandbox.run_mode.preference.set') return { runMode: params?.runMode }
       throw new Error(`unexpected method: ${method}`)
     })
-    const { useSandboxSetupStore } = await import('./sandboxSetup')
-    const store = useSandboxSetupStore()
+    const store = createStore()
 
     await store.startSafeSetup()
     await store.startSafeSetup()

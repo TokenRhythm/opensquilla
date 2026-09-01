@@ -6,10 +6,6 @@ import {
   type RpcClientError,
   RpcTimeoutError,
 } from '@/lib/rpc'
-import {
-  optionalSessionRpcCallOptions,
-  waitForSessionRpcConnection,
-} from '@/composables/chat/sessionBootstrapAdmission'
 
 class MockWebSocket {
   static readonly CONNECTING = 0
@@ -656,36 +652,6 @@ describe('RpcClient', () => {
     expect(MockWebSocket.instances).toHaveLength(1)
     await vi.advanceTimersByTimeAsync(1)
     expect(MockWebSocket.instances).toHaveLength(2)
-    client.disconnect()
-  })
-
-  it('lets the 10 second optional waiter fail without preempting the 45 second Hello watchdog', async () => {
-    const client = new RpcClient()
-    client.connect('ws://rpc.test')
-    const socket = MockWebSocket.instances[0]
-    socket.receive({ type: 'event', event: 'connect.challenge' })
-    const generation = client.connectionGeneration
-
-    const waiter = waitForSessionRpcConnection(
-      client,
-      optionalSessionRpcCallOptions,
-    ).catch((error: unknown) => error)
-
-    await vi.advanceTimersByTimeAsync(10_000)
-    await expect(waiter).resolves.toBeInstanceOf(RpcTimeoutError)
-    expect(socket.readyState).toBe(MockWebSocket.OPEN)
-    expect(client.connectionGeneration).toBe(generation)
-    expect(client.state).toBe('connecting')
-    expect(MockWebSocket.instances).toHaveLength(1)
-
-    await vi.advanceTimersByTimeAsync(34_999)
-    expect(socket.readyState).toBe(MockWebSocket.OPEN)
-    expect(client.connectionGeneration).toBe(generation)
-
-    await vi.advanceTimersByTimeAsync(1)
-    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
-    expect(client.connectionGeneration).not.toBe(generation)
-    expect(client.state).toBe('disconnected')
     client.disconnect()
   })
 

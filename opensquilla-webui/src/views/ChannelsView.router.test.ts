@@ -88,6 +88,7 @@ async function mountWithRealRouter(options: { webHistory?: boolean } = {}) {
     ],
   }
   const rpcCall = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+    if (method === 'channels.status') return { channels: channelRows }
     if (method === 'onboarding.catalog') return { channels: [slackSpec] }
     if (method === 'onboarding.channel.probe') return { status: 'validated', connected: false, warnings: [] }
     if (method === 'onboarding.channel.upsert') {
@@ -178,6 +179,25 @@ async function mountWithRealRouter(options: { webHistory?: boolean } = {}) {
   const el = document.createElement('div')
   document.body.appendChild(el)
   const application = createApp(AppShell)
+  const { APP_SETTINGS_KEY } = await import('@/modules/appSettings')
+  const { SETUP_WORKFLOW_KEY } = await import('@/modules/setupWorkflow')
+  const { CHANNEL_ADMINISTRATION_KEY } = await import('@/modules/channelAdministration')
+  const { CHANNEL_SETUP_KEY } = await import('@/modules/channelSetup')
+  const { createV4ChannelAdministration } = await import('@/adapters/gateway/channelAdministrationV4')
+  const { createV4ChannelSetup } = await import('@/adapters/gateway/channelSetupV4')
+  application.provide(APP_SETTINGS_KEY, {
+    read: async (path: string) => await rpcCall('config.get', { path }),
+  } as unknown as import('@/modules/appSettings').AppSettings)
+  application.provide(SETUP_WORKFLOW_KEY, {
+    catalog: async () => await rpcCall('onboarding.catalog'),
+  } as unknown as import('@/modules/setupWorkflow').SetupWorkflow)
+  application.provide(CHANNEL_ADMINISTRATION_KEY, createV4ChannelAdministration({
+    request: rpcCall as never,
+    ready: vi.fn(async () => undefined),
+  }, {
+    subscribe: vi.fn(() => ({ close: vi.fn() })),
+  }))
+  application.provide(CHANNEL_SETUP_KEY, createV4ChannelSetup({ request: rpcCall as never }))
   application.use(i18n)
   application.use(router)
   await router.push('/channels')

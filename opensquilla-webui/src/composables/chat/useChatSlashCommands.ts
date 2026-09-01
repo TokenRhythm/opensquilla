@@ -1,31 +1,16 @@
 import { computed, ref, type Ref } from 'vue'
 import i18n from '@/i18n'
 import type { RpcCallOptions, RpcClientError, RpcConnectionWaitOptions } from '@/lib/rpc'
-import type { MetaRunCenter } from '@/modules/metaRunCenter'
+import type { MetaLaunchDraftPayload, MetaRunCenter } from '@/modules/metaRunCenter'
+import type { SessionConversation } from '@/modules/sessionConversation'
+import { createLegacySessionConversation } from '@/adapters/gateway/sessionConversationV4'
 import type { HiddenControlDispatchResult } from '@/types/chat'
 import type { MetaSetupReadiness } from '@/types/metaSetup'
-import type { MetaLaunchDraftPayload } from '@/types/rpc'
 import { createClientRequestId } from '@/utils/chat/messageIdentity'
-import {
-  waitForSessionRpcConnection,
-} from '@/composables/chat/sessionBootstrapAdmission'
 import {
   formatGoalDuration,
   type GoalSnapshot,
 } from '@/composables/chat/useChatGoals'
-
-type RpcClient = {
-  waitForConnection: (
-    timeoutMs?: number,
-    signal?: AbortSignal,
-    actions?: RpcConnectionWaitOptions,
-  ) => Promise<void>
-  call: <T = unknown>(
-    method: string,
-    params?: Record<string, unknown>,
-    callOptions?: RpcCallOptions,
-  ) => Promise<T>
-}
 
 export interface ArgumentChoice {
   value: string
@@ -73,14 +58,6 @@ interface SlashCommandPayload extends Record<string, unknown> {
   }
 }
 
-interface UsageStatusResult {
-  totals?: {
-    tokens?: number
-  }
-  totalTokens?: number
-  total_tokens?: number
-}
-
 const SUPPORTED_WEB_SLASH_ACTIONS = new Set([
   '/coding',
   '/compact',
@@ -104,7 +81,20 @@ const SUPPORTED_WEB_SLASH_ACTIONS = new Set([
 ])
 
 export interface UseChatSlashCommandsOptions {
-  rpc: RpcClient
+  rpc?: {
+    policy?: Record<string, unknown> | null
+    waitForConnection?: (
+      timeoutMs?: number,
+      signal?: AbortSignal,
+      actions?: RpcConnectionWaitOptions,
+    ) => Promise<void>
+    call?: <T = unknown>(
+      method: string,
+      params?: Record<string, unknown>,
+      options?: RpcCallOptions,
+    ) => Promise<T>
+  }
+  sessionConversation?: SessionConversation
   /** Domain seam for MetaSkill launch; wire method names stay in its adapter. */
   metaRunCenter?: MetaRunCenter
   catalogCallOptions?: RpcCallOptions
@@ -301,6 +291,8 @@ function localizedMetaDescription(choice: ArgumentChoice): string {
 }
 
 export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
+  const conversation: SessionConversation = options.sessionConversation
+    ?? createLegacySessionConversation(options.rpc as Parameters<typeof createLegacySessionConversation>[0])
   const slashOpen = ref(false)
   const slashIdx = ref(0)
   const slashCmds = ref<ChatSlashCommand[]>([])
@@ -478,18 +470,8 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
 
   async function loadSlashCommands() {
     try {
-      await waitForSessionRpcConnection(options.rpc, options.catalogCallOptions)
-      const params = { surface: 'web_chat' }
-      const res = options.catalogCallOptions
-        ? await options.rpc.call<{ commands?: ChatSlashCommand[] }>(
-            'commands.list_for_surface',
-            params,
-            options.catalogCallOptions,
-          )
-        : await options.rpc.call<{ commands?: ChatSlashCommand[] }>(
-            'commands.list_for_surface',
-            params,
-          )
+      await conversation.ready(options.catalogCallOptions)
+      const res = await conversation.listCommands('web_chat', options.catalogCallOptions)
       if (
         !Array.isArray(res?.commands)
         || !res.commands.every(isValidSlashCommandPayload)
@@ -736,7 +718,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       case 'reset_session':
       case 'sessions.reset':
       case '/reset':
-        options.rpc.call('sessions.reset', { key: options.sessionKey.value })
+        conversation.reset(options.sessionKey.value)
           .then(() => {
             options.resetCurrentSession()
           })
@@ -751,10 +733,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
           tone: 'info',
           source: 'manual',
         })
-        options.rpc.call<Record<string, unknown>>('sessions.contextCompact', {
-          key: compactKey,
-          wait: false,
-        })
+        conversation.compact(compactKey, false)
           .then((result) => {
             if (compactKey !== options.sessionKey.value) return
             options.showCompactionToast({ key: compactKey, source: 'manual', ...result })
@@ -773,8 +752,8 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       case 'usage_status':
       case 'usage.status':
       case '/usage':
-        options.rpc.call<UsageStatusResult>('usage.status')
-          .then((result: UsageStatusResult) => {
+        conversation.usage()
+          .then((result) => {
             const totals = result?.totals || {}
             const tokens = Number(result?.totalTokens ?? result?.total_tokens ?? totals.tokens ?? 0)
             console.info(`Usage: ${tokens.toLocaleString()} tokens`)
