@@ -176,6 +176,7 @@ export function useChatPlans(options: UseChatPlansOptions) {
   const pendingAction = ref<PlanCardAction | 'cancel-run' | 'revise' | null>(null)
   const modeAppliesNextTurn = ref(false)
   const replanTarget = ref<PlanCardActionTarget | null>(null)
+  const planRunSettlementPending = ref(false)
 
   const currentPlanRevisionId = computed(() => currentPlan.value?.revisionId || '')
   const replanActive = computed(() => replanTarget.value !== null)
@@ -193,6 +194,7 @@ export function useChatPlans(options: UseChatPlansOptions) {
     currentPlan.value = null
     activePlanRun.value = null
     settledTaskFence = null
+    planRunSettlementPending.value = false
     modeBusy.value = false
     pendingAction.value = null
     modeAppliesNextTurn.value = false
@@ -269,6 +271,8 @@ export function useChatPlans(options: UseChatPlansOptions) {
       && activePlanRun.value.planRevisionId !== plan.revisionId
     ) {
       activePlanRun.value = null
+      settledTaskFence = null
+      planRunSettlementPending.value = false
     }
     return true
   }
@@ -286,7 +290,10 @@ export function useChatPlans(options: UseChatPlansOptions) {
       || !shouldAdoptPlanRun(run, activePlanRun.value)
     ) return false
     activePlanRun.value = run
-    if (settledTaskFence?.runId === run.runId) settledTaskFence = null
+    if (settledTaskFence) {
+      settledTaskFence = null
+      planRunSettlementPending.value = false
+    }
     return true
   }
 
@@ -312,6 +319,8 @@ export function useChatPlans(options: UseChatPlansOptions) {
       } else if (!staleEnvelope) {
         currentPlan.value = null
         activePlanRun.value = null
+        settledTaskFence = null
+        planRunSettlementPending.value = false
       }
     }
     const rawRun = source.activePlanRun
@@ -326,6 +335,8 @@ export function useChatPlans(options: UseChatPlansOptions) {
         }
       } else if (!staleEnvelope) {
         activePlanRun.value = null
+        settledTaskFence = null
+        planRunSettlementPending.value = false
       }
     }
   }
@@ -432,7 +443,12 @@ export function useChatPlans(options: UseChatPlansOptions) {
   }
 
   async function revise(request: PlanRevisionRequest): Promise<boolean> {
-    if (!options.sessionKey.value || modeBusy.value || pendingAction.value) return false
+    if (
+      !options.sessionKey.value
+      || modeBusy.value
+      || pendingAction.value
+      || planRunSettlementPending.value
+    ) return false
     const prompt = request.prompt.trim()
     if (!prompt) return false
     const key = options.sessionKey.value
@@ -469,7 +485,12 @@ export function useChatPlans(options: UseChatPlansOptions) {
   }
 
   async function implement(target: PlanCardActionTarget, inNewSession: boolean) {
-    if (!options.sessionKey.value || modeBusy.value || pendingAction.value) return
+    if (
+      !options.sessionKey.value
+      || modeBusy.value
+      || pendingAction.value
+      || planRunSettlementPending.value
+    ) return
     const sourceKey = options.sessionKey.value
     const sourceEpoch = acceptedEpoch
     const targetKey = inNewSession
@@ -511,7 +532,12 @@ export function useChatPlans(options: UseChatPlansOptions) {
 
   async function cancelRun() {
     const run = activePlanRun.value
-    if (!run || modeBusy.value || pendingAction.value) return
+    if (
+      !run
+      || modeBusy.value
+      || pendingAction.value
+      || planRunSettlementPending.value
+    ) return
     const key = options.sessionKey.value
     const epoch = acceptedEpoch
     const owner = Symbol('plan-action-mutation')
@@ -555,6 +581,7 @@ export function useChatPlans(options: UseChatPlansOptions) {
     if (!['queued', 'running', 'paused', 'blocked'].includes(run.status)) return false
     const settlementReason = taskStatus === 'cancelled' ? 'cancelled_by_user' : taskStatus
     settledTaskFence = { runId: run.runId, taskId }
+    planRunSettlementPending.value = true
     activePlanRun.value = {
       ...run,
       status: 'paused',
@@ -572,6 +599,7 @@ export function useChatPlans(options: UseChatPlansOptions) {
     currentPlan,
     currentPlanRevisionId,
     activePlanRun,
+    planRunSettlementPending,
     modeBusy,
     modeAppliesNextTurn,
     pendingAction,

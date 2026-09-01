@@ -551,7 +551,7 @@
         <PlanRunRibbon
           :run="executionDockRun"
           :cancel-busy="planActionPending === 'cancel-run'"
-          :disabled="planModeBusy || planActionPending !== null"
+          :disabled="planModeBusy || planActionPending !== null || planRunSettlementPending"
           @cancel="cancelActivePlanRun"
           @focus-return="focusComposerAfterPlanRun"
         />
@@ -2261,6 +2261,7 @@ const {
   currentPlan,
   currentPlanRevisionId,
   activePlanRun,
+  planRunSettlementPending,
   modeBusy: planModeBusy,
   modeAppliesNextTurn: planModeAppliesNextTurn,
   pendingAction: planActionPending,
@@ -4467,6 +4468,7 @@ const planCardPendingAction = computed<PlanCardAction | null>(() => {
 const planActionsDisabled = computed(() =>
   isStreaming.value
   || planModeBusy.value
+  || planRunSettlementPending.value
   || Boolean(liveSendBlockedReason.value)
   || planActionPending.value !== null
   || activePlanRun.value?.status === 'queued'

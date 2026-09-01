@@ -702,6 +702,7 @@ describe('useChatPlans', () => {
     })
     api.subscribe()
     expect(api.settleActiveRunForTerminalTask('task-terminal', 'timeout')).toBe(true)
+    expect(api.planRunSettlementPending.value).toBe(true)
 
     handlers.get('session.event.plan_run')?.({
       session_key: SESSION_ONE,
@@ -731,6 +732,7 @@ describe('useChatPlans', () => {
       pauseReason: 'manual_turn_timed_out',
       stateRevision: 5,
     })
+    expect(api.planRunSettlementPending.value).toBe(false)
 
     handlers.get('session.event.plan_run')?.({
       session_key: SESSION_ONE,
@@ -761,6 +763,7 @@ describe('useChatPlans', () => {
     api.subscribe()
 
     expect(api.settleActiveRunForTerminalTask('task-terminal', 'failed')).toBe(true)
+    expect(api.planRunSettlementPending.value).toBe(true)
     expect(api.activePlanRun.value).toMatchObject({
       status: 'paused',
       pauseReason: 'failed',
@@ -801,6 +804,7 @@ describe('useChatPlans', () => {
       activeTaskId: 'task-resumed',
       stateRevision: 6,
     })
+    expect(api.planRunSettlementPending.value).toBe(false)
   })
 
   it('lets an authoritative cancellation replace a provisional queued settlement', () => {
@@ -816,6 +820,7 @@ describe('useChatPlans', () => {
     api.subscribe()
 
     expect(api.settleActiveRunForTerminalTask('task-terminal', 'cancelled')).toBe(true)
+    expect(api.planRunSettlementPending.value).toBe(true)
     expect(api.activePlanRun.value?.status).toBe('paused')
     handlers.get('session.event.plan_run')?.({
       session_key: SESSION_ONE,
@@ -832,6 +837,46 @@ describe('useChatPlans', () => {
       terminalReason: 'implementation_turn_ended_before_start',
       stateRevision: 5,
     })
+    expect(api.planRunSettlementPending.value).toBe(false)
+  })
+
+  it('blocks Plan mutations until authoritative run settlement arrives', async () => {
+    const { api, handlers, rpc } = harness()
+    const target = { planId: 'plan-1', revisionId: 'revision-2' }
+    api.applyBootstrap({
+      key: SESSION_ONE,
+      currentPlan: revision(),
+      activePlanRun: run('running', {
+        activeTaskId: 'task-terminal',
+        stateRevision: 4,
+      }) as never,
+    })
+    api.subscribe()
+
+    expect(api.settleActiveRunForTerminalTask('task-terminal', 'failed')).toBe(true)
+    await api.implement(target, false)
+    await api.cancelRun()
+    expect(rpc.call).not.toHaveBeenCalled()
+
+    handlers.get('session.event.plan_run')?.({
+      session_key: SESSION_ONE,
+      plan_run: run('paused', {
+        activeTaskId: undefined,
+        pauseReason: 'manual_turn_failed',
+        stateRevision: 5,
+        updatedAt: 500,
+      }),
+    })
+    rpc.call.mockResolvedValueOnce({ planRun: run('queued', { stateRevision: 6 }) })
+    await api.implement(target, false)
+
+    expect(rpc.call).toHaveBeenCalledWith(
+      'plans.implement',
+      expect.objectContaining({
+        sessionKey: SESSION_ONE,
+        planRevisionId: 'revision-2',
+      }),
+    )
   })
 
   it('keeps a newer epoch cancellation locked when the old cancellation returns late', async () => {
