@@ -258,6 +258,34 @@ describe('useChatMessageActions branching edits', () => {
     expect(options.inputText.value).toBe('new owner draft')
   })
 
+  it('does not restore after the edit transcript is replaced in place', () => {
+    const { api, options } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+    ])
+
+    api.editMessage(renderedMessage({
+      role: 'user',
+      displayRole: 'user',
+      sourceIndex: 2,
+      messageId: 'msg-B',
+      text: 'B',
+    }))
+    const currentOwner = options.messages.value
+    currentOwner.splice(0, 1, {
+      role: 'user', text: 'new same-session row', ts: null, messageId: 'msg-new',
+    })
+    options.inputText.value = 'new owner draft'
+
+    expect(api.cancelEdit()).toBe(false)
+    expect(options.messages.value).toBe(currentOwner)
+    expect(options.messages.value.map(message => message.text)).toEqual([
+      'new same-session row', 'ack A',
+    ])
+    expect(options.inputText.value).toBe('new owner draft')
+  })
+
   it('keeps the newer edit when a second one replaces the first', () => {
     const { api, options, pendingForkBeforeMessageId } = makeOptions([
       { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
@@ -279,6 +307,8 @@ describe('useChatMessageActions branching edits', () => {
     // not to the untouched transcript. Cancelling one edit must not undo the
     // other.
     expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A'])
+    expect(options.inputText.value).toBe('B')
+    expect(pendingForkBeforeMessageId.value).toBe('msg-B')
   })
 
   it('records the previous user message id before regenerating', async () => {

@@ -55,10 +55,14 @@ interface EditRestorePoint {
   sessionKey: string
   /** The exact transcript array installed by this edit. */
   editingMessages: ChatMessage[]
+  /** Shallow item identities installed by this edit. */
+  editingMessageOwners: ChatMessage[]
   /** The transcript as it stood before edit truncated it. */
   messages: ChatMessage[]
   /** Whatever the composer held before edit overwrote it with the message. */
   inputText: string
+  /** Fork owner that was active before this edit replaced it. */
+  previousForkBeforeMessageId: string | null
   /** Ties the restore point to the edit that made it; see `cancelEdit`. */
   forkBeforeMessageId: string
 }
@@ -237,8 +241,10 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     editRestorePoint = {
       sessionKey: options.sessionKey.value,
       editingMessages,
+      editingMessageOwners: editingMessages.map(message => toRaw(message)),
       messages: options.messages.value,
       inputText: options.inputText.value,
+      previousForkBeforeMessageId: options.pendingForkBeforeMessageId.value,
       forkBeforeMessageId,
     }
     options.pendingForkBeforeMessageId.value = forkBeforeMessageId
@@ -264,14 +270,19 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     const restore = editRestorePoint
     if (!restore) return false
     editRestorePoint = null
+    const currentMessages = options.messages.value
     if (
       options.sessionKey.value !== restore.sessionKey
-      || toRaw(options.messages.value) !== restore.editingMessages
+      || toRaw(currentMessages) !== restore.editingMessages
+      || currentMessages.length !== restore.editingMessageOwners.length
+      || currentMessages.some(
+        (message, index) => toRaw(message) !== restore.editingMessageOwners[index],
+      )
       || options.pendingForkBeforeMessageId.value !== restore.forkBeforeMessageId
     ) {
       return false
     }
-    options.pendingForkBeforeMessageId.value = null
+    options.pendingForkBeforeMessageId.value = restore.previousForkBeforeMessageId
     options.messages.value = restore.messages
     options.inputText.value = restore.inputText
     options.autoResizeTextarea()
