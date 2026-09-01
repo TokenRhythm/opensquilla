@@ -13,7 +13,7 @@ import { createV4TurnCommands } from './turnCommandsV4'
 import { createV4PendingInputQueue } from './pendingInputQueueV4'
 import { createApprovalCenterV4 } from './approvalCenterV4'
 import type { ApprovalCenter } from '@/modules/approvalCenter'
-import type { HttpRequestOptions } from './privateHttpTransport'
+import type { HttpTransport } from './privateHttpTransport'
 import type { GoalCenter } from '@/modules/goalCenter'
 import { createV4GoalCenter } from './goalCenterV4'
 import { createV4GoalContinuity } from './goalContinuityV4'
@@ -36,6 +36,12 @@ import type { SandboxRuntime } from '@/modules/sandboxRuntime'
 import { createV4SandboxRuntime } from './sandboxRuntimeV4'
 import type { SessionConversation } from '@/modules/sessionConversation'
 import { createV4SessionConversation } from './sessionConversationV4'
+import type { Observability } from '@/modules/observability'
+import { createV4Observability } from './observabilityV4'
+import type { SkillCatalog } from '@/modules/skillCatalog'
+import { createV4SkillCatalog } from './skillCatalogV4'
+import type { AgentCatalog } from '@/modules/agentCatalog'
+import { createV4AgentCatalog } from './agentCatalogV4'
 
 type RpcStoreTransportSource = Parameters<typeof createPrivateGatewayTransports>[0]
 
@@ -58,14 +64,13 @@ export interface GatewayAdapters {
   readonly workspaceCatalog: WorkspaceCatalog
   readonly sandboxRuntime: SandboxRuntime
   readonly sessionConversation: SessionConversation
-}
-
-interface GatewayHttpSource {
-  requestJson<T = unknown>(endpoint: string, options?: HttpRequestOptions): Promise<T>
+  readonly observability: Observability
+  readonly skillCatalog: SkillCatalog
+  readonly agentCatalog: AgentCatalog
 }
 
 export interface GatewayAdapterOptions {
-  http?: GatewayHttpSource
+  http?: HttpTransport
 }
 
 /** Wire Gateway-backed domain Adapters without leaking generic transports. */
@@ -74,8 +79,14 @@ export function createGatewayAdapters(
   options: GatewayAdapterOptions = {},
 ): GatewayAdapters {
   const transports = createPrivateGatewayTransports(source)
-  const http = options.http ?? {
+  const http: HttpTransport = options.http ?? {
     requestJson: async () => {
+      throw new Error('Gateway HTTP transport is unavailable.')
+    },
+    requestBinary: async () => {
+      throw new Error('Gateway HTTP transport is unavailable.')
+    },
+    requestBlob: async () => {
       throw new Error('Gateway HTTP transport is unavailable.')
     },
   }
@@ -105,6 +116,9 @@ export function createGatewayAdapters(
       subscribe: (event, handler) => transports.events.subscribe(event, handler),
     }),
     sessionConversation: createV4SessionConversation(transports.rpc, transports.events),
+    observability: createV4Observability(transports.rpc, http),
+    skillCatalog: createV4SkillCatalog(transports.rpc),
+    agentCatalog: createV4AgentCatalog(transports.rpc),
   }
   return adapters
 }
