@@ -1,12 +1,13 @@
 import { onUnmounted, ref, shallowRef } from 'vue'
 import type { Ref, ShallowRef } from 'vue'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import { artifactExtension, artifactName } from '@/utils/chat/artifacts'
 import {
   artifactAccessHeaders,
   artifactAccessUrl,
   isTrustedArtifactTransportUrl,
-} from '@/utils/chat/artifactAccess'
+  runtimeArtifactBaseOrigin,
+} from './artifactAccessV4'
 import {
   artifactPreviewLimit,
   artifactWorkbenchPreviewKind,
@@ -103,8 +104,7 @@ const GENERIC_IMAGE_MIME_BY_EXTENSION: Record<string, string> = {
 }
 
 function defaultBaseOrigin(): string {
-  if (typeof window !== 'undefined' && window.location?.origin) return window.location.origin
-  return 'http://localhost'
+  return runtimeArtifactBaseOrigin()
 }
 
 function isInlineWorkbenchAttachmentUrl(artifact: ArtifactPayload, url: string): boolean {
@@ -409,13 +409,14 @@ export function createArtifactPreviewResource(
           setFailure('error', 'download-failed')
           return
         }
+        const authToken = options.authToken?.()
         response = await fetchImpl(url, {
           method: 'GET',
           credentials: 'same-origin',
           headers: artifactAccessHeaders(url, {
-            authToken: options.authToken?.() || '',
             baseOrigin,
             sessionKey: options.sessionKey?.() || '',
+            ...(authToken === undefined ? {} : { authToken }),
           }),
           redirect: 'error',
           signal: controller.signal,

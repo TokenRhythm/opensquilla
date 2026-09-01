@@ -176,8 +176,6 @@ import Icon from '@/components/Icon.vue'
 import { useDialogA11y } from '@/composables/useDialogA11y'
 import { useToasts } from '@/composables/useToasts'
 import { SESSION_CONVERSATION_KEY } from '@/modules/sessionConversation'
-import { createLegacySessionConversation } from '@/adapters/gateway/sessionConversationV4'
-import { useRpcStore } from '@/stores/rpc'
 import type {
   PromptCacheKeepaliveStatus,
   PromptCacheKeepaliveStatusUpdate,
@@ -190,9 +188,9 @@ const emit = defineEmits<{
 }>()
 const { t } = useI18n()
 const { pushToast } = useToasts()
-const sessionConversation = inject(SESSION_CONVERSATION_KEY)
-const conversation = sessionConversation
-  ?? createLegacySessionConversation(useRpcStore() as Parameters<typeof createLegacySessionConversation>[0])
+const injectedSessionConversation = inject(SESSION_CONVERSATION_KEY)
+if (!injectedSessionConversation) throw new Error('SessionConversation was not provided')
+const conversation = injectedSessionConversation
 const dialogRef = ref<HTMLElement | null>(null)
 const closeButtonRef = ref<HTMLElement | null>(null)
 const loading = ref(false)

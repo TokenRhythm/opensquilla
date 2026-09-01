@@ -1,6 +1,6 @@
 import { ref } from 'vue'
 import { normalizeAgentId } from '@/utils/chat/sessionKeys'
-import type { AgentOption } from '@/types/rpc'
+import type { AgentOption } from '@/types/agents'
 import type { RpcCallOptions } from '@/lib/rpc'
 import type { AgentCatalog } from '@/modules/agentCatalog'
 

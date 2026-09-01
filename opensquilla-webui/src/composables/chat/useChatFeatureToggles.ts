@@ -22,7 +22,6 @@ import type { ModelRouting } from '@/modules/providerConfiguration'
 import type { SessionConversation } from '@/modules/sessionConversation'
 
 export interface UseChatFeatureTogglesOptions {
-  rpc?: object
   sessionConversation?: SessionConversation
   appSettings: AppSettings
   modelRouting: ModelRouting

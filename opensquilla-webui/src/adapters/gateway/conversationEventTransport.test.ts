@@ -35,11 +35,10 @@ describe('conversation event transport adapter', () => {
     expect(rpc.registered('_state')).toBe(0)
   })
 
-  it('decodes aliases before dispatch while preserving raw wildcard observation', () => {
+  it('decodes aliases into a semantic event while preserving the opaque payload', () => {
     const { rpc, transport } = harness()
     const event = vi.fn()
-    const any = vi.fn()
-    transport.subscribe({ onEvent: event, onAny: any })
+    transport.subscribe({ onEvent: event })
 
     const payload = { sessionKey: 'agent:main:alpha', streamSeq: 3, text: 'hi' }
     rpc.emit('*', 'text_delta', payload, { replayed: false })
@@ -47,49 +46,68 @@ describe('conversation event transport adapter', () => {
     expect(event).toHaveBeenCalledTimes(1)
     expect(event.mock.calls[0]?.[0]).toMatchObject({
       kind: 'conversation',
-      wireName: 'text_delta',
       payload,
       meta: { replayed: false },
-      decoded: { kind: 'known', name: 'session.event.text_delta', legacy: true },
+      event: { kind: 'known', semanticKind: 'text-delta', legacy: true },
     })
-    expect(any).toHaveBeenCalledWith('text_delta', payload)
   })
 
   it('keeps directory changes in the same listener without treating them as conversation frames', () => {
     const { rpc, transport } = harness()
     const event = vi.fn()
-    const any = vi.fn()
-    transport.subscribe({ onEvent: event, onAny: any })
+    transport.subscribe({ onEvent: event })
     const payload = { key: 'agent:main:alpha', reason: 'renamed' }
 
     rpc.emit('*', 'sessions.changed', payload, {})
 
     expect(event).toHaveBeenCalledWith({
       kind: 'sessions-changed',
-      wireName: 'sessions.changed',
-      decoded: null,
       payload,
       meta: {},
     })
-    expect(any).toHaveBeenCalledWith('sessions.changed', payload)
   })
 
   it('quarantines malformed frames but does not break the wildcard stream', () => {
     const { rpc, transport } = harness()
     const event = vi.fn()
     const error = vi.fn()
-    const any = vi.fn()
-    transport.subscribe({ onEvent: event, onDecodeError: error, onAny: any })
+    transport.subscribe({ onEvent: event, onDecodeError: error })
 
     rpc.emit('*', 'presence', { value: true }, {})
 
     expect(event).toHaveBeenCalledWith(expect.objectContaining({
       kind: 'invalid',
-      wireName: 'presence',
-      payload: { value: true },
     }))
     expect(error).toHaveBeenCalledTimes(1)
-    expect(any).toHaveBeenCalledWith('presence', { value: true })
+  })
+
+  it('projects approval aliases before they reach business consumers', () => {
+    const { rpc, transport } = harness()
+    const event = vi.fn()
+    transport.subscribe({ onEvent: event })
+    const payload = { approval_id: 'approval-1' }
+
+    rpc.emit('*', 'exec.approval.requested', payload, {})
+    rpc.emit('*', 'plugin.approval.resolved', payload, {})
+
+    expect(event.mock.calls.map(call => call[0])).toEqual([
+      { kind: 'approval', action: 'requested', sessionKey: null, payload, meta: {} },
+      { kind: 'approval', action: 'resolved', sessionKey: null, payload, meta: {} },
+    ])
+  })
+
+  it('leaves duplicate fencing to ConversationRuntime', () => {
+    const { rpc, transport } = harness()
+    const event = vi.fn()
+    transport.subscribe({ onEvent: event })
+    const payload = { session_key: 'agent:main:alpha', stream_seq: 7, text: 'same' }
+
+    rpc.emit('*', 'session.event.text_delta', payload, {})
+    rpc.emit('*', 'text_delta', payload, {})
+
+    expect(event).toHaveBeenCalledTimes(2)
+    expect(event.mock.calls.map(call => call[0].event.semanticKind))
+      .toEqual(['text-delta', 'text-delta'])
   })
 
   it('forwards connection state through the same lifecycle owner', () => {

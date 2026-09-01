@@ -2,7 +2,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, defineComponent, h, nextTick, ref } from 'vue'
 import i18n from '@/i18n'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import { ARTIFACT_WORKBENCH_KEY, type ArtifactWorkbench } from '@/modules/artifactWorkbench'
 import { createV4ArtifactContentAccess } from '@/adapters/gateway/artifactAccessV4'
 import AudioArtifactCard from './AudioArtifactCard.vue'
@@ -27,7 +27,6 @@ async function mountCard(onDownload = vi.fn(), item: ArtifactPayload = artifact)
   const app = createApp(AudioArtifactCard, {
     artifact: item,
     sessionKey: 'agent:main:webchat:ok',
-    authToken: 'secret',
     onDownload,
   })
   app.use(i18n)
@@ -173,7 +172,6 @@ describe('AudioArtifactCard', () => {
       setup: () => () => h(AudioArtifactCard, {
         artifact,
         sessionKey: sessionKey.value,
-        authToken: 'secret',
       }),
     })
     const host = document.createElement('div')

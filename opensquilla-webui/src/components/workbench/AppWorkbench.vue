@@ -190,10 +190,8 @@ import {
   type WorkbenchDocumentPrepareRequest,
 } from '@/stores/workbenchDocumentContext'
 import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
-import type {
-  ArtifactPayload,
-  ChatDocumentContext,
-} from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
+import type { ChatDocumentContext } from '@/types/chat'
 import {
   ARTIFACT_WORKBENCH_KEY,
   type ArtifactDocumentChange,
@@ -337,15 +335,6 @@ function artifactPreviewItemForExplicitOpen(
   )
 }
 
-function readAuthToken(): string {
-  if (typeof sessionStorage === 'undefined') return ''
-  try {
-    return sessionStorage.getItem('opensquilla.wsToken') || ''
-  } catch {
-    return ''
-  }
-}
-
 function confirmWorkbenchPermission(request: {
   permission: string
   requestingOrigin: string
@@ -406,7 +395,6 @@ for (const definition of createArtifactWorkbenchDefinitions({
       artifactPromptAnnotations.setActiveDocument(sessionKey, documentId)
     },
   } : undefined,
-  authToken: readAuthToken,
   baseOrigin,
   confirmPermission: confirmWorkbenchPermission,
   confirmRemoteResources: () => confirm({

@@ -9,7 +9,6 @@ import type {
 } from '@/types/chat'
 import type {
   AnswerGenerationResetPayload,
-  ArtifactPayload,
   CompactionPayload,
   CronResultPayload,
   EnsembleProgressPayload,
@@ -18,7 +17,6 @@ import type {
   RouterDecisionPayload,
   SessionDonePayload,
   SessionEventPayload,
-  SessionMessagesSnapshotResponse,
   StreamEventEnvelope,
   SubagentCompletionPayload,
   TextDeltaPayload,
@@ -28,8 +26,13 @@ import type {
   ToolUsePayload,
   TurnCommittedPayload,
   WarningPayload,
-} from '@/types/rpc'
-import type { ConversationEventTransportMessage } from '@/adapters/gateway/conversationEventTransport'
+} from '@/types/chat'
+import type { ArtifactPayload } from '@/types/artifacts'
+import type { SessionMessagesSnapshotResponse } from '@/modules/sessionConversation'
+import type {
+  ConversationEvent,
+  ConversationSemanticEventKind,
+} from '@/modules/conversationEvents'
 import {
   isAuthoritativeSessionSubscription,
   type SessionSubscriptionOutcome,
@@ -226,15 +229,15 @@ type ChatDoneUsagePayload = SessionDonePayload & ChatDoneUsageFields & {
 }
 
 type BufferedTerminalEvent =
-  | { kind: 'event'; event: string; payload: SessionEventPayload; priority: number; replayWithoutSeq?: boolean }
+  | { kind: 'event'; event: ConversationSemanticEventKind; payload: SessionEventPayload; priority: number; replayWithoutSeq?: boolean }
   | { kind: 'session-change'; payload: SessionEventPayload; priority: number; replayWithoutSeq?: boolean }
 
 type BufferedTerminalEventInput =
-  | { kind: 'event'; event: string; payload: SessionEventPayload; priority?: number }
+  | { kind: 'event'; event: ConversationSemanticEventKind; payload: SessionEventPayload; priority?: number }
   | { kind: 'session-change'; payload: SessionEventPayload; priority?: number }
 
 type BufferedPendingStreamEvent = {
-  event: string
+  event: ConversationSemanticEventKind
   payload: SessionEventPayload
   replayWithoutSeq?: boolean
 }
@@ -242,7 +245,7 @@ type BufferedPendingStreamEvent = {
 type BufferedPendingReplayEntry =
   | {
       kind: 'stream'
-      event: string
+      event: ConversationSemanticEventKind
       payload: SessionEventPayload
       order: number
       replayWithoutSeq?: boolean
@@ -449,7 +452,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     restoreSteerIntoComposer: options.restoreSteerIntoComposer,
   })
 
-  // Live thinking deltas for the current turn (session.event.thinking).
+  // Live thinking deltas for the current turn.
   const streamThinking = ref<LiveThinking | null>(null)
   let currentGenerationEpoch: number | null = null
   let activeAssistantMessageId = ''
@@ -672,16 +675,15 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     return left.order - right.order
   }
 
-  function terminalEventPriority(event: string): number {
-    if (event === 'session.event.done' || event === 'chat.done' || event.endsWith('.error')) return 3
+  function terminalEventPriority(event: ConversationSemanticEventKind): number {
+    if (event === 'turn-completed' || event === 'turn-failed') return 3
     if (eventTaskTerminalStatus(event)) return 2
     return 0
   }
 
-  function isTerminalEvent(event: string): boolean {
+  function isTerminalEvent(event: ConversationSemanticEventKind): boolean {
     if (eventTaskTerminalStatus(event)) return true
-    if (event === 'session.event.done' || event === 'chat.done') return true
-    return event.endsWith('.error') && !event.includes('.task_group.')
+    return event === 'turn-completed' || event === 'turn-failed'
   }
 
   function bufferPendingTerminalEvent(
@@ -734,7 +736,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   }
 
   function bufferPendingStreamEvent(
-    event: string,
+    event: ConversationSemanticEventKind,
     payload: SessionEventPayload,
   ): boolean {
     if (!isCurrentSessionPayload(payload)) return false
@@ -771,7 +773,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
 
   function handleRpcAnswerGenerationReset(payload: AnswerGenerationResetPayload) {
     if (isStaleEpoch(payload)) return
-    if (bufferPendingStreamEvent('session.event.answer_generation_reset', payload)) return
+    if (bufferPendingStreamEvent('answer-generation-reset', payload)) return
     if (!isCurrentTaskPayload(payload)) return
 
     const oldGenerationEpoch = numericGenerationEpoch(
@@ -891,35 +893,35 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       ? bufferedStreamSeq(entry.payload) ?? undefined
       : undefined
     try {
-      if (event === 'session.event.answer_generation_reset') {
+      if (event === 'answer-generation-reset') {
         handleRpcAnswerGenerationReset(payload as AnswerGenerationResetPayload)
-      } else if (event === 'session.event.text_delta') {
+      } else if (event === 'text-delta') {
         handleRpcTextDelta(payload as TextDeltaPayload)
-      } else if (event === 'session.event.tool_use_start') {
+      } else if (event === 'tool-use-started') {
         handleRpcToolUseStart(payload as ToolUsePayload)
-      } else if (event === 'session.event.tool_use_delta') {
+      } else if (event === 'tool-use-delta') {
         handleRpcToolUseDelta(payload as ToolDeltaPayload)
-      } else if (event === 'session.event.tool_use_end') {
+      } else if (event === 'tool-use-ended') {
         handleRpcToolUseEnd(payload as ToolEndPayload)
-      } else if (event === 'session.event.tool_result') {
+      } else if (event === 'tool-result') {
         handleRpcToolResult(payload as ToolResultPayload)
-      } else if (event === 'session.event.artifact') {
+      } else if (event === 'artifact-created') {
         handleRpcArtifact(payload as ArtifactPayload)
-      } else if (event === 'session.event.state_change') {
+      } else if (event === 'state-changed') {
         handleRpcStateChange(payload)
-      } else if (event === 'session.event.run_heartbeat') {
+      } else if (event === 'run-heartbeat') {
         handleRpcRunHeartbeat(payload)
-      } else if (event === 'session.event.provider_activity') {
+      } else if (event === 'provider-activity') {
         handleRpcProviderActivity(payload as ProviderActivityPayload)
-      } else if (event === 'session.event.router_decision') {
+      } else if (event === 'router-decision') {
         handleRpcRouterDecision(payload as RouterDecisionPayload)
-      } else if (event === 'session.event.ensemble_progress') {
+      } else if (event === 'ensemble-progress') {
         handleRpcEnsembleProgress(payload as EnsembleProgressPayload)
-      } else if (event === 'session.event.router_control_replay') {
+      } else if (event === 'router-control-replay') {
         handleRpcRouterControlReplay(payload)
-      } else if (event === 'session.event.input_disposition') {
+      } else if (event === 'input-disposition') {
         handleRpcInputDisposition(payload as InputDispositionPayload)
-      } else if (event === 'session.event.compaction') {
+      } else if (event === 'compaction-progress') {
         // A live snapshot is the authoritative base for the active stream, not
         // historical replay. Compaction deliberately ignores replayed
         // non-terminal events, so mark this as live to restore the busy/Stop
@@ -929,11 +931,11 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
           replayed: false,
         })
       } else if (
-        event === 'session.event.thinking_start'
-        || event === 'session.event.thinking'
-        || event === 'session.event.thinking_end'
+        event === 'thinking-started'
+        || event === 'thinking-delta'
+        || event === 'thinking-ended'
       ) {
-        handleRpcAny(event, payload)
+        handleSemanticEvent(event, payload)
       }
     } finally {
       replayActivityOrder = previousReplayOrder
@@ -1012,7 +1014,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (entry.kind === 'session-change') {
       handleRpcSessionsChanged(payload)
     } else {
-      handleRpcAny(entry.event, payload)
+      handleSemanticEvent(entry.event, payload)
     }
   }
 
@@ -1059,7 +1061,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       const sequence = bufferedStreamSeq(entry.payload)
       const sharesTerminalSequence = terminalSequence !== null && sequence === terminalSequence
       const maintenanceAfterTerminal = taskTerminalReplayed
-        && entry.event === 'session.event.compaction'
+        && entry.event === 'compaction-progress'
       // Let the terminal own a shared cursor. A tracked compaction terminal may
       // still close its existing UI after task completion, but it must not move
       // the task cursor past the terminal that closed the stream.
@@ -1144,7 +1146,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       }
     }
     // The fold concats the same text into its thinkingText. Gating already
-    // passed upstream (handleRpcAny), so this frame mirrors an accepted delta.
+    // passed upstream through the semantic reducer, so this mirrors an accepted delta.
     if (stream.useReducer.value) {
       const blockId = typeof payload.block_id === 'string'
         ? payload.block_id
@@ -1658,7 +1660,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
 
   function handleRpcTextDelta(payload: TextDeltaPayload) {
     if (isStaleEpoch(payload)) return
-    if (bufferPendingStreamEvent('session.event.text_delta', payload)) return
+    if (bufferPendingStreamEvent('text-delta', payload)) return
     if (!isCurrentGenerationPayload(payload)) return
     if (!isCurrentTaskPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
@@ -1693,7 +1695,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   function handleRpcToolUseStart(payload: ToolUsePayload) {
     if (isStaleEpoch(payload)) return
     if (aborted.value) return
-    if (bufferPendingStreamEvent('session.event.tool_use_start', payload)) return
+    if (bufferPendingStreamEvent('tool-use-started', payload)) return
     if (!isCurrentGenerationPayload(payload)) return
     if (!isCurrentTaskPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
@@ -1705,7 +1707,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   function handleRpcToolUseDelta(payload: ToolDeltaPayload) {
     if (isStaleEpoch(payload)) return
     if (aborted.value) return
-    if (bufferPendingStreamEvent('session.event.tool_use_delta', payload)) return
+    if (bufferPendingStreamEvent('tool-use-delta', payload)) return
     if (!isCurrentGenerationPayload(payload)) return
     if (!isCurrentTaskPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
@@ -1717,7 +1719,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   function handleRpcToolUseEnd(payload: ToolEndPayload) {
     if (isStaleEpoch(payload)) return
     if (aborted.value) return
-    if (bufferPendingStreamEvent('session.event.tool_use_end', payload)) return
+    if (bufferPendingStreamEvent('tool-use-ended', payload)) return
     if (!isCurrentGenerationPayload(payload)) return
     if (!isCurrentTaskPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
@@ -1729,7 +1731,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   function handleRpcToolResult(payload: ToolResultPayload) {
     if (isStaleEpoch(payload)) return
     if (aborted.value) return
-    if (bufferPendingStreamEvent('session.event.tool_result', payload)) return
+    if (bufferPendingStreamEvent('tool-result', payload)) return
     if (!isCurrentGenerationPayload(payload)) return
     if (!isCurrentTaskPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
@@ -1740,7 +1742,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   function handleRpcArtifact(payload: ArtifactPayload) {
     if (isStaleEpoch(payload)) return
     if (aborted.value) return
-    if (bufferPendingStreamEvent('session.event.artifact', payload)) return
+    if (bufferPendingStreamEvent('artifact-created', payload)) return
     if (!isCurrentGenerationPayload(payload)) return
     if (!isCurrentTaskPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
@@ -1751,7 +1753,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   function handleRpcStateChange(payload: SessionEventPayload) {
     if (isStaleEpoch(payload)) return
     if (!payload || aborted.value) return
-    if (bufferPendingStreamEvent('session.event.state_change', payload)) return
+    if (bufferPendingStreamEvent('state-changed', payload)) return
     if (!isCurrentGenerationPayload(payload)) return
     if (!isCurrentTaskPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
@@ -1779,7 +1781,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   function handleRpcRunHeartbeat(payload: SessionEventPayload) {
     if (isStaleEpoch(payload)) return
     if (aborted.value) return
-    if (bufferPendingStreamEvent('session.event.run_heartbeat', payload)) return
+    if (bufferPendingStreamEvent('run-heartbeat', payload)) return
     if (!isCurrentGenerationPayload(payload)) return
     if (!isCurrentTaskPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
@@ -1801,7 +1803,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   function handleRpcProviderActivity(payload: ProviderActivityPayload) {
     if (isStaleEpoch(payload)) return
     if (aborted.value) return
-    if (bufferPendingStreamEvent('session.event.provider_activity', payload)) return
+    if (bufferPendingStreamEvent('provider-activity', payload)) return
     if (!isCurrentTaskPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
 
@@ -1844,7 +1846,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
 
   function handleRpcCompaction(payload: CompactionPayload, meta: unknown) {
     if (isStaleEpoch(payload)) return
-    if (bufferPendingStreamEvent('session.event.compaction', payload)) return
+    if (bufferPendingStreamEvent('compaction-progress', payload)) return
     if (!isCurrentGenerationPayload(payload)) return
     const trackedPlacement = trackedLateCompactionPlacement(payload)
     if (!isCurrentTaskPayload(payload) && !trackedPlacement) return
@@ -2190,7 +2192,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
 
   function handleRpcRouterDecision(payload: RouterDecisionPayload) {
     if (isStaleEpoch(payload)) return
-    if (bufferPendingStreamEvent('session.event.router_decision', payload)) return
+    if (bufferPendingStreamEvent('router-decision', payload)) return
     if (!isCurrentGenerationPayload(payload)) return
     if (!isCurrentTaskPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
@@ -2201,7 +2203,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
 
   function handleRpcEnsembleProgress(payload: EnsembleProgressPayload) {
     if (isStaleEpoch(payload)) return
-    if (bufferPendingStreamEvent('session.event.ensemble_progress', payload)) return
+    if (bufferPendingStreamEvent('ensemble-progress', payload)) return
     if (!isCurrentGenerationPayload(payload)) return
     if (!isCurrentTaskPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
@@ -2215,27 +2217,30 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   function handleRpcRouterControlReplay(payload: SessionEventPayload) {
     if (isStaleEpoch(payload)) return
     if (aborted.value) return
-    if (bufferPendingStreamEvent('session.event.router_control_replay', payload)) return
+    if (bufferPendingStreamEvent('router-control-replay', payload)) return
     if (!isCurrentGenerationPayload(payload)) return
     if (!isCurrentTaskPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
     options.handleRouterControlReplay()
   }
 
-  function handleRpcAny(rawEvent: string, rawPayload: unknown) {
+  function handleSemanticEvent(
+    eventKind: ConversationSemanticEventKind,
+    rawPayload: unknown,
+  ) {
     const payloadObj = (rawPayload && typeof rawPayload === 'object' ? rawPayload : {}) as SessionEventPayload
-    // The wildcard subscription observes approvals and compact task lifecycle
-    // events in addition to ordinary stream frames.  Reject an older
+    // The semantic ingress observes approvals and compact task lifecycle
+    // events in addition to ordinary stream frames. Reject an older
     // subscription epoch before *any* of those branches can mutate run state
     // or task ownership; per-event guards below remain as defence in depth for
     // replayed/normalised payloads.
     if (isStaleEpoch(payloadObj)) return
     if (!isCurrentSessionPayload(payloadObj)) return
-    if (rawEvent === 'session.event.turn_committed') {
+    if (eventKind === 'turn-committed') {
       handleRpcTurnCommitted(payloadObj as TurnCommittedPayload)
       return
     }
-    if (rawEvent === 'task.succeeded') {
+    if (eventKind === 'task-succeeded') {
       const succeededTaskId = payloadTaskId(payloadObj)
       if (
         succeededTaskId
@@ -2254,18 +2259,18 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         return
       }
     }
-    if (rawEvent === 'session.event.answer_generation_reset') {
+    if (eventKind === 'answer-generation-reset') {
       handleRpcAnswerGenerationReset(payloadObj as AnswerGenerationResetPayload)
       return
     }
     if (
       terminalGenerationClosed
-      && (rawEvent.endsWith('.error') || rawEvent.endsWith('.done') || rawEvent === 'chat.done')
+      && (eventKind === 'turn-failed' || eventKind === 'turn-completed')
     ) return
     if (!isCurrentGenerationPayload(payloadObj)) return
-    const taskSucceededFallback = rawEvent === 'task.succeeded'
-    const terminalStatus = eventTaskTerminalStatus(rawEvent)
-    const terminalEvent = isTerminalEvent(rawEvent)
+    const taskSucceededFallback = eventKind === 'task-succeeded'
+    const terminalStatus = eventTaskTerminalStatus(eventKind)
+    const terminalEvent = isTerminalEvent(eventKind)
     // Rich done/error receipts are terminal ownership evidence too, even
     // though only compact task.* events encode a lifecycle status in the event
     // name. Without this, a successor whose done frame was buffered behind A
@@ -2284,7 +2289,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     const normalizedStatus = options.normalizeRunStatus(String(rawStatus))
     if (
       normalizedStatus === 'approval_pending' ||
-      (typeof rawEvent === 'string' && rawEvent.includes('approval') && isCurrentSessionPayload(payloadObj))
+      eventKind === 'approval-requested'
     ) {
       if (!isCurrentSessionPayload(payloadObj)) return
       options.applySessionRunState({
@@ -2295,7 +2300,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     }
     if (
       terminalEvent &&
-      bufferPendingTerminalEvent({ kind: 'event', event: rawEvent, payload: payloadObj })
+      bufferPendingTerminalEvent({ kind: 'event', event: eventKind, payload: payloadObj })
     ) return
     const terminalOwnership = terminalTaskId
       ? options.taskOwnership?.noteTerminal(terminalTaskId)
@@ -2312,11 +2317,11 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     }
     if (
       (
-        rawEvent === 'session.event.thinking_start'
-        || rawEvent === 'session.event.thinking'
-        || rawEvent === 'session.event.thinking_end'
+        eventKind === 'thinking-started'
+        || eventKind === 'thinking-delta'
+        || eventKind === 'thinking-ended'
       ) &&
-      bufferPendingStreamEvent(rawEvent, payloadObj)
+      bufferPendingStreamEvent(eventKind, payloadObj)
     ) return
     // A stale task's terminal/done/error must not end the current turn's stream
     // or push its "Turn failed" into the live transcript (issue #344). Approvals
@@ -2340,7 +2345,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       }
     }
 
-    const normalized = normalizeTaskTerminalEvent(rawEvent, payloadObj)
+    const normalized = normalizeTaskTerminalEvent(eventKind, payloadObj)
     if (normalized && isStaleEpoch(payloadObj)) return
     if (normalized && !stream.isStreaming.value) {
       markTaskSettled(payloadObj)
@@ -2349,23 +2354,26 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       return
     }
 
-    const event = normalized ? normalized.event : rawEvent
+    const event = normalized ? normalized.kind : eventKind
     const payload = normalized ? normalized.payload : payloadObj
 
-    if (typeof event !== 'string') return
-    if (event.startsWith('session.event.') && isStaleEpoch(payload)) return
+    if (isStaleEpoch(payload)) return
     if (!acceptStreamSeq(payload)) return
-    if (event.startsWith('session.event.task_group.')) return
-    if (event === 'sessions.changed') return
+    if (
+      event === 'task-group-waiting'
+      || event === 'task-group-synthesizing'
+      || event === 'task-group-completed'
+      || event === 'task-group-failed'
+    ) return
 
-    if (event === 'session.event.thinking_start') {
+    if (event === 'thinking-started') {
       if (aborted.value) return
       stream.resetStreamIdleTimer()
       handleThinkingStart(payload)
       return
     }
 
-    if (event === 'session.event.thinking') {
+    if (event === 'thinking-delta') {
       if (aborted.value) return
       const thinkingPayload = payload as SessionEventPayload
       const thinkingText = thinkingPayload.text
@@ -2380,14 +2388,14 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       return
     }
 
-    if (event === 'session.event.thinking_end') {
+    if (event === 'thinking-ended') {
       if (aborted.value) return
       stream.resetStreamIdleTimer()
       handleThinkingEnd(payload)
       return
     }
 
-    if (event.endsWith('.done') || event === 'chat.done') {
+    if (event === 'turn-completed') {
       markTaskSettled(payload)
       const awaitingDurableCommit = !taskSucceededFallback && waitForTurnCommit(payload)
       const donePayload = payload as ChatDoneUsagePayload
@@ -2521,7 +2529,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       if (!bindSuccessorAfterTerminal(terminalTaskId)) {
         activeStreamTaskId.value = FINISHED_STREAM_TASK_ID
       }
-    } else if (event.endsWith('.error')) {
+    } else if (event === 'turn-failed') {
       markTaskSettled(payload)
       options.clearPendingRouterDecision()
       clearLiveThinking()
@@ -2579,121 +2587,112 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   }
 
   /**
-   * Consume the single decoded ingress emitted by the private v4 adapter.
-   *
-   * The reducer deliberately remains unchanged in this slice: named handlers
-   * run first, followed by the legacy wildcard path, matching the listener
-   * order that existed before the transport seam. `wireName` is retained only
-   * for that compatibility path; new consumers can rely on `decoded.name` and
-   * its validated metadata without knowing how the frame was transported.
+   * Consume the single semantic ingress emitted by the private v4 adapter.
+   * Named projections run before cross-cutting cursor/ownership handling, the
+   * same ordering used by the previous listener set, without exposing aliases.
    */
-  function handleConversationEvent(message: ConversationEventTransportMessage) {
+  function handleConversationEvent(message: ConversationEvent) {
     if (message.kind === 'sessions-changed') {
       handleRpcSessionsChanged(message.payload as SessionEventPayload)
-      handleRpcAny(message.wireName, message.payload)
       return
     }
 
-    if (message.kind === 'invalid') {
-      // Keep the pre-contract wildcard behavior for malformed or unrelated
-      // frames. The adapter has already quarantined the decode error, but an
-      // older event that the reducer knows how to handle must not disappear
-      // during the migration.
-      handleRpcAny(message.wireName, message.payload)
+    if (message.kind === 'invalid') return
+
+    if (message.kind === 'approval') {
+      handleSemanticEvent(
+        message.action === 'requested' ? 'approval-requested' : 'approval-resolved',
+        message.payload,
+      )
       return
     }
 
-    const event = message.decoded
+    const event = message.event
     if (event.kind === 'known') {
-      switch (event.name) {
-        case 'session.event.answer_generation_reset':
+      switch (event.semanticKind) {
+        case 'answer-generation-reset':
           handleRpcAnswerGenerationReset(message.payload as AnswerGenerationResetPayload)
           break
-        case 'session.event.text_delta':
+        case 'text-delta':
           handleRpcTextDelta(message.payload as TextDeltaPayload)
           break
-        case 'session.event.tool_use_start':
+        case 'tool-use-started':
           handleRpcToolUseStart(message.payload as ToolUsePayload)
           break
-        case 'session.event.tool_use_delta':
+        case 'tool-use-delta':
           handleRpcToolUseDelta(message.payload as ToolDeltaPayload)
           break
-        case 'session.event.tool_use_end':
+        case 'tool-use-ended':
           handleRpcToolUseEnd(message.payload as ToolEndPayload)
           break
-        case 'session.event.tool_result':
+        case 'tool-result':
           handleRpcToolResult(message.payload as ToolResultPayload)
           break
-        case 'session.event.artifact':
+        case 'artifact-created':
           handleRpcArtifact(message.payload as ArtifactPayload)
           break
-        case 'session.event.state_change':
+        case 'state-changed':
           handleRpcStateChange(message.payload as SessionEventPayload)
           break
-        case 'session.event.run_heartbeat':
+        case 'run-heartbeat':
           handleRpcRunHeartbeat(message.payload as SessionEventPayload)
           break
-        case 'session.event.provider_activity':
+        case 'provider-activity':
           handleRpcProviderActivity(message.payload as ProviderActivityPayload)
           break
-        case 'session.event.compaction':
+        case 'compaction-progress':
           handleRpcCompaction(message.payload as CompactionPayload, message.meta)
           break
-        case 'session.event.warning':
+        case 'warning':
           handleRpcWarning(message.payload as WarningPayload)
           break
-        case 'session.event.input_disposition':
+        case 'input-disposition':
           handleRpcInputDisposition(message.payload as InputDispositionPayload)
           break
-        case 'session.event.cron_result':
+        case 'cron-result':
           handleRpcCronResult(message.payload as CronResultPayload)
           break
-        case 'session.event.subagent_completion':
+        case 'subagent-completed':
           handleRpcSubagentCompletion(message.payload as SubagentCompletionPayload)
           break
-        case 'session.epoch_changed':
+        case 'session-epoch-changed':
           handleRpcEpochChanged(message.payload as SessionEventPayload)
           break
-        case 'task.queued':
+        case 'task-queued':
           handleRpcTaskQueued(message.payload as SessionEventPayload)
           break
-        case 'task.running':
+        case 'task-running':
           handleRpcTaskRunning(message.payload as SessionEventPayload)
           break
-        case 'session.event.task_group.waiting':
+        case 'task-group-waiting':
           handleRpcTaskGroupWaiting(message.payload as SessionEventPayload)
           break
-        case 'session.event.task_group.synthesizing':
+        case 'task-group-synthesizing':
           handleRpcTaskGroupSynthesizing(message.payload as SessionEventPayload)
           break
-        case 'session.event.task_group.done':
+        case 'task-group-completed':
           handleRpcTaskGroupDone(message.payload as SessionEventPayload)
           break
-        case 'session.event.task_group.failed':
+        case 'task-group-failed':
           handleRpcTaskGroupFailed(message.payload as SessionEventPayload)
           break
-        case 'session.event.router_decision':
+        case 'router-decision':
           handleRpcRouterDecision(message.payload as RouterDecisionPayload)
           break
-        case 'session.event.ensemble_progress':
+        case 'ensemble-progress':
           handleRpcEnsembleProgress(message.payload as EnsembleProgressPayload)
           break
-        case 'session.event.router_control_replay':
+        case 'router-control-replay':
           handleRpcRouterControlReplay(message.payload as SessionEventPayload)
           break
         default:
-          // Thinking, terminal, approval and future additive events are owned
-          // by the wildcard reducer below until their domain projections are
-          // split into dedicated modules.
+          // Thinking, terminal and future additive events are handled by the
+          // cross-cutting semantic reducer below.
           break
       }
     }
 
-    // Preserve the old wildcard path for terminal/task lifecycle events and
-    // for the reducer's cross-cutting sequence/ownership checks. This call is
-    // intentionally after the named projection, matching RpcClient listener
-    // registration order before S12.
-    handleRpcAny(message.wireName, message.payload)
+    handleSemanticEvent(event.semanticKind, message.payload)
   }
 
   let connectionLostNoted = false
@@ -2774,9 +2773,8 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     }
   }
 
-  // Keep this object as a test-friendly compatibility surface for the reducer
-  // unit tests. Production ingress uses `onConversationEvent` below, so this
-  // object no longer defines the transport contract.
+  // Direct semantic handlers remain a focused unit-test surface. Production
+  // ingress uses `onConversationEvent` below.
   const handlers = {
     onAnswerGenerationReset: handleRpcAnswerGenerationReset,
     onTextDelta: handleRpcTextDelta,
@@ -2804,7 +2802,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     onRouterDecision: handleRpcRouterDecision,
     onEnsembleProgress: handleRpcEnsembleProgress,
     onRouterControlReplay: handleRpcRouterControlReplay,
-    onAny: handleRpcAny,
+    onSemanticEvent: handleSemanticEvent,
     onConnectionState: handleRpcConnectionState,
   }
 

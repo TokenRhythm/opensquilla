@@ -4,8 +4,9 @@ import { nextTick, ref, watch, type Ref } from 'vue'
 
 import { useChatHistory } from './useChatHistory'
 import type { ChatMessage, ChatTurnOutcome } from '@/types/chat'
-import type { ChatHistoryResponse } from '@/types/rpc'
+import type { ChatHistoryResponse } from '@/types/chat'
 import { RpcTimeoutError } from '@/lib/rpc'
+import { sessionConversationFromTestRpc } from '@/testing/sessionConversation.test-helper'
 
 function makeHistory(autoScroll = true, overrides: {
   response?: ChatHistoryResponse
@@ -39,12 +40,13 @@ function makeHistory(autoScroll = true, overrides: {
     policy: {
       concurrent_history_reads: overrides.concurrentHistoryReads ?? true,
     },
-    waitForConnection: vi.fn().mockResolvedValue(undefined),
+    ready: vi.fn().mockResolvedValue(undefined),
     call: vi.fn().mockResolvedValue(response),
   }
   const scrollToBottom = vi.fn()
   const api = useChatHistory({
-    rpc,
+    sessionConversation: sessionConversationFromTestRpc(rpc),
+    concurrentHistoryReads: () => overrides.concurrentHistoryReads ?? true,
     sessionKey: overrides.sessionKey || ref('agent:main:webchat:test'),
     messages,
     threadRef: overrides.threadRef,
@@ -836,7 +838,7 @@ describe('useChatHistory canonical pagination', () => {
       skipSnapshot: false,
     })
 
-    expect(rpc.waitForConnection).toHaveBeenCalledWith(
+    expect(rpc.ready).toHaveBeenCalledWith(
       expect.any(Number),
       expect.any(AbortSignal),
       {
@@ -2116,7 +2118,7 @@ describe('useChatHistory canonical pagination', () => {
       sessionKey.value = 'agent:main:webchat:new-draft'
       await vi.advanceTimersByTimeAsync(50)
 
-      expect(rpc.waitForConnection).not.toHaveBeenCalled()
+      expect(rpc.ready).not.toHaveBeenCalled()
       expect(rpc.call).not.toHaveBeenCalled()
     } finally {
       vi.useRealTimers()

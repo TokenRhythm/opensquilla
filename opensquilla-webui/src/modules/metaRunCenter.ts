@@ -1,4 +1,5 @@
 import type { InjectionKey } from 'vue'
+import type { ConversationCursorSignal } from '@/modules/conversationRuntime'
 import type { MetaSetupReadiness } from '@/types/metaSetup'
 
 /** A wire-independent MetaSkill draft used by recovery UI. */
@@ -43,9 +44,9 @@ export interface MetaLaunchResult {
 }
 
 export interface MetaRunRecovery {
-  readonly announced?: Record<string, unknown>
-  readonly stepStates: readonly Record<string, unknown>[]
-  readonly completed?: Record<string, unknown>
+  readonly announced?: MetaRunAnnouncedPayload
+  readonly stepStates: readonly MetaStepStatePayload[]
+  readonly completed?: MetaRunCompletedPayload
 }
 
 export interface MetaPreflightConfirmation {
@@ -100,36 +101,38 @@ export interface MetaPreflightFieldSpec {
   choices?: unknown[]
 }
 
-export interface MetaPreflightPayload extends MetaSessionEventPayload {
-  run_id?: string
-  meta_skill_name?: string
+export interface MetaPreflightRequestTemplate {
   language?: string
-  interpreted_request?: string
-  missing_fields?: string[]
+  outcome?: string
+  deliverable?: string
+  fields?: MetaPreflightFieldSpec[]
+}
+
+export interface MetaPreflightPayload {
+  runId?: string
+  metaSkillName?: string
+  language?: string
+  interpretedRequest?: string
+  missingFields?: string[]
   assumptions?: string[]
-  request_template?: {
-    language?: string
-    outcome?: string
-    deliverable?: string
-    fields?: MetaPreflightFieldSpec[]
-  }
-  can_skip?: boolean
-  requires_confirmation?: boolean
+  requestTemplate?: MetaPreflightRequestTemplate
+  canSkip?: boolean
+  requiresConfirmation?: boolean
 }
 
 export interface MetaRunStepSpec {
   id?: string
   label?: string
   kind?: string
-  depends_on?: string[]
+  dependsOn?: string[]
 }
 
-export interface MetaRunAnnouncedPayload extends MetaSessionEventPayload {
-  run_id?: string
-  meta_skill_name?: string
+export interface MetaRunAnnouncedPayload {
+  runId?: string
+  metaSkillName?: string
   language?: string
-  user_language?: string
-  meta_language?: string
+  userLanguage?: string
+  metaLanguage?: string
   steps?: MetaRunStepSpec[]
   total?: number
 }
@@ -143,45 +146,39 @@ export interface MetaStepRescue {
   actions?: MetaStepRescueAction[]
 }
 
-export interface MetaStepStatePayload extends MetaSessionEventPayload {
-  run_id?: string
-  step_id?: string
+export interface MetaStepStatePayload {
+  runId?: string
+  stepId?: string
   state?: string
-  status_text?: string | null
+  statusText?: string | null
   error?: string
-  substitute_for?: string | null
+  substituteFor?: string | null
   rescue?: MetaStepRescue
 }
 
-export interface MetaRunCompletedPayload extends MetaSessionEventPayload {
-  run_id?: string
+export interface MetaRunCompletedPayload {
+  runId?: string
   outcome?: string
-  completed_steps?: string[]
-  failed_steps?: string[]
-  recovered_steps?: string[]
-  skipped_steps?: string[]
+  completedSteps?: string[]
+  failedSteps?: string[]
+  recoveredSteps?: string[]
+  skippedSteps?: string[]
 }
 
-export interface MetaSessionEventPayload {
-  key?: string
-  session_key?: string
-  sessionKey?: string
-  epoch?: number
-  stream_seq?: number
-  streamSeq?: number
-  stream_generation?: string
-  streamGeneration?: string
-  [key: string]: unknown
-}
-
-/** Canonical event projection; session and sequence fencing stays in the adapter. */
-export interface MetaEvent {
-  readonly kind: MetaEventKind
-  readonly payload: Readonly<Record<string, unknown>>
+/** Canonical cursor facts shared with the conversation runtime. */
+interface MetaEventContext extends ConversationCursorSignal {
   readonly sessionKey: string | null
+  readonly sessionEpoch: number | null
   readonly streamSeq: number | null
   readonly streamGeneration: string | null
 }
+
+/** Canonical event projection; all wire aliases stay in the Gateway Adapter. */
+export type MetaEvent =
+  | (MetaEventContext & { readonly kind: 'preflight'; readonly payload: MetaPreflightPayload })
+  | (MetaEventContext & { readonly kind: 'run-announced'; readonly payload: MetaRunAnnouncedPayload })
+  | (MetaEventContext & { readonly kind: 'step-state'; readonly payload: MetaStepStatePayload })
+  | (MetaEventContext & { readonly kind: 'run-completed'; readonly payload: MetaRunCompletedPayload })
 
 export interface MetaRunRequestOptions {
   readonly signal?: AbortSignal

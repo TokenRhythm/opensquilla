@@ -213,7 +213,7 @@ async function mountPanel(options: {
   })
   vi.doMock('@/stores/rpc', () => ({
     useRpcStore: () => ({
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call,
     }),
   }))

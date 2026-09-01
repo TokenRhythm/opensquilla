@@ -1,12 +1,12 @@
 // @vitest-environment happy-dom
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick } from 'vue'
+import { SESSION_CONVERSATION_KEY } from '@/modules/sessionConversation'
+import { sessionConversationTestDouble } from '@/testing/sessionConversation.test-helper'
 import type { ChatMessageMeta, ChatRenderedMessage } from '@/types/chat'
 
-const rpcCall = vi.fn()
-vi.mock('@/stores/rpc', () => ({
-  useRpcStore: () => ({ call: rpcCall }),
-}))
+const submitRouteFeedback = vi.fn()
+const sessionConversation = sessionConversationTestDouble({ submitRouteFeedback })
 
 import i18n from '@/i18n'
 import AssistantMessage from './AssistantMessage.vue'
@@ -60,6 +60,7 @@ async function mountMessage(message: ChatRenderedMessage) {
     copyMessage: async () => true,
   })
   app.use(i18n)
+  app.provide(SESSION_CONVERSATION_KEY, sessionConversation)
   app.mount(el)
   await nextTick()
   return { app, el }
@@ -67,8 +68,8 @@ async function mountMessage(message: ChatRenderedMessage) {
 
 beforeEach(() => {
   i18n.global.locale.value = 'en'
-  rpcCall.mockReset()
-  rpcCall.mockResolvedValue({ accepted: true })
+  submitRouteFeedback.mockReset()
+  submitRouteFeedback.mockResolvedValue({ accepted: true })
   document.body.innerHTML = ''
 })
 
@@ -88,10 +89,7 @@ describe('AssistantMessage routing feedback buttons', () => {
 
     votes[1].click()
     await nextTick()
-    expect(rpcCall).toHaveBeenCalledWith('router.feedback.submit', {
-      decisionId: 'dec-ui-1',
-      rating: 'down',
-    })
+    expect(submitRouteFeedback).toHaveBeenCalledWith('dec-ui-1', 'down')
     app.unmount()
   })
 

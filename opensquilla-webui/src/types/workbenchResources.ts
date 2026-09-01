@@ -1,5 +1,5 @@
 import type { ArtifactDocument, ArtifactRevision } from './artifactDocuments'
-import type { ArtifactPayload } from './rpc'
+import type { ArtifactPayload } from './artifacts'
 
 export type WorkbenchResourceType = 'attachment' | 'document' | 'deliverable' | 'url'
 

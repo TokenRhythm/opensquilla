@@ -62,7 +62,7 @@ function harness(
     storage?: MetaSetupStorage | null
     discardStorage?: MetaSetupStorage | null
     session?: string
-    waitForConnection?: (timeoutMs?: number) => Promise<void>
+    ready?: (timeoutMs?: number) => Promise<void>
     autoRestore?: boolean
     dispatchHidden?: (
       providerText: string,
@@ -95,7 +95,7 @@ function harness(
   })))
   const metaRunCenter: MetaRunCenter = {
     launch: async (input) => {
-      await options.waitForConnection?.(15_000)
+      await options.ready?.(15_000)
       const raw = await call('meta.run', input) as Record<string, unknown>
       return {
         ok: raw.ok === true,
@@ -111,15 +111,15 @@ function harness(
     confirmPreflight: async () => ({}),
     replay: async () => ({}),
     setupPlan: async name => {
-      await options.waitForConnection?.(15_000)
+      await options.ready?.(15_000)
       return await call('meta.setup.plan', { name }) as Record<string, unknown>
     },
     setupStatus: async input => {
-      await options.waitForConnection?.(15_000)
+      await options.ready?.(15_000)
       return await call('meta.setup.status', input) as Record<string, unknown>
     },
     setupInstall: async input => {
-      await options.waitForConnection?.(15_000)
+      await options.ready?.(15_000)
       return await call('meta.setup.install', {
         name: input.name,
         sessionKey: input.sessionKey,
@@ -1785,17 +1785,17 @@ describe('useMetaSkillSetup', () => {
 
   it('waits for the RPC connection and retains a job across a transient restore failure', async () => {
     const storage = memoryStorage({ [metaSetupStorageKey(SESSION)]: 'restored-job' })
-    const waitForConnection = vi.fn(async () => undefined)
+    const ready = vi.fn(async () => undefined)
     let statusCalls = 0
     const call = vi.fn(async () => {
       statusCalls += 1
       if (statusCalls === 1) throw new Error('Cannot call meta.setup.status: not connected')
       return { job: job({ job_id: 'restored-job' }) }
     })
-    const { api } = harness(call, { storage, waitForConnection })
+    const { api } = harness(call, { storage, ready })
     await flushPromises()
 
-    expect(waitForConnection).toHaveBeenCalledWith(15_000)
+    expect(ready).toHaveBeenCalledWith(15_000)
     expect(storage.getItem(metaSetupStorageKey(SESSION))).toBe('restored-job')
     expect(api.setupState.value?.phase).toBe('failed')
     expect(api.setupState.value?.retryMode).toBe('status')

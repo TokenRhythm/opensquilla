@@ -2,19 +2,38 @@ import { ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import {
-  useChatSessionSubscription,
-  type UseChatSessionSubscriptionOptions,
+  useChatSessionSubscription as useProductionChatSessionSubscription,
+  type UseChatSessionSubscriptionOptions as ProductionSubscriptionOptions,
 } from './useChatSessionSubscription'
 import { SESSION_PHASE_ATTEMPT_BUDGET_MS } from './sessionBootstrapContract'
 import { RpcTimeoutError, type RpcCallOptions } from '@/lib/rpc'
 import type { ChatRunStatus, ChatRunStatusState } from '@/types/chat'
 import { useChatTaskOwnership } from './useChatTaskOwnership'
+import {
+  gatewayAccessFromTestRpc,
+  sessionConversationFromTestRpc,
+  type SessionConversationTestRpc,
+} from '@/testing/sessionConversation.test-helper'
+
+type UseChatSessionSubscriptionOptions = Omit<
+  ProductionSubscriptionOptions,
+  'sessionConversation' | 'gatewayAccess'
+> & { rpc: SessionConversationTestRpc }
+
+function useChatSessionSubscription(options: UseChatSessionSubscriptionOptions) {
+  const { rpc, ...domainOptions } = options
+  return useProductionChatSessionSubscription({
+    ...domainOptions,
+    sessionConversation: sessionConversationFromTestRpc(rpc),
+    gatewayAccess: gatewayAccessFromTestRpc(rpc),
+  })
+}
 
 function createSubscription(hasActiveInterrupt = false) {
   const resetStreamLiveTurnState = vi.fn()
   const runStatus = ref({ status: 'idle' as const, label: 'Idle', task: null })
   const rpc = {
-    waitForConnection: vi.fn().mockResolvedValue(undefined),
+    ready: vi.fn().mockResolvedValue(undefined),
     call: vi.fn().mockResolvedValue({
       subscribed: true,
       status: 'idle',
@@ -65,7 +84,7 @@ describe('useChatSessionSubscription', () => {
     const rpc = {
       connectionGeneration: 7,
       recoverConnectionGeneration,
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call: call as unknown as UseChatSessionSubscriptionOptions['rpc']['call'],
     }
     const subscription = useChatSessionSubscription({
@@ -141,7 +160,7 @@ describe('useChatSessionSubscription', () => {
     const rpc: UseChatSessionSubscriptionOptions['rpc'] = {
       get connectionGeneration() { return generation },
       recoverConnectionGeneration: vi.fn(),
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call: call as unknown as UseChatSessionSubscriptionOptions['rpc']['call'],
     }
     const subscription = useChatSessionSubscription({
@@ -175,7 +194,7 @@ describe('useChatSessionSubscription', () => {
     const rpc: UseChatSessionSubscriptionOptions['rpc'] = {
       connectionGeneration: 9,
       recoverConnectionGeneration,
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call: vi.fn(async (
         method: string,
         _params?: Record<string, unknown>,
@@ -242,7 +261,7 @@ describe('useChatSessionSubscription', () => {
     const rpc: UseChatSessionSubscriptionOptions['rpc'] = {
       connectionGeneration: 11,
       recoverConnectionGeneration,
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call: call as unknown as UseChatSessionSubscriptionOptions['rpc']['call'],
     }
     const subscription = useChatSessionSubscription({
@@ -292,7 +311,7 @@ describe('useChatSessionSubscription', () => {
     })
     const subscription = useChatSessionSubscription({
       rpc: {
-        waitForConnection: vi.fn(async () => {}),
+        ready: vi.fn(async () => {}),
         call: vi.fn(),
       },
       sessionKey: ref('agent:main:webchat:steer-capability'),
@@ -344,7 +363,7 @@ describe('useChatSessionSubscription', () => {
       }
     })
     const rpc: UseChatSessionSubscriptionOptions['rpc'] = {
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call: call as unknown as <T = unknown>(
         method: string,
         params?: Record<string, unknown>,
@@ -391,7 +410,7 @@ describe('useChatSessionSubscription', () => {
   it('does not clear an unknown-acceptance Stop merely because hydrate is idle', async () => {
     const acceptanceStopPending = ref(true)
     const rpc: UseChatSessionSubscriptionOptions['rpc'] = {
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call: vi.fn(async (method: string) => {
         if (method === 'sessions.messages.snapshot') {
           return {
@@ -438,7 +457,7 @@ describe('useChatSessionSubscription', () => {
   it('skips snapshot on the second bounded bootstrap attempt', async () => {
     const now = Date.now()
     const rpc = {
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call: vi.fn().mockResolvedValue({
         subscribed: true,
         run_status: 'idle',
@@ -492,7 +511,7 @@ describe('useChatSessionSubscription', () => {
     const now = Date.now()
     const timeout = new RpcTimeoutError('sessions.messages.snapshot', 3_000)
     const rpc = {
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call: vi.fn().mockRejectedValue(timeout),
     }
     const subscription = useChatSessionSubscription({
@@ -547,7 +566,7 @@ describe('useChatSessionSubscription', () => {
   it('restores the compact live snapshot before subscribing from its cursor', async () => {
     const onLiveSnapshot = vi.fn()
     const rpc = {
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call: vi.fn(async <T = unknown>(method: string) => {
         if (method === 'sessions.messages.snapshot') {
           return {
@@ -616,7 +635,7 @@ describe('useChatSessionSubscription', () => {
       current_stream_seq: 2400,
       events: [
         {
-          event: 'session.event.thinking',
+          event: 'thinking-delta',
           payload: {
             task_id: 'task-resume',
             text: 'Recovered reasoning',
@@ -636,7 +655,7 @@ describe('useChatSessionSubscription', () => {
     const resetStreamLiveTurnState = vi.fn()
     const runStatus = ref<ChatRunStatus>({ status: 'idle', label: 'Idle', task: null })
     const rpc: UseChatSessionSubscriptionOptions['rpc'] = {
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call: vi.fn(async (method: string) => {
         if (method === 'sessions.messages.snapshot') {
           return {
@@ -696,7 +715,7 @@ describe('useChatSessionSubscription', () => {
   it('hydrates the authoritative run-mode lock from the subscription snapshot', async () => {
     const onRunModeLock = vi.fn()
     const rpc = {
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call: async <T = unknown>() => ({
         subscribed: true,
         run_status: 'running',
@@ -772,7 +791,7 @@ describe('useChatSessionSubscription', () => {
     }
     const subscription = useChatSessionSubscription({
       rpc: {
-        waitForConnection: vi.fn().mockResolvedValue(undefined),
+        ready: vi.fn().mockResolvedValue(undefined),
         call: vi.fn().mockResolvedValue(snapshot),
       },
       sessionKey: ref('agent:main:webchat:test'),
@@ -799,7 +818,7 @@ describe('useChatSessionSubscription', () => {
     let resolveSnapshot: ((value: unknown) => void) | undefined
     const snapshot = new Promise(resolve => { resolveSnapshot = resolve })
     const rpc = {
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call: <T = unknown>() => snapshot as Promise<T>,
     }
     const lastStreamSeq = ref(0)
@@ -846,7 +865,7 @@ describe('useChatSessionSubscription', () => {
     const startStreaming = vi.fn(() => { isStreaming.value = true })
     const reconcileStreamTaskClock = vi.fn()
     const rpc = {
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call: async <T = unknown>() => ({
           subscribed: true,
           run_status: 'running',
@@ -899,7 +918,7 @@ describe('useChatSessionSubscription', () => {
     const reconcileStreamTaskClock = vi.fn()
     const subscription = useChatSessionSubscription({
       rpc: {
-        waitForConnection: vi.fn(async () => {}),
+        ready: vi.fn(async () => {}),
         call: async <T = unknown>() => ({
           subscribed: true,
           run_status: 'running',
@@ -962,7 +981,7 @@ describe('useChatSessionSubscription', () => {
     }
     const subscription = useChatSessionSubscription({
       rpc: {
-        waitForConnection: vi.fn(async () => {}),
+        ready: vi.fn(async () => {}),
         call: async <T = unknown>() => snapshot as T,
       },
       sessionKey: ref('agent:main:webchat:steer-hydration'),
@@ -1002,7 +1021,7 @@ describe('useChatSessionSubscription', () => {
   it('reports a failed subscription as non-authoritative', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const rpc = {
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call: vi.fn().mockRejectedValue(new Error('socket closed')),
     }
     const subscription = useChatSessionSubscription({
@@ -1036,7 +1055,7 @@ describe('useChatSessionSubscription', () => {
   it('does not let an older same-session snapshot claim authoritative idle', async () => {
     const pendingSnapshots: Array<(value: unknown) => void> = []
     const rpc = {
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call: <T = unknown>() => new Promise<T>((resolve) => {
         pendingSnapshots.push(resolve as (value: unknown) => void)
       }),
@@ -1094,7 +1113,7 @@ describe('useChatSessionSubscription', () => {
     const activeTaskGroups = ref(new Set(['stale-group']))
     const runStatus = ref<ChatRunStatus>({ status: 'running', label: '', task: null })
     const rpc = {
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call: async <T = unknown>() => ({
         subscribed: true,
         run_status: 'cancelled',
@@ -1134,7 +1153,7 @@ describe('useChatSessionSubscription', () => {
     const activeTaskGroups = ref(new Set<string>())
     const runStatus = ref<ChatRunStatus>({ status: 'idle', label: '', task: null })
     const rpc = {
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call: async <T = unknown>() => ({
         subscribed: true,
         run_status: 'idle',
@@ -1174,7 +1193,7 @@ describe('useChatSessionSubscription', () => {
   it('releases pending work when a reconnect later proves the session idle', async () => {
     const onAuthoritativeIdle = vi.fn()
     const rpc = {
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call: vi.fn()
         .mockRejectedValueOnce(new Error('socket closed'))
         .mockResolvedValueOnce({ subscribed: true, run_status: 'idle' }),
@@ -1209,7 +1228,7 @@ describe('useChatSessionSubscription', () => {
     const beginSessionMetadataResolution = vi.fn(() => 41)
     const onSessionMetadata = vi.fn()
     const rpc = {
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call: vi.fn().mockResolvedValue({
         subscribed: true,
         run_status: 'idle',
@@ -1260,7 +1279,7 @@ describe('useChatSessionSubscription', () => {
     let generation = 0
     const onSessionMetadataError = vi.fn()
     const rpc = {
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call: <T = unknown>() => new Promise<T>((_resolve, reject) => {
         pending.push(reject)
       }),
@@ -1322,7 +1341,7 @@ describe('useChatSessionSubscription', () => {
     })
     const markLiveSubscribeSent = vi.fn()
     const rpc = {
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call: async <T = unknown>(
         method: string,
         _params?: Record<string, unknown>,
@@ -1450,7 +1469,7 @@ describe('useChatSessionSubscription', () => {
         throw new Error(`Unexpected method: ${method}`)
       })
     const rpc = {
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call: call as unknown as <T = unknown>(
         method: string,
         params?: Record<string, unknown>,
@@ -1506,7 +1525,7 @@ describe('useChatSessionSubscription', () => {
     const beginSessionMetadataResolution = vi.fn(() => 12)
     const onSessionMetadata = vi.fn()
     const rpc = {
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call: vi.fn(async <T = unknown>(method: string) => {
         if (method !== 'sessions.messages.hydrate') {
           throw new Error(`Unexpected method: ${method}`)
@@ -1548,7 +1567,7 @@ describe('useChatSessionSubscription', () => {
 
     await expect(subscription.retrySessionMetadata()).resolves.toBe(true)
 
-    expect(rpc.waitForConnection).toHaveBeenCalledWith(
+    expect(rpc.ready).toHaveBeenCalledWith(
       expect.any(Number),
       expect.any(AbortSignal),
       { timeoutAction: 'reject', abortAction: 'reject' },
@@ -1627,7 +1646,7 @@ describe('useChatSessionSubscription', () => {
     })
     const subscription = useChatSessionSubscription({
       rpc: {
-        waitForConnection: vi.fn(async () => {}),
+        ready: vi.fn(async () => {}),
         call: call as unknown as <T = unknown>(
           method: string,
           params?: Record<string, unknown>,
@@ -1679,7 +1698,7 @@ describe('useChatSessionSubscription', () => {
     const lastStreamSeq = ref(7_500)
     const resetStreamLiveTurnState = vi.fn()
     const rpc: UseChatSessionSubscriptionOptions['rpc'] = {
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call: vi.fn(async () => ({
         subscribed: true,
         hydration_complete: true,
@@ -1724,7 +1743,7 @@ describe('useChatSessionSubscription', () => {
     const resetStreamLiveTurnState = vi.fn()
     const subscription = useChatSessionSubscription({
       rpc: {
-        waitForConnection: vi.fn(async () => {}),
+        ready: vi.fn(async () => {}),
         call: vi.fn(async () => ({})) as unknown as UseChatSessionSubscriptionOptions['rpc']['call'],
       },
       sessionKey: ref('agent:main:webchat:legacy-generation-upgrade'),
@@ -1755,7 +1774,7 @@ describe('useChatSessionSubscription', () => {
     const resetStreamLiveTurnState = vi.fn()
     const subscription = useChatSessionSubscription({
       rpc: {
-        waitForConnection: vi.fn(async () => {}),
+        ready: vi.fn(async () => {}),
         call: vi.fn(async () => ({
           subscribed: true,
           hydration_complete: true,

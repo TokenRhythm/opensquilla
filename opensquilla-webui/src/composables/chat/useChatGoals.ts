@@ -1,5 +1,5 @@
 import { computed, onBeforeUnmount, ref, watch, type Ref } from 'vue'
-import type { SessionMessagesSubscribeResponse } from '@/types/rpc'
+import type { SessionMessagesSubscribeResponse } from '@/modules/sessionConversation'
 import { localizeGoalRpcError } from '@/lib/rpcErrors'
 import { createClientRequestId } from '@/utils/chat/messageIdentity'
 import type { GoalCenter } from '@/modules/goalCenter'

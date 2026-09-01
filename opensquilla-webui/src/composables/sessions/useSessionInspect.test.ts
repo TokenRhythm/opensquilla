@@ -1,15 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const rpc = vi.hoisted(() => ({
-  waitForConnection: vi.fn(),
+  ready: vi.fn(),
   call: vi.fn(),
 }))
 
-vi.mock('@/stores/rpc', () => ({
-  useRpcStore: () => rpc,
-}))
-
 import { useSessionInspect } from './useSessionInspect'
+import { sessionConversationFromTestRpc } from '@/testing/sessionConversation.test-helper'
 
 function page(id: string, cursor: string, hasMore: boolean) {
   return {
@@ -22,7 +19,7 @@ function page(id: string, cursor: string, hasMore: boolean) {
 }
 
 beforeEach(() => {
-  rpc.waitForConnection.mockReset().mockResolvedValue(undefined)
+  rpc.ready.mockReset().mockResolvedValue(undefined)
   rpc.call.mockReset().mockImplementation(async (method: string) => {
     if (method === 'sessions.preview') return { previews: [] }
     return page('m2', 'cursor-2', true)
@@ -31,7 +28,7 @@ beforeEach(() => {
 
 describe('useSessionInspect canonical pagination', () => {
   it('requests canonical transcript pages without summaries', async () => {
-    const inspect = useSessionInspect()
+    const inspect = useSessionInspect(sessionConversationFromTestRpc(rpc))
 
     await inspect.load('agent:main:webchat:test')
 
@@ -62,7 +59,7 @@ describe('useSessionInspect canonical pagination', () => {
         canonical_complete: true,
       }
     })
-    const inspect = useSessionInspect()
+    const inspect = useSessionInspect(sessionConversationFromTestRpc(rpc))
 
     await inspect.load('agent:main:webchat:test')
     await inspect.loadEarlier()
@@ -89,7 +86,7 @@ describe('useSessionInspect canonical pagination', () => {
       }
       return page('m3', 'cursor-3', false)
     })
-    const inspect = useSessionInspect()
+    const inspect = useSessionInspect(sessionConversationFromTestRpc(rpc))
 
     await inspect.load('agent:main:webchat:test')
     await inspect.loadEarlier()
@@ -112,7 +109,7 @@ describe('useSessionInspect canonical pagination', () => {
       if (method === 'sessions.preview') return { previews: [] }
       return { ...page('m1', 'cursor-1', false), canonical_complete: false }
     })
-    const inspect = useSessionInspect()
+    const inspect = useSessionInspect(sessionConversationFromTestRpc(rpc))
 
     await inspect.load('agent:main:webchat:legacy')
 
@@ -131,7 +128,7 @@ describe('useSessionInspect canonical pagination', () => {
         canonical_complete: historyCall > 1,
       }
     })
-    const inspect = useSessionInspect()
+    const inspect = useSessionInspect(sessionConversationFromTestRpc(rpc))
 
     await inspect.load('agent:main:webchat:retry')
 
@@ -153,7 +150,7 @@ describe('useSessionInspect canonical pagination', () => {
         ? page('m2', 'cursor-2', true)
         : page('m1', 'cursor-1', false)
     })
-    const inspect = useSessionInspect()
+    const inspect = useSessionInspect(sessionConversationFromTestRpc(rpc))
     let visibleBeforeApply: string[] = []
 
     await inspect.load('agent:main:webchat:test')
@@ -177,7 +174,7 @@ describe('useSessionInspect canonical pagination', () => {
       if (params?.sessionKey === 'agent:main:webchat:b') return page('b2', 'cursor-b2', true)
       return page('a1', 'cursor-a1', false)
     })
-    const inspect = useSessionInspect()
+    const inspect = useSessionInspect(sessionConversationFromTestRpc(rpc))
 
     await inspect.load('agent:main:webchat:a')
     const staleLoad = inspect.loadEarlier()

@@ -10,7 +10,7 @@ import type {
   ChatCompactionSummary,
   ChatHistoryMessage,
   ChatHistoryResponse,
-} from '@/types/rpc'
+} from '@/types/chat'
 import type { StatusPart } from '@/types/parts'
 import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import { normalizeDisplayAttachments } from '@/utils/chat/attachments'
@@ -39,9 +39,7 @@ import {
   type SessionBootstrapPhaseContext,
   type SessionPhaseResult,
 } from '@/composables/chat/sessionBootstrapContract'
-import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
 import type { SessionConversation } from '@/modules/sessionConversation'
-import { createLegacySessionConversation } from '@/adapters/gateway/sessionConversationV4'
 import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
 import {
   activityReasoningBlocks,
@@ -52,22 +50,8 @@ import { isUsageAccountingBarrier } from '@/utils/chat/usageAccountingFailure'
 import { interleaveHistoryModelCallSegments } from '@/utils/chat/historyModelCallSegments'
 import { normalizePromptAnnotationSnapshot } from '@/workbench/artifactPromptAnnotationProvider'
 
-type RpcClient = {
-  policy?: Record<string, unknown> | null
-  waitForConnection?: (
-    timeoutMs?: number,
-    signal?: AbortSignal,
-    actions?: RpcConnectionWaitOptions,
-  ) => Promise<void>
-  call?: <T = unknown>(
-    method: string,
-    params?: Record<string, unknown>,
-    options?: RpcCallOptions,
-  ) => Promise<T>
-}
-
-function historyTerminationActions(rpc: RpcClient) {
-  const timeoutAction = rpc.policy?.concurrent_history_reads === true
+function historyTerminationActions(concurrentReads: boolean) {
+  const timeoutAction = concurrentReads
     ? 'reject' as const
     : 'reconnect' as const
   return {
@@ -669,8 +653,8 @@ function preserveAcceptedEnsembleRouterRows(
 }
 
 export interface UseChatHistoryOptions {
-  rpc: RpcClient
-  sessionConversation?: SessionConversation
+  sessionConversation: SessionConversation
+  concurrentHistoryReads?: () => boolean
   sessionKey: Ref<string>
   messages: Ref<ChatMessage[]>
   threadRef?: Ref<HTMLElement | null>
@@ -726,8 +710,7 @@ type FailedHistoryRequest =
 const MAX_FORWARD_BRIDGE_PAGES = 2
 
 export function useChatHistory(options: UseChatHistoryOptions) {
-  const conversation: SessionConversation = options.sessionConversation
-    ?? createLegacySessionConversation(options.rpc as Parameters<typeof createLegacySessionConversation>[0])
+  const conversation = options.sessionConversation
   let historySyncTimer: ReturnType<typeof setTimeout> | null = null
   let historyRequestSeq = 0
   let preserveLocalTailGeneration = 0
@@ -978,7 +961,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       // serial Gateways still need a fresh connection to escape a stuck read.
         ...(nonReconnecting
         ? nonReconnectingHistoryActions()
-        : historyTerminationActions(options.rpc)),
+        : historyTerminationActions(options.concurrentHistoryReads?.() === true)),
       onSent: (socketGeneration: number) => {
         bootstrap.markHistoryRequestSent?.(socketGeneration)
       },

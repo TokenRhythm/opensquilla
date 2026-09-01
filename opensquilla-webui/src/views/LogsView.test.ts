@@ -6,14 +6,14 @@ import { OBSERVABILITY_KEY } from '@/modules/observability'
 
 const rpcMocks = vi.hoisted(() => ({
   call: vi.fn(),
-  waitForConnection: vi.fn(),
+  ready: vi.fn(),
 }))
 
 vi.mock('@/stores/rpc', () => ({
   useRpcStore: () => ({
     client: {},
     call: rpcMocks.call,
-    waitForConnection: rpcMocks.waitForConnection,
+    ready: rpcMocks.ready,
   }),
 }))
 
@@ -169,8 +169,8 @@ function tailCalls() {
 beforeEach(() => {
   vi.useFakeTimers()
   rpcMocks.call.mockReset()
-  rpcMocks.waitForConnection.mockReset()
-  rpcMocks.waitForConnection.mockResolvedValue(undefined)
+  rpcMocks.ready.mockReset()
+  rpcMocks.ready.mockResolvedValue(undefined)
   rpcMocks.call.mockImplementation(async (method: string) => {
     if (method === 'logs.status') return normalStatus()
     if (method === 'logs.tail') return { lines: [], cursor: 0 }

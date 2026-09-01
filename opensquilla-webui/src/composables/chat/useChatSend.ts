@@ -86,10 +86,6 @@ import {
   taskTerminalMessage,
 } from '@/utils/chat/streamEvents'
 
-type RpcClient = {
-  call: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
-}
-
 /**
  * The pending-steer WAL and delivery helper still store the historical v4
  * identity spellings. Keep that persistence shape private to this composable
@@ -481,16 +477,9 @@ function chatSourceMetadata(options: UseChatSendOptions): TurnSendSource {
 }
 
 export interface UseChatSendOptions {
-  rpc: RpcClient
   metaRunCenter?: Pick<MetaRunCenter, 'discardDraft'>
   /** Semantic command port; v4 method aliases live in the Gateway Adapter. */
   turnCommands: TurnCommands
-  /**
-   * @deprecated Test-only bridge for legacy harnesses; TurnCommands owns all
-   * turn capability checks in production. Remove with the S14 command
-   * Contract migration.
-   */
-  supportsMethod?: (method: string) => boolean
   activeSteerCapability?: Readonly<Ref<ChatSteerCapability | null>>
   inputText: Ref<string>
   messages: Ref<ChatMessage[]>

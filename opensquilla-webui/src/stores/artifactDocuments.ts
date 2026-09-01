@@ -1,12 +1,13 @@
 import { defineStore } from 'pinia'
 import { markRaw, ref, shallowRef } from 'vue'
 
+import type { ArtifactDocumentProvider } from '@/modules/artifactWorkbench'
 import type {
   ArtifactDocumentActions,
   ArtifactDocumentWorkspace,
   ArtifactDocumentWorkspaceSnapshot,
 } from '@/types/artifactDocuments'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import {
   artifactMutationOutcomeMayBePending,
   artifactProductClientError,
@@ -16,7 +17,6 @@ import { PendingMutationRequestIds } from '@/utils/mutationRequestIdentity'
 import { resolveArtifactMutationBounded } from '@/workbench/artifactMutationRecovery'
 import {
   createLegacyArtifactWorkspace,
-  type ArtifactDocumentProvider,
 } from '@/workbench/artifactDocumentProvider'
 
 function artifactIdentity(artifact: ArtifactPayload): string {

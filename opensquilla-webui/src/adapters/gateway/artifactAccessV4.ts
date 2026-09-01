@@ -1,9 +1,9 @@
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import type {
   ArtifactAccessRequest,
   ArtifactContentAccess,
 } from '@/modules/artifactWorkbench'
-import { artifactDownloadUrl, artifactFileTitle } from '@/utils/chat/artifacts'
+import { artifactFileTitle } from '@/utils/chat/artifacts'
 
 export interface ArtifactAuthContext {
   baseOrigin?: string
@@ -47,12 +47,23 @@ const BLOB_REVOKE_DELAY_MS = 60000
 const DESKTOP_RENDERER_PROTOCOL = 'opensquilla-app:'
 const DESKTOP_RENDERER_HOST = 'desktop'
 
-function runtimeBaseOrigin(): string {
-  if (typeof window !== 'undefined' && window.location?.origin) return window.location.origin
+export function runtimeArtifactBaseOrigin(): string {
+  if (
+    typeof window !== 'undefined'
+    && window.location?.protocol === DESKTOP_RENDERER_PROTOCOL
+    && window.location.hostname === DESKTOP_RENDERER_HOST
+  ) {
+    return `${DESKTOP_RENDERER_PROTOCOL}//${DESKTOP_RENDERER_HOST}`
+  }
+  if (
+    typeof window !== 'undefined'
+    && window.location?.origin
+    && window.location.origin !== 'null'
+  ) return window.location.origin
   return DEFAULT_BASE_ORIGIN
 }
 
-function runtimeAuthToken(): string {
+export function runtimeArtifactAuthToken(): string {
   try {
     return globalThis.sessionStorage?.getItem('opensquilla.wsToken')?.trim() || ''
   } catch {
@@ -62,8 +73,8 @@ function runtimeAuthToken(): string {
 
 function runtimeOptions(request: ArtifactAccessRequest = {}): ArtifactFetchOptions {
   return {
-    authToken: runtimeAuthToken(),
-    baseOrigin: runtimeBaseOrigin(),
+    authToken: runtimeArtifactAuthToken(),
+    baseOrigin: runtimeArtifactBaseOrigin(),
     requireSameOrigin: request.requireSameOrigin,
     sessionKey: request.sessionKey,
     signal: request.signal,
@@ -90,10 +101,7 @@ function urlsShareArtifactOrigin(candidate: URL, base: URL): boolean {
 
 function resolveBaseOrigin(baseOrigin?: string): string {
   if (baseOrigin) return baseOrigin
-  if (typeof window !== 'undefined' && window.location && window.location.origin) {
-    return window.location.origin
-  }
-  return DEFAULT_BASE_ORIGIN
+  return runtimeArtifactBaseOrigin()
 }
 
 function resolveFetch(fetchImpl?: typeof fetch): typeof fetch | null {
@@ -174,6 +182,34 @@ export function isTrustedArtifactTransportUrl(url: string, baseOrigin: string): 
   }
 }
 
+interface ArtifactUrlOptions {
+  readonly absolute?: boolean
+}
+
+function artifactDownloadUrl(
+  artifact: ArtifactPayload,
+  baseOrigin: string,
+  options: ArtifactUrlOptions = {},
+): string {
+  let raw = artifact?.download_url ? String(artifact.download_url) : ''
+  if (!raw && artifact?.id) raw = `/api/v1/artifacts/${encodeURIComponent(artifact.id)}`
+  if (!raw) return ''
+  try {
+    const url = new URL(raw, baseOrigin)
+    const base = new URL(baseOrigin)
+    const sameOrigin = urlsShareArtifactOrigin(url, base)
+    if (sameOrigin) {
+      url.searchParams.delete('token')
+      url.searchParams.delete('sessionKey')
+      url.searchParams.delete('session_key')
+    }
+    if (!sameOrigin || options.absolute) return url.toString()
+    return url.pathname + url.search + url.hash
+  } catch {
+    return raw
+  }
+}
+
 export function artifactAccessUrl(
   artifact: ArtifactPayload,
   baseOrigin: string,
@@ -181,16 +217,32 @@ export function artifactAccessUrl(
 ): string {
   return artifactDownloadUrl(artifact, baseOrigin, {
     absolute: options.absolute === true,
-    includeSessionKey: false,
   })
 }
 
-export function artifactAccessHeaders(url: string, options: ArtifactAuthContext = {}): Record<string, string> {
+export function artifactThumbnailAccessUrl(
+  artifact: ArtifactPayload,
+  baseOrigin: string,
+): string {
+  const thumbnailUrl = artifact?.thumbnail_url ? String(artifact.thumbnail_url) : ''
+  return artifactDownloadUrl(
+    thumbnailUrl ? { ...artifact, download_url: thumbnailUrl } : artifact,
+    baseOrigin,
+  )
+}
+
+export function artifactAccessHeaders(
+  url: string,
+  options: ArtifactAuthContext = {},
+): Record<string, string> {
   const baseOrigin = resolveBaseOrigin(options.baseOrigin)
   if (!isSameOriginArtifactUrl(url, baseOrigin)) return {}
   const headers: Record<string, string> = {}
   if (options.sessionKey) headers['x-opensquilla-session-key'] = options.sessionKey
-  if (options.authToken) headers.Authorization = `Bearer ${options.authToken}`
+  const authToken = options.authToken === undefined
+    ? runtimeArtifactAuthToken()
+    : options.authToken
+  if (authToken) headers.Authorization = `Bearer ${authToken}`
   return headers
 }
 

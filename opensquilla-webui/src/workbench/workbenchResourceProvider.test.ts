@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   createRpcWorkbenchResourceProvider,
   WORKBENCH_RESOURCE_RPC_METHODS,
-} from './workbenchResourceProvider'
+} from '@/adapters/gateway/workbenchResourcesV4'
 
 describe('workbench resource provider', () => {
   it('keeps selection and Agent editing independent from preview and legacy edit', async () => {
@@ -31,7 +31,7 @@ describe('workbench resource provider', () => {
       }],
       totalCount: 2,
     }))
-    const provider = createRpcWorkbenchResourceProvider({ call, supportsMethod: () => true })
+    const provider = createRpcWorkbenchResourceProvider({ call, hasRpcMethod: () => true })
 
     const result = await provider.list('session-a')
 
@@ -83,7 +83,7 @@ describe('workbench resource provider', () => {
       ],
       totalCount: 3,
     }))
-    const provider = createRpcWorkbenchResourceProvider({ call, supportsMethod: () => true })
+    const provider = createRpcWorkbenchResourceProvider({ call, hasRpcMethod: () => true })
 
     const result = await provider.list('session-a')
 
@@ -139,7 +139,7 @@ describe('workbench resource provider', () => {
         nextCursor: 'next-page',
       }
     })
-    const provider = createRpcWorkbenchResourceProvider({ call, supportsMethod: () => true })
+    const provider = createRpcWorkbenchResourceProvider({ call, hasRpcMethod: () => true })
 
     const result = await provider.list('session-a', { limit: 1 })
 
@@ -193,7 +193,7 @@ describe('workbench resource provider', () => {
         replayed: false,
       },
     }))
-    const provider = createRpcWorkbenchResourceProvider({ call, supportsMethod: () => true })
+    const provider = createRpcWorkbenchResourceProvider({ call, hasRpcMethod: () => true })
 
     const result = await provider.importDocument({
       sessionKey: 'session-a',
@@ -237,7 +237,7 @@ describe('workbench resource provider', () => {
         relations: {},
       },
     }))
-    const provider = createRpcWorkbenchResourceProvider({ call, supportsMethod: () => true })
+    const provider = createRpcWorkbenchResourceProvider({ call, hasRpcMethod: () => true })
 
     await expect(provider.get('session-a', { type: 'attachment', attachmentId: 'att-a' }))
       .resolves.toMatchObject({ name: 'page.html' })
@@ -290,7 +290,7 @@ describe('workbench resource provider', () => {
       },
       materialized: true,
     }))
-    const provider = createRpcWorkbenchResourceProvider({ call, supportsMethod: () => true })
+    const provider = createRpcWorkbenchResourceProvider({ call, hasRpcMethod: () => true })
 
     await expect(provider.open?.(
       'session-a',
@@ -334,7 +334,7 @@ describe('workbench resource provider', () => {
         relations: {},
       },
     }))
-    const provider = createRpcWorkbenchResourceProvider({ call, supportsMethod: () => true })
+    const provider = createRpcWorkbenchResourceProvider({ call, hasRpcMethod: () => true })
 
     const result = await provider.open?.(
       'session-a',
@@ -361,11 +361,11 @@ describe('workbench resource provider', () => {
       code: 'METHOD_NOT_FOUND',
     })
     const call = vi.fn(async () => { throw unavailable })
-    const markMethodUnavailable = vi.fn()
+    const rememberUnsupportedMethod = vi.fn()
     const provider = createRpcWorkbenchResourceProvider({
       call,
-      markMethodUnavailable,
-      supportsMethod: () => true,
+      rememberUnsupportedMethod,
+      hasRpcMethod: () => true,
     })
 
     await expect(provider.open?.(
@@ -373,14 +373,14 @@ describe('workbench resource provider', () => {
       { type: 'deliverable', artifactId: 'artifact-a' },
       { intent: 'edit-current', idempotencyKey: 'open-artifact-a' },
     )).resolves.toBeNull()
-    expect(markMethodUnavailable).toHaveBeenCalledWith(
+    expect(rememberUnsupportedMethod).toHaveBeenCalledWith(
       WORKBENCH_RESOURCE_RPC_METHODS.open,
     )
   })
 
   it('rejects a conflicting canonical and legacy resource identity before RPC', async () => {
     const call = vi.fn()
-    const provider = createRpcWorkbenchResourceProvider({ call, supportsMethod: () => true })
+    const provider = createRpcWorkbenchResourceProvider({ call, hasRpcMethod: () => true })
 
     await expect(provider.get('session-a', {
       type: 'attachment',
@@ -411,7 +411,7 @@ describe('workbench resource provider', () => {
         adapter: { adapterId: 'html' },
       },
     }))
-    const provider = createRpcWorkbenchResourceProvider({ call, supportsMethod: () => true })
+    const provider = createRpcWorkbenchResourceProvider({ call, hasRpcMethod: () => true })
 
     const result = await provider.createPreview?.(
       'session-a',
@@ -456,7 +456,7 @@ describe('workbench resource provider', () => {
         replayed: false,
       },
     }))
-    const provider = createRpcWorkbenchResourceProvider({ call, supportsMethod: () => true })
+    const provider = createRpcWorkbenchResourceProvider({ call, hasRpcMethod: () => true })
 
     const result = await provider.publishDocument({
       sessionKey: 'session-a',
@@ -486,7 +486,7 @@ describe('workbench resource provider', () => {
     const call = vi.fn()
     const provider = createRpcWorkbenchResourceProvider({
       call,
-      supportsMethod: () => false,
+      hasRpcMethod: () => false,
     })
 
     await expect(provider.list('session-a')).resolves.toEqual({

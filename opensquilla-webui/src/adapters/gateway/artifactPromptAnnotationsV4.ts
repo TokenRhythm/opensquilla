@@ -25,8 +25,8 @@ export const PROMPT_ANNOTATION_RPC_METHODS = {
 } as const
 
 type PromptAnnotationRpc = {
-  supportsMethod?: (method: string) => boolean
-  markMethodUnavailable?: (method: string) => void
+  hasRpcMethod?: (method: string) => boolean
+  rememberUnsupportedMethod?: (method: string) => void
   call: <T = unknown>(
     method: string,
     params?: Record<string, unknown>,
@@ -234,12 +234,12 @@ export function createRpcArtifactPromptAnnotationProvider(
     params: Record<string, unknown>,
     signal?: AbortSignal,
   ): Promise<T | null> {
-    if (rpc.supportsMethod?.(method) === false) return null
+    if (rpc.hasRpcMethod?.(method) === false) return null
     try {
       return await rpc.call<T>(method, params, signalOptions(signal))
     } catch (error) {
       if (!methodNotFound(error)) throw error
-      rpc.markMethodUnavailable?.(method)
+      rpc.rememberUnsupportedMethod?.(method)
       return null
     }
   }
@@ -323,7 +323,7 @@ export function createV4ArtifactPromptAnnotations(
     call: <T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions) => (
       transport.request<T>(method, params, options)
     ),
-    supportsMethod: method => transport.supports(method),
-    markMethodUnavailable: method => transport.markUnsupported(method),
+    hasRpcMethod: method => transport.supports(method),
+    rememberUnsupportedMethod: method => transport.markUnsupported(method),
   })
 }

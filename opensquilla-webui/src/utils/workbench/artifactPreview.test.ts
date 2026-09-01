@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 
 import { describe, expect, it, vi } from 'vitest'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import {
   ARTIFACT_HTML_OFFLINE_CSP,
   ARTIFACT_HTML_REFERENCE_SCAN_LIMIT,

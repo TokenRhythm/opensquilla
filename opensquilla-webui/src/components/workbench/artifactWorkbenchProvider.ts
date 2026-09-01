@@ -2,7 +2,7 @@ import type {
   Platform,
   WorkbenchPreviewMode,
 } from '@/platform/types'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import type { ArtifactDocumentWorkspaceSnapshot } from '@/types/artifactDocuments'
 import type { ArtifactDocumentActions } from '@/types/artifactDocuments'
 import type {
@@ -92,7 +92,6 @@ export interface ArtifactWorkbenchProviderOptions {
     releaseOverlayEdit?(annotationId: string): void
     setActiveDocument(sessionKey: string, documentId: string): void
   }
-  authToken(): string
   baseOrigin: string
   confirmPermission?(request: {
     permission: string
@@ -2118,7 +2117,6 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         this.mode,
         this.options.platform.id,
         {
-          authToken: this.options.authToken(),
           baseOrigin: this.options.baseOrigin,
           nativeBroker: nativeApi,
           sessionKey: artifactSessionKey(this.item, this.options),
@@ -2422,7 +2420,6 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     if (!lease || !this.context.isItemOpen()) return
     try {
       const renewal = await renewArtifactPreviewLease(lease.lease_id, {
-        authToken: this.options.authToken(),
         baseOrigin: this.options.baseOrigin,
         nativeBroker: this.context.nativeWorkbenchApi,
         sessionKey: artifactSessionKey(this.item, this.options),
@@ -2469,7 +2466,6 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     }
     try {
       await revokeArtifactPreviewLease(lease.lease_id, {
-        authToken: this.options.authToken(),
         baseOrigin: this.options.baseOrigin,
         nativeBroker: this.context.nativeWorkbenchApi,
         sessionKey: artifactSessionKey(this.item, this.options),
@@ -3169,7 +3165,6 @@ export function createArtifactWorkbenchDefinitions(
         })(),
         initialSection: initialSectionFromWorkbenchItem(item),
         initialSectionRequestId: initialSectionRequestIdFromWorkbenchItem(item),
-        authToken: options.authToken(),
         baseOrigin: options.baseOrigin,
         nativeHtml: state.nativeSurface,
         agentEditInProgress: runtimeStateValue(state, 'agentEditInProgress', false),

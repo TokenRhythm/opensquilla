@@ -6,12 +6,20 @@ import type {
   MetaEvent,
   MetaLaunchResult,
   MetaPreflightConfirmation,
+  MetaPreflightFieldSpec,
   MetaPreflightInput,
+  MetaPreflightPayload,
   MetaReplay,
   MetaReplayInput,
+  MetaRunAnnouncedPayload,
   MetaRunCenter,
+  MetaRunCompletedPayload,
   MetaRunRecovery,
   MetaRunRequestOptions,
+  MetaRunStepSpec,
+  MetaStepRescue,
+  MetaStepRescueAction,
+  MetaStepStatePayload,
 } from '@/modules/metaRunCenter'
 import type { MetaSetupReadiness } from '@/types/metaSetup'
 import { META_RUN_METHOD } from '@/contracts/generated/v4/metaRun'
@@ -81,6 +89,10 @@ function object(value: unknown): JsonObject {
     : {}
 }
 
+function isObject(value: unknown): value is JsonObject {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
 function text(...values: unknown[]): string | null {
   for (const value of values) {
     if (typeof value === 'string' && value.trim()) return value.trim()
@@ -93,6 +105,147 @@ function integer(...values: unknown[]): number | null {
     if (typeof value === 'number' && Number.isInteger(value) && value >= 0) return value
   }
   return null
+}
+
+function optionalText(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === 'string') return value
+  }
+  return undefined
+}
+
+function numberValue(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+  }
+  return undefined
+}
+
+function booleanValue(...values: unknown[]): boolean | undefined {
+  for (const value of values) {
+    if (typeof value === 'boolean') return value
+  }
+  return undefined
+}
+
+function nullableText(...values: unknown[]): string | null | undefined {
+  for (const value of values) {
+    if (value === null) return null
+    if (typeof value === 'string') return value
+  }
+  return undefined
+}
+
+function stringList(...values: unknown[]): string[] | undefined {
+  for (const value of values) {
+    if (Array.isArray(value)) return value.filter((item): item is string => typeof item === 'string')
+  }
+  return undefined
+}
+
+function objectList(value: unknown): JsonObject[] {
+  return Array.isArray(value) ? value.filter(isObject) : []
+}
+
+function mapPreflightField(value: unknown): MetaPreflightFieldSpec {
+  const source = object(value)
+  return {
+    name: optionalText(source.name),
+    label: optionalText(source.label),
+    title: optionalText(source.title),
+    type: optionalText(source.type),
+    kind: optionalText(source.kind),
+    multiline: booleanValue(source.multiline),
+    required: booleanValue(source.required),
+    default: source.default,
+    description: optionalText(source.description),
+    help: optionalText(source.help),
+    hint: optionalText(source.hint),
+    options: Array.isArray(source.options) ? [...source.options] : undefined,
+    choices: Array.isArray(source.choices) ? [...source.choices] : undefined,
+  }
+}
+
+function mapPreflight(value: unknown): MetaPreflightPayload {
+  const source = object(value)
+  const template = object(source.requestTemplate ?? source.request_template)
+  return {
+    runId: optionalText(source.runId, source.run_id),
+    metaSkillName: optionalText(source.metaSkillName, source.meta_skill_name),
+    language: optionalText(source.language),
+    interpretedRequest: optionalText(source.interpretedRequest, source.interpreted_request),
+    missingFields: stringList(source.missingFields, source.missing_fields),
+    assumptions: stringList(source.assumptions),
+    requestTemplate: Object.keys(template).length > 0 ? {
+      language: optionalText(template.language),
+      outcome: optionalText(template.outcome),
+      deliverable: optionalText(template.deliverable),
+      fields: objectList(template.fields).map(mapPreflightField),
+    } : undefined,
+    canSkip: booleanValue(source.canSkip, source.can_skip),
+    requiresConfirmation: booleanValue(
+      source.requiresConfirmation,
+      source.requires_confirmation,
+    ),
+  }
+}
+
+function mapRunStep(value: unknown): MetaRunStepSpec {
+  const source = object(value)
+  return {
+    id: optionalText(source.id),
+    label: optionalText(source.label),
+    kind: optionalText(source.kind),
+    dependsOn: stringList(source.dependsOn, source.depends_on),
+  }
+}
+
+function mapRunAnnounced(value: unknown): MetaRunAnnouncedPayload {
+  const source = object(value)
+  return {
+    runId: optionalText(source.runId, source.run_id),
+    metaSkillName: optionalText(source.metaSkillName, source.meta_skill_name),
+    language: optionalText(source.language),
+    userLanguage: optionalText(source.userLanguage, source.user_language),
+    metaLanguage: optionalText(source.metaLanguage, source.meta_language),
+    steps: objectList(source.steps).map(mapRunStep),
+    total: numberValue(source.total),
+  }
+}
+
+function mapRescueAction(value: unknown): MetaStepRescueAction {
+  const source = object(value)
+  return { id: optionalText(source.id), label: optionalText(source.label) }
+}
+
+function mapRescue(value: unknown): MetaStepRescue | undefined {
+  if (!isObject(value)) return undefined
+  return { actions: objectList(value.actions).map(mapRescueAction) }
+}
+
+function mapStepState(value: unknown): MetaStepStatePayload {
+  const source = object(value)
+  return {
+    runId: optionalText(source.runId, source.run_id),
+    stepId: optionalText(source.stepId, source.step_id),
+    state: optionalText(source.state),
+    statusText: nullableText(source.statusText, source.status_text),
+    error: optionalText(source.error),
+    substituteFor: nullableText(source.substituteFor, source.substitute_for),
+    rescue: mapRescue(source.rescue),
+  }
+}
+
+function mapRunCompleted(value: unknown): MetaRunCompletedPayload {
+  const source = object(value)
+  return {
+    runId: optionalText(source.runId, source.run_id),
+    outcome: optionalText(source.outcome),
+    completedSteps: stringList(source.completedSteps, source.completed_steps),
+    failedSteps: stringList(source.failedSteps, source.failed_steps),
+    recoveredSteps: stringList(source.recoveredSteps, source.recovered_steps),
+    skippedSteps: stringList(source.skippedSteps, source.skipped_steps),
+  }
 }
 
 function callOptions(options?: MetaRunRequestOptions): RpcCallOptions | undefined {
@@ -157,15 +310,11 @@ function mapRecovery(value: unknown): MetaRunRecovery | null {
   const source = object(value)
   const recovery = object(source.recovery)
   if (!Object.keys(recovery).length) return null
-  const steps = Array.isArray(recovery.step_states)
-    ? recovery.step_states.filter(item => item && typeof item === 'object' && !Array.isArray(item)) as JsonObject[]
-    : Array.isArray(recovery.stepStates)
-      ? recovery.stepStates.filter(item => item && typeof item === 'object' && !Array.isArray(item)) as JsonObject[]
-      : []
-  const announced = recovery.announced && typeof recovery.announced === 'object'
-    ? recovery.announced as JsonObject : undefined
-  const completed = recovery.completed && typeof recovery.completed === 'object'
-    ? recovery.completed as JsonObject : undefined
+  const steps = objectList(recovery.stepStates ?? recovery.step_states).map(mapStepState)
+  const announced = isObject(recovery.announced)
+    ? mapRunAnnounced(recovery.announced) : undefined
+  const completed = isObject(recovery.completed)
+    ? mapRunCompleted(recovery.completed) : undefined
   return { announced, stepStates: steps, completed }
 }
 
@@ -179,13 +328,16 @@ function eventProjection(kind: MetaEvent['kind'], payload: unknown, meta: unknow
     meta,
   )
   const body = decoded.payload ?? {}
-  return {
-    kind,
-    payload: body,
+  const context = {
     sessionKey: decoded.sessionKey,
+    sessionEpoch: integer(body.sessionEpoch, body.session_epoch, body.epoch),
     streamSeq: decoded.streamSeq,
     streamGeneration: decoded.streamGeneration,
   }
+  if (kind === 'preflight') return { ...context, kind, payload: mapPreflight(body) }
+  if (kind === 'run-announced') return { ...context, kind, payload: mapRunAnnounced(body) }
+  if (kind === 'step-state') return { ...context, kind, payload: mapStepState(body) }
+  return { ...context, kind, payload: mapRunCompleted(body) }
 }
 
 export function createV4MetaRunCenter(

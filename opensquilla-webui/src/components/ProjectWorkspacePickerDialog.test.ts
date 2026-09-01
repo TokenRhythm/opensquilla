@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, defineComponent, h, nextTick, ref, type App } from 'vue'
 import { createI18n } from 'vue-i18n'
-import type { SandboxPathListResponse } from '@/types/rpc'
+import type { WorkspacePathListing as SandboxPathListResponse } from '@/modules/workspaceCatalog'
 import { WORKSPACE_CATALOG_KEY, type WorkspaceCatalog } from '@/modules/workspaceCatalog'
 import ProjectWorkspacePickerDialog from './ProjectWorkspacePickerDialog.vue'
 

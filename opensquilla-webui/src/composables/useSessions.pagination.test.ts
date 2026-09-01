@@ -37,7 +37,7 @@ describe('useSessions pagination', () => {
 
   function setup(responses: Array<SessionPageFixture | Promise<SessionPageFixture>>) {
     const rpc = useRpcStore()
-    vi.spyOn(rpc, 'waitForConnection').mockResolvedValue()
+    vi.spyOn(rpc, 'ready').mockResolvedValue()
     const call = vi.spyOn(rpc, 'call').mockImplementation(async () => {
       const response = responses.shift()
       if (!response) throw new Error('unexpected sessions.list call')
@@ -173,7 +173,7 @@ describe('useSessions pagination', () => {
     const { rpc, call, sessions } = setup([
       { sessions: [{ key: 'agent:main:webchat:current', title: 'Current' }] },
     ])
-    vi.mocked(rpc.waitForConnection)
+    vi.mocked(rpc.ready)
       .mockReset()
       .mockReturnValueOnce(connection.promise)
       .mockResolvedValue(undefined)
@@ -197,7 +197,7 @@ describe('useSessions pagination', () => {
       { sessions: [{ key: 'agent:main:webchat:current', title: 'Current' }] },
     ])
     await sessions.loadSessions()
-    vi.mocked(rpc.waitForConnection)
+    vi.mocked(rpc.ready)
       .mockReset()
       .mockReturnValueOnce(connection.promise)
       .mockResolvedValue(undefined)

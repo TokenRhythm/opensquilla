@@ -9,7 +9,7 @@ import {
   ARTIFACTS_LIST_METHOD,
 } from '@/contracts/generated/v4/artifactsList'
 import { validateArtifactsListResult } from '@/contracts/generated/v4/artifactsListValidators.mjs'
-import type { ArtifactsListResponse, ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import { createV4ArtifactDocuments } from './artifactDocumentsV4'
 import { createV4ArtifactPromptAnnotations } from './artifactPromptAnnotationsV4'
 import { createV4WorkbenchResources } from './workbenchResourcesV4'
@@ -47,10 +47,13 @@ const DOCUMENT_EVENTS = [
 ] as const
 const MAX_ARTIFACT_PAGE_LIMIT = 200
 
-type ArtifactPageShape = Pick<
-  ArtifactsListResponse,
-  'has_more' | 'hasMore' | 'oldest_cursor' | 'oldestCursor'
-> & { artifacts?: unknown }
+interface ArtifactPageShape {
+  artifacts?: unknown
+  has_more?: boolean
+  hasMore?: boolean
+  oldest_cursor?: string | null
+  oldestCursor?: string | null
+}
 
 function artifactPageItems(response: ArtifactPageShape): ArtifactPayload[] {
   return Array.isArray(response.artifacts)
