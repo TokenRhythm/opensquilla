@@ -7,13 +7,18 @@ import {
 } from './useChatSessionSubscription'
 import { useChatTaskOwnership, type ChatTaskOwnershipApi } from './useChatTaskOwnership'
 import { createConversationRuntime } from '@/modules/conversationRuntime'
-import type {
-  SessionReadHistoryPage,
-  SessionReadLease,
-  SessionReadLive,
-  SessionReadMetadata,
-  SessionReadSnapshot,
+import {
+  createSessionReadLifecycle,
+  SessionReadSessionMissingError,
+  type SessionReadHistoryPage,
+  type SessionReadLease,
+  type SessionReadLive,
+  type SessionReadMetadata,
+  type SessionReadPort,
+  type SessionReadPortLive,
+  type SessionReadSnapshot,
 } from '@/modules/sessionReadLifecycle'
+import { createConversationSubscriptionLifecycle } from '@/modules/conversationSubscriptionLifecycle'
 import type {
   ChatRunStatus,
   ChatRunStatusSource,
@@ -165,6 +170,7 @@ interface HarnessOptions {
   beginSessionMetadataResolution?: UseChatSessionSubscriptionOptions['beginSessionMetadataResolution']
   onSessionMetadata?: UseChatSessionSubscriptionOptions['onSessionMetadata']
   onSessionMetadataError?: UseChatSessionSubscriptionOptions['onSessionMetadataError']
+  onSessionMissing?: UseChatSessionSubscriptionOptions['onSessionMissing']
   onSnapshot?: UseChatSessionSubscriptionOptions['onSnapshot']
 }
 
@@ -218,6 +224,7 @@ function harness(
     beginSessionMetadataResolution: options.beginSessionMetadataResolution,
     onSessionMetadata: options.onSessionMetadata,
     onSessionMetadataError: options.onSessionMetadataError,
+    onSessionMissing: options.onSessionMissing,
     onSnapshot: options.onSnapshot,
   })
   return {
@@ -262,6 +269,88 @@ describe('useChatSessionSubscription domain lease', () => {
       live: false,
       backgroundOnly: false,
     })
+  })
+
+  it('projects only a current domain missing failure as terminal session absence', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const currentLive = deferred<SessionReadLive>()
+      const onSessionMissing = vi.fn()
+      const current = harness(leaseFixture({ live: currentLive.promise }).lease, {
+        onSessionMissing,
+      })
+      const currentResult = current.api.subscribeSession()
+      currentLive.reject(new SessionReadSessionMissingError('session missing'))
+
+      await expect(currentResult).resolves.toMatchObject({
+        authoritative: false,
+        cancelled: false,
+        sessionMissing: true,
+      })
+      expect(onSessionMissing).toHaveBeenCalledOnce()
+      expect(onSessionMissing).toHaveBeenCalledWith(KEY)
+
+      const staleLive = deferred<SessionReadLive>()
+      const staleKey = ref(KEY)
+      const stale = harness(leaseFixture({ live: staleLive.promise }).lease, {
+        sessionKey: staleKey,
+        onSessionMissing,
+      })
+      const staleResult = stale.api.subscribeSession()
+      staleKey.value = 'agent:main:webchat:successor'
+      staleLive.reject(new SessionReadSessionMissingError('stale session missing'))
+
+      await expect(staleResult).resolves.toMatchObject({
+        authoritative: false,
+        cancelled: true,
+        sessionMissing: false,
+      })
+      expect(onSessionMissing).toHaveBeenCalledOnce()
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('preserves missing semantics through real lifecycle auto-close', async () => {
+    const missingLive = deferred<SessionReadPortLive>()
+    const close = vi.fn(async () => {})
+    const port: SessionReadPort = {
+      open: request => ({
+        criticalRequestsQueued: Promise.resolve(),
+        live: missingLive.promise,
+        metadata: Promise.resolve(metadata({ sessionKey: request.sessionKey })),
+        readHistory: async () => EMPTY_HISTORY,
+        retryMetadata: async () => metadata({ sessionKey: request.sessionKey }),
+        close,
+      }),
+    }
+    const lifecycle = createSessionReadLifecycle({
+      port,
+      runtime: createConversationRuntime(),
+      subscriptions: createConversationSubscriptionLifecycle(),
+    })
+    const lease = lifecycle.open({ sessionKey: KEY })
+    const onSessionMissing = vi.fn()
+    const subject = harness(lease, {
+      reader: lifecycle,
+      onSessionMissing,
+    })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const result = subject.api.subscribeSession()
+      missingLive.reject(new SessionReadSessionMissingError('session missing'))
+
+      await expect(result).resolves.toMatchObject({
+        authoritative: false,
+        cancelled: false,
+        sessionMissing: true,
+      })
+      expect(onSessionMissing).toHaveBeenCalledWith(KEY)
+      await vi.waitFor(() => expect(close).toHaveBeenCalledOnce())
+      expect(lifecycle.current()).toBeNull()
+    } finally {
+      warn.mockRestore()
+    }
   })
 
   it('projects live task, snapshot, run mode, task clock, and steer capability', async () => {

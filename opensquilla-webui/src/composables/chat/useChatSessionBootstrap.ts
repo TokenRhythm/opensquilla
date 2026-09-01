@@ -107,6 +107,10 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     return ownership.isCurrent(run, options.sessionKey.value)
   }
 
+  function leaseIsCurrent(run: ActiveBootstrap): boolean {
+    return options.sessionReadLifecycle.current() === run.lease
+  }
+
   function contextFor(
     run: ActiveBootstrap,
     phase: PhaseRuntime<unknown>,
@@ -224,7 +228,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
           cancelled: isRpcAbort(error) || run.controller.signal.aborted,
         }
       }
-      if (!isCurrent(run) || result.cancelled) {
+      if (!isCurrent(run)) {
         return { ...result, authoritative: false, cancelled: true }
       }
       phase.result = result
@@ -284,6 +288,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
       && active
       && active.key === key
       && !active.controller.signal.aborted
+      && leaseIsCurrent(active)
     ) {
       if (includeHistory && !active.includeHistory) {
         if (Date.now() >= active.history.deadlineAt) {
@@ -314,7 +319,12 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
   function retryHistory(): Promise<SessionPhaseResult> {
     const key = options.sessionKey.value
     const run = active
-    if (!run || run.key !== key || run.controller.signal.aborted) {
+    if (
+      !run
+      || run.key !== key
+      || run.controller.signal.aborted
+      || !leaseIsCurrent(run)
+    ) {
       return startSessionBootstrap({ includeHistory: true, force: true }).history
     }
     if (run.history.running) return run.history.promise
@@ -350,6 +360,16 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
       && active.key === key
       && isCurrent(active),
     )
+  }
+
+  function currentSessionBootstrap(): SessionBootstrapRun | undefined {
+    const run = active
+    if (
+      !run
+      || !isCurrent(run)
+      || !leaseIsCurrent(run)
+    ) return
+    return publicRun(run)
   }
 
   function handleConnectionState(
@@ -396,7 +416,18 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     if (!run || run.key !== options.sessionKey.value || run.controller.signal.aborted) {
       return startSessionBootstrap({ includeHistory, force: true })
     }
-    if (run.live.running || livePhase.value === 'ready') return publicRun(run)
+    if (!leaseIsCurrent(run)) {
+      return startSessionBootstrap({ includeHistory, force: true })
+    }
+    if (run.live.running) {
+      // Keep one public run internally coherent: generation, admission,
+      // history and live must all belong to the same lease. A connected event
+      // can race a healthy attempt and cause one extra lease, but that cost is
+      // bounded by physical transport transitions. The handoff defer guard
+      // above prevents replacing source A while target B is unresolved.
+      return startSessionBootstrap({ includeHistory, force: true })
+    }
+    if (livePhase.value === 'ready') return publicRun(run)
     if (livePhase.value === 'degraded') {
       return startSessionBootstrap({ includeHistory, force: true })
     }
@@ -413,5 +444,6 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     handleConnectionState,
     setSessionHandoffTarget,
     isSessionBootstrapCurrent,
+    currentSessionBootstrap,
   }
 }

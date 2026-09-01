@@ -3,13 +3,14 @@ import type {
   ChatRunStatus,
   ChatRunStatusSource,
 } from '@/types/chat'
-import type {
-  SessionReadActivity,
-  SessionReadLease,
-  SessionReadLeaseReader,
-  SessionReadMetadata,
-  SessionReadRunModeLock,
-  SessionReadSnapshot,
+import {
+  SessionReadSessionMissingError,
+  type SessionReadActivity,
+  type SessionReadLease,
+  type SessionReadLeaseReader,
+  type SessionReadMetadata,
+  type SessionReadRunModeLock,
+  type SessionReadSnapshot,
 } from '@/modules/sessionReadLifecycle'
 import type { ConversationRuntime } from '@/modules/conversationRuntime'
 import { conversationCursorSignal } from '@/utils/chat/streamEvents'
@@ -60,6 +61,7 @@ export interface UseChatSessionSubscriptionOptions {
     metadata: SessionReadMetadata,
   ) => void
   onSessionMetadataError?: (key: string, generation: number) => void
+  onSessionMissing?: (key: string) => void
   onSnapshot?: (snapshot: SessionReadMetadata) => void
 }
 
@@ -77,6 +79,8 @@ export interface SessionSubscriptionOutcome {
   error?: unknown
   cancelled?: boolean
   skipSnapshotOnRetry?: boolean
+  /** Terminal domain state: the requested session no longer exists. */
+  sessionMissing?: boolean
 }
 
 export type SessionSubscriptionResult = boolean | void | SessionSubscriptionOutcome
@@ -425,6 +429,9 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         || signal.aborted
         || isRpcAbort(err)
       )
+      const sessionMissing = !cancelled
+        && err instanceof SessionReadSessionMissingError
+      if (sessionMissing) options.onSessionMissing?.(key)
       if (
         metadataGeneration !== undefined
         && !cancelled
@@ -438,6 +445,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         ...UNAVAILABLE_SUBSCRIPTION,
         error: err,
         cancelled,
+        sessionMissing,
       }
     } finally {
       if (isCurrentSubscription(lease, key, sequence)) isHydrating.value = false

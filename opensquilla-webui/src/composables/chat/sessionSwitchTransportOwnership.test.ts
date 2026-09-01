@@ -381,6 +381,7 @@ function createHarness(options: {
     cancelSessionBootstrap: bootstrap.cancelSessionBootstrap,
     setSessionHandoffTarget: bootstrap.setSessionHandoffTarget,
     startSessionBootstrap: bootstrap.startSessionBootstrap,
+    currentSessionBootstrap: bootstrap.currentSessionBootstrap,
     loadCurrentSessionUsage: vi.fn(),
     applySessionRunState: subscription.applySessionRunState,
     setCompactInFlight: vi.fn(),
@@ -769,7 +770,12 @@ describe('session switch transport ownership', () => {
         switchPendingQueue: () => queue.promise,
       })
       rpc = harness.rpc
-      const offBridge = harness.attachConnectionBridge()
+      let connectedRecovery:
+        | ReturnType<typeof harness.bootstrap.handleConnectionState>
+        | undefined
+      const offBridge = harness.rpc.on('_state', state => {
+        connectedRecovery = harness.bootstrap.handleConnectionState(String(state))
+      })
       const initial = harness.bootstrap.startSessionBootstrap({ includeHistory: false })
       await flushMicrotasks()
       const subscribeA = requests(harness.socket)[0]!
@@ -793,7 +799,12 @@ describe('session switch transport ownership', () => {
         ['sessions.messages.subscribe', SESSION_B],
       ])
       reply(replacement, replacementWire[0]!, subscribePayload(SESSION_B, 'B'))
-      await switching
+      await expect(switching).resolves.toEqual({
+        authoritative: true,
+        authoritativeIdle: true,
+        backgroundOnly: false,
+      })
+      await connectedRecovery?.live
 
       expect(SessionSwitchSocket.instances).toHaveLength(2)
       expect(keyedRequests(

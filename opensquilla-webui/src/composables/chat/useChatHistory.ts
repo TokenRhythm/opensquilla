@@ -28,18 +28,18 @@ import { planRevisionsFromToolSegments } from '@/utils/chat/plans'
 import {
   SESSION_PHASE_ATTEMPT_BUDGET_MS,
   isRpcAbort,
-  rpcErrorCode,
   type SessionBootstrapPhaseContext,
   type SessionPhaseResult,
 } from '@/composables/chat/sessionBootstrapContract'
-import type {
-  SessionReadCompactionSummary,
-  SessionReadHistoryPage,
-  SessionReadLease,
-  SessionReadLeaseReader,
-  SessionReadMessage,
-  SessionReadTurnContext,
-  SessionReadTurnOutcome,
+import {
+  SessionReadSessionMissingError,
+  type SessionReadCompactionSummary,
+  type SessionReadHistoryPage,
+  type SessionReadLease,
+  type SessionReadLeaseReader,
+  type SessionReadMessage,
+  type SessionReadTurnContext,
+  type SessionReadTurnOutcome,
 } from '@/modules/sessionReadLifecycle'
 import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
 import {
@@ -958,6 +958,27 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     return crossedSession
   }
 
+  function markSessionMissing(key: string): boolean {
+    if (!key || key !== options.sessionKey.value) return false
+    resetForSession(key)
+    // The live registration can prove absence before the eager history frame
+    // is admitted. Retire that read so its later rejection cannot overwrite
+    // this terminal state or a successor session.
+    cancelActiveHistory()
+    failedHistoryRequest = null
+    historyState.value = {
+      ...historyState.value,
+      loading: false,
+      loadingEarlier: false,
+      retrying: false,
+      initialLoadStatus: 'ready',
+      loadEarlierError: false,
+      recoveryError: false,
+      sessionMissing: true,
+    }
+    return true
+  }
+
   function callHistory(
     lease: SessionReadLease,
     request: {
@@ -1427,7 +1448,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           loadEarlierError: Boolean(params.prepend),
           recoveryError: !params.prepend,
           sessionMissing: !params.prepend
-            && ['NOT_FOUND', 'SESSION_NOT_FOUND'].includes(rpcErrorCode(error)),
+            && error instanceof SessionReadSessionMissingError,
         }
         flushPendingHistorySync()
       }
@@ -1567,6 +1588,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     loadHistory,
     loadEarlierHistory,
     retryHistory,
+    markSessionMissing,
     scheduleHistorySync,
     cancelAnchorStabilization,
     cancelActiveHistory,

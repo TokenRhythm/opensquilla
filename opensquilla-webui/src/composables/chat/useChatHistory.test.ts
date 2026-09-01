@@ -5,14 +5,15 @@ import { nextTick, ref, watch, type Ref } from 'vue'
 import { useChatHistory } from './useChatHistory'
 import type { ChatMessage, ChatTurnOutcome } from '@/types/chat'
 import { RpcTimeoutError } from '@/lib/rpc'
-import type {
-  SessionReadCompactionSummary,
-  SessionReadHistoryPage,
-  SessionReadHistoryOptions,
-  SessionReadLease,
-  SessionReadMessage,
-  SessionReadTurnContext,
-  SessionReadTurnOutcome,
+import {
+  SessionReadSessionMissingError,
+  type SessionReadCompactionSummary,
+  type SessionReadHistoryPage,
+  type SessionReadHistoryOptions,
+  type SessionReadLease,
+  type SessionReadMessage,
+  type SessionReadTurnContext,
+  type SessionReadTurnOutcome,
 } from '@/modules/sessionReadLifecycle'
 
 type SessionReadTurnContextFixture = SessionReadTurnContext | (
@@ -1192,9 +1193,9 @@ describe('useChatHistory canonical pagination', () => {
 
   it('classifies a missing session separately from a retryable history failure', async () => {
     const { api, historyFixture } = makeHistory()
-    historyFixture.mockRejectedValueOnce(Object.assign(new Error('missing'), {
-      code: 'NOT_FOUND',
-    }))
+    historyFixture.mockRejectedValueOnce(
+      new SessionReadSessionMissingError('missing'),
+    )
 
     await api.loadHistory()
 
@@ -1202,6 +1203,56 @@ describe('useChatHistory canonical pagination', () => {
       initialLoadStatus: 'error',
       recoveryError: true,
       sessionMissing: true,
+    })
+  })
+
+  it('commits live-proven missing state once and fences a successor session', async () => {
+    const firstKey = 'agent:main:webchat:first'
+    const sessionKey = ref(firstKey)
+    let resolveFirst!: (value: SessionReadHistoryPageFixture) => void
+    const firstPage = new Promise<SessionReadHistoryPageFixture>(resolve => {
+      resolveFirst = resolve
+    })
+    const { api, historyFixture } = makeHistory(false, { sessionKey })
+    historyFixture.mockReturnValueOnce(firstPage)
+
+    const firstLoad = api.loadHistory()
+    expect(api.historyState.value.loading).toBe(true)
+    expect(api.markSessionMissing(firstKey)).toBe(true)
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      loading: false,
+      loadingEarlier: false,
+      retrying: false,
+      loadEarlierError: false,
+      recoveryError: false,
+      sessionMissing: true,
+    })
+    resolveFirst({ messages: [], hasMore: false })
+    await firstLoad
+    expect(api.historyState.value.sessionMissing).toBe(true)
+
+    const successorKey = 'agent:main:webchat:successor'
+    sessionKey.value = successorKey
+    let resolveSuccessor!: (value: SessionReadHistoryPageFixture) => void
+    historyFixture.mockReturnValueOnce(new Promise<SessionReadHistoryPageFixture>(resolve => {
+      resolveSuccessor = resolve
+    }))
+    const successorLoad = api.loadHistory()
+    expect(api.historyState.value).toMatchObject({
+      loading: true,
+      sessionMissing: false,
+    })
+    expect(api.markSessionMissing(firstKey)).toBe(false)
+    expect(api.historyState.value).toMatchObject({
+      loading: true,
+      sessionMissing: false,
+    })
+    resolveSuccessor({ messages: [], hasMore: false })
+    await successorLoad
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      sessionMissing: false,
     })
   })
 

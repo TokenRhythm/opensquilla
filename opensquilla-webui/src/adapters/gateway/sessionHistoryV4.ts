@@ -11,14 +11,15 @@ import {
   validateChatHistoryParams,
   validateChatHistoryResult,
 } from '@/contracts/generated/v4/chatHistoryValidators.mjs'
-import type {
-  SessionReadCompactionSummary,
-  SessionReadHistoryPage,
-  SessionReadJsonObject,
-  SessionReadMessage,
-  SessionReadPortHistoryRequest,
-  SessionReadTurnContext,
-  SessionReadTurnOutcome,
+import {
+  SessionReadSessionMissingError,
+  type SessionReadCompactionSummary,
+  type SessionReadHistoryPage,
+  type SessionReadJsonObject,
+  type SessionReadMessage,
+  type SessionReadPortHistoryRequest,
+  type SessionReadTurnContext,
+  type SessionReadTurnOutcome,
 } from '@/modules/sessionReadLifecycle'
 
 const DEFAULT_HISTORY_BUDGET_MS = 15_000
@@ -50,8 +51,19 @@ function objectValue(value: unknown): Record<string, unknown> | null {
     : null
 }
 
-function camelKey(value: string): string {
-  return value.replace(/_([a-z])/g, (_, letter: string) => letter.toUpperCase())
+function historyError(error: unknown): unknown {
+  if (error instanceof SessionReadSessionMissingError) return error
+  const source = objectValue(error)
+  const data = objectValue(source?.data)
+  const rawCode = source?.code ?? data?.code
+  const code = typeof rawCode === 'string' ? rawCode.toUpperCase() : ''
+  if (code === 'NOT_FOUND' || code === 'SESSION_NOT_FOUND') {
+    return new SessionReadSessionMissingError(
+      error instanceof Error ? error.message : 'The requested session does not exist.',
+      error,
+    )
+  }
+  return error
 }
 
 function projectJson(value: unknown): unknown {
@@ -59,7 +71,7 @@ function projectJson(value: unknown): unknown {
   const item = objectValue(value)
   if (!item) return value
   return Object.freeze(Object.fromEntries(
-    Object.entries(item).map(([key, child]) => [camelKey(key), projectJson(child)]),
+    Object.entries(item).map(([key, child]) => [key, projectJson(child)]),
   ))
 }
 
@@ -87,7 +99,7 @@ function additionalFields(
   return Object.freeze(Object.fromEntries(
     Object.entries(value)
       .filter(([key]) => !known.has(key))
-      .map(([key, child]) => [camelKey(key), projectJson(child)]),
+      .map(([key, child]) => [key, projectJson(child)]),
   ))
 }
 
@@ -359,11 +371,13 @@ export async function requestV4SessionHistory(
       : { expectedGeneration: options.expectedGeneration }),
     ...(options.onSent ? { onSent: options.onSent } : {}),
   }
-  const normalized = withLegacyCanonicalDefaults(await rpc.request(
-    CHAT_HISTORY_METHOD,
-    params,
-    callOptions,
-  ))
+  let raw: unknown
+  try {
+    raw = await rpc.request(CHAT_HISTORY_METHOD, params, callOptions)
+  } catch (error) {
+    throw historyError(error)
+  }
+  const normalized = withLegacyCanonicalDefaults(raw)
   if (!validateChatHistoryResult(normalized.value)) {
     throw options.contractError(`${CHAT_HISTORY_METHOD} result`)
   }

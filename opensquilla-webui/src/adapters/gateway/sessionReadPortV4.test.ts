@@ -14,7 +14,10 @@ import {
   type SessionsMessagesSubscribeResult,
 } from '@/contracts/generated/v4/sessionsMessagesSubscribe'
 import { SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD } from '@/contracts/generated/v4/sessionsMessagesUnsubscribe'
-import { SessionReadContractError } from '@/modules/sessionReadLifecycle'
+import {
+  SessionReadContractError,
+  SessionReadSessionMissingError,
+} from '@/modules/sessionReadLifecycle'
 import { createV4SessionReadPort } from './sessionReadPortV4'
 
 type Call = {
@@ -45,6 +48,7 @@ function metadataFields(hydrationComplete = true) {
     projectWorkspace: {
       id: 'workspace-1',
       display_name: 'Workspace One',
+      nested_context: { snake_value: true },
     },
     projectWorkspaceDeferred: false,
     active_task_group_ids: [],
@@ -105,7 +109,11 @@ function snapshotResult(
     current_stream_seq: 8,
     events: [{
       event: 'session.event.text_delta',
-      payload: { task_id: 'task-snapshot', text_delta: 'hello' },
+      payload: {
+        task_id: 'task-snapshot',
+        text_delta: 'hello',
+        opaque_payload: { snake_value: true },
+      },
     }],
     ...patch,
   }
@@ -285,13 +293,13 @@ describe('v4 SessionReadPort Adapter', () => {
       activeTaskId: 'task-snapshot',
       initialMetadata: {
         hydrationComplete: false,
-        projectWorkspace: { displayName: 'Workspace One' },
+        projectWorkspace: { display_name: 'Workspace One' },
       },
       snapshot: {
         sessionKey: 'alpha',
         events: [{
           semanticKind: 'text-delta',
-          payload: { taskId: 'task-snapshot', textDelta: 'hello' },
+          payload: { task_id: 'task-snapshot', text_delta: 'hello' },
         }],
       },
       cursor: {
@@ -303,6 +311,12 @@ describe('v4 SessionReadPort Adapter', () => {
         currentStreamSeq: 8,
       },
     })
+    const snapshotPayload = live.snapshot?.events[0]?.payload
+    expect(snapshotPayload).toMatchObject({
+      opaque_payload: { snake_value: true },
+    })
+    expect(Object.isFrozen(snapshotPayload)).toBe(true)
+    expect(Object.isFrozen(snapshotPayload?.opaque_payload)).toBe(true)
     let metadataSettled = false
     let historySettled = false
     void lease.metadata.finally(() => { metadataSettled = true })
@@ -323,7 +337,7 @@ describe('v4 SessionReadPort Adapter', () => {
     await lease.close()
   })
 
-  it('projects complete metadata and rich history into camelCase domain values', async () => {
+  it('maps known fields while preserving opaque and additive JSON keys', async () => {
     const harness = makeHarness()
     const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
     await lease.live
@@ -337,21 +351,24 @@ describe('v4 SessionReadPort Adapter', () => {
     expect(projectedMetadata).toMatchObject({
       sessionKey: 'alpha',
       workspaceId: 'workspace-1',
-      projectWorkspace: { displayName: 'Workspace One' },
+      projectWorkspace: {
+        display_name: 'Workspace One',
+        nested_context: { snake_value: true },
+      },
       activeTaskGroupIds: [],
       runModeLock: { locked: true, runMode: 'safe', source: 'profile' },
-      pendingUserInputs: [{ requestId: 'input-1' }],
-      collaboration: { modeName: 'delegate' },
-      currentPlan: { planId: 'plan-1' },
-      activePlanRun: { runId: 'run-1' },
-      goal: { goalId: 'goal-1' },
-      tasks: [{ taskId: 'task-1' }],
-      activeTask: { taskId: 'task-1' },
-      lastTask: { taskId: 'task-0' },
+      pendingUserInputs: [{ request_id: 'input-1' }],
+      collaboration: { mode_name: 'delegate' },
+      currentPlan: { plan_id: 'plan-1' },
+      activePlanRun: { run_id: 'run-1' },
+      goal: { goal_id: 'goal-1' },
+      tasks: [{ task_id: 'task-1' }],
+      activeTask: { task_id: 'task-1' },
+      lastTask: { task_id: 'task-0' },
       queuedTaskIds: ['task-2'],
       epoch: 3,
       hydrationComplete: true,
-      additional: { futureMetadata: { snakeValue: true } },
+      additional: { future_metadata: { snake_value: true } },
     })
     expect(latest).toMatchObject({
       hasMore: true,
@@ -362,7 +379,7 @@ describe('v4 SessionReadPort Adapter', () => {
       pageSize: 100,
       canonicalAvailable: false,
       canonicalComplete: true,
-      additional: { futureHistoryField: { nestedValue: true } },
+      additional: { future_history_field: { nested_value: true } },
       messages: [{
         id: '41',
         messageId: 'message-1',
@@ -371,20 +388,20 @@ describe('v4 SessionReadPort Adapter', () => {
         text: 'hello',
         createdAt: 1_725_199_200,
         reasoningContent: '  thinking exactly  ',
-        routerDecision: { selectedTier: 'c1' },
-        artifacts: [{ artifactId: 'artifact-1' }],
-        toolCalls: [{ toolName: 'read' }],
-        timeline: [{ segmentKind: 'thinking' }],
-        attachments: [{ attachmentId: 'attachment-1' }],
-        promptAnnotations: [{ annotationKind: 'cache' }],
+        routerDecision: { selected_tier: 'c1' },
+        artifacts: [{ artifact_id: 'artifact-1' }],
+        toolCalls: [{ tool_name: 'read' }],
+        timeline: [{ segment_kind: 'thinking' }],
+        attachments: [{ attachment_id: 'attachment-1' }],
+        promptAnnotations: [{ annotation_kind: 'cache' }],
         turnContext: {
           turnId: 'turn-1',
           promotedTurnId: 'turn-promoted',
           appliedIteration: 2,
-          activityMarkers: [{ markerId: 'marker-1' }],
-          additional: { runMode: 'safe' },
+          activityMarkers: [{ marker_id: 'marker-1' }],
+          additional: { run_mode: 'safe' },
         },
-        usage: { totalTokens: 8 },
+        usage: { total_tokens: 8 },
         model: 'model-1',
         inputTokens: 3,
         outputTokens: 5,
@@ -393,22 +410,22 @@ describe('v4 SessionReadPort Adapter', () => {
           sourceSessionKey: 'source-session',
           sourceTool: 'delegate',
         },
-        additional: { additiveMessageField: { nestedValue: true } },
+        additional: { additive_message_field: { nested_value: true } },
       }],
       compactionSummaries: [{
         id: '7',
         compactionId: 'compact-1',
         compactionIndex: 2,
         coveredThroughId: '40',
-        additional: { futureSummaryField: 'kept' },
+        additional: { future_summary_field: 'kept' },
       }],
       turnOutcomes: [{
         turnId: 'turn-1',
-        outcome: { finishReason: 'stop' },
+        outcome: { finish_reason: 'stop' },
         errorClass: 'usage_accounting_busy',
         retryable: true,
-        activitySnapshot: { taskId: 'task-1', phaseName: 'finalize' },
-        usage: { inputTokens: 3, outputTokens: 5 },
+        activitySnapshot: { task_id: 'task-1', phase_name: 'finalize' },
+        usage: { input_tokens: 3, output_tokens: 5 },
         replayProof: {
           usageCallIndex: 1,
           noPriorProviderDispatch: true,
@@ -417,9 +434,13 @@ describe('v4 SessionReadPort Adapter', () => {
           userMessageId: 'message-user-1',
           terminalMessage: 'retry safely',
         },
-        additional: { futureOutcomeField: true },
+        additional: { future_outcome_field: true },
       }],
     })
+    expect(Object.isFrozen(projectedMetadata.projectWorkspace)).toBe(true)
+    expect(Object.isFrozen(projectedMetadata.projectWorkspace?.nested_context)).toBe(true)
+    expect(Object.isFrozen(projectedMetadata.additional)).toBe(true)
+    expect(Object.isFrozen(projectedMetadata.additional.future_metadata)).toBe(true)
 
     await lease.readHistory({
       direction: 'before',
@@ -507,6 +528,42 @@ describe('v4 SessionReadPort Adapter', () => {
     await expect(failedLease.live).rejects.toThrow('timeout')
     await expect(failedLease.criticalRequestsQueued).rejects.toThrow('timeout')
     await failedLease.close()
+  })
+
+  it('projects a missing subscribe as a domain failure without queuing eager history', async () => {
+    const harness = makeHarness()
+    harness.requestMock.mockImplementation((
+      method: string,
+      params?: Record<string, unknown>,
+      options?: RpcCallOptions,
+    ): Promise<unknown> => {
+      harness.calls.push({ method, params, options })
+      if (method === SESSIONS_MESSAGES_SUBSCRIBE_METHOD) {
+        return Promise.reject(Object.assign(new Error('session missing'), {
+          code: 'SESSION_NOT_FOUND',
+        }))
+      }
+      options?.onSent?.(harness.rpc.generation)
+      return Promise.resolve(harness.results.get(method))
+    })
+    const request = openRequest()
+    const lease = createV4SessionReadPort(harness.rpc).open(request)
+    const live = expect(lease.live)
+      .rejects.toBeInstanceOf(SessionReadSessionMissingError)
+    const metadata = expect(lease.metadata)
+      .rejects.toBeInstanceOf(SessionReadSessionMissingError)
+    const admitted = expect(lease.criticalRequestsQueued)
+      .rejects.toBeInstanceOf(SessionReadSessionMissingError)
+    const history = expect(lease.readHistory({
+      direction: 'latest',
+      limit: 100,
+      signal: request.signal,
+    })).rejects.toBeInstanceOf(SessionReadSessionMissingError)
+
+    await Promise.all([live, metadata, admitted, history])
+    expect(harness.calls.filter(call => call.method === CHAT_HISTORY_METHOD)).toEqual([])
+
+    await lease.close()
   })
 
   it('isolates malformed history and hydration from a healthy live subscription', async () => {

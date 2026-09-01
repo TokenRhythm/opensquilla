@@ -58,6 +58,9 @@ function createBootstrap(overrides: {
     open: openSessionRead,
     current: () => currentLease,
   } as SessionReadLifecycle
+  const retireCurrentLease = () => {
+    currentLease = null
+  }
   const sessionKey = ref('agent:main:webchat:bootstrap-test')
   const api = useChatSessionBootstrap({
     sessionKey,
@@ -75,6 +78,7 @@ function createBootstrap(overrides: {
     cancelSubscription,
     closeLease,
     openSessionRead,
+    retireCurrentLease,
   }
 }
 
@@ -157,25 +161,53 @@ describe('useChatSessionBootstrap', () => {
     expect(replacementQueued).toBe(true)
   })
 
-  it('coalesces connected with the in-flight reconnect replacement', async () => {
-    let releaseLive!: (result: SessionSubscriptionOutcome) => void
-    let calls = 0
+  it('replaces an in-flight connected run with one coherent generation', async () => {
+    let releaseInitialLive!: (result: SessionSubscriptionOutcome) => void
+    let liveCall = 0
+    let historyCall = 0
+    const criticalRequests: Promise<void>[] = []
+    const initialHistory: SessionPhaseResult = { ok: true }
+    const replacementHistory: SessionPhaseResult = { ok: true }
+    const replacementLive: SessionSubscriptionOutcome = {
+      ...LIVE_READY,
+      error: new Error('replacement-live'),
+    }
     const { api, openSessionRead } = createBootstrap({
+      criticalRequestsQueued: () => {
+        const queued = Promise.resolve()
+        criticalRequests.push(queued)
+        return queued
+      },
+      loadHistory: async () => {
+        historyCall += 1
+        return historyCall === 1 ? initialHistory : replacementHistory
+      },
       subscribeSession: async () => {
-        calls += 1
-        if (calls === 1) return LIVE_READY
-        return new Promise(resolve => { releaseLive = resolve })
+        liveCall += 1
+        if (liveCall === 1) {
+          return new Promise(resolve => { releaseInitialLive = resolve })
+        }
+        return replacementLive
       },
     })
-    await api.startSessionBootstrap().live
 
-    const disconnected = api.handleConnectionState('disconnected')!
-    const connected = api.handleConnectionState('connected')!
+    const initial = api.startSessionBootstrap()
+    const replacement = api.handleConnectionState('connected')!
 
-    expect(connected.generation).toBe(disconnected.generation)
+    expect(replacement.generation).toBeGreaterThan(initial.generation)
+    expect(replacement.criticalRequestsQueued).toBe(criticalRequests[1])
+    await expect(replacement.history).resolves.toBe(replacementHistory)
+    await expect(replacement.live).resolves.toBe(replacementLive)
     expect(openSessionRead).toHaveBeenCalledTimes(2)
-    releaseLive(LIVE_READY)
-    await disconnected.live
+
+    releaseInitialLive(LIVE_READY)
+    await expect(initial.live).resolves.toEqual({
+      ...LIVE_READY,
+      authoritative: false,
+      cancelled: true,
+    })
+    expect(api.historyPhase.value).toBe('ready')
+    expect(api.livePhase.value).toBe('ready')
   })
 
   it('keeps a degraded lease bounded until an explicit connected recovery', async () => {
@@ -274,6 +306,34 @@ describe('useChatSessionBootstrap', () => {
     expect(api.historyPhase.value).toBe('ready')
   })
 
+  it('reopens a dead lease before retrying history', async () => {
+    let recover = false
+    const failure = Object.assign(new Error('history unavailable'), {
+      code: 'HISTORY_UNAVAILABLE',
+      retryable: false,
+    })
+    const {
+      api,
+      loadHistory,
+      subscribeSession,
+      openSessionRead,
+      retireCurrentLease,
+    } = createBootstrap({
+      loadHistory: async () => recover ? { ok: true } : { ok: false, error: failure },
+    })
+
+    const initial = api.startSessionBootstrap()
+    await Promise.all([initial.history, initial.live])
+    retireCurrentLease()
+    recover = true
+
+    await expect(api.retryHistory()).resolves.toEqual({ ok: true })
+    expect(loadHistory).toHaveBeenCalledTimes(2)
+    expect(subscribeSession).toHaveBeenCalledTimes(2)
+    expect(openSessionRead).toHaveBeenCalledTimes(2)
+    expect(api.historyPhase.value).toBe('ready')
+  })
+
   it('invalidates consumer projections before closing the owned lease', async () => {
     let releaseHistory!: (result: SessionPhaseResult) => void
     let releaseLive!: (result: SessionSubscriptionOutcome) => void
@@ -325,32 +385,64 @@ describe('useChatSessionBootstrap', () => {
     expect(openSessionRead).toHaveBeenCalledOnce()
   })
 
-  it('defers reconnect recovery during handoff and replays only after rollback', async () => {
-    const { api, subscribeSession } = createBootstrap()
-    const initial = api.startSessionBootstrap()
-    await Promise.all([initial.history, initial.live])
+  it('defers an in-flight connected recovery until handoff rollback', async () => {
+    let releaseInitial!: (result: SessionSubscriptionOutcome) => void
+    let liveCall = 0
+    const unavailable: SessionSubscriptionOutcome = {
+      authoritative: false,
+      live: false,
+      backgroundOnly: false,
+      cancelled: true,
+    }
+    const { api, subscribeSession, openSessionRead } = createBootstrap({
+      subscribeSession: async () => {
+        liveCall += 1
+        if (liveCall === 1) {
+          return new Promise(resolve => { releaseInitial = resolve })
+        }
+        return LIVE_READY
+      },
+    })
+    const initial = api.startSessionBootstrap({ includeHistory: false })
 
     api.setSessionHandoffTarget('agent:main:webchat:target', 1)
-    expect(api.handleConnectionState('disconnected')?.deferred).toBe(true)
-    expect(api.handleConnectionState('connected')?.deferred).toBe(true)
-    expect(subscribeSession).toHaveBeenCalledOnce()
+    expect(api.handleConnectionState('connected', false)?.deferred).toBe(true)
+    expect(openSessionRead).toHaveBeenCalledOnce()
+
+    releaseInitial(unavailable)
+    await expect(initial.live).resolves.toEqual(unavailable)
+    expect(api.livePhase.value).toBe('degraded')
+    expect(openSessionRead).toHaveBeenCalledOnce()
 
     const resumed = api.setSessionHandoffTarget(null, 1)
-    await resumed?.live
+    expect(resumed?.generation).toBeGreaterThan(initial.generation)
+    await expect(resumed?.live).resolves.toBe(LIVE_READY)
     expect(subscribeSession).toHaveBeenCalledTimes(2)
+    expect(openSessionRead).toHaveBeenCalledTimes(2)
   })
 
-  it('discards stale reconnect transitions after the target commits', async () => {
-    const { api, subscribeSession } = createBootstrap()
-    const initial = api.startSessionBootstrap()
-    await Promise.all([initial.history, initial.live])
+  it('discards a deferred in-flight recovery after the target commits', async () => {
+    let releaseInitial!: (result: SessionSubscriptionOutcome) => void
+    const unavailable: SessionSubscriptionOutcome = {
+      authoritative: false,
+      live: false,
+      backgroundOnly: false,
+      cancelled: true,
+    }
+    const { api, subscribeSession, openSessionRead } = createBootstrap({
+      subscribeSession: async () => new Promise(resolve => { releaseInitial = resolve }),
+    })
+    const initial = api.startSessionBootstrap({ includeHistory: false })
 
     api.setSessionHandoffTarget('agent:main:webchat:target', 2)
-    api.handleConnectionState('disconnected')
-    api.handleConnectionState('connected')
+    expect(api.handleConnectionState('connected', false)?.deferred).toBe(true)
+    releaseInitial(unavailable)
+    await expect(initial.live).resolves.toEqual(unavailable)
 
     expect(api.setSessionHandoffTarget(null, 2, 'committed')).toBeUndefined()
     expect(subscribeSession).toHaveBeenCalledOnce()
+    expect(openSessionRead).toHaveBeenCalledOnce()
+    expect(api.livePhase.value).toBe('degraded')
   })
 
   it('tracks draft mutation and retryable phase contracts independently of transport', () => {

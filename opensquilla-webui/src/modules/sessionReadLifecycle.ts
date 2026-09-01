@@ -284,6 +284,16 @@ export class SessionReadContractError extends Error {
   }
 }
 
+/** Domain failure projected by an Adapter when the requested session is gone. */
+export class SessionReadSessionMissingError extends Error {
+  readonly code = 'session-missing'
+
+  constructor(message: string, readonly cause?: unknown) {
+    super(message)
+    this.name = 'SessionReadSessionMissingError'
+  }
+}
+
 interface ActiveSessionRead {
   readonly sessionKey: string
   cursor: ConversationCursor
@@ -567,7 +577,13 @@ export function createSessionReadLifecycle(
 
     // A failed live acquisition has no useful subscription left. Metadata and
     // history failures remain independent and do not tear down a healthy live lease.
-    void live.catch(async () => {
+    void live.catch(async error => {
+      // Preserve a terminal domain absence long enough for the lease consumer
+      // to project it. Closing aborts the owner signal synchronously; without
+      // this one-turn handoff the consumer would misclassify the Adapter's
+      // SessionReadSessionMissingError as an ordinary local cancellation.
+      // Other live failures keep the existing immediate close/fence behavior.
+      if (error instanceof SessionReadSessionMissingError) await Promise.resolve()
       if (!state.closedReason) await closeState('closed').catch(() => {})
     })
     void criticalRequestsQueued.catch(() => {})

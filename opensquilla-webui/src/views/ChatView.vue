@@ -2387,6 +2387,7 @@ const {
   scheduleHistorySync,
   cancelAnchorStabilization,
   cancelActiveHistory,
+  markSessionMissing,
   cleanup: cleanupHistory,
 } = chatHistory
 
@@ -2634,6 +2635,7 @@ const chatSessionSubscription = useChatSessionSubscription({
     if (generation < 0) return
     activeProjectWorkspace.failSessionResolution(key, generation)
   },
+  onSessionMissing: markSessionMissing,
   onSnapshot: snapshot => {
     chatSessionRouting.applyBootstrap(snapshot)
     chatPlans.applyBootstrap(snapshot)
@@ -2928,6 +2930,7 @@ const chatSessionRuntime = useChatSessionRuntime({
   setSessionHandoffTarget,
   resumeSessionBootstrap,
   startSessionBootstrap,
+  currentSessionBootstrap: chatSessionBootstrap.currentSessionBootstrap,
   loadCurrentSessionUsage,
   applySessionRunState,
   setCompactInFlight,

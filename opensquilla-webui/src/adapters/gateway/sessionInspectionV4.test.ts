@@ -143,7 +143,7 @@ describe('v4 SessionInspection Adapter', () => {
           turnId: 'turn-1',
           promotedTurnId: 'turn-0',
           appliedIteration: 2,
-          activityMarkers: [{ markerId: 'marker-1' }],
+          activityMarkers: [{ marker_id: 'marker-1' }],
         },
       }],
     })

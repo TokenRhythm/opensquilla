@@ -41,6 +41,7 @@ import {
 } from './sessionHistoryV4'
 import {
   SessionReadContractError,
+  SessionReadSessionMissingError,
   type SessionReadActivity,
   type SessionReadHistoryPage,
   type SessionReadJsonObject,
@@ -157,6 +158,17 @@ function isMissingMethod(error: unknown): boolean {
   return errorCode(error) === 'METHOD_NOT_FOUND'
 }
 
+function subscriptionError(error: unknown): unknown {
+  if (error instanceof SessionReadSessionMissingError) return error
+  if (['NOT_FOUND', 'SESSION_NOT_FOUND'].includes(errorCode(error))) {
+    return new SessionReadSessionMissingError(
+      error instanceof Error ? error.message : 'The requested session does not exist.',
+      error,
+    )
+  }
+  return error
+}
+
 function invalidContract(method: string): SessionReadContractError {
   return new SessionReadContractError(`${method} violated its generated v4 Contract.`)
 }
@@ -190,16 +202,12 @@ function objectValue(value: unknown): Record<string, unknown> | null {
     : null
 }
 
-function camelKey(value: string): string {
-  return value.replace(/_([a-z])/g, (_, letter: string) => letter.toUpperCase())
-}
-
 function projectJson(value: unknown): unknown {
   if (Array.isArray(value)) return Object.freeze(value.map(projectJson))
   const item = objectValue(value)
   if (!item) return value
   return Object.freeze(Object.fromEntries(
-    Object.entries(item).map(([key, child]) => [camelKey(key), projectJson(child)]),
+    Object.entries(item).map(([key, child]) => [key, projectJson(child)]),
   ))
 }
 
@@ -223,7 +231,7 @@ function additionalFields(
   return Object.freeze(Object.fromEntries(
     Object.entries(value)
       .filter(([key]) => !known.has(key))
-      .map(([key, child]) => [camelKey(key), projectJson(child)]),
+      .map(([key, child]) => [key, projectJson(child)]),
   ))
 }
 
@@ -468,8 +476,9 @@ export function createV4SessionReadPort(
           }
           return result
         }).catch(error => {
-          subscribeSent.failed(error)
-          throw error
+          const projected = subscriptionError(error)
+          subscribeSent.failed(projected)
+          throw projected
         })
         const snapshotPromise = optionalSnapshot(
           rpc,
