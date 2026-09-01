@@ -2004,7 +2004,7 @@ describe('useChatHistory canonical pagination', () => {
     })
   })
 
-  it('keeps typed latest recovery pending when a direct sync is scheduled', async () => {
+  it('keeps typed latest recovery pending when a scheduled sync is requested', async () => {
     vi.useFakeTimers()
     try {
       const { api, rpc, messages } = makeHistory(false)
@@ -2055,6 +2055,54 @@ describe('useChatHistory canonical pagination', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('keeps typed latest recovery pending when a direct load is requested', async () => {
+    const { api, rpc, messages } = makeHistory(false)
+    rpc.call
+      .mockResolvedValueOnce({
+        messages: [
+          historyMessage('m1'),
+          historyMessage('m2'),
+          historyMessage('m3'),
+          historyMessage('m4'),
+        ],
+        has_more: true,
+        oldest_cursor: 'cursor-1',
+        newest_cursor: 'cursor-4',
+        canonical_available: true,
+      })
+      .mockRejectedValueOnce(Object.assign(new Error('cursor rejected'), {
+        code: 'HISTORY_CURSOR_INVALIDATED',
+      }))
+      .mockResolvedValueOnce({
+        messages: [historyMessage('m2'), historyMessage('m3'), historyMessage('m4')],
+        has_more: false,
+        oldest_cursor: 'cursor-2',
+        newest_cursor: 'cursor-4',
+        canonical_available: true,
+      })
+
+    await api.loadHistory()
+    await api.loadEarlierHistory()
+    expect(api.historyState.value.loadEarlierError).toBe(true)
+
+    expect(api.loadHistory()).toBeUndefined()
+    await Promise.resolve()
+
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+    expect(messages.value.map(message => message.messageId)).toEqual(['m1', 'm2', 'm3', 'm4'])
+    expect(api.historyState.value.loadEarlierError).toBe(true)
+
+    await api.retryHistory()
+
+    const retryParams = rpc.call.mock.calls[2]?.[1]
+    expect(retryParams).not.toHaveProperty('before')
+    expect(retryParams).not.toHaveProperty('after')
+    expect(rpc.call).toHaveBeenCalledTimes(3)
+    expect(messages.value.map(message => message.messageId)).toEqual(['m2', 'm3', 'm4'])
+    expect(api.historyState.value.loadEarlierError).toBe(false)
+    api.cleanup()
   })
 
   it('replaces an overlapping canonical prefix while preserving the local tail', async () => {

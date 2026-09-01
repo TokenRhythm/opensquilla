@@ -1481,6 +1481,15 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   ): Promise<SessionPhaseResult | void> | undefined {
     const key = options.sessionKey.value
     if (!key) return
+    if (
+      failedHistoryRequest?.key === key
+      && failedHistoryRequest.kind === 'latest'
+      && !params.replaceCanonicalWindow
+    ) {
+      historySyncPending = true
+      historySyncPendingNonReconnecting ||= Boolean(params.nonReconnecting)
+      return
+    }
     if (activeHistory) {
       if (
         activeHistory.key === key
