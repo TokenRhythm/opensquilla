@@ -48,6 +48,13 @@ export function rpcErrorCode(error: unknown): string {
   return typeof code === 'string' ? code : ''
 }
 
+export function historyCursorRequiresLatestReload(error: unknown): boolean {
+  return [
+    'HISTORY_CURSOR_INVALID',
+    'HISTORY_CURSOR_INVALIDATED',
+  ].includes(rpcErrorCode(error))
+}
+
 export function isRpcAbort(error: unknown): boolean {
   return error instanceof RpcAbortError || rpcErrorCode(error) === 'RPC_ABORTED'
 }

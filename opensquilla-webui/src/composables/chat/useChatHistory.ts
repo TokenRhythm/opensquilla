@@ -32,6 +32,7 @@ import type { InitialHistoryLoadStatus } from '@/utils/chat/sessionLoadState'
 import { planRevisionsFromToolSegments } from '@/utils/chat/plans'
 import {
   SESSION_PHASE_ATTEMPT_BUDGET_MS,
+  historyCursorRequiresLatestReload,
   isRpcAbort,
   phaseCallOptions,
   phaseTimeoutMs,
@@ -704,6 +705,10 @@ type FailedHistoryRequest =
     }
   | {
       kind: 'bridge'
+      key: string
+    }
+  | {
+      kind: 'latest'
       key: string
     }
 
@@ -1406,14 +1411,16 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           }
         }
         const initialLoadFailed = isInitialLoad && !bridgeAttempted
-        failedHistoryRequest = bridgeAttempted
-          ? { kind: 'bridge', key }
-          : {
-              kind: 'page',
-              key,
-              before: params.before ?? null,
-              prepend: Boolean(params.prepend),
-            }
+        failedHistoryRequest = historyCursorRequiresLatestReload(error)
+          ? { kind: 'latest', key }
+          : bridgeAttempted
+            ? { kind: 'bridge', key }
+            : {
+                kind: 'page',
+                key,
+                before: params.before ?? null,
+                prepend: Boolean(params.prepend),
+              }
         historyState.value = {
           ...historyState.value,
           loading: false,
@@ -1513,6 +1520,19 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   function retryHistory(bootstrap?: SessionBootstrapPhaseContext) {
     const failed = failedHistoryRequest
     if (failed?.key === options.sessionKey.value) {
+      if (failed.kind === 'latest') {
+        hasLoadedEarlier = false
+        loadEarlierPending = false
+        loadedEarlierCursors.clear()
+        failedHistoryRequest = null
+        historyState.value = {
+          ...historyState.value,
+          hasMore: false,
+          oldestCursor: null,
+          newestCursor: null,
+        }
+        return loadHistory({ retry: true }, bootstrap)
+      }
       if (failed.kind === 'bridge') {
         return loadHistory({ bridgeRetry: true, retry: true }, bootstrap)
       }

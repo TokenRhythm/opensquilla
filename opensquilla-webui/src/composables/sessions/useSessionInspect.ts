@@ -1,5 +1,6 @@
 import { ref } from 'vue'
 import type { ChatHistoryMessage } from '@/types/chat'
+import { historyCursorRequiresLatestReload } from '@/composables/chat/sessionBootstrapContract'
 import type { SessionConversation } from '@/modules/sessionConversation'
 
 // There is deliberately no sessions.get RPC; the inspect drawer composes
@@ -32,10 +33,17 @@ export function useSessionInspect(sessionConversation: SessionConversation) {
 
   let requestSeq = 0
   let currentKey = ''
-  let failedTranscriptRequest: {
-    key: string
-    before: string | number | null
-  } | null = null
+  let failedTranscriptRequest:
+    | {
+        kind: 'page'
+        key: string
+        before: string | number | null
+      }
+    | {
+        kind: 'latest'
+        key: string
+      }
+    | null = null
   const loadedEarlierCursors = new Set<string>()
 
   async function fetchPreview(key: string, seq: number) {
@@ -86,7 +94,7 @@ export function useSessionInspect(sessionConversation: SessionConversation) {
     const complete = data?.canonical_complete ?? data?.canonicalComplete
     if (typeof complete === 'boolean') canonicalComplete.value = complete
     if (available === false) {
-      failedTranscriptRequest = { key, before: before ?? null }
+      failedTranscriptRequest = { kind: 'page', key, before: before ?? null }
       if (before != null) return false
     }
 
@@ -150,8 +158,13 @@ export function useSessionInspect(sessionConversation: SessionConversation) {
       if (seq === requestSeq && applied === true) {
         loadedEarlierCursors.add(String(cursor))
       }
-    } catch {
-      if (seq === requestSeq) loadEarlierError.value = true
+    } catch (error) {
+      if (seq === requestSeq) {
+        if (historyCursorRequiresLatestReload(error)) {
+          failedTranscriptRequest = { kind: 'latest', key: currentKey }
+        }
+        loadEarlierError.value = true
+      }
     } finally {
       if (seq === requestSeq) loadingEarlier.value = false
     }
@@ -166,8 +179,9 @@ export function useSessionInspect(sessionConversation: SessionConversation) {
 
   function retryHistory(beforeApply?: () => void) {
     const failed = failedTranscriptRequest
-    if (failed?.key === currentKey && failed.before != null) {
-      return requestEarlier(failed.before, beforeApply)
+    if (failed?.key === currentKey) {
+      if (failed.kind === 'latest') return load(currentKey)
+      if (failed.before != null) return requestEarlier(failed.before, beforeApply)
     }
     if (canonicalAvailable.value === false) {
       return currentKey ? load(currentKey) : undefined

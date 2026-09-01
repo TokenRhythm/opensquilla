@@ -71,6 +71,40 @@ describe('useSessionInspect canonical pagination', () => {
     expect(historyCall).toBe(3)
   })
 
+  it.each([
+    'HISTORY_CURSOR_INVALID',
+    'HISTORY_CURSOR_INVALIDATED',
+  ])('reloads latest instead of replaying a rejected cursor for %s', async (code) => {
+    let historyCall = 0
+    rpc.call.mockImplementation(async (method: string) => {
+      if (method === 'sessions.preview') return { previews: [] }
+      historyCall++
+      if (historyCall === 1) return page('m4', 'cursor-4', true)
+      if (historyCall === 2) {
+        throw Object.assign(new Error('cursor rejected'), { code })
+      }
+      return page('m9', 'cursor-9', false)
+    })
+    const inspect = useSessionInspect(sessionConversationFromTestRpc(rpc))
+
+    await inspect.load('agent:main:webchat:test')
+    await inspect.loadEarlier()
+
+    expect(inspect.loadEarlierError.value).toBe(true)
+    expect(inspect.messages.value.map(message => message.message_id)).toEqual(['m4'])
+
+    await inspect.retryHistory()
+
+    const historyRequests = rpc.call.mock.calls
+      .filter(([method]) => method === 'chat.history')
+      .map(([, params]) => params)
+    expect(historyRequests[1]).toMatchObject({ before: 'cursor-4' })
+    expect(historyRequests[2]).not.toHaveProperty('before')
+    expect(historyRequests[2]).not.toHaveProperty('after')
+    expect(inspect.messages.value.map(message => message.message_id)).toEqual(['m9'])
+    expect(inspect.loadEarlierError.value).toBe(false)
+  })
+
   it('does not apply unavailable fallback rows and retries the same earlier page', async () => {
     let historyCall = 0
     rpc.call.mockImplementation(async (method: string) => {

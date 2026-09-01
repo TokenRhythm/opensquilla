@@ -1876,6 +1876,60 @@ describe('useChatHistory canonical pagination', () => {
     })
   })
 
+  it('drops an invalidated forward cursor before retrying from latest', async () => {
+    const { api, rpc, messages } = makeHistory(false)
+    rpc.call
+      .mockResolvedValueOnce({
+        messages: [historyMessage('m4')],
+        has_more: true,
+        oldest_cursor: 'cursor-4',
+        newest_cursor: 'cursor-4',
+        canonical_available: true,
+      })
+      .mockResolvedValueOnce({
+        messages: [historyMessage('m3')],
+        has_more: true,
+        oldest_cursor: 'cursor-3',
+        newest_cursor: 'cursor-3',
+        canonical_available: true,
+      })
+      .mockResolvedValueOnce({
+        messages: [historyMessage('m9')],
+        has_more: true,
+        oldest_cursor: 'cursor-9',
+        newest_cursor: 'cursor-9',
+        canonical_available: true,
+      })
+      .mockRejectedValueOnce(Object.assign(new Error('cursor rejected'), {
+        code: 'HISTORY_CURSOR_INVALIDATED',
+      }))
+      .mockResolvedValueOnce({
+        messages: [historyMessage('m10')],
+        has_more: false,
+        oldest_cursor: 'cursor-10',
+        newest_cursor: 'cursor-10',
+        canonical_available: true,
+      })
+
+    await api.loadHistory()
+    await api.loadEarlierHistory()
+    await api.loadHistory()
+
+    expect(rpc.call).toHaveBeenNthCalledWith(4, 'chat.history', expect.objectContaining({
+      after: 'cursor-4',
+    }), expect.any(Object))
+    expect(api.historyState.value.recoveryError).toBe(true)
+
+    await api.retryHistory()
+
+    const retryParams = rpc.call.mock.calls[4]?.[1]
+    expect(retryParams).not.toHaveProperty('before')
+    expect(retryParams).not.toHaveProperty('after')
+    expect(rpc.call).toHaveBeenCalledTimes(5)
+    expect(messages.value.map(message => message.messageId)).toEqual(['m10'])
+    expect(api.historyState.value.recoveryError).toBe(false)
+  })
+
   it('allows the same cursor to be retried after a failed earlier-page request', async () => {
     const { api, rpc } = makeHistory(false, {
       response: {
@@ -1904,6 +1958,50 @@ describe('useChatHistory canonical pagination', () => {
     await api.loadEarlierHistory()
     expect(api.historyState.value.loadEarlierError).toBe(false)
     expect(rpc.call).toHaveBeenCalledTimes(3)
+  })
+
+  it.each([
+    'HISTORY_CURSOR_INVALID',
+    'HISTORY_CURSOR_INVALIDATED',
+  ])('reloads latest without the failed earlier cursor for %s', async (code) => {
+    const { api, rpc, messages } = makeHistory(false)
+    rpc.call
+      .mockResolvedValueOnce({
+        messages: [historyMessage('m4')],
+        has_more: true,
+        oldest_cursor: 'cursor-4',
+        newest_cursor: 'cursor-4',
+        canonical_available: true,
+      })
+      .mockRejectedValueOnce(Object.assign(new Error('cursor rejected'), { code }))
+      .mockResolvedValueOnce({
+        messages: [historyMessage('m9')],
+        has_more: true,
+        oldest_cursor: 'cursor-9',
+        newest_cursor: 'cursor-9',
+        canonical_available: true,
+      })
+
+    await api.loadHistory()
+    await api.loadEarlierHistory()
+
+    expect(messages.value.map(message => message.messageId)).toEqual(['m4'])
+    expect(api.historyState.value.loadEarlierError).toBe(true)
+    expect(rpc.call).toHaveBeenNthCalledWith(2, 'chat.history', expect.objectContaining({
+      before: 'cursor-4',
+    }), expect.any(Object))
+
+    await api.retryHistory()
+
+    const retryParams = rpc.call.mock.calls[2]?.[1]
+    expect(retryParams).not.toHaveProperty('before')
+    expect(retryParams).not.toHaveProperty('after')
+    expect(messages.value.map(message => message.messageId)).toEqual(['m9'])
+    expect(api.historyState.value).toMatchObject({
+      oldestCursor: 'cursor-9',
+      newestCursor: 'cursor-9',
+      loadEarlierError: false,
+    })
   })
 
   it('surfaces and retries an initial history request failure', async () => {
