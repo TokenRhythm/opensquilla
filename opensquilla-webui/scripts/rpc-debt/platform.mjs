@@ -7,11 +7,7 @@ export const debt = {
     supportsMethod: 6,
     waitForConnection: 1,
   },
-  'src/composables/channels/useChannelEditor.ts': { call: 1, waitForConnection: 1 },
-  'src/composables/channels/useChannelMembers.ts': { call: 5, waitForConnection: 1 },
   'src/composables/settings/useSandboxSettings.ts': { call: 1, waitForConnection: 1 },
-  'src/composables/setup/channelRpc.ts': { call: 2 },
   'src/composables/setup/useMemoryLearningSettings.ts': { call: 1 },
   'src/stores/sandboxSetup.ts': { call: 2, waitForConnection: 1 },
-  'src/views/ChannelsView.vue': { call: 7, on: 1, waitForConnection: 1 },
 }

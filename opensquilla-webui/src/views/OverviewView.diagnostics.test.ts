@@ -162,6 +162,7 @@ async function mountOverview(options: MountOptions = {}) {
   const { SESSION_DIRECTORY_KEY } = await import('@/modules/sessionDirectory')
   const { PROVIDER_CONFIGURATION_KEY } = await import('@/modules/providerConfiguration')
   const { OBSERVABILITY_KEY } = await import('@/modules/observability')
+  const { CHANNEL_ADMINISTRATION_KEY } = await import('@/modules/channelAdministration')
   const { createV4Observability } = await import('@/adapters/gateway/observabilityV4')
   const active = ref(true)
   const TestHost = defineComponent({
@@ -227,6 +228,9 @@ async function mountOverview(options: MountOptions = {}) {
     requestJson: vi.fn(),
     requestBinary: vi.fn(),
   }))
+  app.provide(CHANNEL_ADMINISTRATION_KEY, {
+    status: vi.fn(async () => []),
+  } as unknown as import('@/modules/channelAdministration').ChannelAdministration)
   app.mount(el)
   mountedApps.push({ app, el })
 

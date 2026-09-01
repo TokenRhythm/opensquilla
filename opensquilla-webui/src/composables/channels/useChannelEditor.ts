@@ -1,20 +1,18 @@
 import { computed, ref } from 'vue'
 import i18n from '@/i18n'
-import { useRpcStore } from '@/stores/rpc'
 import { errorMessage } from '@/composables/channels/shared'
 import { useSetupChannelsForm } from '@/composables/setup/useSetupChannelsForm'
 import type { SetupCatalogPort } from '@/modules/setupWorkflow'
+import type { ChannelAdministration } from '@/modules/channelAdministration'
 import {
   REDACTED_SENTINEL,
-  parseUpsertOutcome,
-  probeChannelEntry,
-  upsertChannelEntry,
-  type ChannelSaveOutcome,
-} from '@/composables/setup/channelRpc'
+  type ChannelMutationOutcome as ChannelSaveOutcome,
+  type ChannelSetup,
+} from '@/modules/channelSetup'
 
 // In-place channel configuration editor for the /channels workspace. Owns
-// exactly four RPC edges — onboarding.catalog, channels.get,
-// onboarding.channel.probe, onboarding.channel.upsert — and reuses the pure
+// four domain use cases — catalog, saved configuration, draft probe, and
+// upsert — and reuses the pure
 // useSetupChannelsForm draft state. It deliberately does NOT import
 // useSetupCatalog: that composable is a function-scoped single-consumer state
 // tree for the Settings dialog, and instantiating it here would fork an
@@ -130,8 +128,11 @@ export function suggestChannelName(type: string, existingNames: string[]): strin
   return `${base}-${existingNames.length + 1}`
 }
 
-export function useChannelEditor(setupCatalog: SetupCatalogPort) {
-  const rpc = useRpcStore()
+export function useChannelEditor(
+  setupCatalog: SetupCatalogPort,
+  channelAdministration: ChannelAdministration,
+  channelSetup: ChannelSetup,
+) {
   const form = useSetupChannelsForm()
 
   const catalog = ref<ChannelEditorSpec[]>(catalogCache || [])
@@ -213,18 +214,16 @@ export function useChannelEditor(setupCatalog: SetupCatalogPort) {
     fieldErrors.value = {}
     resetProbe()
     try {
-      await rpc.waitForConnection()
+      await channelAdministration.ready()
       const [channels, res] = await Promise.all([
         ensureCatalog(),
-        rpc.call<{ entry?: Record<string, unknown>; secretFields?: string[] }>('channels.get', {
-          name,
-        }),
+        channelAdministration.get(name),
       ])
       const entry = res?.entry
       if (!entry) throw new Error(i18n.global.t('console.channels.editor.entryMissing', { name }))
       entryType.value = String(entry.type || '')
       loadedEntry.value = entry
-      loadedSecretFields.value = res?.secretFields || []
+      loadedSecretFields.value = [...res.secretFields]
       const found = channels.find(s => s.type === entryType.value) || null
       if (found) {
         form.initFromEntry(found, entry, loadedSecretFields.value)
@@ -365,7 +364,7 @@ export function useChannelEditor(setupCatalog: SetupCatalogPort) {
     probe.value = { phase: 'running', rows: [] }
     const started = Date.now()
     try {
-      const res = await probeChannelEntry(rpc, form.payload())
+      const res = await channelSetup.probeDraft(form.payload())
       const rows: ProbeTranscriptRow[] = [
         { id: 'validate', tone: 'ok', text: i18n.global.t('console.channels.editor.probeValid') },
         ...(res?.warnings || []).map((text, index) => ({
@@ -396,8 +395,7 @@ export function useChannelEditor(setupCatalog: SetupCatalogPort) {
 
   async function commit(entry: Record<string, unknown>): Promise<ChannelSaveResult> {
     try {
-      const res = await upsertChannelEntry(rpc, entry)
-      const outcome = parseUpsertOutcome(entry.name, res)
+      const outcome = await channelSetup.upsert(entry)
       if (form.isEditing.value) {
         // Reseed from the server so a just-replaced secret flips back to its
         // masked row, the plaintext leaves memory, and the baseline resets.

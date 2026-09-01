@@ -1,30 +1,20 @@
 import { computed, ref } from 'vue'
 import i18n from '@/i18n'
-import { useRpcStore } from '@/stores/rpc'
 import { useToasts } from '@/composables/useToasts'
 import { useConfirm } from '@/composables/useConfirm'
-import { approvePairingParams, errorMessage, withPendingKey } from '@/composables/channels/shared'
+import { errorMessage, withPendingKey } from '@/composables/channels/shared'
 import type { AppSettings } from '@/modules/appSettings'
+import type {
+  ChannelAdministration,
+  ChannelPairing,
+} from '@/modules/channelAdministration'
+
+export type { ChannelPairing } from '@/modules/channelAdministration'
 
 // Members state for one selected channel: pairing requests, approved access,
 // and channel-admin standing. Owned by the /channels view (state survives tab
 // switches) and rendered by ChannelMembersPanel. Members mutations commit
 // live — deliberately unlike the configuration editor's draft/save model.
-
-export interface ChannelPairing {
-  pairingId: string
-  pairingCode?: string
-  channelName: string
-  senderId: string
-  senderName?: string | null
-  status: 'pending' | 'approved' | string
-  createdAt?: string | null
-  approvedAt?: string | null
-}
-
-interface PairingsResponse {
-  pairings?: ChannelPairing[]
-}
 
 /**
  * First-pairing admin bootstrap rule: the "approve as admin" checkbox may
@@ -39,8 +29,10 @@ export function bootstrapAsAdminDefault(
   return approvedCount === 0 && adminCount === 0
 }
 
-export function useChannelMembers(appSettings: AppSettings) {
-  const rpc = useRpcStore()
+export function useChannelMembers(
+  appSettings: AppSettings,
+  channelAdministration: ChannelAdministration,
+) {
   const { pushToast } = useToasts()
   const { confirm } = useConfirm()
   const t = i18n.global.t
@@ -175,10 +167,10 @@ export function useChannelMembers(appSettings: AppSettings) {
     try {
       // Cold-load guard: a deep-linked Members tab can fire before the WS
       // handshake completes; wait instead of hard-failing with a Retry.
-      await rpc.waitForConnection()
-      const result = await rpc.call<PairingsResponse>('channels.pairings', { channelName: name })
+      await channelAdministration.ready()
+      const result = await channelAdministration.listPairings(name)
       if (activeName.value !== name || id !== requestId) return
-      pairings.value = (result.pairings || []).filter(pairing => pairing.channelName === name)
+      pairings.value = [...result]
       await loadChannelAdmins(name, id)
     } catch (err) {
       if (activeName.value === name && id === requestId) {
@@ -204,8 +196,11 @@ export function useChannelMembers(appSettings: AppSettings) {
     await withPendingKey(pendingActions, actionKey(pairing, pairing.status === 'revoked' ? 'reapprove' : 'approve'), async () => {
       error.value = ''
       try {
-        const res = await rpc.call<{ adminGranted?: boolean; warnings?: string[] }>(
-          'channels.pairing.approve', approvePairingParams(name, pairing.pairingId, asAdmin))
+        const res = await channelAdministration.approvePairing(
+          name,
+          pairing.pairingId,
+          asAdmin,
+        )
         // The backend commits the approval even when the admin grant fails
         // (adminGranted:false + warnings) — surface that instead of falsely
         // announcing an admin success.
@@ -248,11 +243,7 @@ export function useChannelMembers(appSettings: AppSettings) {
     await withPendingKey(pendingActions, actionKey(pairing, 'admin'), async () => {
       error.value = ''
       try {
-        await rpc.call('channels.admin.set', {
-          channelName: name,
-          senderId: pairing.senderId,
-          admin,
-        })
+        await channelAdministration.setAdmin(name, pairing.senderId, admin)
         announcement.value = admin
           ? t('console.channels.pairings.adminGrantedSuccess', { sender })
           : t('console.channels.pairings.adminRemovedSuccess', { sender })
@@ -283,7 +274,7 @@ export function useChannelMembers(appSettings: AppSettings) {
     await withPendingKey(pendingActions, adminOnlyKey(senderId), async () => {
       error.value = ''
       try {
-        await rpc.call('channels.admin.set', { channelName: name, senderId, admin: false })
+        await channelAdministration.setAdmin(name, senderId, false)
         announcement.value = t('console.channels.pairings.adminRemovedSuccess', { sender: senderId })
         pushToast(announcement.value, { tone: 'ok' })
         await load(name)
@@ -305,7 +296,7 @@ export function useChannelMembers(appSettings: AppSettings) {
     await withPendingKey(pendingActions, actionKey(pairing, 'revoke'), async () => {
       error.value = ''
       try {
-        await rpc.call('channels.pairing.revoke', { channelName: name, pairingId: pairing.pairingId })
+        await channelAdministration.revokePairing(name, pairing.pairingId)
         announcement.value = t('console.channels.pairings.revokeSuccess', { sender })
         pushToast(announcement.value, { tone: 'ok' })
         await load(name)

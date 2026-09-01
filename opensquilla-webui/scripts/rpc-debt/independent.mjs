@@ -15,9 +15,6 @@ export const debt = {
     markMethodUnavailable: 1,
     supportsMethod: 1,
   },
-  'src/composables/cron/useCronForm.ts': { call: 1 },
-  'src/composables/cron/useCronJobs.ts': { call: 3, on: 1, waitForConnection: 1 },
-  'src/composables/cron/useCronRuns.ts': { call: 1 },
   'src/composables/workbench/useArtifactPreviewResource.ts': {
     httpRequest: 1,
     httpApiEndpoint: 1,
@@ -25,7 +22,6 @@ export const debt = {
     httpAuthorizationHeader: 1,
     httpSessionKeyHeader: 1,
   },
-  'src/views/OverviewView.vue': { call: 1 },
   'src/utils/workbench/artifactPreviewLease.ts': {
     httpRequest: 3,
     httpApiEndpoint: 3,

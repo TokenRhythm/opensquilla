@@ -1,18 +1,12 @@
 import { computed, onActivated, onDeactivated, onUnmounted, ref } from 'vue'
 import i18n from '@/i18n'
-import { useRpcStore } from '@/stores/rpc'
-import { useRequest } from '@/composables/useRequest'
 import { useToasts } from '@/composables/useToasts'
 import type { CronJob } from '@/types/cron'
+import type { CronScheduler, CronSubscription } from '@/modules/cronScheduler'
 import { humanCountdown, humanTime } from '@/utils/cron/time'
 import { wasCronFinishNotified } from '@/utils/cron/notifications'
 
-interface CronListResponse {
-  jobs?: CronJob[]
-}
-
-export function useCronJobs() {
-  const rpc = useRpcStore()
+export function useCronJobs(scheduler: CronScheduler) {
   const { pushToast } = useToasts()
   const t = i18n.global.t
   const searchText = ref('')
@@ -22,22 +16,18 @@ export function useCronJobs() {
   const sortAsc = ref(true)
   const now = ref(Date.now())
 
-  const { data: cronData, loading, error, refresh } = useRequest<CronListResponse | CronJob[]>(
-    'cron.list',
-    undefined,
-    { errorLabel: t('cronSkills.jobs.errLoad') },
-  )
+  const cronData = ref<readonly CronJob[] | null>(null)
+  const loading = ref(false)
+  const error = ref<string | null>(null)
 
   const jobs = computed<CronJob[]>(() => {
-    const d = cronData.value
-    if (!d) return []
-    return Array.isArray(d) ? d : (d.jobs || [])
+    return cronData.value ? [...cronData.value] : []
   })
   const hasLoaded = computed(() => cronData.value !== null)
 
   let tickInterval: ReturnType<typeof setInterval> | null = null
   let reloadTimer: ReturnType<typeof setTimeout> | null = null
-  let unsubRunFinished: (() => void) | null = null
+  let runFinishedSubscription: CronSubscription | null = null
 
   const enabledCount = computed(() => jobs.value.filter(j => j.enabled).length)
   const pausedCount = computed(() => jobs.value.length - enabledCount.value)
@@ -97,6 +87,20 @@ export function useCronJobs() {
     })
   })
 
+  async function refresh(): Promise<void> {
+    loading.value = true
+    error.value = null
+    try {
+      cronData.value = await scheduler.listJobs()
+    } catch (err) {
+      error.value = t('cronSkills.jobs.errLoad', {
+        error: err instanceof Error ? err.message : String(err),
+      })
+    } finally {
+      loading.value = false
+    }
+  }
+
   const loadData = refresh
 
   function scheduleReload() {
@@ -107,7 +111,7 @@ export function useCronJobs() {
 
   async function recoverAfterConnectionRecycle(): Promise<void> {
     try {
-      await rpc.waitForConnection(10_000)
+      await scheduler.ready({ timeoutMs: 10_000 })
       await refresh()
       pushToast(t('cronSkills.jobs.toastConnectionRecovered'), { tone: 'info' })
     } catch {
@@ -130,7 +134,7 @@ export function useCronJobs() {
 
   async function toggleJob(job: CronJob) {
     try {
-      await rpc.call('cron.update', { id: job.id, enabled: !job.enabled })
+      await scheduler.setEnabled(job.id, !job.enabled)
       pushToast(job.enabled ? t('cronSkills.jobs.toastPaused') : t('cronSkills.jobs.toastResumed'), { tone: 'ok' })
       void refresh()
     } catch (err) {
@@ -145,7 +149,7 @@ export function useCronJobs() {
   async function runJob(id: string) {
     runningJobIds.value = new Set(runningJobIds.value).add(id)
     try {
-      const res = await rpc.call<{ runId?: string; reply?: string; error?: string }>('cron.run', { id })
+      const res = await scheduler.runNow(id)
       if (!res?.runId || !wasCronFinishNotified(res.runId)) {
         if (res?.error) pushToast(t('cronSkills.jobs.toastRunFailed', { error: res.error }), { tone: 'danger' })
         else pushToast(res?.reply ? t('cronSkills.jobs.toastRunComplete', { reply: res.reply.substring(0, 120) }) : t('cronSkills.jobs.toastTriggered'), { tone: 'ok' })
@@ -165,7 +169,7 @@ export function useCronJobs() {
   }
 
   async function removeJob(id: string) {
-    await rpc.call('cron.remove', { id })
+    await scheduler.remove(id)
     pushToast(t('cronSkills.jobs.toastDeleted'), { tone: 'ok' })
     void refresh()
   }
@@ -181,13 +185,14 @@ export function useCronJobs() {
   function teardownLive() {
     if (tickInterval) { clearInterval(tickInterval); tickInterval = null }
     if (reloadTimer) { clearTimeout(reloadTimer); reloadTimer = null }
-    if (unsubRunFinished) { unsubRunFinished(); unsubRunFinished = null }
+    runFinishedSubscription?.close()
+    runFinishedSubscription = null
   }
 
   onActivated(() => {
     void loadData()
     tickInterval = setInterval(() => { now.value = Date.now() }, 1000)
-    unsubRunFinished = rpc.on('cron.run.finished', onRunFinished)
+    runFinishedSubscription = scheduler.subscribe(onRunFinished)
   })
 
   onDeactivated(teardownLive)
