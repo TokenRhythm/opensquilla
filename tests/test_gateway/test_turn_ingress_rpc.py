@@ -102,11 +102,12 @@ async def _open_real_stack(
     db_path: Path,
     *,
     max_pending_per_session: int = 64,
+    session_key: str = SESSION_KEY,
 ) -> AsyncIterator[_RealIngressStack]:
     storage = await SessionStorage.open(str(db_path))
     manager = SessionManager(storage, inject_time_prefix=False)
     session = await manager.create(
-        SESSION_KEY,
+        session_key,
         agent_id="main",
         display_name="Atomic ingress test",
     )
@@ -3210,6 +3211,51 @@ async def test_sessions_send_replays_same_request_without_duplicate_side_effects
         assert replay.payload["turn_id"] == first.payload["turn_id"]
         assert replay.payload["client_message_id"] == "original-composer-message"
         assert replay.payload["surface_id"] == "tui:original"
+        assert _table_counts(stack.db_path) == {
+            "transcript_entries": 1,
+            "agent_tasks": 1,
+            "turn_ingress_receipts": 1,
+        }
+
+
+@pytest.mark.asyncio
+async def test_sessions_send_replays_receipt_before_cron_interactivity_check(
+    tmp_path: Path,
+) -> None:
+    session_key = "legacy-scheduled-run"
+    async with _open_real_stack(
+        tmp_path / "sessions.db",
+        session_key=session_key,
+    ) as stack:
+        params = {
+            "key": session_key,
+            "message": "accepted before the session became read-only",
+            "clientRequestId": CLIENT_REQUEST_ID,
+        }
+        first = await get_dispatcher().dispatch(
+            "rpc-cron-replay-first", "sessions.send", params, stack.context
+        )
+        await stack.wait_until_running()
+        current = await stack.storage.get_session(session_key)
+        assert current is not None
+        updated = await stack.storage.compare_and_set_session_origin(
+            expected_session=current,
+            expected_origin=None,
+            origin={"kind": "cron"},
+            workspace_guard=None,
+        )
+        assert updated is not None
+
+        replay = await get_dispatcher().dispatch(
+            "rpc-cron-replay-second", "sessions.send", params, stack.context
+        )
+
+        assert first.ok is True
+        assert replay.ok is True
+        assert replay.payload["accepted"] is True
+        assert replay.payload["replayed"] is True
+        assert replay.payload["message_id"] == first.payload["message_id"]
+        assert replay.payload["task_id"] == first.payload["task_id"]
         assert _table_counts(stack.db_path) == {
             "transcript_entries": 1,
             "agent_tasks": 1,

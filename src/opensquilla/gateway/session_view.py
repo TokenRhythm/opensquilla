@@ -91,6 +91,21 @@ def build_session_view_item(
     }
 
 
+def is_noninteractive_cron_session(
+    session: Any,
+    *,
+    channel_types: dict[str, str] | None = None,
+) -> bool:
+    """Return whether one stored session is an isolated, read-only Cron run."""
+
+    key = str(getattr(session, "session_key", "") or "")
+    origin = getattr(session, "origin", None)
+    origin_map = origin if isinstance(origin, dict) else {}
+    surface = _surface(session, key, origin_map, channel_types)
+    session_kind = _session_kind(session, key, surface, origin_map)
+    return session_kind == "cron" and not _interactive(session_kind, surface)
+
+
 def _effective_agent_id(session: Any, key: str) -> str:
     parsed = parse_agent_id(key)
     stored = _display(getattr(session, "agent_id", None)) or "main"

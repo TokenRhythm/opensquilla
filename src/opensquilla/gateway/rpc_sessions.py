@@ -121,9 +121,9 @@ from opensquilla.gateway.session_services import (
 )
 from opensquilla.gateway.session_streams import get_session_streams
 from opensquilla.gateway.session_view import (
-    _surface,
     build_session_view_item,
     derive_transcript_title,
+    is_noninteractive_cron_session,
 )
 from opensquilla.gateway.subagent_announce import (
     quiesce_background_completion_sessions,
@@ -3952,18 +3952,17 @@ async def _handle_sessions_send_impl_inner(
                 )
             return replay_response
 
-    if session_intent is SessionIntent.CONTINUE:
-        existing_session = await storage.get_session(key)
-        if existing_session is not None:
-            origin = getattr(existing_session, "origin", None)
-            origin_map = origin if isinstance(origin, dict) else {}
-            if _surface(existing_session, key, origin_map) == "cron":
-                raise RpcHandlerError(
-                    "SESSION_NOT_INTERACTIVE",
-                    "Cron isolated sessions are read-only and cannot receive new turns.",
-                    retryable=False,
-                    accepted=False,
-                )
+    existing_session = await storage.get_session(key)
+    if existing_session is not None and is_noninteractive_cron_session(
+        existing_session,
+        channel_types=_channel_types_from_config(ctx.config),
+    ):
+        raise RpcHandlerError(
+            "SESSION_NOT_INTERACTIVE",
+            "Cron isolated sessions are read-only and cannot receive new turns.",
+            retryable=False,
+            accepted=False,
+        )
 
     if prompt_annotation_ids or document_context_request is not None:
         existing_annotation_session = await storage.get_session(key)

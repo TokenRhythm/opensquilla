@@ -3791,26 +3791,113 @@ class TestSessionsSend:
         assert res.error.code == "NOT_FOUND"
 
     @pytest.mark.asyncio
-    async def test_send_rejects_cron_session_before_acceptance(self, dispatcher):
+    @pytest.mark.parametrize(
+        ("session_key", "origin", "intent"),
+        [
+            pytest.param("cron:job-1:run:1", None, "continue", id="canonical-key"),
+            pytest.param(
+                "scheduled-run-with-legacy-key",
+                {"kind": "cron"},
+                "reset_same_key",
+                id="origin-provenance-and-reset",
+            ),
+        ],
+    )
+    async def test_send_rejects_cron_session_before_acceptance(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+        session_key: str,
+        origin: dict[str, Any] | None,
+        intent: str,
+    ):
         cron_session = FakeSession(
-            session_key="cron:job-1:run:1",
+            session_key=session_key,
             session_id="cron-run-1",
-            origin={"kind": "cron"},
+            origin=origin,
         )
         manager = FakeSessionManager([cron_session])
-        ctx = make_ctx(session_manager=manager, turn_runner=_RecordingTurnRunner())
+        runner = _RecordingTurnRunner()
+        ingest_attachments = AsyncMock(
+            side_effect=AssertionError("Cron rejection must precede attachment ingest")
+        )
+        monkeypatch.setattr(
+            rpc_sessions._attachment_ingest,
+            "ingest_attachments",
+            ingest_attachments,
+        )
+        ctx = make_ctx(session_manager=manager, turn_runner=runner)
+        send_params: dict[str, Any] = {
+            "key": cron_session.session_key,
+            "message": "Unexpected follow-up",
+            "intent": intent,
+            "attachments": [
+                {"type": "text/plain", "data": "bm90ZQ==", "name": "note.txt"}
+            ],
+        }
+        if intent == "continue":
+            # This intentionally combines annotations and attachments. Cron
+            # admission must win before either feature can perform work.
+            send_params["promptAnnotationIds"] = ["annotation-1"]
 
         res = await dispatcher.dispatch(
             "r1",
             "sessions.send",
-            {"key": cron_session.session_key, "message": "Unexpected follow-up"},
+            send_params,
             ctx,
         )
 
         assert res.ok is False
         assert res.error.code == "SESSION_NOT_INTERACTIVE"
+        assert res.error.accepted is False
+        assert res.error.retryable is False
         assert manager.applied_intents == []
         assert manager.created_messages == []
+        assert runner.run_calls == []
+        ingest_attachments.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_send_keeps_custom_named_cron_delivery_session_interactive(
+        self,
+        dispatcher,
+    ):
+        delivery_session = FakeSession(
+            session_key="agent:main:company-chat:direct:user-1",
+            last_channel="company-chat",
+            origin={"kind": "cron"},
+        )
+        manager = FakeSessionManager([delivery_session])
+        runner = _RecordingTurnRunner()
+        config = GatewayConfig(
+            memory={"flush_enabled": False},
+            channels={
+                "channels": [
+                    {
+                        "type": "feishu",
+                        "name": "company-chat",
+                        "app_id": "cli_dummy",
+                        "app_secret": "dummy",
+                    }
+                ]
+            },
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.send",
+            {"key": delivery_session.session_key, "message": "Allowed follow-up"},
+            make_ctx(session_manager=manager, turn_runner=runner, config=config),
+        )
+        background = get_agent_task_registry().get(delivery_session.session_key)
+        if background is not None:
+            await background
+
+        assert res.ok is True
+        assert manager.applied_intents == [(delivery_session.session_key, "continue")]
+        assert manager.created_messages == [
+            (delivery_session.session_key, "user", "Allowed follow-up")
+        ]
+        assert len(runner.run_calls) == 1
 
     @pytest.mark.asyncio
     async def test_send_rejects_too_many_attachments(self, dispatcher, ctx_with_sessions, session):

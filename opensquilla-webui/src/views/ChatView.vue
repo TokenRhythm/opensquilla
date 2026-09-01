@@ -5,20 +5,21 @@
     :class="{
       'chat--new-landing': isNewChatLanding,
       'chat--meta-setup': Boolean(setupState),
-      'chat--drag-over': threadDragOver,
-      'chat--plan-questionnaire-open': Boolean(dockedPlanQuestionnaire),
-      'chat--composer-floating': composerFxEnabled && !isNewChatLanding,
+      'chat--drag-over': threadDragOver && !isCronSession,
+      'chat--plan-questionnaire-open': Boolean(dockedPlanQuestionnaire) && !isCronSession,
+      'chat--composer-floating': composerFxEnabled && !isNewChatLanding && !isCronSession,
       'chat--composer-collapsed': composerCollapsed
         && activePromptAnnotations.length === 0
         && composerFxEnabled
-        && !isNewChatLanding,
+        && !isNewChatLanding
+        && !isCronSession,
     }"
     @dragenter="onChatDragEnter"
     @dragover="onChatDragOver"
     @dragleave="onChatDragLeave"
     @drop="onChatDrop"
   >
-    <div v-if="threadDragOver" class="chat-drop-overlay" role="status" aria-live="polite" aria-atomic="true">
+    <div v-if="threadDragOver && !isCronSession" class="chat-drop-overlay" role="status" aria-live="polite" aria-atomic="true">
       <div class="chat-drop-overlay__frame" aria-hidden="true"></div>
       <div class="chat-drop-overlay__beacon">
         <span class="chat-drop-overlay__glyph" aria-hidden="true">
@@ -1577,6 +1578,11 @@ const lastHeaderRole = ref('')
 const lastHeaderDay = ref('')
 const threadDragOver = ref(false)
 const threadDragDepth = ref(0)
+watch(isCronSession, readOnly => {
+  if (!readOnly) return
+  threadDragDepth.value = 0
+  threadDragOver.value = false
+})
 const shareMode = ref(false)
 const shareSaving = ref(false)
 const selectedShareMessageIds = ref<Set<string>>(new Set())
@@ -2801,8 +2807,13 @@ const promptAnnotationSendBlockedReason = computed<string | null>(() =>
 const deliveryBlockedReason = computed<string | null>(() => (
   sessionRoutingSendBlockedReason.value || liveSendBlockedReason.value
 ))
+const sessionInteractivityBlockedReason = computed<string | null>(() => (
+  isCronSession.value ? t('chat.cronSessionReadOnly') : null
+))
 const effectiveSendBlockedReason = computed<string | null>(() => (
-  deliveryBlockedReason.value || promptAnnotationSendBlockedReason.value
+  sessionInteractivityBlockedReason.value
+  || deliveryBlockedReason.value
+  || promptAnnotationSendBlockedReason.value
 ))
 isLiveDeliveryBlocked = () => Boolean(liveSendBlockedReason.value)
 watch(
@@ -6206,7 +6217,10 @@ function dragEventHasFiles(e: DragEvent): boolean {
 function onChatDragEnter(e: DragEvent) {
   if (!dragEventHasFiles(e)) return
   e.preventDefault()
-  if (replanActive.value) return
+  if (isCronSession.value || replanActive.value) {
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'none'
+    return
+  }
   threadDragDepth.value += 1
   threadDragOver.value = true
 }
@@ -6214,7 +6228,7 @@ function onChatDragEnter(e: DragEvent) {
 function onChatDragOver(e: DragEvent) {
   if (!dragEventHasFiles(e)) return
   e.preventDefault()
-  if (replanActive.value) {
+  if (isCronSession.value || replanActive.value) {
     if (e.dataTransfer) e.dataTransfer.dropEffect = 'none'
     return
   }
@@ -6235,6 +6249,10 @@ function onChatDrop(e: DragEvent) {
   threadDragDepth.value = 0
   threadDragOver.value = false
   if (!dragEventHasFiles(e)) return
+  if (isCronSession.value) {
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'none'
+    return
+  }
   if (replanActive.value) {
     pushToast(t('chat.plan.attachmentsUnavailable'), { tone: 'warn' })
     return
@@ -6254,6 +6272,7 @@ function autoResizeTextarea() {
 /* ── Clipboard paste ───────────────────────────────────────────────── */
 
 function onDocumentPaste(e: ClipboardEvent) {
+  if (isCronSession.value) return
   // Pastes aimed at another editable surface (clarify/approval inputs, the
   // command palette) or at an open dialog keep their default behavior — only
   // composer-bound pastes claim clipboard files, mirroring onDocumentKeydown.
@@ -6655,7 +6674,7 @@ onMounted(async () => {
   // The entire dock can grow through attachments, pending work, and textarea
   // autoresize. Publish its real height locally so the thread always reserves
   // exactly enough clearance for the floating surface.
-  const composerDock = composerRef.value?.composerElement()?.parentElement ?? null
+  const composerDock = chatRootRef.value?.querySelector<HTMLElement>('.chat-composer-dock') ?? null
   if (composerDock && typeof ResizeObserver !== 'undefined') {
     const publishComposerDockHeight = () => {
       const height = Math.ceil(composerDock.getBoundingClientRect().height)

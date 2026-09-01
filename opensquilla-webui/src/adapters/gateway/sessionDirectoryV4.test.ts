@@ -48,6 +48,9 @@ describe('v4 SessionDirectory Adapter', () => {
   it('recognizes isolated cron session keys as read-only', () => {
     expect(isCronSessionKey('cron:job-1:run:1')).toBe(true)
     expect(isCronSessionKey(' CRON:job-1:run:1 ')).toBe(true)
+    expect(isCronSessionKey('')).toBe(false)
+    expect(isCronSessionKey('cron')).toBe(false)
+    expect(isCronSessionKey('agent:main:webchat:cron:run')).toBe(false)
     expect(isCronSessionKey('agent:main:webchat:one')).toBe(false)
   })
 
