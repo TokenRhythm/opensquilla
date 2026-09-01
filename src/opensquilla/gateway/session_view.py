@@ -101,6 +101,14 @@ def is_noninteractive_cron_session(
     key = str(getattr(session, "session_key", "") or "")
     origin = getattr(session, "origin", None)
     origin_map = origin if isinstance(origin, dict) else {}
+    configured_channels = channel_types or {}
+    last_channel = _lower(getattr(session, "last_channel", None))
+    channel = _lower(getattr(session, "channel", None))
+    if last_channel in configured_channels or channel in configured_channels:
+        # Plugin channel types intentionally remain outside the view contract's
+        # closed surface enum, but their configured names still prove this is a
+        # channel delivery rather than an isolated Cron run.
+        return False
     surface = _surface(session, key, origin_map, channel_types)
     session_kind = _session_kind(session, key, surface, origin_map)
     return session_kind == "cron" and not _interactive(session_kind, surface)

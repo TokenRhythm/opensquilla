@@ -64,8 +64,10 @@ import {
   stableClientUuid,
 } from '@/utils/chat/messageIdentity'
 import {
+  hiddenControlDispatchAttempted,
   type HiddenControlStorage,
   listHiddenControls,
+  markHiddenControlDispatchAttempted,
   persistHiddenControlResult,
   removeHiddenControl,
 } from '@/utils/chat/hiddenControlOutbox'
@@ -2520,6 +2522,10 @@ export function useChatSend(options: UseChatSendOptions) {
       || item.ownerSessionKey
       || options.sessionKey.value
     const retryAttempt = recoveredQueuedAttempts.get(item) ?? null
+    const idempotentReplay = retryAttempt?.requiresIdempotentReplay === true
+    const sendBlockedReason = idempotentReplay
+      ? options.idempotentReplayBlockedReason || options.sendBlockedReason
+      : options.sendBlockedReason
     const steerRetryAttempt = options.steerDelivery.attemptForItem(item)
     const preserveRetryState = (outcome: ChatSendOutcome): ChatSendOutcome => (
       (retryAttempt || steerRetryAttempt)
@@ -2533,7 +2539,7 @@ export function useChatSend(options: UseChatSendOptions) {
     if (!ownerSessionKey || options.sessionKey.value !== ownerSessionKey) {
       return preserveRetryState('not_sent')
     }
-    if (options.sendBlockedReason?.value) {
+    if (sendBlockedReason?.value) {
       return blockedOutcome()
     }
     if (options.validateActiveProjectBeforeSend) {
@@ -2541,7 +2547,7 @@ export function useChatSend(options: UseChatSendOptions) {
       if (options.sessionKey.value !== ownerSessionKey) {
         return preserveRetryState('not_sent')
       }
-      if (options.sendBlockedReason?.value) return blockedOutcome()
+      if (sendBlockedReason?.value) return blockedOutcome()
     }
     if (options.hasPendingAttachmentWork()) {
       if (delivery === 'steer') {
@@ -2574,7 +2580,7 @@ export function useChatSend(options: UseChatSendOptions) {
       if (options.sessionKey.value !== ownerSessionKey) {
         return preserveRetryState('not_sent')
       }
-      if (options.sendBlockedReason?.value) return blockedOutcome()
+      if (sendBlockedReason?.value) return blockedOutcome()
       if (
         options.validateActiveProjectBeforeSend
         && await refreshedActiveProjectBlocksSend()
@@ -2582,7 +2588,7 @@ export function useChatSend(options: UseChatSendOptions) {
       if (options.sessionKey.value !== ownerSessionKey) {
         return preserveRetryState('not_sent')
       }
-      if (options.sendBlockedReason?.value) return blockedOutcome()
+      if (sendBlockedReason?.value) return blockedOutcome()
       if (
         options.stream.isStreaming.value
         || hasAuthoritativeWork()
@@ -2655,6 +2661,7 @@ export function useChatSend(options: UseChatSendOptions) {
       },
       preserveComposer: true,
       retryAttempt,
+      idempotentReplay,
       rememberRetryableAttempt: attempt => {
         recoveredQueuedAttempts.set(item, attempt)
       },
@@ -3759,11 +3766,19 @@ export function useChatSend(options: UseChatSendOptions) {
       ))
     }
 
+    const idempotentReplay = persistResult === 'matched'
+      && hiddenControlDispatchAttempted(
+        requestSessionKey,
+        stableClientRequestId,
+        options.hiddenControlStorage,
+      )
     const operation = performHiddenSend(
       providerText,
       displayText,
       stableClientRequestId,
       requestSessionKey,
+      idempotentReplay,
+      persistResult !== 'unavailable',
     )
     hiddenDispatchInFlight.set(hiddenDispatchKey, operation)
     void operation.then(() => {
@@ -3783,15 +3798,20 @@ export function useChatSend(options: UseChatSendOptions) {
     displayText: string,
     stableClientRequestId: string,
     requestSessionKey: string,
+    idempotentReplay: boolean,
+    durableOutbox: boolean,
   ): Promise<HiddenControlDispatchResult> {
     const compactInFlight = options.isCompactInFlightForCurrentSession()
     const handoffInFlight = responseHandoffBlocksCurrentSession()
     const projectBlocked = options.validateActiveProjectBeforeSend
       ? await refreshedActiveProjectBlocksSend()
       : false
+    const sendBlockedReason = idempotentReplay
+      ? options.idempotentReplayBlockedReason || options.sendBlockedReason
+      : options.sendBlockedReason
     if (
       projectBlocked
-      || options.sendBlockedReason?.value
+      || sendBlockedReason?.value
       || options.stream.isStreaming.value
       || hasAuthoritativeWork()
       || compactInFlight
@@ -3810,6 +3830,22 @@ export function useChatSend(options: UseChatSendOptions) {
       return hiddenDispatchResult(
         queued ? 'queued' : 'rejected',
         queued ? 'queued' : 'queue_full',
+        stableClientRequestId,
+        requestSessionKey,
+      )
+    }
+
+    if (
+      durableOutbox
+      && !markHiddenControlDispatchAttempted(
+        requestSessionKey,
+        stableClientRequestId,
+        options.hiddenControlStorage,
+      )
+    ) {
+      return hiddenDispatchResult(
+        'rejected',
+        'outbox_persist_failed',
         stableClientRequestId,
         requestSessionKey,
       )

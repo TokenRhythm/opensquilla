@@ -4,6 +4,7 @@ export interface HiddenControlOutboxItem {
   providerText: string
   displayText: string
   createdAtMs: number
+  dispatchAttempted: boolean
 }
 
 export type HiddenControlStorage = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>
@@ -14,6 +15,14 @@ export type HiddenControlPersistResult =
   | 'invalid'
   | 'unavailable'
   | 'failed'
+
+type HiddenControlOutboxInput = Omit<
+  HiddenControlOutboxItem,
+  'createdAtMs' | 'dispatchAttempted'
+> & {
+  createdAtMs?: number
+  dispatchAttempted?: boolean
+}
 
 const STORAGE_KEY = 'opensquilla.chat.hiddenControlOutbox:v1'
 const MAX_ITEMS = 20
@@ -39,6 +48,7 @@ function normalizeItem(value: unknown, nowMs = Date.now()): HiddenControlOutboxI
   const providerText = typeof candidate.providerText === 'string' ? candidate.providerText : ''
   const displayText = typeof candidate.displayText === 'string' ? candidate.displayText : ''
   const createdAtMs = candidate.createdAtMs
+  const dispatchAttempted = candidate.dispatchAttempted === true
   if (
     !sessionKey
     || sessionKey.length > 512
@@ -51,7 +61,14 @@ function normalizeItem(value: unknown, nowMs = Date.now()): HiddenControlOutboxI
     || createdAtMs > nowMs
     || nowMs - createdAtMs > MAX_AGE_MS
   ) return null
-  return { sessionKey, clientRequestId, providerText, displayText, createdAtMs }
+  return {
+    sessionKey,
+    clientRequestId,
+    providerText,
+    displayText,
+    createdAtMs,
+    dispatchAttempted,
+  }
 }
 
 function readResult(
@@ -89,7 +106,7 @@ function write(storage: HiddenControlStorage | null, items: HiddenControlOutboxI
 }
 
 export function persistHiddenControlResult(
-  item: Omit<HiddenControlOutboxItem, 'createdAtMs'> & { createdAtMs?: number },
+  item: HiddenControlOutboxInput,
   storage: HiddenControlStorage | null = defaultStorage(),
 ): HiddenControlPersistResult {
   const normalized = normalizeItem({ ...item, createdAtMs: item.createdAtMs ?? Date.now() })
@@ -116,11 +133,41 @@ export function persistHiddenControlResult(
 }
 
 export function persistHiddenControl(
-  item: Omit<HiddenControlOutboxItem, 'createdAtMs'> & { createdAtMs?: number },
+  item: HiddenControlOutboxInput,
   storage: HiddenControlStorage | null = defaultStorage(),
 ): boolean {
   const result = persistHiddenControlResult(item, storage)
   return result === 'persisted' || result === 'matched'
+}
+
+export function hiddenControlDispatchAttempted(
+  sessionKey: string,
+  clientRequestId: string,
+  storage: HiddenControlStorage | null = defaultStorage(),
+): boolean {
+  return read(storage).some(candidate => (
+    candidate.sessionKey === sessionKey
+    && candidate.clientRequestId === clientRequestId
+    && candidate.dispatchAttempted
+  ))
+}
+
+export function markHiddenControlDispatchAttempted(
+  sessionKey: string,
+  clientRequestId: string,
+  storage: HiddenControlStorage | null = defaultStorage(),
+): boolean {
+  const state = readResult(storage)
+  if (!state.ok) return false
+  const index = state.items.findIndex(candidate => (
+    candidate.sessionKey === sessionKey
+    && candidate.clientRequestId === clientRequestId
+  ))
+  if (index < 0) return false
+  const current = state.items[index]!
+  if (current.dispatchAttempted) return true
+  state.items[index] = { ...current, dispatchAttempted: true }
+  return write(storage, state.items)
 }
 
 export function removeHiddenControl(

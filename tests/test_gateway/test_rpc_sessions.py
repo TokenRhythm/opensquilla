@@ -3857,30 +3857,32 @@ class TestSessionsSend:
         ingest_attachments.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_send_keeps_custom_named_cron_delivery_session_interactive(
+    @pytest.mark.parametrize(
+        ("channel_name", "channel_type"),
+        [
+            pytest.param("company-chat", "feishu", id="builtin-type"),
+            pytest.param("corp-chat", "whatsapp", id="plugin-type"),
+        ],
+    )
+    async def test_send_keeps_configured_cron_delivery_session_interactive(
         self,
         dispatcher,
+        channel_name: str,
+        channel_type: str,
     ):
         delivery_session = FakeSession(
-            session_key="agent:main:company-chat:direct:user-1",
-            last_channel="company-chat",
+            session_key=f"agent:main:{channel_name}:direct:user-1",
+            last_channel=channel_name,
             origin={"kind": "cron"},
         )
         manager = FakeSessionManager([delivery_session])
         runner = _RecordingTurnRunner()
-        config = GatewayConfig(
-            memory={"flush_enabled": False},
-            channels={
-                "channels": [
-                    {
-                        "type": "feishu",
-                        "name": "company-chat",
-                        "app_id": "cli_dummy",
-                        "app_secret": "dummy",
-                    }
-                ]
-            },
-        )
+        config = GatewayConfig(memory={"flush_enabled": False})
+        # Plugin-provided channel types are registered outside the built-in
+        # config union, so model their normalized runtime entry directly.
+        config.channels.channels = [
+            SimpleNamespace(type=channel_type, name=channel_name)
+        ]
 
         res = await dispatcher.dispatch(
             "r1",

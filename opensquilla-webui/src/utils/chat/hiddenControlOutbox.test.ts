@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import {
+  hiddenControlDispatchAttempted,
   listHiddenControls,
+  markHiddenControlDispatchAttempted,
   persistHiddenControl,
   removeHiddenControl,
 } from './hiddenControlOutbox'
@@ -54,5 +56,32 @@ describe('hidden control durable outbox', () => {
 
     removeHiddenControl(original.sessionKey, original.clientRequestId, storage)
     expect(listHiddenControls(original.sessionKey, storage)).toEqual([])
+  })
+
+  it('persists whether an ingress dispatch was attempted', () => {
+    const storage = memoryStorage()
+    const item = {
+      sessionKey: 'agent:main:chat-1',
+      clientRequestId: 'stable-request-attempted',
+      providerText: '/meta meta-paper-write -- durable request',
+      displayText: 'Start document',
+    }
+    expect(persistHiddenControl(item, storage)).toBe(true)
+    expect(hiddenControlDispatchAttempted(
+      item.sessionKey,
+      item.clientRequestId,
+      storage,
+    )).toBe(false)
+
+    expect(markHiddenControlDispatchAttempted(
+      item.sessionKey,
+      item.clientRequestId,
+      storage,
+    )).toBe(true)
+    expect(hiddenControlDispatchAttempted(
+      item.sessionKey,
+      item.clientRequestId,
+      storage,
+    )).toBe(true)
   })
 })

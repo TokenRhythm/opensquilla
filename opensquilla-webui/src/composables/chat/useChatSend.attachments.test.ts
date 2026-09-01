@@ -2099,6 +2099,40 @@ describe('useChatSend attachment payloads', () => {
     expect(options.messages.value).toEqual([])
   })
 
+  it('replays an ambiguous queued follow-up through the replay-only gate', async () => {
+    const localPolicy = ref<string | null>(null)
+    const replayPolicy = ref<string | null>(null)
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+        .mockResolvedValueOnce({
+          accepted: true,
+          replayed: true,
+          sessionKey: 'agent:main:webchat:test',
+          task_id: 'task-queued-replay',
+        }),
+    }
+    const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-queued-replay',
+      text: 'recover this accepted follow-up',
+      attachments: [],
+      intent: null,
+      ownerSessionKey: 'agent:main:webchat:test',
+    }
+    const { api } = makeOptions({
+      rpc,
+      sendBlockedReason: localPolicy,
+      idempotentReplayBlockedReason: replayPolicy,
+    })
+
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('retryable_failure')
+    const originalParams = rpc.call.mock.calls[0]?.[1]
+    localPolicy.value = 'Cron sessions are read-only.'
+
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('accepted')
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(originalParams)
+  })
+
   it('queues an immutable hidden confirmation while live delivery is blocked', async () => {
     const enqueueHiddenControl = vi.fn(() => true)
     const { api, options, rpc } = makeOptions({
@@ -2121,6 +2155,68 @@ describe('useChatSend attachment payloads', () => {
     expect(rpc.call).not.toHaveBeenCalled()
     expect(options.inputText.value).toBe('hello')
     expect(options.messages.value).toEqual([])
+  })
+
+  it('replays an attempted hidden control through the replay-only gate after remount', async () => {
+    const first = makeOptions({
+      rpc: {
+        call: vi.fn().mockRejectedValueOnce(new RpcTransportError('Connection closed', null)),
+      },
+    })
+    await expect(first.api.dispatchHiddenSend(
+      'provider confirmation',
+      'Confirmed',
+      'hidden-replay-after-policy',
+    )).resolves.toMatchObject({ status: 'unknown' })
+    expect(listHiddenControls(
+      'agent:main:webchat:test',
+      first.options.hiddenControlStorage,
+    )[0]?.dispatchAttempted).toBe(true)
+
+    const localPolicy = ref<string | null>('Cron sessions are read-only.')
+    const replayPolicy = ref<string | null>(null)
+    const remounted = makeOptions({
+      hiddenControlStorage: first.options.hiddenControlStorage,
+      sendBlockedReason: localPolicy,
+      idempotentReplayBlockedReason: replayPolicy,
+    })
+    await remounted.api.restoreHiddenControls('agent:main:webchat:test')
+
+    expect(remounted.rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      clientRequestId: 'hidden-replay-after-policy',
+      message: 'provider confirmation',
+    }))
+  })
+
+  it('keeps an unattempted hidden control blocked by the local policy after remount', async () => {
+    const hiddenControlStorage = memoryStorage()
+    const localPolicy = ref<string | null>('Cron sessions are read-only.')
+    const enqueueHiddenControl = vi.fn(() => true)
+    const first = makeOptions({
+      hiddenControlStorage,
+      sendBlockedReason: localPolicy,
+      idempotentReplayBlockedReason: ref(null),
+      enqueueHiddenControl,
+    })
+    await expect(first.api.dispatchHiddenSend(
+      'fresh provider confirmation',
+      'Fresh confirmation',
+      'hidden-never-attempted',
+    )).resolves.toMatchObject({ status: 'queued' })
+    expect(listHiddenControls(
+      'agent:main:webchat:test',
+      hiddenControlStorage,
+    )[0]?.dispatchAttempted).toBe(false)
+
+    const remounted = makeOptions({
+      hiddenControlStorage,
+      sendBlockedReason: localPolicy,
+      idempotentReplayBlockedReason: ref(null),
+      enqueueHiddenControl,
+    })
+    await remounted.api.restoreHiddenControls('agent:main:webchat:test')
+
+    expect(remounted.rpc.call).not.toHaveBeenCalled()
   })
 
   it('retries a hidden queue item with one stable request identity and bubble', async () => {
