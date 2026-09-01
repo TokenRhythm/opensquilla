@@ -2338,7 +2338,7 @@ class GatewayConfig(BaseSettings):
     # precedence order (explicit kwarg/flag > OPENSQUILLA_LISTEN > OPENSQUILLA_GATEWAY_HOST
     # > default) is testable without the pydantic-settings env cache.
     host: str = "127.0.0.1"
-    port: int = 18791
+    port: int = Field(default=18791, ge=0, le=65535)
     # Resolved from installed distribution metadata (opensquilla.__version__),
     # not operator config. UI/RPC surfaces read __version__ directly, so any
     # stale value persisted in config.toml has no display effect.
