@@ -109,6 +109,9 @@ try {
       () => window.opensquillaDesktop?.getGatewayConnection?.(),
     ))?.status === 'ready',
     'Desktop Gateway readiness',
+    // This readiness window includes the profile inspection and settings
+    // reconciliation that run before the Gateway process can be spawned.
+    120_000,
   )
   const gatewayAccess = await page.evaluate(async () => {
     const connection = await window.opensquillaDesktop?.getGatewayConnection?.()
