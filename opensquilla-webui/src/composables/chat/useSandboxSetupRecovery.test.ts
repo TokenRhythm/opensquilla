@@ -261,7 +261,7 @@ describe('useSandboxSetupRecovery', () => {
     expect(rpc.call).toHaveBeenCalledTimes(2)
   })
 
-  it('offers owner setup only for Windows not_setup/failed states', async () => {
+  it('offers owner setup for Windows first-time setup', async () => {
     const rpc = {
       call: vi.fn(async (method: string) =>
         method === 'sandbox.setup.ensure' ? payload('ready') : payload('not_setup')),
@@ -278,6 +278,21 @@ describe('useSandboxSetupRecovery', () => {
     expect(rpc.call).toHaveBeenCalledWith('sandbox.setup.ensure')
     expect(recovery.status.value?.state).toBe('ready')
     expect(recovery.visible.value).toBe(false)
+    scope.stop()
+  })
+
+  it.each(['failed', 'unavailable', 'setting_up'])('does not offer setup when status is %s', async (state) => {
+    const rpc = { call: vi.fn(async () => payload(state)) }
+    const scope = effectScope()
+    const recovery = scope.run(() => useSandboxSetupRecovery({
+      sandbox: sandboxFromRpc(rpc),
+      connectionState: ref('connected'),
+      runMode: ref('safe'),
+    }))!
+    await vi.waitFor(() => expect(recovery.resolved.value).toBe(true))
+    expect(recovery.canSetup.value).toBe(false)
+    expect(await recovery.ensureSetup()).toBe(false)
+    expect(rpc.call).not.toHaveBeenCalledWith('sandbox.setup.ensure')
     scope.stop()
   })
 
@@ -307,23 +322,23 @@ describe('useSandboxSetupRecovery', () => {
     scope.stop()
   })
 
-  it('reports each terminal unavailable state once, including in Full Access', async () => {
-    const onUnavailable = vi.fn()
-    const rpc = { call: vi.fn(async () => payload('failed')) }
+  it('keeps terminal failure passive while Full Access is selected', async () => {
+    const rpc = { call: vi.fn(async (_method: string) => payload('failed')) }
     const scope = effectScope()
     const recovery = scope.run(() => useSandboxSetupRecovery({
       sandbox: sandboxFromRpc(rpc),
       connectionState: ref('connected'),
       runMode: ref('full'),
-      onUnavailable,
     }))!
 
-    await vi.waitFor(() => expect(onUnavailable).toHaveBeenCalledOnce())
+    await vi.waitFor(() => expect(recovery.resolved.value).toBe(true))
     expect(recovery.status.value?.state).toBe('failed')
     expect(recovery.visible.value).toBe(false)
 
     await recovery.refresh()
-    expect(onUnavailable).toHaveBeenCalledOnce()
+    expect(rpc.call.mock.calls.map(([method]) => method)).toEqual([
+      'sandbox.setup.status', 'sandbox.setup.status',
+    ])
     scope.stop()
   })
 })

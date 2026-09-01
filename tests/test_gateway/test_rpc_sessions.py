@@ -59,6 +59,7 @@ from opensquilla.gateway.websocket import SubscriptionManager, WsConnection, get
 from opensquilla.project_workspaces import ProjectWorkspaceStateError, project_path_key
 from opensquilla.provider.selector import ProviderConfig
 from opensquilla.provider.types import ProviderRequestCorrelation
+from opensquilla.run_mode import RunMode
 from opensquilla.sandbox.capability_service import CapabilityReport
 from opensquilla.sandbox.guest_profile import (
     GuestProfileBoundaryError,
@@ -2652,9 +2653,8 @@ class TestSessionsSend:
         ]
 
     @pytest.mark.asyncio
-    async def test_safe_send_soft_lands_to_full_when_host_sandbox_is_unavailable(
+    async def test_owner_existing_safe_session_uses_global_full_default(
         self,
-        dispatcher,
         monkeypatch: pytest.MonkeyPatch,
     ):
         unavailable = CapabilityReport(
@@ -2700,22 +2700,16 @@ class TestSessionsSend:
             session_manager=FakeSessionManager([session]),
             task_runtime=runtime,
         )
-        res = await dispatcher.dispatch(
-            "r-safe-fallback",
-            "sessions.send",
+        result = await rpc_sessions._handle_sessions_send(
             {"key": session.session_key, "message": "hello"},
             ctx,
         )
 
-        assert res.ok is True
-        envelope = runtime.enqueue_calls[0]["envelope"]
-        assert envelope.metadata["run_mode"] == "full"
-        assert envelope.metadata["sandbox_mode_resolution"] == {
-            "desiredMode": "safe",
-            "effectiveMode": "full",
-            "fallbackReason": "backend_unavailable",
-            "confirmationRequired": True,
-        }
+        assert result["task_id"] == "task-safe-fallback"
+        assert len(runtime.enqueue_calls) == 1
+        accepted = runtime.enqueue_calls[0]
+        assert accepted["envelope"].metadata["run_mode"] == "full"
+        assert accepted["accepted_run_mode_override"].run_mode is RunMode.FULL
         assert session.origin["sandbox_run_context"]["run_mode"] == "safe"
 
     @pytest.mark.asyncio
@@ -3384,15 +3378,15 @@ class TestSessionsSend:
         ("requested_run_mode", "expected_run_mode"),
         [
             ("full", "full"),
-            ("trusted", "full"),
-            ("standard", "full"),
+            ("trusted", None),
+            ("standard", None),
         ],
     )
-    async def test_send_host_capable_token_run_mode_is_resolved_without_persisting(
+    async def test_send_host_capable_token_never_soft_lands_safe_to_full(
         self,
         dispatcher,
         requested_run_mode: str,
-        expected_run_mode: str,
+        expected_run_mode: str | None,
         monkeypatch: pytest.MonkeyPatch,
     ):
         unavailable = CapabilityReport(
@@ -3461,6 +3455,14 @@ class TestSessionsSend:
             },
             ctx,
         )
+
+        if expected_run_mode is None:
+            assert res.ok is False
+            assert res.error is not None
+            assert res.error.code == "SANDBOX_MODE_UNAVAILABLE"
+            assert runtime.enqueue_calls == []
+            assert session.origin["sandbox_run_context"]["run_mode"] == "standard"
+            return
 
         assert res.ok is True
         envelope = runtime.enqueue_calls[0]["envelope"]

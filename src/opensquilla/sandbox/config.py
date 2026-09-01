@@ -93,7 +93,6 @@ class SandboxSettings(BaseSettings):
     backend: BackendName = "auto"
     allow_legacy_mode: bool = False
     run_mode: RunModeName = "full"
-    auto_setup: bool = True
     host_root_readonly: bool = True
     exclude_slash_tmp: bool = False
     exclude_tmpdir_env_var: bool = False

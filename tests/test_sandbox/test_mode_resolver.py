@@ -47,23 +47,19 @@ def test_safe_mode_stays_safe_when_capability_is_available() -> None:
     assert resolved.confirmation_required is False
 
 
-def test_authenticated_host_capability_soft_lands_when_safe_is_unavailable() -> None:
-    resolved = resolve_mode(
-        RunMode.SAFE,
-        _principal("host.execute"),
-        _report(available=False),
-    )
-
-    assert resolved.desired_mode is RunMode.SAFE
-    assert resolved.effective_mode is RunMode.FULL
-    assert resolved.fallback_reason == "backend_unavailable"
-    assert resolved.confirmation_required is True
+def test_authenticated_host_capability_rejects_safe_when_unavailable() -> None:
+    with pytest.raises(ModeResolutionError, match="sandbox_unavailable"):
+        resolve_mode(
+            RunMode.SAFE,
+            _principal("host.execute"),
+            _report(available=False),
+        )
 
 
 def test_guest_cannot_soft_land_when_safe_is_unavailable() -> None:
     with pytest.raises(
         ModeResolutionError,
-        match="sandbox_unavailable_for_guest",
+        match="sandbox_unavailable",
     ):
         resolve_mode(
             RunMode.SAFE,

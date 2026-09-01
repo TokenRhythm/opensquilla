@@ -1063,6 +1063,7 @@
     "tests/test_sandbox/test_shell_code_network_hints.py": 13.456,
     "tests/test_sandbox/test_shell_safe_policy_integration.py": 1.45,
     "tests/test_sandbox/test_stale_approval_authority.py": 25.613,
+    "tests/test_sandbox/test_startup_without_canaries.py": 0.01,
     "tests/test_sandbox/test_tool_runtime_descriptors.py": 0.038,
     "tests/test_sandbox/test_trusted_sandbox_execution.py": 4.015,
     "tests/test_sandbox/test_unavailable_backend.py": 0.398,

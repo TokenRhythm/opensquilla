@@ -559,7 +559,7 @@
       "builtin": "組み込み",
       "actions": { "add": "追加", "remove": "削除", "retry": "再試行", "copy": "コピー", "saving": "保存中…", "redetect": "再検出" },
       "mode": {
-        "title": "既定のアクセスモード", "description": "新しいタスクの開始モードを選びます。能力検証に失敗した場合、Safe は選択できません。",
+        "title": "既定のアクセスモード", "description": "全体のアクセスモードを設定します。初めて Safe を選ぶとサンドボックスの設定が開きます。初期化に失敗した場合や未対応の場合は選択できません。",
         "default": "既定モード", "safe": "Safe", "full": "完全アクセス", "resetWarning": "起動時の警告を再表示"
       },
       "setup": {
