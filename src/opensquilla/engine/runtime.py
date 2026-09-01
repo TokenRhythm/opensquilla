@@ -2322,6 +2322,12 @@ class _SelectorFallbackProvider:
             getattr(self._selector, "active_provider_id", "") or self.provider_name
         )
 
+    @property
+    def active_model_id(self) -> str:
+        """Model of the selector deployment currently serving this turn."""
+
+        return self._active_deployment()[1]
+
     def disable_provider_state_replay(self) -> None:
         """Rebuild the active fallback chain without provider-private replay."""
         disable = getattr(self._selector, "disable_provider_state_replay", None)
@@ -3226,6 +3232,7 @@ class _SelectorFallbackProvider:
                         ):
                             yield ProviderActivityEvent(
                                 activity_id=primary_activity_id,
+                                model=active_model,
                                 phase="reasoning",
                                 reason="initial",
                                 started_at=primary_reasoning_started_at_ms,
@@ -3460,6 +3467,7 @@ class _SelectorFallbackProvider:
                         )
                         yield ProviderActivityEvent(
                             activity_id=primary_activity_id,
+                            model=active_model,
                             phase="retry_wait",
                             reason=retry_reason,
                             retry_attempt=1,
@@ -3498,6 +3506,7 @@ class _SelectorFallbackProvider:
                     # and preventing a fast fallback token from racing the UI.
                     yield ProviderActivityEvent(
                         activity_id=uuid.uuid4().hex,
+                        model=fallback_model,
                         phase="fallback",
                         reason=(
                             "context_overflow"
@@ -3599,6 +3608,7 @@ class _SelectorFallbackProvider:
                                 ):
                                     yield ProviderActivityEvent(
                                         activity_id=fallback_activity_id,
+                                        model=fallback_model,
                                         phase="reasoning",
                                         reason="initial",
                                         started_at=fallback_reasoning_started_at_ms,

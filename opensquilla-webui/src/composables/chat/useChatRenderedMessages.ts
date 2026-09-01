@@ -739,6 +739,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       gridCells: cells,
       winnerIdx: routerWinnerCellIndex(cells, decision.tier),
       routerSelectedModel: String(decision.model || decision.routed_model || '').trim(),
+      routerExecutionModel: executionModelFromMessage(msg) || undefined,
       messageId: messageId || `${index}-router`,
     }
   }
@@ -848,6 +849,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       routerSource: 'llm_ensemble',
       routerObserve: false,
       routerStatic: msg.restoredFromHistory === true,
+      routerExecutionModel: executionModelFromMessage(msg) || undefined,
       // Live strips stay unsettled (animating) while members stream in; a member
       // list alone no longer forces 'settled'. History strips are frozen instead.
       routerSettled: msg.routerSettled === true || msg.restoredFromHistory === true,
@@ -1813,6 +1815,20 @@ function routerDecisionFromUsage(
     accepted_routing_mode: msg.turnOutcome?.acceptedRoutingMode,
     router_tier_snapshot: routerTierSnapshot,
   })
+}
+
+function executionModelFromMessage(msg: ChatMessage): string {
+  const usage = msg.routerUsage || msg.usage || msg.turn_usage
+  const rawLegs = usage?.execution_legs ?? usage?.executionLegs
+  if (Array.isArray(rawLegs)) {
+    for (let index = rawLegs.length - 1; index >= 0; index -= 1) {
+      const leg = rawLegs[index]
+      if (!leg || typeof leg !== 'object' || Array.isArray(leg)) continue
+      const model = String((leg as Record<string, unknown>).model || '').trim()
+      if (model) return model
+    }
+  }
+  return String(msg.routerExecutionModel || '').trim()
 }
 
 export function routerDecisionState(decision: NormalizedRouterDecision): string {

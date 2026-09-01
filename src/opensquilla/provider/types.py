@@ -339,6 +339,7 @@ class ProviderActivityEvent:
     retry_after_ms: int = 0
     started_at: int = 0
     heartbeat: bool = False
+    model: str = ""
 
 
 @dataclass

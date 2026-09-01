@@ -603,6 +603,8 @@ export interface ChatMessage {
   activitySnapshot?: ActivitySnapshotV2
   activitySnapshotIncomplete?: boolean
   routerDecision?: import('./rpc').RouterDecisionPayload | null
+  /** Live physical execution model; never overwrites the logical route decision. */
+  routerExecutionModel?: string
   /** Routing-only usage projection for a split historical answer segment. */
   routerUsage?: ChatUsagePayload
   routerModelCallId?: string
@@ -765,6 +767,8 @@ export interface ChatRenderedMessage {
   winnerIdx?: number
   /** Authoritative model from the historical routing decision, independent of UI cells. */
   routerSelectedModel?: string
+  /** Current or terminal physical execution model, independent of the route decision. */
+  routerExecutionModel?: string
   parts?: import('./parts').ChatPart[]
   sources?: import('./parts').SourcePart[]
   statusHistory?: import('./parts').StatusPart[]
