@@ -1402,7 +1402,8 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     } catch (error: unknown) {
       // History endpoint may not exist yet.
       if (isCurrentRequest()) {
-        if (nonReconnecting) {
+        const cursorRequiresLatestReload = historyCursorRequiresLatestReload(error)
+        if (nonReconnecting && !cursorRequiresLatestReload) {
           restoreSilentBackgroundState()
           return {
             ok: false,
@@ -1411,7 +1412,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           }
         }
         const initialLoadFailed = isInitialLoad && !bridgeAttempted
-        failedHistoryRequest = historyCursorRequiresLatestReload(error)
+        failedHistoryRequest = cursorRequiresLatestReload
           ? { kind: 'latest', key }
           : bridgeAttempted
             ? { kind: 'bridge', key }

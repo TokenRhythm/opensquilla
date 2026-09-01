@@ -1260,7 +1260,13 @@ async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
             "HISTORY_CURSOR_INVALIDATED",
             "The history cursor no longer belongs to this session. Reload from the latest page.",
         ) from exc
-    except KeyError:
+    except KeyError as exc:
+        if parsed_before is not None or parsed_after is not None:
+            raise RpcHandlerError(
+                "HISTORY_CURSOR_INVALIDATED",
+                "The history cursor no longer belongs to this session. "
+                "Reload from the latest page.",
+            ) from exc
         if _is_webchat_session_key(session_key):
             return _empty_chat_history_payload(limit)
         raise

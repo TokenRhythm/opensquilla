@@ -3481,6 +3481,68 @@ describe('useChatHistory accepted ensemble reconciliation', () => {
 })
 
 describe('useChatHistory safe local-tail synchronization', () => {
+  it('surfaces an invalidated background bridge and retries latest without cursors', async () => {
+    vi.useFakeTimers()
+    try {
+      const { api, rpc, messages } = makeHistory(false)
+      rpc.call
+        .mockResolvedValueOnce({
+          messages: [historyMessage('m4')],
+          has_more: true,
+          oldest_cursor: 'cursor-4',
+          newest_cursor: 'cursor-4',
+          canonical_available: true,
+        })
+        .mockResolvedValueOnce({
+          messages: [historyMessage('m3')],
+          has_more: true,
+          oldest_cursor: 'cursor-3',
+          newest_cursor: 'cursor-3',
+          canonical_available: true,
+        })
+        .mockResolvedValueOnce({
+          messages: [historyMessage('m9')],
+          has_more: true,
+          oldest_cursor: 'cursor-9',
+          newest_cursor: 'cursor-9',
+          canonical_available: true,
+        })
+        .mockRejectedValueOnce(Object.assign(new Error('cursor rejected'), {
+          code: 'HISTORY_CURSOR_INVALIDATED',
+        }))
+        .mockResolvedValueOnce({
+          messages: [historyMessage('m10')],
+          has_more: false,
+          oldest_cursor: 'cursor-10',
+          newest_cursor: 'cursor-10',
+          canonical_available: true,
+        })
+
+      await api.loadHistory()
+      await api.loadEarlierHistory()
+      api.scheduleHistorySync(true)
+      await vi.advanceTimersByTimeAsync(50)
+      await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledTimes(4))
+
+      expect(rpc.call).toHaveBeenNthCalledWith(4, 'chat.history', expect.objectContaining({
+        after: 'cursor-4',
+      }), expect.objectContaining({ timeoutAction: 'reject' }))
+      expect(messages.value.map(message => message.messageId)).toEqual(['m3', 'm4'])
+      expect(api.historyState.value.recoveryError).toBe(true)
+
+      await api.retryHistory()
+
+      const retryParams = rpc.call.mock.calls[4]?.[1]
+      expect(retryParams).not.toHaveProperty('before')
+      expect(retryParams).not.toHaveProperty('after')
+      expect(messages.value.map(message => message.messageId)).toEqual(['m10'])
+      expect(api.historyState.value.recoveryError).toBe(false)
+      api.cleanup()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('protects a successor from an older response until a post-generation load succeeds', async () => {
     vi.useFakeTimers()
     try {

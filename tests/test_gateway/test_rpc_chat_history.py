@@ -2174,6 +2174,42 @@ async def test_chat_history_returns_empty_for_missing_webchat_session(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cursor_field", ["before", "after"])
+async def test_chat_history_rejects_cursor_for_missing_webchat_session(
+    cursor_field: str,
+) -> None:
+    session_key = "agent:main:webchat:deleted"
+    mgr = _FakeSessionManager(
+        [],
+        canonical_exception=KeyError(f"Session not found: {session_key}"),
+        transcript_exception=KeyError(f"Session not found: {session_key}"),
+    )
+
+    response = await get_dispatcher().dispatch(
+        f"history-wire-missing-session-{cursor_field}",
+        "chat.history",
+        {
+            "sessionKey": session_key,
+            cursor_field: "1|1",
+            "includeSummaries": False,
+        },
+        RpcContext(
+            conn_id="test",
+            principal=SimpleNamespace(
+                role="operator",
+                scopes=frozenset({"operator.read"}),
+            ),
+            session_manager=mgr,
+        ),
+    )
+
+    assert response.ok is False
+    assert response.error is not None
+    assert response.error.code == "HISTORY_CURSOR_INVALIDATED"
+    assert response.error.retryable is False
+
+
+@pytest.mark.asyncio
 async def test_chat_history_keeps_not_found_for_missing_non_webchat_session() -> None:
     session_key = "agent:main:cli:new123"
     mgr = _FakeSessionManager(
