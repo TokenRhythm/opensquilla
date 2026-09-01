@@ -138,7 +138,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
+import { computed, inject, nextTick, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ErrorState from '@/components/ErrorState.vue'
@@ -146,6 +146,7 @@ import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import HistoryLoadSentinel from '@/components/HistoryLoadSentinel.vue'
 import RunTrace from '@/components/run/RunTrace.vue'
 import { useSessionInspect } from '@/composables/sessions/useSessionInspect'
+import { SESSION_CONVERSATION_KEY } from '@/modules/sessionConversation'
 import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
 import { useRunTrace } from '@/composables/run/useRunTrace'
 import { useToasts } from '@/composables/useToasts'
@@ -183,6 +184,9 @@ const emit = defineEmits<{
   aborted: [item: SessionItem]
 }>()
 
+const sessionConversation = inject(SESSION_CONVERSATION_KEY)
+if (!sessionConversation) throw new Error('SessionConversation was not provided')
+
 const {
   preview,
   messages,
@@ -199,7 +203,7 @@ const {
   retryHistory,
   abortSession,
   reset,
-} = useSessionInspect()
+} = useSessionInspect(sessionConversation)
 
 const { t } = useI18n()
 const { renderMarkdown, stripDirectiveTags, stripTimePrefix } = useChatTextRendering()

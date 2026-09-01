@@ -1,6 +1,8 @@
 import { ref } from 'vue'
+import type { ChatHistoryMessage } from '@/types/rpc'
+import type { SessionConversation } from '@/modules/sessionConversation'
 import { useRpcStore } from '@/stores/rpc'
-import type { ChatHistoryMessage, ChatHistoryResponse } from '@/types/rpc'
+import { createLegacySessionConversation } from '@/adapters/gateway/sessionConversationV4'
 
 // There is deliberately no sessions.get RPC; the inspect drawer composes
 // sessions.preview (summary snippet) with chat.history (transcript pages).
@@ -12,30 +14,15 @@ export interface SessionInspectPreview {
   updatedAt: number | null
 }
 
-interface RawPreviewRow {
-  key?: string
-  title?: string
-  lastMessage?: string
-  updatedAt?: number
-}
-
-interface SessionsPreviewResponse {
-  previews?: RawPreviewRow[]
-}
-
-interface SessionsAbortResponse {
-  aborted?: boolean
-  key?: string
-}
-
 export const SESSION_INSPECT_PAGE_SIZE = 20
 
 function transcriptMessageKey(msg: ChatHistoryMessage): string {
   return String(msg.message_id || msg.id || `${msg.role || ''}:${msg.timestamp ?? msg.ts ?? ''}:${msg.text || ''}`)
 }
 
-export function useSessionInspect() {
-  const rpc = useRpcStore()
+export function useSessionInspect(conversation?: SessionConversation) {
+  const sessionConversation: SessionConversation = conversation
+    ?? createLegacySessionConversation(useRpcStore() as Parameters<typeof createLegacySessionConversation>[0])
   const preview = ref<SessionInspectPreview | null>(null)
   const messages = ref<ChatHistoryMessage[]>([])
   const hasEarlier = ref(false)
@@ -57,7 +44,7 @@ export function useSessionInspect() {
 
   async function fetchPreview(key: string, seq: number) {
     try {
-      const data = await rpc.call<SessionsPreviewResponse>('sessions.preview', { keys: [key] })
+      const data = await sessionConversation.preview([key])
       if (seq !== requestSeq) return
       const rows = data?.previews || []
       const row = rows.find(item => item.key === key) || rows[0] || null
@@ -90,7 +77,13 @@ export function useSessionInspect() {
       includeSummaries: false,
     }
     if (before != null) params.before = before
-    const data = await rpc.call<ChatHistoryResponse>('chat.history', params)
+    const data = await sessionConversation.history({
+      sessionKey: key,
+      limit: SESSION_INSPECT_PAGE_SIZE,
+      includeCanonical: true,
+      includeSummaries: false,
+      ...(before != null ? { before } : {}),
+    })
     if (seq !== requestSeq) return
     const available = data?.canonical_available ?? data?.canonicalAvailable
     if (typeof available === 'boolean') canonicalAvailable.value = available
@@ -136,7 +129,7 @@ export function useSessionInspect() {
     failedTranscriptRequest = null
     loadedEarlierCursors.clear()
     try {
-      await rpc.waitForConnection()
+      await sessionConversation.ready()
       if (seq !== requestSeq) return
       const [, transcript] = await Promise.allSettled([
         fetchPreview(key, seq),
@@ -187,7 +180,7 @@ export function useSessionInspect() {
   }
 
   async function abortSession(key: string): Promise<boolean> {
-    const data = await rpc.call<SessionsAbortResponse>('sessions.abort', { key })
+    const data = await sessionConversation.abort(key)
     return data?.aborted === true
   }
 

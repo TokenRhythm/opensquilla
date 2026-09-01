@@ -22,6 +22,8 @@ import { conversationCursorSignal } from '@/utils/chat/streamEvents'
 import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
 import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
 import { chatTaskId } from '@/composables/chat/useChatTaskOwnership'
+import type { SessionConversation } from '@/modules/sessionConversation'
+import { createLegacySessionConversation } from '@/adapters/gateway/sessionConversationV4'
 import {
   SESSION_PHASE_ATTEMPT_BUDGET_MS,
   SESSION_SNAPSHOT_BUDGET_MS,
@@ -38,12 +40,12 @@ import {
 type RpcClient = {
   readonly connectionGeneration?: number
   readonly policy?: Record<string, unknown> | null
-  waitForConnection: (
+  waitForConnection?: (
     timeoutMs?: number,
     signal?: AbortSignal,
     actions?: RpcConnectionWaitOptions,
   ) => Promise<void>
-  call: <T = unknown>(
+  call?: <T = unknown>(
     method: string,
     params?: Record<string, unknown>,
     options?: RpcCallOptions,
@@ -56,6 +58,7 @@ type RpcClient = {
 
 export interface UseChatSessionSubscriptionOptions {
   rpc: RpcClient
+  sessionConversation?: SessionConversation
   /** Shared domain policy; omitted callers receive an equivalent local seam. */
   conversationRuntime?: ConversationRuntime
   /** Shared Conversation owner; preferred over the legacy cursor-only option. */
@@ -133,6 +136,8 @@ const UNAVAILABLE_SUBSCRIPTION: SessionSubscriptionOutcome = {
 }
 
 export function useChatSessionSubscription(options: UseChatSessionSubscriptionOptions) {
+  const conversation: SessionConversation = options.sessionConversation
+    ?? createLegacySessionConversation(options.rpc as Parameters<typeof createLegacySessionConversation>[0])
   const isHydrating = ref(false)
   const streamGeneration = ref<string | null>(null)
   const conversationRuntime = options.conversationSessionRuntime?.cursor
@@ -388,9 +393,8 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
           deadlineAt: hydrationDeadlineAt,
           attemptDeadlineAt: hydrationDeadlineAt,
         }
-        const hydration = await options.rpc.call<SessionMessagesSubscribeResponse>(
-          'sessions.messages.hydrate',
-          { key },
+        const hydration = await conversation.hydrate(
+          key,
           hydrationCallOptions(hydrationContext),
         )
         if (
@@ -441,13 +445,13 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     if (sinceStreamSeq === 0) isHydrating.value = true
     try {
       if (bootstrap) {
-        await options.rpc.waitForConnection(
-          phaseTimeoutMs(bootstrap, 'sessions.messages.subscribe'),
-          bootstrap.signal,
-          phaseConnectionWaitOptions(),
-        )
+        await conversation.ready({
+          timeoutMs: phaseTimeoutMs(bootstrap, 'sessions.messages.subscribe'),
+          signal: bootstrap.signal,
+          ...phaseConnectionWaitOptions(),
+        })
       } else {
-        await options.rpc.waitForConnection()
+        await conversation.ready()
       }
       if (!subscriptionLifecycle.isCurrent(attemptContext, key)) {
         return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
@@ -500,20 +504,15 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
               lease.socketGeneration = socketGeneration
             },
           }
-      const subscribePromise = options.rpc.call<SessionMessagesSubscribeResponse>(
-        'sessions.messages.subscribe',
-        params,
-        subscribeCallOptions,
-      )
+      const subscribePromise = conversation.subscribe(params, subscribeCallOptions)
       // Pipeline the in-memory snapshot directly behind subscribe. Only after
       // both frames are on the wire may history enter the serialized queue:
       // subscribe → snapshot → history. Slow storage metadata is deferred.
       const snapshotPromise = snapshotRequired
         ? (
             bootstrap
-              ? options.rpc.call<SessionMessagesSnapshotResponse>(
-                  'sessions.messages.snapshot',
-                  { key },
+              ? conversation.snapshot(
+                  key,
                   {
                     ...phaseCallOptions(
                       bootstrap,
@@ -526,10 +525,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
                     },
                   },
                 )
-              : options.rpc.call<SessionMessagesSnapshotResponse>(
-                  'sessions.messages.snapshot',
-                  { key },
-                )
+              : conversation.snapshot(key)
           )
         : null
 
@@ -630,10 +626,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
           bootstrap,
         )
       } else {
-        const hydration = await options.rpc.call<SessionMessagesSubscribeResponse>(
-          'sessions.messages.hydrate',
-          { key },
-        )
+        const hydration = await conversation.hydrate(key)
         const complete = (
           hydration.hydration_complete
           ?? hydration.hydrationComplete
@@ -715,29 +708,21 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     )
 
     try {
-      await options.rpc.waitForConnection(
-        Math.max(1, deadlineAt - Date.now()),
-        controller.signal,
-        {
-          // Metadata admission is only a waiter until the request is sent.
-          // Handshake health belongs to RpcClient's generation watchdogs.
-          timeoutAction: 'reject',
-          abortAction: 'reject',
-        },
-      )
+      await conversation.ready({
+        timeoutMs: Math.max(1, deadlineAt - Date.now()),
+        signal: controller.signal,
+        timeoutAction: 'reject',
+        abortAction: 'reject',
+      })
       if (!isCurrent()) return false
-      const hydration = await options.rpc.call<SessionMessagesSubscribeResponse>(
-        'sessions.messages.hydrate',
-        { key },
-        {
-          ...callOptions,
-          timeoutMs: Math.max(1, deadlineAt - Date.now()),
-          signal: controller.signal,
-          timeoutAction: callOptions.timeoutAction
-            ?? (detachedHydrationAdvertised() ? 'reject' : 'reconnect'),
-          abortAction: callOptions.abortAction ?? 'reject',
-        },
-      )
+      const hydration = await conversation.hydrate(key, {
+        ...callOptions,
+        timeoutMs: Math.max(1, deadlineAt - Date.now()),
+        signal: controller.signal,
+        timeoutAction: callOptions.timeoutAction
+          ?? (detachedHydrationAdvertised() ? 'reject' : 'reconnect'),
+        abortAction: callOptions.abortAction ?? 'reject',
+      })
       if (!isCurrent()) return false
       const complete = (
         hydration.hydration_complete
@@ -800,16 +785,12 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     }
     const release = (async () => {
       try {
-        await options.rpc.call(
-          'sessions.messages.unsubscribe',
-          { key },
-          {
-            timeoutMs: SESSION_PHASE_ATTEMPT_BUDGET_MS,
-            timeoutAction: 'reject',
-            abortAction: 'reject',
-            expectedGeneration,
-          },
-        )
+        await conversation.unsubscribe(key, {
+          timeoutMs: SESSION_PHASE_ATTEMPT_BUDGET_MS,
+          timeoutAction: 'reject',
+          abortAction: 'reject',
+          expectedGeneration,
+        })
       } catch (cause) {
         // A request-local timeout or abort is ambiguous: the serialized frame
         // may still complete after the UI waiter stops observing it. Only an
