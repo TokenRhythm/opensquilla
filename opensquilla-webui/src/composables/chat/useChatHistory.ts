@@ -782,7 +782,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       historySyncTimer = null
       const timerNonReconnecting = historySyncTimerNonReconnecting
       historySyncTimerNonReconnecting = false
-      if (historyState.value.loading) {
+      if (historyState.value.loading || failedHistoryRequest) {
         historySyncPending = true
         historySyncPendingNonReconnecting ||= timerNonReconnecting
         return
@@ -792,6 +792,12 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   }
 
   function scheduleHistorySync(preserveLocalTail = false) {
+    if (failedHistoryRequest) {
+      if (preserveLocalTail) preserveLocalTailGeneration += 1
+      historySyncPending = true
+      historySyncPendingNonReconnecting ||= preserveLocalTail
+      return
+    }
     armHistorySync(preserveLocalTail, true)
   }
 
@@ -1105,6 +1111,9 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       )
       const previousMessages = crossedSession ? [] : options.messages.value
       const previousMaintenance = previousMessages.filter(isHistoryMaintenance)
+      const retainedPreviousMaintenance = params.replaceCanonicalWindow
+        ? previousMaintenance.filter(message => message.restoredFromHistory !== true)
+        : previousMaintenance
       const previousTranscript = previousMessages.filter(message => !isHistoryMaintenance(message))
       const maintenanceMessages = compactionSummaryMessages(data)
       let historyData = data
@@ -1282,7 +1291,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
               : []
         options.messages.value = mergeHistoryMaintenance(
           transcript,
-          [...previousMaintenance, ...maintenanceMessages],
+          [...retainedPreviousMaintenance, ...maintenanceMessages],
         )
         if (options.messages.value.length === 0) {
           options.lastHeaderRole.value = ''
@@ -1311,7 +1320,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         )
         options.messages.value = mergeHistoryMaintenance(
           transcript,
-          [...previousMaintenance, ...maintenanceMessages],
+          [...retainedPreviousMaintenance, ...maintenanceMessages],
         )
       } else {
         const refreshedWindow = params.replaceCanonicalWindow
@@ -1339,7 +1348,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         )
         options.messages.value = mergeHistoryMaintenance(
           transcript,
-          [...previousMaintenance, ...maintenanceMessages],
+          [...retainedPreviousMaintenance, ...maintenanceMessages],
         )
       }
 

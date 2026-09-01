@@ -2004,6 +2004,59 @@ describe('useChatHistory canonical pagination', () => {
     })
   })
 
+  it('keeps typed latest recovery pending when a direct sync is scheduled', async () => {
+    vi.useFakeTimers()
+    try {
+      const { api, rpc, messages } = makeHistory(false)
+      rpc.call
+        .mockResolvedValueOnce({
+          messages: [
+            historyMessage('m1'),
+            historyMessage('m2'),
+            historyMessage('m3'),
+            historyMessage('m4'),
+          ],
+          has_more: true,
+          oldest_cursor: 'cursor-1',
+          newest_cursor: 'cursor-4',
+          canonical_available: true,
+        })
+        .mockRejectedValueOnce(Object.assign(new Error('cursor rejected'), {
+          code: 'HISTORY_CURSOR_INVALIDATED',
+        }))
+        .mockResolvedValueOnce({
+          messages: [historyMessage('m2'), historyMessage('m3'), historyMessage('m4')],
+          has_more: false,
+          oldest_cursor: 'cursor-2',
+          newest_cursor: 'cursor-4',
+          canonical_available: true,
+        })
+
+      await api.loadHistory()
+      await api.loadEarlierHistory()
+      expect(api.historyState.value.loadEarlierError).toBe(true)
+
+      api.scheduleHistorySync(true)
+      await vi.advanceTimersByTimeAsync(100)
+
+      expect(rpc.call).toHaveBeenCalledTimes(2)
+      expect(messages.value.map(message => message.messageId)).toEqual(['m1', 'm2', 'm3', 'm4'])
+      expect(api.historyState.value.loadEarlierError).toBe(true)
+
+      await api.retryHistory()
+
+      const retryParams = rpc.call.mock.calls[2]?.[1]
+      expect(retryParams).not.toHaveProperty('before')
+      expect(retryParams).not.toHaveProperty('after')
+      expect(rpc.call).toHaveBeenCalledTimes(3)
+      expect(messages.value.map(message => message.messageId)).toEqual(['m2', 'm3', 'm4'])
+      expect(api.historyState.value.loadEarlierError).toBe(false)
+      api.cleanup()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('replaces an overlapping canonical prefix while preserving the local tail', async () => {
     const { api, rpc, messages } = makeHistory(false)
     rpc.call
@@ -2106,6 +2159,69 @@ describe('useChatHistory canonical pagination', () => {
     await api.retryHistory()
 
     expect(messages.value.map(message => message.messageId)).toEqual(['local-user'])
+    expect(api.historyState.value).toMatchObject({
+      hasMore: false,
+      oldestCursor: null,
+      newestCursor: null,
+      recoveryError: false,
+    })
+  })
+
+  it('replaces restored compaction maintenance while preserving local maintenance', async () => {
+    const { api, rpc, messages } = makeHistory(false)
+    rpc.call
+      .mockResolvedValueOnce({
+        messages: [historyMessage('m1')],
+        compaction_summaries: [{
+          id: 31,
+          compaction_id: 'cmp-before-reset',
+          trigger_reason: 'manual',
+          created_at: 1_720_000_001,
+        }],
+        has_more: true,
+        oldest_cursor: 'cursor-1',
+        newest_cursor: 'cursor-1',
+        canonical_available: true,
+      })
+      .mockRejectedValueOnce(Object.assign(new Error('cursor rejected'), {
+        code: 'HISTORY_CURSOR_INVALIDATED',
+      }))
+      .mockResolvedValueOnce({
+        messages: [],
+        compaction_summaries: [],
+        has_more: false,
+        oldest_cursor: null,
+        newest_cursor: null,
+        canonical_available: true,
+      })
+
+    await api.loadHistory()
+    expect(messages.value.some(message =>
+      message.maintenance?.compactionId === 'cmp-before-reset',
+    )).toBe(true)
+    messages.value.push({
+      role: 'maintenance',
+      text: '',
+      ts: 1_720_000_002_000,
+      messageId: 'maintenance:local:cmp-current',
+      maintenance: {
+        kind: 'context_compaction',
+        compactionId: 'cmp-current',
+        source: 'manual',
+        state: 'completed',
+        durability: 'durable',
+      },
+    })
+
+    await api.loadEarlierHistory()
+    await api.retryHistory()
+
+    expect(messages.value.map(message => message.messageId)).toEqual([
+      'maintenance:local:cmp-current',
+    ])
+    expect(messages.value.map(message => message.maintenance?.compactionId)).toEqual([
+      'cmp-current',
+    ])
     expect(api.historyState.value).toMatchObject({
       hasMore: false,
       oldestCursor: null,

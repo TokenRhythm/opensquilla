@@ -4180,6 +4180,95 @@ async def test_canonical_transcript_page_reads_one_snapshot_during_compaction(
 
 
 @pytest.mark.asyncio
+async def test_canonical_transcript_cursor_and_page_share_snapshot_during_delete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    db_path = tmp_path / "canonical-cursor-delete-snapshot.db"
+    writer_storage = SessionStorage(str(db_path))
+    await writer_storage.connect()
+    writer = SessionManager(writer_storage, inject_time_prefix=False)
+    node = await writer.create("agent:main:webchat:cursor-delete-snapshot")
+    for index in range(3):
+        await writer_storage.append_transcript_entry(
+            TranscriptEntry(
+                session_id=node.session_id,
+                session_key=node.session_key,
+                message_id=f"cursor-snapshot-{index}",
+                role="user",
+                content=f"message {index}",
+                created_at=1_000 + index,
+            )
+        )
+    anchor = (await writer.get_transcript(node.session_key))[0]
+    assert anchor.id is not None
+
+    reader_storage = SessionStorage(str(db_path))
+    await reader_storage.connect()
+    original_execute = reader_storage.conn.execute
+    deletion_injected = False
+
+    async def delete_transcript_once() -> None:
+        nonlocal deletion_injected
+        if deletion_injected:
+            return
+        await writer_storage.delete_transcript(node.session_id)
+        deletion_injected = True
+
+    class _DeleteAtSnapshotBoundary:
+        def __init__(self, delegate: Any, fetch_kind: str) -> None:
+            self._delegate = delegate
+            self._fetch_kind = fetch_kind
+            self._cursor: Any = None
+
+        async def __aenter__(self):
+            self._cursor = await self._delegate.__aenter__()
+            return self
+
+        async def fetchone(self):
+            row = await self._cursor.fetchone()
+            if self._fetch_kind == "anchor":
+                await delete_transcript_once()
+            return row
+
+        async def fetchall(self):
+            rows = await self._cursor.fetchall()
+            if self._fetch_kind == "page":
+                await delete_transcript_once()
+            return rows
+
+        async def __aexit__(self, *args: Any):
+            return await self._delegate.__aexit__(*args)
+
+    def execute(sql: str, params: Any = ()):
+        result = original_execute(sql, params)
+        normalized = " ".join(sql.split())
+        if normalized.startswith("SELECT 1 FROM transcript_entries"):
+            return _DeleteAtSnapshotBoundary(result, "anchor")
+        if normalized.startswith("WITH cursor_anchor AS"):
+            return _DeleteAtSnapshotBoundary(result, "page")
+        return result
+
+    monkeypatch.setattr(reader_storage.conn, "execute", execute)
+    try:
+        entries, has_more = await reader_storage.get_canonical_transcript_page(
+            node.session_id,
+            limit=10,
+            after=(anchor.created_at, anchor.id),
+        )
+    finally:
+        await reader_storage.close()
+        await writer_storage.close()
+
+    assert deletion_injected is True
+    assert has_more is False
+    assert [entry.message_id for entry in entries] == [
+        "cursor-snapshot-1",
+        "cursor-snapshot-2",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_canonical_page_completeness_uses_post_page_compaction_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
