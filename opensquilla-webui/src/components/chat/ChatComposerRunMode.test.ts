@@ -61,10 +61,19 @@ describe('ChatComposerRunMode', () => {
   })
 
   it('quietly disables Safe when the capability is unavailable', () => {
-    const el = mount(['full'])
+    const selected: Array<'safe' | 'full'> = []
+    const el = mount(['full'], false, mode => selected.push(mode))
     const radios = [...el.querySelectorAll<HTMLButtonElement>('[role="radio"]')]
     expect(radios[0].disabled).toBe(true)
     expect(el.querySelector('.composer-run-mode__hint')).toBeNull()
+    radios[0].click()
+    expect(selected).toEqual([])
+  })
+
+  it('does not enable unavailable modes when the allowed list is empty', () => {
+    const el = mount([])
+    const radios = [...el.querySelectorAll<HTMLButtonElement>('[role="radio"]')]
+    expect(radios.every(radio => radio.disabled)).toBe(true)
   })
 
   it('lets a repairable Safe choice request first-time setup', () => {

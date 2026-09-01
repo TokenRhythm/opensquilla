@@ -1515,7 +1515,13 @@ async def test_channel_admin_sender_gets_owner_tool_context_for_agent_turn(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_saved_channel_run_context_is_applied_to_route_envelope(tmp_path) -> None:
+@pytest.mark.parametrize(
+    ("global_mode", "saved_mode"),
+    [(RunMode.SAFE, RunMode.FULL), (RunMode.FULL, RunMode.SAFE)],
+)
+async def test_global_channel_mode_overrides_saved_mode_and_preserves_scope(
+    tmp_path, global_mode: RunMode, saved_mode: RunMode
+) -> None:
     from opensquilla.gateway.channel_dispatch import _apply_saved_channel_run_context
 
     msg = _authenticated_message()
@@ -1528,7 +1534,7 @@ async def test_saved_channel_run_context_is_applied_to_route_envelope(tmp_path) 
     manager = _RunContextSessionManager(
         {
             "sandbox_run_context": {
-                "run_mode": "full",
+                "run_mode": saved_mode.value,
                 "workspace": str(tmp_path),
                 "mounts": [],
                 "domains": [],
@@ -1539,21 +1545,26 @@ async def test_saved_channel_run_context_is_applied_to_route_envelope(tmp_path) 
         }
     )
     config = SimpleNamespace(
-        sandbox=SimpleNamespace(run_mode="standard", sandbox=True, security_grading=True),
-        permissions=SimpleNamespace(default_mode="off"),
+        sandbox=SimpleNamespace(
+            run_mode=global_mode.value,
+            sandbox=global_mode is RunMode.SAFE,
+            security_grading=global_mode is RunMode.SAFE,
+        ),
+        permissions=SimpleNamespace(default_mode="full" if global_mode is RunMode.FULL else "off"),
     )
 
     await _apply_saved_channel_run_context(
         envelope,
         session_manager=manager,
         config=config,
-        workspace_dir=str(tmp_path),
+        workspace_dir=str(tmp_path / "fallback"),
         principal_is_owner=True,
     )
 
-    assert envelope.metadata["run_mode"] == RunMode.FULL.value
-    assert envelope.metadata["elevated"] == "full"
-    assert envelope.metadata["sandbox_run_context"]["run_mode"] == "full"
+    assert envelope.metadata["run_mode"] == global_mode.value
+    assert envelope.metadata.get("elevated") == ("full" if global_mode is RunMode.FULL else None)
+    assert envelope.metadata["sandbox_run_context"]["run_mode"] == global_mode.value
+    assert envelope.metadata["sandbox_run_context"]["workspace"] == str(tmp_path)
 
 
 @pytest.mark.asyncio

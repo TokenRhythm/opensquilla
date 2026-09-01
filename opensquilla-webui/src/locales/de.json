@@ -559,7 +559,7 @@
       "builtin": "Integriert",
       "actions": { "add": "Hinzufügen", "remove": "Entfernen", "retry": "Erneut versuchen", "copy": "Kopieren", "saving": "Speichern…", "redetect": "Erneut prüfen" },
       "mode": {
-        "title": "Standardzugriffsmodus", "description": "Startmodus für neue Aufgaben. Safe bleibt bei fehlgeschlagener Prüfung nicht auswählbar.",
+        "title": "Standardzugriffsmodus", "description": "Globalen Zugriffsmodus festlegen. Bei der ersten Auswahl von Safe öffnet sich die Sandbox-Einrichtung. Schlägt die Initialisierung fehl oder wird die Sandbox nicht unterstützt, ist Safe nicht auswählbar.",
         "default": "Standardmodus", "safe": "Safe", "full": "Vollzugriff", "resetWarning": "Warnung beim Start wieder anzeigen"
       },
       "setup": {

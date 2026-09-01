@@ -223,7 +223,6 @@ async def test_v020_database_reaches_service_ready_with_live_sink(
         channels={"channels": []},
         mcp={"enabled": False},
         memory={"flush_enabled": False},
-        sandbox={"auto_setup": False},
     )
 
     services = await build_services(

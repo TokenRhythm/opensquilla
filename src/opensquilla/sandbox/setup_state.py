@@ -139,7 +139,7 @@ def _macos_seatbelt_available() -> bool:
 
 async def _windows_setup_status(config: Any) -> SetupResult:
     _ = config
-    return _windows_default_setup_result()
+    return await asyncio.to_thread(_windows_default_setup_result)
 
 
 async def _ensure_windows_setup(config: Any) -> SetupResult:
