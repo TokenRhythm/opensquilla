@@ -86,6 +86,19 @@ def test_a_real_key_still_prints_its_export(key: str, env_var: str) -> None:
     assert f"export {env_var}=18823" in result.stdout
 
 
+def test_invalid_port_is_not_persisted(tmp_path: Path) -> None:
+    target = _empty_config(tmp_path)
+
+    result = runner.invoke(
+        app,
+        ["config", "set", "port", "65536", "--config", str(target)],
+    )
+
+    assert result.exit_code == 2
+    assert "Invalid value for port" in result.stdout
+    assert tomllib.loads(target.read_text(encoding="utf-8")) == {}
+
+
 @pytest.mark.parametrize(
     ("key", "env_var", "value", "expected"),
     [
