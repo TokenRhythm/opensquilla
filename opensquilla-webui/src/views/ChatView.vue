@@ -2924,6 +2924,7 @@ const {
   resetCurrentSessionAfterSlash,
   startDraftSession,
   switchToSession: switchRuntimeToSession,
+  adoptMaterializedSession: adoptRuntimeMaterializedSession,
   adoptResponseSession,
   rebindDraftSession,
 } = chatSessionRuntime
@@ -2931,6 +2932,14 @@ switchToPlanSession = switchToSession
 
 async function switchToSession(nextSessionKey: string) {
   const outcome = await switchRuntimeToSession(nextSessionKey)
+  if (outcome?.authoritative) {
+    await handleAuthoritativeSessionSubscription(nextSessionKey)
+  }
+  return outcome
+}
+
+async function adoptMaterializedSession(nextSessionKey: string) {
+  const outcome = await adoptRuntimeMaterializedSession(nextSessionKey)
   if (outcome?.authoritative) {
     await handleAuthoritativeSessionSubscription(nextSessionKey)
   }
@@ -3086,7 +3095,7 @@ const chatGoals = useChatGoals({
       ) return ''
     }
     if (workspaceId) freshTaskDraft.bindMaterializedProjectTask(key, workspaceId)
-    await switchToSession(key)
+    await adoptMaterializedSession(key)
     return key
   },
   ensureSubscribed: async key => {

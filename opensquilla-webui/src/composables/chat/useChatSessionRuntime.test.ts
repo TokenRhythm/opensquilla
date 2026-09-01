@@ -2,7 +2,7 @@ import { ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import { useChatSessionRuntime, type ChatUsageAccumulator } from './useChatSessionRuntime'
-import type { ChatMessage } from '@/types/chat'
+import type { Attachment, ChatMessage } from '@/types/chat'
 
 function emptyUsage(): ChatUsageAccumulator {
   return {
@@ -301,9 +301,16 @@ describe('useChatSessionRuntime Meta draft recovery', () => {
     expect(retireAttachments).not.toHaveBeenCalled()
   })
 
-  it('preserves attachments for same-key navigation and response handoff', async () => {
+  it('preserves attachments for same-key navigation and canonical adoption', async () => {
     const sessionKey = ref('agent:main:webchat:a')
-    const retireAttachments = vi.fn()
+    const pendingAttachments = ref<Attachment[]>([{
+      kind: 'inline',
+      local_id: 1,
+      name: 'goal-context.txt',
+      mime: 'text/plain',
+      data: 'Z29hbCBjb250ZXh0',
+    }])
+    const retireAttachments = vi.fn(() => { pendingAttachments.value = [] })
     const runtime = useChatSessionRuntime({
       sessionKey,
       messages: ref<ChatMessage[]>([]),
@@ -344,12 +351,15 @@ describe('useChatSessionRuntime Meta draft recovery', () => {
     })
 
     await runtime.switchToSession('agent:main:webchat:a')
-    await runtime.adoptResponseSession('agent:main:webchat:b', 'request-a')
+    await runtime.adoptMaterializedSession('agent:main:webchat:b')
+    await runtime.adoptResponseSession('agent:main:webchat:c', 'request-a')
 
-    expect(sessionKey.value).toBe('agent:main:webchat:b')
+    expect(sessionKey.value).toBe('agent:main:webchat:c')
     expect(retireAttachments).not.toHaveBeenCalled()
+    expect(pendingAttachments.value).toHaveLength(1)
 
     await runtime.switchToSession('agent:main:webchat:a')
     expect(retireAttachments).toHaveBeenCalledOnce()
+    expect(pendingAttachments.value).toEqual([])
   })
 })

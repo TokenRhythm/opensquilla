@@ -181,6 +181,7 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     key: string,
     pendingQueuePolicy:
       | { kind: 'navigate' }
+      | { kind: 'draft_materialization' }
       | { kind: 'response_handoff'; ownerRequestId: string },
   ): Promise<ResponseSessionAdoptionResult | undefined> {
     if (!key) return
@@ -265,6 +266,10 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
 
   function adoptResponseSession(key: string, ownerRequestId: string) {
     return switchSession(key, { kind: 'response_handoff', ownerRequestId })
+  }
+
+  function adoptMaterializedSession(key: string) {
+    return switchSession(key, { kind: 'draft_materialization' })
   }
 
   async function rebindDraftSession(
@@ -364,6 +369,7 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     resetCurrentSessionAfterSlash,
     startDraftSession,
     switchToSession,
+    adoptMaterializedSession,
     adoptResponseSession,
     rebindDraftSession,
   }
