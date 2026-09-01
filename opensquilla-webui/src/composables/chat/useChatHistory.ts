@@ -694,6 +694,7 @@ interface HistoryLoadParams {
   bridgeRetry?: boolean
   retry?: boolean
   nonReconnecting?: boolean
+  replaceCanonicalWindow?: boolean
 }
 
 type FailedHistoryRequest =
@@ -880,6 +881,20 @@ export function useChatHistory(options: UseChatHistoryOptions) {
 
   function hasLocalOptimisticRows(messages: ChatMessage[]): boolean {
     return messages.some(msg => msg.restoredFromHistory !== true)
+  }
+
+  // A rejected anchor makes every older canonical row untrustworthy. Retain
+  // only overlap needed to reconcile live fields plus non-canonical local rows.
+  function replaceCanonicalHistoryWindow(
+    previous: ChatMessage[],
+    latest: ChatMessage[],
+  ): ChatMessage[] {
+    const latestIds = new Set(latest.map(message => message.messageId).filter(Boolean))
+    const liveContext = previous.filter(message =>
+      message.restoredFromHistory !== true
+      || Boolean(message.messageId && latestIds.has(message.messageId)),
+    )
+    return reconcileRunningHistoryMessages(liveContext, latest)
   }
 
   function responseCanonicalComplete(data: ChatHistoryResponse): boolean | null {
@@ -1258,11 +1273,13 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       }
 
       if (msgs.length === 0 && !params.prepend) {
-        const transcript = preserveLiveTail
-          ? reconcileRunningHistoryMessages(previousTranscript, [])
-          : !crossedSession && hasLocalOptimisticRows(previousTranscript)
-            ? previousTranscript
-            : []
+        const transcript = params.replaceCanonicalWindow
+          ? replaceCanonicalHistoryWindow(previousTranscript, [])
+          : preserveLiveTail
+            ? reconcileRunningHistoryMessages(previousTranscript, [])
+            : !crossedSession && hasLocalOptimisticRows(previousTranscript)
+              ? previousTranscript
+              : []
         options.messages.value = mergeHistoryMaintenance(
           transcript,
           [...previousMaintenance, ...maintenanceMessages],
@@ -1297,9 +1314,13 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           [...previousMaintenance, ...maintenanceMessages],
         )
       } else {
-        const refreshedWindow = reconcileHistoryWindow(previousTranscript, mapped)
+        const refreshedWindow = params.replaceCanonicalWindow
+          ? replaceCanonicalHistoryWindow(previousTranscript, mapped)
+          : reconcileHistoryWindow(previousTranscript, mapped)
         let nextMessages: ChatMessage[]
-        if (preserveLiveTail) {
+        if (params.replaceCanonicalWindow) {
+          nextMessages = refreshedWindow
+        } else if (preserveLiveTail) {
           nextMessages = reconcileRunningHistoryMessages(previousTranscript, refreshedWindow)
         } else {
           nextMessages = refreshedWindow
@@ -1412,7 +1433,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           }
         }
         const initialLoadFailed = isInitialLoad && !bridgeAttempted
-        failedHistoryRequest = cursorRequiresLatestReload
+        failedHistoryRequest = cursorRequiresLatestReload || params.replaceCanonicalWindow
           ? { kind: 'latest', key }
           : bridgeAttempted
             ? { kind: 'bridge', key }
@@ -1532,7 +1553,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           oldestCursor: null,
           newestCursor: null,
         }
-        return loadHistory({ retry: true }, bootstrap)
+        return loadHistory({ replaceCanonicalWindow: true, retry: true }, bootstrap)
       }
       if (failed.kind === 'bridge') {
         return loadHistory({ bridgeRetry: true, retry: true }, bootstrap)

@@ -2004,6 +2004,116 @@ describe('useChatHistory canonical pagination', () => {
     })
   })
 
+  it('replaces an overlapping canonical prefix while preserving the local tail', async () => {
+    const { api, rpc, messages } = makeHistory(false)
+    rpc.call
+      .mockResolvedValueOnce({
+        messages: [
+          historyMessage('m1'),
+          historyMessage('m2'),
+          historyMessage('m3'),
+          historyMessage('m4'),
+        ],
+        has_more: true,
+        oldest_cursor: 'cursor-1',
+        newest_cursor: 'cursor-4',
+        canonical_available: true,
+      })
+      .mockRejectedValueOnce(Object.assign(new Error('cursor rejected'), {
+        code: 'HISTORY_CURSOR_INVALIDATED',
+      }))
+      .mockRejectedValueOnce(new Error('offline during latest recovery'))
+      .mockResolvedValueOnce({
+        messages: [historyMessage('m3'), historyMessage('m4')],
+        has_more: false,
+        oldest_cursor: 'cursor-3',
+        newest_cursor: 'cursor-4',
+        canonical_available: true,
+      })
+
+    await api.loadHistory()
+    messages.value.push(
+      {
+        role: 'user',
+        text: 'local follow-up',
+        ts: 'local-user',
+        messageId: 'local-user',
+        turnId: 'local-turn',
+      },
+      {
+        role: 'assistant',
+        text: 'local answer in progress',
+        ts: 'local-assistant',
+        turnId: 'local-turn',
+      },
+    )
+
+    await api.loadEarlierHistory()
+    await api.retryHistory()
+    expect(api.historyState.value.recoveryError).toBe(true)
+
+    await api.retryHistory()
+
+    const latestRecoveryRequests = rpc.call.mock.calls.slice(2).map(([, params]) => params)
+    for (const params of latestRecoveryRequests) {
+      expect(params).not.toHaveProperty('before')
+      expect(params).not.toHaveProperty('after')
+    }
+    expect(messages.value.map(message => message.messageId || message.text)).toEqual([
+      'm3',
+      'm4',
+      'local-user',
+      'local answer in progress',
+    ])
+    expect(api.historyState.value).toMatchObject({
+      hasMore: false,
+      oldestCursor: 'cursor-3',
+      newestCursor: 'cursor-4',
+      recoveryError: false,
+    })
+  })
+
+  it('drops the prior canonical window when latest recovery is empty', async () => {
+    const { api, rpc, messages } = makeHistory(false)
+    rpc.call
+      .mockResolvedValueOnce({
+        messages: [historyMessage('m1')],
+        has_more: true,
+        oldest_cursor: 'cursor-1',
+        newest_cursor: 'cursor-1',
+        canonical_available: true,
+      })
+      .mockRejectedValueOnce(Object.assign(new Error('cursor rejected'), {
+        code: 'HISTORY_CURSOR_INVALIDATED',
+      }))
+      .mockResolvedValueOnce({
+        messages: [],
+        has_more: false,
+        oldest_cursor: null,
+        newest_cursor: null,
+        canonical_available: true,
+      })
+
+    await api.loadHistory()
+    messages.value.push({
+      role: 'user',
+      text: 'local follow-up',
+      ts: 'local-user',
+      messageId: 'local-user',
+      turnId: 'local-turn',
+    })
+    await api.loadEarlierHistory()
+    await api.retryHistory()
+
+    expect(messages.value.map(message => message.messageId)).toEqual(['local-user'])
+    expect(api.historyState.value).toMatchObject({
+      hasMore: false,
+      oldestCursor: null,
+      newestCursor: null,
+      recoveryError: false,
+    })
+  })
+
   it('surfaces and retries an initial history request failure', async () => {
     const { api, rpc, messages } = makeHistory(false)
     rpc.call
