@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from opensquilla.agents.scope import resolve_agent_workspace_dir
+from opensquilla.application.sandbox_runtime import SandboxRuntime
 from opensquilla.gateway.project_workspace_runtime import (
     authoritative_project_run_context,
     map_project_workspace_error,
@@ -689,9 +690,8 @@ def _explain_messages(status: dict[str, Any]) -> list[dict[str, str]]:
     ]
 
 
-def _sandbox_application(ctx: RpcContext) -> Any:
+def _sandbox_application(ctx: RpcContext) -> SandboxRuntime:
     """Compose the transport-neutral SandboxRuntime Module for this request."""
-    from opensquilla.application.sandbox_runtime import SandboxRuntime
     from opensquilla.gateway.adapters.sandbox_runtime import RpcContextSandboxRuntimePort
 
     async def status(c: RpcContext) -> Mapping[str, Any]:
