@@ -90,8 +90,10 @@ class _RealIngressStack:
     runtime: TaskRuntime
     context: RpcContext
     session_id: str
+    session_epoch: int
     handler_started: asyncio.Event
     release_handler: asyncio.Event
+    received_runs: list[Any]
 
     async def wait_until_running(self) -> None:
         await asyncio.wait_for(self.handler_started.wait(), timeout=2.0)
@@ -112,8 +114,10 @@ async def _open_real_stack(
     )
     handler_started = asyncio.Event()
     release_handler = asyncio.Event()
+    received_runs: list[Any] = []
 
-    async def _turn_handler(_run: Any) -> None:
+    async def _turn_handler(run: Any) -> None:
+        received_runs.append(run)
         handler_started.set()
         await release_handler.wait()
 
@@ -143,8 +147,10 @@ async def _open_real_stack(
         runtime=runtime,
         context=context,
         session_id=session.session_id,
+        session_epoch=session.epoch,
         handler_started=handler_started,
         release_handler=release_handler,
+        received_runs=received_runs,
     )
     try:
         yield stack
@@ -2658,6 +2664,8 @@ async def test_queued_meta_control_reopens_and_reactivates_exactly_once(
     assert queued.details["meta_control_semantic_message"] == launch_text
     assert queued.details["accepted_model_routing"]["session_mode"] == "router"
     assert queued.details["accepted_model_routing"]["session_revision"] == 7
+    assert queued.details["session_id"] == session.session_id
+    assert queued.details["session_epoch"] == session.epoch
     transcript = await storage.get_transcript(session.session_id)
     control_entry = next(
         entry
@@ -2707,6 +2715,8 @@ async def test_queued_meta_control_reopens_and_reactivates_exactly_once(
         assert recovered_run.task_id == task_id
         assert recovered_run.message == launch_text
         assert recovered_run.semantic_message == launch_text
+        assert recovered_run.envelope.session_id == session.session_id
+        assert recovered_run.envelope.session_epoch == session.epoch
         assert recovered_run.accepted_config.session_mode == "router"
         assert recovered_run.accepted_config.session_routing_revision == 7
         assert recovered_run.accepted_config.session_routing_source == "session"
@@ -2825,10 +2835,10 @@ async def test_meta_control_recovery_is_nonblocking_and_fair_to_other_sessions()
     )
     first_recovery_started = asyncio.Event()
     release_first_recovery = asyncio.Event()
-    seen: list[tuple[str, str]] = []
+    seen: list[Any] = []
 
     async def _handler(run: Any) -> None:
-        seen.append((run.task_id, run.queue_mode))
+        seen.append(run)
         if run.task_id == "recovery-task-0":
             first_recovery_started.set()
             await release_first_recovery.wait()
@@ -2861,13 +2871,16 @@ async def test_meta_control_recovery_is_nonblocking_and_fair_to_other_sessions()
     for task_id in records:
         assert (await runtime.wait(task_id, timeout=2.0)).status == "succeeded"
     assert claim_calls == 4
-    assert sorted(seen) == [
+    assert sorted((run.task_id, run.queue_mode) for run in seen) == [
         ("ordinary-task", "followup"),
         ("recovery-task-0", "followup"),
         ("recovery-task-1", "followup"),
         ("recovery-task-2", "followup"),
     ]
-    started_task_ids = [task_id for task_id, _mode in seen]
+    recovered_runs = [run for run in seen if run.task_id.startswith("recovery-task-")]
+    assert all(run.envelope.session_id == "recovery-session-id" for run in recovered_runs)
+    assert all(run.envelope.session_epoch is None for run in recovered_runs)
+    started_task_ids = [run.task_id for run in seen]
     assert started_task_ids.index("ordinary-task") < started_task_ids.index("recovery-task-2")
 
 
@@ -3018,6 +3031,16 @@ async def test_sessions_send_atomically_accepts_message_task_and_receipt(tmp_pat
         assert response.payload["client_message_id"] == "composer-message-1"
         assert response.payload["surface_id"] == "tui:atomic-test"
         assert response.payload["replayed"] is False
+        task = await stack.storage.get_agent_task(response.payload["task_id"])
+        assert task is not None
+        assert task.details is not None
+        assert task.details["session_id"] == stack.session_id
+        assert task.details["session_epoch"] == stack.session_epoch
+        assert len(stack.received_runs) == 1
+        run = stack.received_runs[0]
+        assert run.task_id == response.payload["task_id"]
+        assert run.envelope.session_id == stack.session_id
+        assert run.envelope.session_epoch == stack.session_epoch
         entries = await stack.storage.get_transcript(stack.session_id)
         assert entries[0].turn_context == {
             "turn_id": response.payload["task_id"],
@@ -3620,6 +3643,14 @@ async def test_collect_mode_atomically_merges_message_and_receipt_into_queued_ta
             },
             stack.context,
         )
+        first_task = await stack.storage.get_agent_task(first.payload["task_id"])
+        assert first_task is not None
+        assert first_task.details is not None
+        accepted_owner = (
+            first_task.details["session_id"],
+            first_task.details["session_epoch"],
+        )
+        assert accepted_owner == (stack.session_id, stack.session_epoch)
         second = await get_dispatcher().dispatch(
             "rpc-collect-second",
             "sessions.send",
@@ -3649,6 +3680,14 @@ async def test_collect_mode_atomically_merges_message_and_receipt_into_queued_ta
         assert persisted.details is not None
         assert persisted.details["collected"] is True
         assert persisted.details["message_count"] == 2
+        assert (
+            persisted.details["session_id"],
+            persisted.details["session_epoch"],
+        ) == accepted_owner
+        assert (
+            candidate.envelope.session_id,
+            candidate.envelope.session_epoch,
+        ) == accepted_owner
         entries = await stack.storage.get_transcript(stack.session_id)
         assert entries[-2].turn_context == {
             "turn_id": first.payload["task_id"],

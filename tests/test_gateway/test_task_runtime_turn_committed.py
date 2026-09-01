@@ -30,6 +30,7 @@ def _envelope() -> RouteEnvelope:
             "client_message_id": "client-message-1",
             "surface_id": "webui:chat",
         },
+        session_epoch=4,
     )
 
 
@@ -279,6 +280,7 @@ async def test_success_emits_one_commit_with_durable_identity_payload() -> None:
             "schema_version": 1,
             "session_key": _envelope().session_key,
             "session_id": "session-turn-committed",
+            "epoch": 4,
             "task_id": handle.task_id,
             "turn_id": handle.task_id,
             "status": "succeeded",
@@ -289,6 +291,9 @@ async def test_success_emits_one_commit_with_durable_identity_payload() -> None:
             "surface_id": "webui:chat",
         }
     ]
+    assert record.details is not None
+    assert record.details["session_id"] == "session-turn-committed"
+    assert record.details["session_epoch"] == 4
     event_names = [name for name, _payload in emitted]
     assert event_names.index("task.succeeded") < event_names.index(TURN_COMMITTED_EVENT)
 

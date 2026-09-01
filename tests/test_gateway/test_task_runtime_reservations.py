@@ -65,13 +65,20 @@ class _PersistenceResult:
     replayed: bool = False
 
 
-def _envelope(session_key: str = "agent-1::reservation") -> RouteEnvelope:
+def _envelope(
+    session_key: str = "agent-1::reservation",
+    *,
+    session_id: str | None = None,
+    session_epoch: int | None = None,
+) -> RouteEnvelope:
     return RouteEnvelope(
         source_kind=SourceKind.WEB,
         source_name="reservation-test",
         agent_id="agent-1",
         session_key=session_key,
         input_provenance={"kind": "synthetic-test"},
+        session_id=session_id,
+        session_epoch=session_epoch,
     )
 
 
@@ -193,6 +200,56 @@ async def test_reserve_preserves_task_id_without_capturing_accepted_config() -> 
 
     await runtime.abort_reservation(reservation)
     assert config_captures == []
+
+
+@pytest.mark.asyncio
+async def test_reserve_persists_exact_session_owner_in_task_details() -> None:
+    runtime = TaskRuntime(
+        storage=_TrackingStorage(),
+        turn_handler=_noop_turn_handler,
+    )
+
+    reservation = await runtime.reserve(
+        _envelope(session_id="session-owner", session_epoch=0),
+        "reserved",
+    )
+
+    assert reservation.task_record.details is not None
+    assert reservation.task_record.details["session_id"] == "session-owner"
+    assert reservation.task_record.details["session_epoch"] == 0
+    assert reservation.runtime_task.envelope.session_id == "session-owner"
+    assert reservation.runtime_task.envelope.session_epoch == 0
+
+    await runtime.abort_reservation(reservation)
+
+
+@pytest.mark.asyncio
+async def test_reserve_rejects_epoch_without_session_id() -> None:
+    runtime = TaskRuntime(
+        storage=_TrackingStorage(),
+        turn_handler=_noop_turn_handler,
+    )
+
+    with pytest.raises(ValueError, match="session_epoch requires"):
+        await runtime.reserve(_envelope(session_epoch=0), "malformed")
+
+
+@pytest.mark.asyncio
+async def test_reserve_keeps_id_only_legacy_owner_epoch_unknown() -> None:
+    runtime = TaskRuntime(
+        storage=_TrackingStorage(),
+        turn_handler=_noop_turn_handler,
+    )
+
+    reservation = await runtime.reserve(
+        _envelope(session_id="legacy-session"),
+        "legacy",
+    )
+
+    assert reservation.task_record.details is not None
+    assert reservation.task_record.details["session_id"] == "legacy-session"
+    assert "session_epoch" not in reservation.task_record.details
+    await runtime.abort_reservation(reservation)
 
 
 @pytest.mark.asyncio

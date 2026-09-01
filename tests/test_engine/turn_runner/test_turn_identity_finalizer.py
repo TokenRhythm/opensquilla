@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -15,7 +16,8 @@ from opensquilla.engine.turn_runner.turn_finalizer_stage import (
     TurnFinalizerStageInput,
 )
 from opensquilla.session.manager import SessionManager
-from opensquilla.session.storage import SessionStorage
+from opensquilla.session.models import SessionIntent
+from opensquilla.session.storage import SessionStorage, StaleEpochError
 
 
 @dataclass
@@ -34,11 +36,15 @@ class _SessionTranscriptPort:
         turn_usage: dict[str, Any] | None,
         token_count: int | None,
         assistant_message_id: str | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> TranscriptAppendResult:
         self.calls.append(
             {
                 "session_key": session_key,
                 "assistant_message_id": assistant_message_id,
+                "expected_session_id": expected_session_id,
+                "expected_session_epoch": expected_session_epoch,
             }
         )
         entry = await self.manager.append_message(
@@ -50,6 +56,8 @@ class _SessionTranscriptPort:
             reasoning_content=reasoning_content,
             turn_usage=turn_usage,
             token_count=token_count,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
         )
         return TranscriptAppendResult(appended=True, message_id=entry.message_id)
 
@@ -83,6 +91,8 @@ def _make_input(
     context: TurnExecutionContext,
     *,
     text: str,
+    expected_session_id: str | None = None,
+    expected_session_epoch: int | None = None,
 ) -> TurnFinalizerStageInput:
     return TurnFinalizerStageInput(
         final_text_parts=[text] if text else [],
@@ -101,6 +111,8 @@ def _make_input(
         run_kind="default",
         heartbeat_ack_max_chars=300,
         no_memory_capture=True,
+        expected_session_id=expected_session_id,
+        expected_session_epoch=expected_session_epoch,
         execution_context=context,
     )
 
@@ -156,4 +168,50 @@ async def test_finalizer_empty_output_releases_without_append(
     assert outcome.require_output().transcript_appended is False
     assert transcript.calls == []
     assert context.publication_ledger.released is True
+    assert await manager.get_transcript(key) == []
+
+
+@pytest.mark.asyncio
+async def test_reset_rejects_retired_finalizer_owner_without_new_transcript(
+    manager: SessionManager,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = "agent:main:finalizer-identity"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    admitted = await manager.get_session(key)
+    assert admitted is not None
+    context = TurnExecutionContext.create(
+        TurnIdentity("turn-before-reset", "assistant-before-reset", key)
+    )
+    transcript = _SessionTranscriptPort(manager)
+    stage = TurnFinalizerStage(
+        transcript_append=transcript,
+        turn_memory_capture=_NoopMemory(),
+        session_totals=_NoopTotals(),
+        turn_error_persist=_NoopError(),
+    )
+
+    replacement, rotated = await manager.apply_intent(key, SessionIntent.RESET_SAME_KEY)
+    assert rotated is True
+    assert replacement.session_id != admitted.session_id
+
+    with pytest.raises(StaleEpochError, match="owner mismatch"):
+        await stage.run(
+            _make_input(
+                context,
+                text="late answer",
+                expected_session_id=admitted.session_id,
+                expected_session_epoch=int(admitted.epoch or 0),
+            )
+        )
+
+    assert transcript.calls == [
+        {
+            "session_key": key,
+            "assistant_message_id": "assistant-before-reset",
+            "expected_session_id": admitted.session_id,
+            "expected_session_epoch": int(admitted.epoch or 0),
+        }
+    ]
     assert await manager.get_transcript(key) == []

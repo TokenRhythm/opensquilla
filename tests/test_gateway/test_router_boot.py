@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+from dataclasses import fields
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
@@ -46,6 +47,7 @@ from opensquilla.gateway.model_routing import (
     model_routing_snapshot,
 )
 from opensquilla.gateway.routing import (
+    RouteEnvelope,
     build_channel_route_envelope,
     build_cli_route_envelope,
     build_cron_route_envelope,
@@ -67,6 +69,13 @@ from opensquilla.session.models import SessionIntent
 from opensquilla.session.storage import SessionStorage
 from opensquilla.tools.registry import ToolRegistry
 from opensquilla.tools.types import CallerKind, ToolContext, ToolSpec
+
+
+def test_route_envelope_session_epoch_is_append_only_for_positional_callers() -> None:
+    assert [field.name for field in fields(RouteEnvelope)][-2:] == [
+        "runtime_services",
+        "session_epoch",
+    ]
 
 
 def test_gateway_boot_bridges_compaction_notifications_to_session_stream() -> None:
@@ -668,6 +677,46 @@ def test_build_task_runtime_run_kwargs_forwards_task_id_as_root_turn() -> None:
     kwargs = build_task_runtime_run_kwargs(run, tool_context=object(), model="model")
 
     assert kwargs["root_turn_id"] == "task-turn-123"
+
+
+def test_build_task_runtime_run_kwargs_forwards_exact_session_owner() -> None:
+    run = SimpleNamespace(
+        task_id="task-turn-123",
+        agent_id="main",
+        attachments=[],
+        input_provenance=None,
+        run_kind="session_turn",
+        no_memory_capture=False,
+        fresh_user_session=False,
+        ingress_pipeline_steps=(),
+        semantic_message=None,
+        session_id="session-123",
+        session_epoch=0,
+    )
+
+    kwargs = build_task_runtime_run_kwargs(run, tool_context=object(), model="model")
+
+    assert kwargs["expected_session_id"] == "session-123"
+    assert kwargs["expected_session_epoch"] == 0
+
+
+def test_build_task_runtime_run_kwargs_omits_legacy_session_owner() -> None:
+    run = SimpleNamespace(
+        task_id="task-turn-legacy",
+        agent_id="main",
+        attachments=[],
+        input_provenance=None,
+        run_kind="session_turn",
+        no_memory_capture=False,
+        fresh_user_session=False,
+        ingress_pipeline_steps=(),
+        semantic_message=None,
+    )
+
+    kwargs = build_task_runtime_run_kwargs(run, tool_context=object(), model="model")
+
+    assert "expected_session_id" not in kwargs
+    assert "expected_session_epoch" not in kwargs
 
 
 def test_build_task_runtime_run_kwargs_forwards_provider_correlation() -> None:
