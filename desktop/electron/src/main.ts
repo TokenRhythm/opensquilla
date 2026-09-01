@@ -13898,7 +13898,13 @@ async function drainOwnedGatewayForQuit(
   url: string,
   requestShutdown: boolean,
 ): Promise<boolean> {
-  if (hasGatewayProcessExited(child)) return true
+  if (hasGatewayProcessExited(child)) {
+    desktopLog('quit_gateway_exit', {
+      exited: true,
+      hardTerminated: gatewayHardTerminatedProcesses.has(child),
+    })
+    return true
+  }
   const accepted = requestShutdown ? await requestOwnedGatewayShutdown(child, url) : null
   desktopLog('quit_gateway_shutdown_requested', { accepted, alreadyStopping: !requestShutdown })
   let hardTerminated = gatewayHardTerminatedProcesses.has(child)

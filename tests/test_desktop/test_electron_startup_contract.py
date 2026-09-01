@@ -3030,6 +3030,14 @@ def test_desktop_quit_drains_gateway_before_exit_on_every_platform() -> None:
         "hardTerminated: hardTerminated || gatewayHardTerminatedProcesses.has(child)"
         in drain
     )
+    already_exited = _section(
+        drain,
+        "if (hasGatewayProcessExited(child))",
+        "const accepted = requestShutdown",
+    )
+    assert "desktopLog('quit_gateway_exit'" in already_exited
+    assert "exited: true" in already_exited
+    assert "hardTerminated: gatewayHardTerminatedProcesses.has(child)" in already_exited
     final_tree_kill = _section(
         drain,
         "if (!exited && !hasGatewayProcessExited(child))",
