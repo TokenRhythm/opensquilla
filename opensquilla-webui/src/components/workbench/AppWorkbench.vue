@@ -167,6 +167,7 @@
 <script setup lang="ts">
 import {
   computed,
+  inject,
   nextTick,
   onBeforeUnmount,
   onMounted,
@@ -189,12 +190,14 @@ import {
   type WorkbenchDocumentPrepareRequest,
 } from '@/stores/workbenchDocumentContext'
 import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
-import { useRpcStore } from '@/stores/rpc'
 import type {
   ArtifactPayload,
-  ArtifactStateEventPayload,
   ChatDocumentContext,
 } from '@/types/rpc'
+import {
+  ARTIFACT_WORKBENCH_KEY,
+  type ArtifactDocumentChange,
+} from '@/modules/artifactWorkbench'
 import type {
   WorkbenchPreviewDescriptor,
   WorkbenchResource,
@@ -227,9 +230,7 @@ import {
   attachWorkbenchRuntime,
   WorkbenchRuntimeManager,
 } from '@/workbench/runtime'
-import { createRpcArtifactDocumentProvider } from '@/workbench/artifactDocumentProvider'
 import { artifactPayloadFromRevision } from '@/workbench/artifactDocumentProvider'
-import { createRpcWorkbenchResourceProvider } from '@/workbench/workbenchResourceProvider'
 import {
   workbenchResourceActionReasonCode,
 } from '@/workbench/resourceCapabilityPresentation'
@@ -265,7 +266,6 @@ import { createArtifactWorkbenchDefinitions } from './artifactWorkbenchProvider'
 import { createBrowserWorkbenchDefinition } from './browserWorkbenchProvider'
 import { createWorkbenchResourceCollectionDefinition } from './workbenchResourceCollectionProvider'
 import WorkbenchHost from './WorkbenchHost.vue'
-import { fetchArtifactBlob } from '@/utils/chat/artifactAccess'
 import { downloadBlob } from '@/utils/browser'
 
 const props = withDefaults(defineProps<{
@@ -289,14 +289,16 @@ const { confirm } = useConfirm()
 const { pushToast } = useToasts()
 const platform = usePlatform()
 const store = useWorkbenchStore()
-const rpc = useRpcStore()
+const injectedArtifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
+if (!injectedArtifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
+const artifactWorkbench = injectedArtifactWorkbench
 const artifactDocuments = useArtifactDocumentsStore()
 const artifactPromptAnnotations = useArtifactPromptAnnotationsStore()
 const workbenchDocumentContext = useWorkbenchDocumentContextStore()
 const workbenchResources = useWorkbenchResourcesStore()
-const artifactDocumentProvider = createRpcArtifactDocumentProvider(rpc)
+const artifactDocumentProvider = artifactWorkbench.documents
 artifactDocuments.setProvider(artifactDocumentProvider)
-const workbenchResourceProvider = createRpcWorkbenchResourceProvider(rpc)
+const workbenchResourceProvider = artifactWorkbench.resources
 workbenchResources.setProvider(props.workbenchResourcesEnabled ? workbenchResourceProvider : null)
 const nativeSurfaceOccluded = useNativeSurfaceOcclusionState()
 const surfaceBlocked = computed(() => props.modalBlocked || nativeSurfaceOccluded.value)
@@ -318,9 +320,7 @@ const runtimeManager = new WorkbenchRuntimeManager(workbenchPanelRegistry, {
 })
 let stopSurfaceEvents: (() => void) | null = null
 let stopArtifactEvents: (() => void) | null = null
-let stopDocumentEvents: (() => void) | null = null
 let detachRuntime: (() => Promise<void>) | null = null
-const artifactEventSequences = new Map<string, number>()
 let scopeChangeGeneration = 0
 const documentContextController = workbenchDocumentContext.attachController(
   prepareActiveDocumentContext,
@@ -387,6 +387,7 @@ function onBrowserWorkbenchOpen(event: Event) {
 }
 
 for (const definition of createArtifactWorkbenchDefinitions({
+  artifactContent: artifactWorkbench.content,
   artifactDocuments,
   promptAnnotations: props.promptAnnotationsEnabled ? {
     create: request => artifactPromptAnnotations.create(request),
@@ -637,14 +638,16 @@ async function downloadWorkbenchResource(
   const resolved = sessionKey
     ? await workbenchResources.resolve(sessionKey, resource.resource) || resource
     : resource
-  if (
-    resolved.resource.type === 'attachment'
+  const inlineAttachment = resolved.resource.type === 'attachment'
     && typeof resolved.downloadUrl === 'string'
     && resolved.downloadUrl.startsWith('data:')
-  ) {
-    const response = await fetch(resolved.downloadUrl, { credentials: 'omit' })
-    if (!response.ok) throw new Error(t('workbench.resources.actionFailed'))
-    const blob = await response.blob()
+  const artifact = artifactPayloadFromWorkbenchResource(resolved)
+  const result = await artifactWorkbench.content.fetchArtifact(artifact, {
+    sessionKey,
+  })
+  if (!result.ok) throw new Error(result.message)
+  const blob = result.blob
+  if (inlineAttachment) {
     if (typeof resolved.size === 'number' && blob.size !== resolved.size) {
       throw new Error(t('workbench.resources.actionFailed'))
     }
@@ -657,17 +660,8 @@ async function downloadWorkbenchResource(
         throw new Error(t('workbench.resources.actionFailed'))
       }
     }
-    downloadBlob(blob, resolved.name)
-    return
   }
-  const artifact = artifactPayloadFromWorkbenchResource(resolved)
-  const result = await fetchArtifactBlob(artifact, {
-    authToken: readAuthToken(),
-    baseOrigin,
-    sessionKey,
-  })
-  if (!result.ok) throw new Error(result.message)
-  downloadBlob(result.blob, resolved.name)
+  downloadBlob(blob, resolved.name)
 }
 
 function refreshResourceCollectionItem(sessionKey: string) {
@@ -889,12 +883,8 @@ function onNativeSurfaceEvent(event: NativeWorkbenchSurfaceEvent) {
   runtimeManager.handleNativeSurfaceEvent(event)
 }
 
-function onArtifactState(event: ArtifactStateEventPayload) {
-  const documentId = typeof event.documentId === 'string' ? event.documentId : ''
-  const sequence = Number(event.artifactEventSeq)
-  if (!documentId || !Number.isSafeInteger(sequence) || sequence < 1) return
-  if ((artifactEventSequences.get(documentId) || 0) >= sequence) return
-  artifactEventSequences.set(documentId, sequence)
+function onArtifactState(event: ArtifactDocumentChange) {
+  const documentId = event.documentId
   const activeSessionKey = store.activeSessionId || props.sessionId
   if (props.workbenchResourcesEnabled && activeSessionKey) {
     void workbenchResources.load(activeSessionKey, true).then(() => {
@@ -1287,36 +1277,23 @@ watch(
       workbenchResources.reset()
       return
     }
-    if (rpc.state === 'connected' && props.routeActive && sessionKey) {
-      void workbenchResources.load(sessionKey, true).then(() => {
+    if (props.routeActive && sessionKey) {
+      void artifactWorkbench.ready().then(() => workbenchResources.load(sessionKey, true)).then(() => {
         refreshResourceCollectionItem(sessionKey)
       }).catch(() => undefined)
     }
-  },
-)
-
-watch(
-  () => rpc.state,
-  state => {
-    const sessionKey = store.activeSessionId || props.sessionId
-    if (
-      state !== 'connected'
-      || !props.routeActive
-      || !sessionKey
-    ) return
-    if (props.workbenchResourcesEnabled) {
-      void workbenchResources.load(sessionKey, true).then(() => {
-        refreshResourceCollectionItem(sessionKey)
-      }).catch(() => undefined)
-    }
-    refreshOpenArtifactDocuments(sessionKey)
   },
 )
 
 onMounted(() => {
   if (nativeApi) stopSurfaceEvents = nativeApi.onSurfaceEvent(onNativeSurfaceEvent)
-  stopArtifactEvents = rpc.on('session.event.artifact_state', onArtifactState)
-  stopDocumentEvents = rpc.on('document.state_changed', onArtifactState)
+  const documentChanges = artifactWorkbench.subscribeDocumentChanges(onArtifactState)
+  stopArtifactEvents = () => documentChanges.close()
+  const sessionKey = store.activeSessionId || props.sessionId
+  if (props.routeActive && sessionKey) {
+    void artifactWorkbench.ready().then(() => refreshOpenArtifactDocuments(sessionKey))
+      .catch(() => undefined)
+  }
   window.addEventListener(BROWSER_WORKBENCH_OPEN_EVENT, onBrowserWorkbenchOpen)
   window.addEventListener(ARTIFACT_PROMPT_ANNOTATION_FOCUS_EVENT, onPromptAnnotationFocus)
   window.addEventListener(ARTIFACT_PROMPT_ANNOTATION_REUSE_EVENT, onPromptAnnotationReuse)
@@ -1344,9 +1321,6 @@ onBeforeUnmount(() => {
   stopSurfaceEvents = null
   stopArtifactEvents?.()
   stopArtifactEvents = null
-  stopDocumentEvents?.()
-  stopDocumentEvents = null
-  artifactEventSequences.clear()
   if (detachRuntime) void detachRuntime()
   detachRuntime = null
   artifactDocuments.setProvider(null)

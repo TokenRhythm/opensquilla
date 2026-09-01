@@ -812,6 +812,7 @@ import { APP_SETTINGS_KEY } from '@/modules/appSettings'
 import { PROVIDER_CONFIGURATION_KEY } from '@/modules/providerConfiguration'
 import { SANDBOX_RUNTIME_KEY } from '@/modules/sandboxRuntime'
 import { SETUP_WORKFLOW_KEY } from '@/modules/setupWorkflow'
+import { ARTIFACT_WORKBENCH_KEY } from '@/modules/artifactWorkbench'
 import { useSetupStatus } from '@/composables/setup/useSetupStatus'
 import { useAppStore } from '@/stores/app'
 import { useSandboxSetupStore } from '@/stores/sandboxSetup'
@@ -820,7 +821,6 @@ import { useWorkbenchDocumentContextStore } from '@/stores/workbenchDocumentCont
 import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
 import { useWorkbenchStore } from '@/workbench/store'
 import { usePlatform } from '@/platform'
-import { createRpcArtifactPromptAnnotationProvider } from '@/workbench/artifactPromptAnnotationProvider'
 import {
   focusArtifactPromptAnnotation,
   notifyArtifactPromptAnnotationsAccepted,
@@ -1044,7 +1044,6 @@ import type {
 } from '@/types/plans'
 import {
   artifactCategory,
-  artifactDownloadUrl,
   isInlineMediaArtifact,
   isOfficeArtifact,
 } from '@/utils/chat/artifacts'
@@ -1071,7 +1070,6 @@ import {
   artifactWorkbenchPreviewKind,
 } from '@/utils/workbench/artifactPreview'
 import { findArtifactCard, focusArtifactInTranscript } from '@/utils/chat/artifactFocus'
-import { fetchDisplayAttachmentBlob } from '@/utils/chat/attachmentAccess'
 import { classifyArtifactProductError } from '@/utils/artifactProductErrors'
 import {
   persistDeferredMetaDraft,
@@ -1222,6 +1220,10 @@ const injectedSandboxRuntime = inject(SANDBOX_RUNTIME_KEY)
 if (!injectedProviderConfiguration) throw new Error('ProviderConfiguration was not provided')
 const injectedSetupWorkflow = inject(SETUP_WORKFLOW_KEY)
 if (!injectedSetupWorkflow) throw new Error('SetupWorkflow was not provided')
+const injectedArtifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
+if (!injectedArtifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
+const artifactWorkbench = injectedArtifactWorkbench
+if (!injectedArtifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
 
 async function resolveCreatedSessionAvailability(sessionKey: string): Promise<boolean> {
   try {
@@ -1259,7 +1261,7 @@ function artifactPreviewItemForExplicitOpen(
 const artifactPromptAnnotationsStore = useArtifactPromptAnnotationsStore()
 const workbenchDocumentContextStore = useWorkbenchDocumentContextStore()
 const workbenchResourcesStore = useWorkbenchResourcesStore()
-const artifactPromptAnnotationProvider = createRpcArtifactPromptAnnotationProvider(rpc)
+const artifactPromptAnnotationProvider = artifactWorkbench.promptAnnotations
 artifactPromptAnnotationsStore.setProvider(artifactPromptAnnotationProvider)
 const artifactImageLightbox = useArtifactImageLightbox()
 const platform = usePlatform()
@@ -1369,12 +1371,11 @@ const workbenchResourcesEnabled = computed(() => (
 const attachmentWorkbenchPreviewEnabled = computed(() => (
   workbenchEnabled.value
   && workbenchResourcesEnabled.value
-  && rpc.supportsMethod('workbench.resources.list')
-  && rpc.supportsMethod('workbench.resources.get')
+  && artifactWorkbench.resources.available()
 ))
 const attachmentWorkbenchEditEnabled = computed(() => (
   attachmentWorkbenchPreviewEnabled.value
-  && rpc.supportsMethod('documents.import')
+  && artifactWorkbench.resources.canImportDocuments()
 ))
 const activePromptAnnotations = computed(() =>
   promptAnnotationsEnabled.value
@@ -1822,7 +1823,7 @@ watch(
   state => setStreamConnectionAvailable(state === 'connected'),
   { immediate: true },
 )
-const chatAttachments = useChatAttachments()
+const chatAttachments = useChatAttachments(artifactWorkbench.content)
 const {
   pendingAttachments,
   attachmentWorkBusy,
@@ -2496,7 +2497,7 @@ const steerDelivery = useChatSteerDelivery({
 // history. History and the in-flight ArtifactEvent stream remain live fallback
 // sources for mixed-version gateways and list-refresh races.
 const chatSessionArtifacts = useSessionArtifacts({
-  rpc,
+  catalog: artifactWorkbench.artifacts,
   sessionKey,
   messages,
   streamArtifacts,
@@ -4880,10 +4881,8 @@ function subagentBody(text: string): string {
 /* ── Artifacts ─────────────────────────────────────────────────────── */
 
 async function downloadAttachment(attachment: DisplayAttachment): Promise<boolean> {
-  const result = await fetchDisplayAttachmentBlob(attachment, {
-    baseOrigin: window.location.origin,
+  const result = await artifactWorkbench.content.fetchAttachment(attachment, {
     sessionKey: sessionKey.value,
-    authToken: readAuthToken(),
   })
   if (!result.ok) {
     if (result.status > 0) {
@@ -5040,28 +5039,15 @@ async function downloadArtifact(artifact: ArtifactPayload) {
   // A published delivery is an immutable snapshot. Document-head downloads
   // are separate workbench actions and must not change what this chat card
   // resolves to after later edits.
-  const token = readAuthToken()
-  const url = artifactDownloadUrl(artifact, window.location.origin, {
-    sessionKey: sessionKey.value,
-    includeSessionKey: false,
-  })
-  if (!url) return
   try {
-    const headers: Record<string, string> = {}
-    const sameOrigin = new URL(url, window.location.origin).origin === window.location.origin
-    if (sameOrigin && sessionKey.value) headers['x-opensquilla-session-key'] = sessionKey.value
-    if (sameOrigin && token) headers.Authorization = `Bearer ${token}`
-    const response = await fetch(url, {
-      method: 'GET',
-      headers,
-      credentials: sameOrigin ? 'same-origin' : 'omit',
+    const result = await artifactWorkbench.content.fetchArtifact(artifact, {
+      sessionKey: sessionKey.value,
     })
-    if (!response.ok) {
-      pushToast(t('chat.toast.downloadFailedHttp', { status: response.status }), { tone: 'danger' })
+    if (!result.ok) {
+      pushToast(t('chat.toast.downloadFailedHttp', { status: result.status }), { tone: 'danger' })
       return
     }
-    const blob = await response.blob()
-    downloadBlob(blob, artifact.name || 'artifact')
+    downloadBlob(result.blob, artifact.name || 'artifact')
   } catch (err) {
     console.warn('Download failed:', err)
     pushToast(t('chat.toast.downloadFailed'), { tone: 'danger' })

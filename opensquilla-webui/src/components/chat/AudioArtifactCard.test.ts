@@ -3,6 +3,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, defineComponent, h, nextTick, ref } from 'vue'
 import i18n from '@/i18n'
 import type { ArtifactPayload } from '@/types/rpc'
+import { ARTIFACT_WORKBENCH_KEY, type ArtifactWorkbench } from '@/modules/artifactWorkbench'
+import { createV4ArtifactContentAccess } from '@/adapters/gateway/artifactAccessV4'
 import AudioArtifactCard from './AudioArtifactCard.vue'
 
 const artifact: ArtifactPayload = {
@@ -29,6 +31,9 @@ async function mountCard(onDownload = vi.fn(), item: ArtifactPayload = artifact)
     onDownload,
   })
   app.use(i18n)
+  app.provide(ARTIFACT_WORKBENCH_KEY, {
+    content: createV4ArtifactContentAccess(),
+  } as ArtifactWorkbench)
   app.mount(el)
   await nextTick()
   return { app, el, onDownload }
@@ -39,6 +44,9 @@ beforeEach(() => {
   document.body.innerHTML = ''
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
+  vi.stubGlobal('sessionStorage', {
+    getItem: vi.fn((key: string) => key === 'opensquilla.wsToken' ? 'secret' : null),
+  })
 })
 
 describe('AudioArtifactCard', () => {
@@ -172,6 +180,9 @@ describe('AudioArtifactCard', () => {
     document.body.appendChild(host)
     const app = createApp(Root)
     app.use(i18n)
+    app.provide(ARTIFACT_WORKBENCH_KEY, {
+      content: createV4ArtifactContentAccess(),
+    } as ArtifactWorkbench)
     app.mount(host)
     await nextTick()
 

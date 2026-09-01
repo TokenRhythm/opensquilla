@@ -1,33 +1,13 @@
 import { computed, ref, watch, type Ref } from 'vue'
 
-import {
-  optionalSessionRpcCallOptions,
-  waitForSessionRpcConnection,
-} from '@/composables/chat/sessionBootstrapAdmission'
-import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
+import type { ArtifactCatalog } from '@/modules/artifactWorkbench'
 import type { ChatMessage } from '@/types/chat'
-import type { ArtifactsListResponse, ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/rpc'
 
-const ARTIFACTS_LIST_METHOD = 'artifacts.list'
 const MAX_ARTIFACT_PAGE_LIMIT = 200
 
-type ArtifactRpc = {
-  waitForConnection: (
-    timeoutMs?: number,
-    signal?: AbortSignal,
-    actions?: RpcConnectionWaitOptions,
-  ) => Promise<void>
-  supportsMethod: (method: string) => boolean
-  markMethodUnavailable: (method: string) => void
-  call: <T = unknown>(
-    method: string,
-    params?: Record<string, unknown>,
-    callOptions?: RpcCallOptions,
-  ) => Promise<T>
-}
-
 export interface UseSessionArtifactsOptions {
-  rpc: ArtifactRpc
+  catalog: ArtifactCatalog
   sessionKey: Ref<string>
   messages: Ref<ChatMessage[]>
   streamArtifacts: Ref<ArtifactPayload[]>
@@ -76,32 +56,13 @@ export function mergeArtifactSources(
   return [...merged.values()]
 }
 
-function responseArtifacts(response: ArtifactsListResponse): ArtifactPayload[] {
-  return Array.isArray(response.artifacts)
-    ? response.artifacts.filter(
-      (artifact): artifact is ArtifactPayload =>
-        !!artifact && typeof artifact === 'object' && !Array.isArray(artifact),
-    )
-    : []
-}
-
-function responseHasMore(response: ArtifactsListResponse): boolean {
-  return Boolean(response.has_more ?? response.hasMore)
-}
-
-function responseOldestCursor(response: ArtifactsListResponse): string | null {
-  const cursor = response.oldest_cursor ?? response.oldestCursor
-  return typeof cursor === 'string' ? cursor : null
-}
-
-function isMethodNotFound(error: unknown): boolean {
-  const code = (error as { code?: unknown } | null)?.code
-  const message = error instanceof Error ? error.message : String(error)
-  return code === 'METHOD_NOT_FOUND' || /method not found/i.test(message)
-}
-
 function isRpcTimeout(error: unknown): boolean {
   return (error as { code?: unknown } | null)?.code === 'RPC_TIMEOUT'
+}
+
+function isArtifactListTimeout(error: unknown): boolean {
+  return isRpcTimeout(error)
+    && (error as { artifactCatalogPhase?: unknown } | null)?.artifactCatalogPhase !== 'connect'
 }
 
 function normalizedPageLimit(value: number | undefined): number {
@@ -191,11 +152,6 @@ export function useSessionArtifacts(options: UseSessionArtifactsOptions) {
     }
     const controller = new AbortController()
     activeRequestController = controller
-    const callOptions: RpcCallOptions = {
-      ...optionalSessionRpcCallOptions,
-      signal: controller.signal,
-    }
-
     const crossedSession = indexedSessionKey !== sessionKey
     if (crossedSession) {
       indexedSessionKey = sessionKey
@@ -208,76 +164,21 @@ export function useSessionArtifacts(options: UseSessionArtifactsOptions) {
       requestId === requestSequence && sessionKey === options.sessionKey.value
 
     try {
-      // Hello owns the method capability list. Wait for it before checking or a
-      // connecting client would look exactly like an older unsupported gateway.
-      await waitForSessionRpcConnection(options.rpc, callOptions)
+      const collected = await options.catalog.listSession(sessionKey, {
+        limit: normalizedPageLimit(options.pageLimit),
+        signal: controller.signal,
+      })
       if (!isCurrentRequest()) return false
-      if (!options.rpc.supportsMethod(ARTIFACTS_LIST_METHOD)) {
-        // A reconnect can temporarily land on an older Gateway. Retain a
-        // successful index for this same Session; a true Session switch already
-        // cleared it above before any asynchronous work began.
+      if (collected === null) {
         indexAvailable.value = false
         return false
       }
-
-      const pageLimit = normalizedPageLimit(options.pageLimit)
-      const visitedCursors = new Set<string>()
-      let before: string | null = null
-      let collected: ArtifactPayload[] = []
-      let pageRequestInFlight = false
-
-      while (true) {
-        const params: Record<string, unknown> = { sessionKey, limit: pageLimit }
-        if (before !== null) params.before = before
-        pageRequestInFlight = true
-        let response: ArtifactsListResponse
-        try {
-          response = await options.rpc.call<ArtifactsListResponse>(
-            ARTIFACTS_LIST_METHOD,
-            params,
-            callOptions,
-          )
-        } catch (error) {
-          // RpcClient recycles the shared socket when this bounded page call
-          // times out. Suppress the reconnect that this request caused, or a
-          // persistently slow artifact directory would create an automatic
-          // timeout/reconnect/list loop. Connection-wait timeouts never pass
-          // through this branch.
-          if (isCurrentRequest() && pageRequestInFlight && isRpcTimeout(error)) {
-            suppressNextReconnectLoad = true
-          }
-          throw error
-        } finally {
-          pageRequestInFlight = false
-        }
-        if (!isCurrentRequest()) return false
-
-        // The endpoint returns the latest page first and each page oldest to
-        // newest. Older pages are prepended while duplicate boundary entries
-        // still merge their fields deterministically.
-        const pageArtifacts = responseArtifacts(response)
-        collected = mergeArtifactSources(pageArtifacts, collected)
-        if (!responseHasMore(response)) break
-
-        const nextCursor = responseOldestCursor(response)
-        if (nextCursor === null || pageArtifacts.length === 0) {
-          throw new Error('Artifact pagination did not provide an advancing cursor')
-        }
-        if (visitedCursors.has(nextCursor)) {
-          throw new Error('Artifact pagination cursor did not advance')
-        }
-        visitedCursors.add(nextCursor)
-        before = nextCursor
-      }
-
       indexedArtifacts.value = collected
       indexAvailable.value = true
       return true
     } catch (error) {
       if (!isCurrentRequest()) return false
-      if (isMethodNotFound(error)) {
-        options.rpc.markMethodUnavailable(ARTIFACTS_LIST_METHOD)
-      }
+      if (isArtifactListTimeout(error)) suppressNextReconnectLoad = true
       // A missing or transiently failed index must never blank the legacy
       // history/live sources. Keep a previous same-session index on refresh
       // errors; crossed Sessions were already cleared synchronously above.
