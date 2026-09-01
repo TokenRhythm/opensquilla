@@ -2541,6 +2541,7 @@ const voiceCapability = useSetupStatus<{ audioConfigured?: boolean }>(injectedSe
 const voiceReady = computed(() => voiceCapability.data.value?.audioConfigured === true)
 
 const chatMessageActions = useChatMessageActions({
+  sessionKey,
   messages,
   inputText,
   isStreaming,

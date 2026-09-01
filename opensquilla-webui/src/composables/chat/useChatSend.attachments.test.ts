@@ -3233,6 +3233,7 @@ describe('useChatSend attachment payloads', () => {
     // terminal closes the live stream.
     harness.stream.endStreaming({ reason: 'aborted' })
     const actions = useChatMessageActions({
+      sessionKey: ref(parentSessionKey),
       messages,
       inputText,
       isStreaming: harness.stream.isStreaming,

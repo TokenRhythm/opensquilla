@@ -66,8 +66,10 @@ function makeOptions(
   ) => string = text => text,
   aiGeneratedLabel?: () => string,
 ) {
+  const sessionKey = ref('agent:main:webchat:A')
   const pendingForkBeforeMessageId = ref<string | null>(null)
   const options: UseChatMessageActionsOptions = {
+    sessionKey,
     messages: ref(messages),
     inputText: ref(''),
     isStreaming: ref(false),
@@ -83,7 +85,7 @@ function makeOptions(
     canDeliver: () => true,
     notifyDeliveryBlocked: vi.fn(),
   }
-  return { api: useChatMessageActions(options), options, pendingForkBeforeMessageId }
+  return { api: useChatMessageActions(options), options, sessionKey, pendingForkBeforeMessageId }
 }
 
 beforeEach(() => {
@@ -200,6 +202,60 @@ describe('useChatMessageActions branching edits', () => {
 
     expect(api.cancelEdit()).toBe(false)
     expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A'])
+  })
+
+  it('drops the restore point across a session switch, including after switching back', () => {
+    const { api, options, sessionKey } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+    ])
+
+    api.editMessage(renderedMessage({
+      role: 'user',
+      displayRole: 'user',
+      sourceIndex: 0,
+      messageId: 'msg-A',
+      text: 'A',
+    }))
+
+    sessionKey.value = 'agent:main:webchat:B'
+    options.messages.value = [
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+    ]
+    options.inputText.value = 'session B draft'
+
+    expect(api.cancelEdit()).toBe(false)
+    expect(options.messages.value.map(message => message.text)).toEqual(['B'])
+    expect(options.inputText.value).toBe('session B draft')
+
+    sessionKey.value = 'agent:main:webchat:A'
+    expect(api.cancelEdit()).toBe(false)
+    expect(options.messages.value.map(message => message.text)).toEqual(['B'])
+    expect(options.inputText.value).toBe('session B draft')
+  })
+
+  it('does not restore after another transcript owner replaces the edit state', () => {
+    const { api, options } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+    ])
+
+    api.editMessage(renderedMessage({
+      role: 'user',
+      displayRole: 'user',
+      sourceIndex: 0,
+      messageId: 'msg-A',
+      text: 'A',
+    }))
+
+    options.messages.value = [
+      { role: 'user', text: 'new owner', ts: null, messageId: 'msg-new' },
+    ]
+    options.inputText.value = 'new owner draft'
+
+    expect(api.cancelEdit()).toBe(false)
+    expect(options.messages.value.map(message => message.text)).toEqual(['new owner'])
+    expect(options.inputText.value).toBe('new owner draft')
   })
 
   it('keeps the newer edit when a second one replaces the first', () => {

@@ -326,6 +326,20 @@ describe('Escape and message edits', () => {
     expect(spies.cancelMessageEdit).toHaveBeenCalledOnce()
   })
 
+  it('offers the cancel before the pending-queue guard', () => {
+    const { api, spies } = harness({
+      inputText: 'B',
+      pendingQueue: QUEUE,
+      cancelMessageEdit: () => true,
+    })
+    const e = keydown({ key: 'Escape', target: field('B', 'end') })
+
+    api.onTextareaKeydown(e)
+
+    expect(spies.cancelMessageEdit).toHaveBeenCalledOnce()
+    expect(e.preventDefault).toHaveBeenCalledOnce()
+  })
+
   it('still clears the draft when there is no edit to cancel', () => {
     const { api, inputText, spies } = harness({ inputText: 'just a draft' })
 

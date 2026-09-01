@@ -123,7 +123,7 @@ export function useChatComposerShortcuts(options: UseChatComposerShortcutsOption
       }
     }
 
-    if (e.key === 'Escape' && !options.isStreaming.value && options.pendingQueue.value.length === 0) {
+    if (e.key === 'Escape') {
       // An uncommitted edit outranks clearing the draft, and is checked before
       // the non-empty-input guard below: emptying the composer by hand must not
       // strand the user in a truncated transcript with no way out.
@@ -132,7 +132,11 @@ export function useChatComposerShortcuts(options: UseChatComposerShortcutsOption
         clearTextareaUndoState()
         return
       }
-      if (options.inputText.value) {
+      if (
+        !options.isStreaming.value
+        && options.pendingQueue.value.length === 0
+        && options.inputText.value
+      ) {
         e.preventDefault()
         clearTextareaUndoState()
         options.inputText.value = ''

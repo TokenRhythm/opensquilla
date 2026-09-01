@@ -1,4 +1,4 @@
-import { nextTick, type Ref } from 'vue'
+import { nextTick, toRaw, watch, type Ref } from 'vue'
 import type {
   ChatMessage,
   ChatRenderedMessage,
@@ -15,6 +15,7 @@ import { sanitizeAssistantPresentationSegments } from '@/utils/chat/silentSentin
 import type { AssistantPresentationProvenance } from '@/utils/chat/silentSentinels'
 
 export interface UseChatMessageActionsOptions {
+  sessionKey: Ref<string>
   messages: Ref<ChatMessage[]>
   inputText: Ref<string>
   isStreaming: Ref<boolean>
@@ -50,6 +51,10 @@ export interface UseChatMessageActionsOptions {
 }
 
 interface EditRestorePoint {
+  /** Session owner; restore points never cross a session boundary. */
+  sessionKey: string
+  /** The exact transcript array installed by this edit. */
+  editingMessages: ChatMessage[]
   /** The transcript as it stood before edit truncated it. */
   messages: ChatMessage[]
   /** Whatever the composer held before edit overwrote it with the message. */
@@ -60,6 +65,13 @@ interface EditRestorePoint {
 
 export function useChatMessageActions(options: UseChatMessageActionsOptions) {
   let editRestorePoint: EditRestorePoint | null = null
+
+  // Session transitions replace the transcript and composer domain. Retire the
+  // old restore point synchronously so even an immediate switch back cannot
+  // revive state captured before the boundary.
+  watch(options.sessionKey, () => {
+    editRestorePoint = null
+  }, { flush: 'sync' })
 
   function copyableMessageText(message: ChatRenderedMessage): string {
     // User bubbles render the raw text with only the time prefix stripped, so
@@ -216,18 +228,21 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
       return
     }
     const text = sourceMessage.text || ''
+    const editingMessages = options.messages.value.slice(0, msgIndex)
     // Everything below this line is undone by `cancelEdit`. Entering edit mode
     // is not a decision the user has confirmed — the transcript shrinks to
     // nothing on the first click, and until #1372 there was no way back:
     // Escape cleared the composer and left the empty state on screen, which
     // reads as the conversation having been deleted.
     editRestorePoint = {
+      sessionKey: options.sessionKey.value,
+      editingMessages,
       messages: options.messages.value,
       inputText: options.inputText.value,
       forkBeforeMessageId,
     }
     options.pendingForkBeforeMessageId.value = forkBeforeMessageId
-    options.messages.value = options.messages.value.slice(0, msgIndex)
+    options.messages.value = editingMessages
     options.inputText.value = text
     options.autoResizeTextarea()
     options.focusComposer()
@@ -249,7 +264,11 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     const restore = editRestorePoint
     if (!restore) return false
     editRestorePoint = null
-    if (options.pendingForkBeforeMessageId.value !== restore.forkBeforeMessageId) {
+    if (
+      options.sessionKey.value !== restore.sessionKey
+      || toRaw(options.messages.value) !== restore.editingMessages
+      || options.pendingForkBeforeMessageId.value !== restore.forkBeforeMessageId
+    ) {
       return false
     }
     options.pendingForkBeforeMessageId.value = null
