@@ -7,11 +7,6 @@ export type SandboxSetupOutcome =
   | 'failed'
   | 'verification_failed'
 
-export type SandboxSetupCall = (
-  method: string,
-  params?: Record<string, unknown>,
-) => Promise<unknown>
-
 export interface SandboxSetupOperations {
   ensureSetup: () => Promise<unknown>
   setupStatus: () => Promise<unknown>
@@ -41,7 +36,7 @@ export function normalizeSandboxSetupStatus(payload: unknown): SandboxSetupStatu
 }
 
 export async function ensureSandboxReady(
-  operations: SandboxSetupCall | SandboxSetupOperations,
+  operations: SandboxSetupOperations,
   verifyCapability: (() => Promise<Pick<SandboxCapabilityReport, 'available'> | null>) | null = null,
   waitForConnection: SandboxSetupConnectionWait | null = null,
 ): Promise<SandboxSetupResult> {
@@ -55,9 +50,7 @@ export async function ensureSandboxReady(
     }
     const report = verifyCapability
       ? await verifyCapability()
-      : typeof operations === 'function'
-        ? await operations('sandbox.capability.status', { refresh: true }) as { available?: unknown }
-        : await operations.capability()
+      : await operations.capability()
     return report?.available === true
       ? { ready: true, status, outcome: 'ready' }
       : { ready: false, status, outcome: 'verification_failed' }
@@ -65,7 +58,7 @@ export async function ensureSandboxReady(
 
   try {
     const status = normalizeSandboxSetupStatus(
-      await (typeof operations === 'function' ? operations('sandbox.setup.ensure') : operations.ensureSetup()),
+      await operations.ensureSetup(),
     )
     if (!status) return { ready: false, status: null, outcome: 'failed' }
     return await finish(status)
@@ -77,7 +70,7 @@ export async function ensureSandboxReady(
       // for authoritative state instead of making the user repeat UAC.
       await waitForConnection()
       const status = normalizeSandboxSetupStatus(
-        await (typeof operations === 'function' ? operations('sandbox.setup.status') : operations.setupStatus()),
+        await operations.setupStatus(),
       )
       if (!status) return { ready: false, status: null, outcome: 'failed' }
       return await finish(status)

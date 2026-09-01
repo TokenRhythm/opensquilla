@@ -32,6 +32,8 @@ import { CRON_SCHEDULER_KEY } from './modules/cronScheduler'
 import { ARTIFACT_WORKBENCH_KEY } from './modules/artifactWorkbench'
 import { CHANNEL_ADMINISTRATION_KEY } from './modules/channelAdministration'
 import { CHANNEL_SETUP_KEY } from './modules/channelSetup'
+import { MEMORY_PROFILE_IMPORT_KEY } from './modules/memoryProfileImport'
+import { AUDIO_TRANSCRIPTION_KEY } from './modules/audioTranscription'
 import 'katex/dist/katex.min.css'
 import './assets/base.css'
 import './themes/tokens' // eagerly bundles every value theme's token block
@@ -94,6 +96,8 @@ app.provide(CRON_SCHEDULER_KEY, gatewayAdapters.cronScheduler)
 app.provide(CHANNEL_ADMINISTRATION_KEY, gatewayAdapters.channelAdministration)
 app.provide(CHANNEL_SETUP_KEY, gatewayAdapters.channelSetup)
 app.provide(ARTIFACT_WORKBENCH_KEY, gatewayAdapters.artifactWorkbench)
+app.provide(MEMORY_PROFILE_IMPORT_KEY, gatewayAdapters.memoryProfileImport)
+app.provide(AUDIO_TRANSCRIPTION_KEY, gatewayAdapters.audioTranscription)
 router.afterEach(() => {
   rpcStore.applyLinkTokenFromUrl()
 })

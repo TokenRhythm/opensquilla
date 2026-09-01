@@ -98,6 +98,8 @@ async function mountPanel(options: {
 
   const { createApp, nextTick } = await import('vue')
   const i18n = (await import('@/i18n')).default
+  const { MEMORY_PROFILE_IMPORT_KEY } = await import('@/modules/memoryProfileImport')
+  const { createV4MemoryProfileImport } = await import('@/adapters/gateway/memoryProfileImportV4')
   i18n.global.locale.value = 'en'
   const Component = (await import('./SettingsMemoryPanel.vue')).default
   const el = document.createElement('div')
@@ -109,6 +111,17 @@ async function mountPanel(options: {
   document.body.appendChild(el)
   const app = createApp(Component)
   app.use(i18n)
+  app.provide(MEMORY_PROFILE_IMPORT_KEY, createV4MemoryProfileImport({
+    ready: async () => rpc.waitForConnection(),
+    supports: rpc.supportsMethod,
+    markUnsupported: rpc.markMethodUnavailable,
+    request: async <T = unknown>(method: string, params?: Record<string, unknown>) => (
+      await (call as unknown as (
+        method: string,
+        params?: Record<string, unknown>,
+      ) => Promise<unknown>)(method, params)
+    ) as T,
+  }))
   app.mount(el)
   mounted.push({ app, el })
   await settle()

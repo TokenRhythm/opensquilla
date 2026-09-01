@@ -3,8 +3,10 @@ import type {
   GatewayLogBatch,
   GatewayLogEntry,
   GatewayLogStatus,
+  GatewayStatus,
   Observability,
   ReadinessReport,
+  SelfLearningStatus,
   UpdateNotice,
 } from '@/modules/observability'
 import type {
@@ -47,6 +49,8 @@ const USAGE_STATUS_METHOD = 'usage.status'
 const DOCTOR_STATUS_METHOD = 'doctor.status'
 const LOGS_STATUS_METHOD = 'logs.status'
 const LOGS_TAIL_METHOD = 'logs.tail'
+const GATEWAY_STATUS_METHOD = 'status'
+const SELF_LEARNING_STATUS_METHOD = 'router.selflearning.status'
 
 const callOptions = (signal?: AbortSignal): RpcCallOptions => ({
   timeoutMs: 15_000,
@@ -113,6 +117,22 @@ function updateNotice(value: unknown): UpdateNotice | null | undefined {
 
 export function createV4Observability(rpc: RpcTransport, http: HttpTransport): Observability {
   return {
+    async gatewayStatus(options) {
+      await rpc.ready({ signal: options?.signal })
+      return asRecord(await rpc.request(
+        GATEWAY_STATUS_METHOD,
+        {},
+        callOptions(options?.signal),
+      )) as GatewayStatus
+    },
+    async selfLearningStatus(options) {
+      await rpc.ready({ signal: options?.signal })
+      return asRecord(await rpc.request(
+        SELF_LEARNING_STATUS_METHOD,
+        {},
+        callOptions(options?.signal),
+      )) as SelfLearningStatus
+    },
     async usage(range, options = {}) {
       await rpc.ready({ signal: options.signal })
       const timezone = options.timezone || browserTimeZone()

@@ -152,6 +152,29 @@ describe('transport architecture gate ledger integration', () => {
     })
   })
 
+  it('exempts only the constrained platform static-asset reader from HTTP debt', () => {
+    const root = fixture({
+      'src/platform/staticAssets.ts': `
+        export async function readStaticJson(path: string) {
+          const url = new URL(path, location.href)
+          if (url.origin !== location.origin || url.pathname.startsWith('/api/')) return null
+          return await fetch(url)
+        }
+      `,
+      'src/composables/copiedAssetReader.ts': `
+        export async function copied(path: string) {
+          return await fetch(path)
+        }
+      `,
+    })
+    const result = evaluateRpcArchitectureGate({ root, debtLanes: [] })
+
+    expect(result.failures).toContain(
+      'src/composables/copiedAssetReader.ts: unexpected raw transport httpRequest (1); add a domain Adapter instead.',
+    )
+    expect(result.failures.some(failure => failure.includes('src/platform/staticAssets.ts'))).toBe(false)
+  })
+
   it('rejects an Adapter that bypasses the private transport composition', () => {
     const root = fixture({
       'src/stores/rpc.ts': 'export function useRpcStore(): any { return {} }',

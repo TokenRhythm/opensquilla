@@ -21,6 +21,38 @@ export interface ReadinessReport {
   readonly [key: string]: unknown
 }
 
+export interface GatewayStatus {
+  readonly uptime_ms?: number
+  readonly version?: string
+  readonly provider?: string
+  readonly [key: string]: unknown
+}
+
+export interface SelfLearningStatus {
+  enabled?: boolean
+  captureEnabled?: boolean
+  trainingReachable?: boolean
+  dream?: { enabled?: boolean; autoSchedule?: boolean; killSwitchActive?: boolean }
+  activeModel?: { kind?: string; version?: string | null; promotedAt?: string | null }
+  samples?: {
+    total?: number
+    highValue?: number
+    requiredHighValue?: number
+    complaintRate?: number
+    lastCapturedAt?: string | null
+    feedback?: { up?: number; down?: number; downSingle?: number }
+  } | null
+  gate?: {
+    wouldTrain?: boolean
+    reason?: string
+    lastAttemptAt?: string | null
+    lastTrainedAt?: string | null
+    killSwitchActive?: boolean
+  } | null
+  lastReceipt?: { kind?: string; version?: string | null; reason?: string | null } | null
+  error?: string
+}
+
 export interface GatewayLogStatus {
   readonly gateway_file_log?: {
     readonly enabled?: boolean
@@ -68,6 +100,8 @@ export interface SupportBundle {
 }
 
 export interface Observability {
+  gatewayStatus(options?: { readonly signal?: AbortSignal }): Promise<GatewayStatus>
+  selfLearningStatus(options?: { readonly signal?: AbortSignal }): Promise<SelfLearningStatus>
   usage(
     range: UsageRangeSelection,
     options?: UsageSnapshotOptions,

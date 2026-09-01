@@ -113,6 +113,7 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
   const rpc = {
     call: vi.fn().mockResolvedValue({ sessionKey: 'agent:main:webchat:test' }),
   }
+  const metaDiscardDraft = vi.fn().mockResolvedValue({ discarded: true, accepted: false })
   const turnCommands = overrides.turnCommands ?? createV4TurnCommandsFromRpcClient(
     rpc as unknown as UseChatSendOptions['rpc'],
   )
@@ -168,6 +169,7 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
   const options: UseChatSendOptions = {
     rpc,
     turnCommands,
+    metaRunCenter: overrides.metaRunCenter ?? { discardDraft: metaDiscardDraft },
     inputText: ref('hello'),
     messages,
     sessionKey: ref('agent:main:webchat:test'),
@@ -214,7 +216,7 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
       options.supportsMethod,
     )
   }
-  return { api: useChatSend(options), options, rpc, stream, pendingQueue }
+  return { api: useChatSend(options), options, rpc, stream, pendingQueue, metaDiscardDraft }
 }
 
 function sameTurnSteerOptions(
@@ -1691,7 +1693,7 @@ describe('useChatSend attachment payloads', () => {
     )).toHaveLength(1)
 
     first.api.discardHiddenControl('agent:main:webchat:test', 'discarded-meta-request')
-    expect(first.rpc.call).toHaveBeenCalledWith('meta.drafts.discard', {
+    expect(first.metaDiscardDraft).toHaveBeenCalledWith({
       sessionKey: 'agent:main:webchat:test',
       clientRequestId: 'discarded-meta-request',
     })
@@ -1720,7 +1722,7 @@ describe('useChatSend attachment payloads', () => {
       '/meta meta-short-drama -- never launch after cancel',
       'lost-discard-response',
     )
-    first.rpc.call.mockRejectedValueOnce(new Error('response lost'))
+    first.metaDiscardDraft.mockRejectedValueOnce(new Error('response lost'))
     first.api.discardHiddenControl('agent:main:webchat:test', 'lost-discard-response')
     await Promise.resolve()
 
@@ -1730,14 +1732,14 @@ describe('useChatSend attachment payloads', () => {
       hiddenControlStorage: memoryStorage(),
       metaDiscardStorage: persistentDiscardStorage,
     })
-    remounted.rpc.call.mockResolvedValue({ discarded: true })
+    remounted.metaDiscardDraft.mockResolvedValue({ discarded: true, accepted: false })
     await expect(remounted.api.flushPendingMetaDiscards(
       'agent:main:webchat:test',
     )).resolves.toEqual([])
     await remounted.api.restoreHiddenControls('agent:main:webchat:test')
 
-    expect(remounted.rpc.call).toHaveBeenCalledTimes(1)
-    expect(remounted.rpc.call).toHaveBeenCalledWith('meta.drafts.discard', {
+    expect(remounted.metaDiscardDraft).toHaveBeenCalledTimes(1)
+    expect(remounted.metaDiscardDraft).toHaveBeenCalledWith({
       sessionKey: 'agent:main:webchat:test',
       clientRequestId: 'lost-discard-response',
     })
@@ -1757,14 +1759,14 @@ describe('useChatSend attachment payloads', () => {
       hiddenControlStorage: memoryStorage(),
       metaDiscardStorage: persistentDiscardStorage,
     })
-    remounted.rpc.call.mockResolvedValue({ discarded: false, accepted: true })
+    remounted.metaDiscardDraft.mockResolvedValue({ discarded: false, accepted: true })
 
     await expect(remounted.api.flushPendingMetaDiscards(
       'agent:main:webchat:test',
     )).resolves.toEqual([])
     await remounted.api.restoreHiddenControls('agent:main:webchat:test')
 
-    expect(remounted.rpc.call).toHaveBeenCalledTimes(1)
+    expect(remounted.metaDiscardDraft).toHaveBeenCalledTimes(1)
     expect(remounted.rpc.call).not.toHaveBeenCalledWith('chat.send', expect.anything())
     expect(listPendingMetaDiscards(
       'agent:main:webchat:test',

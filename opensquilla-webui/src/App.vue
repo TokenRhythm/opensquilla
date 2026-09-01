@@ -1467,10 +1467,7 @@ async function onProjectRemove(workspaceId: string) {
   if (!project) return
   let affectedCronJobs = 0
   try {
-    const jobs = await rpcStore.call<Array<{ workspaceId?: string }>>(
-      'cron.list',
-      {},
-    )
+    const jobs = await cronScheduler.listJobs()
     affectedCronJobs = (jobs || []).filter(
       job => job.workspaceId === workspaceId,
     ).length

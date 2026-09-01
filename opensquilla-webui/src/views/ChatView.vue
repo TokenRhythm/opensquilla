@@ -944,7 +944,6 @@ import {
   claimSessionBootstrapAdmission,
   optionalSessionRpcAllowed,
   optionalSessionRpcCallOptions,
-  runModeWriteRpcCallOptions,
 } from '@/composables/chat/sessionBootstrapAdmission'
 import { useChatSessionRuntime } from '@/composables/chat/useChatSessionRuntime'
 import {
@@ -969,6 +968,7 @@ import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
 import { useChatUsageWidget } from '@/composables/chat/useChatUsageWidget'
 import { useSessionArtifacts } from '@/composables/chat/useSessionArtifacts'
 import { useVoiceInput } from '@/composables/chat/useVoiceInput'
+import { AUDIO_TRANSCRIPTION_KEY } from '@/modules/audioTranscription'
 import { navigateMetaSetupProviderSettings } from '@/composables/chat/metaSetupProviderNavigation'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { hasOpenDialogLayer } from '@/composables/useDialogA11y'
@@ -1217,6 +1217,9 @@ if (!injectedSessionConversation) throw new Error('SessionConversation was not p
 const sessionConversation: SessionConversation = injectedSessionConversation
 const injectedProviderConfiguration = inject(PROVIDER_CONFIGURATION_KEY)
 const injectedSandboxRuntime = inject(SANDBOX_RUNTIME_KEY)
+if (!injectedSandboxRuntime) throw new Error('SandboxRuntime was not provided')
+const injectedAudioTranscription = inject(AUDIO_TRANSCRIPTION_KEY)
+if (!injectedAudioTranscription) throw new Error('AudioTranscription was not provided')
 if (!injectedProviderConfiguration) throw new Error('ProviderConfiguration was not provided')
 const injectedSetupWorkflow = inject(SETUP_WORKFLOW_KEY)
 if (!injectedSetupWorkflow) throw new Error('SetupWorkflow was not provided')
@@ -1584,6 +1587,7 @@ const copySupported = shareCopyImageSupported()
 
 const chatElevatedMode = useChatElevatedMode({
   sessionKey,
+  approvalCenter,
 })
 // Persist the composer draft per session so a refresh / session switch / crash
 // before the backend accepts a send cannot silently lose typed text (issue 248).
@@ -1602,10 +1606,7 @@ const {
   setGlobalRunMode,
   applyRunModePreferenceChanged,
 } = useChatRunModePreference({
-  rpc,
   sandbox: injectedSandboxRuntime,
-  hydrateCallOptions: optionalSessionRpcCallOptions,
-  writeCallOptions: runModeWriteRpcCallOptions,
   runModePolicy: () => {
     const auth = rpc.auth as RpcAuthPayload | null
     return auth?.runModePolicy
@@ -2510,7 +2511,7 @@ const {
   cleanup: cleanupSessionArtifacts,
 } = chatSessionArtifacts
 
-const voiceInput = useVoiceInput()
+const voiceInput = useVoiceInput(injectedAudioTranscription)
 const {
   voiceBusy,
   voiceRecording,
@@ -3298,6 +3299,7 @@ resetComposerInputHistory = chatComposerShortcuts.resetInputHistory
 
 const chatSend = useChatSend({
   rpc,
+  metaRunCenter,
   turnCommands,
   activeSteerCapability,
   inputText,

@@ -52,6 +52,7 @@ function approvalHarness(statusResponse: Record<string, unknown> = {
   const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map())
   const approvals = useChatApprovals({
     approvalCenter: {
+      setElevatedMode: vi.fn(async () => undefined),
       snapshot: vi.fn(async () => ({ pending: [], mode: 'prompt' as const })),
       status: vi.fn(async () => ({
         id: 'approval-1', namespace: 'exec' as const, pending: statusResponse.pending === true,

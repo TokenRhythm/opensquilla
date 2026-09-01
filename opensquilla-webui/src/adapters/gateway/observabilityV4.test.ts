@@ -15,6 +15,19 @@ function transport(call: ReturnType<typeof vi.fn>, supports = true) {
 }
 
 describe('v4 Observability Adapter', () => {
+  it('owns Gateway and self-learning status methods', async () => {
+    const call = vi.fn(async (method: string) => ({ method, ready: true }))
+    const adapter = createV4Observability(
+      transport(call).value as Parameters<typeof createV4Observability>[0],
+      { requestJson: vi.fn(), requestBinary: vi.fn() },
+    )
+
+    await expect(adapter.gatewayStatus()).resolves.toMatchObject({ ready: true })
+    await expect(adapter.selfLearningStatus()).resolves.toMatchObject({ ready: true })
+    expect(call).toHaveBeenNthCalledWith(1, 'status', {}, expect.any(Object))
+    expect(call).toHaveBeenNthCalledWith(2, 'router.selflearning.status', {}, expect.any(Object))
+  })
+
   it('projects usage.query and preserves the semantic range request', async () => {
     const call = vi.fn(async () => ({
       schemaVersion: 1,

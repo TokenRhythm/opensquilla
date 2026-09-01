@@ -12,7 +12,7 @@ import type { SandboxRuntime } from '@/modules/sandboxRuntime'
 
 interface SandboxTransport {
   request<T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions): Promise<T>
-  ready?: (options?: { timeoutMs?: number }) => Promise<void>
+  ready?: (options?: { timeoutMs?: number; signal?: AbortSignal }) => Promise<void>
   subscribe?: (event: string, handler: (payload: unknown) => void) => { close(): void }
 }
 
@@ -70,9 +70,13 @@ function runtimeStatus(value: unknown): SandboxRuntimePackStatus | null {
 }
 
 export function createV4SandboxRuntime(transport: SandboxTransport): SandboxRuntime {
-  const request = async <T>(method: string, params?: Record<string, unknown>) => {
-    if (transport.ready) await transport.ready({ timeoutMs: 15_000 })
-    return await transport.request<T>(method, params, options())
+  const request = async <T>(method: string, params?: Record<string, unknown>, requestOptions?: { timeoutMs?: number; signal?: AbortSignal }) => {
+    if (transport.ready) await transport.ready({ timeoutMs: requestOptions?.timeoutMs ?? 15_000, signal: requestOptions?.signal })
+    return await transport.request<T>(method, params, {
+      ...options(),
+      ...(requestOptions?.timeoutMs !== undefined ? { timeoutMs: requestOptions.timeoutMs } : {}),
+      ...(requestOptions?.signal ? { signal: requestOptions.signal } : {}),
+    })
   }
 
   return {
@@ -87,11 +91,11 @@ export function createV4SandboxRuntime(transport: SandboxTransport): SandboxRunt
     async updatePolicy(basePolicyVersion, policy) {
       return await request<SandboxPolicy>(METHODS.policyUpdate, { basePolicyVersion, policy })
     },
-    async runModePreference() {
-      return await request<{ runMode: SandboxRunMode; source?: string }>(METHODS.runModeGet)
+    async runModePreference(requestOptions) {
+      return await request<{ runMode: SandboxRunMode; source?: string }>(METHODS.runModeGet, undefined, requestOptions)
     },
-    async setRunMode(mode) {
-      return await request<{ runMode: SandboxRunMode; source?: string }>(METHODS.runModeSet, { runMode: mode })
+    async setRunMode(mode, requestOptions) {
+      return await request<{ runMode: SandboxRunMode; source?: string }>(METHODS.runModeSet, { runMode: mode }, requestOptions)
     },
     subscribeRunModePreferenceChanged(handler) {
       if (!transport.subscribe) return () => undefined

@@ -81,6 +81,9 @@ async function mountOverview(options: MountOptions = {}) {
     params?: unknown,
     callOptions?: { signal?: AbortSignal },
   ) => {
+    if (method === 'status') {
+      return { ready: true, version: 'test' }
+    }
     if (method === 'doctor.status') {
       if (options.report === null) throw new Error('doctor unavailable')
       if (options.doctorHandler) {
@@ -125,22 +128,6 @@ async function mountOverview(options: MountOptions = {}) {
       markMethodUnavailable: vi.fn(),
     }),
   }))
-  const useRequestMethods: string[] = []
-  vi.doMock('@/composables/useRequest', async () => {
-    const { ref } = await import('vue')
-    return {
-      useRequest: (method: string) => {
-        useRequestMethods.push(method)
-        return {
-          data: ref(null),
-          error: ref(null),
-          loading: ref(false),
-          execute: vi.fn(async () => null),
-          refresh: vi.fn(async () => null),
-        }
-      },
-    }
-  })
   vi.doMock('@/composables/useToasts', () => ({ useToasts: () => ({ pushToast }) }))
   vi.doMock('@/utils/browser', () => ({ copyTextWithFallback: copyText }))
   vi.doMock('@/components/Icon.vue', () => ({
@@ -260,7 +247,6 @@ async function mountOverview(options: MountOptions = {}) {
     copyText,
     rpcCall,
     rpcOn,
-    useRequestMethods,
     flush,
     setActive,
     unmount,
@@ -281,7 +267,6 @@ afterEach(() => {
   }
   vi.doUnmock('vue-router')
   vi.doUnmock('@/stores/rpc')
-  vi.doUnmock('@/composables/useRequest')
   vi.doUnmock('@/composables/useToasts')
   vi.doUnmock('@/utils/browser')
   vi.doUnmock('@/components/Icon.vue')
@@ -297,13 +282,13 @@ const DIAGNOSE_SELECTOR = '[title="Diagnose with agent"]'
 
 describe('OverviewView status lifecycle', () => {
   it('drops the old activity panels and their data sources', async () => {
-    const { el, rpcCall, rpcOn, useRequestMethods } = await mountOverview()
+    const { el, rpcCall, rpcOn } = await mountOverview()
 
     expect(el.querySelector('.ov-grid')).toBeNull()
     expect(el.querySelector('.ov-recent')).toBeNull()
     expect(el.querySelector('.conn-pill')).toBeNull()
     expect(el.querySelector('.ov-event-log')).toBeNull()
-    expect(useRequestMethods).toEqual(['status'])
+    expect(rpcCall).toHaveBeenCalledWith('status', {}, expect.any(Object))
     // The Total sessions KPI reads sessions.list (same source as the Sessions
     // page) so sessions without usage records still count.
     const sessionsListCalls = rpcCall.mock.calls.filter(
