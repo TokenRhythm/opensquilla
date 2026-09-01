@@ -3140,8 +3140,18 @@ class TestSessionsSend:
             def __init__(self) -> None:
                 self.records: dict[str, AgentTaskRecord] = {}
                 self.turn_context_updates: list[tuple[str, str, dict[str, Any]]] = []
+                self.owner_cas_calls: list[tuple[str | None, int | None]] = []
 
-            async def create_agent_task(self, record: AgentTaskRecord) -> None:
+            async def create_agent_task(
+                self,
+                record: AgentTaskRecord,
+                *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None,
+            ) -> None:
+                self.owner_cas_calls.append(
+                    (expected_session_id, expected_session_epoch)
+                )
                 self.records[record.task_id] = record
 
             async def update_agent_task(self, task_id: str, **kwargs: Any) -> None:
@@ -3223,6 +3233,10 @@ class TestSessionsSend:
         assert first.payload["task_id"] == first.payload["turn_id"]
         assert second.payload["task_id"] == second.payload["turn_id"]
         assert second.payload["turn_id"] == first.payload["turn_id"]
+        assert runtime_storage.owner_cas_calls == [
+            (None, None),
+            (session.session_id, session.epoch),
+        ]
         assert runtime_storage.turn_context_updates[-1][2] == {
             "turn_id": first.payload["turn_id"],
             "client_request_id": "request-collect-2",
