@@ -54,10 +54,17 @@ import type { MemoryProfileImport } from '@/modules/memoryProfileImport'
 import { createV4MemoryProfileImport } from './memoryProfileImportV4'
 import type { AudioTranscription } from '@/modules/audioTranscription'
 import { createV4AudioTranscription } from './audioTranscriptionV4'
+import type { GatewayAccess } from '@/modules/gatewayAccess'
+import { createV4GatewayAccess } from './gatewayAccessV4'
+import type { ConversationEvents } from '@/modules/conversationEvents'
+import { createConversationEventTransport } from './conversationEventTransport'
 
 type RpcStoreTransportSource = Parameters<typeof createPrivateGatewayTransports>[0]
+  & Parameters<typeof createV4GatewayAccess>[0]
 
 export interface GatewayAdapters {
+  readonly gatewayAccess: GatewayAccess
+  readonly conversationEvents: ConversationEvents
   readonly sessionDirectory: SessionDirectory
   readonly sessionDirectoryChanges: SessionDirectoryChanges
   readonly sessionLifecycle: SessionLifecycle
@@ -109,7 +116,15 @@ export function createGatewayAdapters(
     },
   }
   const sessionDirectory = createV4SessionDirectory(transports.rpc)
+  const conversationEvents = createConversationEventTransport({
+    on(event, handler) {
+      const subscription = transports.events.subscribe(event, handler)
+      return () => subscription.close()
+    },
+  })
   const adapters: GatewayAdapters = {
+    gatewayAccess: createV4GatewayAccess(source),
+    conversationEvents,
     sessionDirectory,
     sessionDirectoryChanges: createV4SessionDirectoryChanges(
       transports.rpc,

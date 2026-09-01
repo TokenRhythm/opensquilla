@@ -23,7 +23,7 @@ type RpcCall = (method: string, params?: Record<string, unknown>) => Promise<any
 
 function catalogFromCall(
   call: RpcCall,
-  supportsMethod: (method: string) => boolean = () => false,
+  hasRpcMethod: (method: string) => boolean = () => false,
 ): SkillCatalog {
   return {
     list: async () => (await call('skills.list', { includeLifecycle: true })).skills || [],
@@ -49,7 +49,7 @@ function catalogFromCall(
         ? { force: true, riskConfirmation: request.riskConfirmation }
         : {}),
     }),
-    supportsInstallCancellation: () => supportsMethod('skills.install.cancel'),
+    supportsInstallCancellation: () => hasRpcMethod('skills.install.cancel'),
     cancelInstall: operationId => call('skills.install.cancel', { operationId }),
     installDependencies: request => call('skills.deps.install', {
       name: request.name,
@@ -77,21 +77,21 @@ function catalogFromCall(
   }
 }
 
-function asCatalog(source: SkillCatalog | { call: RpcCall; supportsMethod?: (method: string) => boolean }) {
+function asCatalog(source: SkillCatalog | { call: RpcCall; hasRpcMethod?: (method: string) => boolean }) {
   return 'call' in source
-    ? catalogFromCall(source.call, source.supportsMethod)
+    ? catalogFromCall(source.call, source.hasRpcMethod)
     : source
 }
 
 function useSkillRegistry(
-  source: SkillCatalog | { call: RpcCall; supportsMethod?: (method: string) => boolean },
+  source: SkillCatalog | { call: RpcCall; hasRpcMethod?: (method: string) => boolean },
   ...rest: Parameters<typeof useSkillRegistryModel> extends [unknown, ...infer Tail] ? Tail : never
 ) {
   return useSkillRegistryModel(asCatalog(source), ...rest)
 }
 
 function useSkillProposals(
-  source: SkillCatalog | { call: RpcCall; supportsMethod?: (method: string) => boolean },
+  source: SkillCatalog | { call: RpcCall; hasRpcMethod?: (method: string) => boolean },
   ...rest: Parameters<typeof useSkillProposalsModel> extends [unknown, ...infer Tail] ? Tail : never
 ) {
   return useSkillProposalsModel(asCatalog(source), ...rest)
@@ -281,7 +281,7 @@ describe('useSkillRegistry install state', () => {
     const loadData = vi.fn(async () => true)
     const registry = useSkillRegistry({
       call,
-      supportsMethod: (method: string) => method === 'skills.install.cancel',
+      hasRpcMethod: (method: string) => method === 'skills.install.cancel',
     } as never, loadData)
     registry.githubUrl.value = [
       'https://github.com/acme/one',
@@ -323,7 +323,7 @@ describe('useSkillRegistry install state', () => {
     const loadData = vi.fn(async () => true)
     const registry = useSkillRegistry({
       call,
-      supportsMethod: (method: string) => method === 'skills.install.cancel',
+      hasRpcMethod: (method: string) => method === 'skills.install.cancel',
     } as never, loadData)
     registry.githubUrl.value = [
       'https://github.com/acme/one',

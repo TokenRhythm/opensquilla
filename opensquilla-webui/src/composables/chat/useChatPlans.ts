@@ -8,7 +8,7 @@ import type {
   PlanRevisionSnapshot,
   PlanRunSnapshot,
 } from '@/types/plans'
-import type { SessionMessagesSubscribeResponse } from '@/types/rpc'
+import type { SessionMessagesSubscribeResponse } from '@/modules/sessionConversation'
 import type { PlanCenter } from '@/modules/planCenter'
 import { createClientRequestId } from '@/utils/chat/messageIdentity'
 import {

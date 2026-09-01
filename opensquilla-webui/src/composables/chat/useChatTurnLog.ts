@@ -5,7 +5,7 @@ import type {
   ChatToolCallGroup,
 } from '@/types/chat'
 import type { InterruptViewState } from '@/types/parts'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import type { Frame, FrameInput } from '@/types/turnlog'
 import { TurnAccumulator, type FoldedTurn } from '@/utils/chat/foldTurn'
 import { diffFoldVsLegacy } from '@/composables/chat/turnParity'

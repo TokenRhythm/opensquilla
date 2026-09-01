@@ -1,7 +1,467 @@
-import type { ArtifactPayload } from './rpc'
-import type { SessionSteerV2Params } from './rpc'
+import type { ArtifactPayload } from './artifacts'
 import type { PromptAnnotationSnapshot } from './promptAnnotations'
 import type { IconName } from '@/utils/icons'
+
+export interface RawSessionTask {
+  status?: string
+  task_id?: string
+  taskId?: string
+  turn_id?: string
+  turnId?: string
+  started_at?: number | string
+  startedAt?: number | string
+  finished_at?: number | string
+  finishedAt?: number | string
+  turn_outcome?: Record<string, unknown>
+  turnOutcome?: Record<string, unknown>
+  document_mutation_outcome?: Record<string, unknown>
+  documentMutationOutcome?: Record<string, unknown>
+  steer_capability?: ChatSteerCapability
+  steerCapability?: ChatSteerCapability
+}
+
+export interface StreamEventEnvelope {
+  key?: string
+  session_key?: string
+  sessionKey?: string
+  epoch?: number
+  stream_generation?: string
+  streamGeneration?: string
+  generation_epoch?: number
+  generationEpoch?: number
+  assistant_message_id?: string
+  assistantMessageId?: string
+  stream_seq?: number
+  [key: string]: unknown
+}
+
+export interface SessionEventPayload extends StreamEventEnvelope {
+  task_id?: string
+  taskId?: string
+  turn_id?: string
+  turnId?: string
+  started_at?: number
+  emitted_at?: number
+  reason?: string
+  status?: string
+  run_status?: string
+  runStatus?: string
+  terminal_message?: string
+  terminal_reason?: string
+  message?: string
+  code?: string
+  group_id?: string
+  to_state?: string
+  toState?: string
+  active_task?: RawSessionTask | null
+  last_task?: RawSessionTask | null
+  [key: string]: unknown
+}
+
+export interface AnswerGenerationResetPayload extends SessionEventPayload {
+  kind?: 'answer_generation_reset'
+  old_generation_epoch?: number
+  oldGenerationEpoch?: number
+  new_generation_epoch?: number
+  newGenerationEpoch?: number
+  preserve_completed_tools?: boolean
+  preserveCompletedTools?: boolean
+  authoritative_text_snapshot?: string
+  authoritativeTextSnapshot?: string
+  authoritative_reasoning_snapshot?: string
+  authoritativeReasoningSnapshot?: string
+  sequence?: number
+  terminal?: boolean
+  terminal_text_snapshot?: string | null
+  terminalTextSnapshot?: string | null
+}
+
+export interface WarningPayload extends SessionEventPayload {
+  message?: string
+  code?: string
+}
+
+/** Content-free invalidation signal for one stable Artifact IDE document. */
+export interface ArtifactStateEventPayload extends SessionEventPayload {
+  artifactEventSeq?: number
+  documentId?: string
+  revisionId?: string | null
+  changeSetId?: string | null
+  action?: string
+}
+
+export type ProviderActivityPhase =
+  | 'requesting'
+  | 'reasoning'
+  | 'retry_wait'
+  | 'retrying'
+  | 'fallback'
+
+export type ProviderActivityReason =
+  | 'initial'
+  | 'rate_limited'
+  | 'provider_overloaded'
+  | 'transport_transient'
+  | 'reasoning_only'
+  | 'empty_response'
+  | 'stream_incomplete'
+  | 'invalid_response'
+  | 'context_overflow'
+  | 'unknown'
+
+export interface ProviderActivityPayload extends SessionEventPayload {
+  schema_version?: 1
+  activity_id?: string
+  phase?: ProviderActivityPhase
+  reason?: ProviderActivityReason
+  retry_attempt?: number
+  retry_limit?: number
+  retry_after_ms?: number
+  started_at?: number
+  heartbeat?: boolean
+}
+
+export interface CronResultMessagePayload {
+  role?: string
+  text?: string
+  timestamp?: string | number | null
+  messageId?: string
+  message_id?: string
+  provenanceKind?: string
+  provenanceSourceTool?: string
+  provenanceSourceSessionKey?: string
+}
+
+export type CronResultPayload = StreamEventEnvelope & {
+  message?: CronResultMessagePayload
+}
+
+export interface SubagentCompletionPayload extends SessionEventPayload {
+  type?: 'subagent_completion'
+  parent_session_key?: string
+  child_session_key?: string
+  status?: string
+  terminal_reason?: string
+  message_id?: string
+  messageId?: string
+  result?: { text?: string; [key: string]: unknown }
+}
+
+export interface ApprovalStatusPayload {
+  found?: boolean
+  id?: string
+  namespace?: string
+  pending?: boolean
+  resolved?: boolean
+  approved?: boolean
+  resolution?: string
+  resolutionInProgress?: boolean
+  consumed?: boolean
+  deadline?: number
+}
+
+export interface TextDeltaPayload extends SessionEventPayload {
+  text?: string
+  /** Gateway-owned semantic role for this text span. */
+  presentation?: 'intermediate' | 'answer'
+  model_call_id?: string
+  modelCallId?: string
+  iteration?: number
+}
+
+export type AssistantDelivery = 'visible' | 'suppressed'
+export type AssistantSuppressionReason = 'no_reply' | 'heartbeat_ack'
+
+/**
+ * Additive terminal-delivery contract. Older gateways omit these fields; the
+ * client then retains the conservative presentation-only sentinel fallback.
+ */
+export interface SessionDonePayload extends SessionEventPayload {
+  text?: string
+  text_snapshot?: string | null
+  textSnapshot?: string | null
+  delivery?: AssistantDelivery
+  suppression_reason?: AssistantSuppressionReason | null
+  suppressionReason?: AssistantSuppressionReason | null
+  /** Additive turn provenance; snake_case is the canonical gateway spelling. */
+  input_mode?: string
+  inputMode?: string
+  run_kind?: string
+  runKind?: string
+}
+
+/** Durable-success receipt emitted only after transcript and task commits. */
+export interface TurnCommittedPayload extends SessionEventPayload {
+  schema_version: 1
+  session_key: string
+  session_id?: string
+  task_id: string
+  turn_id: string
+  status: 'succeeded'
+  terminal_reason: 'completed'
+  finished_at: number
+  client_message_id?: string
+  user_message_id?: string
+  surface_id?: string
+}
+
+export interface ToolUsePayload extends SessionEventPayload {
+  id?: string
+  toolId?: string
+  tool_use_id?: string
+  toolUseId?: string
+  tool_id?: string
+  name?: string
+  tool_name?: string
+  input?: unknown
+  input_delta?: string
+  inputDelta?: string
+  json_fragment?: string
+  jsonFragment?: string
+  fragment?: string
+  // Server wall-clock tool start time (epoch ms). Present on tool_use_start so a
+  // running tool's elapsed timer survives page switches / stream replay instead of
+  // restarting from a fresh local clock on remount (issue #329). 0/absent => use
+  // the local clock.
+  started_at?: number
+  tool_presentation?: ToolPresentation
+}
+
+export interface ToolDeltaPayload extends ToolUsePayload {
+  delta?: string
+  input_delta?: string
+}
+
+export interface ToolEndPayload extends ToolUsePayload {
+  arguments?: Record<string, unknown>
+  synthetic_from_text?: boolean
+}
+
+export interface ToolResultPayload extends ToolUsePayload {
+  arguments?: Record<string, unknown>
+  result?: unknown
+  content?: unknown
+  output?: unknown
+  error?: unknown
+  is_error?: boolean
+  isError?: boolean
+  execution_status?: { status?: string }
+  executionStatus?: { status?: string }
+}
+
+export interface ChatSendAttachmentPayload {
+  type: string
+  mime: string
+  name: string
+  data?: string
+  file_uuid?: string
+}
+
+/** Exact editable document head bound to one chat send attempt. */
+export interface ChatDocumentContext {
+  documentId: string
+  headRevisionId: string
+}
+
+export interface SessionSteerV2Params {
+  key: string
+  message: string
+  expected_turn_id: string
+  client_request_id: string
+  client_message_id: string
+  pendingInputId?: string
+  requestFingerprint?: string
+  expectedRevision?: number
+  surface_id?: string
+  _source?: { elevated?: string; runMode?: 'safe' | 'full' }
+}
+
+export interface InputDispositionPayload extends SessionEventPayload {
+  target_turn_id?: string
+  client_request_id?: string
+  client_message_id?: string
+  user_message_id?: string
+  disposition?: ChatSteerDisposition
+  promoted_from_turn_id?: string
+  promoted_turn_id?: string
+  applied_iteration?: number
+  model_call_id?: string
+  failure_code?: string
+  retryable?: boolean
+  recovery?: string
+  fallback_safe?: boolean
+  revision?: number
+}
+
+export interface ChatHistoryAttachmentPayload {
+  type?: unknown
+  mime?: unknown
+  mime_type?: unknown
+  media_type?: unknown
+  name?: unknown
+  filename?: unknown
+  size?: unknown
+  data?: unknown
+  dataUrl?: unknown
+  data_url?: unknown
+  sha256_ref?: unknown
+  attachmentId?: unknown
+  attachment_id?: unknown
+  download_url?: unknown
+  kind?: unknown
+  [key: string]: unknown
+}
+
+export interface ChatHistoryMessage {
+  role?: string
+  text?: string
+  timestamp?: string | number | null
+  ts?: string | number | null
+  id?: string
+  message_id?: string
+  attachments?: ChatHistoryAttachmentPayload[]
+  promptAnnotations?: unknown[]
+  prompt_annotations?: unknown[]
+  artifacts?: ArtifactPayload[]
+  router_decision?: RouterDecisionPayload | null
+  routerDecision?: RouterDecisionPayload | null
+  tool_calls?: unknown[]
+  timeline?: unknown[]
+  provenance_kind?: string
+  provenance_source_session_key?: string
+  provenance_source_tool?: string
+  turn_context?: Record<string, unknown>
+  reasoning_content?: string
+  usage?: unknown
+  turn_usage?: unknown
+  model?: string
+  input?: number
+  input_tokens?: number
+  output?: number
+  output_tokens?: number
+}
+
+export interface ChatCompactionSummary {
+  id?: string | number | null
+  compaction_id?: string | null
+  compaction_index?: number | null
+  trigger_reason?: string | null
+  summary_text?: string
+  summary_format?: string
+  coverage_status?: string
+  removed_count?: number | null
+  kept_count?: number | null
+  covered_through_id?: number | null
+  created_at?: string | number | null
+}
+
+export interface ChatHistoryResponse {
+  messages?: ChatHistoryMessage[]
+  has_more?: boolean
+  hasMore?: boolean
+  oldest_cursor?: string | number | null
+  oldestCursor?: string | number | null
+  newest_cursor?: string | number | null
+  newestCursor?: string | number | null
+  history_scope?: string
+  historyScope?: string
+  canonical_available?: boolean
+  canonicalAvailable?: boolean
+  canonical_complete?: boolean
+  canonicalComplete?: boolean
+  limit?: number
+  returned?: number
+  compaction_summaries?: ChatCompactionSummary[]
+  compactionSummaries?: ChatCompactionSummary[]
+  turn_outcomes?: ChatHistoryTurnOutcome[]
+}
+
+export interface ChatHistoryTurnOutcome {
+  turn_id?: string
+  task_id?: string
+  status?: string
+  started_at?: string | number
+  finished_at?: string | number
+  outcome?: Record<string, unknown>
+  document_mutation_outcome?: Record<string, unknown>
+  documentMutationOutcome?: Record<string, unknown>
+  code?: string
+  error_class?: string
+  retryable?: boolean
+  retry_after_ms?: number
+  terminal_message?: string
+  activity_snapshot?: Record<string, unknown>
+  usage_call_index?: number
+  no_prior_provider_dispatch?: boolean
+  replay_safe?: boolean
+  user_message_id?: string
+  accepted_routing_mode?: 'direct' | 'router' | 'ensemble'
+}
+
+export interface RouterDecisionPayload extends SessionEventPayload {
+  tier?: string
+  model?: string
+  routed_model?: string
+  source?: string
+  routing_applied?: boolean
+  decision?: unknown
+  router_tier_snapshot?: unknown
+  routerTierSnapshot?: unknown
+}
+
+/* ── LLM ensemble progress ─────────────────────────────────────────────
+ * Mid-turn `session.event.ensemble_progress` frames announce each ensemble
+ * proposer/aggregator starting and finishing, so the router strip can reveal
+ * members incrementally before the terminal `done` event lands.
+ */
+export interface EnsembleProgressPayload extends SessionEventPayload {
+  event_type?: 'proposer_start' | 'proposer_finish' | 'aggregator_start' | 'aggregator_finish'
+  proposer_index?: number
+  proposer_label?: string
+  proposer_model?: string
+  proposer_provider?: string
+  sample_index?: number
+  elapsed_ms?: number
+  input_tokens?: number
+  output_tokens?: number
+  cost_usd?: number
+  error?: string
+}
+
+export interface CompactionPayload extends SessionEventPayload {
+  status?:
+    | 'started'
+    | 'observed'
+    | 'completed'
+    | 'skipped'
+    | 'stale'
+    | 'failed'
+    | 'error'
+    | 'cancelled'
+    | 'timed_out'
+    | 'emergency_ephemeral'
+    | (string & {})
+  compacted?: boolean
+  detail?: string
+  reason?: string
+  skip_reason?: string
+  source?: string
+  phase?: string
+  compaction_id?: string
+  compactionId?: string
+  sequence?: number
+  heartbeat?: boolean
+  heartbeat_at?: number
+  elapsed_ms?: number
+  stage?: string
+  refused?: boolean
+  safe_to_send?: boolean
+  safeToSend?: boolean
+  applied?: boolean
+  durability?: 'durable' | 'request_scoped' | (string & {})
+  user_visible?: boolean
+  userVisible?: boolean
+}
 
 export interface Attachment {
   kind: 'inline' | 'staged' | 'inline_pending' | 'uploading' | 'failed'
@@ -602,7 +1062,7 @@ export interface ChatMessage {
   reasoningPresentationPending?: boolean
   activitySnapshot?: ActivitySnapshotV2
   activitySnapshotIncomplete?: boolean
-  routerDecision?: import('./rpc').RouterDecisionPayload | null
+  routerDecision?: RouterDecisionPayload | null
   /** Routing-only usage projection for a split historical answer segment. */
   routerUsage?: ChatUsagePayload
   routerModelCallId?: string

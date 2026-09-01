@@ -1,11 +1,11 @@
 // @vitest-environment happy-dom
-import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick } from 'vue'
 
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
-import { useRpcStore } from '@/stores/rpc'
+import { SESSION_CONVERSATION_KEY } from '@/modules/sessionConversation'
+import { sessionConversationTestDouble } from '@/testing/sessionConversation.test-helper'
 import PromptCacheKeepaliveDialog from './PromptCacheKeepaliveDialog.vue'
 
 async function settle() {
@@ -24,9 +24,6 @@ beforeEach(() => {
 
 describe('PromptCacheKeepaliveDialog', () => {
   it('explains the bounded plan and saves both timing values', async () => {
-    const pinia = createPinia()
-    setActivePinia(pinia)
-    const rpc = useRpcStore(pinia)
     const scheduledStatus = {
       enabled: true,
       ttlSeconds: 300,
@@ -48,9 +45,12 @@ describe('PromptCacheKeepaliveDialog', () => {
       hasSnapshot: false,
       lastCacheHitTokens: 0,
     } as const
-    const call = vi.spyOn(rpc, 'call')
-      .mockResolvedValueOnce(scheduledStatus)
-      .mockResolvedValueOnce(waitingStatus)
+    const promptCacheStatus = vi.fn().mockResolvedValue(scheduledStatus)
+    const setPromptCacheStatus = vi.fn().mockResolvedValue(waitingStatus)
+    const conversation = sessionConversationTestDouble({
+      promptCacheStatus,
+      setPromptCacheStatus,
+    })
     const saved = vi.fn()
     const closed = vi.fn()
 
@@ -62,8 +62,8 @@ describe('PromptCacheKeepaliveDialog', () => {
       onSaved: saved,
       onClose: closed,
     })
-    app.use(pinia)
     app.use(i18n)
+    app.provide(SESSION_CONVERSATION_KEY, conversation)
     app.mount(host)
     await settle()
 
@@ -95,15 +95,12 @@ describe('PromptCacheKeepaliveDialog', () => {
     save?.click()
     await settle()
 
-    expect(call).toHaveBeenLastCalledWith(
-      'sessions.promptCacheKeepalive.set',
-      {
-        key: 'agent:main:webchat:test',
-        enabled: true,
-        ttlSeconds: 300,
-        idleTimeoutSeconds: 3_600,
-      },
-    )
+    expect(setPromptCacheStatus).toHaveBeenLastCalledWith({
+      key: 'agent:main:webchat:test',
+      enabled: true,
+      ttlSeconds: 300,
+      idleTimeoutSeconds: 3_600,
+    })
     expect(saved).toHaveBeenCalledWith({
       sessionKey: 'agent:main:webchat:test',
       status: waitingStatus,
@@ -118,9 +115,6 @@ describe('PromptCacheKeepaliveDialog', () => {
   })
 
   it('confirms when keepalive is turned off', async () => {
-    const pinia = createPinia()
-    setActivePinia(pinia)
-    const rpc = useRpcStore(pinia)
     const enabledStatus = {
       enabled: true,
       ttlSeconds: 300,
@@ -138,9 +132,10 @@ describe('PromptCacheKeepaliveDialog', () => {
       state: 'off',
       reason: null,
     } as const
-    vi.spyOn(rpc, 'call')
-      .mockResolvedValueOnce(enabledStatus)
-      .mockResolvedValueOnce(offStatus)
+    const conversation = sessionConversationTestDouble({
+      promptCacheStatus: vi.fn().mockResolvedValue(enabledStatus),
+      setPromptCacheStatus: vi.fn().mockResolvedValue(offStatus),
+    })
 
     const host = document.createElement('div')
     document.body.appendChild(host)
@@ -148,8 +143,8 @@ describe('PromptCacheKeepaliveDialog', () => {
       open: true,
       sessionKey: 'agent:main:webchat:test',
     })
-    app.use(pinia)
     app.use(i18n)
+    app.provide(SESSION_CONVERSATION_KEY, conversation)
     app.mount(host)
     await settle()
 
@@ -171,19 +166,18 @@ describe('PromptCacheKeepaliveDialog', () => {
   })
 
   it('blocks a keepalive window that cannot reach the next probe', async () => {
-    const pinia = createPinia()
-    setActivePinia(pinia)
-    const rpc = useRpcStore(pinia)
-    vi.spyOn(rpc, 'call').mockResolvedValue({
-      enabled: true,
-      ttlSeconds: 300,
-      intervalSeconds: 240,
-      idleTimeoutSeconds: 3_600,
-      idleExpiresAt: null,
-      state: 'waiting',
-      reason: null,
-      hasSnapshot: false,
-      lastCacheHitTokens: 0,
+    const conversation = sessionConversationTestDouble({
+      promptCacheStatus: vi.fn().mockResolvedValue({
+        enabled: true,
+        ttlSeconds: 300,
+        intervalSeconds: 240,
+        idleTimeoutSeconds: 3_600,
+        idleExpiresAt: null,
+        state: 'waiting',
+        reason: null,
+        hasSnapshot: false,
+        lastCacheHitTokens: 0,
+      }),
     })
 
     const host = document.createElement('div')
@@ -192,8 +186,8 @@ describe('PromptCacheKeepaliveDialog', () => {
       open: true,
       sessionKey: 'agent:main:webchat:test',
     })
-    app.use(pinia)
     app.use(i18n)
+    app.provide(SESSION_CONVERSATION_KEY, conversation)
     app.mount(host)
     await settle()
 
@@ -220,10 +214,9 @@ describe('PromptCacheKeepaliveDialog', () => {
   })
 
   it('replaces a missing-session transport error with actionable copy', async () => {
-    const pinia = createPinia()
-    setActivePinia(pinia)
-    const rpc = useRpcStore(pinia)
-    vi.spyOn(rpc, 'call').mockRejectedValue(new Error('Session not found'))
+    const conversation = sessionConversationTestDouble({
+      promptCacheStatus: vi.fn().mockRejectedValue(new Error('Session not found')),
+    })
 
     const host = document.createElement('div')
     document.body.appendChild(host)
@@ -231,8 +224,8 @@ describe('PromptCacheKeepaliveDialog', () => {
       open: true,
       sessionKey: 'agent:main:webchat:draft',
     })
-    app.use(pinia)
     app.use(i18n)
+    app.provide(SESSION_CONVERSATION_KEY, conversation)
     app.mount(host)
     await settle()
 

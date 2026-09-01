@@ -1,5 +1,5 @@
 import { computed, inject, nextTick, onUnmounted, ref, watch, type Ref } from 'vue'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import { ARTIFACT_WORKBENCH_KEY } from '@/modules/artifactWorkbench'
 
 export type InlineMediaKind = 'audio' | 'video'
@@ -8,7 +8,6 @@ export type InlineMediaState = 'idle' | 'loading' | 'ready' | 'error' | 'unsuppo
 interface InlineMediaArtifactOptions {
   artifact: () => ArtifactPayload
   sessionKey: () => string | undefined
-  authToken: () => string | undefined
   kind: InlineMediaKind
   element: Ref<HTMLMediaElement | null>
 }
@@ -111,7 +110,7 @@ export function useInlineMediaArtifact(options: InlineMediaArtifactOptions) {
   }
 
   watch(
-    () => [identity.value, options.sessionKey() || '', options.authToken() || ''],
+    () => [identity.value, options.sessionKey() || ''],
     (_next, previous) => { if (previous) reset() },
   )
 

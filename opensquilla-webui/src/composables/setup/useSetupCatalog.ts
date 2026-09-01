@@ -41,7 +41,7 @@ import { invalidateReadiness } from '@/composables/setup/useReadinessSummary'
 import { useSettingsPromotedForm, DEFAULT_LLM_TIMEOUT_SECONDS } from '@/composables/setup/useSettingsPromotedForm'
 import { useSettingsSection } from '@/composables/setup/useSettingsSection'
 import { SETTINGS_SECTIONS, type SettingsSectionId } from '@/composables/setup/settingsSections'
-import { useRpcStore } from '@/stores/rpc'
+import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 import { useToasts } from '@/composables/useToasts'
 import { useConfirm } from '@/composables/useConfirm'
 import { saveFailedMessage } from '@/lib/rpcErrors'
@@ -450,7 +450,9 @@ export function useSetupCatalog() {
 // State
 // ---------------------------------------------------------------------------
 
-const rpc = useRpcStore()
+const injectedGatewayAccess = inject(GATEWAY_ACCESS_KEY)
+if (!injectedGatewayAccess) throw new Error('GatewayAccess was not provided')
+const gatewayAccess = injectedGatewayAccess
 const injectedAppSettings = inject(APP_SETTINGS_KEY)
 if (!injectedAppSettings) throw new Error('AppSettings was not provided')
 const appSettings: AppSettings = injectedAppSettings
@@ -2145,8 +2147,12 @@ function firstActionSection(): SettingsSectionId {
 
 function sectionStatus(sectionId: string): { label: string; tone: string } {
   if (sectionId === 'gateway') {
-    if (rpc.isConnected) return { label: t('setup.connection.connected'), tone: 'is-ok' }
-    if (rpc.isConnecting) return { label: t('setup.connection.connecting'), tone: 'is-muted' }
+    if (gatewayAccess.availability === 'available') {
+      return { label: t('setup.connection.connected'), tone: 'is-ok' }
+    }
+    if (gatewayAccess.availability === 'preparing') {
+      return { label: t('setup.connection.connecting'), tone: 'is-muted' }
+    }
     return { label: t('setup.connection.disconnected'), tone: 'is-warn' }
   }
   if (sectionId === 'provider') {

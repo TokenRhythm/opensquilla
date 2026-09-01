@@ -1,8 +1,6 @@
 import { ref } from 'vue'
-import type { ChatHistoryMessage } from '@/types/rpc'
+import type { ChatHistoryMessage } from '@/types/chat'
 import type { SessionConversation } from '@/modules/sessionConversation'
-import { useRpcStore } from '@/stores/rpc'
-import { createLegacySessionConversation } from '@/adapters/gateway/sessionConversationV4'
 
 // There is deliberately no sessions.get RPC; the inspect drawer composes
 // sessions.preview (summary snippet) with chat.history (transcript pages).
@@ -20,9 +18,7 @@ function transcriptMessageKey(msg: ChatHistoryMessage): string {
   return String(msg.message_id || msg.id || `${msg.role || ''}:${msg.timestamp ?? msg.ts ?? ''}:${msg.text || ''}`)
 }
 
-export function useSessionInspect(conversation?: SessionConversation) {
-  const sessionConversation: SessionConversation = conversation
-    ?? createLegacySessionConversation(useRpcStore() as Parameters<typeof createLegacySessionConversation>[0])
+export function useSessionInspect(sessionConversation: SessionConversation) {
   const preview = ref<SessionInspectPreview | null>(null)
   const messages = ref<ChatHistoryMessage[]>([])
   const hasEarlier = ref(false)

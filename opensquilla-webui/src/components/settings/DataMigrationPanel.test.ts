@@ -25,8 +25,8 @@ async function mountPanel(options: MountOptions = {}) {
   setDesktopApi(options.desktopApi)
 
   const rpc = {
-    waitForConnection: vi.fn(async () => {}),
-    supportsMethod: vi.fn(() => true),
+    ready: vi.fn(async () => {}),
+    hasRpcMethod: vi.fn(() => true),
     call: vi.fn(),
     ...options.rpc,
   }
@@ -45,8 +45,8 @@ async function mountPanel(options: MountOptions = {}) {
   app.use(i18n)
   app.provide(MIGRATION_OPERATIONS_KEY, {
     listSources: async () => {
-      const supportsMethod = (rpc as { supportsMethod?: (method: string) => boolean }).supportsMethod
-      if (supportsMethod && !supportsMethod('migration.sources.list')) {
+      const hasRpcMethod = (rpc as { hasRpcMethod?: (method: string) => boolean }).hasRpcMethod
+      if (hasRpcMethod && !hasRpcMethod('migration.sources.list')) {
         throw Object.assign(new Error('method not found'), { code: 'METHOD_NOT_FOUND' })
       }
       const result = await rpc.call('migration.sources.list', {}) as {
@@ -69,8 +69,8 @@ async function mountPanel(options: MountOptions = {}) {
       }
     },
     preview: async (candidateId: string) => {
-      const supportsMethod = (rpc as { supportsMethod?: (method: string) => boolean }).supportsMethod
-      if (supportsMethod && !supportsMethod('migration.sources.preview')) {
+      const hasRpcMethod = (rpc as { hasRpcMethod?: (method: string) => boolean }).hasRpcMethod
+      if (hasRpcMethod && !hasRpcMethod('migration.sources.preview')) {
         throw Object.assign(new Error('method not found'), { code: 'METHOD_NOT_FOUND' })
       }
       const result = await rpc.call('migration.sources.preview', { candidateId }) as Record<string, unknown>
@@ -692,7 +692,7 @@ describe('DataMigrationPanel gateway preview provider', () => {
     const call = vi.fn()
     const { el } = await mountPanel({
       rpc: {
-        supportsMethod: vi.fn(() => false),
+        hasRpcMethod: vi.fn(() => false),
         call,
       },
     })

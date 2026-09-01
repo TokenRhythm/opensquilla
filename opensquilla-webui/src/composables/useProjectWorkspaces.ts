@@ -1,7 +1,7 @@
 import { computed, hasInjectionContext, inject, ref, watch } from 'vue'
-import { useRpcStore } from '@/stores/rpc'
 import type { RpcCallOptions } from '@/lib/rpc'
 import { WORKSPACE_CATALOG_KEY, type WorkspaceCatalog, type WorkspaceHistoryDeletion, type WorkspaceItem } from '@/modules/workspaceCatalog'
+import { GATEWAY_ACCESS_KEY, type GatewayAccess } from '@/modules/gatewayAccess'
 
 type ProjectWorkspaceItem = WorkspaceItem
 export type { WorkspaceItem as ProjectWorkspaceItem } from '@/modules/workspaceCatalog'
@@ -12,14 +12,22 @@ const error = ref<string | null>(null)
 const hasLoaded = ref(false)
 let loadSequence = 0
 
-export function useProjectWorkspaces(catalogOverride?: WorkspaceCatalog) {
-  const rpc = useRpcStore()
+export function useProjectWorkspaces(
+  catalogOverride?: WorkspaceCatalog,
+  accessOverride?: GatewayAccess,
+) {
   const catalog = catalogOverride
     ?? (hasInjectionContext() ? inject(WORKSPACE_CATALOG_KEY, null) : null)
+  const access = accessOverride
+    ?? (hasInjectionContext() ? inject(GATEWAY_ACCESS_KEY, null) : null)
 
   if (!catalog) {
     throw new Error('Workspace catalog is unavailable.')
   }
+  if (!access) {
+    throw new Error('Gateway access is unavailable.')
+  }
+  const gatewayAccess = access
   const workspaceCatalog: WorkspaceCatalog = catalog
 
   function resetWorkspaces() {
@@ -31,7 +39,7 @@ export function useProjectWorkspaces(catalogOverride?: WorkspaceCatalog) {
   }
 
   function requireOwner() {
-    if (!rpc.isLocalOwner) {
+    if (!gatewayAccess.isLocalOwner) {
       throw new Error('Project workspaces require a local owner.')
     }
   }
@@ -39,7 +47,7 @@ export function useProjectWorkspaces(catalogOverride?: WorkspaceCatalog) {
   async function loadWorkspaces(
     callOptions?: RpcCallOptions,
   ): Promise<ProjectWorkspaceItem[]> {
-    if (!rpc.canManageProjectWorkspaces) {
+    if (!gatewayAccess.canManageProjectWorkspaces) {
       resetWorkspaces()
       return []
     }
@@ -123,7 +131,7 @@ export function useProjectWorkspaces(catalogOverride?: WorkspaceCatalog) {
   const byId = computed(() => new Map(workspaces.value.map(item => [item.id, item])))
 
   watch(
-    () => rpc.canManageProjectWorkspaces,
+    () => gatewayAccess.canManageProjectWorkspaces,
     allowed => {
       if (!allowed) resetWorkspaces()
     },

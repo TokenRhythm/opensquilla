@@ -1,9 +1,11 @@
 import { computed, ref, type Ref } from 'vue'
 import i18n from '@/i18n'
-import type { RpcCallOptions, RpcClientError, RpcConnectionWaitOptions } from '@/lib/rpc'
+import type { RpcClientError } from '@/lib/rpc'
 import type { MetaLaunchDraftPayload, MetaRunCenter } from '@/modules/metaRunCenter'
-import type { SessionConversation } from '@/modules/sessionConversation'
-import { createLegacySessionConversation } from '@/adapters/gateway/sessionConversationV4'
+import type {
+  SessionConversation,
+  SessionConversationRequestOptions,
+} from '@/modules/sessionConversation'
 import type { HiddenControlDispatchResult } from '@/types/chat'
 import type { MetaSetupReadiness } from '@/types/metaSetup'
 import { createClientRequestId } from '@/utils/chat/messageIdentity'
@@ -81,23 +83,10 @@ const SUPPORTED_WEB_SLASH_ACTIONS = new Set([
 ])
 
 export interface UseChatSlashCommandsOptions {
-  rpc?: {
-    policy?: Record<string, unknown> | null
-    waitForConnection?: (
-      timeoutMs?: number,
-      signal?: AbortSignal,
-      actions?: RpcConnectionWaitOptions,
-    ) => Promise<void>
-    call?: <T = unknown>(
-      method: string,
-      params?: Record<string, unknown>,
-      options?: RpcCallOptions,
-    ) => Promise<T>
-  }
-  sessionConversation?: SessionConversation
+  sessionConversation: SessionConversation
   /** Domain seam for MetaSkill launch; wire method names stay in its adapter. */
   metaRunCenter?: MetaRunCenter
-  catalogCallOptions?: RpcCallOptions
+  catalogCallOptions?: SessionConversationRequestOptions
   inputText: Ref<string>
   sessionKey: Ref<string>
   autoResizeTextarea: () => void
@@ -291,8 +280,7 @@ function localizedMetaDescription(choice: ArgumentChoice): string {
 }
 
 export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
-  const conversation: SessionConversation = options.sessionConversation
-    ?? createLegacySessionConversation(options.rpc as Parameters<typeof createLegacySessionConversation>[0])
+  const conversation = options.sessionConversation
   const slashOpen = ref(false)
   const slashIdx = ref(0)
   const slashCmds = ref<ChatSlashCommand[]>([])

@@ -34,6 +34,8 @@ import { CHANNEL_ADMINISTRATION_KEY } from './modules/channelAdministration'
 import { CHANNEL_SETUP_KEY } from './modules/channelSetup'
 import { MEMORY_PROFILE_IMPORT_KEY } from './modules/memoryProfileImport'
 import { AUDIO_TRANSCRIPTION_KEY } from './modules/audioTranscription'
+import { GATEWAY_ACCESS_KEY } from './modules/gatewayAccess'
+import { CONVERSATION_EVENTS_KEY } from './modules/conversationEvents'
 import 'katex/dist/katex.min.css'
 import './assets/base.css'
 import './themes/tokens' // eagerly bundles every value theme's token block
@@ -66,6 +68,8 @@ app.provide(
   SESSION_DIRECTORY_KEY,
   gatewayAdapters.sessionDirectory,
 )
+app.provide(GATEWAY_ACCESS_KEY, gatewayAdapters.gatewayAccess)
+app.provide(CONVERSATION_EVENTS_KEY, gatewayAdapters.conversationEvents)
 app.provide(
   SESSION_DIRECTORY_CHANGES_KEY,
   gatewayAdapters.sessionDirectoryChanges,

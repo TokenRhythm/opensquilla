@@ -2802,7 +2802,8 @@ def test_desktop_gateway_bundle_collects_usage_ledger_and_verifies_query_ui() ->
 
     assert "'--collect-all',\n  'opensquilla'," in build_script
     assert migration.is_file()
-    assert "const USAGE_QUERY_METHOD = 'usage.query'" in usage_query
+    assert "import type { Observability } from '@/modules/observability'" in usage_query
+    assert "return observability.usage(range, options)" in usage_query
     assert "controlUiVerifier" in build_script
     assert "spawnSync(process.execPath, [controlUiVerifier, controlUiDistDir]" in build_script
     assert build_script.index("\nassertControlUiArtifactReady()\n") < build_script.index(
@@ -3224,6 +3225,8 @@ def test_desktop_orphan_recovery_has_a_real_electron_process_flow() -> None:
     )
     assert "firstMain.kill('SIGKILL')" in script
     assert "verifyDesktopGatewayOwnership(firstRecord)" in script
+    assert "'orphan Desktop Gateway ownership verification'" in script
+    assert "electronChildCleanup.remainingMs('verify-orphan-survived')" in script
     assert "await launchDesktop(" in script
     assert "loaded.record.pid === firstRecord.pid" in script
     assert "verifyDesktopGatewayOwnership(loaded.record)" in script

@@ -60,6 +60,41 @@ describe('artifact preview lease client', () => {
     expect(fetchImpl).not.toHaveBeenCalled()
   })
 
+  it('resolves the Desktop broker credential inside the gateway adapter', async () => {
+    vi.stubGlobal('sessionStorage', {
+      getItem: vi.fn((key: string) => key === 'opensquilla.wsToken' ? 'runtime-token' : null),
+    })
+    const create = vi.fn(async () => ({
+      ok: true as const,
+      status: 201,
+      payload: lease,
+    }))
+    try {
+      await createArtifactPreviewLease(
+        { id: 'art-runtime' },
+        'offline',
+        'desktop',
+        {
+          baseOrigin: 'http://127.0.0.1:18791',
+          nativeBroker: {
+            createArtifactPreviewLease: create,
+          },
+          sessionKey: 'agent:main:webchat:runtime',
+        },
+      )
+    } finally {
+      vi.unstubAllGlobals()
+    }
+
+    expect(create).toHaveBeenCalledWith({
+      version: 1,
+      artifactId: 'art-runtime',
+      mode: 'offline',
+      scopeId: 'agent:main:webchat:runtime',
+      authToken: 'runtime-token',
+    })
+  })
+
   it('fails explicitly instead of issuing a Desktop fetch without a broker', async () => {
     const fetchImpl = vi.fn()
     await expect(createArtifactPreviewLease(

@@ -125,7 +125,7 @@ async function mountWithRealRouter(options: { webHistory?: boolean } = {}) {
     useRpcStore: () => ({
       call: rpcCall,
       on: vi.fn(() => () => {}),
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
     }),
   }))
   vi.doMock('@/composables/useRequest', () => ({

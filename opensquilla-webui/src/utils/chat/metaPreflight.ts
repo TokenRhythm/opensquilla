@@ -32,27 +32,27 @@ export function detectLanguage(text: unknown): MetaPreflightLanguage {
   return /[㐀-䶿一-鿿豈-﫿]/.test(String(text || '')) ? 'zh' : 'en'
 }
 
-/** Build a fresh preflight state from a meta_preflight payload. */
+/** Build a fresh preflight state from a projected Meta preflight payload. */
 export function createPreflight(payload: MetaPreflightPayload): MetaPreflightState {
-  const template = payload.request_template || {}
+  const template = payload.requestTemplate || {}
   const language = detectLanguage(
     payload.language ||
       template.language ||
-      payload.interpreted_request ||
+      payload.interpretedRequest ||
       template.outcome ||
       '',
   )
   return {
-    runId: payload.run_id || '',
-    metaSkillName: payload.meta_skill_name || '',
+    runId: payload.runId || '',
+    metaSkillName: payload.metaSkillName || '',
     language,
-    interpretedRequest: payload.interpreted_request || '',
-    missingFields: payload.missing_fields || [],
+    interpretedRequest: payload.interpretedRequest || '',
+    missingFields: payload.missingFields || [],
     assumptions: payload.assumptions || [],
     fields: Array.isArray(template.fields) ? template.fields : [],
     outcome: template.outcome || template.deliverable || '',
-    canSkip: payload.can_skip !== false,
-    requiresGate: payload.requires_confirmation === true,
+    canSkip: payload.canSkip !== false,
+    requiresGate: payload.requiresConfirmation === true,
   }
 }
 

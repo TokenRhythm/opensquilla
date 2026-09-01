@@ -38,6 +38,9 @@ const isTestFile = rel => /\.(test|spec)\.(?:[cm]?[jt]sx?)$/.test(rel)
 const isGatewayAdapter = rel => rel.startsWith('src/adapters/gateway/')
 const isGeneratedContract = rel => rel.startsWith('src/contracts/generated/')
 const isStaticAssetTransportImplementation = rel => rel === 'src/platform/staticAssets.ts'
+const isRawConversationWireName = value => (
+  value.startsWith('session.event.') || /^task\.[a-z0-9_.-]+$/i.test(value)
+)
 const isRpcTransportImplementation = rel => (
   rel === 'src/stores/rpc.ts'
   || rel === 'src/lib/rpc.ts'
@@ -191,6 +194,17 @@ export function evaluateRpcArchitectureGate({
         && !isGeneratedContract(rel)
       ) {
         failures.push(`${rel}: sessions.search wire literal is allowed only in its Contract Adapter.`)
+      }
+      if (
+        ts.isStringLiteralLike(node)
+        && isRawConversationWireName(node.text)
+        && !isGatewayAdapter(rel)
+        && !isTestFile(rel)
+        && !isGeneratedContract(rel)
+      ) {
+        failures.push(
+          `${rel}: ${node.text} wire literal is allowed only in a Gateway Adapter, generated Contract, or test.`,
+        )
       }
       ts.forEachChild(node, visit)
     }

@@ -6,7 +6,7 @@ import { createI18n } from 'vue-i18n'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import ArtifactPreviewPanel from './ArtifactPreviewPanel.vue'
 import en from '@/locales/en.json'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import { ARTIFACT_PREVIEW_ESCAPE_MESSAGE } from '@/utils/workbench/artifactPreview'
 
 function artifact(overrides: Partial<ArtifactPayload> = {}): ArtifactPayload {

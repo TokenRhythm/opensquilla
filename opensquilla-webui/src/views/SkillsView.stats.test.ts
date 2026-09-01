@@ -21,7 +21,7 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
   const loadData = vi.fn(async () => loadDataResult)
   const scrollIntoView = vi.fn()
   const rpcCall = vi.fn(async (_method: string) => reloadResult)
-  const waitForConnection = vi.fn(async () => {})
+  const ready = vi.fn(async () => {})
   const pushToast = vi.fn()
 
   const iconStub = defineComponent({
@@ -111,7 +111,7 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
     }),
   }))
   vi.doMock('@/stores/rpc', () => ({
-    useRpcStore: () => ({ call: rpcCall, waitForConnection }),
+    useRpcStore: () => ({ call: rpcCall, ready }),
   }))
   vi.doMock('@/composables/useToasts', () => ({
     useToasts: () => ({ pushToast }),
@@ -220,7 +220,7 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
     scrollIntoView,
     loadData,
     rpcCall,
-    waitForConnection,
+    ready,
     pushToast,
     viewActive,
   }

@@ -2,10 +2,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AppSettings, SettingChange } from '@/modules/appSettings'
 
 const rpcCall = vi.fn()
-const waitForConnection = vi.fn().mockResolvedValue(undefined)
+const ready = vi.fn().mockResolvedValue(undefined)
 
 vi.mock('@/stores/rpc', () => ({
-  useRpcStore: () => ({ call: rpcCall, waitForConnection }),
+  useRpcStore: () => ({ call: rpcCall, ready }),
 }))
 
 import { useMemoryLearningSettings } from './useMemoryLearningSettings'

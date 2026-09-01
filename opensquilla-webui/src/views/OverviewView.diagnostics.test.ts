@@ -122,10 +122,10 @@ async function mountOverview(options: MountOptions = {}) {
       isConnected: true,
       isConnecting: false,
       on: rpcOn,
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call: rpcCall,
-      supportsMethod: vi.fn(() => true),
-      markMethodUnavailable: vi.fn(),
+      hasRpcMethod: vi.fn(() => true),
+      rememberUnsupportedMethod: vi.fn(),
     }),
   }))
   vi.doMock('@/composables/useToasts', () => ({ useToasts: () => ({ pushToast }) }))

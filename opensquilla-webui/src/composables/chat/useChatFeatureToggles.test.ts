@@ -7,7 +7,7 @@ import type {
   ModelRoutingCapabilitiesByMode,
   ModelRoutingMode,
 } from '@/types/modelRouting'
-import { createLegacySessionConversation } from '@/adapters/gateway/sessionConversationV4'
+import { sessionConversationFromTestRpc } from '@/testing/sessionConversation.test-helper'
 
 type RpcResult = Record<string, unknown> | Error | Promise<unknown>
 
@@ -36,13 +36,13 @@ function createHarness(options: {
   routingGetResults?: RpcResult[]
   patchResults?: RpcResult[]
   readCallOptions?: RpcCallOptions
-  supportsMethod?: (method: string) => boolean
+  hasRpcMethod?: (method: string) => boolean
 } = {}) {
   const configGetResults = [...(options.configGetResults ?? [{}])]
   const routingGetResults = [...(options.routingGetResults ?? [])]
   const patchResults = [...(options.patchResults ?? [])]
   const eventHandlers = new Map<string, (payload: unknown) => void>()
-  const waitForConnection = vi.fn(async () => {})
+  const ready = vi.fn(async () => {})
   const setGlobalElevatedMode = vi.fn()
   const loadCurrentSessionUsage = vi.fn()
   const call = vi.fn(async (method: string, _params?: Record<string, unknown>): Promise<unknown> => {
@@ -52,7 +52,7 @@ function createHarness(options: {
       return await Promise.resolve(result)
     }
     if (method === 'models.routing.get') {
-      if (options.supportsMethod?.('models.routing.get') === false) {
+      if (options.hasRpcMethod?.('models.routing.get') === false) {
         throw Object.assign(new Error('method not found'), { code: 'METHOD_NOT_FOUND' })
       }
       const result = routingGetResults.shift()
@@ -74,17 +74,16 @@ function createHarness(options: {
     callOptions?: RpcCallOptions,
   ) => Promise<unknown>
   const rpc = {
-    waitForConnection,
+    ready,
     call: call as <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>,
     on: vi.fn((event: string, handler: (payload: unknown) => void) => {
       eventHandlers.set(event, handler)
       return () => eventHandlers.delete(event)
     }),
-    supportsMethod: options.supportsMethod,
+    hasRpcMethod: options.hasRpcMethod,
   }
   const api = useChatFeatureToggles({
-    rpc,
-    sessionConversation: createLegacySessionConversation(rpc),
+    sessionConversation: sessionConversationFromTestRpc(rpc),
     appSettings: {
       readAll: vi.fn(async () => {
         return await rpcRequest('config.get', undefined, options.readCallOptions) as import('@/modules/appSettings').SettingsObject
@@ -112,7 +111,7 @@ function createHarness(options: {
   })
   return {
     api,
-    rpc: { waitForConnection, call, on: rpc.on },
+    rpc: { ready, call, on: rpc.on },
     emit: (event: string, payload: unknown) => eventHandlers.get(event)?.(payload),
     setGlobalElevatedMode,
     loadCurrentSessionUsage,
@@ -569,7 +568,7 @@ describe('useChatFeatureToggles model routing mode', () => {
           capabilities_by_mode: CAPABILITIES_BY_MODE,
         },
       ],
-      supportsMethod: method => method !== 'models.routing.get' || supportsRouting,
+      hasRpcMethod: method => method !== 'models.routing.get' || supportsRouting,
     })
 
     await api.loadFeatureToggles()

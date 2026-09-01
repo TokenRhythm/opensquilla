@@ -14,7 +14,7 @@ import type {
   SourcePart,
   StatusPart,
 } from '@/types/parts'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import type { Frame, ReasoningBlock } from '@/types/turnlog'
 import {
   isEmptyToolPreview,

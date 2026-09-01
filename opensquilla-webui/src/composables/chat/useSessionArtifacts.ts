@@ -2,7 +2,7 @@ import { computed, ref, watch, type Ref } from 'vue'
 
 import type { ArtifactCatalog } from '@/modules/artifactWorkbench'
 import type { ChatMessage } from '@/types/chat'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 
 const MAX_ARTIFACT_PAGE_LIMIT = 200
 

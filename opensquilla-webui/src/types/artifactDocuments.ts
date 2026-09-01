@@ -1,4 +1,4 @@
-import type { ArtifactPayload } from './rpc'
+import type { ArtifactPayload } from './artifacts'
 
 export type ArtifactDocumentKind =
   | 'document'

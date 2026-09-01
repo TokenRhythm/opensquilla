@@ -1,5 +1,5 @@
 import type { Attachment, DisplayAttachment } from '@/types/chat'
-import type { ChatHistoryAttachmentPayload, ChatSendAttachmentPayload } from '@/types/rpc'
+import type { ChatHistoryAttachmentPayload, ChatSendAttachmentPayload } from '@/types/chat'
 
 export type SendableAttachment = Attachment & (
   | { kind: 'inline'; data: string }

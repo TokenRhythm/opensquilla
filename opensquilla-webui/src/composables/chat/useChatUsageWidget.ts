@@ -1,20 +1,8 @@
 import { computed, ref, type Ref } from 'vue'
-import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
-import type { SessionConversation } from '@/modules/sessionConversation'
-import { createLegacySessionConversation } from '@/adapters/gateway/sessionConversationV4'
-
-type RpcClient = {
-  waitForConnection?: (
-    timeoutMs?: number,
-    signal?: AbortSignal,
-    actions?: RpcConnectionWaitOptions,
-  ) => Promise<void>
-  call?: <T = unknown>(
-    method: string,
-    params?: Record<string, unknown>,
-    callOptions?: RpcCallOptions,
-  ) => Promise<T>
-}
+import type {
+  SessionConversation,
+  SessionConversationRequestOptions,
+} from '@/modules/sessionConversation'
 
 export interface ChatUsageAccumulator {
   input: number
@@ -27,9 +15,8 @@ export interface ChatUsageAccumulator {
 }
 
 export interface UseChatUsageWidgetOptions {
-  rpc?: RpcClient
-  sessionConversation?: SessionConversation
-  readCallOptions?: RpcCallOptions
+  sessionConversation: SessionConversation
+  readCallOptions?: SessionConversationRequestOptions
   sessionKey: Ref<string>
   tokenVizEnabled: () => boolean
 }
@@ -74,8 +61,7 @@ export function createEmptyUsageAccumulator(): ChatUsageAccumulator {
 }
 
 export function useChatUsageWidget(options: UseChatUsageWidgetOptions) {
-  const conversation: SessionConversation = options.sessionConversation
-    ?? createLegacySessionConversation(options.rpc as Parameters<typeof createLegacySessionConversation>[0])
+  const conversation = options.sessionConversation
   const usageAccum = ref<ChatUsageAccumulator>(createEmptyUsageAccumulator())
   const usageModel = ref('')
   const savingsPopupLastTs = ref(0)

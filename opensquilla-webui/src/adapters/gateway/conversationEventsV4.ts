@@ -4,6 +4,9 @@ import {
   type V4ConversationEventFrame,
 } from '@/contracts/generated/v4/conversationEvents'
 import { validateConversationEventFrame } from '@/contracts/generated/v4/conversationEventsValidators.mjs'
+import type { ConversationSemanticEventKind } from '@/modules/conversationEvents'
+
+export type { ConversationSemanticEventKind } from '@/modules/conversationEvents'
 
 /**
  * The event family is intentionally open for additive rollout.  Keep the
@@ -26,6 +29,68 @@ const BARE_EVENT_ALIASES = new Set(
 
 export type ConversationEventKind = 'known' | 'unknown'
 
+/**
+ * Business-facing event vocabulary. Wire aliases and protocol namespaces are
+ * deliberately absent: consumers switch on these meanings, never on v4 event
+ * names. Additive wire events project to `unknown` until their domain meaning
+ * is explicitly adopted.
+ */
+const SEMANTIC_EVENT_KIND_BY_WIRE_NAME = new Map<string, ConversationSemanticEventKind>([
+  ['chat.done', 'turn-completed'],
+  ['exec.approval.requested', 'approval-requested'],
+  ['exec.approval.resolved', 'approval-resolved'],
+  ['plugin.approval.requested', 'approval-requested'],
+  ['plugin.approval.resolved', 'approval-resolved'],
+  ['session.epoch_changed', 'session-epoch-changed'],
+  ['session.event.answer_generation_reset', 'answer-generation-reset'],
+  ['session.event.approval_required', 'approval-requested'],
+  ['session.event.artifact', 'artifact-created'],
+  ['session.event.artifact_state', 'artifact-state-changed'],
+  ['session.event.collaboration_mode', 'collaboration-mode-changed'],
+  ['session.event.compaction', 'compaction-progress'],
+  ['session.event.cron_result', 'cron-result'],
+  ['session.event.done', 'turn-completed'],
+  ['session.event.ensemble_progress', 'ensemble-progress'],
+  ['session.event.error', 'turn-failed'],
+  ['session.event.goal', 'goal-changed'],
+  ['session.event.goal_run', 'goal-run-changed'],
+  ['session.event.input_disposition', 'input-disposition'],
+  ['session.event.meta_preflight', 'meta-preflight'],
+  ['session.event.meta_run_announced', 'meta-run-announced'],
+  ['session.event.meta_run_completed', 'meta-run-completed'],
+  ['session.event.meta_step_state', 'meta-step-state'],
+  ['session.event.plan_revision', 'plan-revision'],
+  ['session.event.plan_run', 'plan-run'],
+  ['session.event.provider_activity', 'provider-activity'],
+  ['session.event.router_control_replay', 'router-control-replay'],
+  ['session.event.router_decision', 'router-decision'],
+  ['session.event.run_heartbeat', 'run-heartbeat'],
+  ['session.event.state_change', 'state-changed'],
+  ['session.event.steer', 'steer-received'],
+  ['session.event.subagent_completion', 'subagent-completed'],
+  ['session.event.task_group.done', 'task-group-completed'],
+  ['session.event.task_group.failed', 'task-group-failed'],
+  ['session.event.task_group.synthesizing', 'task-group-synthesizing'],
+  ['session.event.task_group.waiting', 'task-group-waiting'],
+  ['session.event.text_delta', 'text-delta'],
+  ['session.event.thinking', 'thinking-delta'],
+  ['session.event.thinking_end', 'thinking-ended'],
+  ['session.event.thinking_start', 'thinking-started'],
+  ['session.event.tool_result', 'tool-result'],
+  ['session.event.tool_use_delta', 'tool-use-delta'],
+  ['session.event.tool_use_end', 'tool-use-ended'],
+  ['session.event.tool_use_start', 'tool-use-started'],
+  ['session.event.turn_committed', 'turn-committed'],
+  ['session.event.warning', 'warning'],
+  ['task.abandoned', 'task-abandoned'],
+  ['task.cancelled', 'task-cancelled'],
+  ['task.failed', 'task-failed'],
+  ['task.queued', 'task-queued'],
+  ['task.running', 'task-running'],
+  ['task.succeeded', 'task-succeeded'],
+  ['task.timeout', 'task-timed-out'],
+])
+
 export type KnownConversationEventName = (typeof CONVERSATION_EVENT_WIRE_NAMES)[number]
 
 interface DecodedConversationEventCommon {
@@ -43,6 +108,7 @@ interface DecodedConversationEventCommon {
   schemaVersion: number | null
   /** True for current v4 events that predate the schema_version field. */
   legacy: boolean
+  semanticKind: ConversationSemanticEventKind
 }
 
 /** Discriminated union used by the future ConversationRuntime consumer. */
@@ -139,6 +205,12 @@ export function canonicalConversationEventName(value: unknown): string {
   return name
 }
 
+/** Project any canonical or legacy wire spelling into the domain vocabulary. */
+export function conversationSemanticEventKind(value: unknown): ConversationSemanticEventKind {
+  const name = canonicalConversationEventName(value)
+  return SEMANTIC_EVENT_KIND_BY_WIRE_NAME.get(name) ?? 'unknown'
+}
+
 function validateFrame(frame: unknown): Record<string, unknown> {
   const value = objectValue(frame)
   if (!value) {
@@ -198,6 +270,7 @@ function decodeValidatedFrame(frame: unknown): DecodedConversationEvent {
   }
 
   const isKnown = KNOWN_EVENT_NAMES.has(name)
+  const semanticKind = SEMANTIC_EVENT_KIND_BY_WIRE_NAME.get(name) ?? 'unknown'
   const decoded: DecodedConversationEvent = isKnown
     ? {
         name: name as KnownConversationEventName,
@@ -215,6 +288,7 @@ function decodeValidatedFrame(frame: unknown): DecodedConversationEvent {
         generationEpoch,
         schemaVersion,
         legacy,
+        semanticKind,
       }
     : {
         name,
@@ -232,6 +306,7 @@ function decodeValidatedFrame(frame: unknown): DecodedConversationEvent {
         generationEpoch,
         schemaVersion,
         legacy,
+        semanticKind,
       }
   return decoded
 }

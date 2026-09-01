@@ -4,9 +4,9 @@ import { createApp, nextTick } from 'vue'
 import { createPinia, setActivePinia } from 'pinia'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
-import { useRpcStore } from '@/stores/rpc'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import { ARTIFACT_WORKBENCH_KEY, type ArtifactWorkbench } from '@/modules/artifactWorkbench'
+import { GATEWAY_ACCESS_KEY, type GatewayAccess } from '@/modules/gatewayAccess'
 import { createV4ArtifactContentAccess } from '@/adapters/gateway/artifactAccessV4'
 import ChatArtifactList from './ChatArtifactList.vue'
 
@@ -48,18 +48,18 @@ async function mountList(options: {
   document.body.appendChild(el)
   const pinia = createPinia()
   setActivePinia(pinia)
-  const rpc = useRpcStore(pinia)
-  rpc.auth = { principal: { isOwner: options.isOwner } }
   const app = createApp(ChatArtifactList, {
     artifacts: [options.artifact || htmlArtifact],
     sessionKey: 'agent:main:webchat:ok',
-    authToken: 'secret',
     preferWorkbench: options.preferWorkbench,
     onDownload: options.onDownload,
     onOpen: options.onOpen,
   })
   app.use(pinia)
   app.use(i18n)
+  app.provide(GATEWAY_ACCESS_KEY, {
+    isLocalOwner: options.isOwner,
+  } as GatewayAccess)
   app.provide(ARTIFACT_WORKBENCH_KEY, {
     content: createV4ArtifactContentAccess(),
   } as ArtifactWorkbench)
