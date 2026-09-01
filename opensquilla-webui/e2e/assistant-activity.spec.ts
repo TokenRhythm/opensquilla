@@ -2,6 +2,13 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { expect, test, type Page } from '@playwright/test'
 
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
+
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-assistant-activity'
 const LIFECYCLE_SESSION_KEY = 'agent:main:webchat:e2e-assistant-activity-lifecycle'
@@ -37,6 +44,9 @@ function wsEvent(event: string, payload: unknown) {
 
 async function mockActivityHistory(page: Page, fixture: ActivityFixture = {}) {
   const isSearchFixture = fixture.searchTargets === true
+  await page.addInitScript(() => {
+    window.localStorage.setItem('opensquilla-locale', 'en')
+  })
   await page.routeWebSocket(/\/ws$/, ws => {
     ws.onMessage(message => {
       let frame: Record<string, unknown>
@@ -55,8 +65,7 @@ async function mockActivityHistory(page: Page, fixture: ActivityFixture = {}) {
           type: 'res',
           id: frame.id,
           ok: true,
-          payload: {
-            messages: [{
+          payload: chatHistoryPayload([{
               role: 'assistant',
               text: 'The canonical answer is complete.',
               id: `assistant-activity-${fixture.failed ? 'failed' : 'success'}`,
@@ -86,10 +95,29 @@ async function mockActivityHistory(page: Page, fixture: ActivityFixture = {}) {
                 { type: 'tool-group', groupId: 'activity-group' },
                 { type: 'text', raw: 'Non-canonical streamed suffix.' },
               ],
-            }],
-            has_more: false,
-          },
+            }]),
         }))
+        return
+      }
+      if (frame.method === 'sessions.messages.subscribe') {
+        const key = String((frame.params as Record<string, unknown> | undefined)?.key || SESSION_KEY)
+        ws.send(wsResponse(frame.id as string | number, sessionMessagesSubscribePayload(
+          key,
+        )))
+        return
+      }
+      if (frame.method === 'sessions.messages.snapshot') {
+        const key = String((frame.params as Record<string, unknown> | undefined)?.key || SESSION_KEY)
+        ws.send(wsResponse(frame.id as string | number, sessionMessagesSnapshotPayload(
+          key,
+        )))
+        return
+      }
+      if (frame.method === 'sessions.messages.hydrate') {
+        const key = String((frame.params as Record<string, unknown> | undefined)?.key || SESSION_KEY)
+        ws.send(wsResponse(frame.id as string | number, sessionMessagesHydratePayload(
+          key,
+        )))
         return
       }
       ws.send(JSON.stringify({ type: 'res', id: frame.id, ok: true, payload: {} }))
@@ -182,14 +210,15 @@ async function mockUnifiedTurnReceiptHistory(page: Page) {
         return
       }
       if (frame.method === 'chat.history') {
-        ws.send(wsResponse(frame.id as string | number, {
-          messages,
+        ws.send(wsResponse(frame.id as string | number, chatHistoryPayload(messages, {
           turn_outcomes: turnOutcomes,
-          has_more: false,
-          canonical_complete: true,
-        }))
+        })))
         return
       }
+      const params = frame.params && typeof frame.params === 'object'
+        ? frame.params as Record<string, unknown>
+        : {}
+      const sessionKey = String(params.key || `${SESSION_KEY}-unified-receipts`)
       const payloads: Record<string, unknown> = {
         'agents.list': { agents: [] },
         'commands.list_for_surface': { commands: [] },
@@ -200,12 +229,15 @@ async function mockUnifiedTurnReceiptHistory(page: Page) {
         },
         'onboarding.status': { audioConfigured: false },
         'sessions.list': { sessions: [], has_more: false },
-        'sessions.messages.subscribe': {
-          subscribed: true,
-          replay_complete: true,
-          current_stream_seq: 0,
-          run_status: 'idle',
-        },
+        'sessions.messages.subscribe': sessionMessagesSubscribePayload(
+          sessionKey,
+        ),
+        'sessions.messages.snapshot': sessionMessagesSnapshotPayload(
+          sessionKey,
+        ),
+        'sessions.messages.hydrate': sessionMessagesHydratePayload(
+          sessionKey,
+        ),
         'usage.status': { sessions: [] },
       }
       ws.send(wsResponse(
@@ -338,7 +370,7 @@ async function mockControlledActivityLifecycle(
         : []
       const payloads: Record<string, unknown> = {
         'agents.list': { agents: [] },
-        'chat.history': { messages, has_more: false, canonical_complete: true },
+        'chat.history': chatHistoryPayload(messages),
         'commands.list_for_surface': { commands: [] },
         'config.get': {
           squilla_router: { enabled: false, rollout_phase: 'observe', tiers: {} },
@@ -347,12 +379,15 @@ async function mockControlledActivityLifecycle(
         },
         'onboarding.status': { audioConfigured: false },
         'sessions.list': { sessions: [], has_more: false },
-        'sessions.messages.subscribe': {
-          subscribed: true,
-          replay_complete: true,
-          current_stream_seq: 0,
-          run_status: 'idle',
-        },
+        'sessions.messages.subscribe': sessionMessagesSubscribePayload(
+          LIFECYCLE_SESSION_KEY,
+        ),
+        'sessions.messages.snapshot': sessionMessagesSnapshotPayload(
+          LIFECYCLE_SESSION_KEY,
+        ),
+        'sessions.messages.hydrate': sessionMessagesHydratePayload(
+          LIFECYCLE_SESSION_KEY,
+        ),
         'usage.status': { sessions: [] },
       }
       ws.send(wsResponse(
