@@ -3322,6 +3322,9 @@ def test_desktop_e2e_shutdown_helpers_bound_windows_cleanup_without_masking_fail
         "desktop/electron/scripts/test-desktop-gateway-orphan-recovery-flow.mjs"
     )
     profile_flow = _read("desktop/electron/scripts/test-profile-consolidation-flow.mjs")
+    profile_import_flow = _read("desktop/electron/scripts/test-profile-import-flow.mjs")
+    window_flow = _read("desktop/electron/scripts/test-desktop-window-background-flow.mjs")
+    theme_flow = _read("desktop/electron/scripts/test-desktop-theme-flow.mjs")
     helper = _read("desktop/electron/scripts/e2e-shutdown-helpers.mjs")
 
     assert "const PROVIDER_SHUTDOWN_TIMEOUT_MS = 15_000" in v1_flow
@@ -3348,9 +3351,34 @@ def test_desktop_e2e_shutdown_helpers_bound_windows_cleanup_without_masking_fail
     assert "shutdown?.processTreeReaped === true" in helper
     assert "gatewayExitCount > 0 && allGatewayExitsClean" in helper
     assert "committedExitIndex > lastGatewayExitIndex" in helper
-    for flow in (v1_flow, orphan_flow, profile_flow):
+    for flow in (
+        v1_flow,
+        orphan_flow,
+        profile_flow,
+        profile_import_flow,
+        window_flow,
+        theme_flow,
+    ):
         assert "readFile(desktopLogPath, 'utf8').catch(() => null)" in flow
         assert "readFile(desktopLogPath, 'utf8').catch(() => '')" not in flow
+    assert "const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000" in profile_import_flow
+    assert "closeElectronWithDeadline" in profile_import_flow
+    assert "desktopShutdownEvidenceSince" in profile_import_flow
+    assert "canAcceptWindowsElectronShutdownFallback" in profile_import_flow
+    assert "trackHttpServerConnections" in profile_import_flow
+    assert "closeHttpServerWithDeadline" in profile_import_flow
+    assert "await closeActiveApp('profile-import-final-shutdown', { failOnError: false })" in (
+        profile_import_flow
+    )
+    assert "await app.close()" not in profile_import_flow
+    assert "app.close().catch(() => {})" not in profile_import_flow
+    for flow in (window_flow, theme_flow):
+        assert "const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000" in flow
+        assert "closeElectronWithDeadline" in flow
+        assert "desktopShutdownEvidenceSince" in flow
+        assert "canAcceptWindowsElectronShutdownFallback" in flow
+        assert "flowSucceeded && shutdownError" in flow
+        assert ".close().catch(() => {})" not in flow
     assert "closeDesktopApp(app, 'restart-electron-shutdown')" in v1_flow
     assert "closeDesktopApp(app, 'final-electron-shutdown')" in v1_flow
     assert "await app.close()" not in v1_flow
