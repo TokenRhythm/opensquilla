@@ -11432,6 +11432,48 @@ def test_session_view_plugin_channel_type_degrades_to_unknown_surface():
     assert feishu_view["sessionKind"] == "channel"
 
 
+@pytest.mark.parametrize(
+    ("last_channel", "channel_types"),
+    [
+        ("slack", None),
+        ("release-room", {"release-room": "feishu"}),
+    ],
+)
+def test_session_view_canonical_cron_key_overrides_delivery_metadata(
+    last_channel,
+    channel_types,
+):
+    from opensquilla.gateway.session_view import build_session_view_item
+
+    session_key = "cron:daily-summary:run:canonical"
+    session = FakeSession(
+        session_key=session_key,
+        last_channel=last_channel,
+        last_to="delivery-target",
+        origin={
+            "kind": "cron",
+            "cron": {
+                "jobId": "daily-summary",
+                "sessionTarget": "session",
+                "targetSessionKey": session_key,
+            },
+        },
+    )
+
+    view = build_session_view_item(
+        session,
+        entry_count=0,
+        task_rows=[],
+        now_ms=0,
+        channel_types=channel_types,
+    )
+
+    assert view["surface"] == "cron"
+    assert view["sessionKind"] == "cron"
+    assert view["groupLabel"] == "Cron"
+    assert view["interactive"] is False
+
+
 @pytest.mark.asyncio
 async def test_search_classifies_custom_named_channel_sessions(dispatcher):
     # sessions.search must thread the configured name->type map exactly like

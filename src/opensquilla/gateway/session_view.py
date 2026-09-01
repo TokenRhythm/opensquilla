@@ -132,6 +132,12 @@ def _surface(
     origin: dict[str, Any],
     channel_types: dict[str, str] | None = None,
 ) -> str:
+    if key.startswith("cron:"):
+        # The canonical isolated-run key is the durable identity. Delivery
+        # metadata can outlive a previous target and must not regroup the run
+        # as an ordinary channel session.
+        return "cron"
+
     last_channel = _lower(getattr(session, "last_channel", None))
     channel = _lower(getattr(session, "channel", None))
     origin_kind = _lower(origin.get("kind"))
@@ -158,7 +164,7 @@ def _surface(
         return "cli"
     if ":subagent:" in key or key.startswith("subagent:"):
         return "subagent"
-    if key.startswith("cron:") or origin_kind == "cron":
+    if origin_kind == "cron":
         return "cron"
     return "unknown"
 
@@ -171,6 +177,8 @@ def _session_kind(session: Any, key: str, surface: str, origin: dict[str, Any]) 
     if surface == "subagent":
         return "task"
     if surface == "cron":
+        if key.startswith("cron:"):
+            return "cron"
         cron_meta = origin.get("cron")
         if isinstance(cron_meta, dict) and cron_meta.get("targetSessionKey") == key:
             channel = _lower(getattr(session, "last_channel", None))

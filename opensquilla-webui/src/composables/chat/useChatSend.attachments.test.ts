@@ -2660,6 +2660,81 @@ describe('useChatSend attachment payloads', () => {
     expect(options.messages.value).toEqual([])
   })
 
+  it('leaves a hidden control in its origin outbox when navigation wins project preflight', async () => {
+    let finishPreflight!: () => void
+    const validateActiveProjectBeforeSend = vi.fn(() => new Promise<string | null>(
+      resolve => {
+        finishPreflight = () => resolve(null)
+      },
+    ))
+    const sessionKey = ref('agent:main:webchat:A')
+    const hiddenControlStorage = memoryStorage()
+    const enqueueHiddenControl = vi.fn(() => true)
+    const { api, options, rpc } = makeOptions({
+      sessionKey,
+      hiddenControlStorage,
+      enqueueHiddenControl,
+      validateActiveProjectBeforeSend,
+    })
+
+    const sending = api.dispatchHiddenSend(
+      'provider confirmation',
+      'Confirmed',
+      'hidden-navigation-preflight',
+    )
+    await vi.waitFor(() => expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce())
+    sessionKey.value = 'agent:main:webchat:B'
+    finishPreflight()
+
+    await expect(sending).resolves.toEqual({
+      status: 'queued',
+      reason: 'queued',
+      clientRequestId: 'hidden-navigation-preflight',
+      sessionKey: 'agent:main:webchat:A',
+    })
+    expect(enqueueHiddenControl).not.toHaveBeenCalled()
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.messages.value).toEqual([])
+    expect(listHiddenControls('agent:main:webchat:A', hiddenControlStorage)).toHaveLength(1)
+    expect(listHiddenControls('agent:main:webchat:B', hiddenControlStorage)).toEqual([])
+  })
+
+  it('fails a navigation-raced hidden control closed when its outbox is unavailable', async () => {
+    let finishPreflight!: () => void
+    const validateActiveProjectBeforeSend = vi.fn(() => new Promise<string | null>(
+      resolve => {
+        finishPreflight = () => resolve(null)
+      },
+    ))
+    const sessionKey = ref('agent:main:webchat:A')
+    const enqueueHiddenControl = vi.fn(() => true)
+    const { api, options, rpc } = makeOptions({
+      sessionKey,
+      hiddenControlStorage: null,
+      enqueueHiddenControl,
+      validateActiveProjectBeforeSend,
+    })
+
+    const sending = api.dispatchHiddenSend(
+      'provider confirmation',
+      'Confirmed',
+      'hidden-navigation-no-outbox',
+    )
+    await vi.waitFor(() => expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce())
+    sessionKey.value = 'agent:main:webchat:B'
+    finishPreflight()
+
+    await expect(sending).resolves.toEqual({
+      status: 'rejected',
+      reason: 'outbox_persist_failed',
+      clientRequestId: 'hidden-navigation-no-outbox',
+      sessionKey: 'agent:main:webchat:A',
+    })
+    expect(enqueueHiddenControl).not.toHaveBeenCalled()
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.messages.value).toEqual([])
+  })
+
   it('keeps queued delivery owned when project validation blocks it', async () => {
     const validateActiveProjectBeforeSend = vi.fn(async () => 'removed')
     const queued: ChatPendingItem = {

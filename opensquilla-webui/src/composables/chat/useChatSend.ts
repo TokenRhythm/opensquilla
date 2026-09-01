@@ -3828,6 +3828,17 @@ export function useChatSend(options: UseChatSendOptions) {
     const projectBlocked = !interactivityBlocked() && options.validateActiveProjectBeforeSend
       ? await refreshedActiveProjectBlocksSend()
       : false
+    if (options.sessionKey.value !== requestSessionKey) {
+      // Project validation yields to the UI. If navigation wins that race, the
+      // origin's durable outbox remains its sole owner; never enqueue or render
+      // that control through the newly selected session.
+      return hiddenDispatchResult(
+        durableOutbox ? 'queued' : 'rejected',
+        durableOutbox ? 'queued' : 'outbox_persist_failed',
+        stableClientRequestId,
+        requestSessionKey,
+      )
+    }
     const sendBlockedReason = idempotentReplay
       ? options.idempotentReplayBlockedReason || options.sendBlockedReason
       : options.sendBlockedReason
