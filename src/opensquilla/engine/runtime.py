@@ -326,6 +326,7 @@ from opensquilla.session.keys import (
     is_subagent_key,
     normalize_agent_id,
 )
+from opensquilla.session.storage import StaleEpochError
 from opensquilla.session.terminal_reply import (
     append_error_ref,
     build_terminal_reply,
@@ -4512,6 +4513,38 @@ def _resolve_submit_review(config: object) -> bool:
     return bool(getattr(config, "submit_review_enabled", False))
 
 
+class _TaskOwnedSessionAppend:
+    """Bind legacy input-stage appends to one admitted session incarnation."""
+
+    def __init__(
+        self,
+        manager: Any,
+        *,
+        session_id: str,
+        session_epoch: int,
+    ) -> None:
+        self._manager = manager
+        self._session_id = session_id
+        self._session_epoch = session_epoch
+
+    async def append_message(
+        self,
+        session_key: str,
+        role: str,
+        content: str,
+        *,
+        provenance: dict[str, Any] | None = None,
+    ) -> Any:
+        return await self._manager.append_message(
+            session_key,
+            role,
+            content,
+            provenance=provenance,
+            expected_session_id=self._session_id,
+            expected_session_epoch=self._session_epoch,
+        )
+
+
 class TurnRunner:
     """Orchestrates a complete agent turn: provider → tools → prompt → pipeline → Agent.
 
@@ -5075,6 +5108,8 @@ class TurnRunner:
         root_turn_id: str | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
         assistant_message_id: str | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run one agent turn with full orchestration.
 
@@ -5089,6 +5124,19 @@ class TurnRunner:
         """
         session_key = canonicalize_session_key(session_key)
         agent_id = normalize_agent_id(agent_id)
+        owner_supplied = (
+            expected_session_id is not None or expected_session_epoch is not None
+        )
+        if owner_supplied and (
+            not isinstance(expected_session_id, str)
+            or not expected_session_id.strip()
+            or isinstance(expected_session_epoch, bool)
+            or not isinstance(expected_session_epoch, int)
+            or expected_session_epoch < 0
+        ):
+            raise ValueError(
+                "expected_session_id and expected_session_epoch must form a valid pair"
+            )
         normalized_input_provenance = self._normalize_input_provenance(input_provenance)
         lock = self.get_session_lock(session_key)
         # Resolved once per turn; ValueError propagates so a run manifest
@@ -5215,6 +5263,8 @@ class TurnRunner:
                         root_turn_id=logical_turn_id,
                         provider_request_correlation=provider_request_correlation,
                         assistant_message_id=assistant_message_id,
+                        expected_session_id=expected_session_id,
+                        expected_session_epoch=expected_session_epoch,
                         execution_context=execution_context,
                     ):
                         yield event
@@ -5271,6 +5321,8 @@ class TurnRunner:
                             root_turn_id=logical_turn_id,
                             provider_request_correlation=provider_request_correlation,
                             assistant_message_id=assistant_message_id,
+                            expected_session_id=expected_session_id,
+                            expected_session_epoch=expected_session_epoch,
                             execution_context=execution_context,
                         ):
                             yield event
@@ -5315,6 +5367,8 @@ class TurnRunner:
         root_turn_id: str | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
         assistant_message_id: str | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
         execution_context: TurnExecutionContext | None = None,
     ) -> AsyncIterator[AgentEvent]:
         # Observability: bracket turn setup + stream loop with monotonic clock
@@ -5360,6 +5414,7 @@ class TurnRunner:
         turn_call_logger: TurnCallLogger | None = None
         trace_context = TraceContext.new(
             session_key=session_key,
+            session_id=expected_session_id,
             turn_id=turn_id,
             agent_id=agent_id,
         )
@@ -5399,7 +5454,11 @@ class TurnRunner:
             # an auxiliary provider call. This lookup is independent from the
             # optional usage sink and never falls back to the external
             # session_key, which may contain channel or user information.
-            pipeline_session_id = await self._resolve_session_id_for_log(session_key)
+            pipeline_session_id = (
+                expected_session_id
+                if expected_session_id is not None
+                else await self._resolve_session_id_for_log(session_key)
+            )
             if provider_request_correlation_disabled(config=self._turn_config()):
                 provider_request_correlation = None
             elif isinstance(correlation_seed, ProviderRequestCorrelation):
@@ -5418,6 +5477,17 @@ class TurnRunner:
             else:
                 provider_request_correlation = None
 
+            session_append: Any = self._session_manager
+            if (
+                session_append is not None
+                and expected_session_id is not None
+                and expected_session_epoch is not None
+            ):
+                session_append = _TaskOwnedSessionAppend(
+                    session_append,
+                    session_id=expected_session_id,
+                    session_epoch=expected_session_epoch,
+                )
             input_out = await self._input_stage.run(
                 InputStageInput(
                     message=message,
@@ -5427,7 +5497,7 @@ class TurnRunner:
                     input_provenance=input_provenance,
                     session_key=session_key,
                     tool_context=tool_context,
-                    session_append=self._session_manager,
+                    session_append=session_append,
                 )
             )
             runtime_message = input_out.runtime_message
@@ -5478,7 +5548,12 @@ class TurnRunner:
                         "error_chars": len(provider_error_event.message),
                     },
                 )
-                await self._persist_turn_error(session_key, provider_error_event)
+                await self._persist_turn_error(
+                    session_key,
+                    provider_error_event,
+                    expected_session_id=expected_session_id,
+                    expected_session_epoch=expected_session_epoch,
+                )
                 yield provider_error_event
                 return
             pt_out = pt_outcome.require_output()
@@ -5543,7 +5618,11 @@ class TurnRunner:
                     agent_run_id=turn_id,
                     turn_id=turn_id,
                     session_id=pipeline_session_id,
-                    session_epoch=self._usage_session_epoch_by_key.get(session_key, 0),
+                    session_epoch=(
+                        expected_session_epoch
+                        if expected_session_epoch is not None
+                        else self._usage_session_epoch_by_key.get(session_key, 0)
+                    ),
                     agent_id=agent_id,
                     run_kind=run_kind or "turn",
                 )
@@ -5619,12 +5698,23 @@ class TurnRunner:
                 )
             resolved_model = pa_out.resolved_model
             provider_name = pa_out.provider_name
-            session_id_for_log = pa_out.session_id_for_log
+            # Prompt assembly may resolve the mutable current session after a
+            # task has already been admitted.  Keep every task-owned record on
+            # the admitted incarnation instead of relabelling it after reset.
+            session_id_for_log = (
+                expected_session_id
+                if expected_session_id is not None
+                else pa_out.session_id_for_log
+            )
             prompt_report_for_log = pa_out.prompt_report
             selector_model = pa_out.selector_model
             trace_context = replace(
                 trace_context,
-                session_id=pa_out.trace_context_session_id,
+                session_id=(
+                    expected_session_id
+                    if expected_session_id is not None
+                    else pa_out.trace_context_session_id
+                ),
             )
             if is_turn_call_log_enabled(self._diagnostics_state):
                 turn_call_logger = TurnCallLogger(
@@ -6377,6 +6467,8 @@ class TurnRunner:
                     root_turn_id=turn_id,
                     provider_request_correlation=provider_request_correlation,
                     assistant_message_id=assistant_message_id,
+                    expected_session_id=expected_session_id,
+                    expected_session_epoch=expected_session_epoch,
                     execution_context=execution_context,
                 ):
                     yield replayed_event
@@ -6433,6 +6525,8 @@ class TurnRunner:
                     run_kind=run_kind,
                     heartbeat_ack_max_chars=heartbeat_ack_max_chars,
                     no_memory_capture=no_memory_capture,
+                    expected_session_id=expected_session_id,
+                    expected_session_epoch=expected_session_epoch,
                     assistant_message_id=execution_context.identity.assistant_message_id,
                     execution_context=execution_context,
                     publication_ledger=execution_context.publication_ledger,
@@ -6731,6 +6825,10 @@ class TurnRunner:
                             execution_context.identity.assistant_message_id
                         ),
                     }
+                    if expected_session_id is not None:
+                        append_kwargs["expected_session_id"] = expected_session_id
+                    if expected_session_epoch is not None:
+                        append_kwargs["expected_session_epoch"] = expected_session_epoch
                     append_message = self._session_manager.append_message
                     if _accepts_keyword_arg(append_message, "turn_usage"):
                         append_kwargs["turn_usage"] = cancelled_turn_usage
@@ -6828,6 +6926,17 @@ class TurnRunner:
             raise
 
         except Exception as exc:
+            if isinstance(exc, StaleEpochError):
+                # A reset retired this task's transcript authority. Never
+                # translate the rejected finalizer append into an unfenced
+                # system Error row in the replacement incarnation.
+                log.info(
+                    "turn_runner.stale_session_owner",
+                    session_key=session_key,
+                    expected_session_id=expected_session_id,
+                    expected_session_epoch=expected_session_epoch,
+                )
+                raise
             provider_boundary_failure_kind = str(
                 getattr(exc, "failure_kind", "") or ""
             ).strip()
@@ -6900,7 +7009,11 @@ class TurnRunner:
             error_id = await self._record_turn_error(
                 session_key=session_key,
                 turn_id=turn_id,
-                session_id=session_id_for_log,
+                session_id=(
+                    expected_session_id
+                    if expected_session_id is not None
+                    else session_id_for_log
+                ),
                 surface=input_mode or "unknown",
                 error_class=error_code or type(exc).__name__,
                 message=error_message,
@@ -6931,8 +7044,19 @@ class TurnRunner:
                     )
                 else:
                     transcript_message = f"Error: {append_error_ref(error_message, error_id)}"
+                error_append_kwargs: dict[str, Any] = {
+                    "role": "system",
+                    "content": transcript_message,
+                }
+                if expected_session_id is not None:
+                    error_append_kwargs["expected_session_id"] = expected_session_id
+                if expected_session_epoch is not None:
+                    error_append_kwargs["expected_session_epoch"] = (
+                        expected_session_epoch
+                    )
                 await self._append_session_message(
-                    session_key, role="system", content=transcript_message
+                    session_key,
+                    **error_append_kwargs,
                 )
             if turn_call_logger is not None:
                 turn_call_logger.write(
@@ -7238,6 +7362,8 @@ class TurnRunner:
         event: ErrorEvent | None,
         *,
         append_transcript: bool = True,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> None:
         """Best-effort durable transcript record for terminal turn errors."""
         if self._session_manager is None or event is None:
@@ -7264,7 +7390,7 @@ class TurnRunner:
             error_id = await self._record_turn_error(
                 session_key=session_key,
                 turn_id=None,
-                session_id=None,
+                session_id=expected_session_id,
                 surface="unknown",
                 error_class=event_code,
                 message=message,
@@ -7303,7 +7429,11 @@ class TurnRunner:
         else:
             transcript_message = f"Error: {append_error_ref(message, error_id)}"
         try:
-            if event_code == "current_turn_context_exhausted":
+            if (
+                event_code == "current_turn_context_exhausted"
+                and expected_session_id is None
+                and expected_session_epoch is None
+            ):
                 compact = getattr(self._session_manager, "compact", None)
                 if callable(compact):
                     budget = int(
@@ -7322,11 +7452,15 @@ class TurnRunner:
                             code=event_code,
                             error=str(exc),
                         )
-            await self._append_session_message(
-                session_key,
-                role="system",
-                content=transcript_message,
-            )
+            append_kwargs: dict[str, Any] = {
+                "role": "system",
+                "content": transcript_message,
+            }
+            if expected_session_id is not None:
+                append_kwargs["expected_session_id"] = expected_session_id
+            if expected_session_epoch is not None:
+                append_kwargs["expected_session_epoch"] = expected_session_epoch
+            await self._append_session_message(session_key, **append_kwargs)
             log.info(
                 "turn_runner.error_persisted",
                 session_key=session_key,

@@ -208,6 +208,8 @@ class TranscriptAppendPort(Protocol):
         turn_usage: dict[str, Any] | None,
         token_count: int | None,
         assistant_message_id: str | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> TranscriptAppendResult | bool: ...
 
 @runtime_checkable
@@ -480,6 +482,8 @@ class TurnErrorPersistPort(Protocol):
         session_key: str,
         event: ErrorEvent | None,
         append_transcript: bool = True,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> None: ...
 
 
@@ -573,6 +577,10 @@ class TurnFinalizerStageInput:
     heartbeat_ack_max_chars: int
     no_memory_capture: bool
 
+    # Immutable session-incarnation owner captured during task admission.
+    # ``None`` preserves direct and legacy TurnRunner callers.
+    expected_session_id: str | None = None
+    expected_session_epoch: int | None = None
     # Additive identity path.  ``None`` preserves direct/legacy stage callers;
     # an identity-aware TurnRunner supplies one id before streaming starts.
     assistant_message_id: str | None = None
@@ -835,6 +843,10 @@ class TurnFinalizerStage:
             }
             if assistant_message_id is not None:
                 append_kwargs["assistant_message_id"] = assistant_message_id
+            if inp.expected_session_id is not None:
+                append_kwargs["expected_session_id"] = inp.expected_session_id
+            if inp.expected_session_epoch is not None:
+                append_kwargs["expected_session_epoch"] = inp.expected_session_epoch
             append_result = await self._transcript_append.append_message(
                 inp.session_key,
                 **append_kwargs,
@@ -891,11 +903,16 @@ class TurnFinalizerStage:
         # adapter folds the session-manager-None guard, and the helper
         # also guards event-is-None internally).
         if inp.error_message:
-            await self._turn_error_persist.persist_error(
-                session_key=inp.session_key,
-                event=inp.pending_error_event,
-                append_transcript=not inp.terminal_generation_reset,
-            )
+            error_kwargs: dict[str, Any] = {
+                "session_key": inp.session_key,
+                "event": inp.pending_error_event,
+                "append_transcript": not inp.terminal_generation_reset,
+            }
+            if inp.expected_session_id is not None:
+                error_kwargs["expected_session_id"] = inp.expected_session_id
+            if inp.expected_session_epoch is not None:
+                error_kwargs["expected_session_epoch"] = inp.expected_session_epoch
+            await self._turn_error_persist.persist_error(**error_kwargs)
 
         # 5. Session totals rollup (only when DoneEvent present; the
         # adapter folds the session-manager-None and

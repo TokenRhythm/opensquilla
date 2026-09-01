@@ -85,6 +85,10 @@ class RouteEnvelope:
         repr=False,
         compare=False,
     )
+    # Immutable session generation captured when this turn is admitted. Keep
+    # this additive field last so older positional RouteEnvelope construction
+    # retains its existing argument layout.
+    session_epoch: int | None = None
 
     def delivery_fields(self) -> dict[str, Any]:
         """Return session routing fields derived from the reply target."""
@@ -126,6 +130,8 @@ def build_channel_route_envelope(
     session_prefix: str,
     agent_id: str | None = None,
     channel_type: str | None = None,
+    session_id: str | None = None,
+    session_epoch: int | None = None,
 ) -> RouteEnvelope:
     """Build a route for a normalized inbound channel message."""
     metadata = dict(msg.metadata or {})
@@ -152,6 +158,7 @@ def build_channel_route_envelope(
         source_name=session_prefix,
         agent_id=resolved_agent_id,
         session_key=session_key,
+        session_id=session_id,
         sender_id=msg.sender_id,
         account_id=account_id,
         channel_type=resolved_channel_type,
@@ -174,6 +181,7 @@ def build_channel_route_envelope(
         delivery_context=delivery_context,
         metadata=metadata,
         interaction_mode=InteractionMode.UNATTENDED,
+        session_epoch=session_epoch,
     )
 
 
@@ -185,6 +193,7 @@ def build_cli_route_envelope(
     channel_id: str = "cli:agent",
     sender_id: str | None = None,
     session_id: str | None = None,
+    session_epoch: int | None = None,
     principal_is_owner: bool | None = None,
     principal_host_execute: bool | None = None,
     interaction_mode: InteractionMode | str = InteractionMode.INTERACTIVE,
@@ -219,6 +228,7 @@ def build_cli_route_envelope(
         input_provenance={"kind": "cli_message", "source": source_name},
         metadata=metadata,
         interaction_mode=resolved_interaction_mode,
+        session_epoch=session_epoch,
     )
 
 
@@ -231,6 +241,7 @@ def build_web_route_envelope(
     sender_id: str | None = None,
     channel_id: str | None = None,
     session_id: str | None = None,
+    session_epoch: int | None = None,
     tool_source_kind: str | None = None,
     principal_is_owner: bool | None = None,
     principal_host_execute: bool | None = None,
@@ -265,6 +276,7 @@ def build_web_route_envelope(
         delivery_context={"sender_id": sender_id, "channel_id": resolved_channel_id},
         metadata=metadata,
         interaction_mode=InteractionMode.INTERACTIVE,
+        session_epoch=session_epoch,
     )
 
 

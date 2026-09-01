@@ -1586,8 +1586,10 @@ async def _drain_task_runtime_for_reset(task_runtime: Any, session_key: str) -> 
                 )
     except TimeoutError:
         log.warning("sessions.reset.task_runtime_drain_timeout", session_key=session_key)
+        raise
     except Exception:
         log.warning("sessions.reset.task_runtime_drain_failed", session_key=session_key)
+        raise
 
 
 def _optional_positive_timeout(config: Any, attr: str, default: float) -> float | None:
@@ -4231,6 +4233,17 @@ async def _handle_sessions_send_impl_inner(
         if isinstance(canonical_session_id, str) and canonical_session_id
         else key.split(":")[-1] or key
     )
+    session_epoch = int(getattr(session, "epoch", 0) or 0)
+
+    def _expected_session_owner_kwargs(call: Any) -> dict[str, Any]:
+        """Pass the admitted owner to modern writers while retaining legacy adapters."""
+
+        owner_kwargs: dict[str, Any] = {}
+        if _accepts_keyword_arg(call, "expected_session_id"):
+            owner_kwargs["expected_session_id"] = session_id
+        if _accepts_keyword_arg(call, "expected_session_epoch"):
+            owner_kwargs["expected_session_epoch"] = session_epoch
+        return owner_kwargs
     if prompt_annotation_ids:
         from opensquilla.artifact_session import (
             ActorKind,
@@ -4981,7 +4994,8 @@ async def _handle_sessions_send_impl_inner(
             source_name=source_hint.get("source_name") or "rpc",
             channel_id=source_hint.get("channel_id") or "cli:rpc",
             sender_id=source_hint.get("sender_id"),
-            session_id=getattr(session, "session_id", None),
+            session_id=session_id,
+            session_epoch=session_epoch,
             principal_is_owner=ctx.principal.is_owner,
             principal_host_execute=host_execute_allowed,
             run_mode=run_context.run_mode.value,
@@ -4995,7 +5009,8 @@ async def _handle_sessions_send_impl_inner(
             channel_id=source_hint.get("channel_id") or f"web:{ctx.conn_id}",
             source_name=source_hint.get("source_name") or "RPC",
             tool_source_kind=source_hint.get("source_kind"),
-            session_id=getattr(session, "session_id", None),
+            session_id=session_id,
+            session_epoch=session_epoch,
             principal_is_owner=ctx.principal.is_owner,
             principal_host_execute=host_execute_allowed,
         )
@@ -5276,6 +5291,7 @@ async def _handle_sessions_send_impl_inner(
     def _turn_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
         enriched = dict(payload)
         enriched.setdefault("session_id", session_id)
+        enriched["epoch"] = session_epoch
         if not enriched.get("turn_id"):
             enriched["turn_id"] = turn_id
         enriched.setdefault("client_message_id", client_message_id)
@@ -5328,7 +5344,12 @@ async def _handle_sessions_send_impl_inner(
             if ctx.turn_runner is None:
                 log.error("sessions.send.no_turn_runner", session_key=key)
                 await ctx.session_manager.append_message(
-                    key, role="system", content="Error: No turn runner available"
+                    key,
+                    role="system",
+                    content="Error: No turn runner available",
+                    **_expected_session_owner_kwargs(
+                        ctx.session_manager.append_message
+                    ),
                 )
                 await _emit_terminal_once(
                     "session.event.error",
@@ -5402,6 +5423,7 @@ async def _handle_sessions_send_impl_inner(
                 semantic_message=semantic_message_text,
                 fresh_user_session=fresh_user_session,
                 root_turn_id=turn_id,
+                **_expected_session_owner_kwargs(ctx.turn_runner.run),
             )
             raw_stream_idle_timeout = effective_agent_stream_idle_timeout_seconds(ctx.config)
             stream_idle_timeout: float | None = (
@@ -5452,6 +5474,20 @@ async def _handle_sessions_send_impl_inner(
                 await _emit_terminal_once("session.event.done", {"reason": "aborted"})
             except Exception:
                 pass
+        except StaleEpochError:
+            log.info(
+                "sessions.send.stale_session_owner",
+                session_key=key,
+                session_id=session_id,
+                session_epoch=session_epoch,
+            )
+            await _emit_terminal_once(
+                "session.event.error",
+                {
+                    "message": "The session changed before this turn completed.",
+                    "code": "session_changed",
+                },
+            )
         except TimeoutError:
             log.warning("sessions.send.stream_idle_timeout", session_key=key)
             timeout_message = build_terminal_reply(
@@ -5462,7 +5498,12 @@ async def _handle_sessions_send_impl_inner(
                     "error_message": _STREAM_IDLE_TIMEOUT_MESSAGE,
                 }
             )
-            await ctx.session_manager.append_message(key, role="system", content=timeout_message)
+            await ctx.session_manager.append_message(
+                key,
+                role="system",
+                content=timeout_message,
+                **_expected_session_owner_kwargs(ctx.session_manager.append_message),
+            )
             await _emit_terminal_once(
                 "session.event.error",
                 {"message": _STREAM_IDLE_TIMEOUT_MESSAGE, "code": _STREAM_IDLE_TIMEOUT_CODE},
@@ -5478,6 +5519,7 @@ async def _handle_sessions_send_impl_inner(
                 key,
                 role="system",
                 content=f"Error: {mapped.message}",
+                **_expected_session_owner_kwargs(ctx.session_manager.append_message),
             )
             await _emit_terminal_once(
                 "session.event.error",
@@ -5504,6 +5546,7 @@ async def _handle_sessions_send_impl_inner(
                 key,
                 role="system",
                 content=f"Error: {error_message}",
+                **_expected_session_owner_kwargs(ctx.session_manager.append_message),
             )
             await _emit_terminal_once(
                 "session.event.error",
@@ -8871,7 +8914,10 @@ async def _prepare_session_event_payload(
     # payloads so the frontend _isStaleEpoch guard can filter pre-reset frames.
     # Read from the in-process cache on SessionManager (populated by reset path) to
     # avoid a DB SELECT on every high-frequency event such as text_delta.
-    if event_name.startswith("session.event.") or event_name == "sessions.changed":
+    if (
+        "epoch" not in prepared
+        and (event_name.startswith("session.event.") or event_name == "sessions.changed")
+    ):
         session_manager = getattr(ctx, "session_manager", None)
         cached_epoch = get_session_epoch(session_manager, session_key)
         if cached_epoch is not None:
@@ -9579,10 +9625,10 @@ async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[s
     """Synchronous session reset with FlushReceipt.
 
     Sequence when ``ctx.flush_service`` is wired:
-    1. Drain any in-flight turn task so the per-session lock is free.
-    2. Acquire the per-session lock for the whole snapshot → flush → rotate
-       window (prevents a late turn write after flush).
-    3. Snapshot the transcript, execute the flush, then rotate via
+    1. Drain any in-flight runtime task.
+    2. Fence every session writer and settle detached writes.
+    3. Hold those fences for the whole snapshot → flush → rotate window.
+    4. Snapshot the transcript, execute the flush, then rotate via
        ``apply_intent(RESET_SAME_KEY)``.
 
     When ``ctx.flush_service`` is None (kill-switch path), falls back to
@@ -9601,6 +9647,23 @@ async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[s
     if storage is None:
         raise KeyError("No session storage available")
 
+    def _session_reset_busy(phase: str, exc: BaseException) -> RpcHandlerError:
+        log.warning(
+            "sessions.reset.quiesce_failed",
+            session_key=key,
+            phase=phase,
+            error_type=type(exc).__name__,
+        )
+        return RpcHandlerError(
+            code="session_reset_busy",
+            message=(
+                "Reset aborted because session work could not be fully drained. "
+                "Wait for the active turn to settle and retry."
+            ),
+            details={"key": key, "phase": phase},
+            retryable=True,
+        )
+
     task_runtime = getattr(ctx, "task_runtime", None)
     # Drain MUST run before any branch that clears session state — including the
     # flush_service=None (kill-switch) path.  Skipping drain here would let a
@@ -9610,22 +9673,16 @@ async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[s
     # force=True does not bypass this: the operator wants a clean slate, not a
     # corrupted one.  drain() is idempotent when no task is running.
     if task_runtime is not None:
-        await _drain_task_runtime_for_reset(task_runtime, key)
+        try:
+            async with asyncio.timeout(
+                _RESET_RUNTIME_SETTLE_SECONDS
+                + _RESET_RUNTIME_CANCEL_DRAIN_SECONDS
+            ):
+                await _drain_task_runtime_for_reset(task_runtime, key)
+        except Exception as exc:  # noqa: BLE001 - reset must fail closed.
+            raise _session_reset_busy("task_runtime_drain", exc) from exc
 
     force = bool((params or {}).get("force", False))
-
-    registry = get_agent_task_registry()
-    active = registry.get(key)
-    if active is not None and not active.done():
-        registry.cancel(key)
-        try:
-            await asyncio.wait_for(active, timeout=2.0)
-        except TimeoutError:
-            log.warning("sessions.reset.drain_timeout", session_key=key)
-        except asyncio.CancelledError:
-            log.debug("sessions.reset.drain_cancelled", session_key=key)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("sessions.reset.drain_failed", session_key=key, error=str(exc))
 
     turn_runner = ctx.turn_runner
     lock = get_session_lock(turn_runner, key)
@@ -9837,11 +9894,40 @@ async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[s
         with bind_usage_accounting_scope(usage_scope):
             return await _run_locked()
 
-    if lock is None:
+    session_keys = (key,)
+    async with contextlib.AsyncExitStack() as fences:
+        try:
+            # Bound only quiesce/drain acquisition. Flush retains its existing
+            # operation timeout while every acquired fence stays held through
+            # snapshot, safety gating, and identity rotation.
+            async with asyncio.timeout(_RESET_RUNTIME_CANCEL_DRAIN_SECONDS):
+                await fences.enter_async_context(
+                    quiesce_background_completion_sessions(session_keys)
+                )
+
+                quiesce_runtime = getattr(task_runtime, "quiesce_sessions", None)
+                if callable(quiesce_runtime):
+                    await fences.enter_async_context(quiesce_runtime(session_keys))
+
+                await fences.enter_async_context(
+                    get_agent_task_registry().quiesce_sessions(session_keys)
+                )
+
+                if lock is not None:
+                    await fences.enter_async_context(lock)
+
+                await drain_pending_flushes_for_sessions(session_keys)
+                drain_turn_writes = getattr(
+                    turn_runner,
+                    "drain_session_background_writes",
+                    None,
+                )
+                if callable(drain_turn_writes):
+                    await drain_turn_writes(session_keys)
+        except Exception as exc:  # noqa: BLE001 - rotation must not follow partial drain.
+            raise _session_reset_busy("writer_quiesce", exc) from exc
+
         result = await _run_accounted()
-    else:
-        async with lock:
-            result = await _run_accounted()
     keepalive_service = getattr(ctx, "prompt_cache_keepalive_service", None)
     if keepalive_service is not None:
         await keepalive_service.invalidate(key)

@@ -1518,6 +1518,85 @@ def _ordered_detail_message_ids(*values: Any) -> list[str]:
     return ordered
 
 
+def _bind_task_session_owner(
+    details: dict[str, Any],
+    *,
+    session_id: str,
+    session_epoch: int,
+) -> dict[str, Any]:
+    """Validate and freeze one task's durable session incarnation owner."""
+
+    if "session_id" in details:
+        bound_session_id = details["session_id"]
+        if not isinstance(bound_session_id, str) or not bound_session_id:
+            raise ValueError("Task session owner session_id must be a non-empty string")
+        if bound_session_id != session_id:
+            raise StaleEpochError(
+                "Task session owner changed before durable acceptance"
+            )
+    if "session_epoch" in details:
+        bound_session_epoch = details["session_epoch"]
+        if (
+            isinstance(bound_session_epoch, bool)
+            or not isinstance(bound_session_epoch, int)
+            or bound_session_epoch < 0
+        ):
+            raise ValueError(
+                "Task session owner session_epoch must be a non-negative integer"
+            )
+        if bound_session_epoch != session_epoch:
+            raise StaleEpochError(
+                "Task session epoch changed before durable acceptance"
+            )
+    details["session_id"] = session_id
+    details["session_epoch"] = session_epoch
+    return details
+
+
+def _validate_optional_session_owner(
+    *,
+    session_id: str | None,
+    session_epoch: int | None,
+) -> None:
+    """Validate a recovery CAS owner while allowing legacy id-only callers."""
+
+    if session_id is not None and (
+        not isinstance(session_id, str) or not session_id
+    ):
+        raise ValueError("expected session owner id must be a non-empty string")
+    if session_epoch is not None and (
+        isinstance(session_epoch, bool)
+        or not isinstance(session_epoch, int)
+        or session_epoch < 0
+    ):
+        raise ValueError("expected session owner epoch must be a non-negative integer")
+    if session_epoch is not None and session_id is None:
+        raise ValueError("expected session owner epoch requires its session id")
+
+
+async def _matches_session_owner_on_conn(
+    conn: Any,
+    *,
+    session_key: str,
+    session_id: str | None,
+    session_epoch: int | None,
+) -> bool:
+    """Return whether the current row still matches a supplied recovery owner."""
+
+    if session_id is None:
+        return True
+    async with conn.execute(
+        "SELECT session_id, epoch FROM sessions WHERE session_key = ?",
+        (session_key,),
+    ) as cur:
+        row = await cur.fetchone()
+    return bool(
+        row is not None
+        and str(row["session_id"]) == session_id
+        and (session_epoch is None or int(row["epoch"]) == session_epoch)
+    )
+
+
 def _deserialize_row(row: dict[str, Any]) -> dict[str, Any]:
     """Deserialize JSON text fields back to Python objects."""
     json_fields = {
@@ -7976,6 +8055,11 @@ class SessionStorage:
             details = dict(task_record.details or {})
             details.pop("goal_candidate", None)
             details["goal_context"] = context.as_task_detail()
+            details = _bind_task_session_owner(
+                details,
+                session_id=goal.session_id,
+                session_epoch=goal.session_epoch,
+            )
             metadata_raw = details.get("metadata")
             metadata = dict(metadata_raw) if isinstance(metadata_raw, dict) else {}
             metadata["required_collaboration_mode"] = "default"
@@ -9850,6 +9934,7 @@ class SessionStorage:
             SessionStatus.KILLED,
             SessionStatus.TIMEOUT,
         )
+        recovered_owners: set[tuple[str, str, int]] = set()
         async with self._write_transaction("claim_meta_control_recovery") as conn:
             async def quarantine_invalid(task_id: str) -> None:
                 await conn.execute(
@@ -9876,7 +9961,9 @@ class SessionStorage:
                 remaining = bounded_limit - len(recovered)
                 async with conn.execute(
                     """
-                    SELECT task.*
+                    SELECT task.*,
+                           owner.session_id AS recovery_owner_session_id,
+                           owner.epoch AS recovery_owner_epoch
                     FROM agent_tasks AS task
                     JOIN meta_control_intents AS intent
                       ON intent.accepted_task_id = task.task_id
@@ -9900,8 +9987,53 @@ class SessionStorage:
                     break
 
                 for raw_task in task_rows:
-                    task = AgentTaskRecord(**_deserialize_row(dict(raw_task)))
+                    task_data = dict(raw_task)
+                    owner_session_id = str(
+                        task_data.pop("recovery_owner_session_id")
+                    )
+                    owner_epoch = int(task_data.pop("recovery_owner_epoch"))
+                    task = AgentTaskRecord(**_deserialize_row(task_data))
                     details = task.details if isinstance(task.details, dict) else {}
+                    detail_session_id = (
+                        details["session_id"] if "session_id" in details else None
+                    )
+                    detail_session_epoch = (
+                        details["session_epoch"]
+                        if "session_epoch" in details
+                        else None
+                    )
+                    try:
+                        if "session_id" in details and (
+                            not isinstance(detail_session_id, str)
+                            or not detail_session_id
+                        ):
+                            raise ValueError(
+                                "Task session owner session_id must be a non-empty string"
+                            )
+                        if "session_epoch" in details and (
+                            isinstance(detail_session_epoch, bool)
+                            or not isinstance(detail_session_epoch, int)
+                            or detail_session_epoch < 0
+                        ):
+                            raise ValueError(
+                                "Task session owner session_epoch must be a non-negative integer"
+                            )
+                        _validate_optional_session_owner(
+                            session_id=detail_session_id,
+                            session_epoch=detail_session_epoch,
+                        )
+                    except ValueError:
+                        await quarantine_invalid(task.task_id)
+                        continue
+                    if (
+                        detail_session_id is not None
+                        and detail_session_id != owner_session_id
+                    ) or (
+                        detail_session_epoch is not None
+                        and detail_session_epoch != owner_epoch
+                    ):
+                        await quarantine_invalid(task.task_id)
+                        continue
                     metadata = details.get("metadata")
                     message_id = details.get("persisted_user_message_id")
                     if not isinstance(metadata, dict) or not isinstance(message_id, str):
@@ -9914,9 +10046,10 @@ class SessionStorage:
                     async with conn.execute(
                         """
                         SELECT * FROM transcript_entries
-                        WHERE session_key = ? AND message_id = ? AND role = 'user'
+                        WHERE session_key = ? AND session_id = ?
+                          AND message_id = ? AND role = 'user'
                         """,
-                        (task.session_key, message_id),
+                        (task.session_key, owner_session_id, message_id),
                     ) as entry_cur:
                         entry_row = await entry_cur.fetchone()
                     if entry_row is None:
@@ -9924,7 +10057,8 @@ class SessionStorage:
                         continue
                     entry = TranscriptEntry(**_deserialize_row(dict(entry_row)))
                     if (
-                        not isinstance(entry.turn_context, dict)
+                        entry.session_id != owner_session_id
+                        or not isinstance(entry.turn_context, dict)
                         or entry.turn_context.get("meta_control") != control
                     ):
                         await quarantine_invalid(task.task_id)
@@ -9936,12 +10070,19 @@ class SessionStorage:
                             terminal_reason = NULL, error_class = NULL, error_message = NULL
                         WHERE task_id = ? AND status = ?
                           AND terminal_reason = 'meta_control_restart_before_start'
+                          AND EXISTS (
+                              SELECT 1 FROM sessions AS owner
+                              WHERE owner.session_key = agent_tasks.session_key
+                                AND owner.session_id = ? AND owner.epoch = ?
+                          )
                         """,
                         (
                             AgentTaskStatus.QUEUED,
                             now_ms,
                             task.task_id,
                             AgentTaskStatus.ABANDONED,
+                            owner_session_id,
+                            owner_epoch,
                         ),
                     ) as update_cur:
                         if int(update_cur.rowcount or 0) != 1:
@@ -9953,20 +10094,26 @@ class SessionStorage:
                     task.error_class = None
                     task.error_message = None
                     recovered.append(RecoverableMetaControlTask(task=task, entry=entry))
+                    recovered_owners.add(
+                        (task.session_key, owner_session_id, owner_epoch)
+                    )
 
-            recovered_keys = sorted({item.task.session_key for item in recovered})
-            for session_key in recovered_keys:
+            for session_key, owner_session_id, owner_epoch in sorted(
+                recovered_owners
+            ):
                 await conn.execute(
                     """
                     UPDATE sessions
                     SET status = ?, updated_at = ?, ended_at = NULL, runtime_ms = NULL
-                    WHERE session_key = ?
+                    WHERE session_key = ? AND session_id = ? AND epoch = ?
                       AND status NOT IN (?, ?, ?, ?)
                     """,
                     (
                         SessionStatus.RUNNING,
                         now_ms,
                         session_key,
+                        owner_session_id,
+                        owner_epoch,
                         *terminal_session_statuses,
                     ),
                 )
@@ -9980,15 +10127,28 @@ class SessionStorage:
         *,
         session_key: str,
         expected_epoch: int,
+        expected_session_id: str | None = None,
     ) -> None:
         async with conn.execute(
-            "SELECT epoch FROM sessions WHERE session_key = ?",
+            "SELECT session_id, epoch FROM sessions WHERE session_key = ?",
             (session_key,),
         ) as cur:
             row = await cur.fetchone()
-        actual = int(row[0]) if row is not None else None
+        actual_session_id = str(row[0]) if row is not None else None
+        actual_epoch = int(row[1]) if row is not None else None
+        expected_owner = (
+            f"{expected_session_id}@{expected_epoch}"
+            if expected_session_id is not None
+            else str(expected_epoch)
+        )
+        actual_owner = (
+            f"{actual_session_id}@{actual_epoch}"
+            if actual_session_id is not None
+            else "missing"
+        )
         raise StaleEpochError(
-            f"Epoch mismatch for {session_key}: expected {expected_epoch}, got {actual}"
+            f"Session owner mismatch for {session_key}: "
+            f"expected {expected_owner}, got {actual_owner}"
         )
 
     @classmethod
@@ -10017,12 +10177,12 @@ class SessionStorage:
             f"SELECT {placeholders} "
             "WHERE EXISTS ("
             "  SELECT 1 FROM sessions "
-            "  WHERE session_key = ? AND epoch = ?"
+            "  WHERE session_key = ? AND session_id = ? AND epoch = ?"
             ")"
         )
         async with conn.execute(
             insert_sql,
-            values + [entry.session_key, expected_epoch],
+            values + [entry.session_key, entry.session_id, expected_epoch],
         ) as cur:
             inserted = cur.rowcount or 0
         if inserted == 0:
@@ -10030,6 +10190,7 @@ class SessionStorage:
                 conn,
                 session_key=entry.session_key,
                 expected_epoch=expected_epoch,
+                expected_session_id=entry.session_id,
             )
 
     async def append_transcript_entry(
@@ -10061,15 +10222,19 @@ class SessionStorage:
 
         if expected_epoch is not None:
             async with conn.execute(
-                "SELECT epoch FROM sessions WHERE session_key = ?",
-                (entry.session_key,),
+                """
+                SELECT 1 FROM sessions
+                WHERE session_key = ? AND session_id = ? AND epoch = ?
+                """,
+                (entry.session_key, entry.session_id, expected_epoch),
             ) as cur:
                 session_row = await cur.fetchone()
-            if session_row is None or int(session_row[0]) != expected_epoch:
+            if session_row is None:
                 await cls._raise_stale_epoch(
                     conn,
                     session_key=entry.session_key,
                     expected_epoch=expected_epoch,
+                    expected_session_id=entry.session_id,
                 )
 
         async with conn.execute(
@@ -10134,13 +10299,14 @@ class SessionStorage:
                 SET updated_at = ?,
                     total_tokens = total_tokens + ?,
                     total_tokens_fresh = CASE WHEN ? THEN 0 ELSE total_tokens_fresh END
-                WHERE session_key = ? AND epoch = ?
+                WHERE session_key = ? AND session_id = ? AND epoch = ?
                 """,
                 (
                     updated_at,
                     effective_token_delta,
                     int(mark_total_tokens_stale and inserted),
                     entry.session_key,
+                    entry.session_id,
                     expected_epoch,
                 ),
             ) as cur:
@@ -10150,6 +10316,7 @@ class SessionStorage:
                     conn,
                     session_key=entry.session_key,
                     expected_epoch=expected_epoch,
+                    expected_session_id=entry.session_id,
                 )
         return inserted
 
@@ -10177,13 +10344,14 @@ class SessionStorage:
                 SET updated_at = ?,
                     total_tokens = total_tokens + ?,
                     total_tokens_fresh = CASE WHEN ? THEN 0 ELSE total_tokens_fresh END
-                WHERE session_key = ? AND epoch = ?
+                WHERE session_key = ? AND session_id = ? AND epoch = ?
                 """,
                 (
                     updated_at,
                     token_delta,
                     int(mark_total_tokens_stale),
                     entry.session_key,
+                    entry.session_id,
                     expected_epoch,
                 ),
             ) as cur:
@@ -10193,6 +10361,7 @@ class SessionStorage:
                     conn,
                     session_key=entry.session_key,
                     expected_epoch=expected_epoch,
+                    expected_session_id=entry.session_id,
                 )
 
     @staticmethod
@@ -12236,6 +12405,11 @@ class SessionStorage:
             task_record.agent_id = normalize_agent_id(task_record.agent_id)
             if task_record.session_key != entry.session_key:
                 raise ValueError("task and transcript session keys must match")
+            task_record.details = _bind_task_session_owner(
+                dict(task_record.details or {}),
+                session_id=entry.session_id,
+                session_epoch=expected_epoch,
+            )
         if isinstance(goal_mutation, StartGoalMutation):
             if task_record is None or merge_into_task:
                 raise ValueError("Goal set requires one newly accepted runtime task")
@@ -13224,7 +13398,17 @@ class SessionStorage:
                         if isinstance(existing_details_raw, dict)
                         else {}
                     )
+                    existing_details = _bind_task_session_owner(
+                        existing_details,
+                        session_id=entry.session_id,
+                        session_epoch=expected_epoch,
+                    )
                     details = {**existing_details, **incoming_details}
+                    # The already queued task owns collection. Incoming detail
+                    # fields may add message metadata, but cannot rebind its
+                    # durable session incarnation.
+                    details["session_id"] = existing_details["session_id"]
+                    details["session_epoch"] = existing_details["session_epoch"]
                     if (
                         isinstance(
                             goal_mutation,
@@ -13303,6 +13487,11 @@ class SessionStorage:
                     )
                     incoming_count = incoming_details.get("message_count")
                     details = dict(incoming_details)
+                    details = _bind_task_session_owner(
+                        details,
+                        session_id=entry.session_id,
+                        session_epoch=expected_epoch,
+                    )
                     details["persisted_user_message_id"] = entry.message_id
                     details["persisted_user_message_ids"] = message_ids
                     details["message_count"] = (
@@ -13928,9 +14117,15 @@ class SessionStorage:
         message_ids: Sequence[str],
         task_record: AgentTaskRecord,
         recovery: str = "process_restart_followup",
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> list[str]:
         """Create one follow-up and claim its steer rows atomically."""
 
+        _validate_optional_session_owner(
+            session_id=expected_session_id,
+            session_epoch=expected_session_epoch,
+        )
         ordered_ids = list(dict.fromkeys(message_id for message_id in message_ids if message_id))
         if not ordered_ids:
             return []
@@ -13938,6 +14133,37 @@ class SessionStorage:
         task_record.agent_id = normalize_agent_id(task_record.agent_id)
         claimed: list[tuple[str, str, str, dict[str, Any]]] = []
         async with self._write_transaction("promote_stranded_steer_inputs") as conn:
+            if not await _matches_session_owner_on_conn(
+                conn,
+                session_key=task_record.session_key,
+                session_id=expected_session_id,
+                session_epoch=expected_session_epoch,
+            ):
+                return []
+            if expected_session_id is not None:
+                task_details = dict(task_record.details or {})
+                if expected_session_epoch is not None:
+                    task_details = _bind_task_session_owner(
+                        task_details,
+                        session_id=expected_session_id,
+                        session_epoch=expected_session_epoch,
+                    )
+                else:
+                    if "session_id" in task_details:
+                        detail_session_id = task_details["session_id"]
+                        if (
+                            not isinstance(detail_session_id, str)
+                            or not detail_session_id
+                        ):
+                            raise ValueError(
+                                "Task session owner session_id must be a non-empty string"
+                            )
+                        if detail_session_id != expected_session_id:
+                            raise StaleEpochError(
+                                "Task session owner changed before recovery promotion"
+                            )
+                    task_details["session_id"] = expected_session_id
+                task_record.details = task_details
             async with conn.execute(
                 "SELECT status FROM agent_tasks WHERE task_id = ?",
                 (target_task_id,),
@@ -13969,6 +14195,11 @@ class SessionStorage:
                 ) as cur:
                     receipt_row = await cur.fetchone()
                 if receipt_row is None:
+                    continue
+                if (
+                    expected_session_id is not None
+                    and str(receipt_row["session_id"]) != expected_session_id
+                ):
                     continue
                 for table in ("transcript_entries", "compacted_transcript_entries"):
                     async with conn.execute(
@@ -14065,10 +14296,71 @@ class SessionStorage:
                 tasks.append(task)
         return tasks
 
-    async def requeue_steer_recovery_task(self, task_id: str) -> bool:
+    async def requeue_steer_recovery_task(
+        self,
+        task_id: str,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> bool:
         """CAS a never-started recovery task back to QUEUED after restart."""
 
+        _validate_optional_session_owner(
+            session_id=expected_session_id,
+            session_epoch=expected_session_epoch,
+        )
         async with self._write_transaction("requeue_steer_recovery_task") as conn:
+            async with conn.execute(
+                """
+                SELECT session_key, details
+                FROM agent_tasks
+                WHERE task_id = ?
+                  AND status = ?
+                  AND terminal_reason = ?
+                  AND started_at IS NULL
+                """,
+                (
+                    task_id,
+                    AgentTaskStatus.ABANDONED,
+                    "process_restart",
+                ),
+            ) as cur:
+                task_row = await cur.fetchone()
+            if task_row is None:
+                return False
+            session_key = canonicalize_session_key(str(task_row["session_key"]))
+            if not await _matches_session_owner_on_conn(
+                conn,
+                session_key=session_key,
+                session_id=expected_session_id,
+                session_epoch=expected_session_epoch,
+            ):
+                return False
+            details_raw = _deserialize_row({"details": task_row["details"]}).get(
+                "details"
+            )
+            details = dict(details_raw) if isinstance(details_raw, dict) else {}
+            if expected_session_id is not None:
+                if expected_session_epoch is not None:
+                    details = _bind_task_session_owner(
+                        details,
+                        session_id=expected_session_id,
+                        session_epoch=expected_session_epoch,
+                    )
+                else:
+                    if "session_id" in details:
+                        detail_session_id = details["session_id"]
+                        if (
+                            not isinstance(detail_session_id, str)
+                            or not detail_session_id
+                        ):
+                            raise ValueError(
+                                "Task session owner session_id must be a non-empty string"
+                            )
+                        if detail_session_id != expected_session_id:
+                            return False
+                    details["session_id"] = expected_session_id
+            details.pop("turn_outcome", None)
             async with conn.execute(
                 """
                 UPDATE agent_tasks
@@ -14093,23 +14385,10 @@ class SessionStorage:
             ) as cur:
                 changed = cur.rowcount or 0
             if changed:
-                async with conn.execute(
-                    "SELECT details FROM agent_tasks WHERE task_id = ?",
-                    (task_id,),
-                ) as cur:
-                    row = await cur.fetchone()
-                if row is not None:
-                    details_raw = _deserialize_row({"details": row["details"]}).get(
-                        "details"
-                    )
-                    details = (
-                        dict(details_raw) if isinstance(details_raw, dict) else {}
-                    )
-                    details.pop("turn_outcome", None)
-                    await conn.execute(
-                        "UPDATE agent_tasks SET details = ? WHERE task_id = ?",
-                        (_serialize(details), task_id),
-                    )
+                await conn.execute(
+                    "UPDATE agent_tasks SET details = ? WHERE task_id = ?",
+                    (_serialize(details), task_id),
+                )
         return changed > 0
 
     async def _canonical_transcript_cursor_exists(

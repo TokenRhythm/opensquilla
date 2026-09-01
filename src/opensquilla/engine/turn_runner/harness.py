@@ -1674,6 +1674,8 @@ class _TurnRunnerTranscriptAppendAdapter(TranscriptAppendPort):
         turn_usage: dict[str, Any] | None,
         token_count: int | None,
         assistant_message_id: str | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> TranscriptAppendResult:
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
@@ -1696,6 +1698,10 @@ class _TurnRunnerTranscriptAppendAdapter(TranscriptAppendPort):
             append_kwargs["turn_usage"] = turn_usage
         if _accepts_keyword_arg(session_manager.append_message, "token_count"):
             append_kwargs["token_count"] = token_count
+        if expected_session_id is not None:
+            append_kwargs["expected_session_id"] = expected_session_id
+        if expected_session_epoch is not None:
+            append_kwargs["expected_session_epoch"] = expected_session_epoch
         entry = await self._runner._append_session_message(session_key, **append_kwargs)
         raw_message_id = getattr(entry, "message_id", None)
         message_id = (
@@ -1985,11 +1991,15 @@ class _TurnRunnerTurnErrorPersistAdapter(TurnErrorPersistPort):
         session_key: str,
         event: ErrorEvent | None,
         append_transcript: bool = True,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> None:
         await self._runner._persist_turn_error(
             session_key,
             event,
             append_transcript=append_transcript,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
         )
 
 

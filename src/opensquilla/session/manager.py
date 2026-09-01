@@ -59,6 +59,7 @@ from opensquilla.session.storage import (
     CANONICAL_FORK_PROOF_SCHEMA_VERSION,
     ResetArchiveSnapshot,
     SessionStorage,
+    StaleEpochError,
 )
 from opensquilla.session.tokenizer import estimate_tokens
 from opensquilla.silent_reply import sanitize_historical_silent_reply
@@ -2118,8 +2119,42 @@ class SessionManager:
         turn_usage: dict[str, Any] | None = None,
         token_count: int | None = None,
         provenance: dict[str, Any] | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> TranscriptEntry:
         """Append a message and narrowly touch its session in one transaction."""
+
+        owner_supplied = (
+            expected_session_id is not None or expected_session_epoch is not None
+        )
+        if owner_supplied and (
+            not isinstance(expected_session_id, str)
+            or not expected_session_id.strip()
+            or isinstance(expected_session_epoch, bool)
+            or not isinstance(expected_session_epoch, int)
+            or expected_session_epoch < 0
+        ):
+            raise ValueError(
+                "expected_session_id and expected_session_epoch must form a valid pair"
+            )
+        owner_node: SessionNode | None = None
+        if owner_supplied:
+            session_key = canonicalize_session_key(session_key)
+            owner_node = await self._storage.get_session(session_key)
+            if (
+                owner_node is None
+                or owner_node.session_id != expected_session_id
+                or int(owner_node.epoch or 0) != expected_session_epoch
+            ):
+                actual_owner = (
+                    "missing"
+                    if owner_node is None
+                    else f"{owner_node.session_id}@{int(owner_node.epoch or 0)}"
+                )
+                raise StaleEpochError(
+                    f"Session owner mismatch for {session_key}: expected "
+                    f"{expected_session_id}@{expected_session_epoch}, got {actual_owner}"
+                )
 
         if message_id is not None and assistant_message_id is not None:
             if message_id != assistant_message_id:
@@ -2136,6 +2171,7 @@ class SessionManager:
             turn_usage=turn_usage,
             token_count=token_count,
             provenance=provenance,
+            session_node=owner_node,
         )
         token_delta = token_count if token_count and turn_usage is None else 0
         submitted_plan = (
@@ -2164,8 +2200,8 @@ class SessionManager:
             node = await self._storage.get_session(session_key)
             if node is None:
                 raise KeyError(f"Session not found: {session_key}")
-            if node.epoch != expected_epoch:
-                raise RuntimeError("Session changed before plan submission")
+            if node.session_id != entry.session_id or node.epoch != expected_epoch:
+                raise StaleEpochError("Session changed before plan submission")
             parent_revision_id = node.active_plan_revision_id
             parent = (
                 await self._storage.get_plan_revision(parent_revision_id)

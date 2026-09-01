@@ -1269,6 +1269,40 @@ def _task_runtime_envelope_host_execute(envelope: Any) -> bool:
     return _task_runtime_envelope_owner(envelope)
 
 
+def _task_runtime_wire_owner(run: Any) -> dict[str, Any]:
+    """Return the admitted owner using public session-event field names."""
+
+    payload: dict[str, Any] = {}
+    session_id = getattr(run, "session_id", None)
+    if isinstance(session_id, str) and session_id:
+        payload["session_id"] = session_id
+    session_epoch = getattr(run, "session_epoch", None)
+    if (
+        isinstance(session_epoch, int)
+        and not isinstance(session_epoch, bool)
+        and session_epoch >= 0
+    ):
+        payload["epoch"] = session_epoch
+    return payload
+
+
+def _validate_task_runtime_session_owner(run: Any, session: Any) -> None:
+    """Reject an admitted task whose session generation is no longer current."""
+
+    expected_session_id = getattr(run, "session_id", None)
+    expected_session_epoch = getattr(run, "session_epoch", None)
+    if (
+        expected_session_id is not None
+        and getattr(session, "session_id", None) != expected_session_id
+    ) or (
+        expected_session_epoch is not None
+        and getattr(session, "epoch", None) != expected_session_epoch
+    ):
+        from opensquilla.session.storage import StaleEpochError
+
+        raise StaleEpochError("Task session owner changed before provider dispatch")
+
+
 async def dispatch_task_runtime_turn(
     run: Any,
     *,
@@ -1301,6 +1335,7 @@ async def dispatch_task_runtime_turn(
         session = await storage.get_session(run.session_key)
         if session is None:
             raise KeyError(f"Session not found: {run.session_key}")
+        _validate_task_runtime_session_owner(run, session)
         try:
             run_context, _workspace_guard = await authoritative_project_run_context(
                 storage=storage,
@@ -1322,6 +1357,7 @@ async def dispatch_task_runtime_turn(
                     "code": mapped.code,
                     "details": mapped.details,
                     "task_id": getattr(run, "task_id", None),
+                    **_task_runtime_wire_owner(run),
                 },
             )
             raise
@@ -1368,6 +1404,8 @@ async def dispatch_task_runtime_turn(
         )
     ):
         session = await session_manager.get_session(run.session_key)
+        if session is not None:
+            _validate_task_runtime_session_owner(run, session)
     run_kwargs = build_task_runtime_run_kwargs(
         run,
         tool_context=tool_context,
@@ -1400,7 +1438,8 @@ async def dispatch_task_runtime_turn(
                 context_bound=is_context_bound_owner(turn_runner),
                 stream_event_sink=getattr(run, "stream_event_sink", None),
                 task_id=getattr(run, "task_id", None),
-                session_id=getattr(run.envelope, "session_id", None),
+                session_id=getattr(run, "session_id", None),
+                session_epoch=getattr(run, "session_epoch", None),
                 client_message_id=getattr(run.envelope, "metadata", {}).get("client_message_id"),
                 user_message_id=getattr(run, "persisted_user_message_id", None),
                 surface_id=getattr(run.envelope, "metadata", {}).get("surface_id"),
@@ -1574,6 +1613,17 @@ def build_task_runtime_run_kwargs(
         # Only forward when set so web/CLI legacy paths keep
         # ``TurnRunner.run`` falling back to ``message`` as semantic input.
         kwargs["semantic_message"] = run.semantic_message
+    expected_session_id = getattr(run, "session_id", None)
+    expected_session_epoch = getattr(run, "session_epoch", None)
+    if (
+        isinstance(expected_session_id, str)
+        and expected_session_id
+        and isinstance(expected_session_epoch, int)
+        and not isinstance(expected_session_epoch, bool)
+        and expected_session_epoch >= 0
+    ):
+        kwargs["expected_session_id"] = expected_session_id
+        kwargs["expected_session_epoch"] = expected_session_epoch
     provider_request_correlation = getattr(
         run,
         "provider_request_correlation",
@@ -1813,6 +1863,7 @@ async def _emit_task_runtime_stream_events(
     stream_event_sink: Any = None,
     task_id: str | None = None,
     session_id: str | None = None,
+    session_epoch: int | None = None,
     client_message_id: str | None = None,
     user_message_id: str | None = None,
     surface_id: str | None = None,
@@ -2048,6 +2099,12 @@ async def _emit_task_runtime_stream_events(
                 event_dict["turn_id"] = task_id
         if session_id:
             event_dict["session_id"] = session_id
+        if (
+            isinstance(session_epoch, int)
+            and not isinstance(session_epoch, bool)
+            and session_epoch >= 0
+        ):
+            event_dict["epoch"] = session_epoch
         if client_message_id:
             event_dict["client_message_id"] = client_message_id
         if primary_user_message_id is not None:
