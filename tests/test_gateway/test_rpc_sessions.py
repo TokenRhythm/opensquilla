@@ -3792,13 +3792,30 @@ class TestSessionsSend:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("session_key", "origin", "intent"),
+        ("session_key", "origin", "intent", "last_channel", "channel_type"),
         [
-            pytest.param("cron:job-1:run:1", None, "continue", id="canonical-key"),
+            pytest.param(
+                "cron:job-1:run:1",
+                None,
+                "continue",
+                None,
+                None,
+                id="canonical-key",
+            ),
+            pytest.param(
+                "cron:job-1:run:2",
+                None,
+                "continue",
+                "corp-chat",
+                "whatsapp",
+                id="canonical-key-with-plugin-delivery-metadata",
+            ),
             pytest.param(
                 "scheduled-run-with-legacy-key",
                 {"kind": "cron"},
                 "reset_same_key",
+                None,
+                None,
                 id="origin-provenance-and-reset",
             ),
         ],
@@ -3810,11 +3827,14 @@ class TestSessionsSend:
         session_key: str,
         origin: dict[str, Any] | None,
         intent: str,
+        last_channel: str | None,
+        channel_type: str | None,
     ):
         cron_session = FakeSession(
             session_key=session_key,
             session_id="cron-run-1",
             origin=origin,
+            last_channel=last_channel,
         )
         manager = FakeSessionManager([cron_session])
         runner = _RecordingTurnRunner()
@@ -3826,7 +3846,12 @@ class TestSessionsSend:
             "ingest_attachments",
             ingest_attachments,
         )
-        ctx = make_ctx(session_manager=manager, turn_runner=runner)
+        config = GatewayConfig(memory={"flush_enabled": False})
+        if last_channel and channel_type:
+            config.channels.channels = [
+                SimpleNamespace(type=channel_type, name=last_channel)
+            ]
+        ctx = make_ctx(session_manager=manager, turn_runner=runner, config=config)
         send_params: dict[str, Any] = {
             "key": cron_session.session_key,
             "message": "Unexpected follow-up",

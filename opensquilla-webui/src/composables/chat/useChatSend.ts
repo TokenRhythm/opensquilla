@@ -201,7 +201,12 @@ interface SendAttempt {
   stopOwner?: symbol
 }
 
-export type ChatSendOutcome = 'accepted' | 'deferred' | 'not_sent' | 'retryable_failure'
+export type ChatSendOutcome =
+  | 'accepted'
+  | 'deferred'
+  | 'not_sent'
+  | 'policy_blocked'
+  | 'retryable_failure'
 
 interface ExplicitSendPayload {
   attachments: Attachment[]
@@ -518,6 +523,8 @@ export interface UseChatSendOptions {
   ) => Promise<TurnDocumentContext | null | false>
   pendingWorkspaceId?: Ref<string | null>
   sendBlockedReason?: Readonly<Ref<string | null>>
+  /** Permanent selected-session policy gate; exact receipt replays bypass it. */
+  sessionInteractivityBlockedReason?: Readonly<Ref<string | null>>
   /** Transport/admission-only gate used by exact replays after unknown acceptance. */
   idempotentReplayBlockedReason?: Readonly<Ref<string | null>>
   validateActiveProjectBeforeSend?: () => Promise<string | null>
@@ -2534,7 +2541,11 @@ export function useChatSend(options: UseChatSendOptions) {
         : outcome
     )
     const blockedOutcome = () => preserveRetryState(
-      delivery === 'followup' ? 'deferred' : 'not_sent',
+      !retryAttempt
+      && !steerRetryAttempt
+      && options.sessionInteractivityBlockedReason?.value
+        ? 'policy_blocked'
+        : delivery === 'followup' ? 'deferred' : 'not_sent',
     )
     if (!ownerSessionKey || options.sessionKey.value !== ownerSessionKey) {
       return preserveRetryState('not_sent')
@@ -2700,7 +2711,14 @@ export function useChatSend(options: UseChatSendOptions) {
     const blockedReason = sendOpts.idempotentReplay
       ? options.idempotentReplayBlockedReason || options.sendBlockedReason
       : options.sendBlockedReason
-    if (blockedReason?.value) return 'not_sent'
+    const blockedDispatchOutcome = (): ChatSendOutcome => (
+      !sendOpts.retryAttempt
+      && !sendOpts.idempotentReplay
+      && options.sessionInteractivityBlockedReason?.value
+        ? 'policy_blocked'
+        : 'not_sent'
+    )
+    if (blockedReason?.value) return blockedDispatchOutcome()
     const preDispatchAllowed = (
       stage: 'preflight' | 'before_rpc' = 'preflight',
     ) => sendOpts.preDispatchGuard?.(stage) !== false
@@ -2795,7 +2813,7 @@ export function useChatSend(options: UseChatSendOptions) {
         { isCurrent: () => options.sessionKey.value === requestSessionKey },
       )
       if (!ready || options.sessionKey.value !== requestSessionKey) return 'not_sent'
-      if (options.sendBlockedReason?.value) return 'not_sent'
+      if (options.sendBlockedReason?.value) return blockedDispatchOutcome()
       if (
         JSON.stringify(currentPromptAnnotationIds())
         !== JSON.stringify(attemptPromptAnnotationIds)
@@ -2847,7 +2865,8 @@ export function useChatSend(options: UseChatSendOptions) {
         return 'not_sent'
       }
       if (prepared === false || options.sessionKey.value !== requestSessionKey) return 'not_sent'
-      if (blockedReason?.value || !preDispatchAllowed()) return 'not_sent'
+      if (blockedReason?.value) return blockedDispatchOutcome()
+      if (!preDispatchAllowed()) return 'not_sent'
       const normalized = normalizeDocumentContext(prepared)
       if (prepared !== null && normalized === null) return 'not_sent'
       attemptDocumentContext = normalized
@@ -2873,7 +2892,7 @@ export function useChatSend(options: UseChatSendOptions) {
     )
     // Routing can change while an expiring staged upload is refreshed. Recheck
     // the authoritative live state before any visible or RPC mutation.
-    if (blockedReason?.value) return 'not_sent'
+    if (blockedReason?.value) return blockedDispatchOutcome()
     if (modelImageSendBlocked(attachmentsToSend)) return 'not_sent'
     const attachmentsToKeep = currentSourceAttachments.filter(
       attachment => !sendAttachmentIds.has(attachment.local_id) || !isSendableAttachment(attachment),
@@ -3803,7 +3822,10 @@ export function useChatSend(options: UseChatSendOptions) {
   ): Promise<HiddenControlDispatchResult> {
     const compactInFlight = options.isCompactInFlightForCurrentSession()
     const handoffInFlight = responseHandoffBlocksCurrentSession()
-    const projectBlocked = options.validateActiveProjectBeforeSend
+    const interactivityBlocked = () => Boolean(
+      !idempotentReplay && options.sessionInteractivityBlockedReason?.value,
+    )
+    const projectBlocked = !interactivityBlocked() && options.validateActiveProjectBeforeSend
       ? await refreshedActiveProjectBlocksSend()
       : false
     const sendBlockedReason = idempotentReplay
@@ -4238,6 +4260,15 @@ export function useChatSend(options: UseChatSendOptions) {
     item.clientRequestId = stableClientRequestId
     item.hiddenClientRequestId = stableClientRequestId
     item.hiddenClientMessageId ||= `hidden-control:${stableClientRequestId}`
+    const freshInteractivityBlocked = () => Boolean(
+      options.sessionInteractivityBlockedReason?.value
+      && !hiddenControlDispatchAttempted(
+        ownerSessionKey,
+        stableClientRequestId,
+        options.hiddenControlStorage,
+      )
+    )
+    if (freshInteractivityBlocked()) return 'policy_blocked'
     const result = await dispatchHiddenSend(
       item.text,
       item.displayTextOverride || '',
@@ -4246,6 +4277,9 @@ export function useChatSend(options: UseChatSendOptions) {
     )
     if (item.displayTextOverride) item.hiddenVisibleCommitted = true
     if (result.status === 'accepted') return 'accepted'
+    if (result.status === 'queued' && freshInteractivityBlocked()) {
+      return 'policy_blocked'
+    }
     if (result.status === 'queued') return 'deferred'
     if (result.status === 'unknown') return 'retryable_failure'
     return 'not_sent'

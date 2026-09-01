@@ -31,6 +31,7 @@ describe('Cron session read-only presentation', () => {
   it('uses the existing send gate while preserving the replay-specific gate', () => {
     expect(chatViewSource).toContain("isCronSession.value ? t('chat.cronSessionReadOnly') : null")
     expect(chatViewSource).toContain('sessionInteractivityBlockedReason.value')
+    expect(chatViewSource).toContain('sessionInteractivityBlockedReason,')
     expect(chatViewSource).toContain('idempotentReplayBlockedReason: liveSendBlockedReason')
   })
 

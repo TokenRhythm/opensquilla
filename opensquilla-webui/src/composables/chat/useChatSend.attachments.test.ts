@@ -29,6 +29,7 @@ import {
 } from '@/utils/chat/streamEvents'
 import {
   listHiddenControls,
+  markHiddenControlDispatchAttempted,
   persistHiddenControl,
   type HiddenControlStorage,
 } from '@/utils/chat/hiddenControlOutbox'
@@ -2099,6 +2100,46 @@ describe('useChatSend attachment payloads', () => {
     expect(options.messages.value).toEqual([])
   })
 
+  it('parks fresh queued and hidden work behind the session interactivity policy', async () => {
+    const policy = ref<string | null>('Cron sessions are read-only.')
+    const validateActiveProjectBeforeSend = vi.fn(async () => null)
+    const enqueueHiddenControl = vi.fn(() => true)
+    const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-cron-blocked',
+      text: 'fresh queued follow-up',
+      attachments: [],
+      intent: null,
+    }
+    const { api, rpc } = makeOptions({
+      sendBlockedReason: policy,
+      sessionInteractivityBlockedReason: policy,
+      idempotentReplayBlockedReason: ref(null),
+      validateActiveProjectBeforeSend,
+      enqueueHiddenControl,
+    })
+
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('policy_blocked')
+    await expect(api.dispatchHiddenSend(
+      'fresh provider confirmation',
+      'Fresh confirmation',
+      'fresh-policy-blocked-hidden',
+    )).resolves.toMatchObject({
+      status: 'queued',
+      reason: 'queued',
+    })
+    await expect(api.dispatchQueuedHiddenSend({
+      pendingUiId: 'pending-ui-hidden-cron-blocked',
+      text: 'fresh provider confirmation',
+      displayTextOverride: 'Fresh confirmation',
+      attachments: [],
+      intent: null,
+      clientRequestId: 'fresh-policy-blocked-hidden',
+    }, 'agent:main:webchat:test')).resolves.toBe('policy_blocked')
+
+    expect(validateActiveProjectBeforeSend).not.toHaveBeenCalled()
+    expect(rpc.call).not.toHaveBeenCalled()
+  })
+
   it('replays an ambiguous queued follow-up through the replay-only gate', async () => {
     const localPolicy = ref<string | null>(null)
     const replayPolicy = ref<string | null>(null)
@@ -2122,6 +2163,7 @@ describe('useChatSend attachment payloads', () => {
     const { api } = makeOptions({
       rpc,
       sendBlockedReason: localPolicy,
+      sessionInteractivityBlockedReason: localPolicy,
       idempotentReplayBlockedReason: replayPolicy,
     })
 
@@ -2178,6 +2220,7 @@ describe('useChatSend attachment payloads', () => {
     const remounted = makeOptions({
       hiddenControlStorage: first.options.hiddenControlStorage,
       sendBlockedReason: localPolicy,
+      sessionInteractivityBlockedReason: localPolicy,
       idempotentReplayBlockedReason: replayPolicy,
     })
     await remounted.api.restoreHiddenControls('agent:main:webchat:test')
@@ -2188,6 +2231,155 @@ describe('useChatSend attachment payloads', () => {
     }))
   })
 
+  it('auto-drains one attempted hidden receipt replay through the session policy', async () => {
+    vi.useFakeTimers()
+    const sessionKey = ref('agent:main:webchat:test')
+    const inputText = ref('')
+    const pendingAttachments = ref<Attachment[]>([])
+    const pendingSessionIntent = ref<string | null>(null)
+    const isStreaming = ref(false)
+    const policy = ref<string | null>('Cron sessions are read-only.')
+    const hiddenControlStorage = memoryStorage()
+    const clientRequestId = 'hidden-queue-exact-replay'
+    persistHiddenControl({
+      sessionKey: sessionKey.value,
+      clientRequestId,
+      providerText: 'provider confirmation',
+      displayText: 'Confirmed',
+    }, hiddenControlStorage)
+    expect(markHiddenControlDispatchAttempted(
+      sessionKey.value,
+      clientRequestId,
+      hiddenControlStorage,
+    )).toBe(true)
+
+    let sendApi!: ReturnType<typeof useChatSend>
+    const dispatchHiddenControl = vi.fn((item: ChatPendingItem, ownerSessionKey: string) => (
+      sendApi.dispatchQueuedHiddenSend(item, ownerSessionKey)
+    ))
+    const pending = useChatPendingQueue({
+      sessionKey,
+      inputText,
+      pendingAttachments,
+      pendingSessionIntent,
+      isStreaming,
+      isBlocked: () => false,
+      autoResizeTextarea: vi.fn(),
+      sendCurrentInput: vi.fn(),
+      resetInputHistory: vi.fn(),
+      hasComposer: () => true,
+      dispatchHiddenControl,
+    })
+    try {
+      const configured = makeOptions({
+        sessionKey,
+        inputText,
+        pendingAttachments,
+        pendingSessionIntent,
+        busySendMode: pending.busySendMode,
+        hiddenControlStorage,
+        sendBlockedReason: policy,
+        sessionInteractivityBlockedReason: policy,
+        idempotentReplayBlockedReason: ref(null),
+        enqueueHiddenControl: pending.enqueueHiddenControl,
+      })
+      sendApi = configured.api
+      pending.enqueueHiddenControl({
+        text: 'provider confirmation',
+        displayText: 'Confirmed',
+        clientRequestId,
+        sessionKey: sessionKey.value,
+      })
+
+      pending.schedulePendingDrainAfterTerminal()
+      await vi.advanceTimersByTimeAsync(500)
+      await nextTick()
+
+      expect(dispatchHiddenControl).toHaveBeenCalledOnce()
+      expect(configured.rpc.call).toHaveBeenCalledOnce()
+      expect(configured.rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+        clientRequestId,
+        message: 'provider confirmation',
+      }))
+      expect(pending.pendingQueue.value).toEqual([])
+      expect(listHiddenControls(sessionKey.value, hiddenControlStorage)).toEqual([])
+    } finally {
+      pending.cleanup()
+      vi.useRealTimers()
+    }
+  })
+
+  it('auto-drains one attempted visible receipt replay through the session policy', async () => {
+    vi.useFakeTimers()
+    const sessionKey = ref('agent:main:webchat:test')
+    const inputText = ref('')
+    const pendingAttachments = ref<Attachment[]>([])
+    const pendingSessionIntent = ref<string | null>(null)
+    const isStreaming = ref(false)
+    const policy = ref<string | null>(null)
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+        .mockResolvedValueOnce({
+          accepted: true,
+          replayed: true,
+          sessionKey: sessionKey.value,
+          task_id: 'task-visible-queue-replay',
+        }),
+    }
+    let sendApi!: ReturnType<typeof useChatSend>
+    const dispatchPendingItem = vi.fn((item: ChatPendingItem, ownerSessionKey: string) => (
+      sendApi.sendQueuedFollowup(item, ownerSessionKey)
+    ))
+    const pending = useChatPendingQueue({
+      sessionKey,
+      inputText,
+      pendingAttachments,
+      pendingSessionIntent,
+      isStreaming,
+      isBlocked: () => false,
+      autoResizeTextarea: vi.fn(),
+      sendCurrentInput: vi.fn(),
+      resetInputHistory: vi.fn(),
+      hasComposer: () => true,
+      pendingInputWal: memoryHandoffWal(),
+      dispatchPendingItem,
+    })
+    try {
+      const configured = makeOptions({
+        rpc,
+        sessionKey,
+        inputText,
+        pendingAttachments,
+        pendingSessionIntent,
+        busySendMode: pending.busySendMode,
+        sendBlockedReason: policy,
+        sessionInteractivityBlockedReason: policy,
+        idempotentReplayBlockedReason: ref(null),
+      })
+      sendApi = configured.api
+      await pending.enqueuePendingPayload({ text: 'recover accepted queue receipt' })
+      const item = pending.pendingQueue.value[0]!
+
+      await expect(sendApi.sendQueuedFollowup(item, sessionKey.value))
+        .resolves.toBe('retryable_failure')
+      const originalParams = rpc.call.mock.calls[0]?.[1]
+      policy.value = 'Cron sessions are read-only.'
+
+      pending.schedulePendingDrainAfterTerminal()
+      await vi.advanceTimersByTimeAsync(500)
+      await nextTick()
+
+      expect(dispatchPendingItem).toHaveBeenCalledOnce()
+      expect(rpc.call).toHaveBeenCalledTimes(2)
+      expect(rpc.call.mock.calls[1]?.[1]).toEqual(originalParams)
+      expect(pending.pendingQueue.value).toEqual([])
+    } finally {
+      pending.cleanup()
+      vi.useRealTimers()
+    }
+  })
+
   it('keeps an unattempted hidden control blocked by the local policy after remount', async () => {
     const hiddenControlStorage = memoryStorage()
     const localPolicy = ref<string | null>('Cron sessions are read-only.')
@@ -2195,6 +2387,7 @@ describe('useChatSend attachment payloads', () => {
     const first = makeOptions({
       hiddenControlStorage,
       sendBlockedReason: localPolicy,
+      sessionInteractivityBlockedReason: localPolicy,
       idempotentReplayBlockedReason: ref(null),
       enqueueHiddenControl,
     })
@@ -2202,7 +2395,7 @@ describe('useChatSend attachment payloads', () => {
       'fresh provider confirmation',
       'Fresh confirmation',
       'hidden-never-attempted',
-    )).resolves.toMatchObject({ status: 'queued' })
+    )).resolves.toMatchObject({ status: 'queued', reason: 'queued' })
     expect(listHiddenControls(
       'agent:main:webchat:test',
       hiddenControlStorage,
@@ -2211,6 +2404,7 @@ describe('useChatSend attachment payloads', () => {
     const remounted = makeOptions({
       hiddenControlStorage,
       sendBlockedReason: localPolicy,
+      sessionInteractivityBlockedReason: localPolicy,
       idempotentReplayBlockedReason: ref(null),
       enqueueHiddenControl,
     })

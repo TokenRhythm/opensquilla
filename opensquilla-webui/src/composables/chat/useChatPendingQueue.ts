@@ -91,6 +91,7 @@ export type PendingDeliveryOutcome =
   | 'accepted'
   | 'deferred'
   | 'not_sent'
+  | 'policy_blocked'
   | 'retryable_failure'
 
 export interface PendingQueueOwner {
@@ -1269,6 +1270,19 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       flushDeferredPendingDrain()
       return
     }
+    if (outcome === 'policy_blocked') {
+      // The selected session cannot admit a fresh turn. Park the head without
+      // retaining or rearming a transient terminal-drain signal; exact receipt
+      // recovery bypasses this outcome in the send layer.
+      if (container === pendingQueue.value && index === 0) {
+        deferredDrainRequested = false
+        cancelPendingDrainTimer()
+      }
+      // Clear the reactive lease only after the active head's drain signal;
+      // otherwise the delivery-barrier watcher can immediately rearm it.
+      if (!item.steerAttempt) item.deliveryState = undefined
+      return
+    }
     if (outcome === 'deferred' && !item.steerAttempt) {
       item.deliveryState = undefined
       deferredDrainRequested = true
@@ -1688,11 +1702,15 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
               options.onHiddenControlDispatchResult?.({
                 status: outcome === 'accepted'
                   ? 'accepted'
+                  : outcome === 'policy_blocked'
+                    ? 'queued'
                   : outcome === 'not_sent'
                     ? 'rejected'
                     : 'unknown',
                 reason: outcome === 'accepted'
                   ? 'accepted'
+                  : outcome === 'policy_blocked'
+                    ? 'queued'
                   : outcome === 'not_sent'
                     ? 'send_rejected'
                     : 'response_unknown',

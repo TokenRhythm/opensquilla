@@ -3322,6 +3322,7 @@ const chatSend = useChatSend({
   pendingSessionIntent,
   pendingWorkspaceId,
   sendBlockedReason: effectiveSendBlockedReason,
+  sessionInteractivityBlockedReason,
   validateActiveProjectBeforeSend,
   acceptPendingWorkspaceBinding: activeProjectWorkspace.acceptPendingBinding,
   initialCollaborationMode,
