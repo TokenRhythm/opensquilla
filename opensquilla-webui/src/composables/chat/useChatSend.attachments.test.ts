@@ -1356,6 +1356,10 @@ describe('useChatSend attachment payloads', () => {
     await api.recoverResponseHandoffs()
 
     expect(prepareAttachmentsForSend).toHaveBeenCalledOnce()
+    expect(prepareAttachmentsForSend).toHaveBeenCalledWith(expect.objectContaining({
+      ownership: 'detached',
+      isCurrent: expect.any(Function),
+    }))
     expect(rpc.call).toHaveBeenCalledTimes(2)
     const replay = rpc.call.mock.calls[1]?.[1] as { attachments?: Array<{ file_uuid?: string }> }
     expect(replay.attachments?.[0]?.file_uuid).toBe('refreshed-upload')
@@ -2939,6 +2943,11 @@ describe('useChatSend attachment payloads', () => {
     await api.onSend()
 
     expect(prepareAttachmentsForSend).toHaveBeenCalledTimes(1)
+    expect(prepareAttachmentsForSend).toHaveBeenCalledWith(expect.objectContaining({
+      ownership: 'composer',
+      attachments: expect.any(Array),
+      isCurrent: expect.any(Function),
+    }))
     expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
       attachments: [
         { type: 'application/pdf', file_uuid: 'file-fresh', mime: 'application/pdf', name: 'ready.pdf' },

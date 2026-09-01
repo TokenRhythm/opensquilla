@@ -33,6 +33,7 @@ import type {
 import type { MetaRunCenter } from '@/modules/metaRunCenter'
 import type { ChatRpcStreamApi } from '@/composables/chat/useChatRpcEventHandlers'
 import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
+import type { AttachmentPreparationOptions } from '@/composables/chat/useChatAttachments'
 import type {
   BusySendMode,
   PendingCancelOptions,
@@ -227,6 +228,7 @@ interface ComposerSnapshot {
 }
 
 interface DispatchSendOptions {
+  attachmentOwnership: 'composer' | 'detached'
   composerText?: string
   promptAnnotationIds?: readonly string[]
   queueMode?: 'steer'
@@ -553,10 +555,7 @@ export interface UseChatSendOptions {
   bindActiveStreamTask?: (taskId: string) => void
   isCompactInFlightForCurrentSession: () => boolean
   hasPendingAttachmentWork: () => boolean
-  prepareAttachmentsForSend?: (options?: {
-    isCurrent?: () => boolean
-    attachments?: Attachment[]
-  }) => Promise<boolean>
+  prepareAttachmentsForSend?: (options?: AttachmentPreparationOptions) => Promise<boolean>
   preparePromptAnnotationsForSend?: (
     ids: readonly string[],
     options?: { isCurrent?: () => boolean },
@@ -1801,6 +1800,7 @@ export function useChatSend(options: UseChatSendOptions) {
               const ready = await options.prepareAttachmentsForSend!({
                 attachments: refreshed,
                 isCurrent: () => true,
+                ownership: 'detached',
               })
               const sendable = refreshed.filter(isSendableAttachment)
               if (ready && sendable.length === refreshed.length) {
@@ -2289,6 +2289,7 @@ export function useChatSend(options: UseChatSendOptions) {
       if (options.sessionKey.value !== requestSessionKey) return
       if (replayBlockedReason?.value) return
       await dispatchSend(exactReplayAttempt.text, {
+        attachmentOwnership: 'detached',
         composerText,
         promptAnnotationIds: exactReplayAttempt.promptAnnotationIds,
         queueMode: exactReplayAttempt.queueMode,
@@ -2344,6 +2345,7 @@ export function useChatSend(options: UseChatSendOptions) {
       })
     ) {
       await dispatchSend(text, {
+        attachmentOwnership: 'composer',
         composerText,
         promptAnnotationIds: recoveredAttempt.promptAnnotationIds,
         queueMode: recoveredAttempt.queueMode,
@@ -2483,6 +2485,7 @@ export function useChatSend(options: UseChatSendOptions) {
     if (!hasPayload || !options.sessionKey.value) return
 
     await dispatchSend(text, {
+      attachmentOwnership: 'composer',
       composerText,
       promptAnnotationIds: composerSnapshot.promptAnnotationIds,
       payload: payloadFromSnapshot(composerSnapshot),
@@ -2644,6 +2647,7 @@ export function useChatSend(options: UseChatSendOptions) {
       return dispatchSteerV2(text, { queuedItem: item })
     }
     const outcome = await dispatchSend(dispatchText, {
+      attachmentOwnership: 'detached',
       composerText: item.text,
       promptAnnotationIds: item.promptAnnotationIds || [],
       payload: {
@@ -2686,7 +2690,7 @@ export function useChatSend(options: UseChatSendOptions) {
 
   async function dispatchSend(
     text: string,
-    sendOpts: DispatchSendOptions = {},
+    sendOpts: DispatchSendOptions,
   ): Promise<ChatSendOutcome> {
     const requestSessionKey = options.sessionKey.value
     if (!requestSessionKey) return 'not_sent'
@@ -2816,10 +2820,15 @@ export function useChatSend(options: UseChatSendOptions) {
       ? sendOpts.durablePendingItem
       : undefined
     if (!retryAttempt && !serverStagedPendingItem && options.prepareAttachmentsForSend) {
-      const ready = await options.prepareAttachmentsForSend({
-        isCurrent: () => options.sessionKey.value === requestSessionKey,
-        ...(sendOpts.payload ? { attachments: sourceAttachments } : {}),
-      })
+      const isCurrent = () => options.sessionKey.value === requestSessionKey
+      const preparationOptions: AttachmentPreparationOptions = sendOpts.attachmentOwnership === 'detached'
+        ? { ownership: 'detached', attachments: sourceAttachments, isCurrent }
+        : {
+            ownership: 'composer',
+            isCurrent,
+            ...(sendOpts.payload ? { attachments: sourceAttachments } : {}),
+          }
+      const ready = await options.prepareAttachmentsForSend(preparationOptions)
       if (!ready) return 'not_sent'
       if (options.sessionKey.value !== requestSessionKey) return 'not_sent'
       if (!preDispatchAllowed()) return 'not_sent'
@@ -3504,6 +3513,7 @@ export function useChatSend(options: UseChatSendOptions) {
     usageBarrierReplayInFlight = true
     try {
       const outcome = await dispatchSend(text, {
+        attachmentOwnership: 'detached',
         payload: {
           attachments: [],
           intent: null,

@@ -6,6 +6,7 @@ import type {
   PendingSteerPhase,
 } from '@/types/chat'
 import type { SessionSteerV2Params } from '@/types/chat'
+import type { AttachmentPreparationOptions } from '@/composables/chat/useChatAttachments'
 import { isControlInput } from '@/utils/chat/inputSemantics'
 import { createClientMessageId, createClientRequestId } from '@/utils/chat/messageIdentity'
 import {
@@ -134,10 +135,9 @@ export interface UseChatPendingQueueOptions {
   pendingInputWal?: PendingInputWal | null
   pendingInputQueue?: PendingInputQueuePort | null
   connectionState?: Readonly<Ref<string>>
-  prepareAttachmentsForSend?: (options: {
-    attachments: Attachment[]
-    isCurrent?: () => boolean
-  }) => Promise<boolean>
+  prepareAttachmentsForSend?: (
+    options: Extract<AttachmentPreparationOptions, { ownership: 'detached' }>,
+  ) => Promise<boolean>
   onPendingPersistenceError?: (
     reason: 'wal_failed' | 'attachments_unsupported' | 'server_rejected' | 'order_conflict',
   ) => void
@@ -486,6 +486,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
               isCurrent: () => pendingQueue.value.some(candidate => (
                 candidate.pendingInputId === pendingInputId
               )),
+              ownership: 'detached',
             })
             if (!ready) {
               await writeWalItem(item, 'retryable')
