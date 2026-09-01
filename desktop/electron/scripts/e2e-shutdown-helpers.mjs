@@ -33,6 +33,65 @@ export function trackHttpServerConnections(server) {
   return sockets
 }
 
+export function desktopShutdownEvidenceSince(checkpoint, current) {
+  if (typeof checkpoint !== 'string' || typeof current !== 'string') {
+    return { gatewayExitLogged: false, committedExitLogged: false }
+  }
+  if (!current.startsWith(checkpoint)) {
+    return { gatewayExitLogged: false, committedExitLogged: false }
+  }
+
+  let gatewayExitCount = 0
+  let allGatewayExitsClean = true
+  let lastGatewayExitIndex = -1
+  let committedExitIndex = -1
+  let recordIndex = 0
+  for (const line of current.slice(checkpoint.length).split(/\r?\n/)) {
+    if (!line.trim()) continue
+    let record
+    try {
+      record = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if (record?.event === 'quit_gateway_exit') {
+      gatewayExitCount += 1
+      lastGatewayExitIndex = recordIndex
+      if (!(record.exited === true && record.hardTerminated === false)) {
+        allGatewayExitsClean = false
+      }
+    }
+    if (
+      committedExitIndex === -1
+      && record?.event === 'desktop_exit_phase'
+      && record.to === 'committed'
+      && record.reason === 'all lifecycle-owned Gateways exited'
+    ) {
+      committedExitIndex = recordIndex
+    }
+    recordIndex += 1
+  }
+  const gatewayExitLogged = gatewayExitCount > 0 && allGatewayExitsClean
+  const committedExitLogged = gatewayExitLogged
+    && committedExitIndex > lastGatewayExitIndex
+  return { gatewayExitLogged, committedExitLogged }
+}
+
+export function canAcceptWindowsElectronShutdownFallback({
+  platform = process.platform,
+  shutdown,
+  gatewayExitLogged,
+  committedExitLogged,
+}) {
+  return platform === 'win32'
+    && shutdown?.closed === false
+    && shutdown?.closeErrorCode === 'DESKTOP_E2E_SHUTDOWN_TIMEOUT'
+    && shutdown?.forcedExitSucceeded === true
+    && shutdown?.processTreeReaped === true
+    && gatewayExitLogged === true
+    && committedExitLogged === true
+}
+
 export async function closeHttpServerWithDeadline(
   server,
   sockets,
@@ -73,10 +132,19 @@ function childHasExited(child) {
 }
 
 async function forceElectronProcessExit(child, phase, emit) {
-  if (childHasExited(child)) return null
+  if (childHasExited(child)) {
+    const processTreeReaped = process.platform !== 'win32'
+    return {
+      error: processTreeReaped
+        ? null
+        : new Error(`${phase} Windows process tree exited before reaping could be verified.`),
+      processTreeReaped,
+    }
+  }
   const exited = new Promise(resolve => child.once('exit', resolve))
+  let processTreeReaped = process.platform !== 'win32'
   if (process.platform === 'win32' && child.pid) {
-    await terminateWindowsProcessTree({
+    processTreeReaped = await terminateWindowsProcessTree({
       pid: child.pid,
       timeoutMs: WINDOWS_PROCESS_TREE_KILL_TIMEOUT_MS,
       fallback: () => {
@@ -92,7 +160,7 @@ async function forceElectronProcessExit(child, phase, emit) {
     try {
       child.kill('SIGKILL')
     } catch (error) {
-      return error
+      return { error, processTreeReaped: false }
     }
   }
   try {
@@ -101,10 +169,16 @@ async function forceElectronProcessExit(child, phase, emit) {
       `${phase} forced process exit`,
       FORCED_PROCESS_EXIT_TIMEOUT_MS,
     )
-    return null
   } catch (error) {
-    return error
+    return { error, processTreeReaped }
   }
+  if (process.platform === 'win32' && !processTreeReaped) {
+    return {
+      error: new Error(`${phase} Windows process tree could not be proven reaped.`),
+      processTreeReaped: false,
+    }
+  }
+  return { error: null, processTreeReaped }
 }
 
 export async function closeElectronWithDeadline({
@@ -117,7 +191,13 @@ export async function closeElectronWithDeadline({
 }) {
   try {
     await withDeadline(() => app.close(), `${phase} Electron shutdown`, timeoutMs)
-    return { closed: true, error: null }
+    return {
+      closed: true,
+      error: null,
+      closeErrorCode: null,
+      forcedExitSucceeded: false,
+      processTreeReaped: false,
+    }
   } catch (cause) {
     const snapshot = await boundedDiagnostics(diagnostics, diagnosticTimeoutMs)
     let child = null
@@ -143,16 +223,25 @@ export async function closeElectronWithDeadline({
       diagnostics: snapshot,
     }
     emit(JSON.stringify(detail))
-    const forcedExitError = child
+    const forcedExit = child
       ? await forceElectronProcessExit(child, phase, emit)
-      : new Error('Electron child process was unavailable for forced shutdown.')
+      : {
+          error: new Error('Electron child process was unavailable for forced shutdown.'),
+          processTreeReaped: false,
+        }
     const error = new Error(
       `DESKTOP_E2E_ELECTRON_SHUTDOWN_FAILED: phase=${phase} `
       + `cause=${cause?.message || String(cause)} `
-      + `forcedExit=${forcedExitError?.message || 'ok'} `
+      + `forcedExit=${forcedExit.error?.message || 'ok'} `
       + `diagnostics=${JSON.stringify(snapshot)}`,
       { cause },
     )
-    return { closed: false, error }
+    return {
+      closed: false,
+      error,
+      closeErrorCode: typeof cause?.code === 'string' ? cause.code : null,
+      forcedExitSucceeded: child !== null && forcedExit.error === null,
+      processTreeReaped: forcedExit.processTreeReaped,
+    }
   }
 }

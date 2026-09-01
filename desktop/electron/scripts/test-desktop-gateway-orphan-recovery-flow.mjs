@@ -15,7 +15,11 @@ import {
   waitForDesktopGatewayOwnershipRelease,
 } from '../dist/desktop-gateway-ownership.js'
 import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
-import { closeElectronWithDeadline } from './e2e-shutdown-helpers.mjs'
+import {
+  canAcceptWindowsElectronShutdownFallback,
+  closeElectronWithDeadline,
+  desktopShutdownEvidenceSince,
+} from './e2e-shutdown-helpers.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
@@ -119,12 +123,19 @@ async function phaseDiagnostics(app, userDataDir, phase) {
 
 async function closeDesktopForPhase(app, userDataDir, phaseName) {
   const phase = createPhaseBudget(phaseName, ELECTRON_SHUTDOWN_TIMEOUT_MS)
-  return closeElectronWithDeadline({
+  const desktopLogPath = join(userDataDir, 'logs', 'desktop.log')
+  const desktopLogCheckpoint = await readFile(desktopLogPath, 'utf8').catch(() => null)
+  const shutdown = await closeElectronWithDeadline({
     app,
     phase: phase.name,
     timeoutMs: phase.timeoutMs,
     diagnostics: () => phaseDiagnostics(app, userDataDir, phase),
   })
+  const desktopLog = await readFile(desktopLogPath, 'utf8').catch(() => null)
+  return {
+    ...shutdown,
+    shutdownEvidence: desktopShutdownEvidenceSince(desktopLogCheckpoint, desktopLog),
+  }
 }
 
 async function phaseError(message, app, userDataDir, phase, cause = null) {
@@ -515,14 +526,27 @@ try {
     'successful-electron-shutdown',
   )
   secondApp = null
-  if (successShutdown.error) throw successShutdown.error
-  assert.equal(
-    await waitForDesktopGatewayOwnershipRelease(secondOwnershipDir, thirdRecord, {
+  const ownershipReleased = await waitForDesktopGatewayOwnershipRelease(
+    secondOwnershipDir,
+    thirdRecord,
+    {
       timeoutMs: 15_000,
       pollIntervalMs: 100,
-    }),
-    true,
+    },
   )
+  assert.equal(ownershipReleased, true)
+  if (successShutdown.error) {
+    const fallbackAccepted = canAcceptWindowsElectronShutdownFallback({
+      shutdown: successShutdown,
+      ...successShutdown.shutdownEvidence,
+    }) && ownershipReleased && !processAlive(thirdRecord.pid)
+    if (!fallbackAccepted) throw successShutdown.error
+    console.warn(JSON.stringify({
+      event: 'desktop_e2e_windows_shell_wrapper_reaped_after_commit',
+      phase: 'successful-electron-shutdown',
+      pid: thirdRecord.pid,
+    }))
+  }
 
   console.log(JSON.stringify({
     ok: true,

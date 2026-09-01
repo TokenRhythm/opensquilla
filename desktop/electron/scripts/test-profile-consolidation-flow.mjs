@@ -19,8 +19,10 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { _electron as electron } from 'playwright'
 import {
+  canAcceptWindowsElectronShutdownFallback,
   closeElectronWithDeadline,
   closeHttpServerWithDeadline,
+  desktopShutdownEvidenceSince,
   trackHttpServerConnections,
 } from './e2e-shutdown-helpers.mjs'
 
@@ -339,13 +341,28 @@ async function closeActiveApp(phase, { failOnError = true } = {}) {
   const targetApp = app
   const profileUserData = activeAppUserData
   app = undefined
+  const desktopLogPath = join(profileUserData, 'logs', 'desktop.log')
+  const desktopLogCheckpoint = await readFile(desktopLogPath, 'utf8').catch(() => null)
   const result = await closeElectronWithDeadline({
     app: targetApp,
     phase,
     timeoutMs: ELECTRON_SHUTDOWN_TIMEOUT_MS,
     diagnostics: () => profileShutdownDiagnostics(targetApp, profileUserData, phase),
   })
-  if (result.error && failOnError) throw result.error
+  if (!result.error) return
+  const desktopLog = await readFile(desktopLogPath, 'utf8').catch(() => null)
+  const shutdownEvidence = desktopShutdownEvidenceSince(desktopLogCheckpoint, desktopLog)
+  if (canAcceptWindowsElectronShutdownFallback({
+    shutdown: result,
+    ...shutdownEvidence,
+  })) {
+    console.warn(JSON.stringify({
+      event: 'desktop_e2e_windows_shell_wrapper_reaped_after_commit',
+      phase,
+    }))
+    return
+  }
+  if (failOnError) throw result.error
 }
 
 try {

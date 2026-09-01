@@ -588,6 +588,7 @@ const gatewayProcessTreeTerminations = new WeakMap<
   ChildProcessWithoutNullStreams,
   Promise<boolean>
 >()
+const gatewayHardTerminatedProcesses = new WeakSet<ChildProcessWithoutNullStreams>()
 const desktopWriters = new DesktopWriterAdmission()
 let desktopOpenFlowRevision = 0
 let desktopOpenFlowPromise: Promise<void> | null = null
@@ -9615,6 +9616,7 @@ function hardTerminateGatewayProcess(
   backstopMs = GATEWAY_HARD_KILL_BACKSTOP_MS,
 ): void {
   if (hasGatewayProcessExited(child)) return
+  gatewayHardTerminatedProcesses.add(child)
   terminateGatewayProcess(child, 'SIGTERM')
   if (process.platform === 'win32') void clearKnownOwnedGatewayPidFile()
   setTimeout(() => {
@@ -13899,7 +13901,7 @@ async function drainOwnedGatewayForQuit(
   if (hasGatewayProcessExited(child)) return true
   const accepted = requestShutdown ? await requestOwnedGatewayShutdown(child, url) : null
   desktopLog('quit_gateway_shutdown_requested', { accepted, alreadyStopping: !requestShutdown })
-  let hardTerminated = false
+  let hardTerminated = gatewayHardTerminatedProcesses.has(child)
   let exited = false
   if (accepted === null) {
     // Another lifecycle operation already initiated the full graceful stop.
@@ -13933,10 +13935,15 @@ async function drainOwnedGatewayForQuit(
   // exit event is delayed past that timer, issue one final tree-aware SIGKILL
   // and wait again before allowing the Electron parent to disappear.
   if (!exited && !hasGatewayProcessExited(child)) {
+    hardTerminated = true
+    gatewayHardTerminatedProcesses.add(child)
     terminateGatewayProcess(child, 'SIGKILL')
     exited = await waitForGatewayProcessExit(child, GATEWAY_HARD_KILL_BACKSTOP_MS)
   }
-  desktopLog('quit_gateway_exit', { exited, hardTerminated })
+  desktopLog('quit_gateway_exit', {
+    exited,
+    hardTerminated: hardTerminated || gatewayHardTerminatedProcesses.has(child),
+  })
   return exited || hasGatewayProcessExited(child)
 }
 

@@ -13,8 +13,10 @@ import {
   startCaseTelemetry,
 } from './ci-case-telemetry.mjs'
 import {
+  canAcceptWindowsElectronShutdownFallback,
   closeElectronWithDeadline,
   closeHttpServerWithDeadline,
+  desktopShutdownEvidenceSince,
   trackHttpServerConnections,
 } from './e2e-shutdown-helpers.mjs'
 import { terminateWindowsProcessTree } from '../dist/windows-process-tree.js'
@@ -224,6 +226,9 @@ try {
     emit: line => shutdownLogs.push(line),
   })
   assert.equal(hangingShutdown.closed, false)
+  assert.equal(hangingShutdown.closeErrorCode, 'DESKTOP_E2E_SHUTDOWN_TIMEOUT')
+  assert.equal(hangingShutdown.forcedExitSucceeded, true)
+  assert.equal(hangingShutdown.processTreeReaped, true)
   assert.match(hangingShutdown.error.message, /DESKTOP_E2E_ELECTRON_SHUTDOWN_FAILED/)
   assert.equal(killedWith, 'SIGKILL')
   assert.equal(shutdownLogs.length, 1)
@@ -244,6 +249,122 @@ try {
     },
     diagnostics: { marker: 'bounded-diagnostic' },
   })
+
+  const shutdownCheckpoint = '{"event":"previous_launch"}\n'
+  const cleanGatewayExit = JSON.stringify({
+    event: 'quit_gateway_exit',
+    exited: true,
+    hardTerminated: false,
+  })
+  const committedExit = JSON.stringify({
+    event: 'desktop_exit_phase',
+    to: 'committed',
+    reason: 'all lifecycle-owned Gateways exited',
+  })
+  const shutdownEvidence = desktopShutdownEvidenceSince(
+    shutdownCheckpoint,
+    `${shutdownCheckpoint}${cleanGatewayExit}\n${committedExit}\n`,
+  )
+  assert.deepEqual(shutdownEvidence, {
+    gatewayExitLogged: true,
+    committedExitLogged: true,
+  })
+  assert.deepEqual(
+    desktopShutdownEvidenceSince(
+      shutdownCheckpoint,
+      `${cleanGatewayExit}\n${committedExit}\n`,
+    ),
+    { gatewayExitLogged: false, committedExitLogged: false },
+  )
+  assert.deepEqual(
+    desktopShutdownEvidenceSince(
+      shutdownCheckpoint,
+      `${shutdownCheckpoint}${committedExit}\n${cleanGatewayExit}\n`,
+    ),
+    { gatewayExitLogged: true, committedExitLogged: false },
+  )
+  assert.deepEqual(
+    desktopShutdownEvidenceSince(
+      shutdownCheckpoint,
+      `${shutdownCheckpoint}${JSON.stringify({
+        event: 'quit_gateway_exit',
+        exited: true,
+        hardTerminated: true,
+      })}\n${committedExit}\n`,
+    ),
+    { gatewayExitLogged: false, committedExitLogged: false },
+  )
+  assert.deepEqual(
+    desktopShutdownEvidenceSince(
+      null,
+      `${shutdownCheckpoint}${cleanGatewayExit}\n${committedExit}\n`,
+    ),
+    { gatewayExitLogged: false, committedExitLogged: false },
+  )
+  const hardGatewayExit = JSON.stringify({
+    event: 'quit_gateway_exit',
+    exited: true,
+    hardTerminated: true,
+  })
+  const failedGatewayExit = JSON.stringify({
+    event: 'quit_gateway_exit',
+    exited: false,
+    hardTerminated: false,
+  })
+  assert.deepEqual(
+    desktopShutdownEvidenceSince(
+      shutdownCheckpoint,
+      `${shutdownCheckpoint}${cleanGatewayExit}\n${hardGatewayExit}\n${committedExit}\n`,
+    ),
+    { gatewayExitLogged: false, committedExitLogged: false },
+  )
+  assert.deepEqual(
+    desktopShutdownEvidenceSince(
+      shutdownCheckpoint,
+      `${shutdownCheckpoint}${cleanGatewayExit}\n${failedGatewayExit}\n${committedExit}\n`,
+    ),
+    { gatewayExitLogged: false, committedExitLogged: false },
+  )
+  assert.deepEqual(
+    desktopShutdownEvidenceSince(
+      shutdownCheckpoint,
+      `${shutdownCheckpoint}${cleanGatewayExit}\n${committedExit}\n${hardGatewayExit}\n`,
+    ),
+    { gatewayExitLogged: false, committedExitLogged: false },
+  )
+
+  const acceptedShutdown = {
+    closed: false,
+    closeErrorCode: 'DESKTOP_E2E_SHUTDOWN_TIMEOUT',
+    forcedExitSucceeded: true,
+    processTreeReaped: true,
+  }
+  const acceptanceProof = {
+    platform: 'win32',
+    shutdown: acceptedShutdown,
+    ...shutdownEvidence,
+  }
+  assert.equal(canAcceptWindowsElectronShutdownFallback(acceptanceProof), true)
+  for (const rejected of [
+    { ...acceptanceProof, platform: 'darwin' },
+    { ...acceptanceProof, shutdown: { ...acceptedShutdown, closed: true } },
+    {
+      ...acceptanceProof,
+      shutdown: { ...acceptedShutdown, closeErrorCode: 'SYNTHETIC_CLOSE_FAILURE' },
+    },
+    {
+      ...acceptanceProof,
+      shutdown: { ...acceptedShutdown, forcedExitSucceeded: false },
+    },
+    {
+      ...acceptanceProof,
+      shutdown: { ...acceptedShutdown, processTreeReaped: false },
+    },
+    { ...acceptanceProof, gatewayExitLogged: false },
+    { ...acceptanceProof, committedExitLogged: false },
+  ]) {
+    assert.equal(canAcceptWindowsElectronShutdownFallback(rejected), false)
+  }
 
   const records = (await readFile(outputPath, 'utf8'))
     .trim()

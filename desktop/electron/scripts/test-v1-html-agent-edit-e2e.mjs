@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { createServer } from 'node:http'
 import { createServer as createTcpServer } from 'node:net'
-import { cp, mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises'
+import { cp, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -16,7 +16,10 @@ import {
   waitFor,
 } from './packaged-smoke-helpers.mjs'
 import {
+  canAcceptWindowsElectronShutdownFallback,
+  closeElectronWithDeadline,
   closeHttpServerWithDeadline,
+  desktopShutdownEvidenceSince,
   trackHttpServerConnections,
 } from './e2e-shutdown-helpers.mjs'
 
@@ -74,6 +77,7 @@ const EXPECTED_CURRENT_DOCUMENT_TOOLS = [
   'document_read',
 ]
 const TIMEOUT_MS = 60_000
+const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000
 const PROVIDER_SHUTDOWN_TIMEOUT_MS = 15_000
 // A cold desktop profile performs recovery discovery before it starts the
 // source Gateway. Keep functional assertions at 60 seconds, but allow this
@@ -1473,6 +1477,29 @@ const evidence = {
   durableMutation: null,
 }
 
+async function closeDesktopApp(targetApp, phase) {
+  const desktopLogPath = join(userDataDir, 'logs', 'desktop.log')
+  const desktopLogCheckpoint = await readFile(desktopLogPath, 'utf8').catch(() => null)
+  const shutdown = await closeElectronWithDeadline({
+    app: targetApp,
+    phase,
+    timeoutMs: ELECTRON_SHUTDOWN_TIMEOUT_MS,
+  })
+  if (!shutdown.error) return
+  const desktopLog = await readFile(desktopLogPath, 'utf8').catch(() => null)
+  const shutdownEvidence = desktopShutdownEvidenceSince(desktopLogCheckpoint, desktopLog)
+  if (!canAcceptWindowsElectronShutdownFallback({
+    shutdown,
+    ...shutdownEvidence,
+  })) {
+    throw shutdown.error
+  }
+  console.warn(JSON.stringify({
+    event: 'desktop_e2e_windows_shell_wrapper_reaped_after_commit',
+    phase,
+  }))
+}
+
 try {
   desktopJourney: {
   app = await electron.launch({
@@ -2141,7 +2168,7 @@ try {
   assert.equal(pageErrors.length, 0, `renderer page errors: ${pageErrors.join(' | ')}`)
   assert.equal(consoleErrors.length, 0, `renderer console errors: ${consoleErrors.join(' | ')}`)
 
-  await app.close()
+  await closeDesktopApp(app, 'restart-electron-shutdown')
   app = undefined
   activePage = undefined
   await delay(1_000)
@@ -2267,7 +2294,8 @@ try {
   }
   try {
     if (app) {
-      await diagnosticCall('Electron shutdown', () => app.close(), 15_000)
+      await closeDesktopApp(app, 'final-electron-shutdown')
+      app = undefined
     }
   } catch (error) {
     const shutdownError = new Error(

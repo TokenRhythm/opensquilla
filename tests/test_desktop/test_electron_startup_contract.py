@@ -3016,6 +3016,31 @@ def test_desktop_quit_drains_gateway_before_exit_on_every_platform() -> None:
     assert "event.preventDefault()" in before_quit
     assert "requestOwnedGatewayShutdown(" in drain
     assert "waitForGatewayProcessExit(child)" in drain
+    assert (
+        "const gatewayHardTerminatedProcesses = "
+        "new WeakSet<ChildProcessWithoutNullStreams>()"
+    ) in main_ts
+    assert "gatewayHardTerminatedProcesses.add(child)" in _section(
+        main_ts,
+        "function hardTerminateGatewayProcess",
+        "function terminateGatewayProcess",
+    )
+    assert "let hardTerminated = gatewayHardTerminatedProcesses.has(child)" in drain
+    assert (
+        "hardTerminated: hardTerminated || gatewayHardTerminatedProcesses.has(child)"
+        in drain
+    )
+    final_tree_kill = _section(
+        drain,
+        "if (!exited && !hasGatewayProcessExited(child))",
+        "desktopLog('quit_gateway_exit'",
+    )
+    assert final_tree_kill.index("hardTerminated = true") < final_tree_kill.index(
+        "terminateGatewayProcess(child, 'SIGKILL')"
+    )
+    assert final_tree_kill.index(
+        "gatewayHardTerminatedProcesses.add(child)"
+    ) < final_tree_kill.index("terminateGatewayProcess(child, 'SIGKILL')")
     assert "app.exit(0)" in before_quit
     # Repeated quit events join one in-flight drain and cannot launch competing
     # shutdown/kill sequences against the same child.
@@ -3259,6 +3284,9 @@ def test_desktop_orphan_recovery_has_a_real_electron_process_flow() -> None:
     assert "const WINDOWS_ELECTRON_CHILD_CLEANUP_BUDGET_MS = 30_000" in script
     assert "const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000" in script
     assert "closeElectronWithDeadline" in script
+    assert "desktopShutdownEvidenceSince" in script
+    assert "canAcceptWindowsElectronShutdownFallback" in script
+    assert "ownershipReleased && !processAlive(thirdRecord.pid)" in script
     assert "'successful-electron-shutdown'" in script
     assert "'finally-second-electron-shutdown'" in script
     assert "'finally-first-electron-shutdown'" in script
@@ -3282,9 +3310,14 @@ def test_desktop_orphan_recovery_has_a_real_electron_process_flow() -> None:
 
 def test_desktop_e2e_shutdown_helpers_bound_windows_cleanup_without_masking_failures() -> None:
     v1_flow = _read("desktop/electron/scripts/test-v1-html-agent-edit-e2e.mjs")
+    orphan_flow = _read(
+        "desktop/electron/scripts/test-desktop-gateway-orphan-recovery-flow.mjs"
+    )
+    profile_flow = _read("desktop/electron/scripts/test-profile-consolidation-flow.mjs")
     helper = _read("desktop/electron/scripts/e2e-shutdown-helpers.mjs")
 
     assert "const PROVIDER_SHUTDOWN_TIMEOUT_MS = 15_000" in v1_flow
+    assert "const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000" in v1_flow
     assert "trackHttpServerConnections(server)" in v1_flow
     assert "closeHttpServerWithDeadline(server, connections" in v1_flow
     assert "phase: 'run-error-before-cleanup'" in v1_flow
@@ -3298,6 +3331,21 @@ def test_desktop_e2e_shutdown_helpers_bound_windows_cleanup_without_masking_fail
     assert "child.kill('SIGKILL')" in helper
     assert "forced process exit" in helper
     assert "desktop_e2e_electron_shutdown_failed" in helper
+    assert "canAcceptWindowsElectronShutdownFallback" in helper
+    assert "desktopShutdownEvidenceSince" in helper
+    assert "record.hardTerminated === false" in helper
+    assert "record.reason === 'all lifecycle-owned Gateways exited'" in helper
+    assert "shutdown?.closeErrorCode === 'DESKTOP_E2E_SHUTDOWN_TIMEOUT'" in helper
+    assert "shutdown?.forcedExitSucceeded === true" in helper
+    assert "shutdown?.processTreeReaped === true" in helper
+    assert "gatewayExitCount > 0 && allGatewayExitsClean" in helper
+    assert "committedExitIndex > lastGatewayExitIndex" in helper
+    for flow in (v1_flow, orphan_flow, profile_flow):
+        assert "readFile(desktopLogPath, 'utf8').catch(() => null)" in flow
+        assert "readFile(desktopLogPath, 'utf8').catch(() => '')" not in flow
+    assert "closeDesktopApp(app, 'restart-electron-shutdown')" in v1_flow
+    assert "closeDesktopApp(app, 'final-electron-shutdown')" in v1_flow
+    assert "await app.close()" not in v1_flow
 
 
 def test_desktop_dual_source_update_resolver_wires_static_channels() -> None:
@@ -4059,6 +4107,8 @@ def test_consolidation_e2e_waits_for_primary_route_and_emits_renderer_diagnostic
     assert "gatewayLogTail: gatewayLog.slice(-8_000)" in source
     assert "const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000" in source
     assert "closeElectronWithDeadline" in source
+    assert "desktopShutdownEvidenceSince" in source
+    assert "canAcceptWindowsElectronShutdownFallback" in source
     assert "closeActiveApp('consolidated-primary-electron-shutdown')" in source
     assert "closeActiveApp('completed-receipt-electron-shutdown')" in source
     assert "closeActiveApp('config-only-electron-shutdown')" in source
