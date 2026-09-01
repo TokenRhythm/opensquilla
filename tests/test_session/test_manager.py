@@ -14,13 +14,13 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 
+from opensquilla.history_cursor import HistoryCursorInvalidatedError
 from opensquilla.session import manager as session_manager_module
 from opensquilla.session.compaction import CompactionConfig, CompactionResult
 from opensquilla.session.context_view import (
     build_compaction_context_records,
     format_compaction_summary_context,
 )
-from opensquilla.session.history_cursor import HistoryCursorInvalidatedError
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import (
     AgentTaskRecord,

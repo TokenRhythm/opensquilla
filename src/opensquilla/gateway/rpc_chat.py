@@ -47,16 +47,16 @@ from opensquilla.gateway.terminal_activity import (
     terminal_activity_snapshot,
     usage_barrier_replay_proof,
 )
+from opensquilla.history_cursor import (
+    HistoryCursorInvalidatedError,
+    HistoryCursorInvalidError,
+)
 from opensquilla.observability.network_policy import (
     provider_request_correlation_disabled,
 )
 from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.session.compaction import build_compaction_config_from_provider
 from opensquilla.session.compaction_lifecycle import new_compaction_id
-from opensquilla.session.history_cursor import (
-    HistoryCursorInvalidatedError,
-    HistoryCursorInvalidError,
-)
 from opensquilla.session.keys import build_webchat_key, canonicalize_session_key, parse_agent_id
 from opensquilla.session.storage import (
     StorageBusyError,

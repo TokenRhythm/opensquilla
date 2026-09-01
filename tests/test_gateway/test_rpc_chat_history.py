@@ -15,7 +15,7 @@ from opensquilla.artifact_session import (
 )
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.rpc_chat import _handle_chat_history
-from opensquilla.session.history_cursor import HistoryCursorInvalidatedError
+from opensquilla.history_cursor import HistoryCursorInvalidatedError
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import (
     AgentTaskRecord,

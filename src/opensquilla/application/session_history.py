@@ -17,7 +17,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
 
-from opensquilla.session.history_cursor import (
+from opensquilla.history_cursor import (
     HistoryCursor,
     HistoryCursorInvalidatedError,
 )

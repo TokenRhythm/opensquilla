@@ -13,7 +13,7 @@ from opensquilla.application.session_history import (
     SessionHistoryQuery,
     paginate_transcript,
 )
-from opensquilla.session.history_cursor import HistoryCursorInvalidatedError
+from opensquilla.history_cursor import HistoryCursorInvalidatedError
 
 
 def entry(index: int) -> SimpleNamespace:

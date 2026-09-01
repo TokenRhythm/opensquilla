@@ -29,7 +29,7 @@ from opensquilla.chat.flattened_tool_markers import (
     has_flattened_used_tool_line,
     is_flattened_tool_result_dump,
 )
-from opensquilla.session.history_cursor import (
+from opensquilla.history_cursor import (
     HistoryCursor,
     HistoryCursorInvalidatedError,
     HistoryCursorInvalidError,

@@ -13,7 +13,7 @@ from opensquilla.gateway.adapters.session_history import (
     canonical_page_parts,
     parse_history_cursor,
 )
-from opensquilla.session.history_cursor import (
+from opensquilla.history_cursor import (
     HistoryCursorInvalidatedError,
     HistoryCursorInvalidError,
 )
