@@ -905,7 +905,19 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     latest: ChatMessage[],
   ): ChatMessage[] {
     const latestIds = new Set(latest.map(message => message.messageId).filter(Boolean))
-    const unprovenTerminalTurnRows = new Set<ChatMessage>()
+    const excludedTerminalRows = new Set<ChatMessage>()
+    const latestHasDurableErrorForUser = (messageId: string): boolean => {
+      const userIndex = latest.findIndex(message =>
+        message.role === 'user' && message.messageId === messageId,
+      )
+      if (userIndex < 0) return false
+      for (let index = userIndex + 1; index < latest.length; index++) {
+        const message = latest[index]
+        if (message?.role === 'user') break
+        if (message?.role === 'error') return true
+      }
+      return false
+    }
     let owningUserIndex = -1
     for (let index = 0; index < previous.length; index++) {
       const message = previous[index]
@@ -916,18 +928,25 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         || owningUserIndex < 0
       ) continue
       const owningUser = previous[owningUserIndex]
-      if (owningUser?.messageId && latestIds.has(owningUser.messageId)) continue
+      if (owningUser?.messageId && latestIds.has(owningUser.messageId)) {
+        // Once the authoritative turn contains its durable error, the local
+        // notice has completed its bridging role and must not survive beside it.
+        if (latestHasDurableErrorForUser(owningUser.messageId)) {
+          excludedTerminalRows.add(message)
+        }
+        continue
+      }
 
       // A rejected cursor means a settled local turn cannot be assigned to the
       // replacement epoch by text, ordinal, or optimistic identity. Keep it
       // only when the authoritative page proves the owning durable user id.
       for (let turnIndex = owningUserIndex; turnIndex <= index; turnIndex++) {
         const turnMessage = previous[turnIndex]
-        if (turnMessage) unprovenTerminalTurnRows.add(turnMessage)
+        if (turnMessage) excludedTerminalRows.add(turnMessage)
       }
     }
     return previous.filter(message =>
-      !unprovenTerminalTurnRows.has(message)
+      !excludedTerminalRows.has(message)
       && (
         message.restoredFromHistory !== true
         || Boolean(message.messageId && latestIds.has(message.messageId))

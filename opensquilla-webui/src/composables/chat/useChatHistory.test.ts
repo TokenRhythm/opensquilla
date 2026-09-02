@@ -2636,6 +2636,59 @@ describe('useChatHistory canonical pagination', () => {
     })
   })
 
+  it('replaces a proven local terminal notice with the durable history error', async () => {
+    const currentUser = sessionReadMessage({
+      id: 'current-user',
+      messageId: 'current-user',
+      role: 'user',
+      text: 'current epoch prompt',
+      createdAt: '2026-07-06T00:00:01Z',
+      turnContext: { turnId: 'current-turn' },
+    }, 0)
+    const durableError = sessionReadMessage({
+      id: 'durable-error',
+      messageId: 'durable-error',
+      role: 'error',
+      text: 'Durable activation failure.',
+      createdAt: '2026-07-06T00:00:02Z',
+      turnContext: { turnId: 'current-turn' },
+    }, 1)
+    const { api, historyFixture, messages } = makeHistory(false)
+    historyFixture
+      .mockResolvedValueOnce({
+        messages: [currentUser],
+        hasMore: true,
+        oldestCursor: 'old-cursor',
+        newestCursor: 'old-cursor',
+        canonicalAvailable: true,
+      })
+      .mockRejectedValueOnce(new SessionReadHistoryCursorError('stale', 'cursor rejected'))
+      .mockResolvedValueOnce({
+        messages: [currentUser, durableError],
+        hasMore: false,
+        oldestCursor: 'current-cursor',
+        newestCursor: 'error-cursor',
+        canonicalAvailable: true,
+      })
+
+    await api.loadHistory()
+    messages.value.push({
+      role: 'error',
+      text: 'Activation failed; retry this message.',
+      ts: 'local-error',
+      turnId: 'current-turn',
+      errorCode: 'failed',
+      terminalNotice: true,
+    })
+    await api.loadEarlierHistory()
+    await api.retryHistory()
+
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'error'])
+    expect(messages.value.filter(message => message.role === 'error')).toHaveLength(1)
+    expect(messages.value[1]?.messageId).toBe('durable-error')
+    expect(messages.value[1]?.terminalNotice).toBeUndefined()
+  })
+
   it('drops the prior canonical window when latest recovery is empty', async () => {
     const { api, historyFixture, messages } = makeHistory(false)
     historyFixture
