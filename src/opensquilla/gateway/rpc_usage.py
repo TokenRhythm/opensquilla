@@ -6,6 +6,7 @@ import time
 from collections.abc import Mapping
 from typing import Any
 
+from opensquilla.gateway.balance_query import BalanceQueryError, query_provider_balance
 from opensquilla.gateway.rpc import (
     RpcContext,
     RpcHandlerError,
@@ -742,6 +743,31 @@ async def _handle_usage_query(params: dict | None, ctx: RpcContext) -> dict[str,
         return await query_usage_ledger(storage, params)
     except UsageQueryValidationError as exc:
         raise RpcHandlerError("INVALID_REQUEST", str(exc)) from exc
+
+
+@_d.method("balance.query", scope="operator.read")
+async def _handle_balance_query(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    """Report the remaining balance/credits of the configured LLM provider.
+
+    Proactive counterpart to ``usage.query``: instead of "how much has been
+    spent", this answers "how much is left" by asking the active provider's
+    balance endpoint. Providers without such an endpoint return
+    ``status="unsupported"`` (a normal result, not an error).
+    """
+
+    llm = getattr(ctx.config, "llm", None) if ctx.config is not None else None
+    if llm is None:
+        raise RpcUnavailableError("No LLM provider is configured")
+    try:
+        return await query_provider_balance(
+            provider=str(getattr(llm, "provider", "") or ""),
+            base_url=str(getattr(llm, "base_url", "") or ""),
+            api_key=str(getattr(llm, "api_key", "") or ""),
+            api_key_env=str(getattr(llm, "api_key_env", "") or ""),
+            proxy=(str(getattr(llm, "proxy", "") or "").strip() or None),
+        )
+    except BalanceQueryError as exc:
+        raise RpcUnavailableError(str(exc)) from exc
 
 
 @_d.method("usage.cost", scope="operator.read")
