@@ -459,9 +459,10 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   function beginBackgroundReceiptReplay(clientMessageId: string, holdHistory = false) {
     const normalizedClientId = String(clientMessageId || '').trim()
     if (!normalizedClientId) return
+    const isNewReceipt = !backgroundReceiptClientIds.has(normalizedClientId)
     pendingBackgroundReceiptClientIds.add(normalizedClientId)
     rememberBackgroundReceiptClient(normalizedClientId)
-    reconciledBackgroundReceiptClientIds.delete(normalizedClientId)
+    if (isNewReceipt) reconciledBackgroundReceiptClientIds.delete(normalizedClientId)
     if (holdHistory) holdBackgroundReceiptReconciliation()
   }
 
@@ -580,6 +581,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     eventKind: ConversationSemanticEventKind | 'sessions-changed',
     payload: SessionEventPayload,
   ): boolean {
+    if (isStaleEpoch(payload)) return false
     if (!isCurrentSessionPayload(payload)) return false
     const identity = matchingBackgroundReceiptIdentity(payload)
     if (!identity) return false

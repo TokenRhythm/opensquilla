@@ -2396,6 +2396,8 @@ const {
   loadEarlierHistory,
   retryHistory: retryHistoryRequest,
   scheduleHistorySync,
+  holdHistorySync,
+  releaseHistorySync,
   cancelAnchorStabilization,
   cancelActiveHistory,
   markSessionMissing,
@@ -2573,8 +2575,14 @@ const chatMessageActions = useChatMessageActions({
   },
   notifyMessagePending: () => pushToast(t('chat.toast.messageStillSaving'), { tone: 'info' }),
   notifyEditBlocked: () => pushToast(t('chat.pending.editWhileStreaming'), { tone: 'info' }),
-  onEditStarted: () => holdBackgroundReceiptReconciliation(),
-  onEditSettled: () => releaseBackgroundReceiptReconciliation(),
+  onEditStarted: () => {
+    holdBackgroundReceiptReconciliation()
+    holdHistorySync()
+  },
+  onEditSettled: () => {
+    releaseBackgroundReceiptReconciliation()
+    releaseHistorySync()
+  },
 })
 const {
   copyMessage,

@@ -2405,7 +2405,7 @@ describe('useChatSend attachment payloads', () => {
     expect(messageActions.cancelEdit()).toBe(false)
   })
 
-  it('exact-replays an unknown edited fork only while its transcript owner is unchanged', async () => {
+  it('keeps an edited receipt offscreen after its composer owner changes', async () => {
     const {
       sessionKey,
       messages,
@@ -2443,15 +2443,15 @@ describe('useChatSend attachment payloads', () => {
     expect(messages.value.map(message => message.role)).toEqual(['user', 'error'])
 
     inputText.value = 'draft typed while retrying'
-    // The live stream belongs to this request whose acceptance is unknown.
-    // An exact receipt replay may resolve it, but must not restart or clear it.
+    // An existing live stream and the newer draft remain foreground owners.
+    // An exact receipt replay may resolve the older request only offscreen.
     stream.isStreaming.value = true
     await api.onSend()
     expect(rpc.call).toHaveBeenCalledTimes(2)
     expect(rpc.call.mock.calls[1]?.[1]?.clientRequestId).toBe(
       rpc.call.mock.calls[0]?.[1]?.clientRequestId,
     )
-    expect(messages.value.map(message => message.role)).toEqual(['user', 'error', 'error'])
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'error'])
     expect(inputText.value).toBe('draft typed while retrying')
     expect(stream.isStreaming.value).toBe(true)
 
@@ -2680,6 +2680,89 @@ describe('useChatSend attachment payloads', () => {
     expect(messages.value).toBe(editOwner)
     expect(messages.value).toEqual([])
     expect(inputText.value).toBe('edited during preflight')
+    expect(pendingForkBeforeMessageId.value).toBe('msg-original')
+    expect(messageActions.cancelEdit()).toBe(true)
+  })
+
+  it('quarantines a same-generation Edit retry when its composer changes during preflight', async () => {
+    const {
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      messageActions,
+    } = makeEditedMessageState('edited question')
+    const composerRevision = ref(0)
+    const promptAnnotationIds = ref<string[]>([])
+    let finishReplayPreflight!: () => void
+    const validateActiveProjectBeforeSend = vi.fn()
+      .mockResolvedValueOnce(null)
+      .mockImplementationOnce(() => new Promise<string | null>(resolve => {
+        finishReplayPreflight = () => resolve(null)
+      }))
+    const beginBackgroundReceiptReplay = vi.fn()
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+        .mockResolvedValueOnce({
+          sessionKey: 'agent:main:webchat:test',
+          task_id: 'task-edit-receipt',
+        }),
+    }
+    const { api, options } = makeOptions({
+      rpc,
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      composerRevision,
+      promptAnnotationIds,
+      messageEditGeneration: messageActions.editGeneration,
+      messageEditActive: messageActions.editActive,
+      validateMessageEditOwner: messageActions.validateEditOwner,
+      commitMessageEdit: messageActions.commitEdit,
+      adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
+      validateActiveProjectBeforeSend,
+      beginBackgroundReceiptReplay,
+    })
+
+    await api.onSend()
+    const originalParams = rpc.call.mock.calls[0]?.[1]
+    const replay = api.onSend()
+    await vi.waitFor(() => expect(validateActiveProjectBeforeSend).toHaveBeenCalledTimes(2))
+
+    // Retyping the same visible text is still a new composer owner. The new
+    // attachment/annotation make the ownership difference independently
+    // observable even in harnesses that do not expose the UI revision counter.
+    inputText.value = 'edited question'
+    composerRevision.value += 1
+    pendingForkBeforeMessageId.value = 'msg-original'
+    const currentAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 903,
+      name: 'same-edit-new.png',
+      mime: 'image/png',
+      file_uuid: 'same-edit-new-file',
+    }
+    options.pendingAttachments.value = [currentAttachment]
+    promptAnnotationIds.value = ['same-edit-new-annotation']
+    const editOwner = messages.value
+
+    expect(beginBackgroundReceiptReplay).toHaveBeenCalledWith(
+      originalParams.clientMessageId,
+      true,
+    )
+    expect(rpc.call).toHaveBeenCalledOnce()
+
+    finishReplayPreflight()
+    await replay
+
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(originalParams)
+    expect(messages.value).toBe(editOwner)
+    expect(inputText.value).toBe('edited question')
+    expect(options.pendingAttachments.value).toEqual([currentAttachment])
+    expect(promptAnnotationIds.value).toEqual(['same-edit-new-annotation'])
     expect(pendingForkBeforeMessageId.value).toBe('msg-original')
     expect(messageActions.cancelEdit()).toBe(true)
   })

@@ -191,6 +191,8 @@ interface SendAttempt {
   }
   params: TurnSendParams
   requiresIdempotentReplay?: boolean
+  /** Exact composer owner captured when this unknown attempt first became retryable. */
+  recoveryComposerSnapshot?: ComposerSnapshot
   // A Stop issued before durable acceptance is known belongs to this exact
   // idempotent request, not to whichever session happens to be visible later.
   stopRequested?: boolean
@@ -837,11 +839,14 @@ export function useChatSend(options: UseChatSendOptions) {
   ): boolean {
     const editOwner = attempt.messageEditTranscriptOwner
     if (editOwner) {
-      return !(
+      const ownsTranscript = (
         options.messageEditActive?.value === true
         && snapshot.messageEditGeneration === editOwner.generation
         && attemptOwnsMessageEditTranscript(attempt)
       )
+      if (!ownsTranscript) return true
+      const recoveryOwner = attempt.recoveryComposerSnapshot
+      return !recoveryOwner || !sameComposerOwnershipSnapshot(snapshot, recoveryOwner)
     }
     const ownsFreshMaterial = Boolean(
       snapshot.inputText
@@ -869,6 +874,34 @@ export function useChatSend(options: UseChatSendOptions) {
       attempt.clientMessageId,
       options.messageEditActive?.value === true,
     )
+  }
+
+  function sameComposerOwnershipSnapshot(
+    current: ComposerSnapshot,
+    owner: ComposerSnapshot,
+  ): boolean {
+    return (
+      (owner.revision === null || current.revision === owner.revision)
+      && current.inputText === owner.inputText
+      && JSON.stringify(current.promptAnnotationIds) === JSON.stringify(owner.promptAnnotationIds)
+      && sameDocumentContext(current.documentContext, owner.documentContext)
+      && current.attachmentRefs.length === owner.attachmentRefs.length
+      && current.attachmentRefs.every(
+        (attachment, index) => attachment === owner.attachmentRefs[index],
+      )
+      && JSON.stringify(current.payloadAttachments) === JSON.stringify(owner.payloadAttachments)
+      && current.intent === owner.intent
+      && current.forkBeforeMessageId === owner.forkBeforeMessageId
+      && current.workspaceId === owner.workspaceId
+      && current.initialCollaborationMode === owner.initialCollaborationMode
+      && current.initialRoutingMode === owner.initialRoutingMode
+      && current.messageEditGeneration === owner.messageEditGeneration
+    )
+  }
+
+  function rememberRecoveryComposerSnapshot(attempt: SendAttempt) {
+    if (attempt.recoveryComposerSnapshot) return
+    attempt.recoveryComposerSnapshot = captureComposerSnapshot()
   }
 
   watch([
@@ -3694,6 +3727,7 @@ export function useChatSend(options: UseChatSendOptions) {
           if (sendOpts.rememberRetryableAttempt) {
             sendOpts.rememberRetryableAttempt(attempt)
           } else {
+            rememberRecoveryComposerSnapshot(attempt)
             recoveredAttempt = attempt
             quarantineRecoveredAttemptIfUnrelated()
           }
@@ -3701,6 +3735,7 @@ export function useChatSend(options: UseChatSendOptions) {
           // The optimistic user bubble already owns this payload. Keep its
           // immutable request identity for exact replay without presenting the
           // same text as a new editable draft.
+          rememberRecoveryComposerSnapshot(attempt)
           recoveredAttempt = attempt
           quarantineRecoveredAttemptIfUnrelated()
         } else if (restoreComposer) {
@@ -3988,6 +4023,7 @@ export function useChatSend(options: UseChatSendOptions) {
       options.pendingWorkspaceId.value = attempt.workspaceId
     }
     attempt.requiresIdempotentReplay = recovery.requiresIdempotentReplay
+    rememberRecoveryComposerSnapshot(attempt)
     recoveredAttempt = attempt
     quarantineRecoveredAttemptIfUnrelated()
     options.autoResizeTextarea()

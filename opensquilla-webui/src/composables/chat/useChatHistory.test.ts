@@ -2405,6 +2405,100 @@ describe('useChatHistory canonical pagination', () => {
     }
   })
 
+  it('pauses a terminal history timer until Edit releases it', async () => {
+    vi.useFakeTimers()
+    try {
+      const initialEditOwner: ChatMessage[] = [{
+        role: 'user',
+        text: 'edit-owned transcript',
+        ts: null,
+        messageId: 'edit-owner',
+      }]
+      const { api, readHistory, messages } = makeHistory(false, {
+        messages: initialEditOwner,
+        response: {
+          messages: [historyMessage('canonical-after-escape')],
+          hasMore: false,
+          oldestCursor: null,
+        },
+      })
+      const editOwner = messages.value
+
+      api.scheduleHistorySync()
+      api.holdHistorySync()
+      await vi.advanceTimersByTimeAsync(50)
+
+      expect(readHistory).not.toHaveBeenCalled()
+      expect(messages.value).toBe(editOwner)
+
+      api.releaseHistorySync()
+      await vi.advanceTimersByTimeAsync(50)
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(readHistory).toHaveBeenCalledOnce()
+      expect(messages.value.map(message => message.messageId)).toEqual([
+        'canonical-after-escape',
+      ])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('defers an in-flight history replacement until Edit releases it', async () => {
+    vi.useFakeTimers()
+    try {
+      let resolveWhileEditing!: (value: SessionReadHistoryPageFixture) => void
+      const responseWhileEditing = new Promise<SessionReadHistoryPageFixture>(resolve => {
+        resolveWhileEditing = resolve
+      })
+      const initialEditOwner: ChatMessage[] = [{
+        role: 'user',
+        text: 'edit-owned transcript',
+        ts: null,
+        messageId: 'edit-owner',
+      }]
+      const { api, readHistory, historyFixture, messages } = makeHistory(false, {
+        messages: initialEditOwner,
+      })
+      const editOwner = messages.value
+      historyFixture
+        .mockImplementationOnce(() => responseWhileEditing)
+        .mockResolvedValueOnce({
+          messages: [historyMessage('canonical-after-escape')],
+          hasMore: false,
+          oldestCursor: null,
+        })
+
+      // A terminal schedules the sync; Edit starts after its timer has already
+      // launched the read but before that read can replace the transcript.
+      api.scheduleHistorySync()
+      await vi.advanceTimersByTimeAsync(50)
+      expect(readHistory).toHaveBeenCalledOnce()
+      api.holdHistorySync()
+      resolveWhileEditing({
+        messages: [historyMessage('canonical-during-edit')],
+        hasMore: false,
+        oldestCursor: null,
+      })
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(messages.value).toBe(editOwner)
+      expect(messages.value.map(message => message.messageId)).toEqual(['edit-owner'])
+
+      // Escape releases the hold and exactly one deferred refresh applies.
+      api.releaseHistorySync()
+      await vi.advanceTimersByTimeAsync(50)
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(readHistory).toHaveBeenCalledTimes(2)
+      expect(messages.value.map(message => message.messageId)).toEqual([
+        'canonical-after-escape',
+      ])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('keeps the new session loading when a stale request fails first', async () => {
     const sessionKey = ref('agent:main:webchat:old')
     let rejectOld!: (reason: Error) => void

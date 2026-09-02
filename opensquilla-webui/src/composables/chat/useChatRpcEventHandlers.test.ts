@@ -422,6 +422,62 @@ describe('useChatRpcEventHandlers decoded conversation ingress', () => {
       harness.stop()
     }
   })
+
+  it('does not learn receipt task ownership from a stale subscription epoch', () => {
+    const harness = createHarness()
+    const deliver = (eventName: string, payload: Record<string, unknown>) => {
+      harness.api.onConversationEvent({
+        kind: 'conversation',
+        event: decodeConversationEvent(eventName, payload, {}),
+        payload,
+        meta: {},
+      })
+    }
+    try {
+      harness.api.beginBackgroundReceiptReplay('client-old-epoch')
+      deliver('task.running', {
+        session_key: 'agent:main:test',
+        epoch: -1,
+        task_id: 'task-old-epoch',
+        client_message_id: 'client-old-epoch',
+      })
+      harness.api.finishBackgroundReceiptReplay('client-old-epoch')
+
+      deliver('session.event.text_delta', {
+        session_key: 'agent:main:test',
+        task_id: 'task-old-epoch',
+        stream_seq: 1,
+        text: 'current-epoch answer',
+      })
+
+      expect(harness.stream.appendDelta).toHaveBeenCalledWith('current-epoch answer')
+    } finally {
+      harness.stop()
+    }
+  })
+
+  it('does not re-arm reconciliation when the same receipt is registered again', () => {
+    const harness = createHarness()
+    try {
+      harness.api.beginBackgroundReceiptReplay('client-reconciled')
+      harness.api.trackBackgroundReceiptTask(
+        'client-reconciled',
+        'task-reconciled',
+        true,
+      )
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+
+      harness.api.beginBackgroundReceiptReplay('client-reconciled')
+      harness.api.trackBackgroundReceiptTask(
+        'client-reconciled',
+        'task-reconciled',
+        true,
+      )
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+    } finally {
+      harness.stop()
+    }
+  })
 })
 
 describe('useChatRpcEventHandlers live snapshot restoration', () => {

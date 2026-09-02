@@ -729,6 +729,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   let historySyncPending = false
   let historySyncTimerNonReconnecting = false
   let historySyncPendingNonReconnecting = false
+  let historySyncHeld = false
   // Exposed read-only by convention so session hand-offs can distinguish the
   // prior session's terminal `ready` state from the new session's first load.
   const historySessionKey = ref('')
@@ -781,6 +782,11 @@ export function useChatHistory(options: UseChatHistoryOptions) {
 
   function armHistorySync(nonReconnecting: boolean, advanceGeneration: boolean) {
     if (nonReconnecting && advanceGeneration) preserveLocalTailGeneration += 1
+    if (historySyncHeld) {
+      historySyncPending = true
+      historySyncPendingNonReconnecting ||= nonReconnecting
+      return
+    }
     historySyncTimerNonReconnecting ||= nonReconnecting
     if (historySyncTimer) clearTimeout(historySyncTimer)
     historySyncTimer = setTimeout(() => {
@@ -800,7 +806,23 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     armHistorySync(preserveLocalTail, true)
   }
 
+  function holdHistorySync() {
+    historySyncHeld = true
+    if (!historySyncTimer) return
+    clearTimeout(historySyncTimer)
+    historySyncTimer = null
+    historySyncPending = true
+    historySyncPendingNonReconnecting ||= historySyncTimerNonReconnecting
+    historySyncTimerNonReconnecting = false
+  }
+
+  function releaseHistorySync() {
+    historySyncHeld = false
+    flushPendingHistorySync()
+  }
+
   function flushPendingHistorySync() {
+    if (historySyncHeld) return
     if (historyState.value.loading || failedHistoryRequest) return
     if (loadEarlierPending) {
       loadEarlierPending = false
@@ -934,6 +956,10 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     const crossedSession = Boolean(historySessionKey.value)
     if (crossedSession) {
       acknowledgedPreserveLocalTailGeneration = preserveLocalTailGeneration
+      // Edit ownership belongs to the old transcript domain. The surrounding
+      // session transition cancels its reads; never carry its apply hold into
+      // the new session's bootstrap.
+      historySyncHeld = false
     }
     historySessionKey.value = key
     hasLoadedEarlier = false
@@ -1074,6 +1100,15 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         bootstrap,
       )
       if (!isCurrentRequest()) return { ok: false, cancelled: true }
+      if (historySyncHeld) {
+        if (params.prepend) loadEarlierPending = true
+        else {
+          historySyncPending = true
+          historySyncPendingNonReconnecting ||= nonReconnecting
+        }
+        restoreSilentBackgroundState()
+        return { ok: false, cancelled: true }
+      }
       const msgs = data.messages
       const canonicalAvailable = data.canonicalAvailable
       if (canonicalAvailable === false) {
@@ -1590,6 +1625,8 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     retryHistory,
     markSessionMissing,
     scheduleHistorySync,
+    holdHistorySync,
+    releaseHistorySync,
     cancelAnchorStabilization,
     cancelActiveHistory,
     cleanup,
