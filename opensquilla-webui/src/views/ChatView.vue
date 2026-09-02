@@ -877,6 +877,13 @@ import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
 import { useChatSessionRouting } from '@/composables/chat/useChatSessionRouting'
 import { SESSION_ROUTING_KEY, type SessionRouting } from '@/modules/sessionRouting'
 import { SESSION_CONVERSATION_KEY, type SessionConversation } from '@/modules/sessionConversation'
+import { USAGE_REPORTING_KEY, type UsageReporting } from '@/modules/usageReporting'
+import { COMMAND_CATALOG_KEY, type CommandCatalog } from '@/modules/commandCatalog'
+import { PROMPT_CACHE_LEASE_KEY, type PromptCacheLease } from '@/modules/promptCacheLease'
+import {
+  CLARIFICATION_SUBMISSION_KEY,
+  type ClarificationSubmission,
+} from '@/modules/clarificationSubmission'
 import { SESSION_MAINTENANCE_KEY, type SessionMaintenance } from '@/modules/sessionMaintenance'
 import { TURN_COMMANDS_KEY, type TurnCommands } from '@/modules/turnCommands'
 import { APPROVAL_CENTER_KEY, type ApprovalCenter } from '@/modules/approvalCenter'
@@ -1210,6 +1217,20 @@ if (!injectedAppSettings) throw new Error('AppSettings was not provided')
 const injectedSessionConversation = inject(SESSION_CONVERSATION_KEY)
 if (!injectedSessionConversation) throw new Error('SessionConversation was not provided')
 const sessionConversation: SessionConversation = injectedSessionConversation
+const injectedUsageReporting = inject(USAGE_REPORTING_KEY)
+if (!injectedUsageReporting) throw new Error('UsageReporting was not provided')
+const usageReporting: UsageReporting = injectedUsageReporting
+const injectedCommandCatalog = inject(COMMAND_CATALOG_KEY)
+if (!injectedCommandCatalog) throw new Error('CommandCatalog was not provided')
+const commandCatalog: CommandCatalog = injectedCommandCatalog
+const injectedPromptCacheLease = inject(PROMPT_CACHE_LEASE_KEY)
+if (!injectedPromptCacheLease) throw new Error('PromptCacheLease was not provided')
+const promptCacheLease: PromptCacheLease = injectedPromptCacheLease
+const injectedClarificationSubmission = inject(CLARIFICATION_SUBMISSION_KEY)
+if (!injectedClarificationSubmission) {
+  throw new Error('ClarificationSubmission was not provided')
+}
+const clarificationSubmission: ClarificationSubmission = injectedClarificationSubmission
 const injectedSessionMaintenance = inject(SESSION_MAINTENANCE_KEY)
 if (!injectedSessionMaintenance) throw new Error('SessionMaintenance was not provided')
 const sessionMaintenance: SessionMaintenance = injectedSessionMaintenance
@@ -1469,7 +1490,7 @@ async function reusePromptAnnotation(annotation: PromptAnnotationSnapshot) {
 const promptCacheKeepaliveOpen = ref(false)
 const promptCacheKeepaliveStatus = ref<PromptCacheKeepaliveStatus | null>(null)
 const promptCacheKeepaliveAvailable = computed(() => (
-  sessionConversation.supports('prompt-cache-keepalive')
+  promptCacheLease.isAvailable()
 ))
 const workbenchEnabled = computed(() => appStore.features.artifactWorkbench === true)
 const promptAnnotationDesktopAvailable = computed(() => (
@@ -1744,7 +1765,7 @@ async function refreshPromptCacheKeepaliveStatus() {
     || !promptCacheKeepaliveSessionReady.value
   ) return
   try {
-    const next = await sessionConversation.promptCacheStatus(key)
+    const next = await promptCacheLease.status(key)
     if (sessionKey.value === key) promptCacheKeepaliveStatus.value = next
   } catch {
     // The settings dialog owns actionable RPC errors. Menu refresh is best effort.
@@ -2101,7 +2122,7 @@ watch(compactStatus, (status) => {
 }, { flush: 'sync' })
 
 const chatUsageWidget = useChatUsageWidget({
-  sessionConversation,
+  usageReporting,
   readCallOptions: optionalSessionRpcCallOptions,
   sessionKey,
   tokenVizEnabled: () => appStore.features.tokenViz,
@@ -3219,7 +3240,8 @@ const goalOutcomeHasMessageAnchor = computed(() => (
 ))
 
 const chatSlashCommands = useChatSlashCommands({
-  sessionConversation,
+  commandCatalog,
+  usageReporting,
   sessionMaintenance,
   metaRunCenter,
   catalogCallOptions: optionalSessionRpcCallOptions,
@@ -3750,6 +3772,7 @@ async function steerPendingMessage(pendingUiId: string) {
 
 const chatApprovals = useChatApprovals({
   sessionConversation,
+  clarificationSubmission,
   approvalCenter,
   sessionKey,
   runStatus,
@@ -6505,12 +6528,6 @@ async function syncDraftProjectFromRoute(generation: number): Promise<boolean> {
   const controller = draftProjectHydration.createController(generation)
   if (!controller) return false
   try {
-    await sessionConversation.ready({
-      timeoutMs: Math.max(1, deadlineAt - Date.now()),
-      signal: controller.signal,
-      timeoutAction: 'reject',
-      abortAction: 'reject',
-    })
     if (!draftProjectHydrationIsCurrent(generation, workspaceId)) return false
     await projectWorkspaces.loadWorkspaces({
       timeoutMs: Math.max(1, deadlineAt - Date.now()),

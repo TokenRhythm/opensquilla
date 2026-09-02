@@ -27,6 +27,14 @@ from typing import Any
 import structlog
 
 from opensquilla.engine.steps.router_decision_record import get_decision_writer
+from opensquilla.gateway.adapters.conversation_ancillary import (
+    GatewayConversationAncillaryAdapter,
+    GatewayConversationAncillaryCallbacks,
+)
+from opensquilla.gateway.adapters.conversation_ancillary_contract import (
+    register_conversation_ancillary_contract,
+)
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.protocol import ERROR_INVALID_REQUEST
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
 from opensquilla.persistence.router_decision_writer import sanitize_token
@@ -118,7 +126,6 @@ async def _handle_router_decisions_list(params: Any, ctx: RpcContext) -> dict[st
     return {"decisions": [_wire_decision(row) for row in rows]}
 
 
-@_d.method("router.feedback.submit", scope="operator.write")
 async def _handle_router_feedback_submit(params: Any, ctx: RpcContext) -> dict[str, Any]:
     """Record a user rating (up/down/neutral) for one routing decision.
 
@@ -355,3 +362,26 @@ async def _handle_selflearning_status(params: Any, ctx: RpcContext) -> dict[str,
         payload["error"] = "status_partial"
 
     return payload
+
+
+async def _handle_router_feedback_submit_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    adapter = GatewayConversationAncillaryAdapter(
+        ctx,
+        GatewayConversationAncillaryCallbacks(
+            route_feedback=_handle_router_feedback_submit,
+        ),
+    )
+    return await adapter.submit_feedback(params)
+
+
+_handle_router_feedback_submit_generated_contract = (
+    register_conversation_ancillary_contract(
+        _d,
+        "router.feedback.submit",
+        _handle_router_feedback_submit_contract,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+)

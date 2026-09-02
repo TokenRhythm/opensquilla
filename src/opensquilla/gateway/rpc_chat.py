@@ -22,6 +22,13 @@ from opensquilla.artifact_session import (
 from opensquilla.chat.conversation import ChatSendRequest, sessions_send_params
 from opensquilla.chat.history import transcript_entries_to_chat_messages
 from opensquilla.chat.source import chat_source_metadata
+from opensquilla.gateway.adapters.conversation_ancillary import (
+    GatewayConversationAncillaryAdapter,
+    GatewayConversationAncillaryCallbacks,
+)
+from opensquilla.gateway.adapters.conversation_ancillary_contract import (
+    register_conversation_ancillary_contract,
+)
 from opensquilla.gateway.adapters.session_history import (
     SessionHistoryStorageAdapter,
     parse_history_cursor,
@@ -1312,7 +1319,6 @@ def _clarify_fields_to_text(fields: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
-@_d.method("chat.clarify_submit", scope="operator.write")
 async def _handle_chat_clarify_submit(params: dict | None, ctx: RpcContext) -> dict:
     """Accept a structured clarify-form submission from a Web UI surface.
 
@@ -1386,7 +1392,10 @@ async def _handle_chat_clarify_submit(params: dict | None, ctx: RpcContext) -> d
             "source_name": "WebChat",
             "clarify_run_id": run_id,
         }
-    result = await _handle_chat_send(send_params, ctx)
+    result = await _chat_turn_admission_adapter(ctx).admit(
+        send_params,
+        surface="webchat",
+    )
     return cast(dict, result)
 
 
@@ -1462,4 +1471,28 @@ _handle_chat_abort_generated_contract = register_turn_admission_contract(
     _handle_chat_abort_contract,
     internal_error=RpcHandlerError,
     guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
+async def _handle_chat_clarify_submit_contract(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    adapter = GatewayConversationAncillaryAdapter(
+        ctx,
+        GatewayConversationAncillaryCallbacks(
+            clarification=_handle_chat_clarify_submit,
+        ),
+    )
+    return await adapter.submit_clarification(params)
+
+
+_handle_chat_clarify_submit_generated_contract = (
+    register_conversation_ancillary_contract(
+        _d,
+        "chat.clarify_submit",
+        _handle_chat_clarify_submit_contract,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
 )

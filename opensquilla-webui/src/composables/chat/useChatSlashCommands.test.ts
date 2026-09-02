@@ -6,7 +6,10 @@ import type { RpcCallOptions } from '@/lib/rpc'
 import type { MetaRunCenter } from '@/modules/metaRunCenter'
 import type { SessionMaintenance } from '@/modules/sessionMaintenance'
 import type { MetaSetupReadiness } from '@/types/metaSetup'
-import { sessionConversationFromTestRpc } from '@/testing/sessionConversation.test-helper'
+import {
+  commandCatalogFromTestRpc,
+  usageReportingFromTestRpc,
+} from '@/testing/conversationAncillary.test-helper'
 
 function deferred() {
   let resolve!: () => void
@@ -18,14 +21,22 @@ function deferred() {
 
 function harness(
   planModeAvailable: boolean,
-  commands: Array<Record<string, unknown>> = [],
+  commands: unknown = [],
   ready: Promise<void> = Promise.resolve(),
   catalogCallOptions?: RpcCallOptions,
 ) {
   const inputText = ref('')
+  const call = vi.fn(async (
+    _method: string,
+    _params?: Record<string, unknown>,
+    _options?: RpcCallOptions,
+  ): Promise<unknown> => {
+    await ready
+    return { commands }
+  })
   const rpc = {
     ready: vi.fn(() => ready),
-    call: vi.fn().mockResolvedValue({ commands }),
+    call,
   }
   const metaRunCenter: MetaRunCenter = {
     launch: vi.fn(async input => {
@@ -84,7 +95,8 @@ function harness(
     })),
   }
   const api = useChatSlashCommands({
-    sessionConversation: sessionConversationFromTestRpc(rpc),
+    commandCatalog: commandCatalogFromTestRpc(rpc),
+    usageReporting: usageReportingFromTestRpc(rpc),
     sessionMaintenance,
     metaRunCenter,
     catalogCallOptions,
@@ -161,18 +173,15 @@ describe('useChatSlashCommands plan compatibility', () => {
       catalogCallOptions,
     )
     await api.loadSlashCommands()
-    expect(rpc.ready).toHaveBeenCalledWith(
-      2_000,
-      undefined,
-      {
-        timeoutAction: 'reject',
-        abortAction: 'reject',
-      },
-    )
     expect(rpc.call).toHaveBeenCalledWith(
       'commands.list_for_surface',
       { surface: 'web_chat' },
-      catalogCallOptions,
+      {
+        timeoutMs: 2_000,
+        signal: undefined,
+        timeoutAction: 'reject',
+        abortAction: 'reject',
+      },
     )
     inputText.value = '/pl'
     api.handleSlashInput()

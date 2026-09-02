@@ -2,10 +2,11 @@ import { computed, ref, type Ref } from 'vue'
 import i18n from '@/i18n'
 import type { RpcClientError } from '@/lib/rpc'
 import type { MetaLaunchDraftPayload, MetaRunCenter } from '@/modules/metaRunCenter'
+import type { CommandCatalog } from '@/modules/commandCatalog'
 import type {
-  SessionConversation,
-  SessionConversationRequestOptions,
-} from '@/modules/sessionConversation'
+  UsageReporting,
+  UsageReportingRequestOptions,
+} from '@/modules/usageReporting'
 import type { SessionMaintenance } from '@/modules/sessionMaintenance'
 import type { HiddenControlDispatchResult } from '@/types/chat'
 import type { MetaSetupReadiness } from '@/types/metaSetup'
@@ -84,11 +85,12 @@ const SUPPORTED_WEB_SLASH_ACTIONS = new Set([
 ])
 
 export interface UseChatSlashCommandsOptions {
-  sessionConversation: SessionConversation
+  commandCatalog: CommandCatalog
+  usageReporting: UsageReporting
   sessionMaintenance: SessionMaintenance
   /** Domain seam for MetaSkill launch; wire method names stay in its adapter. */
   metaRunCenter?: MetaRunCenter
-  catalogCallOptions?: SessionConversationRequestOptions
+  catalogCallOptions?: UsageReportingRequestOptions
   inputText: Ref<string>
   sessionKey: Ref<string>
   autoResizeTextarea: () => void
@@ -282,7 +284,8 @@ function localizedMetaDescription(choice: ArgumentChoice): string {
 }
 
 export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
-  const conversation = options.sessionConversation
+  const commandCatalog = options.commandCatalog
+  const usageReporting = options.usageReporting
   const maintenance = options.sessionMaintenance
   const slashOpen = ref(false)
   const slashIdx = ref(0)
@@ -461,8 +464,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
 
   async function loadSlashCommands() {
     try {
-      await conversation.ready(options.catalogCallOptions)
-      const res = await conversation.listCommands('web_chat', options.catalogCallOptions)
+      const res = await commandCatalog.list('web_chat', options.catalogCallOptions)
       if (
         !Array.isArray(res?.commands)
         || !res.commands.every(isValidSlashCommandPayload)
@@ -743,7 +745,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       case 'usage_status':
       case 'usage.status':
       case '/usage':
-        conversation.usage()
+        usageReporting.status()
           .then((result) => {
             const totals = result?.totals || {}
             const tokens = Number(result?.totalTokens ?? result?.total_tokens ?? totals.tokens ?? 0)

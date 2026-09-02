@@ -16,6 +16,7 @@ import type {
   ApprovalDecision,
 } from '@/modules/approvalCenter'
 import type { SessionConversation } from '@/modules/sessionConversation'
+import type { ClarificationSubmission } from '@/modules/clarificationSubmission'
 
 const MAX_RESOLVED_OUTCOMES = 4
 
@@ -113,6 +114,7 @@ export interface ApprovalsStreamSurface {
 
 export interface UseChatApprovalsOptions {
   sessionConversation: SessionConversation
+  clarificationSubmission: ClarificationSubmission
   approvalCenter: ApprovalCenter
   sessionKey: Ref<string>
   runStatus: Ref<ChatRunStatus>
@@ -201,6 +203,7 @@ function parseClarifyRequest(payload: ToolResultPayload): ChatClarifyRequest | n
 export function useChatApprovals(options: UseChatApprovalsOptions) {
   const { approvalCenter, sessionKey, stream, interruptState } = options
   const conversation = options.sessionConversation
+  const clarificationSubmission = options.clarificationSubmission
 
   const approvalEntries = ref<ChatApprovalEntry[]>([])
   const approvalBusyIds = ref<Set<string>>(new Set())
@@ -717,11 +720,13 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     }
     if (request.requestId) clarifySubmitAttempts.add(key)
     setInterruptState(key, { resolution: 'replied', busy: true, error: '' })
-    const params: Record<string, unknown> = { sessionKey: sessionKey.value, fields }
-    if (request.requestId) params.request_id = request.requestId
-    if (request.runId) params.run_id = request.runId
     try {
-      await conversation.submitClarify(params)
+      await clarificationSubmission.submit({
+        sessionKey: sessionKey.value,
+        fields,
+        ...(request.requestId ? { requestId: request.requestId } : {}),
+        ...(request.runId ? { runId: request.runId } : {}),
+      })
       clarifySubmitAttempts.delete(key)
       setInterruptState(key, { resolution: 'replied', busy: false })
       // request_id submissions resolve the exact paused tool call in the same

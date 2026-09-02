@@ -175,7 +175,7 @@ import ControlSwitch from '@/components/ControlSwitch.vue'
 import Icon from '@/components/Icon.vue'
 import { useDialogA11y } from '@/composables/useDialogA11y'
 import { useToasts } from '@/composables/useToasts'
-import { SESSION_CONVERSATION_KEY } from '@/modules/sessionConversation'
+import { PROMPT_CACHE_LEASE_KEY } from '@/modules/promptCacheLease'
 import type {
   PromptCacheKeepaliveStatus,
   PromptCacheKeepaliveStatusUpdate,
@@ -188,9 +188,9 @@ const emit = defineEmits<{
 }>()
 const { t } = useI18n()
 const { pushToast } = useToasts()
-const injectedSessionConversation = inject(SESSION_CONVERSATION_KEY)
-if (!injectedSessionConversation) throw new Error('SessionConversation was not provided')
-const conversation = injectedSessionConversation
+const injectedPromptCacheLease = inject(PROMPT_CACHE_LEASE_KEY)
+if (!injectedPromptCacheLease) throw new Error('PromptCacheLease was not provided')
+const promptCacheLease = injectedPromptCacheLease
 const dialogRef = ref<HTMLElement | null>(null)
 const closeButtonRef = ref<HTMLElement | null>(null)
 const loading = ref(false)
@@ -241,7 +241,7 @@ async function load() {
   loading.value = true
   error.value = ''
   try {
-    const next = await conversation.promptCacheStatus(props.sessionKey)
+    const next = await promptCacheLease.status(props.sessionKey)
     status.value = next
     draftEnabled.value = next.enabled
     draftTtlMinutes.value = Math.max(5, Math.round(next.ttlSeconds / 60))
@@ -271,7 +271,7 @@ async function save() {
     const idleTimeoutSeconds = Number.isInteger(draftIdleTimeoutMinutes.value)
       ? Math.round(draftIdleTimeoutMinutes.value * 60)
       : (status.value?.idleTimeoutSeconds || 3_600)
-    const next = await conversation.setPromptCacheStatus({
+    const next = await promptCacheLease.setPolicy({
       key: savedSessionKey,
       enabled: draftEnabled.value,
       ttlSeconds,
