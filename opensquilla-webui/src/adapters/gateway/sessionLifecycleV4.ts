@@ -17,10 +17,24 @@ import {
   type SessionsDeleteResult,
 } from '@/contracts/generated/v4/sessionsDelete'
 import { validateSessionsDeleteResult } from '@/contracts/generated/v4/sessionsDeleteValidators.mjs'
+import {
+  SESSIONS_FORK_METHOD,
+  type SessionsForkParams,
+  type SessionsForkResult,
+} from '@/contracts/generated/v4/sessionsFork'
+import { validateSessionsForkResult } from '@/contracts/generated/v4/sessionsForkValidators.mjs'
+import {
+  SESSIONS_FORK_THROUGH_TURN_METHOD,
+  type SessionsForkThroughTurnParams,
+  type SessionsForkThroughTurnResult,
+} from '@/contracts/generated/v4/sessionsForkThroughTurn'
+import { validateSessionsForkThroughTurnResult } from '@/contracts/generated/v4/sessionsForkThroughTurnValidators.mjs'
 import type {
   CreatedSession,
+  ForkedSession,
   SessionCreateRequest,
   SessionDeleteResult as DomainDeleteResult,
+  SessionForkRequest,
   SessionLifecycle,
   SessionRenameRequest,
   SessionRenameResult as DomainRenameResult,
@@ -39,6 +53,8 @@ interface SessionLifecycleTransport {
     params?: Record<string, unknown>,
     options?: RpcCallOptions,
   ): Promise<T>
+  supports?(method: string): boolean
+  markUnsupported?(method: string): void
 }
 
 function optionsFor(signal: AbortSignal | undefined): RpcCallOptions | undefined {
@@ -84,6 +100,11 @@ function lifecycleError(error: unknown): SessionLifecycleError {
   return new SessionLifecycleError('unavailable', message, { cause: error })
 }
 
+function isUnsupportedWireError(error: unknown): boolean {
+  const code = wireErrorCode(error)
+  return code === 'METHOD_NOT_FOUND' || code === 'UNSUPPORTED'
+}
+
 function responseError(message: string): SessionLifecycleError {
   return new SessionLifecycleError('unavailable', message)
 }
@@ -99,6 +120,13 @@ function createParams(request: SessionCreateRequest | undefined): SessionsCreate
   if (request.message !== undefined) params.message = request.message
   if (request.model !== undefined) params.model = request.model
   return params
+}
+
+function forkedSession(raw: SessionsForkResult | SessionsForkThroughTurnResult): ForkedSession {
+  if (!raw.key.trim()) {
+    throw responseError('session fork returned an empty child key')
+  }
+  return { key: raw.key }
 }
 
 export function createV4SessionLifecycle(
@@ -121,6 +149,86 @@ export function createV4SessionLifecycle(
           ...(raw.seededMessage !== undefined ? { seededMessage: raw.seededMessage } : {}),
           ...(raw.note !== undefined ? { note: raw.note } : {}),
         }
+      } catch (error) {
+        if (isAbort(error, request.signal)) throw error
+        throw lifecycleError(error)
+      }
+    },
+
+    async fork(request: SessionForkRequest): Promise<ForkedSession> {
+      try {
+        const normalizedTurnId = request.throughTurnId?.trim()
+        if (request.throughTurnId !== undefined && !normalizedTurnId) {
+          throw new SessionLifecycleError(
+            'invalid',
+            'A through-turn fork requires a non-empty turn identity',
+          )
+        }
+        if (!normalizedTurnId) {
+          const params: SessionsForkParams = { key: request.key }
+          const raw = await transport.request<SessionsForkResult>(
+            SESSIONS_FORK_METHOD,
+            params,
+            optionsFor(request.signal),
+          )
+          if (!validateSessionsForkResult(raw)) {
+            throw responseError('sessions.fork returned an invalid response')
+          }
+          return forkedSession(raw)
+        }
+
+        const params: SessionsForkThroughTurnParams = {
+          key: request.key,
+          throughTurnId: normalizedTurnId,
+        }
+        let raw: SessionsForkResult | SessionsForkThroughTurnResult
+        if (transport.supports?.(SESSIONS_FORK_THROUGH_TURN_METHOD) !== false) {
+          try {
+            const dedicated = await transport.request<SessionsForkThroughTurnResult>(
+              SESSIONS_FORK_THROUGH_TURN_METHOD,
+              params,
+              optionsFor(request.signal),
+            )
+            if (!validateSessionsForkThroughTurnResult(dedicated)) {
+              throw responseError(
+                'sessions.forkThroughTurn returned an invalid response',
+              )
+            }
+            raw = dedicated
+          } catch (error) {
+            if (isAbort(error, request.signal)) throw error
+            if (!isUnsupportedWireError(error)) throw error
+            transport.markUnsupported?.(SESSIONS_FORK_THROUGH_TURN_METHOD)
+            const fallback = await transport.request<SessionsForkResult>(
+              SESSIONS_FORK_METHOD,
+              params,
+              optionsFor(request.signal),
+            )
+            if (!validateSessionsForkResult(fallback)) {
+              throw responseError('sessions.fork returned an invalid response')
+            }
+            raw = fallback
+          }
+        } else {
+          const fallback = await transport.request<SessionsForkResult>(
+            SESSIONS_FORK_METHOD,
+            params,
+            optionsFor(request.signal),
+          )
+          if (!validateSessionsForkResult(fallback)) {
+            throw responseError('sessions.fork returned an invalid response')
+          }
+          raw = fallback
+        }
+        if (
+          raw.forkMode !== 'through_turn'
+          || raw.throughTurnId !== normalizedTurnId
+        ) {
+          throw responseError(
+            'Session fork did not confirm the requested turn boundary',
+          )
+        }
+        return forkedSession(raw)
       } catch (error) {
         if (isAbort(error, request.signal)) throw error
         throw lifecycleError(error)

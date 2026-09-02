@@ -31,6 +31,15 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         "src/opensquilla/contracts/adapters/goals_contract.py",
         "src/opensquilla/gateway/adapters/goals_contract.py",
         "src/opensquilla/gateway/adapters/plans_contract.py",
+        # Session read Contracts are consumed only by the Gateway registration
+        # Adapter; Application Modules and handlers receive domain values.
+        "src/opensquilla/gateway/adapters/session_read_contract.py",
+        # Session lifecycle wire models terminate at the registration Adapter;
+        # the Application Module receives transport-neutral typed commands.
+        "src/opensquilla/gateway/adapters/session_lifecycle_contract.py",
+        # SandboxRuntime handlers stay legacy-compatible while generated
+        # descriptors own registration metadata and success validation.
+        "src/opensquilla/gateway/adapters/sandbox_runtime_contract.py",
     }
 )
 GENERATED_METADATA_IMPORT_ALLOWLIST = frozenset(
@@ -108,7 +117,7 @@ SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
 SESSIONS_RESOLVE_LITERAL_ALLOWLIST: Counter[str] = Counter()
 SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
 RUNTIME_RPC_METHOD_BASELINE = 306
-STATIC_RPC_DECORATOR_BASELINE = 284
+STATIC_RPC_DECORATOR_BASELINE = 259
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
 # closure measurement below.  The temporary S2a cumulative growth budget was
@@ -185,8 +194,35 @@ WEBUI_LEGACY_TRANSPORT_IDENTIFIERS = (
 R3_APPLICATION_MODULE_FILES = (
     "src/opensquilla/application/app_settings.py",
     "src/opensquilla/application/provider_configuration.py",
+    "src/opensquilla/application/sandbox_runtime.py",
+    "src/opensquilla/application/session_read.py",
     "src/opensquilla/application/setup_workflow.py",
 )
+
+# Generated schema artifacts and consumer tests are intentionally excluded:
+# this ledger measures the five authored seams that carry SandboxRuntime's
+# domain, wire projection, and registration complexity.  The large-PR plan
+# requires a hard split before this surface exceeds 3,000 physical lines.
+SANDBOX_RUNTIME_AUTHORED_FILES = (
+    "opensquilla-webui/src/adapters/gateway/sandboxRuntimeV4.ts",
+    "opensquilla-webui/src/modules/sandboxRuntime.ts",
+    "src/opensquilla/application/sandbox_runtime.py",
+    "src/opensquilla/gateway/adapters/sandbox_runtime.py",
+    "src/opensquilla/gateway/adapters/sandbox_runtime_contract.py",
+)
+SANDBOX_RUNTIME_AUTHORED_LOC_CEILING = 3_000
+
+# This ledger is deliberately separate from SandboxRuntime: it measures only
+# the authored SessionLifecycle Module/Port and Gateway Adapter seams.  The
+# large-PR plan requires the predefined split before this seam exceeds 3,000
+# physical lines; generated artifacts, fixtures, and the reused legacy writer
+# fencing Implementation in rpc_sessions.py are not newly authored seams.
+SESSION_LIFECYCLE_AUTHORED_FILES = (
+    "src/opensquilla/application/session_lifecycle.py",
+    "src/opensquilla/gateway/adapters/session_lifecycle.py",
+    "src/opensquilla/gateway/adapters/session_lifecycle_contract.py",
+)
+SESSION_LIFECYCLE_AUTHORED_LOC_CEILING = 3_000
 
 # Existing cross-rpc private imports are architectural debt. This exact ledger
 # prevents growth and also fails stale when an import is removed, so reductions
@@ -545,7 +581,17 @@ def test_contract_gateway_adapters_do_not_join_a_gateway_cycle() -> None:
     graph = _module_import_graph()
     resolve_adapter = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_resolve_contract.py"
     goals_adapter = PACKAGE_ROOT / "gateway" / "adapters" / "goals_contract.py"
-    for adapter_path in (SESSIONS_LIST_GATEWAY_ADAPTER, resolve_adapter, goals_adapter):
+    sandbox_adapter = PACKAGE_ROOT / "gateway" / "adapters" / "sandbox_runtime_contract.py"
+    lifecycle_adapter = (
+        PACKAGE_ROOT / "gateway" / "adapters" / "session_lifecycle_contract.py"
+    )
+    for adapter_path in (
+        SESSIONS_LIST_GATEWAY_ADAPTER,
+        resolve_adapter,
+        goals_adapter,
+        sandbox_adapter,
+        lifecycle_adapter,
+    ):
         adapter = _module_name(adapter_path)
         cycle_edges = sorted(
             dependency for dependency in graph[adapter] if _reaches(graph, dependency, adapter)
@@ -559,6 +605,173 @@ def test_contract_gateway_adapters_do_not_join_a_gateway_cycle() -> None:
             f"{adapter} may depend only on the generic registration Adapter: {gateway_dependencies}"
         )
         assert cycle_edges == [], f"{adapter} joined a Python import cycle: {cycle_edges}"
+
+
+def test_sandbox_application_module_is_transport_neutral_and_typed() -> None:
+    module_path = PACKAGE_ROOT / "application" / "sandbox_runtime.py"
+    tree = _tree(module_path)
+    forbidden_import_prefixes = (
+        "opensquilla.contracts.generated",
+        "opensquilla.gateway",
+        "opensquilla.runtime_packs",
+        "opensquilla.sandbox",
+    )
+    forbidden_typing_names = {"Any", "Mapping", "MutableMapping"}
+    wire_field_names = {
+        "autonomousPaused",
+        "componentId",
+        "operationId",
+        "policyVersion",
+        "requiresAdmin",
+        "runMode",
+        "schemaVersion",
+        "sessionKey",
+    }
+
+    imported_modules: set[str] = set()
+    imported_typing_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported_modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                imported_modules.add(node.module)
+            if node.module == "typing":
+                imported_typing_names.update(alias.name for alias in node.names)
+
+    forbidden_imports = sorted(
+        module
+        for module in imported_modules
+        if module.startswith(forbidden_import_prefixes)
+    )
+    leaked_wire_fields = sorted(
+        {
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value in wire_field_names
+        }
+    )
+    payload_projectors = sorted(
+        {
+            node.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute) and node.attr == "to_payload"
+        }
+    )
+    production_fakes = sorted(
+        node.name
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name.startswith("InMemory")
+    )
+
+    assert forbidden_imports == [], (
+        f"sandbox application imports infrastructure: {forbidden_imports}"
+    )
+    assert imported_typing_names.isdisjoint(forbidden_typing_names), (
+        "sandbox application must expose typed DTOs instead of generic JSON bags: "
+        f"{sorted(imported_typing_names & forbidden_typing_names)}"
+    )
+    assert leaked_wire_fields == [], (
+        f"sandbox application owns wire field names: {leaked_wire_fields}"
+    )
+    assert payload_projectors == [], "sandbox application must not project transport payloads"
+    assert production_fakes == [], f"test fakes leaked into production: {production_fakes}"
+
+
+def test_sandbox_runtime_authored_surface_stays_within_large_pr_ceiling() -> None:
+    current = _physical_lines(SANDBOX_RUNTIME_AUTHORED_FILES)
+    assert current <= SANDBOX_RUNTIME_AUTHORED_LOC_CEILING, (
+        f"SandboxRuntime authored seams total {current} lines; split the domain at its "
+        f"predefined Module/Port or consumer boundary before exceeding "
+        f"{SANDBOX_RUNTIME_AUTHORED_LOC_CEILING}"
+    )
+
+
+def test_session_lifecycle_application_module_is_transport_neutral_and_typed() -> None:
+    module_path = PACKAGE_ROOT / "application" / "session_lifecycle.py"
+    tree = _tree(module_path)
+    forbidden_import_prefixes = (
+        "opensquilla.contracts.generated",
+        "opensquilla.gateway",
+    )
+    forbidden_typing_names = {"Any", "Mapping", "MutableMapping"}
+    wire_field_names = {
+        "agentId",
+        "authProfile",
+        "beforeMessageId",
+        "displayName",
+        "forkMode",
+        "parentKey",
+        "providerOverride",
+        "seededMessage",
+        "sessionId",
+        "throughTurnId",
+        "workspaceId",
+    }
+
+    imported_modules: set[str] = set()
+    imported_typing_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported_modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                imported_modules.add(node.module)
+            if node.module == "typing":
+                imported_typing_names.update(alias.name for alias in node.names)
+
+    forbidden_imports = sorted(
+        module
+        for module in imported_modules
+        if module.startswith(forbidden_import_prefixes)
+    )
+    leaked_wire_fields = sorted(
+        {
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value in wire_field_names
+        }
+    )
+    payload_projectors = sorted(
+        {
+            node.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute) and node.attr == "to_payload"
+        }
+    )
+    production_fakes = sorted(
+        node.name
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name.startswith("InMemory")
+    )
+
+    assert forbidden_imports == [], (
+        f"SessionLifecycle application imports infrastructure: {forbidden_imports}"
+    )
+    assert imported_typing_names.isdisjoint(forbidden_typing_names), (
+        "SessionLifecycle application must expose typed DTOs instead of JSON bags: "
+        f"{sorted(imported_typing_names & forbidden_typing_names)}"
+    )
+    assert leaked_wire_fields == [], (
+        f"SessionLifecycle application owns wire field names: {leaked_wire_fields}"
+    )
+    assert payload_projectors == [], (
+        "SessionLifecycle application must not project transport payloads"
+    )
+    assert production_fakes == [], f"test fakes leaked into production: {production_fakes}"
+
+
+def test_session_lifecycle_authored_surface_stays_within_large_pr_ceiling() -> None:
+    current = _physical_lines(SESSION_LIFECYCLE_AUTHORED_FILES)
+    assert current <= SESSION_LIFECYCLE_AUTHORED_LOC_CEILING, (
+        f"SessionLifecycle authored seams total {current} lines; split the domain at its "
+        f"predefined lifecycle/maintenance or Module/consumer boundary before exceeding "
+        f"{SESSION_LIFECYCLE_AUTHORED_LOC_CEILING}"
+    )
 
 
 def test_rpc_context_does_not_grow_past_pinned_main() -> None:
@@ -685,6 +898,18 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
         for site in sites
         if site[2]
         in {
+            "sessions.create",
+            "sessions.fork",
+            "sessions.forkThroughTurn",
+            "sessions.rename",
+            "sessions.delete",
+        }
+    ] == []
+    assert [
+        site
+        for site in sites
+        if site[2]
+        in {
             "goals.status",
             "goals.set",
             "goals.capabilities",
@@ -701,6 +926,40 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "GOALS_PAUSE_METHOD",
             "GOALS_RESUME_METHOD",
             "GOALS_CLEAR_METHOD",
+        }
+    ] == []
+    assert [
+        site
+        for site in sites
+        if site[2]
+        in {
+            "chat.history",
+            "sessions.messages.subscribe",
+            "sessions.messages.hydrate",
+            "sessions.messages.snapshot",
+            "sessions.messages.unsubscribe",
+            "sessions.preview",
+        }
+    ] == []
+    assert [
+        site
+        for site in sites
+        if site[2]
+        in {
+            "sandbox.setup.status",
+            "sandbox.setup.ensure",
+            "sandbox.capability.status",
+            "sandbox.policy.get",
+            "sandbox.policy.defaults",
+            "sandbox.policy.update",
+            "sandbox.run_mode.preference.get",
+            "sandbox.run_mode.preference.set",
+            "sandbox.runtime.status",
+            "sandbox.runtime.install",
+            "sandbox.runtime.cancel",
+            "sandbox.runtime.remove",
+            "sandbox.runtime.discard_download",
+            "sandbox.resume",
         }
     ] == []
 
@@ -735,6 +994,46 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
     assert entry.required_scope == SESSIONS_RESOLVE_SCOPE
     assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
     assert entry.handler.__name__ == "handle_contract_method"
+
+    from opensquilla.contracts.generated.v4.chat_history_metadata import (
+        CHAT_HISTORY_METHOD,
+        CHAT_HISTORY_SCOPE,
+    )
+    from opensquilla.contracts.generated.v4.sessions_messages_hydrate_metadata import (
+        SESSIONS_MESSAGES_HYDRATE_METHOD,
+        SESSIONS_MESSAGES_HYDRATE_SCOPE,
+    )
+    from opensquilla.contracts.generated.v4.sessions_messages_snapshot_metadata import (
+        SESSIONS_MESSAGES_SNAPSHOT_METHOD,
+        SESSIONS_MESSAGES_SNAPSHOT_SCOPE,
+    )
+    from opensquilla.contracts.generated.v4.sessions_messages_subscribe_metadata import (
+        SESSIONS_MESSAGES_SUBSCRIBE_METHOD,
+        SESSIONS_MESSAGES_SUBSCRIBE_SCOPE,
+    )
+    from opensquilla.contracts.generated.v4.sessions_messages_unsubscribe_metadata import (
+        SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD,
+        SESSIONS_MESSAGES_UNSUBSCRIBE_SCOPE,
+    )
+    from opensquilla.contracts.generated.v4.sessions_preview_metadata import (
+        SESSIONS_PREVIEW_METHOD,
+        SESSIONS_PREVIEW_SCOPE,
+    )
+
+    for method, scope in (
+        (CHAT_HISTORY_METHOD, CHAT_HISTORY_SCOPE),
+        (SESSIONS_MESSAGES_SUBSCRIBE_METHOD, SESSIONS_MESSAGES_SUBSCRIBE_SCOPE),
+        (SESSIONS_MESSAGES_HYDRATE_METHOD, SESSIONS_MESSAGES_HYDRATE_SCOPE),
+        (SESSIONS_MESSAGES_SNAPSHOT_METHOD, SESSIONS_MESSAGES_SNAPSHOT_SCOPE),
+        (SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD, SESSIONS_MESSAGES_UNSUBSCRIBE_SCOPE),
+        (SESSIONS_PREVIEW_METHOD, SESSIONS_PREVIEW_SCOPE),
+    ):
+        entry = registry.get_entry(method)
+        assert entry is not None
+        assert entry.name == method
+        assert entry.required_scope == scope
+        assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
+        assert entry.handler.__name__ == "handle_contract_method"
 
     from opensquilla.contracts.generated.v4.goals_capabilities_metadata import (
         GOALS_CAPABILITIES_METHOD,
@@ -813,6 +1112,33 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
         assert entry is not None
         assert entry.name == method
         assert entry.required_scope == scope
+        assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
+        assert entry.handler.__name__ == "handle_contract_method"
+
+    from opensquilla.contracts.generated.v4.gateway_contract_registry import (
+        GATEWAY_METHOD_CONTRACTS,
+    )
+    from opensquilla.gateway.adapters.sandbox_runtime_contract import (
+        SANDBOX_RUNTIME_CONTRACT_METHODS,
+    )
+
+    for method in SANDBOX_RUNTIME_CONTRACT_METHODS:
+        entry = registry.get_entry(method)
+        assert entry is not None
+        assert entry.name == method
+        assert entry.required_scope == GATEWAY_METHOD_CONTRACTS[method].scope
+        assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
+        assert entry.handler.__name__ == "handle_contract_method"
+
+    from opensquilla.gateway.adapters.session_lifecycle_contract import (
+        SESSION_LIFECYCLE_CONTRACT_METHODS,
+    )
+
+    for method in SESSION_LIFECYCLE_CONTRACT_METHODS:
+        entry = registry.get_entry(method)
+        assert entry is not None
+        assert entry.name == method
+        assert entry.required_scope == GATEWAY_METHOD_CONTRACTS[method].scope
         assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
         assert entry.handler.__name__ == "handle_contract_method"
 

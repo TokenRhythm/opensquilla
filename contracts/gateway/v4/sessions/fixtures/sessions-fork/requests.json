@@ -1,0 +1,90 @@
+{
+  "format_version": 1,
+  "kind": "request",
+  "cases": [
+    {
+      "id": "request.full",
+      "coverage": "backwards-compatible-full-fork",
+      "expectation": "exact",
+      "wire": { "type": "req", "id": "fork-full", "method": "sessions.fork", "params": { "key": "agent:main:webchat:parent" } }
+    },
+    {
+      "id": "request.explicit-empty-title",
+      "coverage": "falsey-title-retains-numbered-title",
+      "expectation": "exact",
+      "wire": { "type": "req", "id": "fork-title", "method": "sessions.fork", "params": { "key": "agent:main:webchat:parent", "title": "" } }
+    },
+    {
+      "id": "request.before-camel",
+      "coverage": "legacy-before-message-camel-alias",
+      "expectation": "exact",
+      "wire": { "type": "req", "id": "fork-before-camel", "method": "sessions.fork", "params": { "key": "agent:main:webchat:parent", "beforeMessageId": "message-middle" } }
+    },
+    {
+      "id": "request.before-snake",
+      "coverage": "legacy-before-message-snake-alias",
+      "expectation": "exact",
+      "wire": { "type": "req", "id": "fork-before-snake", "method": "sessions.fork", "params": { "key": "agent:main:webchat:parent", "before_message_id": "message-middle" } }
+    },
+    {
+      "id": "request.before-first-present-null",
+      "coverage": "first-present-before-alias-semantics",
+      "expectation": "exact",
+      "wire": { "type": "req", "id": "fork-before-first", "method": "sessions.fork", "params": { "key": "agent:main:webchat:parent", "beforeMessageId": null, "before_message_id": "message-middle" } }
+    },
+    {
+      "id": "request.through-camel",
+      "coverage": "through-turn-camel-alias",
+      "expectation": "exact",
+      "wire": { "type": "req", "id": "fork-through-camel", "method": "sessions.fork", "params": { "key": "agent:main:webchat:parent", "throughTurnId": "turn-terminal" } }
+    },
+    {
+      "id": "request.through-snake",
+      "coverage": "through-turn-snake-alias",
+      "expectation": "exact",
+      "wire": { "type": "req", "id": "fork-through-snake", "method": "sessions.fork", "params": { "key": "agent:main:webchat:parent", "through_turn_id": "turn-terminal" } }
+    },
+    {
+      "id": "request.through-dual-matching",
+      "coverage": "matching-through-turn-aliases",
+      "expectation": "exact",
+      "wire": { "type": "req", "id": "fork-through-dual", "method": "sessions.fork", "params": { "key": "agent:main:webchat:parent", "throughTurnId": "turn-terminal", "through_turn_id": "turn-terminal" } }
+    },
+    {
+      "id": "request.invalid-conflicting-anchors",
+      "coverage": "handler-owned-mutually-exclusive-error",
+      "expectation": "exact",
+      "wire": { "type": "req", "id": "fork-conflict", "method": "sessions.fork", "params": { "key": "agent:main:webchat:parent", "beforeMessageId": "message-later", "throughTurnId": "turn-terminal" } }
+    },
+    {
+      "id": "request.invalid-through-aliases",
+      "coverage": "handler-owned-alias-consensus-error",
+      "expectation": "exact",
+      "wire": { "type": "req", "id": "fork-alias-conflict", "method": "sessions.fork", "params": { "key": "agent:main:webchat:parent", "throughTurnId": "turn-terminal", "through_turn_id": "turn-other" } }
+    },
+    {
+      "id": "request.invalid-field-types",
+      "coverage": "observe-only-handler-type-errors",
+      "expectation": "exact",
+      "wire": { "type": "req", "id": "fork-invalid-types", "method": "sessions.fork", "params": { "key": 17, "title": false, "future": { "preserved": true } } }
+    },
+    {
+      "id": "request.null-params",
+      "coverage": "legacy-null-params",
+      "expectation": "exact",
+      "wire": { "type": "req", "id": "fork-null", "method": "sessions.fork", "params": null }
+    },
+    {
+      "id": "request.omitted-params",
+      "coverage": "legacy-omitted-params",
+      "expectation": "exact",
+      "wire": { "type": "req", "id": "fork-omitted", "method": "sessions.fork" }
+    },
+    {
+      "id": "request.non-object-params",
+      "coverage": "legacy-non-object-params",
+      "expectation": "exact",
+      "wire": { "type": "req", "id": "fork-scalar", "method": "sessions.fork", "params": "agent:main:webchat:parent" }
+    }
+  ]
+}

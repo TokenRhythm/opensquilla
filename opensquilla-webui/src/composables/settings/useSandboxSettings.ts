@@ -2,58 +2,33 @@ import { computed, inject, onScopeDispose, reactive, ref } from 'vue'
 
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
-import type { RpcClientError } from '@/lib/rpc'
 import { usePlatform } from '@/platform'
 import {
-  ensureSandboxReady,
-  normalizeSandboxSetupStatus,
+  SANDBOX_RUNTIME_KEY,
+  SandboxError,
+  type SandboxRuntimeActionReceipt,
+  type SandboxSettingsRuntime,
   type SandboxSetupOutcome,
-} from '@/composables/sandboxSetupCoordinator'
+} from '@/modules/sandboxRuntime'
 import type {
   SandboxCapabilityReport,
   SandboxPolicy,
   SandboxPolicyDefaults,
   SandboxRunMode,
-  SandboxRuntimeAvailability,
   SandboxRuntimeComponentId,
-  SandboxRuntimeComponentStatus,
-  SandboxRuntimeError,
   SandboxRuntimeOperation,
   SandboxRuntimeOperationState,
   SandboxRuntimePackStatus,
-  SandboxRuntimeSource,
   SandboxSetupStatusPayload,
 } from '@/types/sandbox'
-import { SANDBOX_RUNTIME_KEY } from '@/modules/sandboxRuntime'
 
 export type SandboxPolicySection = 'files' | 'commands' | 'network' | 'runtimes'
-export type { SandboxSetupOutcome } from '@/composables/sandboxSetupCoordinator'
+export type { SandboxSetupOutcome } from '@/modules/sandboxRuntime'
 
 const SECTION_SAVE_DELAY_MS = 500
 const SANDBOX_STARTUP_POLL_MS = 1_000
 const RUNTIME_STATUS_POLL_MS = 750
 const RUNTIME_STATUS_RETRY_MS = 5_000
-const RUNTIME_COMPONENT_IDS = ['python', 'node', 'gitBash'] as const
-const RUNTIME_AVAILABILITY = new Set<SandboxRuntimeAvailability>([
-  'unsupported',
-  'missing',
-  'ready',
-  'corrupt',
-])
-const RUNTIME_OPERATION_STATES = new Set<SandboxRuntimeOperationState>([
-  'queued',
-  'downloading',
-  'verifying',
-  'extracting',
-  'probing',
-  'activating',
-  'cancelling',
-  'removing',
-  'completed',
-  'cancelled',
-  'failed',
-  'interrupted',
-])
 const ACTIVE_RUNTIME_OPERATION_STATES = new Set<SandboxRuntimeOperationState>([
   'queued',
   'downloading',
@@ -64,121 +39,6 @@ const ACTIVE_RUNTIME_OPERATION_STATES = new Set<SandboxRuntimeOperationState>([
   'cancelling',
   'removing',
 ])
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
-}
-
-function finiteNonNegative(value: unknown, fallback = 0): number {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0
-    ? value
-    : fallback
-}
-
-function isRuntimeComponentId(value: unknown): value is SandboxRuntimeComponentId {
-  return RUNTIME_COMPONENT_IDS.some(componentId => componentId === value)
-}
-
-function normalizeRuntimeError(value: unknown): SandboxRuntimeError | null {
-  if (typeof value === 'string' && value) return { message: value }
-  if (!isRecord(value) || typeof value.message !== 'string' || !value.message) return null
-  return {
-    ...(typeof value.code === 'string' ? { code: value.code } : {}),
-    message: value.message,
-    ...(typeof value.retryable === 'boolean' ? { retryable: value.retryable } : {}),
-    ...(value.source === 'oss' || value.source === 'github'
-      ? { source: value.source as SandboxRuntimeSource }
-      : {}),
-  }
-}
-
-function normalizeRuntimeOperation(
-  value: unknown,
-  componentId: SandboxRuntimeComponentId,
-): SandboxRuntimeOperation | null {
-  if (!isRecord(value)) return null
-  const state = typeof value.state === 'string' ? value.state : value.phase
-  if (typeof state !== 'string' || !RUNTIME_OPERATION_STATES.has(
-    state as SandboxRuntimeOperationState,
-  )) return null
-  const operationId = typeof value.operationId === 'string'
-    ? value.operationId
-    : typeof value.id === 'string'
-      ? value.id
-      : ''
-  const source = value.source === 'oss' || value.source === 'github'
-    ? value.source as SandboxRuntimeSource
-    : null
-  return {
-    operationId,
-    componentId,
-    kind: value.kind === 'remove' ? 'remove' : 'install',
-    state: state as SandboxRuntimeOperationState,
-    source,
-    downloadedBytes: finiteNonNegative(value.downloadedBytes),
-    totalBytes: typeof value.totalBytes === 'number'
-      ? finiteNonNegative(value.totalBytes)
-      : null,
-    progressPercent: finiteNonNegative(value.progressPercent),
-    startedAtMs: finiteNonNegative(value.startedAtMs),
-    updatedAtMs: finiteNonNegative(value.updatedAtMs),
-    error: normalizeRuntimeError(value.error),
-  }
-}
-
-function normalizeRuntimeComponent(value: unknown): SandboxRuntimeComponentStatus | null {
-  if (!isRecord(value) || !isRuntimeComponentId(value.componentId)) return null
-  const availability = typeof value.availability === 'string'
-    && RUNTIME_AVAILABILITY.has(value.availability as SandboxRuntimeAvailability)
-    ? value.availability as SandboxRuntimeAvailability
-    : 'missing'
-  return {
-    componentId: value.componentId,
-    availability,
-    catalogVersion: typeof value.catalogVersion === 'string' ? value.catalogVersion : null,
-    activeVersion: typeof value.activeVersion === 'string' ? value.activeVersion : null,
-    installedBytes: typeof value.installedBytes === 'number'
-      ? finiteNonNegative(value.installedBytes)
-      : null,
-    removable: value.removable === true,
-    resumeAvailable: value.resumeAvailable === true,
-    resumeBytes: finiteNonNegative(value.resumeBytes),
-    operation: normalizeRuntimeOperation(value.operation, value.componentId),
-    lastError: normalizeRuntimeError(value.lastError),
-  }
-}
-
-function normalizeRuntimeStatus(value: unknown): SandboxRuntimePackStatus | null {
-  if (!isRecord(value) || value.schemaVersion !== 1 || !Array.isArray(value.components)) return null
-  const sourceOrder = Array.isArray(value.sourceOrder)
-    ? value.sourceOrder.filter(
-        (source): source is SandboxRuntimeSource => source === 'oss' || source === 'github',
-      )
-    : []
-  const components = value.components
-    .map(normalizeRuntimeComponent)
-    .filter((component): component is SandboxRuntimeComponentStatus => component !== null)
-  return {
-    schemaVersion: 1,
-    managementSupported: value.managementSupported === true,
-    target: typeof value.target === 'string' ? value.target : null,
-    catalogVersion: typeof value.catalogVersion === 'string' ? value.catalogVersion : null,
-    sourceOrder,
-    components,
-    nextPollAfterMs: finiteNonNegative(value.nextPollAfterMs, RUNTIME_STATUS_POLL_MS),
-  }
-}
-
-function normalizeRuntimeStatusResponse(value: unknown): SandboxRuntimePackStatus | null {
-  const direct = normalizeRuntimeStatus(value)
-  if (direct) return direct
-  if (!isRecord(value)) return null
-  return normalizeRuntimeStatus(value.status) ?? normalizeRuntimeStatus(value.runtimeStatus)
-}
-
-function isMethodNotFound(error: unknown): boolean {
-  return (error as RpcClientError | null | undefined)?.code === 'METHOD_NOT_FOUND'
-}
 
 function hasActiveRuntimeOperation(status: SandboxRuntimePackStatus | null): boolean {
   return status?.components.some(component => (
@@ -195,19 +55,10 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-function currentPolicyFromConflict(error: unknown): SandboxPolicy | null {
-  const rpcError = error as RpcClientError | null | undefined
-  if (rpcError?.code !== 'POLICY_VERSION_CONFLICT') return null
-  if (!rpcError.details || typeof rpcError.details !== 'object') return null
-  const currentPolicy = (rpcError.details as { currentPolicy?: unknown }).currentPolicy
-  if (!currentPolicy || typeof currentPolicy !== 'object') return null
-  return clonePolicy(currentPolicy as SandboxPolicy)
-}
-
 export function useSandboxSettings() {
   const injectedSandbox = inject(SANDBOX_RUNTIME_KEY)
   if (!injectedSandbox) throw new Error('SandboxRuntime was not provided')
-  const sandbox = injectedSandbox
+  const sandbox: SandboxSettingsRuntime = injectedSandbox
   const platform = usePlatform()
   const { pushToast } = useToasts()
   const loading = ref(false)
@@ -280,21 +131,17 @@ export function useSandboxSettings() {
     loading.value = true
     loadError.value = ''
     try {
-      const [policyPayload, defaultsPayload, runModePayload] = await Promise.all([
-        sandbox.policy(),
-        sandbox.policyDefaults(),
-        sandbox.runModePreference(),
-      ])
-      baseline.value = clonePolicy(policyPayload)
-      draft.value = clonePolicy(policyPayload)
-      builtinDenyWritePaths.value = Array.isArray(defaultsPayload.builtinDenyWritePaths)
-        ? defaultsPayload.builtinDenyWritePaths.map(String)
+      const snapshot = await sandbox.loadSettings()
+      baseline.value = clonePolicy(snapshot.policy)
+      draft.value = clonePolicy(snapshot.policy)
+      builtinDenyWritePaths.value = Array.isArray(snapshot.defaults.builtinDenyWritePaths)
+        ? snapshot.defaults.builtinDenyWritePaths.map(String)
         : []
-      runtimeTarget.value = typeof defaultsPayload.runtimeTarget === 'string'
-        ? defaultsPayload.runtimeTarget
+      runtimeTarget.value = typeof snapshot.defaults.runtimeTarget === 'string'
+        ? snapshot.defaults.runtimeTarget
         : null
-      runtimeVersions.value = defaultsPayload.runtimeVersions ?? {}
-      const loadedRunMode: SandboxRunMode = runModePayload.runMode === 'full' ? 'full' : 'safe'
+      runtimeVersions.value = snapshot.defaults.runtimeVersions ?? {}
+      const loadedRunMode: SandboxRunMode = snapshot.preference.runMode
       defaultRunModeBaseline.value = loadedRunMode
       defaultRunMode.value = loadedRunMode
       void loadRuntimeStatus()
@@ -312,8 +159,12 @@ export function useSandboxSettings() {
     capabilityLoading.value = true
     capabilityCheckFailed.value = false
     try {
-      const report = await sandbox.capability({ refresh: forceRefresh })
+      const readiness = await sandbox.readiness({ refreshCapability: forceRefresh })
       if (disposed || requestGeneration !== capabilityRequestGeneration) return null
+      if (platform.capabilities.isDesktop && readiness.status) {
+        sandboxSetupStatus.value = readiness.status
+      }
+      const report = readiness.capability
       capability.value = report
       return report
     } catch {
@@ -331,8 +182,10 @@ export function useSandboxSettings() {
   async function loadSetupStatus(): Promise<SandboxSetupStatusPayload | null> {
     if (!platform.capabilities.isDesktop || disposed) return null
     try {
-      const status = normalizeSandboxSetupStatus(await sandbox.setupStatus())
+      const readiness = await sandbox.readiness()
+      const status = readiness.status
       if (!disposed && status) sandboxSetupStatus.value = status
+      if (!disposed && readiness.capability) capability.value = readiness.capability
       return status
     } catch {
       // Capability status remains the visible fallback for old Gateways.
@@ -346,10 +199,11 @@ export function useSandboxSettings() {
       clearTimeout(sandboxStartupPollTimer)
       sandboxStartupPollTimer = null
     }
-    const status = await loadSetupStatus()
+    // The domain readiness call already combines setup state and capability.
+    // Reusing its projection avoids a second capability probe for ready hosts.
+    const report = await loadCapability()
     if (disposed) return
-    const report = status === null || status.state === 'ready' ? await loadCapability() : null
-    if (disposed) return
+    const status = sandboxSetupStatus.value
     if (status && status.state !== 'ready') capability.value = null
     if (status !== null) sandboxStartupPending = status.state === 'setting_up'
     else if (report !== null) sandboxStartupPending = report.code === 'setting_up'
@@ -369,15 +223,9 @@ export function useSandboxSettings() {
     sandboxSetupPending.value = true
     sandboxSetupOutcome.value = 'idle'
     try {
-      const result = await ensureSandboxReady(
-        {
-          ensureSetup: () => sandbox.ensureSetup(),
-          setupStatus: () => sandbox.setupStatus(),
-          capability: () => sandbox.capability({ refresh: true }),
-        },
-        () => loadCapability(true),
-      )
+      const result = await sandbox.ensureReady()
       if (result.status) sandboxSetupStatus.value = result.status
+      capability.value = result.capability
       sandboxSetupOutcome.value = result.outcome
       return result.ready
     } finally {
@@ -425,21 +273,19 @@ export function useSandboxSettings() {
     runtimeStatusLoading.value = true
     runtimeStatusError.value = ''
     try {
-      const status = normalizeRuntimeStatusResponse(await sandbox.runtimeStatus())
+      const status = await sandbox.runtimeStatus()
       if (disposed || requestGeneration !== runtimeStatusRequestGeneration) return null
-      if (!status) throw new Error('Invalid runtime status response')
+      if (!status) {
+        runtimeStatus.value = null
+        runtimeStatusSupported.value = false
+        return null
+      }
       runtimeStatus.value = status
       runtimeStatusSupported.value = true
       return status
     } catch (error) {
       if (disposed || requestGeneration !== runtimeStatusRequestGeneration) return null
-      if (isMethodNotFound(error)) {
-        runtimeStatus.value = null
-        runtimeStatusSupported.value = false
-        runtimeStatusError.value = ''
-      } else {
-        runtimeStatusError.value = errorMessage(error)
-      }
+      runtimeStatusError.value = errorMessage(error)
       return null
     } finally {
       if (!disposed && requestGeneration === runtimeStatusRequestGeneration) {
@@ -474,7 +320,7 @@ export function useSandboxSettings() {
   }
 
   async function runRuntimeAction(
-    action: () => Promise<unknown>,
+    action: () => Promise<SandboxRuntimeActionReceipt>,
     componentId: SandboxRuntimeComponentId,
     actionKind: 'install' | 'cancel' | 'discard' | 'remove',
     prepare?: () => Promise<boolean>,
@@ -487,20 +333,15 @@ export function useSandboxSettings() {
         runtimeActionError[componentId] = i18n.global.t('errors.saveFailed')
         return false
       }
-      const response = await action()
+      const receipt = await action()
       clearRuntimePoll()
       runtimeStatusRequestGeneration += 1
       runtimeStatusLoading.value = false
-      const status = normalizeRuntimeStatusResponse(response)
-      if (status) {
-        runtimeStatus.value = status
+      if (receipt.kind === 'status') {
+        runtimeStatus.value = receipt.status
         runtimeStatusSupported.value = true
-      } else {
-        const operationPayload = isRecord(response) && isRecord(response.operation)
-          ? response.operation
-          : response
-        const operation = normalizeRuntimeOperation(operationPayload, componentId)
-        if (!operation || !applyRuntimeOperation(operation)) await loadRuntimeStatus()
+      } else if (!applyRuntimeOperation(receipt.operation)) {
+        await loadRuntimeStatus()
       }
       scheduleRuntimePoll()
       return true
@@ -596,7 +437,7 @@ export function useSandboxSettings() {
     defaultRunModePending.value = true
     return queueSave(async () => {
       try {
-        const payload = await sandbox.setRunMode(mode)
+        const payload = await sandbox.selectMode(mode)
         if (sequence === defaultRunModeSequence) {
           const savedMode: SandboxRunMode = payload.runMode === 'full' ? 'full' : 'safe'
           defaultRunModeBaseline.value = savedMode
@@ -664,7 +505,9 @@ export function useSandboxSettings() {
       const sectionChangedWhileSaving = currentDraft !== null && (
         JSON.stringify(currentDraft[section]) !== JSON.stringify(submittedSection)
       )
-      const currentPolicy = currentPolicyFromConflict(error)
+      const currentPolicy = error instanceof SandboxError && error.code === 'conflict'
+        ? error.currentPolicy ?? null
+        : null
       if (currentPolicy) {
         baseline.value = clonePolicy(currentPolicy)
         draft.value = clonePolicy(currentPolicy)
