@@ -1734,12 +1734,7 @@ const sessionDirectoryChangesSubscription = sessionDirectoryChanges.subscribe(ch
 })
 
 function subscribeCronEventsWhenAdmitted() {
-  if (
-    !appAutomaticRpcMounted
-    || !optionalSessionRpcAllowed.value
-    || !gatewayAccess.isAvailable
-  ) return
-  void cronScheduler.resumeEvents().catch(() => undefined)
+  // CronScheduler's Adapter owns its generation-aware remote event lease.
 }
 
 function resumeAutomaticAppRpc() {

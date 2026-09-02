@@ -55,6 +55,9 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         # Channel administration wire models terminate at its generated
         # registration Adapter; Application Modules see typed channel intents.
         "src/opensquilla/gateway/adapters/channel_administration_contract.py",
+        # Cron scheduling and subscription wire models terminate at the
+        # generated registration Adapter; Application Modules stay transport-neutral.
+        "src/opensquilla/gateway/adapters/cron_scheduler_contract.py",
         # SandboxRuntime handlers stay legacy-compatible while generated
         # descriptors own registration metadata and success validation.
         "src/opensquilla/gateway/adapters/sandbox_runtime_contract.py",
@@ -138,7 +141,7 @@ SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
 SESSIONS_RESOLVE_LITERAL_ALLOWLIST: Counter[str] = Counter()
 SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
 RUNTIME_RPC_METHOD_BASELINE = 306
-STATIC_RPC_DECORATOR_BASELINE = 199
+STATIC_RPC_DECORATOR_BASELINE = 190
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
 # closure measurement below.  The temporary S2a cumulative growth budget was
@@ -868,6 +871,26 @@ def test_channel_administration_application_does_not_depend_on_gateway() -> None
     assert "RpcContext" not in imported_names
 
 
+def test_cron_scheduler_application_does_not_depend_on_gateway() -> None:
+    path = PACKAGE_ROOT / "application" / "cron_scheduler.py"
+    tree = _tree(path)
+    forbidden_imports: list[str] = []
+    imported_names: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module.startswith("opensquilla.gateway"):
+                forbidden_imports.append(module)
+            imported_names.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.startswith("opensquilla.gateway"):
+                    forbidden_imports.append(alias.name)
+
+    assert forbidden_imports == []
+    assert "RpcContext" not in imported_names
+
+
 def test_rpc_context_does_not_grow_past_pinned_main() -> None:
     tree = _tree(RPC_CONTEXT)
     context = next(
@@ -1034,6 +1057,16 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "channels.pairing.approve",
             "channels.admin.set",
             "channels.pairing.revoke",
+            "cron.list",
+            "cron.status",
+            "cron.add",
+            "cron.create",
+            "cron.update",
+            "cron.remove",
+            "cron.run",
+            "cron.runs",
+            "cron.subscribe",
+            "cron.unsubscribe",
         }
     ] == []
     assert [
@@ -1270,6 +1303,9 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
     from opensquilla.gateway.adapters.conversation_ancillary_contract import (
         CONVERSATION_ANCILLARY_CONTRACT_METHODS,
     )
+    from opensquilla.gateway.adapters.cron_scheduler_contract import (
+        CRON_SCHEDULER_CONTRACT_METHODS,
+    )
     from opensquilla.gateway.adapters.pending_input_queue_contract import (
         PENDING_INPUT_QUEUE_CONTRACT_METHODS,
     )
@@ -1291,6 +1327,7 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
         *CONVERSATION_ANCILLARY_CONTRACT_METHODS,
         *AGENT_CATALOG_CONTRACT_METHODS,
         *CHANNEL_ADMINISTRATION_CONTRACT_METHODS,
+        *CRON_SCHEDULER_CONTRACT_METHODS,
     ):
         entry = registry.get_entry(method)
         assert entry is not None
