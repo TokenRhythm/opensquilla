@@ -13,6 +13,12 @@ import {
 import {
   SESSIONS_DELETE_METHOD,
 } from '@/contracts/generated/v4/sessionsDelete'
+import {
+  SESSIONS_FORK_METHOD,
+} from '@/contracts/generated/v4/sessionsFork'
+import {
+  SESSIONS_FORK_THROUGH_TURN_METHOD,
+} from '@/contracts/generated/v4/sessionsForkThroughTurn'
 
 type LifecycleTransport = Parameters<typeof createV4SessionLifecycle>[0]
 
@@ -77,6 +83,130 @@ describe('v4 SessionLifecycle Adapter', () => {
       sessionId: 'abc123',
       note: 'session manager not available',
     })
+  })
+
+  it('projects a full fork to child identity only', async () => {
+    const { request, transport } = makeTransport({
+      [SESSIONS_FORK_METHOD]: {
+        key: 'agent:main:webchat:child',
+        parentKey: 'agent:main:webchat:parent',
+        future: true,
+      },
+    })
+
+    await expect(createV4SessionLifecycle(transport).fork({
+      key: 'agent:main:webchat:parent',
+    })).resolves.toEqual({ key: 'agent:main:webchat:child' })
+    expect(request).toHaveBeenCalledWith(
+      SESSIONS_FORK_METHOD,
+      { key: 'agent:main:webchat:parent' },
+      undefined,
+    )
+  })
+
+  it('uses the dedicated through-turn capability and validates its echo', async () => {
+    const request = vi.fn().mockResolvedValue({
+      key: 'agent:main:webchat:child',
+      parentKey: 'agent:main:webchat:parent',
+      forkMode: 'through_turn',
+      throughTurnId: 'turn-7',
+    })
+    const transport = {
+      request,
+      supports: vi.fn(() => true),
+    } as LifecycleTransport
+
+    await expect(createV4SessionLifecycle(transport).fork({
+      key: 'agent:main:webchat:parent',
+      throughTurnId: ' turn-7 ',
+    })).resolves.toEqual({ key: 'agent:main:webchat:child' })
+    expect(request).toHaveBeenCalledWith(
+      SESSIONS_FORK_THROUGH_TURN_METHOD,
+      {
+        key: 'agent:main:webchat:parent',
+        throughTurnId: 'turn-7',
+      },
+      undefined,
+    )
+  })
+
+  it('falls back to the existing fork method only for a missing optional capability', async () => {
+    const request = vi.fn().mockResolvedValue({
+      key: 'agent:main:webchat:child',
+      parentKey: 'agent:main:webchat:parent',
+      forkMode: 'through_turn',
+      throughTurnId: 'turn-7',
+    })
+    const markUnsupported = vi.fn()
+    const withoutCapability = {
+      request,
+      supports: vi.fn(() => false),
+      markUnsupported,
+    } as LifecycleTransport
+
+    await expect(createV4SessionLifecycle(withoutCapability).fork({
+      key: 'agent:main:webchat:parent',
+      throughTurnId: 'turn-7',
+    })).resolves.toEqual({ key: 'agent:main:webchat:child' })
+    expect(request).toHaveBeenCalledWith(
+      SESSIONS_FORK_METHOD,
+      {
+        key: 'agent:main:webchat:parent',
+        throughTurnId: 'turn-7',
+      },
+      undefined,
+    )
+    expect(markUnsupported).not.toHaveBeenCalled()
+
+    request.mockReset()
+    request
+      .mockRejectedValueOnce(Object.assign(new Error('missing'), {
+        code: 'METHOD_NOT_FOUND',
+      }))
+      .mockResolvedValueOnce({
+        key: 'agent:main:webchat:child',
+        parentKey: 'agent:main:webchat:parent',
+        forkMode: 'through_turn',
+        throughTurnId: 'turn-7',
+      })
+    const staleCapability = {
+      request,
+      supports: vi.fn(() => true),
+      markUnsupported,
+    } as LifecycleTransport
+    await expect(createV4SessionLifecycle(staleCapability).fork({
+      key: 'agent:main:webchat:parent',
+      throughTurnId: 'turn-7',
+    })).resolves.toEqual({ key: 'agent:main:webchat:child' })
+    expect(markUnsupported).toHaveBeenCalledWith(SESSIONS_FORK_THROUGH_TURN_METHOD)
+    expect(request).toHaveBeenNthCalledWith(
+      2,
+      SESSIONS_FORK_METHOD,
+      {
+        key: 'agent:main:webchat:parent',
+        throughTurnId: 'turn-7',
+      },
+      undefined,
+    )
+  })
+
+  it('rejects a silent full-fork fallback or mismatched through-turn echo', async () => {
+    const { transport } = makeTransport({
+      [SESSIONS_FORK_THROUGH_TURN_METHOD]: {
+        key: 'agent:main:webchat:child',
+        parentKey: 'agent:main:webchat:parent',
+      },
+    })
+    const lifecycle = createV4SessionLifecycle(transport)
+
+    await expect(lifecycle.fork({
+      key: 'agent:main:webchat:parent',
+      throughTurnId: 'turn-7',
+    })).rejects.toMatchObject({ code: 'unavailable' })
+    await expect(lifecycle.fork({
+      key: 'agent:main:webchat:parent',
+      throughTurnId: '   ',
+    })).rejects.toMatchObject({ code: 'invalid' })
   })
 
   it('maps the semantic title to displayName for rename and narrows the result', async () => {
@@ -161,10 +291,15 @@ describe('v4 SessionLifecycle Adapter', () => {
       [SESSIONS_CREATE_METHOD]: { key: 'missing-session-id' },
       [SESSIONS_RENAME_METHOD]: { key: 'k' },
       [SESSIONS_DELETE_METHOD]: { deleted: [] },
+      [SESSIONS_FORK_METHOD]: {
+        key: '',
+        parentKey: 'parent',
+      },
     })
     const lifecycle = createV4SessionLifecycle(transport)
     await expect(lifecycle.create()).rejects.toMatchObject({ code: 'unavailable' })
     await expect(lifecycle.rename({ key: 'k', title: 't' })).rejects.toMatchObject({ code: 'unavailable' })
     await expect(lifecycle.remove(['k'])).rejects.toMatchObject({ code: 'unavailable' })
+    await expect(lifecycle.fork({ key: 'k' })).rejects.toMatchObject({ code: 'unavailable' })
   })
 })
