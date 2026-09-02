@@ -1,8 +1,14 @@
-import { ref } from 'vue'
+import { ref, type Ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
-import { useChatSessionRuntime, type ChatUsageAccumulator } from './useChatSessionRuntime'
+import { useChatPendingQueue } from './useChatPendingQueue'
+import {
+  useChatSessionRuntime,
+  type ChatUsageAccumulator,
+  type UseChatSessionRuntimeOptions,
+} from './useChatSessionRuntime'
 import type { Attachment, ChatMessage } from '@/types/chat'
+import type { PendingInputWal, PendingInputWalRecord } from '@/utils/chat/pendingInputWal'
 
 function emptyUsage(): ChatUsageAccumulator {
   return {
@@ -19,15 +25,20 @@ function emptyUsage(): ChatUsageAccumulator {
 function runtimeHarness(
   initialSessionKey: string,
   generatedSessionKey = 'agent:main:webchat:generated',
+  queueBindings: {
+    sessionKey?: Ref<string>
+    switchPendingQueue?: UseChatSessionRuntimeOptions['switchPendingQueue']
+    adoptPendingQueue?: UseChatSessionRuntimeOptions['adoptPendingQueue']
+  } = {},
 ) {
-  const sessionKey = ref(initialSessionKey)
+  const sessionKey = queueBindings.sessionKey || ref(initialSessionKey)
   const pendingSessionIntent = ref<string | null>(null)
   const persistSession = vi.fn((key: string) => { sessionKey.value = key })
   const beginSessionResolution = vi.fn()
   const cancelSessionBootstrap = vi.fn()
   const setSessionHandoffTarget = vi.fn()
-  const switchPendingQueue = vi.fn()
-  const adoptPendingQueue = vi.fn()
+  const switchPendingQueue = vi.fn(queueBindings.switchPendingQueue || (() => {}))
+  const adoptPendingQueue = vi.fn(queueBindings.adoptPendingQueue || (() => {}))
   const retireAttachments = vi.fn()
   const resetDraftComposer = vi.fn()
   const bootstrappedSessionKeys: string[] = []
@@ -583,5 +594,73 @@ describe('useChatSessionRuntime Meta draft recovery', () => {
       'agent:main:webchat:e',
       'agent:main:webchat:f',
     ])
+  })
+
+  it('round-trips a legacy alias attachment queue through real canonical runtime switches', async () => {
+    const legacySession = 'agent:default:webchat:legacy-draft'
+    const canonicalSession = 'agent:main:webchat:legacy-draft'
+    const otherSession = 'agent:main:webchat:other'
+    const sessionKey = ref(legacySession)
+    const inputText = ref('legacy queued attachment')
+    const pendingAttachments = ref<Attachment[]>([{
+      kind: 'staged',
+      local_id: 901,
+      name: 'legacy-draft.txt',
+      mime: 'text/plain',
+      file_uuid: 'legacy-draft-upload',
+    }])
+    const pendingSessionIntent = ref<string | null>(null)
+    const records = new Map<string, PendingInputWalRecord>()
+    const wal: PendingInputWal = {
+      put: vi.fn(async record => {
+        records.set(record.pendingInputId, structuredClone(record))
+      }),
+      list: vi.fn(async ownerSessionKey => [...records.values()]
+        .filter(record => record.sessionKey === ownerSessionKey)
+        .map(record => structuredClone(record))),
+      delete: vi.fn(async pendingInputId => { records.delete(pendingInputId) }),
+      close: vi.fn(),
+    }
+    const pendingQueue = useChatPendingQueue({
+      sessionKey,
+      inputText,
+      pendingAttachments,
+      pendingSessionIntent,
+      isStreaming: ref(false),
+      isBlocked: () => false,
+      autoResizeTextarea: vi.fn(),
+      sendCurrentInput: vi.fn(),
+      resetInputHistory: vi.fn(),
+      hasComposer: () => true,
+      pendingInputWal: wal,
+    })
+    const harness = runtimeHarness(legacySession, 'agent:main:webchat:generated', {
+      sessionKey,
+      switchPendingQueue: pendingQueue.switchPendingQueue,
+      adoptPendingQueue: pendingQueue.adoptPendingQueue,
+    })
+    try {
+      await expect(pendingQueue.enqueuePendingInput(inputText.value)).resolves.toBe(true)
+      await vi.waitFor(() => {
+        expect(pendingQueue.pendingQueue.value[0]?.pendingPersistenceState).toBe('local_only')
+      })
+      expect([...records.values()][0]?.sessionKey).toBe(canonicalSession)
+
+      await expect(harness.runtime.switchToSession(otherSession)).resolves.toMatchObject({
+        authoritative: true,
+      })
+      expect(pendingQueue.pendingQueue.value).toEqual([])
+
+      await expect(harness.runtime.switchToSession(canonicalSession)).resolves.toMatchObject({
+        authoritative: true,
+      })
+      expect(pendingQueue.pendingQueue.value).toMatchObject([{
+        text: 'legacy queued attachment',
+        ownerSessionKey: canonicalSession,
+        attachments: [{ name: 'legacy-draft.txt' }],
+      }])
+    } finally {
+      pendingQueue.cleanup()
+    }
   })
 })

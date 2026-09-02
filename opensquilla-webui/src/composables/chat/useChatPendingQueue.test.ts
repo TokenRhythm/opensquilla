@@ -1233,6 +1233,195 @@ describe('useChatPendingQueue delivery state', () => {
     },
   )
 
+  it('keeps a retained queue item when the composer changes during delayed recovery', async () => {
+    const { wal, records } = memoryWal()
+    const writeWal = wal.put
+    let releaseCancel!: () => void
+    let markCancelStarted!: () => void
+    const cancelStarted = new Promise<void>(resolve => { markCancelStarted = resolve })
+    const cancelGate = new Promise<void>(resolve => { releaseCancel = resolve })
+    wal.put = vi.fn(async record => {
+      if (record.state === 'cancelling') {
+        markCancelStarted()
+        await cancelGate
+      }
+      await writeWal(record)
+    })
+    const {
+      inputText,
+      pendingAttachments,
+      pendingSessionIntent,
+      queue,
+    } = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      hasRpcMethod: () => false,
+    })
+    const sourceAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 311,
+      name: 'queued-source.txt',
+      mime: 'text/plain',
+      file_uuid: 'queued-source-upload',
+    }
+    const newAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 312,
+      name: 'new-composer.txt',
+      mime: 'text/plain',
+      file_uuid: 'new-composer-upload',
+    }
+    try {
+      inputText.value = 'queued source draft'
+      pendingAttachments.value = [sourceAttachment]
+      pendingSessionIntent.value = 'intent:queued'
+      await expect(queue.enqueuePendingInput(inputText.value)).resolves.toBe(true)
+      await vi.waitFor(() => {
+        expect(queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('local_only')
+      })
+
+      expect(queue.popPendingTail()).toBe(true)
+      await cancelStarted
+      inputText.value = 'new composer draft'
+      pendingAttachments.value = [newAttachment]
+      pendingSessionIntent.value = 'intent:new'
+      releaseCancel()
+
+      await vi.waitFor(() => {
+        expect([...records.values()][0]).toMatchObject({
+          state: 'local_only',
+          retainAfterCancel: true,
+        })
+      })
+      expect(inputText.value).toBe('new composer draft')
+      expect(pendingAttachments.value).toEqual([newAttachment])
+      expect(pendingSessionIntent.value).toBe('intent:new')
+      expect(queue.pendingQueue.value).toMatchObject([{
+        text: 'queued source draft',
+        pendingPersistenceState: 'local_only',
+        attachments: [{ name: 'queued-source.txt' }],
+      }])
+    } finally {
+      queue.cleanup()
+    }
+  })
+
+  it('retains delayed composer recovery in the WAL after cleanup for the next hydrate', async () => {
+    const { wal, records } = memoryWal()
+    const writeWal = wal.put
+    let releaseCancel!: () => void
+    let markCancelStarted!: () => void
+    const cancelStarted = new Promise<void>(resolve => { markCancelStarted = resolve })
+    const cancelGate = new Promise<void>(resolve => { releaseCancel = resolve })
+    wal.put = vi.fn(async record => {
+      if (record.state === 'cancelling') {
+        markCancelStarted()
+        await cancelGate
+      }
+      await writeWal(record)
+    })
+    const initial = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      hasRpcMethod: () => false,
+    })
+    initial.inputText.value = 'survive cleanup'
+    initial.pendingAttachments.value = [{
+      kind: 'staged',
+      local_id: 321,
+      name: 'survive-cleanup.txt',
+      mime: 'text/plain',
+      file_uuid: 'survive-cleanup-upload',
+    }]
+    await expect(initial.queue.enqueuePendingInput(initial.inputText.value)).resolves.toBe(true)
+    await vi.waitFor(() => {
+      expect(initial.queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('local_only')
+    })
+
+    expect(initial.queue.editPendingItem(pendingUiId(initial.queue, 0))).toBe(true)
+    await cancelStarted
+    initial.queue.cleanup()
+    releaseCancel()
+    await vi.waitFor(() => {
+      expect([...records.values()][0]).toMatchObject({
+        state: 'local_only',
+        retainAfterCancel: true,
+        attachments: [{ name: 'survive-cleanup.txt' }],
+      })
+    })
+    expect(initial.inputText.value).toBe('')
+    expect(initial.pendingAttachments.value).toEqual([])
+
+    const restored = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      hasRpcMethod: () => false,
+    })
+    try {
+      await vi.waitFor(() => {
+        expect(restored.queue.pendingQueue.value).toMatchObject([{
+          text: 'survive cleanup',
+          pendingPersistenceState: 'local_only',
+          attachments: [{ name: 'survive-cleanup.txt' }],
+        }])
+      })
+      expect(restored.inputText.value).toBe('')
+      expect(restored.pendingAttachments.value).toEqual([])
+    } finally {
+      restored.queue.cleanup()
+    }
+  })
+
+  it('hydrates and parks a legacy alias WAL row under its canonical queue owner', async () => {
+    const legacySession = 'agent:default:webchat:alias-draft'
+    const canonicalSession = 'agent:main:webchat:alias-draft'
+    const { wal } = memoryWal([{
+      schemaVersion: 1,
+      pendingInputId: 'pending-alias-draft',
+      sessionKey: legacySession,
+      clientRequestId: 'request-alias-draft',
+      clientMessageId: 'message-alias-draft',
+      text: 'legacy alias attachment draft',
+      attachments: [{
+        kind: 'staged',
+        local_id: 331,
+        name: 'legacy-alias.txt',
+        mime: 'text/plain',
+        file_uuid: 'legacy-alias-upload',
+      }],
+      intent: null,
+      state: 'local_only',
+      mayHaveServerCopy: false,
+      createdAt: 1,
+      updatedAt: 2,
+    }])
+    const sessionKey = ref(canonicalSession)
+    const { queue } = makeQueue(undefined, () => false, undefined, undefined, {
+      sessionKey,
+      pendingInputWal: wal,
+      hasRpcMethod: () => false,
+    })
+    try {
+      await vi.waitFor(() => {
+        expect(queue.pendingQueue.value).toMatchObject([{
+          pendingInputId: 'pending-alias-draft',
+          ownerSessionKey: canonicalSession,
+          attachments: [{ name: 'legacy-alias.txt' }],
+        }])
+      })
+
+      queue.switchPendingQueue('agent:main:webchat:other')
+      sessionKey.value = 'agent:main:webchat:other'
+      expect(queue.pendingQueue.value).toEqual([])
+
+      queue.switchPendingQueue(canonicalSession)
+      sessionKey.value = canonicalSession
+      expect(queue.pendingQueue.value).toMatchObject([{
+        pendingInputId: 'pending-alias-draft',
+        ownerSessionKey: canonicalSession,
+      }])
+    } finally {
+      queue.cleanup()
+    }
+  })
+
   it('does not edit a queued annotation batch into plain text', async () => {
     const { inputText, queue } = makeQueue()
     await expect(queue.enqueuePendingPayload({

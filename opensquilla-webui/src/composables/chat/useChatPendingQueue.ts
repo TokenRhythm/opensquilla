@@ -13,6 +13,7 @@ import {
   isSendableAttachment,
   serializeSendableAttachment,
 } from '@/utils/chat/attachments'
+import { canonicalSessionKey } from '@/utils/chat/sessionKeys'
 import type {
   AcceptedHandoffCommit,
   PendingInputWal,
@@ -160,10 +161,39 @@ export interface UseChatPendingQueueOptions {
 }
 
 export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
+  const queueSessionKey = (key = options.sessionKey.value) => {
+    const value = String(key || '').trim()
+    return value ? canonicalSessionKey(value) : ''
+  }
+  const walLookupSessionKeys = (key: string) => {
+    const canonicalKey = queueSessionKey(key)
+    const keys = new Set([canonicalKey])
+    const rawKey = String(key || '').trim()
+    if (rawKey && queueSessionKey(rawKey) === canonicalKey) keys.add(rawKey)
+    if (canonicalKey.startsWith('agent:main:')) {
+      keys.add(`agent:default:${canonicalKey.slice('agent:main:'.length)}`)
+    }
+    const webchatPrefix = 'agent:main:webchat:'
+    if (canonicalKey.startsWith(webchatPrefix)) {
+      keys.add(`sess-${canonicalKey.slice(webchatPrefix.length)}`)
+    }
+    if (canonicalKey === 'agent:main:webchat:default') {
+      keys.add('default')
+      keys.add('webchat:default')
+    }
+    keys.delete('')
+    return [...keys]
+  }
   const pendingInputQueue = options.pendingInputQueue
   const pendingQueue = ref<ChatPendingItem[]>([])
   const parkedQueues = new Map<string, ChatPendingItem[]>()
   let activeQueueLease = 0
+  let composerRevision = 0
+  const stopComposerRevisionWatch = watch(
+    [options.inputText, options.pendingAttachments, options.pendingSessionIntent],
+    () => { composerRevision += 1 },
+    { deep: true, flush: 'sync' },
+  )
   let pendingDrainTimer: ReturnType<typeof setTimeout> | null = null
   let deferredDrainRequested = false
   const isReordering = ref(false)
@@ -262,7 +292,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     return {
       schemaVersion: 1,
       pendingInputId: item.pendingInputId!,
-      sessionKey: item.ownerSessionKey || options.sessionKey.value,
+      sessionKey: queueSessionKey(item.ownerSessionKey),
       clientRequestId: item.pendingClientRequestId!,
       clientMessageId: item.pendingClientMessageId!,
       text: item.text,
@@ -309,7 +339,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       attachments: record.attachments.map(attachment => ({ ...attachment })),
       intent: record.intent,
       ...(record.confirmedPlainText ? { confirmedPlainText: true } : {}),
-      ownerSessionKey: record.sessionKey,
+      ownerSessionKey: queueSessionKey(record.sessionKey),
       ...(record.ownerRequestId ? { ownerRequestId: record.ownerRequestId } : {}),
       pendingInputId: record.pendingInputId,
       pendingClientRequestId: record.clientRequestId,
@@ -332,7 +362,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   }
 
   function removedIdentity(sessionKey: string, pendingInputId: string): string {
-    return `${sessionKey}\u0000${pendingInputId}`
+    return `${queueSessionKey(sessionKey)}\u0000${pendingInputId}`
   }
 
   function rememberRemoval(sessionKey: string, pendingInputId: string) {
@@ -355,23 +385,24 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   }
 
   function removePendingIdentity(sessionKey: string, pendingInputId: string) {
-    if (options.sessionKey.value === sessionKey) {
+    const ownerSessionKey = queueSessionKey(sessionKey)
+    if (queueSessionKey() === ownerSessionKey) {
       pendingQueue.value = pendingQueue.value.filter(item => (
         item.pendingInputId !== pendingInputId
       ))
     }
-    const parked = parkedQueues.get(sessionKey)
+    const parked = parkedQueues.get(ownerSessionKey)
     if (parked) {
       const retained = parked.filter(item => item.pendingInputId !== pendingInputId)
-      if (retained.length > 0) parkedQueues.set(sessionKey, retained)
-      else parkedQueues.delete(sessionKey)
+      if (retained.length > 0) parkedQueues.set(ownerSessionKey, retained)
+      else parkedQueues.delete(ownerSessionKey)
     }
   }
 
   async function cancelServerIdentity(sessionKey: string, pendingInputId: string) {
     if (!supportsServerQueue()) return
     await pendingInputQueue!.cancel({
-      key: sessionKey,
+      key: queueSessionKey(sessionKey),
       pendingInputId,
     })
   }
@@ -382,7 +413,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     action: 'changed' | 'removed' = 'changed',
   ) {
     try {
-      broadcast?.postMessage({ sessionKey, pendingInputId, action })
+      broadcast?.postMessage({
+        sessionKey: queueSessionKey(sessionKey),
+        pendingInputId,
+        action,
+      })
     } catch {}
   }
 
@@ -467,7 +502,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       item.pendingPersistenceState === 'cancelling'
       || item.pendingRetainAfterCancel === true
     ) return
-    const sessionKey = item.ownerSessionKey || options.sessionKey.value
+    const sessionKey = queueSessionKey(item.ownerSessionKey)
     if (wasRemoved(sessionKey, pendingInputId)) return
     const existing = stagingOperations.get(pendingInputId)
     if (existing) return existing
@@ -517,7 +552,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
             item.pendingMayHaveServerCopy = true
             await writeWalItem(item, 'saving')
             const response = await pendingInputQueue!.enqueue({
-                key: item.ownerSessionKey || options.sessionKey.value,
+                key: queueSessionKey(item.ownerSessionKey),
                 pendingInputId,
                 clientRequestId: item.pendingClientRequestId,
                 clientMessageId: item.pendingClientMessageId,
@@ -646,28 +681,44 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
 
   async function hydratePendingQueue(sessionKey = options.sessionKey.value): Promise<void> {
     const wal = options.pendingInputWal
-    if (!wal || !sessionKey || disposed) return
+    const ownerSessionKey = queueSessionKey(sessionKey)
+    if (!wal || !ownerSessionKey || disposed) return
     if (isReordering.value) {
-      deferredHydrateSession = sessionKey
+      deferredHydrateSession = ownerSessionKey
       return
     }
     const generation = ++hydrateGeneration
     let records: PendingInputWalRecord[]
     try {
-      records = await wal.list(sessionKey)
+      const recordsById = new Map<string, PendingInputWalRecord>()
+      const lookupResults = await Promise.all(
+        walLookupSessionKeys(sessionKey).map(lookupKey => wal.list(lookupKey)),
+      )
+      for (const record of lookupResults.flat()) {
+        if (queueSessionKey(record.sessionKey) !== ownerSessionKey) continue
+        recordsById.set(record.pendingInputId, {
+          ...record,
+          sessionKey: ownerSessionKey,
+        })
+      }
+      records = [...recordsById.values()]
     } catch {
       options.onPendingPersistenceError?.('wal_failed')
       return
     }
-    if (disposed || generation !== hydrateGeneration || options.sessionKey.value !== sessionKey) {
+    if (
+      disposed
+      || generation !== hydrateGeneration
+      || queueSessionKey() !== ownerSessionKey
+    ) {
       return
     }
-    mergeWalRecords(records, sessionKey)
+    mergeWalRecords(records, ownerSessionKey)
     const walIds = new Set(records.map(record => record.pendingInputId))
 
     if (!supportsServerQueue()) {
       for (const item of [...pendingQueue.value]) {
-        if (!durableItem(item) || item.ownerSessionKey !== sessionKey) continue
+        if (!durableItem(item) || queueSessionKey(item.ownerSessionKey) !== ownerSessionKey) continue
         const pendingInputId = item.pendingInputId!
         // A snapshot can race the WAL write and the enqueue itself. Keep an
         // in-flight/saving row visible until its owner settles; otherwise an
@@ -680,8 +731,8 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           && !saving
           && !stagingInFlight
         ) {
-          rememberRemoval(sessionKey, pendingInputId)
-          removePendingIdentity(sessionKey, pendingInputId)
+          rememberRemoval(ownerSessionKey, pendingInputId)
+          removePendingIdentity(ownerSessionKey, pendingInputId)
           continue
         }
         // A cancellation WAL is a durable delete intent, never a draft to
@@ -704,14 +755,18 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     for (const item of [...pendingQueue.value]) {
       if (
         durableItem(item)
-        && item.ownerSessionKey === sessionKey
+        && queueSessionKey(item.ownerSessionKey) === ownerSessionKey
         && item.pendingPersistenceState === 'cancelling'
       ) void retryCancellingItem(item)
     }
 
     try {
-      const response = { items: await pendingInputQueue!.list(sessionKey) }
-      if (disposed || generation !== hydrateGeneration || options.sessionKey.value !== sessionKey) {
+      const response = { items: await pendingInputQueue!.list(ownerSessionKey) }
+      if (
+        disposed
+        || generation !== hydrateGeneration
+        || queueSessionKey() !== ownerSessionKey
+      ) {
         return
       }
       const serverItems = Array.isArray(response.items) ? response.items : []
@@ -720,8 +775,8 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         const pendingInputId = serverItem.pendingInputId
         const clientRequestId = serverItem.clientRequestId
         const clientMessageId = serverItem.clientMessageId
-        if (wasRemoved(sessionKey, pendingInputId)) {
-          void cancelServerIdentity(sessionKey, pendingInputId).catch(() => {})
+        if (wasRemoved(ownerSessionKey, pendingInputId)) {
+          void cancelServerIdentity(ownerSessionKey, pendingInputId).catch(() => {})
           continue
         }
         serverIds.add(pendingInputId)
@@ -743,7 +798,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
                 }
               : {}),
             ...(serverItem.confirmedPlainText === true ? { confirmedPlainText: true } : {}),
-            ownerSessionKey: sessionKey,
+            ownerSessionKey,
             pendingInputId,
             pendingClientRequestId: clientRequestId,
             pendingClientMessageId: clientMessageId,
@@ -781,7 +836,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       sortOrdinaryPendingItems()
 
       for (const item of [...pendingQueue.value]) {
-        if (!durableItem(item) || item.ownerSessionKey !== sessionKey) continue
+        if (!durableItem(item) || queueSessionKey(item.ownerSessionKey) !== ownerSessionKey) continue
         if (serverIds.has(item.pendingInputId!)) continue
         const pendingInputId = item.pendingInputId!
         // The list snapshot may have started before the WAL write or enqueue
@@ -794,8 +849,8 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           && !saving
           && !stagingInFlight
         ) {
-          rememberRemoval(sessionKey, pendingInputId)
-          removePendingIdentity(sessionKey, pendingInputId)
+          rememberRemoval(ownerSessionKey, pendingInputId)
+          removePendingIdentity(ownerSessionKey, pendingInputId)
           continue
         }
         if (item.pendingPersistenceState === 'cancelling') {
@@ -824,7 +879,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   if (broadcast) {
     broadcast.onmessage = event => {
       const message = event.data as PendingQueueBroadcastMessage | null
-      const sessionKey = typeof message?.sessionKey === 'string' ? message.sessionKey : ''
+      const sessionKey = typeof message?.sessionKey === 'string'
+        ? queueSessionKey(message.sessionKey)
+        : ''
       const pendingInputId = typeof message?.pendingInputId === 'string'
         ? message.pendingInputId
         : ''
@@ -838,7 +895,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         void cancelServerIdentity(sessionKey, pendingInputId).catch(() => {})
         return
       }
-      if (sessionKey === options.sessionKey.value) {
+      if (sessionKey === queueSessionKey()) {
         void hydratePendingQueue(sessionKey)
       }
     }
@@ -848,7 +905,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   function resolveOwnerRequestId(owner?: PendingQueueOwner): string | undefined {
     if (owner?.ownerRequestId) return owner.ownerRequestId
     const context = options.ownerContext?.value
-    return context?.sessionKey === options.sessionKey.value
+    return context && queueSessionKey(context.sessionKey) === queueSessionKey()
       ? context.ownerRequestId
       : undefined
   }
@@ -878,7 +935,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       attachments: (payload.attachments || []).map(a => ({ ...a })),
       intent: payload.intent ?? null,
       ...(payload.confirmedPlainText ? { confirmedPlainText: true } : {}),
-      ownerSessionKey: options.sessionKey.value,
+      ownerSessionKey: queueSessionKey(),
       ...(ownerRequestId ? { ownerRequestId } : {}),
     }
     const now = Date.now()
@@ -906,7 +963,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       } finally {
         locallyCreatingIds.delete(item.pendingInputId!)
       }
-      broadcastChange(item.ownerSessionKey || options.sessionKey.value)
+      broadcastChange(queueSessionKey(item.ownerSessionKey))
       void ensureServerStaged(item)
       return true
     })()
@@ -975,7 +1032,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     owner?: PendingQueueOwner,
   ) {
     const stableRequestId = String(item.clientRequestId || '').trim()
-    const hiddenControlSessionKey = item.sessionKey || options.sessionKey.value
+    const hiddenControlSessionKey = queueSessionKey(item.sessionKey)
     if (
       stableRequestId
       && pendingQueue.value.some(candidate => (
@@ -995,7 +1052,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       text: item.text,
       attachments: [],
       intent: null,
-      ownerSessionKey: options.sessionKey.value,
+      ownerSessionKey: queueSessionKey(),
       ...(ownerRequestId ? { ownerRequestId } : {}),
       hiddenControl: true,
       displayTextOverride: item.displayText,
@@ -1035,7 +1092,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       text: request.message,
       attachments: [],
       intent: null,
-      ownerSessionKey: options.sessionKey.value,
+      ownerSessionKey: queueSessionKey(),
       ...(ownerRequestId ? { ownerRequestId } : {}),
       steerAttempt: {
         phase: payload.phase || 'submitting',
@@ -1053,7 +1110,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     action: 'changed' | 'removed' = 'changed',
   ): Promise<void> {
     if (!options.pendingInputWal || !item.pendingInputId) return
-    const sessionKey = item.ownerSessionKey || options.sessionKey.value
+    const sessionKey = queueSessionKey(item.ownerSessionKey)
     await options.pendingInputWal.delete(item.pendingInputId)
     if (action === 'removed') rememberRemoval(sessionKey, item.pendingInputId)
     broadcastChange(sessionKey, item.pendingInputId, action)
@@ -1093,7 +1150,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   ): Promise<boolean> {
     if (!durableItem(item)) return true
     const previousState = item.pendingPersistenceState || 'saving'
-    const sessionKey = item.ownerSessionKey || options.sessionKey.value
+    const sessionKey = queueSessionKey(item.ownerSessionKey)
     const retainAfterCancel = cancelOptions.retainAfterCancel === true
     if (item.pendingRetainAfterCancel === true && !retainAfterCancel) {
       try {
@@ -1148,7 +1205,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       // before its local WAL is removed. Otherwise a deleted chip can reappear
       // on the next hydrate.
       await pendingInputQueue!.cancel({
-        key: item.ownerSessionKey || options.sessionKey.value,
+        key: queueSessionKey(item.ownerSessionKey),
         pendingInputId: item.pendingInputId!,
         ...(previousState === 'staged' && item.pendingServerRevision
           ? { expectedRevision: item.pendingServerRevision }
@@ -1182,7 +1239,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         && item.pendingRetainAfterCancel === true
       ) return true
       removePendingIdentity(
-        item.ownerSessionKey || options.sessionKey.value,
+        queueSessionKey(item.ownerSessionKey),
         pendingInputId,
       )
       return true
@@ -1332,8 +1389,14 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     cancelPendingReorder()
     clearPendingDrainAfterTerminalTimer()
     activeQueueLease += 1
-    const sourceSessionKey = options.sessionKey.value
+    const sourceSessionKey = queueSessionKey()
+    const canonicalTargetSessionKey = queueSessionKey(targetSessionKey)
     if (sourceSessionKey && pendingQueue.value.length > 0) {
+      for (const item of pendingQueue.value) {
+        if (queueSessionKey(item.ownerSessionKey) === sourceSessionKey) {
+          item.ownerSessionKey = sourceSessionKey
+        }
+      }
       const existing = parkedQueues.get(sourceSessionKey) || []
       const existingIds = new Set(existing.map(item => item.pendingInputId).filter(Boolean))
       parkedQueues.set(sourceSessionKey, [
@@ -1343,10 +1406,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         )),
       ])
     }
-    const restored = parkedQueues.get(targetSessionKey) || []
-    parkedQueues.delete(targetSessionKey)
+    const restored = parkedQueues.get(canonicalTargetSessionKey) || []
+    parkedQueues.delete(canonicalTargetSessionKey)
     pendingQueue.value = restored
-    nextTick(() => void hydratePendingQueue(targetSessionKey))
+    nextTick(() => void hydratePendingQueue(canonicalTargetSessionKey))
   }
 
   function applyAcceptedHandoffCommit(
@@ -1354,8 +1417,12 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     targetSessionKey: string,
     ownerRequestId: string,
   ) {
+    targetSessionKey = queueSessionKey(targetSessionKey)
     const committedById = new Map(
-      commit.records.map(record => [record.pendingInputId, itemFromWalRecord(record)]),
+      commit.records.map(record => [record.pendingInputId, itemFromWalRecord({
+        ...record,
+        sessionKey: queueSessionKey(record.sessionKey),
+      })]),
     )
     const migrated: ChatPendingItem[] = []
     const updateOwned = (items: ChatPendingItem[]) => items.flatMap(item => {
@@ -1390,6 +1457,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     shouldApply: () => boolean = () => true,
     handoffSignal?: AbortSignal,
   ): Promise<boolean> {
+    targetSessionKey = queueSessionKey(targetSessionKey)
     if (!options.pendingInputWal?.acceptHandoff) return false
     if (options.pendingInputWal.listHandoffs) {
       const records = await options.pendingInputWal.listHandoffs()
@@ -1416,16 +1484,20 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     ownerRequestId: string,
   ): Promise<void> {
     if (!sourceSessionKey || !targetSessionKey || !ownerRequestId) return
+    sourceSessionKey = queueSessionKey(sourceSessionKey)
+    targetSessionKey = queueSessionKey(targetSessionKey)
     const committed = await acceptDurableHandoff(targetSessionKey, ownerRequestId)
     if (!committed) return
-    if (options.sessionKey.value === targetSessionKey) {
+    if (queueSessionKey() === targetSessionKey) {
       activeQueueLease += 1
       const restored = parkedQueues.get(targetSessionKey) || []
       parkedQueues.delete(targetSessionKey)
       pendingQueue.value = [...pendingQueue.value, ...restored]
       sortOrdinaryPendingItems()
       for (const item of pendingQueue.value) {
-        if (item.ownerSessionKey === targetSessionKey) void ensureServerStaged(item)
+        if (queueSessionKey(item.ownerSessionKey) === targetSessionKey) {
+          void ensureServerStaged(item)
+        }
       }
     }
     broadcastChange(sourceSessionKey)
@@ -1439,7 +1511,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     ].filter(item => item.ownerRequestId === ownerRequestId && durableItem(item))
     await Promise.all(owned.map(item => writeWalItem(item, 'retryable').catch(() => {})))
     for (const item of owned) {
-      broadcastChange(item.ownerSessionKey || options.sessionKey.value, item.pendingInputId)
+      broadcastChange(queueSessionKey(item.ownerSessionKey), item.pendingInputId)
     }
   }
 
@@ -1452,7 +1524,8 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     if (reorderCommitPromise) await reorderCommitPromise
     else cancelPendingReorder()
     if (!shouldCommit()) return
-    const sourceSessionKey = options.sessionKey.value
+    const sourceSessionKey = queueSessionKey()
+    targetSessionKey = queueSessionKey(targetSessionKey)
     const durableCommitApplied = await acceptDurableHandoff(
       targetSessionKey,
       ownerRequestId,
@@ -1476,7 +1549,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       if (
         !durableCommitApplied
         && ownerRequestId
-        && item.ownerSessionKey === sourceSessionKey
+        && queueSessionKey(item.ownerSessionKey) === sourceSessionKey
         && item.ownerRequestId === ownerRequestId
       ) {
         // Keep object identity: an in-flight explicit steer stores its
@@ -1505,7 +1578,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     pendingQueue.value = [...targetItems, ...carried]
     sortOrdinaryPendingItems()
     for (const item of pendingQueue.value) {
-      if (item.ownerSessionKey === targetSessionKey) void ensureServerStaged(item)
+      if (queueSessionKey(item.ownerSessionKey) === targetSessionKey) {
+        void ensureServerStaged(item)
+      }
     }
     broadcastChange(sourceSessionKey)
     broadcastChange(targetSessionKey)
@@ -1524,19 +1599,26 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   function restoreDurableItemIntoComposer(
     item: ChatPendingItem,
     restore: () => void,
+    lease = {
+      ownerSessionKey: queueSessionKey(item.ownerSessionKey),
+      queueLease: activeQueueLease,
+      composerRevision,
+    },
   ) {
-    const ownerSessionKey = item.ownerSessionKey || options.sessionKey.value
-    const queueLease = activeQueueLease
     void cancelDurableItem(item, { retainAfterCancel: true }).then(retained => {
       if (
         !retained
-        || options.sessionKey.value !== ownerSessionKey
-        || activeQueueLease !== queueLease
+        || disposed
+        || queueSessionKey(item.ownerSessionKey) !== lease.ownerSessionKey
+        || queueSessionKey() !== lease.ownerSessionKey
+        || activeQueueLease !== lease.queueLease
+        || composerRevision !== lease.composerRevision
       ) return
       const index = pendingQueue.value.indexOf(item)
       if (index < 0) return
       pendingQueue.value.splice(index, 1)
       restore()
+      lease.composerRevision = composerRevision
       // The composer now owns the retained local-only payload. Remove its WAL
       // record without reopening a window where a navigation can restore the
       // source item into a different session's composer.
@@ -1656,6 +1738,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     options.pendingSessionIntent.value = options.pendingSessionIntent.value || headIntent || null
     options.autoResizeTextarea()
     options.resetInputHistory()
+    const restoreLease = {
+      ownerSessionKey: queueSessionKey(),
+      queueLease: activeQueueLease,
+      composerRevision,
+    }
     for (const item of durable) {
       restoreDurableItemIntoComposer(item, () => {
         options.inputText.value = [options.inputText.value, item.text]
@@ -1670,7 +1757,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         )
         options.autoResizeTextarea()
         options.resetInputHistory()
-      })
+      }, restoreLease)
     }
     return true
   }
@@ -1679,8 +1766,8 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     clearPendingDrainAfterTerminalTimer()
     if (pendingQueue.value.length === 0) return
     const head = pendingQueue.value[0]
-    const ownerSessionKey = head?.ownerSessionKey || options.sessionKey.value
-    if (ownerSessionKey !== options.sessionKey.value) {
+    const ownerSessionKey = queueSessionKey(head?.ownerSessionKey)
+    if (ownerSessionKey !== queueSessionKey()) {
       if (head) head.deliveryState = 'retryable'
       return
     }
@@ -1692,7 +1779,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         void (async () => {
           let outcome: PendingDeliveryOutcome = 'retryable_failure'
           try {
-            if (options.sessionKey.value === ownerSessionKey) {
+            if (queueSessionKey() === ownerSessionKey) {
               outcome = await options.dispatchHiddenControl?.(
                 head,
                 ownerSessionKey,
@@ -1730,7 +1817,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         void (async () => {
           let outcome: PendingDeliveryOutcome = 'retryable_failure'
           try {
-            if (options.sessionKey.value === ownerSessionKey) {
+            if (queueSessionKey() === ownerSessionKey) {
               outcome = await options.dispatchPendingItem!(item, ownerSessionKey)
             }
           } catch {
@@ -1749,7 +1836,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     head.deliveryState = 'steering'
     nextTick(() => {
       if (
-        options.sessionKey.value !== ownerSessionKey
+        queueSessionKey() !== ownerSessionKey
         || pendingQueue.value[0] !== head
       ) return
       pendingQueue.value.shift()
@@ -1889,7 +1976,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     if (!pendingInputQueue || !supportsServerQueue()) return false
     const expectedOrder = pendingQueue.value.map(item => item.pendingInputId)
     try {
-      const response = { items: await pendingInputQueue.list(options.sessionKey.value) }
+      const response = { items: await pendingInputQueue.list(queueSessionKey()) }
       const items = Array.isArray(response.items) ? response.items : []
       const serverOrder = items
         .slice()
@@ -1899,7 +1986,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       if (serverOrder.some((id, index) => id !== expectedOrder[index])) {
         options.onPendingPersistenceError?.('order_conflict')
       }
-      broadcastChange(options.sessionKey.value)
+      broadcastChange(queueSessionKey())
       return true
     } catch {
       return false
@@ -1952,7 +2039,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     if (snapshot.mode === 'local') {
       try {
         const result = await options.pendingInputWal!.commitOrder!(
-          options.sessionKey.value,
+          queueSessionKey(),
           orderedIds,
           snapshot.expectedWalRevisions,
         )
@@ -1962,10 +2049,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           item.pendingPosition = record.position
           item.pendingWalRevision = record.walRevision
         }
-        broadcastChange(options.sessionKey.value)
+        broadcastChange(queueSessionKey())
       } catch {
         finishPendingReorder()
-        await hydratePendingQueue(options.sessionKey.value)
+        await hydratePendingQueue(queueSessionKey())
         options.onPendingPersistenceError?.('wal_failed')
         return
       }
@@ -1974,14 +2061,14 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     }
     try {
       const response = await pendingInputQueue!.reorder({
-          key: options.sessionKey.value,
+          key: queueSessionKey(),
           items: pendingQueue.value.map(item => ({
             pendingInputId: item.pendingInputId,
             expectedRevision: item.pendingServerRevision,
           })),
         })
       await applyServerReorderItems(Array.isArray(response.items) ? response.items : [])
-      broadcastChange(options.sessionKey.value)
+      broadcastChange(queueSessionKey())
       finishPendingReorder()
     } catch {
       // An unknown RPC result may have committed. Keep the delivery barrier
@@ -2020,7 +2107,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   function cleanup() {
     cancelPendingReorder()
     disposed = true
+    activeQueueLease += 1
     hydrateGeneration += 1
+    stopComposerRevisionWatch()
     clearPendingDrainAfterTerminalTimer()
     parkedQueues.clear()
     broadcast?.close()
