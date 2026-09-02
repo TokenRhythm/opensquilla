@@ -12,7 +12,15 @@ from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
 
-from opensquilla.gateway.rpc import RpcContext, get_dispatcher
+from opensquilla.gateway.adapters.skill_catalog import (
+    GatewaySkillCatalogAdapter,
+    GatewaySkillCatalogReadPort,
+)
+from opensquilla.gateway.adapters.skill_catalog_contract import (
+    register_skill_catalog_contract,
+)
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
+from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
 from opensquilla.paths import default_opensquilla_home
 from opensquilla.skills.capability_runtime import trusted_capability_consumers_for_meta_plan
 from opensquilla.skills.dependency_summary import build_dependency_summary
@@ -919,13 +927,8 @@ async def _read_skills_list(params: dict | None, ctx: RpcContext) -> dict[str, A
     }
 
 
-@_d.method("skills.list", scope="operator.read")
 async def _handle_skills_list(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    if isinstance(params, dict) and params.get("includeLifecycle") is True:
-        async with _committed_lifecycle_read(ctx):
-            return await _read_skills_list(params, ctx)
-    # Preserve the non-blocking legacy winner-only catalog surface.
-    return await _read_skills_list(params, ctx)
+    return await _skill_catalog(ctx).list(params)
 
 
 @_d.method("skills.bins", scope="node")
@@ -1114,24 +1117,11 @@ async def _read_skills_get(params: dict | None, ctx: RpcContext) -> dict[str, An
     return result
 
 
-@_d.method("skills.get", scope="operator.read")
 async def _handle_skills_get(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    lifecycle_read = bool(
-        isinstance(params, dict)
-        and (
-            params.get("includeLifecycle") is True
-            or params.get("installId")
-            or params.get("install_id")
-        )
-    )
-    if lifecycle_read:
-        async with _committed_lifecycle_read(ctx):
-            return await _read_skills_get(params, ctx)
-    return await _read_skills_get(params, ctx)
+    return await _skill_catalog(ctx).detail(params)
 
 
-@_d.method("skills.search", scope="operator.read")
-async def _handle_skills_search(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def _read_skills_search(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     """Search for skills across Community sources."""
     if not isinstance(params, dict) or "query" not in params:
         raise ValueError("params.query is required")
@@ -1189,6 +1179,38 @@ async def _handle_skills_search(params: dict | None, ctx: RpcContext) -> dict[st
         payload["partial"] = report.partial
         payload["allSourcesUnavailable"] = report.all_sources_unavailable
     return payload
+
+
+def _skill_catalog(ctx: RpcContext) -> GatewaySkillCatalogAdapter:
+    reader = GatewaySkillCatalogReadPort(
+        ctx,
+        list_reader=_read_skills_list,
+        detail_reader=_read_skills_get,
+        search_reader=_read_skills_search,
+        committed_read=lambda: _committed_lifecycle_read(ctx),
+    )
+    return GatewaySkillCatalogAdapter(reader)
+
+
+async def _handle_skills_search(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    return await _skill_catalog(ctx).search(params)
+
+
+for _skill_catalog_method, _skill_catalog_implementation in (
+    ("skills.list", _handle_skills_list),
+    ("skills.get", _handle_skills_get),
+    ("skills.search", _handle_skills_search),
+):
+    register_skill_catalog_contract(
+        _d,
+        _skill_catalog_method,
+        _skill_catalog_implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
 
 
 @_d.method("skills.reload", scope="operator.admin")

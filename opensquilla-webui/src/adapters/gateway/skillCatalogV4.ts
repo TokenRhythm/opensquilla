@@ -1,4 +1,22 @@
 import type { RpcCallOptions } from '@/lib/rpc'
+import {
+  SKILLS_LIST_METHOD,
+  type Params as SkillsListParams,
+  type Result as SkillsListResult,
+} from '@/contracts/generated/v4/skillsList'
+import { validateResult as validateSkillsListResult } from '@/contracts/generated/v4/skillsListValidators.mjs'
+import {
+  SKILLS_GET_METHOD,
+  type Params as SkillsGetParams,
+  type Result as SkillsGetResult,
+} from '@/contracts/generated/v4/skillsGet'
+import { validateResult as validateSkillsGetResult } from '@/contracts/generated/v4/skillsGetValidators.mjs'
+import {
+  SKILLS_SEARCH_METHOD,
+  type Params as SkillsSearchParams,
+  type Result as SkillsSearchResult,
+} from '@/contracts/generated/v4/skillsSearch'
+import { validateResult as validateSkillsSearchResult } from '@/contracts/generated/v4/skillsSearchValidators.mjs'
 import type {
   SkillCatalog,
   SkillInstallResult,
@@ -41,34 +59,52 @@ const objects = <T>(value: unknown): T[] => (
     : []
 )
 
+function invalid(method: string): Error {
+  return new Error(`${method} returned an invalid response`)
+}
+
 export function createV4SkillCatalog(rpc: RpcTransport): SkillCatalog {
   return {
     async list(options) {
       await rpc.ready({ signal: options?.signal })
-      const result = record(await rpc.request(
-        'skills.list',
-        { includeLifecycle: true },
+      const params: SkillsListParams = { includeLifecycle: true }
+      const result = await rpc.request<SkillsListResult>(
+        SKILLS_LIST_METHOD,
+        params,
         callOptions(options?.signal),
-      ))
-      return objects<Skill>(result.skills)
+      )
+      if (!validateSkillsListResult(result)) throw invalid(SKILLS_LIST_METHOD)
+      return result.skills as unknown as Skill[]
     },
     async detail(skill, options) {
-      const result = record(await rpc.request('skills.get', {
+      const params: SkillsGetParams = {
         name: skill.name,
         includeLifecycle: true,
         ...(skill.instance_id ? { instanceId: skill.instance_id } : {}),
         ...(skill.install_id ? { installId: skill.install_id } : {}),
-      }, callOptions(options?.signal)))
+      }
+      const result = await rpc.request<SkillsGetResult>(
+        SKILLS_GET_METHOD,
+        params,
+        callOptions(options?.signal),
+      )
+      if (!validateSkillsGetResult(result)) throw invalid(SKILLS_GET_METHOD)
       return result as unknown as Skill
     },
     async search(query, options) {
-      const result = record(await rpc.request('skills.search', {
+      const params: SkillsSearchParams = {
         query,
         limit: options?.limit ?? 20,
         source: options?.source || 'clawhub',
-      }, callOptions(options?.signal)))
+      }
+      const result = await rpc.request<SkillsSearchResult>(
+        SKILLS_SEARCH_METHOD,
+        params,
+        callOptions(options?.signal),
+      )
+      if (!validateSkillsSearchResult(result)) throw invalid(SKILLS_SEARCH_METHOD)
       return {
-        results: objects<RegistryResult>(result.results),
+        results: result.results as unknown as RegistryResult[],
         diagnostics: objects<SkillDiagnostic>(result.diagnostics),
         message: typeof result.message === 'string' ? result.message : '',
       } satisfies SkillRegistrySearchResult

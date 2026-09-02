@@ -637,6 +637,8 @@
       "tests/test_gateway/test_sessions_search_contract_adapter.py",
       "tests/test_gateway/test_shutdown_endpoint.py",
       "tests/test_gateway/test_shutdown_order.py",
+      "tests/test_gateway/test_skill_catalog_adapter.py",
+      "tests/test_gateway/test_skill_catalog_application.py",
       "tests/test_gateway/test_skill_management_service_injection.py",
       "tests/test_gateway/test_spawn_group_pagination.py",
       "tests/test_gateway/test_spawn_group_tracker.py",
