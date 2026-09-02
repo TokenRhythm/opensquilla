@@ -31,6 +31,7 @@ from opensquilla.chat.flattened_tool_markers import (
     is_flattened_tool_result_dump,
 )
 from opensquilla.history_cursor import (
+    HISTORY_CURSOR_MAX_INTEGER,
     HistoryCursor,
     HistoryCursorInvalidatedError,
     HistoryCursorInvalidError,
@@ -39,8 +40,7 @@ from opensquilla.session.storage import StorageBusyError
 
 log = structlog.get_logger(__name__)
 
-_MAX_HISTORY_CURSOR_INTEGER = (1 << 63) - 1
-_MAX_HISTORY_CURSOR_INTEGER_TEXT = str(_MAX_HISTORY_CURSOR_INTEGER)
+_MAX_HISTORY_CURSOR_INTEGER_TEXT = str(HISTORY_CURSOR_MAX_INTEGER)
 
 
 def parse_history_cursor(value: object) -> HistoryCursor | None:

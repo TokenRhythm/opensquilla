@@ -160,6 +160,57 @@ async def test_chat_history_returns_pagination_metadata_with_legacy_messages() -
 
 
 @pytest.mark.asyncio
+async def test_chat_history_does_not_publish_unusable_legacy_null_id_cursor(
+    tmp_path,
+) -> None:
+    storage = SessionStorage(str(tmp_path / "history-legacy-null-id.db"))
+    await storage.connect()
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:legacy-null-id"
+    node = await manager.create(session_key)
+    try:
+        await storage.conn.executemany(
+            """
+            INSERT INTO compacted_transcript_entries (
+                session_id, session_key, compaction_id, compaction_index,
+                original_entry_id, message_id, role, content, created_at, archived_at
+            ) VALUES (?, ?, ?, ?, NULL, ?, 'user', ?, ?, ?)
+            """,
+            [
+                (
+                    node.session_id,
+                    session_key,
+                    "legacy-compaction",
+                    0,
+                    f"legacy-{index}",
+                    f"legacy message {index}",
+                    index,
+                    index,
+                )
+                for index in (1, 2)
+            ],
+        )
+        await storage.conn.commit()
+
+        result = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 1},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+    finally:
+        await storage.close()
+
+    assert [message["message_id"] for message in result["messages"]] == ["legacy-2"]
+    assert result["canonical_complete"] is False
+    assert result["has_more"] is False
+    assert result["oldest_cursor"] is None
+    assert result["newest_cursor"] is None
+
+
+@pytest.mark.asyncio
 async def test_chat_history_projects_parallel_legacy_activity_on_incomplete_page() -> None:
     tool_entry = TranscriptEntry(
         id=10,

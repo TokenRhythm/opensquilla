@@ -52,6 +52,7 @@ from opensquilla.gateway.terminal_activity import (
     usage_barrier_replay_proof,
 )
 from opensquilla.history_cursor import (
+    HISTORY_CURSOR_MAX_INTEGER,
     HistoryCursorInvalidatedError,
     HistoryCursorInvalidError,
 )
@@ -560,9 +561,18 @@ async def _chat_history_turn_outcomes(
 def _chat_history_cursor(entry: object | None) -> str | None:
     if entry is None:
         return None
-    created_at = getattr(entry, "created_at", "")
-    stable_id = getattr(entry, "id", None) or getattr(entry, "message_id", "")
-    if created_at in {None, ""} or stable_id in {None, ""}:
+    created_at = getattr(entry, "created_at", None)
+    stable_id = getattr(entry, "id", None)
+    if (
+        not isinstance(created_at, int)
+        or isinstance(created_at, bool)
+        or not isinstance(stable_id, int)
+        or isinstance(stable_id, bool)
+        or created_at < 0
+        or stable_id < 0
+        or created_at > HISTORY_CURSOR_MAX_INTEGER
+        or stable_id > HISTORY_CURSOR_MAX_INTEGER
+    ):
         return None
     return f"{created_at}|{stable_id}"
 
@@ -1278,6 +1288,14 @@ async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
         session_key,
         include_summaries=include_summaries,
     )
+    oldest_cursor = _chat_history_cursor(page_entries[0]) if page_entries else None
+    newest_cursor = _chat_history_cursor(page_entries[-1]) if page_entries else None
+    continuation_cursor = newest_cursor if parsed_after is not None else oldest_cursor
+    # Incomplete legacy archives can contain rows whose original integer id was
+    # never preserved. They remain useful display evidence, but there is no
+    # honest numeric keyset anchor to publish for another page.
+    if has_more and continuation_cursor is None:
+        has_more = False
     if summaries:
         history_scope = "compacted"
     elif has_more:
@@ -1302,8 +1320,8 @@ async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
             session_key=session_key,
         ),
         "has_more": has_more,
-        "oldest_cursor": _chat_history_cursor(page_entries[0]) if page_entries else None,
-        "newest_cursor": _chat_history_cursor(page_entries[-1]) if page_entries else None,
+        "oldest_cursor": oldest_cursor,
+        "newest_cursor": newest_cursor,
         "history_scope": history_scope,
         "loaded_count": len(page_entries),
         "page_size": limit,

@@ -14288,6 +14288,13 @@ class SessionStorage:
         entries = entries[:page_size]
         if not ascending:
             entries.reverse()
+        if has_more and entries:
+            continuation_entry = entries[-1] if ascending else entries[0]
+            # Legacy compacted rows can lack their original transcript id. The
+            # archive is already reported incomplete; do not advertise another
+            # keyset page when its boundary cannot form the numeric cursor.
+            if continuation_entry.id is None:
+                has_more = False
         return entries, has_more
 
     @_serialized_read
