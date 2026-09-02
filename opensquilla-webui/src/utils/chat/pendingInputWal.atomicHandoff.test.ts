@@ -270,6 +270,54 @@ class ControlledObjectStore {
 }
 
 describe('BrowserPendingInputWal atomic mutations', () => {
+  it('acquires a cancelling tombstone only from the expected live revision', async () => {
+    const factory = new ControlledIdbFactory()
+    const wal = createPendingInputWal(factory.idbFactory)
+    expect(wal).not.toBeNull()
+    const localOnly: PendingInputWalRecord = {
+      schemaVersion: 1,
+      pendingInputId: 'pending-cancel-cas',
+      sessionKey: 'agent:main:webchat:cancel-cas',
+      clientRequestId: 'request-cancel-cas',
+      clientMessageId: 'message-cancel-cas',
+      text: 'cancel only while this row is live',
+      attachments: [],
+      intent: null,
+      state: 'local_only',
+      mayHaveServerCopy: false,
+      walRevision: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    const cancelling = {
+      ...localOnly,
+      state: 'cancelling' as const,
+      retainAfterCancel: true,
+      walRevision: 2,
+    }
+    await wal!.put(localOnly)
+
+    await expect(wal!.beginCancellation!(cancelling, 1)).resolves.toMatchObject({
+      applied: true,
+      record: {
+        state: 'cancelling',
+        retainAfterCancel: true,
+        walRevision: 2,
+      },
+    })
+    await expect(wal!.beginCancellation!(cancelling, 1)).resolves.toMatchObject({
+      applied: false,
+      record: { state: 'cancelling', walRevision: 2 },
+    })
+    await wal!.delete(localOnly.pendingInputId)
+    await expect(wal!.beginCancellation!(cancelling, 2)).resolves.toEqual({
+      applied: false,
+      record: null,
+    })
+    expect(factory.record(PENDING_STORE, localOnly.pendingInputId)).toBeUndefined()
+    wal!.close()
+  })
+
   it('does not retain a cancelled draft after another owner deletes its WAL row', async () => {
     const factory = new ControlledIdbFactory()
     const wal = createPendingInputWal(factory.idbFactory)

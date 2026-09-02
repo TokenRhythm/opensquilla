@@ -1244,15 +1244,72 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     if (retainAfterCancel) item.pendingRetainAfterCancel = true
     else delete item.pendingRetainAfterCancel
     rememberRemoval(sessionKey, item.pendingInputId!)
+    const usesAtomicCancellation = Boolean(options.pendingInputWal?.beginCancellation)
     try {
-      await writeWalItem(item, 'cancelling')
+      if (options.pendingInputWal?.beginCancellation) {
+        let transition: 'applied' | 'missing' | 'conflict' = 'conflict'
+        for (let attempt = 0; attempt < 3; attempt++) {
+          if (retainAfterCancel) item.pendingRetainAfterCancel = true
+          else delete item.pendingRetainAfterCancel
+          const expectedWalRevision = item.pendingWalRevision ?? 1
+          const mutation = await options.pendingInputWal.beginCancellation(
+            {
+              ...walRecordForItem(item, 'cancelling'),
+              walRevision: expectedWalRevision + 1,
+            },
+            expectedWalRevision,
+          )
+          if (mutation.applied) {
+            item.pendingPersistenceState = mutation.record!.state
+            item.pendingWalRevision = mutation.record!.walRevision
+            transition = 'applied'
+            break
+          }
+          if (!mutation.record) {
+            removePendingIdentity(sessionKey, item.pendingInputId!)
+            transition = 'missing'
+            break
+          }
+          const sameIdentity = (
+            mutation.record.sessionKey === sessionKey
+            && mutation.record.clientRequestId === item.pendingClientRequestId
+            && mutation.record.clientMessageId === item.pendingClientMessageId
+          )
+          if (
+            mutation.record.state !== 'cancelling'
+            || mutation.record.retainAfterCancel === true
+          ) {
+            forgetRemoval(sessionKey, item.pendingInputId!)
+          }
+          if (sameIdentity) replaceItemFromWalRecord(item, mutation.record)
+          if (
+            !retainAfterCancel
+            && sameIdentity
+            && mutation.record.state === 'cancelling'
+            && mutation.record.retainAfterCancel !== true
+          ) {
+            transition = 'applied'
+            break
+          }
+          if (!retainAfterCancel && sameIdentity) {
+            rememberRemoval(sessionKey, item.pendingInputId!)
+            continue
+          }
+          transition = 'conflict'
+          break
+        }
+        if (transition !== 'applied') return transition === 'missing' && !retainAfterCancel
+      } else {
+        await writeWalItem(item, 'cancelling')
+      }
     } catch {
       // The delete intent never became durable, so the composer/queue must keep
       // owning the previous state. No cancellation RPC was sent.
       forgetRemoval(sessionKey, item.pendingInputId!)
       if (previousRetainAfterCancel) item.pendingRetainAfterCancel = true
       else delete item.pendingRetainAfterCancel
-      await writeWalItem(item, previousState).catch(() => {})
+      if (usesAtomicCancellation) item.pendingPersistenceState = previousState
+      else await writeWalItem(item, previousState).catch(() => {})
       broadcastChange(sessionKey, item.pendingInputId, 'changed')
       return false
     }

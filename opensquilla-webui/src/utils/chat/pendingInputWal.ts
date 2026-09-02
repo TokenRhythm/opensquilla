@@ -69,7 +69,7 @@ export interface PendingInputOrderCommit {
   records: PendingInputWalRecord[]
 }
 
-export interface PendingInputRetainMutation {
+export interface PendingInputWalMutation {
   applied: boolean
   /** The current live row, or null only when no valid row owns this identity. */
   record: PendingInputWalRecord | null
@@ -90,11 +90,16 @@ export interface PendingInputWal {
   list: (sessionKey: string) => Promise<PendingInputWalRecord[]>
   delete: (pendingInputId: string) => Promise<void>
   putMany?: (records: PendingInputWalRecord[]) => Promise<void>
+  /** Acquire a cancellation tombstone only while the exact WAL revision still owns the row. */
+  beginCancellation?: (
+    record: PendingInputWalRecord,
+    expectedWalRevision: number,
+  ) => Promise<PendingInputWalMutation>
   /** Convert one cancelling tombstone into a retained local draft only while its exact WAL revision still owns the row. */
   retainCancelled?: (
     record: PendingInputWalRecord,
     expectedWalRevision: number,
-  ) => Promise<PendingInputRetainMutation>
+  ) => Promise<PendingInputWalMutation>
   commitOrder?: (
     sessionKey: string,
     orderedIds: string[],
@@ -335,10 +340,42 @@ class BrowserPendingInputWal implements PendingInputWal {
     await transactionDone(transaction)
   }
 
+  async beginCancellation(
+    record: PendingInputWalRecord,
+    expectedWalRevision: number,
+  ): Promise<PendingInputWalMutation> {
+    const database = await this.database()
+    const transaction = database.transaction(STORE_NAME, 'readwrite')
+    const store = transaction.objectStore(STORE_NAME)
+    const raw = await requestResult(store.get(record.pendingInputId))
+    if (
+      !isPendingInputWalRecord(raw)
+      || raw.sessionKey !== record.sessionKey
+      || raw.clientRequestId !== record.clientRequestId
+      || raw.clientMessageId !== record.clientMessageId
+      || (raw.walRevision ?? 1) !== expectedWalRevision
+    ) {
+      await transactionDone(transaction)
+      return {
+        applied: false,
+        record: isPendingInputWalRecord(raw) ? cloneRecord(raw) : null,
+      }
+    }
+    const cancelling = cloneRecord({
+      ...record,
+      state: 'cancelling',
+      walRevision: expectedWalRevision + 1,
+      updatedAt: Date.now(),
+    })
+    store.put(cancelling)
+    await transactionDone(transaction)
+    return { applied: true, record: cancelling }
+  }
+
   async retainCancelled(
     record: PendingInputWalRecord,
     expectedWalRevision: number,
-  ): Promise<PendingInputRetainMutation> {
+  ): Promise<PendingInputWalMutation> {
     const database = await this.database()
     const transaction = database.transaction(STORE_NAME, 'readwrite')
     const store = transaction.objectStore(STORE_NAME)

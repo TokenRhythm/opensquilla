@@ -1203,6 +1203,86 @@ describe('useChatPendingQueue delivery state', () => {
     }
   })
 
+  it('does not recreate a tombstone when delayed cancellation acquisition loses to delete', async () => {
+    vi.stubGlobal(
+      'BroadcastChannel',
+      TestBroadcastChannel as unknown as typeof BroadcastChannel,
+    )
+    const { wal, records } = memoryWal()
+    const beginCancellation: NonNullable<PendingInputWal['beginCancellation']> = vi.fn(
+      async (record, expectedWalRevision) => {
+        const current = records.get(record.pendingInputId)
+        if (
+          !current
+          || current.sessionKey !== record.sessionKey
+          || current.clientRequestId !== record.clientRequestId
+          || current.clientMessageId !== record.clientMessageId
+          || (current.walRevision ?? 1) !== expectedWalRevision
+        ) {
+          return {
+            applied: false,
+            record: current ? structuredClone(current) : null,
+          }
+        }
+        const cancelling = {
+          ...structuredClone(record),
+          state: 'cancelling' as const,
+          walRevision: expectedWalRevision + 1,
+          updatedAt: Date.now(),
+        }
+        records.set(record.pendingInputId, cancelling)
+        return { applied: true, record: structuredClone(cancelling) }
+      },
+    )
+    let markDelayedBegin!: () => void
+    let releaseDelayedBegin!: () => void
+    const delayedBegin = new Promise<void>(resolve => { markDelayedBegin = resolve })
+    const delayedBeginGate = new Promise<void>(resolve => { releaseDelayedBegin = resolve })
+    const retainingWal: PendingInputWal = {
+      ...wal,
+      beginCancellation: vi.fn(async (record, expectedWalRevision) => {
+        markDelayedBegin()
+        await delayedBeginGate
+        return beginCancellation(record, expectedWalRevision)
+      }),
+    }
+    const destructiveWal: PendingInputWal = { ...wal, beginCancellation }
+    const retaining = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: retainingWal,
+      hasRpcMethod: () => false,
+    })
+    const destructive = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: destructiveWal,
+      hasRpcMethod: () => false,
+    })
+    try {
+      retaining.inputText.value = 'peer delete wins before cancellation acquisition'
+      await expect(retaining.queue.enqueuePendingInput(retaining.inputText.value))
+        .resolves.toBe(true)
+      await destructive.queue.hydratePendingQueue()
+
+      expect(retaining.queue.editPendingItem(pendingUiId(retaining.queue, 0))).toBe(true)
+      await delayedBegin
+      expect(destructive.queue.removePendingChip(pendingUiId(destructive.queue, 0))).toBe(true)
+      await vi.waitFor(() => expect(records.size).toBe(0))
+
+      releaseDelayedBegin()
+      await vi.waitFor(() => {
+        expect(retaining.queue.pendingQueue.value).toEqual([])
+        expect(destructive.queue.pendingQueue.value).toEqual([])
+        expect(records.size).toBe(0)
+      })
+      expect(retaining.inputText.value).toBe('')
+      await retaining.queue.hydratePendingQueue()
+      expect(retaining.queue.pendingQueue.value).toEqual([])
+    } finally {
+      retaining.queue.cleanup()
+      destructive.queue.cleanup()
+      vi.unstubAllGlobals()
+      TestBroadcastChannel.channels.clear()
+    }
+  })
+
   it('does not turn a peer-owned destructive tombstone back into a retained draft', async () => {
     const { wal, records } = memoryWal()
     const sharedRetain = wal.retainCancelled!
