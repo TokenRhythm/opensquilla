@@ -219,9 +219,8 @@ import ControlSwitch from '@/components/ControlSwitch.vue'
 import RunTrace from '@/components/run/RunTrace.vue'
 import SupportDiagnosticsMenu from '@/components/SupportDiagnosticsMenu.vue'
 import { useRunTrace } from '@/composables/run/useRunTrace'
-import { nodeStepsFromHistoryMessage } from '@/components/run/runTrace'
+import { nodeStepsFromToolCalls } from '@/components/run/runTrace'
 import type { NodeStep, RunTraceSummary } from '@/types/runTrace'
-import type { ChatHistoryMessage } from '@/types/chat'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -352,14 +351,14 @@ const rawTitleText = computed(() =>
 
 // A run-bearing line carries structured tool_calls in its raw JSON payload; the
 // drawer renders those as a trace, falling back to the raw text otherwise.
-const selectedTrace = computed<ChatHistoryMessage | null>(() => {
+const selectedTrace = computed<readonly unknown[] | null>(() => {
   const raw = selectedLine.value?.raw
   if (!raw || typeof raw !== 'string') return null
   const trimmed = raw.trim()
   if (!trimmed.startsWith('{')) return null
   try {
     const parsed = JSON.parse(trimmed) as Record<string, unknown>
-    if (Array.isArray(parsed.tool_calls)) return parsed as ChatHistoryMessage
+    if (Array.isArray(parsed.tool_calls)) return parsed.tool_calls
     return null
   } catch {
     return null
@@ -367,7 +366,7 @@ const selectedTrace = computed<ChatHistoryMessage | null>(() => {
 })
 
 const lineSteps = computed<NodeStep[]>(() =>
-  selectedTrace.value ? nodeStepsFromHistoryMessage(selectedTrace.value) : [])
+  selectedTrace.value ? nodeStepsFromToolCalls(selectedTrace.value) : [])
 
 const lineSummary = computed<RunTraceSummary | undefined>(() => {
   if (!lineSteps.value.length) return undefined

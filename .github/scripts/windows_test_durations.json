@@ -25,7 +25,7 @@
         "runner_os": "Windows"
       },
       "sha": "9bd99e1deecc3a2634f324634e1b36ab0143d56f",
-      "weighted_file_count": 1308
+      "weighted_file_count": 1310
     },
     {
       "assignment_sha256": "b68d0aa5389729f3ea25a81580b6a755674e5a1a46ca1b8b4394d8d48a646555",
@@ -84,6 +84,7 @@
     "tests/contracts/test_gateway_contract_runner.py": 0.01,
     "tests/contracts/test_gateway_contract_toolchain_integration.py": 0.01,
     "tests/contracts/test_goals_contract.py": 0.01,
+    "tests/contracts/test_sandbox_runtime_contract.py": 0.01,
     "tests/contracts/test_turn_commands_contract.py": 0.01,
     "tests/contracts/test_sessions_changed_contract.py": 0.01,
     "tests/contracts/test_sessions_directory_subscription_contract.py": 0.01,
@@ -110,6 +111,7 @@
     "tests/test_application/test_approval_patterns.py": 0.017,
     "tests/test_application/test_approval_rpc.py": 0.086,
     "tests/test_application/test_session_directory.py": 0.01,
+    "tests/test_application/test_session_read.py": 0.01,
     "tests/test_application/test_session_transcript.py": 0.01,
     "tests/test_application/test_wizard.py": 0.01,
     "tests/test_artifact_bundles.py": 0.662,
@@ -657,6 +659,7 @@
     "tests/test_gateway/test_rpc_workspaces.py": 15.487,
     "tests/test_gateway/test_runtime_override_provenance.py": 0.582,
     "tests/test_gateway/test_sandbox_protocol_codec.py": 0.01,
+    "tests/test_gateway/test_sandbox_runtime_contract_registration.py": 0.01,
     "tests/test_gateway/test_sandbox_v2_routes.py": 0.148,
     "tests/test_gateway/test_search_runtime_config_gateway.py": 0.01,
     "tests/test_gateway/test_security_headers.py": 0.037,
@@ -668,6 +671,8 @@
     "tests/test_gateway/test_goal_plan_contract_adapters.py": 0.01,
     "tests/test_gateway/test_session_preview_adapter.py": 0.01,
     "tests/test_gateway/test_session_history_adapter.py": 0.01,
+    "tests/test_gateway/test_session_read_adapter.py": 0.01,
+    "tests/test_gateway/test_session_read_contract_registration.py": 0.01,
     "tests/test_gateway/test_session_streams.py": 0.038,
     "tests/test_gateway/test_sessions_bootstrap_history_characterization.py": 0.01,
     "tests/test_gateway/test_sessions_list_contract_adapter.py": 0.01,
