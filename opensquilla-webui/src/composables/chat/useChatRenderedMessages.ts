@@ -536,9 +536,9 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       const isPlanMessage = msg.role === 'assistant' && planRevisions.length > 0
       const normalizedToolCalls = normalizeToolCalls(msg.tool_calls)
       const terminalClarifyTaskId = msg.turnOutcome
-        && msg.turnOutcome.taskId
+        && (msg.turnOutcome.taskId || msg.turnOutcome.turnId)
         && turnOutcomePresentation(msg.turnOutcome) !== 'completed'
-        ? msg.turnOutcome.taskId
+        ? msg.turnOutcome.taskId || msg.turnOutcome.turnId
         : ''
       const assistantRawText = msg.role === 'assistant'
         ? options.stripGeneratedArtifactMarkers(msg.text)

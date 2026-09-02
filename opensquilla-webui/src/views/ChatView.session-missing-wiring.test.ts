@@ -20,16 +20,24 @@ describe('ChatView missing-session wiring', () => {
   })
 
   it('forwards complete session-read metadata to pending-input reconciliation', () => {
-    const assignment = chatViewSource.indexOf(
-      'applyPendingUserInputSnapshot = applyUserInputBootstrap',
+    const assignmentStart = chatViewSource.indexOf(
+      'applyPendingUserInputSnapshot = (snapshot, snapshotStreamGeneration)',
     )
-    expect(assignment).toBeGreaterThan(-1)
+    expect(assignmentStart).toBeGreaterThan(-1)
+    const assignmentEnd = chatViewSource.indexOf('\n})', assignmentStart)
+    const assignment = chatViewSource.slice(assignmentStart, assignmentEnd)
+    expect(assignment).toContain('...snapshot')
+    expect(assignment).toContain('streamGeneration: snapshotStreamGeneration')
+    expect(assignment).not.toContain('streamGeneration.value')
 
     const subscriptionStart = chatViewSource.indexOf(
       'const chatSessionSubscription = useChatSessionSubscription({',
     )
     const subscriptionEnd = chatViewSource.indexOf('\n})', subscriptionStart)
     const subscriptionWiring = chatViewSource.slice(subscriptionStart, subscriptionEnd)
-    expect(subscriptionWiring).toContain('applyPendingUserInputSnapshot(snapshot)')
+    expect(subscriptionWiring).toContain('onSnapshot: (snapshot, snapshotStreamGeneration)')
+    expect(subscriptionWiring).toContain(
+      'applyPendingUserInputSnapshot(snapshot, snapshotStreamGeneration)',
+    )
   })
 })

@@ -2596,7 +2596,10 @@ let settleTaskTerminalPresentation: (
   taskId: string,
   status: TaskTerminalStatus,
 ) => void = () => {}
-let applyPendingUserInputSnapshot: (snapshot: SessionReadMetadata) => void = () => {}
+let applyPendingUserInputSnapshot: (
+  snapshot: SessionReadMetadata,
+  streamGeneration: string | null,
+) => void = () => {}
 let applyGoalSnapshot: (snapshot: SessionReadMetadata) => void = () => {}
 const chatSessionSubscription = useChatSessionSubscription({
   sessionReadLeaseReader: sessionReadLifecycle,
@@ -2656,12 +2659,12 @@ const chatSessionSubscription = useChatSessionSubscription({
     activeProjectWorkspace.failSessionResolution(key, generation)
   },
   onSessionMissing: markSessionMissing,
-  onSnapshot: snapshot => {
+  onSnapshot: (snapshot, snapshotStreamGeneration) => {
     const terminalTask = terminalTaskFromRunState(snapshot)
     chatSessionRouting.applyBootstrap(snapshot)
     chatPlans.applyBootstrap(snapshot)
     applyGoalSnapshot(snapshot)
-    applyPendingUserInputSnapshot(snapshot)
+    applyPendingUserInputSnapshot(snapshot, snapshotStreamGeneration)
     if (terminalTask) {
       settleTaskTerminalPresentation(terminalTask.taskId, terminalTask.status)
     }
@@ -3792,7 +3795,10 @@ const {
   settlePendingClarifyForTerminalTask,
   applyUserInputBootstrap,
 } = chatApprovals
-applyPendingUserInputSnapshot = applyUserInputBootstrap
+applyPendingUserInputSnapshot = (snapshot, snapshotStreamGeneration) => applyUserInputBootstrap({
+  ...snapshot,
+  ...(snapshotStreamGeneration ? { streamGeneration: snapshotStreamGeneration } : {}),
+})
 settleTaskTerminalPresentation = (taskId, status) => {
   if (status !== 'succeeded') {
     chatPlans.settleActiveRunForTerminalTask(taskId, status)

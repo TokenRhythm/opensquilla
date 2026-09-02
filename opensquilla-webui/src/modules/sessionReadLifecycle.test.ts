@@ -168,6 +168,7 @@ describe('SessionReadLifecycle', () => {
     }
     await expect(lease.live).resolves.toMatchObject({
       sessionKey: 'alpha',
+      streamGeneration: 'stream-1',
       reloadRequired: null,
     })
     expect(adapter.openRecords).toEqual([{

@@ -970,6 +970,54 @@ describe('clarify tool-result recovery', () => {
     }
   })
 
+  it('rejects a previously unseen questionnaire delivered after its task terminated', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      expect(runtime.approvals.settlePendingClarifyForTerminalTask(
+        'plan-run-1',
+        'cancelled',
+      )).toBe(false)
+
+      runtime.handlers.get('session.event.tool_result')?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: planClarifyResult,
+      })
+
+      expect(runtime.approvals.pendingClarify.value).toBeNull()
+      expect(runtime.appendInterruptFrame).not.toHaveBeenCalled()
+      expect(runtime.interruptState.value.has('input-request-1')).toBe(false)
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('rejects a late positive pending-input hydrate after task termination', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      expect(runtime.approvals.settlePendingClarifyForTerminalTask(
+        'plan-run-1',
+        'failed',
+      )).toBe(false)
+
+      runtime.approvals.applyUserInputBootstrap({
+        pendingUserInputs: [planClarifyResult],
+        goalSnapshotStreamSeq: 7,
+      })
+
+      expect(runtime.approvals.pendingClarify.value).toBeNull()
+      expect(runtime.appendInterruptFrame).not.toHaveBeenCalled()
+      expect(runtime.interruptState.value.has('input-request-1')).toBe(false)
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
   it('settles only questionnaires owned by the terminal task', async () => {
     installSnapshot()
     const runtime = await harness()

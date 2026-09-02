@@ -251,6 +251,22 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     if (oldest) terminalClarifyTaskIds.delete(oldest)
   }
 
+  function rejectTerminalClarifyRequest(
+    key: string,
+    request: ChatClarifyRequest,
+  ): boolean {
+    if (!request.requestId || !terminalClarifyTaskIds.has(request.runId)) return false
+    activeClarifyRequests.delete(key)
+    if (
+      interruptState.value.has(key)
+      && interruptState.value.get(key)?.resolution !== 'replied'
+    ) {
+      setInterruptState(key, { resolution: 'unavailable', busy: false, error: '' })
+    }
+    clearPendingClarify(key)
+    return true
+  }
+
   function retireClarifyStreamGeneration(generation: string) {
     if (!generation) return
     retiredClarifyStreamGenerations.delete(generation)
@@ -751,6 +767,9 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     const request = parseClarifyRequest(payload)
     if (!request) return
     const key = clarifyFrameKey(request)
+    // Terminal delivery can overtake a previously unseen paused result. The
+    // task ledger is authoritative even when no clarify frame existed yet.
+    if (rejectTerminalClarifyRequest(key, request)) return
     // Tool-result replay and reconnect delivery can surface the paused half
     // after its terminal outcome. Never resurrect an already-settled request.
     if (interruptState.value.get(key)?.resolution) return
@@ -1062,6 +1081,9 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
 
     for (const request of requests) {
       const key = clarifyFrameKey(request)
+      // A hydrate captured before terminal settlement may complete after it.
+      // Never let that late positive snapshot resurrect the questionnaire.
+      if (rejectTerminalClarifyRequest(key, request)) continue
       if (interruptState.value.get(key)?.resolution) {
         activeClarifyRequests.delete(key)
         continue

@@ -77,6 +77,7 @@ function live(overrides: Partial<SessionReadLive> = {}): SessionReadLive {
     sessionKey: KEY,
     activity: 'idle',
     activeTaskId: null,
+    streamGeneration: 'generation-1',
     initialMetadata: metadata(),
     snapshot: null,
     reloadRequired: null,
@@ -403,7 +404,7 @@ describe('useChatSessionSubscription domain lease', () => {
     })
     expect(onLiveSnapshot).toHaveBeenCalledWith(snapshot)
     expect(onRunModeLock).toHaveBeenCalledWith(initialMetadata.runModeLock)
-    expect(onSnapshot).toHaveBeenCalledWith(initialMetadata)
+    expect(onSnapshot).toHaveBeenCalledWith(initialMetadata, 'generation-1')
     expect(subject.startStreaming).toHaveBeenCalledWith(90_000)
     expect(subject.activeStreamTaskId.value).toBe('task-live')
     expect(reconcileStreamTaskClock).toHaveBeenCalledWith({
@@ -555,8 +556,41 @@ describe('useChatSessionSubscription domain lease', () => {
       7,
       hydrated,
     ))
-    expect(onSnapshot).toHaveBeenCalledWith(hydrated)
+    expect(onSnapshot).toHaveBeenCalledWith(hydrated, 'generation-1')
     expect(taskOwnership.hydrationResolved.value).toBe(true)
+  })
+
+  it('syncs a restarted lease generation before no-event hydration reconciliation', async () => {
+    const complete = deferred<SessionReadMetadata>()
+    const onSnapshot = vi.fn()
+    const subject = harness(leaseFixture({
+      live: live({
+        streamGeneration: 'generation-2',
+        reloadRequired: 'generationChanged',
+        initialMetadata: metadata({
+          hydrationComplete: false,
+          deferredFields: ['pendingUserInputs', 'goalSnapshotStreamSeq'],
+        }),
+      }),
+      metadata: complete.promise,
+    }).lease, {
+      lastStreamSeq: ref(100),
+      onSnapshot,
+    })
+    subject.api.observeStreamGeneration({ streamGeneration: 'generation-1' })
+
+    await expect(subject.api.subscribeSession()).resolves.toMatchObject({
+      authoritative: true,
+    })
+    expect(subject.api.streamGeneration.value).toBe('generation-2')
+    expect(subject.lastStreamSeq.value).toBe(0)
+
+    const restartedMetadata = metadata({ goalSnapshotStreamSeq: 0 })
+    complete.resolve(restartedMetadata)
+    await vi.waitFor(() => expect(onSnapshot).toHaveBeenCalledWith(
+      restartedMetadata,
+      'generation-2',
+    ))
   })
 
   it('honors background activity even before task-group metadata is complete', async () => {

@@ -2953,6 +2953,42 @@ describe('useChatRenderedMessages clarify history recovery', () => {
       ?.resolution).toBeNull()
   })
 
+  it('expires an abnormal direct-turn clarify when history has no task id', () => {
+    const api = renderedMessagesFor([{
+      role: 'assistant',
+      text: '',
+      ts: 0,
+      messageId: 'm-direct-terminal-history',
+      turnId: 'direct-terminal-turn',
+      restoredFromHistory: true,
+      turnOutcome: {
+        turnId: 'direct-terminal-turn',
+        status: 'timeout',
+      },
+      tool_calls: [{
+        type: 'tool_result',
+        tool_use_id: 'request-direct-terminal',
+        result: {
+          status: 'input_required',
+          kind: 'user_input',
+          paused: true,
+          request_id: 'request-direct-terminal',
+          run_id: 'direct-terminal-turn',
+          step: 'choose_target',
+          clarify_schema: {
+            fields: [{ name: 'target', type: 'string' }],
+          },
+        },
+      }],
+    }])
+
+    const clarify = api.renderedMessages.value[0].parts?.find((part): part is ChatPart & {
+      type: 'interrupt'
+      interruptKind: 'clarify'
+    } => part.type === 'interrupt' && part.interruptKind === 'clarify')
+    expect(clarify?.resolution).toBe('unavailable')
+  })
+
   it('keeps consecutive requests distinct by requestId', () => {
     const request = (requestId: string) => ({
       status: 'input_required',
