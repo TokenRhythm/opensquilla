@@ -4,6 +4,8 @@ import { createApp, nextTick, type App, type ComponentPublicInstance } from 'vue
 import { createI18n } from 'vue-i18n'
 
 import ChatHeaderActions from './ChatHeaderActions.vue'
+import chatHeaderActionsSource from './ChatHeaderActions.vue?raw'
+import type { ContextUsage } from '@/composables/chat/useChatUsageWidget'
 
 type LayoutName = 'wide' | 'compact' | 'tight'
 type Action = 'deliverables' | 'share' | 'copy-session-key'
@@ -18,6 +20,7 @@ const BASE_PROPS = {
   copyIcon: 'copy' as const,
   copyLiveText: '',
   deliverableCount: 2,
+  contextUsage: null as ContextUsage | null,
   hasNewDeliverable: false,
   shareMode: false,
   shareableMessageCount: 3,
@@ -25,6 +28,9 @@ const BASE_PROPS = {
 
 const messages = {
   chat: {
+    contextPressure: 'Context {pct}%',
+    contextPressureTitle: 'Context window {used}k / {window}k tokens — nearing compaction',
+    contextUsageTitle: 'Context window {used}k / {window}k tokens',
     copied: 'Copied',
     copySessionKey: 'Copy session ID',
     deliverables: 'Deliverables',
@@ -146,6 +152,10 @@ async function mountHeader(
   const observer = resizeObservers[resizeObservers.length - 1]!
   await flush()
   return { app, el, handlers, instance, observer }
+}
+
+function contextChip(el: HTMLElement): HTMLElement | null {
+  return el.querySelector<HTMLElement>('[data-testid="chat-header-context-usage"]')
 }
 
 function trigger(el: HTMLElement): HTMLButtonElement {
@@ -656,5 +666,64 @@ describe('ChatHeaderActions', () => {
     const tight = await mountHeader(120)
     expect(tight.instance.focusAction('deliverables')).toBe(true)
     expect(document.activeElement).toBe(trigger(tight.el))
+  })
+
+  it('reports context usage while there is still room to act on it', async () => {
+    const { el } = await mountHeader(800, {
+      contextUsage: { pct: 42, usedK: 54, windowK: 128, warning: false },
+    })
+    const chip = contextChip(el)
+
+    // The point of the readout: visible well below the warning ratio, where a
+    // user can still decide to compact instead of being told it is imminent.
+    expect(chip).not.toBeNull()
+    expect(chip!.textContent).toBe('Context 42%')
+    expect(chip!.getAttribute('title')).toBe('Context window 54k / 128k tokens')
+    expect(chip!.classList.contains('is-warning')).toBe(false)
+  })
+
+  it('keeps the pressure styling and wording once the gateway flags a warning', async () => {
+    const { el } = await mountHeader(800, {
+      contextUsage: { pct: 88, usedK: 113, windowK: 128, warning: true },
+    })
+    const chip = contextChip(el)
+
+    expect(chip!.classList.contains('is-warning')).toBe(true)
+    expect(chip!.getAttribute('title')).toBe(
+      'Context window 113k / 128k tokens — nearing compaction',
+    )
+  })
+
+  it('omits the chip when the gateway resolved no context window', async () => {
+    // A percentage needs a denominator the gateway actually resolved; showing
+    // one anyway would read as a measurement.
+    const { el } = await mountHeader(800, { contextUsage: null })
+    expect(contextChip(el)).toBeNull()
+  })
+
+  it('drops the chip in the tight layout, where the title is already squeezed', async () => {
+    const { el } = await mountHeader(120, {
+      contextUsage: { pct: 42, usedK: 54, windowK: 128, warning: false },
+    })
+    expect(contextChip(el)).toBeNull()
+  })
+
+  it('keeps the warning percentage readable against its own background', () => {
+    // `--warn-fill` is an indicator colour: every other use in the app is a dot
+    // or a bar with nothing written on it, and `foundation.css` defaults it to
+    // `var(--warn)`. Painting `color: var(--warn)` on a bare `var(--warn-fill)`
+    // ground therefore erases the percentage in every theme that does not give
+    // the two roles separate values — which, today, is most of them. The fill
+    // has to be tinted for text to sit on it.
+    const start = chatHeaderActionsSource.indexOf('.chat-header__context.is-warning {')
+    expect(start).toBeGreaterThanOrEqual(0)
+    const rule = chatHeaderActionsSource.slice(
+      start,
+      chatHeaderActionsSource.indexOf('}', start),
+    )
+
+    expect(rule).toContain('color: var(--warn);')
+    expect(rule).not.toContain('background: var(--warn-fill);')
+    expect(rule).toMatch(/background:\s*color-mix\(/)
   })
 })

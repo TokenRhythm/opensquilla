@@ -211,6 +211,7 @@
           :copy-icon="chatRouteHeaderCopyIcon"
           :copy-live-text="chatRouteHeaderCopyLiveText"
           :deliverable-count="chatRouteHeaderDeliverableCount"
+          :context-usage="chatRouteHeaderContextUsage"
           :has-new-deliverable="chatRouteHeaderHasNewDeliverable"
           :share-mode="chatRouteHeaderShareMode"
           :shareable-message-count="chatRouteHeaderShareableMessageCount"
@@ -582,6 +583,7 @@ const {
   copyIcon: chatRouteHeaderCopyIcon,
   copyLiveText: chatRouteHeaderCopyLiveText,
   deliverableCount: chatRouteHeaderDeliverableCount,
+  contextUsage: chatRouteHeaderContextUsage,
   hasNewDeliverable: chatRouteHeaderHasNewDeliverable,
   shareMode: chatRouteHeaderShareMode,
   shareableMessageCount: chatRouteHeaderShareableMessageCount,

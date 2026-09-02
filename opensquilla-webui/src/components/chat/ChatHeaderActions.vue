@@ -24,6 +24,20 @@
 
     <span class="chat-header__spacer" aria-hidden="true"></span>
 
+    <!-- Read-only reading, not an action, so it sits outside the action group —
+         after the spacer, which is the one element that absorbs slack, so the
+         chip stays beside the controls instead of trailing the title. Hidden in
+         the tight layout, where the header has under 144px to work with and the
+         title itself is already being squeezed. -->
+    <span
+      v-if="contextUsage && layout !== 'tight'"
+      class="chat-header__context"
+      :class="{ 'is-warning': contextUsage.warning }"
+      :title="contextUsageTitle"
+      :aria-label="contextUsageTitle"
+      data-testid="chat-header-context-usage"
+    >{{ t('chat.contextPressure', { pct: contextUsage.pct }) }}</span>
+
     <div v-if="layout === 'wide'" class="chat-header__actions">
       <button
         v-if="deliverableCount > 0"
@@ -180,6 +194,7 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import type { ContextUsage } from '@/composables/chat/useChatUsageWidget'
 import { useDialogLayer } from '@/composables/useDialogA11y'
 import { useChatTopbarPopoverCoordination } from '@/composables/useChatTopbarPopoverCoordinator'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
@@ -199,10 +214,23 @@ const props = defineProps<{
   copyIcon: IconName
   copyLiveText: string
   deliverableCount: number
+  /** Live context-window reading, or null while the gateway has no window. */
+  contextUsage?: ContextUsage | null
   hasNewDeliverable: boolean
   shareMode: boolean
   shareableMessageCount: number
 }>()
+
+// Two tooltips, because the pressure wording ("nearing compaction") is a claim
+// about what happens next and is only true past the gateway's warning ratio.
+const contextUsageTitle = computed(() => {
+  const usage = props.contextUsage
+  if (!usage) return ''
+  const params = { used: usage.usedK, window: usage.windowK }
+  return usage.warning
+    ? t('chat.contextPressureTitle', params)
+    : t('chat.contextUsageTitle', params)
+})
 
 const emit = defineEmits<{
   'open-deliverables': []
@@ -541,6 +569,33 @@ defineExpose({ focusAction, closeMenu })
 
 .chat-header__actions--compact {
   gap: var(--sp-1);
+}
+
+.chat-header__context {
+  align-items: center;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  color: var(--text-muted);
+  display: inline-flex;
+  flex: 0 0 auto;
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  min-height: 24px;
+  padding: 0.125rem 0.5rem;
+  white-space: nowrap;
+}
+
+.chat-header__context.is-warning {
+  /* `--warn-fill` is a solid indicator colour — every other use in the app is a
+     dot or a bar with nothing written on it, and `foundation.css` defaults it
+     to `var(--warn)`, so painting warn text on a warn-fill ground erases the
+     percentage in every theme that does not override the two separately.
+     Tinting it is the pattern the degraded status glyph in OverviewView
+     already uses for warn-coloured text on a warn ground. */
+  background: color-mix(in srgb, var(--warn-fill) 14%, transparent);
+  border-color: var(--warn);
+  color: var(--warn);
 }
 
 .chat-header__action {

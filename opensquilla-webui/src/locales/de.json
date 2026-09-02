@@ -3448,6 +3448,7 @@
     "deliverablesCount": "Ergebnisse ({count})",
     "contextPressure": "Kontext {pct} %",
     "contextPressureTitle": "Kontextfenster {used}k / {window}k Tokens — nahe der Komprimierungsschwelle",
+    "contextUsageTitle": "Kontextfenster {used}k / {window}k Tokens",
     "sessionDeliverables": "Sitzungsergebnisse",
     "noDeliverables": "Noch keine Ergebnisse.",
     "openArtifact": "{title}, {subtitle} öffnen",
