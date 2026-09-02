@@ -900,17 +900,24 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     return messages.some(msg => msg.restoredFromHistory !== true)
   }
 
+  function canonicalHistoryReplacementContext(
+    previous: ChatMessage[],
+    latest: ChatMessage[],
+  ): ChatMessage[] {
+    const latestIds = new Set(latest.map(message => message.messageId).filter(Boolean))
+    return previous.filter(message =>
+      message.restoredFromHistory !== true
+      || Boolean(message.messageId && latestIds.has(message.messageId)),
+    )
+  }
+
   // A rejected anchor makes every older canonical row untrustworthy. Retain
   // only overlap needed to reconcile live fields plus non-canonical local rows.
   function replaceCanonicalHistoryWindow(
     previous: ChatMessage[],
     latest: ChatMessage[],
   ): ChatMessage[] {
-    const latestIds = new Set(latest.map(message => message.messageId).filter(Boolean))
-    const liveContext = previous.filter(message =>
-      message.restoredFromHistory !== true
-      || Boolean(message.messageId && latestIds.has(message.messageId)),
-    )
+    const liveContext = canonicalHistoryReplacementContext(previous, latest)
     return reconcileRunningHistoryMessages(liveContext, latest)
   }
 
@@ -1346,8 +1353,11 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           [...retainedPreviousMaintenance, ...maintenanceMessages],
         )
       } else {
+        const terminalNoticeContext = params.replaceCanonicalWindow
+          ? canonicalHistoryReplacementContext(previousTranscript, mapped)
+          : previousTranscript
         const refreshedWindow = params.replaceCanonicalWindow
-          ? replaceCanonicalHistoryWindow(previousTranscript, mapped)
+          ? reconcileRunningHistoryMessages(terminalNoticeContext, mapped)
           : reconcileHistoryWindow(previousTranscript, mapped)
         let nextMessages: ChatMessage[]
         if (params.replaceCanonicalWindow) {
@@ -1365,7 +1375,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         const transcript = interleaveHistoryModelCallSegments(
           rehomePromotedSteerRows(
             dedupeSyntheticUsageBarrierErrors(
-              reconcileClientTerminalNotices(previousTranscript, nextMessages),
+              reconcileClientTerminalNotices(terminalNoticeContext, nextMessages),
             ),
           ),
         )

@@ -2445,6 +2445,57 @@ describe('useChatHistory canonical pagination', () => {
     })
   })
 
+  it('does not graft a prior-epoch terminal notice onto a reset latest window', async () => {
+    const oldUser = sessionReadMessage({
+      id: 'old-user',
+      messageId: 'old-user',
+      role: 'user',
+      text: 'old epoch prompt',
+      createdAt: '2026-07-06T00:00:01Z',
+      turnContext: { turnId: 'old-turn' },
+    }, 0)
+    const newUser = sessionReadMessage({
+      id: 'new-user',
+      messageId: 'new-user',
+      role: 'user',
+      text: 'new epoch prompt',
+      createdAt: '2026-07-06T00:00:02Z',
+      turnContext: { turnId: 'new-turn' },
+    }, 0)
+    const { api, historyFixture, messages } = makeHistory(false)
+    historyFixture
+      .mockResolvedValueOnce({
+        messages: [oldUser],
+        hasMore: true,
+        oldestCursor: 'old-cursor',
+        newestCursor: 'old-cursor',
+        canonicalAvailable: true,
+      })
+      .mockRejectedValueOnce(new SessionReadHistoryCursorError('stale', 'cursor rejected'))
+      .mockResolvedValueOnce({
+        messages: [newUser],
+        hasMore: false,
+        oldestCursor: 'new-cursor',
+        newestCursor: 'new-cursor',
+        canonicalAvailable: true,
+      })
+
+    await api.loadHistory()
+    messages.value.push({
+      role: 'error',
+      text: 'Activation failed; retry this message.',
+      ts: 'local-error',
+      turnId: 'old-turn',
+      errorCode: 'failed',
+      terminalNotice: true,
+    })
+    await api.loadEarlierHistory()
+    await api.retryHistory()
+
+    expect(messages.value.map(message => message.messageId)).toEqual(['new-user'])
+    expect(messages.value.some(message => message.terminalNotice)).toBe(false)
+  })
+
   it('drops the prior canonical window when latest recovery is empty', async () => {
     const { api, historyFixture, messages } = makeHistory(false)
     historyFixture
