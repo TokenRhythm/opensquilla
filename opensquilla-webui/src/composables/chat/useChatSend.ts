@@ -1527,6 +1527,7 @@ export function useChatSend(options: UseChatSendOptions) {
   async function persistResponseHandoff(
     attempt: SendAttempt,
     requirePrepared = false,
+    preserveExistingOnFailure = false,
   ): Promise<ResponseHandoffWalRecord | null> {
     const wal = options.pendingInputWal
     if (!wal) return null
@@ -1590,7 +1591,7 @@ export function useChatSend(options: UseChatSendOptions) {
           record.walRevision,
           null,
         ).catch(() => {})
-      } else {
+      } else if (!preserveExistingOnFailure) {
         await wal.deleteHandoff?.(record.ownerRequestId).catch(() => {})
       }
       return null
@@ -1740,6 +1741,16 @@ export function useChatSend(options: UseChatSendOptions) {
     if (!options.pendingInputWal?.putHandoff) return
     gate.durableRecord = accepted
     await options.pendingInputWal.putHandoff(accepted).catch(() => {})
+  }
+
+  async function finalizeBackgroundResponseHandoff(
+    gate: ResponseHandoffGate,
+    acceptedSessionKey: string,
+  ): Promise<void> {
+    await markResponseHandoffAccepted(gate, acceptedSessionKey)
+    if (gate.durableRecord && await deleteResponseHandoff(gate.durableRecord)) {
+      gate.durableRecord = null
+    }
   }
 
   async function markResponseHandoffFailed(
@@ -3261,11 +3272,16 @@ export function useChatSend(options: UseChatSendOptions) {
       return true
     }
     let durableHandoffRecord: ResponseHandoffWalRecord | null = null
+    const preservesExistingReplayHandoff = Boolean(
+      sendOpts.idempotentReplay && retryAttempt?.requiresIdempotentReplay,
+    )
     const rejectBeforeDispatch = async (): Promise<ChatSendOutcome> => {
       if (attempt && sendOpts.acceptedVisibleReplay) {
         sendOpts.rememberRetryableAttempt?.(attempt)
       }
-      await discardUnsentResponseHandoff(durableHandoffRecord)
+      if (!preservesExistingReplayHandoff) {
+        await discardUnsentResponseHandoff(durableHandoffRecord)
+      }
       return 'not_sent'
     }
     if (!attempt) {
@@ -3374,6 +3390,7 @@ export function useChatSend(options: UseChatSendOptions) {
       durableHandoffRecord = await persistResponseHandoff(
         attempt,
         sendOpts.requirePreparedHandoff,
+        preservesExistingReplayHandoff,
       )
       if (sendOpts.requirePreparedHandoff && !durableHandoffRecord) {
         return rejectBeforeDispatch()
@@ -3523,13 +3540,24 @@ export function useChatSend(options: UseChatSendOptions) {
         responseOwnsVisibleTranscript = false
       }
       if (!responseOwnsVisibleTranscript) {
+        const acceptedSessionKey = res?.sessionKey || requestSessionKey
         const terminalStatus = terminalResponseStatus(res)
-        const accepted = noteAcceptedTask(res, requestSessionKey)
+        const taskId = acceptedTaskId(res)
+        // A fork receipt belongs to its child session. Never let an offscreen
+        // child claim the still-visible parent's busy/Stop ownership.
+        if (acceptedSessionKey === requestSessionKey) {
+          noteAcceptedTask(res, requestSessionKey)
+        }
         options.trackBackgroundReceiptTask?.(
           attempt.clientMessageId,
-          accepted.taskId,
+          taskId,
           Boolean(terminalStatus),
         )
+        if (responseHandoff) {
+          responseHandoff.acceptedTaskId = taskId
+          responseHandoff.terminalResponse = Boolean(terminalStatus)
+          await finalizeBackgroundResponseHandoff(responseHandoff, acceptedSessionKey)
+        }
         if (recoveredAttempt?.clientRequestId === attempt.clientRequestId) {
           recoveredAttempt = null
         }
@@ -3733,7 +3761,15 @@ export function useChatSend(options: UseChatSendOptions) {
       if (acceptedError) consumeAcceptedSessionIntent(attempt)
       if (acceptedError && !acceptedResponseOwnsVisibleTranscript) {
         attempt.acceptanceResolved = true
+        attempt.acceptedSessionKey = acceptedError.sessionKey || requestSessionKey
         options.trackBackgroundReceiptTask?.(attempt.clientMessageId, '', true)
+        if (responseHandoff) {
+          responseHandoff.terminalResponse = acceptedError.terminalWithoutTask
+          await finalizeBackgroundResponseHandoff(
+            responseHandoff,
+            attempt.acceptedSessionKey,
+          )
+        }
         if (!wasStreaming && freshSendToken && activeFreshSendToken === freshSendToken) {
           activeFreshSendToken = null
           options.activeStreamTaskId.value = ''

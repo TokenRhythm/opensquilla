@@ -2918,6 +2918,144 @@ describe('useChatSend attachment payloads', () => {
     expect(messageActions.cancelEdit()).toBe(true)
   })
 
+  it.each(['Escape', 'session switch'] as const)(
+    'retains an unknown fork handoff when %s invalidates its replay during the second write',
+    async (invalidation) => {
+      const {
+        sessionKey,
+        messages,
+        inputText,
+        pendingForkBeforeMessageId,
+        messageActions,
+      } = makeEditedMessageState('edited question')
+      let finishReplayHandoff!: () => void
+      let handoffWrites = 0
+      const baseWal = memoryHandoffWal()
+      const pendingInputWal: PendingInputWal = {
+        ...baseWal,
+        putHandoff: vi.fn(async (record) => {
+          handoffWrites += 1
+          if (handoffWrites === 2) {
+            await new Promise<void>(resolve => {
+              finishReplayHandoff = resolve
+            })
+          }
+          await baseWal.putHandoff?.(record)
+        }),
+      }
+      const rpc = {
+        call: vi.fn()
+          .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+          .mockResolvedValueOnce({
+            sessionKey: 'agent:main:webchat:child',
+            task_id: 'must-not-dispatch',
+          }),
+      }
+      const { api } = makeOptions({
+        rpc,
+        sessionKey,
+        messages,
+        inputText,
+        pendingForkBeforeMessageId,
+        pendingInputWal,
+        messageEditGeneration: messageActions.editGeneration,
+        messageEditActive: messageActions.editActive,
+        validateMessageEditOwner: messageActions.validateEditOwner,
+        commitMessageEdit: messageActions.commitEdit,
+        adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
+      })
+
+      await api.onSend()
+      const ownerRequestId = String(rpc.call.mock.calls[0]?.[1]?.clientRequestId)
+      const replay = api.onSend()
+      await vi.waitFor(() => expect(pendingInputWal.putHandoff).toHaveBeenCalledTimes(2))
+
+      if (invalidation === 'Escape') {
+        expect(messageActions.cancelEdit()).toBe(false)
+        expect(messageActions.editActive.value).toBe(false)
+      } else {
+        sessionKey.value = 'agent:main:webchat:new-draft'
+      }
+      finishReplayHandoff()
+      await replay
+
+      expect(rpc.call).toHaveBeenCalledOnce()
+      expect(await pendingInputWal.listHandoffs?.()).toEqual([
+        expect.objectContaining({
+          ownerRequestId,
+          state: 'submitting',
+        }),
+      ])
+    },
+  )
+
+  it.each([
+    ['resolved response', false],
+    ['accepted error', true],
+  ] as const)(
+    'keeps an offscreen fork child out of parent ownership and retires its WAL for an %s',
+    async (_label, acceptedError) => {
+      const parentSessionKey = 'agent:main:webchat:test'
+      const childSessionKey = 'agent:main:webchat:child'
+      const {
+        sessionKey,
+        messages,
+        inputText,
+        pendingForkBeforeMessageId,
+        messageActions,
+      } = makeEditedMessageState('edited question')
+      const pendingInputWal = memoryHandoffWal()
+      const taskOwnership = useChatTaskOwnership()
+      const adoptResponseSession = vi.fn()
+      const rpc = {
+        call: vi.fn()
+          .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+          .mockImplementationOnce(() => acceptedError
+            ? Promise.reject(Object.assign(new Error('accepted response was lost'), {
+                accepted: true,
+                details: {
+                  session_key: childSessionKey,
+                  orphan_message_id: 'child-user-message',
+                },
+              }))
+            : Promise.resolve({
+                sessionKey: childSessionKey,
+                task_id: 'task-child-receipt',
+              })),
+      }
+      const { api } = makeOptions({
+        rpc,
+        sessionKey,
+        messages,
+        inputText,
+        pendingForkBeforeMessageId,
+        pendingInputWal,
+        taskOwnership,
+        adoptResponseSession,
+        messageEditGeneration: messageActions.editGeneration,
+        messageEditActive: messageActions.editActive,
+        validateMessageEditOwner: messageActions.validateEditOwner,
+        commitMessageEdit: messageActions.commitEdit,
+        adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
+      })
+
+      await api.onSend()
+      inputText.value = 'newer edit owner'
+      pendingForkBeforeMessageId.value = 'msg-original'
+      await api.onSend()
+
+      expect(rpc.call).toHaveBeenCalledTimes(2)
+      expect(sessionKey.value).toBe(parentSessionKey)
+      expect(adoptResponseSession).not.toHaveBeenCalled()
+      expect(taskOwnership.runningTaskId.value).toBe('')
+      expect(taskOwnership.hasAuthoritativeWork.value).toBe(false)
+      expect(await pendingInputWal.listHandoffs?.()).toEqual([])
+      expect(inputText.value).toBe('newer edit owner')
+      expect(pendingForkBeforeMessageId.value).toBe('msg-original')
+      expect(messageActions.cancelEdit()).toBe(true)
+    },
+  )
+
   it.each([
     ['different text', 'new ordinary question'],
     ['the same text', 'later ordinary question'],

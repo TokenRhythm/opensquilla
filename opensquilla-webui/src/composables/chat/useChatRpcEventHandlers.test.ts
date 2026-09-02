@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { effectScope, nextTick, ref } from 'vue'
 import { useChatRpcEventHandlers, type ChatRpcStreamApi } from './useChatRpcEventHandlers'
 import { useChatMessageActions } from './useChatMessageActions'
+import { useChatTaskOwnership } from './useChatTaskOwnership'
 import type { SessionBootstrapRun } from './useChatSessionBootstrap'
 import type {
   ChatMessage,
@@ -38,6 +39,7 @@ function createHarness(options: {
   getCompactionPlacement?: (compactionId: string) => 'activity' | 'standalone' | undefined
   observeStreamGeneration?: (payload: unknown) => boolean
   supportsTurnCommitted?: boolean
+  taskOwnership?: ReturnType<typeof useChatTaskOwnership>
 } = {}) {
   const messages = ref<ChatMessage[]>(options.messages ?? [])
   const sessionKey = ref('agent:main:test')
@@ -79,6 +81,7 @@ function createHarness(options: {
   const markEnsembleHandoff = vi.fn()
   const bindRouterDecisionToModelCall = vi.fn()
   const queueRouterDecision = vi.fn()
+  const clearPendingRouterDecision = vi.fn()
   const schedulePendingDrainAfterTerminal = vi.fn()
   const scheduleHistorySync = vi.fn()
   const showCompactionToast = vi.fn()
@@ -121,7 +124,7 @@ function createHarness(options: {
     appendEnsembleProgress: vi.fn(),
     markEnsembleHandoff,
     flushPendingRouterDecision: vi.fn(),
-    clearPendingRouterDecision: vi.fn(),
+    clearPendingRouterDecision,
     handleRouterControlReplay: vi.fn(),
     showCompactionToast,
     getCompactionPlacement: options.getCompactionPlacement,
@@ -138,6 +141,7 @@ function createHarness(options: {
     handleSessionConnectionState,
     loadCurrentSessionUsage,
     refreshRunModePreference,
+    taskOwnership: options.taskOwnership,
   }))!
   const api = {
     ...rawApi,
@@ -163,6 +167,7 @@ function createHarness(options: {
     markEnsembleHandoff,
     bindRouterDecisionToModelCall,
     queueRouterDecision,
+    clearPendingRouterDecision,
     schedulePendingDrainAfterTerminal,
     scheduleHistorySync,
     showCompactionToast,
@@ -396,7 +401,7 @@ describe('useChatRpcEventHandlers decoded conversation ingress', () => {
       expect(harness.stream.startStreaming).not.toHaveBeenCalled()
       expect(harness.stream.appendDelta).not.toHaveBeenCalled()
       expect(harness.stream.endStreaming).not.toHaveBeenCalled()
-      expect(harness.applySessionRunState).toHaveBeenCalledOnce()
+      expect(harness.applySessionRunState).toHaveBeenCalledTimes(2)
       expect(harness.applySessionRunState).toHaveBeenCalledWith(expect.objectContaining({
         run_status: 'running',
         active_task: expect.objectContaining({ task_id: 'task-successor' }),
@@ -497,6 +502,64 @@ describe('useChatRpcEventHandlers decoded conversation ingress', () => {
       })
 
       expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+    } finally {
+      harness.stop()
+    }
+  })
+
+  it('settles run state and drains queued work once for a background receipt terminal', () => {
+    const taskOwnership = useChatTaskOwnership()
+    const harness = createHarness({
+      taskOwnership,
+      pendingQueue: [{
+        pendingUiId: 'pending-after-receipt',
+        text: 'send after the old receipt settles',
+        attachments: [],
+        intent: null,
+      }],
+    })
+    harness.stream.isStreaming.value = false
+    const deliver = (eventName: string, payload: Record<string, unknown>) => {
+      harness.api.onConversationEvent({
+        kind: 'conversation',
+        event: decodeConversationEvent(eventName, payload, {}),
+        payload,
+        meta: {},
+      })
+    }
+    try {
+      harness.api.beginBackgroundReceiptReplay('client-old-receipt')
+      deliver('task.running', {
+        session_key: 'agent:main:test',
+        task_id: 'task-old-receipt',
+        client_message_id: 'client-old-receipt',
+      })
+      expect(taskOwnership.hasAuthoritativeWork.value).toBe(true)
+
+      deliver('task.succeeded', {
+        session_key: 'agent:main:test',
+        task_id: 'task-old-receipt',
+        client_message_id: 'client-old-receipt',
+        status: 'succeeded',
+      })
+
+      expect(taskOwnership.hasAuthoritativeWork.value).toBe(false)
+      expect(harness.applySessionRunState).toHaveBeenLastCalledWith(expect.objectContaining({
+        run_status: 'idle',
+        last_task: expect.objectContaining({
+          task_id: 'task-old-receipt',
+          status: 'succeeded',
+        }),
+      }))
+      expect(harness.clearPendingRouterDecision).toHaveBeenCalledOnce()
+      expect(harness.schedulePendingDrainAfterTerminal).toHaveBeenCalledOnce()
+
+      deliver('session.event.turn_committed', {
+        session_key: 'agent:main:test',
+        task_id: 'task-old-receipt',
+        client_message_id: 'client-old-receipt',
+      })
+      expect(harness.schedulePendingDrainAfterTerminal).toHaveBeenCalledOnce()
     } finally {
       harness.stop()
     }

@@ -563,12 +563,12 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   function applyBackgroundReceiptContinuation(
     payload: SessionEventPayload,
     receiptTaskId: string,
-  ) {
+  ): boolean {
     const activeTask = (payload.active_task || payload.activeTask) as Record<string, unknown> | undefined
     const activeTaskId = activeTask
       ? String(activeTask.task_id || activeTask.taskId || activeTask.turn_id || activeTask.turnId || '').trim()
       : ''
-    if (!activeTask || !activeTaskId || activeTaskId === receiptTaskId) return
+    if (!activeTask || !activeTaskId || activeTaskId === receiptTaskId) return false
     const activeStatus = String(activeTask?.status || '').trim().toLowerCase()
     if (activeStatus === 'queued') options.taskOwnership?.noteQueued(activeTask)
     else options.taskOwnership?.noteRunning({ ...activeTask, status: activeStatus || 'running' })
@@ -583,6 +583,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     delete continuation.lastTask
     delete continuation.status
     handleRpcSessionsChanged(continuation)
+    return true
   }
 
   function suppressBackgroundReceiptEvent(
@@ -594,6 +595,12 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     const identity = matchingBackgroundReceiptIdentity(payload)
     if (!identity) return false
     const { clientMessageId: owner, taskId } = identity
+    const terminalEvent = eventKind === 'sessions-changed'
+      ? sessionChangeIsTerminal(payload)
+      : isTerminalEvent(eventKind)
+    const terminalWasAlreadySeen = [...backgroundReceiptTasks.values()].some(task => (
+      task.clientMessageId === owner && task.terminalSeen
+    ))
     // A matching lifecycle frame can beat the replay ACK. Bind only the exact
     // client-message owner: unrelated same-session tasks from another tab must
     // remain visible and must never enter this quarantine.
@@ -602,12 +609,9 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       options.taskOwnership?.noteQueued({ ...payload, status: 'queued' })
     } else if (eventKind === 'task-running') {
       options.taskOwnership?.noteRunning({ ...payload, status: 'running' })
-    } else if (
-      eventKind === 'sessions-changed'
-        ? sessionChangeIsTerminal(payload)
-        : isTerminalEvent(eventKind)
-    ) {
+    } else if (terminalEvent) {
       options.taskOwnership?.noteTerminal(taskId)
+      markTaskSettled(payload)
       rememberBackgroundReceiptTask(owner, taskId, true)
       if (!reconciledBackgroundReceiptClientIds.has(owner)) {
         dirtyBackgroundReceiptClientIds.add(owner)
@@ -618,8 +622,36 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     // (done -> sessions.changed -> task.* / turn.committed). For a terminal
     // session projection, retain an unrelated successor task without allowing
     // the receipt's history sync to replace the newer Edit transcript.
-    if (eventKind === 'sessions-changed') {
-      applyBackgroundReceiptContinuation(payload, taskId)
+    const hasContinuation = eventKind === 'sessions-changed'
+      && applyBackgroundReceiptContinuation(payload, taskId)
+    if (
+      terminalEvent
+      && !terminalWasAlreadySeen
+      && !hasContinuation
+      && activeTaskGroups.value.size === 0
+      && !options.taskOwnership?.hasAuthoritativeWork.value
+    ) {
+      const terminalTask = terminalSessionChangeTask(payload)
+      const rawStatus = String(
+        terminalTask?.status || payload.status || payload.task_status || '',
+      ).trim().toLowerCase()
+      const failed = rawStatus === 'failed' || eventKind === 'task-failed' || eventKind === 'turn-failed'
+      const interrupted = ['cancelled', 'abandoned', 'interrupted'].includes(rawStatus)
+      if (!stream.isStreaming.value) {
+        clearLiveThinking()
+        options.clearPendingRouterDecision()
+      }
+      options.applySessionRunState({
+        run_status: failed ? 'failed' : interrupted ? 'cancelled' : 'idle',
+        last_task: {
+          ...(terminalTask || payload),
+          task_id: taskId,
+          status: rawStatus || (failed ? 'failed' : 'succeeded'),
+        },
+      })
+      if (pendingQueue.value.length > 0 && !interrupted) {
+        options.schedulePendingDrainAfterTerminal()
+      }
     }
     return true
   }
