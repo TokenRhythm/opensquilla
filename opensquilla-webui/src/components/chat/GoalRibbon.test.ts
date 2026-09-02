@@ -77,6 +77,10 @@ async function openActions(host: HTMLElement) {
   await nextTick()
 }
 
+function openMenu(host: HTMLElement) {
+  host.querySelector<HTMLButtonElement>('button[aria-label="Goal actions"]')?.click()
+}
+
 afterEach(() => {
   for (const app of mountedApps.splice(0)) app.unmount()
   document.body.innerHTML = ''
@@ -414,6 +418,34 @@ describe('GoalRibbon', () => {
     expect(host.textContent).toContain('Finalizing result')
     expect(host.querySelector('[data-testid="goal-lifecycle-action"]')).toBeNull()
     expect(host.querySelector('[aria-haspopup="menu"]')).toBeNull()
+  })
+
+  it('keeps the overflow menu reachable on a settled complete Goal', async () => {
+    const onClear = vi.fn()
+    const host = mountRibbon({
+      goal: goal({ status: 'complete', activeTaskId: null, executionState: 'idle' }),
+      onClear,
+    })
+
+    expect(host.textContent).not.toContain('Finalizing result')
+    const trigger = host.querySelector<HTMLButtonElement>('button[aria-label="Goal actions"]')
+    expect(trigger).not.toBeNull()
+    await openActions(host)
+    const items = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+    expect(items.map(item => item.textContent?.trim())).toEqual(['Edit goal', 'Remove goal'])
+    items[1]?.click()
+    expect(onClear).toHaveBeenCalledOnce()
+  })
+
+  it('does not reopen the overflow menu when a complete Goal is still settling', async () => {
+    const host = mountRibbon({
+      goal: goal({ status: 'complete', activeTaskId: 'task-1', executionState: 'working' }),
+    })
+
+    expect(host.querySelector('button[aria-label="Goal actions"]')).toBeNull()
+    openMenu(host)
+    await nextTick()
+    expect(host.querySelector('[role="menu"]')).toBeNull()
   })
 
   it('uses touch-sized actions on narrow layouts', () => {
