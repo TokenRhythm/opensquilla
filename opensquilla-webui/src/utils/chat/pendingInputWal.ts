@@ -84,10 +84,16 @@ export interface PendingInputWal {
   list: (sessionKey: string) => Promise<PendingInputWalRecord[]>
   delete: (pendingInputId: string) => Promise<void>
   putMany?: (records: PendingInputWalRecord[]) => Promise<void>
+  /** Convert one cancelling tombstone into a retained local draft only while its exact WAL revision still owns the row. */
+  retainCancelled?: (
+    record: PendingInputWalRecord,
+    expectedWalRevision: number,
+  ) => Promise<PendingInputWalRecord | null>
   commitOrder?: (
     sessionKey: string,
     orderedIds: string[],
     expectedWalRevisions: Record<string, number>,
+    equivalentSessionKeys?: string[],
   ) => Promise<PendingInputOrderCommit>
   putHandoff?: (record: ResponseHandoffWalRecord) => Promise<void>
   /** Atomically create a handoff without replacing another dispatcher's record. */
@@ -323,6 +329,38 @@ class BrowserPendingInputWal implements PendingInputWal {
     await transactionDone(transaction)
   }
 
+  async retainCancelled(
+    record: PendingInputWalRecord,
+    expectedWalRevision: number,
+  ): Promise<PendingInputWalRecord | null> {
+    const database = await this.database()
+    const transaction = database.transaction(STORE_NAME, 'readwrite')
+    const store = transaction.objectStore(STORE_NAME)
+    const raw = await requestResult(store.get(record.pendingInputId))
+    if (
+      !isPendingInputWalRecord(raw)
+      || raw.sessionKey !== record.sessionKey
+      || raw.clientRequestId !== record.clientRequestId
+      || raw.clientMessageId !== record.clientMessageId
+      || raw.state !== 'cancelling'
+      || raw.retainAfterCancel !== true
+      || (raw.walRevision ?? 1) !== expectedWalRevision
+    ) {
+      await transactionDone(transaction)
+      return null
+    }
+    const retained = cloneRecord({
+      ...record,
+      state: 'local_only',
+      retainAfterCancel: true,
+      walRevision: expectedWalRevision + 1,
+      updatedAt: Date.now(),
+    })
+    store.put(retained)
+    await transactionDone(transaction)
+    return retained
+  }
+
   async list(sessionKey: string): Promise<PendingInputWalRecord[]> {
     const database = await this.database()
     const transaction = database.transaction(STORE_NAME, 'readonly')
@@ -348,17 +386,16 @@ class BrowserPendingInputWal implements PendingInputWal {
     sessionKey: string,
     orderedIds: string[],
     expectedWalRevisions: Record<string, number>,
+    equivalentSessionKeys: string[] = [],
   ): Promise<PendingInputOrderCommit> {
     const database = await this.database()
     const transaction = database.transaction(STORE_NAME, 'readwrite')
     const store = transaction.objectStore(STORE_NAME)
-    const index = store.index('session_created')
-    const range = IDBKeyRange.bound(
-      [sessionKey, Number.MIN_SAFE_INTEGER],
-      [sessionKey, Number.MAX_SAFE_INTEGER],
-    )
-    const raw = await requestResult(index.getAll(range))
-    const records = (raw as unknown[]).filter(isPendingInputWalRecord)
+    const raw = await requestResult(store.getAll())
+    const sessionKeys = new Set([sessionKey, ...equivalentSessionKeys])
+    const records = (raw as unknown[])
+      .filter(isPendingInputWalRecord)
+      .filter(record => sessionKeys.has(record.sessionKey))
     const byId = new Map(records.map(record => [record.pendingInputId, record]))
     if (
       orderedIds.length !== records.length
@@ -377,6 +414,7 @@ class BrowserPendingInputWal implements PendingInputWal {
       }
       const next = cloneRecord({
         ...record,
+        sessionKey,
         position,
         walRevision: currentRevision + 1,
         updatedAt: Date.now(),

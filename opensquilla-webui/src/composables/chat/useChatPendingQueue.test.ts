@@ -115,12 +115,35 @@ function memoryWal(initial: PendingInputWalRecord[] = []) {
         records.set(record.pendingInputId, structuredClone(record))
       }
     }),
+    retainCancelled: vi.fn(async (record, expectedWalRevision) => {
+      const current = records.get(record.pendingInputId)
+      if (
+        !current
+        || current.sessionKey !== record.sessionKey
+        || current.clientRequestId !== record.clientRequestId
+        || current.clientMessageId !== record.clientMessageId
+        || current.state !== 'cancelling'
+        || current.retainAfterCancel !== true
+        || (current.walRevision ?? 1) !== expectedWalRevision
+      ) return null
+      const retained = {
+        ...structuredClone(record),
+        state: 'local_only' as const,
+        retainAfterCancel: true,
+        walRevision: expectedWalRevision + 1,
+        updatedAt: Date.now(),
+      }
+      records.set(record.pendingInputId, retained)
+      return structuredClone(retained)
+    }),
     commitOrder: vi.fn(async (
       sessionKey: string,
       orderedIds: string[],
       expectedWalRevisions: Record<string, number>,
+      equivalentSessionKeys: string[] = [],
     ) => {
-      const current = [...records.values()].filter(record => record.sessionKey === sessionKey)
+      const sessionKeys = new Set([sessionKey, ...equivalentSessionKeys])
+      const current = [...records.values()].filter(record => sessionKeys.has(record.sessionKey))
       if (
         current.length !== orderedIds.length
         || orderedIds.some(id => !current.some(record => record.pendingInputId === id))
@@ -131,6 +154,7 @@ function memoryWal(initial: PendingInputWalRecord[] = []) {
         if (expectedWalRevisions[pendingInputId] !== revision) throw new Error('conflict')
         const next = {
           ...record,
+          sessionKey,
           position,
           walRevision: revision + 1,
           updatedAt: Date.now(),
@@ -1110,6 +1134,72 @@ describe('useChatPendingQueue delivery state', () => {
     }
   })
 
+  it('does not rewrite a retained WAL row after a peer removes it', async () => {
+    vi.stubGlobal(
+      'BroadcastChannel',
+      TestBroadcastChannel as unknown as typeof BroadcastChannel,
+    )
+    const { wal, records } = memoryWal()
+    const first = makeQueue(
+      undefined,
+      () => false,
+      undefined,
+      undefined,
+      { pendingInputWal: wal, hasRpcMethod: () => false },
+    )
+    const second = makeQueue(
+      undefined,
+      () => false,
+      undefined,
+      undefined,
+      { pendingInputWal: wal, hasRpcMethod: () => false },
+    )
+    try {
+      first.inputText.value = 'peer removal wins'
+      await expect(first.queue.enqueuePendingInput(first.inputText.value)).resolves.toBe(true)
+      await vi.waitFor(() => {
+        expect(first.queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('local_only')
+      })
+      await second.queue.hydratePendingQueue()
+
+      const pendingId = first.queue.pendingQueue.value[0]!.pendingInputId!
+      const retainCancelled = wal.retainCancelled!
+      let releaseRetainedWrite!: () => void
+      let markRetainedWriteStarted!: () => void
+      const retainedWriteStarted = new Promise<void>(resolve => {
+        markRetainedWriteStarted = resolve
+      })
+      const retainedWriteGate = new Promise<void>(resolve => { releaseRetainedWrite = resolve })
+      wal.retainCancelled = vi.fn(async (record, expectedWalRevision) => {
+        if (record.pendingInputId === pendingId) {
+          markRetainedWriteStarted()
+          await retainedWriteGate
+        }
+        return retainCancelled(record, expectedWalRevision)
+      })
+
+      expect(first.queue.editPendingItem(pendingUiId(first.queue, 0))).toBe(true)
+      await retainedWriteStarted
+      expect(second.queue.removePendingChip(pendingUiId(second.queue, 0))).toBe(true)
+      await vi.waitFor(() => {
+        expect(first.queue.pendingQueue.value).toEqual([])
+        expect(second.queue.pendingQueue.value).toEqual([])
+        expect(records.size).toBe(0)
+      })
+
+      releaseRetainedWrite()
+      await vi.waitFor(() => expect(records.size).toBe(0))
+      expect(first.inputText.value).toBe('')
+      await first.queue.hydratePendingQueue()
+      expect(first.queue.pendingQueue.value).toEqual([])
+    } finally {
+      first.queue.cleanup()
+      second.queue.cleanup()
+      vi.unstubAllGlobals()
+      TestBroadcastChannel.channels.clear()
+    }
+  })
+
   it('resolves a queued action by stable UI identity after a peer deletion shifts indexes', async () => {
     const { inputText, queue } = makeQueue()
     inputText.value = 'peer removes this first row'
@@ -1130,6 +1220,82 @@ describe('useChatPendingQueue delivery state', () => {
       expect(inputText.value).toBe('edit this surviving row')
     })
     queue.cleanup()
+  })
+
+  it('restores multiple durable drafts in queue order when cancellation resolves in reverse', async () => {
+    const { wal } = memoryWal()
+    const writeWal = wal.put
+    const cancellationReleases = new Map<string, () => void>()
+    let markBothStarted!: () => void
+    const bothStarted = new Promise<void>(resolve => { markBothStarted = resolve })
+    wal.put = vi.fn(async record => {
+      if (record.state === 'cancelling') {
+        await new Promise<void>(resolve => {
+          cancellationReleases.set(record.pendingInputId, resolve)
+          if (cancellationReleases.size === 2) markBothStarted()
+        })
+      }
+      await writeWal(record)
+    })
+    const {
+      inputText,
+      pendingAttachments,
+      pendingSessionIntent,
+      queue,
+    } = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      hasRpcMethod: () => false,
+    })
+    try {
+      inputText.value = 'A'
+      pendingAttachments.value = [{
+        kind: 'staged',
+        local_id: 281,
+        name: 'A.txt',
+        mime: 'text/plain',
+        file_uuid: 'upload-A',
+      }]
+      pendingSessionIntent.value = 'intent:A'
+      await expect(queue.enqueuePendingInput(inputText.value)).resolves.toBe(true)
+
+      inputText.value = 'B'
+      pendingAttachments.value = [{
+        kind: 'staged',
+        local_id: 282,
+        name: 'B.txt',
+        mime: 'text/plain',
+        file_uuid: 'upload-B',
+      }]
+      pendingSessionIntent.value = 'intent:B'
+      await expect(queue.enqueuePendingInput(inputText.value)).resolves.toBe(true)
+      await vi.waitFor(() => expect(queue.pendingQueue.value.every(item => (
+        item.pendingPersistenceState === 'local_only'
+      ))).toBe(true))
+      const [firstId, secondId] = queue.pendingQueue.value.map(item => item.pendingInputId!)
+
+      expect(queue.popAllPendingIntoComposer()).toBe(true)
+      await bothStarted
+      cancellationReleases.get(secondId)?.()
+      await vi.waitFor(() => {
+        expect(queue.pendingQueue.value.find(item => item.pendingInputId === secondId))
+          .toMatchObject({ pendingPersistenceState: 'local_only' })
+      })
+      expect(inputText.value).toBe('')
+      expect(pendingAttachments.value).toEqual([])
+
+      cancellationReleases.get(firstId)?.()
+      await vi.waitFor(() => {
+        expect(inputText.value).toBe('A\nB')
+        expect(queue.pendingQueue.value).toEqual([])
+      })
+      expect(pendingAttachments.value.map(attachment => attachment.name)).toEqual([
+        'A.txt',
+        'B.txt',
+      ])
+      expect(pendingSessionIntent.value).toBe('intent:A')
+    } finally {
+      queue.cleanup()
+    }
   })
 
   it.each([
@@ -1369,6 +1535,74 @@ describe('useChatPendingQueue delivery state', () => {
     }
   })
 
+  it('deduplicates reconnect cancellation while a durable draft is returning to the composer', async () => {
+    const { wal, records } = memoryWal()
+    let serverRow: Awaited<ReturnType<PendingInputQueuePort['list']>>[number] | null = null
+    let releaseCancel!: () => void
+    let markCancelStarted!: () => void
+    const cancelStarted = new Promise<void>(resolve => { markCancelStarted = resolve })
+    const cancelGate = new Promise<void>(resolve => { releaseCancel = resolve })
+    const pendingInputQueue: PendingInputQueuePort = {
+      supportsQueue: () => true,
+      supportsReorder: () => false,
+      enqueue: vi.fn(async request => {
+        serverRow = {
+          pendingInputId: request.pendingInputId,
+          clientRequestId: request.clientRequestId || 'request-reconnect',
+          clientMessageId: request.clientMessageId || 'message-reconnect',
+          message: request.message,
+          displayText: request.displayText,
+          position: 0,
+          revision: 1,
+          requestFingerprint: 'fingerprint-reconnect',
+        }
+        return {
+          requestFingerprint: 'fingerprint-reconnect',
+          revision: 1,
+          position: 0,
+        }
+      }),
+      list: vi.fn(async () => serverRow ? [serverRow] : []),
+      cancel: vi.fn(async () => {
+        markCancelStarted()
+        await cancelGate
+        serverRow = null
+      }),
+      reorder: vi.fn(async () => ({ items: [] })),
+    }
+    const { inputText, queue } = makeQueue(
+      undefined,
+      () => false,
+      undefined,
+      undefined,
+      { pendingInputWal: wal, pendingInputQueue },
+    )
+    try {
+      inputText.value = 'restore once after reconnect'
+      await expect(queue.enqueuePendingInput(inputText.value)).resolves.toBe(true)
+      await vi.waitFor(() => {
+        expect(queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('staged')
+      })
+
+      expect(queue.editPendingItem(pendingUiId(queue, 0))).toBe(true)
+      await cancelStarted
+      await queue.hydratePendingQueue()
+      expect(pendingInputQueue.cancel).toHaveBeenCalledTimes(1)
+
+      releaseCancel()
+      await vi.waitFor(() => {
+        expect(inputText.value).toBe('restore once after reconnect')
+        expect(queue.pendingQueue.value).toEqual([])
+        expect(records.size).toBe(0)
+      })
+      await queue.hydratePendingQueue()
+      expect(queue.pendingQueue.value).toEqual([])
+      expect(pendingInputQueue.cancel).toHaveBeenCalledTimes(1)
+    } finally {
+      queue.cleanup()
+    }
+  })
+
   it('hydrates and parks a legacy alias WAL row under its canonical queue owner', async () => {
     const legacySession = 'agent:default:webchat:alias-draft'
     const canonicalSession = 'agent:main:webchat:alias-draft'
@@ -1419,6 +1653,80 @@ describe('useChatPendingQueue delivery state', () => {
       }])
     } finally {
       queue.cleanup()
+    }
+  })
+
+  it('atomically reorders legacy alias and canonical WAL rows under the canonical owner', async () => {
+    const legacySession = 'agent:default:webchat:alias-reorder'
+    const canonicalSession = 'agent:main:webchat:alias-reorder'
+    const baseRecord = {
+      schemaVersion: 1 as const,
+      attachments: [],
+      intent: null,
+      state: 'local_only' as const,
+      mayHaveServerCopy: false,
+      walRevision: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    const { wal, records } = memoryWal([
+      {
+        ...baseRecord,
+        pendingInputId: 'pending-legacy-first',
+        sessionKey: legacySession,
+        clientRequestId: 'request-legacy-first',
+        clientMessageId: 'message-legacy-first',
+        text: 'legacy first',
+        position: 0,
+      },
+      {
+        ...baseRecord,
+        pendingInputId: 'pending-canonical-second',
+        sessionKey: canonicalSession,
+        clientRequestId: 'request-canonical-second',
+        clientMessageId: 'message-canonical-second',
+        text: 'canonical second',
+        position: 1,
+      },
+    ])
+    const first = makeQueue(undefined, () => false, undefined, undefined, {
+      sessionKey: ref(canonicalSession),
+      pendingInputWal: wal,
+      hasRpcMethod: () => false,
+    })
+    await vi.waitFor(() => {
+      expect(first.queue.pendingQueue.value.map(item => item.text)).toEqual([
+        'legacy first',
+        'canonical second',
+      ])
+    })
+
+    expect(first.queue.beginPendingReorder(1)).toBe(true)
+    expect(first.queue.reorderPendingItem(1, 0)).toBe(true)
+    await first.queue.endPendingReorder()
+    expect(first.queue.pendingQueue.value.map(item => item.text)).toEqual([
+      'canonical second',
+      'legacy first',
+    ])
+    expect([...records.values()].every(record => (
+      record.sessionKey === canonicalSession
+    ))).toBe(true)
+    first.queue.cleanup()
+
+    const reloaded = makeQueue(undefined, () => false, undefined, undefined, {
+      sessionKey: ref(canonicalSession),
+      pendingInputWal: wal,
+      hasRpcMethod: () => false,
+    })
+    try {
+      await vi.waitFor(() => {
+        expect(reloaded.queue.pendingQueue.value.map(item => item.text)).toEqual([
+          'canonical second',
+          'legacy first',
+        ])
+      })
+    } finally {
+      reloaded.queue.cleanup()
     }
   })
 

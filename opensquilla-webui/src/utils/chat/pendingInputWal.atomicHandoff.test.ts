@@ -269,7 +269,112 @@ class ControlledObjectStore {
   }
 }
 
-describe('BrowserPendingInputWal atomic handoff cancellation', () => {
+describe('BrowserPendingInputWal atomic mutations', () => {
+  it('does not retain a cancelled draft after another owner deletes its WAL row', async () => {
+    const factory = new ControlledIdbFactory()
+    const wal = createPendingInputWal(factory.idbFactory)
+    expect(wal).not.toBeNull()
+    const cancelling: PendingInputWalRecord = {
+      schemaVersion: 1,
+      pendingInputId: 'pending-retain-cas',
+      sessionKey: 'agent:main:webchat:retain-cas',
+      clientRequestId: 'request-retain-cas',
+      clientMessageId: 'message-retain-cas',
+      text: 'retain only while this tombstone owns the row',
+      attachments: [],
+      intent: null,
+      state: 'cancelling',
+      mayHaveServerCopy: false,
+      retainAfterCancel: true,
+      walRevision: 2,
+      createdAt: 1,
+      updatedAt: 2,
+    }
+    const retained = {
+      ...cancelling,
+      state: 'local_only' as const,
+      walRevision: 3,
+    }
+    await wal!.put(cancelling)
+    await wal!.delete(cancelling.pendingInputId)
+
+    await expect(wal!.retainCancelled!(retained, 2)).resolves.toBeNull()
+    expect(factory.record(PENDING_STORE, cancelling.pendingInputId)).toBeUndefined()
+
+    await wal!.put(cancelling)
+    await expect(wal!.retainCancelled!(retained, 2)).resolves.toMatchObject({
+      state: 'local_only',
+      retainAfterCancel: true,
+      walRevision: 3,
+    })
+    expect(factory.record(PENDING_STORE, cancelling.pendingInputId)).toMatchObject({
+      state: 'local_only',
+      walRevision: 3,
+    })
+    wal!.close()
+  })
+
+  it('commits equivalent legacy session aliases under the canonical reorder owner', async () => {
+    const factory = new ControlledIdbFactory()
+    const wal = createPendingInputWal(factory.idbFactory)
+    expect(wal).not.toBeNull()
+    const canonicalSession = 'agent:main:webchat:alias-order'
+    const legacySession = 'agent:default:webchat:alias-order'
+    const record = (
+      pendingInputId: string,
+      sessionKey: string,
+      text: string,
+      position: number,
+    ): PendingInputWalRecord => ({
+      schemaVersion: 1,
+      pendingInputId,
+      sessionKey,
+      clientRequestId: `request-${pendingInputId}`,
+      clientMessageId: `message-${pendingInputId}`,
+      text,
+      attachments: [],
+      intent: null,
+      state: 'local_only',
+      mayHaveServerCopy: false,
+      position,
+      walRevision: 1,
+      createdAt: position + 1,
+      updatedAt: position + 1,
+    })
+    const legacy = record('legacy-row', legacySession, 'legacy', 0)
+    const canonical = record('canonical-row', canonicalSession, 'canonical', 1)
+    await wal!.put(legacy)
+    await wal!.put(canonical)
+
+    const result = await wal!.commitOrder!(
+      canonicalSession,
+      ['canonical-row', 'legacy-row'],
+      { 'legacy-row': 1, 'canonical-row': 1 },
+      [canonicalSession, legacySession],
+    )
+
+    expect(result.records).toMatchObject([
+      {
+        pendingInputId: 'canonical-row',
+        sessionKey: canonicalSession,
+        position: 0,
+        walRevision: 2,
+      },
+      {
+        pendingInputId: 'legacy-row',
+        sessionKey: canonicalSession,
+        position: 1,
+        walRevision: 2,
+      },
+    ])
+    expect(factory.record(PENDING_STORE, 'legacy-row')).toMatchObject({
+      sessionKey: canonicalSession,
+      position: 1,
+      walRevision: 2,
+    })
+    wal!.close()
+  })
+
   it('rolls back both stores when the handoff epoch aborts after both writes are queued', async () => {
     const factory = new ControlledIdbFactory()
     const wal = createPendingInputWal(factory.idbFactory)

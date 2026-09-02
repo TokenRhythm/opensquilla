@@ -204,6 +204,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   let disposed = false
   const stagingOperations = new Map<string, Promise<void>>()
   const cancellationOperations = new Map<string, Promise<boolean>>()
+  const cancellationInvalidations = new Map<string, number>()
   const locallyCreatingIds = new Set<string>()
   const removedIdentityOrder: string[] = []
   const removedIdentities = new Set<string>()
@@ -382,6 +383,13 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
 
   function forgetRemoval(sessionKey: string, pendingInputId: string) {
     removedIdentities.delete(removedIdentity(sessionKey, pendingInputId))
+  }
+
+  function invalidateCancellation(pendingInputId: string) {
+    cancellationInvalidations.set(
+      pendingInputId,
+      (cancellationInvalidations.get(pendingInputId) ?? 0) + 1,
+    )
   }
 
   function removePendingIdentity(sessionKey: string, pendingInputId: string) {
@@ -776,7 +784,12 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         const clientRequestId = serverItem.clientRequestId
         const clientMessageId = serverItem.clientMessageId
         if (wasRemoved(ownerSessionKey, pendingInputId)) {
-          void cancelServerIdentity(ownerSessionKey, pendingInputId).catch(() => {})
+          const cancellingItem = pendingQueue.value.find(candidate => (
+            candidate.pendingInputId === pendingInputId
+            && candidate.pendingPersistenceState === 'cancelling'
+          ))
+          if (cancellingItem) void retryCancellingItem(cancellingItem)
+          else void cancelServerIdentity(ownerSessionKey, pendingInputId).catch(() => {})
           continue
         }
         serverIds.add(pendingInputId)
@@ -887,6 +900,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         : ''
       if (!sessionKey) return
       if (message?.action === 'removed' && pendingInputId) {
+        invalidateCancellation(pendingInputId)
         rememberRemoval(sessionKey, pendingInputId)
         removePendingIdentity(sessionKey, pendingInputId)
         void options.pendingInputWal?.delete(pendingInputId).catch(() => {})
@@ -1111,6 +1125,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   ): Promise<void> {
     if (!options.pendingInputWal || !item.pendingInputId) return
     const sessionKey = queueSessionKey(item.ownerSessionKey)
+    if (action === 'removed') invalidateCancellation(item.pendingInputId)
     await options.pendingInputWal.delete(item.pendingInputId)
     if (action === 'removed') rememberRemoval(sessionKey, item.pendingInputId)
     broadcastChange(sessionKey, item.pendingInputId, action)
@@ -1119,7 +1134,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   async function retainCancelledDraft(
     item: ChatPendingItem,
     sessionKey: string,
+    expectedInvalidation: number,
   ): Promise<boolean> {
+    if ((cancellationInvalidations.get(item.pendingInputId!) ?? 0) !== expectedInvalidation) {
+      return false
+    }
     const previousMayHaveServerCopy = item.pendingMayHaveServerCopy
     const previousFingerprint = item.pendingRequestFingerprint
     const previousServerRevision = item.pendingServerRevision
@@ -1130,7 +1149,28 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     delete item.pendingServerRevision
     delete item.pendingPosition
     try {
-      await writeWalItem(item, 'local_only')
+      if (options.pendingInputWal?.retainCancelled) {
+        const expectedWalRevision = item.pendingWalRevision ?? 1
+        const retained = await options.pendingInputWal.retainCancelled(
+          {
+            ...walRecordForItem(item, 'local_only'),
+            walRevision: expectedWalRevision + 1,
+          },
+          expectedWalRevision,
+        )
+        if (!retained) {
+          removePendingIdentity(sessionKey, item.pendingInputId!)
+          return false
+        }
+        item.pendingPersistenceState = retained.state
+        item.pendingWalRevision = retained.walRevision
+      } else {
+        await writeWalItem(item, 'local_only')
+      }
+      if ((cancellationInvalidations.get(item.pendingInputId!) ?? 0) !== expectedInvalidation) {
+        await options.pendingInputWal?.delete(item.pendingInputId!).catch(() => {})
+        return false
+      }
       broadcastChange(sessionKey, item.pendingInputId, 'changed')
       return true
     } catch {
@@ -1144,7 +1184,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     }
   }
 
-  async function cancelDurableItem(
+  async function performDurableCancellation(
     item: ChatPendingItem,
     cancelOptions: PendingCancelOptions = {},
   ): Promise<boolean> {
@@ -1152,6 +1192,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const previousState = item.pendingPersistenceState || 'saving'
     const sessionKey = queueSessionKey(item.ownerSessionKey)
     const retainAfterCancel = cancelOptions.retainAfterCancel === true
+    const expectedInvalidation = cancellationInvalidations.get(item.pendingInputId!) ?? 0
     if (item.pendingRetainAfterCancel === true && !retainAfterCancel) {
       try {
         await forgetDurableItem(item, 'removed')
@@ -1187,7 +1228,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         return false
       }
       try {
-        if (retainAfterCancel) return retainCancelledDraft(item, sessionKey)
+        if (retainAfterCancel) {
+          return retainCancelledDraft(item, sessionKey, expectedInvalidation)
+        }
         await forgetDurableItem(item, 'removed')
         return true
       } catch {
@@ -1211,7 +1254,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           ? { expectedRevision: item.pendingServerRevision }
           : {}),
       })
-      if (retainAfterCancel) return retainCancelledDraft(item, sessionKey)
+      if (retainAfterCancel) {
+        return retainCancelledDraft(item, sessionKey, expectedInvalidation)
+      }
       await forgetDurableItem(item, 'removed')
       return true
     } catch {
@@ -1223,14 +1268,29 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     }
   }
 
+  function cancelDurableItem(
+    item: ChatPendingItem,
+    cancelOptions: PendingCancelOptions = {},
+  ): Promise<boolean> {
+    const pendingInputId = item.pendingInputId
+    if (!pendingInputId || !options.pendingInputWal) return Promise.resolve(true)
+    const existing = cancellationOperations.get(pendingInputId)
+    if (existing) return existing
+    const operation = performDurableCancellation(item, cancelOptions).finally(() => {
+      if (cancellationOperations.get(pendingInputId) === operation) {
+        cancellationOperations.delete(pendingInputId)
+      }
+    })
+    cancellationOperations.set(pendingInputId, operation)
+    return operation
+  }
+
   function retryCancellingItem(item: ChatPendingItem): Promise<boolean> {
     const pendingInputId = item.pendingInputId
     if (!pendingInputId || item.pendingPersistenceState !== 'cancelling') {
       return Promise.resolve(false)
     }
-    const existing = cancellationOperations.get(pendingInputId)
-    if (existing) return existing
-    const operation = cancelDurableItem(item, {
+    return cancelDurableItem(item, {
       retainAfterCancel: item.pendingRetainAfterCancel === true,
     }).then(cancelled => {
       if (!cancelled) return false
@@ -1243,11 +1303,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         pendingInputId,
       )
       return true
-    }).finally(() => {
-      cancellationOperations.delete(pendingInputId)
     })
-    cancellationOperations.set(pendingInputId, operation)
-    return operation
   }
 
   function pendingIndex(pendingUiId: string): number {
@@ -1626,6 +1682,40 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     })
   }
 
+  function restoreDurableItemsIntoComposerInOrder(
+    items: ChatPendingItem[],
+    restore: (item: ChatPendingItem) => void,
+    lease: {
+      ownerSessionKey: string
+      queueLease: number
+      composerRevision: number
+    },
+  ) {
+    void Promise.all(items.map(item => (
+      cancelDurableItem(item, { retainAfterCancel: true })
+    ))).then(retainedItems => {
+      if (
+        disposed
+        || queueSessionKey() !== lease.ownerSessionKey
+        || activeQueueLease !== lease.queueLease
+        || composerRevision !== lease.composerRevision
+      ) return
+      for (const [index, item] of items.entries()) {
+        if (
+          !retainedItems[index]
+          || queueSessionKey(item.ownerSessionKey) !== lease.ownerSessionKey
+        ) continue
+        const queueIndex = pendingQueue.value.indexOf(item)
+        if (queueIndex < 0) continue
+        pendingQueue.value.splice(queueIndex, 1)
+        restore(item)
+        lease.composerRevision = composerRevision
+        // Each retained row is removed only after its ordered composer commit.
+        void cancelDurableItem(item)
+      }
+    })
+  }
+
   function editPendingItem(pendingUiId: string): boolean {
     const index = pendingIndex(pendingUiId)
     const item = pendingQueue.value[index]
@@ -1743,22 +1833,20 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       queueLease: activeQueueLease,
       composerRevision,
     }
-    for (const item of durable) {
-      restoreDurableItemIntoComposer(item, () => {
-        options.inputText.value = [options.inputText.value, item.text]
-          .filter(Boolean)
-          .join('\n')
-        options.pendingAttachments.value = [
-          ...options.pendingAttachments.value,
-          ...(item.attachments || []),
-        ]
-        options.pendingSessionIntent.value = (
-          options.pendingSessionIntent.value || item.intent || null
-        )
-        options.autoResizeTextarea()
-        options.resetInputHistory()
-      }, restoreLease)
-    }
+    restoreDurableItemsIntoComposerInOrder(durable, item => {
+      options.inputText.value = [options.inputText.value, item.text]
+        .filter(Boolean)
+        .join('\n')
+      options.pendingAttachments.value = [
+        ...options.pendingAttachments.value,
+        ...(item.attachments || []),
+      ]
+      options.pendingSessionIntent.value = (
+        options.pendingSessionIntent.value || item.intent || null
+      )
+      options.autoResizeTextarea()
+      options.resetInputHistory()
+    }, restoreLease)
     return true
   }
 
@@ -2042,6 +2130,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           queueSessionKey(),
           orderedIds,
           snapshot.expectedWalRevisions,
+          walLookupSessionKeys(options.sessionKey.value),
         )
         const byId = new Map(result.records.map(record => [record.pendingInputId, record]))
         for (const item of pendingQueue.value) {

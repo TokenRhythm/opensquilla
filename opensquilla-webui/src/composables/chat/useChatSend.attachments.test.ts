@@ -1278,6 +1278,82 @@ describe('useChatSend attachment payloads', () => {
     expect(retained).toBeNull()
   })
 
+  it('restores a delayed failed handoff attachment when a new upload reuses its local id', async () => {
+    const sessionKey = 'agent:main:webchat:failed-fork-reload'
+    const recoveredAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 1,
+      name: 'recover-after-reload.txt',
+      mime: 'text/plain',
+      file_uuid: 'old-handoff-upload',
+    }
+    const newAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 1,
+      name: 'new-after-reload.txt',
+      mime: 'text/plain',
+      file_uuid: 'new-upload',
+    }
+    const record: ResponseHandoffWalRecord = {
+      schemaVersion: 1,
+      ownerRequestId: 'failed-reload-request',
+      requestSessionKey: sessionKey,
+      clientRequestId: 'failed-reload-request',
+      clientMessageId: 'failed-reload-message',
+      composerText: 'restore after delayed hydration',
+      recoveryAttachments: [recoveredAttachment],
+      params: {
+        sessionKey,
+        clientRequestId: 'failed-reload-request',
+        clientMessageId: 'failed-reload-message',
+        message: 'restore after delayed hydration',
+        forkBeforeMessageId: 'fork-before-reload',
+      },
+      state: 'failed',
+      errorCode: 'ATTACHMENT_EXPIRED',
+      createdAt: 1,
+      updatedAt: 2,
+    }
+    let retained: ResponseHandoffWalRecord | null = record
+    let releaseList!: () => void
+    let markListStarted!: () => void
+    const listStarted = new Promise<void>(resolve => { markListStarted = resolve })
+    const listGate = new Promise<void>(resolve => { releaseList = resolve })
+    const pendingInputWal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      listHandoffs: async () => {
+        markListStarted()
+        await listGate
+        return retained ? [structuredClone(retained)] : []
+      },
+      deleteHandoff: async () => { retained = null },
+      close: () => {},
+    }
+    const inputText = ref('')
+    const pendingAttachments = ref<Attachment[]>([])
+    const { api } = makeOptions({
+      sessionKey: ref(sessionKey),
+      inputText,
+      pendingAttachments,
+      pendingInputWal,
+    })
+
+    const recovery = api.recoverResponseHandoffs()
+    await listStarted
+    pendingAttachments.value = [newAttachment]
+    releaseList()
+    await recovery
+
+    expect(inputText.value).toBe('restore after delayed hydration')
+    expect(pendingAttachments.value).toEqual([
+      recoveredAttachment,
+      newAttachment,
+    ])
+    expect(retained).toBeNull()
+  })
+
   it('refreshes expired handoff attachments only after a definite rejection', async () => {
     const parent = 'agent:main:webchat:expired-fork-parent'
     const child = 'agent:main:webchat:expired-fork-child'

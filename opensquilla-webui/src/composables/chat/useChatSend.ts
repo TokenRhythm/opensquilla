@@ -423,6 +423,12 @@ function sameSendableAttachments(
   })
 }
 
+const responseHandoffAttachmentOwners = new WeakMap<Attachment, string>()
+
+function responseHandoffAttachmentOwner(ownerRequestId: string, index: number): string {
+  return `${ownerRequestId}\u0000${index}`
+}
+
 function normalizeDocumentContext(value: unknown): TurnDocumentContext | null {
   if (!value || typeof value !== 'object') return null
   const raw = value as Record<string, unknown>
@@ -1702,17 +1708,23 @@ export function useChatSend(options: UseChatSendOptions) {
         .filter(Boolean)
         .join('\n')
     }
-    const existingAttachmentIds = new Set(
-      options.pendingAttachments.value.map(attachment => attachment.local_id),
-    )
-    const missingAttachments = record.recoveryAttachments.filter(attachment => (
-      !existingAttachmentIds.has(attachment.local_id)
-    ))
+    const missingAttachments = record.recoveryAttachments.flatMap((attachment, index) => {
+      const owner = responseHandoffAttachmentOwner(record.ownerRequestId, index)
+      return options.pendingAttachments.value.some(candidate => (
+        responseHandoffAttachmentOwners.get(candidate) === owner
+      ))
+        ? []
+        : [{ attachment: { ...attachment }, owner }]
+    })
     if (missingAttachments.length > 0) {
       options.pendingAttachments.value = [
-        ...missingAttachments.map(attachment => ({ ...attachment })),
+        ...missingAttachments.map(entry => entry.attachment),
         ...options.pendingAttachments.value,
       ]
+      for (const [index, entry] of missingAttachments.entries()) {
+        const restored = options.pendingAttachments.value[index]
+        if (restored) responseHandoffAttachmentOwners.set(restored, entry.owner)
+      }
     }
     const forkBeforeMessageId = typeof record.params.forkBeforeMessageId === 'string'
       ? record.params.forkBeforeMessageId
@@ -3558,7 +3570,7 @@ export function useChatSend(options: UseChatSendOptions) {
     ) {
       options.inputText.value = [attempt.composerText, currentText].filter(Boolean).join('\n')
     }
-    restoreSendableAttachments(attempt.attachments)
+    restoreSendableAttachments(attempt.attachments, attempt.clientRequestId)
     if (!options.pendingSessionIntent.value) options.pendingSessionIntent.value = attempt.intent
     if (!options.pendingForkBeforeMessageId.value) {
       options.pendingForkBeforeMessageId.value = attempt.forkBeforeMessageId
@@ -3571,12 +3583,35 @@ export function useChatSend(options: UseChatSendOptions) {
     options.autoResizeTextarea()
   }
 
-  function restoreSendableAttachments(attachments: SendableAttachment[]) {
+  function restoreSendableAttachments(
+    attachments: SendableAttachment[],
+    ownerRequestId: string,
+  ) {
     if (attachments.length === 0) return
-    const currentLocalIds = new Set(options.pendingAttachments.value.map(attachment => attachment.local_id))
-    const missing = attachments.filter(attachment => !currentLocalIds.has(attachment.local_id))
-    if (missing.length > 0) {
-      options.pendingAttachments.value = [...missing, ...options.pendingAttachments.value]
+    const additions: Array<{ attachment: SendableAttachment, owner: string }> = []
+    for (const [index, attachment] of attachments.entries()) {
+      const owner = responseHandoffAttachmentOwner(ownerRequestId, index)
+      const current = options.pendingAttachments.value.find(candidate => (
+        isSendableAttachment(candidate)
+        && candidate.local_id === attachment.local_id
+        && JSON.stringify(serializeSendableAttachment(candidate))
+          === JSON.stringify(serializeSendableAttachment(attachment))
+      ))
+      if (current) {
+        responseHandoffAttachmentOwners.set(current, owner)
+      } else {
+        additions.push({ attachment, owner })
+      }
+    }
+    if (additions.length > 0) {
+      options.pendingAttachments.value = [
+        ...additions.map(entry => entry.attachment),
+        ...options.pendingAttachments.value,
+      ]
+      for (const [index, entry] of additions.entries()) {
+        const restored = options.pendingAttachments.value[index]
+        if (restored) responseHandoffAttachmentOwners.set(restored, entry.owner)
+      }
     }
   }
 
