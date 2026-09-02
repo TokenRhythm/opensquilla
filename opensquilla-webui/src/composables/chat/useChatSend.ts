@@ -64,9 +64,12 @@ import {
   stableClientUuid,
 } from '@/utils/chat/messageIdentity'
 import {
+  getHiddenControlRequestSnapshot,
   hiddenControlReceiptReplayEligible,
+  type HiddenControlRequestSnapshot,
   type HiddenControlStorage,
   listHiddenControls,
+  markHiddenControlDispatchDefinitelyRejected,
   markHiddenControlDispatchAttempted,
   persistHiddenControlResult,
   removeHiddenControl,
@@ -3752,6 +3755,15 @@ export function useChatSend(options: UseChatSendOptions) {
     const existing = hiddenDispatchInFlight.get(hiddenDispatchKey)
     if (existing) return existing
 
+    const hiddenSessionIntent = requestSessionKey === options.sessionKey.value
+      ? options.pendingSessionIntent.value
+      : null
+    const requestSnapshot: HiddenControlRequestSnapshot = {
+      intent: hiddenSessionIntent,
+      initialRoutingMode: initialRoutingModeForIntent(hiddenSessionIntent),
+      source: chatSourceMetadata(options),
+    }
+
     // Persist before either local queueing or RPC. The payload contains only
     // the already-visible control turn (never provider credentials), while its
     // stable request id lets Gateway ingress collapse response-loss retries.
@@ -3760,6 +3772,7 @@ export function useChatSend(options: UseChatSendOptions) {
       clientRequestId: stableClientRequestId,
       providerText,
       displayText,
+      requestSnapshot,
     }, options.hiddenControlStorage)
     if (persistResult === 'conflict' || persistResult === 'failed' || persistResult === 'invalid') {
       return Promise.resolve(hiddenDispatchResult(
@@ -3797,6 +3810,11 @@ export function useChatSend(options: UseChatSendOptions) {
         options.noninteractiveReceiptReplay?.value === true,
         options.hiddenControlStorage,
       )
+    const persistedRequestSnapshot = getHiddenControlRequestSnapshot(
+      requestSessionKey,
+      stableClientRequestId,
+      options.hiddenControlStorage,
+    ) || requestSnapshot
     const operation = performHiddenSend(
       providerText,
       displayText,
@@ -3804,6 +3822,7 @@ export function useChatSend(options: UseChatSendOptions) {
       requestSessionKey,
       idempotentReplay,
       persistResult !== 'unavailable',
+      persistedRequestSnapshot,
     )
     hiddenDispatchInFlight.set(hiddenDispatchKey, operation)
     void operation.then(() => {
@@ -3825,6 +3844,7 @@ export function useChatSend(options: UseChatSendOptions) {
     requestSessionKey: string,
     idempotentReplay: boolean,
     durableOutbox: boolean,
+    requestSnapshot: HiddenControlRequestSnapshot,
   ): Promise<HiddenControlDispatchResult> {
     const compactInFlight = options.isCompactInFlightForCurrentSession()
     const handoffInFlight = responseHandoffBlocksCurrentSession()
@@ -3919,14 +3939,12 @@ export function useChatSend(options: UseChatSendOptions) {
       message: providerText,
       sessionKey: requestSessionKey,
     }
-    const hiddenSessionIntent = requestSessionKey === options.sessionKey.value
-      ? options.pendingSessionIntent.value
-      : null
-    const hiddenInitialRoutingMode = initialRoutingModeForIntent(hiddenSessionIntent)
+    const hiddenSessionIntent = requestSnapshot.intent
+    const hiddenInitialRoutingMode = requestSnapshot.initialRoutingMode
     if (hiddenSessionIntent) params.intent = hiddenSessionIntent
     if (hiddenInitialRoutingMode) params.initialRoutingMode = hiddenInitialRoutingMode
     if (displayText && displayText !== providerText) params.displayText = displayText
-    params.source = chatSourceMetadata(options)
+    params.source = requestSnapshot.source
 
     // Hidden controls preserve the composer and render their own outbox-backed
     // bubble, but their acceptance/Stop identity is otherwise the same as an
@@ -4215,6 +4233,12 @@ export function useChatSend(options: UseChatSendOptions) {
       }
       if (accepted === false && rpcError?.retryable === false) {
         removeHiddenControl(
+          requestSessionKey,
+          stableClientRequestId,
+          options.hiddenControlStorage,
+        )
+      } else if (accepted === false) {
+        markHiddenControlDispatchDefinitelyRejected(
           requestSessionKey,
           stableClientRequestId,
           options.hiddenControlStorage,

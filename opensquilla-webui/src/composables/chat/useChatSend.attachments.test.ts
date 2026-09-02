@@ -1586,6 +1586,56 @@ describe('useChatSend attachment payloads', () => {
     )).toHaveLength(1)
   })
 
+  it.each(['project', 'interactivity'] as const)(
+    'keeps a definitely rejected hidden control behind %s policy',
+    async policyGate => {
+      const sessionPolicy = ref<string | null>(null)
+      const projectState = ref<'ready' | 'removed'>('ready')
+      const validateActiveProjectBeforeSend = vi.fn(async () => (
+        projectState.value === 'removed' ? 'removed' : null
+      ))
+      const rpc = {
+        call: vi.fn().mockRejectedValue(Object.assign(new Error('storage busy'), {
+          accepted: false,
+          retryable: true,
+        })),
+      }
+      const configured = makeOptions({
+        rpc,
+        sendBlockedReason: sessionPolicy,
+        sessionInteractivityBlockedReason: sessionPolicy,
+        idempotentReplayBlockedReason: ref(null),
+        validateActiveProjectBeforeSend,
+      })
+
+      await expect(configured.api.dispatchHiddenSend(
+        'provider confirmation',
+        'Confirmed',
+        'hidden-rejected-policy-gate',
+      )).resolves.toMatchObject({ status: 'rejected', reason: 'send_rejected' })
+      expect(listHiddenControls(
+        'agent:main:webchat:test',
+        configured.options.hiddenControlStorage,
+      )[0]?.dispatchAttempted).toBe(false)
+      if (policyGate === 'interactivity') {
+        sessionPolicy.value = 'Cron sessions are read-only.'
+      } else {
+        projectState.value = 'removed'
+      }
+
+      await configured.api.dispatchHiddenSend(
+        'provider confirmation',
+        'Confirmed',
+        'hidden-rejected-policy-gate',
+      )
+
+      expect(rpc.call).toHaveBeenCalledOnce()
+      expect(validateActiveProjectBeforeSend).toHaveBeenCalledTimes(
+        policyGate === 'project' ? 2 : 1,
+      )
+    },
+  )
+
   it('coalesces concurrent retries with the same session and ingress id', async () => {
     let resolveSend: ((value: unknown) => void) | undefined
     const pendingSend = new Promise(resolve => { resolveSend = resolve })
@@ -2248,6 +2298,10 @@ describe('useChatSend attachment payloads', () => {
         rpc: {
           call: vi.fn().mockRejectedValueOnce(new RpcTransportError('Connection closed', null)),
         },
+        pendingSessionIntent: ref<string | null>('new_chat'),
+        initialRoutingMode: ref<'ensemble'>('ensemble'),
+        elevatedMode: ref<string>('enabled'),
+        runMode: ref<'safe' | 'full'>('safe'),
         validateActiveProjectBeforeSend: firstProjectValidator,
       })
       await expect(first.api.dispatchHiddenSend(
@@ -2272,6 +2326,10 @@ describe('useChatSend attachment payloads', () => {
         sendBlockedReason: localPolicy,
         sessionInteractivityBlockedReason: localPolicy,
         idempotentReplayBlockedReason: replayPolicy,
+        pendingSessionIntent: ref<string | null>(null),
+        initialRoutingMode: ref<'direct'>('direct'),
+        elevatedMode: ref<string>(''),
+        runMode: ref<'safe' | 'full'>('full'),
         validateActiveProjectBeforeSend: replayProjectValidator,
       })
       await remounted.api.restoreHiddenControls('agent:main:webchat:test')

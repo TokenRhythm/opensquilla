@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import {
+  getHiddenControlRequestSnapshot,
   hiddenControlDispatchAttempted,
   hiddenControlReceiptReplayEligible,
   listHiddenControls,
+  markHiddenControlDispatchDefinitelyRejected,
   markHiddenControlDispatchAttempted,
   persistHiddenControl,
   removeHiddenControl,
@@ -84,6 +86,56 @@ describe('hidden control durable outbox', () => {
       item.clientRequestId,
       storage,
     )).toBe(true)
+  })
+
+  it('preserves the hidden request fingerprint and revokes replay after definite rejection', () => {
+    const storage = memoryStorage()
+    const item = {
+      sessionKey: 'agent:main:chat-1',
+      clientRequestId: 'stable-request-fingerprint',
+      providerText: '/meta meta-paper-write -- durable request',
+      displayText: 'Start document',
+      requestSnapshot: {
+        intent: 'new_chat',
+        initialRoutingMode: 'ensemble' as const,
+        source: { elevated: 'enabled', runMode: 'safe' as const },
+      },
+    }
+    expect(persistHiddenControl(item, storage)).toBe(true)
+    expect(getHiddenControlRequestSnapshot(
+      item.sessionKey,
+      item.clientRequestId,
+      storage,
+    )).toEqual(item.requestSnapshot)
+
+    expect(markHiddenControlDispatchAttempted(
+      item.sessionKey,
+      item.clientRequestId,
+      storage,
+    )).toBe(true)
+    expect(hiddenControlReceiptReplayEligible(
+      item.sessionKey,
+      item.clientRequestId,
+      false,
+      storage,
+    )).toBe(true)
+
+    expect(markHiddenControlDispatchDefinitelyRejected(
+      item.sessionKey,
+      item.clientRequestId,
+      storage,
+    )).toBe(true)
+    expect(hiddenControlReceiptReplayEligible(
+      item.sessionKey,
+      item.clientRequestId,
+      false,
+      storage,
+    )).toBe(false)
+    expect(getHiddenControlRequestSnapshot(
+      item.sessionKey,
+      item.clientRequestId,
+      storage,
+    )).toEqual(item.requestSnapshot)
   })
 
   it('preserves legacy dispatch state as unknown until a capable Gateway can recover it', () => {
