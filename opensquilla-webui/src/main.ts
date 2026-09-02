@@ -25,6 +25,7 @@ import { MIGRATION_OPERATIONS_KEY } from './modules/migrationOperations'
 import { WORKSPACE_CATALOG_KEY } from './modules/workspaceCatalog'
 import { SANDBOX_RUNTIME_KEY } from './modules/sandboxRuntime'
 import { SESSION_CONVERSATION_KEY } from './modules/sessionConversation'
+import { SESSION_MAINTENANCE_KEY } from './modules/sessionMaintenance'
 import { OBSERVABILITY_KEY } from './modules/observability'
 import { SKILL_CATALOG_KEY } from './modules/skillCatalog'
 import { AGENT_CATALOG_KEY } from './modules/agentCatalog'
@@ -100,6 +101,7 @@ app.provide(MIGRATION_OPERATIONS_KEY, gatewayAdapters.migrationOperations)
 app.provide(WORKSPACE_CATALOG_KEY, gatewayAdapters.workspaceCatalog)
 app.provide(SANDBOX_RUNTIME_KEY, gatewayAdapters.sandboxRuntime)
 app.provide(SESSION_CONVERSATION_KEY, gatewayAdapters.sessionConversation)
+app.provide(SESSION_MAINTENANCE_KEY, gatewayAdapters.sessionMaintenance)
 app.provide(OBSERVABILITY_KEY, gatewayAdapters.observability)
 app.provide(SKILL_CATALOG_KEY, gatewayAdapters.skillCatalog)
 app.provide(AGENT_CATALOG_KEY, gatewayAdapters.agentCatalog)

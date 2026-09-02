@@ -6,6 +6,7 @@ import type {
   SessionConversation,
   SessionConversationRequestOptions,
 } from '@/modules/sessionConversation'
+import type { SessionMaintenance } from '@/modules/sessionMaintenance'
 import type { HiddenControlDispatchResult } from '@/types/chat'
 import type { MetaSetupReadiness } from '@/types/metaSetup'
 import { createClientRequestId } from '@/utils/chat/messageIdentity'
@@ -84,6 +85,7 @@ const SUPPORTED_WEB_SLASH_ACTIONS = new Set([
 
 export interface UseChatSlashCommandsOptions {
   sessionConversation: SessionConversation
+  sessionMaintenance: SessionMaintenance
   /** Domain seam for MetaSkill launch; wire method names stay in its adapter. */
   metaRunCenter?: MetaRunCenter
   catalogCallOptions?: SessionConversationRequestOptions
@@ -281,6 +283,7 @@ function localizedMetaDescription(choice: ArgumentChoice): string {
 
 export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   const conversation = options.sessionConversation
+  const maintenance = options.sessionMaintenance
   const slashOpen = ref(false)
   const slashIdx = ref(0)
   const slashCmds = ref<ChatSlashCommand[]>([])
@@ -706,7 +709,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       case 'reset_session':
       case 'sessions.reset':
       case '/reset':
-        conversation.reset(options.sessionKey.value)
+        maintenance.reset({ key: options.sessionKey.value })
           .then(() => {
             options.resetCurrentSession()
           })
@@ -721,10 +724,10 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
           tone: 'info',
           source: 'manual',
         })
-        conversation.compact(compactKey, false)
+        maintenance.compact({ key: compactKey, wait: false })
           .then((result) => {
             if (compactKey !== options.sessionKey.value) return
-            options.showCompactionToast({ key: compactKey, source: 'manual', ...result })
+            options.showCompactionToast({ ...result, key: compactKey, source: 'manual' })
           })
           .catch((err: unknown) => {
             if (compactKey !== options.sessionKey.value) return

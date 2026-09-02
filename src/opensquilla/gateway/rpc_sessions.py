@@ -76,6 +76,13 @@ from opensquilla.gateway.adapters.session_lifecycle import (
 from opensquilla.gateway.adapters.session_lifecycle_contract import (
     register_session_lifecycle_contract,
 )
+from opensquilla.gateway.adapters.session_maintenance import (
+    GatewaySessionMaintenanceAdapter,
+    GatewaySessionMaintenanceCallbacks,
+)
+from opensquilla.gateway.adapters.session_maintenance_contract import (
+    register_session_maintenance_contract,
+)
 from opensquilla.gateway.adapters.session_preview import (
     SystemClock,
     preview_params_from_v4,
@@ -9417,8 +9424,7 @@ _handle_sessions_rename_contract = register_session_lifecycle_contract(
 )
 
 
-@_d.method("sessions.reset", scope="operator.write")
-async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def _execute_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     """Synchronous session reset with FlushReceipt.
 
     Sequence when ``ctx.flush_service`` is wired:
@@ -9877,8 +9883,7 @@ _handle_sessions_delete_contract = register_session_lifecycle_contract(
 )
 
 
-@_d.method("sessions.contextCompact", scope="operator.write")
-async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext) -> dict:
+async def _execute_sessions_context_compact(params: dict | None, ctx: RpcContext) -> dict:
     key = _require_key(params)
     if ctx.session_manager is None:
         raise KeyError("No session manager available")
@@ -10683,9 +10688,52 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
     }
 
 
-@_d.method("sessions.compact", scope="operator.write")
+def _session_maintenance_adapter(ctx: RpcContext) -> GatewaySessionMaintenanceAdapter:
+    return GatewaySessionMaintenanceAdapter(
+        ctx,
+        GatewaySessionMaintenanceCallbacks(
+            require_key=_require_key,
+            execute_reset=_execute_sessions_reset,
+            execute_compact=_execute_sessions_context_compact,
+        ),
+    )
+
+
+async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    return await _session_maintenance_adapter(ctx).reset(params)
+
+
+async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext) -> dict:
+    return await _session_maintenance_adapter(ctx).compact(params)
+
+
 async def _handle_sessions_compact(params: dict | None, ctx: RpcContext) -> dict:
-    return cast(dict, await _handle_sessions_context_compact(params, ctx))
+    return await _session_maintenance_adapter(ctx).compact(params)
+
+
+_handle_sessions_reset_contract = register_session_maintenance_contract(
+    _d,
+    "sessions.reset",
+    _handle_sessions_reset,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+_handle_sessions_context_compact_contract = register_session_maintenance_contract(
+    _d,
+    "sessions.contextCompact",
+    _handle_sessions_context_compact,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+_handle_sessions_compact_contract = register_session_maintenance_contract(
+    _d,
+    "sessions.compact",
+    _handle_sessions_compact,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 @_d.method("sessions.truncate", scope="operator.write")

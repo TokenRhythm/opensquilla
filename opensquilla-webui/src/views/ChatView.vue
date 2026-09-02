@@ -877,6 +877,7 @@ import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
 import { useChatSessionRouting } from '@/composables/chat/useChatSessionRouting'
 import { SESSION_ROUTING_KEY, type SessionRouting } from '@/modules/sessionRouting'
 import { SESSION_CONVERSATION_KEY, type SessionConversation } from '@/modules/sessionConversation'
+import { SESSION_MAINTENANCE_KEY, type SessionMaintenance } from '@/modules/sessionMaintenance'
 import { TURN_COMMANDS_KEY, type TurnCommands } from '@/modules/turnCommands'
 import { APPROVAL_CENTER_KEY, type ApprovalCenter } from '@/modules/approvalCenter'
 import { GOAL_CENTER_KEY, type GoalCenter } from '@/modules/goalCenter'
@@ -1209,6 +1210,9 @@ if (!injectedAppSettings) throw new Error('AppSettings was not provided')
 const injectedSessionConversation = inject(SESSION_CONVERSATION_KEY)
 if (!injectedSessionConversation) throw new Error('SessionConversation was not provided')
 const sessionConversation: SessionConversation = injectedSessionConversation
+const injectedSessionMaintenance = inject(SESSION_MAINTENANCE_KEY)
+if (!injectedSessionMaintenance) throw new Error('SessionMaintenance was not provided')
+const sessionMaintenance: SessionMaintenance = injectedSessionMaintenance
 const conversationEvents = inject(CONVERSATION_EVENTS_KEY)
 if (!conversationEvents) throw new Error('ConversationEvents was not provided')
 const sessionReadLifecycleFactory = inject(SESSION_READ_LIFECYCLE_FACTORY_KEY)
@@ -3216,6 +3220,7 @@ const goalOutcomeHasMessageAnchor = computed(() => (
 
 const chatSlashCommands = useChatSlashCommands({
   sessionConversation,
+  sessionMaintenance,
   metaRunCenter,
   catalogCallOptions: optionalSessionRpcCallOptions,
   inputText,

@@ -9,13 +9,6 @@ export interface SessionConversationRequestOptions {
   abortAction?: 'reject' | 'reconnect'
 }
 
-export interface SessionCompactResult {
-  status?: string
-  compactionId?: string
-  compaction_id?: string
-  [key: string]: unknown
-}
-
 export interface UsageStatusSession {
   session?: string
   sessionKey?: string
@@ -75,8 +68,6 @@ export interface PromptCacheKeepaliveUpdate {
 }
 
 export type SessionConversationCapability =
-  | 'reset'
-  | 'compact'
   | 'usage'
   | 'slash-catalog'
   | 'route-feedback'
@@ -94,12 +85,6 @@ export interface SessionConversationSubscription {
  */
 export interface SessionConversation {
   ready(options?: SessionConversationRequestOptions): Promise<void>
-  reset(key: string, options?: SessionConversationRequestOptions): Promise<Record<string, unknown>>
-  compact(
-    key: string,
-    wait?: boolean,
-    options?: SessionConversationRequestOptions,
-  ): Promise<SessionCompactResult>
   usage(
     sessionKey?: string,
     options?: SessionConversationRequestOptions,

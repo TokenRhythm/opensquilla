@@ -36,6 +36,8 @@ import type { SandboxRuntime } from '@/modules/sandboxRuntime'
 import { createV4SandboxRuntime } from './sandboxRuntimeV4'
 import type { SessionConversation } from '@/modules/sessionConversation'
 import { createV4SessionConversation } from './sessionConversationV4'
+import type { SessionMaintenance } from '@/modules/sessionMaintenance'
+import { createV4SessionMaintenance } from './sessionMaintenanceV4'
 import type { Observability } from '@/modules/observability'
 import { createV4Observability } from './observabilityV4'
 import type { SkillCatalog } from '@/modules/skillCatalog'
@@ -90,6 +92,7 @@ export interface GatewayAdapters {
   readonly workspaceCatalog: WorkspaceCatalog
   readonly sandboxRuntime: SandboxRuntime
   readonly sessionConversation: SessionConversation
+  readonly sessionMaintenance: SessionMaintenance
   readonly observability: Observability
   readonly skillCatalog: SkillCatalog
   readonly agentCatalog: AgentCatalog
@@ -163,6 +166,7 @@ export function createGatewayAdapters(
     workspaceCatalog: createV4WorkspaceCatalog(transports.rpc),
     sandboxRuntime: createV4SandboxRuntime(transports.rpc, transports.events),
     sessionConversation: createV4SessionConversation(transports.rpc, transports.events),
+    sessionMaintenance: createV4SessionMaintenance(transports.rpc),
     observability: createV4Observability(transports.rpc, http),
     skillCatalog: createV4SkillCatalog(transports.rpc),
     agentCatalog: createV4AgentCatalog(transports.rpc),

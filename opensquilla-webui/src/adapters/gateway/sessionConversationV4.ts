@@ -2,7 +2,6 @@ import type { RpcCallOptions, RpcEventHandler, RpcConnectionWaitOptions } from '
 import type { PromptCacheKeepaliveStatus } from '@/types/promptCacheKeepalive'
 import type {
   RouteFeedbackRating,
-  SessionCompactResult,
   SessionConversation,
   SessionConversationCapability,
   SessionConversationRequestOptions,
@@ -28,8 +27,6 @@ interface SessionConversationEventTransport {
 }
 
 const METHODS = {
-  reset: 'sessions.reset',
-  compact: 'sessions.contextCompact',
   usage: 'usage.status',
   commands: 'commands.list_for_surface',
   feedback: 'router.feedback.submit',
@@ -86,16 +83,6 @@ export function createV4SessionConversation(
             abortAction: 'reject',
           }
         : undefined),
-
-    reset: async (key, options) => objectResult<Record<string, unknown>>(
-      await request(METHODS.reset, { key }, options),
-      METHODS.reset,
-    ),
-
-    compact: async (key, wait = false, options) => objectResult<SessionCompactResult>(
-      await request(METHODS.compact, { key, wait }, options),
-      METHODS.compact,
-    ),
 
     usage: async (sessionKey, options) => objectResult<UsageStatusResult>(
       await request(
@@ -155,9 +142,7 @@ export function createV4SessionConversation(
       if (capability === 'turn-committed') {
         return events.supports?.('session.event.turn_committed') !== false
       }
-      const method = capability === 'reset' ? METHODS.reset
-          : capability === 'compact' ? METHODS.compact
-            : capability === 'usage' ? METHODS.usage
+      const method = capability === 'usage' ? METHODS.usage
               : capability === 'slash-catalog' ? METHODS.commands
                 : capability === 'route-feedback' ? METHODS.feedback
                   : METHODS.promptStatus

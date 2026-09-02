@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { parseMetaCommandInvocation, useChatSlashCommands } from './useChatSlashCommands'
 import type { RpcCallOptions } from '@/lib/rpc'
 import type { MetaRunCenter } from '@/modules/metaRunCenter'
+import type { SessionMaintenance } from '@/modules/sessionMaintenance'
 import type { MetaSetupReadiness } from '@/types/metaSetup'
 import { sessionConversationFromTestRpc } from '@/testing/sessionConversation.test-helper'
 
@@ -63,8 +64,28 @@ function harness(
   const goalPause = vi.fn(async () => true)
   const goalResume = vi.fn(async () => true)
   const goalClear = vi.fn(async () => true)
+  const sessionMaintenance: SessionMaintenance = {
+    reset: vi.fn(async command => ({
+      key: command.key,
+      reset: true as const,
+      rotated: true,
+      previousSessionId: 'before',
+      sessionId: 'after',
+      epoch: 1,
+    })),
+    compact: vi.fn(async command => ({
+      key: command.key,
+      compactionId: 'cmp-test',
+      status: 'started',
+      compacted: false,
+      applied: false,
+      durability: 'none',
+      userVisible: true,
+    })),
+  }
   const api = useChatSlashCommands({
     sessionConversation: sessionConversationFromTestRpc(rpc),
+    sessionMaintenance,
     metaRunCenter,
     catalogCallOptions,
     inputText,
@@ -106,6 +127,7 @@ function harness(
     goalClear,
     notify,
     rpc,
+    sessionMaintenance,
     setCodingModeEnabled,
   }
 }
@@ -435,12 +457,12 @@ describe('useChatSlashCommands recovery', () => {
   })
 
   it('keeps a legacy supported command without execution metadata registered', async () => {
-    const { api, rpc } = harness(false, [{ name: '/reset', aliases: [] }])
+    const { api, sessionMaintenance } = harness(false, [{ name: '/reset', aliases: [] }])
 
     await expect(api.classifySlashCommand('/reset')).resolves.toBe('registered')
     await expect(api.executeSlashCommand('/reset', 'registered')).resolves.toBe(true)
 
-    expect(rpc.call).toHaveBeenCalledWith('sessions.reset', {
+    expect(sessionMaintenance.reset).toHaveBeenCalledWith({
       key: 'agent:main:webchat:test',
     })
   })

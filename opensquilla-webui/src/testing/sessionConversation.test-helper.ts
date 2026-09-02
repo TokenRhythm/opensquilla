@@ -28,8 +28,6 @@ export function sessionConversationTestDouble(
 ): SessionConversation {
   return {
     ready: async () => {},
-    reset: async () => unconfigured('reset'),
-    compact: async () => unconfigured('compact'),
     usage: async () => unconfigured('usage'),
     listCommands: async () => unconfigured('listCommands'),
     submitRouteFeedback: async () => unconfigured('submitRouteFeedback'),
