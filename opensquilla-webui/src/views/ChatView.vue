@@ -807,7 +807,10 @@ import { SESSION_LIFECYCLE_KEY } from '@/modules/sessionLifecycle'
 import { PENDING_INPUT_QUEUE_KEY } from '@/modules/pendingInputQueue'
 import { APP_SETTINGS_KEY } from '@/modules/appSettings'
 import { PROVIDER_CONFIGURATION_KEY } from '@/modules/providerConfiguration'
-import { SANDBOX_RUNTIME_KEY } from '@/modules/sandboxRuntime'
+import {
+  SANDBOX_RUNTIME_KEY,
+  type SandboxChatRuntime,
+} from '@/modules/sandboxRuntime'
 import { SETUP_WORKFLOW_KEY } from '@/modules/setupWorkflow'
 import { ARTIFACT_WORKBENCH_KEY } from '@/modules/artifactWorkbench'
 import { useSetupStatus } from '@/composables/setup/useSetupStatus'
@@ -1217,6 +1220,7 @@ if (!sessionReadLifecycleFactory) throw new Error('SessionReadLifecycleFactory w
 const injectedProviderConfiguration = inject(PROVIDER_CONFIGURATION_KEY)
 const injectedSandboxRuntime = inject(SANDBOX_RUNTIME_KEY)
 if (!injectedSandboxRuntime) throw new Error('SandboxRuntime was not provided')
+const sandboxRuntime: SandboxChatRuntime = injectedSandboxRuntime
 const injectedAudioTranscription = inject(AUDIO_TRANSCRIPTION_KEY)
 if (!injectedAudioTranscription) throw new Error('AudioTranscription was not provided')
 if (!injectedProviderConfiguration) throw new Error('ProviderConfiguration was not provided')
@@ -1605,7 +1609,7 @@ const {
   setGlobalRunMode,
   applyRunModePreferenceChanged,
 } = useChatRunModePreference({
-  sandbox: injectedSandboxRuntime,
+  sandbox: sandboxRuntime,
   runModePolicy: () => gatewayAccess.runModePolicy,
 })
 async function refreshRunModePreference() {
@@ -1624,7 +1628,7 @@ const requestedRunMode = computed<SandboxRunMode>(
 )
 
 const sandboxSetupRecovery = useSandboxSetupRecovery({
-  sandbox: injectedSandboxRuntime,
+  sandbox: sandboxRuntime,
   connectionState: gatewayConnectionState,
   runMode: requestedRunMode,
   autoRefresh: false,
@@ -5596,7 +5600,7 @@ async function resumeSandbox() {
   const key = sessionKey.value
   if (!key) return
   try {
-    await injectedSandboxRuntime?.resume(key)
+    await sandboxRuntime.resumeSession(key)
     messages.value.push({
       role: 'system',
       text: t('chat.sandboxResumed'),
@@ -6670,9 +6674,9 @@ onMounted(async () => {
   // Load elevated mode
   loadElevatedMode()
 
-  unsubs.push(injectedSandboxRuntime?.subscribeRunModePreferenceChanged(
+  unsubs.push(sandboxRuntime.onPreferenceChanged(
     payload => applyRunModePreferenceChanged(payload),
-  ) ?? (() => undefined))
+  ))
 
   // Register event handlers before sessions.messages.subscribe can replay
   // buffered events, then start the two critical phases before any optional
