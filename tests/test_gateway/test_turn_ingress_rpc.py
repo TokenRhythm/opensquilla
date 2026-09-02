@@ -223,6 +223,69 @@ async def test_missing_canonical_cron_new_chat_rejects_without_durable_side_effe
 
 
 @pytest.mark.asyncio
+async def test_chat_send_cron_rejection_preserves_running_turn_compaction_marker(
+    tmp_path: Path,
+) -> None:
+    session_key = "legacy-scheduled-run"
+
+    class SeededCompactionMarker:
+        def __init__(self) -> None:
+            self.marked = {session_key}
+            self.clear_calls: list[str] = []
+
+        def has_compacted_this_turn(self, key: str) -> bool:
+            return key in self.marked
+
+        def mark_compacted_this_turn(self, key: str) -> None:
+            self.marked.add(key)
+
+        def clear_compacted_this_turn(self, key: str) -> None:
+            self.clear_calls.append(key)
+            self.marked.discard(key)
+
+    async with _open_real_stack(
+        tmp_path / "chat-send-cron-marker.db",
+        session_key=session_key,
+    ) as stack:
+        current = await stack.storage.get_session(session_key)
+        assert current is not None
+        updated = await stack.storage.compare_and_set_session_origin(
+            expected_session=current,
+            expected_origin=None,
+            origin={"kind": "cron"},
+            workspace_guard=None,
+        )
+        assert updated is not None
+        marker = SeededCompactionMarker()
+        stack.context.turn_runner = marker  # type: ignore[assignment]
+
+        response = await get_dispatcher().dispatch(
+            "rpc-chat-send-cron-marker",
+            "chat.send",
+            {
+                "sessionKey": session_key,
+                "message": "must not disturb the running Cron turn",
+                "clientRequestId": "chat-send-cron-marker",
+            },
+            stack.context,
+        )
+
+        assert response.error is not None
+        assert response.error.code == "SESSION_NOT_INTERACTIVE"
+        assert response.error.accepted is False
+        assert response.error.retryable is False
+        assert marker.marked == {session_key}
+        assert marker.clear_calls == []
+        assert _table_counts(stack.db_path) == {
+            "transcript_entries": 0,
+            "agent_tasks": 0,
+            "turn_ingress_receipts": 0,
+        }
+        _assert_no_runtime_acceptance_state(stack.runtime)
+        assert stack.handler_started.is_set() is False
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("method", "run_kind_injection"),
     [

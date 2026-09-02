@@ -4642,16 +4642,17 @@ const sendButtonTitle = computed(() => {
 })
 
 function implementCurrentPlan(target: PlanCardActionTarget) {
-  if (liveSendBlockedReason.value) return
+  if (isCronSession.value || liveSendBlockedReason.value) return
   void chatPlans.implement(target, false)
 }
 
 function implementPlanInNewTask(target: PlanCardActionTarget) {
-  if (liveSendBlockedReason.value) return
+  if (isCronSession.value || liveSendBlockedReason.value) return
   void chatPlans.implement(target, true)
 }
 
 function beginPlanRevision(target: PlanCardActionTarget) {
+  if (isCronSession.value) return
   if (pendingAttachments.value.length > 0) {
     pushToast(t('chat.plan.attachmentsUnavailable'), { tone: 'warn' })
     return
@@ -5529,6 +5530,7 @@ async function returnToForkParent() {
 }
 
 async function forkConversation(throughTurnId?: string) {
+  if (isCronSession.value) return
   const parentKey = sessionKey.value
   if (!parentKey || forkTransition.value) return
   if (pendingSessionIntent.value === 'new_chat' || isStreaming.value) return

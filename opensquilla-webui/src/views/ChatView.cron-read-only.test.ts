@@ -37,6 +37,40 @@ describe('Cron session read-only presentation', () => {
     expect(chatViewSource).toContain('canMutateMessages: () => !isCronSession.value')
   })
 
+  it('guards current, new-task, and replan handlers before Plan mutations', () => {
+    const implementCurrent = sourceBetween(
+      'function implementCurrentPlan(',
+      'function implementPlanInNewTask(',
+    )
+    const implementNew = sourceBetween(
+      'function implementPlanInNewTask(',
+      'function beginPlanRevision(',
+    )
+    const replan = sourceBetween('function beginPlanRevision(', 'function cancelPlanRevision(')
+
+    expect(implementCurrent).toContain('if (isCronSession.value || liveSendBlockedReason.value) return')
+    expect(implementCurrent.indexOf('isCronSession.value')).toBeLessThan(
+      implementCurrent.indexOf('chatPlans.implement'),
+    )
+    expect(implementNew).toContain('if (isCronSession.value || liveSendBlockedReason.value) return')
+    expect(implementNew.indexOf('isCronSession.value')).toBeLessThan(
+      implementNew.indexOf('chatPlans.implement'),
+    )
+    expect(replan).toContain('if (isCronSession.value) return')
+    expect(replan.indexOf('isCronSession.value')).toBeLessThan(
+      replan.indexOf('chatPlans.beginReplan'),
+    )
+  })
+
+  it('guards fork before creating another session', () => {
+    const fork = sourceBetween('async function forkConversation(', 'async function resumeSandbox(')
+
+    expect(fork).toContain('if (isCronSession.value) return')
+    expect(fork.indexOf('isCronSession.value')).toBeLessThan(
+      fork.indexOf('sessionLifecycle.fork'),
+    )
+  })
+
   it('does not prepare hidden attachments from drag, drop, or paste', () => {
     const dragEnter = sourceBetween('function onChatDragEnter(', 'function onChatDragOver(')
     const dragOver = sourceBetween('function onChatDragOver(', 'function onChatDragLeave(')

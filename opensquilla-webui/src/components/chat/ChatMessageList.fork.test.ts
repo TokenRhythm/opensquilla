@@ -272,13 +272,30 @@ describe('ChatMessageList usage barrier retry anchor', () => {
 
 describe('ChatMessageList assistant usage barrier regenerate', () => {
   it('hides edit and regenerate mutations for a read-only session', () => {
+    const planned = assistant('assistant-read-only', 'turn:read-only', 'turn-read-only')
+    planned.parts = [{
+      type: 'plan',
+      key: 'assistant-read-only:plan:revision-read-only',
+      plan: {
+        revisionId: 'revision-read-only',
+        planId: 'plan-read-only',
+        title: 'Read-only plan',
+        markdown: 'Inspect without mutating.',
+        steps: [{ stepId: 'inspect', title: 'Inspect' }],
+        current: true,
+      },
+    }]
     const { host } = mountList([
       user('user-read-only', 'turn:read-only', 'turn-read-only'),
-      assistant('assistant-read-only', 'turn:read-only', 'turn-read-only'),
+      planned,
     ], { messageActionsAvailable: false })
 
     expect(host.querySelector('[aria-label="Edit"]')).toBeNull()
     expect(host.querySelector('[aria-label="Regenerate"]')).toBeNull()
+    expect(host.querySelector('[data-testid="fork-conversation"]')).toBeNull()
+    expect(Array.from(
+      host.querySelectorAll<HTMLButtonElement>('.plan-card__actions button'),
+    ).every(button => button.disabled)).toBe(true)
   })
 
   it('hides Regenerate for an unsafe status-only barrier with a same-turn steer', () => {
