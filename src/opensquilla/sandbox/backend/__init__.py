@@ -19,6 +19,7 @@ Four concrete backends ship today:
 from __future__ import annotations
 
 import logging
+import shutil
 import sys
 
 from opensquilla.sandbox.backend.base import Backend
@@ -28,7 +29,7 @@ from opensquilla.sandbox.backend.seatbelt import SeatbeltBackend
 from opensquilla.sandbox.backend.unavailable import UnavailableBackend
 from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
 from opensquilla.sandbox.config import SandboxSettings
-from opensquilla.sandbox.types import SandboxBackendError
+from opensquilla.sandbox.types import SandboxBackendError, SandboxSetupRequiredError
 
 log = logging.getLogger(__name__)
 
@@ -78,24 +79,49 @@ def _windows_marker_proxy_ports() -> tuple[int, ...]:
     return marker.network.allowed_proxy_ports
 
 
-def _auto_backend() -> Backend:
+def _backend_available(backend: Backend, *, verify_runtime: bool) -> bool:
+    if verify_runtime:
+        return backend.available()
+    # Startup selects an installed backend, without test subprocesses, logons,
+    # or write-open canaries. Real operations enforce and report their failures.
+    if isinstance(backend, BubblewrapBackend):
+        return sys.platform.startswith("linux") and shutil.which("bwrap") is not None
+    if isinstance(backend, WindowsDefaultBackend):
+        from opensquilla.sandbox.backend.windows_default_setup import default_setup_marker_path
+        from opensquilla.sandbox.backend.windows_default_support import (
+            probe_windows_default_support,
+        )
+
+        support = probe_windows_default_support(verify_runtime=False)
+        if (
+            support.ctypes_available
+            and support.token_api_available
+            and support.acl_api_available
+            and not default_setup_marker_path().exists()
+        ):
+            raise SandboxSetupRequiredError("Windows sandbox has not been set up yet.")
+        return support.default_backend_available and support.proxy_allowlist_enforced
+    return backend.available()
+
+
+def _auto_backend(*, verify_runtime: bool = True) -> Backend:
     """Pick the strongest available backend for the current host."""
     if sys.platform.startswith("linux"):
         bwrap = BubblewrapBackend()
-        if bwrap.available():
+        if _backend_available(bwrap, verify_runtime=verify_runtime):
             return bwrap
     if sys.platform == "darwin":
         seatbelt = SeatbeltBackend()
-        if seatbelt.available():
+        if _backend_available(seatbelt, verify_runtime=verify_runtime):
             return seatbelt
     if sys.platform.startswith("win"):
         windows_default = WindowsDefaultBackend()
-        if windows_default.available():
+        if _backend_available(windows_default, verify_runtime=verify_runtime):
             return windows_default
     return NoopBackend()
 
 
-def select_backend(settings: SandboxSettings) -> Backend:
+def select_backend(settings: SandboxSettings, *, verify_runtime: bool = True) -> Backend:
     """Return the backend matching ``settings.backend``.
 
     ``"auto"`` defers to :func:`_auto_backend`. Explicit choices are honoured
@@ -109,7 +135,7 @@ def select_backend(settings: SandboxSettings) -> Backend:
     if not settings.sandbox:
         backend = NoopBackend()
     elif choice == "auto":
-        backend = _auto_backend()
+        backend = _auto_backend(verify_runtime=verify_runtime)
     elif choice == "bubblewrap":
         backend = BubblewrapBackend()
     elif choice == "seatbelt":
@@ -121,15 +147,20 @@ def select_backend(settings: SandboxSettings) -> Backend:
     else:  # pragma: no cover - pydantic Literal constrains this upstream
         raise ValueError(f"unknown sandbox backend: {choice!r}")
 
+    available = _backend_available(backend, verify_runtime=verify_runtime)
     log.info(
         "sandbox.backend_selected: choice=%s resolved=%s available=%s",
         choice,
         backend.name,
-        backend.available(),
+        available,
     )
     if settings.sandbox and choice == "auto" and isinstance(backend, NoopBackend):
+        if not verify_runtime:
+            raise SandboxBackendError(
+                "No installed sandbox backend with completed setup is available."
+            )
         raise SandboxBackendError(_auto_backend_failure_message())
-    if settings.sandbox and choice != "noop" and not backend.available():
+    if settings.sandbox and choice != "noop" and not available:
         raise SandboxBackendError(
             f"sandbox backend {backend.name!r} is unavailable while sandbox=true"
         )

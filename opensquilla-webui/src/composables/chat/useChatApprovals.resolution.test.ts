@@ -9,6 +9,7 @@ import {
 import { approvalChoiceForDecision } from '@/modules/approvalCenter'
 import type { ChatApprovalEntry } from './useChatApprovals'
 import type { InterruptViewState } from '@/types/parts'
+import { sessionConversationFromTestRpc } from '@/testing/sessionConversation.test-helper'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -52,6 +53,7 @@ function approvalHarness(statusResponse: Record<string, unknown> = {
   const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map())
   const approvals = useChatApprovals({
     approvalCenter: {
+      setElevatedMode: vi.fn(async () => undefined),
       snapshot: vi.fn(async () => ({ pending: [], mode: 'prompt' as const })),
       status: vi.fn(async () => ({
         id: 'approval-1', namespace: 'exec' as const, pending: statusResponse.pending === true,
@@ -69,13 +71,13 @@ function approvalHarness(statusResponse: Record<string, unknown> = {
       subscribeAvailability: vi.fn(() => ({ close: vi.fn() })),
       dispose: vi.fn(),
     },
-    rpc: {
+    sessionConversation: sessionConversationFromTestRpc({
       call: vi.fn(async () => statusResponse) as <T = unknown>(
         method: string,
         params?: Record<string, unknown>,
       ) => Promise<T>,
       on: vi.fn(() => () => {}),
-    },
+    }),
     sessionKey: ref('agent:main:web'),
     runStatus: ref({ status: 'idle', label: '', task: null }),
     stream: {

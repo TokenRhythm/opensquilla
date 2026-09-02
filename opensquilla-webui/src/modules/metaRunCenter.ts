@@ -1,4 +1,5 @@
 import type { InjectionKey } from 'vue'
+import type { ConversationCursorSignal } from '@/modules/conversationRuntime'
 import type { MetaSetupReadiness } from '@/types/metaSetup'
 
 /** A wire-independent MetaSkill draft used by recovery UI. */
@@ -16,6 +17,9 @@ export interface MetaDraftListResult {
   readonly drafts: readonly MetaDraft[]
   readonly durable: boolean
 }
+
+/** Legacy name kept as a domain alias while older composables migrate. */
+export type MetaLaunchDraftPayload = MetaDraft
 
 export interface MetaDraftQuery {
   readonly sessionKey?: string
@@ -40,9 +44,9 @@ export interface MetaLaunchResult {
 }
 
 export interface MetaRunRecovery {
-  readonly announced?: Record<string, unknown>
-  readonly stepStates: readonly Record<string, unknown>[]
-  readonly completed?: Record<string, unknown>
+  readonly announced?: MetaRunAnnouncedPayload
+  readonly stepStates: readonly MetaStepStatePayload[]
+  readonly completed?: MetaRunCompletedPayload
 }
 
 export interface MetaPreflightConfirmation {
@@ -80,14 +84,101 @@ export interface MetaReplay {
 
 export type MetaEventKind = 'preflight' | 'run-announced' | 'step-state' | 'run-completed'
 
-/** Canonical event projection; session and sequence fencing stays in the adapter. */
-export interface MetaEvent {
-  readonly kind: MetaEventKind
-  readonly payload: Readonly<Record<string, unknown>>
+/** Domain projections consumed by the Meta UI; wire snake_case aliases stay in the Adapter. */
+export interface MetaPreflightFieldSpec {
+  name?: string
+  label?: string
+  title?: string
+  type?: string
+  kind?: string
+  multiline?: boolean
+  required?: boolean
+  default?: unknown
+  description?: string
+  help?: string
+  hint?: string
+  options?: unknown[]
+  choices?: unknown[]
+}
+
+export interface MetaPreflightRequestTemplate {
+  language?: string
+  outcome?: string
+  deliverable?: string
+  fields?: MetaPreflightFieldSpec[]
+}
+
+export interface MetaPreflightPayload {
+  runId?: string
+  metaSkillName?: string
+  language?: string
+  interpretedRequest?: string
+  missingFields?: string[]
+  assumptions?: string[]
+  requestTemplate?: MetaPreflightRequestTemplate
+  canSkip?: boolean
+  requiresConfirmation?: boolean
+}
+
+export interface MetaRunStepSpec {
+  id?: string
+  label?: string
+  kind?: string
+  dependsOn?: string[]
+}
+
+export interface MetaRunAnnouncedPayload {
+  runId?: string
+  metaSkillName?: string
+  language?: string
+  userLanguage?: string
+  metaLanguage?: string
+  steps?: MetaRunStepSpec[]
+  total?: number
+}
+
+export interface MetaStepRescueAction {
+  id?: string
+  label?: string
+}
+
+export interface MetaStepRescue {
+  actions?: MetaStepRescueAction[]
+}
+
+export interface MetaStepStatePayload {
+  runId?: string
+  stepId?: string
+  state?: string
+  statusText?: string | null
+  error?: string
+  substituteFor?: string | null
+  rescue?: MetaStepRescue
+}
+
+export interface MetaRunCompletedPayload {
+  runId?: string
+  outcome?: string
+  completedSteps?: string[]
+  failedSteps?: string[]
+  recoveredSteps?: string[]
+  skippedSteps?: string[]
+}
+
+/** Canonical cursor facts shared with the conversation runtime. */
+interface MetaEventContext extends ConversationCursorSignal {
   readonly sessionKey: string | null
+  readonly sessionEpoch: number | null
   readonly streamSeq: number | null
   readonly streamGeneration: string | null
 }
+
+/** Canonical event projection; all wire aliases stay in the Gateway Adapter. */
+export type MetaEvent =
+  | (MetaEventContext & { readonly kind: 'preflight'; readonly payload: MetaPreflightPayload })
+  | (MetaEventContext & { readonly kind: 'run-announced'; readonly payload: MetaRunAnnouncedPayload })
+  | (MetaEventContext & { readonly kind: 'step-state'; readonly payload: MetaStepStatePayload })
+  | (MetaEventContext & { readonly kind: 'run-completed'; readonly payload: MetaRunCompletedPayload })
 
 export interface MetaRunRequestOptions {
   readonly signal?: AbortSignal

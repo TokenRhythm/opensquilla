@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { ref, watchEffect } from 'vue'
 import {
   DEFAULT_STREAM_IDLE_TIMEOUT_MS,
-  streamIdleTimeoutFromPolicy,
+  resolvedStreamIdleTimeoutMs,
   useChatStream,
 } from './useChatStream'
 import type { ChatMessage, ChatRunStatus } from '@/types/chat'
@@ -14,7 +14,7 @@ import type { InterruptViewState } from '@/types/parts'
 // stubbed and driven manually; fake timers cover the Date.now() flush throttle.
 function makeStream(
   renderMarkdown = vi.fn((t: string, _o?: { highlight?: boolean }) => `<p>${t}</p>`),
-  rpcPolicy?: () => Record<string, unknown> | undefined,
+  streamIdleTimeoutMs?: () => number | undefined,
   interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map()),
 ) {
   const scrollToBottom = vi.fn()
@@ -32,7 +32,7 @@ function makeStream(
     stripDirectiveTags: (t: string) => t,
     stripGeneratedArtifactMarkers: (t: string) => t,
     scrollToBottom,
-    rpcPolicy,
+    streamIdleTimeoutMs,
     interruptState,
   })
   return {
@@ -63,21 +63,21 @@ describe('useChatStream render coalescing', () => {
   })
 
   it('uses valid negotiated idle grace and falls back to 630s for invalid policy', () => {
-    expect(streamIdleTimeoutFromPolicy({ webui_stream_idle_grace_ms: 1_260_000 })).toBe(1_260_000)
-    expect(streamIdleTimeoutFromPolicy(undefined)).toBe(DEFAULT_STREAM_IDLE_TIMEOUT_MS)
-    expect(streamIdleTimeoutFromPolicy({ webui_stream_idle_grace_ms: 0 })).toBe(DEFAULT_STREAM_IDLE_TIMEOUT_MS)
-    expect(streamIdleTimeoutFromPolicy({ webui_stream_idle_grace_ms: '1260000' })).toBe(DEFAULT_STREAM_IDLE_TIMEOUT_MS)
+    expect(resolvedStreamIdleTimeoutMs(1_260_000)).toBe(1_260_000)
+    expect(resolvedStreamIdleTimeoutMs(undefined)).toBe(DEFAULT_STREAM_IDLE_TIMEOUT_MS)
+    expect(resolvedStreamIdleTimeoutMs(0)).toBe(DEFAULT_STREAM_IDLE_TIMEOUT_MS)
+    expect(resolvedStreamIdleTimeoutMs(Number.NaN)).toBe(DEFAULT_STREAM_IDLE_TIMEOUT_MS)
   })
 
-  it('re-reads policy whenever the hard idle timer is reset', () => {
-    let policy = { webui_stream_idle_grace_ms: 1_260_000 }
-    const { api } = makeStream(undefined, () => policy)
+  it('re-reads the projected timeout whenever the hard idle timer is reset', () => {
+    let timeoutMs = 1_260_000
+    const { api } = makeStream(undefined, () => timeoutMs)
 
     api.startStreaming()
     api.resetStreamIdleTimer()
     expect(api.streamIdleTimeoutMs.value).toBe(1_260_000)
 
-    policy = { webui_stream_idle_grace_ms: 900_000 }
+    timeoutMs = 900_000
     api.resetStreamIdleTimer()
     expect(api.streamIdleTimeoutMs.value).toBe(900_000)
     api.cleanup()
@@ -98,7 +98,7 @@ describe('useChatStream render coalescing', () => {
   })
 
   it('extends the single hard-idle deadline from the latest heartbeat', () => {
-    const { api } = makeStream(undefined, () => ({ webui_stream_idle_grace_ms: 1_000 }))
+    const { api } = makeStream(undefined, () => 1_000)
 
     api.startStreaming()
     vi.advanceTimersByTime(750)

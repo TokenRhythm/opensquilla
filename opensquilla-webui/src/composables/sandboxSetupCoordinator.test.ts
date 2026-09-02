@@ -3,9 +3,23 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   ensureSandboxReady,
   normalizeSandboxSetupStatus,
+  type SandboxSetupOperations,
 } from './sandboxSetupCoordinator'
 
 describe('sandboxSetupCoordinator', () => {
+  function operations(
+    call: (method: string, params?: Record<string, unknown>) => Promise<unknown>,
+  ): SandboxSetupOperations {
+    return {
+      ensureSetup: () => call('sandbox.setup.ensure'),
+      setupStatus: () => call('sandbox.setup.status'),
+      capability: async () => await call(
+        'sandbox.capability.status',
+        { refresh: true },
+      ) as { available: boolean } | null,
+    }
+  }
+
   it('normalizes snake_case administrator state', () => {
     expect(normalizeSandboxSetupStatus({
       state: 'not_setup',
@@ -26,7 +40,7 @@ describe('sandboxSetupCoordinator', () => {
       .mockResolvedValueOnce({ state: 'ready', platform: 'win32' })
       .mockResolvedValueOnce({ available: false })
 
-    await expect(ensureSandboxReady(call)).resolves.toMatchObject({
+    await expect(ensureSandboxReady(operations(call))).resolves.toMatchObject({
       ready: false,
       outcome: 'verification_failed',
       status: { state: 'ready' },
@@ -40,7 +54,7 @@ describe('sandboxSetupCoordinator', () => {
       .mockResolvedValueOnce({ state: 'ready', platform: 'win32' })
       .mockResolvedValueOnce({ available: true })
 
-    await expect(ensureSandboxReady(call)).resolves.toMatchObject({
+    await expect(ensureSandboxReady(operations(call))).resolves.toMatchObject({
       ready: true,
       outcome: 'ready',
       status: { state: 'ready' },
@@ -54,7 +68,7 @@ describe('sandboxSetupCoordinator', () => {
       detail: 'cancelled_by_user',
     })
 
-    await expect(ensureSandboxReady(call)).resolves.toMatchObject({
+    await expect(ensureSandboxReady(operations(call))).resolves.toMatchObject({
       ready: false,
       outcome: 'cancelled',
       status: { state: 'failed' },
@@ -63,9 +77,9 @@ describe('sandboxSetupCoordinator', () => {
   })
 
   it('converts malformed payloads and transport failures into retryable failure', async () => {
-    await expect(ensureSandboxReady(vi.fn().mockResolvedValue({ state: 'future' })))
+    await expect(ensureSandboxReady(operations(vi.fn().mockResolvedValue({ state: 'future' }))))
       .resolves.toEqual({ ready: false, status: null, outcome: 'failed' })
-    await expect(ensureSandboxReady(vi.fn().mockRejectedValue(new Error('recycled'))))
+    await expect(ensureSandboxReady(operations(vi.fn().mockRejectedValue(new Error('recycled')))))
       .resolves.toEqual({ ready: false, status: null, outcome: 'failed' })
   })
 
@@ -74,14 +88,14 @@ describe('sandboxSetupCoordinator', () => {
       .mockRejectedValueOnce(new Error('Connection recycled after sandbox.setup.ensure terminated'))
       .mockResolvedValueOnce({ state: 'ready', platform: 'win32' })
       .mockResolvedValueOnce({ available: true })
-    const waitForConnection = vi.fn().mockResolvedValue(undefined)
+    const ready = vi.fn().mockResolvedValue(undefined)
 
-    await expect(ensureSandboxReady(call, null, waitForConnection)).resolves.toMatchObject({
+    await expect(ensureSandboxReady(operations(call), null, ready)).resolves.toMatchObject({
       ready: true,
       outcome: 'ready',
       status: { state: 'ready' },
     })
-    expect(waitForConnection).toHaveBeenCalledOnce()
+    expect(ready).toHaveBeenCalledOnce()
     expect(call).toHaveBeenNthCalledWith(1, 'sandbox.setup.ensure')
     expect(call).toHaveBeenNthCalledWith(2, 'sandbox.setup.status')
     expect(call).toHaveBeenNthCalledWith(3, 'sandbox.capability.status', { refresh: true })

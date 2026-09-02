@@ -1397,7 +1397,7 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
         (
             "desktop-cleanup-flow",
             "Windows",
-            "Error: Timed out waiting for post-exit delete-all helper completion.; "
+            "Error: Timed out waiting for post-exit delete-all helper completion: ; "
             "pending synthetic targets: synthetic-home\n",
             "windows-delete-helper-handoff-timeout-v1",
         ),
@@ -1680,7 +1680,9 @@ def test_v1_editor_failure_evidence_is_captured_before_desktop_shutdown() -> Non
     failure_capture = script.index(
         "failureEvidence = await captureFailureEvidence", finally_block
     )
-    app_close = script.index("await diagnosticCall('Electron shutdown'", finally_block)
+    app_close = script.index(
+        "await closeDesktopApp(app, 'final-electron-shutdown')", finally_block
+    )
 
     assert durable_check < failure_capture < app_close
     assert "async function diagnosticCall" in script

@@ -21,6 +21,7 @@ import {
   type DesktopProfilePaths,
 } from './desktop-profile-context.js'
 import { DesktopWriterAdmission } from './desktop-writer-admission.js'
+import { terminateWindowsProcessTree } from './windows-process-tree.js'
 import {
   createDesktopGatewayInstanceNonce,
   desktopGatewayAuthToken,
@@ -336,11 +337,6 @@ interface DesktopPreferencesSnapshot {
   platform: 'darwin' | 'win32' | 'linux' | 'other'
 }
 
-interface SandboxUnavailablePayload {
-  state: 'failed' | 'unavailable'
-  message?: string
-}
-
 interface RuntimeLaunch {
   command: string
   args: string[]
@@ -464,7 +460,6 @@ let desktopPreferencesCache: {
   writable: boolean
 } | null = null
 let desktopPreferencesWritePromise: Promise<void> = Promise.resolve()
-let sandboxUnavailableWarningShownThisLaunch = false
 
 type DesktopNativeThemeSource = 'light' | 'dark' | 'system'
 
@@ -589,6 +584,11 @@ let desktopCleanupBusy = false
 // userData handles.
 let pendingDeleteAllHelper: ChildProcess | null = null
 const gatewayProcessTreeChildren = new WeakSet<ChildProcessWithoutNullStreams>()
+const gatewayProcessTreeTerminations = new WeakMap<
+  ChildProcessWithoutNullStreams,
+  Promise<boolean>
+>()
+const gatewayHardTerminatedProcesses = new WeakSet<ChildProcessWithoutNullStreams>()
 const desktopWriters = new DesktopWriterAdmission()
 let desktopOpenFlowRevision = 0
 let desktopOpenFlowPromise: Promise<void> | null = null
@@ -2583,82 +2583,6 @@ async function saveDesktopPreferences(
   }))
 }
 
-function normalizeSandboxUnavailablePayload(raw: unknown): SandboxUnavailablePayload {
-  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
-    throw new Error('The sandbox availability report is invalid.')
-  }
-  const payload = raw as Record<string, unknown>
-  if (payload.state !== 'failed' && payload.state !== 'unavailable') {
-    throw new Error('The sandbox availability report is invalid.')
-  }
-  if (
-    payload.message !== undefined
-    && (typeof payload.message !== 'string' || payload.message.length > 2_000)
-  ) {
-    throw new Error('The sandbox availability report is invalid.')
-  }
-  return {
-    state: payload.state,
-    ...(typeof payload.message === 'string' && payload.message.trim()
-      ? { message: payload.message.trim() }
-      : {}),
-  }
-}
-
-async function reportSandboxUnavailable(raw: unknown): Promise<{
-  shown: boolean
-  suppressed: boolean
-}> {
-  normalizeSandboxUnavailablePayload(raw)
-  const preferences = loadDesktopPreferencesRecord().value
-  if (
-    preferences.sandbox_unavailable_warning_suppressed
-    || sandboxUnavailableWarningShownThisLaunch
-  ) {
-    return {
-      shown: false,
-      suppressed: preferences.sandbox_unavailable_warning_suppressed,
-    }
-  }
-
-  // Reserve the single prompt slot before awaiting the native dialog so
-  // concurrent renderer reports cannot open duplicate prompts.
-  sandboxUnavailableWarningShownThisLaunch = true
-  const options: Electron.MessageBoxOptions = {
-    type: 'warning',
-    title: desktopT('sandboxUnavailable.title'),
-    message: desktopT('sandboxUnavailable.message'),
-    detail: desktopT('sandboxUnavailable.detail'),
-    buttons: [
-      desktopT('sandboxUnavailable.acknowledge'),
-      desktopT('sandboxUnavailable.suppress'),
-    ],
-    defaultId: 0,
-    cancelId: 0,
-    noLink: true,
-  }
-  const window = currentMainWindow()
-  const result = window
-    ? await dialog.showMessageBox(window, options)
-    : await dialog.showMessageBox(options)
-  if (result.response !== 1) {
-    return { shown: true, suppressed: false }
-  }
-
-  try {
-    await enqueueDesktopPreferencesUpdate((current) => ({
-      ...current,
-      sandbox_unavailable_warning_suppressed: true,
-    }))
-  } catch (error) {
-    desktopLog('sandbox_unavailable_warning_persist_failed', {
-      error: error instanceof Error ? error.message : String(error),
-    })
-    return { shown: true, suppressed: false }
-  }
-  return { shown: true, suppressed: true }
-}
-
 function markBackgroundCloseNoticeShown(): void {
   const loaded = loadDesktopPreferencesRecord()
   if (!loaded.writable || loaded.value.background_close_notice_shown) return
@@ -3517,11 +3441,6 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'closePrompt.quit': 'Quit OpenSquilla',
     'closePrompt.cancel': 'Cancel',
     'closePrompt.remember': 'Remember my choice',
-    'sandboxUnavailable.title': 'Safe mode is unavailable',
-    'sandboxUnavailable.message': 'OpenSquilla cannot start its sandbox on this device.',
-    'sandboxUnavailable.detail': 'Safe mode has been disabled. Tasks can use Full Access, which runs with host permissions and has additional security risk.',
-    'sandboxUnavailable.acknowledge': 'I understand',
-    'sandboxUnavailable.suppress': "Don't remind me again",
     'update.newVersionTitle': 'A new version is available',
     'update.newVersionDetail': 'OpenSquilla {version} is available. Download it now?',
     'update.download': 'Download',
@@ -3654,11 +3573,6 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'closePrompt.quit': '退出 OpenSquilla',
     'closePrompt.cancel': '取消',
     'closePrompt.remember': '记住我的选择',
-    'sandboxUnavailable.title': '安全模式当前不可用',
-    'sandboxUnavailable.message': 'OpenSquilla 无法在此设备上启动沙箱。',
-    'sandboxUnavailable.detail': '安全模式已禁用。任务只能使用完全访问，并将以宿主机权限运行，存在额外的安全风险。',
-    'sandboxUnavailable.acknowledge': '我知道了',
-    'sandboxUnavailable.suppress': '不再提醒',
     'update.newVersionTitle': '有新版本可用',
     'update.newVersionDetail': 'OpenSquilla {version} 已发布，现在下载吗？',
     'update.download': '下载',
@@ -8286,7 +8200,6 @@ const GATEWAY_OUTPUT_TAIL_MAX_CHARS = 12_000
 const NEWER_CONFIG_DIAGNOSTIC_FIELDS = [
   'llm_ensemble',
   'privacy',
-  'sandbox.auto_setup',
   'llm_profiles',
 ] as const
 
@@ -9589,6 +9502,8 @@ const GATEWAY_SHUTDOWN_KILL_AFTER_MS = 75_000
 // Short SIGKILL backstop after a hard terminate (TerminateProcess / SIGTERM)
 // when the graceful path was skipped or already overran its deadline.
 const GATEWAY_HARD_KILL_BACKSTOP_MS = 5_000
+// Keep Windows process-tree cleanup inside the existing hard-kill backstop.
+const WINDOWS_PROCESS_TREE_KILL_TIMEOUT_MS = 5_000
 const UPDATE_GATEWAY_EXIT_TIMEOUT_MS = GATEWAY_SHUTDOWN_KILL_AFTER_MS + GATEWAY_HARD_KILL_BACKSTOP_MS
 
 // Ask the gateway to shut down gracefully over its owner-only HTTP endpoint,
@@ -9701,6 +9616,7 @@ function hardTerminateGatewayProcess(
   backstopMs = GATEWAY_HARD_KILL_BACKSTOP_MS,
 ): void {
   if (hasGatewayProcessExited(child)) return
+  gatewayHardTerminatedProcesses.add(child)
   terminateGatewayProcess(child, 'SIGTERM')
   if (process.platform === 'win32') void clearKnownOwnedGatewayPidFile()
   setTimeout(() => {
@@ -9718,11 +9634,25 @@ function terminateGatewayProcess(
   const pid = child.pid
   if (pid && gatewayProcessTreeChildren.has(child)) {
     if (process.platform === 'win32') {
-      const result = spawnSync('taskkill', ['/pid', String(pid), '/t', '/f'], {
-        stdio: 'ignore',
-        windowsHide: true,
+      if (gatewayProcessTreeTerminations.has(child)) return
+      const termination = terminateWindowsProcessTree({
+        pid,
+        timeoutMs: WINDOWS_PROCESS_TREE_KILL_TIMEOUT_MS,
+        fallback: () => {
+          if (!hasGatewayProcessExited(child)) child.kill(signal)
+        },
+        onFailure: failure => desktopLog('gateway_process_tree_termination_failed', {
+          ...failure,
+          requestedSignal: signal,
+        }),
       })
-      if (result.status === 0) return
+      gatewayProcessTreeTerminations.set(child, termination)
+      void termination.finally(() => {
+        if (gatewayProcessTreeTerminations.get(child) === termination) {
+          gatewayProcessTreeTerminations.delete(child)
+        }
+      })
+      return
     } else {
       try {
         process.kill(-pid, signal)
@@ -11397,12 +11327,6 @@ ipcMain.handle('desktop:preferences:get', (event) => {
 ipcMain.handle('desktop:preferences:save', async (event, payload: DesktopPreferencesPayload) => {
   if (!trustedMainWindowControlIpc(event)) throw new Error('Untrusted Desktop preferences request.')
   return await saveDesktopPreferences(payload)
-})
-ipcMain.handle('desktop:sandbox:unavailable', async (event, payload: unknown) => {
-  if (!trustedMainWindowControlIpc(event)) {
-    throw new Error('Untrusted sandbox availability report.')
-  }
-  return await reportSandboxUnavailable(payload)
 })
 ipcMain.handle('desktop:artifact:open', async (_event, payload: ArtifactOpenRequest) => openArtifactWithDefaultApp(payload))
 ipcMain.handle('desktop:workspace:choose-directory', async (event, payload: unknown) => {
@@ -13974,10 +13898,16 @@ async function drainOwnedGatewayForQuit(
   url: string,
   requestShutdown: boolean,
 ): Promise<boolean> {
-  if (hasGatewayProcessExited(child)) return true
+  if (hasGatewayProcessExited(child)) {
+    desktopLog('quit_gateway_exit', {
+      exited: true,
+      hardTerminated: gatewayHardTerminatedProcesses.has(child),
+    })
+    return true
+  }
   const accepted = requestShutdown ? await requestOwnedGatewayShutdown(child, url) : null
   desktopLog('quit_gateway_shutdown_requested', { accepted, alreadyStopping: !requestShutdown })
-  let hardTerminated = false
+  let hardTerminated = gatewayHardTerminatedProcesses.has(child)
   let exited = false
   if (accepted === null) {
     // Another lifecycle operation already initiated the full graceful stop.
@@ -14011,10 +13941,15 @@ async function drainOwnedGatewayForQuit(
   // exit event is delayed past that timer, issue one final tree-aware SIGKILL
   // and wait again before allowing the Electron parent to disappear.
   if (!exited && !hasGatewayProcessExited(child)) {
+    hardTerminated = true
+    gatewayHardTerminatedProcesses.add(child)
     terminateGatewayProcess(child, 'SIGKILL')
     exited = await waitForGatewayProcessExit(child, GATEWAY_HARD_KILL_BACKSTOP_MS)
   }
-  desktopLog('quit_gateway_exit', { exited, hardTerminated })
+  desktopLog('quit_gateway_exit', {
+    exited,
+    hardTerminated: hardTerminated || gatewayHardTerminatedProcesses.has(child),
+  })
   return exited || hasGatewayProcessExited(child)
 }
 

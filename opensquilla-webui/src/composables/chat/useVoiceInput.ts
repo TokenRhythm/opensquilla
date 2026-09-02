@@ -3,12 +3,11 @@ import { ref } from 'vue'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
 import { detectPlatformId } from '@/platform/capabilities'
-
-interface TranscriptionResponse {
-  text?: string
-  error?: string
-  code?: string
-}
+import { usePlatform } from '@/platform'
+import {
+  AudioTranscriptionError,
+  type AudioTranscription,
+} from '@/modules/audioTranscription'
 
 // Abort a hung transcription request so voiceBusy cannot pin the mic button
 // disabled forever. 60s is deliberately generous: a long dictation against a
@@ -36,20 +35,9 @@ function recordingFailureKey(err: unknown): string {
   return 'chat.toast.voiceRecordFailed'
 }
 
-interface DesktopWindowVisibilityBridge {
-  onWindowHidden?: (callback: () => void) => void | (() => void)
-}
-
-function authToken(): string {
-  try {
-    return sessionStorage.getItem('opensquilla.wsToken') || ''
-  } catch {
-    return ''
-  }
-}
-
-export function useVoiceInput() {
+export function useVoiceInput(transcription: AudioTranscription) {
   const { pushToast } = useToasts()
+  const platform = usePlatform()
   const voiceBusy = ref(false)
   const voiceRecording = ref(false)
   let recorder: MediaRecorder | null = null
@@ -168,41 +156,22 @@ export function useVoiceInput() {
     }, TRANSCRIBE_TIMEOUT_MS)
     voiceBusy.value = true
     try {
-      const form = new FormData()
-      form.append('file', payload, 'voice.webm')
-      form.append('mime', mime)
-      const headers: Record<string, string> = {}
-      const token = authToken()
-      if (token) headers.Authorization = `Bearer ${token}`
-      const response = await fetch('/api/audio/transcribe', {
-        method: 'POST',
-        headers,
-        body: form,
-        credentials: 'same-origin',
+      const text = await transcription.transcribe({
+        recording: payload,
+        mimeType: mime,
         signal: controller.signal,
       })
-      const data = (await response.json().catch(() => ({}))) as TranscriptionResponse
       if (generation !== recordingGeneration || cleanedUp) return
-      if (!response.ok) {
-        // A 503/UNAVAILABLE means voice transcription isn't configured on the
-        // backend (audio disabled or no ElevenLabs key). The mic button is
-        // normally gated on readiness, so this is a race/stale-status backstop:
-        // surface a visible, actionable toast instead of failing silently.
-        const unavailable = response.status === 503 || data.code === 'UNAVAILABLE'
-        console.warn('Voice transcription failed:', data.error || `HTTP ${response.status}`)
-        pushToast(
-          i18n.global.t(unavailable ? 'chat.toast.voiceUnavailable' : 'chat.toast.voiceTranscribeFailed'),
-          { tone: 'danger' },
-        )
-        return
-      }
-      const text = String(data.text || '').trim()
       if (text) onText(text)
     } catch (err) {
       if (controller.signal.aborted && !timedOut) return
       if (generation !== recordingGeneration || cleanedUp) return
       console.warn('Voice transcription failed:', err instanceof Error ? err.message : String(err))
-      pushToast(i18n.global.t('chat.toast.voiceTranscribeFailed'), { tone: 'danger' })
+      pushToast(i18n.global.t(
+        err instanceof AudioTranscriptionError && err.kind === 'unavailable'
+          ? 'chat.toast.voiceUnavailable'
+          : 'chat.toast.voiceTranscribeFailed',
+      ), { tone: 'danger' })
     } finally {
       clearTimeout(timeoutTimer)
       if (transcriptionController === controller) transcriptionController = null
@@ -259,10 +228,7 @@ export function useVoiceInput() {
   }
 
   if (typeof window !== 'undefined') {
-    const desktop = (window as unknown as {
-      opensquillaDesktop?: DesktopWindowVisibilityBridge
-    }).opensquillaDesktop
-    const unsubscribe = desktop?.onWindowHidden?.(() => cancelRecording({ notify: true }))
+    const unsubscribe = platform.window.onHidden?.(() => cancelRecording({ notify: true }))
     if (typeof unsubscribe === 'function') unsubscribeWindowHidden = unsubscribe
   }
   if (typeof document !== 'undefined') {

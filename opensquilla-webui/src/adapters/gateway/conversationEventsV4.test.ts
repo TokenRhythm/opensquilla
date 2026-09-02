@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import {
   canonicalConversationEventName,
+  conversationSemanticEventKind,
   decodeConversationEvent,
   decodeConversationEventFrame,
   isConversationEventName,
@@ -125,5 +126,12 @@ describe('conversation event v4 Adapter', () => {
       .toBe('session.event.turn_committed')
     expect(isConversationEventName('task.running')).toBe(true)
     expect(isConversationEventName('presence')).toBe(false)
+  })
+
+  it('projects canonical, bare, and versioned aliases to the same semantic kind', () => {
+    expect(conversationSemanticEventKind('session.event.text_delta')).toBe('text-delta')
+    expect(conversationSemanticEventKind('text_delta')).toBe('text-delta')
+    expect(conversationSemanticEventKind('session.turn_committed.v1')).toBe('turn-committed')
+    expect(conversationSemanticEventKind('exec.approval.requested')).toBe('approval-requested')
   })
 })

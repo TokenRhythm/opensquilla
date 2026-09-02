@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { useChatAttachments } from './useChatAttachments'
 import type { Attachment } from '@/types/chat'
+import type { ArtifactContentAccess } from '@/modules/artifactWorkbench'
 
 const pushToast = vi.hoisted(() => vi.fn())
 
@@ -38,6 +39,62 @@ async function flushUpload() {
   await new Promise(resolve => setTimeout(resolve, 0))
 }
 
+function useTestChatAttachments() {
+  const content: ArtifactContentAccess = {
+    fetchArtifact: vi.fn(async () => ({
+      ok: false as const,
+      status: 0,
+      url: '',
+      message: 'not used',
+    })),
+    openArtifact: vi.fn(async () => ({
+      ok: false as const,
+      status: 0,
+      url: '',
+      message: 'not used',
+    })),
+    openArtifactBlob: vi.fn(async () => ({
+      ok: false as const,
+      status: 0,
+      url: '',
+      message: 'not used',
+    })),
+    clearPreviewStorage: vi.fn(async () => undefined),
+    fetchAttachment: vi.fn(async () => ({
+      ok: false as const,
+      status: 0,
+      source: 'none' as const,
+      url: '',
+      message: 'not used',
+    })),
+    async uploadAttachment(file, mime) {
+      const form = new FormData()
+      form.append('file', file, file.name)
+      form.append('mime', mime)
+      const token = globalThis.sessionStorage?.getItem('opensquilla.wsToken')?.trim()
+      const response = await fetch('/api/v1/files/upload', {
+        method: 'POST',
+        body: form,
+        credentials: 'same-origin',
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      })
+      if (!response.ok) {
+        const detail = await response.text().catch(() => '')
+        throw new Error(`HTTP ${response.status} ${detail}`)
+      }
+      const raw = await response.json() as Record<string, unknown>
+      const fileUuid = typeof raw.file_uuid === 'string' ? raw.file_uuid.trim() : ''
+      if (!fileUuid) throw new Error('Upload response missing file_uuid')
+      return {
+        fileUuid,
+        ...(typeof raw.expires_at === 'number' ? { expiresAt: raw.expires_at } : {}),
+        ...(typeof raw.ttl_seconds === 'number' ? { ttlSeconds: raw.ttl_seconds } : {}),
+      }
+    },
+  }
+  return useChatAttachments(content)
+}
+
 describe('useChatAttachments', () => {
   beforeEach(() => {
     pushToast.mockClear()
@@ -54,7 +111,7 @@ describe('useChatAttachments', () => {
     const fetchMock = vi.fn().mockResolvedValue(successfulUploadResponse('file-valid'))
     vi.stubGlobal('fetch', fetchMock)
 
-    const attachments = useChatAttachments()
+    const attachments = useTestChatAttachments()
 
     await attachments.addAttachments([stagedPdf('valid.pdf'), stagedBinary()])
     await flushUpload()
@@ -70,7 +127,7 @@ describe('useChatAttachments', () => {
     const fetchMock = vi.fn().mockResolvedValue(successfulUploadResponse('file-zip'))
     vi.stubGlobal('fetch', fetchMock)
 
-    const attachments = useChatAttachments()
+    const attachments = useTestChatAttachments()
 
     await attachments.addAttachment(stagedZip())
     await flushUpload()
@@ -86,7 +143,7 @@ describe('useChatAttachments', () => {
     const fetchMock = vi.fn().mockResolvedValue(successfulUploadResponse('file-text'))
     vi.stubGlobal('fetch', fetchMock)
 
-    const attachments = useChatAttachments()
+    const attachments = useTestChatAttachments()
     const bigText = new File(['a'.repeat(2_000_001)], 'huge.tex', { type: '' })
 
     await attachments.addAttachment(bigText)
@@ -100,7 +157,7 @@ describe('useChatAttachments', () => {
   it('rejects zero-byte files before read or upload work starts', async () => {
     const fetchMock = vi.fn()
     vi.stubGlobal('fetch', fetchMock)
-    const attachments = useChatAttachments()
+    const attachments = useTestChatAttachments()
 
     await attachments.addAttachments([new File([], 'empty.txt', { type: 'text/plain' })])
 
@@ -112,7 +169,7 @@ describe('useChatAttachments', () => {
   it('enforces the frontend aggregate attachment count before upload work starts', async () => {
     const fetchMock = vi.fn().mockResolvedValue(successfulUploadResponse('file-count'))
     vi.stubGlobal('fetch', fetchMock)
-    const attachments = useChatAttachments()
+    const attachments = useTestChatAttachments()
 
     const files = Array.from({ length: 11 }, (_, index) => stagedPdf(`paper-${index}.pdf`))
     await attachments.addAttachments(files)
@@ -126,7 +183,7 @@ describe('useChatAttachments', () => {
   it('emits a single count-cap toast for a batch far over the limit', async () => {
     const fetchMock = vi.fn().mockResolvedValue(successfulUploadResponse('file-count'))
     vi.stubGlobal('fetch', fetchMock)
-    const attachments = useChatAttachments()
+    const attachments = useTestChatAttachments()
 
     const files = Array.from({ length: 15 }, (_, index) => stagedPdf(`paper-${index}.pdf`))
     await attachments.addAttachments(files)
@@ -140,7 +197,7 @@ describe('useChatAttachments', () => {
   it('names the per-type cap when rejecting an oversized file', async () => {
     const fetchMock = vi.fn()
     vi.stubGlobal('fetch', fetchMock)
-    const attachments = useChatAttachments()
+    const attachments = useTestChatAttachments()
     const hugePdf = new File([new Uint8Array(30 * 1024 * 1024 + 1)], 'huge.pdf', { type: 'application/pdf' })
 
     await attachments.addAttachments([hugePdf])
@@ -152,7 +209,7 @@ describe('useChatAttachments', () => {
 
   it('never states a rounded-up cap the rejected file already satisfies', async () => {
     vi.stubGlobal('fetch', vi.fn())
-    const attachments = useChatAttachments()
+    const attachments = useTestChatAttachments()
     const bigEmail = new File([new Uint8Array(2_000_001)], 'mail.eml', { type: 'message/rfc822' })
 
     await attachments.addAttachments([bigEmail])
@@ -164,7 +221,7 @@ describe('useChatAttachments', () => {
   it('emits a single total-size toast for a batch that overflows the aggregate cap', async () => {
     const fetchMock = vi.fn()
     vi.stubGlobal('fetch', fetchMock)
-    const attachments = useChatAttachments()
+    const attachments = useTestChatAttachments()
     attachments.pendingAttachments.value = Array.from({ length: 4 }, (_, index) => ({
       kind: 'staged',
       local_id: index + 1,
@@ -188,7 +245,7 @@ describe('useChatAttachments', () => {
   it('enforces the frontend aggregate attachment size before upload work starts', async () => {
     const fetchMock = vi.fn()
     vi.stubGlobal('fetch', fetchMock)
-    const attachments = useChatAttachments()
+    const attachments = useTestChatAttachments()
     attachments.pendingAttachments.value = Array.from({ length: 4 }, (_, index) => ({
       kind: 'staged',
       local_id: index + 1,
@@ -212,7 +269,7 @@ describe('useChatAttachments', () => {
     const fetchMock = vi.fn().mockResolvedValue(successfulUploadResponse('file-token'))
     vi.stubGlobal('fetch', fetchMock)
 
-    const attachments = useChatAttachments()
+    const attachments = useTestChatAttachments()
     await attachments.addAttachment(stagedPdf())
     await flushUpload()
 
@@ -232,7 +289,7 @@ describe('useChatAttachments', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
 
-    const attachments = useChatAttachments()
+    const attachments = useTestChatAttachments()
     await attachments.addAttachment(stagedPdf('missing-uuid.pdf'))
     await flushUpload()
 
@@ -257,7 +314,7 @@ describe('useChatAttachments', () => {
       .mockResolvedValueOnce(successfulUploadResponse('file-retry'))
     vi.stubGlobal('fetch', fetchMock)
 
-    const attachments = useChatAttachments()
+    const attachments = useTestChatAttachments()
     await attachments.addAttachment(stagedPdf('retry.pdf'))
     await flushUpload()
 
@@ -291,7 +348,7 @@ describe('useChatAttachments', () => {
       })
     vi.stubGlobal('fetch', fetchMock)
 
-    const attachments = useChatAttachments()
+    const attachments = useTestChatAttachments()
     await attachments.addAttachment(stagedPdf('refresh.pdf'))
     await flushUpload()
 
@@ -316,7 +373,7 @@ describe('useChatAttachments', () => {
       text: async () => '',
     })
     vi.stubGlobal('fetch', fetchMock)
-    const attachments = useChatAttachments()
+    const attachments = useTestChatAttachments()
     attachments.pendingAttachments.value = [
       {
         kind: 'staged',
@@ -350,7 +407,7 @@ describe('useChatAttachments', () => {
       text: async () => '',
     })
     vi.stubGlobal('fetch', fetchMock)
-    const attachments = useChatAttachments()
+    const attachments = useTestChatAttachments()
     const composerAttachment: Attachment = {
       kind: 'inline',
       local_id: 1,
@@ -383,7 +440,7 @@ describe('useChatAttachments', () => {
   it('does not refresh staged uploads that are outside the expiration grace window', async () => {
     const fetchMock = vi.fn()
     vi.stubGlobal('fetch', fetchMock)
-    const attachments = useChatAttachments()
+    const attachments = useTestChatAttachments()
     const stagedAttachment: Attachment = {
       kind: 'staged',
       local_id: 1,
@@ -408,7 +465,7 @@ describe('useChatAttachments', () => {
       resolveUpload = resolve
     }))
     vi.stubGlobal('fetch', fetchMock)
-    const attachments = useChatAttachments()
+    const attachments = useTestChatAttachments()
     const stagedAttachment: Attachment = {
       kind: 'staged',
       local_id: 1,
@@ -444,7 +501,7 @@ describe('useChatAttachments', () => {
   it('marks expired staged uploads failed when the original file is unavailable', async () => {
     const fetchMock = vi.fn()
     vi.stubGlobal('fetch', fetchMock)
-    const attachments = useChatAttachments()
+    const attachments = useTestChatAttachments()
     attachments.pendingAttachments.value = [
       {
         kind: 'staged',
@@ -478,7 +535,7 @@ describe('useChatAttachments', () => {
       json: async () => ({}),
     })
     vi.stubGlobal('fetch', fetchMock)
-    const attachments = useChatAttachments()
+    const attachments = useTestChatAttachments()
     attachments.pendingAttachments.value = [
       {
         kind: 'staged',

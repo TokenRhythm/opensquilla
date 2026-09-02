@@ -1,47 +1,17 @@
+import type {
+  Channel,
+  ChannelCapabilityEvidence,
+} from '@/modules/channelAdministration'
+
+export type { Channel, ProbeResult } from '@/modules/channelAdministration'
+
 // Shared channel presentation facts: the row types the gateway's
 // channels.status returns plus the pure formatting helpers the dashboard
 // cards and the drill-in page both render from. Extracted from ChannelsView
 // so the card grid and the full-page detail cannot drift on how a channel's
 // identity, transport, uptime, or delivery health is derived.
 
-export interface CapabilityEvidence {
-  declared?: boolean
-  implemented?: boolean
-  effective?: boolean
-  evidence_kind?: string
-  methods?: string[]
-  proof_status?: string
-}
-
-export interface Channel {
-  name?: string
-  id?: string
-  type?: string
-  status?: string
-  connected?: boolean
-  connected_since?: string | number | null
-  restart_attempts?: number
-  pendingPairings?: number
-  bot_user_id?: string | null
-  enabled?: boolean
-  configured?: boolean
-  capabilities?: string[]
-  capability_profile?: {
-    transports?: string[]
-    maturity?: string
-    evidence?: Record<string, CapabilityEvidence>
-  } | null
-  diagnostics?: Record<string, unknown>
-  [key: string]: unknown
-}
-
-export interface ProbeResult {
-  status: string
-  connected: boolean
-  latencyMs?: number | null
-  detail?: string
-  result?: Record<string, unknown>
-}
+export type CapabilityEvidence = ChannelCapabilityEvidence
 
 export function channelKey(ch: Channel): string {
   return String(ch.name || ch.id || ch.type || 'unknown')

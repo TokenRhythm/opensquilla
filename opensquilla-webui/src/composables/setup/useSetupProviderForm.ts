@@ -1,5 +1,5 @@
 import { computed, ref, type ComputedRef, type Ref } from 'vue'
-import { useRpcStore } from '@/stores/rpc'
+import type { SetupDiscoveryResult, SetupWorkflow } from '@/modules/setupWorkflow'
 
 interface ProviderField {
   name: string
@@ -574,7 +574,7 @@ export function hasEffectiveProvider(config: ProviderConfig, status: SetupStatus
   return ['explicit', 'env', 'not_required'].includes(String(status.llmSource || ''))
 }
 
-export function useSetupProviderForm() {
+export function useSetupProviderForm(setupWorkflow: SetupWorkflow) {
   const providerSelected = ref('')
   const providerFieldValues = ref<Record<string, unknown>>({})
   const touchedFields = ref<Set<string>>(new Set())
@@ -691,28 +691,21 @@ export function useSetupProviderForm() {
     discoverPromise = null
     discoverPromiseForceRefresh = false
     connection.value = { ...freshConnection(providerSelected.value), phase: 'probing' }
-    const rpc = useRpcStore()
     let outcome: ConnectionState
     try {
       const params = connectionParams(options.defaultModel, options.modelOverride)
       const draftParams = profileDraftParams(options.defaultModel, options.modelOverride)
-      const res = await rpc.call<{
-        ok?: boolean
-        failureKind?: string
-        message?: string
-        firstResponseMs?: number
-        totalMs?: number
-        latencyMs?: number
-      }>(
-        options.draftProfile
-          ? 'onboarding.llmProfile.draft.probe'
-          : (options.storedProfile ? 'onboarding.llmProfile.probe' : 'onboarding.provider.probe'),
-        options.draftProfile
-          ? draftParams
-          : (options.storedProfile
-              ? { providerId: providerSelected.value, model: params.model || options.defaultModel || '' }
-              : params),
-      )
+      let res: SetupDiscoveryResult
+      if (options.draftProfile) {
+        res = await setupWorkflow.profile.probeDraft(draftParams)
+      } else if (options.storedProfile) {
+        res = await setupWorkflow.profile.probe({
+          providerId: providerSelected.value,
+          model: params.model || options.defaultModel || '',
+        }) as SetupDiscoveryResult
+      } else {
+        res = await setupWorkflow.provider.probe(params) as SetupDiscoveryResult
+      }
       if (epoch !== connectionEpoch) return
       const timings = normalizeProbeTimings(res)
       if (res?.ok) {
@@ -769,31 +762,22 @@ export function useSetupProviderForm() {
       })
     }
     const epoch = connectionEpoch
-    const rpc = useRpcStore()
     const request = (async () => {
       try {
-        const res = await rpc.call<{
-          ok?: boolean
-          failureKind?: string
-          detail?: string
-          source?: string
-          models?: unknown
-          catalog?: unknown
-        }>(
-          options.draftProfile
-            ? 'onboarding.llmProfile.draft.models.discover'
-            : (options.storedProfile
-                ? 'onboarding.llmProfile.models.discover'
-                : 'onboarding.models.discover'),
-          {
-            ...(options.draftProfile
-              ? profileDraftParams('', options.modelOverride)
-              : (options.storedProfile
-                  ? { providerId: providerSelected.value }
-                  : connectionParams('', options.modelOverride))),
-            ...(options.forceRefresh ? { forceRefresh: true } : {}),
-          },
-        )
+        const payload = {
+          ...(options.draftProfile
+            ? profileDraftParams('', options.modelOverride)
+            : connectionParams('', options.modelOverride)),
+          ...(options.forceRefresh ? { forceRefresh: true } : {}),
+        }
+        const res = options.draftProfile
+          ? await setupWorkflow.profile.discoverDraftModels(payload)
+          : (options.storedProfile
+              ? await setupWorkflow.profile.discoverModels({
+                  providerId: providerSelected.value,
+                  ...(options.forceRefresh ? { forceRefresh: true } : {}),
+                })
+              : await setupWorkflow.provider.discoverModels(payload))
         if (epoch !== connectionEpoch) return
         if (res?.ok) {
           const modelSource = res.source === 'live' ? 'live' : 'none'

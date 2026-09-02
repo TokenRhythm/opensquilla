@@ -154,9 +154,8 @@ import {
   createArtifactPreview,
   type ArtifactPreviewState,
 } from '@/composables/chat/useArtifactPreview'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import {
-  artifactDownloadUrl,
   artifactFileSubtitle,
   artifactFileTitle,
 } from '@/utils/chat/artifacts'
@@ -164,7 +163,6 @@ import {
 const props = defineProps<{
   artifact: ArtifactPayload
   sessionKey?: string
-  authToken?: string
 }>()
 
 const emit = defineEmits<{
@@ -184,22 +182,7 @@ const artifactIdentity = computed(() => [
   props.artifact.mime,
   props.artifact.size,
   props.sessionKey,
-  props.authToken,
 ].map(value => String(value || '')).join('\u0000'))
-
-function sameOrigin(url: string): boolean {
-  try {
-    return new URL(url, window.location.origin).origin === window.location.origin
-  } catch { return false }
-}
-
-function previewHeaders(url: string): Record<string, string> {
-  if (!sameOrigin(url)) return {}
-  const headers: Record<string, string> = {}
-  if (props.sessionKey) headers['x-opensquilla-session-key'] = props.sessionKey
-  if (props.authToken) headers.Authorization = `Bearer ${props.authToken}`
-  return headers
-}
 
 function supportedByBrowser(blob: Blob): boolean {
   const responseMime = String(blob.type || '').split(';', 1)[0].trim().toLowerCase()
@@ -222,15 +205,9 @@ function supportedByBrowser(blob: Blob): boolean {
 // Blob URL keeps session/auth credentials out of the media URL while avoiding
 // bandwidth and memory cost for videos the user never chooses to watch.
 const controller = createArtifactPreview({
-  resolveUrl: () => artifactDownloadUrl(props.artifact, window.location.origin, {
-    sessionKey: props.sessionKey,
-    includeSessionKey: false,
-  }),
-  headers: () => previewHeaders(artifactDownloadUrl(props.artifact, window.location.origin, {
-    sessionKey: props.sessionKey,
-    includeSessionKey: false,
-  })),
-  sameOrigin,
+  artifact: () => props.artifact,
+  sessionKey: () => props.sessionKey,
+  variant: 'content',
   fullSize: false,
   timeoutMs: VIDEO_PREVIEW_TIMEOUT_MS,
   maxBytes: VIDEO_PREVIEW_MAX_BYTES,

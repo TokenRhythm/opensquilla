@@ -1,6 +1,6 @@
 import { ref, type Ref } from 'vue'
 import type { ChatEnsembleMeta, ChatEnsembleMetaModel, ChatMessage } from '@/types/chat'
-import type { EnsembleProgressPayload, RouterDecisionPayload } from '@/types/rpc'
+import type { EnsembleProgressPayload, RouterDecisionPayload } from '@/types/chat'
 import { normalizeEnsembleMemberRole } from '@/utils/ensembleRoles'
 import {
   type NormalizedRouterDecision,

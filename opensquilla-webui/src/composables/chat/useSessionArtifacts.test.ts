@@ -2,9 +2,24 @@ import { nextTick, ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
+import type { ArtifactCatalog } from '@/modules/artifactWorkbench'
+import type { ArtifactPayload } from '@/types/artifacts'
 import type { ChatMessage } from '@/types/chat'
-import type { ArtifactsListResponse, ArtifactPayload } from '@/types/rpc'
-import { useSessionArtifacts } from './useSessionArtifacts'
+import { mergeArtifactSources, useSessionArtifacts } from './useSessionArtifacts'
+
+interface ArtifactsListResponse {
+  artifacts?: ArtifactPayload[]
+  has_more?: boolean
+  hasMore?: boolean
+  oldest_cursor?: string | null
+  oldestCursor?: string | null
+  newest_cursor?: string | null
+  newestCursor?: string | null
+  total_count?: number
+  totalCount?: number
+  page_size?: number
+  pageSize?: number
+}
 
 type RpcCall = <T = unknown>(
   method: string,
@@ -23,7 +38,7 @@ function makeHarness(options: {
     params?: Record<string, unknown>,
     callOptions?: RpcCallOptions,
   ) => Promise<unknown>
-  waitForConnection?: (
+  ready?: (
     timeoutMs?: number,
     signal?: AbortSignal,
     actions?: RpcConnectionWaitOptions,
@@ -36,12 +51,71 @@ function makeHarness(options: {
   const streamArtifacts = ref<ArtifactPayload[]>(options.streamArtifacts || [])
   const callMock = vi.fn(options.call || (async () => ({ artifacts: [], has_more: false })))
   const rpc = {
-    waitForConnection: vi.fn(options.waitForConnection || (async () => {})),
-    supportsMethod: vi.fn(() => options.supported ?? true),
-    markMethodUnavailable: vi.fn(),
+    ready: vi.fn(options.ready || (async () => {})),
+    hasRpcMethod: vi.fn((_method: string) => options.supported ?? true),
+    rememberUnsupportedMethod: vi.fn(),
     call: callMock as unknown as RpcCall,
   }
-  const api = useSessionArtifacts({ rpc, sessionKey, messages, streamArtifacts })
+  const catalog: ArtifactCatalog = {
+    async listSession(key, request = {}) {
+      try {
+        await rpc.ready(10_000, request.signal, {
+          timeoutAction: 'reject',
+          abortAction: 'reject',
+        })
+      } catch (error) {
+        if (error && typeof error === 'object') {
+          ;(error as { artifactCatalogPhase?: string }).artifactCatalogPhase = 'connect'
+        }
+        throw error
+      }
+      if (!rpc.hasRpcMethod('artifacts.list')) return null
+      const visited = new Set<string>()
+      let before: string | null = null
+      let collected: ArtifactPayload[] = []
+      try {
+        for (;;) {
+          const response: ArtifactsListResponse = await rpc.call<ArtifactsListResponse>(
+            'artifacts.list',
+            {
+              sessionKey: key,
+              limit: request.limit ?? 200,
+              ...(before === null ? {} : { before }),
+            },
+            {
+              timeoutMs: 10_000,
+              timeoutAction: 'reconnect',
+              abortAction: 'reject',
+              signal: request.signal,
+            },
+          )
+          const page = Array.isArray(response.artifacts) ? response.artifacts : []
+          collected = mergeArtifactSources(page, collected)
+          if (!Boolean(response.has_more ?? response.hasMore)) return collected
+          const cursor: unknown = response.oldest_cursor ?? response.oldestCursor
+          if (typeof cursor !== 'string' || page.length === 0 || visited.has(cursor)) {
+            throw new Error('Artifact pagination did not provide an advancing cursor')
+          }
+          visited.add(cursor)
+          before = cursor
+        }
+      } catch (error) {
+        const code = (error as { code?: unknown } | null)?.code
+        if (
+          code === 'METHOD_NOT_FOUND'
+          || /method not found/i.test(error instanceof Error ? error.message : String(error))
+        ) {
+          rpc.rememberUnsupportedMethod('artifacts.list')
+          return null
+        }
+        if (error && typeof error === 'object') {
+          ;(error as { artifactCatalogPhase?: string }).artifactCatalogPhase = 'list'
+        }
+        throw error
+      }
+    },
+  }
+  const api = useSessionArtifacts({ catalog, sessionKey, messages, streamArtifacts })
   return { api, callMock, messages, rpc, sessionKey, streamArtifacts }
 }
 
@@ -144,7 +218,7 @@ describe('useSessionArtifacts', () => {
         signal: expect.any(AbortSignal),
       }),
     )
-    expect(rpc.waitForConnection).toHaveBeenCalledWith(
+    expect(rpc.ready).toHaveBeenCalledWith(
       10_000,
       expect.any(AbortSignal),
       { timeoutAction: 'reject', abortAction: 'reject' },
@@ -177,8 +251,8 @@ describe('useSessionArtifacts', () => {
 
     await expect(api.load()).resolves.toBe(false)
 
-    expect(rpc.waitForConnection).toHaveBeenCalledOnce()
-    expect(rpc.supportsMethod).toHaveBeenCalledWith('artifacts.list')
+    expect(rpc.ready).toHaveBeenCalledOnce()
+    expect(rpc.hasRpcMethod).toHaveBeenCalledWith('artifacts.list')
     expect(callMock).not.toHaveBeenCalled()
     expect(api.artifacts.value.map(artifact => artifact.id)).toEqual([
       'art-history',
@@ -197,7 +271,7 @@ describe('useSessionArtifacts', () => {
 
     await expect(api.load()).resolves.toBe(false)
 
-    expect(rpc.markMethodUnavailable).toHaveBeenCalledWith('artifacts.list')
+    expect(rpc.rememberUnsupportedMethod).toHaveBeenCalledWith('artifacts.list')
     expect(api.artifacts.value.map(artifact => artifact.id)).toEqual(['art-history'])
     expect(api.loading.value).toBe(false)
   })
@@ -211,7 +285,7 @@ describe('useSessionArtifacts', () => {
     })
 
     await expect(api.load()).resolves.toBe(true)
-    rpc.supportsMethod.mockReturnValue(false)
+    rpc.hasRpcMethod.mockReturnValue(false)
     await expect(api.load()).resolves.toBe(false)
 
     expect(callMock).toHaveBeenCalledOnce()
@@ -238,7 +312,7 @@ describe('useSessionArtifacts', () => {
     missing = true
     await expect(api.load()).resolves.toBe(false)
 
-    expect(rpc.markMethodUnavailable).toHaveBeenCalledWith('artifacts.list')
+    expect(rpc.rememberUnsupportedMethod).toHaveBeenCalledWith('artifacts.list')
     expect(api.artifacts.value.map(artifact => artifact.id)).toEqual(['art-index'])
     expect(api.indexAvailable.value).toBe(false)
   })
@@ -339,10 +413,10 @@ describe('useSessionArtifacts', () => {
   it('does not suppress reconnect loading after a connection-wait timeout', async () => {
     let waitCalls = 0
     const { api, callMock } = makeHarness({
-      waitForConnection: async () => {
+      ready: async () => {
         waitCalls += 1
         if (waitCalls === 1) {
-          throw Object.assign(new Error('waitForConnection timed out'), {
+          throw Object.assign(new Error('ready timed out'), {
             code: 'RPC_TIMEOUT',
           })
         }
@@ -394,7 +468,7 @@ describe('useSessionArtifacts', () => {
   it('aborts pending connection waits on reset and cleanup', async () => {
     const waitingSignals: AbortSignal[] = []
     const { api } = makeHarness({
-      waitForConnection: async (_timeoutMs, signal) => {
+      ready: async (_timeoutMs, signal) => {
         if (!signal) throw new Error('missing abort signal')
         waitingSignals.push(signal)
         await new Promise<void>((_resolve, reject) => {

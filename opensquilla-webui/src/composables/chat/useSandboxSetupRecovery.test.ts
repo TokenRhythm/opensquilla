@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { effectScope, nextTick, ref } from 'vue'
+import type { SandboxRuntime } from '@/modules/sandboxRuntime'
+import type { SandboxCapabilityReport, SandboxSetupStatusPayload } from '@/types/sandbox'
 import { useSandboxSetupRecovery } from './useSandboxSetupRecovery'
 
 afterEach(() => {
@@ -10,12 +12,31 @@ function payload(state: string, platform = 'win32') {
   return { state, platform, message: state, requiresAdmin: false }
 }
 
+type SandboxRpcCall = (method: string, params?: Record<string, unknown>) => Promise<unknown>
+
+function sandboxFromRpc(
+  rpc: { call: SandboxRpcCall },
+): Pick<SandboxRuntime, 'setupStatus' | 'ensureSetup' | 'capability'> {
+  return {
+    setupStatus: async () => await rpc.call(
+      'sandbox.setup.status',
+    ) as SandboxSetupStatusPayload | null,
+    ensureSetup: async () => await rpc.call(
+      'sandbox.setup.ensure',
+    ) as SandboxSetupStatusPayload | null,
+    capability: async (options?: { refresh?: boolean }) => await rpc.call(
+      'sandbox.capability.status',
+      options?.refresh ? { refresh: true } : undefined,
+    ) as SandboxCapabilityReport,
+  }
+}
+
 describe('useSandboxSetupRecovery', () => {
   it('can defer automatic status RPCs until the session bootstrap admits them', async () => {
     const rpc = { call: vi.fn(async () => payload('ready')) }
     const scope = effectScope()
     const recovery = scope.run(() => useSandboxSetupRecovery({
-      rpc,
+      sandbox: sandboxFromRpc(rpc),
       connectionState: ref('connected'),
       runMode: ref('safe'),
       autoRefresh: false,
@@ -35,7 +56,7 @@ describe('useSandboxSetupRecovery', () => {
     const connectionState = ref('connected')
     const scope = effectScope()
     const recovery = scope.run(() => useSandboxSetupRecovery({
-      rpc,
+      sandbox: sandboxFromRpc(rpc),
       connectionState,
       runMode: ref('safe'),
       autoRefresh: false,
@@ -56,13 +77,13 @@ describe('useSandboxSetupRecovery', () => {
     const rpc = { call: vi.fn(async () => payload('ready')) }
     const scope = effectScope()
     const recovery = scope.run(() => useSandboxSetupRecovery({
-      rpc,
+      sandbox: sandboxFromRpc(rpc),
       connectionState: ref('connected'),
       runMode,
     }))!
 
-    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledWith('sandbox.setup.status'))
-    expect(recovery.status.value?.state).toBe('ready')
+    await vi.waitFor(() => expect(recovery.status.value?.state).toBe('ready'))
+    expect(rpc.call).toHaveBeenCalledWith('sandbox.setup.status')
     expect(recovery.visible.value).toBe(false)
     expect(runMode.value).toBe('safe')
     scope.stop()
@@ -77,7 +98,7 @@ describe('useSandboxSetupRecovery', () => {
     }
     const scope = effectScope()
     const recovery = scope.run(() => useSandboxSetupRecovery({
-      rpc,
+      sandbox: sandboxFromRpc(rpc),
       connectionState: ref('connected'),
       runMode: ref('safe'),
     }))!
@@ -102,7 +123,7 @@ describe('useSandboxSetupRecovery', () => {
     }
     const scope = effectScope()
     const recovery = scope.run(() => useSandboxSetupRecovery({
-      rpc,
+      sandbox: sandboxFromRpc(rpc),
       connectionState: ref('connected'),
       runMode: ref('safe'),
     }))!
@@ -135,7 +156,7 @@ describe('useSandboxSetupRecovery', () => {
     }
     const scope = effectScope()
     const recovery = scope.run(() => useSandboxSetupRecovery({
-      rpc,
+      sandbox: sandboxFromRpc(rpc),
       connectionState: ref('connected'),
       runMode: ref('safe'),
     }))!
@@ -157,7 +178,7 @@ describe('useSandboxSetupRecovery', () => {
     const rpc = { call: vi.fn().mockRejectedValue(new Error('Method not found')) }
     const scope = effectScope()
     const recovery = scope.run(() => useSandboxSetupRecovery({
-      rpc,
+      sandbox: sandboxFromRpc(rpc),
       connectionState: ref('connected'),
       runMode: ref('safe'),
     }))!
@@ -186,7 +207,11 @@ describe('useSandboxSetupRecovery', () => {
       const connectionState = ref('connected')
       const runMode = ref<'safe' | 'full'>('safe')
       const scope = effectScope()
-      const recovery = scope.run(() => useSandboxSetupRecovery({ rpc, connectionState, runMode }))!
+      const recovery = scope.run(() => useSandboxSetupRecovery({
+        sandbox: sandboxFromRpc(rpc),
+        connectionState,
+        runMode,
+      }))!
       await vi.runAllTicks()
       await Promise.resolve()
 
@@ -217,7 +242,7 @@ describe('useSandboxSetupRecovery', () => {
     }
     const scope = effectScope()
     const recovery = scope.run(() => useSandboxSetupRecovery({
-      rpc,
+      sandbox: sandboxFromRpc(rpc),
       connectionState: ref('connected'),
       runMode: ref('safe'),
     }))!
@@ -236,14 +261,14 @@ describe('useSandboxSetupRecovery', () => {
     expect(rpc.call).toHaveBeenCalledTimes(2)
   })
 
-  it('offers owner setup only for Windows not_setup/failed states', async () => {
+  it('offers owner setup for Windows first-time setup', async () => {
     const rpc = {
       call: vi.fn(async (method: string) =>
         method === 'sandbox.setup.ensure' ? payload('ready') : payload('not_setup')),
     }
     const scope = effectScope()
     const recovery = scope.run(() => useSandboxSetupRecovery({
-      rpc,
+      sandbox: sandboxFromRpc(rpc),
       connectionState: ref('connected'),
       runMode: ref('safe'),
     }))!
@@ -256,12 +281,31 @@ describe('useSandboxSetupRecovery', () => {
     scope.stop()
   })
 
+  it.each(['failed', 'unavailable', 'setting_up'])('does not offer setup when status is %s', async (state) => {
+    const rpc = { call: vi.fn(async () => payload(state)) }
+    const scope = effectScope()
+    const recovery = scope.run(() => useSandboxSetupRecovery({
+      sandbox: sandboxFromRpc(rpc),
+      connectionState: ref('connected'),
+      runMode: ref('safe'),
+    }))!
+    await vi.waitFor(() => expect(recovery.resolved.value).toBe(true))
+    expect(recovery.canSetup.value).toBe(false)
+    expect(await recovery.ensureSetup()).toBe(false)
+    expect(rpc.call).not.toHaveBeenCalledWith('sandbox.setup.ensure')
+    scope.stop()
+  })
+
   it('keeps authoritative availability while Full Access is selected', async () => {
     const runMode = ref<'safe' | 'full'>('safe')
     const connectionState = ref('connected')
     const rpc = { call: vi.fn(async () => payload('unavailable', 'darwin')) }
     const scope = effectScope()
-    const recovery = scope.run(() => useSandboxSetupRecovery({ rpc, connectionState, runMode }))!
+    const recovery = scope.run(() => useSandboxSetupRecovery({
+      sandbox: sandboxFromRpc(rpc),
+      connectionState,
+      runMode,
+    }))!
     await vi.waitFor(() => expect(recovery.visible.value).toBe(true))
     expect(recovery.canSetup.value).toBe(false)
 
@@ -278,23 +322,23 @@ describe('useSandboxSetupRecovery', () => {
     scope.stop()
   })
 
-  it('reports each terminal unavailable state once, including in Full Access', async () => {
-    const onUnavailable = vi.fn()
-    const rpc = { call: vi.fn(async () => payload('failed')) }
+  it('keeps terminal failure passive while Full Access is selected', async () => {
+    const rpc = { call: vi.fn(async (_method: string) => payload('failed')) }
     const scope = effectScope()
     const recovery = scope.run(() => useSandboxSetupRecovery({
-      rpc,
+      sandbox: sandboxFromRpc(rpc),
       connectionState: ref('connected'),
       runMode: ref('full'),
-      onUnavailable,
     }))!
 
-    await vi.waitFor(() => expect(onUnavailable).toHaveBeenCalledOnce())
+    await vi.waitFor(() => expect(recovery.resolved.value).toBe(true))
     expect(recovery.status.value?.state).toBe('failed')
     expect(recovery.visible.value).toBe(false)
 
     await recovery.refresh()
-    expect(onUnavailable).toHaveBeenCalledOnce()
+    expect(rpc.call.mock.calls.map(([method]) => method)).toEqual([
+      'sandbox.setup.status', 'sandbox.setup.status',
+    ])
     scope.stop()
   })
 })

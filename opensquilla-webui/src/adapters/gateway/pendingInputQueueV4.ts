@@ -46,7 +46,7 @@ interface RawPendingInputQueuePort {
   list: (sessionKey: string) => Promise<unknown>
   cancel: (request: PendingInputCancelRequest) => Promise<unknown>
   reorder: (request: PendingInputReorderRequest) => Promise<unknown>
-  waitForConnection?: PendingInputQueuePort['waitForConnection']
+  ready?: PendingInputQueuePort['ready']
 }
 
 function isRecord(value: unknown): value is WireRecord {
@@ -232,7 +232,7 @@ function withPendingInputValidation(
       }
     },
   }
-  if (raw.waitForConnection) port.waitForConnection = raw.waitForConnection
+  if (raw.ready) port.ready = raw.ready
   return port
 }
 
@@ -251,7 +251,7 @@ export function createV4PendingInputQueue(
   transport: PendingInputV4Transport,
 ): PendingInputQueuePort {
   const raw = createRawPendingInputQueuePort(transport, METHODS)
-  if (transport.ready) raw.waitForConnection = options => transport.ready!(options)
+  if (transport.ready) raw.ready = options => transport.ready!(options)
   return withPendingInputValidation(raw)
 }
 

@@ -1,6 +1,6 @@
 import { ref, computed } from 'vue'
 import i18n from '@/i18n'
-import type { ProjectWorkspaceItem } from '@/types/rpc'
+import type { WorkspaceItem as ProjectWorkspaceItem } from '@/modules/workspaceCatalog'
 import type { SessionTaskAttention } from '@/composables/useSessionTaskAttention'
 import type { ChatRunStatusSource } from '@/types/chat'
 import type {

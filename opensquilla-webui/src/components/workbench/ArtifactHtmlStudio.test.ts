@@ -6,12 +6,12 @@ import { createI18n } from 'vue-i18n'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import en from '@/locales/en.json'
+import type { ArtifactDocumentProvider } from '@/modules/artifactWorkbench'
 import { useArtifactDocumentsStore } from '@/stores/artifactDocuments'
 import type { ArtifactDocument, ArtifactSourceSnapshot } from '@/types/artifactDocuments'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import {
   createLegacyArtifactWorkspace,
-  type ArtifactDocumentProvider,
 } from '@/workbench/artifactDocumentProvider'
 import ArtifactHtmlStudio from './ArtifactHtmlStudio.vue'
 

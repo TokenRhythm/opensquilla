@@ -5,6 +5,7 @@ import { parseMetaCommandInvocation, useChatSlashCommands } from './useChatSlash
 import type { RpcCallOptions } from '@/lib/rpc'
 import type { MetaRunCenter } from '@/modules/metaRunCenter'
 import type { MetaSetupReadiness } from '@/types/metaSetup'
+import { sessionConversationFromTestRpc } from '@/testing/sessionConversation.test-helper'
 
 function deferred() {
   let resolve!: () => void
@@ -17,12 +18,12 @@ function deferred() {
 function harness(
   planModeAvailable: boolean,
   commands: Array<Record<string, unknown>> = [],
-  waitForConnection: Promise<void> = Promise.resolve(),
+  ready: Promise<void> = Promise.resolve(),
   catalogCallOptions?: RpcCallOptions,
 ) {
   const inputText = ref('')
   const rpc = {
-    waitForConnection: vi.fn(() => waitForConnection),
+    ready: vi.fn(() => ready),
     call: vi.fn().mockResolvedValue({ commands }),
   }
   const metaRunCenter: MetaRunCenter = {
@@ -63,7 +64,7 @@ function harness(
   const goalResume = vi.fn(async () => true)
   const goalClear = vi.fn(async () => true)
   const api = useChatSlashCommands({
-    rpc,
+    sessionConversation: sessionConversationFromTestRpc(rpc),
     metaRunCenter,
     catalogCallOptions,
     inputText,
@@ -138,7 +139,7 @@ describe('useChatSlashCommands plan compatibility', () => {
       catalogCallOptions,
     )
     await api.loadSlashCommands()
-    expect(rpc.waitForConnection).toHaveBeenCalledWith(
+    expect(rpc.ready).toHaveBeenCalledWith(
       2_000,
       undefined,
       {

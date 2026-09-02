@@ -7,10 +7,11 @@ export type SandboxSetupOutcome =
   | 'failed'
   | 'verification_failed'
 
-export type SandboxSetupCall = (
-  method: string,
-  params?: Record<string, unknown>,
-) => Promise<unknown>
+export interface SandboxSetupOperations {
+  ensureSetup: () => Promise<unknown>
+  setupStatus: () => Promise<unknown>
+  capability: () => Promise<Pick<SandboxCapabilityReport, 'available'> | null>
+}
 
 export type SandboxSetupConnectionWait = () => Promise<unknown>
 
@@ -35,9 +36,9 @@ export function normalizeSandboxSetupStatus(payload: unknown): SandboxSetupStatu
 }
 
 export async function ensureSandboxReady(
-  call: SandboxSetupCall,
+  operations: SandboxSetupOperations,
   verifyCapability: (() => Promise<Pick<SandboxCapabilityReport, 'available'> | null>) | null = null,
-  waitForConnection: SandboxSetupConnectionWait | null = null,
+  ready: SandboxSetupConnectionWait | null = null,
 ): Promise<SandboxSetupResult> {
   const finish = async (status: SandboxSetupStatusPayload): Promise<SandboxSetupResult> => {
     if (status.state !== 'ready') {
@@ -49,24 +50,28 @@ export async function ensureSandboxReady(
     }
     const report = verifyCapability
       ? await verifyCapability()
-      : await call('sandbox.capability.status', { refresh: true }) as { available?: unknown }
+      : await operations.capability()
     return report?.available === true
       ? { ready: true, status, outcome: 'ready' }
       : { ready: false, status, outcome: 'verification_failed' }
   }
 
   try {
-    const status = normalizeSandboxSetupStatus(await call('sandbox.setup.ensure'))
+    const status = normalizeSandboxSetupStatus(
+      await operations.ensureSetup(),
+    )
     if (!status) return { ready: false, status: null, outcome: 'failed' }
     return await finish(status)
   } catch {
-    if (!waitForConnection) return { ready: false, status: null, outcome: 'failed' }
+    if (!ready) return { ready: false, status: null, outcome: 'failed' }
     try {
       // The elevated Windows helper can finish successfully after the browser's
       // original response socket has gone away. Reconnect and ask the Gateway
       // for authoritative state instead of making the user repeat UAC.
-      await waitForConnection()
-      const status = normalizeSandboxSetupStatus(await call('sandbox.setup.status'))
+      await ready()
+      const status = normalizeSandboxSetupStatus(
+        await operations.setupStatus(),
+      )
       if (!status) return { ready: false, status: null, outcome: 'failed' }
       return await finish(status)
     } catch {

@@ -72,7 +72,7 @@ export interface PendingInputQueuePort {
   list: (sessionKey: string) => Promise<PendingInputServerItem[]>
   cancel: (request: PendingInputCancelRequest) => Promise<void>
   reorder: (request: PendingInputReorderRequest) => Promise<PendingInputReorderResult>
-  waitForConnection?: (options?: {
+  ready?: (options?: {
     timeoutMs?: number
     signal?: AbortSignal
   }) => Promise<void>

@@ -489,15 +489,36 @@ export interface PlatformSettingsApi {
       sandboxUnavailableWarningSuppressed?: boolean
     },
   ) => Promise<DesktopPreferences>
-  reportSandboxUnavailable?: (
-    payload: { state: 'failed' | 'unavailable'; message?: string },
-  ) => Promise<{ shown: boolean; suppressed: boolean }>
 }
 
 export interface PlatformOnboardingApi {
   getDefaults?: () => Promise<unknown>
   save?: (payload: unknown) => Promise<unknown>
   cancel?: () => Promise<unknown>
+}
+
+/** Desktop-only migration operations; Web exposes an empty implementation. */
+export interface PlatformMigrationApi {
+  getRecoveryState?: () => Promise<unknown>
+  retryProfileConsolidation?: () => Promise<{ ok: boolean; error?: string }>
+  chooseLegacyAgentDataLocation?: (payload?: Record<string, never>) => Promise<unknown>
+  migrationSummary?: (payload?: { source?: string }) => Promise<unknown>
+  migrationBrowseSource?: (payload: { kind: string }) => Promise<unknown>
+  migrationRun?: (payload: { previewId: string; overwrite?: boolean }) => Promise<unknown>
+  migrationTakeLastResult?: () => Promise<unknown>
+  migrationPeekLastResult?: () => Promise<unknown>
+  migrationDismissLastResult?: () => Promise<unknown>
+  revealRecoveryPath?: (payload: { target: 'primary' | 'backups' }) => Promise<boolean>
+  onMigrationProgress?: (callback: (payload: unknown) => void) => () => void
+  inspectDesktopCleanup?: (payload: { mode: string }) => Promise<unknown>
+  discardDesktopCleanup?: (payload: { previewId: string }) => Promise<boolean>
+  applyDesktopCleanup?: (payload: { previewId: string; acknowledged: boolean; confirmation: string }) => Promise<unknown>
+  revealDesktopUserData?: () => Promise<boolean>
+  abandonCleanupTransaction?: () => Promise<unknown>
+}
+
+export interface PlatformWindowApi {
+  onHidden?: (callback: () => void) => void | (() => void)
 }
 
 export interface PlatformUpdatesApi {
@@ -515,6 +536,8 @@ export interface Platform {
   gateway: PlatformGatewayApi
   settings: PlatformSettingsApi
   onboarding: PlatformOnboardingApi
+  migration: PlatformMigrationApi
+  window: PlatformWindowApi
   files: PlatformFilesApi
   workbench: PlatformWorkbenchApi
   updates: PlatformUpdatesApi

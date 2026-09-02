@@ -30,6 +30,7 @@ import type {
   TurnSteerRequest,
   TurnCommands,
 } from '@/modules/turnCommands'
+import type { MetaRunCenter } from '@/modules/metaRunCenter'
 import type { ChatRpcStreamApi } from '@/composables/chat/useChatRpcEventHandlers'
 import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
 import type {
@@ -84,10 +85,6 @@ import {
   STOPPED_STREAM_TASK_ID,
   taskTerminalMessage,
 } from '@/utils/chat/streamEvents'
-
-type RpcClient = {
-  call: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
-}
 
 /**
  * The pending-steer WAL and delivery helper still store the historical v4
@@ -480,15 +477,9 @@ function chatSourceMetadata(options: UseChatSendOptions): TurnSendSource {
 }
 
 export interface UseChatSendOptions {
-  rpc: RpcClient
+  metaRunCenter?: Pick<MetaRunCenter, 'discardDraft'>
   /** Semantic command port; v4 method aliases live in the Gateway Adapter. */
   turnCommands: TurnCommands
-  /**
-   * @deprecated Test-only bridge for legacy harnesses; TurnCommands owns all
-   * turn capability checks in production. Remove with the S14 command
-   * Contract migration.
-   */
-  supportsMethod?: (method: string) => boolean
   activeSteerCapability?: Readonly<Ref<ChatSteerCapability | null>>
   inputText: Ref<string>
   messages: Ref<ChatMessage[]>
@@ -4251,8 +4242,9 @@ export function useChatSend(options: UseChatSendOptions) {
     sessionKey: string,
     clientRequestId: string,
   ): Promise<boolean> {
+    if (!options.metaRunCenter) return false
     try {
-      const result = await options.rpc.call<{ discarded?: boolean; accepted?: boolean }>('meta.drafts.discard', {
+      const result = await options.metaRunCenter.discardDraft({
         sessionKey,
         clientRequestId,
       })

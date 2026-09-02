@@ -1,42 +1,22 @@
 import type { RpcEventHandler } from '@/lib/rpc'
 import type { ConversationEventSourceHandlers } from '@/modules/conversationEventHub'
+import type {
+  ConversationEvent,
+  ConversationEventProjection,
+} from '@/modules/conversationEvents'
+import { conversationEventSessionKey } from '@/modules/conversationEvents'
 import {
+  conversationSemanticEventKind,
   decodeConversationEvent,
-  type DecodedConversationEvent,
 } from './conversationEventsV4'
 
 /**
- * A decoded event message is the only event shape that leaves the v4 adapter.
- * `wireName` and `payload` are retained for compatibility with the existing
- * reducer (which still understands a few legacy spellings), while `decoded`
- * carries the validated/canonical projection for new consumers.  Keeping the
- * raw values here avoids forcing a behavior change while the reducer is moved
- * behind the ConversationRuntime seam in the next slice.
+ * A semantic event message is the only event shape that leaves the v4 adapter.
+ * The opaque payload remains byte-for-byte owned by the producer, while wire
+ * names and aliases stop here.
  */
-export type ConversationEventTransportMessage =
-  | {
-      kind: 'conversation'
-      wireName: string
-      decoded: DecodedConversationEvent
-      payload: unknown
-      meta: unknown
-    }
-  | {
-      kind: 'sessions-changed'
-      wireName: 'sessions.changed'
-      decoded: null
-      payload: unknown
-      meta: unknown
-    }
-  | {
-      /** A malformed/unrelated frame kept for the legacy wildcard reducer. */
-      kind: 'invalid'
-      wireName: string
-      decoded: null
-      payload: unknown
-      meta: unknown
-      error: unknown
-    }
+export type ConversationEventTransportMessage = ConversationEvent
+export type { ConversationEventProjection }
 
 export interface ConversationEventTransportHandlers
   extends ConversationEventSourceHandlers<ConversationEventTransportMessage> {
@@ -49,14 +29,9 @@ export interface ConversationEventTransportHandlers
  * module about JSON-RPC field spellings. Directory invalidations are global by
  * design and therefore return null.
  */
-export function conversationEventSessionKey(
-  message: ConversationEventTransportMessage,
-): string | null {
-  if (message.kind === 'sessions-changed') return null
-  if (message.kind === 'conversation' && message.decoded.sessionKey) {
-    return message.decoded.sessionKey
-  }
-  const payload = message.payload
+export { conversationEventSessionKey }
+
+function rawSessionKey(payload: unknown): string | null {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null
   const value = payload as Record<string, unknown>
   for (const name of ['key', 'session_key', 'sessionKey']) {
@@ -89,21 +64,30 @@ export function createConversationEventTransport(rpc: RpcSubscriptionClient) {
       if (eventName === 'sessions.changed') {
         handlers.onEvent?.({
           kind: 'sessions-changed',
-          wireName: 'sessions.changed',
-          decoded: null,
           payload: rawPayload,
           meta: rawMeta,
         })
-        handlers.onAny?.(eventName, rawPayload)
+        return
+      }
+
+      const semanticKind = conversationSemanticEventKind(eventName)
+      if (semanticKind === 'approval-requested' || semanticKind === 'approval-resolved') {
+        handlers.onEvent?.({
+          kind: 'approval',
+          action: semanticKind === 'approval-requested' ? 'requested' : 'resolved',
+          sessionKey: rawSessionKey(rawPayload),
+          payload: rawPayload,
+          meta: rawMeta,
+        })
         return
       }
 
       try {
         const decoded = decodeConversationEvent(eventName, rawPayload, rawMeta)
+        const { name: _wireName, ...event } = decoded
         handlers.onEvent?.({
           kind: 'conversation',
-          wireName: eventName,
-          decoded,
+          event: event as ConversationEventProjection,
           payload: rawPayload,
           meta: rawMeta,
         })
@@ -113,15 +97,10 @@ export function createConversationEventTransport(rpc: RpcSubscriptionClient) {
         // `invalid` message and report the contract violation for diagnostics.
         handlers.onEvent?.({
           kind: 'invalid',
-          wireName: eventName,
-          decoded: null,
-          payload: rawPayload,
-          meta: rawMeta,
           error,
         })
-        handlers.onDecodeError?.(error, eventName, rawPayload)
+        handlers.onDecodeError?.(error)
       }
-      handlers.onAny?.(eventName, rawPayload)
     }
 
     const offWildcard = rpc.on('*', onEvent)

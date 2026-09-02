@@ -2,7 +2,11 @@ import { describe, expect, it, vi } from 'vitest'
 import { useChatRpcSubscriptions } from './useChatRpcSubscriptions'
 import type { RpcEventHandler } from '@/lib/rpc'
 import { createConversationEventHub } from '@/modules/conversationEventHub'
-import type { ConversationEventTransportMessage } from '@/adapters/gateway/conversationEventTransport'
+import {
+  createConversationEventTransport,
+  conversationEventSessionKey,
+  type ConversationEventTransportMessage,
+} from '@/adapters/gateway/conversationEventTransport'
 
 function rpcHarness() {
   const listeners = new Map<string, Set<RpcEventHandler>>()
@@ -23,16 +27,24 @@ function rpcHarness() {
   return rpc
 }
 
+function runtimeHarness(rpc: ReturnType<typeof rpcHarness>) {
+  return {
+    events: createConversationEventHub(createConversationEventTransport(rpc), {
+      sessionKey: conversationEventSessionKey,
+    }),
+  }
+}
+
 describe('useChatRpcSubscriptions', () => {
   it('bridges one logical subscription through the event hub and detaches idempotently', () => {
     const rpc = rpcHarness()
     const event = vi.fn()
-    const any = vi.fn()
     const state = vi.fn()
-    const bridge = useChatRpcSubscriptions(rpc, {
+    const bridge = useChatRpcSubscriptions({
       onEvent: event,
-      onAny: any,
       onConnectionState: state,
+    }, {
+      runtime: runtimeHarness(rpc),
     })
 
     const detach = bridge.subscribe()
@@ -45,8 +57,12 @@ describe('useChatRpcSubscriptions', () => {
     }, {})
     rpc.emit('_state', 'connected')
     expect(event).toHaveBeenCalledTimes(1)
-    expect(any).toHaveBeenCalledWith('session.event.text_delta', expect.any(Object))
     expect(state).toHaveBeenCalledWith('connected')
+    rpc.emit('_state', 'disconnected')
+    rpc.emit('_state', 'connected')
+    expect(state.mock.calls.map(call => call[0]))
+      .toEqual(['connected', 'disconnected', 'connected'])
+    expect(rpc.count('*')).toBe(1)
 
     detach()
     detach()
@@ -58,7 +74,10 @@ describe('useChatRpcSubscriptions', () => {
     const rpc = rpcHarness()
     const primary = vi.fn()
     const secondary = vi.fn()
-    const bridge = useChatRpcSubscriptions(rpc, { onEvent: primary })
+    const bridge = useChatRpcSubscriptions(
+      { onEvent: primary },
+      { runtime: runtimeHarness(rpc) },
+    )
     const primaryDetach = bridge.subscribe()
     const secondaryStream = bridge.open('agent:main:secondary', secondary)
 
@@ -81,9 +100,8 @@ describe('useChatRpcSubscriptions', () => {
     const event = vi.fn()
     let currentKey = 'agent:main:alpha'
     const bridge = useChatRpcSubscriptions(
-      rpc,
       { onEvent: event },
-      { getSessionKey: () => currentKey },
+      { runtime: runtimeHarness(rpc), getSessionKey: () => currentKey },
     )
     bridge.subscribe()
 
@@ -114,12 +132,11 @@ describe('useChatRpcSubscriptions', () => {
       },
     }, {
       sessionKey: message => (
-        message.kind === 'conversation' ? message.decoded.sessionKey : null
+        message.kind === 'conversation' ? message.event.sessionKey : null
       ),
     })
     const event = vi.fn()
     const bridge = useChatRpcSubscriptions(
-      rpc,
       { onEvent: event },
       { runtime: { events: hub }, getSessionKey: () => 'agent:main:a' },
     )
@@ -128,8 +145,6 @@ describe('useChatRpcSubscriptions', () => {
     expect(rpc.count('*')).toBe(0)
     sourceState.emit?.({
       kind: 'sessions-changed',
-      wireName: 'sessions.changed',
-      decoded: null,
       payload: {},
       meta: {},
     })

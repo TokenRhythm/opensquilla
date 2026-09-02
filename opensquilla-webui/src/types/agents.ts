@@ -1,3 +1,9 @@
+export interface AgentOption {
+  id: string
+  name: string
+  model?: string
+}
+
 export interface Agent {
   id?: string
   name?: string

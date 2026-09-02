@@ -1,7 +1,11 @@
 import { readFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { walkFiles } from './lib/fs-walk.mjs'
+
+const require = createRequire(import.meta.url)
+const ts = require('typescript')
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const srcRoot = join(root, 'src')
@@ -10,13 +14,48 @@ const allowedDesktopGlobal = new Set([
   'src/platform/desktop.ts',
   'src/vite-env.d.ts',
 ])
-const bannedPatterns = [
-  {
-    pattern: 'window.opensquillaDesktop',
-    allow: allowedDesktopGlobal,
-    message: 'Electron preload access must stay behind src/platform/.',
-  },
-]
+function unwrapExpression(node) {
+  let current = node
+  while (
+    ts.isParenthesizedExpression(current)
+    || ts.isAsExpression(current)
+    || ts.isTypeAssertionExpression(current)
+    || ts.isNonNullExpression(current)
+  ) {
+    current = current.expression
+  }
+  return current
+}
+
+function globalObjectName(node) {
+  const current = unwrapExpression(node)
+  return ts.isIdentifier(current) && new Set(['window', 'globalThis', 'self']).has(current.text)
+}
+
+function isDesktopGlobalAccess(node) {
+  if (ts.isPropertyAccessExpression(node)) {
+    return node.name.text === 'opensquillaDesktop' && globalObjectName(node.expression)
+  }
+  if (ts.isElementAccessExpression(node)) {
+    const argument = node.argumentExpression
+    return globalObjectName(node.expression)
+      && ts.isStringLiteralLike(argument)
+      && argument.text === 'opensquillaDesktop'
+  }
+  return false
+}
+
+function desktopGlobalAccesses(body, rel) {
+  if (allowedDesktopGlobal.has(rel)) return 0
+  const source = ts.createSourceFile(rel, body, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+  let count = 0
+  function visit(node) {
+    if (isDesktopGlobalAccess(node)) count += 1
+    ts.forEachChild(node, visit)
+  }
+  visit(source)
+  return count
+}
 const stalePlatformPatterns = [
   'activeProfile',
   'cloudUrl',
@@ -51,10 +90,11 @@ const failures = []
 for (const file of walkFiles(srcRoot, /\.(ts|vue)$/, { skipFile: isTestFile })) {
   const rel = relative(root, file).replace(/\\/g, '/')
   const body = readFileSync(file, 'utf8')
-  for (const rule of bannedPatterns) {
-    if (body.includes(rule.pattern) && !rule.allow.has(rel)) {
-      failures.push(`${rel}: ${rule.message} Found "${rule.pattern}".`)
-    }
+  const desktopAccessCount = desktopGlobalAccesses(body, rel)
+  if (desktopAccessCount > 0) {
+    failures.push(
+      `${rel}: Electron preload access must stay behind src/platform/. Found ${desktopAccessCount} AST property access(es).`,
+    )
   }
   for (const pattern of stalePlatformPatterns) {
     if (body.includes(pattern)) {

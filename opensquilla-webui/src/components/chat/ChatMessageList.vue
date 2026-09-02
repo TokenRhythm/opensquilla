@@ -80,7 +80,6 @@
           :tool-status-text="toolStatusText"
           :tool-secondary-text="toolSecondaryText"
           :session-key="sessionKey"
-          :auth-token="authToken"
           :workbench-enabled="workbenchEnabled"
           :artifact-navigation-items="artifactNavigationItems"
           :copy-message="copyMessage"
@@ -152,7 +151,7 @@ import type {
   ChatToolCallRenderItem,
   ToolResultContext,
 } from '@/types/chat'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import {
   goalHasSettledTerminalOutcome,
   type GoalSnapshot,
@@ -192,7 +191,6 @@ const props = defineProps<{
   downloadAttachment: (attachment: import('@/types/chat').DisplayAttachment) => Promise<boolean>
   artifactNavigationItems?: ArtifactPayload[]
   sessionKey?: string
-  authToken?: string
   workbenchEnabled?: boolean
   workbenchResourcePreviewEnabled?: boolean
   workbenchResourceEditEnabled?: boolean

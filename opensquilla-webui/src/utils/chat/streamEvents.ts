@@ -1,4 +1,5 @@
-import type { SessionEventPayload, StreamEventEnvelope } from '@/types/rpc'
+import type { SessionEventPayload, StreamEventEnvelope } from '@/types/chat'
+import type { ConversationSemanticEventKind } from '@/modules/conversationEvents'
 import {
   createConversationRuntime,
   type ConversationCursorSignal,
@@ -153,25 +154,33 @@ export function sessionChangeIsTerminal(
   return ['failed', 'timeout', 'cancelled', 'interrupted'].includes(runStatus)
 }
 
-export function taskTerminalStatus(event: string): string {
-  if (!event.startsWith('task.')) return ''
-  const status = event.slice('task.'.length)
-  return ['succeeded', 'failed', 'timeout', 'abandoned', 'cancelled'].includes(status) ? status : ''
+export function taskTerminalStatus(event: ConversationSemanticEventKind): string {
+  const statusByKind: Partial<Record<ConversationSemanticEventKind, string>> = {
+    'task-succeeded': 'succeeded',
+    'task-failed': 'failed',
+    'task-timed-out': 'timeout',
+    'task-abandoned': 'abandoned',
+    'task-cancelled': 'cancelled',
+  }
+  return statusByKind[event] ?? ''
 }
 
-export function taskTerminalAsSessionEvent(event: string, payload: SessionEventPayload | null | undefined) {
-  // session.event.done is the rich terminal receipt (final text + usage), but
-  // TaskRuntime also emits task.succeeded after its handler returns. Treat that
+export function taskTerminalAsSessionEvent(
+  event: ConversationSemanticEventKind,
+  payload: SessionEventPayload | null | undefined,
+) {
+  // The rich completion receipt carries final text + usage, but TaskRuntime
+  // also emits a lifecycle success after its handler returns. Treat that
   // lifecycle event as a terminal fallback so a missing done frame cannot leave
   // the client spinning forever on an otherwise completed turn.
-  if (event === 'task.succeeded') {
-    return { event: 'session.event.done', payload: { ...(payload || {}), reason: 'completed' } }
+  if (event === 'task-succeeded') {
+    return { kind: 'turn-completed' as const, payload: { ...(payload || {}), reason: 'completed' } }
   }
-  if (event === 'task.cancelled') {
-    return { event: 'session.event.done', payload: { ...(payload || {}), reason: 'aborted' } }
+  if (event === 'task-cancelled') {
+    return { kind: 'turn-completed' as const, payload: { ...(payload || {}), reason: 'aborted' } }
   }
-  if (!['task.failed', 'task.timeout', 'task.abandoned'].includes(event)) return null
-  const status = event.replace('task.', '')
+  const status = taskTerminalStatus(event)
+  if (!['failed', 'timeout', 'abandoned'].includes(status)) return null
   const outcome = payload?.turn_outcome && typeof payload.turn_outcome === 'object'
     ? payload.turn_outcome as Record<string, unknown>
     : {}
@@ -183,7 +192,7 @@ export function taskTerminalAsSessionEvent(event: string, payload: SessionEventP
     ? payloadCode
     : /^[a-z][a-z0-9_.-]*$/.test(terminalReason) ? terminalReason : status
   return {
-    event: 'session.event.error',
+    kind: 'turn-failed' as const,
     payload: { ...(payload || {}), message: taskTerminalMessage(status, payload), code },
   }
 }

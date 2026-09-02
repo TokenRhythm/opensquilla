@@ -1,21 +1,8 @@
 import { computed, ref, type Ref } from 'vue'
-import {
-  waitForSessionRpcConnection,
-} from '@/composables/chat/sessionBootstrapAdmission'
-import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
-
-type RpcClient = {
-  waitForConnection: (
-    timeoutMs?: number,
-    signal?: AbortSignal,
-    actions?: RpcConnectionWaitOptions,
-  ) => Promise<void>
-  call: <T = unknown>(
-    method: string,
-    params?: Record<string, unknown>,
-    callOptions?: RpcCallOptions,
-  ) => Promise<T>
-}
+import type {
+  SessionConversation,
+  SessionConversationRequestOptions,
+} from '@/modules/sessionConversation'
 
 export interface ChatUsageAccumulator {
   input: number
@@ -28,8 +15,8 @@ export interface ChatUsageAccumulator {
 }
 
 export interface UseChatUsageWidgetOptions {
-  rpc: RpcClient
-  readCallOptions?: RpcCallOptions
+  sessionConversation: SessionConversation
+  readCallOptions?: SessionConversationRequestOptions
   sessionKey: Ref<string>
   tokenVizEnabled: () => boolean
 }
@@ -61,29 +48,6 @@ export interface ContextWarning {
   windowK: number
 }
 
-interface UsageStatusSession {
-  session?: string
-  sessionKey?: string
-  key?: string
-  input_tokens?: number
-  inputTokens?: number
-  output_tokens?: number
-  outputTokens?: number
-  cache_read_tokens?: number
-  cacheReadTokens?: number
-  cache_write_tokens?: number
-  cacheWriteTokens?: number
-  cost_usd?: number
-  costUsd?: number
-  model?: string
-  contextStatus?: ContextStatus | null
-  context_status?: ContextStatus | null
-}
-
-interface UsageStatusResponse {
-  sessions?: UsageStatusSession[]
-}
-
 export function createEmptyUsageAccumulator(): ChatUsageAccumulator {
   return {
     input: 0,
@@ -97,6 +61,7 @@ export function createEmptyUsageAccumulator(): ChatUsageAccumulator {
 }
 
 export function useChatUsageWidget(options: UseChatUsageWidgetOptions) {
+  const conversation = options.sessionConversation
   const usageAccum = ref<ChatUsageAccumulator>(createEmptyUsageAccumulator())
   const usageModel = ref('')
   const savingsPopupLastTs = ref(0)
@@ -161,15 +126,8 @@ export function useChatUsageWidget(options: UseChatUsageWidgetOptions) {
   async function loadCurrentSessionUsage() {
     if (!options.sessionKey.value) return
     try {
-      await waitForSessionRpcConnection(options.rpc, options.readCallOptions)
-      const params = { sessionKey: options.sessionKey.value }
-      const usage = options.readCallOptions
-        ? await options.rpc.call<UsageStatusResponse>(
-            'usage.status',
-            params,
-            options.readCallOptions,
-          )
-        : await options.rpc.call<UsageStatusResponse>('usage.status', params)
+      await conversation.ready(options.readCallOptions)
+      const usage = await conversation.usage(options.sessionKey.value, options.readCallOptions)
       const sessions = usage?.sessions || []
       const current = sessions.find(s => (s.session || s.sessionKey || s.key) === options.sessionKey.value)
       if (current) {

@@ -202,7 +202,7 @@ import {
   type ArtifactPreviewResourceState,
   type NativeHtmlArtifactResource,
 } from '@/composables/workbench/useArtifactPreviewResource'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import type { WorkbenchComponentEvent } from '@/workbench/types'
 import {
   artifactFileSubtitle,
@@ -214,7 +214,6 @@ import { ARTIFACT_PREVIEW_ESCAPE_MESSAGE } from '@/utils/workbench/artifactPrevi
 const props = withDefaults(defineProps<{
   agentEditInProgress?: boolean
   artifact: ArtifactPayload
-  authToken?: string
   baseOrigin?: string
   nativeHtml?: boolean
   nativeSurfaceState?: 'crashed' | 'error' | 'loading' | 'ready'
@@ -230,7 +229,6 @@ const props = withDefaults(defineProps<{
   suspended?: boolean
 }>(), {
   agentEditInProgress: false,
-  authToken: '',
   baseOrigin: '',
   nativeHtml: false,
   nativeSurfaceState: 'loading',
@@ -260,7 +258,6 @@ const htmlFrameGeneration = ref(0)
 
 const preview = useArtifactPreviewResource({
   artifact: () => props.artifact,
-  authToken: () => props.authToken,
   baseOrigin: () => props.baseOrigin,
   htmlCollectionStatus: () => props.previewCollectionStatus,
   htmlLaunchUrl: () => props.previewLaunchUrl,
@@ -282,7 +279,6 @@ const resourceSignature = computed(() => [
   props.artifact.mime || '',
   props.artifact.size || '',
   props.sessionKey,
-  props.authToken,
   props.baseOrigin,
   props.nativeHtml ? 'native' : 'web',
   props.previewBlocked ? 'blocked' : 'unblocked',

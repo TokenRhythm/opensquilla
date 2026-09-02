@@ -280,10 +280,9 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, nextTick } from 'vue'
+import { ref, computed, inject, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
-import { useRpcStore } from '@/stores/rpc'
 import Icon from '@/components/Icon.vue'
 import ErrorState from '@/components/ErrorState.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
@@ -292,17 +291,20 @@ import { isAgentBuiltin, useAgentDrawer } from '@/composables/agents/useAgentDra
 import { useDialogA11y } from '@/composables/useDialogA11y'
 import type { Agent } from '@/types/agents'
 import { useToasts } from '@/composables/useToasts'
+import { AGENT_CATALOG_KEY } from '@/modules/agentCatalog'
 
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 
 const { t } = useI18n()
-const rpc = useRpcStore()
+const injectedAgentCatalog = inject(AGENT_CATALOG_KEY)
+if (!injectedAgentCatalog) throw new Error('AgentCatalog was not provided')
+const agentCatalog = injectedAgentCatalog
 const { pushToast } = useToasts()
 const router = useRouter()
 
-const { agents, loadData, loading, error } = useAgentsData()
+const { agents, loadData, loading, error } = useAgentsData(agentCatalog)
 const newId = ref('')
 const newName = ref('')
 
@@ -393,7 +395,7 @@ async function onInlineAdd() {
   const payload: Record<string, unknown> = { id }
   if (name) payload.name = name
   try {
-    await rpc.call('agents.create', payload)
+    await agentCatalog.create(payload)
     pushToast(t('console.agents.toastCreated', { id }), { tone: 'ok' })
     newId.value = ''
     newName.value = ''
@@ -430,7 +432,7 @@ async function onSave() {
       saving.value = false
       return
     }
-    await rpc.call('agents.update', payload)
+    await agentCatalog.update(payload)
     pushToast(t('console.agents.toastUpdated', { id: drawerAgentId.value }), { tone: 'ok' })
     await loadData()
     const updated = agents.value.find(a => a.id === drawerAgentId.value)
@@ -463,7 +465,7 @@ async function deleteAgent(id?: string) {
   )
   if (!ok) return
   try {
-    await rpc.call('agents.delete', { id })
+    await agentCatalog.remove(id)
     pushToast(t('console.agents.toastDeleted', { id }), { tone: 'ok' })
     await loadData()
   } catch (err: unknown) {

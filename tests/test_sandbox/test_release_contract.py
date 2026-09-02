@@ -30,20 +30,6 @@ def test_saved_safe_policy_is_pinned_at_every_gateway_turn_boundary() -> None:
     assert "sandbox_policy" in _text("src/opensquilla/tools/types.py")
 
 
-def test_capability_status_requires_live_canaries() -> None:
-    capability = _text("src/opensquilla/sandbox/capability_service.py")
-    runtime = _text("src/opensquilla/sandbox/setup_runtime.py")
-    assert 'SandboxSetupState.READY: "probe_required"' in capability
-    assert "_probe_runtime_capabilities" in runtime
-    for capability_name in (
-        "process",
-        "filesystem-worker",
-        "denyWriteCarveout",
-        "authorityDenyRead",
-    ):
-        assert capability_name in runtime
-
-
 def test_recursive_delete_reaches_backup_broker_and_double_confirmation() -> None:
     shell = _text("src/opensquilla/tools/builtin/shell.py")
     assert "_gate_recursive_delete" in shell

@@ -7,6 +7,13 @@ import { dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { _electron as electron } from 'playwright'
+import {
+  canAcceptWindowsElectronShutdownFallback,
+  closeElectronWithDeadline,
+  closeHttpServerWithDeadline,
+  desktopShutdownEvidenceSince,
+  trackHttpServerConnections,
+} from './e2e-shutdown-helpers.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
@@ -19,6 +26,7 @@ const importScreenshotDir = String(
 ).trim()
 const SOURCE_CHAT = 'synthetic imported chat survives whole-profile transfer'
 const PROFILE_FIXTURE_TIMEOUT_MS = 120_000
+const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000
 async function waitFor(check, label, timeoutMs = 90_000) {
   const startedAt = Date.now()
   let lastError
@@ -69,6 +77,7 @@ async function startFakeProvider() {
       ].join('\n'))
     })
   })
+  const connections = trackHttpServerConnections(server)
   await new Promise((resolveListen, rejectListen) => {
     const onError = (error) => rejectListen(error)
     server.once('error', onError)
@@ -85,11 +94,10 @@ async function startFakeProvider() {
     setMode(nextMode) {
       mode = nextMode
     },
-    async close() {
-      await new Promise((resolveClose, rejectClose) => {
-        server.close((error) => (error ? rejectClose(error) : resolveClose()))
-      })
-    },
+    close: () => closeHttpServerWithDeadline(server, connections, {
+      label: 'profile import fake provider shutdown',
+      timeoutMs: ELECTRON_SHUTDOWN_TIMEOUT_MS,
+    }),
   }
 }
 
@@ -359,6 +367,37 @@ with sqlite3.connect(Path(sys.argv[1]) / "state" / "sessions.db") as connection:
 const root = await realpath(await mkdtemp(join(tmpdir(), 'opensquilla-profile-import-e2e-')))
 let app = null
 let fakeProvider = null
+let activeAppUserData = null
+
+async function closeActiveApp(phase, { failOnError = true } = {}) {
+  if (!app) return
+  const targetApp = app
+  const profileUserData = activeAppUserData
+  app = null
+  activeAppUserData = null
+  const desktopLogPath = join(profileUserData, 'logs', 'desktop.log')
+  const desktopLogCheckpoint = await readFile(desktopLogPath, 'utf8').catch(() => null)
+  const shutdown = await closeElectronWithDeadline({
+    app: targetApp,
+    phase,
+    timeoutMs: ELECTRON_SHUTDOWN_TIMEOUT_MS,
+  })
+  if (!shutdown.error) return
+  const desktopLog = await readFile(desktopLogPath, 'utf8').catch(() => null)
+  const shutdownEvidence = desktopShutdownEvidenceSince(desktopLogCheckpoint, desktopLog)
+  if (canAcceptWindowsElectronShutdownFallback({
+    shutdown,
+    ...shutdownEvidence,
+  })) {
+    console.warn(JSON.stringify({
+      event: 'desktop_e2e_windows_shell_wrapper_reaped_after_commit',
+      phase,
+    }))
+    return
+  }
+  if (failOnError) throw shutdown.error
+}
+
 try {
   if (importScreenshotDir) await mkdir(importScreenshotDir, { recursive: true })
 
@@ -370,13 +409,13 @@ try {
   seedProfile(cliOnlySource, SOURCE_IDENTITY, SOURCE_CHAT)
   const cliOnlySourceBefore = await snapshotTree(cliOnlySource)
   app = await launchDesktop(cliOnlyUserData, cliOnlyHome, 18921)
+  activeAppUserData = cliOnlyUserData
   let page = await onboardingPage(app)
   await page.locator('[data-screen="1"].active').waitFor({ state: 'visible' })
   assert.equal(await page.locator('[data-screen="0"]').count(), 0)
   assert.equal(await page.locator('[data-screen="5"]').count(), 0)
   assert.deepEqual(await snapshotTree(cliOnlySource), cliOnlySourceBefore)
-  await app.close()
-  app = null
+  await closeActiveApp('cli-only-electron-shutdown')
 
   if (process.platform === 'win32') {
     const portableHome = join(root, 'portable-home')
@@ -403,6 +442,7 @@ try {
     // only after the user opens the Settings migration surface.
     const settingsOnlyUserData = join(root, 'portable-settings-only-user-data')
     app = await launchDesktop(settingsOnlyUserData, portableHome, 18925)
+    activeAppUserData = settingsOnlyUserData
     page = await onboardingPage(app)
     await page.locator('[data-screen="1"].active').waitFor({ state: 'visible' })
     assert.equal(await page.locator('[data-screen="0"]').count(), 0)
@@ -424,8 +464,7 @@ try {
       portableSources.candidates.some((candidate) => candidate.path === tempPortable),
       true,
     )
-    await app.close()
-    app = null
+    await closeActiveApp('portable-settings-only-electron-shutdown')
     assert.deepEqual(await snapshotTree(localPortable), localPortableBefore)
     assert.deepEqual(await snapshotTree(tempPortable), tempPortableBefore)
 
@@ -443,6 +482,7 @@ try {
   const targetSessionsBefore = await readFile(join(target, 'state', 'sessions.db'))
   const targetConfigBefore = await readFile(join(target, 'config.toml'))
   app = await launchDesktop(userData, importHome, 18922)
+  activeAppUserData = userData
   page = await onboardingPage(app)
   await page.locator('[data-screen="1"].active').waitFor({ state: 'visible' })
   assert.equal(await page.locator('[data-screen="0"]').count(), 0)
@@ -461,8 +501,7 @@ try {
   assert.deepEqual(await readFile(join(target, 'state', 'sessions.db')), targetSessionsBefore)
   assert.deepEqual(await snapshotTree(join(target, 'workspace')), targetWorkspaceBefore)
   assert.equal((await readdir(userData)).some((name) => name.startsWith('opensquilla.backup.')), false)
-  await app.close()
-  app = null
+  await closeActiveApp('existing-profile-electron-shutdown')
 
   // Settings import with a required key must release exclusive admission before
   // onboarding, preserve source config bytes, and retain the previous credential.
@@ -504,6 +543,7 @@ try {
     apiKey: 'synthetic-old-target-key',
   })
   app = await launchDesktop(settingsUserData, settingsHome, 18924)
+  activeAppUserData = settingsUserData
   const settingsControl = await controlPage(app)
   const settingsPreview = await settingsControl.evaluate(async (sourcePath) => (
     await window.opensquillaDesktop.migrationSummary({ source: sourcePath })
@@ -633,8 +673,7 @@ try {
   if (process.platform !== 'win32') {
     assert.equal((await lstat(credentialBackup)).mode & 0o777, 0o600)
   }
-  await app.close()
-  app = null
+  await closeActiveApp('settings-import-electron-shutdown')
   await fakeProvider.close()
   fakeProvider = null
 
@@ -650,7 +689,7 @@ try {
     primaryOnly: true,
   }, null, 2))
 } finally {
-  if (app) await app.close().catch(() => {})
+  await closeActiveApp('profile-import-final-shutdown', { failOnError: false })
   if (fakeProvider) await fakeProvider.close().catch(() => {})
   await rm(root, { recursive: true, force: true })
 }
