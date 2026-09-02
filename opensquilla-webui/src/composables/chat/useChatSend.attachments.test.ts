@@ -3229,7 +3229,10 @@ describe('useChatSend attachment payloads', () => {
     expect(await pendingInputWal.listHandoffs!()).toEqual([])
   })
 
-  it('keeps the recovery worker until the background-only accepted CAS is durable', async () => {
+  async function expectBackgroundCasRetry(
+    shouldFailTransition: (record: ResponseHandoffWalRecord | null) => boolean,
+    expectedRetainedState: ResponseHandoffWalRecord['state'],
+  ) {
     vi.useFakeTimers()
     try {
       const {
@@ -3240,12 +3243,12 @@ describe('useChatSend attachment payloads', () => {
         messageActions,
       } = makeEditedMessageState('edited question')
       const baseWal = memoryHandoffWal()
-      let failAcceptedTransition = true
+      let failTransition = true
       const pendingInputWal: PendingInputWal = {
         ...baseWal,
         compareAndSwapHandoff: vi.fn(async (owner, walOwner, revision, record) => {
-          if (record?.state === 'accepted' && failAcceptedTransition) {
-            failAcceptedTransition = false
+          if (shouldFailTransition(record) && failTransition) {
+            failTransition = false
             return { applied: false, record: (await baseWal.listHandoffs!())[0] || null }
           }
           return baseWal.compareAndSwapHandoff!(owner, walOwner, revision, record)
@@ -3282,7 +3285,10 @@ describe('useChatSend attachment payloads', () => {
 
       expect(acceptanceRecoveryPending.value).toBe(true)
       expect(await pendingInputWal.listHandoffs!()).toEqual([
-        expect.objectContaining({ state: 'submitting', backgroundOnly: true }),
+        expect.objectContaining({
+          state: expectedRetainedState,
+          backgroundOnly: true,
+        }),
       ])
 
       await vi.advanceTimersByTimeAsync(250)
@@ -3292,7 +3298,19 @@ describe('useChatSend attachment payloads', () => {
     } finally {
       vi.useRealTimers()
     }
-  })
+  }
+
+  it.each([
+    ['accepted transition', (record: ResponseHandoffWalRecord | null) => (
+      record?.state === 'accepted'
+    ), 'submitting'],
+    ['final deletion', (record: ResponseHandoffWalRecord | null) => record === null, 'accepted'],
+  ] as const)(
+    'keeps the recovery worker until the background-only %s CAS is durable',
+    async (_label, shouldFailTransition, expectedRetainedState) => {
+      await expectBackgroundCasRetry(shouldFailTransition, expectedRetainedState)
+    },
+  )
 
   it('keeps the recovery worker when background-only WAL persistence fails', async () => {
     vi.useFakeTimers()

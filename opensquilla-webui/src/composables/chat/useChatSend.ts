@@ -1859,10 +1859,11 @@ export function useChatSend(options: UseChatSendOptions) {
       gate.ownerRequestId,
     ).catch(() => false)
     if (queueReleased !== true) return false
-    gate.backgroundFinalized = true
-    if (gate.durableRecord && await deleteResponseHandoff(gate.durableRecord)) {
+    if (gate.durableRecord) {
+      if (!await deleteResponseHandoff(gate.durableRecord)) return false
       gate.durableRecord = null
     }
+    gate.backgroundFinalized = true
     return true
   }
 
