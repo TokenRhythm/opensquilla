@@ -19,11 +19,20 @@ type TurnSteerMode = Literal["durable", "legacy"]
 
 
 @dataclass(frozen=True, slots=True)
+class PendingInputGuard:
+    pending_input_id: str
+    request_fingerprint: str
+    expected_revision: int
+    source_scope: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class AdmitTurn:
     session_key: str
     message: str
     surface: TurnAdmissionSurface
     attributes: Mapping[str, Any]
+    pending_input: PendingInputGuard | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +51,7 @@ class SteerTurn:
     message: str
     mode: TurnSteerMode
     attributes: Mapping[str, Any]
+    pending_input: PendingInputGuard | None = None
 
 
 class TurnAdmissionRuntimePort(Protocol):
@@ -64,6 +74,7 @@ class TurnAdmission:
         key = self._session_key(command.session_key)
         if not isinstance(command.message, str):
             raise ValueError("message must be a string")
+        self._validate_pending_guard(command.pending_input)
         return await self._runtime.admit(replace(command, session_key=key))
 
     async def cancel(self, command: CancelTurn) -> Mapping[str, Any]:
@@ -84,7 +95,23 @@ class TurnAdmission:
             raise ValueError("message must be a string")
         if not command.message.strip():
             raise ValueError("message must not be blank")
+        self._validate_pending_guard(command.pending_input, require_source=True)
         return await self._runtime.steer(replace(command, session_key=key))
+
+    @staticmethod
+    def _validate_pending_guard(
+        guard: PendingInputGuard | None,
+        *,
+        require_source: bool = False,
+    ) -> None:
+        if guard is None:
+            return
+        if not guard.pending_input_id.strip() or not guard.request_fingerprint.strip():
+            raise ValueError("pending input identity must be non-empty")
+        if guard.expected_revision < 1:
+            raise ValueError("pending input revision must be positive")
+        if require_source and not (guard.source_scope or "").strip():
+            raise ValueError("pending input source scope must be non-empty")
 
     @staticmethod
     def _session_key(value: str) -> str:
@@ -97,6 +124,7 @@ class TurnAdmission:
 __all__ = [
     "AdmitTurn",
     "CancelTurn",
+    "PendingInputGuard",
     "SteerTurn",
     "TurnAdmission",
     "TurnAdmissionRuntimePort",

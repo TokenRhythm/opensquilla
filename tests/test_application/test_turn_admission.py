@@ -3,9 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import pytest
+
 from opensquilla.application.turn_admission import (
     AdmitTurn,
     CancelTurn,
+    PendingInputGuard,
     SteerTurn,
     TurnAdmission,
 )
@@ -76,3 +79,21 @@ async def test_exact_task_cancel_fails_closed_before_runtime() -> None:
         "reason": "task_id_required",
     }
     assert runtime.cancellations == []
+
+
+async def test_pending_steer_requires_complete_atomic_guard() -> None:
+    runtime = _Runtime()
+    application = TurnAdmission(runtime)
+
+    with pytest.raises(ValueError, match="source scope"):
+        await application.steer(
+            SteerTurn(
+                "agent:main:webchat:one",
+                "guide",
+                "durable",
+                {},
+                pending_input=PendingInputGuard("pending-1", "fingerprint", 2),
+            )
+        )
+
+    assert runtime.steers == []

@@ -43,6 +43,9 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         # Canonical and legacy turn wire models terminate at TurnAdmission's
         # generated registration Adapter.
         "src/opensquilla/gateway/adapters/turn_admission_contract.py",
+        # Durable pending-input wire models terminate at the queue Adapter;
+        # the Application Module receives queue identities and revisions.
+        "src/opensquilla/gateway/adapters/pending_input_queue_contract.py",
         # SandboxRuntime handlers stay legacy-compatible while generated
         # descriptors own registration metadata and success validation.
         "src/opensquilla/gateway/adapters/sandbox_runtime_contract.py",
@@ -126,7 +129,7 @@ SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
 SESSIONS_RESOLVE_LITERAL_ALLOWLIST: Counter[str] = Counter()
 SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
 RUNTIME_RPC_METHOD_BASELINE = 306
-STATIC_RPC_DECORATOR_BASELINE = 227
+STATIC_RPC_DECORATOR_BASELINE = 220
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
 # closure measurement below.  The temporary S2a cumulative growth budget was
@@ -237,6 +240,9 @@ SESSION_LIFECYCLE_AUTHORED_FILES = (
     "src/opensquilla/application/turn_admission.py",
     "src/opensquilla/gateway/adapters/turn_admission.py",
     "src/opensquilla/gateway/adapters/turn_admission_contract.py",
+    "src/opensquilla/application/pending_input_queue.py",
+    "src/opensquilla/gateway/adapters/pending_input_queue.py",
+    "src/opensquilla/gateway/adapters/pending_input_queue_contract.py",
 )
 SESSION_LIFECYCLE_AUTHORED_LOC_CEILING = 3_000
 
@@ -928,6 +934,13 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "sessions.abort",
             "sessions.steer.v2",
             "sessions.steer",
+            "sessions.pending_inputs.enqueue",
+            "sessions.pending_inputs.list",
+            "sessions.pending_inputs.update",
+            "sessions.pending_inputs.reorder",
+            "sessions.pending_inputs.cancel",
+            "sessions.pending_inputs.dispatch",
+            "sessions.pending_inputs.steer",
         }
     ] == []
     assert [
@@ -1155,6 +1168,9 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
         assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
         assert entry.handler.__name__ == "handle_contract_method"
 
+    from opensquilla.gateway.adapters.pending_input_queue_contract import (
+        PENDING_INPUT_QUEUE_CONTRACT_METHODS,
+    )
     from opensquilla.gateway.adapters.session_lifecycle_contract import (
         SESSION_LIFECYCLE_CONTRACT_METHODS,
     )
@@ -1169,6 +1185,7 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
         *SESSION_LIFECYCLE_CONTRACT_METHODS,
         *SESSION_MAINTENANCE_CONTRACT_METHODS,
         *TURN_ADMISSION_CONTRACT_METHODS,
+        *PENDING_INPUT_QUEUE_CONTRACT_METHODS,
     ):
         entry = registry.get_entry(method)
         assert entry is not None
