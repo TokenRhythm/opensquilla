@@ -365,6 +365,21 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     } as ChatPendingItem
   }
 
+  function replaceItemFromWalRecord(
+    item: ChatPendingItem,
+    record: PendingInputWalRecord,
+  ) {
+    delete item.promptAnnotationIds
+    delete item.confirmedPlainText
+    delete item.ownerRequestId
+    delete item.pendingRetainAfterCancel
+    delete item.pendingRequestFingerprint
+    delete item.pendingServerRevision
+    delete item.pendingPosition
+    delete item.deliveryState
+    Object.assign(item, itemFromWalRecord(record))
+  }
+
   function removedIdentity(sessionKey: string, pendingInputId: string): string {
     return `${queueSessionKey(sessionKey)}\u0000${pendingInputId}`
   }
@@ -671,11 +686,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     for (const record of records) {
       const existing = existingById.get(record.pendingInputId)
       if (existing && record.retainAfterCancel === true) {
-        Object.assign(existing, itemFromWalRecord(record))
-        delete existing.deliveryState
-        delete existing.pendingRequestFingerprint
-        delete existing.pendingServerRevision
-        delete existing.pendingPosition
+        replaceItemFromWalRecord(existing, record)
         continue
       }
       if (
@@ -1165,17 +1176,18 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           if (mutation.record) {
             // Another tab still owns a live row. Keep this queue slot as an
             // ordering barrier and allow a later hydrate to reconcile it.
-            forgetRemoval(sessionKey, item.pendingInputId!)
+            if (
+              mutation.record.state !== 'cancelling'
+              || mutation.record.retainAfterCancel === true
+            ) {
+              forgetRemoval(sessionKey, item.pendingInputId!)
+            }
             if (
               mutation.record.sessionKey === sessionKey
               && mutation.record.clientRequestId === item.pendingClientRequestId
               && mutation.record.clientMessageId === item.pendingClientMessageId
             ) {
-              Object.assign(item, itemFromWalRecord(mutation.record))
-              delete item.deliveryState
-              delete item.pendingRequestFingerprint
-              delete item.pendingServerRevision
-              delete item.pendingPosition
+              replaceItemFromWalRecord(item, mutation.record)
             }
             return false
           }
@@ -1694,6 +1706,25 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     ))
   }
 
+  function collisionFreeComposerAttachments(
+    attachments: Attachment[],
+    existing: Attachment[] = options.pendingAttachments.value,
+  ): Attachment[] {
+    const usedLocalIds = new Set(existing.map(attachment => attachment.local_id))
+    let nextRecoveredLocalId = -1
+    return attachments.map(attachment => {
+      if (!usedLocalIds.has(attachment.local_id)) {
+        usedLocalIds.add(attachment.local_id)
+        return attachment
+      }
+      while (usedLocalIds.has(nextRecoveredLocalId)) nextRecoveredLocalId -= 1
+      const rekeyed = { ...attachment, local_id: nextRecoveredLocalId }
+      usedLocalIds.add(nextRecoveredLocalId)
+      nextRecoveredLocalId -= 1
+      return rekeyed
+    })
+  }
+
   function restoreDurableItemIntoComposer(
     item: ChatPendingItem,
     restore: () => void,
@@ -1790,7 +1821,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           : attachment
       ))
       options.pendingAttachments.value = [
-        ...restoredAttachments,
+        ...collisionFreeComposerAttachments(restoredAttachments),
         ...options.pendingAttachments.value,
       ]
       options.pendingSessionIntent.value = (
@@ -1827,7 +1858,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     if (durableItem(tail)) {
       restoreDurableItemIntoComposer(tail, () => {
         options.inputText.value = tail.text || ''
-        options.pendingAttachments.value = tail.attachments || []
+        options.pendingAttachments.value = collisionFreeComposerAttachments(
+          tail.attachments || [],
+          [],
+        )
         options.pendingSessionIntent.value = tail.intent || null
         options.autoResizeTextarea()
       })
@@ -1835,7 +1869,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     }
     pendingQueue.value.splice(tailIndex, 1)
     options.inputText.value = tail?.text || ''
-    options.pendingAttachments.value = tail?.attachments || []
+    options.pendingAttachments.value = collisionFreeComposerAttachments(
+      tail?.attachments || [],
+      [],
+    )
     options.pendingSessionIntent.value = tail?.intent || null
     options.autoResizeTextarea()
     return true
@@ -1853,12 +1890,6 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         && !p.steerAttempt
         && !hasUneditablePendingAttachments(p),
     )
-    const retained = pendingQueue.value.filter(
-      p => p.hiddenControl
-        || p.deliveryState
-        || p.steerAttempt
-        || hasUneditablePendingAttachments(p),
-    )
     if (visible.length === 0) return false
     const immediate = visible.filter(item => !durableItem(item))
     const durable = visible.filter(durableItem)
@@ -1867,9 +1898,17 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const headIntent = immediate[0]?.intent
     const current = options.inputText.value || ''
     const joined = [current, ...queuedTexts].filter(Boolean).join('\n')
-    pendingQueue.value = [...retained, ...durable]
+    const immediateItems = new Set(immediate)
+    for (let index = pendingQueue.value.length - 1; index >= 0; index--) {
+      if (immediateItems.has(pendingQueue.value[index]!)) {
+        pendingQueue.value.splice(index, 1)
+      }
+    }
     options.inputText.value = joined
-    options.pendingAttachments.value = [...options.pendingAttachments.value, ...queuedAttachments]
+    options.pendingAttachments.value = [
+      ...options.pendingAttachments.value,
+      ...collisionFreeComposerAttachments(queuedAttachments),
+    ]
     options.pendingSessionIntent.value = options.pendingSessionIntent.value || headIntent || null
     options.autoResizeTextarea()
     options.resetInputHistory()
@@ -1884,7 +1923,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         .join('\n')
       options.pendingAttachments.value = [
         ...options.pendingAttachments.value,
-        ...(item.attachments || []),
+        ...collisionFreeComposerAttachments(item.attachments || []),
       ]
       options.pendingSessionIntent.value = (
         options.pendingSessionIntent.value || item.intent || null
@@ -1974,7 +2013,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       ) return
       pendingQueue.value.shift()
       options.inputText.value = head.text || ''
-      options.pendingAttachments.value = head.attachments || []
+      options.pendingAttachments.value = collisionFreeComposerAttachments(
+        head.attachments || [],
+        [],
+      )
       options.pendingSessionIntent.value = head.intent || null
       options.sendCurrentInput()
     })
