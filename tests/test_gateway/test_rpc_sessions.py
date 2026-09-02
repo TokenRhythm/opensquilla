@@ -4855,6 +4855,138 @@ class TestSessionsSend:
 
 class TestSessionsSteer:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["sessions.steer.v2", "sessions.steer"])
+    @pytest.mark.parametrize(
+        "cron_session",
+        [
+            pytest.param(
+                FakeSession(session_key="cron:job-1:run:steer"),
+                id="canonical-key",
+            ),
+            pytest.param(
+                FakeSession(
+                    session_key="scheduled-run-with-legacy-steer-key",
+                    origin={"kind": "cron"},
+                ),
+                id="legacy-origin",
+            ),
+        ],
+    )
+    async def test_steer_rejects_cron_session_before_runtime_or_persistence(
+        self,
+        dispatcher,
+        method: str,
+        cron_session: FakeSession,
+    ) -> None:
+        runtime = SimpleNamespace(
+            active_task_id=AsyncMock(
+                side_effect=AssertionError("Cron rejection must precede runtime lookup")
+            ),
+            steer=AsyncMock(
+                side_effect=AssertionError("Cron rejection must precede runtime steering")
+            ),
+            admit_steer=AsyncMock(
+                side_effect=AssertionError("Cron rejection must precede steer admission")
+            ),
+        )
+        manager = FakeSessionManager([cron_session])
+        ctx = make_ctx(session_manager=manager, task_runtime=runtime)
+
+        response = await dispatcher.dispatch(
+            "r-steer-cron-rejected",
+            method,
+            {
+                "key": cron_session.session_key,
+                "message": "must not be accepted",
+                "expected_turn_id": "turn-running",
+                "client_request_id": "request-steer-cron",
+                "client_message_id": "client-steer-cron",
+            },
+            ctx,
+        )
+
+        assert response.ok is False
+        assert response.error.code == "SESSION_NOT_INTERACTIVE"
+        assert response.error.accepted is False
+        assert response.error.retryable is False
+        assert manager.created_messages == []
+        runtime.active_task_id.assert_not_awaited()
+        runtime.steer.assert_not_awaited()
+        runtime.admit_steer.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pending_input_steer_rejects_cron_without_consuming_row(
+        self,
+        dispatcher,
+        tmp_path,
+    ) -> None:
+        from opensquilla.session.manager import SessionManager
+        from opensquilla.session.models import SessionNode
+        from opensquilla.session.storage import SessionStorage
+
+        key = "scheduled-run-with-pending-steer"
+        store = SessionStorage(str(tmp_path / "pending-cron-steer.db"))
+        await store.connect()
+        await store.upsert_session(
+            SessionNode(
+                session_key=key,
+                session_id="session-pending-cron-steer",
+                agent_id="main",
+                created_at=100,
+                updated_at=100,
+                origin={"kind": "cron"},
+            )
+        )
+        manager = SessionManager(store, inject_time_prefix=False)
+        payload = {
+            "key": key,
+            "message": "queued guidance",
+            "attachments": [],
+            "queueMode": "followup",
+            "clientRequestId": "request-pending-cron-steer",
+            "clientMessageId": "client-pending-cron-steer",
+            "_source": {"caller_kind": "web", "channel_kind": "web"},
+        }
+        fingerprint = request_fingerprint(payload)
+        row, replayed = await store.enqueue_pending_chat_input(
+            pending_input_id="pending-cron-steer-1",
+            session_key=key,
+            source_scope="web:web:operator",
+            client_request_id="request-pending-cron-steer",
+            client_message_id="client-pending-cron-steer",
+            request_fingerprint=fingerprint,
+            payload=payload,
+        )
+        assert replayed is False
+        ctx = make_ctx(session_manager=manager, task_runtime=SimpleNamespace())
+        try:
+            response = await dispatcher.dispatch(
+                "r-pending-cron-steer",
+                "sessions.pending_inputs.steer",
+                {
+                    "key": key,
+                    "pendingInputId": row.pending_input_id,
+                    "clientRequestId": row.client_request_id,
+                    "clientMessageId": row.client_message_id,
+                    "requestFingerprint": row.request_fingerprint,
+                    "expectedRevision": row.state_revision,
+                    "expected_turn_id": "turn-running",
+                    "_source": {"caller_kind": "web", "channel_kind": "web"},
+                },
+                ctx,
+            )
+
+            assert response.ok is False
+            assert response.error.code == "SESSION_NOT_INTERACTIVE"
+            assert [
+                item.pending_input_id
+                for item in await store.list_pending_chat_inputs(key)
+            ] == [row.pending_input_id]
+            assert await store.get_transcript("session-pending-cron-steer") == []
+        finally:
+            await store.close()
+
+    @pytest.mark.asyncio
     async def test_pending_input_steer_atomically_consumes_durable_row(
         self,
         dispatcher,
@@ -5112,12 +5244,18 @@ class TestSessionsSteer:
             finally:
                 store.accept_turn = original_accept_turn  # type: ignore[method-assign]
             await store.remove_project_workspace(workspace.workspace_id, now_ms=200)
+            stored_session = await store.get_session(key)
+            assert stored_session is not None
+            stored_session.origin = {"kind": "cron"}
+            await store.upsert_session(stored_session)
             replayed = await dispatcher.dispatch(
                 "r-steer-v2-replay",
                 "sessions.steer.v2",
                 params,
                 ctx,
             )
+            stored_session.origin = None
+            await store.upsert_session(stored_session)
             unavailable = await dispatcher.dispatch(
                 "r-steer-v2-workspace-unavailable",
                 "sessions.steer.v2",

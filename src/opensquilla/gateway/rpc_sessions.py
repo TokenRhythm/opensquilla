@@ -8166,21 +8166,6 @@ async def _handle_sessions_steer_v2_impl(
             accepted=False,
         )
 
-    task_runtime = getattr(ctx, "task_runtime", None)
-    admit_steer = getattr(task_runtime, "admit_steer", None)
-    if not callable(admit_steer):
-        return _steer_v2_failure(
-            key=key,
-            expected_turn_id=expected_turn_id,
-            failure_code="STEER_V2_UNAVAILABLE",
-            capability={
-                "mode": "disabled",
-                "expected_turn_id": expected_turn_id,
-                "input_kinds": [],
-                "reason": "gateway_upgrade_required",
-            },
-        )
-
     source_hint = _normalize_session_send_source_hint(params)
     normalized = normalize_incoming_text(
         raw_message,
@@ -8279,6 +8264,32 @@ async def _handle_sessions_steer_v2_impl(
                 surface_id=surface_id,
                 storage=storage,
             )
+
+    if key.startswith("cron:") or is_noninteractive_cron_session(
+        session,
+        channel_types=_channel_types_from_config(ctx.config),
+    ):
+        raise RpcHandlerError(
+            "SESSION_NOT_INTERACTIVE",
+            "Cron isolated sessions are read-only and cannot receive new turns.",
+            retryable=False,
+            accepted=False,
+        )
+
+    task_runtime = getattr(ctx, "task_runtime", None)
+    admit_steer = getattr(task_runtime, "admit_steer", None)
+    if not callable(admit_steer):
+        return _steer_v2_failure(
+            key=key,
+            expected_turn_id=expected_turn_id,
+            failure_code="STEER_V2_UNAVAILABLE",
+            capability={
+                "mode": "disabled",
+                "expected_turn_id": expected_turn_id,
+                "input_kinds": [],
+                "reason": "gateway_upgrade_required",
+            },
+        )
 
     workspace_guard = None
     bound_workspace_id = getattr(session, "workspace_id", None)
@@ -8517,6 +8528,16 @@ async def _handle_sessions_steer(params: dict | None, ctx: RpcContext) -> dict:
     session = await storage.get_session(key)
     if session is None:
         raise KeyError(f"Session not found: {key}")
+    if key.startswith("cron:") or is_noninteractive_cron_session(
+        session,
+        channel_types=_channel_types_from_config(ctx.config),
+    ):
+        raise RpcHandlerError(
+            "SESSION_NOT_INTERACTIVE",
+            "Cron isolated sessions are read-only and cannot receive new turns.",
+            retryable=False,
+            accepted=False,
+        )
 
     task_runtime = getattr(ctx, "task_runtime", None)
     active_task_id = getattr(task_runtime, "active_task_id", None)
