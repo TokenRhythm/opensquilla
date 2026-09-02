@@ -111,6 +111,13 @@ from opensquilla.gateway.adapters.sessions_resolve_contract import (
 from opensquilla.gateway.adapters.sessions_search_contract import (
     register_sessions_search_contract,
 )
+from opensquilla.gateway.adapters.turn_admission import (
+    GatewayTurnAdmissionAdapter,
+    GatewayTurnAdmissionCallbacks,
+)
+from opensquilla.gateway.adapters.turn_admission_contract import (
+    register_turn_admission_contract,
+)
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
 from opensquilla.gateway.artifact_product_errors import (
     ArtifactProductErrorCode,
@@ -3451,7 +3458,6 @@ _INGRESS_TURN_AUTHORITY_SCOPE: ContextVar[_IngressTurnAuthorityScope | None] = C
 )
 
 
-@_d.method("sessions.send", scope="operator.write")
 async def _handle_sessions_send_impl(
     params: dict | None,
     ctx: RpcContext,
@@ -8042,7 +8048,6 @@ async def _handle_pending_inputs_steer(
         )
 
 
-@_d.method("sessions.steer.v2", scope="operator.write")
 async def _handle_sessions_steer_v2(params: dict | None, ctx: RpcContext) -> dict:
     return await _handle_sessions_steer_v2_impl(params, ctx)
 
@@ -8479,7 +8484,6 @@ async def _handle_sessions_steer_v2_impl(
     )
 
 
-@_d.method("sessions.steer", scope="operator.write")
 async def _handle_sessions_steer(params: dict | None, ctx: RpcContext) -> dict:
     """Inject text into the active turn, with a durable follow-up fallback."""
 
@@ -8830,7 +8834,6 @@ async def _emit_to_subscribers(
     )
 
 
-@_d.method("sessions.abort", scope="operator.write")
 async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
     key = _require_key(params)
 
@@ -12469,3 +12472,74 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
         "epoch": epoch,
         "stream_cursor": stream_cursor,
     }
+
+
+def _session_turn_admission_adapter(ctx: RpcContext) -> GatewayTurnAdmissionAdapter:
+    return GatewayTurnAdmissionAdapter(
+        ctx,
+        GatewayTurnAdmissionCallbacks(
+            require_key=_require_key,
+            execute_session_send=_handle_sessions_send,
+            execute_session_abort=_handle_sessions_abort,
+            execute_durable_steer=_handle_sessions_steer_v2,
+            execute_legacy_steer=_handle_sessions_steer,
+        ),
+    )
+
+
+async def _handle_sessions_send_contract(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    return await _session_turn_admission_adapter(ctx).admit(params, surface="session")
+
+
+async def _handle_sessions_abort_contract(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    return await _session_turn_admission_adapter(ctx).cancel(params, surface="session")
+
+
+async def _handle_sessions_steer_v2_contract(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    return await _session_turn_admission_adapter(ctx).steer(params, durable=True)
+
+
+async def _handle_sessions_steer_contract(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    return await _session_turn_admission_adapter(ctx).steer(params, durable=False)
+
+
+_handle_sessions_send_generated_contract = register_turn_admission_contract(
+    _d,
+    "sessions.send",
+    _handle_sessions_send_contract,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_sessions_abort_generated_contract = register_turn_admission_contract(
+    _d,
+    "sessions.abort",
+    _handle_sessions_abort_contract,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_sessions_steer_v2_generated_contract = register_turn_admission_contract(
+    _d,
+    "sessions.steer.v2",
+    _handle_sessions_steer_v2_contract,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_sessions_steer_generated_contract = register_turn_admission_contract(
+    _d,
+    "sessions.steer",
+    _handle_sessions_steer_contract,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)

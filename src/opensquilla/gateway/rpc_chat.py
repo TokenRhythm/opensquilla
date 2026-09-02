@@ -29,6 +29,13 @@ from opensquilla.gateway.adapters.session_history import (
 from opensquilla.gateway.adapters.session_read_contract import (
     register_chat_history_contract,
 )
+from opensquilla.gateway.adapters.turn_admission import (
+    GatewayTurnAdmissionAdapter,
+    GatewayTurnAdmissionCallbacks,
+)
+from opensquilla.gateway.adapters.turn_admission_contract import (
+    register_turn_admission_contract,
+)
 from opensquilla.gateway.compaction_target import (
     effective_session_model,
     resolve_gateway_compaction_target,
@@ -925,7 +932,6 @@ async def _enforce_context_overflow(
     return None
 
 
-@_d.method("chat.send", scope="operator.write")
 async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
     if not isinstance(params, dict) or "message" not in params:
         raise ValueError("params.message is required")
@@ -1100,7 +1106,6 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
         raise
 
 
-@_d.method("chat.abort", scope="operator.write")
 async def _handle_chat_abort(params: dict | None, ctx: RpcContext) -> dict:
     raw_params = params or {}
     session_key = _canonical_webchat_session_key(raw_params.get("sessionKey"))
@@ -1410,3 +1415,51 @@ async def _handle_chat_inject(params: dict | None, ctx: RpcContext) -> dict:
 
     await ctx.session_manager.append_message(session_key, role=role, content=params["content"])
     return {"ok": True, "sessionKey": session_key}
+
+
+def _require_chat_turn_key(params: dict[str, Any] | None) -> str:
+    raw = params or {}
+    return _canonical_webchat_session_key(
+        raw.get("sessionKey", raw.get("session_key", raw.get("key")))
+    )
+
+
+def _chat_turn_admission_adapter(ctx: RpcContext) -> GatewayTurnAdmissionAdapter:
+    return GatewayTurnAdmissionAdapter(
+        ctx,
+        GatewayTurnAdmissionCallbacks(
+            require_key=_require_chat_turn_key,
+            execute_chat_send=_handle_chat_send,
+            execute_chat_abort=_handle_chat_abort,
+        ),
+    )
+
+
+async def _handle_chat_send_contract(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    return await _chat_turn_admission_adapter(ctx).admit(params, surface="webchat")
+
+
+async def _handle_chat_abort_contract(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    return await _chat_turn_admission_adapter(ctx).cancel(params, surface="webchat")
+
+
+_handle_chat_send_generated_contract = register_turn_admission_contract(
+    _d,
+    "chat.send",
+    _handle_chat_send_contract,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_chat_abort_generated_contract = register_turn_admission_contract(
+    _d,
+    "chat.abort",
+    _handle_chat_abort_contract,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)

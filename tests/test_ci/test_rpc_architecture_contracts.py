@@ -40,6 +40,9 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         # Reset and compact wire models terminate at SessionMaintenance's
         # generated registration Adapter.
         "src/opensquilla/gateway/adapters/session_maintenance_contract.py",
+        # Canonical and legacy turn wire models terminate at TurnAdmission's
+        # generated registration Adapter.
+        "src/opensquilla/gateway/adapters/turn_admission_contract.py",
         # SandboxRuntime handlers stay legacy-compatible while generated
         # descriptors own registration metadata and success validation.
         "src/opensquilla/gateway/adapters/sandbox_runtime_contract.py",
@@ -123,7 +126,7 @@ SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
 SESSIONS_RESOLVE_LITERAL_ALLOWLIST: Counter[str] = Counter()
 SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
 RUNTIME_RPC_METHOD_BASELINE = 306
-STATIC_RPC_DECORATOR_BASELINE = 233
+STATIC_RPC_DECORATOR_BASELINE = 227
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
 # closure measurement below.  The temporary S2a cumulative growth budget was
@@ -231,6 +234,9 @@ SESSION_LIFECYCLE_AUTHORED_FILES = (
     "src/opensquilla/application/session_maintenance.py",
     "src/opensquilla/gateway/adapters/session_maintenance.py",
     "src/opensquilla/gateway/adapters/session_maintenance_contract.py",
+    "src/opensquilla/application/turn_admission.py",
+    "src/opensquilla/gateway/adapters/turn_admission.py",
+    "src/opensquilla/gateway/adapters/turn_admission_contract.py",
 )
 SESSION_LIFECYCLE_AUTHORED_LOC_CEILING = 3_000
 
@@ -916,6 +922,12 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "sessions.reset",
             "sessions.contextCompact",
             "sessions.compact",
+            "chat.send",
+            "chat.abort",
+            "sessions.send",
+            "sessions.abort",
+            "sessions.steer.v2",
+            "sessions.steer",
         }
     ] == []
     assert [
@@ -1149,10 +1161,14 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
     from opensquilla.gateway.adapters.session_maintenance_contract import (
         SESSION_MAINTENANCE_CONTRACT_METHODS,
     )
+    from opensquilla.gateway.adapters.turn_admission_contract import (
+        TURN_ADMISSION_CONTRACT_METHODS,
+    )
 
     for method in (
         *SESSION_LIFECYCLE_CONTRACT_METHODS,
         *SESSION_MAINTENANCE_CONTRACT_METHODS,
+        *TURN_ADMISSION_CONTRACT_METHODS,
     ):
         entry = registry.get_entry(method)
         assert entry is not None
