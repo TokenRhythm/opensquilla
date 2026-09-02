@@ -67,8 +67,21 @@ describe('Platform configuration adapters', () => {
     expect(await settings.read('theme')).toBe('dark')
     expect(await settings.readAll()).toEqual({ theme: 'dark' })
     expect(await settings.readEffective()).toEqual({ fields: { theme: { value: 'dark', source: 'config' } } })
+    expect(source.request).toHaveBeenCalledWith(
+      'config.get',
+      undefined,
+      expect.objectContaining({
+        timeoutMs: 10_000,
+        timeoutAction: 'reconnect',
+        abortAction: 'reject',
+      }),
+    )
     expect(await settings.patchSafe([{ path: 'theme', value: 'light' }])).toEqual({ patched: ['theme'], restartRequired: true })
-    expect(source.request).toHaveBeenCalledWith('config.patch.safe', { patches: { theme: 'light' } }, expect.any(Object))
+    expect(source.request).toHaveBeenCalledWith(
+      'config.patch.safe',
+      { patches: { theme: 'light' } },
+      expect.objectContaining({ timeoutAction: 'reject', abortAction: 'reject' }),
+    )
     await settings.merge({ llm: { model: 'gpt-4' } })
     expect(source.request).toHaveBeenCalledWith('config.patch', { patch: { llm: { model: 'gpt-4' } } }, expect.any(Object))
   })

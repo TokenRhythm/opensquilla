@@ -1734,7 +1734,16 @@ const sessionDirectoryChangesSubscription = sessionDirectoryChanges.subscribe(ch
 })
 
 function subscribeCronEventsWhenAdmitted() {
-  // CronScheduler's Adapter owns its generation-aware remote event lease.
+  if (
+    !appAutomaticRpcMounted
+    || !optionalSessionRpcAllowed.value
+    || !gatewayAccess.isAvailable
+    || cronFinishedSubscription
+  ) return
+  // CronScheduler's Adapter owns its generation-aware remote event lease, but
+  // App owns admission so the optional subscribe frame cannot enter the
+  // Gateway's serial dispatcher ahead of critical session recovery.
+  cronFinishedSubscription = cronScheduler.subscribe(handleCronRunFinished)
 }
 
 function resumeAutomaticAppRpc() {
@@ -1945,7 +1954,6 @@ onMounted(() => {
   resumeAutomaticAppRpc()
   // Keep the approval badge/count live app-wide, not just on the Approvals page.
   subscribeApprovals()
-  cronFinishedSubscription = cronScheduler.subscribe(handleCronRunFinished)
   // Seed now in case an approval was pending before mount. Availability events
   // re-seed after reconnects and clear stale data while transport recovers.
   void seedPendingApprovals()
