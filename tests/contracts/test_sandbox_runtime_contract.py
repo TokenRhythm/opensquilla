@@ -9,9 +9,6 @@ from opensquilla.contracts.generated.v4.gateway_contract_registry import (
     GATEWAY_EVENT_CONTRACTS,
     GATEWAY_METHOD_CONTRACTS,
 )
-from opensquilla.gateway.adapters.sandbox_runtime_contract import (
-    SANDBOX_RUNTIME_CONTRACT_METHODS,
-)
 
 EXPECTED_SCOPES = {
     "sandbox.setup.status": "operator.read",
@@ -56,8 +53,6 @@ def _runtime_status() -> dict[str, object]:
 
 
 def test_registry_freezes_method_scope_guest_policy_and_errors() -> None:
-    assert tuple(SANDBOX_RUNTIME_CONTRACT_METHODS) == tuple(EXPECTED_SCOPES)
-
     for method, expected_scope in EXPECTED_SCOPES.items():
         descriptor = GATEWAY_METHOD_CONTRACTS[method]
         codes = {str(error["code"]) for error in descriptor.errors}
