@@ -4500,7 +4500,8 @@ const planCardPendingAction = computed<PlanCardAction | null>(() => {
     : null
 })
 const planActionsDisabled = computed(() =>
-  isStreaming.value
+  isCronSession.value
+  || isStreaming.value
   || planModeBusy.value
   || Boolean(liveSendBlockedReason.value)
   || planActionPending.value !== null

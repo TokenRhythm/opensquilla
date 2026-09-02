@@ -62,6 +62,20 @@ describe('Cron session read-only presentation', () => {
     )
   })
 
+  it('disables the standalone tail PlanCard as well as historical PlanCards', () => {
+    const tailPlanCard = sourceBetween(
+      '<PlanCard\n          v-if="currentPlan && !currentPlanInHistory"',
+      '<!-- MetaSkill run cards:',
+    )
+    const disabledState = sourceBetween(
+      'const planActionsDisabled = computed(',
+      'const PLAN_RUN_TERMINAL_HOLD_MS',
+    )
+
+    expect(tailPlanCard).toContain(':disabled="planActionsDisabled"')
+    expect(disabledState).toContain('isCronSession.value')
+  })
+
   it('guards fork before creating another session', () => {
     const fork = sourceBetween('async function forkConversation(', 'async function resumeSandbox(')
 
