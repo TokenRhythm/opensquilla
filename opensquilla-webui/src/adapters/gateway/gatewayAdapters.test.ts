@@ -37,6 +37,8 @@ describe('Gateway Adapter composition', () => {
     expect(Object.keys(adapters)).toEqual([
       'gatewayAccess',
       'conversationEvents',
+      'sessionReadLifecycleFactory',
+      'sessionInspection',
       'sessionDirectory',
       'sessionDirectoryChanges',
       'sessionLifecycle',
@@ -67,6 +69,7 @@ describe('Gateway Adapter composition', () => {
     ])
     expect(adapters).not.toHaveProperty('rpc')
     expect(adapters).not.toHaveProperty('events')
+    expect(adapters).not.toHaveProperty('sessionReadPort')
     await expect(adapters.sessionDirectory.listPage({ limit: 10 })).resolves.toEqual({
       items: [],
       hasMore: false,

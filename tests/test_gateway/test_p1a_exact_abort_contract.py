@@ -30,6 +30,22 @@ from tests.test_gateway.test_task_runtime_terminal_cleanup import (
 )
 
 
+class _ControlledAbortClock:
+    """Keep business deadlines deterministic while asyncio retains real time."""
+
+    def __init__(self, real_time: Any) -> None:
+        self._real_time = real_time
+        self.expired = False
+
+    def monotonic(self) -> float:
+        # Cross the 20 ms RPC observation deadline while leaving the separate
+        # 500 ms cleanup deadline active.
+        return 0.03 if self.expired else 0.0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real_time, name)
+
+
 @pytest.mark.asyncio
 async def test_exact_abort_auxiliary_cleanup_includes_persisted_registry(
     monkeypatch: pytest.MonkeyPatch,
@@ -155,6 +171,7 @@ async def test_exact_abort_starts_process_cleanup_before_slow_completion_deadlin
     process_started = asyncio.Event()
     release_process = asyncio.Event()
     process_finished = asyncio.Event()
+    clock = _ControlledAbortClock(rpc_sessions.time)
 
     class Runtime:
         async def cancel(self, **_kwargs: Any) -> int:
@@ -182,6 +199,7 @@ async def test_exact_abort_starts_process_cleanup_before_slow_completion_deadlin
 
     monkeypatch.setattr(rpc_sessions, "_ABORT_RUNTIME_CANCEL_DRAIN_SECONDS", 0.02)
     monkeypatch.setattr(rpc_sessions, "_ABORT_OWNED_CLEANUP_SECONDS", 0.08)
+    monkeypatch.setattr(rpc_sessions, "time", clock)
     monkeypatch.setattr(
         "opensquilla.gateway.subagent_announce.cancel_background_completion_for_task",
         slow_completion,
@@ -191,29 +209,29 @@ async def test_exact_abort_starts_process_cleanup_before_slow_completion_deadlin
         process_cleanup,
     )
 
-    started_at = asyncio.get_running_loop().time()
-    response = await get_dispatcher().dispatch(
-        "abort-parallel-cleanup",
-        "chat.abort",
-        {
-            "sessionKey": session.session_key,
-            "taskId": "task-A",
-            "scope": "task",
-            "source": "webui_stop",
-        },
-        make_ctx(
-            session_manager=FakeSessionManager([session]),
-            task_runtime=Runtime(),
+    response = await asyncio.wait_for(
+        get_dispatcher().dispatch(
+            "abort-parallel-cleanup",
+            "chat.abort",
+            {
+                "sessionKey": session.session_key,
+                "taskId": "task-A",
+                "scope": "task",
+                "source": "webui_stop",
+            },
+            make_ctx(
+                session_manager=FakeSessionManager([session]),
+                task_runtime=Runtime(),
+            ),
         ),
+        timeout=1.0,
     )
-    elapsed = asyncio.get_running_loop().time() - started_at
-
     assert response.ok is True
     assert response.payload["aborted"] is True
-    assert elapsed < 0.12
     assert completion_started.is_set()
     assert process_started.is_set()
     assert process_finished.is_set() is False
+    assert completion_cancelled.is_set() is False
 
     release_process.set()
     await asyncio.wait_for(process_finished.wait(), timeout=0.2)
@@ -228,13 +246,22 @@ async def test_slow_exact_runtime_cancel_cannot_delay_starting_any_safety_cleanu
     release = asyncio.Event()
     started = {
         name: asyncio.Event()
-        for name in ("runtime", "completion", "process", "descendants")
+        for name in ("runtime", "completion", "process", "persisted", "descendants")
     }
     finished = {name: asyncio.Event() for name in started}
+    outer_finished = {
+        name: asyncio.Event()
+        for name in ("runtime", "auxiliary", "descendants")
+    }
+    clock = _ControlledAbortClock(rpc_sessions.time)
+    original_runtime_cleanup = rpc_sessions._cancel_task_runtime
+    original_auxiliary_cleanup = rpc_sessions._cancel_task_owned_auxiliary_work
+    original_descendant_cleanup = rpc_sessions._cancel_task_owned_descendants
 
     class Runtime:
         async def cancel(self, **_kwargs: Any) -> int:
             started["runtime"].set()
+            clock.expired = True
             try:
                 await release.wait()
                 return 1
@@ -269,8 +296,39 @@ async def test_slow_exact_runtime_cancel_cannot_delay_starting_any_safety_cleanu
         finally:
             finished["process"].set()
 
+    async def slow_persisted_cleanup(
+        _state_dir: Any,
+        _session_key: str,
+        _task_id: str,
+    ) -> int:
+        started["persisted"].set()
+        try:
+            await release.wait()
+            return 1
+        finally:
+            finished["persisted"].set()
+
+    async def tracked_runtime_cleanup(*args: Any, **kwargs: Any) -> int:
+        try:
+            return await original_runtime_cleanup(*args, **kwargs)
+        finally:
+            outer_finished["runtime"].set()
+
+    async def tracked_auxiliary_cleanup(*args: Any, **kwargs: Any) -> int:
+        try:
+            return await original_auxiliary_cleanup(*args, **kwargs)
+        finally:
+            outer_finished["auxiliary"].set()
+
+    async def tracked_descendant_cleanup(*args: Any, **kwargs: Any) -> int:
+        try:
+            return await original_descendant_cleanup(*args, **kwargs)
+        finally:
+            outer_finished["descendants"].set()
+
     monkeypatch.setattr(rpc_sessions, "_ABORT_RUNTIME_CANCEL_DRAIN_SECONDS", 0.02)
     monkeypatch.setattr(rpc_sessions, "_ABORT_OWNED_CLEANUP_SECONDS", 0.5)
+    monkeypatch.setattr(rpc_sessions, "time", clock)
     monkeypatch.setattr(
         "opensquilla.gateway.subagent_announce.cancel_background_completion_for_task",
         slow_completion,
@@ -278,6 +336,21 @@ async def test_slow_exact_runtime_cancel_cannot_delay_starting_any_safety_cleanu
     monkeypatch.setattr(
         "opensquilla.tools.builtin.shell.cancel_background_processes_for_task",
         slow_process_cleanup,
+    )
+    monkeypatch.setattr(
+        "opensquilla.process_tree.cancel_persisted_processes_for_task",
+        slow_persisted_cleanup,
+    )
+    monkeypatch.setattr(rpc_sessions, "_cancel_task_runtime", tracked_runtime_cleanup)
+    monkeypatch.setattr(
+        rpc_sessions,
+        "_cancel_task_owned_auxiliary_work",
+        tracked_auxiliary_cleanup,
+    )
+    monkeypatch.setattr(
+        rpc_sessions,
+        "_cancel_task_owned_descendants",
+        tracked_descendant_cleanup,
     )
 
     response = await asyncio.wait_for(
@@ -295,9 +368,8 @@ async def test_slow_exact_runtime_cancel_cannot_delay_starting_any_safety_cleanu
                 task_runtime=Runtime(),
             ),
         ),
-        timeout=0.15,
+        timeout=1.0,
     )
-
     assert response.ok is True
     assert response.payload["aborted"] is False
     assert response.payload["reason"] == "task_cancel_unknown"
@@ -306,7 +378,8 @@ async def test_slow_exact_runtime_cancel_cannot_delay_starting_any_safety_cleanu
 
     release.set()
     await asyncio.gather(
-        *(asyncio.wait_for(event.wait(), timeout=0.2) for event in finished.values())
+        *(asyncio.wait_for(event.wait(), timeout=1.0) for event in finished.values()),
+        *(asyncio.wait_for(event.wait(), timeout=1.0) for event in outer_finished.values()),
     )
 
 

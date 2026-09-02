@@ -11,42 +11,20 @@ function makeAdapter() {
 }
 
 describe('SessionConversation v4 adapter', () => {
-  it('keeps wire method and aliases private while mapping history and stream reads', async () => {
-    const { api, request } = makeAdapter()
-    request
-      .mockResolvedValueOnce({ subscribed: true, hydration_complete: true })
-      .mockResolvedValueOnce({ messages: [], has_more: false })
-      .mockResolvedValueOnce({
-        key: 'agent:main:webchat:test',
-        events: [{
-          event: 'session.event.text_delta',
-          payload: { session_key: 'agent:main:webchat:test', text: 'hello' },
-        }],
-      })
+  it('does not retain the migrated session-read and inspection operations', () => {
+    const { api } = makeAdapter()
 
-    await api.subscribe({ key: 'agent:main:webchat:test', since_stream_seq: 4 })
-    await api.history({
-      sessionKey: 'agent:main:webchat:test',
-      limit: 50,
-      includeCanonical: true,
-      includeSummaries: false,
-    })
-    const snapshot = await api.snapshot('agent:main:webchat:test')
-
-    expect(request.mock.calls.map(([method, params]) => [method, params])).toEqual([
-      ['sessions.messages.subscribe', { key: 'agent:main:webchat:test', since_stream_seq: 4 }],
-      ['chat.history', {
-        sessionKey: 'agent:main:webchat:test',
-        limit: 50,
-        includeCanonical: true,
-        includeSummaries: false,
-      }],
-      ['sessions.messages.snapshot', { key: 'agent:main:webchat:test' }],
-    ])
-    expect(snapshot.events?.[0]).toMatchObject({
-      event: 'text-delta',
-      payload: { session_key: 'agent:main:webchat:test', text: 'hello' },
-    })
+    for (const operation of [
+      'subscribe',
+      'hydrate',
+      'snapshot',
+      'unsubscribe',
+      'history',
+      'preview',
+      'abort',
+    ]) {
+      expect(api).not.toHaveProperty(operation)
+    }
   })
 
   it('selects through-turn fork only when that capability is advertised', async () => {

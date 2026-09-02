@@ -1,5 +1,7 @@
 import type { Attachment, DisplayAttachment } from '@/types/chat'
-import type { ChatHistoryAttachmentPayload, ChatSendAttachmentPayload } from '@/types/chat'
+import type { ChatSendAttachmentPayload } from '@/types/chat'
+
+type AttachmentProjectionInput = Attachment | DisplayAttachment | Readonly<Record<string, unknown>>
 
 export type SendableAttachment = Attachment & (
   | { kind: 'inline'; data: string }
@@ -56,7 +58,7 @@ export function normalizeAttachmentMimeValue(value: unknown, fallback = 'applica
 }
 
 export function displayAttachmentMime(attachment: Record<string, unknown>): string {
-  for (const key of ['mime', 'mime_type', 'media_type', 'type']) {
+  for (const key of ['mime', 'mimeType', 'mediaType', 'mime_type', 'media_type', 'type']) {
     const value = attachment[key]
     if (isMimeLike(value)) return value.trim().toLowerCase()
   }
@@ -168,10 +170,10 @@ export function serializeDisplayAttachment(attachment: SendableAttachment): Disp
 }
 
 export function normalizeDisplayAttachment(
-  raw: Attachment | DisplayAttachment | ChatHistoryAttachmentPayload,
+  raw: AttachmentProjectionInput,
   options: { messageId?: string, index?: number } = {},
 ): DisplayAttachment {
-  const record = raw as Record<string, unknown>
+  const record = raw as Readonly<Record<string, unknown>>
   const mime = displayAttachmentMime(record)
   const image = isImageAttachmentMime(mime)
   const name = typeof record.name === 'string' && record.name.trim()
@@ -179,14 +181,16 @@ export function normalizeDisplayAttachment(
     : typeof record.filename === 'string' && record.filename.trim()
       ? record.filename.trim()
       : 'attachment'
-  const sha = typeof record.sha256_ref === 'string' && record.sha256_ref.trim()
-    ? record.sha256_ref.trim()
+  const shaValue = record.sha256Ref ?? record.sha256_ref
+  const sha = typeof shaValue === 'string' && shaValue.trim()
+    ? shaValue.trim()
     : ''
   const existingDisplayId = typeof record.displayId === 'string' && record.displayId.trim()
     ? record.displayId.trim()
     : ''
-  const localId = typeof record.local_id === 'number' && Number.isFinite(record.local_id)
-    ? `local:${record.local_id}`
+  const projectedLocalId = record.localId ?? record.local_id
+  const localId = typeof projectedLocalId === 'number' && Number.isFinite(projectedLocalId)
+    ? `local:${projectedLocalId}`
     : ''
   const index = typeof options.index === 'number' ? options.index : 0
   const messagePart = options.messageId || 'history'
@@ -230,7 +234,11 @@ export function normalizeDisplayAttachment(
       : typeof File !== 'undefined' && record.file instanceof File
         ? record.file
         : undefined,
-    download_url: typeof record.download_url === 'string' ? record.download_url : undefined,
+    download_url: typeof record.downloadUrl === 'string'
+      ? record.downloadUrl
+      : typeof record.download_url === 'string'
+        ? record.download_url
+        : undefined,
     sha256_ref: sha || undefined,
     attachmentId: typeof record.attachmentId === 'string' && record.attachmentId.trim()
       ? record.attachmentId.trim()
@@ -241,7 +249,7 @@ export function normalizeDisplayAttachment(
 }
 
 export function normalizeDisplayAttachments(
-  attachments: Array<Attachment | DisplayAttachment | ChatHistoryAttachmentPayload> | undefined,
+  attachments: readonly AttachmentProjectionInput[] | undefined,
   options: { messageId?: string } = {},
 ): DisplayAttachment[] {
   return (attachments || []).map((attachment, index) =>

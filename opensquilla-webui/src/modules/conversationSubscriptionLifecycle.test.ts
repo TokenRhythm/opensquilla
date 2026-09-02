@@ -19,6 +19,7 @@ describe('conversation subscription lifecycle', () => {
     expect(second).toBe(first)
     expect(await first).toBe(7)
     expect(run).toHaveBeenCalledTimes(1)
+    expect(lifecycle.leases.size).toBe(0)
   })
 
   it('aborts the predecessor and fences its late completion', async () => {
@@ -38,6 +39,7 @@ describe('conversation subscription lifecycle', () => {
     await Promise.all([predecessor, successor])
     expect(predecessorSignal).toHaveBeenCalledTimes(1)
     expect(await successor).toBe('new')
+    expect(lifecycle.leases.size).toBe(0)
   })
 
   it('relays external cancellation without owning the transport', async () => {
@@ -51,6 +53,7 @@ describe('conversation subscription lifecycle', () => {
     external.abort()
     await promise
     expect(signal.aborted).toBe(true)
+    expect(lifecycle.leases.size).toBe(0)
   })
 
   it('keeps a finished attempt current for detached hydration until cancelled', async () => {
@@ -65,5 +68,44 @@ describe('conversation subscription lifecycle', () => {
     expect(lifecycle.isCurrent(attemptRef!, 'agent:main:test')).toBe(true)
     lifecycle.cancel()
     expect(lifecycle.isCurrent(attemptRef!, 'agent:main:test')).toBe(false)
+    expect(lifecycle.leases.size).toBe(0)
+  })
+
+  it('does not retire a transport-activated lease when its attempt settles', async () => {
+    const lifecycle = createConversationSubscriptionLifecycle<boolean>()
+    let lease: Parameters<typeof lifecycle.leases.activate>[0] | undefined
+    await lifecycle.start(identity(), undefined, async attempt => {
+      lease = attempt.lease
+      lifecycle.leases.activate(attempt.lease)
+      return true
+    })
+
+    expect(lease?.state).toBe('active')
+    expect(lifecycle.leases.size).toBe(1)
+    lifecycle.cancel()
+    expect(lease?.state).toBe('active')
+    lifecycle.leases.retire(lease!)
+    expect(lifecycle.leases.size).toBe(0)
+  })
+
+  it('leaves a pending transport-activated lease for its transport to release', async () => {
+    const lifecycle = createConversationSubscriptionLifecycle<boolean>()
+    let lease: Parameters<typeof lifecycle.leases.activate>[0] | undefined
+    let release!: () => void
+    const pending = lifecycle.start(identity(), undefined, async attempt => {
+      lease = attempt.lease
+      lifecycle.leases.activate(attempt.lease)
+      await new Promise<void>(resolve => { release = resolve })
+      return true
+    })
+
+    lifecycle.cancel()
+    expect(lease?.state).toBe('active')
+    expect(lifecycle.leases.size).toBe(1)
+    release()
+    await pending
+    expect(lease?.state).toBe('active')
+    lifecycle.leases.retire(lease!)
+    expect(lifecycle.leases.size).toBe(0)
   })
 })

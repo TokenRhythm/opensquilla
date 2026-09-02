@@ -5,10 +5,16 @@ import { dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { _electron as electron } from 'playwright'
+import {
+  canAcceptWindowsElectronShutdownFallback,
+  closeElectronWithDeadline,
+  desktopShutdownEvidenceSince,
+} from './e2e-shutdown-helpers.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
 const repoRoot = resolve(packageRoot, '../..')
+const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000
 
 async function waitFor(check, label, timeoutMs = 60_000) {
   const startedAt = Date.now()
@@ -130,6 +136,7 @@ const userDataDir = join(isolationRoot, 'chromium-user-data')
 const isolatedHome = join(isolationRoot, 'home')
 let desktopApp
 let page
+let flowSucceeded = false
 
 try {
   await mkdir(userDataDir, { recursive: true })
@@ -270,6 +277,7 @@ try {
     darkToSystem,
     crtGreenToSystem,
   }, null, 2))
+  flowSucceeded = true
 } catch (error) {
   const currentTheme = desktopApp && page
     ? await themeSnapshot(desktopApp, page).catch(() => null)
@@ -296,6 +304,31 @@ try {
   }, null, 2))
   throw error
 } finally {
-  await desktopApp?.close().catch(() => {})
+  let shutdownError = null
+  if (desktopApp) {
+    const desktopLogPath = join(userDataDir, 'logs', 'desktop.log')
+    const desktopLogCheckpoint = await readFile(desktopLogPath, 'utf8').catch(() => null)
+    const shutdown = await closeElectronWithDeadline({
+      app: desktopApp,
+      phase: 'theme-final-shutdown',
+      timeoutMs: ELECTRON_SHUTDOWN_TIMEOUT_MS,
+    })
+    shutdownError = shutdown.error
+    if (shutdown.error) {
+      const desktopLog = await readFile(desktopLogPath, 'utf8').catch(() => null)
+      const shutdownEvidence = desktopShutdownEvidenceSince(desktopLogCheckpoint, desktopLog)
+      if (canAcceptWindowsElectronShutdownFallback({
+        shutdown,
+        ...shutdownEvidence,
+      })) {
+        shutdownError = null
+        console.warn(JSON.stringify({
+          event: 'desktop_e2e_windows_shell_wrapper_reaped_after_commit',
+          phase: 'theme-final-shutdown',
+        }))
+      }
+    }
+  }
   await rm(isolationRoot, { recursive: true, force: true }).catch(() => {})
+  if (flowSucceeded && shutdownError) throw shutdownError
 }

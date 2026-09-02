@@ -36,6 +36,8 @@ import { MEMORY_PROFILE_IMPORT_KEY } from './modules/memoryProfileImport'
 import { AUDIO_TRANSCRIPTION_KEY } from './modules/audioTranscription'
 import { GATEWAY_ACCESS_KEY } from './modules/gatewayAccess'
 import { CONVERSATION_EVENTS_KEY } from './modules/conversationEvents'
+import { SESSION_READ_LIFECYCLE_FACTORY_KEY } from './modules/sessionReadLifecycle'
+import { SESSION_INSPECTION_KEY } from './modules/sessionInspection'
 import 'katex/dist/katex.min.css'
 import './assets/base.css'
 import './themes/tokens' // eagerly bundles every value theme's token block
@@ -70,6 +72,11 @@ app.provide(
 )
 app.provide(GATEWAY_ACCESS_KEY, gatewayAdapters.gatewayAccess)
 app.provide(CONVERSATION_EVENTS_KEY, gatewayAdapters.conversationEvents)
+app.provide(
+  SESSION_READ_LIFECYCLE_FACTORY_KEY,
+  gatewayAdapters.sessionReadLifecycleFactory,
+)
+app.provide(SESSION_INSPECTION_KEY, gatewayAdapters.sessionInspection)
 app.provide(
   SESSION_DIRECTORY_CHANGES_KEY,
   gatewayAdapters.sessionDirectoryChanges,

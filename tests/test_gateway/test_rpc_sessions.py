@@ -9014,6 +9014,7 @@ class TestSessionsMessagesSubscribe:
             nonlocal observed_bounded_scope
             observed_bounded_scope = session_storage._BOUNDED_INTERACTIVE_READS.get()
             return {
+                **rpc_sessions._deferred_sessions_messages_metadata(),
                 "key": key,
                 "hydration_complete": True,
                 "deferred_fields": [],

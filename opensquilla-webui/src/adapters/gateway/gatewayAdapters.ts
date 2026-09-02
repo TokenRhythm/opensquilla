@@ -58,6 +58,11 @@ import type { GatewayAccess } from '@/modules/gatewayAccess'
 import { createV4GatewayAccess } from './gatewayAccessV4'
 import type { ConversationEvents } from '@/modules/conversationEvents'
 import { createConversationEventTransport } from './conversationEventTransport'
+import type { SessionReadLifecycleFactory } from '@/modules/sessionReadLifecycle'
+import { createSessionReadLifecycleFactory } from '@/modules/sessionReadLifecycle'
+import { createV4SessionReadPort } from './sessionReadPortV4'
+import type { SessionInspection } from '@/modules/sessionInspection'
+import { createV4SessionInspection } from './sessionInspectionV4'
 
 type RpcStoreTransportSource = Parameters<typeof createPrivateGatewayTransports>[0]
   & Parameters<typeof createV4GatewayAccess>[0]
@@ -65,6 +70,8 @@ type RpcStoreTransportSource = Parameters<typeof createPrivateGatewayTransports>
 export interface GatewayAdapters {
   readonly gatewayAccess: GatewayAccess
   readonly conversationEvents: ConversationEvents
+  readonly sessionReadLifecycleFactory: SessionReadLifecycleFactory
+  readonly sessionInspection: SessionInspection
   readonly sessionDirectory: SessionDirectory
   readonly sessionDirectoryChanges: SessionDirectoryChanges
   readonly sessionLifecycle: SessionLifecycle
@@ -116,6 +123,11 @@ export function createGatewayAdapters(
     },
   }
   const sessionDirectory = createV4SessionDirectory(transports.rpc)
+  const gatewayAccess = createV4GatewayAccess(source)
+  const concurrentHistoryReads = () => gatewayAccess.concurrentHistoryReads
+  const sessionReadLifecycleFactory = createSessionReadLifecycleFactory(
+    createV4SessionReadPort(transports.rpc, { concurrentHistoryReads }),
+  )
   const conversationEvents = createConversationEventTransport({
     on(event, handler) {
       const subscription = transports.events.subscribe(event, handler)
@@ -123,8 +135,13 @@ export function createGatewayAdapters(
     },
   })
   const adapters: GatewayAdapters = {
-    gatewayAccess: createV4GatewayAccess(source),
+    gatewayAccess,
     conversationEvents,
+    sessionReadLifecycleFactory,
+    sessionInspection: createV4SessionInspection(
+      transports.rpc,
+      { concurrentHistoryReads },
+    ),
     sessionDirectory,
     sessionDirectoryChanges: createV4SessionDirectoryChanges(
       transports.rpc,
@@ -144,10 +161,7 @@ export function createGatewayAdapters(
     setupWorkflow: createV4SetupWorkflow(transports.rpc),
     migrationOperations: createV4MigrationOperations(transports.rpc),
     workspaceCatalog: createV4WorkspaceCatalog(transports.rpc),
-    sandboxRuntime: createV4SandboxRuntime({
-      ...transports.rpc,
-      subscribe: (event, handler) => transports.events.subscribe(event, handler),
-    }),
+    sandboxRuntime: createV4SandboxRuntime(transports.rpc, transports.events),
     sessionConversation: createV4SessionConversation(transports.rpc, transports.events),
     observability: createV4Observability(transports.rpc, http),
     skillCatalog: createV4SkillCatalog(transports.rpc),
