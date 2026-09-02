@@ -796,7 +796,7 @@ async def audio_config(
 
     holder = SimpleNamespace(config=_gateway_config)
     try:
-        result = apply_agent_audio_provider_configuration(
+        result = await apply_agent_audio_provider_configuration(
             holder,
             provider_id=provider,
             api_key=api_key,

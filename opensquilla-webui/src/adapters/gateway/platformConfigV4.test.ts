@@ -31,6 +31,13 @@ function rpc() {
       count: 1,
     } as T
     if (method === 'onboarding.status') return { ready: true } as T
+    if (method === 'onboarding.router.configure') return {
+      changed: true,
+      restartRequired: false,
+      configPath: '/tmp/config.toml',
+      entry: { mode: 'recommended' },
+      warnings: [],
+    } as T
     if (method === 'migration.sources.list') return {
       schemaVersion: 1,
       mode: 'preview_only',
@@ -86,7 +93,10 @@ describe('Platform configuration adapters', () => {
     expect(source.request).toHaveBeenCalledWith('models.routing.set', { mode: 'ensemble' }, expect.any(Object))
     const setup = createV4SetupWorkflow(source)
     expect(await setup.status()).toEqual({ ready: true })
-    await expect(setup.capability.configure('router', { mode: 'recommended' })).resolves.toEqual({})
+    await expect(setup.capability.configureRouter({ mode: 'recommended' })).resolves.toMatchObject({
+      changed: true,
+      restartRequired: false,
+    })
     expect(source.request).toHaveBeenCalledWith('onboarding.router.configure', { mode: 'recommended' }, expect.any(Object))
   })
 
