@@ -412,6 +412,94 @@ interface TurnActivityRecord {
 }
 
 export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions) {
+  const pendingBackgroundReceiptClientIds = new Set<string>()
+  const backgroundReceiptTaskOwners = new Map<string, string>()
+
+  function beginBackgroundReceiptReplay(clientMessageId: string) {
+    const normalizedClientId = String(clientMessageId || '').trim()
+    if (normalizedClientId) pendingBackgroundReceiptClientIds.add(normalizedClientId)
+  }
+
+  function rememberBackgroundReceiptTask(clientMessageId: string, taskId: string) {
+    const normalizedClientId = String(clientMessageId || '').trim()
+    const normalizedTaskId = String(taskId || '').trim()
+    if (!normalizedClientId || !normalizedTaskId) return
+    if (!backgroundReceiptTaskOwners.has(normalizedTaskId) && backgroundReceiptTaskOwners.size >= 256) {
+      const oldestTaskId = backgroundReceiptTaskOwners.keys().next().value
+      if (typeof oldestTaskId === 'string') backgroundReceiptTaskOwners.delete(oldestTaskId)
+    }
+    backgroundReceiptTaskOwners.set(normalizedTaskId, normalizedClientId)
+  }
+
+  function trackBackgroundReceiptTask(clientMessageId: string, taskId: string) {
+    rememberBackgroundReceiptTask(clientMessageId, taskId)
+  }
+
+  function finishBackgroundReceiptReplay(clientMessageId: string) {
+    pendingBackgroundReceiptClientIds.delete(String(clientMessageId || '').trim())
+  }
+
+  function receiptEventIdentity(payload: SessionEventPayload): {
+    clientMessageId: string
+    taskId: string
+  } {
+    const candidates = [
+      payload,
+      payload.changed_task,
+      payload.changedTask,
+      payload.active_task,
+      payload.activeTask,
+      payload.last_task,
+      payload.lastTask,
+    ]
+    let clientMessageId = ''
+    let taskId = payloadTaskId(payload)
+    for (const candidate of candidates) {
+      if (!candidate || typeof candidate !== 'object') continue
+      const record = candidate as Record<string, unknown>
+      clientMessageId ||= String(
+        record.client_message_id || record.clientMessageId || '',
+      ).trim()
+      taskId ||= String(record.task_id || record.taskId || '').trim()
+    }
+    return { clientMessageId, taskId }
+  }
+
+  function suppressBackgroundReceiptEvent(
+    eventKind: ConversationSemanticEventKind | 'sessions-changed',
+    payload: SessionEventPayload,
+  ): boolean {
+    if (!isCurrentSessionPayload(payload)) return false
+    const { clientMessageId, taskId } = receiptEventIdentity(payload)
+    const pendingOwner = clientMessageId
+      && pendingBackgroundReceiptClientIds.has(clientMessageId)
+      ? clientMessageId
+      : ''
+    const trackedOwner = taskId ? backgroundReceiptTaskOwners.get(taskId) || '' : ''
+    const owner = pendingOwner || trackedOwner
+    const suppress = Boolean(owner && taskId)
+    if (!suppress) return false
+    // A matching lifecycle frame can beat the replay ACK. Bind only the exact
+    // client-message owner: unrelated same-session tasks from another tab must
+    // remain visible and must never enter this quarantine.
+    rememberBackgroundReceiptTask(owner, taskId)
+    if (eventKind === 'task-queued') {
+      options.taskOwnership?.noteQueued({ ...payload, status: 'queued' })
+    } else if (eventKind === 'task-running') {
+      options.taskOwnership?.noteRunning({ ...payload, status: 'running' })
+    } else if (
+      eventKind === 'sessions-changed'
+        ? sessionChangeIsTerminal(payload)
+        : isTerminalEvent(eventKind)
+    ) {
+      options.taskOwnership?.noteTerminal(taskId)
+    }
+    // Keep the task identity through the complete terminal echo cluster
+    // (done -> sessions.changed -> task.* / turn.committed). Session change
+    // retires the owning Edit and clears this bounded registry below.
+    return true
+  }
+
   const {
     sessionKey,
     currentEpoch,
@@ -1357,6 +1445,8 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   }
 
   watch(sessionKey, () => {
+    pendingBackgroundReceiptClientIds.clear()
+    backgroundReceiptTaskOwners.clear()
     streamThinking.value = null
     clearGenerationTracking()
     turnReasoningLog.length = 0
@@ -2584,7 +2674,10 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
    */
   function handleConversationEvent(message: ConversationEvent) {
     if (message.kind === 'sessions-changed') {
-      handleRpcSessionsChanged(message.payload as SessionEventPayload)
+      const payload = message.payload as SessionEventPayload
+      if (!suppressBackgroundReceiptEvent('sessions-changed', payload)) {
+        handleRpcSessionsChanged(payload)
+      }
       return
     }
 
@@ -2599,6 +2692,13 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     }
 
     const event = message.event
+    if (
+      event.kind === 'known'
+      && suppressBackgroundReceiptEvent(
+        event.semanticKind,
+        message.payload as SessionEventPayload,
+      )
+    ) return
     if (event.kind === 'known') {
       switch (event.semanticKind) {
         case 'answer-generation-reset':
@@ -2809,5 +2909,8 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     streamThinkingElapsedText,
     attachTurnReasoning,
     awaitingCommitTaskIds,
+    beginBackgroundReceiptReplay,
+    trackBackgroundReceiptTask,
+    finishBackgroundReceiptReplay,
   }
 }

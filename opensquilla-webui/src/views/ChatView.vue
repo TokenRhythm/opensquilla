@@ -1697,6 +1697,9 @@ const isStopPending = computed(() => (
   || acceptanceRecoveryPending.value
 ))
 let bindActiveStreamTask = (taskId: string) => { activeStreamTaskId.value = taskId }
+let beginBackgroundReceiptReplay = (_clientMessageId: string) => {}
+let trackBackgroundReceiptTask = (_clientMessageId: string, _taskId: string) => {}
+let finishBackgroundReceiptReplay = (_clientMessageId: string) => {}
 let restoreLiveTurnSnapshot = (_snapshot: SessionReadSnapshot) => {}
 
 function projectWorkspaceFromSessionRead(
@@ -3446,6 +3449,13 @@ const chatSend = useChatSend({
   restoreSteerIntoComposer: text => appendComposerText(text),
   popAllPendingIntoComposer,
   reconcileTaskOwnership: () => retrySessionMetadata(),
+  beginBackgroundReceiptReplay: clientMessageId => beginBackgroundReceiptReplay(clientMessageId),
+  trackBackgroundReceiptTask: (clientMessageId, taskId) => (
+    trackBackgroundReceiptTask(clientMessageId, taskId)
+  ),
+  finishBackgroundReceiptReplay: clientMessageId => (
+    finishBackgroundReceiptReplay(clientMessageId)
+  ),
   classifySlashCommand,
   executeSlashCommand,
   closeSlashMenu,
@@ -3906,6 +3916,9 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   refreshRunModePreference: refreshPostBootstrapMetadata,
 })
 bindActiveStreamTask = rpcEventHandlers.bindActiveStreamTask
+beginBackgroundReceiptReplay = rpcEventHandlers.beginBackgroundReceiptReplay
+trackBackgroundReceiptTask = rpcEventHandlers.trackBackgroundReceiptTask
+finishBackgroundReceiptReplay = rpcEventHandlers.finishBackgroundReceiptReplay
 restoreLiveTurnSnapshot = rpcEventHandlers.restoreLiveTurnSnapshot
 const {
   streamThinkingText,

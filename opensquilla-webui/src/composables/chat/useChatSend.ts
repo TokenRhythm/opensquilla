@@ -251,6 +251,8 @@ interface DispatchSendOptions {
   acceptedVisibleReplay?: { forkBeforeMessageId: string }
   /** Protocol replays keep a rejected attempt on their own surface. */
   suppressRejectedFailureMessage?: boolean
+  /** Resolve an older receipt without claiming or mutating the visible stream. */
+  backgroundReceiptReplay?: boolean
   /** Preserve an explicit empty attachment list on the chat.send wire. */
   includeEmptyAttachments?: boolean
   /** Revalidate protocol-owned sends after every awaited pre-dispatch step. */
@@ -620,6 +622,12 @@ export interface UseChatSendOptions {
   restoreSteerIntoComposer?: (text: string) => void
   popAllPendingIntoComposer: () => boolean
   reconcileTaskOwnership?: () => void | Promise<unknown>
+  /** Bracket an older receipt replay so its early live events stay offscreen. */
+  beginBackgroundReceiptReplay?: (clientMessageId: string) => void
+  /** Keep a non-terminal accepted receipt task off the visible stream. */
+  trackBackgroundReceiptTask?: (clientMessageId: string, taskId: string) => void
+  /** Release the pre-response event quarantine for an older receipt replay. */
+  finishBackgroundReceiptReplay?: (clientMessageId: string) => void
   hiddenControlStorage?: HiddenControlStorage | null
   metaDiscardStorage?: MetaDiscardStorage | null
   classifySlashCommand: (text: string) => Promise<SlashCommandClassification>
@@ -2410,6 +2418,15 @@ export function useChatSend(options: UseChatSendOptions) {
         composerText,
         promptAnnotationIds: exactReplayAttempt.promptAnnotationIds,
         queueMode: exactReplayAttempt.queueMode,
+        payload: {
+          attachments: exactReplayAttempt.attachments,
+          intent: exactReplayAttempt.intent,
+          forkBeforeMessageId: exactReplayAttempt.forkBeforeMessageId,
+          workspaceId: exactReplayAttempt.workspaceId,
+          initialCollaborationMode: exactReplayAttempt.initialCollaborationMode,
+          documentContext: exactReplayAttempt.documentContext,
+          initialRoutingMode: exactReplayAttempt.initialRoutingMode,
+        },
         retryAttempt: exactReplayAttempt,
         idempotentReplay: true,
         // Receipt recovery resolves the prior immutable request. If the user
@@ -2417,6 +2434,7 @@ export function useChatSend(options: UseChatSendOptions) {
         // visible transcript state belongs to the replay.
         preserveComposer: preserveUnrelatedBranch,
         suppressRejectedFailureMessage: preserveUnrelatedBranch,
+        backgroundReceiptReplay: preserveUnrelatedBranch,
         preDispatchGuard: stage => (
           forkSnapshotPreDispatchAllowed(
             composerSnapshot,
@@ -3244,8 +3262,9 @@ export function useChatSend(options: UseChatSendOptions) {
     // A steer send rides an already-active stream; restarting it would wipe
     // the partial output of the run being steered.
     const wasStreaming = options.stream.isStreaming.value
+    const backgroundReceiptReplay = sendOpts.backgroundReceiptReplay === true
     if (!preDispatchAllowed('after_mutation')) return rejectBeforeDispatch()
-    const freshSendToken = wasStreaming
+    const freshSendToken = wasStreaming || backgroundReceiptReplay
       ? null
       : beginFreshStream(requestSessionKey, attempt)
     if (!preDispatchAllowed(freshSendToken ? 'before_rpc' : 'after_mutation')) {
@@ -3322,11 +3341,30 @@ export function useChatSend(options: UseChatSendOptions) {
       )
       attempt.acceptanceRequest = { request: acceptanceRequest }
       attempt.acceptanceInFlight = true
+      if (backgroundReceiptReplay) {
+        options.beginBackgroundReceiptReplay?.(attempt.clientMessageId)
+      }
       const res = await options.turnCommands.send(acceptanceRequest)
       acknowledgeAttemptPromptAnnotations(attempt, res)
       attempt.acceptanceResolved = true
       attempt.acceptedTaskId = acceptedTaskId(res)
       attempt.acceptedSessionKey = res?.sessionKey || requestSessionKey
+      if (backgroundReceiptReplay) {
+        const terminalStatus = terminalResponseStatus(res)
+        const accepted = noteAcceptedTask(res, requestSessionKey)
+        if (!terminalStatus && accepted.taskId) {
+          options.trackBackgroundReceiptTask?.(attempt.clientMessageId, accepted.taskId)
+        }
+        if (recoveredAttempt?.clientRequestId === attempt.clientRequestId) {
+          recoveredAttempt = null
+        }
+        consumeAcceptedSessionIntent(attempt)
+        // This request predates the branch currently shown in the composer.
+        // Quarantine its accepted task offscreen; binding it as the foreground
+        // stream (or materializing a terminal response) would append into the
+        // newer edit's exact transcript and make Escape unable to restore it.
+        return 'accepted'
+      }
       if (!commitAcceptedVisibleReplay({
         messageId: res?.userMessageId || res?.messageId || '',
         turnId: acceptedTaskId(res),
@@ -3481,9 +3519,13 @@ export function useChatSend(options: UseChatSendOptions) {
       if (!acceptedError && attemptOwnsMessageEditTranscript(attempt)) {
         setAttemptPromptAnnotations(attempt, [])
       }
-      if (acceptedError && !commitAcceptedVisibleReplay({
+      if (
+        acceptedError
+        && !backgroundReceiptReplay
+        && !commitAcceptedVisibleReplay({
         messageId: acceptedError.messageId,
-      })) {
+        })
+      ) {
         options.scheduleHistorySync()
       }
       if (
@@ -3493,6 +3535,10 @@ export function useChatSend(options: UseChatSendOptions) {
         recoveredAttempt = null
       }
       if (acceptedError) consumeAcceptedSessionIntent(attempt)
+      if (acceptedError && backgroundReceiptReplay) {
+        attempt.acceptanceResolved = true
+        return 'accepted'
+      }
       const acceptedSessionKey = acceptedError?.sessionKey || requestSessionKey
       const rememberRetryableAttempt = (restoreComposer: boolean) => {
         if (!shouldRestoreSendAttempt(err)) return
@@ -3643,6 +3689,9 @@ export function useChatSend(options: UseChatSendOptions) {
       return acceptedError ? 'accepted' : 'retryable_failure'
     } finally {
       attempt.acceptanceInFlight = false
+      if (backgroundReceiptReplay) {
+        options.finishBackgroundReceiptReplay?.(attempt.clientMessageId)
+      }
       finishAcceptanceTransaction(acceptanceTransaction)
       finishResponseHandoff(responseHandoff)
     }

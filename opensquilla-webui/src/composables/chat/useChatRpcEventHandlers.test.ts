@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { effectScope, nextTick, ref } from 'vue'
 import { useChatRpcEventHandlers, type ChatRpcStreamApi } from './useChatRpcEventHandlers'
+import { useChatMessageActions } from './useChatMessageActions'
 import type { SessionBootstrapRun } from './useChatSessionBootstrap'
 import type {
   ChatMessage,
@@ -255,6 +256,147 @@ describe('useChatRpcEventHandlers decoded conversation ingress', () => {
         { modelCallId: 'call-1', iteration: 1 },
       )
       expect(harness.lastStreamSeq.value).toBe(1)
+    } finally {
+      harness.stop()
+    }
+  })
+
+  it('quarantines live and terminal events from a background receipt replay', () => {
+    const harness = createHarness({
+      messages: [
+        { role: 'user', text: 'original question', ts: null, messageId: 'msg-original' },
+        { role: 'assistant', text: 'original answer', ts: null, messageId: 'msg-answer' },
+      ],
+    })
+    harness.stream.isStreaming.value = false
+    const originalOwner = harness.messages.value
+    const inputText = ref('unrelated draft')
+    const pendingForkBeforeMessageId = ref<string | null>(null)
+    const pendingAttachments = ref([{
+      kind: 'staged' as const,
+      local_id: 901,
+      name: 'new-edit.png',
+      mime: 'image/png',
+      file_uuid: 'new-edit-file',
+    }])
+    const promptAnnotationIds = ref(['current-edit-annotation'])
+    const pendingSessionIntent = ref<string | null>('new_chat')
+    const messageActions = useChatMessageActions({
+      sessionKey: harness.sessionKey,
+      messages: harness.messages,
+      inputText,
+      isStreaming: harness.stream.isStreaming,
+      sanitizeCopyText: text => text,
+      stripTimePrefix: text => text,
+      autoResizeTextarea: vi.fn(),
+      sendCurrentInput: vi.fn(),
+      sendUsageBarrierReplay: vi.fn(async () => true),
+      focusComposer: vi.fn(),
+      pendingForkBeforeMessageId,
+    })
+    messageActions.editMessage({
+      role: 'user',
+      displayRole: 'user',
+      roleLabel: 'User',
+      text: 'original question',
+      timeStr: '',
+      showHeader: false,
+      sourceIndex: 0,
+      messageId: 'msg-original',
+    })
+    inputText.value = 'edited original question'
+    const editOwner = harness.messages.value
+    const attachmentOwner = pendingAttachments.value[0]
+    const deliver = (eventName: string, payload: Record<string, unknown>) => {
+      harness.api.onConversationEvent({
+        kind: 'conversation',
+        event: decodeConversationEvent(eventName, payload, {}),
+        payload,
+        meta: {},
+      })
+    }
+    try {
+      harness.api.beginBackgroundReceiptReplay('client-old-receipt')
+      deliver('task.queued', {
+        session_key: 'agent:main:test',
+        task_id: 'task-other-tab',
+        client_message_id: 'client-other-tab',
+      })
+      // A second tab's task is not owned merely because it interleaves with
+      // the receipt RPC window.
+      expect(harness.applySessionRunState).toHaveBeenCalledOnce()
+      harness.applySessionRunState.mockClear()
+
+      deliver('task.running', {
+        session_key: 'agent:main:test',
+        task_id: 'task-old-receipt',
+        client_message_id: 'client-old-receipt',
+      })
+      harness.api.trackBackgroundReceiptTask('client-old-receipt', 'task-old-receipt')
+      harness.api.finishBackgroundReceiptReplay('client-old-receipt')
+      deliver('session.event.text_delta', {
+        session_key: 'agent:main:test',
+        task_id: 'task-old-receipt',
+        stream_seq: 1,
+        text: 'old answer',
+      })
+      deliver('session.event.done', {
+        session_key: 'agent:main:test',
+        task_id: 'task-old-receipt',
+        stream_seq: 2,
+        text: 'old terminal answer',
+      })
+      harness.api.onConversationEvent({
+        kind: 'sessions-changed',
+        payload: {
+          session_key: 'agent:main:test',
+          reason: 'task_terminal',
+          run_status: 'idle',
+          changed_task: {
+            task_id: 'task-old-receipt',
+            client_message_id: 'client-old-receipt',
+            status: 'succeeded',
+          },
+          last_task: {
+            task_id: 'task-old-receipt',
+            client_message_id: 'client-old-receipt',
+            status: 'succeeded',
+          },
+        },
+        meta: {},
+      })
+      deliver('task.succeeded', {
+        session_key: 'agent:main:test',
+        task_id: 'task-old-receipt',
+        stream_seq: 3,
+      })
+      deliver('session.event.turn_committed', {
+        session_key: 'agent:main:test',
+        task_id: 'task-old-receipt',
+        stream_seq: 4,
+      })
+
+      expect(harness.activeStreamTaskId.value).toBe('')
+      expect(harness.stream.startStreaming).not.toHaveBeenCalled()
+      expect(harness.stream.appendDelta).not.toHaveBeenCalled()
+      expect(harness.stream.endStreaming).not.toHaveBeenCalled()
+      expect(harness.applySessionRunState).not.toHaveBeenCalled()
+      expect(harness.messages.value).toBe(editOwner)
+      expect(harness.messages.value).toEqual([])
+      expect(harness.scheduleHistorySync).not.toHaveBeenCalled()
+      expect(inputText.value).toBe('edited original question')
+      expect(pendingForkBeforeMessageId.value).toBe('msg-original')
+      expect(pendingAttachments.value).toEqual([attachmentOwner])
+      expect(promptAnnotationIds.value).toEqual(['current-edit-annotation'])
+      expect(pendingSessionIntent.value).toBe('new_chat')
+
+      expect(messageActions.cancelEdit()).toBe(true)
+      expect(harness.messages.value).toBe(originalOwner)
+      expect(harness.messages.value.map(message => message.text)).toEqual([
+        'original question', 'original answer',
+      ])
+      expect(inputText.value).toBe('unrelated draft')
+      expect(pendingForkBeforeMessageId.value).toBeNull()
     } finally {
       harness.stop()
     }

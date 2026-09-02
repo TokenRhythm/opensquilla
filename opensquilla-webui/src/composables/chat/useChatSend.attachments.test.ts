@@ -2479,9 +2479,16 @@ describe('useChatSend attachment payloads', () => {
   })
 
   it.each([
-    ['accepted', () => Promise.resolve({
+    ['accepted while running', () => Promise.resolve({
       sessionKey: 'agent:main:webchat:test',
       task_id: 'task-recovered',
+    })],
+    ['accepted with a complete terminal response', () => Promise.resolve({
+      sessionKey: 'agent:main:webchat:test',
+      task_id: 'task-recovered-terminal',
+      task_status: 'failed',
+      terminal_reason: 'activation_failed',
+      terminal_message: 'The older request failed after acceptance.',
     })],
     ['definitely rejected', () => Promise.reject(Object.assign(new Error('database busy'), {
       accepted: false,
@@ -2510,13 +2517,14 @@ describe('useChatSend attachment payloads', () => {
           .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
           .mockImplementationOnce(replayResult),
       }
-      const { api, options } = makeOptions({
+      const { api, options, stream } = makeOptions({
         rpc,
         sessionKey,
         messages,
         inputText,
         pendingForkBeforeMessageId,
         promptAnnotationIds,
+        modelRoutingMode: ref<'llm_ensemble'>('llm_ensemble'),
         messageEditGeneration: messageActions.editGeneration,
         validateMessageEditOwner: messageActions.validateEditOwner,
         adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
@@ -2524,6 +2532,8 @@ describe('useChatSend attachment payloads', () => {
 
       await api.onSend()
       const originalRequestId = rpc.call.mock.calls[0]?.[1]?.clientRequestId
+      expect(stream.startStreaming).toHaveBeenCalledTimes(1)
+      expect(stream.endStreaming).toHaveBeenCalledTimes(1)
       expect(messages.value.map(message => message.role)).toEqual([
         'user', 'assistant', 'user', 'error',
       ])
@@ -2543,8 +2553,8 @@ describe('useChatSend attachment payloads', () => {
       const currentAttachment: Attachment = {
         kind: 'staged',
         local_id: 901,
-        name: 'new-edit.txt',
-        mime: 'text/plain',
+        name: 'new-edit.png',
+        mime: 'image/png',
         file_uuid: 'new-edit-file',
       }
       options.pendingAttachments.value = [currentAttachment]
@@ -2565,6 +2575,11 @@ describe('useChatSend attachment payloads', () => {
       expect(options.pendingAttachments.value[0]).toBe(attachmentOwner)
       expect(promptAnnotationIds.value).toEqual(['current-edit-annotation'])
       expect(options.pendingSessionIntent.value).toBe('new_chat')
+      expect(stream.startStreaming).toHaveBeenCalledTimes(1)
+      expect(stream.endStreaming).toHaveBeenCalledTimes(1)
+      expect(options.activeStreamTaskId.value).toBe('')
+      expect(options.activeStreamSessionKey.value).toBe('')
+      expect(options.scheduleHistorySync).not.toHaveBeenCalled()
 
       expect(messageActions.cancelEdit()).toBe(true)
       expect(messages.value).toBe(originalOwner)
