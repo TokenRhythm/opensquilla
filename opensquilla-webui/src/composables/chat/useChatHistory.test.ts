@@ -6,6 +6,7 @@ import { useChatHistory } from './useChatHistory'
 import type { ChatMessage, ChatTurnOutcome } from '@/types/chat'
 import { RpcTimeoutError } from '@/lib/rpc'
 import {
+  SessionReadHistoryCursorError,
   SessionReadSessionMissingError,
   type SessionReadCompactionSummary,
   type SessionReadHistoryPage,
@@ -2156,6 +2157,59 @@ describe('useChatHistory canonical pagination', () => {
     })
   })
 
+  it('drops an invalidated forward cursor before retrying from latest', async () => {
+    const { api, readHistory, historyFixture, messages } = makeHistory(false)
+    historyFixture
+      .mockResolvedValueOnce({
+        messages: [historyMessage('m4')],
+        hasMore: true,
+        oldestCursor: 'cursor-4',
+        newestCursor: 'cursor-4',
+        canonicalAvailable: true,
+      })
+      .mockResolvedValueOnce({
+        messages: [historyMessage('m3')],
+        hasMore: true,
+        oldestCursor: 'cursor-3',
+        newestCursor: 'cursor-3',
+        canonicalAvailable: true,
+      })
+      .mockResolvedValueOnce({
+        messages: [historyMessage('m9')],
+        hasMore: true,
+        oldestCursor: 'cursor-9',
+        newestCursor: 'cursor-9',
+        canonicalAvailable: true,
+      })
+      .mockRejectedValueOnce(new SessionReadHistoryCursorError('stale', 'cursor rejected'))
+      .mockResolvedValueOnce({
+        messages: [historyMessage('m10')],
+        hasMore: false,
+        oldestCursor: 'cursor-10',
+        newestCursor: 'cursor-10',
+        canonicalAvailable: true,
+      })
+
+    await api.loadHistory()
+    await api.loadEarlierHistory()
+    await api.loadHistory()
+
+    expect(readHistory).toHaveBeenNthCalledWith(
+      4,
+      'after',
+      'cursor-4',
+      expect.any(Object),
+    )
+    expect(api.historyState.value.recoveryError).toBe(true)
+
+    await api.retryHistory()
+
+    expect(readHistory).toHaveBeenNthCalledWith(5, 'latest', null, expect.any(Object))
+    expect(readHistory).toHaveBeenCalledTimes(5)
+    expect(messages.value.map(message => message.messageId)).toEqual(['m10'])
+    expect(api.historyState.value.recoveryError).toBe(false)
+  })
+
   it('allows the same cursor to be retried after a failed earlier-page request', async () => {
     const { api, readHistory, historyFixture } = makeHistory(false, {
       response: {
@@ -2184,6 +2238,555 @@ describe('useChatHistory canonical pagination', () => {
     await api.loadEarlierHistory()
     expect(api.historyState.value.loadEarlierError).toBe(false)
     expect(readHistory).toHaveBeenCalledTimes(3)
+  })
+
+  it.each([
+    'invalid',
+    'stale',
+  ] as const)('reloads latest without the failed earlier cursor for %s', async (reason) => {
+    const { api, readHistory, historyFixture, messages } = makeHistory(false)
+    historyFixture
+      .mockResolvedValueOnce({
+        messages: [historyMessage('m4')],
+        hasMore: true,
+        oldestCursor: 'cursor-4',
+        newestCursor: 'cursor-4',
+        canonicalAvailable: true,
+      })
+      .mockRejectedValueOnce(new SessionReadHistoryCursorError(reason, 'cursor rejected'))
+      .mockResolvedValueOnce({
+        messages: [historyMessage('m9')],
+        hasMore: true,
+        oldestCursor: 'cursor-9',
+        newestCursor: 'cursor-9',
+        canonicalAvailable: true,
+      })
+
+    await api.loadHistory()
+    await api.loadEarlierHistory()
+
+    expect(messages.value.map(message => message.messageId)).toEqual(['m4'])
+    expect(api.historyState.value.loadEarlierError).toBe(true)
+    expect(readHistory).toHaveBeenNthCalledWith(
+      2,
+      'before',
+      'cursor-4',
+      expect.any(Object),
+    )
+
+    await api.retryHistory()
+
+    expect(readHistory).toHaveBeenNthCalledWith(3, 'latest', null, expect.any(Object))
+    expect(messages.value.map(message => message.messageId)).toEqual(['m9'])
+    expect(api.historyState.value).toMatchObject({
+      oldestCursor: 'cursor-9',
+      newestCursor: 'cursor-9',
+      loadEarlierError: false,
+    })
+  })
+
+  it('keeps typed latest recovery pending when a scheduled sync is requested', async () => {
+    vi.useFakeTimers()
+    try {
+      const { api, readHistory, historyFixture, messages } = makeHistory(false)
+      historyFixture
+        .mockResolvedValueOnce({
+          messages: [
+            historyMessage('m1'),
+            historyMessage('m2'),
+            historyMessage('m3'),
+            historyMessage('m4'),
+          ],
+          hasMore: true,
+          oldestCursor: 'cursor-1',
+          newestCursor: 'cursor-4',
+          canonicalAvailable: true,
+        })
+        .mockRejectedValueOnce(new SessionReadHistoryCursorError('stale', 'cursor rejected'))
+        .mockResolvedValueOnce({
+          messages: [historyMessage('m2'), historyMessage('m3'), historyMessage('m4')],
+          hasMore: false,
+          oldestCursor: 'cursor-2',
+          newestCursor: 'cursor-4',
+          canonicalAvailable: true,
+        })
+
+      await api.loadHistory()
+      await api.loadEarlierHistory()
+      expect(api.historyState.value.loadEarlierError).toBe(true)
+
+      api.scheduleHistorySync(true)
+      await vi.advanceTimersByTimeAsync(100)
+
+      expect(readHistory).toHaveBeenCalledTimes(2)
+      expect(messages.value.map(message => message.messageId)).toEqual(['m1', 'm2', 'm3', 'm4'])
+      expect(api.historyState.value.loadEarlierError).toBe(true)
+
+      await api.retryHistory()
+
+      expect(readHistory).toHaveBeenNthCalledWith(3, 'latest', null, expect.any(Object))
+      expect(readHistory).toHaveBeenCalledTimes(3)
+      expect(messages.value.map(message => message.messageId)).toEqual(['m2', 'm3', 'm4'])
+      expect(api.historyState.value.loadEarlierError).toBe(false)
+      api.cleanup()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps typed latest recovery pending when a direct load is requested', async () => {
+    const { api, readHistory, historyFixture, messages } = makeHistory(false)
+    historyFixture
+      .mockResolvedValueOnce({
+        messages: [
+          historyMessage('m1'),
+          historyMessage('m2'),
+          historyMessage('m3'),
+          historyMessage('m4'),
+        ],
+        hasMore: true,
+        oldestCursor: 'cursor-1',
+        newestCursor: 'cursor-4',
+        canonicalAvailable: true,
+      })
+      .mockRejectedValueOnce(new SessionReadHistoryCursorError('stale', 'cursor rejected'))
+      .mockResolvedValueOnce({
+        messages: [historyMessage('m2'), historyMessage('m3'), historyMessage('m4')],
+        hasMore: false,
+        oldestCursor: 'cursor-2',
+        newestCursor: 'cursor-4',
+        canonicalAvailable: true,
+      })
+
+    await api.loadHistory()
+    await api.loadEarlierHistory()
+    expect(api.historyState.value.loadEarlierError).toBe(true)
+
+    expect(api.loadHistory()).toBeUndefined()
+    await Promise.resolve()
+
+    expect(readHistory).toHaveBeenCalledTimes(2)
+    expect(messages.value.map(message => message.messageId)).toEqual(['m1', 'm2', 'm3', 'm4'])
+    expect(api.historyState.value.loadEarlierError).toBe(true)
+
+    await api.retryHistory()
+
+    expect(readHistory).toHaveBeenNthCalledWith(3, 'latest', null, expect.any(Object))
+    expect(readHistory).toHaveBeenCalledTimes(3)
+    expect(messages.value.map(message => message.messageId)).toEqual(['m2', 'm3', 'm4'])
+    expect(api.historyState.value.loadEarlierError).toBe(false)
+    api.cleanup()
+  })
+
+  it('replaces an overlapping canonical prefix while preserving the local tail', async () => {
+    const { api, readHistory, historyFixture, messages } = makeHistory(false)
+    historyFixture
+      .mockResolvedValueOnce({
+        messages: [
+          historyMessage('m1'),
+          historyMessage('m2'),
+          historyMessage('m3'),
+          historyMessage('m4'),
+        ],
+        hasMore: true,
+        oldestCursor: 'cursor-1',
+        newestCursor: 'cursor-4',
+        canonicalAvailable: true,
+      })
+      .mockRejectedValueOnce(new SessionReadHistoryCursorError('stale', 'cursor rejected'))
+      .mockRejectedValueOnce(new Error('offline during latest recovery'))
+      .mockResolvedValueOnce({
+        messages: [historyMessage('m3'), historyMessage('m4')],
+        hasMore: false,
+        oldestCursor: 'cursor-3',
+        newestCursor: 'cursor-4',
+        canonicalAvailable: true,
+      })
+
+    await api.loadHistory()
+    messages.value.push(
+      {
+        role: 'user',
+        text: 'local follow-up',
+        ts: 'local-user',
+        messageId: 'local-user',
+        turnId: 'local-turn',
+      },
+      {
+        role: 'assistant',
+        text: 'local answer in progress',
+        ts: 'local-assistant',
+        turnId: 'local-turn',
+      },
+    )
+
+    await api.loadEarlierHistory()
+    await api.retryHistory()
+    expect(api.historyState.value.recoveryError).toBe(true)
+
+    await api.retryHistory()
+
+    const latestRecoveryRequests = readHistory.mock.calls.slice(2)
+    for (const [direction, cursor] of latestRecoveryRequests) {
+      expect(direction).toBe('latest')
+      expect(cursor).toBeNull()
+    }
+    expect(messages.value.map(message => message.messageId || message.text)).toEqual([
+      'm3',
+      'm4',
+      'local-user',
+      'local answer in progress',
+    ])
+    expect(api.historyState.value).toMatchObject({
+      hasMore: false,
+      oldestCursor: 'cursor-3',
+      newestCursor: 'cursor-4',
+      recoveryError: false,
+    })
+  })
+
+  it('does not graft a prior-epoch terminal notice onto a reset latest window', async () => {
+    const oldUser = sessionReadMessage({
+      id: 'old-user',
+      messageId: 'old-user',
+      role: 'user',
+      text: 'old epoch prompt',
+      createdAt: '2026-07-06T00:00:01Z',
+      turnContext: { turnId: 'old-turn' },
+    }, 0)
+    const newUser = sessionReadMessage({
+      id: 'new-user',
+      messageId: 'new-user',
+      role: 'user',
+      text: 'new epoch prompt',
+      createdAt: '2026-07-06T00:00:02Z',
+      turnContext: { turnId: 'new-turn' },
+    }, 0)
+    const { api, historyFixture, messages } = makeHistory(false)
+    historyFixture
+      .mockResolvedValueOnce({
+        messages: [oldUser],
+        hasMore: true,
+        oldestCursor: 'old-cursor',
+        newestCursor: 'old-cursor',
+        canonicalAvailable: true,
+      })
+      .mockRejectedValueOnce(new SessionReadHistoryCursorError('stale', 'cursor rejected'))
+      .mockResolvedValueOnce({
+        messages: [newUser],
+        hasMore: false,
+        oldestCursor: 'new-cursor',
+        newestCursor: 'new-cursor',
+        canonicalAvailable: true,
+      })
+
+    await api.loadHistory()
+    messages.value.push({
+      role: 'error',
+      text: 'Activation failed; retry this message.',
+      ts: 'local-error',
+      turnId: 'old-turn',
+      errorCode: 'failed',
+      terminalNotice: true,
+    })
+    await api.loadEarlierHistory()
+    await api.retryHistory()
+
+    expect(messages.value.map(message => message.messageId)).toEqual(['new-user'])
+    expect(messages.value.some(message => message.terminalNotice)).toBe(false)
+  })
+
+  it('drops a prior local terminal turn when the replacement proves a new epoch', async () => {
+    const newUser = sessionReadMessage({
+      id: 'new-user',
+      messageId: 'new-user',
+      role: 'user',
+      text: 'new epoch prompt',
+      createdAt: '2026-07-06T00:00:02Z',
+      turnContext: { turnId: 'new-turn' },
+    }, 0)
+    const { api, historyFixture, messages } = makeHistory(false)
+    historyFixture
+      .mockResolvedValueOnce({
+        messages: [historyMessage('old-assistant')],
+        hasMore: true,
+        oldestCursor: 'old-cursor',
+        newestCursor: 'old-cursor',
+        canonicalAvailable: true,
+      })
+      .mockRejectedValueOnce(new SessionReadHistoryCursorError('stale', 'cursor rejected'))
+      .mockResolvedValueOnce({
+        messages: [newUser],
+        hasMore: false,
+        oldestCursor: 'new-cursor',
+        newestCursor: 'new-cursor',
+        canonicalAvailable: true,
+      })
+
+    await api.loadHistory()
+    messages.value.push(
+      {
+        role: 'user',
+        text: 'old local prompt',
+        ts: 'old-local-user',
+        messageId: 'old-local-user',
+        turnId: 'old-local-turn',
+      },
+      {
+        role: 'error',
+        text: 'Activation failed; retry this message.',
+        ts: 'old-local-error',
+        turnId: 'old-local-turn',
+        errorCode: 'failed',
+        terminalNotice: true,
+      },
+    )
+    await api.loadEarlierHistory()
+    await api.retryHistory()
+
+    expect(messages.value.map(message => message.messageId)).toEqual(['new-user'])
+    expect(messages.value.some(message => message.terminalNotice)).toBe(false)
+  })
+
+  it('drops a prior terminal turn when authoritative recovery is empty', async () => {
+    const oldUser = sessionReadMessage({
+      id: 'old-user',
+      messageId: 'old-user',
+      role: 'user',
+      text: 'old epoch prompt',
+      createdAt: '2026-07-06T00:00:01Z',
+      turnContext: { turnId: 'old-turn' },
+    }, 0)
+    const { api, historyFixture, messages } = makeHistory(false)
+    historyFixture
+      .mockResolvedValueOnce({
+        messages: [oldUser],
+        hasMore: true,
+        oldestCursor: 'old-cursor',
+        newestCursor: 'old-cursor',
+        canonicalAvailable: true,
+      })
+      .mockRejectedValueOnce(new SessionReadHistoryCursorError('stale', 'cursor rejected'))
+      .mockResolvedValueOnce({
+        messages: [],
+        hasMore: false,
+        oldestCursor: null,
+        newestCursor: null,
+        canonicalAvailable: true,
+      })
+
+    await api.loadHistory()
+    messages.value.push({
+      role: 'error',
+      text: 'Activation failed; retry this message.',
+      ts: 'local-error',
+      turnId: 'old-turn',
+      errorCode: 'failed',
+      terminalNotice: true,
+    })
+    await api.loadEarlierHistory()
+    await api.retryHistory()
+
+    expect(messages.value).toEqual([])
+  })
+
+  it('keeps a local terminal notice when latest proves its owning user id', async () => {
+    const currentUser = sessionReadMessage({
+      id: 'current-user',
+      messageId: 'current-user',
+      role: 'user',
+      text: 'current epoch prompt',
+      createdAt: '2026-07-06T00:00:01Z',
+      turnContext: { turnId: 'current-turn' },
+    }, 0)
+    const { api, historyFixture, messages } = makeHistory(false)
+    historyFixture
+      .mockResolvedValueOnce({
+        messages: [currentUser],
+        hasMore: true,
+        oldestCursor: 'old-cursor',
+        newestCursor: 'old-cursor',
+        canonicalAvailable: true,
+      })
+      .mockRejectedValueOnce(new SessionReadHistoryCursorError('stale', 'cursor rejected'))
+      .mockResolvedValueOnce({
+        messages: [currentUser],
+        hasMore: false,
+        oldestCursor: 'current-cursor',
+        newestCursor: 'current-cursor',
+        canonicalAvailable: true,
+      })
+
+    await api.loadHistory()
+    messages.value.push({
+      role: 'error',
+      text: 'Activation failed; retry this message.',
+      ts: 'local-error',
+      turnId: 'current-turn',
+      errorCode: 'failed',
+      terminalNotice: true,
+    })
+    await api.loadEarlierHistory()
+    await api.retryHistory()
+
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'error'])
+    expect(messages.value[1]).toMatchObject({
+      turnId: 'current-turn',
+      terminalNotice: true,
+    })
+  })
+
+  it('replaces a proven local terminal notice with the durable history error', async () => {
+    const currentUser = sessionReadMessage({
+      id: 'current-user',
+      messageId: 'current-user',
+      role: 'user',
+      text: 'current epoch prompt',
+      createdAt: '2026-07-06T00:00:01Z',
+      turnContext: { turnId: 'current-turn' },
+    }, 0)
+    const durableError = sessionReadMessage({
+      id: 'durable-error',
+      messageId: 'durable-error',
+      role: 'error',
+      text: 'Durable activation failure.',
+      createdAt: '2026-07-06T00:00:02Z',
+      turnContext: { turnId: 'current-turn' },
+    }, 1)
+    const { api, historyFixture, messages } = makeHistory(false)
+    historyFixture
+      .mockResolvedValueOnce({
+        messages: [currentUser],
+        hasMore: true,
+        oldestCursor: 'old-cursor',
+        newestCursor: 'old-cursor',
+        canonicalAvailable: true,
+      })
+      .mockRejectedValueOnce(new SessionReadHistoryCursorError('stale', 'cursor rejected'))
+      .mockResolvedValueOnce({
+        messages: [currentUser, durableError],
+        hasMore: false,
+        oldestCursor: 'current-cursor',
+        newestCursor: 'error-cursor',
+        canonicalAvailable: true,
+      })
+
+    await api.loadHistory()
+    messages.value.push({
+      role: 'error',
+      text: 'Activation failed; retry this message.',
+      ts: 'local-error',
+      turnId: 'current-turn',
+      errorCode: 'failed',
+      terminalNotice: true,
+    })
+    await api.loadEarlierHistory()
+    await api.retryHistory()
+
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'error'])
+    expect(messages.value.filter(message => message.role === 'error')).toHaveLength(1)
+    expect(messages.value[1]?.messageId).toBe('durable-error')
+    expect(messages.value[1]?.terminalNotice).toBeUndefined()
+  })
+
+  it('drops the prior canonical window when latest recovery is empty', async () => {
+    const { api, historyFixture, messages } = makeHistory(false)
+    historyFixture
+      .mockResolvedValueOnce({
+        messages: [historyMessage('m1')],
+        hasMore: true,
+        oldestCursor: 'cursor-1',
+        newestCursor: 'cursor-1',
+        canonicalAvailable: true,
+      })
+      .mockRejectedValueOnce(new SessionReadHistoryCursorError('stale', 'cursor rejected'))
+      .mockResolvedValueOnce({
+        messages: [],
+        hasMore: false,
+        oldestCursor: null,
+        newestCursor: null,
+        canonicalAvailable: true,
+      })
+
+    await api.loadHistory()
+    messages.value.push({
+      role: 'user',
+      text: 'local follow-up',
+      ts: 'local-user',
+      messageId: 'local-user',
+      turnId: 'local-turn',
+    })
+    await api.loadEarlierHistory()
+    await api.retryHistory()
+
+    expect(messages.value.map(message => message.messageId)).toEqual(['local-user'])
+    expect(api.historyState.value).toMatchObject({
+      hasMore: false,
+      oldestCursor: null,
+      newestCursor: null,
+      recoveryError: false,
+    })
+  })
+
+  it('replaces restored compaction maintenance while preserving local maintenance', async () => {
+    const { api, historyFixture, messages } = makeHistory(false)
+    historyFixture
+      .mockResolvedValueOnce({
+        messages: [historyMessage('m1')],
+        compactionSummaries: [{
+          id: 31,
+          compactionId: 'cmp-before-reset',
+          triggerReason: 'manual',
+          createdAt: 1_720_000_001,
+        }],
+        hasMore: true,
+        oldestCursor: 'cursor-1',
+        newestCursor: 'cursor-1',
+        canonicalAvailable: true,
+      })
+      .mockRejectedValueOnce(new SessionReadHistoryCursorError('stale', 'cursor rejected'))
+      .mockResolvedValueOnce({
+        messages: [],
+        compactionSummaries: [],
+        hasMore: false,
+        oldestCursor: null,
+        newestCursor: null,
+        canonicalAvailable: true,
+      })
+
+    await api.loadHistory()
+    expect(messages.value.some(message =>
+      message.maintenance?.compactionId === 'cmp-before-reset',
+    )).toBe(true)
+    messages.value.push({
+      role: 'maintenance',
+      text: '',
+      ts: 1_720_000_002_000,
+      messageId: 'maintenance:local:cmp-current',
+      maintenance: {
+        kind: 'context_compaction',
+        compactionId: 'cmp-current',
+        source: 'manual',
+        state: 'completed',
+        durability: 'durable',
+      },
+    })
+
+    await api.loadEarlierHistory()
+    await api.retryHistory()
+
+    expect(messages.value.map(message => message.messageId)).toEqual([
+      'maintenance:local:cmp-current',
+    ])
+    expect(messages.value.map(message => message.maintenance?.compactionId)).toEqual([
+      'cmp-current',
+    ])
+    expect(api.historyState.value).toMatchObject({
+      hasMore: false,
+      oldestCursor: null,
+      newestCursor: null,
+      recoveryError: false,
+    })
   })
 
   it('surfaces and retries an initial history request failure', async () => {
@@ -3663,6 +4266,67 @@ describe('useChatHistory accepted ensemble reconciliation', () => {
 })
 
 describe('useChatHistory safe local-tail synchronization', () => {
+  it('surfaces an invalidated background bridge and retries latest without cursors', async () => {
+    vi.useFakeTimers()
+    try {
+      const { api, readHistory, historyFixture, messages } = makeHistory(false)
+      historyFixture
+        .mockResolvedValueOnce({
+          messages: [historyMessage('m4')],
+          hasMore: true,
+          oldestCursor: 'cursor-4',
+          newestCursor: 'cursor-4',
+          canonicalAvailable: true,
+        })
+        .mockResolvedValueOnce({
+          messages: [historyMessage('m3')],
+          hasMore: true,
+          oldestCursor: 'cursor-3',
+          newestCursor: 'cursor-3',
+          canonicalAvailable: true,
+        })
+        .mockResolvedValueOnce({
+          messages: [historyMessage('m9')],
+          hasMore: true,
+          oldestCursor: 'cursor-9',
+          newestCursor: 'cursor-9',
+          canonicalAvailable: true,
+        })
+        .mockRejectedValueOnce(new SessionReadHistoryCursorError('stale', 'cursor rejected'))
+        .mockResolvedValueOnce({
+          messages: [historyMessage('m10')],
+          hasMore: false,
+          oldestCursor: 'cursor-10',
+          newestCursor: 'cursor-10',
+          canonicalAvailable: true,
+        })
+
+      await api.loadHistory()
+      await api.loadEarlierHistory()
+      api.scheduleHistorySync(true)
+      await vi.advanceTimersByTimeAsync(50)
+      await vi.waitFor(() => expect(readHistory).toHaveBeenCalledTimes(4))
+
+      expect(readHistory).toHaveBeenNthCalledWith(
+        4,
+        'after',
+        'cursor-4',
+        expect.any(Object),
+      )
+      expect(messages.value.map(message => message.messageId)).toEqual(['m3', 'm4'])
+      expect(api.historyState.value.recoveryError).toBe(true)
+
+      await api.retryHistory()
+
+      expect(readHistory).toHaveBeenNthCalledWith(5, 'latest', null, expect.any(Object))
+      expect(messages.value.map(message => message.messageId)).toEqual(['m10'])
+      expect(api.historyState.value.recoveryError).toBe(false)
+      api.cleanup()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('protects a successor from an older response until a post-generation load succeeds', async () => {
     vi.useFakeTimers()
     try {

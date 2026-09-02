@@ -1,7 +1,10 @@
 import { describe, expect, it, vi } from 'vitest'
 import { CHAT_HISTORY_METHOD, type ChatHistoryResult } from '@/contracts/generated/v4/chatHistory'
 import type { RpcCallOptions } from '@/lib/rpc'
-import { SessionReadSessionMissingError } from '@/modules/sessionReadLifecycle'
+import {
+  SessionReadHistoryCursorError,
+  SessionReadSessionMissingError,
+} from '@/modules/sessionReadLifecycle'
 import {
   requestV4SessionHistory,
   type SessionHistoryV4Transport,
@@ -40,6 +43,44 @@ describe('v4 SessionHistory Adapter', () => {
         code: 'session-missing',
         cause,
       } satisfies Partial<SessionReadSessionMissingError>)
+    },
+  )
+
+  it.each([
+    ['HISTORY_CURSOR_INVALID', 'invalid', { code: 'HISTORY_CURSOR_INVALID' }],
+    ['HISTORY_CURSOR_INVALIDATED', 'stale', { code: 'HISTORY_CURSOR_INVALIDATED' }],
+    ['lowercase data.code', 'stale', { data: { code: 'history_cursor_invalidated' } }],
+  ] as const)(
+    'maps %s into a reload-latest history cursor failure',
+    async (_label, reason, suppliedShape) => {
+      const cause = Object.assign(new Error('cursor rejected'), suppliedShape)
+      const transport: SessionHistoryV4Transport = {
+        request: vi.fn(async () => { throw cause }),
+      }
+
+      const request = requestV4SessionHistory(
+        transport,
+        'session-1',
+        {
+          direction: 'before',
+          cursor: '1|1',
+          limit: 100,
+          signal: new AbortController().signal,
+        },
+        {
+          includeSummaries: true,
+          policy: { concurrentHistoryReads: () => true },
+          contractError: message => new Error(message),
+        },
+      )
+
+      await expect(request).rejects.toMatchObject({
+        name: 'SessionReadHistoryCursorError',
+        code: 'history-cursor-rejected',
+        reason,
+        recovery: 'reload-latest',
+        cause,
+      } satisfies Partial<SessionReadHistoryCursorError>)
     },
   )
 

@@ -103,6 +103,32 @@
         }
       },
       "expected_outcome": "error.storage-busy"
+    },
+    {
+      "id": "request.history-cursor-invalid",
+      "wire": {
+        "type": "req",
+        "id": "request.history-cursor-invalid",
+        "method": "chat.history",
+        "params": {
+          "sessionKey": "agent:main:webchat:characterization",
+          "before": "malformed"
+        }
+      },
+      "expected_outcome": "error.history-cursor-invalid"
+    },
+    {
+      "id": "request.history-cursor-invalidated",
+      "wire": {
+        "type": "req",
+        "id": "request.history-cursor-invalidated",
+        "method": "chat.history",
+        "params": {
+          "sessionKey": "agent:main:webchat:characterization",
+          "before": "999999|999999"
+        }
+      },
+      "expected_outcome": "error.history-cursor-invalidated"
     }
   ]
 }

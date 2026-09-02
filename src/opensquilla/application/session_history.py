@@ -5,19 +5,24 @@ projection.  This module owns the storage-independent part that is safe to
 extract first: choosing a canonical page when it is available and applying
 the same keyset pagination policy to an active transcript fallback.
 
-Adapters translate concrete storage failures into ``None`` for an unavailable
-canonical reader (while preserving retryable failures), and translate legacy
-wire cursors into :class:`HistoryCursor` values.  No RPC, WebSocket, Gateway,
-or persistence type is allowed to cross this boundary.
+Adapters translate unexpected concrete storage failures into a domain error
+that permits active fallback without confusing an unavailable canonical anchor
+with a stale cursor. They preserve retryable and cursor-domain failures and
+translate legacy wire cursors into :class:`HistoryCursor` values. No RPC,
+WebSocket, Gateway, or persistence type is allowed to cross this boundary.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol, cast
+from typing import Protocol
 
-type HistoryCursor = tuple[int, int]
+from opensquilla.history_cursor import (
+    HISTORY_CURSOR_MAX_INTEGER,
+    HistoryCursor,
+    HistoryCursorInvalidatedError,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,9 +30,8 @@ class SessionHistoryQuery:
     """Normalized input for one history page read.
 
     ``before`` takes precedence over ``after`` when both are present.  The
-    Gateway adapter is responsible for preserving legacy malformed-value
-    behavior before constructing this value; the application receives a
-    positive limit and parsed cursors only.
+    Gateway adapter rejects malformed wire values before constructing this
+    value; the application receives a positive limit and parsed cursors only.
     """
 
     session_key: str
@@ -47,13 +51,19 @@ class HistoryPage:
     canonical_complete: bool
 
 
+class CanonicalHistoryReadError(RuntimeError):
+    """Raised when canonical projection fails for a non-cursor reason."""
+
+
 class CanonicalHistoryReader(Protocol):
     """Port for the preferred persisted/keyset history projection.
 
-    Returning ``None`` means that the canonical projection is unavailable and
-    the application should use the active transcript reader.  Implementations
-    must still raise retryable storage failures instead of converting them to
-    ``None`` so the Gateway can retain its existing error semantics.
+    Returning ``None`` means that the canonical capability is unavailable and
+    the application should use the active transcript reader. Implementations
+    wrap unexpected projection failures in :class:`CanonicalHistoryReadError`
+    so fallback can be attempted without later misclassifying the failure as a
+    stale cursor. Retryable storage failures and cursor invalidations remain
+    explicit.
     """
 
     async def read_canonical_page(
@@ -87,16 +97,22 @@ class SessionHistoryApplication:
     async def read_page(self, query: SessionHistoryQuery) -> HistoryPage:
         """Prefer canonical storage, then apply the legacy fallback policy."""
 
+        effective_after = None if query.before is not None else query.after
+        canonical_failure: CanonicalHistoryReadError | None = None
         if query.include_canonical and self._canonical is not None:
-            # The Port deliberately decides which implementation failures are
-            # recoverable.  Any exception that reaches here (for example a
-            # retryable storage-busy error) must remain visible to the adapter.
-            canonical_page = await self._canonical.read_canonical_page(
-                query.session_key,
-                limit=query.limit,
-                before=query.before,
-                after=query.after,
-            )
+            # The Port marks only generic projection failures as eligible for
+            # active fallback. Retryable and cursor-domain failures remain
+            # visible to the caller.
+            try:
+                canonical_page = await self._canonical.read_canonical_page(
+                    query.session_key,
+                    limit=query.limit,
+                    before=query.before,
+                    after=effective_after,
+                )
+            except CanonicalHistoryReadError as exc:
+                canonical_failure = exc
+                canonical_page = None
             if canonical_page is not None:
                 return HistoryPage(
                     entries=tuple(canonical_page.entries),
@@ -108,12 +124,17 @@ class SessionHistoryApplication:
         transcript = tuple(
             await self._active.read_active_transcript(query.session_key)
         )
-        entries, has_more = paginate_transcript(
-            transcript,
-            limit=query.limit,
-            before=query.before,
-            after=query.after,
-        )
+        try:
+            entries, has_more = paginate_transcript(
+                transcript,
+                limit=query.limit,
+                before=query.before,
+                after=effective_after,
+            )
+        except HistoryCursorInvalidatedError:
+            if canonical_failure is not None:
+                raise canonical_failure
+            raise
         return HistoryPage(
             entries=entries,
             has_more=has_more,
@@ -126,13 +147,19 @@ def cursor_for_entry(entry: object) -> HistoryCursor | None:
     """Return the stable integer cursor used by the history Port."""
 
     created_at = getattr(entry, "created_at", None)
-    stable_id = getattr(entry, "id", None) or getattr(entry, "message_id", None)
-    if created_at in {None, ""} or stable_id in {None, ""}:
+    stable_id = getattr(entry, "id", None)
+    if (
+        not isinstance(created_at, int)
+        or isinstance(created_at, bool)
+        or not isinstance(stable_id, int)
+        or isinstance(stable_id, bool)
+        or created_at < 0
+        or stable_id < 0
+        or created_at > HISTORY_CURSOR_MAX_INTEGER
+        or stable_id > HISTORY_CURSOR_MAX_INTEGER
+    ):
         return None
-    try:
-        return int(cast(Any, created_at)), int(cast(Any, stable_id))
-    except (TypeError, ValueError):
-        return None
+    return created_at, stable_id
 
 
 def paginate_transcript(
@@ -144,26 +171,34 @@ def paginate_transcript(
 ) -> tuple[tuple[object, ...], bool]:
     """Apply the current active-transcript keyset policy.
 
-    A missing cursor is treated as an unpositioned read, matching the legacy
-    handler.  When both cursors are supplied, ``before`` wins.  The caller
-    supplies a positive ``limit`` after v4 compatibility normalization.
+    Only an absent cursor is treated as an unpositioned read. When both
+    cursors are supplied, ``before`` wins and ``after`` is ignored. A parsed
+    cursor that does not identify an entry raises a typed invalidation error
+    instead of silently returning the latest window.
     """
 
     rows = tuple(entries)
-    if not rows:
-        return (), False
-
-    before_index = _cursor_index(rows, before)
-    if before_index is not None:
+    if before is not None:
+        before_index = _cursor_index(rows, before)
+        if before_index is None:
+            raise HistoryCursorInvalidatedError(
+                "history cursor no longer anchors this session"
+            )
         start = max(0, before_index - limit)
         return rows[start:before_index], start > 0
 
-    after_index = _cursor_index(rows, after)
-    if after_index is not None:
+    if after is not None:
+        after_index = _cursor_index(rows, after)
+        if after_index is None:
+            raise HistoryCursorInvalidatedError(
+                "history cursor no longer anchors this session"
+            )
         start = min(len(rows), after_index + 1)
         end = min(len(rows), start + limit)
         return rows[start:end], end < len(rows)
 
+    if not rows:
+        return (), False
     if len(rows) <= limit:
         return rows, False
     return rows[-limit:], True
@@ -180,6 +215,7 @@ def _cursor_index(entries: Sequence[object], cursor: HistoryCursor | None) -> in
 
 __all__ = [
     "ActiveHistoryReader",
+    "CanonicalHistoryReadError",
     "CanonicalHistoryReader",
     "HistoryCursor",
     "HistoryPage",

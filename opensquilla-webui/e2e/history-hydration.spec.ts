@@ -1004,6 +1004,91 @@ test('keeps loaded messages visible when an earlier page fails and retries inlin
   expect(earlierHistoryRequests).toBe(2)
 })
 
+test('drops an invalidated earlier cursor before retrying from latest', async ({ page }) => {
+  const historyParams: Array<Record<string, unknown>> = []
+  let earlierCursorInvalidated = false
+
+  await stubApprovals(page)
+  await page.routeWebSocket(/\/ws$/, ws => {
+    ws.send(JSON.stringify({ type: 'event', event: 'connect.challenge', payload: {} }))
+    ws.onMessage(message => {
+      try {
+        const frame = JSON.parse(String(message))
+        if (replyToPing(ws, frame)) return
+        if (frame?.type !== 'req') return
+        if (frame.method === 'connect') {
+          ws.send(helloResponse(30000))
+          return
+        }
+        if (frame.method === 'chat.history') {
+          const params = frame.params || {}
+          historyParams.push(params)
+          if (params.before === 'cursor-50') {
+            earlierCursorInvalidated = true
+            ws.send(JSON.stringify({
+              type: 'res',
+              id: String(frame.id),
+              ok: false,
+              error: {
+                code: 'HISTORY_CURSOR_INVALIDATED',
+                message: 'cursor no longer belongs to this session',
+              },
+            }))
+          } else if (!earlierCursorInvalidated) {
+            const messages = longHistoryMessages()
+            ws.send(successResponse(String(frame.id), chatHistoryPayload(messages, {
+              has_more: true,
+              oldest_cursor: 'cursor-50',
+              newest_cursor: 'cursor-100',
+              history_scope: 'latest_window',
+              loaded_count: messages.length,
+              page_size: Number(frame.params?.limit) || 50,
+            })))
+          } else {
+            const messages = [{
+              role: 'assistant',
+              text: 'Latest history recovered without the stale cursor.',
+              id: 'latest-history-message',
+              timestamp: Math.floor(Date.now() / 1000),
+            }]
+            ws.send(successResponse(String(frame.id), chatHistoryPayload(messages, {
+              oldest_cursor: 'cursor-latest',
+              newest_cursor: 'cursor-latest',
+              loaded_count: messages.length,
+              page_size: Number(frame.params?.limit) || 50,
+            })))
+          }
+          return
+        }
+        ws.send(successResponse(
+          String(frame.id),
+          basePayload(String(frame.method), requestSessionKey(frame)),
+        ))
+      } catch {}
+    })
+  })
+
+  await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
+  const thread = page.locator('.chat-thread')
+  await expect(page.getByText('Hydration complete.')).toBeVisible()
+  await thread.evaluate(element => element.scrollTo({ top: 0 }))
+  await expect.poll(() => earlierCursorInvalidated).toBe(true)
+
+  const retry = page.getByTestId('history-load-retry')
+  await expect(retry).toBeVisible()
+  await retry.click()
+
+  await expect(page.getByText('Latest history recovered without the stale cursor.')).toBeVisible()
+  const invalidatedRequestIndex = historyParams.findIndex(
+    params => params.before === 'cursor-50',
+  )
+  expect(invalidatedRequestIndex).toBeGreaterThanOrEqual(0)
+  const retryParams = historyParams[invalidatedRequestIndex + 1]
+  expect(retryParams).toBeDefined()
+  expect(retryParams).not.toHaveProperty('before')
+  expect(retryParams).not.toHaveProperty('after')
+})
+
 test('ignores a late history response after navigating to another session', async ({ page }) => {
   let releaseOldHistory: (() => void) | undefined
 

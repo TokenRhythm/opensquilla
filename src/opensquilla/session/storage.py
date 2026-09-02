@@ -28,6 +28,7 @@ from functools import wraps
 from typing import TYPE_CHECKING, Any, Concatenate, cast
 
 from opensquilla.compat import aiosqlite
+from opensquilla.history_cursor import HistoryCursorInvalidatedError
 from opensquilla.session.cost_rollup import rollup_cost_source
 from opensquilla.session.goals import (
     GOAL_EFFECTIVE_CONTEXT_DETAIL_KEY,
@@ -14112,28 +14113,6 @@ class SessionStorage:
                     )
         return changed > 0
 
-    async def _canonical_transcript_cursor_exists(
-        self,
-        session_id: str,
-        cursor: tuple[int, int],
-    ) -> bool:
-        created_at, entry_id = cursor
-        sql = """
-            SELECT 1
-            FROM transcript_entries
-            WHERE session_id = ? AND created_at = ? AND id = ?
-            UNION ALL
-            SELECT 1
-            FROM compacted_transcript_entries
-            WHERE session_id = ? AND created_at = ? AND original_entry_id = ?
-            LIMIT 1
-        """
-        async with self.conn.execute(
-            sql,
-            (session_id, created_at, entry_id, session_id, created_at, entry_id),
-        ) as cur:
-            return await cur.fetchone() is not None
-
     @_serialized_read
     async def get_canonical_transcript_page(
         self,
@@ -14147,28 +14126,41 @@ class SessionStorage:
 
         Each source CTE is bounded to ``limit + 1`` rows and both are merged in
         one SQLite read snapshot. ``before`` keeps its historical precedence
-        over ``after`` when both cursors exist; an unknown cursor is ignored,
-        matching the legacy list-pagination path.
+        over ``after`` when both cursors exist. A supplied cursor must identify
+        an anchor in this session; missing, foreign, or deleted anchors fail
+        closed instead of being treated as an unpositioned latest read. Legacy
+        archived rows without an original integer id are not keyset-addressable
+        and are omitted while canonical coverage reports the archive incomplete.
         """
         page_size = max(1, int(limit))
         fetch_size = page_size + 1
 
-        resolved_before = before
-        if resolved_before is not None and not await self._canonical_transcript_cursor_exists(
-            session_id,
-            resolved_before,
-        ):
-            resolved_before = None
+        cursor = before
+        ascending = False
+        if cursor is None and after is not None:
+            cursor = after
+            ascending = True
 
-        resolved_after = None
-        if resolved_before is None and after is not None:
-            if await self._canonical_transcript_cursor_exists(session_id, after):
-                resolved_after = after
-
-        cursor = resolved_before or resolved_after
-        ascending = resolved_after is not None
         comparator = ">" if ascending else "<"
         direction = "ASC" if ascending else "DESC"
+
+        anchor_params: list[Any] = []
+        anchor_sql = "SELECT 1 AS present"
+        if cursor is not None:
+            created_at, entry_id = cursor
+            anchor_sql = """
+                SELECT 1 AS present
+                FROM transcript_entries
+                WHERE session_id = ? AND created_at = ? AND id = ?
+                UNION ALL
+                SELECT 1 AS present
+                FROM compacted_transcript_entries
+                WHERE session_id = ? AND created_at = ? AND original_entry_id = ?
+                LIMIT 1
+            """
+            anchor_params.extend(
+                (session_id, created_at, entry_id, session_id, created_at, entry_id)
+            )
 
         active_params: list[Any] = [session_id]
         active_cursor_clause = ""
@@ -14191,7 +14183,10 @@ class SessionStorage:
             archived_params.extend((created_at, created_at, entry_id))
         archived_params.append(fetch_size)
         sql = f"""
-            WITH active_page AS (
+            WITH cursor_anchor AS (
+                {anchor_sql}
+            ),
+            active_page AS (
                 SELECT
                     id,
                     session_id,
@@ -14214,6 +14209,7 @@ class SessionStorage:
                     schema_version
                 FROM transcript_entries
                 WHERE session_id = ?
+                  AND EXISTS (SELECT 1 FROM cursor_anchor)
                   {active_cursor_clause}
                 ORDER BY created_at {direction}, id {direction}
                 LIMIT ?
@@ -14241,6 +14237,8 @@ class SessionStorage:
                     schema_version
                 FROM compacted_transcript_entries
                 WHERE session_id = ?
+                  AND original_entry_id IS NOT NULL
+                  AND EXISTS (SELECT 1 FROM cursor_anchor)
                   {archived_cursor_clause}
                 ORDER BY
                     created_at {direction},
@@ -14252,22 +14250,43 @@ class SessionStorage:
                 SELECT * FROM active_page
                 UNION ALL
                 SELECT * FROM archived_page
+            ),
+            page AS (
+                SELECT merged.*, 1 AS _page_row
+                FROM merged
+                ORDER BY created_at {direction}, id {direction}
+                LIMIT ?
+            ),
+            cursor_status AS (
+                SELECT EXISTS (SELECT 1 FROM cursor_anchor) AS is_valid
             )
-            SELECT *
-            FROM merged
-            ORDER BY created_at {direction}, id {direction}
-            LIMIT ?
+            SELECT page.*, cursor_status.is_valid AS _cursor_valid
+            FROM cursor_status
+            LEFT JOIN page ON cursor_status.is_valid = 1
+            ORDER BY page.created_at {direction}, page.id {direction}
         """
 
-        # Both sources must be read by one SQLite statement. A compaction moves
-        # rows from transcript_entries into compacted_transcript_entries inside
-        # one transaction; separate SELECT statements could otherwise observe
-        # opposite sides of that move and duplicate or omit canonical rows.
-        params = [*active_params, *archived_params, fetch_size]
+        # Cursor membership and both transcript sources must share one SQLite
+        # statement. A concurrent delete/reset or compaction can then land only
+        # before or after this snapshot, never between validation and paging.
+        params = [*anchor_params, *active_params, *archived_params, fetch_size]
         async with self.conn.execute(sql, params) as cur:
             rows = await cur.fetchall()
 
-        entries = [TranscriptEntry(**_deserialize_row(dict(row))) for row in rows]
+        if not rows or not bool(rows[0]["_cursor_valid"]):
+            raise HistoryCursorInvalidatedError(
+                "history cursor no longer anchors this session"
+            )
+
+        entry_rows: list[dict[str, Any]] = []
+        for row in rows:
+            payload = dict(row)
+            payload.pop("_cursor_valid", None)
+            page_row = payload.pop("_page_row", None)
+            if page_row is not None:
+                entry_rows.append(payload)
+
+        entries = [TranscriptEntry(**_deserialize_row(row)) for row in entry_rows]
         has_more = len(entries) > page_size
         entries = entries[:page_size]
         if not ascending:

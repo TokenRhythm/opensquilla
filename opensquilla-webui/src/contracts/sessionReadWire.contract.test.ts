@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
+import { CHAT_HISTORY_ERRORS } from './generated/v4/chatHistory'
 
 interface ContractValidator {
   (value: unknown): boolean
@@ -105,6 +106,25 @@ describe('generated Session read v4 Contracts', () => {
         details: { operation: 'chat.history', stage: 'characterization' },
       },
     })).toBe(true)
+  })
+
+  it('publishes and validates both strict history cursor failures', () => {
+    const declaredCodes = new Set(CHAT_HISTORY_ERRORS.map(error => error.code))
+    expect(declaredCodes.has('HISTORY_CURSOR_INVALID')).toBe(true)
+    expect(declaredCodes.has('HISTORY_CURSOR_INVALIDATED')).toBe(true)
+
+    const cursorErrors = historyFixture('errors.json').cases
+      .filter(testCase => testCase.id.startsWith('error.history-cursor-'))
+    expect(cursorErrors).toHaveLength(2)
+    for (const testCase of cursorErrors) {
+      expect(historyValidators.validateChatHistoryResponseFrame({
+        type: 'res',
+        id: testCase.id,
+        ok: false,
+        payload: null,
+        error: testCase.wire,
+      }), testCase.id).toBe(true)
+    }
   })
 
   it('accepts the real enriched and fast-ACK message subscription shapes', () => {

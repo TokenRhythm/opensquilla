@@ -32,6 +32,7 @@ import {
   type SessionPhaseResult,
 } from '@/composables/chat/sessionBootstrapContract'
 import {
+  SessionReadHistoryCursorError,
   SessionReadSessionMissingError,
   type SessionReadCompactionSummary,
   type SessionReadHistoryPage,
@@ -705,6 +706,7 @@ interface HistoryLoadParams {
   bridgeRetry?: boolean
   retry?: boolean
   nonReconnecting?: boolean
+  replaceCanonicalWindow?: boolean
 }
 
 type FailedHistoryRequest =
@@ -716,6 +718,10 @@ type FailedHistoryRequest =
     }
   | {
       kind: 'bridge'
+      key: string
+    }
+  | {
+      kind: 'latest'
       key: string
     }
 
@@ -787,7 +793,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       historySyncTimer = null
       const timerNonReconnecting = historySyncTimerNonReconnecting
       historySyncTimerNonReconnecting = false
-      if (historyState.value.loading) {
+      if (historyState.value.loading || failedHistoryRequest) {
         historySyncPending = true
         historySyncPendingNonReconnecting ||= timerNonReconnecting
         return
@@ -797,6 +803,12 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   }
 
   function scheduleHistorySync(preserveLocalTail = false) {
+    if (failedHistoryRequest) {
+      if (preserveLocalTail) preserveLocalTailGeneration += 1
+      historySyncPending = true
+      historySyncPendingNonReconnecting ||= preserveLocalTail
+      return
+    }
     armHistorySync(preserveLocalTail, true)
   }
 
@@ -886,6 +898,70 @@ export function useChatHistory(options: UseChatHistoryOptions) {
 
   function hasLocalOptimisticRows(messages: ChatMessage[]): boolean {
     return messages.some(msg => msg.restoredFromHistory !== true)
+  }
+
+  function canonicalHistoryReplacementContext(
+    previous: ChatMessage[],
+    latest: ChatMessage[],
+  ): ChatMessage[] {
+    const latestIds = new Set(latest.map(message => message.messageId).filter(Boolean))
+    const excludedTerminalRows = new Set<ChatMessage>()
+    const latestHasDurableErrorForUser = (messageId: string): boolean => {
+      const userIndex = latest.findIndex(message =>
+        message.role === 'user' && message.messageId === messageId,
+      )
+      if (userIndex < 0) return false
+      for (let index = userIndex + 1; index < latest.length; index++) {
+        const message = latest[index]
+        if (message?.role === 'user') break
+        if (message?.role === 'error') return true
+      }
+      return false
+    }
+    let owningUserIndex = -1
+    for (let index = 0; index < previous.length; index++) {
+      const message = previous[index]
+      if (message?.role === 'user') owningUserIndex = index
+      if (
+        message?.role !== 'error'
+        || !message.terminalNotice
+        || owningUserIndex < 0
+      ) continue
+      const owningUser = previous[owningUserIndex]
+      if (owningUser?.messageId && latestIds.has(owningUser.messageId)) {
+        // Once the authoritative turn contains its durable error, the local
+        // notice has completed its bridging role and must not survive beside it.
+        if (latestHasDurableErrorForUser(owningUser.messageId)) {
+          excludedTerminalRows.add(message)
+        }
+        continue
+      }
+
+      // A rejected cursor means a settled local turn cannot be assigned to the
+      // replacement epoch by text, ordinal, or optimistic identity. Keep it
+      // only when the authoritative page proves the owning durable user id.
+      for (let turnIndex = owningUserIndex; turnIndex <= index; turnIndex++) {
+        const turnMessage = previous[turnIndex]
+        if (turnMessage) excludedTerminalRows.add(turnMessage)
+      }
+    }
+    return previous.filter(message =>
+      !excludedTerminalRows.has(message)
+      && (
+        message.restoredFromHistory !== true
+        || Boolean(message.messageId && latestIds.has(message.messageId))
+      ),
+    )
+  }
+
+  // A rejected anchor makes every older canonical row untrustworthy. Retain
+  // only overlap needed to reconcile live fields plus non-canonical local rows.
+  function replaceCanonicalHistoryWindow(
+    previous: ChatMessage[],
+    latest: ChatMessage[],
+  ): ChatMessage[] {
+    const liveContext = canonicalHistoryReplacementContext(previous, latest)
+    return reconcileRunningHistoryMessages(liveContext, latest)
   }
 
   function responseCanonicalComplete(data: SessionReadHistoryPage): boolean | null {
@@ -1114,6 +1190,9 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       )
       const previousMessages = crossedSession ? [] : options.messages.value
       const previousMaintenance = previousMessages.filter(isHistoryMaintenance)
+      const retainedPreviousMaintenance = params.replaceCanonicalWindow
+        ? previousMaintenance.filter(message => message.restoredFromHistory !== true)
+        : previousMaintenance
       const previousTranscript = previousMessages.filter(message => !isHistoryMaintenance(message))
       const maintenanceMessages = compactionSummaryMessages(data)
       let historyData = data
@@ -1276,14 +1355,16 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       }
 
       if (msgs.length === 0 && !params.prepend) {
-        const transcript = preserveLiveTail
-          ? reconcileRunningHistoryMessages(previousTranscript, [])
-          : !crossedSession && hasLocalOptimisticRows(previousTranscript)
-            ? previousTranscript
-            : []
+        const transcript = params.replaceCanonicalWindow
+          ? replaceCanonicalHistoryWindow(previousTranscript, [])
+          : preserveLiveTail
+            ? reconcileRunningHistoryMessages(previousTranscript, [])
+            : !crossedSession && hasLocalOptimisticRows(previousTranscript)
+              ? previousTranscript
+              : []
         options.messages.value = mergeHistoryMaintenance(
           transcript,
-          [...previousMaintenance, ...maintenanceMessages],
+          [...retainedPreviousMaintenance, ...maintenanceMessages],
         )
         if (options.messages.value.length === 0) {
           options.lastHeaderRole.value = ''
@@ -1312,12 +1393,19 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         )
         options.messages.value = mergeHistoryMaintenance(
           transcript,
-          [...previousMaintenance, ...maintenanceMessages],
+          [...retainedPreviousMaintenance, ...maintenanceMessages],
         )
       } else {
-        const refreshedWindow = reconcileHistoryWindow(previousTranscript, mapped)
+        const terminalNoticeContext = params.replaceCanonicalWindow
+          ? canonicalHistoryReplacementContext(previousTranscript, mapped)
+          : previousTranscript
+        const refreshedWindow = params.replaceCanonicalWindow
+          ? reconcileRunningHistoryMessages(terminalNoticeContext, mapped)
+          : reconcileHistoryWindow(previousTranscript, mapped)
         let nextMessages: ChatMessage[]
-        if (preserveLiveTail) {
+        if (params.replaceCanonicalWindow) {
+          nextMessages = refreshedWindow
+        } else if (preserveLiveTail) {
           nextMessages = reconcileRunningHistoryMessages(previousTranscript, refreshedWindow)
         } else {
           nextMessages = refreshedWindow
@@ -1330,13 +1418,13 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         const transcript = interleaveHistoryModelCallSegments(
           rehomePromotedSteerRows(
             dedupeSyntheticUsageBarrierErrors(
-              reconcileClientTerminalNotices(previousTranscript, nextMessages),
+              reconcileClientTerminalNotices(terminalNoticeContext, nextMessages),
             ),
           ),
         )
         options.messages.value = mergeHistoryMaintenance(
           transcript,
-          [...previousMaintenance, ...maintenanceMessages],
+          [...retainedPreviousMaintenance, ...maintenanceMessages],
         )
       }
 
@@ -1420,7 +1508,8 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     } catch (error: unknown) {
       // History endpoint may not exist yet.
       if (isCurrentRequest()) {
-        if (nonReconnecting) {
+        const cursorRequiresLatestReload = error instanceof SessionReadHistoryCursorError
+        if (nonReconnecting && !cursorRequiresLatestReload) {
           restoreSilentBackgroundState()
           return {
             ok: false,
@@ -1429,14 +1518,16 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           }
         }
         const initialLoadFailed = isInitialLoad && !bridgeAttempted
-        failedHistoryRequest = bridgeAttempted
-          ? { kind: 'bridge', key }
-          : {
-              kind: 'page',
-              key,
-              before: params.before ?? null,
-              prepend: Boolean(params.prepend),
-            }
+        failedHistoryRequest = cursorRequiresLatestReload || params.replaceCanonicalWindow
+          ? { kind: 'latest', key }
+          : bridgeAttempted
+            ? { kind: 'bridge', key }
+            : {
+                kind: 'page',
+                key,
+                before: params.before ?? null,
+                prepend: Boolean(params.prepend),
+              }
         historyState.value = {
           ...historyState.value,
           loading: false,
@@ -1466,6 +1557,15 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   ): Promise<SessionPhaseResult | void> | undefined {
     const key = options.sessionKey.value
     if (!key) return
+    if (
+      failedHistoryRequest?.key === key
+      && failedHistoryRequest.kind === 'latest'
+      && !params.replaceCanonicalWindow
+    ) {
+      historySyncPending = true
+      historySyncPendingNonReconnecting ||= Boolean(params.nonReconnecting)
+      return
+    }
     if (activeHistory) {
       if (
         activeHistory.key === key
@@ -1536,6 +1636,19 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   function retryHistory(bootstrap?: SessionBootstrapPhaseContext) {
     const failed = failedHistoryRequest
     if (failed?.key === options.sessionKey.value) {
+      if (failed.kind === 'latest') {
+        hasLoadedEarlier = false
+        loadEarlierPending = false
+        loadedEarlierCursors.clear()
+        failedHistoryRequest = null
+        historyState.value = {
+          ...historyState.value,
+          hasMore: false,
+          oldestCursor: null,
+          newestCursor: null,
+        }
+        return loadHistory({ replaceCanonicalWindow: true, retry: true }, bootstrap)
+      }
       if (failed.kind === 'bridge') {
         return loadHistory({ bridgeRetry: true, retry: true }, bootstrap)
       }

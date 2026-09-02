@@ -2,9 +2,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { SessionInspection } from '@/modules/sessionInspection'
 import type { TurnCommands } from '@/modules/turnCommands'
-import type {
-  SessionReadHistoryPage,
-  SessionReadMessage,
+import {
+  SessionReadHistoryCursorError,
+  type SessionReadHistoryPage,
+  type SessionReadMessage,
 } from '@/modules/sessionReadLifecycle'
 import { abortInspectedSession, useSessionInspect } from './useSessionInspect'
 
@@ -111,6 +112,37 @@ describe('useSessionInspect canonical pagination', () => {
     expect(inspect.loadEarlierError.value).toBe(false)
     expect(inspect.messages.value.map(row => row.messageId)).toEqual(['m1', 'm2'])
     expect(before).toHaveBeenCalledTimes(2)
+  })
+
+  it.each([
+    'invalid',
+    'stale',
+  ] as const)('reloads latest instead of replaying a rejected %s cursor', async (reason) => {
+    latest
+      .mockResolvedValueOnce(page('m4', 'cursor-4', true))
+      .mockResolvedValueOnce(page('m9', 'cursor-9', false))
+    before.mockRejectedValueOnce(new SessionReadHistoryCursorError(
+      reason,
+      'cursor rejected',
+    ))
+    const inspect = useSessionInspect(inspection)
+
+    await inspect.load('agent:main:webchat:test')
+    await inspect.loadEarlier()
+
+    expect(inspect.loadEarlierError.value).toBe(true)
+    expect(inspect.messages.value.map(message => message.messageId)).toEqual(['m4'])
+
+    await inspect.retryHistory()
+
+    expect(before).toHaveBeenCalledWith(
+      'agent:main:webchat:test',
+      'cursor-4',
+      expect.objectContaining({ limit: 20 }),
+    )
+    expect(latest).toHaveBeenCalledTimes(2)
+    expect(inspect.messages.value.map(message => message.messageId)).toEqual(['m9'])
+    expect(inspect.loadEarlierError.value).toBe(false)
   })
 
   it('does not advance an unavailable earlier page and retries the same cursor', async () => {

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://opensquilla.dev/contracts/gateway/v4/conversation/chat-history.schema.json",
   "title": "OpenSquilla chat.history Contract",
-  "description": "Language-neutral Contract for the v4 chat.history query. The wire keeps legacy default-session, cursor, limit and boolean coercion behavior while publishing one canonical history projection.",
+  "description": "Language-neutral Contract for the v4 chat.history query. The wire keeps legacy default-session, limit and boolean coercion behavior while publishing one canonical history projection. Supplied cursors are strict ASCII-decimal created_at|id anchors; malformed cursors and anchors that no longer belong to the session fail explicitly.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -37,6 +37,8 @@
       { "code": "NOT_FOUND", "semantics": "missing-non-webchat-session" },
       { "code": "UNAVAILABLE", "retryable": true },
       { "code": "STORAGE_BUSY", "retryable": true, "retryAfterMs": true, "details": true },
+      { "code": "HISTORY_CURSOR_INVALID", "semantics": "supplied-cursor-malformed-null-empty-or-out-of-range" },
+      { "code": "HISTORY_CURSOR_INVALIDATED", "semantics": "supplied-cursor-anchor-missing-from-session" },
       { "code": "INTERNAL_ERROR" }
     ]
   },
@@ -45,7 +47,7 @@
     "NullableCursor": { "type": ["string", "null"] },
     "ChatHistoryParams": {
       "title": "chat.history params",
-      "description": "All fields are optional for v4 compatibility. A null or absent sessionKey selects the canonical default WebChat session. Unknown fields are ignored.",
+      "description": "All fields are optional for v4 compatibility. A null or absent sessionKey selects the canonical default WebChat session. Absent before/after fields request an unpositioned page; after trimming outer whitespace, a supplied cursor must contain exactly two non-negative signed-64-bit ASCII decimal components in created_at|id form and must anchor this session. Malformed or null supplied cursors return HISTORY_CURSOR_INVALID, missing anchors return HISTORY_CURSOR_INVALIDATED, and before takes precedence when both fields are present. Unknown fields are ignored.",
       "type": "object",
       "additionalProperties": true,
       "properties": {

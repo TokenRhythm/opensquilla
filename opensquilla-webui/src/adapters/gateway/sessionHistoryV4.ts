@@ -12,6 +12,7 @@ import {
   validateChatHistoryResult,
 } from '@/contracts/generated/v4/chatHistoryValidators.mjs'
 import {
+  SessionReadHistoryCursorError,
   SessionReadSessionMissingError,
   type SessionReadCompactionSummary,
   type SessionReadHistoryPage,
@@ -52,7 +53,10 @@ function objectValue(value: unknown): Record<string, unknown> | null {
 }
 
 function historyError(error: unknown): unknown {
-  if (error instanceof SessionReadSessionMissingError) return error
+  if (
+    error instanceof SessionReadSessionMissingError
+    || error instanceof SessionReadHistoryCursorError
+  ) return error
   const source = objectValue(error)
   const data = objectValue(source?.data)
   const rawCode = source?.code ?? data?.code
@@ -60,6 +64,13 @@ function historyError(error: unknown): unknown {
   if (code === 'NOT_FOUND' || code === 'SESSION_NOT_FOUND') {
     return new SessionReadSessionMissingError(
       error instanceof Error ? error.message : 'The requested session does not exist.',
+      error,
+    )
+  }
+  if (code === 'HISTORY_CURSOR_INVALID' || code === 'HISTORY_CURSOR_INVALIDATED') {
+    return new SessionReadHistoryCursorError(
+      code === 'HISTORY_CURSOR_INVALID' ? 'invalid' : 'stale',
+      error instanceof Error ? error.message : 'The history cursor was rejected.',
       error,
     )
   }

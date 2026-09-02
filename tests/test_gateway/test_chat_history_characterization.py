@@ -235,7 +235,10 @@ async def test_chat_history_request_cases_preserve_v4_wire_behavior(request_case
 
     if request_case == "request.default-null":
         manager = _HistoryManager(entries, missing_keys={"agent:main:webchat:default"})
-    elif request_case == "request.missing-non-webchat":
+    elif request_case in {
+        "request.missing-non-webchat",
+        "request.history-cursor-invalidated",
+    }:
         manager = _HistoryManager(entries, missing_keys={session_key})
     elif request_case == "request.storage-busy":
         manager = _HistoryManager(entries, busy_keys={session_key})
@@ -263,7 +266,7 @@ async def test_chat_history_request_cases_preserve_v4_wire_behavior(request_case
         assert manager.canonical_calls == []
     if request_case == "request.before-after":
         assert manager.canonical_calls[0]["before"] == (3, 3)
-        assert manager.canonical_calls[0]["after"] == (1, 1)
+        assert manager.canonical_calls[0]["after"] is None
     if request_case == "request.default-null":
         assert manager.active_calls == ["agent:main:webchat:default"]
 

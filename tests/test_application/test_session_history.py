@@ -8,11 +8,14 @@ from typing import Any
 import pytest
 
 from opensquilla.application.session_history import (
+    CanonicalHistoryReadError,
     HistoryPage,
     SessionHistoryApplication,
     SessionHistoryQuery,
+    cursor_for_entry,
     paginate_transcript,
 )
+from opensquilla.history_cursor import HistoryCursorInvalidatedError
 
 
 def entry(index: int) -> SimpleNamespace:
@@ -92,7 +95,7 @@ async def test_canonical_page_is_preferred_and_metadata_is_normalized() -> None:
             "session_key": "agent:main:webchat:history",
             "limit": 2,
             "before": (3, 3),
-            "after": (1, 1),
+            "after": None,
         }
     ]
 
@@ -164,16 +167,63 @@ async def test_reader_failures_are_not_silently_swallowed() -> None:
     assert active.calls == []
 
 
-def test_paginate_transcript_preserves_latest_window_and_after_cursor() -> None:
+@pytest.mark.asyncio
+async def test_canonical_failure_is_not_downgraded_to_stale_cursor_by_fallback() -> None:
+    active = ActivePort([entry(1)])
+    failure = CanonicalHistoryReadError("canonical projection failed")
+
+    class UnavailableCanonical(CanonicalPort):
+        async def read_canonical_page(self, *args: Any, **kwargs: Any) -> HistoryPage | None:
+            raise failure
+
+    app = SessionHistoryApplication(active=active, canonical=UnavailableCanonical())
+    with pytest.raises(CanonicalHistoryReadError) as caught:
+        await app.read_page(
+            SessionHistoryQuery(
+                session_key="agent:main:webchat:history",
+                limit=1,
+                before=(2, 2),
+            )
+        )
+
+    assert caught.value is failure
+    assert active.calls == ["agent:main:webchat:history"]
+
+
+def test_paginate_transcript_preserves_latest_window_and_valid_cursors() -> None:
     rows = [entry(index) for index in range(1, 6)]
 
     latest, latest_more = paginate_transcript(rows, limit=2)
     forward, forward_more = paginate_transcript(rows, limit=2, after=(2, 2))
-    missing, missing_more = paginate_transcript(rows, limit=2, after=(99, 99))
+    backward, backward_more = paginate_transcript(
+        rows,
+        limit=2,
+        before=(4, 4),
+        after=(99, 99),
+    )
 
     assert [getattr(row, "id") for row in latest] == [4, 5]
     assert latest_more is True
     assert [getattr(row, "id") for row in forward] == [3, 4]
     assert forward_more is True
-    assert [getattr(row, "id") for row in missing] == [4, 5]
-    assert missing_more is True
+    assert [getattr(row, "id") for row in backward] == [2, 3]
+    assert backward_more is True
+
+
+def test_cursor_for_entry_uses_only_bounded_integer_transcript_ids() -> None:
+    assert cursor_for_entry(SimpleNamespace(id=0, message_id="999", created_at=42)) == (
+        42,
+        0,
+    )
+    assert cursor_for_entry(SimpleNamespace(id=None, message_id="7", created_at=42)) is None
+    assert cursor_for_entry(SimpleNamespace(id=1 << 63, message_id="1", created_at=42)) is None
+
+
+@pytest.mark.parametrize("direction", ["before", "after"])
+def test_paginate_transcript_rejects_missing_cursor(direction: str) -> None:
+    kwargs = {direction: (99, 99)}
+
+    with pytest.raises(HistoryCursorInvalidatedError):
+        paginate_transcript([entry(1)], limit=2, **kwargs)
+    with pytest.raises(HistoryCursorInvalidatedError):
+        paginate_transcript([], limit=2, **kwargs)

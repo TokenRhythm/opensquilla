@@ -1,6 +1,9 @@
 import { ref } from 'vue'
 import type { SessionInspection } from '@/modules/sessionInspection'
-import type { SessionReadMessage } from '@/modules/sessionReadLifecycle'
+import {
+  SessionReadHistoryCursorError,
+  type SessionReadMessage,
+} from '@/modules/sessionReadLifecycle'
 import type { TurnCommands } from '@/modules/turnCommands'
 
 // The inspect drawer composes a bounded preview with canonical transcript pages.
@@ -41,10 +44,17 @@ export function useSessionInspect(sessionInspection: SessionInspection) {
   let requestSeq = 0
   let currentKey = ''
   let activeController: AbortController | null = null
-  let failedTranscriptRequest: {
-    key: string
-    before: string | number | null
-  } | null = null
+  let failedTranscriptRequest:
+    | {
+        kind: 'page'
+        key: string
+        before: string | number | null
+      }
+    | {
+        kind: 'latest'
+        key: string
+      }
+    | null = null
   const loadedEarlierCursors = new Set<string>()
 
   async function fetchPreview(key: string, seq: number, signal: AbortSignal) {
@@ -78,7 +88,7 @@ export function useSessionInspect(sessionInspection: SessionInspection) {
     canonicalAvailable.value = available
     canonicalComplete.value = data.canonicalComplete
     if (available === false) {
-      failedTranscriptRequest = { key, before: before ?? null }
+      failedTranscriptRequest = { kind: 'page', key, before: before ?? null }
       if (before != null) return false
     }
 
@@ -142,8 +152,13 @@ export function useSessionInspect(sessionInspection: SessionInspection) {
       if (seq === requestSeq && applied === true) {
         loadedEarlierCursors.add(String(cursor))
       }
-    } catch {
-      if (seq === requestSeq) loadEarlierError.value = true
+    } catch (error) {
+      if (seq === requestSeq) {
+        if (error instanceof SessionReadHistoryCursorError) {
+          failedTranscriptRequest = { kind: 'latest', key: currentKey }
+        }
+        loadEarlierError.value = true
+      }
     } finally {
       if (seq === requestSeq) loadingEarlier.value = false
     }
@@ -158,8 +173,9 @@ export function useSessionInspect(sessionInspection: SessionInspection) {
 
   function retryHistory(beforeApply?: () => void) {
     const failed = failedTranscriptRequest
-    if (failed?.key === currentKey && failed.before != null) {
-      return requestEarlier(failed.before, beforeApply)
+    if (failed?.key === currentKey) {
+      if (failed.kind === 'latest') return load(currentKey)
+      if (failed.before != null) return requestEarlier(failed.before, beforeApply)
     }
     if (canonicalAvailable.value === false) {
       return currentKey ? load(currentKey) : undefined

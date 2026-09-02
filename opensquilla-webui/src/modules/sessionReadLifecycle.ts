@@ -294,6 +294,23 @@ export class SessionReadSessionMissingError extends Error {
   }
 }
 
+export type SessionReadHistoryCursorFailure = 'invalid' | 'stale'
+
+/** Domain failure for a rejected history anchor. Recovery must start from latest. */
+export class SessionReadHistoryCursorError extends Error {
+  readonly code = 'history-cursor-rejected'
+  readonly recovery = 'reload-latest'
+
+  constructor(
+    readonly reason: SessionReadHistoryCursorFailure,
+    message: string,
+    readonly cause?: unknown,
+  ) {
+    super(message)
+    this.name = 'SessionReadHistoryCursorError'
+  }
+}
+
 interface ActiveSessionRead {
   readonly sessionKey: string
   cursor: ConversationCursor

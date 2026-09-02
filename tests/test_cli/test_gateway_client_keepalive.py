@@ -834,6 +834,41 @@ async def test_session_history_all_rejects_reset_or_unknown_cursor_page(
 
 
 @pytest.mark.asyncio
+async def test_session_history_all_stops_when_gateway_invalidates_cursor() -> None:
+    calls: list[str | None] = []
+
+    async def fetch(
+        session_key: str,
+        limit: int = 1000,
+        *,
+        before: str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        calls.append(before)
+        if before is not None:
+            raise GatewayRPCError(
+                "chat.history",
+                code="HISTORY_CURSOR_INVALIDATED",
+                message="history cursor was invalidated",
+            )
+        return {
+            "messages": [
+                {"message_id": "m3", "role": "user", "text": "three"},
+                {"message_id": "m4", "role": "assistant", "text": "four"},
+            ],
+            "has_more": True,
+            "oldest_cursor": "3|3",
+            "newest_cursor": "4|4",
+        }
+
+    with pytest.raises(GatewayRPCError) as exc_info:
+        await session_history_all(fetch, "agent:main:test")
+
+    assert exc_info.value.code == "HISTORY_CURSOR_INVALIDATED"
+    assert calls == [None, "3|3"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("field", "code"),
     [
