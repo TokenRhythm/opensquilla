@@ -2149,6 +2149,36 @@ export function useChatSend(options: UseChatSendOptions) {
     }
   }
 
+  async function retireFailedBackgroundHandoff(
+    record: ResponseHandoffWalRecord,
+  ): Promise<void> {
+    const gate = beginResponseHandoff(
+      record.requestSessionKey,
+      record.ownerRequestId,
+      record,
+    )
+    gate.backgroundOnly = true
+    try {
+      if (
+        options.sessionKey.value === gate.requestSessionKey
+        && options.hasPendingQueueWork?.() !== true
+      ) {
+        options.schedulePendingDrainAfterTerminal()
+      }
+      const queueReleased = await options.recoverPendingQueueHandoff?.(
+        gate.requestSessionKey,
+        gate.requestSessionKey,
+        gate.ownerRequestId,
+      ).catch(() => false)
+      if (queueReleased !== true) return
+      if (!await deleteResponseHandoff(record)) return
+      gate.durableRecord = null
+      gate.backgroundFinalized = true
+    } finally {
+      finishResponseHandoff(gate)
+    }
+  }
+
   function restoreResponseHandoffDraft(record: ResponseHandoffWalRecord): boolean {
     if (options.sessionKey.value !== record.requestSessionKey) return false
     if (record.restoreComposerOnFailure === false) return true
@@ -2207,7 +2237,9 @@ export function useChatSend(options: UseChatSendOptions) {
           continue
         }
         if (record.state === 'failed') {
-          if (restoreResponseHandoffDraft(record)) {
+          if (record.backgroundOnly) {
+            await retireFailedBackgroundHandoff(record)
+          } else if (restoreResponseHandoffDraft(record)) {
             await deleteResponseHandoff(record)
           }
           continue
@@ -3718,6 +3750,13 @@ export function useChatSend(options: UseChatSendOptions) {
             }
       )
       attempt.acceptanceRequest = { request: acceptanceRequest }
+      if (backgroundReceiptReplay && responseHandoff) {
+        responseHandoff.backgroundOnly = true
+        if (!await markResponseHandoffBackgroundOnly(responseHandoff)) {
+          return rejectBeforeDispatch()
+        }
+        durableHandoffRecord = responseHandoff.durableRecord
+      }
       attempt.acceptanceInFlight = true
       rememberRecoveryComposerSnapshot(attempt)
       if (backgroundReceiptReplay) {
@@ -3751,7 +3790,10 @@ export function useChatSend(options: UseChatSendOptions) {
         if (acceptedSessionKey === requestSessionKey) {
           noteAcceptedTask(res, requestSessionKey)
         }
-        if (acceptedSessionKey === requestSessionKey) {
+        if (
+          options.sessionKey.value === requestSessionKey
+          && acceptedSessionKey === requestSessionKey
+        ) {
           options.trackBackgroundReceiptTask?.(
             attempt.clientMessageId,
             taskId,
@@ -3979,7 +4021,10 @@ export function useChatSend(options: UseChatSendOptions) {
       if (acceptedError && !acceptedResponseOwnsVisibleTranscript) {
         attempt.acceptanceResolved = true
         attempt.acceptedSessionKey = acceptedError.sessionKey || requestSessionKey
-        if (attempt.acceptedSessionKey === requestSessionKey) {
+        if (
+          options.sessionKey.value === requestSessionKey
+          && attempt.acceptedSessionKey === requestSessionKey
+        ) {
           options.trackBackgroundReceiptTask?.(
             attempt.clientMessageId,
             '',

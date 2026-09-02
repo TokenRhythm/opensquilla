@@ -3130,6 +3130,72 @@ describe('useChatSend attachment payloads', () => {
     expect(await pendingInputWal.listHandoffs?.()).toEqual([])
   })
 
+  it('retires a failed background-only handoff without restoring its composer payload', async () => {
+    const parent = 'agent:main:webchat:failed-background-parent'
+    const ownerRequestId = 'failed-background-request'
+    const pendingInputWal = memoryHandoffWal()
+    await pendingInputWal.prepareHandoff!({
+      schemaVersion: 1,
+      ownerRequestId,
+      requestSessionKey: parent,
+      clientRequestId: ownerRequestId,
+      clientMessageId: 'failed-background-message',
+      composerText: 'stale recovered text',
+      recoveryAttachments: [{
+        kind: 'staged',
+        local_id: 911,
+        name: 'stale.png',
+        mime: 'image/png',
+        file_uuid: 'stale-file',
+      }],
+      params: {
+        sessionKey: parent,
+        clientRequestId: ownerRequestId,
+        clientMessageId: 'failed-background-message',
+        message: 'stale recovered text',
+        forkBeforeMessageId: 'stale-fork-anchor',
+      },
+      backgroundOnly: true,
+      walOwnerId: 'failed-background-owner',
+      walRevision: 3,
+      state: 'failed',
+      errorCode: 'rejected',
+      createdAt: 1,
+      updatedAt: 2,
+    })
+    const currentAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 912,
+      name: 'current.png',
+      mime: 'image/png',
+      file_uuid: 'current-file',
+    }
+    const inputText = ref('current composer text')
+    const pendingAttachments = ref<Attachment[]>([currentAttachment])
+    const pendingForkBeforeMessageId = ref<string | null>('current-fork-anchor')
+    const recoverPendingQueueHandoff = vi.fn(async () => true)
+    const adoptResponseSession = vi.fn()
+    const harness = makeOptions({
+      sessionKey: ref(parent),
+      inputText,
+      pendingAttachments,
+      pendingForkBeforeMessageId,
+      pendingInputWal,
+      recoverPendingQueueHandoff,
+      adoptResponseSession,
+    })
+
+    await harness.api.recoverResponseHandoffs()
+
+    expect(harness.rpc.call).not.toHaveBeenCalled()
+    expect(adoptResponseSession).not.toHaveBeenCalled()
+    expect(recoverPendingQueueHandoff).toHaveBeenCalledWith(parent, parent, ownerRequestId)
+    expect(inputText.value).toBe('current composer text')
+    expect(pendingAttachments.value).toEqual([currentAttachment])
+    expect(pendingForkBeforeMessageId.value).toBe('current-fork-anchor')
+    expect(await pendingInputWal.listHandoffs!()).toEqual([])
+  })
+
   it('replays a background-only submitting WAL without adopting its child', async () => {
     const parent = 'agent:main:webchat:parent-background'
     const child = 'agent:main:webchat:child-background'
@@ -3311,6 +3377,68 @@ describe('useChatSend attachment payloads', () => {
       await expectBackgroundCasRetry(shouldFailTransition, expectedRetainedState)
     },
   )
+
+  it('does not dispatch a background fork receipt replay before its WAL disposition is durable', async () => {
+    const {
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      messageActions,
+    } = makeEditedMessageState('edited question')
+    const baseWal = memoryHandoffWal()
+    let failBackgroundTransition = true
+    const pendingInputWal: PendingInputWal = {
+      ...baseWal,
+      compareAndSwapHandoff: vi.fn(async (owner, walOwner, revision, record) => {
+        if (
+          failBackgroundTransition
+          && record?.state === 'submitting'
+          && record.backgroundOnly === true
+        ) {
+          failBackgroundTransition = false
+          return { applied: false, record: (await baseWal.listHandoffs!())[0] || null }
+        }
+        return baseWal.compareAndSwapHandoff!(owner, walOwner, revision, record)
+      }),
+    }
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+        .mockResolvedValueOnce({
+          sessionKey: 'agent:main:webchat:child',
+          task_id: 'background-after-cas',
+        }),
+    }
+    const harness = makeOptions({
+      rpc,
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      pendingInputWal,
+      messageEditGeneration: messageActions.editGeneration,
+      messageEditActive: messageActions.editActive,
+      validateMessageEditOwner: messageActions.validateEditOwner,
+      commitMessageEdit: messageActions.commitEdit,
+      adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
+    })
+
+    await harness.api.onSend()
+    inputText.value = 'newer edit owner'
+    pendingForkBeforeMessageId.value = 'msg-original'
+    await harness.api.onSend()
+
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(await pendingInputWal.listHandoffs!()).toEqual([
+      expect.objectContaining({ state: 'submitting' }),
+    ])
+
+    await harness.api.onSend()
+
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+    expect(await pendingInputWal.listHandoffs!()).toEqual([])
+  })
 
   it('keeps the recovery worker when background-only WAL persistence fails', async () => {
     vi.useFakeTimers()
@@ -3762,6 +3890,47 @@ describe('useChatSend attachment payloads', () => {
       expect(inputText.value).toBe('newer question')
     },
   )
+
+  it('does not project a non-fork receipt terminal into a session selected during replay', async () => {
+    const requestSessionKey = 'agent:main:webchat:receipt-origin'
+    const sessionKey = ref(requestSessionKey)
+    const inputText = ref('older question')
+    const trackBackgroundReceiptTask = vi.fn()
+    let resolveReplay!: (value: unknown) => void
+    const rpc = {
+      call: vi.fn(<T = unknown>() => {
+        if (rpc.call.mock.calls.length === 1) {
+          return Promise.reject(new RpcTransportError('Connection closed', null))
+        }
+        return new Promise<T>(resolve => {
+          resolveReplay = resolve as (value: unknown) => void
+        })
+      }),
+    } as unknown as UseChatSendOptions['rpc']
+    const harness = makeOptions({
+      rpc,
+      sessionKey,
+      inputText,
+      trackBackgroundReceiptTask,
+    })
+
+    await harness.api.onSend()
+    inputText.value = 'newer composer owner'
+    const replay = harness.api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledTimes(2))
+    sessionKey.value = 'agent:main:webchat:selected-during-replay'
+    resolveReplay({
+      sessionKey: requestSessionKey,
+      task_id: 'terminal-old-receipt',
+      task_status: 'timeout',
+    })
+    await replay
+
+    expect(rpc.call.mock.calls[0]?.[1]).not.toHaveProperty('forkBeforeMessageId')
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(rpc.call.mock.calls[0]?.[1])
+    expect(trackBackgroundReceiptTask).not.toHaveBeenCalled()
+    expect(sessionKey.value).toBe('agent:main:webchat:selected-during-replay')
+  })
 
   it('does not start async queue persistence for a fork edit while work is active', async () => {
     const {
