@@ -16,6 +16,14 @@ from opensquilla.channels.contract import (
     channel_capability_profile,
     channel_platform_manifest,
 )
+from opensquilla.gateway.adapters.channel_administration import (
+    GatewayChannelAdministrationAdapter,
+    GatewayChannelAdministrationCallbacks,
+)
+from opensquilla.gateway.adapters.channel_administration_contract import (
+    register_channel_administration_contract,
+)
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
 from opensquilla.redaction import redact_error_text
 
@@ -324,7 +332,6 @@ def _pending_pairings_by_channel(ctx: RpcContext) -> dict[str, int]:
     return counts
 
 
-@_d.method("channels.status", scope="operator.read")
 async def _handle_channels_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     health_map = await ctx.channel_manager.health() if ctx.channel_manager else {}
     start_errors = _manager_start_errors(ctx.channel_manager)
@@ -418,7 +425,6 @@ async def _handle_channels_status(params: dict | None, ctx: RpcContext) -> dict[
     return {"channels": channels, "bootId": _boot_id}
 
 
-@_d.method("channels.get", scope="operator.admin")
 async def _handle_channels_get(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     name = str((params or {}).get("name") or (params or {}).get("channel") or "")
     if not name:
@@ -437,7 +443,6 @@ async def _handle_channels_get(params: dict | None, ctx: RpcContext) -> dict[str
     raise KeyError(f"Channel not found: {name}")
 
 
-@_d.method("channels.probe", scope="operator.admin")
 async def _handle_channels_probe(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     """Run a non-mutating provider credential/network probe when implemented."""
     from opensquilla.channels.registry import build_managed_channel, parse_channel_entry
@@ -512,7 +517,6 @@ async def _handle_channels_probe(params: dict | None, ctx: RpcContext) -> dict[s
     }
 
 
-@_d.method("channels.logout", scope="operator.admin")
 async def _handle_channels_logout(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     channel_name = None
     if isinstance(params, dict):
@@ -527,7 +531,6 @@ async def _handle_channels_logout(params: dict | None, ctx: RpcContext) -> dict[
     return {"status": "disconnected", "channel": channel_name}
 
 
-@_d.method("channels.restart", scope="operator.admin")
 async def _handle_channels_restart(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     channel_name = None
     if isinstance(params, dict):
@@ -547,7 +550,6 @@ async def _handle_channels_restart(params: dict | None, ctx: RpcContext) -> dict
     return {"status": "restarted", "channel": channel_name}
 
 
-@_d.method("channels.pairings", scope="operator.pairing")
 async def _handle_channels_pairings(
     params: dict | None,
     ctx: RpcContext,
@@ -650,7 +652,6 @@ async def _send_pairing_approved_notice(ctx: RpcContext, record: Any) -> None:
         )
 
 
-@_d.method("channels.pairing.approve", scope="operator.pairing")
 async def _handle_channels_pairing_approve(
     params: dict | None,
     ctx: RpcContext,
@@ -772,7 +773,6 @@ def _set_channel_admin_sender(
     return admin_senders.get(channel_name, [])
 
 
-@_d.method("channels.admin.set", scope="operator.pairing")
 async def _handle_channels_admin_set(
     params: dict | None,
     ctx: RpcContext,
@@ -816,7 +816,6 @@ async def _handle_channels_admin_set(
     }
 
 
-@_d.method("channels.pairing.revoke", scope="operator.pairing")
 async def _handle_channels_pairing_revoke(
     params: dict | None,
     ctx: RpcContext,
@@ -858,3 +857,94 @@ async def _handle_channels_pairing_revoke(
                 "Remove it from the members view."
             ]
     return payload
+
+
+def _channel_administration_adapter(ctx: RpcContext) -> GatewayChannelAdministrationAdapter:
+    return GatewayChannelAdministrationAdapter(
+        ctx,
+        GatewayChannelAdministrationCallbacks(
+            status=_handle_channels_status,
+            get=_handle_channels_get,
+            probe=_handle_channels_probe,
+            restart=_handle_channels_restart,
+            logout=_handle_channels_logout,
+            pairings=_handle_channels_pairings,
+            approve_pairing=_handle_channels_pairing_approve,
+            revoke_pairing=_handle_channels_pairing_revoke,
+            set_admin=_handle_channels_admin_set,
+        ),
+    )
+
+
+async def _channel_status_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _channel_administration_adapter(ctx).status(params)
+
+
+async def _channel_get_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _channel_administration_adapter(ctx).get(params)
+
+
+async def _channel_probe_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _channel_administration_adapter(ctx).probe(params)
+
+
+async def _channel_logout_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _channel_administration_adapter(ctx).logout(params)
+
+
+async def _channel_restart_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _channel_administration_adapter(ctx).restart(params)
+
+
+async def _channel_pairings_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _channel_administration_adapter(ctx).list_pairings(params)
+
+
+async def _channel_pairing_approve_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _channel_administration_adapter(ctx).approve_pairing(params)
+
+
+async def _channel_admin_set_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _channel_administration_adapter(ctx).set_admin(params)
+
+
+async def _channel_pairing_revoke_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _channel_administration_adapter(ctx).revoke_pairing(params)
+
+
+for _channel_method, _channel_implementation in (
+    ("channels.status", _channel_status_contract),
+    ("channels.get", _channel_get_contract),
+    ("channels.probe", _channel_probe_contract),
+    ("channels.logout", _channel_logout_contract),
+    ("channels.restart", _channel_restart_contract),
+    ("channels.pairings", _channel_pairings_contract),
+    ("channels.pairing.approve", _channel_pairing_approve_contract),
+    ("channels.admin.set", _channel_admin_set_contract),
+    ("channels.pairing.revoke", _channel_pairing_revoke_contract),
+):
+    register_channel_administration_contract(
+        _d,
+        _channel_method,
+        _channel_implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
