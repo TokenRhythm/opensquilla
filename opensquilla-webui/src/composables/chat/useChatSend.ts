@@ -635,7 +635,7 @@ export interface UseChatSendOptions {
   trackBackgroundReceiptTask?: (
     clientMessageId: string,
     taskId: string,
-    terminal?: boolean,
+    terminal?: boolean | string,
   ) => void
   /** Release the pre-response event quarantine for an older receipt replay. */
   finishBackgroundReceiptReplay?: (clientMessageId: string) => void
@@ -1335,14 +1335,17 @@ export function useChatSend(options: UseChatSendOptions) {
     attempt: SendAttempt,
     response: TurnSendResponse,
   ): Promise<boolean> {
+    const acceptedSessionKey = response.sessionKey || attempt.requestSessionKey
     let responseOwnsVisibleTranscript = !recoveredAttemptHasUnrelatedComposer(
       attempt,
       captureComposerSnapshot(),
-    ) && validateAttemptMessageEditTranscript(attempt)
+    )
+      && acceptedSessionKey === attempt.requestSessionKey
+      && validateAttemptMessageEditTranscript(attempt)
     acknowledgeAttemptPromptAnnotations(attempt, response, responseOwnsVisibleTranscript)
     attempt.acceptanceResolved = true
     attempt.acceptedTaskId = acceptedTaskId(response)
-    attempt.acceptedSessionKey = response.sessionKey || attempt.requestSessionKey
+    attempt.acceptedSessionKey = acceptedSessionKey
     if (
       responseOwnsVisibleTranscript
       && attempt.messageEditTranscriptOwner
@@ -1362,7 +1365,9 @@ export function useChatSend(options: UseChatSendOptions) {
     }
 
     const isCurrentRequest = options.sessionKey.value === attempt.requestSessionKey
-    const accepted = noteAcceptedTask(response, attempt.requestSessionKey)
+    const accepted = acceptedSessionKey === attempt.requestSessionKey
+      ? noteAcceptedTask(response, attempt.requestSessionKey)
+      : { taskId: acceptedTaskId(response), claimRender: false, renderTaskId: '' }
     const terminalStatus = terminalResponseStatus(response)
     if (isCurrentRequest && responseOwnsVisibleTranscript) {
       consumeAcceptedSessionIntent(attempt)
@@ -1370,11 +1375,16 @@ export function useChatSend(options: UseChatSendOptions) {
       options.scheduleHistorySync()
     } else if (isCurrentRequest) {
       consumeAcceptedSessionIntent(attempt)
-      options.trackBackgroundReceiptTask?.(
-        attempt.clientMessageId,
-        accepted.taskId,
-        Boolean(terminalStatus),
-      )
+      if (acceptedSessionKey === attempt.requestSessionKey) {
+        options.trackBackgroundReceiptTask?.(
+          attempt.clientMessageId,
+          accepted.taskId,
+          terminalStatus,
+        )
+      }
+    }
+    if (!responseOwnsVisibleTranscript && attempt.forkBeforeMessageId) {
+      await finalizeAttemptBackgroundResponseHandoff(attempt, acceptedSessionKey)
     }
 
     if (!attempt.stopRequested) {
@@ -1428,15 +1438,26 @@ export function useChatSend(options: UseChatSendOptions) {
         } catch (error: unknown) {
           const rpcError = error as RpcClientError | null | undefined
           const accepted = acceptedErrorInfo(error)
-          if (rpcError?.accepted === false || accepted?.terminalWithoutTask) {
+          if (accepted) {
+            const response: TurnSendResponse = {
+              sessionKey: accepted.sessionKey || attempt.requestSessionKey,
+              userMessageId: accepted.messageId,
+              ...(accepted.terminalWithoutTask
+                ? {
+                    taskStatus: 'failed',
+                    terminalReason: errorMessage(error),
+                  }
+                : {}),
+            }
+            if (await settleRecoveredAcceptance(attempt, response)) return
+            continue
+          }
+          if (rpcError?.accepted === false) {
             attempt.acceptanceResolved = true
             if (attempt.stopRequested) clearAttemptStop(attempt)
             if (
               attempt.hiddenControl
-              && (
-                accepted?.terminalWithoutTask
-                || (rpcError?.accepted === false && rpcError.retryable === false)
-              )
+              && rpcError.retryable === false
             ) {
               removeHiddenControl(
                 attempt.requestSessionKey,
@@ -1531,10 +1552,23 @@ export function useChatSend(options: UseChatSendOptions) {
   ): Promise<ResponseHandoffWalRecord | null> {
     const wal = options.pendingInputWal
     if (!wal) return null
+    if (preserveExistingOnFailure) {
+      if (!wal.listHandoffs) return null
+      const records = await wal.listHandoffs(attempt.requestSessionKey).catch(() => [])
+      return records.find(record => (
+        record.ownerRequestId === attempt.clientRequestId
+        && record.clientRequestId === attempt.clientRequestId
+        && record.clientMessageId === attempt.clientMessageId
+        && record.state !== 'accepted'
+        && record.state !== 'failed'
+        && Boolean(record.walOwnerId && record.walRevision && wal.compareAndSwapHandoff)
+      )) || null
+    }
     if (requirePrepared && (!wal.prepareHandoff || !wal.compareAndSwapHandoff)) return null
-    if (!requirePrepared && !wal.putHandoff) return null
+    const useOwnedWal = Boolean(wal.prepareHandoff && wal.compareAndSwapHandoff)
+    if (!useOwnedWal && !wal.putHandoff) return null
     const now = Date.now()
-    if (requirePrepared) {
+    if (useOwnedWal) {
       attempt.handoffWalOwnerId ||= createClientRequestId()
       attempt.handoffWalRevision ||= 1
     }
@@ -1553,7 +1587,7 @@ export function useChatSend(options: UseChatSendOptions) {
       ...(attempt.replayCoordinationKey
         ? { replayCoordinationKey: attempt.replayCoordinationKey }
         : {}),
-      ...(requirePrepared
+      ...(useOwnedWal
         ? {
             walOwnerId: attempt.handoffWalOwnerId!,
             walRevision: attempt.handoffWalRevision!,
@@ -1564,12 +1598,12 @@ export function useChatSend(options: UseChatSendOptions) {
       updatedAt: now,
     }
     try {
-      if (requirePrepared) {
+      if (useOwnedWal) {
         const prepared = await wal.prepareHandoff!(record)
         if (prepared.applied) return prepared.record
         const current = prepared.record
         if (
-          current?.state === 'preparing'
+          current?.state === record.state
           && current.ownerRequestId === record.ownerRequestId
           && current.clientMessageId === record.clientMessageId
           && current.replayCoordinationKey === record.replayCoordinationKey
@@ -1581,7 +1615,7 @@ export function useChatSend(options: UseChatSendOptions) {
       await wal.putHandoff!(record)
       return record
     } catch {
-      if (requirePrepared && record.walOwnerId && record.walRevision) {
+      if (useOwnedWal && record.walOwnerId && record.walRevision) {
         // The create operation may report failure after its write became
         // visible. A conditional delete cannot erase another tab's arm or
         // acceptance, and a failed delete leaves only an unarmed record.
@@ -1721,6 +1755,7 @@ export function useChatSend(options: UseChatSendOptions) {
       ...current,
       state: 'accepted',
       acceptedSessionKey,
+      ...(gate.backgroundOnly ? { backgroundOnly: true } : {}),
       ...(current.walRevision ? { walRevision: current.walRevision + 1 } : {}),
       updatedAt: Date.now(),
     }
@@ -1747,10 +1782,54 @@ export function useChatSend(options: UseChatSendOptions) {
     gate: ResponseHandoffGate,
     acceptedSessionKey: string,
   ): Promise<void> {
+    gate.targetSessionKey = acceptedSessionKey
+    gate.backgroundOnly = true
     await markResponseHandoffAccepted(gate, acceptedSessionKey)
     if (gate.durableRecord && await deleteResponseHandoff(gate.durableRecord)) {
       gate.durableRecord = null
     }
+  }
+
+  function releaseBackgroundResponseHandoffParent(gate: ResponseHandoffGate): void {
+    if (
+      !gate.backgroundOnly
+      || gate.stoppedByUser
+      || options.sessionKey.value !== gate.requestSessionKey
+      || options.stream.isStreaming.value
+      || options.taskOwnership?.hasAuthoritativeWork.value
+    ) return
+    options.flushDeferredPendingDrain()
+    if (options.hasPendingQueueWork?.() === true) {
+      options.schedulePendingDrainAfterTerminal()
+    }
+  }
+
+  async function finalizeAttemptBackgroundResponseHandoff(
+    attempt: SendAttempt,
+    acceptedSessionKey: string,
+  ): Promise<void> {
+    const wal = options.pendingInputWal
+    if (!wal?.listHandoffs) return
+    const records = await wal.listHandoffs(attempt.requestSessionKey).catch(() => [])
+    const record = records.find(candidate => (
+      candidate.ownerRequestId === attempt.clientRequestId
+      && candidate.clientRequestId === attempt.clientRequestId
+      && candidate.clientMessageId === attempt.clientMessageId
+    ))
+    if (!record) return
+    const gate: ResponseHandoffGate = {
+      requestSessionKey: attempt.requestSessionKey,
+      ownerRequestId: attempt.clientRequestId,
+      targetSessionKey: acceptedSessionKey,
+      stoppedByUser: attempt.stopRequested === true,
+      acceptedTaskId: attempt.acceptedTaskId || '',
+      terminalResponse: false,
+      authoritativeIdle: false,
+      backgroundOnly: true,
+      durableRecord: record,
+    }
+    await finalizeBackgroundResponseHandoff(gate, acceptedSessionKey)
+    releaseBackgroundResponseHandoffParent(gate)
   }
 
   async function markResponseHandoffFailed(
@@ -1893,6 +1972,7 @@ export function useChatSend(options: UseChatSendOptions) {
     if (options.pendingQueueOwnerContext.value?.ownerRequestId === gate.ownerRequestId) {
       options.pendingQueueOwnerContext.value = null
     }
+    releaseBackgroundResponseHandoffParent(gate)
     if (adoptedTargetIsCurrent && !gate.stoppedByUser) {
       options.flushDeferredPendingDrain()
       // An idle subscription snapshot can be authoritative without replaying
@@ -2025,7 +2105,11 @@ export function useChatSend(options: UseChatSendOptions) {
           continue
         }
         if (record.state === 'accepted' && record.acceptedSessionKey) {
-          await finalizeRecoveredHandoff(record, record.acceptedSessionKey)
+          if (record.backgroundOnly) {
+            await deleteResponseHandoff(record)
+          } else {
+            await finalizeRecoveredHandoff(record, record.acceptedSessionKey)
+          }
           continue
         }
         let replayRecord = record
@@ -3392,7 +3476,10 @@ export function useChatSend(options: UseChatSendOptions) {
         sendOpts.requirePreparedHandoff,
         preservesExistingReplayHandoff,
       )
-      if (sendOpts.requirePreparedHandoff && !durableHandoffRecord) {
+      if (
+        (sendOpts.requirePreparedHandoff || preservesExistingReplayHandoff)
+        && !durableHandoffRecord
+      ) {
         return rejectBeforeDispatch()
       }
       if (!preDispatchAllowed()) return rejectBeforeDispatch()
@@ -3548,11 +3635,13 @@ export function useChatSend(options: UseChatSendOptions) {
         if (acceptedSessionKey === requestSessionKey) {
           noteAcceptedTask(res, requestSessionKey)
         }
-        options.trackBackgroundReceiptTask?.(
-          attempt.clientMessageId,
-          taskId,
-          Boolean(terminalStatus),
-        )
+        if (acceptedSessionKey === requestSessionKey) {
+          options.trackBackgroundReceiptTask?.(
+            attempt.clientMessageId,
+            taskId,
+            terminalStatus,
+          )
+        }
         if (responseHandoff) {
           responseHandoff.acceptedTaskId = taskId
           responseHandoff.terminalResponse = Boolean(terminalStatus)
@@ -3762,7 +3851,13 @@ export function useChatSend(options: UseChatSendOptions) {
       if (acceptedError && !acceptedResponseOwnsVisibleTranscript) {
         attempt.acceptanceResolved = true
         attempt.acceptedSessionKey = acceptedError.sessionKey || requestSessionKey
-        options.trackBackgroundReceiptTask?.(attempt.clientMessageId, '', true)
+        if (attempt.acceptedSessionKey === requestSessionKey) {
+          options.trackBackgroundReceiptTask?.(
+            attempt.clientMessageId,
+            '',
+            acceptedError.terminalWithoutTask ? 'failed' : false,
+          )
+        }
         if (responseHandoff) {
           responseHandoff.terminalResponse = acceptedError.terminalWithoutTask
           await finalizeBackgroundResponseHandoff(
@@ -3871,7 +3966,13 @@ export function useChatSend(options: UseChatSendOptions) {
         }
         if (!attemptTranscriptIdentityStillOwned(attempt)) {
           attempt.acceptanceResolved = true
-          options.trackBackgroundReceiptTask?.(attempt.clientMessageId, '', true)
+          if (acceptedSessionKey === requestSessionKey) {
+            options.trackBackgroundReceiptTask?.(
+              attempt.clientMessageId,
+              '',
+              acceptedError.terminalWithoutTask ? 'failed' : false,
+            )
+          }
           if (!wasStreaming && freshSendToken && activeFreshSendToken === freshSendToken) {
             activeFreshSendToken = null
             options.activeStreamTaskId.value = ''

@@ -422,6 +422,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   const backgroundReceiptTasks = new Map<string, BackgroundReceiptTask>()
   const dirtyBackgroundReceiptClientIds = new Set<string>()
   const reconciledBackgroundReceiptClientIds = new Set<string>()
+  const settledBackgroundReceiptClientIds = new Set<string>()
   let backgroundReceiptEditHeld = false
   let backgroundReceiptHoldSessionKey = ''
 
@@ -434,6 +435,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         backgroundReceiptClientIds.delete(oldestClientId)
         dirtyBackgroundReceiptClientIds.delete(oldestClientId)
         reconciledBackgroundReceiptClientIds.delete(oldestClientId)
+        settledBackgroundReceiptClientIds.delete(oldestClientId)
       }
     }
     backgroundReceiptClientIds.add(normalizedClientId)
@@ -497,14 +499,63 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   function trackBackgroundReceiptTask(
     clientMessageId: string,
     taskId: string,
-    terminal = false,
+    terminal: boolean | string = false,
   ) {
     const normalizedClientId = String(clientMessageId || '').trim()
+    const normalizedTaskId = String(taskId || '').trim()
+    const terminalStatus = typeof terminal === 'string'
+      ? terminal.trim().toLowerCase()
+      : terminal ? 'succeeded' : ''
     rememberBackgroundReceiptClient(normalizedClientId)
-    rememberBackgroundReceiptTask(normalizedClientId, taskId, terminal)
-    if (terminal && !reconciledBackgroundReceiptClientIds.has(normalizedClientId)) {
-      dirtyBackgroundReceiptClientIds.add(normalizedClientId)
-      flushBackgroundReceiptReconciliationIfReady()
+    rememberBackgroundReceiptTask(normalizedClientId, normalizedTaskId, Boolean(terminalStatus))
+    if (terminalStatus) {
+      if (normalizedTaskId) options.taskOwnership?.noteTerminal(normalizedTaskId)
+      if (!reconciledBackgroundReceiptClientIds.has(normalizedClientId)) {
+        dirtyBackgroundReceiptClientIds.add(normalizedClientId)
+        flushBackgroundReceiptReconciliationIfReady()
+      }
+      settleBackgroundReceiptTerminal(
+        normalizedClientId,
+        normalizedTaskId,
+        terminalStatus,
+        {},
+        true,
+      )
+    }
+  }
+
+  function settleBackgroundReceiptTerminal(
+    clientMessageId: string,
+    taskId: string,
+    rawStatus: string,
+    terminalTask: object,
+    allowProjection: boolean,
+  ) {
+    if (!clientMessageId || settledBackgroundReceiptClientIds.has(clientMessageId)) return
+    settledBackgroundReceiptClientIds.add(clientMessageId)
+    // The receipt owns its history/task cleanup, but never the visible run
+    // projection while a newer foreground send still owns the stream.
+    if (
+      !allowProjection
+      || stream.isStreaming.value
+      || activeStreamTaskId.value === PENDING_STREAM_TASK_ID
+      || activeTaskGroups.value.size > 0
+      || options.taskOwnership?.hasAuthoritativeWork.value
+    ) return
+    const failed = ['failed', 'timeout', 'abandoned'].includes(rawStatus)
+    const interrupted = ['cancelled', 'interrupted'].includes(rawStatus)
+    clearLiveThinking()
+    options.clearPendingRouterDecision()
+    options.applySessionRunState({
+      run_status: failed ? 'failed' : interrupted ? 'cancelled' : 'idle',
+      last_task: {
+        ...terminalTask,
+        ...(taskId ? { task_id: taskId } : {}),
+        status: rawStatus || (failed ? 'failed' : 'succeeded'),
+      },
+    })
+    if (pendingQueue.value.length > 0 && !interrupted) {
+      options.schedulePendingDrainAfterTerminal()
     }
   }
 
@@ -598,9 +649,6 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     const terminalEvent = eventKind === 'sessions-changed'
       ? sessionChangeIsTerminal(payload)
       : isTerminalEvent(eventKind)
-    const terminalWasAlreadySeen = [...backgroundReceiptTasks.values()].some(task => (
-      task.clientMessageId === owner && task.terminalSeen
-    ))
     // A matching lifecycle frame can beat the replay ACK. Bind only the exact
     // client-message owner: unrelated same-session tasks from another tab must
     // remain visible and must never enter this quarantine.
@@ -624,34 +672,25 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     // the receipt's history sync to replace the newer Edit transcript.
     const hasContinuation = eventKind === 'sessions-changed'
       && applyBackgroundReceiptContinuation(payload, taskId)
-    if (
-      terminalEvent
-      && !terminalWasAlreadySeen
-      && !hasContinuation
-      && activeTaskGroups.value.size === 0
-      && !options.taskOwnership?.hasAuthoritativeWork.value
-    ) {
+    if (terminalEvent) {
       const terminalTask = terminalSessionChangeTask(payload)
       const rawStatus = String(
-        terminalTask?.status || payload.status || payload.task_status || '',
+        terminalTask?.status
+          || payload.status
+          || payload.task_status
+          || payload.run_status
+          || payload.runStatus
+          || '',
       ).trim().toLowerCase()
-      const failed = rawStatus === 'failed' || eventKind === 'task-failed' || eventKind === 'turn-failed'
-      const interrupted = ['cancelled', 'abandoned', 'interrupted'].includes(rawStatus)
-      if (!stream.isStreaming.value) {
-        clearLiveThinking()
-        options.clearPendingRouterDecision()
-      }
-      options.applySessionRunState({
-        run_status: failed ? 'failed' : interrupted ? 'cancelled' : 'idle',
-        last_task: {
-          ...(terminalTask || payload),
-          task_id: taskId,
-          status: rawStatus || (failed ? 'failed' : 'succeeded'),
-        },
-      })
-      if (pendingQueue.value.length > 0 && !interrupted) {
-        options.schedulePendingDrainAfterTerminal()
-      }
+      settleBackgroundReceiptTerminal(
+        owner,
+        taskId,
+        rawStatus
+          || (eventKind === 'sessions-changed' ? '' : eventTaskTerminalStatus(eventKind))
+          || (eventKind === 'turn-failed' ? 'failed' : 'succeeded'),
+        terminalTask || payload,
+        !hasContinuation,
+      )
     }
     return true
   }
@@ -1606,6 +1645,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     backgroundReceiptTasks.clear()
     dirtyBackgroundReceiptClientIds.clear()
     reconciledBackgroundReceiptClientIds.clear()
+    settledBackgroundReceiptClientIds.clear()
     backgroundReceiptEditHeld = false
     backgroundReceiptHoldSessionKey = ''
     streamThinking.value = null

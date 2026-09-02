@@ -2837,7 +2837,7 @@ describe('useChatSend attachment payloads', () => {
     expect(messageActions.cancelEdit()).toBe(true)
   })
 
-  it('rechecks exact-replay ownership after the second handoff write', async () => {
+  it('rechecks exact-replay ownership after the durable handoff lookup', async () => {
     const {
       sessionKey,
       messages,
@@ -2847,18 +2847,18 @@ describe('useChatSend attachment payloads', () => {
     } = makeEditedMessageState('edited question')
     const composerRevision = ref(0)
     let finishReplayHandoff!: () => void
-    let handoffWrites = 0
+    let handoffLookups = 0
     const baseWal = memoryHandoffWal()
     const pendingInputWal: PendingInputWal = {
       ...baseWal,
-      putHandoff: vi.fn(async (record) => {
-        handoffWrites += 1
-        if (handoffWrites === 2) {
+      listHandoffs: vi.fn(async (requestSessionKey) => {
+        handoffLookups += 1
+        if (handoffLookups === 1) {
           await new Promise<void>(resolve => {
             finishReplayHandoff = resolve
           })
         }
-        await baseWal.putHandoff?.(record)
+        return baseWal.listHandoffs?.(requestSessionKey) || []
       }),
     }
     const beginBackgroundReceiptReplay = vi.fn()
@@ -2889,7 +2889,7 @@ describe('useChatSend attachment payloads', () => {
     await api.onSend()
     const originalParams = rpc.call.mock.calls[0]?.[1]
     const replay = api.onSend()
-    await vi.waitFor(() => expect(pendingInputWal.putHandoff).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() => expect(pendingInputWal.listHandoffs).toHaveBeenCalledOnce())
     expect(rpc.call).toHaveBeenCalledOnce()
 
     inputText.value = 'edited question'
@@ -2919,7 +2919,7 @@ describe('useChatSend attachment payloads', () => {
   })
 
   it.each(['Escape', 'session switch'] as const)(
-    'retains an unknown fork handoff when %s invalidates its replay during the second write',
+    'retains an unknown fork handoff when %s invalidates its durable lookup',
     async (invalidation) => {
       const {
         sessionKey,
@@ -2929,18 +2929,18 @@ describe('useChatSend attachment payloads', () => {
         messageActions,
       } = makeEditedMessageState('edited question')
       let finishReplayHandoff!: () => void
-      let handoffWrites = 0
+      let handoffLookups = 0
       const baseWal = memoryHandoffWal()
       const pendingInputWal: PendingInputWal = {
         ...baseWal,
-        putHandoff: vi.fn(async (record) => {
-          handoffWrites += 1
-          if (handoffWrites === 2) {
+        listHandoffs: vi.fn(async (requestSessionKey) => {
+          handoffLookups += 1
+          if (handoffLookups === 1) {
             await new Promise<void>(resolve => {
               finishReplayHandoff = resolve
             })
           }
-          await baseWal.putHandoff?.(record)
+          return baseWal.listHandoffs?.(requestSessionKey) || []
         }),
       }
       const rpc = {
@@ -2968,7 +2968,7 @@ describe('useChatSend attachment payloads', () => {
       await api.onSend()
       const ownerRequestId = String(rpc.call.mock.calls[0]?.[1]?.clientRequestId)
       const replay = api.onSend()
-      await vi.waitFor(() => expect(pendingInputWal.putHandoff).toHaveBeenCalledTimes(2))
+      await vi.waitFor(() => expect(pendingInputWal.listHandoffs).toHaveBeenCalledOnce())
 
       if (invalidation === 'Escape') {
         expect(messageActions.cancelEdit()).toBe(false)
@@ -3023,7 +3023,7 @@ describe('useChatSend attachment payloads', () => {
                 task_id: 'task-child-receipt',
               })),
       }
-      const { api } = makeOptions({
+      const { api, options } = makeOptions({
         rpc,
         sessionKey,
         messages,
@@ -3032,6 +3032,7 @@ describe('useChatSend attachment payloads', () => {
         pendingInputWal,
         taskOwnership,
         adoptResponseSession,
+        hasPendingQueueWork: () => true,
         messageEditGeneration: messageActions.editGeneration,
         messageEditActive: messageActions.editActive,
         validateMessageEditOwner: messageActions.validateEditOwner,
@@ -3050,11 +3051,204 @@ describe('useChatSend attachment payloads', () => {
       expect(taskOwnership.runningTaskId.value).toBe('')
       expect(taskOwnership.hasAuthoritativeWork.value).toBe(false)
       expect(await pendingInputWal.listHandoffs?.()).toEqual([])
+      expect(options.flushDeferredPendingDrain).toHaveBeenCalledOnce()
+      expect(options.schedulePendingDrainAfterTerminal).toHaveBeenCalledOnce()
       expect(inputText.value).toBe('newer edit owner')
       expect(pendingForkBeforeMessageId.value).toBe('msg-original')
       expect(messageActions.cancelEdit()).toBe(true)
     },
   )
+
+  it('recovers a retained background-only acceptance without adopting its child', async () => {
+    const childSessionKey = 'agent:main:webchat:child'
+    const {
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      messageActions,
+    } = makeEditedMessageState('edited question')
+    const baseWal = memoryHandoffWal()
+    let failAcceptedDelete = true
+    const pendingInputWal: PendingInputWal = {
+      ...baseWal,
+      compareAndSwapHandoff: vi.fn(async (owner, walOwner, revision, record) => {
+        if (record === null && failAcceptedDelete) {
+          throw new Error('delete unavailable')
+        }
+        return baseWal.compareAndSwapHandoff!(owner, walOwner, revision, record)
+      }),
+    }
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+        .mockResolvedValueOnce({
+          sessionKey: childSessionKey,
+          task_id: 'task-child-background',
+        }),
+    }
+    const first = makeOptions({
+      rpc,
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      pendingInputWal,
+      messageEditGeneration: messageActions.editGeneration,
+      messageEditActive: messageActions.editActive,
+      validateMessageEditOwner: messageActions.validateEditOwner,
+      commitMessageEdit: messageActions.commitEdit,
+      adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
+    })
+
+    await first.api.onSend()
+    inputText.value = 'newer edit owner'
+    pendingForkBeforeMessageId.value = 'msg-original'
+    await first.api.onSend()
+
+    expect(await pendingInputWal.listHandoffs?.()).toEqual([
+      expect.objectContaining({
+        state: 'accepted',
+        acceptedSessionKey: childSessionKey,
+        backgroundOnly: true,
+      }),
+    ])
+
+    failAcceptedDelete = false
+    const adoptResponseSession = vi.fn()
+    const recovery = makeOptions({
+      sessionKey,
+      pendingInputWal,
+      adoptResponseSession,
+    })
+    await recovery.api.recoverResponseHandoffs()
+
+    expect(recovery.rpc.call).not.toHaveBeenCalled()
+    expect(adoptResponseSession).not.toHaveBeenCalled()
+    expect(sessionKey.value).toBe('agent:main:webchat:test')
+    expect(await pendingInputWal.listHandoffs?.()).toEqual([])
+  })
+
+  it('does not recreate an exact replay handoff after another recovery retires it', async () => {
+    const {
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      messageActions,
+    } = makeEditedMessageState('edited question')
+    const pendingInputWal = memoryHandoffWal()
+    const rpc = {
+      call: vi.fn().mockRejectedValueOnce(new RpcTransportError('Connection closed', null)),
+    }
+    const live = makeOptions({
+      rpc,
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      pendingInputWal,
+      messageEditGeneration: messageActions.editGeneration,
+      messageEditActive: messageActions.editActive,
+      validateMessageEditOwner: messageActions.validateEditOwner,
+      commitMessageEdit: messageActions.commitEdit,
+      adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
+    })
+
+    await live.api.onSend()
+    expect(await pendingInputWal.listHandoffs?.()).toHaveLength(1)
+
+    const recovery = makeOptions({
+      sessionKey: ref('agent:main:webchat:other'),
+      pendingInputWal,
+      rpc: {
+        call: vi.fn().mockResolvedValue({
+          sessionKey: 'agent:main:webchat:child',
+          task_id: 'task-recovered-elsewhere',
+        }),
+      },
+    })
+    await recovery.api.recoverResponseHandoffs()
+    expect(await pendingInputWal.listHandoffs?.()).toEqual([])
+
+    await live.api.onSend()
+
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(await pendingInputWal.listHandoffs?.()).toEqual([])
+  })
+
+  it('does not resurrect a handoff from a lookup that lost a concurrent acceptance race', async () => {
+    const {
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      messageActions,
+    } = makeEditedMessageState('edited question')
+    const baseWal = memoryHandoffWal()
+    let releaseLookup!: () => void
+    let capturedLookup: ResponseHandoffWalRecord[] = []
+    const pendingInputWal: PendingInputWal = {
+      ...baseWal,
+      listHandoffs: vi.fn(async (requestSessionKey) => {
+        capturedLookup = await baseWal.listHandoffs!(requestSessionKey)
+        await new Promise<void>(resolve => {
+          releaseLookup = resolve
+        })
+        return capturedLookup.map(record => structuredClone(record))
+      }),
+    }
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+        .mockResolvedValueOnce({
+          sessionKey: 'agent:main:webchat:test',
+          task_id: 'same-receipt-after-race',
+        }),
+    }
+    const live = makeOptions({
+      rpc,
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      pendingInputWal,
+      messageEditGeneration: messageActions.editGeneration,
+      messageEditActive: messageActions.editActive,
+      validateMessageEditOwner: messageActions.validateEditOwner,
+      commitMessageEdit: messageActions.commitEdit,
+      adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
+    })
+
+    await live.api.onSend()
+    const replay = live.api.onSend()
+    await vi.waitFor(() => expect(pendingInputWal.listHandoffs).toHaveBeenCalledOnce())
+    const stale = capturedLookup[0]!
+    const accepted = {
+      ...stale,
+      state: 'accepted' as const,
+      acceptedSessionKey: 'agent:main:webchat:test',
+      walRevision: stale.walRevision! + 1,
+      updatedAt: Date.now(),
+    }
+    expect((await baseWal.compareAndSwapHandoff!(
+      stale.ownerRequestId,
+      stale.walOwnerId!,
+      stale.walRevision!,
+      accepted,
+    )).applied).toBe(true)
+    expect((await baseWal.compareAndSwapHandoff!(
+      accepted.ownerRequestId,
+      accepted.walOwnerId!,
+      accepted.walRevision!,
+      null,
+    )).applied).toBe(true)
+    releaseLookup()
+    await replay
+
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+    expect(await baseWal.listHandoffs?.()).toEqual([])
+  })
 
   it.each([
     ['different text', 'new ordinary question'],
@@ -3117,6 +3311,49 @@ describe('useChatSend attachment payloads', () => {
     },
   )
 
+  it.each([
+    ['terminal response', () => Promise.resolve({
+      sessionKey: 'agent:main:webchat:test',
+      task_id: 'task-terminal-receipt',
+      task_status: 'timeout',
+    }), 'task-terminal-receipt', 'timeout'],
+    ['QUEUE_FULL_DIRTY accepted error', () => Promise.reject(Object.assign(
+      new Error('queue bookkeeping failed'),
+      {
+        code: 'QUEUE_FULL_DIRTY',
+        accepted: true,
+        details: {
+          session_key: 'agent:main:webchat:test',
+          orphan_message_id: 'message-terminal-receipt',
+        },
+      },
+    )), '', 'failed'],
+  ] as const)(
+    'forwards an offscreen %s to the terminal receipt boundary',
+    async (_label, terminalResult, expectedTaskId, expectedStatus) => {
+      const inputText = ref('older question')
+      const trackBackgroundReceiptTask = vi.fn()
+      const rpc = {
+        call: vi.fn()
+          .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+          .mockImplementationOnce(terminalResult),
+      }
+      const harness = makeOptions({ rpc, inputText, trackBackgroundReceiptTask })
+
+      await harness.api.onSend()
+      const clientMessageId = String(rpc.call.mock.calls[0]?.[1]?.clientMessageId)
+      inputText.value = 'newer question'
+      await harness.api.onSend()
+
+      expect(trackBackgroundReceiptTask).toHaveBeenCalledWith(
+        clientMessageId,
+        expectedTaskId,
+        expectedStatus,
+      )
+      expect(inputText.value).toBe('newer question')
+    },
+  )
+
   it('does not start async queue persistence for a fork edit while work is active', async () => {
     const {
       sessionKey,
@@ -3168,15 +3405,15 @@ describe('useChatSend attachment payloads', () => {
     } = makeEditedMessageState('edited question')
 
     let finishHandoff!: () => void
-    let handoffWrites = 0
+    const baseWal = memoryHandoffWal()
     const pendingInputWal: PendingInputWal = {
-      ...memoryHandoffWal(),
-      putHandoff: vi.fn(() => {
-        handoffWrites += 1
-        if (handoffWrites > 1) return Promise.resolve()
-        return new Promise<void>(resolve => {
+      ...baseWal,
+      prepareHandoff: vi.fn(async (record) => {
+        const prepared = await baseWal.prepareHandoff!(record)
+        await new Promise<void>(resolve => {
           finishHandoff = resolve
         })
+        return prepared
       }),
     }
     const acceptanceStopPending = ref(false)
@@ -3193,7 +3430,7 @@ describe('useChatSend attachment payloads', () => {
     })
 
     const send = api.onSend()
-    await vi.waitFor(() => expect(pendingInputWal.putHandoff).toHaveBeenCalled())
+    await vi.waitFor(() => expect(pendingInputWal.prepareHandoff).toHaveBeenCalled())
     acceptanceStopPending.value = true
     finishHandoff()
     await send
@@ -7393,6 +7630,111 @@ describe('useChatSend attachment payloads', () => {
       vi.useRealTimers()
     }
   })
+
+  it.each([
+    ['resolved child response', () => Promise.resolve({
+      sessionKey: 'agent:main:webchat:child',
+      task_id: 'task-child-recovered',
+      task_status: 'running',
+    })],
+    ['accepted child error', () => Promise.reject(Object.assign(new Error('accepted response lost'), {
+      accepted: true,
+      details: {
+        session_key: 'agent:main:webchat:child',
+        orphan_message_id: 'message-child-recovered',
+      },
+    }))],
+    ['terminal accepted child error', () => Promise.reject(Object.assign(new Error('queue bookkeeping failed'), {
+      code: 'QUEUE_FULL_DIRTY',
+      accepted: true,
+      details: {
+        session_key: 'agent:main:webchat:child',
+        orphan_message_id: 'message-child-terminal',
+      },
+    }))],
+  ] as const)(
+    'keeps an automatically recovered fork off the parent for a %s',
+    async (_label, recoveredResult) => {
+      vi.useFakeTimers()
+      try {
+        const parentSessionKey = 'agent:main:webchat:test'
+        const {
+          sessionKey,
+          messages,
+          inputText,
+          pendingForkBeforeMessageId,
+          messageActions,
+        } = makeEditedMessageState('edited question')
+        const pendingInputWal = memoryHandoffWal()
+        const taskOwnership = useChatTaskOwnership()
+        const activeStreamTaskId = ref('')
+        let rejectFirstSend!: (reason: unknown) => void
+        let sendCalls = 0
+        const rpc = {
+          call: vi.fn(<T = unknown>(method: string) => {
+            if (method === 'chat.abort') {
+              return Promise.resolve({ aborted: true }) as Promise<T>
+            }
+            sendCalls += 1
+            if (sendCalls === 1) {
+              return new Promise<T>((_resolve, reject) => {
+                rejectFirstSend = reject
+              })
+            }
+            return recoveredResult() as Promise<T>
+          }) as UseChatSendOptions['rpc']['call'],
+        }
+        const adoptResponseSession = vi.fn()
+        const harness = makeOptions({
+          rpc,
+          sessionKey,
+          messages,
+          inputText,
+          pendingForkBeforeMessageId,
+          pendingInputWal,
+          taskOwnership,
+          activeStreamTaskId,
+          adoptResponseSession,
+          reconcileTaskOwnership: vi.fn(async () => {}),
+          messageEditGeneration: messageActions.editGeneration,
+          messageEditActive: messageActions.editActive,
+          validateMessageEditOwner: messageActions.validateEditOwner,
+          commitMessageEdit: messageActions.commitEdit,
+          adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
+        })
+        harness.stream.startStreaming = vi.fn(() => {
+          harness.stream.isStreaming.value = true
+        })
+        harness.stream.endStreaming = vi.fn(() => {
+          harness.stream.isStreaming.value = false
+        })
+
+        const firstSend = harness.api.onSend()
+        await vi.waitFor(() => expect(sendCalls).toBe(1))
+        taskOwnership.applySnapshot({
+          run_status: 'running',
+          active_task: { task_id: 'task-parent-A', status: 'running' },
+        }, true)
+        activeStreamTaskId.value = 'task-parent-A'
+        harness.api.onStop()
+        rejectFirstSend(Object.assign(new Error('response lost'), { retryable: true }))
+        await firstSend
+
+        await vi.runAllTimersAsync()
+        await Promise.resolve()
+
+        expect(sendCalls).toBe(2)
+        expect(sessionKey.value).toBe(parentSessionKey)
+        expect(adoptResponseSession).not.toHaveBeenCalled()
+        expect(taskOwnership.runningTaskId.value).toBe('task-parent-A')
+        expect([...taskOwnership.queuedTaskIds.value]).not.toContain('task-child-recovered')
+        expect(await pendingInputWal.listHandoffs?.()).toEqual([])
+        expect(messages.value.find(message => message.messageId?.startsWith('message-child'))).toBeUndefined()
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+  )
 
   it('retries the exact recovered task Stop when its first abort is not acknowledged', async () => {
     vi.useFakeTimers()

@@ -1701,7 +1701,7 @@ let beginBackgroundReceiptReplay = (_clientMessageId: string, _holdHistory = fal
 let trackBackgroundReceiptTask = (
   _clientMessageId: string,
   _taskId: string,
-  _terminal = false,
+  _terminal: boolean | string = false,
 ) => {}
 let finishBackgroundReceiptReplay = (_clientMessageId: string) => {}
 let holdBackgroundReceiptReconciliation = () => {}

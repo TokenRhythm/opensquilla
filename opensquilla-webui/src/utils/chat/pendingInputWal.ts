@@ -52,6 +52,8 @@ export interface ResponseHandoffWalRecord {
   recoveryAttachments: Attachment[]
   /** A protocol-owned replay must never be restored into the user composer. */
   restoreComposerOnFailure?: boolean
+  /** Accepted offscreen; recovery may retire it but must never adopt its target. */
+  backgroundOnly?: boolean
   /** Stable source-session + barrier identity used for cross-tab coordination. */
   replayCoordinationKey?: string
   /** Identifies the live dispatcher allowed to arm an unsubmitted handoff. */
@@ -202,6 +204,10 @@ function isResponseHandoffWalRecord(value: unknown): value is ResponseHandoffWal
     && (
       record.restoreComposerOnFailure === undefined
       || typeof record.restoreComposerOnFailure === 'boolean'
+    )
+    && (
+      record.backgroundOnly === undefined
+      || typeof record.backgroundOnly === 'boolean'
     )
     && (
       record.replayCoordinationKey === undefined

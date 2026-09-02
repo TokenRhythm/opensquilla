@@ -536,6 +536,12 @@ describe('useChatRpcEventHandlers decoded conversation ingress', () => {
       })
       expect(taskOwnership.hasAuthoritativeWork.value).toBe(true)
 
+      harness.api.trackBackgroundReceiptTask(
+        'client-old-receipt',
+        'task-old-receipt',
+        'succeeded',
+      )
+
       deliver('task.succeeded', {
         session_key: 'agent:main:test',
         task_id: 'task-old-receipt',
@@ -564,6 +570,91 @@ describe('useChatRpcEventHandlers decoded conversation ingress', () => {
       harness.stop()
     }
   })
+
+  it('does not let an old receipt terminal overwrite a newer pending foreground stream', () => {
+    const harness = createHarness({
+      pendingQueue: [{
+        pendingUiId: 'pending-after-foreground',
+        text: 'wait for the foreground turn',
+        attachments: [],
+        intent: null,
+      }],
+    })
+    harness.stream.isStreaming.value = true
+    harness.activeStreamTaskId.value = PENDING_STREAM_TASK_ID
+    try {
+      harness.api.beginBackgroundReceiptReplay('client-old-receipt')
+      harness.api.onConversationEvent({
+        kind: 'conversation',
+        event: decodeConversationEvent('task.succeeded', {
+          session_key: 'agent:main:test',
+          task_id: 'task-old-receipt',
+          client_message_id: 'client-old-receipt',
+        }, {}),
+        payload: {
+          session_key: 'agent:main:test',
+          task_id: 'task-old-receipt',
+          client_message_id: 'client-old-receipt',
+        },
+        meta: {},
+      })
+
+      expect(harness.applySessionRunState).not.toHaveBeenCalled()
+      expect(harness.clearPendingRouterDecision).not.toHaveBeenCalled()
+      expect(harness.schedulePendingDrainAfterTerminal).not.toHaveBeenCalled()
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+    } finally {
+      harness.stop()
+    }
+  })
+
+  it.each([
+    ['task.cancelled', 'cancelled', 'cancelled', false],
+    ['task.timeout', 'timeout', 'failed', true],
+    ['task.abandoned', 'abandoned', 'failed', true],
+  ] as const)(
+    'derives a missing receipt status from %s',
+    (eventName, expectedTaskStatus, expectedRunStatus, shouldDrain) => {
+      const harness = createHarness({
+        pendingQueue: [{
+          pendingUiId: 'pending-after-terminal',
+          text: 'continue after terminal',
+          attachments: [],
+          intent: null,
+        }],
+      })
+      harness.stream.isStreaming.value = false
+      try {
+        harness.api.beginBackgroundReceiptReplay('client-terminal-kind')
+        harness.api.onConversationEvent({
+          kind: 'conversation',
+          event: decodeConversationEvent(eventName, {
+            session_key: 'agent:main:test',
+            task_id: 'task-terminal-kind',
+            client_message_id: 'client-terminal-kind',
+          }, {}),
+          payload: {
+            session_key: 'agent:main:test',
+            task_id: 'task-terminal-kind',
+            client_message_id: 'client-terminal-kind',
+          },
+          meta: {},
+        })
+
+        expect(harness.applySessionRunState).toHaveBeenCalledWith(expect.objectContaining({
+          run_status: expectedRunStatus,
+          last_task: expect.objectContaining({ status: expectedTaskStatus }),
+        }))
+        if (shouldDrain) {
+          expect(harness.schedulePendingDrainAfterTerminal).toHaveBeenCalledOnce()
+        } else {
+          expect(harness.schedulePendingDrainAfterTerminal).not.toHaveBeenCalled()
+        }
+      } finally {
+        harness.stop()
+      }
+    },
+  )
 
   it('does not learn receipt task ownership from a stale subscription epoch', () => {
     const harness = createHarness()
