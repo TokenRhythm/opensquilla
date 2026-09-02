@@ -490,15 +490,19 @@ def test_generic_webui_change_does_not_wake_desktop_matrix(
 @pytest.mark.parametrize(
     "path",
     [
+        "contracts/gateway/v4/sandbox/sandbox-runtime-status.schema.json",
         "contracts/gateway/v4/sessions/sessions-list.schema.json",
         "contracts/gateway/v4/sessions/sessions-changed.schema.json",
+        "opensquilla-webui/src/contracts/generated/v4/sandboxRuntimeStatus.ts",
         "opensquilla-webui/src/contracts/generated/v4/sessionsChanged.ts",
         "scripts/contracts/generate_gateway_contracts.py",
         "scripts/contracts/generate_sessions_list_contract.py",
+        "src/opensquilla/contracts/generated/v4/sandbox_runtime_status.py",
         "src/opensquilla/contracts/generated/v4/sessions_list.py",
         "src/opensquilla/contracts/generated/v4/sessions_changed.py",
         "tests/contracts/test_gateway_contract_runner.py",
         "tests/contracts/test_gateway_contract_toolchain_integration.py",
+        "tests/contracts/test_sandbox_runtime_contract.py",
         "tests/contracts/test_sessions_list_contract.py",
         "tests/contracts/test_sessions_changed_contract.py",
         "tests/fixtures/contracts/gateway/v4/toolchain/toolchain-ping.schema.json",
@@ -533,6 +537,7 @@ def test_gateway_contract_changes_run_deterministic_generation(
         "opensquilla-webui/src/modules/sessionConversation.ts",
         "opensquilla-webui/src/platform/desktop.ts",
         "opensquilla-webui/src/types/chat.ts",
+        "src/opensquilla/gateway/adapters/sandbox_runtime_contract.py",
         "src/opensquilla/gateway/adapters/sessions_list_contract.py",
     ],
 )
