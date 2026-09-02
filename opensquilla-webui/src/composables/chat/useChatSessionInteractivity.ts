@@ -34,6 +34,9 @@ export function useChatSessionInteractivity(options: UseChatSessionInteractivity
   async function resolve(key: string, attempt: number, signal: AbortSignal): Promise<void> {
     let cursor: string | undefined
     const seenCursors = new Set<string>()
+    const markUnresolved = () => {
+      if (!signal.aborted && attempt === generation) unresolvedKey.value = key
+    }
     try {
       while (!signal.aborted && attempt === generation) {
         const page = await options.directory.listPage({
@@ -45,16 +48,20 @@ export function useChatSessionInteractivity(options: UseChatSessionInteractivity
         const match = page.items.find(item => item.key === key)
         if (match) {
           authority.value = match
+          unresolvedKey.value = ''
           return
         }
         const next = page.nextCursor || ''
-        if (!page.hasMore || !next || next === cursor || seenCursors.has(next)) return
+        if (!page.hasMore || !next || next === cursor || seenCursors.has(next)) {
+          markUnresolved()
+          return
+        }
         seenCursors.add(next)
         cursor = next
       }
     } catch (error) {
       if (!signal.aborted && attempt === generation) {
-        unresolvedKey.value = key
+        markUnresolved()
         console.warn(
           'Selected session policy lookup failed:',
           error instanceof Error ? error.message : error,

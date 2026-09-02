@@ -2119,6 +2119,7 @@ describe('useChatSend attachment payloads', () => {
     })
 
     await expect(api.sendQueuedFollowup(queued)).resolves.toBe('policy_blocked')
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('policy_blocked')
     await expect(api.dispatchHiddenSend(
       'fresh provider confirmation',
       'Fresh confirmation',
@@ -3872,6 +3873,79 @@ describe('useChatSend attachment payloads', () => {
       'sessions.steer.v2',
     ])
     expect(options.messages.value.filter(message => message.role === 'user')).toHaveLength(1)
+  })
+
+  it('replays an acceptance-unknown queued steer after the session becomes read-only', async () => {
+    const sessionPolicy = ref<string | null>(null)
+    const replayPolicy = ref<string | null>(null)
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+        .mockResolvedValueOnce({
+          accepted: true,
+          replayed: true,
+          turn_id: 'turn-current',
+          disposition: 'steering',
+        }),
+    }
+    const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-unknown-steer-read-only',
+      text: 'recover the exact steer',
+      attachments: [],
+      intent: null,
+      ownerSessionKey: 'agent:main:webchat:test',
+    }
+    const { api } = makeOptions({
+      ...sameTurnSteerOptions(),
+      rpc,
+      sendBlockedReason: sessionPolicy,
+      sessionInteractivityBlockedReason: sessionPolicy,
+      idempotentReplayBlockedReason: replayPolicy,
+    })
+
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('retryable_failure')
+    const originalParams = rpc.call.mock.calls[0]?.[1]
+    expect(queued.steerAttempt?.phase).toBe('acceptance_unknown')
+    sessionPolicy.value = 'Cron sessions are read-only.'
+
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('accepted')
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(originalParams)
+  })
+
+  it('does not replay a definitely rejected queued steer through read-only policy', async () => {
+    const sessionPolicy = ref<string | null>(null)
+    const rpc = {
+      call: vi.fn().mockRejectedValue(Object.assign(new Error('storage busy'), {
+        accepted: false,
+        retryable: true,
+      })),
+    }
+    const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-rejected-steer-read-only',
+      text: 'do not recover as receipt replay',
+      attachments: [],
+      intent: null,
+      ownerSessionKey: 'agent:main:webchat:test',
+    }
+    const { api } = makeOptions({
+      ...sameTurnSteerOptions(),
+      rpc,
+      sendBlockedReason: sessionPolicy,
+      sessionInteractivityBlockedReason: sessionPolicy,
+      idempotentReplayBlockedReason: ref(null),
+    })
+
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('retryable_failure')
+    expect(queued.steerAttempt?.phase).toBe('retryable_rejected')
+    const originalRequest = queued.steerAttempt?.request
+    sessionPolicy.value = 'Cron sessions are read-only.'
+
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('retryable_failure')
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(queued.steerAttempt).toMatchObject({
+      phase: 'retryable_rejected',
+      request: originalRequest,
+    })
   })
 
   it('treats a fulfilled steer response without accepted as unknown despite tempting fields', async () => {

@@ -2018,6 +2018,10 @@ export function useChatSend(options: UseChatSendOptions) {
     const recovered = pendingItem
       ? options.steerDelivery.attemptForItem(pendingItem)
       : null
+    const receiptReplay = recovered?.phase === 'acceptance_unknown'
+    const blockedReason = receiptReplay
+      ? options.idempotentReplayBlockedReason || options.sendBlockedReason
+      : options.sendBlockedReason
     if (!requestSessionKey || !text.trim()) return 'not_sent'
     if (!options.turnCommands.supports('same-turn-steer')) {
       return recovered ? 'retryable_failure' : 'not_sent'
@@ -2048,7 +2052,7 @@ export function useChatSend(options: UseChatSendOptions) {
         pendingItem ? null : options.pendingForkBeforeMessageId.value,
       )
     ) return 'not_sent'
-    if (options.sendBlockedReason?.value || options.hasPendingAttachmentWork()) {
+    if (blockedReason?.value || options.hasPendingAttachmentWork()) {
       return recovered ? 'retryable_failure' : 'not_sent'
     }
     if (
@@ -2531,11 +2535,12 @@ export function useChatSend(options: UseChatSendOptions) {
       || item.ownerSessionKey
       || options.sessionKey.value
     const retryAttempt = recoveredQueuedAttempts.get(item) ?? null
+    const steerRetryAttempt = options.steerDelivery.attemptForItem(item)
     const idempotentReplay = retryAttempt?.requiresIdempotentReplay === true
+      || steerRetryAttempt?.phase === 'acceptance_unknown'
     const sendBlockedReason = idempotentReplay
       ? options.idempotentReplayBlockedReason || options.sendBlockedReason
       : options.sendBlockedReason
-    const steerRetryAttempt = options.steerDelivery.attemptForItem(item)
     const preserveRetryState = (outcome: ChatSendOutcome): ChatSendOutcome => (
       (retryAttempt || steerRetryAttempt)
       && (outcome === 'deferred' || outcome === 'not_sent')

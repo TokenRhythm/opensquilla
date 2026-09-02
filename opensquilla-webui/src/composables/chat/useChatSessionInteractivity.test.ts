@@ -104,6 +104,76 @@ describe('useChatSessionInteractivity', () => {
     policy.dispose()
   })
 
+  it('keeps a direct route blocked when the terminal page does not contain it', async () => {
+    const key = ref('session-missing-from-terminal-page')
+    const source = directory([{
+      items: [session('another-session')],
+      hasMore: false,
+      nextCursor: null,
+    }])
+    const policy = useChatSessionInteractivity({ sessionKey: key, directory: source })
+
+    await vi.waitFor(() => expect(policy.policyUnavailable.value).toBe(true))
+    expect(policy.policyPending.value).toBe(false)
+    expect(policy.turnActionsBlocked.value).toBe(true)
+    policy.dispose()
+  })
+
+  it.each([
+    {
+      name: 'a missing cursor',
+      pages: [{ items: [], hasMore: true, nextCursor: null }],
+      calls: 1,
+    },
+    {
+      name: 'a repeated cursor',
+      pages: [
+        { items: [], hasMore: true, nextCursor: 'page-2' },
+        { items: [], hasMore: true, nextCursor: 'page-2' },
+      ],
+      calls: 2,
+    },
+    {
+      name: 'a cursor loop',
+      pages: [
+        { items: [], hasMore: true, nextCursor: 'page-2' },
+        { items: [], hasMore: true, nextCursor: 'page-3' },
+        { items: [], hasMore: true, nextCursor: 'page-2' },
+      ],
+      calls: 3,
+    },
+  ])('fails closed when pagination ends with $name', async ({ pages, calls }) => {
+    const key = ref('session-behind-invalid-pagination')
+    const source = directory(pages)
+    const policy = useChatSessionInteractivity({ sessionKey: key, directory: source })
+
+    await vi.waitFor(() => expect(policy.policyUnavailable.value).toBe(true))
+    expect(policy.policyPending.value).toBe(false)
+    expect(policy.turnActionsBlocked.value).toBe(true)
+    expect(source.listPage).toHaveBeenCalledTimes(calls)
+    policy.dispose()
+  })
+
+  it('stays blocked after pagination reordering until a directory refresh supplies authority', async () => {
+    const key = ref('session-reordered-into-an-earlier-page')
+    const knownSessions = ref<SessionItem[]>([])
+    const source = directory([
+      { items: [session('first-page-peer')], hasMore: true, nextCursor: 'page-2' },
+      { items: [session('second-page-peer')], hasMore: false, nextCursor: null },
+    ])
+    const policy = useChatSessionInteractivity({ sessionKey: key, directory: source, knownSessions })
+
+    await vi.waitFor(() => expect(policy.policyUnavailable.value).toBe(true))
+    expect(policy.turnActionsBlocked.value).toBe(true)
+
+    knownSessions.value = [session(key.value)]
+    await nextTick()
+
+    expect(policy.policyUnavailable.value).toBe(false)
+    expect(policy.turnActionsBlocked.value).toBe(false)
+    policy.dispose()
+  })
+
   it('does not treat a display-only inferred Cron kind as policy authority', () => {
     const key = ref('legacy-source-labelled-cron')
     const knownSessions = ref<SessionItem[]>([
