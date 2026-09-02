@@ -42,7 +42,7 @@ describe('useChatSessionInteractivity', () => {
   it('uses loaded navigation metadata for a noncanonical legacy Cron session', () => {
     const key = ref('legacy-scheduled-run')
     const knownSessions = ref<SessionItem[]>([
-      session(key.value, { sessionKind: 'cron', interactive: false }),
+      session(key.value, { sessionKind: 'cron', interactive: null }),
     ])
     const source = directory([])
     const policy = useChatSessionInteractivity({ sessionKey: key, directory: source, knownSessions })
@@ -58,7 +58,7 @@ describe('useChatSessionInteractivity', () => {
     const source = directory([
       { items: [], hasMore: true, nextCursor: 'page-2' },
       {
-        items: [session(key.value, { sessionKind: 'cron', interactive: false })],
+        items: [session(key.value, { sessionKind: 'chat', interactive: false })],
         hasMore: false,
         nextCursor: null,
       },
