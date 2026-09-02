@@ -10,6 +10,7 @@ import type {
 } from '@/types/plans'
 import type { PlanCenter } from '@/modules/planCenter'
 import { createClientRequestId } from '@/utils/chat/messageIdentity'
+import type { TaskSettlementStatus } from '@/utils/chat/streamEvents'
 import {
   normalizeCollaborationSnapshot,
   normalizePlanRevisionSnapshot,
@@ -174,12 +175,14 @@ export function useChatPlans(options: UseChatPlansOptions) {
   const pendingAction = ref<PlanCardAction | 'cancel-run' | 'revise' | null>(null)
   const modeAppliesNextTurn = ref(false)
   const replanTarget = ref<PlanCardActionTarget | null>(null)
+  const planRunSettlementPending = ref(false)
 
   const currentPlanRevisionId = computed(() => currentPlan.value?.revisionId || '')
   const replanActive = computed(() => replanTarget.value !== null)
   let acceptedEpoch = 0
   let modeMutationOwner: symbol | null = null
   let actionMutationOwner: symbol | null = null
+  let settledTaskFence: { runId: string; taskId: string } | null = null
 
   function clearPlanState() {
     // Reset/session changes invalidate in-flight UI mutations. Their delayed
@@ -189,6 +192,8 @@ export function useChatPlans(options: UseChatPlansOptions) {
     collaboration.value = { mode: 'default', revision: 0 }
     currentPlan.value = null
     activePlanRun.value = null
+    settledTaskFence = null
+    planRunSettlementPending.value = false
     modeBusy.value = false
     pendingAction.value = null
     modeAppliesNextTurn.value = false
@@ -265,6 +270,8 @@ export function useChatPlans(options: UseChatPlansOptions) {
       && activePlanRun.value.planRevisionId !== plan.revisionId
     ) {
       activePlanRun.value = null
+      settledTaskFence = null
+      planRunSettlementPending.value = false
     }
     return true
   }
@@ -275,9 +282,17 @@ export function useChatPlans(options: UseChatPlansOptions) {
       !run
       || !currentPlan.value
       || run.planRevisionId !== currentPlan.value.revisionId
+      || (
+        settledTaskFence?.runId === run.runId
+        && settledTaskFence.taskId === run.activeTaskId
+      )
       || !shouldAdoptPlanRun(run, activePlanRun.value)
     ) return false
     activePlanRun.value = run
+    if (settledTaskFence) {
+      settledTaskFence = null
+      planRunSettlementPending.value = false
+    }
     return true
   }
 
@@ -303,6 +318,8 @@ export function useChatPlans(options: UseChatPlansOptions) {
       } else if (!staleEnvelope) {
         currentPlan.value = null
         activePlanRun.value = null
+        settledTaskFence = null
+        planRunSettlementPending.value = false
       }
     }
     const rawRun = source.activePlanRun
@@ -317,6 +334,8 @@ export function useChatPlans(options: UseChatPlansOptions) {
         }
       } else if (!staleEnvelope) {
         activePlanRun.value = null
+        settledTaskFence = null
+        planRunSettlementPending.value = false
       }
     }
   }
@@ -423,7 +442,12 @@ export function useChatPlans(options: UseChatPlansOptions) {
   }
 
   async function revise(request: PlanRevisionRequest): Promise<boolean> {
-    if (!options.sessionKey.value || modeBusy.value || pendingAction.value) return false
+    if (
+      !options.sessionKey.value
+      || modeBusy.value
+      || pendingAction.value
+      || planRunSettlementPending.value
+    ) return false
     const prompt = request.prompt.trim()
     if (!prompt) return false
     const key = options.sessionKey.value
@@ -460,7 +484,12 @@ export function useChatPlans(options: UseChatPlansOptions) {
   }
 
   async function implement(target: PlanCardActionTarget, inNewSession: boolean) {
-    if (!options.sessionKey.value || modeBusy.value || pendingAction.value) return
+    if (
+      !options.sessionKey.value
+      || modeBusy.value
+      || pendingAction.value
+      || planRunSettlementPending.value
+    ) return
     const sourceKey = options.sessionKey.value
     const sourceEpoch = acceptedEpoch
     const targetKey = inNewSession
@@ -502,7 +531,12 @@ export function useChatPlans(options: UseChatPlansOptions) {
 
   async function cancelRun() {
     const run = activePlanRun.value
-    if (!run || modeBusy.value || pendingAction.value) return
+    if (
+      !run
+      || modeBusy.value
+      || pendingAction.value
+      || planRunSettlementPending.value
+    ) return
     const key = options.sessionKey.value
     const epoch = acceptedEpoch
     const owner = Symbol('plan-action-mutation')
@@ -529,6 +563,33 @@ export function useChatPlans(options: UseChatPlansOptions) {
     }
   }
 
+  /**
+   * A task terminal arrives before TaskRuntime settles its attached PlanRun.
+   * Release the exact task owner immediately for presentation, but do not
+   * invent a terminal run: running implementations are persisted as resumable
+   * paused runs. The owner fence rejects delayed pre-terminal run events until
+   * the authoritative owner-free paused/cancelled snapshot replaces this
+   * transient projection.
+   */
+  function settleActiveRunForTerminalTask(
+    taskId: string,
+    taskStatus: TaskSettlementStatus,
+  ) {
+    const run = activePlanRun.value
+    if (!run || !taskId || run.activeTaskId !== taskId) return false
+    if (!['queued', 'running', 'paused', 'blocked'].includes(run.status)) return false
+    const settlementReason = taskStatus === 'cancelled' ? 'cancelled_by_user' : taskStatus
+    settledTaskFence = { runId: run.runId, taskId }
+    planRunSettlementPending.value = true
+    activePlanRun.value = {
+      ...run,
+      status: 'paused',
+      activeTaskId: undefined,
+      pauseReason: settlementReason,
+    }
+    return true
+  }
+
   reset()
 
   return {
@@ -537,6 +598,7 @@ export function useChatPlans(options: UseChatPlansOptions) {
     currentPlan,
     currentPlanRevisionId,
     activePlanRun,
+    planRunSettlementPending,
     modeBusy,
     modeAppliesNextTurn,
     pendingAction,
@@ -552,5 +614,6 @@ export function useChatPlans(options: UseChatPlansOptions) {
     revise,
     implement,
     cancelRun,
+    settleActiveRunForTerminalTask,
   }
 }

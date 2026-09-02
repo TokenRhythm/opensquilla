@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { effectScope, ref } from 'vue'
+import { effectScope, nextTick, ref } from 'vue'
 import type { RpcEventHandler } from '@/lib/rpc'
 import type { InterruptViewState } from '@/types/parts'
 import { projectApprovalDisplayArgs } from '@/adapters/gateway/approvalCenterV4Contract'
 import { sessionConversationFromTestRpc } from '@/testing/sessionConversation.test-helper'
+import type { SessionReadMetadata } from '@/modules/sessionReadLifecycle'
 import {
   useChatApprovals,
 } from './useChatApprovals'
@@ -16,8 +17,12 @@ afterEach(() => {
 
 function deferred<T>() {
   let resolve!: (value: T) => void
-  const promise = new Promise<T>(done => { resolve = done })
-  return { promise, resolve }
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((done, fail) => {
+    resolve = done
+    reject = fail
+  })
+  return { promise, resolve, reject }
 }
 
 async function harness(statusResult: unknown = { found: true, pending: true, resolved: false }) {
@@ -26,6 +31,18 @@ async function harness(statusResult: unknown = { found: true, pending: true, res
   const rpcCall = vi.fn(async <T,>(_method?: string, _params?: Record<string, unknown>) => statusResult as T)
   const appendInterruptFrame = vi.fn()
   const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map())
+  const currentEpoch = ref(3)
+  const streamGeneration = ref('generation-1')
+  const observeStreamGeneration = vi.fn((source: unknown) => {
+    const value = source && typeof source === 'object'
+      ? source as Record<string, unknown>
+      : {}
+    const generation = String(value.stream_generation ?? value.streamGeneration ?? '').trim()
+    if (!generation || generation === streamGeneration.value) return false
+    streamGeneration.value = generation
+    return true
+  })
+  const sessionKey = ref('agent:main:web')
   const scope = effectScope()
   const approvalCenter: any = {
     snapshot: vi.fn(async () => {
@@ -94,7 +111,10 @@ async function harness(statusResult: unknown = { found: true, pending: true, res
         return () => handlers.delete(event)
       }),
     }),
-    sessionKey: ref('agent:main:web'),
+    sessionKey,
+    currentEpoch,
+    streamGeneration,
+    observeStreamGeneration,
     runStatus: ref({ status: 'idle', label: '', task: null }),
     stream: {
       isStreaming: ref(false),
@@ -108,7 +128,19 @@ async function harness(statusResult: unknown = { found: true, pending: true, res
   const unsubscribe = approvals.subscribe()
   await vi.waitFor(() => expect(fetch).toHaveBeenCalled())
   vi.mocked(fetch).mockClear()
-  return { approvals, handlers, rpcCall, appendInterruptFrame, interruptState, unsubscribe, scope }
+  return {
+    approvals,
+    handlers,
+    rpcCall,
+    appendInterruptFrame,
+    interruptState,
+    currentEpoch,
+    streamGeneration,
+    observeStreamGeneration,
+    sessionKey,
+    unsubscribe,
+    scope,
+  }
 }
 
 function installSnapshot(pending: unknown[] = []) {
@@ -465,6 +497,151 @@ describe('clarify tool-result recovery', () => {
     }
   })
 
+  it('ignores a paused clarify replay from an older session epoch', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      runtime.handlers.get('session.event.tool_result')?.({
+        session_key: 'agent:main:web',
+        epoch: runtime.currentEpoch.value - 1,
+        stream_generation: runtime.streamGeneration.value,
+        tool_use_id: 'stale-epoch-request',
+        name: 'request_user_input',
+        result: { ...planClarifyResult, request_id: 'stale-epoch-request' },
+      })
+
+      expect(runtime.approvals.pendingClarify.value).toBeNull()
+      expect(runtime.interruptState.value.has('stale-epoch-request')).toBe(false)
+      expect(runtime.appendInterruptFrame).not.toHaveBeenCalled()
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('ignores a paused clarify replay from a retired transport generation', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      runtime.streamGeneration.value = 'generation-2'
+      runtime.handlers.get('session.event.tool_result')?.({
+        session_key: 'agent:main:web',
+        epoch: runtime.currentEpoch.value,
+        stream_generation: 'generation-1',
+        tool_use_id: 'stale-generation-request',
+        name: 'request_user_input',
+        result: { ...planClarifyResult, request_id: 'stale-generation-request' },
+      })
+
+      expect(runtime.approvals.pendingClarify.value).toBeNull()
+      expect(runtime.interruptState.value.has('stale-generation-request')).toBe(false)
+      expect(runtime.appendInterruptFrame).not.toHaveBeenCalled()
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('observes a new generation before appending and rejects all retired snapshot state', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      const handler = runtime.handlers.get('session.event.tool_result')
+      runtime.observeStreamGeneration.mockImplementationOnce((source: unknown) => {
+        // Model resetLiveTurnState clearing the fold log. If observation runs
+        // after the approvals append, this erases the only actionable frame.
+        runtime.appendInterruptFrame.mockClear()
+        const value = source as Record<string, unknown>
+        runtime.streamGeneration.value = String(value.stream_generation || '')
+        return true
+      })
+      handler?.({
+        session_key: 'agent:main:web',
+        epoch: runtime.currentEpoch.value,
+        stream_generation: 'generation-2',
+        stream_seq: 1,
+        tool_use_id: 'first-new-generation-request',
+        name: 'request_user_input',
+        result: { ...planClarifyResult, request_id: 'first-new-generation-request' },
+      })
+
+      expect(runtime.streamGeneration.value).toBe('generation-2')
+      expect(runtime.approvals.pendingClarify.value?.requestId)
+        .toBe('first-new-generation-request')
+      expect(runtime.observeStreamGeneration).toHaveBeenCalledTimes(1)
+      expect(runtime.appendInterruptFrame).toHaveBeenCalledTimes(1)
+      expect(runtime.observeStreamGeneration.mock.invocationCallOrder[0])
+        .toBeLessThan(runtime.appendInterruptFrame.mock.invocationCallOrder[0]!)
+
+      runtime.approvals.applyUserInputBootstrap({
+        pendingUserInputs: [],
+        streamGeneration: 'generation-1',
+        goalSnapshotStreamSeq: 200,
+      })
+      expect(runtime.approvals.pendingClarify.value?.requestId)
+        .toBe('first-new-generation-request')
+      const appendCount = runtime.appendInterruptFrame.mock.calls.length
+      runtime.approvals.applyUserInputBootstrap({
+        pendingUserInputs: [{
+          ...planClarifyResult,
+          request_id: 'retired-snapshot-request',
+        }],
+        streamGeneration: 'generation-1',
+        goalSnapshotStreamSeq: 201,
+      })
+      expect(runtime.interruptState.value.has('retired-snapshot-request')).toBe(false)
+      expect(runtime.approvals.pendingClarify.value?.requestId)
+        .toBe('first-new-generation-request')
+      expect(runtime.appendInterruptFrame).toHaveBeenCalledTimes(appendCount)
+
+      // The retired namespace cannot roll the live ingress back either.
+      handler?.({
+        session_key: 'agent:main:web',
+        epoch: runtime.currentEpoch.value,
+        stream_generation: 'generation-1',
+        stream_seq: 200,
+        tool_use_id: 'late-retired-generation-request',
+        name: 'request_user_input',
+        result: { ...planClarifyResult, request_id: 'late-retired-generation-request' },
+      })
+
+      expect(runtime.interruptState.value.has('late-retired-generation-request')).toBe(false)
+      expect(runtime.appendInterruptFrame).toHaveBeenCalledTimes(appendCount)
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('retires a shared generation change when navigation happens before another tool result', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      // A non-tool wildcard event advanced the transport cursor; navigation is
+      // the first approvals lifecycle hook that observes that transition.
+      runtime.streamGeneration.value = 'generation-2'
+      runtime.sessionKey.value = 'agent:other:web'
+      await nextTick()
+
+      runtime.handlers.get('session.event.tool_result')?.({
+        session_key: 'agent:other:web',
+        epoch: runtime.currentEpoch.value,
+        stream_generation: 'generation-1',
+        stream_seq: 200,
+        tool_use_id: 'post-navigation-retired-request',
+        name: 'request_user_input',
+        result: { ...planClarifyResult, request_id: 'post-navigation-retired-request' },
+      })
+
+      expect(runtime.approvals.pendingClarify.value).toBeNull()
+      expect(runtime.interruptState.value.has('post-navigation-retired-request')).toBe(false)
+      expect(runtime.appendInterruptFrame).not.toHaveBeenCalled()
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
   it('hydrates a pending deferred request after reconnect', async () => {
     installSnapshot()
     const runtime = await harness()
@@ -485,7 +662,196 @@ describe('clarify tool-result recovery', () => {
     }
   })
 
-  it('releases a failed submit when reconnect says that request is no longer pending', async () => {
+  it('marks a request unavailable when an authoritative empty snapshot omits it', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      runtime.handlers.get('session.event.tool_result')?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: planClarifyResult,
+      })
+
+      runtime.approvals.applyUserInputBootstrap({ pendingUserInputs: [] })
+
+      expect(runtime.approvals.pendingClarify.value).toBeNull()
+      expect(runtime.interruptState.value.get('input-request-1')).toEqual({
+        resolution: 'unavailable',
+        busy: false,
+        error: '',
+      })
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('does not treat the broker snapshot as authoritative for a legacy Meta clarify', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      runtime.handlers.get('session.event.tool_result')?.({
+        session_key: 'agent:main:web',
+        stream_generation: runtime.streamGeneration.value,
+        stream_seq: 8,
+        tool_use_id: 'legacy-meta-clarify',
+        name: 'request_user_input',
+        result: {
+          ...planClarifyResult,
+          request_id: undefined,
+          run_id: 'meta-run-1',
+        },
+      })
+
+      runtime.approvals.applyUserInputBootstrap({
+        pendingUserInputs: [],
+        streamGeneration: runtime.streamGeneration.value,
+        goalSnapshotStreamSeq: 8,
+      })
+
+      expect(runtime.approvals.pendingClarify.value?.requestId).toBeUndefined()
+      expect(runtime.approvals.pendingClarify.value?.runId).toBe('meta-run-1')
+      expect(runtime.interruptState.value.get('meta-run-1|confirm_scope')?.resolution)
+        .toBeNull()
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('does not let an older session-read hydration erase a newer live request', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      runtime.handlers.get('session.event.tool_result')?.({
+        session_key: 'agent:main:web',
+        stream_seq: 8,
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: planClarifyResult,
+      })
+
+      const olderHydration = Object.freeze({
+        pendingUserInputs: Object.freeze([]),
+        goalSnapshotStreamSeq: 7,
+        deferredFields: Object.freeze([]),
+      }) satisfies Pick<
+        SessionReadMetadata,
+        'pendingUserInputs' | 'goalSnapshotStreamSeq' | 'deferredFields'
+      >
+      runtime.approvals.applyUserInputBootstrap(olderHydration)
+
+      expect(runtime.approvals.pendingClarify.value?.requestId).toBe('input-request-1')
+      expect(runtime.interruptState.value.get('input-request-1')?.resolution).toBeNull()
+
+      runtime.approvals.applyUserInputBootstrap(Object.freeze({
+        pendingUserInputs: Object.freeze([]),
+        goalSnapshotStreamSeq: 8,
+        deferredFields: Object.freeze([]),
+      }))
+      expect(runtime.approvals.pendingClarify.value).toBeNull()
+      expect(runtime.interruptState.value.get('input-request-1')?.resolution)
+        .toBe('unavailable')
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('does not compare request cursors across different transport generations', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      runtime.streamGeneration.value = 'generation-2'
+      runtime.handlers.get('session.event.tool_result')?.({
+        session_key: 'agent:main:web',
+        stream_generation: 'generation-2',
+        stream_seq: 2,
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: planClarifyResult,
+      })
+
+      runtime.approvals.applyUserInputBootstrap({
+        pendingUserInputs: [],
+        stream_generation: 'generation-1',
+        goalSnapshotStreamSeq: 200,
+      })
+
+      expect(runtime.approvals.pendingClarify.value?.requestId).toBe('input-request-1')
+      expect(runtime.interruptState.value.get('input-request-1')?.resolution).toBeNull()
+
+      runtime.approvals.applyUserInputBootstrap({
+        pendingUserInputs: [],
+        stream_generation: 'generation-2',
+        goalSnapshotStreamSeq: 2,
+      })
+      expect(runtime.approvals.pendingClarify.value).toBeNull()
+      expect(runtime.interruptState.value.get('input-request-1')?.resolution)
+        .toBe('unavailable')
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('lets a new transport generation reconcile requests left by the old one', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      runtime.handlers.get('session.event.tool_result')?.({
+        session_key: 'agent:main:web',
+        stream_generation: 'generation-1',
+        stream_seq: 100,
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: planClarifyResult,
+      })
+      runtime.streamGeneration.value = 'generation-2'
+
+      runtime.approvals.applyUserInputBootstrap({
+        pendingUserInputs: [],
+        stream_generation: 'generation-2',
+        goalSnapshotStreamSeq: 0,
+      })
+
+      expect(runtime.approvals.pendingClarify.value).toBeNull()
+      expect(runtime.interruptState.value.get('input-request-1')?.resolution)
+        .toBe('unavailable')
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('ignores the placeholder pending list while that hydration field is deferred', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      runtime.handlers.get('session.event.tool_result')?.({
+        session_key: 'agent:main:web',
+        stream_seq: 8,
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: planClarifyResult,
+      })
+
+      runtime.approvals.applyUserInputBootstrap({
+        pendingUserInputs: [],
+        goalSnapshotStreamSeq: null,
+        deferred_fields: ['pendingUserInputs', 'goalSnapshotStreamSeq'],
+      })
+
+      expect(runtime.approvals.pendingClarify.value?.requestId).toBe('input-request-1')
+      expect(runtime.interruptState.value.get('input-request-1')?.resolution).toBeNull()
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('marks a failed submit unavailable when reconnect says it is no longer pending', async () => {
     installSnapshot()
     const runtime = await harness()
     try {
@@ -508,7 +874,546 @@ describe('clarify tool-result recovery', () => {
       expect(runtime.approvals.clarifyBusy.value).toBe(false)
       expect(runtime.approvals.clarifyError.value).toBe('')
       expect(runtime.interruptState.value.get('input-request-1')).toEqual({
+        resolution: 'unavailable',
+        busy: false,
+        error: '',
+      })
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it.each([
+    'cancelled',
+    'timeout',
+    'failed',
+    'abandoned',
+    'interrupted',
+  ] as const)('unlocks a pending questionnaire when its task becomes %s', async (status) => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      runtime.handlers.get('session.event.tool_result')?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: planClarifyResult,
+      })
+
+      expect(runtime.approvals.settlePendingClarifyForTerminalTask(
+        'another-plan-run',
+        status,
+      )).toBe(false)
+      expect(runtime.approvals.pendingClarify.value?.requestId).toBe('input-request-1')
+      expect(runtime.approvals.settlePendingClarifyForTerminalTask(
+        'plan-run-1',
+        status,
+      )).toBe(true)
+
+      expect(runtime.approvals.pendingClarify.value).toBeNull()
+      expect(runtime.approvals.clarifyBusy.value).toBe(false)
+      expect(runtime.interruptState.value.get('input-request-1')).toEqual({
+        resolution: 'unavailable',
+        busy: false,
+        error: '',
+      })
+      expect(runtime.approvals.settlePendingClarifyForTerminalTask(
+        'plan-run-1',
+        status,
+      )).toBe(false)
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('settles every pending questionnaire owned by the terminal task', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      const handler = runtime.handlers.get('session.event.tool_result')
+      for (const requestId of ['input-request-1', 'input-request-2']) {
+        handler?.({
+          session_key: 'agent:main:web',
+          tool_use_id: requestId,
+          name: 'request_user_input',
+          result: {
+            ...planClarifyResult,
+            request_id: requestId,
+            step: `confirm_${requestId}`,
+          },
+        })
+      }
+
+      expect(runtime.approvals.pendingClarify.value?.requestId).toBe('input-request-2')
+      expect(runtime.approvals.settlePendingClarifyForTerminalTask(
+        'plan-run-1',
+        'cancelled',
+      )).toBe(true)
+
+      for (const requestId of ['input-request-1', 'input-request-2']) {
+        expect(runtime.interruptState.value.get(requestId)).toEqual({
+          resolution: 'unavailable',
+          busy: false,
+          error: '',
+        })
+      }
+      expect(runtime.approvals.pendingClarify.value).toBeNull()
+      expect(runtime.approvals.settlePendingClarifyForTerminalTask(
+        'plan-run-1',
+        'cancelled',
+      )).toBe(false)
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('rejects a previously unseen questionnaire delivered after its task terminated', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      expect(runtime.approvals.settlePendingClarifyForTerminalTask(
+        'plan-run-1',
+        'cancelled',
+      )).toBe(false)
+
+      runtime.handlers.get('session.event.tool_result')?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: planClarifyResult,
+      })
+
+      expect(runtime.approvals.pendingClarify.value).toBeNull()
+      expect(runtime.appendInterruptFrame).not.toHaveBeenCalled()
+      expect(runtime.interruptState.value.has('input-request-1')).toBe(false)
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('rejects a late positive pending-input hydrate after task termination', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      expect(runtime.approvals.settlePendingClarifyForTerminalTask(
+        'plan-run-1',
+        'failed',
+      )).toBe(false)
+
+      runtime.approvals.applyUserInputBootstrap({
+        pendingUserInputs: [planClarifyResult],
+        goalSnapshotStreamSeq: 7,
+      })
+
+      expect(runtime.approvals.pendingClarify.value).toBeNull()
+      expect(runtime.appendInterruptFrame).not.toHaveBeenCalled()
+      expect(runtime.interruptState.value.has('input-request-1')).toBe(false)
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('settles only questionnaires owned by the terminal task', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      const handler = runtime.handlers.get('session.event.tool_result')
+      handler?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: planClarifyResult,
+      })
+      handler?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-2',
+        name: 'request_user_input',
+        result: {
+          ...planClarifyResult,
+          request_id: 'input-request-2',
+          run_id: 'plan-run-2',
+        },
+      })
+
+      expect(runtime.approvals.settlePendingClarifyForTerminalTask(
+        'plan-run-1',
+        'timeout',
+      )).toBe(true)
+      expect(runtime.interruptState.value.get('input-request-1')?.resolution)
+        .toBe('unavailable')
+      expect(runtime.interruptState.value.get('input-request-2')?.resolution).toBeNull()
+      expect(runtime.approvals.pendingClarify.value).toEqual(expect.objectContaining({
+        requestId: 'input-request-2',
+        runId: 'plan-run-2',
+      }))
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('reconciles every known questionnaire against an authoritative snapshot', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      const handler = runtime.handlers.get('session.event.tool_result')
+      const secondRequest = {
+        ...planClarifyResult,
+        request_id: 'input-request-2',
+        run_id: 'plan-run-2',
+      }
+      handler?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: planClarifyResult,
+      })
+      handler?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-2',
+        name: 'request_user_input',
+        result: secondRequest,
+      })
+
+      runtime.approvals.applyUserInputBootstrap({
+        pendingUserInputs: [secondRequest],
+      })
+
+      expect(runtime.interruptState.value.get('input-request-1')?.resolution)
+        .toBe('unavailable')
+      expect(runtime.interruptState.value.get('input-request-2')?.resolution).toBeNull()
+      expect(runtime.approvals.pendingClarify.value?.requestId).toBe('input-request-2')
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('does not report replied before the clarify RPC acknowledgement', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    const submitted = deferred<unknown>()
+    try {
+      runtime.handlers.get('session.event.tool_result')?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: planClarifyResult,
+      })
+      runtime.rpcCall.mockImplementationOnce(async <T,>() => await submitted.promise as T)
+
+      const submission = runtime.approvals.submitClarify({ scope: 'focused' })
+      await vi.waitFor(() => expect(runtime.rpcCall).toHaveBeenCalledWith(
+        'chat.clarify_submit',
+        expect.objectContaining({ request_id: 'input-request-1' }),
+      ))
+
+      expect(runtime.approvals.pendingClarify.value?.requestId).toBe('input-request-1')
+      expect(runtime.approvals.clarifySubmitted.value).toBe(false)
+      expect(runtime.approvals.clarifyBusy.value).toBe(true)
+      expect(runtime.interruptState.value.get('input-request-1')).toEqual({
+        resolution: null,
+        busy: true,
+        error: '',
+      })
+
+      submitted.resolve({ resolved: true, request_id: 'input-request-1' })
+      await submission
+
+      expect(runtime.approvals.pendingClarify.value).toBeNull()
+      expect(runtime.interruptState.value.get('input-request-1')?.resolution).toBe('replied')
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('does not infer a reply from an empty snapshot before a late RPC rejection', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    const submitted = deferred<unknown>()
+    try {
+      runtime.handlers.get('session.event.tool_result')?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: planClarifyResult,
+      })
+      runtime.rpcCall.mockImplementationOnce(async <T,>() => await submitted.promise as T)
+
+      const submission = runtime.approvals.submitClarify({ scope: 'focused' })
+      await vi.waitFor(() => expect(runtime.rpcCall).toHaveBeenCalledWith(
+        'chat.clarify_submit',
+        expect.objectContaining({ request_id: 'input-request-1' }),
+      ))
+      runtime.approvals.applyUserInputBootstrap({ pendingUserInputs: [] })
+
+      expect(runtime.approvals.pendingClarify.value).toBeNull()
+      expect(runtime.interruptState.value.get('input-request-1')).toEqual({
+        resolution: 'unavailable',
+        busy: false,
+        error: '',
+      })
+
+      submitted.reject(new Error('late transport failure'))
+      await submission
+
+      expect(runtime.interruptState.value.get('input-request-1')).toEqual({
+        resolution: 'unavailable',
+        busy: false,
+        error: '',
+      })
+      expect(runtime.approvals.clarifyError.value).toBe('')
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('lets a late successful RPC acknowledgement upgrade an unavailable snapshot', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    const submitted = deferred<unknown>()
+    try {
+      runtime.handlers.get('session.event.tool_result')?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: planClarifyResult,
+      })
+      runtime.rpcCall.mockImplementationOnce(async <T,>() => await submitted.promise as T)
+
+      const submission = runtime.approvals.submitClarify({ scope: 'focused' })
+      await vi.waitFor(() => expect(runtime.rpcCall).toHaveBeenCalledTimes(1))
+      runtime.approvals.applyUserInputBootstrap({ pendingUserInputs: [] })
+      expect(runtime.interruptState.value.get('input-request-1')?.resolution)
+        .toBe('unavailable')
+
+      submitted.resolve({ resolved: true, request_id: 'input-request-1' })
+      await submission
+
+      expect(runtime.interruptState.value.get('input-request-1')).toEqual({
         resolution: 'replied',
+        busy: false,
+        error: '',
+      })
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('keeps an in-flight request busy across a duplicate paused replay', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    const submitted = deferred<unknown>()
+    try {
+      const handler = runtime.handlers.get('session.event.tool_result')
+      handler?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: planClarifyResult,
+      })
+      runtime.rpcCall.mockImplementationOnce(async <T,>() => await submitted.promise as T)
+      const submission = runtime.approvals.submitClarify({ scope: 'focused' })
+      await vi.waitFor(() => expect(runtime.rpcCall).toHaveBeenCalledTimes(1))
+
+      handler?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: planClarifyResult,
+      })
+      await runtime.approvals.submitClarify({ scope: 'complete' })
+
+      expect(runtime.rpcCall).toHaveBeenCalledTimes(1)
+      expect(runtime.approvals.clarifySubmitted.value).toBe(false)
+      expect(runtime.approvals.clarifyBusy.value).toBe(true)
+      expect(runtime.interruptState.value.get('input-request-1')).toEqual({
+        resolution: null,
+        busy: true,
+        error: '',
+      })
+
+      submitted.resolve({ resolved: true, request_id: 'input-request-1' })
+      await submission
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('restores the selected request busy state across a multi-request bootstrap', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    const submitted = deferred<unknown>()
+    const secondRequest = {
+      ...planClarifyResult,
+      request_id: 'input-request-2',
+      step: 'confirm_delivery',
+    }
+    try {
+      const handler = runtime.handlers.get('session.event.tool_result')
+      handler?.({
+        session_key: 'agent:main:web',
+        stream_seq: 4,
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: planClarifyResult,
+      })
+      handler?.({
+        session_key: 'agent:main:web',
+        stream_seq: 5,
+        tool_use_id: 'request-input-2',
+        name: 'request_user_input',
+        result: secondRequest,
+      })
+      runtime.rpcCall.mockImplementationOnce(async <T,>() => await submitted.promise as T)
+      const submission = runtime.approvals.submitClarify({ scope: 'focused' })
+      await vi.waitFor(() => expect(runtime.rpcCall).toHaveBeenCalledTimes(1))
+
+      runtime.approvals.applyUserInputBootstrap({
+        pendingUserInputs: [planClarifyResult, secondRequest],
+        goalSnapshotStreamSeq: 5,
+      })
+
+      expect(runtime.approvals.pendingClarify.value?.requestId).toBe('input-request-2')
+      expect(runtime.approvals.clarifyBusy.value).toBe(true)
+      expect(runtime.interruptState.value.get('input-request-2')).toEqual({
+        resolution: null,
+        busy: true,
+        error: '',
+      })
+
+      submitted.resolve({ resolved: true, request_id: 'input-request-2' })
+      await submission
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('allows a different request to submit while the docked request is busy', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    const submitted = deferred<unknown>()
+    try {
+      const handler = runtime.handlers.get('session.event.tool_result')
+      handler?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: planClarifyResult,
+      })
+      const firstRequest = { ...runtime.approvals.pendingClarify.value! }
+      handler?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-2',
+        name: 'request_user_input',
+        result: {
+          ...planClarifyResult,
+          request_id: 'input-request-2',
+          step: 'confirm_delivery',
+        },
+      })
+      runtime.rpcCall.mockImplementationOnce(async <T,>() => await submitted.promise as T)
+      const dockedSubmission = runtime.approvals.submitClarify({ scope: 'focused' })
+      await vi.waitFor(() => expect(runtime.rpcCall).toHaveBeenCalledTimes(1))
+
+      await runtime.approvals.submitClarify({ scope: 'complete' }, firstRequest)
+
+      expect(runtime.rpcCall).toHaveBeenCalledTimes(2)
+      expect(runtime.interruptState.value.get('input-request-1')?.resolution).toBe('replied')
+      expect(runtime.interruptState.value.get('input-request-2')?.busy).toBe(true)
+
+      submitted.resolve({ resolved: true, request_id: 'input-request-2' })
+      await dockedSubmission
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('deduplicates an in-flight recovered inline request by its interrupt state', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    const submitted = deferred<unknown>()
+    const recoveredRequest = {
+      intro: 'Recover this request.',
+      fields: [{
+        name: 'scope',
+        type: 'enum',
+        required: true,
+        prompt: 'Which scope?',
+        defaultValue: '',
+        choices: ['focused', 'complete'],
+      }],
+      requestId: 'recovered-request-1',
+      runId: 'recovered-task-1',
+      step: 'confirm_scope',
+    }
+    try {
+      runtime.rpcCall.mockImplementationOnce(async <T,>() => await submitted.promise as T)
+      const firstSubmit = runtime.approvals.submitClarify(
+        { scope: 'focused' },
+        recoveredRequest,
+      )
+      await vi.waitFor(() => expect(runtime.rpcCall).toHaveBeenCalledTimes(1))
+
+      await runtime.approvals.submitClarify(
+        { scope: 'complete' },
+        recoveredRequest,
+      )
+
+      expect(runtime.rpcCall).toHaveBeenCalledTimes(1)
+      expect(runtime.interruptState.value.get('recovered-request-1')).toEqual({
+        resolution: null,
+        busy: true,
+        error: '',
+      })
+
+      submitted.resolve({ resolved: true, request_id: 'recovered-request-1' })
+      await firstSubmit
+      expect(runtime.interruptState.value.get('recovered-request-1')?.resolution).toBe('replied')
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('does not reopen a terminal request when an in-flight RPC rejects late', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    const submitted = deferred<unknown>()
+    try {
+      runtime.handlers.get('session.event.tool_result')?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: planClarifyResult,
+      })
+      runtime.rpcCall.mockImplementationOnce(async <T,>() => await submitted.promise as T)
+      const submission = runtime.approvals.submitClarify({ scope: 'focused' })
+      await vi.waitFor(() => expect(runtime.rpcCall).toHaveBeenCalledTimes(1))
+
+      expect(runtime.approvals.settlePendingClarifyForTerminalTask(
+        'plan-run-1',
+        'timeout',
+      )).toBe(true)
+      submitted.reject(new Error('late transport failure'))
+      await submission
+
+      expect(runtime.approvals.pendingClarify.value).toBeNull()
+      expect(runtime.approvals.clarifyBusy.value).toBe(false)
+      expect(runtime.approvals.clarifyError.value).toBe('')
+      expect(runtime.interruptState.value.get('input-request-1')).toEqual({
+        resolution: 'unavailable',
         busy: false,
         error: '',
       })
@@ -575,6 +1480,71 @@ describe('clarify tool-result recovery', () => {
       expect(runtime.approvals.clarifySubmitted.value).toBe(false)
       expect(runtime.approvals.clarifyBusy.value).toBe(false)
       expect(runtime.approvals.clarifyError.value).toBe('')
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it.each(['cancelled', 'expired'] as const)(
+    'marks the matching card unavailable when the user-input outcome is %s',
+    async (status) => {
+      installSnapshot()
+      const runtime = await harness()
+      try {
+        const handler = runtime.handlers.get('session.event.tool_result')
+        handler?.({
+          session_key: 'agent:main:web',
+          tool_use_id: 'request-input-1',
+          name: 'request_user_input',
+          result: planClarifyResult,
+        })
+        handler?.({
+          session_key: 'agent:main:web',
+          tool_use_id: 'request-input-1',
+          name: 'request_user_input',
+          result: {
+            kind: 'user_input',
+            status,
+            paused: false,
+            request_id: 'input-request-1',
+          },
+        })
+
+        expect(runtime.interruptState.value.get('input-request-1')).toEqual({
+          resolution: 'unavailable',
+          busy: false,
+          error: '',
+        })
+        expect(runtime.approvals.pendingClarify.value).toBeNull()
+      } finally {
+        runtime.unsubscribe()
+        runtime.scope.stop()
+      }
+    },
+  )
+
+  it('keeps an acknowledged reply dominant over a later unavailable outcome replay', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      const handler = runtime.handlers.get('session.event.tool_result')
+      for (const status of ['answered', 'expired'] as const) {
+        handler?.({
+          session_key: 'agent:main:web',
+          tool_use_id: 'request-input-1',
+          name: 'request_user_input',
+          result: {
+            kind: 'user_input',
+            status,
+            paused: false,
+            request_id: 'input-request-1',
+            ...(status === 'answered' ? { answers: { scope: 'focused' } } : {}),
+          },
+        })
+      }
+
+      expect(runtime.interruptState.value.get('input-request-1')?.resolution).toBe('replied')
     } finally {
       runtime.unsubscribe()
       runtime.scope.stop()
@@ -693,42 +1663,85 @@ describe('clarify tool-result recovery', () => {
     }
   })
 
-  it('does not resurrect a settled request from a late paused-event replay', async () => {
+  it.each([
+    ['answered', 'replied'],
+    ['cancelled', 'unavailable'],
+    ['expired', 'unavailable'],
+  ] as const)(
+    'does not resurrect a %s request from a late paused-event replay',
+    async (status, resolution) => {
+      installSnapshot()
+      const runtime = await harness()
+      try {
+        const handler = runtime.handlers.get('session.event.tool_result')
+        handler?.({
+          session_key: 'agent:main:web',
+          tool_use_id: 'request-input-1',
+          name: 'request_user_input',
+          result: {
+            kind: 'user_input',
+            status,
+            paused: false,
+            request_id: 'input-request-1',
+            ...(status === 'answered' ? { answers: { scope: 'focused' } } : {}),
+          },
+        })
+        const appendCount = runtime.appendInterruptFrame.mock.calls.length
+
+        handler?.({
+          session_key: 'agent:main:web',
+          tool_use_id: 'request-input-1',
+          name: 'request_user_input',
+          result: planClarifyResult,
+        })
+
+        expect(runtime.approvals.pendingClarify.value).toBeNull()
+        expect(runtime.appendInterruptFrame).toHaveBeenCalledTimes(appendCount)
+        expect(runtime.interruptState.value.get('input-request-1')?.resolution).toBe(resolution)
+      } finally {
+        runtime.unsubscribe()
+        runtime.scope.stop()
+      }
+    },
+  )
+
+  it('does not retain a legacy receipt when its accepted task already terminated', async () => {
     installSnapshot()
     const runtime = await harness()
+    const submitted = deferred<unknown>()
     try {
-      const handler = runtime.handlers.get('session.event.tool_result')
-      handler?.({
+      runtime.handlers.get('session.event.tool_result')?.({
         session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+        tool_use_id: 'legacy-clarify',
         name: 'request_user_input',
         result: {
-          kind: 'user_input',
-          status: 'answered',
-          paused: false,
-          request_id: 'input-request-1',
-          answers: { scope: 'focused' },
+          ...clarifyResult,
+          request_id: undefined,
+          run_id: 'meta-run-1',
         },
       })
-      const appendCount = runtime.appendInterruptFrame.mock.calls.length
+      runtime.rpcCall.mockImplementationOnce(async <T,>() => await submitted.promise as T)
 
-      handler?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
-        name: 'request_user_input',
-        result: planClarifyResult,
-      })
+      const submission = runtime.approvals.submitClarify({ scope: 'focused' })
+      await vi.waitFor(() => expect(runtime.rpcCall).toHaveBeenCalledTimes(1))
+      expect(runtime.approvals.settlePendingClarifyForTerminalTask(
+        'accepted-continuation-task',
+        'succeeded',
+      )).toBe(false)
+
+      submitted.resolve({ task_id: 'accepted-continuation-task' })
+      await submission
 
       expect(runtime.approvals.pendingClarify.value).toBeNull()
-      expect(runtime.appendInterruptFrame).toHaveBeenCalledTimes(appendCount)
-      expect(runtime.interruptState.value.get('input-request-1')?.resolution).toBe('replied')
+      expect(runtime.interruptState.value.get('meta-run-1|confirm_scope')?.resolution)
+        .toBe('replied')
     } finally {
       runtime.unsubscribe()
       runtime.scope.stop()
     }
   })
 
-  it('retains the legacy cross-turn clarify receipt after a successful send acknowledgement', async () => {
+  it('retains a legacy clarify receipt until its accepted task terminates', async () => {
     installSnapshot()
     const runtime = await harness()
     try {
@@ -742,6 +1755,7 @@ describe('clarify tool-result recovery', () => {
         },
       })
 
+      runtime.rpcCall.mockResolvedValueOnce({ task_id: 'accepted-continuation-task' })
       await runtime.approvals.submitClarify({ scope: 'focused' })
 
       expect(runtime.rpcCall).toHaveBeenLastCalledWith('chat.clarify_submit', {
@@ -752,6 +1766,52 @@ describe('clarify tool-result recovery', () => {
       expect(runtime.approvals.pendingClarify.value?.requestId).toBeUndefined()
       expect(runtime.approvals.clarifySubmitted.value).toBe(true)
       expect(runtime.approvals.clarifyBusy.value).toBe(false)
+      expect(runtime.approvals.settlePendingClarifyForTerminalTask(
+        'plan-run-1',
+        'timeout',
+      )).toBe(false)
+      expect(runtime.approvals.pendingClarify.value).not.toBeNull()
+      expect(runtime.approvals.settlePendingClarifyForTerminalTask(
+        'accepted-continuation-task',
+        'succeeded',
+      )).toBe(true)
+      expect(runtime.approvals.pendingClarify.value).toBeNull()
+      expect(runtime.interruptState.value.get('plan-run-1|confirm_scope')?.resolution)
+        .toBe('replied')
+      expect(runtime.approvals.settlePendingClarifyForTerminalTask(
+        'accepted-continuation-task',
+        'succeeded',
+      )).toBe(false)
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('uses the direct-mode turn id as the retained legacy owner', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      runtime.handlers.get('session.event.tool_result')?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'legacy-clarify',
+        name: 'request_user_input',
+        result: {
+          ...clarifyResult,
+          request_id: undefined,
+          run_id: 'meta-run-direct',
+        },
+      })
+      runtime.rpcCall.mockResolvedValueOnce({ turn_id: 'direct-continuation-turn' })
+
+      await runtime.approvals.submitClarify({ scope: 'focused' })
+
+      expect(runtime.approvals.pendingClarify.value).not.toBeNull()
+      expect(runtime.approvals.settlePendingClarifyForTerminalTask(
+        'direct-continuation-turn',
+        'succeeded',
+      )).toBe(true)
+      expect(runtime.approvals.pendingClarify.value).toBeNull()
     } finally {
       runtime.unsubscribe()
       runtime.scope.stop()

@@ -764,7 +764,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     for (const raw of data.turnOutcomes) {
       const outcome = normalizeTurnOutcome(turnOutcomeRecord(raw))
       if (
-        outcome?.taskId
+        (outcome?.taskId || outcome?.turnId)
         && ['succeeded', 'failed', 'cancelled', 'timeout', 'abandoned', 'interrupted']
           .includes(outcome.status.toLowerCase())
       ) {

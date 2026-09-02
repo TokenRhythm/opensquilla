@@ -62,7 +62,10 @@ export interface UseChatSessionSubscriptionOptions {
   ) => void
   onSessionMetadataError?: (key: string, generation: number) => void
   onSessionMissing?: (key: string) => void
-  onSnapshot?: (snapshot: SessionReadMetadata) => void
+  onSnapshot?: (
+    snapshot: SessionReadMetadata,
+    streamGeneration: string | null,
+  ) => void
 }
 
 export interface SessionMetadataRetryOptions {
@@ -202,6 +205,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     metadataGeneration: number | undefined,
     metadata: SessionReadMetadata,
     activity: SessionReadActivity = 'unknown',
+    snapshotStreamGeneration: string | null = null,
   ): SessionSubscriptionOutcome {
     if (metadataGeneration !== undefined) {
       options.onSessionMetadata?.(key, metadataGeneration, metadata)
@@ -218,7 +222,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       ? { ...metadata, runStatus: 'idle', activeTask: null }
       : metadata
     const effectiveSource = metadataRunStatusSource(effectiveMetadata)
-    options.onSnapshot?.(effectiveMetadata)
+    options.onSnapshot?.(effectiveMetadata, snapshotStreamGeneration)
     options.taskOwnership?.applySnapshot(effectiveSource, true)
     // Do not clear an acceptance-result-unknown Stop from an idle snapshot.
     // The subscription can race ahead of the original ingress commit, so only
@@ -324,6 +328,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     metadataHydration: number,
     metadataGeneration: number | undefined,
     activity: SessionReadActivity,
+    snapshotStreamGeneration: string | null,
     signal: AbortSignal,
   ): void {
     void lease.metadata.then((metadata) => {
@@ -334,7 +339,13 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       if (!metadata.hydrationComplete) {
         throw new Error('Session state hydration remained incomplete')
       }
-      applyHydratedSubscriptionState(key, metadataGeneration, metadata, activity)
+      applyHydratedSubscriptionState(
+        key,
+        metadataGeneration,
+        metadata,
+        activity,
+        snapshotStreamGeneration,
+      )
     }).catch((cause) => {
       if (
         !isCurrentSubscription(lease, key, sequence, signal)
@@ -368,6 +379,15 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       if (!isCurrentSubscription(lease, key, sequence, signal)) {
         return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
       }
+      if (live.streamGeneration) {
+        observeStreamGeneration({
+          sessionKey: key,
+          streamGeneration: live.streamGeneration,
+          ...(live.reloadRequired === 'generationChanged'
+            ? { replayGapReason: 'stream_generation_changed' }
+            : {}),
+        })
+      }
       let snapshotTaskLive = false
       const snapshot = live.snapshot
       if (snapshot?.sessionKey === key) {
@@ -379,7 +399,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         snapshotTaskLive = Boolean(snapshotTaskId) && !settledSnapshot
       }
       if (live.reloadRequired) {
-        if (live.reloadRequired === 'generationChanged') {
+        if (live.reloadRequired === 'generationChanged' && !live.streamGeneration) {
           syncCursor(conversationRuntime.reset(cursor()))
           options.resetStreamLiveTurnState()
         }
@@ -391,6 +411,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
           metadataGeneration,
           live.initialMetadata,
           live.activity,
+          live.streamGeneration,
         )
       }
       if (options.ownershipHydrationRequired?.() !== false) {
@@ -406,6 +427,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         metadataHydration,
         metadataGeneration,
         live.activity,
+        live.streamGeneration,
         signal,
       )
       // Fast ACK is authoritative for delivery registration. Deferred storage
@@ -482,16 +504,34 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     )
 
     try {
-      const hydration = await waitForMetadataRetry(
-        lease.retryMetadata(),
-        controller.signal,
-        timeoutMs,
-      )
+      const [hydration, live] = await Promise.all([
+        waitForMetadataRetry(
+          lease.retryMetadata(),
+          controller.signal,
+          timeoutMs,
+        ),
+        lease.live,
+      ])
       if (!isCurrent()) return false
+      if (live.streamGeneration) {
+        observeStreamGeneration({
+          sessionKey: key,
+          streamGeneration: live.streamGeneration,
+          ...(live.reloadRequired === 'generationChanged'
+            ? { replayGapReason: 'stream_generation_changed' }
+            : {}),
+        })
+      }
       if (!hydration.hydrationComplete) {
         throw new Error('Session state hydration remained incomplete')
       }
-      applyHydratedSubscriptionState(key, metadataGeneration, hydration)
+      applyHydratedSubscriptionState(
+        key,
+        metadataGeneration,
+        hydration,
+        'unknown',
+        live.streamGeneration,
+      )
       return true
     } catch (cause) {
       if (isCurrent() && metadataGeneration !== undefined) {

@@ -66,6 +66,8 @@ export interface SessionReadLive {
   readonly sessionKey: string
   readonly activity: SessionReadActivity
   readonly activeTaskId: string | null
+  /** Exact stream namespace shared by this lease's metadata reads. */
+  readonly streamGeneration: string | null
   /** Fast-ACK metadata may be incomplete. Await `lease.metadata` for hydration. */
   readonly initialMetadata: SessionReadMetadata
   readonly snapshot: SessionReadSnapshot | null
@@ -218,7 +220,10 @@ export interface SessionReadPortOpenRequest {
   readonly signal: AbortSignal
 }
 
-export interface SessionReadPortLive extends Omit<SessionReadLive, 'reloadRequired'> {
+export interface SessionReadPortLive extends Omit<
+  SessionReadLive,
+  'reloadRequired' | 'streamGeneration'
+> {
   readonly cursor: ConversationCursorSignal
   readonly snapshotCursor: ConversationCursorSignal | null
 }
@@ -460,6 +465,7 @@ export function createSessionReadLifecycle(
         sessionKey: value.sessionKey,
         activity: value.activity,
         activeTaskId: value.activeTaskId,
+        streamGeneration: state.cursor.streamGeneration,
         initialMetadata: value.initialMetadata,
         snapshot: value.snapshot,
         reloadRequired: replay.requiresHistory

@@ -787,6 +787,8 @@ describe('PlanRunRibbon', () => {
     expect(chatViewSource).toContain('@stop="onComposerStop"')
     expect(chatViewSource).toContain('@focus-return="focusComposerAfterPlanRun"')
     expect(chatViewSource).toContain(':stop-targets-plan-run="composerStopsPlanRun"')
+    expect(chatViewSource).toContain('planRunSettlementPending.value')
+    expect(chatViewSource).toContain('planActionPending !== null || planRunSettlementPending')
     expect(chatViewSource).toContain("activePlanRun.value?.status === 'queued'")
     expect(chatViewSource).toContain("activePlanRun.value?.status === 'running'")
   })

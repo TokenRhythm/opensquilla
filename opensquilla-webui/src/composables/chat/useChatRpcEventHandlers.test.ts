@@ -37,6 +37,7 @@ function createHarness(options: {
   getCompactionPlacement?: (compactionId: string) => 'activity' | 'standalone' | undefined
   observeStreamGeneration?: (payload: unknown) => boolean
   supportsTurnCommitted?: boolean
+  onTaskTerminal?: (taskId: string, status: string) => void
 } = {}) {
   const messages = ref<ChatMessage[]>(options.messages ?? [])
   const sessionKey = ref('agent:main:test')
@@ -90,6 +91,7 @@ function createHarness(options: {
   const loadCurrentSessionUsage = vi.fn(options.loadCurrentSessionUsage ?? (() => {}))
   const refreshRunModePreference = vi.fn(options.refreshRunModePreference ?? (() => {}))
   const restoreSteerIntoComposer = vi.fn(options.restoreSteerIntoComposer ?? (() => {}))
+  const onTaskTerminal = vi.fn(options.onTaskTerminal ?? (() => {}))
   const scope = effectScope()
   const rawApi = scope.run(() => useChatRpcEventHandlers({
     sessionKey,
@@ -137,6 +139,7 @@ function createHarness(options: {
     handleSessionConnectionState,
     loadCurrentSessionUsage,
     refreshRunModePreference,
+    onTaskTerminal,
   }))!
   const api = {
     ...rawApi,
@@ -172,6 +175,7 @@ function createHarness(options: {
     loadCurrentSessionUsage,
     refreshRunModePreference,
     restoreSteerIntoComposer,
+    onTaskTerminal,
     stop: () => scope.stop(),
   }
 }
@@ -1808,6 +1812,142 @@ describe('useChatRpcEventHandlers task group lifecycle', () => {
 
       expect(activeTaskGroups.value.size).toBe(0)
       expect(stream.endStreaming).toHaveBeenCalled()
+    } finally {
+      stop()
+    }
+  })
+
+  it.each([
+    ['task.succeeded', 'succeeded', {}],
+    ['task.cancelled', 'cancelled', {}],
+    ['task.timeout', 'timeout', {}],
+    ['task.failed', 'failed', {}],
+    ['task.abandoned', 'abandoned', {}],
+    ['session.event.error', 'failed', {}],
+    ['session.event.done', 'cancelled', { reason: 'aborted' }],
+    ['session.event.error', 'cancelled', { status: 'killed' }],
+    ['session.event.error', 'timeout', { status: 'timed_out' }],
+  ])(
+    'passes the authoritative %s settlement to terminal presentation owners',
+    (event, expectedStatus, extra) => {
+      const { api, onTaskTerminal, stop } = createHarness()
+      try {
+        api.bindActiveStreamTask('task-terminal-1')
+        api.handlers.onWireEventFixture(event, {
+          session_key: 'agent:main:test',
+          task_id: 'task-terminal-1',
+          stream_seq: 1,
+          generation_epoch: 0,
+          ...extra,
+        })
+
+        expect(onTaskTerminal).toHaveBeenCalledWith('task-terminal-1', expectedStatus)
+      } finally {
+        stop()
+      }
+    },
+  )
+
+  it('uses a direct turn id to settle presentation without TaskRuntime', () => {
+    const { api, onTaskTerminal, stop } = createHarness()
+    try {
+      api.handlers.onWireEventFixture('session.event.done', {
+        session_key: 'agent:main:test',
+        turn_id: 'direct-turn-1',
+        stream_seq: 1,
+        generation_epoch: 0,
+      })
+
+      expect(onTaskTerminal).toHaveBeenCalledWith('direct-turn-1', 'succeeded')
+    } finally {
+      stop()
+    }
+  })
+
+  it('passes interrupted terminal state from the authoritative session projection', () => {
+    const { api, onTaskTerminal, stop } = createHarness()
+    try {
+      api.handlers.onSessionsChanged({
+        session_key: 'agent:main:test',
+        reason: 'task_terminal',
+        run_status: 'interrupted',
+        last_task: { task_id: 'task-interrupted-1', status: 'interrupted' },
+      })
+
+      expect(onTaskTerminal).toHaveBeenCalledWith('task-interrupted-1', 'interrupted')
+    } finally {
+      stop()
+    }
+  })
+
+  it('passes succeeded terminal state from the authoritative session projection', () => {
+    const { api, onTaskTerminal, stop } = createHarness()
+    try {
+      api.handlers.onSessionsChanged({
+        session_key: 'agent:main:test',
+        reason: 'task_terminal',
+        run_status: 'idle',
+        last_task: { task_id: 'task-succeeded-1', status: 'succeeded' },
+      })
+
+      expect(onTaskTerminal).toHaveBeenCalledWith('task-succeeded-1', 'succeeded')
+    } finally {
+      stop()
+    }
+  })
+
+  it('passes a terminal to its domain owner before rejecting a different render owner', () => {
+    const { api, onTaskTerminal, stop } = createHarness()
+    try {
+      api.bindActiveStreamTask('task-rendered')
+      api.handlers.onWireEventFixture('task.timeout', {
+        session_key: 'agent:main:test',
+        task_id: 'task-plan-owner',
+        stream_seq: 1,
+        generation_epoch: 0,
+      })
+
+      expect(onTaskTerminal).toHaveBeenCalledWith('task-plan-owner', 'timeout')
+    } finally {
+      stop()
+    }
+  })
+
+  it('passes a terminal to its domain owner before buffering pending task acceptance', () => {
+    const { api, onTaskTerminal, stop } = createHarness()
+    try {
+      api.bindActiveStreamTask(PENDING_STREAM_TASK_ID)
+      api.handlers.onWireEventFixture('task.timeout', {
+        session_key: 'agent:main:test',
+        task_id: 'task-pending-acceptance',
+        stream_seq: 1,
+        generation_epoch: 0,
+      })
+
+      expect(onTaskTerminal).toHaveBeenCalledWith('task-pending-acceptance', 'timeout')
+    } finally {
+      stop()
+    }
+  })
+
+  it('rejects foreign-session and stale-epoch terminal settlements', () => {
+    const { api, onTaskTerminal, stop } = createHarness()
+    try {
+      api.handlers.onWireEventFixture('task.failed', {
+        session_key: 'agent:other:test',
+        task_id: 'task-foreign',
+        stream_seq: 1,
+        generation_epoch: 0,
+      })
+      api.handlers.onWireEventFixture('task.timeout', {
+        session_key: 'agent:main:test',
+        task_id: 'task-stale',
+        epoch: -1,
+        stream_seq: 2,
+        generation_epoch: 0,
+      })
+
+      expect(onTaskTerminal).not.toHaveBeenCalled()
     } finally {
       stop()
     }

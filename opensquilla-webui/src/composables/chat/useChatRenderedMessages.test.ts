@@ -2803,6 +2803,192 @@ describe('useChatRenderedMessages clarify history recovery', () => {
     expect(clarify?.clarify?.presentation).toBe('plan_questionnaire_v1')
   })
 
+  it.each(['cancelled', 'expired'] as const)(
+    'restores a %s request as unavailable from its preserved request payload',
+    (status) => {
+      const api = renderedMessagesFor([
+        {
+          role: 'assistant',
+          text: '',
+          ts: 0,
+          messageId: `m-terminal-${status}-request-user-input`,
+          tool_calls: [
+            {
+              type: 'tool_result',
+              tool_use_id: `request-input-${status}`,
+              name: 'request_user_input',
+              user_input_request: {
+                status: 'input_required',
+                kind: 'user_input',
+                paused: true,
+                request_id: `request-${status}-1`,
+                run_id: 'plan-run-2',
+                step: 'choose_target',
+                clarify_schema: {
+                  mode: 'form',
+                  presentation: 'plan_questionnaire_v1',
+                  fields: [{
+                    name: 'target',
+                    type: 'enum',
+                    required: true,
+                    choices: ['current', 'new'],
+                  }],
+                },
+              },
+              result: JSON.stringify({
+                status,
+                kind: 'user_input',
+                paused: false,
+                request_id: `request-${status}-1`,
+              }),
+            },
+          ],
+        },
+      ])
+
+      const [message] = api.renderedMessages.value
+      const clarify = message.parts?.find((part): part is ChatPart & {
+        type: 'interrupt'
+        interruptKind: 'clarify'
+      } => part.type === 'interrupt' && part.interruptKind === 'clarify')
+
+      expect(clarify?.resolution).toBe('unavailable')
+      expect(clarify?.clarify?.requestId).toBe(`request-${status}-1`)
+    },
+  )
+
+  it('keeps an answered historical request replied after a later expiry replay', () => {
+    const request = {
+      status: 'input_required',
+      kind: 'user_input',
+      paused: true,
+      request_id: 'request-terminal-replay',
+      run_id: 'plan-run-2',
+      step: 'choose_target',
+      clarify_schema: {
+        fields: [{ name: 'target', type: 'string' }],
+      },
+    }
+    const outcome = (status: 'answered' | 'expired') => ({
+      status,
+      kind: 'user_input',
+      paused: false,
+      request_id: 'request-terminal-replay',
+    })
+    const api = renderedMessagesFor([{
+      role: 'assistant',
+      text: '',
+      ts: 0,
+      messageId: 'm-terminal-replay',
+      tool_calls: [
+        {
+          type: 'tool_result',
+          tool_use_id: 'request-input-terminal-replay',
+          name: 'request_user_input',
+          user_input_request: request,
+          result: outcome('answered'),
+        },
+        {
+          type: 'tool_result',
+          tool_use_id: 'request-input-terminal-replay',
+          name: 'request_user_input',
+          result: outcome('expired'),
+        },
+      ],
+    }])
+
+    const clarify = api.renderedMessages.value[0].parts?.find((part): part is ChatPart & {
+      type: 'interrupt'
+      interruptKind: 'clarify'
+    } => part.type === 'interrupt' && part.interruptKind === 'clarify')
+    expect(clarify?.resolution).toBe('replied')
+  })
+
+  it('expires only the unresolved historical clarify owned by an abnormal terminal task', () => {
+    const request = (requestId: string, runId: string) => ({
+      status: 'input_required',
+      kind: 'user_input',
+      paused: true,
+      request_id: requestId,
+      run_id: runId,
+      step: 'choose_target',
+      clarify_schema: {
+        fields: [{ name: 'target', type: 'string' }],
+      },
+    })
+    const api = renderedMessagesFor([{
+      role: 'assistant',
+      text: '',
+      ts: 0,
+      messageId: 'm-terminal-history',
+      turnId: 'task-terminal-history',
+      restoredFromHistory: true,
+      turnOutcome: {
+        turnId: 'task-terminal-history',
+        taskId: 'task-terminal-history',
+        status: 'timeout',
+      },
+      tool_calls: [
+        {
+          type: 'tool_result',
+          tool_use_id: 'request-terminal-owner',
+          result: request('request-terminal-owner', 'task-terminal-history'),
+        },
+        {
+          type: 'tool_result',
+          tool_use_id: 'request-other-owner',
+          result: request('request-other-owner', 'task-other'),
+        },
+      ],
+    }])
+
+    const clarifies = api.renderedMessages.value[0].parts
+      ?.filter((part): part is ChatPart & {
+        type: 'interrupt'
+        interruptKind: 'clarify'
+      } => part.type === 'interrupt' && part.interruptKind === 'clarify')
+    expect(clarifies?.find(part => part.clarify?.requestId === 'request-terminal-owner')
+      ?.resolution).toBe('unavailable')
+    expect(clarifies?.find(part => part.clarify?.requestId === 'request-other-owner')
+      ?.resolution).toBeNull()
+  })
+
+  it('expires an abnormal direct-turn clarify when history has no task id', () => {
+    const api = renderedMessagesFor([{
+      role: 'assistant',
+      text: '',
+      ts: 0,
+      messageId: 'm-direct-terminal-history',
+      turnId: 'direct-terminal-turn',
+      restoredFromHistory: true,
+      turnOutcome: {
+        turnId: 'direct-terminal-turn',
+        status: 'timeout',
+      },
+      tool_calls: [{
+        type: 'tool_result',
+        tool_use_id: 'request-direct-terminal',
+        result: {
+          status: 'input_required',
+          kind: 'user_input',
+          paused: true,
+          request_id: 'request-direct-terminal',
+          run_id: 'direct-terminal-turn',
+          step: 'choose_target',
+          clarify_schema: {
+            fields: [{ name: 'target', type: 'string' }],
+          },
+        },
+      }],
+    }])
+
+    const clarify = api.renderedMessages.value[0].parts?.find((part): part is ChatPart & {
+      type: 'interrupt'
+      interruptKind: 'clarify'
+    } => part.type === 'interrupt' && part.interruptKind === 'clarify')
+    expect(clarify?.resolution).toBe('unavailable')
+  })
+
   it('keeps consecutive requests distinct by requestId', () => {
     const request = (requestId: string) => ({
       status: 'input_required',

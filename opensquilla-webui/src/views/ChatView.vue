@@ -551,7 +551,7 @@
         <PlanRunRibbon
           :run="executionDockRun"
           :cancel-busy="planActionPending === 'cancel-run'"
-          :disabled="planModeBusy || planActionPending !== null"
+          :disabled="planModeBusy || planActionPending !== null || planRunSettlementPending"
           @cancel="cancelActivePlanRun"
           @focus-return="focusComposerAfterPlanRun"
         />
@@ -1094,6 +1094,8 @@ import {
   FINISHED_STREAM_TASK_ID,
   PENDING_STREAM_TASK_ID,
   STOPPED_STREAM_TASK_ID,
+  taskTerminalStatusFromValue,
+  type TaskTerminalStatus,
 } from '@/utils/chat/streamEvents'
 import { copyTextWithFallback, copyImageToClipboard, downloadBlob, shareCopyImageSupported } from '@/utils/browser'
 import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
@@ -2287,6 +2289,7 @@ const {
   currentPlan,
   currentPlanRevisionId,
   activePlanRun,
+  planRunSettlementPending,
   modeBusy: planModeBusy,
   modeAppliesNextTurn: planModeAppliesNextTurn,
   pendingAction: planActionPending,
@@ -2358,8 +2361,10 @@ const chatHistory = useChatHistory({
   stripTimePrefix,
   scrollToBottom,
   onTerminalTask: outcome => {
-    const taskId = outcome.taskId || ''
+    const taskId = outcome.taskId || outcome.turnId || ''
     if (!taskId) return
+    const terminalStatus = taskTerminalStatusFromValue(outcome.status)
+    if (terminalStatus) settleTaskTerminalPresentation(taskId, terminalStatus)
     taskOwnership.noteTerminal(taskId)
     const ownsLiveStream = activeStreamTaskId.value === taskId
     const ownsRunStatus = chatTaskId(runStatus.value.task) === taskId
@@ -2578,7 +2583,21 @@ async function handleRegenerateMessage(
   settle?.(accepted)
 }
 
-let applyPendingUserInputSnapshot: (snapshot: SessionReadMetadata) => void = () => {}
+function terminalTaskFromRunState(source: SessionReadMetadata) {
+  const task = source.lastTask || source.activeTask
+  const taskId = chatTaskId(task)
+  const status = taskTerminalStatusFromValue(task?.status)
+  return taskId && status ? { taskId, status } : null
+}
+
+let settleTaskTerminalPresentation: (
+  taskId: string,
+  status: TaskTerminalStatus,
+) => void = () => {}
+let applyPendingUserInputSnapshot: (
+  snapshot: SessionReadMetadata,
+  streamGeneration: string | null,
+) => void = () => {}
 let applyGoalSnapshot: (snapshot: SessionReadMetadata) => void = () => {}
 const chatSessionSubscription = useChatSessionSubscription({
   sessionReadLeaseReader: sessionReadLifecycle,
@@ -2638,11 +2657,15 @@ const chatSessionSubscription = useChatSessionSubscription({
     activeProjectWorkspace.failSessionResolution(key, generation)
   },
   onSessionMissing: markSessionMissing,
-  onSnapshot: snapshot => {
+  onSnapshot: (snapshot, snapshotStreamGeneration) => {
+    const terminalTask = terminalTaskFromRunState(snapshot)
     chatSessionRouting.applyBootstrap(snapshot)
     chatPlans.applyBootstrap(snapshot)
     applyGoalSnapshot(snapshot)
-    applyPendingUserInputSnapshot(snapshot)
+    applyPendingUserInputSnapshot(snapshot, snapshotStreamGeneration)
+    if (terminalTask) {
+      settleTaskTerminalPresentation(terminalTask.taskId, terminalTask.status)
+    }
   },
 })
 const {
@@ -3747,6 +3770,9 @@ const chatApprovals = useChatApprovals({
   sessionConversation,
   approvalCenter,
   sessionKey,
+  currentEpoch,
+  streamGeneration,
+  observeStreamGeneration,
   runStatus,
   stream: { isStreaming, appendInterruptFrame, ensureInterruptBubble },
   interruptState,
@@ -3764,11 +3790,19 @@ const {
   extendInterrupt,
   submitClarify,
   dismissClarify,
+  settlePendingClarifyForTerminalTask,
   applyUserInputBootstrap,
 } = chatApprovals
-applyPendingUserInputSnapshot = snapshot => applyUserInputBootstrap({
-  pendingUserInputs: [...snapshot.pendingUserInputs],
+applyPendingUserInputSnapshot = (snapshot, snapshotStreamGeneration) => applyUserInputBootstrap({
+  ...snapshot,
+  ...(snapshotStreamGeneration ? { streamGeneration: snapshotStreamGeneration } : {}),
 })
+settleTaskTerminalPresentation = (taskId, status) => {
+  if (status !== 'succeeded') {
+    chatPlans.settleActiveRunForTerminalTask(taskId, status)
+  }
+  settlePendingClarifyForTerminalTask(taskId, status)
+}
 
 const dockedPlanQuestionnaire = computed(() => (
   pendingClarify.value?.presentation === 'plan_questionnaire_v1'
@@ -3895,6 +3929,9 @@ const rpcEventHandlers = useChatRpcEventHandlers({
     handleSessionConnectionState(state, !isDraftRoute()),
   loadCurrentSessionUsage,
   refreshRunModePreference: refreshPostBootstrapMetadata,
+  onTaskTerminal: (taskId, status) => {
+    settleTaskTerminalPresentation(taskId, status)
+  },
 })
 bindActiveStreamTask = rpcEventHandlers.bindActiveStreamTask
 restoreLiveTurnSnapshot = rpcEventHandlers.restoreLiveTurnSnapshot
@@ -4477,6 +4514,7 @@ const planCardPendingAction = computed<PlanCardAction | null>(() => {
 const planActionsDisabled = computed(() =>
   isStreaming.value
   || planModeBusy.value
+  || planRunSettlementPending.value
   || Boolean(liveSendBlockedReason.value)
   || planActionPending.value !== null
   || activePlanRun.value?.status === 'queued'

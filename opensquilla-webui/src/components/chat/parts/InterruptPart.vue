@@ -12,7 +12,11 @@
     @extend="emit('extend', part.approval.approvalId)"
   />
   <ClarifyCard
-    v-else-if="part.interruptKind === 'clarify' && part.clarify"
+    v-else-if="
+      part.interruptKind === 'clarify'
+      && part.clarify
+      && (part.resolution == null || part.resolution === 'replied')
+    "
     :request="part.clarify"
     :submitted="part.resolution === 'replied'"
     :busy="part.busy"

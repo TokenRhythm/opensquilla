@@ -178,6 +178,7 @@ function planPart(): Extract<ChatPart, { type: 'plan' }> {
 
 function clarifyPart(
   presentation?: string,
+  resolution: Extract<ChatPart, { type: 'interrupt' }>['resolution'] = 'replied',
 ): Extract<ChatPart, { type: 'interrupt' }> {
   return {
     type: 'interrupt',
@@ -198,7 +199,7 @@ function clarifyPart(
       runId: 'plan-run-1',
       step: 'confirm_scope',
     },
-    resolution: 'replied',
+    resolution,
     busy: false,
     error: '',
   }
@@ -978,6 +979,21 @@ describe('AssistantMessage activity disclosure', () => {
     expect(el.querySelector('.plan-card')).not.toBeNull()
     expect(el.querySelector('.clarify-outcome')).not.toBeNull()
     expect(el.querySelector('.clarify-outcome--plan')).toBeNull()
+  })
+
+  it('does not render an unavailable questionnaire as an action or success receipt', async () => {
+    const unavailable = clarifyPart('plan_questionnaire_v1', 'unavailable')
+    const el = mountMessage(baseMessage({
+      text: '',
+      timelineItems: [approvalTimelineItem(unavailable)],
+      parts: [unavailable, planPart()],
+      statusHistory: [],
+    }))
+    await nextTick()
+
+    expect(el.querySelector('.plan-card')).not.toBeNull()
+    expect(el.querySelector('.clarify-card')).toBeNull()
+    expect(el.querySelector('.clarify-outcome')).toBeNull()
   })
 
   it('keeps intermediate candidate narration inside activity and the final answer outside once', async () => {
