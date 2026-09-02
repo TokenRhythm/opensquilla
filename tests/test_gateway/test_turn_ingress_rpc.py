@@ -223,8 +223,18 @@ async def test_missing_canonical_cron_new_chat_rejects_without_durable_side_effe
 
 
 @pytest.mark.asyncio
-async def test_chat_send_cron_rejection_preserves_running_turn_compaction_marker(
+@pytest.mark.parametrize(
+    ("request_overrides", "expected_code"),
+    [
+        ({}, "SESSION_NOT_INTERACTIVE"),
+        ({"intent": "bogus"}, "INVALID_REQUEST"),
+    ],
+    ids=["cron-policy-rejection", "early-intent-validation"],
+)
+async def test_chat_send_cron_pre_admission_failures_preserve_running_turn_marker(
     tmp_path: Path,
+    request_overrides: dict[str, object],
+    expected_code: str,
 ) -> None:
     session_key = "legacy-scheduled-run"
 
@@ -266,14 +276,18 @@ async def test_chat_send_cron_rejection_preserves_running_turn_compaction_marker
                 "sessionKey": session_key,
                 "message": "must not disturb the running Cron turn",
                 "clientRequestId": "chat-send-cron-marker",
+                **request_overrides,
             },
             stack.context,
         )
 
         assert response.error is not None
-        assert response.error.code == "SESSION_NOT_INTERACTIVE"
-        assert response.error.accepted is False
-        assert response.error.retryable is False
+        assert response.error.code == expected_code
+        if expected_code == "SESSION_NOT_INTERACTIVE":
+            assert response.error.accepted is False
+            assert response.error.retryable is False
+        else:
+            assert "Invalid session intent" in response.error.message
         assert marker.marked == {session_key}
         assert marker.clear_calls == []
         assert _table_counts(stack.db_path) == {
