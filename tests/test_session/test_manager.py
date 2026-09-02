@@ -4071,6 +4071,58 @@ async def test_canonical_transcript_page_crosses_multiple_compaction_boundaries(
 
 
 @pytest.mark.asyncio
+async def test_canonical_page_skips_null_legacy_ids_without_hiding_valid_rows(manager):
+    node = await manager.create("agent:main:webchat:legacy-null-page")
+    await manager._storage.conn.executemany(
+        """
+        INSERT INTO compacted_transcript_entries (
+            session_id, session_key, compaction_id, compaction_index,
+            original_entry_id, message_id, role, content, created_at, archived_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'user', ?, ?, ?)
+        """,
+        [
+            (
+                node.session_id,
+                node.session_key,
+                "legacy-compaction",
+                0,
+                original_id,
+                f"legacy-{created_at}",
+                f"legacy message {created_at}",
+                created_at,
+                created_at,
+            )
+            for created_at, original_id in ((1, 1), (2, None), (3, 3))
+        ],
+    )
+    await manager._storage.conn.commit()
+
+    latest = await manager.get_canonical_transcript_page(node.session_key, limit=1)
+    before = await manager.get_canonical_transcript_page(
+        node.session_key,
+        limit=1,
+        before=(3, 3),
+    )
+    after = await manager.get_canonical_transcript_page(
+        node.session_key,
+        limit=1,
+        after=(1, 1),
+    )
+    full = await manager.get_canonical_transcript_page(node.session_key, limit=2)
+
+    assert [(entry.created_at, entry.id) for entry in latest.entries] == [(3, 3)]
+    assert latest.has_more is True
+    assert latest.canonical_complete is False
+    assert [(entry.created_at, entry.id) for entry in before.entries] == [(1, 1)]
+    assert before.has_more is False
+    assert [(entry.created_at, entry.id) for entry in after.entries] == [(3, 3)]
+    assert after.has_more is False
+    assert [(entry.created_at, entry.id) for entry in full.entries] == [(1, 1), (3, 3)]
+    assert full.has_more is False
+    assert full.canonical_complete is False
+
+
+@pytest.mark.asyncio
 async def test_canonical_transcript_page_preserves_turn_context(manager):
     """Paged canonical reads must keep turn_context on active and archived rows."""
     node = await manager.create("agent:main:main")

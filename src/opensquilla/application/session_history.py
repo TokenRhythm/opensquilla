@@ -16,9 +16,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol, cast
+from typing import Protocol
 
 from opensquilla.history_cursor import (
+    HISTORY_CURSOR_MAX_INTEGER,
     HistoryCursor,
     HistoryCursorInvalidatedError,
 )
@@ -146,13 +147,19 @@ def cursor_for_entry(entry: object) -> HistoryCursor | None:
     """Return the stable integer cursor used by the history Port."""
 
     created_at = getattr(entry, "created_at", None)
-    stable_id = getattr(entry, "id", None) or getattr(entry, "message_id", None)
-    if created_at in {None, ""} or stable_id in {None, ""}:
+    stable_id = getattr(entry, "id", None)
+    if (
+        not isinstance(created_at, int)
+        or isinstance(created_at, bool)
+        or not isinstance(stable_id, int)
+        or isinstance(stable_id, bool)
+        or created_at < 0
+        or stable_id < 0
+        or created_at > HISTORY_CURSOR_MAX_INTEGER
+        or stable_id > HISTORY_CURSOR_MAX_INTEGER
+    ):
         return None
-    try:
-        return int(cast(Any, created_at)), int(cast(Any, stable_id))
-    except (TypeError, ValueError):
-        return None
+    return created_at, stable_id
 
 
 def paginate_transcript(

@@ -14128,7 +14128,9 @@ class SessionStorage:
         one SQLite read snapshot. ``before`` keeps its historical precedence
         over ``after`` when both cursors exist. A supplied cursor must identify
         an anchor in this session; missing, foreign, or deleted anchors fail
-        closed instead of being treated as an unpositioned latest read.
+        closed instead of being treated as an unpositioned latest read. Legacy
+        archived rows without an original integer id are not keyset-addressable
+        and are omitted while canonical coverage reports the archive incomplete.
         """
         page_size = max(1, int(limit))
         fetch_size = page_size + 1
@@ -14235,6 +14237,7 @@ class SessionStorage:
                     schema_version
                 FROM compacted_transcript_entries
                 WHERE session_id = ?
+                  AND original_entry_id IS NOT NULL
                   AND EXISTS (SELECT 1 FROM cursor_anchor)
                   {archived_cursor_clause}
                 ORDER BY
@@ -14288,13 +14291,6 @@ class SessionStorage:
         entries = entries[:page_size]
         if not ascending:
             entries.reverse()
-        if has_more and entries:
-            continuation_entry = entries[-1] if ascending else entries[0]
-            # Legacy compacted rows can lack their original transcript id. The
-            # archive is already reported incomplete; do not advertise another
-            # keyset page when its boundary cannot form the numeric cursor.
-            if continuation_entry.id is None:
-                has_more = False
         return entries, has_more
 
     @_serialized_read

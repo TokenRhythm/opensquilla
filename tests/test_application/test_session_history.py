@@ -12,6 +12,7 @@ from opensquilla.application.session_history import (
     HistoryPage,
     SessionHistoryApplication,
     SessionHistoryQuery,
+    cursor_for_entry,
     paginate_transcript,
 )
 from opensquilla.history_cursor import HistoryCursorInvalidatedError
@@ -207,6 +208,15 @@ def test_paginate_transcript_preserves_latest_window_and_valid_cursors() -> None
     assert forward_more is True
     assert [getattr(row, "id") for row in backward] == [2, 3]
     assert backward_more is True
+
+
+def test_cursor_for_entry_uses_only_bounded_integer_transcript_ids() -> None:
+    assert cursor_for_entry(SimpleNamespace(id=0, message_id="999", created_at=42)) == (
+        42,
+        0,
+    )
+    assert cursor_for_entry(SimpleNamespace(id=None, message_id="7", created_at=42)) is None
+    assert cursor_for_entry(SimpleNamespace(id=1 << 63, message_id="1", created_at=42)) is None
 
 
 @pytest.mark.parametrize("direction", ["before", "after"])
