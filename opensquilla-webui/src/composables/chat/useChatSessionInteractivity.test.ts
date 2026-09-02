@@ -225,15 +225,67 @@ describe('useChatSessionInteractivity', () => {
 
   it('does not delay a provisional new-chat key that has no route authority yet', () => {
     const key = ref('agent:main:webchat:new-draft')
+    const resolveEnabled = ref(false)
     const source = directory([])
     const policy = useChatSessionInteractivity({
       sessionKey: key,
       directory: source,
-      shouldResolve: () => false,
+      resolveEnabled,
     })
 
     expect(policy.turnActionsBlocked.value).toBe(false)
     expect(source.listPage).not.toHaveBeenCalled()
     policy.dispose()
   })
+
+  it('resolves a recovered existing session when the provisional gate opens', async () => {
+    const key = ref('legacy-scheduled-run')
+    const resolveEnabled = ref(false)
+    const source = directory([{
+      items: [session(key.value, { sessionKind: 'cron', interactive: false })],
+      hasMore: false,
+      nextCursor: null,
+    }])
+    const policy = useChatSessionInteractivity({
+      sessionKey: key,
+      directory: source,
+      resolveEnabled,
+    })
+
+    expect(source.listPage).not.toHaveBeenCalled()
+    resolveEnabled.value = true
+
+    await vi.waitFor(() => expect(policy.isCronSession.value).toBe(true))
+    expect(source.listPage).toHaveBeenCalledOnce()
+    expect(policy.turnActionsBlocked.value).toBe(true)
+    policy.dispose()
+  })
+
+  it.each(['terminal miss', 'lookup error'] as const)(
+    'keeps a recovered existing session fail-closed after a %s',
+    async failure => {
+      const key = ref('legacy-scheduled-run')
+      const resolveEnabled = ref(false)
+      const source = directory([{
+        items: [session('another-session')],
+        hasMore: false,
+        nextCursor: null,
+      }])
+      if (failure === 'lookup error') {
+        source.listPage.mockRejectedValueOnce(new Error('gateway unavailable'))
+      }
+      const policy = useChatSessionInteractivity({
+        sessionKey: key,
+        directory: source,
+        resolveEnabled,
+      })
+
+      resolveEnabled.value = true
+
+      await vi.waitFor(() => expect(policy.policyUnavailable.value).toBe(true))
+      expect(policy.policyPending.value).toBe(false)
+      expect(policy.turnActionsBlocked.value).toBe(true)
+      policy.dispose()
+    },
+  )
 })

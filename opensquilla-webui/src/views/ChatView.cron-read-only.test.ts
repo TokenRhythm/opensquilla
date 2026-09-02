@@ -47,12 +47,21 @@ describe('Cron session read-only presentation', () => {
   })
 
   it('uses authoritative directory interactivity with a pending direct-route gate', () => {
+    const initialSession = sourceBetween(
+      'const initialSession = resolveInitialSession',
+      '// Load elevated mode',
+    )
     expect(chatViewSource).toContain('useChatSessionInteractivity({')
     expect(chatViewSource).toContain('knownSessions: knownDirectorySessions')
+    expect(chatViewSource).toContain('resolveEnabled: sessionPolicyResolutionEnabled')
+    expect(chatViewSource).not.toContain('shouldResolve: key => readSessionFromUrl() === key')
     expect(chatViewSource).toContain('policyPending: sessionPolicyPending')
     expect(chatViewSource).toContain('policyUnavailable: sessionPolicyUnavailable')
     expect(chatViewSource).toContain('isNoninteractiveSession,')
     expect(chatViewSource).toContain('turnActionsBlocked,')
+    expect(initialSession.indexOf("pendingSessionIntent.value = 'new_chat'")).toBeLessThan(
+      initialSession.indexOf('sessionKey.value = initialSession.sessionKey'),
+    )
   })
 
   it('guards current, new-task, and replan handlers before Plan mutations', () => {

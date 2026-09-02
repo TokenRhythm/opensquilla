@@ -394,6 +394,181 @@ async def test_internal_send_can_supply_trusted_background_run_kind(tmp_path: Pa
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "cron_kind",
+    ["canonical-missing", "legacy-existing"],
+)
+async def test_pending_input_fresh_cron_enqueue_rejects_before_side_effects(
+    tmp_path: Path,
+    cron_kind: str,
+) -> None:
+    cron_key = (
+        "cron:missing-job:run:missing-run"
+        if cron_kind == "canonical-missing"
+        else "legacy-scheduled-run"
+    )
+    stack_key = SESSION_KEY if cron_kind == "canonical-missing" else cron_key
+    async with _open_real_stack(
+        tmp_path / f"pending-cron-{cron_kind}.db",
+        session_key=stack_key,
+    ) as stack:
+        if cron_kind == "legacy-existing":
+            current = await stack.storage.get_session(cron_key)
+            assert current is not None
+            updated = await stack.storage.compare_and_set_session_origin(
+                expected_session=current,
+                expected_origin=None,
+                origin={"kind": "cron"},
+                workspace_guard=None,
+            )
+            assert updated is not None
+
+        response = await get_dispatcher().dispatch(
+            f"pending-cron-{cron_kind}",
+            "sessions.pending_inputs.enqueue",
+            {
+                "key": cron_key,
+                "pendingInputId": f"pending-cron-{cron_kind}",
+                "clientRequestId": f"pending-cron-{cron_kind}-request",
+                "clientMessageId": f"pending-cron-{cron_kind}-message",
+                "message": "must not be staged",
+                "attachments": [
+                    {
+                        "type": "text/plain",
+                        "name": "must-not-persist.txt",
+                        "data": "bm8gc2lkZSBlZmZlY3Rz",
+                    }
+                ],
+            },
+            stack.context,
+        )
+
+        assert response.ok is False
+        assert response.error is not None
+        assert response.error.code == "SESSION_NOT_INTERACTIVE"
+        assert response.error.accepted is False
+        assert response.error.retryable is False
+        assert await stack.storage.get_pending_chat_input(
+            f"pending-cron-{cron_kind}"
+        ) is None
+        media_root = Path(stack.context.config.attachments.media_root or "")
+        assert not media_root.exists() or list(media_root.rglob("*")) == []
+
+
+@pytest.mark.asyncio
+async def test_pending_input_exact_queue_replay_precedes_cron_policy(
+    tmp_path: Path,
+) -> None:
+    session_key = "legacy-scheduled-run"
+    async with _open_real_stack(
+        tmp_path / "pending-cron-replay.db",
+        session_key=session_key,
+    ) as stack:
+        params = {
+            "key": session_key,
+            "pendingInputId": "pending-cron-replay",
+            "clientRequestId": "pending-cron-replay-request",
+            "clientMessageId": "pending-cron-replay-message",
+            "message": "staged before the session became read-only",
+            "attachments": [
+                {
+                    "type": "text/plain",
+                    "name": "replayed.txt",
+                    "data": "cXVldWVkIGJlZm9yZSBjcm9u",
+                }
+            ],
+        }
+        first = await get_dispatcher().dispatch(
+            "pending-cron-replay-first",
+            "sessions.pending_inputs.enqueue",
+            params,
+            stack.context,
+        )
+        assert first.ok is True
+
+        current = await stack.storage.get_session(session_key)
+        assert current is not None
+        updated = await stack.storage.compare_and_set_session_origin(
+            expected_session=current,
+            expected_origin=None,
+            origin={"kind": "cron"},
+            workspace_guard=None,
+        )
+        assert updated is not None
+
+        replay = await get_dispatcher().dispatch(
+            "pending-cron-replay-second",
+            "sessions.pending_inputs.enqueue",
+            params,
+            stack.context,
+        )
+
+        assert replay.ok is True
+        assert replay.payload["replayed"] is True
+        assert replay.payload["pendingInputId"] == params["pendingInputId"]
+        assert len(await stack.storage.list_pending_chat_inputs(session_key)) == 1
+
+
+@pytest.mark.asyncio
+async def test_pending_input_exact_dispatch_receipt_precedes_cron_policy(
+    tmp_path: Path,
+) -> None:
+    session_key = "legacy-scheduled-run"
+    async with _open_real_stack(
+        tmp_path / "pending-cron-receipt-replay.db",
+        session_key=session_key,
+    ) as stack:
+        params = {
+            "key": session_key,
+            "pendingInputId": "pending-cron-receipt-replay",
+            "clientRequestId": "pending-cron-receipt-replay-request",
+            "clientMessageId": "pending-cron-receipt-replay-message",
+            "message": "dispatched before the session became read-only",
+        }
+        staged = await get_dispatcher().dispatch(
+            "pending-cron-receipt-replay-enqueue",
+            "sessions.pending_inputs.enqueue",
+            params,
+            stack.context,
+        )
+        assert staged.ok is True
+        dispatched = await get_dispatcher().dispatch(
+            "pending-cron-receipt-replay-dispatch",
+            "sessions.pending_inputs.dispatch",
+            {
+                "key": session_key,
+                "pendingInputId": params["pendingInputId"],
+                "clientRequestId": params["clientRequestId"],
+                "requestFingerprint": staged.payload["requestFingerprint"],
+            },
+            stack.context,
+        )
+        assert dispatched.ok is True
+
+        current = await stack.storage.get_session(session_key)
+        assert current is not None
+        updated = await stack.storage.compare_and_set_session_origin(
+            expected_session=current,
+            expected_origin=None,
+            origin={"kind": "cron"},
+            workspace_guard=None,
+        )
+        assert updated is not None
+
+        replay = await get_dispatcher().dispatch(
+            "pending-cron-receipt-replay-enqueue-again",
+            "sessions.pending_inputs.enqueue",
+            params,
+            stack.context,
+        )
+
+        assert replay.ok is False
+        assert replay.error is not None
+        assert replay.error.code == "PENDING_INPUT_ALREADY_DISPATCHED"
+        assert await stack.storage.list_pending_chat_inputs(session_key) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("message", "display_text"),
     [("/coding", "//coding"), ("//usr/bin/env", "///usr/bin/env")],
 )

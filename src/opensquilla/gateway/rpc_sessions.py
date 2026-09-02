@@ -7307,7 +7307,70 @@ async def _handle_pending_inputs_enqueue(
     async def _materialize_and_enqueue() -> tuple[PendingChatInput, bool]:
         async with _pending_input_enqueue_lock(ctx, key, pending_input_id):
             payload = dict(raw_payload)
-            staged_scope = await _pending_input_current_session_id(storage, key)
+            session = await storage.get_session(key)
+            staged_scope = getattr(session, "session_id", None)
+            if not isinstance(staged_scope, str) or not staged_scope:
+                staged_scope = None
+
+            # A response-loss retry must remain available after the session
+            # becomes read-only. Prove the complete persisted queue identity
+            # before policy, without restaging attachments or touching SQLite.
+            existing = await storage.get_pending_chat_input(pending_input_id)
+            if existing is not None:
+                replay_payload = dict(raw_payload)
+                if attachments and staged_scope is not None:
+                    manifest = read_pending_chat_input_manifest(
+                        media_root=media_root_from_config(ctx.config),
+                        session_id=staged_scope,
+                        pending_input_id=pending_input_id,
+                    )
+                    if (
+                        manifest is not None
+                        and manifest.get("enqueue_fingerprint")
+                        == request_fingerprint(raw_payload)
+                    ):
+                        replay_payload["attachments"] = manifest["attachments"]
+                replay_fingerprint = request_fingerprint(replay_payload)
+                if (
+                    existing.session_key == key
+                    and existing.source_scope == source_scope
+                    and existing.client_request_id == raw_payload["clientRequestId"]
+                    and existing.client_message_id == raw_payload["clientMessageId"]
+                    and existing.request_fingerprint == replay_fingerprint
+                    and existing.payload == replay_payload
+                ):
+                    return existing, True
+
+            dispatch_receipt = (
+                await storage.get_pending_chat_input_dispatch_receipt(
+                    pending_input_id
+                )
+            )
+            raw_fingerprint = request_fingerprint(raw_payload)
+            if (
+                dispatch_receipt is not None
+                and dispatch_receipt.session_key == key
+                and dispatch_receipt.source_scope == source_scope
+                and dispatch_receipt.client_request_id
+                == raw_payload["clientRequestId"]
+                and dispatch_receipt.client_message_id
+                == raw_payload["clientMessageId"]
+                and dispatch_receipt.request_fingerprint == raw_fingerprint
+            ):
+                raise PendingChatInputAlreadyDispatchedError(
+                    "pending input was already dispatched"
+                )
+
+            if key.startswith("cron:") or is_noninteractive_cron_session(
+                session,
+                channel_types=_channel_types_from_config(ctx.config),
+            ):
+                raise RpcHandlerError(
+                    "SESSION_NOT_INTERACTIVE",
+                    "Cron isolated sessions are read-only and cannot receive new turns.",
+                    retryable=False,
+                    accepted=False,
+                )
             if staged_scope is None:
                 raise RpcHandlerError(
                     "PENDING_SESSION_UNAVAILABLE",

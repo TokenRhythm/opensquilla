@@ -12,7 +12,7 @@ export interface UseChatSessionInteractivityOptions {
   sessionKey: Readonly<Ref<string>>
   directory: SessionDirectory
   knownSessions?: Readonly<Ref<readonly SessionItem[]>>
-  shouldResolve?: (key: string) => boolean
+  resolveEnabled?: Readonly<Ref<boolean>>
 }
 
 /**
@@ -85,7 +85,7 @@ export function useChatSessionInteractivity(options: UseChatSessionInteractivity
       authority.value = known
       return
     }
-    if (options.shouldResolve?.(key) === false) return
+    if (options.resolveEnabled?.value === false) return
     const attempt = generation
     controller = new AbortController()
     resolvingKey.value = key
@@ -104,6 +104,11 @@ export function useChatSessionInteractivity(options: UseChatSessionInteractivity
         resolvingKey.value = ''
         unresolvedKey.value = ''
         authority.value = known
+      })
+    : () => {}
+  const stopResolveEnabledWatch = options.resolveEnabled
+    ? watch(options.resolveEnabled, enabled => {
+        if (enabled) select(options.sessionKey.value)
       })
     : () => {}
 
@@ -141,6 +146,7 @@ export function useChatSessionInteractivity(options: UseChatSessionInteractivity
     unresolvedKey.value = ''
     stopSessionWatch()
     stopKnownSessionsWatch()
+    stopResolveEnabledWatch()
   }
 
   return {

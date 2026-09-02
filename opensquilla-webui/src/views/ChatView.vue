@@ -1347,11 +1347,14 @@ const { enabled: composerFxEnabled } = useComposerFloatingPreference()
 /* ── State ─────────────────────────────────────────────────────────── */
 
 const sessionKey = ref('')
+// Only a not-yet-durable draft may skip authoritative session policy lookup.
+const pendingSessionIntent = ref<string | null>(null)
+const sessionPolicyResolutionEnabled = computed(() => pendingSessionIntent.value !== 'new_chat')
 const sessionInteractivity = useChatSessionInteractivity({
   sessionKey,
   directory: sessionDirectory,
   knownSessions: knownDirectorySessions,
-  shouldResolve: key => readSessionFromUrl() === key,
+  resolveEnabled: sessionPolicyResolutionEnabled,
 })
 const {
   isCronSession,
@@ -1756,8 +1759,6 @@ function projectWorkspaceFromSessionRead(
   }
 }
 
-// Pending session intent
-const pendingSessionIntent = ref<string | null>(null)
 const pendingForkBeforeMessageId = ref<string | null>(null)
 const freshTaskDraft = useFreshTaskDraft()
 const promptCacheKeepaliveSessionReady = computed(() => pendingSessionIntent.value === null)
@@ -6672,6 +6673,7 @@ onMounted(async () => {
   // draft, except for the one most-recent non-empty draft recovered on a cold
   // /chat/new entry. Explicit new-task handoffs always remain clean.
   const initialSession = resolveInitialSession({ recoverDraft: !explicitFreshTask })
+  if (initialSession.draft) pendingSessionIntent.value = 'new_chat'
   sessionKey.value = initialSession.sessionKey
   bindTailLayoutObservers()
   let initialDraftProjectGeneration: number | null = null
@@ -6681,7 +6683,6 @@ onMounted(async () => {
     attachments: Attachment[]
   } | null = null
   if (initialSession.draft) {
-    pendingSessionIntent.value = 'new_chat'
     initialDraftProjectGeneration = draftProjectHydration.begin()
     // Apply the hand-off before any asynchronous project/live work. A later
     // completion must never overwrite text the operator typed while waiting.
