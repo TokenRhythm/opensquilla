@@ -7,14 +7,14 @@ import { createV4RouteFeedback } from './routeFeedbackV4'
 import { createV4UsageReporting } from './usageReportingV4'
 
 function transport() {
-  const request = vi.fn(async (method: string) => {
-    if (method === 'usage.status') return { sessions: [] }
-    if (method === 'usage.query') return { rows: [] }
-    if (method === 'usage.cost') return { totalCostUsd: 0, breakdown: [] }
+  const request = vi.fn(async <T = unknown>(method: string): Promise<T> => {
+    if (method === 'usage.status') return { sessions: [] } as T
+    if (method === 'usage.query') return { rows: [] } as T
+    if (method === 'usage.cost') return { totalCostUsd: 0, breakdown: [] } as T
     if (method === 'commands.list_for_surface') {
-      return { surface: 'web_chat', commands: [] }
+      return { surface: 'web_chat', commands: [] } as T
     }
-    if (method === 'router.feedback.submit') return { accepted: true, recorded: 'up' }
+    if (method === 'router.feedback.submit') return { accepted: true, recorded: 'up' } as T
     if (method.startsWith('sessions.promptCacheKeepalive.')) {
       return {
         enabled: true,
@@ -26,9 +26,11 @@ function transport() {
         reason: null,
         hasSnapshot: true,
         lastCacheHitTokens: 8,
-      }
+      } as T
     }
-    if (method === 'chat.clarify_submit') return { resolved: true, requestId: 'request-1' }
+    if (method === 'chat.clarify_submit') {
+      return { resolved: true, requestId: 'request-1' } as T
+    }
     throw new Error(`unexpected method: ${method}`)
   })
   return { request, supports: vi.fn().mockReturnValue(true) }
@@ -37,11 +39,21 @@ function transport() {
 describe('conversation ancillary v4 adapters', () => {
   it('maps all eight generated contract methods to narrow domain interfaces', async () => {
     const rpc = transport()
-    const usage = createV4UsageReporting(rpc)
-    const commands = createV4CommandCatalog(rpc)
-    const feedback = createV4RouteFeedback(rpc)
-    const promptCache = createV4PromptCacheLease(rpc)
-    const clarification = createV4ClarificationSubmission(rpc)
+    const usage = createV4UsageReporting(
+      rpc as Parameters<typeof createV4UsageReporting>[0],
+    )
+    const commands = createV4CommandCatalog(
+      rpc as Parameters<typeof createV4CommandCatalog>[0],
+    )
+    const feedback = createV4RouteFeedback(
+      rpc as Parameters<typeof createV4RouteFeedback>[0],
+    )
+    const promptCache = createV4PromptCacheLease(
+      rpc as Parameters<typeof createV4PromptCacheLease>[0],
+    )
+    const clarification = createV4ClarificationSubmission(
+      rpc as Parameters<typeof createV4ClarificationSubmission>[0],
+    )
 
     await usage.status('agent:main:webchat:test')
     await usage.query({ timezone: 'UTC' })
