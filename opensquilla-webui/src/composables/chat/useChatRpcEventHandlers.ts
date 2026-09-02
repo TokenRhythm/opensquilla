@@ -542,8 +542,9 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       || activeTaskGroups.value.size > 0
       || options.taskOwnership?.hasAuthoritativeWork.value
     ) return
-    const failed = ['failed', 'timeout', 'abandoned'].includes(rawStatus)
-    const interrupted = ['cancelled', 'interrupted'].includes(rawStatus)
+    const normalizedStatus = options.normalizeRunStatus(rawStatus)
+    const failed = ['failed', 'timeout', 'abandoned'].includes(normalizedStatus)
+    const interrupted = ['cancelled', 'interrupted'].includes(normalizedStatus)
     clearLiveThinking()
     options.clearPendingRouterDecision()
     options.applySessionRunState({
@@ -551,7 +552,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       last_task: {
         ...terminalTask,
         ...(taskId ? { task_id: taskId } : {}),
-        status: rawStatus || (failed ? 'failed' : 'succeeded'),
+        status: normalizedStatus || (failed ? 'failed' : 'succeeded'),
       },
     })
     if (pendingQueue.value.length > 0 && !interrupted) {

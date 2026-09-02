@@ -284,6 +284,7 @@ interface ResponseHandoffGate {
   terminalResponse: boolean
   authoritativeIdle: boolean
   backgroundOnly: boolean
+  backgroundFinalized: boolean
   durableRecord: ResponseHandoffWalRecord | null
 }
 
@@ -570,7 +571,7 @@ export interface UseChatSendOptions {
     sourceSessionKey: string,
     targetSessionKey: string,
     ownerRequestId: string,
-  ) => Promise<void>
+  ) => Promise<boolean>
   failPendingQueueHandoff?: (ownerRequestId: string) => Promise<void> | void
   scheduleHistorySync: () => void
   schedulePendingDrainAfterTerminal: () => void
@@ -1383,8 +1384,13 @@ export function useChatSend(options: UseChatSendOptions) {
         )
       }
     }
-    if (!responseOwnsVisibleTranscript && attempt.forkBeforeMessageId) {
-      await finalizeAttemptBackgroundResponseHandoff(attempt, acceptedSessionKey)
+    if (
+      !responseOwnsVisibleTranscript
+      && attempt.forkBeforeMessageId
+      && !await finalizeAttemptBackgroundResponseHandoff(attempt, acceptedSessionKey)
+    ) {
+      attempt.acceptanceResolved = false
+      return false
     }
 
     if (!attempt.stopRequested) {
@@ -1536,6 +1542,7 @@ export function useChatSend(options: UseChatSendOptions) {
       terminalResponse: false,
       authoritativeIdle: false,
       backgroundOnly: false,
+      backgroundFinalized: false,
       durableRecord,
     }
     activeResponseHandoff = gate
@@ -1745,12 +1752,53 @@ export function useChatSend(options: UseChatSendOptions) {
     }
   }
 
+  async function markResponseHandoffBackgroundOnly(
+    gate: ResponseHandoffGate,
+  ): Promise<boolean> {
+    const current = gate.durableRecord
+    if (!current || current.backgroundOnly) return true
+    const backgroundRecord: ResponseHandoffWalRecord = {
+      ...current,
+      backgroundOnly: true,
+      ...(current.walRevision ? { walRevision: current.walRevision + 1 } : {}),
+      updatedAt: Date.now(),
+    }
+    if (
+      current.walOwnerId
+      && current.walRevision
+      && options.pendingInputWal?.compareAndSwapHandoff
+    ) {
+      const transition = await options.pendingInputWal.compareAndSwapHandoff(
+        current.ownerRequestId,
+        current.walOwnerId,
+        current.walRevision,
+        backgroundRecord,
+      ).catch(() => null)
+      if (!transition?.applied || !transition.record) return false
+      gate.durableRecord = transition.record
+      return true
+    }
+    if (!options.pendingInputWal?.putHandoff) return false
+    try {
+      await options.pendingInputWal.putHandoff(backgroundRecord)
+      gate.durableRecord = backgroundRecord
+      return true
+    } catch {
+      return false
+    }
+  }
+
   async function markResponseHandoffAccepted(
     gate: ResponseHandoffGate,
     acceptedSessionKey: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const current = gate.durableRecord
-    if (!current) return
+    if (!current) return true
+    if (
+      current.state === 'accepted'
+      && current.acceptedSessionKey === acceptedSessionKey
+      && (!gate.backgroundOnly || current.backgroundOnly)
+    ) return true
     const accepted: ResponseHandoffWalRecord = {
       ...current,
       state: 'accepted',
@@ -1770,29 +1818,58 @@ export function useChatSend(options: UseChatSendOptions) {
         current.walRevision,
         accepted,
       ).catch(() => null)
-      if (transition?.applied && transition.record) gate.durableRecord = transition.record
-      return
+      if (!transition?.applied || !transition.record) return false
+      gate.durableRecord = transition.record
+      return true
     }
-    if (!options.pendingInputWal?.putHandoff) return
-    gate.durableRecord = accepted
-    await options.pendingInputWal.putHandoff(accepted).catch(() => {})
+    if (!options.pendingInputWal?.putHandoff) return false
+    try {
+      await options.pendingInputWal.putHandoff(accepted)
+      gate.durableRecord = accepted
+      return true
+    } catch {
+      return false
+    }
   }
 
   async function finalizeBackgroundResponseHandoff(
     gate: ResponseHandoffGate,
     acceptedSessionKey: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     gate.targetSessionKey = acceptedSessionKey
     gate.backgroundOnly = true
-    await markResponseHandoffAccepted(gate, acceptedSessionKey)
+    if (!await markResponseHandoffBackgroundOnly(gate)) return false
+    if (!await markResponseHandoffAccepted(gate, acceptedSessionKey)) return false
+    if (!gate.durableRecord) {
+      gate.backgroundFinalized = true
+      return true
+    }
+    if (
+      options.sessionKey.value === gate.requestSessionKey
+      && !gate.stoppedByUser
+      && options.hasPendingQueueWork?.() !== true
+    ) {
+      // Arm the terminal signal while the handoff still blocks delivery. A
+      // later queue hydrate will flush it after the durable owner is released.
+      options.schedulePendingDrainAfterTerminal()
+    }
+    const queueReleased = await options.recoverPendingQueueHandoff?.(
+      gate.requestSessionKey,
+      gate.requestSessionKey,
+      gate.ownerRequestId,
+    ).catch(() => false)
+    if (queueReleased !== true) return false
+    gate.backgroundFinalized = true
     if (gate.durableRecord && await deleteResponseHandoff(gate.durableRecord)) {
       gate.durableRecord = null
     }
+    return true
   }
 
   function releaseBackgroundResponseHandoffParent(gate: ResponseHandoffGate): void {
     if (
       !gate.backgroundOnly
+      || !gate.backgroundFinalized
       || gate.stoppedByUser
       || options.sessionKey.value !== gate.requestSessionKey
       || options.stream.isStreaming.value
@@ -1807,16 +1884,21 @@ export function useChatSend(options: UseChatSendOptions) {
   async function finalizeAttemptBackgroundResponseHandoff(
     attempt: SendAttempt,
     acceptedSessionKey: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const wal = options.pendingInputWal
-    if (!wal?.listHandoffs) return
-    const records = await wal.listHandoffs(attempt.requestSessionKey).catch(() => [])
+    if (!wal?.listHandoffs) return false
+    let records: ResponseHandoffWalRecord[]
+    try {
+      records = await wal.listHandoffs(attempt.requestSessionKey)
+    } catch {
+      return false
+    }
     const record = records.find(candidate => (
       candidate.ownerRequestId === attempt.clientRequestId
       && candidate.clientRequestId === attempt.clientRequestId
       && candidate.clientMessageId === attempt.clientMessageId
     ))
-    if (!record) return
+    if (!record) return true
     const gate: ResponseHandoffGate = {
       requestSessionKey: attempt.requestSessionKey,
       ownerRequestId: attempt.clientRequestId,
@@ -1826,10 +1908,12 @@ export function useChatSend(options: UseChatSendOptions) {
       terminalResponse: false,
       authoritativeIdle: false,
       backgroundOnly: true,
+      backgroundFinalized: false,
       durableRecord: record,
     }
-    await finalizeBackgroundResponseHandoff(gate, acceptedSessionKey)
+    const finalized = await finalizeBackgroundResponseHandoff(gate, acceptedSessionKey)
     releaseBackgroundResponseHandoffParent(gate)
+    return finalized
   }
 
   async function markResponseHandoffFailed(
@@ -1911,19 +1995,24 @@ export function useChatSend(options: UseChatSendOptions) {
         ownerRequestId: gate.ownerRequestId,
       }
     }
-    await markResponseHandoffAccepted(gate, key)
-    const adoption = key === gate.requestSessionKey && options.sessionKey.value === key
-      ? await options.recoverPendingQueueHandoff?.(
-          gate.requestSessionKey,
-          key,
-          gate.ownerRequestId,
-        )
-      : await options.adoptResponseSession(key, gate.ownerRequestId)
+    if (!await markResponseHandoffAccepted(gate, key)) return
+    let adoption: Awaited<ReturnType<typeof options.adoptResponseSession>> = undefined
+    if (key === gate.requestSessionKey && options.sessionKey.value === key) {
+      const recovered = await options.recoverPendingQueueHandoff?.(
+        gate.requestSessionKey,
+        key,
+        gate.ownerRequestId,
+      )
+      if (recovered !== true) return
+    } else {
+      adoption = await options.adoptResponseSession(key, gate.ownerRequestId)
+    }
     if (gate.durableRecord && await deleteResponseHandoff(gate.durableRecord)) {
       gate.durableRecord = null
     }
     gate.authoritativeIdle = adoption?.authoritativeIdle === true
     gate.backgroundOnly = adoption?.backgroundOnly === true
+    gate.backgroundFinalized = gate.backgroundOnly
     if (gate.stoppedByUser && options.sessionKey.value === key) {
       options.activeStreamSessionKey.value = key
       if (gate.acceptedTaskId) {
@@ -2033,12 +2122,30 @@ export function useChatSend(options: UseChatSendOptions) {
     } else {
       await options.pendingInputWal?.putHandoff?.(acceptedRecord).catch(() => {})
     }
-    await options.recoverPendingQueueHandoff?.(
+    const queueReleased = await options.recoverPendingQueueHandoff?.(
       record.requestSessionKey,
       targetSessionKey,
       record.ownerRequestId,
-    )
+    ).catch(() => false)
+    if (queueReleased !== true) return
     await deleteResponseHandoff(acceptedRecord)
+  }
+
+  async function finalizeRecoveredBackgroundHandoff(
+    record: ResponseHandoffWalRecord,
+    targetSessionKey: string,
+  ): Promise<void> {
+    const gate = beginResponseHandoff(
+      record.requestSessionKey,
+      record.ownerRequestId,
+      record,
+    )
+    gate.backgroundOnly = true
+    try {
+      await finalizeBackgroundResponseHandoff(gate, targetSessionKey)
+    } finally {
+      finishResponseHandoff(gate)
+    }
   }
 
   function restoreResponseHandoffDraft(record: ResponseHandoffWalRecord): boolean {
@@ -2106,7 +2213,7 @@ export function useChatSend(options: UseChatSendOptions) {
         }
         if (record.state === 'accepted' && record.acceptedSessionKey) {
           if (record.backgroundOnly) {
-            await deleteResponseHandoff(record)
+            await finalizeRecoveredBackgroundHandoff(record, record.acceptedSessionKey)
           } else {
             await finalizeRecoveredHandoff(record, record.acceptedSessionKey)
           }
@@ -2121,12 +2228,20 @@ export function useChatSend(options: UseChatSendOptions) {
               params: replayRecord.params,
             })
             const targetSessionKey = response.sessionKey || replayRecord.requestSessionKey
-            await finalizeRecoveredHandoff(replayRecord, targetSessionKey)
+            if (replayRecord.backgroundOnly) {
+              await finalizeRecoveredBackgroundHandoff(replayRecord, targetSessionKey)
+            } else {
+              await finalizeRecoveredHandoff(replayRecord, targetSessionKey)
+            }
             break
           } catch (error) {
             const accepted = acceptedErrorInfo(error)
             if (accepted?.sessionKey) {
-              await finalizeRecoveredHandoff(replayRecord, accepted.sessionKey)
+              if (replayRecord.backgroundOnly) {
+                await finalizeRecoveredBackgroundHandoff(replayRecord, accepted.sessionKey)
+              } else {
+                await finalizeRecoveredHandoff(replayRecord, accepted.sessionKey)
+              }
               break
             }
             const rpcError = error as RpcClientError | null | undefined
@@ -3645,9 +3760,20 @@ export function useChatSend(options: UseChatSendOptions) {
         if (responseHandoff) {
           responseHandoff.acceptedTaskId = taskId
           responseHandoff.terminalResponse = Boolean(terminalStatus)
-          await finalizeBackgroundResponseHandoff(responseHandoff, acceptedSessionKey)
+          const finalized = await finalizeBackgroundResponseHandoff(
+            responseHandoff,
+            acceptedSessionKey,
+          )
+          if (!finalized) {
+            attempt.acceptanceResolved = false
+            recoveredAttempt = attempt
+            scheduleAcceptanceRecovery(attempt)
+          }
         }
-        if (recoveredAttempt?.clientRequestId === attempt.clientRequestId) {
+        if (
+          attempt.acceptanceResolved
+          && recoveredAttempt?.clientRequestId === attempt.clientRequestId
+        ) {
           recoveredAttempt = null
         }
         consumeAcceptedSessionIntent(attempt)
@@ -3843,6 +3969,7 @@ export function useChatSend(options: UseChatSendOptions) {
       }
       if (
         acceptedError
+        && acceptedResponseOwnsVisibleTranscript
         && recoveredAttempt?.clientRequestId === attempt.clientRequestId
       ) {
         recoveredAttempt = null
@@ -3860,10 +3987,21 @@ export function useChatSend(options: UseChatSendOptions) {
         }
         if (responseHandoff) {
           responseHandoff.terminalResponse = acceptedError.terminalWithoutTask
-          await finalizeBackgroundResponseHandoff(
+          const finalized = await finalizeBackgroundResponseHandoff(
             responseHandoff,
             attempt.acceptedSessionKey,
           )
+          if (!finalized) {
+            attempt.acceptanceResolved = false
+            recoveredAttempt = attempt
+            scheduleAcceptanceRecovery(attempt)
+          }
+        }
+        if (
+          attempt.acceptanceResolved
+          && recoveredAttempt?.clientRequestId === attempt.clientRequestId
+        ) {
+          recoveredAttempt = null
         }
         if (!wasStreaming && freshSendToken && activeFreshSendToken === freshSendToken) {
           activeFreshSendToken = null

@@ -33,6 +33,7 @@ function createHarness(options: {
   handleSessionConnectionState?: (state: string) => SessionBootstrapRun | undefined
   loadCurrentSessionUsage?: () => void
   refreshRunModePreference?: () => void | Promise<void>
+  normalizeRunStatus?: (status: string) => string
   pendingQueue?: ChatPendingItem[]
   stream?: ChatRpcStreamApi
   restoreSteerIntoComposer?: (text: string) => void
@@ -116,7 +117,7 @@ function createHarness(options: {
     }),
     usageModel: ref(''),
     stream,
-    normalizeRunStatus: (status: string) => status,
+    normalizeRunStatus: options.normalizeRunStatus || ((status: string) => status),
     sessionRunStatus: options.sessionRunStatus || (() => ({ status: 'idle', label: 'Idle', task: null })),
     applySessionRunState,
     queueRouterDecision,
@@ -655,6 +656,49 @@ describe('useChatRpcEventHandlers decoded conversation ingress', () => {
       }
     },
   )
+
+  it('normalizes a killed receipt echo as cancelled without draining queued work', () => {
+    const harness = createHarness({
+      normalizeRunStatus: status => status === 'killed' ? 'cancelled' : status,
+      pendingQueue: [{
+        pendingUiId: 'pending-after-killed',
+        text: 'do not drain after cancellation',
+        attachments: [],
+        intent: null,
+      }],
+    })
+    harness.stream.isStreaming.value = false
+    try {
+      harness.api.beginBackgroundReceiptReplay('client-killed-receipt')
+      harness.api.onConversationEvent({
+        kind: 'sessions-changed',
+        payload: {
+          session_key: 'agent:main:test',
+          reason: 'task_terminal',
+          run_status: 'killed',
+          changed_task: {
+            task_id: 'task-killed-receipt',
+            client_message_id: 'client-killed-receipt',
+            status: 'killed',
+          },
+          last_task: {
+            task_id: 'task-killed-receipt',
+            client_message_id: 'client-killed-receipt',
+            status: 'killed',
+          },
+        },
+        meta: {},
+      })
+
+      expect(harness.applySessionRunState).toHaveBeenCalledWith(expect.objectContaining({
+        run_status: 'cancelled',
+        last_task: expect.objectContaining({ status: 'cancelled' }),
+      }))
+      expect(harness.schedulePendingDrainAfterTerminal).not.toHaveBeenCalled()
+    } finally {
+      harness.stop()
+    }
+  })
 
   it('does not learn receipt task ownership from a stale subscription epoch', () => {
     const harness = createHarness()
