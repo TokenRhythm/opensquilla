@@ -2382,6 +2382,7 @@ describe('useChatSend attachment payloads', () => {
       inputText,
       pendingForkBeforeMessageId,
       messageEditGeneration: messageActions.editGeneration,
+      messageEditActive: messageActions.editActive,
       validateMessageEditOwner: messageActions.validateEditOwner,
       adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
       validateActiveProjectBeforeSend,
@@ -4257,6 +4258,7 @@ describe('useChatSend attachment payloads', () => {
       inputText,
       pendingForkBeforeMessageId,
       messageEditGeneration: messageActions.editGeneration,
+      messageEditActive: messageActions.editActive,
       validateMessageEditOwner: messageActions.validateEditOwner,
       adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
     })
@@ -4305,6 +4307,7 @@ describe('useChatSend attachment payloads', () => {
       inputText,
       pendingForkBeforeMessageId,
       messageEditGeneration: messageActions.editGeneration,
+      messageEditActive: messageActions.editActive,
       validateMessageEditOwner: messageActions.validateEditOwner,
       adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
     })
@@ -4508,6 +4511,7 @@ describe('useChatSend attachment payloads', () => {
       inputText,
       pendingForkBeforeMessageId,
       messageEditGeneration: messageActions.editGeneration,
+      messageEditActive: messageActions.editActive,
       validateMessageEditOwner: messageActions.validateEditOwner,
       adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
     })
@@ -5449,6 +5453,51 @@ describe('useChatSend attachment payloads', () => {
       forkBeforeMessageId: 'msg-B',
     }))
     expect(pendingForkBeforeMessageId.value).toBeNull()
+  })
+
+  it('adopts a regenerated child after replaying an unknown receipt outside Edit mode', async () => {
+    const parentSessionKey = 'agent:main:webchat:regenerate-parent'
+    const childSessionKey = 'agent:main:webchat:regenerate-child'
+    const sessionKey = ref(parentSessionKey)
+    const inputText = ref('regenerate this question')
+    const pendingForkBeforeMessageId = ref<string | null>('message-to-regenerate')
+    const pendingInputWal = memoryHandoffWal()
+    const beginBackgroundReceiptReplay = vi.fn()
+    const adoptResponseSession = vi.fn(async (key: string) => {
+      sessionKey.value = key
+    })
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+        .mockResolvedValueOnce({
+          sessionKey: childSessionKey,
+          task_id: 'regenerated-child-task',
+        }),
+    }
+    const harness = makeOptions({
+      rpc,
+      sessionKey,
+      inputText,
+      pendingForkBeforeMessageId,
+      pendingInputWal,
+      beginBackgroundReceiptReplay,
+      adoptResponseSession,
+      messageEditGeneration: ref(0),
+      messageEditActive: ref(false),
+    })
+
+    await harness.api.onSend()
+    const originalParams = rpc.call.mock.calls[0]?.[1]
+    const ownerRequestId = String(originalParams?.clientRequestId)
+
+    await harness.api.onSend()
+
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(originalParams)
+    expect(beginBackgroundReceiptReplay).not.toHaveBeenCalled()
+    expect(adoptResponseSession).toHaveBeenCalledWith(childSessionKey, ownerRequestId)
+    expect(sessionKey.value).toBe(childSessionKey)
+    expect(await pendingInputWal.listHandoffs!()).toEqual([])
   })
 
   it('switches the session lifecycle when a stopped turn is edited into a child session', async () => {

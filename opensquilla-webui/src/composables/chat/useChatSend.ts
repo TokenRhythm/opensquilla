@@ -235,6 +235,7 @@ interface ComposerSnapshot {
   initialCollaborationMode: CollaborationMode | null
   initialRoutingMode: GatewayModelRoutingMode | null
   queueOwnerRequestId: string | null
+  messageEditActive: boolean
   messageEditGeneration: number | null
 }
 
@@ -833,6 +834,7 @@ export function useChatSend(options: UseChatSendOptions) {
       queueOwnerRequestId: queueOwnerContext?.sessionKey === options.sessionKey.value
         ? queueOwnerContext.ownerRequestId
         : null,
+      messageEditActive: options.messageEditActive?.value === true,
       messageEditGeneration: options.messageEditGeneration?.value ?? null,
     }
   }
@@ -900,6 +902,7 @@ export function useChatSend(options: UseChatSendOptions) {
       && current.workspaceId === owner.workspaceId
       && current.initialCollaborationMode === owner.initialCollaborationMode
       && current.initialRoutingMode === owner.initialRoutingMode
+      && current.messageEditActive === owner.messageEditActive
       && current.messageEditGeneration === owner.messageEditGeneration
     )
   }
@@ -934,7 +937,9 @@ export function useChatSend(options: UseChatSendOptions) {
     snapshot: ComposerSnapshot,
     validateTranscript = false,
   ): boolean {
-    if (snapshot.messageEditGeneration === null) return true
+    if (!snapshot.messageEditActive) return true
+    if (snapshot.messageEditGeneration === null) return false
+    if (options.messageEditActive?.value !== true) return false
     if (options.messageEditGeneration?.value !== snapshot.messageEditGeneration) return false
     return !validateTranscript
       || options.validateMessageEditOwner?.(snapshot.messageEditGeneration) !== false
@@ -3626,7 +3631,10 @@ export function useChatSend(options: UseChatSendOptions) {
         ...(sendOpts.replayCoordination
           ? { replayCoordinationKey: sendOpts.replayCoordination.key }
           : {}),
-        ...(forkBeforeMessageId && sendOpts.composerSnapshot?.messageEditGeneration != null
+        ...(
+          forkBeforeMessageId
+          && sendOpts.composerSnapshot?.messageEditActive === true
+          && sendOpts.composerSnapshot.messageEditGeneration != null
           ? {
               messageEditTranscriptOwner: {
                 generation: sendOpts.composerSnapshot.messageEditGeneration,
