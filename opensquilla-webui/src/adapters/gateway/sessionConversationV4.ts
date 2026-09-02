@@ -6,8 +6,6 @@ import type {
   SessionConversation,
   SessionConversationCapability,
   SessionConversationRequestOptions,
-  SessionForkRequest,
-  SessionForkResult,
   SlashCommandCatalogResult,
   UsageStatusResult,
   PromptCacheKeepaliveUpdate,
@@ -30,8 +28,6 @@ interface SessionConversationEventTransport {
 }
 
 const METHODS = {
-  fork: 'sessions.fork',
-  forkThroughTurn: 'sessions.forkThroughTurn',
   reset: 'sessions.reset',
   compact: 'sessions.contextCompact',
   usage: 'usage.status',
@@ -90,19 +86,6 @@ export function createV4SessionConversation(
             abortAction: 'reject',
           }
         : undefined),
-
-    fork: async (forkRequest: SessionForkRequest, options): Promise<SessionForkResult> => {
-      const params: Record<string, unknown> = { key: forkRequest.key }
-      if (forkRequest.beforeMessageId) params.beforeMessageId = forkRequest.beforeMessageId
-      if (forkRequest.throughTurnId) {
-        params.throughTurnId = forkRequest.throughTurnId
-        const method = hasRpcMethod(rpc, METHODS.forkThroughTurn)
-          ? METHODS.forkThroughTurn
-          : METHODS.fork
-        return objectResult<SessionForkResult>(await request(method, params, options), method)
-      }
-      return objectResult<SessionForkResult>(await request(METHODS.fork, params, options), METHODS.fork)
-    },
 
     reset: async (key, options) => objectResult<Record<string, unknown>>(
       await request(METHODS.reset, { key }, options),
@@ -172,8 +155,7 @@ export function createV4SessionConversation(
       if (capability === 'turn-committed') {
         return events.supports?.('session.event.turn_committed') !== false
       }
-      const method = capability === 'fork' ? METHODS.fork
-        : capability === 'reset' ? METHODS.reset
+      const method = capability === 'reset' ? METHODS.reset
           : capability === 'compact' ? METHODS.compact
             : capability === 'usage' ? METHODS.usage
               : capability === 'slash-catalog' ? METHODS.commands
