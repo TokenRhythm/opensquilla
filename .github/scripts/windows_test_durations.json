@@ -706,6 +706,8 @@
     "tests/test_gateway/test_skill_catalog_application.py": 0.01,
     "tests/test_gateway/test_skill_management_adapter.py": 0.01,
     "tests/test_gateway/test_skill_management_application.py": 0.01,
+    "tests/test_gateway/test_skill_proposal_review_adapter.py": 0.01,
+    "tests/test_gateway/test_skill_proposal_review_application.py": 0.01,
     "tests/test_gateway/test_turn_admission_adapter.py": 0.01,
     "tests/test_gateway/test_skill_management_service_injection.py": 0.734,
     "tests/test_gateway/test_spawn_group_pagination.py": 0.01,

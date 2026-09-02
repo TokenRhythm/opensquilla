@@ -67,6 +67,9 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         # SkillManagement wire models terminate at its generated registration
         # Adapter; the Application Module sees explicit mutation commands.
         "src/opensquilla/gateway/adapters/skill_management_contract.py",
+        # Proposal review wire models terminate at its registration Adapter;
+        # scheduler rollback and catalog invalidation stay in the Application Module.
+        "src/opensquilla/gateway/adapters/skill_proposal_review_contract.py",
         # SandboxRuntime handlers stay legacy-compatible while generated
         # descriptors own registration metadata and success validation.
         "src/opensquilla/gateway/adapters/sandbox_runtime_contract.py",
@@ -150,7 +153,7 @@ SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
 SESSIONS_RESOLVE_LITERAL_ALLOWLIST: Counter[str] = Counter()
 SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
 RUNTIME_RPC_METHOD_BASELINE = 306
-STATIC_RPC_DECORATOR_BASELINE = 178
+STATIC_RPC_DECORATOR_BASELINE = 170
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
 # closure measurement below.  The temporary S2a cumulative growth budget was
@@ -234,6 +237,7 @@ R3_APPLICATION_MODULE_FILES = (
     "src/opensquilla/application/observability.py",
     "src/opensquilla/application/skill_catalog.py",
     "src/opensquilla/application/skill_management.py",
+    "src/opensquilla/application/skill_proposal_review.py",
 )
 
 # Generated schema artifacts and consumer tests are intentionally excluded:
@@ -1311,6 +1315,9 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
     from opensquilla.gateway.adapters.skill_management_contract import (
         SKILL_MANAGEMENT_CONTRACT_METHODS,
     )
+    from opensquilla.gateway.adapters.skill_proposal_review_contract import (
+        SKILL_PROPOSAL_REVIEW_CONTRACT_METHODS,
+    )
     from opensquilla.gateway.adapters.turn_admission_contract import (
         TURN_ADMISSION_CONTRACT_METHODS,
     )
@@ -1327,6 +1334,7 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
         *OBSERVABILITY_CONTRACT_METHODS,
         *SKILL_CATALOG_CONTRACT_METHODS,
         *SKILL_MANAGEMENT_CONTRACT_METHODS,
+        *SKILL_PROPOSAL_REVIEW_CONTRACT_METHODS,
     ):
         entry = registry.get_entry(method)
         assert entry is not None
