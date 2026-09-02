@@ -15,6 +15,7 @@ describe('SessionConversation v4 adapter', () => {
     const { api } = makeAdapter()
 
     for (const operation of [
+      'fork',
       'subscribe',
       'hydrate',
       'snapshot',
@@ -25,26 +26,6 @@ describe('SessionConversation v4 adapter', () => {
     ]) {
       expect(api).not.toHaveProperty(operation)
     }
-  })
-
-  it('selects through-turn fork only when that capability is advertised', async () => {
-    const { api, request } = makeAdapter()
-    await api.fork({ key: 'parent', throughTurnId: 'turn-1' })
-    expect(request).toHaveBeenCalledWith(
-      'sessions.forkThroughTurn',
-      { key: 'parent', throughTurnId: 'turn-1' },
-    )
-
-    const fallback = makeAdapter()
-    fallback.api = createV4SessionConversation(
-      { ...fallback.api, request: fallback.request, ready: fallback.ready, supports: vi.fn().mockReturnValue(false) },
-      fallback.events,
-    )
-    await fallback.api.fork({ key: 'parent', throughTurnId: 'turn-1' })
-    expect(fallback.request).toHaveBeenCalledWith(
-      'sessions.fork',
-      { key: 'parent', throughTurnId: 'turn-1' },
-    )
   })
 
   it('maps semantic mutation inputs and connection/event seams', async () => {

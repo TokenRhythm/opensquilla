@@ -69,6 +69,13 @@ from opensquilla.gateway.adapters.plans_contract import (
     register_plans_revise_contract,
     register_plans_set_mode_contract,
 )
+from opensquilla.gateway.adapters.session_lifecycle import (
+    GatewaySessionLifecycleAdapter,
+    GatewaySessionLifecycleCallbacks,
+)
+from opensquilla.gateway.adapters.session_lifecycle_contract import (
+    register_session_lifecycle_contract,
+)
 from opensquilla.gateway.adapters.session_preview import (
     SystemClock,
     preview_params_from_v4,
@@ -3050,223 +3057,76 @@ _handle_sessions_search_contract = register_sessions_search_contract(
 )
 
 
-@_d.method("sessions.create", scope="operator.write")
+def _session_lifecycle_adapter(ctx: RpcContext) -> GatewaySessionLifecycleAdapter:
+    return GatewaySessionLifecycleAdapter(
+        ctx,
+        GatewaySessionLifecycleCallbacks(
+            deployment_fields=_rpc_session_deployment_fields,
+            new_session_key=_create_session_key,
+            normalize_agent_id=normalize_agent_id,
+            agent_model=_agent_registry_model,
+            agent_exists=_agent_registry_has,
+            validate_deployment=_validate_rpc_session_deployment,
+            raise_deployment_model_required=_raise_explicit_session_deployment_model_required,
+            require_key=_require_key,
+            optional_string=_optional_string_param,
+            optional_non_empty_aliased_string=_optional_aliased_non_empty_string_param,
+            model_value=_model_value,
+            effective_agent_id=_effective_agent_id_for_session,
+            fork_session=_fork_with_numbered_title,
+            rename_session=_apply_sessions_patch,
+            delete_session=_delete_session_with_lifecycle,
+            emit_session_event=_emit_to_subscribers,
+            resolve_project_workspace=resolve_validated_project_workspace,
+        ),
+    )
+
+
 async def _handle_sessions_create(params: dict | None, ctx: RpcContext) -> dict:
-    if not isinstance(params, dict):
-        params = {}
-    agent_id = normalize_agent_id(params.get("agentId", "main"))
-    display_name = params.get("displayName")
-    message = params.get("message")
-    requested_model = _model_value(params.get("model"))
-    model = requested_model or _agent_registry_model(ctx, agent_id)
-    kind = params.get("kind") or params.get("sessionKind")
-    session_key = _create_session_key(agent_id, kind)
-    raw_workspace_id = params.get("workspaceId", params.get("workspace_id"))
-    workspace_id: str | None = None
-    if raw_workspace_id is not None:
-        if not isinstance(raw_workspace_id, str) or not raw_workspace_id.strip():
-            raise ValueError("workspaceId must be a non-empty string")
-        workspace_id = raw_workspace_id.strip()
-        if not ctx.principal.is_owner:
-            raise RpcHandlerError(
-                "OWNER_REQUIRED",
-                "Project workspaces require a locally proven owner.",
-            )
-    (
-        provider_present,
-        provider_override,
-        auth_profile_present,
-        auth_profile_override,
-    ) = _rpc_session_deployment_fields(params)
-    deployment_requested = bool(provider_override or auth_profile_override)
-    if deployment_requested:
-        if (
-            "model" not in params
-            or not isinstance(params.get("model"), str)
-            or requested_model is None
-        ):
-            _raise_explicit_session_deployment_model_required()
-        _validate_rpc_session_deployment(
-            ctx,
-            session_key=session_key,
-            provider=provider_override,
-            model=requested_model,
-            auth_profile=auth_profile_override,
-        )
-    if message is not None and not isinstance(message, str):
-        raise ValueError("params.message must be a string")
-
-    if not await _agent_registry_has(ctx, agent_id):
-        raise RpcHandlerError(
-            "agent.not_found",
-            f"Agent '{agent_id}' does not exist",
-            details={"agentId": agent_id},
-        )
-
-    if ctx.session_manager is None:
-        if message:
-            raise RpcUnavailableError("sessions.create(message=...) requires a session manager")
-        if provider_present or auth_profile_present:
-            raise RpcUnavailableError(
-                "sessions.create deployment overrides require a session manager"
-            )
-        if workspace_id is not None:
-            raise RpcUnavailableError(
-                "sessions.create(workspaceId=...) requires a session manager"
-            )
-        return {
-            "key": session_key,
-            "sessionId": session_key.rsplit(":", 1)[-1],
-            "note": "session manager not available",
-        }
-
-    create_kwargs: dict[str, Any] = {
-        "session_key": session_key,
-        "agent_id": agent_id,
-        "display_name": display_name,
-        "model": model,
-    }
-    if provider_present:
-        create_kwargs["provider_override"] = provider_override
-    if auth_profile_present:
-        create_kwargs["auth_profile_override"] = auth_profile_override
-        create_kwargs["auth_profile_override_source"] = (
-            "rpc" if auth_profile_override else None
-        )
-    if workspace_id is not None:
-        storage = get_session_storage(ctx.session_manager)
-        if storage is None:
-            raise RpcUnavailableError(
-                "sessions.create(workspaceId=...) requires session storage"
-            )
-        try:
-            validated_workspace = await resolve_validated_project_workspace(
-                storage,
-                workspace_id,
-            )
-        except ProjectWorkspaceStateError as exc:
-            raise map_project_workspace_error(
-                exc,
-                owner=ctx.principal.is_owner,
-            ) from exc
-        mode = project_default_run_mode(ctx.config)
-        mode_source = (
-            "project_default"
-            if mode is RunMode.SAFE and config_run_mode(ctx.config) is RunMode.FULL
-            else "operator_default"
-        )
-        create_kwargs["workspace_id"] = validated_workspace.workspace.workspace_id
-        create_kwargs["origin"] = {
-            RUN_CONTEXT_ORIGIN_KEY: RunContext(
-                run_mode=mode,
-                workspace=validated_workspace.workspace.path,
-                run_mode_source=mode_source,
-                source="project_workspace",
-            ).to_origin_payload()
-        }
-    session = await ctx.session_manager.create(
-        **create_kwargs,
-    )
-    result = {"key": session.session_key, "sessionId": session.session_id}
-
-    if message:
-        _persisted = await ctx.session_manager.append_message(
-            session.session_key,
-            role="user",
-            content=message,
-        )
-        if _persisted is not None and isinstance(_persisted.content, str):
-            message = _persisted.content
-        result["seededMessage"] = True
-
-    return result
+    return await _session_lifecycle_adapter(ctx).create(params)
 
 
-async def _fork_session_impl(
-    params: dict | None,
-    ctx: RpcContext,
-    *,
-    require_through_turn: bool,
-) -> dict:
-    """Fork a session using the legacy or capability-safe through-turn contract."""
-
-    key = _require_key(params)
-    assert isinstance(params, dict)
-    title = params.get("title")
-    if title is not None and not isinstance(title, str):
-        raise ValueError("params.title must be a string")
-    before_message_id = _optional_string_param(
-        params,
-        "beforeMessageId",
-        "before_message_id",
-    )
-    through_turn_id = _optional_aliased_non_empty_string_param(
-        params,
-        "throughTurnId",
-        "through_turn_id",
-    )
-    if require_through_turn:
-        if any(name in params for name in ("beforeMessageId", "before_message_id")):
-            raise ValueError("sessions.forkThroughTurn does not accept beforeMessageId")
-        if through_turn_id is None:
-            raise ValueError("params.throughTurnId is required")
-    if before_message_id and through_turn_id:
-        raise ValueError("beforeMessageId and throughTurnId are mutually exclusive")
-
-    if ctx.session_manager is None:
-        raise KeyError("No session manager available")
-    storage = get_session_storage(ctx.session_manager)
-    if storage is None:
-        raise KeyError("No session storage available")
-
-    parent = await storage.get_session(key)
-    if parent is None:
-        raise KeyError(f"Session not found: {key}")
-
-    agent_id = _effective_agent_id_for_session(parent, key)
-    child_key = _create_session_key(agent_id, "webchat")
-    child = await _fork_with_numbered_title(
-        ctx,
-        storage,
-        key,
-        child_key,
-        explicit_title=title,
-        fork_transcript=True,
-        status=SessionStatus.DONE,
-        fork_before_message_id=before_message_id,
-        fork_through_turn_id=through_turn_id,
-    )
-
-    await _emit_to_subscribers(
-        ctx,
-        child.session_key,
-        "sessions.changed",
-        build_sessions_changed_payload(child.session_key, "forked", run_status="idle"),
-    )
-
-    result = {"key": child.session_key, "parentKey": key}
-    if through_turn_id is not None:
-        result.update(
-            {
-                "forkMode": "through_turn",
-                "throughTurnId": through_turn_id,
-            }
-        )
-    return result
+_handle_sessions_create_contract = register_session_lifecycle_contract(
+    _d,
+    "sessions.create",
+    _handle_sessions_create,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
-@_d.method("sessions.fork", scope="operator.write")
 async def _handle_sessions_fork(params: dict | None, ctx: RpcContext) -> dict:
     """Fork a session using the backwards-compatible full/prefix contract."""
 
-    return await _fork_session_impl(params, ctx, require_through_turn=False)
+    return await _session_lifecycle_adapter(ctx).fork(
+        params,
+        require_through_turn=False,
+    )
 
 
-@_d.method("sessions.forkThroughTurn", scope="operator.write")
 async def _handle_sessions_fork_through_turn(params: dict | None, ctx: RpcContext) -> dict:
     """Fork through one terminal turn without a silent full-fork fallback."""
 
-    return await _fork_session_impl(params, ctx, require_through_turn=True)
+    return await _session_lifecycle_adapter(ctx).fork(
+        params,
+        require_through_turn=True,
+    )
+
+
+_handle_sessions_fork_contract = register_session_lifecycle_contract(
+    _d,
+    "sessions.fork",
+    _handle_sessions_fork,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_sessions_fork_through_turn_contract = register_session_lifecycle_contract(
+    _d,
+    "sessions.forkThroughTurn",
+    _handle_sessions_fork_through_turn,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 async def _should_auto_title(
@@ -9504,9 +9364,6 @@ _SESSION_DEPLOYMENT_PATCH_FIELDS = frozenset(
     }
 )
 
-_MAX_SESSION_DISPLAY_NAME_CHARS = 512
-
-
 @_d.method("sessions.patch", scope="operator.admin")
 async def _handle_sessions_patch(params: dict | None, ctx: RpcContext) -> dict:
     key = _require_key(params)
@@ -9545,50 +9402,19 @@ async def _handle_sessions_patch(params: dict | None, ctx: RpcContext) -> dict:
     return result
 
 
-@_d.method("sessions.rename", scope="operator.write")
 async def _handle_sessions_rename(params: dict | None, ctx: RpcContext) -> dict:
     """Rename one session without exposing admin-only deployment fields."""
 
-    key = _require_key(params)
-    assert isinstance(params, dict)
-    unexpected = sorted(set(params) - {"key", "displayName"})
-    if unexpected:
-        raise RpcHandlerError(
-            code="INVALID_PARAMS",
-            message="sessions.rename accepts only key and displayName.",
-            details={"unexpected_fields": unexpected},
-        )
-    display_name = params.get("displayName")
-    if not isinstance(display_name, str) or not display_name.strip():
-        raise RpcHandlerError(
-            code="INVALID_PARAMS",
-            message="displayName must be a non-empty string.",
-            details={"field": "displayName"},
-        )
-    normalized_display_name = display_name.strip()
-    if len(normalized_display_name) > _MAX_SESSION_DISPLAY_NAME_CHARS:
-        raise RpcHandlerError(
-            code="INVALID_PARAMS",
-            message=(
-                "displayName must be at most "
-                f"{_MAX_SESSION_DISPLAY_NAME_CHARS} characters."
-            ),
-            details={
-                "field": "displayName",
-                "maxLength": _MAX_SESSION_DISPLAY_NAME_CHARS,
-            },
-        )
-    if ctx.session_manager is None:
-        raise KeyError("No session manager available")
-    storage = get_session_storage(ctx.session_manager)
-    if storage is None:
-        raise KeyError("No session storage available")
-    return await _apply_sessions_patch(
-        {"key": key, "displayName": normalized_display_name},
-        ctx,
-        key=key,
-        storage=storage,
-    )
+    return await _session_lifecycle_adapter(ctx).rename(params)
+
+
+_handle_sessions_rename_contract = register_session_lifecycle_contract(
+    _d,
+    "sessions.rename",
+    _handle_sessions_rename,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 @_d.method("sessions.reset", scope="operator.write")
@@ -9947,23 +9773,6 @@ def _reset_response(
     }
 
 
-async def _settle_session_delete_despite_cancellation(awaitable: Any) -> Any:
-    """Finish one fenced delete before propagating caller cancellation."""
-
-    operation = asyncio.ensure_future(awaitable)
-    cancellation: asyncio.CancelledError | None = None
-    while not operation.done():
-        try:
-            await asyncio.shield(operation)
-        except asyncio.CancelledError as exc:
-            cancellation = cancellation or exc
-    if cancellation is not None:
-        with contextlib.suppress(BaseException):
-            operation.result()
-        raise cancellation
-    return operation.result()
-
-
 async def _delete_session_with_lifecycle(
     *,
     canonical_key: str,
@@ -10054,44 +9863,18 @@ async def _delete_session_with_lifecycle(
             evict_runtime_state(canonical_key, session_id=session_id)
 
 
-@_d.method("sessions.delete", scope="operator.write")
 async def _handle_sessions_delete(params: dict | None, ctx: RpcContext) -> dict:
     """Delete one or more sessions. Accepts {key} for single or {keys} for bulk."""
-    if ctx.session_manager is None:
-        raise KeyError("No session manager available")
+    return await _session_lifecycle_adapter(ctx).delete(params)
 
-    storage = get_session_storage(ctx.session_manager)
-    if storage is None:
-        raise KeyError("No session storage available")
 
-    # Support both single key and bulk keys
-    keys: list[str] = []
-    if isinstance(params, dict):
-        if "keys" in params:
-            keys = params["keys"]
-        elif "key" in params:
-            keys = [params["key"]]
-
-    if not keys:
-        raise ValueError("params.key or params.keys is required")
-
-    deleted: list[str] = []
-    errors: list[str] = []
-    for k in keys:
-        try:
-            canonical_key = canonicalize_session_key(k)
-            await _settle_session_delete_despite_cancellation(
-                _delete_session_with_lifecycle(
-                    canonical_key=canonical_key,
-                    ctx=ctx,
-                    storage=storage,
-                )
-            )
-            deleted.append(k)
-        except Exception as exc:
-            errors.append(f"{k}: {exc}")
-
-    return {"deleted": deleted, "errors": errors}
+_handle_sessions_delete_contract = register_session_lifecycle_contract(
+    _d,
+    "sessions.delete",
+    _handle_sessions_delete,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 @_d.method("sessions.contextCompact", scope="operator.write")
