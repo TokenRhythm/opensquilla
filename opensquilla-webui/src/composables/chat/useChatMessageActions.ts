@@ -65,6 +65,8 @@ interface EditRestorePoint {
   previousForkBeforeMessageId: string | null
   /** Ties the restore point to the edit that made it; see `cancelEdit`. */
   forkBeforeMessageId: string
+  /** The edit that was active before this one, for layered Escape restores. */
+  previousRestorePoint: EditRestorePoint | null
 }
 
 export function useChatMessageActions(options: UseChatMessageActionsOptions) {
@@ -78,6 +80,31 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     editRestorePoint = null
     editGeneration.value += 1
   }, { flush: 'sync' })
+
+  function restoreOwnsCurrentSessionAndFork(restore: EditRestorePoint): boolean {
+    return options.sessionKey.value === restore.sessionKey
+      && options.pendingForkBeforeMessageId.value === restore.forkBeforeMessageId
+  }
+
+  function restoreOwnsCurrentTranscript(restore: EditRestorePoint): boolean {
+    const currentMessages = options.messages.value
+    return toRaw(currentMessages) === restore.editingMessages
+      && currentMessages.length === restore.editingMessageOwners.length
+      && currentMessages.every(
+        (message, index) => toRaw(message) === restore.editingMessageOwners[index],
+      )
+  }
+
+  function retireOwnedEdit(restore: EditRestorePoint): void {
+    editRestorePoint = null
+    editGeneration.value += 1
+    if (
+      options.sessionKey.value === restore.sessionKey
+      && options.pendingForkBeforeMessageId.value === restore.forkBeforeMessageId
+    ) {
+      options.pendingForkBeforeMessageId.value = null
+    }
+  }
 
   function copyableMessageText(message: ChatRenderedMessage): string {
     // User bubbles render the raw text with only the time prefix stripped, so
@@ -170,6 +197,13 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
       console.warn('Wait for the current response to finish')
       return false
     }
+    if (editRestorePoint) {
+      // Regenerate and edit both replace the visible branch, but only edit has
+      // an Escape restore frame. Let the user cancel or send that edit first;
+      // otherwise regenerate would replace its fork and orphan the frame.
+      console.warn('Finish or cancel the current message edit before regenerating')
+      return false
+    }
     const usageBarrierRetry = isUsageAccountingBarrierMessage(message)
     const assistantIndex = sourceMessageIndex(message)
     const usageBarrierUserIndex = strictUsageBarrierRetryUserMessageIndex(
@@ -235,6 +269,26 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     }
     const text = sourceMessage.text || ''
     const editingMessages = options.messages.value.slice(0, msgIndex)
+    const previousRestore = editRestorePoint
+    if (
+      previousRestore
+      && (
+        !restoreOwnsCurrentSessionAndFork(previousRestore)
+        || !restoreOwnsCurrentTranscript(previousRestore)
+      )
+    ) {
+      // Never hang a new edit from a stale lower frame. In particular, an
+      // authoritative history replacement must not leave its old fork anchor
+      // underneath the new restore point, where a later Escape could revive it.
+      retireOwnedEdit(previousRestore)
+    }
+    if (!editRestorePoint && options.pendingForkBeforeMessageId.value) {
+      // A regenerate (or another branch owner) already owns this composer.
+      // Replacing its fork without a corresponding restore frame would make
+      // Escape unable to return to either operation coherently.
+      console.warn('Finish the current branched draft before editing another message')
+      return
+    }
     editGeneration.value += 1
     // Everything below this line is undone by `cancelEdit`. Entering edit mode
     // is not a decision the user has confirmed — the transcript shrinks to
@@ -249,6 +303,7 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
       inputText: options.inputText.value,
       previousForkBeforeMessageId: options.pendingForkBeforeMessageId.value,
       forkBeforeMessageId,
+      previousRestorePoint: editRestorePoint,
     }
     options.pendingForkBeforeMessageId.value = forkBeforeMessageId
     options.messages.value = editingMessages
@@ -260,46 +315,93 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
   /**
    * Put the transcript and the draft back, if an edit is still uncommitted.
    *
-   * Returns whether anything was restored, so a caller can tell an edit
-   * cancellation apart from an ordinary Escape and act on only one of them.
+   * Returns whether Escape handled an edit, including retiring an edit whose
+   * transcript was authoritatively replaced. The latter must consume Escape so
+   * the replacement owner's draft is not cleared by the ordinary shortcut.
    *
-   * The restore point is only honoured while `pendingForkBeforeMessageId` still
-   * holds the id the edit set. Sending consumes that id, and a second edit
-   * replaces it; in both cases the truncation has been made real by something
-   * the user did mean, and resurrecting the old array would put back messages
-   * the server no longer has.
+   * The top restore point is only honoured while
+   * `pendingForkBeforeMessageId` still holds the id that edit set. Sending
+   * consumes that id and retires the whole stack; a nested edit instead becomes
+   * the new top and Escape returns one layer at a time.
    */
   function cancelEdit(): boolean {
     const restore = editRestorePoint
     if (!restore) return false
-    editRestorePoint = null
-    const currentMessages = options.messages.value
-    if (
-      options.sessionKey.value !== restore.sessionKey
-      || options.pendingForkBeforeMessageId.value !== restore.forkBeforeMessageId
-    ) {
+    if (!restoreOwnsCurrentSessionAndFork(restore)) {
+      // The fork was consumed or replaced by another action. Drop every lower
+      // frame without touching the new owner or resurrecting an older branch.
+      editRestorePoint = null
+      editGeneration.value += 1
       return false
     }
-    editGeneration.value += 1
-    const stillOwnsTranscript = (
-      toRaw(currentMessages) === restore.editingMessages
-      && currentMessages.length === restore.editingMessageOwners.length
-      && currentMessages.every(
-        (message, index) => toRaw(message) === restore.editingMessageOwners[index],
-      )
-    )
-    if (!stillOwnsTranscript) {
+    if (!restoreOwnsCurrentTranscript(restore)) {
       // A same-session history refresh can replace the array while an edit-owned
       // send is awaiting preflight. The authoritative transcript must win, but
       // the abandoned edit must not leave either that send generation or its
       // fork anchor live for the next ordinary draft.
-      options.pendingForkBeforeMessageId.value = null
-      return false
+      retireOwnedEdit(restore)
+      return true
     }
+    editRestorePoint = restore.previousRestorePoint
+    editGeneration.value += 1
     options.pendingForkBeforeMessageId.value = restore.previousForkBeforeMessageId
     options.messages.value = restore.messages
     options.inputText.value = restore.inputText
     options.autoResizeTextarea()
+    return true
+  }
+
+  /**
+   * Revalidate the uncommitted edit immediately before a send mutates state.
+   * Generation alone cannot detect a same-session history refresh because it
+   * happens outside this composable.
+   */
+  function validateEditOwner(generation: number): boolean {
+    if (editGeneration.value !== generation) return false
+    const restore = editRestorePoint
+    if (!restore) return true
+    if (!restoreOwnsCurrentSessionAndFork(restore)) {
+      editRestorePoint = null
+      editGeneration.value += 1
+      return false
+    }
+    if (restoreOwnsCurrentTranscript(restore)) return true
+    retireOwnedEdit(restore)
+    return false
+  }
+
+  /**
+   * A definitely rejected send may leave only its own optimistic/error rows in
+   * the edit-owned transcript. Adopt those exact identities so Escape can still
+   * restore the pre-edit conversation. Arbitrary suffixes are never accepted.
+   */
+  function adoptRejectedEditRows(
+    generation: number,
+    rows: readonly ChatMessage[],
+  ): boolean {
+    if (editGeneration.value !== generation || rows.length === 0) return false
+    const restore = editRestorePoint
+    if (!restore) return false
+    if (!restoreOwnsCurrentSessionAndFork(restore)) {
+      editRestorePoint = null
+      editGeneration.value += 1
+      return false
+    }
+    const currentMessages = options.messages.value
+    const expectedLength = restore.editingMessageOwners.length + rows.length
+    const ownsPrefix = toRaw(currentMessages) === restore.editingMessages
+      && currentMessages.length === expectedLength
+      && restore.editingMessageOwners.every(
+        (message, index) => toRaw(currentMessages[index]) === message,
+      )
+    const ownsSuffix = rows.every((message, index) => (
+      toRaw(currentMessages[restore.editingMessageOwners.length + index]) === toRaw(message)
+    ))
+    if (!ownsPrefix || !ownsSuffix) {
+      retireOwnedEdit(restore)
+      return false
+    }
+    restore.editingMessageOwners.push(...rows.map(message => toRaw(message)))
     return true
   }
 
@@ -308,6 +410,8 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     regenerateMessage,
     editMessage,
     cancelEdit,
+    validateEditOwner,
+    adoptRejectedEditRows,
     editGeneration,
   }
 }

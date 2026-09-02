@@ -253,7 +253,7 @@ describe('useChatMessageActions branching edits', () => {
     ]
     options.inputText.value = 'new owner draft'
 
-    expect(api.cancelEdit()).toBe(false)
+    expect(api.cancelEdit()).toBe(true)
     expect(api.editGeneration.value).toBe(2)
     expect(pendingForkBeforeMessageId.value).toBeNull()
     expect(options.messages.value.map(message => message.text)).toEqual(['new owner'])
@@ -280,7 +280,7 @@ describe('useChatMessageActions branching edits', () => {
     })
     options.inputText.value = 'new owner draft'
 
-    expect(api.cancelEdit()).toBe(false)
+    expect(api.cancelEdit()).toBe(true)
     expect(api.editGeneration.value).toBe(2)
     expect(pendingForkBeforeMessageId.value).toBeNull()
     expect(options.messages.value).toBe(currentOwner)
@@ -290,29 +290,167 @@ describe('useChatMessageActions branching edits', () => {
     expect(options.inputText.value).toBe('new owner draft')
   })
 
-  it('keeps the newer edit when a second one replaces the first', () => {
+  it('cancels nested edits one layer at a time without orphaning a fork', () => {
     const { api, options, pendingForkBeforeMessageId } = makeOptions([
       { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
       { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
       { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
       { role: 'assistant', text: 'ack B', ts: null, messageId: 'msg-b1' },
     ])
+    options.inputText.value = 'unrelated original draft'
 
     api.editMessage(renderedMessage({
       role: 'user', displayRole: 'user', sourceIndex: 2, messageId: 'msg-B', text: 'B',
     }))
+    options.inputText.value = 'edited B draft'
     api.editMessage(renderedMessage({
       role: 'user', displayRole: 'user', sourceIndex: 0, messageId: 'msg-A', text: 'A',
     }))
 
     expect(pendingForkBeforeMessageId.value).toBe('msg-A')
     expect(api.cancelEdit()).toBe(true)
-    // The second edit's restore point wins: back to what the first edit left,
-    // not to the untouched transcript. Cancelling one edit must not undo the
-    // other.
+    // The first Escape returns to the still-uncommitted B edit.
     expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A'])
-    expect(options.inputText.value).toBe('B')
+    expect(options.inputText.value).toBe('edited B draft')
     expect(pendingForkBeforeMessageId.value).toBe('msg-B')
+
+    expect(api.cancelEdit()).toBe(true)
+    expect(options.messages.value.map(message => message.text)).toEqual([
+      'A', 'ack A', 'B', 'ack B',
+    ])
+    expect(options.inputText.value).toBe('unrelated original draft')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(api.cancelEdit()).toBe(false)
+  })
+
+  it('keeps an active edit untouched when regenerate is requested', async () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+      { role: 'assistant', text: 'ack B', ts: null, messageId: 'msg-b1' },
+    ])
+    const originalOwner = options.messages.value
+
+    api.editMessage(renderedMessage({
+      role: 'user', displayRole: 'user', sourceIndex: 2, messageId: 'msg-B', text: 'B',
+    }))
+    options.inputText.value = 'edited B'
+    const editOwner = options.messages.value
+
+    const regenerated = await api.regenerateMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      sourceIndex: 1,
+      messageId: 'msg-a1',
+      text: 'ack A',
+    }))
+    await nextTick()
+
+    expect(regenerated).toBe(false)
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    expect(options.messages.value).toBe(editOwner)
+    expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A'])
+    expect(options.inputText.value).toBe('edited B')
+    expect(pendingForkBeforeMessageId.value).toBe('msg-B')
+
+    expect(api.cancelEdit()).toBe(true)
+    expect(options.messages.value).toBe(originalOwner)
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+  })
+
+  it('does not replace a foreign pending fork when entering edit mode', () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+    ])
+    const forkOwner = options.messages.value
+    pendingForkBeforeMessageId.value = 'msg-A'
+    options.inputText.value = 'pending regenerate draft'
+
+    api.editMessage(renderedMessage({
+      role: 'user', displayRole: 'user', sourceIndex: 2, messageId: 'msg-B', text: 'B',
+    }))
+
+    expect(options.messages.value).toBe(forkOwner)
+    expect(options.inputText.value).toBe('pending regenerate draft')
+    expect(pendingForkBeforeMessageId.value).toBe('msg-A')
+    expect(options.focusComposer).not.toHaveBeenCalled()
+    expect(api.editGeneration.value).toBe(0)
+    expect(api.cancelEdit()).toBe(false)
+  })
+
+  it('retires an edit during pre-dispatch validation when history replaced it', () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+    ])
+    api.editMessage(renderedMessage({
+      role: 'user', displayRole: 'user', sourceIndex: 0, messageId: 'msg-A', text: 'A',
+    }))
+    const generation = api.editGeneration.value
+    const replacement = [
+      { role: 'user' as const, text: 'authoritative', ts: null, messageId: 'msg-new' },
+    ]
+    options.messages.value = replacement
+    const replacementOwner = options.messages.value
+    options.inputText.value = 'authoritative draft'
+
+    expect(api.validateEditOwner(generation)).toBe(false)
+    expect(api.editGeneration.value).toBe(generation + 1)
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.messages.value).toBe(replacementOwner)
+    expect(options.inputText.value).toBe('authoritative draft')
+    expect(api.cancelEdit()).toBe(false)
+  })
+
+  it('adopts only exact rejected-send rows before restoring the original edit state', () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+    ])
+    options.inputText.value = 'original draft'
+    api.editMessage(renderedMessage({
+      role: 'user', displayRole: 'user', sourceIndex: 2, messageId: 'msg-B', text: 'B',
+    }))
+    const generation = api.editGeneration.value
+    const optimistic: ChatMessage = { role: 'user', text: 'edited B', ts: null }
+    const error: ChatMessage = { role: 'error', text: 'rejected', ts: null }
+    options.messages.value.push(optimistic, error)
+
+    expect(api.adoptRejectedEditRows(generation, [optimistic, error])).toBe(true)
+    expect(api.cancelEdit()).toBe(true)
+    expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A', 'B'])
+    expect(options.inputText.value).toBe('original draft')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+  })
+
+  it('retires instead of adopting rejected rows around an unrelated suffix', () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+    ])
+    api.editMessage(renderedMessage({
+      role: 'user', displayRole: 'user', sourceIndex: 2, messageId: 'msg-B', text: 'B',
+    }))
+    const generation = api.editGeneration.value
+    const optimistic: ChatMessage = { role: 'user', text: 'edited B', ts: null }
+    const unrelated: ChatMessage = { role: 'assistant', text: 'authoritative row', ts: null }
+    const error: ChatMessage = { role: 'error', text: 'rejected', ts: null }
+    options.messages.value.push(optimistic, unrelated, error)
+    const currentOwner = options.messages.value
+
+    expect(api.adoptRejectedEditRows(generation, [optimistic, error])).toBe(false)
+    expect(api.editGeneration.value).toBe(generation + 1)
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(api.cancelEdit()).toBe(false)
+    expect(options.messages.value).toBe(currentOwner)
+    expect(options.messages.value.map(message => message.text)).toEqual([
+      'A', 'ack A', 'edited B', 'authoritative row', 'rejected',
+    ])
   })
 
   it('records the previous user message id before regenerating', async () => {

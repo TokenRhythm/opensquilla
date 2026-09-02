@@ -19,6 +19,7 @@ import type {
   ChatRenderedMessage,
 } from '@/types/chat'
 import type { CollaborationMode } from '@/types/plans'
+import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import {
   useChatPendingQueue,
   type BusySendMode,
@@ -228,6 +229,67 @@ function makeOptions(overrides: SendHarnessOverrides = {}) {
     )
   }
   return { api: useChatSend(options), options, rpc, stream, pendingQueue, metaDiscardDraft }
+}
+
+function makeEditedMessageState(editedDraft?: string) {
+  const originalTranscript: ChatMessage[] = [
+    { role: 'user', text: 'original question', ts: null, messageId: 'msg-original' },
+    { role: 'assistant', text: 'original answer', ts: null, messageId: 'msg-answer' },
+  ]
+  const sessionKey = ref('agent:main:webchat:test')
+  const messages = ref<ChatMessage[]>(originalTranscript)
+  const originalOwner = messages.value
+  const inputText = ref('unrelated draft')
+  const pendingForkBeforeMessageId = ref<string | null>(null)
+  const messageActions = useChatMessageActions({
+    sessionKey,
+    messages,
+    inputText,
+    isStreaming: ref(false),
+    sanitizeCopyText: text => text,
+    stripTimePrefix: text => text,
+    autoResizeTextarea: vi.fn(),
+    sendCurrentInput: vi.fn(),
+    sendUsageBarrierReplay: vi.fn(async () => false),
+    focusComposer: vi.fn(),
+    pendingForkBeforeMessageId,
+  })
+  messageActions.editMessage({
+    role: 'user',
+    displayRole: 'user',
+    roleLabel: 'User',
+    text: 'original question',
+    timeStr: '',
+    showHeader: false,
+    sourceIndex: 0,
+    messageId: 'msg-original',
+  })
+  if (editedDraft !== undefined) inputText.value = editedDraft
+  return {
+    sessionKey,
+    messages,
+    originalOwner,
+    inputText,
+    pendingForkBeforeMessageId,
+    messageActions,
+  }
+}
+
+function messageEditAnnotation(): PromptAnnotationSnapshot {
+  return {
+    annotationId: 'annotation-edit',
+    documentId: 'document-1',
+    documentName: 'page.html',
+    revisionId: 'revision-1',
+    generation: 1,
+    anchorId: 'anchor-edit',
+    body: 'Change this message',
+    tagName: 'p',
+    locator: {},
+    quote: 'original question',
+    sourceExcerpt: null,
+    sentOrder: 0,
+  }
 }
 
 function sameTurnSteerOptions(
@@ -2210,36 +2272,13 @@ describe('useChatSend attachment payloads', () => {
   })
 
   it('abandons an edited send when Escape cancels it during project validation', async () => {
-    const sessionKey = ref('agent:main:webchat:test')
-    const messages = ref<ChatMessage[]>([
-      { role: 'user', text: 'original question', ts: null, messageId: 'msg-original' },
-      { role: 'assistant', text: 'original answer', ts: null, messageId: 'msg-answer' },
-    ])
-    const inputText = ref('unrelated draft')
-    const pendingForkBeforeMessageId = ref<string | null>(null)
-    const messageActions = useChatMessageActions({
+    const {
       sessionKey,
       messages,
       inputText,
-      isStreaming: ref(false),
-      sanitizeCopyText: text => text,
-      stripTimePrefix: text => text,
-      autoResizeTextarea: vi.fn(),
-      sendCurrentInput: vi.fn(),
-      sendUsageBarrierReplay: vi.fn(async () => false),
-      focusComposer: vi.fn(),
       pendingForkBeforeMessageId,
-    })
-    messageActions.editMessage({
-      role: 'user',
-      displayRole: 'user',
-      roleLabel: 'User',
-      text: 'original question',
-      timeStr: '',
-      showHeader: false,
-      sourceIndex: 0,
-      messageId: 'msg-original',
-    })
+      messageActions,
+    } = makeEditedMessageState()
 
     let finishPreflight!: () => void
     const validateActiveProjectBeforeSend = vi.fn(() => new Promise<string | null>(
@@ -2253,6 +2292,8 @@ describe('useChatSend attachment payloads', () => {
       inputText,
       pendingForkBeforeMessageId,
       messageEditGeneration: messageActions.editGeneration,
+      validateMessageEditOwner: messageActions.validateEditOwner,
+      adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
       validateActiveProjectBeforeSend,
     })
 
@@ -2271,36 +2312,13 @@ describe('useChatSend attachment payloads', () => {
   })
 
   it('abandons an edited send when its transcript owner changes during validation', async () => {
-    const sessionKey = ref('agent:main:webchat:test')
-    const messages = ref<ChatMessage[]>([
-      { role: 'user', text: 'original question', ts: null, messageId: 'msg-original' },
-      { role: 'assistant', text: 'original answer', ts: null, messageId: 'msg-answer' },
-    ])
-    const inputText = ref('unrelated draft')
-    const pendingForkBeforeMessageId = ref<string | null>(null)
-    const messageActions = useChatMessageActions({
+    const {
       sessionKey,
       messages,
       inputText,
-      isStreaming: ref(false),
-      sanitizeCopyText: text => text,
-      stripTimePrefix: text => text,
-      autoResizeTextarea: vi.fn(),
-      sendCurrentInput: vi.fn(),
-      sendUsageBarrierReplay: vi.fn(async () => false),
-      focusComposer: vi.fn(),
       pendingForkBeforeMessageId,
-    })
-    messageActions.editMessage({
-      role: 'user',
-      displayRole: 'user',
-      roleLabel: 'User',
-      text: 'original question',
-      timeStr: '',
-      showHeader: false,
-      sourceIndex: 0,
-      messageId: 'msg-original',
-    })
+      messageActions,
+    } = makeEditedMessageState()
 
     let finishPreflight!: () => void
     const validateActiveProjectBeforeSend = vi.fn(() => new Promise<string | null>(
@@ -2314,6 +2332,8 @@ describe('useChatSend attachment payloads', () => {
       inputText,
       pendingForkBeforeMessageId,
       messageEditGeneration: messageActions.editGeneration,
+      validateMessageEditOwner: messageActions.validateEditOwner,
+      adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
       validateActiveProjectBeforeSend,
     })
 
@@ -2325,7 +2345,7 @@ describe('useChatSend attachment payloads', () => {
     messages.value = replacementTranscript
     const replacementOwner = messages.value
     inputText.value = 'replacement owner draft'
-    expect(messageActions.cancelEdit()).toBe(false)
+    expect(messageActions.cancelEdit()).toBe(true)
     expect(messageActions.editGeneration.value).toBe(2)
     expect(pendingForkBeforeMessageId.value).toBeNull()
     finishPreflight()
@@ -2336,37 +2356,234 @@ describe('useChatSend attachment payloads', () => {
     expect(inputText.value).toBe('replacement owner draft')
   })
 
-  it('does not start async queue persistence for a fork edit while work is active', async () => {
-    const sessionKey = ref('agent:main:webchat:test')
-    const messages = ref<ChatMessage[]>([
-      { role: 'user', text: 'original question', ts: null, messageId: 'msg-original' },
-      { role: 'assistant', text: 'original answer', ts: null, messageId: 'msg-answer' },
-    ])
-    const inputText = ref('unrelated draft')
-    const pendingForkBeforeMessageId = ref<string | null>(null)
-    const messageActions = useChatMessageActions({
+  it('detects transcript replacement during validation without requiring Escape', async () => {
+    const {
       sessionKey,
       messages,
       inputText,
-      isStreaming: ref(false),
-      sanitizeCopyText: text => text,
-      stripTimePrefix: text => text,
-      autoResizeTextarea: vi.fn(),
-      sendCurrentInput: vi.fn(),
-      sendUsageBarrierReplay: vi.fn(async () => false),
-      focusComposer: vi.fn(),
       pendingForkBeforeMessageId,
+      messageActions,
+    } = makeEditedMessageState()
+
+    let finishPreflight!: () => void
+    const validateActiveProjectBeforeSend = vi.fn(() => new Promise<string | null>(
+      resolve => {
+        finishPreflight = () => resolve(null)
+      },
+    ))
+    const { api, rpc } = makeOptions({
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      messageEditGeneration: messageActions.editGeneration,
+      validateMessageEditOwner: messageActions.validateEditOwner,
+      adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
+      validateActiveProjectBeforeSend,
     })
-    messageActions.editMessage({
-      role: 'user',
-      displayRole: 'user',
-      roleLabel: 'User',
-      text: 'original question',
-      timeStr: '',
-      showHeader: false,
-      sourceIndex: 0,
-      messageId: 'msg-original',
+
+    const send = api.onSend()
+    await vi.waitFor(() => expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce())
+    const replacementTranscript: ChatMessage[] = [
+      { role: 'user', text: 'authoritative replacement', ts: null, messageId: 'msg-new' },
+    ]
+    messages.value = replacementTranscript
+    const replacementOwner = messages.value
+    inputText.value = 'replacement owner draft'
+    finishPreflight()
+    await send
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(messageActions.editGeneration.value).toBe(2)
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(messages.value).toBe(replacementOwner)
+    expect(inputText.value).toBe('replacement owner draft')
+    expect(messageActions.cancelEdit()).toBe(false)
+  })
+
+  it('exact-replays an unknown edited fork only while its transcript owner is unchanged', async () => {
+    const {
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      messageActions,
+    } = makeEditedMessageState('edited question')
+    const annotation = messageEditAnnotation()
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+        .mockRejectedValueOnce(new RpcTransportError('Connection closed again', null))
+        .mockResolvedValueOnce({
+          sessionKey: 'agent:main:webchat:test',
+          task_id: 'should-not-send',
+        }),
+    }
+    const { api, stream } = makeOptions({
+      rpc,
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      promptAnnotationIds: ref(['annotation-edit']),
+      promptAnnotationSnapshots: () => [annotation],
+      messageEditGeneration: messageActions.editGeneration,
+      validateMessageEditOwner: messageActions.validateEditOwner,
+      adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
     })
+
+    await api.onSend()
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'error'])
+
+    inputText.value = 'draft typed while retrying'
+    // The live stream belongs to this request whose acceptance is unknown.
+    // An exact receipt replay may resolve it, but must not restart or clear it.
+    stream.isStreaming.value = true
+    await api.onSend()
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+    expect(rpc.call.mock.calls[1]?.[1]?.clientRequestId).toBe(
+      rpc.call.mock.calls[0]?.[1]?.clientRequestId,
+    )
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'error', 'error'])
+    expect(inputText.value).toBe('draft typed while retrying')
+    expect(stream.isStreaming.value).toBe(true)
+
+    messages.value = [
+      { role: 'user', text: 'authoritative replacement', ts: null, messageId: 'msg-new' },
+    ]
+    const replacementOwner = messages.value
+    inputText.value = 'replacement owner draft'
+    await api.onSend()
+
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+    expect(messageActions.editGeneration.value).toBe(2)
+    expect(messages.value).toBe(replacementOwner)
+    expect(inputText.value).toBe('replacement owner draft')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(messageActions.cancelEdit()).toBe(false)
+
+    // The stale receipt was detached by the failed lease validation. Once the
+    // authoritative work is idle, a later draft is an ordinary fresh send.
+    stream.isStreaming.value = false
+    inputText.value = 'ordinary replacement follow-up'
+    await api.onSend()
+    expect(rpc.call).toHaveBeenCalledTimes(3)
+    expect(rpc.call.mock.calls[2]?.[1]).toMatchObject({
+      message: 'ordinary replacement follow-up',
+    })
+    expect(rpc.call.mock.calls[2]?.[1]).not.toHaveProperty('forkBeforeMessageId')
+    expect(rpc.call.mock.calls[2]?.[1]?.clientRequestId).not.toBe(
+      rpc.call.mock.calls[0]?.[1]?.clientRequestId,
+    )
+  })
+
+  it.each([
+    ['accepted', () => Promise.resolve({
+      sessionKey: 'agent:main:webchat:test',
+      task_id: 'task-recovered',
+    })],
+    ['definitely rejected', () => Promise.reject(Object.assign(new Error('database busy'), {
+      accepted: false,
+      retryable: true,
+    }))],
+    ['still unknown', () => Promise.reject(new RpcTransportError(
+      'Connection closed again',
+      null,
+    ))],
+  ] as const)(
+    'preserves a newer message edit when an older unknown receipt is %s',
+    async (_label, replayResult) => {
+      const {
+        sessionKey,
+        messages,
+        originalOwner,
+        inputText,
+        pendingForkBeforeMessageId,
+        messageActions,
+      } = makeEditedMessageState()
+      expect(messageActions.cancelEdit()).toBe(true)
+      inputText.value = 'later ordinary question'
+      const promptAnnotationIds = ref<string[]>([])
+      const rpc = {
+        call: vi.fn()
+          .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+          .mockImplementationOnce(replayResult),
+      }
+      const { api, options } = makeOptions({
+        rpc,
+        sessionKey,
+        messages,
+        inputText,
+        pendingForkBeforeMessageId,
+        promptAnnotationIds,
+        messageEditGeneration: messageActions.editGeneration,
+        validateMessageEditOwner: messageActions.validateEditOwner,
+        adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
+      })
+
+      await api.onSend()
+      const originalRequestId = rpc.call.mock.calls[0]?.[1]?.clientRequestId
+      expect(messages.value.map(message => message.role)).toEqual([
+        'user', 'assistant', 'user', 'error',
+      ])
+
+      messageActions.editMessage({
+        role: 'user',
+        displayRole: 'user',
+        roleLabel: 'User',
+        text: 'original question',
+        timeStr: '',
+        showHeader: false,
+        sourceIndex: 0,
+        messageId: 'msg-original',
+      })
+      inputText.value = 'edited original question'
+      const editOwner = messages.value
+      const currentAttachment: Attachment = {
+        kind: 'staged',
+        local_id: 901,
+        name: 'new-edit.txt',
+        mime: 'text/plain',
+        file_uuid: 'new-edit-file',
+      }
+      options.pendingAttachments.value = [currentAttachment]
+      const attachmentOwner = options.pendingAttachments.value[0]
+      promptAnnotationIds.value = ['current-edit-annotation']
+      options.pendingSessionIntent.value = 'new_chat'
+
+      await api.onSend()
+
+      expect(rpc.call).toHaveBeenCalledTimes(2)
+      expect(rpc.call.mock.calls[1]?.[1]?.clientRequestId).toBe(originalRequestId)
+      expect(rpc.call.mock.calls[1]?.[1]?.message).toBe('later ordinary question')
+      expect(messages.value).toBe(editOwner)
+      expect(messages.value).toEqual([])
+      expect(inputText.value).toBe('edited original question')
+      expect(pendingForkBeforeMessageId.value).toBe('msg-original')
+      expect(options.pendingAttachments.value).toEqual([currentAttachment])
+      expect(options.pendingAttachments.value[0]).toBe(attachmentOwner)
+      expect(promptAnnotationIds.value).toEqual(['current-edit-annotation'])
+      expect(options.pendingSessionIntent.value).toBe('new_chat')
+
+      expect(messageActions.cancelEdit()).toBe(true)
+      expect(messages.value).toBe(originalOwner)
+      expect(messages.value.map(message => message.role)).toEqual([
+        'user', 'assistant', 'user', 'error',
+      ])
+      expect(inputText.value).toBe('')
+      expect(pendingForkBeforeMessageId.value).toBeNull()
+    },
+  )
+
+  it('does not start async queue persistence for a fork edit while work is active', async () => {
+    const {
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      messageActions,
+    } = makeEditedMessageState()
 
     let finishQueuePersistence: (() => void) | undefined
     const enqueuePendingInput = vi.fn(() => new Promise<boolean>(resolve => {
@@ -2378,6 +2595,8 @@ describe('useChatSend attachment payloads', () => {
       inputText,
       pendingForkBeforeMessageId,
       messageEditGeneration: messageActions.editGeneration,
+      validateMessageEditOwner: messageActions.validateEditOwner,
+      adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
       acceptanceStopPending: ref(true),
       enqueuePendingInput,
     })
@@ -2394,6 +2613,350 @@ describe('useChatSend attachment payloads', () => {
     ])
     expect(inputText.value).toBe('unrelated draft')
     expect(pendingForkBeforeMessageId.value).toBeNull()
+  })
+
+  it('abandons a fork edit when work becomes busy during handoff persistence', async () => {
+    const {
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      messageActions,
+    } = makeEditedMessageState('edited question')
+
+    let finishHandoff!: () => void
+    let handoffWrites = 0
+    const pendingInputWal: PendingInputWal = {
+      ...memoryHandoffWal(),
+      putHandoff: vi.fn(() => {
+        handoffWrites += 1
+        if (handoffWrites > 1) return Promise.resolve()
+        return new Promise<void>(resolve => {
+          finishHandoff = resolve
+        })
+      }),
+    }
+    const acceptanceStopPending = ref(false)
+    const { api, rpc } = makeOptions({
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      pendingInputWal,
+      acceptanceStopPending,
+      messageEditGeneration: messageActions.editGeneration,
+      validateMessageEditOwner: messageActions.validateEditOwner,
+      adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
+    })
+
+    const send = api.onSend()
+    await vi.waitFor(() => expect(pendingInputWal.putHandoff).toHaveBeenCalled())
+    acceptanceStopPending.value = true
+    finishHandoff()
+    await send
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(messages.value).toEqual([])
+    expect(inputText.value).toBe('edited question')
+    expect(pendingForkBeforeMessageId.value).toBe('msg-original')
+    expect(messageActions.validateEditOwner(messageActions.editGeneration.value)).toBe(true)
+  })
+
+  it('keeps definitely rejected edited retries cancelable', async () => {
+    const {
+      sessionKey,
+      messages,
+      originalOwner,
+      inputText,
+      pendingForkBeforeMessageId,
+      messageActions,
+    } = makeEditedMessageState('edited question')
+    const annotation = messageEditAnnotation()
+    const rpc = {
+      call: vi.fn().mockRejectedValue(Object.assign(new Error('database busy'), {
+        accepted: false,
+        retryable: true,
+      })),
+    }
+    const { api } = makeOptions({
+      rpc,
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      promptAnnotationIds: ref(['annotation-edit']),
+      promptAnnotationSnapshots: () => [annotation],
+      messageEditGeneration: messageActions.editGeneration,
+      validateMessageEditOwner: messageActions.validateEditOwner,
+      adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
+    })
+
+    await api.onSend()
+
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'error'])
+    expect(inputText.value).toBe('edited question')
+    expect(pendingForkBeforeMessageId.value).toBe('msg-original')
+
+    await api.onSend()
+
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'error', 'error'])
+    expect(inputText.value).toBe('edited question')
+    expect(pendingForkBeforeMessageId.value).toBe('msg-original')
+    expect(messageActions.cancelEdit()).toBe(true)
+    expect(messages.value).toBe(originalOwner)
+    expect(messages.value.map(message => message.text)).toEqual([
+      'original question', 'original answer',
+    ])
+    expect(inputText.value).toBe('unrelated draft')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+  })
+
+  it('keeps an unknown edit cancelable after its exact replay is definitely rejected', async () => {
+    const {
+      sessionKey,
+      messages,
+      originalOwner,
+      inputText,
+      pendingForkBeforeMessageId,
+      messageActions,
+    } = makeEditedMessageState('edited question')
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+        .mockRejectedValueOnce(Object.assign(new Error('database busy'), {
+          accepted: false,
+          retryable: true,
+        })),
+    }
+    const { api } = makeOptions({
+      rpc,
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      messageEditGeneration: messageActions.editGeneration,
+      validateMessageEditOwner: messageActions.validateEditOwner,
+      adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
+    })
+
+    await api.onSend()
+    const requestId = rpc.call.mock.calls[0]?.[1]?.clientRequestId
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'error'])
+    expect(inputText.value).toBe('')
+
+    await api.onSend()
+
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+    expect(rpc.call.mock.calls[1]?.[1]?.clientRequestId).toBe(requestId)
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'error', 'error'])
+    expect(inputText.value).toBe('edited question')
+    expect(pendingForkBeforeMessageId.value).toBe('msg-original')
+
+    expect(messageActions.cancelEdit()).toBe(true)
+    expect(messages.value).toBe(originalOwner)
+    expect(messages.value.map(message => message.text)).toEqual([
+      'original question', 'original answer',
+    ])
+    expect(inputText.value).toBe('unrelated draft')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+  })
+
+  it('refuses to adopt a same-client replacement of its optimistic edit row', async () => {
+    const {
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      messageActions,
+    } = makeEditedMessageState('edited question')
+    let rejectSend!: (reason: unknown) => void
+    const rpc = {
+      call: vi.fn(() => new Promise((_resolve, reject) => {
+        rejectSend = reject
+      })),
+    }
+    const { api } = makeOptions({
+      rpc,
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      messageEditGeneration: messageActions.editGeneration,
+      validateMessageEditOwner: messageActions.validateEditOwner,
+      adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
+    })
+
+    const send = api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledOnce())
+    const optimistic = messages.value[0]!
+    const replacement: ChatMessage = { ...optimistic }
+    messages.value.splice(0, 1, replacement)
+    const replacementOwner = messages.value[0]
+    inputText.value = 'replacement owner draft'
+    pendingForkBeforeMessageId.value = 'msg-authoritative-fork'
+    rejectSend(Object.assign(new Error('database busy'), {
+      accepted: false,
+      retryable: true,
+    }))
+    await send
+
+    expect(messages.value[0]).toBe(replacementOwner)
+    expect(messages.value.map(message => message.role)).toEqual(['user'])
+    expect(inputText.value).toBe('replacement owner draft')
+    expect(messageActions.editGeneration.value).toBe(2)
+    expect(pendingForkBeforeMessageId.value).toBe('msg-authoritative-fork')
+    expect(messageActions.cancelEdit()).toBe(false)
+    expect(messages.value.map(message => message.text)).toEqual(['edited question'])
+  })
+
+  it('does not mutate an authoritative transcript that replaces an edit during rejection', async () => {
+    const {
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      messageActions,
+    } = makeEditedMessageState('edited question')
+    let rejectSend!: (reason: unknown) => void
+    const rpc = {
+      call: vi.fn(() => new Promise((_resolve, reject) => {
+        rejectSend = reject
+      })),
+    }
+    const { api } = makeOptions({
+      rpc,
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      messageEditGeneration: messageActions.editGeneration,
+      validateMessageEditOwner: messageActions.validateEditOwner,
+      adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
+    })
+
+    const send = api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledOnce())
+    const replacementTranscript: ChatMessage[] = [
+      { role: 'user', text: 'authoritative replacement', ts: null, messageId: 'msg-new' },
+      { role: 'assistant', text: 'authoritative answer', ts: null, messageId: 'msg-new-answer' },
+    ]
+    messages.value = replacementTranscript
+    const replacementOwner = messages.value
+    const replacementItems = [...replacementOwner]
+    inputText.value = 'replacement owner draft\nbyte exact'
+
+    rejectSend(Object.assign(new Error('database busy'), {
+      accepted: false,
+      retryable: true,
+    }))
+    await send
+
+    expect(messages.value).toBe(replacementOwner)
+    expect(messages.value).toEqual(replacementItems)
+    expect(messages.value[0]).toBe(replacementItems[0])
+    expect(messages.value[1]).toBe(replacementItems[1])
+    expect(inputText.value).toBe('replacement owner draft\nbyte exact')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(messageActions.editGeneration.value).toBe(2)
+    expect(messageActions.cancelEdit()).toBe(false)
+  })
+
+  it('never restores an edited send explicitly reported as accepted', async () => {
+    const {
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      messageActions,
+    } = makeEditedMessageState('edited question')
+    const rpc = {
+      call: vi.fn().mockRejectedValue(Object.assign(new Error('response lost'), {
+        accepted: true,
+        details: {
+          orphan_message_id: 'msg-edited',
+          session_key: sessionKey.value,
+        },
+      })),
+    }
+    const { api } = makeOptions({
+      rpc,
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      messageEditGeneration: messageActions.editGeneration,
+      validateMessageEditOwner: messageActions.validateEditOwner,
+      adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
+    })
+
+    await api.onSend()
+    const committedOwner = messages.value
+
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'error'])
+    expect(messages.value[0]?.messageId).toBe('msg-edited')
+    expect(inputText.value).toBe('')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(messageActions.cancelEdit()).toBe(false)
+    expect(messages.value).toBe(committedOwner)
+    expect(messages.value.map(message => message.text)).toEqual([
+      'edited question', expect.stringContaining('response lost'),
+    ])
+  })
+
+  it('starts a fresh receipt when the same edit is re-entered after cancellation', async () => {
+    const {
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      messageActions,
+    } = makeEditedMessageState('edited question')
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(Object.assign(new Error('database busy'), {
+          accepted: false,
+          retryable: true,
+        }))
+        .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+        .mockResolvedValueOnce({
+          sessionKey: sessionKey.value,
+          task_id: 'task-replayed',
+        }),
+    }
+    const { api } = makeOptions({
+      rpc,
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      messageEditGeneration: messageActions.editGeneration,
+      validateMessageEditOwner: messageActions.validateEditOwner,
+      adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
+    })
+
+    await api.onSend()
+    const rejectedRequestId = rpc.call.mock.calls[0]?.[1]?.clientRequestId
+    expect(messageActions.cancelEdit()).toBe(true)
+    messageActions.editMessage({
+      role: 'user',
+      displayRole: 'user',
+      roleLabel: 'User',
+      text: 'original question',
+      timeStr: '',
+      showHeader: false,
+      sourceIndex: 0,
+      messageId: 'msg-original',
+    })
+    inputText.value = 'edited question'
+
+    await api.onSend()
+    const newRequestId = rpc.call.mock.calls[1]?.[1]?.clientRequestId
+    expect(newRequestId).not.toBe(rejectedRequestId)
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'error'])
+
+    await api.onSend()
+    expect(rpc.call).toHaveBeenCalledTimes(3)
+    expect(rpc.call.mock.calls[2]?.[1]?.clientRequestId).toBe(newRequestId)
   })
 
   it('sends the clicked snapshot without clearing edits made during project validation', async () => {
@@ -4148,9 +4711,9 @@ describe('useChatSend attachment payloads', () => {
     })
 
     await harness.api.onSend()
-    harness.stream.isStreaming.value = true
     const retry = harness.api.onSend()
     await vi.waitFor(() => expect(sendCount).toBe(2))
+    harness.stream.isStreaming.value = true
     const ownerRequestId = String(rpcCall.mock.calls[1]?.[1]?.clientRequestId)
 
     inputText.value = 'follow the recovered edit'
@@ -4214,10 +4777,10 @@ describe('useChatSend attachment payloads', () => {
     })
 
     await harness.api.onSend()
-    harness.stream.isStreaming.value = true
-    harness.options.activeStreamSessionKey.value = parentSessionKey
     const retry = harness.api.onSend()
     await vi.waitFor(() => expect(sendCount).toBe(2))
+    harness.stream.isStreaming.value = true
+    harness.options.activeStreamSessionKey.value = parentSessionKey
 
     // The ambient parent run can finish while the idempotent fork retry is
     // still waiting for its canonical child response.

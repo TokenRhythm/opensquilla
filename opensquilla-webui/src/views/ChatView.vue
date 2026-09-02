@@ -2570,6 +2570,8 @@ const {
   regenerateMessage,
   editMessage,
   cancelEdit,
+  validateEditOwner,
+  adoptRejectedEditRows,
   editGeneration,
 } = chatMessageActions
 
@@ -3343,6 +3345,8 @@ const chatSend = useChatSend({
   pendingAttachments,
   composerRevision,
   messageEditGeneration: editGeneration,
+  validateMessageEditOwner: validateEditOwner,
+  adoptRejectedMessageEditRows: adoptRejectedEditRows,
   pendingSessionIntent,
   pendingWorkspaceId,
   sendBlockedReason: effectiveSendBlockedReason,

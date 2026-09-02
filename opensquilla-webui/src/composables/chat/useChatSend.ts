@@ -1,4 +1,4 @@
-import { computed, ref, watch, type ComputedRef, type Ref } from 'vue'
+import { computed, ref, toRaw, watch, type ComputedRef, type Ref } from 'vue'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
 import type { RpcClientError } from '@/lib/rpc'
@@ -181,6 +181,14 @@ interface SendAttempt {
   handoffWalOwnerId?: string
   handoffWalRevision?: number
   replayCoordinationKey?: string
+  /** Exact local transcript owner for a fork whose acceptance may need replay. */
+  messageEditTranscriptOwner?: {
+    generation: number
+    messages: ChatMessage[]
+    messageOwners: ChatMessage[]
+    baseMessageCount: number
+    cancelableMessageCount: number
+  }
   params: TurnSendParams
   requiresIdempotentReplay?: boolean
   // A Stop issued before durable acceptance is known belongs to this exact
@@ -246,7 +254,7 @@ interface DispatchSendOptions {
   /** Preserve an explicit empty attachment list on the chat.send wire. */
   includeEmptyAttachments?: boolean
   /** Revalidate protocol-owned sends after every awaited pre-dispatch step. */
-  preDispatchGuard?: (stage: 'preflight' | 'before_rpc') => boolean
+  preDispatchGuard?: (stage: 'preflight' | 'after_mutation' | 'before_rpc') => boolean
   /** Require a non-replayable WAL preparation that is armed immediately before RPC. */
   requirePreparedHandoff?: boolean
   /** Stable cross-tab identity for one protocol-owned replay. */
@@ -498,6 +506,13 @@ export interface UseChatSendOptions {
   composerRevision?: Readonly<Ref<number>>
   /** Invalidates a composer send when its message-edit owner is cancelled or replaced. */
   messageEditGeneration?: Readonly<Ref<number>>
+  /** Confirms that an edit still owns the exact live transcript before mutation. */
+  validateMessageEditOwner?: (generation: number) => boolean
+  /** Extends edit ownership by the exact rows left by a definitely rejected send. */
+  adoptRejectedMessageEditRows?: (
+    generation: number,
+    rows: readonly ChatMessage[],
+  ) => boolean
   pendingSessionIntent: Ref<string | null>
   initialCollaborationMode: Readonly<Ref<CollaborationMode>>
   initialRoutingMode: Readonly<Ref<GatewayModelRoutingMode | null>>
@@ -744,10 +759,11 @@ export function useChatSend(options: UseChatSendOptions) {
     if (messageIndex >= 0) {
       const message = options.messages.value[messageIndex]
       if (message) {
-        const next = { ...message }
-        if (snapshots.length > 0) next.promptAnnotations = [...snapshots]
-        else delete next.promptAnnotations
-        options.messages.value[messageIndex] = next
+        // Preserve the row identity. Message-edit cancellation owns exact
+        // transcript objects, and annotation retry bookkeeping must not make
+        // an otherwise untouched optimistic row look authoritatively replaced.
+        if (snapshots.length > 0) message.promptAnnotations = [...snapshots]
+        else delete message.promptAnnotations
       }
     }
   }
@@ -798,9 +814,93 @@ export function useChatSend(options: UseChatSendOptions) {
     }
   }
 
-  function messageEditOwnerMatchesSnapshot(snapshot: ComposerSnapshot): boolean {
-    return snapshot.messageEditGeneration === null
-      || options.messageEditGeneration?.value === snapshot.messageEditGeneration
+  function messageEditOwnerMatchesSnapshot(
+    snapshot: ComposerSnapshot,
+    validateTranscript = false,
+  ): boolean {
+    if (snapshot.messageEditGeneration === null) return true
+    if (options.messageEditGeneration?.value !== snapshot.messageEditGeneration) return false
+    return !validateTranscript
+      || options.validateMessageEditOwner?.(snapshot.messageEditGeneration) !== false
+  }
+
+  function forkSnapshotPreDispatchAllowed(
+    snapshot: ComposerSnapshot,
+    stage: 'preflight' | 'after_mutation' | 'before_rpc',
+    opts: {
+      forkBeforeMessageId?: string | null
+      allowAuthoritativeRecovery?: boolean
+      validateTranscript?: boolean
+    } = {},
+  ): boolean {
+    if (!messageEditOwnerMatchesSnapshot(
+      snapshot,
+      stage === 'preflight' && opts.validateTranscript !== false,
+    )) return false
+    const forkBeforeMessageId = opts.forkBeforeMessageId === undefined
+      ? snapshot.forkBeforeMessageId
+      : opts.forkBeforeMessageId
+    if (!forkBeforeMessageId) return true
+    // `before_rpc` follows this dispatch's own beginFreshStream. Earlier
+    // stages must still reject a stream that appeared while async preparation
+    // was pending. Authoritative receipt recovery is the one exception: its
+    // existing work is the request this exact idempotent replay must resolve.
+    if (
+      !opts.allowAuthoritativeRecovery
+      && stage !== 'before_rpc'
+      && options.stream.isStreaming.value
+    ) return false
+    if (!opts.allowAuthoritativeRecovery && hasAuthoritativeWork()) return false
+    return !options.isCompactInFlightForCurrentSession()
+      && !responseHandoffBlocksCurrentSession()
+  }
+
+  function attemptOwnsMessageEditTranscript(attempt: SendAttempt): boolean {
+    const owner = attempt.messageEditTranscriptOwner
+    if (!owner) return true
+    const currentMessages = options.messages.value
+    return options.sessionKey.value === attempt.requestSessionKey
+      && options.messageEditGeneration?.value === owner.generation
+      && toRaw(currentMessages) === owner.messages
+      && currentMessages.length === owner.messageOwners.length
+      && currentMessages.every(
+        (message, index) => toRaw(message) === owner.messageOwners[index],
+      )
+  }
+
+  function validateAttemptMessageEditTranscript(attempt: SendAttempt): boolean {
+    if (attemptOwnsMessageEditTranscript(attempt)) return true
+    if (recoveredAttempt === attempt) recoveredAttempt = null
+    const generation = attempt.messageEditTranscriptOwner?.generation
+    if (
+      generation !== undefined
+      && options.messageEditGeneration?.value === generation
+    ) {
+      // Retire only the same stale generation. A newer edit owns its own stack
+      // and must not be disturbed by an old receipt replay.
+      options.validateMessageEditOwner?.(generation)
+    }
+    return false
+  }
+
+  function extendAttemptMessageEditTranscript(
+    attempt: SendAttempt,
+    rows: readonly ChatMessage[],
+  ): boolean {
+    const owner = attempt.messageEditTranscriptOwner
+    if (!owner || rows.length === 0) return false
+    const currentMessages = options.messages.value
+    const ownsPrefix = toRaw(currentMessages) === owner.messages
+      && currentMessages.length === owner.messageOwners.length + rows.length
+      && owner.messageOwners.every(
+        (message, index) => toRaw(currentMessages[index]) === message,
+      )
+    const ownsSuffix = rows.every((message, index) => (
+      toRaw(currentMessages[owner.messageOwners.length + index]) === toRaw(message)
+    ))
+    if (!ownsPrefix || !ownsSuffix) return false
+    owner.messageOwners.push(...rows.map(message => toRaw(message)))
+    return true
   }
 
   function queueOwnerMatchesSnapshot(snapshot: ComposerSnapshot): boolean {
@@ -1901,7 +2001,10 @@ export function useChatSend(options: UseChatSendOptions) {
     if (index < 0) return
     const optimistic = options.messages.value[index]
     if (!optimistic || optimistic.messageId === messageId) return
-    options.messages.value[index] = { ...optimistic, messageId }
+    // Keep the exact optimistic row identity. Message-edit retry ownership is
+    // intentionally identity-based so a server-id acknowledgement must not
+    // look like an authoritative transcript replacement.
+    optimistic.messageId = messageId
   }
 
   function bindAcceptedTask(taskId: string) {
@@ -2289,6 +2392,10 @@ export function useChatSend(options: UseChatSendOptions) {
       ? recoveredAttempt
       : null
     if (exactReplayAttempt) {
+      const preserveUnrelatedBranch = Boolean(
+        composerSnapshot.forkBeforeMessageId
+        && composerSnapshot.forkBeforeMessageId !== exactReplayAttempt.forkBeforeMessageId,
+      )
       const replayBlockedReason = options.idempotentReplayBlockedReason
         || options.sendBlockedReason
       if (replayBlockedReason?.value) return
@@ -2297,6 +2404,7 @@ export function useChatSend(options: UseChatSendOptions) {
       }
       if (options.sessionKey.value !== requestSessionKey) return
       if (!messageEditOwnerMatchesSnapshot(composerSnapshot)) return
+      if (!validateAttemptMessageEditTranscript(exactReplayAttempt)) return
       if (replayBlockedReason?.value) return
       await dispatchSend(exactReplayAttempt.text, {
         composerText,
@@ -2304,7 +2412,25 @@ export function useChatSend(options: UseChatSendOptions) {
         queueMode: exactReplayAttempt.queueMode,
         retryAttempt: exactReplayAttempt,
         idempotentReplay: true,
-        preDispatchGuard: () => messageEditOwnerMatchesSnapshot(composerSnapshot),
+        // Receipt recovery resolves the prior immutable request. If the user
+        // has since entered another branch operation, none of its composer or
+        // visible transcript state belongs to the replay.
+        preserveComposer: preserveUnrelatedBranch,
+        suppressRejectedFailureMessage: preserveUnrelatedBranch,
+        preDispatchGuard: stage => (
+          forkSnapshotPreDispatchAllowed(
+            composerSnapshot,
+            stage,
+            {
+              forkBeforeMessageId: exactReplayAttempt.forkBeforeMessageId,
+              allowAuthoritativeRecovery: true,
+              // The first unknown attempt already installed its optimistic row.
+              // The attempt's exact transcript lease below owns that mutation.
+              validateTranscript: false,
+            },
+          )
+          && validateAttemptMessageEditTranscript(exactReplayAttempt)
+        ),
       })
       return
     }
@@ -2319,7 +2445,7 @@ export function useChatSend(options: UseChatSendOptions) {
         if (await refreshedActiveProjectBlocksSend()) return
       }
       if (options.sessionKey.value !== requestSessionKey) return
-      if (!messageEditOwnerMatchesSnapshot(composerSnapshot)) return
+      if (!forkSnapshotPreDispatchAllowed(composerSnapshot, 'preflight')) return
       if (!queueOwnerMatchesSnapshot(composerSnapshot)) return
       if (options.sendBlockedReason?.value) return
       if (
@@ -2362,7 +2488,10 @@ export function useChatSend(options: UseChatSendOptions) {
         payload: payloadFromSnapshot(composerSnapshot),
         composerSnapshot,
         cancelIfComposerChanged: invocation.cancelIfComposerChanged,
-        preDispatchGuard: () => messageEditOwnerMatchesSnapshot(composerSnapshot),
+        preDispatchGuard: stage => forkSnapshotPreDispatchAllowed(
+          composerSnapshot,
+          stage,
+        ),
       })
       return
     }
@@ -2375,7 +2504,7 @@ export function useChatSend(options: UseChatSendOptions) {
     if (slashClassification !== null) {
       if (
         options.sessionKey.value !== requestSessionKey
-        || !messageEditOwnerMatchesSnapshot(composerSnapshot)
+        || !forkSnapshotPreDispatchAllowed(composerSnapshot, 'preflight')
         || !composerMatchesSnapshot(composerSnapshot)
         || !queueOwnerMatchesSnapshot(composerSnapshot)
         || Boolean(options.sendBlockedReason?.value)
@@ -2387,7 +2516,7 @@ export function useChatSend(options: UseChatSendOptions) {
       ) return
       if (
         options.sessionKey.value !== requestSessionKey
-        || !messageEditOwnerMatchesSnapshot(composerSnapshot)
+        || !forkSnapshotPreDispatchAllowed(composerSnapshot, 'preflight')
         || !composerMatchesSnapshot(composerSnapshot)
         || !queueOwnerMatchesSnapshot(composerSnapshot)
         || Boolean(options.sendBlockedReason?.value)
@@ -2509,7 +2638,10 @@ export function useChatSend(options: UseChatSendOptions) {
       payload: payloadFromSnapshot(composerSnapshot),
       composerSnapshot,
       cancelIfComposerChanged: invocation.cancelIfComposerChanged,
-      preDispatchGuard: () => messageEditOwnerMatchesSnapshot(composerSnapshot),
+      preDispatchGuard: stage => forkSnapshotPreDispatchAllowed(
+        composerSnapshot,
+        stage,
+      ),
     })
   }
 
@@ -2717,7 +2849,7 @@ export function useChatSend(options: UseChatSendOptions) {
       : options.sendBlockedReason
     if (blockedReason?.value) return 'not_sent'
     const preDispatchAllowed = (
-      stage: 'preflight' | 'before_rpc' = 'preflight',
+      stage: 'preflight' | 'after_mutation' | 'before_rpc' = 'preflight',
     ) => sendOpts.preDispatchGuard?.(stage) !== false
     if (!preDispatchAllowed()) return 'not_sent'
     let preserveComposer = sendOpts.preserveComposer === true
@@ -2756,6 +2888,8 @@ export function useChatSend(options: UseChatSendOptions) {
     // stream state, and chat.send. A blocked draft remains exactly editable.
     if (modelImageSendBlocked(sourceAttachments)) return 'not_sent'
     const retryCandidate = sendOpts.retryAttempt ?? (preserveComposer ? null : recoveredAttempt)
+    const retryCandidateOwnsTranscript = !retryCandidate
+      || attemptOwnsMessageEditTranscript(retryCandidate)
     const requestedPromptAnnotationIds = sendOpts.promptAnnotationIds === undefined
       ? currentPromptAnnotationIds()
       : [...sendOpts.promptAnnotationIds]
@@ -2764,6 +2898,7 @@ export function useChatSend(options: UseChatSendOptions) {
           .slice(0, 16)
     const requiresRecoveryReplay = Boolean(
       retryCandidate?.requiresIdempotentReplay
+      && retryCandidateOwnsTranscript
       && retryCandidate.requestSessionKey === requestSessionKey
       && retryCandidate.queueMode === sendOpts.queueMode,
     )
@@ -2771,6 +2906,7 @@ export function useChatSend(options: UseChatSendOptions) {
       requiresRecoveryReplay
       || (
         retryCandidate
+        && retryCandidateOwnsTranscript
         && matchesRecoveredDraft(retryCandidate, {
           requestSessionKey,
           promptAnnotationIds: requestedPromptAnnotationIds,
@@ -2793,7 +2929,7 @@ export function useChatSend(options: UseChatSendOptions) {
     if (retryAttempt?.acceptanceInFlight) return 'retryable_failure'
     const attemptPromptAnnotationIds = retryAttempt?.promptAnnotationIds
       ?? requestedPromptAnnotationIds
-    if (promptAnnotationSendIsBusy(attemptPromptAnnotationIds)) {
+    if (!sendOpts.idempotentReplay && promptAnnotationSendIsBusy(attemptPromptAnnotationIds)) {
       rejectBusyPromptAnnotationSend()
       return 'not_sent'
     }
@@ -2905,6 +3041,34 @@ export function useChatSend(options: UseChatSendOptions) {
 
     const userText = text
     let attempt = retryAttempt
+    let appendedOptimisticMessage: ChatMessage | null = null
+    const adoptDefinitelyRejectedEditRows = (errorRow: ChatMessage): void => {
+      const owner = attempt?.messageEditTranscriptOwner
+      const generation = sendOpts.composerSnapshot?.messageEditGeneration
+        ?? owner?.generation
+      if (
+        generation === null
+        || generation === undefined
+        || !attempt?.forkBeforeMessageId
+        || !options.adoptRejectedMessageEditRows
+      ) return
+      if (
+        owner
+        && (
+          owner.cancelableMessageCount < owner.baseMessageCount
+          || owner.cancelableMessageCount > owner.messageOwners.length
+        )
+      ) return
+      const rows = owner
+        ? owner.messageOwners.slice(owner.cancelableMessageCount)
+        : appendedOptimisticMessage
+          ? [appendedOptimisticMessage, errorRow]
+          : [errorRow]
+      if (rows.length === 0) return
+      if (options.adoptRejectedMessageEditRows(generation, rows) && owner) {
+        owner.cancelableMessageCount = owner.messageOwners.length
+      }
+    }
     let acceptedVisibleReplayCommitted = false
     const commitAcceptedVisibleReplay = (accepted?: {
       messageId?: string
@@ -2998,6 +3162,17 @@ export function useChatSend(options: UseChatSendOptions) {
         ...(sendOpts.replayCoordination
           ? { replayCoordinationKey: sendOpts.replayCoordination.key }
           : {}),
+        ...(forkBeforeMessageId && sendOpts.composerSnapshot?.messageEditGeneration != null
+          ? {
+              messageEditTranscriptOwner: {
+                generation: sendOpts.composerSnapshot.messageEditGeneration,
+                messages: toRaw(options.messages.value),
+                messageOwners: options.messages.value.map(message => toRaw(message)),
+                baseMessageCount: options.messages.value.length,
+                cancelableMessageCount: options.messages.value.length,
+              },
+            }
+          : {}),
         params,
       }
       if (attempt.forkBeforeMessageId) {
@@ -3013,7 +3188,7 @@ export function useChatSend(options: UseChatSendOptions) {
       if (!sendOpts.acceptedVisibleReplay) {
         const now = new Date().toISOString()
         const displayAttachments = attachmentsToSend.map(serializeDisplayAttachment)
-        options.messages.value.push({
+        const optimisticMessage: ChatMessage = {
           role: 'user',
           text: userText,
           ts: now,
@@ -3022,7 +3197,10 @@ export function useChatSend(options: UseChatSendOptions) {
           ...(attempt.promptAnnotations.length > 0
             ? { promptAnnotations: attempt.promptAnnotations }
             : {}),
-        })
+        }
+        options.messages.value.push(optimisticMessage)
+        appendedOptimisticMessage = optimisticMessage
+        extendAttemptMessageEditTranscript(attempt, [optimisticMessage])
         options.autoScroll.value = true
         options.scrollToBottom()
       }
@@ -3037,7 +3215,7 @@ export function useChatSend(options: UseChatSendOptions) {
       }
       if (!preDispatchAllowed()) return rejectBeforeDispatch()
     }
-    if (!preDispatchAllowed()) return rejectBeforeDispatch()
+    if (!preDispatchAllowed('after_mutation')) return rejectBeforeDispatch()
     if (!preserveComposer) options.closeSlashMenu()
     recordSessionNavigationDiag('send.start', {
       requestSession: requestSessionKey,
@@ -3066,11 +3244,11 @@ export function useChatSend(options: UseChatSendOptions) {
     // A steer send rides an already-active stream; restarting it would wipe
     // the partial output of the run being steered.
     const wasStreaming = options.stream.isStreaming.value
-    if (!preDispatchAllowed()) return rejectBeforeDispatch()
+    if (!preDispatchAllowed('after_mutation')) return rejectBeforeDispatch()
     const freshSendToken = wasStreaming
       ? null
       : beginFreshStream(requestSessionKey, attempt)
-    if (!preDispatchAllowed('before_rpc')) {
+    if (!preDispatchAllowed(freshSendToken ? 'before_rpc' : 'after_mutation')) {
       if (freshSendToken && activeFreshSendToken === freshSendToken) {
         activeFreshSendToken = null
         options.activeStreamTaskId.value = ''
@@ -3091,7 +3269,7 @@ export function useChatSend(options: UseChatSendOptions) {
         return rejectBeforeDispatch()
       }
       durableHandoffRecord = armed
-      if (!preDispatchAllowed('before_rpc')) {
+      if (!preDispatchAllowed(freshSendToken ? 'before_rpc' : 'after_mutation')) {
         durableHandoffRecord = await disarmResponseHandoff(armed, attempt) || armed
         if (freshSendToken && activeFreshSendToken === freshSendToken) {
           activeFreshSendToken = null
@@ -3300,7 +3478,9 @@ export function useChatSend(options: UseChatSendOptions) {
     } catch (err: unknown) {
       const rpcError = err as RpcClientError | null | undefined
       const acceptedError = acceptedErrorInfo(err)
-      if (!acceptedError) setAttemptPromptAnnotations(attempt, [])
+      if (!acceptedError && attemptOwnsMessageEditTranscript(attempt)) {
+        setAttemptPromptAnnotations(attempt, [])
+      }
       if (acceptedError && !commitAcceptedVisibleReplay({
         messageId: acceptedError.messageId,
       })) {
@@ -3400,7 +3580,12 @@ export function useChatSend(options: UseChatSendOptions) {
         if (responseHandoff && acceptedSessionKey === requestSessionKey) {
           await handoffResponseSession(requestSessionKey, responseHandoff)
         }
-        bindUserMessageId(attempt.clientMessageId, acceptedError.messageId)
+        if (
+          !attempt.messageEditTranscriptOwner
+          || attemptOwnsMessageEditTranscript(attempt)
+        ) {
+          bindUserMessageId(attempt.clientMessageId, acceptedError.messageId)
+        }
         options.scheduleHistorySync()
       }
       if (options.sessionKey.value !== requestSessionKey) {
@@ -3431,14 +3616,29 @@ export function useChatSend(options: UseChatSendOptions) {
           await markResponseHandoffFailed(responseHandoff, err)
         }
       }
+      if (
+        attempt.messageEditTranscriptOwner
+        && !validateAttemptMessageEditTranscript(attempt)
+      ) {
+        // History hydration or another owner replaced this edit while the RPC
+        // was pending. Request cleanup above is still required, but the stale
+        // rejection must not restore text/fork state or append into the new
+        // owner's transcript.
+        return acceptedError ? 'accepted' : 'retryable_failure'
+      }
       rememberRetryableAttempt(true)
       if (acceptedError || !sendOpts.suppressRejectedFailureMessage) {
-        options.messages.value.push({
+        const errorRow: ChatMessage = {
           role: 'error',
           text: sendFailureMessage(err, paramsHaveArtifactContext(attempt.params)),
           errorCode: errorCode(err),
           ts: new Date().toISOString(),
-        })
+        }
+        options.messages.value.push(errorRow)
+        extendAttemptMessageEditTranscript(attempt, [errorRow])
+        if (rpcError?.accepted === false) {
+          adoptDefinitelyRejectedEditRows(errorRow)
+        }
       }
       return acceptedError ? 'accepted' : 'retryable_failure'
     } finally {
