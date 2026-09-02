@@ -39,6 +39,7 @@ import {
 import { RpcTransportError } from '@/lib/rpc'
 import type {
   PendingInputWal,
+  PendingInputWalRecord,
   ResponseHandoffWalRecord,
 } from '@/utils/chat/pendingInputWal'
 
@@ -335,18 +336,54 @@ describe('useChatSend response-handoff persistence boundary', () => {
       file_uuid: 'child-upload',
     }
     const pendingAttachments = ref<Attachment[]>([parentAttachment])
+    const pendingSessionIntent = ref<string | null>(null)
     const pendingForkBeforeMessageId = ref<string | null>('parent-message')
+    const pendingQueueOwnerContext = ref<UseChatSendOptions['pendingQueueOwnerContext']['value']>(null)
+    const queuedRecords = new Map<string, PendingInputWalRecord>()
+    const pendingQueue = useChatPendingQueue({
+      sessionKey,
+      ownerContext: pendingQueueOwnerContext,
+      inputText,
+      pendingAttachments,
+      pendingSessionIntent,
+      isStreaming: ref(false),
+      isBlocked: () => false,
+      autoResizeTextarea: vi.fn(),
+      sendCurrentInput: vi.fn(),
+      resetInputHistory: vi.fn(),
+      hasComposer: () => true,
+      pendingInputWal: {
+        put: async record => { queuedRecords.set(record.pendingInputId, structuredClone(record)) },
+        list: async key => [...queuedRecords.values()].filter(record => record.sessionKey === key),
+        delete: async pendingInputId => { queuedRecords.delete(pendingInputId) },
+        close: () => {},
+      },
+    })
+    inputText.value = 'queued source draft'
+    expect(await pendingQueue.enqueuePendingInput(inputText.value)).toBe(true)
+    const queuedSourceId = pendingQueue.pendingQueue.value[0]!.pendingUiId
+    inputText.value = 'parent draft'
+    pendingAttachments.value = [parentAttachment]
     const delayed = delayedHandoffWal()
     const { api, options, rpc } = makeOptions({
       sessionKey,
       inputText,
       pendingAttachments,
+      pendingSessionIntent,
       pendingForkBeforeMessageId,
+      pendingQueueOwnerContext,
       pendingInputWal: delayed.wal,
     })
 
     const sending = api.onSend()
     await delayed.persistStarted
+    expect(pendingQueueOwnerContext.value).toMatchObject({
+      sessionKey: parentSessionKey,
+      sourceSessionKey: parentSessionKey,
+    })
+    expect(pendingQueue.editPendingItem(queuedSourceId)).toBe(false)
+    expect(pendingQueue.popPendingTail()).toBe(false)
+    expect(pendingQueue.popAllPendingIntoComposer()).toBe(false)
     sessionKey.value = childSessionKey
     inputText.value = 'child draft'
     pendingAttachments.value = [childAttachment]
@@ -359,6 +396,72 @@ describe('useChatSend response-handoff persistence boundary', () => {
     expect(inputText.value).toBe('child draft')
     expect(pendingAttachments.value).toEqual([childAttachment])
     expect(delayed.retained()).toBeNull()
+    expect(pendingQueueOwnerContext.value).toBeNull()
+    pendingQueue.cleanup()
+  })
+
+  it('releases the source fence when prepared handoff persistence fails', async () => {
+    let markPrepareStarted!: () => void
+    let releasePrepare!: () => void
+    const prepareStarted = new Promise<void>(resolve => { markPrepareStarted = resolve })
+    const prepareGate = new Promise<void>(resolve => { releasePrepare = resolve })
+    const pendingInputWal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      prepareHandoff: async () => {
+        markPrepareStarted()
+        await prepareGate
+        return { applied: false, record: null }
+      },
+      compareAndSwapHandoff: async () => ({ applied: false, record: null }),
+      close: () => {},
+    }
+    const pendingQueueOwnerContext = ref<UseChatSendOptions['pendingQueueOwnerContext']['value']>(null)
+    const { api, rpc } = makeOptions({
+      messages: ref(usageReplayMessages()),
+      pendingInputWal,
+      pendingQueueOwnerContext,
+    })
+
+    const replay = api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })
+    await prepareStarted
+    expect(pendingQueueOwnerContext.value).toMatchObject({
+      sessionKey: 'agent:main:webchat:test',
+      sourceSessionKey: 'agent:main:webchat:test',
+    })
+
+    releasePrepare()
+
+    expect(await replay).toBe(false)
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(pendingQueueOwnerContext.value).toBeNull()
+  })
+
+  it('does not mistake its own source fence for a composer edit', async () => {
+    const sessionKey = ref('agent:main:webchat:persist-unchanged')
+    const inputText = ref('unchanged draft')
+    const pendingForkBeforeMessageId = ref<string | null>('parent-message')
+    const delayed = delayedHandoffWal()
+    const { api, rpc } = makeOptions({
+      sessionKey,
+      inputText,
+      pendingForkBeforeMessageId,
+      pendingInputWal: delayed.wal,
+    })
+    rpc.call.mockResolvedValue({ sessionKey: sessionKey.value })
+
+    const sending = api.onSend()
+    await delayed.persistStarted
+    delayed.releasePersist()
+    await sending
+
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(inputText.value).toBe('')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
   })
 
   it('sends only the persisted snapshot while preserving newer same-session content', async () => {

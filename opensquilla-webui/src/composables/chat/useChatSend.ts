@@ -805,6 +805,11 @@ export function useChatSend(options: UseChatSendOptions) {
       ? context.ownerRequestId
       : null
     return currentOwnerRequestId === snapshot.queueOwnerRequestId
+      || Boolean(
+        snapshot.queueOwnerRequestId === null
+        && currentOwnerRequestId === activeResponseHandoff?.ownerRequestId
+        && activeResponseHandoff.requestSessionKey === options.sessionKey.value,
+      )
   }
 
   function queueOwnerFromSnapshot(snapshot: ComposerSnapshot): PendingQueueOwner | undefined {
@@ -1267,12 +1272,10 @@ export function useChatSend(options: UseChatSendOptions) {
       durableRecord,
     }
     activeResponseHandoff = gate
-    if (durableRecord) {
-      options.pendingQueueOwnerContext.value = {
-        sessionKey: requestSessionKey,
-        sourceSessionKey: requestSessionKey,
-        ownerRequestId,
-      }
+    options.pendingQueueOwnerContext.value = {
+      sessionKey: requestSessionKey,
+      sourceSessionKey: requestSessionKey,
+      ownerRequestId,
     }
     return gate
   }
@@ -2942,12 +2945,35 @@ export function useChatSend(options: UseChatSendOptions) {
       return true
     }
     let durableHandoffRecord: ResponseHandoffWalRecord | null = null
+    const responseHandoffState: { gate: ResponseHandoffGate | null } = { gate: null }
     let consumeComposerSnapshotAfterHandoffPersistence = false
+    const ensureResponseHandoffSourceFence = (): ResponseHandoffGate | null => {
+      const currentAttempt = attempt
+      if (!currentAttempt) return null
+      responseHandoffState.gate ||= beginResponseHandoff(
+        requestSessionKey,
+        currentAttempt.clientRequestId,
+        durableHandoffRecord,
+      )
+      return responseHandoffState.gate
+    }
+    const persistResponseHandoffIntoGate = async (
+      requirePrepared = false,
+    ): Promise<ResponseHandoffWalRecord | null> => {
+      const currentAttempt = attempt
+      const gate = ensureResponseHandoffSourceFence()
+      if (!currentAttempt || !gate) return null
+      const record = await persistResponseHandoff(currentAttempt, requirePrepared)
+      if (record) gate.durableRecord = record
+      return record
+    }
     const rejectBeforeDispatch = async (): Promise<ChatSendOutcome> => {
       if (attempt && sendOpts.acceptedVisibleReplay) {
         sendOpts.rememberRetryableAttempt?.(attempt)
       }
       await discardUnsentResponseHandoff(durableHandoffRecord)
+      finishResponseHandoff(responseHandoffState.gate)
+      responseHandoffState.gate = null
       return 'not_sent'
     }
     const revalidateAfterHandoffPersistence = (): boolean => {
@@ -3023,8 +3049,7 @@ export function useChatSend(options: UseChatSendOptions) {
         params,
       }
       if (attempt.forkBeforeMessageId) {
-        durableHandoffRecord = await persistResponseHandoff(
-          attempt,
+        durableHandoffRecord = await persistResponseHandoffIntoGate(
           sendOpts.requirePreparedHandoff,
         )
         if (sendOpts.requirePreparedHandoff && !durableHandoffRecord) {
@@ -3050,8 +3075,7 @@ export function useChatSend(options: UseChatSendOptions) {
       }
     }
     if (attempt.forkBeforeMessageId && !durableHandoffRecord) {
-      durableHandoffRecord = await persistResponseHandoff(
-        attempt,
+      durableHandoffRecord = await persistResponseHandoffIntoGate(
         sendOpts.requirePreparedHandoff,
       )
       if (sendOpts.requirePreparedHandoff && !durableHandoffRecord) {
@@ -3128,8 +3152,12 @@ export function useChatSend(options: UseChatSendOptions) {
         return rejectBeforeDispatch()
       }
       durableHandoffRecord = armed
+      if (responseHandoffState.gate) responseHandoffState.gate.durableRecord = armed
       if (!preDispatchAllowed('before_rpc')) {
         durableHandoffRecord = await disarmResponseHandoff(armed, attempt) || armed
+        if (responseHandoffState.gate) {
+          responseHandoffState.gate.durableRecord = durableHandoffRecord
+        }
         if (freshSendToken && activeFreshSendToken === freshSendToken) {
           activeFreshSendToken = null
           options.activeStreamTaskId.value = ''
@@ -3140,15 +3168,7 @@ export function useChatSend(options: UseChatSendOptions) {
       }
     }
     options.aborted.value = false
-    let responseHandoff = (
-      attempt.forkBeforeMessageId
-        ? beginResponseHandoff(
-            requestSessionKey,
-            attempt.clientRequestId,
-            durableHandoffRecord,
-        )
-        : null
-    )
+    if (attempt.forkBeforeMessageId) ensureResponseHandoffSourceFence()
     const acceptanceTransaction = beginAcceptanceTransaction(
       requestSessionKey,
       freshSendToken,
@@ -3202,12 +3222,12 @@ export function useChatSend(options: UseChatSendOptions) {
       const accepted = noteAcceptedTask(res, requestSessionKey)
       const taskId = accepted.taskId
       const terminalStatus = terminalResponseStatus(res)
-      if (responseHandoff) {
-        responseHandoff.acceptedTaskId = taskId
-        responseHandoff.terminalResponse = Boolean(terminalStatus)
+      if (responseHandoffState.gate) {
+        responseHandoffState.gate.acceptedTaskId = taskId
+        responseHandoffState.gate.terminalResponse = Boolean(terminalStatus)
       }
       const stoppedByUser = acceptanceTransaction.stoppedByUser
-        || responseHandoff?.stoppedByUser === true
+        || responseHandoffState.gate?.stoppedByUser === true
       const lostFreshStream = !wasStreaming
         && !freshSendStillOwnsStream(freshSendToken, requestSessionKey)
       if (stoppedByUser || lostFreshStream) {
@@ -3257,18 +3277,17 @@ export function useChatSend(options: UseChatSendOptions) {
           && options.sessionKey.value === requestSessionKey
           && acceptedSessionKey !== requestSessionKey
         ) {
-          durableHandoffRecord ||= await persistResponseHandoff(attempt)
-          responseHandoff ||= beginResponseHandoff(
-            requestSessionKey,
-            attempt.clientRequestId,
-            durableHandoffRecord,
-          )
+          const responseHandoff = ensureResponseHandoffSourceFence()!
+          durableHandoffRecord ||= await persistResponseHandoffIntoGate()
           responseHandoff.stoppedByUser = true
           responseHandoff.acceptedTaskId = taskId
           responseHandoff.terminalResponse = Boolean(terminalStatus)
           await handoffResponseSession(acceptedSessionKey, responseHandoff)
-        } else if (responseHandoff && acceptedSessionKey === requestSessionKey) {
-          await handoffResponseSession(requestSessionKey, responseHandoff)
+        } else if (
+          responseHandoffState.gate
+          && acceptedSessionKey === requestSessionKey
+        ) {
+          await handoffResponseSession(requestSessionKey, responseHandoffState.gate)
         }
         return 'accepted'
       }
@@ -3302,17 +3321,13 @@ export function useChatSend(options: UseChatSendOptions) {
           responseSession: decision.responseSessionKey,
           current: options.sessionKey.value,
         })
-        durableHandoffRecord ||= await persistResponseHandoff(attempt)
-        responseHandoff ||= beginResponseHandoff(
-          requestSessionKey,
-          attempt.clientRequestId,
-          durableHandoffRecord,
-        )
+        const responseHandoff = ensureResponseHandoffSourceFence()!
+        durableHandoffRecord ||= await persistResponseHandoffIntoGate()
         responseHandoff.acceptedTaskId = taskId
         responseHandoff.terminalResponse = Boolean(terminalStatus)
         await handoffResponseSession(decision.responseSessionKey, responseHandoff)
-      } else if (responseHandoff && decision.reason === 'same_session') {
-        await handoffResponseSession(requestSessionKey, responseHandoff)
+      } else if (responseHandoffState.gate && decision.reason === 'same_session') {
+        await handoffResponseSession(requestSessionKey, responseHandoffState.gate)
       } else if (decision.reason === 'current_session_changed') {
         recordSessionNavigationDiag('send.response.stale', {
           requestSession: requestSessionKey,
@@ -3373,7 +3388,7 @@ export function useChatSend(options: UseChatSendOptions) {
         }
       }
       const stoppedByUser = acceptanceTransaction.stoppedByUser
-        || responseHandoff?.stoppedByUser === true
+        || responseHandoffState.gate?.stoppedByUser === true
       if (stoppedByUser) {
         if (acceptedError?.terminalWithoutTask || rpcError?.accepted === false) {
           clearAcceptanceStop(acceptanceTransaction)
@@ -3412,12 +3427,8 @@ export function useChatSend(options: UseChatSendOptions) {
           options.activeStreamSessionKey.value = ''
           options.stream.endStreaming()
         }
-        durableHandoffRecord ||= await persistResponseHandoff(attempt)
-        responseHandoff ||= beginResponseHandoff(
-          requestSessionKey,
-          attempt.clientRequestId,
-          durableHandoffRecord,
-        )
+        const responseHandoff = ensureResponseHandoffSourceFence()!
+        durableHandoffRecord ||= await persistResponseHandoffIntoGate()
         responseHandoff.stoppedByUser = stoppedByUser
         responseHandoff.terminalResponse = acceptedError.terminalWithoutTask
         await handoffResponseSession(acceptedSessionKey, responseHandoff)
@@ -3434,8 +3445,8 @@ export function useChatSend(options: UseChatSendOptions) {
         return 'accepted'
       }
       if (acceptedError && options.sessionKey.value === requestSessionKey) {
-        if (responseHandoff && acceptedSessionKey === requestSessionKey) {
-          await handoffResponseSession(requestSessionKey, responseHandoff)
+        if (responseHandoffState.gate && acceptedSessionKey === requestSessionKey) {
+          await handoffResponseSession(requestSessionKey, responseHandoffState.gate)
         }
         bindUserMessageId(attempt.clientMessageId, acceptedError.messageId)
         options.scheduleHistorySync()
@@ -3461,11 +3472,11 @@ export function useChatSend(options: UseChatSendOptions) {
         options.activeStreamSessionKey.value = ''
         options.stream.endStreaming()
       }
-      if (responseHandoff && rpcError?.accepted === false) {
+      if (responseHandoffState.gate && rpcError?.accepted === false) {
         if (sendOpts.requirePreparedHandoff && rpcError.retryable !== false) {
-          await resetResponseHandoffForRetry(responseHandoff, attempt)
+          await resetResponseHandoffForRetry(responseHandoffState.gate, attempt)
         } else if (rpcError.retryable === false) {
-          await markResponseHandoffFailed(responseHandoff, err)
+          await markResponseHandoffFailed(responseHandoffState.gate, err)
         }
       }
       rememberRetryableAttempt(true)
@@ -3481,7 +3492,7 @@ export function useChatSend(options: UseChatSendOptions) {
     } finally {
       attempt.acceptanceInFlight = false
       finishAcceptanceTransaction(acceptanceTransaction)
-      finishResponseHandoff(responseHandoff)
+      finishResponseHandoff(responseHandoffState.gate)
     }
   }
 
@@ -3525,6 +3536,9 @@ export function useChatSend(options: UseChatSendOptions) {
         && (anchor.attachments?.length ?? 0) === 0,
       )
     }
+    const replayOwnsResponseFence = () => (
+      activeResponseHandoff?.ownerRequestId === stableClientRequestId
+    )
     const replayIsBlocked = (allowOwnedStream = false) => (
       options.sessionKey.value !== requestSessionKey
       || !replayAnchorIsCurrent()
@@ -3533,10 +3547,13 @@ export function useChatSend(options: UseChatSendOptions) {
       || (!allowOwnedStream && options.stream.isStreaming.value)
       || hasAuthoritativeWork()
       || options.isCompactInFlightForCurrentSession()
-      || responseHandoffBlocksCurrentSession()
+      || (responseHandoffBlocksCurrentSession() && !replayOwnsResponseFence())
       || Boolean(handoffRecoveryPromise)
       || options.hasPendingQueueWork?.() === true
-      || options.pendingQueueOwnerContext.value?.sessionKey === requestSessionKey
+      || (
+        options.pendingQueueOwnerContext.value?.sessionKey === requestSessionKey
+        && options.pendingQueueOwnerContext.value.ownerRequestId !== stableClientRequestId
+      )
     )
     if (replayIsBlocked()) return false
 
