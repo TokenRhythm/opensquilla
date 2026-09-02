@@ -12,6 +12,7 @@ function session(key: string, overrides: Partial<SessionItem> = {}): SessionItem
     groupLabel: 'main',
     effectiveAgentId: 'main',
     sessionKind: 'chat',
+    sessionKindAuthoritative: true,
     interactive: true,
     surface: 'webchat',
     conversationKind: 'direct',
@@ -67,9 +68,56 @@ describe('useChatSessionInteractivity', () => {
 
     expect(policy.policyPending.value).toBe(true)
     expect(policy.turnActionsBlocked.value).toBe(true)
-    await vi.waitFor(() => expect(policy.isCronSession.value).toBe(true))
+    await vi.waitFor(() => expect(policy.isNoninteractiveSession.value).toBe(true))
     expect(policy.policyPending.value).toBe(false)
+    expect(policy.isNoninteractiveSession.value).toBe(true)
+    expect(policy.isCronSession.value).toBe(false)
     expect(source.listPage).toHaveBeenCalledTimes(2)
+    policy.dispose()
+  })
+
+  it('accepts an authoritative same-key policy refresh', async () => {
+    const key = ref('legacy-scheduled-run')
+    const knownSessions = ref<SessionItem[]>([session(key.value)])
+    const source = directory([])
+    const policy = useChatSessionInteractivity({ sessionKey: key, directory: source, knownSessions })
+    expect(policy.turnActionsBlocked.value).toBe(false)
+
+    knownSessions.value = [session(key.value, { interactive: false })]
+    await nextTick()
+
+    expect(policy.isNoninteractiveSession.value).toBe(true)
+    expect(policy.turnActionsBlocked.value).toBe(true)
+    policy.dispose()
+  })
+
+  it('keeps a direct route blocked when authoritative lookup fails', async () => {
+    const key = ref('legacy-scheduled-run')
+    const source = directory([])
+    source.listPage.mockRejectedValueOnce(new Error('gateway unavailable'))
+    const policy = useChatSessionInteractivity({ sessionKey: key, directory: source })
+
+    expect(policy.policyPending.value).toBe(true)
+    await vi.waitFor(() => expect(policy.policyUnavailable.value).toBe(true))
+    expect(policy.policyPending.value).toBe(false)
+    expect(policy.turnActionsBlocked.value).toBe(true)
+    policy.dispose()
+  })
+
+  it('does not treat a display-only inferred Cron kind as policy authority', () => {
+    const key = ref('legacy-source-labelled-cron')
+    const knownSessions = ref<SessionItem[]>([
+      session(key.value, {
+        sessionKind: 'cron',
+        sessionKindAuthoritative: false,
+        interactive: null,
+      }),
+    ])
+    const source = directory([])
+    const policy = useChatSessionInteractivity({ sessionKey: key, directory: source, knownSessions })
+
+    expect(policy.isCronSession.value).toBe(false)
+    expect(policy.turnActionsBlocked.value).toBe(false)
     policy.dispose()
   })
 

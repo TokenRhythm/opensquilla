@@ -3347,6 +3347,7 @@
     "sendSteers": "Enviar (redirige la respuesta actual ahora)",
     "sendQueuesUntilCompaction": "Enviar (se pone en cola hasta que termine la compactación)",
     "cronSessionReadOnly": "Las sesiones de Cron son de solo lectura y no pueden recibir nuevos turnos.",
+    "sessionReadOnly": "Esta sesión es de solo lectura y no puede recibir nuevos turnos.",
     "stopResponse": "Detener respuesta actual",
     "stopResponseEsc": "Detener respuesta actual (Esc)",
     "stoppingResponse": "Deteniendo de forma segura… Los mensajes nuevos se pondrán en cola.",

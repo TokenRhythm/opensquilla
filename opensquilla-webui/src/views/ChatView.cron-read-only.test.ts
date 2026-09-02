@@ -12,9 +12,8 @@ function sourceBetween(start: string, end: string): string {
 describe('Cron session read-only presentation', () => {
   it('replaces the composer with a localized status without floating dock clearance', () => {
     expect(chatViewSource).toContain('v-if="turnActionsBlocked"')
-    expect(chatViewSource).toContain(
-      "{{ t(isCronSession ? 'chat.cronSessionReadOnly' : 'chat.loadingSession') }}",
-    )
+    expect(chatViewSource).toContain("? 'chat.cronSessionReadOnly'")
+    expect(chatViewSource).toContain("sessionPolicyPending ? 'chat.loadingSession' : 'chat.sessionReadOnly'")
     expect(chatViewSource).toContain('<template v-else>')
     expect(chatViewSource).toContain(
       "chatRootRef.value?.querySelector<HTMLElement>('.chat-composer-dock')",
@@ -33,8 +32,9 @@ describe('Cron session read-only presentation', () => {
   it('uses the existing send gate while preserving the replay-specific gate', () => {
     expect(chatViewSource).toContain("isCronSession.value\n    ? t('chat.cronSessionReadOnly')")
     expect(chatViewSource).toContain(
-      "sessionPolicyPending.value ? t('chat.loadingSession') : null",
+      "? t('chat.loadingSession')",
     )
+    expect(chatViewSource).toContain("? t('chat.sessionReadOnly')")
     expect(chatViewSource).toContain('sessionInteractivityBlockedReason.value')
     expect(chatViewSource).toContain('sessionInteractivityBlockedReason,')
     expect(chatViewSource).toContain('idempotentReplayBlockedReason: liveSendBlockedReason')
@@ -50,6 +50,8 @@ describe('Cron session read-only presentation', () => {
     expect(chatViewSource).toContain('useChatSessionInteractivity({')
     expect(chatViewSource).toContain('knownSessions: knownDirectorySessions')
     expect(chatViewSource).toContain('policyPending: sessionPolicyPending')
+    expect(chatViewSource).toContain('policyUnavailable: sessionPolicyUnavailable')
+    expect(chatViewSource).toContain('isNoninteractiveSession,')
     expect(chatViewSource).toContain('turnActionsBlocked,')
   })
 

@@ -152,7 +152,8 @@ function classifySession(row: SessionRow, key: string) {
   const task = key.includes(':subagent:') || source === 'subagent' || channel === 'subagent'
   const cli = key.includes(':cli:') || key.includes(':standalone:') || source === 'cli' || channel === 'cli'
   const external = source === 'channel' || (!!channel && !['cli', 'subagent', 'standalone'].includes(channel))
-  const sessionKind = textValue(row.sessionKind)
+  const authoritativeSessionKind = textValue(row.sessionKind)
+  const sessionKind = authoritativeSessionKind
     || (web ? 'chat' : cron ? 'cron' : external ? 'channel' : task ? 'task' : cli ? 'chat' : 'unknown')
   const conversationKind = textValue(row.conversationKind)
     || (web ? 'direct' : cron ? 'unknown' : external ? chatType || 'group' : task || cli ? 'internal' : 'unknown')
@@ -160,7 +161,12 @@ function classifySession(row: SessionRow, key: string) {
     : sessionKind === 'cron' ? channel || source || 'cron'
       : sessionKind === 'channel' ? channel || source || 'channel'
         : task ? 'subagent' : cli ? 'cli' : source || channel || 'unknown'
-  return { sessionKind, conversationKind, surface: textValue(row.surface) || fallbackSurface }
+  return {
+    sessionKind,
+    sessionKindAuthoritative: Boolean(authoritativeSessionKind),
+    conversationKind,
+    surface: textValue(row.surface) || fallbackSurface,
+  }
 }
 
 function deriveGroupLabel(row: SessionRow, sessionKind: string, agentId: string): string {
@@ -218,7 +224,12 @@ export function normalizeV4SessionItem(item: unknown): SessionItem | null {
   const derivedAgentId = textValue(row.effectiveAgentId, row.agentId, row.agent_id)
     || keyAgentId(key)
     || 'unknown'
-  const { sessionKind, conversationKind, surface } = classifySession(row, key)
+  const {
+    sessionKind,
+    sessionKindAuthoritative,
+    conversationKind,
+    surface,
+  } = classifySession(row, key)
   const groupLabel = deriveGroupLabel(row, sessionKind, derivedAgentId)
   const workspace = textValue(row.workspace)
   const workspaceId = textValue(row.workspaceId, row.workspace_id)
@@ -254,6 +265,7 @@ export function normalizeV4SessionItem(item: unknown): SessionItem | null {
     workspaceDisplayPath: textValue(row.workspaceDisplayPath) || undefined,
     effectiveAgentId: derivedAgentId,
     sessionKind,
+    sessionKindAuthoritative,
     interactive: booleanValue(row.interactive),
     surface,
     conversationKind,

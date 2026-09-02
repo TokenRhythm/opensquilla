@@ -15,10 +15,6 @@ export interface UseChatSessionInteractivityOptions {
   shouldResolve?: (key: string) => boolean
 }
 
-function isAuthoritativeNoninteractive(item: SessionItem | null): boolean {
-  return item?.interactive === false || item?.sessionKind === 'cron'
-}
-
 /**
  * Resolves the selected session's authoritative mutation policy. Canonical
  * Cron keys remain the compatibility fallback; noncanonical legacy runs are
@@ -27,6 +23,7 @@ function isAuthoritativeNoninteractive(item: SessionItem | null): boolean {
 export function useChatSessionInteractivity(options: UseChatSessionInteractivityOptions) {
   const authority = ref<SessionItem | null>(null)
   const resolvingKey = ref('')
+  const unresolvedKey = ref('')
   let generation = 0
   let controller: AbortController | null = null
 
@@ -57,6 +54,7 @@ export function useChatSessionInteractivity(options: UseChatSessionInteractivity
       }
     } catch (error) {
       if (!signal.aborted && attempt === generation) {
+        unresolvedKey.value = key
         console.warn(
           'Selected session policy lookup failed:',
           error instanceof Error ? error.message : error,
@@ -73,6 +71,7 @@ export function useChatSessionInteractivity(options: UseChatSessionInteractivity
     controller = null
     authority.value = null
     resolvingKey.value = ''
+    unresolvedKey.value = ''
     if (!key || isCronSessionKey(key)) return
     const known = knownSession(key)
     if (known) {
@@ -91,11 +90,12 @@ export function useChatSessionInteractivity(options: UseChatSessionInteractivity
     ? watch(options.knownSessions, () => {
         const key = options.sessionKey.value
         const known = knownSession(key)
-        if (!key || !known || authority.value?.key === key) return
+        if (!key || !known || authority.value === known) return
         generation += 1
         controller?.abort()
         controller = null
         resolvingKey.value = ''
+        unresolvedKey.value = ''
         authority.value = known
       })
     : () => {}
@@ -103,22 +103,45 @@ export function useChatSessionInteractivity(options: UseChatSessionInteractivity
   const isCronSession = computed(() => {
     const key = options.sessionKey.value
     if (isCronSessionKey(key)) return true
-    return authority.value?.key === key && isAuthoritativeNoninteractive(authority.value)
+    return authority.value?.key === key
+      && authority.value.sessionKindAuthoritative === true
+      && authority.value.sessionKind === 'cron'
   })
+  const isNoninteractiveSession = computed(() => (
+    authority.value?.key === options.sessionKey.value
+    && authority.value.interactive === false
+  ))
   const policyPending = computed(() => (
     Boolean(options.sessionKey.value)
     && resolvingKey.value === options.sessionKey.value
   ))
-  const turnActionsBlocked = computed(() => isCronSession.value || policyPending.value)
+  const policyUnavailable = computed(() => (
+    Boolean(options.sessionKey.value)
+    && unresolvedKey.value === options.sessionKey.value
+  ))
+  const turnActionsBlocked = computed(() => (
+    isCronSession.value
+    || isNoninteractiveSession.value
+    || policyPending.value
+    || policyUnavailable.value
+  ))
 
   function dispose(): void {
     generation += 1
     controller?.abort()
     controller = null
     resolvingKey.value = ''
+    unresolvedKey.value = ''
     stopSessionWatch()
     stopKnownSessionsWatch()
   }
 
-  return { isCronSession, policyPending, turnActionsBlocked, dispose }
+  return {
+    isCronSession,
+    isNoninteractiveSession,
+    policyPending,
+    policyUnavailable,
+    turnActionsBlocked,
+    dispose,
+  }
 }

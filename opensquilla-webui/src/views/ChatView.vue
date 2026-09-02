@@ -553,7 +553,11 @@
       class="chat-composer-read-only"
       role="status"
       aria-live="polite"
-    >{{ t(isCronSession ? 'chat.cronSessionReadOnly' : 'chat.loadingSession') }}</div>
+    >{{ t(
+      isCronSession
+        ? 'chat.cronSessionReadOnly'
+        : sessionPolicyPending ? 'chat.loadingSession' : 'chat.sessionReadOnly',
+    ) }}</div>
     <template v-else>
     <!-- Durable execution progress belongs to the work surface, not to the
          transcript. Keeping it immediately above the composer also lets a
@@ -1351,7 +1355,9 @@ const sessionInteractivity = useChatSessionInteractivity({
 })
 const {
   isCronSession,
+  isNoninteractiveSession,
   policyPending: sessionPolicyPending,
+  policyUnavailable: sessionPolicyUnavailable,
   turnActionsBlocked,
 } = sessionInteractivity
 function clearPendingComposerScrollIntent() {
@@ -2866,7 +2872,11 @@ const deliveryBlockedReason = computed<string | null>(() => (
 const sessionInteractivityBlockedReason = computed<string | null>(() => (
   isCronSession.value
     ? t('chat.cronSessionReadOnly')
-    : sessionPolicyPending.value ? t('chat.loadingSession') : null
+    : sessionPolicyPending.value
+      ? t('chat.loadingSession')
+      : (isNoninteractiveSession.value || sessionPolicyUnavailable.value)
+          ? t('chat.sessionReadOnly')
+          : null
 ))
 const effectiveSendBlockedReason = computed<string | null>(() => (
   sessionInteractivityBlockedReason.value

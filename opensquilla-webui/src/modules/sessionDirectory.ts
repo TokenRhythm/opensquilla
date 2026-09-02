@@ -11,6 +11,8 @@ export interface SessionItem {
   workspaceDisplayPath?: string
   effectiveAgentId: string
   sessionKind: string
+  /** True only when sessionKind came directly from the Gateway row. */
+  sessionKindAuthoritative?: boolean
   /** Null/undefined means an older Gateway did not publish this authority. */
   interactive?: boolean | null
   surface: string

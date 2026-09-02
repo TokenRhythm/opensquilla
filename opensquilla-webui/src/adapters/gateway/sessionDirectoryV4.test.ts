@@ -62,12 +62,21 @@ describe('v4 SessionDirectory Adapter', () => {
     })).toMatchObject({
       key: 'legacy-scheduled-run',
       sessionKind: 'cron',
+      sessionKindAuthoritative: true,
       interactive: false,
     })
     expect(normalizeV4SessionItem({
       key: 'agent:main:webchat:ordinary',
       sessionKind: 'chat',
     })?.interactive).toBeNull()
+    expect(normalizeV4SessionItem({
+      key: 'legacy-source-labelled-cron',
+      sourceKind: 'cron',
+    })).toMatchObject({
+      sessionKind: 'cron',
+      sessionKindAuthoritative: false,
+      interactive: null,
+    })
   })
 
   it('uses the pinned legacy Gateway wire without requiring a new envelope', async () => {
