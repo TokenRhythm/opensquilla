@@ -254,8 +254,7 @@ async def _handle_set_heartbeats(params: dict | None, ctx: RpcContext) -> dict[s
     }
 
 
-@_d.method("doctor.memory.status", scope="operator.read")
-async def _handle_doctor_memory_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def read_memory_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if params is not None and not isinstance(params, dict):
         raise ValueError("params must be an object")
     params = params or {}
@@ -387,3 +386,8 @@ async def _handle_doctor_memory_status(params: dict | None, ctx: RpcContext) -> 
             }
         )
     return payload
+
+
+@_d.method("doctor.memory.status", scope="operator.read")
+async def _handle_doctor_memory_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    return await read_memory_status(params, ctx)

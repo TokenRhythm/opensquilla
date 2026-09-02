@@ -332,7 +332,7 @@ def _pending_pairings_by_channel(ctx: RpcContext) -> dict[str, int]:
     return counts
 
 
-async def _handle_channels_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def read_channel_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     health_map = await ctx.channel_manager.health() if ctx.channel_manager else {}
     start_errors = _manager_start_errors(ctx.channel_manager)
     manager_types = (
@@ -423,6 +423,11 @@ async def _handle_channels_status(params: dict | None, ctx: RpcContext) -> dict[
     from opensquilla.gateway.boot import _boot_id
 
     return {"channels": channels, "bootId": _boot_id}
+
+
+async def _handle_channels_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    """Compatibility callable for tests and older in-process consumers."""
+    return await read_channel_status(params, ctx)
 
 
 async def _handle_channels_get(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
@@ -863,7 +868,7 @@ def _channel_administration_adapter(ctx: RpcContext) -> GatewayChannelAdministra
     return GatewayChannelAdministrationAdapter(
         ctx,
         GatewayChannelAdministrationCallbacks(
-            status=_handle_channels_status,
+            status=read_channel_status,
             get=_handle_channels_get,
             probe=_handle_channels_probe,
             restart=_handle_channels_restart,

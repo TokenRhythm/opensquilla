@@ -16,16 +16,49 @@ function transport(call: ReturnType<typeof vi.fn>, supports = true) {
 
 describe('v4 Observability Adapter', () => {
   it('owns Gateway and self-learning status methods', async () => {
-    const call = vi.fn(async (method: string) => ({ method, ready: true }))
+    const call = vi.fn(async (method: string) => {
+      if (method === 'status') {
+        return {
+          status: 'running',
+          version: '1.0.0',
+          uptime_ms: 1,
+          provider: null,
+          active_sessions: 0,
+        }
+      }
+      return {
+        agentId: 'main',
+        enabled: false,
+        captureEnabled: false,
+        trainingReachable: false,
+        dream: {},
+        activeModel: {},
+        samples: null,
+        gate: null,
+        lastReceipt: null,
+      }
+    })
     const adapter = createV4Observability(
       transport(call).value as Parameters<typeof createV4Observability>[0],
       { requestJson: vi.fn(), requestBinary: vi.fn() },
     )
 
-    await expect(adapter.gatewayStatus()).resolves.toMatchObject({ ready: true })
-    await expect(adapter.selfLearningStatus()).resolves.toMatchObject({ ready: true })
+    await expect(adapter.gatewayStatus()).resolves.toMatchObject({ status: 'running' })
+    await expect(adapter.selfLearningStatus()).resolves.toMatchObject({ agentId: 'main' })
     expect(call).toHaveBeenNthCalledWith(1, 'status', {}, expect.any(Object))
     expect(call).toHaveBeenNthCalledWith(2, 'router.selflearning.status', {}, expect.any(Object))
+  })
+
+  it('rejects a successful response that violates the generated Contract', async () => {
+    const call = vi.fn(async () => ({ ready: true }))
+    const adapter = createV4Observability(
+      transport(call).value as Parameters<typeof createV4Observability>[0],
+      { requestJson: vi.fn(), requestBinary: vi.fn() },
+    )
+
+    await expect(adapter.gatewayStatus()).rejects.toThrow(
+      'status returned an invalid response',
+    )
   })
 
   it('projects usage.query and preserves the semantic range request', async () => {
@@ -78,9 +111,17 @@ describe('v4 Observability Adapter', () => {
 
   it('owns readiness, log, update, and support-bundle transport details', async () => {
     const call = vi.fn(async (method: string) => {
-      if (method === 'doctor.status') return { status: 'ready', ready: true }
-      if (method === 'logs.status') return { gateway_file_log: { enabled: true } }
-      if (method === 'logs.tail') return { lines: ['ready'], cursor: 4 }
+      if (method === 'doctor.status') {
+        return { status: 'ready', ready: true, findings: [], agentId: 'main' }
+      }
+      if (method === 'logs.status') {
+        return {
+          raw_turn_call_log: {},
+          gateway_file_log: { enabled: true },
+          diagnostics_enabled: {},
+        }
+      }
+      if (method === 'logs.tail') return { lines: ['ready'], cursor: 4, has_more: false }
       throw new Error(`unexpected method ${method}`)
     })
     const http = {

@@ -26,6 +26,7 @@ from typing import Any
 
 import structlog
 
+from opensquilla.application.observability import RouterLearningQuery, RouterLearningStatus
 from opensquilla.engine.steps.router_decision_record import get_decision_writer
 from opensquilla.gateway.adapters.conversation_ancillary import (
     GatewayConversationAncillaryAdapter,
@@ -33,6 +34,10 @@ from opensquilla.gateway.adapters.conversation_ancillary import (
 )
 from opensquilla.gateway.adapters.conversation_ancillary_contract import (
     register_conversation_ancillary_contract,
+)
+from opensquilla.gateway.adapters.observability import GatewayRouterLearningStatusPort
+from opensquilla.gateway.adapters.observability_contract import (
+    register_observability_contract,
 )
 from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.protocol import ERROR_INVALID_REQUEST
@@ -222,8 +227,7 @@ async def _handle_router_feedback_submit(params: Any, ctx: RpcContext) -> dict[s
     return {"accepted": True, "recorded": rating}
 
 
-@_d.method("router.selflearning.status", scope="operator.read")
-async def _handle_selflearning_status(params: Any, ctx: RpcContext) -> dict[str, Any]:
+async def read_router_learning_status(agent_id_value: str, ctx: RpcContext) -> dict[str, Any]:
     """Read-only status of the router self-learning loop for one agent.
 
     Everything here is derived from on-disk state the loop already writes
@@ -232,12 +236,10 @@ async def _handle_selflearning_status(params: Any, ctx: RpcContext) -> dict[str,
     the single source the Web UI status card and CLI doctor consume, so gate
     reason codes are surfaced verbatim for the client to localize.
 
-    Params (optional): ``agentId`` (defaults to ``main``).
+    The Gateway Adapter supplies a normalized domain query.
     """
 
-    p = params if isinstance(params, dict) else {}
-    agent_raw = p.get("agentId") or p.get("agent_id") or "main"
-    agent_id = sanitize_token(agent_raw)
+    agent_id = sanitize_token(agent_id_value)
     if agent_id is None:
         raise RpcHandlerError(ERROR_INVALID_REQUEST, "agentId must be an id token")
 
@@ -362,6 +364,26 @@ async def _handle_selflearning_status(params: Any, ctx: RpcContext) -> dict[str,
         payload["error"] = "status_partial"
 
     return payload
+
+
+async def _router_selflearning_status_contract(
+    params: Any, ctx: RpcContext
+) -> dict[str, Any]:
+    p = params if isinstance(params, dict) else {}
+    agent_id = p.get("agentId") or p.get("agent_id") or "main"
+    status = RouterLearningStatus(
+        GatewayRouterLearningStatusPort(ctx, read_router_learning_status)
+    )
+    return await status.read(RouterLearningQuery(str(agent_id)))
+
+
+_handle_selflearning_status = register_observability_contract(
+    _d,
+    "router.selflearning.status",
+    _router_selflearning_status_contract,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 async def _handle_router_feedback_submit_contract(

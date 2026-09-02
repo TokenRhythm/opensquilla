@@ -21,7 +21,11 @@ describe('CronScheduler v4 Adapter', () => {
   it('owns one remote event lease for all domain subscribers', async () => {
     const handlers = new Map<string, (payload: unknown) => void>()
     const close = vi.fn()
-    const request = vi.fn(async (method: string) => (
+    const request = vi.fn(async (
+      method: string,
+      _params?: Record<string, unknown>,
+      _options?: unknown,
+    ) => (
       method === 'cron.subscribe' || method === 'cron.unsubscribe'
         ? { ok: true, topic: 'cron:*' }
         : {}
@@ -64,7 +68,11 @@ describe('CronScheduler v4 Adapter', () => {
   it('rebinds an active lease once per transport generation', async () => {
     let generation = 1
     const handlers = new Map<string, (payload: unknown) => void>()
-    const request = vi.fn(async (method: string) => (
+    const request = vi.fn(async (
+      method: string,
+      _params?: Record<string, unknown>,
+      _options?: unknown,
+    ) => (
       method === 'cron.subscribe' || method === 'cron.unsubscribe'
         ? { ok: true, topic: 'cron:*' }
         : {}

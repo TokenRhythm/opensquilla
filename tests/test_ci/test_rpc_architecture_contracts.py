@@ -58,6 +58,9 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         # Cron scheduling and subscription wire models terminate at the
         # generated registration Adapter; Application Modules stay transport-neutral.
         "src/opensquilla/gateway/adapters/cron_scheduler_contract.py",
+        # Runtime/readiness/log wire models terminate at the Observability
+        # registration Adapter; collectors receive transport-neutral queries.
+        "src/opensquilla/gateway/adapters/observability_contract.py",
         # SandboxRuntime handlers stay legacy-compatible while generated
         # descriptors own registration metadata and success validation.
         "src/opensquilla/gateway/adapters/sandbox_runtime_contract.py",
@@ -141,7 +144,7 @@ SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
 SESSIONS_RESOLVE_LITERAL_ALLOWLIST: Counter[str] = Counter()
 SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
 RUNTIME_RPC_METHOD_BASELINE = 306
-STATIC_RPC_DECORATOR_BASELINE = 190
+STATIC_RPC_DECORATOR_BASELINE = 186
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
 # closure measurement below.  The temporary S2a cumulative growth budget was
@@ -222,6 +225,7 @@ R3_APPLICATION_MODULE_FILES = (
     "src/opensquilla/application/session_read.py",
     "src/opensquilla/application/setup_workflow.py",
     "src/opensquilla/application/session_maintenance.py",
+    "src/opensquilla/application/observability.py",
 )
 
 # Generated schema artifacts and consumer tests are intentionally excluded:
@@ -277,11 +281,6 @@ APPROVED_PRIVATE_RPC_IMPORTS: Counter[tuple[str, str, str]] = Counter(
             "_apply_run_context_route_metadata",
         ): 1,
         (
-            "src/opensquilla/diagnostics_sources.py",
-            "opensquilla.gateway.rpc_logs",
-            "_build_logs_status",
-        ): 1,
-        (
             "src/opensquilla/gateway/channel_dispatch.py",
             "opensquilla.gateway.rpc_sessions",
             "_apply_run_context_route_metadata",
@@ -305,31 +304,6 @@ APPROVED_PRIVATE_RPC_IMPORTS: Counter[tuple[str, str, str]] = Counter(
             "src/opensquilla/gateway/rpc_chat.py",
             "opensquilla.gateway.rpc_sessions",
             "_handle_sessions_send",
-        ): 1,
-        (
-            "src/opensquilla/gateway/rpc_doctor.py",
-            "opensquilla.gateway.rpc_channels",
-            "_handle_channels_status",
-        ): 1,
-        (
-            "src/opensquilla/gateway/rpc_doctor.py",
-            "opensquilla.gateway.rpc_logs",
-            "_build_logs_status",
-        ): 1,
-        (
-            "src/opensquilla/gateway/rpc_doctor.py",
-            "opensquilla.gateway.rpc_system",
-            "_handle_doctor_memory_status",
-        ): 1,
-        (
-            "src/opensquilla/gateway/rpc_doctor.py",
-            "opensquilla.gateway.rpc_tools",
-            "_handle_providers_status",
-        ): 1,
-        (
-            "src/opensquilla/gateway/rpc_doctor.py",
-            "opensquilla.gateway.rpc_tools",
-            "_handle_search_status",
         ): 1,
         (
             "src/opensquilla/gateway/rpc_models.py",
@@ -1067,6 +1041,11 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "cron.runs",
             "cron.subscribe",
             "cron.unsubscribe",
+            "status",
+            "router.selflearning.status",
+            "doctor.status",
+            "logs.status",
+            "logs.tail",
         }
     ] == []
     assert [
@@ -1306,6 +1285,9 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
     from opensquilla.gateway.adapters.cron_scheduler_contract import (
         CRON_SCHEDULER_CONTRACT_METHODS,
     )
+    from opensquilla.gateway.adapters.observability_contract import (
+        OBSERVABILITY_CONTRACT_METHODS,
+    )
     from opensquilla.gateway.adapters.pending_input_queue_contract import (
         PENDING_INPUT_QUEUE_CONTRACT_METHODS,
     )
@@ -1328,6 +1310,7 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
         *AGENT_CATALOG_CONTRACT_METHODS,
         *CHANNEL_ADMINISTRATION_CONTRACT_METHODS,
         *CRON_SCHEDULER_CONTRACT_METHODS,
+        *OBSERVABILITY_CONTRACT_METHODS,
     ):
         entry = registry.get_entry(method)
         assert entry is not None
