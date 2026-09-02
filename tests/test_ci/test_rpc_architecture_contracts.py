@@ -70,6 +70,9 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         # Proposal review wire models terminate at its registration Adapter;
         # scheduler rollback and catalog invalidation stay in the Application Module.
         "src/opensquilla/gateway/adapters/skill_proposal_review_contract.py",
+        # Artifact Workbench wire models terminate at its registration Adapter;
+        # the Application composition receives only typed domain commands.
+        "src/opensquilla/gateway/adapters/artifact_workbench_contract.py",
         # SandboxRuntime handlers stay legacy-compatible while generated
         # descriptors own registration metadata and success validation.
         "src/opensquilla/gateway/adapters/sandbox_runtime_contract.py",
@@ -153,7 +156,7 @@ SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
 SESSIONS_RESOLVE_LITERAL_ALLOWLIST: Counter[str] = Counter()
 SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
 RUNTIME_RPC_METHOD_BASELINE = 306
-STATIC_RPC_DECORATOR_BASELINE = 170
+STATIC_RPC_DECORATOR_BASELINE = 140
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
 # closure measurement below.  The temporary S2a cumulative growth budget was
@@ -238,6 +241,7 @@ R3_APPLICATION_MODULE_FILES = (
     "src/opensquilla/application/skill_catalog.py",
     "src/opensquilla/application/skill_management.py",
     "src/opensquilla/application/skill_proposal_review.py",
+    "src/opensquilla/application/artifact_workbench.py",
 )
 
 # Generated schema artifacts and consumer tests are intentionally excluded:
@@ -1117,6 +1121,13 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "sandbox.resume",
         }
     ] == []
+    from opensquilla.gateway.adapters.artifact_workbench_contract import (
+        ARTIFACT_WORKBENCH_CONTRACT_METHODS,
+    )
+
+    assert [
+        site for site in sites if site[2] in ARTIFACT_WORKBENCH_CONTRACT_METHODS
+    ] == []
 
 
 def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter() -> None:
@@ -1288,6 +1299,9 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
     from opensquilla.gateway.adapters.agent_catalog_contract import (
         AGENT_CATALOG_CONTRACT_METHODS,
     )
+    from opensquilla.gateway.adapters.artifact_workbench_contract import (
+        ARTIFACT_WORKBENCH_CONTRACT_METHODS,
+    )
     from opensquilla.gateway.adapters.channel_administration_contract import (
         CHANNEL_ADMINISTRATION_CONTRACT_METHODS,
     )
@@ -1335,6 +1349,7 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
         *SKILL_CATALOG_CONTRACT_METHODS,
         *SKILL_MANAGEMENT_CONTRACT_METHODS,
         *SKILL_PROPOSAL_REVIEW_CONTRACT_METHODS,
+        *ARTIFACT_WORKBENCH_CONTRACT_METHODS,
     ):
         entry = registry.get_entry(method)
         assert entry is not None

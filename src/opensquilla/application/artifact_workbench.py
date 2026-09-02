@@ -239,8 +239,6 @@ class SourcePatch:
             raise ValueError("expected state revision must be positive")
         if not self.edits:
             raise ValueError("at least one source edit is required")
-        if self.offset_encoding != "unicode-code-point":
-            raise ValueError("unsupported source offset encoding")
         edit_session_fields = (
             self.edit_session_id,
             self.expected_edit_session_state_revision,
