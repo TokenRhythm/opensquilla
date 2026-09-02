@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import re
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -276,6 +277,47 @@ def _corrections_budget_fallback(model_id: str) -> tuple[int, int] | None:
         min(max_outputs) if max_outputs else 0,
         min(windows) if windows else 0,
     )
+
+
+# ---------------------------------------------------------------------------
+# Custom-endpoint context-window inference
+#
+# When *no* catalog layer resolved a window (no snapshot, no corrections, no
+# live catalog field), infer a reasonable default from the model-id naming
+# convention. This gives custom-provider operators a sensible starting point
+# instead of the cloud-fallback 200 k.  If catalog *did* resolve, trust it
+# — inference is only a last-resort bridge.
+# ---------------------------------------------------------------------------
+
+_INFERENCE_WINDOW_FLASH = 1_000_000   # ~1 M tokens
+_INFERENCE_WINDOW_SMALL = 200_000     # ~200 k tokens
+_PARAM_SMALL_THRESHOLD  = 250         # billion parameters
+
+#: Pattern matching a trailing param-scale suffix like "3b", "8b", "250b".
+_RE_PARAM_SUFFIX = re.compile(r"\b(\d+(?:\.\d+)?)\s*b\b", re.IGNORECASE)
+
+#: Suffixes that signal a large-window model (case-insensitive).
+_LARGE_MODEL_SUFFIXES = frozenset({"flash", "pro", "plus", "max"})
+
+
+def _infer_context_window_from_model_id(model_id: str) -> int:
+    """Return an inferred context window in tokens, or 0 when inconclusive."""
+    mid = model_id.strip().lower()
+    if not mid:
+        return 0
+
+    # 1) Param-scale suffix: detect explicit parameter count.
+    m = _RE_PARAM_SUFFIX.search(mid)
+    if m:
+        params_billion = float(m.group(1))
+        return _INFERENCE_WINDOW_SMALL if params_billion < _PARAM_SMALL_THRESHOLD else _INFERENCE_WINDOW_FLASH
+
+    # 2) Naming-convention suffix: flash / pro / plus / max at the very end.
+    for suffix in _LARGE_MODEL_SUFFIXES:
+        if mid.endswith(suffix):
+            return _INFERENCE_WINDOW_FLASH
+
+    return 0
 
 
 def _live_layer_fields(info: ModelInfo | None) -> dict[str, Any]:
@@ -1635,6 +1677,13 @@ class ModelCatalog:
         budgets = _corrections_budget_fallback(model_id)
         if budgets is not None and budgets[1] > 0:
             return budgets[1], "catalog"
+        # Custom / unknown endpoint without any catalog data — infer from the
+        # model-id naming convention.  This gives operators a sensible starting
+        # point instead of the cloud-fallback default.  Only activates when no
+        # catalog layer resolved anything; if catalog *did* resolve, trust it.
+        inferred = _infer_context_window_from_model_id(model_id)
+        if inferred > 0:
+            return inferred, "default"
         if provider and provider.strip().lower() in LOCAL_RUNTIME_PROVIDERS:
             return _LOCAL_CONTEXT_WINDOW, "default"
         return DEFAULT_CONTEXT_WINDOW, "default"

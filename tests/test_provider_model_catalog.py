@@ -502,3 +502,33 @@ def test_cloud_provider_context_window_unchanged() -> None:
     assert catalog.resolve_context_window("some-cloud-model", provider="openai") == (
         DEFAULT_CONTEXT_WINDOW
     )
+
+
+def _infer(model_id: str) -> int:
+    from opensquilla.provider.model_catalog import (
+        _infer_context_window_from_model_id as f,
+    )
+    return f(model_id)
+
+
+def test_infer_context_window_suffix_flash_pro_plus_max() -> None:
+    """Naming-convention suffix → large window (1 M)."""
+    assert _infer("qwen3.8-flash") == 1_000_000
+    assert _infer("glm-5.3-flash") == 1_000_000
+    assert _infer("deepseek-v4-pro") == 1_000_000
+    assert _infer("gemini-2.5-plus-preview") == 1_000_000
+    assert _infer("gpt-4o-max") == 1_000_000
+
+
+def test_infer_context_window_param_suffix_small_and_large() -> None:
+    """Explicit param count: <250B→200k, ≥250B→1M."""
+    assert _infer("Qwen/Qwen3-8B") == 200_000
+    assert _infer("llama3-70b") == 200_000
+    assert _infer("mixtral-260b") == 1_000_000
+
+
+def test_infer_context_window_no_match_returns_zero() -> None:
+    """No recognizable pattern → 0 (catalog default path)."""
+    assert _infer("unknown-foo") == 0
+    assert _infer("") == 0
+    assert _infer("   ") == 0
