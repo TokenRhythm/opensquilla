@@ -28,6 +28,20 @@
           "stage": "characterization"
         }
       }
+    },
+    {
+      "id": "error.history-cursor-invalid",
+      "wire": {
+        "code": "HISTORY_CURSOR_INVALID",
+        "message": "The history cursor is invalid. Reload history from the latest page."
+      }
+    },
+    {
+      "id": "error.history-cursor-invalidated",
+      "wire": {
+        "code": "HISTORY_CURSOR_INVALIDATED",
+        "message": "The history cursor no longer belongs to this session. Reload from the latest page."
+      }
     }
   ]
 }

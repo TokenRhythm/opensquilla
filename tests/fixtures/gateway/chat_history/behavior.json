@@ -44,11 +44,15 @@
       "id": "behavior.error-envelope",
       "request_cases": [
         "request.invalid-truthy-params",
-        "request.storage-busy"
+        "request.storage-busy",
+        "request.history-cursor-invalid",
+        "request.history-cursor-invalidated"
       ],
       "asserts": [
         "error.invalid-truthy-params",
-        "error.storage-busy"
+        "error.storage-busy",
+        "error.history-cursor-invalid",
+        "error.history-cursor-invalidated"
       ]
     }
   ]
