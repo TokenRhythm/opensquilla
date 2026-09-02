@@ -537,6 +537,7 @@
       v-if="setupState"
       :state="setupState"
       :provider-navigation-pending="metaSetupProviderNavigationPending"
+      :turn-actions-disabled="isCronSession"
       @confirm="confirmSetup"
       @retry="retrySetup"
       @cancel="cancelSetup"
@@ -3032,6 +3033,7 @@ const metaSkillSetup = useMetaSkillSetup({
   forgetHiddenControl: (draftSessionKey: string, clientRequestId: string) => {
     forgetHiddenControlOutbox(draftSessionKey, clientRequestId)
   },
+  turnActionsBlocked: () => isCronSession.value,
 })
 const {
   setupState,

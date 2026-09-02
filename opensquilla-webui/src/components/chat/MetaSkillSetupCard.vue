@@ -197,7 +197,7 @@
           :class="state.actionIds.length === 0 && index === 0 ? 'btn--primary' : 'btn--ghost'"
           data-testid="meta-setup-configure-provider"
           :data-provider-id="action.provider_id"
-          :disabled="providerNavigationPending"
+          :disabled="providerNavigationPending || turnActionsDisabled"
           @click="emit('configure', action.provider_id || '')"
         >
           {{ t('chat.metaSetup.configureProvider', {
@@ -209,7 +209,7 @@
           type="button"
           class="btn btn--ghost"
           data-testid="meta-setup-retry"
-          :disabled="providerNavigationPending"
+          :disabled="providerNavigationPending || turnActionsDisabled"
           @click="emit('retry')"
         >
           {{ t('chat.metaSetup.checkAgain') }}
@@ -219,6 +219,7 @@
           type="button"
           class="btn btn--primary"
           data-testid="meta-setup-confirm"
+          :disabled="turnActionsDisabled"
           @click="emit('confirm')"
         >
           {{ t('chat.metaSetup.installAndContinue') }}
@@ -255,7 +256,7 @@
           class="btn btn--ghost"
           data-testid="meta-setup-configure-provider"
           :data-provider-id="action.provider_id"
-          :disabled="providerNavigationPending"
+          :disabled="providerNavigationPending || turnActionsDisabled"
           @click="emit('configure', action.provider_id || '')"
         >
           {{ t('chat.metaSetup.configureProvider', {
@@ -267,6 +268,7 @@
           type="button"
           class="btn btn--primary"
           data-testid="meta-setup-retry"
+          :disabled="turnActionsDisabled"
           @click="emit('retry')"
         >
           {{ state.retryMode === 'readiness'
@@ -297,8 +299,10 @@ const descriptionId = `meta-setup-description-${instanceId}`
 const props = withDefaults(defineProps<{
   state: MetaSetupState
   providerNavigationPending?: boolean
+  turnActionsDisabled?: boolean
 }>(), {
   providerNavigationPending: false,
+  turnActionsDisabled: false,
 })
 
 const emit = defineEmits<{

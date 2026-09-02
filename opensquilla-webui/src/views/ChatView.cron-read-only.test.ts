@@ -35,8 +35,10 @@ describe('Cron session read-only presentation', () => {
     expect(chatViewSource).toContain('idempotentReplayBlockedReason: liveSendBlockedReason')
     expect(chatViewSource).toContain(':message-actions-available="!isCronSession"')
     expect(chatViewSource).toContain('canMutateMessages: () => !isCronSession.value')
-    expect(chatViewSource.match(/:turn-actions-disabled="isCronSession"/g)).toHaveLength(2)
+    expect(chatViewSource.match(/:turn-actions-disabled="isCronSession"/g)).toHaveLength(3)
     expect(chatViewSource).toContain('turnActionsBlocked: () => isCronSession.value')
+    expect(chatViewSource).toContain('<MetaSkillSetupCard')
+    expect(chatViewSource).toContain(':turn-actions-disabled="isCronSession"')
   })
 
   it('guards current, new-task, and replan handlers before Plan mutations', () => {
