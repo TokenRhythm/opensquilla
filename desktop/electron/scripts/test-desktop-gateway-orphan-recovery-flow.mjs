@@ -15,6 +15,11 @@ import {
   waitForDesktopGatewayOwnershipRelease,
 } from '../dist/desktop-gateway-ownership.js'
 import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
+import {
+  canAcceptWindowsElectronShutdownFallback,
+  closeElectronWithDeadline,
+  desktopShutdownEvidenceSince,
+} from './e2e-shutdown-helpers.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
@@ -35,6 +40,7 @@ const ORPHAN_RECOVERY_STARTUP_BUDGET_MS = (
 )
 const GATEWAY_CHILD_CRASH_RECOVERY_BUDGET_MS = INITIAL_DESKTOP_STARTUP_BUDGET_MS + 10_000
 const CRASH_EXIT_BUDGET_MS = 15_000
+const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000
 const WINDOWS_ELECTRON_CHILD_CLEANUP_COMMAND_TIMEOUT_MS = 20_000
 const WINDOWS_ELECTRON_CHILD_CLEANUP_BUDGET_MS = 30_000
 
@@ -112,6 +118,23 @@ async function phaseDiagnostics(app, userDataDir, phase) {
     process: appProcessState(app),
     windows,
     ownership: await ownershipDiagnostics(userDataDir),
+  }
+}
+
+async function closeDesktopForPhase(app, userDataDir, phaseName) {
+  const phase = createPhaseBudget(phaseName, ELECTRON_SHUTDOWN_TIMEOUT_MS)
+  const desktopLogPath = join(userDataDir, 'logs', 'desktop.log')
+  const desktopLogCheckpoint = await readFile(desktopLogPath, 'utf8').catch(() => null)
+  const shutdown = await closeElectronWithDeadline({
+    app,
+    phase: phase.name,
+    timeoutMs: phase.timeoutMs,
+    diagnostics: () => phaseDiagnostics(app, userDataDir, phase),
+  })
+  const desktopLog = await readFile(desktopLogPath, 'utf8').catch(() => null)
+  return {
+    ...shutdown,
+    shutdownEvidence: desktopShutdownEvidenceSince(desktopLogCheckpoint, desktopLog),
   }
 }
 
@@ -497,15 +520,33 @@ try {
     'crashed-gateway-process-exit',
   ), () => phaseDiagnostics(secondApp, userDataDir, childCrashRecovery))
 
-  await secondApp.close()
+  const successShutdown = await closeDesktopForPhase(
+    secondApp,
+    userDataDir,
+    'successful-electron-shutdown',
+  )
   secondApp = null
-  assert.equal(
-    await waitForDesktopGatewayOwnershipRelease(secondOwnershipDir, thirdRecord, {
+  const ownershipReleased = await waitForDesktopGatewayOwnershipRelease(
+    secondOwnershipDir,
+    thirdRecord,
+    {
       timeoutMs: 15_000,
       pollIntervalMs: 100,
-    }),
-    true,
+    },
   )
+  assert.equal(ownershipReleased, true)
+  if (successShutdown.error) {
+    const fallbackAccepted = canAcceptWindowsElectronShutdownFallback({
+      shutdown: successShutdown,
+      ...successShutdown.shutdownEvidence,
+    }) && ownershipReleased && !processAlive(thirdRecord.pid)
+    if (!fallbackAccepted) throw successShutdown.error
+    console.warn(JSON.stringify({
+      event: 'desktop_e2e_windows_shell_wrapper_reaped_after_commit',
+      phase: 'successful-electron-shutdown',
+      pid: thirdRecord.pid,
+    }))
+  }
 
   console.log(JSON.stringify({
     ok: true,
@@ -515,8 +556,16 @@ try {
   }))
   flowSucceeded = true
 } finally {
-  if (secondApp) await secondApp.close().catch(() => null)
-  if (firstApp) await firstApp.close().catch(() => null)
+  if (secondApp) {
+    const app = secondApp
+    secondApp = null
+    await closeDesktopForPhase(app, userDataDir, 'finally-second-electron-shutdown')
+  }
+  if (firstApp) {
+    const app = firstApp
+    firstApp = null
+    await closeDesktopForPhase(app, userDataDir, 'finally-first-electron-shutdown')
+  }
   for (const { ownershipDir, record } of ownedInstances.reverse()) {
     if (processAlive(record.pid) && await verifyDesktopGatewayOwnership(record).catch(() => false)) {
       await requestVerifiedDesktopGatewayShutdown(record).catch(() => false)

@@ -10,13 +10,25 @@ import stat
 import subprocess
 import sys
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Awaitable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from opensquilla.agents.scope import resolve_agent_workspace_dir
-from opensquilla.application.sandbox_runtime import SandboxRuntime
+from opensquilla.application.sandbox_runtime import (
+    SandboxCapabilityUnavailableError,
+    SandboxPolicyConflictError,
+    SandboxRuntime,
+    SandboxRuntimeDiscardError,
+    SandboxRuntimeIdentityError,
+    SandboxRuntimeOperationConflictError,
+    SandboxUnavailableError,
+)
+from opensquilla.gateway.adapters.sandbox_runtime_contract import (
+    register_sandbox_runtime_contract,
+)
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.project_workspace_runtime import (
     authoritative_project_run_context,
     map_project_workspace_error,
@@ -42,24 +54,17 @@ from opensquilla.run_mode import (
 )
 from opensquilla.sandbox.domain_validation import validate_domain_pattern
 from opensquilla.sandbox.escalation import remember_resolved_run_context
-from opensquilla.sandbox.file_policy import builtin_deny_write_paths
 from opensquilla.sandbox.package_bundles import expand_package_bundle
 from opensquilla.sandbox.path_validation import (
     decide_path_access,
     normalize_mount_access,
     normalize_path,
 )
-from opensquilla.sandbox.policy_store import (
-    PolicyVersionConflict,
-    SandboxPolicyStore,
-)
 from opensquilla.sandbox.run_context import (
     RUN_CONTEXT_ORIGIN_KEY,
-    RUN_MODE_PREFERENCE_KEY,
     RunContext,
     get_run_context,
     normalize_workspace_path,
-    resolve_default_run_mode,
     set_run_mode,
 )
 from opensquilla.sandbox.run_context_service import (
@@ -85,7 +90,6 @@ from opensquilla.sandbox.status import status_payload
 from opensquilla.session.keys import parse_agent_id
 
 _d = get_dispatcher()
-_RUN_MODE_PREFERENCE_CHANGED_EVENT = "sandbox.run_mode.preference.changed"
 _WINDOWS_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
@@ -93,13 +97,6 @@ def _require_params(params: dict | None) -> dict[str, Any]:
     if not isinstance(params, dict):
         raise ValueError("params must be an object")
     return params
-
-
-def _sandbox_policy_store(ctx: RpcContext) -> SandboxPolicyStore:
-    state_dir = getattr(ctx.config, "state_dir", None)
-    if not state_dir:
-        raise RpcUnavailableError("Sandbox policy storage is unavailable.")
-    return SandboxPolicyStore(Path(str(state_dir)) / "sessions.db")
 
 
 def _sandbox_token_store(ctx: RpcContext) -> TokenStore:
@@ -414,13 +411,6 @@ def _run_mode_preference_registry() -> Any:
     return get_registry()
 
 
-def _runtime_preference_storage(ctx: RpcContext) -> Any:
-    storage = get_session_storage(getattr(ctx, "session_manager", None))
-    if storage is None:
-        raise RpcUnavailableError("Session storage is not configured")
-    return storage
-
-
 def _context_for_principal(context: RunContext, principal: Any) -> RunContext:
     if run_mode_allowed_for_principal(context.run_mode, principal):
         return context
@@ -692,178 +682,149 @@ def _explain_messages(status: dict[str, Any]) -> list[dict[str, str]]:
 
 def _sandbox_application(ctx: RpcContext) -> SandboxRuntime:
     """Compose the transport-neutral SandboxRuntime Module for this request."""
-    from opensquilla.gateway.adapters.sandbox_runtime import RpcContextSandboxRuntimePort
+    from opensquilla.gateway.adapters.sandbox_runtime import (
+        GatewaySandboxPolicyAdapter,
+        GatewaySandboxResumeAdapter,
+        GatewaySandboxRunModeAdapter,
+        GatewaySandboxRunModeEventsAdapter,
+        GatewaySandboxRuntimePackAdapter,
+        GatewaySandboxSetupAdapter,
+    )
 
-    async def status(c: RpcContext) -> Mapping[str, Any]:
-        return status_payload(c.config)
+    async def publish(event: str, payload: dict[str, str]) -> None:
+        await _run_mode_preference_registry().broadcast(event, payload)
 
-    async def setup_status(c: RpcContext) -> Mapping[str, Any]:
-        return (await current_sandbox_setup_runtime_status(c.config)).to_payload()
+    return SandboxRuntime(
+        setup=GatewaySandboxSetupAdapter(
+            ctx.config,
+            status_reader=current_sandbox_setup_runtime_status,
+            setup_runner=ensure_sandbox_setup_auto,
+            capability_reader=current_sandbox_capability_report,
+        ),
+        policy=GatewaySandboxPolicyAdapter(getattr(ctx.config, "state_dir", None)),
+        run_modes=GatewaySandboxRunModeAdapter(
+            session_manager=getattr(ctx, "session_manager", None),
+            config=ctx.config,
+            principal=ctx.principal,
+        ),
+        run_mode_events=GatewaySandboxRunModeEventsAdapter(publish),
+        runtime_packs=GatewaySandboxRuntimePackAdapter(_runtime_state_dir(ctx)),
+        resume=GatewaySandboxResumeAdapter(),
+    )
 
-    async def ensure_setup(c: RpcContext) -> Mapping[str, Any]:
-        return (await ensure_sandbox_setup_auto(c.config)).to_payload()
 
-    async def capability(c: RpcContext, refresh: bool) -> Mapping[str, Any]:
-        report = await current_sandbox_capability_report(c.config, force_refresh=refresh)
-        return report.to_payload()
+async def _sandbox_payload(
+    operation: Awaitable[Any],
+    *,
+    structured_unavailable: bool = False,
+) -> dict[str, Any]:
+    from opensquilla.gateway.adapters.sandbox_runtime import (
+        sandbox_application_payload,
+        sandbox_capability_payload,
+        sandbox_policy_payload,
+    )
 
-    async def policy(c: RpcContext) -> Mapping[str, Any]:
-        return _sandbox_policy_store(c).read().to_public_dict()
-
-    async def policy_defaults(c: RpcContext) -> Mapping[str, Any]:
-        # Legacy defaults remain implemented by the existing handler; this
-        # Port is deliberately narrow and does not hash runtime payloads.
-        return {"builtinDenyWritePaths": [str(path) for path in builtin_deny_write_paths()]}
-
-    async def policy_update(
-        c: RpcContext,
-        base: int,
-        value: Mapping[str, Any],
-    ) -> Mapping[str, Any]:
-        try:
-            return _sandbox_policy_store(c).compare_and_swap(base, dict(value)).to_public_dict()
-        except PolicyVersionConflict as exc:
+    try:
+        result = await operation
+    except SandboxCapabilityUnavailableError as exc:
+        raise RpcHandlerError(
+            "SANDBOX_CAPABILITY_UNAVAILABLE",
+            str(exc),
+            details=sandbox_capability_payload(exc.report),
+        ) from exc
+    except SandboxPolicyConflictError as exc:
+        raise RpcHandlerError(
+            "POLICY_VERSION_CONFLICT",
+            str(exc),
+            details={"currentPolicy": sandbox_policy_payload(exc.current_policy)},
+        ) from exc
+    except (SandboxRuntimeOperationConflictError, SandboxRuntimeIdentityError) as exc:
+        raise RpcHandlerError(
+            "RUNTIME_JOB_CONFLICT",
+            "The Runtime Pack operation changed; refresh its status and try again.",
+        ) from exc
+    except SandboxRuntimeDiscardError as exc:
+        raise RpcHandlerError(
+            "RUNTIME_DISCARD_FAILED",
+            str(exc),
+        ) from exc
+    except SandboxUnavailableError as exc:
+        if structured_unavailable:
             raise RpcHandlerError(
-                "POLICY_VERSION_CONFLICT",
-                "The sandbox policy changed in another client.",
-                details={"currentPolicy": exc.current_policy.to_public_dict()},
+                "UNAVAILABLE",
+                str(exc),
+                retryable=exc.retryable,
             ) from exc
-
-    async def run_mode(c: RpcContext) -> Mapping[str, Any]:
-        mode, source = await resolve_default_run_mode(c.session_manager, c.config)
-        mode = coerce_run_mode_for_principal(mode, c.principal)
-        return {"runMode": mode.value, "source": source}
-
-    async def run_mode_write(c: RpcContext, mode: str) -> Mapping[str, Any]:
-        await _require_sandbox_setup_ready_for_mode(c, mode)
-        storage = _runtime_preference_storage(c)
-        confirmed = await storage.set_runtime_preference(RUN_MODE_PREFERENCE_KEY, mode)
-        payload = {"runMode": confirmed, "source": "preference"}
-        await _run_mode_preference_registry().broadcast(_RUN_MODE_PREFERENCE_CHANGED_EVENT, payload)
-        return payload
-
-    async def runtime_status(c: RpcContext) -> Mapping[str, Any]:
-        return await _runtime_status_payload(c)
-
-    return SandboxRuntime(RpcContextSandboxRuntimePort(
-        ctx,
-        status=status,
-        setup_status=setup_status,
-        ensure_setup=ensure_setup,
-        capability=capability,
-        policy=policy,
-        policy_defaults=policy_defaults,
-        policy_update=policy_update,
-        run_mode=run_mode,
-        run_mode_write=run_mode_write,
-        runtime_status=runtime_status,
-    ))
+        raise RpcUnavailableError(str(exc)) from exc
+    return sandbox_application_payload(result)
 
 
 @_d.method("sandbox.status", scope="operator.read")
 async def _handle_sandbox_status(params: dict | None, ctx: RpcContext) -> dict:
-    return await _sandbox_application(ctx).status()
+    return status_payload(ctx.config)
 
 
-@_d.method("sandbox.setup.status", scope="operator.read")
 async def _handle_sandbox_setup_status(params: dict | None, ctx: RpcContext) -> dict:
-    return await _sandbox_application(ctx).setup_status()
+    return await _sandbox_payload(_sandbox_application(ctx).inspect_setup())
 
 
-@_d.method("sandbox.capability.status", scope="operator.read")
+_handle_sandbox_setup_status_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.setup.status",
+    _handle_sandbox_setup_status,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
 async def _handle_sandbox_capability_status(params: dict | None, ctx: RpcContext) -> dict:
     if params is not None and not isinstance(params, dict):
         raise ValueError("params must be an object")
     refresh = (params or {}).get("refresh", False)
     if not isinstance(refresh, bool):
         raise ValueError("params.refresh must be a boolean")
-    return await _sandbox_application(ctx).capability(refresh=refresh)
+    return await _sandbox_payload(
+        _sandbox_application(ctx).inspect_capability(refresh=refresh)
+    )
 
 
-@_d.method("sandbox.policy.get", scope="operator.read")
+_handle_sandbox_capability_status_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.capability.status",
+    _handle_sandbox_capability_status,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
 async def _handle_sandbox_policy_get(params: dict | None, ctx: RpcContext) -> dict:
     if params is not None and not isinstance(params, dict):
         raise ValueError("params must be an object")
-    return await _sandbox_application(ctx).policy()
+    return await _sandbox_payload(_sandbox_application(ctx).read_policy())
 
 
-@_d.method("sandbox.policy.defaults", scope="operator.read")
+_handle_sandbox_policy_get_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.policy.get",
+    _handle_sandbox_policy_get,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
 async def _handle_sandbox_policy_defaults(params: dict | None, ctx: RpcContext) -> dict:
     if params is not None and not isinstance(params, dict):
         raise ValueError("params must be an object")
-    from opensquilla.runtime_packs import load_default_catalog
-    from opensquilla.sandbox.runtime_launcher import bundled_runtime_resolver
-    from opensquilla.sandbox.runtime_manifest import (
-        BundledRuntimeResolver,
-        RuntimeManifest,
-        RuntimeManifestError,
-        runtime_target,
-    )
+    return await _sandbox_payload(_sandbox_application(ctx).read_policy_defaults())
 
-    runtime_versions: dict[str, dict[str, object]] = {}
-    detected_runtime_target: str | None = None
 
-    # This legacy projection must stay cheap: new clients load installation and
-    # integrity state independently through sandbox.runtime.status. In
-    # particular, policy.defaults must never hash installed Runtime Pack
-    # payloads while the rest of the Settings page is waiting for its response.
-    try:
-        detected_runtime_target = runtime_target()
-        catalog = load_default_catalog(require_complete=True)
-        for key in ("python", "node", "gitBash"):
-            descriptor = catalog.descriptor(detected_runtime_target, key)
-            if descriptor is None:
-                continue
-            runtime_versions[key] = {
-                "version": descriptor.version,
-                "available": False,
-            }
-    except (OSError, RuntimeManifestError, ValueError):
-        runtime_versions = {}
-
-    resolver = None
-    if not runtime_versions:
-        try:
-            resolver = bundled_runtime_resolver()
-            if resolver is None:
-                # Source checkouts intentionally omit developer/. The checked-in
-                # layout remains authoritative for legacy version display.
-                candidate = (
-                    Path(__file__).resolve().parents[3]
-                    / "desktop"
-                    / "electron"
-                    / "runtime"
-                    / "runtime-manifest.json"
-                )
-                if candidate.is_file():
-                    resolver = BundledRuntimeResolver(
-                        RuntimeManifest.from_path(candidate),
-                        resource_root=candidate.parent / "developer",
-                    )
-            if resolver is not None:
-                detected_runtime_target = resolver.target
-                assets = resolver.manifest.assets.get(resolver.target, {})
-                executable_paths = resolver.executable_paths()
-                for key, asset in assets.items():
-                    executable_names = tuple(asset.executables)
-                    runtime_versions[key] = {
-                        "version": asset.version,
-                        "available": bool(executable_names)
-                        and all(
-                            executable_paths.get(name, Path()).is_file()
-                            for name in executable_names
-                        ),
-                    }
-        except (OSError, RuntimeManifestError, ValueError):
-            resolver = None
-            detected_runtime_target = None
-            runtime_versions = {}
-
-    return {
-        "builtinDenyWritePaths": [str(path) for path in builtin_deny_write_paths()],
-        "runtimeTarget": detected_runtime_target,
-        "runtimeVersions": runtime_versions,
-    }
+_handle_sandbox_policy_defaults_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.policy.defaults",
+    _handle_sandbox_policy_defaults,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 def _runtime_component_param(params: dict | None) -> str:
@@ -879,38 +840,39 @@ def _runtime_state_dir(ctx: RpcContext) -> str | Path | None:
     return value if value and str(value).strip() else None
 
 
-async def _runtime_status_payload(ctx: RpcContext) -> dict[str, object]:
-    from opensquilla.runtime_packs import status_snapshot
-
-    status = await asyncio.to_thread(status_snapshot, _runtime_state_dir(ctx))
-    return status.to_public_dict()
-
-
-@_d.method("sandbox.runtime.status", scope="operator.read")
 async def _handle_sandbox_runtime_status(params: dict | None, ctx: RpcContext) -> dict:
     if params is not None and not isinstance(params, dict):
         raise ValueError("params must be an object")
-    return await _sandbox_application(ctx).runtime_status()
+    return await _sandbox_payload(_sandbox_application(ctx).inspect_runtime_packs())
 
 
-@_d.method("sandbox.runtime.install", scope="operator.admin")
+_handle_sandbox_runtime_status_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.runtime.status",
+    _handle_sandbox_runtime_status,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
 async def _handle_sandbox_runtime_install(params: dict | None, ctx: RpcContext) -> dict:
-    from opensquilla.runtime_packs import start_install
-
     _require_owner(ctx, "sandbox.runtime.install")
     component_id = _runtime_component_param(params)
-    operation = await asyncio.to_thread(
-        start_install,
-        component_id,
-        _runtime_state_dir(ctx),
+    return await _sandbox_payload(
+        _sandbox_application(ctx).install_runtime_pack(component_id)
     )
-    return {"operation": operation.to_public_dict()}
 
 
-@_d.method("sandbox.runtime.cancel", scope="operator.admin")
+_handle_sandbox_runtime_install_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.runtime.install",
+    _handle_sandbox_runtime_install,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
 async def _handle_sandbox_runtime_cancel(params: dict | None, ctx: RpcContext) -> dict:
-    from opensquilla.runtime_packs import RuntimePackError, cancel_install
-
     _require_owner(ctx, "sandbox.runtime.cancel")
     component_id = _runtime_component_param(params)
     operation_id = _require_string_param(
@@ -918,70 +880,63 @@ async def _handle_sandbox_runtime_cancel(params: dict | None, ctx: RpcContext) -
         "operationId",
         "params.operationId is required",
     ).strip()
-    try:
-        operation = await asyncio.to_thread(
-            cancel_install,
+    return await _sandbox_payload(
+        _sandbox_application(ctx).cancel_runtime_pack_install(
             component_id,
             operation_id,
-            _runtime_state_dir(ctx),
         )
-    except RuntimePackError as exc:
-        raise RpcHandlerError(
-            "RUNTIME_JOB_CONFLICT",
-            "The Runtime Pack operation changed; refresh its status and try again.",
-        ) from exc
-    return {"operation": operation.to_public_dict()}
+    )
 
 
-@_d.method("sandbox.runtime.remove", scope="operator.admin")
+_handle_sandbox_runtime_cancel_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.runtime.cancel",
+    _handle_sandbox_runtime_cancel,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
 async def _handle_sandbox_runtime_remove(params: dict | None, ctx: RpcContext) -> dict:
-    from opensquilla.runtime_packs import remove_component
-
     _require_owner(ctx, "sandbox.runtime.remove")
     component_id = _runtime_component_param(params)
-    operation = await asyncio.to_thread(
-        remove_component,
-        component_id,
-        _runtime_state_dir(ctx),
+    return await _sandbox_payload(
+        _sandbox_application(ctx).remove_runtime_pack(component_id)
     )
-    return {"operation": operation.to_public_dict()}
 
 
-@_d.method("sandbox.runtime.discard_download", scope="operator.admin")
+_handle_sandbox_runtime_remove_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.runtime.remove",
+    _handle_sandbox_runtime_remove,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
 async def _handle_sandbox_runtime_discard_download(
     params: dict | None,
     ctx: RpcContext,
 ) -> dict:
-    from opensquilla.runtime_packs import (
-        RuntimePackDiscardError,
-        RuntimePackError,
-        RuntimePackUnavailableError,
-        discard_download,
-    )
-
     _require_owner(ctx, "sandbox.runtime.discard_download")
     component_id = _runtime_component_param(params)
-    try:
-        status = await asyncio.to_thread(
-            discard_download,
-            component_id,
-            _runtime_state_dir(ctx),
-        )
-    except (RuntimePackDiscardError, RuntimePackUnavailableError) as exc:
-        raise RpcHandlerError(
-            "RUNTIME_DISCARD_FAILED",
-            "Runtime Pack downloaded data could not be removed. Retry after closing running tools.",
-        ) from exc
-    except RuntimePackError as exc:
-        raise RpcHandlerError(
-            "RUNTIME_JOB_CONFLICT",
-            "The Runtime Pack operation changed; refresh its status and try again.",
-        ) from exc
-    return {"status": status.to_public_dict()}
+    return await _sandbox_payload(
+        _sandbox_application(ctx).discard_runtime_pack_download(component_id)
+    )
 
 
-@_d.method("sandbox.policy.update", scope="operator.write")
+_handle_sandbox_runtime_discard_download_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.runtime.discard_download",
+    _handle_sandbox_runtime_discard_download,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
 async def _handle_sandbox_policy_update(params: dict | None, ctx: RpcContext) -> dict:
+    from opensquilla.gateway.adapters.sandbox_runtime import sandbox_policy_from_payload
+
     _require_owner(ctx, "sandbox.policy.update")
     values = _require_params(params)
     base_version = values.get("basePolicyVersion")
@@ -990,7 +945,21 @@ async def _handle_sandbox_policy_update(params: dict | None, ctx: RpcContext) ->
     policy = values.get("policy")
     if not isinstance(policy, dict):
         raise ValueError("params.policy must be an object")
-    return await _sandbox_application(ctx).update_policy(base_version, policy)
+    return await _sandbox_payload(
+        _sandbox_application(ctx).replace_policy(
+            base_version,
+            sandbox_policy_from_payload(policy),
+        )
+    )
+
+
+_handle_sandbox_policy_update_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.policy.update",
+    _handle_sandbox_policy_update,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 @_d.method("sandbox.tokens.list", scope="operator.read")
@@ -1044,10 +1013,18 @@ async def _handle_sandbox_token_revoke(params: dict | None, ctx: RpcContext) -> 
     }
 
 
-@_d.method("sandbox.setup.ensure", scope="operator.write")
 async def _handle_sandbox_setup_ensure(params: dict | None, ctx: RpcContext) -> dict:
     _require_owner(ctx, "sandbox.setup.ensure")
-    return await _sandbox_application(ctx).ensure_setup()
+    return await _sandbox_payload(_sandbox_application(ctx).prepare())
+
+
+_handle_sandbox_setup_ensure_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.setup.ensure",
+    _handle_sandbox_setup_ensure,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 @_d.method("sandbox.explain", scope="operator.read")
@@ -1086,7 +1063,6 @@ async def _session_autonomous_paused(session_key: str) -> bool:
     return await runtime.ledger.is_paused(session_key)
 
 
-@_d.method("sandbox.resume", scope="operator.write")
 async def _handle_sandbox_resume(params: dict | None, ctx: RpcContext) -> dict:
     """Clear a denial-ledger autonomous pause so a stuck run can continue.
 
@@ -1097,13 +1073,19 @@ async def _handle_sandbox_resume(params: dict | None, ctx: RpcContext) -> dict:
     _require_owner(ctx, "sandbox.resume")
     params = _require_params(params)
     session_key = _require_session_key(params)
-    from opensquilla.sandbox.integration import get_runtime
+    return await _sandbox_payload(
+        _sandbox_application(ctx).resume_paused_session(session_key),
+        structured_unavailable=True,
+    )
 
-    runtime = get_runtime()
-    if runtime is None:
-        raise RpcHandlerError("UNAVAILABLE", "Sandbox runtime is not configured.", retryable=True)
-    resumed = await runtime.ledger.clear_pause(session_key)
-    return {"sessionKey": session_key, "resumed": resumed, "autonomousPaused": False}
+
+_handle_sandbox_resume_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.resume",
+    _handle_sandbox_resume,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 async def _require_sandbox_setup_ready_for_mode(ctx: RpcContext, run_mode: Any) -> None:
@@ -1119,17 +1101,24 @@ async def _require_sandbox_setup_ready_for_mode(ctx: RpcContext, run_mode: Any) 
         )
 
 
-@_d.method("sandbox.run_mode.preference.get", scope="operator.read")
 async def _handle_run_mode_preference_get(
     params: dict | None,
     ctx: RpcContext,
 ) -> dict[str, str]:
     if params is not None and not isinstance(params, dict):
         raise ValueError("params must be an object")
-    return await _sandbox_application(ctx).run_mode()
+    return await _sandbox_payload(_sandbox_application(ctx).read_run_mode())
 
 
-@_d.method("sandbox.run_mode.preference.set", scope="operator.write")
+_handle_run_mode_preference_get_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.run_mode.preference.get",
+    _handle_run_mode_preference_get,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
 async def _handle_run_mode_preference_set(
     params: dict | None,
     ctx: RpcContext,
@@ -1137,7 +1126,18 @@ async def _handle_run_mode_preference_set(
     _require_owner(ctx, "sandbox.run_mode.preference.set")
     params = _require_params(params)
     mode = normalize_run_mode(params.get("runMode"))
-    return await _sandbox_application(ctx).set_run_mode(mode.value)
+    return await _sandbox_payload(
+        _sandbox_application(ctx).select_run_mode(mode.value)
+    )
+
+
+_handle_run_mode_preference_set_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.run_mode.preference.set",
+    _handle_run_mode_preference_set,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 @_d.method("sandbox.run_context.get", scope="operator.read")

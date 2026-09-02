@@ -145,8 +145,12 @@ import ErrorState from '@/components/ErrorState.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import HistoryLoadSentinel from '@/components/HistoryLoadSentinel.vue'
 import RunTrace from '@/components/run/RunTrace.vue'
-import { useSessionInspect } from '@/composables/sessions/useSessionInspect'
-import { SESSION_CONVERSATION_KEY } from '@/modules/sessionConversation'
+import {
+  abortInspectedSession,
+  useSessionInspect,
+} from '@/composables/sessions/useSessionInspect'
+import { SESSION_INSPECTION_KEY } from '@/modules/sessionInspection'
+import { TURN_COMMANDS_KEY } from '@/modules/turnCommands'
 import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
 import { useRunTrace } from '@/composables/run/useRunTrace'
 import { useToasts } from '@/composables/useToasts'
@@ -157,7 +161,7 @@ import {
   restoreMessageAnchor,
   stabilizeMessageAnchor,
 } from '@/utils/chat/scrollAnchor'
-import { nodeStepsFromHistoryMessage } from '@/components/run/runTrace'
+import { nodeStepsFromSessionReadMessage } from '@/components/run/runTrace'
 import type { NodeStep, RunTraceStatus, RunTraceSummary } from '@/types/runTrace'
 import type { SessionItem } from '@/composables/useSessions'
 import { sessionRelTime, sessionStatusBadge, sessionSurfaceIcon } from './sessionDisplay'
@@ -184,8 +188,12 @@ const emit = defineEmits<{
   aborted: [item: SessionItem]
 }>()
 
-const sessionConversation = inject(SESSION_CONVERSATION_KEY)
-if (!sessionConversation) throw new Error('SessionConversation was not provided')
+const injectedSessionInspection = inject(SESSION_INSPECTION_KEY)
+if (!injectedSessionInspection) throw new Error('SessionInspection was not provided')
+const sessionInspection = injectedSessionInspection
+const injectedTurnCommands = inject(TURN_COMMANDS_KEY)
+if (!injectedTurnCommands) throw new Error('TurnCommands was not provided')
+const turnCommands = injectedTurnCommands
 
 const {
   preview,
@@ -201,9 +209,8 @@ const {
   load,
   loadEarlier,
   retryHistory,
-  abortSession,
   reset,
-} = useSessionInspect(sessionConversation)
+} = useSessionInspect(sessionInspection)
 
 const { t } = useI18n()
 const { renderMarkdown, stripDirectiveTags, stripTimePrefix } = useChatTextRendering()
@@ -262,10 +269,10 @@ const transcriptRows = computed((): TranscriptRow[] => {
     const role = String(msg.role || 'assistant')
     const text = role === 'user' ? stripTimePrefix(msg.text || '') : msg.text || ''
     const html = text.trim() ? renderMarkdown(text) : ''
-    const steps = nodeStepsFromHistoryMessage(msg)
+    const steps = nodeStepsFromSessionReadMessage(msg)
     if (!html && steps.length === 0) return
     rows.push({
-      id: String(msg.message_id || msg.id || `${index}:${msg.timestamp ?? msg.ts ?? ''}`),
+      id: String(msg.messageId || msg.id || `${index}:${msg.createdAt ?? ''}`),
       tone: roleTone(role),
       roleLabel: roleLabel(role),
       html,
@@ -380,7 +387,7 @@ async function onAbort() {
   if (!ok) return
   aborting.value = true
   try {
-    const aborted = await abortSession(item.key)
+    const aborted = await abortInspectedSession(turnCommands, item.key)
     pushToast(aborted ? t('sessions.inspect.abortDone') : t('sessions.inspect.abortNone'))
     emit('aborted', item)
   } catch {

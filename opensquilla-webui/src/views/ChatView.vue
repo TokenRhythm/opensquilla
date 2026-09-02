@@ -807,7 +807,10 @@ import { SESSION_LIFECYCLE_KEY } from '@/modules/sessionLifecycle'
 import { PENDING_INPUT_QUEUE_KEY } from '@/modules/pendingInputQueue'
 import { APP_SETTINGS_KEY } from '@/modules/appSettings'
 import { PROVIDER_CONFIGURATION_KEY } from '@/modules/providerConfiguration'
-import { SANDBOX_RUNTIME_KEY } from '@/modules/sandboxRuntime'
+import {
+  SANDBOX_RUNTIME_KEY,
+  type SandboxChatRuntime,
+} from '@/modules/sandboxRuntime'
 import { SETUP_WORKFLOW_KEY } from '@/modules/setupWorkflow'
 import { ARTIFACT_WORKBENCH_KEY } from '@/modules/artifactWorkbench'
 import { useSetupStatus } from '@/composables/setup/useSetupStatus'
@@ -944,11 +947,16 @@ import {
 import { useChatSessionRuntime } from '@/composables/chat/useChatSessionRuntime'
 import {
   useChatSessionSubscription,
-  type SessionSubscriptionOutcome,
 } from '@/composables/chat/useChatSessionSubscription'
 import {
   createConversationSessionRuntime,
 } from '@/modules/conversationSessionRuntime'
+import {
+  SESSION_READ_LIFECYCLE_FACTORY_KEY,
+  type SessionReadMetadata,
+  type SessionReadPortLease,
+  type SessionReadSnapshot,
+} from '@/modules/sessionReadLifecycle'
 import {
   CONVERSATION_EVENTS_KEY,
   conversationEventSessionKey,
@@ -1009,10 +1017,6 @@ import {
   type SteerUnavailableReason,
 } from '@/utils/chat/steerAvailability'
 import type { ArtifactPayload } from '@/types/artifacts'
-import type {
-  SessionMessagesSnapshotResponse,
-  SessionMessagesSubscribeResponse,
-} from '@/modules/sessionConversation'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import {
   isRecognizedSandboxRunMode,
@@ -1209,9 +1213,12 @@ if (!injectedSessionConversation) throw new Error('SessionConversation was not p
 const sessionConversation: SessionConversation = injectedSessionConversation
 const conversationEvents = inject(CONVERSATION_EVENTS_KEY)
 if (!conversationEvents) throw new Error('ConversationEvents was not provided')
+const sessionReadLifecycleFactory = inject(SESSION_READ_LIFECYCLE_FACTORY_KEY)
+if (!sessionReadLifecycleFactory) throw new Error('SessionReadLifecycleFactory was not provided')
 const injectedProviderConfiguration = inject(PROVIDER_CONFIGURATION_KEY)
 const injectedSandboxRuntime = inject(SANDBOX_RUNTIME_KEY)
 if (!injectedSandboxRuntime) throw new Error('SandboxRuntime was not provided')
+const sandboxRuntime: SandboxChatRuntime = injectedSandboxRuntime
 const injectedAudioTranscription = inject(AUDIO_TRANSCRIPTION_KEY)
 if (!injectedAudioTranscription) throw new Error('AudioTranscription was not provided')
 if (!injectedProviderConfiguration) throw new Error('ProviderConfiguration was not provided')
@@ -1600,7 +1607,7 @@ const {
   setGlobalRunMode,
   applyRunModePreferenceChanged,
 } = useChatRunModePreference({
-  sandbox: injectedSandboxRuntime,
+  sandbox: sandboxRuntime,
   runModePolicy: () => gatewayAccess.runModePolicy,
 })
 async function refreshRunModePreference() {
@@ -1619,7 +1626,7 @@ const requestedRunMode = computed<SandboxRunMode>(
 )
 
 const sandboxSetupRecovery = useSandboxSetupRecovery({
-  sandbox: injectedSandboxRuntime,
+  sandbox: sandboxRuntime,
   connectionState: gatewayConnectionState,
   runMode: requestedRunMode,
   autoRefresh: false,
@@ -1668,12 +1675,16 @@ const lastStreamSeq = ref(0)
 // and subscription leases stay behind the transport-neutral runtime seam.
 const conversationSessionRuntime = createConversationSessionRuntime<
   ConversationEvent,
-  SessionSubscriptionOutcome
+  SessionReadPortLease
 >({
   source: conversationEvents,
   events: { sessionKey: conversationEventSessionKey },
 })
 const conversationRuntime = conversationSessionRuntime.cursor
+const sessionReadLifecycle = sessionReadLifecycleFactory.create({
+  cursor: conversationRuntime,
+  subscriptions: conversationSessionRuntime.subscriptions,
+})
 const activeTaskGroups = ref<Set<string>>(new Set())
 // Task id whose output the live stream renders; binds late events to the
 // current turn so a prior task can't leak into it (issue 344).
@@ -1688,7 +1699,26 @@ const isStopPending = computed(() => (
   || acceptanceRecoveryPending.value
 ))
 let bindActiveStreamTask = (taskId: string) => { activeStreamTaskId.value = taskId }
-let restoreLiveTurnSnapshot = (_snapshot: SessionMessagesSnapshotResponse) => {}
+let restoreLiveTurnSnapshot = (_snapshot: SessionReadSnapshot) => {}
+
+function projectWorkspaceFromSessionRead(
+  value: SessionReadMetadata['projectWorkspace'],
+): ActiveProjectWorkspaceSnapshot | null {
+  if (!value) return null
+  const id = typeof value.id === 'string' ? value.id : ''
+  if (!id) return null
+  const availabilityReason = typeof value.availabilityReason === 'string'
+    ? value.availabilityReason
+    : undefined
+  return {
+    id,
+    name: typeof value.name === 'string' ? value.name : '',
+    path: typeof value.path === 'string' ? value.path : '',
+    available: value.available === true,
+    removed: value.removed === true,
+    ...(availabilityReason ? { availabilityReason } : {}),
+  }
+}
 
 // Pending session intent
 const pendingSessionIntent = ref<string | null>(null)
@@ -2317,8 +2347,7 @@ const preserveHistoryLiveTail = computed(() =>
 )
 
 const chatHistory = useChatHistory({
-  sessionConversation,
-  concurrentHistoryReads: () => gatewayAccess.concurrentHistoryReads,
+  sessionReadLeaseReader: sessionReadLifecycle,
   sessionKey,
   messages,
   threadRef,
@@ -2362,6 +2391,7 @@ const {
   scheduleHistorySync,
   cancelAnchorStabilization,
   cancelActiveHistory,
+  markSessionMissing,
   cleanup: cleanupHistory,
 } = chatHistory
 
@@ -2550,12 +2580,11 @@ async function handleRegenerateMessage(
   settle?.(accepted)
 }
 
-let applyPendingUserInputSnapshot: typeof chatPlans.applyBootstrap = () => {}
-let applyGoalSnapshot: (snapshot: SessionMessagesSubscribeResponse) => void = () => {}
+let applyPendingUserInputSnapshot: (snapshot: SessionReadMetadata) => void = () => {}
+let applyGoalSnapshot: (snapshot: SessionReadMetadata) => void = () => {}
 const chatSessionSubscription = useChatSessionSubscription({
-  sessionConversation,
-  gatewayAccess,
-  conversationSessionRuntime: conversationSessionRuntime,
+  sessionReadLeaseReader: sessionReadLifecycle,
+  conversationRuntime,
   sessionKey,
   lastStreamSeq,
   runStatus,
@@ -2601,12 +2630,16 @@ const chatSessionSubscription = useChatSessionSubscription({
       : activeProjectWorkspace.beginSessionResolution(key),
   onSessionMetadata: (key, generation, metadata) => {
     if (generation < 0) return
-    activeProjectWorkspace.applySessionSnapshot(key, generation, metadata)
+    activeProjectWorkspace.applySessionSnapshot(key, generation, {
+      workspaceId: metadata.workspaceId ?? undefined,
+      projectWorkspace: projectWorkspaceFromSessionRead(metadata.projectWorkspace),
+    })
   },
   onSessionMetadataError: (key, generation) => {
     if (generation < 0) return
     activeProjectWorkspace.failSessionResolution(key, generation)
   },
+  onSessionMissing: markSessionMissing,
   onSnapshot: snapshot => {
     chatSessionRouting.applyBootstrap(snapshot)
     chatPlans.applyBootstrap(snapshot)
@@ -2617,7 +2650,6 @@ const chatSessionSubscription = useChatSessionSubscription({
 const {
   subscribeSession,
   retrySessionMetadata,
-  unsubscribeSession,
   cancelActiveSubscription,
   streamGeneration,
   observeStreamGeneration,
@@ -2626,6 +2658,7 @@ applySessionRunState = chatSessionSubscription.applySessionRunState
 
 const chatSessionBootstrap = useChatSessionBootstrap({
   sessionKey,
+  sessionReadLifecycle,
   loadHistory: async (context, retry) => (
     retry
       ? await retryHistoryRequest(context)
@@ -2634,7 +2667,6 @@ const chatSessionBootstrap = useChatSessionBootstrap({
   subscribeSession,
   cancelHistory: cancelActiveHistory,
   cancelSubscription: cancelActiveSubscription,
-  unsubscribeSession,
 })
 const {
   livePhase,
@@ -2685,20 +2717,23 @@ function schedulePostBootstrapMetadata(
   key: string,
 ) {
   if (postBootstrapMetadataStarted) return
-  void run.criticalRequestsQueued.then(() => {
-    if (
-      postBootstrapMetadataStarted
-      || chatViewDisposed
-      || sessionKey.value !== key
-      || !isSessionBootstrapCurrent(run.generation, key)
-    ) return
-    postBootstrapMetadataStarted = true
-    void refreshPostBootstrapMetadata()
-    void loadFeatureToggles().then(() => {
-      if (!chatViewDisposed) unsubs.push(bindFeatureRefresh(scheduleHistorySync))
-    })
-    loadSlashCommands()
-  })
+  void run.criticalRequestsQueued.then(
+    () => {
+      if (
+        postBootstrapMetadataStarted
+        || chatViewDisposed
+        || sessionKey.value !== key
+        || !isSessionBootstrapCurrent(run.generation, key)
+      ) return
+      postBootstrapMetadataStarted = true
+      void refreshPostBootstrapMetadata()
+      void loadFeatureToggles().then(() => {
+        if (!chatViewDisposed) unsubs.push(bindFeatureRefresh(scheduleHistorySync))
+      })
+      loadSlashCommands()
+    },
+    () => {},
+  )
 }
 
 function bindSessionBootstrapRun<T extends SessionBootstrapRun>(run: T, key: string): T {
@@ -2707,15 +2742,18 @@ function bindSessionBootstrapRun<T extends SessionBootstrapRun>(run: T, key: str
   // omit it, so queue a bounded fallback only after the critical live/history
   // frames. A session-key watcher must never put routing.get in front of the
   // target subscribe during a same-socket handoff.
-  void tracked.criticalRequestsQueued.then(() => {
-    if (
-      chatViewDisposed
-      || sessionKey.value !== key
-      || !isSessionBootstrapCurrent(tracked.generation, key)
-      || chatSessionRouting.hasAuthoritativeSnapshot.value
-    ) return
-    void chatSessionRouting.load()
-  })
+  void tracked.criticalRequestsQueued.then(
+    () => {
+      if (
+        chatViewDisposed
+        || sessionKey.value !== key
+        || !isSessionBootstrapCurrent(tracked.generation, key)
+        || chatSessionRouting.hasAuthoritativeSnapshot.value
+      ) return
+      void chatSessionRouting.load()
+    },
+    () => {},
+  )
   schedulePostBootstrapMetadata(tracked, key)
   return tracked
 }
@@ -2738,15 +2776,18 @@ function resumeSessionBootstrap(run: SessionBootstrapRun) {
       && isSessionBootstrapCurrent(tracked.generation, key)
     ) void handleAuthoritativeSessionSubscription(key)
   }).catch(() => {})
-  void tracked.criticalRequestsQueued.then(() => {
-    if (
-      chatViewDisposed
-      || sessionKey.value !== key
-      || !isSessionBootstrapCurrent(tracked.generation, key)
-    ) return
-    void loadCurrentSessionUsage()
-    void refreshPostBootstrapMetadata()
-  })
+  void tracked.criticalRequestsQueued.then(
+    () => {
+      if (
+        chatViewDisposed
+        || sessionKey.value !== key
+        || !isSessionBootstrapCurrent(tracked.generation, key)
+      ) return
+      void loadCurrentSessionUsage()
+      void refreshPostBootstrapMetadata()
+    },
+    () => {},
+  )
 }
 
 function retryHistory() {
@@ -2902,6 +2943,7 @@ const chatSessionRuntime = useChatSessionRuntime({
   setSessionHandoffTarget,
   resumeSessionBootstrap,
   startSessionBootstrap,
+  currentSessionBootstrap: chatSessionBootstrap.currentSessionBootstrap,
   loadCurrentSessionUsage,
   applySessionRunState,
   setCompactInFlight,
@@ -3726,7 +3768,9 @@ const {
   dismissClarify,
   applyUserInputBootstrap,
 } = chatApprovals
-applyPendingUserInputSnapshot = applyUserInputBootstrap
+applyPendingUserInputSnapshot = snapshot => applyUserInputBootstrap({
+  pendingUserInputs: [...snapshot.pendingUserInputs],
+})
 
 const dockedPlanQuestionnaire = computed(() => (
   pendingClarify.value?.presentation === 'plan_questionnaire_v1'
@@ -5522,7 +5566,7 @@ async function resumeSandbox() {
   const key = sessionKey.value
   if (!key) return
   try {
-    await injectedSandboxRuntime?.resume(key)
+    await sandboxRuntime.resumeSession(key)
     messages.value.push({
       role: 'system',
       text: t('chat.sandboxResumed'),
@@ -6380,8 +6424,6 @@ async function validateActiveProjectBeforeSend(): Promise<string | null> {
       const recovered = await retrySessionMetadata({
         timeoutMs: Math.max(1, deadlineAt - Date.now()),
         signal: controller.signal,
-        timeoutAction: 'reconnect',
-        abortAction: 'reject',
       })
       if (!recovered) {
         if (!controller.signal.aborted && sessionKey.value === key) {
@@ -6598,9 +6640,9 @@ onMounted(async () => {
   // Load elevated mode
   loadElevatedMode()
 
-  unsubs.push(injectedSandboxRuntime?.subscribeRunModePreferenceChanged(
+  unsubs.push(sandboxRuntime.onPreferenceChanged(
     payload => applyRunModePreferenceChanged(payload),
-  ) ?? (() => undefined))
+  ))
 
   // Register event handlers before sessions.messages.subscribe can replay
   // buffered events, then start the two critical phases before any optional

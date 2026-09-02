@@ -21,18 +21,6 @@ export interface SessionBootstrapPhaseContext {
   attemptDeadlineAt: number
   signal: AbortSignal
   skipSnapshot: boolean
-  /**
-   * Marks that this attempt's subscribe frame was synchronously sent. History
-   * may then enter the serialized Gateway queue behind it.
-   */
-  markLiveSubscribeSent?: (socketGeneration: number) => void
-  /** Marks that the canonical history frame was synchronously sent. */
-  markHistoryRequestSent?: (socketGeneration: number) => void
-  /**
-   * Optional metadata may start once the critical frames are on the wire. It
-   * must not wait for a potentially slow history response.
-   */
-  waitForCriticalRequestsQueued?: () => Promise<void>
 }
 
 export interface SessionPhaseResult<T = void> {
@@ -46,13 +34,6 @@ export function rpcErrorCode(error: unknown): string {
   if (!error || typeof error !== 'object') return ''
   const code = (error as RpcClientError).code
   return typeof code === 'string' ? code : ''
-}
-
-export function historyCursorRequiresLatestReload(error: unknown): boolean {
-  return [
-    'HISTORY_CURSOR_INVALID',
-    'HISTORY_CURSOR_INVALIDATED',
-  ].includes(rpcErrorCode(error))
 }
 
 export function isRpcAbort(error: unknown): boolean {
