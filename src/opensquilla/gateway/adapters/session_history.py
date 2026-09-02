@@ -56,12 +56,14 @@ def parse_history_cursor(value: object) -> HistoryCursor | None:
             "history cursor must use the created_at|id integer format"
         )
     created_at, stable_id = raw.split("|", 1)
-    try:
-        cursor = int(created_at), int(stable_id)
-    except ValueError:
+    if not all(
+        component.isascii() and component.isdecimal()
+        for component in (created_at, stable_id)
+    ):
         raise HistoryCursorInvalidError(
             "history cursor must use the created_at|id integer format"
-        ) from None
+        )
+    cursor = int(created_at), int(stable_id)
     if any(value < 0 or value > (1 << 63) - 1 for value in cursor):
         raise HistoryCursorInvalidError("history cursor integers are out of range")
     return cursor

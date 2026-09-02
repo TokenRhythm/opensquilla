@@ -76,14 +76,19 @@ class _FakePagedSessionManager(_FakeSessionManager):
         return self._page
 
 
-def _entry(idx: int, role: str = "user") -> TranscriptEntry:
+def _entry(
+    idx: int,
+    role: str = "user",
+    *,
+    created_at: int | None = None,
+) -> TranscriptEntry:
     return TranscriptEntry(
         id=idx,
         session_id="parent",
         session_key="agent:main:webchat:test",
         role=role,
         content=f"message {idx}",
-        created_at=idx,
+        created_at=idx if created_at is None else created_at,
         message_id=f"msg-{idx}",
     )
 
@@ -1946,6 +1951,20 @@ async def test_chat_history_cursor_failures_map_to_stable_wire_codes() -> None:
             {"after": None},
             _FakeSessionManager([_entry(1)], canonical_entries=[_entry(1)]),
             "HISTORY_CURSOR_INVALID",
+        ),
+        *(
+            (
+                f"invalid-ascii-grammar-{index}",
+                {"before": cursor},
+                _FakeSessionManager(
+                    [_entry(2, created_at=10)],
+                    canonical_entries=[_entry(2, created_at=10)],
+                ),
+                "HISTORY_CURSOR_INVALID",
+            )
+            for index, cursor in enumerate(
+                ("1_0|2", "+10|2", "١٠|٢", "10 |2", "10| 2")
+            )
         ),
         (
             "invalidated",
