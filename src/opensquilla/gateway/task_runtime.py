@@ -116,6 +116,7 @@ TaskActivationListener = Callable[
 ]
 RuntimeIdleListener = Callable[[str], Awaitable[None]]
 AcceptedConfigProvider = Callable[..., Any]
+AcceptanceValidator = Callable[[Any, Any | None], Any]
 _CollectResult = TypeVar("_CollectResult")
 _MISSING_GOAL_ACCEPTANCE = object()
 _USE_ACCEPTED_CONFIG_PROVIDER = object()
@@ -1234,6 +1235,7 @@ class TaskRuntime:
         turn_hard_deadline_s: float | None = None,
         running_heartbeat_interval_s: float | None = 30.0,
         accepted_config_provider: AcceptedConfigProvider | None = None,
+        acceptance_validator: AcceptanceValidator | None = None,
         pending_overflow_policy: PendingOverflowPolicy | str = (
             PendingOverflowPolicy.REJECT_NEWEST
         ),
@@ -1278,6 +1280,7 @@ class TaskRuntime:
         self._turn_hard_deadline_s = turn_hard_deadline_s
         self._running_heartbeat_interval_s = running_heartbeat_interval_s
         self._accepted_config_provider = accepted_config_provider
+        self._acceptance_validator = acceptance_validator
         self._pending_overflow_policy = pending_overflow_policy
         self._activation_listener = activation_listener
         self._idle_listener = idle_listener
@@ -2401,6 +2404,19 @@ class TaskRuntime:
             accepted_config=accepted_config,
         )
 
+    async def validate_acceptance(
+        self,
+        envelope: RouteEnvelope,
+        accepted_run_mode_override: Any | None = None,
+    ) -> None:
+        """Run the shared pre-persistence admission check, when configured."""
+
+        if self._acceptance_validator is None:
+            return
+        result = self._acceptance_validator(envelope, accepted_run_mode_override)
+        if inspect.isawaitable(result):
+            await result
+
     async def _freeze_acceptance(
         self,
         reservation: TaskReservation,
@@ -2409,6 +2425,11 @@ class TaskRuntime:
         accepted_config: Any = _USE_ACCEPTED_CONFIG_PROVIDER,
     ) -> None:
         """Capture once, optionally backfilling callers that already committed."""
+
+        await self.validate_acceptance(
+            reservation.runtime_task.envelope,
+            reservation.runtime_task.accepted_run_mode_override,
+        )
 
         if (
             accepted_config is _USE_ACCEPTED_CONFIG_PROVIDER

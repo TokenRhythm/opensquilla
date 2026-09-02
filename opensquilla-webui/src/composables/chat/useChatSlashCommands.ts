@@ -1,30 +1,18 @@
 import { computed, ref, type Ref } from 'vue'
 import i18n from '@/i18n'
-import type { RpcCallOptions, RpcClientError, RpcConnectionWaitOptions } from '@/lib/rpc'
+import type { RpcClientError } from '@/lib/rpc'
+import type { MetaLaunchDraftPayload, MetaRunCenter } from '@/modules/metaRunCenter'
+import type {
+  SessionConversation,
+  SessionConversationRequestOptions,
+} from '@/modules/sessionConversation'
 import type { HiddenControlDispatchResult } from '@/types/chat'
 import type { MetaSetupReadiness } from '@/types/metaSetup'
-import type { MetaLaunchDraftPayload } from '@/types/rpc'
 import { createClientRequestId } from '@/utils/chat/messageIdentity'
-import {
-  waitForSessionRpcConnection,
-} from '@/composables/chat/sessionBootstrapAdmission'
 import {
   formatGoalDuration,
   type GoalSnapshot,
 } from '@/composables/chat/useChatGoals'
-
-type RpcClient = {
-  waitForConnection: (
-    timeoutMs?: number,
-    signal?: AbortSignal,
-    actions?: RpcConnectionWaitOptions,
-  ) => Promise<void>
-  call: <T = unknown>(
-    method: string,
-    params?: Record<string, unknown>,
-    callOptions?: RpcCallOptions,
-  ) => Promise<T>
-}
 
 export interface ArgumentChoice {
   value: string
@@ -72,14 +60,6 @@ interface SlashCommandPayload extends Record<string, unknown> {
   }
 }
 
-interface UsageStatusResult {
-  totals?: {
-    tokens?: number
-  }
-  totalTokens?: number
-  total_tokens?: number
-}
-
 const SUPPORTED_WEB_SLASH_ACTIONS = new Set([
   '/coding',
   '/compact',
@@ -103,8 +83,10 @@ const SUPPORTED_WEB_SLASH_ACTIONS = new Set([
 ])
 
 export interface UseChatSlashCommandsOptions {
-  rpc: RpcClient
-  catalogCallOptions?: RpcCallOptions
+  sessionConversation: SessionConversation
+  /** Domain seam for MetaSkill launch; wire method names stay in its adapter. */
+  metaRunCenter?: MetaRunCenter
+  catalogCallOptions?: SessionConversationRequestOptions
   inputText: Ref<string>
   sessionKey: Ref<string>
   autoResizeTextarea: () => void
@@ -298,6 +280,7 @@ function localizedMetaDescription(choice: ArgumentChoice): string {
 }
 
 export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
+  const conversation = options.sessionConversation
   const slashOpen = ref(false)
   const slashIdx = ref(0)
   const slashCmds = ref<ChatSlashCommand[]>([])
@@ -356,13 +339,8 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       options.notify(i18n.global.t('chat.metaRuns.couldNotRunSkillError', { error }))
     }
     try {
-      const result = await options.rpc.call<{
-        ok?: boolean
-        error?: string
-        drafted?: boolean
-        setup_required?: boolean
-        readiness?: MetaSetupReadiness
-      }>('meta.run', {
+      if (!options.metaRunCenter) throw new Error('MetaRunCenter is unavailable')
+      const result = await options.metaRunCenter.launch({
         name: skillName,
         sessionKey: originatingSessionKey,
         clientRequestId,
@@ -389,7 +367,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
         }
         return dispatchResult?.status === 'queued' ? 'queued' : 'accepted'
       }
-      if (result?.setup_required) {
+      if (result?.setupRequired) {
         const readiness = result.readiness || {}
         if (options.requestMetaSetup) {
           const disposition = await options.requestMetaSetup(
@@ -480,18 +458,8 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
 
   async function loadSlashCommands() {
     try {
-      await waitForSessionRpcConnection(options.rpc, options.catalogCallOptions)
-      const params = { surface: 'web_chat' }
-      const res = options.catalogCallOptions
-        ? await options.rpc.call<{ commands?: ChatSlashCommand[] }>(
-            'commands.list_for_surface',
-            params,
-            options.catalogCallOptions,
-          )
-        : await options.rpc.call<{ commands?: ChatSlashCommand[] }>(
-            'commands.list_for_surface',
-            params,
-          )
+      await conversation.ready(options.catalogCallOptions)
+      const res = await conversation.listCommands('web_chat', options.catalogCallOptions)
       if (
         !Array.isArray(res?.commands)
         || !res.commands.every(isValidSlashCommandPayload)
@@ -738,7 +706,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       case 'reset_session':
       case 'sessions.reset':
       case '/reset':
-        options.rpc.call('sessions.reset', { key: options.sessionKey.value })
+        conversation.reset(options.sessionKey.value)
           .then(() => {
             options.resetCurrentSession()
           })
@@ -753,10 +721,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
           tone: 'info',
           source: 'manual',
         })
-        options.rpc.call<Record<string, unknown>>('sessions.contextCompact', {
-          key: compactKey,
-          wait: false,
-        })
+        conversation.compact(compactKey, false)
           .then((result) => {
             if (compactKey !== options.sessionKey.value) return
             options.showCompactionToast({ key: compactKey, source: 'manual', ...result })
@@ -775,8 +740,8 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       case 'usage_status':
       case 'usage.status':
       case '/usage':
-        options.rpc.call<UsageStatusResult>('usage.status')
-          .then((result: UsageStatusResult) => {
+        conversation.usage()
+          .then((result) => {
             const totals = result?.totals || {}
             const tokens = Number(result?.totalTokens ?? result?.total_tokens ?? totals.tokens ?? 0)
             console.info(`Usage: ${tokens.toLocaleString()} tokens`)

@@ -17,15 +17,15 @@ describe('chat fork hand-off contract', () => {
     expect(messageListSource).toContain("forkConversation: [throughTurnId?: string]")
     expect(messageListSource).toContain("turnOutcome?.turnId?.trim()")
     expect(messageListSource).toContain("@fork=\"$emit('forkConversation', forkThroughTurnId(entry.index))\"")
-    expect(transitionSource).toContain("method: 'sessions.forkThroughTurn'")
-    expect(transitionSource).toContain("params: { key: parentKey, throughTurnId }")
-    expect(chatViewSource).toContain('rpc.call<ForkRpcResponse>(request.method, request.params)')
-    expect(chatViewSource).toContain('validatedForkChildKey(res, normalizedTurnId)')
-    expect(chatViewSource.indexOf('validatedForkChildKey(res, normalizedTurnId)')).toBeLessThan(
+    expect(chatViewSource).toContain('sessionLifecycle.fork({')
+    expect(chatViewSource).toContain('throughTurnId: normalizedTurnId')
+    expect(chatViewSource).not.toContain('rpc.call<ForkRpcResponse>')
+    expect(chatViewSource).toContain('const childKey = res.key')
+    expect(chatViewSource.indexOf('const childKey = res.key')).toBeLessThan(
       chatViewSource.indexOf('query: { session: childKey }'),
     )
-    expect(transitionSource).toContain("response?.forkMode !== 'through_turn'")
-    expect(transitionSource).toContain('response.throughTurnId !== throughTurnId')
+    expect(transitionSource).not.toContain('ForkRpcResponse')
+    expect(transitionSource).not.toContain('sessions.forkThroughTurn')
     expect(chatViewSource).not.toContain('beforeMessageId: normalizedTurnId')
     expect(chatViewSource).toContain("clearForkTransition(generation)\n      pushToast(t('chat.toast.forkFailed')")
   })

@@ -7,6 +7,7 @@ import type {
   ModelRoutingCapabilitiesByMode,
   ModelRoutingMode,
 } from '@/types/modelRouting'
+import { sessionConversationFromTestRpc } from '@/testing/sessionConversation.test-helper'
 
 type RpcResult = Record<string, unknown> | Error | Promise<unknown>
 
@@ -35,13 +36,13 @@ function createHarness(options: {
   routingGetResults?: RpcResult[]
   patchResults?: RpcResult[]
   readCallOptions?: RpcCallOptions
-  supportsMethod?: (method: string) => boolean
+  hasRpcMethod?: (method: string) => boolean
 } = {}) {
   const configGetResults = [...(options.configGetResults ?? [{}])]
   const routingGetResults = [...(options.routingGetResults ?? [])]
   const patchResults = [...(options.patchResults ?? [])]
   const eventHandlers = new Map<string, (payload: unknown) => void>()
-  const waitForConnection = vi.fn(async () => {})
+  const ready = vi.fn(async () => {})
   const setGlobalElevatedMode = vi.fn()
   const loadCurrentSessionUsage = vi.fn()
   const call = vi.fn(async (method: string, _params?: Record<string, unknown>): Promise<unknown> => {
@@ -51,6 +52,9 @@ function createHarness(options: {
       return await Promise.resolve(result)
     }
     if (method === 'models.routing.get') {
+      if (options.hasRpcMethod?.('models.routing.get') === false) {
+        throw Object.assign(new Error('method not found'), { code: 'METHOD_NOT_FOUND' })
+      }
       const result = routingGetResults.shift()
       if (result === undefined) throw new Error('canonical routing unavailable')
       if (result instanceof Error) throw result
@@ -64,24 +68,50 @@ function createHarness(options: {
     }
     throw new Error(`Unexpected RPC method: ${method}`)
   })
+  const rpcRequest = call as unknown as (
+    method: string,
+    params?: Record<string, unknown>,
+    callOptions?: RpcCallOptions,
+  ) => Promise<unknown>
   const rpc = {
-    waitForConnection,
+    ready,
     call: call as <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>,
     on: vi.fn((event: string, handler: (payload: unknown) => void) => {
       eventHandlers.set(event, handler)
       return () => eventHandlers.delete(event)
     }),
-    supportsMethod: options.supportsMethod,
+    hasRpcMethod: options.hasRpcMethod,
   }
   const api = useChatFeatureToggles({
-    rpc,
+    sessionConversation: sessionConversationFromTestRpc(rpc),
+    appSettings: {
+      readAll: vi.fn(async () => {
+        return await rpcRequest('config.get', undefined, options.readCallOptions) as import('@/modules/appSettings').SettingsObject
+      }),
+      read: vi.fn(async () => null),
+      readEffective: vi.fn(async () => ({ fields: {} })),
+      patch: vi.fn(async () => ({})),
+      patchSafe: vi.fn(async (changes: readonly { path: string; value: unknown }[]) => {
+        const patches = Object.fromEntries(changes.map(change => [change.path, change.value]))
+        await call('config.patch.safe', { patches })
+        return {}
+      }),
+      merge: vi.fn(async () => ({})),
+    },
+    modelRouting: {
+      get: vi.fn(async () => await rpcRequest('models.routing.get', undefined, options.readCallOptions) as import('@/modules/providerConfiguration').ModelRoutingSnapshot),
+      setRouting: vi.fn(async (mode: string) => {
+        await rpcRequest('models.routing.set', { mode })
+        return { mode: mode as import('@/modules/providerConfiguration').RoutingMode }
+      }),
+    },
     readCallOptions: options.readCallOptions,
     setGlobalElevatedMode,
     loadCurrentSessionUsage,
   })
   return {
     api,
-    rpc: { waitForConnection, call, on: rpc.on },
+    rpc: { ready, call, on: rpc.on },
     emit: (event: string, payload: unknown) => eventHandlers.get(event)?.(payload),
     setGlobalElevatedMode,
     loadCurrentSessionUsage,
@@ -116,14 +146,6 @@ describe('useChatFeatureToggles coding mode', () => {
     await api.loadFeatureToggles()
 
     expect(api.codingModeEnabled.value).toBe(true)
-    expect(rpc.waitForConnection).toHaveBeenCalledWith(
-      2_000,
-      undefined,
-      {
-        timeoutAction: 'reject',
-        abortAction: 'reject',
-      },
-    )
     expect(rpc.call).toHaveBeenCalledWith(
       'config.get',
       undefined,
@@ -546,7 +568,7 @@ describe('useChatFeatureToggles model routing mode', () => {
           capabilities_by_mode: CAPABILITIES_BY_MODE,
         },
       ],
-      supportsMethod: method => method !== 'models.routing.get' || supportsRouting,
+      hasRpcMethod: method => method !== 'models.routing.get' || supportsRouting,
     })
 
     await api.loadFeatureToggles()
@@ -724,8 +746,8 @@ describe('useChatFeatureToggles model routing mode', () => {
     const setterEnd = source.indexOf('function bindFeatureRefresh', setterStart)
     const setterSource = source.slice(setterStart, setterEnd)
 
-    expect(setterSource).toContain("options.rpc.call('models.routing.set'")
-    expect(setterSource).not.toContain("options.rpc.call('config.patch.safe'")
+    expect(setterSource).toContain('options.modelRouting.setRouting')
+    expect(source).toContain('options.appSettings.patchSafe')
     expect(setterSource).not.toMatch(/localStorage|sessionStorage/)
   })
 })

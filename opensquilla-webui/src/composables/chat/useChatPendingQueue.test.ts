@@ -5,6 +5,8 @@ import {
   useChatPendingQueue,
   type UseChatPendingQueueOptions,
 } from './useChatPendingQueue'
+import { createLegacyPendingInputQueue } from '@/adapters/gateway/pendingInputQueueV4'
+import type { PendingInputQueuePort } from '@/modules/pendingInputQueue'
 import type { Attachment, ChatPendingItem, HiddenControlDispatchResult } from '@/types/chat'
 import {
   createPendingInputWal,
@@ -12,6 +14,15 @@ import {
   type PendingInputWalRecord,
   type ResponseHandoffWalRecord,
 } from '@/utils/chat/pendingInputWal'
+
+type LegacyQueueRpc = {
+  call: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
+}
+
+type QueueTestOverrides = Partial<UseChatPendingQueueOptions> & {
+  rpc?: LegacyQueueRpc
+  hasRpcMethod?: (method: string) => boolean
+}
 
 function makeQueue(
   dispatchPendingItem?: (item: ChatPendingItem, ownerSessionKey: string) => Promise<
@@ -23,7 +34,7 @@ function makeQueue(
     ownerSessionKey: string,
   ) => Promise<'accepted' | 'deferred' | 'not_sent' | 'retryable_failure'>,
   onHiddenControlDispatchResult?: (result: HiddenControlDispatchResult) => void | boolean,
-  overrides: Partial<UseChatPendingQueueOptions> = {},
+  overrides: QueueTestOverrides = {},
 ) {
   const sessionKey = ref('agent:main:webchat:test')
   const inputText = ref('')
@@ -32,6 +43,21 @@ function makeQueue(
   const isStreaming = ref(false)
   const sendCurrentInput = vi.fn()
   const defaultWal = memoryWal().wal
+  const {
+    rpc,
+    hasRpcMethod,
+    pendingInputQueue,
+    ...safeOverrides
+  } = overrides
+  const compatibilityQueue: PendingInputQueuePort | null = pendingInputQueue
+    ?? (rpc
+      ? createLegacyPendingInputQueue({
+          request: <T = unknown>(method: string, params?: Record<string, unknown>) => (
+            rpc.call<T>(method, params)
+          ),
+          supports: hasRpcMethod,
+        })
+      : null)
   const queue = useChatPendingQueue({
     sessionKey,
     inputText,
@@ -47,8 +73,8 @@ function makeQueue(
     dispatchHiddenControl,
     onHiddenControlDispatchResult,
     pendingInputWal: defaultWal,
-    supportsMethod: () => false,
-    ...overrides,
+    pendingInputQueue: compatibilityQueue,
+    ...safeOverrides,
   })
 
   return {
@@ -213,7 +239,7 @@ describe('useChatPendingQueue delivery state', () => {
       () => false,
       undefined,
       undefined,
-      { pendingInputWal: wal, supportsMethod: () => false },
+      { pendingInputWal: wal, hasRpcMethod: () => false },
     )
     inputText.value = 'survives a refresh'
 
@@ -268,7 +294,7 @@ describe('useChatPendingQueue delivery state', () => {
       () => false,
       undefined,
       undefined,
-      { pendingInputWal: wal, supportsMethod: () => false },
+      { pendingInputWal: wal, hasRpcMethod: () => false },
     )
     const original: Attachment = {
       kind: 'staged',
@@ -316,7 +342,7 @@ describe('useChatPendingQueue delivery state', () => {
       () => false,
       undefined,
       undefined,
-      { pendingInputWal: wal, supportsMethod: () => false },
+      { pendingInputWal: wal, hasRpcMethod: () => false },
     )
     inputText.value = 'queued draft'
 
@@ -353,7 +379,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         sessionKey: delayedSessionKey,
         pendingInputWal: wal,
-        supportsMethod: () => false,
+        hasRpcMethod: () => false,
       },
     )
     expect(queue.pendingQueue.value).toEqual([])
@@ -387,7 +413,7 @@ describe('useChatPendingQueue delivery state', () => {
       () => false,
       undefined,
       undefined,
-      { pendingInputWal: wal, supportsMethod: () => false },
+      { pendingInputWal: wal, hasRpcMethod: () => false },
     )
     await vi.waitFor(() => {
       expect(queue.pendingQueue.value[0]).toMatchObject({
@@ -484,7 +510,7 @@ describe('useChatPendingQueue delivery state', () => {
         throw new Error(`unexpected method: ${method}`)
       },
     )
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         rpcCall(method, params) as Promise<T>
       ),
@@ -497,7 +523,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
     inputText.value = 'queue with attachment'
@@ -557,7 +583,7 @@ describe('useChatPendingQueue delivery state', () => {
         throw new Error(`unexpected method: ${method}`)
       },
     )
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         rpcCall(method, params) as Promise<T>
       ),
@@ -577,7 +603,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
         prepareAttachmentsForSend,
       },
     )
@@ -621,7 +647,7 @@ describe('useChatPendingQueue delivery state', () => {
         throw new Error(`unexpected method: ${method}`)
       },
     )
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         rpcCall(method, params) as Promise<T>
       ),
@@ -634,7 +660,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
     inputText.value = 'stage exactly once'
@@ -678,7 +704,7 @@ describe('useChatPendingQueue delivery state', () => {
         throw new Error(`unexpected method: ${method}`)
       },
     )
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         rpcCall(method, params) as Promise<T>
       ),
@@ -691,7 +717,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
 
@@ -734,7 +760,7 @@ describe('useChatPendingQueue delivery state', () => {
       }
       throw new Error(`unexpected method: ${method}`)
     })
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => {
         void params
         return rpcCall(method) as Promise<T>
@@ -743,7 +769,7 @@ describe('useChatPendingQueue delivery state', () => {
     const { queue } = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
       rpc,
-      supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+      hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
     })
 
     await vi.waitFor(() => expect(queue.pendingQueue.value).toHaveLength(1))
@@ -774,7 +800,7 @@ describe('useChatPendingQueue delivery state', () => {
       }
       throw new Error(`unexpected method: ${method}`)
     })
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => {
         void params
         return rpcCall(method) as Promise<T>
@@ -783,7 +809,7 @@ describe('useChatPendingQueue delivery state', () => {
     const { queue } = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
       rpc,
-      supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+      hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
     })
 
     await vi.waitFor(() => expect(queue.pendingQueue.value).toHaveLength(1))
@@ -840,7 +866,7 @@ describe('useChatPendingQueue delivery state', () => {
         }],
       }
     })
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         rpcCall(method, params) as Promise<T>
       ),
@@ -853,7 +879,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
 
@@ -883,7 +909,7 @@ describe('useChatPendingQueue delivery state', () => {
         throw new Error(`unexpected method: ${method}`)
       },
     )
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         rpcCall(method, params) as Promise<T>
       ),
@@ -896,7 +922,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
     inputText.value = 'cancel after lost acknowledgement'
@@ -934,7 +960,7 @@ describe('useChatPendingQueue delivery state', () => {
       }
       throw new Error(`unexpected method: ${method}`)
     })
-    const initialRpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const initialRpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         initialRpcCall(method, params) as Promise<T>
       ),
@@ -947,7 +973,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc: initialRpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
     initial.inputText.value = 'cancel across a Gateway downgrade'
@@ -969,7 +995,7 @@ describe('useChatPendingQueue delivery state', () => {
       () => false,
       undefined,
       undefined,
-      { pendingInputWal: wal, supportsMethod: () => false },
+      { pendingInputWal: wal, hasRpcMethod: () => false },
     )
     await vi.waitFor(() => {
       expect(legacy.queue.pendingQueue.value[0]).toMatchObject({
@@ -1006,7 +1032,7 @@ describe('useChatPendingQueue delivery state', () => {
       }
       throw new Error(`unexpected method: ${method}`)
     })
-    const restoredRpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const restoredRpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         restoredRpcCall(method, params) as Promise<T>
       ),
@@ -1019,7 +1045,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc: restoredRpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
 
@@ -1047,14 +1073,14 @@ describe('useChatPendingQueue delivery state', () => {
       () => false,
       undefined,
       undefined,
-      { pendingInputWal: wal, supportsMethod: () => false },
+      { pendingInputWal: wal, hasRpcMethod: () => false },
     )
     const second = makeQueue(
       undefined,
       () => false,
       undefined,
       undefined,
-      { pendingInputWal: wal, supportsMethod: () => false },
+      { pendingInputWal: wal, hasRpcMethod: () => false },
     )
     try {
       first.inputText.value = 'cancel this in every tab'
@@ -1170,7 +1196,7 @@ describe('useChatPendingQueue delivery state', () => {
       }
       throw new Error(`unexpected method: ${method}`)
     })
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => {
         void params
         return rpcCall(method) as Promise<T>
@@ -1184,7 +1210,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
 
@@ -1260,7 +1286,7 @@ describe('useChatPendingQueue delivery state', () => {
       }
       throw new Error(`unexpected method: ${method}`)
     })
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => {
         void params
         return rpcCall(method) as Promise<T>
@@ -1274,7 +1300,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
     await vi.waitFor(() => {
@@ -1318,7 +1344,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
     await vi.waitFor(() => {
@@ -1367,7 +1393,7 @@ describe('useChatPendingQueue delivery state', () => {
       }
       throw new Error(`unexpected method: ${method}`)
     })
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => {
         void params
         return rpcCall(method) as Promise<T>
@@ -1381,7 +1407,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
 
@@ -1529,7 +1555,7 @@ describe('useChatPendingQueue delivery state', () => {
         items: key === sessionB ? structuredClone(serverRows) : [],
       }
     })
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         rpcCall(method, params) as Promise<T>
       ),
@@ -1545,7 +1571,7 @@ describe('useChatPendingQueue delivery state', () => {
         sessionKey,
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
         connectionState: ref('connected'),
       },
     )
@@ -1993,7 +2019,7 @@ describe('useChatPendingQueue delivery state', () => {
 
     const first = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
-      supportsMethod: () => false,
+      hasRpcMethod: () => false,
     })
     first.inputText.value = 'follow-up A'
     await first.queue.enqueuePendingInput(first.inputText.value, { ownerRequestId })
@@ -2003,7 +2029,7 @@ describe('useChatPendingQueue delivery state', () => {
 
     const reloaded = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
-      supportsMethod: () => false,
+      hasRpcMethod: () => false,
     })
     await reloaded.queue.hydratePendingQueue(parent)
     expect(reloaded.queue.pendingQueue.value.map(item => item.ownerRequestId)).toEqual([
@@ -2040,7 +2066,7 @@ describe('useChatPendingQueue delivery state', () => {
     const { wal } = memoryWal()
     const first = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
-      supportsMethod: () => false,
+      hasRpcMethod: () => false,
     })
     for (const text of ['A', 'B', 'C']) {
       first.inputText.value = text
@@ -2057,7 +2083,7 @@ describe('useChatPendingQueue delivery state', () => {
 
     const reloaded = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
-      supportsMethod: () => false,
+      hasRpcMethod: () => false,
     })
     await reloaded.queue.hydratePendingQueue(reloaded.sessionKey.value)
     expect(reloaded.queue.pendingQueue.value.map(item => item.text)).toEqual(['C', 'A', 'B'])
@@ -2090,7 +2116,7 @@ describe('useChatPendingQueue delivery state', () => {
     })
     const source = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
-      supportsMethod: () => false,
+      hasRpcMethod: () => false,
     })
     for (const text of ['A', 'B']) {
       source.inputText.value = text
@@ -2164,7 +2190,7 @@ describe('useChatPendingQueue delivery state', () => {
     ))
     const source = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
-      supportsMethod: () => false,
+      hasRpcMethod: () => false,
     })
     let current = true
 
@@ -2222,7 +2248,7 @@ describe('useChatPendingQueue delivery state', () => {
       () => blocked,
       undefined,
       undefined,
-      { pendingInputWal: wal, supportsMethod: () => false },
+      { pendingInputWal: wal, hasRpcMethod: () => false },
     )
     try {
       source.inputText.value = 'source item must still drain'
@@ -2306,7 +2332,7 @@ describe('useChatPendingQueue delivery state', () => {
     })
     const source = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
-      supportsMethod: () => false,
+      hasRpcMethod: () => false,
     })
     const controller = new AbortController()
 
@@ -2379,13 +2405,13 @@ describe('useChatPendingQueue delivery state', () => {
         }
         return {}
       })
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
-      call: rpcCall as unknown as NonNullable<UseChatPendingQueueOptions['rpc']>['call'],
+    const rpc: LegacyQueueRpc = {
+      call: rpcCall as unknown as LegacyQueueRpc['call'],
     }
     const first = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
       rpc,
-      supportsMethod: method => [
+      hasRpcMethod: method => [
         'sessions.pending_inputs.enqueue',
         'sessions.pending_inputs.reorder',
       ].includes(method),

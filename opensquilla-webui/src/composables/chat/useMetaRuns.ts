@@ -1,14 +1,13 @@
 import { reactive, ref, watch, type Ref } from 'vue'
 import i18n from '@/i18n'
-import type { RpcEventHandler } from '@/lib/rpc'
 import type {
+  MetaEvent,
   MetaPreflightPayload,
   MetaRunAnnouncedPayload,
   MetaRunCompletedPayload,
+  MetaRunCenter,
   MetaStepStatePayload,
-  SessionEventPayload,
-} from '@/types/rpc'
-import { isCurrentSessionPayload, isStaleEpoch } from '@/utils/chat/streamEvents'
+} from '@/modules/metaRunCenter'
 import {
   completeRun,
   createRibbon,
@@ -28,44 +27,22 @@ import type {
 /**
  * Self-contained controller for the MetaSkill run UI, mirroring
  * useChatApprovals. Owns the four `session.event.meta_*` subscriptions, the
- * per-run_id state Maps, the action handlers, and the confirm/replay RPC.
+ * per-run state Maps, the action handlers, and the confirm/replay RPC.
  *
- * Seq gating: the `*` wildcard (handleRpcAny) advances the shared lastStreamSeq
+ * Seq gating: the semantic conversation ingress advances the shared lastStreamSeq
  * for every session.event.* and runs AFTER these exact meta handlers, so this
  * controller must NOT call acceptStreamSeq (advancing twice would drop the next
- * frame). Instead gatePayload reads the pre-frame cursor read-only and drops
+ * frame). Instead gateEvent reads the projected pre-frame cursor and drops
  * stale/duplicate frames (seq <= lastStreamSeq) — without this, a replayed
- * meta_run_announced (e.g. on reconnect) would recreate the ribbon and reset it
- * to all-pending. It also gates on isStaleEpoch + isCurrentSessionPayload and
- * is a no-op on an unknown run_id (preserved from the vanilla modules).
+ * run announcement (e.g. on reconnect) would recreate the ribbon and reset it
+ * to all-pending. It also gates on the shared session/epoch cursor semantics and
+ * is a no-op on an unknown run (preserved from the vanilla modules).
  */
-
-type RpcClient = {
-  call: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
-  on: (event: string, handler: RpcEventHandler) => () => void
-}
 
 export interface MetaPreflightEntry {
   state: MetaPreflightState
   phase: MetaPreflightPhase
   errorText: string
-}
-
-interface MetaRunRecoveryPayload {
-  announced?: MetaRunAnnouncedPayload
-  step_states?: MetaStepStatePayload[]
-  completed?: MetaRunCompletedPayload
-}
-
-interface MetaReplayPayload {
-  message?: string
-  launch_text?: string
-  display_text?: string
-  live_replay?: {
-    available?: boolean
-    replay_token?: string
-    committed?: boolean
-  }
 }
 
 function canonicalMetaReplayMessage(value: unknown): string {
@@ -77,11 +54,11 @@ function canonicalMetaReplayMessage(value: unknown): string {
 }
 
 export interface UseMetaRunsOptions {
-  rpc: RpcClient
+  metaRunCenter: MetaRunCenter
   sessionKey: Ref<string>
   currentEpoch: Ref<number>
   /**
-   * Shared stream-seq cursor (the same ref advanced by handleRpcAny for every
+   * Shared stream-seq cursor (the same ref advanced by conversation ingress for every
    * session.event.*). Used read-only here to drop stale/duplicate meta frames.
    */
   lastStreamSeq: Ref<number>
@@ -122,9 +99,9 @@ export interface UseMetaRunsOptions {
 }
 
 export function useMetaRuns(options: UseMetaRunsOptions) {
-  const { rpc, sessionKey, currentEpoch, lastStreamSeq } = options
+  const { metaRunCenter, sessionKey, currentEpoch, lastStreamSeq } = options
 
-  // Reactive Maps keyed by run_id. ribbonOrder keeps render order stable.
+  // Reactive Maps keyed by run ID. ribbonOrder keeps render order stable.
   const ribbons = ref<Map<string, MetaRibbonState>>(new Map())
   const preflights = ref<Map<string, MetaPreflightEntry>>(new Map())
   const ribbonOrder = ref<string[]>([])
@@ -136,18 +113,17 @@ export function useMetaRuns(options: UseMetaRunsOptions) {
     if (!ribbonOrder.value.includes(runId)) ribbonOrder.value = [...ribbonOrder.value, runId]
   }
 
-  function gatePayload(payload: SessionEventPayload | null | undefined): boolean {
-    if (!payload || typeof payload !== 'object') return false
-    if (isStaleEpoch(payload, currentEpoch.value)) return false
-    if (!isCurrentSessionPayload(payload, sessionKey.value)) return false
-    options.observeStreamGeneration?.(payload)
+  function gateEvent(event: MetaEvent): boolean {
+    if (event.sessionEpoch !== null && event.sessionEpoch < currentEpoch.value) return false
+    if (event.sessionKey && sessionKey.value && event.sessionKey !== sessionKey.value) return false
+    options.observeStreamGeneration?.(event)
     // Drop stale/duplicate stream frames (e.g. replayed on reconnect). Without
     // this, a re-delivered meta_run_announced would reset the ribbon to
-    // all-pending and lose progress. The wildcard handleRpcAny advances
+    // all-pending and lose progress. The semantic conversation ingress advances
     // lastStreamSeq for every session.event.* and runs AFTER the exact meta
     // handlers, so we read the pre-frame cursor here (read-only, never advance).
-    // Frames without a numeric stream_seq are accepted, matching acceptStreamSeq.
-    const seq = payload.stream_seq
+    // Frames without a numeric streamSeq are accepted, matching acceptStreamSeq.
+    const seq = event.streamSeq
     if (typeof seq === 'number' && Number.isFinite(seq) && seq <= lastStreamSeq.value) return false
     return true
   }
@@ -155,7 +131,6 @@ export function useMetaRuns(options: UseMetaRunsOptions) {
   /* ── Event handlers ──────────────────────────────────────────────── */
 
   function onPreflight(payload: MetaPreflightPayload) {
-    if (!gatePayload(payload)) return
     const state = reactive(createPreflight(payload)) as MetaPreflightState
     if (!state.runId) return
     noteRunId(state.runId)
@@ -165,8 +140,7 @@ export function useMetaRuns(options: UseMetaRunsOptions) {
   }
 
   function onRunAnnounced(payload: MetaRunAnnouncedPayload) {
-    if (!gatePayload(payload)) return
-    const runId = payload.run_id || ''
+    const runId = payload.runId || ''
     // A run's compiled DAG is immutable. Duplicate announce frames can be
     // replayed after reconnect; never let them reset live progress or a
     // durable terminal recovery snapshot back to all-pending.
@@ -183,16 +157,14 @@ export function useMetaRuns(options: UseMetaRunsOptions) {
   }
 
   function onStepState(payload: MetaStepStatePayload) {
-    if (!gatePayload(payload)) return
-    const runId = payload.run_id || ''
+    const runId = payload.runId || ''
     const ribbon = ribbons.value.get(runId)
     if (!ribbon) return // out-of-order / unknown run — tolerate
     updateStep(ribbon, payload)
   }
 
   function onRunCompleted(payload: MetaRunCompletedPayload) {
-    if (!gatePayload(payload)) return
-    const runId = payload.run_id || ''
+    const runId = payload.runId || ''
     const ribbon = ribbons.value.get(runId)
     if (!ribbon) return
     completeRun(ribbon, payload)
@@ -212,20 +184,16 @@ export function useMetaRuns(options: UseMetaRunsOptions) {
     const requestVersion = ++recoveryRequestVersion
     const run = async () => {
       try {
-        const payload = await rpc.call<{ recovery?: MetaRunRecoveryPayload | null }>(
-          'meta.runs.recovery',
-          { sessionKey: targetSessionKey },
-        )
+        const recovery = await metaRunCenter.recover(targetSessionKey)
         if (
           requestVersion !== recoveryRequestVersion
           || sessionKey.value !== targetSessionKey
         ) return
-        const recovery = payload?.recovery
         const announced = recovery?.announced
-        if (!announced?.run_id) return
+        if (!announced?.runId) return
 
         const ribbon = reactive(createRibbon(announced)) as MetaRibbonState
-        for (const stepState of recovery?.step_states || []) updateStep(ribbon, stepState)
+        for (const stepState of recovery?.stepStates || []) updateStep(ribbon, stepState)
         if (recovery?.completed) completeRun(ribbon, recovery.completed)
         noteRunId(ribbon.runId)
         const next = new Map(ribbons.value)
@@ -273,10 +241,9 @@ export function useMetaRuns(options: UseMetaRunsOptions) {
     setPreflightPhase(runId, 'submitting')
     let confirmed: { message?: string } | null = null
     try {
-      confirmed = await rpc.call<{ message?: string }>('meta.runs.confirm_preflight', {
+      confirmed = await metaRunCenter.confirmPreflight({
         sessionKey: originatingSessionKey,
         runId,
-        run_id: runId,
         // The server feeds interpretedRequest into confirmation_message() so the
         // authored confirmation carries the interpreted-request context.
         interpretedRequest: payload.interpretedRequest,
@@ -330,17 +297,12 @@ export function useMetaRuns(options: UseMetaRunsOptions) {
       // is not an authoritative retry seed.
       const originatingSessionKey = sessionKey.value
       try {
-        const payloadOut = await rpc.call<{ replay?: MetaReplayPayload } & MetaReplayPayload>(
-          'meta.runs.replay',
-          {
-            sessionKey: originatingSessionKey,
-            runId,
-            run_id: runId,
-            mode: 'run',
-          },
-        )
+        const replay = await metaRunCenter.replay({
+          sessionKey: originatingSessionKey,
+          runId,
+          mode: 'run',
+        })
         if (sessionKey.value !== originatingSessionKey) return
-        const replay = payloadOut?.replay || payloadOut
         const message = canonicalMetaReplayMessage(replay?.message)
         if (!message) {
           options.pushToast(i18n.global.t('chat.metaRuns.replayUnavailable'), { tone: 'danger' })
@@ -407,21 +369,16 @@ export function useMetaRuns(options: UseMetaRunsOptions) {
     const mode = REPLAY_MODES[action]
     const originatingSessionKey = sessionKey.value
     try {
-      const payloadOut = await rpc.call<{ replay?: MetaReplayPayload } & MetaReplayPayload>(
-        'meta.runs.replay',
-        {
-          sessionKey: originatingSessionKey,
-          runId,
-          run_id: runId,
-          mode,
-          action,
-          stepId: stepId || undefined,
-          prepareLive: true,
-        },
-      )
+      const replay = await metaRunCenter.replay({
+        sessionKey: originatingSessionKey,
+        runId,
+        mode,
+        action,
+        stepId: stepId || undefined,
+        prepareLive: true,
+      })
       if (sessionKey.value !== originatingSessionKey) return
-      const replay = payloadOut && payloadOut.replay ? payloadOut.replay : payloadOut
-      const replayToken = replay?.live_replay?.replay_token || ''
+      const replayToken = replay?.liveReplay?.replayToken || ''
       if (!replayToken) {
         // Compatibility with older gateways: replay.message is now a
         // canonical `/meta <skill> -- <request>` command, never replay prose.
@@ -436,20 +393,15 @@ export function useMetaRuns(options: UseMetaRunsOptions) {
         return
       }
 
-      const committedOut = await rpc.call<{ replay?: MetaReplayPayload } & MetaReplayPayload>(
-        'meta.runs.replay',
-        {
-          sessionKey: originatingSessionKey,
-          runId,
-          run_id: runId,
-          mode,
-          replayToken,
-        },
-      )
+      const committed = await metaRunCenter.replay({
+        sessionKey: originatingSessionKey,
+        runId,
+        mode,
+        replayToken,
+      })
       if (sessionKey.value !== originatingSessionKey) return
-      const committed = committedOut?.replay || committedOut
-      const launchText = committed?.launch_text || ''
-      if (!launchText || committed?.live_replay?.committed !== true) {
+      const launchText = committed?.launchText || ''
+      if (!launchText || committed?.liveReplay?.committed !== true) {
         const fallbackMessage = canonicalMetaReplayMessage(replay?.message)
         if (fallbackMessage) {
           options.sendComposerText(fallbackMessage)
@@ -460,7 +412,7 @@ export function useMetaRuns(options: UseMetaRunsOptions) {
         }
         return
       }
-      const displayText = committed.display_text || (
+      const displayText = committed.displayText || (
         action === 'retry-step' ? 'Retry failed step' : 'Retry with partial context'
       )
       options.sendHiddenReplay(launchText, displayText)
@@ -479,15 +431,14 @@ export function useMetaRuns(options: UseMetaRunsOptions) {
   /* ── Subscription lifecycle ──────────────────────────────────────── */
 
   function subscribe(): () => void {
-    const unsubs = [
-      rpc.on('session.event.meta_preflight', onPreflight as RpcEventHandler),
-      rpc.on('session.event.meta_run_announced', onRunAnnounced as RpcEventHandler),
-      rpc.on('session.event.meta_step_state', onStepState as RpcEventHandler),
-      rpc.on('session.event.meta_run_completed', onRunCompleted as RpcEventHandler),
-    ]
-    return () => {
-      unsubs.forEach((unsub) => unsub())
-    }
+    const subscription = metaRunCenter.subscribe(event => {
+      if (!gateEvent(event)) return
+      if (event.kind === 'preflight') onPreflight(event.payload)
+      else if (event.kind === 'run-announced') onRunAnnounced(event.payload)
+      else if (event.kind === 'step-state') onStepState(event.payload)
+      else onRunCompleted(event.payload)
+    })
+    return () => subscription.close()
   }
 
   function reset() {

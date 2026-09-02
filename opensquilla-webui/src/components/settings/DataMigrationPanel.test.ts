@@ -25,8 +25,8 @@ async function mountPanel(options: MountOptions = {}) {
   setDesktopApi(options.desktopApi)
 
   const rpc = {
-    waitForConnection: vi.fn(async () => {}),
-    supportsMethod: vi.fn(() => true),
+    ready: vi.fn(async () => {}),
+    hasRpcMethod: vi.fn(() => true),
     call: vi.fn(),
     ...options.rpc,
   }
@@ -38,10 +38,67 @@ async function mountPanel(options: MountOptions = {}) {
   const i18n = (await import('@/i18n')).default
   i18n.global.locale.value = 'en'
   const Component = (await import('./DataMigrationPanel.vue')).default
+  const { MIGRATION_OPERATIONS_KEY } = await import('@/modules/migrationOperations')
   const el = document.createElement('div')
   document.body.appendChild(el)
   const app = createApp(Component)
   app.use(i18n)
+  app.provide(MIGRATION_OPERATIONS_KEY, {
+    listSources: async () => {
+      const hasRpcMethod = (rpc as { hasRpcMethod?: (method: string) => boolean }).hasRpcMethod
+      if (hasRpcMethod && !hasRpcMethod('migration.sources.list')) {
+        throw Object.assign(new Error('method not found'), { code: 'METHOD_NOT_FOUND' })
+      }
+      const result = await rpc.call('migration.sources.list', {}) as {
+        schemaVersion: 1
+        mode: 'preview_only'
+        capabilities: { discover: boolean; preview: boolean; apply: boolean; manualSource: boolean }
+        candidates: Array<Record<string, unknown>>
+      }
+      return {
+        ...result,
+        candidates: result.candidates.map(candidate => ({
+          id: String(candidate.candidateId),
+          sourceKind: String(candidate.sourceKind),
+          version: typeof candidate.version === 'string' ? candidate.version : null,
+          estimatedActivityAt: typeof candidate.estimatedActivityAt === 'string' ? candidate.estimatedActivityAt : null,
+          sessionCount: typeof candidate.sessionCount === 'number' ? candidate.sessionCount : null,
+          sizeBytes: typeof candidate.sizeBytes === 'number' ? candidate.sizeBytes : null,
+          previouslyImported: candidate.previouslyImported === true,
+        })),
+      }
+    },
+    preview: async (candidateId: string) => {
+      const hasRpcMethod = (rpc as { hasRpcMethod?: (method: string) => boolean }).hasRpcMethod
+      if (hasRpcMethod && !hasRpcMethod('migration.sources.preview')) {
+        throw Object.assign(new Error('method not found'), { code: 'METHOD_NOT_FOUND' })
+      }
+      const result = await rpc.call('migration.sources.preview', { candidateId }) as Record<string, unknown>
+      const summary = result.summary as Record<string, unknown> | undefined
+      return {
+        ...result,
+        candidate: result.candidate ?? {
+          candidateId,
+          sourceKind: 'cli-home',
+          version: null,
+          estimatedActivityAt: null,
+          sessionCount: null,
+          sizeBytes: null,
+          previouslyImported: false,
+        },
+        summary: {
+          sessionCount: typeof summary?.sessionCount === 'number' ? summary.sessionCount : null,
+          itemCounts: summary?.itemCounts ?? { planned: 0, skipped: 0, error: 0 },
+          pausedJobCount: typeof summary?.pausedJobCount === 'number' ? summary.pausedJobCount : 0,
+          diskRequiredBytes: typeof summary?.diskRequiredBytes === 'number' ? summary.diskRequiredBytes : 0,
+          diskFreeBytes: typeof summary?.diskFreeBytes === 'number' ? summary.diskFreeBytes : 0,
+        },
+        blockers: Array.isArray(result.blockers) ? result.blockers : [],
+        notices: Array.isArray(result.notices) ? result.notices : [],
+        execution: result.execution ?? { canApply: false, supportedBy: ['desktop', 'host_cli'] },
+      }
+    },
+  } as unknown as import('@/modules/migrationOperations').MigrationOperations)
   app.mount(el)
   mounted.push({ app, el })
   await settle()
@@ -635,7 +692,7 @@ describe('DataMigrationPanel gateway preview provider', () => {
     const call = vi.fn()
     const { el } = await mountPanel({
       rpc: {
-        supportsMethod: vi.fn(() => false),
+        hasRpcMethod: vi.fn(() => false),
         call,
       },
     })

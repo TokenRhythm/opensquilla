@@ -3,7 +3,7 @@
   "schema_version": 1,
   "source_runs": [
     {
-      "assignment_sha256": "28060706ffde5d4aeb36285be1618e114be2026f7bb48a4dc21098fc4e98eafe",
+      "assignment_sha256": "b68d0aa5389729f3ea25a81580b6a755674e5a1a46ca1b8b4394d8d48a646555",
       "attempts": {
         "core": 1,
         "desktop-installer-contracts": 1,
@@ -25,10 +25,10 @@
         "runner_os": "Windows"
       },
       "sha": "9bd99e1deecc3a2634f324634e1b36ab0143d56f",
-      "weighted_file_count": 1307
+      "weighted_file_count": 1310
     },
     {
-      "assignment_sha256": "28060706ffde5d4aeb36285be1618e114be2026f7bb48a4dc21098fc4e98eafe",
+      "assignment_sha256": "b68d0aa5389729f3ea25a81580b6a755674e5a1a46ca1b8b4394d8d48a646555",
       "attempts": {
         "core": 1,
         "desktop-installer-contracts": 1,
@@ -50,10 +50,10 @@
         "runner_os": "Windows"
       },
       "sha": "9bd99e1deecc3a2634f324634e1b36ab0143d56f",
-      "weighted_file_count": 1307
+      "weighted_file_count": 1308
     },
     {
-      "assignment_sha256": "28060706ffde5d4aeb36285be1618e114be2026f7bb48a4dc21098fc4e98eafe",
+      "assignment_sha256": "b68d0aa5389729f3ea25a81580b6a755674e5a1a46ca1b8b4394d8d48a646555",
       "attempts": {
         "core": 1,
         "desktop-installer-contracts": 1,
@@ -75,13 +75,17 @@
         "runner_os": "Windows"
       },
       "sha": "9bd99e1deecc3a2634f324634e1b36ab0143d56f",
-      "weighted_file_count": 1307
+      "weighted_file_count": 1308
     }
   ],
   "weights_seconds": {
+    "tests/contracts/test_approval_center_contract.py": 0.01,
     "tests/contracts/test_conversation_events_contract.py": 0.01,
     "tests/contracts/test_gateway_contract_runner.py": 0.01,
     "tests/contracts/test_gateway_contract_toolchain_integration.py": 0.01,
+    "tests/contracts/test_goals_contract.py": 0.01,
+    "tests/contracts/test_sandbox_runtime_contract.py": 0.01,
+    "tests/contracts/test_turn_commands_contract.py": 0.01,
     "tests/contracts/test_sessions_changed_contract.py": 0.01,
     "tests/contracts/test_sessions_directory_subscription_contract.py": 0.01,
     "tests/contracts/test_sessions_lifecycle_contract.py": 0.01,
@@ -103,10 +107,17 @@
     "tests/integration/cli/tui_real_terminal/test_visual_layout_matrix.py": 0.01,
     "tests/test_agent_cmd_no_key.py": 0.043,
     "tests/test_agents/test_registry_write_open_nofollow.py": 0.01,
+    "tests/test_application/test_app_settings.py": 0.01,
     "tests/test_application/test_approval_patterns.py": 0.017,
     "tests/test_application/test_approval_rpc.py": 0.086,
+    "tests/test_application/test_conversation_runtime.py": 0.01,
+    "tests/test_application/test_provider_configuration.py": 0.01,
+    "tests/test_application/test_sandbox_runtime.py": 0.01,
     "tests/test_application/test_session_directory.py": 0.01,
+    "tests/test_application/test_session_lifecycle.py": 0.01,
+    "tests/test_application/test_session_read.py": 0.01,
     "tests/test_application/test_session_transcript.py": 0.01,
+    "tests/test_application/test_setup_workflow.py": 0.01,
     "tests/test_application/test_wizard.py": 0.01,
     "tests/test_artifact_bundles.py": 0.662,
     "tests/test_artifact_session/test_candidate_loop.py": 0.01,
@@ -653,6 +664,7 @@
     "tests/test_gateway/test_rpc_workspaces.py": 15.487,
     "tests/test_gateway/test_runtime_override_provenance.py": 0.582,
     "tests/test_gateway/test_sandbox_protocol_codec.py": 0.01,
+    "tests/test_gateway/test_sandbox_runtime_contract_registration.py": 0.01,
     "tests/test_gateway/test_sandbox_v2_routes.py": 0.148,
     "tests/test_gateway/test_search_runtime_config_gateway.py": 0.01,
     "tests/test_gateway/test_security_headers.py": 0.037,
@@ -660,8 +672,13 @@
     "tests/test_gateway/test_session_model_routing.py": 0.01,
     "tests/test_gateway/test_session_model_routing_rpc.py": 0.01,
     "tests/test_gateway/test_chat_history_characterization.py": 0.01,
+    "tests/test_gateway/test_conversation_runtime_adapter.py": 0.01,
+    "tests/test_gateway/test_goal_plan_contract_adapters.py": 0.01,
     "tests/test_gateway/test_session_preview_adapter.py": 0.01,
     "tests/test_gateway/test_session_history_adapter.py": 0.01,
+    "tests/test_gateway/test_session_lifecycle_adapter.py": 0.01,
+    "tests/test_gateway/test_session_read_adapter.py": 0.01,
+    "tests/test_gateway/test_session_read_contract_registration.py": 0.01,
     "tests/test_gateway/test_session_streams.py": 0.038,
     "tests/test_gateway/test_sessions_bootstrap_history_characterization.py": 0.01,
     "tests/test_gateway/test_sessions_list_contract_adapter.py": 0.01,
@@ -1057,6 +1074,7 @@
     "tests/test_sandbox/test_shell_code_network_hints.py": 13.456,
     "tests/test_sandbox/test_shell_safe_policy_integration.py": 1.45,
     "tests/test_sandbox/test_stale_approval_authority.py": 25.613,
+    "tests/test_sandbox/test_startup_without_canaries.py": 0.01,
     "tests/test_sandbox/test_tool_runtime_descriptors.py": 0.038,
     "tests/test_sandbox/test_trusted_sandbox_execution.py": 4.015,
     "tests/test_sandbox/test_unavailable_backend.py": 0.398,
@@ -1118,6 +1136,7 @@
     "tests/test_scripts/test_release_channel_manifest.py": 0.035,
     "tests/test_scripts/test_replay_finalize_gate.py": 0.126,
     "tests/test_scripts/test_router_live_script_defaults.py": 0.043,
+    "tests/test_scripts/test_stage_webui_artifact.py": 0.01,
     "tests/test_scripts/test_verify_desktop_slim_size.py": 0.035,
     "tests/test_scripts/test_verify_webui_artifact.py": 2.686,
     "tests/test_search/test_bocha_provider.py": 0.058,

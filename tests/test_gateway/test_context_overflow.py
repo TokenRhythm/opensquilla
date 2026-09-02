@@ -438,6 +438,7 @@ async def test_hard_truncate_drops_oldest_history_until_fits() -> None:
     assert len(outcome.trimmed_history) == len(transcript) - outcome.truncated_entries
 
 
+@pytest.mark.ci_serial
 @pytest.mark.asyncio
 async def test_auto_summarize_invokes_compaction_and_retries_once() -> None:
     """AUTO_SUMMARIZE retries only after compacted payload is inside budget."""

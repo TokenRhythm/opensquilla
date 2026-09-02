@@ -1,20 +1,19 @@
 import { computed, nextTick, onUnmounted, reactive, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import i18n from '@/i18n'
-import { useRpcStore } from '@/stores/rpc'
 import { useToasts } from '@/composables/useToasts'
 import { useProjectWorkspaces } from '@/composables/useProjectWorkspaces'
 import type { CronJob, CronJobFormModel, CronPanelTemplate } from '@/types/cron'
 import { buildDeliveryFromValues, normalizeDeliveryFields } from '@/utils/cron/delivery'
 import { DEFAULT_CRON_EXPRESSION, explainCron, nextRuns, parseCron } from '@/utils/cron/schedule'
 import { canonicalSessionKey } from '@/utils/chat/sessionKeys'
+import type { CronScheduler } from '@/modules/cronScheduler'
 
 interface UseCronFormOptions {
   afterSaved: () => void
 }
 
-export function useCronForm(options: UseCronFormOptions) {
-  const rpc = useRpcStore()
+export function useCronForm(scheduler: CronScheduler, options: UseCronFormOptions) {
   const route = useRoute()
   const { pushToast } = useToasts()
   const projectWorkspaces = useProjectWorkspaces()
@@ -287,7 +286,7 @@ export function useCronForm(options: UseCronFormOptions) {
 
     if (editingJob.value) payload.id = editingJob.value.id
     try {
-      await rpc.call(editingJob.value ? 'cron.update' : 'cron.create', payload)
+      await scheduler.saveJob(payload, { existing: Boolean(editingJob.value) })
       pushToast(editingJob.value ? t('cronSkills.form.toastUpdated') : t('cronSkills.form.toastCreated'), { tone: 'ok' })
       closePanel()
       options.afterSaved()

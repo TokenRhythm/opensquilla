@@ -1,9 +1,9 @@
 import { computed, ref, watch } from 'vue'
 
-import {
-  waitForSessionRpcConnection,
-} from '@/composables/chat/sessionBootstrapAdmission'
-import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
+import type {
+  SandboxChatRuntime,
+  SandboxRunModePreference,
+} from '@/modules/sandboxRuntime'
 import {
   SANDBOX_RUN_MODES,
   isRecognizedSandboxRunMode,
@@ -21,22 +21,7 @@ export interface RunModePolicy {
 
 interface UseChatRunModePreferenceOptions {
   runModePolicy: () => RunModePolicy | null | undefined
-  rpc: RunModePreferenceRpc
-  hydrateCallOptions?: RpcCallOptions
-  writeCallOptions?: RpcCallOptions
-}
-
-interface RunModePreferenceRpc {
-  waitForConnection: (
-    timeoutMs?: number,
-    signal?: AbortSignal,
-    actions?: RpcConnectionWaitOptions,
-  ) => Promise<void>
-  call: (
-    method: string,
-    params?: Record<string, unknown>,
-    callOptions?: RpcCallOptions,
-  ) => Promise<unknown>
+  sandbox: Pick<SandboxChatRuntime, 'preference' | 'selectMode'>
 }
 
 function availableStorage(): Storage | null {
@@ -155,26 +140,11 @@ export function useChatRunModePreference(options: UseChatRunModePreferenceOption
     return next
   }
 
-  function modeFromPayload(payload: unknown): unknown {
-    if (!payload || typeof payload !== 'object') return undefined
-    return (payload as Record<string, unknown>).runMode
-  }
-
   async function hydrateRunModePreference(): Promise<SandboxRunMode> {
-    await waitForSessionRpcConnection(options.rpc, options.hydrateCallOptions)
-    const payload = options.hydrateCallOptions
-      ? await options.rpc.call(
-          'sandbox.run_mode.preference.get',
-          undefined,
-          options.hydrateCallOptions,
-        )
-      : await options.rpc.call('sandbox.run_mode.preference.get')
-    const source = payload && typeof payload === 'object'
-      ? (payload as Record<string, unknown>).source
-      : null
+    const preference = await options.sandbox.preference({ timeoutMs: 10_000 })
     return applyConfirmedPreference(
-      modeFromPayload(payload),
-      { selected: source === 'preference' },
+      preference.runMode,
+      { selected: preference.source === 'preference' },
     )
   }
 
@@ -193,19 +163,10 @@ export function useChatRunModePreference(options: UseChatRunModePreferenceOption
     runModeUserSelected.value = true
 
     try {
-      await waitForSessionRpcConnection(options.rpc, options.writeCallOptions)
-      const payload = options.writeCallOptions
-        ? await options.rpc.call(
-            'sandbox.run_mode.preference.set',
-            { runMode: requested },
-            options.writeCallOptions,
-          )
-        : await options.rpc.call('sandbox.run_mode.preference.set', {
-            runMode: requested,
-          })
+      const preference = await options.sandbox.selectMode(requested, { timeoutMs: 5_000 })
       if (sequence !== writeSequence) return runMode.value
       return applyConfirmedPreference(
-        modeFromPayload(payload),
+        preference.runMode,
         { selected: true },
       )
     } catch (cause) {
@@ -217,9 +178,11 @@ export function useChatRunModePreference(options: UseChatRunModePreferenceOption
     }
   }
 
-  function applyRunModePreferenceChanged(payload: unknown): SandboxRunMode {
+  function applyRunModePreferenceChanged(
+    preference: SandboxRunModePreference,
+  ): SandboxRunMode {
     return applyConfirmedPreference(
-      modeFromPayload(payload),
+      preference.runMode,
       { selected: true },
     )
   }

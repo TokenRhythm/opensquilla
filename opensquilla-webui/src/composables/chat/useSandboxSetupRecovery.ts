@@ -1,9 +1,8 @@
 import { computed, onScopeDispose, ref, watch, type Ref } from 'vue'
-import {
-  ensureSandboxReady,
-  normalizeSandboxSetupStatus,
-  type SandboxSetupOutcome,
-} from '@/composables/sandboxSetupCoordinator'
+import type {
+  SandboxChatRuntime,
+  SandboxSetupOutcome,
+} from '@/modules/sandboxRuntime'
 import type {
   SandboxRunMode,
   SandboxSetupStatusPayload,
@@ -11,19 +10,11 @@ import type {
 
 const SETUP_POLL_MS = 2000
 
-type SandboxSetupRpc = {
-  call: (method: string, params?: Record<string, unknown>) => Promise<unknown>
-  waitForConnection?: () => Promise<unknown>
-}
-
 export interface UseSandboxSetupRecoveryOptions {
-  rpc: SandboxSetupRpc
+  sandbox: Pick<SandboxChatRuntime, 'readiness' | 'ensureReady'>
   connectionState: Ref<string>
   runMode: Ref<SandboxRunMode>
   autoRefresh?: boolean
-  onUnavailable?: (
-    status: SandboxSetupStatusPayload & { state: 'failed' | 'unavailable' },
-  ) => void | Promise<void>
 }
 
 export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions) {
@@ -37,7 +28,6 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
   let requestGeneration = 0
   let pollTimer: ReturnType<typeof setTimeout> | null = null
   let lastState = ''
-  let lastUnavailableFingerprint = ''
 
   const active = computed(() => options.connectionState.value === 'connected')
   const visible = computed(() =>
@@ -48,7 +38,7 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
     && status.value.state !== 'ready')
   const isWindows = computed(() => status.value?.platform.toLowerCase().startsWith('win') === true)
   const canSetup = computed(() =>
-    isWindows.value && (status.value?.state === 'not_setup' || status.value?.state === 'failed'))
+    isWindows.value && status.value?.state === 'not_setup')
 
   function clearPoll() {
     if (pollTimer) clearTimeout(pollTimer)
@@ -66,23 +56,6 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
     lastState = next.state
     status.value = next
     if (next.state !== 'failed') error.value = ''
-    if (next.state === 'ready') {
-      lastUnavailableFingerprint = ''
-    } else if (next.state === 'failed' || next.state === 'unavailable') {
-      const fingerprint = `${next.state}\0${next.message}\0${next.detail || ''}`
-      if (fingerprint !== lastUnavailableFingerprint) {
-        lastUnavailableFingerprint = fingerprint
-        void Promise.resolve(options.onUnavailable?.({
-          ...next,
-          state: next.state,
-        })).catch((cause) => {
-          console.warn(
-            'Failed to report unavailable sandbox:',
-            cause instanceof Error ? cause.message : String(cause),
-          )
-        })
-      }
-    }
     schedulePoll()
   }
 
@@ -92,7 +65,7 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
     loading.value = status.value === null
     clearPoll()
     try {
-      const payload = normalizeSandboxSetupStatus(await options.rpc.call('sandbox.setup.status'))
+      const payload = (await options.sandbox.readiness()).status
       if (generation !== requestGeneration) return
       if (!payload) {
         // Keep following an already-authoritative setting_up state when a
@@ -127,11 +100,7 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
     error.value = ''
     clearPoll()
     try {
-      const result = await ensureSandboxReady(
-        options.rpc.call,
-        null,
-        options.rpc.waitForConnection ?? null,
-      )
+      const result = await options.sandbox.ensureReady()
       if (generation !== requestGeneration) return false
       if (result.status) applyStatus(result.status)
       outcome.value = result.outcome
@@ -157,7 +126,6 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
         status.value = null
         resolved.value = false
         lastState = ''
-        lastUnavailableFingerprint = ''
         loading.value = false
         ensuring.value = false
       }

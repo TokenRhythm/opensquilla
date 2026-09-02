@@ -21,7 +21,7 @@ import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -829,6 +829,9 @@ async def run_channel_dispatch(
                             semantic_message=raw_content,
                             stream_event_sink=(
                                 stream_relay.emit if stream_relay is not None else None
+                            ),
+                            accepted_run_mode_override=(
+                                _channel_accepted_run_mode_override(route_envelope)
                             ),
                         )
                         _persisted, persisted_content = await _append_channel_user_message(
@@ -1665,7 +1668,21 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
                     apply_policy = getattr(task_runtime, "apply_overflow_policy", None)
                     if callable(apply_policy):
                         await apply_policy(session_key, policy=channel_overflow_policy)
-                handle = await start_turn_via_runtime(task_runtime, route_envelope, msg.content, attachments=ingested.attachments, mode=_resolve_channel_busy_input_mode(task_runtime, busy_input_mode), run_kind="channel_turn", semantic_message=raw_content, stream_event_sink=stream_relay.emit if stream_relay is not None else None)  # noqa: E501
+                handle = await start_turn_via_runtime(
+                    task_runtime,
+                    route_envelope,
+                    msg.content,
+                    attachments=ingested.attachments,
+                    mode=_resolve_channel_busy_input_mode(task_runtime, busy_input_mode),
+                    run_kind="channel_turn",
+                    semantic_message=raw_content,
+                    stream_event_sink=(
+                        stream_relay.emit if stream_relay is not None else None
+                    ),
+                    accepted_run_mode_override=(
+                        _channel_accepted_run_mode_override(route_envelope)
+                    ),
+                )
                 _persisted, persisted_content = await _append_channel_user_message(
                     session_manager=session_manager,
                     session_key=session_key,
@@ -1825,13 +1842,27 @@ async def _apply_saved_channel_run_context(
         return
     try:
         from opensquilla.gateway.rpc_sessions import _apply_run_context_route_metadata
-        from opensquilla.sandbox.run_context import get_run_context
+        from opensquilla.sandbox.run_context import (
+            get_run_context,
+            resolve_default_run_mode,
+        )
+        from opensquilla.sandbox.run_mode import RunMode
 
         run_context = await get_run_context(
             session_manager,
             route_envelope.session_key,
             config=config,
             workspace=workspace_dir,
+        )
+        global_mode, global_source = await resolve_default_run_mode(
+            session_manager,
+            config,
+        )
+        run_context = replace(
+            run_context,
+            run_mode=global_mode if principal_is_owner else RunMode.SAFE,
+            run_mode_source="operator_default" if principal_is_owner else None,
+            source=global_source,
         )
     except KeyError:
         # First channel message: the atomic acceptance path has intentionally
@@ -1848,6 +1879,19 @@ async def _apply_saved_channel_run_context(
         route_envelope,
         run_context,
         principal_is_owner=principal_is_owner,
+    )
+
+
+def _channel_accepted_run_mode_override(route_envelope: Any) -> Any:
+    """Freeze the channel route's already-resolved run mode at acceptance."""
+    from opensquilla.gateway.project_workspace_runtime import AcceptedRunModeOverride
+    from opensquilla.sandbox.run_mode import normalize_run_mode
+
+    principal_is_owner = bool(route_envelope.metadata.get("principal_is_owner"))
+    return AcceptedRunModeOverride(
+        run_mode=normalize_run_mode(route_envelope.metadata.get("run_mode")),
+        run_mode_source="operator_default" if principal_is_owner else None,
+        source="channel_ingress",
     )
 
 
@@ -3370,6 +3414,7 @@ async def _accept_channel_runtime_turn_impl(
         config,
     )
     overflow_policy = _resolve_channel_overflow_policy(channel, config)
+    accepted_run_mode_override = _channel_accepted_run_mode_override(route_envelope)
 
     async def _commit_and_activate() -> tuple[
         Any | None,
@@ -3395,6 +3440,7 @@ async def _accept_channel_runtime_turn_impl(
                 if goal_claim_candidate is not None
                 else None
             ),
+            accepted_run_mode_override=accepted_run_mode_override,
         )
         try:
             if intent_plan.action == "create":

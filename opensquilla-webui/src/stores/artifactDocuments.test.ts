@@ -1,11 +1,11 @@
 import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type { ArtifactDocumentProvider } from '@/modules/artifactWorkbench'
 import type { ArtifactDocumentWorkspace } from '@/types/artifactDocuments'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import {
   createLegacyArtifactWorkspace,
-  type ArtifactDocumentProvider,
 } from '@/workbench/artifactDocumentProvider'
 import {
   artifactDocumentWorkspaceKey,

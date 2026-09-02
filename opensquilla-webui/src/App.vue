@@ -89,8 +89,8 @@
       :current-key="sidebarCurrentKey"
       :contract-debug-enabled="contractDebugEnabled"
       :search-hint="commandPaletteHint"
-      :can-manage-projects="rpcStore.canManageProjectWorkspaces"
-      :can-create-projects="rpcStore.canChooseProject"
+      :can-manage-projects="gatewayAccess.canManageProjectWorkspaces"
+      :can-create-projects="gatewayAccess.canChooseProject"
       @select="switchToSession"
       @refresh="loadSidebarData"
       @load-more="loadMoreSessions"
@@ -247,12 +247,12 @@
             v-if="webConfigEnabled"
             type="button"
             class="conn-pill conn-pill--link"
-            :class="rpcStore.state"
+            :class="connectionState"
             :title="t('chrome.connectionTitle', { state: connectionStateLabel })"
             :aria-label="t('chrome.manageConnection')"
             @click="openConnectionSettings"
           >{{ connectionStateLabel }}</button>
-          <span v-else class="conn-pill" :class="rpcStore.state">{{ connectionStateLabel }}</span>
+          <span v-else class="conn-pill" :class="connectionState">{{ connectionStateLabel }}</span>
           <DesktopUpdateIndicator />
         </template>
         <!-- Opt-in (Settings → Appearance or the command palette); off by
@@ -406,7 +406,7 @@
   <ConfirmModal />
 
   <ProjectWorkspaceCreateDialog
-    v-if="rpcStore.canChooseProject"
+    v-if="gatewayAccess.canChooseProject"
     :open="projectCreateOpen && !projectCreateConfirming && !projectSourcePickerOpen"
     :name="projectCreateName"
     :source-path="projectCreateSourcePath"
@@ -419,9 +419,9 @@
   />
 
   <ProjectWorkspacePickerDialog
-    v-if="rpcStore.canChooseProject"
+    v-if="gatewayAccess.canChooseProject"
     :open="projectCreateOpen && projectSourcePickerOpen"
-    :enabled="rpcStore.canChooseProject"
+    :enabled="gatewayAccess.canChooseProject"
     :session-key="currentSessionKey || 'agent:main:webchat:workspace-picker'"
     :initial-path="projectCreateSourcePath"
     @close="projectSourcePickerOpen = false"
@@ -429,7 +429,7 @@
   />
 
   <ProjectWorkspaceEditDialog
-    v-if="rpcStore.canManageProjectWorkspaces"
+    v-if="gatewayAccess.canManageProjectWorkspaces"
     :open="Boolean(editingProject)"
     :initial-name="editingProject?.name || ''"
     :path="editingProject?.path || ''"
@@ -452,10 +452,11 @@ import { useI18n } from 'vue-i18n'
 import { routeTitle } from './router'
 import { getPlatform } from '@/platform'
 import { useAppStore, type ThemeMode, type PendingApproval } from './stores/app'
-import { useRpcStore } from './stores/rpc'
+import { GATEWAY_ACCESS_KEY } from './modules/gatewayAccess'
 import { SESSION_DIRECTORY_KEY } from './modules/sessionDirectory'
 import { SESSION_DIRECTORY_CHANGES_KEY } from './modules/sessionDirectoryChanges'
 import { SESSION_LIFECYCLE_KEY } from './modules/sessionLifecycle'
+import { APPROVAL_CENTER_KEY, type ApprovalEvent, type ApprovalItem, type ApprovalSubscription } from './modules/approvalCenter'
 import {
   arrangeSidebarSections,
   useSessions,
@@ -510,7 +511,6 @@ import { normalizeAgentId } from './utils/chat/sessionKeys'
 import { effectiveChatConnectionState } from './utils/chat/chatConnectionState'
 import { reminderToastPreview } from './utils/cron/notifications'
 import { installSessionNavigationDiagConsole, recordSessionNavigationDiag } from './utils/chat/sessionNavigationDiag'
-import type { RpcEventHandler } from '@/lib/rpc'
 import { isMacPlatform } from './utils/browser'
 import { useShortcutsStore } from './stores/shortcuts'
 import { bindingMatches, formatBinding } from './utils/keychord'
@@ -528,6 +528,12 @@ import {
   optionalSessionRpcCallOptions,
 } from './composables/chat/sessionBootstrapAdmission'
 import { markCronFinishNotified } from './utils/cron/notifications'
+import { AGENT_CATALOG_KEY } from './modules/agentCatalog'
+import {
+  CRON_SCHEDULER_KEY,
+  type CronRunFinished,
+  type CronSubscription,
+} from './modules/cronScheduler'
 import {
   buildChatSessionTitles,
   isSensibleChatTitle,
@@ -535,7 +541,9 @@ import {
 } from './composables/chat/useChatSessionTitles'
 
 const appStore = useAppStore()
-const rpcStore = useRpcStore()
+const injectedGatewayAccess = inject(GATEWAY_ACCESS_KEY)
+if (!injectedGatewayAccess) throw new Error('GatewayAccess was not provided')
+const gatewayAccess = injectedGatewayAccess
 const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
 if (!injectedSessionDirectory) throw new Error('SessionDirectory was not provided')
 const sessionDirectory = injectedSessionDirectory
@@ -545,6 +553,15 @@ const sessionDirectoryChanges = injectedSessionDirectoryChanges
 const injectedSessionLifecycle = inject(SESSION_LIFECYCLE_KEY)
 if (!injectedSessionLifecycle) throw new Error('SessionLifecycle was not provided')
 const sessionLifecycle = injectedSessionLifecycle
+const injectedApprovalCenter = inject(APPROVAL_CENTER_KEY)
+if (!injectedApprovalCenter) throw new Error('ApprovalCenter was not provided')
+const approvalCenter = injectedApprovalCenter
+const injectedAgentCatalog = inject(AGENT_CATALOG_KEY)
+if (!injectedAgentCatalog) throw new Error('AgentCatalog was not provided')
+const agentCatalog = injectedAgentCatalog
+const injectedCronScheduler = inject(CRON_SCHEDULER_KEY)
+if (!injectedCronScheduler) throw new Error('CronScheduler was not provided')
+const cronScheduler = injectedCronScheduler
 const shortcutsStore = useShortcutsStore()
 const artifactImageLightbox = provideArtifactImageLightbox()
 const { t } = useI18n()
@@ -608,10 +625,13 @@ watch(sidebarEffectiveWidth, width => {
 const APP_SESSION_SYNC_SOURCE = 'app-sidebar'
 
 // Localized connection-state label for the topbar pill and its tooltip. The
-// store state ('connected' | 'connecting' | 'disconnected') is a stable key, not
-// display text; CSS uppercases the result (a no-op for CJK scripts).
+// Semantic availability is projected into the existing presentation keys;
+// CSS uppercases the result (a no-op for CJK scripts).
+const connectionState = computed(() => gatewayAccess.availability === 'available'
+  ? 'connected'
+  : gatewayAccess.availability === 'preparing' ? 'connecting' : 'disconnected')
 const effectiveConnectionState = computed(() => effectiveChatConnectionState(
-  rpcStore.state,
+  connectionState.value,
   appStore.chatLivePhase,
   isChatRoute.value,
 ))
@@ -656,7 +676,7 @@ const editingProject = computed(() =>
     : null,
 )
 watch(
-  () => rpcStore.canManageProjectWorkspaces,
+  () => gatewayAccess.canManageProjectWorkspaces,
   allowed => {
     if (allowed) {
       scheduleSessionRefresh()
@@ -678,21 +698,9 @@ const { enabled: bgmEnabled } = useBgm()
 const desktopUpdate = useDesktopUpdate()
 const webConfigEnabled = getPlatform().capabilities.hasWebConfig
 
-interface AppCronRunFinishedPayload {
-  jobId?: string
-  jobName?: string
-  payloadKind?: string
-  runId?: string
-  sessionKey?: string
-  summary?: string
-  success?: boolean
-}
+let cronFinishedSubscription: CronSubscription | null = null
 
-let unsubscribeCronFinished: (() => void) | null = null
-
-function handleCronRunFinished(payload: unknown) {
-  if (!payload || typeof payload !== 'object') return
-  const event = payload as AppCronRunFinishedPayload
+function handleCronRunFinished(event: CronRunFinished) {
   const runId = typeof event.runId === 'string' ? event.runId : ''
   const jobName = event.jobName?.trim() || t('cronSkills.jobs.unnamedTask')
   markCronFinishNotified(runId)
@@ -732,7 +740,7 @@ function handleCronRunFinished(payload: unknown) {
 installSessionNavigationDiagConsole()
 
 // Shared agents.list state + fetch (singleton) for sidebar session metadata.
-const { agents, loadAgents } = useAgentOptions(optionalSessionRpcCallOptions)
+const { agents, loadAgents } = useAgentOptions(agentCatalog, optionalSessionRpcCallOptions)
 const mobileKeyboardOpen = ref(false)
 const commandPaletteOpen = ref(false)
 const localChatSessions = ref<Record<string, { effectiveAgentId: string; title: string; updatedAt: number }>>({})
@@ -1092,7 +1100,7 @@ const sidebarSections = computed((): SidebarSection[] => {
   const byKey = new Map(sidebarSessionItems.value.map(item => [item.key, item]))
   return arrangeSidebarSections(
     sidebarSessionItems.value,
-    rpcStore.canManageProjectWorkspaces && projectWorkspaces.hasLoaded.value
+    gatewayAccess.canManageProjectWorkspaces && projectWorkspaces.hasLoaded.value
       ? projectWorkspaces.workspaces.value
       : undefined,
     sidebarSessionOrder.value,
@@ -1278,7 +1286,7 @@ function startNewChatInstant() {
 }
 
 function startProjectTask(workspaceId: string) {
-  if (!workspaceId || !rpcStore.canManageProjectWorkspaces) return
+  if (!workspaceId || !gatewayAccess.canManageProjectWorkspaces) return
   handleNavClick()
   freshTaskDraft.requestFreshTask('main', workspaceId)
   void router.push({
@@ -1303,7 +1311,7 @@ function resetProjectCreator() {
 }
 
 function openProjectCreator() {
-  if (!rpcStore.canChooseProject) return
+  if (!gatewayAccess.canChooseProject) return
   projectCreateName.value = ''
   projectCreateSourcePath.value = ''
   projectCreateBusy.value = false
@@ -1319,7 +1327,7 @@ function closeProjectCreator() {
 }
 
 function onProjectPathChosen(path: string) {
-  if (!projectCreateOpen.value || !rpcStore.canChooseProject) return
+  if (!projectCreateOpen.value || !gatewayAccess.canChooseProject) return
   projectCreateSourcePath.value = path
   if (!projectCreateName.value.trim()) {
     projectCreateName.value = projectNameFromPath(path)
@@ -1334,7 +1342,7 @@ function onProjectSourcePathChosen(path: string) {
 async function chooseProjectSourceDirectory() {
   if (
     !projectCreateOpen.value
-    || !rpcStore.canChooseProject
+    || !gatewayAccess.canChooseProject
     || projectCreateBusy.value
     || projectCreateSourcePicking.value
     || projectSourcePickerOpen.value
@@ -1363,7 +1371,7 @@ async function chooseProjectSourceDirectory() {
 async function createProjectWorkspace(payload: { name: string; path: string }) {
   if (
     !projectCreateOpen.value
-    || !rpcStore.canChooseProject
+    || !gatewayAccess.canChooseProject
     || projectCreateBusy.value
     || projectCreateSourcePicking.value
     || projectSourcePickerOpen.value
@@ -1414,7 +1422,7 @@ async function createProjectWorkspace(payload: { name: string; path: string }) {
 }
 
 async function onProjectPin(payload: { workspaceId: string; pinned: boolean }) {
-  if (!rpcStore.canManageProjectWorkspaces) return
+  if (!gatewayAccess.canManageProjectWorkspaces) return
   try {
     await projectWorkspaces.setPinned(payload.workspaceId, payload.pinned)
   } catch (err) {
@@ -1423,12 +1431,12 @@ async function onProjectPin(payload: { workspaceId: string; pinned: boolean }) {
 }
 
 function openProjectEditor(workspaceId: string) {
-  if (!rpcStore.canManageProjectWorkspaces) return
+  if (!gatewayAccess.canManageProjectWorkspaces) return
   editingProjectId.value = workspaceId
 }
 
 async function onProjectRename(name: string) {
-  if (!rpcStore.canManageProjectWorkspaces) return
+  if (!gatewayAccess.canManageProjectWorkspaces) return
   const workspaceId = editingProjectId.value
   if (!workspaceId) return
   try {
@@ -1440,7 +1448,7 @@ async function onProjectRename(name: string) {
 }
 
 async function onProjectDeleteHistory(workspaceId: string) {
-  if (!rpcStore.canManageProjectWorkspaces) return
+  if (!gatewayAccess.canManageProjectWorkspaces) return
   try {
     const result = await projectWorkspaces.deleteWorkspaceHistory(workspaceId)
     const leaveDeletedTask = activeTaskWasDeletedWithProjectHistory({
@@ -1459,15 +1467,12 @@ async function onProjectDeleteHistory(workspaceId: string) {
 }
 
 async function onProjectRemove(workspaceId: string) {
-  if (!rpcStore.canManageProjectWorkspaces) return
+  if (!gatewayAccess.canManageProjectWorkspaces) return
   const project = projectWorkspaces.byId.value.get(workspaceId)
   if (!project) return
   let affectedCronJobs = 0
   try {
-    const jobs = await rpcStore.call<Array<{ workspaceId?: string }>>(
-      'cron.list',
-      {},
-    )
+    const jobs = await cronScheduler.listJobs()
     affectedCronJobs = (jobs || []).filter(
       job => job.workspaceId === workspaceId,
     ).length
@@ -1692,7 +1697,7 @@ function flushScheduledSidebarRefresh() {
 async function performSidebarLoad(): Promise<void> {
   const requests: Promise<unknown>[] = [loadSessions()]
   if (
-    rpcStore.canManageProjectWorkspaces
+    gatewayAccess.canManageProjectWorkspaces
     && optionalSessionRpcAllowed.value
   ) {
     requests.push(
@@ -1732,9 +1737,9 @@ function subscribeCronEventsWhenAdmitted() {
   if (
     !appAutomaticRpcMounted
     || !optionalSessionRpcAllowed.value
-    || !rpcStore.isConnected
+    || !gatewayAccess.isAvailable
   ) return
-  void rpcStore.call('cron.subscribe', {}).catch(() => undefined)
+  void cronScheduler.resumeEvents().catch(() => undefined)
 }
 
 function resumeAutomaticAppRpc() {
@@ -1754,9 +1759,9 @@ watch(optionalSessionRpcAllowed, admitted => {
 }, { flush: 'sync' })
 
 watch(
-  () => rpcStore.state,
+  () => gatewayAccess.availability,
   state => {
-    if (state !== 'connected') return
+    if (state !== 'available') return
     subscribeCronEventsWhenAdmitted()
     if (!appAutomaticRpcMounted || !optionalSessionRpcAllowed.value) return
     // The event stream is live-only. Rebind the logical lease and refresh a
@@ -1849,49 +1854,16 @@ function errorMessage(err: unknown): string {
 // socket (e.g. a reload while one is already pending).
 // ---------------------------------------------------------------------------
 
-interface ApprovalPushPayload {
-  approval_id?: string
-  approvalId?: string
-  session_key?: string
-  sessionKey?: string
-  tool_name?: string
-  toolName?: string
-  command?: string
-}
+const approvalSubscriptions: ApprovalSubscription[] = []
 
-interface ApprovalSnapshotItem {
-  id?: string
-  sessionKey?: string
-  toolName?: string
-  pluginId?: string
-  actionKind?: string
-  command?: string
-  argv?: string[]
-}
-
-const rpcApprovalUnsubs: Array<() => void> = []
-
-function approvalAuthHeaders(): Record<string, string> {
-  const headers: Record<string, string> = {}
-  try {
-    const token = sessionStorage.getItem('opensquilla.wsToken') || ''
-    if (token) headers['Authorization'] = `Bearer ${token}`
-  } catch { /* ignore */ }
-  return headers
-}
-
-function snapshotItemToPending(item: ApprovalSnapshotItem): PendingApproval | null {
-  const approvalId = String(item.id || '').trim()
+function approvalItemToPending(item: ApprovalItem): PendingApproval | null {
+  const approvalId = item.id.trim()
   if (!approvalId) return null
-  let command = String(item.command || '')
-  if (!command && Array.isArray(item.argv) && item.argv.length > 0) {
-    command = item.argv.map(String).join(' ')
-  }
   return {
     approvalId,
-    sessionKey: String(item.sessionKey || ''),
-    tool: String(item.toolName || item.pluginId || item.actionKind || 'Unknown tool'),
-    command,
+    sessionKey: item.sessionKey,
+    tool: item.toolName || 'Unknown tool',
+    command: item.command,
   }
 }
 
@@ -1900,11 +1872,9 @@ function snapshotItemToPending(item: ApprovalSnapshotItem): PendingApproval | nu
 // snapshot is ordered oldest-first, which the deep-link relies on.
 async function seedPendingApprovals() {
   try {
-    const res = await fetch('/api/approvals', { headers: approvalAuthHeaders() })
-    if (!res.ok) throw new Error('HTTP ' + res.status)
-    const data = await res.json() as { pending?: ApprovalSnapshotItem[] }
-    const items = (data.pending || [])
-      .map(snapshotItemToPending)
+    const snapshot = await approvalCenter.snapshot()
+    const items = snapshot.pending
+      .map(approvalItemToPending)
       .filter((item): item is PendingApproval => item !== null)
     appStore.setPendingApprovals(items)
   } catch (err) {
@@ -1912,26 +1882,21 @@ async function seedPendingApprovals() {
   }
 }
 
-function onApprovalRequested(payload: ApprovalPushPayload) {
-  const approvalId = String(payload.approval_id || payload.approvalId || '').trim()
-  if (!approvalId) return
-  appStore.upsertPendingApproval({
-    approvalId,
-    sessionKey: String(payload.session_key || payload.sessionKey || ''),
-    tool: String(payload.tool_name || payload.toolName || 'Unknown tool'),
-    command: String(payload.command || ''),
-  })
-}
-
-function onApprovalResolved(payload: ApprovalPushPayload) {
-  const approvalId = String(payload.approval_id || payload.approvalId || '').trim()
-  if (approvalId) appStore.removePendingApproval(approvalId)
+function onApprovalEvent(event: ApprovalEvent) {
+  if (event.kind === 'resolved') {
+    appStore.removePendingApproval(event.approvalId)
+    return
+  }
+  if (event.approval) {
+    const item = approvalItemToPending(event.approval)
+    if (item) appStore.upsertPendingApproval(item)
+  }
 }
 
 // Reconnect re-seeds the list (recovers approvals that arrived while the socket
 // was down); the push events keep it live thereafter.
-function onApprovalConnectionState(state: unknown) {
-  if (state !== 'connected') {
+function onApprovalAvailability(state: 'available' | 'recovering' | 'unavailable') {
+  if (state !== 'available') {
     appStore.setPendingApprovals([])
     return
   }
@@ -1939,18 +1904,15 @@ function onApprovalConnectionState(state: unknown) {
 }
 
 function subscribeApprovals() {
-  rpcApprovalUnsubs.push(
-    rpcStore.on('exec.approval.requested', onApprovalRequested as RpcEventHandler),
-    rpcStore.on('exec.approval.resolved', onApprovalResolved as RpcEventHandler),
-    rpcStore.on('plugin.approval.requested', onApprovalRequested as RpcEventHandler),
-    rpcStore.on('plugin.approval.resolved', onApprovalResolved as RpcEventHandler),
-    rpcStore.on('_state', onApprovalConnectionState as RpcEventHandler),
+  approvalSubscriptions.push(
+    approvalCenter.subscribe(onApprovalEvent),
+    approvalCenter.subscribeAvailability(onApprovalAvailability),
   )
 }
 
 function unsubscribeApprovals() {
-  rpcApprovalUnsubs.forEach(unsub => unsub())
-  rpcApprovalUnsubs.length = 0
+  approvalSubscriptions.splice(0).forEach(subscription => subscription.close())
+  approvalCenter.dispose()
 }
 
 // ---------------------------------------------------------------------------
@@ -1988,10 +1950,10 @@ onMounted(() => {
   resumeAutomaticAppRpc()
   // Keep the approval badge/count live app-wide, not just on the Approvals page.
   subscribeApprovals()
-  unsubscribeCronFinished = rpcStore.on('cron.run.finished', handleCronRunFinished)
-  // Seed now in case the socket is already connected (the `_state` listener
-  // covers later reconnects); recovers a request pending before mount.
-  if (rpcStore.isConnected) void seedPendingApprovals()
+  cronFinishedSubscription = cronScheduler.subscribe(handleCronRunFinished)
+  // Seed now in case an approval was pending before mount. Availability events
+  // re-seed after reconnects and clear stale data while transport recovers.
+  void seedPendingApprovals()
 })
 
 onUnmounted(() => {
@@ -2003,9 +1965,8 @@ onUnmounted(() => {
   sessionDirectoryChangesSubscription.close()
   sessionDirectoryChanges.dispose()
   unsubscribeApprovals()
-  unsubscribeCronFinished?.()
-  unsubscribeCronFinished = null
-  void rpcStore.call('cron.unsubscribe', {}).catch(() => undefined)
+  cronFinishedSubscription?.close()
+  cronFinishedSubscription = null
   if (titleDebounce) {
     clearTimeout(titleDebounce)
     titleDebounce = null

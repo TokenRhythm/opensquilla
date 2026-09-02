@@ -490,15 +490,19 @@ def test_generic_webui_change_does_not_wake_desktop_matrix(
 @pytest.mark.parametrize(
     "path",
     [
+        "contracts/gateway/v4/sandbox/sandbox-runtime-status.schema.json",
         "contracts/gateway/v4/sessions/sessions-list.schema.json",
         "contracts/gateway/v4/sessions/sessions-changed.schema.json",
+        "opensquilla-webui/src/contracts/generated/v4/sandboxRuntimeStatus.ts",
         "opensquilla-webui/src/contracts/generated/v4/sessionsChanged.ts",
         "scripts/contracts/generate_gateway_contracts.py",
         "scripts/contracts/generate_sessions_list_contract.py",
+        "src/opensquilla/contracts/generated/v4/sandbox_runtime_status.py",
         "src/opensquilla/contracts/generated/v4/sessions_list.py",
         "src/opensquilla/contracts/generated/v4/sessions_changed.py",
         "tests/contracts/test_gateway_contract_runner.py",
         "tests/contracts/test_gateway_contract_toolchain_integration.py",
+        "tests/contracts/test_sandbox_runtime_contract.py",
         "tests/contracts/test_sessions_list_contract.py",
         "tests/contracts/test_sessions_changed_contract.py",
         "tests/fixtures/contracts/gateway/v4/toolchain/toolchain-ping.schema.json",
@@ -510,10 +514,45 @@ def test_gateway_contract_changes_run_deterministic_generation(
     plan = _plan(tmp_path, suite_config, path)
 
     assert plan["full_fallback"] is False
-    assert {"frontend-artifact", "frontend-validation"} <= set(
+    assert {
+        "frontend-artifact",
+        "frontend-validation",
+        "python-targeted",
+    } <= set(
         plan["required_suites"]
     )
+    assert {
+        "tests/test_ci/test_architecture_import_contracts.py",
+        "tests/test_ci/test_rpc_architecture_contracts.py",
+    } <= set(plan["python_targets"])
     assert plan["reason_codes"] == ["gateway_contract_changed"]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "opensquilla-webui/scripts/lib/rpc-architecture-gate.mjs",
+        "opensquilla-webui/scripts/rpc-debt/session-chat.mjs",
+        "opensquilla-webui/src/adapters/gateway/sessionConversationV4.ts",
+        "opensquilla-webui/src/modules/sessionConversation.ts",
+        "opensquilla-webui/src/platform/desktop.ts",
+        "opensquilla-webui/src/types/chat.ts",
+        "src/opensquilla/gateway/adapters/sandbox_runtime_contract.py",
+        "src/opensquilla/gateway/adapters/sessions_list_contract.py",
+    ],
+)
+def test_webui_boundary_changes_run_python_architecture_contracts(
+    tmp_path: Path,
+    suite_config: dict[str, Any],
+    path: str,
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+
+    assert "python-targeted" in plan["required_suites"]
+    assert {
+        "tests/test_ci/test_architecture_import_contracts.py",
+        "tests/test_ci/test_rpc_architecture_contracts.py",
+    } <= set(plan["python_targets"])
 
 
 def test_gateway_change_runs_browser_recovery_without_native_desktop(

@@ -4,7 +4,7 @@ import type {
   NativeWorkbenchSurfaceResult,
   Platform,
 } from '@/platform/types'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import { createLegacyArtifactWorkspace } from '@/workbench/artifactDocumentProvider'
 import { createArtifactPreviewWorkbenchItem } from '@/workbench/artifactItems'
 import {
@@ -16,7 +16,31 @@ import type {
   WorkbenchPanelRenderState,
   WorkbenchRuntimeContext,
 } from '@/workbench/types'
-import { createArtifactWorkbenchDefinitions } from './artifactWorkbenchProvider'
+import type { ArtifactContentAccess } from '@/modules/artifactWorkbench'
+import { createV4ArtifactContentAccess } from '@/adapters/gateway/artifactAccessV4'
+import {
+  createArtifactWorkbenchDefinitions as createDefinitions,
+  type ArtifactWorkbenchProviderOptions,
+} from './artifactWorkbenchProvider'
+
+const testArtifactContent: ArtifactContentAccess = {
+  ...createV4ArtifactContentAccess(),
+  fetchAttachment: vi.fn(async () => ({
+    ok: false as const,
+    status: 0,
+    source: 'none' as const,
+    url: '',
+    message: 'not used',
+  })),
+  uploadAttachment: vi.fn(async () => ({ fileUuid: 'test-file' })),
+}
+
+function createArtifactWorkbenchDefinitions(
+  options: Omit<ArtifactWorkbenchProviderOptions, 'artifactContent'>
+    & Partial<Pick<ArtifactWorkbenchProviderOptions, 'artifactContent'>>,
+) {
+  return createDefinitions({ artifactContent: testArtifactContent, ...options })
+}
 
 const artifact: ArtifactPayload = {
   id: 'artifact-1',
@@ -64,7 +88,6 @@ async function createNativeRuntimeHarness(
     sessionKey: 'session-a',
   })
   const definition = createArtifactWorkbenchDefinitions({
-    authToken: () => '',
     baseOrigin: 'http://localhost',
     confirmRemoteResources,
     currentSessionId: () => 'session-a',
@@ -251,7 +274,6 @@ async function createAnnotationDraftHarness(
       releaseOverlayEdit,
       setActiveDocument: vi.fn(),
     },
-    authToken: () => 'synthetic-token',
     baseOrigin: 'http://127.0.0.1:18791',
     confirmRemoteResources: vi.fn(async () => true),
     currentSessionId: () => 'session-a',
@@ -969,7 +991,6 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://localhost',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -1035,7 +1056,6 @@ describe('artifact Workbench provider', () => {
         })),
         headArtifact: vi.fn(value => value),
       },
-      authToken: () => '',
       baseOrigin: 'http://localhost',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -1088,7 +1108,6 @@ describe('artifact Workbench provider', () => {
         })),
         headArtifact: vi.fn(value => value),
       },
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -1170,7 +1189,6 @@ describe('artifact Workbench provider', () => {
     const renderState: Record<string, unknown> = {}
     const definition = createArtifactWorkbenchDefinitions({
       artifactDocuments: { load, snapshot, headArtifact },
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -1236,7 +1254,6 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => '',
       baseOrigin: 'http://localhost',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -1285,7 +1302,6 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources,
       currentSessionId: () => 'session-a',
@@ -1456,7 +1472,6 @@ describe('artifact Workbench provider', () => {
         })),
         headArtifact: vi.fn(() => currentHead),
       },
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -1539,7 +1554,6 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => '',
       baseOrigin: 'http://localhost',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -1698,7 +1712,6 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => '',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -1778,7 +1791,6 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definitions = createArtifactWorkbenchDefinitions({
-      authToken: () => '',
       baseOrigin: 'http://localhost',
       confirmRemoteResources,
       currentSessionId: () => 'session-a',
@@ -1923,7 +1935,6 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => '',
       baseOrigin: 'http://localhost',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -2194,7 +2205,6 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -2312,7 +2322,6 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -2376,7 +2385,6 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => '',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -2440,7 +2448,6 @@ describe('artifact Workbench provider', () => {
         sessionKey: 'session-a',
       })
       const definition = createArtifactWorkbenchDefinitions({
-        authToken: () => '',
         baseOrigin: 'http://127.0.0.1:18791',
         confirmRemoteResources: vi.fn(async () => true),
         currentSessionId: () => 'session-a',
@@ -2601,7 +2608,6 @@ describe('artifact Workbench provider', () => {
         discard: vi.fn(async () => true),
         setActiveDocument: vi.fn(),
       },
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -2797,7 +2803,6 @@ describe('artifact Workbench provider', () => {
         })),
         headArtifact: vi.fn(() => workspace.headArtifact),
       },
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -2970,7 +2975,6 @@ describe('artifact Workbench provider', () => {
         discard: vi.fn(async () => true),
         setActiveDocument: vi.fn(),
       },
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -3385,7 +3389,6 @@ describe('artifact Workbench provider', () => {
         releaseOverlayEdit,
         setActiveDocument,
       },
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',

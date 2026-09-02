@@ -3,7 +3,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick } from 'vue'
 import { createPinia, setActivePinia } from 'pinia'
 import i18n from '@/i18n'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
+import { ARTIFACT_WORKBENCH_KEY, type ArtifactWorkbench } from '@/modules/artifactWorkbench'
+import { GATEWAY_ACCESS_KEY, type GatewayAccess } from '@/modules/gatewayAccess'
+import { createV4ArtifactContentAccess } from '@/adapters/gateway/artifactAccessV4'
 import ChatArtifactList from './ChatArtifactList.vue'
 
 const videoArtifact: ArtifactPayload = {
@@ -32,11 +35,16 @@ async function mountList(
   const app = createApp(ChatArtifactList, {
     artifacts,
     sessionKey: 'agent:main:webchat:video',
-    authToken: 'secret',
     onDownload,
   })
   app.use(pinia)
   app.use(i18n)
+  app.provide(GATEWAY_ACCESS_KEY, {
+    isLocalOwner: false,
+  } as GatewayAccess)
+  app.provide(ARTIFACT_WORKBENCH_KEY, {
+    content: createV4ArtifactContentAccess(),
+  } as ArtifactWorkbench)
   app.mount(el)
   await settle()
   return { app, el, onDownload }
@@ -63,6 +71,9 @@ beforeEach(() => {
   vi.useRealTimers()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
+  vi.stubGlobal('sessionStorage', {
+    getItem: vi.fn((key: string) => key === 'opensquilla.wsToken' ? 'secret' : null),
+  })
   vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:opensquilla-video')
   vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
 })

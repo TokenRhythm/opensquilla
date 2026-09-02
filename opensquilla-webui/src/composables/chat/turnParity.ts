@@ -4,7 +4,7 @@ import type {
   ChatToolCallRenderItem,
 } from '@/types/chat'
 import type { InterruptViewState } from '@/types/parts'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import type { FoldedTurn } from '@/utils/chat/foldTurn'
 import { toolState } from '@/utils/chat/toParts'
 

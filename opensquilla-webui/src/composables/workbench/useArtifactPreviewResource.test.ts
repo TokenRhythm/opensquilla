@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import {
   ARTIFACT_TEXT_PREVIEW_LIMIT,
 } from '@/utils/workbench/artifactPreview'

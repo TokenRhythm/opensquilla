@@ -8,7 +8,7 @@ import i18n, {
   type LocaleCode,
 } from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
-import { useRpcStore } from '@/stores/rpc'
+import type { AppSettings } from '@/modules/appSettings'
 import { getManifest, isValueThemeId, normalizeThemeId, themePickerOptions } from '@/themes/registry'
 import { ensureThemeWorld } from '@/themes/apply'
 import {
@@ -157,7 +157,11 @@ export const useAppStore = defineStore('app', () => {
   let themeWatchStop: (() => void) | null = null
   let localeSyncPromise: Promise<void> | null = null
   let localeSyncWarningShown = false
-  const rpcStore = useRpcStore()
+  let appSettings: AppSettings | null = null
+
+  function bindAppSettings(settings: AppSettings) {
+    appSettings = settings
+  }
   const { pushToast } = useToasts()
 
   function applyTheme() {
@@ -286,15 +290,15 @@ export const useAppStore = defineStore('app', () => {
     if (localeSyncPromise) return localeSyncPromise
     localeSyncPromise = (async () => {
       while (pendingChannelNoticeLocale.value) {
-        if (!rpcStore.isConnected || !rpcStore.supportsMethod('config.patch.safe')) {
+        if (!appSettings) {
           if (warnOnUnavailable) notifyLocaleSyncPending()
           return
         }
         const target = pendingChannelNoticeLocale.value
         try {
-          await rpcStore.call('config.patch.safe', {
-            patches: { 'control_ui.default_locale': target },
-          })
+          await appSettings.patchSafe([
+            { path: 'control_ui.default_locale', value: target },
+          ])
           clearPendingLocaleSync(target)
           localeSyncWarningShown = false
         } catch {
@@ -308,12 +312,6 @@ export const useAppStore = defineStore('app', () => {
     })
     return localeSyncPromise
   }
-
-  watch([() => rpcStore.state, () => rpcStore.methods], ([state]) => {
-    if (state === 'connected' && pendingChannelNoticeLocale.value) {
-      void syncLocaleToGateway()
-    }
-  })
 
   // Resolve and apply the startup locale (saved → OS locale → data-locale →
   // <html lang> → navigator → en). Loads the locale chunk before applying so the
@@ -505,6 +503,7 @@ export const useAppStore = defineStore('app', () => {
     setTheme,
     cycleTheme,
     initLocale,
+    bindAppSettings,
     setLocale,
     syncLocaleToGateway,
     setSidebarOpen,

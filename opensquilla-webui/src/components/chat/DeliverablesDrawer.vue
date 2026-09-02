@@ -171,7 +171,7 @@
 import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import { useDialogLayer } from '@/composables/useDialogA11y'
 
 const { t } = useI18n()
@@ -182,18 +182,15 @@ import {
 } from '@/composables/chat/useArtifactPreview'
 import {
   artifactCategory,
-  artifactDownloadUrl,
   artifactFileSubtitle,
   artifactFileTitle,
   artifactIconName,
-  artifactThumbnailUrl,
 } from '@/utils/chat/artifacts'
 
 const props = defineProps<{
   open: boolean
   artifacts: ArtifactPayload[]
   sessionKey?: string
-  authToken?: string
 }>()
 
 const emit = defineEmits<{
@@ -230,20 +227,6 @@ function isVisual(artifact: ArtifactPayload | null): artifact is ArtifactPayload
   return !!artifact && artifactCategory(artifact) === 'visual'
 }
 
-function sameOrigin(url: string): boolean {
-  try {
-    return new URL(url, window.location.origin).origin === window.location.origin
-  } catch { return false }
-}
-
-function previewHeaders(url: string): Record<string, string> {
-  if (!sameOrigin(url)) return {}
-  const headers: Record<string, string> = {}
-  if (props.sessionKey) headers['x-opensquilla-session-key'] = props.sessionKey
-  if (props.authToken) headers.Authorization = `Bearer ${props.authToken}`
-  return headers
-}
-
 /* ── Tile thumbnails: lazy + capped, small bytes per tile ──────────────────
    Each visual tile fetches the `variant=thumb` webp (or the full image when no
    thumbnail exists) only when it scrolls into view. Bytes are rendered as a
@@ -256,15 +239,9 @@ function tileController(artifact: ArtifactPayload): ArtifactPreviewController {
   let controller = tileControllers.get(key)
   if (!controller) {
     controller = createArtifactPreview({
-      resolveUrl: () => artifactThumbnailUrl(artifact, window.location.origin, {
-        sessionKey: props.sessionKey,
-        includeSessionKey: false,
-      }),
-      headers: () => previewHeaders(artifactThumbnailUrl(artifact, window.location.origin, {
-        sessionKey: props.sessionKey,
-        includeSessionKey: false,
-      })),
-      sameOrigin,
+      artifact: () => artifact,
+      sessionKey: () => props.sessionKey,
+      variant: 'thumbnail',
       fullSize: false,
     })
     tileControllers.set(key, controller)
@@ -314,15 +291,9 @@ function disposeFull() {
 function loadFull(artifact: ArtifactPayload) {
   disposeFull()
   fullController = createArtifactPreview({
-    resolveUrl: () => artifactDownloadUrl(artifact, window.location.origin, {
-      sessionKey: props.sessionKey,
-      includeSessionKey: false,
-    }),
-    headers: () => previewHeaders(artifactDownloadUrl(artifact, window.location.origin, {
-      sessionKey: props.sessionKey,
-      includeSessionKey: false,
-    })),
-    sameOrigin,
+    artifact: () => artifact,
+    sessionKey: () => props.sessionKey,
+    variant: 'content',
     fullSize: true,
   })
   const ctrl = fullController
@@ -449,7 +420,7 @@ const visualKeys = computed(() => visualArtifacts.value.map(artifactKey).join('|
 // Drop tile controllers when the open drawer's artifact set or auth changes so
 // their blob URLs are revoked promptly.
 watch(
-  () => [visualKeys.value, props.sessionKey || '', props.authToken || ''],
+  () => [visualKeys.value, props.sessionKey || ''],
   () => { if (props.open) disposeTileControllers() },
 )
 

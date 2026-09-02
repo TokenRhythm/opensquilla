@@ -239,6 +239,19 @@ def make_agent_run_handler(
             log.warning("agent_run_handler.empty_task", job_id=job.id)
             return HandlerResult()
 
+        route_envelope = None
+        if task_runtime is not None:
+            from opensquilla.scheduler.routing import build_cron_route_envelope
+
+            route_envelope = build_cron_route_envelope(
+                job,
+                session_key=session_key,
+                agent_id=agent_id,
+            )
+            validate_acceptance = getattr(task_runtime, "validate_acceptance", None)
+            if callable(validate_acceptance):
+                await validate_acceptance(route_envelope)
+
         # Session setup
         bound_workspace_dir: str | None = None
         workspace_id = job.payload.get("_workspace_id")
@@ -301,15 +314,10 @@ def make_agent_run_handler(
         summary: str | None = None
         try:
             if task_runtime is not None:
-                from opensquilla.scheduler.routing import build_cron_route_envelope
                 from opensquilla.session.models import AgentTaskStatus
 
                 transcript_watermark = await _transcript_watermark(sm, session_key)
-                route_envelope = build_cron_route_envelope(
-                    job,
-                    session_key=session_key,
-                    agent_id=agent_id,
-                )
+                assert route_envelope is not None
                 handle = await task_runtime.enqueue(
                     route_envelope,
                     task,

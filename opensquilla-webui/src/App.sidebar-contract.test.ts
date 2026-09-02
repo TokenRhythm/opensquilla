@@ -51,9 +51,19 @@ describe('App sidebar chrome contract', () => {
 
   it('bounds automatic sidebar RPCs after chat bootstrap admission', () => {
     expect(appSource).toContain('useSessions(sessionDirectory)')
-    expect(appSource).toContain('useAgentOptions(optionalSessionRpcCallOptions)')
+    expect(appSource).toContain('useAgentOptions(agentCatalog, optionalSessionRpcCallOptions)')
     expect(appSource).toContain('SESSION_DIRECTORY_CHANGES_KEY')
     expect(appSource).toContain('sessionDirectoryChanges.resume()')
     expect(appSource).not.toContain('useSessionListSubscription')
+  })
+
+  it('keeps app-wide approval awareness behind ApprovalCenter', () => {
+    expect(appSource).toContain('APPROVAL_CENTER_KEY')
+    expect(appSource).toContain('approvalCenter.snapshot()')
+    expect(appSource).toContain('approvalCenter.subscribe(onApprovalEvent)')
+    expect(appSource).not.toContain("fetch('/api/approvals'")
+    expect(appSource).not.toContain("rpcStore.on('exec.approval")
+    expect(appSource).not.toContain("rpcStore.on('plugin.approval")
+    expect(appSource).not.toContain("rpcStore.on('_state', onApproval")
   })
 })

@@ -1,6 +1,7 @@
 import { nextTick, ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
+import { createV4MetaRunCenter } from '@/adapters/gateway/metaRunCenterV4'
 import { useMetaRuns } from './useMetaRuns'
 import { counterText, ribbonCopy } from '@/utils/chat/metaRibbon'
 
@@ -20,17 +21,19 @@ function makeOptions(
   const sessionKey = ref('agent:main:replay-session')
   const handlers = new Map<string, (...args: unknown[]) => void>()
   const lastStreamSeq = ref(0)
-  const api = useMetaRuns({
-    rpc: {
-      call: <T = unknown>(
-        method: string,
-        params?: Record<string, unknown>,
-      ): Promise<T> => call(method, params) as Promise<T>,
-      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
-        handlers.set(event, handler)
-        return () => handlers.delete(event)
-      }),
+  const metaRunCenter = createV4MetaRunCenter({
+    request: async <T = unknown>(method: string, params?: Record<string, unknown>): Promise<T> => (
+      await call(method, params) as T
+    ),
+    supports: () => true,
+  }, {
+    subscribe: (name, handler) => {
+      handlers.set(name, handler as (...args: unknown[]) => void)
+      return { close: () => handlers.delete(name) }
     },
+  })
+  const api = useMetaRuns({
+    metaRunCenter,
     sessionKey,
     currentEpoch: ref(1),
     lastStreamSeq,
@@ -58,7 +61,7 @@ describe('useMetaRuns stream generation', () => {
   it('observes a new generation before its independent stale-seq gate', () => {
     let cursor = ref(0)
     const observeStreamGeneration = vi.fn((payload: unknown) => {
-      if ((payload as { stream_generation?: string }).stream_generation !== 'generation-2') {
+      if ((payload as { streamGeneration?: string }).streamGeneration !== 'generation-2') {
         return false
       }
       cursor.value = 0
@@ -526,7 +529,7 @@ describe('useMetaRuns persisted recovery hydration', () => {
 
     const first = api.hydrateRecovery()
     const second = api.hydrateRecovery()
-    expect(call).toHaveBeenCalledTimes(1)
+    await vi.waitFor(() => expect(call).toHaveBeenCalledTimes(1))
     expect(second).toBe(first)
 
     resolveRecovery?.(recoveryPayload('persisted-paper-run'))

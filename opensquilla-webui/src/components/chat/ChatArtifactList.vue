@@ -106,7 +106,6 @@
         :data-artifact-key="artifactKey(artifact)"
         :artifact="artifact"
         :session-key="sessionKey"
-        :auth-token="authToken"
         @download="$emit('download', $event)"
       />
     </TransitionGroup>
@@ -119,7 +118,6 @@
         :data-artifact-key="artifactKey(artifact)"
         :artifact="artifact"
         :session-key="sessionKey"
-        :auth-token="authToken"
         @download="$emit('download', $event)"
       />
     </TransitionGroup>
@@ -147,13 +145,13 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onUnmounted, watch } from 'vue'
+import { computed, inject, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ArtifactChip from '@/components/chat/ArtifactChip.vue'
 import AudioArtifactCard from '@/components/chat/AudioArtifactCard.vue'
 import VideoArtifactCard from '@/components/chat/VideoArtifactCard.vue'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import { useToasts } from '@/composables/useToasts'
 import {
   createArtifactPreview,
@@ -161,13 +159,11 @@ import {
   type ArtifactPreviewState,
 } from '@/composables/chat/useArtifactPreview'
 import {
-  fetchArtifactBlob,
   isActiveDocumentArtifactCandidate,
-  openArtifactBlobUrl,
-  openArtifactViaGateway,
 } from '@/utils/chat/artifactAccess'
+import { ARTIFACT_WORKBENCH_KEY } from '@/modules/artifactWorkbench'
+import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 import { usePlatform } from '@/platform'
-import { useRpcStore } from '@/stores/rpc'
 import {
   artifactCategory,
   artifactFileSubtitle,
@@ -175,7 +171,6 @@ import {
   artifactIconName,
   artifactKindPill,
   artifactSizeLabel,
-  artifactThumbnailUrl,
   canPreview,
   isOfficeArtifact,
 } from '@/utils/chat/artifacts'
@@ -184,7 +179,6 @@ const props = defineProps<{
   artifacts: ArtifactPayload[]
   navigationArtifacts?: ArtifactPayload[]
   sessionKey?: string
-  authToken?: string
   /** Route previewable document artifacts into the app-level Workbench. */
   preferWorkbench?: boolean
 }>()
@@ -197,7 +191,11 @@ const emit = defineEmits<{
 const { t } = useI18n()
 const { pushToast } = useToasts()
 const platform = usePlatform()
-const rpcStore = useRpcStore()
+const gatewayAccess = inject(GATEWAY_ACCESS_KEY)
+if (!gatewayAccess) throw new Error('GatewayAccess was not provided')
+const injectedArtifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
+if (!injectedArtifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
+const artifactWorkbench = injectedArtifactWorkbench
 
 const visualArtifacts = computed(() => props.artifacts.filter(artifact => artifactCategory(artifact) === 'visual'))
 const audioArtifacts = computed(() => props.artifacts.filter(artifact => artifactCategory(artifact) === 'audio'))
@@ -213,13 +211,7 @@ function artifactKey(artifact: ArtifactPayload): string {
 
 const webOwnerCanNativeOpen = computed(() => {
   if (platform.capabilities.isDesktop) return false
-  const auth = rpcStore.auth
-  const principal = auth && typeof auth === 'object' ? auth.principal : null
-  return Boolean(
-    principal &&
-    typeof principal === 'object' &&
-    (principal as Record<string, unknown>).isOwner === true,
-  )
+  return gatewayAccess.isLocalOwner
 })
 
 function artifactCanOpen(artifact: ArtifactPayload): boolean {
@@ -235,20 +227,6 @@ function artifactChipActionLabel(artifact: ArtifactPayload): string {
   return artifactCanOpen(artifact) ? 'Open' : 'Download'
 }
 
-function sameOrigin(url: string): boolean {
-  try {
-    return new URL(url, window.location.origin).origin === window.location.origin
-  } catch { return false }
-}
-
-function previewHeaders(url: string): Record<string, string> {
-  if (!sameOrigin(url)) return {}
-  const headers: Record<string, string> = {}
-  if (props.sessionKey) headers['x-opensquilla-session-key'] = props.sessionKey
-  if (props.authToken) headers.Authorization = `Bearer ${props.authToken}`
-  return headers
-}
-
 // Per-card thumbnail controllers. Each fetches the small `variant=thumb` webp
 // (or the full image when no thumbnail exists) only after the card scrolls into
 // view, through the shared concurrency-capped queue. The controller renders the
@@ -261,15 +239,9 @@ function controllerFor(artifact: ArtifactPayload): ArtifactPreviewController {
   let controller = controllers.get(key)
   if (!controller) {
     controller = createArtifactPreview({
-      resolveUrl: () => artifactThumbnailUrl(artifact, window.location.origin, {
-        sessionKey: props.sessionKey,
-        includeSessionKey: false,
-      }),
-      headers: () => previewHeaders(artifactThumbnailUrl(artifact, window.location.origin, {
-        sessionKey: props.sessionKey,
-        includeSessionKey: false,
-      })),
-      sameOrigin,
+      artifact: () => artifact,
+      sessionKey: () => props.sessionKey,
+      variant: 'thumbnail',
       fullSize: false,
     })
     controllers.set(key, controller)
@@ -316,10 +288,8 @@ async function openFile(artifact: ArtifactPayload) {
     return
   }
   if (platform.capabilities.canOpenArtifactsNatively && platform.files.openArtifact) {
-    const fetched = await fetchArtifactBlob(artifact, {
-      baseOrigin: window.location.origin,
+    const fetched = await artifactWorkbench.content.fetchArtifact(artifact, {
       sessionKey: props.sessionKey,
-      authToken: props.authToken,
     })
     if (!fetched.ok) {
       pushToast(fetched.message, { tone: 'danger' })
@@ -339,20 +309,16 @@ async function openFile(artifact: ArtifactPayload) {
   }
 
   if (isActiveDocumentArtifactCandidate(artifact)) {
-    const result = await openArtifactViaGateway(artifact, {
-      baseOrigin: window.location.origin,
+    const result = await artifactWorkbench.content.openArtifact(artifact, {
       sessionKey: props.sessionKey,
-      authToken: props.authToken,
     })
     if (result.ok) return
     pushToast(result.message, { tone: 'danger' })
     return
   }
 
-  const result = await openArtifactBlobUrl(artifact, {
-    baseOrigin: window.location.origin,
+  const result = await artifactWorkbench.content.openArtifactBlob(artifact, {
     sessionKey: props.sessionKey,
-    authToken: props.authToken,
   })
   if (result.ok) return
   pushToast(result.message, { tone: 'danger' })
@@ -368,10 +334,10 @@ function disposeStaleControllers() {
   }
 }
 
-// When the artifact set or auth changes, drop controllers whose card is gone so
+// When the artifact set or session changes, drop controllers whose card is gone so
 // their blob URLs are revoked promptly.
 watch(
-  () => [visualArtifacts.value.map(artifactKey).join('|'), props.sessionKey || '', props.authToken || ''],
+  () => [visualArtifacts.value.map(artifactKey).join('|'), props.sessionKey || ''],
   () => { disposeStaleControllers() },
 )
 

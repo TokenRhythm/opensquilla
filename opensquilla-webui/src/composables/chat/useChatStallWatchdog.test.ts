@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { ref, nextTick, effectScope, type EffectScope } from 'vue'
+import { conversationSemanticEventKind } from '@/adapters/gateway/conversationEventsV4'
 import {
   useChatStallWatchdog,
   SOFT_STALL_THRESHOLD_MS as THRESHOLD,
@@ -9,9 +10,17 @@ function harness(streamIdleGraceMs = 0) {
   const isStreaming = ref(false)
   const negotiatedGrace = ref(streamIdleGraceMs)
   const scope: EffectScope = effectScope()
-  let api!: ReturnType<typeof useChatStallWatchdog>
+  let api!: Omit<ReturnType<typeof useChatStallWatchdog>, 'noteEvent'> & {
+    noteEvent(eventName: string, payload?: unknown): void
+  }
   scope.run(() => {
-    api = useChatStallWatchdog({ isStreaming, streamIdleGraceMs: negotiatedGrace })
+    const semanticApi = useChatStallWatchdog({ isStreaming, streamIdleGraceMs: negotiatedGrace })
+    api = {
+      ...semanticApi,
+      noteEvent: (eventName: string, payload?: unknown) => (
+        semanticApi.noteEvent(conversationSemanticEventKind(eventName), payload)
+      ),
+    }
   })
   return { isStreaming, streamIdleGraceMs: negotiatedGrace, api, scope }
 }

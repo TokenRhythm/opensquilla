@@ -3,6 +3,9 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { parseMetaCommandInvocation, useChatSlashCommands } from './useChatSlashCommands'
 import type { RpcCallOptions } from '@/lib/rpc'
+import type { MetaRunCenter } from '@/modules/metaRunCenter'
+import type { MetaSetupReadiness } from '@/types/metaSetup'
+import { sessionConversationFromTestRpc } from '@/testing/sessionConversation.test-helper'
 
 function deferred() {
   let resolve!: () => void
@@ -15,13 +18,34 @@ function deferred() {
 function harness(
   planModeAvailable: boolean,
   commands: Array<Record<string, unknown>> = [],
-  waitForConnection: Promise<void> = Promise.resolve(),
+  ready: Promise<void> = Promise.resolve(),
   catalogCallOptions?: RpcCallOptions,
 ) {
   const inputText = ref('')
   const rpc = {
-    waitForConnection: vi.fn(() => waitForConnection),
+    ready: vi.fn(() => ready),
     call: vi.fn().mockResolvedValue({ commands }),
+  }
+  const metaRunCenter: MetaRunCenter = {
+    launch: vi.fn(async input => {
+      const raw = await rpc.call('meta.run', input) as Record<string, unknown>
+      return {
+        ok: raw.ok === true,
+        error: typeof raw.error === 'string' ? raw.error : undefined,
+        drafted: raw.drafted === true,
+        setupRequired: raw.setup_required === true,
+        readiness: raw.readiness as MetaSetupReadiness | undefined,
+      }
+    }),
+    listDrafts: vi.fn(async () => ({ drafts: [], durable: true })),
+    discardDraft: vi.fn(async () => ({ discarded: true, accepted: false })),
+    recover: vi.fn(async () => null),
+    confirmPreflight: vi.fn(async () => ({})),
+    replay: vi.fn(async () => ({})),
+    setupPlan: vi.fn(async () => ({})),
+    setupStatus: vi.fn(async () => ({})),
+    setupInstall: vi.fn(async () => ({})),
+    subscribe: vi.fn(() => ({ close: vi.fn() })),
   }
   const activatePlanMode = vi.fn(async () => true)
   const codingModeEnabled = ref(false)
@@ -40,7 +64,8 @@ function harness(
   const goalResume = vi.fn(async () => true)
   const goalClear = vi.fn(async () => true)
   const api = useChatSlashCommands({
-    rpc,
+    sessionConversation: sessionConversationFromTestRpc(rpc),
+    metaRunCenter,
     catalogCallOptions,
     inputText,
     sessionKey: ref('agent:main:webchat:test'),
@@ -114,7 +139,7 @@ describe('useChatSlashCommands plan compatibility', () => {
       catalogCallOptions,
     )
     await api.loadSlashCommands()
-    expect(rpc.waitForConnection).toHaveBeenCalledWith(
+    expect(rpc.ready).toHaveBeenCalledWith(
       2_000,
       undefined,
       {

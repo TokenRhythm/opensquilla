@@ -1,20 +1,9 @@
 import type { DurableMetaDraft } from '@/composables/chat/useChatSlashCommands'
+import type { MetaDraftQuery, MetaRunCenter } from '@/modules/metaRunCenter'
 import {
   isAuthoritativeSessionSubscription,
   type SessionSubscriptionResult,
 } from '@/composables/chat/useChatSessionSubscription'
-import type { MetaDraftsListResponse } from '@/types/rpc'
-
-const META_DRAFTS_LIST_METHOD = 'meta.drafts.list'
-
-export type MetaDraftQuery = { sessionKey?: string, agentId?: string }
-
-export interface MetaDraftListRpc {
-  waitForConnection: (timeoutMs?: number) => Promise<void>
-  supportsMethod: (method: string) => boolean
-  markMethodUnavailable: (method: string) => void
-  call: (method: string, params?: Record<string, unknown>) => Promise<unknown>
-}
 
 export interface MetaDraftListResult {
   drafts: DurableMetaDraft[]
@@ -28,24 +17,17 @@ function isMethodNotFound(error: unknown): boolean {
 }
 
 export async function queryServerMetaDrafts(
-  rpc: MetaDraftListRpc,
+  center: MetaRunCenter,
   query: MetaDraftQuery,
 ): Promise<MetaDraftListResult> {
   try {
-    // waitForConnection resolves after hello has populated the advertised method
-    // set, so mixed-version gateways never receive an unsupported request.
-    await rpc.waitForConnection(15_000)
-    if (!rpc.supportsMethod(META_DRAFTS_LIST_METHOD)) {
-      return { drafts: [], retryable: false }
-    }
-    const result = await rpc.call(META_DRAFTS_LIST_METHOD, query) as MetaDraftsListResponse
+    const result = await center.listDrafts(query)
     return {
-      drafts: Array.isArray(result?.drafts) ? result.drafts : [],
+      drafts: Array.isArray(result?.drafts) ? [...result.drafts] : [],
       retryable: false,
     }
   } catch (error) {
     const unavailable = isMethodNotFound(error)
-    if (unavailable) rpc.markMethodUnavailable(META_DRAFTS_LIST_METHOD)
     // Browser outboxes remain the compatibility fallback for older or
     // temporarily unavailable gateways.
     return { drafts: [], retryable: !unavailable }
@@ -53,10 +35,10 @@ export async function queryServerMetaDrafts(
 }
 
 export async function listServerMetaDrafts(
-  rpc: MetaDraftListRpc,
+  center: MetaRunCenter,
   query: MetaDraftQuery,
 ): Promise<DurableMetaDraft[]> {
-  return (await queryServerMetaDrafts(rpc, query)).drafts
+  return (await queryServerMetaDrafts(center, query)).drafts
 }
 
 export interface ChatMetaDraftRecoveryOptions {

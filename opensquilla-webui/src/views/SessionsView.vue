@@ -129,7 +129,6 @@
 import { computed, inject, onActivated, onDeactivated, onUnmounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
-import { useRpcStore } from '@/stores/rpc'
 import Icon from '@/components/Icon.vue'
 import ErrorState from '@/components/ErrorState.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
@@ -157,12 +156,11 @@ import { sessionAgentIdentity } from '@/components/sessions/sessionDisplay'
 import { SESSION_DIRECTORY_KEY } from '@/modules/sessionDirectory'
 import { SESSION_DIRECTORY_CHANGES_KEY } from '@/modules/sessionDirectoryChanges'
 import { SESSION_LIFECYCLE_KEY } from '@/modules/sessionLifecycle'
+import { APPROVAL_CENTER_KEY, type ApprovalEvent } from '@/modules/approvalCenter'
+import { OBSERVABILITY_KEY } from '@/modules/observability'
+import { AGENT_CATALOG_KEY } from '@/modules/agentCatalog'
 
 type FilterId = 'all' | 'chats' | 'automations' | 'channels'
-
-interface AgentsListResponse {
-  agents?: Array<{ id?: string; name?: string }>
-}
 
 const FILTER_CHIPS: Array<{ id: FilterId; labelKey: string }> = [
   { id: 'all', labelKey: 'sessions.filter.all' },
@@ -183,7 +181,6 @@ const SESSIONS_VIEW_SYNC_SOURCE = 'sessions-view'
 
 const { t } = useI18n()
 const router = useRouter()
-const rpc = useRpcStore()
 const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
 if (!injectedSessionDirectory) throw new Error('SessionDirectory was not provided')
 const sessionDirectory = injectedSessionDirectory
@@ -193,6 +190,15 @@ const sessionDirectoryChanges = injectedSessionDirectoryChanges
 const injectedSessionLifecycle = inject(SESSION_LIFECYCLE_KEY)
 if (!injectedSessionLifecycle) throw new Error('SessionLifecycle was not provided')
 const sessionLifecycle = injectedSessionLifecycle
+const injectedApprovalCenter = inject(APPROVAL_CENTER_KEY)
+if (!injectedApprovalCenter) throw new Error('ApprovalCenter was not provided')
+const approvalCenter = injectedApprovalCenter
+const injectedObservability = inject(OBSERVABILITY_KEY)
+if (!injectedObservability) throw new Error('Observability was not provided')
+const observability = injectedObservability
+const injectedAgentCatalog = inject(AGENT_CATALOG_KEY)
+if (!injectedAgentCatalog) throw new Error('AgentCatalog was not provided')
+const agentCatalog = injectedAgentCatalog
 const { confirm } = useConfirm()
 const {
   sessionsList,
@@ -296,10 +302,10 @@ const inspectAgentName = computed(() => {
 async function loadAgents() {
   const generation = ++agentsRequestGeneration
   try {
-    const data = await rpc.call<AgentsListResponse>('agents.list')
+    const agents = await agentCatalog.list()
     if (generation !== agentsRequestGeneration) return
     agentNames.value = new Map(
-      (data?.agents || [])
+      agents
         .filter(agent => agent.id)
         .map(agent => [String(agent.id), String(agent.name || agent.id)]))
     agentsLoaded.value = true
@@ -312,22 +318,11 @@ async function loadAgents() {
   }
 }
 
-function approvalAuthHeaders(): Record<string, string> {
-  const headers: Record<string, string> = {}
-  try {
-    const token = sessionStorage.getItem('opensquilla.wsToken') || ''
-    if (token) headers['Authorization'] = `Bearer ${token}`
-  } catch { /* ignore */ }
-  return headers
-}
-
 async function refreshApprovals() {
   try {
-    const res = await fetch('/api/approvals', { headers: approvalAuthHeaders() })
-    if (!res.ok) return
-    const data = await res.json() as { pending?: Array<{ sessionKey?: string }> }
-    pendingApprovals.value = (data.pending || [])
-      .map(item => String(item.sessionKey || '').trim())
+    const snapshot = await approvalCenter.snapshot()
+    pendingApprovals.value = snapshot.pending
+      .map(item => item.sessionKey.trim())
       .filter(Boolean)
   } catch {
     // Strip keeps the last known count.
@@ -336,7 +331,7 @@ async function refreshApprovals() {
 
 async function refreshCost() {
   try {
-    const snapshot = await requestUsageSnapshot(rpc, 'today', {
+    const snapshot = await requestUsageSnapshot(observability, 'today', {
       days: false,
       models: false,
       sessions: false,
@@ -397,12 +392,12 @@ function handleLocalSessionsDeleted(event: Event) {
   scheduleSessionRefresh()
 }
 
-function handleApprovalPush() {
+function handleApprovalPush(_event: ApprovalEvent) {
   void refreshApprovals()
 }
 
-function handleConnectionState(state: unknown) {
-  if (state === 'connected') scheduleSessionRefresh()
+function handleApprovalAvailability(state: 'available' | 'recovering' | 'unavailable') {
+  if (state === 'available') scheduleSessionRefresh()
 }
 
 // ---------------------------------------------------------------------------
@@ -506,13 +501,12 @@ onActivated(() => {
   const directoryChangesSubscription = sessionDirectoryChanges.subscribe(() => {
     scheduleSessionRefresh()
   })
+  const approvalSubscription = approvalCenter.subscribe(handleApprovalPush)
+  const approvalAvailabilitySubscription = approvalCenter.subscribeAvailability(handleApprovalAvailability)
   unsubs = [
     () => directoryChangesSubscription.close(),
-    rpc.on('exec.approval.requested', handleApprovalPush),
-    rpc.on('exec.approval.resolved', handleApprovalPush),
-    rpc.on('plugin.approval.requested', handleApprovalPush),
-    rpc.on('plugin.approval.resolved', handleApprovalPush),
-    rpc.on('_state', handleConnectionState),
+    () => approvalSubscription.close(),
+    () => approvalAvailabilitySubscription.close(),
   ]
   pollTimer = setInterval(loadAll, FALLBACK_POLL_MS)
 })

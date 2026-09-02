@@ -5,30 +5,71 @@ import { createGatewayAdapters } from './gatewayAdapters'
 
 describe('Gateway Adapter composition', () => {
   it('exposes domain Modules without exposing the private transports', async () => {
-    const call = vi.fn(async () => ({ sessions: [] })) as <T = unknown>(
+    const call = vi.fn(async (method: string) => (
+      method === 'sessions.pending_inputs.list'
+        ? { items: [] }
+        : { sessions: [] }
+    )) as <T = unknown>(
       method: string,
       params?: Record<string, unknown>,
       options?: RpcCallOptions,
     ) => Promise<T>
     const adapters = createGatewayAdapters({
+      state: 'connected',
+      error: null,
+      isLocalOwner: true,
+      canManageProjectWorkspaces: true,
+      canChooseProject: true,
+      auth: { principal: { authState: 'authenticated' } },
+      policy: null,
       connectionGeneration: 1,
+      connect: vi.fn(async () => undefined),
+      disconnect: vi.fn(),
+      recoverConnectionGeneration: vi.fn(() => true),
       call,
       on: vi.fn((_event: string, _handler: RpcEventHandler) => vi.fn()),
-      supportsMethod: vi.fn(() => true),
-      supportsEvent: vi.fn(() => true),
-      markMethodUnavailable: vi.fn(),
-      waitForConnection: vi.fn(async () => undefined),
+      hasRpcMethod: vi.fn(() => true),
+      hasRpcEvent: vi.fn(() => true),
+      rememberUnsupportedMethod: vi.fn(),
+      ready: vi.fn(async () => undefined),
     })
 
     expect(Object.keys(adapters)).toEqual([
+      'gatewayAccess',
+      'conversationEvents',
+      'sessionReadLifecycleFactory',
+      'sessionInspection',
       'sessionDirectory',
       'sessionDirectoryChanges',
       'sessionLifecycle',
       'sessionRouting',
       'turnCommands',
+      'pendingInputQueue',
+      'approvalCenter',
+      'goalCenter',
+      'goalContinuity',
+      'planCenter',
+      'metaRunCenter',
+      'appSettings',
+      'providerConfiguration',
+      'setupWorkflow',
+      'migrationOperations',
+      'workspaceCatalog',
+      'sandboxRuntime',
+      'sessionConversation',
+      'observability',
+      'skillCatalog',
+      'agentCatalog',
+      'cronScheduler',
+      'channelAdministration',
+      'channelSetup',
+      'artifactWorkbench',
+      'memoryProfileImport',
+      'audioTranscription',
     ])
     expect(adapters).not.toHaveProperty('rpc')
     expect(adapters).not.toHaveProperty('events')
+    expect(adapters).not.toHaveProperty('sessionReadPort')
     await expect(adapters.sessionDirectory.listPage({ limit: 10 })).resolves.toEqual({
       items: [],
       hasMore: false,
@@ -46,5 +87,7 @@ describe('Gateway Adapter composition', () => {
       { sessionKey: 'agent:main:test', source: 'test' },
       undefined,
     )
+
+    await expect(adapters.pendingInputQueue.list('agent:main:test')).resolves.toEqual([])
   })
 })

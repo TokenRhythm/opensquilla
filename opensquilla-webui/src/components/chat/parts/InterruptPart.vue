@@ -46,7 +46,7 @@ const emit = defineEmits<{
 function toApprovalItem(data: InterruptApprovalData): ChatApprovalItem {
   return {
     id: data.approvalId,
-    namespace: data.namespace,
+    namespace: data.namespace === 'plugin' ? 'plugin' : 'exec',
     toolName: data.toolName,
     command: data.command,
     approvalKind: data.approvalKind,

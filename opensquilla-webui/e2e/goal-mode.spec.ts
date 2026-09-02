@@ -2,6 +2,12 @@ import { expect, test, type Page } from '@playwright/test'
 
 import { startRealGoalGateway } from './real-goal-gateway'
 import { test as isolatedGatewayTest } from './real-gateway.fixture'
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-goal-mode'
@@ -173,11 +179,7 @@ async function installFakeGoalGateway(
 
       const payloads: Record<string, unknown> = {
         'agents.list': { agents: [] },
-        'chat.history': {
-          messages: [],
-          has_more: false,
-          canonical_complete: true,
-        },
+        'chat.history': chatHistoryPayload(),
         'commands.list_for_surface': {
           commands: [{
             name: '/goal',
@@ -203,33 +205,23 @@ async function installFakeGoalGateway(
         'models.routing.get': { mode: 'direct' },
         'onboarding.status': { audioConfigured: false },
         'sessions.list': { sessions: [], has_more: false },
-        'sessions.messages.snapshot': {
-          key: SESSION_KEY,
-          events: [],
+        'sessions.messages.snapshot': sessionMessagesSnapshotPayload(SESSION_KEY, {
           current_stream_seq: 0,
-        },
-        'sessions.messages.subscribe': {
-          key: SESSION_KEY,
+        }),
+        'sessions.messages.subscribe': sessionMessagesSubscribePayload(SESSION_KEY, {
           sessionId: SESSION_ID,
           epoch: 1,
-          subscribed: true,
           hydration_complete: false,
-          replay_complete: true,
-          current_stream_seq: 0,
-          run_status: 'idle',
           goal: null,
           goalSnapshotStreamSeq: null,
           deferred_fields: ['goal', 'goalSnapshotStreamSeq'],
-        },
-        'sessions.messages.hydrate': {
-          key: SESSION_KEY,
+        }),
+        'sessions.messages.hydrate': sessionMessagesHydratePayload(SESSION_KEY, {
           sessionId: SESSION_ID,
           epoch: 1,
-          hydration_complete: true,
-          run_status: 'idle',
           goal: null,
           goalSnapshotStreamSeq: 0,
-        },
+        }),
         'sessions.routing.get': {
           sessionKey: SESSION_KEY,
           mode: 'direct',

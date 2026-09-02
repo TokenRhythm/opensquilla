@@ -7,7 +7,7 @@ import { createPinia } from 'pinia'
 
 import en from '@/locales/en.json'
 import type { ArtifactDocumentWorkspaceSnapshot } from '@/types/artifactDocuments'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import { createLegacyArtifactWorkspace } from '@/workbench/artifactDocumentProvider'
 import {
   artifactPayloadFromWorkbenchResource,

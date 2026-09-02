@@ -559,7 +559,7 @@
       "builtin": "Integrado",
       "actions": { "add": "Añadir", "remove": "Quitar", "retry": "Reintentar", "copy": "Copiar", "saving": "Guardando…", "redetect": "Volver a detectar" },
       "mode": {
-        "title": "Modo de acceso predeterminado", "description": "Elige el modo inicial de las tareas nuevas. Seguro no se puede seleccionar si falla la comprobación.",
+        "title": "Modo de acceso predeterminado", "description": "Configura el modo de acceso global. Al elegir Seguro por primera vez se abre la configuración del entorno aislado; no se puede seleccionar si falla la inicialización o no es compatible.",
         "default": "Modo predeterminado", "safe": "Seguro", "full": "Acceso completo", "resetWarning": "Volver a mostrar el aviso al iniciar"
       },
       "setup": {

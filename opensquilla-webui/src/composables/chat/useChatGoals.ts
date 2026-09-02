@@ -1,7 +1,8 @@
 import { computed, onBeforeUnmount, ref, watch, type Ref } from 'vue'
-import type { SessionMessagesSubscribeResponse } from '@/types/rpc'
 import { localizeGoalRpcError } from '@/lib/rpcErrors'
 import { createClientRequestId } from '@/utils/chat/messageIdentity'
+import type { GoalCenter } from '@/modules/goalCenter'
+import type { GoalContinuity, GoalEvent } from '@/modules/goalContinuity'
 
 export type GoalStatus = 'active' | 'paused' | 'blocked' | 'usage_limited' | 'complete'
 export type GoalExecutionState = 'idle' | 'queued' | 'working'
@@ -83,15 +84,6 @@ export interface GoalSetAcceptedPayload {
   response: GoalMutationResponse
 }
 
-interface GoalReattachResponse {
-  accepted: true
-  sessionKey: string
-  sessionId: string
-  epoch: number
-  goal: GoalSnapshot
-  continuityToken?: string
-}
-
 export interface GoalContinuityStorage {
   readonly length: number
   key: (index: number) => string | null
@@ -100,20 +92,11 @@ export interface GoalContinuityStorage {
   removeItem: (key: string) => void
 }
 
-interface GoalStatusResult {
-  goal?: unknown
-}
-
-type RpcClient = {
-  call: <T = unknown>(
-    method: string,
-    params?: Record<string, unknown>,
-  ) => Promise<T>
-  on: (event: string, handler: (...args: unknown[]) => void) => () => void
-}
-
 export interface UseChatGoalsOptions {
-  rpc: RpcClient
+  /** Domain GoalCenter owns goals.status/set wire mapping. */
+  goalCenter: GoalCenter
+  /** Domain GoalContinuity owns lease reattachment and Goal event decoding. */
+  goalContinuity: GoalContinuity
   sessionKey: Ref<string>
   currentEpoch?: Ref<number>
   /** Current Gateway transport namespace, owned by the message subscription. */
@@ -751,7 +734,7 @@ export function useChatGoals(options: UseChatGoalsOptions) {
     return applySnapshot(source, { allowClear: true })
   }
 
-  function applyHydration(value: SessionMessagesSubscribeResponse | unknown): boolean {
+  function applyHydration(value: unknown): boolean {
     const source = record(value)
     if (!source) return false
     observeTransportGeneration(source)
@@ -778,15 +761,12 @@ export function useChatGoals(options: UseChatGoalsOptions) {
     return applied
   }
 
-  function onGoalEvent(payload: unknown) {
-    const source = record(payload)
-    if (!source) return
-    observeTransportGeneration(source)
-    const eventType = stringField(source, 'eventType', 'event_type')
-    const applied = applySnapshot(source, {
-      allowClear: eventType === 'cleared',
+  function onGoalEvent(event: GoalEvent) {
+    observeTransportGeneration(event)
+    const applied = applySnapshot(event, {
+      allowClear: event.eventType === 'cleared',
     })
-    if (applied) discardInvalidContinuity(goal.value, envelopeSessionKey(source))
+    if (applied) discardInvalidContinuity(goal.value, event.sessionKey ?? undefined)
   }
 
   function discardInvalidContinuity(
@@ -875,7 +855,7 @@ export function useChatGoals(options: UseChatGoalsOptions) {
     connectionTakeoverAvailable.value = false
     void (async () => {
       try {
-        const response = await options.rpc.call<GoalReattachResponse>('goals.reattach', {
+        const response = await options.goalContinuity.reattach({
           sessionKey: current.sessionKey,
           sessionId: current.sessionId,
           epoch: current.epoch,
@@ -931,7 +911,7 @@ export function useChatGoals(options: UseChatGoalsOptions) {
     mutationOwner = owner
     busy.value = true
     try {
-      const response = await options.rpc.call<GoalReattachResponse>('goals.reattach', {
+      const response = await options.goalContinuity.reattach({
         sessionKey: current.sessionKey,
         sessionId: current.sessionId,
         epoch: current.epoch,
@@ -974,12 +954,25 @@ export function useChatGoals(options: UseChatGoalsOptions) {
       busy.value = true
       const clientRequestId = createClientRequestId()
       const clientMessageId = createClientRequestId()
-      const response = await options.rpc.call<GoalMutationResponse>('goals.set', {
+      const result = await options.goalCenter.set({
         sessionKey: key,
         objective,
         clientRequestId,
         clientMessageId,
       })
+      if (result.accepted !== true) return false
+      const response: GoalMutationResponse = {
+        accepted: true,
+        clientRequestId: result.clientRequestId ?? clientRequestId,
+        sessionKey: result.sessionKey ?? key,
+        sessionId: result.sessionId ?? '',
+        epoch: result.epoch ?? options.currentEpoch?.value ?? 0,
+        taskId: result.taskId ?? null,
+        userMessageId: result.userMessageId ?? null,
+        previousGoalId: result.previousGoalId ?? null,
+        goal: normalizeGoal(result.goal),
+        ...(result.continuityToken ? { continuityToken: result.continuityToken } : {}),
+      }
       if (owner !== mutationOwner || key !== options.sessionKey.value) return false
       const applied = applyMutationResponse(response)
       if (applied) {
@@ -1024,13 +1017,22 @@ export function useChatGoals(options: UseChatGoalsOptions) {
     mutationOwner = owner
     busy.value = true
     try {
-      const response = await options.rpc.call<GoalMutationResponse>(method, {
+      const input = {
         sessionKey: key,
         clientRequestId: createClientRequestId(),
         expectedGoalId: current.goalId,
         expectedStateRevision: current.stateRevision,
         ...params,
-      })
+      }
+      const response = await (
+        method === 'goals.edit'
+          ? options.goalCenter.edit(input as never)
+          : method === 'goals.pause'
+            ? options.goalCenter.pause(input)
+            : method === 'goals.resume'
+              ? options.goalCenter.resume(input)
+              : options.goalCenter.clear(input)
+      )
       if (owner !== mutationOwner || key !== options.sessionKey.value) return false
       const applied = applyMutationResponse(response)
       if ((method === 'goals.resume' || method === 'goals.edit') && applied) {
@@ -1069,12 +1071,12 @@ export function useChatGoals(options: UseChatGoalsOptions) {
   async function status(): Promise<GoalSnapshot | null> {
     const key = options.sessionKey.value
     if (!key) return null
-    const result = await options.rpc.call<GoalStatusResult>('goals.status', { sessionKey: key })
-    const snapshot = normalizeGoal(result?.goal)
+    const result = await options.goalCenter.status(key)
+    const snapshot = normalizeGoal(result.goal)
     return snapshot?.sessionKey === key ? snapshot : null
   }
 
-  const unsubscribeGoal = options.rpc.on('session.event.goal', onGoalEvent)
+  const goalSubscription = options.goalContinuity.subscribe(onGoalEvent)
 
   watch(options.sessionKey, () => {
     disarm()
@@ -1102,7 +1104,7 @@ export function useChatGoals(options: UseChatGoalsOptions) {
     }, { flush: 'sync' })
   }
 
-  onBeforeUnmount(unsubscribeGoal)
+  onBeforeUnmount(() => goalSubscription.close())
 
   return {
     draftArmed,
