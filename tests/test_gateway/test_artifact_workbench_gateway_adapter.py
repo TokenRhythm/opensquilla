@@ -63,6 +63,38 @@ async def test_invalid_identity_fails_before_the_existing_implementation() -> No
     assert calls == 0
 
 
+@pytest.mark.asyncio
+async def test_prompt_annotation_create_preserves_an_explicit_empty_body() -> None:
+    calls: list[dict[str, Any] | None] = []
+
+    async def implementation(
+        params: dict[str, Any] | None, ctx: RpcContext
+    ) -> dict[str, Any]:
+        del ctx
+        calls.append(params)
+        return {"annotation": {}}
+
+    params = {
+        "sessionKey": "session-1",
+        "annotationId": "ann_12345678901234567890123456789012",
+        "documentId": "document-1",
+        "revisionId": "revision-1",
+        "selection": {
+            "selectionId": "selection-1",
+            "tagName": "img",
+            "elementPath": "[[\"\",\"img\",1]]",
+            "elementProofSha256": "a" * 64,
+        },
+        "body": "",
+    }
+    handler = GatewayArtifactWorkbenchAdapter.bind(
+        "artifacts.prompt_annotations.create", implementation
+    )
+
+    assert await handler(params, cast(RpcContext, object())) == {"annotation": {}}
+    assert calls == [params]
+
+
 def test_all_workbench_methods_have_generated_descriptors_and_guest_policy() -> None:
     assert len(ARTIFACT_WORKBENCH_CONTRACT_METHODS) == 30
     assert all(

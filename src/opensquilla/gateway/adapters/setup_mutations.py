@@ -143,7 +143,7 @@ class OnboardingSetupMutationPort(
             config,
             mode=command.mode,
             default_tier=command.default_tier,
-            tiers=command.tiers,
+            tiers=dict(command.tiers) if command.tiers is not None else None,
             cross_provider_tiers=command.cross_provider_tiers,
             tier_provider_mismatch=command.tier_provider_mismatch,
         )
@@ -155,8 +155,14 @@ class OnboardingSetupMutationPort(
             config,
             enabled=command.enabled,
             selection_mode=command.selection_mode,
-            model_options=command.model_options,
-            candidates=command.candidates,
+            model_options=(
+                list(command.model_options)
+                if command.model_options is not None
+                else None
+            ),
+            candidates=(
+                list(command.candidates) if command.candidates is not None else None
+            ),
             min_successful_proposers=command.min_successful_proposers,
             proposer_max_retries=command.proposer_max_retries,
             all_failed_policy=command.all_failed_policy,

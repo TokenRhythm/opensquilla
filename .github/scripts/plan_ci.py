@@ -143,6 +143,7 @@ _WEBUI_BOUNDARY_EXACT: Final = frozenset(
         "opensquilla-webui/src/lib/rpc.ts",
         "opensquilla-webui/src/main.ts",
         "opensquilla-webui/src/stores/rpc.ts",
+        "src/opensquilla/application/artifact_workbench.py",
     }
 )
 _SKILL_HUB_TESTS: Final = frozenset(

@@ -327,6 +327,9 @@ class GatewayArtifactWorkbenchAdapter:
             )
         elif method == "artifacts.prompt_annotations.create":
             selection = self._mapping("selection")
+            raw_body = p.get("body")
+            if raw_body is not None and not isinstance(raw_body, str):
+                raise ValueError("body must be a string")
             result = await PromptAnnotationApplication(cast(PromptAnnotationPort, port)).create(
                 PromptAnnotationCreate(
                     self._text("sessionKey"),
@@ -340,7 +343,7 @@ class GatewayArtifactWorkbenchAdapter:
                         self._mapping_optional_text(selection, "domSha256"),
                     ),
                     self._optional_text("revisionId"),
-                    self._optional_text("body"),
+                    cast(str | None, raw_body),
                 )
             )
         elif method == "artifacts.prompt_annotations.focus":

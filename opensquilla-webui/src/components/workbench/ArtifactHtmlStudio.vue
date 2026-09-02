@@ -62,6 +62,7 @@ import EditorWorker from 'monaco-editor/editor/editor.worker.js?worker'
 import HtmlWorker from 'monaco-editor/language/html/html.worker.js?worker'
 
 import Icon from '@/components/Icon.vue'
+import type { PatchArtifactSource } from '@/modules/artifactWorkbench'
 import { useArtifactDocumentsStore } from '@/stores/artifactDocuments'
 import type {
   ArtifactDocument,
@@ -159,7 +160,7 @@ let autosaveBlocked = false
 type PendingSourceMutation = {
   logicalKey: string
   requestId: string
-  request: Readonly<Record<string, unknown>>
+  request: PatchArtifactSource
   baseline: ArtifactSourceSnapshot
   content: string
 }
@@ -844,7 +845,15 @@ async function commitCurrentSnapshot(): Promise<boolean> {
       patch.replacement,
     ])
     const requestId = pendingSourceRequestIds.idFor(logicalSaveKey, 'document-save')
-    const request: Record<string, unknown> = {
+    const requiresEditSession = editSessionMode.value !== 'legacy'
+    const currentSession = requiresEditSession
+      ? assertActiveEditSession(editSession.value)
+      : null
+    if (currentSession && currentSession.lastSavedRevisionId !== baseline.revisionId) {
+      enterHeadConflict(artifactProductClientError('DOCUMENT_CHANGED'))
+      return false
+    }
+    const request: PatchArtifactSource = {
       sessionKey: props.sessionKey,
       documentId: props.document.documentId,
       expectedHeadRevisionId: baseline.revisionId,
@@ -853,25 +862,19 @@ async function commitCurrentSnapshot(): Promise<boolean> {
       offsetEncoding: SOURCE_OFFSET_ENCODING,
       patches: [patch],
       clientRequestId: requestId,
-    }
-    const requiresEditSession = editSessionMode.value !== 'legacy'
-    const currentSession = requiresEditSession
-      ? assertActiveEditSession(editSession.value)
-      : null
-    if (currentSession) {
-      if (currentSession.lastSavedRevisionId !== baseline.revisionId) {
-        enterHeadConflict(artifactProductClientError('DOCUMENT_CHANGED'))
-        return false
-      }
-      request.editSessionId = currentSession.editSessionId
-      request.expectedEditSessionStateRevision = currentSession.stateRevision
-      request.expectedLastSavedRevisionId = currentSession.lastSavedRevisionId
+      ...(currentSession
+        ? {
+            editSessionId: currentSession.editSessionId,
+            expectedEditSessionStateRevision: currentSession.stateRevision,
+            expectedLastSavedRevisionId: currentSession.lastSavedRevisionId,
+          }
+        : {}),
     }
     const frozenRequest = pendingSourceRequestIds.freeze(
       logicalSaveKey,
       requestId,
-      request,
-    )
+      request as PatchArtifactSource & Readonly<Record<string, unknown>>,
+    ) as PatchArtifactSource
     const pending: PendingSourceMutation = {
       logicalKey: logicalSaveKey,
       requestId,

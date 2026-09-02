@@ -31,6 +31,9 @@ from opensquilla.onboarding.redaction import is_redacted_secret_sentinel
 from opensquilla.search.types import DEFAULT_SEARCH_MAX_RESULTS
 
 if TYPE_CHECKING:
+    from opensquilla.application.capability_setup import CapabilitySetup
+    from opensquilla.application.profile_lifecycle import ProfileLifecycle
+    from opensquilla.application.provider_setup import ProviderSetup
     from opensquilla.application.setup_workflow import SetupWorkflow
     from opensquilla.onboarding.config_store import CredentialBackupRedaction
     from opensquilla.onboarding.probe import ProviderProbeResult
@@ -518,7 +521,7 @@ def _setup_mutation_port() -> Any:
     return OnboardingSetupMutationPort()
 
 
-def _provider_setup(ctx: RpcContext) -> Any:
+def _provider_setup(ctx: RpcContext) -> ProviderSetup:
     from opensquilla.application.provider_setup import ProviderSetup
 
     config, runtime = _setup_application_ports(ctx)
@@ -530,7 +533,7 @@ def _provider_setup(ctx: RpcContext) -> Any:
     )
 
 
-def _capability_setup(ctx: RpcContext) -> Any:
+def _capability_setup(ctx: RpcContext) -> CapabilitySetup:
     from opensquilla.application.capability_setup import CapabilitySetup
 
     config, runtime = _setup_application_ports(ctx)
@@ -601,7 +604,7 @@ def _profile_probe_command(params: Any) -> Any:
     )
 
 
-def _profile_lifecycle(ctx: RpcContext) -> Any:
+def _profile_lifecycle(ctx: RpcContext) -> ProfileLifecycle:
     from opensquilla.application.profile_lifecycle import ProfileLifecycle
 
     config, runtime = _setup_application_ports(ctx)
@@ -786,21 +789,21 @@ async def _provider_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
         ConfigurePrimaryProvider,
     )
 
-    command = ConfigurePrimaryProvider(
-        provider_id=str(_require(params, "providerId")),
-        model=str(_param(params, "model", "")),
-        api_key=str(_param(params, "apiKey", "")),
-        api_key_env=str(_param(params, "apiKeyEnv", "")),
-        preserve_api_key=_bool_param(params, "preserveApiKey"),
-        base_url=str(_param(params, "baseUrl", "")),
-        proxy=str(_param(params, "proxy", "")),
-        preset_id=str(_param(params, "presetId", "")),
-        router_action=str(_param(params, "routerAction", "preserve")),
-        image_generation_intent=str(
-            _param(params, "imageGenerationIntent", "preserve")
-        ),
-    )
     with _validation_error("onboarding.provider.invalid"):
+        command = ConfigurePrimaryProvider(
+            provider_id=str(_require(params, "providerId")),
+            model=str(_param(params, "model", "")),
+            api_key=str(_param(params, "apiKey", "")),
+            api_key_env=str(_param(params, "apiKeyEnv", "")),
+            preserve_api_key=_bool_param(params, "preserveApiKey"),
+            base_url=str(_param(params, "baseUrl", "")),
+            proxy=str(_param(params, "proxy", "")),
+            preset_id=str(_param(params, "presetId", "")),
+            router_action=str(_param(params, "routerAction", "preserve")),
+            image_generation_intent=str(
+                _param(params, "imageGenerationIntent", "preserve")
+            ),
+        )
         result = await _provider_setup(ctx).configure_primary(command)
     return result.to_payload()
 

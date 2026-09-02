@@ -6,6 +6,9 @@ import re
 from typing import Any, cast
 
 from opensquilla.application.observability import (
+    _COLLECTION_INSPECT_COMMANDS as _APPLICATION_COLLECTION_INSPECT_COMMANDS,
+)
+from opensquilla.application.observability import (
     ReadinessDiagnostics,
     ReadinessQuery,
 )
@@ -31,6 +34,10 @@ from opensquilla.gateway.rpc_tools import (
 from opensquilla.sandbox.status import status_payload as _sandbox_status_payload
 
 _d = get_dispatcher()
+
+# Compatibility export for recovery-command consumers; the Application Module
+# remains the single owner of the command mapping.
+_COLLECTION_INSPECT_COMMANDS = _APPLICATION_COLLECTION_INSPECT_COMMANDS
 
 _UNKNOWN_SEARCH_PROVIDER_RE = re.compile(
     r"Unknown search provider ['\"]([^'\"]+)['\"]"
