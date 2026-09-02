@@ -63,6 +63,7 @@
             type="button"
             :data-action="btn.action"
             :data-step-id="btn.stepId || undefined"
+            :disabled="actionDisabled(btn.action)"
             @click="onActionClick(btn.action, btn.stepId)"
           >
             {{ btn.label }}
@@ -94,6 +95,7 @@ import {
 
 const props = defineProps<{
   run: MetaRibbonState
+  turnActionsDisabled?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -121,7 +123,12 @@ function onChipClick(stepId: string) {
 }
 
 function onActionClick(action: string, stepId: string | null) {
+  if (actionDisabled(action)) return
   emit('action', { action, stepId, runId: props.run.runId })
+}
+
+function actionDisabled(action: string): boolean {
+  return props.turnActionsDisabled === true && action !== 'show-detail'
 }
 </script>
 

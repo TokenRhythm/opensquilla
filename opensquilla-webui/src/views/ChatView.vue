@@ -305,11 +305,13 @@
             :state="metaRuns.preflights.value.get(runId)!.state"
             :phase="metaRuns.preflights.value.get(runId)!.phase"
             :error-text="metaRuns.preflights.value.get(runId)!.errorText"
+            :turn-actions-disabled="isCronSession"
             @action="metaRuns.onPreflightAction"
           />
           <MetaRibbon
             v-if="metaRuns.ribbons.value.has(runId)"
             :run="metaRuns.ribbons.value.get(runId)!"
+            :turn-actions-disabled="isCronSession"
             @action="metaRuns.onRibbonAction"
             @chip-select="metaRuns.onChipSelect"
           />
@@ -4229,6 +4231,7 @@ const metaRuns = useMetaRuns({
   // focus) so the vanilla guidance is not silently dropped.
   setComposerPlaceholder: (hint: string) => pushToast(hint, { duration: 6000 }),
   focusComposer: () => composerRef.value?.focusTextarea(),
+  turnActionsBlocked: () => isCronSession.value,
   pushToast,
 })
 

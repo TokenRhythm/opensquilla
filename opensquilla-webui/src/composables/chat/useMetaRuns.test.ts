@@ -12,7 +12,10 @@ type RpcCall = (
 
 function makeOptions(
   call: RpcCall,
-  extra: { observeStreamGeneration?: (payload: unknown) => boolean } = {},
+  extra: {
+    observeStreamGeneration?: (payload: unknown) => boolean
+    turnActionsBlocked?: () => boolean
+  } = {},
 ) {
   const sendComposerText = vi.fn()
   const sendHiddenReplay = vi.fn()
@@ -38,6 +41,7 @@ function makeOptions(
     currentEpoch: ref(1),
     lastStreamSeq,
     observeStreamGeneration: extra.observeStreamGeneration,
+    turnActionsBlocked: extra.turnActionsBlocked,
     sendHiddenConfirmation,
     sendHiddenReplay,
     scrollToStepCard: vi.fn(),
@@ -443,6 +447,54 @@ describe('useMetaRuns replay actions', () => {
 })
 
 describe('useMetaRuns preflight actions', () => {
+  it('does not confirm or replay when the selected session is read-only', async () => {
+    const call = vi.fn(async () => ({}))
+    const {
+      api,
+      sendComposerText,
+      sendHiddenConfirmation,
+      sendHiddenReplay,
+    } = makeOptions(call, { turnActionsBlocked: () => true })
+    api.preflights.value = new Map([
+      ['preflight-run', {
+        state: {
+          runId: 'preflight-run',
+          metaSkillName: 'meta-short-drama',
+          language: 'en',
+          interpretedRequest: 'Create a short drama',
+          missingFields: [],
+          assumptions: [],
+          fields: [],
+          outcome: 'video',
+          canSkip: true,
+          requiresGate: true,
+        },
+        phase: 'ready',
+        errorText: '',
+      }],
+    ])
+
+    await api.onPreflightAction({
+      action: 'continue',
+      runId: 'preflight-run',
+      metaSkillName: 'meta-short-drama',
+      interpretedRequest: 'Create a short drama',
+      missingFields: [],
+      confirmedFields: {},
+    })
+    await api.onRibbonAction({
+      action: 'retry-with-partial-context',
+      stepId: 'draft',
+      runId: 'failed-run',
+    })
+
+    expect(call).not.toHaveBeenCalled()
+    expect(sendHiddenConfirmation).not.toHaveBeenCalled()
+    expect(sendHiddenReplay).not.toHaveBeenCalled()
+    expect(sendComposerText).not.toHaveBeenCalled()
+    expect(api.preflights.value.get('preflight-run')?.phase).toBe('ready')
+  })
+
   it('does not send a confirmation into a session selected during the RPC', async () => {
     let resolveConfirmation: ((value: unknown) => void) | undefined
     const call = vi.fn(() => new Promise((resolve) => { resolveConfirmation = resolve }))

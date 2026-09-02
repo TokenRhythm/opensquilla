@@ -95,6 +95,8 @@ export interface UseMetaRunsOptions {
   /** Composer affordances (placeholder hint + focus) for switch-skill. */
   setComposerPlaceholder?: (text: string) => void
   focusComposer?: () => void
+  /** Permanent selected-session policy gate for actions that can start another turn. */
+  turnActionsBlocked?: () => boolean
   pushToast: (message: string, options?: { tone?: 'info' | 'danger'; duration?: number }) => void
 }
 
@@ -235,6 +237,7 @@ export function useMetaRuns(options: UseMetaRunsOptions) {
       setPreflightPhase(runId, 'cancelled')
       return
     }
+    if (options.turnActionsBlocked?.()) return
 
     // continue / defaults both confirm the preflight then fire the hidden send.
     const originatingSessionKey = sessionKey.value
@@ -290,6 +293,11 @@ export function useMetaRuns(options: UseMetaRunsOptions) {
 
   async function onRibbonAction(payload: { action: string; stepId: string | null; runId: string }) {
     const { action, runId, stepId } = payload
+
+    // Read-only sessions retain inspection actions, but no rescue action may
+    // prepare/consume a replay capability, stage a draft, or focus a hidden
+    // composer for a new turn.
+    if (options.turnActionsBlocked?.() && action !== 'show-detail') return
 
     if (action === 'retry-run') {
       // Resolve the selected run through the durable ledger. The latest visible
