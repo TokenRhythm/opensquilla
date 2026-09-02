@@ -412,57 +412,168 @@ interface TurnActivityRecord {
 }
 
 export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions) {
-  const pendingBackgroundReceiptClientIds = new Set<string>()
-  const backgroundReceiptTaskOwners = new Map<string, string>()
-
-  function beginBackgroundReceiptReplay(clientMessageId: string) {
-    const normalizedClientId = String(clientMessageId || '').trim()
-    if (normalizedClientId) pendingBackgroundReceiptClientIds.add(normalizedClientId)
+  interface BackgroundReceiptTask {
+    clientMessageId: string
+    terminalSeen: boolean
   }
 
-  function rememberBackgroundReceiptTask(clientMessageId: string, taskId: string) {
+  const pendingBackgroundReceiptClientIds = new Set<string>()
+  const backgroundReceiptClientIds = new Set<string>()
+  const backgroundReceiptTasks = new Map<string, BackgroundReceiptTask>()
+  const dirtyBackgroundReceiptClientIds = new Set<string>()
+  const reconciledBackgroundReceiptClientIds = new Set<string>()
+  let backgroundReceiptEditHeld = false
+
+  function rememberBackgroundReceiptClient(clientMessageId: string) {
+    const normalizedClientId = String(clientMessageId || '').trim()
+    if (!normalizedClientId) return
+    if (!backgroundReceiptClientIds.has(normalizedClientId) && backgroundReceiptClientIds.size >= 256) {
+      const oldestClientId = backgroundReceiptClientIds.values().next().value
+      if (typeof oldestClientId === 'string') {
+        backgroundReceiptClientIds.delete(oldestClientId)
+        dirtyBackgroundReceiptClientIds.delete(oldestClientId)
+        reconciledBackgroundReceiptClientIds.delete(oldestClientId)
+      }
+    }
+    backgroundReceiptClientIds.add(normalizedClientId)
+  }
+
+  function holdBackgroundReceiptReconciliation() {
+    backgroundReceiptEditHeld = true
+  }
+
+  function flushBackgroundReceiptReconciliationIfReady() {
+    if (backgroundReceiptEditHeld || dirtyBackgroundReceiptClientIds.size === 0) return
+    for (const clientMessageId of dirtyBackgroundReceiptClientIds) {
+      reconciledBackgroundReceiptClientIds.add(clientMessageId)
+    }
+    dirtyBackgroundReceiptClientIds.clear()
+    options.scheduleHistorySync()
+  }
+
+  function releaseBackgroundReceiptReconciliation() {
+    backgroundReceiptEditHeld = false
+    flushBackgroundReceiptReconciliationIfReady()
+  }
+
+  function beginBackgroundReceiptReplay(clientMessageId: string, holdHistory = false) {
+    const normalizedClientId = String(clientMessageId || '').trim()
+    if (!normalizedClientId) return
+    pendingBackgroundReceiptClientIds.add(normalizedClientId)
+    rememberBackgroundReceiptClient(normalizedClientId)
+    reconciledBackgroundReceiptClientIds.delete(normalizedClientId)
+    if (holdHistory) holdBackgroundReceiptReconciliation()
+  }
+
+  function rememberBackgroundReceiptTask(
+    clientMessageId: string,
+    taskId: string,
+    terminalSeen = false,
+  ) {
     const normalizedClientId = String(clientMessageId || '').trim()
     const normalizedTaskId = String(taskId || '').trim()
     if (!normalizedClientId || !normalizedTaskId) return
-    if (!backgroundReceiptTaskOwners.has(normalizedTaskId) && backgroundReceiptTaskOwners.size >= 256) {
-      const oldestTaskId = backgroundReceiptTaskOwners.keys().next().value
-      if (typeof oldestTaskId === 'string') backgroundReceiptTaskOwners.delete(oldestTaskId)
+    rememberBackgroundReceiptClient(normalizedClientId)
+    const existing = backgroundReceiptTasks.get(normalizedTaskId)
+    if (!existing && backgroundReceiptTasks.size >= 256) {
+      const oldestTaskId = backgroundReceiptTasks.keys().next().value
+      if (typeof oldestTaskId === 'string') backgroundReceiptTasks.delete(oldestTaskId)
     }
-    backgroundReceiptTaskOwners.set(normalizedTaskId, normalizedClientId)
+    backgroundReceiptTasks.set(normalizedTaskId, {
+      clientMessageId: normalizedClientId,
+      terminalSeen: terminalSeen || existing?.terminalSeen === true,
+    })
   }
 
-  function trackBackgroundReceiptTask(clientMessageId: string, taskId: string) {
-    rememberBackgroundReceiptTask(clientMessageId, taskId)
+  function trackBackgroundReceiptTask(
+    clientMessageId: string,
+    taskId: string,
+    terminal = false,
+  ) {
+    const normalizedClientId = String(clientMessageId || '').trim()
+    rememberBackgroundReceiptClient(normalizedClientId)
+    rememberBackgroundReceiptTask(normalizedClientId, taskId, terminal)
+    if (terminal && !reconciledBackgroundReceiptClientIds.has(normalizedClientId)) {
+      dirtyBackgroundReceiptClientIds.add(normalizedClientId)
+      flushBackgroundReceiptReconciliationIfReady()
+    }
   }
 
   function finishBackgroundReceiptReplay(clientMessageId: string) {
     pendingBackgroundReceiptClientIds.delete(String(clientMessageId || '').trim())
   }
 
-  function receiptEventIdentity(payload: SessionEventPayload): {
+  function receiptEventIdentities(payload: SessionEventPayload): Array<{
     clientMessageId: string
     taskId: string
-  } {
+  }> {
     const candidates = [
       payload,
       payload.changed_task,
       payload.changedTask,
-      payload.active_task,
-      payload.activeTask,
       payload.last_task,
       payload.lastTask,
+      payload.active_task,
+      payload.activeTask,
     ]
-    let clientMessageId = ''
-    let taskId = payloadTaskId(payload)
+    const identities: Array<{ clientMessageId: string, taskId: string }> = []
     for (const candidate of candidates) {
       if (!candidate || typeof candidate !== 'object') continue
       const record = candidate as Record<string, unknown>
-      clientMessageId ||= String(
+      const clientMessageId = String(
         record.client_message_id || record.clientMessageId || '',
       ).trim()
-      taskId ||= String(record.task_id || record.taskId || '').trim()
+      const taskId = String(
+        record.task_id || record.taskId || record.turn_id || record.turnId || '',
+      ).trim()
+      if (!taskId) continue
+      if (!identities.some(identity => (
+        identity.taskId === taskId && identity.clientMessageId === clientMessageId
+      ))) identities.push({ clientMessageId, taskId })
     }
-    return { clientMessageId, taskId }
+    return identities
+  }
+
+  function matchingBackgroundReceiptIdentity(payload: SessionEventPayload): {
+    clientMessageId: string
+    taskId: string
+  } | null {
+    for (const identity of receiptEventIdentities(payload)) {
+      const tracked = backgroundReceiptTasks.get(identity.taskId)
+      if (tracked) {
+        return { clientMessageId: tracked.clientMessageId, taskId: identity.taskId }
+      }
+      if (
+        identity.clientMessageId
+        && backgroundReceiptClientIds.has(identity.clientMessageId)
+      ) return identity
+    }
+    return null
+  }
+
+  function applyBackgroundReceiptContinuation(
+    payload: SessionEventPayload,
+    receiptTaskId: string,
+  ) {
+    const activeTask = (payload.active_task || payload.activeTask) as Record<string, unknown> | undefined
+    const activeTaskId = activeTask
+      ? String(activeTask.task_id || activeTask.taskId || activeTask.turn_id || activeTask.turnId || '').trim()
+      : ''
+    if (!activeTask || !activeTaskId || activeTaskId === receiptTaskId) return
+    const activeStatus = String(activeTask?.status || '').trim().toLowerCase()
+    if (activeStatus === 'queued') options.taskOwnership?.noteQueued(activeTask)
+    else options.taskOwnership?.noteRunning({ ...activeTask, status: activeStatus || 'running' })
+    const continuation: SessionEventPayload = {
+      ...payload,
+      reason: 'background_receipt_continuation',
+      run_status: activeStatus || 'running',
+    }
+    delete continuation.changed_task
+    delete continuation.changedTask
+    delete continuation.last_task
+    delete continuation.lastTask
+    delete continuation.status
+    handleRpcSessionsChanged(continuation)
   }
 
   function suppressBackgroundReceiptEvent(
@@ -470,15 +581,9 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     payload: SessionEventPayload,
   ): boolean {
     if (!isCurrentSessionPayload(payload)) return false
-    const { clientMessageId, taskId } = receiptEventIdentity(payload)
-    const pendingOwner = clientMessageId
-      && pendingBackgroundReceiptClientIds.has(clientMessageId)
-      ? clientMessageId
-      : ''
-    const trackedOwner = taskId ? backgroundReceiptTaskOwners.get(taskId) || '' : ''
-    const owner = pendingOwner || trackedOwner
-    const suppress = Boolean(owner && taskId)
-    if (!suppress) return false
+    const identity = matchingBackgroundReceiptIdentity(payload)
+    if (!identity) return false
+    const { clientMessageId: owner, taskId } = identity
     // A matching lifecycle frame can beat the replay ACK. Bind only the exact
     // client-message owner: unrelated same-session tasks from another tab must
     // remain visible and must never enter this quarantine.
@@ -493,10 +598,19 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         : isTerminalEvent(eventKind)
     ) {
       options.taskOwnership?.noteTerminal(taskId)
+      rememberBackgroundReceiptTask(owner, taskId, true)
+      if (!reconciledBackgroundReceiptClientIds.has(owner)) {
+        dirtyBackgroundReceiptClientIds.add(owner)
+      }
+      flushBackgroundReceiptReconciliationIfReady()
     }
     // Keep the task identity through the complete terminal echo cluster
-    // (done -> sessions.changed -> task.* / turn.committed). Session change
-    // retires the owning Edit and clears this bounded registry below.
+    // (done -> sessions.changed -> task.* / turn.committed). For a terminal
+    // session projection, retain an unrelated successor task without allowing
+    // the receipt's history sync to replace the newer Edit transcript.
+    if (eventKind === 'sessions-changed') {
+      applyBackgroundReceiptContinuation(payload, taskId)
+    }
     return true
   }
 
@@ -1446,7 +1560,11 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
 
   watch(sessionKey, () => {
     pendingBackgroundReceiptClientIds.clear()
-    backgroundReceiptTaskOwners.clear()
+    backgroundReceiptClientIds.clear()
+    backgroundReceiptTasks.clear()
+    dirtyBackgroundReceiptClientIds.clear()
+    reconciledBackgroundReceiptClientIds.clear()
+    backgroundReceiptEditHeld = false
     streamThinking.value = null
     clearGenerationTracking()
     turnReasoningLog.length = 0
@@ -2912,5 +3030,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     beginBackgroundReceiptReplay,
     trackBackgroundReceiptTask,
     finishBackgroundReceiptReplay,
+    holdBackgroundReceiptReconciliation,
+    releaseBackgroundReceiptReconciliation,
   }
 }

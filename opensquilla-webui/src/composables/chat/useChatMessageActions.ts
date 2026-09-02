@@ -48,6 +48,10 @@ export interface UseChatMessageActionsOptions {
    * points (keyboard, future surfaces) must not fail silently either.
    */
   notifyEditBlocked?: () => void
+  /** Hold receipt/history reconciliation while an exact Edit snapshot is active. */
+  onEditStarted?: () => void
+  /** Release deferred receipt/history reconciliation after Edit leaves ownership. */
+  onEditSettled?: () => void
 }
 
 interface EditRestorePoint {
@@ -72,12 +76,14 @@ interface EditRestorePoint {
 export function useChatMessageActions(options: UseChatMessageActionsOptions) {
   let editRestorePoint: EditRestorePoint | null = null
   const editGeneration = ref(0)
+  const editActive = ref(false)
 
   // Session transitions replace the transcript and composer domain. Retire the
   // old restore point synchronously so even an immediate switch back cannot
   // revive state captured before the boundary.
   watch(options.sessionKey, () => {
     editRestorePoint = null
+    editActive.value = false
     editGeneration.value += 1
   }, { flush: 'sync' })
 
@@ -97,6 +103,7 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
 
   function retireOwnedEdit(restore: EditRestorePoint): void {
     editRestorePoint = null
+    editActive.value = false
     editGeneration.value += 1
     if (
       options.sessionKey.value === restore.sessionKey
@@ -289,6 +296,7 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
       console.warn('Finish the current branched draft before editing another message')
       return
     }
+    const startsEditIsolation = editRestorePoint === null
     editGeneration.value += 1
     // Everything below this line is undone by `cancelEdit`. Entering edit mode
     // is not a decision the user has confirmed — the transcript shrinks to
@@ -304,6 +312,10 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
       previousForkBeforeMessageId: options.pendingForkBeforeMessageId.value,
       forkBeforeMessageId,
       previousRestorePoint: editRestorePoint,
+    }
+    if (startsEditIsolation) {
+      editActive.value = true
+      options.onEditStarted?.()
     }
     options.pendingForkBeforeMessageId.value = forkBeforeMessageId
     options.messages.value = editingMessages
@@ -331,7 +343,9 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
       // The fork was consumed or replaced by another action. Drop every lower
       // frame without touching the new owner or resurrecting an older branch.
       editRestorePoint = null
+      editActive.value = false
       editGeneration.value += 1
+      options.onEditSettled?.()
       return false
     }
     if (!restoreOwnsCurrentTranscript(restore)) {
@@ -340,14 +354,28 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
       // the abandoned edit must not leave either that send generation or its
       // fork anchor live for the next ordinary draft.
       retireOwnedEdit(restore)
+      options.onEditSettled?.()
       return true
     }
     editRestorePoint = restore.previousRestorePoint
+    editActive.value = editRestorePoint !== null
     editGeneration.value += 1
     options.pendingForkBeforeMessageId.value = restore.previousForkBeforeMessageId
     options.messages.value = restore.messages
     options.inputText.value = restore.inputText
     options.autoResizeTextarea()
+    if (!editRestorePoint) options.onEditSettled?.()
+    return true
+  }
+
+  /** Retire the matching restore frame after Gateway acceptance commits it. */
+  function commitEdit(generation: number): boolean {
+    if (editGeneration.value !== generation) return false
+    if (!editRestorePoint) return true
+    editRestorePoint = null
+    editActive.value = false
+    editGeneration.value += 1
+    options.onEditSettled?.()
     return true
   }
 
@@ -362,11 +390,14 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     if (!restore) return true
     if (!restoreOwnsCurrentSessionAndFork(restore)) {
       editRestorePoint = null
+      editActive.value = false
       editGeneration.value += 1
+      options.onEditSettled?.()
       return false
     }
     if (restoreOwnsCurrentTranscript(restore)) return true
     retireOwnedEdit(restore)
+    options.onEditSettled?.()
     return false
   }
 
@@ -384,7 +415,9 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     if (!restore) return false
     if (!restoreOwnsCurrentSessionAndFork(restore)) {
       editRestorePoint = null
+      editActive.value = false
       editGeneration.value += 1
+      options.onEditSettled?.()
       return false
     }
     const currentMessages = options.messages.value
@@ -399,6 +432,7 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     ))
     if (!ownsPrefix || !ownsSuffix) {
       retireOwnedEdit(restore)
+      options.onEditSettled?.()
       return false
     }
     restore.editingMessageOwners.push(...rows.map(message => toRaw(message)))
@@ -410,8 +444,10 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     regenerateMessage,
     editMessage,
     cancelEdit,
+    commitEdit,
     validateEditOwner,
     adoptRejectedEditRows,
     editGeneration,
+    editActive,
   }
 }

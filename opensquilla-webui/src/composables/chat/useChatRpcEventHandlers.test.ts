@@ -293,6 +293,8 @@ describe('useChatRpcEventHandlers decoded conversation ingress', () => {
       sendUsageBarrierReplay: vi.fn(async () => true),
       focusComposer: vi.fn(),
       pendingForkBeforeMessageId,
+      onEditStarted: harness.api.holdBackgroundReceiptReconciliation,
+      onEditSettled: harness.api.releaseBackgroundReceiptReconciliation,
     })
     messageActions.editMessage({
       role: 'user',
@@ -351,16 +353,19 @@ describe('useChatRpcEventHandlers decoded conversation ingress', () => {
         payload: {
           session_key: 'agent:main:test',
           reason: 'task_terminal',
-          run_status: 'idle',
+          run_status: 'running',
           changed_task: {
             task_id: 'task-old-receipt',
-            client_message_id: 'client-old-receipt',
             status: 'succeeded',
           },
           last_task: {
             task_id: 'task-old-receipt',
-            client_message_id: 'client-old-receipt',
             status: 'succeeded',
+          },
+          active_task: {
+            task_id: 'task-successor',
+            client_message_id: 'client-successor',
+            status: 'running',
           },
         },
         meta: {},
@@ -375,12 +380,27 @@ describe('useChatRpcEventHandlers decoded conversation ingress', () => {
         task_id: 'task-old-receipt',
         stream_seq: 4,
       })
+      harness.api.onConversationEvent({
+        kind: 'sessions-changed',
+        payload: {
+          session_key: 'agent:main:test',
+          reason: 'turn_complete',
+          turn_id: 'turn-old-direct',
+          client_message_id: 'client-old-receipt',
+          status: 'done',
+        },
+        meta: {},
+      })
 
       expect(harness.activeStreamTaskId.value).toBe('')
       expect(harness.stream.startStreaming).not.toHaveBeenCalled()
       expect(harness.stream.appendDelta).not.toHaveBeenCalled()
       expect(harness.stream.endStreaming).not.toHaveBeenCalled()
-      expect(harness.applySessionRunState).not.toHaveBeenCalled()
+      expect(harness.applySessionRunState).toHaveBeenCalledOnce()
+      expect(harness.applySessionRunState).toHaveBeenCalledWith(expect.objectContaining({
+        run_status: 'running',
+        active_task: expect.objectContaining({ task_id: 'task-successor' }),
+      }))
       expect(harness.messages.value).toBe(editOwner)
       expect(harness.messages.value).toEqual([])
       expect(harness.scheduleHistorySync).not.toHaveBeenCalled()
@@ -397,6 +417,7 @@ describe('useChatRpcEventHandlers decoded conversation ingress', () => {
       ])
       expect(inputText.value).toBe('unrelated draft')
       expect(pendingForkBeforeMessageId.value).toBeNull()
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
     } finally {
       harness.stop()
     }

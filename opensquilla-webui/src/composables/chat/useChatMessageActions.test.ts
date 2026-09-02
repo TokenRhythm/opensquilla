@@ -359,6 +359,40 @@ describe('useChatMessageActions branching edits', () => {
     expect(pendingForkBeforeMessageId.value).toBeNull()
   })
 
+  it('retires a committed edit so regenerate is immediately available', async () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+      { role: 'assistant', text: 'ack B', ts: null, messageId: 'msg-b1' },
+    ])
+
+    api.editMessage(renderedMessage({
+      role: 'user', displayRole: 'user', sourceIndex: 2, messageId: 'msg-B', text: 'B',
+    }))
+    const generation = api.editGeneration.value
+    options.messages.value.push(
+      { role: 'user', text: 'edited B', ts: null, messageId: 'msg-B-edited' },
+      { role: 'assistant', text: 'edited answer', ts: null, messageId: 'msg-b2' },
+    )
+    pendingForkBeforeMessageId.value = null
+
+    expect(api.commitEdit(generation)).toBe(true)
+    expect(api.editActive.value).toBe(false)
+    expect(api.cancelEdit()).toBe(false)
+    expect(api.regenerateMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      sourceIndex: 3,
+      messageId: 'msg-b2',
+      text: 'edited answer',
+    }))).toBe(true)
+    await nextTick()
+
+    expect(pendingForkBeforeMessageId.value).toBe('msg-B-edited')
+    expect(options.sendCurrentInput).toHaveBeenCalledOnce()
+  })
+
   it('does not replace a foreign pending fork when entering edit mode', () => {
     const { api, options, pendingForkBeforeMessageId } = makeOptions([
       { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },

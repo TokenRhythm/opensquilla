@@ -1697,9 +1697,15 @@ const isStopPending = computed(() => (
   || acceptanceRecoveryPending.value
 ))
 let bindActiveStreamTask = (taskId: string) => { activeStreamTaskId.value = taskId }
-let beginBackgroundReceiptReplay = (_clientMessageId: string) => {}
-let trackBackgroundReceiptTask = (_clientMessageId: string, _taskId: string) => {}
+let beginBackgroundReceiptReplay = (_clientMessageId: string, _holdHistory = false) => {}
+let trackBackgroundReceiptTask = (
+  _clientMessageId: string,
+  _taskId: string,
+  _terminal = false,
+) => {}
 let finishBackgroundReceiptReplay = (_clientMessageId: string) => {}
+let holdBackgroundReceiptReconciliation = () => {}
+let releaseBackgroundReceiptReconciliation = () => {}
 let restoreLiveTurnSnapshot = (_snapshot: SessionReadSnapshot) => {}
 
 function projectWorkspaceFromSessionRead(
@@ -2567,15 +2573,19 @@ const chatMessageActions = useChatMessageActions({
   },
   notifyMessagePending: () => pushToast(t('chat.toast.messageStillSaving'), { tone: 'info' }),
   notifyEditBlocked: () => pushToast(t('chat.pending.editWhileStreaming'), { tone: 'info' }),
+  onEditStarted: () => holdBackgroundReceiptReconciliation(),
+  onEditSettled: () => releaseBackgroundReceiptReconciliation(),
 })
 const {
   copyMessage,
   regenerateMessage,
   editMessage,
   cancelEdit,
+  commitEdit,
   validateEditOwner,
   adoptRejectedEditRows,
   editGeneration,
+  editActive,
 } = chatMessageActions
 
 async function handleRegenerateMessage(
@@ -3348,7 +3358,9 @@ const chatSend = useChatSend({
   pendingAttachments,
   composerRevision,
   messageEditGeneration: editGeneration,
+  messageEditActive: editActive,
   validateMessageEditOwner: validateEditOwner,
+  commitMessageEdit: commitEdit,
   adoptRejectedMessageEditRows: adoptRejectedEditRows,
   pendingSessionIntent,
   pendingWorkspaceId,
@@ -3449,9 +3461,11 @@ const chatSend = useChatSend({
   restoreSteerIntoComposer: text => appendComposerText(text),
   popAllPendingIntoComposer,
   reconcileTaskOwnership: () => retrySessionMetadata(),
-  beginBackgroundReceiptReplay: clientMessageId => beginBackgroundReceiptReplay(clientMessageId),
-  trackBackgroundReceiptTask: (clientMessageId, taskId) => (
-    trackBackgroundReceiptTask(clientMessageId, taskId)
+  beginBackgroundReceiptReplay: (clientMessageId, holdHistory) => (
+    beginBackgroundReceiptReplay(clientMessageId, holdHistory)
+  ),
+  trackBackgroundReceiptTask: (clientMessageId, taskId, terminal) => (
+    trackBackgroundReceiptTask(clientMessageId, taskId, terminal)
   ),
   finishBackgroundReceiptReplay: clientMessageId => (
     finishBackgroundReceiptReplay(clientMessageId)
@@ -3919,6 +3933,8 @@ bindActiveStreamTask = rpcEventHandlers.bindActiveStreamTask
 beginBackgroundReceiptReplay = rpcEventHandlers.beginBackgroundReceiptReplay
 trackBackgroundReceiptTask = rpcEventHandlers.trackBackgroundReceiptTask
 finishBackgroundReceiptReplay = rpcEventHandlers.finishBackgroundReceiptReplay
+holdBackgroundReceiptReconciliation = rpcEventHandlers.holdBackgroundReceiptReconciliation
+releaseBackgroundReceiptReconciliation = rpcEventHandlers.releaseBackgroundReceiptReconciliation
 restoreLiveTurnSnapshot = rpcEventHandlers.restoreLiveTurnSnapshot
 const {
   streamThinkingText,

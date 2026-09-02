@@ -508,8 +508,12 @@ export interface UseChatSendOptions {
   composerRevision?: Readonly<Ref<number>>
   /** Invalidates a composer send when its message-edit owner is cancelled or replaced. */
   messageEditGeneration?: Readonly<Ref<number>>
+  /** Whether a one-shot message-edit restore frame currently owns the composer. */
+  messageEditActive?: Readonly<Ref<boolean>>
   /** Confirms that an edit still owns the exact live transcript before mutation. */
   validateMessageEditOwner?: (generation: number) => boolean
+  /** Retires the exact restore frame once Gateway acceptance commits the Edit. */
+  commitMessageEdit?: (generation: number) => boolean
   /** Extends edit ownership by the exact rows left by a definitely rejected send. */
   adoptRejectedMessageEditRows?: (
     generation: number,
@@ -623,9 +627,13 @@ export interface UseChatSendOptions {
   popAllPendingIntoComposer: () => boolean
   reconcileTaskOwnership?: () => void | Promise<unknown>
   /** Bracket an older receipt replay so its early live events stay offscreen. */
-  beginBackgroundReceiptReplay?: (clientMessageId: string) => void
+  beginBackgroundReceiptReplay?: (clientMessageId: string, holdHistory?: boolean) => void
   /** Keep a non-terminal accepted receipt task off the visible stream. */
-  trackBackgroundReceiptTask?: (clientMessageId: string, taskId: string) => void
+  trackBackgroundReceiptTask?: (
+    clientMessageId: string,
+    taskId: string,
+    terminal?: boolean,
+  ) => void
   /** Release the pre-response event quarantine for an older receipt replay. */
   finishBackgroundReceiptReplay?: (clientMessageId: string) => void
   hiddenControlStorage?: HiddenControlStorage | null
@@ -708,6 +716,7 @@ export function useChatSend(options: UseChatSendOptions) {
   function acknowledgeAttemptPromptAnnotations(
     attempt: SendAttempt,
     response: TurnSendResponse,
+    updateVisibleMessage = true,
   ) {
     if (
       attempt.promptAnnotationIds.length === 0
@@ -730,7 +739,7 @@ export function useChatSend(options: UseChatSendOptions) {
     const acceptedSnapshots = attempt.promptAnnotations.filter(snapshot => (
       acceptedSet.has(snapshot.annotationId)
     ))
-    setAttemptPromptAnnotations(attempt, acceptedSnapshots)
+    if (updateVisibleMessage) setAttemptPromptAnnotations(attempt, acceptedSnapshots)
     // A first send from a provisional draft can be accepted under a different
     // canonical session key. Publish both identities so Workbench can finish
     // the native annotation lifecycle regardless of which descriptor wins the
@@ -822,6 +831,60 @@ export function useChatSend(options: UseChatSendOptions) {
     }
   }
 
+  function recoveredAttemptHasUnrelatedComposer(
+    attempt: SendAttempt,
+    snapshot: ComposerSnapshot,
+  ): boolean {
+    const editOwner = attempt.messageEditTranscriptOwner
+    if (editOwner) {
+      return !(
+        options.messageEditActive?.value === true
+        && snapshot.messageEditGeneration === editOwner.generation
+        && attemptOwnsMessageEditTranscript(attempt)
+      )
+    }
+    const ownsFreshMaterial = Boolean(
+      snapshot.inputText
+      || snapshot.payloadAttachments.length > 0
+      || snapshot.promptAnnotationIds.length > 0
+      || snapshot.forkBeforeMessageId
+      || snapshot.intent
+      || snapshot.workspaceId,
+    )
+    return ownsFreshMaterial
+      || !sameDocumentContext(snapshot.documentContext, attempt.documentContext)
+      || snapshot.initialCollaborationMode !== attempt.initialCollaborationMode
+      || snapshot.initialRoutingMode !== attempt.initialRoutingMode
+  }
+
+  function quarantineRecoveredAttemptIfUnrelated() {
+    const attempt = recoveredAttempt
+    if (
+      !attempt?.requiresIdempotentReplay
+      || attempt.requestSessionKey !== options.sessionKey.value
+    ) return
+    const snapshot = captureComposerSnapshot()
+    if (!recoveredAttemptHasUnrelatedComposer(attempt, snapshot)) return
+    options.beginBackgroundReceiptReplay?.(
+      attempt.clientMessageId,
+      options.messageEditActive?.value === true,
+    )
+  }
+
+  watch([
+    () => options.sessionKey.value,
+    () => options.inputText.value,
+    () => options.pendingAttachments.value,
+    () => currentPromptAnnotationIds().join('\u0000'),
+    () => options.pendingForkBeforeMessageId.value,
+    () => options.pendingSessionIntent.value,
+    () => options.pendingWorkspaceId?.value,
+    () => options.messageEditGeneration?.value,
+    () => options.messageEditActive?.value,
+    () => options.initialCollaborationMode.value,
+    () => options.initialRoutingMode.value,
+  ], quarantineRecoveredAttemptIfUnrelated, { flush: 'sync', deep: true })
+
   function messageEditOwnerMatchesSnapshot(
     snapshot: ComposerSnapshot,
     validateTranscript = false,
@@ -869,6 +932,18 @@ export function useChatSend(options: UseChatSendOptions) {
     const currentMessages = options.messages.value
     return options.sessionKey.value === attempt.requestSessionKey
       && options.messageEditGeneration?.value === owner.generation
+      && toRaw(currentMessages) === owner.messages
+      && currentMessages.length === owner.messageOwners.length
+      && currentMessages.every(
+        (message, index) => toRaw(message) === owner.messageOwners[index],
+      )
+  }
+
+  function attemptTranscriptIdentityStillOwned(attempt: SendAttempt): boolean {
+    const owner = attempt.messageEditTranscriptOwner
+    if (!owner) return true
+    const currentMessages = options.messages.value
+    return options.sessionKey.value === attempt.requestSessionKey
       && toRaw(currentMessages) === owner.messages
       && currentMessages.length === owner.messageOwners.length
       && currentMessages.every(
@@ -1216,10 +1291,23 @@ export function useChatSend(options: UseChatSendOptions) {
     attempt: SendAttempt,
     response: TurnSendResponse,
   ): Promise<boolean> {
-    acknowledgeAttemptPromptAnnotations(attempt, response)
+    let responseOwnsVisibleTranscript = !recoveredAttemptHasUnrelatedComposer(
+      attempt,
+      captureComposerSnapshot(),
+    ) && validateAttemptMessageEditTranscript(attempt)
+    acknowledgeAttemptPromptAnnotations(attempt, response, responseOwnsVisibleTranscript)
     attempt.acceptanceResolved = true
     attempt.acceptedTaskId = acceptedTaskId(response)
     attempt.acceptedSessionKey = response.sessionKey || attempt.requestSessionKey
+    if (
+      responseOwnsVisibleTranscript
+      && attempt.messageEditTranscriptOwner
+      && options.commitMessageEdit?.(
+        attempt.messageEditTranscriptOwner.generation,
+      ) === false
+    ) {
+      responseOwnsVisibleTranscript = false
+    }
     const ownsRecoveredAttempt = recoveredAttempt?.clientRequestId === attempt.clientRequestId
     if (attempt.hiddenControl) {
       removeHiddenControl(
@@ -1232,10 +1320,17 @@ export function useChatSend(options: UseChatSendOptions) {
     const isCurrentRequest = options.sessionKey.value === attempt.requestSessionKey
     const accepted = noteAcceptedTask(response, attempt.requestSessionKey)
     const terminalStatus = terminalResponseStatus(response)
-    if (isCurrentRequest) {
+    if (isCurrentRequest && responseOwnsVisibleTranscript) {
       consumeAcceptedSessionIntent(attempt)
       bindAcceptedUserMessage(attempt.clientMessageId, response)
       options.scheduleHistorySync()
+    } else if (isCurrentRequest) {
+      consumeAcceptedSessionIntent(attempt)
+      options.trackBackgroundReceiptTask?.(
+        attempt.clientMessageId,
+        accepted.taskId,
+        Boolean(terminalStatus),
+      )
     }
 
     if (!attempt.stopRequested) {
@@ -1243,7 +1338,7 @@ export function useChatSend(options: UseChatSendOptions) {
       return true
     }
     if (terminalStatus) {
-      if (isCurrentRequest) {
+      if (isCurrentRequest && responseOwnsVisibleTranscript) {
         handleTerminalResponse(response, null, { finishFreshStream: false })
       }
       clearAttemptStop(attempt)
@@ -2400,10 +2495,6 @@ export function useChatSend(options: UseChatSendOptions) {
       ? recoveredAttempt
       : null
     if (exactReplayAttempt) {
-      const preserveUnrelatedBranch = Boolean(
-        composerSnapshot.forkBeforeMessageId
-        && composerSnapshot.forkBeforeMessageId !== exactReplayAttempt.forkBeforeMessageId,
-      )
       const replayBlockedReason = options.idempotentReplayBlockedReason
         || options.sendBlockedReason
       if (replayBlockedReason?.value) return
@@ -2411,11 +2502,17 @@ export function useChatSend(options: UseChatSendOptions) {
         if (await refreshedActiveProjectBlocksSend()) return
       }
       if (options.sessionKey.value !== requestSessionKey) return
-      if (!messageEditOwnerMatchesSnapshot(composerSnapshot)) return
+      const replayComposerSnapshot = captureComposerSnapshot()
+      const preserveUnrelatedBranch = recoveredAttemptHasUnrelatedComposer(
+        exactReplayAttempt,
+        replayComposerSnapshot,
+      )
+      if (!messageEditOwnerMatchesSnapshot(replayComposerSnapshot)) return
       if (!validateAttemptMessageEditTranscript(exactReplayAttempt)) return
       if (replayBlockedReason?.value) return
       await dispatchSend(exactReplayAttempt.text, {
         composerText,
+        composerSnapshot: replayComposerSnapshot,
         promptAnnotationIds: exactReplayAttempt.promptAnnotationIds,
         queueMode: exactReplayAttempt.queueMode,
         payload: {
@@ -2437,7 +2534,7 @@ export function useChatSend(options: UseChatSendOptions) {
         backgroundReceiptReplay: preserveUnrelatedBranch,
         preDispatchGuard: stage => (
           forkSnapshotPreDispatchAllowed(
-            composerSnapshot,
+            replayComposerSnapshot,
             stage,
             {
               forkBeforeMessageId: exactReplayAttempt.forkBeforeMessageId,
@@ -3027,6 +3124,12 @@ export function useChatSend(options: UseChatSendOptions) {
       : false
     if (sendOpts.cancelIfComposerChanged && composerChanged) return 'not_sent'
     if (composerChanged) preserveComposer = true
+    const backgroundReceiptReplay = sendOpts.backgroundReceiptReplay === true
+      || Boolean(
+        sendOpts.idempotentReplay
+        && preserveComposer
+        && retryAttempt?.requiresIdempotentReplay,
+      )
     const currentSourceAttachments = sendOpts.payload?.attachments
       ?? options.pendingAttachments.value
     if (
@@ -3253,7 +3356,7 @@ export function useChatSend(options: UseChatSendOptions) {
       if (options.pendingForkBeforeMessageId.value === forkBeforeMessageId) {
         options.pendingForkBeforeMessageId.value = null
       }
-    } else if (sendOpts.composerSnapshot) {
+    } else if (sendOpts.composerSnapshot && !backgroundReceiptReplay) {
       const originalAttachmentRefs = new Set(sendOpts.composerSnapshot.attachmentRefs)
       options.pendingAttachments.value = options.pendingAttachments.value.filter(
         attachment => !originalAttachmentRefs.has(attachment),
@@ -3262,7 +3365,6 @@ export function useChatSend(options: UseChatSendOptions) {
     // A steer send rides an already-active stream; restarting it would wipe
     // the partial output of the run being steered.
     const wasStreaming = options.stream.isStreaming.value
-    const backgroundReceiptReplay = sendOpts.backgroundReceiptReplay === true
     if (!preDispatchAllowed('after_mutation')) return rejectBeforeDispatch()
     const freshSendToken = wasStreaming || backgroundReceiptReplay
       ? null
@@ -3342,27 +3444,48 @@ export function useChatSend(options: UseChatSendOptions) {
       attempt.acceptanceRequest = { request: acceptanceRequest }
       attempt.acceptanceInFlight = true
       if (backgroundReceiptReplay) {
-        options.beginBackgroundReceiptReplay?.(attempt.clientMessageId)
+        options.beginBackgroundReceiptReplay?.(
+          attempt.clientMessageId,
+          options.messageEditActive?.value === true,
+        )
       }
       const res = await options.turnCommands.send(acceptanceRequest)
-      acknowledgeAttemptPromptAnnotations(attempt, res)
+      let responseOwnsVisibleTranscript = !backgroundReceiptReplay
+        && validateAttemptMessageEditTranscript(attempt)
+      acknowledgeAttemptPromptAnnotations(attempt, res, responseOwnsVisibleTranscript)
       attempt.acceptanceResolved = true
       attempt.acceptedTaskId = acceptedTaskId(res)
       attempt.acceptedSessionKey = res?.sessionKey || requestSessionKey
-      if (backgroundReceiptReplay) {
+      if (
+        responseOwnsVisibleTranscript
+        && attempt.messageEditTranscriptOwner
+        && options.commitMessageEdit?.(
+          attempt.messageEditTranscriptOwner.generation,
+        ) === false
+      ) {
+        responseOwnsVisibleTranscript = false
+      }
+      if (!responseOwnsVisibleTranscript) {
         const terminalStatus = terminalResponseStatus(res)
         const accepted = noteAcceptedTask(res, requestSessionKey)
-        if (!terminalStatus && accepted.taskId) {
-          options.trackBackgroundReceiptTask?.(attempt.clientMessageId, accepted.taskId)
-        }
+        options.trackBackgroundReceiptTask?.(
+          attempt.clientMessageId,
+          accepted.taskId,
+          Boolean(terminalStatus),
+        )
         if (recoveredAttempt?.clientRequestId === attempt.clientRequestId) {
           recoveredAttempt = null
         }
         consumeAcceptedSessionIntent(attempt)
-        // This request predates the branch currently shown in the composer.
-        // Quarantine its accepted task offscreen; binding it as the foreground
-        // stream (or materializing a terminal response) would append into the
-        // newer edit's exact transcript and make Escape unable to restore it.
+        if (!wasStreaming && freshSendToken && activeFreshSendToken === freshSendToken) {
+          activeFreshSendToken = null
+          options.activeStreamTaskId.value = ''
+          options.activeStreamSessionKey.value = ''
+          options.stream.endStreaming()
+        }
+        // This response no longer owns the exact transcript (or predates the
+        // branch currently shown). Keep task bookkeeping authoritative, but
+        // quarantine visible rows and terminal echoes offscreen.
         return 'accepted'
       }
       if (!commitAcceptedVisibleReplay({
@@ -3504,6 +3627,7 @@ export function useChatSend(options: UseChatSendOptions) {
         terminalStatus
         && responseIsCurrent
         && options.sessionKey.value === terminalSessionKey
+        && attemptTranscriptIdentityStillOwned(attempt)
       ) {
         handleTerminalResponse(res, freshSendToken, {
           finishFreshStream: !wasStreaming,
@@ -3516,14 +3640,29 @@ export function useChatSend(options: UseChatSendOptions) {
     } catch (err: unknown) {
       const rpcError = err as RpcClientError | null | undefined
       const acceptedError = acceptedErrorInfo(err)
+      let acceptedResponseOwnsVisibleTranscript = !acceptedError
+        || (
+          !backgroundReceiptReplay
+          && validateAttemptMessageEditTranscript(attempt)
+        )
+      if (
+        acceptedError
+        && acceptedResponseOwnsVisibleTranscript
+        && attempt.messageEditTranscriptOwner
+        && options.commitMessageEdit?.(
+          attempt.messageEditTranscriptOwner.generation,
+        ) === false
+      ) {
+        acceptedResponseOwnsVisibleTranscript = false
+      }
       if (!acceptedError && attemptOwnsMessageEditTranscript(attempt)) {
         setAttemptPromptAnnotations(attempt, [])
       }
       if (
         acceptedError
-        && !backgroundReceiptReplay
+        && acceptedResponseOwnsVisibleTranscript
         && !commitAcceptedVisibleReplay({
-        messageId: acceptedError.messageId,
+          messageId: acceptedError.messageId,
         })
       ) {
         options.scheduleHistorySync()
@@ -3535,8 +3674,15 @@ export function useChatSend(options: UseChatSendOptions) {
         recoveredAttempt = null
       }
       if (acceptedError) consumeAcceptedSessionIntent(attempt)
-      if (acceptedError && backgroundReceiptReplay) {
+      if (acceptedError && !acceptedResponseOwnsVisibleTranscript) {
         attempt.acceptanceResolved = true
+        options.trackBackgroundReceiptTask?.(attempt.clientMessageId, '', true)
+        if (!wasStreaming && freshSendToken && activeFreshSendToken === freshSendToken) {
+          activeFreshSendToken = null
+          options.activeStreamTaskId.value = ''
+          options.activeStreamSessionKey.value = ''
+          options.stream.endStreaming()
+        }
         return 'accepted'
       }
       const acceptedSessionKey = acceptedError?.sessionKey || requestSessionKey
@@ -3549,12 +3695,14 @@ export function useChatSend(options: UseChatSendOptions) {
             sendOpts.rememberRetryableAttempt(attempt)
           } else {
             recoveredAttempt = attempt
+            quarantineRecoveredAttemptIfUnrelated()
           }
         } else if (acceptanceUnknown) {
           // The optimistic user bubble already owns this payload. Keep its
           // immutable request identity for exact replay without presenting the
           // same text as a new editable draft.
           recoveredAttempt = attempt
+          quarantineRecoveredAttemptIfUnrelated()
         } else if (restoreComposer) {
           restoreSendAttempt(attempt, {
             requiresIdempotentReplay: false,
@@ -3626,12 +3774,18 @@ export function useChatSend(options: UseChatSendOptions) {
         if (responseHandoff && acceptedSessionKey === requestSessionKey) {
           await handoffResponseSession(requestSessionKey, responseHandoff)
         }
-        if (
-          !attempt.messageEditTranscriptOwner
-          || attemptOwnsMessageEditTranscript(attempt)
-        ) {
-          bindUserMessageId(attempt.clientMessageId, acceptedError.messageId)
+        if (!attemptTranscriptIdentityStillOwned(attempt)) {
+          attempt.acceptanceResolved = true
+          options.trackBackgroundReceiptTask?.(attempt.clientMessageId, '', true)
+          if (!wasStreaming && freshSendToken && activeFreshSendToken === freshSendToken) {
+            activeFreshSendToken = null
+            options.activeStreamTaskId.value = ''
+            options.activeStreamSessionKey.value = ''
+            options.stream.endStreaming()
+          }
+          return 'accepted'
         }
+        bindUserMessageId(attempt.clientMessageId, acceptedError.messageId)
         options.scheduleHistorySync()
       }
       if (options.sessionKey.value !== requestSessionKey) {
@@ -3663,6 +3817,8 @@ export function useChatSend(options: UseChatSendOptions) {
         }
       }
       if (
+        !acceptedError
+        &&
         attempt.messageEditTranscriptOwner
         && !validateAttemptMessageEditTranscript(attempt)
       ) {
@@ -3673,7 +3829,10 @@ export function useChatSend(options: UseChatSendOptions) {
         return acceptedError ? 'accepted' : 'retryable_failure'
       }
       rememberRetryableAttempt(true)
-      if (acceptedError || !sendOpts.suppressRejectedFailureMessage) {
+      if (
+        acceptedError
+        || (!backgroundReceiptReplay && !sendOpts.suppressRejectedFailureMessage)
+      ) {
         const errorRow: ChatMessage = {
           role: 'error',
           text: sendFailureMessage(err, paramsHaveArtifactContext(attempt.params)),
@@ -3830,6 +3989,7 @@ export function useChatSend(options: UseChatSendOptions) {
     }
     attempt.requiresIdempotentReplay = recovery.requiresIdempotentReplay
     recoveredAttempt = attempt
+    quarantineRecoveredAttemptIfUnrelated()
     options.autoResizeTextarea()
   }
 

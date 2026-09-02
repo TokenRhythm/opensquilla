@@ -2292,7 +2292,9 @@ describe('useChatSend attachment payloads', () => {
       inputText,
       pendingForkBeforeMessageId,
       messageEditGeneration: messageActions.editGeneration,
+      messageEditActive: messageActions.editActive,
       validateMessageEditOwner: messageActions.validateEditOwner,
+      commitMessageEdit: messageActions.commitEdit,
       adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
       validateActiveProjectBeforeSend,
     })
@@ -2332,7 +2334,9 @@ describe('useChatSend attachment payloads', () => {
       inputText,
       pendingForkBeforeMessageId,
       messageEditGeneration: messageActions.editGeneration,
+      messageEditActive: messageActions.editActive,
       validateMessageEditOwner: messageActions.validateEditOwner,
+      commitMessageEdit: messageActions.commitEdit,
       adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
       validateActiveProjectBeforeSend,
     })
@@ -2428,7 +2432,9 @@ describe('useChatSend attachment payloads', () => {
       promptAnnotationIds: ref(['annotation-edit']),
       promptAnnotationSnapshots: () => [annotation],
       messageEditGeneration: messageActions.editGeneration,
+      messageEditActive: messageActions.editActive,
       validateMessageEditOwner: messageActions.validateEditOwner,
+      commitMessageEdit: messageActions.commitEdit,
       adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
     })
 
@@ -2512,6 +2518,7 @@ describe('useChatSend attachment payloads', () => {
       expect(messageActions.cancelEdit()).toBe(true)
       inputText.value = 'later ordinary question'
       const promptAnnotationIds = ref<string[]>([])
+      const beginBackgroundReceiptReplay = vi.fn()
       const rpc = {
         call: vi.fn()
           .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
@@ -2526,12 +2533,16 @@ describe('useChatSend attachment payloads', () => {
         promptAnnotationIds,
         modelRoutingMode: ref<'llm_ensemble'>('llm_ensemble'),
         messageEditGeneration: messageActions.editGeneration,
+        messageEditActive: messageActions.editActive,
         validateMessageEditOwner: messageActions.validateEditOwner,
+        commitMessageEdit: messageActions.commitEdit,
         adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
+        beginBackgroundReceiptReplay,
       })
 
       await api.onSend()
       const originalRequestId = rpc.call.mock.calls[0]?.[1]?.clientRequestId
+      const originalClientMessageId = rpc.call.mock.calls[0]?.[1]?.clientMessageId
       expect(stream.startStreaming).toHaveBeenCalledTimes(1)
       expect(stream.endStreaming).toHaveBeenCalledTimes(1)
       expect(messages.value.map(message => message.role)).toEqual([
@@ -2562,6 +2573,11 @@ describe('useChatSend attachment payloads', () => {
       promptAnnotationIds.value = ['current-edit-annotation']
       options.pendingSessionIntent.value = 'new_chat'
 
+      expect(beginBackgroundReceiptReplay).toHaveBeenCalledWith(
+        originalClientMessageId,
+        true,
+      )
+
       await api.onSend()
 
       expect(rpc.call).toHaveBeenCalledTimes(2)
@@ -2591,6 +2607,144 @@ describe('useChatSend attachment payloads', () => {
     },
   )
 
+  it('quarantines an older receipt when Edit starts during project preflight', async () => {
+    const {
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      messageActions,
+    } = makeEditedMessageState()
+    expect(messageActions.cancelEdit()).toBe(true)
+    inputText.value = 'later ordinary question'
+
+    let finishReplayPreflight!: () => void
+    const validateActiveProjectBeforeSend = vi.fn()
+      .mockResolvedValueOnce(null)
+      .mockImplementationOnce(() => new Promise<string | null>(resolve => {
+        finishReplayPreflight = () => resolve(null)
+      }))
+    const beginBackgroundReceiptReplay = vi.fn()
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+        .mockResolvedValueOnce({
+          sessionKey: 'agent:main:webchat:test',
+          task_id: 'task-preflight-receipt',
+        }),
+    }
+    const { api } = makeOptions({
+      rpc,
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      messageEditGeneration: messageActions.editGeneration,
+      messageEditActive: messageActions.editActive,
+      validateMessageEditOwner: messageActions.validateEditOwner,
+      commitMessageEdit: messageActions.commitEdit,
+      adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
+      validateActiveProjectBeforeSend,
+      beginBackgroundReceiptReplay,
+    })
+
+    await api.onSend()
+    const originalParams = rpc.call.mock.calls[0]?.[1]
+    const replay = api.onSend()
+    await vi.waitFor(() => expect(validateActiveProjectBeforeSend).toHaveBeenCalledTimes(2))
+
+    messageActions.editMessage({
+      role: 'user',
+      displayRole: 'user',
+      roleLabel: 'User',
+      text: 'original question',
+      timeStr: '',
+      showHeader: false,
+      sourceIndex: 0,
+      messageId: 'msg-original',
+    })
+    inputText.value = 'edited during preflight'
+    const editOwner = messages.value
+
+    expect(beginBackgroundReceiptReplay).toHaveBeenCalledWith(
+      originalParams.clientMessageId,
+      true,
+    )
+    expect(rpc.call).toHaveBeenCalledOnce()
+
+    finishReplayPreflight()
+    await replay
+
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(originalParams)
+    expect(messages.value).toBe(editOwner)
+    expect(messages.value).toEqual([])
+    expect(inputText.value).toBe('edited during preflight')
+    expect(pendingForkBeforeMessageId.value).toBe('msg-original')
+    expect(messageActions.cancelEdit()).toBe(true)
+  })
+
+  it.each([
+    ['different text', 'new ordinary question'],
+    ['the same text', 'later ordinary question'],
+  ])(
+    'preserves a newer ordinary composer with %s while resolving an older receipt',
+    async (_label, currentText) => {
+      const inputText = ref('later ordinary question')
+      const promptAnnotationIds = ref<string[]>([])
+      const pendingSessionIntent = ref<string | null>(null)
+      const beginBackgroundReceiptReplay = vi.fn()
+      const rpc = {
+        call: vi.fn()
+          .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+          .mockResolvedValueOnce({
+            sessionKey: 'agent:main:webchat:test',
+            task_id: 'task-older-receipt',
+          }),
+      }
+      const { api, options, stream } = makeOptions({
+        rpc,
+        inputText,
+        promptAnnotationIds,
+        pendingSessionIntent,
+        modelRoutingMode: ref<'llm_ensemble'>('llm_ensemble'),
+        beginBackgroundReceiptReplay,
+      })
+
+      await api.onSend()
+      const originalParams = rpc.call.mock.calls[0]?.[1]
+      inputText.value = currentText
+      const currentAttachment: Attachment = {
+        kind: 'staged',
+        local_id: 902,
+        name: 'ordinary-draft.png',
+        mime: 'image/png',
+        file_uuid: 'ordinary-draft-file',
+      }
+      options.pendingAttachments.value = [currentAttachment]
+      const attachmentOwner = options.pendingAttachments.value[0]
+      promptAnnotationIds.value = ['ordinary-draft-annotation']
+      pendingSessionIntent.value = 'new_chat'
+
+      expect(beginBackgroundReceiptReplay).toHaveBeenCalledWith(
+        originalParams.clientMessageId,
+        false,
+      )
+      await api.onSend()
+
+      expect(rpc.call).toHaveBeenCalledTimes(2)
+      expect(rpc.call.mock.calls[1]?.[1]).toEqual(originalParams)
+      expect(inputText.value).toBe(currentText)
+      expect(options.pendingAttachments.value).toEqual([currentAttachment])
+      expect(options.pendingAttachments.value[0]).toBe(attachmentOwner)
+      expect(promptAnnotationIds.value).toEqual(['ordinary-draft-annotation'])
+      expect(pendingSessionIntent.value).toBe('new_chat')
+      expect(stream.startStreaming).toHaveBeenCalledTimes(1)
+      expect(stream.endStreaming).toHaveBeenCalledTimes(1)
+      expect(options.activeStreamTaskId.value).toBe('')
+    },
+  )
+
   it('does not start async queue persistence for a fork edit while work is active', async () => {
     const {
       sessionKey,
@@ -2610,7 +2764,9 @@ describe('useChatSend attachment payloads', () => {
       inputText,
       pendingForkBeforeMessageId,
       messageEditGeneration: messageActions.editGeneration,
+      messageEditActive: messageActions.editActive,
       validateMessageEditOwner: messageActions.validateEditOwner,
+      commitMessageEdit: messageActions.commitEdit,
       adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
       acceptanceStopPending: ref(true),
       enqueuePendingInput,
@@ -2750,7 +2906,9 @@ describe('useChatSend attachment payloads', () => {
       inputText,
       pendingForkBeforeMessageId,
       messageEditGeneration: messageActions.editGeneration,
+      messageEditActive: messageActions.editActive,
       validateMessageEditOwner: messageActions.validateEditOwner,
+      commitMessageEdit: messageActions.commitEdit,
       adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
     })
 
@@ -2876,6 +3034,99 @@ describe('useChatSend attachment payloads', () => {
     expect(messageActions.cancelEdit()).toBe(false)
   })
 
+  it.each([
+    ['fulfilled terminal response', 'array replacement'],
+    ['fulfilled terminal response', 'same-client replacement'],
+    ['accepted error', 'array replacement'],
+    ['accepted error', 'same-client replacement'],
+  ] as const)(
+    'keeps a %s off a newer %s owner',
+    async (responseKind, replacementKind) => {
+      const {
+        sessionKey,
+        messages,
+        inputText,
+        pendingForkBeforeMessageId,
+        messageActions,
+      } = makeEditedMessageState('edited question')
+      let finishSend!: () => void
+      const rpc = {
+        call: vi.fn(() => new Promise((resolve, reject) => {
+          finishSend = () => {
+            if (responseKind === 'accepted error') {
+              reject(Object.assign(new Error('accepted without response'), {
+                accepted: true,
+                details: {
+                  orphan_message_id: 'msg-stale-edit',
+                  session_key: sessionKey.value,
+                },
+              }))
+              return
+            }
+            resolve({
+              sessionKey: sessionKey.value,
+              task_id: 'task-stale-edit',
+              task_status: 'failed',
+              terminal_reason: 'activation_failed',
+              terminal_message: 'The stale edit failed after acceptance.',
+            })
+          }
+        })),
+      }
+      const { api, options, stream } = makeOptions({
+        rpc,
+        sessionKey,
+        messages,
+        inputText,
+        pendingForkBeforeMessageId,
+        messageEditGeneration: messageActions.editGeneration,
+        messageEditActive: messageActions.editActive,
+        validateMessageEditOwner: messageActions.validateEditOwner,
+        commitMessageEdit: messageActions.commitEdit,
+        adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
+      })
+
+      const send = api.onSend()
+      await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledOnce())
+      let replacementOwner: ChatMessage[]
+      let replacementItems: ChatMessage[]
+      if (replacementKind === 'array replacement') {
+        messages.value = [
+          { role: 'user', text: 'authoritative replacement', ts: null, messageId: 'msg-new' },
+          { role: 'assistant', text: 'authoritative answer', ts: null, messageId: 'msg-new-answer' },
+        ]
+        replacementOwner = messages.value
+        replacementItems = [...replacementOwner]
+      } else {
+        replacementOwner = messages.value
+        const replacement = {
+          ...messages.value[0]!,
+          text: 'same-client authoritative replacement',
+        }
+        messages.value.splice(0, 1, replacement)
+        replacementItems = [messages.value[0]!]
+      }
+      inputText.value = 'replacement owner draft'
+      pendingForkBeforeMessageId.value = 'msg-authoritative-fork'
+
+      finishSend()
+      await send
+
+      expect(messages.value).toBe(replacementOwner)
+      expect(messages.value).toEqual(replacementItems)
+      replacementItems.forEach((message, index) => {
+        expect(messages.value[index]).toBe(message)
+      })
+      expect(messages.value.some(message => message.role === 'error')).toBe(false)
+      expect(inputText.value).toBe('replacement owner draft')
+      expect(pendingForkBeforeMessageId.value).toBe('msg-authoritative-fork')
+      expect(messageActions.editActive.value).toBe(false)
+      expect(messageActions.cancelEdit()).toBe(false)
+      expect(options.scheduleHistorySync).not.toHaveBeenCalled()
+      expect(stream.endStreaming).toHaveBeenCalledOnce()
+    },
+  )
+
   it('never restores an edited send explicitly reported as accepted', async () => {
     const {
       sessionKey,
@@ -2900,7 +3151,9 @@ describe('useChatSend attachment payloads', () => {
       inputText,
       pendingForkBeforeMessageId,
       messageEditGeneration: messageActions.editGeneration,
+      messageEditActive: messageActions.editActive,
       validateMessageEditOwner: messageActions.validateEditOwner,
+      commitMessageEdit: messageActions.commitEdit,
       adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
     })
 
@@ -2916,6 +3169,14 @@ describe('useChatSend attachment payloads', () => {
     expect(messages.value.map(message => message.text)).toEqual([
       'edited question', expect.stringContaining('response lost'),
     ])
+
+    inputText.value = 'ordinary follow-up after committed edit'
+    await api.onSend()
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+    expect(rpc.call.mock.calls[1]?.[1]).toMatchObject({
+      message: 'ordinary follow-up after committed edit',
+    })
+    expect(rpc.call.mock.calls[1]?.[1]).not.toHaveProperty('forkBeforeMessageId')
   })
 
   it('starts a fresh receipt when the same edit is re-entered after cancellation', async () => {
