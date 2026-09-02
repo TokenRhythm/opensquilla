@@ -3792,9 +3792,7 @@ const {
   settlePendingClarifyForTerminalTask,
   applyUserInputBootstrap,
 } = chatApprovals
-applyPendingUserInputSnapshot = snapshot => applyUserInputBootstrap({
-  pendingUserInputs: [...snapshot.pendingUserInputs],
-})
+applyPendingUserInputSnapshot = applyUserInputBootstrap
 settleTaskTerminalPresentation = (taskId, status) => {
   if (status !== 'succeeded') {
     chatPlans.settleActiveRunForTerminalTask(taskId, status)

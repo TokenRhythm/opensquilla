@@ -993,14 +993,14 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   }
 
   function applyUserInputBootstrap(snapshot: {
-    pendingUserInputs?: unknown[]
-    pending_user_inputs?: unknown[]
+    pendingUserInputs?: readonly unknown[]
+    pending_user_inputs?: readonly unknown[]
     goalSnapshotStreamSeq?: number | null
     goal_snapshot_stream_seq?: number | null
     streamGeneration?: string
     stream_generation?: string
-    deferredFields?: string[]
-    deferred_fields?: string[]
+    deferredFields?: readonly string[]
+    deferred_fields?: readonly string[]
   }) {
     const hasAuthoritativePendingList = Object.prototype.hasOwnProperty.call(
       snapshot,

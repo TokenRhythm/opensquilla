@@ -18,4 +18,18 @@ describe('ChatView missing-session wiring', () => {
     expect(subscriptionWiring).not.toContain('SESSION_NOT_FOUND')
     expect(subscriptionWiring).not.toContain('NOT_FOUND')
   })
+
+  it('forwards complete session-read metadata to pending-input reconciliation', () => {
+    const assignment = chatViewSource.indexOf(
+      'applyPendingUserInputSnapshot = applyUserInputBootstrap',
+    )
+    expect(assignment).toBeGreaterThan(-1)
+
+    const subscriptionStart = chatViewSource.indexOf(
+      'const chatSessionSubscription = useChatSessionSubscription({',
+    )
+    const subscriptionEnd = chatViewSource.indexOf('\n})', subscriptionStart)
+    const subscriptionWiring = chatViewSource.slice(subscriptionStart, subscriptionEnd)
+    expect(subscriptionWiring).toContain('applyPendingUserInputSnapshot(snapshot)')
+  })
 })

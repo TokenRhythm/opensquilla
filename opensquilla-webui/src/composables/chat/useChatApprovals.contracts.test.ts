@@ -4,6 +4,7 @@ import type { RpcEventHandler } from '@/lib/rpc'
 import type { InterruptViewState } from '@/types/parts'
 import { projectApprovalDisplayArgs } from '@/adapters/gateway/approvalCenterV4Contract'
 import { sessionConversationFromTestRpc } from '@/testing/sessionConversation.test-helper'
+import type { SessionReadMetadata } from '@/modules/sessionReadLifecycle'
 import {
   useChatApprovals,
 } from './useChatApprovals'
@@ -719,7 +720,7 @@ describe('clarify tool-result recovery', () => {
     }
   })
 
-  it('does not let an older hydration snapshot erase a newer live request', async () => {
+  it('does not let an older session-read hydration erase a newer live request', async () => {
     installSnapshot()
     const runtime = await harness()
     try {
@@ -731,18 +732,24 @@ describe('clarify tool-result recovery', () => {
         result: planClarifyResult,
       })
 
-      runtime.approvals.applyUserInputBootstrap({
-        pendingUserInputs: [],
+      const olderHydration = Object.freeze({
+        pendingUserInputs: Object.freeze([]),
         goalSnapshotStreamSeq: 7,
-      })
+        deferredFields: Object.freeze([]),
+      }) satisfies Pick<
+        SessionReadMetadata,
+        'pendingUserInputs' | 'goalSnapshotStreamSeq' | 'deferredFields'
+      >
+      runtime.approvals.applyUserInputBootstrap(olderHydration)
 
       expect(runtime.approvals.pendingClarify.value?.requestId).toBe('input-request-1')
       expect(runtime.interruptState.value.get('input-request-1')?.resolution).toBeNull()
 
-      runtime.approvals.applyUserInputBootstrap({
-        pendingUserInputs: [],
+      runtime.approvals.applyUserInputBootstrap(Object.freeze({
+        pendingUserInputs: Object.freeze([]),
         goalSnapshotStreamSeq: 8,
-      })
+        deferredFields: Object.freeze([]),
+      }))
       expect(runtime.approvals.pendingClarify.value).toBeNull()
       expect(runtime.interruptState.value.get('input-request-1')?.resolution)
         .toBe('unavailable')
