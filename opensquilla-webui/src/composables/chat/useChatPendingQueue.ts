@@ -388,7 +388,14 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     sessionKey: string,
   ): boolean {
     return queueSessionKey(record.sessionKey) === queueSessionKey(sessionKey)
-      && record.clientRequestId === item.pendingClientRequestId
+      && walRecordMatchesItemIdentity(record, item)
+  }
+
+  function walRecordMatchesItemIdentity(
+    record: PendingInputWalRecord,
+    item: ChatPendingItem,
+  ): boolean {
+    return record.clientRequestId === item.pendingClientRequestId
       && record.clientMessageId === item.pendingClientMessageId
   }
 
@@ -524,6 +531,41 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         mutation.record.state === 'cancelling'
         && mutation.record.retainAfterCancel !== true
       ) rememberRemoval(sessionKey, pendingInputId)
+      if (mutation.record.state === 'cancelling' && supportsServerQueue()) {
+        void retryCancellingItem(item)
+      }
+    }
+    return false
+  }
+
+  async function deleteStagedWalItem(
+    item: ChatPendingItem,
+    sessionKey: string,
+  ): Promise<boolean> {
+    const pendingInputId = item.pendingInputId
+    const wal = options.pendingInputWal
+    if (!pendingInputId || !wal) return false
+    if (!wal.compareAndDeletePendingInput) {
+      await wal.delete(pendingInputId)
+      return true
+    }
+    const expectedWalRevision = item.pendingWalRevision ?? 1
+    const mutation = await wal.compareAndDeletePendingInput(
+      walRecordForItem(item, item.pendingPersistenceState || 'staged'),
+      expectedWalRevision,
+      walLookupSessionKeys(sessionKey),
+    )
+    if (mutation.applied) return true
+    if (!mutation.record) {
+      rememberRemoval(sessionKey, pendingInputId)
+      removePendingIdentity(sessionKey, pendingInputId)
+      return false
+    }
+    if (walRecordOwnsItem(mutation.record, item, sessionKey)) {
+      replaceItemFromWalRecord(item, mutation.record)
+      if (mutation.record.state === 'cancelling' && supportsServerQueue()) {
+        void retryCancellingItem(item)
+      }
     }
     return false
   }
@@ -755,10 +797,15 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     )
     for (const record of records) {
       const existing = existingById.get(record.pendingInputId)
-      if (
-        existing
-        && (record.retainAfterCancel === true || record.state === 'cancelling')
-      ) {
+      const newerWalRevision = (record.walRevision ?? 1) > (existing?.pendingWalRevision ?? 0)
+      const localOperationOwnsItem = stagingOperations.has(record.pendingInputId)
+        || cancellationOperations.has(record.pendingInputId)
+        || locallyCreatingIds.has(record.pendingInputId)
+      if (existing && (
+        record.retainAfterCancel === true
+        || record.state === 'cancelling'
+        || (newerWalRevision && !localOperationOwnsItem)
+      )) {
         replaceItemFromWalRecord(existing, record)
         continue
       }
@@ -838,7 +885,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           || item.pendingRetainAfterCancel === true
         ) continue
         if (item.pendingPersistenceState !== 'local_only') {
-          void writeWalItem(item, 'local_only')
+          void writeStagingWalItem(item, 'local_only', ownerSessionKey)
         }
       }
       return
@@ -961,9 +1008,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         if (item.pendingPersistenceState === 'staged') {
           // Another tab either cancelled or dispatched the server row. Both
           // outcomes are terminal for this WAL entry.
-          await wal.delete(item.pendingInputId!)
-          const index = pendingQueue.value.indexOf(item)
-          if (index >= 0) pendingQueue.value.splice(index, 1)
+          if (await deleteStagedWalItem(item, ownerSessionKey)) {
+            const index = pendingQueue.value.indexOf(item)
+            if (index >= 0) pendingQueue.value.splice(index, 1)
+          }
           continue
         }
         // This also upgrades IndexedDB-only rows created against an older
@@ -1293,7 +1341,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   ): Promise<boolean> {
     if (!durableItem(item)) return true
     const previousState = item.pendingPersistenceState || 'saving'
-    const sessionKey = queueSessionKey(item.ownerSessionKey)
+    let sessionKey = queueSessionKey(item.ownerSessionKey)
     const retainAfterCancel = cancelOptions.retainAfterCancel === true
     const expectedInvalidation = cancellationInvalidations.get(item.pendingInputId!) ?? 0
     if (
@@ -1342,6 +1390,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
             break
           }
           const sameIdentity = walRecordOwnsItem(mutation.record, item, sessionKey)
+          const migratedIdentity = !retainAfterCancel
+            && !sameIdentity
+            && walRecordMatchesItemIdentity(mutation.record, item)
           if (
             mutation.record.state !== 'cancelling'
             || mutation.record.retainAfterCancel === true
@@ -1359,6 +1410,12 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
             break
           }
           if (!retainAfterCancel && sameIdentity) {
+            rememberRemoval(sessionKey, item.pendingInputId!)
+            continue
+          }
+          if (migratedIdentity) {
+            replaceItemFromWalRecord(item, mutation.record)
+            sessionKey = queueSessionKey(mutation.record.sessionKey)
             rememberRemoval(sessionKey, item.pendingInputId!)
             continue
           }
@@ -1508,8 +1565,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     if (durableItem(item)) {
       void cancelDurableItem(item).then(cancelled => {
         if (!cancelled) return
-        const currentIndex = pendingQueue.value.indexOf(item)
-        if (currentIndex >= 0) pendingQueue.value.splice(currentIndex, 1)
+        removePendingIdentity(
+          queueSessionKey(item.ownerSessionKey),
+          item.pendingInputId!,
+        )
       })
       return true
     }
@@ -1751,7 +1810,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       ...pendingQueue.value,
       ...[...parkedQueues.values()].flat(),
     ].filter(item => item.ownerRequestId === ownerRequestId && durableItem(item))
-    await Promise.all(owned.map(item => writeWalItem(item, 'retryable').catch(() => {})))
+    await Promise.all(owned.map(item => (
+      writeStagingWalItem(item, 'retryable', queueSessionKey(item.ownerSessionKey))
+        .catch(() => false)
+    )))
     for (const item of owned) {
       broadcastChange(queueSessionKey(item.ownerSessionKey), item.pendingInputId)
     }
@@ -2278,6 +2340,48 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       orderedIds.length !== pendingQueue.value.length
       || orderedIds.some(id => !id || !byId.has(id))
     ) throw new Error('Gateway returned an incomplete pending order')
+    const orderedItems = orderedIds.map(id => (
+      pendingQueue.value.find(item => item.pendingInputId === id)!
+    ))
+    const expectedWalRevisions = Object.fromEntries(orderedItems.map(item => [
+      item.pendingInputId!,
+      item.pendingWalRevision ?? 1,
+    ]))
+    const nextRecords = orderedItems.map(item => {
+      const serverItem = byId.get(item.pendingInputId || '')!
+      return walRecordForItem({
+        ...item,
+        pendingPosition: Number(serverItem.position),
+        pendingServerRevision: Number(serverItem.revision),
+        pendingWalRevision: (item.pendingWalRevision ?? 1) + 1,
+      }, 'staged')
+    })
+    if (options.pendingInputWal?.compareAndSwapPendingInputs) {
+      const result = await options.pendingInputWal.compareAndSwapPendingInputs(
+        nextRecords,
+        expectedWalRevisions,
+        walLookupSessionKeys(options.sessionKey.value),
+      )
+      if (!result.applied) {
+        mergeWalRecords(result.records.map(record => ({
+          ...record,
+          sessionKey: queueSessionKey(record.sessionKey),
+        })), queueSessionKey())
+        for (const item of pendingQueue.value) {
+          if (item.pendingPersistenceState === 'cancelling') void retryCancellingItem(item)
+        }
+        throw Object.assign(
+          new Error('Pending queue changed before server reorder persistence'),
+          { code: 'PENDING_WAL_CONFLICT' },
+        )
+      }
+      restorePendingOrder(orderedIds)
+      const committedById = new Map(result.records.map(record => [record.pendingInputId, record]))
+      for (const item of pendingQueue.value) {
+        replaceItemFromWalRecord(item, committedById.get(item.pendingInputId!)!)
+      }
+      return
+    }
     restorePendingOrder(orderedIds)
     for (const item of pendingQueue.value) {
       const serverItem = byId.get(item.pendingInputId || '')!
@@ -2395,7 +2499,13 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       await applyServerReorderItems(Array.isArray(response.items) ? response.items : [])
       broadcastChange(queueSessionKey())
       finishPendingReorder()
-    } catch {
+    } catch (error) {
+      if ((error as { code?: unknown } | null)?.code === 'PENDING_WAL_CONFLICT') {
+        finishPendingReorder()
+        await hydratePendingQueue(queueSessionKey())
+        options.onPendingPersistenceError?.('order_conflict')
+        return
+      }
       // An unknown RPC result may have committed. Keep the delivery barrier
       // until an authoritative list proves which order won.
       if (await recoverServerReorder()) finishPendingReorder()

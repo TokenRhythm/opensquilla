@@ -574,4 +574,58 @@ describe('BrowserPendingInputWal atomic mutations', () => {
 
     wal!.close()
   })
+
+  it('accepts a handoff without migrating its cancellation tombstone', async () => {
+    const factory = new ControlledIdbFactory()
+    const wal = createPendingInputWal(factory.idbFactory)
+    expect(wal).not.toBeNull()
+    const ownerRequestId = 'owner-cancelling-handoff'
+    const sourceSessionKey = 'agent:main:webchat:cancel-source'
+    const targetSessionKey = 'agent:main:webchat:cancel-target'
+    const pending: PendingInputWalRecord = {
+      schemaVersion: 1,
+      pendingInputId: 'pending-cancelling-handoff',
+      sessionKey: sourceSessionKey,
+      clientRequestId: 'request-cancelling-handoff',
+      clientMessageId: 'message-cancelling-handoff',
+      text: 'do not migrate the tombstone',
+      attachments: [],
+      intent: null,
+      ownerRequestId,
+      state: 'cancelling',
+      mayHaveServerCopy: true,
+      walRevision: 2,
+      createdAt: 1,
+      updatedAt: 2,
+    }
+    await wal!.put(pending)
+    await wal!.putHandoff!({
+      schemaVersion: 1,
+      ownerRequestId,
+      requestSessionKey: sourceSessionKey,
+      clientRequestId: ownerRequestId,
+      clientMessageId: pending.clientMessageId,
+      params: {
+        sessionKey: sourceSessionKey,
+        message: pending.text,
+        clientRequestId: ownerRequestId,
+        clientMessageId: pending.clientMessageId,
+      },
+      composerText: pending.text,
+      recoveryAttachments: [],
+      state: 'submitting',
+      createdAt: 1,
+      updatedAt: 1,
+    })
+
+    const committed = await wal!.acceptHandoff!(ownerRequestId, targetSessionKey)
+
+    expect(committed?.records).toEqual([])
+    expect(committed?.handoff).toMatchObject({
+      state: 'accepted',
+      acceptedSessionKey: targetSessionKey,
+    })
+    expect(factory.record(PENDING_STORE, pending.pendingInputId)).toEqual(pending)
+    wal!.close()
+  })
 })
