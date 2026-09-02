@@ -2141,39 +2141,78 @@ describe('useChatSend attachment payloads', () => {
     expect(rpc.call).not.toHaveBeenCalled()
   })
 
-  it('replays an ambiguous queued follow-up through the replay-only gate', async () => {
-    const localPolicy = ref<string | null>(null)
-    const replayPolicy = ref<string | null>(null)
+  it.each(['removed', 'throws'] as const)(
+    'replays an ambiguous queued follow-up when project validation %s',
+    async projectFailure => {
+      const localPolicy = ref<string | null>(null)
+      const replayPolicy = ref<string | null>(null)
+      const projectState = ref<'ready' | 'removed' | 'throws'>('ready')
+      const validateActiveProjectBeforeSend = vi.fn(async () => {
+        if (projectState.value === 'throws') throw new Error('project lookup failed')
+        return projectState.value === 'removed' ? 'removed' : null
+      })
+      const rpc = {
+        call: vi.fn()
+          .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+          .mockResolvedValueOnce({
+            accepted: true,
+            replayed: true,
+            sessionKey: 'agent:main:webchat:test',
+            task_id: 'task-queued-replay',
+          }),
+      }
+      const queued: ChatPendingItem = {
+        pendingUiId: 'pending-ui-queued-replay',
+        text: 'recover this accepted follow-up',
+        attachments: [],
+        intent: null,
+        ownerSessionKey: 'agent:main:webchat:test',
+      }
+      const { api } = makeOptions({
+        rpc,
+        sendBlockedReason: localPolicy,
+        sessionInteractivityBlockedReason: localPolicy,
+        idempotentReplayBlockedReason: replayPolicy,
+        validateActiveProjectBeforeSend,
+      })
+
+      await expect(api.sendQueuedFollowup(queued)).resolves.toBe('retryable_failure')
+      const originalParams = rpc.call.mock.calls[0]?.[1]
+      localPolicy.value = 'Cron sessions are read-only.'
+      projectState.value = projectFailure
+
+      await expect(api.sendQueuedFollowup(queued)).resolves.toBe('accepted')
+      expect(rpc.call.mock.calls[1]?.[1]).toEqual(originalParams)
+      expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce()
+    },
+  )
+
+  it('keeps project validation for a definitely rejected queued follow-up', async () => {
+    const projectState = ref<'ready' | 'removed'>('ready')
+    const validateActiveProjectBeforeSend = vi.fn(async () => (
+      projectState.value === 'removed' ? 'removed' : null
+    ))
     const rpc = {
-      call: vi.fn()
-        .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
-        .mockResolvedValueOnce({
-          accepted: true,
-          replayed: true,
-          sessionKey: 'agent:main:webchat:test',
-          task_id: 'task-queued-replay',
-        }),
+      call: vi.fn().mockRejectedValue(Object.assign(new Error('storage busy'), {
+        accepted: false,
+        retryable: true,
+      })),
     }
     const queued: ChatPendingItem = {
-      pendingUiId: 'pending-ui-queued-replay',
-      text: 'recover this accepted follow-up',
+      pendingUiId: 'pending-ui-rejected-project-gate',
+      text: 'retry only while the project exists',
       attachments: [],
       intent: null,
       ownerSessionKey: 'agent:main:webchat:test',
     }
-    const { api } = makeOptions({
-      rpc,
-      sendBlockedReason: localPolicy,
-      sessionInteractivityBlockedReason: localPolicy,
-      idempotentReplayBlockedReason: replayPolicy,
-    })
+    const { api } = makeOptions({ rpc, validateActiveProjectBeforeSend })
 
     await expect(api.sendQueuedFollowup(queued)).resolves.toBe('retryable_failure')
-    const originalParams = rpc.call.mock.calls[0]?.[1]
-    localPolicy.value = 'Cron sessions are read-only.'
+    projectState.value = 'removed'
 
-    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('accepted')
-    expect(rpc.call.mock.calls[1]?.[1]).toEqual(originalParams)
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('retryable_failure')
+    expect(validateActiveProjectBeforeSend).toHaveBeenCalledTimes(2)
+    expect(rpc.call).toHaveBeenCalledOnce()
   })
 
   it('queues an immutable hidden confirmation while live delivery is blocked', async () => {
@@ -2200,37 +2239,48 @@ describe('useChatSend attachment payloads', () => {
     expect(options.messages.value).toEqual([])
   })
 
-  it('replays an attempted hidden control through the replay-only gate after remount', async () => {
-    const first = makeOptions({
-      rpc: {
-        call: vi.fn().mockRejectedValueOnce(new RpcTransportError('Connection closed', null)),
-      },
-    })
-    await expect(first.api.dispatchHiddenSend(
-      'provider confirmation',
-      'Confirmed',
-      'hidden-replay-after-policy',
-    )).resolves.toMatchObject({ status: 'unknown' })
-    expect(listHiddenControls(
-      'agent:main:webchat:test',
-      first.options.hiddenControlStorage,
-    )[0]?.dispatchAttempted).toBe(true)
+  it.each(['removed', 'throws'] as const)(
+    'replays an attempted hidden control when project validation %s after remount',
+    async projectFailure => {
+      const projectState = ref<'removed' | 'throws'>(projectFailure)
+      const firstProjectValidator = vi.fn(async () => null)
+      const first = makeOptions({
+        rpc: {
+          call: vi.fn().mockRejectedValueOnce(new RpcTransportError('Connection closed', null)),
+        },
+        validateActiveProjectBeforeSend: firstProjectValidator,
+      })
+      await expect(first.api.dispatchHiddenSend(
+        'provider confirmation',
+        'Confirmed',
+        'hidden-replay-after-policy',
+      )).resolves.toMatchObject({ status: 'unknown' })
+      expect(listHiddenControls(
+        'agent:main:webchat:test',
+        first.options.hiddenControlStorage,
+      )[0]?.dispatchAttempted).toBe(true)
+      const originalParams = first.rpc.call.mock.calls[0]?.[1]
 
-    const localPolicy = ref<string | null>('Cron sessions are read-only.')
-    const replayPolicy = ref<string | null>(null)
-    const remounted = makeOptions({
-      hiddenControlStorage: first.options.hiddenControlStorage,
-      sendBlockedReason: localPolicy,
-      sessionInteractivityBlockedReason: localPolicy,
-      idempotentReplayBlockedReason: replayPolicy,
-    })
-    await remounted.api.restoreHiddenControls('agent:main:webchat:test')
+      const localPolicy = ref<string | null>('Cron sessions are read-only.')
+      const replayPolicy = ref<string | null>(null)
+      const replayProjectValidator = vi.fn(async () => {
+        if (projectState.value === 'throws') throw new Error('project lookup failed')
+        return 'removed'
+      })
+      const remounted = makeOptions({
+        hiddenControlStorage: first.options.hiddenControlStorage,
+        sendBlockedReason: localPolicy,
+        sessionInteractivityBlockedReason: localPolicy,
+        idempotentReplayBlockedReason: replayPolicy,
+        validateActiveProjectBeforeSend: replayProjectValidator,
+      })
+      await remounted.api.restoreHiddenControls('agent:main:webchat:test')
 
-    expect(remounted.rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
-      clientRequestId: 'hidden-replay-after-policy',
-      message: 'provider confirmation',
-    }))
-  })
+      expect(remounted.rpc.call).toHaveBeenCalledWith('chat.send', originalParams)
+      expect(firstProjectValidator).toHaveBeenCalledOnce()
+      expect(replayProjectValidator).not.toHaveBeenCalled()
+    },
+  )
 
   it('reconciles an attempted hidden receipt even when a completed setup job owns the draft', async () => {
     const hiddenControlStorage = memoryStorage()
@@ -3875,78 +3925,104 @@ describe('useChatSend attachment payloads', () => {
     expect(options.messages.value.filter(message => message.role === 'user')).toHaveLength(1)
   })
 
-  it('replays an acceptance-unknown queued steer after the session becomes read-only', async () => {
-    const sessionPolicy = ref<string | null>(null)
-    const replayPolicy = ref<string | null>(null)
-    const rpc = {
-      call: vi.fn()
-        .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
-        .mockResolvedValueOnce({
-          accepted: true,
-          replayed: true,
-          turn_id: 'turn-current',
-          disposition: 'steering',
-        }),
-    }
-    const queued: ChatPendingItem = {
-      pendingUiId: 'pending-ui-unknown-steer-read-only',
-      text: 'recover the exact steer',
-      attachments: [],
-      intent: null,
-      ownerSessionKey: 'agent:main:webchat:test',
-    }
-    const { api } = makeOptions({
-      ...sameTurnSteerOptions(),
-      rpc,
-      sendBlockedReason: sessionPolicy,
-      sessionInteractivityBlockedReason: sessionPolicy,
-      idempotentReplayBlockedReason: replayPolicy,
-    })
+  it.each(['removed', 'throws'] as const)(
+    'replays an acceptance-unknown queued steer when project validation %s',
+    async projectFailure => {
+      const sessionPolicy = ref<string | null>(null)
+      const replayPolicy = ref<string | null>(null)
+      const projectState = ref<'ready' | 'removed' | 'throws'>('ready')
+      const validateActiveProjectBeforeSend = vi.fn(async () => {
+        if (projectState.value === 'throws') throw new Error('project lookup failed')
+        return projectState.value === 'removed' ? 'removed' : null
+      })
+      const rpc = {
+        call: vi.fn()
+          .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+          .mockResolvedValueOnce({
+            accepted: true,
+            replayed: true,
+            turn_id: 'turn-current',
+            disposition: 'steering',
+          }),
+      }
+      const queued: ChatPendingItem = {
+        pendingUiId: 'pending-ui-unknown-steer-read-only',
+        text: 'recover the exact steer',
+        attachments: [],
+        intent: null,
+        ownerSessionKey: 'agent:main:webchat:test',
+      }
+      const { api } = makeOptions({
+        ...sameTurnSteerOptions(),
+        rpc,
+        sendBlockedReason: sessionPolicy,
+        sessionInteractivityBlockedReason: sessionPolicy,
+        idempotentReplayBlockedReason: replayPolicy,
+        validateActiveProjectBeforeSend,
+      })
 
-    await expect(api.sendQueuedSteer(queued)).resolves.toBe('retryable_failure')
-    const originalParams = rpc.call.mock.calls[0]?.[1]
-    expect(queued.steerAttempt?.phase).toBe('acceptance_unknown')
-    sessionPolicy.value = 'Cron sessions are read-only.'
+      await expect(api.sendQueuedSteer(queued)).resolves.toBe('retryable_failure')
+      const originalParams = rpc.call.mock.calls[0]?.[1]
+      expect(queued.steerAttempt?.phase).toBe('acceptance_unknown')
+      sessionPolicy.value = 'Cron sessions are read-only.'
+      projectState.value = projectFailure
 
-    await expect(api.sendQueuedSteer(queued)).resolves.toBe('accepted')
-    expect(rpc.call.mock.calls[1]?.[1]).toEqual(originalParams)
-  })
+      await expect(api.sendQueuedSteer(queued)).resolves.toBe('accepted')
+      expect(rpc.call.mock.calls[1]?.[1]).toEqual(originalParams)
+      expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce()
+    },
+  )
 
-  it('does not replay a definitely rejected queued steer through read-only policy', async () => {
-    const sessionPolicy = ref<string | null>(null)
-    const rpc = {
-      call: vi.fn().mockRejectedValue(Object.assign(new Error('storage busy'), {
-        accepted: false,
-        retryable: true,
-      })),
-    }
-    const queued: ChatPendingItem = {
-      pendingUiId: 'pending-ui-rejected-steer-read-only',
-      text: 'do not recover as receipt replay',
-      attachments: [],
-      intent: null,
-      ownerSessionKey: 'agent:main:webchat:test',
-    }
-    const { api } = makeOptions({
-      ...sameTurnSteerOptions(),
-      rpc,
-      sendBlockedReason: sessionPolicy,
-      sessionInteractivityBlockedReason: sessionPolicy,
-      idempotentReplayBlockedReason: ref(null),
-    })
+  it.each(['project', 'interactivity'] as const)(
+    'does not replay a definitely rejected queued steer through %s policy',
+    async policyGate => {
+      const sessionPolicy = ref<string | null>(null)
+      const projectState = ref<'ready' | 'removed'>('ready')
+      const validateActiveProjectBeforeSend = vi.fn(async () => (
+        projectState.value === 'removed' ? 'removed' : null
+      ))
+      const rpc = {
+        call: vi.fn().mockRejectedValue(Object.assign(new Error('storage busy'), {
+          accepted: false,
+          retryable: true,
+        })),
+      }
+      const queued: ChatPendingItem = {
+        pendingUiId: 'pending-ui-rejected-steer-read-only',
+        text: 'do not recover as receipt replay',
+        attachments: [],
+        intent: null,
+        ownerSessionKey: 'agent:main:webchat:test',
+      }
+      const { api } = makeOptions({
+        ...sameTurnSteerOptions(),
+        rpc,
+        sendBlockedReason: sessionPolicy,
+        sessionInteractivityBlockedReason: sessionPolicy,
+        idempotentReplayBlockedReason: ref(null),
+        validateActiveProjectBeforeSend,
+      })
 
-    await expect(api.sendQueuedSteer(queued)).resolves.toBe('retryable_failure')
-    expect(queued.steerAttempt?.phase).toBe('retryable_rejected')
-    const originalRequest = queued.steerAttempt?.request
-    sessionPolicy.value = 'Cron sessions are read-only.'
+      await expect(api.sendQueuedSteer(queued)).resolves.toBe('retryable_failure')
+      expect(queued.steerAttempt?.phase).toBe('retryable_rejected')
+      const originalRequest = queued.steerAttempt?.request
+      if (policyGate === 'interactivity') {
+        sessionPolicy.value = 'Cron sessions are read-only.'
+      } else {
+        projectState.value = 'removed'
+      }
 
-    await expect(api.sendQueuedSteer(queued)).resolves.toBe('retryable_failure')
-    expect(rpc.call).toHaveBeenCalledOnce()
-    expect(queued.steerAttempt).toMatchObject({
-      phase: 'retryable_rejected',
-      request: originalRequest,
-    })
-  })
+      await expect(api.sendQueuedSteer(queued)).resolves.toBe('retryable_failure')
+      expect(rpc.call).toHaveBeenCalledOnce()
+      expect(queued.steerAttempt).toMatchObject({
+        phase: 'retryable_rejected',
+        request: originalRequest,
+      })
+      expect(validateActiveProjectBeforeSend).toHaveBeenCalledTimes(
+        policyGate === 'project' ? 2 : 1,
+      )
+    },
+  )
 
   it('treats a fulfilled steer response without accepted as unknown despite tempting fields', async () => {
     const rpc = {
@@ -4676,38 +4752,70 @@ describe('useChatSend attachment payloads', () => {
     expect(secondParams).not.toHaveProperty('collaborationMode')
   })
 
-  it('replays an unknown-acceptance attempt with its original mode and request id', async () => {
-    const inputText = ref('inspect and plan')
-    const pendingSessionIntent = ref<string | null>('new_chat')
-    const initialCollaborationMode = ref<CollaborationMode>('plan')
+  it.each(['removed', 'throws'] as const)(
+    'replays an unknown-acceptance attempt when project validation %s',
+    async projectFailure => {
+      const inputText = ref('inspect and plan')
+      const pendingSessionIntent = ref<string | null>('new_chat')
+      const initialCollaborationMode = ref<CollaborationMode>('plan')
+      const projectState = ref<'ready' | 'removed' | 'throws'>('ready')
+      const validateActiveProjectBeforeSend = vi.fn(async () => {
+        if (projectState.value === 'throws') throw new Error('project lookup failed')
+        return projectState.value === 'removed' ? 'removed' : null
+      })
+      const rpc = {
+        call: vi.fn()
+          .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+          .mockResolvedValueOnce({
+            sessionKey: 'agent:main:webchat:test',
+            task_id: 'task-plan',
+          }),
+      }
+      const { api } = makeOptions({
+        rpc,
+        inputText,
+        pendingSessionIntent,
+        initialCollaborationMode,
+        validateActiveProjectBeforeSend,
+      })
+
+      await api.onSend()
+      initialCollaborationMode.value = 'default'
+      projectState.value = projectFailure
+      await api.onSend()
+
+      const firstParams = rpc.call.mock.calls[0]?.[1]
+      const secondParams = rpc.call.mock.calls[1]?.[1]
+      expect(secondParams.clientRequestId).toBe(firstParams.clientRequestId)
+      expect(secondParams).toEqual(firstParams)
+      expect(secondParams).toMatchObject({
+        collaborationMode: 'plan',
+        intent: 'new_chat',
+        initialRoutingMode: 'direct',
+      })
+      expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce()
+    },
+  )
+
+  it('keeps project validation for a definitely rejected visible retry', async () => {
+    const projectState = ref<'ready' | 'removed'>('ready')
+    const validateActiveProjectBeforeSend = vi.fn(async () => (
+      projectState.value === 'removed' ? 'removed' : null
+    ))
     const rpc = {
-      call: vi.fn()
-        .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
-        .mockResolvedValueOnce({
-          sessionKey: 'agent:main:webchat:test',
-          task_id: 'task-plan',
-        }),
+      call: vi.fn().mockRejectedValue(Object.assign(new Error('storage busy'), {
+        accepted: false,
+        retryable: true,
+      })),
     }
-    const { api } = makeOptions({
-      rpc,
-      inputText,
-      pendingSessionIntent,
-      initialCollaborationMode,
-    })
+    const { api } = makeOptions({ rpc, validateActiveProjectBeforeSend })
 
     await api.onSend()
-    initialCollaborationMode.value = 'default'
+    projectState.value = 'removed'
     await api.onSend()
 
-    const firstParams = rpc.call.mock.calls[0]?.[1]
-    const secondParams = rpc.call.mock.calls[1]?.[1]
-    expect(secondParams.clientRequestId).toBe(firstParams.clientRequestId)
-    expect(secondParams).toEqual(firstParams)
-    expect(secondParams).toMatchObject({
-      collaborationMode: 'plan',
-      intent: 'new_chat',
-      initialRoutingMode: 'direct',
-    })
+    expect(validateActiveProjectBeforeSend).toHaveBeenCalledTimes(2)
+    expect(rpc.call).toHaveBeenCalledOnce()
   })
 
   it('resolves unknown acceptance before sending an edited draft', async () => {

@@ -2298,9 +2298,6 @@ export function useChatSend(options: UseChatSendOptions) {
       const replayBlockedReason = options.idempotentReplayBlockedReason
         || options.sendBlockedReason
       if (replayBlockedReason?.value) return
-      if (options.validateActiveProjectBeforeSend) {
-        if (await refreshedActiveProjectBlocksSend()) return
-      }
       if (options.sessionKey.value !== requestSessionKey) return
       if (replayBlockedReason?.value) return
       await dispatchSend(exactReplayAttempt.text, {
@@ -2560,7 +2557,7 @@ export function useChatSend(options: UseChatSendOptions) {
     if (sendBlockedReason?.value) {
       return blockedOutcome()
     }
-    if (options.validateActiveProjectBeforeSend) {
+    if (!idempotentReplay && options.validateActiveProjectBeforeSend) {
       if (await refreshedActiveProjectBlocksSend()) return blockedOutcome()
       if (options.sessionKey.value !== ownerSessionKey) {
         return preserveRetryState('not_sent')
@@ -2600,7 +2597,8 @@ export function useChatSend(options: UseChatSendOptions) {
       }
       if (sendBlockedReason?.value) return blockedOutcome()
       if (
-        options.validateActiveProjectBeforeSend
+        !idempotentReplay
+        && options.validateActiveProjectBeforeSend
         && await refreshedActiveProjectBlocksSend()
       ) return blockedOutcome()
       if (options.sessionKey.value !== ownerSessionKey) {
@@ -3833,7 +3831,9 @@ export function useChatSend(options: UseChatSendOptions) {
     const interactivityBlocked = () => Boolean(
       !idempotentReplay && options.sessionInteractivityBlockedReason?.value,
     )
-    const projectBlocked = !interactivityBlocked() && options.validateActiveProjectBeforeSend
+    const projectBlocked = !idempotentReplay
+      && !interactivityBlocked()
+      && options.validateActiveProjectBeforeSend
       ? await refreshedActiveProjectBlocksSend()
       : false
     if (options.sessionKey.value !== requestSessionKey) {
