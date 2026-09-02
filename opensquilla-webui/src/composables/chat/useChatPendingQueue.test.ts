@@ -125,7 +125,10 @@ function memoryWal(initial: PendingInputWalRecord[] = []) {
         || current.state !== 'cancelling'
         || current.retainAfterCancel !== true
         || (current.walRevision ?? 1) !== expectedWalRevision
-      ) return null
+      ) return {
+        applied: false,
+        record: current ? structuredClone(current) : null,
+      }
       const retained = {
         ...structuredClone(record),
         state: 'local_only' as const,
@@ -134,7 +137,7 @@ function memoryWal(initial: PendingInputWalRecord[] = []) {
         updatedAt: Date.now(),
       }
       records.set(record.pendingInputId, retained)
-      return structuredClone(retained)
+      return { applied: true, record: structuredClone(retained) }
     }),
     commitOrder: vi.fn(async (
       sessionKey: string,
@@ -1336,6 +1339,88 @@ describe('useChatPendingQueue delivery state', () => {
       expect(queue.pendingQueue.value.map(item => item.text)).toEqual(['A', 'B'])
     } finally {
       queue.cleanup()
+    }
+  })
+
+  it('keeps adjacent drafts ordered when different tabs win their retain CAS', async () => {
+    vi.stubGlobal(
+      'BroadcastChannel',
+      TestBroadcastChannel as unknown as typeof BroadcastChannel,
+    )
+    const { wal, records } = memoryWal()
+    const sharedRetain = wal.retainCancelled!
+    let retainCalls = 0
+    let releaseRetainCalls!: () => void
+    const allRetainCalls = new Promise<void>(resolve => { releaseRetainCalls = resolve })
+    const waitForAllRetainCalls = async () => {
+      retainCalls += 1
+      if (retainCalls === 4) releaseRetainCalls()
+      await allRetainCalls
+    }
+    let markFirstWonA!: () => void
+    let markSecondWonB!: () => void
+    const firstWonA = new Promise<void>(resolve => { markFirstWonA = resolve })
+    const secondWonB = new Promise<void>(resolve => { markSecondWonB = resolve })
+    let firstId = ''
+    let secondId = ''
+    const firstWal: PendingInputWal = {
+      ...wal,
+      retainCancelled: vi.fn(async (record, expectedWalRevision) => {
+        await waitForAllRetainCalls()
+        if (record.pendingInputId === firstId) {
+          const result = await sharedRetain(record, expectedWalRevision)
+          markFirstWonA()
+          return result
+        }
+        await secondWonB
+        return sharedRetain(record, expectedWalRevision)
+      }),
+    }
+    const secondWal: PendingInputWal = {
+      ...wal,
+      retainCancelled: vi.fn(async (record, expectedWalRevision) => {
+        await waitForAllRetainCalls()
+        if (record.pendingInputId === secondId) {
+          const result = await sharedRetain(record, expectedWalRevision)
+          markSecondWonB()
+          return result
+        }
+        await firstWonA
+        return sharedRetain(record, expectedWalRevision)
+      }),
+    }
+    const first = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: firstWal,
+      hasRpcMethod: () => false,
+    })
+    const second = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: secondWal,
+      hasRpcMethod: () => false,
+    })
+    try {
+      for (const text of ['A', 'B']) {
+        first.inputText.value = text
+        await expect(first.queue.enqueuePendingInput(text)).resolves.toBe(true)
+      }
+      await second.queue.hydratePendingQueue()
+      firstId = first.queue.pendingQueue.value[0]!.pendingInputId!
+      secondId = first.queue.pendingQueue.value[1]!.pendingInputId!
+
+      expect(first.queue.popAllPendingIntoComposer()).toBe(true)
+      expect(second.queue.popAllPendingIntoComposer()).toBe(true)
+
+      await vi.waitFor(() => {
+        expect(first.inputText.value).toBe('A')
+        expect(second.inputText.value).toBe('')
+        expect(first.queue.pendingQueue.value.map(item => item.text)).toEqual(['B'])
+        expect(second.queue.pendingQueue.value.map(item => item.text)).toEqual(['B'])
+        expect([...records.values()].map(record => record.text)).toEqual(['B'])
+      })
+    } finally {
+      first.queue.cleanup()
+      second.queue.cleanup()
+      vi.unstubAllGlobals()
+      TestBroadcastChannel.channels.clear()
     }
   })
 

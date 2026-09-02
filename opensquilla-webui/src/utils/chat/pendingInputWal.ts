@@ -69,6 +69,12 @@ export interface PendingInputOrderCommit {
   records: PendingInputWalRecord[]
 }
 
+export interface PendingInputRetainMutation {
+  applied: boolean
+  /** The current live row, or null only when no valid row owns this identity. */
+  record: PendingInputWalRecord | null
+}
+
 export interface AcceptedHandoffCommit {
   handoff: ResponseHandoffWalRecord
   records: PendingInputWalRecord[]
@@ -88,7 +94,7 @@ export interface PendingInputWal {
   retainCancelled?: (
     record: PendingInputWalRecord,
     expectedWalRevision: number,
-  ) => Promise<PendingInputWalRecord | null>
+  ) => Promise<PendingInputRetainMutation>
   commitOrder?: (
     sessionKey: string,
     orderedIds: string[],
@@ -332,7 +338,7 @@ class BrowserPendingInputWal implements PendingInputWal {
   async retainCancelled(
     record: PendingInputWalRecord,
     expectedWalRevision: number,
-  ): Promise<PendingInputWalRecord | null> {
+  ): Promise<PendingInputRetainMutation> {
     const database = await this.database()
     const transaction = database.transaction(STORE_NAME, 'readwrite')
     const store = transaction.objectStore(STORE_NAME)
@@ -347,7 +353,10 @@ class BrowserPendingInputWal implements PendingInputWal {
       || (raw.walRevision ?? 1) !== expectedWalRevision
     ) {
       await transactionDone(transaction)
-      return null
+      return {
+        applied: false,
+        record: isPendingInputWalRecord(raw) ? cloneRecord(raw) : null,
+      }
     }
     const retained = cloneRecord({
       ...record,
@@ -358,7 +367,7 @@ class BrowserPendingInputWal implements PendingInputWal {
     })
     store.put(retained)
     await transactionDone(transaction)
-    return retained
+    return { applied: true, record: retained }
   }
 
   async list(sessionKey: string): Promise<PendingInputWalRecord[]> {

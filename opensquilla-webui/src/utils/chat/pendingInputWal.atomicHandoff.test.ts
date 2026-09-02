@@ -298,18 +298,31 @@ describe('BrowserPendingInputWal atomic mutations', () => {
     await wal!.put(cancelling)
     await wal!.delete(cancelling.pendingInputId)
 
-    await expect(wal!.retainCancelled!(retained, 2)).resolves.toBeNull()
+    await expect(wal!.retainCancelled!(retained, 2)).resolves.toEqual({
+      applied: false,
+      record: null,
+    })
     expect(factory.record(PENDING_STORE, cancelling.pendingInputId)).toBeUndefined()
 
     await wal!.put(cancelling)
     await expect(wal!.retainCancelled!(retained, 2)).resolves.toMatchObject({
-      state: 'local_only',
-      retainAfterCancel: true,
-      walRevision: 3,
+      applied: true,
+      record: {
+        state: 'local_only',
+        retainAfterCancel: true,
+        walRevision: 3,
+      },
     })
     expect(factory.record(PENDING_STORE, cancelling.pendingInputId)).toMatchObject({
       state: 'local_only',
       walRevision: 3,
+    })
+    await expect(wal!.retainCancelled!(retained, 2)).resolves.toMatchObject({
+      applied: false,
+      record: {
+        state: 'local_only',
+        walRevision: 3,
+      },
     })
     wal!.close()
   })

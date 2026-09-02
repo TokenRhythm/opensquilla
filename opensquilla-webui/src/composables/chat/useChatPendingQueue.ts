@@ -1154,17 +1154,35 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     try {
       if (options.pendingInputWal?.retainCancelled) {
         const expectedWalRevision = item.pendingWalRevision ?? 1
-        const retained = await options.pendingInputWal.retainCancelled(
+        const mutation = await options.pendingInputWal.retainCancelled(
           {
             ...walRecordForItem(item, 'local_only'),
             walRevision: expectedWalRevision + 1,
           },
           expectedWalRevision,
         )
-        if (!retained) {
+        if (!mutation.applied) {
+          if (mutation.record) {
+            // Another tab still owns a live row. Keep this queue slot as an
+            // ordering barrier and allow a later hydrate to reconcile it.
+            forgetRemoval(sessionKey, item.pendingInputId!)
+            if (
+              mutation.record.sessionKey === sessionKey
+              && mutation.record.clientRequestId === item.pendingClientRequestId
+              && mutation.record.clientMessageId === item.pendingClientMessageId
+            ) {
+              Object.assign(item, itemFromWalRecord(mutation.record))
+              delete item.deliveryState
+              delete item.pendingRequestFingerprint
+              delete item.pendingServerRevision
+              delete item.pendingPosition
+            }
+            return false
+          }
           removePendingIdentity(sessionKey, item.pendingInputId!)
           return false
         }
+        const retained = mutation.record!
         item.pendingPersistenceState = retained.state
         item.pendingWalRevision = retained.walRevision
       } else {
