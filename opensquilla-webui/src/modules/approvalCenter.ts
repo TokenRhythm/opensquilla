@@ -105,6 +105,11 @@ export interface ApprovalSubscription {
 }
 
 export interface ApprovalCenter {
+  setElevatedMode(
+    sessionKey: string,
+    mode: 'off' | 'on' | 'bypass' | 'full',
+    options?: ApprovalRequestOptions,
+  ): Promise<void>
   snapshot(options?: ApprovalRequestOptions): Promise<ApprovalSnapshot>
   status(
     namespace: ApprovalNamespace,

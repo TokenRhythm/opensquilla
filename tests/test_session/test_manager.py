@@ -3171,6 +3171,7 @@ async def test_compact_with_result_summarizes_completed_tool_round(manager):
     )
 
 
+@pytest.mark.ci_serial
 @pytest.mark.asyncio
 async def test_compact_with_result_strict_coverage_installs_verified_backfill(manager):
     node = await manager.create("agent:main:main")

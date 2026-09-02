@@ -573,7 +573,7 @@
       },
       "mode": {
         "title": "Default access mode",
-        "description": "Choose the starting mode for new tasks. Safe stays unavailable when the capability probe fails.",
+        "description": "Set the global access mode. Selecting Safe for the first time opens sandbox setup; Safe is disabled if initialization fails or the sandbox is unsupported.",
         "default": "Default mode",
         "safe": "Safe",
         "full": "Full Access",

@@ -2,8 +2,10 @@ import { describe, expect, it, vi } from 'vitest'
 
 import {
   createRpcArtifactPromptAnnotationProvider,
-  normalizePromptAnnotationSnapshot,
   PROMPT_ANNOTATION_RPC_METHODS,
+} from '@/adapters/gateway/artifactPromptAnnotationsV4'
+import {
+  normalizePromptAnnotationSnapshot,
 } from './artifactPromptAnnotationProvider'
 import type { PromptAnnotationSelection } from '@/types/promptAnnotations'
 
@@ -174,15 +176,15 @@ describe('artifact prompt annotation RPC provider', () => {
   })
 
   it('marks unsupported optional RPCs unavailable without retaining fake drafts', async () => {
-    const markMethodUnavailable = vi.fn()
+    const rememberUnsupportedMethod = vi.fn()
     const provider = createRpcArtifactPromptAnnotationProvider({
       call: vi.fn().mockRejectedValue(Object.assign(new Error('Method not found'), {
         code: 'METHOD_NOT_FOUND',
       })),
-      markMethodUnavailable,
+      rememberUnsupportedMethod,
     })
 
     await expect(provider.list('session-a')).resolves.toEqual([])
-    expect(markMethodUnavailable).toHaveBeenCalledWith(PROMPT_ANNOTATION_RPC_METHODS.list)
+    expect(rememberUnsupportedMethod).toHaveBeenCalledWith(PROMPT_ANNOTATION_RPC_METHODS.list)
   })
 })

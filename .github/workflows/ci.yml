@@ -1466,8 +1466,8 @@ jobs:
                   "os": "Windows",
                   "cases": {"desktop-cleanup-flow"},
                   "pattern": re.compile(
-                      r"^Error: Timed out waiting for post-exit delete-all helper completion\."
-                      r"; pending synthetic targets: .+$",
+                      r"^Error: Timed out waiting for post-exit delete-all helper completion:"
+                      r"\s*; pending synthetic targets: .+$",
                       re.MULTILINE,
                   ),
                   "companion_patterns": (),

@@ -1,7 +1,20 @@
 import type { RpcCallOptions } from '@/lib/rpc'
-import type { AppSettings, AppSettingsSnapshot, SettingsObject } from '@/modules/appSettings'
+import type {
+  AppSettings,
+  EffectiveSettings,
+  SettingChange,
+  SettingsMutation,
+  SettingsObject,
+  SettingsValue,
+} from '@/modules/appSettings'
 import { CONFIG_GET_METHOD } from '@/contracts/generated/v4/configGet'
 import { validateResult as validateConfigGetResult } from '@/contracts/generated/v4/configGetValidators.mjs'
+import { CONFIG_EFFECTIVE_METHOD } from '@/contracts/generated/v4/configEffective'
+import { validateResult as validateConfigEffectiveResult } from '@/contracts/generated/v4/configEffectiveValidators.mjs'
+import { CONFIG_PATCH_METHOD } from '@/contracts/generated/v4/configPatch'
+import { validateResult as validateConfigPatchResult } from '@/contracts/generated/v4/configPatchValidators.mjs'
+import { CONFIG_PATCH_SAFE_METHOD } from '@/contracts/generated/v4/configPatchSafe'
+import { validateResult as validateConfigPatchSafeResult } from '@/contracts/generated/v4/configPatchSafeValidators.mjs'
 
 interface RpcTransport {
   request<T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions): Promise<T>
@@ -11,14 +24,53 @@ function object(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
 }
 
-function snapshot(value: unknown): AppSettingsSnapshot {
-  const raw = object(value)
-  const values = object(raw.values ?? raw.config ?? raw.settings) as SettingsObject
-  return {
-    values,
-    ...(Number.isInteger(raw.revision) ? { revision: raw.revision as number } : {}),
-    ...(typeof raw.restartRequired === 'boolean' ? { restartRequired: raw.restartRequired } : {}),
+function settings(value: unknown): SettingsObject {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${CONFIG_GET_METHOD} returned a non-object public config`)
   }
+  return value as SettingsObject
+}
+
+function effective(value: unknown): EffectiveSettings {
+  const raw = object(value)
+  const fields = object(raw.fields)
+  for (const [path, field] of Object.entries(fields)) {
+    const record = object(field)
+    if (!('value' in record) || typeof record.source !== 'string') {
+      throw new Error(`config.effective returned an invalid field: ${path}`)
+    }
+  }
+  return { fields: fields as EffectiveSettings['fields'] }
+}
+
+function mutation(value: unknown): SettingsMutation {
+  const raw = object(value)
+  const result: Record<string, unknown> = { ...raw }
+  const values = raw.values ?? raw.config ?? raw.settings
+  if (values && typeof values === 'object' && !Array.isArray(values)) {
+    result.values = values as SettingsObject
+  } else {
+    delete result.values
+  }
+  if (Number.isInteger(raw.revision)) result.revision = raw.revision as number
+  if (typeof raw.restartRequired === 'boolean') result.restartRequired = raw.restartRequired
+  else if (typeof raw.restart_required === 'boolean') result.restartRequired = raw.restart_required
+  if (Array.isArray(raw.patched)) result.patched = raw.patched.filter(item => typeof item === 'string')
+  if (Array.isArray(raw.linked)) result.linked = raw.linked.filter(item => typeof item === 'string')
+  return result as SettingsMutation
+}
+
+function patchMap(changes: readonly SettingChange[]): Record<string, SettingsValue> {
+  const patches: Record<string, SettingsValue> = {}
+  for (const change of changes) {
+    const path = change?.path?.trim()
+    if (!path) throw new Error('Setting paths must not be empty')
+    if (Object.prototype.hasOwnProperty.call(patches, path)) {
+      throw new Error(`Duplicate setting path: ${path}`)
+    }
+    patches[path] = change.value
+  }
+  return patches
 }
 
 function options(signal?: AbortSignal): RpcCallOptions {
@@ -27,19 +79,42 @@ function options(signal?: AbortSignal): RpcCallOptions {
 
 export function createV4AppSettings(rpc: RpcTransport): AppSettings {
   return {
-    async get(path, request) {
-      const result = await rpc.request(CONFIG_GET_METHOD, path ? { path } : undefined, options(request?.signal))
-      if (!validateConfigGetResult(result)) throw new Error(`${CONFIG_GET_METHOD} returned an invalid response`)
-      return snapshot(result)
+    async readAll(request) {
+      const result = await rpc.request(CONFIG_GET_METHOD, undefined, options(request?.signal))
+      if (!validateConfigGetResult(result) || !result || typeof result !== 'object' || Array.isArray(result)) {
+        throw new Error(`${CONFIG_GET_METHOD} returned an invalid response`)
+      }
+      return settings(result)
     },
-    async effective(request) {
-      return snapshot(await rpc.request('config.effective', undefined, options(request?.signal)))
+    async read(path, request) {
+      const normalizedPath = path.trim()
+      if (!normalizedPath) throw new Error('Setting path must not be empty')
+      const result = await rpc.request(CONFIG_GET_METHOD, { path: normalizedPath }, options(request?.signal))
+      if (!validateConfigGetResult(result)) throw new Error(`${CONFIG_GET_METHOD} returned an invalid response`)
+      return result as SettingsValue | null
+    },
+    async readEffective(request) {
+      const result = await rpc.request(CONFIG_EFFECTIVE_METHOD, undefined, options(request?.signal))
+      if (!validateConfigEffectiveResult(result)) throw new Error(`${CONFIG_EFFECTIVE_METHOD} returned an invalid response`)
+      return effective(result)
     },
     async patch(patches, request) {
-      return snapshot(await rpc.request('config.patch', { patches }, options(request?.signal)))
+      const result = await rpc.request(CONFIG_PATCH_METHOD, { patches: patchMap(patches) }, options(request?.signal))
+      if (!validateConfigPatchResult(result)) throw new Error(`${CONFIG_PATCH_METHOD} returned an invalid response`)
+      return mutation(result)
     },
     async patchSafe(patches, request) {
-      return snapshot(await rpc.request('config.patch.safe', { patches }, options(request?.signal)))
+      const result = await rpc.request(CONFIG_PATCH_SAFE_METHOD, { patches: patchMap(patches) }, options(request?.signal))
+      if (!validateConfigPatchSafeResult(result)) throw new Error(`${CONFIG_PATCH_SAFE_METHOD} returned an invalid response`)
+      return mutation(result)
+    },
+    async merge(patch, request) {
+      if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
+        throw new Error('Config merge patch must be an object')
+      }
+      const result = await rpc.request(CONFIG_PATCH_METHOD, { patch }, options(request?.signal))
+      if (!validateConfigPatchResult(result)) throw new Error(`${CONFIG_PATCH_METHOD} returned an invalid response`)
+      return mutation(result)
     },
   }
 }

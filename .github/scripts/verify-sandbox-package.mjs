@@ -168,8 +168,14 @@ const mainSource = readFileSync(
 if (/opensquilla-gateway(?:\.exe)?['"`]?\s*,\s*\[\s*['"]-m['"]/.test(mainSource)) {
   fail('desktop source launches the frozen gateway with the invalid -m entrypoint')
 }
-if (!mainSource.includes('reportSandboxUnavailable')) {
-  fail('desktop source is missing the sandbox-unavailable soft-landing prompt')
+const preloadSource = readFileSync(
+  join(repoRoot, 'desktop', 'electron', 'src', 'preload.cts'),
+  'utf8',
+)
+if ([mainSource, preloadSource].some(source => (
+  /reportSandboxUnavailable|desktop:sandbox:unavailable/.test(source)
+))) {
+  fail('desktop source must not expose an automatic native sandbox-unavailable prompt')
 }
 
 const packageArgumentIndex = process.argv.indexOf('--package')

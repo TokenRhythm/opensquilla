@@ -2,6 +2,7 @@ import { computed, ref } from 'vue'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
 import type { Attachment } from '@/types/chat'
+import type { ArtifactContentAccess } from '@/modules/artifactWorkbench'
 
 const INLINE_THRESHOLD_BYTES = 2_000_000
 const ATTACHMENT_TEXT_HARD_CAP_BYTES = INLINE_THRESHOLD_BYTES
@@ -110,7 +111,7 @@ async function fileLooksLikeUtf8Text(file: File): Promise<boolean> {
   }
 }
 
-export function useChatAttachments() {
+export function useChatAttachments(artifactContent?: ArtifactContentAccess) {
   const { pushToast } = useToasts()
   const pendingAttachments = ref<Attachment[]>([])
   const nextAttachmentId = ref(1)
@@ -226,21 +227,8 @@ export function useChatAttachments() {
   }
 
   async function uploadAttachmentFile(file: File, mime: string): Promise<UploadResponseMeta> {
-    const form = new FormData()
-    form.append('file', file, file.name)
-    form.append('mime', mime)
-    const response = await fetch('/api/v1/files/upload', {
-      method: 'POST',
-      body: form,
-      credentials: 'same-origin',
-      headers: uploadAuthHeaders(),
-    })
-    if (!response.ok) {
-      const detail = await response.text().catch(() => '')
-      throw new Error(`HTTP ${response.status} ${detail}`)
-    }
-    const result = await response.json()
-    return uploadResponseMeta(result)
+    if (!artifactContent) throw new Error('Attachment upload is unavailable.')
+    return artifactContent.uploadAttachment(file, mime)
   }
 
   function removeAttachment(index: number) {
@@ -381,35 +369,9 @@ export function useChatAttachments() {
   }
 }
 
-function uploadAuthHeaders(): HeadersInit | undefined {
-  try {
-    const token = globalThis.sessionStorage?.getItem('opensquilla.wsToken')?.trim()
-    return token ? { Authorization: `Bearer ${token}` } : undefined
-  } catch {
-    return undefined
-  }
-}
-
 function uploadFailureMessage(err: unknown): string {
   if (err instanceof Error) return err.message
   return String(err)
-}
-
-function uploadResponseMeta(result: unknown): UploadResponseMeta {
-  const record = (result && typeof result === 'object' ? result : {}) as {
-    file_uuid?: unknown
-    expires_at?: unknown
-    ttl_seconds?: unknown
-  }
-  const fileUuid = typeof record.file_uuid === 'string' ? record.file_uuid.trim() : ''
-  if (!fileUuid) throw new Error('Upload response missing file_uuid')
-  const expiresAt = typeof record.expires_at === 'number' && Number.isFinite(record.expires_at)
-    ? record.expires_at
-    : undefined
-  const ttlSeconds = typeof record.ttl_seconds === 'number' && Number.isFinite(record.ttl_seconds)
-    ? record.ttl_seconds
-    : undefined
-  return { fileUuid, expiresAt, ttlSeconds }
 }
 
 function stagedUploadNeedsRefresh(attachment: Attachment): boolean {

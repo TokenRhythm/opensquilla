@@ -509,7 +509,7 @@ function forwardContract<T>(
  * backend command behavior.
  */
 export function createV4TurnCommands(transport: TurnCommandsTransport): TurnCommands {
-  const supportsMethod = (method: string): boolean => (
+  const hasRpcMethod = (method: string): boolean => (
     transport.supports?.(method) ?? false
   )
 
@@ -582,8 +582,8 @@ export function createV4TurnCommands(transport: TurnCommandsTransport): TurnComm
     },
 
     supports: (capability: TurnCommandCapability): boolean => {
-      if (capability === 'same-turn-steer') return supportsMethod(SESSIONS_STEER_V2_METHOD)
-      return supportsMethod(SESSIONS_PENDING_INPUTS_STEER_METHOD)
+      if (capability === 'same-turn-steer') return hasRpcMethod(SESSIONS_STEER_V2_METHOD)
+      return hasRpcMethod(SESSIONS_PENDING_INPUTS_STEER_METHOD)
     },
   }
 }
@@ -599,14 +599,14 @@ export function createV4TurnCommandsFromRpcClient(client: {
     params?: Record<string, unknown>,
     options?: RpcCallOptions,
   ): Promise<T>
-  supportsMethod?(method: string): boolean
-}, supportsMethod?: (method: string) => boolean): TurnCommands {
+  hasRpcMethod?(method: string): boolean
+}, hasRpcMethod?: (method: string) => boolean): TurnCommands {
   return createV4TurnCommands({
     request: (method, params, options) => options
       ? client.call(method, params, options)
       : client.call(method, params),
-    supports: method => supportsMethod?.(method)
-      ?? client.supportsMethod?.(method)
+    supports: method => hasRpcMethod?.(method)
+      ?? client.hasRpcMethod?.(method)
       ?? false,
   })
 }

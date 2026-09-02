@@ -30,6 +30,7 @@ from opensquilla.onboarding.redaction import is_redacted_secret_sentinel
 from opensquilla.search.types import DEFAULT_SEARCH_MAX_RESULTS
 
 if TYPE_CHECKING:
+    from opensquilla.application.setup_workflow import SetupWorkflow
     from opensquilla.onboarding.config_store import CredentialBackupRedaction
     from opensquilla.onboarding.probe import ProviderProbeResult
 
@@ -409,34 +410,38 @@ def _credential_clear_effective_payload(
     }
 
 
-@_d.method("onboarding.status", scope="operator.read")
-async def _onboarding_status(params: Any, ctx: RpcContext) -> dict[str, Any]:
+async def _read_onboarding_status(ctx: RpcContext) -> dict[str, Any]:
     return _status_payload(ctx)
 
 
-@_d.method("onboarding.catalog", scope="operator.read")
-async def _onboarding_catalog(params: Any, ctx: RpcContext) -> dict[str, Any]:
-    from opensquilla.onboarding.audio_specs import audio_provider_catalog_payload
-    from opensquilla.onboarding.channel_specs import channel_catalog_payload
-    from opensquilla.onboarding.image_generation_specs import (
-        image_generation_provider_catalog_payload,
-    )
-    from opensquilla.onboarding.memory_embedding_specs import (
-        memory_embedding_provider_catalog_payload,
-    )
-    from opensquilla.onboarding.provider_specs import provider_catalog_payload
-    from opensquilla.onboarding.router_specs import router_catalog_payload
-    from opensquilla.onboarding.search_specs import search_provider_catalog_payload
+async def _read_onboarding_catalog(_ctx: RpcContext) -> dict[str, Any]:
+    from opensquilla.onboarding.setup_engine import setup_catalog_payload
 
-    return {
-        "providers": provider_catalog_payload(),
-        "channels": channel_catalog_payload(),
-        "searchProviders": search_provider_catalog_payload(),
-        "routerProfiles": router_catalog_payload(),
-        "memoryEmbeddingProviders": memory_embedding_provider_catalog_payload(),
-        "imageGenerationProviders": image_generation_provider_catalog_payload(),
-        "audioProviders": audio_provider_catalog_payload(),
-    }
+    return setup_catalog_payload()
+
+
+def _setup_workflow(ctx: RpcContext) -> SetupWorkflow:
+    from opensquilla.application.setup_workflow import SetupWorkflow
+    from opensquilla.gateway.adapters.setup_workflow import (
+        RpcContextSetupWorkflowPort,
+    )
+
+    port = RpcContextSetupWorkflowPort(
+        ctx,
+        catalog_reader=_read_onboarding_catalog,
+        status_reader=_read_onboarding_status,
+    )
+    return SetupWorkflow(port, port)
+
+
+@_d.method("onboarding.status", scope="operator.read")
+async def _onboarding_status(_params: Any, ctx: RpcContext) -> dict[str, Any]:
+    return await _setup_workflow(ctx).status()
+
+
+@_d.method("onboarding.catalog", scope="operator.read")
+async def _onboarding_catalog(_params: Any, ctx: RpcContext) -> dict[str, Any]:
+    return await _setup_workflow(ctx).catalog()
 
 
 def _require(params: Any, key: str) -> Any:

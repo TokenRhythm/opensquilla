@@ -142,7 +142,6 @@ def _probe_unleased_build_services(
         channels={"channels": []},
         mcp={"enabled": False},
         memory={"flush_enabled": False},
-        sandbox={"auto_setup": False},
     )
 
     async def run() -> tuple[str, ...]:

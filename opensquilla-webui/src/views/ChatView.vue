@@ -147,14 +147,14 @@
           v-else-if="!forkTransition && visibleHistoryRecoveryState"
           :key="`${sessionKey}:history`"
           :state="visibleHistoryRecoveryState"
-          :transport-state="rpc.state"
+          :transport-state="gatewayConnectionState"
           @retry="retryHistory"
         />
         <ChatSessionRecoveryStatus
           v-if="!forkTransition && liveRecoveryState"
           :key="`${sessionKey}:live`"
           :state="liveRecoveryState"
-          :transport-state="rpc.state"
+          :transport-state="gatewayConnectionState"
           @retry="retryLive"
         />
         <div
@@ -192,7 +192,6 @@
           :session-key="forkTransition?.parentKey || sessionKey"
           :scroll-container="threadRef"
           :virtualization-disabled="Boolean(forkTransition)"
-          :auth-token="readAuthToken()"
           :artifact-navigation-items="sessionArtifacts"
           :workbench-enabled="workbenchEnabled"
           :workbench-resource-preview-enabled="attachmentWorkbenchPreviewEnabled"
@@ -427,7 +426,6 @@
               :artifacts="liveArtifacts"
               :navigation-artifacts="sessionArtifacts"
               :session-key="sessionKey"
-              :auth-token="readAuthToken()"
               :prefer-workbench="workbenchEnabled"
               @download="downloadArtifact"
               @open="openArtifact"
@@ -689,7 +687,7 @@
       :project-status-message="activeProjectStatusMessage"
       :prompt-annotations="activePromptAnnotations"
       :can-close-project="isDraftRoute() && pendingWorkspaceId !== null"
-      :can-choose-project="rpc.canChooseProject"
+      :can-choose-project="gatewayAccess.canChooseProject"
       :plan-mode-available="planUiAvailable"
       :collaboration-mode="collaboration.mode"
       :plan-mode-busy="planModeBusy"
@@ -739,9 +737,9 @@
       @confirm="void confirmComposerSandboxSetup()"
     />
     <ProjectWorkspacePickerDialog
-      v-if="rpc.canChooseProject"
+      v-if="gatewayAccess.canChooseProject"
       :open="projectPickerOpen"
-      :enabled="rpc.canChooseProject"
+      :enabled="gatewayAccess.canChooseProject"
       :session-key="sessionKey"
       :initial-path="activeWorkspace?.path"
       @close="projectPickerOpen = false"
@@ -761,7 +759,6 @@
       :open="deliverablesOpen"
       :artifacts="sessionArtifacts"
       :session-key="sessionKey"
-      :auth-token="readAuthToken()"
       @close="closeDeliverables"
       @download="downloadArtifact"
     />
@@ -801,14 +798,19 @@ import { ref, computed, inject, onMounted, onUnmounted, nextTick, watch, watchEf
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
-import { useRpcStore } from '@/stores/rpc'
+import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 import {
   SESSION_DIRECTORY_KEY,
   SessionDirectoryError,
 } from '@/modules/sessionDirectory'
 import { SESSION_LIFECYCLE_KEY } from '@/modules/sessionLifecycle'
 import { PENDING_INPUT_QUEUE_KEY } from '@/modules/pendingInputQueue'
-import { useRpcCall } from '@/composables/useRpc'
+import { APP_SETTINGS_KEY } from '@/modules/appSettings'
+import { PROVIDER_CONFIGURATION_KEY } from '@/modules/providerConfiguration'
+import { SANDBOX_RUNTIME_KEY } from '@/modules/sandboxRuntime'
+import { SETUP_WORKFLOW_KEY } from '@/modules/setupWorkflow'
+import { ARTIFACT_WORKBENCH_KEY } from '@/modules/artifactWorkbench'
+import { useSetupStatus } from '@/composables/setup/useSetupStatus'
 import { useAppStore } from '@/stores/app'
 import { useSandboxSetupStore } from '@/stores/sandboxSetup'
 import { useArtifactPromptAnnotationsStore } from '@/stores/artifactPromptAnnotations'
@@ -816,7 +818,6 @@ import { useWorkbenchDocumentContextStore } from '@/stores/workbenchDocumentCont
 import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
 import { useWorkbenchStore } from '@/workbench/store'
 import { usePlatform } from '@/platform'
-import { createRpcArtifactPromptAnnotationProvider } from '@/workbench/artifactPromptAnnotationProvider'
 import {
   focusArtifactPromptAnnotation,
   notifyArtifactPromptAnnotationsAccepted,
@@ -872,6 +873,7 @@ import { useChatElevatedMode } from '@/composables/chat/useChatElevatedMode'
 import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
 import { useChatSessionRouting } from '@/composables/chat/useChatSessionRouting'
 import { SESSION_ROUTING_KEY, type SessionRouting } from '@/modules/sessionRouting'
+import { SESSION_CONVERSATION_KEY, type SessionConversation } from '@/modules/sessionConversation'
 import { TURN_COMMANDS_KEY, type TurnCommands } from '@/modules/turnCommands'
 import { APPROVAL_CENTER_KEY, type ApprovalCenter } from '@/modules/approvalCenter'
 import { GOAL_CENTER_KEY, type GoalCenter } from '@/modules/goalCenter'
@@ -925,7 +927,6 @@ import {
 } from '@/composables/chat/useChatSessionRoute'
 import {
   useChatRunModePreference,
-  type RunModePolicy,
 } from '@/composables/chat/useChatRunModePreference'
  import {
    useChatSessionBootstrap,
@@ -939,22 +940,25 @@ import {
   claimSessionBootstrapAdmission,
   optionalSessionRpcAllowed,
   optionalSessionRpcCallOptions,
-  runModeWriteRpcCallOptions,
-  sandboxSetupRpcCallOptions,
 } from '@/composables/chat/sessionBootstrapAdmission'
 import { useChatSessionRuntime } from '@/composables/chat/useChatSessionRuntime'
 import {
   useChatSessionSubscription,
-  type SessionSubscriptionOutcome,
 } from '@/composables/chat/useChatSessionSubscription'
 import {
   createConversationSessionRuntime,
 } from '@/modules/conversationSessionRuntime'
 import {
-  createConversationEventTransport,
+  SESSION_READ_LIFECYCLE_FACTORY_KEY,
+  type SessionReadMetadata,
+  type SessionReadPortLease,
+  type SessionReadSnapshot,
+} from '@/modules/sessionReadLifecycle'
+import {
+  CONVERSATION_EVENTS_KEY,
   conversationEventSessionKey,
-  type ConversationEventTransportMessage,
-} from '@/adapters/gateway/conversationEventTransport'
+  type ConversationEvent,
+} from '@/modules/conversationEvents'
 import {
   useChatSlashCommands,
   type DurableMetaDraft,
@@ -965,6 +969,7 @@ import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
 import { useChatUsageWidget } from '@/composables/chat/useChatUsageWidget'
 import { useSessionArtifacts } from '@/composables/chat/useSessionArtifacts'
 import { useVoiceInput } from '@/composables/chat/useVoiceInput'
+import { AUDIO_TRANSCRIPTION_KEY } from '@/modules/audioTranscription'
 import { navigateMetaSetupProviderSettings } from '@/composables/chat/metaSetupProviderNavigation'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { hasOpenDialogLayer } from '@/composables/useDialogA11y'
@@ -1000,7 +1005,6 @@ import {
   createForkTransitionLifetime,
   forkNavigationPhase,
   forkRouteHandoffAction,
-  forkRpcRequest,
   snapshotForkPreviewMessages,
   validatedForkChildKey,
   type ForkRpcResponse,
@@ -1009,12 +1013,7 @@ import {
   steerUnavailableReason,
   type SteerUnavailableReason,
 } from '@/utils/chat/steerAvailability'
-import type {
-  ArtifactPayload,
-  SessionEventPayload,
-  SessionMessagesSnapshotResponse,
-  SessionMessagesSubscribeResponse,
-} from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import {
   isRecognizedSandboxRunMode,
@@ -1041,7 +1040,6 @@ import type {
 } from '@/types/plans'
 import {
   artifactCategory,
-  artifactDownloadUrl,
   isInlineMediaArtifact,
   isOfficeArtifact,
 } from '@/utils/chat/artifacts'
@@ -1068,7 +1066,6 @@ import {
   artifactWorkbenchPreviewKind,
 } from '@/utils/workbench/artifactPreview'
 import { findArtifactCard, focusArtifactInTranscript } from '@/utils/chat/artifactFocus'
-import { fetchDisplayAttachmentBlob } from '@/utils/chat/attachmentAccess'
 import { classifyArtifactProductError } from '@/utils/artifactProductErrors'
 import {
   persistDeferredMetaDraft,
@@ -1096,7 +1093,6 @@ import {
   FINISHED_STREAM_TASK_ID,
   PENDING_STREAM_TASK_ID,
   STOPPED_STREAM_TASK_ID,
-  isCurrentSessionPayload as payloadIsCurrentSession,
 } from '@/utils/chat/streamEvents'
 import { copyTextWithFallback, copyImageToClipboard, downloadBlob, shareCopyImageSupported } from '@/utils/browser'
 import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
@@ -1153,13 +1149,6 @@ interface ChatComposerHandle {
 
 type Message = ChatMessage
 
-interface RpcAuthPayload {
-  runModePolicy?: RunModePolicy
-  principal?: {
-    authState?: string
-  }
-}
-
 /* ── Constants ─────────────────────────────────────────────────────── */
 
 const CHAT_RUN_STATUS_VALUES: ChatRunStatusState[] = [
@@ -1181,7 +1170,12 @@ const toolResultModal = ref<{
 
 /* ── Stores / Router ───────────────────────────────────────────────── */
 
-const rpc = useRpcStore()
+const injectedGatewayAccess = inject(GATEWAY_ACCESS_KEY)
+if (!injectedGatewayAccess) throw new Error('GatewayAccess was not provided')
+const gatewayAccess = injectedGatewayAccess
+const gatewayConnectionState = computed(() => gatewayAccess.availability === 'available'
+  ? 'connected'
+  : gatewayAccess.availability === 'preparing' ? 'connecting' : 'disconnected')
 const pendingInputQueue = inject(PENDING_INPUT_QUEUE_KEY, null)
 const sessionRouting = inject(SESSION_ROUTING_KEY) as SessionRouting | undefined
 if (!sessionRouting) throw new Error('SessionRouting was not provided')
@@ -1209,6 +1203,27 @@ const goalContinuity: GoalContinuity = injectedGoalContinuity
 const injectedMetaRunCenter = inject(META_RUN_CENTER_KEY)
 if (!injectedMetaRunCenter) throw new Error('MetaRunCenter was not provided')
 const metaRunCenter: MetaRunCenter = injectedMetaRunCenter
+const injectedAppSettings = inject(APP_SETTINGS_KEY)
+if (!injectedAppSettings) throw new Error('AppSettings was not provided')
+const injectedSessionConversation = inject(SESSION_CONVERSATION_KEY)
+if (!injectedSessionConversation) throw new Error('SessionConversation was not provided')
+const sessionConversation: SessionConversation = injectedSessionConversation
+const conversationEvents = inject(CONVERSATION_EVENTS_KEY)
+if (!conversationEvents) throw new Error('ConversationEvents was not provided')
+const sessionReadLifecycleFactory = inject(SESSION_READ_LIFECYCLE_FACTORY_KEY)
+if (!sessionReadLifecycleFactory) throw new Error('SessionReadLifecycleFactory was not provided')
+const injectedProviderConfiguration = inject(PROVIDER_CONFIGURATION_KEY)
+const injectedSandboxRuntime = inject(SANDBOX_RUNTIME_KEY)
+if (!injectedSandboxRuntime) throw new Error('SandboxRuntime was not provided')
+const injectedAudioTranscription = inject(AUDIO_TRANSCRIPTION_KEY)
+if (!injectedAudioTranscription) throw new Error('AudioTranscription was not provided')
+if (!injectedProviderConfiguration) throw new Error('ProviderConfiguration was not provided')
+const injectedSetupWorkflow = inject(SETUP_WORKFLOW_KEY)
+if (!injectedSetupWorkflow) throw new Error('SetupWorkflow was not provided')
+const injectedArtifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
+if (!injectedArtifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
+const artifactWorkbench = injectedArtifactWorkbench
+if (!injectedArtifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
 
 async function resolveCreatedSessionAvailability(sessionKey: string): Promise<boolean> {
   try {
@@ -1246,7 +1261,7 @@ function artifactPreviewItemForExplicitOpen(
 const artifactPromptAnnotationsStore = useArtifactPromptAnnotationsStore()
 const workbenchDocumentContextStore = useWorkbenchDocumentContextStore()
 const workbenchResourcesStore = useWorkbenchResourcesStore()
-const artifactPromptAnnotationProvider = createRpcArtifactPromptAnnotationProvider(rpc)
+const artifactPromptAnnotationProvider = artifactWorkbench.promptAnnotations
 artifactPromptAnnotationsStore.setProvider(artifactPromptAnnotationProvider)
 const artifactImageLightbox = useArtifactImageLightbox()
 const platform = usePlatform()
@@ -1356,12 +1371,11 @@ const workbenchResourcesEnabled = computed(() => (
 const attachmentWorkbenchPreviewEnabled = computed(() => (
   workbenchEnabled.value
   && workbenchResourcesEnabled.value
-  && rpc.supportsMethod('workbench.resources.list')
-  && rpc.supportsMethod('workbench.resources.get')
+  && artifactWorkbench.resources.available()
 ))
 const attachmentWorkbenchEditEnabled = computed(() => (
   attachmentWorkbenchPreviewEnabled.value
-  && rpc.supportsMethod('documents.import')
+  && artifactWorkbench.resources.canImportDocuments()
 ))
 const activePromptAnnotations = computed(() =>
   promptAnnotationsEnabled.value
@@ -1449,8 +1463,7 @@ async function reusePromptAnnotation(annotation: PromptAnnotationSnapshot) {
 const promptCacheKeepaliveOpen = ref(false)
 const promptCacheKeepaliveStatus = ref<PromptCacheKeepaliveStatus | null>(null)
 const promptCacheKeepaliveAvailable = computed(() => (
-  rpc.supportsMethod('sessions.promptCacheKeepalive.status')
-  && rpc.supportsMethod('sessions.promptCacheKeepalive.set')
+  sessionConversation.supports('prompt-cache-keepalive')
 ))
 const workbenchEnabled = computed(() => appStore.features.artifactWorkbench === true)
 const promptAnnotationDesktopAvailable = computed(() => (
@@ -1571,6 +1584,7 @@ const copySupported = shareCopyImageSupported()
 
 const chatElevatedMode = useChatElevatedMode({
   sessionKey,
+  approvalCenter,
 })
 // Persist the composer draft per session so a refresh / session switch / crash
 // before the backend accepts a send cannot silently lose typed text (issue 248).
@@ -1589,13 +1603,8 @@ const {
   setGlobalRunMode,
   applyRunModePreferenceChanged,
 } = useChatRunModePreference({
-  rpc,
-  hydrateCallOptions: optionalSessionRpcCallOptions,
-  writeCallOptions: runModeWriteRpcCallOptions,
-  runModePolicy: () => {
-    const auth = rpc.auth as RpcAuthPayload | null
-    return auth?.runModePolicy
-  },
+  sandbox: injectedSandboxRuntime,
+  runModePolicy: () => gatewayAccess.runModePolicy,
 })
 async function refreshRunModePreference() {
   try {
@@ -1613,20 +1622,10 @@ const requestedRunMode = computed<SandboxRunMode>(
 )
 
 const sandboxSetupRecovery = useSandboxSetupRecovery({
-  rpc: {
-    call: (method, params) =>
-      rpc.call(method, params, sandboxSetupRpcCallOptions),
-    waitForConnection: () => rpc.waitForConnection(10_000),
-  },
-  connectionState: computed(() => rpc.state),
+  sandbox: injectedSandboxRuntime,
+  connectionState: gatewayConnectionState,
   runMode: requestedRunMode,
   autoRefresh: false,
-  onUnavailable: async (status) => {
-    await platform.settings.reportSandboxUnavailable?.({
-      state: status.state,
-      ...(status.message ? { message: status.message } : {}),
-    })
-  },
 })
 const {
   status: sandboxSetupStatus,
@@ -1643,19 +1642,20 @@ const composerAllowedRunModes = computed<SandboxRunMode[]>(() => {
   }
   const status = sandboxSetupStatus.value
   if (
-    status !== null
-    && status.state !== 'ready'
+    status === null
+    || status.state !== 'ready'
   ) {
     return allowedRunModes.value.filter((mode) => mode !== 'safe')
   }
   return allowedRunModes.value
 })
-const composerSafeSetupAvailable = computed(() => sandboxSetupRecovery.canSetup.value)
+const composerSafeSetupAvailable = computed(() =>
+  !sandboxSetupPending.value && sandboxSetupRecovery.canSetup.value)
 const composerSandboxSetupOpen = ref(false)
 
 async function refreshPostBootstrapMetadata() {
   await refreshRunModePreference()
-  if (!chatViewDisposed && rpc.state === 'connected') {
+  if (!chatViewDisposed && gatewayAccess.isAvailable) {
     await sandboxSetupRecovery.refresh()
   }
 }
@@ -1670,13 +1670,17 @@ const lastStreamSeq = ref(0)
 // Its cursor policy remains projected into legacy refs, while the event source
 // and subscription leases stay behind the transport-neutral runtime seam.
 const conversationSessionRuntime = createConversationSessionRuntime<
-  ConversationEventTransportMessage,
-  SessionSubscriptionOutcome
+  ConversationEvent,
+  SessionReadPortLease
 >({
-  source: createConversationEventTransport(rpc),
+  source: conversationEvents,
   events: { sessionKey: conversationEventSessionKey },
 })
 const conversationRuntime = conversationSessionRuntime.cursor
+const sessionReadLifecycle = sessionReadLifecycleFactory.create({
+  cursor: conversationRuntime,
+  subscriptions: conversationSessionRuntime.subscriptions,
+})
 const activeTaskGroups = ref<Set<string>>(new Set())
 // Task id whose output the live stream renders; binds late events to the
 // current turn so a prior task can't leak into it (issue 344).
@@ -1691,7 +1695,26 @@ const isStopPending = computed(() => (
   || acceptanceRecoveryPending.value
 ))
 let bindActiveStreamTask = (taskId: string) => { activeStreamTaskId.value = taskId }
-let restoreLiveTurnSnapshot = (_snapshot: SessionMessagesSnapshotResponse) => {}
+let restoreLiveTurnSnapshot = (_snapshot: SessionReadSnapshot) => {}
+
+function projectWorkspaceFromSessionRead(
+  value: SessionReadMetadata['projectWorkspace'],
+): ActiveProjectWorkspaceSnapshot | null {
+  if (!value) return null
+  const id = typeof value.id === 'string' ? value.id : ''
+  if (!id) return null
+  const availabilityReason = typeof value.availabilityReason === 'string'
+    ? value.availabilityReason
+    : undefined
+  return {
+    id,
+    name: typeof value.name === 'string' ? value.name : '',
+    path: typeof value.path === 'string' ? value.path : '',
+    available: value.available === true,
+    removed: value.removed === true,
+    ...(availabilityReason ? { availabilityReason } : {}),
+  }
+}
 
 // Pending session intent
 const pendingSessionIntent = ref<string | null>(null)
@@ -1715,10 +1738,7 @@ async function refreshPromptCacheKeepaliveStatus() {
     || !promptCacheKeepaliveSessionReady.value
   ) return
   try {
-    const next = await rpc.call<PromptCacheKeepaliveStatus>(
-      'sessions.promptCacheKeepalive.status',
-      { key },
-    )
+    const next = await sessionConversation.promptCacheStatus(key)
     if (sessionKey.value === key) promptCacheKeepaliveStatus.value = next
   } catch {
     // The settings dialog owns actionable RPC errors. Menu refresh is best effort.
@@ -1777,7 +1797,7 @@ const chatStream = useChatStream({
   stripGeneratedArtifactMarkers,
   scrollToBottom,
   interruptState,
-  rpcPolicy: () => rpc.policy,
+  streamIdleTimeoutMs: () => gatewayAccess.streamIdleTimeoutMs,
 })
 const {
   isStreaming,
@@ -1812,11 +1832,11 @@ const {
   completeReasoningPresentation,
 } = chatStream
 watch(
-  () => rpc.state,
-  state => setStreamConnectionAvailable(state === 'connected'),
+  () => gatewayAccess.isAvailable,
+  available => setStreamConnectionAvailable(available),
   { immediate: true },
 )
-const chatAttachments = useChatAttachments()
+const chatAttachments = useChatAttachments(artifactWorkbench.content)
 const {
   pendingAttachments,
   attachmentWorkBusy,
@@ -1905,7 +1925,7 @@ const chatPendingQueue = useChatPendingQueue({
   hasComposer: () => Boolean(composerRef.value),
   pendingInputWal,
   pendingInputQueue,
-  connectionState: computed(() => rpc.state),
+  connectionState: gatewayConnectionState,
   prepareAttachmentsForSend,
   onPendingPersistenceError: reason => {
     const message = reason === 'order_conflict'
@@ -2075,7 +2095,7 @@ watch(compactStatus, (status) => {
 }, { flush: 'sync' })
 
 const chatUsageWidget = useChatUsageWidget({
-  rpc,
+  sessionConversation,
   readCallOptions: optionalSessionRpcCallOptions,
   sessionKey,
   tokenVizEnabled: () => appStore.features.tokenViz,
@@ -2105,7 +2125,9 @@ const {
 } = chatSessionRoute
 
 const chatFeatureToggles = useChatFeatureToggles({
-  rpc,
+  sessionConversation,
+  appSettings: injectedAppSettings,
+  modelRouting: injectedProviderConfiguration,
   readCallOptions: optionalSessionRpcCallOptions,
   setGlobalElevatedMode,
   loadCurrentSessionUsage,
@@ -2128,9 +2150,8 @@ const {
 } = chatFeatureToggles
 
 const sessionRoutingAvailable = computed(() => {
-  const auth = rpc.auth as RpcAuthPayload | null
-  return rpc.state === 'connected'
-    && auth?.principal?.authState === 'authenticated'
+  return gatewayAccess.isAvailable
+    && gatewayAccess.isAuthenticated
     && sessionRouting.available()
 })
 const chatSessionRouting = useChatSessionRouting({
@@ -2322,7 +2343,7 @@ const preserveHistoryLiveTail = computed(() =>
 )
 
 const chatHistory = useChatHistory({
-  rpc,
+  sessionReadLeaseReader: sessionReadLifecycle,
   sessionKey,
   messages,
   threadRef,
@@ -2366,6 +2387,7 @@ const {
   scheduleHistorySync,
   cancelAnchorStabilization,
   cancelActiveHistory,
+  markSessionMissing,
   cleanup: cleanupHistory,
 } = chatHistory
 
@@ -2485,7 +2507,7 @@ const steerDelivery = useChatSteerDelivery({
 // history. History and the in-flight ArtifactEvent stream remain live fallback
 // sources for mixed-version gateways and list-refresh races.
 const chatSessionArtifacts = useSessionArtifacts({
-  rpc,
+  catalog: artifactWorkbench.artifacts,
   sessionKey,
   messages,
   streamArtifacts,
@@ -2498,7 +2520,7 @@ const {
   cleanup: cleanupSessionArtifacts,
 } = chatSessionArtifacts
 
-const voiceInput = useVoiceInput()
+const voiceInput = useVoiceInput(injectedAudioTranscription)
 const {
   voiceBusy,
   voiceRecording,
@@ -2511,11 +2533,9 @@ const {
 // (including env-var keys the browser can't see), so audioConfigured is a true
 // "voice will work" signal — this keeps the button from being clicked into a
 // guaranteed failure. It's the same snapshot the empty-state chips read.
-const voiceCapability = useRpcCall<{ audioConfigured?: boolean }>(
-  'onboarding.status',
-  undefined,
-  { callOptions: optionalSessionRpcCallOptions },
-)
+const voiceCapability = useSetupStatus<{ audioConfigured?: boolean }>(injectedSetupWorkflow, {
+  allowed: optionalSessionRpcAllowed,
+})
 const voiceReady = computed(() => voiceCapability.data.value?.audioConfigured === true)
 
 const chatMessageActions = useChatMessageActions({
@@ -2556,11 +2576,11 @@ async function handleRegenerateMessage(
   settle?.(accepted)
 }
 
-let applyPendingUserInputSnapshot: typeof chatPlans.applyBootstrap = () => {}
-let applyGoalSnapshot: (snapshot: SessionMessagesSubscribeResponse) => void = () => {}
+let applyPendingUserInputSnapshot: (snapshot: SessionReadMetadata) => void = () => {}
+let applyGoalSnapshot: (snapshot: SessionReadMetadata) => void = () => {}
 const chatSessionSubscription = useChatSessionSubscription({
-  rpc,
-  conversationSessionRuntime: conversationSessionRuntime,
+  sessionReadLeaseReader: sessionReadLifecycle,
+  conversationRuntime,
   sessionKey,
   lastStreamSeq,
   runStatus,
@@ -2606,12 +2626,16 @@ const chatSessionSubscription = useChatSessionSubscription({
       : activeProjectWorkspace.beginSessionResolution(key),
   onSessionMetadata: (key, generation, metadata) => {
     if (generation < 0) return
-    activeProjectWorkspace.applySessionSnapshot(key, generation, metadata)
+    activeProjectWorkspace.applySessionSnapshot(key, generation, {
+      workspaceId: metadata.workspaceId ?? undefined,
+      projectWorkspace: projectWorkspaceFromSessionRead(metadata.projectWorkspace),
+    })
   },
   onSessionMetadataError: (key, generation) => {
     if (generation < 0) return
     activeProjectWorkspace.failSessionResolution(key, generation)
   },
+  onSessionMissing: markSessionMissing,
   onSnapshot: snapshot => {
     chatSessionRouting.applyBootstrap(snapshot)
     chatPlans.applyBootstrap(snapshot)
@@ -2622,7 +2646,6 @@ const chatSessionSubscription = useChatSessionSubscription({
 const {
   subscribeSession,
   retrySessionMetadata,
-  unsubscribeSession,
   cancelActiveSubscription,
   streamGeneration,
   observeStreamGeneration,
@@ -2631,6 +2654,7 @@ applySessionRunState = chatSessionSubscription.applySessionRunState
 
 const chatSessionBootstrap = useChatSessionBootstrap({
   sessionKey,
+  sessionReadLifecycle,
   loadHistory: async (context, retry) => (
     retry
       ? await retryHistoryRequest(context)
@@ -2639,7 +2663,6 @@ const chatSessionBootstrap = useChatSessionBootstrap({
   subscribeSession,
   cancelHistory: cancelActiveHistory,
   cancelSubscription: cancelActiveSubscription,
-  unsubscribeSession,
 })
 const {
   livePhase,
@@ -2690,20 +2713,23 @@ function schedulePostBootstrapMetadata(
   key: string,
 ) {
   if (postBootstrapMetadataStarted) return
-  void run.criticalRequestsQueued.then(() => {
-    if (
-      postBootstrapMetadataStarted
-      || chatViewDisposed
-      || sessionKey.value !== key
-      || !isSessionBootstrapCurrent(run.generation, key)
-    ) return
-    postBootstrapMetadataStarted = true
-    void refreshPostBootstrapMetadata()
-    void loadFeatureToggles().then(() => {
-      if (!chatViewDisposed) unsubs.push(bindFeatureRefresh(scheduleHistorySync))
-    })
-    loadSlashCommands()
-  })
+  void run.criticalRequestsQueued.then(
+    () => {
+      if (
+        postBootstrapMetadataStarted
+        || chatViewDisposed
+        || sessionKey.value !== key
+        || !isSessionBootstrapCurrent(run.generation, key)
+      ) return
+      postBootstrapMetadataStarted = true
+      void refreshPostBootstrapMetadata()
+      void loadFeatureToggles().then(() => {
+        if (!chatViewDisposed) unsubs.push(bindFeatureRefresh(scheduleHistorySync))
+      })
+      loadSlashCommands()
+    },
+    () => {},
+  )
 }
 
 function bindSessionBootstrapRun<T extends SessionBootstrapRun>(run: T, key: string): T {
@@ -2712,15 +2738,18 @@ function bindSessionBootstrapRun<T extends SessionBootstrapRun>(run: T, key: str
   // omit it, so queue a bounded fallback only after the critical live/history
   // frames. A session-key watcher must never put routing.get in front of the
   // target subscribe during a same-socket handoff.
-  void tracked.criticalRequestsQueued.then(() => {
-    if (
-      chatViewDisposed
-      || sessionKey.value !== key
-      || !isSessionBootstrapCurrent(tracked.generation, key)
-      || chatSessionRouting.hasAuthoritativeSnapshot.value
-    ) return
-    void chatSessionRouting.load()
-  })
+  void tracked.criticalRequestsQueued.then(
+    () => {
+      if (
+        chatViewDisposed
+        || sessionKey.value !== key
+        || !isSessionBootstrapCurrent(tracked.generation, key)
+        || chatSessionRouting.hasAuthoritativeSnapshot.value
+      ) return
+      void chatSessionRouting.load()
+    },
+    () => {},
+  )
   schedulePostBootstrapMetadata(tracked, key)
   return tracked
 }
@@ -2743,15 +2772,18 @@ function resumeSessionBootstrap(run: SessionBootstrapRun) {
       && isSessionBootstrapCurrent(tracked.generation, key)
     ) void handleAuthoritativeSessionSubscription(key)
   }).catch(() => {})
-  void tracked.criticalRequestsQueued.then(() => {
-    if (
-      chatViewDisposed
-      || sessionKey.value !== key
-      || !isSessionBootstrapCurrent(tracked.generation, key)
-    ) return
-    void loadCurrentSessionUsage()
-    void refreshPostBootstrapMetadata()
-  })
+  void tracked.criticalRequestsQueued.then(
+    () => {
+      if (
+        chatViewDisposed
+        || sessionKey.value !== key
+        || !isSessionBootstrapCurrent(tracked.generation, key)
+      ) return
+      void loadCurrentSessionUsage()
+      void refreshPostBootstrapMetadata()
+    },
+    () => {},
+  )
 }
 
 function retryHistory() {
@@ -2907,6 +2939,7 @@ const chatSessionRuntime = useChatSessionRuntime({
   setSessionHandoffTarget,
   resumeSessionBootstrap,
   startSessionBootstrap,
+  currentSessionBootstrap: chatSessionBootstrap.currentSessionBootstrap,
   loadCurrentSessionUsage,
   applySessionRunState,
   setCompactInFlight,
@@ -3180,7 +3213,7 @@ const goalOutcomeHasMessageAnchor = computed(() => (
 ))
 
 const chatSlashCommands = useChatSlashCommands({
-  rpc,
+  sessionConversation,
   metaRunCenter,
   catalogCallOptions: optionalSessionRpcCallOptions,
   inputText,
@@ -3285,7 +3318,7 @@ const {
 resetComposerInputHistory = chatComposerShortcuts.resetInputHistory
 
 const chatSend = useChatSend({
-  rpc,
+  metaRunCenter,
   turnCommands,
   activeSteerCapability,
   inputText,
@@ -3427,9 +3460,9 @@ const {
 sendUsageBarrierReplay = dispatchUsageBarrierReplay
 void recoverResponseHandoffs()
 watch(
-  [() => rpc.state, sessionKey],
+  [() => gatewayAccess.availability, sessionKey],
   ([state]) => {
-    if (state === 'connected') void recoverResponseHandoffs()
+    if (state === 'available') void recoverResponseHandoffs()
   },
 )
 async function onSend(
@@ -3709,7 +3742,7 @@ async function steerPendingMessage(pendingUiId: string) {
 }
 
 const chatApprovals = useChatApprovals({
-  rpc,
+  sessionConversation,
   approvalCenter,
   sessionKey,
   runStatus,
@@ -3731,7 +3764,9 @@ const {
   dismissClarify,
   applyUserInputBootstrap,
 } = chatApprovals
-applyPendingUserInputSnapshot = applyUserInputBootstrap
+applyPendingUserInputSnapshot = snapshot => applyUserInputBootstrap({
+  pendingUserInputs: [...snapshot.pendingUserInputs],
+})
 
 const dockedPlanQuestionnaire = computed(() => (
   pendingClarify.value?.presentation === 'plan_questionnaire_v1'
@@ -3844,7 +3879,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   showCompactionToast,
   getCompactionPlacement: id => getCompactionPlacement(id) || undefined,
   showWarningToast: message => pushToast(message || t('chat.warning.default'), { tone: 'warn', duration: 5000 }),
-  supportsTurnCommitted: () => rpc.supportsEvent('session.event.turn_committed'),
+  supportsTurnCommitted: () => sessionConversation.supports('turn-committed'),
   scheduleHistorySync,
   schedulePendingDrainAfterTerminal,
   popAllPendingIntoComposer,
@@ -4116,21 +4151,21 @@ watch(isStreaming, (streaming, wasStreaming) => {
 const stallWatchdog = useChatStallWatchdog({ isStreaming, streamIdleGraceMs: streamIdleTimeoutMs })
 const { stallActive, stallSeconds } = stallWatchdog
 
-const chatRpcSubscriptions = useChatRpcSubscriptions(rpc, {
-  // The private v4 adapter emits one validated event message. The reducer
-  // owns named projections and the legacy wildcard terminal path behind that
-  // single ingress, so the view no longer wires event names itself.
-  onEvent: rpcEventHandlers.onConversationEvent,
-  onConnectionState: rpcEventHandlers.handlers.onConnectionState,
-  // The wildcard handler is the one funnel that sees every gateway event with
-  // its name; feed the active session's events to the watchdog before the
-  // regular reducer consumes them (same session filter as existing handlers).
-  onAny: (rawEvent, rawPayload) => {
-    const payloadObj = (rawPayload && typeof rawPayload === 'object' ? rawPayload : {}) as SessionEventPayload
-    if (payloadIsCurrentSession(payloadObj, sessionKey.value)) {
-      stallWatchdog.noteEvent(rawEvent, payloadObj)
+const chatRpcSubscriptions = useChatRpcSubscriptions({
+  // The private v4 adapter emits one semantic message. Feed that projection to
+  // both business consumers without exposing protocol names in the view.
+  onEvent: (message) => {
+    if (message.kind === 'conversation') {
+      stallWatchdog.noteEvent(message.event.semanticKind, message.payload)
+    } else if (message.kind === 'approval') {
+      stallWatchdog.noteEvent(
+        message.action === 'requested' ? 'approval-requested' : 'approval-resolved',
+        message.payload,
+      )
     }
+    rpcEventHandlers.onConversationEvent(message)
   },
+  onConnectionState: rpcEventHandlers.handlers.onConnectionState,
 }, {
   getSessionKey: () => sessionKey.value,
   runtime: conversationSessionRuntime,
@@ -4674,14 +4709,6 @@ const selectedShareCount = computed(() => selectedShareMessageIds.value.size)
 
 /* ── Helpers ───────────────────────────────────────────────────────── */
 
-function readAuthToken(): string {
-  try {
-    return sessionStorage.getItem('opensquilla.wsToken') || ''
-  } catch {
-    return ''
-  }
-}
-
 function reportRunModePersistenceError(cause: unknown): void {
   const detail = cause instanceof Error ? cause.message : String(cause)
   console.warn('Failed to persist sandbox run mode:', detail)
@@ -4723,10 +4750,10 @@ function cancelComposerSandboxSetup(): void {
 async function confirmComposerSandboxSetup(): Promise<void> {
   if (sandboxSetupPending.value) return
   const ready = await sandboxSetupStore.startSafeSetup()
+  await sandboxSetupRecovery.refresh()
   if (ready) {
     composerSandboxSetupOpen.value = false
     await refreshRunModePreference()
-    await sandboxSetupRecovery.refresh()
   }
 }
 
@@ -4868,10 +4895,8 @@ function subagentBody(text: string): string {
 /* ── Artifacts ─────────────────────────────────────────────────────── */
 
 async function downloadAttachment(attachment: DisplayAttachment): Promise<boolean> {
-  const result = await fetchDisplayAttachmentBlob(attachment, {
-    baseOrigin: window.location.origin,
+  const result = await artifactWorkbench.content.fetchAttachment(attachment, {
     sessionKey: sessionKey.value,
-    authToken: readAuthToken(),
   })
   if (!result.ok) {
     if (result.status > 0) {
@@ -5028,28 +5053,15 @@ async function downloadArtifact(artifact: ArtifactPayload) {
   // A published delivery is an immutable snapshot. Document-head downloads
   // are separate workbench actions and must not change what this chat card
   // resolves to after later edits.
-  const token = readAuthToken()
-  const url = artifactDownloadUrl(artifact, window.location.origin, {
-    sessionKey: sessionKey.value,
-    includeSessionKey: false,
-  })
-  if (!url) return
   try {
-    const headers: Record<string, string> = {}
-    const sameOrigin = new URL(url, window.location.origin).origin === window.location.origin
-    if (sameOrigin && sessionKey.value) headers['x-opensquilla-session-key'] = sessionKey.value
-    if (sameOrigin && token) headers.Authorization = `Bearer ${token}`
-    const response = await fetch(url, {
-      method: 'GET',
-      headers,
-      credentials: sameOrigin ? 'same-origin' : 'omit',
+    const result = await artifactWorkbench.content.fetchArtifact(artifact, {
+      sessionKey: sessionKey.value,
     })
-    if (!response.ok) {
-      pushToast(t('chat.toast.downloadFailedHttp', { status: response.status }), { tone: 'danger' })
+    if (!result.ok) {
+      pushToast(t('chat.toast.downloadFailedHttp', { status: result.status }), { tone: 'danger' })
       return
     }
-    const blob = await response.blob()
-    downloadBlob(blob, artifact.name || 'artifact')
+    downloadBlob(result.blob, artifact.name || 'artifact')
   } catch (err) {
     console.warn('Download failed:', err)
     pushToast(t('chat.toast.downloadFailed'), { tone: 'danger' })
@@ -5506,8 +5518,10 @@ async function forkConversation(throughTurnId?: string) {
     previewMessages: snapshotForkPreviewMessages(renderedMessages.value, normalizedTurnId),
   }
   try {
-    const request = forkRpcRequest(parentKey, normalizedTurnId)
-    const res = await rpc.call<ForkRpcResponse>(request.method, request.params)
+    const res = await sessionConversation.fork({
+      key: parentKey,
+      ...(normalizedTurnId ? { throughTurnId: normalizedTurnId } : {}),
+    }) as ForkRpcResponse
     if (!isForkTransitionActive(generation)) return
     const childKey = validatedForkChildKey(res, normalizedTurnId)
     if (sessionKey.value !== parentKey) {
@@ -5548,7 +5562,7 @@ async function resumeSandbox() {
   const key = sessionKey.value
   if (!key) return
   try {
-    await rpc.call('sandbox.resume', { sessionKey: key })
+    await injectedSandboxRuntime?.resume(key)
     messages.value.push({
       role: 'system',
       text: t('chat.sandboxResumed'),
@@ -6353,7 +6367,7 @@ function consumeDraftPrefill() {
 
 async function chooseProjectPath(path: string) {
   projectPickerOpen.value = false
-  if (!rpc.canChooseProject) return
+  if (!gatewayAccess.canChooseProject) return
   const trusted = await confirm({
     title: t('workspaces.trustTitle'),
     body: t('workspaces.trustBody', { path }),
@@ -6377,7 +6391,7 @@ async function chooseProjectPath(path: string) {
 }
 
 function openProjectPicker() {
-  if (!rpc.canChooseProject) return
+  if (!gatewayAccess.canChooseProject) return
   projectPickerOpen.value = true
 }
 
@@ -6406,8 +6420,6 @@ async function validateActiveProjectBeforeSend(): Promise<string | null> {
       const recovered = await retrySessionMetadata({
         timeoutMs: Math.max(1, deadlineAt - Date.now()),
         signal: controller.signal,
-        timeoutAction: 'reconnect',
-        abortAction: 'reject',
       })
       if (!recovered) {
         if (!controller.signal.aborted && sessionKey.value === key) {
@@ -6418,7 +6430,7 @@ async function validateActiveProjectBeforeSend(): Promise<string | null> {
       workspaceId = boundWorkspaceId.value
     }
     if (!workspaceId) return activeWorkspaceSendBlockedReason.value
-    if (!rpc.canManageProjectWorkspaces) {
+    if (!gatewayAccess.canManageProjectWorkspaces) {
       return activeWorkspaceSendBlockedReason.value
     }
     const workspaces = await projectWorkspaces.loadWorkspaces({
@@ -6467,7 +6479,7 @@ async function syncDraftProjectFromRoute(generation: number): Promise<boolean> {
     activeProjectWorkspace.clearDraft()
     return true
   }
-  if (!rpc.canChooseProject) {
+  if (!gatewayAccess.canChooseProject) {
     activeProjectWorkspace.clearDraft()
     freshTaskDraft.requestFreshTask(draftAgentId())
     goToDraft({
@@ -6486,11 +6498,12 @@ async function syncDraftProjectFromRoute(generation: number): Promise<boolean> {
   const controller = draftProjectHydration.createController(generation)
   if (!controller) return false
   try {
-    await rpc.waitForConnection(
-      Math.max(1, deadlineAt - Date.now()),
-      controller.signal,
-      { timeoutAction: 'reject', abortAction: 'reject' },
-    )
+    await sessionConversation.ready({
+      timeoutMs: Math.max(1, deadlineAt - Date.now()),
+      signal: controller.signal,
+      timeoutAction: 'reject',
+      abortAction: 'reject',
+    })
     if (!draftProjectHydrationIsCurrent(generation, workspaceId)) return false
     await projectWorkspaces.loadWorkspaces({
       timeoutMs: Math.max(1, deadlineAt - Date.now()),
@@ -6623,10 +6636,9 @@ onMounted(async () => {
   // Load elevated mode
   loadElevatedMode()
 
-  unsubs.push(rpc.on(
-    'sandbox.run_mode.preference.changed',
+  unsubs.push(injectedSandboxRuntime?.subscribeRunModePreferenceChanged(
     payload => applyRunModePreferenceChanged(payload),
-  ))
+  ) ?? (() => undefined))
 
   // Register event handlers before sessions.messages.subscribe can replay
   // buffered events, then start the two critical phases before any optional
@@ -6949,7 +6961,7 @@ watch(freshTaskDraft.request, request => {
   // outgoing composer and cannot recreate the discarded recovery pointer.
   inputText.value = ''
   draftPersistence.clearDraft(sessionKey.value)
-  if (request.workspaceId && rpc.canChooseProject) {
+  if (request.workspaceId && gatewayAccess.canChooseProject) {
     const workspace = projectWorkspaces.byId.value.get(request.workspaceId)
     if (workspace) {
       activeProjectWorkspace.beginProjectDraft(activeSnapshot(workspace))
@@ -6964,7 +6976,7 @@ watch(freshTaskDraft.request, request => {
 })
 
 watch(projectWorkspaces.workspaces, workspaces => {
-  if (!rpc.canManageProjectWorkspaces) return
+  if (!gatewayAccess.canManageProjectWorkspaces) return
   const workspaceId = boundWorkspaceId.value
   if (!workspaceId) return
   const workspace = workspaces.find(item => item.id === workspaceId) || null
@@ -6974,7 +6986,7 @@ watch(projectWorkspaces.workspaces, workspaces => {
 })
 
 watch(
-  () => rpc.canChooseProject,
+  () => gatewayAccess.canChooseProject,
   allowed => {
     if (allowed) return
     projectPickerOpen.value = false
@@ -7061,8 +7073,8 @@ watch(sessionKey, () => {
 
 // Hello refreshes method capabilities on reconnect. Retry the durable index
 // for the current Session then; older gateways simply remain on history/live.
-watch(() => rpc.state, (state, previous) => {
-  if (state !== 'connected' || previous === 'connected') return
+watch(() => gatewayAccess.availability, (state, previous) => {
+  if (state !== 'available' || previous === 'available') return
   void loadFeatureToggles()
   if (
     sessionKey.value

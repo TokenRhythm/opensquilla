@@ -31,6 +31,9 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         "src/opensquilla/contracts/adapters/goals_contract.py",
         "src/opensquilla/gateway/adapters/goals_contract.py",
         "src/opensquilla/gateway/adapters/plans_contract.py",
+        # Session read Contracts are consumed only by the Gateway registration
+        # Adapter; Application Modules and handlers receive domain values.
+        "src/opensquilla/gateway/adapters/session_read_contract.py",
     }
 )
 GENERATED_METADATA_IMPORT_ALLOWLIST = frozenset(
@@ -108,7 +111,7 @@ SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
 SESSIONS_RESOLVE_LITERAL_ALLOWLIST: Counter[str] = Counter()
 SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
 RUNTIME_RPC_METHOD_BASELINE = 306
-STATIC_RPC_DECORATOR_BASELINE = 284
+STATIC_RPC_DECORATOR_BASELINE = 278
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
 # closure measurement below.  The temporary S2a cumulative growth budget was
@@ -147,12 +150,15 @@ AUTHORED_RUNTIME_FILES = (
     "src/opensquilla/application/session_directory.py",
     "src/opensquilla/session_key.py",
 )
+AUTHORED_RUNTIME_LOC_BASELINE = 26_507
 
-F2_FOUNDATION_RUNTIME_FILES = (
-    "opensquilla-webui/src/adapters/gateway/gatewayAdapters.ts",
+F2_TRANSPORT_FOUNDATION_FILES = (
     "opensquilla-webui/src/adapters/gateway/privateHttpTransport.ts",
     "opensquilla-webui/src/adapters/gateway/privateTransports.ts",
     "src/opensquilla/gateway/adapters/contract_method.py",
+)
+F2_GATEWAY_COMPOSITION_ROOT = (
+    "opensquilla-webui/src/adapters/gateway/gatewayAdapters.ts"
 )
 # F2 adds three explicitly reviewed HTTP hardening slices on top of the
 # initial 849-line foundation: 58 lines for body lifecycle ownership, 103
@@ -160,22 +166,31 @@ F2_FOUNDATION_RUNTIME_FILES = (
 # tightening), 135 lines for cancellation-safe response-body ownership, and
 # 3 lines for hostile request-option normalization and 3 lines for endpoint
 # input normalization.
-# Keep the allowance explicit so later domain slices cannot hide authored
-# growth behind this infrastructure exception.  Session-directory changes and
-# lifecycle now each register one reviewed domain Adapter in the composition
-# root; the 12-line increase is the deliberate cumulative seam cost for those
-# two slices. Session routing adds one more adapter registration and its typed
-# composition-root seam (4 lines), TurnCommands adds the same 4-line
-# composition seam, and PendingInputQueue adds its typed adapter registration
-# and module provision (5 lines). ApprovalCenter adds the HTTP-backed adapter
-# seam and its composition entry (21 lines). GoalCenter adds its typed
-# composition entry (4 lines), and GoalContinuity adds its independently
-# owned lease/event seam (4 lines). Keep every reviewed increment explicit
-# rather than turning the foundation exception into an open-ended budget.
-# The current main baseline is 1,200 physical lines.  Keep this ceiling
-# explicit so future domain slices cannot hide growth behind the foundation
-# allowance; this is a baseline correction, not a new R1 exception.
-F2_FOUNDATION_RUNTIME_LOC_CEILING = 1_200
+# Keep the Transport allowance explicit so later domain slices cannot hide
+# authored growth behind this infrastructure exception.  The Gateway Adapter
+# composition root is deliberately excluded: every completed domain slice
+# adds typed imports, one Interface member, and one Adapter registration there,
+# which is reviewed architecture rather than Transport-foundation growth.
+# Its structure is governed separately below and by the WebUI architecture
+# import gate.  The three stable Transport files totalled 1,125 physical lines
+# on the reviewed #1525 baseline.
+F2_TRANSPORT_FOUNDATION_LOC_CEILING = 1_125
+
+WEBUI_SOURCE_ROOT = ROOT / "opensquilla-webui" / "src"
+WEBUI_LEGACY_TRANSPORT_IDENTIFIERS = (
+    "supportsMethod",
+    "supportsEvent",
+    "waitForConnection",
+    "markMethodUnavailable",
+    "createLegacySessionConversation",
+)
+
+R3_APPLICATION_MODULE_FILES = (
+    "src/opensquilla/application/app_settings.py",
+    "src/opensquilla/application/provider_configuration.py",
+    "src/opensquilla/application/session_read.py",
+    "src/opensquilla/application/setup_workflow.py",
+)
 
 # Existing cross-rpc private imports are architectural debt. This exact ledger
 # prevents growth and also fails stale when an import is removed, so reductions
@@ -563,14 +578,77 @@ def _physical_lines(relative_paths: tuple[str, ...]) -> int:
     return sum(
         len((ROOT / relative).read_text(encoding="utf-8").splitlines())
         for relative in relative_paths
+        if (ROOT / relative).is_file()
     )
 
 
-def test_f2_foundation_runtime_stays_within_explicit_ceiling() -> None:
-    current = _physical_lines(F2_FOUNDATION_RUNTIME_FILES)
-    assert current <= F2_FOUNDATION_RUNTIME_LOC_CEILING, (
-        f"F2 authored foundation runtime grew to {current} lines; "
-        f"the reviewed ceiling is {F2_FOUNDATION_RUNTIME_LOC_CEILING}"
+def test_z1_authored_runtime_is_smaller_than_platform_baseline() -> None:
+    current = _physical_lines(AUTHORED_RUNTIME_FILES)
+    assert current < AUTHORED_RUNTIME_LOC_BASELINE, (
+        f"Z1 authored runtime is {current} lines; complete domain migration must remain below "
+        f"the reviewed #1525 baseline of {AUTHORED_RUNTIME_LOC_BASELINE}"
+    )
+
+
+def test_z1_webui_legacy_transport_surface_is_closed() -> None:
+    legacy_rpc_types = WEBUI_SOURCE_ROOT / "types" / "rpc.ts"
+    assert not legacy_rpc_types.exists(), (
+        "types/rpc.ts must be deleted after domain ownership closes"
+    )
+
+    forbidden_identifiers: dict[str, list[str]] = {}
+    raw_store_imports: list[str] = []
+    for path in sorted(WEBUI_SOURCE_ROOT.rglob("*")):
+        if not path.is_file() or path.suffix not in {".ts", ".tsx", ".js", ".jsx", ".vue"}:
+            continue
+        relative = path.relative_to(WEBUI_SOURCE_ROOT).as_posix()
+        if ".test." in path.name or ".spec." in path.name:
+            continue
+        if relative.startswith("contracts/generated/"):
+            continue
+        source = path.read_text(encoding="utf-8")
+        leaked = [name for name in WEBUI_LEGACY_TRANSPORT_IDENTIFIERS if name in source]
+        if leaked:
+            forbidden_identifiers[relative] = leaked
+        if (
+            ("@/stores/rpc" in source or "./stores/rpc" in source or "../stores/rpc" in source)
+            and relative not in {"main.ts", "stores/rpc.ts"}
+        ):
+            raw_store_imports.append(relative)
+
+    assert forbidden_identifiers == {}, (
+        "legacy generic transport capabilities must stay deleted from production WebUI: "
+        f"{forbidden_identifiers}"
+    )
+    assert raw_store_imports == [], (
+        "useRpcStore is private to the composition root and transport implementation: "
+        f"{raw_store_imports}"
+    )
+
+
+def test_f2_transport_foundation_stays_within_explicit_ceiling() -> None:
+    current = _physical_lines(F2_TRANSPORT_FOUNDATION_FILES)
+    assert current <= F2_TRANSPORT_FOUNDATION_LOC_CEILING, (
+        f"F2 authored Transport foundation grew to {current} lines; "
+        f"the reviewed ceiling is {F2_TRANSPORT_FOUNDATION_LOC_CEILING}"
+    )
+
+
+def test_f2_gateway_composition_root_stays_declarative() -> None:
+    source = (ROOT / F2_GATEWAY_COMPOSITION_ROOT).read_text(encoding="utf-8")
+    forbidden = {
+        "rpc.call(": "raw RPC calls",
+        "rpc.request(": "raw RPC requests",
+        "fetch(": "direct HTTP requests",
+        "supportsMethod(": "wire capability checks",
+        "supportsEvent(": "wire event capability checks",
+        "waitForConnection(": "connection lifecycle ownership",
+        "markMethodUnavailable(": "wire compatibility state",
+    }
+    leaked = [label for token, label in forbidden.items() if token in source]
+    assert leaked == [], (
+        "Gateway Adapter composition root must remain declarative; found "
+        + ", ".join(leaked)
     )
 
 
@@ -629,6 +707,19 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "GOALS_CLEAR_METHOD",
         }
     ] == []
+    assert [
+        site
+        for site in sites
+        if site[2]
+        in {
+            "chat.history",
+            "sessions.messages.subscribe",
+            "sessions.messages.hydrate",
+            "sessions.messages.snapshot",
+            "sessions.messages.unsubscribe",
+            "sessions.preview",
+        }
+    ] == []
 
 
 def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter() -> None:
@@ -661,6 +752,46 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
     assert entry.required_scope == SESSIONS_RESOLVE_SCOPE
     assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
     assert entry.handler.__name__ == "handle_contract_method"
+
+    from opensquilla.contracts.generated.v4.chat_history_metadata import (
+        CHAT_HISTORY_METHOD,
+        CHAT_HISTORY_SCOPE,
+    )
+    from opensquilla.contracts.generated.v4.sessions_messages_hydrate_metadata import (
+        SESSIONS_MESSAGES_HYDRATE_METHOD,
+        SESSIONS_MESSAGES_HYDRATE_SCOPE,
+    )
+    from opensquilla.contracts.generated.v4.sessions_messages_snapshot_metadata import (
+        SESSIONS_MESSAGES_SNAPSHOT_METHOD,
+        SESSIONS_MESSAGES_SNAPSHOT_SCOPE,
+    )
+    from opensquilla.contracts.generated.v4.sessions_messages_subscribe_metadata import (
+        SESSIONS_MESSAGES_SUBSCRIBE_METHOD,
+        SESSIONS_MESSAGES_SUBSCRIBE_SCOPE,
+    )
+    from opensquilla.contracts.generated.v4.sessions_messages_unsubscribe_metadata import (
+        SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD,
+        SESSIONS_MESSAGES_UNSUBSCRIBE_SCOPE,
+    )
+    from opensquilla.contracts.generated.v4.sessions_preview_metadata import (
+        SESSIONS_PREVIEW_METHOD,
+        SESSIONS_PREVIEW_SCOPE,
+    )
+
+    for method, scope in (
+        (CHAT_HISTORY_METHOD, CHAT_HISTORY_SCOPE),
+        (SESSIONS_MESSAGES_SUBSCRIBE_METHOD, SESSIONS_MESSAGES_SUBSCRIBE_SCOPE),
+        (SESSIONS_MESSAGES_HYDRATE_METHOD, SESSIONS_MESSAGES_HYDRATE_SCOPE),
+        (SESSIONS_MESSAGES_SNAPSHOT_METHOD, SESSIONS_MESSAGES_SNAPSHOT_SCOPE),
+        (SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD, SESSIONS_MESSAGES_UNSUBSCRIBE_SCOPE),
+        (SESSIONS_PREVIEW_METHOD, SESSIONS_PREVIEW_SCOPE),
+    ):
+        entry = registry.get_entry(method)
+        assert entry is not None
+        assert entry.name == method
+        assert entry.required_scope == scope
+        assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
+        assert entry.handler.__name__ == "handle_contract_method"
 
     from opensquilla.contracts.generated.v4.goals_capabilities_metadata import (
         GOALS_CAPABILITIES_METHOD,
@@ -759,3 +890,25 @@ def test_cross_rpc_private_import_debt_is_exact() -> None:
     stale = APPROVED_PRIVATE_RPC_IMPORTS - actual
     assert unexpected == Counter(), f"unexpected private RPC imports: {unexpected}"
     assert stale == Counter(), f"stale private RPC import allowlist: {stale}"
+
+
+def test_r3_application_modules_do_not_depend_on_gateway_context() -> None:
+    violations: list[str] = []
+    for relative in R3_APPLICATION_MODULE_FILES:
+        path = ROOT / relative
+        tree = _tree(path)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
+                "opensquilla.gateway"
+            ):
+                violations.append(f"{relative}:{node.lineno}: imports {node.module}")
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.startswith("opensquilla.gateway"):
+                        violations.append(f"{relative}:{node.lineno}: imports {alias.name}")
+            elif isinstance(node, ast.Name) and node.id == "RpcContext":
+                violations.append(f"{relative}:{node.lineno}: references RpcContext")
+
+    assert violations == [], "R3 Application Modules crossed the Gateway seam:\n" + "\n".join(
+        violations
+    )

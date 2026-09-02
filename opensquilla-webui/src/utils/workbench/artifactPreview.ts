@@ -1,6 +1,6 @@
 import createDOMPurify from 'dompurify'
 import { marked } from 'marked'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import { artifactExtension, artifactMime, artifactName } from '@/utils/chat/artifacts'
 import { strictStrikethrough } from '@/utils/markdown/strikethrough'
 

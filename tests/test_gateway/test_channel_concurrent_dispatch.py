@@ -502,7 +502,7 @@ async def test_cap_full_no_transcript_pollution() -> None:
 
     config = _make_config(channel_inflight_cap=1, max_concurrency=1)
 
-    fake_envelope = MagicMock()
+    fake_envelope = MagicMock(metadata={})
     fake_envelope.thread_id = None
     fake_envelope.channel_id = "ch-test"
 
@@ -599,7 +599,7 @@ async def test_debounce_reservation_enforced() -> None:
         combined.coalesced_count = 1
         return combined
 
-    fake_envelope = MagicMock()
+    fake_envelope = MagicMock(metadata={})
     fake_envelope.thread_id = None
     fake_envelope.channel_id = "ch-test"
 
@@ -607,6 +607,7 @@ async def test_debounce_reservation_enforced() -> None:
 
     async def _slow_enqueue(*args: Any, **kwargs: Any) -> Any:
         nonlocal enqueue_call_count
+        assert kwargs["accepted_run_mode_override"].run_mode.value == "safe"
         enqueue_call_count += 1
         # Yield so the second coroutine gets to run its cap check concurrently.
         await asyncio.sleep(0)
@@ -772,7 +773,7 @@ async def test_apply_overflow_policy_invoked_when_channel_override_present() -> 
     cfg = _make_config(channel_inflight_cap=8, max_concurrency=4)
     cfg.task_runtime.pending_overflow_policy_per_channel = {"feishu": "drop_oldest"}
 
-    fake_envelope = MagicMock()
+    fake_envelope = MagicMock(metadata={})
     fake_envelope.thread_id = None
     fake_envelope.channel_id = "ch-test"
 
@@ -883,7 +884,7 @@ async def test_apply_overflow_policy_not_invoked_without_channel_override() -> N
     cfg = _make_config(channel_inflight_cap=8, max_concurrency=4)
     cfg.task_runtime.pending_overflow_policy_per_channel = {"feishu": "drop_oldest"}
 
-    fake_envelope = MagicMock()
+    fake_envelope = MagicMock(metadata={})
     fake_envelope.thread_id = None
     fake_envelope.channel_id = "ch-test"
 

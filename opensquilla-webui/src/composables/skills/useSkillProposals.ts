@@ -1,6 +1,6 @@
 import { computed, ref, type ComputedRef, type Ref } from 'vue'
 import i18n from '@/i18n'
-import type { useRpcStore } from '@/stores/rpc'
+import type { SkillCatalog } from '@/modules/skillCatalog'
 import { useConfirm } from '@/composables/useConfirm'
 import { useToasts } from '@/composables/useToasts'
 import {
@@ -8,33 +8,6 @@ import {
   type SkillMutationGate,
 } from '@/composables/skills/useSkillMutationGate'
 import type { AutoEnabledSkill, Proposal, ProposalsSettings } from '@/types/skills'
-
-interface ProposalsListData {
-  proposals?: Proposal[]
-}
-
-interface AutoEnabledListData {
-  skills?: AutoEnabledSkill[]
-}
-
-interface ProposalSettingsData {
-  settings?: ProposalsSettings
-  status?: string
-  reason?: string
-}
-
-interface ProposalShowData {
-  status?: string
-  reason?: string
-  skill_md?: string
-  gates?: Record<string, unknown>
-  auto_enable_audit?: Proposal['auto_enable_audit']
-}
-
-interface ProposalActionData {
-  status?: string
-  reason?: string
-}
 
 export interface SkillProposals {
   proposals: Ref<Proposal[]>
@@ -59,7 +32,7 @@ const DEFAULT_PROPOSAL_SETTINGS: ProposalsSettings = {
 }
 
 export function useSkillProposals(
-  rpc: ReturnType<typeof useRpcStore>,
+  catalog: SkillCatalog,
   loadData: () => Promise<void>,
   mutationGate: SkillMutationGate = createSkillMutationGate(),
 ): SkillProposals {
@@ -77,21 +50,13 @@ export function useSkillProposals(
 
   async function loadProposals() {
     try {
-      const data = await rpc.call<ProposalsListData>('exec.proposals.list')
-      proposals.value = data.proposals || []
+      const snapshot = await catalog.proposals()
+      proposals.value = [...snapshot.proposals]
+      autoEnabledSkills.value = [...snapshot.autoEnabledSkills]
+      proposalsSettings.value = snapshot.settings || proposalsSettings.value
     } catch {
       proposals.value = []
-    }
-    try {
-      const data = await rpc.call<AutoEnabledListData>('exec.proposals.auto_enabled.list')
-      autoEnabledSkills.value = data.skills || []
-    } catch {
       autoEnabledSkills.value = []
-    }
-    try {
-      const data = await rpc.call<ProposalSettingsData>('exec.proposals.settings.get')
-      proposalsSettings.value = data.settings || proposalsSettings.value
-    } catch {
       proposalsSettings.value = { ...DEFAULT_PROPOSAL_SETTINGS }
     }
   }
@@ -99,7 +64,7 @@ export function useSkillProposals(
   async function toggleAutoPropose(key: string, value: boolean) {
     if (!mutationGate.acquire('proposal')) return
     try {
-      const out = await rpc.call<ProposalSettingsData>('exec.proposals.settings.set', { [key]: value })
+      const out = await catalog.updateProposalSettings({ [key]: value })
       if (out && out.status === 'error') {
         pushToast(t('cronSkills.proposals.toastSettingsFailed', { reason: out.reason || t('cronSkills.proposals.unknown') }), { tone: 'danger' })
         return
@@ -116,7 +81,7 @@ export function useSkillProposals(
   async function setAutoEnableRisk(value: string) {
     if (!mutationGate.acquire('proposal')) return
     try {
-      const out = await rpc.call<ProposalSettingsData>('exec.proposals.settings.set', { auto_enable_max_risk: value })
+      const out = await catalog.updateProposalSettings({ auto_enable_max_risk: value })
       if (out && out.status === 'error') {
         pushToast(t('cronSkills.proposals.toastSettingsFailed', { reason: out.reason || t('cronSkills.proposals.unknown') }), { tone: 'danger' })
         return
@@ -131,7 +96,7 @@ export function useSkillProposals(
 
   async function showProposal(proposalId: string): Promise<Proposal | null> {
     try {
-      const data = await rpc.call<ProposalShowData>('exec.proposals.show', { proposal_id: proposalId })
+      const data = await catalog.proposal(proposalId)
       if (data.status !== 'ok') {
         pushToast(t('cronSkills.proposals.toastShowFailed', { reason: data.reason || t('cronSkills.proposals.unknown') }), { tone: 'danger' })
         return null
@@ -146,7 +111,7 @@ export function useSkillProposals(
   async function acceptProposal(proposalId: string) {
     if (!mutationGate.acquire('proposal')) return
     try {
-      let data = await rpc.call<ProposalActionData>('exec.proposals.accept', { proposal_id: proposalId })
+      let data = await catalog.acceptProposal(proposalId)
       if (data.status === 'refused' && data.reason && data.reason.indexOf('gates') !== -1) {
         const ok = await confirm({
           title: t('cronSkills.proposals.acceptAnywayTitle'),
@@ -154,7 +119,7 @@ export function useSkillProposals(
           primaryLabel: t('cronSkills.proposals.forceAccept'),
         })
         if (!ok) return
-        data = await rpc.call<ProposalActionData>('exec.proposals.accept', { proposal_id: proposalId, force: true })
+        data = await catalog.acceptProposal(proposalId, { force: true })
       }
       if (data.status !== 'ok') {
         pushToast(t('cronSkills.proposals.toastAcceptFailed', { reason: data.reason || data.status }), { tone: 'danger' })
@@ -177,7 +142,7 @@ export function useSkillProposals(
     if (!ok) return
     if (!mutationGate.acquire('proposal')) return
     try {
-      const data = await rpc.call<ProposalActionData>('exec.proposals.reject', { proposal_id: proposalId })
+      const data = await catalog.rejectProposal(proposalId)
       if (data.status !== 'ok') {
         pushToast(t('cronSkills.proposals.toastRejectFailed', { reason: data.reason || data.status }), { tone: 'danger' })
         return
@@ -199,7 +164,7 @@ export function useSkillProposals(
     if (!ok) return
     if (!mutationGate.acquire('proposal')) return
     try {
-      const data = await rpc.call<ProposalActionData>('exec.proposals.auto_enabled.disable', { name })
+      const data = await catalog.disableAutoEnabledSkill(name)
       if (data.status !== 'ok') {
         pushToast(t('cronSkills.proposals.toastDisableFailed', { reason: data.reason || data.status }), { tone: 'danger' })
         return

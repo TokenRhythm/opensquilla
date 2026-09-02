@@ -120,6 +120,31 @@ _GATEWAY_CONTRACT_PREFIXES: Final = (
     "tests/contracts/",
     "tests/fixtures/contracts/gateway/v4/",
 )
+_WEBUI_ARCHITECTURE_TEST_TARGETS: Final = frozenset(
+    {
+        "tests/test_ci/test_architecture_import_contracts.py",
+        "tests/test_ci/test_rpc_architecture_contracts.py",
+    }
+)
+_WEBUI_BOUNDARY_PREFIXES: Final = (
+    "opensquilla-webui/scripts/lib/",
+    "opensquilla-webui/scripts/rpc-debt/",
+    "opensquilla-webui/src/adapters/gateway/",
+    "opensquilla-webui/src/contracts/",
+    "opensquilla-webui/src/modules/",
+    "opensquilla-webui/src/platform/",
+    "opensquilla-webui/src/types/",
+    "src/opensquilla/contracts/",
+    "src/opensquilla/gateway/adapters/",
+)
+_WEBUI_BOUNDARY_EXACT: Final = frozenset(
+    {
+        "opensquilla-webui/scripts/check-architecture.mjs",
+        "opensquilla-webui/src/lib/rpc.ts",
+        "opensquilla-webui/src/main.ts",
+        "opensquilla-webui/src/stores/rpc.ts",
+    }
+)
 _SKILL_HUB_TESTS: Final = frozenset(
     {
         "tests/test_skills_manifest.py",
@@ -669,6 +694,14 @@ def _is_dependency(path: str) -> bool:
 
 def _is_gateway_contract_input(path: str) -> bool:
     return path.startswith(_GATEWAY_CONTRACT_PREFIXES)
+
+
+def _is_webui_boundary_input(path: str) -> bool:
+    return (
+        path in _WEBUI_BOUNDARY_EXACT
+        or path.startswith(_WEBUI_BOUNDARY_PREFIXES)
+        or _is_gateway_contract_input(path)
+    )
 
 
 def _is_skill_hub_input(path: str) -> bool:
@@ -1565,6 +1598,10 @@ def plan_changes(
             full_fallback = True
             reasons.add("unknown_dependency_manifest")
             continue
+
+        if _is_webui_boundary_input(path):
+            suites.add("python-targeted")
+            targets.update(_WEBUI_ARCHITECTURE_TEST_TARGETS)
 
         if _is_gateway_contract_input(path):
             suites.update({"frontend-artifact", "frontend-validation"})

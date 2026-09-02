@@ -21,7 +21,7 @@ type LegacyQueueRpc = {
 
 type QueueTestOverrides = Partial<UseChatPendingQueueOptions> & {
   rpc?: LegacyQueueRpc
-  supportsMethod?: (method: string) => boolean
+  hasRpcMethod?: (method: string) => boolean
 }
 
 function makeQueue(
@@ -45,7 +45,7 @@ function makeQueue(
   const defaultWal = memoryWal().wal
   const {
     rpc,
-    supportsMethod,
+    hasRpcMethod,
     pendingInputQueue,
     ...safeOverrides
   } = overrides
@@ -55,7 +55,7 @@ function makeQueue(
           request: <T = unknown>(method: string, params?: Record<string, unknown>) => (
             rpc.call<T>(method, params)
           ),
-          supports: supportsMethod,
+          supports: hasRpcMethod,
         })
       : null)
   const queue = useChatPendingQueue({
@@ -239,7 +239,7 @@ describe('useChatPendingQueue delivery state', () => {
       () => false,
       undefined,
       undefined,
-      { pendingInputWal: wal, supportsMethod: () => false },
+      { pendingInputWal: wal, hasRpcMethod: () => false },
     )
     inputText.value = 'survives a refresh'
 
@@ -294,7 +294,7 @@ describe('useChatPendingQueue delivery state', () => {
       () => false,
       undefined,
       undefined,
-      { pendingInputWal: wal, supportsMethod: () => false },
+      { pendingInputWal: wal, hasRpcMethod: () => false },
     )
     const original: Attachment = {
       kind: 'staged',
@@ -342,7 +342,7 @@ describe('useChatPendingQueue delivery state', () => {
       () => false,
       undefined,
       undefined,
-      { pendingInputWal: wal, supportsMethod: () => false },
+      { pendingInputWal: wal, hasRpcMethod: () => false },
     )
     inputText.value = 'queued draft'
 
@@ -379,7 +379,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         sessionKey: delayedSessionKey,
         pendingInputWal: wal,
-        supportsMethod: () => false,
+        hasRpcMethod: () => false,
       },
     )
     expect(queue.pendingQueue.value).toEqual([])
@@ -413,7 +413,7 @@ describe('useChatPendingQueue delivery state', () => {
       () => false,
       undefined,
       undefined,
-      { pendingInputWal: wal, supportsMethod: () => false },
+      { pendingInputWal: wal, hasRpcMethod: () => false },
     )
     await vi.waitFor(() => {
       expect(queue.pendingQueue.value[0]).toMatchObject({
@@ -523,7 +523,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
     inputText.value = 'queue with attachment'
@@ -603,7 +603,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
         prepareAttachmentsForSend,
       },
     )
@@ -660,7 +660,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
     inputText.value = 'stage exactly once'
@@ -717,7 +717,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
 
@@ -769,7 +769,7 @@ describe('useChatPendingQueue delivery state', () => {
     const { queue } = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
       rpc,
-      supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+      hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
     })
 
     await vi.waitFor(() => expect(queue.pendingQueue.value).toHaveLength(1))
@@ -809,7 +809,7 @@ describe('useChatPendingQueue delivery state', () => {
     const { queue } = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
       rpc,
-      supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+      hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
     })
 
     await vi.waitFor(() => expect(queue.pendingQueue.value).toHaveLength(1))
@@ -879,7 +879,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
 
@@ -922,7 +922,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
     inputText.value = 'cancel after lost acknowledgement'
@@ -973,7 +973,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc: initialRpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
     initial.inputText.value = 'cancel across a Gateway downgrade'
@@ -995,7 +995,7 @@ describe('useChatPendingQueue delivery state', () => {
       () => false,
       undefined,
       undefined,
-      { pendingInputWal: wal, supportsMethod: () => false },
+      { pendingInputWal: wal, hasRpcMethod: () => false },
     )
     await vi.waitFor(() => {
       expect(legacy.queue.pendingQueue.value[0]).toMatchObject({
@@ -1045,7 +1045,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc: restoredRpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
 
@@ -1073,14 +1073,14 @@ describe('useChatPendingQueue delivery state', () => {
       () => false,
       undefined,
       undefined,
-      { pendingInputWal: wal, supportsMethod: () => false },
+      { pendingInputWal: wal, hasRpcMethod: () => false },
     )
     const second = makeQueue(
       undefined,
       () => false,
       undefined,
       undefined,
-      { pendingInputWal: wal, supportsMethod: () => false },
+      { pendingInputWal: wal, hasRpcMethod: () => false },
     )
     try {
       first.inputText.value = 'cancel this in every tab'
@@ -1210,7 +1210,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
 
@@ -1300,7 +1300,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
     await vi.waitFor(() => {
@@ -1344,7 +1344,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
     await vi.waitFor(() => {
@@ -1407,7 +1407,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
 
@@ -1571,7 +1571,7 @@ describe('useChatPendingQueue delivery state', () => {
         sessionKey,
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
         connectionState: ref('connected'),
       },
     )
@@ -2019,7 +2019,7 @@ describe('useChatPendingQueue delivery state', () => {
 
     const first = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
-      supportsMethod: () => false,
+      hasRpcMethod: () => false,
     })
     first.inputText.value = 'follow-up A'
     await first.queue.enqueuePendingInput(first.inputText.value, { ownerRequestId })
@@ -2029,7 +2029,7 @@ describe('useChatPendingQueue delivery state', () => {
 
     const reloaded = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
-      supportsMethod: () => false,
+      hasRpcMethod: () => false,
     })
     await reloaded.queue.hydratePendingQueue(parent)
     expect(reloaded.queue.pendingQueue.value.map(item => item.ownerRequestId)).toEqual([
@@ -2066,7 +2066,7 @@ describe('useChatPendingQueue delivery state', () => {
     const { wal } = memoryWal()
     const first = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
-      supportsMethod: () => false,
+      hasRpcMethod: () => false,
     })
     for (const text of ['A', 'B', 'C']) {
       first.inputText.value = text
@@ -2083,7 +2083,7 @@ describe('useChatPendingQueue delivery state', () => {
 
     const reloaded = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
-      supportsMethod: () => false,
+      hasRpcMethod: () => false,
     })
     await reloaded.queue.hydratePendingQueue(reloaded.sessionKey.value)
     expect(reloaded.queue.pendingQueue.value.map(item => item.text)).toEqual(['C', 'A', 'B'])
@@ -2116,7 +2116,7 @@ describe('useChatPendingQueue delivery state', () => {
     })
     const source = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
-      supportsMethod: () => false,
+      hasRpcMethod: () => false,
     })
     for (const text of ['A', 'B']) {
       source.inputText.value = text
@@ -2190,7 +2190,7 @@ describe('useChatPendingQueue delivery state', () => {
     ))
     const source = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
-      supportsMethod: () => false,
+      hasRpcMethod: () => false,
     })
     let current = true
 
@@ -2248,7 +2248,7 @@ describe('useChatPendingQueue delivery state', () => {
       () => blocked,
       undefined,
       undefined,
-      { pendingInputWal: wal, supportsMethod: () => false },
+      { pendingInputWal: wal, hasRpcMethod: () => false },
     )
     try {
       source.inputText.value = 'source item must still drain'
@@ -2332,7 +2332,7 @@ describe('useChatPendingQueue delivery state', () => {
     })
     const source = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
-      supportsMethod: () => false,
+      hasRpcMethod: () => false,
     })
     const controller = new AbortController()
 
@@ -2411,7 +2411,7 @@ describe('useChatPendingQueue delivery state', () => {
     const first = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
       rpc,
-      supportsMethod: method => [
+      hasRpcMethod: method => [
         'sessions.pending_inputs.enqueue',
         'sessions.pending_inputs.reorder',
       ].includes(method),

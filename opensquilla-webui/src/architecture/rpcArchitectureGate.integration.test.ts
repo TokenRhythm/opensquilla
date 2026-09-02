@@ -107,6 +107,22 @@ describe('transport architecture gate ledger integration', () => {
     )
   })
 
+  it.each([
+    'session.event.text_delta',
+    'task.succeeded',
+  ])('keeps %s wire literals inside Gateway Adapters', (wireName) => {
+    const root = seededFixture(`export const leakedEvent = '${wireName}'`, {
+      'src/adapters/gateway/eventsV4.ts': `export const wireEvent = '${wireName}'`,
+    })
+    const failures = evaluateRpcArchitectureGate({ root, debtLanes: [] }).failures
+
+    expect(failures).toContain(
+      `src/feature.ts: ${wireName} wire literal is allowed only in a Gateway Adapter, generated Contract, or test.`,
+    )
+    expect(failures.some(failure => failure.includes('src/adapters/gateway/eventsV4.ts')))
+      .toBe(false)
+  })
+
   it('fails when a paid-down entry remains in the ledger', () => {
     const root = seededFixture('export const value = 1')
     expect(evaluateRpcArchitectureGate({ root, debtLanes: oneCallLane }).failures).toContain(
@@ -150,6 +166,29 @@ describe('transport architecture gate ledger integration', () => {
       failures: [],
       total: 0,
     })
+  })
+
+  it('exempts only the constrained platform static-asset reader from HTTP debt', () => {
+    const root = fixture({
+      'src/platform/staticAssets.ts': `
+        export async function readStaticJson(path: string) {
+          const url = new URL(path, location.href)
+          if (url.origin !== location.origin || url.pathname.startsWith('/api/')) return null
+          return await fetch(url)
+        }
+      `,
+      'src/composables/copiedAssetReader.ts': `
+        export async function copied(path: string) {
+          return await fetch(path)
+        }
+      `,
+    })
+    const result = evaluateRpcArchitectureGate({ root, debtLanes: [] })
+
+    expect(result.failures).toContain(
+      'src/composables/copiedAssetReader.ts: unexpected raw transport httpRequest (1); add a domain Adapter instead.',
+    )
+    expect(result.failures.some(failure => failure.includes('src/platform/staticAssets.ts'))).toBe(false)
   })
 
   it('rejects an Adapter that bypasses the private transport composition', () => {

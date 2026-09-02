@@ -79,7 +79,7 @@ const runtimePackStatus: SandboxRuntimePackStatus = {
 }
 
 async function settle() {
-  for (let index = 0; index < 8; index++) await Promise.resolve()
+  for (let index = 0; index < 32; index++) await Promise.resolve()
 }
 
 async function mountPanel(options: {
@@ -213,7 +213,7 @@ async function mountPanel(options: {
   })
   vi.doMock('@/stores/rpc', () => ({
     useRpcStore: () => ({
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call,
     }),
   }))
@@ -228,6 +228,8 @@ async function mountPanel(options: {
   const { createApp } = await import('vue')
   const { createPinia } = await import('pinia')
   const i18n = (await import('@/i18n')).default
+  const { SANDBOX_RUNTIME_KEY } = await import('@/modules/sandboxRuntime')
+  const { createV4SandboxRuntime } = await import('@/adapters/gateway/sandboxRuntimeV4')
   i18n.global.locale.value = 'en'
   const Component = (await import('./SandboxSettingsPanel.vue')).default
   const el = document.createElement('div')
@@ -235,6 +237,13 @@ async function mountPanel(options: {
   const app = createApp(Component)
   app.use(createPinia())
   app.use(i18n)
+  app.provide(SANDBOX_RUNTIME_KEY, createV4SandboxRuntime({
+    request: (method, params) => (
+      params === undefined && method !== 'sandbox.capability.status'
+        ? call(method)
+        : call(method, params)
+    ),
+  }))
   app.mount(el)
   mounted.push(app)
   await settle()
@@ -442,6 +451,42 @@ describe('SandboxSettingsPanel', () => {
 
     expect(document.body.querySelector('[data-testid="sandbox-setup-confirm"]')).toBeNull()
     expect(call.mock.calls.some(([method]) => method === 'sandbox.setup.ensure')).toBe(false)
+  })
+
+  it.each(['failed', 'unavailable', 'setting_up'] as const)(
+    'disables Safe mode when sandbox status is %s without opening setup',
+    async setupState => {
+      const { el, call } = await mountPanel({ setupState })
+      const safeButton = el.querySelector<HTMLButtonElement>('[data-testid="sandbox-safe-mode"]')!
+
+      expect(safeButton.disabled).toBe(true)
+      safeButton.click()
+      await settle()
+
+      expect(document.body.querySelector('[data-testid="sandbox-setup-confirm"]')).toBeNull()
+      expect(call.mock.calls.some(([method]) => method === 'sandbox.setup.ensure')).toBe(false)
+      expect(el.querySelector<HTMLButtonElement>('[data-testid="sandbox-full-mode"]')?.disabled)
+        .toBe(false)
+    },
+  )
+
+  it('allows cancelling first-time setup and opening it again without installing', async () => {
+    const { el, call } = await mountPanel({ setupState: 'not_setup' })
+    const safeButton = el.querySelector<HTMLButtonElement>('[data-testid="sandbox-safe-mode"]')!
+
+    safeButton.click()
+    await settle()
+    const dialog = document.body.querySelector('[data-testid="sandbox-setup-confirm"]')!
+    dialog.querySelector<HTMLButtonElement>('.btn:not(.btn--primary)')!.click()
+    await settle()
+    expect(document.body.querySelector('[data-testid="sandbox-setup-confirm"]')).toBeNull()
+    expect(safeButton.disabled).toBe(false)
+
+    safeButton.click()
+    await settle()
+    expect(document.body.querySelector('[data-testid="sandbox-setup-confirm"]')).toBeTruthy()
+    expect(call.mock.calls.some(([method]) => method === 'sandbox.setup.ensure')).toBe(false)
+    expect(call.mock.calls.some(([method]) => method === 'sandbox.run_mode.preference.set')).toBe(false)
   })
 
   it('shows neutral elapsed setup guidance while administrator approval is pending', async () => {

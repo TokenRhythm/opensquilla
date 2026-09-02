@@ -103,7 +103,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
+import { computed, inject, nextTick, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import {
@@ -115,11 +115,10 @@ import { useArtifactImageLightbox } from '@/composables/chat/useArtifactImageLig
 import { useDialogLayer } from '@/composables/useDialogA11y'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { useToasts } from '@/composables/useToasts'
-import type { ArtifactPayload } from '@/types/rpc'
-import { fetchArtifactBlob } from '@/utils/chat/artifactAccess'
+import type { ArtifactPayload } from '@/types/artifacts'
+import { ARTIFACT_WORKBENCH_KEY } from '@/modules/artifactWorkbench'
 import {
   artifactCategory,
-  artifactDownloadUrl,
   artifactFileTitle,
 } from '@/utils/chat/artifacts'
 import { downloadBlob } from '@/utils/browser'
@@ -127,6 +126,9 @@ import { downloadBlob } from '@/utils/browser'
 const { t } = useI18n()
 const { pushToast } = useToasts()
 const controller = useArtifactImageLightbox()
+const injectedArtifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
+if (!injectedArtifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
+const artifactWorkbench = injectedArtifactWorkbench
 const active = computed(() => controller.request.value?.artifact ?? null)
 const isOpen = computed(() => active.value !== null)
 const lightboxIsTopmost = useDialogLayer(isOpen)
@@ -175,32 +177,6 @@ const canGoNextImage = computed(() =>
   activeImageIndex.value >= 0
   && activeImageIndex.value < navigationVisualArtifacts.value.length - 1)
 
-function readAuthToken(): string {
-  if (typeof sessionStorage === 'undefined') return ''
-  try {
-    return sessionStorage.getItem('opensquilla.wsToken') || ''
-  } catch {
-    return ''
-  }
-}
-
-function sameOrigin(url: string): boolean {
-  try {
-    return new URL(url, window.location.origin).origin === window.location.origin
-  } catch {
-    return false
-  }
-}
-
-function previewHeaders(url: string, sessionKey: string): Record<string, string> {
-  if (!sameOrigin(url)) return {}
-  const headers: Record<string, string> = {}
-  if (sessionKey) headers['x-opensquilla-session-key'] = sessionKey
-  const authToken = readAuthToken()
-  if (authToken) headers.Authorization = `Bearer ${authToken}`
-  return headers
-}
-
 function disposeFull() {
   stopFullState?.()
   stopFullState = null
@@ -213,14 +189,10 @@ function disposeFull() {
 
 function loadFull(artifact: ArtifactPayload, sessionKey: string) {
   disposeFull()
-  const url = artifactDownloadUrl(artifact, window.location.origin, {
-    sessionKey,
-    includeSessionKey: false,
-  })
   fullController = createArtifactPreview({
-    resolveUrl: () => url,
-    headers: () => previewHeaders(url, sessionKey),
-    sameOrigin,
+    artifact: () => artifact,
+    sessionKey: () => sessionKey,
+    variant: 'content',
     fullSize: true,
   })
   const preview = fullController
@@ -309,9 +281,7 @@ function onLightboxKeydown(event: KeyboardEvent) {
 async function downloadActive() {
   const request = controller.request.value
   if (!request) return
-  const result = await fetchArtifactBlob(request.artifact, {
-    authToken: readAuthToken(),
-    baseOrigin: window.location.origin,
+  const result = await artifactWorkbench.content.fetchArtifact(request.artifact, {
     sessionKey: request.sessionKey,
   })
   if (!result.ok) {

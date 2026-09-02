@@ -1,11 +1,16 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, shallowRef } from 'vue'
+import { computed, inject, nextTick, onMounted, onUnmounted, ref, shallowRef } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { useConfirm } from '@/composables/useConfirm'
 import { useToasts } from '@/composables/useToasts'
 import { usePlatform } from '@/platform'
-import { useRpcStore } from '@/stores/rpc'
+import {
+  MIGRATION_OPERATIONS_KEY,
+  type GatewayMigrationCandidate,
+  type GatewayMigrationPreview,
+  type MigrationOperations,
+} from '@/modules/migrationOperations'
 import {
   formatByteSize,
   summarizeMigrationReport,
@@ -127,44 +132,6 @@ interface DesktopMigrationBridge {
   revealDesktopUserData?: () => Promise<boolean>
 }
 
-interface GatewayCandidate {
-  candidateId?: unknown
-  sourceKind?: unknown
-  version?: unknown
-  estimatedActivityAt?: unknown
-  sessionCount?: unknown
-  sizeBytes?: unknown
-  previouslyImported?: unknown
-}
-
-interface GatewaySourcesResponse {
-  schemaVersion?: unknown
-  mode?: unknown
-  capabilities?: {
-    discover?: unknown
-    preview?: unknown
-    apply?: unknown
-    manualSource?: unknown
-  }
-  candidates?: unknown
-}
-
-interface GatewayPreviewResponse {
-  schemaVersion?: unknown
-  mode?: unknown
-  previewStatus?: unknown
-  targetAction?: unknown
-  summary?: {
-    sessionCount?: unknown
-    itemCounts?: { planned?: unknown; skipped?: unknown; error?: unknown }
-    pausedJobCount?: unknown
-    diskRequiredBytes?: unknown
-    diskFreeBytes?: unknown
-  }
-  blockers?: unknown
-  notices?: unknown
-}
-
 interface RecoveryInspection {
   outcome?: string
   stable_code?: string
@@ -207,10 +174,10 @@ const { t, locale } = useI18n()
 const { confirm } = useConfirm()
 const { pushToast } = useToasts()
 const platform = usePlatform()
-const rpc = useRpcStore()
-const desktopBridge = (globalThis as unknown as {
-  opensquillaDesktop?: DesktopMigrationBridge
-}).opensquillaDesktop
+const injectedMigrationOperations = inject(MIGRATION_OPERATIONS_KEY)
+if (!injectedMigrationOperations) throw new Error('MigrationOperations was not provided')
+const migrationOperations: MigrationOperations = injectedMigrationOperations
+const desktopBridge = platform.migration as unknown as DesktopMigrationBridge
 const hasDesktopMigrationBridge = computed(() => Boolean(
   platform.capabilities.isDesktop
   && desktopBridge?.migrationSummary
@@ -229,7 +196,7 @@ const busy = ref(false)
 const candidates = ref<MigrationCandidate[]>([])
 const selectedCandidate = ref<MigrationCandidate | null>(null)
 const desktopSummary = shallowRef<MigrationReportSummary | null>(null)
-const gatewayPreview = shallowRef<GatewayPreviewResponse | null>(null)
+const gatewayPreview = shallowRef<GatewayMigrationPreview | null>(null)
 const previewId = ref('')
 const overwrite = ref(false)
 const phase = ref('')
@@ -425,21 +392,16 @@ function normalizeDesktopCandidate(candidate: DesktopMigrationCandidate): Migrat
   }
 }
 
-function normalizeGatewayCandidate(value: unknown): MigrationCandidate | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
-  const candidate = value as GatewayCandidate
-  const id = nonEmptyString(candidate.candidateId)
-  const kind = nonEmptyString(candidate.sourceKind)
-  if (!id || !kind) return null
+function normalizeGatewayCandidate(candidate: GatewayMigrationCandidate): MigrationCandidate {
   return {
-    id,
+    id: candidate.id,
     provider: 'gateway',
-    kind,
+    kind: candidate.sourceKind,
     version: safeDisplayVersion(candidate.version),
-    estimatedActivityAt: nonEmptyString(candidate.estimatedActivityAt),
+    estimatedActivityAt: candidate.estimatedActivityAt,
     sessionCount: finiteNonNegative(candidate.sessionCount),
     sizeBytes: finiteNonNegative(candidate.sizeBytes),
-    previouslyImported: candidate.previouslyImported === true,
+    previouslyImported: candidate.previouslyImported,
   }
 }
 
@@ -525,24 +487,12 @@ async function scanDesktopSources(): Promise<void> {
 }
 
 async function scanGatewaySources(): Promise<void> {
-  await rpc.waitForConnection()
-  if (!rpc.supportsMethod('migration.sources.list')) {
+  const response = await migrationOperations.listSources()
+  if (!response.capabilities.discover || !response.capabilities.preview) {
     panelState.value = 'unsupported'
     return
   }
-  const response = await rpc.call<GatewaySourcesResponse>('migration.sources.list', {})
-  if (response?.schemaVersion !== 1 || response.mode !== 'preview_only') {
-    throw new Error(t('settings.dataMigration.invalidResponse'))
-  }
-  if (response.capabilities?.discover !== true || response.capabilities?.preview !== true) {
-    panelState.value = 'unsupported'
-    return
-  }
-  const rawCandidates = Array.isArray(response.candidates) ? response.candidates : []
-  candidates.value = uniqueCandidates(rawCandidates.flatMap((candidate) => {
-    const normalized = normalizeGatewayCandidate(candidate)
-    return normalized ? [normalized] : []
-  }))
+  candidates.value = uniqueCandidates(response.candidates.map(normalizeGatewayCandidate))
   panelState.value = candidates.value.length > 0 ? 'ready' : 'empty'
 }
 
@@ -585,16 +535,7 @@ async function previewDesktopCandidate(candidate: MigrationCandidate): Promise<v
 }
 
 async function previewGatewayCandidate(candidate: MigrationCandidate): Promise<void> {
-  if (!rpc.supportsMethod('migration.sources.preview')) {
-    panelState.value = 'unsupported'
-    return
-  }
-  const response = await rpc.call<GatewayPreviewResponse>('migration.sources.preview', {
-    candidateId: candidate.id,
-  })
-  if (response?.schemaVersion !== 1 || response.mode !== 'preview_only') {
-    throw new Error(t('settings.dataMigration.invalidResponse'))
-  }
+  const response = await migrationOperations.preview(candidate.id)
   selectedCandidate.value = candidate
   gatewayPreview.value = response
 }

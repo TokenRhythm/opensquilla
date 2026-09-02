@@ -1,4 +1,4 @@
-import type { RpcClientError } from '@/lib/rpc'
+import type { Observability } from '@/modules/observability'
 import type {
   ModelBreakdownItem,
   ModelCard,
@@ -16,16 +16,8 @@ import type {
   NativeBilledByCurrency,
 } from '@/types/usage'
 
-const USAGE_QUERY_METHOD = 'usage.query'
 const NANO_USD = 1_000_000_000
 const MICRO_USD = 1_000_000
-
-export interface UsageRpc {
-  supportsMethod: (method: string) => boolean
-  markMethodUnavailable: (method: string) => void
-  waitForConnection: (timeoutMs?: number) => Promise<void>
-  call: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
-}
 
 export interface UsageQueryOptions {
   days?: boolean
@@ -494,98 +486,10 @@ function sessionTimestamp(row: SessionRow): number | null {
   return null
 }
 
-function isMethodNotFound(error: unknown): boolean {
-  const rpcError = error as RpcClientError | undefined
-  return rpcError?.code === 'METHOD_NOT_FOUND'
-    || /method not found/i.test(error instanceof Error ? error.message : String(error))
-}
-
-function isInvalidTimezone(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error)
-  return /unknown iana timezone|invalid timezone|time zone/i.test(message)
-}
-
-function queryParams(
-  range: UsageRangeSelection,
-  timezone: string,
-  options: UsageQueryOptions,
-): Record<string, unknown> {
-  return {
-    schemaVersion: 1,
-    range: { preset: usagePresetForRange(range) },
-    timezone,
-    include: {
-      days: options.days ?? true,
-      models: options.models ?? true,
-      sessions: options.sessions ?? true,
-    },
-  }
-}
-
 export async function requestUsageSnapshot(
-  rpc: UsageRpc,
+  observability: Observability,
   range: UsageRangeSelection,
   options: UsageQueryOptions = {},
 ): Promise<UsageSnapshot> {
-  await rpc.waitForConnection()
-  const timezone = options.timezone || browserTimeZone()
-  const requestedPreset = usagePresetForRange(range)
-  const cachedSnapshot = options.cachedSnapshot
-  const matchingLedgerCache = cachedSnapshot?.source === 'usage_ledger'
-    && cachedSnapshot.range.preset === requestedPreset
-    ? cachedSnapshot
-    : null
-  let transientQueryFailure = false
-  if (rpc.supportsMethod(USAGE_QUERY_METHOD)) {
-    try {
-      const response = await rpc.call<UsageQueryResponse>(
-        USAGE_QUERY_METHOD,
-        queryParams(range, timezone, options),
-      )
-      return normalizeUsageQueryResponse(response)
-    } catch (error) {
-      if (isMethodNotFound(error)) {
-        rpc.markMethodUnavailable(USAGE_QUERY_METHOD)
-      } else if (timezone !== 'UTC' && isInvalidTimezone(error)) {
-        try {
-          const response = await rpc.call<UsageQueryResponse>(
-            USAGE_QUERY_METHOD,
-            queryParams(range, 'UTC', options),
-          )
-          const snapshot = normalizeUsageQueryResponse(response)
-          return {
-            ...snapshot,
-            timezoneFallback: {
-              requestedTimezone: timezone,
-              effectiveTimezone: snapshot.timezone,
-              reason: 'invalid_timezone',
-            },
-          }
-        } catch (utcError) {
-          if (isMethodNotFound(utcError)) {
-            rpc.markMethodUnavailable(USAGE_QUERY_METHOD)
-          } else {
-            transientQueryFailure = true
-          }
-        }
-      } else {
-        transientQueryFailure = true
-      }
-      // Mixed-version upgrades must keep rendering. Any query failure falls
-      // back to the legacy endpoint; if that also fails, its error is surfaced.
-    }
-  }
-  try {
-    const status = await rpc.call<UsageStatusData>('usage.status')
-    // A previous ledger result is more trustworthy than a fresh session-lifetime
-    // approximation. Keep it for transient query failures, but still accept the
-    // legacy endpoint when the capability genuinely disappeared.
-    if (transientQueryFailure && matchingLedgerCache) return matchingLedgerCache
-    return normalizeUsageStatusResponse(status, options.fallbackRange || range, timezone)
-  } catch (error) {
-    // Background refresh failures should not erase a successful, same-range
-    // ledger result. With no suitable cache, preserve the original error path.
-    if (matchingLedgerCache) return matchingLedgerCache
-    throw error
-  }
+  return observability.usage(range, options)
 }

@@ -1,43 +1,34 @@
 import { ref } from 'vue'
-import { useRpcStore } from '@/stores/rpc'
-import type { ChatHistoryMessage, ChatHistoryResponse } from '@/types/rpc'
+import type { SessionInspection } from '@/modules/sessionInspection'
+import type { SessionReadMessage } from '@/modules/sessionReadLifecycle'
+import type { TurnCommands } from '@/modules/turnCommands'
 
-// There is deliberately no sessions.get RPC; the inspect drawer composes
-// sessions.preview (summary snippet) with chat.history (transcript pages).
-
-export interface SessionInspectPreview {
-  key: string
-  title: string
-  lastMessage: string
-  updatedAt: number | null
-}
-
-interface RawPreviewRow {
-  key?: string
-  title?: string
-  lastMessage?: string
-  updatedAt?: number
-}
-
-interface SessionsPreviewResponse {
-  previews?: RawPreviewRow[]
-}
-
-interface SessionsAbortResponse {
-  aborted?: boolean
-  key?: string
-}
+// The inspect drawer composes a bounded preview with canonical transcript pages.
 
 export const SESSION_INSPECT_PAGE_SIZE = 20
 
-function transcriptMessageKey(msg: ChatHistoryMessage): string {
-  return String(msg.message_id || msg.id || `${msg.role || ''}:${msg.timestamp ?? msg.ts ?? ''}:${msg.text || ''}`)
+export async function abortInspectedSession(
+  turnCommands: Pick<TurnCommands, 'cancel'>,
+  sessionKey: string,
+): Promise<boolean> {
+  const result = await turnCommands.cancel({
+    sessionKey,
+    source: 'session-inspection',
+  })
+  return result.aborted === true
 }
 
-export function useSessionInspect() {
-  const rpc = useRpcStore()
-  const preview = ref<SessionInspectPreview | null>(null)
-  const messages = ref<ChatHistoryMessage[]>([])
+function transcriptMessageKey(msg: SessionReadMessage): string {
+  return String(
+    msg.messageId
+    || msg.id
+    || `${msg.role}:${msg.createdAt ?? ''}:${msg.text}`,
+  )
+}
+
+export function useSessionInspect(sessionInspection: SessionInspection) {
+  const preview = ref<Awaited<ReturnType<SessionInspection['preview']>>>(null)
+  const messages = ref<SessionReadMessage[]>([])
   const hasEarlier = ref(false)
   const loading = ref(false)
   const loadingEarlier = ref(false)
@@ -49,27 +40,18 @@ export function useSessionInspect() {
 
   let requestSeq = 0
   let currentKey = ''
+  let activeController: AbortController | null = null
   let failedTranscriptRequest: {
     key: string
     before: string | number | null
   } | null = null
   const loadedEarlierCursors = new Set<string>()
 
-  async function fetchPreview(key: string, seq: number) {
+  async function fetchPreview(key: string, seq: number, signal: AbortSignal) {
     try {
-      const data = await rpc.call<SessionsPreviewResponse>('sessions.preview', { keys: [key] })
+      const row = await sessionInspection.preview(key, { signal })
       if (seq !== requestSeq) return
-      const rows = data?.previews || []
-      const row = rows.find(item => item.key === key) || rows[0] || null
-      const updatedAt = row?.updatedAt != null ? Number(row.updatedAt) : NaN
       preview.value = row
-        ? {
-            key: String(row.key || key),
-            title: String(row.title || ''),
-            lastMessage: String(row.lastMessage || ''),
-            updatedAt: Number.isFinite(updatedAt) ? updatedAt : null,
-          }
-        : null
     } catch {
       // Preview is a summary garnish; header data falls back to the ledger
       // row and transcript failures are surfaced separately.
@@ -80,33 +62,34 @@ export function useSessionInspect() {
   async function fetchTranscript(
     key: string,
     seq: number,
+    signal: AbortSignal,
     before?: string | number | null,
     beforeApply?: () => void,
   ) {
-    const params: Record<string, unknown> = {
-      sessionKey: key,
+    const historyOptions = {
       limit: SESSION_INSPECT_PAGE_SIZE,
-      includeCanonical: true,
-      includeSummaries: false,
+      signal,
     }
-    if (before != null) params.before = before
-    const data = await rpc.call<ChatHistoryResponse>('chat.history', params)
+    const data = before == null
+      ? await sessionInspection.history.latest(key, historyOptions)
+      : await sessionInspection.history.before(key, String(before), historyOptions)
     if (seq !== requestSeq) return
-    const available = data?.canonical_available ?? data?.canonicalAvailable
-    if (typeof available === 'boolean') canonicalAvailable.value = available
-    const complete = data?.canonical_complete ?? data?.canonicalComplete
-    if (typeof complete === 'boolean') canonicalComplete.value = complete
+    const available = data.canonicalAvailable
+    canonicalAvailable.value = available
+    canonicalComplete.value = data.canonicalComplete
     if (available === false) {
       failedTranscriptRequest = { key, before: before ?? null }
       if (before != null) return false
     }
 
     if (available !== false) failedTranscriptRequest = null
-    const page = data?.messages || []
-    const nextOldestCursor = data?.oldest_cursor ?? data?.oldestCursor ?? null
-    hasEarlier.value = Boolean(data?.has_more ?? data?.hasMore)
-      && (before == null || nextOldestCursor !== before)
-    oldestCursor.value = nextOldestCursor
+    const page = [...data.messages]
+    if (available !== false) {
+      const nextOldestCursor = data.oldestCursor
+      hasEarlier.value = data.hasMore
+        && (before == null || nextOldestCursor !== String(before))
+      oldestCursor.value = nextOldestCursor
+    }
     beforeApply?.()
     if (before != null) {
       const seen = new Set(messages.value.map(transcriptMessageKey))
@@ -122,6 +105,9 @@ export function useSessionInspect() {
 
   async function load(key: string) {
     const seq = ++requestSeq
+    activeController?.abort()
+    const controller = new AbortController()
+    activeController = controller
     currentKey = key
     loading.value = true
     loadingEarlier.value = false
@@ -135,20 +121,14 @@ export function useSessionInspect() {
     oldestCursor.value = null
     failedTranscriptRequest = null
     loadedEarlierCursors.clear()
-    try {
-      await rpc.waitForConnection()
-      if (seq !== requestSeq) return
-      const [, transcript] = await Promise.allSettled([
-        fetchPreview(key, seq),
-        fetchTranscript(key, seq),
-      ])
-      if (seq !== requestSeq) return
-      if (transcript.status === 'rejected') transcriptError.value = true
-    } catch {
-      if (seq === requestSeq) transcriptError.value = true
-    } finally {
-      if (seq === requestSeq) loading.value = false
+    const [, transcript] = await Promise.allSettled([
+      fetchPreview(key, seq, controller.signal),
+      fetchTranscript(key, seq, controller.signal),
+    ])
+    if (seq === requestSeq && transcript.status === 'rejected') {
+      transcriptError.value = true
     }
+    if (seq === requestSeq) loading.value = false
   }
 
   async function requestEarlier(cursor: string | number, beforeApply?: () => void) {
@@ -157,7 +137,8 @@ export function useSessionInspect() {
     loadingEarlier.value = true
     loadEarlierError.value = false
     try {
-      const applied = await fetchTranscript(currentKey, seq, cursor, beforeApply)
+      const signal = activeController?.signal ?? new AbortController().signal
+      const applied = await fetchTranscript(currentKey, seq, signal, cursor, beforeApply)
       if (seq === requestSeq && applied === true) {
         loadedEarlierCursors.add(String(cursor))
       }
@@ -186,13 +167,10 @@ export function useSessionInspect() {
     return loadEarlier(beforeApply)
   }
 
-  async function abortSession(key: string): Promise<boolean> {
-    const data = await rpc.call<SessionsAbortResponse>('sessions.abort', { key })
-    return data?.aborted === true
-  }
-
   function reset() {
     requestSeq++
+    activeController?.abort()
+    activeController = null
     currentKey = ''
     preview.value = null
     messages.value = []
@@ -222,7 +200,6 @@ export function useSessionInspect() {
     load,
     loadEarlier,
     retryHistory,
-    abortSession,
     reset,
   }
 }

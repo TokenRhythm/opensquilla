@@ -68,11 +68,15 @@ describe('ApprovalCenter v4 adapter', () => {
   it('projects HTTP snapshot and validates all RPC operations', async () => {
     const h = harness()
     const center = createApprovalCenterV4(h.rpc, h.events, { http: h.http })
+    await expect(center.setElevatedMode('session-1', 'on')).resolves.toBeUndefined()
     await expect(center.snapshot()).resolves.toMatchObject({ mode: 'prompt', pending: [{ id: 'a1', args: { command: 'ls' } }] })
     await expect(center.status('exec', 'a1')).resolves.toMatchObject({ id: 'a1', namespace: 'exec', pending: true })
     await expect(center.extend('exec', 'a1', 30)).resolves.toMatchObject({ deadline: 123 })
     await expect(center.resolve({ id: 'a1', namespace: 'exec', decision: 'allow-once' })).resolves.toMatchObject({ approved: true, resolved: true })
     expect(h.calls.map(call => call.method)).toEqual(['exec.approval.status', 'exec.approval.extend'])
+    expect(h.requestJson).toHaveBeenCalledWith('/api/elevated-mode', expect.objectContaining({
+      method: 'POST', json: { sessionKey: 'session-1', mode: 'on' },
+    }))
     expect(h.requestJson).toHaveBeenCalledWith('/api/approvals/resolve', expect.objectContaining({
       method: 'POST', json: { id: 'a1', namespace: 'exec', approved: true, choice: 'allow_once' },
     }))

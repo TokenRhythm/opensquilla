@@ -9,7 +9,6 @@ import {
   optionalSessionRpcCallOptions,
   primeSessionBootstrapAdmission,
   sandboxSetupRpcCallOptions,
-  waitForSessionRpcConnection,
 } from './sessionBootstrapAdmission'
 
 afterEach(() => {
@@ -24,27 +23,6 @@ describe('session bootstrap admission', () => {
       timeoutAction: 'reconnect',
       abortAction: 'reject',
     })
-  })
-
-  it('keeps connection waiting local to the waiter even when request timeout recycles', async () => {
-    const waitForConnection = vi.fn().mockResolvedValue(undefined)
-    const controller = new AbortController()
-
-    await waitForSessionRpcConnection(
-      { waitForConnection },
-      {
-        timeoutMs: 10_000,
-        signal: controller.signal,
-        timeoutAction: 'reconnect',
-        abortAction: 'reconnect',
-      },
-    )
-
-    expect(waitForConnection).toHaveBeenCalledWith(
-      10_000,
-      controller.signal,
-      { timeoutAction: 'reject', abortAction: 'reject' },
-    )
   })
 
   it('lets the first live sandbox verification finish without recycling the socket', () => {

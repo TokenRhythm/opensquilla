@@ -4,7 +4,7 @@ import { createApp, h, nextTick, ref } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import i18n from '@/i18n'
 import { useSkillsCatalog } from '@/composables/skills/useSkillsCatalog'
-import type { useRpcStore } from '@/stores/rpc'
+import type { SkillCatalog } from '@/modules/skillCatalog'
 import SkillGroup from './SkillGroup.vue'
 
 const apps: ReturnType<typeof createApp>[] = []
@@ -16,20 +16,16 @@ afterEach(() => {
 
 describe('SkillGroup lifecycle compatibility', () => {
   it('loads and renders an old Gateway skills.list response without lifecycle fields', async () => {
-    const rpc = {
-      waitForConnection: vi.fn(async () => {}),
-      call: vi.fn(async () => ({
-        skills: [{
+    const list = vi.fn(async () => ([{
           name: 'legacy-community-skill',
           description: 'Loaded from an older Gateway response',
           layer: 'managed',
           status: 'ready',
           eligible: true,
-        }],
-      })),
-    } as unknown as ReturnType<typeof useRpcStore>
+        }]))
+    const skillCatalog = { list } as unknown as SkillCatalog
     const loadProposals = vi.fn(async () => {})
-    const catalog = useSkillsCatalog(rpc, {
+    const catalog = useSkillsCatalog(skillCatalog, {
       proposals: ref([]),
       autoEnabledSkills: ref([]),
       proposalsSettings: ref({
@@ -43,7 +39,7 @@ describe('SkillGroup lifecycle compatibility', () => {
     })
 
     await expect(catalog.loadData()).resolves.toBe(true)
-    expect(rpc.call).toHaveBeenCalledWith('skills.list', { includeLifecycle: true })
+    expect(list).toHaveBeenCalledOnce()
     expect(loadProposals).toHaveBeenCalledOnce()
     expect(catalog.allSkills.value).toHaveLength(1)
     expect(catalog.allSkills.value[0]?.lifecycle).toBeUndefined()

@@ -8,7 +8,6 @@ import type {
   PlanRevisionSnapshot,
   PlanRunSnapshot,
 } from '@/types/plans'
-import type { SessionMessagesSubscribeResponse } from '@/types/rpc'
 import type { PlanCenter } from '@/modules/planCenter'
 import { createClientRequestId } from '@/utils/chat/messageIdentity'
 import {
@@ -322,7 +321,7 @@ export function useChatPlans(options: UseChatPlansOptions) {
     }
   }
 
-  function applyBootstrap(snapshot: SessionMessagesSubscribeResponse) {
+  function applyBootstrap(snapshot: unknown) {
     if (!payloadBelongsToSession(snapshot, options.sessionKey.value)) return
     if (!acceptEpoch(snapshot, true)) return
     applyResponse(snapshot)

@@ -1,9 +1,6 @@
 import { computed, ref, watch } from 'vue'
 
-import {
-  waitForSessionRpcConnection,
-} from '@/composables/chat/sessionBootstrapAdmission'
-import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
+import type { SandboxRuntime } from '@/modules/sandboxRuntime'
 import {
   SANDBOX_RUN_MODES,
   isRecognizedSandboxRunMode,
@@ -21,22 +18,7 @@ export interface RunModePolicy {
 
 interface UseChatRunModePreferenceOptions {
   runModePolicy: () => RunModePolicy | null | undefined
-  rpc: RunModePreferenceRpc
-  hydrateCallOptions?: RpcCallOptions
-  writeCallOptions?: RpcCallOptions
-}
-
-interface RunModePreferenceRpc {
-  waitForConnection: (
-    timeoutMs?: number,
-    signal?: AbortSignal,
-    actions?: RpcConnectionWaitOptions,
-  ) => Promise<void>
-  call: (
-    method: string,
-    params?: Record<string, unknown>,
-    callOptions?: RpcCallOptions,
-  ) => Promise<unknown>
+  sandbox: Pick<SandboxRuntime, 'runModePreference' | 'setRunMode'>
 }
 
 function availableStorage(): Storage | null {
@@ -161,14 +143,7 @@ export function useChatRunModePreference(options: UseChatRunModePreferenceOption
   }
 
   async function hydrateRunModePreference(): Promise<SandboxRunMode> {
-    await waitForSessionRpcConnection(options.rpc, options.hydrateCallOptions)
-    const payload = options.hydrateCallOptions
-      ? await options.rpc.call(
-          'sandbox.run_mode.preference.get',
-          undefined,
-          options.hydrateCallOptions,
-        )
-      : await options.rpc.call('sandbox.run_mode.preference.get')
+    const payload = await options.sandbox.runModePreference({ timeoutMs: 10_000 })
     const source = payload && typeof payload === 'object'
       ? (payload as Record<string, unknown>).source
       : null
@@ -193,16 +168,7 @@ export function useChatRunModePreference(options: UseChatRunModePreferenceOption
     runModeUserSelected.value = true
 
     try {
-      await waitForSessionRpcConnection(options.rpc, options.writeCallOptions)
-      const payload = options.writeCallOptions
-        ? await options.rpc.call(
-            'sandbox.run_mode.preference.set',
-            { runMode: requested },
-            options.writeCallOptions,
-          )
-        : await options.rpc.call('sandbox.run_mode.preference.set', {
-            runMode: requested,
-          })
+      const payload = await options.sandbox.setRunMode(requested, { timeoutMs: 5_000 })
       if (sequence !== writeSequence) return runMode.value
       return applyConfirmedPreference(
         modeFromPayload(payload),

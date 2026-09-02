@@ -509,28 +509,15 @@ async def _status(params: Any, ctx: RpcContext) -> dict[str, Any]:
 
 
 async def _config_get(params: Any, ctx: RpcContext) -> Any:
-    if ctx.config is None:
-        return {}
-    cfg_dict = (
-        ctx.config.to_public_dict()
-        if hasattr(ctx.config, "to_public_dict")
-        else ctx.config.model_dump()
-        if hasattr(ctx.config, "model_dump")
-        else {}
-    )
+    from opensquilla.application.app_settings import AppSettings
+    from opensquilla.gateway.adapters.app_settings import RpcContextAppSettingsPort
+
+    settings = AppSettings(RpcContextAppSettingsPort(ctx))
     if isinstance(params, dict):
         path = params.get("path")
         if path:
-            parts = path.split(".")
-            val: Any = cfg_dict
-            for part in parts:
-                if isinstance(val, dict):
-                    val = val.get(part)
-                else:
-                    val = None
-                    break
-            return val
-    return cfg_dict
+            return await settings.read(str(path))
+    return await settings.read_all()
 
 
 async def _sessions_get(params: Any, ctx: RpcContext) -> dict[str, Any]:

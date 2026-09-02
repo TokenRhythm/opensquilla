@@ -1,5 +1,4 @@
 import { computed, onBeforeUnmount, ref, watch, type Ref } from 'vue'
-import type { SessionMessagesSubscribeResponse } from '@/types/rpc'
 import { localizeGoalRpcError } from '@/lib/rpcErrors'
 import { createClientRequestId } from '@/utils/chat/messageIdentity'
 import type { GoalCenter } from '@/modules/goalCenter'
@@ -735,7 +734,7 @@ export function useChatGoals(options: UseChatGoalsOptions) {
     return applySnapshot(source, { allowClear: true })
   }
 
-  function applyHydration(value: SessionMessagesSubscribeResponse | unknown): boolean {
+  function applyHydration(value: unknown): boolean {
     const source = record(value)
     if (!source) return false
     observeTransportGeneration(source)

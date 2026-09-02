@@ -8,22 +8,15 @@ import type {
   SandboxRunMode,
   SandboxSetupStatusPayload,
 } from '@/types/sandbox'
+import type { SandboxRuntime } from '@/modules/sandboxRuntime'
 
 const SETUP_POLL_MS = 2000
 
-type SandboxSetupRpc = {
-  call: (method: string, params?: Record<string, unknown>) => Promise<unknown>
-  waitForConnection?: () => Promise<unknown>
-}
-
 export interface UseSandboxSetupRecoveryOptions {
-  rpc: SandboxSetupRpc
+  sandbox: Pick<SandboxRuntime, 'setupStatus' | 'ensureSetup' | 'capability'>
   connectionState: Ref<string>
   runMode: Ref<SandboxRunMode>
   autoRefresh?: boolean
-  onUnavailable?: (
-    status: SandboxSetupStatusPayload & { state: 'failed' | 'unavailable' },
-  ) => void | Promise<void>
 }
 
 export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions) {
@@ -37,7 +30,6 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
   let requestGeneration = 0
   let pollTimer: ReturnType<typeof setTimeout> | null = null
   let lastState = ''
-  let lastUnavailableFingerprint = ''
 
   const active = computed(() => options.connectionState.value === 'connected')
   const visible = computed(() =>
@@ -48,7 +40,7 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
     && status.value.state !== 'ready')
   const isWindows = computed(() => status.value?.platform.toLowerCase().startsWith('win') === true)
   const canSetup = computed(() =>
-    isWindows.value && (status.value?.state === 'not_setup' || status.value?.state === 'failed'))
+    isWindows.value && status.value?.state === 'not_setup')
 
   function clearPoll() {
     if (pollTimer) clearTimeout(pollTimer)
@@ -66,23 +58,6 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
     lastState = next.state
     status.value = next
     if (next.state !== 'failed') error.value = ''
-    if (next.state === 'ready') {
-      lastUnavailableFingerprint = ''
-    } else if (next.state === 'failed' || next.state === 'unavailable') {
-      const fingerprint = `${next.state}\0${next.message}\0${next.detail || ''}`
-      if (fingerprint !== lastUnavailableFingerprint) {
-        lastUnavailableFingerprint = fingerprint
-        void Promise.resolve(options.onUnavailable?.({
-          ...next,
-          state: next.state,
-        })).catch((cause) => {
-          console.warn(
-            'Failed to report unavailable sandbox:',
-            cause instanceof Error ? cause.message : String(cause),
-          )
-        })
-      }
-    }
     schedulePoll()
   }
 
@@ -92,7 +67,9 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
     loading.value = status.value === null
     clearPoll()
     try {
-      const payload = normalizeSandboxSetupStatus(await options.rpc.call('sandbox.setup.status'))
+      const payload = normalizeSandboxSetupStatus(
+        await options.sandbox.setupStatus(),
+      )
       if (generation !== requestGeneration) return
       if (!payload) {
         // Keep following an already-authoritative setting_up state when a
@@ -128,9 +105,11 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
     clearPoll()
     try {
       const result = await ensureSandboxReady(
-        options.rpc.call,
-        null,
-        options.rpc.waitForConnection ?? null,
+        {
+          ensureSetup: () => options.sandbox.ensureSetup(),
+          setupStatus: () => options.sandbox.setupStatus(),
+          capability: () => options.sandbox.capability({ refresh: true }),
+        },
       )
       if (generation !== requestGeneration) return false
       if (result.status) applyStatus(result.status)
@@ -157,7 +136,6 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
         status.value = null
         resolved.value = false
         lastState = ''
-        lastUnavailableFingerprint = ''
         loading.value = false
         ensuring.value = false
       }
