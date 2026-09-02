@@ -18,15 +18,19 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Route
 
-from opensquilla.artifact_session import (
-    ArtifactNotFoundError as ArtifactSessionNotFoundError,
+from opensquilla.application.artifact_workbench import (
+    ArtifactContentApplication,
+    ArtifactContentQuery,
+    ContentIntegrityError,
+    ContentNotFoundError,
+    DocumentContentQuery,
 )
-from opensquilla.artifact_session import ArtifactSessionService
 from opensquilla.artifacts import (
     ArtifactIntegrityError,
     ArtifactNotFoundError,
     ArtifactStore,
 )
+from opensquilla.gateway.adapters.artifact_content import GatewayArtifactContentPort
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.origin_guard import (
     forbidden_origin_response,
@@ -35,7 +39,6 @@ from opensquilla.gateway.origin_guard import (
 from opensquilla.gateway.origin_guard import (
     request_principal_is_owner as _request_principal_is_owner,
 )
-from opensquilla.gateway.session_services import get_session_storage
 from opensquilla.paths import media_root_from_config, native_io_path
 
 _OPENABLE_HTML_MIMES = frozenset({"text/html", "application/xhtml+xml"})
@@ -166,6 +169,10 @@ def register_artifact_routes(
 ) -> None:
     """Register GET /api/v1/artifacts/{artifact_id} on the given Starlette app."""
 
+    content = ArtifactContentApplication(
+        GatewayArtifactContentPort(config, session_manager=session_manager)
+    )
+
     async def document_download_handler(request: Request) -> FileResponse | JSONResponse:
         document_id = request.path_params.get("document_id", "")
         session_key = (
@@ -174,43 +181,29 @@ def register_artifact_routes(
             or request.headers.get("x-opensquilla-session-key")
             or ""
         )
-        session_id = await _session_id_for_download(session_manager, session_key)
-        storage = get_session_storage(session_manager)
-        if not session_id or storage is None:
-            return JSONResponse(
-                {"error": "Artifact document not found", "code": "NOT_FOUND"},
-                status_code=404,
-            )
         try:
-            service = await ArtifactSessionService.from_session_storage(storage)
-            document = await service.get_document(str(document_id))
-            if document.session_key != session_key or document.session_id != session_id:
-                raise ArtifactSessionNotFoundError("artifact document not found")
-            revision_id = request.query_params.get("revisionId") or document.head_revision_id
-            revision = await service.get_revision(str(revision_id))
-            if revision.document_id != document.document_id:
-                raise ArtifactSessionNotFoundError("artifact revision not found")
-            ref, path = ArtifactStore(_media_root_from_config(config)).resolve_for_download(
-                revision.artifact_id,
-                session_id=session_id,
+            material = await content.document(
+                DocumentContentQuery(
+                    session_key,
+                    str(document_id),
+                    request.query_params.get("revisionId"),
+                )
             )
-        except ArtifactIntegrityError as exc:
+        except ContentIntegrityError as exc:
             return JSONResponse(
                 {"error": str(exc), "code": "INTEGRITY_ERROR"},
                 status_code=409,
             )
-        except (
-            ArtifactSessionNotFoundError,
-            ArtifactNotFoundError,
-            ValueError,
-        ):
+        except (ContentNotFoundError, ValueError):
             return JSONResponse(
                 {"error": "Artifact document not found", "code": "NOT_FOUND"},
                 status_code=404,
             )
-
-        filename = document.name if revision_id == document.head_revision_id else revision.filename
-        return FileResponse(native_io_path(path), media_type=ref.mime, filename=filename)
+        return FileResponse(
+            material.path,
+            media_type=material.media_type,
+            filename=material.filename,
+        )
 
     async def download_handler(request: Request) -> FileResponse | JSONResponse:
         artifact_id = request.path_params.get("artifact_id", "")
@@ -220,34 +213,27 @@ def register_artifact_routes(
             or request.headers.get("x-opensquilla-session-key")
             or ""
         )
-        session_id = await _session_id_for_download(session_manager, session_key)
-        if not session_id:
-            return JSONResponse(
-                {"error": "Artifact not found", "code": "NOT_FOUND"},
-                status_code=404,
-            )
-
         want_thumbnail = request.query_params.get("variant") == "thumb"
-
-        store = ArtifactStore(_media_root_from_config(config))
         try:
-            ref, path = store.resolve_for_download(str(artifact_id), session_id=session_id)
-            if want_thumbnail:
-                thumbnail = store.resolve_thumbnail_for_download(
-                    str(artifact_id), session_id=session_id
+            material = await content.artifact(
+                ArtifactContentQuery(
+                    session_key,
+                    str(artifact_id),
+                    thumbnail=want_thumbnail,
                 )
-                if thumbnail is not None:
-                    _, thumb_path = thumbnail
-                    return FileResponse(native_io_path(thumb_path), media_type="image/webp")
-        except ArtifactIntegrityError as exc:
+            )
+        except ContentIntegrityError as exc:
             return JSONResponse({"error": str(exc), "code": "INTEGRITY_ERROR"}, status_code=409)
-        except (ArtifactNotFoundError, ValueError):
+        except (ContentNotFoundError, ValueError):
             return JSONResponse(
                 {"error": "Artifact not found", "code": "NOT_FOUND"},
                 status_code=404,
             )
-
-        return FileResponse(native_io_path(path), media_type=ref.mime, filename=ref.name)
+        return FileResponse(
+            material.path,
+            media_type=material.media_type,
+            filename=material.filename,
+        )
 
     async def open_handler(request: Request) -> JSONResponse:
         if not request_origin_allowed(request, config):

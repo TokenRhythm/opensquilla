@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 
@@ -66,9 +67,7 @@ class DocumentCapabilitiesQuery:
         if (self.session_key is None) != (self.document_id is None):
             raise ValueError("session key and document id must be supplied together")
         if self.session_key is not None:
-            object.__setattr__(
-                self, "session_key", _identity(self.session_key, "session key")
-            )
+            object.__setattr__(self, "session_key", _identity(self.session_key, "session key"))
             object.__setattr__(
                 self, "document_id", _identity(self.document_id or "", "document id")
             )
@@ -441,6 +440,104 @@ class MutationResolution:
             _identity(self.document_id, "document id")
 
 
+class ContentNotFoundError(LookupError):
+    """Requested Workbench content is outside the resolved session scope."""
+
+
+class ContentIntegrityError(RuntimeError):
+    """Stored Workbench content failed its integrity check."""
+
+
+class AttachmentClaimError(ValueError):
+    """A strict attachment admission policy rejected the claimed MIME."""
+
+
+class AttachmentEmptyError(ValueError):
+    """An attachment upload contained no bytes."""
+
+
+class AttachmentOpaqueOversizeError(ValueError):
+    """Opaque attachment bytes exceed the configured admission ceiling."""
+
+    def __init__(self, *, limit: int, actual: int, mime: str) -> None:
+        self.limit = limit
+        self.actual = actual
+        self.mime = mime
+        super().__init__(f"upload exceeds {limit} byte cap for {mime} (got {actual})")
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactContentQuery:
+    session_key: str
+    artifact_id: str
+    thumbnail: bool = False
+
+    def __post_init__(self) -> None:
+        _identity(self.session_key, "session key")
+        _identity(self.artifact_id, "artifact id")
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentContentQuery:
+    session_key: str
+    document_id: str
+    revision_id: str | None = None
+
+    def __post_init__(self) -> None:
+        DocumentIdentity(self.session_key, self.document_id)
+        if self.revision_id is not None:
+            _identity(self.revision_id, "revision id")
+
+
+@dataclass(frozen=True, slots=True)
+class AttachmentContentQuery:
+    session_key: str
+    sha256: str
+
+    def __post_init__(self) -> None:
+        _identity(self.session_key, "session key")
+        if len(self.sha256) != 64:
+            raise ValueError("attachment digest must be a SHA-256 value")
+
+
+@dataclass(frozen=True, slots=True)
+class ContentMaterial:
+    path: Path
+    media_type: str
+    filename: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AttachmentStagingPolicy:
+    accept_opaque: bool
+    opaque_max_bytes: int
+
+    def __post_init__(self) -> None:
+        if self.opaque_max_bytes < 1:
+            raise ValueError("opaque attachment ceiling must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class AttachmentStage:
+    filename: str
+    claimed_mime: str
+    payload: bytes
+
+    def __post_init__(self) -> None:
+        _identity(self.filename, "attachment filename")
+        if not self.payload:
+            raise AttachmentEmptyError("empty upload")
+
+
+@dataclass(frozen=True, slots=True)
+class StagedAttachment:
+    file_uuid: str
+    filename: str
+    mime: str
+    size: int
+    expires_at: float
+
+
 class ArtifactCatalogPort(Protocol):
     async def list_artifacts(self, query: ArtifactCatalogQuery) -> Mapping[str, Any]: ...
 
@@ -448,15 +545,11 @@ class ArtifactCatalogPort(Protocol):
 
 
 class DocumentWorkspacePort(Protocol):
-    async def capabilities(
-        self, query: DocumentCapabilitiesQuery
-    ) -> Mapping[str, Any]: ...
+    async def capabilities(self, query: DocumentCapabilitiesQuery) -> Mapping[str, Any]: ...
 
     async def open_document(self, command: DocumentOpen) -> Mapping[str, Any]: ...
 
-    async def list_documents(
-        self, query: SessionDocumentsQuery
-    ) -> Mapping[str, Any]: ...
+    async def list_documents(self, query: SessionDocumentsQuery) -> Mapping[str, Any]: ...
 
     async def get_document(self, identity: DocumentIdentity) -> Mapping[str, Any]: ...
 
@@ -482,9 +575,7 @@ class ChangeHistoryPort(Protocol):
 class DocumentEditSessionPort(Protocol):
     async def start_edit_session(self, command: EditSessionStart) -> Mapping[str, Any]: ...
 
-    async def heartbeat_edit_session(
-        self, command: EditSessionMutation
-    ) -> Mapping[str, Any]: ...
+    async def heartbeat_edit_session(self, command: EditSessionMutation) -> Mapping[str, Any]: ...
 
     async def close_edit_session(self, command: EditSessionMutation) -> Mapping[str, Any]: ...
 
@@ -496,45 +587,27 @@ class DocumentSourcePort(Protocol):
 
 
 class PromptAnnotationPort(Protocol):
-    async def list_annotations(
-        self, query: PromptAnnotationQuery
-    ) -> Mapping[str, Any]: ...
+    async def list_annotations(self, query: PromptAnnotationQuery) -> Mapping[str, Any]: ...
 
-    async def create_annotation(
-        self, command: PromptAnnotationCreate
-    ) -> Mapping[str, Any]: ...
+    async def create_annotation(self, command: PromptAnnotationCreate) -> Mapping[str, Any]: ...
 
-    async def focus_annotation(
-        self, identity: PromptAnnotationIdentity
-    ) -> Mapping[str, Any]: ...
+    async def focus_annotation(self, identity: PromptAnnotationIdentity) -> Mapping[str, Any]: ...
 
-    async def update_annotation(
-        self, command: PromptAnnotationMutation
-    ) -> Mapping[str, Any]: ...
+    async def update_annotation(self, command: PromptAnnotationMutation) -> Mapping[str, Any]: ...
 
-    async def discard_annotation(
-        self, command: PromptAnnotationMutation
-    ) -> Mapping[str, Any]: ...
+    async def discard_annotation(self, command: PromptAnnotationMutation) -> Mapping[str, Any]: ...
 
 
 class WorkbenchResourcePort(Protocol):
-    async def list_resources(
-        self, query: WorkbenchResourceListQuery
-    ) -> Mapping[str, Any]: ...
+    async def list_resources(self, query: WorkbenchResourceListQuery) -> Mapping[str, Any]: ...
 
-    async def get_resource(
-        self, query: WorkbenchResourceQuery
-    ) -> Mapping[str, Any]: ...
+    async def get_resource(self, query: WorkbenchResourceQuery) -> Mapping[str, Any]: ...
 
-    async def open_resource(
-        self, command: WorkbenchResourceOpen
-    ) -> Mapping[str, Any]: ...
+    async def open_resource(self, command: WorkbenchResourceOpen) -> Mapping[str, Any]: ...
 
 
 class ResourcePreviewPort(Protocol):
-    async def create_preview(
-        self, command: WorkbenchPreviewCreate
-    ) -> Mapping[str, Any]: ...
+    async def create_preview(self, command: WorkbenchPreviewCreate) -> Mapping[str, Any]: ...
 
 
 class DocumentTransferPort(Protocol):
@@ -544,9 +617,29 @@ class DocumentTransferPort(Protocol):
 
 
 class MutationOutcomePort(Protocol):
-    async def resolve_mutation(
-        self, query: MutationResolution
-    ) -> Mapping[str, Any]: ...
+    async def resolve_mutation(self, query: MutationResolution) -> Mapping[str, Any]: ...
+
+
+class ArtifactContentPort(Protocol):
+    async def artifact_content(self, query: ArtifactContentQuery) -> ContentMaterial: ...
+
+    async def document_content(self, query: DocumentContentQuery) -> ContentMaterial: ...
+
+    async def attachment_content(self, query: AttachmentContentQuery) -> ContentMaterial: ...
+
+
+class AttachmentStagingPort(Protocol):
+    async def stage_attachment(
+        self, *, filename: str, mime: str, payload: bytes
+    ) -> tuple[str, float]: ...
+
+
+class AttachmentMimePolicyPort(Protocol):
+    def validate_claim(self, claimed_mime: str, *, accept_opaque: bool) -> str | None: ...
+
+    def resolve_mime(self, claimed_mime: str, payload: bytes, *, accept_opaque: bool) -> str: ...
+
+    def is_opaque(self, mime: str) -> bool: ...
 
 
 class ArtifactCatalog:
@@ -694,6 +787,67 @@ class MutationOutcomeApplication:
         return await self._port.resolve_mutation(query)
 
 
+class ArtifactContentApplication:
+    def __init__(self, port: ArtifactContentPort) -> None:
+        self._port = port
+
+    async def artifact(self, query: ArtifactContentQuery) -> ContentMaterial:
+        return await self._port.artifact_content(query)
+
+    async def document(self, query: DocumentContentQuery) -> ContentMaterial:
+        return await self._port.document_content(query)
+
+    async def attachment(self, query: AttachmentContentQuery) -> ContentMaterial:
+        return await self._port.attachment_content(query)
+
+
+class AttachmentStagingApplication:
+    def __init__(
+        self,
+        port: AttachmentStagingPort,
+        policy: AttachmentStagingPolicy,
+        mime_policy: AttachmentMimePolicyPort,
+    ) -> None:
+        self._port = port
+        self._policy = policy
+        self._mime_policy = mime_policy
+
+    def validate_claim(self, claimed_mime: str) -> str | None:
+        return self._mime_policy.validate_claim(
+            claimed_mime, accept_opaque=self._policy.accept_opaque
+        )
+
+    async def stage(self, command: AttachmentStage) -> StagedAttachment:
+        self.validate_claim(command.claimed_mime)
+        resolved_mime = self._mime_policy.resolve_mime(
+            command.claimed_mime,
+            command.payload,
+            accept_opaque=self._policy.accept_opaque,
+        )
+        if (
+            self._policy.accept_opaque
+            and self._mime_policy.is_opaque(resolved_mime)
+            and len(command.payload) > self._policy.opaque_max_bytes
+        ):
+            raise AttachmentOpaqueOversizeError(
+                limit=self._policy.opaque_max_bytes,
+                actual=len(command.payload),
+                mime=resolved_mime,
+            )
+        file_uuid, expires_at = await self._port.stage_attachment(
+            filename=command.filename,
+            mime=resolved_mime,
+            payload=command.payload,
+        )
+        return StagedAttachment(
+            file_uuid=file_uuid,
+            filename=command.filename,
+            mime=resolved_mime,
+            size=len(command.payload),
+            expires_at=expires_at,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class ArtifactWorkbench:
     artifacts: ArtifactCatalog
@@ -707,6 +861,8 @@ class ArtifactWorkbench:
     previews: ResourcePreviewApplication
     transfers: DocumentTransferApplication
     mutation_outcomes: MutationOutcomeApplication
+    content: ArtifactContentApplication
+    attachment_staging: AttachmentStagingApplication
 
 
 __all__ = [name for name in globals() if not name.startswith("_")]
