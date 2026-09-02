@@ -1132,6 +1132,107 @@ describe('useChatPendingQueue delivery state', () => {
     queue.cleanup()
   })
 
+  it.each([
+    'editPendingItem',
+    'popPendingTail',
+    'popAllPendingIntoComposer',
+  ] as const)(
+    'keeps an attachment draft parked in A when %s cancellation settles after navigating to B',
+    async recoveryPath => {
+      const sessionA = 'agent:main:webchat:test'
+      const sessionB = 'agent:main:webchat:B'
+      const { wal, records } = memoryWal()
+      const writeWal = wal.put
+      let releaseCancel!: () => void
+      let markCancelStarted!: () => void
+      const cancelStarted = new Promise<void>(resolve => { markCancelStarted = resolve })
+      const cancelGate = new Promise<void>(resolve => { releaseCancel = resolve })
+      wal.put = vi.fn(async record => {
+        if (record.state === 'cancelling') {
+          markCancelStarted()
+          await cancelGate
+        }
+        await writeWal(record)
+      })
+      const {
+        inputText,
+        pendingAttachments,
+        pendingSessionIntent,
+        queue,
+        sessionKey,
+      } = makeQueue(undefined, () => false, undefined, undefined, {
+        pendingInputWal: wal,
+        hasRpcMethod: () => false,
+      })
+      const sourceAttachment: Attachment = {
+        kind: 'staged',
+        local_id: 301,
+        name: 'source-a.txt',
+        mime: 'text/plain',
+        size: 8,
+        file_uuid: 'source-a-upload',
+      }
+      const targetAttachment: Attachment = {
+        kind: 'staged',
+        local_id: 302,
+        name: 'target-b.txt',
+        mime: 'text/plain',
+        size: 8,
+        file_uuid: 'target-b-upload',
+      }
+      try {
+        inputText.value = 'source A draft'
+        pendingAttachments.value = [sourceAttachment]
+        pendingSessionIntent.value = 'intent:A'
+        await expect(queue.enqueuePendingInput(inputText.value)).resolves.toBe(true)
+        await vi.waitFor(() => {
+          expect(queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('local_only')
+        })
+        const itemId = pendingUiId(queue, 0)
+
+        const started = recoveryPath === 'editPendingItem'
+          ? queue.editPendingItem(itemId)
+          : recoveryPath === 'popPendingTail'
+            ? queue.popPendingTail()
+            : queue.popAllPendingIntoComposer()
+        expect(started).toBe(true)
+        await cancelStarted
+
+        queue.switchPendingQueue(sessionB)
+        sessionKey.value = sessionB
+        inputText.value = 'target B draft'
+        pendingAttachments.value = [targetAttachment]
+        pendingSessionIntent.value = 'intent:B'
+        releaseCancel()
+
+        await vi.waitFor(() => {
+          expect([...records.values()][0]).toMatchObject({
+            sessionKey: sessionA,
+            state: 'local_only',
+            retainAfterCancel: true,
+          })
+        })
+        expect(inputText.value).toBe('target B draft')
+        expect(pendingAttachments.value).toEqual([targetAttachment])
+        expect(pendingSessionIntent.value).toBe('intent:B')
+        expect(queue.pendingQueue.value).toEqual([])
+
+        queue.switchPendingQueue(sessionA)
+        sessionKey.value = sessionA
+        await nextTick()
+        expect(queue.pendingQueue.value).toHaveLength(1)
+        expect(queue.pendingQueue.value[0]).toMatchObject({
+          text: 'source A draft',
+          ownerSessionKey: sessionA,
+          pendingPersistenceState: 'local_only',
+          attachments: [{ name: 'source-a.txt' }],
+        })
+      } finally {
+        queue.cleanup()
+      }
+    },
+  )
+
   it('does not edit a queued annotation batch into plain text', async () => {
     const { inputText, queue } = makeQueue()
     await expect(queue.enqueuePendingPayload({

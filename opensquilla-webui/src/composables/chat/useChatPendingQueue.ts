@@ -163,6 +163,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   const pendingInputQueue = options.pendingInputQueue
   const pendingQueue = ref<ChatPendingItem[]>([])
   const parkedQueues = new Map<string, ChatPendingItem[]>()
+  let activeQueueLease = 0
   let pendingDrainTimer: ReturnType<typeof setTimeout> | null = null
   let deferredDrainRequested = false
   const isReordering = ref(false)
@@ -1330,6 +1331,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     if (!shouldCommit()) return
     cancelPendingReorder()
     clearPendingDrainAfterTerminalTimer()
+    activeQueueLease += 1
     const sourceSessionKey = options.sessionKey.value
     if (sourceSessionKey && pendingQueue.value.length > 0) {
       const existing = parkedQueues.get(sourceSessionKey) || []
@@ -1417,6 +1419,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const committed = await acceptDurableHandoff(targetSessionKey, ownerRequestId)
     if (!committed) return
     if (options.sessionKey.value === targetSessionKey) {
+      activeQueueLease += 1
       const restored = parkedQueues.get(targetSessionKey) || []
       parkedQueues.delete(targetSessionKey)
       pendingQueue.value = [...pendingQueue.value, ...restored]
@@ -1461,6 +1464,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     // handoff has committed and this epoch is current. Clearing it before the
     // await would strand A if IndexedDB failed or A→B was superseded by A.
     clearPendingDrainAfterTerminalTimer()
+    activeQueueLease += 1
     const carried: ChatPendingItem[] = []
     const stayingVisible: ChatPendingItem[] = []
     const stayingHidden: ChatPendingItem[] = []
@@ -1517,6 +1521,29 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     ))
   }
 
+  function restoreDurableItemIntoComposer(
+    item: ChatPendingItem,
+    restore: () => void,
+  ) {
+    const ownerSessionKey = item.ownerSessionKey || options.sessionKey.value
+    const queueLease = activeQueueLease
+    void cancelDurableItem(item, { retainAfterCancel: true }).then(retained => {
+      if (
+        !retained
+        || options.sessionKey.value !== ownerSessionKey
+        || activeQueueLease !== queueLease
+      ) return
+      const index = pendingQueue.value.indexOf(item)
+      if (index < 0) return
+      pendingQueue.value.splice(index, 1)
+      restore()
+      // The composer now owns the retained local-only payload. Remove its WAL
+      // record without reopening a window where a navigation can restore the
+      // source item into a different session's composer.
+      void cancelDurableItem(item)
+    })
+  }
+
   function editPendingItem(pendingUiId: string): boolean {
     const index = pendingIndex(pendingUiId)
     const item = pendingQueue.value[index]
@@ -1555,12 +1582,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       options.autoResizeTextarea()
     }
     if (durableItem(item)) {
-      void cancelDurableItem(item).then(cancelled => {
-        if (!cancelled) return
-        const currentIndex = pendingQueue.value.indexOf(item)
-        if (currentIndex >= 0) pendingQueue.value.splice(currentIndex, 1)
-        restore()
-      })
+      restoreDurableItemIntoComposer(item, restore)
       return true
     }
     pendingQueue.value.splice(index, 1)
@@ -1586,10 +1608,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     if (!tail) return false
     if (hasUneditablePendingAttachments(tail)) return false
     if (durableItem(tail)) {
-      void cancelDurableItem(tail).then(cancelled => {
-        if (!cancelled) return
-        const index = pendingQueue.value.indexOf(tail)
-        if (index >= 0) pendingQueue.value.splice(index, 1)
+      restoreDurableItemIntoComposer(tail, () => {
         options.inputText.value = tail.text || ''
         options.pendingAttachments.value = tail.attachments || []
         options.pendingSessionIntent.value = tail.intent || null
@@ -1638,10 +1657,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     options.autoResizeTextarea()
     options.resetInputHistory()
     for (const item of durable) {
-      void cancelDurableItem(item).then(cancelled => {
-        if (!cancelled) return
-        const index = pendingQueue.value.indexOf(item)
-        if (index >= 0) pendingQueue.value.splice(index, 1)
+      restoreDurableItemIntoComposer(item, () => {
         options.inputText.value = [options.inputText.value, item.text]
           .filter(Boolean)
           .join('\n')

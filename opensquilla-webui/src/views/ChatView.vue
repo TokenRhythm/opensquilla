@@ -3599,6 +3599,7 @@ function isPristineDraftForRecovery(expectedSessionKey: string, agentId: string)
     && pendingSessionIntent.value === 'new_chat'
     && messages.value.length === 0
     && inputText.value.length === 0
+    && !attachmentWorkBusy.value
     && pendingAttachments.value.length === 0
     && pendingQueue.value.length === 0
     && pendingAutoSend.value.length === 0
