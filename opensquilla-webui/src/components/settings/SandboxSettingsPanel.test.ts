@@ -1,7 +1,17 @@
 // @vitest-environment happy-dom
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { App } from 'vue'
-import type { SandboxRuntimePackStatus } from '@/types/sandbox'
+import type {
+  SandboxRuntime,
+  SandboxRuntimeActionReceipt,
+  SandboxSetupResult,
+} from '@/modules/sandboxRuntime'
+import type {
+  SandboxCapabilityReport,
+  SandboxPolicy,
+  SandboxRuntimePackStatus,
+  SandboxSetupStatusPayload,
+} from '@/types/sandbox'
 
 const mounted: App[] = []
 
@@ -82,17 +92,48 @@ async function settle() {
   for (let index = 0; index < 32; index++) await Promise.resolve()
 }
 
+function readySetupResult(): SandboxSetupResult {
+  return {
+    ready: true,
+    outcome: 'ready',
+    status: {
+      state: 'ready',
+      platform: 'win32',
+      message: 'Sandbox setup is ready.',
+      requiresAdmin: false,
+    },
+    capability: {
+      available: true,
+      backend: 'windows_default',
+      platform: 'win32',
+      code: 'ready',
+      reason: 'ready',
+      setupSupported: true,
+      restartRequired: false,
+      probeVersion: 1,
+      capabilities: ['process'],
+    },
+  }
+}
+
 async function mountPanel(options: {
-  capability?: Promise<unknown> | ((params?: Record<string, unknown>) => unknown)
+  capability?: Promise<unknown> | ((refreshCapability: boolean) => unknown)
   desktop?: boolean
   setupState?: 'not_setup' | 'setting_up' | 'ready' | 'failed' | 'unavailable'
   ensureState?: 'ready' | 'failed'
   ensureDetail?: string
-  ensure?: Promise<unknown>
+  ensure?: Promise<SandboxSetupResult>
   runtimeTarget?: string
-  runtimeStatus?: unknown | ((params?: Record<string, unknown>) => unknown)
+  runtimeStatus?: SandboxRuntimePackStatus | null
+    | Promise<SandboxRuntimePackStatus | null> | (
+    () => SandboxRuntimePackStatus | null | Promise<SandboxRuntimePackStatus | null>
+  )
   runtimeStatusError?: Error
-  runtimeAction?: (method: string, params?: Record<string, unknown>) => unknown
+  runtimeAction?: (
+    action: 'install' | 'cancel' | 'remove' | 'discard',
+    componentId: string,
+    operationId?: string,
+  ) => SandboxRuntimeActionReceipt
   runtimePolicy?: {
     enabled: boolean
     python: boolean
@@ -104,67 +145,87 @@ async function mountPanel(options: {
   vi.resetModules()
   document.body.innerHTML = ''
   let currentRunMode: 'safe' | 'full' = 'full'
-  const call = vi.fn(async (method: string, params?: Record<string, unknown>) => {
-    if (method === 'sandbox.capability.status') {
-      if (typeof options.capability === 'function') return options.capability(params)
-      if (options.capability) return options.capability
-      const setupReady = (options.setupState ?? 'ready') === 'ready'
-        || (params?.refresh === true && (options.ensureState ?? 'ready') === 'ready')
+
+  const setupStatus = (
+    state = options.setupState ?? 'ready',
+  ): SandboxSetupStatusPayload => ({
+    state,
+    platform: 'win32',
+    message: state === 'ready' ? 'Sandbox setup is ready.' : 'Sandbox setup is required.',
+    requiresAdmin: state !== 'ready',
+  })
+
+  const capability = async (
+    refreshCapability = false,
+  ): Promise<SandboxCapabilityReport> => {
+    if (typeof options.capability === 'function') {
+      return await options.capability(refreshCapability) as SandboxCapabilityReport
+    }
+    if (options.capability) return await options.capability as SandboxCapabilityReport
+    const setupReady = (options.setupState ?? 'ready') === 'ready'
+      || (refreshCapability && (options.ensureState ?? 'ready') === 'ready')
+    return {
+      available: setupReady,
+      backend: 'windows_default',
+      platform: 'win32',
+      code: setupReady ? 'ready' : 'setup_required',
+      reason: setupReady ? 'ready' : 'setup required',
+      setupSupported: true,
+      restartRequired: false,
+      probeVersion: 1,
+      capabilities: setupReady ? ['process'] : [],
+    }
+  }
+
+  const actionReceipt = (
+    action: 'install' | 'cancel' | 'remove' | 'discard',
+    componentId: string,
+    operationId?: string,
+  ): SandboxRuntimeActionReceipt => {
+    return options.runtimeAction?.(action, componentId, operationId)
+      ?? { kind: 'status', status: structuredClone(runtimePackStatus) }
+  }
+
+  const readiness = vi.fn(async (request?: { refreshCapability?: boolean }) => {
+    const status = setupStatus()
+    const report = status.state === 'ready'
+      ? await capability(request?.refreshCapability === true)
+      : null
+    return { status, capability: report }
+  })
+  const ensureReady = vi.fn(async (): Promise<SandboxSetupResult> => {
+    if (options.ensure) return await options.ensure
+    const state = options.ensureState ?? 'ready'
+    const status = {
+      ...setupStatus(state),
+      ...(options.ensureDetail ? { detail: options.ensureDetail } : {}),
+    }
+    if (state !== 'ready') {
       return {
-        available: setupReady,
-        backend: 'windows_default',
-        platform: 'win32',
-        code: setupReady ? 'ready' : 'setup_required',
-        reason: setupReady ? 'ready' : 'setup required',
-        setupSupported: true,
-        restartRequired: false,
-        probeVersion: 1,
-        capabilities: setupReady ? ['process'] : [],
+        ready: false,
+        status,
+        capability: null,
+        outcome: status.detail?.toLowerCase().includes('cancel')
+          ? 'cancelled' as const
+          : 'failed' as const,
       }
     }
-    if (method === 'sandbox.setup.status') {
-      const state = options.setupState ?? 'ready'
-      return {
-        state,
-        platform: 'win32',
-        message: state === 'ready' ? 'Sandbox setup is ready.' : 'Sandbox setup is required.',
-        requiresAdmin: state !== 'ready',
-      }
-    }
-    if (method === 'sandbox.setup.ensure') {
-      if (options.ensure) return options.ensure
-      const state = options.ensureState ?? 'ready'
-      return {
-        state,
-        platform: 'win32',
-        message: state === 'ready' ? 'Sandbox setup is ready.' : 'Sandbox setup failed.',
-        requiresAdmin: state !== 'ready',
-        ...(options.ensureDetail ? { detail: options.ensureDetail } : {}),
-      }
-    }
-    if (method === 'sandbox.policy.get') {
-      const loadedPolicy = JSON.parse(JSON.stringify(policy))
-      if (options.runtimePolicy) loadedPolicy.runtimes = structuredClone(options.runtimePolicy)
-      return loadedPolicy
-    }
-    if (method === 'sandbox.runtime.status') {
-      if (options.runtimeStatusError) throw options.runtimeStatusError
-      if (typeof options.runtimeStatus === 'function') return options.runtimeStatus(params)
-      if (options.runtimeStatus !== undefined) return options.runtimeStatus
-      return structuredClone(runtimePackStatus)
-    }
-    if (
-      method === 'sandbox.runtime.install'
-      || method === 'sandbox.runtime.cancel'
-      || method === 'sandbox.runtime.discard_download'
-      || method === 'sandbox.runtime.remove'
-    ) {
-      return options.runtimeAction?.(method, params) ?? {
-        status: structuredClone(runtimePackStatus),
-      }
-    }
-    if (method === 'sandbox.policy.defaults') {
-      return {
+    const report = await capability(true)
+    return report.available
+      ? { ready: true, status, capability: report, outcome: 'ready' as const }
+      : {
+          ready: false,
+          status,
+          capability: report,
+          outcome: 'verification_failed' as const,
+        }
+  })
+  const loadSettings = vi.fn(async () => {
+    const loadedPolicy = JSON.parse(JSON.stringify(policy)) as SandboxPolicy
+    if (options.runtimePolicy) loadedPolicy.runtimes = structuredClone(options.runtimePolicy)
+    return {
+      policy: loadedPolicy,
+      defaults: {
         builtinDenyWritePaths: ['C:\\Users\\tester\\.ssh'],
         runtimeTarget: options.runtimeTarget ?? 'windows-x64',
         runtimeVersions: {
@@ -172,51 +233,63 @@ async function mountPanel(options: {
           node: { version: '24.18.1', available: true },
           gitBash: { version: '2.55.0', available: true },
         },
-      }
+      },
+      preference: { runMode: currentRunMode, source: 'preference' },
     }
-    if (method === 'sandbox.tokens.list') return { tokens: [] }
-    if (method === 'sandbox.run_mode.preference.get') {
-      return { runMode: currentRunMode, source: 'preference' }
-    }
-    if (method === 'config.get') {
-      return {
-        host: '127.0.0.1',
-        auth: { allowed_client_cidrs: [] },
-      }
-    }
-    if (method === 'sandbox.policy.update') {
-      if (options.policyUpdateError) throw options.policyUpdateError
-      const saved = JSON.parse(JSON.stringify(params?.policy))
-      saved.policyVersion = Number(params?.basePolicyVersion) + 1
-      return saved
-    }
-    if (method === 'sandbox.tokens.create') {
-      return {
-        token: 'osq_public_secret-once',
-        record: {
-          publicId: 'public',
-          name: params?.name,
-          capabilities: ['host.execute', 'task.read', 'task.submit'],
-          createdAt: 1,
-          lastUsedAt: null,
-          lastPeer: null,
-        },
-      }
-    }
-    if (method === 'sandbox.tokens.revoke') return { revoked: true }
-    if (method === 'sandbox.run_mode.preference.set') {
-      currentRunMode = params?.runMode === 'safe' ? 'safe' : 'full'
-      return { runMode: currentRunMode, source: 'preference' }
-    }
-    if (method === 'config.patch') return { restartRequired: true }
-    throw new Error(`unexpected method: ${method}`)
   })
-  vi.doMock('@/stores/rpc', () => ({
-    useRpcStore: () => ({
-      ready: vi.fn(async () => {}),
-      call,
-    }),
+  const updatePolicy = vi.fn(async (basePolicyVersion: number, value: SandboxPolicy) => {
+    if (options.policyUpdateError) throw options.policyUpdateError
+    return { ...structuredClone(value), policyVersion: basePolicyVersion + 1 }
+  })
+  const preference = vi.fn(async () => ({
+    runMode: currentRunMode,
+    source: 'preference',
   }))
+  const selectMode = vi.fn(async (mode: 'safe' | 'full') => {
+    currentRunMode = mode
+    return { runMode: currentRunMode, source: 'preference' }
+  })
+  const runtimeStatus = vi.fn(async () => {
+    if (options.runtimeStatusError) throw options.runtimeStatusError
+    if (typeof options.runtimeStatus === 'function') {
+      return await options.runtimeStatus() as SandboxRuntimePackStatus | null
+    }
+    if (options.runtimeStatus !== undefined) {
+      return await options.runtimeStatus
+    }
+    return structuredClone(runtimePackStatus)
+  })
+  const installRuntime = vi.fn(async (componentId: 'python' | 'node' | 'gitBash') => (
+    actionReceipt('install', componentId)
+  ))
+  const cancelRuntime = vi.fn(async (
+    componentId: 'python' | 'node' | 'gitBash',
+    operationId: string,
+  ) => actionReceipt('cancel', componentId, operationId))
+  const removeRuntime = vi.fn(async (componentId: 'python' | 'node' | 'gitBash') => (
+    actionReceipt('remove', componentId)
+  ))
+  const discardRuntimeDownload = vi.fn(async (
+    componentId: 'python' | 'node' | 'gitBash',
+  ) => actionReceipt('discard', componentId))
+
+  const sandbox: SandboxRuntime = {
+    readiness,
+    ensureReady,
+    loadSettings,
+    updatePolicy,
+    preference,
+    selectMode,
+    onPreferenceChanged: () => () => undefined,
+    runtimeStatus,
+    installRuntime,
+    cancelRuntime,
+    removeRuntime,
+    discardRuntimeDownload,
+    async resumeSession(sessionKey) {
+      return { sessionKey, resumed: true, autonomousPaused: false }
+    },
+  }
   vi.doMock('@/platform', () => ({
     usePlatform: () => ({
       id: options.desktop === false ? 'web' : 'desktop',
@@ -229,7 +302,6 @@ async function mountPanel(options: {
   const { createPinia } = await import('pinia')
   const i18n = (await import('@/i18n')).default
   const { SANDBOX_RUNTIME_KEY } = await import('@/modules/sandboxRuntime')
-  const { createV4SandboxRuntime } = await import('@/adapters/gateway/sandboxRuntimeV4')
   i18n.global.locale.value = 'en'
   const Component = (await import('./SandboxSettingsPanel.vue')).default
   const el = document.createElement('div')
@@ -237,13 +309,7 @@ async function mountPanel(options: {
   const app = createApp(Component)
   app.use(createPinia())
   app.use(i18n)
-  app.provide(SANDBOX_RUNTIME_KEY, createV4SandboxRuntime({
-    request: (method, params) => (
-      params === undefined && method !== 'sandbox.capability.status'
-        ? call(method)
-        : call(method, params)
-    ),
-  }))
+  app.provide(SANDBOX_RUNTIME_KEY, sandbox)
   app.mount(el)
   mounted.push(app)
   await settle()
@@ -252,12 +318,27 @@ async function mountPanel(options: {
     if (index >= 0) mounted.splice(index, 1)
     app.unmount()
   }
-  return { el, call, unmount }
+  return {
+    el,
+    operations: {
+      readiness,
+      ensureReady,
+      loadSettings,
+      updatePolicy,
+      preference,
+      selectMode,
+      runtimeStatus,
+      installRuntime,
+      cancelRuntime,
+      removeRuntime,
+      discardRuntimeDownload,
+    },
+    unmount,
+  }
 }
 
 afterEach(() => {
   while (mounted.length) mounted.pop()!.unmount()
-  vi.doUnmock('@/stores/rpc')
   vi.doUnmock('@/platform')
   vi.restoreAllMocks()
   vi.useRealTimers()
@@ -278,7 +359,7 @@ describe('SandboxSettingsPanel', () => {
   }, 15_000)
 
   it('opens focused details and returns without saving', async () => {
-    const { el, call } = await mountPanel()
+    const { el, operations } = await mountPanel()
 
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-files"]')!.click()
     await settle()
@@ -289,14 +370,11 @@ describe('SandboxSettingsPanel', () => {
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-detail-back"]')!.click()
     await settle()
     expect(el.querySelector('[data-testid="sandbox-overview"]')).toBeTruthy()
-    expect(call.mock.calls.some(([method]) => method === 'sandbox.policy.update')).toBe(false)
-
-    expect(call.mock.calls.some(([method]) => String(method).startsWith('sandbox.tokens.')))
-      .toBe(false)
+    expect(operations.updatePolicy).not.toHaveBeenCalled()
   }, 15_000)
 
   it('loads immutable file rules and immediately saves an added custom rule', async () => {
-    const { el, call } = await mountPanel()
+    const { el, operations } = await mountPanel()
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-files"]')!.click()
     await settle()
     expect(el.querySelector('[data-testid="builtin-file-rules"]')?.textContent)
@@ -308,19 +386,19 @@ describe('SandboxSettingsPanel', () => {
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
     await settle()
 
-    expect(call).toHaveBeenCalledWith('sandbox.policy.update', expect.objectContaining({
-      basePolicyVersion: 0,
-      policy: expect.objectContaining({
+    expect(operations.updatePolicy).toHaveBeenCalledWith(
+      0,
+      expect.objectContaining({
         files: expect.objectContaining({
           customDenyWritePaths: ['D:\\Secrets'],
         }),
       }),
-    }))
+    )
   })
 
   it('clamps the recursive-delete backup quota to the visible 0.1 GiB minimum', async () => {
     vi.useFakeTimers()
-    const { el, call } = await mountPanel()
+    const { el, operations } = await mountPanel()
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-files"]')!.click()
     await settle()
     const input = el.querySelector<HTMLInputElement>('[data-testid="sandbox-backup-quota"]')!
@@ -329,22 +407,21 @@ describe('SandboxSettingsPanel', () => {
     await vi.advanceTimersByTimeAsync(500)
     await settle()
 
-    expect(call).toHaveBeenCalledWith('sandbox.policy.update', expect.objectContaining({
-      policy: expect.objectContaining({
+    expect(operations.updatePolicy).toHaveBeenCalledWith(
+      0,
+      expect.objectContaining({
         files: expect.objectContaining({
           backupQuotaBytes: Math.ceil(0.1 * 1024 ** 3),
         }),
       }),
-    }))
+    )
   })
 
   it('does not expose or load named-token management', async () => {
-    const { el, call } = await mountPanel()
+    const { el } = await mountPanel()
 
     expect(el.textContent).not.toContain('Named Token')
     expect(el.querySelector('[data-testid="create-sandbox-token"]')).toBeNull()
-    expect(call.mock.calls.some(([method]) => String(method).startsWith('sandbox.tokens.')))
-      .toBe(false)
   })
 
   it('renders policy controls without waiting for live capability verification', async () => {
@@ -359,12 +436,12 @@ describe('SandboxSettingsPanel', () => {
   })
 
   it('immediately persists an available Safe mode selection without Save or Discard', async () => {
-    const { el, call } = await mountPanel()
+    const { el, operations } = await mountPanel()
 
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-safe-mode"]')!.click()
     await settle()
 
-    expect(call).toHaveBeenCalledWith('sandbox.run_mode.preference.set', { runMode: 'safe' })
+    expect(operations.selectMode).toHaveBeenCalledWith('safe')
     expect(el.querySelector('[data-testid="save-sandbox-section"]')).toBeNull()
     await vi.waitFor(() => {
       expect(el.querySelector('[data-testid="sandbox-safe-mode"]')?.classList.contains('is-selected'))
@@ -375,30 +452,30 @@ describe('SandboxSettingsPanel', () => {
   it('does not retry an unavailable live capability in the background', async () => {
     vi.useFakeTimers()
     let attempts = 0
-    const { call } = await mountPanel({
+    const { operations } = await mountPanel({
       capability: () => {
         attempts += 1
         return {
-          available: attempts > 1,
+          available: false,
           backend: 'windows_default',
           platform: 'win32',
-          code: attempts > 1 ? 'ready' : 'probe_timeout',
-          reason: attempts > 1 ? 'ready' : 'timed out',
+          code: 'probe_timeout',
+          reason: 'timed out',
           setupSupported: true,
           restartRequired: false,
           probeVersion: 1,
-          capabilities: attempts > 1 ? ['process'] : [],
+          capabilities: [],
         }
       },
     })
 
-    expect(attempts).toBe(1)
+    const initialReads = operations.readiness.mock.calls.length
+    expect(attempts).toBe(initialReads)
     for (const elapsed of [10_000, 20_000, 30_000]) {
       await vi.advanceTimersByTimeAsync(elapsed)
       await settle()
-      expect(attempts).toBe(1)
+      expect(operations.readiness).toHaveBeenCalledTimes(initialReads)
     }
-    expect(call).toHaveBeenLastCalledWith('sandbox.capability.status', undefined)
   })
 
   it('does not retry capability verification after the panel is unmounted', async () => {
@@ -407,42 +484,39 @@ describe('SandboxSettingsPanel', () => {
     const capability = new Promise<unknown>((_resolve, reject) => {
       rejectCapability = reject
     })
-    const { call, unmount } = await mountPanel({ capability })
+    const { operations, unmount } = await mountPanel({ capability })
 
-    expect(call.mock.calls.filter(([method]) => method === 'sandbox.capability.status'))
-      .toHaveLength(1)
+    expect(operations.readiness).toHaveBeenCalledOnce()
     unmount()
     rejectCapability(new Error('connection closed'))
     await settle()
     await vi.advanceTimersByTimeAsync(20_000)
     await settle()
 
-    expect(call.mock.calls.filter(([method]) => method === 'sandbox.capability.status'))
-      .toHaveLength(1)
+    expect(operations.readiness).toHaveBeenCalledOnce()
   })
 
   it('does not expose desktop listener or CIDR configuration', async () => {
-    const { el, call } = await mountPanel()
+    const { el } = await mountPanel()
 
     expect(el.querySelector('[data-testid="sandbox-listen-lan"]')).toBeNull()
     expect(el.querySelector('input[placeholder="192.168.1.0/24"]')).toBeNull()
-    expect(call.mock.calls.some(([method]) => String(method).startsWith('config.'))).toBe(false)
   })
 
   it('does not request setup until the local desktop user confirms', async () => {
-    const { el, call } = await mountPanel({ setupState: 'not_setup' })
+    const { el, operations } = await mountPanel({ setupState: 'not_setup' })
 
-    expect(call.mock.calls.some(([method]) => method === 'sandbox.capability.status')).toBe(false)
+    expect(operations.ensureReady).not.toHaveBeenCalled()
 
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-safe-mode"]')!.click()
     await settle()
 
     expect(document.body.querySelector('[data-testid="sandbox-setup-confirm"]')).toBeTruthy()
-    expect(call.mock.calls.some(([method]) => method === 'sandbox.setup.ensure')).toBe(false)
+    expect(operations.ensureReady).not.toHaveBeenCalled()
   })
 
   it('does not offer the setup action to a remote web client', async () => {
-    const { el, call } = await mountPanel({ desktop: false, setupState: 'not_setup' })
+    const { el, operations } = await mountPanel({ desktop: false, setupState: 'not_setup' })
     const safeButton = el.querySelector<HTMLButtonElement>('[data-testid="sandbox-safe-mode"]')!
 
     expect(safeButton.disabled).toBe(true)
@@ -450,13 +524,13 @@ describe('SandboxSettingsPanel', () => {
     await settle()
 
     expect(document.body.querySelector('[data-testid="sandbox-setup-confirm"]')).toBeNull()
-    expect(call.mock.calls.some(([method]) => method === 'sandbox.setup.ensure')).toBe(false)
+    expect(operations.ensureReady).not.toHaveBeenCalled()
   })
 
   it.each(['failed', 'unavailable', 'setting_up'] as const)(
     'disables Safe mode when sandbox status is %s without opening setup',
     async setupState => {
-      const { el, call } = await mountPanel({ setupState })
+      const { el, operations } = await mountPanel({ setupState })
       const safeButton = el.querySelector<HTMLButtonElement>('[data-testid="sandbox-safe-mode"]')!
 
       expect(safeButton.disabled).toBe(true)
@@ -464,14 +538,14 @@ describe('SandboxSettingsPanel', () => {
       await settle()
 
       expect(document.body.querySelector('[data-testid="sandbox-setup-confirm"]')).toBeNull()
-      expect(call.mock.calls.some(([method]) => method === 'sandbox.setup.ensure')).toBe(false)
+      expect(operations.ensureReady).not.toHaveBeenCalled()
       expect(el.querySelector<HTMLButtonElement>('[data-testid="sandbox-full-mode"]')?.disabled)
         .toBe(false)
     },
   )
 
   it('allows cancelling first-time setup and opening it again without installing', async () => {
-    const { el, call } = await mountPanel({ setupState: 'not_setup' })
+    const { el, operations } = await mountPanel({ setupState: 'not_setup' })
     const safeButton = el.querySelector<HTMLButtonElement>('[data-testid="sandbox-safe-mode"]')!
 
     safeButton.click()
@@ -485,14 +559,14 @@ describe('SandboxSettingsPanel', () => {
     safeButton.click()
     await settle()
     expect(document.body.querySelector('[data-testid="sandbox-setup-confirm"]')).toBeTruthy()
-    expect(call.mock.calls.some(([method]) => method === 'sandbox.setup.ensure')).toBe(false)
-    expect(call.mock.calls.some(([method]) => method === 'sandbox.run_mode.preference.set')).toBe(false)
+    expect(operations.ensureReady).not.toHaveBeenCalled()
+    expect(operations.selectMode).not.toHaveBeenCalled()
   })
 
   it('shows neutral elapsed setup guidance while administrator approval is pending', async () => {
     vi.useFakeTimers()
-    let resolveEnsure!: (value: unknown) => void
-    const ensure = new Promise<unknown>((resolve) => {
+    let resolveEnsure!: (value: SandboxSetupResult) => void
+    const ensure = new Promise<SandboxSetupResult>((resolve) => {
       resolveEnsure = resolve
     })
     const { el } = await mountPanel({ setupState: 'not_setup', ensure })
@@ -520,12 +594,7 @@ describe('SandboxSettingsPanel', () => {
     expect(document.body.querySelector('[data-testid="sandbox-setup-progress"]')?.textContent)
       .toContain('First-time setup can take a few minutes. Verification will run automatically.')
 
-    resolveEnsure({
-      state: 'ready',
-      platform: 'win32',
-      message: 'Sandbox setup is ready.',
-      requiresAdmin: false,
-    })
+    resolveEnsure(readySetupResult())
     await settle()
 
     expect(document.body.querySelector('[data-testid="sandbox-setup-progress"]')).toBeNull()
@@ -533,8 +602,8 @@ describe('SandboxSettingsPanel', () => {
 
   it('keeps the original setup progress active after same-tick repeated Continue clicks', async () => {
     vi.useFakeTimers()
-    let resolveEnsure!: (value: unknown) => void
-    const ensure = new Promise<unknown>((resolve) => {
+    let resolveEnsure!: (value: SandboxSetupResult) => void
+    const ensure = new Promise<SandboxSetupResult>((resolve) => {
       resolveEnsure = resolve
     })
     const { el } = await mountPanel({ setupState: 'not_setup', ensure })
@@ -560,23 +629,18 @@ describe('SandboxSettingsPanel', () => {
       .toContain('OpenSquilla is completing Safe mode setup. Keep the app open.')
     expect(document.body.querySelector('[data-testid="sandbox-setup-confirm"]')).toBeTruthy()
 
-    resolveEnsure({
-      state: 'ready',
-      platform: 'win32',
-      message: 'Sandbox setup is ready.',
-      requiresAdmin: false,
-    })
+    resolveEnsure(readySetupResult())
     await settle()
 
     expect(document.body.querySelector('[data-testid="sandbox-setup-progress"]')).toBeNull()
   })
 
   it('closes only the dialog when setup is moved to the background', async () => {
-    let resolveEnsure!: (value: unknown) => void
-    const ensure = new Promise<unknown>((resolve) => {
+    let resolveEnsure!: (value: SandboxSetupResult) => void
+    const ensure = new Promise<SandboxSetupResult>((resolve) => {
       resolveEnsure = resolve
     })
-    const { el, call } = await mountPanel({ setupState: 'not_setup', ensure })
+    const { el, operations } = await mountPanel({ setupState: 'not_setup', ensure })
 
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-safe-mode"]')!.click()
     await settle()
@@ -589,40 +653,32 @@ describe('SandboxSettingsPanel', () => {
     await settle()
 
     expect(document.body.querySelector('[data-testid="sandbox-setup-confirm"]')).toBeNull()
-    expect(call.mock.calls.filter(([method]) => method === 'sandbox.setup.ensure')).toHaveLength(1)
+    expect(operations.ensureReady).toHaveBeenCalledOnce()
 
-    resolveEnsure({
-      state: 'ready',
-      platform: 'win32',
-      message: 'Sandbox setup is ready.',
-      requiresAdmin: false,
-    })
+    resolveEnsure(readySetupResult())
     await settle()
 
-    expect(call.mock.calls.filter(([method]) => method === 'sandbox.setup.ensure')).toHaveLength(1)
+    expect(operations.ensureReady).toHaveBeenCalledOnce()
   })
 
   it('forces live verification after setup and persists Safe mode automatically', async () => {
-    const { el, call } = await mountPanel({ setupState: 'not_setup' })
+    const { el, operations } = await mountPanel({ setupState: 'not_setup' })
 
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-safe-mode"]')!.click()
     await settle()
     document.body.querySelector<HTMLButtonElement>('[data-testid="sandbox-setup-continue"]')!.click()
     await settle()
 
-    expect(call.mock.calls.some(([method]) => method === 'sandbox.setup.ensure')).toBe(true)
-    expect(call.mock.calls.some(([method, params]) => (
-      method === 'sandbox.capability.status' && params?.refresh === true
-    ))).toBe(true)
+    expect(operations.ensureReady).toHaveBeenCalledOnce()
     await vi.waitFor(() => {
       expect(el.querySelector('[data-testid="sandbox-safe-mode"]')?.classList.contains('is-selected'))
         .toBe(true)
     })
-    expect(call).toHaveBeenCalledWith('sandbox.run_mode.preference.set', { runMode: 'safe' })
+    expect(operations.selectMode).toHaveBeenCalledWith('safe')
   })
 
   it('soft-lands a cancelled UAC request without exposing helper details', async () => {
-    const { el, call } = await mountPanel({
+    const { el, operations } = await mountPanel({
       setupState: 'not_setup',
       ensureState: 'failed',
       ensureDetail: 'windows_setup_helper_cancelled',
@@ -637,8 +693,7 @@ describe('SandboxSettingsPanel', () => {
       .toBe(true)
     expect(el.querySelector('[data-testid="sandbox-setup-result"]')?.textContent)
       .not.toContain('windows_setup_helper_cancelled')
-    expect(call.mock.calls.some(([method]) => method === 'sandbox.run_mode.preference.set'))
-      .toBe(false)
+    expect(operations.selectMode).not.toHaveBeenCalled()
   })
 
   it('renders compact runtime pack states without ambiguous policy switches', async () => {
@@ -677,7 +732,7 @@ describe('SandboxSettingsPanel', () => {
   })
 
   it('enables only the requested runtime before starting its download', async () => {
-    const { el, call } = await mountPanel({
+    const { el, operations } = await mountPanel({
       runtimePolicy: {
         enabled: false,
         python: true,
@@ -691,16 +746,13 @@ describe('SandboxSettingsPanel', () => {
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-runtime-install-node"]')!.click()
     await settle()
 
-    const policyCallIndex = call.mock.calls.findIndex(
-      ([method]) => method === 'sandbox.policy.update',
-    )
-    const installCallIndex = call.mock.calls.findIndex(
-      ([method]) => method === 'sandbox.runtime.install',
-    )
-    expect(policyCallIndex).toBeGreaterThanOrEqual(0)
-    expect(installCallIndex).toBeGreaterThan(policyCallIndex)
-    expect(call.mock.calls[policyCallIndex]?.[1]).toEqual(expect.objectContaining({
-      policy: expect.objectContaining({
+    expect(operations.updatePolicy).toHaveBeenCalledOnce()
+    expect(operations.installRuntime).toHaveBeenCalledWith('node')
+    expect(operations.updatePolicy.mock.invocationCallOrder[0])
+      .toBeLessThan(operations.installRuntime.mock.invocationCallOrder[0]!)
+    expect(operations.updatePolicy).toHaveBeenCalledWith(
+      0,
+      expect.objectContaining({
         runtimes: {
           enabled: true,
           python: false,
@@ -708,11 +760,11 @@ describe('SandboxSettingsPanel', () => {
           gitBash: false,
         },
       }),
-    }))
+    )
   })
 
   it('does not download when automatic runtime enabling cannot be saved', async () => {
-    const { el, call } = await mountPanel({
+    const { el, operations } = await mountPanel({
       runtimePolicy: {
         enabled: false,
         python: false,
@@ -727,14 +779,14 @@ describe('SandboxSettingsPanel', () => {
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-runtime-install-node"]')!.click()
     await settle()
 
-    expect(call.mock.calls.some(([method]) => method === 'sandbox.policy.update')).toBe(true)
-    expect(call.mock.calls.some(([method]) => method === 'sandbox.runtime.install')).toBe(false)
+    expect(operations.updatePolicy).toHaveBeenCalledOnce()
+    expect(operations.installRuntime).not.toHaveBeenCalled()
     expect(el.querySelector('[data-testid="sandbox-runtime-node"]')?.textContent)
       .toContain('Save failed')
   })
 
   it('offers one explicit Enable action for an installed legacy-disabled runtime', async () => {
-    const { el, call } = await mountPanel({
+    const { el, operations } = await mountPanel({
       runtimePolicy: {
         enabled: false,
         python: false,
@@ -753,8 +805,9 @@ describe('SandboxSettingsPanel', () => {
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-runtime-enable-python"]')!.click()
     await settle()
 
-    expect(call).toHaveBeenCalledWith('sandbox.policy.update', expect.objectContaining({
-      policy: expect.objectContaining({
+    expect(operations.updatePolicy).toHaveBeenCalledWith(
+      0,
+      expect.objectContaining({
         runtimes: {
           enabled: true,
           python: true,
@@ -762,8 +815,8 @@ describe('SandboxSettingsPanel', () => {
           gitBash: false,
         },
       }),
-    }))
-    expect(call.mock.calls.some(([method]) => method === 'sandbox.runtime.install')).toBe(false)
+    )
+    expect(operations.installRuntime).not.toHaveBeenCalled()
   })
 
   it('keeps the successful download source visible after installation', async () => {
@@ -812,7 +865,7 @@ describe('SandboxSettingsPanel', () => {
         error: null,
       },
     }
-    const { el, call } = await mountPanel({ runtimeStatus: downloading })
+    const { el, operations } = await mountPanel({ runtimeStatus: downloading })
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-runtimes"]')!.click()
     await settle()
 
@@ -827,11 +880,8 @@ describe('SandboxSettingsPanel', () => {
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-runtime-install-node"]')!.click()
     await settle()
 
-    expect(call).toHaveBeenCalledWith('sandbox.runtime.cancel', {
-      componentId: 'python',
-      operationId: 'operation-1',
-    })
-    expect(call).toHaveBeenCalledWith('sandbox.runtime.install', { componentId: 'node' })
+    expect(operations.cancelRuntime).toHaveBeenCalledWith('python', 'operation-1')
+    expect(operations.installRuntime).toHaveBeenCalledWith('node')
   })
 
   it('offers resume and discard for partial or complete cancelled downloads', async () => {
@@ -859,7 +909,7 @@ describe('SandboxSettingsPanel', () => {
           error: null,
         },
       }
-      const { el, call } = await mountPanel({ runtimeStatus: cancelled })
+      const { el, operations } = await mountPanel({ runtimeStatus: cancelled })
       el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-runtimes"]')!.click()
       await settle()
 
@@ -873,9 +923,7 @@ describe('SandboxSettingsPanel', () => {
         '[data-testid="sandbox-runtime-discard-python"]',
       )!.click()
       await settle()
-      expect(call).toHaveBeenCalledWith('sandbox.runtime.discard_download', {
-        componentId: 'python',
-      })
+      expect(operations.discardRuntimeDownload).toHaveBeenCalledWith('python')
       expect(el.querySelector('[data-testid="sandbox-runtime-discard-python"]')).toBeNull()
     }
   })
@@ -927,11 +975,8 @@ describe('SandboxSettingsPanel', () => {
     expect(el.querySelector('[data-testid="sandbox-runtime-gitBash"]')).toBeNull()
   })
 
-  it('falls back to legacy versions when the runtime RPC is unavailable', async () => {
-    const methodNotFound = Object.assign(new Error('method not found'), {
-      code: 'METHOD_NOT_FOUND',
-    })
-    const { el } = await mountPanel({ runtimeStatusError: methodNotFound })
+  it('falls back to legacy versions when runtime management is unavailable', async () => {
+    const { el } = await mountPanel({ runtimeStatus: null })
 
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-runtimes"]')!.click()
     await settle()
@@ -943,12 +988,9 @@ describe('SandboxSettingsPanel', () => {
     expect(el.querySelector('[data-testid="sandbox-runtime-status-retry"]')).toBeNull()
   })
 
-  it('can re-enable a legacy runtime when the management RPC is unavailable', async () => {
-    const methodNotFound = Object.assign(new Error('method not found'), {
-      code: 'METHOD_NOT_FOUND',
-    })
-    const { el, call } = await mountPanel({
-      runtimeStatusError: methodNotFound,
+  it('can re-enable a legacy runtime when runtime management is unavailable', async () => {
+    const { el, operations } = await mountPanel({
+      runtimeStatus: null,
       runtimePolicy: {
         enabled: false,
         python: false,
@@ -964,16 +1006,13 @@ describe('SandboxSettingsPanel', () => {
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-runtime-enable-python"]')!.click()
     await settle()
 
-    expect(call.mock.calls.some(([method]) => method === 'sandbox.policy.update')).toBe(true)
-    expect(call.mock.calls.some(([method]) => method === 'sandbox.runtime.install')).toBe(false)
+    expect(operations.updatePolicy).toHaveBeenCalledOnce()
+    expect(operations.installRuntime).not.toHaveBeenCalled()
   })
 
   it('keeps an explicit Enable failure inside the affected legacy runtime row', async () => {
-    const methodNotFound = Object.assign(new Error('method not found'), {
-      code: 'METHOD_NOT_FOUND',
-    })
-    const { el, call } = await mountPanel({
-      runtimeStatusError: methodNotFound,
+    const { el, operations } = await mountPanel({
+      runtimeStatus: null,
       runtimePolicy: {
         enabled: false,
         python: false,
@@ -987,7 +1026,7 @@ describe('SandboxSettingsPanel', () => {
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-runtime-enable-python"]')!.click()
     await settle()
 
-    expect(call.mock.calls.some(([method]) => method === 'sandbox.runtime.install')).toBe(false)
+    expect(operations.installRuntime).not.toHaveBeenCalled()
     expect(el.querySelector('[data-testid="sandbox-runtime-python"]')?.textContent)
       .toContain('Save failed')
   })
@@ -1029,7 +1068,7 @@ describe('SandboxSettingsPanel', () => {
         error: null,
       },
     }
-    const { el, call } = await mountPanel({ runtimeStatus: status })
+    const { el, operations } = await mountPanel({ runtimeStatus: status })
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-runtimes"]')!.click()
     await settle()
 
@@ -1041,7 +1080,7 @@ describe('SandboxSettingsPanel', () => {
     expect(el.querySelector('[data-testid="sandbox-runtime-discard-python"]')).toBeNull()
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-runtime-remove-python"]')!.click()
     await settle()
-    expect(call).toHaveBeenCalledWith('sandbox.runtime.remove', { componentId: 'python' })
+    expect(operations.removeRuntime).toHaveBeenCalledWith('python')
   })
 
   it('offers download again after a remove operation completes', async () => {
@@ -1075,7 +1114,7 @@ describe('SandboxSettingsPanel', () => {
   })
 
   it('keeps transient runtime status errors inside the runtime subpage and allows retry', async () => {
-    const { el, call } = await mountPanel({
+    const { el, operations } = await mountPanel({
       runtimeStatusError: new Error('runtime service unavailable'),
     })
 
@@ -1089,12 +1128,9 @@ describe('SandboxSettingsPanel', () => {
     expect(el.textContent).toContain('Status unavailable')
     expect(el.textContent).not.toContain('runtime service unavailable')
 
-    const beforeRetry = call.mock.calls.filter(
-      ([method]) => method === 'sandbox.runtime.status',
-    ).length
+    const beforeRetry = operations.runtimeStatus.mock.calls.length
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-runtime-status-retry"]')!.click()
     await settle()
-    expect(call.mock.calls.filter(([method]) => method === 'sandbox.runtime.status'))
-      .toHaveLength(beforeRetry + 1)
+    expect(operations.runtimeStatus).toHaveBeenCalledTimes(beforeRetry + 1)
   })
 })

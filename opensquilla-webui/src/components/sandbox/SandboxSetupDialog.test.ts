@@ -96,6 +96,15 @@ describe('SandboxSetupDialog', () => {
     expect(onBackground).toHaveBeenCalledTimes(1)
   })
 
+  it('keeps an ambiguous server-side setup read-only and backgroundable', () => {
+    const body = mountDialog(false, 'in_progress')
+
+    expect(body.textContent).not.toContain('Cancel')
+    expect(body.querySelector('[data-testid="sandbox-setup-background"]')).toBeTruthy()
+    expect(body.querySelector<HTMLButtonElement>('[data-testid="sandbox-setup-continue"]')?.disabled)
+      .toBe(true)
+  })
+
   it('keeps a retryable failure visible', () => {
     const body = mountDialog(false, 'verification_failed')
 
