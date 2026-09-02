@@ -208,8 +208,9 @@ test('keeps the conversation usable while startup and long history are delayed',
     'sessions.messages.snapshot',
     'chat.history',
   ]
-  expect(receivedMethods.slice(0, criticalStartupOrder.length)).toEqual(
-    criticalStartupOrder,
+  const expectedStartupMethods = ['sessions.list', ...criticalStartupOrder]
+  expect(receivedMethods.slice(0, expectedStartupMethods.length)).toEqual(
+    expectedStartupMethods,
   )
   expect(sessionRequestOrder.slice(0, criticalStartupOrder.length)).toEqual(
     criticalStartupOrder,
