@@ -1,0 +1,72 @@
+{
+  "format_version": 1,
+  "kind": "request",
+  "cases": [
+    {
+      "id": "request.camel",
+      "coverage": "canonical-through-turn-alias",
+      "expectation": "exact",
+      "wire": { "type": "req", "id": "fork-through-camel", "method": "sessions.forkThroughTurn", "params": { "key": "agent:main:webchat:parent", "throughTurnId": "turn-terminal" } }
+    },
+    {
+      "id": "request.snake",
+      "coverage": "legacy-snake-through-turn-alias",
+      "expectation": "exact",
+      "wire": { "type": "req", "id": "fork-through-snake", "method": "sessions.forkThroughTurn", "params": { "key": "agent:main:webchat:parent", "through_turn_id": "turn-terminal" } }
+    },
+    {
+      "id": "request.dual-matching",
+      "coverage": "matching-through-turn-aliases",
+      "expectation": "exact",
+      "wire": { "type": "req", "id": "fork-through-dual", "method": "sessions.forkThroughTurn", "params": { "key": "agent:main:webchat:parent", "throughTurnId": "turn-terminal", "through_turn_id": "turn-terminal", "title": "Synthetic fork" } }
+    },
+    {
+      "id": "request.invalid-missing-anchor",
+      "coverage": "handler-owned-required-anchor-error",
+      "expectation": "exact",
+      "wire": { "type": "req", "id": "fork-through-missing-anchor", "method": "sessions.forkThroughTurn", "params": { "key": "agent:main:webchat:parent" } }
+    },
+    {
+      "id": "request.invalid-before-camel-present-null",
+      "coverage": "handler-rejects-before-alias-presence",
+      "expectation": "exact",
+      "wire": { "type": "req", "id": "fork-through-before", "method": "sessions.forkThroughTurn", "params": { "key": "agent:main:webchat:parent", "beforeMessageId": null, "throughTurnId": "turn-terminal" } }
+    },
+    {
+      "id": "request.invalid-before-snake-present",
+      "coverage": "handler-rejects-legacy-before-alias-presence",
+      "expectation": "exact",
+      "wire": { "type": "req", "id": "fork-through-before-snake", "method": "sessions.forkThroughTurn", "params": { "key": "agent:main:webchat:parent", "before_message_id": "message-middle", "through_turn_id": "turn-terminal" } }
+    },
+    {
+      "id": "request.invalid-dual-aliases",
+      "coverage": "handler-owned-alias-consensus-error",
+      "expectation": "exact",
+      "wire": { "type": "req", "id": "fork-through-alias-conflict", "method": "sessions.forkThroughTurn", "params": { "key": "agent:main:webchat:parent", "throughTurnId": "turn-terminal", "through_turn_id": "turn-other" } }
+    },
+    {
+      "id": "request.invalid-field-types",
+      "coverage": "observe-only-handler-type-errors",
+      "expectation": "exact",
+      "wire": { "type": "req", "id": "fork-through-invalid-types", "method": "sessions.forkThroughTurn", "params": { "key": { "invalid": true }, "throughTurnId": 17, "future": ["preserved"] } }
+    },
+    {
+      "id": "request.null-params",
+      "coverage": "legacy-null-params",
+      "expectation": "exact",
+      "wire": { "type": "req", "id": "fork-through-null", "method": "sessions.forkThroughTurn", "params": null }
+    },
+    {
+      "id": "request.omitted-params",
+      "coverage": "legacy-omitted-params",
+      "expectation": "exact",
+      "wire": { "type": "req", "id": "fork-through-omitted", "method": "sessions.forkThroughTurn" }
+    },
+    {
+      "id": "request.non-object-params",
+      "coverage": "legacy-non-object-params",
+      "expectation": "exact",
+      "wire": { "type": "req", "id": "fork-through-scalar", "method": "sessions.forkThroughTurn", "params": false }
+    }
+  ]
+}
