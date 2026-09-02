@@ -1268,7 +1268,11 @@ export function useChatSend(options: UseChatSendOptions) {
     }
     activeResponseHandoff = gate
     if (durableRecord) {
-      options.pendingQueueOwnerContext.value = { sessionKey: requestSessionKey, ownerRequestId }
+      options.pendingQueueOwnerContext.value = {
+        sessionKey: requestSessionKey,
+        sourceSessionKey: requestSessionKey,
+        ownerRequestId,
+      }
     }
     return gate
   }
@@ -1567,6 +1571,7 @@ export function useChatSend(options: UseChatSendOptions) {
     if (activeResponseHandoff === gate) {
       options.pendingQueueOwnerContext.value = {
         sessionKey: key,
+        sourceSessionKey: gate.requestSessionKey,
         ownerRequestId: gate.ownerRequestId,
       }
     }

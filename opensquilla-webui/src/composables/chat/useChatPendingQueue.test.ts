@@ -2254,7 +2254,7 @@ describe('useChatPendingQueue delivery state', () => {
     },
   )
 
-  it('blocks composer recovery and invalidates an existing restore during delayed handoff acceptance', async () => {
+  it('keeps the source recovery fence after context targets B but session remains A', async () => {
     const sourceSessionKey = 'agent:main:webchat:test'
     const targetSessionKey = 'agent:main:webchat:delayed-handoff-target'
     const ownerRequestId = 'owner-delayed-handoff-recovery'
@@ -2333,10 +2333,15 @@ describe('useChatPendingQueue delivery state', () => {
 
       expect(initial.queue.editPendingItem(firstId)).toBe(true)
       await retainStarted
-      ownerContext.value = { sessionKey: sourceSessionKey, ownerRequestId }
+      ownerContext.value = {
+        sessionKey: targetSessionKey,
+        sourceSessionKey,
+        ownerRequestId,
+      }
       const adoption = initial.queue.adoptPendingQueue(targetSessionKey, ownerRequestId)
       await acceptStarted
 
+      expect(initial.sessionKey.value).toBe(sourceSessionKey)
       expect(initial.queue.popPendingTail()).toBe(false)
       expect(initial.queue.popAllPendingIntoComposer()).toBe(false)
       releaseRetain()

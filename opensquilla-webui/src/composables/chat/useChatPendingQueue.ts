@@ -107,6 +107,8 @@ export interface PendingCancelOptions {
 
 export interface PendingQueueOwnerContext {
   sessionKey: string
+  /** Original visible queue fenced until response-session adoption settles. */
+  sourceSessionKey?: string
   ownerRequestId: string
 }
 
@@ -198,14 +200,21 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   )
   const ownerContextKey = (context: PendingQueueOwnerContext | null | undefined) => (
     context
-      ? `${queueSessionKey(context.sessionKey)}\u0000${context.ownerRequestId}`
+      ? [
+          queueSessionKey(context.sessionKey),
+          queueSessionKey(context.sourceSessionKey),
+          context.ownerRequestId,
+        ].join('\u0000')
       : ''
   )
   const responseHandoffOwnsCurrentQueue = () => {
     const context = options.ownerContext?.value
     return Boolean(
       context
-      && queueSessionKey(context.sessionKey) === queueSessionKey(),
+      && (
+        queueSessionKey(context.sessionKey) === queueSessionKey()
+        || queueSessionKey(context.sourceSessionKey) === queueSessionKey()
+      ),
     )
   }
   const stopOwnerContextWatch = options.ownerContext
