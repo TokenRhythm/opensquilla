@@ -446,14 +446,17 @@
 </template>
 
 <script setup lang="ts">
-import { computed, inject, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, inject, nextTick, onMounted, onUnmounted, provide, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { routeTitle } from './router'
 import { getPlatform } from '@/platform'
 import { useAppStore, type ThemeMode, type PendingApproval } from './stores/app'
 import { GATEWAY_ACCESS_KEY } from './modules/gatewayAccess'
-import { SESSION_DIRECTORY_KEY } from './modules/sessionDirectory'
+import {
+  SESSION_DIRECTORY_ITEMS_KEY,
+  SESSION_DIRECTORY_KEY,
+} from './modules/sessionDirectory'
 import { SESSION_DIRECTORY_CHANGES_KEY } from './modules/sessionDirectoryChanges'
 import { SESSION_LIFECYCLE_KEY } from './modules/sessionLifecycle'
 import { APPROVAL_CENTER_KEY, type ApprovalEvent, type ApprovalItem, type ApprovalSubscription } from './modules/approvalCenter'
@@ -655,6 +658,7 @@ const {
   loadSessions,
   loadMoreSessions,
 } = useSessions(sessionDirectory)
+provide(SESSION_DIRECTORY_ITEMS_KEY, allSessions)
 const { bottomRoutes, workNav } = useNavigation()
 // Axis-B: the active expressive skin for the routed content area (meta.skin).
 const { skinId, variants } = useSurfaceSkin()

@@ -11,34 +11,46 @@ function sourceBetween(start: string, end: string): string {
 
 describe('Cron session read-only presentation', () => {
   it('replaces the composer with a localized status without floating dock clearance', () => {
-    expect(chatViewSource).toContain('v-if="isCronSession"')
-    expect(chatViewSource).toContain("{{ t('chat.cronSessionReadOnly') }}")
+    expect(chatViewSource).toContain('v-if="turnActionsBlocked"')
+    expect(chatViewSource).toContain(
+      "{{ t(isCronSession ? 'chat.cronSessionReadOnly' : 'chat.loadingSession') }}",
+    )
     expect(chatViewSource).toContain('<template v-else>')
     expect(chatViewSource).toContain(
       "chatRootRef.value?.querySelector<HTMLElement>('.chat-composer-dock')",
     )
     expect(chatViewSource).toContain(
-      "'chat--composer-floating': composerFxEnabled && !isNewChatLanding && !isCronSession",
+      "'chat--composer-floating': composerFxEnabled && !isNewChatLanding && !turnActionsBlocked",
     )
     expect(chatViewSource).toContain(
-      "'chat--plan-questionnaire-open': Boolean(dockedPlanQuestionnaire) && !isCronSession",
+      "'chat--plan-questionnaire-open': Boolean(dockedPlanQuestionnaire) && !turnActionsBlocked",
     )
     expect(chatViewSource).toMatch(
-      /'chat--composer-collapsed':[\s\S]*&& !isNewChatLanding\s*&& !isCronSession/,
+      /'chat--composer-collapsed':[\s\S]*&& !isNewChatLanding\s*&& !turnActionsBlocked/,
     )
   })
 
   it('uses the existing send gate while preserving the replay-specific gate', () => {
-    expect(chatViewSource).toContain("isCronSession.value ? t('chat.cronSessionReadOnly') : null")
+    expect(chatViewSource).toContain("isCronSession.value\n    ? t('chat.cronSessionReadOnly')")
+    expect(chatViewSource).toContain(
+      "sessionPolicyPending.value ? t('chat.loadingSession') : null",
+    )
     expect(chatViewSource).toContain('sessionInteractivityBlockedReason.value')
     expect(chatViewSource).toContain('sessionInteractivityBlockedReason,')
     expect(chatViewSource).toContain('idempotentReplayBlockedReason: liveSendBlockedReason')
-    expect(chatViewSource).toContain(':message-actions-available="!isCronSession"')
-    expect(chatViewSource).toContain('canMutateMessages: () => !isCronSession.value')
-    expect(chatViewSource.match(/:turn-actions-disabled="isCronSession"/g)).toHaveLength(3)
-    expect(chatViewSource).toContain('turnActionsBlocked: () => isCronSession.value')
+    expect(chatViewSource).toContain(':message-actions-available="!turnActionsBlocked"')
+    expect(chatViewSource).toContain('canMutateMessages: () => !turnActionsBlocked.value')
+    expect(chatViewSource.match(/:turn-actions-disabled="turnActionsBlocked"/g)).toHaveLength(3)
+    expect(chatViewSource).toContain('turnActionsBlocked: () => turnActionsBlocked.value')
     expect(chatViewSource).toContain('<MetaSkillSetupCard')
-    expect(chatViewSource).toContain(':turn-actions-disabled="isCronSession"')
+    expect(chatViewSource).toContain(':turn-actions-disabled="turnActionsBlocked"')
+  })
+
+  it('uses authoritative directory interactivity with a pending direct-route gate', () => {
+    expect(chatViewSource).toContain('useChatSessionInteractivity({')
+    expect(chatViewSource).toContain('knownSessions: knownDirectorySessions')
+    expect(chatViewSource).toContain('policyPending: sessionPolicyPending')
+    expect(chatViewSource).toContain('turnActionsBlocked,')
   })
 
   it('guards current, new-task, and replan handlers before Plan mutations', () => {
@@ -52,16 +64,16 @@ describe('Cron session read-only presentation', () => {
     )
     const replan = sourceBetween('function beginPlanRevision(', 'function cancelPlanRevision(')
 
-    expect(implementCurrent).toContain('if (isCronSession.value || liveSendBlockedReason.value) return')
-    expect(implementCurrent.indexOf('isCronSession.value')).toBeLessThan(
+    expect(implementCurrent).toContain('if (turnActionsBlocked.value || liveSendBlockedReason.value) return')
+    expect(implementCurrent.indexOf('turnActionsBlocked.value')).toBeLessThan(
       implementCurrent.indexOf('chatPlans.implement'),
     )
-    expect(implementNew).toContain('if (isCronSession.value || liveSendBlockedReason.value) return')
-    expect(implementNew.indexOf('isCronSession.value')).toBeLessThan(
+    expect(implementNew).toContain('if (turnActionsBlocked.value || liveSendBlockedReason.value) return')
+    expect(implementNew.indexOf('turnActionsBlocked.value')).toBeLessThan(
       implementNew.indexOf('chatPlans.implement'),
     )
-    expect(replan).toContain('if (isCronSession.value) return')
-    expect(replan.indexOf('isCronSession.value')).toBeLessThan(
+    expect(replan).toContain('if (turnActionsBlocked.value) return')
+    expect(replan.indexOf('turnActionsBlocked.value')).toBeLessThan(
       replan.indexOf('chatPlans.beginReplan'),
     )
   })
@@ -77,14 +89,14 @@ describe('Cron session read-only presentation', () => {
     )
 
     expect(tailPlanCard).toContain(':disabled="planActionsDisabled"')
-    expect(disabledState).toContain('isCronSession.value')
+    expect(disabledState).toContain('turnActionsBlocked.value')
   })
 
   it('guards fork before creating another session', () => {
     const fork = sourceBetween('async function forkConversation(', 'async function resumeSandbox(')
 
-    expect(fork).toContain('if (isCronSession.value) return')
-    expect(fork.indexOf('isCronSession.value')).toBeLessThan(
+    expect(fork).toContain('if (turnActionsBlocked.value) return')
+    expect(fork.indexOf('turnActionsBlocked.value')).toBeLessThan(
       fork.indexOf('sessionLifecycle.fork'),
     )
   })
@@ -95,16 +107,16 @@ describe('Cron session read-only presentation', () => {
     const drop = sourceBetween('function onChatDrop(', '/* ── Textarea')
     const paste = sourceBetween('function onDocumentPaste(', '/* ── Document keydown')
 
-    expect(dragEnter).toContain('isCronSession.value || replanActive.value')
+    expect(dragEnter).toContain('turnActionsBlocked.value || replanActive.value')
     expect(dragEnter).toContain("e.dataTransfer.dropEffect = 'none'")
-    expect(dragOver).toContain('isCronSession.value || replanActive.value')
+    expect(dragOver).toContain('turnActionsBlocked.value || replanActive.value')
     expect(dragOver).toContain("e.dataTransfer.dropEffect = 'none'")
-    expect(chatViewSource).toContain('v-if="threadDragOver && !isCronSession"')
-    expect(chatViewSource).toContain('watch(isCronSession, readOnly => {')
-    expect(drop).toContain('if (isCronSession.value)')
-    expect(drop.indexOf('if (isCronSession.value)')).toBeLessThan(drop.indexOf('addAttachments(files)'))
-    expect(paste).toContain('if (isCronSession.value) return')
-    expect(paste.indexOf('if (isCronSession.value) return')).toBeLessThan(
+    expect(chatViewSource).toContain('v-if="threadDragOver && !turnActionsBlocked"')
+    expect(chatViewSource).toContain('watch(turnActionsBlocked, readOnly => {')
+    expect(drop).toContain('if (turnActionsBlocked.value)')
+    expect(drop.indexOf('if (turnActionsBlocked.value)')).toBeLessThan(drop.indexOf('addAttachments(files)'))
+    expect(paste).toContain('if (turnActionsBlocked.value) return')
+    expect(paste.indexOf('if (turnActionsBlocked.value) return')).toBeLessThan(
       paste.indexOf('collectClipboardFiles'),
     )
   })

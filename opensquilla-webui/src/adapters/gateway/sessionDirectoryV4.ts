@@ -122,6 +122,13 @@ function numberValue(...values: unknown[]): number | null {
   return null
 }
 
+function booleanValue(...values: unknown[]): boolean | null {
+  for (const value of values) {
+    if (typeof value === 'boolean') return value
+  }
+  return null
+}
+
 function objectValue(...values: unknown[]): Record<string, unknown> | null {
   const found = values.find(value => value && typeof value === 'object' && !Array.isArray(value))
   return (found as Record<string, unknown> | undefined) || null
@@ -247,6 +254,7 @@ export function normalizeV4SessionItem(item: unknown): SessionItem | null {
     workspaceDisplayPath: textValue(row.workspaceDisplayPath) || undefined,
     effectiveAgentId: derivedAgentId,
     sessionKind,
+    interactive: booleanValue(row.interactive),
     surface,
     conversationKind,
     status,

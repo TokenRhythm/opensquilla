@@ -5,21 +5,21 @@
     :class="{
       'chat--new-landing': isNewChatLanding,
       'chat--meta-setup': Boolean(setupState),
-      'chat--drag-over': threadDragOver && !isCronSession,
-      'chat--plan-questionnaire-open': Boolean(dockedPlanQuestionnaire) && !isCronSession,
-      'chat--composer-floating': composerFxEnabled && !isNewChatLanding && !isCronSession,
+      'chat--drag-over': threadDragOver && !turnActionsBlocked,
+      'chat--plan-questionnaire-open': Boolean(dockedPlanQuestionnaire) && !turnActionsBlocked,
+      'chat--composer-floating': composerFxEnabled && !isNewChatLanding && !turnActionsBlocked,
       'chat--composer-collapsed': composerCollapsed
         && activePromptAnnotations.length === 0
         && composerFxEnabled
         && !isNewChatLanding
-        && !isCronSession,
+        && !turnActionsBlocked,
     }"
     @dragenter="onChatDragEnter"
     @dragover="onChatDragOver"
     @dragleave="onChatDragLeave"
     @drop="onChatDrop"
   >
-    <div v-if="threadDragOver && !isCronSession" class="chat-drop-overlay" role="status" aria-live="polite" aria-atomic="true">
+    <div v-if="threadDragOver && !turnActionsBlocked" class="chat-drop-overlay" role="status" aria-live="polite" aria-atomic="true">
       <div class="chat-drop-overlay__frame" aria-hidden="true"></div>
       <div class="chat-drop-overlay__beacon">
         <span class="chat-drop-overlay__glyph" aria-hidden="true">
@@ -218,7 +218,7 @@
           :plan-action-pending="planCardPendingAction"
           :plan-actions-disabled="planActionsDisabled"
           :is-streaming="isStreaming"
-          :message-actions-available="!isCronSession"
+          :message-actions-available="!turnActionsBlocked"
           :follow-live-edge="autoScroll"
           :scroll-epoch="scrollEpoch"
           :goal="currentGoalRun"
@@ -305,13 +305,13 @@
             :state="metaRuns.preflights.value.get(runId)!.state"
             :phase="metaRuns.preflights.value.get(runId)!.phase"
             :error-text="metaRuns.preflights.value.get(runId)!.errorText"
-            :turn-actions-disabled="isCronSession"
+            :turn-actions-disabled="turnActionsBlocked"
             @action="metaRuns.onPreflightAction"
           />
           <MetaRibbon
             v-if="metaRuns.ribbons.value.has(runId)"
             :run="metaRuns.ribbons.value.get(runId)!"
-            :turn-actions-disabled="isCronSession"
+            :turn-actions-disabled="turnActionsBlocked"
             @action="metaRuns.onRibbonAction"
             @chip-select="metaRuns.onChipSelect"
           />
@@ -537,7 +537,7 @@
       v-if="setupState"
       :state="setupState"
       :provider-navigation-pending="metaSetupProviderNavigationPending"
-      :turn-actions-disabled="isCronSession"
+      :turn-actions-disabled="turnActionsBlocked"
       @confirm="confirmSetup"
       @retry="retrySetup"
       @cancel="cancelSetup"
@@ -549,11 +549,11 @@
          anchor to the chat container's bottom edge. -->
     <div class="chat-composer-dock">
     <div
-      v-if="isCronSession"
+      v-if="turnActionsBlocked"
       class="chat-composer-read-only"
       role="status"
       aria-live="polite"
-    >{{ t('chat.cronSessionReadOnly') }}</div>
+    >{{ t(isCronSession ? 'chat.cronSessionReadOnly' : 'chat.loadingSession') }}</div>
     <template v-else>
     <!-- Durable execution progress belongs to the work surface, not to the
          transcript. Keeping it immediately above the composer also lets a
@@ -813,9 +813,9 @@ import { useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 import {
+  SESSION_DIRECTORY_ITEMS_KEY,
   SESSION_DIRECTORY_KEY,
   SessionDirectoryError,
-  isCronSessionKey,
 } from '@/modules/sessionDirectory'
 import { SESSION_LIFECYCLE_KEY } from '@/modules/sessionLifecycle'
 import { PENDING_INPUT_QUEUE_KEY } from '@/modules/pendingInputQueue'
@@ -889,6 +889,7 @@ import { useChatDraftPersistence } from '@/composables/chat/useChatDraftPersiste
 import { useChatElevatedMode } from '@/composables/chat/useChatElevatedMode'
 import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
 import { useChatSessionRouting } from '@/composables/chat/useChatSessionRouting'
+import { useChatSessionInteractivity } from '@/composables/chat/useChatSessionInteractivity'
 import { SESSION_ROUTING_KEY, type SessionRouting } from '@/modules/sessionRouting'
 import { SESSION_CONVERSATION_KEY, type SessionConversation } from '@/modules/sessionConversation'
 import { TURN_COMMANDS_KEY, type TurnCommands } from '@/modules/turnCommands'
@@ -1197,6 +1198,7 @@ if (!sessionRouting) throw new Error('SessionRouting was not provided')
 const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
 if (!injectedSessionDirectory) throw new Error('SessionDirectory was not provided')
 const sessionDirectory = injectedSessionDirectory
+const knownDirectorySessions = inject(SESSION_DIRECTORY_ITEMS_KEY)
 const injectedSessionLifecycle = inject(SESSION_LIFECYCLE_KEY)
 if (!injectedSessionLifecycle) throw new Error('SessionLifecycle was not provided')
 const sessionLifecycle = injectedSessionLifecycle
@@ -1306,7 +1308,6 @@ function cancelActiveProjectValidation() {
 const isCompactViewport = useMediaQuery('(max-width: 480px)')
 const isDesktopViewport = useMediaQuery('(min-width: 769px)')
 const landingAgentId = computed(() => agentIdFromSessionKey(sessionKey.value))
-const isCronSession = computed(() => isCronSessionKey(sessionKey.value))
 // True when the current draft opened with prefilled composer text (Sessions
 // Hub task input); the landing suggestion chips stay out of the way then.
 const landingPrefilled = ref(false)
@@ -1342,6 +1343,17 @@ const { enabled: composerFxEnabled } = useComposerFloatingPreference()
 /* ── State ─────────────────────────────────────────────────────────── */
 
 const sessionKey = ref('')
+const sessionInteractivity = useChatSessionInteractivity({
+  sessionKey,
+  directory: sessionDirectory,
+  knownSessions: knownDirectorySessions,
+  shouldResolve: key => readSessionFromUrl() === key,
+})
+const {
+  isCronSession,
+  policyPending: sessionPolicyPending,
+  turnActionsBlocked,
+} = sessionInteractivity
 function clearPendingComposerScrollIntent() {
   pendingComposerScrollIntent = null
   if (composerScrollIntentTimer !== null) {
@@ -1587,7 +1599,7 @@ const lastHeaderRole = ref('')
 const lastHeaderDay = ref('')
 const threadDragOver = ref(false)
 const threadDragDepth = ref(0)
-watch(isCronSession, readOnly => {
+watch(turnActionsBlocked, readOnly => {
   if (!readOnly) return
   threadDragDepth.value = 0
   threadDragOver.value = false
@@ -2583,7 +2595,7 @@ const chatMessageActions = useChatMessageActions({
   },
   notifyMessagePending: () => pushToast(t('chat.toast.messageStillSaving'), { tone: 'info' }),
   notifyEditBlocked: () => pushToast(t('chat.pending.editWhileStreaming'), { tone: 'info' }),
-  canMutateMessages: () => !isCronSession.value,
+  canMutateMessages: () => !turnActionsBlocked.value,
 })
 const {
   copyMessage,
@@ -2852,7 +2864,9 @@ const deliveryBlockedReason = computed<string | null>(() => (
   sessionRoutingSendBlockedReason.value || liveSendBlockedReason.value
 ))
 const sessionInteractivityBlockedReason = computed<string | null>(() => (
-  isCronSession.value ? t('chat.cronSessionReadOnly') : null
+  isCronSession.value
+    ? t('chat.cronSessionReadOnly')
+    : sessionPolicyPending.value ? t('chat.loadingSession') : null
 ))
 const effectiveSendBlockedReason = computed<string | null>(() => (
   sessionInteractivityBlockedReason.value
@@ -3033,7 +3047,7 @@ const metaSkillSetup = useMetaSkillSetup({
   forgetHiddenControl: (draftSessionKey: string, clientRequestId: string) => {
     forgetHiddenControlOutbox(draftSessionKey, clientRequestId)
   },
-  turnActionsBlocked: () => isCronSession.value,
+  turnActionsBlocked: () => turnActionsBlocked.value,
 })
 const {
   setupState,
@@ -3275,6 +3289,7 @@ const chatSlashCommands = useChatSlashCommands({
   ),
   restoreDraft: restoreMetaLaunchDraft,
   requestMetaSetup,
+  turnActionsBlocked: () => turnActionsBlocked.value,
   dispatchPlanPrompt: (prompt: string, composerText: string) => {
     dispatchPlanComposerPrompt(prompt, composerText)
   },
@@ -4233,7 +4248,7 @@ const metaRuns = useMetaRuns({
   // focus) so the vanilla guidance is not silently dropped.
   setComposerPlaceholder: (hint: string) => pushToast(hint, { duration: 6000 }),
   focusComposer: () => composerRef.value?.focusTextarea(),
-  turnActionsBlocked: () => isCronSession.value,
+  turnActionsBlocked: () => turnActionsBlocked.value,
   pushToast,
 })
 
@@ -4505,7 +4520,7 @@ const planCardPendingAction = computed<PlanCardAction | null>(() => {
     : null
 })
 const planActionsDisabled = computed(() =>
-  isCronSession.value
+  turnActionsBlocked.value
   || isStreaming.value
   || planModeBusy.value
   || Boolean(liveSendBlockedReason.value)
@@ -4648,17 +4663,17 @@ const sendButtonTitle = computed(() => {
 })
 
 function implementCurrentPlan(target: PlanCardActionTarget) {
-  if (isCronSession.value || liveSendBlockedReason.value) return
+  if (turnActionsBlocked.value || liveSendBlockedReason.value) return
   void chatPlans.implement(target, false)
 }
 
 function implementPlanInNewTask(target: PlanCardActionTarget) {
-  if (isCronSession.value || liveSendBlockedReason.value) return
+  if (turnActionsBlocked.value || liveSendBlockedReason.value) return
   void chatPlans.implement(target, true)
 }
 
 function beginPlanRevision(target: PlanCardActionTarget) {
-  if (isCronSession.value) return
+  if (turnActionsBlocked.value) return
   if (pendingAttachments.value.length > 0) {
     pushToast(t('chat.plan.attachmentsUnavailable'), { tone: 'warn' })
     return
@@ -5536,7 +5551,7 @@ async function returnToForkParent() {
 }
 
 async function forkConversation(throughTurnId?: string) {
-  if (isCronSession.value) return
+  if (turnActionsBlocked.value) return
   const parentKey = sessionKey.value
   if (!parentKey || forkTransition.value) return
   if (pendingSessionIntent.value === 'new_chat' || isStreaming.value) return
@@ -6271,7 +6286,7 @@ function dragEventHasFiles(e: DragEvent): boolean {
 function onChatDragEnter(e: DragEvent) {
   if (!dragEventHasFiles(e)) return
   e.preventDefault()
-  if (isCronSession.value || replanActive.value) {
+  if (turnActionsBlocked.value || replanActive.value) {
     if (e.dataTransfer) e.dataTransfer.dropEffect = 'none'
     return
   }
@@ -6282,7 +6297,7 @@ function onChatDragEnter(e: DragEvent) {
 function onChatDragOver(e: DragEvent) {
   if (!dragEventHasFiles(e)) return
   e.preventDefault()
-  if (isCronSession.value || replanActive.value) {
+  if (turnActionsBlocked.value || replanActive.value) {
     if (e.dataTransfer) e.dataTransfer.dropEffect = 'none'
     return
   }
@@ -6303,7 +6318,7 @@ function onChatDrop(e: DragEvent) {
   threadDragDepth.value = 0
   threadDragOver.value = false
   if (!dragEventHasFiles(e)) return
-  if (isCronSession.value) {
+  if (turnActionsBlocked.value) {
     if (e.dataTransfer) e.dataTransfer.dropEffect = 'none'
     return
   }
@@ -6326,7 +6341,7 @@ function autoResizeTextarea() {
 /* ── Clipboard paste ───────────────────────────────────────────────── */
 
 function onDocumentPaste(e: ClipboardEvent) {
-  if (isCronSession.value) return
+  if (turnActionsBlocked.value) return
   // Pastes aimed at another editable surface (clarify/approval inputs, the
   // command palette) or at an open dialog keep their default behavior — only
   // composer-bound pastes claim clipboard files, mirroring onDocumentKeydown.
@@ -6843,6 +6858,7 @@ onUnmounted(() => {
   chatViewActive = false
   appStore.setChatLivePhase('idle')
   chatViewDisposed = true
+  sessionInteractivity.dispose()
   forkTransitionLifetime.dispose()
   forkTransition.value = null
   durableRecoveryGeneration += 1

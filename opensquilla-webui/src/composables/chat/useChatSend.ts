@@ -4309,7 +4309,18 @@ export function useChatSend(options: UseChatSendOptions) {
     const skipped = new Set(skipClientRequestIds)
     for (const item of listHiddenControls(targetSessionKey, options.hiddenControlStorage)) {
       if (!isCurrent() || options.sessionKey.value !== targetSessionKey) return
-      if (skipped.has(item.clientRequestId)) continue
+      const receiptOnlyRecovery = Boolean(options.sessionInteractivityBlockedReason?.value)
+        && hiddenControlReceiptReplayEligible(
+          targetSessionKey,
+          item.clientRequestId,
+          options.noninteractiveReceiptReplay?.value === true,
+          options.hiddenControlStorage,
+        )
+      // An active setup normally owns its matching server draft. In a read-only
+      // session that owner cannot launch, so an already-attempted browser copy
+      // must still reconcile the exact Gateway receipt. Fresh controls remain
+      // skipped and cannot turn this recovery path into a new Cron turn.
+      if (skipped.has(item.clientRequestId) && !receiptOnlyRecovery) continue
       const result = await dispatchHiddenSend(
         item.providerText,
         item.displayText,

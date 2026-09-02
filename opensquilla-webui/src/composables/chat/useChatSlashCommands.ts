@@ -121,6 +121,8 @@ export interface UseChatSlashCommandsOptions {
     launchText: string,
     clientRequestId?: string,
   ) => void | 'visible' | 'deferred' | Promise<void | 'visible' | 'deferred'>
+  /** Permanent selected-session policy gate for Meta launch and recovery work. */
+  turnActionsBlocked?: () => boolean
   // Send the optional text after "/plan" through the normal composer path so
   // attachments, intent, optimistic rendering, and retry restoration are kept.
   dispatchPlanPrompt: (prompt: string, composerText: string) => void
@@ -304,13 +306,14 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     launchText: string
     originatingSessionKey: string
     clientRequestId: string
-  }): Promise<'accepted' | 'queued' | 'setup' | 'failed' | 'discarded'> {
+  }): Promise<'accepted' | 'queued' | 'setup' | 'failed' | 'discarded' | 'blocked'> {
     const {
       skillName,
       launchText,
       originatingSessionKey,
       clientRequestId,
     } = input
+    if (options.turnActionsBlocked?.() === true) return 'blocked'
     const retainStableRetry = async (error: string): Promise<void> => {
       if (options.requestMetaSetup) {
         try {
@@ -346,6 +349,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
         clientRequestId,
         launchText,
       })
+      if (options.turnActionsBlocked?.() === true) return 'blocked'
       if (result?.ok) {
         const dispatchResult = await options.dispatchHidden(
           launchText,
@@ -440,6 +444,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
         || !draft.launchText
         || !/^\S{1,256}$/.test(draft.clientRequestId)
       ) continue
+      if (options.turnActionsBlocked?.() === true) return attemptedRequestIds
       attemptedRequestIds.push(draft.clientRequestId)
       const outcome = await runMetaInvocation({
         skillName: draft.name,

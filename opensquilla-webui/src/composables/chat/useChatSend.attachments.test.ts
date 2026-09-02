@@ -2231,6 +2231,66 @@ describe('useChatSend attachment payloads', () => {
     }))
   })
 
+  it('reconciles an attempted hidden receipt even when a completed setup job owns the draft', async () => {
+    const hiddenControlStorage = memoryStorage()
+    const sessionKey = 'cron:meta-setup:run:completed'
+    const clientRequestId = 'completed-setup-attempted-control'
+    persistHiddenControl({
+      sessionKey,
+      clientRequestId,
+      providerText: '/meta meta-paper-write -- preserved request',
+      displayText: '/meta meta-paper-write -- preserved request',
+    }, hiddenControlStorage)
+    expect(markHiddenControlDispatchAttempted(
+      sessionKey,
+      clientRequestId,
+      hiddenControlStorage,
+    )).toBe(true)
+    const policy = ref<string | null>('Cron sessions are read-only.')
+    const configured = makeOptions({
+      sessionKey: ref(sessionKey),
+      hiddenControlStorage,
+      sendBlockedReason: policy,
+      sessionInteractivityBlockedReason: policy,
+      idempotentReplayBlockedReason: ref(null),
+    })
+
+    await configured.api.restoreHiddenControls(sessionKey, [clientRequestId])
+
+    expect(configured.rpc.call).toHaveBeenCalledOnce()
+    expect(configured.rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      clientRequestId,
+      message: '/meta meta-paper-write -- preserved request',
+    }))
+  })
+
+  it('does not turn a setup-owned unattempted hidden control into a new Cron turn', async () => {
+    const hiddenControlStorage = memoryStorage()
+    const sessionKey = 'cron:meta-setup:run:completed'
+    const clientRequestId = 'completed-setup-fresh-control'
+    persistHiddenControl({
+      sessionKey,
+      clientRequestId,
+      providerText: '/meta meta-paper-write -- fresh request',
+      displayText: '/meta meta-paper-write -- fresh request',
+    }, hiddenControlStorage)
+    const policy = ref<string | null>('Cron sessions are read-only.')
+    const configured = makeOptions({
+      sessionKey: ref(sessionKey),
+      hiddenControlStorage,
+      sendBlockedReason: policy,
+      sessionInteractivityBlockedReason: policy,
+      idempotentReplayBlockedReason: ref(null),
+    })
+
+    await configured.api.restoreHiddenControls(sessionKey, [clientRequestId])
+
+    expect(configured.rpc.call).not.toHaveBeenCalled()
+    expect(listHiddenControls(sessionKey, hiddenControlStorage)).toEqual([
+      expect.objectContaining({ clientRequestId, dispatchAttempted: false }),
+    ])
+  })
+
   it('auto-drains one attempted hidden receipt replay through the session policy', async () => {
     vi.useFakeTimers()
     const sessionKey = ref('agent:main:webchat:test')

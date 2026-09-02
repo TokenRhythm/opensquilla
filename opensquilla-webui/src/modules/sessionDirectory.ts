@@ -1,4 +1,4 @@
-import type { InjectionKey } from 'vue'
+import type { InjectionKey, Ref } from 'vue'
 
 export interface SessionItem {
   key: string
@@ -11,6 +11,8 @@ export interface SessionItem {
   workspaceDisplayPath?: string
   effectiveAgentId: string
   sessionKind: string
+  /** Null/undefined means an older Gateway did not publish this authority. */
+  interactive?: boolean | null
   surface: string
   conversationKind: string
   status: string
@@ -92,3 +94,7 @@ export interface SessionDirectory {
 }
 
 export const SESSION_DIRECTORY_KEY: InjectionKey<SessionDirectory> = Symbol('SessionDirectory')
+
+/** Reactive authoritative rows already loaded by the application shell. */
+export const SESSION_DIRECTORY_ITEMS_KEY: InjectionKey<Readonly<Ref<readonly SessionItem[]>>> =
+  Symbol('SessionDirectoryItems')

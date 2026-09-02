@@ -54,6 +54,22 @@ describe('v4 SessionDirectory Adapter', () => {
     expect(isCronSessionKey('agent:main:webchat:one')).toBe(false)
   })
 
+  it('preserves authoritative interactivity for a noncanonical legacy Cron row', () => {
+    expect(normalizeV4SessionItem({
+      key: 'legacy-scheduled-run',
+      sessionKind: 'cron',
+      interactive: false,
+    })).toMatchObject({
+      key: 'legacy-scheduled-run',
+      sessionKind: 'cron',
+      interactive: false,
+    })
+    expect(normalizeV4SessionItem({
+      key: 'agent:main:webchat:ordinary',
+      sessionKind: 'chat',
+    })?.interactive).toBeNull()
+  })
+
   it('uses the pinned legacy Gateway wire without requiring a new envelope', async () => {
     const request = fixtureCase('requests.json', 'request.page-first')
     const response = fixtureCase('responses.json', 'response.empty-page')
