@@ -1,6 +1,9 @@
 import { computed, ref, watch } from 'vue'
 
-import type { SandboxRuntime } from '@/modules/sandboxRuntime'
+import type {
+  SandboxChatRuntime,
+  SandboxRunModePreference,
+} from '@/modules/sandboxRuntime'
 import {
   SANDBOX_RUN_MODES,
   isRecognizedSandboxRunMode,
@@ -18,7 +21,7 @@ export interface RunModePolicy {
 
 interface UseChatRunModePreferenceOptions {
   runModePolicy: () => RunModePolicy | null | undefined
-  sandbox: Pick<SandboxRuntime, 'runModePreference' | 'setRunMode'>
+  sandbox: Pick<SandboxChatRuntime, 'preference' | 'selectMode'>
 }
 
 function availableStorage(): Storage | null {
@@ -137,19 +140,11 @@ export function useChatRunModePreference(options: UseChatRunModePreferenceOption
     return next
   }
 
-  function modeFromPayload(payload: unknown): unknown {
-    if (!payload || typeof payload !== 'object') return undefined
-    return (payload as Record<string, unknown>).runMode
-  }
-
   async function hydrateRunModePreference(): Promise<SandboxRunMode> {
-    const payload = await options.sandbox.runModePreference({ timeoutMs: 10_000 })
-    const source = payload && typeof payload === 'object'
-      ? (payload as Record<string, unknown>).source
-      : null
+    const preference = await options.sandbox.preference({ timeoutMs: 10_000 })
     return applyConfirmedPreference(
-      modeFromPayload(payload),
-      { selected: source === 'preference' },
+      preference.runMode,
+      { selected: preference.source === 'preference' },
     )
   }
 
@@ -168,10 +163,10 @@ export function useChatRunModePreference(options: UseChatRunModePreferenceOption
     runModeUserSelected.value = true
 
     try {
-      const payload = await options.sandbox.setRunMode(requested, { timeoutMs: 5_000 })
+      const preference = await options.sandbox.selectMode(requested, { timeoutMs: 5_000 })
       if (sequence !== writeSequence) return runMode.value
       return applyConfirmedPreference(
-        modeFromPayload(payload),
+        preference.runMode,
         { selected: true },
       )
     } catch (cause) {
@@ -183,9 +178,11 @@ export function useChatRunModePreference(options: UseChatRunModePreferenceOption
     }
   }
 
-  function applyRunModePreferenceChanged(payload: unknown): SandboxRunMode {
+  function applyRunModePreferenceChanged(
+    preference: SandboxRunModePreference,
+  ): SandboxRunMode {
     return applyConfirmedPreference(
-      modeFromPayload(payload),
+      preference.runMode,
       { selected: true },
     )
   }
