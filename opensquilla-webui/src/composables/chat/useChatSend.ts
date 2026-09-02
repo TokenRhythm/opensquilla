@@ -3596,6 +3596,10 @@ export function useChatSend(options: UseChatSendOptions) {
   ) {
     if (attachments.length === 0) return
     const additions: Array<{ attachment: SendableAttachment, owner: string }> = []
+    const usedLocalIds = new Set(
+      options.pendingAttachments.value.map(attachment => attachment.local_id),
+    )
+    let nextRecoveredLocalId = -1
     for (const [index, attachment] of attachments.entries()) {
       const owner = responseHandoffAttachmentOwner(ownerRequestId, index)
       const current = options.pendingAttachments.value.find(candidate => (
@@ -3607,7 +3611,14 @@ export function useChatSend(options: UseChatSendOptions) {
       if (current) {
         responseHandoffAttachmentOwners.set(current, owner)
       } else {
-        additions.push({ attachment, owner })
+        let restored = attachment
+        if (usedLocalIds.has(restored.local_id)) {
+          while (usedLocalIds.has(nextRecoveredLocalId)) nextRecoveredLocalId -= 1
+          restored = { ...restored, local_id: nextRecoveredLocalId }
+          nextRecoveredLocalId -= 1
+        }
+        usedLocalIds.add(restored.local_id)
+        additions.push({ attachment: restored, owner })
       }
     }
     if (additions.length > 0) {

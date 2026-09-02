@@ -101,6 +101,8 @@ export interface PendingQueueOwner {
 
 export interface PendingCancelOptions {
   retainAfterCancel?: boolean
+  /** Internal post-restore cleanup must not invalidate sibling restores. */
+  invalidateRestore?: boolean
 }
 
 export interface PendingQueueOwnerContext {
@@ -380,6 +382,16 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     Object.assign(item, itemFromWalRecord(record))
   }
 
+  function walRecordOwnsItem(
+    record: PendingInputWalRecord,
+    item: ChatPendingItem,
+    sessionKey: string,
+  ): boolean {
+    return queueSessionKey(record.sessionKey) === queueSessionKey(sessionKey)
+      && record.clientRequestId === item.pendingClientRequestId
+      && record.clientMessageId === item.pendingClientMessageId
+  }
+
   function removedIdentity(sessionKey: string, pendingInputId: string): string {
     return `${queueSessionKey(sessionKey)}\u0000${pendingInputId}`
   }
@@ -469,6 +481,53 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     }
   }
 
+  async function writeStagingWalItem(
+    item: ChatPendingItem,
+    state: PendingInputWalState,
+    sessionKey: string,
+  ): Promise<boolean> {
+    const pendingInputId = item.pendingInputId
+    const wal = options.pendingInputWal
+    if (
+      !pendingInputId
+      || !wal
+      || wasRemoved(sessionKey, pendingInputId)
+      || item.pendingPersistenceState === 'cancelling'
+      || item.pendingRetainAfterCancel === true
+    ) return false
+    if (!wal.compareAndSwapPendingInput) {
+      await writeWalItem(item, state)
+      return !wasRemoved(sessionKey, pendingInputId)
+    }
+    const expectedWalRevision = item.pendingWalRevision ?? 1
+    const mutation = await wal.compareAndSwapPendingInput(
+      {
+        ...walRecordForItem(item, state),
+        walRevision: expectedWalRevision + 1,
+      },
+      expectedWalRevision,
+      walLookupSessionKeys(sessionKey),
+    )
+    if (mutation.applied) {
+      item.pendingPersistenceState = mutation.record!.state
+      item.pendingWalRevision = mutation.record!.walRevision
+      return true
+    }
+    if (!mutation.record) {
+      rememberRemoval(sessionKey, pendingInputId)
+      removePendingIdentity(sessionKey, pendingInputId)
+      return false
+    }
+    if (walRecordOwnsItem(mutation.record, item, sessionKey)) {
+      replaceItemFromWalRecord(item, mutation.record)
+      if (
+        mutation.record.state === 'cancelling'
+        && mutation.record.retainAfterCancel !== true
+      ) rememberRemoval(sessionKey, pendingInputId)
+    }
+    return false
+  }
+
   function ordinaryDurableItem(item: ChatPendingItem): boolean {
     return Boolean(
       item.pendingInputId
@@ -535,7 +594,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const operation = (async () => {
       if (wasRemoved(sessionKey, pendingInputId)) return
       if (!supportsServerQueue()) {
-        await writeWalItem(item, 'local_only')
+        await writeStagingWalItem(item, 'local_only', sessionKey)
         return
       }
       let refreshedLostUpload = false
@@ -550,19 +609,24 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
               )),
               ownership: 'detached',
             })
+            if (
+              wasRemoved(sessionKey, pendingInputId)
+              || item.pendingPersistenceState === 'cancelling'
+              || item.pendingRetainAfterCancel === true
+            ) return
             if (!ready) {
-              await writeWalItem(item, 'retryable')
+              if (!await writeStagingWalItem(item, 'retryable', sessionKey)) return
               options.onPendingPersistenceError?.('server_rejected')
               return
             }
             // Persist refreshed upload UUIDs before the request can become
             // ambiguous. A reload then retries the same material snapshot.
-            await writeWalItem(item, 'saving')
+            if (!await writeStagingWalItem(item, 'saving', sessionKey)) return
           }
           if (wasRemoved(sessionKey, pendingInputId)) return
           const sendable = item.attachments.filter(isSendableAttachment)
           if (sendable.length !== item.attachments.length) {
-            await writeWalItem(item, 'retryable')
+            if (!await writeStagingWalItem(item, 'retryable', sessionKey)) return
             options.onPendingPersistenceError?.('server_rejected')
             return
           }
@@ -576,7 +640,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
             // lost ACK can then distinguish this identity from a genuinely
             // IndexedDB-only draft when the next Gateway is older/offline.
             item.pendingMayHaveServerCopy = true
-            await writeWalItem(item, 'saving')
+            if (!await writeStagingWalItem(item, 'saving', sessionKey)) return
             const response = await pendingInputQueue!.enqueue({
                 key: queueSessionKey(item.ownerSessionKey),
                 pendingInputId,
@@ -618,7 +682,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
             // Drop base64, File objects and expiring upload capabilities from
             // IndexedDB; dispatch now needs only the stable pending identity.
             item.attachments = item.attachments.map(durableAttachmentMetadata)
-            await writeWalItem(item, 'staged')
+            if (!await writeStagingWalItem(item, 'staged', sessionKey)) return
             flushDeferredPendingDrain()
             return
           } catch (error) {
@@ -656,19 +720,25 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           broadcastChange(sessionKey, pendingInputId, 'removed')
           return
         }
+        if (
+          wasRemoved(sessionKey, pendingInputId)
+          || item.pendingPersistenceState === 'cancelling'
+          || item.pendingRetainAfterCancel === true
+        ) return
         if (code === 'METHOD_NOT_FOUND') {
-          await writeWalItem(item, 'local_only')
-          flushDeferredPendingDrain()
+          if (await writeStagingWalItem(item, 'local_only', sessionKey)) {
+            flushDeferredPendingDrain()
+          }
           return
         }
         if ((error as { accepted?: unknown } | null)?.accepted === false) {
-          await writeWalItem(item, 'retryable').catch(() => {})
+          await writeStagingWalItem(item, 'retryable', sessionKey).catch(() => false)
           options.onPendingPersistenceError?.('server_rejected')
           return
         }
         // Unknown transport results deliberately remain "saving". Reconnect,
         // hydrate, or another tab retries this exact identity byte-for-byte.
-        await writeWalItem(item, 'saving').catch(() => {})
+        await writeStagingWalItem(item, 'saving', sessionKey).catch(() => false)
       }
     })().finally(() => {
       stagingOperations.delete(pendingInputId)
@@ -685,7 +755,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     )
     for (const record of records) {
       const existing = existingById.get(record.pendingInputId)
-      if (existing && record.retainAfterCancel === true) {
+      if (
+        existing
+        && (record.retainAfterCancel === true || record.state === 'cancelling')
+      ) {
         replaceItemFromWalRecord(existing, record)
         continue
       }
@@ -857,7 +930,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           ? serverItem.position
           : item.pendingPosition
         item.pendingMayHaveServerCopy = true
-        await writeWalItem(item, 'staged')
+        await writeStagingWalItem(item, 'staged', ownerSessionKey)
       }
 
       sortOrdinaryPendingItems()
@@ -1171,6 +1244,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
             walRevision: expectedWalRevision + 1,
           },
           expectedWalRevision,
+          walLookupSessionKeys(sessionKey),
         )
         if (!mutation.applied) {
           if (mutation.record) {
@@ -1182,11 +1256,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
             ) {
               forgetRemoval(sessionKey, item.pendingInputId!)
             }
-            if (
-              mutation.record.sessionKey === sessionKey
-              && mutation.record.clientRequestId === item.pendingClientRequestId
-              && mutation.record.clientMessageId === item.pendingClientMessageId
-            ) {
+            if (walRecordOwnsItem(mutation.record, item, sessionKey)) {
               replaceItemFromWalRecord(item, mutation.record)
             }
             return false
@@ -1258,6 +1328,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
               walRevision: expectedWalRevision + 1,
             },
             expectedWalRevision,
+            walLookupSessionKeys(sessionKey),
           )
           if (mutation.applied) {
             item.pendingPersistenceState = mutation.record!.state
@@ -1270,11 +1341,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
             transition = 'missing'
             break
           }
-          const sameIdentity = (
-            mutation.record.sessionKey === sessionKey
-            && mutation.record.clientRequestId === item.pendingClientRequestId
-            && mutation.record.clientMessageId === item.pendingClientMessageId
-          )
+          const sameIdentity = walRecordOwnsItem(mutation.record, item, sessionKey)
           if (
             mutation.record.state !== 'cancelling'
             || mutation.record.retainAfterCancel === true
@@ -1370,6 +1437,14 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const pendingInputId = item.pendingInputId
     if (!pendingInputId || !options.pendingInputWal) return Promise.resolve(true)
     const retainAfterCancel = cancelOptions.retainAfterCancel === true
+    if (
+      !retainAfterCancel
+      && cancelOptions.invalidateRestore !== false
+      && item.pendingRetainAfterCancel === true
+    ) {
+      invalidateCancellation(pendingInputId)
+      activeQueueLease += 1
+    }
     const existing = cancellationOperations.get(pendingInputId)
     if (existing) {
       if (!existing.retainAfterCancel || retainAfterCancel) return existing.promise
@@ -1789,6 +1864,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       ownerSessionKey: queueSessionKey(item.ownerSessionKey),
       queueLease: activeQueueLease,
       composerRevision,
+      cancellationInvalidation: item.pendingInputId
+        ? cancellationInvalidations.get(item.pendingInputId) ?? 0
+        : 0,
     },
   ) {
     void cancelDurableItem(item, { retainAfterCancel: true }).then(retained => {
@@ -1799,6 +1877,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         || queueSessionKey() !== lease.ownerSessionKey
         || activeQueueLease !== lease.queueLease
         || composerRevision !== lease.composerRevision
+        || (item.pendingInputId
+          && (cancellationInvalidations.get(item.pendingInputId) ?? 0)
+            !== lease.cancellationInvalidation)
       ) return
       const index = pendingQueue.value.indexOf(item)
       if (index < 0) return
@@ -1808,7 +1889,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       // The composer now owns the retained local-only payload. Remove its WAL
       // record without reopening a window where a navigation can restore the
       // source item into a different session's composer.
-      void cancelDurableItem(item)
+      void cancelDurableItem(item, { invalidateRestore: false })
     })
   }
 
@@ -1819,6 +1900,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       ownerSessionKey: string
       queueLease: number
       composerRevision: number
+      cancellationInvalidations: Map<string, number>
     },
   ) {
     void Promise.all(items.map(item => (
@@ -1831,6 +1913,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         || composerRevision !== lease.composerRevision
       ) return
       for (const [index, item] of items.entries()) {
+        if (
+          item.pendingInputId
+          && (cancellationInvalidations.get(item.pendingInputId) ?? 0)
+            !== (lease.cancellationInvalidations.get(item.pendingInputId) ?? 0)
+        ) break
         const queueIndex = pendingQueue.value.indexOf(item)
         if (!retainedItems[index]) {
           // A failed predecessor that still owns a queue slot is an ordering
@@ -1844,7 +1931,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         restore(item)
         lease.composerRevision = composerRevision
         // Each retained row is removed only after its ordered composer commit.
-        void cancelDurableItem(item)
+        void cancelDurableItem(item, { invalidateRestore: false })
       }
     })
   }
@@ -1973,6 +2060,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       ownerSessionKey: queueSessionKey(),
       queueLease: activeQueueLease,
       composerRevision,
+      cancellationInvalidations: new Map(durable.flatMap(item => (
+        item.pendingInputId
+          ? [[item.pendingInputId, cancellationInvalidations.get(item.pendingInputId) ?? 0]]
+          : []
+      ))),
     }
     restoreDurableItemsIntoComposerInOrder(durable, item => {
       options.inputText.value = [options.inputText.value, item.text]

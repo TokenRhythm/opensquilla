@@ -211,6 +211,46 @@ function memoryWal(initial: PendingInputWalRecord[] = []) {
   return { records, handoffs, wal }
 }
 
+function enableAtomicPendingMutations(
+  wal: PendingInputWal,
+  records: Map<string, PendingInputWalRecord>,
+) {
+  const compareAndSwap: NonNullable<PendingInputWal['compareAndSwapPendingInput']> = vi.fn(
+    async (record, expectedWalRevision, equivalentSessionKeys = []) => {
+      const current = records.get(record.pendingInputId)
+      const sessionKeys = new Set([record.sessionKey, ...equivalentSessionKeys])
+      if (
+        !current
+        || !sessionKeys.has(current.sessionKey)
+        || current.clientRequestId !== record.clientRequestId
+        || current.clientMessageId !== record.clientMessageId
+        || (current.walRevision ?? 1) !== expectedWalRevision
+      ) {
+        return {
+          applied: false,
+          record: current ? structuredClone(current) : null,
+        }
+      }
+      const updated = {
+        ...structuredClone(record),
+        walRevision: expectedWalRevision + 1,
+        updatedAt: Date.now(),
+      }
+      records.set(record.pendingInputId, updated)
+      return { applied: true, record: structuredClone(updated) }
+    },
+  )
+  wal.compareAndSwapPendingInput = compareAndSwap
+  wal.beginCancellation = vi.fn(async (record, expectedWalRevision, equivalentSessionKeys) => (
+    compareAndSwap(
+      { ...record, state: 'cancelling' },
+      expectedWalRevision,
+      equivalentSessionKeys,
+    )
+  ))
+  return compareAndSwap
+}
+
 class TestBroadcastChannel {
   static readonly channels = new Map<string, Set<TestBroadcastChannel>>()
 
@@ -659,6 +699,120 @@ describe('useChatPendingQueue delivery state', () => {
       expect(queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('staged')
     })
     queue.cleanup()
+  })
+
+  it('does not restage an attachment after removal during delayed preparation', async () => {
+    const { wal, records } = memoryWal()
+    enableAtomicPendingMutations(wal, records)
+    let markPreparationStarted!: () => void
+    let releasePreparation!: () => void
+    const preparationStarted = new Promise<void>(resolve => { markPreparationStarted = resolve })
+    const preparationGate = new Promise<void>(resolve => { releasePreparation = resolve })
+    const prepareAttachmentsForSend = vi.fn(async () => {
+      markPreparationStarted()
+      await preparationGate
+      return true
+    })
+    const rpcCall = vi.fn(async (method: string): Promise<unknown> => {
+      if (method === 'sessions.pending_inputs.list') return { items: [] }
+      if (method === 'sessions.pending_inputs.cancel') return { cancelled: true }
+      throw new Error(`unexpected method: ${method}`)
+    })
+    const rpc: LegacyQueueRpc = {
+      call: <T = unknown>(method: string, params?: Record<string, unknown>) => {
+        void params
+        return rpcCall(method) as Promise<T>
+      },
+    }
+    const { inputText, pendingAttachments, queue } = makeQueue(
+      undefined,
+      () => false,
+      undefined,
+      undefined,
+      {
+        pendingInputWal: wal,
+        rpc,
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
+        prepareAttachmentsForSend,
+      },
+    )
+    try {
+      inputText.value = 'remove during attachment preparation'
+      pendingAttachments.value = [{
+        kind: 'staged',
+        local_id: 11,
+        name: 'delayed.txt',
+        mime: 'text/plain',
+        file_uuid: 'delayed-upload',
+        file: new File(['delayed'], 'delayed.txt', { type: 'text/plain' }),
+      }]
+      await expect(queue.enqueuePendingInput(inputText.value)).resolves.toBe(true)
+      await preparationStarted
+
+      expect(queue.removePendingChip(pendingUiId(queue, 0))).toBe(true)
+      await vi.waitFor(() => expect(records.size).toBe(0))
+      releasePreparation()
+
+      await vi.waitFor(() => expect(queue.pendingQueue.value).toEqual([]))
+      expect(records.size).toBe(0)
+      expect(rpcCall.mock.calls.map(call => call[0]))
+        .not.toContain('sessions.pending_inputs.enqueue')
+    } finally {
+      queue.cleanup()
+    }
+  })
+
+  it('does not rewrite saving after removal wins an unknown enqueue response', async () => {
+    const { wal, records } = memoryWal()
+    enableAtomicPendingMutations(wal, records)
+    let markEnqueueStarted!: () => void
+    let rejectEnqueue!: (error: unknown) => void
+    const enqueueStarted = new Promise<void>(resolve => { markEnqueueStarted = resolve })
+    const enqueueResult = new Promise<never>((_resolve, reject) => { rejectEnqueue = reject })
+    const rpcCall = vi.fn((method: string): Promise<unknown> => {
+      if (method === 'sessions.pending_inputs.list') return Promise.resolve({ items: [] })
+      if (method === 'sessions.pending_inputs.cancel') {
+        return Promise.resolve({ cancelled: true })
+      }
+      if (method === 'sessions.pending_inputs.enqueue') {
+        markEnqueueStarted()
+        return enqueueResult
+      }
+      return Promise.reject(new Error(`unexpected method: ${method}`))
+    })
+    const rpc: LegacyQueueRpc = {
+      call: <T = unknown>(method: string, params?: Record<string, unknown>) => {
+        void params
+        return rpcCall(method) as Promise<T>
+      },
+    }
+    const { inputText, queue } = makeQueue(
+      undefined,
+      () => false,
+      undefined,
+      undefined,
+      {
+        pendingInputWal: wal,
+        rpc,
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
+      },
+    )
+    try {
+      inputText.value = 'remove during unknown enqueue response'
+      await expect(queue.enqueuePendingInput(inputText.value)).resolves.toBe(true)
+      await enqueueStarted
+
+      expect(queue.removePendingChip(pendingUiId(queue, 0))).toBe(true)
+      await vi.waitFor(() => expect(records.size).toBe(0))
+      rejectEnqueue(new Error('connection closed after request'))
+
+      await vi.waitFor(() => expect(queue.pendingQueue.value).toEqual([]))
+      expect(records.size).toBe(0)
+      await queue.hydratePendingQueue()
+      expect(queue.pendingQueue.value).toEqual([])
+    } finally {
+      queue.cleanup()
+    }
   })
 
   it('retries an unknown enqueue result with the same durable identities', async () => {
@@ -1986,6 +2140,67 @@ describe('useChatPendingQueue delivery state', () => {
     }
   })
 
+  it.each([
+    'editPendingItem',
+    'popAllPendingIntoComposer',
+  ] as const)(
+    'trash invalidates an in-flight %s restore before destructive cleanup',
+    async recoveryPath => {
+      const { wal, records } = memoryWal()
+      const retainCancelled = wal.retainCancelled!
+      let releaseRetain!: () => void
+      let markRetainStarted!: () => void
+      const retainStarted = new Promise<void>(resolve => { markRetainStarted = resolve })
+      const retainGate = new Promise<void>(resolve => { releaseRetain = resolve })
+      wal.retainCancelled = vi.fn(async (record, expectedWalRevision) => {
+        markRetainStarted()
+        await retainGate
+        return retainCancelled(record, expectedWalRevision)
+      })
+      const initial = makeQueue(undefined, () => false, undefined, undefined, {
+        pendingInputWal: wal,
+        hasRpcMethod: () => false,
+      })
+      try {
+        initial.inputText.value = `trash ${recoveryPath} restore`
+        await expect(initial.queue.enqueuePendingInput(initial.inputText.value))
+          .resolves.toBe(true)
+        await vi.waitFor(() => {
+          expect(initial.queue.pendingQueue.value[0]?.pendingPersistenceState)
+            .toBe('local_only')
+        })
+        const pendingId = pendingUiId(initial.queue, 0)
+
+        const restoring = recoveryPath === 'editPendingItem'
+          ? initial.queue.editPendingItem(pendingId)
+          : initial.queue.popAllPendingIntoComposer()
+        expect(restoring).toBe(true)
+        await retainStarted
+        expect(initial.queue.removePendingChip(pendingId)).toBe(true)
+        releaseRetain()
+
+        await vi.waitFor(() => {
+          expect(initial.queue.pendingQueue.value).toEqual([])
+          expect(records.size).toBe(0)
+        })
+        expect(initial.inputText.value).toBe('')
+
+        const reloaded = makeQueue(undefined, () => false, undefined, undefined, {
+          pendingInputWal: wal,
+          hasRpcMethod: () => false,
+        })
+        try {
+          await reloaded.queue.hydratePendingQueue()
+          expect(reloaded.queue.pendingQueue.value).toEqual([])
+        } finally {
+          reloaded.queue.cleanup()
+        }
+      } finally {
+        initial.queue.cleanup()
+      }
+    },
+  )
+
   it('retains delayed composer recovery in the WAL after cleanup for the next hydrate', async () => {
     const { wal, records } = memoryWal()
     const writeWal = wal.put
@@ -2121,7 +2336,7 @@ describe('useChatPendingQueue delivery state', () => {
   it('hydrates and parks a legacy alias WAL row under its canonical queue owner', async () => {
     const legacySession = 'agent:default:webchat:alias-draft'
     const canonicalSession = 'agent:main:webchat:alias-draft'
-    const { wal } = memoryWal([{
+    const { wal, records } = memoryWal([{
       schemaVersion: 1,
       pendingInputId: 'pending-alias-draft',
       sessionKey: legacySession,
@@ -2141,6 +2356,7 @@ describe('useChatPendingQueue delivery state', () => {
       createdAt: 1,
       updatedAt: 2,
     }])
+    enableAtomicPendingMutations(wal, records)
     const sessionKey = ref(canonicalSession)
     const { queue } = makeQueue(undefined, () => false, undefined, undefined, {
       sessionKey,
@@ -2166,6 +2382,17 @@ describe('useChatPendingQueue delivery state', () => {
         pendingInputId: 'pending-alias-draft',
         ownerSessionKey: canonicalSession,
       }])
+
+      expect(queue.editPendingItem(pendingUiId(queue, 0))).toBe(true)
+      await vi.waitFor(() => {
+        expect(queue.pendingQueue.value).toEqual([])
+        expect(records.size).toBe(0)
+      })
+      expect(wal.beginCancellation).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionKey: canonicalSession }),
+        1,
+        expect.arrayContaining([legacySession, canonicalSession]),
+      )
     } finally {
       queue.cleanup()
     }
@@ -2347,6 +2574,88 @@ describe('useChatPendingQueue delivery state', () => {
       || method === 'sessions.pending_inputs.cancel'
     ))).toBe(true)
     queue.cleanup()
+  })
+
+  it('does not let an in-flight server hydrate overwrite a peer cancellation tombstone', async () => {
+    const pendingInputId = 'pending-peer-cancel-during-hydrate'
+    const initialRecord: PendingInputWalRecord = {
+      schemaVersion: 1,
+      pendingInputId,
+      sessionKey: 'agent:main:webchat:test',
+      clientRequestId: 'request-peer-cancel-during-hydrate',
+      clientMessageId: 'message-peer-cancel-during-hydrate',
+      text: 'peer cancellation must win',
+      attachments: [],
+      intent: null,
+      state: 'staged',
+      mayHaveServerCopy: true,
+      requestFingerprint: 'sha256:peer-cancel-during-hydrate',
+      serverRevision: 4,
+      walRevision: 1,
+      createdAt: 1,
+      updatedAt: 2,
+    }
+    const { wal, records } = memoryWal([initialRecord])
+    enableAtomicPendingMutations(wal, records)
+    let markListStarted!: () => void
+    let releaseList!: () => void
+    const listStarted = new Promise<void>(resolve => { markListStarted = resolve })
+    const listGate = new Promise<void>(resolve => { releaseList = resolve })
+    const pendingInputQueue: PendingInputQueuePort = {
+      supportsQueue: () => true,
+      supportsReorder: () => false,
+      enqueue: vi.fn(async () => ({
+        requestFingerprint: initialRecord.requestFingerprint!,
+        revision: 4,
+        position: 0,
+      })),
+      list: vi.fn(async () => {
+        markListStarted()
+        await listGate
+        return [{
+          pendingInputId,
+          clientRequestId: initialRecord.clientRequestId,
+          clientMessageId: initialRecord.clientMessageId,
+          message: initialRecord.text,
+          position: 0,
+          revision: 4,
+          requestFingerprint: initialRecord.requestFingerprint!,
+        }]
+      }),
+      cancel: vi.fn(async () => {
+        throw new Error('keep the tombstone for inspection')
+      }),
+      reorder: vi.fn(async () => ({ items: [] })),
+    }
+    const { queue } = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      pendingInputQueue,
+    })
+    try {
+      await listStarted
+      records.set(pendingInputId, {
+        ...initialRecord,
+        state: 'cancelling',
+        walRevision: 2,
+        updatedAt: 3,
+      })
+      releaseList()
+
+      await vi.waitFor(() => {
+        expect(queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('cancelling')
+      })
+      expect(records.get(pendingInputId)).toMatchObject({
+        state: 'cancelling',
+        walRevision: 2,
+      })
+      expect(wal.compareAndSwapPendingInput).toHaveBeenCalledWith(
+        expect.objectContaining({ state: 'staged' }),
+        1,
+        expect.any(Array),
+      )
+    } finally {
+      queue.cleanup()
+    }
   })
 
   it('retains a reclassified draft when the cancel acknowledgement is lost', async () => {

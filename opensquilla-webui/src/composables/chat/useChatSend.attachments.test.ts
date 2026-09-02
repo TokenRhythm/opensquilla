@@ -3428,6 +3428,44 @@ describe('useChatSend attachment payloads', () => {
     expect(pendingForkBeforeMessageId.value).toBeNull()
   })
 
+  it('re-keys a rejected attempt attachment that collides with a newer draft', async () => {
+    const attempted: Attachment = {
+      kind: 'staged',
+      local_id: 1,
+      name: 'attempted.pdf',
+      mime: 'application/pdf',
+      file_uuid: 'file-attempted',
+    }
+    const newer: Attachment = {
+      kind: 'staged',
+      local_id: 1,
+      name: 'newer.pdf',
+      mime: 'application/pdf',
+      file_uuid: 'file-newer',
+    }
+    let rejectSend!: (error: unknown) => void
+    const rpc = {
+      call: vi.fn(() => new Promise<never>((_resolve, reject) => { rejectSend = reject })),
+    }
+    const inputText = ref('attempt this send')
+    const pendingAttachments = ref<Attachment[]>([attempted])
+    const { api } = makeOptions({ rpc, inputText, pendingAttachments })
+
+    const sending = api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalled())
+    inputText.value = 'newer composer draft'
+    pendingAttachments.value = [newer]
+    rejectSend(Object.assign(new Error('database busy'), { accepted: false }))
+    await sending
+
+    expect(pendingAttachments.value.map(attachment => attachment.name))
+      .toEqual(['attempted.pdf', 'newer.pdf'])
+    expect(pendingAttachments.value.map(attachment => attachment.local_id))
+      .toEqual([-1, 1])
+    expect(new Set(pendingAttachments.value.map(attachment => attachment.local_id)).size)
+      .toBe(2)
+  })
+
   it('moves an ambiguous v2 steer into an exact-id retry instead of resending as follow-up', async () => {
     const inputText = ref('steer this exact turn')
     const rpc = {

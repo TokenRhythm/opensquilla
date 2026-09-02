@@ -318,6 +318,52 @@ describe('BrowserPendingInputWal atomic mutations', () => {
     wal!.close()
   })
 
+  it('acquires and retains a canonical cancellation from a legacy alias row', async () => {
+    const factory = new ControlledIdbFactory()
+    const wal = createPendingInputWal(factory.idbFactory)
+    expect(wal).not.toBeNull()
+    const legacySession = 'agent:default:webchat:cancel-alias'
+    const canonicalSession = 'agent:main:webchat:cancel-alias'
+    const legacy: PendingInputWalRecord = {
+      schemaVersion: 1,
+      pendingInputId: 'pending-cancel-alias',
+      sessionKey: legacySession,
+      clientRequestId: 'request-cancel-alias',
+      clientMessageId: 'message-cancel-alias',
+      text: 'cancel the legacy alias row',
+      attachments: [],
+      intent: null,
+      state: 'local_only',
+      mayHaveServerCopy: false,
+      walRevision: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    const cancelling = {
+      ...legacy,
+      sessionKey: canonicalSession,
+      state: 'cancelling' as const,
+      retainAfterCancel: true,
+      walRevision: 2,
+    }
+    await wal!.put(legacy)
+
+    await expect(wal!.beginCancellation!(cancelling, 1, [legacySession]))
+      .resolves.toMatchObject({
+        applied: true,
+        record: { sessionKey: canonicalSession, state: 'cancelling', walRevision: 2 },
+      })
+    await expect(wal!.retainCancelled!({
+      ...cancelling,
+      state: 'local_only',
+      walRevision: 3,
+    }, 2, [legacySession])).resolves.toMatchObject({
+      applied: true,
+      record: { sessionKey: canonicalSession, state: 'local_only', walRevision: 3 },
+    })
+    wal!.close()
+  })
+
   it('does not retain a cancelled draft after another owner deletes its WAL row', async () => {
     const factory = new ControlledIdbFactory()
     const wal = createPendingInputWal(factory.idbFactory)

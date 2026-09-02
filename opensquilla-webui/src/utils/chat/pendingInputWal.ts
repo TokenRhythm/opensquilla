@@ -94,11 +94,19 @@ export interface PendingInputWal {
   beginCancellation?: (
     record: PendingInputWalRecord,
     expectedWalRevision: number,
+    equivalentSessionKeys?: string[],
   ) => Promise<PendingInputWalMutation>
   /** Convert one cancelling tombstone into a retained local draft only while its exact WAL revision still owns the row. */
   retainCancelled?: (
     record: PendingInputWalRecord,
     expectedWalRevision: number,
+    equivalentSessionKeys?: string[],
+  ) => Promise<PendingInputWalMutation>
+  /** Replace a live pending row only while its exact identity and WAL revision still match. */
+  compareAndSwapPendingInput?: (
+    record: PendingInputWalRecord,
+    expectedWalRevision: number,
+    equivalentSessionKeys?: string[],
   ) => Promise<PendingInputWalMutation>
   commitOrder?: (
     sessionKey: string,
@@ -343,6 +351,7 @@ class BrowserPendingInputWal implements PendingInputWal {
   async beginCancellation(
     record: PendingInputWalRecord,
     expectedWalRevision: number,
+    equivalentSessionKeys: string[] = [],
   ): Promise<PendingInputWalMutation> {
     const database = await this.database()
     const transaction = database.transaction(STORE_NAME, 'readwrite')
@@ -350,7 +359,7 @@ class BrowserPendingInputWal implements PendingInputWal {
     const raw = await requestResult(store.get(record.pendingInputId))
     if (
       !isPendingInputWalRecord(raw)
-      || raw.sessionKey !== record.sessionKey
+      || !new Set([record.sessionKey, ...equivalentSessionKeys]).has(raw.sessionKey)
       || raw.clientRequestId !== record.clientRequestId
       || raw.clientMessageId !== record.clientMessageId
       || (raw.walRevision ?? 1) !== expectedWalRevision
@@ -375,6 +384,7 @@ class BrowserPendingInputWal implements PendingInputWal {
   async retainCancelled(
     record: PendingInputWalRecord,
     expectedWalRevision: number,
+    equivalentSessionKeys: string[] = [],
   ): Promise<PendingInputWalMutation> {
     const database = await this.database()
     const transaction = database.transaction(STORE_NAME, 'readwrite')
@@ -382,7 +392,7 @@ class BrowserPendingInputWal implements PendingInputWal {
     const raw = await requestResult(store.get(record.pendingInputId))
     if (
       !isPendingInputWalRecord(raw)
-      || raw.sessionKey !== record.sessionKey
+      || !new Set([record.sessionKey, ...equivalentSessionKeys]).has(raw.sessionKey)
       || raw.clientRequestId !== record.clientRequestId
       || raw.clientMessageId !== record.clientMessageId
       || raw.state !== 'cancelling'
@@ -405,6 +415,38 @@ class BrowserPendingInputWal implements PendingInputWal {
     store.put(retained)
     await transactionDone(transaction)
     return { applied: true, record: retained }
+  }
+
+  async compareAndSwapPendingInput(
+    record: PendingInputWalRecord,
+    expectedWalRevision: number,
+    equivalentSessionKeys: string[] = [],
+  ): Promise<PendingInputWalMutation> {
+    const database = await this.database()
+    const transaction = database.transaction(STORE_NAME, 'readwrite')
+    const store = transaction.objectStore(STORE_NAME)
+    const raw = await requestResult(store.get(record.pendingInputId))
+    if (
+      !isPendingInputWalRecord(raw)
+      || !new Set([record.sessionKey, ...equivalentSessionKeys]).has(raw.sessionKey)
+      || raw.clientRequestId !== record.clientRequestId
+      || raw.clientMessageId !== record.clientMessageId
+      || (raw.walRevision ?? 1) !== expectedWalRevision
+    ) {
+      await transactionDone(transaction)
+      return {
+        applied: false,
+        record: isPendingInputWalRecord(raw) ? cloneRecord(raw) : null,
+      }
+    }
+    const updated = cloneRecord({
+      ...record,
+      walRevision: expectedWalRevision + 1,
+      updatedAt: Date.now(),
+    })
+    store.put(updated)
+    await transactionDone(transaction)
+    return { applied: true, record: updated }
   }
 
   async list(sessionKey: string): Promise<PendingInputWalRecord[]> {
