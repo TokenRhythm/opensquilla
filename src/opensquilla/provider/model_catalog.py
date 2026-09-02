@@ -69,7 +69,9 @@ class _TokenRhythmSnapshotSidecars:
 # model-metadata layer (live catalog, models.dev snapshot, packaged static
 # fallback), "default" is a hardcoded engine default.
 MaxTokensSource = Literal["override", "catalog", "default"]
-ContextWindowSource = Literal["override", "catalog", "default"]
+ContextWindowSource = Literal[
+    "override", "config", "catalog", "inferred", "default"
+]
 
 # Local runtimes (Ollama, …) have unqualified model ids that miss the catalog
 # and the packaged corrections, so the 200k cloud default would make the turn
@@ -313,9 +315,12 @@ def _infer_context_window_from_model_id(model_id: str) -> int:
         return _INFERENCE_WINDOW_SMALL if params_billion < _PARAM_SMALL_THRESHOLD else _INFERENCE_WINDOW_FLASH
 
     # 2) Naming-convention suffix: flash / pro / plus / max at the very end.
-    for suffix in _LARGE_MODEL_SUFFIXES:
-        if mid.endswith(suffix):
-            return _INFERENCE_WINDOW_FLASH
+    #    Version-trailing ids like "gemini-2.5-plus-preview" keep the tier
+    #    token anywhere in the trailing segment, so match on any hyphen-
+    #    separated token instead of only the strict end.
+    tokens = [t for t in mid.replace("_", "-").split("-") if t]
+    if any(t in _LARGE_MODEL_SUFFIXES for t in tokens):
+        return _INFERENCE_WINDOW_FLASH
 
     return 0
 
@@ -1677,13 +1682,24 @@ class ModelCatalog:
         budgets = _corrections_budget_fallback(model_id)
         if budgets is not None and budgets[1] > 0:
             return budgets[1], "catalog"
+        # Profile-scoped default window (``[llm_profiles.<id>].context_window_tokens``)
+        # — an explicit operator value for the whole profile deployment, more
+        # specific than the global llm.context_window_tokens and trusted by the
+        # ensemble member budget rebinding ("config" source).
+        profile_window = self._profile_default_windows.get(provider_id)
+        if profile_window and int(profile_window) > 0:
+            return int(profile_window), "config"
         # Custom / unknown endpoint without any catalog data — infer from the
-        # model-id naming convention.  This gives operators a sensible starting
-        # point instead of the cloud-fallback default.  Only activates when no
-        # catalog layer resolved anything; if catalog *did* resolve, trust it.
-        inferred = _infer_context_window_from_model_id(model_id)
-        if inferred > 0:
-            return inferred, "default"
+        # model-id naming convention.  Only for non-local providers: an
+        # unqualified local id ("llama3:3b") must keep the conservative runtime
+        # window, never a cloud-scale guessed one.
+        if not (
+            provider
+            and str(provider).strip().lower() in LOCAL_RUNTIME_PROVIDERS
+        ):
+            inferred = _infer_context_window_from_model_id(model_id)
+            if inferred > 0:
+                return inferred, "inferred"
         if provider and provider.strip().lower() in LOCAL_RUNTIME_PROVIDERS:
             return _LOCAL_CONTEXT_WINDOW, "default"
         return DEFAULT_CONTEXT_WINDOW, "default"

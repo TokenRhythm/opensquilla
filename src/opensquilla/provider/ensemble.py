@@ -6844,7 +6844,8 @@ def _runtime_member_request_budget_bindings(
         reliable_context = (
             context_window is not None
             and context_window > 0
-            and context_source in {"override", "config", "catalog"}
+            and context_source
+            in {"override", "config", "catalog", "inferred"}
         )
         bindings[key] = _MemberRequestBudgetBinding(
             context_window_tokens=context_window,
