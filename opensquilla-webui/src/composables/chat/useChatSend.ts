@@ -1335,12 +1335,11 @@ export function useChatSend(options: UseChatSendOptions) {
   async function settleRecoveredAcceptance(
     attempt: SendAttempt,
     response: TurnSendResponse,
+    forceBackground = false,
   ): Promise<boolean> {
     const acceptedSessionKey = response.sessionKey || attempt.requestSessionKey
-    let responseOwnsVisibleTranscript = !recoveredAttemptHasUnrelatedComposer(
-      attempt,
-      captureComposerSnapshot(),
-    )
+    let responseOwnsVisibleTranscript = !forceBackground
+      && !recoveredAttemptHasUnrelatedComposer(attempt, captureComposerSnapshot())
       && acceptedSessionKey === attempt.requestSessionKey
       && validateAttemptMessageEditTranscript(attempt)
     acknowledgeAttemptPromptAnnotations(attempt, response, responseOwnsVisibleTranscript)
@@ -1417,6 +1416,43 @@ export function useChatSend(options: UseChatSendOptions) {
     return abortRecoveredAcceptedTask(attempt)
   }
 
+  function attemptOwnsVisibleReceipt(attempt: SendAttempt): boolean {
+    return options.sessionKey.value === attempt.requestSessionKey
+      && !recoveredAttemptHasUnrelatedComposer(attempt, captureComposerSnapshot())
+      && attemptOwnsMessageEditTranscript(attempt)
+  }
+
+  async function persistAttemptBackgroundOnly(attempt: SendAttempt): Promise<boolean> {
+    if (!attempt.forkBeforeMessageId) return true
+    const wal = options.pendingInputWal
+    if (!wal?.listHandoffs) return false
+    let records: ResponseHandoffWalRecord[]
+    try {
+      records = await wal.listHandoffs(attempt.requestSessionKey)
+    } catch {
+      return false
+    }
+    const record = records.find(candidate => (
+      candidate.ownerRequestId === attempt.clientRequestId
+      && candidate.clientRequestId === attempt.clientRequestId
+      && candidate.clientMessageId === attempt.clientMessageId
+    ))
+    if (!record) return false
+    const gate: ResponseHandoffGate = {
+      requestSessionKey: attempt.requestSessionKey,
+      ownerRequestId: attempt.clientRequestId,
+      targetSessionKey: null,
+      stoppedByUser: attempt.stopRequested === true,
+      acceptedTaskId: attempt.acceptedTaskId || '',
+      terminalResponse: false,
+      authoritativeIdle: false,
+      backgroundOnly: true,
+      backgroundFinalized: false,
+      durableRecord: record,
+    }
+    return markResponseHandoffBackgroundOnly(gate)
+  }
+
   function scheduleAcceptanceRecovery(attempt: SendAttempt) {
     if ((attempt.acceptanceResolved && !attempt.stopRequested) || !attempt.acceptanceRequest) return
     const key = acceptanceAttemptKey(attempt)
@@ -1436,11 +1472,21 @@ export function useChatSend(options: UseChatSendOptions) {
         }
         if (attempt.acceptanceInFlight) continue
         attempt.acceptanceInFlight = true
+        let backgroundReceiptReplayStarted = false
         try {
+          const backgroundReceiptReplay = !attemptOwnsVisibleReceipt(attempt)
+          if (backgroundReceiptReplay) {
+            if (!await persistAttemptBackgroundOnly(attempt)) continue
+            options.beginBackgroundReceiptReplay?.(
+              attempt.clientMessageId,
+              options.messageEditActive?.value === true,
+            )
+            backgroundReceiptReplayStarted = true
+          }
           const response = await options.turnCommands.send(
             attempt.acceptanceRequest!.request,
           )
-          if (await settleRecoveredAcceptance(attempt, response)) return
+          if (await settleRecoveredAcceptance(attempt, response, backgroundReceiptReplay)) return
         } catch (error: unknown) {
           const rpcError = error as RpcClientError | null | undefined
           const accepted = acceptedErrorInfo(error)
@@ -1455,7 +1501,9 @@ export function useChatSend(options: UseChatSendOptions) {
                   }
                 : {}),
             }
-            if (await settleRecoveredAcceptance(attempt, response)) return
+            if (await settleRecoveredAcceptance(attempt, response, backgroundReceiptReplayStarted)) {
+              return
+            }
             continue
           }
           if (rpcError?.accepted === false) {
@@ -1483,6 +1531,9 @@ export function useChatSend(options: UseChatSendOptions) {
             void options.reconcileTaskOwnership?.()
           }
         } finally {
+          if (backgroundReceiptReplayStarted) {
+            options.finishBackgroundReceiptReplay?.(attempt.clientMessageId)
+          }
           attempt.acceptanceInFlight = false
         }
       }

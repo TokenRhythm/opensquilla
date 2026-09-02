@@ -3196,7 +3196,7 @@ describe('useChatSend attachment payloads', () => {
     expect(await pendingInputWal.listHandoffs!()).toEqual([])
   })
 
-  it('replays a background-only submitting WAL without adopting its child', async () => {
+  it('does not adopt a child from a background-only submitting WAL left by a crash', async () => {
     const parent = 'agent:main:webchat:parent-background'
     const child = 'agent:main:webchat:child-background'
     const ownerRequestId = 'background-submitting-request'
@@ -3438,6 +3438,121 @@ describe('useChatSend attachment payloads', () => {
 
     expect(rpc.call).toHaveBeenCalledTimes(2)
     expect(await pendingInputWal.listHandoffs!()).toEqual([])
+  })
+
+  it('persists and quarantines an automatic background receipt before replaying it', async () => {
+    vi.useFakeTimers()
+    try {
+      const {
+        sessionKey,
+        messages,
+        inputText,
+        pendingForkBeforeMessageId,
+        messageActions,
+      } = makeEditedMessageState('edited question')
+      const baseWal = memoryHandoffWal()
+      let failedBackgroundWrites = 0
+      const pendingInputWal: PendingInputWal = {
+        ...baseWal,
+        compareAndSwapHandoff: vi.fn(async (owner, walOwner, revision, record) => {
+          if (record?.state === 'submitting' && record.backgroundOnly === true) {
+            failedBackgroundWrites += 1
+            if (failedBackgroundWrites <= 2) {
+              return { applied: false, record: (await baseWal.listHandoffs!())[0] || null }
+            }
+          }
+          return baseWal.compareAndSwapHandoff!(owner, walOwner, revision, record)
+        }),
+      }
+      const acceptanceRecoveryPending = ref(false)
+      const beginBackgroundReceiptReplay = vi.fn()
+      const finishBackgroundReceiptReplay = vi.fn()
+      const adoptResponseSession = vi.fn()
+      let resolveFirstSend!: (value: unknown) => void
+      let resolveRecoverySend!: (value: unknown) => void
+      const rpc = {
+        call: vi.fn(<T = unknown>() => {
+          if (rpc.call.mock.calls.length === 1) {
+            return new Promise<T>(resolve => {
+              resolveFirstSend = resolve as (value: unknown) => void
+            })
+          }
+          return new Promise<T>(resolve => {
+            resolveRecoverySend = resolve as (value: unknown) => void
+          })
+        }),
+      } as unknown as UseChatSendOptions['rpc']
+      const harness = makeOptions({
+        rpc,
+        sessionKey,
+        messages,
+        inputText,
+        pendingForkBeforeMessageId,
+        pendingInputWal,
+        acceptanceRecoveryPending,
+        beginBackgroundReceiptReplay,
+        finishBackgroundReceiptReplay,
+        adoptResponseSession,
+        messageEditGeneration: messageActions.editGeneration,
+        messageEditActive: messageActions.editActive,
+        validateMessageEditOwner: messageActions.validateEditOwner,
+        commitMessageEdit: messageActions.commitEdit,
+        adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
+      })
+
+      const send = harness.api.onSend()
+      await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledOnce())
+      messages.value = [{
+        role: 'user',
+        text: 'new transcript owner',
+        ts: null,
+        messageId: 'new-owner-message',
+      }]
+      inputText.value = 'new composer owner'
+      resolveFirstSend({
+        sessionKey: 'agent:main:webchat:child',
+        task_id: 'background-worker-task',
+      })
+      await send
+
+      expect(acceptanceRecoveryPending.value).toBe(true)
+      expect(rpc.call).toHaveBeenCalledOnce()
+
+      await vi.advanceTimersByTimeAsync(250)
+
+      expect(rpc.call).toHaveBeenCalledOnce()
+      expect(beginBackgroundReceiptReplay).not.toHaveBeenCalled()
+      expect(await pendingInputWal.listHandoffs!()).toEqual([
+        expect.objectContaining({ state: 'submitting' }),
+      ])
+
+      await vi.advanceTimersByTimeAsync(1_000)
+      await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledTimes(2))
+
+      expect(await pendingInputWal.listHandoffs!()).toEqual([
+        expect.objectContaining({
+          state: 'submitting',
+          backgroundOnly: true,
+        }),
+      ])
+      expect(beginBackgroundReceiptReplay).toHaveBeenCalledOnce()
+      expect(beginBackgroundReceiptReplay.mock.invocationCallOrder[0]).toBeLessThan(
+        rpc.call.mock.invocationCallOrder[1]!,
+      )
+      expect(finishBackgroundReceiptReplay).not.toHaveBeenCalled()
+
+      resolveRecoverySend({
+        sessionKey: 'agent:main:webchat:child',
+        task_id: 'background-worker-task',
+      })
+      await vi.waitFor(() => expect(acceptanceRecoveryPending.value).toBe(false))
+
+      expect(finishBackgroundReceiptReplay).toHaveBeenCalledOnce()
+      expect(adoptResponseSession).not.toHaveBeenCalled()
+      expect(await pendingInputWal.listHandoffs!()).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('keeps the recovery worker when background-only WAL persistence fails', async () => {
