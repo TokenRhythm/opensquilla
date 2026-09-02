@@ -27,6 +27,15 @@ from opensquilla.application.session_directory import (
     SessionSearchProjection,
     _resolve_session_record_for_bootstrap,
 )
+from opensquilla.application.session_read import (
+    SessionMetadataQuery,
+    SessionPlanningState,
+    SessionReadApplication,
+    SessionRunModeLock,
+    SessionTaskState,
+    SessionWorkspaceState,
+    deferred_session_read_metadata,
+)
 from opensquilla.artifacts import enrich_artifact_event_dict
 from opensquilla.attachment_refs import (
     PENDING_CHAT_INPUT_MATERIAL_STORE,
@@ -54,10 +63,6 @@ from opensquilla.engine.steps.router_decision_record import (
     drain_pending_flushes_for_sessions,
 )
 from opensquilla.gateway import attachment_ingest as _attachment_ingest
-from opensquilla.gateway.adapters.conversation_runtime import (
-    build_v4_conversation_snapshot_application,
-    snapshot_result_to_v4,
-)
 from opensquilla.gateway.adapters.plans_contract import (
     register_plans_cancel_run_contract,
     register_plans_implement_contract,
@@ -66,10 +71,22 @@ from opensquilla.gateway.adapters.plans_contract import (
 )
 from opensquilla.gateway.adapters.session_preview import (
     SystemClock,
-    build_session_preview_application,
     preview_params_from_v4,
     preview_query_from_v4_values,
     preview_result_to_v4,
+)
+from opensquilla.gateway.adapters.session_read import (
+    GatewaySessionReadPorts,
+    build_v4_session_read_application,
+    session_read_metadata_to_v4,
+    session_read_snapshot_to_v4,
+)
+from opensquilla.gateway.adapters.session_read_contract import (
+    register_sessions_messages_hydrate_contract,
+    register_sessions_messages_snapshot_contract,
+    register_sessions_messages_subscribe_contract,
+    register_sessions_messages_unsubscribe_contract,
+    register_sessions_preview_contract,
 )
 from opensquilla.gateway.adapters.sessions_list_contract import (
     register_sessions_list_contract,
@@ -11173,44 +11190,206 @@ async def _build_sessions_messages_subscription_payload(
 
 
 def _deferred_sessions_messages_metadata() -> dict[str, Any]:
-    deferred_fields = [
-        "workspaceId",
-        "projectWorkspace",
-        "tasks",
-        "active_task",
-        "last_task",
-        "run_status",
-        "active_task_group_ids",
-        "run_mode_lock",
-        "pendingUserInputs",
-        "collaboration",
-        "routing",
-        "currentPlan",
-        "activePlanRun",
-        "goal",
-        "goalSnapshotStreamSeq",
-        "epoch",
-    ]
-    return {
-        "workspaceId": None,
-        "projectWorkspace": None,
-        "projectWorkspaceDeferred": True,
-        "active_task_group_ids": [],
-        "run_mode_lock": {"locked": True, "source": "deferred"},
-        "pendingUserInputs": [],
-        "collaboration": None,
-        "routing": None,
-        "currentPlan": None,
-        "activePlanRun": None,
-        "goal": None,
-        "goalSnapshotStreamSeq": None,
-        "tasks": [],
-        "active_task": None,
-        "last_task": None,
-        "run_status": "idle",
-        "hydration_complete": False,
-        "deferred_fields": deferred_fields,
-    }
+    return session_read_metadata_to_v4(
+        deferred_session_read_metadata("deferred"),
+        include_key=False,
+    )
+
+
+def _build_session_read_application(
+    ctx: RpcContext,
+    *,
+    clock: SystemClock | None = None,
+) -> SessionReadApplication:
+    """Compose request-scoped Ports without exposing ``RpcContext`` upstream."""
+
+    streams = get_session_streams()
+    manager = getattr(ctx, "session_manager", None)
+    storage = cast(SessionStorage | None, get_session_storage(manager))
+    session_missing = object()
+    cached_session: object = session_missing
+
+    async def read_session(session_key: str) -> Any | None:
+        nonlocal cached_session
+        if cached_session is session_missing:
+            cached_session = (
+                await storage.get_session(session_key) if storage is not None else None
+            )
+        return cached_session
+
+    async def read_tasks(session_key: str) -> SessionTaskState:
+        task_rows = await _list_task_rows(ctx, storage, session_key)
+        task_state = _task_state_summary(task_rows)
+        await _overlay_runtime_task_snapshot(ctx, session_key, task_state)
+        await _attach_active_steer_capability(ctx, session_key, task_state)
+        from opensquilla.gateway.subagent_announce import (
+            active_background_completion_group_ids,
+            active_background_completion_run_mode_override,
+        )
+
+        active_task_group_ids = await active_background_completion_group_ids(
+            session_key
+        )
+        background_run_mode_override = (
+            await active_background_completion_run_mode_override(session_key)
+            if active_task_group_ids
+            else None
+        )
+        session = await read_session(session_key)
+        lock = _run_mode_lock_payload(
+            task_rows=task_rows,
+            active_task_group_ids=active_task_group_ids,
+            background_override=background_run_mode_override,
+            session=session,
+            principal=ctx.principal,
+        )
+        queued_task_ids = task_state.get("queued_task_ids")
+        return SessionTaskState(
+            tasks=tuple(
+                cast(Sequence[Mapping[str, Any]], task_state.get("tasks", ()))
+            ),
+            active_task=cast(
+                Mapping[str, Any] | None,
+                task_state.get("active_task"),
+            ),
+            last_task=cast(
+                Mapping[str, Any] | None,
+                task_state.get("last_task"),
+            ),
+            run_status=str(task_state.get("run_status") or "idle"),
+            queued_task_ids=(
+                tuple(cast(Sequence[str], queued_task_ids))
+                if queued_task_ids is not None
+                else None
+            ),
+            active_task_group_ids=tuple(active_task_group_ids),
+            run_mode_lock=SessionRunModeLock(
+                locked=bool(lock.get("locked")),
+                run_mode=(
+                    lock.get("runMode")
+                    if isinstance(lock.get("runMode"), str)
+                    else None
+                ),
+                source=(
+                    lock.get("source")
+                    if isinstance(lock.get("source"), str)
+                    else None
+                ),
+            ),
+        )
+
+    async def read_workspace(
+        session_key: str,
+        include_project_workspace: bool,
+    ) -> SessionWorkspaceState:
+        session = await read_session(session_key)
+        workspace_id = getattr(session, "workspace_id", None)
+        project_snapshot = (
+            await persisted_project_workspace_snapshot(storage, session)
+            if include_project_workspace and storage is not None and session is not None
+            else None
+        )
+        return SessionWorkspaceState(
+            workspace_id=cast(str | None, workspace_id),
+            project_workspace=cast(Mapping[str, Any] | None, project_snapshot),
+            project_workspace_deferred=(
+                bool(workspace_id) and not include_project_workspace
+            ),
+        )
+
+    async def read_pending_inputs(
+        session_key: str,
+    ) -> Sequence[Mapping[str, Any]]:
+        getter = getattr(
+            getattr(ctx, "task_runtime", None),
+            "pending_user_inputs",
+            None,
+        )
+        if not callable(getter):
+            return ()
+        candidate = getter(session_key)
+        result = await candidate if inspect.isawaitable(candidate) else candidate
+        return cast(Sequence[Mapping[str, Any]], result)
+
+    async def read_routing(session_key: str) -> Mapping[str, Any]:
+        return await _resolve_session_routing_snapshot(ctx, session_key)
+
+    async def read_planning(session_key: str) -> SessionPlanningState:
+        session = await read_session(session_key)
+        collaboration: Mapping[str, Any] | None = None
+        current_plan_payload: Mapping[str, Any] | None = None
+        active_plan_run_payload: Mapping[str, Any] | None = None
+        goal_payload: Mapping[str, Any] | None = None
+        session_epoch: int | None = None
+        if storage is not None and session is not None:
+            session_epoch = await _bootstrap_epoch(
+                ctx.session_manager,
+                storage,
+                session,
+                session_key,
+            )
+            collaboration = _plan_collaboration_snapshot(session)
+            get_current_plan = getattr(storage, "get_current_plan_revision", None)
+            get_active_run = getattr(storage, "get_active_plan_run", None)
+            current_plan = (
+                await get_current_plan(session_key)
+                if callable(get_current_plan)
+                else None
+            )
+            active_plan_run = (
+                await get_active_run(session_key) if callable(get_active_run) else None
+            )
+            from opensquilla.session.plans import (
+                plan_revision_snapshot,
+                plan_run_snapshot,
+            )
+
+            if current_plan is not None:
+                current_plan_payload = plan_revision_snapshot(
+                    current_plan,
+                    current=True,
+                )
+            if active_plan_run is not None:
+                active_plan_run_payload = plan_run_snapshot(active_plan_run)
+            get_goal = getattr(storage, "get_goal", None)
+            goal = await get_goal(session_key) if callable(get_goal) else None
+            if goal is not None:
+                goal_service = getattr(
+                    getattr(ctx, "task_runtime", None),
+                    "goal_service",
+                    None,
+                )
+                snapshot = getattr(goal_service, "snapshot", None)
+                if callable(snapshot):
+                    goal_payload = cast(Mapping[str, Any], await snapshot(goal))
+                else:
+                    from opensquilla.session.goals import goal_snapshot
+
+                    goal_payload = goal_snapshot(goal)
+
+        return SessionPlanningState(
+            collaboration=collaboration,
+            current_plan=current_plan_payload,
+            active_plan_run=active_plan_run_payload,
+            goal=goal_payload,
+            epoch=session_epoch,
+        )
+
+    ports = GatewaySessionReadPorts(
+        streams=streams,
+        read_tasks=read_tasks,
+        read_workspace=read_workspace,
+        read_pending_inputs=read_pending_inputs,
+        read_routing=read_routing,
+        read_planning=read_planning,
+    )
+    return build_v4_session_read_application(
+        streams=streams,
+        session_manager=manager,
+        storage=storage,
+        ports=ports,
+        clock=clock,
+    )
 
 
 async def _hydrate_sessions_messages_metadata(
@@ -11221,131 +11400,16 @@ async def _hydrate_sessions_messages_metadata(
 ) -> dict[str, Any]:
     """Load authoritative subscription metadata outside the fast ACK path."""
 
-    # The subscriber is already registered before hydration begins. Capture a
-    # cursor before reading the Goal row so clients can apply every later event
-    # and reject a late snapshot that predates one they have already observed.
-    goal_snapshot_stream_seq = get_session_streams().replay(
-        key,
-        None,
-    ).current_stream_seq
-    storage = get_session_storage(getattr(ctx, "session_manager", None))
-    task_rows = await _list_task_rows(ctx, storage, key)
-    task_state = _task_state_summary(task_rows)
-    await _overlay_runtime_task_snapshot(ctx, key, task_state)
-    await _attach_active_steer_capability(ctx, key, task_state)
-    from opensquilla.gateway.subagent_announce import (
-        active_background_completion_group_ids,
-        active_background_completion_run_mode_override,
+    application = _build_session_read_application(ctx)
+    metadata = await application.read_metadata(
+        SessionMetadataQuery(
+            session_key=key,
+            include_project_workspace=include_project_workspace,
+        )
     )
-
-    active_task_group_ids = await active_background_completion_group_ids(key)
-    background_run_mode_override = (
-        await active_background_completion_run_mode_override(key)
-        if active_task_group_ids
-        else None
-    )
-    session = await storage.get_session(key) if storage is not None else None
-    workspace_id = getattr(session, "workspace_id", None)
-    project_snapshot = (
-        await persisted_project_workspace_snapshot(storage, session)
-        if include_project_workspace and storage is not None and session is not None
-        else None
-    )
-    pending_user_inputs: list[dict[str, Any]] = []
-    pending_user_inputs_getter = getattr(
-        getattr(ctx, "task_runtime", None),
-        "pending_user_inputs",
-        None,
-    )
-    if callable(pending_user_inputs_getter):
-        candidate = pending_user_inputs_getter(key)
-        pending_user_inputs = (
-            await candidate if inspect.isawaitable(candidate) else candidate
-        )
-    collaboration: dict[str, Any] | None = None
-    routing = await _resolve_session_routing_snapshot(ctx, key)
-    current_plan_payload: dict[str, Any] | None = None
-    active_plan_run_payload: dict[str, Any] | None = None
-    goal_payload: dict[str, Any] | None = None
-    session_epoch: int | None = None
-    if storage is not None and session is not None:
-        session_epoch = await _bootstrap_epoch(
-            ctx.session_manager,
-            storage,
-            session,
-            key,
-        )
-        collaboration = _plan_collaboration_snapshot(session)
-        get_current_plan = getattr(storage, "get_current_plan_revision", None)
-        get_active_run = getattr(storage, "get_active_plan_run", None)
-        current_plan = (
-            await get_current_plan(key) if callable(get_current_plan) else None
-        )
-        active_plan_run = (
-            await get_active_run(key) if callable(get_active_run) else None
-        )
-        from opensquilla.session.plans import (
-            plan_revision_snapshot,
-            plan_run_snapshot,
-        )
-
-        if current_plan is not None:
-            current_plan_payload = plan_revision_snapshot(
-                current_plan,
-                current=True,
-            )
-        if active_plan_run is not None:
-            active_plan_run_payload = plan_run_snapshot(active_plan_run)
-        get_goal = getattr(storage, "get_goal", None)
-        goal = await get_goal(key) if callable(get_goal) else None
-        if goal is not None:
-            goal_service = getattr(
-                getattr(ctx, "task_runtime", None),
-                "goal_service",
-                None,
-            )
-            snapshot = getattr(goal_service, "snapshot", None)
-            if callable(snapshot):
-                goal_payload = await snapshot(goal)
-            else:
-                from opensquilla.session.goals import goal_snapshot
-
-                goal_payload = goal_snapshot(goal)
-
-    project_workspace_deferred = bool(workspace_id) and not include_project_workspace
-    return {
-        "key": key,
-        "workspaceId": workspace_id,
-        # New clients opt into a fast subscribe and refresh this field through
-        # the workspace RPC. Legacy callers retain the old payload shape using
-        # persisted binding state; turn ingress still validates the directory.
-        "projectWorkspace": project_snapshot,
-        "projectWorkspaceDeferred": project_workspace_deferred,
-        "active_task_group_ids": active_task_group_ids,
-        "run_mode_lock": _run_mode_lock_payload(
-            task_rows=task_rows,
-            active_task_group_ids=active_task_group_ids,
-            background_override=background_run_mode_override,
-            session=session,
-            principal=ctx.principal,
-        ),
-        "pendingUserInputs": pending_user_inputs,
-        "collaboration": collaboration,
-        "routing": routing,
-        "currentPlan": current_plan_payload,
-        "activePlanRun": active_plan_run_payload,
-        "goal": goal_payload,
-        "goalSnapshotStreamSeq": goal_snapshot_stream_seq,
-        **({"epoch": session_epoch} if session_epoch is not None else {}),
-        **task_state,
-        "hydration_complete": True,
-        "deferred_fields": (
-            ["projectWorkspace"] if project_workspace_deferred else []
-        ),
-    }
+    return session_read_metadata_to_v4(metadata)
 
 
-@_d.method("sessions.messages.subscribe", scope="operator.read")
 async def _handle_sessions_messages_subscribe(params: dict | None, ctx: RpcContext) -> dict:
     key = _require_key(params)
     if ":subagent:" in key:
@@ -11382,7 +11446,6 @@ async def _handle_sessions_messages_subscribe(params: dict | None, ctx: RpcConte
         raise
 
 
-@_d.method("sessions.messages.hydrate", scope="operator.read")
 async def _handle_sessions_messages_hydrate(params: dict | None, ctx: RpcContext) -> dict:
     key = _require_key(params)
     # This is an interactive continuation of the fast subscribe ACK. Keep all
@@ -11392,7 +11455,6 @@ async def _handle_sessions_messages_hydrate(params: dict | None, ctx: RpcContext
         return await _hydrate_sessions_messages_metadata(ctx, key)
 
 
-@_d.method("sessions.messages.snapshot", scope="operator.read")
 async def _handle_sessions_messages_snapshot(params: dict | None, ctx: RpcContext) -> dict:
     """Return a compact active-turn base before a client subscribes for deltas."""
 
@@ -11401,16 +11463,13 @@ async def _handle_sessions_messages_snapshot(params: dict | None, ctx: RpcContex
     key = _require_key(params)
     connection = get_registry().get(ctx.conn_id)
     client_caps: frozenset[str] = getattr(connection, "client_caps", frozenset())
-    application = build_v4_conversation_snapshot_application(
-        get_session_streams(),
-    )
-    return snapshot_result_to_v4(
+    application = _build_session_read_application(ctx)
+    return session_read_snapshot_to_v4(
         key,
-        application.read(key, client_caps=client_caps),
+        application.read_snapshot(key, client_caps=client_caps),
     )
 
 
-@_d.method("sessions.messages.unsubscribe", scope="operator.read")
 async def _handle_sessions_messages_unsubscribe(params: dict | None, ctx: RpcContext) -> None:
     key = _require_key(params)
     subscription_mgr = getattr(ctx, "subscription_manager", None)
@@ -11419,7 +11478,6 @@ async def _handle_sessions_messages_unsubscribe(params: dict | None, ctx: RpcCon
     return None
 
 
-@_d.method("sessions.preview", scope="operator.read")
 async def _handle_sessions_preview(params: dict | None, ctx: RpcContext) -> dict:
     # Preserve the legacy order: a truthy non-mapping params value raises from
     # ``.get`` before an unavailable manager can produce an empty response.
@@ -11434,7 +11492,7 @@ async def _handle_sessions_preview(params: dict | None, ctx: RpcContext) -> dict
     if storage is None:
         return {"ts": now_ms, "previews": []}
 
-    application = build_session_preview_application(storage, clock=clock)
+    application = _build_session_read_application(ctx, clock=clock)
 
     # Preview is an interactive read. Keep storage lock acquisition bounded
     # while preserving the existing key/list selection and response shape.
@@ -11442,9 +11500,45 @@ async def _handle_sessions_preview(params: dict | None, ctx: RpcContext) -> dict
         # Key iteration stays inside the same bounded section as the old
         # handler; malformed iterables therefore fail at the same point.
         query = preview_query_from_v4_values(raw_keys, raw_limit)
-        result = await application.preview(query)
+        result = await application.read_previews(query)
 
     return preview_result_to_v4(result)
+
+
+_handle_sessions_messages_subscribe_contract = (
+    register_sessions_messages_subscribe_contract(
+        _d,
+        _handle_sessions_messages_subscribe,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+)
+_handle_sessions_messages_hydrate_contract = register_sessions_messages_hydrate_contract(
+    _d,
+    _handle_sessions_messages_hydrate,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_sessions_messages_snapshot_contract = register_sessions_messages_snapshot_contract(
+    _d,
+    _handle_sessions_messages_snapshot,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_sessions_messages_unsubscribe_contract = (
+    register_sessions_messages_unsubscribe_contract(
+        _d,
+        _handle_sessions_messages_unsubscribe,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+)
+_handle_sessions_preview_contract = register_sessions_preview_contract(
+    _d,
+    _handle_sessions_preview,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 async def _handle_sessions_resolve(params: dict | None, ctx: RpcContext) -> dict:

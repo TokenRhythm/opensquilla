@@ -4,6 +4,7 @@ import type {
   GatewayConnectionSettings,
   GatewayRunModePolicy,
 } from '@/modules/gatewayAccess'
+import { SESSIONS_MESSAGES_HYDRATE_METHOD } from '@/contracts/generated/v4/sessionsMessagesHydrate'
 
 const WS_URL_KEY = 'opensquilla.wsUrl'
 
@@ -103,7 +104,7 @@ export function createV4GatewayAccess(source: GatewayAccessSource): GatewayAcces
     },
     get detachedSessionHydration() {
       const methods = source.policy?.concurrent_optional_read_methods
-      return Array.isArray(methods) && methods.includes('sessions.messages.hydrate')
+      return Array.isArray(methods) && methods.includes(SESSIONS_MESSAGES_HYDRATE_METHOD)
     },
     get subscriptionEpoch() {
       return source.connectionGeneration

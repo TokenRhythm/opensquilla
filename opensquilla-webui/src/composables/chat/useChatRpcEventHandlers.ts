@@ -28,7 +28,7 @@ import type {
   WarningPayload,
 } from '@/types/chat'
 import type { ArtifactPayload } from '@/types/artifacts'
-import type { SessionMessagesSnapshotResponse } from '@/modules/sessionConversation'
+import type { SessionReadSnapshot } from '@/modules/sessionReadLifecycle'
 import type {
   ConversationEvent,
   ConversationSemanticEventKind,
@@ -945,8 +945,8 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     }
   }
 
-  function restoreLiveTurnSnapshot(snapshot: SessionMessagesSnapshotResponse) {
-    if (!snapshot || snapshot.key !== sessionKey.value) return
+  function restoreLiveTurnSnapshot(snapshot: SessionReadSnapshot) {
+    if (!snapshot || snapshot.sessionKey !== sessionKey.value) return
 
     steerDelivery.resetTransientBoundaries()
     stream.resetLiveTurnState?.()
@@ -957,16 +957,16 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     settledTaskIds.clear()
     pendingSuccessorRenderTaskId = ''
     options.clearPendingRouterDecision()
-    activeStreamTaskId.value = typeof snapshot.task_id === 'string'
-      ? snapshot.task_id
+    activeStreamTaskId.value = typeof snapshot.taskId === 'string'
+      ? snapshot.taskId
       : ''
 
     const replayEntries: BufferedPendingReplayEntry[] = (snapshot.events || [])
       .flatMap((entry, order): BufferedPendingReplayEntry[] => {
-        if (!entry || typeof entry.event !== 'string') return []
+        if (!entry || typeof entry.semanticKind !== 'string') return []
         return [{
           kind: 'stream',
-          event: entry.event,
+          event: entry.semanticKind,
           payload: { ...(entry.payload || {}) },
           order,
         }]
@@ -999,15 +999,6 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       })
     }
 
-    if (
-      typeof snapshot.current_stream_seq === 'number'
-      && Number.isFinite(snapshot.current_stream_seq)
-    ) {
-      syncCursor(conversationRuntime.restoreSnapshot(
-        cursor(),
-        conversationCursorSignal(snapshot),
-      ))
-    }
   }
 
   function replayPendingTerminalEvent(entry: BufferedTerminalEvent) {
@@ -2780,15 +2771,18 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         // potentially slow history response before refreshing independent UI.
         const criticalRequestsQueued = recovery?.criticalRequestsQueued
           ?? Promise.resolve()
-        void criticalRequestsQueued.then(() => {
-          if (
-            connectionStateGeneration === stateGeneration
-            && sessionKey.value === connectedSessionKey
-          ) {
-            options.loadCurrentSessionUsage()
-            void options.refreshRunModePreference?.()
-          }
-        })
+        void criticalRequestsQueued.then(
+          () => {
+            if (
+              connectionStateGeneration === stateGeneration
+              && sessionKey.value === connectedSessionKey
+            ) {
+              options.loadCurrentSessionUsage()
+              void options.refreshRunModePreference?.()
+            }
+          },
+          () => {},
+        )
       }
       if (!recovery) {
         options.loadCurrentSessionUsage()

@@ -7,9 +7,8 @@ import type {
   ChatPendingItem,
   ChatRunStatus,
   ChatRunStatusSource,
-  SessionEventPayload,
 } from '@/types/chat'
-import type { SessionMessagesSnapshotResponse } from '@/modules/sessionConversation'
+import type { SessionReadSnapshot } from '@/modules/sessionReadLifecycle'
 import {
   FINISHED_STREAM_TASK_ID,
   PENDING_STREAM_TASK_ID,
@@ -144,15 +143,8 @@ function createHarness(options: {
   }))!
   const api = {
     ...rawApi,
-    restoreLiveTurnSnapshot: (snapshot: Omit<SessionMessagesSnapshotResponse, 'events'> & {
-      events?: Array<{ event: string, payload: SessionEventPayload }>
-    }) => rawApi.restoreLiveTurnSnapshot({
-      ...snapshot,
-      events: snapshot.events?.map(entry => ({
-        ...entry,
-        event: conversationSemanticEventKind(entry.event),
-      })),
-    }),
+    restoreLiveTurnSnapshot: (snapshot: SessionReadSnapshot) =>
+      rawApi.restoreLiveTurnSnapshot(snapshot),
     handlers: {
       ...rawApi.handlers,
       onWireEventFixture: (eventName: string, payload: unknown) => {
@@ -279,19 +271,18 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
     harness.stream.isStreaming.value = false
     try {
       harness.api.restoreLiveTurnSnapshot({
-        key: 'agent:main:test',
-        task_id: 'task-clock',
-        current_stream_seq: 2,
+        sessionKey: 'agent:main:test',
+        taskId: 'task-clock',
         events: [
           {
-            event: 'session.event.provider_activity',
+            semanticKind: conversationSemanticEventKind('session.event.provider_activity'),
             payload: {
               session_key: 'agent:main:test', task_id: 'task-clock',
               stream_seq: 1, emitted_at: 2_000, phase: 'requesting',
             },
           },
           {
-            event: 'session.event.thinking',
+            semanticKind: conversationSemanticEventKind('session.event.thinking'),
             payload: {
               session_key: 'agent:main:test', task_id: 'task-clock',
               stream_seq: 2, emitted_at: 3_000, text: 'reasoning',
@@ -310,12 +301,11 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
     const { api, stream, stop } = createHarness()
     try {
       api.restoreLiveTurnSnapshot({
-        key: 'agent:main:test',
-        task_id: 'task-tool-timeline',
-        current_stream_seq: 3,
+        sessionKey: 'agent:main:test',
+        taskId: 'task-tool-timeline',
         events: [
           {
-            event: 'session.event.tool_use_start',
+            semanticKind: conversationSemanticEventKind('session.event.tool_use_start'),
             payload: {
               session_key: 'agent:main:test',
               task_id: 'task-tool-timeline',
@@ -326,7 +316,7 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
             },
           },
           {
-            event: 'session.event.tool_use_delta',
+            semanticKind: conversationSemanticEventKind('session.event.tool_use_delta'),
             payload: {
               session_key: 'agent:main:test',
               task_id: 'task-tool-timeline',
@@ -337,7 +327,7 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
             },
           },
           {
-            event: 'session.event.tool_use_end',
+            semanticKind: conversationSemanticEventKind('session.event.tool_use_end'),
             payload: {
               session_key: 'agent:main:test',
               task_id: 'task-tool-timeline',
@@ -371,12 +361,11 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
     } = createHarness()
     try {
       api.restoreLiveTurnSnapshot({
-        key: 'agent:main:test',
-        task_id: 'task-live',
-        current_stream_seq: 5,
+        sessionKey: 'agent:main:test',
+        taskId: 'task-live',
         events: [
           {
-            event: 'session.event.text_delta',
+            semanticKind: conversationSemanticEventKind('session.event.text_delta'),
             payload: {
               session_key: 'agent:main:test',
               task_id: 'task-live',
@@ -386,7 +375,7 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
             },
           },
           {
-            event: 'session.event.answer_generation_reset',
+            semanticKind: conversationSemanticEventKind('session.event.answer_generation_reset'),
             payload: {
               session_key: 'agent:main:test',
               task_id: 'task-live',
@@ -400,7 +389,7 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
             },
           },
           {
-            event: 'session.event.text_delta',
+            semanticKind: conversationSemanticEventKind('session.event.text_delta'),
             payload: {
               session_key: 'agent:main:test',
               task_id: 'task-live',
@@ -410,7 +399,7 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
             },
           },
           {
-            event: 'session.event.text_delta',
+            semanticKind: conversationSemanticEventKind('session.event.text_delta'),
             payload: {
               session_key: 'agent:main:test',
               task_id: 'task-live',
@@ -570,7 +559,7 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
     }
   })
 
-  it('rebuilds the unfinished turn while advancing to the authoritative cursor', () => {
+  it('rebuilds the unfinished turn without owning the lease cursor', () => {
     const {
       api,
       stream,
@@ -581,12 +570,11 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
     try {
       lastStreamSeq.value = 900
       api.restoreLiveTurnSnapshot({
-        key: 'agent:main:test',
-        task_id: 'task-live',
-        current_stream_seq: 2400,
+        sessionKey: 'agent:main:test',
+        taskId: 'task-live',
         events: [
           {
-            event: 'session.event.thinking',
+            semanticKind: conversationSemanticEventKind('session.event.thinking'),
             payload: {
               session_key: 'agent:main:test',
               task_id: 'task-live',
@@ -595,7 +583,7 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
             },
           },
           {
-            event: 'session.event.tool_use_start',
+            semanticKind: conversationSemanticEventKind('session.event.tool_use_start'),
             payload: {
               session_key: 'agent:main:test',
               task_id: 'task-live',
@@ -605,7 +593,7 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
             },
           },
           {
-            event: 'session.event.text_delta',
+            semanticKind: conversationSemanticEventKind('session.event.text_delta'),
             payload: {
               session_key: 'agent:main:test',
               task_id: 'task-live',
@@ -627,13 +615,13 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
       expect(stream.setAcceptedActivityOrder).toHaveBeenNthCalledWith(2, 11)
       expect(stream.setAcceptedActivityOrder).toHaveBeenNthCalledWith(3, 12)
       expect(activeStreamTaskId.value).toBe('task-live')
-      expect(lastStreamSeq.value).toBe(2400)
+      expect(lastStreamSeq.value).toBe(900)
     } finally {
       stop()
     }
   })
 
-  it('keeps a snapshot router sequence as identity without replaying it through the cursor', () => {
+  it('keeps a snapshot router sequence as identity without owning the cursor', () => {
     const {
       api,
       lastStreamSeq,
@@ -643,11 +631,10 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
     try {
       lastStreamSeq.value = 900
       api.restoreLiveTurnSnapshot({
-        key: 'agent:main:test',
-        task_id: 'task-live',
-        current_stream_seq: 2_400,
+        sessionKey: 'agent:main:test',
+        taskId: 'task-live',
         events: [{
-          event: 'session.event.router_decision',
+          semanticKind: conversationSemanticEventKind('session.event.router_decision'),
           payload: {
             session_key: 'agent:main:test',
             task_id: 'task-live',
@@ -664,7 +651,7 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
       const [payload, identityStreamSeq] = queueRouterDecision.mock.calls[0]!
       expect(payload).not.toHaveProperty('stream_seq')
       expect(identityStreamSeq).toBe(17)
-      expect(lastStreamSeq.value).toBe(2_400)
+      expect(lastStreamSeq.value).toBe(900)
     } finally {
       stop()
     }
@@ -686,11 +673,10 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
       })
 
       api.restoreLiveTurnSnapshot({
-        key: 'agent:main:test',
-        task_id: 'task-live',
-        current_stream_seq: 4,
+        sessionKey: 'agent:main:test',
+        taskId: 'task-live',
         events: [{
-          event: 'session.event.provider_activity',
+          semanticKind: conversationSemanticEventKind('session.event.provider_activity'),
           payload: {
             session_key: 'agent:main:test',
             task_id: 'task-live',
@@ -722,12 +708,11 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
     })
     try {
       api.restoreLiveTurnSnapshot({
-        key: 'agent:main:test',
-        task_id: 'task-live',
-        current_stream_seq: 12,
+        sessionKey: 'agent:main:test',
+        taskId: 'task-live',
         events: [
           {
-            event: 'session.event.text_delta',
+            semanticKind: conversationSemanticEventKind('session.event.text_delta'),
             payload: {
               session_key: 'agent:main:test',
               task_id: 'task-live',
@@ -738,7 +723,7 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
             },
           },
           {
-            event: 'session.event.input_disposition',
+            semanticKind: conversationSemanticEventKind('session.event.input_disposition'),
             payload: {
               session_key: 'agent:main:test',
               task_id: 'task-live',
@@ -752,7 +737,7 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
             },
           },
           {
-            event: 'session.event.text_delta',
+            semanticKind: conversationSemanticEventKind('session.event.text_delta'),
             payload: {
               session_key: 'agent:main:test',
               task_id: 'task-live',
@@ -791,12 +776,11 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
     const { api, messages, stream, stop } = createHarness()
     try {
       api.restoreLiveTurnSnapshot({
-        key: 'agent:main:test',
-        task_id: 'task-live',
-        current_stream_seq: 12,
+        sessionKey: 'agent:main:test',
+        taskId: 'task-live',
         events: [
           {
-            event: 'session.event.text_delta',
+            semanticKind: conversationSemanticEventKind('session.event.text_delta'),
             payload: {
               session_key: 'agent:main:test',
               task_id: 'task-live',
@@ -805,7 +789,7 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
             },
           },
           {
-            event: 'session.event.input_disposition',
+            semanticKind: conversationSemanticEventKind('session.event.input_disposition'),
             payload: {
               session_key: 'agent:main:test',
               task_id: 'task-live',
@@ -817,7 +801,7 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
             },
           },
           {
-            event: 'session.event.text_delta',
+            semanticKind: conversationSemanticEventKind('session.event.text_delta'),
             payload: {
               session_key: 'agent:main:test',
               task_id: 'task-live',
@@ -874,12 +858,11 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
     })
     try {
       api.restoreLiveTurnSnapshot({
-        key: 'agent:main:test',
-        task_id: 'task-live',
-        current_stream_seq: 2,
+        sessionKey: 'agent:main:test',
+        taskId: 'task-live',
         events: [
           {
-            event: 'session.event.text_delta',
+            semanticKind: conversationSemanticEventKind('session.event.text_delta'),
             payload: {
               session_key: 'agent:main:test',
               task_id: 'task-live',
@@ -888,7 +871,7 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
             },
           },
           {
-            event: 'session.event.input_disposition',
+            semanticKind: conversationSemanticEventKind('session.event.input_disposition'),
             payload: {
               session_key: 'agent:main:test',
               task_id: 'task-live',
@@ -931,12 +914,11 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
         stream.isStreaming.value = true
       })
       api.restoreLiveTurnSnapshot({
-        key: 'agent:main:test',
-        task_id: 'task-live',
-        current_stream_seq: 2400,
+        sessionKey: 'agent:main:test',
+        taskId: 'task-live',
         events: [
           {
-            event: 'session.event.compaction',
+            semanticKind: conversationSemanticEventKind('session.event.compaction'),
             payload: {
               session_key: 'agent:main:test',
               status: 'started',
@@ -968,7 +950,7 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
       expect(stream.recordCompactionActivity).toHaveBeenCalledWith(expect.objectContaining({
         compaction_id: 'cmp-live',
       }))
-      expect(lastStreamSeq.value).toBe(2400)
+      expect(lastStreamSeq.value).toBe(0)
     } finally {
       stop()
     }
@@ -2987,6 +2969,39 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
       resolveLive()
       resolveHistory()
       await Promise.all([live, history])
+    } finally {
+      harness.stop()
+    }
+  })
+
+  it('does not leak an expected admission rejection from a superseded reconnect run', async () => {
+    let rejectCriticalRequestsQueued!: (error: Error) => void
+    const criticalRequestsQueued = new Promise<void>((_resolve, reject) => {
+      rejectCriticalRequestsQueued = reject
+    })
+    const run: SessionBootstrapRun = {
+      generation: 2,
+      criticalRequestsQueued,
+      history: Promise.resolve({ ok: false }),
+      live: Promise.resolve({
+        authoritative: false,
+        live: false,
+        backgroundOnly: false,
+        cancelled: true,
+      }),
+    }
+    const harness = createHarness({
+      handleSessionConnectionState: () => run,
+    })
+
+    try {
+      harness.api.handlers.onConnectionState('connected')
+      rejectCriticalRequestsQueued(new Error('superseded session read lease'))
+      await criticalRequestsQueued.catch(() => {})
+      await Promise.resolve()
+
+      expect(harness.loadCurrentSessionUsage).not.toHaveBeenCalled()
+      expect(harness.refreshRunModePreference).not.toHaveBeenCalled()
     } finally {
       harness.stop()
     }

@@ -26,6 +26,9 @@ from opensquilla.gateway.adapters.session_history import (
     SessionHistoryStorageAdapter,
     parse_history_cursor,
 )
+from opensquilla.gateway.adapters.session_read_contract import (
+    register_chat_history_contract,
+)
 from opensquilla.gateway.compaction_target import (
     effective_session_model,
     resolve_gateway_compaction_target,
@@ -33,7 +36,13 @@ from opensquilla.gateway.compaction_target import (
 )
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.context_overflow import apply_context_overflow_policy
-from opensquilla.gateway.rpc import RpcContext, RpcUnavailableError, get_dispatcher
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
+from opensquilla.gateway.rpc import (
+    RpcContext,
+    RpcHandlerError,
+    RpcUnavailableError,
+    get_dispatcher,
+)
 from opensquilla.gateway.session_services import get_session_lock, get_session_storage
 from opensquilla.gateway.terminal_activity import (
     is_usage_accounting_barrier,
@@ -1125,7 +1134,6 @@ async def _handle_chat_abort(params: dict | None, ctx: RpcContext) -> dict:
     return {"sessionKey": session_key, **result}
 
 
-@_d.method("chat.history", scope="operator.read")
 async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
     raw_params = params or {}
     session_key = _canonical_webchat_session_key(raw_params.get("sessionKey"))
@@ -1265,6 +1273,14 @@ async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
         "compaction_summaries": summaries,
         "turn_outcomes": turn_outcomes,
     }
+
+
+_handle_chat_history_contract = register_chat_history_contract(
+    _d,
+    _handle_chat_history,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 def _clarify_fields_to_text(fields: dict[str, object]) -> str:

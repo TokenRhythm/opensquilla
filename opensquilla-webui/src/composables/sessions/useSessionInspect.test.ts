@@ -1,65 +1,107 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const rpc = vi.hoisted(() => ({
-  ready: vi.fn(),
-  call: vi.fn(),
-}))
+import type { SessionInspection } from '@/modules/sessionInspection'
+import type { TurnCommands } from '@/modules/turnCommands'
+import type {
+  SessionReadHistoryPage,
+  SessionReadMessage,
+} from '@/modules/sessionReadLifecycle'
+import { abortInspectedSession, useSessionInspect } from './useSessionInspect'
 
-import { useSessionInspect } from './useSessionInspect'
-import { sessionConversationFromTestRpc } from '@/testing/sessionConversation.test-helper'
-
-function page(id: string, cursor: string, hasMore: boolean) {
+function message(id: string, text = id): SessionReadMessage {
   return {
-    messages: [{ id, message_id: id, role: 'assistant', text: id }],
-    has_more: hasMore,
-    oldest_cursor: cursor,
-    canonical_available: true,
-    canonical_complete: true,
+    id,
+    messageId: id,
+    transcriptId: `transcript:${id}`,
+    role: 'assistant',
+    text,
+    createdAt: 1,
+    reasoningContent: null,
+    routerDecision: null,
+    artifacts: [],
+    toolCalls: [],
+    timeline: [],
+    attachments: [],
+    promptAnnotations: [],
+    provenance: { kind: null, sourceSessionKey: null, sourceTool: null },
+    turnContext: null,
+    usage: null,
+    model: null,
+    inputTokens: null,
+    outputTokens: null,
+    additional: {},
   }
 }
 
+function page(
+  id: string,
+  cursor: string,
+  hasMore: boolean,
+  patch: Partial<SessionReadHistoryPage> = {},
+): SessionReadHistoryPage {
+  return {
+    messages: [message(id)],
+    hasMore,
+    oldestCursor: cursor,
+    newestCursor: cursor,
+    scope: 'complete',
+    loadedCount: 1,
+    pageSize: 20,
+    canonicalAvailable: true,
+    canonicalComplete: true,
+    compactionSummaries: [],
+    turnOutcomes: [],
+    additional: {},
+    ...patch,
+  }
+}
+
+const preview = vi.fn<SessionInspection['preview']>()
+const latest = vi.fn<SessionInspection['history']['latest']>()
+const before = vi.fn<SessionInspection['history']['before']>()
+const inspection: SessionInspection = {
+  preview,
+  history: { latest, before },
+}
+
 beforeEach(() => {
-  rpc.ready.mockReset().mockResolvedValue(undefined)
-  rpc.call.mockReset().mockImplementation(async (method: string) => {
-    if (method === 'sessions.preview') return { previews: [] }
-    return page('m2', 'cursor-2', true)
-  })
+  preview.mockReset().mockResolvedValue(null)
+  latest.mockReset().mockResolvedValue(page('m2', 'cursor-2', true))
+  before.mockReset().mockResolvedValue(page('m1', 'cursor-1', false))
 })
 
 describe('useSessionInspect canonical pagination', () => {
-  it('requests canonical transcript pages without summaries', async () => {
-    const inspect = useSessionInspect(sessionConversationFromTestRpc(rpc))
+  it('aborts through the turn command domain seam', async () => {
+    const cancel = vi.fn<TurnCommands['cancel']>().mockResolvedValue({ aborted: true })
+
+    await expect(abortInspectedSession({ cancel }, 'agent:main:webchat:test'))
+      .resolves.toBe(true)
+    expect(cancel).toHaveBeenCalledWith({
+      sessionKey: 'agent:main:webchat:test',
+      source: 'session-inspection',
+    })
+  })
+
+  it('reads a canonical domain page without exposing wire parameters', async () => {
+    const inspect = useSessionInspect(inspection)
 
     await inspect.load('agent:main:webchat:test')
 
-    expect(rpc.call).toHaveBeenCalledWith('chat.history', {
-      sessionKey: 'agent:main:webchat:test',
+    expect(latest).toHaveBeenCalledWith('agent:main:webchat:test', {
       limit: 20,
-      includeCanonical: true,
-      includeSummaries: false,
+      signal: expect.any(AbortSignal),
     })
     expect(inspect.canonicalComplete.value).toBe(true)
     expect(inspect.canonicalAvailable.value).toBe(true)
   })
 
   it('deduplicates prepended rows and allows retrying a failed cursor', async () => {
-    let historyCall = 0
-    rpc.call.mockImplementation(async (method: string) => {
-      if (method === 'sessions.preview') return { previews: [] }
-      historyCall++
-      if (historyCall === 1) return page('m2', 'cursor-2', true)
-      if (historyCall === 2) throw new Error('offline')
-      return {
-        messages: [
-          { id: 'm1', message_id: 'm1', role: 'assistant', text: 'm1' },
-          { id: 'm2', message_id: 'm2', role: 'assistant', text: 'm2 duplicate' },
-        ],
-        has_more: false,
-        oldest_cursor: 'cursor-1',
-        canonical_complete: true,
-      }
-    })
-    const inspect = useSessionInspect(sessionConversationFromTestRpc(rpc))
+    before
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValueOnce(page('m1', 'cursor-1', false, {
+        messages: [message('m1'), message('m2', 'm2 duplicate')],
+      }))
+    const inspect = useSessionInspect(inspection)
 
     await inspect.load('agent:main:webchat:test')
     await inspect.loadEarlier()
@@ -67,49 +109,43 @@ describe('useSessionInspect canonical pagination', () => {
 
     await inspect.loadEarlier()
     expect(inspect.loadEarlierError.value).toBe(false)
-    expect(inspect.messages.value.map(message => message.message_id)).toEqual(['m1', 'm2'])
-    expect(historyCall).toBe(3)
+    expect(inspect.messages.value.map(row => row.messageId)).toEqual(['m1', 'm2'])
+    expect(before).toHaveBeenCalledTimes(2)
   })
 
-  it('does not apply unavailable fallback rows and retries the same earlier page', async () => {
-    let historyCall = 0
-    rpc.call.mockImplementation(async (method: string) => {
-      if (method === 'sessions.preview') return { previews: [] }
-      historyCall++
-      if (historyCall === 1) return page('m4', 'cursor-4', true)
-      if (historyCall === 2) {
-        return {
-          ...page('fallback', 'fallback-cursor', false),
-          canonical_available: false,
-          canonical_complete: false,
-        }
-      }
-      return page('m3', 'cursor-3', false)
-    })
-    const inspect = useSessionInspect(sessionConversationFromTestRpc(rpc))
+  it('does not advance an unavailable earlier page and retries the same cursor', async () => {
+    latest.mockResolvedValueOnce(page('m4', 'cursor-4', true))
+    before
+      .mockResolvedValueOnce(page('fallback', 'fallback-cursor', false, {
+        canonicalAvailable: false,
+        canonicalComplete: false,
+      }))
+      .mockResolvedValueOnce(page('m3', 'cursor-3', false))
+    const inspect = useSessionInspect(inspection)
 
     await inspect.load('agent:main:webchat:test')
     await inspect.loadEarlier()
 
-    expect(inspect.messages.value.map(message => message.message_id)).toEqual(['m4'])
+    expect(inspect.messages.value.map(row => row.messageId)).toEqual(['m4'])
     expect(inspect.oldestCursor.value).toBe('cursor-4')
     expect(inspect.hasEarlier.value).toBe(true)
     expect(inspect.canonicalAvailable.value).toBe(false)
 
     await inspect.retryHistory()
 
-    expect(inspect.messages.value.map(message => message.message_id)).toEqual(['m3', 'm4'])
-    expect(rpc.call).toHaveBeenLastCalledWith('chat.history', expect.objectContaining({
-      before: 'cursor-4',
-    }))
+    expect(inspect.messages.value.map(row => row.messageId)).toEqual(['m3', 'm4'])
+    expect(before).toHaveBeenLastCalledWith(
+      'agent:main:webchat:test',
+      'cursor-4',
+      expect.objectContaining({ limit: 20 }),
+    )
   })
 
-  it('marks a legacy transcript incomplete only when the server says so', async () => {
-    rpc.call.mockImplementation(async (method: string) => {
-      if (method === 'sessions.preview') return { previews: [] }
-      return { ...page('m1', 'cursor-1', false), canonical_complete: false }
-    })
-    const inspect = useSessionInspect(sessionConversationFromTestRpc(rpc))
+  it('marks a legacy transcript incomplete only when the domain says so', async () => {
+    latest.mockResolvedValueOnce(page('m1', 'cursor-1', false, {
+      canonicalComplete: false,
+    }))
+    const inspect = useSessionInspect(inspection)
 
     await inspect.load('agent:main:webchat:legacy')
 
@@ -117,64 +153,55 @@ describe('useSessionInspect canonical pagination', () => {
     expect(inspect.hasEarlier.value).toBe(false)
   })
 
-  it('keeps canonical read unavailability distinct from legacy incompleteness', async () => {
-    let historyCall = 0
-    rpc.call.mockImplementation(async (method: string) => {
-      if (method === 'sessions.preview') return { previews: [] }
-      historyCall++
-      return {
-        ...page('m1', 'cursor-1', false),
-        canonical_available: historyCall > 1,
-        canonical_complete: historyCall > 1,
-      }
-    })
-    const inspect = useSessionInspect(sessionConversationFromTestRpc(rpc))
+  it('keeps unavailable latest rows but does not advance their cursor', async () => {
+    latest
+      .mockResolvedValueOnce(page('m1', 'fallback-cursor', true, {
+        canonicalAvailable: false,
+        canonicalComplete: false,
+      }))
+      .mockResolvedValueOnce(page('m1', 'cursor-1', false))
+    const inspect = useSessionInspect(inspection)
 
     await inspect.load('agent:main:webchat:retry')
 
+    expect(inspect.messages.value.map(row => row.messageId)).toEqual(['m1'])
+    expect(inspect.oldestCursor.value).toBeNull()
+    expect(inspect.hasEarlier.value).toBe(false)
     expect(inspect.canonicalAvailable.value).toBe(false)
-    expect(inspect.canonicalComplete.value).toBe(false)
-    expect(inspect.messages.value.map(message => message.message_id)).toEqual(['m1'])
 
     await inspect.retryHistory()
-    expect(historyCall).toBe(2)
+    expect(latest).toHaveBeenCalledTimes(2)
     expect(inspect.canonicalAvailable.value).toBe(true)
+    expect(inspect.oldestCursor.value).toBe('cursor-1')
   })
 
   it('invokes the prepend hook immediately before applying the returned page', async () => {
-    let historyCall = 0
-    rpc.call.mockImplementation(async (method: string) => {
-      if (method === 'sessions.preview') return { previews: [] }
-      historyCall++
-      return historyCall === 1
-        ? page('m2', 'cursor-2', true)
-        : page('m1', 'cursor-1', false)
-    })
-    const inspect = useSessionInspect(sessionConversationFromTestRpc(rpc))
+    const inspect = useSessionInspect(inspection)
     let visibleBeforeApply: string[] = []
 
     await inspect.load('agent:main:webchat:test')
     await inspect.loadEarlier(() => {
-      visibleBeforeApply = inspect.messages.value.map(message => String(message.message_id))
+      visibleBeforeApply = inspect.messages.value.map(row => row.messageId ?? row.id)
     })
 
     expect(visibleBeforeApply).toEqual(['m2'])
-    expect(inspect.messages.value.map(message => message.message_id)).toEqual(['m1', 'm2'])
+    expect(inspect.messages.value.map(row => row.messageId)).toEqual(['m1', 'm2'])
   })
 
-  it('clears a stale earlier-page loading state when switching sessions', async () => {
-    let historyCall = 0
-    let resolveOldEarlier!: (value: ReturnType<typeof page>) => void
-    const oldEarlier = new Promise<ReturnType<typeof page>>(resolve => { resolveOldEarlier = resolve })
-    rpc.call.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
-      if (method === 'sessions.preview') return { previews: [] }
-      historyCall++
-      if (historyCall === 1) return page('a2', 'cursor-a2', true)
-      if (historyCall === 2) return oldEarlier
-      if (params?.sessionKey === 'agent:main:webchat:b') return page('b2', 'cursor-b2', true)
-      return page('a1', 'cursor-a1', false)
+  it('fences a stale earlier page when switching sessions', async () => {
+    let resolveOldEarlier!: (value: SessionReadHistoryPage) => void
+    const oldEarlier = new Promise<SessionReadHistoryPage>(resolve => {
+      resolveOldEarlier = resolve
     })
-    const inspect = useSessionInspect(sessionConversationFromTestRpc(rpc))
+    latest.mockImplementation(async key => (
+      key.endsWith(':b')
+        ? page('b2', 'cursor-b2', true)
+        : page('a2', 'cursor-a2', true)
+    ))
+    before.mockImplementation(async key => (
+      key.endsWith(':a') ? oldEarlier : page('b1', 'cursor-b1', false)
+    ))
+    const inspect = useSessionInspect(inspection)
 
     await inspect.load('agent:main:webchat:a')
     const staleLoad = inspect.loadEarlier()
@@ -186,9 +213,38 @@ describe('useSessionInspect canonical pagination', () => {
     await staleLoad
 
     await inspect.loadEarlier()
-    expect(rpc.call).toHaveBeenLastCalledWith('chat.history', expect.objectContaining({
-      sessionKey: 'agent:main:webchat:b',
-      before: 'cursor-b2',
-    }))
+    expect(before).toHaveBeenLastCalledWith(
+      'agent:main:webchat:b',
+      'cursor-b2',
+      expect.any(Object),
+    )
+  })
+
+  it('aborts pending inspection reads on reset', async () => {
+    let observedSignal: AbortSignal | null = null
+    latest.mockImplementation(async (_key, options) => {
+      observedSignal = options?.signal ?? null
+      await new Promise<void>(() => {})
+      return page('never', 'never', false)
+    })
+    const inspect = useSessionInspect(inspection)
+
+    void inspect.load('agent:main:webchat:pending')
+    await vi.waitFor(() => expect(observedSignal).not.toBeNull())
+    inspect.reset()
+
+    expect((observedSignal as unknown as AbortSignal).aborted).toBe(true)
+    expect(inspect.loading.value).toBe(false)
+  })
+
+  it('keeps a preview failure separate from transcript state', async () => {
+    preview.mockRejectedValueOnce(new Error('preview unavailable'))
+    const inspect = useSessionInspect(inspection)
+
+    await inspect.load('agent:main:webchat:test')
+
+    expect(inspect.preview.value).toBeNull()
+    expect(inspect.transcriptError.value).toBe(false)
+    expect(inspect.messages.value.map(row => row.messageId)).toEqual(['m2'])
   })
 })

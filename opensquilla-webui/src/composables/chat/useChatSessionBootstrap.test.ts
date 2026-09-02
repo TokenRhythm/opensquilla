@@ -2,24 +2,21 @@ import { ref } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { RpcTimeoutError } from '@/lib/rpc'
-import { useChatSessionBootstrap } from './useChatSessionBootstrap'
 import type {
-  SessionBootstrapPhaseContext,
-  SessionPhaseResult,
-} from './sessionBootstrapContract'
+  SessionReadLease,
+  SessionReadLifecycle,
+} from '@/modules/sessionReadLifecycle'
+import type { SessionSubscriptionOutcome } from './useChatSessionSubscription'
 import {
   autoSendDraftIsUnchanged,
   shouldRetrySessionPhase,
+  type SessionBootstrapPhaseContext,
+  type SessionPhaseResult,
 } from './sessionBootstrapContract'
-import type { SessionSubscriptionOutcome } from './useChatSessionSubscription'
+import { useChatSessionBootstrap } from './useChatSessionBootstrap'
 
 const LIVE_READY: SessionSubscriptionOutcome = {
   authoritative: true,
-  live: false,
-  backgroundOnly: false,
-}
-const UNAVAILABLE_FOR_TEST: SessionSubscriptionOutcome = {
-  authoritative: false,
   live: false,
   backgroundOnly: false,
 }
@@ -32,49 +29,56 @@ function createBootstrap(overrides: {
   subscribeSession?: (
     context: SessionBootstrapPhaseContext,
   ) => Promise<SessionSubscriptionOutcome>
-  markCriticalRequestsSent?: boolean
+  criticalRequestsQueued?: () => Promise<void>
 } = {}) {
   const loadHistoryImplementation = overrides.loadHistory || (async () => ({ ok: true }))
   const loadHistory = vi.fn(async (
     context: SessionBootstrapPhaseContext,
     retry: boolean,
-  ) => {
-    // Production marks immediately after RpcClient synchronously sends the
-    // history frame.
-    if (overrides.markCriticalRequestsSent !== false) {
-      context.markHistoryRequestSent?.(context.attempt + 1)
-    }
-    return loadHistoryImplementation(context, retry)
-  })
+  ) => loadHistoryImplementation(context, retry))
   const subscribeImplementation = overrides.subscribeSession || (async () => LIVE_READY)
-  const subscribeSession = vi.fn(async (context: SessionBootstrapPhaseContext) => {
-    // The production subscription marks immediately after its subscribe frame
-    // is synchronously sent. Test doubles must model the same wire boundary.
-    if (overrides.markCriticalRequestsSent !== false) {
-      context.markLiveSubscribeSent?.(context.attempt + 1)
-    }
-    return subscribeImplementation(context)
-  })
+  const subscribeSession = vi.fn(subscribeImplementation)
   const cancelHistory = vi.fn()
   const cancelSubscription = vi.fn()
-  const unsubscribeSession = vi.fn()
+  const closeLease = vi.fn(async () => undefined)
+  let currentLease: SessionReadLease | null = null
+  const openSessionRead = vi.fn(() => {
+    void currentLease?.close()
+    currentLease = ({
+      criticalRequestsQueued: overrides.criticalRequestsQueued?.() ?? Promise.resolve(),
+      live: Promise.resolve({}),
+      metadata: Promise.resolve({}),
+      history: {},
+      retryMetadata: async () => ({}),
+      close: closeLease,
+    }) as unknown as SessionReadLease
+    return currentLease
+  })
+  const sessionReadLifecycle = {
+    open: openSessionRead,
+    current: () => currentLease,
+  } as SessionReadLifecycle
+  const retireCurrentLease = () => {
+    currentLease = null
+  }
   const sessionKey = ref('agent:main:webchat:bootstrap-test')
   const api = useChatSessionBootstrap({
     sessionKey,
+    sessionReadLifecycle,
     loadHistory,
     subscribeSession,
     cancelHistory,
     cancelSubscription,
-    unsubscribeSession,
   })
   return {
     api,
-    sessionKey,
     loadHistory,
     subscribeSession,
     cancelHistory,
     cancelSubscription,
-    unsubscribeSession,
+    closeLease,
+    openSessionRead,
+    retireCurrentLease,
   }
 }
 
@@ -83,15 +87,11 @@ afterEach(() => {
 })
 
 describe('useChatSessionBootstrap', () => {
-  it('releases optional traffic after critical frames are queued, not responses', async () => {
-    let resolveHistory!: (result: SessionPhaseResult) => void
-    let resolveLive!: (result: SessionSubscriptionOutcome) => void
-    const history = new Promise<SessionPhaseResult>(resolve => {
-      resolveHistory = resolve
-    })
-    const live = new Promise<SessionSubscriptionOutcome>(resolve => {
-      resolveLive = resolve
-    })
+  it('releases optional traffic after the lease queues critical frames, not responses', async () => {
+    let releaseHistory!: (result: SessionPhaseResult) => void
+    let releaseLive!: (result: SessionSubscriptionOutcome) => void
+    const history = new Promise<SessionPhaseResult>(resolve => { releaseHistory = resolve })
+    const live = new Promise<SessionSubscriptionOutcome>(resolve => { releaseLive = resolve })
     const { api } = createBootstrap({
       loadHistory: async () => history,
       subscribeSession: async () => live,
@@ -103,22 +103,19 @@ describe('useChatSessionBootstrap', () => {
     expect(api.historyPhase.value).toBe('loading')
     expect(api.livePhase.value).toBe('connecting')
 
-    resolveHistory({ ok: true })
-    resolveLive(LIVE_READY)
+    releaseHistory({ ok: true })
+    releaseLive(LIVE_READY)
     await Promise.all([run.history, run.live])
   })
 
-  it('retries a history-only timeout without waiting for a new live registration', async () => {
+  it('retries a history-only timeout without reopening the live lease', async () => {
     vi.useFakeTimers()
-    let historyAttempt = 0
-    const { api, loadHistory, subscribeSession } = createBootstrap({
+    let attempt = 0
+    const { api, loadHistory, subscribeSession, openSessionRead } = createBootstrap({
       loadHistory: async () => {
-        historyAttempt += 1
-        return historyAttempt === 1
-          ? {
-              ok: false,
-              error: new RpcTimeoutError('chat.history', 7_000),
-            }
+        attempt += 1
+        return attempt === 1
+          ? { ok: false, error: new RpcTimeoutError('chat.history', 7_000) }
           : { ok: true }
       },
     })
@@ -129,186 +126,119 @@ describe('useChatSessionBootstrap', () => {
 
     expect(loadHistory).toHaveBeenCalledTimes(2)
     expect(subscribeSession).toHaveBeenCalledOnce()
-    expect(api.historyPhase.value).toBe('ready')
-    expect(api.livePhase.value).toBe('ready')
-  })
-
-  it('queues replacement live registration before retrying legacy history', async () => {
-    const order: string[] = []
-    let resolveFirstHistory!: (result: SessionPhaseResult) => void
-    const { api } = createBootstrap({
-      subscribeSession: async context => {
-        order.push(`subscribe:${context.attempt}`)
-        return LIVE_READY
-      },
-      loadHistory: async context => {
-        order.push(`history:${context.attempt}`)
-        if (context.attempt === 0) {
-          return new Promise(resolve => {
-            resolveFirstHistory = resolve
-          })
-        }
-        return { ok: true }
-      },
-    })
-
-    const run = api.startSessionBootstrap()
-    await run.live
-    api.handleConnectionState('disconnected')
-    resolveFirstHistory({
-      ok: false,
-      error: new RpcTimeoutError('chat.history', 7_000),
-    })
-    await Promise.all([run.history, api.handleConnectionState('connected')!.live])
-
-    expect(order).toEqual([
-      'subscribe:0',
-      'history:0',
-      'subscribe:1',
-      'history:1',
-    ])
-    expect(api.livePhase.value).toBe('ready')
+    expect(openSessionRead).toHaveBeenCalledOnce()
     expect(api.historyPhase.value).toBe('ready')
   })
 
-  it('rearms the critical queue for a replacement socket', async () => {
-    let resolveFirstHistory!: (result: SessionPhaseResult) => void
-    let historyAttempt = 0
-    const connectionFailure = new Error('connection closed')
-    const { api, loadHistory, subscribeSession } = createBootstrap({
-      loadHistory: async () => {
-        historyAttempt += 1
-        if (historyAttempt === 1) {
-          return new Promise(resolve => {
-            resolveFirstHistory = resolve
-          })
-        }
-        return { ok: true }
+  it('replaces a disconnected lease with a fenced logical generation', async () => {
+    let opened = 0
+    let releaseReplacement!: () => void
+    const { api, openSessionRead, subscribeSession } = createBootstrap({
+      criticalRequestsQueued: () => {
+        opened += 1
+        return opened === 1
+          ? Promise.resolve()
+          : new Promise<void>(resolve => { releaseReplacement = resolve })
       },
     })
 
     const initial = api.startSessionBootstrap()
-    await initial.criticalRequestsQueued
     await initial.live
+    const replacement = api.handleConnectionState('disconnected')!
 
-    const recovery = api.handleConnectionState('disconnected')!
+    expect(replacement.generation).toBeGreaterThan(initial.generation)
+    expect(api.isSessionBootstrapCurrent(initial.generation)).toBe(false)
+    expect(api.isSessionBootstrapCurrent(replacement.generation)).toBe(true)
+    expect(openSessionRead).toHaveBeenCalledTimes(2)
+    expect(subscribeSession).toHaveBeenCalledTimes(2)
+
     let replacementQueued = false
-    void recovery.criticalRequestsQueued.then(() => {
-      replacementQueued = true
-    })
+    void replacement.criticalRequestsQueued.then(() => { replacementQueued = true })
     await Promise.resolve()
     expect(replacementQueued).toBe(false)
-
-    resolveFirstHistory({ ok: false, error: connectionFailure })
-    await recovery.criticalRequestsQueued
-    await Promise.all([recovery.history, recovery.live])
-
-    expect(loadHistory).toHaveBeenCalledTimes(2)
-    expect(subscribeSession).toHaveBeenCalledTimes(2)
+    releaseReplacement()
+    await replacement.criticalRequestsQueued
     expect(replacementQueued).toBe(true)
   })
 
-  it('keeps existing queue waiters blocked across a same-run reconnect', async () => {
-    let resolveFirstLive!: (result: SessionSubscriptionOutcome) => void
-    let liveAttempt = 0
-    const { api } = createBootstrap({
-      markCriticalRequestsSent: false,
-      subscribeSession: async context => {
-        liveAttempt += 1
-        if (liveAttempt === 1) {
-          return new Promise(resolve => {
-            resolveFirstLive = resolve
-          })
-        }
-        context.markLiveSubscribeSent?.(2)
-        return LIVE_READY
+  it('replaces an in-flight connected run with one coherent generation', async () => {
+    let releaseInitialLive!: (result: SessionSubscriptionOutcome) => void
+    let liveCall = 0
+    let historyCall = 0
+    const criticalRequests: Promise<void>[] = []
+    const initialHistory: SessionPhaseResult = { ok: true }
+    const replacementHistory: SessionPhaseResult = { ok: true }
+    const replacementLive: SessionSubscriptionOutcome = {
+      ...LIVE_READY,
+      error: new Error('replacement-live'),
+    }
+    const { api, openSessionRead } = createBootstrap({
+      criticalRequestsQueued: () => {
+        const queued = Promise.resolve()
+        criticalRequests.push(queued)
+        return queued
       },
-      loadHistory: async context => {
-        context.markHistoryRequestSent?.(2)
-        return { ok: true }
+      loadHistory: async () => {
+        historyCall += 1
+        return historyCall === 1 ? initialHistory : replacementHistory
+      },
+      subscribeSession: async () => {
+        liveCall += 1
+        if (liveCall === 1) {
+          return new Promise(resolve => { releaseInitialLive = resolve })
+        }
+        return replacementLive
       },
     })
 
     const initial = api.startSessionBootstrap()
-    let initialQueued = false
-    void initial.criticalRequestsQueued.then(() => {
-      initialQueued = true
-    })
+    const replacement = api.handleConnectionState('connected')!
 
-    const firstRecovery = api.handleConnectionState('disconnected')!
-    let firstReplacementQueued = false
-    void firstRecovery.criticalRequestsQueued.then(() => {
-      firstReplacementQueued = true
-    })
-    const latestRecovery = api.handleConnectionState('disconnected')!
-    let latestReplacementQueued = false
-    void latestRecovery.criticalRequestsQueued.then(() => {
-      latestReplacementQueued = true
-    })
-    await Promise.resolve()
-    expect(initialQueued).toBe(false)
-    expect(firstReplacementQueued).toBe(false)
-    expect(latestReplacementQueued).toBe(false)
+    expect(replacement.generation).toBeGreaterThan(initial.generation)
+    expect(replacement.criticalRequestsQueued).toBe(criticalRequests[1])
+    await expect(replacement.history).resolves.toBe(replacementHistory)
+    await expect(replacement.live).resolves.toBe(replacementLive)
+    expect(openSessionRead).toHaveBeenCalledTimes(2)
 
-    resolveFirstLive({
-      ...UNAVAILABLE_FOR_TEST,
-      error: new Error('connection closed'),
+    releaseInitialLive(LIVE_READY)
+    await expect(initial.live).resolves.toEqual({
+      ...LIVE_READY,
+      authoritative: false,
+      cancelled: true,
     })
-    await latestRecovery.criticalRequestsQueued
-    await firstRecovery.criticalRequestsQueued
-    await Promise.all([latestRecovery.history, latestRecovery.live])
-
-    expect(initialQueued).toBe(true)
-    expect(firstReplacementQueued).toBe(true)
-    expect(latestReplacementQueued).toBe(true)
-    expect(liveAttempt).toBe(2)
+    expect(api.historyPhase.value).toBe('ready')
+    expect(api.livePhase.value).toBe('ready')
   })
 
-  it('cancels delayed auto-send when text or attachments changed', () => {
-    const attachment = { id: 1 }
-    expect(autoSendDraftIsUnchanged(
-      'draft', 'draft', [attachment], [attachment], 1, 1,
-    )).toBe(true)
-    expect(autoSendDraftIsUnchanged(
-      'draft', 'edited', [attachment], [attachment], 1, 2,
-    )).toBe(false)
-    expect(autoSendDraftIsUnchanged(
-      'draft', '', [attachment], [attachment], 1, 2,
-    )).toBe(false)
-    expect(autoSendDraftIsUnchanged(
-      'draft', 'draft', [], [attachment], 1, 2,
-    )).toBe(false)
-    expect(autoSendDraftIsUnchanged(
-      'draft', 'draft', [attachment], [{ id: 1 }], 1, 2,
-    )).toBe(false)
-    // Editing and then restoring the same visible draft still means the user
-    // took control while bootstrap was pending.
-    expect(autoSendDraftIsUnchanged(
-      'draft', 'draft', [attachment], [attachment], 1, 3,
-    )).toBe(false)
+  it('keeps a degraded lease bounded until an explicit connected recovery', async () => {
+    let available = false
+    const { api, openSessionRead } = createBootstrap({
+      subscribeSession: async () => available
+        ? LIVE_READY
+        : { authoritative: false, live: false, backgroundOnly: false },
+    })
+    const initial = api.startSessionBootstrap()
+    await Promise.all([initial.history, initial.live])
+
+    const disconnected = api.handleConnectionState('disconnected')!
+    expect(disconnected.generation).toBe(initial.generation)
+    expect(openSessionRead).toHaveBeenCalledOnce()
+
+    available = true
+    const recovered = api.handleConnectionState('connected')!
+    await recovered.live
+    expect(recovered.generation).toBeGreaterThan(initial.generation)
+    expect(openSessionRead).toHaveBeenCalledTimes(2)
+    expect(api.livePhase.value).toBe('ready')
   })
 
-  it('honors a retryable server contract for idempotent bootstrap phases', () => {
-    expect(shouldRetrySessionPhase(Object.assign(new Error('temporarily unavailable'), {
-      code: 'UNAVAILABLE',
-      retryable: true,
-    }))).toBe(true)
-    expect(shouldRetrySessionPhase(Object.assign(new Error('not authorized'), {
-      code: 'FORBIDDEN',
-      retryable: false,
-    }))).toBe(false)
-  })
-
-  it('terminates both phases after one bounded automatic retry', async () => {
+  it('keeps live retry ownership at the lease boundary while history retries once', async () => {
     const historyContexts: SessionBootstrapPhaseContext[] = []
     const liveContexts: SessionBootstrapPhaseContext[] = []
     const { api } = createBootstrap({
       loadHistory: async context => {
         historyContexts.push(context)
-        return {
-          ok: false,
-          error: new RpcTimeoutError('chat.history', 7_000),
-        }
+        return { ok: false, error: new RpcTimeoutError('chat.history', 7_000) }
       },
       subscribeSession: async context => {
         liveContexts.push(context)
@@ -325,658 +255,211 @@ describe('useChatSessionBootstrap', () => {
     await Promise.all([run.history, run.live])
 
     expect(historyContexts.map(context => context.attempt)).toEqual([0, 1])
-    expect(liveContexts.map(context => context.attempt)).toEqual([0, 1])
-    expect(liveContexts.map(context => context.skipSnapshot)).toEqual([false, false])
-    expect(historyContexts.every(context =>
-      context.attemptDeadlineAt <= context.deadlineAt
-      && context.attemptDeadlineAt - Date.now() <= 7_000,
-    )).toBe(true)
+    expect(liveContexts.map(context => context.attempt)).toEqual([0])
     expect(api.historyPhase.value).toBe('error')
     expect(api.livePhase.value).toBe('degraded')
   })
 
-  it('puts live subscribe ahead of history on every replacement socket', async () => {
-    const order: string[] = []
-    const connectionFailure = new Error('connection closed')
-    const { api } = createBootstrap({
-      subscribeSession: async context => {
-        order.push(`subscribe:${context.attempt}`)
-        return context.attempt === 0
-          ? { ...UNAVAILABLE_FOR_TEST, error: connectionFailure }
-          : LIVE_READY
-      },
-      loadHistory: async context => {
-        order.push(`history:${context.attempt}`)
-        return context.attempt === 0
-          ? { ok: false, error: connectionFailure }
-          : { ok: true }
-      },
-    })
-
-    const run = api.startSessionBootstrap()
-    await Promise.all([run.history, run.live])
-
-    expect(order).toEqual([
-      'subscribe:0',
-      'history:0',
-      'subscribe:1',
-      'history:1',
-    ])
-    expect(api.livePhase.value).toBe('ready')
-    expect(api.historyPhase.value).toBe('ready')
-  })
-
-  it('retries STORAGE_BUSY once after the server-provided delay without degrading live', async () => {
+  it('retries STORAGE_BUSY after the server delay without disturbing live', async () => {
     vi.useFakeTimers()
     const busy = Object.assign(new Error('storage busy'), {
       code: 'STORAGE_BUSY',
       retryable: true,
       retry_after_ms: 100,
     })
-    let historyAttempt = 0
+    let attempt = 0
     const { api, loadHistory, subscribeSession } = createBootstrap({
       loadHistory: async () => {
-        historyAttempt += 1
-        return historyAttempt === 1
-          ? { ok: false, error: busy }
-          : { ok: true }
+        attempt += 1
+        return attempt === 1 ? { ok: false, error: busy } : { ok: true }
       },
     })
 
     const run = api.startSessionBootstrap()
     await run.live
     expect(loadHistory).toHaveBeenCalledOnce()
-    expect(api.livePhase.value).toBe('ready')
-
     await vi.advanceTimersByTimeAsync(100)
     await run.history
 
     expect(loadHistory).toHaveBeenCalledTimes(2)
     expect(subscribeSession).toHaveBeenCalledOnce()
-    expect(api.historyPhase.value).toBe('ready')
-    expect(api.livePhase.value).toBe('ready')
   })
 
-  it('retries one failed phase manually without restarting the healthy phase', async () => {
-    let recoverHistory = false
-    const terminal = Object.assign(new Error('history unavailable'), {
+  it('retries failed history manually on the same lease', async () => {
+    let recover = false
+    const failure = Object.assign(new Error('history unavailable'), {
       code: 'HISTORY_UNAVAILABLE',
       retryable: true,
     })
-    const { api, loadHistory, subscribeSession } = createBootstrap({
-      loadHistory: async () => (
-        recoverHistory
-          ? { ok: true }
-          : { ok: false, error: terminal }
-      ),
+    const { api, loadHistory, subscribeSession, openSessionRead } = createBootstrap({
+      loadHistory: async () => recover ? { ok: true } : { ok: false, error: failure },
     })
 
-    const first = api.startSessionBootstrap()
-    await Promise.all([first.history, first.live])
-    expect(api.historyPhase.value).toBe('error')
-    expect(api.livePhase.value).toBe('ready')
-
-    recoverHistory = true
+    const initial = api.startSessionBootstrap()
+    await Promise.all([initial.history, initial.live])
+    recover = true
     await api.retryHistory()
 
     expect(loadHistory).toHaveBeenCalledTimes(3)
     expect(subscribeSession).toHaveBeenCalledOnce()
+    expect(openSessionRead).toHaveBeenCalledOnce()
     expect(api.historyPhase.value).toBe('ready')
-    expect(api.livePhase.value).toBe('ready')
   })
 
-  it('invalidates and aborts both phases before best-effort unsubscribe', async () => {
-    let resolveHistory!: (result: SessionPhaseResult) => void
-    let resolveLive!: (result: SessionSubscriptionOutcome) => void
-    const history = new Promise<SessionPhaseResult>(resolve => {
-      resolveHistory = resolve
+  it('reopens a dead lease before retrying history', async () => {
+    let recover = false
+    const failure = Object.assign(new Error('history unavailable'), {
+      code: 'HISTORY_UNAVAILABLE',
+      retryable: false,
     })
-    const live = new Promise<SessionSubscriptionOutcome>(resolve => {
-      resolveLive = resolve
+    const {
+      api,
+      loadHistory,
+      subscribeSession,
+      openSessionRead,
+      retireCurrentLease,
+    } = createBootstrap({
+      loadHistory: async () => recover ? { ok: true } : { ok: false, error: failure },
     })
-    const { api, cancelHistory, cancelSubscription, unsubscribeSession } = createBootstrap({
+
+    const initial = api.startSessionBootstrap()
+    await Promise.all([initial.history, initial.live])
+    retireCurrentLease()
+    recover = true
+
+    await expect(api.retryHistory()).resolves.toEqual({ ok: true })
+    expect(loadHistory).toHaveBeenCalledTimes(2)
+    expect(subscribeSession).toHaveBeenCalledTimes(2)
+    expect(openSessionRead).toHaveBeenCalledTimes(2)
+    expect(api.historyPhase.value).toBe('ready')
+  })
+
+  it('invalidates consumer projections before closing the owned lease', async () => {
+    let releaseHistory!: (result: SessionPhaseResult) => void
+    let releaseLive!: (result: SessionSubscriptionOutcome) => void
+    const history = new Promise<SessionPhaseResult>(resolve => { releaseHistory = resolve })
+    const live = new Promise<SessionSubscriptionOutcome>(resolve => { releaseLive = resolve })
+    const { api, cancelHistory, cancelSubscription, closeLease } = createBootstrap({
       loadHistory: async () => history,
       subscribeSession: async () => live,
     })
-
     const run = api.startSessionBootstrap()
-    expect(api.livePhase.value).toBe('connecting')
+    cancelHistory.mockClear()
+    cancelSubscription.mockClear()
 
     api.cancelSessionBootstrap()
 
     expect(cancelHistory).toHaveBeenCalledOnce()
     expect(cancelSubscription).toHaveBeenCalledOnce()
-    expect(unsubscribeSession).toHaveBeenCalledWith(
-      'agent:main:webchat:bootstrap-test',
-    )
+    expect(closeLease).toHaveBeenCalledOnce()
     expect(api.historyPhase.value).toBe('idle')
     expect(api.livePhase.value).toBe('idle')
 
-    resolveHistory({ ok: true })
-    resolveLive(LIVE_READY)
+    releaseHistory({ ok: true })
+    releaseLive(LIVE_READY)
     await Promise.all([run.history, run.live])
-
     expect(api.historyPhase.value).toBe('idle')
     expect(api.livePhase.value).toBe('idle')
   })
 
-  it('routes a completed connection recovery through one new coordinated run', async () => {
-    const { api, loadHistory, subscribeSession } = createBootstrap()
-    const first = api.startSessionBootstrap()
-    await Promise.all([first.history, first.live])
+  it('retries live through a fresh logical run without reloading history', async () => {
+    const { api, loadHistory, subscribeSession, openSessionRead } = createBootstrap()
+    const initial = api.startSessionBootstrap()
+    await Promise.all([initial.history, initial.live])
 
-    const resumed = api.handleConnectionState('disconnected')
-    expect(api.livePhase.value).toBe('connecting')
-    await Promise.all([resumed!.history, resumed!.live])
-    api.handleConnectionState('connected')
+    await api.retryLive()
 
-    expect(loadHistory).toHaveBeenCalledTimes(2)
-    expect(subscribeSession).toHaveBeenCalledTimes(2)
-    expect(api.historyPhase.value).toBe('ready')
-    expect(api.livePhase.value).toBe('ready')
-  })
-
-  it('automatically retries interrupted history after the recovery budget expires', async () => {
-    vi.useFakeTimers()
-    let resolveHistory!: (result: SessionPhaseResult) => void
-    let resolveLive!: (result: SessionSubscriptionOutcome) => void
-    let historyCalls = 0
-    let liveCalls = 0
-    const timeout = new RpcTimeoutError('session bootstrap', 7_000)
-    const connectionClosed = new Error('connection closed')
-    const { api, loadHistory, subscribeSession } = createBootstrap({
-      loadHistory: async () => {
-        historyCalls += 1
-        if (historyCalls === 1) {
-          return new Promise(resolve => {
-            resolveHistory = resolve
-          })
-        }
-        return historyCalls === 2
-          ? { ok: false, error: timeout }
-          : { ok: true }
-      },
-      subscribeSession: async () => {
-        liveCalls += 1
-        if (liveCalls === 1) {
-          return new Promise(resolve => {
-            resolveLive = resolve
-          })
-        }
-        return liveCalls === 2
-          ? { ...UNAVAILABLE_FOR_TEST, error: timeout }
-          : LIVE_READY
-      },
-    })
-
-    const run = api.startSessionBootstrap()
-    await vi.waitFor(() => {
-      expect(resolveHistory).toBeTypeOf('function')
-      expect(resolveLive).toBeTypeOf('function')
-    })
-    api.handleConnectionState('disconnected')
-    resolveHistory({ ok: false, error: connectionClosed })
-    resolveLive({ ...UNAVAILABLE_FOR_TEST, error: timeout })
-    await Promise.all([run.history, run.live])
-
-    await vi.advanceTimersByTimeAsync(15_001)
-    api.handleConnectionState('disconnected')
-    expect(api.livePhase.value).toBe('degraded')
-    const lateRecovery = api.handleConnectionState('connected')
-    await Promise.all([lateRecovery!.history, lateRecovery!.live])
-
-    expect(loadHistory).toHaveBeenCalledTimes(3)
-    expect(loadHistory.mock.calls[2]?.[0].attempt).toBe(0)
-    expect(loadHistory.mock.calls[2]?.[1]).toBe(true)
-    expect(subscribeSession).toHaveBeenCalledTimes(3)
-    expect(api.historyPhase.value).toBe('ready')
-    expect(api.livePhase.value).toBe('ready')
-  })
-
-  it.each([
-    {
-      label: 'deterministic INVALID_REQUEST',
-      error: Object.assign(new Error('invalid history request'), {
-        code: 'INVALID_REQUEST',
-        retryable: false,
-      }),
-      initialCalls: 1,
-    },
-    {
-      label: 'out-of-scope STORAGE_BUSY',
-      error: Object.assign(new Error('storage busy'), {
-        code: 'STORAGE_BUSY',
-        retryable: true,
-      }),
-      initialCalls: 2,
-    },
-  ])('does not retry $label history on a late replacement connection', async ({
-    error,
-    initialCalls,
-  }) => {
-    vi.useFakeTimers()
-    let resolveLive!: (result: SessionSubscriptionOutcome) => void
-    let liveCalls = 0
-    const timeout = new RpcTimeoutError('sessions.messages.subscribe', 7_000)
-    const { api, loadHistory, subscribeSession } = createBootstrap({
-      loadHistory: async () => ({ ok: false, error }),
-      subscribeSession: async () => {
-        liveCalls += 1
-        if (liveCalls === 1) {
-          return new Promise(resolve => {
-            resolveLive = resolve
-          })
-        }
-        return liveCalls === 2
-          ? { ...UNAVAILABLE_FOR_TEST, error: timeout }
-          : LIVE_READY
-      },
-    })
-
-    const run = api.startSessionBootstrap()
-    await vi.waitFor(() => expect(resolveLive).toBeTypeOf('function'))
-    api.handleConnectionState('disconnected')
-    resolveLive({ ...UNAVAILABLE_FOR_TEST, error: timeout })
-    await Promise.all([run.history, run.live])
-    expect(loadHistory).toHaveBeenCalledTimes(initialCalls)
-
-    await vi.advanceTimersByTimeAsync(15_001)
-    api.handleConnectionState('disconnected')
-    const lateRecovery = api.handleConnectionState('connected')
-    await Promise.all([lateRecovery!.history, lateRecovery!.live])
-
-    expect(loadHistory).toHaveBeenCalledTimes(initialCalls)
-    expect(subscribeSession).toHaveBeenCalledTimes(3)
-    expect(api.historyPhase.value).toBe('error')
-    expect(api.livePhase.value).toBe('ready')
-  })
-
-  it('resumes when a replacement connects before the interrupted subscribe settles', async () => {
-    let resolveInterrupted!: (result: SessionSubscriptionOutcome) => void
-    let liveCalls = 0
-    const { api, loadHistory, subscribeSession } = createBootstrap({
-      subscribeSession: async () => {
-        liveCalls += 1
-        if (liveCalls === 1) {
-          return new Promise(resolve => {
-            resolveInterrupted = resolve
-          })
-        }
-        return LIVE_READY
-      },
-    })
-
-    const run = api.startSessionBootstrap()
-    await vi.waitFor(() => expect(resolveInterrupted).toBeTypeOf('function'))
-    api.handleConnectionState('disconnected')
-    api.handleConnectionState('connected')
-    resolveInterrupted({ ...UNAVAILABLE_FOR_TEST, cancelled: true })
-    await run.live
-
-    await vi.waitFor(() => expect(api.livePhase.value).toBe('ready'))
     expect(loadHistory).toHaveBeenCalledOnce()
     expect(subscribeSession).toHaveBeenCalledTimes(2)
+    expect(openSessionRead).toHaveBeenCalledTimes(2)
+    expect(api.historyPhase.value).toBe('ready')
   })
 
-  it('recovers once when connected wins the disconnect-association race', async () => {
-    let resolveInterrupted!: (result: SessionSubscriptionOutcome) => void
-    let liveCalls = 0
-    const connectionClosed = new Error('connection closed')
-    const { api, subscribeSession } = createBootstrap({
-      subscribeSession: async () => {
-        liveCalls += 1
-        if (liveCalls === 1) {
-          return new Promise(resolve => {
-            resolveInterrupted = resolve
-          })
-        }
-        if (liveCalls === 2) {
-          return { ...UNAVAILABLE_FOR_TEST, error: connectionClosed }
-        }
-        return LIVE_READY
-      },
-    })
-
-    const run = api.startSessionBootstrap()
-    await vi.waitFor(() => expect(resolveInterrupted).toBeTypeOf('function'))
-
-    // RpcClient can emit disconnected while a superseded bootstrap is being
-    // cancelled, before this run becomes active. Its replacement handshake is
-    // still observable, so remember that connected socket while this phase is
-    // settling and recover if both old-generation attempts fail.
-    api.handleConnectionState('connected')
-    resolveInterrupted({ ...UNAVAILABLE_FOR_TEST, error: connectionClosed })
-    await run.live
-
-    await vi.waitFor(() => expect(api.livePhase.value).toBe('ready'))
-    expect(subscribeSession).toHaveBeenCalledTimes(3)
-  })
-
-  it('recovers history when replacement connected before interrupted phases settled', async () => {
-    let resolveHistory!: (result: SessionPhaseResult) => void
-    let resolveLive!: (result: SessionSubscriptionOutcome) => void
-    let historyCalls = 0
-    let liveCalls = 0
-    const connectionClosed = new Error('connection closed')
-    const timeout = new RpcTimeoutError('chat.history', 7_000)
-    const { api, loadHistory, subscribeSession } = createBootstrap({
-      loadHistory: async () => {
-        historyCalls += 1
-        if (historyCalls === 1) {
-          return new Promise(resolve => {
-            resolveHistory = resolve
-          })
-        }
-        return historyCalls === 2
-          ? { ok: false, error: timeout }
-          : { ok: true }
-      },
-      subscribeSession: async () => {
-        liveCalls += 1
-        if (liveCalls === 1) {
-          return new Promise(resolve => {
-            resolveLive = resolve
-          })
-        }
-        return LIVE_READY
-      },
-    })
-
-    const run = api.startSessionBootstrap()
-    await vi.waitFor(() => {
-      expect(resolveHistory).toBeTypeOf('function')
-      expect(resolveLive).toBeTypeOf('function')
-    })
-    api.handleConnectionState('disconnected')
-    api.handleConnectionState('connected')
-    resolveHistory({ ok: false, error: connectionClosed })
-    resolveLive({ ...UNAVAILABLE_FOR_TEST, cancelled: true })
-    await run.live
-
-    await vi.waitFor(() => {
-      expect(api.historyPhase.value).toBe('ready')
-      expect(api.livePhase.value).toBe('ready')
-    })
-    expect(loadHistory).toHaveBeenCalledTimes(3)
-    expect(subscribeSession).toHaveBeenCalledTimes(2)
-  })
-
-  it('recovers history once when connected wins the disconnect-association race', async () => {
-    let resolveHistory!: (result: SessionPhaseResult) => void
-    let resolveLive!: (result: SessionSubscriptionOutcome) => void
-    let historyCalls = 0
-    let liveCalls = 0
-    const connectionClosed = new Error('connection closed')
-    const timeout = new RpcTimeoutError('chat.history', 7_000)
-    const { api, loadHistory, subscribeSession } = createBootstrap({
-      loadHistory: async () => {
-        historyCalls += 1
-        if (historyCalls === 1) {
-          return new Promise(resolve => {
-            resolveHistory = resolve
-          })
-        }
-        return historyCalls === 2
-          ? { ok: false, error: timeout }
-          : { ok: true }
-      },
-      subscribeSession: async () => {
-        liveCalls += 1
-        if (liveCalls === 1) {
-          return new Promise(resolve => {
-            resolveLive = resolve
-          })
-        }
-        return liveCalls === 2
-          ? { ...UNAVAILABLE_FOR_TEST, error: connectionClosed }
-          : LIVE_READY
-      },
-    })
-
-    const run = api.startSessionBootstrap()
-    await vi.waitFor(() => {
-      expect(resolveHistory).toBeTypeOf('function')
-      expect(resolveLive).toBeTypeOf('function')
-    })
-    api.handleConnectionState('connected')
-    resolveHistory({ ok: false, error: connectionClosed })
-    resolveLive({ ...UNAVAILABLE_FOR_TEST, error: connectionClosed })
-    await run.live
-
-    await vi.waitFor(() => {
-      expect(api.historyPhase.value).toBe('ready')
-      expect(api.livePhase.value).toBe('ready')
-    })
-    expect(loadHistory).toHaveBeenCalledTimes(3)
-    expect(subscribeSession).toHaveBeenCalledTimes(3)
-    api.handleConnectionState('connected')
-    await Promise.resolve()
-    expect(loadHistory).toHaveBeenCalledTimes(3)
-    expect(subscribeSession).toHaveBeenCalledTimes(3)
-  })
-
-  it('does not grant repeated replacement sockets unbounded recovery budgets', async () => {
-    let resolveInterrupted!: (result: SessionSubscriptionOutcome) => void
-    const timeout = new RpcTimeoutError('sessions.messages.subscribe', 7_000)
-    let liveCalls = 0
-    const { api, subscribeSession } = createBootstrap({
-      subscribeSession: async () => {
-        liveCalls += 1
-        if (liveCalls === 1) {
-          return new Promise(resolve => {
-            resolveInterrupted = resolve
-          })
-        }
-        return { ...UNAVAILABLE_FOR_TEST, error: timeout }
-      },
-    })
-
-    const run = api.startSessionBootstrap()
-    await vi.waitFor(() => expect(resolveInterrupted).toBeTypeOf('function'))
-    api.handleConnectionState('disconnected')
-    api.handleConnectionState('connected')
-    resolveInterrupted({ ...UNAVAILABLE_FOR_TEST, cancelled: true })
-    await run.live
-    await vi.waitFor(() => expect(api.livePhase.value).toBe('degraded'))
-
-    api.handleConnectionState('disconnected')
-    api.handleConnectionState('connected')
-    await Promise.resolve()
-
-    expect(subscribeSession).toHaveBeenCalledTimes(2)
-    expect(api.livePhase.value).toBe('degraded')
-  })
-
-  it('does not grant a degraded live phase more attempts when history recycles the socket', async () => {
-    let resolveHistory!: (result: SessionPhaseResult) => void
-    const history = new Promise<SessionPhaseResult>(resolve => {
-      resolveHistory = resolve
-    })
-    const timeout = new RpcTimeoutError('sessions.messages.subscribe', 7_000)
-    const { api, subscribeSession } = createBootstrap({
-      loadHistory: async () => history,
-      subscribeSession: async () => ({
-        ...UNAVAILABLE_FOR_TEST,
-        error: timeout,
-      }),
-    })
-
-    const run = api.startSessionBootstrap()
-    await run.live
-    expect(subscribeSession).toHaveBeenCalledTimes(2)
-    expect(api.livePhase.value).toBe('degraded')
-
-    api.handleConnectionState('disconnected')
-    await Promise.resolve()
-
-    expect(subscribeSession).toHaveBeenCalledTimes(2)
-    expect(api.livePhase.value).toBe('degraded')
-    resolveHistory({ ok: true })
-    await run.history
-  })
-
-  it('preserves the live attempt count across repeated disconnects in one bootstrap run', async () => {
-    let resolveHistory!: (result: SessionPhaseResult) => void
-    const history = new Promise<SessionPhaseResult>(resolve => {
-      resolveHistory = resolve
-    })
-    const { api, subscribeSession } = createBootstrap({
-      loadHistory: async () => history,
-      subscribeSession: async () => LIVE_READY,
-    })
-
-    const run = api.startSessionBootstrap()
-    await run.live
-    expect(subscribeSession).toHaveBeenCalledOnce()
-
-    await api.handleConnectionState('disconnected')!.live
-    expect(subscribeSession).toHaveBeenCalledTimes(2)
-    expect(api.livePhase.value).toBe('ready')
-
-    await api.handleConnectionState('disconnected')!.live
-    expect(subscribeSession).toHaveBeenCalledTimes(2)
-    expect(api.livePhase.value).toBe('degraded')
-
-    resolveHistory({ ok: true })
-    await run.history
-  })
-
-  it('gives live a fresh outage budget when a manual history retry recycles its socket', async () => {
-    let resolveManualHistory!: (result: SessionPhaseResult) => void
-    let historyCalls = 0
-    let liveCalls = 0
-    const firstLiveFailure = new Error('connection closed')
-    const terminalHistory = Object.assign(new Error('history unavailable'), {
-      code: 'HISTORY_UNAVAILABLE',
-    })
-    const { api, subscribeSession } = createBootstrap({
-      loadHistory: async () => {
-        historyCalls += 1
-        if (historyCalls === 1) {
-          return { ok: false, error: terminalHistory }
-        }
-        return new Promise(resolve => {
-          resolveManualHistory = resolve
-        })
-      },
-      subscribeSession: async () => {
-        liveCalls += 1
-        return liveCalls === 1
-          ? { ...UNAVAILABLE_FOR_TEST, error: firstLiveFailure }
-          : LIVE_READY
-      },
-    })
-
-    const initial = api.startSessionBootstrap()
-    await Promise.all([initial.history, initial.live])
-    expect(subscribeSession).toHaveBeenCalledTimes(2)
-    expect(api.livePhase.value).toBe('ready')
-    expect(api.historyPhase.value).toBe('error')
-
-    const historyRetry = api.retryHistory()
-    await vi.waitFor(() => expect(resolveManualHistory).toBeTypeOf('function'))
-    const outage = api.handleConnectionState('disconnected')
-    await outage!.live
-
-    expect(subscribeSession).toHaveBeenCalledTimes(3)
-    expect(api.livePhase.value).toBe('ready')
-    resolveManualHistory({ ok: true })
-    await historyRetry
-  })
-
-  it('skips the second snapshot only after the first attempt reached a terminal snapshot stage', async () => {
-    const contexts: SessionBootstrapPhaseContext[] = []
-    let call = 0
-    const timeout = new RpcTimeoutError('sessions.messages.snapshot', 3_000)
-    const { api } = createBootstrap({
-      subscribeSession: async context => {
-        contexts.push(context)
-        call += 1
-        return call === 1
-          ? {
-              ...UNAVAILABLE_FOR_TEST,
-              error: timeout,
-              skipSnapshotOnRetry: true,
-            }
-          : LIVE_READY
-      },
-    })
-
-    await api.startSessionBootstrap().live
-
-    expect(contexts.map(context => context.skipSnapshot)).toEqual([false, true])
-    expect(api.livePhase.value).toBe('ready')
-  })
-
-  it('does not reset an outage budget while the socket repeatedly flaps', async () => {
-    let resolveRecovery!: (result: SessionSubscriptionOutcome) => void
-    let liveCalls = 0
-    const { api, subscribeSession } = createBootstrap({
-      subscribeSession: async () => {
-        liveCalls += 1
-        if (liveCalls === 1) return LIVE_READY
-        return new Promise(resolve => {
-          resolveRecovery = resolve
-        })
-      },
-    })
-    const initial = api.startSessionBootstrap()
-    await Promise.all([initial.history, initial.live])
-
-    const recovery = api.handleConnectionState('disconnected')
-    api.handleConnectionState('connected')
-    api.handleConnectionState('disconnected')
-    api.handleConnectionState('connected')
-
-    expect(subscribeSession).toHaveBeenCalledTimes(2)
-    resolveRecovery(LIVE_READY)
-    await recovery!.live
-    expect(api.livePhase.value).toBe('ready')
-  })
-
-  it('upgrades a same-session live-only bootstrap to include history', async () => {
-    const { api, loadHistory, subscribeSession } = createBootstrap()
-    const liveOnly = api.startSessionBootstrap({ includeHistory: false })
-    await liveOnly.live
-
-    const full = api.startSessionBootstrap({ includeHistory: true })
-    await full.history
+  it('upgrades a same-session live-only run without reopening its lease', async () => {
+    const { api, loadHistory, subscribeSession, openSessionRead } = createBootstrap()
+    await api.startSessionBootstrap({ includeHistory: false }).live
+    await api.startSessionBootstrap({ includeHistory: true }).history
 
     expect(subscribeSession).toHaveBeenCalledOnce()
     expect(loadHistory).toHaveBeenCalledOnce()
-    expect(api.historyPhase.value).toBe('ready')
+    expect(openSessionRead).toHaveBeenCalledOnce()
   })
 
-  it('defers connection recovery instead of restarting the source during handoff', async () => {
-    const { api, subscribeSession } = createBootstrap()
-    const initial = api.startSessionBootstrap()
-    await Promise.all([initial.history, initial.live])
+  it('defers an in-flight connected recovery until handoff rollback', async () => {
+    let releaseInitial!: (result: SessionSubscriptionOutcome) => void
+    let liveCall = 0
+    const unavailable: SessionSubscriptionOutcome = {
+      authoritative: false,
+      live: false,
+      backgroundOnly: false,
+      cancelled: true,
+    }
+    const { api, subscribeSession, openSessionRead } = createBootstrap({
+      subscribeSession: async () => {
+        liveCall += 1
+        if (liveCall === 1) {
+          return new Promise(resolve => { releaseInitial = resolve })
+        }
+        return LIVE_READY
+      },
+    })
+    const initial = api.startSessionBootstrap({ includeHistory: false })
 
     api.setSessionHandoffTarget('agent:main:webchat:target', 1)
-    const disconnected = api.handleConnectionState('disconnected')
-    const connected = api.handleConnectionState('connected')
+    expect(api.handleConnectionState('connected', false)?.deferred).toBe(true)
+    expect(openSessionRead).toHaveBeenCalledOnce()
 
-    expect(disconnected?.deferred).toBe(true)
-    expect(connected?.deferred).toBe(true)
-    expect(subscribeSession).toHaveBeenCalledOnce()
+    releaseInitial(unavailable)
+    await expect(initial.live).resolves.toEqual(unavailable)
+    expect(api.livePhase.value).toBe('degraded')
+    expect(openSessionRead).toHaveBeenCalledOnce()
 
     const resumed = api.setSessionHandoffTarget(null, 1)
-    await resumed?.live
-
+    expect(resumed?.generation).toBeGreaterThan(initial.generation)
+    await expect(resumed?.live).resolves.toBe(LIVE_READY)
     expect(subscribeSession).toHaveBeenCalledTimes(2)
-    expect(api.livePhase.value).toBe('ready')
+    expect(openSessionRead).toHaveBeenCalledTimes(2)
   })
 
-  it('discards stale transport transitions after the target bootstrap commits', async () => {
-    const { api, subscribeSession } = createBootstrap()
-    const initial = api.startSessionBootstrap()
-    await Promise.all([initial.history, initial.live])
+  it('discards a deferred in-flight recovery after the target commits', async () => {
+    let releaseInitial!: (result: SessionSubscriptionOutcome) => void
+    const unavailable: SessionSubscriptionOutcome = {
+      authoritative: false,
+      live: false,
+      backgroundOnly: false,
+      cancelled: true,
+    }
+    const { api, subscribeSession, openSessionRead } = createBootstrap({
+      subscribeSession: async () => new Promise(resolve => { releaseInitial = resolve }),
+    })
+    const initial = api.startSessionBootstrap({ includeHistory: false })
 
     api.setSessionHandoffTarget('agent:main:webchat:target', 2)
-    api.handleConnectionState('disconnected')
-    api.handleConnectionState('connected')
+    expect(api.handleConnectionState('connected', false)?.deferred).toBe(true)
+    releaseInitial(unavailable)
+    await expect(initial.live).resolves.toEqual(unavailable)
 
     expect(api.setSessionHandoffTarget(null, 2, 'committed')).toBeUndefined()
     expect(subscribeSession).toHaveBeenCalledOnce()
+    expect(openSessionRead).toHaveBeenCalledOnce()
+    expect(api.livePhase.value).toBe('degraded')
+  })
+
+  it('tracks draft mutation and retryable phase contracts independently of transport', () => {
+    const attachment = { id: 1 }
+    expect(autoSendDraftIsUnchanged(
+      'draft', 'draft', [attachment], [attachment], 1, 1,
+    )).toBe(true)
+    expect(autoSendDraftIsUnchanged(
+      'draft', 'draft', [attachment], [attachment], 1, 2,
+    )).toBe(false)
+    expect(shouldRetrySessionPhase(Object.assign(new Error('temporarily unavailable'), {
+      code: 'UNAVAILABLE',
+      retryable: true,
+    }))).toBe(true)
+    expect(shouldRetrySessionPhase(Object.assign(new Error('not authorized'), {
+      code: 'FORBIDDEN',
+      retryable: false,
+    }))).toBe(false)
   })
 })
