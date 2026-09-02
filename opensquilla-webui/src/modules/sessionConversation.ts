@@ -9,20 +9,6 @@ export interface SessionConversationRequestOptions {
   abortAction?: 'reject' | 'reconnect'
 }
 
-export interface SessionForkRequest {
-  key: string
-  beforeMessageId?: string
-  throughTurnId?: string
-}
-
-export interface SessionForkResult {
-  key: string
-  parentKey?: string
-  forkMode?: string
-  throughTurnId?: string
-  [key: string]: unknown
-}
-
 export interface SessionCompactResult {
   status?: string
   compactionId?: string
@@ -89,7 +75,6 @@ export interface PromptCacheKeepaliveUpdate {
 }
 
 export type SessionConversationCapability =
-  | 'fork'
   | 'reset'
   | 'compact'
   | 'usage'
@@ -109,10 +94,6 @@ export interface SessionConversationSubscription {
  */
 export interface SessionConversation {
   ready(options?: SessionConversationRequestOptions): Promise<void>
-  fork(
-    request: SessionForkRequest,
-    options?: SessionConversationRequestOptions,
-  ): Promise<SessionForkResult>
   reset(key: string, options?: SessionConversationRequestOptions): Promise<Record<string, unknown>>
   compact(
     key: string,
