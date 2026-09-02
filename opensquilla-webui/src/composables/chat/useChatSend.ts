@@ -1708,13 +1708,20 @@ export function useChatSend(options: UseChatSendOptions) {
         .filter(Boolean)
         .join('\n')
     }
+    const usedLocalIds = new Set(
+      options.pendingAttachments.value.map(attachment => attachment.local_id),
+    )
+    let nextRecoveredLocalId = -1
     const missingAttachments = record.recoveryAttachments.flatMap((attachment, index) => {
       const owner = responseHandoffAttachmentOwner(record.ownerRequestId, index)
-      return options.pendingAttachments.value.some(candidate => (
+      if (options.pendingAttachments.value.some(candidate => (
         responseHandoffAttachmentOwners.get(candidate) === owner
-      ))
-        ? []
-        : [{ attachment: { ...attachment }, owner }]
+      ))) return []
+      while (usedLocalIds.has(nextRecoveredLocalId)) nextRecoveredLocalId -= 1
+      const localId = nextRecoveredLocalId
+      usedLocalIds.add(localId)
+      nextRecoveredLocalId -= 1
+      return [{ attachment: { ...attachment, local_id: localId }, owner }]
     })
     if (missingAttachments.length > 0) {
       options.pendingAttachments.value = [

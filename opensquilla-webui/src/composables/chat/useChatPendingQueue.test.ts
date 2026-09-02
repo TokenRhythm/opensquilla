@@ -1298,6 +1298,47 @@ describe('useChatPendingQueue delivery state', () => {
     }
   })
 
+  it('keeps later retained drafts queued behind an earlier cancellation failure', async () => {
+    const { wal } = memoryWal()
+    const { inputText, queue } = makeQueue(
+      undefined,
+      () => false,
+      undefined,
+      undefined,
+      { pendingInputWal: wal, hasRpcMethod: () => false },
+    )
+    try {
+      for (const text of ['A', 'B']) {
+        inputText.value = text
+        await expect(queue.enqueuePendingInput(text)).resolves.toBe(true)
+      }
+      await vi.waitFor(() => expect(queue.pendingQueue.value.every(item => (
+        item.pendingPersistenceState === 'local_only'
+      ))).toBe(true))
+      const firstId = queue.pendingQueue.value[0]!.pendingInputId!
+      const writeWal = wal.put
+      wal.put = vi.fn(async record => {
+        if (record.pendingInputId === firstId && record.state === 'cancelling') {
+          throw new Error('lost cancellation acknowledgement')
+        }
+        await writeWal(record)
+      })
+
+      expect(queue.popAllPendingIntoComposer()).toBe(true)
+      await vi.waitFor(() => {
+        expect(queue.pendingQueue.value[1]).toMatchObject({
+          text: 'B',
+          pendingPersistenceState: 'local_only',
+          pendingRetainAfterCancel: true,
+        })
+      })
+      expect(inputText.value).toBe('')
+      expect(queue.pendingQueue.value.map(item => item.text)).toEqual(['A', 'B'])
+    } finally {
+      queue.cleanup()
+    }
+  })
+
   it.each([
     'editPendingItem',
     'popPendingTail',
@@ -1468,6 +1509,56 @@ describe('useChatPendingQueue delivery state', () => {
       }])
     } finally {
       queue.cleanup()
+    }
+  })
+
+  it('chains a destructive clear after an in-flight retained cancellation', async () => {
+    const { wal, records } = memoryWal()
+    const retainCancelled = wal.retainCancelled!
+    let releaseRetain!: () => void
+    let markRetainStarted!: () => void
+    const retainStarted = new Promise<void>(resolve => { markRetainStarted = resolve })
+    const retainGate = new Promise<void>(resolve => { releaseRetain = resolve })
+    wal.retainCancelled = vi.fn(async (record, expectedWalRevision) => {
+      markRetainStarted()
+      await retainGate
+      return retainCancelled(record, expectedWalRevision)
+    })
+    const initial = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      hasRpcMethod: () => false,
+    })
+    try {
+      initial.inputText.value = 'clear this retained draft'
+      await expect(initial.queue.enqueuePendingInput(initial.inputText.value)).resolves.toBe(true)
+      await vi.waitFor(() => {
+        expect(initial.queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('local_only')
+      })
+
+      expect(initial.queue.editPendingItem(pendingUiId(initial.queue, 0))).toBe(true)
+      await retainStarted
+      initial.inputText.value = 'new composer text'
+      initial.queue.clearPendingQueue()
+      releaseRetain()
+
+      await vi.waitFor(() => {
+        expect(initial.queue.pendingQueue.value).toEqual([])
+        expect(records.size).toBe(0)
+      })
+      expect(initial.inputText.value).toBe('new composer text')
+
+      const reloaded = makeQueue(undefined, () => false, undefined, undefined, {
+        pendingInputWal: wal,
+        hasRpcMethod: () => false,
+      })
+      try {
+        await reloaded.queue.hydratePendingQueue()
+        expect(reloaded.queue.pendingQueue.value).toEqual([])
+      } finally {
+        reloaded.queue.cleanup()
+      }
+    } finally {
+      initial.queue.cleanup()
     }
   })
 

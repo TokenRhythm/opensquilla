@@ -203,7 +203,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   let hydrateGeneration = 0
   let disposed = false
   const stagingOperations = new Map<string, Promise<void>>()
-  const cancellationOperations = new Map<string, Promise<boolean>>()
+  const cancellationOperations = new Map<string, {
+    promise: Promise<boolean>
+    retainAfterCancel: boolean
+  }>()
   const cancellationInvalidations = new Map<string, number>()
   const locallyCreatingIds = new Set<string>()
   const removedIdentityOrder: string[] = []
@@ -1193,7 +1196,12 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const sessionKey = queueSessionKey(item.ownerSessionKey)
     const retainAfterCancel = cancelOptions.retainAfterCancel === true
     const expectedInvalidation = cancellationInvalidations.get(item.pendingInputId!) ?? 0
-    if (item.pendingRetainAfterCancel === true && !retainAfterCancel) {
+    if (
+      item.pendingRetainAfterCancel === true
+      && !retainAfterCancel
+      && item.pendingPersistenceState === 'local_only'
+      && item.pendingMayHaveServerCopy === false
+    ) {
       try {
         await forgetDurableItem(item, 'removed')
         return true
@@ -1274,14 +1282,29 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   ): Promise<boolean> {
     const pendingInputId = item.pendingInputId
     if (!pendingInputId || !options.pendingInputWal) return Promise.resolve(true)
+    const retainAfterCancel = cancelOptions.retainAfterCancel === true
     const existing = cancellationOperations.get(pendingInputId)
-    if (existing) return existing
+    if (existing) {
+      if (!existing.retainAfterCancel || retainAfterCancel) return existing.promise
+      const chained = existing.promise
+        .then(() => performDurableCancellation(item))
+        .finally(() => {
+          if (cancellationOperations.get(pendingInputId)?.promise === chained) {
+            cancellationOperations.delete(pendingInputId)
+          }
+        })
+      cancellationOperations.set(pendingInputId, {
+        promise: chained,
+        retainAfterCancel: false,
+      })
+      return chained
+    }
     const operation = performDurableCancellation(item, cancelOptions).finally(() => {
-      if (cancellationOperations.get(pendingInputId) === operation) {
+      if (cancellationOperations.get(pendingInputId)?.promise === operation) {
         cancellationOperations.delete(pendingInputId)
       }
     })
-    cancellationOperations.set(pendingInputId, operation)
+    cancellationOperations.set(pendingInputId, { promise: operation, retainAfterCancel })
     return operation
   }
 
@@ -1399,6 +1422,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   function clearPendingQueue() {
     cancelPendingReorder()
     clearPendingDrainAfterTerminalTimer()
+    activeQueueLease += 1
     for (const item of [...pendingQueue.value]) {
       if (
         item.deliveryState === 'steering'
@@ -1701,11 +1725,14 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         || composerRevision !== lease.composerRevision
       ) return
       for (const [index, item] of items.entries()) {
-        if (
-          !retainedItems[index]
-          || queueSessionKey(item.ownerSessionKey) !== lease.ownerSessionKey
-        ) continue
         const queueIndex = pendingQueue.value.indexOf(item)
+        if (!retainedItems[index]) {
+          // A failed predecessor that still owns a queue slot is an ordering
+          // barrier. A peer-terminal row is already absent and can be skipped.
+          if (queueIndex >= 0) break
+          continue
+        }
+        if (queueSessionKey(item.ownerSessionKey) !== lease.ownerSessionKey) break
         if (queueIndex < 0) continue
         pendingQueue.value.splice(queueIndex, 1)
         restore(item)

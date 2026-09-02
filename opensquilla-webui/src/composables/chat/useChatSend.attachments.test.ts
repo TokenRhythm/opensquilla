@@ -1273,7 +1273,10 @@ describe('useChatSend attachment payloads', () => {
 
     expect(rpc.call).not.toHaveBeenCalled()
     expect(inputText.value).toBe('restore the fork draft')
-    expect(pendingAttachments.value).toEqual([attachment])
+    expect(pendingAttachments.value).toEqual([{
+      ...attachment,
+      local_id: -1,
+    }])
     expect(pendingForkBeforeMessageId.value).toBe('fork-source-message')
     expect(retained).toBeNull()
   })
@@ -1348,9 +1351,10 @@ describe('useChatSend attachment payloads', () => {
 
     expect(inputText.value).toBe('restore after delayed hydration')
     expect(pendingAttachments.value).toEqual([
-      recoveredAttachment,
+      { ...recoveredAttachment, local_id: -1 },
       newAttachment,
     ])
+    expect(new Set(pendingAttachments.value.map(attachment => attachment.local_id)).size).toBe(2)
     expect(retained).toBeNull()
   })
 
