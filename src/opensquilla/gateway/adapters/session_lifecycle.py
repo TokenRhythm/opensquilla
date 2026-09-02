@@ -66,12 +66,16 @@ type EventEmitter = Callable[..., Awaitable[None]]
 
 
 class _ProjectWorkspaceView(Protocol):
-    workspace_id: str
-    path: object
+    @property
+    def workspace_id(self) -> str: ...
+
+    @property
+    def path(self) -> object: ...
 
 
 class _ValidatedWorkspaceView(Protocol):
-    workspace: _ProjectWorkspaceView
+    @property
+    def workspace(self) -> _ProjectWorkspaceView: ...
 
 
 type WorkspaceResolver = Callable[
