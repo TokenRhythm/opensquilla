@@ -168,6 +168,34 @@ def test_manual_consumer_budget_uses_stable_base_not_last_routed_model() -> None
     )
 
 
+def test_manual_consumer_budget_clamps_to_context_budget_tokens() -> None:
+    config = GatewayConfig(
+        llm={
+            "provider": "openai",
+            "model": "gpt-stable",
+            "api_key": "dummy-key",
+            "base_url": "https://api.openai.com/v1",
+            "context_window_tokens": 128_000,
+            "max_tokens": 4_096,
+        },
+        context_budget_tokens=100_000,
+    )
+    current = ProviderConfig(
+        provider="openai",
+        model="gpt-stable",
+        api_key="dummy-key",
+        base_url="https://api.openai.com/v1",
+    )
+
+    budget = resolve_gateway_consumer_budget(
+        _ctx(config, current),
+        SimpleNamespace(session_key="agent:main:webchat:manual-cap"),
+    )
+
+    assert budget.context_window_tokens == 100_000
+    assert budget.max_output_tokens == 4_096
+
+
 def test_manual_consumer_admission_uses_exact_adapter_projection() -> None:
     config = GatewayConfig(
         llm={

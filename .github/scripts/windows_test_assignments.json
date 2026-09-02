@@ -58,6 +58,7 @@
       "tests/test_cli/test_skills_reload_cmd.py",
       "tests/test_cli/test_skills_search_cmd.py",
       "tests/test_cli/test_tui_meta_command.py",
+      "tests/test_context_budget_docs.py",
       "tests/test_contracts/test_ensemble_fallback_event_wire.py",
       "tests/test_contracts/test_error_event_wire.py",
       "tests/test_contracts/test_onboarding_status.py",

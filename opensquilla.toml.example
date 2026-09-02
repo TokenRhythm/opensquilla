@@ -31,6 +31,25 @@
 # Disabled by default; set a positive value such as 1800.0 to enable the cap.
 # web_chat_runtime_timeout_seconds = 0.0
 
+# Context compaction controls.
+#
+# preflight_compact_ratio controls automatic preflight compaction for eligible
+# durable sessions. The turn runner applies it to the effective token and
+# character capacity left for compactable history after the current request,
+# attachments, fixed prompt/tool envelope, and output/thinking reserves.
+#
+# context_budget_tokens is a flat upper bound used by manual compaction targets.
+# It can reduce, but never enlarge, the resolved model window. It is not an
+# automatic next-turn history-plus-message threshold.
+#
+# context_overflow_policy is compatibility-only. The accepted values are
+# auto_summarize, hard_truncate, and refuse, but the ordinary shared turn path
+# does not consult them. In particular, refuse is not a fail-closed control for
+# ordinary turns.
+# context_budget_tokens = 100000
+# context_overflow_policy = "auto_summarize"
+# preflight_compact_ratio = 0.85
+
 # WebSocket per-connection outbound writer queue. When enabled (default),
 # each WS connection gets a bounded asyncio queue + dedicated writer task.
 # Producers enqueue and return immediately; slow clients trigger a fast
