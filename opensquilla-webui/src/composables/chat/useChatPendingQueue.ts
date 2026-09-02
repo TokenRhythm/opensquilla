@@ -196,6 +196,28 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     () => { composerRevision += 1 },
     { deep: true, flush: 'sync' },
   )
+  const ownerContextKey = (context: PendingQueueOwnerContext | null | undefined) => (
+    context
+      ? `${queueSessionKey(context.sessionKey)}\u0000${context.ownerRequestId}`
+      : ''
+  )
+  const responseHandoffOwnsCurrentQueue = () => {
+    const context = options.ownerContext?.value
+    return Boolean(
+      context
+      && queueSessionKey(context.sessionKey) === queueSessionKey(),
+    )
+  }
+  const stopOwnerContextWatch = options.ownerContext
+    ? watch(options.ownerContext, (current, previous) => {
+        if (current && ownerContextKey(current) !== ownerContextKey(previous)) {
+          // Establishing response-handoff ownership is a synchronous recovery
+          // boundary. No edit/pop callback captured before it may later write
+          // the source payload into the handoff target's composer.
+          activeQueueLease += 1
+        }
+      }, { flush: 'sync' })
+    : () => {}
   let pendingDrainTimer: ReturnType<typeof setTimeout> | null = null
   let deferredDrainRequested = false
   const isReordering = ref(false)
@@ -2013,6 +2035,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       || item.promptAnnotationIds?.length
       || item.pendingPersistenceState === 'saving'
       || item.pendingPersistenceState === 'cancelling'
+      || responseHandoffOwnsCurrentQueue()
       || hasUneditablePendingAttachments(item)
     ) return false
     const restore = () => {
@@ -2045,6 +2068,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   }
 
   function popPendingTail() {
+    if (responseHandoffOwnsCurrentQueue()) return false
     // Hidden controls and explicit/ambiguous steer deliveries must retain
     // their own transport identity instead of being converted into a fresh
     // composer send.
@@ -2085,6 +2109,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   }
 
   function popAllPendingIntoComposer(): boolean {
+    if (responseHandoffOwnsCurrentQueue()) return false
     cancelPendingReorder()
     clearPendingDrainAfterTerminalTimer()
     if (!options.hasComposer() || pendingQueue.value.length === 0) return false
@@ -2545,6 +2570,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     activeQueueLease += 1
     hydrateGeneration += 1
     stopComposerRevisionWatch()
+    stopOwnerContextWatch()
     clearPendingDrainAfterTerminalTimer()
     parkedQueues.clear()
     broadcast?.close()

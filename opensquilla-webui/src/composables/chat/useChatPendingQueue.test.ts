@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import {
   useChatPendingQueue,
+  type PendingQueueOwnerContext,
   type UseChatPendingQueueOptions,
 } from './useChatPendingQueue'
 import { createLegacyPendingInputQueue } from '@/adapters/gateway/pendingInputQueueV4'
@@ -2252,6 +2253,107 @@ describe('useChatPendingQueue delivery state', () => {
       }
     },
   )
+
+  it('blocks composer recovery and invalidates an existing restore during delayed handoff acceptance', async () => {
+    const sourceSessionKey = 'agent:main:webchat:test'
+    const targetSessionKey = 'agent:main:webchat:delayed-handoff-target'
+    const ownerRequestId = 'owner-delayed-handoff-recovery'
+    const ownerContext = ref<PendingQueueOwnerContext | null>(null)
+    const { handoffs, records, wal } = memoryWal()
+    enableAtomicPendingMutations(wal, records)
+    handoffs.set(ownerRequestId, {
+      schemaVersion: 1,
+      ownerRequestId,
+      requestSessionKey: sourceSessionKey,
+      clientRequestId: ownerRequestId,
+      clientMessageId: 'message-delayed-handoff-recovery',
+      params: {
+        sessionKey: sourceSessionKey,
+        message: 'handoff this queue',
+        clientRequestId: ownerRequestId,
+        clientMessageId: 'message-delayed-handoff-recovery',
+      },
+      composerText: 'handoff this queue',
+      recoveryAttachments: [],
+      state: 'submitting',
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    const retainCancelled = wal.retainCancelled!
+    let markRetainStarted!: () => void
+    let releaseRetain!: () => void
+    const retainStarted = new Promise<void>(resolve => { markRetainStarted = resolve })
+    const retainGate = new Promise<void>(resolve => { releaseRetain = resolve })
+    wal.retainCancelled = vi.fn(async (record, expectedWalRevision, equivalentSessionKeys) => {
+      markRetainStarted()
+      await retainGate
+      return retainCancelled(record, expectedWalRevision, equivalentSessionKeys)
+    })
+    const acceptHandoff = wal.acceptHandoff!
+    let markAcceptStarted!: () => void
+    let releaseAccept!: () => void
+    const acceptStarted = new Promise<void>(resolve => { markAcceptStarted = resolve })
+    const acceptGate = new Promise<void>(resolve => { releaseAccept = resolve })
+    wal.acceptHandoff = vi.fn(async (
+      currentOwnerRequestId,
+      acceptedSessionKey,
+      shouldAccept,
+      handoffSignal,
+    ) => {
+      markAcceptStarted()
+      await acceptGate
+      return acceptHandoff(
+        currentOwnerRequestId,
+        acceptedSessionKey,
+        shouldAccept,
+        handoffSignal,
+      )
+    })
+    const initial = makeQueue(undefined, () => false, undefined, undefined, {
+      ownerContext,
+      pendingInputWal: wal,
+      hasRpcMethod: () => false,
+    })
+    try {
+      initial.inputText.value = 'source text with attachment'
+      initial.pendingAttachments.value = [{
+        kind: 'staged',
+        local_id: 501,
+        name: 'source.txt',
+        mime: 'text/plain',
+        file_uuid: 'source-upload',
+      }]
+      await initial.queue.enqueuePendingInput(
+        initial.inputText.value,
+        { ownerRequestId },
+      )
+      initial.inputText.value = 'second source item'
+      await initial.queue.enqueuePendingInput(initial.inputText.value, { ownerRequestId })
+      const firstId = pendingUiId(initial.queue, 0)
+
+      expect(initial.queue.editPendingItem(firstId)).toBe(true)
+      await retainStarted
+      ownerContext.value = { sessionKey: sourceSessionKey, ownerRequestId }
+      const adoption = initial.queue.adoptPendingQueue(targetSessionKey, ownerRequestId)
+      await acceptStarted
+
+      expect(initial.queue.popPendingTail()).toBe(false)
+      expect(initial.queue.popAllPendingIntoComposer()).toBe(false)
+      releaseRetain()
+      await vi.waitFor(() => {
+        expect(initial.inputText.value).toBe('')
+        expect(initial.pendingAttachments.value).toEqual([])
+      })
+
+      releaseAccept()
+      await adoption
+      initial.sessionKey.value = targetSessionKey
+      expect(initial.inputText.value).toBe('')
+      expect(initial.pendingAttachments.value).toEqual([])
+    } finally {
+      initial.queue.cleanup()
+    }
+  })
 
   it('retains delayed composer recovery in the WAL after cleanup for the next hydrate', async () => {
     const { wal, records } = memoryWal()

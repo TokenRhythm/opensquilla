@@ -2937,12 +2937,24 @@ export function useChatSend(options: UseChatSendOptions) {
       return true
     }
     let durableHandoffRecord: ResponseHandoffWalRecord | null = null
+    let consumeComposerSnapshotAfterHandoffPersistence = false
     const rejectBeforeDispatch = async (): Promise<ChatSendOutcome> => {
       if (attempt && sendOpts.acceptedVisibleReplay) {
         sendOpts.rememberRetryableAttempt?.(attempt)
       }
       await discardUnsentResponseHandoff(durableHandoffRecord)
       return 'not_sent'
+    }
+    const revalidateAfterHandoffPersistence = (): boolean => {
+      if (options.sessionKey.value !== requestSessionKey) return false
+      if (
+        sendOpts.composerSnapshot
+        && !composerMatchesSnapshot(sendOpts.composerSnapshot)
+      ) {
+        preserveComposer = true
+        consumeComposerSnapshotAfterHandoffPersistence = true
+      }
+      return preDispatchAllowed()
     }
     if (!attempt) {
       const durablePendingItem = sendOpts.durablePendingItem
@@ -3013,7 +3025,7 @@ export function useChatSend(options: UseChatSendOptions) {
         if (sendOpts.requirePreparedHandoff && !durableHandoffRecord) {
           return rejectBeforeDispatch()
         }
-        if (!preDispatchAllowed()) return rejectBeforeDispatch()
+        if (!revalidateAfterHandoffPersistence()) return rejectBeforeDispatch()
       }
       if (!sendOpts.acceptedVisibleReplay) {
         const now = new Date().toISOString()
@@ -3040,7 +3052,7 @@ export function useChatSend(options: UseChatSendOptions) {
       if (sendOpts.requirePreparedHandoff && !durableHandoffRecord) {
         return rejectBeforeDispatch()
       }
-      if (!preDispatchAllowed()) return rejectBeforeDispatch()
+      if (!revalidateAfterHandoffPersistence()) return rejectBeforeDispatch()
     }
     if (!preDispatchAllowed()) return rejectBeforeDispatch()
     if (!preserveComposer) options.closeSlashMenu()
@@ -3067,6 +3079,21 @@ export function useChatSend(options: UseChatSendOptions) {
       options.pendingAttachments.value = options.pendingAttachments.value.filter(
         attachment => !originalAttachmentRefs.has(attachment),
       )
+      if (consumeComposerSnapshotAfterHandoffPersistence) {
+        if (options.inputText.value === sendOpts.composerSnapshot.inputText) {
+          options.inputText.value = ''
+        }
+        if (options.pendingSessionIntent.value === sendOpts.composerSnapshot.intent) {
+          options.pendingSessionIntent.value = null
+        }
+        if (
+          options.pendingForkBeforeMessageId.value
+          === sendOpts.composerSnapshot.forkBeforeMessageId
+        ) {
+          options.pendingForkBeforeMessageId.value = null
+        }
+        options.autoResizeTextarea()
+      }
     }
     // A steer send rides an already-active stream; restarting it would wipe
     // the partial output of the run being steered.

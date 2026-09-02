@@ -271,6 +271,142 @@ function usageReplayMessages(): ChatMessage[] {
   ]
 }
 
+describe('useChatSend response-handoff persistence boundary', () => {
+  function delayedHandoffWal() {
+    let retained: ResponseHandoffWalRecord | null = null
+    let markPersistStarted!: () => void
+    let releasePersist!: () => void
+    let firstWrite = true
+    const persistStarted = new Promise<void>(resolve => { markPersistStarted = resolve })
+    const persistGate = new Promise<void>(resolve => { releasePersist = resolve })
+    const wal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      putHandoff: vi.fn(async record => {
+        retained = structuredClone(record)
+        if (firstWrite) {
+          firstWrite = false
+          markPersistStarted()
+          await persistGate
+        }
+      }),
+      deleteHandoff: vi.fn(async () => { retained = null }),
+      acceptHandoff: async (ownerRequestId, acceptedSessionKey) => {
+        if (!retained || retained.ownerRequestId !== ownerRequestId) {
+          throw new Error('missing handoff')
+        }
+        const handoff: ResponseHandoffWalRecord = {
+          ...retained,
+          state: 'accepted',
+          acceptedSessionKey,
+          updatedAt: Date.now(),
+        }
+        retained = handoff
+        return { handoff, records: [] }
+      },
+      close: () => {},
+    }
+    return {
+      wal,
+      persistStarted,
+      releasePersist,
+      retained: () => retained,
+    }
+  }
+
+  it('stops a delayed fork send after A-to-B navigation without touching B composer', async () => {
+    const parentSessionKey = 'agent:main:webchat:persist-parent'
+    const childSessionKey = 'agent:main:webchat:persist-other'
+    const sessionKey = ref(parentSessionKey)
+    const inputText = ref('parent draft')
+    const parentAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 31,
+      name: 'parent.txt',
+      mime: 'text/plain',
+      file_uuid: 'parent-upload',
+    }
+    const childAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 32,
+      name: 'child.txt',
+      mime: 'text/plain',
+      file_uuid: 'child-upload',
+    }
+    const pendingAttachments = ref<Attachment[]>([parentAttachment])
+    const pendingForkBeforeMessageId = ref<string | null>('parent-message')
+    const delayed = delayedHandoffWal()
+    const { api, options, rpc } = makeOptions({
+      sessionKey,
+      inputText,
+      pendingAttachments,
+      pendingForkBeforeMessageId,
+      pendingInputWal: delayed.wal,
+    })
+
+    const sending = api.onSend()
+    await delayed.persistStarted
+    sessionKey.value = childSessionKey
+    inputText.value = 'child draft'
+    pendingAttachments.value = [childAttachment]
+    pendingForkBeforeMessageId.value = null
+    delayed.releasePersist()
+    await sending
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.messages.value).toEqual([])
+    expect(inputText.value).toBe('child draft')
+    expect(pendingAttachments.value).toEqual([childAttachment])
+    expect(delayed.retained()).toBeNull()
+  })
+
+  it('sends only the persisted snapshot while preserving newer same-session content', async () => {
+    const sessionKey = ref('agent:main:webchat:persist-same-session')
+    const inputText = ref('persisted draft')
+    const persistedAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 41,
+      name: 'persisted.txt',
+      mime: 'text/plain',
+      file_uuid: 'persisted-upload',
+    }
+    const newerAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 42,
+      name: 'newer.txt',
+      mime: 'text/plain',
+      file_uuid: 'newer-upload',
+    }
+    const pendingAttachments = ref<Attachment[]>([persistedAttachment])
+    const pendingForkBeforeMessageId = ref<string | null>('parent-message')
+    const delayed = delayedHandoffWal()
+    const { api, rpc } = makeOptions({
+      sessionKey,
+      inputText,
+      pendingAttachments,
+      pendingForkBeforeMessageId,
+      pendingInputWal: delayed.wal,
+    })
+    rpc.call.mockResolvedValue({ sessionKey: sessionKey.value })
+
+    const sending = api.onSend()
+    await delayed.persistStarted
+    inputText.value = 'newer draft'
+    pendingAttachments.value = [persistedAttachment, newerAttachment]
+    delayed.releasePersist()
+    await sending
+
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      sessionKey: sessionKey.value,
+      message: 'persisted draft',
+      attachments: [expect.objectContaining({ name: 'persisted.txt' })],
+    }))
+    expect(inputText.value).toBe('newer draft')
+    expect(pendingAttachments.value).toEqual([newerAttachment])
+  })
+})
+
 describe('useChatSend dedicated usage-barrier replay', () => {
   it('atomically admits only one of two cross-tab clicks for the same barrier', async () => {
     const pendingInputWal = memoryHandoffWal()
