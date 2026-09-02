@@ -39,6 +39,9 @@ from opensquilla.session.storage import StorageBusyError
 
 log = structlog.get_logger(__name__)
 
+_MAX_HISTORY_CURSOR_INTEGER = (1 << 63) - 1
+_MAX_HISTORY_CURSOR_INTEGER_TEXT = str(_MAX_HISTORY_CURSOR_INTEGER)
+
 
 def parse_history_cursor(value: object) -> HistoryCursor | None:
     """Parse the legacy ``created_at|entry_id`` cursor.
@@ -63,10 +66,19 @@ def parse_history_cursor(value: object) -> HistoryCursor | None:
         raise HistoryCursorInvalidError(
             "history cursor must use the created_at|id integer format"
         )
-    cursor = int(created_at), int(stable_id)
-    if any(value < 0 or value > (1 << 63) - 1 for value in cursor):
+    normalized_components = tuple(
+        component.lstrip("0") or "0" for component in (created_at, stable_id)
+    )
+    if any(
+        len(component) > len(_MAX_HISTORY_CURSOR_INTEGER_TEXT)
+        or (
+            len(component) == len(_MAX_HISTORY_CURSOR_INTEGER_TEXT)
+            and component > _MAX_HISTORY_CURSOR_INTEGER_TEXT
+        )
+        for component in normalized_components
+    ):
         raise HistoryCursorInvalidError("history cursor integers are out of range")
-    return cursor
+    return int(normalized_components[0]), int(normalized_components[1])
 
 
 def canonical_page_parts(page: object) -> tuple[list[object], bool, bool]:

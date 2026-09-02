@@ -36,6 +36,7 @@ def row(index: int, *, role: str = "user", content: str | None = None) -> Simple
 def test_parse_history_cursor_distinguishes_absent_and_valid_values() -> None:
     assert parse_history_cursor(None) is None
     assert parse_history_cursor(" 2|7 ") == (2, 7)
+    assert parse_history_cursor(f"{'0' * 5000}2|7") == (2, 7)
 
 
 @pytest.mark.parametrize(
@@ -55,6 +56,7 @@ def test_parse_history_cursor_distinguishes_absent_and_valid_values() -> None:
         "1|-2",
         f"{1 << 63}|1",
         f"1|{1 << 63}",
+        f"{'9' * 5000}|1",
     ],
 )
 def test_parse_history_cursor_rejects_invalid_values(value: object) -> None:

@@ -1963,7 +1963,14 @@ async def test_chat_history_cursor_failures_map_to_stable_wire_codes() -> None:
                 "HISTORY_CURSOR_INVALID",
             )
             for index, cursor in enumerate(
-                ("1_0|2", "+10|2", "١٠|٢", "10 |2", "10| 2")
+                (
+                    "1_0|2",
+                    "+10|2",
+                    "١٠|٢",
+                    "10 |2",
+                    "10| 2",
+                    f"{'9' * 5000}|2",
+                )
             )
         ),
         (
