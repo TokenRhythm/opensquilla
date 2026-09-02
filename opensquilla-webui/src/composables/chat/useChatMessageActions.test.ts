@@ -65,6 +65,7 @@ function makeOptions(
     opts?: { assistantBoundary?: boolean },
   ) => string = text => text,
   aiGeneratedLabel?: () => string,
+  overrides: Partial<UseChatMessageActionsOptions> = {},
 ) {
   const sessionKey = ref('agent:main:webchat:A')
   const pendingForkBeforeMessageId = ref<string | null>(null)
@@ -84,6 +85,7 @@ function makeOptions(
     notifyMessagePending: vi.fn(),
     canDeliver: () => true,
     notifyDeliveryBlocked: vi.fn(),
+    ...overrides,
   }
   return { api: useChatMessageActions(options), options, sessionKey, pendingForkBeforeMessageId }
 }
@@ -232,6 +234,38 @@ describe('useChatMessageActions branching edits', () => {
     expect(api.cancelEdit()).toBe(false)
     expect(options.messages.value.map(message => message.text)).toEqual(['B'])
     expect(options.inputText.value).toBe('session B draft')
+  })
+
+  it('settles an active Edit exactly once when its session changes', () => {
+    const onEditStarted = vi.fn()
+    const onEditSettled = vi.fn()
+    const { api, sessionKey } = makeOptions(
+      [
+        { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+        { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      ],
+      text => text,
+      undefined,
+      { onEditStarted, onEditSettled },
+    )
+
+    api.editMessage(renderedMessage({
+      role: 'user',
+      displayRole: 'user',
+      sourceIndex: 0,
+      messageId: 'msg-A',
+      text: 'A',
+    }))
+    expect(onEditStarted).toHaveBeenCalledOnce()
+
+    sessionKey.value = 'agent:main:webchat:new-draft'
+    expect(api.editActive.value).toBe(false)
+    expect(onEditSettled).toHaveBeenCalledOnce()
+
+    sessionKey.value = 'agent:main:webchat:next'
+    expect(onEditSettled).toHaveBeenCalledOnce()
+    expect(api.cancelEdit()).toBe(false)
+    expect(onEditSettled).toHaveBeenCalledOnce()
   })
 
   it('retires the edit owner without restoring over a replacement transcript', () => {

@@ -423,6 +423,85 @@ describe('useChatRpcEventHandlers decoded conversation ingress', () => {
     }
   })
 
+  it('drops deferred receipt reconciliation when Edit crosses into a new session', () => {
+    const harness = createHarness({
+      messages: [
+        { role: 'user', text: 'original question', ts: null, messageId: 'msg-original' },
+        { role: 'assistant', text: 'original answer', ts: null, messageId: 'msg-answer' },
+      ],
+    })
+    harness.stream.isStreaming.value = false
+    const messageActions = useChatMessageActions({
+      sessionKey: harness.sessionKey,
+      messages: harness.messages,
+      inputText: ref(''),
+      isStreaming: harness.stream.isStreaming,
+      sanitizeCopyText: text => text,
+      stripTimePrefix: text => text,
+      autoResizeTextarea: vi.fn(),
+      sendCurrentInput: vi.fn(),
+      sendUsageBarrierReplay: vi.fn(async () => true),
+      focusComposer: vi.fn(),
+      pendingForkBeforeMessageId: ref<string | null>(null),
+      onEditStarted: harness.api.holdBackgroundReceiptReconciliation,
+      onEditSettled: harness.api.releaseBackgroundReceiptReconciliation,
+    })
+    const deliver = (eventName: string, payload: Record<string, unknown>) => {
+      harness.api.onConversationEvent({
+        kind: 'conversation',
+        event: decodeConversationEvent(eventName, payload, {}),
+        payload,
+        meta: {},
+      })
+    }
+    try {
+      messageActions.editMessage({
+        role: 'user',
+        displayRole: 'user',
+        roleLabel: 'User',
+        text: 'original question',
+        timeStr: '',
+        showHeader: false,
+        sourceIndex: 0,
+        messageId: 'msg-original',
+      })
+      harness.api.beginBackgroundReceiptReplay('client-old-receipt')
+      deliver('task.running', {
+        session_key: 'agent:main:test',
+        task_id: 'task-old-receipt',
+        client_message_id: 'client-old-receipt',
+      })
+      harness.api.trackBackgroundReceiptTask('client-old-receipt', 'task-old-receipt')
+      harness.api.finishBackgroundReceiptReplay('client-old-receipt')
+      deliver('task.succeeded', {
+        session_key: 'agent:main:test',
+        task_id: 'task-old-receipt',
+      })
+      expect(harness.scheduleHistorySync).not.toHaveBeenCalled()
+
+      harness.sessionKey.value = 'agent:main:new-draft'
+      expect(messageActions.editActive.value).toBe(false)
+      expect(harness.scheduleHistorySync).not.toHaveBeenCalled()
+
+      harness.api.beginBackgroundReceiptReplay('client-new-receipt')
+      deliver('task.running', {
+        session_key: 'agent:main:new-draft',
+        task_id: 'task-new-receipt',
+        client_message_id: 'client-new-receipt',
+      })
+      harness.api.trackBackgroundReceiptTask('client-new-receipt', 'task-new-receipt')
+      harness.api.finishBackgroundReceiptReplay('client-new-receipt')
+      deliver('task.succeeded', {
+        session_key: 'agent:main:new-draft',
+        task_id: 'task-new-receipt',
+      })
+
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+    } finally {
+      harness.stop()
+    }
+  })
+
   it('does not learn receipt task ownership from a stale subscription epoch', () => {
     const harness = createHarness()
     const deliver = (eventName: string, payload: Record<string, unknown>) => {

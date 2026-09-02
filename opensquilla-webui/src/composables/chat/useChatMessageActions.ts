@@ -82,9 +82,11 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
   // old restore point synchronously so even an immediate switch back cannot
   // revive state captured before the boundary.
   watch(options.sessionKey, () => {
+    const hadActiveEdit = editRestorePoint !== null
     editRestorePoint = null
     editActive.value = false
     editGeneration.value += 1
+    if (hadActiveEdit) options.onEditSettled?.()
   }, { flush: 'sync' })
 
   function restoreOwnsCurrentSessionAndFork(restore: EditRestorePoint): boolean {

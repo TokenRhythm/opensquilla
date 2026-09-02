@@ -423,6 +423,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   const dirtyBackgroundReceiptClientIds = new Set<string>()
   const reconciledBackgroundReceiptClientIds = new Set<string>()
   let backgroundReceiptEditHeld = false
+  let backgroundReceiptHoldSessionKey = ''
 
   function rememberBackgroundReceiptClient(clientMessageId: string) {
     const normalizedClientId = String(clientMessageId || '').trim()
@@ -439,6 +440,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   }
 
   function holdBackgroundReceiptReconciliation() {
+    if (!backgroundReceiptEditHeld) backgroundReceiptHoldSessionKey = sessionKey.value
     backgroundReceiptEditHeld = true
   }
 
@@ -453,6 +455,12 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
 
   function releaseBackgroundReceiptReconciliation() {
     backgroundReceiptEditHeld = false
+    if (backgroundReceiptHoldSessionKey !== sessionKey.value) {
+      dirtyBackgroundReceiptClientIds.clear()
+      backgroundReceiptHoldSessionKey = ''
+      return
+    }
+    backgroundReceiptHoldSessionKey = ''
     flushBackgroundReceiptReconciliationIfReady()
   }
 
@@ -1567,6 +1575,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     dirtyBackgroundReceiptClientIds.clear()
     reconciledBackgroundReceiptClientIds.clear()
     backgroundReceiptEditHeld = false
+    backgroundReceiptHoldSessionKey = ''
     streamThinking.value = null
     clearGenerationTracking()
     turnReasoningLog.length = 0

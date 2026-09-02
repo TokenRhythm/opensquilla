@@ -2767,6 +2767,157 @@ describe('useChatSend attachment payloads', () => {
     expect(messageActions.cancelEdit()).toBe(true)
   })
 
+  it('keeps composer changes made during the original ambiguous RPC out of its receipt owner', async () => {
+    const {
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      messageActions,
+    } = makeEditedMessageState('edited question')
+    const composerRevision = ref(0)
+    let rejectOriginal!: (reason: Error) => void
+    const originalResponse = new Promise((_resolve, reject) => {
+      rejectOriginal = reject
+    })
+    const beginBackgroundReceiptReplay = vi.fn()
+    const rpc = {
+      call: vi.fn()
+        .mockImplementationOnce(() => originalResponse)
+        .mockResolvedValueOnce({
+          sessionKey: 'agent:main:webchat:test',
+          task_id: 'task-original-race-receipt',
+        }),
+    }
+    const { api, options } = makeOptions({
+      rpc,
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      composerRevision,
+      messageEditGeneration: messageActions.editGeneration,
+      messageEditActive: messageActions.editActive,
+      validateMessageEditOwner: messageActions.validateEditOwner,
+      commitMessageEdit: messageActions.commitEdit,
+      adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
+      beginBackgroundReceiptReplay,
+    })
+
+    const original = api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledOnce())
+    inputText.value = 'edited question'
+    composerRevision.value += 1
+    pendingForkBeforeMessageId.value = 'msg-original'
+    const currentAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 904,
+      name: 'during-rpc.png',
+      mime: 'image/png',
+      file_uuid: 'during-rpc-file',
+    }
+    options.pendingAttachments.value = [currentAttachment]
+
+    rejectOriginal(new RpcTransportError('Connection closed', null))
+    await original
+
+    const originalParams = rpc.call.mock.calls[0]?.[1]
+    expect(beginBackgroundReceiptReplay).toHaveBeenCalledWith(
+      originalParams.clientMessageId,
+      true,
+    )
+
+    await api.onSend()
+
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(originalParams)
+    expect(inputText.value).toBe('edited question')
+    expect(options.pendingAttachments.value).toEqual([currentAttachment])
+    expect(pendingForkBeforeMessageId.value).toBe('msg-original')
+    expect(messageActions.cancelEdit()).toBe(true)
+  })
+
+  it('rechecks exact-replay ownership after the second handoff write', async () => {
+    const {
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      messageActions,
+    } = makeEditedMessageState('edited question')
+    const composerRevision = ref(0)
+    let finishReplayHandoff!: () => void
+    let handoffWrites = 0
+    const baseWal = memoryHandoffWal()
+    const pendingInputWal: PendingInputWal = {
+      ...baseWal,
+      putHandoff: vi.fn(async (record) => {
+        handoffWrites += 1
+        if (handoffWrites === 2) {
+          await new Promise<void>(resolve => {
+            finishReplayHandoff = resolve
+          })
+        }
+        await baseWal.putHandoff?.(record)
+      }),
+    }
+    const beginBackgroundReceiptReplay = vi.fn()
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+        .mockResolvedValueOnce({
+          sessionKey: 'agent:main:webchat:test',
+          task_id: 'task-handoff-race-receipt',
+        }),
+    }
+    const { api, options } = makeOptions({
+      rpc,
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      pendingInputWal,
+      composerRevision,
+      messageEditGeneration: messageActions.editGeneration,
+      messageEditActive: messageActions.editActive,
+      validateMessageEditOwner: messageActions.validateEditOwner,
+      commitMessageEdit: messageActions.commitEdit,
+      adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
+      beginBackgroundReceiptReplay,
+    })
+
+    await api.onSend()
+    const originalParams = rpc.call.mock.calls[0]?.[1]
+    const replay = api.onSend()
+    await vi.waitFor(() => expect(pendingInputWal.putHandoff).toHaveBeenCalledTimes(2))
+    expect(rpc.call).toHaveBeenCalledOnce()
+
+    inputText.value = 'edited question'
+    composerRevision.value += 1
+    pendingForkBeforeMessageId.value = 'msg-original'
+    const currentAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 905,
+      name: 'handoff-race.png',
+      mime: 'image/png',
+      file_uuid: 'handoff-race-file',
+    }
+    options.pendingAttachments.value = [currentAttachment]
+    finishReplayHandoff()
+    await replay
+
+    expect(beginBackgroundReceiptReplay).toHaveBeenCalledWith(
+      originalParams.clientMessageId,
+      true,
+    )
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(originalParams)
+    expect(inputText.value).toBe('edited question')
+    expect(options.pendingAttachments.value).toEqual([currentAttachment])
+    expect(pendingForkBeforeMessageId.value).toBe('msg-original')
+    expect(messageActions.cancelEdit()).toBe(true)
+  })
+
   it.each([
     ['different text', 'new ordinary question'],
     ['the same text', 'later ordinary question'],

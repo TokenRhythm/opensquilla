@@ -1955,6 +1955,81 @@ describe('useChatHistory canonical pagination', () => {
     )
   })
 
+  it('defers a forward-bridge result when Edit starts during an after-page read', async () => {
+    vi.useFakeTimers()
+    try {
+      let resolveBridge!: (value: SessionReadHistoryPageFixture) => void
+      const bridgeResponse = new Promise<SessionReadHistoryPageFixture>(resolve => {
+        resolveBridge = resolve
+      })
+      const { api, readHistory, historyFixture, messages } = makeHistory(false)
+      historyFixture
+        .mockResolvedValueOnce({
+          messages: [historyMessage('m1')],
+          hasMore: true,
+          oldestCursor: 'cursor-1',
+          newestCursor: 'cursor-1',
+          canonicalAvailable: true,
+        })
+        .mockResolvedValueOnce({
+          messages: [historyMessage('m0')],
+          hasMore: false,
+          oldestCursor: 'cursor-0',
+          newestCursor: 'cursor-0',
+          canonicalAvailable: true,
+        })
+        .mockResolvedValueOnce({
+          messages: [historyMessage('m9')],
+          hasMore: false,
+          oldestCursor: 'cursor-9',
+          newestCursor: 'cursor-9',
+          canonicalAvailable: true,
+        })
+        .mockImplementationOnce(() => bridgeResponse)
+        .mockResolvedValueOnce({
+          messages: [historyMessage('m9')],
+          hasMore: false,
+          oldestCursor: 'cursor-9',
+          newestCursor: 'cursor-9',
+          canonicalAvailable: true,
+        })
+        .mockResolvedValueOnce({
+          messages: [historyMessage('m2'), historyMessage('m9')],
+          hasMore: false,
+          oldestCursor: 'cursor-2',
+          newestCursor: 'cursor-9',
+          canonicalAvailable: true,
+        })
+
+      await api.loadHistory()
+      await api.loadEarlierHistory()
+      const refresh = api.loadHistory()
+      await vi.waitFor(() => expect(readHistory).toHaveBeenCalledTimes(4))
+      const editOwnerRef = messages.value
+      api.holdHistorySync()
+      resolveBridge({
+        messages: [historyMessage('m2'), historyMessage('m9')],
+        hasMore: false,
+        oldestCursor: 'cursor-2',
+        newestCursor: 'cursor-9',
+        canonicalAvailable: true,
+      })
+      await refresh
+
+      expect(messages.value).toBe(editOwnerRef)
+      expect(messages.value.map(message => message.messageId)).toEqual(['m0', 'm1'])
+
+      api.releaseHistorySync()
+      await vi.advanceTimersByTimeAsync(50)
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(readHistory).toHaveBeenCalledTimes(6)
+      expect(messages.value.map(message => message.messageId)).toEqual(['m0', 'm1', 'm2', 'm9'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('bounds each disconnected forward bridge and resumes from the saved cursor', async () => {
     const { api, readHistory, historyFixture, messages } = makeHistory(false)
     historyFixture
@@ -2438,6 +2513,35 @@ describe('useChatHistory canonical pagination', () => {
       expect(readHistory).toHaveBeenCalledOnce()
       expect(messages.value.map(message => message.messageId)).toEqual([
         'canonical-after-escape',
+      ])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('drops an old Edit hold at a session boundary so the new draft can sync', async () => {
+    vi.useFakeTimers()
+    try {
+      const sessionKey = ref('agent:main:webchat:old')
+      const { api, readHistory, historyFixture, messages } = makeHistory(false, { sessionKey })
+      historyFixture.mockResolvedValueOnce({
+        messages: [historyMessage('new-session-terminal')],
+        hasMore: false,
+        oldestCursor: null,
+      })
+
+      api.holdHistorySync()
+      api.scheduleHistorySync()
+      sessionKey.value = 'agent:main:webchat:new-draft'
+      api.releaseHistorySync()
+
+      api.scheduleHistorySync()
+      await vi.advanceTimersByTimeAsync(50)
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(readHistory).toHaveBeenCalledOnce()
+      expect(messages.value.map(message => message.messageId)).toEqual([
+        'new-session-terminal',
       ])
     } finally {
       vi.useRealTimers()

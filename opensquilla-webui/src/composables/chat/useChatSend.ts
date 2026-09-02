@@ -223,6 +223,7 @@ interface ExplicitSendPayload {
 
 interface ComposerSnapshot {
   revision: number | null
+  ownershipEpoch: number
   inputText: string
   promptAnnotationIds: string[]
   documentContext: TurnDocumentContext | null
@@ -659,6 +660,7 @@ export function useChatSend(options: UseChatSendOptions) {
   let activeResponseHandoff: ResponseHandoffGate | null = null
   let activeProjectPreflightToken: symbol | null = null
   let recoveredAttempt: SendAttempt | null = null
+  let composerOwnershipEpoch = 0
   let usageBarrierReplayAttempt: SendAttempt | null = null
   let usageBarrierReplayInFlight = false
   let handoffRecoveryPromise: Promise<void> | null = null
@@ -814,6 +816,7 @@ export function useChatSend(options: UseChatSendOptions) {
     const queueOwnerContext = options.pendingQueueOwnerContext.value
     return {
       revision: options.composerRevision?.value ?? null,
+      ownershipEpoch: composerOwnershipEpoch,
       inputText: options.inputText.value,
       promptAnnotationIds: currentPromptAnnotationIds(),
       documentContext: normalizeDocumentContext(
@@ -882,6 +885,7 @@ export function useChatSend(options: UseChatSendOptions) {
   ): boolean {
     return (
       (owner.revision === null || current.revision === owner.revision)
+      && current.ownershipEpoch === owner.ownershipEpoch
       && current.inputText === owner.inputText
       && JSON.stringify(current.promptAnnotationIds) === JSON.stringify(owner.promptAnnotationIds)
       && sameDocumentContext(current.documentContext, owner.documentContext)
@@ -916,7 +920,14 @@ export function useChatSend(options: UseChatSendOptions) {
     () => options.messageEditActive?.value,
     () => options.initialCollaborationMode.value,
     () => options.initialRoutingMode.value,
-  ], quarantineRecoveredAttemptIfUnrelated, { flush: 'sync', deep: true })
+    () => options.composerRevision?.value,
+    () => JSON.stringify(normalizeDocumentContext(
+      options.currentDocumentContext?.(options.sessionKey.value),
+    )),
+  ], () => {
+    composerOwnershipEpoch += 1
+    quarantineRecoveredAttemptIfUnrelated()
+  }, { flush: 'sync', deep: true })
 
   function messageEditOwnerMatchesSnapshot(
     snapshot: ComposerSnapshot,
@@ -3157,7 +3168,7 @@ export function useChatSend(options: UseChatSendOptions) {
       : false
     if (sendOpts.cancelIfComposerChanged && composerChanged) return 'not_sent'
     if (composerChanged) preserveComposer = true
-    const backgroundReceiptReplay = sendOpts.backgroundReceiptReplay === true
+    let backgroundReceiptReplay = sendOpts.backgroundReceiptReplay === true
       || Boolean(
         sendOpts.idempotentReplay
         && preserveComposer
@@ -3369,6 +3380,18 @@ export function useChatSend(options: UseChatSendOptions) {
       }
       if (!preDispatchAllowed()) return rejectBeforeDispatch()
     }
+    if (
+      sendOpts.idempotentReplay
+      && retryAttempt?.requiresIdempotentReplay
+      && sendOpts.composerSnapshot
+      && !sameComposerOwnershipSnapshot(
+        captureComposerSnapshot(),
+        sendOpts.composerSnapshot,
+      )
+    ) {
+      preserveComposer = true
+      backgroundReceiptReplay = true
+    }
     if (!preDispatchAllowed('after_mutation')) return rejectBeforeDispatch()
     if (!preserveComposer) options.closeSlashMenu()
     recordSessionNavigationDiag('send.start', {
@@ -3476,6 +3499,7 @@ export function useChatSend(options: UseChatSendOptions) {
       )
       attempt.acceptanceRequest = { request: acceptanceRequest }
       attempt.acceptanceInFlight = true
+      rememberRecoveryComposerSnapshot(attempt)
       if (backgroundReceiptReplay) {
         options.beginBackgroundReceiptReplay?.(
           attempt.clientMessageId,
