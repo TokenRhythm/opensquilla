@@ -1009,8 +1009,6 @@ import {
   forkNavigationPhase,
   forkRouteHandoffAction,
   snapshotForkPreviewMessages,
-  validatedForkChildKey,
-  type ForkRpcResponse,
 } from '@/utils/chat/forkTransition'
 import {
   steerUnavailableReason,
@@ -5522,12 +5520,12 @@ async function forkConversation(throughTurnId?: string) {
     previewMessages: snapshotForkPreviewMessages(renderedMessages.value, normalizedTurnId),
   }
   try {
-    const res = await sessionConversation.fork({
+    const res = await sessionLifecycle.fork({
       key: parentKey,
       ...(normalizedTurnId ? { throughTurnId: normalizedTurnId } : {}),
-    }) as ForkRpcResponse
+    })
     if (!isForkTransitionActive(generation)) return
-    const childKey = validatedForkChildKey(res, normalizedTurnId)
+    const childKey = res.key
     if (sessionKey.value !== parentKey) {
       clearForkTransition(generation)
       return
