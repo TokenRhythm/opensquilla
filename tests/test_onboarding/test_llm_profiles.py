@@ -163,6 +163,48 @@ def test_profile_upsert_allows_credentialless_draft() -> None:
     assert result.changed is True
 
 
+def test_profile_upsert_registers_unknown_custom_provider() -> None:
+    """A custom provider id (e.g. bailian) upserts via dynamic registration.
+
+    Regression: the setup-catalog lookup ran before register_profile_provider,
+    so every unknown id failed with ``unknown provider`` even though the UI
+    flow (and probe.py) intends dynamic OpenAI-compatible registration from
+    the supplied base_url.
+    """
+    from opensquilla.provider import registry as provider_registry
+
+    snapshot = dict(provider_registry._PROVIDER_SPECS)
+    try:
+        result = upsert_llm_profile(
+            GatewayConfig(),
+            provider_id="bailian",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            api_key="sk-custom",
+            model="qwen3.8-flash",
+        )
+
+        profile = result.config.llm_profiles["bailian"]
+        assert profile.base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        assert profile.api_key == "sk-custom"
+        assert profile.model == "qwen3.8-flash"
+        assert result.public_payload["api_key"] == "***"
+        # The dynamic provider is registered and runtime-capable, so a
+        # follow-up edit without re-sending base_url still resolves.
+        spec = provider_registry.get_provider_spec("bailian")
+        assert spec.runtime_supported is True
+
+        edited = upsert_llm_profile(result.config, provider_id="bailian", model="qwen4")
+        assert edited.config.llm_profiles["bailian"].model == "qwen4"
+    finally:
+        provider_registry._PROVIDER_SPECS.clear()
+        provider_registry._PROVIDER_SPECS.update(snapshot)
+
+
+def test_profile_upsert_unknown_provider_without_base_url_still_rejected() -> None:
+    with pytest.raises(KeyError, match="unknown provider"):
+        upsert_llm_profile(GatewayConfig(), provider_id="does-not-exist")
+
+
 def test_profile_upsert_sets_preserves_and_clears_direct_model() -> None:
     secret = "synthetic-profile-model-secret"
     cfg = GatewayConfig(
