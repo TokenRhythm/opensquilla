@@ -161,10 +161,7 @@ export function createGatewayAdapters(
     setupWorkflow: createV4SetupWorkflow(transports.rpc),
     migrationOperations: createV4MigrationOperations(transports.rpc),
     workspaceCatalog: createV4WorkspaceCatalog(transports.rpc),
-    sandboxRuntime: createV4SandboxRuntime({
-      ...transports.rpc,
-      subscribe: (event, handler) => transports.events.subscribe(event, handler),
-    }),
+    sandboxRuntime: createV4SandboxRuntime(transports.rpc, transports.events),
     sessionConversation: createV4SessionConversation(transports.rpc, transports.events),
     observability: createV4Observability(transports.rpc, http),
     skillCatalog: createV4SkillCatalog(transports.rpc),
