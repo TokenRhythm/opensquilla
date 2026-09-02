@@ -3952,10 +3952,14 @@ async def _handle_sessions_send_impl_inner(
                 )
             return replay_response
 
-    existing_session = await storage.get_session(key)
-    if existing_session is not None and is_noninteractive_cron_session(
-        existing_session,
-        channel_types=_channel_types_from_config(ctx.config),
+    canonical_cron_key = key.startswith("cron:")
+    existing_session = None if canonical_cron_key else await storage.get_session(key)
+    if canonical_cron_key or (
+        existing_session is not None
+        and is_noninteractive_cron_session(
+            existing_session,
+            channel_types=_channel_types_from_config(ctx.config),
+        )
     ):
         raise RpcHandlerError(
             "SESSION_NOT_INTERACTIVE",

@@ -181,6 +181,48 @@ def _assert_no_runtime_acceptance_state(runtime: TaskRuntime) -> None:
 
 
 @pytest.mark.asyncio
+async def test_missing_canonical_cron_new_chat_rejects_without_durable_side_effects(
+    tmp_path: Path,
+) -> None:
+    async with _open_real_stack(tmp_path / "missing-cron.db") as stack:
+        cron_key = "cron:missing-job:run:missing-run"
+        media_root = Path(stack.context.config.attachments.media_root or "")
+
+        response = await get_dispatcher().dispatch(
+            "rpc-missing-cron-new-chat",
+            "sessions.send",
+            {
+                "key": cron_key,
+                "message": "must remain rejected",
+                "intent": "new_chat",
+                "clientRequestId": "missing-cron-new-chat",
+                "attachments": [
+                    {
+                        "type": "text/plain",
+                        "name": "must-not-persist.txt",
+                        "data": "bm8gc2lkZSBlZmZlY3Rz",
+                    }
+                ],
+            },
+            stack.context,
+        )
+
+        assert response.error is not None
+        assert response.error.code == "SESSION_NOT_INTERACTIVE"
+        assert response.error.accepted is False
+        assert response.error.retryable is False
+        assert await stack.storage.get_session(cron_key) is None
+        assert _table_counts(stack.db_path) == {
+            "transcript_entries": 0,
+            "agent_tasks": 0,
+            "turn_ingress_receipts": 0,
+        }
+        assert not media_root.exists() or list(media_root.rglob("*")) == []
+        _assert_no_runtime_acceptance_state(stack.runtime)
+        assert stack.handler_started.is_set() is False
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("method", "run_kind_injection"),
     [

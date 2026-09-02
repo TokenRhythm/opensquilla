@@ -27,7 +27,7 @@ export interface SessionItem {
 
 /** Cron runs are isolated, scheduled sessions and are intentionally read-only. */
 export function isCronSessionKey(key: string): boolean {
-  return key.trim().toLowerCase().startsWith('cron:')
+  return key.trim().startsWith('cron:')
 }
 
 export interface SessionPage {
