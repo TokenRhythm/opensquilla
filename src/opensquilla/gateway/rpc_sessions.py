@@ -137,7 +137,11 @@ from opensquilla.gateway.session_services import (
     set_session_epoch,
 )
 from opensquilla.gateway.session_streams import get_session_streams
-from opensquilla.gateway.session_view import build_session_view_item, derive_transcript_title
+from opensquilla.gateway.session_view import (
+    _surface,
+    build_session_view_item,
+    derive_transcript_title,
+)
 from opensquilla.gateway.subagent_announce import (
     quiesce_background_completion_sessions,
 )
@@ -3964,6 +3968,19 @@ async def _handle_sessions_send_impl_inner(
                     previous_acceptance.receipt.accepted_session_key,
                 )
             return replay_response
+
+    if session_intent is SessionIntent.CONTINUE:
+        existing_session = await storage.get_session(key)
+        if existing_session is not None:
+            origin = getattr(existing_session, "origin", None)
+            origin_map = origin if isinstance(origin, dict) else {}
+            if _surface(existing_session, key, origin_map) == "cron":
+                raise RpcHandlerError(
+                    "SESSION_NOT_INTERACTIVE",
+                    "Cron isolated sessions are read-only and cannot receive new turns.",
+                    retryable=False,
+                    accepted=False,
+                )
 
     if prompt_annotation_ids or document_context_request is not None:
         existing_annotation_session = await storage.get_session(key)
