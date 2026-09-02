@@ -19,6 +19,13 @@ from opensquilla.gateway.adapters.skill_catalog import (
 from opensquilla.gateway.adapters.skill_catalog_contract import (
     register_skill_catalog_contract,
 )
+from opensquilla.gateway.adapters.skill_management import (
+    GatewaySkillManagementAdapter,
+    GatewaySkillManagementPort,
+)
+from opensquilla.gateway.adapters.skill_management_contract import (
+    register_skill_management_contract,
+)
 from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
 from opensquilla.paths import default_opensquilla_home
@@ -1213,8 +1220,7 @@ for _skill_catalog_method, _skill_catalog_implementation in (
     )
 
 
-@_d.method("skills.reload", scope="operator.admin")
-async def _handle_skills_reload(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def _execute_skills_reload(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     """Force a rescan of the running Gateway's Skill catalog."""
     loader = _get_loader(ctx)
     if loader is None:
@@ -1239,8 +1245,7 @@ async def _handle_skills_reload(params: dict | None, ctx: RpcContext) -> dict[st
     return result.to_dict()
 
 
-@_d.method("skills.install", scope="operator.admin")
-async def _handle_skills_install(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def _execute_skills_install(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     """Install a skill from a Community source."""
     if not isinstance(params, dict) or "identifier" not in params:
         raise ValueError("params.identifier is required")
@@ -1352,8 +1357,7 @@ async def _run_skill_install(params: dict[str, Any], ctx: RpcContext) -> dict[st
     return _install_result_to_dict(result)
 
 
-@_d.method("skills.install.cancel", scope="operator.admin")
-async def _handle_skills_install_cancel(
+async def _execute_skills_install_cancel(
     params: dict | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -1470,8 +1474,7 @@ async def _handle_skills_update(params: dict | None, ctx: RpcContext) -> dict[st
     }
 
 
-@_d.method("skills.uninstall", scope="operator.admin")
-async def _handle_skills_uninstall(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def _execute_skills_uninstall(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     """Uninstall a managed skill."""
     if not isinstance(params, dict):
         raise ValueError("params.name or params.installId is required")
@@ -1586,8 +1589,9 @@ async def _handle_skills_doctor(params: dict | None, ctx: RpcContext) -> dict[st
         return await _read_skills_doctor(params, ctx)
 
 
-@_d.method("skills.deps.install", scope="operator.admin")
-async def _handle_skills_deps_install(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def _execute_skills_deps_install(
+    params: dict | None, ctx: RpcContext
+) -> dict[str, Any]:
     """Install runtime dependencies for an already-loaded skill.
 
     Looks up the skill by name, finds the matching SkillInstallSpec by id in
@@ -1693,6 +1697,69 @@ async def _handle_skills_deps_install(params: dict | None, ctx: RpcContext) -> d
             "env_any": [list(group) for group in report.missing_env_any],
         },
     }
+
+
+def _skill_management(ctx: RpcContext) -> GatewaySkillManagementAdapter:
+    port = GatewaySkillManagementPort(
+        ctx,
+        reload=_execute_skills_reload,
+        install=_execute_skills_install,
+        cancel=_execute_skills_install_cancel,
+        install_dependencies=_execute_skills_deps_install,
+        uninstall=_execute_skills_uninstall,
+    )
+    return GatewaySkillManagementAdapter(port)
+
+
+async def _handle_skills_reload(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    return await _skill_management(ctx).reload(params)
+
+
+async def _handle_skills_install(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    return await _skill_management(ctx).install(params)
+
+
+async def _handle_skills_install_cancel(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    return await _skill_management(ctx).cancel(params)
+
+
+async def _handle_skills_deps_install(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    return await _skill_management(ctx).install_dependencies(params)
+
+
+async def _handle_skills_uninstall(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    return await _skill_management(ctx).uninstall(params)
+
+
+for _skill_management_method, _skill_management_implementation in (
+    ("skills.reload", _handle_skills_reload),
+    ("skills.install", _handle_skills_install),
+    ("skills.install.cancel", _handle_skills_install_cancel),
+    ("skills.deps.install", _handle_skills_deps_install),
+    ("skills.uninstall", _handle_skills_uninstall),
+):
+    register_skill_management_contract(
+        _d,
+        _skill_management_method,
+        _skill_management_implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
 
 
 # ---------------------------------------------------------------------------

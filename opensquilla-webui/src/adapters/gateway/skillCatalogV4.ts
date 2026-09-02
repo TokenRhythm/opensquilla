@@ -17,6 +17,35 @@ import {
   type Result as SkillsSearchResult,
 } from '@/contracts/generated/v4/skillsSearch'
 import { validateResult as validateSkillsSearchResult } from '@/contracts/generated/v4/skillsSearchValidators.mjs'
+import {
+  SKILLS_RELOAD_METHOD,
+  type Result as SkillsReloadResult,
+} from '@/contracts/generated/v4/skillsReload'
+import { validateResult as validateSkillsReloadResult } from '@/contracts/generated/v4/skillsReloadValidators.mjs'
+import {
+  SKILLS_INSTALL_METHOD,
+  type Params as SkillsInstallParams,
+  type Result as SkillsInstallResult,
+} from '@/contracts/generated/v4/skillsInstall'
+import { validateResult as validateSkillsInstallResult } from '@/contracts/generated/v4/skillsInstallValidators.mjs'
+import {
+  SKILLS_INSTALL_CANCEL_METHOD,
+  type Params as SkillsInstallCancelParams,
+  type Result as SkillsInstallCancelResult,
+} from '@/contracts/generated/v4/skillsInstallCancel'
+import { validateResult as validateSkillsInstallCancelResult } from '@/contracts/generated/v4/skillsInstallCancelValidators.mjs'
+import {
+  SKILLS_DEPS_INSTALL_METHOD,
+  type Params as SkillsDepsInstallParams,
+  type Result as SkillsDepsInstallResult,
+} from '@/contracts/generated/v4/skillsDepsInstall'
+import { validateResult as validateSkillsDepsInstallResult } from '@/contracts/generated/v4/skillsDepsInstallValidators.mjs'
+import {
+  SKILLS_UNINSTALL_METHOD,
+  type Params as SkillsUninstallParams,
+  type Result as SkillsUninstallResult,
+} from '@/contracts/generated/v4/skillsUninstall'
+import { validateResult as validateSkillsUninstallResult } from '@/contracts/generated/v4/skillsUninstallValidators.mjs'
 import type {
   SkillCatalog,
   SkillInstallResult,
@@ -110,45 +139,73 @@ export function createV4SkillCatalog(rpc: RpcTransport): SkillCatalog {
       } satisfies SkillRegistrySearchResult
     },
     async reload(options) {
-      return record(await rpc.request(
-        'skills.reload',
+      const result = await rpc.request<SkillsReloadResult>(
+        SKILLS_RELOAD_METHOD,
         undefined,
         callOptions(options?.signal),
-      )) as unknown as SkillReloadResult
+      )
+      if (!validateSkillsReloadResult(result)) throw invalid(SKILLS_RELOAD_METHOD)
+      return result as unknown as SkillReloadResult
     },
     async install(request) {
-      return record(await rpc.request('skills.install', {
+      const params: SkillsInstallParams = {
         identifier: request.identifier,
         source: request.source,
         ...(request.operationId ? { operationId: request.operationId } : {}),
         ...(request.riskConfirmation
           ? { force: true, riskConfirmation: request.riskConfirmation }
           : {}),
-      }, callOptions(request.signal))) as unknown as SkillInstallResult
+      }
+      const result = await rpc.request<SkillsInstallResult>(
+        SKILLS_INSTALL_METHOD,
+        params,
+        callOptions(request.signal),
+      )
+      if (!validateSkillsInstallResult(result)) throw invalid(SKILLS_INSTALL_METHOD)
+      return result as unknown as SkillInstallResult
     },
     supportsInstallCancellation() {
-      return rpc.supports('skills.install.cancel')
+      return rpc.supports(SKILLS_INSTALL_CANCEL_METHOD)
     },
     async cancelInstall(operationId, options) {
-      return record(await rpc.request(
-        'skills.install.cancel',
-        { operationId },
+      const params: SkillsInstallCancelParams = { operationId }
+      const result = await rpc.request<SkillsInstallCancelResult>(
+        SKILLS_INSTALL_CANCEL_METHOD,
+        params,
         callOptions(options?.signal),
-      )) as unknown as SkillInstallResult
+      )
+      if (!validateSkillsInstallCancelResult(result)) {
+        throw invalid(SKILLS_INSTALL_CANCEL_METHOD)
+      }
+      return result as unknown as SkillInstallResult
     },
     async installDependencies(request) {
-      return record(await rpc.request('skills.deps.install', {
+      const params: SkillsDepsInstallParams = {
         name: request.name,
         install_id: request.dependencyId,
         ...(request.skillInstallId ? { installId: request.skillInstallId } : {}),
         ...(request.instanceId ? { instanceId: request.instanceId } : {}),
-      }, callOptions(request.signal))) as unknown as SkillInstallResult
+      }
+      const result = await rpc.request<SkillsDepsInstallResult>(
+        SKILLS_DEPS_INSTALL_METHOD,
+        params,
+        callOptions(request.signal),
+      )
+      if (!validateSkillsDepsInstallResult(result)) throw invalid(SKILLS_DEPS_INSTALL_METHOD)
+      return result as unknown as SkillInstallResult
     },
     async uninstall(request) {
-      return record(await rpc.request('skills.uninstall', {
+      const params: SkillsUninstallParams = {
         ...(request.name ? { name: request.name } : {}),
         ...(request.installId ? { installId: request.installId } : {}),
-      }, callOptions(request.signal))) as unknown as SkillInstallResult
+      }
+      const result = await rpc.request<SkillsUninstallResult>(
+        SKILLS_UNINSTALL_METHOD,
+        params,
+        callOptions(request.signal),
+      )
+      if (!validateSkillsUninstallResult(result)) throw invalid(SKILLS_UNINSTALL_METHOD)
+      return result as unknown as SkillInstallResult
     },
     async proposals(options) {
       const [listed, enabled, settings] = await Promise.allSettled([
