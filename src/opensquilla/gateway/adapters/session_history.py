@@ -20,6 +20,7 @@ from collections.abc import Sequence
 import structlog
 
 from opensquilla.application.session_history import (
+    CanonicalHistoryReadError,
     HistoryPage,
     SessionHistoryApplication,
     cursor_for_entry,
@@ -115,9 +116,10 @@ class SessionHistoryStorageAdapter:
     ) -> HistoryPage | None:
         """Read canonical history, returning ``None`` only when unavailable.
 
-        Unexpected canonical failures retain the active-transcript fallback.
-        Busy and cursor-domain failures are intentionally preserved so the
-        dispatcher can return their explicit error envelopes.
+        Unexpected canonical failures are wrapped so the application can try
+        active fallback without later misreporting a canonical-only anchor as
+        stale. Busy and cursor-domain failures are intentionally preserved so
+        the dispatcher can return their explicit error envelopes.
         """
 
         page_getter = getattr(self._manager, "get_canonical_transcript_page", None)
@@ -142,8 +144,10 @@ class SessionHistoryStorageAdapter:
                 HistoryCursorInvalidatedError,
             ):
                 raise
-            except Exception:  # noqa: BLE001 - preserve legacy active fallback
-                return None
+            except Exception as exc:  # noqa: BLE001 - preserve active fallback
+                raise CanonicalHistoryReadError(
+                    "canonical history projection failed"
+                ) from exc
 
         getter = getattr(self._manager, "get_canonical_transcript", None)
         if callable(getter):
@@ -167,8 +171,10 @@ class SessionHistoryStorageAdapter:
                 HistoryCursorInvalidatedError,
             ):
                 raise
-            except Exception:  # noqa: BLE001 - preserve legacy active fallback
-                return None
+            except Exception as exc:  # noqa: BLE001 - preserve active fallback
+                raise CanonicalHistoryReadError(
+                    "canonical history projection failed"
+                ) from exc
         return None
 
     async def read_active_transcript(self, session_key: str) -> Sequence[object]:

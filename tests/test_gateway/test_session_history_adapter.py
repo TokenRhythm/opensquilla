@@ -7,7 +7,10 @@ from typing import Any
 
 import pytest
 
-from opensquilla.application.session_history import SessionHistoryQuery
+from opensquilla.application.session_history import (
+    CanonicalHistoryReadError,
+    SessionHistoryQuery,
+)
 from opensquilla.gateway.adapters.session_history import (
     SessionHistoryStorageAdapter,
     canonical_page_parts,
@@ -156,6 +159,33 @@ async def test_adapter_falls_back_to_active_transcript_on_canonical_failure() ->
     assert result.has_more is True
     assert result.canonical_available is False
     assert result.canonical_complete is False
+    assert manager.active_calls == ["agent:main:webchat:history"]
+
+
+@pytest.mark.asyncio
+async def test_adapter_does_not_mislabel_canonical_only_cursor_on_projection_failure() -> None:
+    failure = RuntimeError("projection unavailable")
+
+    class BrokenManager(CanonicalManager):
+        async def get_canonical_transcript_page(self, *args: Any, **kwargs: Any) -> object:
+            raise failure
+
+        async def get_transcript(self, session_key: str) -> list[SimpleNamespace]:
+            self.active_calls.append(session_key)
+            return [row(1)]
+
+    manager = BrokenManager(None)
+    adapter = SessionHistoryStorageAdapter(manager)
+    with pytest.raises(CanonicalHistoryReadError) as caught:
+        await adapter.application().read_page(
+            SessionHistoryQuery(
+                session_key="agent:main:webchat:history",
+                limit=2,
+                before=(4, 4),
+            )
+        )
+
+    assert caught.value.__cause__ is failure
     assert manager.active_calls == ["agent:main:webchat:history"]
 
 

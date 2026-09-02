@@ -5,10 +5,11 @@ projection.  This module owns the storage-independent part that is safe to
 extract first: choosing a canonical page when it is available and applying
 the same keyset pagination policy to an active transcript fallback.
 
-Adapters translate unexpected concrete storage failures into ``None`` for an
-unavailable canonical reader, while preserving retryable and cursor-domain
-failures, and translate legacy wire cursors into :class:`HistoryCursor` values.
-No RPC, WebSocket, Gateway, or persistence type is allowed to cross this boundary.
+Adapters translate unexpected concrete storage failures into a domain error
+that permits active fallback without confusing an unavailable canonical anchor
+with a stale cursor. They preserve retryable and cursor-domain failures and
+translate legacy wire cursors into :class:`HistoryCursor` values. No RPC,
+WebSocket, Gateway, or persistence type is allowed to cross this boundary.
 """
 
 from __future__ import annotations
@@ -49,13 +50,19 @@ class HistoryPage:
     canonical_complete: bool
 
 
+class CanonicalHistoryReadError(RuntimeError):
+    """Raised when canonical projection fails for a non-cursor reason."""
+
+
 class CanonicalHistoryReader(Protocol):
     """Port for the preferred persisted/keyset history projection.
 
-    Returning ``None`` means that the canonical projection is unavailable and
-    the application should use the active transcript reader.  Implementations
-    must still raise retryable storage failures and cursor invalidations instead
-    of converting them to ``None`` so the Gateway can retain explicit errors.
+    Returning ``None`` means that the canonical capability is unavailable and
+    the application should use the active transcript reader. Implementations
+    wrap unexpected projection failures in :class:`CanonicalHistoryReadError`
+    so fallback can be attempted without later misclassifying the failure as a
+    stale cursor. Retryable storage failures and cursor invalidations remain
+    explicit.
     """
 
     async def read_canonical_page(
@@ -90,16 +97,21 @@ class SessionHistoryApplication:
         """Prefer canonical storage, then apply the legacy fallback policy."""
 
         effective_after = None if query.before is not None else query.after
+        canonical_failure: CanonicalHistoryReadError | None = None
         if query.include_canonical and self._canonical is not None:
-            # The Port deliberately decides which implementation failures are
-            # recoverable.  Any exception that reaches here (for example a
-            # retryable storage-busy error) must remain visible to the adapter.
-            canonical_page = await self._canonical.read_canonical_page(
-                query.session_key,
-                limit=query.limit,
-                before=query.before,
-                after=effective_after,
-            )
+            # The Port marks only generic projection failures as eligible for
+            # active fallback. Retryable and cursor-domain failures remain
+            # visible to the caller.
+            try:
+                canonical_page = await self._canonical.read_canonical_page(
+                    query.session_key,
+                    limit=query.limit,
+                    before=query.before,
+                    after=effective_after,
+                )
+            except CanonicalHistoryReadError as exc:
+                canonical_failure = exc
+                canonical_page = None
             if canonical_page is not None:
                 return HistoryPage(
                     entries=tuple(canonical_page.entries),
@@ -111,12 +123,17 @@ class SessionHistoryApplication:
         transcript = tuple(
             await self._active.read_active_transcript(query.session_key)
         )
-        entries, has_more = paginate_transcript(
-            transcript,
-            limit=query.limit,
-            before=query.before,
-            after=effective_after,
-        )
+        try:
+            entries, has_more = paginate_transcript(
+                transcript,
+                limit=query.limit,
+                before=query.before,
+                after=effective_after,
+            )
+        except HistoryCursorInvalidatedError:
+            if canonical_failure is not None:
+                raise canonical_failure
+            raise
         return HistoryPage(
             entries=entries,
             has_more=has_more,
@@ -191,6 +208,7 @@ def _cursor_index(entries: Sequence[object], cursor: HistoryCursor | None) -> in
 
 __all__ = [
     "ActiveHistoryReader",
+    "CanonicalHistoryReadError",
     "CanonicalHistoryReader",
     "HistoryCursor",
     "HistoryPage",

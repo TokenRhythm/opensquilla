@@ -2056,6 +2056,36 @@ async def test_chat_history_falls_back_to_active_when_paged_canonical_read_fails
 
 
 @pytest.mark.asyncio
+async def test_chat_history_does_not_misreport_projection_failure_as_stale_cursor() -> None:
+    mgr = _FakePagedSessionManager(
+        [_entry(1)],
+        page_exception=OSError("temporary database read failure"),
+    )
+
+    response = await get_dispatcher().dispatch(
+        "history-canonical-failure",
+        "chat.history",
+        {
+            "sessionKey": "agent:main:webchat:test",
+            "before": "2|2",
+            "includeSummaries": False,
+        },
+        RpcContext(
+            conn_id="test",
+            principal=SimpleNamespace(
+                role="operator",
+                scopes=frozenset({"operator.read"}),
+            ),
+            session_manager=mgr,
+        ),
+    )
+
+    assert response.ok is False
+    assert response.error is not None
+    assert response.error.code == "INTERNAL_ERROR"
+
+
+@pytest.mark.asyncio
 async def test_chat_history_does_not_fallback_when_canonical_storage_is_busy() -> None:
     busy = StorageBusyError(
         "get_canonical_transcript_page",

@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from opensquilla.application.session_history import (
+    CanonicalHistoryReadError,
     HistoryPage,
     SessionHistoryApplication,
     SessionHistoryQuery,
@@ -163,6 +164,29 @@ async def test_reader_failures_are_not_silently_swallowed() -> None:
             )
         )
     assert active.calls == []
+
+
+@pytest.mark.asyncio
+async def test_canonical_failure_is_not_downgraded_to_stale_cursor_by_fallback() -> None:
+    active = ActivePort([entry(1)])
+    failure = CanonicalHistoryReadError("canonical projection failed")
+
+    class UnavailableCanonical(CanonicalPort):
+        async def read_canonical_page(self, *args: Any, **kwargs: Any) -> HistoryPage | None:
+            raise failure
+
+    app = SessionHistoryApplication(active=active, canonical=UnavailableCanonical())
+    with pytest.raises(CanonicalHistoryReadError) as caught:
+        await app.read_page(
+            SessionHistoryQuery(
+                session_key="agent:main:webchat:history",
+                limit=1,
+                before=(2, 2),
+            )
+        )
+
+    assert caught.value is failure
+    assert active.calls == ["agent:main:webchat:history"]
 
 
 def test_paginate_transcript_preserves_latest_window_and_valid_cursors() -> None:
