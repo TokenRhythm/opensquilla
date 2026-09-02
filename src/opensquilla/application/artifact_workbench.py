@@ -466,6 +466,14 @@ class AttachmentOpaqueOversizeError(ValueError):
         super().__init__(f"upload exceeds {limit} byte cap for {mime} (got {actual})")
 
 
+class NativeArtifactUnsupportedError(ValueError):
+    """The selected artifact cannot be opened by the native document surface."""
+
+
+class NativeArtifactOpenError(RuntimeError):
+    """The platform could not materialize or open the selected artifact."""
+
+
 @dataclass(frozen=True, slots=True)
 class ArtifactContentQuery:
     session_key: str
@@ -536,6 +544,83 @@ class StagedAttachment:
     mime: str
     size: int
     expires_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class NativeArtifactOpen:
+    session_key: str
+    artifact_id: str
+
+    def __post_init__(self) -> None:
+        ArtifactIdentity(self.session_key, self.artifact_id)
+
+
+@dataclass(frozen=True, slots=True)
+class PreviewLeaseCreate:
+    session_key: str
+    session_id: str
+    artifact_id: str
+    mode: str
+    client: str
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.session_key, "session key"),
+            (self.session_id, "session id"),
+            (self.artifact_id, "artifact id"),
+        ):
+            _identity(value, label)
+        if self.mode not in {"full", "offline"}:
+            raise ValueError("preview mode must be full or offline")
+        if self.client not in {"desktop", "web"}:
+            raise ValueError("preview client must be desktop or web")
+
+
+@dataclass(frozen=True, slots=True)
+class PreviewLeaseIdentity:
+    session_key: str
+    session_id: str
+    lease_id: str
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.session_key, "session key"),
+            (self.session_id, "session id"),
+            (self.lease_id, "preview lease id"),
+        ):
+            _identity(value, label)
+
+
+@dataclass(frozen=True, slots=True)
+class PreviewLeaseGrant:
+    lease_id: str
+    token: str
+    entrypoint: str
+    mode: str
+    client: str
+    source: Mapping[str, Any]
+    expires_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class PreviewLeaseRenewal:
+    lease_id: str
+    expires_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class CandidatePreviewGrant:
+    candidate_handle: str
+    candidate_artifact_id: str
+    scope_id: str
+    lease: PreviewLeaseGrant
+
+
+@dataclass(frozen=True, slots=True)
+class WorkbenchRecoveryReport:
+    drafts: Mapping[str, int]
+    mutations: Mapping[str, int]
+    resources: Mapping[str, int]
 
 
 class ArtifactCatalogPort(Protocol):
@@ -640,6 +725,30 @@ class AttachmentMimePolicyPort(Protocol):
     def resolve_mime(self, claimed_mime: str, payload: bytes, *, accept_opaque: bool) -> str: ...
 
     def is_opaque(self, mime: str) -> bool: ...
+
+
+class NativeArtifactOpenPort(Protocol):
+    async def open_artifact(self, command: NativeArtifactOpen) -> None: ...
+
+
+class PreviewMaterialPort(Protocol):
+    async def create_lease(self, command: PreviewLeaseCreate) -> PreviewLeaseGrant: ...
+
+    async def renew_lease(self, identity: PreviewLeaseIdentity) -> PreviewLeaseRenewal: ...
+
+    async def revoke_lease(self, identity: PreviewLeaseIdentity) -> None: ...
+
+    async def resolve_candidate(self, handle: str) -> CandidatePreviewGrant: ...
+
+    async def release_candidate(self, handle: str) -> None: ...
+
+
+class ArtifactRecoveryPort(Protocol):
+    async def recover_drafts(self) -> Mapping[str, int]: ...
+
+    async def recover_mutations(self) -> Mapping[str, int]: ...
+
+    async def recover_resources(self) -> Mapping[str, int]: ...
 
 
 class ArtifactCatalog:
@@ -848,6 +957,51 @@ class AttachmentStagingApplication:
         )
 
 
+class NativeArtifactOpenApplication:
+    def __init__(self, port: NativeArtifactOpenPort) -> None:
+        self._port = port
+
+    async def open(self, command: NativeArtifactOpen) -> None:
+        await self._port.open_artifact(command)
+
+
+class PreviewMaterialApplication:
+    def __init__(self, port: PreviewMaterialPort) -> None:
+        self._port = port
+
+    async def create(self, command: PreviewLeaseCreate) -> PreviewLeaseGrant:
+        return await self._port.create_lease(command)
+
+    async def renew(self, identity: PreviewLeaseIdentity) -> PreviewLeaseRenewal:
+        return await self._port.renew_lease(identity)
+
+    async def revoke(self, identity: PreviewLeaseIdentity) -> None:
+        await self._port.revoke_lease(identity)
+
+    async def resolve_candidate(self, handle: str) -> CandidatePreviewGrant:
+        return await self._port.resolve_candidate(_identity(handle, "candidate preview handle"))
+
+    async def release_candidate(self, handle: str) -> None:
+        await self._port.release_candidate(_identity(handle, "candidate preview handle"))
+
+
+class ArtifactRecoveryApplication:
+    """Run the three durable Workbench recovery passes in dependency order."""
+
+    def __init__(self, port: ArtifactRecoveryPort) -> None:
+        self._port = port
+
+    async def reconcile(self) -> WorkbenchRecoveryReport:
+        drafts = await self._port.recover_drafts()
+        mutations = await self._port.recover_mutations()
+        resources = await self._port.recover_resources()
+        return WorkbenchRecoveryReport(
+            drafts=dict(drafts),
+            mutations=dict(mutations),
+            resources=dict(resources),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class ArtifactWorkbench:
     artifacts: ArtifactCatalog
@@ -863,6 +1017,9 @@ class ArtifactWorkbench:
     mutation_outcomes: MutationOutcomeApplication
     content: ArtifactContentApplication
     attachment_staging: AttachmentStagingApplication
+    native_open: NativeArtifactOpenApplication
+    preview_material: PreviewMaterialApplication
+    recovery: ArtifactRecoveryApplication
 
 
 __all__ = [name for name in globals() if not name.startswith("_")]
