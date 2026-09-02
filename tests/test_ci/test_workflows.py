@@ -1157,6 +1157,7 @@ def test_gateway_contract_hashes_are_compared_between_linux_and_windows() -> Non
     )
 
     assert windows["runs-on"] == "windows-latest"
+    assert windows["timeout-minutes"] == 60
     assert "tests/contracts" in linux_integration["run"]
     assert linux_integration["env"]["PYTHONPATH"] == (
         "${{ github.workspace }}:${{ github.workspace }}/src"
