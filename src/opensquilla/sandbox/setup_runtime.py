@@ -147,6 +147,12 @@ async def ensure_sandbox_setup_auto(config: Any) -> SetupResult:
     generation = _GENERATION
     async with _LOCK:
         _require_current_generation(generation)
+        # A client can lose the setup response while the elevated helper keeps
+        # running (for example, across Windows UAC). A later request waits for
+        # the active operation through _LOCK, then reuses its authoritative
+        # READY result instead of rotating credentials or repairing ACLs twice.
+        if _LAST_RESULT is not None and _LAST_RESULT.state is SandboxSetupState.READY:
+            return _LAST_RESULT
         _SETTING_UP = True
         setup_result: SetupResult | None = None
         try:
