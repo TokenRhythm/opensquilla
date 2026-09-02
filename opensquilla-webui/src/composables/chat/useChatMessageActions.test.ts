@@ -91,6 +91,37 @@ beforeEach(() => {
 })
 
 describe('useChatMessageActions branching edits', () => {
+  it('defensively blocks edit and regenerate before any read-only session mutation', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+    ]
+    const { api, options, pendingForkBeforeMessageId } = makeOptions(messages)
+    options.canMutateMessages = () => false
+
+    api.editMessage(renderedMessage({
+      role: 'user',
+      displayRole: 'user',
+      sourceIndex: 0,
+      messageId: 'msg-A',
+      text: 'A',
+    }))
+    const regenerated = await api.regenerateMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      sourceIndex: 1,
+      messageId: 'msg-a1',
+      text: 'ack A',
+    }))
+
+    expect(regenerated).toBe(false)
+    expect(options.messages.value).toEqual(messages)
+    expect(options.inputText.value).toBe('')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    expect(options.focusComposer).not.toHaveBeenCalled()
+  })
+
   it('records the edited user message id before trimming local history', () => {
     const { api, options, pendingForkBeforeMessageId } = makeOptions([
       { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },

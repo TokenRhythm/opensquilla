@@ -119,7 +119,7 @@ function assistant(
 
 function mountList(
   messages: ChatRenderedMessage[],
-  options: { isStreaming?: boolean } = {},
+  options: { isStreaming?: boolean, messageActionsAvailable?: boolean } = {},
 ) {
   const host = document.createElement('div')
   document.body.appendChild(host)
@@ -141,7 +141,9 @@ function mountList(
     toolStatusText: () => '',
     toolSecondaryText: () => '',
     copyMessage: async () => true,
+    downloadAttachment: async () => true,
     isStreaming: options.isStreaming ?? false,
+    messageActionsAvailable: options.messageActionsAvailable,
     onForkConversation: (throughTurnId?: string) => forks.push(throughTurnId),
   })
   app.use(i18n)
@@ -269,6 +271,16 @@ describe('ChatMessageList usage barrier retry anchor', () => {
 })
 
 describe('ChatMessageList assistant usage barrier regenerate', () => {
+  it('hides edit and regenerate mutations for a read-only session', () => {
+    const { host } = mountList([
+      user('user-read-only', 'turn:read-only', 'turn-read-only'),
+      assistant('assistant-read-only', 'turn:read-only', 'turn-read-only'),
+    ], { messageActionsAvailable: false })
+
+    expect(host.querySelector('[aria-label="Edit"]')).toBeNull()
+    expect(host.querySelector('[aria-label="Regenerate"]')).toBeNull()
+  })
+
   it('hides Regenerate for an unsafe status-only barrier with a same-turn steer', () => {
     const { host } = mountList([
       user('user-primary', 'turn:primary', 'turn-safe'),

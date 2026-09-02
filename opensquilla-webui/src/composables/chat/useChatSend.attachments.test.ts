@@ -2413,6 +2413,68 @@ describe('useChatSend attachment payloads', () => {
     expect(remounted.rpc.call).not.toHaveBeenCalled()
   })
 
+  it('recovers a legacy hidden receipt only when Gateway advertises receipt-first rejection', async () => {
+    const hiddenControlStorage = memoryStorage()
+    const sessionKey = 'cron:legacy-job:run:accepted-run'
+    hiddenControlStorage.setItem(
+      'opensquilla.chat.hiddenControlOutbox:v1',
+      JSON.stringify([{
+        sessionKey,
+        clientRequestId: 'legacy-hidden-accepted',
+        providerText: 'provider confirmation',
+        displayText: 'Confirmed',
+        createdAtMs: Date.now(),
+      }]),
+    )
+    const policy = ref<string | null>('Cron sessions are read-only.')
+    const configured = makeOptions({
+      sessionKey: ref(sessionKey),
+      hiddenControlStorage,
+      sendBlockedReason: policy,
+      sessionInteractivityBlockedReason: policy,
+      idempotentReplayBlockedReason: ref(null),
+      noninteractiveReceiptReplay: ref(true),
+    })
+
+    await configured.api.restoreHiddenControls(sessionKey)
+
+    expect(configured.rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      clientRequestId: 'legacy-hidden-accepted',
+      message: 'provider confirmation',
+    }))
+    expect(listHiddenControls(sessionKey, hiddenControlStorage)).toEqual([])
+  })
+
+  it('keeps a legacy unknown hidden record blocked against an older Gateway', async () => {
+    const hiddenControlStorage = memoryStorage()
+    const sessionKey = 'cron:legacy-job:run:never-attempted'
+    hiddenControlStorage.setItem(
+      'opensquilla.chat.hiddenControlOutbox:v1',
+      JSON.stringify([{
+        sessionKey,
+        clientRequestId: 'legacy-hidden-unknown',
+        providerText: 'provider confirmation',
+        displayText: 'Confirmed',
+        createdAtMs: Date.now(),
+      }]),
+    )
+    const policy = ref<string | null>('Cron sessions are read-only.')
+    const configured = makeOptions({
+      sessionKey: ref(sessionKey),
+      hiddenControlStorage,
+      sendBlockedReason: policy,
+      sessionInteractivityBlockedReason: policy,
+      idempotentReplayBlockedReason: ref(null),
+      noninteractiveReceiptReplay: ref(false),
+      enqueueHiddenControl: vi.fn(() => true),
+    })
+
+    await configured.api.restoreHiddenControls(sessionKey)
+
+    expect(configured.rpc.call).not.toHaveBeenCalled()
+    expect(listHiddenControls(sessionKey, hiddenControlStorage)[0]?.dispatchAttempted).toBeNull()
+  })
+
   it('retries a hidden queue item with one stable request identity and bubble', async () => {
     const rpc = {
       call: vi.fn()

@@ -106,6 +106,9 @@ export function createV4GatewayAccess(source: GatewayAccessSource): GatewayAcces
       const methods = source.policy?.concurrent_optional_read_methods
       return Array.isArray(methods) && methods.includes(SESSIONS_MESSAGES_HYDRATE_METHOD)
     },
+    get noninteractiveReceiptReplay() {
+      return source.policy?.noninteractive_receipt_replay === true
+    },
     get subscriptionEpoch() {
       return source.connectionGeneration
     },

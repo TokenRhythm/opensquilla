@@ -1110,6 +1110,7 @@ async def handle_ws_connection(
         policy=PolicyInfo(
             concurrent_history_reads=True,
             concurrent_optional_read_methods=sorted(_CONCURRENT_OPTIONAL_READ_METHODS),
+            noninteractive_receipt_replay=True,
             agent_stream_heartbeat_interval_ms=int(
                 max(0.0, float(getattr(config, "agent_stream_heartbeat_interval_seconds", 15.0)))
                 * 1000

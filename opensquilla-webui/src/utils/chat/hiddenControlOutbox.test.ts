@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import {
   hiddenControlDispatchAttempted,
+  hiddenControlReceiptReplayEligible,
   listHiddenControls,
   markHiddenControlDispatchAttempted,
   persistHiddenControl,
@@ -83,5 +84,37 @@ describe('hidden control durable outbox', () => {
       item.clientRequestId,
       storage,
     )).toBe(true)
+  })
+
+  it('preserves legacy dispatch state as unknown until a capable Gateway can recover it', () => {
+    const storage = memoryStorage()
+    const item = {
+      sessionKey: 'cron:legacy-job:run:legacy-run',
+      clientRequestId: 'legacy-hidden-request',
+      providerText: '/meta meta-paper-write -- durable request',
+      displayText: 'Start document',
+      createdAtMs: Date.now(),
+    }
+    storage.setItem(
+      'opensquilla.chat.hiddenControlOutbox:v1',
+      JSON.stringify([item]),
+    )
+
+    expect(listHiddenControls(item.sessionKey, storage)[0]?.dispatchAttempted).toBeNull()
+    expect(hiddenControlReceiptReplayEligible(
+      item.sessionKey,
+      item.clientRequestId,
+      false,
+      storage,
+    )).toBe(false)
+    expect(hiddenControlReceiptReplayEligible(
+      item.sessionKey,
+      item.clientRequestId,
+      true,
+      storage,
+    )).toBe(true)
+
+    expect(persistHiddenControl(item, storage)).toBe(true)
+    expect(listHiddenControls(item.sessionKey, storage)[0]?.dispatchAttempted).toBeNull()
   })
 })

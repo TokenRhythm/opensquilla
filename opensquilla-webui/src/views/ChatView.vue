@@ -218,6 +218,7 @@
           :plan-action-pending="planCardPendingAction"
           :plan-actions-disabled="planActionsDisabled"
           :is-streaming="isStreaming"
+          :message-actions-available="!isCronSession"
           :follow-live-edge="autoScroll"
           :scroll-epoch="scrollEpoch"
           :goal="currentGoalRun"
@@ -2581,6 +2582,7 @@ const chatMessageActions = useChatMessageActions({
   },
   notifyMessagePending: () => pushToast(t('chat.toast.messageStillSaving'), { tone: 'info' }),
   notifyEditBlocked: () => pushToast(t('chat.pending.editWhileStreaming'), { tone: 'info' }),
+  canMutateMessages: () => !isCronSession.value,
 })
 const {
   copyMessage,
@@ -3365,6 +3367,7 @@ const chatSend = useChatSend({
   pendingWorkspaceId,
   sendBlockedReason: effectiveSendBlockedReason,
   sessionInteractivityBlockedReason,
+  noninteractiveReceiptReplay: computed(() => gatewayAccess.noninteractiveReceiptReplay === true),
   validateActiveProjectBeforeSend,
   acceptPendingWorkspaceBinding: activeProjectWorkspace.acceptPendingBinding,
   initialCollaborationMode,

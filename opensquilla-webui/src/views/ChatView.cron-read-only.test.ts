@@ -33,6 +33,8 @@ describe('Cron session read-only presentation', () => {
     expect(chatViewSource).toContain('sessionInteractivityBlockedReason.value')
     expect(chatViewSource).toContain('sessionInteractivityBlockedReason,')
     expect(chatViewSource).toContain('idempotentReplayBlockedReason: liveSendBlockedReason')
+    expect(chatViewSource).toContain(':message-actions-available="!isCronSession"')
+    expect(chatViewSource).toContain('canMutateMessages: () => !isCronSession.value')
   })
 
   it('does not prepare hidden attachments from drag, drop, or paste', () => {

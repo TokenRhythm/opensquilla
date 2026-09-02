@@ -49,6 +49,7 @@
           :download-attachment="downloadAttachment"
           :show-turn-outcome="isTurnTip(entry.index)"
           :is-streaming="isStreaming"
+          :edit-available="messageActionsAvailable !== false"
           :is-goal-source="isGoalSource(messages[entry.index])"
           :can-reuse-prompt-annotations="canReusePromptAnnotations === true"
           :workbench-resource-preview-enabled="workbenchResourcePreviewEnabled === true"
@@ -83,7 +84,7 @@
           :workbench-enabled="workbenchEnabled"
           :artifact-navigation-items="artifactNavigationItems"
           :copy-message="copyMessage"
-          :regenerate-available="assistantRegenerateAvailable(entry.index)"
+          :regenerate-available="messageActionsAvailable !== false && assistantRegenerateAvailable(entry.index)"
           :is-tip="isForkableAssistant(entry.index)"
           :fork-busy="forkBusy"
           :plan-action-pending="planActionPending"
@@ -114,7 +115,7 @@
           :message="messages[entry.index]"
           :subagent-summary="subagentSummary"
           :subagent-body="subagentBody"
-          :retry-available="usageBarrierRetryAvailable(entry.index)"
+          :retry-available="messageActionsAvailable !== false && usageBarrierRetryAvailable(entry.index)"
           @resume="$emit('resumeSandbox')"
           @retry="forwardSystemRetry"
         />
@@ -172,7 +173,7 @@ import {
   type VariableWindowEntry,
 } from '@/utils/chat/variableMessageWindow'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   messages: ChatRenderedMessage[]
   shareMode: boolean
   selectedMessageIds: Set<string>
@@ -200,6 +201,7 @@ const props = defineProps<{
   planActionPending?: PlanCardAction | null
   planActionsDisabled?: boolean
   isStreaming?: boolean
+  messageActionsAvailable?: boolean
   goal?: GoalSnapshot | null
   goalElapsed?: string
   resolveSessionAvailability?: (sessionKey: string) => Promise<boolean>
@@ -213,7 +215,9 @@ const props = defineProps<{
   forceMountMessageKeys?: ReadonlySet<string>
   /** Keep the live edge pinned while estimated row heights settle. */
   followLiveEdge?: boolean
-}>()
+}>(), {
+  messageActionsAvailable: true,
+})
 
 const emit = defineEmits<{
   editMessage: [message: ChatRenderedMessage]

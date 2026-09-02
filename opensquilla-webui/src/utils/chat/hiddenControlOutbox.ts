@@ -4,7 +4,7 @@ export interface HiddenControlOutboxItem {
   providerText: string
   displayText: string
   createdAtMs: number
-  dispatchAttempted: boolean
+  dispatchAttempted: boolean | null
 }
 
 export type HiddenControlStorage = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>
@@ -48,7 +48,9 @@ function normalizeItem(value: unknown, nowMs = Date.now()): HiddenControlOutboxI
   const providerText = typeof candidate.providerText === 'string' ? candidate.providerText : ''
   const displayText = typeof candidate.displayText === 'string' ? candidate.displayText : ''
   const createdAtMs = candidate.createdAtMs
-  const dispatchAttempted = candidate.dispatchAttempted === true
+  const dispatchAttempted = typeof candidate.dispatchAttempted === 'boolean'
+    ? candidate.dispatchAttempted
+    : null
   if (
     !sessionKey
     || sessionKey.length > 512
@@ -109,7 +111,11 @@ export function persistHiddenControlResult(
   item: HiddenControlOutboxInput,
   storage: HiddenControlStorage | null = defaultStorage(),
 ): HiddenControlPersistResult {
-  const normalized = normalizeItem({ ...item, createdAtMs: item.createdAtMs ?? Date.now() })
+  const normalized = normalizeItem({
+    ...item,
+    createdAtMs: item.createdAtMs ?? Date.now(),
+    dispatchAttempted: item.dispatchAttempted ?? false,
+  })
   if (!normalized) return 'invalid'
   if (!storage) return 'unavailable'
   const state = readResult(storage)
@@ -150,6 +156,20 @@ export function hiddenControlDispatchAttempted(
     && candidate.clientRequestId === clientRequestId
     && candidate.dispatchAttempted
   ))
+}
+
+export function hiddenControlReceiptReplayEligible(
+  sessionKey: string,
+  clientRequestId: string,
+  allowLegacyUnknown: boolean,
+  storage: HiddenControlStorage | null = defaultStorage(),
+): boolean {
+  const item = read(storage).find(candidate => (
+    candidate.sessionKey === sessionKey
+    && candidate.clientRequestId === clientRequestId
+  ))
+  return item?.dispatchAttempted === true
+    || (item?.dispatchAttempted === null && allowLegacyUnknown)
 }
 
 export function markHiddenControlDispatchAttempted(

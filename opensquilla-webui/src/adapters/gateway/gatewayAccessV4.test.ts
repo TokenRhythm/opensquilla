@@ -52,6 +52,7 @@ describe('createV4GatewayAccess', () => {
       webui_stream_idle_grace_ms: 42_000,
       concurrent_history_reads: true,
       concurrent_optional_read_methods: ['sessions.messages.hydrate'],
+      noninteractive_receipt_replay: true,
     }
     raw.connectionGeneration = 7
 
@@ -68,6 +69,7 @@ describe('createV4GatewayAccess', () => {
     expect(access.streamIdleTimeoutMs).toBe(42_000)
     expect(access.concurrentHistoryReads).toBe(true)
     expect(access.detachedSessionHydration).toBe(true)
+    expect(access.noninteractiveReceiptReplay).toBe(true)
     expect(access.subscriptionEpoch).toBe(7)
   })
 
@@ -93,5 +95,6 @@ describe('createV4GatewayAccess', () => {
     expect(access.isAuthenticated).toBe(false)
     expect(access.runModePolicy).toBeNull()
     expect(access.streamIdleTimeoutMs).toBeNull()
+    expect(access.noninteractiveReceiptReplay).toBe(false)
   })
 })

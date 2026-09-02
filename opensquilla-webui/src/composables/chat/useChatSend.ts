@@ -64,7 +64,7 @@ import {
   stableClientUuid,
 } from '@/utils/chat/messageIdentity'
 import {
-  hiddenControlDispatchAttempted,
+  hiddenControlReceiptReplayEligible,
   type HiddenControlStorage,
   listHiddenControls,
   markHiddenControlDispatchAttempted,
@@ -612,6 +612,8 @@ export interface UseChatSendOptions {
   popAllPendingIntoComposer: () => boolean
   reconcileTaskOwnership?: () => void | Promise<unknown>
   hiddenControlStorage?: HiddenControlStorage | null
+  /** Gateway proves receipt lookup precedes noninteractive-session rejection. */
+  noninteractiveReceiptReplay?: Readonly<Ref<boolean>>
   metaDiscardStorage?: MetaDiscardStorage | null
   classifySlashCommand: (text: string) => Promise<SlashCommandClassification>
   executeSlashCommand: (
@@ -3786,9 +3788,10 @@ export function useChatSend(options: UseChatSendOptions) {
     }
 
     const idempotentReplay = persistResult === 'matched'
-      && hiddenControlDispatchAttempted(
+      && hiddenControlReceiptReplayEligible(
         requestSessionKey,
         stableClientRequestId,
+        options.noninteractiveReceiptReplay?.value === true,
         options.hiddenControlStorage,
       )
     const operation = performHiddenSend(
@@ -4273,9 +4276,10 @@ export function useChatSend(options: UseChatSendOptions) {
     item.hiddenClientMessageId ||= `hidden-control:${stableClientRequestId}`
     const freshInteractivityBlocked = () => Boolean(
       options.sessionInteractivityBlockedReason?.value
-      && !hiddenControlDispatchAttempted(
+      && !hiddenControlReceiptReplayEligible(
         ownerSessionKey,
         stableClientRequestId,
+        options.noninteractiveReceiptReplay?.value === true,
         options.hiddenControlStorage,
       )
     )
