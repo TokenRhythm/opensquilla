@@ -252,6 +252,197 @@ class SourcePatch:
             raise ValueError("edit session fencing fields must be supplied together")
 
 
+@dataclass(frozen=True, slots=True)
+class PromptAnnotationSelection:
+    selection_id: str
+    tag_name: str
+    element_path: str
+    element_proof_sha256: str
+    dom_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.selection_id, "selection id"),
+            (self.tag_name, "selection tag name"),
+            (self.element_path, "selection element path"),
+            (self.element_proof_sha256, "selection element proof"),
+        ):
+            _identity(value, label)
+
+
+@dataclass(frozen=True, slots=True)
+class PromptAnnotationQuery:
+    session_key: str
+    document_id: str | None = None
+    status: str = "draft"
+    limit: int = 500
+
+    def __post_init__(self) -> None:
+        _identity(self.session_key, "session key")
+        if self.document_id is not None:
+            _identity(self.document_id, "document id")
+        _identity(self.status, "annotation status")
+        if self.limit < 1 or self.limit > 500:
+            raise ValueError("annotation page limit must be between 1 and 500")
+
+
+@dataclass(frozen=True, slots=True)
+class PromptAnnotationCreate:
+    session_key: str
+    annotation_id: str
+    document_id: str
+    selection: PromptAnnotationSelection
+    revision_id: str | None = None
+    body: str | None = None
+
+    def __post_init__(self) -> None:
+        DocumentIdentity(self.session_key, self.document_id)
+        _identity(self.annotation_id, "annotation id")
+        if self.revision_id is not None:
+            _identity(self.revision_id, "revision id")
+
+
+@dataclass(frozen=True, slots=True)
+class PromptAnnotationIdentity:
+    session_key: str
+    annotation_id: str
+
+    def __post_init__(self) -> None:
+        _identity(self.session_key, "session key")
+        _identity(self.annotation_id, "annotation id")
+
+
+@dataclass(frozen=True, slots=True)
+class PromptAnnotationMutation:
+    session_key: str
+    annotation_id: str
+    expected_state_revision: int
+    body: str | None = None
+
+    def __post_init__(self) -> None:
+        PromptAnnotationIdentity(self.session_key, self.annotation_id)
+        if self.expected_state_revision < 1:
+            raise ValueError("expected annotation state revision must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkbenchResourceRef:
+    resource_type: str
+    resource_id: str
+
+    def __post_init__(self) -> None:
+        if self.resource_type not in {"attachment", "document", "deliverable", "url"}:
+            raise ValueError("unsupported Workbench resource type")
+        _identity(self.resource_id, "resource id")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkbenchResourceQuery:
+    session_key: str
+    resource: WorkbenchResourceRef
+
+    def __post_init__(self) -> None:
+        _identity(self.session_key, "session key")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkbenchResourceListQuery:
+    session_key: str
+    resource_types: Sequence[str] = (
+        "document",
+        "attachment",
+        "deliverable",
+        "url",
+    )
+    limit: int = 100
+    cursor: str | None = None
+
+    def __post_init__(self) -> None:
+        _identity(self.session_key, "session key")
+        if not self.resource_types or any(
+            item not in {"attachment", "document", "deliverable", "url"}
+            for item in self.resource_types
+        ):
+            raise ValueError("resource types are invalid")
+        if self.limit < 1:
+            raise ValueError("resource page limit must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkbenchResourceOpen:
+    session_key: str
+    resource: WorkbenchResourceRef
+    idempotency_key: str | None = None
+    expected_sha256: str | None = None
+    intent: str = "edit-current"
+
+    def __post_init__(self) -> None:
+        _identity(self.session_key, "session key")
+        if self.intent != "edit-current":
+            raise ValueError("unsupported resource open intent")
+        if self.idempotency_key is not None:
+            _identity(self.idempotency_key, "idempotency key")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkbenchPreviewCreate:
+    session_key: str
+    resource: WorkbenchResourceRef
+    mode: str = "isolated"
+
+    def __post_init__(self) -> None:
+        _identity(self.session_key, "session key")
+        if self.mode != "isolated":
+            raise ValueError("unsupported Workbench preview mode")
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentImport:
+    session_key: str
+    source: WorkbenchResourceRef
+    idempotency_key: str
+    expected_sha256: str | None = None
+    client_request_id: str | None = None
+    name: str | None = None
+    mode: str = "copy"
+
+    def __post_init__(self) -> None:
+        _identity(self.session_key, "session key")
+        _identity(self.idempotency_key, "idempotency key")
+        if self.mode != "copy":
+            raise ValueError("unsupported document import mode")
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentPublish:
+    session_key: str
+    document_id: str
+    revision_id: str
+    idempotency_key: str
+    client_request_id: str | None = None
+    name: str | None = None
+
+    def __post_init__(self) -> None:
+        DocumentIdentity(self.session_key, self.document_id)
+        _identity(self.revision_id, "revision id")
+        _identity(self.idempotency_key, "idempotency key")
+
+
+@dataclass(frozen=True, slots=True)
+class MutationResolution:
+    session_key: str
+    operation: str
+    request_id: str
+    document_id: str | None = None
+
+    def __post_init__(self) -> None:
+        _identity(self.session_key, "session key")
+        _identity(self.operation, "mutation operation")
+        _identity(self.request_id, "mutation request id")
+        if self.document_id is not None:
+            _identity(self.document_id, "document id")
+
+
 class ArtifactCatalogPort(Protocol):
     async def list_artifacts(self, query: ArtifactCatalogQuery) -> Mapping[str, Any]: ...
 
@@ -304,6 +495,60 @@ class DocumentSourcePort(Protocol):
     async def read_source(self, query: SourceRead) -> Mapping[str, Any]: ...
 
     async def patch_source(self, command: SourcePatch) -> Mapping[str, Any]: ...
+
+
+class PromptAnnotationPort(Protocol):
+    async def list_annotations(
+        self, query: PromptAnnotationQuery
+    ) -> Mapping[str, Any]: ...
+
+    async def create_annotation(
+        self, command: PromptAnnotationCreate
+    ) -> Mapping[str, Any]: ...
+
+    async def focus_annotation(
+        self, identity: PromptAnnotationIdentity
+    ) -> Mapping[str, Any]: ...
+
+    async def update_annotation(
+        self, command: PromptAnnotationMutation
+    ) -> Mapping[str, Any]: ...
+
+    async def discard_annotation(
+        self, command: PromptAnnotationMutation
+    ) -> Mapping[str, Any]: ...
+
+
+class WorkbenchResourcePort(Protocol):
+    async def list_resources(
+        self, query: WorkbenchResourceListQuery
+    ) -> Mapping[str, Any]: ...
+
+    async def get_resource(
+        self, query: WorkbenchResourceQuery
+    ) -> Mapping[str, Any]: ...
+
+    async def open_resource(
+        self, command: WorkbenchResourceOpen
+    ) -> Mapping[str, Any]: ...
+
+
+class ResourcePreviewPort(Protocol):
+    async def create_preview(
+        self, command: WorkbenchPreviewCreate
+    ) -> Mapping[str, Any]: ...
+
+
+class DocumentTransferPort(Protocol):
+    async def import_document(self, command: DocumentImport) -> Mapping[str, Any]: ...
+
+    async def publish_document(self, command: DocumentPublish) -> Mapping[str, Any]: ...
+
+
+class MutationOutcomePort(Protocol):
+    async def resolve_mutation(
+        self, query: MutationResolution
+    ) -> Mapping[str, Any]: ...
 
 
 class ArtifactCatalog:
@@ -390,6 +635,67 @@ class DocumentSource:
         return await self._port.patch_source(command)
 
 
+class PromptAnnotationApplication:
+    def __init__(self, port: PromptAnnotationPort) -> None:
+        self._port = port
+
+    async def list(self, query: PromptAnnotationQuery) -> Mapping[str, Any]:
+        return await self._port.list_annotations(query)
+
+    async def create(self, command: PromptAnnotationCreate) -> Mapping[str, Any]:
+        return await self._port.create_annotation(command)
+
+    async def focus(self, identity: PromptAnnotationIdentity) -> Mapping[str, Any]:
+        return await self._port.focus_annotation(identity)
+
+    async def update(self, command: PromptAnnotationMutation) -> Mapping[str, Any]:
+        return await self._port.update_annotation(command)
+
+    async def discard(self, command: PromptAnnotationMutation) -> Mapping[str, Any]:
+        return await self._port.discard_annotation(command)
+
+
+class WorkbenchResourceApplication:
+    def __init__(self, port: WorkbenchResourcePort) -> None:
+        self._port = port
+
+    async def list(self, query: WorkbenchResourceListQuery) -> Mapping[str, Any]:
+        return await self._port.list_resources(query)
+
+    async def get(self, query: WorkbenchResourceQuery) -> Mapping[str, Any]:
+        return await self._port.get_resource(query)
+
+    async def open(self, command: WorkbenchResourceOpen) -> Mapping[str, Any]:
+        return await self._port.open_resource(command)
+
+
+class ResourcePreviewApplication:
+    def __init__(self, port: ResourcePreviewPort) -> None:
+        self._port = port
+
+    async def create(self, command: WorkbenchPreviewCreate) -> Mapping[str, Any]:
+        return await self._port.create_preview(command)
+
+
+class DocumentTransferApplication:
+    def __init__(self, port: DocumentTransferPort) -> None:
+        self._port = port
+
+    async def import_document(self, command: DocumentImport) -> Mapping[str, Any]:
+        return await self._port.import_document(command)
+
+    async def publish_document(self, command: DocumentPublish) -> Mapping[str, Any]:
+        return await self._port.publish_document(command)
+
+
+class MutationOutcomeApplication:
+    def __init__(self, port: MutationOutcomePort) -> None:
+        self._port = port
+
+    async def resolve(self, query: MutationResolution) -> Mapping[str, Any]:
+        return await self._port.resolve_mutation(query)
+
+
 @dataclass(frozen=True, slots=True)
 class ArtifactWorkbench:
     artifacts: ArtifactCatalog
@@ -398,6 +704,11 @@ class ArtifactWorkbench:
     changes: ChangeHistory
     edit_sessions: DocumentEditSession
     source: DocumentSource
+    prompt_annotations: PromptAnnotationApplication
+    resources: WorkbenchResourceApplication
+    previews: ResourcePreviewApplication
+    transfers: DocumentTransferApplication
+    mutation_outcomes: MutationOutcomeApplication
 
 
 __all__ = [name for name in globals() if not name.startswith("_")]
