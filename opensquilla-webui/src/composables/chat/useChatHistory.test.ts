@@ -2496,6 +2496,146 @@ describe('useChatHistory canonical pagination', () => {
     expect(messages.value.some(message => message.terminalNotice)).toBe(false)
   })
 
+  it('drops a prior local terminal turn when the replacement proves a new epoch', async () => {
+    const newUser = sessionReadMessage({
+      id: 'new-user',
+      messageId: 'new-user',
+      role: 'user',
+      text: 'new epoch prompt',
+      createdAt: '2026-07-06T00:00:02Z',
+      turnContext: { turnId: 'new-turn' },
+    }, 0)
+    const { api, historyFixture, messages } = makeHistory(false)
+    historyFixture
+      .mockResolvedValueOnce({
+        messages: [historyMessage('old-assistant')],
+        hasMore: true,
+        oldestCursor: 'old-cursor',
+        newestCursor: 'old-cursor',
+        canonicalAvailable: true,
+      })
+      .mockRejectedValueOnce(new SessionReadHistoryCursorError('stale', 'cursor rejected'))
+      .mockResolvedValueOnce({
+        messages: [newUser],
+        hasMore: false,
+        oldestCursor: 'new-cursor',
+        newestCursor: 'new-cursor',
+        canonicalAvailable: true,
+      })
+
+    await api.loadHistory()
+    messages.value.push(
+      {
+        role: 'user',
+        text: 'old local prompt',
+        ts: 'old-local-user',
+        messageId: 'old-local-user',
+        turnId: 'old-local-turn',
+      },
+      {
+        role: 'error',
+        text: 'Activation failed; retry this message.',
+        ts: 'old-local-error',
+        turnId: 'old-local-turn',
+        errorCode: 'failed',
+        terminalNotice: true,
+      },
+    )
+    await api.loadEarlierHistory()
+    await api.retryHistory()
+
+    expect(messages.value.map(message => message.messageId)).toEqual(['new-user'])
+    expect(messages.value.some(message => message.terminalNotice)).toBe(false)
+  })
+
+  it('drops a prior terminal turn when authoritative recovery is empty', async () => {
+    const oldUser = sessionReadMessage({
+      id: 'old-user',
+      messageId: 'old-user',
+      role: 'user',
+      text: 'old epoch prompt',
+      createdAt: '2026-07-06T00:00:01Z',
+      turnContext: { turnId: 'old-turn' },
+    }, 0)
+    const { api, historyFixture, messages } = makeHistory(false)
+    historyFixture
+      .mockResolvedValueOnce({
+        messages: [oldUser],
+        hasMore: true,
+        oldestCursor: 'old-cursor',
+        newestCursor: 'old-cursor',
+        canonicalAvailable: true,
+      })
+      .mockRejectedValueOnce(new SessionReadHistoryCursorError('stale', 'cursor rejected'))
+      .mockResolvedValueOnce({
+        messages: [],
+        hasMore: false,
+        oldestCursor: null,
+        newestCursor: null,
+        canonicalAvailable: true,
+      })
+
+    await api.loadHistory()
+    messages.value.push({
+      role: 'error',
+      text: 'Activation failed; retry this message.',
+      ts: 'local-error',
+      turnId: 'old-turn',
+      errorCode: 'failed',
+      terminalNotice: true,
+    })
+    await api.loadEarlierHistory()
+    await api.retryHistory()
+
+    expect(messages.value).toEqual([])
+  })
+
+  it('keeps a local terminal notice when latest proves its owning user id', async () => {
+    const currentUser = sessionReadMessage({
+      id: 'current-user',
+      messageId: 'current-user',
+      role: 'user',
+      text: 'current epoch prompt',
+      createdAt: '2026-07-06T00:00:01Z',
+      turnContext: { turnId: 'current-turn' },
+    }, 0)
+    const { api, historyFixture, messages } = makeHistory(false)
+    historyFixture
+      .mockResolvedValueOnce({
+        messages: [currentUser],
+        hasMore: true,
+        oldestCursor: 'old-cursor',
+        newestCursor: 'old-cursor',
+        canonicalAvailable: true,
+      })
+      .mockRejectedValueOnce(new SessionReadHistoryCursorError('stale', 'cursor rejected'))
+      .mockResolvedValueOnce({
+        messages: [currentUser],
+        hasMore: false,
+        oldestCursor: 'current-cursor',
+        newestCursor: 'current-cursor',
+        canonicalAvailable: true,
+      })
+
+    await api.loadHistory()
+    messages.value.push({
+      role: 'error',
+      text: 'Activation failed; retry this message.',
+      ts: 'local-error',
+      turnId: 'current-turn',
+      errorCode: 'failed',
+      terminalNotice: true,
+    })
+    await api.loadEarlierHistory()
+    await api.retryHistory()
+
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'error'])
+    expect(messages.value[1]).toMatchObject({
+      turnId: 'current-turn',
+      terminalNotice: true,
+    })
+  })
+
   it('drops the prior canonical window when latest recovery is empty', async () => {
     const { api, historyFixture, messages } = makeHistory(false)
     historyFixture

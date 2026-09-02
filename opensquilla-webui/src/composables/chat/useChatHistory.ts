@@ -905,9 +905,33 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     latest: ChatMessage[],
   ): ChatMessage[] {
     const latestIds = new Set(latest.map(message => message.messageId).filter(Boolean))
+    const unprovenTerminalTurnRows = new Set<ChatMessage>()
+    let owningUserIndex = -1
+    for (let index = 0; index < previous.length; index++) {
+      const message = previous[index]
+      if (message?.role === 'user') owningUserIndex = index
+      if (
+        message?.role !== 'error'
+        || !message.terminalNotice
+        || owningUserIndex < 0
+      ) continue
+      const owningUser = previous[owningUserIndex]
+      if (owningUser?.messageId && latestIds.has(owningUser.messageId)) continue
+
+      // A rejected cursor means a settled local turn cannot be assigned to the
+      // replacement epoch by text, ordinal, or optimistic identity. Keep it
+      // only when the authoritative page proves the owning durable user id.
+      for (let turnIndex = owningUserIndex; turnIndex <= index; turnIndex++) {
+        const turnMessage = previous[turnIndex]
+        if (turnMessage) unprovenTerminalTurnRows.add(turnMessage)
+      }
+    }
     return previous.filter(message =>
-      message.restoredFromHistory !== true
-      || Boolean(message.messageId && latestIds.has(message.messageId)),
+      !unprovenTerminalTurnRows.has(message)
+      && (
+        message.restoredFromHistory !== true
+        || Boolean(message.messageId && latestIds.has(message.messageId))
+      ),
     )
   }
 
