@@ -317,9 +317,8 @@ SESSION_MAINTENANCE_AUTHORED_FILES = (
 )
 SESSION_MAINTENANCE_AUTHORED_LOC_CEILING = 3_000
 
-# RPC modules may share neutral services and Adapters, but never each other's
-# private handlers.  The empty exact ledger keeps this boundary at zero.
-APPROVED_PRIVATE_RPC_IMPORTS: Counter[tuple[str, str, str]] = Counter()
+RPC_IMPLEMENTATION_PREFIX = "opensquilla.gateway.rpc_"
+RPC_LOADER = GATEWAY_ROOT / "rpc" / "__init__.py"
 
 SESSION_GATEWAY_TRANSITION_DEBT = {
     "src/opensquilla/gateway/adapters/conversation_ancillary.py": frozenset(
@@ -1301,6 +1300,7 @@ def test_artifact_workbench_has_no_callback_transition_path() -> None:
         ROOT / "src/opensquilla/gateway/rpc_artifacts.py",
         ROOT / "src/opensquilla/gateway/rpc_artifact_editing.py",
         ROOT / "src/opensquilla/gateway/rpc_workbench_resources.py",
+        ROOT / "src/opensquilla/gateway/workbench_resource_runtime.py",
     )
     source = "\n".join(path.read_text(encoding="utf-8") for path in paths)
     assert "class _CallbackPort" not in source
@@ -1539,22 +1539,34 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
         assert entry.handler.__name__ == "handle_contract_method"
 
 
-def test_cross_rpc_private_import_debt_is_exact() -> None:
-    actual: Counter[tuple[str, str, str]] = Counter()
+def test_production_cross_rpc_imports_are_forbidden_outside_loader() -> None:
+    violations: list[tuple[str, int, str]] = []
     for path in _python_files(PACKAGE_ROOT):
+        if path == RPC_LOADER:
+            continue
         for node in ast.walk(_tree(path)):
-            if not isinstance(node, ast.ImportFrom) or not node.module:
-                continue
-            if not node.module.startswith("opensquilla.gateway.rpc_"):
-                continue
-            for alias in node.names:
-                if alias.name.startswith("_"):
-                    actual[(_relative(path), node.module, alias.name)] += 1
+            targets: list[str] = []
+            if isinstance(node, ast.Import):
+                targets.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:
+                    relative = path.relative_to(PACKAGE_ROOT)
+                    package = ("opensquilla", *relative.parent.parts)
+                    base = package[: len(package) - node.level + 1]
+                    module = ".".join(
+                        (*base, *(node.module.split(".") if node.module else ()))
+                    )
+                else:
+                    module = node.module or ""
+                if module:
+                    targets.append(module)
+                    if module == "opensquilla.gateway":
+                        targets.extend(f"{module}.{alias.name}" for alias in node.names)
+            for target in targets:
+                if target.startswith(RPC_IMPLEMENTATION_PREFIX):
+                    violations.append((_relative(path), node.lineno, target))
 
-    unexpected = actual - APPROVED_PRIVATE_RPC_IMPORTS
-    stale = APPROVED_PRIVATE_RPC_IMPORTS - actual
-    assert unexpected == Counter(), f"unexpected private RPC imports: {unexpected}"
-    assert stale == Counter(), f"stale private RPC import allowlist: {stale}"
+    assert violations == [], f"production modules import RPC implementations: {violations}"
 
 
 def test_session_gateway_callback_transition_debt_is_zero() -> None:

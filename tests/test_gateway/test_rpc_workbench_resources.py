@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import opensquilla.gateway.rpc_workbench_resources as resource_rpc
+import opensquilla.gateway.workbench_resource_runtime as resource_rpc
 from opensquilla.artifact_session import (
     Actor,
     ActorKind,
