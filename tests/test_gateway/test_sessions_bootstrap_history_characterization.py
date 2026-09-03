@@ -1,9 +1,4 @@
-"""Characterize the history hand-off inside ``sessions.bootstrap``.
-
-The test deliberately observes the current private call boundary.  A later
-S4c3 slice may replace that call with an application adapter, but it must keep
-the input aliases and capture the stream cursor before the history read.
-"""
+"""Characterize the shared history projection inside ``sessions.bootstrap``."""
 
 from __future__ import annotations
 
@@ -16,7 +11,6 @@ from typing import Any, cast
 import pytest
 
 import opensquilla.gateway.model_routing as model_routing
-import opensquilla.gateway.rpc_chat as rpc_chat
 import opensquilla.gateway.rpc_sessions as rpc_sessions
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
@@ -110,7 +104,7 @@ async def test_bootstrap_forwards_history_aliases_and_captures_cursor_first(
             "turn_outcomes": [],
         }
 
-    monkeypatch.setattr(rpc_chat, "_handle_chat_history", fake_history)
+    monkeypatch.setattr(rpc_sessions, "read_chat_history_v4", fake_history)
     monkeypatch.setattr(
         rpc_sessions,
         "get_session_streams",

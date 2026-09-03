@@ -26,6 +26,10 @@ from typing import Any
 
 import structlog
 
+from opensquilla.application.conversation_ancillary import (
+    RouteFeedbackPort,
+    SubmitRouteFeedback,
+)
 from opensquilla.application.observability import (
     RouterLearningQuery,
     RouterLearningStatus,
@@ -34,7 +38,6 @@ from opensquilla.application.observability import (
 from opensquilla.engine.steps.router_decision_record import get_decision_writer
 from opensquilla.gateway.adapters.conversation_ancillary import (
     GatewayConversationAncillaryAdapter,
-    GatewayConversationAncillaryCallbacks,
 )
 from opensquilla.gateway.adapters.conversation_ancillary_contract import (
     register_conversation_ancillary_contract,
@@ -134,7 +137,7 @@ async def _handle_router_decisions_list(params: Any, ctx: RpcContext) -> dict[st
     return {"decisions": [_wire_decision(row) for row in rows]}
 
 
-async def _handle_router_feedback_submit(params: Any, ctx: RpcContext) -> dict[str, Any]:
+async def _submit_route_feedback(params: Any, ctx: RpcContext) -> dict[str, Any]:
     """Record a user rating (up/down/neutral) for one routing decision.
 
     The F7 feedback intake, live: ``decisionId`` is resolved through the
@@ -397,15 +400,21 @@ _handle_selflearning_status = register_observability_contract(
 )
 
 
+class _GatewayRouteFeedbackPort(RouteFeedbackPort):
+    def __init__(self, context: RpcContext) -> None:
+        self._context = context
+
+    async def submit(self, command: SubmitRouteFeedback) -> Mapping[str, Any]:
+        return await _submit_route_feedback(
+            {"decisionId": command.decision_id, "rating": command.rating},
+            self._context,
+        )
+
+
 async def _handle_router_feedback_submit_contract(
     params: dict[str, Any] | None, ctx: RpcContext
 ) -> dict[str, Any]:
-    adapter = GatewayConversationAncillaryAdapter(
-        ctx,
-        GatewayConversationAncillaryCallbacks(
-            route_feedback=_handle_router_feedback_submit,
-        ),
-    )
+    adapter = GatewayConversationAncillaryAdapter(feedback=_GatewayRouteFeedbackPort(ctx))
     return await adapter.submit_feedback(params)
 
 

@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, cast
 
-from opensquilla.application.conversation_ancillary import PromptCachePolicy
+from opensquilla.application.conversation_ancillary import (
+    PromptCacheLeasePort,
+    PromptCachePolicy,
+    SetPromptCacheLease,
+)
 from opensquilla.gateway.adapters.conversation_ancillary import (
     GatewayConversationAncillaryAdapter,
-    GatewayConversationAncillaryCallbacks,
 )
 from opensquilla.gateway.adapters.conversation_ancillary_contract import (
     register_conversation_ancillary_contract,
@@ -32,12 +36,7 @@ from opensquilla.gateway.session_services import get_session_storage
 _d = get_dispatcher()
 
 
-async def _resolve_session(params: Any, ctx: RpcContext) -> str:
-    if not isinstance(params, dict):
-        raise ValueError("params must be an object")
-    key = params.get("key")
-    if not isinstance(key, str) or not key.strip():
-        raise ValueError("params.key must be a complete session key")
+async def _resolve_session_key(key: str, ctx: RpcContext) -> str:
     storage = get_session_storage(ctx.session_manager)
     if storage is None:
         raise RpcUnavailableError("Session storage is not available")
@@ -54,51 +53,6 @@ def _service(ctx: RpcContext) -> Any:
     return service
 
 
-async def _status(params: Any, ctx: RpcContext) -> dict[str, Any]:
-    key = await _resolve_session(params, ctx)
-    return cast(dict[str, Any], _service(ctx).status(key))
-
-
-async def _set(params: Any, ctx: RpcContext) -> dict[str, Any]:
-    key = await _resolve_session(params, ctx)
-    assert isinstance(params, dict)
-    enabled = params.get("enabled")
-    if type(enabled) is not bool:
-        raise ValueError("params.enabled must be a boolean")
-    ttl = params.get("ttlSeconds", DEFAULT_TTL_SECONDS)
-    if type(ttl) is not int:
-        raise ValueError("params.ttlSeconds must be an integer")
-    if enabled and not MIN_TTL_SECONDS <= ttl <= MAX_TTL_SECONDS:
-        raise ValueError(
-            f"params.ttlSeconds must be between {MIN_TTL_SECONDS} and "
-            f"{MAX_TTL_SECONDS}"
-        )
-    minimum_useful_idle_timeout = int(ttl * 0.8) + 1
-    idle_timeout = params.get("idleTimeoutSeconds")
-    if idle_timeout is None:
-        idle_timeout = max(DEFAULT_IDLE_TIMEOUT_SECONDS, minimum_useful_idle_timeout)
-    if type(idle_timeout) is not int:
-        raise ValueError("params.idleTimeoutSeconds must be an integer")
-    if enabled and not MIN_IDLE_TIMEOUT_SECONDS <= idle_timeout <= MAX_IDLE_TIMEOUT_SECONDS:
-        raise ValueError(
-            "params.idleTimeoutSeconds must be between "
-            f"{MIN_IDLE_TIMEOUT_SECONDS} and {MAX_IDLE_TIMEOUT_SECONDS}"
-        )
-    if enabled and idle_timeout < minimum_useful_idle_timeout:
-        raise ValueError(
-            "params.idleTimeoutSeconds must be longer than the probe interval"
-        )
-    return cast(
-        dict[str, Any],
-        await _service(ctx).set_enabled(
-            key,
-            enabled=enabled,
-            ttl_seconds=ttl,
-            idle_timeout_seconds=idle_timeout,
-        ),
-    )
-
-
 _PROMPT_CACHE_POLICY = PromptCachePolicy(
     default_ttl_seconds=DEFAULT_TTL_SECONDS,
     minimum_ttl_seconds=MIN_TTL_SECONDS,
@@ -109,13 +63,32 @@ _PROMPT_CACHE_POLICY = PromptCachePolicy(
 )
 
 
+class _GatewayPromptCacheLeasePort(PromptCacheLeasePort):
+    def __init__(self, context: RpcContext) -> None:
+        self._context = context
+
+    async def status(self, session_key: str) -> Mapping[str, Any]:
+        key = await _resolve_session_key(session_key, self._context)
+        return cast(dict[str, Any], _service(self._context).status(key))
+
+    async def set_policy(self, command: SetPromptCacheLease) -> Mapping[str, Any]:
+        key = await _resolve_session_key(command.session_key, self._context)
+        assert command.ttl_seconds is not None
+        assert command.idle_timeout_seconds is not None
+        return cast(
+            dict[str, Any],
+            await _service(self._context).set_enabled(
+                key,
+                enabled=command.enabled,
+                ttl_seconds=command.ttl_seconds,
+                idle_timeout_seconds=command.idle_timeout_seconds,
+            )
+        )
+
+
 def _prompt_cache_adapter(ctx: RpcContext) -> GatewayConversationAncillaryAdapter:
     return GatewayConversationAncillaryAdapter(
-        ctx,
-        GatewayConversationAncillaryCallbacks(
-            prompt_cache_status=_status,
-            prompt_cache_set=_set,
-        ),
+        prompt_cache=_GatewayPromptCacheLeasePort(ctx),
         prompt_cache_policy=_PROMPT_CACHE_POLICY,
     )
 

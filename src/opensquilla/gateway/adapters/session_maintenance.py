@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
@@ -39,6 +39,11 @@ from opensquilla.application.session_maintenance import (
     SessionCompactionUsagePort,
     SessionMaintenance,
 )
+from opensquilla.engine.cache_break_monitor import (
+    compaction_terminal_status,
+    notify_compaction,
+    register_active_compaction,
+)
 from opensquilla.engine.usage_accounting import bind_usage_accounting_scope
 from opensquilla.gateway.compaction_target import (
     GatewayConsumerBudget,
@@ -49,6 +54,14 @@ from opensquilla.gateway.compaction_target import (
     resolve_gateway_consumer_budget,
 )
 from opensquilla.gateway.rpc.registry import RpcContext, RpcHandlerError
+from opensquilla.gateway.session_event_publisher import (
+    buffer_session_event,
+    prepare_session_event_payload,
+    send_prepared_to_subscribers,
+)
+from opensquilla.gateway.session_maintenance_runtime import (
+    durable_checkpoint_covers_transcript,
+)
 from opensquilla.gateway.session_services import get_session_lock, get_session_storage
 from opensquilla.gateway.usage_ledger_runtime import build_session_usage_scope
 from opensquilla.observability.network_policy import (
@@ -81,6 +94,7 @@ from opensquilla.session.compaction_lifecycle import (
     new_compaction_id,
     pre_compaction_flush_requires_safe_receipt,
 )
+from opensquilla.session.keys import canonicalize_session_key
 
 log = structlog.get_logger(__name__)
 
@@ -91,44 +105,14 @@ _MILESTONE_TO_RUNTIME_EVENT = {
     SessionCompactionMilestone.PERSISTED: COMPACTION_PERSISTED_EVENT,
 }
 
-type SessionKeyReader = Callable[[dict[str, Any] | None], str]
-type CheckpointCoverage = Callable[
-    [Any, str, str | None, list[Any]],
-    Awaitable[bool],
-]
-type EventPreparer = Callable[
-    [RpcContext, str, str, dict[str, Any]],
-    Awaitable[dict[str, Any]],
-]
-type EventBuffer = Callable[[str, str, dict[str, Any] | None], dict[str, Any]]
-type EventSender = Callable[
-    [RpcContext, str, str, dict[str, Any]],
-    Awaitable[None],
-]
-type TerminalStatusReader = Callable[[str], str | None]
-type BackgroundRegistrar = Callable[[str, str, asyncio.Task[Any]], None]
 
-
-class CompactionNotifier(Protocol):
-    def __call__(
-        self,
-        session_key: str,
-        *,
-        notify_listeners: object = True,
-        track_current_task: object = True,
-        **payload: Any,
-    ) -> dict[str, Any] | None: ...
-
-
-@dataclass(frozen=True, slots=True)
-class GatewaySessionMaintenanceCallbacks:
-    checkpoint_covers: CheckpointCoverage
-    prepare_event: EventPreparer
-    buffer_event: EventBuffer
-    send_event: EventSender
-    notify_compaction: CompactionNotifier
-    terminal_status: TerminalStatusReader
-    register_background: BackgroundRegistrar
+def _require_session_key(params: dict[str, Any] | None) -> str:
+    if not isinstance(params, dict) or "key" not in params:
+        raise ValueError("params.key is required")
+    key = params["key"]
+    if not isinstance(key, str):
+        raise ValueError("params.key must be a string")
+    return canonicalize_session_key(key)
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,10 +161,8 @@ class GatewaySessionMaintenancePorts(
     def __init__(
         self,
         context: RpcContext,
-        callbacks: GatewaySessionMaintenanceCallbacks,
     ) -> None:
         self._context = context
-        self._callbacks = callbacks
         self._manager = context.session_manager
         self._storage = get_session_storage(self._manager)
 
@@ -402,7 +384,7 @@ class GatewaySessionMaintenancePorts(
     ) -> bool:
         if self._storage is None:
             return False
-        return await self._callbacks.checkpoint_covers(
+        return await durable_checkpoint_covers_transcript(
             self._storage,
             self._session_key(session),
             session.session_id,
@@ -601,7 +583,7 @@ class GatewaySessionMaintenancePorts(
             payload["cancellation_reconciled"] = True
         if event.deadline_reconciled:
             payload["deadline_reconciled"] = True
-        return await self._callbacks.prepare_event(
+        return await prepare_session_event_payload(
             self._context,
             event.session_key,
             self._EVENT_NAME,
@@ -616,17 +598,17 @@ class GatewaySessionMaintenancePorts(
         track_current_task: bool,
     ) -> object | None:
         prepared_payload = cast(dict[str, Any], prepared)
-        normalized = self._callbacks.notify_compaction(
+        normalized = notify_compaction(
             event.session_key,
             notify_listeners=False,
             track_current_task=track_current_task,
             **prepared_payload,
         )
         if normalized is None:
-            if self._callbacks.terminal_status(event.compaction_id) is not None:
+            if compaction_terminal_status(event.compaction_id) is not None:
                 return None
             normalized = prepared_payload
-        buffered = self._callbacks.buffer_event(
+        buffered = buffer_session_event(
             event.session_key,
             self._EVENT_NAME,
             normalized,
@@ -635,7 +617,7 @@ class GatewaySessionMaintenancePorts(
 
     async def broadcast(self, buffered: object) -> None:
         envelope = cast(_GatewayBufferedCompactionEvent, buffered)
-        await self._callbacks.send_event(
+        await send_prepared_to_subscribers(
             self._context,
             envelope.session_key,
             self._EVENT_NAME,
@@ -648,7 +630,7 @@ class GatewaySessionMaintenancePorts(
         compaction_id: str,
         task: asyncio.Task[object],
     ) -> None:
-        self._callbacks.register_background(session_key, compaction_id, task)
+        register_active_compaction(session_key, compaction_id, task)
         _manual_compaction_tasks.add(task)
         task.add_done_callback(_manual_compaction_tasks.discard)
 
@@ -687,14 +669,11 @@ class GatewaySessionMaintenanceAdapter:
     def __init__(
         self,
         application: SessionMaintenanceUseCase,
-        *,
-        require_key: SessionKeyReader,
     ) -> None:
         self._application = application
-        self._require_key = require_key
 
     async def compact(self, params: dict[str, Any] | None) -> dict[str, Any]:
-        key = self._require_key(params)
+        key = _require_session_key(params)
         raw = params or {}
         instructions = raw.get("instructions")
         if instructions is not None and not isinstance(instructions, str):
@@ -821,11 +800,8 @@ class GatewaySessionMaintenanceAdapter:
 
 def build_gateway_session_maintenance_adapter(
     context: RpcContext,
-    callbacks: GatewaySessionMaintenanceCallbacks,
-    *,
-    require_key: SessionKeyReader,
 ) -> GatewaySessionMaintenanceAdapter:
-    ports = GatewaySessionMaintenancePorts(context, callbacks)
+    ports = GatewaySessionMaintenancePorts(context)
     application = SessionMaintenance(
         planning=ports,
         locking=ports,
@@ -838,13 +814,11 @@ def build_gateway_session_maintenance_adapter(
     )
     return GatewaySessionMaintenanceAdapter(
         application,
-        require_key=require_key,
     )
 
 
 __all__ = [
     "GatewaySessionMaintenanceAdapter",
-    "GatewaySessionMaintenanceCallbacks",
     "GatewaySessionMaintenancePorts",
     "SessionMaintenanceUseCase",
     "build_gateway_session_maintenance_adapter",

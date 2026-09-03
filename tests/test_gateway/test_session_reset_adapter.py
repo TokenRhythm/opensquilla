@@ -47,11 +47,7 @@ async def test_adapter_terminates_force_authority_and_projects_wire_result() -> 
         RpcContext,
         SimpleNamespace(has_scope=lambda scope: scope == "operator.admin"),
     )
-    adapter = GatewaySessionResetAdapter(
-        context,
-        application,
-        require_key=lambda params: str((params or {})["key"]),
-    )
+    adapter = GatewaySessionResetAdapter(context, application)
 
     result = await adapter.reset(
         {"key": "agent:main:webchat:one", "force": True}
@@ -83,11 +79,7 @@ async def test_adapter_maps_flush_unavailable_without_losing_safety_details() ->
         )
     )
     context = cast(RpcContext, SimpleNamespace(has_scope=lambda _scope: False))
-    adapter = GatewaySessionResetAdapter(
-        context,
-        application,
-        require_key=lambda params: str((params or {})["key"]),
-    )
+    adapter = GatewaySessionResetAdapter(context, application)
 
     with pytest.raises(RpcHandlerError) as raised:
         await adapter.reset({"key": "agent:main:webchat:one"})
@@ -162,11 +154,7 @@ async def test_adapter_projects_typed_reset_failures(
 ) -> None:
     application = _Application(error=error)
     context = cast(RpcContext, SimpleNamespace(has_scope=lambda _scope: False))
-    adapter = GatewaySessionResetAdapter(
-        context,
-        application,
-        require_key=lambda params: str((params or {})["key"]),
-    )
+    adapter = GatewaySessionResetAdapter(context, application)
 
     with pytest.raises(RpcHandlerError) as raised:
         await adapter.reset({"key": "agent:main:webchat:one"})
@@ -188,11 +176,7 @@ async def test_adapter_preserves_missing_session_not_found_projection(
 ) -> None:
     application = _Application(error=error)
     context = cast(RpcContext, SimpleNamespace(has_scope=lambda _scope: False))
-    adapter = GatewaySessionResetAdapter(
-        context,
-        application,
-        require_key=lambda params: str((params or {})["key"]),
-    )
+    adapter = GatewaySessionResetAdapter(context, application)
 
     with pytest.raises(KeyError):
         await adapter.reset({"key": "agent:main:webchat:one"})

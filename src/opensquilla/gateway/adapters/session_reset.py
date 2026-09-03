@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from typing import Any, Protocol, cast
 
 import structlog
@@ -38,6 +37,12 @@ from opensquilla.application.session_reset import (
 from opensquilla.engine.usage_accounting import bind_usage_accounting_scope
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
 from opensquilla.gateway.rpc.registry import RpcContext, RpcHandlerError
+from opensquilla.gateway.session_event_publisher import emit_session_event
+from opensquilla.gateway.session_maintenance_runtime import (
+    build_session_flush_correlation,
+    cancel_task_runtime,
+    durable_checkpoint_covers_transcript,
+)
 from opensquilla.gateway.session_services import (
     get_session_lock,
     get_session_storage,
@@ -51,29 +56,19 @@ from opensquilla.session.compaction_lifecycle import (
     flush_receipt_to_dict,
     flush_trigger_enabled,
 )
+from opensquilla.session.keys import canonicalize_session_key
 from opensquilla.session.models import SessionIntent
 
 log = structlog.get_logger(__name__)
 
-type SessionKeyReader = Callable[[dict[str, Any] | None], str]
-type RuntimeCanceller = Callable[..., Awaitable[int]]
-type CheckpointCoverage = Callable[
-    [Any, str, str | None, list[Any]],
-    Awaitable[bool],
-]
-type FlushCorrelationBuilder = Callable[[RpcContext, object], tuple[str, object | None]]
-type SessionEventEmitter = Callable[
-    [RpcContext, str, str, dict[str, Any]],
-    Awaitable[None],
-]
 
-
-@dataclass(frozen=True, slots=True)
-class GatewaySessionResetCallbacks:
-    cancel_runtime: RuntimeCanceller
-    checkpoint_covers: CheckpointCoverage
-    build_flush_correlation: FlushCorrelationBuilder
-    emit_session_event: SessionEventEmitter
+def _require_session_key(params: dict[str, Any] | None) -> str:
+    if not isinstance(params, dict) or "key" not in params:
+        raise ValueError("params.key is required")
+    key = params["key"]
+    if not isinstance(key, str):
+        raise ValueError("params.key must be a string")
+    return canonicalize_session_key(key)
 
 
 def _accepts_keyword_arg(func: Callable[..., object], name: str) -> bool:
@@ -110,10 +105,8 @@ class GatewaySessionResetPorts(
     def __init__(
         self,
         context: RpcContext,
-        callbacks: GatewaySessionResetCallbacks,
     ) -> None:
         self._context = context
-        self._callbacks = callbacks
         self._manager = context.session_manager
         self._storage = get_session_storage(self._manager)
 
@@ -164,7 +157,7 @@ class GatewaySessionResetPorts(
                     session_key=session_key,
                 )
 
-        await self._callbacks.cancel_runtime(
+        await cancel_task_runtime(
             task_runtime,
             session_key=session_key,
             source="sessions_reset",
@@ -268,7 +261,7 @@ class GatewaySessionResetPorts(
         return getattr(self._context, "flush_service", None) is not None
 
     async def checkpoint_covers(self, snapshot: SessionResetSnapshot) -> bool:
-        return await self._callbacks.checkpoint_covers(
+        return await durable_checkpoint_covers_transcript(
             self._storage,
             snapshot.session_key,
             snapshot.session_id,
@@ -302,7 +295,7 @@ class GatewaySessionResetPorts(
         flush_service = self._context.flush_service
         if flush_service is None:
             raise RuntimeError("session flush service is unavailable")
-        turn_id, correlation = self._callbacks.build_flush_correlation(
+        turn_id, correlation = build_session_flush_correlation(
             self._context,
             snapshot.session_id,
         )
@@ -374,7 +367,7 @@ class GatewaySessionResetPorts(
 
     async def publish(self, session_key: str, epoch: int) -> None:
         try:
-            await self._callbacks.emit_session_event(
+            await emit_session_event(
                 self._context,
                 session_key,
                 "session.epoch_changed",
@@ -404,15 +397,12 @@ class GatewaySessionResetAdapter:
         self,
         context: RpcContext,
         application: SessionResetUseCase,
-        *,
-        require_key: SessionKeyReader,
     ) -> None:
         self._context = context
         self._application = application
-        self._require_key = require_key
 
     async def reset(self, params: dict[str, Any] | None) -> dict[str, Any]:
-        key = self._require_key(params)
+        key = _require_session_key(params)
         force = bool((params or {}).get("force", False))
         try:
             result = await self._application.reset(
@@ -492,11 +482,8 @@ class GatewaySessionResetAdapter:
 
 def build_gateway_session_reset_adapter(
     context: RpcContext,
-    callbacks: GatewaySessionResetCallbacks,
-    *,
-    require_key: SessionKeyReader,
 ) -> GatewaySessionResetAdapter:
-    ports = GatewaySessionResetPorts(context, callbacks)
+    ports = GatewaySessionResetPorts(context)
     application = SessionResetApplication(
         quiescence=ports,
         lock=ports,
@@ -510,13 +497,11 @@ def build_gateway_session_reset_adapter(
     return GatewaySessionResetAdapter(
         context,
         application,
-        require_key=require_key,
     )
 
 
 __all__ = [
     "GatewaySessionResetAdapter",
-    "GatewaySessionResetCallbacks",
     "GatewaySessionResetPorts",
     "SessionResetUseCase",
     "build_gateway_session_reset_adapter",

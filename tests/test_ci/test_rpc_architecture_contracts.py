@@ -313,21 +313,95 @@ SESSION_MAINTENANCE_AUTHORED_FILES = (
     "src/opensquilla/application/session_maintenance.py",
     "src/opensquilla/gateway/adapters/session_maintenance.py",
     "src/opensquilla/gateway/adapters/session_maintenance_contract.py",
+    "src/opensquilla/gateway/session_maintenance_runtime.py",
 )
 SESSION_MAINTENANCE_AUTHORED_LOC_CEILING = 3_000
 
-# Existing cross-rpc private imports are architectural debt. This exact ledger
-# prevents growth and also fails stale when an import is removed, so reductions
-# must be made explicit instead of leaving an ever-growing allowlist.
-APPROVED_PRIVATE_RPC_IMPORTS: Counter[tuple[str, str, str]] = Counter(
-    {
-        (
-            "src/opensquilla/gateway/rpc_sessions.py",
-            "opensquilla.gateway.rpc_chat",
-            "_handle_chat_history",
-        ): 1,
-    }
-)
+# RPC modules may share neutral services and Adapters, but never each other's
+# private handlers.  The empty exact ledger keeps this boundary at zero.
+APPROVED_PRIVATE_RPC_IMPORTS: Counter[tuple[str, str, str]] = Counter()
+
+SESSION_GATEWAY_TRANSITION_DEBT = {
+    "src/opensquilla/gateway/adapters/conversation_ancillary.py": frozenset(
+        {"AncillaryExecutor", "GatewayConversationAncillaryCallbacks"}
+    ),
+    "src/opensquilla/gateway/adapters/pending_input_queue.py": frozenset(
+        {
+            "GatewayPendingInputQueueCallbacks",
+            "GatewayPendingInputQueueRuntime",
+            "PendingInputExecutor",
+            "SessionKeyReader",
+        }
+    ),
+    "src/opensquilla/gateway/adapters/session_lifecycle.py": frozenset(
+        {
+            "AgentExistsReader",
+            "AgentIdNormalizer",
+            "AgentModelReader",
+            "DeleteExecutor",
+            "DeploymentFieldsReader",
+            "DeploymentModelError",
+            "DeploymentValidator",
+            "EffectiveAgentReader",
+            "EventEmitter",
+            "ForkExecutor",
+            "GatewaySessionLifecycleCallbacks",
+            "GatewaySessionLifecyclePorts",
+            "GatewaySessionLifecycleRuntime",
+            "ModelValueReader",
+            "OptionalStringReader",
+            "RenameExecutor",
+            "SessionKeyFactory",
+            "SessionKeyReader",
+            "WorkspaceResolver",
+        }
+    ),
+    "src/opensquilla/gateway/adapters/session_reset.py": frozenset(
+        {
+            "CheckpointCoverage",
+            "FlushCorrelationBuilder",
+            "GatewaySessionResetCallbacks",
+            "RuntimeCanceller",
+            "SessionEventEmitter",
+            "SessionKeyReader",
+        }
+    ),
+    "src/opensquilla/gateway/adapters/session_maintenance.py": frozenset(
+        {
+            "BackgroundRegistrar",
+            "CheckpointCoverage",
+            "EventBuffer",
+            "EventPreparer",
+            "EventSender",
+            "GatewaySessionMaintenanceCallbacks",
+            "SessionKeyReader",
+            "TerminalStatusReader",
+        }
+    ),
+    "src/opensquilla/gateway/rpc_chat.py": frozenset(
+        {"_handle_chat_clarify_submit"}
+    ),
+    "src/opensquilla/gateway/rpc_commands.py": frozenset(
+        {"_handle_commands_list_for_surface"}
+    ),
+    "src/opensquilla/gateway/rpc_router.py": frozenset(
+        {"_handle_router_feedback_submit"}
+    ),
+    "src/opensquilla/gateway/rpc_sessions.py": frozenset(
+        {
+            "_handle_pending_inputs_cancel",
+            "_handle_pending_inputs_dispatch",
+            "_handle_pending_inputs_enqueue",
+            "_handle_pending_inputs_list",
+            "_handle_pending_inputs_reorder",
+            "_handle_pending_inputs_steer",
+            "_handle_pending_inputs_update",
+        }
+    ),
+    "src/opensquilla/gateway/rpc_usage.py": frozenset(
+        {"_handle_usage_cost", "_handle_usage_query", "_handle_usage_status"}
+    ),
+}
 
 
 def _relative(path: Path) -> str:
@@ -1481,6 +1555,99 @@ def test_cross_rpc_private_import_debt_is_exact() -> None:
     stale = APPROVED_PRIVATE_RPC_IMPORTS - actual
     assert unexpected == Counter(), f"unexpected private RPC imports: {unexpected}"
     assert stale == Counter(), f"stale private RPC import allowlist: {stale}"
+
+
+def test_session_gateway_callback_transition_debt_is_zero() -> None:
+    violations: list[str] = []
+    for relative, forbidden_names in SESSION_GATEWAY_TRANSITION_DEBT.items():
+        path = ROOT / relative
+        tree = _tree(path)
+        names = {
+            node.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name)
+        }
+        names.update(node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef))
+        names.update(
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        remaining = sorted(names & forbidden_names)
+        if remaining:
+            violations.append(f"{relative}: {', '.join(remaining)}")
+
+    assert violations == [], "session callback transition debt remains:\n" + "\n".join(
+        violations
+    )
+
+    adapter_files = tuple(
+        ROOT / relative
+        for relative in SESSION_GATEWAY_TRANSITION_DEBT
+        if "/adapters/" in relative
+    )
+    structural_violations: list[str] = []
+    for path in adapter_files:
+        tree = _tree(path)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            if node.name.startswith("Gateway") and node.name.endswith(
+                ("Callbacks", "Runtime")
+            ):
+                structural_violations.append(
+                    f"{_relative(path)}:{node.lineno}: callback capability object "
+                    f"{node.name}"
+                )
+            initializer = next(
+                (
+                    item
+                    for item in node.body
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and item.name == "__init__"
+                ),
+                None,
+            )
+            if initializer is None:
+                continue
+            injected = {
+                arg.arg
+                for arg in (
+                    *initializer.args.posonlyargs,
+                    *initializer.args.args,
+                    *initializer.args.kwonlyargs,
+                )
+            } & {"callbacks", "runtime"}
+            if injected:
+                structural_violations.append(
+                    f"{_relative(path)}:{initializer.lineno}: injects broad "
+                    f"{', '.join(sorted(injected))} capability object"
+                )
+
+    assert structural_violations == [], (
+        "session Gateway Adapters must receive semantic Ports or an Application Module, "
+        "not renamed callback/runtime bags:\n" + "\n".join(structural_violations)
+    )
+
+    lifecycle_tree = _tree(
+        ROOT / "src/opensquilla/gateway/adapters/session_lifecycle.py"
+    )
+    lifecycle_adapter = next(
+        node
+        for node in lifecycle_tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "GatewaySessionLifecycleAdapter"
+    )
+    lifecycle_init = next(
+        node
+        for node in lifecycle_adapter.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    assert [arg.arg for arg in lifecycle_init.args.args] == [
+        "self",
+        "context",
+        "application",
+    ]
 
 
 def test_r3_application_modules_do_not_depend_on_gateway_context() -> None:

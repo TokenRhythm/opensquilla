@@ -8,12 +8,16 @@ one source rather than being hardcoded per-surface. Read-only.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from typing import Any
 
+from opensquilla.application.conversation_ancillary import (
+    CommandCatalogPort,
+    CommandCatalogQuery,
+)
 from opensquilla.engine.commands import DEFAULT_REGISTRY, CommandDef, Surface, parse_surface
 from opensquilla.gateway.adapters.conversation_ancillary import (
     GatewayConversationAncillaryAdapter,
-    GatewayConversationAncillaryCallbacks,
 )
 from opensquilla.gateway.adapters.conversation_ancillary_contract import (
     register_conversation_ancillary_contract,
@@ -129,17 +133,15 @@ async def _meta_skill_argument_choices(ctx: RpcContext) -> list[dict[str, Any]]:
     return await asyncio.to_thread(project_choices)
 
 
-async def _handle_commands_list_for_surface(
-    params: dict | None, ctx: RpcContext
+async def _list_commands_for_surface(
+    surface_name: str,
+    ctx: RpcContext,
 ) -> dict[str, Any]:
-    raw = (params or {}).get("surface", "web")
-    if not isinstance(raw, str):
-        raise ValueError("params.surface must be a string")
     try:
-        surface = parse_surface(raw)
+        surface = parse_surface(surface_name)
     except ValueError as exc:
         valid = ", ".join(sorted({s.value for s in Surface}))
-        raise ValueError(f"unknown surface {raw!r}; valid: {valid}") from exc
+        raise ValueError(f"unknown surface {surface_name!r}; valid: {valid}") from exc
     commands = [_serialize(cmd, surface) for cmd in DEFAULT_REGISTRY.for_surface(surface)]
     # Populate /meta's argument candidates from the live meta-skills so the
     # slash menu can offer them as Tab-completable choices (SPA + TUI).
@@ -152,15 +154,18 @@ async def _handle_commands_list_for_surface(
     return {"surface": surface.value, "commands": commands}
 
 
+class _GatewayCommandCatalogPort(CommandCatalogPort):
+    def __init__(self, context: RpcContext) -> None:
+        self._context = context
+
+    async def list(self, query: CommandCatalogQuery) -> Mapping[str, Any]:
+        return await _list_commands_for_surface(query.surface, self._context)
+
+
 async def _handle_commands_list_for_surface_contract(
     params: dict[str, Any] | None, ctx: RpcContext
 ) -> dict[str, Any]:
-    adapter = GatewayConversationAncillaryAdapter(
-        ctx,
-        GatewayConversationAncillaryCallbacks(
-            command_catalog=_handle_commands_list_for_surface,
-        ),
-    )
+    adapter = GatewayConversationAncillaryAdapter(commands=_GatewayCommandCatalogPort(ctx))
     return await adapter.list_commands(params)
 
 

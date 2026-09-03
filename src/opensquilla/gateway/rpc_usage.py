@@ -6,9 +6,9 @@ import time
 from collections.abc import Mapping
 from typing import Any
 
+from opensquilla.application.conversation_ancillary import UsageQuery, UsageReportingPort
 from opensquilla.gateway.adapters.conversation_ancillary import (
     GatewayConversationAncillaryAdapter,
-    GatewayConversationAncillaryCallbacks,
 )
 from opensquilla.gateway.adapters.conversation_ancillary_contract import (
     register_conversation_ancillary_contract,
@@ -617,7 +617,7 @@ def _usage_totals(rows: list[dict[str, Any]]) -> dict[str, int | float]:
     }
 
 
-async def _handle_usage_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def _read_usage_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     now_ms = _now_ms()
     requested_session_key = None
     if isinstance(params, Mapping):
@@ -731,7 +731,7 @@ async def _handle_usage_status(params: dict | None, ctx: RpcContext) -> dict[str
         }
 
 
-async def _handle_usage_query(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def _query_usage(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     """Aggregate timestamped usage events for one explicit calendar range.
 
     This is intentionally additive.  ``usage.status`` and ``usage.cost`` keep
@@ -750,7 +750,7 @@ async def _handle_usage_query(params: dict | None, ctx: RpcContext) -> dict[str,
         raise RpcHandlerError("INVALID_REQUEST", str(exc)) from exc
 
 
-async def _handle_usage_cost(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def _read_usage_cost(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     now_ms = _now_ms()
     tracker_rows = _tracker_rows(ctx, now_ms=now_ms)
 
@@ -801,15 +801,31 @@ async def _handle_usage_cost(params: dict | None, ctx: RpcContext) -> dict[str, 
         }
 
 
+class _GatewayUsageReportingPort(UsageReportingPort):
+    """Terminate the usage Port at the existing ledger/tracker implementation."""
+
+    def __init__(self, context: RpcContext) -> None:
+        self._context = context
+
+    @staticmethod
+    def _params(query: UsageQuery) -> dict[str, Any]:
+        params = dict(query.filters or {})
+        if query.session_key is not None:
+            params["sessionKey"] = query.session_key
+        return params
+
+    async def status(self, query: UsageQuery) -> Mapping[str, Any]:
+        return await _read_usage_status(self._params(query), self._context)
+
+    async def query(self, query: UsageQuery) -> Mapping[str, Any]:
+        return await _query_usage(self._params(query), self._context)
+
+    async def cost_breakdown(self, query: UsageQuery) -> Mapping[str, Any]:
+        return await _read_usage_cost(self._params(query), self._context)
+
+
 def _usage_reporting_adapter(ctx: RpcContext) -> GatewayConversationAncillaryAdapter:
-    return GatewayConversationAncillaryAdapter(
-        ctx,
-        GatewayConversationAncillaryCallbacks(
-            usage_status=_handle_usage_status,
-            usage_query=_handle_usage_query,
-            usage_cost=_handle_usage_cost,
-        ),
-    )
+    return GatewayConversationAncillaryAdapter(usage=_GatewayUsageReportingPort(ctx))
 
 
 async def _handle_usage_status_contract(

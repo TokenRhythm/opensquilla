@@ -41,10 +41,7 @@ class _Application:
 def _adapter() -> tuple[GatewaySessionMaintenanceAdapter, _Application]:
     application = _Application()
     return (
-        GatewaySessionMaintenanceAdapter(
-            application,
-            require_key=lambda params: str((params or {})["key"]),
-        ),
+        GatewaySessionMaintenanceAdapter(application),
         application,
     )
 

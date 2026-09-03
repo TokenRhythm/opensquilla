@@ -1,40 +1,49 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-from typing import cast
+from collections.abc import Mapping
+from typing import Any
 from unittest.mock import AsyncMock
 
-from opensquilla.gateway.adapters.pending_input_queue import (
-    GatewayPendingInputQueueAdapter,
-    GatewayPendingInputQueueCallbacks,
-)
-from opensquilla.gateway.rpc import RpcContext
+from opensquilla.application.pending_input_queue import PendingInputRequest
+from opensquilla.gateway.adapters.pending_input_queue import GatewayPendingInputQueueAdapter
 
 
-def _adapter() -> tuple[GatewayPendingInputQueueAdapter, dict[str, AsyncMock], RpcContext]:
-    callbacks = {
-        name: AsyncMock(return_value={"status": name})
-        for name in ("enqueue", "list", "update", "reorder", "cancel", "dispatch", "steer")
-    }
-    context = cast(RpcContext, SimpleNamespace())
-    adapter = GatewayPendingInputQueueAdapter(
-        context,
-        GatewayPendingInputQueueCallbacks(
-            require_key=lambda params: str((params or {})["key"]),
-            enqueue=callbacks["enqueue"],
-            list=callbacks["list"],
-            update=callbacks["update"],
-            reorder=callbacks["reorder"],
-            cancel=callbacks["cancel"],
-            dispatch=callbacks["dispatch"],
-            steer=callbacks["steer"],
-        ),
-    )
-    return adapter, callbacks, context
+class _RecordingPort:
+    def __init__(self) -> None:
+        self.calls = {
+            name: AsyncMock(return_value={"status": name})
+            for name in ("enqueue", "list", "update", "reorder", "cancel", "dispatch", "steer")
+        }
+
+    async def enqueue(self, request: PendingInputRequest) -> Mapping[str, Any]:
+        return await self.calls["enqueue"](request)
+
+    async def list(self, request: PendingInputRequest) -> Mapping[str, Any]:
+        return await self.calls["list"](request)
+
+    async def update(self, request: PendingInputRequest) -> Mapping[str, Any]:
+        return await self.calls["update"](request)
+
+    async def reorder(self, request: PendingInputRequest) -> Mapping[str, Any]:
+        return await self.calls["reorder"](request)
+
+    async def cancel(self, request: PendingInputRequest) -> Mapping[str, Any]:
+        return await self.calls["cancel"](request)
+
+    async def dispatch(self, request: PendingInputRequest) -> Mapping[str, Any]:
+        return await self.calls["dispatch"](request)
+
+    async def steer(self, request: PendingInputRequest) -> Mapping[str, Any]:
+        return await self.calls["steer"](request)
+
+
+def _adapter() -> tuple[GatewayPendingInputQueueAdapter, _RecordingPort]:
+    port = _RecordingPort()
+    return GatewayPendingInputQueueAdapter(port), port
 
 
 async def test_adapter_preserves_queue_identity_and_revision_aliases() -> None:
-    adapter, callbacks, context = _adapter()
+    adapter, port = _adapter()
 
     result = await adapter.update(
         {
@@ -46,21 +55,22 @@ async def test_adapter_preserves_queue_identity_and_revision_aliases() -> None:
     )
 
     assert result == {"status": "update"}
-    callbacks["update"].assert_awaited_once_with(
-        {
+    request = port.calls["update"].await_args.args[0]
+    assert request == PendingInputRequest(
+        session_key="agent:main:webchat:one",
+        pending_input_id="pending-1",
+        expected_revision=2,
+        attributes={
             "key": "agent:main:webchat:one",
             "pending_input_id": "pending-1",
-            "pendingInputId": "pending-1",
             "expected_revision": 2,
-            "expectedRevision": 2,
             "position": 1,
         },
-        context,
     )
 
 
 async def test_adapter_exposes_all_seven_queue_use_cases() -> None:
-    adapter, callbacks, _context = _adapter()
+    adapter, port = _adapter()
     key = "agent:main:webchat:one"
     identified = {"key": key, "pendingInputId": "pending-1"}
     revisioned = {**identified, "expectedRevision": 1}
@@ -73,4 +83,4 @@ async def test_adapter_exposes_all_seven_queue_use_cases() -> None:
     await adapter.dispatch(identified)
     await adapter.steer(revisioned)
 
-    assert all(callback.await_count == 1 for callback in callbacks.values())
+    assert all(call.await_count == 1 for call in port.calls.values())

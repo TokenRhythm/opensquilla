@@ -22,10 +22,28 @@ from typing import TYPE_CHECKING, Any, NoReturn, cast
 import structlog
 
 from opensquilla.agents.scope import default_workspace_dir, resolve_agent_workspace_dir
+from opensquilla.application.pending_input_queue import (
+    PendingInputQueuePort,
+    PendingInputRequest,
+)
 from opensquilla.application.session_directory import (
     SessionDirectory,
     SessionSearchProjection,
     _resolve_session_record_for_bootstrap,
+)
+from opensquilla.application.session_lifecycle import (
+    ForkSessionSpec,
+    NewSession,
+    SessionCreationKind,
+    SessionCreationPolicyPort,
+    SessionDeletionPort,
+    SessionForked,
+    SessionForkMode,
+    SessionIdentity,
+    SessionLifecycle,
+    SessionLifecycleEventsPort,
+    SessionLifecycleStorePort,
+    SessionWorkspaceBinding,
 )
 from opensquilla.application.session_read import (
     SessionMetadataQuery,
@@ -61,9 +79,6 @@ from opensquilla.chat.conversation import ChatSendRequest, sessions_send_params
 from opensquilla.chat.source import chat_source_metadata
 from opensquilla.engine.cache_break_monitor import (
     cancel_active_compactions,
-    compaction_terminal_status,
-    notify_compaction,
-    register_active_compaction,
 )
 from opensquilla.engine.commands import DEFAULT_REGISTRY, Surface
 from opensquilla.engine.start_turn import reserve_turn_via_runtime, start_turn_via_runtime
@@ -73,7 +88,6 @@ from opensquilla.engine.steps.router_decision_record import (
 from opensquilla.gateway import attachment_ingest as _attachment_ingest
 from opensquilla.gateway.adapters.pending_input_queue import (
     GatewayPendingInputQueueAdapter,
-    GatewayPendingInputQueueCallbacks,
 )
 from opensquilla.gateway.adapters.pending_input_queue_contract import (
     register_pending_input_queue_contract,
@@ -88,16 +102,15 @@ from opensquilla.gateway.adapters.plans_contract import (
 from opensquilla.gateway.adapters.session_control_contract import (
     register_session_control_contract,
 )
+from opensquilla.gateway.adapters.session_history_projection import read_chat_history_v4
 from opensquilla.gateway.adapters.session_lifecycle import (
     GatewaySessionLifecycleAdapter,
-    GatewaySessionLifecycleCallbacks,
 )
 from opensquilla.gateway.adapters.session_lifecycle_contract import (
     register_session_lifecycle_contract,
 )
 from opensquilla.gateway.adapters.session_maintenance import (
     GatewaySessionMaintenanceAdapter,
-    GatewaySessionMaintenanceCallbacks,
     build_gateway_session_maintenance_adapter,
 )
 from opensquilla.gateway.adapters.session_maintenance_contract import (
@@ -124,7 +137,6 @@ from opensquilla.gateway.adapters.session_read_contract import (
 )
 from opensquilla.gateway.adapters.session_reset import (
     GatewaySessionResetAdapter,
-    GatewaySessionResetCallbacks,
     build_gateway_session_reset_adapter,
 )
 from opensquilla.gateway.adapters.sessions_list_contract import (
@@ -174,6 +186,18 @@ from opensquilla.gateway.session_event_publisher import (
     send_prepared_to_subscribers,
 )
 from opensquilla.gateway.session_events import build_sessions_changed_payload
+from opensquilla.gateway.session_maintenance_runtime import (
+    TaskScopedCancelUnsupportedError as _TaskScopedCancelUnsupportedError,
+)
+from opensquilla.gateway.session_maintenance_runtime import (
+    build_session_flush_correlation as _build_session_flush_correlation,
+)
+from opensquilla.gateway.session_maintenance_runtime import (
+    cancel_task_runtime as _cancel_task_runtime,
+)
+from opensquilla.gateway.session_maintenance_runtime import (
+    durable_checkpoint_covers_transcript as _durable_receipt_allows_covered_destructive_compaction,
+)
 from opensquilla.gateway.session_services import (
     get_session_epoch,
     get_session_lock,
@@ -227,7 +251,6 @@ from opensquilla.sandbox.run_mode_policy import (
 from opensquilla.sandbox.setup_runtime import current_sandbox_capability_report
 from opensquilla.session.compaction_lifecycle import (
     compaction_memory_status,
-    durable_receipt_allows_destructive_compaction,
     flush_receipt_status_for_compaction,
     flush_receipt_to_dict,
     flush_trigger_enabled,
@@ -477,30 +500,6 @@ def _artifact_state_event_emitter(
         await bridge.emit(session_key, "document.state_changed", safe_payload)
 
     return emit
-
-
-def _build_session_flush_correlation(
-    ctx: RpcContext,
-    session_id: object,
-) -> tuple[str, ProviderRequestCorrelation | None]:
-    """Create one root operation and execution for a session-bound maintenance flush."""
-
-    turn_id = uuid.uuid4().hex
-    if (
-        not isinstance(session_id, str)
-        or not session_id
-        or provider_request_correlation_disabled(config=ctx.config)
-    ):
-        return turn_id, None
-    return (
-        turn_id,
-        ProviderRequestCorrelation(
-            session_id=session_id,
-            turn_id=turn_id,
-            execution_id=uuid.uuid4().hex,
-            call_kind="auxiliary.session_flush",
-        ),
-    )
 
 
 async def _branch_with_session_mutation_lock(
@@ -786,70 +785,6 @@ def _clean_cancel_source(value: Any, default: str) -> str:
 
 def _cancel_source_from_params(params: dict | None, default: str) -> str:
     return _clean_cancel_source((params or {}).get("source"), default)
-
-
-async def _cancel_task_runtime(
-    task_runtime: Any,
-    *,
-    session_key: str,
-    task_id: str | None = None,
-    source: str,
-    reason: str,
-) -> int:
-    exact_cancel = getattr(task_runtime, "cancel_exact", None) if task_id else None
-    cancel = exact_cancel if callable(exact_cancel) else getattr(task_runtime, "cancel")
-    kwargs: dict[str, Any] = {}
-    if task_id:
-        # An exact Stop must never widen into a session-wide cancellation for
-        # an older/custom runtime.  Both identities are required so a stale or
-        # forged task id cannot cancel work owned by another session.
-        if not (
-            _accepts_keyword_arg(cancel, "task_id")
-            and _accepts_keyword_arg(cancel, "session_key")
-        ):
-            raise _TaskScopedCancelUnsupportedError
-        kwargs["task_id"] = task_id
-        kwargs["session_key"] = session_key
-    else:
-        kwargs["session_key"] = session_key
-    if _accepts_keyword_arg(cancel, "source"):
-        kwargs["source"] = source
-    if _accepts_keyword_arg(cancel, "reason"):
-        kwargs["reason"] = reason
-    return int(await cancel(**kwargs))
-
-
-class _TaskScopedCancelUnsupportedError(RuntimeError):
-    """The runtime cannot atomically cancel a task owned by one session."""
-
-
-async def _durable_receipt_allows_covered_destructive_compaction(
-    storage: Any,
-    session_key: str,
-    session_id: str | None,
-    entries: list[Any],
-) -> bool:
-    if not entries:
-        return True
-    from opensquilla.memory.checkpoint import (
-        checkpoint_coverage_hash,
-        checkpoint_turn_id,
-    )
-
-    list_receipts = getattr(storage, "list_memory_durable_receipts", None)
-    if not callable(list_receipts):
-        return False
-    receipts = await list_receipts(
-        session_key=session_key,
-        session_id=session_id,
-        scope="checkpoint",
-        status="checkpoint_saved",
-        coverage_turn_id=checkpoint_turn_id(entries),
-        coverage_hash=checkpoint_coverage_hash(entries),
-        coverage_entry_count=len(entries),
-        limit=1,
-    )
-    return any(durable_receipt_allows_destructive_compaction(receipt) for receipt in receipts)
 
 
 def _truncate_removed_entries(transcript: list[Any], max_messages: int) -> list[Any]:
@@ -2972,29 +2907,216 @@ _handle_sessions_search_contract = register_sessions_search_contract(
 )
 
 
+class _GatewaySessionLifecyclePorts(
+    SessionCreationPolicyPort,
+    SessionLifecycleStorePort,
+    SessionDeletionPort,
+    SessionLifecycleEventsPort,
+):
+    """Concrete Application Ports over the one SessionManager runtime."""
+
+    def __init__(self, context: RpcContext) -> None:
+        self._context = context
+        self._manager = context.session_manager
+        self._storage = get_session_storage(self._manager)
+
+    @property
+    def available(self) -> bool:
+        return self._manager is not None
+
+    @property
+    def deletion_available(self) -> bool:
+        return self._manager is not None and self._storage is not None
+
+    def new_session_key(self, agent_id: str, kind: SessionCreationKind) -> str:
+        wire_kind: str | None = None if kind is SessionCreationKind.DEFAULT else kind.value
+        return _create_session_key(agent_id, wire_kind)
+
+    async def default_model(self, agent_id: str) -> str | None:
+        return _agent_registry_model(self._context, agent_id)
+
+    async def agent_exists(self, agent_id: str) -> bool:
+        return await _agent_registry_has(self._context, agent_id)
+
+    def validate_deployment(
+        self,
+        *,
+        session_key: str,
+        provider: str | None,
+        model: str | None,
+        auth_profile: str | None,
+    ) -> None:
+        _validate_rpc_session_deployment(
+            self._context,
+            session_key=session_key,
+            provider=provider,
+            model=model,
+            auth_profile=auth_profile,
+        )
+
+    async def resolve_workspace(self, workspace_id: str) -> SessionWorkspaceBinding:
+        if self._storage is None:
+            raise RpcUnavailableError(
+                "sessions.create(workspaceId=...) requires session storage"
+            )
+        try:
+            validated = await resolve_validated_project_workspace(
+                self._storage,
+                workspace_id,
+            )
+        except ProjectWorkspaceStateError as exc:
+            raise map_project_workspace_error(
+                exc,
+                owner=self._context.principal.is_owner,
+            ) from exc
+        mode = project_default_run_mode(self._context.config)
+        source = (
+            "project_default"
+            if mode is RunMode.SAFE
+            and config_run_mode(self._context.config) is RunMode.FULL
+            else "operator_default"
+        )
+        return SessionWorkspaceBinding(
+            workspace_id=validated.workspace.workspace_id,
+            path=str(validated.workspace.path),
+            run_mode=mode.value,
+            run_mode_source=source,
+        )
+
+    async def create(self, session: NewSession) -> SessionIdentity:
+        if self._manager is None:
+            raise RpcUnavailableError("sessions.create requires a session manager")
+        create_kwargs: dict[str, Any] = {
+            "session_key": session.session_key,
+            "agent_id": session.agent_id,
+            "display_name": session.display_name,
+            "model": session.model,
+        }
+        if session.provider.present:
+            create_kwargs["provider_override"] = session.provider.value
+        if session.auth_profile.present:
+            create_kwargs["auth_profile_override"] = session.auth_profile.value
+            create_kwargs["auth_profile_override_source"] = (
+                "rpc" if session.auth_profile.value else None
+            )
+        if session.workspace is not None:
+            workspace = session.workspace
+            create_kwargs["workspace_id"] = workspace.workspace_id
+            create_kwargs["origin"] = {
+                RUN_CONTEXT_ORIGIN_KEY: RunContext(
+                    run_mode=RunMode(workspace.run_mode),
+                    workspace=workspace.path,
+                    run_mode_source=workspace.run_mode_source,
+                    source=workspace.source,
+                ).to_origin_payload()
+            }
+        created = await self._manager.create(**create_kwargs)
+        return SessionIdentity(
+            session_key=str(created.session_key),
+            session_id=str(created.session_id),
+        )
+
+    async def append_initial_user_message(self, session_key: str, message: str) -> None:
+        if self._manager is None:
+            raise RpcUnavailableError(
+                "sessions.create(message=...) requires a session manager"
+            )
+        await self._manager.append_message(session_key, role="user", content=message)
+
+    async def rename(self, session_key: str, display_name: str) -> None:
+        if self._manager is None:
+            raise KeyError("No session manager available")
+        if self._storage is None:
+            raise KeyError("No session storage available")
+        session = await self._storage.get_session(session_key)
+        if session is None:
+            raise KeyError(f"Session not found: {session_key}")
+        update = getattr(self._manager, "update", None)
+        if callable(update):
+            await update(session_key, display_name=display_name)
+            return
+        setattr(session, "display_name", display_name)
+        upsert = getattr(self._storage, "upsert_session", None)
+        if callable(upsert):
+            await upsert(session)
+
+    async def fork_agent_id(self, parent_key: str) -> str:
+        if self._storage is None:
+            raise KeyError("No session storage available")
+        parent = await self._storage.get_session(parent_key)
+        if parent is None:
+            raise KeyError(f"Session not found: {parent_key}")
+        return _effective_agent_id_for_session(parent, parent_key)
+
+    async def fork(self, spec: ForkSessionSpec) -> SessionIdentity:
+        if self._manager is None:
+            raise KeyError("No session manager available")
+        if self._storage is None:
+            raise KeyError("No session storage available")
+        fork_kwargs: dict[str, Any] = {
+            "fork_transcript": True,
+            "status": SessionStatus.DONE,
+        }
+        if spec.point.mode is SessionForkMode.BEFORE_MESSAGE:
+            fork_kwargs["fork_before_message_id"] = spec.point.anchor_id
+        elif spec.point.mode is SessionForkMode.THROUGH_TURN:
+            fork_kwargs["fork_through_turn_id"] = spec.point.anchor_id
+        child = await _fork_with_numbered_title(
+            self._context,
+            self._storage,
+            spec.parent_key,
+            spec.child_key,
+            explicit_title=spec.title,
+            **fork_kwargs,
+        )
+        return SessionIdentity(
+            session_key=str(getattr(child, "session_key")),
+            session_id=str(getattr(child, "session_id")),
+        )
+
+    async def delete_one(self, canonical_key: str) -> None:
+        if self._storage is None:
+            raise KeyError("No session storage available")
+        await _delete_session_with_lifecycle(
+            canonical_key=canonical_key,
+            ctx=self._context,
+            storage=self._storage,
+        )
+
+    async def publish_forked(self, event: SessionForked) -> None:
+        await _emit_to_subscribers(
+            self._context,
+            event.child_key,
+            "sessions.changed",
+            build_sessions_changed_payload(
+                event.child_key,
+                "forked",
+                run_status="idle",
+            ),
+        )
+
+
+class _SessionLifecycleDeletionPort(SessionDeletionPort):
+    def __init__(self, ports: _GatewaySessionLifecyclePorts) -> None:
+        self._ports = ports
+
+    @property
+    def available(self) -> bool:
+        return self._ports.deletion_available
+
+    async def delete_one(self, canonical_key: str) -> None:
+        await self._ports.delete_one(canonical_key)
+
+
 def _session_lifecycle_adapter(ctx: RpcContext) -> GatewaySessionLifecycleAdapter:
-    return GatewaySessionLifecycleAdapter(
-        ctx,
-        GatewaySessionLifecycleCallbacks(
-            deployment_fields=_rpc_session_deployment_fields,
-            new_session_key=_create_session_key,
-            normalize_agent_id=normalize_agent_id,
-            agent_model=_agent_registry_model,
-            agent_exists=_agent_registry_has,
-            validate_deployment=_validate_rpc_session_deployment,
-            raise_deployment_model_required=_raise_explicit_session_deployment_model_required,
-            require_key=_require_key,
-            optional_string=_optional_string_param,
-            optional_non_empty_aliased_string=_optional_aliased_non_empty_string_param,
-            model_value=_model_value,
-            effective_agent_id=_effective_agent_id_for_session,
-            fork_session=_fork_with_numbered_title,
-            rename_session=_apply_sessions_patch,
-            delete_session=_delete_session_with_lifecycle,
-            emit_session_event=_emit_to_subscribers,
-            resolve_project_workspace=resolve_validated_project_workspace,
-        ),
+    ports = _GatewaySessionLifecyclePorts(ctx)
+    application = SessionLifecycle(
+        creation_policy=ports,
+        store=ports,
+        deletion=_SessionLifecycleDeletionPort(ports),
+        events=ports,
     )
+    return GatewaySessionLifecycleAdapter(ctx, application)
 
 
 async def _handle_sessions_create(params: dict | None, ctx: RpcContext) -> dict:
@@ -7159,7 +7281,7 @@ async def _cleanup_unreferenced_pending_promotions(
                 )
 
 
-async def _handle_pending_inputs_enqueue(
+async def _enqueue_pending_input(
     params: dict | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -7377,7 +7499,7 @@ async def _handle_pending_inputs_enqueue(
     return {"status": "staged", **_pending_input_payload(row, replayed=replayed)}
 
 
-async def _handle_pending_inputs_list(
+async def _list_pending_inputs(
     params: dict | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -7390,7 +7512,7 @@ async def _handle_pending_inputs_list(
     }
 
 
-async def _handle_pending_inputs_update(
+async def _update_pending_input(
     params: dict | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -7432,7 +7554,7 @@ async def _handle_pending_inputs_update(
     return {"status": "updated", **_pending_input_payload(row)}
 
 
-async def _handle_pending_inputs_reorder(
+async def _reorder_pending_inputs(
     params: dict | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -7487,7 +7609,7 @@ async def _handle_pending_inputs_reorder(
     }
 
 
-async def _handle_pending_inputs_cancel(
+async def _cancel_pending_input(
     params: dict | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -7547,7 +7669,7 @@ async def _handle_pending_inputs_cancel(
     }
 
 
-async def _handle_pending_inputs_dispatch(
+async def _dispatch_pending_input(
     params: dict | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -7785,7 +7907,7 @@ async def _steer_v2_response(
     return payload
 
 
-async def _handle_pending_inputs_steer(
+async def _steer_pending_input(
     params: dict | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -9380,32 +9502,11 @@ _handle_sessions_delete_contract = register_session_lifecycle_contract(
 
 
 def _session_maintenance_adapter(ctx: RpcContext) -> GatewaySessionMaintenanceAdapter:
-    return build_gateway_session_maintenance_adapter(
-        ctx,
-        GatewaySessionMaintenanceCallbacks(
-            checkpoint_covers=_durable_receipt_allows_covered_destructive_compaction,
-            prepare_event=_prepare_session_event_payload,
-            buffer_event=_buffer_session_event,
-            send_event=_send_prepared_to_subscribers,
-            notify_compaction=notify_compaction,
-            terminal_status=compaction_terminal_status,
-            register_background=register_active_compaction,
-        ),
-        require_key=_require_key,
-    )
+    return build_gateway_session_maintenance_adapter(ctx)
 
 
 def _session_reset_adapter(ctx: RpcContext) -> GatewaySessionResetAdapter:
-    return build_gateway_session_reset_adapter(
-        ctx,
-        GatewaySessionResetCallbacks(
-            cancel_runtime=_cancel_task_runtime,
-            checkpoint_covers=_durable_receipt_allows_covered_destructive_compaction,
-            build_flush_correlation=_build_session_flush_correlation,
-            emit_session_event=_emit_to_subscribers,
-        ),
-        require_key=_require_key,
-    )
+    return build_gateway_session_reset_adapter(ctx)
 
 
 async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
@@ -11038,11 +11139,7 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
         if isinstance(params, dict) and source in params:
             history_params[target] = params[source]
 
-    # Local import avoids making rpc_chat/rpc_sessions module registration
-    # order part of the public RPC contract.
-    from opensquilla.gateway.rpc_chat import _handle_chat_history
-
-    history = await _handle_chat_history(history_params, ctx)
+    history = await read_chat_history_v4(history_params, ctx)
     task_rows = await _list_task_rows(ctx, storage, session_key)
     task_state = _task_state_summary(task_rows)
     await _overlay_runtime_task_snapshot(ctx, session_key, task_state)
@@ -11512,20 +11609,46 @@ _handle_sessions_steer_generated_contract = register_turn_admission_contract(
 )
 
 
+class _GatewayPendingInputQueuePort(PendingInputQueuePort):
+    """Concrete queue Port backed by the single durable SessionStorage path."""
+
+    def __init__(self, context: RpcContext) -> None:
+        self._context = context
+
+    @staticmethod
+    def _params(request: PendingInputRequest) -> dict[str, Any]:
+        params = dict(request.attributes)
+        params["key"] = request.session_key
+        if request.pending_input_id is not None:
+            params["pendingInputId"] = request.pending_input_id
+        if request.expected_revision is not None:
+            params["expectedRevision"] = request.expected_revision
+        return params
+
+    async def enqueue(self, request: PendingInputRequest) -> Mapping[str, Any]:
+        return await _enqueue_pending_input(self._params(request), self._context)
+
+    async def list(self, request: PendingInputRequest) -> Mapping[str, Any]:
+        return await _list_pending_inputs(self._params(request), self._context)
+
+    async def update(self, request: PendingInputRequest) -> Mapping[str, Any]:
+        return await _update_pending_input(self._params(request), self._context)
+
+    async def reorder(self, request: PendingInputRequest) -> Mapping[str, Any]:
+        return await _reorder_pending_inputs(self._params(request), self._context)
+
+    async def cancel(self, request: PendingInputRequest) -> Mapping[str, Any]:
+        return await _cancel_pending_input(self._params(request), self._context)
+
+    async def dispatch(self, request: PendingInputRequest) -> Mapping[str, Any]:
+        return await _dispatch_pending_input(self._params(request), self._context)
+
+    async def steer(self, request: PendingInputRequest) -> Mapping[str, Any]:
+        return await _steer_pending_input(self._params(request), self._context)
+
+
 def _pending_input_queue_adapter(ctx: RpcContext) -> GatewayPendingInputQueueAdapter:
-    return GatewayPendingInputQueueAdapter(
-        ctx,
-        GatewayPendingInputQueueCallbacks(
-            require_key=_pending_input_key,
-            enqueue=_handle_pending_inputs_enqueue,
-            list=_handle_pending_inputs_list,
-            update=_handle_pending_inputs_update,
-            reorder=_handle_pending_inputs_reorder,
-            cancel=_handle_pending_inputs_cancel,
-            dispatch=_handle_pending_inputs_dispatch,
-            steer=_handle_pending_inputs_steer,
-        ),
-    )
+    return GatewayPendingInputQueueAdapter(_GatewayPendingInputQueuePort(ctx))
 
 
 async def _handle_pending_inputs_enqueue_contract(

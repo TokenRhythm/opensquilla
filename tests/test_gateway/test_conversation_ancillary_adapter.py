@@ -1,37 +1,61 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
-from opensquilla.application.conversation_ancillary import PromptCachePolicy
+from opensquilla.application.conversation_ancillary import (
+    ClarificationSubmissionPort,
+    CommandCatalogPort,
+    PromptCacheLeasePort,
+    PromptCachePolicy,
+    RouteFeedbackPort,
+    UsageReportingPort,
+)
 from opensquilla.gateway.adapters.conversation_ancillary import (
     GatewayConversationAncillaryAdapter,
-    GatewayConversationAncillaryCallbacks,
 )
-from opensquilla.gateway.rpc import RpcContext
 
 
-def _adapter() -> tuple[
-    GatewayConversationAncillaryAdapter,
-    RpcContext,
-    GatewayConversationAncillaryCallbacks,
-]:
-    context = cast(RpcContext, SimpleNamespace(conn_id="test"))
-    callbacks = GatewayConversationAncillaryCallbacks(
-        usage_status=AsyncMock(return_value={"sessions": []}),
-        usage_query=AsyncMock(return_value={"rows": []}),
-        usage_cost=AsyncMock(return_value={"totalCostUsd": 1.5}),
-        command_catalog=AsyncMock(return_value={"surface": "web", "commands": []}),
-        route_feedback=AsyncMock(return_value={"accepted": True}),
-        prompt_cache_status=AsyncMock(return_value={"enabled": False}),
-        prompt_cache_set=AsyncMock(return_value={"enabled": True}),
-        clarification=AsyncMock(return_value={"accepted": True}),
+def _adapter() -> tuple[GatewayConversationAncillaryAdapter, dict[str, AsyncMock]]:
+    calls = {
+        name: AsyncMock(return_value=value)
+        for name, value in {
+            "usage_status": {"sessions": []},
+            "usage_query": {"rows": []},
+            "usage_cost": {"totalCostUsd": 1.5},
+            "commands": {"surface": "web", "commands": []},
+            "feedback": {"accepted": True},
+            "prompt_status": {"enabled": False},
+            "prompt_set": {"enabled": True},
+            "clarification": {"accepted": True},
+        }.items()
+    }
+    usage = cast(
+        UsageReportingPort,
+        SimpleNamespace(
+            status=calls["usage_status"],
+            query=calls["usage_query"],
+            cost_breakdown=calls["usage_cost"],
+        ),
+    )
+    commands = cast(CommandCatalogPort, SimpleNamespace(list=calls["commands"]))
+    feedback = cast(RouteFeedbackPort, SimpleNamespace(submit=calls["feedback"]))
+    prompt_cache = cast(
+        PromptCacheLeasePort,
+        SimpleNamespace(status=calls["prompt_status"], set_policy=calls["prompt_set"]),
+    )
+    clarification = cast(
+        ClarificationSubmissionPort,
+        SimpleNamespace(submit=calls["clarification"]),
     )
     return (
         GatewayConversationAncillaryAdapter(
-            context,
-            callbacks,
+            usage=usage,
+            commands=commands,
+            feedback=feedback,
+            prompt_cache=prompt_cache,
+            clarification=clarification,
             prompt_cache_policy=PromptCachePolicy(
                 default_ttl_seconds=300,
                 minimum_ttl_seconds=60,
@@ -41,13 +65,12 @@ def _adapter() -> tuple[
                 maximum_idle_timeout_seconds=7200,
             ),
         ),
-        context,
-        callbacks,
+        calls,
     )
 
 
 async def test_adapter_projects_usage_commands_feedback_and_prompt_cache() -> None:
-    adapter, context, callbacks = _adapter()
+    adapter, calls = _adapter()
 
     await adapter.usage_status({"session_key": "agent:main:webchat:test"})
     await adapter.list_commands({"surface": " web "})
@@ -56,32 +79,24 @@ async def test_adapter_projects_usage_commands_feedback_and_prompt_cache() -> No
         {"key": "agent:main:webchat:test", "enabled": True}
     )
 
-    cast(AsyncMock, callbacks.usage_status).assert_awaited_once_with(
-        {
-            "session_key": "agent:main:webchat:test",
-            "sessionKey": "agent:main:webchat:test",
-        },
-        context,
-    )
-    cast(AsyncMock, callbacks.command_catalog).assert_awaited_once_with(
-        {"surface": "web"}, context
-    )
-    cast(AsyncMock, callbacks.route_feedback).assert_awaited_once_with(
-        {"decisionId": "d-1", "rating": "down"}, context
-    )
-    cast(AsyncMock, callbacks.prompt_cache_set).assert_awaited_once_with(
-        {
-            "key": "agent:main:webchat:test",
-            "enabled": True,
-            "ttlSeconds": 300,
-            "idleTimeoutSeconds": 600,
-        },
-        context,
-    )
+    usage_query = calls["usage_status"].await_args.args[0]
+    assert usage_query.session_key == "agent:main:webchat:test"
+    assert dict(usage_query.filters) == {"session_key": "agent:main:webchat:test"}
+    command_query = calls["commands"].await_args.args[0]
+    assert command_query.surface == "web"
+    feedback = calls["feedback"].await_args.args[0]
+    assert (feedback.decision_id, feedback.rating) == ("d-1", "down")
+    prompt = calls["prompt_set"].await_args.args[0]
+    assert (
+        prompt.session_key,
+        prompt.enabled,
+        prompt.ttl_seconds,
+        prompt.idle_timeout_seconds,
+    ) == ("agent:main:webchat:test", True, 300, 600)
 
 
 async def test_adapter_projects_clarification_aliases_to_domain_command() -> None:
-    adapter, context, callbacks = _adapter()
+    adapter, calls = _adapter()
 
     result = await adapter.submit_clarification(
         {
@@ -93,12 +108,8 @@ async def test_adapter_projects_clarification_aliases_to_domain_command() -> Non
     )
 
     assert result == {"accepted": True}
-    cast(AsyncMock, callbacks.clarification).assert_awaited_once_with(
-        {
-            "sessionKey": "agent:main:webchat:test",
-            "fields": {"choice": "continue"},
-            "requestId": "request-1",
-            "run_id": "run-1",
-        },
-        context,
-    )
+    command = calls["clarification"].await_args.args[0]
+    assert cast(Any, command).session_key == "agent:main:webchat:test"
+    assert dict(cast(Any, command).fields) == {"choice": "continue"}
+    assert cast(Any, command).request_id == "request-1"
+    assert cast(Any, command).run_id == "run-1"
