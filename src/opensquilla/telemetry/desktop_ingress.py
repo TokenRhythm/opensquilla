@@ -117,10 +117,9 @@ def _restore_processing_claim(processing: Path, ready: Path, now_timestamp: floa
         return _unlink_best_effort(processing)
     except OSError:
         return False
-    try:
-        os.utime(ready, (now_timestamp, now_timestamp), follow_symlinks=False)
-    except OSError:
-        pass
+    if not _mark_processing_claim_current(ready, now_timestamp):
+        _unlink_best_effort(ready)
+        return False
     return _unlink_best_effort(processing)
 
 
