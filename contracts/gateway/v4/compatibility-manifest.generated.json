@@ -706,7 +706,7 @@
       "lifecycle": "stable",
       "name": "meta.run",
       "schema": "meta/meta-run.schema.json",
-      "schemaSha256": "e32309cd99bf6fd437b13d04fefaf4ac07befdf98d7b02ac13bfdfb3b55ec722"
+      "schemaSha256": "9a07117a5189afc6a757041cc890f22b5ed2b32b2c93bfbf499fb7cc404a3905"
     },
     {
       "lifecycle": "stable",
@@ -730,31 +730,31 @@
       "lifecycle": "stable",
       "name": "meta.setup.install",
       "schema": "meta/meta-setup-install.schema.json",
-      "schemaSha256": "9a7aa7d2527ee662e7ee4b250b2170d26fafb9a842966292e018b688459de004"
+      "schemaSha256": "b85028c3b064c6d6cd86b0fd73f5334256f203c7494d0d4dac7b84d7d226c860"
     },
     {
       "lifecycle": "stable",
       "name": "meta.setup.plan",
       "schema": "meta/meta-setup-plan.schema.json",
-      "schemaSha256": "1771ce53903c94483caf7b802692df75e67fc9f540716c54e9daeb1bba1dc3d2"
+      "schemaSha256": "71aa47eea68acb30fc45af243a79814b7df075b64ca15a5096e320c841e20a50"
     },
     {
       "lifecycle": "stable",
       "name": "meta.setup.status",
       "schema": "meta/meta-setup-status.schema.json",
-      "schemaSha256": "9ccbe052d4e1b8c47ed943c15bbd24927e0d878d014932e385b5ff9f4f3952fb"
+      "schemaSha256": "513891f57c0f8890d5c73aa403a1d3a18c4dfd0ae05663b2e62aeade59b36156"
     },
     {
       "lifecycle": "stable",
       "name": "migration.sources.list",
       "schema": "platform/migration-sources-list.schema.json",
-      "schemaSha256": "831c252a4ba5f1c6118c85fd9c5975589ce75c4d0dc5c33cdbaa4f1fd54d8362"
+      "schemaSha256": "29d2999440e0b278e655394d39bd3782cbf7ad4ec5051d09174be6c1f761d5f2"
     },
     {
       "lifecycle": "stable",
       "name": "migration.sources.preview",
       "schema": "platform/migration-sources-preview.schema.json",
-      "schemaSha256": "56a18cbc490cb0e249b4629f5284353eb28348038010e19ce807268b98e50e0b"
+      "schemaSha256": "7d89ea10bff333c3a5c92fb157ea887fbc5823685808e6531fab1cb9426597ff"
     },
     {
       "lifecycle": "stable",
@@ -1425,7 +1425,7 @@
       "lifecycle": "stable",
       "name": "workspaces.history.delete",
       "schema": "workspaces/workspaces-history-delete.schema.json",
-      "schemaSha256": "1b85394939ca047ccb0045ab5175d0986ced09db0076780945b7b657efc461c4"
+      "schemaSha256": "8f934b8a6c04c5b386aa63c368831f5a3294c6e2238c1c9f3cdebaaeee09d4cf"
     },
     {
       "lifecycle": "stable",
@@ -1437,34 +1437,34 @@
       "lifecycle": "stable",
       "name": "workspaces.open",
       "schema": "workspaces/workspaces-open.schema.json",
-      "schemaSha256": "7f4d348c260694be2043d161cbea7dffbcea15f88f5577e15e5b53620274ef1e"
+      "schemaSha256": "5eb38deaaaefe31693fa2ede17f4077f22d7e7e7bb5e7dccbd62a8b1c02dc45c"
     },
     {
       "lifecycle": "stable",
       "name": "workspaces.pin",
       "schema": "workspaces/workspaces-pin.schema.json",
-      "schemaSha256": "2c29870ce9832673be0bbf71872959611122773f620fed0668a6b39054207ee2"
+      "schemaSha256": "9833ea6908570663fb3f43f85746f50beea88d732e457222255eb35f5373d06a"
     },
     {
       "lifecycle": "stable",
       "name": "workspaces.remove",
       "schema": "workspaces/workspaces-remove.schema.json",
-      "schemaSha256": "cba52965830693445429735e06c714643afdf6be4093e314c934cae073cbf960"
+      "schemaSha256": "57e0a55fcec7ec8d8811166e9f02d7c03f8d60da31ad858a9923c24405d27892"
     },
     {
       "lifecycle": "stable",
       "name": "workspaces.update",
       "schema": "workspaces/workspaces-update.schema.json",
-      "schemaSha256": "602839431b74909a552e45827a8a3e5bfb87e3cafb2261ef19674835e2a453f8"
+      "schemaSha256": "c4b354b7cd53646f14b85aab8161034dc26816e0836cf0f98a0833521a5f0480"
     }
   ],
   "protocol": "opensquilla-websocket-json",
   "source": {
     "eventFamilyCount": 9,
-    "generatorSha256": "efe446ba6223a0e9daf70f3b76e320eaff8a30d5f83af0f8740f8d6b7c86e449",
+    "generatorSha256": "ad40cd44840fcc9cb1a00fbdc1d884bb8e4643bf943f10053e6b8c84309f6261",
     "methodCount": 215,
     "schemaCount": 224,
-    "schemaTreeSha256": "3ae0918a0a7ff3256de98b594115173a1d946e7b3311597da3f480d55c935e95"
+    "schemaTreeSha256": "be85f40cb1443712d8888287242ad212abd4fecfbc7e30e300444d412436e20e"
   },
   "wireVersion": 4
 }

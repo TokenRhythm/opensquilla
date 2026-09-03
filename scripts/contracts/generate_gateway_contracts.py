@@ -65,6 +65,10 @@ SCOPE_PATTERN = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$")
 ERROR_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 LEGACY_DOTTED_ERROR_CODES = frozenset(
     {
+        "migration.candidate_unavailable",
+        "migration.invalid_params",
+        "migration.preview_unavailable",
+        "migration.unavailable",
         "onboarding.channel.invalid",
         "onboarding.channel.not_found",
     }

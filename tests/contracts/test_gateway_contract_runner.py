@@ -327,6 +327,52 @@ def test_only_declared_legacy_channel_error_codes_allow_dots(
     assert spec.metadata["errors"][0]["code"] == error_code
 
 
+@pytest.mark.parametrize(
+    "error_code",
+    (
+        "migration.invalid_params",
+        "migration.candidate_unavailable",
+        "migration.unavailable",
+        "migration.preview_unavailable",
+    ),
+)
+def test_only_declared_legacy_migration_error_codes_allow_dots(
+    tmp_path: Path,
+    error_code: str,
+) -> None:
+    document = _method_schema("migration.sources.preview")
+    document["x-opensquilla-method"]["errors"] = [
+        {"code": error_code},
+        {"code": "INTERNAL_ERROR"},
+    ]
+    schema = _write_schema(
+        tmp_path,
+        "platform/migration-sources-preview.schema.json",
+        document,
+    )
+
+    spec = runner.load_contract(schema, contract_root=tmp_path)
+
+    assert spec.metadata["errors"][0]["code"] == error_code
+
+
+def test_undeclared_migration_dotted_error_code_remains_rejected(
+    tmp_path: Path,
+) -> None:
+    document = _method_schema("migration.sources.preview")
+    document["x-opensquilla-method"]["errors"] = [
+        {"code": "migration.unknown"}
+    ]
+    schema = _write_schema(
+        tmp_path,
+        "platform/migration-sources-preview.schema.json",
+        document,
+    )
+
+    with pytest.raises(runner.ContractConfigurationError, match="error code"):
+        runner.load_contract(schema, contract_root=tmp_path)
+
+
 def test_undeclared_dotted_error_code_remains_rejected(tmp_path: Path) -> None:
     document = _method_schema("onboarding.channel.probe")
     document["x-opensquilla-method"]["errors"] = [
