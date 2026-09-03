@@ -499,7 +499,7 @@ async def test_stale_completion_cannot_append_to_replacement_parent(
         async def send(self, *_args: Any, **_kwargs: Any) -> None:
             raise AssertionError("stale completion must not enqueue a parent wake")
 
-    with pytest.raises(StaleEpochError, match="message append"):
+    with pytest.raises(StaleEpochError, match="owner mismatch"):
         await announce_subagent_completion(
             _completion_event(parent, child),
             session_manager=process_a,
