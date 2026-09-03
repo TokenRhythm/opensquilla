@@ -242,10 +242,78 @@ class ControlUiConfig(BaseSettings):
         return v
 
 
+_SCOPED_TELEMETRY_CONSENT_FIELDS = frozenset(
+    {
+        "reliability_diagnostics_enabled",
+        "reliability_notice_version",
+        "reliability_consented_at_utc",
+        "product_analytics_enabled",
+        "product_analytics_notice_version",
+        "product_analytics_consented_at_utc",
+    }
+)
+
+
+class _EnvWithoutScopedTelemetryConsent(PydanticBaseSettingsSource):
+    """Remove user-consent records from environment-backed settings sources.
+
+    Environment and dotenv inputs may impose telemetry vetoes, but they are
+    not an authenticated user-interaction surface and therefore cannot grant,
+    decline, timestamp, or version either scoped consent.  The wrapper handles
+    both direct ``PrivacyConfig`` keys and nested ``GatewayConfig.privacy``
+    payloads produced by pydantic-settings.
+    """
+
+    def __init__(self, inner: PydanticBaseSettingsSource) -> None:
+        super().__init__(inner.settings_cls)
+        self._inner = inner
+
+    def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
+        return self._inner.get_field_value(field, field_name)
+
+    def __call__(self) -> dict[str, Any]:
+        values = dict(self._inner())
+        for field_name in _SCOPED_TELEMETRY_CONSENT_FIELDS:
+            values.pop(field_name, None)
+        privacy = values.get("privacy")
+        if isinstance(privacy, dict):
+            filtered_privacy = dict(privacy)
+            for field_name in _SCOPED_TELEMETRY_CONSENT_FIELDS:
+                filtered_privacy.pop(field_name, None)
+            values["privacy"] = filtered_privacy
+        return values
+
+
 class PrivacyConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_PRIVACY_")
 
+    # Scoped telemetry consent is deliberately tri-state.  ``None`` means the
+    # operator has not made a choice, while ``False`` records an explicit opt
+    # out.  The legacy global switch remains a hard veto, but its default
+    # ``False`` is not consent for either new scope.
+    reliability_diagnostics_enabled: bool | None = None
+    reliability_notice_version: str | None = None
+    reliability_consented_at_utc: str | None = None
+    product_analytics_enabled: bool | None = None
+    product_analytics_notice_version: str | None = None
+    product_analytics_consented_at_utc: str | None = None
     disable_network_observability: bool = False
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return (
+            init_settings,
+            _EnvWithoutScopedTelemetryConsent(env_settings),
+            _EnvWithoutScopedTelemetryConsent(dotenv_settings),
+            _EnvWithoutScopedTelemetryConsent(file_secret_settings),
+        )
 
 
 class SkillsConfig(BaseSettings):
@@ -2793,14 +2861,18 @@ class GatewayConfig(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        # Default source order, with env-backed sources filtered so
-        # OPENSQUILLA_GATEWAY_CONFIG_VERSION can never populate the migration
-        # stamp — see _EnvWithoutConfigVersion for the full rationale.
+        # Default source order, with env-backed sources filtered so the
+        # migration stamp and scoped user-consent records remain owned by
+        # authenticated config mutation surfaces.
         return (
             init_settings,
-            _EnvWithoutConfigVersion(env_settings),
-            _EnvWithoutConfigVersion(dotenv_settings),
-            file_secret_settings,
+            _EnvWithoutConfigVersion(
+                _EnvWithoutScopedTelemetryConsent(env_settings)
+            ),
+            _EnvWithoutConfigVersion(
+                _EnvWithoutScopedTelemetryConsent(dotenv_settings)
+            ),
+            _EnvWithoutScopedTelemetryConsent(file_secret_settings),
         )
 
     def model_post_init(self, __context: Any) -> None:
@@ -3036,10 +3108,20 @@ class GatewayConfig(BaseSettings):
         if isinstance(privacy, dict):
             from opensquilla.observability.network_policy import (
                 provider_request_correlation_disabled,
+                telemetry_scope_forced_off_reasons,
             )
 
             privacy["network_observability_disabled_effective"] = (
                 provider_request_correlation_disabled(config=self)
+            )
+            # These are effective, read-only UI hints.  Persisted consent stays
+            # untouched when an environment/global veto is active so lifting a
+            # temporary veto cannot manufacture or erase a user decision.
+            privacy["reliability_diagnostics_forced_off"] = bool(
+                telemetry_scope_forced_off_reasons("reliability", config=self)
+            )
+            privacy["product_analytics_forced_off"] = bool(
+                telemetry_scope_forced_off_reasons("growth", config=self)
             )
         return data
 

@@ -26,6 +26,8 @@ from opensquilla.engine.types import (
     ToolUseStartEvent,
     WarningEvent,
 )
+from opensquilla.telemetry.contracts.reliability import TurnFailureStage
+from opensquilla.telemetry.runtime_facts import current_turn_failure_stage
 
 # Reuse upstream patch helpers from's equivalence harness -- this
 # stage sits after all six prior stages so the same upstream patching
@@ -547,6 +549,7 @@ async def test_stream_consumer_stage_snapshot(
     if case.expected_pending_error_code is not None:
         tail = next(e for e in reversed(yielded) if isinstance(e, ErrorEvent))
         assert tail.code == case.expected_pending_error_code
+        assert current_turn_failure_stage() is TurnFailureStage.AGENT_EXECUTION
 
     if case.expected_done_present:
         assert any(isinstance(e, DoneEvent) for e in yielded)

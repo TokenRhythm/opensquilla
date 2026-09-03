@@ -175,6 +175,18 @@ class RpcContext:
     agent_registry: Any = None  # AgentRegistry instance (injected at boot)
     diagnostics_state: Any = None  # DiagnosticsState instance (injected at boot)
     provider_stats: Any = None  # ProviderStatsStore instance (injected at boot)
+    # Optional explicit instance; otherwise RPC and telemetry producers resolve
+    # the same process-wide coordinator from the live config object's identity.
+    telemetry_consent_coordinator: Any = None
+    # Optional host override for a complete per-scope telemetry cleanup.  A
+    # desktop host can include state the Gateway cannot locate (for example an
+    # Electron early spool); an injected hook is authoritative and must also
+    # clear the scope outbox/rejections and Growth identity when applicable.
+    telemetry_consent_cleanup: Any = None
+    # Growth eligibility currently has no Gateway persistence implementation.
+    # Hosts that add one inject its exact, narrow deletion hook here instead of
+    # making the Gateway guess a state path or delete a broad directory.
+    telemetry_growth_eligibility_cleanup: Any = None
     profile_import_service: Any = None  # Optional injected service/factory for profile import.
     memory_managers: dict[str, Any] = field(default_factory=dict)
     memory_stores: dict[str, Any] = field(default_factory=dict)

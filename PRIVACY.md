@@ -43,13 +43,11 @@ corresponding feature is enabled by configuration or user action.
 
 ## Network Observability Controls
 
-OpenSquilla groups background network observability and the optional
-pseudonymous installation identifier attached to official TokenRhythm API
-requests under one switch. Enable it to disable automatic install telemetry,
-daily aggregate usage telemetry, passive update checks, automatic desktop
-update checks, and that TokenRhythm request identifier. Changes to the
-TokenRhythm identifier policy apply to the next request without requiring a
-restart:
+OpenSquilla exposes separate consent controls for **Reliability diagnostics**
+and **Product and growth analytics**. An unset choice, an explicit decline, an
+incomplete consent receipt, or a stale notice version is treated as disabled.
+The global control below is a hard veto over both telemetry scopes, passive
+update checks, and automatic desktop update checks:
 
 ```sh
 OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY=true
@@ -69,9 +67,10 @@ OPENSQUILLA_TELEMETRY_DISABLED=true
 OPENSQUILLA_UPDATE_CHECK_DISABLED=true
 ```
 
-`OPENSQUILLA_TELEMETRY_DISABLED=true` also suppresses the optional TokenRhythm
-installation identifier. Setting only
-`OPENSQUILLA_UPDATE_CHECK_DISABLED=true` does not suppress it.
+`OPENSQUILLA_TELEMETRY_DISABLED=true` remains a hard veto for both new
+telemetry scopes. It does not grant consent and does not reactivate retired
+legacy telemetry. `OPENSQUILLA_UPDATE_CHECK_DISABLED=true` applies only to
+update checks.
 
 Manual user-initiated actions may still contact network services after user
 intent, including release downloads and configured providers, search, channels,
@@ -79,98 +78,66 @@ automation, or integrations. Update-availability checks, including
 `opensquilla version --check` and the desktop manual check, do not bypass the
 unified or legacy opt-out controls.
 
-## Installation Telemetry
+## Optional Telemetry
 
-OpenSquilla uses pseudonymous installation telemetry to estimate install
-counts, version adoption, and runtime compatibility. Telemetry is sent on first
-gateway startup and once per OpenSquilla version. Uploads use a short timeout
-and never block startup.
+### Reliability diagnostics
 
-Telemetry payloads include:
+When separately consented for the current notice, OpenSquilla may record the
+result, bounded duration, enumerated error code, and other closed attributes
+for app startup, Gateway startup, detected crashes, AI turns, tool calls, file
+parsing, updates, and session performance. Reliability uses a random
+`app_session_id`; it does not use an account identifier. Crash events contain
+only a one-way error fingerprint, component, version, and bounded runtime facts.
+Complete exception messages and stacks remain local.
 
-- schema version
-- locally generated stable `install_id` digest
-- OpenSquilla version
-- event type, such as `install` or `version_seen`
-- install method, such as `pip`, `source`, `docker`, `desktop`, or `unknown`
-- operating system, OS version, CPU architecture, and Python major/minor version
-- first-seen and sent timestamps
-- CI/test-environment marker
+### Product and growth analytics
 
-The `install_id` is a local one-way SHA-256 digest derived from usable MAC
-addresses, then local IP addresses when no MAC is available, with a random
-persisted fallback. Raw MAC addresses and raw IP addresses are not uploaded.
+When separately consented for the current notice, OpenSquilla may record
+one-time funnel milestones for acquisition, onboarding completion, first app
+readiness, registration, first turn start, and first successful response.
+Growth uses random, purpose-specific `acquisition_id` and
+`analytics_user_id` values. The analytics user ID is not a raw account ID or a
+hash of one, is not shared with Reliability, and is deleted locally when Growth
+consent is withdrawn.
 
-Telemetry does not include usernames, hostnames, local paths, API keys,
-provider configuration, chat content, session content, memory content, agent
-content, file names, or file contents. Source IP addresses may be visible to
-HTTP servers at the transport layer, but are not part of the telemetry payload.
+Website, CDN, and account-service milestones must be emitted by those services
+at their authoritative transaction boundary. They use independent server-side
+signing credentials that are never shipped in browser JavaScript, installers,
+or the desktop app. Ordinary installers without a consented, signed acquisition
+token do not emit installation events, and the desktop does not infer an
+external registration result.
 
-Use the unified network observability switch above to opt out before startup.
-The legacy telemetry opt-out `OPENSQUILLA_TELEMETRY_DISABLED=true` remains
-honored for compatibility.
+### Collection and upload rules
 
-CI and test environments automatically suppress installation telemetry before
-an installation identifier is generated or uploaded.
+Both scopes use a strict field whitelist and reject unknown fields. They write
+to separate bounded local SQLite queues and upload batches to separate routes:
+`/v1/reliability/events` and `/v1/growth/events`. Consent is checked before
+local collection and again immediately before network upload. Offline retries
+reuse `event_id` for deduplication. Growth events are not sampled.
 
-Advanced deployments can direct installation and usage telemetry to independent
-routes on their own service:
+Telemetry payloads never include prompts, responses, provider configuration,
+agent configuration, tool arguments, task parameters, file names, file paths,
+file contents, raw exception messages, complete stacks, usernames, hostnames,
+API keys, raw account IDs, order data, IP addresses, MAC addresses, or device
+fingerprints. Source IP addresses may be visible to network servers at the
+transport layer, but are not telemetry fields and are never used to join
+website and client identities.
 
-```sh
-OPENSQUILLA_TELEMETRY_ENDPOINT=https://example.com/v1/install
-OPENSQUILLA_USAGE_TELEMETRY_ENDPOINT=https://example.com/v1/usage
-```
+CI, test, and `DO_NOT_TRACK` environments fail closed for both scopes. A remote
+or local forced-off state pauses sending without manufacturing or changing a
+saved consent decision. Withdrawing a scope's consent deletes that scope's
+pending local telemetry; withdrawing Growth consent also deletes its local
+analytics identity.
 
-## TokenRhythm Installation Identifier
+### Retired legacy telemetry
 
-By default, OpenSquilla may add this optional header to requests sent directly
-to the official TokenRhythm HTTPS API:
-
-```http
-X-OpenSquilla-Install-Id: <current install_id>
-```
-
-This is a pseudonymous installation-level identifier. It is stable across
-sessions and reuses the same locally persisted `install_id` described above,
-including its MAC-address, local-IP, and random persisted fallback order. Raw
-MAC addresses and raw IP addresses are never placed in the header or sent as
-part of the request. Identifier resolution happens in the background; if it is
-not ready or fails validation, OpenSquilla omits the header and continues the
-request normally.
-
-The header is allowed only for direct API targets on
-`https://tokenrhythm.studio` and `https://api.tokenrhythm.studio`, using the
-default HTTPS port or an explicit port `443`. OpenSquilla does not attach it to
-HTTP URLs, URLs with user information, nonstandard ports, lookalike domains,
-custom proxies, OpenRouter, other providers, browser registration pages,
-returned image or CDN downloads, or redirected nonofficial targets. It is not
-placed in request bodies or query strings, and provider traces record only
-whether it was present, not its value. The raw value is also excluded from
-logs, errors, and serialized configuration.
-
-The unified network-observability switch and the legacy telemetry opt-out both
-suppress generation and transmission of this header. CI and test environments
-suppress it automatically. The legacy update-check opt-out alone does not.
-
-TokenRhythm services must treat this header as optional and untrusted. It must
-not be used for authentication, authorization, billing, rate limiting, or
-anti-abuse decisions.
-
-## Daily Aggregate Usage Telemetry
-
-OpenSquilla uses the same telemetry service with a dedicated `/v1/usage` route
-and the unified network observability switch for content-free daily usage
-aggregates. It records only completed top-level interactive turns. While the
-gateway is running, it attempts to upload pending cumulative UTC-day snapshots
-at startup and once per hour, including the current day. Heartbeats, scheduled
-jobs, subagents, and incomplete turns are excluded.
-
-Daily payloads include the existing `install_id`, OpenSquilla version, UTC day,
-send timestamp, a retry-stable event ID, completed conversation count, and
-aggregate input, output, cached, and cache-write token counts. They do not
-include prompts, responses, provider or model names, channels, session
-identifiers, costs, tools, file names, or file contents. Failed uploads remain
-pending locally and are retried later.
+The automatic installation upload at `/v1/install`, the daily token aggregate
+at `/v1/usage`, and the `X-OpenSquilla-Install-Id` provider header are retired.
+Production code no longer starts those upload loops, records daily usage for
+them, derives an installation identifier from MAC or local IP data, or attaches
+that identifier to provider requests. Legacy modules and environment-variable
+names remain only for source/configuration compatibility and cannot opt a user
+into telemetry v2.
 
 ## Logs And Diagnostics
 

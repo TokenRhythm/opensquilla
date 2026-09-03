@@ -56,6 +56,8 @@ async def run_tui_runtime(
     async with surface_factory() as tui_surface:
         if hooks.expose_surface is not None:
             hooks.expose_surface(tui_surface)
+        with contextlib.suppress(Exception):
+            await hooks.on_surface_ready()
         turn_task: asyncio.Task[bool] | None = None
         # Abort tasks are held (and drained on shutdown) so a fire-and-forget
         # cancel RPC is never garbage-collected mid-flight or abandoned while
@@ -198,17 +200,14 @@ async def run_tui_runtime(
                 if steered:
                     if hooks.notice is not None:
                         hooks.notice(
-                            "[bold]Pending steer confirmed with its original "
-                            "request ID.[/bold]"
+                            "[bold]Pending steer confirmed with its original request ID.[/bold]"
                         )
                     # A replayed receipt confirms this input already belongs to
                     # the original turn; it must not become a second turn.
                     continue
 
                 if hooks.notice is not None:
-                    hooks.notice(
-                        "[dim]Steer no longer applies; queued for the next turn.[/dim]"
-                    )
+                    hooks.notice("[dim]Steer no longer applies; queued for the next turn.[/dim]")
                 return promoted
 
         async def _run_shutdown_drain() -> bool:
@@ -462,9 +461,7 @@ async def run_tui_runtime(
                                 )
                             continue
                         if hooks.notice is not None:
-                            hooks.notice(
-                                f"[red]Steer failed: {_escape(str(exc))}[/red]"
-                            )
+                            hooks.notice(f"[red]Steer failed: {_escape(str(exc))}[/red]")
                         steered = False
                     if steered:
                         try:
@@ -584,9 +581,7 @@ async def run_tui_runtime(
                     if hooks.notice is not None:
                         position = runtime_state.pending_size
                         prefix = "Steer unavailable; queued" if steer_fell_back else "Queued"
-                        hooks.notice(
-                            f"[dim]{prefix} (#{position}) behind the running turn.[/dim]"
-                        )
+                        hooks.notice(f"[dim]{prefix} (#{position}) behind the running turn.[/dim]")
                     continue
 
                 if runtime_state.pending_size:
@@ -642,9 +637,7 @@ async def run_tui_runtime(
                 # reaches the backend before the client connection closes.
                 # The drain is bounded: a gateway that never answers the
                 # abort must not hang exit, so stragglers are cancelled.
-                _, stragglers = await asyncio.wait(
-                    set(abort_tasks), timeout=_ABORT_DRAIN_TIMEOUT_S
-                )
+                _, stragglers = await asyncio.wait(set(abort_tasks), timeout=_ABORT_DRAIN_TIMEOUT_S)
                 for straggler in stragglers:
                     straggler.cancel()
             with contextlib.suppress(Exception):

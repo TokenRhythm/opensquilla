@@ -18,16 +18,19 @@ from opensquilla.provider.tokenrhythm_correlation import (
     TOKENRHYTHM_TURN_ID_HEADER,
     _reset_tokenrhythm_install_id_cache_for_tests,
     is_tokenrhythm_correlation_target,
-    prewarm_tokenrhythm_install_id,
     redact_tokenrhythm_install_ids,
     tokenrhythm_correlation_headers,
-    tokenrhythm_install_id_headers,
 )
 from opensquilla.provider.types import (
     ChatConfig,
     ProviderRequestCorrelation,
     derive_provider_request_correlation,
 )
+
+# Exercise the legacy resolver only as a private compatibility seam.  The
+# public functions are permanently retired no-ops and are tested separately.
+prewarm_tokenrhythm_install_id = tokenrhythm._prewarm_tokenrhythm_install_id
+tokenrhythm_install_id_headers = tokenrhythm._tokenrhythm_install_id_headers
 
 
 @pytest.fixture(autouse=True)
@@ -75,6 +78,18 @@ def _config(state_dir, *, privacy_disabled: bool = False):
             disable_network_observability=privacy_disabled,
         ),
     )
+
+
+def test_public_install_id_apis_are_retired_noops(tmp_path) -> None:
+    state_path = tmp_path / "install_telemetry.json"
+
+    assert tokenrhythm.prewarm_tokenrhythm_install_id(state_path=state_path) is None
+    assert tokenrhythm.tokenrhythm_install_id_headers(
+        "tokenrhythm",
+        "https://tokenrhythm.studio/v1",
+        state_path=state_path,
+    ) == {}
+    assert not state_path.exists()
 
 
 @pytest.mark.parametrize(
@@ -903,9 +918,9 @@ def test_install_id_helpers_fail_open_when_context_resolution_raises() -> None:
 
     config = _BrokenConfig()
 
-    assert prewarm_tokenrhythm_install_id(config=config) is None
+    assert tokenrhythm.prewarm_tokenrhythm_install_id(config=config) is None
     assert (
-        tokenrhythm_install_id_headers(
+        tokenrhythm.tokenrhythm_install_id_headers(
             "tokenrhythm",
             "https://tokenrhythm.studio/v1",
             config=config,

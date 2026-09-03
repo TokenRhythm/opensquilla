@@ -6,6 +6,8 @@ import type {
   SettingsMutation,
   SettingsObject,
   SettingsValue,
+  TelemetryConsentDecision,
+  TelemetryConsentScope,
 } from '@/modules/appSettings'
 import { CONFIG_GET_METHOD } from '@/contracts/generated/v4/configGet'
 import { validateResult as validateConfigGetResult } from '@/contracts/generated/v4/configGetValidators.mjs'
@@ -58,6 +60,30 @@ function mutation(value: unknown): SettingsMutation {
   if (Array.isArray(raw.patched)) result.patched = raw.patched.filter(item => typeof item === 'string')
   if (Array.isArray(raw.linked)) result.linked = raw.linked.filter(item => typeof item === 'string')
   return result as SettingsMutation
+}
+
+function telemetryConsent(
+  value: unknown,
+  scope: TelemetryConsentScope,
+  enabled: boolean,
+): TelemetryConsentDecision {
+  const raw = object(value)
+  const noticeVersion = raw.noticeVersion
+  const consentedAtUtc = raw.consentedAtUtc
+  if (
+    raw.scope !== scope
+    || raw.enabled !== enabled
+    || (enabled && (typeof noticeVersion !== 'string' || typeof consentedAtUtc !== 'string'))
+    || (!enabled && (noticeVersion !== null || consentedAtUtc !== null))
+  ) {
+    throw new Error('telemetry.consent.set returned an invalid response')
+  }
+  return {
+    scope,
+    enabled,
+    noticeVersion: noticeVersion as string | null,
+    consentedAtUtc: consentedAtUtc as string | null,
+  }
 }
 
 function patchMap(changes: readonly SettingChange[]): Record<string, SettingsValue> {
@@ -119,6 +145,14 @@ export function createV4AppSettings(rpc: RpcTransport): AppSettings {
       const result = await rpc.request(CONFIG_PATCH_METHOD, { patch }, mutationOptions(request?.signal))
       if (!validateConfigPatchResult(result)) throw new Error(`${CONFIG_PATCH_METHOD} returned an invalid response`)
       return mutation(result)
+    },
+    async setTelemetryConsent(scope, enabled, request) {
+      const result = await rpc.request(
+        'telemetry.consent.set',
+        { scope, enabled },
+        mutationOptions(request?.signal),
+      )
+      return telemetryConsent(result, scope, enabled)
     },
   }
 }

@@ -33,6 +33,7 @@ from opensquilla.engine.types import done_text_snapshot
 from opensquilla.execution_status import derive_is_error
 from opensquilla.router_tiers import tier_index
 from opensquilla.session.terminal_reply import build_terminal_reply
+from opensquilla.telemetry.contracts.common import ClientSurface, ExecutionMode
 
 _DEFAULT_STREAM_HEARTBEAT_INTERVAL_SECONDS = 15.0
 _DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS = 600.0
@@ -175,9 +176,7 @@ def default_turn_stream_dependencies(
             _BackendFallbackRenderer if renderer_factory is None else renderer_factory
         ),
         stream_wrapper=wrap_cli_turn_stream if stream_wrapper is None else stream_wrapper,
-        approval_handler=(
-            _noop_approval_handler if approval_handler is None else approval_handler
-        ),
+        approval_handler=(_noop_approval_handler if approval_handler is None else approval_handler),
         cancel_clearer=_noop_cancel_clearer if cancel_clearer is None else cancel_clearer,
         image_attachment_builder=(
             image_prompt_and_attachments
@@ -919,9 +918,7 @@ async def stream_response_gateway(
                         if callable(bind_identity):
                             turn_id = event.get("turn_id") or event.get("task_id")
                             client_message_id = event.get("client_message_id")
-                            if isinstance(turn_id, str) and isinstance(
-                                client_message_id, str
-                            ):
+                            if isinstance(turn_id, str) and isinstance(client_message_id, str):
                                 await bind_identity(turn_id, client_message_id)
                     elif event_name == "session.event.text_delta":
                         await _append_text_delta(
@@ -1010,9 +1007,7 @@ async def stream_response_gateway(
                             source="gateway",
                             turn_id=session_key,
                         )
-                        tool_name = (
-                            event.get("tool_name") or event.get("toolName") or "tool"
-                        )
+                        tool_name = event.get("tool_name") or event.get("toolName") or "tool"
                         tool_args = event.get("input") or event.get("arguments")
                         tool_use_id = event.get("tool_use_id") or event.get("toolUseId")
                         _emit_tui_domain_event(
@@ -1050,11 +1045,8 @@ async def stream_response_gateway(
                         if not is_approval_or_blocked_result(event.get("result")):
                             tool_use_id = event.get("tool_use_id") or event.get("toolUseId")
                             success = _tool_result_success_from_status(
-                                event.get("execution_status")
-                                or event.get("executionStatus"),
-                                legacy_is_error=bool(
-                                    event.get("is_error") or event.get("isError")
-                                ),
+                                event.get("execution_status") or event.get("executionStatus"),
+                                legacy_is_error=bool(event.get("is_error") or event.get("isError")),
                             )
                             _emit_tui_domain_event(
                                 stream_deps,
@@ -1065,9 +1057,7 @@ async def stream_response_gateway(
                                     "success": success,
                                     "execution_status": event.get("execution_status")
                                     or event.get("executionStatus"),
-                                    "is_error": bool(
-                                        event.get("is_error") or event.get("isError")
-                                    ),
+                                    "is_error": bool(event.get("is_error") or event.get("isError")),
                                 },
                                 turn_id=session_key,
                             )
@@ -1362,6 +1352,8 @@ async def stream_response_turnrunner(
                         model=model,
                         timeout=timeout,
                         pending_input_provider=pending_input_provider,
+                        telemetry_surface=ClientSurface.TUI,
+                        telemetry_execution_mode=ExecutionMode.STANDALONE,
                     ),
                     accepted_config,
                 )
@@ -1386,9 +1378,7 @@ async def stream_response_turnrunner(
                             source="turn_runner",
                             turn_id=session_key,
                         )
-                        authoritative_text = str(
-                            event.authoritative_text_snapshot or ""
-                        )
+                        authoritative_text = str(event.authoritative_text_snapshot or "")
                         if event.terminal:
                             terminal_text = str(
                                 event.terminal_text_snapshot
@@ -1748,6 +1738,8 @@ async def handle_image_command_turnrunner(
                         attachments=attachments,
                         timeout=timeout,
                         pending_input_provider=pending_input_provider,
+                        telemetry_surface=ClientSurface.TUI,
+                        telemetry_execution_mode=ExecutionMode.STANDALONE,
                     ),
                     accepted_config,
                 )

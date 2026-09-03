@@ -97,6 +97,12 @@ function createHarness(options: {
         return {}
       }),
       merge: vi.fn(async () => ({})),
+      setTelemetryConsent: vi.fn(async (scope, enabled) => ({
+        scope,
+        enabled,
+        noticeVersion: enabled ? `${scope}-v1` : null,
+        consentedAtUtc: enabled ? '2026-09-03T00:00:00Z' : null,
+      })),
     },
     modelRouting: {
       get: vi.fn(async () => await rpcRequest('models.routing.get', undefined, options.readCallOptions) as import('@/modules/providerConfiguration').ModelRoutingSnapshot),

@@ -77,6 +77,10 @@ async function mountCatalog() {
       'config.patch',
       { patch },
     ) as import('@/modules/appSettings').SettingsMutation,
+    setTelemetryConsent: async (scope: 'reliability' | 'growth', enabled: boolean) => await rpcCall(
+      'telemetry.consent.set',
+      { scope, enabled },
+    ) as import('@/modules/appSettings').TelemetryConsentDecision,
   } as unknown as import('@/modules/appSettings').AppSettings)
   app.provide(SETUP_WORKFLOW_KEY, {
     capabilities: {
@@ -150,12 +154,22 @@ async function mountCatalog() {
 
 function mockConfigSequence(configs: Array<Record<string, unknown>>) {
   const queue = [...configs]
-  rpcCall.mockImplementation(async (method: string) => {
+  rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
     if (method === 'onboarding.catalog') return {}
     if (method === 'onboarding.status') return {}
     if (method === 'channels.status') return { channels: [] }
     if (method === 'config.get') return queue.shift() ?? configs[configs.length - 1] ?? {}
     if (method === 'config.patch.safe') return { restartRequired: false }
+    if (method === 'telemetry.consent.set') {
+      const scope = params?.scope as 'reliability' | 'growth'
+      const enabled = params?.enabled === true
+      return {
+        scope,
+        enabled,
+        noticeVersion: enabled ? (scope === 'reliability' ? 'reliability-v1' : 'growth-v1') : null,
+        consentedAtUtc: enabled ? new Date().toISOString() : null,
+      }
+    }
     if (method === 'models.routing.set') return {}
     throw new Error(`Unexpected RPC method: ${method}`)
   })
@@ -175,6 +189,190 @@ afterEach(() => {
 })
 
 describe('useSetupCatalog privacy settings', () => {
+  it('does not treat the legacy global false value as scoped telemetry consent', async () => {
+    mockConfigSequence([
+      { privacy: { disable_network_observability: false } },
+    ])
+    const { api, app } = await mountCatalog()
+
+    expect(api.privacyPanel.value).toMatchObject({
+      reliabilityDiagnosticsEnabled: false,
+      reliabilityDiagnosticsDecision: null,
+      productAnalyticsEnabled: false,
+      productAnalyticsDecision: null,
+    })
+    expect(api.sectionDirty('securityPrivacy')).toBe(false)
+    app.unmount()
+  })
+
+  it('keeps the legacy row as an immediate global veto for both scoped controls', async () => {
+    mockConfigSequence([
+      {
+        privacy: {
+          disable_network_observability: false,
+          reliability_diagnostics_enabled: true,
+          reliability_notice_version: 'reliability-v1',
+          reliability_consented_at_utc: '2026-09-01T08:30:00.000Z',
+          product_analytics_enabled: true,
+          product_analytics_notice_version: 'growth-v1',
+          product_analytics_consented_at_utc: '2026-09-01T08:30:00.000Z',
+        },
+      },
+    ])
+    const { api, app } = await mountCatalog()
+
+    api.setNetworkReportingEnabled(false)
+
+    expect(api.privacyPanel.value).toMatchObject({
+      networkReportingEnabled: false,
+      reliabilityDiagnosticsEnabled: true,
+      reliabilityDiagnosticsDecision: true,
+      reliabilityDiagnosticsForcedOff: true,
+      productAnalyticsEnabled: true,
+      productAnalyticsDecision: true,
+      productAnalyticsForcedOff: true,
+    })
+    expect(api.sectionDirty('securityPrivacy')).toBe(true)
+    app.unmount()
+  })
+
+  it('saves the two consent scopes independently with notice metadata', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-09-01T08:30:00.000Z'))
+    mockConfigSequence([
+      { privacy: { disable_network_observability: false } },
+      {
+        privacy: {
+          disable_network_observability: false,
+          reliability_diagnostics_enabled: true,
+          reliability_notice_version: 'reliability-v1',
+          reliability_consented_at_utc: '2026-09-01T08:30:00.000Z',
+          product_analytics_enabled: false,
+        },
+      },
+    ])
+    const { api, app } = await mountCatalog()
+
+    api.setReliabilityDiagnosticsEnabled(true)
+    api.setProductAnalyticsEnabled(false)
+    expect(api.sectionDirty('securityPrivacy')).toBe(true)
+
+    await api.savePrivacy()
+
+    expect(rpcCall).toHaveBeenCalledWith('telemetry.consent.set', {
+      scope: 'reliability',
+      enabled: true,
+    })
+    expect(rpcCall).toHaveBeenCalledWith('telemetry.consent.set', {
+      scope: 'growth',
+      enabled: false,
+    })
+    expect(rpcCall).not.toHaveBeenCalledWith('config.patch.safe', expect.anything())
+    expect(api.privacyPanel.value).toMatchObject({
+      reliabilityDiagnosticsEnabled: true,
+      reliabilityDiagnosticsDecision: true,
+      productAnalyticsEnabled: false,
+      productAnalyticsDecision: false,
+    })
+    expect(api.sectionDirty('securityPrivacy')).toBe(false)
+    app.unmount()
+  })
+
+  it('allows granted consent to be revoked while its scope is forced off', async () => {
+    mockConfigSequence([
+      {
+        privacy: {
+          disable_network_observability: false,
+          reliability_diagnostics_enabled: true,
+          reliability_notice_version: 'reliability-v1',
+          reliability_consented_at_utc: '2026-09-01T08:30:00.000Z',
+          reliability_diagnostics_forced_off: true,
+          product_analytics_enabled: true,
+          product_analytics_notice_version: 'growth-v1',
+          product_analytics_consented_at_utc: '2026-09-01T08:30:00.000Z',
+          product_analytics_forced_off: false,
+        },
+      },
+      {
+        privacy: {
+          disable_network_observability: false,
+          reliability_diagnostics_enabled: false,
+          reliability_diagnostics_forced_off: true,
+          product_analytics_enabled: true,
+          product_analytics_notice_version: 'growth-v1',
+          product_analytics_consented_at_utc: '2026-09-01T08:30:00.000Z',
+          product_analytics_forced_off: false,
+        },
+      },
+    ])
+    const { api, app } = await mountCatalog()
+
+    expect(api.privacyPanel.value).toMatchObject({
+      reliabilityDiagnosticsEnabled: true,
+      reliabilityDiagnosticsDecision: true,
+      reliabilityDiagnosticsForcedOff: true,
+      productAnalyticsEnabled: true,
+      productAnalyticsDecision: true,
+      productAnalyticsForcedOff: false,
+    })
+    api.setReliabilityDiagnosticsEnabled(false)
+    expect(api.privacyPanel.value.reliabilityDiagnosticsDecision).toBe(false)
+    expect(api.sectionDirty('securityPrivacy')).toBe(true)
+    api.setReliabilityDiagnosticsEnabled(true)
+    expect(api.privacyPanel.value.reliabilityDiagnosticsDecision).toBe(false)
+    await api.savePrivacy()
+    expect(rpcCall).toHaveBeenCalledWith('telemetry.consent.set', {
+      scope: 'reliability',
+      enabled: false,
+    })
+    expect(api.sectionDirty('securityPrivacy')).toBe(false)
+    app.unmount()
+  })
+
+  it('blocks a forced-off unset scope from being enabled', async () => {
+    mockConfigSequence([
+      {
+        privacy: {
+          disable_network_observability: false,
+          product_analytics_forced_off: true,
+        },
+      },
+    ])
+    const { api, app } = await mountCatalog()
+
+    api.setProductAnalyticsEnabled(true)
+
+    expect(api.privacyPanel.value).toMatchObject({
+      productAnalyticsEnabled: false,
+      productAnalyticsDecision: null,
+      productAnalyticsForcedOff: true,
+    })
+    expect(api.sectionDirty('securityPrivacy')).toBe(false)
+    app.unmount()
+  })
+
+  it('requires current notice metadata before displaying a stored true value as consent', async () => {
+    mockConfigSequence([
+      {
+        privacy: {
+          disable_network_observability: false,
+          reliability_diagnostics_enabled: true,
+          reliability_notice_version: 'reliability-v0',
+          reliability_consented_at_utc: '2026-08-01T08:30:00.000Z',
+        },
+      },
+    ])
+    const { api, app } = await mountCatalog()
+
+    expect(api.privacyPanel.value).toMatchObject({
+      reliabilityDiagnosticsEnabled: false,
+      reliabilityDiagnosticsDecision: null,
+    })
+    api.setReliabilityDiagnosticsEnabled(true)
+    expect(api.sectionDirty('securityPrivacy')).toBe(true)
+    app.unmount()
+  })
+
   it('tracks and saves automatic memory capture from the Advanced section', async () => {
     mockConfigSequence([
       {

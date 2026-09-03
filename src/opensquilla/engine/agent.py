@@ -270,6 +270,17 @@ from opensquilla.session.compaction_lifecycle import (
 )
 from opensquilla.session.context_view import format_compaction_summary_context
 from opensquilla.session.terminal_reply import build_terminal_reply, safe_provider_failure_code
+from opensquilla.telemetry.contracts.reliability import (
+    ToolCategory,
+    ToolErrorCode,
+    ToolOutcome,
+)
+from opensquilla.telemetry.runtime_facts import (
+    ToolCallReliabilityFacts,
+    ToolReliabilitySink,
+    classify_tool_result,
+    tool_category_for_name,
+)
 from opensquilla.tool_boundary import AgentToolHandler as ToolHandler
 from opensquilla.tools.patch_classification import is_instrumentation_only_patch
 from opensquilla.tools.projected_arguments import find_projected_tool_argument
@@ -2913,6 +2924,18 @@ class _StreamAccumulator:
     json_chars: int = 0
 
 
+@dataclass(slots=True)
+class _ToolReliabilityState:
+    """Ephemeral correlation state; only its closed facts leave the Agent."""
+
+    category: ToolCategory
+    attempt_count: int = 0
+    active_duration_ms: int = 0
+    active_started_at: float | None = None
+    terminal: tuple[ToolOutcome, ToolErrorCode | None] | None = None
+    emitted: bool = False
+
+
 class Agent:
     """Explicit state-machine agent.
 
@@ -3010,6 +3033,8 @@ class Agent:
         self._usage_execution_context = usage_execution_context
         self._provider_request_correlation = provider_request_correlation
         self._execution_context = execution_context
+        self._tool_reliability_sink: ToolReliabilitySink | None = None
+        self._tool_reliability_states: dict[str, _ToolReliabilityState] = {}
         # Populated only by a successful real provider stream.  TurnRunner
         # publishes it after durable finalization, so failed/cancelled turns
         # can never arm a gateway keepalive probe.
@@ -3107,6 +3132,165 @@ class Agent:
                 ),
             )
         return resolve_tool_presentation(spec).to_payload()
+
+    def set_tool_reliability_sink(self, sink: ToolReliabilitySink | None) -> None:
+        """Install the optional synchronous, content-free result observer."""
+
+        self._tool_reliability_sink = sink
+
+    def settle_pending_tool_reliability_on_stream_close(self) -> None:
+        """Cancel admitted calls when an owning public stream closes early."""
+
+        self._flush_pending_tool_reliability(
+            terminal=(ToolOutcome.CANCEL, ToolErrorCode.CANCELLED),
+        )
+
+    def _begin_tool_reliability_attempt(
+        self,
+        *,
+        tool_use_id: str,
+        tool_name: str,
+    ) -> float | None:
+        if self._tool_reliability_sink is None:
+            return None
+        state = self._tool_reliability_states.get(tool_use_id)
+        if state is None:
+            state = _ToolReliabilityState(category=tool_category_for_name(tool_name))
+            self._tool_reliability_states[tool_use_id] = state
+        if state.emitted or state.active_started_at is not None:
+            return None
+        state.attempt_count += 1
+        state.active_started_at = time.monotonic()
+        return state.active_started_at
+
+    def _admit_tool_reliability_call(
+        self,
+        *,
+        tool_use_id: str,
+        tool_name: str,
+    ) -> None:
+        """Register a logical call once it enters the dispatch scheduler."""
+
+        if self._tool_reliability_sink is None:
+            return
+        self._tool_reliability_states.setdefault(
+            tool_use_id,
+            _ToolReliabilityState(category=tool_category_for_name(tool_name)),
+        )
+
+    def _end_tool_reliability_attempt(
+        self,
+        *,
+        tool_use_id: str,
+        started_at: float | None,
+    ) -> None:
+        if started_at is None:
+            return
+        state = self._tool_reliability_states.get(tool_use_id)
+        if state is None or state.emitted:
+            return
+        if state.active_started_at is not None:
+            state.active_duration_ms += max(
+                0,
+                int((time.monotonic() - state.active_started_at) * 1000),
+            )
+            state.active_started_at = None
+
+    def _set_tool_reliability_terminal(
+        self,
+        *,
+        tool_use_id: str,
+        outcome: ToolOutcome,
+        error_code: ToolErrorCode,
+    ) -> None:
+        state = self._tool_reliability_states.get(tool_use_id)
+        if state is not None and not state.emitted:
+            state.attempt_count = max(1, state.attempt_count)
+            state.terminal = (outcome, error_code)
+
+    def _settle_tool_reliability(
+        self,
+        *,
+        tool_use_id: str,
+        result: ToolResult,
+    ) -> None:
+        state = self._tool_reliability_states.get(tool_use_id)
+        if state is None or state.emitted:
+            return
+        state.attempt_count = max(1, state.attempt_count)
+        self._end_tool_reliability_attempt(
+            tool_use_id=tool_use_id,
+            started_at=state.active_started_at,
+        )
+        terminal = state.terminal
+        if terminal is None:
+            terminal = classify_tool_result(
+                status=(
+                    result.execution_status.get("status")
+                    if result.execution_status is not None
+                    else None
+                ),
+                reason=(
+                    result.execution_status.get("reason")
+                    if result.execution_status is not None
+                    else None
+                ),
+                is_error=result.is_error,
+            )
+        self._publish_tool_reliability(state, terminal=terminal)
+
+    def _flush_pending_tool_reliability(
+        self,
+        *,
+        terminal: tuple[ToolOutcome, ToolErrorCode],
+    ) -> None:
+        for state in tuple(self._tool_reliability_states.values()):
+            if state.emitted:
+                continue
+            state.attempt_count = max(1, state.attempt_count)
+            if state.active_started_at is not None:
+                state.active_duration_ms += max(
+                    0,
+                    int((time.monotonic() - state.active_started_at) * 1000),
+                )
+                state.active_started_at = None
+            self._publish_tool_reliability(
+                state,
+                terminal=state.terminal or terminal,
+            )
+        self._tool_reliability_states.clear()
+
+    def _publish_tool_reliability(
+        self,
+        state: _ToolReliabilityState,
+        *,
+        terminal: tuple[ToolOutcome, ToolErrorCode | None],
+    ) -> None:
+        if state.emitted:
+            return
+        state.emitted = True
+        facts = ToolCallReliabilityFacts(
+            tool_category=state.category,
+            outcome=terminal[0],
+            error_code=terminal[1],
+            duration_ms=state.active_duration_ms,
+            retry_count=max(0, state.attempt_count - 1),
+        )
+        sink = self._tool_reliability_sink
+        if sink is None:
+            return
+        try:
+            sink_result = sink(facts)
+            if inspect.isawaitable(sink_result):
+                close = getattr(sink_result, "close", None)
+                if callable(close):
+                    close()
+                logger.warning("agent.tool_reliability_sink_must_be_synchronous")
+        except BaseException as exc:  # observer must never change tool behavior
+            logger.warning(
+                "agent.tool_reliability_sink_failed",
+                error_type=type(exc).__name__,
+            )
 
     def _context_overflow_error(self) -> ErrorEvent:
         reason = self._last_compaction_refusal_reason
@@ -6660,6 +6844,8 @@ class Agent:
         self._prompt_cache_keepalive_candidate = None
         self._active_artifact_writer_intent_id = None
         self._artifact_writer_rejected_proposal_digests.clear()
+        self._tool_reliability_states.clear()
+        pending_tool_terminal = (ToolOutcome.FAIL, ToolErrorCode.INTERNAL_ERROR)
 
         try:
             if self._session_key:
@@ -6688,7 +6874,17 @@ class Agent:
                     pending_input_provider=pending_input_provider,
                 ):
                     yield event
+        except asyncio.CancelledError:
+            pending_tool_terminal = (ToolOutcome.CANCEL, ToolErrorCode.CANCELLED)
+            raise
+        except GeneratorExit:
+            pending_tool_terminal = (ToolOutcome.CANCEL, ToolErrorCode.CANCELLED)
+            raise
+        except BaseException:
+            pending_tool_terminal = (ToolOutcome.FAIL, ToolErrorCode.INTERNAL_ERROR)
+            raise
         finally:
+            self._flush_pending_tool_reliability(terminal=pending_tool_terminal)
             # A staged candidate is never an implicit commit.  If the turn is
             # cancelled, times out, or exits without document_finish, reject
             # the draft before releasing the rest of the turn authorities.
@@ -14942,6 +15138,10 @@ class Agent:
                     nonlocal workspace_edit_gate_recovery_read_paths
                     nonlocal workspace_edit_gate_recovery_reads_remaining
                     started = time.monotonic()
+                    reliability_started = self._begin_tool_reliability_attempt(
+                        tool_use_id=tc.tool_use_id,
+                        tool_name=tc.tool_name,
+                    )
                     self._write_turn_call_log(
                         "tool_request",
                         iteration=iterations,
@@ -15105,6 +15305,10 @@ class Agent:
                                         STOP_CANCEL_GRACE_SECONDS,
                                     ),
                                 )
+                            self._end_tool_reliability_attempt(
+                                tool_use_id=tc.tool_use_id,
+                                started_at=reliability_started,
+                            )
                             raise
                         except TimeoutError:
                             # A TimeoutError raised by the tool itself remains a
@@ -15126,6 +15330,10 @@ class Agent:
                                 failure_code="writer_tool_timed_out",
                             )
                     duration_ms = int((time.monotonic() - started) * 1000)
+                    self._end_tool_reliability_attempt(
+                        tool_use_id=tc.tool_use_id,
+                        started_at=reliability_started,
+                    )
                     self._record_focused_diagnostic_retrieval(execution_tc, res)
                     if len(self._effective_workspace_write_records()) > 0:
                         workspace_edit_gate_details = None
@@ -15227,6 +15435,11 @@ class Agent:
                                                 timed_out=True,
                                             ),
                                         )
+                                        self._set_tool_reliability_terminal(
+                                            tool_use_id=tc.tool_use_id,
+                                            outcome=ToolOutcome.TIMEOUT,
+                                            error_code=ToolErrorCode.TOOL_TIMEOUT,
+                                        )
                                 return
                             wait_timeout = remaining if interval <= 0 else min(interval, remaining)
                             done, pending = await asyncio.wait(
@@ -15256,6 +15469,11 @@ class Agent:
                                                     reason="runtime_timeout",
                                                     timed_out=True,
                                                 ),
+                                            )
+                                            self._set_tool_reliability_terminal(
+                                                tool_use_id=tc.tool_use_id,
+                                                outcome=ToolOutcome.TIMEOUT,
+                                                error_code=ToolErrorCode.TOOL_TIMEOUT,
                                             )
                                     return
                                 now = time.monotonic()
@@ -15406,6 +15624,11 @@ class Agent:
                 ) -> AsyncIterator[RunHeartbeatEvent]:
                     if not batch:
                         return
+                    for admitted_call in batch:
+                        self._admit_tool_reliability_call(
+                            tool_use_id=admitted_call.tool_use_id,
+                            tool_name=admitted_call.tool_name,
+                        )
                     semaphore = asyncio.Semaphore(self._max_safe_tool_concurrency())
                     keyed_locks: dict[Any, asyncio.Lock] = {}
                     limiters: dict[Any, asyncio.Semaphore] = {}
@@ -15499,6 +15722,12 @@ class Agent:
                         async for event in _flush_parallel_batch(parallel_batch):
                             yield event
                         parallel_batch = []
+                        submit_reliability_started = (
+                            self._begin_tool_reliability_attempt(
+                                tool_use_id=tc.tool_use_id,
+                                tool_name=tc.tool_name,
+                            )
+                        )
                         submit_capture = await self._workspace_submit_review_capture()
                         if submit_capture is None:
                             unavailable_payload = self._submit_review_git_unavailable_payload(
@@ -15527,6 +15756,10 @@ class Agent:
                                 git_state=self._submit_review_git_state.value,
                                 code=unavailable_payload["code"],
                                 terminates_turn=True,
+                            )
+                            self._end_tool_reliability_attempt(
+                                tool_use_id=tc.tool_use_id,
+                                started_at=submit_reliability_started,
                             )
                             continue
                         submit_file_index, submit_diff_text = submit_capture
@@ -15594,6 +15827,10 @@ class Agent:
                         results_by_id[tc.tool_use_id] = submit_result
                         if submit_result.terminates_turn:
                             dispatch_boundary = submit_result
+                        self._end_tool_reliability_attempt(
+                            tool_use_id=tc.tool_use_id,
+                            started_at=submit_reliability_started,
+                        )
                         continue
                     if tc.tool_name == "meta_invoke":
                         async for event in _flush_parallel_batch(parallel_batch):
@@ -15602,11 +15839,21 @@ class Agent:
                         active_ctx = (
                             current_tool_context.get() or self._tool_context or ToolContext()
                         )
-                        async for ev in self._run_one_streaming(tc, active_ctx):
-                            if isinstance(ev, ToolResult):
-                                results_by_id[tc.tool_use_id] = ev
-                            else:
-                                yield ev
+                        meta_reliability_started = self._begin_tool_reliability_attempt(
+                            tool_use_id=tc.tool_use_id,
+                            tool_name=tc.tool_name,
+                        )
+                        try:
+                            async for ev in self._run_one_streaming(tc, active_ctx):
+                                if isinstance(ev, ToolResult):
+                                    results_by_id[tc.tool_use_id] = ev
+                                else:
+                                    yield ev
+                        finally:
+                            self._end_tool_reliability_attempt(
+                                tool_use_id=tc.tool_use_id,
+                                started_at=meta_reliability_started,
+                            )
                         meta_result = results_by_id.get(tc.tool_use_id)
                         if meta_result is not None and meta_result.terminates_turn:
                             dispatch_boundary = meta_result
@@ -15627,6 +15874,10 @@ class Agent:
                         async for event in _flush_parallel_batch(parallel_batch):
                             yield event
                         parallel_batch = []
+                        self._admit_tool_reliability_call(
+                            tool_use_id=tc.tool_use_id,
+                            tool_name=tc.tool_name,
+                        )
                         async for event in _collect_tool_tasks(
                             {asyncio.create_task(_run_one(tc)): tc}
                         ):
@@ -15750,6 +16001,10 @@ class Agent:
                             result,
                             tool_call=tc,
                         )
+                        self._settle_tool_reliability(
+                            tool_use_id=tc.tool_use_id,
+                            result=result,
+                        )
                         yield ToolResultEvent(
                             tool_use_id=projected_result.tool_use_id,
                             tool_name=projected_result.tool_name,
@@ -15815,6 +16070,15 @@ class Agent:
                             except KeyError:
                                 approval_entry = None
                             if approval_entry is None or not approval_entry.resolved:
+                                self._set_tool_reliability_terminal(
+                                    tool_use_id=tc.tool_use_id,
+                                    outcome=ToolOutcome.CANCEL,
+                                    error_code=ToolErrorCode.CANCELLED,
+                                )
+                                self._settle_tool_reliability(
+                                    tool_use_id=tc.tool_use_id,
+                                    result=result,
+                                )
                                 turn_yielded = True
                                 break
                             if not approval_entry.approved:
@@ -15842,6 +16106,18 @@ class Agent:
                                     if resolution == "expired"
                                     else "approval_denied"
                                 )
+                                if explicit_human_denial:
+                                    self._set_tool_reliability_terminal(
+                                        tool_use_id=tc.tool_use_id,
+                                        outcome=ToolOutcome.DENIED,
+                                        error_code=ToolErrorCode.POLICY_DENIED,
+                                    )
+                                else:
+                                    self._set_tool_reliability_terminal(
+                                        tool_use_id=tc.tool_use_id,
+                                        outcome=ToolOutcome.CANCEL,
+                                        error_code=ToolErrorCode.CANCELLED,
+                                    )
                                 result = ToolResult(
                                     tool_use_id=tc.tool_use_id,
                                     tool_name=tc.tool_name,
@@ -15867,6 +16143,10 @@ class Agent:
                                         result,
                                         tool_call=tc,
                                     )
+                                )
+                                self._settle_tool_reliability(
+                                    tool_use_id=tc.tool_use_id,
+                                    result=result,
                                 )
                                 yield ToolResultEvent(
                                     tool_use_id=projected_result.tool_use_id,
@@ -15899,6 +16179,10 @@ class Agent:
                             )
                             pending_approval = _pending_approval_payload(result.content)
                             if pending_approval is None:
+                                self._settle_tool_reliability(
+                                    tool_use_id=tc.tool_use_id,
+                                    result=result,
+                                )
                                 yield ToolResultEvent(
                                     tool_use_id=projected_result.tool_use_id,
                                     tool_name=projected_result.tool_name,
@@ -15915,6 +16199,10 @@ class Agent:
                                 if replay_event is not None:
                                     yield replay_event
                     elif not deferred_user_input_handled:
+                        self._settle_tool_reliability(
+                            tool_use_id=tc.tool_use_id,
+                            result=result,
+                        )
                         yield ToolResultEvent(
                             tool_use_id=projected_result.tool_use_id,
                             tool_name=projected_result.tool_name,

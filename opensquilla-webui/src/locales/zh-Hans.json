@@ -1753,8 +1753,13 @@
     },
     "privacy": {
       "statusDisabledByEnv": "已由环境设置关闭。",
-      "networkReportingLabel": "诊断与更新",
-      "networkReportingDesc": "发送有限的产品诊断数据并检查更新；不会上传对话内容、文件或模型请求内容。"
+      "statusNotChosen": "尚未保存选择；开启前不会发送数据。",
+      "reliabilityDiagnosticsLabel": "稳定性诊断",
+      "reliabilityDiagnosticsDesc": "发送操作结果、耗时和经隐私处理的错误指纹，用于诊断崩溃与失败；绝不包含对话或文件内容。",
+      "productAnalyticsLabel": "产品与增长分析",
+      "productAnalyticsDesc": "发送一次性的激活里程碑，用于衡量设置和首次对话漏斗的流失；绝不包含对话内容或原始账号 ID，仅使用随机、专用的分析标识。",
+      "networkReportingLabel": "网络诊断总开关",
+      "networkReportingDesc": "统一控制网络诊断、分析和更新检查；关闭后会覆盖下方两个独立选择。"
     },
     "toast": {
       "loadFailed": "加载设置失败：{error}",

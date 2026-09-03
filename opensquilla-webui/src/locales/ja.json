@@ -1665,8 +1665,13 @@
     },
     "privacy": {
       "statusDisabledByEnv": "環境設定により無効になっています。",
-      "networkReportingLabel": "診断とアップデート",
-      "networkReportingDesc": "限定的な製品診断データを送信してアップデートを確認します。会話内容、ファイル、モデルリクエストの内容はアップロードされません。"
+      "statusNotChosen": "選択はまだ保存されていません。有効にするまでデータは送信されません。",
+      "reliabilityDiagnosticsLabel": "安定性診断",
+      "reliabilityDiagnosticsDesc": "クラッシュや失敗の診断に役立てるため、操作結果、所要時間、プライバシーに配慮したエラー指紋を共有します。会話やファイルの内容は含まれません。",
+      "productAnalyticsLabel": "製品・成長分析",
+      "productAnalyticsDesc": "セットアップと初回会話の離脱を測定するため、一度限りの有効化マイルストーンを共有します。会話内容や元のアカウント ID は含めず、ランダムな分析専用識別子を使用します。",
+      "networkReportingLabel": "ネットワーク診断のマスタースイッチ",
+      "networkReportingDesc": "ネットワーク診断、分析、アップデート確認を一括で制御します。無効にすると、下の 2 つの選択より優先されます。"
     },
     "toast": {
       "loadFailed": "設定の読み込みに失敗しました: {error}",

@@ -77,34 +77,13 @@ def test_gateway_boot_bridges_compaction_notifications_to_session_stream() -> No
     assert "_compaction_listener_remove" in source
 
 
-def test_shared_service_boot_prewarms_tokenrhythm_install_id_after_config_load() -> None:
+def test_gateway_boot_does_not_start_retired_legacy_telemetry() -> None:
     source = Path("src/opensquilla/gateway/boot.py").read_text(encoding="utf-8")
-    build_start = source.index("async def build_services(")
-    config_load = source.index("GatewayConfig.load(", build_start)
-    prewarm = source.index("_prewarm_tokenrhythm_install_id(config)", build_start)
-    provider_setup = source.index("# ── Provider selector", build_start)
-    live_catalog = source.index("await refresh_live_model_catalog(", build_start)
 
-    # build_services is shared by Gateway, one-shot agents, and --standalone.
-    assert config_load < prewarm < provider_setup < live_catalog
-
-
-def test_tokenrhythm_install_id_prewarm_never_breaks_boot(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from opensquilla.gateway import boot
-    from opensquilla.provider import tokenrhythm_correlation
-
-    def fail_prewarm(**_kwargs: Any) -> None:
-        raise RuntimeError("synthetic resolver failure")
-
-    monkeypatch.setattr(
-        tokenrhythm_correlation,
-        "prewarm_tokenrhythm_install_id",
-        fail_prewarm,
-    )
-
-    boot._prewarm_tokenrhythm_install_id(GatewayConfig())
+    assert "_start_background_install_telemetry" not in source
+    assert "run_daily_usage_upload_loop" not in source
+    assert "prewarm_tokenrhythm_install_id" not in source
+    assert '"gateway.install_telemetry"' not in source
 
 
 def test_gateway_startup_phase_log_uses_bounded_fields(
@@ -308,11 +287,6 @@ def test_start_gateway_server_releases_pid_lock_when_build_services_fails(
         events.append("reconcile_process_owners")
         return 0
 
-    monkeypatch.setattr(
-        boot,
-        "_start_background_install_telemetry",
-        lambda config: events.append("install_telemetry"),
-    )
     monkeypatch.setattr(boot, "build_services", fail_build_services)
     monkeypatch.setattr(
         "opensquilla.process_tree.reconcile_persisted_processes",
@@ -453,7 +427,7 @@ def test_failed_desktop_ownership_does_not_reset_active_stream_generation(
         reset_session_streams()
 
 
-def test_start_gateway_server_starts_telemetry_after_listener_and_runtime_are_ready(
+def test_start_gateway_server_does_not_start_retired_legacy_telemetry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -525,32 +499,6 @@ def test_start_gateway_server_starts_telemetry_after_listener_and_runtime_are_re
             close=close,
         )
 
-    def fake_start_background_install_telemetry(
-        *,
-        config: GatewayConfig,
-        on_result: Any,
-    ) -> None:
-        assert app_holder["app"].state.gateway_ready is True
-        call_order.append("install_telemetry")
-        on_result(
-            SimpleNamespace(
-                skipped_reason=None,
-                event="install",
-                sent=True,
-                uploaded=False,
-                endpoint_configured=True,
-            )
-        )
-
-    def fake_daily_usage_loop(storage: Any, *, config: GatewayConfig) -> Any:
-        assert app_holder["app"].state.gateway_ready is True
-        call_order.append("daily_usage")
-
-        async def complete() -> None:
-            return None
-
-        return complete()
-
     def fake_sandbox_startup(config: GatewayConfig) -> Any:
         assert app_holder["app"].state.gateway_ready is True
         assert "listener" in call_order
@@ -560,7 +508,6 @@ def test_start_gateway_server_starts_telemetry_after_listener_and_runtime_are_re
             return None
 
         return complete()
-
     real_create_gateway_app = boot.create_gateway_app
 
     def capture_gateway_app(*args: Any, **kwargs: Any) -> Any:
@@ -578,14 +525,6 @@ def test_start_gateway_server_starts_telemetry_after_listener_and_runtime_are_re
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
     monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(boot, "_ensure_sandbox_setup_on_boot", fake_sandbox_startup)
-    monkeypatch.setattr(
-        "opensquilla.observability.install_telemetry.start_background_install_telemetry",
-        fake_start_background_install_telemetry,
-    )
-    monkeypatch.setattr(
-        "opensquilla.observability.usage_telemetry.run_daily_usage_upload_loop",
-        fake_daily_usage_loop,
-    )
     monkeypatch.setattr(
         "opensquilla.gateway.pidlock.GatewayPidLock.acquire",
         lambda self: None,
@@ -607,12 +546,9 @@ def test_start_gateway_server_starts_telemetry_after_listener_and_runtime_are_re
         try:
             assert call_order == ["build_services", "runtime_state"]
             await asyncio.sleep(0)
-            telemetry_logs = [
-                kwargs for event, kwargs in debug_logs if event == "gateway.install_telemetry"
-            ]
-            assert len(telemetry_logs) == 1
-            assert telemetry_logs[0]["telemetry_event"] == "install"
-            assert "event" not in telemetry_logs[0]
+            assert "gateway.install_telemetry" not in {
+                event for event, _kwargs in debug_logs
+            }
             assert "gateway.install_telemetry_skipped" not in {
                 event for event, _kwargs in debug_logs
             }
@@ -623,8 +559,6 @@ def test_start_gateway_server_starts_telemetry_after_listener_and_runtime_are_re
                 "listener",
                 "gateway_ready",
                 "sandbox_startup",
-                "install_telemetry",
-                "daily_usage",
             ]
         finally:
             await server.close()

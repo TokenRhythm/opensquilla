@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="icon" href="data:,">
+    <title>OpenSquilla · 埋点数据 V2</title>
+    <style nonce="{{ csp_nonce }}">
+      :root {
+        color-scheme: light;
+        --ink: #163042; --muted: #667d8c; --paper: #f2f7f8; --panel: #fff;
+        --line: #d8e5e8; --teal: #087f78; --teal-2: #35a69b; --teal-soft: #e2f4f1;
+        --blue: #356f9f; --rose: #b94b59; --shadow: 0 18px 52px rgba(25,61,76,.08);
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0; min-height: 100vh; color: var(--ink);
+        background: linear-gradient(rgba(37,83,99,.045) 1px, transparent 1px), var(--paper);
+        background-size: 100% 32px;
+        font: 15px/1.5 "Aptos", "Noto Sans SC", "PingFang SC", system-ui, sans-serif;
+      }
+      button, input { font: inherit; }
+      button { cursor: pointer; }
+      :focus-visible { outline: 3px solid rgba(8,127,120,.25); outline-offset: 2px; }
+      .page { width: min(1320px, calc(100% - 32px)); margin: 0 auto; padding: 24px 0 52px; }
+      .topbar { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 34px; }
+      .brand { display: inline-flex; align-items: center; gap: 11px; font-weight: 850; letter-spacing: -.025em; }
+      .brand-mark { width: 13px; height: 13px; border-radius: 50%; background: var(--teal); box-shadow: 8px 0 0 rgba(8,127,120,.25); }
+      .preview-pill { margin-left: 8px; padding: 3px 8px; border: 1px solid #b9d9d5; border-radius: 999px; color: var(--teal); font-size: 10px; letter-spacing: .1em; }
+      .quiet-button, .primary-button { min-height: 38px; border: 1px solid var(--line); border-radius: 9px; padding: 0 14px; background: var(--panel); color: var(--ink); font-weight: 750; }
+      .primary-button { border-color: var(--teal); background: var(--teal); color: #fff; }
+      .hero { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: end; gap: 28px; margin-bottom: 18px; }
+      .eyebrow { margin: 0 0 8px; color: var(--teal); font-size: 11px; font-weight: 850; letter-spacing: .14em; text-transform: uppercase; }
+      h1 { margin: 0; font-size: clamp(34px,5vw,58px); line-height: .98; letter-spacing: -.055em; }
+      .hero-copy { max-width: 720px; margin: 13px 0 0; color: var(--muted); }
+      .filters { display: flex; align-items: end; gap: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 13px; background: rgba(255,255,255,.86); box-shadow: 0 8px 24px rgba(28,55,72,.05); }
+      .field { display: grid; gap: 4px; color: var(--muted); font-size: 10px; font-weight: 850; letter-spacing: .07em; text-transform: uppercase; }
+      .field input { width: 148px; min-height: 38px; padding: 6px 9px; border: 1px solid var(--line); border-radius: 8px; background: #fff; color: var(--ink); }
+      .status-line { display: flex; align-items: center; gap: 8px; min-height: 24px; margin: 0 0 12px; color: var(--muted); font-size: 12px; }
+      .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--teal-2); box-shadow: 0 0 0 4px rgba(53,166,155,.13); }
+      .summary-strip { display: grid; grid-template-columns: repeat(5,1fr); gap: 12px; margin-bottom: 18px; }
+      .summary-card { min-height: 124px; padding: 19px 20px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); box-shadow: 0 10px 30px rgba(29,65,80,.05); }
+      .summary-card.accent { background: linear-gradient(135deg,#e5f5f2,#f9fdfc); border-color: #c3e2dd; }
+      .summary-label { color: var(--muted); font-size: 11px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; }
+      .summary-value { margin: 7px 0 2px; font: 750 clamp(28px,4vw,43px)/1 "SFMono-Regular",Consolas,monospace; letter-spacing: -.065em; }
+      .summary-note { margin: 7px 0 0; color: var(--muted); font-size: 11px; }
+      .panel { margin-bottom: 18px; border: 1px solid var(--line); border-radius: 16px; background: var(--panel); box-shadow: var(--shadow); overflow: hidden; }
+      .panel-head { display: flex; align-items: start; justify-content: space-between; gap: 20px; margin-bottom: 18px; }
+      .panel-head h2 { margin: 0; font-size: 18px; letter-spacing: -.025em; }
+      .panel-head p { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+      .trend-panel { display: grid; grid-template-columns: 250px minmax(0,1fr); min-height: 390px; }
+      .trend-summary { display: flex; flex-direction: column; justify-content: space-between; padding: 28px; border-right: 1px solid var(--line); background: #edf7f5; }
+      .trend-number { margin: 13px 0 5px; font: 750 58px/.95 "SFMono-Regular",Consolas,monospace; letter-spacing: -.08em; }
+      .trend-legend { display: grid; gap: 10px; color: var(--muted); font-size: 12px; }
+      .legend-item { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+      .legend-label { display: inline-flex; align-items: center; gap: 8px; }
+      .legend-swatch { width: 20px; height: 3px; border-radius: 3px; background: var(--teal); }
+      .legend-swatch.issue { background: var(--rose); }
+      .legend-value { color: var(--ink); font: 700 14px "SFMono-Regular",Consolas,monospace; }
+      .trend-side { min-width: 0; padding: 24px 26px 16px; }
+      #reliability-trend { display: block; width: 100%; min-height: 285px; overflow: visible; }
+      #terminal-trend { display: block; width: 100%; min-height: 285px; overflow: visible; }
+      .chart-empty-note { margin: -9px 0 9px; color: var(--muted); font-size: 11px; text-align: center; }
+      .chart-grid { stroke: #e2ecee; stroke-width: 1; }
+      .chart-axis { fill: var(--muted); font: 10px "SFMono-Regular",Consolas,monospace; }
+      .chart-area { fill: url(#trend-area-fill); }
+      .terminal-chart-area { fill: url(#terminal-area-fill); }
+      .chart-events { fill: none; stroke: var(--teal); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+      .chart-issues { fill: none; stroke: var(--rose); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 7 5; }
+      .chart-tui { fill: none; stroke: var(--teal); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+      .chart-cli { fill: none; stroke: var(--blue); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 7 5; }
+      .chart-point { fill: #fff; stroke: var(--teal); stroke-width: 2; }
+      .install-chart-area { fill: url(#install-area-fill); }
+      .chart-installs { fill: none; stroke: var(--blue); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+      .install-point { fill: #fff; stroke: var(--blue); stroke-width: 2; }
+      .evolution-strip { display: grid; grid-template-columns: repeat(3,1fr); gap: 0; margin-bottom: 18px; padding: 0; }
+      .evolution-step { position: relative; min-width: 0; padding: 18px 22px; border-right: 1px solid var(--line); }
+      .evolution-step:last-child { border-right: 0; }
+      .evolution-step::after { content: '\2192'; position: absolute; z-index: 1; top: 50%; right: -13px; display: grid; place-items: center; width: 26px; height: 26px; border: 1px solid var(--line); border-radius: 50%; background: var(--panel); color: var(--teal); transform: translateY(-50%); }
+      .evolution-step:last-child::after { display: none; }
+      .evolution-step strong { display: block; margin: 5px 0 2px; font-size: 14px; }
+      .evolution-step p { margin: 0; color: var(--muted); font-size: 11px; }
+      .source-tag { display: inline-flex; padding: 2px 7px; border: 1px solid #bed7df; border-radius: 99px; color: var(--blue); font-size: 9px; font-weight: 850; letter-spacing: .08em; text-transform: uppercase; }
+      .legacy-panel .trend-summary { background: #edf4f8; }
+      .legacy-panel .legend-swatch { background: var(--blue); }
+      .section-title { display: flex; align-items: end; justify-content: space-between; gap: 20px; margin: 28px 2px 12px; }
+      .section-title h2 { margin: 0; font-size: 24px; letter-spacing: -.035em; }
+      .section-title p { margin: 0; color: var(--muted); font-size: 12px; }
+      .health-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 12px; }
+      .health-card { display: grid; grid-template-columns: 84px 1fr; align-items: center; gap: 17px; min-height: 156px; padding: 18px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); }
+      .ring { display: block; width: 84px; height: 84px; transform: rotate(-90deg); }
+      .ring-track { fill: none; stroke: #e7eff1; stroke-width: 9; }
+      .ring-meter { fill: none; stroke: var(--teal); stroke-width: 9; stroke-linecap: round; stroke-dasharray: 100; stroke-dashoffset: 100; }
+      .health-card h3 { margin: 0 0 3px; font-size: 15px; }
+      .rate-value { margin: 0; color: var(--teal); font: 750 26px/1.2 "SFMono-Regular",Consolas,monospace; letter-spacing: -.045em; }
+      .health-meta { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 7px; color: var(--muted); font-size: 11px; }
+      .health-meta strong { color: var(--ink); font-family: "SFMono-Regular",Consolas,monospace; }
+      .breakdown-grid, .funnel-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 18px; margin-top: 18px; }
+      .breakdown, .funnel { padding: 24px 26px; }
+      .bar-list { display: grid; gap: 13px; }
+      .bar-row { display: grid; grid-template-columns: minmax(108px,.8fr) minmax(120px,2fr) auto; align-items: center; gap: 12px; }
+      .bar-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 700; }
+      .bar-value { min-width: 42px; text-align: right; font: 700 12px "SFMono-Regular",Consolas,monospace; }
+      progress { width: 100%; height: 9px; overflow: hidden; border: 0; border-radius: 99px; background: #edf2f3; accent-color: var(--blue); }
+      progress::-webkit-progress-bar { border-radius: 99px; background: #edf2f3; }
+      progress::-webkit-progress-value { border-radius: 99px; background: var(--blue); }
+      progress::-moz-progress-bar { border-radius: 99px; background: var(--blue); }
+      .funnel progress { accent-color: var(--teal); }
+      .funnel progress::-webkit-progress-value { background: linear-gradient(90deg,var(--teal),var(--teal-2)); }
+      .funnel progress::-moz-progress-bar { background: var(--teal); }
+      .transition-list { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 20px; }
+      .transition-chip { padding: 6px 9px; border: 1px solid var(--line); border-radius: 8px; background: #f7fafb; color: var(--muted); font-size: 10px; }
+      .transition-chip strong { color: var(--ink); }
+      .coverage-panel { padding: 24px 26px; }
+      .coverage-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 14px; }
+      .coverage-card { display: grid; grid-template-columns: 92px 1fr; align-items: center; gap: 18px; padding: 17px; border: 1px solid #e3ebed; border-radius: 13px; background: #fbfdfd; }
+      .coverage-card .ring-meter { stroke: var(--blue); }
+      .coverage-card h3 { margin: 0; font-size: 13px; }
+      .coverage-card .summary-value { font-size: 27px; }
+      .privacy-note { margin: 18px 2px 0; color: var(--muted); font-size: 11px; }
+      .empty { padding: 40px 24px; color: var(--muted); text-align: center; }
+      [hidden] { display: none !important; }
+      @media (max-width: 1040px) {
+        .hero { grid-template-columns: 1fr; }
+        .summary-strip { grid-template-columns: repeat(2,1fr); }
+        .trend-panel { grid-template-columns: 1fr; }
+        .trend-summary { min-height: 180px; border-right: 0; border-bottom: 1px solid var(--line); }
+        .trend-legend { grid-template-columns: 1fr 1fr; }
+        .health-grid { grid-template-columns: repeat(2,1fr); }
+        .coverage-grid { grid-template-columns: 1fr; }
+      }
+      @media (max-width: 720px) {
+        .page { width: min(100% - 20px,1320px); padding-top: 17px; }
+        .topbar { margin-bottom: 26px; }
+        .preview-pill { display: none; }
+        .filters { display: grid; grid-template-columns: 1fr 1fr; }
+        .filters .field input { width: 100%; }
+        .filters .primary-button { grid-column: span 2; }
+        .summary-strip, .health-grid, .breakdown-grid, .funnel-grid, .evolution-strip { grid-template-columns: 1fr; }
+        .evolution-step { border-right: 0; border-bottom: 1px solid var(--line); }
+        .evolution-step:last-child { border-bottom: 0; }
+        .evolution-step::after { top: auto; right: 22px; bottom: -13px; transform: rotate(90deg); }
+        .trend-side, .breakdown, .funnel, .coverage-panel { padding: 20px 15px; }
+        .bar-row { grid-template-columns: 92px minmax(90px,1fr) 38px; gap: 8px; }
+        .section-title { align-items: start; flex-direction: column; gap: 4px; }
+      }
+    </style>
+  </head>
+  <body>
+    {% macro percent(value) -%}{{ '—' if value is none else ('%.1f' | format(value * 100)) ~ '%' }}{%- endmacro %}
+    {% set tool_labels = {'filesystem_read':'文件读取','filesystem_write':'文件写入','shell':'命令行','code_execution':'代码执行','web':'网页访问','search':'搜索','browser':'浏览器','computer_use':'电脑操作','artifact':'成果物','document':'文档处理','collaboration':'协作','mcp_extension':'扩展工具','other':'其他'} %}
+    {% set file_labels = {'pdf':'PDF 文档','docx':'Word 文档','xlsx':'Excel 表格','pptx':'演示文稿','email':'邮件','text':'文本'} %}
+    {% set platform_labels = {'darwin':'macOS','macos':'macOS','macOS':'macOS','windows':'Windows','Windows':'Windows','win32':'Windows','linux':'Linux','Linux':'Linux'} %}
+    {% set entrypoint_labels = {'chat':'对话','agent':'单次 Agent 任务','gateway_run':'网关运行'} %}
+    {% set funnel_labels = {'landing_view':'访问落地页','download_click':'点击下载','download_served':'安装包交付成功','install_started':'开始安装','install_succeeded':'安装成功','registration_started':'开始注册','registration_succeeded':'注册成功','first_app_ready':'首次进入可用界面','onboarding_completed':'完成引导','first_turn_started':'首次提问','first_turn_succeeded':'首次成功回复'} %}
+    {% set failure_stage_labels = {'turn_setup':'回合初始化','input_processing':'输入处理','provider_and_tools':'模型与工具准备','attachment_processing':'附件处理','prompt_assembly':'提示词组装','agent_bootstrap':'Agent 初始化','context_preparation':'上下文准备','agent_execution':'Agent 执行','result_finalization':'结果收尾','unclassified':'历史事件（未记录步骤）'} %}
+    {% set error_code_labels = {'provider_timeout':'模型服务超时','provider_rate_limited':'模型服务限流','provider_auth':'模型服务鉴权失败','provider_unavailable':'模型服务不可用','context_limit':'上下文超限','request_too_large':'请求过大','output_truncated':'输出被截断','budget_exhausted':'预算耗尽','hard_deadline':'达到总时限','cancelled_by_user':'用户取消','cancelled_before_start':'启动前取消','shutdown':'服务关闭','platform_validation':'平台校验失败','safety_blocked':'安全策略拦截','internal_error':'内部错误','unknown':'未知错误'} %}
+    <main class="page">
+      <header class="topbar">
+        <div class="brand"><span class="brand-mark"></span> OpenSquilla <span class="preview-pill">埋点 V2</span></div>
+        <form method="post" action="{{ base_path }}/logout"><input type="hidden" name="csrf_token" value="{{ logout_csrf }}"><button class="quiet-button" type="submit">退出看板</button></form>
+      </header>
+      <section class="hero">
+        <div><p class="eyebrow">安装 · 稳定性 · 用户增长</p><h1>产品数据全景</h1><p class="hero-copy">从 V1 装机历史延续到 V2 稳定性与增长漏斗，按同一 UTC 时间范围统一展示。仅提供汇总指标，不包含原始事件和身份标识。</p></div>
+        <form class="filters" method="get" action="{{ base_path }}" aria-label="统计时间筛选">
+          <label class="field">开始日期（UTC）<input type="date" name="start" value="{{ start_date }}" required></label>
+          <label class="field">结束日期（UTC）<input type="date" name="end" value="{{ end_date }}" required></label>
+          <button class="primary-button" type="submit">应用时间范围</button>
+        </form>
+      </section>
+      <div class="status-line"><span class="status-dot"></span>统一只读快照 · V1 {{ summary.legacyInstallation.asOfReceivedUtc if summary.legacyInstallation is not none and summary.legacyInstallation.asOfReceivedUtc else '暂无上报' }} · V2 {{ summary.reliability.asOfReceivedUtc if summary.reliability is not none and summary.reliability.asOfReceivedUtc else (summary.growth.asOfReceivedUtc if summary.growth is not none and summary.growth.asOfReceivedUtc else '暂无上报') }}</div>
+
+      <section class="summary-strip" aria-label="核心指标">
+        {% if summary.legacyInstallation is not none %}<article class="summary-card accent"><div class="summary-label">V1 去重装机</div><div class="summary-value">{{ summary.legacyInstallation.installations }}</div><p class="summary-note">所选时间段 · 桌面端首次安装</p></article>{% else %}<article class="summary-card accent"><div class="summary-label">V1 去重装机</div><div class="summary-value">—</div><p class="summary-note">历史数据源暂不可用</p></article>{% endif %}
+        {% if summary.reliability is not none %}
+        {% set reliability_total = summary.reliability.appStart.estimatedEvents + summary.reliability.gatewayStart.estimatedEvents + summary.reliability.turns.estimatedEvents + summary.reliability.tools.estimatedEvents + summary.reliability.fileParsing.estimatedEvents + summary.reliability.updates.estimatedEvents %}
+        <article class="summary-card accent"><div class="summary-label">稳定性事件</div><div class="summary-value">{{ reliability_total }}</div><p class="summary-note">所选时间段 · 采样校正</p></article>
+        <article class="summary-card"><div class="summary-label">对话成功率</div><div class="summary-value">{{ percent(summary.reliability.turns.successRate) }}</div><p class="summary-note">P95 总耗时 {{ summary.reliability.turns.p95DurationMs if summary.reliability.turns.p95DurationMs is not none else '—' }} 毫秒</p></article>
+        <article class="summary-card"><div class="summary-label">无崩溃会话率</div><div class="summary-value">{{ percent(summary.reliability.crashFreeSessions.crashFreeRate) }}</div><p class="summary-note">{{ summary.reliability.crashFreeSessions.sessions }} 个会话</p></article>
+        {% else %}
+        <article class="summary-card accent"><div class="summary-label">稳定性事件</div><div class="summary-value">—</div><p class="summary-note">该数据域暂不可用</p></article>
+        <article class="summary-card"><div class="summary-label">对话成功率</div><div class="summary-value">—</div></article>
+        <article class="summary-card"><div class="summary-label">无崩溃会话率</div><div class="summary-value">—</div></article>
+        {% endif %}
+        {% if summary.growth is not none %}<article class="summary-card"><div class="summary-label">首次成功对话</div><div class="summary-value">{{ summary.growth.activation.stages[-1].deduplicatedCount }}</div><p class="summary-note">按分析专用标识去重</p></article>{% else %}<article class="summary-card"><div class="summary-label">首次成功对话</div><div class="summary-value">—</div><p class="summary-note">增长数据域暂不可用</p></article>{% endif %}
+      </section>
+
+      <section class="panel evolution-strip" aria-label="埋点版本演进">
+        <article class="evolution-step"><span class="source-tag">埋点 V1</span><strong>安装历史基线</strong><p>桌面端首次安装去重、版本及系统覆盖</p></article>
+        <article class="evolution-step"><span class="source-tag">埋点 V2</span><strong>标准化安装漏斗</strong><p>安装器事件进入统一信封与独立增长端点</p></article>
+        <article class="evolution-step"><span class="source-tag">埋点 V2</span><strong>激活与稳定性</strong><p>首次可用、首次成功对话和操作结果</p></article>
+      </section>
+
+      {% if summary.legacyInstallation is not none %}
+      {% set legacy = summary.legacyInstallation %}
+      <div class="section-title"><div><p class="eyebrow">安装历史</p><h2>安装与版本演进</h2></div><p>沿用 V1 首次安装去重口径，统一转换为 UTC 时间窗</p></div>
+      <section class="panel trend-panel legacy-panel">
+        <div class="trend-summary"><div><div class="summary-label">V1 安装基线</div><div class="trend-number">{{ legacy.installations }}</div><div class="summary-note">桌面端首次安装 · 排除持续集成环境</div></div><div class="trend-legend"><div class="legend-item"><span class="legend-label"><i class="legend-swatch"></i>末日新增</span><span class="legend-value">{{ legacy.dailyTrend[-1].installations if legacy.dailyTrend else 0 }}</span></div><div class="legend-item"><span class="legend-label">日均</span><span class="legend-value">{{ (legacy.installations / (legacy.dailyTrend | length)) | round(1) if legacy.dailyTrend else 0 }}</span></div></div></div>
+        <div class="trend-side"><div class="panel-head"><div><h2>首次安装趋势</h2><p>历史数据继续由 V1 采集，V2 只读呈现，不改写旧库</p></div><p>{{ start_date }} → {{ end_date }}</p></div><svg id="install-trend" viewBox="0 0 960 285" role="img" aria-label="V1 每日首次安装趋势图"></svg>{% if legacy.installations == 0 %}<p class="chart-empty-note" role="status">当前时间范围暂无 V1 首次安装。</p>{% endif %}<div id="install-trend-data" hidden>{% for point in legacy.dailyTrend %}<span data-date="{{ point.date }}" data-installations="{{ point.installations }}"></span>{% endfor %}</div></div>
+      </section>
+      <section class="breakdown-grid">
+        <article class="panel breakdown"><div class="panel-head"><div><h2>版本覆盖量</h2><p>首次安装时记录的 OpenSquilla 版本</p></div></div><div class="bar-list">{% for item in legacy.versions %}<div class="bar-row"><span class="bar-name">{{ item.dimension }}</span><progress max="{{ legacy.installations if legacy.installations else 1 }}" value="{{ item.installations }}"></progress><span class="bar-value">{{ item.installations }} · {{ percent(item.share) }}</span></div>{% else %}<div class="empty">暂无版本数据</div>{% endfor %}</div></article>
+        <article class="panel breakdown"><div class="panel-head"><div><h2>操作系统覆盖量</h2><p>首次安装时记录的平台分布</p></div></div><div class="bar-list">{% for item in legacy.operatingSystems %}<div class="bar-row"><span class="bar-name">{{ platform_labels.get(item.dimension, '其他系统') }}</span><progress max="{{ legacy.installations if legacy.installations else 1 }}" value="{{ item.installations }}"></progress><span class="bar-value">{{ item.installations }} · {{ percent(item.share) }}</span></div>{% else %}<div class="empty">暂无系统数据</div>{% endfor %}</div></article>
+      </section>
+      {% else %}<section class="panel empty" role="status"><h2>V1 安装历史暂不可用</h2><p>V2 稳定性与增长数据仍可独立读取；旧看板不会受影响。</p></section>{% endif %}
+
+      {% if summary.reliability is not none %}
+      {% set reliability_total = summary.reliability.appStart.estimatedEvents + summary.reliability.gatewayStart.estimatedEvents + summary.reliability.turns.estimatedEvents + summary.reliability.tools.estimatedEvents + summary.reliability.fileParsing.estimatedEvents + summary.reliability.updates.estimatedEvents %}
+      <section class="panel trend-panel">
+        <div class="trend-summary"><div><div class="summary-label">稳定性概览</div><div class="trend-number">{{ reliability_total }}</div><div class="summary-note">采样校正后的操作结果</div></div><div class="trend-legend"><div class="legend-item"><span class="legend-label"><i class="legend-swatch"></i>事件量</span><span class="legend-value">{{ summary.reliability.dailyTrend | sum(attribute='estimatedEvents') }}</span></div><div class="legend-item"><span class="legend-label"><i class="legend-swatch issue"></i>问题量</span><span class="legend-value">{{ summary.reliability.dailyTrend | sum(attribute='estimatedIssues') }}</span></div></div></div>
+        <div class="trend-side"><div class="panel-head"><div><h2>每日稳定性趋势</h2><p>实线为事件量，虚线为失败、超时、取消、拒绝或崩溃</p></div><p>{{ start_date }} → {{ end_date }}</p></div><svg id="reliability-trend" viewBox="0 0 960 285" role="img" aria-label="每日稳定性事件及问题趋势图"></svg>{% if summary.reliability.dailyTrend | sum(attribute='estimatedEvents') == 0 %}<p class="chart-empty-note" role="status">当前时间范围暂无稳定性上报；接入生产客户端后趋势会自动出现。</p>{% endif %}<div id="trend-data" hidden>{% for point in summary.reliability.dailyTrend %}<span data-date="{{ point.date }}" data-events="{{ point.estimatedEvents }}" data-issues="{{ point.estimatedIssues }}"></span>{% endfor %}</div></div>
+      </section>
+
+      <div class="section-title"><div><p class="eyebrow">稳定性</p><h2>稳定性质量</h2></div><p>环图展示成功率；同时保留样本量与 P95 延迟</p></div>
+      {% set reliability_metrics = [('应用启动','客户端启动',summary.reliability.appStart),('网关启动','网关启动',summary.reliability.gatewayStart),('AI 对话','AI 对话',summary.reliability.turns),('工具调用','工具调用',summary.reliability.tools),('文件解析','文件解析',summary.reliability.fileParsing),('应用更新','应用更新',summary.reliability.updates)] %}
+      <section class="health-grid">
+        {% for label, description, metric in reliability_metrics %}<article class="health-card"><svg class="ring" viewBox="0 0 84 84" data-rate="{{ metric.successRate if metric.successRate is not none else 0 }}" aria-hidden="true"><circle class="ring-track" cx="42" cy="42" r="34" pathLength="100"></circle><circle class="ring-meter" cx="42" cy="42" r="34" pathLength="100"></circle></svg><div><h3>{{ label }}</h3><p class="rate-value">{{ percent(metric.successRate) }}</p><div class="health-meta"><span>{{ description }}</span><span>估算事件数：<strong>{{ metric.estimatedEvents }}</strong></span><span>P95 <strong>{{ metric.p95DurationMs if metric.p95DurationMs is not none else '—' }} 毫秒</strong></span></div></div></article>{% endfor %}
+      </section>
+
+      <section class="breakdown-grid">
+        <article class="panel breakdown"><div class="panel-head"><div><h2>工具类别分布</h2><p>按工具类别展示调用量与成功率</p></div></div><div class="bar-list">{% for item in summary.reliability.tools.byCategory %}<div class="bar-row"><span class="bar-name">{{ tool_labels.get(item.dimension, '其他工具') }}</span><progress max="{{ summary.reliability.tools.estimatedEvents if summary.reliability.tools.estimatedEvents else 1 }}" value="{{ item.estimatedEvents }}"></progress><span class="bar-value">{{ item.estimatedEvents }} · {{ percent(item.successRate) }}</span></div>{% else %}<div class="empty">暂无工具调用数据</div>{% endfor %}</div></article>
+        <article class="panel breakdown"><div class="panel-head"><div><h2>解析类型分布</h2><p>不同文件类型的解析结果</p></div></div><div class="bar-list">{% for item in summary.reliability.fileParsing.byType %}<div class="bar-row"><span class="bar-name">{{ file_labels.get(item.dimension, '其他文件') }}</span><progress max="{{ summary.reliability.fileParsing.estimatedEvents if summary.reliability.fileParsing.estimatedEvents else 1 }}" value="{{ item.estimatedEvents }}"></progress><span class="bar-value">{{ item.estimatedEvents }} · {{ percent(item.successRate) }}</span></div>{% else %}<div class="empty">暂无文件解析数据</div>{% endfor %}</div></article>
+      </section>
+      <section class="breakdown-grid" id="agent-error-breakdown">
+        {% set failure_total = summary.reliability.turns.byFailureStage | sum(attribute='estimatedEvents') %}
+        {% set error_total = summary.reliability.turns.byErrorCode | sum(attribute='estimatedEvents') %}
+        <article class="panel breakdown"><div class="panel-head"><div><h2>Agent 出错步骤</h2><p>统计失败、超时和取消发生时所在的执行步骤</p></div></div><div class="bar-list">{% for item in summary.reliability.turns.byFailureStage %}<div class="bar-row"><span class="bar-name">{{ failure_stage_labels.get(item.dimension, '未识别步骤') }}</span><progress max="{{ failure_total if failure_total else 1 }}" value="{{ item.estimatedEvents }}"></progress><span class="bar-value">{{ item.estimatedEvents }}</span></div>{% else %}<div class="empty">暂无 Agent 出错步骤数据</div>{% endfor %}</div></article>
+        <article class="panel breakdown"><div class="panel-head"><div><h2>Agent 错误码</h2><p>按受控错误类型汇总，不展示原始异常内容</p></div></div><div class="bar-list">{% for item in summary.reliability.turns.byErrorCode %}<div class="bar-row"><span class="bar-name">{{ error_code_labels.get(item.dimension, '未识别错误') }}</span><progress max="{{ error_total if error_total else 1 }}" value="{{ item.estimatedEvents }}"></progress><span class="bar-value">{{ item.estimatedEvents }}</span></div>{% else %}<div class="empty">暂无 Agent 错误码数据</div>{% endfor %}</div></article>
+      </section>
+      {% else %}<section class="panel empty" role="status"><h2>稳定性数据暂不可用</h2><p>用户增长数据仍保持隔离并可独立查看。</p></section>{% endif %}
+
+      {% if summary.growth is not none %}
+      <div class="section-title"><div><p class="eyebrow">终端客户端</p><h2>TUI 与 CLI 可观测用户</h2></div><p>按分析专用用户标识去重，不使用事件次数</p></div>
+      {% set client_usage = summary.growth.clientUsage %}
+      <section class="panel trend-panel">
+        <div class="trend-summary"><div><span class="badge">终端并集</span><div class="trend-number">{{ client_usage.totals.terminalUsers }}</div><p class="summary-note">TUI {{ client_usage.totals.tuiUsers }} · CLI {{ client_usage.totals.cliUsers }}</p></div><div class="trend-legend"><div class="legend-item"><span class="legend-label"><i class="legend-swatch"></i>TUI 用户</span><span class="legend-value">{{ client_usage.totals.tuiUsers }}</span></div><div class="legend-item"><span class="legend-label"><i class="legend-swatch" style="background:var(--blue)"></i>CLI 用户</span><span class="legend-value">{{ client_usage.totals.cliUsers }}</span></div></div></div>
+        <div class="trend-side"><div class="panel-head"><div><h2>每日去重用户趋势</h2><p>{{ client_usage.observablePopulationNote }}</p></div><p>{{ start_date }} → {{ end_date }}</p></div><svg id="terminal-trend" viewBox="0 0 960 285" role="img" aria-label="每日 TUI 与 CLI 去重用户趋势图"></svg>{% if client_usage.totals.terminalUsers == 0 %}<p class="chart-empty-note" role="status">当前时间范围暂无已同意且可观测的终端用户。</p>{% endif %}<div id="terminal-trend-data" hidden>{% for point in client_usage.dailyTrend %}<span data-date="{{ point.period }}" data-tui="{{ point.tuiUsers }}" data-cli="{{ point.cliUsers }}"></span>{% endfor %}</div></div>
+      </section>
+      <section class="breakdown-grid">
+        <article class="panel breakdown"><div class="panel-head"><div><h2>终端使用交集</h2><p>同一用户在所选时间范围内的界面覆盖</p></div></div>{% set overlap_max = client_usage.totals.terminalUsers if client_usage.totals.terminalUsers else 1 %}<div class="bar-list">{% for label, value in [('仅 TUI',client_usage.totals.tuiOnly),('仅 CLI',client_usage.totals.cliOnly),('两者都用',client_usage.totals.both)] %}<div class="bar-row"><span class="bar-name">{{ label }}</span><progress max="{{ overlap_max }}" value="{{ value }}"></progress><span class="bar-value">{{ value }}</span></div>{% endfor %}</div></article>
+        <article class="panel breakdown"><div class="panel-head"><div><h2>入口分布</h2><p>每个入口按分析用户去重</p></div></div>{% set entry_max = client_usage.totals.terminalUsers if client_usage.totals.terminalUsers else 1 %}<div class="bar-list">{% for item in client_usage.entrypoints %}<div class="bar-row"><span class="bar-name">{{ entrypoint_labels.get(item.entrypoint, '其他入口') }}</span><progress max="{{ entry_max }}" value="{{ item.users }}"></progress><span class="bar-value">{{ item.users }}</span></div>{% else %}<div class="empty">暂无入口数据</div>{% endfor %}</div></article>
+      </section>
+      <div class="section-title"><div><p class="eyebrow">用户增长</p><h2>用户增长漏斗</h2></div><p>同一批用户、统一窗口、按专用标识去重</p></div>
+      <section class="funnel-grid">
+        {% for title, subtitle, deduplication, journey in [('获客漏斗','从落地页到注册成功','按获客链路去重',summary.growth.acquisition),('激活漏斗','从首次可用到首次成功对话','按分析用户去重',summary.growth.activation)] %}
+        {% set funnel_max = journey.stages[0].deduplicatedCount if journey.stages and journey.stages[0].deduplicatedCount else 1 %}
+        <article class="panel funnel"><div class="panel-head"><div><h2>{{ title }}</h2><p>{{ subtitle }} · {{ deduplication }}</p></div></div><div class="bar-list">{% for stage in journey.stages %}<div class="bar-row"><span class="bar-name">{{ funnel_labels.get(stage.stage, '未识别阶段') }}</span><progress max="{{ funnel_max }}" value="{{ stage.deduplicatedCount }}"></progress><span class="bar-value">{{ stage.deduplicatedCount }}</span></div>{% endfor %}</div><div class="transition-list">{% for transition in journey.transitions %}<span class="transition-chip">{{ funnel_labels.get(transition['from'], '未识别阶段') }} → {{ funnel_labels.get(transition.to, '未识别阶段') }} · {{ transition.windowHours }} 小时 · 流失 <strong>{{ percent(transition.dropoffRate) }}</strong></span>{% endfor %}</div></article>
+        {% endfor %}
+      </section>
+      <section class="panel coverage-panel"><div class="panel-head"><div><h2>安装 → 首次可用关联覆盖</h2><p>只计算账号服务提供显式关联的数据；未关联安装单独展示，不计作流失</p></div></div><div class="coverage-grid">
+        <article class="coverage-card"><svg class="ring" viewBox="0 0 84 84" data-rate="{{ summary.growth.linkedInstallToReady.linkCoverageRate if summary.growth.linkedInstallToReady.linkCoverageRate is not none else 0 }}" aria-hidden="true"><circle class="ring-track" cx="42" cy="42" r="34" pathLength="100"></circle><circle class="ring-meter" cx="42" cy="42" r="34" pathLength="100"></circle></svg><div><h3>关联覆盖率</h3><div class="summary-value">{{ percent(summary.growth.linkedInstallToReady.linkCoverageRate) }}</div><p class="summary-note">{{ summary.growth.linkedInstallToReady.linkableInstallations }} / {{ summary.growth.linkedInstallToReady.eligibleInstallations }} 可关联</p></div></article>
+        <article class="coverage-card"><svg class="ring" viewBox="0 0 84 84" data-rate="{{ summary.growth.linkedInstallToReady.conversionRateAmongLinked if summary.growth.linkedInstallToReady.conversionRateAmongLinked is not none else 0 }}" aria-hidden="true"><circle class="ring-track" cx="42" cy="42" r="34" pathLength="100"></circle><circle class="ring-meter" cx="42" cy="42" r="34" pathLength="100"></circle></svg><div><h3>已关联转化率</h3><div class="summary-value">{{ percent(summary.growth.linkedInstallToReady.conversionRateAmongLinked) }}</div><p class="summary-note">24 小时内首次可用 {{ summary.growth.linkedInstallToReady.readyWithin24Hours }}</p></div></article>
+        <article class="coverage-card"><svg class="ring" viewBox="0 0 84 84" data-rate="0" aria-hidden="true"><circle class="ring-track" cx="42" cy="42" r="34" pathLength="100"></circle><circle class="ring-meter" cx="42" cy="42" r="34" pathLength="100"></circle></svg><div><h3>未关联安装</h3><div class="summary-value">{{ summary.growth.linkedInstallToReady.unlinkedInstallations }}</div><p class="summary-note">不通过网络地址、网卡地址或设备指纹补齐</p></div></article>
+      </div></section>
+      <p class="privacy-note">增长排除规则由上游生产数据隔离执行：内部测试、自动化流量和重复安装不会通过网络或设备指纹强行关联。</p>
+      {% else %}<section class="panel empty" role="status"><h2>用户增长数据暂不可用</h2><p>稳定性数据仍保持隔离并可独立查看。</p></section>{% endif %}
+    </main>
+
+    <script nonce="{{ csp_nonce }}">
+      (() => {
+        const clampRate = value => Math.max(0, Math.min(1, Number(value) || 0));
+        document.querySelectorAll('.ring[data-rate]').forEach(ring => {
+          const meter = ring.querySelector('.ring-meter');
+          if (meter) meter.setAttribute('stroke-dashoffset', String(100 - clampRate(ring.dataset.rate) * 100));
+        });
+        const ns = 'http://www.w3.org/2000/svg';
+        const make = (name, attrs = {}, text = null) => {
+          const node = document.createElementNS(ns, name);
+          Object.entries(attrs).forEach(([key, value]) => node.setAttribute(key, String(value)));
+          if (text !== null) node.textContent = text;
+          return node;
+        };
+        const drawTrend = ({svgSelector, data, series, areaId, areaClass, colors, title}) => {
+          const svg = document.querySelector(svgSelector);
+          if (!svg || !data.length) return;
+          const width = 960, height = 285, left = 46, right = 14, top = 16, bottom = 38;
+          const chartWidth = width - left - right, chartHeight = height - top - bottom;
+          const actualMax = Math.max(0, ...data.flatMap(point => series.map(item => point[item.key])));
+          const maxValue = Math.max(1, actualMax);
+          const x = index => left + (data.length === 1 ? chartWidth / 2 : index / (data.length - 1) * chartWidth);
+          const y = value => top + chartHeight - value / maxValue * chartHeight;
+          const coordinates = key => data.map((point, index) => `${x(index).toFixed(2)},${y(point[key]).toFixed(2)}`);
+          const defs = make('defs');
+          const gradient = make('linearGradient', {id: areaId, x1: 0, y1: 0, x2: 0, y2: 1});
+          gradient.append(make('stop', {offset: 0, 'stop-color': colors[0], 'stop-opacity': .33}));
+          gradient.append(make('stop', {offset: 1, 'stop-color': colors[0], 'stop-opacity': .02}));
+          defs.append(gradient); svg.replaceChildren(defs);
+          for (let index = 0; index <= 4; index += 1) {
+            const gridY = top + chartHeight * index / 4;
+            svg.append(make('line', {class: 'chart-grid', x1: left, y1: gridY, x2: left + chartWidth, y2: gridY}));
+            const axisLabel = actualMax === 0 ? (index === 4 ? '0' : '') : (actualMax <= 4 && index > 0 && index < 4 ? '' : String(Math.round(maxValue * (1 - index / 4))));
+            if (axisLabel) svg.append(make('text', {class: 'chart-axis', x: left - 9, y: gridY + 4, 'text-anchor': 'end'}, axisLabel));
+          }
+          const plotted = series.map(item => ({...item, coordinates: coordinates(item.key)}));
+          svg.append(make('path', {class: areaClass, d: `M ${left} ${top + chartHeight} L ${plotted[0].coordinates.join(' L ')} L ${left + chartWidth} ${top + chartHeight} Z`}));
+          plotted.forEach(item => svg.append(make('polyline', {class: item.lineClass, points: item.coordinates.join(' ')})));
+          const labelIndexes = new Set([0, data.length - 1]);
+          for (let index = 1; index < 4; index += 1) labelIndexes.add(Math.round((data.length - 1) * index / 4));
+          [...labelIndexes].sort((a,b) => a - b).forEach(index => svg.append(make('text', {class: 'chart-axis', x: x(index), y: height - 11, 'text-anchor': index === 0 ? 'start' : (index === data.length - 1 ? 'end' : 'middle')}, data[index].date.slice(5))));
+          if (data.length <= 62) data.forEach((point, index) => {
+            const dot = make('circle', {class: series[0].pointClass, cx: x(index), cy: y(point[series[0].key]), r: 3.2, tabindex: 0});
+            dot.append(make('title', {}, `${point.date} · ${title} ${point[series[0].key]}`)); svg.append(dot);
+          });
+        };
+        const installData = Array.from(document.querySelectorAll('#install-trend-data [data-date]')).map(node => ({date: node.dataset.date, installations: Number(node.dataset.installations) || 0}));
+        drawTrend({svgSelector: '#install-trend', data: installData, series: [{key: 'installations', lineClass: 'chart-installs', pointClass: 'install-point'}], areaId: 'install-area-fill', areaClass: 'install-chart-area', colors: ['#356f9f'], title: '首次安装'});
+        const reliabilityData = Array.from(document.querySelectorAll('#trend-data [data-date]')).map(node => ({date: node.dataset.date, events: Number(node.dataset.events) || 0, issues: Number(node.dataset.issues) || 0}));
+        drawTrend({svgSelector: '#reliability-trend', data: reliabilityData, series: [{key: 'events', lineClass: 'chart-events', pointClass: 'chart-point'}, {key: 'issues', lineClass: 'chart-issues', pointClass: 'chart-point'}], areaId: 'trend-area-fill', areaClass: 'chart-area', colors: ['#43a99d'], title: '稳定性事件'});
+        const terminalData = Array.from(document.querySelectorAll('#terminal-trend-data [data-date]')).map(node => ({date: node.dataset.date, tui: Number(node.dataset.tui) || 0, cli: Number(node.dataset.cli) || 0}));
+        drawTrend({svgSelector: '#terminal-trend', data: terminalData, series: [{key: 'tui', lineClass: 'chart-tui', pointClass: 'chart-point'}, {key: 'cli', lineClass: 'chart-cli', pointClass: 'install-point'}], areaId: 'terminal-area-fill', areaClass: 'terminal-chart-area', colors: ['#43a99d'], title: 'TUI 用户'});
+      })();
+    </script>
+  </body>
+</html>
