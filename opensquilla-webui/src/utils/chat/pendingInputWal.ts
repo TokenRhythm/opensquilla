@@ -503,7 +503,15 @@ class BrowserPendingInputWal implements PendingInputWal {
         transaction.abort()
         throw new Error('Response handoff no longer exists')
       }
-      if (rawHandoff.walOwnerId && rawHandoff.state !== 'accepted') {
+      const releasesFailedOwnerToSource = (
+        rawHandoff.state === 'failed'
+        && acceptedSessionKey === rawHandoff.requestSessionKey
+      )
+      if (
+        rawHandoff.walOwnerId
+        && rawHandoff.state !== 'accepted'
+        && !releasesFailedOwnerToSource
+      ) {
         transaction.abort()
         throw new Error('Response handoff is not durably accepted')
       }

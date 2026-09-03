@@ -201,6 +201,9 @@ interface SendAttempt {
   }
   acceptanceResolved?: boolean
   acceptanceInFlight?: boolean
+  /** A background receipt was rejected and only its durable retirement remains. */
+  backgroundRejectionPending?: boolean
+  backgroundRejectionError?: unknown
   acceptedTaskId?: string
   acceptedSessionKey?: string
   stopAbortPromise?: Promise<boolean> | null
@@ -257,6 +260,8 @@ interface DispatchSendOptions {
   suppressRejectedFailureMessage?: boolean
   /** Resolve an older receipt without claiming or mutating the visible stream. */
   backgroundReceiptReplay?: boolean
+  /** The rejected background receipt and its queue owner were durably retired. */
+  onBackgroundRejectionRetired?: () => void
   /** Preserve an explicit empty attachment list on the chat.send wire. */
   includeEmptyAttachments?: boolean
   /** Revalidate protocol-owned sends after every awaited pre-dispatch step. */
@@ -1471,6 +1476,20 @@ export function useChatSend(options: UseChatSendOptions) {
         ]!
         recoveryAttempt += 1
         await new Promise<void>(resolve => globalThis.setTimeout(resolve, delayMs))
+        if (attempt.backgroundRejectionPending) {
+          if (!await retireAttemptBackgroundRejection(
+            attempt,
+            attempt.backgroundRejectionError,
+          )) continue
+          attempt.backgroundRejectionPending = false
+          attempt.backgroundRejectionError = undefined
+          attempt.acceptanceResolved = true
+          if (attempt.stopRequested) clearAttemptStop(attempt)
+          if (recoveredAttempt?.clientRequestId === attempt.clientRequestId) {
+            recoveredAttempt = null
+          }
+          return
+        }
         if (attempt.acceptanceResolved) {
           if (await abortRecoveredAcceptedTask(attempt)) return
           continue
@@ -1512,6 +1531,13 @@ export function useChatSend(options: UseChatSendOptions) {
             continue
           }
           if (rpcError?.accepted === false) {
+            if (backgroundReceiptReplayStarted) {
+              attempt.backgroundRejectionPending = true
+              attempt.backgroundRejectionError = error
+              if (!await retireAttemptBackgroundRejection(attempt, error)) continue
+              attempt.backgroundRejectionPending = false
+              attempt.backgroundRejectionError = undefined
+            }
             attempt.acceptanceResolved = true
             if (attempt.stopRequested) clearAttemptStop(attempt)
             if (
@@ -1973,12 +1999,12 @@ export function useChatSend(options: UseChatSendOptions) {
     return finalized
   }
 
-  async function markResponseHandoffFailed(
+  async function persistResponseHandoffFailed(
     gate: ResponseHandoffGate,
     error: unknown,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const current = gate.durableRecord
-    if (!current) return
+    if (!current || current.state === 'failed') return true
     const failed: ResponseHandoffWalRecord = {
       ...current,
       state: 'failed',
@@ -1997,12 +2023,87 @@ export function useChatSend(options: UseChatSendOptions) {
         current.walRevision,
         failed,
       ).catch(() => null)
-      if (transition?.applied && transition.record) gate.durableRecord = transition.record
-    } else if (options.pendingInputWal?.putHandoff) {
-      gate.durableRecord = failed
-      await options.pendingInputWal.putHandoff(failed).catch(() => {})
+      if (!transition?.applied || !transition.record) return false
+      gate.durableRecord = transition.record
+      return true
     }
+    if (!options.pendingInputWal?.putHandoff) return false
+    try {
+      await options.pendingInputWal.putHandoff(failed)
+      gate.durableRecord = failed
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  async function markResponseHandoffFailed(
+    gate: ResponseHandoffGate,
+    error: unknown,
+  ): Promise<void> {
+    await persistResponseHandoffFailed(gate, error)
     await options.failPendingQueueHandoff?.(gate.ownerRequestId)
+  }
+
+  async function retireRejectedBackgroundResponseHandoff(
+    gate: ResponseHandoffGate,
+    error: unknown,
+  ): Promise<boolean> {
+    gate.backgroundOnly = true
+    if (!await persistResponseHandoffFailed(gate, error)) return false
+    if (
+      options.sessionKey.value === gate.requestSessionKey
+      && options.hasPendingQueueWork?.() !== true
+    ) {
+      options.schedulePendingDrainAfterTerminal()
+    }
+    const queueReleased = await options.recoverPendingQueueHandoff?.(
+      gate.requestSessionKey,
+      gate.requestSessionKey,
+      gate.ownerRequestId,
+    ).catch(() => false)
+    if (queueReleased !== true) return false
+    if (gate.durableRecord) {
+      if (!await deleteResponseHandoff(gate.durableRecord)) return false
+      gate.durableRecord = null
+    }
+    gate.backgroundFinalized = true
+    return true
+  }
+
+  async function retireAttemptBackgroundRejection(
+    attempt: SendAttempt,
+    error: unknown,
+  ): Promise<boolean> {
+    const wal = options.pendingInputWal
+    if (!wal?.listHandoffs) return false
+    let records: ResponseHandoffWalRecord[]
+    try {
+      records = await wal.listHandoffs(attempt.requestSessionKey)
+    } catch {
+      return false
+    }
+    const record = records.find(candidate => (
+      candidate.ownerRequestId === attempt.clientRequestId
+      && candidate.clientRequestId === attempt.clientRequestId
+      && candidate.clientMessageId === attempt.clientMessageId
+    ))
+    if (!record) return true
+    const gate: ResponseHandoffGate = {
+      requestSessionKey: attempt.requestSessionKey,
+      ownerRequestId: attempt.clientRequestId,
+      targetSessionKey: null,
+      stoppedByUser: attempt.stopRequested === true,
+      acceptedTaskId: attempt.acceptedTaskId || '',
+      terminalResponse: false,
+      authoritativeIdle: false,
+      backgroundOnly: true,
+      backgroundFinalized: false,
+      durableRecord: record,
+    }
+    const retired = await retireRejectedBackgroundResponseHandoff(gate, error)
+    releaseBackgroundResponseHandoffParent(gate)
+    return retired
   }
 
   async function resetResponseHandoffForRetry(
@@ -2207,7 +2308,8 @@ export function useChatSend(options: UseChatSendOptions) {
 
   async function retireFailedBackgroundHandoff(
     record: ResponseHandoffWalRecord,
-  ): Promise<void> {
+    rejectionError?: unknown,
+  ): Promise<boolean> {
     const gate = beginResponseHandoff(
       record.requestSessionKey,
       record.ownerRequestId,
@@ -2215,6 +2317,9 @@ export function useChatSend(options: UseChatSendOptions) {
     )
     gate.backgroundOnly = true
     try {
+      if (rejectionError !== undefined) {
+        return retireRejectedBackgroundResponseHandoff(gate, rejectionError)
+      }
       if (
         options.sessionKey.value === gate.requestSessionKey
         && options.hasPendingQueueWork?.() !== true
@@ -2226,10 +2331,11 @@ export function useChatSend(options: UseChatSendOptions) {
         gate.requestSessionKey,
         gate.ownerRequestId,
       ).catch(() => false)
-      if (queueReleased !== true) return
-      if (!await deleteResponseHandoff(record)) return
+      if (queueReleased !== true) return false
+      if (!await deleteResponseHandoff(record)) return false
       gate.durableRecord = null
       gate.backgroundFinalized = true
+      return true
     } finally {
       finishResponseHandoff(gate)
     }
@@ -2271,6 +2377,12 @@ export function useChatSend(options: UseChatSendOptions) {
 
   function recoverResponseHandoffs(): Promise<void> {
     if (handoffRecoveryPromise) return handoffRecoveryPromise
+    let backgroundReceiptClientMessageId = ''
+    const finishBackgroundReceiptRecovery = () => {
+      const clientMessageId = backgroundReceiptClientMessageId
+      backgroundReceiptClientMessageId = ''
+      if (clientMessageId) options.finishBackgroundReceiptReplay?.(clientMessageId)
+    }
     const operation = (async () => {
       const wal = options.pendingInputWal
       if (!wal?.listHandoffs || activeResponseHandoff) return
@@ -2307,6 +2419,13 @@ export function useChatSend(options: UseChatSendOptions) {
             await finalizeRecoveredHandoff(record, record.acceptedSessionKey)
           }
           continue
+        }
+        if (record.backgroundOnly) {
+          options.beginBackgroundReceiptReplay?.(
+            record.clientMessageId,
+            options.messageEditActive?.value === true,
+          )
+          backgroundReceiptClientMessageId = record.clientMessageId
         }
         let replayRecord = record
         let refreshedExpiredAttachments = false
@@ -2374,7 +2493,9 @@ export function useChatSend(options: UseChatSendOptions) {
                 continue
               }
             }
-            if (definitelyRejected && rpcError?.retryable === false) {
+            if (definitelyRejected && replayRecord.backgroundOnly) {
+              await retireFailedBackgroundHandoff(replayRecord, error)
+            } else if (definitelyRejected && rpcError?.retryable === false) {
               await wal.putHandoff?.({
                 ...replayRecord,
                 state: 'failed',
@@ -2387,13 +2508,15 @@ export function useChatSend(options: UseChatSendOptions) {
                 { tone: 'danger' },
               )
             }
-            // Unknown/retryable acceptance deliberately remains submitting
-            // and is replayed byte-for-byte after the next reconnect.
+            // Unknown acceptance, and retryable foreground rejection,
+            // remain submitting for the next reconnect.
             break
           }
         }
+        finishBackgroundReceiptRecovery()
       }
     })().finally(() => {
+      finishBackgroundReceiptRecovery()
       handoffRecoveryPromise = null
     })
     handoffRecoveryPromise = operation
@@ -2864,6 +2987,7 @@ export function useChatSend(options: UseChatSendOptions) {
         && !validateAttemptMessageEditTranscript(exactReplayAttempt)
       ) return
       if (replayBlockedReason?.value) return
+      let rejectedReplayRetired = false
       const replayOutcome = await dispatchSend(exactReplayAttempt.text, {
         composerText,
         composerSnapshot: replayComposerSnapshot,
@@ -2886,6 +3010,9 @@ export function useChatSend(options: UseChatSendOptions) {
         preserveComposer: preserveUnrelatedBranch,
         suppressRejectedFailureMessage: preserveUnrelatedBranch,
         backgroundReceiptReplay: preserveUnrelatedBranch,
+        onBackgroundRejectionRetired: () => {
+          rejectedReplayRetired = true
+        },
         preDispatchGuard: stage => (
           forkSnapshotPreDispatchAllowed(
             replayComposerSnapshot,
@@ -2904,7 +3031,10 @@ export function useChatSend(options: UseChatSendOptions) {
           )
         ),
       })
-      if (!replayingSupersededEditOwner || replayOutcome !== 'accepted') return
+      if (
+        !replayingSupersededEditOwner
+        || (replayOutcome !== 'accepted' && !rejectedReplayRetired)
+      ) return
       if (
         options.sessionKey.value !== requestSessionKey
         || !sameComposerOwnershipSnapshot(captureComposerSnapshot(), replayComposerSnapshot)
@@ -3816,6 +3946,7 @@ export function useChatSend(options: UseChatSendOptions) {
     // pending cards without creating a duplicate message.
     setAttemptPromptAnnotations(attempt, attempt.promptAnnotations)
 
+    let backgroundRejectionRetired = false
     try {
       const stagedPendingItem = serverStagedPendingItem
       const acceptanceRequest = attempt.acceptanceRequest?.request || (
@@ -4253,6 +4384,30 @@ export function useChatSend(options: UseChatSendOptions) {
         bindUserMessageId(attempt.clientMessageId, acceptedError.messageId)
         options.scheduleHistorySync()
       }
+      if (
+        responseHandoff
+        && rpcError?.accepted === false
+        && backgroundReceiptReplay
+      ) {
+        backgroundRejectionRetired = await retireRejectedBackgroundResponseHandoff(
+          responseHandoff,
+          err,
+        )
+        if (backgroundRejectionRetired) {
+          attempt.backgroundRejectionPending = false
+          attempt.backgroundRejectionError = undefined
+          if (recoveredAttempt?.clientRequestId === attempt.clientRequestId) {
+            recoveredAttempt = null
+          }
+          sendOpts.onBackgroundRejectionRetired?.()
+        } else {
+          attempt.acceptanceResolved = false
+          attempt.backgroundRejectionPending = true
+          attempt.backgroundRejectionError = err
+          recoveredAttempt = attempt
+          scheduleAcceptanceRecovery(attempt)
+        }
+      }
       if (options.sessionKey.value !== requestSessionKey) {
         rememberRetryableAttempt(false)
         recordSessionNavigationDiag('send.error.stale', {
@@ -4275,9 +4430,13 @@ export function useChatSend(options: UseChatSendOptions) {
         options.stream.endStreaming()
       }
       if (responseHandoff && rpcError?.accepted === false) {
-        if (sendOpts.requirePreparedHandoff && rpcError.retryable !== false) {
+        if (
+          !backgroundReceiptReplay
+          && sendOpts.requirePreparedHandoff
+          && rpcError.retryable !== false
+        ) {
           await resetResponseHandoffForRetry(responseHandoff, attempt)
-        } else if (rpcError.retryable === false) {
+        } else if (!backgroundReceiptReplay && rpcError.retryable === false) {
           await markResponseHandoffFailed(responseHandoff, err)
         }
       }
@@ -4293,7 +4452,7 @@ export function useChatSend(options: UseChatSendOptions) {
         // owner's transcript.
         return acceptedError ? 'accepted' : 'retryable_failure'
       }
-      rememberRetryableAttempt(true)
+      if (!backgroundRejectionRetired) rememberRetryableAttempt(true)
       if (
         acceptedError
         || (!backgroundReceiptReplay && !sendOpts.suppressRejectedFailureMessage)
