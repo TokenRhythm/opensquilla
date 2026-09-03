@@ -157,6 +157,31 @@ def _require_expected_session_owner(
         raise StaleEpochError(f"Session owner changed before {operation}")
 
 
+def _require_compatible_session_owner(
+    node: SessionNode,
+    *,
+    expected_session_id: str | None,
+    expected_session_epoch: int | None,
+    operation: str,
+) -> None:
+    """Fence an optional owner while retaining legacy id-only callers."""
+
+    if expected_session_epoch is not None:
+        _require_expected_session_owner(
+            node,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+            operation=operation,
+        )
+        return
+    if expected_session_id is None:
+        return
+    if not isinstance(expected_session_id, str) or not expected_session_id:
+        raise ValueError("expected_session_id must be a non-empty string")
+    if node.session_id != expected_session_id:
+        raise StaleEpochError(f"Session owner changed before {operation}")
+
+
 def _acquire_compaction_singleflight(
     key: _CompactionSingleflightKey,
     *,
@@ -883,11 +908,25 @@ class SessionManager:
         node = await self.create(session_key, agent_id=agent_id, **kwargs)
         return node, True
 
-    async def get_session(self, session_key: str) -> SessionNode | None:
-        """Return the session node for ``session_key`` without mutating it."""
+    async def get_session(
+        self,
+        session_key: str,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> SessionNode | None:
+        """Return a session node, optionally fenced to an admitted owner."""
 
         session_key = canonicalize_session_key(session_key)
-        return await self._storage.get_session(session_key)
+        node = await self._storage.get_session(session_key)
+        if node is not None:
+            _require_compatible_session_owner(
+                node,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+                operation="session read",
+            )
+        return node
 
     async def get_agent_config(self, agent_id: str) -> dict[str, Any] | None:
         """Return the registry entry for ``agent_id``, or None when unavailable.
@@ -948,10 +987,18 @@ class SessionManager:
         self,
         session_key: str,
         limit: int | None = None,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> list[dict[str, Any]]:
         """Return JSON-serializable transcript entries for a session."""
         session_key = canonicalize_session_key(session_key)
-        entries = await self.get_transcript(session_key, limit=limit)
+        entries = await self.get_transcript(
+            session_key,
+            limit=limit,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+        )
         return [entry.model_dump(mode="json") for entry in entries]
 
     async def inject_message(
@@ -1216,7 +1263,7 @@ class SessionManager:
         node = await self._storage.get_session(session_key)
         if node is None:
             raise KeyError(f"Session not found: {session_key}")
-        _require_expected_session_owner(
+        _require_compatible_session_owner(
             node,
             expected_session_id=expected_session_id,
             expected_session_epoch=expected_session_epoch,
@@ -1226,15 +1273,12 @@ class SessionManager:
             if hasattr(node, k):
                 setattr(node, k, v)
         node.updated_at = _now_ms()
+        upsert_owner: dict[str, Any] = {"expected_session_id": node.session_id}
+        if expected_session_epoch is not None:
+            upsert_owner["expected_session_epoch"] = expected_session_epoch
         await self._storage.upsert_session(
             node,
-            expected_session_id=node.session_id,
-            expected_session_epoch=(
-                expected_session_epoch
-                if expected_session_id is not None
-                or expected_session_epoch is not None
-                else None
-            ),
+            **upsert_owner,
         )
         return node
 
@@ -1242,21 +1286,33 @@ class SessionManager:
         self,
         session_key: str,
         status: str = SessionStatus.DONE,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> SessionNode:
         """Mark a session as finished; set ended_at and runtime_ms."""
         session_key = canonicalize_session_key(session_key)
         node = await self._storage.get_session(session_key)
         if node is None:
             raise KeyError(f"Session not found: {session_key}")
+        _require_compatible_session_owner(
+            node,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+            operation="finish",
+        )
         now = _now_ms()
         node.status = status
         node.ended_at = now
         node.updated_at = now
         if node.started_at:
             node.runtime_ms = now - node.started_at
+        upsert_owner: dict[str, Any] = {"expected_session_id": node.session_id}
+        if expected_session_epoch is not None:
+            upsert_owner["expected_session_epoch"] = expected_session_epoch
         await self._storage.upsert_session(
             node,
-            expected_session_id=node.session_id,
+            **upsert_owner,
         )
         self.evict_session_runtime_state(
             session_key,
@@ -2175,7 +2231,7 @@ class SessionManager:
         owner_supplied = (
             expected_session_id is not None or expected_session_epoch is not None
         )
-        if owner_supplied and (
+        if expected_session_epoch is not None and (
             not isinstance(expected_session_id, str)
             or not expected_session_id.strip()
             or isinstance(expected_session_epoch, bool)
@@ -2185,23 +2241,35 @@ class SessionManager:
             raise ValueError(
                 "expected_session_id and expected_session_epoch must form a valid pair"
             )
+        if expected_session_epoch is None and expected_session_id is not None and (
+            not isinstance(expected_session_id, str) or not expected_session_id.strip()
+        ):
+            raise ValueError("expected_session_id must be a non-empty string")
         owner_node: SessionNode | None = None
         if owner_supplied:
             session_key = canonicalize_session_key(session_key)
             owner_node = await self._storage.get_session(session_key)
-            if (
-                owner_node is None
-                or owner_node.session_id != expected_session_id
-                or int(owner_node.epoch or 0) != expected_session_epoch
-            ):
+            owner_matches = owner_node is not None and (
+                owner_node.session_id == expected_session_id
+                and (
+                    expected_session_epoch is None
+                    or int(owner_node.epoch or 0) == expected_session_epoch
+                )
+            )
+            if not owner_matches:
+                expected_owner = (
+                    f"{expected_session_id}@{expected_session_epoch}"
+                    if expected_session_epoch is not None
+                    else str(expected_session_id)
+                )
                 actual_owner = (
                     "missing"
                     if owner_node is None
                     else f"{owner_node.session_id}@{int(owner_node.epoch or 0)}"
                 )
                 raise StaleEpochError(
-                    f"Session owner mismatch for {session_key}: expected "
-                    f"{expected_session_id}@{expected_session_epoch}, got {actual_owner}"
+                    f"Session owner mismatch for {session_key}: "
+                    f"expected {expected_owner}, got {actual_owner}"
                 )
 
         if message_id is not None and assistant_message_id is not None:
@@ -2349,7 +2417,7 @@ class SessionManager:
         node = await self._storage.get_session(session_key)
         if node is None:
             raise KeyError(f"Session not found: {session_key}")
-        _require_expected_session_owner(
+        _require_compatible_session_owner(
             node,
             expected_session_id=expected_session_id,
             expected_session_epoch=expected_session_epoch,
@@ -2360,7 +2428,7 @@ class SessionManager:
             current = await self._storage.get_session(session_key)
             if current is None:
                 raise StaleEpochError("Session owner changed during transcript read")
-            _require_expected_session_owner(
+            _require_compatible_session_owner(
                 current,
                 expected_session_id=expected_session_id,
                 expected_session_epoch=expected_session_epoch,

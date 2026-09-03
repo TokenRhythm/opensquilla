@@ -262,6 +262,9 @@ class ToolContext:
         default_factory=dict,
         repr=False,
     )
+    # Immutable durable session id admitted with this turn. Kept at the
+    # positional tail; ``session_epoch`` above is its legacy-added companion.
+    session_id: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         # A restricted turn's ceiling is an authority boundary, not a policy

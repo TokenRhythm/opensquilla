@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from opensquilla.gateway.routing import tool_context_from_envelope
+from opensquilla.gateway.routing import RouteEnvelope, SourceKind, tool_context_from_envelope
 from opensquilla.provider.correlation_context import bind_provider_request_correlation
 from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.sandbox.run_context import (
@@ -603,6 +603,23 @@ async def test_sessions_spawn_freezes_child_owner_across_persist_enqueue_reset()
             self.admitted = SimpleNamespace(session_id="child-owner-old", epoch=2)
             self.current = self.admitted
             self.append_owner = None
+            self.parent_reads: list[tuple[str | None, int | None]] = []
+
+        async def get_session(
+            self,
+            session_key: str,
+            *,
+            expected_session_id: str | None = None,
+            expected_session_epoch: int | None = None,
+        ) -> SimpleNamespace:
+            assert session_key == "agent:caller:main"
+            self.parent_reads.append((expected_session_id, expected_session_epoch))
+            return SimpleNamespace(
+                session_key=session_key,
+                session_id="parent-owner-old",
+                epoch=4,
+                workspace_id=None,
+            )
 
         async def create(self, **kwargs):
             self.created.append(kwargs)
@@ -622,19 +639,35 @@ async def test_sessions_spawn_freezes_child_owner_across_persist_enqueue_reset()
     runtime = _StubTaskRuntime()
     sessions_tool.set_session_manager(manager)
     sessions_tool.set_task_runtime(runtime)
-    token = current_tool_context.set(_ctx())
+    parent_context = tool_context_from_envelope(
+        RouteEnvelope(
+            source_kind=SourceKind.WEB,
+            source_name="test",
+            agent_id="caller",
+            session_key="agent:caller:main",
+            session_id="parent-owner-old",
+            metadata={"task_id": "task-parent"},
+            session_epoch=4,
+        ),
+        is_owner=True,
+    )
+    token = current_tool_context.set(parent_context)
     try:
         await sessions_tool.sessions_spawn(agent_id="worker", task="fenced child")
     finally:
         current_tool_context.reset(token)
 
     envelope = runtime.enqueued[0]["envelope"]
+    assert manager.parent_reads == [("parent-owner-old", 4)]
     assert manager.append_owner == ("child-owner-old", 2)
     assert (manager.current.session_id, manager.current.epoch) == (
         "child-owner-new",
         3,
     )
     assert (envelope.session_id, envelope.session_epoch) == ("child-owner-old", 2)
+    assert envelope.metadata["parent_session_id"] == "parent-owner-old"
+    assert envelope.metadata["parent_session_epoch"] == 4
+    assert manager.created[0]["origin"]["task_id"] == runtime.enqueued[0]["task_id"]
     assert runtime.enqueued[0]["persisted_user_message_id"] == "child-input-old"
 
 

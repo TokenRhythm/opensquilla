@@ -374,6 +374,8 @@ def build_subagent_route_envelope(
     agent_id: str | None = None,
     session_id: str | None = None,
     session_epoch: int | None = None,
+    parent_session_id: str | None = None,
+    parent_session_epoch: int | None = None,
     run_id: str | None = None,
     parent_task_id: str | None = None,
     spawn_depth: int = 0,
@@ -393,6 +395,14 @@ def build_subagent_route_envelope(
         "spawn_depth": spawn_depth,
         "origin": origin,
     }
+    if isinstance(parent_session_id, str) and parent_session_id:
+        metadata["parent_session_id"] = parent_session_id
+    if (
+        isinstance(parent_session_epoch, int)
+        and not isinstance(parent_session_epoch, bool)
+        and parent_session_epoch >= 0
+    ):
+        metadata["parent_session_epoch"] = parent_session_epoch
     if principal_is_owner is not None:
         metadata["principal_is_owner"] = bool(principal_is_owner)
     if principal_host_execute is not None:
@@ -722,6 +732,7 @@ def tool_context_from_envelope(
         sandbox_mounts=sandbox_mounts,
         sandbox_run_context=sandbox_run_context,
         session_key=envelope.session_key,
+        session_epoch=envelope.session_epoch,
         channel_kind=envelope.channel_name or envelope.channel_type,
         channel_id=envelope.channel_id,
         sender_id=envelope.sender_id,
@@ -776,6 +787,7 @@ def tool_context_from_envelope(
         turn_cleanup_callbacks=list(
             envelope.runtime_services.get("turn_cleanup_callbacks") or ()
         ),
+        session_id=envelope.session_id,
     )
     if sandbox_run_context_fresh:
         # Runtime-only authority marker copied from the RouteEnvelope field,

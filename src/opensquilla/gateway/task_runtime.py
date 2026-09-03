@@ -755,6 +755,12 @@ class SubagentCompletionEvent:
     parent_task_id: str | None = None
     error_class: str | None = None
     error_message: str | None = None
+    # Immutable child and parent incarnations captured at durable admission.
+    # Optional fields retain ownerless and id-only event compatibility.
+    child_session_id: str | None = None
+    child_session_epoch: int | None = None
+    parent_session_id: str | None = None
+    parent_session_epoch: int | None = None
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -2591,6 +2597,8 @@ class TaskRuntime:
                 task_id=task_id,
                 task_status=AgentTaskStatus.QUEUED,
                 run_kind=run_kind,
+                session_id=envelope.session_id,
+                session_epoch=envelope.session_epoch,
             )
         )
 
@@ -6161,6 +6169,8 @@ class TaskRuntime:
                 task_id=task.task_id,
                 task_status=AgentTaskStatus.RUNNING,
                 run_kind=task.run_kind,
+                session_id=task.envelope.session_id,
+                session_epoch=task.envelope.session_epoch,
             )
         )
         return True
@@ -6606,6 +6616,8 @@ class TaskRuntime:
                     task_id=task.task_id,
                     task_status=status,
                     run_kind=task.run_kind,
+                    session_id=task.envelope.session_id,
+                    session_epoch=task.envelope.session_epoch,
                     terminal_reason=terminal_reason,
                     error_class=error_class,
                     error_message=error_message,
@@ -6974,6 +6986,10 @@ class TaskRuntime:
             parent_task_id=task.envelope.metadata.get("parent_task_id"),
             error_class=error_class,
             error_message=error_message,
+            child_session_id=task.envelope.session_id,
+            child_session_epoch=task.envelope.session_epoch,
+            parent_session_id=task.envelope.metadata.get("parent_session_id"),
+            parent_session_epoch=task.envelope.metadata.get("parent_session_epoch"),
         )
         try:
             await self._terminal_listener(event)

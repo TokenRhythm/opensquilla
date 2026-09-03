@@ -1756,6 +1756,8 @@ def _make_task_session_lifecycle_listener(
                         if event.phase == "running"
                         else "task_terminal"
                     ),
+                    session_id=event.session_id,
+                    epoch=event.session_epoch,
                     changed_task=task_state,
                 ),
             )
@@ -1806,6 +1808,8 @@ def _make_task_session_lifecycle_listener(
             build_sessions_changed_payload(
                 event.session_key,
                 reason,
+                session_id=event.session_id,
+                epoch=event.session_epoch,
                 status=getattr(session_status, "value", session_status),
                 run_status=(
                     active_task["status"]
