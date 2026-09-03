@@ -128,7 +128,6 @@ _WEBUI_ARCHITECTURE_TEST_TARGETS: Final = frozenset(
 )
 _WEBUI_BOUNDARY_PREFIXES: Final = (
     "opensquilla-webui/scripts/lib/",
-    "opensquilla-webui/scripts/rpc-debt/",
     "opensquilla-webui/src/adapters/gateway/",
     "opensquilla-webui/src/contracts/",
     "opensquilla-webui/src/modules/",

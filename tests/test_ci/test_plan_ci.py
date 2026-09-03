@@ -490,6 +490,7 @@ def test_generic_webui_change_does_not_wake_desktop_matrix(
 @pytest.mark.parametrize(
     "path",
     [
+        "contracts/gateway/v4/compatibility-manifest.generated.json",
         "contracts/gateway/v4/sandbox/sandbox-runtime-status.schema.json",
         "contracts/gateway/v4/sessions/sessions-list.schema.json",
         "contracts/gateway/v4/sessions/sessions-changed.schema.json",
@@ -532,7 +533,6 @@ def test_gateway_contract_changes_run_deterministic_generation(
     "path",
     [
         "opensquilla-webui/scripts/lib/rpc-architecture-gate.mjs",
-        "opensquilla-webui/scripts/rpc-debt/session-chat.mjs",
         "opensquilla-webui/src/adapters/gateway/sessionConversationV4.ts",
         "opensquilla-webui/src/modules/sessionConversation.ts",
         "opensquilla-webui/src/platform/desktop.ts",
@@ -553,6 +553,19 @@ def test_webui_boundary_changes_run_python_architecture_contracts(
         "tests/test_ci/test_architecture_import_contracts.py",
         "tests/test_ci/test_rpc_architecture_contracts.py",
     } <= set(plan["python_targets"])
+
+
+def test_webui_boundary_prefix_registry_is_explicit_and_current() -> None:
+    assert MODULE["_WEBUI_BOUNDARY_PREFIXES"] == (
+        "opensquilla-webui/scripts/lib/",
+        "opensquilla-webui/src/adapters/gateway/",
+        "opensquilla-webui/src/contracts/",
+        "opensquilla-webui/src/modules/",
+        "opensquilla-webui/src/platform/",
+        "opensquilla-webui/src/types/",
+        "src/opensquilla/contracts/",
+        "src/opensquilla/gateway/adapters/",
+    )
 
 
 def test_artifact_workbench_application_runs_full_python_architecture_suite(

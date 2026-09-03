@@ -5,9 +5,6 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { evaluateRpcArchitectureGate } from '../../scripts/lib/rpc-architecture-gate.mjs'
 
-type Debt = Record<string, Record<string, number>>
-type DebtLane = { lane: string; debt: Debt }
-
 const roots: string[] = []
 
 afterEach(() => {
@@ -33,51 +30,63 @@ function seededFixture(feature: string, extra: Record<string, string> = {}): str
   })
 }
 
-const oneCallLane: DebtLane[] = [{
-  lane: 'fixture',
-  debt: { 'src/feature.ts': { call: 1 } },
-}]
-
-describe('transport architecture gate ledger integration', () => {
-  it('accepts an exact seeded ledger', () => {
+describe('transport architecture hard-zero integration', () => {
+  it('rejects every raw RPC operation outside its private boundary', () => {
     const root = seededFixture(`
       import { useRpcStore } from './stores/rpc'
       const rpc = useRpcStore()
       rpc.call('feature.get')
     `)
-    expect(evaluateRpcArchitectureGate({ root, debtLanes: oneCallLane })).toMatchObject({
-      failures: [],
+    const result = evaluateRpcArchitectureGate({ root })
+
+    expect(result).toMatchObject({
       total: 1,
       rpcTotal: 1,
       httpTotal: 0,
     })
+    expect(Object.keys(result).sort()).toEqual([
+      'failures',
+      'httpTotal',
+      'rpcTotal',
+      'total',
+    ])
+    expect(result.failures).toContain(
+      'src/feature.ts: unexpected raw transport call (1); add a domain Adapter instead.',
+    )
   })
 
-  it('fails when the count changes', () => {
+  it('groups every forbidden operation by file and kind', () => {
     const root = seededFixture(`
       import { useRpcStore } from './stores/rpc'
       const rpc = useRpcStore()
       rpc.call('feature.get')
       rpc.call('feature.refresh')
     `)
-    expect(evaluateRpcArchitectureGate({ root, debtLanes: oneCallLane }).failures).toContain(
-      'src/feature.ts: raw transport call count is 2; lane debt requires 1.',
+    expect(evaluateRpcArchitectureGate({ root }).failures).toContain(
+      'src/feature.ts: unexpected raw transport call (2); add a domain Adapter instead.',
     )
   })
 
-  it('fails on an unapproved new file', () => {
-    const root = seededFixture(`
-      import { useRpcStore } from './stores/rpc'
-      useRpcStore().call('feature.get')
-    `, {
-      'src/extra.ts': `
-        import { useRpcStore } from './stores/rpc'
-        useRpcStore().call('extra.get')
+  it('sorts whole-tree failures independently of source creation order', () => {
+    const root = fixture({
+      'src/zeta.ts': `
+        import type { RpcClient } from './lib/rpc'
+        declare const rpc: RpcClient
+        rpc.call('zeta.get')
+      `,
+      'src/lib/rpc.ts': `
+        export interface RpcClient { call(method: string): unknown }
+      `,
+      'src/alpha.ts': `
+        import type { RpcClient } from './lib/rpc'
+        declare const rpc: RpcClient
+        rpc.call('alpha.get')
       `,
     })
-    expect(evaluateRpcArchitectureGate({ root, debtLanes: oneCallLane }).failures).toContain(
-      'src/extra.ts: unexpected raw transport call (1); add a domain Adapter instead.',
-    )
+    expect(evaluateRpcArchitectureGate({ root }).failures).toEqual([
+      'src/alpha.ts: unexpected raw transport call (1); add a domain Adapter instead.',
+      'src/zeta.ts: unexpected raw transport call (1); add a domain Adapter instead.',
+    ])
   })
 
   it('analyzes RPC provenance from Vue script setup blocks', () => {
@@ -92,7 +101,7 @@ describe('transport architecture gate ledger integration', () => {
         </script>
       `,
     })
-    expect(evaluateRpcArchitectureGate({ root, debtLanes: [] }).failures).toContain(
+    expect(evaluateRpcArchitectureGate({ root }).failures).toContain(
       'src/views/FeatureView.vue: unexpected raw transport call (1); add a domain Adapter instead.',
     )
   })
@@ -102,7 +111,7 @@ describe('transport architecture gate ledger integration', () => {
       import { useRpcStore } from './stores/rpc'
       useRpcStore().call('sessions.search')
     `)
-    expect(evaluateRpcArchitectureGate({ root, debtLanes: oneCallLane }).failures).toContain(
+    expect(evaluateRpcArchitectureGate({ root }).failures).toContain(
       'src/feature.ts: sessions.search wire literal is allowed only in its Contract Adapter.',
     )
   })
@@ -114,37 +123,13 @@ describe('transport architecture gate ledger integration', () => {
     const root = seededFixture(`export const leakedEvent = '${wireName}'`, {
       'src/adapters/gateway/eventsV4.ts': `export const wireEvent = '${wireName}'`,
     })
-    const failures = evaluateRpcArchitectureGate({ root, debtLanes: [] }).failures
+    const failures = evaluateRpcArchitectureGate({ root }).failures
 
     expect(failures).toContain(
       `src/feature.ts: ${wireName} wire literal is allowed only in a Gateway Adapter, generated Contract, or test.`,
     )
     expect(failures.some(failure => failure.includes('src/adapters/gateway/eventsV4.ts')))
       .toBe(false)
-  })
-
-  it('fails when a paid-down entry remains in the ledger', () => {
-    const root = seededFixture('export const value = 1')
-    expect(evaluateRpcArchitectureGate({ root, debtLanes: oneCallLane }).failures).toContain(
-      'src/feature.ts: stale raw transport call debt (1); remove it from its lane file.',
-    )
-  })
-
-  it('fails when two lanes claim the same file', () => {
-    const root = seededFixture(`
-      import { useRpcStore } from './stores/rpc'
-      useRpcStore().call('feature.get')
-    `)
-    const failures = evaluateRpcArchitectureGate({
-      root,
-      debtLanes: [
-        ...oneCallLane,
-        { lane: 'duplicate', debt: { 'src/feature.ts': { call: 1 } } },
-      ],
-    }).failures
-    expect(failures).toContain(
-      'src/feature.ts: transport debt is owned by both fixture and duplicate.',
-    )
   })
 
   it('does not charge a local same-named call/wait interface', () => {
@@ -162,13 +147,13 @@ describe('transport architecture gate ledger integration', () => {
         cache.waitForConnection()
       `,
     })
-    expect(evaluateRpcArchitectureGate({ root, debtLanes: [] })).toMatchObject({
+    expect(evaluateRpcArchitectureGate({ root })).toMatchObject({
       failures: [],
       total: 0,
     })
   })
 
-  it('exempts only the constrained platform static-asset reader from HTTP debt', () => {
+  it('keeps HTTP boundary hard-zero while retaining Adapter and static-asset exemptions', () => {
     const root = fixture({
       'src/platform/staticAssets.ts': `
         export async function readStaticJson(path: string) {
@@ -182,13 +167,20 @@ describe('transport architecture gate ledger integration', () => {
           return await fetch(path)
         }
       `,
+      'src/adapters/gateway/legacyHttpV4.ts': `
+        export async function request(path: string) {
+          return await fetch(path)
+        }
+      `,
     })
-    const result = evaluateRpcArchitectureGate({ root, debtLanes: [] })
+    const result = evaluateRpcArchitectureGate({ root })
 
     expect(result.failures).toContain(
       'src/composables/copiedAssetReader.ts: unexpected raw transport httpRequest (1); add a domain Adapter instead.',
     )
     expect(result.failures.some(failure => failure.includes('src/platform/staticAssets.ts'))).toBe(false)
+    expect(result.failures.some(failure => failure.includes('src/adapters/gateway/legacyHttpV4.ts')))
+      .toBe(false)
   })
 
   it('rejects an Adapter that bypasses the private transport composition', () => {
@@ -199,8 +191,25 @@ describe('transport architecture gate ledger integration', () => {
         export const bypass = () => useRpcStore()
       `,
     })
-    expect(evaluateRpcArchitectureGate({ root, debtLanes: [] }).failures).toContain(
-      'src/adapters/gateway/bypass.ts: Gateway Adapters must consume the private transport Interface instead of useRpcStore.',
+    expect(evaluateRpcArchitectureGate({ root }).failures).toContain(
+      'src/adapters/gateway/bypass.ts: useRpcStore may be imported only by the composition root or tests.',
+    )
+  })
+
+  it('does not exempt sessionConversationV4 from raw RPC operations', () => {
+    const root = fixture({
+      'src/lib/rpc.ts': `
+        export interface RpcClient { call(method: string): unknown }
+      `,
+      'src/adapters/gateway/sessionConversationV4.ts': `
+        import type { RpcClient } from '../../lib/rpc'
+        declare const rpc: RpcClient
+        rpc.call('session.get')
+      `,
+    })
+
+    expect(evaluateRpcArchitectureGate({ root }).failures).toContain(
+      'src/adapters/gateway/sessionConversationV4.ts: unexpected raw transport call (1); add a domain Adapter instead.',
     )
   })
 
@@ -261,9 +270,9 @@ describe('transport architecture gate ledger integration', () => {
       },
       expected: 'src/consumer.ts: unexpected raw transport call (1); add a domain Adapter instead.',
     },
-  ])('rejects an unapproved raw call through $label', ({ files, expected }) => {
+  ])('rejects a forbidden raw call through $label', ({ files, expected }) => {
     const root = fixture(files as unknown as Record<string, string>)
-    expect(evaluateRpcArchitectureGate({ root, debtLanes: [] }).failures).toContain(expected)
+    expect(evaluateRpcArchitectureGate({ root }).failures).toContain(expected)
   })
 
   it('does not merge same-named values from separate lexical scopes', () => {
@@ -284,8 +293,7 @@ describe('transport architecture gate ledger integration', () => {
       void cacheOnly
       void shadowed
     `)
-    expect(evaluateRpcArchitectureGate({ root, debtLanes: [] })).toMatchObject({
-      failures: [],
+    expect(evaluateRpcArchitectureGate({ root })).toMatchObject({
       rpcTotal: 0,
     })
   })
@@ -300,8 +308,8 @@ describe('transport architecture gate ledger integration', () => {
         export const bypass = () => useRpcStore()
       `,
     })
-    expect(evaluateRpcArchitectureGate({ root, debtLanes: [] }).failures).toContain(
-      'src/adapters/gateway/bypass.ts: Gateway Adapters must consume the private transport Interface instead of useRpcStore.',
+    expect(evaluateRpcArchitectureGate({ root }).failures).toContain(
+      'src/adapters/gateway/bypass.ts: useRpcStore may be imported only by the composition root or tests.',
     )
   })
 
@@ -314,17 +322,17 @@ describe('transport architecture gate ledger integration', () => {
         export const bypass = () => stores.useRpcStore()
       `,
     })
-    expect(evaluateRpcArchitectureGate({ root, debtLanes: [] }).failures).toContain(
-      'src/adapters/gateway/bypass.ts: Gateway Adapters must consume the private transport Interface instead of useRpcStore.',
+    expect(evaluateRpcArchitectureGate({ root }).failures).toContain(
+      'src/adapters/gateway/bypass.ts: useRpcStore may be imported only by the composition root or tests.',
     )
   })
 
-  it('allows ordinary store barrels to re-export the RPC factory', () => {
+  it('forbids ordinary store barrels from re-exporting the RPC factory', () => {
     const root = fixture({
       'src/stores/rpc.ts': 'export function useRpcStore() { return {} }',
       'src/stores/index.ts': `export * from './rpc'`,
     })
-    expect(evaluateRpcArchitectureGate({ root, debtLanes: [] }).failures).not.toContain(
+    expect(evaluateRpcArchitectureGate({ root }).failures).toContain(
       'src/stores/index.ts: RPC store factory modules must not be re-exported through a barrel.',
     )
   })
@@ -340,7 +348,7 @@ describe('transport architecture gate ledger integration', () => {
         }
       `,
     })
-    expect(evaluateRpcArchitectureGate({ root, debtLanes: [] }).failures).toContain(
+    expect(evaluateRpcArchitectureGate({ root }).failures).toContain(
       'src/adapters/gateway/classExpressionLeak.ts: exported declaration exposes private Gateway transport symbols.',
     )
   })
@@ -351,7 +359,7 @@ describe('transport architecture gate ledger integration', () => {
       'src/adapters/gateway/index.ts': `export { hidden as h } from './privateTransports'`,
       'src/adapters/gateway/leak.ts': `export { h as publicHidden } from './index'`,
     })
-    const failures = evaluateRpcArchitectureGate({ root, debtLanes: [] }).failures
+    const failures = evaluateRpcArchitectureGate({ root }).failures
     expect(failures).toEqual(expect.arrayContaining([
       'src/adapters/gateway/index.ts: private Gateway transport modules must not be re-exported through a barrel.',
       'src/adapters/gateway/leak.ts: private Gateway transport modules must not be re-exported through a barrel.',
@@ -365,7 +373,7 @@ describe('transport architecture gate ledger integration', () => {
         module.exports.useRpcStore = useRpcStore
       `,
     })
-    expect(evaluateRpcArchitectureGate({ root, debtLanes: [] }).failures).toContain(
+    expect(evaluateRpcArchitectureGate({ root }).failures).toContain(
       'src/stores/rpc.ts: RPC provenance seed must remain an ESM named export "useRpcStore".',
     )
   })
@@ -383,7 +391,7 @@ describe('transport architecture gate ledger integration', () => {
         module.exports['transport'] = require('./privateTransports')['RpcTransport']
       `,
     })
-    const failures = evaluateRpcArchitectureGate({ root, debtLanes: [] }).failures
+    const failures = evaluateRpcArchitectureGate({ root }).failures
     expect(failures).toEqual(expect.arrayContaining([
       'src/adapters/gateway/functionLeak.ts: exported declaration exposes private Gateway transport symbols.',
       'src/adapters/gateway/cjsLeak.js: CommonJS export exposes private Gateway transport symbols.',
@@ -407,7 +415,7 @@ describe('transport architecture gate ledger integration', () => {
       `,
     })
     const started = performance.now()
-    expect(evaluateRpcArchitectureGate({ root, debtLanes: [] }).failures).toContain(
+    expect(evaluateRpcArchitectureGate({ root }).failures).toContain(
       'src/feature.ts: unexpected raw transport call (1); add a domain Adapter instead.',
     )
     expect(performance.now() - started).toBeLessThan(500)
