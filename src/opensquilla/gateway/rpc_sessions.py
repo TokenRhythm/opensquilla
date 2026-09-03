@@ -881,11 +881,6 @@ _attachment_media_type = _attachment_ingest.attachment_media_type
 _normalize_attachments = _attachment_ingest.normalize_attachments
 _sniff_mime_from_bytes = _attachment_ingest.sniff_mime_from_bytes
 
-# Compatibility alias for callers that historically imported this helper
-# from the RPC module.  New execution producers use the shared runtime helper.
-_apply_run_context_route_metadata = apply_run_context_route_metadata
-
-
 def _trusted_elevated_hint(ctx: RpcContext, source_hint: dict[str, Any]) -> str | None:
     """Return an operator-owned elevated hint, or None."""
 
@@ -5268,7 +5263,7 @@ async def _handle_sessions_send_impl_inner(
                 execution_run_context,
                 accepted_run_mode_override,
             )
-            _apply_run_context_route_metadata(
+            apply_run_context_route_metadata(
                 route_envelope,
                 execution_run_context,
                 principal_is_owner=ctx.principal.is_owner,

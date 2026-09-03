@@ -1841,7 +1841,9 @@ async def _apply_saved_channel_run_context(
     if route_envelope is None or session_manager is None or config is None:
         return
     try:
-        from opensquilla.gateway.rpc_sessions import _apply_run_context_route_metadata
+        from opensquilla.gateway.project_workspace_runtime import (
+            apply_run_context_route_metadata,
+        )
         from opensquilla.sandbox.run_context import (
             get_run_context,
             resolve_default_run_mode,
@@ -1875,7 +1877,7 @@ async def _apply_saved_channel_run_context(
             error_type=type(exc).__name__,
         )
         return
-    _apply_run_context_route_metadata(
+    apply_run_context_route_metadata(
         route_envelope,
         run_context,
         principal_is_owner=principal_is_owner,
@@ -2099,6 +2101,7 @@ async def _run_turn_with_streaming(
     """
     from opensquilla.agents.scope import resolve_agent_workspace_dir
     from opensquilla.gateway.project_workspace_runtime import (
+        apply_run_context_route_metadata,
         authoritative_project_run_context,
     )
     from opensquilla.gateway.routing import build_channel_route_envelope, tool_context_from_envelope
@@ -2130,11 +2133,7 @@ async def _run_turn_with_streaming(
             config=config,
             default_workspace=(str(workspace_dir) if workspace_dir is not None else None),
         )
-        from opensquilla.gateway.rpc_sessions import (
-            _apply_run_context_route_metadata,
-        )
-
-        _apply_run_context_route_metadata(
+        apply_run_context_route_metadata(
             envelope,
             run_context,
             principal_is_owner=principal_is_owner,

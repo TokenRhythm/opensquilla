@@ -302,21 +302,6 @@ SESSION_LIFECYCLE_AUTHORED_LOC_CEILING = 3_000
 APPROVED_PRIVATE_RPC_IMPORTS: Counter[tuple[str, str, str]] = Counter(
     {
         (
-            "src/opensquilla/cli/agent_cmd.py",
-            "opensquilla.gateway.rpc_sessions",
-            "_apply_run_context_route_metadata",
-        ): 1,
-        (
-            "src/opensquilla/cli/tui/standalone_runtime.py",
-            "opensquilla.gateway.rpc_sessions",
-            "_apply_run_context_route_metadata",
-        ): 1,
-        (
-            "src/opensquilla/gateway/channel_dispatch.py",
-            "opensquilla.gateway.rpc_sessions",
-            "_apply_run_context_route_metadata",
-        ): 2,
-        (
             "src/opensquilla/gateway/rpc_chat.py",
             "opensquilla.gateway.rpc_sessions",
             "_handle_sessions_abort",
