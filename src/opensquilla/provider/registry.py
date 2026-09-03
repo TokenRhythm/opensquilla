@@ -718,6 +718,15 @@ def register_profile_providers(config: Any) -> int:
     usable in router tiers and ``[llm]``. Already-registered providers
     (``deepseek``, ``custom``, etc.) are skipped. Returns the count of newly
     registered providers.
+
+    As a last-resort sweep, an ``[llm]`` block that references an unknown
+    provider id while carrying its own ``base_url`` registers that id too.
+    A profile can be deleted (or lost to a config rewrite) while ``[llm]``
+    still points at its provider id; without this sweep the deployment
+    becomes unresolvable after every restart (doctor: provider.active.unknown,
+    ensemble: fixed_fallback unknown) even though the active block is fully
+    self-sufficient. Registration is idempotent, so a profile that does
+    exist simply wins the race and the ``[llm]`` sweep becomes a no-op.
     """
     count = 0
     for profile_id, profile in (getattr(config, "llm_profiles", None) or {}).items():
@@ -729,4 +738,21 @@ def register_profile_providers(config: Any) -> int:
             continue
         if register_profile_provider(raw_id, profile_base_url):
             count += 1
+    llm_cfg = getattr(config, "llm", None)
+    if llm_cfg is not None:
+        active_id = str(getattr(llm_cfg, "provider", "") or "").strip().lower()
+        active_base_url = str(getattr(llm_cfg, "base_url", "") or "").strip()
+        # Only an explicitly written base_url counts: the LlmProviderConfig
+        # default carries the tokenrhythm endpoint, and registering an
+        # unknown provider id against that fallback URL would silently point
+        # it at the wrong server. Pydantic records explicit assignments in
+        # model_fields_set (TOML keys and env overrides both land there).
+        fields_set = getattr(llm_cfg, "model_fields_set", None) or set()
+        if (
+            active_id
+            and active_base_url
+            and "base_url" in fields_set
+        ):
+            if register_profile_provider(active_id, active_base_url):
+                count += 1
     return count
