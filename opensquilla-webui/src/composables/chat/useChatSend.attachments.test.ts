@@ -2704,12 +2704,16 @@ describe('useChatSend attachment payloads', () => {
       if (delayRetirement) vi.useFakeTimers()
       try {
         const sendNewEdit = harness.api.onSend()
+        let repeatedSend: Promise<void> | null = null
         if (delayRetirement) {
           await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledTimes(2))
+          repeatedSend = harness.api.onSend()
+          await vi.advanceTimersByTimeAsync(0)
+          expect(rpc.call).toHaveBeenCalledTimes(2)
           if (!shouldSendNewEdit) inputText.value = 'changed while retirement was pending'
           await vi.advanceTimersByTimeAsync(250)
         }
-        await sendNewEdit
+        await Promise.all([sendNewEdit, repeatedSend])
       } finally {
         if (delayRetirement) vi.useRealTimers()
       }
@@ -3562,11 +3566,7 @@ describe('useChatSend attachment payloads', () => {
       }),
     } as unknown as UseChatSendOptions['rpc']
     const taskOwnership = useChatTaskOwnership()
-    taskOwnership.applySnapshot({
-      run_status: 'running',
-      active_task: { task_id: 'current-task', status: 'running' },
-    }, true)
-    const activeStreamTaskId = ref('current-task')
+    const activeStreamTaskId = ref('')
     const messages = ref<ChatMessage[]>([{
       role: 'assistant',
       text: 'current history',
@@ -3575,14 +3575,27 @@ describe('useChatSend attachment payloads', () => {
     const historyOwner = messages.value
     let beginReplay = (_clientMessageId: string, _holdHistory?: boolean) => {}
     let finishReplay = (_clientMessageId: string) => {}
+    let trackReplay = (
+      _clientMessageId: string,
+      _taskId: string,
+      _terminal?: boolean | string,
+    ) => {}
     const beginBackgroundReceiptReplay = vi.fn((id: string, holdHistory?: boolean) => {
       beginReplay(id, holdHistory)
     })
     const finishBackgroundReceiptReplay = vi.fn((id: string) => {
       finishReplay(id)
     })
+    const trackBackgroundReceiptTask = vi.fn((
+      id: string,
+      taskId: string,
+      terminal?: boolean | string,
+    ) => {
+      trackReplay(id, taskId, terminal)
+    })
     const applySessionRunState = vi.fn()
     const scheduleHistorySync = vi.fn()
+    const schedulePendingDrainAfterTerminal = vi.fn()
     let resolveQueueRelease!: (released: boolean) => void
     const recoverPendingQueueHandoff = vi.fn(() => new Promise<boolean>(resolve => {
       resolveQueueRelease = resolve
@@ -3596,6 +3609,7 @@ describe('useChatSend attachment payloads', () => {
       activeStreamTaskId,
       beginBackgroundReceiptReplay,
       finishBackgroundReceiptReplay,
+      trackBackgroundReceiptTask,
       scheduleHistorySync,
       recoverPendingQueueHandoff,
       messageEditActive: ref(true),
@@ -3608,7 +3622,13 @@ describe('useChatSend attachment payloads', () => {
         return true
       }),
     })
-    recovery.stream.isStreaming.value = true
+    recovery.pendingQueue.value.push({
+      pendingUiId: 'background-recovery-pending',
+      text: 'keep the parent queue pending',
+      attachments: [],
+      intent: null,
+      ownerSessionKey: parent,
+    })
     const scope = effectScope()
     const rpcEvents = scope.run(() => useChatRpcEventHandlers({
       sessionKey: recovery.options.sessionKey,
@@ -3643,13 +3663,14 @@ describe('useChatSend attachment payloads', () => {
       showCompactionToast: vi.fn(),
       showWarningToast: vi.fn(),
       scheduleHistorySync,
-      schedulePendingDrainAfterTerminal: vi.fn(),
+      schedulePendingDrainAfterTerminal,
       popAllPendingIntoComposer: vi.fn(() => false),
       saveWidgetState: vi.fn(),
       loadCurrentSessionUsage: vi.fn(),
     }))!
     beginReplay = rpcEvents.beginBackgroundReceiptReplay
     finishReplay = rpcEvents.finishBackgroundReceiptReplay
+    trackReplay = rpcEvents.trackBackgroundReceiptTask
 
     try {
       const restoring = recovery.api.recoverResponseHandoffs()
@@ -3661,8 +3682,19 @@ describe('useChatSend attachment payloads', () => {
       expect(rpc.call.mock.calls[1]?.[1]?.attachments?.[0]?.file_uuid).toBe(
         'refreshed-recovery-file',
       )
-      resolveRecovery({ sessionKey: child, task_id: 'recovered-task' })
+      resolveRecovery({
+        sessionKey: child,
+        task_id: 'recovered-task',
+        task_status: 'failed',
+      })
       await vi.waitFor(() => expect(recoverPendingQueueHandoff).toHaveBeenCalledOnce())
+      expect(trackBackgroundReceiptTask).toHaveBeenCalledWith(
+        clientMessageId,
+        'recovered-task',
+        false,
+      )
+      expect(applySessionRunState).not.toHaveBeenCalled()
+      expect(schedulePendingDrainAfterTerminal).not.toHaveBeenCalled()
       expect(finishBackgroundReceiptReplay).not.toHaveBeenCalled()
       const deliver = (eventName: string, payload: Record<string, unknown>) => {
         rpcEvents.onConversationEvent({
@@ -3685,7 +3717,7 @@ describe('useChatSend attachment payloads', () => {
       rpcEvents.onConversationEvent({
         kind: 'sessions-changed',
         payload: {
-          session_key: parent,
+          session_key: child,
           reason: 'task_terminal',
           run_status: 'idle',
           changed_task: { task_id: 'recovered-task', status: 'succeeded' },
@@ -3694,10 +3726,11 @@ describe('useChatSend attachment payloads', () => {
         meta: {},
       })
 
-      expect(activeStreamTaskId.value).toBe('current-task')
-      expect(taskOwnership.runningTaskId.value).toBe('current-task')
+      expect(activeStreamTaskId.value).toBe('')
+      expect(taskOwnership.runningTaskId.value).toBe('')
       expect(recovery.stream.appendDelta).not.toHaveBeenCalled()
       expect(applySessionRunState).not.toHaveBeenCalled()
+      expect(schedulePendingDrainAfterTerminal).not.toHaveBeenCalled()
       expect(messages.value).toBe(historyOwner)
       expect(messages.value).toEqual([expect.objectContaining({ text: 'current history' })])
       expect(scheduleHistorySync).not.toHaveBeenCalled()

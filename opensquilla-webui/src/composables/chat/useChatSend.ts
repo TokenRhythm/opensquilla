@@ -2482,7 +2482,10 @@ export function useChatSend(options: UseChatSendOptions) {
               options.trackBackgroundReceiptTask?.(
                 replayRecord.clientMessageId,
                 acceptedTaskId(response),
-                terminalResponseStatus(response),
+                targetSessionKey === replayRecord.requestSessionKey
+                  && targetSessionKey === options.sessionKey.value
+                  ? terminalResponseStatus(response)
+                  : false,
               )
               await finalizeRecoveredBackgroundHandoff(replayRecord, targetSessionKey)
             } else {
@@ -3034,9 +3037,10 @@ export function useChatSend(options: UseChatSendOptions) {
         && !validateAttemptMessageEditTranscript(exactReplayAttempt)
       ) return
       if (replayBlockedReason?.value) return
+      const rejectionAlreadyPending = exactReplayAttempt.backgroundRejectionPending === true
       let rejectedReplayRetired = false
       let rejectedReplayRetirement: Promise<void> | null = null
-      const replayOutcome = await dispatchSend(exactReplayAttempt.text, {
+      const dispatchExactReplay = () => dispatchSend(exactReplayAttempt.text, {
         composerText,
         composerSnapshot: replayComposerSnapshot,
         promptAnnotationIds: exactReplayAttempt.promptAnnotationIds,
@@ -3082,11 +3086,19 @@ export function useChatSend(options: UseChatSendOptions) {
           )
         ),
       })
-      if (!replayingSupersededEditOwner) return
-      if (replayOutcome !== 'accepted' && !rejectedReplayRetired) {
+      const replayOutcome = rejectionAlreadyPending ? null : await dispatchExactReplay()
+      if (rejectionAlreadyPending) {
+        rejectedReplayRetirement = scheduleAcceptanceRecovery(exactReplayAttempt)
+        if (rejectedReplayRetirement) await rejectedReplayRetirement
+        if (
+          exactReplayAttempt.backgroundRejectionPending
+          || !exactReplayAttempt.acceptanceResolved
+        ) return
+      } else if (replayOutcome !== 'accepted' && !rejectedReplayRetired) {
         if (!rejectedReplayRetirement) return
         await rejectedReplayRetirement
       }
+      if (!replayingSupersededEditOwner) return
       if (
         options.sessionKey.value !== requestSessionKey
         || !sameComposerOwnershipSnapshot(captureComposerSnapshot(), replayComposerSnapshot)
