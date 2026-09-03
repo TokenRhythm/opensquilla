@@ -114,7 +114,10 @@ async def _search_runtime_payload(
     return read_search_status(str(provider) if provider else None)
 
 
-async def _provider_payload(params: dict[str, Any] | None, ctx: RpcContext) -> dict[str, Any]:
+async def _provider_payload(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
     query = params or {}
     return cast(
         dict[str, Any],
@@ -122,6 +125,29 @@ async def _provider_payload(params: dict[str, Any] | None, ctx: RpcContext) -> d
             provider_id=query.get("provider"),
             probe_models=bool(query.get("probeModels", False)),
         ),
+    )
+
+
+async def _readiness_provider(
+    query: ReadinessQuery,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    """Collect the provider projection from one typed readiness query."""
+
+    return await _provider_payload({"probeModels": query.probe_providers}, ctx)
+
+
+async def _readiness_memory(
+    query: ReadinessQuery,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    """Collect memory health from explicit runtime dependencies."""
+
+    return await read_memory_status(
+        {"agentId": query.agent_id, "deep": query.deep},
+        memory_backend=getattr(ctx, "memory_backend", None),
+        memory_managers=getattr(ctx, "memory_managers", None),
+        session_manager=getattr(ctx, "session_manager", None),
     )
 
 
@@ -450,14 +476,17 @@ async def _doctor_status_contract(
         raise ValueError("params must be an object")
     params = params or {}
     port = _GatewayReadinessRuntime(ctx)
-    return await ReadinessDiagnostics(port, GatewayReadinessEvaluationPort()).assess(
-        ReadinessQuery(
-            agent_id=str(params.get("agentId") or "main"),
-            deep=bool(params.get("deep", True)),
-            probe_providers=bool(params.get("probeProviders", False)),
+    return cast(
+        dict[str, Any],
+        await ReadinessDiagnostics(port, GatewayReadinessEvaluationPort()).assess(
+            ReadinessQuery(
+                agent_id=str(params.get("agentId") or "main"),
+                deep=bool(params.get("deep", True)),
+                probe_providers=bool(params.get("probeProviders", False)),
+            ),
+            connection_id=ctx.conn_id,
+            config_path=_config_path(ctx),
         ),
-        connection_id=ctx.conn_id,
-        config_path=_config_path(ctx),
     )
 
 
@@ -468,21 +497,14 @@ class _GatewayReadinessRuntime(ReadinessDataPort):
         self._ctx = ctx
 
     async def provider(self, query: ReadinessQuery) -> dict[str, Any]:
-        return await _provider_payload(
-            {"probeModels": query.probe_providers}, self._ctx
-        )
+        return await _readiness_provider(query, self._ctx)
 
     async def logs(self, query: ReadinessQuery) -> dict[str, Any]:
         del query
         return _build_logs_status(self._ctx)
 
     async def memory(self, query: ReadinessQuery) -> dict[str, Any]:
-        return await read_memory_status(
-            {"agentId": query.agent_id, "deep": query.deep},
-            memory_backend=getattr(self._ctx, "memory_backend", None),
-            memory_managers=getattr(self._ctx, "memory_managers", None),
-            session_manager=getattr(self._ctx, "session_manager", None),
-        )
+        return await _readiness_memory(query, self._ctx)
 
     async def channels(self, query: ReadinessQuery) -> dict[str, Any]:
         del query
@@ -493,7 +515,7 @@ class _GatewayReadinessRuntime(ReadinessDataPort):
         return _sandbox_payload(self._ctx)
 
     async def router(self, query: ReadinessQuery) -> dict[str, Any]:
-        return _router_payload(self._ctx, deep=query.deep)
+        return _router_payload(self._ctx, deep=bool(query.deep))
 
     async def squilla_router(self, query: ReadinessQuery) -> dict[str, Any]:
         del query

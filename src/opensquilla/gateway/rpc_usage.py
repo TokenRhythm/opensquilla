@@ -623,15 +623,26 @@ def _usage_totals(rows: list[dict[str, Any]]) -> dict[str, int | float]:
     }
 
 
-async def _read_usage_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+def _usage_query_value(value: UsageQuery | dict | None) -> UsageQuery:
+    if isinstance(value, UsageQuery):
+        return value
+    raw = value if isinstance(value, Mapping) else {}
+    raw_session_key = raw.get("sessionKey") or raw.get("session_key") or raw.get("key")
+    session_key = (
+        raw_session_key.strip()
+        if isinstance(raw_session_key, str) and raw_session_key.strip()
+        else None
+    )
+    return UsageQuery(session_key=session_key, filters=raw)
+
+
+async def _usage_status(
+    value: UsageQuery | dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    query = _usage_query_value(value)
     now_ms = _now_ms()
-    requested_session_key = None
-    if isinstance(params, Mapping):
-        raw_requested_session_key = (
-            params.get("sessionKey") or params.get("session_key") or params.get("key")
-        )
-        if isinstance(raw_requested_session_key, str) and raw_requested_session_key.strip():
-            requested_session_key = raw_requested_session_key.strip()
+    requested_session_key = query.session_key
     tracker_rows = _tracker_rows(
         ctx,
         now_ms=now_ms,
@@ -737,7 +748,10 @@ async def _read_usage_status(params: dict | None, ctx: RpcContext) -> dict[str, 
         }
 
 
-async def _query_usage(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def _query_usage(
+    value: UsageQuery | dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
     """Aggregate timestamped usage events for one explicit calendar range.
 
     This is intentionally additive.  ``usage.status`` and ``usage.cost`` keep
@@ -751,12 +765,17 @@ async def _query_usage(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if storage is None or not hasattr(storage, "query_usage_events"):
         raise RpcUnavailableError("Durable usage accounting is not available")
     try:
-        return await query_usage_ledger(storage, params)
+        query = _usage_query_value(value)
+        return await query_usage_ledger(storage, dict(query.filters or {}))
     except UsageQueryValidationError as exc:
         raise RpcHandlerError("INVALID_REQUEST", str(exc)) from exc
 
 
-async def _read_usage_cost(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def _usage_cost(
+    value: UsageQuery | dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    del value
     now_ms = _now_ms()
     tracker_rows = _tracker_rows(ctx, now_ms=now_ms)
 
@@ -807,36 +826,24 @@ async def _read_usage_cost(params: dict | None, ctx: RpcContext) -> dict[str, An
         }
 
 
+_read_usage_status = _usage_status
+_read_usage_cost = _usage_cost
+
+
 class _GatewayUsageReportingPort(UsageReportingPort):
     """Terminate the usage Port at the existing ledger/tracker implementation."""
 
     def __init__(self, context: RpcContext) -> None:
         self._context = context
 
-    @staticmethod
-    def _params(query: UsageQuery) -> dict[str, Any]:
-        params = dict(query.filters or {})
-        if query.session_key is not None:
-            params["sessionKey"] = query.session_key
-        return params
-
     async def status(self, query: UsageQuery) -> UsageStatusResult:
-        return cast(
-            UsageStatusResult,
-            await _read_usage_status(self._params(query), self._context),
-        )
+        return cast(UsageStatusResult, await _usage_status(query, self._context))
 
     async def query(self, query: UsageQuery) -> UsageQueryResult:
-        return cast(
-            UsageQueryResult,
-            await _query_usage(self._params(query), self._context),
-        )
+        return cast(UsageQueryResult, await _query_usage(query, self._context))
 
     async def cost_breakdown(self, query: UsageQuery) -> UsageCostResult:
-        return cast(
-            UsageCostResult,
-            await _read_usage_cost(self._params(query), self._context),
-        )
+        return cast(UsageCostResult, await _usage_cost(query, self._context))
 
 
 def _usage_reporting_adapter(ctx: RpcContext) -> GatewayConversationAncillaryAdapter:

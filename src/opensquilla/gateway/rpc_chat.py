@@ -251,25 +251,39 @@ def _clarify_fields_to_text(fields: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
-async def _submit_clarification(params: dict | None, ctx: RpcContext) -> dict:
-    if not isinstance(params, dict):
-        raise ValueError("params required: sessionKey, fields")
-    fields = params.get("fields")
-    if not isinstance(fields, dict) or not fields:
-        raise ValueError("params.fields must be a non-empty mapping")
+async def _submit_clarification(
+    request: SubmitClarification | dict | None,
+    ctx: RpcContext,
+) -> dict:
+    """Resolve or admit one typed command, retaining the legacy helper shape."""
 
-    session_key = _canonical_webchat_session_key(params.get("sessionKey"))
-    raw_request_id = params.get("request_id", params.get("requestId"))
-    if raw_request_id is not None:
-        request_id = str(raw_request_id).strip()
-        if not request_id:
+    if isinstance(request, SubmitClarification):
+        command = request
+    else:
+        if not isinstance(request, dict):
+            raise ValueError("params required: sessionKey, fields")
+        fields = request.get("fields")
+        if not isinstance(fields, dict) or not fields:
+            raise ValueError("params.fields must be a non-empty mapping")
+        raw_request_id = request.get("request_id", request.get("requestId"))
+        request_id = str(raw_request_id).strip() if raw_request_id is not None else None
+        if request_id == "":
             raise ValueError("params.request_id must be a non-empty string")
+        run_id = request.get("run_id")
+        command = SubmitClarification(
+            session_key=_canonical_webchat_session_key(request.get("sessionKey")),
+            fields=fields,
+            request_id=request_id,
+            run_id=run_id if isinstance(run_id, str) else None,
+        )
+    fields = dict(command.fields)
+    session_key = _canonical_webchat_session_key(command.session_key)
+    if command.request_id is not None:
+        request_id = command.request_id
         task_runtime = getattr(ctx, "task_runtime", None)
         resolve_user_input = getattr(task_runtime, "resolve_user_input", None)
         if not callable(resolve_user_input):
-            raise RpcUnavailableError(
-                "Deferred user-input resolution is not available"
-            )
+            raise RpcUnavailableError("Deferred user-input resolution is not available")
         result = await resolve_user_input(
             session_key=session_key,
             request_id=request_id,
@@ -285,7 +299,7 @@ async def _submit_clarification(params: dict | None, ctx: RpcContext) -> dict:
         return {"sessionKey": session_key, **result}
 
     text = _clarify_fields_to_text(fields)
-    run_id = params.get("run_id")
+    run_id = command.run_id
     log.info(
         "chat.clarify_submit.params",
         session_key=session_key,
@@ -308,10 +322,7 @@ async def _submit_clarification(params: dict | None, ctx: RpcContext) -> dict:
         }
     return cast(
         dict,
-        await _chat_turn_admission_adapter(ctx).admit(
-            send_params,
-            surface="webchat",
-        ),
+        await _chat_turn_admission_adapter(ctx).admit(send_params, surface="webchat"),
     )
 
 
@@ -377,17 +388,9 @@ class _GatewayClarificationSubmissionPort(ClarificationSubmissionPort):
         self._context = context
 
     async def submit(self, command: SubmitClarification) -> ClarificationSubmissionResult:
-        payload: dict[str, Any] = {
-            "sessionKey": command.session_key,
-            "fields": dict(command.fields),
-        }
-        if command.request_id is not None:
-            payload["requestId"] = command.request_id
-        if command.run_id is not None:
-            payload["run_id"] = command.run_id
         return cast(
             ClarificationSubmissionResult,
-            await _submit_clarification(payload, self._context),
+            await _submit_clarification(command, self._context),
         )
 
 

@@ -36,8 +36,7 @@ from opensquilla.gateway.session_services import get_session_storage
 _d = get_dispatcher()
 
 
-async def _resolve_session_key(key: str, ctx: RpcContext) -> str:
-    storage = get_session_storage(ctx.session_manager)
+async def _stored_session_key(key: str, storage: Any) -> str:
     if storage is None:
         raise RpcUnavailableError("Session storage is not available")
     session = await storage.get_session(key)
@@ -46,8 +45,7 @@ async def _resolve_session_key(key: str, ctx: RpcContext) -> str:
     return str(session.session_key)
 
 
-def _service(ctx: RpcContext) -> Any:
-    service = ctx.prompt_cache_keepalive_service
+def _require_service(service: Any) -> Any:
     if service is None:
         raise RpcUnavailableError("Prompt-cache keepalive is not available")
     return service
@@ -65,24 +63,25 @@ _PROMPT_CACHE_POLICY = PromptCachePolicy(
 
 class _GatewayPromptCacheLeasePort(PromptCacheLeasePort):
     def __init__(self, context: RpcContext) -> None:
-        self._context = context
+        self._storage = get_session_storage(context.session_manager)
+        self._keepalive = context.prompt_cache_keepalive_service
 
     async def status(self, session_key: str) -> PromptCacheLeaseResult:
-        key = await _resolve_session_key(session_key, self._context)
-        return cast(PromptCacheLeaseResult, _service(self._context).status(key))
+        key = await _stored_session_key(session_key, self._storage)
+        return cast(PromptCacheLeaseResult, _require_service(self._keepalive).status(key))
 
     async def set_policy(self, command: SetPromptCacheLease) -> PromptCacheLeaseResult:
-        key = await _resolve_session_key(command.session_key, self._context)
+        key = await _stored_session_key(command.session_key, self._storage)
         assert command.ttl_seconds is not None
         assert command.idle_timeout_seconds is not None
         return cast(
             PromptCacheLeaseResult,
-            await _service(self._context).set_enabled(
+            await _require_service(self._keepalive).set_enabled(
                 key,
                 enabled=command.enabled,
                 ttl_seconds=command.ttl_seconds,
                 idle_timeout_seconds=command.idle_timeout_seconds,
-            )
+            ),
         )
 
 

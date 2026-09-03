@@ -70,7 +70,10 @@ def _serialize(cmd: CommandDef, surface: Surface) -> dict[str, Any]:
     return out
 
 
-async def _meta_skill_argument_choices(ctx: RpcContext) -> list[dict[str, Any]]:
+async def _meta_skill_argument_choices(
+    skill_loader: Any,
+    config: Any,
+) -> list[dict[str, Any]]:
     """Live meta-skill names as ``/meta`` argument candidates (value + description).
 
     Mirrors the ``meta.list`` filter: invokable ``kind="meta"`` skills only, and
@@ -82,8 +85,8 @@ async def _meta_skill_argument_choices(ctx: RpcContext) -> list[dict[str, Any]]:
         meta_readiness_context,
     )
 
-    loader = getattr(ctx, "skill_loader", None)
-    if loader is None or not is_meta_skill_enabled(getattr(ctx, "config", None)):
+    loader = skill_loader
+    if loader is None or not is_meta_skill_enabled(config):
         return []
     try:
         refresh = getattr(loader, "refresh_if_changed", None)
@@ -98,6 +101,7 @@ async def _meta_skill_argument_choices(ctx: RpcContext) -> list[dict[str, Any]]:
             specs = await asyncio.to_thread(loader.load_all)
     except Exception:  # noqa: BLE001 — fail-open to an empty candidate list
         return []
+
     def project_choices() -> list[dict[str, Any]]:
         skill_index = {skill.name: skill for skill in specs}
         choices = []
@@ -109,9 +113,9 @@ async def _meta_skill_argument_choices(ctx: RpcContext) -> list[dict[str, Any]]:
             readiness = assess_meta_skill_readiness(
                 spec,
                 skill_index=skill_index,
-                ctx=meta_readiness_context(config=getattr(ctx, "config", None)),
+                ctx=meta_readiness_context(config=config),
                 verify_capabilities=False,
-                config=getattr(ctx, "config", None),
+                config=config,
             )
             choices.append(
                 {
@@ -133,35 +137,39 @@ async def _meta_skill_argument_choices(ctx: RpcContext) -> list[dict[str, Any]]:
     return await asyncio.to_thread(project_choices)
 
 
-async def _list_commands_for_surface(
-    surface_name: str,
-    ctx: RpcContext,
-) -> dict[str, Any]:
+async def _command_catalog(
+    query: CommandCatalogQuery,
+    *,
+    skill_loader: Any,
+    config: Any,
+) -> CommandCatalogResult:
     try:
-        surface = parse_surface(surface_name)
+        surface = parse_surface(query.surface)
     except ValueError as exc:
         valid = ", ".join(sorted({s.value for s in Surface}))
-        raise ValueError(f"unknown surface {surface_name!r}; valid: {valid}") from exc
+        raise ValueError(f"unknown surface {query.surface!r}; valid: {valid}") from exc
     commands = [_serialize(cmd, surface) for cmd in DEFAULT_REGISTRY.for_surface(surface)]
     # Populate /meta's argument candidates from the live meta-skills so the
     # slash menu can offer them as Tab-completable choices (SPA + TUI).
-    meta_choices = await _meta_skill_argument_choices(ctx)
+    meta_choices = await _meta_skill_argument_choices(skill_loader, config)
     if meta_choices:
         for entry in commands:
             if entry.get("name") == "/meta":
                 entry["argument_choices"] = meta_choices
                 break
-    return {"surface": surface.value, "commands": commands}
+    return cast(CommandCatalogResult, {"surface": surface.value, "commands": commands})
 
 
 class _GatewayCommandCatalogPort(CommandCatalogPort):
     def __init__(self, context: RpcContext) -> None:
-        self._context = context
+        self._skill_loader = getattr(context, "skill_loader", None)
+        self._config = getattr(context, "config", None)
 
     async def list(self, query: CommandCatalogQuery) -> CommandCatalogResult:
-        return cast(
-            CommandCatalogResult,
-            await _list_commands_for_surface(query.surface, self._context),
+        return await _command_catalog(
+            query,
+            skill_loader=self._skill_loader,
+            config=self._config,
         )
 
 
