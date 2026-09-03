@@ -61,7 +61,7 @@ describe('ClarifyCard submit feedback', () => {
         || Boolean(forkTransition)
         || historyState.sessionMissing"`,
     )
-    expect(composerSource).toContain(':disabled="inputDisabled"')
+    expect(composerSource).toContain(':disabled="inputDisabled || freshInputDisabled"')
   })
 
   it('floats the Plan questionnaire without adding height to the composer dock', () => {

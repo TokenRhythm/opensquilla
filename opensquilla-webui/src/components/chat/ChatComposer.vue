@@ -266,7 +266,7 @@
                 :aria-disabled="freshInputDisabled || sessionRoutingControlBlocked
                   ? 'true'
                   : 'false'"
-                :disabled="freshInputDisabled || sessionRoutingControlBlocked"
+                :disabled="freshInputDisabled"
                 @click="toggleModelRouting"
               >
                 <Icon name="router" :size="17" />
@@ -741,7 +741,7 @@ onBeforeUnmount(() => {
 })
 
 function toggleModelRouting() {
-  if (props.freshInputDisabled || props.sessionRoutingControlBlocked) return
+  if (props.freshInputDisabled) return
   modelRoutingOpen.value = !modelRoutingOpen.value
   if (modelRoutingOpen.value) {
     dismissRouterNewBadge()
