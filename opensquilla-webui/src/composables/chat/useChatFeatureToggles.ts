@@ -19,10 +19,8 @@ import { useRouterVisualEffectsPreference } from '@/composables/useRouterVisualE
 import type { RpcCallOptions } from '@/lib/rpc'
 import type { AppSettings } from '@/modules/appSettings'
 import type { ModelRouting } from '@/modules/providerConfiguration'
-import type { SessionConversation } from '@/modules/sessionConversation'
 
 export interface UseChatFeatureTogglesOptions {
-  sessionConversation?: SessionConversation
   appSettings: AppSettings
   modelRouting: ModelRouting
   readCallOptions?: RpcCallOptions
@@ -390,9 +388,9 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
       if (document.visibilityState === 'visible') schedule()
     }
     const onFocus = () => schedule()
-    const unbindRouting = options.sessionConversation?.subscribeRoutingChanged((payload) => {
+    const unbindRouting = options.modelRouting.subscribeChanged((payload) => {
       modelRoutingEventGeneration += 1
-      applyModelRoutingSnapshot(payload as ModelRoutingSnapshot)
+      applyModelRoutingSnapshot(payload)
       scheduleHistorySync?.()
     })
     document.addEventListener('visibilitychange', onVisibility)

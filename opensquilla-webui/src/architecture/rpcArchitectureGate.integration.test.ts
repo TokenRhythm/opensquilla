@@ -205,12 +205,12 @@ describe('transport architecture hard-zero integration', () => {
     )
   })
 
-  it('does not exempt sessionConversationV4 from raw RPC operations', () => {
+  it('does not exempt copied Gateway Adapters from raw RPC operations', () => {
     const root = fixture({
       'src/lib/rpc.ts': `
         export interface RpcClient { call(method: string): unknown }
       `,
-      'src/adapters/gateway/sessionConversationV4.ts': `
+      'src/adapters/gateway/copiedConversationV4.ts': `
         import type { RpcClient } from '../../lib/rpc'
         declare const rpc: RpcClient
         rpc.call('session.get')
@@ -218,7 +218,7 @@ describe('transport architecture hard-zero integration', () => {
     })
 
     expect(evaluateRpcArchitectureGate({ root }).failures).toContain(
-      'src/adapters/gateway/sessionConversationV4.ts: unexpected raw transport call (1); add a domain Adapter instead.',
+      'src/adapters/gateway/copiedConversationV4.ts: unexpected raw transport call (1); add a domain Adapter instead.',
     )
   })
 

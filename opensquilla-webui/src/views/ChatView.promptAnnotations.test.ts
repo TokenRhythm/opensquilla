@@ -90,7 +90,6 @@ describe('ChatView prompt annotation focus and reuse', () => {
     expect(validation).toContain("abortAction: 'reject'")
     expect(validation).not.toContain("abortAction: 'reconnect'")
     expect(draftStart).toBeGreaterThan(-1)
-    expect(draft).not.toContain('sessionConversation.ready(')
     expect(draft).not.toContain('rpc.ready(')
     expect(draft).toContain('await projectWorkspaces.loadWorkspaces({')
     expect(draft).toContain("timeoutAction: 'reconnect'")

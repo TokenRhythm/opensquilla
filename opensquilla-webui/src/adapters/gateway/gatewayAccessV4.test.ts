@@ -26,6 +26,7 @@ function source() {
     connect: vi.fn(async () => undefined),
     disconnect: vi.fn(),
     recoverConnectionGeneration: vi.fn(() => true),
+    hasRpcEvent: vi.fn((_event: string) => false),
   }
 }
 
@@ -54,6 +55,7 @@ describe('createV4GatewayAccess', () => {
       concurrent_optional_read_methods: ['sessions.messages.hydrate'],
     }
     raw.connectionGeneration = 7
+    raw.hasRpcEvent.mockImplementation(event => event === 'session.event.turn_committed')
 
     const access = createV4GatewayAccess(raw)
 
@@ -68,6 +70,7 @@ describe('createV4GatewayAccess', () => {
     expect(access.streamIdleTimeoutMs).toBe(42_000)
     expect(access.concurrentHistoryReads).toBe(true)
     expect(access.detachedSessionHydration).toBe(true)
+    expect(access.turnCommittedEvents).toBe(true)
     expect(access.subscriptionEpoch).toBe(7)
   })
 

@@ -15,8 +15,9 @@ import type {
   ApprovalItem,
   ApprovalDecision,
 } from '@/modules/approvalCenter'
-import type { SessionConversation } from '@/modules/sessionConversation'
 import type { ClarificationSubmission } from '@/modules/clarificationSubmission'
+import type { ConversationEventHub } from '@/modules/conversationEventHub'
+import type { ConversationEvent } from '@/modules/conversationEvents'
 
 const MAX_RESOLVED_OUTCOMES = 4
 
@@ -113,7 +114,7 @@ export interface ApprovalsStreamSurface {
 }
 
 export interface UseChatApprovalsOptions {
-  sessionConversation: SessionConversation
+  conversationEvents: Pick<ConversationEventHub<ConversationEvent>, 'open'>
   clarificationSubmission: ClarificationSubmission
   approvalCenter: ApprovalCenter
   sessionKey: Ref<string>
@@ -202,7 +203,7 @@ function parseClarifyRequest(payload: ToolResultPayload): ChatClarifyRequest | n
  */
 export function useChatApprovals(options: UseChatApprovalsOptions) {
   const { approvalCenter, sessionKey, stream, interruptState } = options
-  const conversation = options.sessionConversation
+  const conversationEvents = options.conversationEvents
   const clarificationSubmission = options.clarificationSubmission
 
   const approvalEntries = ref<ChatApprovalEntry[]>([])
@@ -683,8 +684,13 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
 
   /** Register stream listeners; returns the unsubscribe function. */
   function subscribe(): () => void {
-    const toolResultSubscription = conversation.subscribeToolResults((payload) => {
-      handleToolResult(payload as ToolResultPayload)
+    const toolResultHandle = conversationEvents.open('')
+    const detachToolResults = toolResultHandle.observe((message) => {
+      if (
+        message.kind !== 'conversation'
+        || message.event.semanticKind !== 'tool-result'
+      ) return
+      handleToolResult(message.payload as ToolResultPayload)
     })
     const approvalEvents = approvalCenter.subscribe(event => {
       if (event.kind === 'requested') handleApprovalRequested(event)
@@ -696,7 +702,8 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     // before the listeners attached.
     hydrateApprovals()
     return () => {
-      toolResultSubscription.close()
+      detachToolResults()
+      toolResultHandle.close()
       approvalEvents.close()
       connection.close()
       stopFallbackPoll()

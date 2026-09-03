@@ -125,6 +125,7 @@ export interface ProviderStatusQuery {
 export interface ModelRouting {
   get(options?: { signal?: AbortSignal }): Promise<ModelRoutingSnapshot>
   setRouting(mode: RoutingMode, options?: { signal?: AbortSignal }): Promise<ModelRoutingSnapshot>
+  subscribeChanged(listener: (snapshot: ModelRoutingSnapshot) => void): { close(): void }
 }
 
 /** Composition object retained while pages migrate to narrow domain seams. */

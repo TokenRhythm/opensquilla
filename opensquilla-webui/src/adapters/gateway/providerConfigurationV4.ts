@@ -18,6 +18,8 @@ import { MODELS_LIST_METHOD } from '@/contracts/generated/v4/modelsList'
 import { validateResult as validateModelsListResult } from '@/contracts/generated/v4/modelsListValidators.mjs'
 import { MODELS_ROUTING_SET_METHOD } from '@/contracts/generated/v4/modelsRoutingSet'
 import { validateParams as validateModelsRoutingSetParams, validateResult as validateModelsRoutingSetResult } from '@/contracts/generated/v4/modelsRoutingSetValidators.mjs'
+import { MODELS_ROUTING_CHANGED_EVENT } from '@/contracts/generated/v4/modelsRoutingChangedEvent'
+import { validateModelsRoutingChangedPayload } from '@/contracts/generated/v4/modelsRoutingChangedEventValidators.mjs'
 import { ONBOARDING_CATALOG_METHOD } from '@/contracts/generated/v4/onboardingCatalog'
 import { validateResult as validateOnboardingCatalogResult } from '@/contracts/generated/v4/onboardingCatalogValidators.mjs'
 import { PROVIDERS_STATUS_METHOD } from '@/contracts/generated/v4/providersStatus'
@@ -25,6 +27,9 @@ import { validateParams as validateProvidersStatusParams, validateResult as vali
 
 interface RpcTransport {
   request<T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions): Promise<T>
+}
+interface EventTransport {
+  subscribe(event: string, handler: (payload: unknown) => void): { close(): void }
 }
 const options = (signal?: AbortSignal): RpcCallOptions => ({
   timeoutMs: 15_000,
@@ -164,7 +169,10 @@ function routing(value: unknown): ModelRoutingSnapshot {
   }
 }
 
-export function createV4ProviderConfiguration(rpc: RpcTransport): ProviderConfiguration {
+export function createV4ProviderConfiguration(
+  rpc: RpcTransport,
+  events: EventTransport,
+): ProviderConfiguration {
   return {
     async catalog(request) {
       const result = await rpc.request(ONBOARDING_CATALOG_METHOD, undefined, options(request?.signal))
@@ -201,6 +209,12 @@ export function createV4ProviderConfiguration(rpc: RpcTransport): ProviderConfig
       const result = await rpc.request(MODELS_ROUTING_SET_METHOD, params, options(request?.signal))
       if (!validateModelsRoutingSetResult(result)) throw new Error(`${MODELS_ROUTING_SET_METHOD} returned an invalid response`)
       return routing(result)
+    },
+    subscribeChanged(listener) {
+      return events.subscribe(MODELS_ROUTING_CHANGED_EVENT, payload => {
+        if (!validateModelsRoutingChangedPayload(payload)) return
+        listener(routing(payload))
+      })
     },
     credentials: {
       async reveal(providerId, request) {

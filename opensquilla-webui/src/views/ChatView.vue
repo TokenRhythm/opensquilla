@@ -876,7 +876,6 @@ import { useChatElevatedMode } from '@/composables/chat/useChatElevatedMode'
 import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
 import { useChatSessionRouting } from '@/composables/chat/useChatSessionRouting'
 import { SESSION_ROUTING_KEY, type SessionRouting } from '@/modules/sessionRouting'
-import { SESSION_CONVERSATION_KEY, type SessionConversation } from '@/modules/sessionConversation'
 import { USAGE_REPORTING_KEY, type UsageReporting } from '@/modules/usageReporting'
 import { COMMAND_CATALOG_KEY, type CommandCatalog } from '@/modules/commandCatalog'
 import { PROMPT_CACHE_LEASE_KEY, type PromptCacheLease } from '@/modules/promptCacheLease'
@@ -1214,9 +1213,6 @@ if (!injectedMetaRunCenter) throw new Error('MetaRunCenter was not provided')
 const metaRunCenter: MetaRunCenter = injectedMetaRunCenter
 const injectedAppSettings = inject(APP_SETTINGS_KEY)
 if (!injectedAppSettings) throw new Error('AppSettings was not provided')
-const injectedSessionConversation = inject(SESSION_CONVERSATION_KEY)
-if (!injectedSessionConversation) throw new Error('SessionConversation was not provided')
-const sessionConversation: SessionConversation = injectedSessionConversation
 const injectedUsageReporting = inject(USAGE_REPORTING_KEY)
 if (!injectedUsageReporting) throw new Error('UsageReporting was not provided')
 const usageReporting: UsageReporting = injectedUsageReporting
@@ -2152,7 +2148,6 @@ const {
 } = chatSessionRoute
 
 const chatFeatureToggles = useChatFeatureToggles({
-  sessionConversation,
   appSettings: injectedAppSettings,
   modelRouting: injectedProviderConfiguration,
   readCallOptions: optionalSessionRpcCallOptions,
@@ -3771,7 +3766,7 @@ async function steerPendingMessage(pendingUiId: string) {
 }
 
 const chatApprovals = useChatApprovals({
-  sessionConversation,
+  conversationEvents: conversationSessionRuntime.events,
   clarificationSubmission,
   approvalCenter,
   sessionKey,
@@ -3909,7 +3904,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   showCompactionToast,
   getCompactionPlacement: id => getCompactionPlacement(id) || undefined,
   showWarningToast: message => pushToast(message || t('chat.warning.default'), { tone: 'warn', duration: 5000 }),
-  supportsTurnCommitted: () => sessionConversation.supports('turn-committed'),
+  supportsTurnCommitted: () => gatewayAccess.turnCommittedEvents,
   scheduleHistorySync,
   schedulePendingDrainAfterTerminal,
   popAllPendingIntoComposer,
