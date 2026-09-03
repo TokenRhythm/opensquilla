@@ -43,8 +43,7 @@ def _reject_past_at(cron_expr: str, now: datetime) -> None:
     at_dt = parse_iso_at(cron_expr)
     if at_dt < now:
         raise ValueError(
-            f"schedule.at is in the past: {cron_expr}; "
-            "one-time schedules must be in the future"
+            f"schedule.at is in the past: {cron_expr}; one-time schedules must be in the future"
         )
 
 
@@ -227,11 +226,7 @@ class SchedulerOps:
         # fall back to ISOLATED instead of failing creation. Headless cron
         # callers (no session context) get an isolated run rather than a hard
         # error.
-        if (
-            session_target == SessionTarget.CURRENT
-            and not session_key
-            and not origin_session_key
-        ):
+        if session_target == SessionTarget.CURRENT and not session_key and not origin_session_key:
             session_target = SessionTarget.ISOLATED
 
         origin_session_key = normalize_origin_session_key(session_target, origin_session_key)

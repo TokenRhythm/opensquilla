@@ -132,9 +132,7 @@ async def test_cron_creator_authority_survives_persistence_without_widening_owne
         creator_is_owner or expected_persisted_host_execute
     )
     assert bool(envelope.metadata.get("cron_trusted_owner")) is creator_is_owner
-    assert bool(envelope.metadata.get("cron_trusted_host")) is (
-        expected_persisted_host_execute
-    )
+    assert bool(envelope.metadata.get("cron_trusted_host")) is (expected_persisted_host_execute)
     assert bool(envelope.metadata.get(PRINCIPAL_HOST_EXECUTE_METADATA_KEY)) is (
         expected_persisted_host_execute
     )
