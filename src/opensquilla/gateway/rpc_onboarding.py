@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import structlog
 
@@ -488,7 +488,7 @@ async def _provider_probe(params: Any, ctx: RpcContext) -> dict[str, Any]:
         proxy=str(p.get("proxy", "") or ""),
         preserve_api_key=bool(p.get("preserveApiKey", False)),
     )
-    return await _provider_setup(ctx).probe_primary(command)
+    return cast(dict[str, Any], await _provider_setup(ctx).probe_primary(command))
 
 
 async def _models_discover(params: Any, ctx: RpcContext) -> dict[str, Any]:
@@ -505,15 +505,21 @@ async def _models_discover(params: Any, ctx: RpcContext) -> dict[str, Any]:
         proxy=str(p.get("proxy", "") or ""),
         force_refresh=_bool_param(params, "forceRefresh"),
     )
-    return await _provider_setup(ctx).discover_primary_models(command)
+    return cast(
+        dict[str, Any],
+        await _provider_setup(ctx).discover_primary_models(command),
+    )
 
 
 async def _image_generation_models_discover(
     params: Any, ctx: RpcContext
 ) -> dict[str, Any]:
 
-    return await _provider_setup(ctx).discover_image_models(
-        str(_require(params, "providerId"))
+    return cast(
+        dict[str, Any],
+        await _provider_setup(ctx).discover_image_models(
+            str(_require(params, "providerId"))
+        ),
     )
 
 
@@ -540,33 +546,45 @@ def _profile_lifecycle(ctx: RpcContext) -> ProfileLifecycle:
 
 
 async def _llm_profile_probe(params: Any, ctx: RpcContext) -> dict[str, Any]:
-    return await _profile_lifecycle(ctx).probe(_profile_probe_command(params))
+    return cast(
+        dict[str, Any],
+        await _profile_lifecycle(ctx).probe(_profile_probe_command(params)),
+    )
 
 
 async def _llm_profile_draft_probe(params: Any, ctx: RpcContext) -> dict[str, Any]:
-    return await _profile_lifecycle(ctx).probe_draft(_profile_probe_command(params))
+    return cast(
+        dict[str, Any],
+        await _profile_lifecycle(ctx).probe_draft(_profile_probe_command(params)),
+    )
 
 
 async def _llm_profile_models_discover(
     params: Any, ctx: RpcContext
 ) -> dict[str, Any]:
-    return await _profile_lifecycle(ctx).discover_models(_profile_probe_command(params))
+    return cast(
+        dict[str, Any],
+        await _profile_lifecycle(ctx).discover_models(_profile_probe_command(params)),
+    )
 
 
 async def _llm_profile_draft_models_discover(
     params: Any, ctx: RpcContext
 ) -> dict[str, Any]:
-    return await _profile_lifecycle(ctx).discover_draft_models(
-        _profile_probe_command(params)
+    return cast(
+        dict[str, Any],
+        await _profile_lifecycle(ctx).discover_draft_models(
+            _profile_probe_command(params)
+        ),
     )
 
 
 async def _onboarding_status(_params: Any, ctx: RpcContext) -> dict[str, Any]:
-    return await _setup_workflow(ctx).status()
+    return cast(dict[str, Any], await _setup_workflow(ctx).status())
 
 
 async def _onboarding_catalog(_params: Any, ctx: RpcContext) -> dict[str, Any]:
-    return await _setup_workflow(ctx).catalog()
+    return cast(dict[str, Any], await _setup_workflow(ctx).catalog())
 
 
 def _require(params: Any, key: str) -> Any:
@@ -727,7 +745,7 @@ async def _provider_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
             ),
         )
         result = await _provider_setup(ctx).configure_primary(command)
-    return result.to_payload()
+    return cast(dict[str, Any], result.to_payload())
 
 
 async def _llm_profile_upsert(params: Any, ctx: RpcContext) -> dict[str, Any]:
@@ -761,7 +779,7 @@ async def _llm_profile_upsert(params: Any, ctx: RpcContext) -> dict[str, Any]:
                 proxy=p.get("proxy") if "proxy" in p else None,
             )
         )
-    return result.to_payload()
+    return cast(dict[str, Any], result.to_payload())
 
 
 async def _llm_profile_credential_clear(params: Any, ctx: RpcContext) -> dict[str, Any]:
@@ -793,7 +811,7 @@ async def _llm_profile_remove(params: Any, ctx: RpcContext) -> dict[str, Any]:
     provider_id = str(_require(params, "providerId"))
     with _validation_error("onboarding.llmProfile.invalid"):
         result = await _profile_lifecycle(ctx).remove(provider_id)
-    return result.to_payload()
+    return cast(dict[str, Any], result.to_payload())
 
 
 async def _llm_profile_active_remove(params: Any, ctx: RpcContext) -> dict[str, Any]:
@@ -860,7 +878,7 @@ async def _llm_profile_active_remove(params: Any, ctx: RpcContext) -> dict[str, 
     except (ValueError, KeyError) as exc:
         raise RpcHandlerError("onboarding.llmProfile.invalid", str(exc)) from exc
 
-    return result.to_payload()
+    return cast(dict[str, Any], result.to_payload())
 
 
 async def _llm_profile_activate(params: Any, ctx: RpcContext) -> dict[str, Any]:
@@ -910,7 +928,7 @@ async def _llm_profile_activate(params: Any, ctx: RpcContext) -> dict[str, Any]:
     except (ValueError, KeyError) as exc:
         raise RpcHandlerError("onboarding.llmProfile.invalid", str(exc)) from exc
 
-    return result.to_payload()
+    return cast(dict[str, Any], result.to_payload())
 
 
 def _llm_profile_rpc_session_key(ctx: RpcContext, provider_id: str) -> str:
@@ -1280,12 +1298,15 @@ async def _provider_credential_reveal(params: Any, ctx: RpcContext) -> dict[str,
             _credential_clear_effective_payload(current, provider, active=active)
         ),
     )
-    return ProviderCredentials(
-        config,
-        runtime,
-        credentials,
-        _setup_mutation_port(),
-    ).reveal_active(str(_require(params, "providerId")))
+    return cast(
+        dict[str, Any],
+        ProviderCredentials(
+            config,
+            runtime,
+            credentials,
+            _setup_mutation_port(),
+        ).reveal_active(str(_require(params, "providerId"))),
+    )
 
 
 async def _provider_credential_clear(params: Any, ctx: RpcContext) -> dict[str, Any]:
@@ -1318,7 +1339,7 @@ async def _provider_credential_clear(params: Any, ctx: RpcContext) -> dict[str, 
     # must not retain stale runtime-secret provenance.
     if not str(getattr(live_config.llm, "api_key", "") or ""):
         live_config._runtime_secret_paths.discard("llm.api_key")
-    return result.to_payload()
+    return cast(dict[str, Any], result.to_payload())
 
 
 async def _models_discover_impl(params: Any, ctx: RpcContext) -> dict[str, Any]:
@@ -1431,7 +1452,7 @@ async def _router_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
                 tier_provider_mismatch=tier_provider_mismatch,
             )
         )
-    return result.to_payload()
+    return cast(dict[str, Any], result.to_payload())
 
 
 async def _ensemble_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
@@ -1457,7 +1478,7 @@ async def _ensemble_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
                 all_failed_policy=p.get("allFailedPolicy"),
             )
         )
-    return result.to_payload()
+    return cast(dict[str, Any], result.to_payload())
 
 
 async def _channel_probe(params: Any, ctx: RpcContext) -> dict[str, Any]:
@@ -1507,7 +1528,7 @@ async def _search_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
                 diagnostics=_bool_param(params, "diagnostics"),
             )
         )
-    return result.to_payload()
+    return cast(dict[str, Any], result.to_payload())
 
 
 async def _image_generation_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
@@ -1535,7 +1556,7 @@ async def _image_generation_configure(params: Any, ctx: RpcContext) -> dict[str,
                 credential_mode=p.get("credentialMode"),
             )
         )
-    return result.to_payload()
+    return cast(dict[str, Any], result.to_payload())
 
 
 async def _memory_embedding_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
@@ -1554,7 +1575,7 @@ async def _memory_embedding_configure(params: Any, ctx: RpcContext) -> dict[str,
             onnx_dir=str(p.get("onnxDir", "")),
         )
     )
-    return result.to_payload()
+    return cast(dict[str, Any], result.to_payload())
 
 
 async def _audio_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
@@ -1574,7 +1595,7 @@ async def _audio_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
             language_code=p.get("languageCode", ""),
         ),
     )
-    return result.to_payload()
+    return cast(dict[str, Any], result.to_payload())
 
 
 async def _capability_reset(params: Any, ctx: RpcContext) -> dict[str, Any]:
@@ -1583,7 +1604,7 @@ async def _capability_reset(params: Any, ctx: RpcContext) -> dict[str, Any]:
         result = await _capability_setup(ctx).reset(
             str(_require(params, "capabilityId"))
         )
-    return result.to_payload()
+    return cast(dict[str, Any], result.to_payload())
 
 
 async def _reconcile_channels_live() -> dict[str, str] | None:

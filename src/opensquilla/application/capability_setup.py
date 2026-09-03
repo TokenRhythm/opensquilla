@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from opensquilla.application.setup_mutations import (
     SetupConfigPort,
     SetupMutation,
+    SetupMutationEntry,
     SetupRuntimePort,
     commit_setup_mutation,
 )
@@ -234,7 +235,7 @@ class CapabilitySetup:
             changed=bool(result.changed),
             restart_required=restart_required,
             config_path=config_path,
-            entry=dict(result.public_payload),
+            entry=cast(SetupMutationEntry, dict(result.public_payload)),
             warnings=tuple(warnings),
         )
 

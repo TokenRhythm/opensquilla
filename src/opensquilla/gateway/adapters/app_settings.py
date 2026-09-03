@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
-from typing import Any
+from typing import Any, cast
 
+from opensquilla.application.app_settings import (
+    EffectiveSettings,
+    SettingsMutation,
+    SettingsObject,
+    SettingsValue,
+)
 from opensquilla.gateway.rpc import RpcContext
 
 PatchRunner = Callable[[dict[str, Any], RpcContext, str], Awaitable[dict[str, Any]]]
@@ -25,7 +31,7 @@ class RpcContextAppSettingsPort:
         self._patch_runner = patch_runner
         self._effective_reader = effective_reader
 
-    async def read_public_settings(self) -> Mapping[str, Any]:
+    async def read_public_settings(self) -> SettingsObject:
         config = self._ctx.config
         if config is None:
             return {}
@@ -36,25 +42,31 @@ class RpcContextAppSettingsPort:
             if hasattr(config, "model_dump")
             else {}
         )
-        return value if isinstance(value, Mapping) else {}
+        return cast(SettingsObject, dict(value)) if isinstance(value, Mapping) else {}
 
-    async def read_effective_settings(self) -> Mapping[str, Any]:
+    async def read_effective_settings(self) -> EffectiveSettings:
         if self._effective_reader is None:
             raise RuntimeError("effective settings reader is not configured")
-        return await self._effective_reader(self._ctx)
+        return cast(EffectiveSettings, await self._effective_reader(self._ctx))
 
     async def patch_settings(
         self,
-        changes: Mapping[str, Any],
+        changes: Mapping[str, SettingsValue],
         *,
         safe: bool,
-    ) -> Mapping[str, Any]:
+    ) -> SettingsMutation:
         if self._patch_runner is None:
             raise RuntimeError("settings mutation runner is not configured")
         source = "config.patch.safe" if safe else "config.patch"
-        return await self._patch_runner({"patches": dict(changes)}, self._ctx, source)
+        return cast(
+            SettingsMutation,
+            await self._patch_runner({"patches": dict(changes)}, self._ctx, source),
+        )
 
-    async def merge_settings(self, patch: Mapping[str, Any]) -> Mapping[str, Any]:
+    async def merge_settings(self, patch: Mapping[str, SettingsValue]) -> SettingsMutation:
         if self._patch_runner is None:
             raise RuntimeError("settings mutation runner is not configured")
-        return await self._patch_runner({"patch": dict(patch)}, self._ctx, "config.patch")
+        return cast(
+            SettingsMutation,
+            await self._patch_runner({"patch": dict(patch)}, self._ctx, "config.patch"),
+        )

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.provider.model_catalog import ModelCatalog
@@ -258,9 +258,12 @@ async def _handle_models_list(params: dict | None, ctx: RpcContext) -> dict[str,
     if capabilities is not None and not isinstance(capabilities, list):
         raise ValueError("params.capabilities must be an array")
     catalog = ModelCatalog(RpcContextModelCatalogPort(ctx, _load_models))
-    return await catalog.query(
-        provider_id=query.get("provider"),
-        capabilities=capabilities,
+    return cast(
+        dict[str, Any],
+        await catalog.query(
+            provider_id=query.get("provider"),
+            capabilities=capabilities,
+        ),
     )
 
 
@@ -285,7 +288,7 @@ async def _handle_models_routing_get(
     _params: dict | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    return await _model_routing(ctx).read()
+    return cast(dict[str, Any], await _model_routing(ctx).read())
 
 
 async def _handle_models_routing_set(
@@ -294,7 +297,7 @@ async def _handle_models_routing_set(
 ) -> dict[str, Any]:
     if not isinstance(params, dict) or not isinstance(params.get("mode"), str):
         raise ValueError("params.mode is required")
-    return await _model_routing(ctx).set_mode(params["mode"])
+    return cast(dict[str, Any], await _model_routing(ctx).set_mode(params["mode"]))
 
 
 # Generated descriptors own identity/scope/validation for the contracted

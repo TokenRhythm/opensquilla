@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from opensquilla.application.capability_setup import (
     AudioCapabilitySetup,
@@ -29,7 +29,10 @@ def _application(holder: Any) -> AudioCapabilitySetup:
 async def configure_audio_provider(holder: Any, command: ConfigureAudio) -> dict[str, Any]:
     """Configure one operator-specified audio provider and return a safe payload."""
 
-    return (await _application(holder).configure(command)).to_payload()
+    return cast(
+        dict[str, Any],
+        (await _application(holder).configure(command)).to_payload(),
+    )
 
 
 async def configure_agent_audio_provider(

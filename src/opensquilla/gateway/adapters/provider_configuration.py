@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
-from typing import Any
+from collections.abc import Awaitable, Callable
+from typing import Any, cast
 
-from opensquilla.application.provider_configuration import PreparedModelRouting
+from opensquilla.application.provider_configuration import (
+    ModelCatalogResult,
+    ModelRoutingSnapshot,
+    PreparedModelRouting,
+    ProviderStatusResult,
+)
 from opensquilla.gateway.model_routing import (
     apply_model_routing_mode,
     broadcast_model_routing_changed_if_needed,
@@ -28,15 +33,15 @@ class RpcContextModelCatalogPort:
         self._ctx = ctx
         self._loader = loader
 
-    async def load_model_catalog(self) -> Mapping[str, Any]:
-        return await self._loader(self._ctx)
+    async def load_model_catalog(self) -> ModelCatalogResult:
+        return cast(ModelCatalogResult, await self._loader(self._ctx))
 
 
 class GatewayModelRoutingPolicyPort:
     """Translate domain routing intent into a detached config candidate."""
 
-    def snapshot(self, config: Any) -> Mapping[str, Any]:
-        return model_routing_public_snapshot(config)
+    def snapshot(self, config: Any) -> ModelRoutingSnapshot:
+        return cast(ModelRoutingSnapshot, model_routing_public_snapshot(config))
 
     def prepare(self, config: Any, mode: str) -> PreparedModelRouting:
         patches = model_routing_patches(config, mode)
@@ -63,7 +68,7 @@ class RpcContextModelRoutingRuntimePort:
 
     async def publish_changed(
         self,
-        previous: Mapping[str, Any],
+        previous: ModelRoutingSnapshot,
         config: Any,
         *,
         source: str,
@@ -87,11 +92,14 @@ class GatewayProviderStatusPort:
         *,
         provider_id: str | None,
         probe_models: bool,
-    ) -> Mapping[str, Any]:
-        return await read_provider_status(
-            config=getattr(self._ctx, "config", None),
-            provider_selector=getattr(self._ctx, "provider_selector", None),
-            provider_stats=getattr(self._ctx, "provider_stats", None),
-            provider_id=provider_id,
-            probe_models=probe_models,
+    ) -> ProviderStatusResult:
+        return cast(
+            ProviderStatusResult,
+            await read_provider_status(
+                config=getattr(self._ctx, "config", None),
+                provider_selector=getattr(self._ctx, "provider_selector", None),
+                provider_stats=getattr(self._ctx, "provider_stats", None),
+                provider_id=provider_id,
+                probe_models=probe_models,
+            ),
         )

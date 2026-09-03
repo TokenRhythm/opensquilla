@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import copy
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import structlog
 
@@ -1000,9 +1000,12 @@ async def _handle_config_patch(
         return await _execute_config_patch(params, ctx, _model_routing_source)
     settings = _app_settings(ctx)
     if patch_data:
-        return await settings.merge(patch_data)
-    return await settings.patch(
-        [SettingChange(path, value) for path, value in dot_patches.items()]
+        return cast(dict[str, Any], await settings.merge(patch_data))
+    return cast(
+        dict[str, Any],
+        await settings.patch(
+            [SettingChange(path, value) for path, value in dot_patches.items()]
+        ),
     )
 
 
@@ -1025,8 +1028,11 @@ async def _handle_config_patch_safe(params: dict | None, ctx: RpcContext) -> dic
 
     from opensquilla.application.app_settings import SettingChange
 
-    return await _app_settings(ctx).patch_safe(
-        [SettingChange(path, value) for path, value in dot_patches.items()]
+    return cast(
+        dict[str, Any],
+        await _app_settings(ctx).patch_safe(
+            [SettingChange(path, value) for path, value in dot_patches.items()]
+        ),
     )
 
 
@@ -1351,7 +1357,7 @@ async def _handle_config_effective(
     _params: dict | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    return await _app_settings(ctx).read_effective()
+    return cast(dict[str, Any], await _app_settings(ctx).read_effective())
 
 
 # Generated descriptors own identity/scope/validation for the contracted

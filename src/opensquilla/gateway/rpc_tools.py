@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.search_status_runtime import read_search_status as _read_search_status
@@ -89,9 +89,12 @@ async def read_provider_status(params: dict | None, ctx: RpcContext) -> dict[str
         raise ValueError("params must be an object")
     query = params or {}
     status = ProviderStatus(GatewayProviderStatusPort(ctx))
-    return await status.read(
-        provider_id=query.get("provider"),
-        probe_models=bool(query.get("probeModels", False)),
+    return cast(
+        dict[str, Any],
+        await status.read(
+            provider_id=query.get("provider"),
+            probe_models=bool(query.get("probeModels", False)),
+        ),
     )
 
 

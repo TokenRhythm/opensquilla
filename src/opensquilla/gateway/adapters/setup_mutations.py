@@ -8,7 +8,7 @@ context itself.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from typing import Any
+from typing import Any, cast
 
 from opensquilla.application.capability_setup import (
     CapabilityMutationPort,
@@ -28,15 +28,20 @@ from opensquilla.application.profile_lifecycle import (
     UpsertProfile,
 )
 from opensquilla.application.provider_credentials import (
+    CredentialClearDescription,
     CredentialResolutionPort,
+    CredentialRevealResult,
     ProviderCredentialMutationPort,
 )
 from opensquilla.application.provider_setup import (
     ConfigurePrimaryProvider,
     DiscoverPrimaryModels,
+    ImageModelDiscoveryResult,
     PrimaryProviderMutationPort,
     ProbePrimaryProvider,
+    ProviderModelDiscoveryResult,
     ProviderProbePort,
+    ProviderProbeResult,
 )
 from opensquilla.application.setup_mutations import SetupConfigPort, SetupRuntimePort
 from opensquilla.gateway.rpc import RpcContext
@@ -341,16 +346,25 @@ class RpcContextProviderProbePort(ProviderProbePort):
         self._discover = discover
         self._discover_images = discover_images
 
-    async def probe_primary(self, command: ProbePrimaryProvider) -> Mapping[str, Any]:
-        return await self._probe(_provider_probe_params(command), self._ctx)
+    async def probe_primary(self, command: ProbePrimaryProvider) -> ProviderProbeResult:
+        return cast(
+            ProviderProbeResult,
+            await self._probe(_provider_probe_params(command), self._ctx),
+        )
 
     async def discover_primary_models(
         self, command: DiscoverPrimaryModels
-    ) -> Mapping[str, Any]:
-        return await self._discover(_provider_discovery_params(command), self._ctx)
+    ) -> ProviderModelDiscoveryResult:
+        return cast(
+            ProviderModelDiscoveryResult,
+            await self._discover(_provider_discovery_params(command), self._ctx),
+        )
 
-    async def discover_image_models(self, provider_id: str) -> Mapping[str, Any]:
-        return await self._discover_images({"providerId": provider_id}, self._ctx)
+    async def discover_image_models(self, provider_id: str) -> ImageModelDiscoveryResult:
+        return cast(
+            ImageModelDiscoveryResult,
+            await self._discover_images({"providerId": provider_id}, self._ctx),
+        )
 
 
 class RpcContextProfileProbePort(ProfileProbePort):
@@ -369,17 +383,33 @@ class RpcContextProfileProbePort(ProfileProbePort):
         self._discover_saved = discover_saved
         self._discover_draft = discover_draft
 
-    async def probe_saved(self, command: ProfileProbeCommand) -> Mapping[str, Any]:
-        return await self._probe_saved(dict(command.values), self._ctx)
+    async def probe_saved(self, command: ProfileProbeCommand) -> ProviderProbeResult:
+        return cast(
+            ProviderProbeResult,
+            await self._probe_saved(dict(command.values), self._ctx),
+        )
 
-    async def probe_draft(self, command: ProfileProbeCommand) -> Mapping[str, Any]:
-        return await self._probe_draft(dict(command.values), self._ctx)
+    async def probe_draft(self, command: ProfileProbeCommand) -> ProviderProbeResult:
+        return cast(
+            ProviderProbeResult,
+            await self._probe_draft(dict(command.values), self._ctx),
+        )
 
-    async def discover_saved(self, command: ProfileProbeCommand) -> Mapping[str, Any]:
-        return await self._discover_saved(dict(command.values), self._ctx)
+    async def discover_saved(
+        self, command: ProfileProbeCommand
+    ) -> ProviderModelDiscoveryResult:
+        return cast(
+            ProviderModelDiscoveryResult,
+            await self._discover_saved(dict(command.values), self._ctx),
+        )
 
-    async def discover_draft(self, command: ProfileProbeCommand) -> Mapping[str, Any]:
-        return await self._discover_draft(dict(command.values), self._ctx)
+    async def discover_draft(
+        self, command: ProfileProbeCommand
+    ) -> ProviderModelDiscoveryResult:
+        return cast(
+            ProviderModelDiscoveryResult,
+            await self._discover_draft(dict(command.values), self._ctx),
+        )
 
 
 class RpcContextCredentialResolutionPort(CredentialResolutionPort):
@@ -394,13 +424,16 @@ class RpcContextCredentialResolutionPort(CredentialResolutionPort):
         self._reveal = reveal
         self._describe = describe
 
-    def reveal_active(self, provider_id: str) -> Mapping[str, Any]:
-        return self._reveal(self._ctx, provider_id)
+    def reveal_active(self, provider_id: str) -> CredentialRevealResult:
+        return cast(CredentialRevealResult, self._reveal(self._ctx, provider_id))
 
     def describe_clear_result(
         self, config: Any, provider_id: str, *, active: bool
-    ) -> Mapping[str, Any]:
-        return self._describe(config, provider_id, active)
+    ) -> CredentialClearDescription:
+        return cast(
+            CredentialClearDescription,
+            self._describe(config, provider_id, active),
+        )
 
 
 def _provider_probe_params(command: ProbePrimaryProvider) -> dict[str, Any]:

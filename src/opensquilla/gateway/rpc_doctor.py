@@ -116,9 +116,12 @@ async def _search_runtime_payload(
 
 async def _provider_payload(params: dict[str, Any] | None, ctx: RpcContext) -> dict[str, Any]:
     query = params or {}
-    return await ProviderStatus(GatewayProviderStatusPort(ctx)).read(
-        provider_id=query.get("provider"),
-        probe_models=bool(query.get("probeModels", False)),
+    return cast(
+        dict[str, Any],
+        await ProviderStatus(GatewayProviderStatusPort(ctx)).read(
+            provider_id=query.get("provider"),
+            probe_models=bool(query.get("probeModels", False)),
+        ),
     )
 
 
