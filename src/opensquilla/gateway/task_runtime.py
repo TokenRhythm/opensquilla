@@ -280,8 +280,14 @@ def _storage_owner_cas_kwargs(
             return {"expected_session_id": session_id}
         return {}
 
-    supports_session_id = _accepts_keyword_arg(operation, "expected_session_id")
-    supports_session_epoch = _accepts_keyword_arg(operation, "expected_session_epoch")
+    supports_session_id = _accepts_explicit_keyword_arg(
+        operation,
+        "expected_session_id",
+    )
+    supports_session_epoch = _accepts_explicit_keyword_arg(
+        operation,
+        "expected_session_epoch",
+    )
     if (
         not isinstance(session_id, str)
         or not session_id
@@ -305,6 +311,17 @@ def _accepts_keyword_arg(callable_obj: Any, name: str) -> bool:
     if name in params:
         return True
     return any(param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values())
+
+
+def _accepts_explicit_keyword_arg(callable_obj: Any, name: str) -> bool:
+    try:
+        parameter = inspect.signature(callable_obj).parameters.get(name)
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
 
 
 def _accepted_run_mode_payload(override: Any) -> dict[str, str] | None:

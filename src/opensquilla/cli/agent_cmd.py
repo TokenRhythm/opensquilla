@@ -125,7 +125,7 @@ async def _standalone_session_owner_kwargs(
     *,
     session: Any | None = None,
 ) -> dict[str, Any]:
-    from opensquilla.engine.runtime import _accepts_keyword_arg
+    from opensquilla.engine.runtime import _accepts_explicit_keyword_arg
     from opensquilla.gateway.session_services import get_session_storage
     from opensquilla.session.storage import SessionStorage
 
@@ -133,12 +133,12 @@ async def _standalone_session_owner_kwargs(
     if not isinstance(storage, SessionStorage):
         return {}
     if not all(
-        _accepts_keyword_arg(session_manager.append_message, name)
+        _accepts_explicit_keyword_arg(session_manager.append_message, name)
         for name in ("expected_session_id", "expected_session_epoch")
     ):
         raise RuntimeError("Session writer cannot enforce a durable owner")
     if not all(
-        _accepts_keyword_arg(turn_runner.run, name)
+        _accepts_explicit_keyword_arg(turn_runner.run, name)
         for name in ("expected_session_id", "expected_session_epoch")
     ):
         raise RuntimeError("Turn runner cannot enforce a durable owner")
@@ -330,6 +330,17 @@ async def run_agent_once(
             session_key,
             session=admitted_session,
         )
+        if transcript_path and owner_kwargs:
+            from opensquilla.engine.runtime import _accepts_explicit_keyword_arg
+
+            if not all(
+                _accepts_explicit_keyword_arg(
+                    svc.session_manager.get_transcript,
+                    name,
+                )
+                for name in ("expected_session_id", "expected_session_epoch")
+            ):
+                raise RuntimeError("Session reader cannot enforce a durable owner")
         if run_attachments:
             from opensquilla.gateway.transcripts import build_transcript_attachment_envelope
 
@@ -504,7 +515,10 @@ async def run_agent_once(
         usage = _usage_from_done(done, effective_model)
         transcript_usage = _to_transcript_usage(usage)
         if transcript_path:
-            transcript = await svc.session_manager.get_transcript(session_key)
+            transcript = await svc.session_manager.get_transcript(
+                session_key,
+                **owner_kwargs,
+            )
             _write_jsonl(transcript_path, _to_benchmark_transcript(transcript, transcript_usage))
     finally:
         await svc.close()

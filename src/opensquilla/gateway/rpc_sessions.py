@@ -419,6 +419,19 @@ def _accepts_keyword_arg(func: Any, name: str) -> bool:
     )
 
 
+def _accepts_explicit_keyword_arg(func: Any, name: str) -> bool:
+    """Return whether a durable-owner keyword is part of the declared contract."""
+
+    try:
+        parameter = inspect.signature(func).parameters.get(name)
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
+
+
 def _artifact_state_event_emitter(
     ctx: RpcContext,
     session_key: str,
@@ -4111,9 +4124,23 @@ async def _handle_sessions_send_impl_inner(
         else key.split(":")[-1] or key
     )
     session_epoch = int(getattr(session, "epoch", 0) or 0)
+    exact_owner_required = isinstance(storage, SessionStorage)
 
     def _expected_session_owner_kwargs(call: Any) -> dict[str, Any]:
         """Pass the admitted owner to modern writers while retaining legacy adapters."""
+
+        if exact_owner_required:
+            if not all(
+                _accepts_explicit_keyword_arg(call, name)
+                for name in ("expected_session_id", "expected_session_epoch")
+            ):
+                raise RuntimeError(
+                    "Durable session ingress cannot retain the exact session owner"
+                )
+            return {
+                "expected_session_id": session_id,
+                "expected_session_epoch": session_epoch,
+            }
 
         owner_kwargs: dict[str, Any] = {}
         if _accepts_keyword_arg(call, "expected_session_id"):

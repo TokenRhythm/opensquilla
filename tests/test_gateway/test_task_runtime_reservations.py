@@ -68,6 +68,15 @@ class _TrackingStorage:
         self.records[record.task_id] = record
 
 
+class _DroppingKwargsStorage(_TrackingStorage):
+    async def create_agent_task(
+        self,
+        record: AgentTaskRecord,
+        **_kwargs: Any,
+    ) -> None:
+        await super().create_agent_task(record)
+
+
 @dataclass(frozen=True)
 class _PersistenceResult:
     replayed: bool = False
@@ -134,6 +143,28 @@ async def test_direct_enqueue_rejects_stale_owner_before_task_activation(tmp_pat
     finally:
         await runtime.shutdown(graceful=True, timeout=1.0)
         await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_direct_enqueue_modern_owner_rejects_dropping_kwargs_storage() -> None:
+    storage = _DroppingKwargsStorage()
+    handler_started = asyncio.Event()
+
+    async def handler(_run: Any) -> None:
+        handler_started.set()
+
+    runtime = TaskRuntime(storage=storage, turn_handler=handler)
+
+    with pytest.raises(RuntimeError, match="exact session-owner storage CAS"):
+        await runtime.enqueue(
+            _envelope(session_id="session-owner", session_epoch=0),
+            "must not execute",
+        )
+
+    assert storage.create_calls == []
+    assert storage.records == {}
+    assert not handler_started.is_set()
+    assert runtime._reservations_by_session == {}
 
 
 @pytest.mark.asyncio

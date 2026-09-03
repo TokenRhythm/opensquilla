@@ -1153,6 +1153,38 @@ class TestSessionsCreate:
         assert session_manager.append_kwargs == {}
 
     @pytest.mark.asyncio
+    async def test_create_with_message_rejects_dropping_durable_writer(
+        self,
+        dispatcher,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from opensquilla.session.manager import SessionManager
+
+        storage = await SessionStorage.open(str(tmp_path / "create-dropping-writer.db"))
+        manager = SessionManager(storage, inject_time_prefix=False)
+        append_calls: list[dict[str, Any]] = []
+
+        async def _dropping_append(*_args: Any, **kwargs: Any) -> None:
+            append_calls.append(dict(kwargs))
+
+        monkeypatch.setattr(manager, "append_message", _dropping_append)
+        try:
+            response = await dispatcher.dispatch(
+                "r-create-dropping-writer",
+                "sessions.create",
+                {"agentId": "main", "message": "must not persist"},
+                make_ctx(session_manager=manager),
+            )
+        finally:
+            await storage.close()
+
+        assert response.ok is False
+        assert response.error.code == "INTERNAL_ERROR"
+        assert "cannot enforce a durable owner" in response.error.message
+        assert append_calls == []
+
+    @pytest.mark.asyncio
     async def test_create_with_message_reset_before_append_preserves_replacement(
         self,
         dispatcher,
@@ -1173,12 +1205,20 @@ class TestSessionsCreate:
             admitted = await original_create(*args, **kwargs)
             return admitted
 
-        async def _reset_before_append(*args: Any, **kwargs: Any) -> TranscriptEntry:
+        async def _reset_before_append(
+            session_key: str,
+            role: str = "user",
+            content: str = "",
+            *,
+            expected_session_id: str | None = None,
+            expected_session_epoch: int | None = None,
+            **kwargs: Any,
+        ) -> TranscriptEntry:
             assert admitted is not None
-            assert (
-                kwargs.get("expected_session_id"),
-                kwargs.get("expected_session_epoch"),
-            ) == (admitted.session_id, int(admitted.epoch or 0))
+            assert (expected_session_id, expected_session_epoch) == (
+                admitted.session_id,
+                int(admitted.epoch or 0),
+            )
             replacement = await _reset_durable_session(
                 storage,
                 admitted,
@@ -1192,7 +1232,14 @@ class TestSessionsCreate:
                 expected_session_id=replacement.session_id,
                 expected_session_epoch=int(replacement.epoch or 0),
             )
-            return await original_append(*args, **kwargs)
+            return await original_append(
+                session_key,
+                role=role,
+                content=content,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+                **kwargs,
+            )
 
         monkeypatch.setattr(rpc_sessions, "_create_session_key", lambda _agent, _kind=None: key)
         monkeypatch.setattr(manager, "create", _capture_create)
@@ -2467,6 +2514,59 @@ class TestSessionsList:
 
 
 class TestSessionsSend:
+    @pytest.mark.asyncio
+    async def test_direct_send_rejects_dropping_durable_runner(
+        self,
+        dispatcher,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from opensquilla.session.manager import SessionManager
+
+        storage = await SessionStorage.open(str(tmp_path / "send-dropping-runner.db"))
+        manager = SessionManager(storage, inject_time_prefix=False)
+        session = await manager.create(
+            session_key="agent:main:webchat:send-dropping-runner",
+            agent_id="main",
+        )
+        terminal = asyncio.Event()
+
+        class DroppingRunner:
+            called = False
+
+            async def run(self, *_args: Any, **_kwargs: Any):
+                self.called = True
+                yield DoneEvent(text="must not run")
+
+        async def _emit(
+            _ctx: RpcContext,
+            _session_key: str,
+            event_name: str,
+            _payload: dict[str, Any],
+        ) -> None:
+            if event_name == "session.event.error":
+                terminal.set()
+
+        runner = DroppingRunner()
+        monkeypatch.setattr(rpc_sessions, "_send_prepared_to_subscribers", _emit)
+        try:
+            response = await dispatcher.dispatch(
+                "r-send-dropping-runner",
+                "sessions.send",
+                {"key": session.session_key, "message": "must remain fenced"},
+                make_ctx(
+                    session_manager=manager,
+                    task_runtime=None,
+                    turn_runner=runner,
+                ),
+            )
+            await asyncio.wait_for(terminal.wait(), timeout=2.0)
+        finally:
+            await storage.close()
+
+        assert response.ok is True
+        assert runner.called is False
+
     @pytest.mark.asyncio
     async def test_direct_send_serializes_generation_reset_without_error(
         self,

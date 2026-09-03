@@ -455,6 +455,50 @@ def _accepts_keyword_arg(callable_obj: Any, name: str) -> bool:
     return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
+def _accepts_explicit_keyword_arg(callable_obj: Any, name: str) -> bool:
+    """Return whether a durable-owner keyword is part of the declared contract."""
+
+    try:
+        parameter = inspect.signature(callable_obj).parameters.get(name)
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
+
+
+def _turn_runner_owner_kwargs(
+    run: Any,
+    *,
+    expected_session_id: str | None,
+    expected_session_epoch: int | None,
+) -> dict[str, Any]:
+    """Carry modern owners only across an explicitly declared runner contract."""
+
+    if expected_session_epoch is None:
+        if (
+            isinstance(expected_session_id, str)
+            and expected_session_id
+            and _accepts_keyword_arg(run, "expected_session_id")
+        ):
+            return {"expected_session_id": expected_session_id}
+        return {}
+    if (
+        not isinstance(expected_session_id, str)
+        or not expected_session_id
+        or not _accepts_explicit_keyword_arg(run, "expected_session_id")
+        or not _accepts_explicit_keyword_arg(run, "expected_session_epoch")
+    ):
+        raise RuntimeError(
+            "Modern channel turn ownership requires an exact turn-runner owner contract"
+        )
+    return {
+        "expected_session_id": expected_session_id,
+        "expected_session_epoch": expected_session_epoch,
+    }
+
+
 @contextlib.asynccontextmanager
 async def _maybe_lock(lock: asyncio.Lock | None) -> AsyncIterator[None]:
     """Yield under ``lock`` if provided; otherwise yield unlocked.
@@ -4251,14 +4295,13 @@ async def _run_turn_batch_path(
         run_kwargs["semantic_message"] = semantic_message
     if attachments and _accepts_keyword_arg(turn_runner.run, "attachments"):
         run_kwargs["attachments"] = attachments
-    if (
-        expected_session_id
-        and expected_session_epoch is not None
-        and _accepts_keyword_arg(turn_runner.run, "expected_session_id")
-        and _accepts_keyword_arg(turn_runner.run, "expected_session_epoch")
-    ):
-        run_kwargs["expected_session_id"] = expected_session_id
-        run_kwargs["expected_session_epoch"] = expected_session_epoch
+    run_kwargs.update(
+        _turn_runner_owner_kwargs(
+            turn_runner.run,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+        )
+    )
     try:
         from opensquilla.gateway.session_model_routing import (
             accepted_model_routing_stream,
@@ -4498,14 +4541,13 @@ async def _run_turn_streaming_path(
             run_kwargs["semantic_message"] = semantic_message
         if attachments and _accepts_keyword_arg(turn_runner.run, "attachments"):
             run_kwargs["attachments"] = attachments
-        if (
-            expected_session_id
-            and expected_session_epoch is not None
-            and _accepts_keyword_arg(turn_runner.run, "expected_session_id")
-            and _accepts_keyword_arg(turn_runner.run, "expected_session_epoch")
-        ):
-            run_kwargs["expected_session_id"] = expected_session_id
-            run_kwargs["expected_session_epoch"] = expected_session_epoch
+        run_kwargs.update(
+            _turn_runner_owner_kwargs(
+                turn_runner.run,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+            )
+        )
         from opensquilla.gateway.session_model_routing import (
             accepted_model_routing_stream,
         )

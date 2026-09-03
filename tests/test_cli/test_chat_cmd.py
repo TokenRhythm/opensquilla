@@ -16,6 +16,9 @@ from typer.testing import CliRunner
 
 from opensquilla.cli import chat_cmd
 from opensquilla.cli.chat.turn_stream import (
+    _standalone_session_owner_kwargs as _chat_session_owner_kwargs,
+)
+from opensquilla.cli.chat.turn_stream import (
     default_turn_stream_dependencies,
     handle_image_command_turnrunner,
     stream_response_turnrunner,
@@ -995,9 +998,23 @@ async def test_standalone_streams_fence_reset_owner_before_runner_write(
     replacement = None
 
     class FakeTurnRunner:
-        async def run(self, message: str, session_key: str, **kwargs):
+        async def run(
+            self,
+            message: str,
+            session_key: str,
+            *,
+            expected_session_id: str | None = None,
+            expected_session_epoch: int | None = None,
+            **kwargs,
+        ):
             nonlocal replacement
-            run_call.update(kwargs)
+            run_call.update(
+                {
+                    **kwargs,
+                    "expected_session_id": expected_session_id,
+                    "expected_session_epoch": expected_session_epoch,
+                }
+            )
             replacement, rotated = await manager.apply_intent(
                 key,
                 SessionIntent.RESET_SAME_KEY,
@@ -1007,8 +1024,8 @@ async def test_standalone_streams_fence_reset_owner_before_runner_write(
                 key,
                 role="assistant",
                 content="late answer",
-                expected_session_id=kwargs["expected_session_id"],
-                expected_session_epoch=kwargs["expected_session_epoch"],
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
             )
             yield DoneEvent(text="unreachable")
 
@@ -1065,6 +1082,28 @@ async def test_standalone_streams_fence_reset_owner_before_runner_write(
     assert current is not None
     assert current.session_id == replacement.session_id
     assert transcript == []
+
+
+@pytest.mark.asyncio
+async def test_chat_owner_guard_rejects_kwargs_only_durable_runner(tmp_path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "chat-dropping-runner.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    key = "agent:main:chat-dropping-runner"
+    await manager.create(key)
+    run_calls: list[dict[str, object]] = []
+
+    class DroppingRunner:
+        async def run(self, *args, **kwargs):
+            run_calls.append(dict(kwargs))
+            yield DoneEvent(text="unreachable")
+
+    try:
+        with pytest.raises(RuntimeError, match="runner cannot enforce"):
+            await _chat_session_owner_kwargs(manager, DroppingRunner(), key)
+    finally:
+        await storage.close()
+
+    assert run_calls == []
 
 
 @pytest.mark.asyncio

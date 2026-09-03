@@ -160,7 +160,7 @@ async def _standalone_session_owner_kwargs(
     turn_runner: Any,
     session_key: str,
 ) -> dict[str, Any]:
-    from opensquilla.engine.runtime import _accepts_keyword_arg
+    from opensquilla.engine.runtime import _accepts_explicit_keyword_arg
     from opensquilla.gateway.session_services import get_session_storage
     from opensquilla.session.storage import SessionStorage
 
@@ -168,12 +168,12 @@ async def _standalone_session_owner_kwargs(
     if not isinstance(storage, SessionStorage):
         return {}
     if not all(
-        _accepts_keyword_arg(session_manager.append_message, name)
+        _accepts_explicit_keyword_arg(session_manager.append_message, name)
         for name in ("expected_session_id", "expected_session_epoch")
     ):
         raise RuntimeError("Session writer cannot enforce a durable owner")
     if not all(
-        _accepts_keyword_arg(turn_runner.run, name)
+        _accepts_explicit_keyword_arg(turn_runner.run, name)
         for name in ("expected_session_id", "expected_session_epoch")
     ):
         raise RuntimeError("Turn runner cannot enforce a durable owner")

@@ -77,7 +77,12 @@ def _accepts_keyword_arg(
         parameters = inspect.signature(call).parameters
     except (TypeError, ValueError):
         return False
-    return name in parameters or (
+    parameter = parameters.get(name)
+    accepts_named_keyword = parameter is not None and parameter.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
+    return accepts_named_keyword or (
         allow_var_keyword
         and any(
             parameter.kind is inspect.Parameter.VAR_KEYWORD
@@ -267,7 +272,7 @@ class GatewaySessionLifecyclePorts(
             _accepts_keyword_arg(
                 append_message,
                 name,
-                allow_var_keyword=durable_storage,
+                allow_var_keyword=False,
             )
             for name in ("expected_session_id", "expected_session_epoch")
         )

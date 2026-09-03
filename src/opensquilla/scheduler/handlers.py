@@ -43,6 +43,10 @@ WorkspaceResolver = Callable[[str], tuple[str | None, bool]]
 DefaultElevatedResolver = Callable[[], str | None]
 
 
+class _ExactOwnerCapabilityError(RuntimeError):
+    """Raised when a modern owner cannot cross a compatibility surface."""
+
+
 def _durable_session_owner(value: Any) -> tuple[str, int] | None:
     """Extract an exact owner from SessionManager lifecycle return values."""
 
@@ -76,7 +80,12 @@ def _accepts_keyword_arg(
         parameters = inspect.signature(call).parameters
     except (TypeError, ValueError):
         return False
-    return name in parameters or (
+    parameter = parameters.get(name)
+    accepts_named_keyword = parameter is not None and parameter.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
+    return accepts_named_keyword or (
         allow_var_keyword
         and any(
             parameter.kind is inspect.Parameter.VAR_KEYWORD
@@ -357,13 +366,28 @@ def make_agent_run_handler(
                         workspace_id,
                         **bind_kwargs,
                     )
+                append_message = sm.append_message
                 append_kwargs: dict[str, Any] = {}
                 if session_owner is not None:
+                    if not all(
+                        _accepts_keyword_arg(
+                            append_message,
+                            name,
+                            allow_var_keyword=False,
+                        )
+                        for name in (
+                            "expected_session_id",
+                            "expected_session_epoch",
+                        )
+                    ):
+                        raise _ExactOwnerCapabilityError(
+                            "Cron session writer cannot enforce the admitted session owner"
+                        )
                     append_kwargs = {
                         "expected_session_id": session_owner[0],
                         "expected_session_epoch": session_owner[1],
                     }
-                _persisted = await sm.append_message(
+                _persisted = await append_message(
                     session_key,
                     role="user",
                     content=task,
@@ -377,6 +401,13 @@ def make_agent_run_handler(
             except StaleEpochError:
                 log.warning(
                     "agent_run_handler.stale_session_owner",
+                    job_id=job.id,
+                    session_key=session_key,
+                )
+                raise
+            except _ExactOwnerCapabilityError:
+                log.warning(
+                    "agent_run_handler.owner_capability_unavailable",
                     job_id=job.id,
                     session_key=session_key,
                 )
@@ -491,11 +522,21 @@ def make_agent_run_handler(
                     "run_kind": "cron_turn",
                     "input_provenance": {"kind": "cron_job", "job_id": job.id},
                 }
-                if (
-                    session_owner is not None
-                    and _accepts_keyword_arg(turn_runner.run, "expected_session_id")
-                    and _accepts_keyword_arg(turn_runner.run, "expected_session_epoch")
-                ):
+                if session_owner is not None:
+                    if not all(
+                        _accepts_keyword_arg(
+                            turn_runner.run,
+                            name,
+                            allow_var_keyword=False,
+                        )
+                        for name in (
+                            "expected_session_id",
+                            "expected_session_epoch",
+                        )
+                    ):
+                        raise RuntimeError(
+                            "Cron turn runner cannot enforce the admitted session owner"
+                        )
                     run_kwargs.update(
                         expected_session_id=session_owner[0],
                         expected_session_epoch=session_owner[1],
