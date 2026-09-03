@@ -525,6 +525,32 @@ describe('clarify tool-result recovery', () => {
     }
   })
 
+  it('unlocks a pending questionnaire when its task is cancelled', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      runtime.handlers.get('session.event.tool_result')?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: planClarifyResult,
+      })
+
+      runtime.approvals.cancelPendingClarify()
+
+      expect(runtime.approvals.pendingClarify.value).toBeNull()
+      expect(runtime.approvals.clarifyBusy.value).toBe(false)
+      expect(runtime.interruptState.value.get('input-request-1')).toEqual({
+        resolution: 'unavailable',
+        busy: false,
+        error: '',
+      })
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
   it('does not settle a failed submit from a partial snapshot without pending-input state', async () => {
     installSnapshot()
     const runtime = await harness()

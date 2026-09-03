@@ -529,6 +529,28 @@ export function useChatPlans(options: UseChatPlansOptions) {
     }
   }
 
+  /**
+   * The generic Stop control can cancel the task before the plan-run event
+   * reaches this surface. Do not leave that run presenting as active in the
+   * meantime; a delayed authoritative plan-run event may still enrich it.
+   */
+  function settleActiveRunForCancelledTask(taskId: string) {
+    const run = activePlanRun.value
+    if (!run || !taskId || run.activeTaskId !== taskId) return false
+    if (!['queued', 'running', 'paused', 'blocked'].includes(run.status)) return false
+    activePlanRun.value = {
+      ...run,
+      status: 'cancelled',
+      currentStepId: undefined,
+      terminalReason: 'cancelled_by_user',
+      finishedAt: run.finishedAt ?? Date.now(),
+      steps: run.steps.map(step => step.status === 'in_progress'
+        ? { ...step, status: 'skipped', reason: 'cancelled_by_user' }
+        : step),
+    }
+    return true
+  }
+
   reset()
 
   return {
@@ -552,5 +574,6 @@ export function useChatPlans(options: UseChatPlansOptions) {
     revise,
     implement,
     cancelRun,
+    settleActiveRunForCancelledTask,
   }
 }
