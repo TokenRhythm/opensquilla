@@ -26,8 +26,9 @@ async function mountQueue(
     text: string
     pendingInputId?: string
     pendingPersistenceState?: 'saving' | 'staged' | 'local_only' | 'retryable' | 'cancelling'
-    deliveryState?: 'steering' | 'retryable'
+    deliveryState?: 'steering' | 'replay_pending' | 'retryable'
     steerAttempt?: PendingSteerAttempt
+    confirmedPlainText?: boolean
     attachments?: Attachment[]
     hiddenControl?: boolean
     displayTextOverride?: string
@@ -39,6 +40,7 @@ async function mountQueue(
     steerAvailable?: boolean
     durableSteerAvailable?: boolean
     steerUnavailableMessage?: string
+    immutableRetryOnly?: boolean
   } = {},
 ) {
   const el = document.createElement('div')
@@ -274,33 +276,146 @@ describe('PendingQueue', () => {
     app.unmount()
   })
 
-  it('keeps a retryable item available for an explicit retry', async () => {
-    let steered = 0
-    let edited = 0
-    const { app, el } = await mountQueue({
-      onSteer: () => { steered += 1 },
-      onEdit: () => { edited += 1 },
-    }, [{ text: 'Retry this steer', deliveryState: 'retryable' }], {
+  it.each(['retryable', 'replay_pending'] as const)(
+    'keeps a %s item available for an explicit retry',
+    async (deliveryState) => {
+      let steered = 0
+      let edited = 0
+      const { app, el } = await mountQueue({
+        onSteer: () => { steered += 1 },
+        onEdit: () => { edited += 1 },
+      }, [{ text: 'Retry this send', deliveryState }], {
+        steerAvailable: false,
+        steerUnavailableMessage: 'New messages will queue after the current response.',
+      })
+
+      expect(el.querySelector('.chat-pending-card')?.hasAttribute('aria-busy')).toBe(false)
+      const retry = [...el.querySelectorAll<HTMLButtonElement>('button')]
+        .find(button => button.textContent?.includes('Retry'))
+      expect(retry?.disabled).toBe(false)
+      expect(retry?.title).toBe('Retry')
+      expect(el.querySelector('.chat-pending-steer-status')).toBeNull()
+      retry?.click()
+      expect(steered).toBe(1)
+
+      el.querySelector<HTMLButtonElement>('[aria-label="More"]')?.click()
+      await nextTick()
+      const edit = [...el.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+        .find(button => button.textContent?.includes('Edit message'))
+      expect(edit?.disabled).toBe(true)
+      edit?.click()
+      expect(edited).toBe(0)
+      app.unmount()
+    },
+  )
+
+  it.each(['retryable', 'replay_pending'] as const)(
+    'lets a %s ordinary receipt retry replay attachments and confirmed plain text',
+    async (deliveryState) => {
+      const attachment: Attachment = {
+        kind: 'staged',
+        local_id: 10,
+        name: 'receipt.pdf',
+        mime: 'application/pdf',
+        file_uuid: 'receipt-10',
+      }
+      const retried: string[] = []
+      const { app, el } = await mountQueue({
+        onSteer: pendingUiId => retried.push(pendingUiId),
+      }, [{
+        text: '/literal prompt',
+        confirmedPlainText: true,
+        attachments: [attachment],
+        deliveryState,
+      }], {
+        steerAvailable: false,
+        durableSteerAvailable: false,
+        steerUnavailableMessage: 'Fresh Steer is unavailable.',
+      })
+
+      const retry = el.querySelector<HTMLButtonElement>('.chat-pending-action--steer')
+      expect(retry?.textContent).toContain('Retry')
+      expect(retry?.disabled).toBe(false)
+      expect(retry?.title).toBe('Retry')
+      retry?.click()
+      expect(retried).toEqual(['pending-ui-0'])
+      app.unmount()
+    },
+  )
+
+  it('keeps a receipt retry blocked while another delivery owns the queue lease', async () => {
+    const { app, el } = await mountQueue({}, [
+      { text: 'In flight', deliveryState: 'steering' },
+      { text: 'Retry later', deliveryState: 'retryable' },
+    ])
+
+    const retry = [...el.querySelectorAll<HTMLButtonElement>(
+      '.chat-pending-action--steer',
+    )].find(button => button.textContent?.includes('Retry'))
+    expect(retry?.disabled).toBe(true)
+    expect(retry?.title).toContain('another queued message is being delivered')
+    app.unmount()
+  })
+
+  it('renders only the immutable Retry action in a read-only queue', async () => {
+    const listeners = {
+      onClear: vi.fn(),
+      onEdit: vi.fn(),
+      onRemove: vi.fn(),
+      onReorder: vi.fn(),
+      onSteer: vi.fn(),
+    }
+    const { app, el } = await mountQueue(listeners, [
+      {
+        text: 'Retry the exact receipt',
+        deliveryState: 'retryable',
+      },
+      { text: 'Do not expose a fresh Steer' },
+    ], {
+      immutableRetryOnly: true,
       steerAvailable: false,
-      steerUnavailableMessage: 'New messages will queue after the current response.',
     })
 
-    expect(el.querySelector('.chat-pending-card')?.hasAttribute('aria-busy')).toBe(false)
-    const retry = [...el.querySelectorAll<HTMLButtonElement>('button')]
-      .find(button => button.textContent?.includes('Retry'))
-    expect(retry?.disabled).toBe(false)
-    expect(retry?.title).toBe('Retry')
-    expect(el.querySelector('.chat-pending-steer-status')).toBeNull()
-    retry?.click()
-    expect(steered).toBe(1)
+    const card = el.querySelector<HTMLElement>('.chat-pending-card')
+    const buttons = [...el.querySelectorAll<HTMLButtonElement>('button')]
+    expect(buttons).toHaveLength(1)
+    expect(buttons[0]?.textContent).toContain('Retry')
+    expect(buttons[0]?.disabled).toBe(false)
+    expect(card?.classList.contains('is-reorderable')).toBe(false)
+    expect(card?.hasAttribute('tabindex')).toBe(false)
+    buttons[0]?.click()
+    expect(listeners.onSteer).toHaveBeenCalledWith('pending-ui-0')
+    expect(listeners.onClear).not.toHaveBeenCalled()
+    expect(listeners.onEdit).not.toHaveBeenCalled()
+    expect(listeners.onRemove).not.toHaveBeenCalled()
+    expect(listeners.onReorder).not.toHaveBeenCalled()
+    app.unmount()
+  })
 
-    el.querySelector<HTMLButtonElement>('[aria-label="More"]')?.click()
-    await nextTick()
-    const edit = [...el.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
-      .find(button => button.textContent?.includes('Edit message'))
-    expect(edit?.disabled).toBe(true)
-    edit?.click()
-    expect(edited).toBe(0)
+  it('renders an acceptance-unknown Steer as the only immutable retry action', async () => {
+    const onSteer = vi.fn()
+    const { app, el } = await mountQueue({ onSteer }, [{
+      text: 'Retry the exact Steer receipt',
+      steerAttempt: {
+        phase: 'acceptance_unknown',
+        request: {
+          key: 'agent:main:webchat:test',
+          message: 'Retry the exact Steer receipt',
+          expected_turn_id: 'turn-current',
+          client_request_id: 'request-steer',
+          client_message_id: 'message-steer',
+        },
+      },
+    }], {
+      immutableRetryOnly: true,
+      steerAvailable: false,
+    })
+
+    const buttons = [...el.querySelectorAll<HTMLButtonElement>('button')]
+    expect(buttons).toHaveLength(1)
+    expect(buttons[0]?.disabled).toBe(false)
+    buttons[0]?.click()
+    expect(onSteer).toHaveBeenCalledOnce()
     app.unmount()
   })
 

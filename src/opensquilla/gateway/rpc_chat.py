@@ -1093,10 +1093,10 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
         result_session_key = result.get("sessionKey") or result.get("key") or session_key
         return {"ok": True, "sessionKey": result_session_key, **result}
     except Exception:
-        marker = getattr(ctx, "turn_runner", None)
-        clear = getattr(marker, "clear_compacted_this_turn", None)
-        if callable(clear):
-            clear(session_key)
+        # Context shaping now belongs to TurnRunner, so this compatibility
+        # wrapper never owns its session-keyed compaction state. In particular,
+        # a pre-admission failure must not clear a marker belonging to an
+        # already-running turn for the same session.
         raise
 
 

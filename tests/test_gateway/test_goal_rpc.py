@@ -123,6 +123,7 @@ class _GoalRpcStack:
 async def _open_goal_rpc_stack(
     db_path: Path,
     *,
+    session_key: str = SOURCE_KEY,
     handler: _TurnHandler | None = None,
     subscribe: bool = True,
     execution_enabled: bool = True,
@@ -199,10 +200,10 @@ async def _open_goal_rpc_stack(
         task_runtime=runtime,
         subscription_manager=subscriptions,
     )
-    await manager.create(SOURCE_KEY, agent_id="main")
+    await manager.create(session_key, agent_id="main")
     get_registry().register(SimpleNamespace(conn_id=conn_id, principal=_PRINCIPAL))
     if subscribe:
-        subscriptions.subscribe_messages(conn_id, SOURCE_KEY)
+        subscriptions.subscribe_messages(conn_id, session_key)
     try:
         yield _GoalRpcStack(
             storage=storage,
@@ -326,6 +327,21 @@ async def _table_count(storage: SessionStorage, table: str) -> int:
         row = await cursor.fetchone()
     assert row is not None
     return int(row[0])
+
+
+async def _mark_source_as_cron(
+    stack: _GoalRpcStack,
+    session_key: str = SOURCE_KEY,
+) -> None:
+    current = await stack.storage.get_session(session_key)
+    assert current is not None
+    updated = await stack.storage.compare_and_set_session_origin(
+        expected_session=current,
+        expected_origin=current.origin,
+        origin={"kind": "cron"},
+        workspace_guard=None,
+    )
+    assert updated is not None
 
 
 async def _bind_project_workspace(
@@ -1020,6 +1036,290 @@ async def test_set_receipt_replays_exactly_and_rejects_fingerprint_reuse(
         with pytest.raises(RpcHandlerError) as exc_info:
             await _handle_goals_set(conflicting, stack.context)
         assert exc_info.value.code == "IDEMPOTENCY_CONFLICT"
+
+
+@pytest.mark.asyncio
+async def test_goal_writes_reject_cron_before_any_durable_side_effect(
+    tmp_path: Path,
+) -> None:
+    session_key = "legacy-scheduled-goal-run"
+    async with _open_goal_rpc_stack(
+        tmp_path / "goal-cron-set.sqlite",
+        session_key=session_key,
+    ) as stack:
+        await _mark_source_as_cron(stack, session_key)
+        before = {
+            table: await _table_count(stack.storage, table)
+            for table in (
+                "agent_tasks",
+                "goal_command_receipts",
+                "turn_ingress_receipts",
+                "transcript_entries",
+            )
+        }
+        with pytest.raises(RpcHandlerError) as exc_info:
+            await _handle_goals_set(
+                {**_set_params(), "sessionKey": session_key},
+                stack.context,
+            )
+        assert exc_info.value.code == "SESSION_NOT_INTERACTIVE"
+        assert await stack.storage.get_goal(session_key) is None
+        assert {
+            table: await _table_count(stack.storage, table)
+            for table in before
+        } == before
+
+    async with _open_goal_rpc_stack(
+        tmp_path / "goal-cron-edit.sqlite",
+        session_key=session_key,
+    ) as stack:
+        created = await _handle_goals_set(
+            {**_set_params(), "sessionKey": session_key},
+            stack.context,
+        )
+        await _mark_source_as_cron(stack, session_key)
+        transcript_before = await stack.manager.get_transcript(session_key)
+        goal_before = await stack.storage.get_goal(session_key)
+        counts_before = {
+            table: await _table_count(stack.storage, table)
+            for table in (
+                "agent_tasks",
+                "goal_command_receipts",
+                "turn_ingress_receipts",
+                "transcript_entries",
+            )
+        }
+        with pytest.raises(RpcHandlerError) as exc_info:
+            await _handle_goals_edit(
+                {
+                    **_mutation_params(created["goal"], request_index=2),
+                    "sessionKey": session_key,
+                    "objective": "Do not mutate the Cron Goal.",
+                },
+                stack.context,
+            )
+        assert exc_info.value.code == "SESSION_NOT_INTERACTIVE"
+        assert await stack.storage.get_goal(session_key) == goal_before
+        assert await stack.manager.get_transcript(session_key) == transcript_before
+        assert {
+            table: await _table_count(stack.storage, table)
+            for table in counts_before
+        } == counts_before
+
+    async with _open_goal_rpc_stack(
+        tmp_path / "goal-cron-resume.sqlite",
+        session_key=session_key,
+    ) as stack:
+        created = await _handle_goals_set(
+            {**_set_params(), "sessionKey": session_key},
+            stack.context,
+        )
+        paused = await _handle_goals_pause(
+            {
+                **_mutation_params(created["goal"], request_index=2),
+                "sessionKey": session_key,
+            },
+            stack.context,
+        )
+        await _mark_source_as_cron(stack, session_key)
+        goal_before = await stack.storage.get_goal(session_key)
+        counts_before = {
+            table: await _table_count(stack.storage, table)
+            for table in (
+                "agent_tasks",
+                "goal_command_receipts",
+                "turn_ingress_receipts",
+                "transcript_entries",
+            )
+        }
+        with pytest.raises(RpcHandlerError) as exc_info:
+            await _handle_goals_resume(
+                {
+                    **_mutation_params(paused["goal"], request_index=3),
+                    "sessionKey": session_key,
+                },
+                stack.context,
+            )
+        assert exc_info.value.code == "SESSION_NOT_INTERACTIVE"
+        assert await stack.storage.get_goal(session_key) == goal_before
+        assert {
+            table: await _table_count(stack.storage, table)
+            for table in counts_before
+        } == counts_before
+
+    async with _open_goal_rpc_stack(
+        tmp_path / "goal-cron-pause-clear.sqlite",
+        session_key=session_key,
+    ) as stack:
+        created = await _handle_goals_set(
+            {**_set_params(), "sessionKey": session_key},
+            stack.context,
+        )
+        await _settle_set_task(stack, created)
+        await _mark_source_as_cron(stack, session_key)
+        transcript_before = await stack.manager.get_transcript(session_key)
+        goal_before = await stack.storage.get_goal(session_key)
+        counts_before = {
+            table: await _table_count(stack.storage, table)
+            for table in (
+                "agent_tasks",
+                "goal_command_receipts",
+                "turn_ingress_receipts",
+                "transcript_entries",
+            )
+        }
+        for handler, request_index in (
+            (_handle_goals_pause, 2),
+            (_handle_goals_clear, 3),
+        ):
+            idle_notified = asyncio.Event()
+
+            async def observe_production_idle(key: str) -> None:
+                await stack.service.on_runtime_idle(key)
+                idle_notified.set()
+
+            stack.runtime.set_idle_listener(observe_production_idle)
+            with pytest.raises(RpcHandlerError) as exc_info:
+                await handler(
+                    {
+                        **_mutation_params(created["goal"], request_index=request_index),
+                        "sessionKey": session_key,
+                    },
+                    stack.context,
+                )
+            assert exc_info.value.code == "SESSION_NOT_INTERACTIVE"
+            await asyncio.wait_for(idle_notified.wait(), timeout=2.0)
+            scheduled = stack.service._kick_tasks.get(session_key)
+            if scheduled is not None:
+                await asyncio.wait_for(asyncio.shield(scheduled), timeout=2.0)
+            assert await stack.storage.get_goal(session_key) == goal_before
+            assert await stack.manager.get_transcript(session_key) == transcript_before
+            assert {
+                table: await _table_count(stack.storage, table)
+                for table in counts_before
+            } == counts_before
+
+
+@pytest.mark.asyncio
+async def test_goal_exact_receipts_replay_after_session_becomes_cron(
+    tmp_path: Path,
+) -> None:
+    session_key = "legacy-scheduled-goal-replay"
+    async with _open_goal_rpc_stack(
+        tmp_path / "goal-cron-replay.sqlite",
+        session_key=session_key,
+    ) as stack:
+        set_params = {**_set_params(), "sessionKey": session_key}
+        created = await _handle_goals_set(set_params, stack.context)
+        edit_params = {
+            **_mutation_params(created["goal"], request_index=2),
+            "sessionKey": session_key,
+            "objective": "Replay the accepted Goal commands exactly.",
+        }
+        edited = await _handle_goals_edit(edit_params, stack.context)
+        pause_params = {
+            **_mutation_params(edited["goal"], request_index=3),
+            "sessionKey": session_key,
+        }
+        paused = await _handle_goals_pause(pause_params, stack.context)
+        resume_params = {
+            **_mutation_params(paused["goal"], request_index=4),
+            "sessionKey": session_key,
+        }
+        resumed = await _handle_goals_resume(resume_params, stack.context)
+        clear_params = {
+            **_mutation_params(resumed["goal"], request_index=5),
+            "sessionKey": session_key,
+        }
+        cleared = await _handle_goals_clear(clear_params, stack.context)
+        await _mark_source_as_cron(stack, session_key)
+        counts_before = {
+            table: await _table_count(stack.storage, table)
+            for table in (
+                "agent_tasks",
+                "goal_command_receipts",
+                "turn_ingress_receipts",
+                "transcript_entries",
+            )
+        }
+
+        replays = (
+            await _handle_goals_set(dict(set_params), stack.context),
+            await _handle_goals_edit(dict(edit_params), stack.context),
+            await _handle_goals_pause(dict(pause_params), stack.context),
+            await _handle_goals_resume(dict(resume_params), stack.context),
+            await _handle_goals_clear(dict(clear_params), stack.context),
+        )
+        for replay, accepted in zip(
+            replays,
+            (created, edited, paused, resumed, cleared),
+            strict=True,
+        ):
+            assert {key: value for key, value in replay.items() if key != "continuityToken"} == {
+                key: value for key, value in accepted.items() if key != "continuityToken"
+            }
+        assert {
+            table: await _table_count(stack.storage, table)
+            for table in counts_before
+        } == counts_before
+
+
+@pytest.mark.asyncio
+async def test_goal_reattach_rejects_cron_before_authority_side_effects(
+    tmp_path: Path,
+) -> None:
+    session_key = "legacy-scheduled-goal-reattach"
+    async with _open_goal_rpc_stack(
+        tmp_path / "goal-cron-reattach.sqlite",
+        session_key=session_key,
+    ) as stack:
+        created = await _handle_goals_set(
+            {**_set_params(), "sessionKey": session_key},
+            stack.context,
+        )
+        await _settle_set_task(stack, created)
+        lease = stack.service._leases[session_key]
+        stack.service._detach_authority(session_key, expected=lease)
+        await _mark_source_as_cron(stack, session_key)
+
+        goal_before = await stack.storage.get_goal(session_key)
+        transcript_before = await stack.manager.get_transcript(session_key)
+        leases_before = dict(stack.service._leases)
+        grants_before = dict(stack.service._continuity_grants)
+        events_before = list(stack.events)
+        counts_before = {
+            table: await _table_count(stack.storage, table)
+            for table in (
+                "agent_tasks",
+                "goal_command_receipts",
+                "turn_ingress_receipts",
+                "transcript_entries",
+            )
+        }
+
+        with pytest.raises(RpcHandlerError) as exc_info:
+            await _handle_goals_reattach(
+                {
+                    **_reattach_params(
+                        created,
+                        continuity_token=created["continuityToken"],
+                    ),
+                    "sessionKey": session_key,
+                },
+                stack.context,
+            )
+
+        assert exc_info.value.code == "SESSION_NOT_INTERACTIVE"
+        assert stack.service._leases == leases_before
+        assert stack.service._continuity_grants == grants_before
+        assert stack.service._kick_tasks == {}
+        assert await stack.storage.get_goal(session_key) == goal_before
+        assert await stack.manager.get_transcript(session_key) == transcript_before
+        assert stack.events == events_before
+        assert {
+            table: await _table_count(stack.storage, table)
+            for table in counts_before
+        } == counts_before
 
 
 @pytest.mark.asyncio

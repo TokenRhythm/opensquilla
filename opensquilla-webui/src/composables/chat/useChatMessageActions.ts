@@ -47,6 +47,8 @@ export interface UseChatMessageActionsOptions {
    * points (keyboard, future surfaces) must not fail silently either.
    */
   notifyEditBlocked?: () => void
+  /** Permanent session policy gate checked before edit/regenerate mutations. */
+  canMutateMessages?: () => boolean
 }
 
 export function useChatMessageActions(options: UseChatMessageActionsOptions) {
@@ -137,6 +139,7 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
   }
 
   function regenerateMessage(message: ChatRenderedMessage): boolean | Promise<boolean> {
+    if (options.canMutateMessages && !options.canMutateMessages()) return false
     if (options.isStreaming.value) {
       console.warn('Wait for the current response to finish')
       return false
@@ -189,6 +192,7 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
   }
 
   function editMessage(message: ChatRenderedMessage) {
+    if (options.canMutateMessages && !options.canMutateMessages()) return
     if (options.isStreaming.value) {
       console.warn('Wait for the current response to finish')
       options.notifyEditBlocked?.()

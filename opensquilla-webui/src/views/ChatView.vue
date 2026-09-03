@@ -5,20 +5,21 @@
     :class="{
       'chat--new-landing': isNewChatLanding,
       'chat--meta-setup': Boolean(setupState),
-      'chat--drag-over': threadDragOver,
-      'chat--plan-questionnaire-open': Boolean(dockedPlanQuestionnaire),
-      'chat--composer-floating': composerFxEnabled && !isNewChatLanding,
+      'chat--drag-over': threadDragOver && !turnActionsBlocked,
+      'chat--plan-questionnaire-open': Boolean(dockedPlanQuestionnaire) && !turnActionsBlocked,
+      'chat--composer-floating': composerFxEnabled && !isNewChatLanding && !turnActionsBlocked,
       'chat--composer-collapsed': composerCollapsed
         && activePromptAnnotations.length === 0
         && composerFxEnabled
-        && !isNewChatLanding,
+        && !isNewChatLanding
+        && !turnActionsBlocked,
     }"
     @dragenter="onChatDragEnter"
     @dragover="onChatDragOver"
     @dragleave="onChatDragLeave"
     @drop="onChatDrop"
   >
-    <div v-if="threadDragOver" class="chat-drop-overlay" role="status" aria-live="polite" aria-atomic="true">
+    <div v-if="threadDragOver && !turnActionsBlocked" class="chat-drop-overlay" role="status" aria-live="polite" aria-atomic="true">
       <div class="chat-drop-overlay__frame" aria-hidden="true"></div>
       <div class="chat-drop-overlay__beacon">
         <span class="chat-drop-overlay__glyph" aria-hidden="true">
@@ -217,6 +218,7 @@
           :plan-action-pending="planCardPendingAction"
           :plan-actions-disabled="planActionsDisabled"
           :is-streaming="isStreaming"
+          :message-actions-available="!turnActionsBlocked"
           :follow-live-edge="autoScroll"
           :scroll-epoch="scrollEpoch"
           :goal="currentGoalRun"
@@ -303,11 +305,13 @@
             :state="metaRuns.preflights.value.get(runId)!.state"
             :phase="metaRuns.preflights.value.get(runId)!.phase"
             :error-text="metaRuns.preflights.value.get(runId)!.errorText"
+            :turn-actions-disabled="turnActionsBlocked"
             @action="metaRuns.onPreflightAction"
           />
           <MetaRibbon
             v-if="metaRuns.ribbons.value.has(runId)"
             :run="metaRuns.ribbons.value.get(runId)!"
+            :turn-actions-disabled="turnActionsBlocked"
             @action="metaRuns.onRibbonAction"
             @chip-select="metaRuns.onChipSelect"
           />
@@ -454,6 +458,7 @@
         <ChatStallNotice
           v-if="stallActive"
           :seconds="stallSeconds"
+          :can-interrupt="!turnActionsBlocked"
           @wait="stallWatchdog.dismiss()"
           @interrupt="onStop"
         />
@@ -533,6 +538,7 @@
       v-if="setupState"
       :state="setupState"
       :provider-navigation-pending="metaSetupProviderNavigationPending"
+      :turn-actions-disabled="turnActionsBlocked"
       @confirm="confirmSetup"
       @retry="retrySetup"
       @cancel="cancelSetup"
@@ -543,11 +549,22 @@
          composer instead of pinning it to the bottom, so the menu must not
          anchor to the chat container's bottom edge. -->
     <div class="chat-composer-dock">
+    <div
+      v-if="turnActionsBlocked && !exactReceiptReplayVisibleForCurrentSession"
+      class="chat-composer-read-only"
+      role="status"
+      aria-live="polite"
+    >{{ t(
+      isCronSession
+        ? 'chat.cronSessionReadOnly'
+        : sessionPolicyPending ? 'chat.loadingSession' : 'chat.sessionReadOnly',
+    ) }}</div>
+    <template v-else>
     <!-- Durable execution progress belongs to the work surface, not to the
          transcript. Keeping it immediately above the composer also lets a
          execution surfaces reuse this dock across multiple turns. -->
     <Transition name="plan-run-dock">
-      <div v-if="executionDockRun" class="plan-run-dock">
+      <div v-if="!turnActionsBlocked && executionDockRun" class="plan-run-dock">
         <PlanRunRibbon
           :run="executionDockRun"
           :cancel-busy="planActionPending === 'cancel-run'"
@@ -560,7 +577,7 @@
     <!-- Long-running goal progress lives in the same dock as plan execution so
          the active objective stays visible above the composer across turns. -->
     <Transition name="goal-run-dock">
-      <div v-if="activeGoalRun" ref="goalRunDockRef" class="goal-run-dock">
+      <div v-if="!turnActionsBlocked && activeGoalRun" ref="goalRunDockRef" class="goal-run-dock">
         <GoalRibbon
           :goal="activeGoalRun"
           :elapsed="goalElapsed"
@@ -593,7 +610,7 @@
       </button>
     </Transition>
     <!-- Slash command menu -->
-    <div v-if="slashOpen" ref="slashMenuRef" class="chat-slash">
+    <div v-if="!turnActionsBlocked && slashOpen" ref="slashMenuRef" class="chat-slash">
       <div
         v-for="(cmd, i) in filteredSlashCmds"
         :key="cmd.cmd"
@@ -611,8 +628,10 @@
     </div>
 
     <PendingQueue
-      :items="pendingQueue"
+      v-if="!turnActionsBlocked || queueReceiptReplayItems.length > 0"
+      :items="turnActionsBlocked ? queueReceiptReplayItems : pendingQueue"
       :max-pending="maxPending"
+      :immutable-retry-only="turnActionsBlocked"
       :reorder-enabled="canReorderPendingQueue"
       :reorder-pending="pendingQueueReorderPending"
       :image-blocked-message="queuedImageSendBlockedMessage"
@@ -629,7 +648,7 @@
     />
 
     <div
-      v-if="dockedPlanQuestionnaire"
+      v-if="!turnActionsBlocked && dockedPlanQuestionnaire"
       class="plan-questionnaire-dock"
       @wheel="handlePlanQuestionnaireWheel"
       @touchstart.passive="onPlanQuestionnaireTouchStart"
@@ -648,18 +667,20 @@
     </div>
 
     <ChatComposer
+      v-if="!turnActionsBlocked || exactReceiptReplayPendingForCurrentSession"
       ref="composerRef"
       v-model="inputText"
       :attachments="pendingAttachments"
       :busy-send-mode="busySendMode"
       :has-send-content="composerHasSendContent"
       :is-streaming="isStreaming"
-      :can-stop="canStop"
+      :can-stop="!turnActionsBlocked && canStop"
       :stop-targets-plan-run="composerStopsPlanRun"
       :is-new-landing="isNewChatLanding"
       :placeholder="composerPlaceholder"
       :send-button-title="sendButtonTitle"
       :send-blocked-message="composerSendBlockedMessage"
+      :fresh-input-disabled="turnActionsBlocked"
       :input-disabled="Boolean(dockedPlanQuestionnaire)
         || Boolean(forkTransition)
         || historyState.sessionMissing"
@@ -669,7 +690,8 @@
       :run-mode-locked="runModeLocked"
       :run-mode-lock-message="t('chat.composer.runModeLocked')"
       :session-routing-mode="modelRoutingMode"
-      :session-routing-busy="modelRoutingSettingsBusy"
+      :session-routing-busy="modelRoutingSettingsBusy
+        && !exactReceiptReplayPendingForCurrentSession"
       :session-routing-control-blocked="goalBusy"
       :session-routing-available="sessionRoutingAvailable"
       :coding-mode-enabled="codingModeEnabled"
@@ -745,6 +767,7 @@
       @close="projectPickerOpen = false"
       @choose="chooseProjectPath"
     />
+    </template>
     </div>
 
     <ToolResultModal
@@ -800,6 +823,7 @@ import { useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 import {
+  SESSION_DIRECTORY_ITEMS_KEY,
   SESSION_DIRECTORY_KEY,
   SessionDirectoryError,
 } from '@/modules/sessionDirectory'
@@ -875,6 +899,7 @@ import { useChatDraftPersistence } from '@/composables/chat/useChatDraftPersiste
 import { useChatElevatedMode } from '@/composables/chat/useChatElevatedMode'
 import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
 import { useChatSessionRouting } from '@/composables/chat/useChatSessionRouting'
+import { useChatSessionInteractivity } from '@/composables/chat/useChatSessionInteractivity'
 import { SESSION_ROUTING_KEY, type SessionRouting } from '@/modules/sessionRouting'
 import { SESSION_CONVERSATION_KEY, type SessionConversation } from '@/modules/sessionConversation'
 import { TURN_COMMANDS_KEY, type TurnCommands } from '@/modules/turnCommands'
@@ -1183,6 +1208,7 @@ if (!sessionRouting) throw new Error('SessionRouting was not provided')
 const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
 if (!injectedSessionDirectory) throw new Error('SessionDirectory was not provided')
 const sessionDirectory = injectedSessionDirectory
+const knownDirectorySessions = inject(SESSION_DIRECTORY_ITEMS_KEY)
 const injectedSessionLifecycle = inject(SESSION_LIFECYCLE_KEY)
 if (!injectedSessionLifecycle) throw new Error('SessionLifecycle was not provided')
 const sessionLifecycle = injectedSessionLifecycle
@@ -1327,6 +1353,22 @@ const { enabled: composerFxEnabled } = useComposerFloatingPreference()
 /* ── State ─────────────────────────────────────────────────────────── */
 
 const sessionKey = ref('')
+// Only a not-yet-durable draft may skip authoritative session policy lookup.
+const pendingSessionIntent = ref<string | null>(null)
+const sessionPolicyResolutionEnabled = computed(() => pendingSessionIntent.value !== 'new_chat')
+const sessionInteractivity = useChatSessionInteractivity({
+  sessionKey,
+  directory: sessionDirectory,
+  knownSessions: knownDirectorySessions,
+  resolveEnabled: sessionPolicyResolutionEnabled,
+})
+const {
+  isCronSession,
+  isNoninteractiveSession,
+  policyPending: sessionPolicyPending,
+  policyUnavailable: sessionPolicyUnavailable,
+  turnActionsBlocked,
+} = sessionInteractivity
 function clearPendingComposerScrollIntent() {
   pendingComposerScrollIntent = null
   if (composerScrollIntentTimer !== null) {
@@ -1572,6 +1614,11 @@ const lastHeaderRole = ref('')
 const lastHeaderDay = ref('')
 const threadDragOver = ref(false)
 const threadDragDepth = ref(0)
+watch(turnActionsBlocked, readOnly => {
+  if (!readOnly) return
+  threadDragDepth.value = 0
+  threadDragOver.value = false
+})
 const shareMode = ref(false)
 const shareSaving = ref(false)
 const selectedShareMessageIds = ref<Set<string>>(new Set())
@@ -1718,8 +1765,6 @@ function projectWorkspaceFromSessionRead(
   }
 }
 
-// Pending session intent
-const pendingSessionIntent = ref<string | null>(null)
 const pendingForkBeforeMessageId = ref<string | null>(null)
 const freshTaskDraft = useFreshTaskDraft()
 const promptCacheKeepaliveSessionReady = computed(() => pendingSessionIntent.value === null)
@@ -1838,7 +1883,9 @@ watch(
   available => setStreamConnectionAvailable(available),
   { immediate: true },
 )
-const chatAttachments = useChatAttachments(artifactWorkbench.content)
+const chatAttachments = useChatAttachments(artifactWorkbench.content, {
+  canMutate: () => !turnActionsBlocked.value,
+})
 const {
   pendingAttachments,
   attachmentWorkBusy,
@@ -1887,6 +1934,7 @@ let dispatchPlanComposerPrompt: (prompt: string, composerText: string) => void =
 let isCompactInFlightForCurrentSession: () => boolean = () => false
 let isQueuedDeliveryBlocked: () => boolean = () => false
 let isLiveDeliveryBlocked: () => boolean = () => true
+let isReceiptReplayBlocked: () => boolean = () => true
 let dispatchQueuedHiddenControl: (
   item: ChatPendingItem,
   ownerSessionKey: string,
@@ -1921,6 +1969,7 @@ const chatPendingQueue = useChatPendingQueue({
     || hasPendingAttachmentWork()
     || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
   ),
+  isReceiptReplayBlocked: () => isReceiptReplayBlocked(),
   autoResizeTextarea,
   sendCurrentInput: () => sendCurrentInput(),
   resetInputHistory: () => resetComposerInputHistory(),
@@ -2563,6 +2612,7 @@ const chatMessageActions = useChatMessageActions({
   },
   notifyMessagePending: () => pushToast(t('chat.toast.messageStillSaving'), { tone: 'info' }),
   notifyEditBlocked: () => pushToast(t('chat.pending.editWhileStreaming'), { tone: 'info' }),
+  canMutateMessages: () => !turnActionsBlocked.value,
 })
 const {
   copyMessage,
@@ -2830,10 +2880,22 @@ const promptAnnotationSendBlockedReason = computed<string | null>(() =>
 const deliveryBlockedReason = computed<string | null>(() => (
   sessionRoutingSendBlockedReason.value || liveSendBlockedReason.value
 ))
+const sessionInteractivityBlockedReason = computed<string | null>(() => (
+  isCronSession.value
+    ? t('chat.cronSessionReadOnly')
+    : sessionPolicyPending.value
+      ? t('chat.loadingSession')
+      : (isNoninteractiveSession.value || sessionPolicyUnavailable.value)
+          ? t('chat.sessionReadOnly')
+          : null
+))
 const effectiveSendBlockedReason = computed<string | null>(() => (
-  deliveryBlockedReason.value || promptAnnotationSendBlockedReason.value
+  sessionInteractivityBlockedReason.value
+  || deliveryBlockedReason.value
+  || promptAnnotationSendBlockedReason.value
 ))
 isLiveDeliveryBlocked = () => Boolean(liveSendBlockedReason.value)
+isReceiptReplayBlocked = () => Boolean(liveSendBlockedReason.value)
 watch(
   livePhase,
   phase => appStore.setChatLivePhase(phase),
@@ -3007,6 +3069,7 @@ const metaSkillSetup = useMetaSkillSetup({
   forgetHiddenControl: (draftSessionKey: string, clientRequestId: string) => {
     forgetHiddenControlOutbox(draftSessionKey, clientRequestId)
   },
+  turnActionsBlocked: () => turnActionsBlocked.value,
 })
 const {
   setupState,
@@ -3248,6 +3311,7 @@ const chatSlashCommands = useChatSlashCommands({
   ),
   restoreDraft: restoreMetaLaunchDraft,
   requestMetaSetup,
+  turnActionsBlocked: () => turnActionsBlocked.value,
   dispatchPlanPrompt: (prompt: string, composerText: string) => {
     dispatchPlanComposerPrompt(prompt, composerText)
   },
@@ -3341,6 +3405,8 @@ const chatSend = useChatSend({
   pendingSessionIntent,
   pendingWorkspaceId,
   sendBlockedReason: effectiveSendBlockedReason,
+  sessionInteractivityBlockedReason,
+  noninteractiveReceiptReplay: computed(() => gatewayAccess.noninteractiveReceiptReplay === true),
   validateActiveProjectBeforeSend,
   acceptPendingWorkspaceBinding: activeProjectWorkspace.acceptPendingBinding,
   initialCollaborationMode,
@@ -3408,6 +3474,7 @@ const chatSend = useChatSend({
   autoScroll,
   stream: chatStream,
   canStop: () => canStop.value,
+  turnActionsBlocked: () => turnActionsBlocked.value,
   normalizeElevatedMode,
   adoptResponseSession: async (key, ownerRequestId) => {
     const sourceKey = sessionKey.value
@@ -3448,6 +3515,7 @@ const {
   onStop,
   sendQueuedSteer,
   sendQueuedFollowup,
+  retryQueuedItem,
   sendUsageBarrierReplay: dispatchUsageBarrierReplay,
   dispatchComposerPrompt,
   dispatchHiddenSend,
@@ -3458,7 +3526,16 @@ const {
   restoreHiddenControls,
   sendHiddenMetaPreflightConfirmation,
   recoverResponseHandoffs,
+  exactReceiptReplayPendingForCurrentSession,
+  isQueuedExactReceiptReplay,
 } = chatSend
+const queueReceiptReplayItems = computed(() => (
+  pendingQueue.value.filter(isQueuedExactReceiptReplay)
+))
+const exactReceiptReplayVisibleForCurrentSession = computed(() => (
+  exactReceiptReplayPendingForCurrentSession.value
+  || queueReceiptReplayItems.value.length > 0
+))
 sendUsageBarrierReplay = dispatchUsageBarrierReplay
 void recoverResponseHandoffs()
 watch(
@@ -3668,6 +3745,13 @@ async function onComposerSend() {
   // All composer submission modes, including keyboard-driven plan revision,
   // share the same fail-closed delivery gate.
   if (composerSendBlockedMessage.value) return
+  // A receipt replay belongs to the already-attempted immutable request. It
+  // must not be reinterpreted as a Goal or Plan mutation, and it must not wait
+  // for mutable routing state that cannot change the replayed request.
+  if (exactReceiptReplayPendingForCurrentSession.value) {
+    await dispatchCurrentInput()
+    return
+  }
   // Serialize session-routing and plan mutations before accepting another
   // composer turn, so the send cannot race either CAS update.
   if (modelRoutingSettingsBusy.value || planModeBusy.value) return
@@ -3726,6 +3810,10 @@ async function steerPendingMessage(pendingUiId: string) {
       || pendingSteerClicks.has(candidate)
     )
   ) return
+  const retryAction = Boolean(
+    candidate?.steerAttempt
+    || ['retryable', 'replay_pending'].includes(candidate?.deliveryState || ''),
+  )
   const item = candidate?.steerAttempt
     ? candidate
     : beginPendingDelivery(pendingUiId, candidate?.hiddenControl === true)
@@ -3736,7 +3824,9 @@ async function steerPendingMessage(pendingUiId: string) {
   try {
     outcome = item.hiddenControl
       ? await dispatchQueuedHiddenSend(item, item.ownerSessionKey || sessionKey.value)
-      : await sendQueuedSteer(item)
+      : retryAction
+        ? await retryQueuedItem(item)
+        : await sendQueuedSteer(item)
   } finally {
     settlePendingDelivery(item, outcome)
     pendingSteerClicks.delete(item)
@@ -4204,6 +4294,7 @@ const metaRuns = useMetaRuns({
   // focus) so the vanilla guidance is not silently dropped.
   setComposerPlaceholder: (hint: string) => pushToast(hint, { duration: 6000 }),
   focusComposer: () => composerRef.value?.focusTextarea(),
+  turnActionsBlocked: () => turnActionsBlocked.value,
   pushToast,
 })
 
@@ -4475,7 +4566,8 @@ const planCardPendingAction = computed<PlanCardAction | null>(() => {
     : null
 })
 const planActionsDisabled = computed(() =>
-  isStreaming.value
+  turnActionsBlocked.value
+  || isStreaming.value
   || planModeBusy.value
   || Boolean(liveSendBlockedReason.value)
   || planActionPending.value !== null
@@ -4587,8 +4679,8 @@ const activeProjectComposerBlockMessage = computed(() => {
   }
 })
 
-const composerSendBlockedMessage = computed(() =>
-  (forkTransition.value
+const composerSendBlockedMessage = computed(() => {
+  const forkBlock = forkTransition.value
     ? t(
         forkTransition.value.phase === 'error'
           ? 'chat.forkOpenFailed'
@@ -4598,11 +4690,15 @@ const composerSendBlockedMessage = computed(() =>
               ? 'chat.forkReturning'
               : 'chat.forkOpening',
       )
-    : '')
-  || modelImageSendBlockedMessage.value
-  || effectiveSendBlockedReason.value
-  || activeProjectComposerBlockMessage.value,
-)
+    : ''
+  if (forkBlock) return forkBlock
+  if (exactReceiptReplayPendingForCurrentSession.value) {
+    return liveSendBlockedReason.value || ''
+  }
+  return modelImageSendBlockedMessage.value
+    || effectiveSendBlockedReason.value
+    || activeProjectComposerBlockMessage.value
+})
 
 const sendButtonTitle = computed(() => {
   if (replanActive.value) return t('chat.plan.reviseSend')
@@ -4617,16 +4713,17 @@ const sendButtonTitle = computed(() => {
 })
 
 function implementCurrentPlan(target: PlanCardActionTarget) {
-  if (liveSendBlockedReason.value) return
+  if (turnActionsBlocked.value || liveSendBlockedReason.value) return
   void chatPlans.implement(target, false)
 }
 
 function implementPlanInNewTask(target: PlanCardActionTarget) {
-  if (liveSendBlockedReason.value) return
+  if (turnActionsBlocked.value || liveSendBlockedReason.value) return
   void chatPlans.implement(target, true)
 }
 
 function beginPlanRevision(target: PlanCardActionTarget) {
+  if (turnActionsBlocked.value) return
   if (pendingAttachments.value.length > 0) {
     pushToast(t('chat.plan.attachmentsUnavailable'), { tone: 'warn' })
     return
@@ -5504,6 +5601,7 @@ async function returnToForkParent() {
 }
 
 async function forkConversation(throughTurnId?: string) {
+  if (turnActionsBlocked.value) return
   const parentKey = sessionKey.value
   if (!parentKey || forkTransition.value) return
   if (pendingSessionIntent.value === 'new_chat' || isStreaming.value) return
@@ -6238,7 +6336,10 @@ function dragEventHasFiles(e: DragEvent): boolean {
 function onChatDragEnter(e: DragEvent) {
   if (!dragEventHasFiles(e)) return
   e.preventDefault()
-  if (replanActive.value) return
+  if (turnActionsBlocked.value || replanActive.value) {
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'none'
+    return
+  }
   threadDragDepth.value += 1
   threadDragOver.value = true
 }
@@ -6246,7 +6347,7 @@ function onChatDragEnter(e: DragEvent) {
 function onChatDragOver(e: DragEvent) {
   if (!dragEventHasFiles(e)) return
   e.preventDefault()
-  if (replanActive.value) {
+  if (turnActionsBlocked.value || replanActive.value) {
     if (e.dataTransfer) e.dataTransfer.dropEffect = 'none'
     return
   }
@@ -6267,6 +6368,10 @@ function onChatDrop(e: DragEvent) {
   threadDragDepth.value = 0
   threadDragOver.value = false
   if (!dragEventHasFiles(e)) return
+  if (turnActionsBlocked.value) {
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'none'
+    return
+  }
   if (replanActive.value) {
     pushToast(t('chat.plan.attachmentsUnavailable'), { tone: 'warn' })
     return
@@ -6286,6 +6391,7 @@ function autoResizeTextarea() {
 /* ── Clipboard paste ───────────────────────────────────────────────── */
 
 function onDocumentPaste(e: ClipboardEvent) {
+  if (turnActionsBlocked.value) return
   // Pastes aimed at another editable surface (clarify/approval inputs, the
   // command palette) or at an open dialog keep their default behavior — only
   // composer-bound pastes claim clipboard files, mirroring onDocumentKeydown.
@@ -6332,6 +6438,7 @@ function onDocumentKeydown(e: KeyboardEvent) {
     || (target instanceof HTMLTextAreaElement && !composerRef.value?.isTextareaFocused())
     || (target instanceof HTMLElement && target.isContentEditable)
   if (editableTarget) return
+  if (turnActionsBlocked.value) return
 
   if (canStop.value) {
     e.preventDefault()
@@ -6606,6 +6713,7 @@ onMounted(async () => {
   // draft, except for the one most-recent non-empty draft recovered on a cold
   // /chat/new entry. Explicit new-task handoffs always remain clean.
   const initialSession = resolveInitialSession({ recoverDraft: !explicitFreshTask })
+  if (initialSession.draft) pendingSessionIntent.value = 'new_chat'
   sessionKey.value = initialSession.sessionKey
   bindTailLayoutObservers()
   let initialDraftProjectGeneration: number | null = null
@@ -6615,7 +6723,6 @@ onMounted(async () => {
     attachments: Attachment[]
   } | null = null
   if (initialSession.draft) {
-    pendingSessionIntent.value = 'new_chat'
     initialDraftProjectGeneration = draftProjectHydration.begin()
     // Apply the hand-off before any asynchronous project/live work. A later
     // completion must never overwrite text the operator typed while waiting.
@@ -6685,7 +6792,7 @@ onMounted(async () => {
   // The entire dock can grow through attachments, pending work, and textarea
   // autoresize. Publish its real height locally so the thread always reserves
   // exactly enough clearance for the floating surface.
-  const composerDock = composerRef.value?.composerElement()?.parentElement ?? null
+  const composerDock = chatRootRef.value?.querySelector<HTMLElement>('.chat-composer-dock') ?? null
   if (composerDock && typeof ResizeObserver !== 'undefined') {
     const publishComposerDockHeight = () => {
       const height = Math.ceil(composerDock.getBoundingClientRect().height)
@@ -6802,6 +6909,7 @@ onUnmounted(() => {
   chatViewActive = false
   appStore.setChatLivePhase('idle')
   chatViewDisposed = true
+  sessionInteractivity.dispose()
   forkTransitionLifetime.dispose()
   forkTransition.value = null
   durableRecoveryGeneration += 1
@@ -7138,5 +7246,11 @@ watch(
   width: 100%;
   height: 1px;
   pointer-events: none;
+}
+
+.chat-composer-read-only {
+  padding: 0.75rem 1rem;
+  color: var(--text-muted);
+  text-align: center;
 }
 </style>

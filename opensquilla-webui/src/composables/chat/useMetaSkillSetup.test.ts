@@ -76,6 +76,7 @@ function harness(
     ) => boolean | MetaDraftDiscardOutcome | Promise<boolean | MetaDraftDiscardOutcome>
     onDraftAlreadyAccepted?: (sessionKey: string, clientRequestId: string) => void
     forgetHiddenControl?: (sessionKey: string, clientRequestId: string) => void
+    turnActionsBlocked?: () => boolean
   } = {},
 ) {
   const currentSessionKey = ref(options.session || SESSION)
@@ -141,6 +142,7 @@ function harness(
     discardDraft: options.discardDraft,
     onDraftAlreadyAccepted: options.onDraftAlreadyAccepted,
     forgetHiddenControl: options.forgetHiddenControl,
+    turnActionsBlocked: options.turnActionsBlocked,
   })
   return { api, currentSessionKey, dispatchHidden }
 }
@@ -159,6 +161,86 @@ afterEach(() => {
 })
 
 describe('useMetaSkillSetup', () => {
+  it('blocks install, retry, and provider handoff side effects in a read-only session', async () => {
+    const call = vi.fn(async () => ({ ok: true }))
+    const { api, dispatchHidden } = harness(call, {
+      autoRestore: false,
+      turnActionsBlocked: () => true,
+    })
+
+    await api.requestSetup('meta-paper-write', readiness({
+      manual_setup_actions: [{
+        id: 'provider:openrouter',
+        kind: 'provider_connection',
+        provider_id: 'openrouter',
+        available: true,
+      }],
+    }), SESSION)
+    await api.confirmSetup()
+    await api.retrySetup()
+
+    expect(api.beginProviderHandoff('openrouter')).toBe('')
+    expect(call).not.toHaveBeenCalled()
+    expect(dispatchHidden).not.toHaveBeenCalled()
+    expect(api.setupState.value?.phase).toBe('confirm')
+    api.dispose()
+  })
+
+  it('restores a read-only checkpoint without auto-resuming its launch', async () => {
+    const storage = memoryStorage()
+    const first = harness(vi.fn(async () => ({})), { storage, autoRestore: false })
+    await first.api.requestSetup(
+      'meta-short-drama',
+      readiness({ missing_bins: [], setup_actions: [] }),
+      SESSION,
+      '/meta meta-short-drama -- preserved request',
+      'stable-checkpoint-request',
+    )
+    first.api.dispose()
+
+    const call = vi.fn(async () => ({ ok: true }))
+    const second = harness(call, { storage, turnActionsBlocked: () => true })
+    await flushPromises()
+
+    expect(second.api.setupState.value?.name).toBe('meta-short-drama')
+    expect(call).not.toHaveBeenCalled()
+    expect(second.dispatchHidden).not.toHaveBeenCalled()
+    second.api.dispose()
+  })
+
+  it('observes a completed setup job without launching it in a read-only session', async () => {
+    const launchText = '/meta meta-paper-write -- preserved completed job'
+    const storage = memoryStorage({
+      [metaSetupStorageKey(SESSION)]: 'restored-job',
+      [metaSetupLaunchStorageKey(SESSION)]: launchText,
+    })
+    const call = vi.fn(async (method: string) => {
+      if (method === 'meta.setup.status') {
+        return {
+          job: job({
+            job_id: 'restored-job',
+            status: 'completed',
+            phase: 'completed',
+            readiness: readiness({ ready: true, status: 'ready', missing_bins: [] }),
+          }),
+        }
+      }
+      throw new Error(`Unexpected RPC: ${method}`)
+    })
+    const { api, dispatchHidden } = harness(call, {
+      storage,
+      turnActionsBlocked: () => true,
+    })
+    await flushPromises()
+
+    expect(call.mock.calls.map(([method]) => method)).toEqual(['meta.setup.status'])
+    expect(call.mock.calls.some(([method]) => method === 'meta.setup.install')).toBe(false)
+    expect(call.mock.calls.some(([method]) => method === 'meta.run')).toBe(false)
+    expect(dispatchHidden).not.toHaveBeenCalled()
+    expect(storage.getItem(metaSetupStorageKey(SESSION))).toBe('restored-job')
+    api.dispose()
+  })
+
   it('confirms, reports real phases, verifies readiness, and resumes exactly once', async () => {
     let statusCalls = 0
     const call = vi.fn(async (method: string, _params?: Record<string, unknown>) => {

@@ -428,6 +428,7 @@ async def test_slow_chat_history_does_not_block_later_interactive_rpc(
     history_index = next(i for i, frame in enumerate(responses) if frame["id"] == "history")
     assert quick_index < history_index
     assert ws.hello()["policy"]["concurrent_history_reads"] is True
+    assert ws.hello()["policy"]["noninteractive_receipt_replay"] is True
     assert ws.close_codes == []
 
 

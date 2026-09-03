@@ -82,6 +82,9 @@ export interface UseMetaSkillSetupOptions {
   // Remove a browser-side hidden-control retry when the Gateway proves the
   // same stable identity was cancelled in another tab.
   forgetHiddenControl?: (sessionKey: string, clientRequestId: string) => void
+  // Permanent selected-session policy gate for install, launch, and retry work.
+  // Cancellation and receipt recovery are owned by separate paths and remain available.
+  turnActionsBlocked?: () => boolean
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 850
@@ -118,6 +121,10 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
   let installInFlight = false
   let cancelInFlight = false
   let disposed = false
+
+  function turnActionsBlocked(): boolean {
+    return options.turnActionsBlocked?.() === true
+  }
 
   function stopPolling(): void {
     if (pollTimer !== null) {
@@ -232,7 +239,7 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
     token: number,
     clientRequestId = '',
   ): Promise<void> {
-    if (!isCurrent(token)) return
+    if (!isCurrent(token) || turnActionsBlocked()) return
     const current = setupState.value
     if (!current || current.name !== name || current.sessionKey !== sessionKey) return
     const stableClientRequestId = normalizeClientRequestId(
@@ -260,6 +267,7 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
       )
       return
     }
+    if (turnActionsBlocked()) return
 
     try {
       const result = await options.metaRunCenter.launch({
@@ -279,6 +287,7 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
       }
 
       if (result?.ok) {
+        if (turnActionsBlocked()) return
         const launchText = normalizeMetaLaunchText(name, setupState.value?.launchText)
         try {
           const dispatchResult = await options.dispatchHidden(
@@ -415,7 +424,7 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
   }
 
   async function startInstall(current: MetaSetupState): Promise<void> {
-    if (installInFlight || current.actionIds.length === 0) return
+    if (installInFlight || current.actionIds.length === 0 || turnActionsBlocked()) return
     if (options.currentSessionKey.value !== current.sessionKey) {
       setupState.value = transitionMetaSetupState(current, { type: 'session_changed' })
       return
@@ -426,6 +435,7 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
     persistSetupCheckpoint(current)
     setupState.value = transitionMetaSetupState(current, { type: 'install_started' })
     try {
+      if (turnActionsBlocked()) return
       const result = await options.metaRunCenter.setupInstall({
         name: current.name,
         sessionKey: current.sessionKey,
@@ -598,6 +608,7 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
     const normalizedProviderId = normalizeProviderId(providerId)
     if (
       !current
+      || turnActionsBlocked()
       || isBusyPhase(current)
       || current.sessionKey !== options.currentSessionKey.value
       || !availableProviderIds(current.readiness).includes(normalizedProviderId)
@@ -665,6 +676,7 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
     current: MetaSetupState,
     clientRequestId = '',
   ): Promise<void> {
+    if (turnActionsBlocked()) return
     if (options.currentSessionKey.value !== current.sessionKey) {
       setupState.value = transitionMetaSetupState(current, {
         type: 'session_changed',
@@ -695,6 +707,7 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
       return
     }
     try {
+      if (turnActionsBlocked()) return
       const result = await options.metaRunCenter.setupPlan(current.name) as unknown as MetaSetupPlanResponse
       if (!isCurrent(token) || !setupState.value) return
       if (options.currentSessionKey.value !== current.sessionKey) return
@@ -736,6 +749,7 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
       await retrySetupDiscard(current)
       return
     }
+    if (turnActionsBlocked()) return
     if (current.retryMode === 'status' && current.jobId) {
       const token = beginOperation()
       setupState.value = { ...current, phase: 'verifying', error: '' }

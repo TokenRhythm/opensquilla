@@ -125,7 +125,7 @@
         class="meta-preflight-link"
         type="button"
         data-action="defaults"
-        :disabled="busy"
+        :disabled="busy || turnActionsDisabled"
         @click="onAction('defaults')"
       >
         {{ copy.useDefaults }}
@@ -144,7 +144,7 @@
         class="meta-preflight-primary"
         type="button"
         data-action="continue"
-        :disabled="busy"
+        :disabled="busy || turnActionsDisabled"
         :aria-busy="phase === 'submitting' ? 'true' : 'false'"
         @click="onAction('continue')"
       >
@@ -186,6 +186,7 @@ const props = defineProps<{
   state: MetaPreflightState
   phase: MetaPreflightPhase
   errorText?: string
+  turnActionsDisabled?: boolean
 }>()
 
 const emit = defineEmits<{

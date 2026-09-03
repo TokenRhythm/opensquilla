@@ -89,8 +89,10 @@ interface PendingQueueBroadcastMessage {
 export type BusySendMode = 'queue' | 'steer'
 export type PendingDeliveryOutcome =
   | 'accepted'
+  | 'acceptance_unknown'
   | 'deferred'
   | 'not_sent'
+  | 'policy_blocked'
   | 'retryable_failure'
 
 export interface PendingQueueOwner {
@@ -127,6 +129,8 @@ export interface UseChatPendingQueueOptions {
   pendingSessionIntent: Ref<string | null>
   isStreaming: Ref<boolean>
   isBlocked: () => boolean
+  /** Transport-only barrier used while resolving an acceptance-unknown receipt. */
+  isReceiptReplayBlocked?: () => boolean
   autoResizeTextarea: () => void
   sendCurrentInput: () => void
   resetInputHistory: () => void
@@ -193,7 +197,8 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   const hasDeliveryBarrier = computed(() =>
     pendingQueue.value.some(
       item => Boolean(
-        item.deliveryState
+        item.deliveryState === 'steering'
+        || item.deliveryState === 'retryable'
         || item.steerAttempt
         || item.pendingPersistenceState === 'saving'
         || item.pendingPersistenceState === 'cancelling',
@@ -1269,8 +1274,31 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       flushDeferredPendingDrain()
       return
     }
+    if (outcome === 'policy_blocked') {
+      // The selected session cannot admit a fresh turn. Park the head without
+      // retaining or rearming a transient terminal-drain signal; exact receipt
+      // recovery bypasses this outcome in the send layer.
+      if (container === pendingQueue.value && index === 0) {
+        deferredDrainRequested = false
+        cancelPendingDrainTimer()
+      }
+      // Clear the reactive lease only after the active head's drain signal;
+      // otherwise the delivery-barrier watcher can immediately rearm it.
+      if (!item.steerAttempt) item.deliveryState = undefined
+      return
+    }
     if (outcome === 'deferred' && !item.steerAttempt) {
       item.deliveryState = undefined
+      deferredDrainRequested = true
+      flushDeferredPendingDrain()
+      return
+    }
+    if (outcome === 'acceptance_unknown' && !item.steerAttempt) {
+      // Release the first delivery lease so the retained terminal-drain signal
+      // can perform one exact receipt lookup. If that replay is also unknown,
+      // sendQueuedFollowup returns retryable_failure and parks the item instead
+      // of creating a transport retry loop.
+      item.deliveryState = 'replay_pending'
       deferredDrainRequested = true
       flushDeferredPendingDrain()
       return
@@ -1688,11 +1716,15 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
               options.onHiddenControlDispatchResult?.({
                 status: outcome === 'accepted'
                   ? 'accepted'
+                  : outcome === 'policy_blocked'
+                    ? 'queued'
                   : outcome === 'not_sent'
                     ? 'rejected'
                     : 'unknown',
                 reason: outcome === 'accepted'
                   ? 'accepted'
+                  : outcome === 'policy_blocked'
+                    ? 'queued'
                   : outcome === 'not_sent'
                     ? 'send_rejected'
                     : 'response_unknown',
@@ -1765,9 +1797,12 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         deferredDrainRequested = false
         return
       }
+      const receiptReplay = pendingQueue.value[0]?.deliveryState === 'replay_pending'
       if (
         options.isStreaming.value
-        || options.isBlocked()
+        || (receiptReplay
+          ? options.isReceiptReplayBlocked?.() ?? options.isBlocked()
+          : options.isBlocked())
         || hasDeliveryBarrier.value
         || isReordering.value
       ) return

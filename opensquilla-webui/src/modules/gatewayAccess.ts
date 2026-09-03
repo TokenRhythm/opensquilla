@@ -32,6 +32,7 @@ export interface GatewayAccess {
   readonly streamIdleTimeoutMs: number | null
   readonly concurrentHistoryReads: boolean
   readonly detachedSessionHydration: boolean
+  readonly noninteractiveReceiptReplay?: boolean
   readonly subscriptionEpoch: number
   loadConnectionEndpoint(): string
   connect(settings: GatewayConnectionSettings): Promise<void>

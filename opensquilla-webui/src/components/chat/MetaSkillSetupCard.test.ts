@@ -40,6 +40,7 @@ async function mountCard(
     onRetry?: () => void
     onConfigure?: (providerId: string) => void
     providerNavigationPending?: boolean
+    turnActionsDisabled?: boolean
   } = {},
 ) {
   const root = document.createElement('div')
@@ -384,6 +385,52 @@ describe('MetaSkillSetupCard', () => {
     expect(mounted.root.querySelector<HTMLButtonElement>(
       '[data-testid="meta-setup-retry"]',
     )?.disabled).toBe(true)
+  })
+
+  it('disables setup turn actions in a read-only session while retaining cancel', async () => {
+    const onConfirm = vi.fn()
+    const onCancel = vi.fn()
+    const onRetry = vi.fn()
+    const onConfigure = vi.fn()
+    const mounted = await mountCard(state({
+      readiness: {
+        ...state().readiness,
+        manual_setup_actions: [{
+          id: 'provider:acme-media',
+          kind: 'provider_connection',
+          provider_id: 'acme-media',
+          available: true,
+        }],
+      },
+      retryMode: 'readiness',
+    }), {
+      onConfirm,
+      onCancel,
+      onRetry,
+      onConfigure,
+      turnActionsDisabled: true,
+    })
+    apps.push(mounted.app)
+
+    const confirm = mounted.root.querySelector<HTMLButtonElement>('[data-testid="meta-setup-confirm"]')
+    const retry = mounted.root.querySelector<HTMLButtonElement>('[data-testid="meta-setup-retry"]')
+    const configure = mounted.root.querySelector<HTMLButtonElement>(
+      '[data-testid="meta-setup-configure-provider"]',
+    )
+    const cancel = mounted.root.querySelector<HTMLButtonElement>('[data-testid="meta-setup-cancel"]')
+    expect(confirm?.disabled).toBe(true)
+    expect(retry?.disabled).toBe(true)
+    expect(configure?.disabled).toBe(true)
+    expect(cancel?.disabled).toBe(false)
+
+    confirm?.click()
+    retry?.click()
+    configure?.click()
+    cancel?.click()
+    expect(onConfirm).not.toHaveBeenCalled()
+    expect(onRetry).not.toHaveBeenCalled()
+    expect(onConfigure).not.toHaveBeenCalled()
+    expect(onCancel).toHaveBeenCalledOnce()
   })
 
   it('does not infer a provider settings action from a raw missing environment key', async () => {

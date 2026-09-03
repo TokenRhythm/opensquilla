@@ -35,7 +35,7 @@ describe('ChatComposer control hierarchy', () => {
     expect(viewSource).toContain('await setGlobalRunMode(mode)')
     expect(viewSource).toContain(':run-mode-locked="runModeLocked"')
     expect(viewSource).toContain('|| activeRunModeLock.value !== null')
-    expect(composerSource).toContain(':disabled="runModeLocked"')
+    expect(composerSource).toContain(':disabled="freshInputDisabled || runModeLocked"')
     expect(composerSource).toContain('chat-run-mode-lock-tip')
     expect(composerSource).not.toContain('cursor: not-allowed')
     expect(composerSource).toContain('cursor: default')
@@ -116,7 +116,9 @@ describe('ChatComposer model routing contract', () => {
     expect(composerSource).toContain('setSessionRoutingMode: [mode: ModelRoutingMode]')
 
     expect(viewSource).toContain(':session-routing-mode="modelRoutingMode"')
-    expect(viewSource).toContain(':session-routing-busy="modelRoutingSettingsBusy"')
+    expect(viewSource).toContain(
+      ':session-routing-busy="modelRoutingSettingsBusy\n        && !exactReceiptReplayPendingForCurrentSession"',
+    )
     expect(viewSource).toContain(':session-routing-control-blocked="goalBusy"')
     expect(viewSource).toContain(':session-routing-available="sessionRoutingAvailable"')
     expect(viewSource).toContain('gatewayAccess.isAuthenticated')
@@ -160,9 +162,9 @@ describe('ChatComposer model routing contract', () => {
     expect(viewSource).toContain('sendBlockedReason: effectiveSendBlockedReason,')
     expect(viewSource).toContain('&& !deliveryBlockedReason.value')
     expect(viewSource).toContain('sessionRoutingSendBlockedReason.value || liveSendBlockedReason.value')
-    expect(viewSource).toContain(
-      'deliveryBlockedReason.value || promptAnnotationSendBlockedReason.value',
-    )
+    expect(viewSource).toContain('sessionInteractivityBlockedReason.value')
+    expect(viewSource).toContain('|| deliveryBlockedReason.value')
+    expect(viewSource).toContain('|| promptAnnotationSendBlockedReason.value')
     expect(viewSource).not.toContain('\n  || sessionRoutingSendBlockedReason.value\n')
     expect(composerSource).toContain('|| sessionRoutingBusy || inputDisabled')
     expect(composerSource).toContain(":aria-busy=\"sessionRoutingBusy ? 'true' : 'false'\"")

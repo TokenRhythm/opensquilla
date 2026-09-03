@@ -144,7 +144,12 @@ from opensquilla.gateway.session_services import (
     set_session_epoch,
 )
 from opensquilla.gateway.session_streams import get_session_streams
-from opensquilla.gateway.session_view import build_session_view_item, derive_transcript_title
+from opensquilla.gateway.session_view import (
+    build_session_view_item,
+    channel_types_from_config,
+    derive_transcript_title,
+    is_noninteractive_cron_session,
+)
 from opensquilla.gateway.subagent_announce import (
     quiesce_background_completion_sessions,
 )
@@ -638,7 +643,7 @@ async def _fork_title_state(
         sessions.append(parent)
 
     transcript_titles = await _list_transcript_titles(storage, sessions)
-    channel_types = _channel_types_from_config(getattr(ctx, "config", None))
+    channel_types = channel_types_from_config(getattr(ctx, "config", None))
     sessions_by_key = {
         str(getattr(session, "session_key", "") or ""): session for session in sessions
     }
@@ -953,18 +958,6 @@ def _is_remote_web_guest(principal: Any, source_hint: dict[str, Any]) -> bool:
         has_capability("guest.safe")
         and not principal_has_host_execute(principal)
     )
-
-
-def _channel_types_from_config(config: Any) -> dict[str, str]:
-    """Lowercased configured-channel-name -> platform-type map for the view."""
-    channels_cfg = getattr(getattr(config, "channels", None), "channels", None) or []
-    out: dict[str, str] = {}
-    for entry in channels_cfg:
-        name = str(getattr(entry, "name", "") or "").strip().lower()
-        ctype = str(getattr(entry, "type", "") or "").strip().lower()
-        if name and ctype:
-            out[name] = ctype
-    return out
 
 
 def _normalize_session_send_source_hint(params: dict[str, Any]) -> dict[str, Any]:
@@ -2848,7 +2841,7 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
             entry_counts = {}
 
     result = []
-    channel_types = _channel_types_from_config(ctx.config)
+    channel_types = channel_types_from_config(ctx.config)
     for s in sessions:
         # Fetch entry count for metadata
         entry_count = entry_counts.get(s.session_id, 0)
@@ -2998,7 +2991,7 @@ async def _handle_sessions_search(params: dict | None, ctx: RpcContext) -> dict:
     if storage is None:
         return empty
 
-    channel_types = _channel_types_from_config(getattr(ctx, "config", None))
+    channel_types = channel_types_from_config(getattr(ctx, "config", None))
 
     def project(session: Any, transcript_title: str) -> SessionSearchProjection:
         view = build_session_view_item(
@@ -3147,7 +3140,7 @@ async def _should_auto_title(
         origin = getattr(session, "origin", None)
         origin_map = origin if isinstance(origin, dict) else {}
         surface = _surface(
-            session, key, origin_map, _channel_types_from_config(getattr(ctx, "config", None))
+            session, key, origin_map, channel_types_from_config(getattr(ctx, "config", None))
         )
         session_kind = _session_kind(session, key, surface, origin_map)
         if not is_naming_eligible(naming_cfg, surface, session_kind):
@@ -3478,6 +3471,7 @@ async def _handle_sessions_send_impl_inner(
     atomic_collaboration_mode_update: bool = False,
     pending_input_id: str | None = None,
     pending_input_fingerprint: str | None = None,
+    pending_input_enqueue_fingerprint: str | None = None,
     pending_input_revision: int | None = None,
     _prompt_annotation_acceptance_retries: int = 1,
     trusted_run_kind: str | None = None,
@@ -3728,11 +3722,6 @@ async def _handle_sessions_send_impl_inner(
             raise ValueError("initialRoutingMode requires new_chat intent")
         if fork_before_message_id is not None:
             raise ValueError("initialRoutingMode cannot be combined with a transcript fork")
-        # Validate the activation plan before accepting a first message. This
-        # is read-only and rejects an Ensemble that cannot be built today.
-        from opensquilla.gateway.model_routing import model_routing_patches
-
-        model_routing_patches(ctx.config, initial_routing_mode)
 
     if ctx.session_manager is None:
         raise KeyError("No session manager available")
@@ -3824,6 +3813,29 @@ async def _handle_sessions_send_impl_inner(
                     previous_acceptance.receipt.accepted_session_key,
                 )
             return replay_response
+
+    if initial_routing_mode is not None:
+        # Receipt replay is an identity lookup, not a new admission decision.
+        # Validate the live activation plan only after proving this is fresh.
+        from opensquilla.gateway.model_routing import model_routing_patches
+
+        model_routing_patches(ctx.config, initial_routing_mode)
+
+    canonical_cron_key = key.startswith("cron:")
+    existing_session = None if canonical_cron_key else await storage.get_session(key)
+    if canonical_cron_key or (
+        existing_session is not None
+        and is_noninteractive_cron_session(
+            existing_session,
+            channel_types=channel_types_from_config(ctx.config),
+        )
+    ):
+        raise RpcHandlerError(
+            "SESSION_NOT_INTERACTIVE",
+            "Cron isolated sessions are read-only and cannot receive new turns.",
+            retryable=False,
+            accepted=False,
+        )
 
     if prompt_annotation_ids or document_context_request is not None:
         existing_annotation_session = await storage.get_session(key)
@@ -5653,6 +5665,9 @@ async def _handle_sessions_send_impl_inner(
                 prompt_annotation_turn_id=(turn_id if prompt_annotation_rows else None),
                 pending_input_id=pending_input_id,
                 pending_input_fingerprint=pending_input_fingerprint,
+                pending_input_enqueue_fingerprint=(
+                    pending_input_enqueue_fingerprint
+                ),
                 pending_input_revision=pending_input_revision,
             )
             if not acceptance.replayed and not merge_into_task:
@@ -5884,6 +5899,9 @@ async def _handle_sessions_send_impl_inner(
                         atomic_collaboration_mode_update=atomic_collaboration_mode_update,
                         pending_input_id=pending_input_id,
                         pending_input_fingerprint=pending_input_fingerprint,
+                        pending_input_enqueue_fingerprint=(
+                            pending_input_enqueue_fingerprint
+                        ),
                         pending_input_revision=pending_input_revision,
                         _prompt_annotation_acceptance_retries=(
                             _prompt_annotation_acceptance_retries - 1
@@ -6271,6 +6289,9 @@ async def _handle_sessions_send_impl_inner(
                 workspace_guard=workspace_guard,
                 pending_input_id=pending_input_id,
                 pending_input_fingerprint=pending_input_fingerprint,
+                pending_input_enqueue_fingerprint=(
+                    pending_input_enqueue_fingerprint
+                ),
                 pending_input_revision=pending_input_revision,
             )
             if acceptance.replayed:
@@ -6852,6 +6873,7 @@ async def _handle_sessions_send(
     atomic_collaboration_mode_update: bool = False,
     pending_input_id: str | None = None,
     pending_input_fingerprint: str | None = None,
+    pending_input_enqueue_fingerprint: str | None = None,
     pending_input_revision: int | None = None,
     trusted_run_kind: str | None = None,
     _explicit_ingress_intent_registered: bool = False,
@@ -6890,6 +6912,9 @@ async def _handle_sessions_send(
                 atomic_collaboration_mode_update=atomic_collaboration_mode_update,
                 pending_input_id=pending_input_id,
                 pending_input_fingerprint=pending_input_fingerprint,
+                pending_input_enqueue_fingerprint=(
+                    pending_input_enqueue_fingerprint
+                ),
                 pending_input_revision=pending_input_revision,
                 trusted_run_kind=trusted_run_kind,
             ),
@@ -7287,7 +7312,82 @@ async def _handle_pending_inputs_enqueue(
     async def _materialize_and_enqueue() -> tuple[PendingChatInput, bool]:
         async with _pending_input_enqueue_lock(ctx, key, pending_input_id):
             payload = dict(raw_payload)
-            staged_scope = await _pending_input_current_session_id(storage, key)
+            session = await storage.get_session(key)
+            staged_scope = getattr(session, "session_id", None)
+            if not isinstance(staged_scope, str) or not staged_scope:
+                staged_scope = None
+
+            # A response-loss retry must remain available after the session
+            # becomes read-only. Prove the complete persisted queue identity
+            # before policy, without restaging attachments or touching SQLite.
+            existing = await storage.get_pending_chat_input(pending_input_id)
+            if existing is not None:
+                replay_payload = dict(raw_payload)
+                if attachments and staged_scope is not None:
+                    manifest = read_pending_chat_input_manifest(
+                        media_root=media_root_from_config(ctx.config),
+                        session_id=staged_scope,
+                        pending_input_id=pending_input_id,
+                    )
+                    if (
+                        manifest is not None
+                        and manifest.get("enqueue_fingerprint")
+                        == request_fingerprint(raw_payload)
+                    ):
+                        replay_payload["attachments"] = manifest["attachments"]
+                replay_fingerprint = request_fingerprint(replay_payload)
+                if (
+                    existing.session_key == key
+                    and existing.source_scope == source_scope
+                    and existing.client_request_id == raw_payload["clientRequestId"]
+                    and existing.client_message_id == raw_payload["clientMessageId"]
+                    and existing.request_fingerprint == replay_fingerprint
+                    and existing.payload == replay_payload
+                ):
+                    return existing, True
+
+            dispatch_receipts = await storage.find_pending_chat_input_dispatch_receipts(
+                pending_input_id=pending_input_id,
+                session_key=key,
+                source_scope=source_scope,
+                client_request_id=raw_payload["clientRequestId"],
+                client_message_id=raw_payload["clientMessageId"],
+            )
+            raw_fingerprint = request_fingerprint(raw_payload)
+            if dispatch_receipts:
+                dispatch_receipt = dispatch_receipts[0]
+                replay_fingerprint = (
+                    dispatch_receipt.enqueue_request_fingerprint
+                    or dispatch_receipt.request_fingerprint
+                )
+                if (
+                    len(dispatch_receipts) == 1
+                    and dispatch_receipt.pending_input_id == pending_input_id
+                    and dispatch_receipt.session_key == key
+                    and dispatch_receipt.source_scope == source_scope
+                    and dispatch_receipt.client_request_id
+                    == raw_payload["clientRequestId"]
+                    and dispatch_receipt.client_message_id
+                    == raw_payload["clientMessageId"]
+                    and replay_fingerprint == raw_fingerprint
+                ):
+                    raise PendingChatInputAlreadyDispatchedError(
+                        "pending input was already dispatched"
+                    )
+                raise PendingChatInputConflictError(
+                    "pending input dispatch identity was already used"
+                )
+
+            if key.startswith("cron:") or is_noninteractive_cron_session(
+                session,
+                channel_types=channel_types_from_config(ctx.config),
+            ):
+                raise RpcHandlerError(
+                    "SESSION_NOT_INTERACTIVE",
+                    "Cron isolated sessions are read-only and cannot receive new turns.",
+                    retryable=False,
+                    accepted=False,
+                )
             if staged_scope is None:
                 raise RpcHandlerError(
                     "PENDING_SESSION_UNAVAILABLE",
@@ -7743,12 +7843,32 @@ async def _handle_pending_inputs_dispatch(
                 accepted=False,
             )
         try:
+            enqueue_fingerprints: set[str] = set()
+            for session_id in _pending_input_attachment_scopes(row):
+                manifest = read_pending_chat_input_manifest(
+                    media_root=media_root_from_config(ctx.config),
+                    session_id=session_id,
+                    pending_input_id=row.pending_input_id,
+                )
+                if manifest is not None:
+                    enqueue_fingerprints.add(str(manifest["enqueue_fingerprint"]))
+            if len(enqueue_fingerprints) > 1:
+                raise PendingChatInputConflictError(
+                    "pending attachment manifests disagree on enqueue identity"
+                )
+            pending_input_enqueue_fingerprint = next(
+                iter(enqueue_fingerprints),
+                row.request_fingerprint,
+            )
             response = await _handle_sessions_send(
                 dict(row.payload),
                 ctx,
                 fingerprint_params=dict(row.payload),
                 pending_input_id=row.pending_input_id,
                 pending_input_fingerprint=row.request_fingerprint,
+                pending_input_enqueue_fingerprint=(
+                    pending_input_enqueue_fingerprint
+                ),
                 pending_input_revision=row.state_revision,
             )
         except PendingChatInputNotFoundError as exc:
@@ -8146,21 +8266,6 @@ async def _handle_sessions_steer_v2_impl(
             accepted=False,
         )
 
-    task_runtime = getattr(ctx, "task_runtime", None)
-    admit_steer = getattr(task_runtime, "admit_steer", None)
-    if not callable(admit_steer):
-        return _steer_v2_failure(
-            key=key,
-            expected_turn_id=expected_turn_id,
-            failure_code="STEER_V2_UNAVAILABLE",
-            capability={
-                "mode": "disabled",
-                "expected_turn_id": expected_turn_id,
-                "input_kinds": [],
-                "reason": "gateway_upgrade_required",
-            },
-        )
-
     source_hint = _normalize_session_send_source_hint(params)
     normalized = normalize_incoming_text(
         raw_message,
@@ -8259,6 +8364,32 @@ async def _handle_sessions_steer_v2_impl(
                 surface_id=surface_id,
                 storage=storage,
             )
+
+    if key.startswith("cron:") or is_noninteractive_cron_session(
+        session,
+        channel_types=channel_types_from_config(ctx.config),
+    ):
+        raise RpcHandlerError(
+            "SESSION_NOT_INTERACTIVE",
+            "Cron isolated sessions are read-only and cannot receive new turns.",
+            retryable=False,
+            accepted=False,
+        )
+
+    task_runtime = getattr(ctx, "task_runtime", None)
+    admit_steer = getattr(task_runtime, "admit_steer", None)
+    if not callable(admit_steer):
+        return _steer_v2_failure(
+            key=key,
+            expected_turn_id=expected_turn_id,
+            failure_code="STEER_V2_UNAVAILABLE",
+            capability={
+                "mode": "disabled",
+                "expected_turn_id": expected_turn_id,
+                "input_kinds": [],
+                "reason": "gateway_upgrade_required",
+            },
+        )
 
     workspace_guard = None
     bound_workspace_id = getattr(session, "workspace_id", None)
@@ -8497,6 +8628,16 @@ async def _handle_sessions_steer(params: dict | None, ctx: RpcContext) -> dict:
     session = await storage.get_session(key)
     if session is None:
         raise KeyError(f"Session not found: {key}")
+    if key.startswith("cron:") or is_noninteractive_cron_session(
+        session,
+        channel_types=channel_types_from_config(ctx.config),
+    ):
+        raise RpcHandlerError(
+            "SESSION_NOT_INTERACTIVE",
+            "Cron isolated sessions are read-only and cannot receive new turns.",
+            retryable=False,
+            accepted=False,
+        )
 
     task_runtime = getattr(ctx, "task_runtime", None)
     active_task_id = getattr(task_runtime, "active_task_id", None)

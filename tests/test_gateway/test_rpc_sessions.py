@@ -3791,6 +3791,158 @@ class TestSessionsSend:
         assert res.error.code == "NOT_FOUND"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("session_key", "origin", "intent", "last_channel", "channel_type"),
+        [
+            pytest.param(
+                "cron:job-1:run:1",
+                None,
+                "continue",
+                None,
+                None,
+                id="canonical-key",
+            ),
+            pytest.param(
+                "cron:job-1:run:2",
+                None,
+                "continue",
+                "slack",
+                None,
+                id="canonical-key-with-raw-builtin-delivery-metadata",
+            ),
+            pytest.param(
+                "cron:job-1:run:3",
+                None,
+                "continue",
+                "company-chat",
+                "feishu",
+                id="canonical-key-with-configured-builtin-delivery-metadata",
+            ),
+            pytest.param(
+                "cron:job-1:run:4",
+                None,
+                "continue",
+                "corp-chat",
+                "whatsapp",
+                id="canonical-key-with-plugin-delivery-metadata",
+            ),
+            pytest.param(
+                "scheduled-run-with-legacy-key",
+                {"kind": "cron"},
+                "reset_same_key",
+                None,
+                None,
+                id="origin-provenance-and-reset",
+            ),
+        ],
+    )
+    async def test_send_rejects_cron_session_before_acceptance(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+        session_key: str,
+        origin: dict[str, Any] | None,
+        intent: str,
+        last_channel: str | None,
+        channel_type: str | None,
+    ):
+        cron_session = FakeSession(
+            session_key=session_key,
+            session_id="cron-run-1",
+            origin=origin,
+            last_channel=last_channel,
+        )
+        manager = FakeSessionManager([cron_session])
+        runner = _RecordingTurnRunner()
+        ingest_attachments = AsyncMock(
+            side_effect=AssertionError("Cron rejection must precede attachment ingest")
+        )
+        monkeypatch.setattr(
+            rpc_sessions._attachment_ingest,
+            "ingest_attachments",
+            ingest_attachments,
+        )
+        config = GatewayConfig(memory={"flush_enabled": False})
+        if last_channel and channel_type:
+            config.channels.channels = [
+                SimpleNamespace(type=channel_type, name=last_channel)
+            ]
+        ctx = make_ctx(session_manager=manager, turn_runner=runner, config=config)
+        send_params: dict[str, Any] = {
+            "key": cron_session.session_key,
+            "message": "Unexpected follow-up",
+            "intent": intent,
+            "attachments": [
+                {"type": "text/plain", "data": "bm90ZQ==", "name": "note.txt"}
+            ],
+        }
+        if intent == "continue":
+            # This intentionally combines annotations and attachments. Cron
+            # admission must win before either feature can perform work.
+            send_params["promptAnnotationIds"] = ["annotation-1"]
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.send",
+            send_params,
+            ctx,
+        )
+
+        assert res.ok is False
+        assert res.error.code == "SESSION_NOT_INTERACTIVE"
+        assert res.error.accepted is False
+        assert res.error.retryable is False
+        assert manager.applied_intents == []
+        assert manager.created_messages == []
+        assert runner.run_calls == []
+        ingest_attachments.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("channel_name", "channel_type"),
+        [
+            pytest.param("company-chat", "feishu", id="builtin-type"),
+            pytest.param("corp-chat", "whatsapp", id="plugin-type"),
+        ],
+    )
+    async def test_send_keeps_configured_cron_delivery_session_interactive(
+        self,
+        dispatcher,
+        channel_name: str,
+        channel_type: str,
+    ):
+        delivery_session = FakeSession(
+            session_key=f"agent:main:{channel_name}:direct:user-1",
+            last_channel=channel_name,
+            origin={"kind": "cron"},
+        )
+        manager = FakeSessionManager([delivery_session])
+        runner = _RecordingTurnRunner()
+        config = GatewayConfig(memory={"flush_enabled": False})
+        # Plugin-provided channel types are registered outside the built-in
+        # config union, so model their normalized runtime entry directly.
+        config.channels.channels = [
+            SimpleNamespace(type=channel_type, name=channel_name)
+        ]
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.send",
+            {"key": delivery_session.session_key, "message": "Allowed follow-up"},
+            make_ctx(session_manager=manager, turn_runner=runner, config=config),
+        )
+        background = get_agent_task_registry().get(delivery_session.session_key)
+        if background is not None:
+            await background
+
+        assert res.ok is True
+        assert manager.applied_intents == [(delivery_session.session_key, "continue")]
+        assert manager.created_messages == [
+            (delivery_session.session_key, "user", "Allowed follow-up")
+        ]
+        assert len(runner.run_calls) == 1
+
+    @pytest.mark.asyncio
     async def test_send_rejects_too_many_attachments(self, dispatcher, ctx_with_sessions, session):
         # The per-turn cap is 10; 11 must be rejected.
         res = await dispatcher.dispatch(
@@ -4703,6 +4855,138 @@ class TestSessionsSend:
 
 class TestSessionsSteer:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["sessions.steer.v2", "sessions.steer"])
+    @pytest.mark.parametrize(
+        "cron_session",
+        [
+            pytest.param(
+                FakeSession(session_key="cron:job-1:run:steer"),
+                id="canonical-key",
+            ),
+            pytest.param(
+                FakeSession(
+                    session_key="scheduled-run-with-legacy-steer-key",
+                    origin={"kind": "cron"},
+                ),
+                id="legacy-origin",
+            ),
+        ],
+    )
+    async def test_steer_rejects_cron_session_before_runtime_or_persistence(
+        self,
+        dispatcher,
+        method: str,
+        cron_session: FakeSession,
+    ) -> None:
+        runtime = SimpleNamespace(
+            active_task_id=AsyncMock(
+                side_effect=AssertionError("Cron rejection must precede runtime lookup")
+            ),
+            steer=AsyncMock(
+                side_effect=AssertionError("Cron rejection must precede runtime steering")
+            ),
+            admit_steer=AsyncMock(
+                side_effect=AssertionError("Cron rejection must precede steer admission")
+            ),
+        )
+        manager = FakeSessionManager([cron_session])
+        ctx = make_ctx(session_manager=manager, task_runtime=runtime)
+
+        response = await dispatcher.dispatch(
+            "r-steer-cron-rejected",
+            method,
+            {
+                "key": cron_session.session_key,
+                "message": "must not be accepted",
+                "expected_turn_id": "turn-running",
+                "client_request_id": "request-steer-cron",
+                "client_message_id": "client-steer-cron",
+            },
+            ctx,
+        )
+
+        assert response.ok is False
+        assert response.error.code == "SESSION_NOT_INTERACTIVE"
+        assert response.error.accepted is False
+        assert response.error.retryable is False
+        assert manager.created_messages == []
+        runtime.active_task_id.assert_not_awaited()
+        runtime.steer.assert_not_awaited()
+        runtime.admit_steer.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pending_input_steer_rejects_cron_without_consuming_row(
+        self,
+        dispatcher,
+        tmp_path,
+    ) -> None:
+        from opensquilla.session.manager import SessionManager
+        from opensquilla.session.models import SessionNode
+        from opensquilla.session.storage import SessionStorage
+
+        key = "scheduled-run-with-pending-steer"
+        store = SessionStorage(str(tmp_path / "pending-cron-steer.db"))
+        await store.connect()
+        await store.upsert_session(
+            SessionNode(
+                session_key=key,
+                session_id="session-pending-cron-steer",
+                agent_id="main",
+                created_at=100,
+                updated_at=100,
+                origin={"kind": "cron"},
+            )
+        )
+        manager = SessionManager(store, inject_time_prefix=False)
+        payload = {
+            "key": key,
+            "message": "queued guidance",
+            "attachments": [],
+            "queueMode": "followup",
+            "clientRequestId": "request-pending-cron-steer",
+            "clientMessageId": "client-pending-cron-steer",
+            "_source": {"caller_kind": "web", "channel_kind": "web"},
+        }
+        fingerprint = request_fingerprint(payload)
+        row, replayed = await store.enqueue_pending_chat_input(
+            pending_input_id="pending-cron-steer-1",
+            session_key=key,
+            source_scope="web:web:operator",
+            client_request_id="request-pending-cron-steer",
+            client_message_id="client-pending-cron-steer",
+            request_fingerprint=fingerprint,
+            payload=payload,
+        )
+        assert replayed is False
+        ctx = make_ctx(session_manager=manager, task_runtime=SimpleNamespace())
+        try:
+            response = await dispatcher.dispatch(
+                "r-pending-cron-steer",
+                "sessions.pending_inputs.steer",
+                {
+                    "key": key,
+                    "pendingInputId": row.pending_input_id,
+                    "clientRequestId": row.client_request_id,
+                    "clientMessageId": row.client_message_id,
+                    "requestFingerprint": row.request_fingerprint,
+                    "expectedRevision": row.state_revision,
+                    "expected_turn_id": "turn-running",
+                    "_source": {"caller_kind": "web", "channel_kind": "web"},
+                },
+                ctx,
+            )
+
+            assert response.ok is False
+            assert response.error.code == "SESSION_NOT_INTERACTIVE"
+            assert [
+                item.pending_input_id
+                for item in await store.list_pending_chat_inputs(key)
+            ] == [row.pending_input_id]
+            assert await store.get_transcript("session-pending-cron-steer") == []
+        finally:
+            await store.close()
+
+    @pytest.mark.asyncio
     async def test_pending_input_steer_atomically_consumes_durable_row(
         self,
         dispatcher,
@@ -4960,12 +5244,18 @@ class TestSessionsSteer:
             finally:
                 store.accept_turn = original_accept_turn  # type: ignore[method-assign]
             await store.remove_project_workspace(workspace.workspace_id, now_ms=200)
+            stored_session = await store.get_session(key)
+            assert stored_session is not None
+            stored_session.origin = {"kind": "cron"}
+            await store.upsert_session(stored_session)
             replayed = await dispatcher.dispatch(
                 "r-steer-v2-replay",
                 "sessions.steer.v2",
                 params,
                 ctx,
             )
+            stored_session.origin = None
+            await store.upsert_session(stored_session)
             unavailable = await dispatcher.dispatch(
                 "r-steer-v2-workspace-unavailable",
                 "sessions.steer.v2",
@@ -11279,6 +11569,48 @@ def test_session_view_plugin_channel_type_degrades_to_unknown_surface():
     )
     assert feishu_view["surface"] == "feishu"
     assert feishu_view["sessionKind"] == "channel"
+
+
+@pytest.mark.parametrize(
+    ("last_channel", "channel_types"),
+    [
+        ("slack", None),
+        ("release-room", {"release-room": "feishu"}),
+    ],
+)
+def test_session_view_canonical_cron_key_overrides_delivery_metadata(
+    last_channel,
+    channel_types,
+):
+    from opensquilla.gateway.session_view import build_session_view_item
+
+    session_key = "cron:daily-summary:run:canonical"
+    session = FakeSession(
+        session_key=session_key,
+        last_channel=last_channel,
+        last_to="delivery-target",
+        origin={
+            "kind": "cron",
+            "cron": {
+                "jobId": "daily-summary",
+                "sessionTarget": "session",
+                "targetSessionKey": session_key,
+            },
+        },
+    )
+
+    view = build_session_view_item(
+        session,
+        entry_count=0,
+        task_rows=[],
+        now_ms=0,
+        channel_types=channel_types,
+    )
+
+    assert view["surface"] == "cron"
+    assert view["sessionKind"] == "cron"
+    assert view["groupLabel"] == "Cron"
+    assert view["interactive"] is False
 
 
 @pytest.mark.asyncio

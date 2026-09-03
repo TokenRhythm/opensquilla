@@ -1,9 +1,20 @@
+import type { TurnSendSource } from '@/modules/turnCommands'
+import type { GatewayModelRoutingMode } from '@/types/modelRouting'
+
+export interface HiddenControlRequestSnapshot {
+  intent: string | null
+  initialRoutingMode: GatewayModelRoutingMode | null
+  source: TurnSendSource
+}
+
 export interface HiddenControlOutboxItem {
   sessionKey: string
   clientRequestId: string
   providerText: string
   displayText: string
   createdAtMs: number
+  dispatchAttempted: boolean | null
+  requestSnapshot: HiddenControlRequestSnapshot | null
 }
 
 export type HiddenControlStorage = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>
@@ -15,10 +26,49 @@ export type HiddenControlPersistResult =
   | 'unavailable'
   | 'failed'
 
+type HiddenControlOutboxInput = Omit<
+  HiddenControlOutboxItem,
+  'createdAtMs' | 'dispatchAttempted' | 'requestSnapshot'
+> & {
+  createdAtMs?: number
+  dispatchAttempted?: boolean
+  requestSnapshot?: HiddenControlRequestSnapshot
+}
+
 const STORAGE_KEY = 'opensquilla.chat.hiddenControlOutbox:v1'
 const MAX_ITEMS = 20
 const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 const REQUEST_ID_PATTERN = /^\S{1,256}$/
+
+function normalizeRequestSnapshot(value: unknown): HiddenControlRequestSnapshot | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const candidate = value as Partial<HiddenControlRequestSnapshot>
+  const intent = candidate.intent
+  const initialRoutingMode = candidate.initialRoutingMode
+  const source = candidate.source
+  if (
+    !(intent === null || (typeof intent === 'string' && intent.length <= 512))
+    || !(
+      initialRoutingMode === null
+      || initialRoutingMode === 'direct'
+      || initialRoutingMode === 'router'
+      || initialRoutingMode === 'ensemble'
+    )
+    || !source
+    || typeof source !== 'object'
+    || Array.isArray(source)
+    || (source.runMode !== 'safe' && source.runMode !== 'full')
+    || !(source.elevated === undefined || typeof source.elevated === 'string')
+  ) return null
+  return {
+    intent,
+    initialRoutingMode,
+    source: {
+      ...(source.elevated ? { elevated: source.elevated } : {}),
+      runMode: source.runMode,
+    },
+  }
+}
 
 function defaultStorage(): HiddenControlStorage | null {
   if (typeof window === 'undefined') return null
@@ -39,6 +89,10 @@ function normalizeItem(value: unknown, nowMs = Date.now()): HiddenControlOutboxI
   const providerText = typeof candidate.providerText === 'string' ? candidate.providerText : ''
   const displayText = typeof candidate.displayText === 'string' ? candidate.displayText : ''
   const createdAtMs = candidate.createdAtMs
+  const dispatchAttempted = typeof candidate.dispatchAttempted === 'boolean'
+    ? candidate.dispatchAttempted
+    : null
+  const requestSnapshot = normalizeRequestSnapshot(candidate.requestSnapshot)
   if (
     !sessionKey
     || sessionKey.length > 512
@@ -51,7 +105,15 @@ function normalizeItem(value: unknown, nowMs = Date.now()): HiddenControlOutboxI
     || createdAtMs > nowMs
     || nowMs - createdAtMs > MAX_AGE_MS
   ) return null
-  return { sessionKey, clientRequestId, providerText, displayText, createdAtMs }
+  return {
+    sessionKey,
+    clientRequestId,
+    providerText,
+    displayText,
+    createdAtMs,
+    dispatchAttempted,
+    requestSnapshot,
+  }
 }
 
 function readResult(
@@ -89,10 +151,15 @@ function write(storage: HiddenControlStorage | null, items: HiddenControlOutboxI
 }
 
 export function persistHiddenControlResult(
-  item: Omit<HiddenControlOutboxItem, 'createdAtMs'> & { createdAtMs?: number },
+  item: HiddenControlOutboxInput,
   storage: HiddenControlStorage | null = defaultStorage(),
 ): HiddenControlPersistResult {
-  const normalized = normalizeItem({ ...item, createdAtMs: item.createdAtMs ?? Date.now() })
+  const normalized = normalizeItem({
+    ...item,
+    createdAtMs: item.createdAtMs ?? Date.now(),
+    dispatchAttempted: item.dispatchAttempted ?? false,
+    requestSnapshot: item.requestSnapshot ?? null,
+  })
   if (!normalized) return 'invalid'
   if (!storage) return 'unavailable'
   const state = readResult(storage)
@@ -116,11 +183,84 @@ export function persistHiddenControlResult(
 }
 
 export function persistHiddenControl(
-  item: Omit<HiddenControlOutboxItem, 'createdAtMs'> & { createdAtMs?: number },
+  item: HiddenControlOutboxInput,
   storage: HiddenControlStorage | null = defaultStorage(),
 ): boolean {
   const result = persistHiddenControlResult(item, storage)
   return result === 'persisted' || result === 'matched'
+}
+
+export function hiddenControlDispatchAttempted(
+  sessionKey: string,
+  clientRequestId: string,
+  storage: HiddenControlStorage | null = defaultStorage(),
+): boolean {
+  return read(storage).some(candidate => (
+    candidate.sessionKey === sessionKey
+    && candidate.clientRequestId === clientRequestId
+    && candidate.dispatchAttempted
+  ))
+}
+
+export function hiddenControlReceiptReplayEligible(
+  sessionKey: string,
+  clientRequestId: string,
+  allowLegacyUnknown: boolean,
+  storage: HiddenControlStorage | null = defaultStorage(),
+): boolean {
+  const item = read(storage).find(candidate => (
+    candidate.sessionKey === sessionKey
+    && candidate.clientRequestId === clientRequestId
+  ))
+  return item?.dispatchAttempted === true
+    || (item?.dispatchAttempted === null && allowLegacyUnknown)
+}
+
+export function markHiddenControlDispatchAttempted(
+  sessionKey: string,
+  clientRequestId: string,
+  storage: HiddenControlStorage | null = defaultStorage(),
+): boolean {
+  const state = readResult(storage)
+  if (!state.ok) return false
+  const index = state.items.findIndex(candidate => (
+    candidate.sessionKey === sessionKey
+    && candidate.clientRequestId === clientRequestId
+  ))
+  if (index < 0) return false
+  const current = state.items[index]!
+  if (current.dispatchAttempted) return true
+  state.items[index] = { ...current, dispatchAttempted: true }
+  return write(storage, state.items)
+}
+
+export function markHiddenControlDispatchDefinitelyRejected(
+  sessionKey: string,
+  clientRequestId: string,
+  storage: HiddenControlStorage | null = defaultStorage(),
+): boolean {
+  const state = readResult(storage)
+  if (!state.ok) return false
+  const index = state.items.findIndex(candidate => (
+    candidate.sessionKey === sessionKey
+    && candidate.clientRequestId === clientRequestId
+  ))
+  if (index < 0) return false
+  const current = state.items[index]!
+  if (current.dispatchAttempted === false) return true
+  state.items[index] = { ...current, dispatchAttempted: false }
+  return write(storage, state.items)
+}
+
+export function getHiddenControlRequestSnapshot(
+  sessionKey: string,
+  clientRequestId: string,
+  storage: HiddenControlStorage | null = defaultStorage(),
+): HiddenControlRequestSnapshot | null {
+  return read(storage).find(candidate => (
+    candidate.sessionKey === sessionKey
+    && candidate.clientRequestId === clientRequestId
+  ))?.requestSnapshot ?? null
 }
 
 export function removeHiddenControl(

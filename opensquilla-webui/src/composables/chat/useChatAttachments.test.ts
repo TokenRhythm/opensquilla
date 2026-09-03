@@ -39,7 +39,7 @@ async function flushUpload() {
   await new Promise(resolve => setTimeout(resolve, 0))
 }
 
-function useTestChatAttachments() {
+function useTestChatAttachments(canMutate?: () => boolean) {
   const content: ArtifactContentAccess = {
     fetchArtifact: vi.fn(async () => ({
       ok: false as const,
@@ -92,7 +92,7 @@ function useTestChatAttachments() {
       }
     },
   }
-  return useChatAttachments(content)
+  return useChatAttachments(content, { canMutate })
 }
 
 describe('useChatAttachments', () => {
@@ -105,6 +105,38 @@ describe('useChatAttachments', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals()
+  })
+
+  it('rejects file-picker uploads while fresh composer mutation is blocked', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(successfulUploadResponse('file-allowed'))
+    vi.stubGlobal('fetch', fetchMock)
+    let allowed = false
+    const attachments = useTestChatAttachments(() => allowed)
+    const blockedTarget = {
+      files: [stagedPdf('blocked.pdf')],
+      value: 'selected',
+    } as unknown as HTMLInputElement
+
+    attachments.onFileInputChange({ target: blockedTarget } as unknown as Event)
+    await flushUpload()
+
+    expect(blockedTarget.value).toBe('')
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(attachments.pendingAttachments.value).toEqual([])
+
+    allowed = true
+    const allowedTarget = {
+      files: [stagedPdf('allowed.pdf')],
+      value: 'selected',
+    } as unknown as HTMLInputElement
+    attachments.onFileInputChange({ target: allowedTarget } as unknown as Event)
+    await flushUpload()
+
+    expect(allowedTarget.value).toBe('')
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(attachments.pendingAttachments.value).toMatchObject([
+      { kind: 'staged', name: 'allowed.pdf', file_uuid: 'file-allowed' },
+    ])
   })
 
   it('accepts every file type in a mixed batch (opaque binaries included)', async () => {

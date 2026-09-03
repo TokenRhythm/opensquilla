@@ -3436,6 +3436,8 @@
     "sendQueues": "发送（排队等待当前回复结束）",
     "sendSteers": "发送（立即引导当前回复）",
     "sendQueuesUntilCompaction": "发送（排队等待压缩完成）",
+    "cronSessionReadOnly": "定时任务会话为只读，不能接收新的对话轮次。",
+    "sessionReadOnly": "此会话为只读，不能接收新的对话轮次。",
     "stopResponse": "停止当前回复",
     "stopResponseEsc": "停止当前回复（Esc）",
     "stoppingResponse": "正在安全停止… 新消息将进入队列。",

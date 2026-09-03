@@ -3346,6 +3346,8 @@
     "sendQueues": "Senden (wird nach der aktuellen Antwort in die Warteschlange gestellt)",
     "sendSteers": "Senden (lenkt die aktuelle Antwort jetzt)",
     "sendQueuesUntilCompaction": "Senden (in Warteschlange, bis die Verdichtung abgeschlossen ist)",
+    "cronSessionReadOnly": "Cron-Sitzungen sind schreibgeschützt und können keine neuen Nachrichten empfangen.",
+    "sessionReadOnly": "Diese Sitzung ist schreibgeschützt und kann keine neuen Nachrichten empfangen.",
     "stopResponse": "Aktuelle Antwort stoppen",
     "stopResponseEsc": "Aktuelle Antwort stoppen (Esc)",
     "stoppingResponse": "Wird sicher beendet… Neue Nachrichten werden eingereiht.",

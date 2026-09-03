@@ -177,6 +177,7 @@
       </button>
       <span class="msg-copy-live" aria-live="polite">{{ copyLiveText }}</span>
       <button
+        v-if="editAvailable !== false"
         type="button"
         class="msg-action"
         :class="{ 'msg-action--disabled': isStreaming }"
@@ -223,7 +224,7 @@ import {
 
 const { t } = useI18n()
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   message: ChatRenderedMessage
   shareMode: boolean
   shareSelected: boolean
@@ -233,12 +234,15 @@ const props = defineProps<{
   downloadAttachment: (attachment: DisplayAttachment) => Promise<boolean>
   showTurnOutcome?: boolean
   isStreaming?: boolean
+  editAvailable?: boolean
   isGoalSource?: boolean
   canReusePromptAnnotations?: boolean
   workbenchResourcePreviewEnabled?: boolean
   workbenchResourceEditEnabled?: boolean
   workbenchAttachmentResources?: ReadonlyMap<string, WorkbenchResource>
-}>()
+}>(), {
+  editAvailable: true,
+})
 
 const emit = defineEmits<{
   edit: [message: ChatRenderedMessage]

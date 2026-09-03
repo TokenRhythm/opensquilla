@@ -44,6 +44,10 @@ type AttachmentBatch = {
   totalSizeToastShown: boolean
 }
 
+type ChatAttachmentAdmission = {
+  canMutate?: () => boolean
+}
+
 const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 const PPTX_MIME = 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
@@ -111,7 +115,10 @@ async function fileLooksLikeUtf8Text(file: File): Promise<boolean> {
   }
 }
 
-export function useChatAttachments(artifactContent?: ArtifactContentAccess) {
+export function useChatAttachments(
+  artifactContent?: ArtifactContentAccess,
+  admission: ChatAttachmentAdmission = {},
+) {
   const { pushToast } = useToasts()
   const pendingAttachments = ref<Attachment[]>([])
   const nextAttachmentId = ref(1)
@@ -126,6 +133,10 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess) {
 
   function onFileInputChange(e: Event) {
     const target = e.target as HTMLInputElement
+    if (admission.canMutate?.() === false) {
+      target.value = ''
+      return
+    }
     if (target.files) {
       void addAttachments(Array.from(target.files))
       target.value = ''
@@ -133,6 +144,7 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess) {
   }
 
   async function addAttachments(files: File[]) {
+    if (admission.canMutate?.() === false) return
     const batch: AttachmentBatch = { totalSizeToastShown: false }
     for (const file of files) {
       // One toast for the whole batch when the count cap is hit — a per-file

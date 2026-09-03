@@ -1,4 +1,4 @@
-import type { InjectionKey } from 'vue'
+import type { InjectionKey, Ref } from 'vue'
 
 export interface SessionItem {
   key: string
@@ -11,6 +11,10 @@ export interface SessionItem {
   workspaceDisplayPath?: string
   effectiveAgentId: string
   sessionKind: string
+  /** True only when sessionKind came directly from the Gateway row. */
+  sessionKindAuthoritative?: boolean
+  /** Null/undefined means an older Gateway did not publish this authority. */
+  interactive?: boolean | null
   surface: string
   conversationKind: string
   status: string
@@ -23,6 +27,11 @@ export interface SessionItem {
   provisional?: boolean
   forkedFromParent: boolean
   hasContractGaps: boolean
+}
+
+/** Cron runs are isolated, scheduled sessions and are intentionally read-only. */
+export function isCronSessionKey(key: string): boolean {
+  return key.trim().startsWith('cron:')
 }
 
 export interface SessionPage {
@@ -87,3 +96,7 @@ export interface SessionDirectory {
 }
 
 export const SESSION_DIRECTORY_KEY: InjectionKey<SessionDirectory> = Symbol('SessionDirectory')
+
+/** Reactive authoritative rows already loaded by the application shell. */
+export const SESSION_DIRECTORY_ITEMS_KEY: InjectionKey<Readonly<Ref<readonly SessionItem[]>>> =
+  Symbol('SessionDirectoryItems')

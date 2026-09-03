@@ -73,6 +73,7 @@
           </span>
         </button>
         <button
+          v-if="!immutableRetryOnly"
           type="button"
           class="chat-pending-action chat-pending-action--icon"
           :aria-label="removeLabel(item, index)"
@@ -82,7 +83,7 @@
         >
           <Icon name="trash" :size="14" />
         </button>
-        <div v-if="!item.hiddenControl" class="chat-pending-more-wrap">
+        <div v-if="!immutableRetryOnly && !item.hiddenControl" class="chat-pending-more-wrap">
           <button
             type="button"
             class="chat-pending-action chat-pending-action--icon"
@@ -154,8 +155,9 @@ interface PendingQueueItem {
   pendingInputId?: string
   displayTextOverride?: string
   hiddenControl?: boolean
+  confirmedPlainText?: boolean
   attachments?: Attachment[]
-  deliveryState?: 'steering' | 'retryable'
+  deliveryState?: 'steering' | 'replay_pending' | 'retryable'
   steerAttempt?: PendingSteerAttempt
   pendingPersistenceState?: 'saving' | 'staged' | 'local_only' | 'retryable' | 'cancelling'
 }
@@ -170,6 +172,7 @@ type PendingSteerBlocker =
 const props = withDefaults(defineProps<{
   items: PendingQueueItem[]
   maxPending: number
+  immutableRetryOnly?: boolean
   reorderEnabled?: boolean
   reorderPending?: boolean
   imageBlockedMessage?: string
@@ -220,6 +223,7 @@ const showSteerUnavailableStatus = computed(() => (
   && !props.items.some(item => (
     isSteering(item)
     || item.deliveryState === 'retryable'
+    || item.deliveryState === 'replay_pending'
     || isSteerRetry(item)
   ))
   && props.items.some(item => (
@@ -232,7 +236,8 @@ function displayText(item: PendingQueueItem): string {
 }
 
 function queueCanReorder(): boolean {
-  return props.reorderEnabled !== false
+  return props.immutableRetryOnly !== true
+    && props.reorderEnabled !== false
     && props.reorderPending !== true
     && props.items.length > 1 && props.items.every(item => (
     !item.hiddenControl
@@ -259,9 +264,17 @@ function isSteerRetry(item: PendingQueueItem): boolean {
     || item.steerAttempt?.phase === 'acceptance_unknown'
 }
 
+function isPendingRetry(item: PendingQueueItem): boolean {
+  return item.deliveryState === 'retryable'
+    || item.deliveryState === 'replay_pending'
+    || isSteerRetry(item)
+}
+
 function pendingCardState(item: PendingQueueItem): 'queued' | 'busy' | 'attention' {
   if (isSteering(item)) return 'busy'
-  if (item.deliveryState === 'retryable' || isSteerRetry(item)) return 'attention'
+  if (
+    isPendingRetry(item)
+  ) return 'attention'
   return 'queued'
 }
 
@@ -274,7 +287,9 @@ function steerActionLabel(item: PendingQueueItem): string {
     case 'acceptance_unknown':
       return t('chat.pending.steerRetryUnknown')
     default:
-      return item.deliveryState === 'retryable' ? t('chat.retry') : t('chat.steerMode')
+      return ['retryable', 'replay_pending'].includes(item.deliveryState || '')
+        ? t('chat.retry')
+        : t('chat.steerMode')
   }
 }
 
@@ -287,6 +302,7 @@ function removeLabel(item: PendingQueueItem, index: number): string {
 
 function canShowSteer(item: PendingQueueItem): boolean {
   return !item.hiddenControl
+    && (props.immutableRetryOnly !== true || isPendingRetry(item))
 }
 
 function hasUnsendableAttachment(item: PendingQueueItem): boolean {
@@ -318,15 +334,17 @@ function attachmentBlockMessage(item: PendingQueueItem): string {
 }
 
 function pendingSteerBlocker(item: PendingQueueItem): PendingSteerBlocker | null {
-  if (isControlInput(item.text)) return 'controlInput'
-  if (item.attachments?.length) return 'attachment'
-  if (
-    item.pendingInputId
-    && item.pendingPersistenceState === 'staged'
-    && props.durableSteerAvailable !== true
-  ) return 'capability'
-  if (!props.steerAvailable && item.deliveryState !== 'retryable' && !isSteerRetry(item)) {
-    return 'capability'
+  // A Retry replays an already-captured immutable request; control, attachment,
+  // and Steer-capability checks apply only when creating a fresh Steer.
+  if (!isPendingRetry(item)) {
+    if (isControlInput(item.text)) return 'controlInput'
+    if (item.attachments?.length) return 'attachment'
+    if (
+      item.pendingInputId
+      && item.pendingPersistenceState === 'staged'
+      && props.durableSteerAvailable !== true
+    ) return 'capability'
+    if (!props.steerAvailable) return 'capability'
   }
   if (props.items.some(
     candidate => candidate !== item && Boolean(candidate.deliveryState || candidate.steerAttempt),
@@ -365,7 +383,9 @@ function steerTitle(item: PendingQueueItem): string {
       if (item.steerAttempt?.phase === 'acceptance_unknown') {
         return t('chat.pending.steerRetryUnknownHint')
       }
-      return item.deliveryState === 'retryable' ? t('chat.retry') : t('chat.pending.steerHint')
+      return ['retryable', 'replay_pending'].includes(item.deliveryState || '')
+        ? t('chat.retry')
+        : t('chat.pending.steerHint')
   }
 }
 

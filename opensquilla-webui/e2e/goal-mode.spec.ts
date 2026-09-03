@@ -41,6 +41,24 @@ function response(id: string | number | undefined, payload: unknown) {
   return JSON.stringify({ type: 'res', id, ok: true, payload })
 }
 
+function sessionListPayload() {
+  return {
+    sessions: [{
+      key: SESSION_KEY,
+      title: 'Goal mode session',
+      sessionKind: 'chat',
+      surface: 'webchat',
+      conversationKind: 'direct',
+      effectiveAgentId: 'main',
+      updatedAt: 100,
+      messageCount: 0,
+      status: 'ok',
+      runStatus: 'idle',
+    }],
+    has_more: false,
+  }
+}
+
 function goalSnapshot(overrides: Record<string, unknown> = {}) {
   return {
     goalId: GOAL_ID,
@@ -204,7 +222,7 @@ async function installFakeGoalGateway(
         },
         'models.routing.get': { mode: 'direct' },
         'onboarding.status': { audioConfigured: false },
-        'sessions.list': { sessions: [], has_more: false },
+        'sessions.list': sessionListPayload(),
         'sessions.messages.snapshot': sessionMessagesSnapshotPayload(SESSION_KEY, {
           current_stream_seq: 0,
         }),

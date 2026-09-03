@@ -91,6 +91,46 @@ def build_session_view_item(
     }
 
 
+def is_noninteractive_cron_session(
+    session: Any,
+    *,
+    channel_types: dict[str, str] | None = None,
+) -> bool:
+    """Return whether one stored session is an isolated, read-only Cron run."""
+
+    key = str(getattr(session, "session_key", "") or "")
+    origin = getattr(session, "origin", None)
+    origin_map = origin if isinstance(origin, dict) else {}
+    if key.startswith("cron:"):
+        # Canonical isolated-run identity is authoritative. Stored delivery
+        # metadata can be stale and must not make this session writable.
+        return True
+    configured_channels = channel_types or {}
+    last_channel = _lower(getattr(session, "last_channel", None))
+    channel = _lower(getattr(session, "channel", None))
+    if last_channel in configured_channels or channel in configured_channels:
+        # Plugin channel types intentionally remain outside the view contract's
+        # closed surface enum, but their configured names still prove this is a
+        # channel delivery rather than an isolated Cron run.
+        return False
+    surface = _surface(session, key, origin_map, channel_types)
+    session_kind = _session_kind(session, key, surface, origin_map)
+    return session_kind == "cron" and not _interactive(session_kind, surface)
+
+
+def channel_types_from_config(config: Any) -> dict[str, str]:
+    """Return the configured channel-name to platform-type map used by policy."""
+
+    channels_cfg = getattr(getattr(config, "channels", None), "channels", None) or []
+    out: dict[str, str] = {}
+    for entry in channels_cfg:
+        name = str(getattr(entry, "name", "") or "").strip().lower()
+        channel_type = str(getattr(entry, "type", "") or "").strip().lower()
+        if name and channel_type:
+            out[name] = channel_type
+    return out
+
+
 def _effective_agent_id(session: Any, key: str) -> str:
     parsed = parse_agent_id(key)
     stored = _display(getattr(session, "agent_id", None)) or "main"
@@ -105,6 +145,12 @@ def _surface(
     origin: dict[str, Any],
     channel_types: dict[str, str] | None = None,
 ) -> str:
+    if key.startswith("cron:"):
+        # The canonical isolated-run key is the durable identity. Delivery
+        # metadata can outlive a previous target and must not regroup the run
+        # as an ordinary channel session.
+        return "cron"
+
     last_channel = _lower(getattr(session, "last_channel", None))
     channel = _lower(getattr(session, "channel", None))
     origin_kind = _lower(origin.get("kind"))
@@ -131,7 +177,7 @@ def _surface(
         return "cli"
     if ":subagent:" in key or key.startswith("subagent:"):
         return "subagent"
-    if key.startswith("cron:") or origin_kind == "cron":
+    if origin_kind == "cron":
         return "cron"
     return "unknown"
 
@@ -144,6 +190,8 @@ def _session_kind(session: Any, key: str, surface: str, origin: dict[str, Any]) 
     if surface == "subagent":
         return "task"
     if surface == "cron":
+        if key.startswith("cron:"):
+            return "cron"
         cron_meta = origin.get("cron")
         if isinstance(cron_meta, dict) and cron_meta.get("targetSessionKey") == key:
             channel = _lower(getattr(session, "last_channel", None))

@@ -64,8 +64,13 @@ import {
   stableClientUuid,
 } from '@/utils/chat/messageIdentity'
 import {
+  getHiddenControlRequestSnapshot,
+  hiddenControlReceiptReplayEligible,
+  type HiddenControlRequestSnapshot,
   type HiddenControlStorage,
   listHiddenControls,
+  markHiddenControlDispatchDefinitelyRejected,
+  markHiddenControlDispatchAttempted,
   persistHiddenControlResult,
   removeHiddenControl,
 } from '@/utils/chat/hiddenControlOutbox'
@@ -199,7 +204,13 @@ interface SendAttempt {
   stopOwner?: symbol
 }
 
-export type ChatSendOutcome = 'accepted' | 'deferred' | 'not_sent' | 'retryable_failure'
+export type ChatSendOutcome =
+  | 'accepted'
+  | 'acceptance_unknown'
+  | 'deferred'
+  | 'not_sent'
+  | 'policy_blocked'
+  | 'retryable_failure'
 
 interface ExplicitSendPayload {
   attachments: Attachment[]
@@ -516,6 +527,8 @@ export interface UseChatSendOptions {
   ) => Promise<TurnDocumentContext | null | false>
   pendingWorkspaceId?: Ref<string | null>
   sendBlockedReason?: Readonly<Ref<string | null>>
+  /** Permanent selected-session policy gate; exact receipt replays bypass it. */
+  sessionInteractivityBlockedReason?: Readonly<Ref<string | null>>
   /** Transport/admission-only gate used by exact replays after unknown acceptance. */
   idempotentReplayBlockedReason?: Readonly<Ref<string | null>>
   validateActiveProjectBeforeSend?: () => Promise<string | null>
@@ -532,6 +545,8 @@ export interface UseChatSendOptions {
   autoScroll: Ref<boolean>
   stream: ChatRpcStreamApi
   canStop?: () => boolean
+  /** Permanent selected-session policy gate; Stop must never bypass it. */
+  turnActionsBlocked?: () => boolean
   normalizeElevatedMode: (mode: string) => string
   adoptResponseSession: (
     key: string,
@@ -603,6 +618,8 @@ export interface UseChatSendOptions {
   popAllPendingIntoComposer: () => boolean
   reconcileTaskOwnership?: () => void | Promise<unknown>
   hiddenControlStorage?: HiddenControlStorage | null
+  /** Gateway proves receipt lookup precedes noninteractive-session rejection. */
+  noninteractiveReceiptReplay?: Readonly<Ref<boolean>>
   metaDiscardStorage?: MetaDiscardStorage | null
   classifySlashCommand: (text: string) => Promise<SlashCommandClassification>
   executeSlashCommand: (
@@ -636,6 +653,11 @@ export function useChatSend(options: UseChatSendOptions) {
     acceptanceRecoveryVersion.value += 1
   }
 
+  function setRecoveredAttempt(attempt: SendAttempt | null) {
+    recoveredAttempt = attempt
+    noteAcceptanceRecoveryChanged()
+  }
+
   const acceptanceRecoveryPendingForCurrentSession: ComputedRef<boolean> = computed(() => {
     // Depend on an explicit version because the attempt registry is purposely
     // non-reactive and must remain request-owned across route switches.
@@ -650,6 +672,14 @@ export function useChatSend(options: UseChatSendOptions) {
     }
     return false
   })
+  const exactReceiptReplayPendingForCurrentSession = computed(() => {
+    acceptanceRecoveryVersion.value
+    return Boolean(
+      recoveredAttempt?.requiresIdempotentReplay
+      && recoveredAttempt.requestSessionKey === options.sessionKey.value
+      && !recoveredAttempt.acceptanceInFlight,
+    )
+  })
   watch(acceptanceRecoveryPendingForCurrentSession, (pending) => {
     if (options.acceptanceRecoveryPending) {
       options.acceptanceRecoveryPending.value = pending
@@ -661,6 +691,21 @@ export function useChatSend(options: UseChatSendOptions) {
   }
 
   const recoveredQueuedAttempts = new WeakMap<ChatPendingItem, SendAttempt>()
+
+  function isQueuedExactReceiptReplay(item: ChatPendingItem): boolean {
+    acceptanceRecoveryVersion.value
+    const attempt = recoveredQueuedAttempts.get(item)
+    const followupReplay = Boolean(
+      ['retryable', 'replay_pending'].includes(item.deliveryState || '')
+      && attempt?.requiresIdempotentReplay
+      && attempt.requestSessionKey === options.sessionKey.value
+    )
+    const steerAttempt = options.steerDelivery.attemptForItem(item)
+    return followupReplay || Boolean(
+      steerAttempt?.phase === 'acceptance_unknown'
+      && steerAttempt.request.key === options.sessionKey.value,
+    )
+  }
 
   function currentPromptAnnotationIds(): string[] {
     return [...(options.promptAnnotationIds?.value || [])]
@@ -1072,7 +1117,7 @@ export function useChatSend(options: UseChatSendOptions) {
           )) {
             clearAttemptStop(attempt)
             if (recoveredAttempt?.clientRequestId === attempt.clientRequestId) {
-              recoveredAttempt = null
+              setRecoveredAttempt(null)
             }
             return true
           }
@@ -1080,7 +1125,7 @@ export function useChatSend(options: UseChatSendOptions) {
         }
         clearAttemptStop(attempt)
         if (recoveredAttempt?.clientRequestId === attempt.clientRequestId) {
-          recoveredAttempt = null
+          setRecoveredAttempt(null)
         }
         if (isCurrentRequest) options.scheduleHistorySync()
         return true
@@ -1122,7 +1167,7 @@ export function useChatSend(options: UseChatSendOptions) {
     }
 
     if (!attempt.stopRequested) {
-      if (ownsRecoveredAttempt) recoveredAttempt = null
+      if (ownsRecoveredAttempt) setRecoveredAttempt(null)
       return true
     }
     if (terminalStatus) {
@@ -1130,7 +1175,7 @@ export function useChatSend(options: UseChatSendOptions) {
         handleTerminalResponse(response, null, { finishFreshStream: false })
       }
       clearAttemptStop(attempt)
-      if (ownsRecoveredAttempt) recoveredAttempt = null
+      if (ownsRecoveredAttempt) setRecoveredAttempt(null)
       return true
     }
 
@@ -1189,7 +1234,7 @@ export function useChatSend(options: UseChatSendOptions) {
               )
             }
             if (recoveredAttempt?.clientRequestId === attempt.clientRequestId) {
-              recoveredAttempt = null
+              setRecoveredAttempt(null)
             }
             return
           }
@@ -2007,8 +2052,12 @@ export function useChatSend(options: UseChatSendOptions) {
     const recovered = pendingItem
       ? options.steerDelivery.attemptForItem(pendingItem)
       : null
-    if (!requestSessionKey || !text.trim()) return 'not_sent'
-    if (!options.turnCommands.supports('same-turn-steer')) {
+    const receiptReplay = recovered?.phase === 'acceptance_unknown'
+    const blockedReason = receiptReplay
+      ? options.idempotentReplayBlockedReason || options.sendBlockedReason
+      : options.sendBlockedReason
+    if (!requestSessionKey || (!receiptReplay && !text.trim())) return 'not_sent'
+    if (!receiptReplay && !options.turnCommands.supports('same-turn-steer')) {
       return recovered ? 'retryable_failure' : 'not_sent'
     }
     const durablePending = Boolean(
@@ -2023,7 +2072,8 @@ export function useChatSend(options: UseChatSendOptions) {
       ),
     )
     if (
-      durablePending
+      !receiptReplay
+      && durablePending
       && !options.turnCommands.supports('durable-steer')
     ) {
       return recovered ? 'retryable_failure' : 'not_sent'
@@ -2037,7 +2087,7 @@ export function useChatSend(options: UseChatSendOptions) {
         pendingItem ? null : options.pendingForkBeforeMessageId.value,
       )
     ) return 'not_sent'
-    if (options.sendBlockedReason?.value || options.hasPendingAttachmentWork()) {
+    if (blockedReason?.value || (!receiptReplay && options.hasPendingAttachmentWork())) {
       return recovered ? 'retryable_failure' : 'not_sent'
     }
     if (
@@ -2241,9 +2291,35 @@ export function useChatSend(options: UseChatSendOptions) {
     cancelIfComposerChanged?: boolean
   } = {}) {
     const requestSessionKey = options.sessionKey.value
-    const composerSnapshot = captureComposerSnapshot()
     const bypassSlashCommand = invocation.bypassSlashCommand === true
     const composerText = invocation.composerText ?? options.inputText.value
+    const handoffInFlight = responseHandoffBlocksCurrentSession()
+
+    // Unknown acceptance is resolved by replaying the immutable prior payload.
+    // Recognize it before consulting any mutable composer or admission state.
+    const exactReplayAttempt = (
+      !handoffInFlight
+      && recoveredAttempt?.requiresIdempotentReplay
+      && recoveredAttempt.requestSessionKey === requestSessionKey
+    )
+      ? recoveredAttempt
+      : null
+    if (exactReplayAttempt) {
+      const replayBlockedReason = options.idempotentReplayBlockedReason
+        || options.sendBlockedReason
+      if (replayBlockedReason?.value) return
+      if (options.sessionKey.value !== requestSessionKey) return
+      await dispatchSend(exactReplayAttempt.text, {
+        composerText,
+        promptAnnotationIds: exactReplayAttempt.promptAnnotationIds,
+        queueMode: exactReplayAttempt.queueMode,
+        retryAttempt: exactReplayAttempt,
+        idempotentReplay: true,
+      })
+      return
+    }
+
+    const composerSnapshot = captureComposerSnapshot()
     let text = (invocation.textOverride ?? options.inputText.value).trim()
     let durableText = text
     let sendableAttachments = options.pendingAttachments.value.filter(isSendableAttachment)
@@ -2251,8 +2327,6 @@ export function useChatSend(options: UseChatSendOptions) {
       text || sendableAttachments.length > 0 || composerSnapshot.promptAnnotationIds.length > 0,
     )
     let isLiteralSlash = false
-    const handoffInFlight = responseHandoffBlocksCurrentSession()
-
     if (options.hasPendingAttachmentWork()) {
       pushToast(i18n.global.t('chat.toast.waitAttachments'), { tone: 'info' })
       return
@@ -2266,36 +2340,6 @@ export function useChatSend(options: UseChatSendOptions) {
       hasPayload = Boolean(
         text || sendableAttachments.length > 0 || composerSnapshot.promptAnnotationIds.length > 0,
       )
-    }
-
-    // Unknown acceptance is resolved by replaying the immutable prior payload.
-    // In particular, do this before consulting the current annotation drafts:
-    // the first request may already have consumed them and advanced the head.
-    // Only live transport/admission state is allowed to block this exact replay.
-    const exactReplayAttempt = (
-      !handoffInFlight
-      && recoveredAttempt?.requiresIdempotentReplay
-      && recoveredAttempt.requestSessionKey === options.sessionKey.value
-    )
-      ? recoveredAttempt
-      : null
-    if (exactReplayAttempt) {
-      const replayBlockedReason = options.idempotentReplayBlockedReason
-        || options.sendBlockedReason
-      if (replayBlockedReason?.value) return
-      if (options.validateActiveProjectBeforeSend) {
-        if (await refreshedActiveProjectBlocksSend()) return
-      }
-      if (options.sessionKey.value !== requestSessionKey) return
-      if (replayBlockedReason?.value) return
-      await dispatchSend(exactReplayAttempt.text, {
-        composerText,
-        promptAnnotationIds: exactReplayAttempt.promptAnnotationIds,
-        queueMode: exactReplayAttempt.queueMode,
-        retryAttempt: exactReplayAttempt,
-        idempotentReplay: true,
-      })
-      return
     }
 
     if (hasPayload) {
@@ -2516,34 +2560,48 @@ export function useChatSend(options: UseChatSendOptions) {
     const dispatchText = !item.hiddenControl && text.startsWith('//')
       ? text.slice(1)
       : text
-    const ownerSessionKey = expectedSessionKey
-      || item.ownerSessionKey
-      || options.sessionKey.value
     const retryAttempt = recoveredQueuedAttempts.get(item) ?? null
     const steerRetryAttempt = options.steerDelivery.attemptForItem(item)
+    const ownerSessionKey = expectedSessionKey
+      || retryAttempt?.requestSessionKey
+      || steerRetryAttempt?.request.key
+      || item.ownerSessionKey
+      || options.sessionKey.value
+    const idempotentReplay = retryAttempt?.requiresIdempotentReplay === true
+      || steerRetryAttempt?.phase === 'acceptance_unknown'
+    const sendBlockedReason = idempotentReplay
+      ? options.idempotentReplayBlockedReason || options.sendBlockedReason
+      : options.sendBlockedReason
     const preserveRetryState = (outcome: ChatSendOutcome): ChatSendOutcome => (
       (retryAttempt || steerRetryAttempt)
       && (outcome === 'deferred' || outcome === 'not_sent')
         ? 'retryable_failure'
         : outcome
     )
-    const blockedOutcome = () => preserveRetryState(
-      delivery === 'followup' ? 'deferred' : 'not_sent',
-    )
+    const blockedOutcome = (): ChatSendOutcome => {
+      if (idempotentReplay) return 'acceptance_unknown'
+      return preserveRetryState(
+        !retryAttempt
+        && !steerRetryAttempt
+        && options.sessionInteractivityBlockedReason?.value
+        ? 'policy_blocked'
+        : delivery === 'followup' ? 'deferred' : 'not_sent',
+      )
+    }
     if (!ownerSessionKey || options.sessionKey.value !== ownerSessionKey) {
       return preserveRetryState('not_sent')
     }
-    if (options.sendBlockedReason?.value) {
+    if (sendBlockedReason?.value) {
       return blockedOutcome()
     }
-    if (options.validateActiveProjectBeforeSend) {
+    if (!idempotentReplay && options.validateActiveProjectBeforeSend) {
       if (await refreshedActiveProjectBlocksSend()) return blockedOutcome()
       if (options.sessionKey.value !== ownerSessionKey) {
         return preserveRetryState('not_sent')
       }
-      if (options.sendBlockedReason?.value) return blockedOutcome()
+      if (sendBlockedReason?.value) return blockedOutcome()
     }
-    if (options.hasPendingAttachmentWork()) {
+    if (!idempotentReplay && options.hasPendingAttachmentWork()) {
       if (delivery === 'steer') {
         pushToast(i18n.global.t('chat.toast.waitAttachments'), { tone: 'info' })
       }
@@ -2552,13 +2610,15 @@ export function useChatSend(options: UseChatSendOptions) {
     const serverStagedItem = item.pendingPersistenceState === 'staged'
       && Boolean(item.pendingInputId)
     if (
-      !serverStagedItem
+      !idempotentReplay
+      && !serverStagedItem
       && item.attachments.some(attachment => !isSendableAttachment(attachment))
     ) {
       return preserveRetryState('not_sent')
     }
     if (
-      delivery === 'followup'
+      !idempotentReplay
+      && delivery === 'followup'
       && !item.hiddenControl
       && item.text.trim().startsWith('/')
       && !item.text.trim().startsWith('//')
@@ -2574,15 +2634,16 @@ export function useChatSend(options: UseChatSendOptions) {
       if (options.sessionKey.value !== ownerSessionKey) {
         return preserveRetryState('not_sent')
       }
-      if (options.sendBlockedReason?.value) return blockedOutcome()
+      if (sendBlockedReason?.value) return blockedOutcome()
       if (
-        options.validateActiveProjectBeforeSend
+        !idempotentReplay
+        && options.validateActiveProjectBeforeSend
         && await refreshedActiveProjectBlocksSend()
       ) return blockedOutcome()
       if (options.sessionKey.value !== ownerSessionKey) {
         return preserveRetryState('not_sent')
       }
-      if (options.sendBlockedReason?.value) return blockedOutcome()
+      if (sendBlockedReason?.value) return blockedOutcome()
       if (
         options.stream.isStreaming.value
         || hasAuthoritativeWork()
@@ -2614,7 +2675,7 @@ export function useChatSend(options: UseChatSendOptions) {
       // Confirmed unknown slash input falls through to the normal send path
       // below, mirroring the primary onSend contract.
     }
-    if (hasSendableModelInputImageAttachment(item.attachments)) {
+    if (!idempotentReplay && hasSendableModelInputImageAttachment(item.attachments)) {
       if (options.modelRoutingSettingsBusy.value) {
         return preserveRetryState(delivery === 'followup' ? 'deferred' : 'not_sent')
       }
@@ -2629,11 +2690,14 @@ export function useChatSend(options: UseChatSendOptions) {
       }
     }
     if (
-      options.isCompactInFlightForCurrentSession()
+      !idempotentReplay
+      && (
+        options.isCompactInFlightForCurrentSession()
       || responseHandoffBlocksCurrentSession()
       || (
         delivery === 'followup'
         && (hasAuthoritativeWork() || options.stream.isStreaming.value)
+      )
       )
     ) {
       return preserveRetryState(delivery === 'followup' ? 'deferred' : 'not_sent')
@@ -2655,8 +2719,10 @@ export function useChatSend(options: UseChatSendOptions) {
       },
       preserveComposer: true,
       retryAttempt,
+      idempotentReplay,
       rememberRetryableAttempt: attempt => {
         recoveredQueuedAttempts.set(item, attempt)
+        noteAcceptanceRecoveryChanged()
       },
       ...(item.pendingInputId
         && item.pendingClientRequestId
@@ -2666,6 +2732,7 @@ export function useChatSend(options: UseChatSendOptions) {
     })
     if (outcome === 'accepted') {
       recoveredQueuedAttempts.delete(item)
+      noteAcceptanceRecoveryChanged()
     }
     return preserveRetryState(outcome)
   }
@@ -2674,7 +2741,13 @@ export function useChatSend(options: UseChatSendOptions) {
     item: ChatPendingItem,
     expectedSessionKey?: string,
   ): Promise<ChatSendOutcome> {
-    return sendQueuedItem(item, 'steer', expectedSessionKey)
+    // PendingQueue uses one action for both a fresh Steer and Retry. An
+    // ordinary recovered chat.send must keep its original RPC and payload;
+    // only an item carrying a real steerAttempt belongs on sessions.steer.v2.
+    const delivery = !item.steerAttempt && recoveredQueuedAttempts.has(item)
+      ? 'followup'
+      : 'steer'
+    return sendQueuedItem(item, delivery, expectedSessionKey)
   }
 
   function sendQueuedFollowup(
@@ -2682,6 +2755,15 @@ export function useChatSend(options: UseChatSendOptions) {
     expectedSessionKey?: string,
   ): Promise<ChatSendOutcome> {
     return sendQueuedItem(item, 'followup', expectedSessionKey)
+  }
+
+  function retryQueuedItem(
+    item: ChatPendingItem,
+    expectedSessionKey?: string,
+  ): Promise<ChatSendOutcome> {
+    return item.steerAttempt
+      ? sendQueuedSteer(item, expectedSessionKey)
+      : sendQueuedFollowup(item, expectedSessionKey)
   }
 
   async function dispatchSend(
@@ -2693,58 +2775,83 @@ export function useChatSend(options: UseChatSendOptions) {
     const blockedReason = sendOpts.idempotentReplay
       ? options.idempotentReplayBlockedReason || options.sendBlockedReason
       : options.sendBlockedReason
-    if (blockedReason?.value) return 'not_sent'
+    const blockedDispatchOutcome = (): ChatSendOutcome => (
+      !sendOpts.retryAttempt
+      && !sendOpts.idempotentReplay
+      && options.sessionInteractivityBlockedReason?.value
+        ? 'policy_blocked'
+        : 'not_sent'
+    )
+    if (blockedReason?.value) return blockedDispatchOutcome()
     const preDispatchAllowed = (
       stage: 'preflight' | 'before_rpc' = 'preflight',
     ) => sendOpts.preDispatchGuard?.(stage) !== false
     if (!preDispatchAllowed()) return 'not_sent'
     let preserveComposer = sendOpts.preserveComposer === true
-    const sourceAttachments = sendOpts.payload?.attachments ?? options.pendingAttachments.value
-    const intent = sendOpts.payload
+    const retryCandidate = sendOpts.retryAttempt ?? (preserveComposer ? null : recoveredAttempt)
+    const requiresRecoveryReplay = Boolean(
+      retryCandidate?.requiresIdempotentReplay
+      && retryCandidate.requestSessionKey === requestSessionKey
+      && retryCandidate.queueMode === sendOpts.queueMode,
+    )
+    const replayAttempt = requiresRecoveryReplay ? retryCandidate : null
+    const effectiveText = replayAttempt?.text ?? text
+    const sourceAttachments = replayAttempt?.attachments
+      ?? sendOpts.payload?.attachments
+      ?? options.pendingAttachments.value
+    const intent = replayAttempt
+      ? replayAttempt.intent
+      : sendOpts.payload
       ? sendOpts.payload.intent
       : options.pendingSessionIntent.value
-    const forkBeforeMessageId = sendOpts.payload
+    const forkBeforeMessageId = replayAttempt
+      ? replayAttempt.forkBeforeMessageId
+      : sendOpts.payload
       ? sendOpts.payload.forkBeforeMessageId
       : options.pendingForkBeforeMessageId.value
     // Only the first new-task attempt owns the pending workspace. Follow-up
     // queue/steer sends may run before it is accepted, but must neither inherit
     // nor clear that project binding.
-    const workspaceId = sendOpts.payload && 'workspaceId' in sendOpts.payload
+    const workspaceId = replayAttempt
+      ? replayAttempt.workspaceId
+      : sendOpts.payload && 'workspaceId' in sendOpts.payload
       ? sendOpts.payload.workspaceId ?? null
       : pendingWorkspaceForIntent(intent)
-    const initialCollaborationMode = (
+    const initialCollaborationMode = replayAttempt
+      ? replayAttempt.initialCollaborationMode
+      : (
       sendOpts.payload
       && 'initialCollaborationMode' in sendOpts.payload
     )
       ? sendOpts.payload.initialCollaborationMode ?? null
       : initialModeForIntent(intent)
-    const initialRoutingMode = (
+    const initialRoutingMode = replayAttempt
+      ? replayAttempt.initialRoutingMode
+      : (
       sendOpts.payload
       && 'initialRoutingMode' in sendOpts.payload
     )
       ? sendOpts.payload.initialRoutingMode ?? null
       : initialRoutingModeForIntent(intent)
     const initialSendableAttachments = sourceAttachments.filter(isSendableAttachment)
-    const requestedDocumentContext = intent === null
+    const requestedDocumentContext = replayAttempt
+      ? replayAttempt.documentContext
+      : intent === null
       ? sendOpts.payload
         ? normalizeDocumentContext(sendOpts.payload.documentContext)
         : normalizeDocumentContext(options.currentDocumentContext?.(requestSessionKey))
       : null
-    // This is deliberately before optimistic rendering, composer clearing,
-    // stream state, and chat.send. A blocked draft remains exactly editable.
-    if (modelImageSendBlocked(sourceAttachments)) return 'not_sent'
-    const retryCandidate = sendOpts.retryAttempt ?? (preserveComposer ? null : recoveredAttempt)
-    const requestedPromptAnnotationIds = sendOpts.promptAnnotationIds === undefined
+    const requestedPromptAnnotationIds = replayAttempt
+      ? [...replayAttempt.promptAnnotationIds]
+      : sendOpts.promptAnnotationIds === undefined
       ? currentPromptAnnotationIds()
       : [...sendOpts.promptAnnotationIds]
           .map(value => String(value || '').trim())
           .filter((value, index, values) => Boolean(value) && values.indexOf(value) === index)
           .slice(0, 16)
-    const requiresRecoveryReplay = Boolean(
-      retryCandidate?.requiresIdempotentReplay
-      && retryCandidate.requestSessionKey === requestSessionKey
-      && retryCandidate.queueMode === sendOpts.queueMode,
-    )
+    // Fresh sends observe live image/routing admission. Exact receipt replay
+    // must reach Gateway with the original immutable request instead.
+    if (!requiresRecoveryReplay && modelImageSendBlocked(sourceAttachments)) return 'not_sent'
     const isRecoveredRetry = Boolean(
       requiresRecoveryReplay
       || (
@@ -2753,7 +2860,7 @@ export function useChatSend(options: UseChatSendOptions) {
           requestSessionKey,
           promptAnnotationIds: requestedPromptAnnotationIds,
           documentContext: requestedDocumentContext,
-          text,
+          text: effectiveText,
           attachments: initialSendableAttachments,
           intent,
           initialCollaborationMode,
@@ -2771,7 +2878,7 @@ export function useChatSend(options: UseChatSendOptions) {
     if (retryAttempt?.acceptanceInFlight) return 'retryable_failure'
     const attemptPromptAnnotationIds = retryAttempt?.promptAnnotationIds
       ?? requestedPromptAnnotationIds
-    if (promptAnnotationSendIsBusy(attemptPromptAnnotationIds)) {
+    if (!requiresRecoveryReplay && promptAnnotationSendIsBusy(attemptPromptAnnotationIds)) {
       rejectBusyPromptAnnotationSend()
       return 'not_sent'
     }
@@ -2788,7 +2895,7 @@ export function useChatSend(options: UseChatSendOptions) {
         { isCurrent: () => options.sessionKey.value === requestSessionKey },
       )
       if (!ready || options.sessionKey.value !== requestSessionKey) return 'not_sent'
-      if (options.sendBlockedReason?.value) return 'not_sent'
+      if (options.sendBlockedReason?.value) return blockedDispatchOutcome()
       if (
         JSON.stringify(currentPromptAnnotationIds())
         !== JSON.stringify(attemptPromptAnnotationIds)
@@ -2840,7 +2947,8 @@ export function useChatSend(options: UseChatSendOptions) {
         return 'not_sent'
       }
       if (prepared === false || options.sessionKey.value !== requestSessionKey) return 'not_sent'
-      if (blockedReason?.value || !preDispatchAllowed()) return 'not_sent'
+      if (blockedReason?.value) return blockedDispatchOutcome()
+      if (!preDispatchAllowed()) return 'not_sent'
       const normalized = normalizeDocumentContext(prepared)
       if (prepared !== null && normalized === null) return 'not_sent'
       attemptDocumentContext = normalized
@@ -2853,7 +2961,8 @@ export function useChatSend(options: UseChatSendOptions) {
     const currentSourceAttachments = sendOpts.payload?.attachments
       ?? options.pendingAttachments.value
     if (
-      preserveComposer
+      !requiresRecoveryReplay
+      && preserveComposer
       && !serverStagedPendingItem
       && sendOpts.payload
       && currentSourceAttachments.some(attachment => !isSendableAttachment(attachment))
@@ -2866,13 +2975,13 @@ export function useChatSend(options: UseChatSendOptions) {
     )
     // Routing can change while an expiring staged upload is refreshed. Recheck
     // the authoritative live state before any visible or RPC mutation.
-    if (blockedReason?.value) return 'not_sent'
-    if (modelImageSendBlocked(attachmentsToSend)) return 'not_sent'
+    if (blockedReason?.value) return blockedDispatchOutcome()
+    if (!requiresRecoveryReplay && modelImageSendBlocked(attachmentsToSend)) return 'not_sent'
     const attachmentsToKeep = currentSourceAttachments.filter(
       attachment => !sendAttachmentIds.has(attachment.local_id) || !isSendableAttachment(attachment),
     )
     if (
-      !text
+      !effectiveText
       && attachmentsToSend.length === 0
       && attemptPromptAnnotationIds.length === 0
       && !serverStagedPendingItem
@@ -2880,7 +2989,7 @@ export function useChatSend(options: UseChatSendOptions) {
       return 'not_sent'
     }
 
-    const userText = text
+    const userText = effectiveText
     let attempt = retryAttempt
     let acceptedVisibleReplayCommitted = false
     const commitAcceptedVisibleReplay = (accepted?: {
@@ -2926,7 +3035,7 @@ export function useChatSend(options: UseChatSendOptions) {
           || sendOpts.replayCoordination?.clientRequestId
           || createClientRequestId(),
         clientMessageId,
-        message: text || (attemptPromptAnnotationIds.length > 0
+        message: effectiveText || (attemptPromptAnnotationIds.length > 0
           ? i18n.global.t('chat.promptAnnotations.applyPrompt')
           : 'Describe these attachments'),
         // The Vue client never uses the legacy cancel-style steer path. Make
@@ -2956,13 +3065,13 @@ export function useChatSend(options: UseChatSendOptions) {
       attempt = {
         clientRequestId: params.clientRequestId!,
         clientMessageId,
-        composerText: sendOpts?.composerText ?? text,
+        composerText: sendOpts?.composerText ?? effectiveText,
         requestSessionKey,
         promptAnnotationIds: [...attemptPromptAnnotationIds],
         promptAnnotations: options.promptAnnotationSnapshots?.(attemptPromptAnnotationIds) || [],
         documentContext: attemptDocumentContext ? { ...attemptDocumentContext } : null,
         queueMode: sendOpts?.queueMode,
-        text,
+        text: effectiveText,
         attachments: attachmentsToSend.map(attachment => ({ ...attachment })),
         intent,
         initialCollaborationMode,
@@ -3021,7 +3130,7 @@ export function useChatSend(options: UseChatSendOptions) {
       current: requestSessionKey,
     })
     if (!preserveComposer) {
-      recoveredAttempt = null
+      setRecoveredAttempt(null)
       const composerTextBeforeSend = options.inputText.value
       const preserveEditedComposer = Boolean(
         retryAttempt?.requiresIdempotentReplay
@@ -3133,7 +3242,7 @@ export function useChatSend(options: UseChatSendOptions) {
         options.scheduleHistorySync()
       }
       if (recoveredAttempt?.clientRequestId === attempt.clientRequestId) {
-        recoveredAttempt = null
+        setRecoveredAttempt(null)
       }
       // A draft becomes a routable session only after the gateway has durably
       // accepted its first turn. Keeping the intent until this point avoids
@@ -3287,7 +3396,7 @@ export function useChatSend(options: UseChatSendOptions) {
         acceptedError
         && recoveredAttempt?.clientRequestId === attempt.clientRequestId
       ) {
-        recoveredAttempt = null
+        setRecoveredAttempt(null)
       }
       if (acceptedError) consumeAcceptedSessionIntent(attempt)
       const acceptedSessionKey = acceptedError?.sessionKey || requestSessionKey
@@ -3299,13 +3408,13 @@ export function useChatSend(options: UseChatSendOptions) {
           if (sendOpts.rememberRetryableAttempt) {
             sendOpts.rememberRetryableAttempt(attempt)
           } else {
-            recoveredAttempt = attempt
+            setRecoveredAttempt(attempt)
           }
         } else if (acceptanceUnknown) {
           // The optimistic user bubble already owns this payload. Keep its
           // immutable request identity for exact replay without presenting the
           // same text as a new editable draft.
-          recoveredAttempt = attempt
+          setRecoveredAttempt(attempt)
         } else if (restoreComposer) {
           restoreSendAttempt(attempt, {
             requiresIdempotentReplay: false,
@@ -3417,9 +3526,14 @@ export function useChatSend(options: UseChatSendOptions) {
           ts: new Date().toISOString(),
         })
       }
-      return acceptedError ? 'accepted' : 'retryable_failure'
+      return acceptedError
+        ? 'accepted'
+        : hasUnknownAcceptance(err) && !requiresRecoveryReplay
+          ? 'acceptance_unknown'
+          : 'retryable_failure'
     } finally {
       attempt.acceptanceInFlight = false
+      noteAcceptanceRecoveryChanged()
       finishAcceptanceTransaction(acceptanceTransaction)
       finishResponseHandoff(responseHandoff)
     }
@@ -3557,7 +3671,7 @@ export function useChatSend(options: UseChatSendOptions) {
       options.pendingWorkspaceId.value = attempt.workspaceId
     }
     attempt.requiresIdempotentReplay = recovery.requiresIdempotentReplay
-    recoveredAttempt = attempt
+    setRecoveredAttempt(attempt)
     options.autoResizeTextarea()
   }
 
@@ -3571,6 +3685,7 @@ export function useChatSend(options: UseChatSendOptions) {
   }
 
   function onStop() {
+    if (options.turnActionsBlocked?.()) return
     // A first Stop can race durable ingress before chat.send returns a task id.
     // Keep that transaction latched until its ACK/reconcile so a double click
     // cannot widen the second request into legacy whole-session cancellation.
@@ -3721,6 +3836,15 @@ export function useChatSend(options: UseChatSendOptions) {
     const existing = hiddenDispatchInFlight.get(hiddenDispatchKey)
     if (existing) return existing
 
+    const hiddenSessionIntent = requestSessionKey === options.sessionKey.value
+      ? options.pendingSessionIntent.value
+      : null
+    const requestSnapshot: HiddenControlRequestSnapshot = {
+      intent: hiddenSessionIntent,
+      initialRoutingMode: initialRoutingModeForIntent(hiddenSessionIntent),
+      source: chatSourceMetadata(options),
+    }
+
     // Persist before either local queueing or RPC. The payload contains only
     // the already-visible control turn (never provider credentials), while its
     // stable request id lets Gateway ingress collapse response-loss retries.
@@ -3729,6 +3853,7 @@ export function useChatSend(options: UseChatSendOptions) {
       clientRequestId: stableClientRequestId,
       providerText,
       displayText,
+      requestSnapshot,
     }, options.hiddenControlStorage)
     if (persistResult === 'conflict' || persistResult === 'failed' || persistResult === 'invalid') {
       return Promise.resolve(hiddenDispatchResult(
@@ -3759,11 +3884,26 @@ export function useChatSend(options: UseChatSendOptions) {
       ))
     }
 
+    const idempotentReplay = persistResult === 'matched'
+      && hiddenControlReceiptReplayEligible(
+        requestSessionKey,
+        stableClientRequestId,
+        options.noninteractiveReceiptReplay?.value === true,
+        options.hiddenControlStorage,
+      )
+    const persistedRequestSnapshot = getHiddenControlRequestSnapshot(
+      requestSessionKey,
+      stableClientRequestId,
+      options.hiddenControlStorage,
+    ) || requestSnapshot
     const operation = performHiddenSend(
       providerText,
       displayText,
       stableClientRequestId,
       requestSessionKey,
+      idempotentReplay,
+      persistResult !== 'unavailable',
+      persistedRequestSnapshot,
     )
     hiddenDispatchInFlight.set(hiddenDispatchKey, operation)
     void operation.then(() => {
@@ -3783,15 +3923,37 @@ export function useChatSend(options: UseChatSendOptions) {
     displayText: string,
     stableClientRequestId: string,
     requestSessionKey: string,
+    idempotentReplay: boolean,
+    durableOutbox: boolean,
+    requestSnapshot: HiddenControlRequestSnapshot,
   ): Promise<HiddenControlDispatchResult> {
     const compactInFlight = options.isCompactInFlightForCurrentSession()
     const handoffInFlight = responseHandoffBlocksCurrentSession()
-    const projectBlocked = options.validateActiveProjectBeforeSend
+    const interactivityBlocked = () => Boolean(
+      !idempotentReplay && options.sessionInteractivityBlockedReason?.value,
+    )
+    const projectBlocked = !idempotentReplay
+      && !interactivityBlocked()
+      && options.validateActiveProjectBeforeSend
       ? await refreshedActiveProjectBlocksSend()
       : false
+    if (options.sessionKey.value !== requestSessionKey) {
+      // Project validation yields to the UI. If navigation wins that race, the
+      // origin's durable outbox remains its sole owner; never enqueue or render
+      // that control through the newly selected session.
+      return hiddenDispatchResult(
+        durableOutbox ? 'queued' : 'rejected',
+        durableOutbox ? 'queued' : 'outbox_persist_failed',
+        stableClientRequestId,
+        requestSessionKey,
+      )
+    }
+    const sendBlockedReason = idempotentReplay
+      ? options.idempotentReplayBlockedReason || options.sendBlockedReason
+      : options.sendBlockedReason
     if (
       projectBlocked
-      || options.sendBlockedReason?.value
+      || sendBlockedReason?.value
       || options.stream.isStreaming.value
       || hasAuthoritativeWork()
       || compactInFlight
@@ -3810,6 +3972,22 @@ export function useChatSend(options: UseChatSendOptions) {
       return hiddenDispatchResult(
         queued ? 'queued' : 'rejected',
         queued ? 'queued' : 'queue_full',
+        stableClientRequestId,
+        requestSessionKey,
+      )
+    }
+
+    if (
+      durableOutbox
+      && !markHiddenControlDispatchAttempted(
+        requestSessionKey,
+        stableClientRequestId,
+        options.hiddenControlStorage,
+      )
+    ) {
+      return hiddenDispatchResult(
+        'rejected',
+        'outbox_persist_failed',
         stableClientRequestId,
         requestSessionKey,
       )
@@ -3842,14 +4020,12 @@ export function useChatSend(options: UseChatSendOptions) {
       message: providerText,
       sessionKey: requestSessionKey,
     }
-    const hiddenSessionIntent = requestSessionKey === options.sessionKey.value
-      ? options.pendingSessionIntent.value
-      : null
-    const hiddenInitialRoutingMode = initialRoutingModeForIntent(hiddenSessionIntent)
+    const hiddenSessionIntent = requestSnapshot.intent
+    const hiddenInitialRoutingMode = requestSnapshot.initialRoutingMode
     if (hiddenSessionIntent) params.intent = hiddenSessionIntent
     if (hiddenInitialRoutingMode) params.initialRoutingMode = hiddenInitialRoutingMode
     if (displayText && displayText !== providerText) params.displayText = displayText
-    params.source = chatSourceMetadata(options)
+    params.source = requestSnapshot.source
 
     // Hidden controls preserve the composer and render their own outbox-backed
     // bubble, but their acceptance/Stop identity is otherwise the same as an
@@ -4142,6 +4318,12 @@ export function useChatSend(options: UseChatSendOptions) {
           stableClientRequestId,
           options.hiddenControlStorage,
         )
+      } else if (accepted === false) {
+        markHiddenControlDispatchDefinitelyRejected(
+          requestSessionKey,
+          stableClientRequestId,
+          options.hiddenControlStorage,
+        )
       }
       if (options.sessionKey.value !== requestSessionKey) {
         recordSessionNavigationDiag('hiddenSend.error.stale', {
@@ -4202,6 +4384,16 @@ export function useChatSend(options: UseChatSendOptions) {
     item.clientRequestId = stableClientRequestId
     item.hiddenClientRequestId = stableClientRequestId
     item.hiddenClientMessageId ||= `hidden-control:${stableClientRequestId}`
+    const freshInteractivityBlocked = () => Boolean(
+      options.sessionInteractivityBlockedReason?.value
+      && !hiddenControlReceiptReplayEligible(
+        ownerSessionKey,
+        stableClientRequestId,
+        options.noninteractiveReceiptReplay?.value === true,
+        options.hiddenControlStorage,
+      )
+    )
+    if (freshInteractivityBlocked()) return 'policy_blocked'
     const result = await dispatchHiddenSend(
       item.text,
       item.displayTextOverride || '',
@@ -4210,6 +4402,9 @@ export function useChatSend(options: UseChatSendOptions) {
     )
     if (item.displayTextOverride) item.hiddenVisibleCommitted = true
     if (result.status === 'accepted') return 'accepted'
+    if (result.status === 'queued' && freshInteractivityBlocked()) {
+      return 'policy_blocked'
+    }
     if (result.status === 'queued') return 'deferred'
     if (result.status === 'unknown') return 'retryable_failure'
     return 'not_sent'
@@ -4224,7 +4419,18 @@ export function useChatSend(options: UseChatSendOptions) {
     const skipped = new Set(skipClientRequestIds)
     for (const item of listHiddenControls(targetSessionKey, options.hiddenControlStorage)) {
       if (!isCurrent() || options.sessionKey.value !== targetSessionKey) return
-      if (skipped.has(item.clientRequestId)) continue
+      const receiptOnlyRecovery = Boolean(options.sessionInteractivityBlockedReason?.value)
+        && hiddenControlReceiptReplayEligible(
+          targetSessionKey,
+          item.clientRequestId,
+          options.noninteractiveReceiptReplay?.value === true,
+          options.hiddenControlStorage,
+        )
+      // An active setup normally owns its matching server draft. In a read-only
+      // session that owner cannot launch, so an already-attempted browser copy
+      // must still reconcile the exact Gateway receipt. Fresh controls remain
+      // skipped and cannot turn this recovery path into a new Cron turn.
+      if (skipped.has(item.clientRequestId) && !receiptOnlyRecovery) continue
       const result = await dispatchHiddenSend(
         item.providerText,
         item.displayText,
@@ -4317,6 +4523,7 @@ export function useChatSend(options: UseChatSendOptions) {
     onStop,
     sendQueuedSteer,
     sendQueuedFollowup,
+    retryQueuedItem,
     supportsSameTurnSteer,
     dispatchComposerPrompt,
     dispatchHiddenSend,
@@ -4329,5 +4536,7 @@ export function useChatSend(options: UseChatSendOptions) {
     sendHiddenMetaPreflightConfirmation,
     sendUsageBarrierReplay,
     acceptanceRecoveryPendingForCurrentSession,
+    exactReceiptReplayPendingForCurrentSession,
+    isQueuedExactReceiptReplay,
   }
 }

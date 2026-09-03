@@ -26,13 +26,13 @@ type QueueTestOverrides = Partial<UseChatPendingQueueOptions> & {
 
 function makeQueue(
   dispatchPendingItem?: (item: ChatPendingItem, ownerSessionKey: string) => Promise<
-    'accepted' | 'deferred' | 'not_sent' | 'retryable_failure'
+    'accepted' | 'deferred' | 'not_sent' | 'policy_blocked' | 'retryable_failure'
   >,
   isBlocked: () => boolean = () => false,
   dispatchHiddenControl?: (
     item: ChatPendingItem,
     ownerSessionKey: string,
-  ) => Promise<'accepted' | 'deferred' | 'not_sent' | 'retryable_failure'>,
+  ) => Promise<'accepted' | 'deferred' | 'not_sent' | 'policy_blocked' | 'retryable_failure'>,
   onHiddenControlDispatchResult?: (result: HiddenControlDispatchResult) => void | boolean,
   overrides: QueueTestOverrides = {},
 ) {
@@ -1843,6 +1843,141 @@ describe('useChatPendingQueue delivery state', () => {
 
       expect(dispatchPendingItem).toHaveBeenCalledTimes(2)
       expect(queue.pendingQueue.value).toEqual([])
+    } finally {
+      queue.cleanup()
+      vi.useRealTimers()
+    }
+  })
+
+  it.each(['visible', 'hidden'] as const)(
+    'parks a policy-blocked %s head without rearming the drain timer',
+    async kind => {
+      vi.useFakeTimers()
+      const dispatchPendingItem = vi.fn(async () => 'policy_blocked' as const)
+      const dispatchHiddenControl = vi.fn(async () => 'policy_blocked' as const)
+      const onHiddenControlDispatchResult = vi.fn()
+      const { inputText, queue } = makeQueue(
+        kind === 'visible' ? dispatchPendingItem : undefined,
+        () => false,
+        kind === 'hidden' ? dispatchHiddenControl : undefined,
+        onHiddenControlDispatchResult,
+      )
+      try {
+        if (kind === 'hidden') {
+          queue.enqueueHiddenControl({
+            text: 'fresh provider confirmation',
+            displayText: 'Fresh confirmation',
+            clientRequestId: 'policy-blocked-hidden',
+          })
+        } else {
+          inputText.value = 'fresh visible follow-up'
+          await queue.enqueuePendingInput(inputText.value)
+        }
+
+        queue.schedulePendingDrainAfterTerminal()
+        await vi.advanceTimersByTimeAsync(500)
+        await nextTick()
+
+        const dispatch = kind === 'visible' ? dispatchPendingItem : dispatchHiddenControl
+        expect(dispatch).toHaveBeenCalledOnce()
+        expect(queue.pendingQueue.value).toHaveLength(1)
+        expect(queue.pendingQueue.value[0]?.deliveryState).toBeUndefined()
+
+        await vi.advanceTimersByTimeAsync(500)
+        await nextTick()
+        expect(dispatch).toHaveBeenCalledOnce()
+        queue.flushDeferredPendingDrain()
+        await vi.advanceTimersByTimeAsync(500)
+        await nextTick()
+        expect(dispatch).toHaveBeenCalledOnce()
+        if (kind === 'hidden') {
+          expect(onHiddenControlDispatchResult).toHaveBeenCalledWith(expect.objectContaining({
+            status: 'queued',
+            reason: 'queued',
+          }))
+        }
+      } finally {
+        queue.cleanup()
+        vi.useRealTimers()
+      }
+    },
+  )
+
+  it('does not let a parked session policy result cancel the current session drain', async () => {
+    vi.useFakeTimers()
+    const sessionA = 'agent:main:webchat:A'
+    const sessionB = 'agent:main:webchat:B'
+    let resolveSessionA!: (outcome: 'policy_blocked') => void
+    const sessionAOutcome = new Promise<'policy_blocked'>(resolve => {
+      resolveSessionA = resolve
+    })
+    const dispatchPendingItem = vi.fn((
+      _item: ChatPendingItem,
+      ownerSessionKey: string,
+    ) => (
+      ownerSessionKey === sessionA
+        ? sessionAOutcome
+        : Promise.resolve('accepted' as const)
+    ))
+    const { inputText, queue, sessionKey } = makeQueue(dispatchPendingItem)
+    try {
+      sessionKey.value = sessionA
+      inputText.value = 'A policy-blocked follow-up'
+      await queue.enqueuePendingInput(inputText.value)
+      queue.schedulePendingDrainAfterTerminal()
+      await vi.advanceTimersByTimeAsync(50)
+      await nextTick()
+      expect(dispatchPendingItem).toHaveBeenCalledTimes(1)
+
+      queue.switchPendingQueue(sessionB)
+      sessionKey.value = sessionB
+      inputText.value = 'B ready follow-up'
+      await queue.enqueuePendingInput(inputText.value)
+      queue.schedulePendingDrainAfterTerminal()
+
+      resolveSessionA('policy_blocked')
+      await nextTick()
+      await vi.advanceTimersByTimeAsync(50)
+      await nextTick()
+
+      expect(dispatchPendingItem).toHaveBeenCalledTimes(2)
+      expect(dispatchPendingItem).toHaveBeenLastCalledWith(
+        expect.objectContaining({ text: 'B ready follow-up' }),
+        sessionB,
+      )
+      expect(queue.pendingQueue.value).toEqual([])
+    } finally {
+      queue.cleanup()
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not let a policy-blocked non-head cancel the queued head drain', async () => {
+    vi.useFakeTimers()
+    const dispatchPendingItem = vi.fn(async () => 'accepted' as const)
+    const { inputText, queue } = makeQueue(dispatchPendingItem)
+    try {
+      inputText.value = 'head exact-recovery candidate'
+      await queue.enqueuePendingInput(inputText.value)
+      inputText.value = 'manually attempted fresh tail'
+      await queue.enqueuePendingInput(inputText.value)
+      const tail = queue.beginPendingDelivery(pendingUiId(queue, 1))
+      expect(tail).not.toBeNull()
+      await nextTick()
+
+      queue.schedulePendingDrainAfterTerminal()
+      queue.settlePendingDelivery(tail!, 'policy_blocked')
+      await nextTick()
+      await vi.advanceTimersByTimeAsync(50)
+      await nextTick()
+
+      expect(dispatchPendingItem).toHaveBeenCalledOnce()
+      expect(dispatchPendingItem).toHaveBeenCalledWith(
+        expect.objectContaining({ text: 'head exact-recovery candidate' }),
+        'agent:main:webchat:test',
+      )
+      expect(queue.pendingQueue.value.map(item => item.text))
+        .toEqual(['manually attempted fresh tail'])
     } finally {
       queue.cleanup()
       vi.useRealTimers()

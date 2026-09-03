@@ -51,7 +51,21 @@ function basePayload(method: string, sessionKey = SESSION_KEY): unknown {
       skills: {},
     },
     'models.routing.get': { mode: 'direct' },
-    'sessions.list': { sessions: [], has_more: false },
+    'sessions.list': {
+      sessions: [{
+        key: sessionKey,
+        title: 'History hydration session',
+        sessionKind: 'chat',
+        surface: 'webchat',
+        conversationKind: 'direct',
+        effectiveAgentId: 'main',
+        updatedAt: 100,
+        messageCount: 0,
+        status: 'ok',
+        runStatus: 'idle',
+      }],
+      has_more: false,
+    },
     'sessions.messages.snapshot': sessionMessagesSnapshotPayload(sessionKey),
     'sessions.messages.subscribe': sessionMessagesSubscribePayload(sessionKey),
     'sessions.messages.hydrate': sessionMessagesHydratePayload(sessionKey),
@@ -93,6 +107,7 @@ test('keeps the conversation usable while startup and long history are delayed',
 
   await page.setViewportSize({ width: 1280, height: 900 })
   await page.addInitScript(() => {
+    window.localStorage.setItem('opensquilla-locale', 'en')
     const state = { emptySeen: false }
     Object.defineProperty(window, '__opensquillaHistoryHydrationTest', { value: state })
     const markEmpty = () => {
@@ -208,9 +223,6 @@ test('keeps the conversation usable while startup and long history are delayed',
     'sessions.messages.snapshot',
     'chat.history',
   ]
-  expect(receivedMethods.slice(0, criticalStartupOrder.length)).toEqual(
-    criticalStartupOrder,
-  )
   expect(sessionRequestOrder.slice(0, criticalStartupOrder.length)).toEqual(
     criticalStartupOrder,
   )

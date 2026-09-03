@@ -20,6 +20,7 @@ function harness(
   commands: Array<Record<string, unknown>> = [],
   ready: Promise<void> = Promise.resolve(),
   catalogCallOptions?: RpcCallOptions,
+  turnActionsBlocked?: () => boolean,
 ) {
   const inputText = ref('')
   const rpc = {
@@ -77,6 +78,7 @@ function harness(
     showCompactionToast: vi.fn(),
     notify,
     dispatchHidden,
+    turnActionsBlocked,
     dispatchPlanPrompt,
     activatePlanMode,
     planModeAvailable: () => planModeAvailable,
@@ -403,6 +405,34 @@ describe('useChatSlashCommands Coding mode', () => {
 })
 
 describe('useChatSlashCommands recovery', () => {
+  it('retains an unrelated durable Meta draft without launch or hidden dispatch when turns are blocked', async () => {
+    const { api, dispatchHidden, rpc } = harness(
+      false,
+      [],
+      Promise.resolve(),
+      undefined,
+      () => true,
+    )
+    const drafts = [{
+      sessionKey: 'agent:main:webchat:test',
+      clientRequestId: 'cron-unrelated-server-draft',
+      name: 'meta-paper-write',
+      launchText: '/meta meta-paper-write -- retained request',
+      createdAt: 1,
+      expiresAt: 2,
+      sessionExists: true,
+    }]
+
+    await expect(api.restoreDurableMetaDrafts(drafts)).resolves.toEqual([])
+
+    expect(rpc.call).not.toHaveBeenCalledWith('meta.run', expect.anything())
+    expect(dispatchHidden).not.toHaveBeenCalled()
+    expect(drafts).toEqual([expect.objectContaining({
+      clientRequestId: 'cron-unrelated-server-draft',
+      launchText: '/meta meta-paper-write -- retained request',
+    })])
+  })
+
   it.each([
     {},
     { commands: null },

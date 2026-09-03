@@ -265,6 +265,8 @@ describe('ChatComposer popovers', () => {
       onSetSessionRoutingMode: setMode,
     })
 
+    const trigger = el.querySelector<HTMLButtonElement>('.chat-model-routing-btn')
+    expect(trigger?.getAttribute('aria-disabled')).toBe('false')
     await clickButton(el, "This chat's model routing")
     const option = el.querySelector<HTMLButtonElement>('[role="radio"]')
     expect(option?.getAttribute('aria-disabled')).toBe('true')
