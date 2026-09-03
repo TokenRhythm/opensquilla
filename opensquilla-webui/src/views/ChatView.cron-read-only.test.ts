@@ -47,6 +47,7 @@ describe('Cron session read-only presentation', () => {
     expect(chatViewSource).toContain(
       'v-if="!turnActionsBlocked || exactReceiptReplayPendingForCurrentSession"',
     )
+    expect(chatViewSource).toContain(':can-stop="!turnActionsBlocked && canStop"')
     expect(chatViewSource).toContain(
       'v-if="!turnActionsBlocked && executionDockRun"',
     )
@@ -99,6 +100,18 @@ describe('Cron session read-only presentation', () => {
     expect(pendingRetry).toContain("['retryable', 'replay_pending'].includes")
     expect(pendingRetry).toContain('? await retryQueuedItem(item)')
     expect(pendingRetry).toContain(': await sendQueuedSteer(item)')
+  })
+
+  it('does not let Escape stop work or pop drafts while receipt replay is read-only', () => {
+    const keydown = sourceBetween(
+      'function onDocumentKeydown(',
+      '/* ── Lifecycle',
+    )
+    const readOnlyGuard = keydown.indexOf('if (turnActionsBlocked.value) return')
+
+    expect(readOnlyGuard).toBeGreaterThan(-1)
+    expect(readOnlyGuard).toBeLessThan(keydown.indexOf('if (canStop.value)'))
+    expect(readOnlyGuard).toBeLessThan(keydown.indexOf('popAllPendingIntoComposer()'))
   })
 
   it('uses authoritative directory interactivity with a pending direct-route gate', () => {

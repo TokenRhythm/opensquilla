@@ -673,7 +673,7 @@
       :busy-send-mode="busySendMode"
       :has-send-content="composerHasSendContent"
       :is-streaming="isStreaming"
-      :can-stop="canStop"
+      :can-stop="!turnActionsBlocked && canStop"
       :stop-targets-plan-run="composerStopsPlanRun"
       :is-new-landing="isNewChatLanding"
       :placeholder="composerPlaceholder"
@@ -6437,6 +6437,7 @@ function onDocumentKeydown(e: KeyboardEvent) {
     || (target instanceof HTMLTextAreaElement && !composerRef.value?.isTextareaFocused())
     || (target instanceof HTMLElement && target.isContentEditable)
   if (editableTarget) return
+  if (turnActionsBlocked.value) return
 
   if (canStop.value) {
     e.preventDefault()
