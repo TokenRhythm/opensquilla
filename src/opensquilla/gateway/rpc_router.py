@@ -28,6 +28,7 @@ import structlog
 
 from opensquilla.application.conversation_ancillary import (
     RouteFeedbackPort,
+    RouteFeedbackResult,
     SubmitRouteFeedback,
 )
 from opensquilla.application.observability import (
@@ -408,10 +409,13 @@ class _GatewayRouteFeedbackPort(RouteFeedbackPort):
     def __init__(self, context: RpcContext) -> None:
         self._context = context
 
-    async def submit(self, command: SubmitRouteFeedback) -> Mapping[str, Any]:
-        return await _submit_route_feedback(
-            {"decisionId": command.decision_id, "rating": command.rating},
-            self._context,
+    async def submit(self, command: SubmitRouteFeedback) -> RouteFeedbackResult:
+        return cast(
+            RouteFeedbackResult,
+            await _submit_route_feedback(
+                {"decisionId": command.decision_id, "rating": command.rating},
+                self._context,
+            ),
         )
 
 

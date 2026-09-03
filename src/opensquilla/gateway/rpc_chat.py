@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from typing import Any, cast
 from uuid import uuid4
 
@@ -10,6 +10,7 @@ import structlog
 
 from opensquilla.application.conversation_ancillary import (
     ClarificationSubmissionPort,
+    ClarificationSubmissionResult,
     SubmitClarification,
 )
 from opensquilla.gateway.adapters.conversation_ancillary import (
@@ -375,7 +376,7 @@ class _GatewayClarificationSubmissionPort(ClarificationSubmissionPort):
     def __init__(self, context: RpcContext) -> None:
         self._context = context
 
-    async def submit(self, command: SubmitClarification) -> Mapping[str, Any]:
+    async def submit(self, command: SubmitClarification) -> ClarificationSubmissionResult:
         payload: dict[str, Any] = {
             "sessionKey": command.session_key,
             "fields": dict(command.fields),
@@ -384,7 +385,10 @@ class _GatewayClarificationSubmissionPort(ClarificationSubmissionPort):
             payload["requestId"] = command.request_id
         if command.run_id is not None:
             payload["run_id"] = command.run_id
-        return await _submit_clarification(payload, self._context)
+        return cast(
+            ClarificationSubmissionResult,
+            await _submit_clarification(payload, self._context),
+        )
 
 
 async def _handle_chat_clarify_submit_contract(

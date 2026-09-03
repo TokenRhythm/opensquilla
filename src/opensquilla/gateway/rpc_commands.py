@@ -8,12 +8,12 @@ one source rather than being hardcoded per-surface. Read-only.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 from opensquilla.application.conversation_ancillary import (
     CommandCatalogPort,
     CommandCatalogQuery,
+    CommandCatalogResult,
 )
 from opensquilla.engine.commands import DEFAULT_REGISTRY, CommandDef, Surface, parse_surface
 from opensquilla.gateway.adapters.conversation_ancillary import (
@@ -158,8 +158,11 @@ class _GatewayCommandCatalogPort(CommandCatalogPort):
     def __init__(self, context: RpcContext) -> None:
         self._context = context
 
-    async def list(self, query: CommandCatalogQuery) -> Mapping[str, Any]:
-        return await _list_commands_for_surface(query.surface, self._context)
+    async def list(self, query: CommandCatalogQuery) -> CommandCatalogResult:
+        return cast(
+            CommandCatalogResult,
+            await _list_commands_for_surface(query.surface, self._context),
+        )
 
 
 async def _handle_commands_list_for_surface_contract(

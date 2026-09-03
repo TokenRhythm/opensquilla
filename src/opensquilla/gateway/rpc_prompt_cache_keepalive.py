@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Any, cast
 
 from opensquilla.application.conversation_ancillary import (
     PromptCacheLeasePort,
+    PromptCacheLeaseResult,
     PromptCachePolicy,
     SetPromptCacheLease,
 )
@@ -67,16 +67,16 @@ class _GatewayPromptCacheLeasePort(PromptCacheLeasePort):
     def __init__(self, context: RpcContext) -> None:
         self._context = context
 
-    async def status(self, session_key: str) -> Mapping[str, Any]:
+    async def status(self, session_key: str) -> PromptCacheLeaseResult:
         key = await _resolve_session_key(session_key, self._context)
-        return cast(dict[str, Any], _service(self._context).status(key))
+        return cast(PromptCacheLeaseResult, _service(self._context).status(key))
 
-    async def set_policy(self, command: SetPromptCacheLease) -> Mapping[str, Any]:
+    async def set_policy(self, command: SetPromptCacheLease) -> PromptCacheLeaseResult:
         key = await _resolve_session_key(command.session_key, self._context)
         assert command.ttl_seconds is not None
         assert command.idle_timeout_seconds is not None
         return cast(
-            dict[str, Any],
+            PromptCacheLeaseResult,
             await _service(self._context).set_enabled(
                 key,
                 enabled=command.enabled,

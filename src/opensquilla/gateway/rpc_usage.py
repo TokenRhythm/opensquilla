@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import time
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
-from opensquilla.application.conversation_ancillary import UsageQuery, UsageReportingPort
+from opensquilla.application.conversation_ancillary import (
+    UsageCostResult,
+    UsageQuery,
+    UsageQueryResult,
+    UsageReportingPort,
+    UsageStatusResult,
+)
 from opensquilla.gateway.adapters.conversation_ancillary import (
     GatewayConversationAncillaryAdapter,
 )
@@ -814,14 +820,23 @@ class _GatewayUsageReportingPort(UsageReportingPort):
             params["sessionKey"] = query.session_key
         return params
 
-    async def status(self, query: UsageQuery) -> Mapping[str, Any]:
-        return await _read_usage_status(self._params(query), self._context)
+    async def status(self, query: UsageQuery) -> UsageStatusResult:
+        return cast(
+            UsageStatusResult,
+            await _read_usage_status(self._params(query), self._context),
+        )
 
-    async def query(self, query: UsageQuery) -> Mapping[str, Any]:
-        return await _query_usage(self._params(query), self._context)
+    async def query(self, query: UsageQuery) -> UsageQueryResult:
+        return cast(
+            UsageQueryResult,
+            await _query_usage(self._params(query), self._context),
+        )
 
-    async def cost_breakdown(self, query: UsageQuery) -> Mapping[str, Any]:
-        return await _read_usage_cost(self._params(query), self._context)
+    async def cost_breakdown(self, query: UsageQuery) -> UsageCostResult:
+        return cast(
+            UsageCostResult,
+            await _read_usage_cost(self._params(query), self._context),
+        )
 
 
 def _usage_reporting_adapter(ctx: RpcContext) -> GatewayConversationAncillaryAdapter:

@@ -23,8 +23,13 @@ import structlog
 
 from opensquilla.agents.scope import default_workspace_dir, resolve_agent_workspace_dir
 from opensquilla.application.pending_input_queue import (
+    PendingInputCancelResult,
+    PendingInputEnqueueResult,
+    PendingInputListResult,
     PendingInputQueuePort,
+    PendingInputReorderResult,
     PendingInputRequest,
+    PendingInputUpdateResult,
 )
 from opensquilla.application.session_directory import (
     SessionDirectory,
@@ -56,9 +61,12 @@ from opensquilla.application.session_read import (
 )
 from opensquilla.application.turn_admission import (
     AdmitTurn,
+    AdmitTurnResult,
     CancelTurn,
+    CancelTurnResult,
     PendingInputGuard,
     SteerTurn,
+    SteerTurnResult,
     TurnAdmission,
     TurnCancellationPort,
     TurnIngressPort,
@@ -11271,27 +11279,45 @@ class _GatewayTurnAdmissionPorts(
     def __init__(self, context: RpcContext) -> None:
         self._context = context
 
-    async def admit(self, command: AdmitTurn) -> Mapping[str, Any]:
+    async def admit(self, command: AdmitTurn) -> AdmitTurnResult:
         if command.pending_input is not None:
             guard = command.pending_input
-            return await _admit_turn(
-                command,
-                self._context,
-                pending_input_id=guard.pending_input_id,
-                pending_input_fingerprint=guard.request_fingerprint,
-                pending_input_revision=guard.expected_revision,
+            return cast(
+                AdmitTurnResult,
+                await _admit_turn(
+                    command,
+                    self._context,
+                    pending_input_id=guard.pending_input_id,
+                    pending_input_fingerprint=guard.request_fingerprint,
+                    pending_input_revision=guard.expected_revision,
+                ),
             )
         if command.surface == "webchat":
-            return await _execute_webchat_turn(command, self._context)
-        return await _admit_turn(command, self._context)
+            return cast(
+                AdmitTurnResult,
+                await _execute_webchat_turn(command, self._context),
+            )
+        return cast(
+            AdmitTurnResult,
+            await _admit_turn(command, self._context),
+        )
 
-    async def cancel(self, command: CancelTurn) -> Mapping[str, Any]:
-        return await _cancel_turn(command, self._context)
+    async def cancel(self, command: CancelTurn) -> CancelTurnResult:
+        return cast(
+            CancelTurnResult,
+            await _cancel_turn(command, self._context),
+        )
 
-    async def steer(self, command: SteerTurn) -> Mapping[str, Any]:
+    async def steer(self, command: SteerTurn) -> SteerTurnResult:
         if command.mode == "durable":
-            return await _steer_turn_durable(command, self._context)
-        return await _steer_turn_legacy(command, self._context)
+            return cast(
+                SteerTurnResult,
+                await _steer_turn_durable(command, self._context),
+            )
+        return cast(
+            SteerTurnResult,
+            await _steer_turn_legacy(command, self._context),
+        )
 
 
 async def _execute_webchat_turn(
@@ -11557,26 +11583,47 @@ class _GatewayPendingInputQueuePort(PendingInputQueuePort):
     def __init__(self, context: RpcContext) -> None:
         self._context = context
 
-    async def enqueue(self, request: PendingInputRequest) -> Mapping[str, Any]:
-        return await _enqueue_pending_input(request, self._context)
+    async def enqueue(self, request: PendingInputRequest) -> PendingInputEnqueueResult:
+        return cast(
+            PendingInputEnqueueResult,
+            await _enqueue_pending_input(request, self._context),
+        )
 
-    async def list(self, request: PendingInputRequest) -> Mapping[str, Any]:
-        return await _list_pending_inputs(request, self._context)
+    async def list(self, request: PendingInputRequest) -> PendingInputListResult:
+        return cast(
+            PendingInputListResult,
+            await _list_pending_inputs(request, self._context),
+        )
 
-    async def update(self, request: PendingInputRequest) -> Mapping[str, Any]:
-        return await _update_pending_input(request, self._context)
+    async def update(self, request: PendingInputRequest) -> PendingInputUpdateResult:
+        return cast(
+            PendingInputUpdateResult,
+            await _update_pending_input(request, self._context),
+        )
 
-    async def reorder(self, request: PendingInputRequest) -> Mapping[str, Any]:
-        return await _reorder_pending_inputs(request, self._context)
+    async def reorder(self, request: PendingInputRequest) -> PendingInputReorderResult:
+        return cast(
+            PendingInputReorderResult,
+            await _reorder_pending_inputs(request, self._context),
+        )
 
-    async def cancel(self, request: PendingInputRequest) -> Mapping[str, Any]:
-        return await _cancel_pending_input(request, self._context)
+    async def cancel(self, request: PendingInputRequest) -> PendingInputCancelResult:
+        return cast(
+            PendingInputCancelResult,
+            await _cancel_pending_input(request, self._context),
+        )
 
-    async def dispatch(self, request: PendingInputRequest) -> Mapping[str, Any]:
-        return await _dispatch_pending_input(request, self._context)
+    async def dispatch(self, request: PendingInputRequest) -> AdmitTurnResult:
+        return cast(
+            AdmitTurnResult,
+            await _dispatch_pending_input(request, self._context),
+        )
 
-    async def steer(self, request: PendingInputRequest) -> Mapping[str, Any]:
-        return await _steer_pending_input(request, self._context)
+    async def steer(self, request: PendingInputRequest) -> SteerTurnResult:
+        return cast(
+            SteerTurnResult,
+            await _steer_pending_input(request, self._context),
+        )
 
 
 def _pending_input_queue_adapter(ctx: RpcContext) -> GatewayPendingInputQueueAdapter:
