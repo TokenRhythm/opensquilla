@@ -1,4 +1,4 @@
-"""Generated Contract bindings for persisted project workspace Gateway methods."""
+"""Generated Contract bindings for Meta run recovery and setup methods."""
 
 from __future__ import annotations
 
@@ -19,21 +19,21 @@ from opensquilla.gateway.adapters.contract_method import (
     register_gateway_contract_method,
 )
 
-WORKSPACE_CATALOG_CONTRACT_METHODS: Final = (
-    "workspaces.list",
-    "workspaces.open",
-    "workspaces.update",
-    "workspaces.pin",
-    "workspaces.remove",
-    "workspaces.history.delete",
-    "sandbox.path.list",
-    "sandbox.path.create-directory",
-    "sandbox.path.pick",
+META_RUN_CENTER_CONTRACT_METHODS: Final = (
+    "meta.drafts.list",
+    "meta.drafts.discard",
+    "meta.run",
+    "meta.runs.confirm_preflight",
+    "meta.runs.recovery",
+    "meta.runs.replay",
+    "meta.setup.plan",
+    "meta.setup.install",
+    "meta.setup.status",
 )
 
 
-class WorkspaceCatalogContractError(ValueError):
-    """A workspace success payload violated its generated Contract."""
+class MetaRunCenterContractError(ValueError):
+    """A Meta run success payload violated its generated Contract."""
 
 
 def _params_observer(
@@ -74,7 +74,7 @@ def _result_validator(
         try:
             descriptor.result_model.model_validate(result)
         except ValidationError as exc:
-            raise WorkspaceCatalogContractError(
+            raise MetaRunCenterContractError(
                 f"{method} result violated the generated v4 Contract"
             ) from exc
         return result
@@ -83,14 +83,14 @@ def _result_validator(
 
 
 def _binding(method: str) -> GatewayContractBinding[Any]:
-    if method not in WORKSPACE_CATALOG_CONTRACT_METHODS:
-        raise ValueError(f"unsupported workspace Contract method: {method}")
+    if method not in META_RUN_CENTER_CONTRACT_METHODS:
+        raise ValueError(f"unsupported Meta run Contract method: {method}")
     descriptor = GATEWAY_METHOD_CONTRACTS[method]
     return GatewayContractBinding(
         descriptor=descriptor,
         observe_params=_params_observer(method, descriptor),
         validate_result=_result_validator(method, descriptor),
-        result_validation_errors=(WorkspaceCatalogContractError,),
+        result_validation_errors=(MetaRunCenterContractError,),
         response_error_message=f"{method} response violated its v4 contract",
         request_mismatch_event=f"{method}.request_contract_mismatch",
         response_violation_event=f"{method}.contract_violation",
@@ -98,11 +98,11 @@ def _binding(method: str) -> GatewayContractBinding[Any]:
 
 
 _BINDINGS: Final = {
-    method: _binding(method) for method in WORKSPACE_CATALOG_CONTRACT_METHODS
+    method: _binding(method) for method in META_RUN_CENTER_CONTRACT_METHODS
 }
 
 
-def register_workspace_catalog_contract[ContextT, ResultT](
+def register_meta_run_center_contract[ContextT, ResultT](
     registry: MethodRegistry[ContextT],
     method: str,
     implementation: Callable[[Any, ContextT], Awaitable[ResultT]],
@@ -113,7 +113,7 @@ def register_workspace_catalog_contract[ContextT, ResultT](
     try:
         binding = _BINDINGS[method]
     except KeyError as exc:
-        raise ValueError(f"unsupported workspace Contract method: {method}") from exc
+        raise ValueError(f"unsupported Meta run Contract method: {method}") from exc
     return register_gateway_contract_method(
         registry,
         cast(GatewayContractBinding[ResultT], binding),
@@ -124,7 +124,7 @@ def register_workspace_catalog_contract[ContextT, ResultT](
 
 
 __all__ = [
-    "WORKSPACE_CATALOG_CONTRACT_METHODS",
-    "WorkspaceCatalogContractError",
-    "register_workspace_catalog_contract",
+    "META_RUN_CENTER_CONTRACT_METHODS",
+    "MetaRunCenterContractError",
+    "register_meta_run_center_contract",
 ]

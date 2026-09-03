@@ -105,7 +105,6 @@ async def _handle_workspaces_list(
     }
 
 
-@_d.method("workspaces.open", scope="operator.write")
 async def _handle_workspaces_open(
     params: dict | None,
     ctx: RpcContext,
@@ -136,7 +135,6 @@ async def _handle_workspaces_open(
     return {"workspace": await _payload(storage, workspace)}
 
 
-@_d.method("workspaces.update", scope="operator.write")
 async def _handle_workspaces_update(
     params: dict | None,
     ctx: RpcContext,
@@ -158,7 +156,6 @@ async def _handle_workspaces_update(
     return {"workspace": await _payload(storage, workspace)}
 
 
-@_d.method("workspaces.pin", scope="operator.write")
 async def _handle_workspaces_pin(
     params: dict | None,
     ctx: RpcContext,
@@ -177,7 +174,6 @@ async def _handle_workspaces_pin(
     return {"workspace": await _payload(storage, workspace)}
 
 
-@_d.method("workspaces.remove", scope="operator.write")
 async def _handle_workspaces_remove(
     params: dict | None,
     ctx: RpcContext,
@@ -210,7 +206,6 @@ async def _handle_workspaces_remove(
     }
 
 
-@_d.method("workspaces.history.delete", scope="operator.write")
 async def _handle_workspaces_history_delete(
     params: dict | None,
     ctx: RpcContext,
@@ -305,6 +300,11 @@ async def _handle_workspaces_history_delete(
 
 _WORKSPACE_CATALOG_CONTRACT_IMPLEMENTATIONS = {
     "workspaces.list": _handle_workspaces_list,
+    "workspaces.open": _handle_workspaces_open,
+    "workspaces.update": _handle_workspaces_update,
+    "workspaces.pin": _handle_workspaces_pin,
+    "workspaces.remove": _handle_workspaces_remove,
+    "workspaces.history.delete": _handle_workspaces_history_delete,
 }
 
 _WORKSPACE_CATALOG_CONTRACT_HANDLERS = {

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 from collections import Counter
 from pathlib import Path
 
@@ -94,6 +95,11 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         # Workspace and path-picker wire models terminate at this registration
         # Adapter; existing workspace and sandbox handlers keep behavior.
         "src/opensquilla/gateway/adapters/workspace_catalog_contract.py",
+        # Meta recovery/setup and read-only migration wire models terminate at
+        # generated registration Adapters; existing handlers remain the only
+        # business implementations.
+        "src/opensquilla/gateway/adapters/meta_run_center_contract.py",
+        "src/opensquilla/gateway/adapters/migration_operations_contract.py",
     }
 )
 GENERATED_METADATA_IMPORT_ALLOWLIST = frozenset(
@@ -171,7 +177,8 @@ SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
 SESSIONS_RESOLVE_LITERAL_ALLOWLIST: Counter[str] = Counter()
 SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
 RUNTIME_RPC_METHOD_BASELINE = 306
-STATIC_RPC_DECORATOR_BASELINE = 103
+RUNTIME_RPC_METHOD_DIGEST = "b95b0d01e58f0d2b221b459b322c5cf0b05f050d567186b703bd67f6260a8fc4"
+STATIC_RPC_DECORATOR_BASELINE = 87
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
 # closure measurement below.  The temporary S2a cumulative growth budget was
@@ -1063,6 +1070,22 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "sandbox.path.list",
             "sandbox.path.create-directory",
             "sandbox.path.pick",
+            "workspaces.open",
+            "workspaces.update",
+            "workspaces.pin",
+            "workspaces.remove",
+            "workspaces.history.delete",
+            "meta.drafts.list",
+            "meta.drafts.discard",
+            "meta.run",
+            "meta.runs.confirm_preflight",
+            "meta.runs.recovery",
+            "meta.runs.replay",
+            "meta.setup.plan",
+            "meta.setup.install",
+            "meta.setup.status",
+            "migration.sources.list",
+            "migration.sources.preview",
         }
     ] == []
     assert [
@@ -1142,6 +1165,8 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
     methods = registry.list_methods()
     assert len(methods) == RUNTIME_RPC_METHOD_BASELINE
     assert len(methods) == len(set(methods))
+    digest = hashlib.sha256(("\n".join(sorted(methods)) + "\n").encode()).hexdigest()
+    assert digest == RUNTIME_RPC_METHOD_DIGEST
 
     entry = registry.get_entry(SESSIONS_LIST_METHOD)
     assert entry is not None
