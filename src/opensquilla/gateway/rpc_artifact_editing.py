@@ -94,10 +94,14 @@ from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.rpc import (
     RpcContext,
     RpcHandlerError,
+    RpcUnavailableError,
     get_dispatcher,
 )
-from opensquilla.gateway.rpc_artifacts import _session_id_for_key
-from opensquilla.gateway.session_services import get_session_storage
+from opensquilla.gateway.session_services import (
+    SessionServiceUnavailableError,
+    get_session_storage,
+    session_id_for_key,
+)
 from opensquilla.gateway.websocket import get_registry
 from opensquilla.paths import media_root_from_config
 from opensquilla.session.keys import canonicalize_session_key
@@ -689,7 +693,10 @@ async def _scope(
     ctx: RpcContext,
 ) -> tuple[str, str, ArtifactSessionService]:
     session_key = _session_key(params)
-    session_id = await _session_id_for_key(ctx, session_key)
+    try:
+        session_id = await session_id_for_key(ctx.session_manager, session_key)
+    except SessionServiceUnavailableError as exc:
+        raise RpcUnavailableError(str(exc)) from exc
     if session_id is None:
         raise artifact_product_error(
             ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,

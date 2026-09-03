@@ -317,11 +317,6 @@ APPROVED_PRIVATE_RPC_IMPORTS: Counter[tuple[str, str, str]] = Counter(
             "_apply_run_context_route_metadata",
         ): 2,
         (
-            "src/opensquilla/gateway/rpc_artifact_editing.py",
-            "opensquilla.gateway.rpc_artifacts",
-            "_session_id_for_key",
-        ): 1,
-        (
             "src/opensquilla/gateway/rpc_chat.py",
             "opensquilla.gateway.rpc_sessions",
             "_handle_sessions_abort",
@@ -340,11 +335,6 @@ APPROVED_PRIVATE_RPC_IMPORTS: Counter[tuple[str, str, str]] = Counter(
             "src/opensquilla/gateway/rpc_sessions.py",
             "opensquilla.gateway.rpc_chat",
             "_handle_chat_history",
-        ): 1,
-        (
-            "src/opensquilla/gateway/rpc_workbench_resources.py",
-            "opensquilla.gateway.rpc_artifacts",
-            "_session_id_for_key",
         ): 1,
         (
             "src/opensquilla/session/naming.py",

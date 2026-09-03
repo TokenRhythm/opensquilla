@@ -26,7 +26,10 @@ from opensquilla.gateway.rpc import (
     RpcUnavailableError,
     get_dispatcher,
 )
-from opensquilla.gateway.session_services import get_session_storage
+from opensquilla.gateway.session_services import (
+    SessionServiceUnavailableError,
+    session_id_for_key,
+)
 from opensquilla.paths import media_root_from_config
 from opensquilla.session.keys import canonicalize_session_key
 
@@ -73,30 +76,6 @@ def _optional_before(params: dict[str, Any] | None) -> str | None:
     return validate_artifact_cursor(stripped)
 
 
-async def _session_id_for_key(ctx: RpcContext, session_key: str) -> str | None:
-    manager = ctx.session_manager
-    if manager is None:
-        raise RpcUnavailableError("session manager is not wired")
-
-    get_session = getattr(manager, "get_session", None)
-    try:
-        if callable(get_session):
-            session = await get_session(session_key)
-        else:
-            storage = get_session_storage(manager)
-            if storage is None:
-                raise RpcUnavailableError("session storage is not wired")
-            session = await storage.get_session(session_key)
-    except KeyError:
-        session = None
-    if session is None:
-        return None
-    session_id = getattr(session, "session_id", None)
-    if not isinstance(session_id, str) or not session_id:
-        return None
-    return session_id
-
-
 def _empty_artifact_page(limit: int) -> dict[str, Any]:
     return {
         "artifacts": [],
@@ -117,7 +96,10 @@ async def _execute_artifacts_list(
     session_key = _require_session_key(params)
     limit = _bounded_limit(params.get("limit") if isinstance(params, dict) else None)
     before = _optional_before(params)
-    session_id = await _session_id_for_key(ctx, session_key)
+    try:
+        session_id = await session_id_for_key(ctx.session_manager, session_key)
+    except SessionServiceUnavailableError as exc:
+        raise RpcUnavailableError(str(exc)) from exc
     if session_id is None:
         return _empty_artifact_page(limit)
     store = ArtifactStore(media_root_from_config(ctx.config))
@@ -148,7 +130,10 @@ async def _execute_artifacts_get(
 
     session_key = _require_session_key(params)
     artifact_id = validate_artifact_cursor(_require_string(params, "artifactId"))
-    session_id = await _session_id_for_key(ctx, session_key)
+    try:
+        session_id = await session_id_for_key(ctx.session_manager, session_key)
+    except SessionServiceUnavailableError as exc:
+        raise RpcUnavailableError(str(exc)) from exc
     if session_id is None:
         raise RpcHandlerError(
             ERROR_NOT_FOUND,
