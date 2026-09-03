@@ -1704,6 +1704,7 @@ let trackBackgroundReceiptTask = (
   _terminal: boolean | string = false,
   _allowProjection = true,
   _retireParentProjection = false,
+  _acceptedStatus = '',
 ) => {}
 let finishBackgroundReceiptReplay = (_clientMessageId: string) => {}
 let holdBackgroundReceiptReconciliation = () => {}
@@ -3480,6 +3481,7 @@ const chatSend = useChatSend({
     terminal,
     allowProjection,
     retireParentProjection,
+    acceptedStatus,
   ) => (
     trackBackgroundReceiptTask(
       clientMessageId,
@@ -3487,6 +3489,7 @@ const chatSend = useChatSend({
       terminal,
       allowProjection,
       retireParentProjection,
+      acceptedStatus,
     )
   ),
   finishBackgroundReceiptReplay: clientMessageId => (

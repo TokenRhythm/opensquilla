@@ -206,6 +206,7 @@ interface SendAttempt {
   backgroundRejectionError?: unknown
   backgroundRejectionContinuationClaimed?: boolean
   acceptedTaskId?: string
+  acceptedTaskStatus?: string
   acceptedSessionKey?: string
   stopAbortPromise?: Promise<boolean> | null
   autoRecoverAcceptance?: boolean
@@ -290,6 +291,7 @@ interface ResponseHandoffGate {
   targetSessionKey: string | null
   stoppedByUser: boolean
   acceptedTaskId: string
+  acceptedTaskStatus: string
   terminalResponse: boolean
   authoritativeIdle: boolean
   backgroundOnly: boolean
@@ -648,6 +650,7 @@ export interface UseChatSendOptions {
     terminal?: boolean | string,
     allowProjection?: boolean,
     retireParentProjection?: boolean,
+    acceptedStatus?: string,
   ) => void
   /** Release the pre-response event quarantine for an older receipt replay. */
   finishBackgroundReceiptReplay?: (clientMessageId: string) => void
@@ -1154,6 +1157,31 @@ export function useChatSend(options: UseChatSendOptions) {
     }
   }
 
+  function trackBackgroundReceiptResponse(
+    clientMessageId: string,
+    response: TurnSendResponse,
+    requestSessionKey: string,
+  ) {
+    const targetSessionKey = response.sessionKey || requestSessionKey
+    const requestSessionIsCurrent = requestSessionKey === options.sessionKey.value
+    const allowProjection = (
+      targetSessionKey === requestSessionKey
+      && requestSessionIsCurrent
+    )
+    const retireParentProjection = (
+      requestSessionIsCurrent
+      && targetSessionKey !== requestSessionKey
+    )
+    options.trackBackgroundReceiptTask?.(
+      clientMessageId,
+      acceptedTaskId(response),
+      terminalResponseStatus(response),
+      allowProjection,
+      retireParentProjection,
+      taskAcceptanceStatus(response),
+    )
+  }
+
   function supportsSameTurnSteer(): boolean {
     const capability = activeSteerCapability()
     const expectedTurnId = capabilityExpectedTurnId()
@@ -1366,6 +1394,7 @@ export function useChatSend(options: UseChatSendOptions) {
     acknowledgeAttemptPromptAnnotations(attempt, response, responseOwnsVisibleTranscript)
     attempt.acceptanceResolved = true
     attempt.acceptedTaskId = acceptedTaskId(response)
+    attempt.acceptedTaskStatus = taskAcceptanceStatus(response)
     attempt.acceptedSessionKey = acceptedSessionKey
     if (
       responseOwnsVisibleTranscript
@@ -1396,13 +1425,13 @@ export function useChatSend(options: UseChatSendOptions) {
       options.scheduleHistorySync()
     } else if (isCurrentRequest) {
       consumeAcceptedSessionIntent(attempt)
-      if (acceptedSessionKey === attempt.requestSessionKey) {
-        options.trackBackgroundReceiptTask?.(
-          attempt.clientMessageId,
-          accepted.taskId,
-          terminalStatus,
-        )
-      }
+    }
+    if (!responseOwnsVisibleTranscript) {
+      trackBackgroundReceiptResponse(
+        attempt.clientMessageId,
+        response,
+        attempt.requestSessionKey,
+      )
     }
     if (
       !responseOwnsVisibleTranscript
@@ -1465,6 +1494,7 @@ export function useChatSend(options: UseChatSendOptions) {
       targetSessionKey: null,
       stoppedByUser: attempt.stopRequested === true,
       acceptedTaskId: attempt.acceptedTaskId || '',
+      acceptedTaskStatus: attempt.acceptedTaskStatus || '',
       terminalResponse: false,
       authoritativeIdle: false,
       backgroundOnly: true,
@@ -1637,6 +1667,7 @@ export function useChatSend(options: UseChatSendOptions) {
       targetSessionKey: null,
       stoppedByUser: false,
       acceptedTaskId: '',
+      acceptedTaskStatus: '',
       terminalResponse: false,
       authoritativeIdle: false,
       backgroundOnly: false,
@@ -1896,11 +1927,15 @@ export function useChatSend(options: UseChatSendOptions) {
       current.state === 'accepted'
       && current.acceptedSessionKey === acceptedSessionKey
       && (!gate.backgroundOnly || current.backgroundOnly)
+      && (!gate.acceptedTaskId || current.acceptedTaskId === gate.acceptedTaskId)
+      && (!gate.acceptedTaskStatus || current.acceptedTaskStatus === gate.acceptedTaskStatus)
     ) return true
     const accepted: ResponseHandoffWalRecord = {
       ...current,
       state: 'accepted',
       acceptedSessionKey,
+      ...(gate.acceptedTaskId ? { acceptedTaskId: gate.acceptedTaskId } : {}),
+      ...(gate.acceptedTaskStatus ? { acceptedTaskStatus: gate.acceptedTaskStatus } : {}),
       ...(gate.backgroundOnly ? { backgroundOnly: true } : {}),
       ...(current.walRevision ? { walRevision: current.walRevision + 1 } : {}),
       updatedAt: Date.now(),
@@ -2004,6 +2039,7 @@ export function useChatSend(options: UseChatSendOptions) {
       targetSessionKey: acceptedSessionKey,
       stoppedByUser: attempt.stopRequested === true,
       acceptedTaskId: attempt.acceptedTaskId || '',
+      acceptedTaskStatus: attempt.acceptedTaskStatus || '',
       terminalResponse: false,
       authoritativeIdle: false,
       backgroundOnly: true,
@@ -2111,6 +2147,7 @@ export function useChatSend(options: UseChatSendOptions) {
       targetSessionKey: null,
       stoppedByUser: attempt.stopRequested === true,
       acceptedTaskId: attempt.acceptedTaskId || '',
+      acceptedTaskStatus: attempt.acceptedTaskStatus || '',
       terminalResponse: false,
       authoritativeIdle: false,
       backgroundOnly: true,
@@ -2308,17 +2345,70 @@ export function useChatSend(options: UseChatSendOptions) {
   async function finalizeRecoveredBackgroundHandoff(
     record: ResponseHandoffWalRecord,
     targetSessionKey: string,
-  ): Promise<void> {
+    acceptedTaskId = record.acceptedTaskId || '',
+    acceptedTaskStatus = record.acceptedTaskStatus || '',
+  ): Promise<boolean> {
     const gate = beginResponseHandoff(
       record.requestSessionKey,
       record.ownerRequestId,
       record,
     )
     gate.backgroundOnly = true
+    gate.acceptedTaskId = acceptedTaskId
+    gate.acceptedTaskStatus = acceptedTaskStatus
+    gate.terminalResponse = Boolean(terminalResponseStatus({ taskStatus: acceptedTaskStatus }))
     try {
-      await finalizeBackgroundResponseHandoff(gate, targetSessionKey)
+      return await finalizeBackgroundResponseHandoff(gate, targetSessionKey)
     } finally {
       finishResponseHandoff(gate)
+    }
+  }
+
+  async function finalizeRecoveredBackgroundHandoffUntilComplete(
+    initialRecord: ResponseHandoffWalRecord,
+    initialTargetSessionKey: string,
+    acceptedTaskId = initialRecord.acceptedTaskId || '',
+    acceptedTaskStatus = initialRecord.acceptedTaskStatus || '',
+  ): Promise<void> {
+    const wal = options.pendingInputWal
+    if (!wal?.listHandoffs) return
+    let record = initialRecord
+    let targetSessionKey = initialTargetSessionKey
+    let retryAttempt = 0
+    while (true) {
+      const finalized = await finalizeRecoveredBackgroundHandoff(
+        record,
+        targetSessionKey,
+        acceptedTaskId,
+        acceptedTaskStatus,
+      )
+      if (finalized) return
+      const delayMs = acceptanceRecoveryDelaysMs[
+        Math.min(retryAttempt, acceptanceRecoveryDelaysMs.length - 1)
+      ]!
+      retryAttempt += 1
+      await new Promise<void>(resolve => globalThis.setTimeout(resolve, delayMs))
+      let records: ResponseHandoffWalRecord[]
+      try {
+        records = await wal.listHandoffs(record.requestSessionKey)
+      } catch {
+        continue
+      }
+      const current = records.find(candidate => (
+        candidate.ownerRequestId === record.ownerRequestId
+        && candidate.clientRequestId === record.clientRequestId
+        && candidate.clientMessageId === record.clientMessageId
+      ))
+      if (!current) return
+      if (current.state === 'failed') {
+        await retireBackgroundHandoffUntilComplete(current)
+        return
+      }
+      if (current.state === 'preparing' || current.backgroundOnly !== true) return
+      record = current
+      targetSessionKey = current.acceptedSessionKey || targetSessionKey
+      acceptedTaskId = current.acceptedTaskId || acceptedTaskId
+      acceptedTaskStatus = current.acceptedTaskStatus || acceptedTaskStatus
     }
   }
 
@@ -2465,7 +2555,25 @@ export function useChatSend(options: UseChatSendOptions) {
         }
         if (record.state === 'accepted' && record.acceptedSessionKey) {
           if (record.backgroundOnly) {
-            await finalizeRecoveredBackgroundHandoff(record, record.acceptedSessionKey)
+            options.beginBackgroundReceiptReplay?.(
+              record.clientMessageId,
+              options.messageEditActive?.value === true,
+            )
+            backgroundReceiptClientMessageId = record.clientMessageId
+            trackBackgroundReceiptResponse(
+              record.clientMessageId,
+              {
+                sessionKey: record.acceptedSessionKey,
+                taskId: record.acceptedTaskId,
+                taskStatus: record.acceptedTaskStatus,
+              },
+              record.requestSessionKey,
+            )
+            await finalizeRecoveredBackgroundHandoffUntilComplete(
+              record,
+              record.acceptedSessionKey,
+            )
+            finishBackgroundReceiptRecovery()
           } else {
             await finalizeRecoveredHandoff(record, record.acceptedSessionKey)
           }
@@ -2488,25 +2596,17 @@ export function useChatSend(options: UseChatSendOptions) {
             })
             const targetSessionKey = response.sessionKey || replayRecord.requestSessionKey
             if (replayRecord.backgroundOnly) {
-              const requestSessionIsCurrent = (
-                replayRecord.requestSessionKey === options.sessionKey.value
-              )
-              const allowTerminalProjection = (
-                targetSessionKey === replayRecord.requestSessionKey
-                && requestSessionIsCurrent
-              )
-              const retireParentProjection = (
-                requestSessionIsCurrent
-                && targetSessionKey !== replayRecord.requestSessionKey
-              )
-              options.trackBackgroundReceiptTask?.(
+              trackBackgroundReceiptResponse(
                 replayRecord.clientMessageId,
-                acceptedTaskId(response),
-                terminalResponseStatus(response),
-                allowTerminalProjection,
-                retireParentProjection,
+                response,
+                replayRecord.requestSessionKey,
               )
-              await finalizeRecoveredBackgroundHandoff(replayRecord, targetSessionKey)
+              await finalizeRecoveredBackgroundHandoffUntilComplete(
+                replayRecord,
+                targetSessionKey,
+                acceptedTaskId(response),
+                taskAcceptanceStatus(response),
+              )
             } else {
               await finalizeRecoveredHandoff(replayRecord, targetSessionKey)
             }
@@ -2515,7 +2615,10 @@ export function useChatSend(options: UseChatSendOptions) {
             const accepted = acceptedErrorInfo(error)
             if (accepted?.sessionKey) {
               if (replayRecord.backgroundOnly) {
-                await finalizeRecoveredBackgroundHandoff(replayRecord, accepted.sessionKey)
+                await finalizeRecoveredBackgroundHandoffUntilComplete(
+                  replayRecord,
+                  accepted.sessionKey,
+                )
               } else {
                 await finalizeRecoveredHandoff(replayRecord, accepted.sessionKey)
               }
@@ -4099,6 +4202,7 @@ export function useChatSend(options: UseChatSendOptions) {
       acknowledgeAttemptPromptAnnotations(attempt, res, responseOwnsVisibleTranscript)
       attempt.acceptanceResolved = true
       attempt.acceptedTaskId = acceptedTaskId(res)
+      attempt.acceptedTaskStatus = taskAcceptanceStatus(res)
       attempt.acceptedSessionKey = res?.sessionKey || requestSessionKey
       if (
         responseOwnsVisibleTranscript
@@ -4118,18 +4222,10 @@ export function useChatSend(options: UseChatSendOptions) {
         if (acceptedSessionKey === requestSessionKey) {
           noteAcceptedTask(res, requestSessionKey)
         }
-        if (
-          options.sessionKey.value === requestSessionKey
-          && acceptedSessionKey === requestSessionKey
-        ) {
-          options.trackBackgroundReceiptTask?.(
-            attempt.clientMessageId,
-            taskId,
-            terminalStatus,
-          )
-        }
+        trackBackgroundReceiptResponse(attempt.clientMessageId, res, requestSessionKey)
         if (responseHandoff) {
           responseHandoff.acceptedTaskId = taskId
+          responseHandoff.acceptedTaskStatus = taskAcceptanceStatus(res)
           responseHandoff.terminalResponse = Boolean(terminalStatus)
           const finalized = await finalizeBackgroundResponseHandoff(
             responseHandoff,
@@ -4177,6 +4273,7 @@ export function useChatSend(options: UseChatSendOptions) {
       const terminalStatus = terminalResponseStatus(res)
       if (responseHandoff) {
         responseHandoff.acceptedTaskId = taskId
+        responseHandoff.acceptedTaskStatus = taskAcceptanceStatus(res)
         responseHandoff.terminalResponse = Boolean(terminalStatus)
       }
       const stoppedByUser = acceptanceTransaction.stoppedByUser
@@ -4238,6 +4335,7 @@ export function useChatSend(options: UseChatSendOptions) {
           )
           responseHandoff.stoppedByUser = true
           responseHandoff.acceptedTaskId = taskId
+          responseHandoff.acceptedTaskStatus = taskAcceptanceStatus(res)
           responseHandoff.terminalResponse = Boolean(terminalStatus)
           await handoffResponseSession(acceptedSessionKey, responseHandoff)
         } else if (responseHandoff && acceptedSessionKey === requestSessionKey) {
@@ -4282,6 +4380,7 @@ export function useChatSend(options: UseChatSendOptions) {
           durableHandoffRecord,
         )
         responseHandoff.acceptedTaskId = taskId
+        responseHandoff.acceptedTaskStatus = taskAcceptanceStatus(res)
         responseHandoff.terminalResponse = Boolean(terminalStatus)
         await handoffResponseSession(decision.responseSessionKey, responseHandoff)
       } else if (responseHandoff && decision.reason === 'same_session') {

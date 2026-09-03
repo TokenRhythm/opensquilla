@@ -62,6 +62,10 @@ export interface ResponseHandoffWalRecord {
   walRevision?: number
   state: ResponseHandoffWalState
   acceptedSessionKey?: string
+  /** Accepted task identity retained across a crash before owner retirement. */
+  acceptedTaskId?: string
+  /** Gateway lifecycle status paired with the accepted task identity. */
+  acceptedTaskStatus?: string
   errorCode?: string
   createdAt: number
   updatedAt: number
@@ -225,6 +229,14 @@ function isResponseHandoffWalRecord(value: unknown): value is ResponseHandoffWal
       || (Number.isSafeInteger(record.walRevision) && record.walRevision >= 1)
     )
     && ['preparing', 'submitting', 'accepted', 'failed'].includes(String(record.state || ''))
+    && (
+      record.acceptedTaskId === undefined
+      || (typeof record.acceptedTaskId === 'string' && record.acceptedTaskId.length > 0)
+    )
+    && (
+      record.acceptedTaskStatus === undefined
+      || (typeof record.acceptedTaskStatus === 'string' && record.acceptedTaskStatus.length > 0)
+    )
     && (
       record.state !== 'preparing'
       || (

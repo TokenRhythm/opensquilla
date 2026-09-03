@@ -325,6 +325,77 @@ describe('useChatRpcEventHandlers decoded conversation ingress', () => {
     }
   })
 
+  it('keeps a rich early terminal snapshot when a sparse echo arrives before ACK', () => {
+    const taskOwnership = useChatTaskOwnership()
+    const harness = createHarness({
+      taskOwnership,
+      pendingQueue: [{
+        pendingUiId: 'pending-after-successor',
+        text: 'wait for successor',
+        attachments: [],
+        intent: null,
+      }],
+    })
+    harness.stream.isStreaming.value = false
+    try {
+      harness.api.beginBackgroundReceiptReplay('client-rich-terminal')
+      harness.api.onConversationEvent({
+        kind: 'sessions-changed',
+        payload: {
+          session_key: 'agent:main:test',
+          reason: 'task_terminal',
+          run_status: 'running',
+          changed_task: {
+            task_id: 'task-rich-terminal',
+            client_message_id: 'client-rich-terminal',
+            status: 'succeeded',
+          },
+          last_task: {
+            task_id: 'task-rich-terminal',
+            client_message_id: 'client-rich-terminal',
+            status: 'succeeded',
+          },
+          active_task: {
+            task_id: 'task-rich-successor',
+            client_message_id: 'client-rich-successor',
+            status: 'running',
+          },
+        },
+        meta: {},
+      })
+      const sparsePayload = {
+        session_key: 'agent:main:test',
+        task_id: 'task-rich-terminal',
+        client_message_id: 'client-rich-terminal',
+      }
+      harness.api.onConversationEvent({
+        kind: 'conversation',
+        event: decodeConversationEvent('task.succeeded', sparsePayload, {}),
+        payload: sparsePayload,
+        meta: {},
+      })
+
+      expect(harness.applySessionRunState).not.toHaveBeenCalled()
+      expect(harness.scheduleHistorySync).not.toHaveBeenCalled()
+      harness.api.trackBackgroundReceiptTask(
+        'client-rich-terminal',
+        'task-rich-terminal',
+        false,
+        true,
+      )
+
+      expect(taskOwnership.runningTaskId.value).toBe('task-rich-successor')
+      expect(harness.applySessionRunState).toHaveBeenLastCalledWith(expect.objectContaining({
+        run_status: 'running',
+        active_task: expect.objectContaining({ task_id: 'task-rich-successor' }),
+      }))
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+      expect(harness.schedulePendingDrainAfterTerminal).not.toHaveBeenCalled()
+    } finally {
+      harness.stop()
+    }
+  })
+
   it('quarantines live and terminal events from a background receipt replay', () => {
     const harness = createHarness({
       messages: [
@@ -460,7 +531,14 @@ describe('useChatRpcEventHandlers decoded conversation ingress', () => {
       expect(harness.stream.startStreaming).not.toHaveBeenCalled()
       expect(harness.stream.appendDelta).not.toHaveBeenCalled()
       expect(harness.stream.endStreaming).not.toHaveBeenCalled()
-      expect(harness.applySessionRunState).toHaveBeenCalledTimes(2)
+      expect(harness.applySessionRunState).toHaveBeenCalledTimes(3)
+      expect(harness.applySessionRunState).toHaveBeenCalledWith({
+        run_status: 'running',
+        active_task: {
+          task_id: 'task-old-receipt',
+          status: 'running',
+        },
+      })
       expect(harness.applySessionRunState).toHaveBeenCalledWith(expect.objectContaining({
         run_status: 'running',
         active_task: expect.objectContaining({ task_id: 'task-successor' }),

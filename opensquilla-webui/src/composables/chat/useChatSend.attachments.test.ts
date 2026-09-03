@@ -3526,7 +3526,7 @@ describe('useChatSend attachment payloads', () => {
     expect(await pendingInputWal.listHandoffs?.()).toEqual([])
   })
 
-  async function verifyCrashedChildReceiptRecovery(taskStatus: string) {
+  async function verifyCrashedReceiptRecovery(taskStatus: string, sameSession = false) {
     const parent = 'agent:main:webchat:background-recovery-parent'
     const child = 'agent:main:webchat:background-recovery-child'
     const ownerRequestId = 'background-recovery-request'
@@ -3601,6 +3601,7 @@ describe('useChatSend attachment payloads', () => {
       _terminal?: boolean | string,
       _allowProjection?: boolean,
       _retireParentProjection?: boolean,
+      _acceptedStatus?: string,
     ) => {}
     const beginBackgroundReceiptReplay = vi.fn((id: string, holdHistory?: boolean) => {
       beginReplay(id, holdHistory)
@@ -3614,8 +3615,16 @@ describe('useChatSend attachment payloads', () => {
       terminal?: boolean | string,
       allowProjection?: boolean,
       retireParentProjection?: boolean,
+      acceptedStatus?: string,
     ) => {
-      trackReplay(id, taskId, terminal, allowProjection, retireParentProjection)
+      trackReplay(
+        id,
+        taskId,
+        terminal,
+        allowProjection,
+        retireParentProjection,
+        acceptedStatus,
+      )
     })
     const applySessionRunState = vi.fn()
     const scheduleHistorySync = vi.fn()
@@ -3726,17 +3735,19 @@ describe('useChatSend attachment payloads', () => {
         task_id: 'recovered-task',
         client_message_id: clientMessageId,
       })
-      deliver('task.succeeded', {
-        session_key: parent,
-        task_id: 'recovered-task',
-        client_message_id: clientMessageId,
-      })
+      if (!sameSession) {
+        deliver('task.succeeded', {
+          session_key: parent,
+          task_id: 'recovered-task',
+          client_message_id: clientMessageId,
+        })
+      }
       expect(activeStreamTaskId.value).toBe('')
       expect(taskOwnership.runningTaskId.value).toBe('')
       expect(applySessionRunState).not.toHaveBeenCalled()
       expect(scheduleHistorySync).not.toHaveBeenCalled()
       resolveRecovery({
-        sessionKey: child,
+        sessionKey: sameSession ? parent : child,
         task_id: 'recovered-task',
         ...(taskStatus ? { task_status: taskStatus } : {}),
       })
@@ -3745,9 +3756,54 @@ describe('useChatSend attachment payloads', () => {
         clientMessageId,
         'recovered-task',
         taskStatus,
-        false,
-        true,
+        sameSession,
+        !sameSession,
+        taskStatus,
       )
+      expect(await pendingInputWal.listHandoffs!()).toEqual([
+        expect.objectContaining({
+          state: 'accepted',
+          acceptedTaskId: 'recovered-task',
+          ...(taskStatus ? { acceptedTaskStatus: taskStatus } : {}),
+        }),
+      ])
+      if (sameSession) {
+        expect(taskOwnership.runningTaskId.value).toBe('recovered-task')
+        expect(applySessionRunState).toHaveBeenCalledWith({
+          run_status: 'running',
+          active_task: {
+            task_id: 'recovered-task',
+            status: 'running',
+          },
+        })
+        expect(schedulePendingDrainAfterTerminal).not.toHaveBeenCalled()
+
+        resolveQueueRelease(true)
+        await restoring
+
+        expect(taskOwnership.runningTaskId.value).toBe('recovered-task')
+        expect(schedulePendingDrainAfterTerminal).not.toHaveBeenCalled()
+        deliver('session.event.text_delta', {
+          session_key: parent,
+          task_id: 'recovered-task',
+          stream_seq: 1,
+          text: 'old recovered output',
+        })
+        deliver('task.succeeded', {
+          session_key: parent,
+          task_id: 'recovered-task',
+        })
+        expect(recovery.stream.appendDelta).not.toHaveBeenCalled()
+        expect(taskOwnership.runningTaskId.value).toBe('')
+        expect(applySessionRunState).toHaveBeenLastCalledWith(expect.objectContaining({
+          run_status: 'idle',
+          last_task: expect.objectContaining({ task_id: 'recovered-task' }),
+        }))
+        expect(schedulePendingDrainAfterTerminal).toHaveBeenCalledOnce()
+        expect(finishBackgroundReceiptReplay).toHaveBeenCalledWith(clientMessageId)
+        expect(await pendingInputWal.listHandoffs!()).toEqual([])
+        return
+      }
       expect(applySessionRunState).not.toHaveBeenCalled()
       expect(schedulePendingDrainAfterTerminal).not.toHaveBeenCalled()
       expect(scheduleRecoveredQueueDrain).toHaveBeenCalledOnce()
@@ -3804,56 +3860,94 @@ describe('useChatSend attachment payloads', () => {
   ] as const)(
     'quarantines task, turn, and session events after a crashed %s child ACK',
     async (_label, taskStatus) => {
-      await verifyCrashedChildReceiptRecovery(taskStatus)
+      await verifyCrashedReceiptRecovery(taskStatus)
     },
   )
 
-  it('releases a crashed accepted background-only owner back to the parent drain', async () => {
-    const parent = 'agent:main:webchat:accepted-background-parent'
-    const child = 'agent:main:webchat:accepted-background-child'
-    const ownerRequestId = 'accepted-background-request'
-    const pendingInputWal = memoryHandoffWal()
-    await pendingInputWal.prepareHandoff!({
-      schemaVersion: 1,
-      ownerRequestId,
-      requestSessionKey: parent,
-      clientRequestId: ownerRequestId,
-      clientMessageId: 'accepted-background-message',
-      composerText: 'already accepted offscreen',
-      recoveryAttachments: [],
-      params: {
-        sessionKey: parent,
+  it('keeps a crashed same-session receipt running until its terminal event', async () => {
+    await verifyCrashedReceiptRecovery('', true)
+  })
+
+  it('quarantines and retries a crashed accepted background-only owner', async () => {
+    vi.useFakeTimers()
+    try {
+      const parent = 'agent:main:webchat:accepted-background-parent'
+      const child = 'agent:main:webchat:accepted-background-child'
+      const ownerRequestId = 'accepted-background-request'
+      const clientMessageId = 'accepted-background-message'
+      const pendingInputWal = memoryHandoffWal()
+      await pendingInputWal.prepareHandoff!({
+        schemaVersion: 1,
+        ownerRequestId,
+        requestSessionKey: parent,
         clientRequestId: ownerRequestId,
-        clientMessageId: 'accepted-background-message',
-        message: 'already accepted offscreen',
-        forkBeforeMessageId: 'fork-anchor',
-      },
-      backgroundOnly: true,
-      acceptedSessionKey: child,
-      walOwnerId: 'accepted-background-owner',
-      walRevision: 4,
-      state: 'accepted',
-      createdAt: 1,
-      updatedAt: 2,
-    })
-    const adoptResponseSession = vi.fn()
-    const recoverPendingQueueHandoff = vi.fn(async () => true)
-    const harness = makeOptions({
-      sessionKey: ref(parent),
-      pendingInputWal,
-      adoptResponseSession,
-      recoverPendingQueueHandoff,
-      hasPendingQueueWork: () => true,
-    })
+        clientMessageId,
+        composerText: 'already accepted offscreen',
+        recoveryAttachments: [],
+        params: {
+          sessionKey: parent,
+          clientRequestId: ownerRequestId,
+          clientMessageId,
+          message: 'already accepted offscreen',
+          forkBeforeMessageId: 'fork-anchor',
+        },
+        backgroundOnly: true,
+        acceptedSessionKey: child,
+        acceptedTaskId: 'accepted-background-task',
+        acceptedTaskStatus: 'running',
+        walOwnerId: 'accepted-background-owner',
+        walRevision: 4,
+        state: 'accepted',
+        createdAt: 1,
+        updatedAt: 2,
+      })
+      const beginBackgroundReceiptReplay = vi.fn()
+      const finishBackgroundReceiptReplay = vi.fn()
+      const trackBackgroundReceiptTask = vi.fn()
+      const recoverPendingQueueHandoff = vi.fn(async () => (
+        recoverPendingQueueHandoff.mock.calls.length > 1
+      ))
+      const harness = makeOptions({
+        sessionKey: ref(parent),
+        pendingInputWal,
+        beginBackgroundReceiptReplay,
+        finishBackgroundReceiptReplay,
+        trackBackgroundReceiptTask,
+        recoverPendingQueueHandoff,
+        hasPendingQueueWork: () => true,
+      })
 
-    await harness.api.recoverResponseHandoffs()
+      const recovery = harness.api.recoverResponseHandoffs()
+      await vi.waitFor(() => expect(recoverPendingQueueHandoff).toHaveBeenCalledOnce())
 
-    expect(harness.rpc.call).not.toHaveBeenCalled()
-    expect(adoptResponseSession).not.toHaveBeenCalled()
-    expect(recoverPendingQueueHandoff).toHaveBeenCalledWith(parent, parent, ownerRequestId)
-    expect(harness.options.flushDeferredPendingDrain).toHaveBeenCalledOnce()
-    expect(harness.options.schedulePendingDrainAfterTerminal).toHaveBeenCalledOnce()
-    expect(await pendingInputWal.listHandoffs!()).toEqual([])
+      expect(harness.rpc.call).not.toHaveBeenCalled()
+      expect(beginBackgroundReceiptReplay).toHaveBeenCalledWith(clientMessageId, false)
+      expect(trackBackgroundReceiptTask).toHaveBeenCalledWith(
+        clientMessageId,
+        'accepted-background-task',
+        '',
+        false,
+        true,
+        'running',
+      )
+      expect(await pendingInputWal.listHandoffs!()).toEqual([
+        expect.objectContaining({
+          state: 'accepted',
+          acceptedTaskId: 'accepted-background-task',
+          acceptedTaskStatus: 'running',
+        }),
+      ])
+      await vi.advanceTimersByTimeAsync(250)
+      await recovery
+
+      expect(recoverPendingQueueHandoff).toHaveBeenCalledTimes(2)
+      expect(finishBackgroundReceiptReplay).toHaveBeenCalledWith(clientMessageId)
+      expect(harness.options.flushDeferredPendingDrain).toHaveBeenCalledOnce()
+      expect(harness.options.schedulePendingDrainAfterTerminal).toHaveBeenCalledOnce()
+      expect(await pendingInputWal.listHandoffs!()).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   async function expectBackgroundCasRetry(
@@ -4670,6 +4764,7 @@ describe('useChatSend attachment payloads', () => {
         clientMessageId,
         expectedTaskId,
         expectedStatus,
+        ...(expectedTaskId ? [true, false, expectedStatus] : []),
       )
       expect(inputText.value).toBe('newer question')
     },
@@ -4712,8 +4807,51 @@ describe('useChatSend attachment payloads', () => {
 
     expect(rpc.call.mock.calls[0]?.[1]).not.toHaveProperty('forkBeforeMessageId')
     expect(rpc.call.mock.calls[1]?.[1]).toEqual(rpc.call.mock.calls[0]?.[1])
-    expect(trackBackgroundReceiptTask).not.toHaveBeenCalled()
+    expect(trackBackgroundReceiptTask).toHaveBeenCalledWith(
+      expect.any(String),
+      'terminal-old-receipt',
+      'timeout',
+      false,
+      false,
+      'timeout',
+    )
     expect(sessionKey.value).toBe('agent:main:webchat:selected-during-replay')
+  })
+
+  it('registers a manual offscreen child receipt for task-id-only quarantine', async () => {
+    const requestSessionKey = 'agent:main:webchat:manual-receipt-parent'
+    const inputText = ref('older question')
+    const trackBackgroundReceiptTask = vi.fn()
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+        .mockResolvedValueOnce({
+          sessionKey: 'agent:main:webchat:manual-receipt-child',
+          task_id: 'manual-child-task',
+          task_status: 'running',
+        }),
+    }
+    const harness = makeOptions({
+      rpc,
+      sessionKey: ref(requestSessionKey),
+      inputText,
+      trackBackgroundReceiptTask,
+    })
+
+    await harness.api.onSend()
+    const clientMessageId = String(rpc.call.mock.calls[0]?.[1]?.clientMessageId)
+    inputText.value = 'newer composer owner'
+    await harness.api.onSend()
+
+    expect(trackBackgroundReceiptTask).toHaveBeenCalledWith(
+      clientMessageId,
+      'manual-child-task',
+      '',
+      false,
+      true,
+      'running',
+    )
+    expect(inputText.value).toBe('newer composer owner')
   })
 
   it('does not start async queue persistence for a fork edit while work is active', async () => {

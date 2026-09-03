@@ -416,6 +416,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     clientMessageId: string
     terminalSeen: boolean
     allowProjection: boolean
+    lifecycleStatus: string
   }
 
   interface DeferredBackgroundReceiptTerminal {
@@ -424,6 +425,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     payload: SessionEventPayload
     status: string
     terminalTask: object
+    priority: number
   }
 
   const pendingBackgroundReceiptClientIds = new Set<string>()
@@ -494,6 +496,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     taskId: string,
     terminalSeen = false,
     allowProjection?: boolean,
+    lifecycleStatus = '',
   ) {
     const normalizedClientId = String(clientMessageId || '').trim()
     const normalizedTaskId = String(taskId || '').trim()
@@ -511,6 +514,12 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       clientMessageId: normalizedClientId,
       terminalSeen: terminalSeen || existing?.terminalSeen === true,
       allowProjection: allowProjection ?? existing?.allowProjection ?? false,
+      lifecycleStatus: (
+        ['running', 'approval_pending'].includes(existing?.lifecycleStatus || '')
+        && !['running', 'approval_pending'].includes(lifecycleStatus)
+      )
+        ? existing!.lifecycleStatus
+        : lifecycleStatus || existing?.lifecycleStatus || '',
     })
   }
 
@@ -520,6 +529,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     terminal: boolean | string = false,
     allowProjection = true,
     retireParentProjection = false,
+    acceptedStatus = '',
   ) {
     const normalizedClientId = String(clientMessageId || '').trim()
     const normalizedTaskId = String(taskId || '').trim()
@@ -539,26 +549,23 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     const deferredTerminal = deferredCandidate?.clientMessageId === normalizedClientId
       ? deferredCandidate
       : undefined
-    if (normalizedTaskId && (terminalStatus || retireParentProjection)) {
-      options.taskOwnership?.noteTerminal(normalizedTaskId, allowProjection)
-    }
-    if (terminalStatus) {
-      deferredBackgroundReceiptTerminals.delete(normalizedTaskId)
-      if (
-        allowProjection
-        && !reconciledBackgroundReceiptClientIds.has(normalizedClientId)
-      ) {
-        dirtyBackgroundReceiptClientIds.add(normalizedClientId)
-        flushBackgroundReceiptReconciliationIfReady()
+    if (!allowProjection) {
+      if (normalizedTaskId && (terminalStatus || retireParentProjection)) {
+        options.taskOwnership?.noteTerminal(normalizedTaskId, false)
       }
-      settleBackgroundReceiptTerminal(
-        normalizedClientId,
-        normalizedTaskId,
-        terminalStatus,
-        {},
-        allowProjection,
-      )
-    } else if (allowProjection && deferredTerminal) {
+      deferredBackgroundReceiptTerminals.delete(normalizedTaskId)
+      if (terminalStatus) {
+        settleBackgroundReceiptTerminal(
+          normalizedClientId,
+          normalizedTaskId,
+          terminalStatus,
+          {},
+          false,
+        )
+      }
+      return
+    }
+    if (deferredTerminal) {
       deferredBackgroundReceiptTerminals.delete(normalizedTaskId)
       options.taskOwnership?.noteTerminal(normalizedTaskId)
       markTaskSettled(deferredTerminal.payload)
@@ -575,8 +582,43 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         deferredTerminal.terminalTask,
         !hasContinuation,
       )
-    } else if (retireParentProjection) {
+      return
+    }
+    if (terminalStatus) {
       deferredBackgroundReceiptTerminals.delete(normalizedTaskId)
+      options.taskOwnership?.noteTerminal(normalizedTaskId)
+      if (!reconciledBackgroundReceiptClientIds.has(normalizedClientId)) {
+        dirtyBackgroundReceiptClientIds.add(normalizedClientId)
+        flushBackgroundReceiptReconciliationIfReady()
+      }
+      settleBackgroundReceiptTerminal(
+        normalizedClientId,
+        normalizedTaskId,
+        terminalStatus,
+        {},
+        true,
+      )
+      return
+    }
+    if (normalizedTaskId) {
+      const cachedStatus = backgroundReceiptTasks.get(normalizedTaskId)?.lifecycleStatus || ''
+      const lifecycleStatus = (
+        ['running', 'approval_pending'].includes(cachedStatus)
+          ? cachedStatus
+          : acceptedStatus || cachedStatus || 'queued'
+      )
+      options.taskOwnership?.noteAccepted(normalizedTaskId, lifecycleStatus)
+      if (lifecycleStatus === 'queued') {
+        options.applySessionRunState({
+          run_status: 'queued',
+          active_task: { task_id: normalizedTaskId, status: 'queued' },
+        })
+      } else if (['running', 'approval_pending'].includes(lifecycleStatus)) {
+        options.applySessionRunState({
+          run_status: lifecycleStatus,
+          active_task: { task_id: normalizedTaskId, status: lifecycleStatus },
+        })
+      }
     }
   }
 
@@ -699,6 +741,15 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     return true
   }
 
+  function deferredBackgroundReceiptTerminalPriority(
+    eventKind: ConversationSemanticEventKind | 'sessions-changed',
+    payload: SessionEventPayload,
+  ): number {
+    if (eventKind !== 'sessions-changed') return 1
+    const activeTask = payload.active_task || payload.activeTask
+    return activeTask && typeof activeTask === 'object' ? 3 : 2
+  }
+
   function suppressBackgroundReceiptEvent(
     eventKind: ConversationSemanticEventKind | 'sessions-changed',
     payload: SessionEventPayload,
@@ -715,10 +766,16 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     // client-message owner: unrelated same-session tasks from another tab must
     // remain visible and must never enter this quarantine.
     rememberBackgroundReceiptTask(owner, taskId)
-    if (eventKind === 'task-queued' && allowProjection) {
-      options.taskOwnership?.noteQueued({ ...payload, status: 'queued' })
-    } else if (eventKind === 'task-running' && allowProjection) {
-      options.taskOwnership?.noteRunning({ ...payload, status: 'running' })
+    if (eventKind === 'task-queued') {
+      rememberBackgroundReceiptTask(owner, taskId, false, undefined, 'queued')
+      if (allowProjection) {
+        options.taskOwnership?.noteQueued({ ...payload, status: 'queued' })
+      }
+    } else if (eventKind === 'task-running') {
+      rememberBackgroundReceiptTask(owner, taskId, false, undefined, 'running')
+      if (allowProjection) {
+        options.taskOwnership?.noteRunning({ ...payload, status: 'running' })
+      }
     }
     if (terminalEvent) {
       const terminalTask = terminalSessionChangeTask(payload)
@@ -735,13 +792,22 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         || (eventKind === 'turn-failed' ? 'failed' : 'succeeded')
       rememberBackgroundReceiptTask(owner, taskId, true)
       if (!allowProjection) {
-        deferredBackgroundReceiptTerminals.set(taskId, {
-          clientMessageId: owner,
-          eventKind,
-          payload,
-          status,
-          terminalTask: terminalTask || payload,
-        })
+        const priority = deferredBackgroundReceiptTerminalPriority(eventKind, payload)
+        const existing = deferredBackgroundReceiptTerminals.get(taskId)
+        if (
+          !existing
+          || priority > existing.priority
+          || (priority === existing.priority && !existing.status && Boolean(status))
+        ) {
+          deferredBackgroundReceiptTerminals.set(taskId, {
+            clientMessageId: owner,
+            eventKind,
+            payload,
+            status,
+            terminalTask: terminalTask || payload,
+            priority,
+          })
+        }
         return true
       }
       options.taskOwnership?.noteTerminal(taskId)
