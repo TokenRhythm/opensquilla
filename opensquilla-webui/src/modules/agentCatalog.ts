@@ -5,6 +5,27 @@ export interface AgentCatalogRequestOptions {
   readonly signal?: AbortSignal
 }
 
+export type AgentCatalogErrorKind =
+  | 'already-exists'
+  | 'not-found'
+  | 'immutable'
+  | 'forbidden'
+  | 'conflict'
+  | 'unavailable'
+  | 'invalid'
+
+/** Agent-management failure projected by its Gateway Adapter. */
+export class AgentCatalogError extends Error {
+  constructor(
+    readonly kind: AgentCatalogErrorKind,
+    message: string,
+    readonly cause?: unknown,
+  ) {
+    super(message)
+    this.name = 'AgentCatalogError'
+  }
+}
+
 export interface CreateAgentCommand {
   readonly id?: string
   readonly name?: string

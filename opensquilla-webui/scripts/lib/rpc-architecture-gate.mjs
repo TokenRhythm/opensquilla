@@ -15,6 +15,7 @@ import {
   generatedContractImportViolation,
   moduleReferenceSpecifier,
   privateGatewayTransportImportViolation,
+  resolveSourceImport,
 } from './rpc-architecture-imports.mjs'
 import {
   collectRpcTransportOperations,
@@ -33,6 +34,7 @@ const trackedKinds = new Set([...trackedRpcKinds, ...trackedHttpKinds])
 
 const normalized = path => path.replace(/\\/g, '/')
 const isTestFile = rel => /\.(test|spec)\.(?:[cm]?[jt]sx?)$/.test(rel)
+const isTestingSupport = rel => rel.startsWith('src/testing/')
 const isGatewayAdapter = rel => rel.startsWith('src/adapters/gateway/')
 const isGeneratedContract = rel => rel.startsWith('src/contracts/generated/')
 const isPrivateHttpTransportImplementation = rel => (
@@ -46,9 +48,6 @@ const isRpcTransportImplementation = rel => (
   rel === 'src/stores/rpc.ts'
   || rel === 'src/lib/rpc.ts'
   || rel === 'src/adapters/gateway/privateTransports.ts'
-  // This adapter is the private wildcard listener for the v4 event stream;
-  // exposing its raw `on` calls to a composable would defeat the seam.
-  || rel === 'src/adapters/gateway/conversationEventTransport.ts'
 )
 
 function scriptBody(rel, body) {
@@ -128,6 +127,26 @@ export function evaluateRpcArchitectureGate({ root = defaultRoot } = {}) {
     function visit(node) {
       const specifier = moduleReferenceSpecifier(ts, node)
       if (specifier) {
+        const target = resolveSourceImport(root, rel, specifier)
+        const targetRel = target ? normalized(relative(root, target)).replace(/\.(?:vue|[cm]?[jt]sx?)$/, '') : ''
+        if (
+          targetRel === 'src/lib/rpc'
+          && rel !== 'src/stores/rpc.ts'
+          && rel !== 'src/adapters/gateway/privateTransports.ts'
+          && !isTestFile(rel)
+          && !isTestingSupport(rel)
+        ) {
+          failures.push(`${rel}: lib/rpc may be imported only by the RPC store or private Gateway transport.`)
+        }
+        if (
+          targetRel.startsWith('src/adapters/gateway/')
+          && !isGatewayAdapter(rel)
+          && rel !== 'src/main.ts'
+          && !isTestFile(rel)
+          && !isTestingSupport(rel)
+        ) {
+          failures.push(`${rel}: Gateway Adapters may be imported only by the composition root or tests.`)
+        }
         const generatedFailure = generatedContractImportViolation({
           root, importer: rel, specifier,
         })

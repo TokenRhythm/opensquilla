@@ -8,12 +8,13 @@ import type {
 } from '@/types/parts'
 import { clarifyRequestFromValue, userInputOutcomeFromValue } from '@/utils/chat/clarify'
 import { isCurrentSessionPayload } from '@/utils/chat/streamEvents'
-import type {
-  ApprovalCenter,
-  ApprovalAvailability,
-  ApprovalEvent,
-  ApprovalItem,
-  ApprovalDecision,
+import {
+  ApprovalCenterError,
+  type ApprovalCenter,
+  type ApprovalAvailability,
+  type ApprovalEvent,
+  type ApprovalItem,
+  type ApprovalDecision,
 } from '@/modules/approvalCenter'
 import type { ClarificationSubmission } from '@/modules/clarificationSubmission'
 import type { ConversationEventHub } from '@/modules/conversationEventHub'
@@ -395,9 +396,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   }
 
   function isMethodNotFound(error: unknown): boolean {
-    const candidate = error as { code?: unknown; message?: unknown } | null
-    return candidate?.code === 'METHOD_NOT_FOUND'
-      || /method not found/i.test(error instanceof Error ? error.message : String(candidate?.message || error))
+    return error instanceof ApprovalCenterError && error.kind === 'unsupported'
   }
 
   function applyApprovalStatus(id: string, payload: ApprovalStatusPayload, generation: number) {

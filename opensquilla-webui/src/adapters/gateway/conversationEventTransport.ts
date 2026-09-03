@@ -1,4 +1,3 @@
-import type { RpcEventHandler } from '@/lib/rpc'
 import type { ConversationEventSourceHandlers } from '@/modules/conversationEventHub'
 import type {
   ConversationEvent,
@@ -9,6 +8,14 @@ import {
   conversationSemanticEventKind,
   decodeConversationEvent,
 } from './conversationEventsV4'
+import type { TransportEventHandler } from './transportTypes'
+
+interface ConversationEventWireSource {
+  subscribe(
+    event: string,
+    handler: TransportEventHandler,
+  ): { close(): void }
+}
 
 /**
  * A semantic event message is the only event shape that leaves the v4 adapter.
@@ -41,17 +48,13 @@ function rawSessionKey(payload: unknown): string | null {
   return null
 }
 
-type RpcSubscriptionClient = {
-  on(event: string, handler: RpcEventHandler): () => void
-}
-
 /** Create the one WebSocket event listener used by the Conversation lane. */
-export function createConversationEventTransport(rpc: RpcSubscriptionClient) {
+export function createConversationEventTransport(events: ConversationEventWireSource) {
   let detach: (() => void) | null = null
 
   function subscribe(handlers: ConversationEventTransportHandlers): () => void {
     detach?.()
-    const onEvent: RpcEventHandler = (
+    const onEvent: TransportEventHandler = (
       rawEvent: unknown,
       rawPayload: unknown,
       rawMeta: unknown,
@@ -103,13 +106,13 @@ export function createConversationEventTransport(rpc: RpcSubscriptionClient) {
       }
     }
 
-    const offWildcard = rpc.on('*', onEvent)
-    const offState = rpc.on('_state', (state: unknown) => {
-      handlers.onConnectionState?.(String(state))
+    const wildcard = events.subscribe('*', onEvent)
+    const state = events.subscribe('_state', (connectionState: unknown) => {
+      handlers.onConnectionState?.(String(connectionState))
     })
     detach = () => {
-      offWildcard()
-      offState()
+      wildcard.close()
+      state.close()
       detach = null
     }
     return detach

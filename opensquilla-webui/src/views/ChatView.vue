@@ -917,7 +917,7 @@ import {
   acquireSessionBootstrapAdmission,
   claimSessionBootstrapAdmission,
   optionalSessionRpcAllowed,
-  optionalSessionRpcCallOptions,
+  optionalSessionReadOptions,
 } from '@/composables/chat/sessionBootstrapAdmission'
 import { useChatSessionRuntime } from '@/composables/chat/useChatSessionRuntime'
 import {
@@ -1042,7 +1042,11 @@ import {
   artifactWorkbenchPreviewKind,
 } from '@/utils/workbench/artifactPreview'
 import { findArtifactCard, focusArtifactInTranscript } from '@/utils/chat/artifactFocus'
-import { classifyArtifactProductError } from '@/utils/artifactProductErrors'
+import {
+  ArtifactProductFailure,
+  artifactProductReasonCode,
+  classifyArtifactProductError,
+} from '@/utils/artifactProductErrors'
 import {
   persistDeferredMetaDraft,
   takeDeferredMetaDrafts,
@@ -1403,12 +1407,6 @@ async function discardPromptAnnotation(annotationId: string) {
   }
 }
 
-function promptAnnotationRpcErrorCode(error: unknown): string {
-  if (!error || typeof error !== 'object') return ''
-  const code = (error as { code?: unknown }).code
-  return typeof code === 'string' ? code : ''
-}
-
 async function jumpPromptAnnotation(annotationId: string) {
   const annotation = artifactPromptAnnotationsStore.annotations[annotationId]
   if (!annotation) return
@@ -1424,11 +1422,15 @@ async function jumpPromptAnnotation(annotationId: string) {
   try {
     await artifactPromptAnnotationsStore.focus(annotationId)
   } catch (error) {
-    if (promptAnnotationRpcErrorCode(error) === 'ARTIFACT_REVISION_CHANGED') {
+    const failure = error instanceof ArtifactProductFailure ? error : null
+    if (failure?.code === 'DOCUMENT_CHANGED') {
       pushToast(t('chat.promptAnnotations.focusUnavailable'), { tone: 'warn' })
       return
     }
-    if (promptAnnotationRpcErrorCode(error) === 'ARTIFACT_ANNOTATION_NOT_DRAFT') {
+    if (
+      failure?.code === 'ANNOTATION_UNAVAILABLE'
+      && artifactProductReasonCode(failure) === 'not_draft'
+    ) {
       await artifactPromptAnnotationsStore.load(annotation.sessionKey, { force: true })
     }
     pushToast(t('chat.promptAnnotations.focusUnavailable'), { tone: 'warn' })
@@ -2084,7 +2086,7 @@ watch(compactStatus, (status) => {
 
 const chatUsageWidget = useChatUsageWidget({
   usageReporting,
-  readCallOptions: optionalSessionRpcCallOptions,
+  readOptions: optionalSessionReadOptions,
   sessionKey,
   tokenVizEnabled: () => appStore.features.tokenViz,
 })
@@ -2115,7 +2117,7 @@ const {
 const chatFeatureToggles = useChatFeatureToggles({
   appSettings: injectedAppSettings,
   modelRouting: injectedProviderConfiguration,
-  readCallOptions: optionalSessionRpcCallOptions,
+  readOptions: optionalSessionReadOptions,
   setGlobalElevatedMode,
   loadCurrentSessionUsage,
 })
@@ -3204,7 +3206,7 @@ const chatSlashCommands = useChatSlashCommands({
   usageReporting,
   sessionMaintenance,
   metaRunCenter,
-  catalogCallOptions: optionalSessionRpcCallOptions,
+  catalogCallOptions: optionalSessionReadOptions,
   inputText,
   sessionKey,
   autoResizeTextarea,
@@ -6378,8 +6380,6 @@ async function validateActiveProjectBeforeSend(): Promise<string | null> {
     const workspaces = await projectWorkspaces.loadWorkspaces({
       timeoutMs: Math.max(1, deadlineAt - Date.now()),
       signal: controller.signal,
-      timeoutAction: 'reconnect',
-      abortAction: 'reject',
     })
     if (sessionKey.value !== key || boundWorkspaceId.value !== workspaceId) {
       return activeWorkspaceSendBlockedReason.value || 'resolving'
@@ -6444,8 +6444,6 @@ async function syncDraftProjectFromRoute(generation: number): Promise<boolean> {
     await projectWorkspaces.loadWorkspaces({
       timeoutMs: Math.max(1, deadlineAt - Date.now()),
       signal: controller.signal,
-      timeoutAction: 'reconnect',
-      abortAction: 'reject',
     })
     if (!draftProjectHydrationIsCurrent(generation, workspaceId)) return false
     const workspace = projectWorkspaces.byId.value.get(workspaceId)

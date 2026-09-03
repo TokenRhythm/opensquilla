@@ -1,4 +1,4 @@
-import type { RpcCallOptions } from '@/lib/rpc'
+import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import {
   SKILLS_LIST_METHOD,
   type Params as SkillsListParams,

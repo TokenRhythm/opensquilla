@@ -3,7 +3,7 @@ import { ref } from 'vue'
 
 import type { MetaSetupJob, MetaSetupReadiness } from '@/types/metaSetup'
 import type { HiddenControlDispatchResult } from '@/types/chat'
-import type { MetaRunCenter } from '@/modules/metaRunCenter'
+import { MetaRunCenterError, type MetaRunCenter } from '@/modules/metaRunCenter'
 import {
   META_SETUP_PROVIDER_HANDOFF_TTL_MS,
   metaSetupLaunchStorageKey,
@@ -941,11 +941,10 @@ describe('useMetaSkillSetup', () => {
     const clientRequestId = first.api.beginProviderHandoff('openrouter')
     first.api.dispose()
 
-    const discarded = Object.assign(new Error('The saved request was already discarded.'), {
-      code: 'META_DRAFT_DISCARDED',
-      retryable: false,
-      accepted: false,
-    })
+    const discarded = new MetaRunCenterError(
+      'draft-discarded',
+      'The saved request was already discarded.',
+    )
     const restoreDraft = vi.fn()
     const forgetHiddenControl = vi.fn()
     const call = vi.fn(async (method: string) => {

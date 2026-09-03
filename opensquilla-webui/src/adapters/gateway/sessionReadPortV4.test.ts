@@ -16,9 +16,11 @@ import {
 import { SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD } from '@/contracts/generated/v4/sessionsMessagesUnsubscribe'
 import {
   SessionReadContractError,
+  SessionReadFailure,
   SessionReadSessionMissingError,
 } from '@/modules/sessionReadLifecycle'
 import { createV4SessionReadPort } from './sessionReadPortV4'
+import { mapSessionReadError } from './sessionReadErrorMapping'
 
 type Call = {
   method: string
@@ -258,6 +260,19 @@ async function flushAsyncWork() {
 }
 
 describe('v4 SessionReadPort Adapter', () => {
+  it('preserves the established retryability of coded and uncoded failures', () => {
+    expect(mapSessionReadError(Object.assign(new Error('invalid'), {
+      code: 'INVALID_REQUEST',
+    }))).toMatchObject({
+      kind: 'unavailable',
+      retryable: false,
+    } satisfies Partial<SessionReadFailure>)
+    expect(mapSessionReadError(new Error('connection recycled'))).toMatchObject({
+      kind: 'unavailable',
+      retryable: true,
+    } satisfies Partial<SessionReadFailure>)
+  })
+
   it('queues critical frames in order while live, metadata and history settle independently', async () => {
     const harness = makeHarness()
     const subscribe = deferred<SessionsMessagesSubscribeResult>()
@@ -680,7 +695,10 @@ describe('v4 SessionReadPort Adapter', () => {
     ready.resolve(undefined)
 
     await expect(closing).resolves.toBeUndefined()
-    await expect(lease.live).rejects.toMatchObject({ name: 'AbortError' })
+    await expect(lease.live).rejects.toMatchObject({
+      name: 'SessionReadFailure',
+      kind: 'aborted',
+    })
     expect(harness.calls).toHaveLength(0)
   })
 

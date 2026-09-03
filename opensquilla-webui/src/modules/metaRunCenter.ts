@@ -188,7 +188,14 @@ export interface MetaRunSubscription {
   close(): void
 }
 
-export type MetaRunErrorCode = 'not-found' | 'unsupported' | 'forbidden' | 'conflict' | 'unavailable' | 'invalid'
+export type MetaRunErrorCode =
+  | 'not-found'
+  | 'unsupported'
+  | 'forbidden'
+  | 'conflict'
+  | 'unavailable'
+  | 'invalid'
+  | 'draft-discarded'
 
 export class MetaRunCenterError extends Error {
   readonly name = 'MetaRunCenterError'

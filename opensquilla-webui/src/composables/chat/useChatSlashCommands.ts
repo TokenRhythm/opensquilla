@@ -1,7 +1,10 @@
 import { computed, ref, type Ref } from 'vue'
 import i18n from '@/i18n'
-import type { RpcClientError } from '@/lib/rpc'
-import type { MetaLaunchDraftPayload, MetaRunCenter } from '@/modules/metaRunCenter'
+import {
+  MetaRunCenterError,
+  type MetaLaunchDraftPayload,
+  type MetaRunCenter,
+} from '@/modules/metaRunCenter'
 import type { CommandCatalog } from '@/modules/commandCatalog'
 import type {
   UsageReporting,
@@ -415,12 +418,11 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       )
       return 'failed'
     } catch (err: unknown) {
-      const rpcError = err as RpcClientError | undefined
-      if (rpcError?.code === 'META_DRAFT_DISCARDED') {
+      if (err instanceof MetaRunCenterError && err.code === 'draft-discarded') {
         // Another tab already committed the user's cancellation. This identity
         // is terminal: never recreate a setup card or a sendable composer copy.
         options.notify(i18n.global.t('chat.metaRuns.couldNotRunSkillError', {
-          error: rpcError.message,
+          error: err.message,
         }))
         return 'discarded'
       }

@@ -7,7 +7,10 @@ import type {
   ModelRoutingCapabilitiesByMode,
   ModelRoutingMode,
 } from '@/types/modelRouting'
-import type { ModelRoutingSnapshot } from '@/modules/providerConfiguration'
+import {
+  ProviderConfigurationError,
+  type ModelRoutingSnapshot,
+} from '@/modules/providerConfiguration'
 
 type RpcResult = Record<string, unknown> | Error | Promise<unknown>
 
@@ -61,7 +64,10 @@ function createHarness(options: {
     }
     if (method === 'models.routing.get') {
       if (options.hasRpcMethod?.('models.routing.get') === false) {
-        throw Object.assign(new Error('method not found'), { code: 'METHOD_NOT_FOUND' })
+        throw new ProviderConfigurationError(
+          'unsupported',
+          'Model routing is unsupported.',
+        )
       }
       const result = routingGetResults.shift()
       if (result === undefined) throw new Error('canonical routing unavailable')
@@ -104,7 +110,7 @@ function createHarness(options: {
       }),
       subscribeChanged,
     },
-    readCallOptions: options.readCallOptions,
+    readOptions: options.readCallOptions,
     setGlobalElevatedMode,
     loadCurrentSessionUsage,
   })

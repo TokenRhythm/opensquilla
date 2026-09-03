@@ -84,7 +84,9 @@ describe('transport architecture hard-zero integration', () => {
       `,
     })
     expect(evaluateRpcArchitectureGate({ root }).failures).toEqual([
+      'src/alpha.ts: lib/rpc may be imported only by the RPC store or private Gateway transport.',
       'src/alpha.ts: unexpected raw transport call (1); add a domain Adapter instead.',
+      'src/zeta.ts: lib/rpc may be imported only by the RPC store or private Gateway transport.',
       'src/zeta.ts: unexpected raw transport call (1); add a domain Adapter instead.',
     ])
   })

@@ -1,8 +1,8 @@
 import type {
-  RpcCallOptions,
-  RpcConnectionWaitOptions,
-  RpcEventHandler,
-} from '@/lib/rpc'
+  TransportCallOptions,
+  TransportConnectionWaitOptions,
+  TransportEventHandler,
+} from './transportTypes'
 
 /**
  * Raw v4 transport capabilities.
@@ -15,7 +15,7 @@ export interface RpcTransport {
   request<T = unknown>(
     method: string,
     params?: Record<string, unknown>,
-    options?: RpcCallOptions,
+    options?: TransportCallOptions,
   ): Promise<T>
   ready(options?: TransportReadyOptions): Promise<void>
   supports(method: string): boolean
@@ -24,11 +24,11 @@ export interface RpcTransport {
 }
 
 export interface EventTransport {
-  subscribe(event: string, handler: RpcEventHandler): TransportSubscription
+  subscribe(event: string, handler: TransportEventHandler): TransportSubscription
   supports(event: string): boolean
 }
 
-export interface TransportReadyOptions extends RpcConnectionWaitOptions {
+export interface TransportReadyOptions extends TransportConnectionWaitOptions {
   timeoutMs?: number
   signal?: AbortSignal
 }
@@ -42,21 +42,55 @@ export interface GatewayTransports {
   readonly events: EventTransport
 }
 
+export interface TransportFailure {
+  readonly message: string
+  readonly code?: string
+  readonly details?: unknown
+  readonly retryable?: boolean
+  readonly retryAfterMs?: number
+  readonly accepted?: boolean | null
+}
+
+/** Read a rejected wire request without allowing its error shape past an Adapter. */
+export function readTransportFailure(error: unknown): TransportFailure {
+  const source = error && typeof error === 'object'
+    ? error as Record<string, unknown>
+    : null
+  const data = source?.data && typeof source.data === 'object' && !Array.isArray(source.data)
+    ? source.data as Record<string, unknown>
+    : null
+  const code = source?.code ?? data?.code
+  const retryAfter = source?.retry_after_ms ?? source?.retryAfterMs
+  const accepted = source?.accepted
+  return {
+    message: error instanceof Error ? error.message : String(error ?? ''),
+    ...(typeof code === 'string' && code ? { code } : {}),
+    ...(source && Object.prototype.hasOwnProperty.call(source, 'details')
+      ? { details: source.details }
+      : {}),
+    ...(typeof source?.retryable === 'boolean' ? { retryable: source.retryable } : {}),
+    ...(typeof retryAfter === 'number' && Number.isFinite(retryAfter)
+      ? { retryAfterMs: Math.max(0, retryAfter) }
+      : {}),
+    ...(accepted === true || accepted === false || accepted === null ? { accepted } : {}),
+  }
+}
+
 interface RpcStoreTransportSource {
   readonly connectionGeneration: number
   call<T = unknown>(
     method: string,
     params?: Record<string, unknown>,
-    options?: RpcCallOptions,
+    options?: TransportCallOptions,
   ): Promise<T>
-  on(event: string, handler: RpcEventHandler): () => void
+  on(event: string, handler: TransportEventHandler): () => void
   hasRpcMethod(method: string): boolean
   hasRpcEvent(event: string): boolean
   rememberUnsupportedMethod(method: string): void
   ready(
     timeoutMs?: number,
     signal?: AbortSignal,
-    actions?: RpcConnectionWaitOptions,
+    actions?: TransportConnectionWaitOptions,
   ): Promise<void>
 }
 

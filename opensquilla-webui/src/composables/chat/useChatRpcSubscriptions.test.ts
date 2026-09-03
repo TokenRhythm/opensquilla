@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { useChatRpcSubscriptions } from './useChatRpcSubscriptions'
-import type { RpcEventHandler } from '@/lib/rpc'
+import type { TransportEventHandler } from '@/adapters/gateway/transportTypes'
 import { createConversationEventHub } from '@/modules/conversationEventHub'
 import {
   createConversationEventTransport,
@@ -9,13 +9,13 @@ import {
 } from '@/adapters/gateway/conversationEventTransport'
 
 function rpcHarness() {
-  const listeners = new Map<string, Set<RpcEventHandler>>()
+  const listeners = new Map<string, Set<TransportEventHandler>>()
   const rpc = {
-    on(event: string, handler: RpcEventHandler) {
-      const bucket = listeners.get(event) ?? new Set<RpcEventHandler>()
+    subscribe(event: string, handler: TransportEventHandler) {
+      const bucket = listeners.get(event) ?? new Set<TransportEventHandler>()
       bucket.add(handler)
       listeners.set(event, bucket)
-      return () => bucket.delete(handler)
+      return { close: () => { bucket.delete(handler) } }
     },
     emit(event: string, ...args: unknown[]) {
       for (const handler of listeners.get(event) ?? []) handler(...args)

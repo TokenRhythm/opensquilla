@@ -1,4 +1,5 @@
-import type { RpcCallOptions } from '@/lib/rpc'
+import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
+import { readTransportFailure } from './privateTransports'
 import type {
   ModelCatalogResult,
   ModelDescriptor,
@@ -12,6 +13,7 @@ import type {
   ProviderModelProbe,
   RoutingMode,
 } from '@/modules/providerConfiguration'
+import { ProviderConfigurationError } from '@/modules/providerConfiguration'
 import { MODELS_ROUTING_GET_METHOD } from '@/contracts/generated/v4/modelsRoutingGet'
 import { validateResult as validateModelsRoutingGetResult } from '@/contracts/generated/v4/modelsRoutingGetValidators.mjs'
 import { MODELS_LIST_METHOD } from '@/contracts/generated/v4/modelsList'
@@ -42,6 +44,37 @@ const record = (value: unknown): Record<string, unknown> => (
     ? value as Record<string, unknown>
     : {}
 )
+
+function mapProviderError(error: unknown): ProviderConfigurationError {
+  if (error instanceof ProviderConfigurationError) return error
+  const failure = readTransportFailure(error)
+  const code = failure.code
+  const domainCode = code === 'METHOD_NOT_FOUND'
+    ? 'unsupported'
+    : code === 'NOT_FOUND'
+      ? 'not-found'
+      : code === 'UNAUTHORIZED' || code === 'FORBIDDEN'
+        ? 'forbidden'
+        : code?.includes('CONFLICT')
+          ? 'conflict'
+          : code?.startsWith('INVALID_')
+            ? 'invalid'
+            : 'unavailable'
+  return new ProviderConfigurationError(domainCode, failure.message, error)
+}
+
+async function requestProvider<T>(
+  rpc: RpcTransport,
+  method: string,
+  params: Record<string, unknown> | undefined,
+  requestOptions: RpcCallOptions,
+): Promise<T> {
+  try {
+    return await rpc.request<T>(method, params, requestOptions)
+  } catch (error) {
+    throw mapProviderError(error)
+  }
+}
 
 function providerCatalog(value: unknown): ProviderDescriptor[] {
   const raw = record(value)
@@ -175,12 +208,12 @@ export function createV4ProviderConfiguration(
 ): ProviderConfiguration {
   return {
     async catalog(request) {
-      const result = await rpc.request(ONBOARDING_CATALOG_METHOD, undefined, options(request?.signal))
+      const result = await requestProvider(rpc, ONBOARDING_CATALOG_METHOD, undefined, options(request?.signal))
       if (!validateOnboardingCatalogResult(result)) throw new Error(`${ONBOARDING_CATALOG_METHOD} returned an invalid response`)
       return providerCatalog(result)
     },
     async list(request) {
-      const result = await rpc.request(MODELS_LIST_METHOD, undefined, options(request?.signal))
+      const result = await requestProvider(rpc, MODELS_LIST_METHOD, undefined, options(request?.signal))
       if (!validateModelsListResult(result)) throw new Error(`${MODELS_LIST_METHOD} returned an invalid response`)
       return modelCatalog(result)
     },
@@ -191,12 +224,12 @@ export function createV4ProviderConfiguration(
         ...(request?.probeModels !== undefined ? { probeModels: request.probeModels } : {}),
       }
       if (!validateProvidersStatusParams(params)) throw new Error(`${PROVIDERS_STATUS_METHOD} params are invalid`)
-      const result = await rpc.request(PROVIDERS_STATUS_METHOD, params, options(request?.signal))
+      const result = await requestProvider(rpc, PROVIDERS_STATUS_METHOD, params, options(request?.signal))
       if (!validateProvidersStatusResult(result)) throw new Error(`${PROVIDERS_STATUS_METHOD} returned an invalid response`)
       return status(result)
     },
     async get(request) {
-      const result = await rpc.request(MODELS_ROUTING_GET_METHOD, undefined, options(request?.signal))
+      const result = await requestProvider(rpc, MODELS_ROUTING_GET_METHOD, undefined, options(request?.signal))
       if (!validateModelsRoutingGetResult(result)) throw new Error(`${MODELS_ROUTING_GET_METHOD} returned an invalid response`)
       return routing(result)
     },
@@ -206,7 +239,7 @@ export function createV4ProviderConfiguration(
       }
       const params = { mode }
       if (!validateModelsRoutingSetParams(params)) throw new Error(`${MODELS_ROUTING_SET_METHOD} params are invalid`)
-      const result = await rpc.request(MODELS_ROUTING_SET_METHOD, params, options(request?.signal))
+      const result = await requestProvider(rpc, MODELS_ROUTING_SET_METHOD, params, options(request?.signal))
       if (!validateModelsRoutingSetResult(result)) throw new Error(`${MODELS_ROUTING_SET_METHOD} returned an invalid response`)
       return routing(result)
     },
@@ -218,10 +251,10 @@ export function createV4ProviderConfiguration(
     },
     credentials: {
       async reveal(providerId, request) {
-        return record(await rpc.request('onboarding.provider.credential.reveal', { providerId }, options(request?.signal)))
+        return record(await requestProvider(rpc, 'onboarding.provider.credential.reveal', { providerId }, options(request?.signal)))
       },
       async clear(providerId, request) {
-        return record(await rpc.request('onboarding.provider.credential.clear', { providerId }, options(request?.signal)))
+        return record(await requestProvider(rpc, 'onboarding.provider.credential.clear', { providerId }, options(request?.signal)))
       },
     },
   }

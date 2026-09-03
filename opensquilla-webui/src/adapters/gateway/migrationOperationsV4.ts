@@ -1,10 +1,14 @@
-import type { RpcCallOptions } from '@/lib/rpc'
+import {
+  readTransportFailure,
+} from './privateTransports'
+import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import type {
   GatewayMigrationCandidate,
   GatewayMigrationPreview,
   GatewayMigrationSources,
   MigrationOperations,
 } from '@/modules/migrationOperations'
+import { MigrationOperationsError } from '@/modules/migrationOperations'
 import { MIGRATION_SOURCES_LIST_METHOD } from '@/contracts/generated/v4/migrationSourcesList'
 import { validateResult as validateMigrationSourcesListResult } from '@/contracts/generated/v4/migrationSourcesListValidators.mjs'
 import { MIGRATION_SOURCES_PREVIEW_METHOD } from '@/contracts/generated/v4/migrationSourcesPreview'
@@ -86,23 +90,69 @@ function preview(value: unknown): GatewayMigrationPreview {
   }
 }
 
+function mapMigrationError(error: unknown): MigrationOperationsError {
+  if (error instanceof MigrationOperationsError) return error
+  const failure = readTransportFailure(error)
+  const code = failure.code?.toUpperCase()
+  const kind = code === 'METHOD_NOT_FOUND' || code === 'UNSUPPORTED'
+    ? 'unsupported'
+    : code === 'UNAUTHORIZED' || code === 'FORBIDDEN'
+      ? 'forbidden'
+      : code === 'INVALID_PARAMS' || code === 'INVALID_REQUEST'
+        ? 'invalid'
+        : 'unavailable'
+  return new MigrationOperationsError(kind, failure.message, error)
+}
+
+async function requestMigration<T>(
+  rpc: RpcTransport,
+  method: string,
+  params: Record<string, unknown>,
+  requestOptions: RpcCallOptions,
+): Promise<T> {
+  try {
+    return await rpc.request<T>(method, params, requestOptions)
+  } catch (error) {
+    throw mapMigrationError(error)
+  }
+}
+
 export function createV4MigrationOperations(rpc: RpcTransport): MigrationOperations {
   return {
     async listSources(request) {
-      const result = await rpc.request(MIGRATION_SOURCES_LIST_METHOD, {}, options(request?.signal))
+      const result = await requestMigration(
+        rpc,
+        MIGRATION_SOURCES_LIST_METHOD,
+        {},
+        options(request?.signal),
+      )
       if (!validateMigrationSourcesListResult(result)) {
-        throw new Error(`${MIGRATION_SOURCES_LIST_METHOD} returned an invalid response`)
+        throw new MigrationOperationsError(
+          'invalid',
+          `${MIGRATION_SOURCES_LIST_METHOD} returned an invalid response`,
+        )
       }
       return sources(result)
     },
     async preview(candidateId, request) {
       const params = { candidateId: candidateId.trim() }
       if (!validateMigrationSourcesPreviewParams(params)) {
-        throw new Error(`${MIGRATION_SOURCES_PREVIEW_METHOD} params are invalid`)
+        throw new MigrationOperationsError(
+          'invalid',
+          `${MIGRATION_SOURCES_PREVIEW_METHOD} params are invalid`,
+        )
       }
-      const result = await rpc.request(MIGRATION_SOURCES_PREVIEW_METHOD, params, options(request?.signal))
+      const result = await requestMigration(
+        rpc,
+        MIGRATION_SOURCES_PREVIEW_METHOD,
+        params,
+        options(request?.signal),
+      )
       if (!validateMigrationSourcesPreviewResult(result)) {
-        throw new Error(`${MIGRATION_SOURCES_PREVIEW_METHOD} returned an invalid response`)
+        throw new MigrationOperationsError(
+          'invalid',
+          `${MIGRATION_SOURCES_PREVIEW_METHOD} returned an invalid response`,
+        )
       }
       return preview(result)
     },

@@ -24,7 +24,7 @@ describe('useChatUsageWidget background reads', () => {
     }
     const api = useChatUsageWidget({
       usageReporting: usageReportingFromTestRpc(rpc),
-      readCallOptions,
+      readOptions: readCallOptions,
       sessionKey: ref('agent:main:webchat:usage'),
       tokenVizEnabled: () => false,
     })

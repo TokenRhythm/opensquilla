@@ -1,7 +1,6 @@
 import { getCurrentScope, onScopeDispose, ref, watch, type Ref } from 'vue'
 
-import type { RpcClientError } from '@/lib/rpc'
-import type { MetaRunCenter } from '@/modules/metaRunCenter'
+import { MetaRunCenterError, type MetaRunCenter } from '@/modules/metaRunCenter'
 import type {
   MetaSetupInstallResponse,
   MetaSetupJob,
@@ -325,8 +324,7 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
       )
     } catch (error) {
       if (!isCurrent(token) || !setupState.value) return
-      const rpcError = error as RpcClientError | undefined
-      if (rpcError?.code === 'META_DRAFT_DISCARDED') {
+      if (error instanceof MetaRunCenterError && error.code === 'draft-discarded') {
         // A cancellation committed in another tab wins over this stale setup
         // checkpoint. Consume it terminally without restoring sendable text.
         removePendingMetaDiscard(sessionKey, stableClientRequestId, discardStorage)

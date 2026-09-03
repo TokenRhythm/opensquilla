@@ -2,7 +2,7 @@ import { nextTick, ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
-import type { ArtifactCatalog } from '@/modules/artifactWorkbench'
+import { ArtifactCatalogError, type ArtifactCatalog } from '@/modules/artifactWorkbench'
 import type { ArtifactPayload } from '@/types/artifacts'
 import type { ChatMessage } from '@/types/chat'
 import { mergeArtifactSources, useSessionArtifacts } from './useSessionArtifacts'
@@ -64,10 +64,13 @@ function makeHarness(options: {
           abortAction: 'reject',
         })
       } catch (error) {
-        if (error && typeof error === 'object') {
-          ;(error as { artifactCatalogPhase?: string }).artifactCatalogPhase = 'connect'
-        }
-        throw error
+        const code = (error as { code?: unknown } | null)?.code
+        throw new ArtifactCatalogError(
+          code === 'RPC_TIMEOUT' ? 'timeout' : 'unavailable',
+          'connect',
+          error instanceof Error ? error.message : String(error),
+          error,
+        )
       }
       if (!rpc.hasRpcMethod('artifacts.list')) return null
       const visited = new Set<string>()
@@ -108,10 +111,12 @@ function makeHarness(options: {
           rpc.rememberUnsupportedMethod('artifacts.list')
           return null
         }
-        if (error && typeof error === 'object') {
-          ;(error as { artifactCatalogPhase?: string }).artifactCatalogPhase = 'list'
-        }
-        throw error
+        throw new ArtifactCatalogError(
+          code === 'RPC_TIMEOUT' ? 'timeout' : 'unavailable',
+          'list',
+          error instanceof Error ? error.message : String(error),
+          error,
+        )
       }
     },
   }

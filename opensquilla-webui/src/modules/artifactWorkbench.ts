@@ -144,6 +144,22 @@ export interface ArtifactCatalog {
   ): Promise<ArtifactPayload[] | null>
 }
 
+export type ArtifactCatalogErrorKind = 'aborted' | 'timeout' | 'unavailable' | 'invalid'
+export type ArtifactCatalogPhase = 'connect' | 'list'
+
+/** Artifact-index read failure projected by the Gateway Adapter. */
+export class ArtifactCatalogError extends Error {
+  constructor(
+    readonly kind: ArtifactCatalogErrorKind,
+    readonly phase: ArtifactCatalogPhase,
+    message: string,
+    readonly cause?: unknown,
+  ) {
+    super(message)
+    this.name = 'ArtifactCatalogError'
+  }
+}
+
 export interface ArtifactWorkbenchSubscription {
   close(): void
 }

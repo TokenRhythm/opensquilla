@@ -291,7 +291,7 @@ import { isAgentBuiltin, useAgentDrawer } from '@/composables/agents/useAgentDra
 import { useDialogA11y } from '@/composables/useDialogA11y'
 import type { Agent } from '@/types/agents'
 import { useToasts } from '@/composables/useToasts'
-import { AGENT_CATALOG_KEY } from '@/modules/agentCatalog'
+import { AGENT_CATALOG_KEY, AgentCatalogError } from '@/modules/agentCatalog'
 import type { CreateAgentCommand } from '@/modules/agentCatalog'
 
 // ---------------------------------------------------------------------------
@@ -401,8 +401,8 @@ async function onInlineAdd() {
     newName.value = ''
     await loadData()
   } catch (err: unknown) {
-    const code = rpcErrorCode(err)
-    if (code === 'agent.exists') pushToast(t('console.agents.toastExists', { id }), { tone: 'danger' })
+    const kind = agentCatalogErrorKind(err)
+    if (kind === 'already-exists') pushToast(t('console.agents.toastExists', { id }), { tone: 'danger' })
     else pushToast(t('console.agents.toastCreateFailed', { msg: errorMessage(err) }), { tone: 'danger' })
   }
 }
@@ -440,11 +440,11 @@ async function onSave() {
       applyUpdatedAgent(updated)
     }
   } catch (err: unknown) {
-    const code = rpcErrorCode(err)
+    const kind = agentCatalogErrorKind(err)
     const msg = errorMessage(err)
     let friendly = t('console.agents.toastSaveFailed', { msg })
-    if (code === 'agent.not_found') friendly = t('console.agents.toastNotFound', { id: drawerAgentId.value })
-    if (code === 'agent.builtin_immutable') friendly = t('console.agents.toastBuiltinImmutable', { id: drawerAgentId.value })
+    if (kind === 'not-found') friendly = t('console.agents.toastNotFound', { id: drawerAgentId.value })
+    if (kind === 'immutable') friendly = t('console.agents.toastBuiltinImmutable', { id: drawerAgentId.value })
     pushToast(friendly, { tone: 'danger' })
   } finally {
     saving.value = false
@@ -517,10 +517,8 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
 
-function rpcErrorCode(err: unknown): string {
-  if (!err || typeof err !== 'object' || !('code' in err)) return ''
-  const code = (err as { code?: unknown }).code
-  return typeof code === 'string' ? code : ''
+function agentCatalogErrorKind(err: unknown): AgentCatalogError['kind'] | null {
+  return err instanceof AgentCatalogError ? err.kind : null
 }
 </script>
 

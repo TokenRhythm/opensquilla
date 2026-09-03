@@ -10,6 +10,10 @@ function isTestFile(importer) {
   return /\.(test|spec)\.(?:[cm]?[jt]sx?)$/.test(importer)
 }
 
+function isTestingSupport(importer) {
+  return importer.startsWith('src/testing/')
+}
+
 function isGatewayAdapter(importer) {
   return importer.startsWith('src/adapters/gateway/')
 }
@@ -458,7 +462,7 @@ export function collectBoundaryArchitectureViolations({
       rel === 'src/adapters/gateway/privateTransports.ts'
       || rel === 'src/adapters/gateway/privateHttpTransport.ts'
     )
-    if (!isCompositionRoot(rel) && !isTestFile(rel)) {
+    if (!isCompositionRoot(rel) && !isTestFile(rel) && !isTestingSupport(rel)) {
       function namespaceExportsStoreFactory(name) {
         const raw = rawSymbol(name)
         const moduleSymbol = analysis.canonicalSymbol(raw) ?? raw
@@ -512,7 +516,7 @@ export function collectBoundaryArchitectureViolations({
       const isExported = Boolean(ts.getModifiers(statement)?.some(modifier => (
         modifier.kind === ts.SyntaxKind.ExportKeyword
       )))
-      if (isExported && !privateBoundaryModule) {
+      if (isExported && !privateBoundaryModule && !isTestingSupport(rel)) {
         for (const kind of exportedStatementKinds(statement)) {
           if (kind === 'generated Contract' && generated) continue
           if (
@@ -522,7 +526,11 @@ export function collectBoundaryArchitectureViolations({
           failures.push(`${rel}: exported declaration exposes ${kind} symbols.`)
         }
       }
-      if (ts.isExportAssignment(statement) && !privateBoundaryModule) {
+      if (
+        ts.isExportAssignment(statement)
+        && !privateBoundaryModule
+        && !isTestingSupport(rel)
+      ) {
         for (const kind of valueBoundaryKinds(statement.expression)) {
           if (kind === 'generated Contract' && generated) continue
           failures.push(`${rel}: default export exposes ${kind} symbols.`)
@@ -534,6 +542,7 @@ export function collectBoundaryArchitectureViolations({
         && statement.exportClause
         && ts.isNamedExports(statement.exportClause)
         && !privateBoundaryModule
+        && !isTestingSupport(rel)
       ) {
         for (const element of statement.exportClause.elements) {
           const kind = symbolOrigin(rawSymbol(element.propertyName ?? element.name))

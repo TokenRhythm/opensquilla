@@ -16,7 +16,7 @@ export interface ChatUsageAccumulator {
 
 export interface UseChatUsageWidgetOptions {
   usageReporting: UsageReporting
-  readCallOptions?: UsageReportingRequestOptions
+  readOptions?: UsageReportingRequestOptions
   sessionKey: Ref<string>
   tokenVizEnabled: () => boolean
 }
@@ -128,7 +128,7 @@ export function useChatUsageWidget(options: UseChatUsageWidgetOptions) {
     try {
       const usage = await usageReporting.status(
         options.sessionKey.value,
-        options.readCallOptions,
+        options.readOptions,
       )
       const sessions = usage?.sessions || []
       const current = sessions.find(s => (s.session || s.sessionKey || s.key) === options.sessionKey.value)

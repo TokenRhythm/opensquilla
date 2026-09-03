@@ -91,6 +91,25 @@ export interface ProviderStatusResult {
 
 export type RoutingMode = 'direct' | 'router' | 'ensemble'
 
+export type ProviderConfigurationErrorCode =
+  | 'not-found'
+  | 'unsupported'
+  | 'forbidden'
+  | 'conflict'
+  | 'unavailable'
+  | 'invalid'
+
+export class ProviderConfigurationError extends Error {
+  constructor(
+    readonly code: ProviderConfigurationErrorCode,
+    message: string,
+    readonly cause?: unknown,
+  ) {
+    super(message)
+    this.name = 'ProviderConfigurationError'
+  }
+}
+
 export interface ModelRoutingSnapshot {
   readonly mode: RoutingMode
   readonly provider?: string

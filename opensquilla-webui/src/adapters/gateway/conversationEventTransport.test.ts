@@ -1,17 +1,17 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { RpcEventHandler } from '@/lib/rpc'
+import type { TransportEventHandler } from './transportTypes'
 import { createConversationEventTransport } from './conversationEventTransport'
 
-type ListenerMap = Map<string, Set<RpcEventHandler>>
+type ListenerMap = Map<string, Set<TransportEventHandler>>
 
 function harness() {
   const listeners: ListenerMap = new Map()
   const rpc = {
-    on(event: string, handler: RpcEventHandler) {
-      const bucket = listeners.get(event) ?? new Set<RpcEventHandler>()
+    subscribe(event: string, handler: TransportEventHandler) {
+      const bucket = listeners.get(event) ?? new Set<TransportEventHandler>()
       bucket.add(handler)
       listeners.set(event, bucket)
-      return () => bucket.delete(handler)
+      return { close: () => { bucket.delete(handler) } }
     },
     emit(event: string, ...args: unknown[]) {
       for (const handler of listeners.get(event) ?? []) handler(...args)

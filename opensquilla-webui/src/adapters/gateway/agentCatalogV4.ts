@@ -1,4 +1,7 @@
-import type { RpcCallOptions } from '@/lib/rpc'
+import {
+  readTransportFailure,
+} from './privateTransports'
+import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import {
   AGENTS_LIST_METHOD,
   type Params as AgentsListParams,
@@ -28,6 +31,7 @@ import type {
   CreateAgentCommand,
   UpdateAgentCommand,
 } from '@/modules/agentCatalog'
+import { AgentCatalogError } from '@/modules/agentCatalog'
 import type { Agent } from '@/types/agents'
 
 interface RpcTransport {
@@ -71,15 +75,53 @@ function updateParams(command: UpdateAgentCommand): AgentsUpdateParams {
 }
 
 function invalid(method: string): Error {
-  return new Error(`${method} returned an invalid response`)
+  return new AgentCatalogError('invalid', `${method} returned an invalid response`)
+}
+
+function mapAgentCatalogError(error: unknown): AgentCatalogError {
+  if (error instanceof AgentCatalogError) return error
+  const failure = readTransportFailure(error)
+  const code = failure.code?.trim().toLowerCase().replace(/_/g, '.') || ''
+  const kind = code === 'agent.exists' || code === 'already.exists'
+    ? 'already-exists'
+    : code === 'agent.not.found' || code === 'not.found'
+      ? 'not-found'
+      : code === 'agent.builtin.immutable'
+        ? 'immutable'
+        : code === 'forbidden' || code === 'unauthorized'
+          ? 'forbidden'
+          : code === 'conflict'
+            ? 'conflict'
+            : code === 'invalid.params' || code === 'invalid.request'
+              ? 'invalid'
+              : 'unavailable'
+  return new AgentCatalogError(kind, failure.message, error)
+}
+
+async function requestAgentCatalog<T>(
+  rpc: RpcTransport,
+  method: string,
+  params: Record<string, unknown>,
+  options: RpcCallOptions,
+): Promise<T> {
+  try {
+    return await rpc.request<T>(method, params, options)
+  } catch (error) {
+    throw mapAgentCatalogError(error)
+  }
 }
 
 export function createV4AgentCatalog(rpc: RpcTransport): AgentCatalog {
   return {
     async list(options) {
-      await rpc.ready({ signal: options?.signal })
+      try {
+        await rpc.ready({ signal: options?.signal })
+      } catch (error) {
+        throw mapAgentCatalogError(error)
+      }
       const params: AgentsListParams = {}
-      const result = await rpc.request<AgentsListResult>(
+      const result = await requestAgentCatalog<AgentsListResult>(
+        rpc,
         AGENTS_LIST_METHOD,
         params,
         callOptions(options?.signal),
@@ -88,7 +130,8 @@ export function createV4AgentCatalog(rpc: RpcTransport): AgentCatalog {
       return result.agents as Agent[]
     },
     async create(command, options) {
-      const result = await rpc.request<AgentsCreateResult>(
+      const result = await requestAgentCatalog<AgentsCreateResult>(
+        rpc,
         AGENTS_CREATE_METHOD,
         createParams(command),
         callOptions(options?.signal),
@@ -97,7 +140,8 @@ export function createV4AgentCatalog(rpc: RpcTransport): AgentCatalog {
       return result as Agent
     },
     async update(command, options) {
-      const result = await rpc.request<AgentsUpdateResult>(
+      const result = await requestAgentCatalog<AgentsUpdateResult>(
+        rpc,
         AGENTS_UPDATE_METHOD,
         updateParams(command),
         callOptions(options?.signal),
@@ -107,7 +151,8 @@ export function createV4AgentCatalog(rpc: RpcTransport): AgentCatalog {
     },
     async remove(agentId, options) {
       const params: AgentsDeleteParams = { id: agentId }
-      const result = await rpc.request<AgentsDeleteResult>(
+      const result = await requestAgentCatalog<AgentsDeleteResult>(
+        rpc,
         AGENTS_DELETE_METHOD,
         params,
         callOptions(options?.signal),

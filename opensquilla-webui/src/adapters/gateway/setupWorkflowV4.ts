@@ -1,4 +1,5 @@
-import type { RpcCallOptions } from '@/lib/rpc'
+import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
+import { readTransportFailure } from './privateTransports'
 import type {
   CapabilitySetup,
   ProfileLifecycle,
@@ -8,6 +9,10 @@ import type {
   SetupRequestOptions,
   SetupStatus,
   SetupWorkflow,
+} from '@/modules/setupWorkflow'
+import {
+  SetupWorkflowError,
+  type SetupWorkflowFailureReason,
 } from '@/modules/setupWorkflow'
 import { ONBOARDING_CATALOG_METHOD } from '@/contracts/generated/v4/onboardingCatalog'
 import { validateResult as validateOnboardingCatalogResult } from '@/contracts/generated/v4/onboardingCatalogValidators.mjs'
@@ -35,13 +40,44 @@ const object = (result: unknown, method: string): Record<string, unknown> => {
   return result as Record<string, unknown>
 }
 
+function mapSetupError(error: unknown): SetupWorkflowError {
+  if (error instanceof SetupWorkflowError) return error
+  const failure = readTransportFailure(error)
+  const wireCode = failure.code ?? ''
+  const unsupported = wireCode === 'METHOD_NOT_FOUND'
+    || /method.*not found|unknown method|not registered/i.test(failure.message)
+  const code = unsupported
+    ? 'unsupported'
+    : wireCode === 'NOT_FOUND'
+      ? 'not-found'
+      : wireCode === 'UNAUTHORIZED' || wireCode === 'FORBIDDEN'
+        ? 'forbidden'
+        : wireCode.includes('CONFLICT')
+          ? 'conflict'
+          : wireCode.startsWith('INVALID_') || wireCode.endsWith('.invalid')
+            ? 'invalid'
+            : 'unavailable'
+  const reasons: Record<string, SetupWorkflowFailureReason> = {
+    'onboarding.provider.invalid': 'provider-invalid',
+    'onboarding.router.invalid': 'router-invalid',
+    'onboarding.search.invalid': 'search-invalid',
+    'onboarding.imageGeneration.invalid': 'image-generation-invalid',
+  }
+  return new SetupWorkflowError(code, failure.message, reasons[wireCode], error)
+}
+
 async function requestContract(
   rpc: RpcTransport,
   contract: SetupContractDescriptor,
   params: Record<string, unknown> | undefined,
   request?: SetupRequestOptions,
 ): Promise<Record<string, unknown>> {
-  const result = await rpc.request(contract.method, params, options(request?.signal))
+  let result: unknown
+  try {
+    result = await rpc.request(contract.method, params, options(request?.signal))
+  } catch (error) {
+    throw mapSetupError(error)
+  }
   if (!contract.validateResult(result)) {
     throw new Error(`${contract.method} returned an invalid response`)
   }
@@ -49,8 +85,7 @@ async function requestContract(
 }
 
 function isMethodUnavailable(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error)
-  return /method.*not found|unknown method|not registered/i.test(message)
+  return error instanceof SetupWorkflowError && error.code === 'unsupported'
 }
 
 export function createV4SetupWorkflow(rpc: RpcTransport): SetupWorkflow {
@@ -144,12 +179,21 @@ export function createV4SetupWorkflow(rpc: RpcTransport): SetupWorkflow {
       },
     },
     async catalog(request) {
-      const result = await rpc.request(ONBOARDING_CATALOG_METHOD, undefined, options(request?.signal))
+      let result: unknown
+      try {
+        result = await rpc.request(ONBOARDING_CATALOG_METHOD, undefined, options(request?.signal))
+      } catch (error) {
+        throw mapSetupError(error)
+      }
       if (!validateOnboardingCatalogResult(result)) throw new Error(`${ONBOARDING_CATALOG_METHOD} returned an invalid response`)
       return result as SetupCatalog
     },
     async status(request) {
-      await rpc.ready?.({ timeoutMs: 20_000, signal: request?.signal })
+      try {
+        await rpc.ready?.({ timeoutMs: 20_000, signal: request?.signal })
+      } catch (error) {
+        throw mapSetupError(error)
+      }
       return requestContract(rpc, setupContracts.status, undefined, request) as Promise<SetupStatus>
     },
     discoverImageGenerationModels(providerId, request) {

@@ -18,9 +18,10 @@ import type {
   PendingInputWalRecord,
   PendingInputWalState,
 } from '@/utils/chat/pendingInputWal'
-import type {
-  PendingInputQueuePort,
-  PendingInputServerItem,
+import {
+  PendingInputQueueError,
+  type PendingInputQueuePort,
+  type PendingInputServerItem,
 } from '@/modules/pendingInputQueue'
 import { snapshotSteerRequest } from './useChatSteerDelivery'
 
@@ -431,9 +432,8 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     ))
   }
 
-  function rpcErrorCode(error: unknown): string {
-    const code = (error as { code?: unknown } | null)?.code
-    return typeof code === 'string' ? code : ''
+  function pendingQueueFailure(error: unknown): PendingInputQueueError | null {
+    return error instanceof PendingInputQueueError ? error : null
   }
 
   function durableAttachmentMetadata(attachment: Attachment): Attachment {
@@ -559,11 +559,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
             flushDeferredPendingDrain()
             return
           } catch (error) {
-            const code = rpcErrorCode(error)
+            const kind = pendingQueueFailure(error)?.kind
             if (
               !refreshedLostUpload
               && options.prepareAttachmentsForSend
-              && (code === 'ATTACHMENT_EXPIRED' || code === 'ATTACHMENT_LOST_IN_RESTART')
+              && (kind === 'attachment-expired' || kind === 'attachment-lost')
               && item.attachments.some(attachment => attachment.kind === 'staged' && attachment.file)
             ) {
               refreshedLostUpload = true
@@ -578,10 +578,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           }
         }
       } catch (error) {
-        const code = rpcErrorCode(error)
+        const failure = pendingQueueFailure(error)
         if (
-          code === 'PENDING_INPUT_CANCELLED'
-          || code === 'PENDING_INPUT_ALREADY_DISPATCHED'
+          failure?.kind === 'cancelled'
+          || failure?.kind === 'already-dispatched'
         ) {
           // A peer or an earlier crashed tab already committed the durable
           // terminal outcome. Treat that server tombstone as authoritative
@@ -593,12 +593,12 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           broadcastChange(sessionKey, pendingInputId, 'removed')
           return
         }
-        if (code === 'METHOD_NOT_FOUND') {
+        if (failure?.kind === 'unsupported') {
           await writeWalItem(item, 'local_only')
           flushDeferredPendingDrain()
           return
         }
-        if ((error as { accepted?: unknown } | null)?.accepted === false) {
+        if (failure?.accepted === false) {
           await writeWalItem(item, 'retryable').catch(() => {})
           options.onPendingPersistenceError?.('server_rejected')
           return

@@ -149,12 +149,7 @@ export function createGatewayAdapters(
   const sessionReadLifecycleFactory = createSessionReadLifecycleFactory(
     createV4SessionReadPort(transports.rpc, { concurrentHistoryReads }),
   )
-  const conversationEvents = createConversationEventTransport({
-    on(event, handler) {
-      const subscription = transports.events.subscribe(event, handler)
-      return () => subscription.close()
-    },
-  })
+  const conversationEvents = createConversationEventTransport(transports.events)
   const adapters: GatewayAdapters = {
     gatewayAccess,
     conversationEvents,

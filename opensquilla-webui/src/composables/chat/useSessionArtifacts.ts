@@ -1,6 +1,6 @@
 import { computed, ref, watch, type Ref } from 'vue'
 
-import type { ArtifactCatalog } from '@/modules/artifactWorkbench'
+import { ArtifactCatalogError, type ArtifactCatalog } from '@/modules/artifactWorkbench'
 import type { ChatMessage } from '@/types/chat'
 import type { ArtifactPayload } from '@/types/artifacts'
 
@@ -56,13 +56,10 @@ export function mergeArtifactSources(
   return [...merged.values()]
 }
 
-function isRpcTimeout(error: unknown): boolean {
-  return (error as { code?: unknown } | null)?.code === 'RPC_TIMEOUT'
-}
-
 function isArtifactListTimeout(error: unknown): boolean {
-  return isRpcTimeout(error)
-    && (error as { artifactCatalogPhase?: unknown } | null)?.artifactCatalogPhase !== 'connect'
+  return error instanceof ArtifactCatalogError
+    && error.kind === 'timeout'
+    && error.phase === 'list'
 }
 
 function normalizedPageLimit(value: number | undefined): number {

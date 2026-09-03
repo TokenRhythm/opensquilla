@@ -4,7 +4,11 @@ import type {
   ArtifactWorkbench,
   ArtifactWorkbenchSubscription,
 } from '@/modules/artifactWorkbench'
-import type { RpcCallOptions } from '@/lib/rpc'
+import { ArtifactCatalogError } from '@/modules/artifactWorkbench'
+import {
+  readTransportFailure,
+} from './privateTransports'
+import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import {
   ARTIFACTS_LIST_METHOD,
 } from '@/contracts/generated/v4/artifactsList'
@@ -84,10 +88,19 @@ function methodNotFound(error: unknown): boolean {
     || /method not found/i.test(error instanceof Error ? error.message : String(error || ''))
 }
 
-function markCatalogPhase(error: unknown, phase: 'connect' | 'list'): void {
-  if (error && typeof error === 'object') {
-    ;(error as { artifactCatalogPhase?: string }).artifactCatalogPhase = phase
-  }
+function catalogError(
+  error: unknown,
+  phase: 'connect' | 'list',
+): ArtifactCatalogError {
+  if (error instanceof ArtifactCatalogError) return error
+  const failure = readTransportFailure(error)
+  const code = failure.code?.toUpperCase()
+  const kind = code === 'RPC_ABORTED' || (error instanceof Error && error.name === 'AbortError')
+    ? 'aborted'
+    : code === 'RPC_TIMEOUT'
+      ? 'timeout'
+      : 'unavailable'
+  return new ArtifactCatalogError(kind, phase, failure.message, error)
 }
 
 function createV4ArtifactCatalog(rpc: RpcTransport): ArtifactCatalog {
@@ -101,8 +114,7 @@ function createV4ArtifactCatalog(rpc: RpcTransport): ArtifactCatalog {
           abortAction: 'reject',
         })
       } catch (error) {
-        markCatalogPhase(error, 'connect')
-        throw error
+        throw catalogError(error, 'connect')
       }
       if (!rpc.supports(ARTIFACTS_LIST_METHOD)) return null
       const limit = typeof options.limit === 'number' && Number.isFinite(options.limit)
@@ -133,7 +145,13 @@ function createV4ArtifactCatalog(rpc: RpcTransport): ArtifactCatalog {
             !Array.isArray(response.artifacts)
             || (!canonical && typeof response.hasMore !== 'boolean')
             || typeof (response.has_more ?? response.hasMore) !== 'boolean'
-          ) throw new Error('Artifact catalog response violated its v4 contract')
+          ) {
+            throw new ArtifactCatalogError(
+              'invalid',
+              'list',
+              'Artifact catalog response violated its v4 contract',
+            )
+          }
           const page = artifactPageItems(response)
           collected = mergeArtifacts(page, collected)
           if (!Boolean(response.has_more ?? response.hasMore)) break
@@ -142,15 +160,20 @@ function createV4ArtifactCatalog(rpc: RpcTransport): ArtifactCatalog {
             typeof cursor !== 'string'
             || page.length === 0
             || visitedCursors.has(cursor)
-          ) throw new Error('Artifact pagination did not provide an advancing cursor')
+          ) {
+            throw new ArtifactCatalogError(
+              'invalid',
+              'list',
+              'Artifact pagination did not provide an advancing cursor',
+            )
+          }
           visitedCursors.add(cursor)
           before = cursor
         }
         return collected
       } catch (error) {
         if (!methodNotFound(error)) {
-          markCatalogPhase(error, 'list')
-          throw error
+          throw catalogError(error, 'list')
         }
         rpc.markUnsupported(ARTIFACTS_LIST_METHOD)
         return null

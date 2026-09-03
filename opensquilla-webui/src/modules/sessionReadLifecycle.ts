@@ -284,6 +284,22 @@ export class SessionReadContractError extends Error {
   }
 }
 
+export type SessionReadFailureKind = 'aborted' | 'timeout' | 'busy' | 'unavailable'
+
+/** Recoverable read failure projected by a transport Adapter. */
+export class SessionReadFailure extends Error {
+  constructor(
+    readonly kind: SessionReadFailureKind,
+    message: string,
+    readonly retryable: boolean,
+    readonly retryAfterMs = 0,
+    readonly cause?: unknown,
+  ) {
+    super(message)
+    this.name = 'SessionReadFailure'
+  }
+}
+
 /** Domain failure projected by an Adapter when the requested session is gone. */
 export class SessionReadSessionMissingError extends Error {
   readonly code = 'session-missing'
