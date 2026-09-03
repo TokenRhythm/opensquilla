@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from opensquilla.gateway.config_persistence import persist_gateway_config
 from opensquilla.gateway.config_secrets import (
     REDACTED_PUBLIC_VALUE as _REDACTED_PUBLIC_VALUE,
 )
@@ -31,7 +32,6 @@ from opensquilla.gateway.model_routing import (
     reconcile_model_routing_write,
 )
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
-from opensquilla.paths import default_opensquilla_home
 
 if TYPE_CHECKING:
     from opensquilla.application.app_settings import AppSettings
@@ -76,43 +76,6 @@ async def _notify_goal_config_changed(ctx: RpcContext, previous_config: Any) -> 
         # The service reads the current root config dynamically, so a failed
         # best-effort pause hook still blocks every new automatic admission.
         log.warning("gateway.goal_config_reconcile_failed", exc_info=True)
-
-
-def _persist_config(config: Any) -> None:
-    """Write config to TOML, defaulting to the user config path when unset.
-
-    Delegates to the shared sparse persister so every gateway write path has
-    one persistence contract: diff-merge onto the on-disk TOML (hand-edits
-    and unknown keys survive, defaults are not materialized), a timestamped
-    backup of the previous file, pre-write re-validation, fsync-before-rename
-    and 0600 modes. The outcome is logged either way — a config rewrite must
-    never be invisible in the gateway log.
-    """
-    if not getattr(config, "config_path", None) and hasattr(config, "config_path"):
-        config.config_path = str(default_opensquilla_home() / "config.toml")
-
-    if not getattr(config, "config_path", None):
-        return
-
-    from opensquilla.onboarding.config_store import persist_config
-
-    path = str(config.config_path)
-    try:
-        result = persist_config(config, path=path)
-    except Exception as exc:
-        # Only the exception type: a pydantic ValidationError repr can embed
-        # rejected field values, and secrets must never reach the log.
-        log.error(
-            "gateway.config_persist_failed",
-            path=path,
-            error=type(exc).__name__,
-        )
-        raise
-    log.info(
-        "gateway.config_persisted",
-        path=str(result.path),
-        backup=str(result.backup_path) if result.backup_path else None,
-    )
 
 
 _PUBLIC_DERIVED_CONFIG_PATHS = frozenset(
@@ -849,7 +812,7 @@ async def _handle_config_set(params: dict | None, ctx: RpcContext) -> dict[str, 
     # Persist the candidate BEFORE mutating the live config: if the write
     # fails, memory and disk stay consistent (both keep the old state)
     # instead of silently diverging until the next restart reverts memory.
-    _persist_config(new_config)
+    persist_gateway_config(new_config)
     _update_config_in_place(ctx.config, new_config)
     await _notify_goal_config_changed(ctx, previous_config)
     _sync_resolved_provider_selector(ctx, provider_config)
@@ -998,7 +961,7 @@ async def _execute_config_patch(
     provider_config = _resolve_provider_selector_config(new_config)
     # Persist the candidate BEFORE mutating the live config: if the write
     # fails, memory and disk stay consistent (both keep the old state).
-    _persist_config(new_config)
+    persist_gateway_config(new_config)
     # Update in-memory config so subsequent requests see changes immediately
     _update_config_in_place(ctx.config, new_config)
     await _notify_goal_config_changed(ctx, previous_config)
@@ -1157,7 +1120,7 @@ async def _handle_config_apply(params: dict | None, ctx: RpcContext) -> dict[str
     provider_config = _resolve_provider_selector_config(new_config)
     # Persist the candidate BEFORE mutating the live config: if the write
     # fails, memory and disk stay consistent (both keep the old state).
-    _persist_config(new_config)
+    persist_gateway_config(new_config)
     if ctx.config is not None:
         _update_config_in_place(ctx.config, new_config)
         await _notify_goal_config_changed(ctx, previous_config)

@@ -1083,12 +1083,13 @@ async def test_pairing_approve_as_admin_survives_a_failed_grant_and_still_notifi
     ctx = _notice_ctx(adapter, _NoticeStore())
     ctx.config.config_path = str(tmp_path / "config.toml")
 
-    from opensquilla.gateway import rpc_config
+    from opensquilla.gateway import config_persistence
 
     def _boom(_config):
         raise OSError("read-only config")
 
-    monkeypatch.setattr(rpc_config, "_persist_config", _boom)
+    monkeypatch.setattr(config_persistence, "persist_gateway_config", _boom)
+    monkeypatch.setattr(opensquilla.gateway.rpc_channels, "persist_gateway_config", _boom)
 
     res = await get_dispatcher().dispatch(
         "r1",

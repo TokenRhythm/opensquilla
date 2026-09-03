@@ -9,6 +9,7 @@ from opensquilla.contracts.generated.v4.sessions_list_metadata import (
     SESSIONS_LIST_METHOD,
 )
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.config_persistence import persist_gateway_config
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, RpcUnavailableError, get_dispatcher
 from opensquilla.gateway.rpc_memory import memory_health_from_durable_ledger
 from opensquilla.session.keys import normalize_agent_id
@@ -228,10 +229,8 @@ async def _handle_set_heartbeats(params: dict | None, ctx: RpcContext) -> dict[s
             raise ValueError("params.lightContext must be a boolean")
         heartbeat.light_context = light_context
 
-    from opensquilla.gateway.rpc_config import _persist_config
-
     if should_persist:
-        _persist_config(candidate)
+        persist_gateway_config(candidate)
     if candidate is not ctx.config:
         ctx.config.heartbeat = heartbeat
         if hasattr(ctx.config, "inherit_persist_provenance"):

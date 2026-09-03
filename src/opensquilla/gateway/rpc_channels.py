@@ -23,6 +23,7 @@ from opensquilla.gateway.adapters.channel_administration import (
 from opensquilla.gateway.adapters.channel_administration_contract import (
     register_channel_administration_contract,
 )
+from opensquilla.gateway.config_persistence import persist_gateway_config
 from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
 from opensquilla.redaction import redact_error_text
@@ -763,12 +764,10 @@ def _set_channel_admin_sender(
             admin_senders[channel_name] = remaining
         else:
             admin_senders.pop(channel_name, None)
-    from opensquilla.gateway.rpc_config import _persist_config
-
     # Persist-before-apply: write the candidate to disk first so a failed
     # write leaves memory and TOML agreeing on the old state.
     candidate = ctx.config.model_copy(update={"channel_admin_senders": admin_senders})
-    _persist_config(candidate)
+    persist_gateway_config(candidate)
     ctx.config.channel_admin_senders = admin_senders
     log.info(
         "channel.admin_set" if admin else "channel.admin_removed",
