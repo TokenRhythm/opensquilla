@@ -53,10 +53,10 @@
     "result": "#/$defs/SandboxPathPickResult",
     "errors": [
       {
-        "code": "OWNER_REQUIRED"
+        "code": "UNAUTHORIZED"
       },
       {
-        "code": "INVALID_PARAMS"
+        "code": "INVALID_REQUEST"
       },
       {
         "code": "UNAVAILABLE"

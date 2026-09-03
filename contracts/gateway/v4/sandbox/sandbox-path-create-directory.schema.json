@@ -53,13 +53,10 @@
     "result": "#/$defs/SandboxPathCreateDirectoryResult",
     "errors": [
       {
-        "code": "OWNER_REQUIRED"
+        "code": "UNAUTHORIZED"
       },
       {
-        "code": "INVALID_PARAMS"
-      },
-      {
-        "code": "UNAVAILABLE"
+        "code": "INVALID_REQUEST"
       },
       {
         "code": "INTERNAL_ERROR"

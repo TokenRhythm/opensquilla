@@ -52,6 +52,61 @@ RESPONSE_VALIDATED_METHODS = (
     "workspaces.history.delete",
 )
 
+EXPECTED_ACCURATE_ERROR_CODES = {
+    "sandbox.path.list": (
+        "UNAUTHORIZED",
+        "INVALID_REQUEST",
+        "UNAVAILABLE",
+        "INTERNAL_ERROR",
+    ),
+    "sandbox.path.create-directory": (
+        "UNAUTHORIZED",
+        "INVALID_REQUEST",
+        "INTERNAL_ERROR",
+    ),
+    "sandbox.path.pick": (
+        "UNAUTHORIZED",
+        "INVALID_REQUEST",
+        "UNAVAILABLE",
+        "INTERNAL_ERROR",
+    ),
+    "onboarding.channel.probe": (
+        "INVALID_REQUEST",
+        "onboarding.channel.invalid",
+        "UNAUTHORIZED",
+        "UNAVAILABLE",
+        "INTERNAL_ERROR",
+    ),
+    "onboarding.channel.upsert": (
+        "INVALID_REQUEST",
+        "onboarding.channel.invalid",
+        "UNAUTHORIZED",
+        "UNAVAILABLE",
+        "INTERNAL_ERROR",
+    ),
+    "onboarding.channel.remove": (
+        "INVALID_REQUEST",
+        "onboarding.channel.not_found",
+        "UNAUTHORIZED",
+        "UNAVAILABLE",
+        "INTERNAL_ERROR",
+    ),
+    "onboarding.channel.enable": (
+        "INVALID_REQUEST",
+        "onboarding.channel.not_found",
+        "UNAUTHORIZED",
+        "UNAVAILABLE",
+        "INTERNAL_ERROR",
+    ),
+    "onboarding.channel.disable": (
+        "INVALID_REQUEST",
+        "onboarding.channel.not_found",
+        "UNAUTHORIZED",
+        "UNAVAILABLE",
+        "INTERNAL_ERROR",
+    ),
+}
+
 
 def _specs_by_wire_name():
     return {spec.wire_name: spec for spec in discover_contracts()}
@@ -92,6 +147,13 @@ def test_response_validated_handler_contracts_declare_fail_closed_error() -> Non
 
         assert descriptor.name == method
         assert "INTERNAL_ERROR" in error_codes
+
+
+def test_contract_error_metadata_matches_reachable_gateway_codes() -> None:
+    specs = _specs_by_wire_name()
+
+    for method, expected in EXPECTED_ACCURATE_ERROR_CODES.items():
+        assert tuple(error["code"] for error in specs[method].metadata["errors"]) == expected
 
 
 @pytest.mark.asyncio

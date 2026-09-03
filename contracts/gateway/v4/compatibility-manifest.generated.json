@@ -796,31 +796,31 @@
       "lifecycle": "stable",
       "name": "onboarding.channel.disable",
       "schema": "platform/onboarding-channel-disable.schema.json",
-      "schemaSha256": "2f4bb37d3d67f2ddaf38f4575e23ef0727e5f2637eb54607f5d7bbdce1890bc3"
+      "schemaSha256": "eb4a983d3247021fea23c1ab1eeb8c0dc7947eda7ad6aaf8ceb95b6c8be0720d"
     },
     {
       "lifecycle": "stable",
       "name": "onboarding.channel.enable",
       "schema": "platform/onboarding-channel-enable.schema.json",
-      "schemaSha256": "b4231b337833c02212b285e0d35bb95dafee18bce52332dcd2f163c2129e9ae1"
+      "schemaSha256": "d3735f7f2b9719ef76639f66b8ab7a01b82ad2ae95f3858d69b05f68483aa701"
     },
     {
       "lifecycle": "stable",
       "name": "onboarding.channel.probe",
       "schema": "platform/onboarding-channel-probe.schema.json",
-      "schemaSha256": "fd3d2365184718197550b12cacf21ed016a81dd5e3298c9c6bc9c34cffcc7fa5"
+      "schemaSha256": "9587b1fbed27ddf85f8f466f16e7903671b175e182ee904b3f2c54b503c16bee"
     },
     {
       "lifecycle": "stable",
       "name": "onboarding.channel.remove",
       "schema": "platform/onboarding-channel-remove.schema.json",
-      "schemaSha256": "d5adcf647ad855277f7bec0cb73999522dc5019050441598e1d17f9723268d35"
+      "schemaSha256": "2a81b19ee5f43596187b934f12a1c6018341a12598b5f992bc2c422fb8f8a891"
     },
     {
       "lifecycle": "stable",
       "name": "onboarding.channel.upsert",
       "schema": "platform/onboarding-channel-upsert.schema.json",
-      "schemaSha256": "1ca0b7cc6f7581729fc652840aa4a125c6d9d5296465fbcf5921274df1ecd334"
+      "schemaSha256": "bcdb4ba615c09f69b2dad120546d607fc8280d482a2fc81e6692d09f0e31701d"
     },
     {
       "lifecycle": "stable",
@@ -1027,19 +1027,19 @@
       "lifecycle": "stable",
       "name": "sandbox.path.create-directory",
       "schema": "sandbox/sandbox-path-create-directory.schema.json",
-      "schemaSha256": "b20cdc152ef747bcfb926c45807a42daf7b2b3455a6c575e94673216fe8d9726"
+      "schemaSha256": "5ebcf39ad2ef33886594af9a9f13b7bcb753904898bd980088d5116df08f117f"
     },
     {
       "lifecycle": "stable",
       "name": "sandbox.path.list",
       "schema": "sandbox/sandbox-path-list.schema.json",
-      "schemaSha256": "984f2cb361c2a8452e5d907511d338b1650fae13c65c6cde1273749938cb0854"
+      "schemaSha256": "d8eae7fe51b05c2a897c3abce5336c994eaf10b408533e9203d26bae9900b41b"
     },
     {
       "lifecycle": "stable",
       "name": "sandbox.path.pick",
       "schema": "sandbox/sandbox-path-pick.schema.json",
-      "schemaSha256": "7caf63d7fa1f86aa845f80d979a7e8b18649ba1998256cef70dde55da6016dfb"
+      "schemaSha256": "bd4ad1cb54f1141ab08d39593a87fcabf2d7515442c9898b0bac69c6cb805b97"
     },
     {
       "lifecycle": "stable",
@@ -1461,10 +1461,10 @@
   "protocol": "opensquilla-websocket-json",
   "source": {
     "eventFamilyCount": 9,
-    "generatorSha256": "002f61ba00e3836de98ba4a771fe5aaf1ceca7c9ea4a7c7b0508cc798bd627cf",
+    "generatorSha256": "efe446ba6223a0e9daf70f3b76e320eaff8a30d5f83af0f8740f8d6b7c86e449",
     "methodCount": 215,
     "schemaCount": 224,
-    "schemaTreeSha256": "594c437e18ff29da709fb27cd14bd56fd2928766855749a20d579d69bdb97c50"
+    "schemaTreeSha256": "3ae0918a0a7ff3256de98b594115173a1d946e7b3311597da3f480d55c935e95"
   },
   "wireVersion": 4
 }

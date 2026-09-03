@@ -300,6 +300,48 @@ def test_invalid_generation_metadata_fails_before_tool_execution(
         runner.load_contract(schema, contract_root=tmp_path)
 
 
+@pytest.mark.parametrize(
+    "error_code",
+    (
+        "onboarding.channel.invalid",
+        "onboarding.channel.not_found",
+    ),
+)
+def test_only_declared_legacy_channel_error_codes_allow_dots(
+    tmp_path: Path,
+    error_code: str,
+) -> None:
+    document = _method_schema("onboarding.channel.probe")
+    document["x-opensquilla-method"]["errors"] = [
+        {"code": error_code},
+        {"code": "INTERNAL_ERROR"},
+    ]
+    schema = _write_schema(
+        tmp_path,
+        "platform/onboarding-channel-probe.schema.json",
+        document,
+    )
+
+    spec = runner.load_contract(schema, contract_root=tmp_path)
+
+    assert spec.metadata["errors"][0]["code"] == error_code
+
+
+def test_undeclared_dotted_error_code_remains_rejected(tmp_path: Path) -> None:
+    document = _method_schema("onboarding.channel.probe")
+    document["x-opensquilla-method"]["errors"] = [
+        {"code": "onboarding.channel.unknown"}
+    ]
+    schema = _write_schema(
+        tmp_path,
+        "platform/onboarding-channel-probe.schema.json",
+        document,
+    )
+
+    with pytest.raises(runner.ContractConfigurationError, match="error code"):
+        runner.load_contract(schema, contract_root=tmp_path)
+
+
 def test_only_the_legacy_status_root_method_is_accepted(tmp_path: Path) -> None:
     status = _write_schema(
         tmp_path,

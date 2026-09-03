@@ -56,6 +56,9 @@
         "code": "INVALID_REQUEST"
       },
       {
+        "code": "onboarding.channel.not_found"
+      },
+      {
         "code": "UNAUTHORIZED"
       },
       {

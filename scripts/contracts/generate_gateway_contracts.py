@@ -63,6 +63,12 @@ LEGACY_ROOT_METHOD_NAMES = frozenset({"status"})
 LEGACY_HYPHENATED_WIRE_NAMES = frozenset({"sandbox.path.create-directory"})
 SCOPE_PATTERN = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$")
 ERROR_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
+LEGACY_DOTTED_ERROR_CODES = frozenset(
+    {
+        "onboarding.channel.invalid",
+        "onboarding.channel.not_found",
+    }
+)
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 FILE_STEM_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -305,7 +311,10 @@ def load_contract(schema: Path, *, contract_root: Path = CONTRACT_ROOT) -> Contr
                 schema=schema,
             )
             error_code = _require_string(error_metadata, "code", schema=schema)
-            if not ERROR_CODE_PATTERN.fullmatch(error_code):
+            if (
+                not ERROR_CODE_PATTERN.fullmatch(error_code)
+                and error_code not in LEGACY_DOTTED_ERROR_CODES
+            ):
                 raise ContractConfigurationError(
                     f"{schema}: error code {error_code!r} is not a legal identifier"
                 )
