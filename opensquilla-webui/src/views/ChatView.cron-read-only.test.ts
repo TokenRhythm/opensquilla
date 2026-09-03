@@ -41,6 +41,8 @@ describe('Cron session read-only presentation', () => {
     expect(chatViewSource).toContain('sessionInteractivityBlockedReason,')
     expect(chatViewSource).toContain('idempotentReplayBlockedReason: liveSendBlockedReason')
     expect(chatViewSource).toContain('exactReceiptReplayPendingForCurrentSession,')
+    expect(chatViewSource).toContain(':fresh-input-disabled="turnActionsBlocked"')
+    expect(chatViewSource).toContain('canMutate: () => !turnActionsBlocked.value')
     expect(chatViewSource).toContain(':message-actions-available="!turnActionsBlocked"')
     expect(chatViewSource).toContain('canMutateMessages: () => !turnActionsBlocked.value')
     expect(chatViewSource.match(/:turn-actions-disabled="turnActionsBlocked"/g)).toHaveLength(3)

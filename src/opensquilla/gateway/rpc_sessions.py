@@ -3471,6 +3471,7 @@ async def _handle_sessions_send_impl_inner(
     atomic_collaboration_mode_update: bool = False,
     pending_input_id: str | None = None,
     pending_input_fingerprint: str | None = None,
+    pending_input_enqueue_fingerprint: str | None = None,
     pending_input_revision: int | None = None,
     _prompt_annotation_acceptance_retries: int = 1,
     trusted_run_kind: str | None = None,
@@ -5664,6 +5665,9 @@ async def _handle_sessions_send_impl_inner(
                 prompt_annotation_turn_id=(turn_id if prompt_annotation_rows else None),
                 pending_input_id=pending_input_id,
                 pending_input_fingerprint=pending_input_fingerprint,
+                pending_input_enqueue_fingerprint=(
+                    pending_input_enqueue_fingerprint
+                ),
                 pending_input_revision=pending_input_revision,
             )
             if not acceptance.replayed and not merge_into_task:
@@ -5895,6 +5899,9 @@ async def _handle_sessions_send_impl_inner(
                         atomic_collaboration_mode_update=atomic_collaboration_mode_update,
                         pending_input_id=pending_input_id,
                         pending_input_fingerprint=pending_input_fingerprint,
+                        pending_input_enqueue_fingerprint=(
+                            pending_input_enqueue_fingerprint
+                        ),
                         pending_input_revision=pending_input_revision,
                         _prompt_annotation_acceptance_retries=(
                             _prompt_annotation_acceptance_retries - 1
@@ -6282,6 +6289,9 @@ async def _handle_sessions_send_impl_inner(
                 workspace_guard=workspace_guard,
                 pending_input_id=pending_input_id,
                 pending_input_fingerprint=pending_input_fingerprint,
+                pending_input_enqueue_fingerprint=(
+                    pending_input_enqueue_fingerprint
+                ),
                 pending_input_revision=pending_input_revision,
             )
             if acceptance.replayed:
@@ -6863,6 +6873,7 @@ async def _handle_sessions_send(
     atomic_collaboration_mode_update: bool = False,
     pending_input_id: str | None = None,
     pending_input_fingerprint: str | None = None,
+    pending_input_enqueue_fingerprint: str | None = None,
     pending_input_revision: int | None = None,
     trusted_run_kind: str | None = None,
     _explicit_ingress_intent_registered: bool = False,
@@ -6901,6 +6912,9 @@ async def _handle_sessions_send(
                 atomic_collaboration_mode_update=atomic_collaboration_mode_update,
                 pending_input_id=pending_input_id,
                 pending_input_fingerprint=pending_input_fingerprint,
+                pending_input_enqueue_fingerprint=(
+                    pending_input_enqueue_fingerprint
+                ),
                 pending_input_revision=pending_input_revision,
                 trusted_run_kind=trusted_run_kind,
             ),
@@ -7338,18 +7352,25 @@ async def _handle_pending_inputs_enqueue(
                 )
             )
             raw_fingerprint = request_fingerprint(raw_payload)
-            if (
-                dispatch_receipt is not None
-                and dispatch_receipt.session_key == key
-                and dispatch_receipt.source_scope == source_scope
-                and dispatch_receipt.client_request_id
-                == raw_payload["clientRequestId"]
-                and dispatch_receipt.client_message_id
-                == raw_payload["clientMessageId"]
-                and dispatch_receipt.request_fingerprint == raw_fingerprint
-            ):
-                raise PendingChatInputAlreadyDispatchedError(
-                    "pending input was already dispatched"
+            if dispatch_receipt is not None:
+                replay_fingerprint = (
+                    dispatch_receipt.enqueue_request_fingerprint
+                    or dispatch_receipt.request_fingerprint
+                )
+                if (
+                    dispatch_receipt.session_key == key
+                    and dispatch_receipt.source_scope == source_scope
+                    and dispatch_receipt.client_request_id
+                    == raw_payload["clientRequestId"]
+                    and dispatch_receipt.client_message_id
+                    == raw_payload["clientMessageId"]
+                    and replay_fingerprint == raw_fingerprint
+                ):
+                    raise PendingChatInputAlreadyDispatchedError(
+                        "pending input was already dispatched"
+                    )
+                raise PendingChatInputConflictError(
+                    "pending input dispatch identity was already used"
                 )
 
             if key.startswith("cron:") or is_noninteractive_cron_session(
@@ -7817,12 +7838,32 @@ async def _handle_pending_inputs_dispatch(
                 accepted=False,
             )
         try:
+            enqueue_fingerprints: set[str] = set()
+            for session_id in _pending_input_attachment_scopes(row):
+                manifest = read_pending_chat_input_manifest(
+                    media_root=media_root_from_config(ctx.config),
+                    session_id=session_id,
+                    pending_input_id=row.pending_input_id,
+                )
+                if manifest is not None:
+                    enqueue_fingerprints.add(str(manifest["enqueue_fingerprint"]))
+            if len(enqueue_fingerprints) > 1:
+                raise PendingChatInputConflictError(
+                    "pending attachment manifests disagree on enqueue identity"
+                )
+            pending_input_enqueue_fingerprint = next(
+                iter(enqueue_fingerprints),
+                row.request_fingerprint,
+            )
             response = await _handle_sessions_send(
                 dict(row.payload),
                 ctx,
                 fingerprint_params=dict(row.payload),
                 pending_input_id=row.pending_input_id,
                 pending_input_fingerprint=row.request_fingerprint,
+                pending_input_enqueue_fingerprint=(
+                    pending_input_enqueue_fingerprint
+                ),
                 pending_input_revision=row.state_revision,
             )
         except PendingChatInputNotFoundError as exc:

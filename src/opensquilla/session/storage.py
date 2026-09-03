@@ -290,6 +290,7 @@ class PendingChatInputDispatchReceipt:
     client_message_id: str
     request_fingerprint: str
     accepted_at: int
+    enqueue_request_fingerprint: str | None = None
     schema_version: int = 1
 
 
@@ -1095,6 +1096,7 @@ CREATE TABLE IF NOT EXISTS pending_chat_input_dispatch_receipts (
     client_request_id      TEXT NOT NULL,
     client_message_id      TEXT NOT NULL,
     request_fingerprint    TEXT NOT NULL,
+    enqueue_request_fingerprint TEXT,
     accepted_at            INTEGER NOT NULL,
     schema_version         INTEGER NOT NULL DEFAULT 1 CHECK (schema_version >= 1)
 )
@@ -10529,15 +10531,16 @@ class SessionStorage:
         client_request_id: str,
         client_message_id: str,
         request_fingerprint: str,
+        enqueue_request_fingerprint: str,
         accepted_at: int,
     ) -> None:
         await conn.execute(
             """
             INSERT INTO pending_chat_input_dispatch_receipts (
                 pending_input_id, session_key, source_scope,
-                client_request_id, client_message_id, request_fingerprint, accepted_at,
-                schema_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                client_request_id, client_message_id, request_fingerprint,
+                enqueue_request_fingerprint, accepted_at, schema_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
             """,
             (
                 pending_input_id,
@@ -10546,6 +10549,7 @@ class SessionStorage:
                 client_request_id,
                 client_message_id,
                 request_fingerprint,
+                enqueue_request_fingerprint,
                 accepted_at,
             ),
         )
@@ -12145,6 +12149,7 @@ class SessionStorage:
         prompt_annotation_turn_id: str | None = None,
         pending_input_id: str | None = None,
         pending_input_fingerprint: str | None = None,
+        pending_input_enqueue_fingerprint: str | None = None,
         pending_input_revision: int | None = None,
     ) -> TurnAcceptanceResult:
         """Commit one user message, optional task, and request receipt atomically.
@@ -12213,10 +12218,24 @@ class SessionStorage:
             value is not None for value in pending_guard_values
         ):
             raise ValueError("pending input dispatch guard must be complete")
+        if pending_input_enqueue_fingerprint is not None and pending_input_id is None:
+            raise ValueError(
+                "pending input enqueue fingerprint requires a dispatch guard"
+            )
         if pending_input_id is not None:
             pending_input_id = pending_input_id.strip()
             pending_input_fingerprint = str(pending_input_fingerprint).strip()
-            if not pending_input_id or not pending_input_fingerprint:
+            if pending_input_enqueue_fingerprint is None:
+                pending_input_enqueue_fingerprint = pending_input_fingerprint
+            else:
+                pending_input_enqueue_fingerprint = str(
+                    pending_input_enqueue_fingerprint
+                ).strip()
+            if (
+                not pending_input_id
+                or not pending_input_fingerprint
+                or not pending_input_enqueue_fingerprint
+            ):
                 raise ValueError("pending input dispatch identity must not be blank")
             if request_fingerprint != pending_input_fingerprint:
                 raise PendingChatInputConflictError(
@@ -13385,6 +13404,9 @@ class SessionStorage:
                         client_request_id=client_request_id,
                         client_message_id=pending_dispatch_client_message_id,
                         request_fingerprint=str(pending_input_fingerprint),
+                        enqueue_request_fingerprint=str(
+                            pending_input_enqueue_fingerprint
+                        ),
                         accepted_at=receipt.accepted_at,
                     )
                 except sqlite3.IntegrityError as exc:

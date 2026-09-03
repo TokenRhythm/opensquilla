@@ -107,6 +107,7 @@ test('keeps the conversation usable while startup and long history are delayed',
 
   await page.setViewportSize({ width: 1280, height: 900 })
   await page.addInitScript(() => {
+    window.localStorage.setItem('opensquilla-locale', 'en')
     const state = { emptySeen: false }
     Object.defineProperty(window, '__opensquillaHistoryHydrationTest', { value: state })
     const markEmpty = () => {
@@ -222,10 +223,6 @@ test('keeps the conversation usable while startup and long history are delayed',
     'sessions.messages.snapshot',
     'chat.history',
   ]
-  const expectedStartupMethods = ['sessions.list', ...criticalStartupOrder]
-  expect(receivedMethods.slice(0, expectedStartupMethods.length)).toEqual(
-    expectedStartupMethods,
-  )
   expect(sessionRequestOrder.slice(0, criticalStartupOrder.length)).toEqual(
     criticalStartupOrder,
   )

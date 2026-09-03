@@ -16,6 +16,7 @@
       :aria-pressed="active"
       :aria-label="t('chat.goal.turnOffMode')"
       :title="t('chat.goal.turnOffMode')"
+      :disabled="disabled"
       @click="$emit('disarm')"
     >
       <Icon name="x" :size="12" aria-hidden="true" />
@@ -29,6 +30,7 @@ import Icon from '@/components/Icon.vue'
 
 defineProps<{
   active: boolean
+  disabled?: boolean
 }>()
 
 defineEmits<{
@@ -81,7 +83,7 @@ const { t } = useI18n()
   font: inherit;
 }
 
-.composer-goal-mode__toggle:hover,
+.composer-goal-mode__toggle:hover:not(:disabled),
 .composer-goal-mode__toggle:focus-visible {
   background: var(--bg-hover);
   color: var(--text);
@@ -90,5 +92,10 @@ const { t } = useI18n()
 .composer-goal-mode__toggle:focus-visible {
   outline: 0;
   box-shadow: var(--focus-ring);
+}
+
+.composer-goal-mode__toggle:disabled {
+  opacity: var(--state-disabled-opacity);
+  cursor: not-allowed;
 }
 </style>

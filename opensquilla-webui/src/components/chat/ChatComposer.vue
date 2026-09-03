@@ -28,10 +28,10 @@
             </span>
             <span class="attachment-chip__name">{{ att.name }}</span>
             <span class="attachment-chip__meta">{{ attachmentMeta(att) }}</span>
-            <button v-if="att.kind === 'failed' && att.file" class="attachment-action" :title="t('chat.retryUpload')" :aria-label="t('chat.retryUpload')" @click="emit('retryAttachment', i)">
+            <button v-if="att.kind === 'failed' && att.file" class="attachment-action" :title="t('chat.retryUpload')" :aria-label="t('chat.retryUpload')" :disabled="freshInputDisabled" @click="emit('retryAttachment', i)">
               <Icon name="refresh" :size="12" />
             </button>
-            <button class="attachment-action attachment-remove" :title="t('chat.remove')" :aria-label="t('chat.remove')" @click="emit('removeAttachment', i)">
+            <button class="attachment-action attachment-remove" :title="t('chat.remove')" :aria-label="t('chat.remove')" :disabled="freshInputDisabled" @click="emit('removeAttachment', i)">
               <Icon name="x" :size="12" />
             </button>
           </div>
@@ -65,13 +65,16 @@
                 ref="annotationInputEl"
                 v-model="annotationDraftBody"
                 type="text"
+                :disabled="freshInputDisabled"
                 :maxlength="promptAnnotationMaxBodyLength"
                 :aria-label="t('chat.promptAnnotations.editLabel')"
                 @keydown.esc.prevent="cancelAnnotationEdit"
               />
               <button
                 type="submit"
-                :disabled="annotationDraftBody.trim().length === 0 || annotationDraftTooLong"
+                :disabled="freshInputDisabled
+                  || annotationDraftBody.trim().length === 0
+                  || annotationDraftTooLong"
               >
                 {{ t('common.save') }}
               </button>
@@ -84,6 +87,7 @@
                 type="button"
                 class="chat-prompt-annotation-chip__main"
                 :title="annotation.body"
+                :disabled="freshInputDisabled"
                 @click="emit('jumpPromptAnnotation', annotation.annotationId)"
               >
                 <span class="chat-prompt-annotation-chip__target">
@@ -98,6 +102,7 @@
                 class="attachment-action"
                 :aria-label="t('chat.promptAnnotations.editLabel')"
                 :title="t('chat.promptAnnotations.editLabel')"
+                :disabled="freshInputDisabled"
                 @click="beginAnnotationEdit(annotation)"
               >
                 <Icon name="edit" :size="12" />
@@ -107,6 +112,7 @@
                 class="attachment-action attachment-remove"
                 :aria-label="t('chat.promptAnnotations.removeLabel')"
                 :title="t('chat.promptAnnotations.removeLabel')"
+                :disabled="freshInputDisabled"
                 @click="emit('discardPromptAnnotation', annotation.annotationId)"
               >
                 <Icon name="x" :size="12" />
@@ -132,6 +138,7 @@
             <button
               type="button"
               class="chat-replan-draft__cancel"
+              :disabled="freshInputDisabled"
               @click="emit('cancelReplan')"
             >
               {{ t('common.cancel') }}
@@ -145,7 +152,7 @@
             class="chat-textarea"
             rows="1"
             :placeholder="placeholder"
-            :disabled="inputDisabled"
+            :disabled="inputDisabled || freshInputDisabled"
             maxlength="100000"
             :aria-label="t('chat.messageToSend')"
             :aria-describedby="sendBlockedMessage ? 'chat-composer-send-status' : undefined"
@@ -169,6 +176,7 @@
                 :aria-label="t('chat.add')"
                 aria-haspopup="menu"
                 :aria-expanded="addMenuOpen ? 'true' : 'false'"
+                :disabled="freshInputDisabled"
                 @click="toggleAddMenu"
               >
                 <Icon name="plus" :size="18" />
@@ -204,6 +212,7 @@
               <button
                 v-if="canCloseProject"
                 type="button"
+                :disabled="freshInputDisabled"
                 :aria-label="t('workspaces.closeProjectDraft')"
                 :title="t('workspaces.closeProjectDraft')"
                 @click="emit('closeProject')"
@@ -220,6 +229,7 @@
               "
               type="button"
               class="chat-project-choose"
+              :disabled="freshInputDisabled"
               @click="emit('chooseProject')"
             >
               <Icon name="folder" :size="15" />
@@ -233,7 +243,7 @@
               :title="t('chat.codingMode.disableLabel')"
               :aria-label="t('chat.codingMode.disableLabel')"
               :aria-busy="codingModeSettingsBusy ? 'true' : 'false'"
-              :disabled="codingModeSettingsBusy"
+              :disabled="freshInputDisabled || codingModeSettingsBusy"
               @click="emit('setCodingModeEnabled', false)"
             >
               <span>{{ t('chat.codingMode.activeLabel') }}</span>
@@ -253,7 +263,10 @@
                 :title="t('chat.composer.sessionModelRouting')"
                 :aria-label="t('chat.composer.sessionModelRouting')"
                 :aria-expanded="modelRoutingOpen ? 'true' : 'false'"
-                :aria-disabled="sessionRoutingControlBlocked ? 'true' : 'false'"
+                :aria-disabled="freshInputDisabled || sessionRoutingControlBlocked
+                  ? 'true'
+                  : 'false'"
+                :disabled="freshInputDisabled || sessionRoutingControlBlocked"
                 @click="toggleModelRouting"
               >
                 <Icon name="router" :size="17" />
@@ -281,9 +294,9 @@
                 :title="runModeLocked ? undefined : t('chat.composer.runMode')"
                 :aria-label="t('chat.composer.runMode')"
                 :aria-expanded="runModeOpen ? 'true' : 'false'"
-                :aria-disabled="runModeLocked ? 'true' : 'false'"
+                :aria-disabled="freshInputDisabled || runModeLocked ? 'true' : 'false'"
                 :aria-describedby="runModeLocked ? 'chat-run-mode-lock-tip' : undefined"
-                :disabled="runModeLocked"
+                :disabled="freshInputDisabled || runModeLocked"
                 @click="toggleRunMode"
               >
                 <Icon name="shield" :size="17" />
@@ -311,6 +324,7 @@
                 :aria-label="t('chrome.more')"
                 aria-haspopup="menu"
                 :aria-expanded="moreActionsOpen ? 'true' : 'false'"
+                :disabled="freshInputDisabled"
                 @click="toggleMoreActions"
               >
                 <Icon name="moreHorizontal" :size="18" />
@@ -375,13 +389,14 @@
           </div>
           <ChatComposerGoalMode
             :active="goalDraftArmed"
+            :disabled="freshInputDisabled"
             @disarm="emit('disarmGoal')"
           />
           <ChatComposerPlanMode
             :available="planModeAvailable === true"
             :mode="collaborationMode || 'default'"
             :busy="planModeBusy === true"
-            :disabled="planModeDisabled === true"
+            :disabled="freshInputDisabled || planModeDisabled === true"
             :applies-next-turn="planModeAppliesNextTurn === true"
             @set-mode="emit('setCollaborationMode', $event)"
           />
@@ -439,7 +454,8 @@
       type="file"
       multiple
       class="hidden"
-      @change="emit('fileChange', $event)"
+      :disabled="freshInputDisabled"
+      @change="onFileInputChange"
     />
   </div>
 </template>
@@ -486,6 +502,8 @@ const props = withDefaults(defineProps<{
   placeholder: string
   sendButtonTitle: string
   sendBlockedMessage?: string
+  /** Disable creation or mutation of fresh input while preserving exact Retry. */
+  freshInputDisabled?: boolean
   inputDisabled?: boolean
   runMode: SandboxRunMode
   allowedRunModes: SandboxRunMode[]
@@ -533,6 +551,7 @@ const props = withDefaults(defineProps<{
   sessionRoutingAvailable: true,
   sessionRoutingControlBlocked: false,
   goalDraftArmed: false,
+  freshInputDisabled: false,
   inputDisabled: false,
   safeSetupAvailable: false,
   floating: false,
@@ -621,6 +640,7 @@ const showProjectContext = computed(() =>
 )
 
 function beginAnnotationEdit(annotation: PromptAnnotation) {
+  if (props.freshInputDisabled) return
   editingAnnotationId.value = annotation.annotationId
   annotationDraftBody.value = annotation.body
   void nextTick(() => {
@@ -637,6 +657,7 @@ function cancelAnnotationEdit() {
 }
 
 function saveAnnotationEdit(annotationId: string) {
+  if (props.freshInputDisabled) return
   const body = annotationDraftBody.value.trim()
   if (!body || !promptAnnotationBodyWithinLimit(body)) return
   emit('updatePromptAnnotation', annotationId, body)
@@ -720,6 +741,7 @@ onBeforeUnmount(() => {
 })
 
 function toggleModelRouting() {
+  if (props.freshInputDisabled || props.sessionRoutingControlBlocked) return
   modelRoutingOpen.value = !modelRoutingOpen.value
   if (modelRoutingOpen.value) {
     dismissRouterNewBadge()
@@ -730,7 +752,7 @@ function toggleModelRouting() {
 }
 
 function toggleRunMode() {
-  if (props.runModeLocked) return
+  if (props.freshInputDisabled || props.runModeLocked) return
   runModeOpen.value = !runModeOpen.value
   if (runModeOpen.value) {
     addMenuOpen.value = false
@@ -750,6 +772,12 @@ function closeAllPopovers() {
   moreActionsOpen.value = false
 }
 
+watch(() => props.freshInputDisabled, (disabled) => {
+  if (!disabled) return
+  closeAllPopovers()
+  cancelAnnotationEdit()
+})
+
 // The retract animation collapses the footer with overflow clipping; any open
 // menu would be clipped/vanished mid-flight, so close menus the moment the
 // composer starts collapsing.
@@ -758,6 +786,7 @@ watch(() => props.collapsed, (collapsed) => {
 })
 
 function toggleMoreActions() {
+  if (props.freshInputDisabled) return
   moreActionsOpen.value = !moreActionsOpen.value
   if (moreActionsOpen.value) {
     addMenuOpen.value = false
@@ -773,6 +802,7 @@ function toggleMoreActions() {
 }
 
 function toggleAddMenu() {
+  if (props.freshInputDisabled) return
   addMenuOpen.value = !addMenuOpen.value
   if (addMenuOpen.value) {
     moreActionsOpen.value = false
@@ -782,6 +812,7 @@ function toggleAddMenu() {
 }
 
 function triggerVoice() {
+  if (props.freshInputDisabled) return
   moreActionsOpen.value = false
   if (props.voiceReady) {
     emit('voiceInput')
@@ -791,14 +822,20 @@ function triggerVoice() {
 }
 
 function exportConversation() {
+  if (props.freshInputDisabled) return
   moreActionsOpen.value = false
   emit('exportMarkdown')
 }
 
 function openPromptCacheKeepalive() {
-  if (!props.promptCacheKeepaliveSessionReady) return
+  if (props.freshInputDisabled || !props.promptCacheKeepaliveSessionReady) return
   moreActionsOpen.value = false
   emit('openPromptCacheKeepalive')
+}
+
+function onFileInputChange(event: Event) {
+  if (props.freshInputDisabled) return
+  emit('fileChange', event)
 }
 
 function attachmentIcon(att: Attachment): IconName {

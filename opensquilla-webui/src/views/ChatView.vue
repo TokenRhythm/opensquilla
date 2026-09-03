@@ -676,6 +676,7 @@
       :placeholder="composerPlaceholder"
       :send-button-title="sendButtonTitle"
       :send-blocked-message="composerSendBlockedMessage"
+      :fresh-input-disabled="turnActionsBlocked"
       :input-disabled="Boolean(dockedPlanQuestionnaire)
         || Boolean(forkTransition)
         || historyState.sessionMissing"
@@ -1878,7 +1879,9 @@ watch(
   available => setStreamConnectionAvailable(available),
   { immediate: true },
 )
-const chatAttachments = useChatAttachments(artifactWorkbench.content)
+const chatAttachments = useChatAttachments(artifactWorkbench.content, {
+  canMutate: () => !turnActionsBlocked.value,
+})
 const {
   pendingAttachments,
   attachmentWorkBusy,

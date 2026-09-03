@@ -154,6 +154,7 @@ interface PendingQueueItem {
   pendingInputId?: string
   displayTextOverride?: string
   hiddenControl?: boolean
+  confirmedPlainText?: boolean
   attachments?: Attachment[]
   deliveryState?: 'steering' | 'replay_pending' | 'retryable'
   steerAttempt?: PendingSteerAttempt
@@ -260,12 +261,16 @@ function isSteerRetry(item: PendingQueueItem): boolean {
     || item.steerAttempt?.phase === 'acceptance_unknown'
 }
 
+function isPendingRetry(item: PendingQueueItem): boolean {
+  return item.deliveryState === 'retryable'
+    || item.deliveryState === 'replay_pending'
+    || isSteerRetry(item)
+}
+
 function pendingCardState(item: PendingQueueItem): 'queued' | 'busy' | 'attention' {
   if (isSteering(item)) return 'busy'
   if (
-    item.deliveryState === 'retryable'
-    || item.deliveryState === 'replay_pending'
-    || isSteerRetry(item)
+    isPendingRetry(item)
   ) return 'attention'
   return 'queued'
 }
@@ -325,19 +330,17 @@ function attachmentBlockMessage(item: PendingQueueItem): string {
 }
 
 function pendingSteerBlocker(item: PendingQueueItem): PendingSteerBlocker | null {
-  if (isControlInput(item.text)) return 'controlInput'
-  if (item.attachments?.length) return 'attachment'
-  if (
-    item.pendingInputId
-    && item.pendingPersistenceState === 'staged'
-    && props.durableSteerAvailable !== true
-  ) return 'capability'
-  if (
-    !props.steerAvailable
-    && !['retryable', 'replay_pending'].includes(item.deliveryState || '')
-    && !isSteerRetry(item)
-  ) {
-    return 'capability'
+  // A Retry replays an already-captured immutable request; control, attachment,
+  // and Steer-capability checks apply only when creating a fresh Steer.
+  if (!isPendingRetry(item)) {
+    if (isControlInput(item.text)) return 'controlInput'
+    if (item.attachments?.length) return 'attachment'
+    if (
+      item.pendingInputId
+      && item.pendingPersistenceState === 'staged'
+      && props.durableSteerAvailable !== true
+    ) return 'capability'
+    if (!props.steerAvailable) return 'capability'
   }
   if (props.items.some(
     candidate => candidate !== item && Boolean(candidate.deliveryState || candidate.steerAttempt),

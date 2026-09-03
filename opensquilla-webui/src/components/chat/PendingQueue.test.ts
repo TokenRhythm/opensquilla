@@ -28,6 +28,7 @@ async function mountQueue(
     pendingPersistenceState?: 'saving' | 'staged' | 'local_only' | 'retryable' | 'cancelling'
     deliveryState?: 'steering' | 'replay_pending' | 'retryable'
     steerAttempt?: PendingSteerAttempt
+    confirmedPlainText?: boolean
     attachments?: Attachment[]
     hiddenControl?: boolean
     displayTextOverride?: string
@@ -306,6 +307,54 @@ describe('PendingQueue', () => {
       app.unmount()
     },
   )
+
+  it.each(['retryable', 'replay_pending'] as const)(
+    'lets a %s ordinary receipt retry replay attachments and confirmed plain text',
+    async (deliveryState) => {
+      const attachment: Attachment = {
+        kind: 'staged',
+        local_id: 10,
+        name: 'receipt.pdf',
+        mime: 'application/pdf',
+        file_uuid: 'receipt-10',
+      }
+      const retried: string[] = []
+      const { app, el } = await mountQueue({
+        onSteer: pendingUiId => retried.push(pendingUiId),
+      }, [{
+        text: '/literal prompt',
+        confirmedPlainText: true,
+        attachments: [attachment],
+        deliveryState,
+      }], {
+        steerAvailable: false,
+        durableSteerAvailable: false,
+        steerUnavailableMessage: 'Fresh Steer is unavailable.',
+      })
+
+      const retry = el.querySelector<HTMLButtonElement>('.chat-pending-action--steer')
+      expect(retry?.textContent).toContain('Retry')
+      expect(retry?.disabled).toBe(false)
+      expect(retry?.title).toBe('Retry')
+      retry?.click()
+      expect(retried).toEqual(['pending-ui-0'])
+      app.unmount()
+    },
+  )
+
+  it('keeps a receipt retry blocked while another delivery owns the queue lease', async () => {
+    const { app, el } = await mountQueue({}, [
+      { text: 'In flight', deliveryState: 'steering' },
+      { text: 'Retry later', deliveryState: 'retryable' },
+    ])
+
+    const retry = [...el.querySelectorAll<HTMLButtonElement>(
+      '.chat-pending-action--steer',
+    )].find(button => button.textContent?.includes('Retry'))
+    expect(retry?.disabled).toBe(true)
+    expect(retry?.title).toContain('another queued message is being delivered')
+    app.unmount()
+  })
 
   it('keeps hidden control input removable without exposing same-turn retry', async () => {
     let retried = 0

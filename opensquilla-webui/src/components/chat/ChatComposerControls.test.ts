@@ -35,7 +35,7 @@ describe('ChatComposer control hierarchy', () => {
     expect(viewSource).toContain('await setGlobalRunMode(mode)')
     expect(viewSource).toContain(':run-mode-locked="runModeLocked"')
     expect(viewSource).toContain('|| activeRunModeLock.value !== null')
-    expect(composerSource).toContain(':disabled="runModeLocked"')
+    expect(composerSource).toContain(':disabled="freshInputDisabled || runModeLocked"')
     expect(composerSource).toContain('chat-run-mode-lock-tip')
     expect(composerSource).not.toContain('cursor: not-allowed')
     expect(composerSource).toContain('cursor: default')

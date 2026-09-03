@@ -27,6 +27,7 @@ from opensquilla.artifact_session import (
 from opensquilla.artifacts import ArtifactStore
 from opensquilla.attachment_refs import (
     PENDING_CHAT_INPUT_MATERIAL_STORE,
+    pending_chat_input_manifest_exists,
     pending_chat_input_material_path,
     transcript_material_path,
 )
@@ -565,6 +566,111 @@ async def test_pending_input_exact_dispatch_receipt_precedes_cron_policy(
         assert replay.error is not None
         assert replay.error.code == "PENDING_INPUT_ALREADY_DISPATCHED"
         assert await stack.storage.list_pending_chat_inputs(session_key) == []
+
+
+@pytest.mark.asyncio
+async def test_pending_attachment_raw_replay_uses_dispatch_tombstone_before_cron_policy(
+    tmp_path: Path,
+) -> None:
+    session_key = "legacy-scheduled-run"
+    original_store = get_upload_store()
+    upload_store = UploadStore(tmp_path / "cron-replay-upload-markers")
+    set_upload_store(upload_store)
+    try:
+        async with _open_real_stack(
+            tmp_path / "pending-attachment-cron-replay.db",
+            session_key=session_key,
+        ) as stack:
+            payload = b"attachment replay survives manifest cleanup\n"
+            file_uuid = await upload_store.put(
+                "replay.txt",
+                "text/plain",
+                payload,
+            )
+            params = {
+                "key": session_key,
+                "pendingInputId": "pending-attachment-cron-replay",
+                "clientRequestId": "pending-attachment-cron-replay-request",
+                "clientMessageId": "pending-attachment-cron-replay-message",
+                "message": "Dispatch this attachment before Cron lock-down.",
+                "attachments": [
+                    {
+                        "type": "text/plain",
+                        "name": "replay.txt",
+                        "file_uuid": file_uuid,
+                    }
+                ],
+            }
+            staged = await get_dispatcher().dispatch(
+                "pending-attachment-cron-replay-enqueue",
+                "sessions.pending_inputs.enqueue",
+                params,
+                stack.context,
+            )
+            assert staged.ok is True
+            media_root = Path(stack.context.config.attachments.media_root or "")
+            assert pending_chat_input_manifest_exists(
+                media_root=media_root,
+                session_id=stack.session_id,
+                pending_input_id=params["pendingInputId"],
+            )
+
+            dispatched = await get_dispatcher().dispatch(
+                "pending-attachment-cron-replay-dispatch",
+                "sessions.pending_inputs.dispatch",
+                {
+                    "key": session_key,
+                    "pendingInputId": params["pendingInputId"],
+                    "clientRequestId": params["clientRequestId"],
+                    "requestFingerprint": staged.payload["requestFingerprint"],
+                },
+                stack.context,
+            )
+            assert dispatched.ok is True
+            receipt = await stack.storage.get_pending_chat_input_dispatch_receipt(
+                params["pendingInputId"]
+            )
+            assert receipt is not None
+            assert receipt.enqueue_request_fingerprint is not None
+            assert receipt.enqueue_request_fingerprint != receipt.request_fingerprint
+            assert not pending_chat_input_manifest_exists(
+                media_root=media_root,
+                session_id=stack.session_id,
+                pending_input_id=params["pendingInputId"],
+            )
+
+            current = await stack.storage.get_session(session_key)
+            assert current is not None
+            updated = await stack.storage.compare_and_set_session_origin(
+                expected_session=current,
+                expected_origin=None,
+                origin={"kind": "cron"},
+                workspace_guard=None,
+            )
+            assert updated is not None
+
+            exact_replay = await get_dispatcher().dispatch(
+                "pending-attachment-cron-replay-enqueue-again",
+                "sessions.pending_inputs.enqueue",
+                params,
+                stack.context,
+            )
+            assert exact_replay.ok is False
+            assert exact_replay.error is not None
+            assert exact_replay.error.code == "PENDING_INPUT_ALREADY_DISPATCHED"
+
+            conflict = await get_dispatcher().dispatch(
+                "pending-attachment-cron-replay-conflict",
+                "sessions.pending_inputs.enqueue",
+                {**params, "message": "Changed after dispatch."},
+                stack.context,
+            )
+            assert conflict.ok is False
+            assert conflict.error is not None
+            assert conflict.error.code == "PENDING_INPUT_CONFLICT"
+            assert await stack.storage.list_pending_chat_inputs(session_key) == []
+    finally:
+        set_upload_store(original_store)
 
 
 @pytest.mark.asyncio
