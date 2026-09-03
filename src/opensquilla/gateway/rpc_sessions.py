@@ -146,6 +146,7 @@ from opensquilla.gateway.session_services import (
 from opensquilla.gateway.session_streams import get_session_streams
 from opensquilla.gateway.session_view import (
     build_session_view_item,
+    channel_types_from_config,
     derive_transcript_title,
     is_noninteractive_cron_session,
 )
@@ -642,7 +643,7 @@ async def _fork_title_state(
         sessions.append(parent)
 
     transcript_titles = await _list_transcript_titles(storage, sessions)
-    channel_types = _channel_types_from_config(getattr(ctx, "config", None))
+    channel_types = channel_types_from_config(getattr(ctx, "config", None))
     sessions_by_key = {
         str(getattr(session, "session_key", "") or ""): session for session in sessions
     }
@@ -957,18 +958,6 @@ def _is_remote_web_guest(principal: Any, source_hint: dict[str, Any]) -> bool:
         has_capability("guest.safe")
         and not principal_has_host_execute(principal)
     )
-
-
-def _channel_types_from_config(config: Any) -> dict[str, str]:
-    """Lowercased configured-channel-name -> platform-type map for the view."""
-    channels_cfg = getattr(getattr(config, "channels", None), "channels", None) or []
-    out: dict[str, str] = {}
-    for entry in channels_cfg:
-        name = str(getattr(entry, "name", "") or "").strip().lower()
-        ctype = str(getattr(entry, "type", "") or "").strip().lower()
-        if name and ctype:
-            out[name] = ctype
-    return out
 
 
 def _normalize_session_send_source_hint(params: dict[str, Any]) -> dict[str, Any]:
@@ -2852,7 +2841,7 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
             entry_counts = {}
 
     result = []
-    channel_types = _channel_types_from_config(ctx.config)
+    channel_types = channel_types_from_config(ctx.config)
     for s in sessions:
         # Fetch entry count for metadata
         entry_count = entry_counts.get(s.session_id, 0)
@@ -3002,7 +2991,7 @@ async def _handle_sessions_search(params: dict | None, ctx: RpcContext) -> dict:
     if storage is None:
         return empty
 
-    channel_types = _channel_types_from_config(getattr(ctx, "config", None))
+    channel_types = channel_types_from_config(getattr(ctx, "config", None))
 
     def project(session: Any, transcript_title: str) -> SessionSearchProjection:
         view = build_session_view_item(
@@ -3151,7 +3140,7 @@ async def _should_auto_title(
         origin = getattr(session, "origin", None)
         origin_map = origin if isinstance(origin, dict) else {}
         surface = _surface(
-            session, key, origin_map, _channel_types_from_config(getattr(ctx, "config", None))
+            session, key, origin_map, channel_types_from_config(getattr(ctx, "config", None))
         )
         session_kind = _session_kind(session, key, surface, origin_map)
         if not is_naming_eligible(naming_cfg, surface, session_kind):
@@ -3732,11 +3721,6 @@ async def _handle_sessions_send_impl_inner(
             raise ValueError("initialRoutingMode requires new_chat intent")
         if fork_before_message_id is not None:
             raise ValueError("initialRoutingMode cannot be combined with a transcript fork")
-        # Validate the activation plan before accepting a first message. This
-        # is read-only and rejects an Ensemble that cannot be built today.
-        from opensquilla.gateway.model_routing import model_routing_patches
-
-        model_routing_patches(ctx.config, initial_routing_mode)
 
     if ctx.session_manager is None:
         raise KeyError("No session manager available")
@@ -3829,13 +3813,20 @@ async def _handle_sessions_send_impl_inner(
                 )
             return replay_response
 
+    if initial_routing_mode is not None:
+        # Receipt replay is an identity lookup, not a new admission decision.
+        # Validate the live activation plan only after proving this is fresh.
+        from opensquilla.gateway.model_routing import model_routing_patches
+
+        model_routing_patches(ctx.config, initial_routing_mode)
+
     canonical_cron_key = key.startswith("cron:")
     existing_session = None if canonical_cron_key else await storage.get_session(key)
     if canonical_cron_key or (
         existing_session is not None
         and is_noninteractive_cron_session(
             existing_session,
-            channel_types=_channel_types_from_config(ctx.config),
+            channel_types=channel_types_from_config(ctx.config),
         )
     ):
         raise RpcHandlerError(
@@ -7363,7 +7354,7 @@ async def _handle_pending_inputs_enqueue(
 
             if key.startswith("cron:") or is_noninteractive_cron_session(
                 session,
-                channel_types=_channel_types_from_config(ctx.config),
+                channel_types=channel_types_from_config(ctx.config),
             ):
                 raise RpcHandlerError(
                     "SESSION_NOT_INTERACTIVE",
@@ -8330,7 +8321,7 @@ async def _handle_sessions_steer_v2_impl(
 
     if key.startswith("cron:") or is_noninteractive_cron_session(
         session,
-        channel_types=_channel_types_from_config(ctx.config),
+        channel_types=channel_types_from_config(ctx.config),
     ):
         raise RpcHandlerError(
             "SESSION_NOT_INTERACTIVE",
@@ -8593,7 +8584,7 @@ async def _handle_sessions_steer(params: dict | None, ctx: RpcContext) -> dict:
         raise KeyError(f"Session not found: {key}")
     if key.startswith("cron:") or is_noninteractive_cron_session(
         session,
-        channel_types=_channel_types_from_config(ctx.config),
+        channel_types=channel_types_from_config(ctx.config),
     ):
         raise RpcHandlerError(
             "SESSION_NOT_INTERACTIVE",

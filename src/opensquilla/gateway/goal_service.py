@@ -22,6 +22,10 @@ from opensquilla.gateway.routing import (
     build_web_route_envelope,
 )
 from opensquilla.gateway.session_lifecycle import TaskLifecycleEvent
+from opensquilla.gateway.session_view import (
+    channel_types_from_config,
+    is_noninteractive_cron_session,
+)
 from opensquilla.gateway.turn_ingress import complete_durable_ingress
 from opensquilla.sandbox.run_mode_policy import principal_has_host_execute
 from opensquilla.session.goals import (
@@ -247,6 +251,28 @@ class GoalService:
                 "EXECUTION_LEASE_REQUIRED",
                 "Subscribe to this session before starting Goal execution",
             )
+
+    async def _require_interactive_session(self, session_key: str) -> Any:
+        """Return the stored session after enforcing the shared Cron policy."""
+
+        key = canonicalize_session_key(session_key)
+        if key.startswith("cron:"):
+            raise GoalConflictError(
+                "SESSION_NOT_INTERACTIVE",
+                "Cron isolated sessions are read-only and cannot mutate Goals",
+            )
+        session = await self._storage.get_session(key)
+        if session is None:
+            raise KeyError(f"Session not found: {key}")
+        if is_noninteractive_cron_session(
+            session,
+            channel_types=channel_types_from_config(self._config),
+        ):
+            raise GoalConflictError(
+                "SESSION_NOT_INTERACTIVE",
+                "Cron isolated sessions are read-only and cannot mutate Goals",
+            )
+        return session
 
     def _install_lease(
         self,
@@ -668,11 +694,9 @@ class GoalService:
                 session_key=key,
                 ctx=ctx,
             )
+        session = await self._require_interactive_session(key)
         self._require_execution_available()
         self._require_subscription(ctx, key)
-        session = await self._storage.get_session(key)
-        if session is None:
-            raise KeyError(f"Session not found: {key}")
 
         prepare_message = getattr(self._session_manager, "prepare_message", None)
         if not callable(prepare_message):
@@ -1002,6 +1026,8 @@ class GoalService:
                 ctx=ctx,
             )
 
+        await self._require_interactive_session(key)
+
         async with self._lock(key):
             goal = await self._storage.get_goal(key)
             if goal is None:
@@ -1135,6 +1161,7 @@ class GoalService:
                 session_key=key,
                 ctx=ctx,
             )
+        await self._require_interactive_session(key)
         self._require_execution_available()
         self._require_subscription(ctx, key)
 

@@ -318,7 +318,10 @@ async def test_chat_send_atomically_creates_first_plan_turn(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_chat_send_atomically_snapshots_initial_routing_mode(tmp_path: Path) -> None:
+async def test_chat_send_atomically_snapshots_initial_routing_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     async with _open_intent_stack(tmp_path / "sessions.db") as stack:
         async def production_provider(*, session_key: str, run_kind: str) -> Any:
             return await capture_accepted_model_routing_config(
@@ -369,6 +372,14 @@ async def test_chat_send_atomically_snapshots_initial_routing_mode(tmp_path: Pat
         assert accepted_audit["session_revision"] == 0
         assert accepted_audit["source"] == "session"
         assert stack.handler_runs[0].accepted_config.session_mode == "router"
+
+        def reject_live_routing_revalidation(*_args: Any, **_kwargs: Any) -> Any:
+            raise ValueError("router is no longer constructable")
+
+        monkeypatch.setattr(
+            "opensquilla.gateway.model_routing.model_routing_patches",
+            reject_live_routing_revalidation,
+        )
 
         replay = await get_dispatcher().dispatch(
             "rpc-new-chat-routing-replay",

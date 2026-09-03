@@ -2486,6 +2486,16 @@ describe('useChatSend attachment payloads', () => {
     const pendingSessionIntent = ref<string | null>(null)
     const isStreaming = ref(false)
     const policy = ref<string | null>(null)
+    const imageInputAdmission = ref<'allowed' | 'blocked'>('allowed')
+    const modelRoutingSettingsBusy = ref(false)
+    let attachmentWorkPending = false
+    const queuedImage: Attachment = {
+      kind: 'staged',
+      local_id: 92,
+      name: 'queued-original.png',
+      mime: 'image/png',
+      file_uuid: 'queued-original-image',
+    }
     const rpc = {
       call: vi.fn()
         .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
@@ -2525,15 +2535,35 @@ describe('useChatSend attachment payloads', () => {
         sendBlockedReason: policy,
         sessionInteractivityBlockedReason: policy,
         idempotentReplayBlockedReason: ref(null),
+        imageInputAdmission,
+        modelRoutingSettingsBusy,
+        hasPendingAttachmentWork: () => attachmentWorkPending,
       })
       sendApi = configured.api
-      await pending.enqueuePendingPayload({ text: 'recover accepted queue receipt' })
+      await pending.enqueuePendingPayload({
+        text: 'recover accepted queue receipt',
+        attachments: [queuedImage],
+        promptAnnotationIds: ['queued-annotation'],
+      })
       const item = pending.pendingQueue.value[0]!
 
       await expect(sendApi.sendQueuedFollowup(item, sessionKey.value))
         .resolves.toBe('retryable_failure')
       const originalParams = rpc.call.mock.calls[0]?.[1]
       policy.value = 'Cron sessions are read-only.'
+      attachmentWorkPending = true
+      imageInputAdmission.value = 'blocked'
+      modelRoutingSettingsBusy.value = true
+      configured.stream.isStreaming.value = true
+      item.text = ''
+      item.attachments = [{
+        kind: 'failed',
+        local_id: 93,
+        name: 'current-failed.png',
+        mime: 'image/png',
+        error: 'current upload failed',
+      }]
+      item.promptAnnotationIds = ['current-annotation']
 
       pending.schedulePendingDrainAfterTerminal()
       await vi.advanceTimersByTimeAsync(500)
@@ -3937,6 +3967,8 @@ describe('useChatSend attachment payloads', () => {
 
   it('moves an ambiguous v2 steer into an exact-id retry instead of resending as follow-up', async () => {
     const inputText = ref('steer this exact turn')
+    let methodAvailable = true
+    let attachmentWorkPending = false
     const rpc = {
       call: vi.fn()
         .mockRejectedValueOnce(Object.assign(new Error('response lost'), {
@@ -3950,6 +3982,8 @@ describe('useChatSend attachment payloads', () => {
     }
     const { api, options, stream, pendingQueue } = makeOptions({
       ...sameTurnSteerOptions(),
+      methodAvailability: method => methodAvailable && method === 'sessions.steer.v2',
+      hasPendingAttachmentWork: () => attachmentWorkPending,
       rpc,
       inputText,
       busySendMode: ref<BusySendMode>('steer'),
@@ -3973,6 +4007,9 @@ describe('useChatSend attachment payloads', () => {
     // Even if the active task settles before the retry, the original target
     // and request id are replayed; this must never become chat.send follow-up.
     stream.isStreaming.value = false
+    methodAvailable = false
+    attachmentWorkPending = true
+    pendingQueue.value[0]!.text = ''
     await api.sendQueuedSteer(pendingQueue.value[0]!)
 
     expect(rpc.call.mock.calls[1]?.[1]).toEqual(firstParams)
@@ -4854,6 +4891,51 @@ describe('useChatSend attachment payloads', () => {
       expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce()
     },
   )
+
+  it('replays an unknown direct acceptance before mutable attachment admission', async () => {
+    const image: Attachment = {
+      kind: 'staged',
+      local_id: 91,
+      name: 'original.png',
+      mime: 'image/png',
+      file_uuid: 'original-image',
+    }
+    const pendingAttachments = ref<Attachment[]>([image])
+    const promptAnnotationIds = ref<readonly string[]>(['annotation-original'])
+    const imageInputAdmission = ref<'allowed' | 'blocked'>('allowed')
+    const modelRoutingSettingsBusy = ref(false)
+    let attachmentWorkPending = false
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+        .mockResolvedValueOnce({
+          accepted: true,
+          replayed: true,
+          sessionKey: 'agent:main:webchat:test',
+          task_id: 'task-direct-replay',
+        }),
+    }
+    const { api, stream } = makeOptions({
+      rpc,
+      pendingAttachments,
+      promptAnnotationIds,
+      imageInputAdmission,
+      modelRoutingSettingsBusy,
+      hasPendingAttachmentWork: () => attachmentWorkPending,
+    })
+
+    await api.onSend()
+    const originalParams = rpc.call.mock.calls[0]?.[1]
+    attachmentWorkPending = true
+    imageInputAdmission.value = 'blocked'
+    modelRoutingSettingsBusy.value = true
+    stream.isStreaming.value = true
+
+    await api.onSend()
+
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(originalParams)
+  })
 
   it('keeps project validation for a definitely rejected visible retry', async () => {
     const projectState = ref<'ready' | 'removed'>('ready')
@@ -7574,7 +7656,7 @@ describe('useChatSend Ensemble image guard', () => {
     expect(pendingAttachments.value).toEqual([image])
   })
 
-  it('blocks a recovered image retry without restoring it after switching to Ensemble', async () => {
+  it('replays an unknown image acceptance after switching to Ensemble', async () => {
     const image = readyAttachment('image/jpg', { name: 'photo.jpg' })
     const pendingAttachments = ref<Attachment[]>([image])
     const modelRoutingMode = ref<'off' | 'llm_ensemble'>('off')
@@ -7585,11 +7667,13 @@ describe('useChatSend Ensemble image guard', () => {
 
     await api.onSend()
     expect(rpc.call).toHaveBeenCalledOnce()
+    const originalParams = rpc.call.mock.calls[0]?.[1]
     modelRoutingMode.value = 'llm_ensemble'
 
     await api.onSend()
 
-    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(originalParams)
     expect(options.inputText.value).toBe('')
     expect(pendingAttachments.value).toEqual([])
   })

@@ -118,6 +118,19 @@ def is_noninteractive_cron_session(
     return session_kind == "cron" and not _interactive(session_kind, surface)
 
 
+def channel_types_from_config(config: Any) -> dict[str, str]:
+    """Return the configured channel-name to platform-type map used by policy."""
+
+    channels_cfg = getattr(getattr(config, "channels", None), "channels", None) or []
+    out: dict[str, str] = {}
+    for entry in channels_cfg:
+        name = str(getattr(entry, "name", "") or "").strip().lower()
+        channel_type = str(getattr(entry, "type", "") or "").strip().lower()
+        if name and channel_type:
+            out[name] = channel_type
+    return out
+
+
 def _effective_agent_id(session: Any, key: str) -> str:
     parsed = parse_agent_id(key)
     stored = _display(getattr(session, "agent_id", None)) or "main"
