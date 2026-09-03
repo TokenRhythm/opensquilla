@@ -2850,10 +2850,21 @@ export function useChatSend(options: UseChatSendOptions) {
         exactReplayAttempt,
         replayComposerSnapshot,
       )
+      const replayingSupersededEditOwner = Boolean(
+        preserveUnrelatedBranch
+        && replayComposerSnapshot.messageEditActive
+        && replayComposerSnapshot.messageEditGeneration !== null
+        && exactReplayAttempt.messageEditTranscriptOwner
+        && replayComposerSnapshot.messageEditGeneration
+          !== exactReplayAttempt.messageEditTranscriptOwner.generation,
+      )
       if (!messageEditOwnerMatchesSnapshot(replayComposerSnapshot)) return
-      if (!validateAttemptMessageEditTranscript(exactReplayAttempt)) return
+      if (
+        !replayingSupersededEditOwner
+        && !validateAttemptMessageEditTranscript(exactReplayAttempt)
+      ) return
       if (replayBlockedReason?.value) return
-      await dispatchSend(exactReplayAttempt.text, {
+      const replayOutcome = await dispatchSend(exactReplayAttempt.text, {
         composerText,
         composerSnapshot: replayComposerSnapshot,
         promptAnnotationIds: exactReplayAttempt.promptAnnotationIds,
@@ -2887,10 +2898,18 @@ export function useChatSend(options: UseChatSendOptions) {
               validateTranscript: false,
             },
           )
-          && validateAttemptMessageEditTranscript(exactReplayAttempt)
+          && (
+            replayingSupersededEditOwner
+            || validateAttemptMessageEditTranscript(exactReplayAttempt)
+          )
         ),
       })
-      return
+      if (!replayingSupersededEditOwner || replayOutcome !== 'accepted') return
+      if (
+        options.sessionKey.value !== requestSessionKey
+        || !sameComposerOwnershipSnapshot(captureComposerSnapshot(), replayComposerSnapshot)
+        || !messageEditOwnerMatchesSnapshot(replayComposerSnapshot, true)
+      ) return
     }
 
     if (hasPayload) {
@@ -3346,8 +3365,15 @@ export function useChatSend(options: UseChatSendOptions) {
     // stream state, and chat.send. A blocked draft remains exactly editable.
     if (modelImageSendBlocked(sourceAttachments)) return 'not_sent'
     const retryCandidate = sendOpts.retryAttempt ?? (preserveComposer ? null : recoveredAttempt)
+    const explicitBackgroundReceiptReplay = Boolean(
+      retryCandidate
+      && sendOpts.retryAttempt === retryCandidate
+      && sendOpts.idempotentReplay
+      && sendOpts.backgroundReceiptReplay,
+    )
     const retryCandidateOwnsTranscript = !retryCandidate
       || attemptOwnsMessageEditTranscript(retryCandidate)
+      || explicitBackgroundReceiptReplay
     const requestedPromptAnnotationIds = sendOpts.promptAnnotationIds === undefined
       ? currentPromptAnnotationIds()
       : [...sendOpts.promptAnnotationIds]

@@ -2609,6 +2609,96 @@ describe('useChatSend attachment payloads', () => {
     },
   )
 
+  it('settles an older Edit receipt in the background before sending the newer Edit click', async () => {
+    const oldChildSessionKey = 'agent:main:webchat:old-edit-child'
+    const newChildSessionKey = 'agent:main:webchat:new-edit-child'
+    const {
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      messageActions,
+    } = makeEditedMessageState('older edited question')
+    const pendingInputWal = memoryHandoffWal()
+    const beginBackgroundReceiptReplay = vi.fn()
+    const adoptResponseSession = vi.fn(async (key: string) => {
+      sessionKey.value = key
+    })
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+        .mockResolvedValueOnce({
+          sessionKey: oldChildSessionKey,
+          task_id: 'old-edit-task',
+        })
+        .mockResolvedValueOnce({
+          sessionKey: newChildSessionKey,
+          task_id: 'new-edit-task',
+        }),
+    }
+    const harness = makeOptions({
+      rpc,
+      sessionKey,
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      pendingInputWal,
+      beginBackgroundReceiptReplay,
+      adoptResponseSession,
+      messageEditGeneration: messageActions.editGeneration,
+      messageEditActive: messageActions.editActive,
+      validateMessageEditOwner: messageActions.validateEditOwner,
+      commitMessageEdit: messageActions.commitEdit,
+      adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
+    })
+
+    await harness.api.onSend()
+    const oldParams = rpc.call.mock.calls[0]?.[1]
+    const oldRequestId = oldParams?.clientRequestId
+    const oldClientMessageId = oldParams?.clientMessageId
+
+    pendingForkBeforeMessageId.value = null
+    messages.value = [
+      { role: 'user', text: 'first question', ts: null, messageId: 'first-user' },
+      { role: 'assistant', text: 'first answer', ts: null, messageId: 'first-answer' },
+      { role: 'user', text: 'new edit target', ts: null, messageId: 'new-edit-target' },
+      { role: 'assistant', text: 'new target answer', ts: null, messageId: 'new-answer' },
+    ]
+    expect(messageActions.cancelEdit()).toBe(false)
+    messageActions.editMessage({
+      role: 'user',
+      displayRole: 'user',
+      roleLabel: 'User',
+      text: 'new edit target',
+      timeStr: '',
+      showHeader: false,
+      sourceIndex: 2,
+      messageId: 'new-edit-target',
+    })
+    inputText.value = 'newer edited question'
+    const newerEditOwner = messages.value
+    expect(messageActions.editActive.value).toBe(true)
+    expect(pendingForkBeforeMessageId.value).toBe('new-edit-target')
+    expect(inputText.value).toBe('newer edited question')
+
+    await harness.api.onSend()
+
+    expect(rpc.call).toHaveBeenCalledTimes(3)
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(oldParams)
+    expect(rpc.call.mock.calls[2]?.[1]).toMatchObject({
+      message: 'newer edited question',
+      forkBeforeMessageId: 'new-edit-target',
+    })
+    expect(rpc.call.mock.calls[2]?.[1]?.clientRequestId).not.toBe(oldRequestId)
+    expect(beginBackgroundReceiptReplay).toHaveBeenCalledWith(oldClientMessageId, true)
+    expect(adoptResponseSession).toHaveBeenCalledTimes(1)
+    expect(adoptResponseSession).toHaveBeenCalledWith(newChildSessionKey, expect.any(String))
+    expect(sessionKey.value).toBe(newChildSessionKey)
+    expect(messages.value).toBe(newerEditOwner)
+    expect(messageActions.editActive.value).toBe(false)
+    expect(await pendingInputWal.listHandoffs!()).toEqual([])
+  })
+
   it('quarantines an older receipt when Edit starts during project preflight', async () => {
     const {
       sessionKey,
