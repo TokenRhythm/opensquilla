@@ -59,10 +59,6 @@ from opensquilla.attachment_refs import (
 )
 from opensquilla.chat.conversation import ChatSendRequest, sessions_send_params
 from opensquilla.chat.source import chat_source_metadata
-from opensquilla.contracts.adapters.sessions_changed_contract import (
-    SESSIONS_CHANGED_EVENT,
-    observe_sessions_changed_payload,
-)
 from opensquilla.engine.cache_break_monitor import (
     cancel_active_compactions,
     compaction_terminal_status,
@@ -172,6 +168,11 @@ from opensquilla.gateway.project_workspace_runtime import (
     project_workspace_snapshot,
 )
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, RpcUnavailableError, get_dispatcher
+from opensquilla.gateway.session_event_publisher import (
+    buffer_session_event,
+    prepare_session_event_payload,
+    send_prepared_to_subscribers,
+)
 from opensquilla.gateway.session_events import build_sessions_changed_payload
 from opensquilla.gateway.session_services import (
     get_session_epoch,
@@ -1612,9 +1613,12 @@ def _buffer_session_event(
     event_name: str,
     payload: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    if event_name.startswith("session.event."):
-        return get_session_streams().record(session_key, event_name, payload)
-    return dict(payload or {})
+    return buffer_session_event(
+        session_key,
+        event_name,
+        payload,
+        streams=get_session_streams(),
+    )
 
 
 async def _resolve_attachments(
@@ -8644,34 +8648,7 @@ async def _prepare_session_event_payload(
     event_name: str,
     payload: dict,
 ) -> dict:
-    """Resolve async epoch metadata before an event enters the replay buffer."""
-    prepared = dict(payload)
-    # Inject current epoch into session.event.* and sessions.changed
-    # payloads so the frontend _isStaleEpoch guard can filter pre-reset frames.
-    # Read from the in-process cache on SessionManager (populated by reset path) to
-    # avoid a DB SELECT on every high-frequency event such as text_delta.
-    if event_name.startswith("session.event.") or event_name == "sessions.changed":
-        session_manager = getattr(ctx, "session_manager", None)
-        cached_epoch = get_session_epoch(session_manager, session_key)
-        if cached_epoch is not None:
-            prepared["epoch"] = cached_epoch
-        else:
-            storage = get_session_storage(session_manager)
-            if storage is not None and hasattr(storage, "get_epoch"):
-                try:
-                    epoch = await storage.get_epoch(session_key)
-                    # Populate cache for subsequent emits.
-                    set_session_epoch(session_manager, session_key, epoch)
-                    prepared["epoch"] = epoch
-                except Exception:
-                    pass  # best-effort; never block event delivery
-    if event_name == SESSIONS_CHANGED_EVENT:
-        prepared = observe_sessions_changed_payload(
-            prepared,
-            source="gateway.rpc_sessions",
-            allow_legacy=False,
-        )
-    return prepared
+    return await prepare_session_event_payload(ctx, session_key, event_name, payload)
 
 
 async def _send_prepared_to_subscribers(
@@ -8680,27 +8657,7 @@ async def _send_prepared_to_subscribers(
     event_name: str,
     send_payload: dict,
 ) -> None:
-    """Broadcast an already-buffered event without mutating replay state."""
-    from opensquilla.gateway.websocket import get_registry
-
-    sub_mgr = getattr(ctx, "subscription_manager", None)
-    if sub_mgr is None:
-        return
-
-    registry = get_registry()
-    conn_ids = sub_mgr.get_message_subscribers(session_key)
-
-    # For session-level events, also include session subscribers
-    if event_name.startswith("sessions."):
-        conn_ids = conn_ids | sub_mgr.get_session_subscribers()
-
-    for conn_id in conn_ids:
-        conn = registry.get(conn_id)
-        if conn is not None:
-            try:
-                await conn.send_event(event_name, send_payload)
-            except Exception:
-                log.warning("emit.send_failed", conn_id=conn_id, ws_event=event_name)
+    await send_prepared_to_subscribers(ctx, session_key, event_name, send_payload)
 
 
 async def _emit_to_subscribers(
