@@ -555,6 +555,20 @@ def test_webui_boundary_changes_run_python_architecture_contracts(
     } <= set(plan["python_targets"])
 
 
+def test_artifact_workbench_application_runs_full_python_architecture_suite(
+    tmp_path: Path,
+    suite_config: dict[str, Any],
+) -> None:
+    plan = _plan(
+        tmp_path,
+        suite_config,
+        "src/opensquilla/application/artifact_workbench.py",
+    )
+
+    assert "python-full" in plan["required_suites"]
+    assert plan["python_targets"] == ["tests"]
+
+
 def test_gateway_change_runs_browser_recovery_without_native_desktop(
     tmp_path: Path, suite_config: dict[str, Any]
 ) -> None:

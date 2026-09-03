@@ -518,7 +518,10 @@ jobs:
           && needs.frontend-check.result == 'success'
           && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
     runs-on: windows-latest
-    timeout-minutes: 15
+    # Real-toolchain generation scales with the complete Contract inventory.
+    # Keep the full Windows check, determinism replay, tests, and cross-OS hash
+    # comparison within one bounded job instead of weakening the gate.
+    timeout-minutes: 60
     steps:
       - name: Check out repository
         uses: actions/checkout@v4

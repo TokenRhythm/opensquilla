@@ -501,4 +501,13 @@ describe('workbench resource provider', () => {
     })).rejects.toThrow('unavailable')
     expect(call).not.toHaveBeenCalled()
   })
+
+  it('rejects non-object results before legacy projection', async () => {
+    const provider = createRpcWorkbenchResourceProvider({
+      call: vi.fn().mockResolvedValue(['invalid-wire-result']),
+      hasRpcMethod: () => true,
+    })
+
+    await expect(provider.list('session-a')).rejects.toThrow('invalid response')
+  })
 })

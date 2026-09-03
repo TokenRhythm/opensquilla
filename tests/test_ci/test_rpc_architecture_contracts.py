@@ -37,9 +37,48 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         # Session lifecycle wire models terminate at the registration Adapter;
         # the Application Module receives transport-neutral typed commands.
         "src/opensquilla/gateway/adapters/session_lifecycle_contract.py",
+        # Reset and compact wire models terminate at SessionMaintenance's
+        # generated registration Adapter.
+        "src/opensquilla/gateway/adapters/session_maintenance_contract.py",
+        # Canonical and legacy turn wire models terminate at TurnAdmission's
+        # generated registration Adapter.
+        "src/opensquilla/gateway/adapters/turn_admission_contract.py",
+        # Durable pending-input wire models terminate at the queue Adapter;
+        # the Application Module receives queue identities and revisions.
+        "src/opensquilla/gateway/adapters/pending_input_queue_contract.py",
+        # Usage, command, feedback, prompt-cache, and clarification wire
+        # models terminate at their generated registration Adapter.
+        "src/opensquilla/gateway/adapters/conversation_ancillary_contract.py",
+        # AgentCatalog wire models terminate at its generated registration
+        # Adapter; the Application Module sees explicit create/update commands.
+        "src/opensquilla/gateway/adapters/agent_catalog_contract.py",
+        # Channel administration wire models terminate at its generated
+        # registration Adapter; Application Modules see typed channel intents.
+        "src/opensquilla/gateway/adapters/channel_administration_contract.py",
+        # Cron scheduling and subscription wire models terminate at the
+        # generated registration Adapter; Application Modules stay transport-neutral.
+        "src/opensquilla/gateway/adapters/cron_scheduler_contract.py",
+        # Runtime/readiness/log wire models terminate at the Observability
+        # registration Adapter; collectors receive transport-neutral queries.
+        "src/opensquilla/gateway/adapters/observability_contract.py",
+        # SkillCatalog read wire models terminate at its generated registration
+        # Adapter; the Application Module sees domain identities and queries.
+        "src/opensquilla/gateway/adapters/skill_catalog_contract.py",
+        # SkillManagement wire models terminate at its generated registration
+        # Adapter; the Application Module sees explicit mutation commands.
+        "src/opensquilla/gateway/adapters/skill_management_contract.py",
+        # Proposal review wire models terminate at its registration Adapter;
+        # scheduler rollback and catalog invalidation stay in the Application Module.
+        "src/opensquilla/gateway/adapters/skill_proposal_review_contract.py",
+        # Artifact Workbench wire models terminate at its registration Adapter;
+        # the Application composition receives only typed domain commands.
+        "src/opensquilla/gateway/adapters/artifact_workbench_contract.py",
         # SandboxRuntime handlers stay legacy-compatible while generated
         # descriptors own registration metadata and success validation.
         "src/opensquilla/gateway/adapters/sandbox_runtime_contract.py",
+        # Platform setup wire models terminate at the generated registration
+        # Adapter; Application Modules receive transport-neutral commands.
+        "src/opensquilla/gateway/adapters/platform_setup_contract.py",
     }
 )
 GENERATED_METADATA_IMPORT_ALLOWLIST = frozenset(
@@ -117,7 +156,7 @@ SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
 SESSIONS_RESOLVE_LITERAL_ALLOWLIST: Counter[str] = Counter()
 SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
 RUNTIME_RPC_METHOD_BASELINE = 306
-STATIC_RPC_DECORATOR_BASELINE = 259
+STATIC_RPC_DECORATOR_BASELINE = 140
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
 # closure measurement below.  The temporary S2a cumulative growth budget was
@@ -197,6 +236,12 @@ R3_APPLICATION_MODULE_FILES = (
     "src/opensquilla/application/sandbox_runtime.py",
     "src/opensquilla/application/session_read.py",
     "src/opensquilla/application/setup_workflow.py",
+    "src/opensquilla/application/session_maintenance.py",
+    "src/opensquilla/application/observability.py",
+    "src/opensquilla/application/skill_catalog.py",
+    "src/opensquilla/application/skill_management.py",
+    "src/opensquilla/application/skill_proposal_review.py",
+    "src/opensquilla/application/artifact_workbench.py",
 )
 
 # Generated schema artifacts and consumer tests are intentionally excluded:
@@ -221,6 +266,18 @@ SESSION_LIFECYCLE_AUTHORED_FILES = (
     "src/opensquilla/application/session_lifecycle.py",
     "src/opensquilla/gateway/adapters/session_lifecycle.py",
     "src/opensquilla/gateway/adapters/session_lifecycle_contract.py",
+    "src/opensquilla/application/session_maintenance.py",
+    "src/opensquilla/gateway/adapters/session_maintenance.py",
+    "src/opensquilla/gateway/adapters/session_maintenance_contract.py",
+    "src/opensquilla/application/turn_admission.py",
+    "src/opensquilla/gateway/adapters/turn_admission.py",
+    "src/opensquilla/gateway/adapters/turn_admission_contract.py",
+    "src/opensquilla/application/pending_input_queue.py",
+    "src/opensquilla/gateway/adapters/pending_input_queue.py",
+    "src/opensquilla/gateway/adapters/pending_input_queue_contract.py",
+    "src/opensquilla/application/conversation_ancillary.py",
+    "src/opensquilla/gateway/adapters/conversation_ancillary.py",
+    "src/opensquilla/gateway/adapters/conversation_ancillary_contract.py",
 )
 SESSION_LIFECYCLE_AUTHORED_LOC_CEILING = 3_000
 
@@ -238,11 +295,6 @@ APPROVED_PRIVATE_RPC_IMPORTS: Counter[tuple[str, str, str]] = Counter(
             "src/opensquilla/cli/tui/standalone_runtime.py",
             "opensquilla.gateway.rpc_sessions",
             "_apply_run_context_route_metadata",
-        ): 1,
-        (
-            "src/opensquilla/diagnostics_sources.py",
-            "opensquilla.gateway.rpc_logs",
-            "_build_logs_status",
         ): 1,
         (
             "src/opensquilla/gateway/channel_dispatch.py",
@@ -268,31 +320,6 @@ APPROVED_PRIVATE_RPC_IMPORTS: Counter[tuple[str, str, str]] = Counter(
             "src/opensquilla/gateway/rpc_chat.py",
             "opensquilla.gateway.rpc_sessions",
             "_handle_sessions_send",
-        ): 1,
-        (
-            "src/opensquilla/gateway/rpc_doctor.py",
-            "opensquilla.gateway.rpc_channels",
-            "_handle_channels_status",
-        ): 1,
-        (
-            "src/opensquilla/gateway/rpc_doctor.py",
-            "opensquilla.gateway.rpc_logs",
-            "_build_logs_status",
-        ): 1,
-        (
-            "src/opensquilla/gateway/rpc_doctor.py",
-            "opensquilla.gateway.rpc_system",
-            "_handle_doctor_memory_status",
-        ): 1,
-        (
-            "src/opensquilla/gateway/rpc_doctor.py",
-            "opensquilla.gateway.rpc_tools",
-            "_handle_providers_status",
-        ): 1,
-        (
-            "src/opensquilla/gateway/rpc_doctor.py",
-            "opensquilla.gateway.rpc_tools",
-            "_handle_search_status",
         ): 1,
         (
             "src/opensquilla/gateway/rpc_models.py",
@@ -774,6 +801,86 @@ def test_session_lifecycle_authored_surface_stays_within_large_pr_ceiling() -> N
     )
 
 
+def test_conversation_ancillary_application_does_not_depend_on_gateway() -> None:
+    path = PACKAGE_ROOT / "application" / "conversation_ancillary.py"
+    tree = _tree(path)
+    forbidden_imports: list[str] = []
+    imported_names: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module.startswith("opensquilla.gateway"):
+                forbidden_imports.append(module)
+            imported_names.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.startswith("opensquilla.gateway"):
+                    forbidden_imports.append(alias.name)
+
+    assert forbidden_imports == []
+    assert "RpcContext" not in imported_names
+
+
+def test_agent_catalog_application_does_not_depend_on_gateway() -> None:
+    path = PACKAGE_ROOT / "application" / "agent_catalog.py"
+    tree = _tree(path)
+    forbidden_imports: list[str] = []
+    imported_names: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module.startswith("opensquilla.gateway"):
+                forbidden_imports.append(module)
+            imported_names.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.startswith("opensquilla.gateway"):
+                    forbidden_imports.append(alias.name)
+
+    assert forbidden_imports == []
+    assert "RpcContext" not in imported_names
+
+
+def test_channel_administration_application_does_not_depend_on_gateway() -> None:
+    path = PACKAGE_ROOT / "application" / "channel_administration.py"
+    tree = _tree(path)
+    forbidden_imports: list[str] = []
+    imported_names: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module.startswith("opensquilla.gateway"):
+                forbidden_imports.append(module)
+            imported_names.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.startswith("opensquilla.gateway"):
+                    forbidden_imports.append(alias.name)
+
+    assert forbidden_imports == []
+    assert "RpcContext" not in imported_names
+
+
+def test_cron_scheduler_application_does_not_depend_on_gateway() -> None:
+    path = PACKAGE_ROOT / "application" / "cron_scheduler.py"
+    tree = _tree(path)
+    forbidden_imports: list[str] = []
+    imported_names: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module.startswith("opensquilla.gateway"):
+                forbidden_imports.append(module)
+            imported_names.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.startswith("opensquilla.gateway"):
+                    forbidden_imports.append(alias.name)
+
+    assert forbidden_imports == []
+    assert "RpcContext" not in imported_names
+
+
 def test_rpc_context_does_not_grow_past_pinned_main() -> None:
     tree = _tree(RPC_CONTEXT)
     context = next(
@@ -903,6 +1010,58 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "sessions.forkThroughTurn",
             "sessions.rename",
             "sessions.delete",
+            "sessions.reset",
+            "sessions.contextCompact",
+            "sessions.compact",
+            "chat.send",
+            "chat.abort",
+            "sessions.send",
+            "sessions.abort",
+            "sessions.steer.v2",
+            "sessions.steer",
+            "sessions.pending_inputs.enqueue",
+            "sessions.pending_inputs.list",
+            "sessions.pending_inputs.update",
+            "sessions.pending_inputs.reorder",
+            "sessions.pending_inputs.cancel",
+            "sessions.pending_inputs.dispatch",
+            "sessions.pending_inputs.steer",
+            "usage.status",
+            "usage.query",
+            "usage.cost",
+            "commands.list_for_surface",
+            "router.feedback.submit",
+            "sessions.promptCacheKeepalive.status",
+            "sessions.promptCacheKeepalive.set",
+            "chat.clarify_submit",
+            "agents.list",
+            "agents.create",
+            "agents.update",
+            "agents.delete",
+            "channels.status",
+            "channels.get",
+            "channels.probe",
+            "channels.logout",
+            "channels.restart",
+            "channels.pairings",
+            "channels.pairing.approve",
+            "channels.admin.set",
+            "channels.pairing.revoke",
+            "cron.list",
+            "cron.status",
+            "cron.add",
+            "cron.create",
+            "cron.update",
+            "cron.remove",
+            "cron.run",
+            "cron.runs",
+            "cron.subscribe",
+            "cron.unsubscribe",
+            "status",
+            "router.selflearning.status",
+            "doctor.status",
+            "logs.status",
+            "logs.tail",
         }
     ] == []
     assert [
@@ -961,6 +1120,13 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "sandbox.runtime.discard_download",
             "sandbox.resume",
         }
+    ] == []
+    from opensquilla.gateway.adapters.artifact_workbench_contract import (
+        ARTIFACT_WORKBENCH_CONTRACT_METHODS,
+    )
+
+    assert [
+        site for site in sites if site[2] in ARTIFACT_WORKBENCH_CONTRACT_METHODS
     ] == []
 
 
@@ -1130,11 +1296,61 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
         assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
         assert entry.handler.__name__ == "handle_contract_method"
 
+    from opensquilla.gateway.adapters.agent_catalog_contract import (
+        AGENT_CATALOG_CONTRACT_METHODS,
+    )
+    from opensquilla.gateway.adapters.artifact_workbench_contract import (
+        ARTIFACT_WORKBENCH_CONTRACT_METHODS,
+    )
+    from opensquilla.gateway.adapters.channel_administration_contract import (
+        CHANNEL_ADMINISTRATION_CONTRACT_METHODS,
+    )
+    from opensquilla.gateway.adapters.conversation_ancillary_contract import (
+        CONVERSATION_ANCILLARY_CONTRACT_METHODS,
+    )
+    from opensquilla.gateway.adapters.cron_scheduler_contract import (
+        CRON_SCHEDULER_CONTRACT_METHODS,
+    )
+    from opensquilla.gateway.adapters.observability_contract import (
+        OBSERVABILITY_CONTRACT_METHODS,
+    )
+    from opensquilla.gateway.adapters.pending_input_queue_contract import (
+        PENDING_INPUT_QUEUE_CONTRACT_METHODS,
+    )
     from opensquilla.gateway.adapters.session_lifecycle_contract import (
         SESSION_LIFECYCLE_CONTRACT_METHODS,
     )
+    from opensquilla.gateway.adapters.session_maintenance_contract import (
+        SESSION_MAINTENANCE_CONTRACT_METHODS,
+    )
+    from opensquilla.gateway.adapters.skill_catalog_contract import (
+        SKILL_CATALOG_CONTRACT_METHODS,
+    )
+    from opensquilla.gateway.adapters.skill_management_contract import (
+        SKILL_MANAGEMENT_CONTRACT_METHODS,
+    )
+    from opensquilla.gateway.adapters.skill_proposal_review_contract import (
+        SKILL_PROPOSAL_REVIEW_CONTRACT_METHODS,
+    )
+    from opensquilla.gateway.adapters.turn_admission_contract import (
+        TURN_ADMISSION_CONTRACT_METHODS,
+    )
 
-    for method in SESSION_LIFECYCLE_CONTRACT_METHODS:
+    for method in (
+        *SESSION_LIFECYCLE_CONTRACT_METHODS,
+        *SESSION_MAINTENANCE_CONTRACT_METHODS,
+        *TURN_ADMISSION_CONTRACT_METHODS,
+        *PENDING_INPUT_QUEUE_CONTRACT_METHODS,
+        *CONVERSATION_ANCILLARY_CONTRACT_METHODS,
+        *AGENT_CATALOG_CONTRACT_METHODS,
+        *CHANNEL_ADMINISTRATION_CONTRACT_METHODS,
+        *CRON_SCHEDULER_CONTRACT_METHODS,
+        *OBSERVABILITY_CONTRACT_METHODS,
+        *SKILL_CATALOG_CONTRACT_METHODS,
+        *SKILL_MANAGEMENT_CONTRACT_METHODS,
+        *SKILL_PROPOSAL_REVIEW_CONTRACT_METHODS,
+        *ARTIFACT_WORKBENCH_CONTRACT_METHODS,
+    ):
         entry = registry.get_entry(method)
         assert entry is not None
         assert entry.name == method

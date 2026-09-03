@@ -1,7 +1,11 @@
 import { defineStore } from 'pinia'
 import { markRaw, ref, shallowRef } from 'vue'
 
-import type { ArtifactDocumentProvider } from '@/modules/artifactWorkbench'
+import type {
+  ArtifactDocumentProvider,
+  RestoreArtifactRevision,
+  RevertArtifactChangeSet,
+} from '@/modules/artifactWorkbench'
 import type {
   ArtifactDocumentActions,
   ArtifactDocumentWorkspace,
@@ -192,7 +196,10 @@ export const useArtifactDocumentsStore = defineStore('artifactDocuments', () => 
     return { provider: currentProvider, workspace }
   }
 
-  async function runDocumentMutation<T>(
+  async function runDocumentMutation<
+    TCommand extends RestoreArtifactRevision | RevertArtifactChangeSet,
+    TResult,
+  >(
     artifact: ArtifactPayload,
     sessionKey: string,
     options: {
@@ -201,8 +208,8 @@ export const useArtifactDocumentsStore = defineStore('artifactDocuments', () => 
       operation: 'revision.restore' | 'change.revert'
       logicalKey: string
       requestPrefix: string
-      buildPayload: (requestId: string) => Readonly<Record<string, unknown>>
-      execute: (payload: Readonly<Record<string, unknown>>) => Promise<T | null>
+      buildPayload: (requestId: string) => TCommand
+      execute: (payload: TCommand) => Promise<TResult | null>
     },
   ): Promise<ArtifactDocumentWorkspace> {
     const clientRequestId = mutationRequestIds.idFor(
@@ -210,12 +217,15 @@ export const useArtifactDocumentsStore = defineStore('artifactDocuments', () => 
       options.requestPrefix,
     )
     const wasPending = mutationRequestIds.isPending(options.logicalKey, clientRequestId)
-    const payload = mutationRequestIds.pendingPayload(options.logicalKey, clientRequestId)
-      || mutationRequestIds.freeze(
-        options.logicalKey,
-        clientRequestId,
-        options.buildPayload(clientRequestId),
-      )
+    const retainedPayload = mutationRequestIds.pendingPayload(
+      options.logicalKey,
+      clientRequestId,
+    ) as TCommand | null
+    const payload = retainedPayload || mutationRequestIds.freeze(
+      options.logicalKey,
+      clientRequestId,
+      options.buildPayload(clientRequestId) as TCommand & Readonly<Record<string, unknown>>,
+    )
     const release = () => mutationRequestIds.release(options.logicalKey, clientRequestId)
     const pendingError = () => artifactProductClientError('MUTATION_OUTCOME_PENDING')
     const notApplied = async (): Promise<never> => {

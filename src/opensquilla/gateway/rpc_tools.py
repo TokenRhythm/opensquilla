@@ -385,8 +385,7 @@ async def _read_providers_status(
     }
 
 
-@_d.method("providers.status", scope="operator.read")
-async def _handle_providers_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def read_provider_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     from opensquilla.application.provider_configuration import ProviderStatus
     from opensquilla.gateway.adapters.provider_configuration import (
         RpcContextProviderStatusPort,
@@ -404,21 +403,25 @@ async def _handle_providers_status(params: dict | None, ctx: RpcContext) -> dict
     )
 
 
-@_d.method("search.status", scope="operator.read")
-async def _handle_search_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+@_d.method("providers.status", scope="operator.read")
+async def _handle_providers_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    return await read_provider_status(params, ctx)
+
+
+async def read_search_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if params is not None and not isinstance(params, dict):
         raise ValueError("params must be an object")
     provider = (params or {}).get("provider")
     payload = search_runtime_status(str(provider) if provider else None)
-    # Configured and buildable is only half of ready. `search.query` below runs
-    # through the sandbox network path, which can refuse before the provider is
-    # reached, so report that half from the same posture the query will resolve.
-    # Every readiness surface reaches this handler — the CLI table, and the
-    # Control UI Overview through the doctor — so one field covers all of them.
     reason = in_process_network_precondition()
     payload["networkReady"] = reason is None
     payload["networkBlockedReason"] = reason
     return payload
+
+
+@_d.method("search.status", scope="operator.read")
+async def _handle_search_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    return await read_search_status(params, ctx)
 
 
 def _query_limit(params: dict[str, Any]) -> int | None:

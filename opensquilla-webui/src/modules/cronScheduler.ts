@@ -1,5 +1,29 @@
 import type { InjectionKey } from 'vue'
-import type { CronJob, CronRun } from '@/types/cron'
+import type { CronJob, CronRun, DeliveryConfig } from '@/types/cron'
+
+export type CronSchedule =
+  | { readonly kind: 'cron'; readonly expr: string; readonly tz?: string }
+  | { readonly kind: 'every'; readonly every_seconds: number }
+  | { readonly kind: 'at'; readonly at: string }
+
+export interface CronJobMutation {
+  id?: string
+  name: string
+  enabled: boolean
+  schedule?: CronSchedule
+  payloadKind: string
+  agentId: string
+  sessionTarget: string
+  text: string
+  workspaceId: string
+  templateId: string
+  tz?: string
+  wakeMode?: string
+  delivery?: DeliveryConfig
+  sessionKey?: string
+  targetSessionKey?: string
+  originSessionKey?: string
+}
 
 export interface CronRunOutcome {
   readonly runId?: string
@@ -23,13 +47,11 @@ export interface CronSubscription {
 
 export interface CronScheduler {
   listJobs(): Promise<readonly CronJob[]>
-  saveJob(input: Record<string, unknown>, options: { readonly existing: boolean }): Promise<void>
+  saveJob(input: CronJobMutation, options: { readonly existing: boolean }): Promise<void>
   setEnabled(jobId: string, enabled: boolean): Promise<void>
   runNow(jobId: string): Promise<CronRunOutcome>
   remove(jobId: string): Promise<void>
   listRuns(jobId: string, limit?: number): Promise<readonly CronRun[]>
-  ready(options?: { readonly timeoutMs?: number }): Promise<void>
-  resumeEvents(): Promise<void>
   subscribe(listener: (event: CronRunFinished) => void): CronSubscription
 }
 

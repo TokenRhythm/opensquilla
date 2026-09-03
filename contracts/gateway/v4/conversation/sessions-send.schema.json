@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opensquilla.dev/contracts/gateway/v4/conversation/sessions-send.schema.json",
+  "title": "OpenSquilla sessions.send Contract",
+  "description": "Language-neutral Contract for the session-oriented compatibility name of turn admission.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "request": { "$ref": "#/$defs/SessionsSendRequestFrame" },
+    "response": { "$ref": "#/$defs/SessionsSendResponseFrame" }
+  },
+  "x-opensquilla-wire": { "protocol": "opensquilla-websocket-json", "version": 4, "compatibility": "exact-json-tree" },
+  "x-opensquilla-codegen": {
+    "python": { "tool": "datamodel-code-generator", "version": "0.75.1", "target": "pydantic_v2.BaseModel" },
+    "typescript": { "tool": "json-schema-to-typescript", "version": "15.0.4" },
+    "runtimeValidation": { "tool": "ajv", "version": "8.17.1", "mode": "standalone-adapter-only" }
+  },
+  "x-opensquilla-method": {
+    "name": "sessions.send",
+    "kind": "command",
+    "scope": "operator.write",
+    "guestAllowed": false,
+    "idempotency": "idempotent",
+    "timeout": { "policy": "caller" },
+    "capability": { "kind": "method-availability", "name": "sessions.send" },
+    "request": "#/$defs/SessionsSendRequestFrame",
+    "params": "#/$defs/SessionsSendParams",
+    "response": "#/$defs/SessionsSendResponseFrame",
+    "result": "#/$defs/SessionsSendResult",
+    "errors": [
+      { "code": "INVALID_PARAMS" }, { "code": "INVALID_REQUEST" },
+      { "code": "UNAUTHORIZED" }, { "code": "UNAVAILABLE", "retryable": true },
+      { "code": "STORAGE_BUSY", "retryable": true, "retryAfterMs": true, "details": true },
+      { "code": "QUEUE_FULL", "retryable": true },
+      { "code": "QUEUE_FULL_DIRTY", "details": true },
+      { "code": "SESSION_CHANGED", "retryable": true },
+      { "code": "IDEMPOTENCY_CONFLICT" }, { "code": "INTERNAL_ERROR" }
+    ]
+  },
+  "$defs": {
+    "SessionsSendParams": {
+      "type": "object", "additionalProperties": true, "required": ["message"],
+      "properties": {
+        "key": { "type": ["string", "null"] },
+        "sessionKey": { "type": ["string", "null"] },
+        "session_key": { "type": ["string", "null"] },
+        "message": { "type": "string" },
+        "client_request_id": { "type": ["string", "null"] },
+        "clientRequestId": { "type": ["string", "null"] },
+        "client_message_id": { "type": ["string", "null"] },
+        "clientMessageId": { "type": ["string", "null"] },
+        "attachments": { "type": ["array", "null"], "items": {} },
+        "_source": { "type": ["object", "null"], "additionalProperties": true }
+      }
+    },
+    "SessionsSendLegacyNonObjectParams": { "anyOf": [{ "type": "array", "items": {} }, { "type": "string" }, { "type": "number" }, { "type": "boolean" }] },
+    "SessionsSendRequestFrame": {
+      "type": "object", "additionalProperties": false, "required": ["type", "id", "method"],
+      "properties": {
+        "type": { "const": "req" }, "id": { "type": "string" }, "method": { "const": "sessions.send" },
+        "params": { "anyOf": [{ "$ref": "#/$defs/SessionsSendParams" }, { "$ref": "#/$defs/SessionsSendLegacyNonObjectParams" }, { "type": "null" }] }
+      }
+    },
+    "SessionsSendResult": { "type": "object", "additionalProperties": true },
+    "RpcError": { "type": "object", "additionalProperties": true, "required": ["code", "message"], "properties": { "code": { "type": "string" }, "message": { "type": "string" }, "details": {}, "retryable": { "type": ["boolean", "null"] }, "retry_after_ms": { "type": ["integer", "null"], "minimum": 0 }, "accepted": { "type": ["boolean", "null"] } } },
+    "SessionsSendOkResponseFrame": { "type": "object", "additionalProperties": false, "required": ["type", "id", "ok", "payload"], "properties": { "type": { "const": "res" }, "id": { "type": "string" }, "ok": { "const": true }, "payload": { "$ref": "#/$defs/SessionsSendResult" }, "error": { "type": "null" } } },
+    "SessionsSendErrorResponseFrame": { "type": "object", "additionalProperties": false, "required": ["type", "id", "ok", "error"], "properties": { "type": { "const": "res" }, "id": { "type": "string" }, "ok": { "const": false }, "payload": { "type": "null" }, "error": { "$ref": "#/$defs/RpcError" } } },
+    "SessionsSendResponseFrame": { "oneOf": [{ "$ref": "#/$defs/SessionsSendOkResponseFrame" }, { "$ref": "#/$defs/SessionsSendErrorResponseFrame" }] }
+  }
+}

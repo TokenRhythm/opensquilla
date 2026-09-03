@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import os
-import re
 import stat
 from pathlib import Path
 from typing import Any, cast
 
 from opensquilla.agents.scope import resolve_agent_workspace_dir
+from opensquilla.gateway.adapters.agent_catalog import GatewayAgentCatalogAdapter
+from opensquilla.gateway.adapters.agent_catalog_contract import (
+    register_agent_catalog_contract,
+)
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.rpc import (
     RpcContext,
     RpcHandlerError,
@@ -32,12 +36,6 @@ _WORKSPACE_AGENT_FILE_NAMES = (
     "memory.md",
 )
 _WORKSPACE_AGENT_FILE_NAME_SET = frozenset(_WORKSPACE_AGENT_FILE_NAMES)
-
-
-def _slugify(name: str) -> str:
-    """Generate a slug-based ID from a name."""
-    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-    return slug or "agent"
 
 
 def _get_agent_registry(ctx: RpcContext):
@@ -165,126 +163,47 @@ def _write_workspace_agent_file(root: Path, name: str, content: Any) -> dict[str
     return {"name": safe_name, "path": safe_name, "size": len(data)}
 
 
-@_d.method("agents.list", scope="operator.read")
-async def _handle_agents_list(params: dict | None, ctx: RpcContext) -> dict:
-    include_builtin = (params or {}).get("includeBuiltin", True)
-
-    agent_registry = getattr(ctx, "agent_registry", None)
-    if agent_registry is not None:
-        agents = await agent_registry.list_agents(include_builtin=include_builtin)
-        return {"agents": agents}
-
-    return {"agents": []}
+def _agent_catalog(ctx: RpcContext) -> GatewayAgentCatalogAdapter:
+    return GatewayAgentCatalogAdapter(getattr(ctx, "agent_registry", None))
 
 
-_UPDATE_FIELD_MAP: tuple[tuple[str, ...], ...] = (
-    ("name",),
-    ("description",),
-    ("model",),
-    ("systemPrompt", "system_prompt"),
-    ("tools",),
-    ("workspace",),
-    ("agentDir", "agent_dir"),
-    ("enabled",),
-)
+async def _handle_agents_list(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _agent_catalog(ctx).list(params)
 
 
-@_d.method("agents.create", scope="operator.admin")
-async def _handle_agents_create(params: dict | None, ctx: RpcContext) -> dict:
-    if not isinstance(params, dict):
-        raise ValueError("params.id or params.name is required")
-
-    name = params.get("name")
-    raw_agent_id = params.get("id") or params.get("agentId") or (_slugify(name) if name else None)
-    if not raw_agent_id:
-        raise ValueError("params.id or params.name is required")
-    agent_id = normalize_agent_id(raw_agent_id)
-
-    agent_registry = _get_agent_registry(ctx)
-    try:
-        result = await agent_registry.create_agent(
-            agent_id=agent_id,
-            name=name or agent_id,
-            description=params.get("description"),
-            model=params.get("model"),
-            workspace=params.get("workspace"),
-            agent_dir=params.get("agentDir") or params.get("agent_dir"),
-            enabled=params.get("enabled", True),
-            system_prompt=params.get("systemPrompt"),
-            tools=params.get("tools"),
-        )
-    except ValueError as exc:
-        msg = str(exc)
-        if "already exists" in msg:
-            raise RpcHandlerError(
-                "agent.exists", msg, details={"agentId": agent_id}
-            ) from exc
-        if agent_id == "main" or "builtin" in msg.lower():
-            raise RpcHandlerError(
-                "agent.builtin_immutable", msg, details={"agentId": agent_id}
-            ) from exc
-        raise
-    return cast(dict, result)
+async def _handle_agents_create(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _agent_catalog(ctx).create(params)
 
 
-@_d.method("agents.update", scope="operator.admin")
-async def _handle_agents_update(params: dict | None, ctx: RpcContext) -> dict:
-    if not isinstance(params, dict) or "id" not in params:
-        raise ValueError("params.id is required")
-
-    agent_id = normalize_agent_id(params["id"])
-    updated_fields: list[str] = []
-    for aliases in _UPDATE_FIELD_MAP:
-        if any(alias in params for alias in aliases):
-            updated_fields.append(aliases[0])
-
-    if not updated_fields:
-        raise ValueError("No fields to update")
-
-    agent_registry = _get_agent_registry(ctx)
-    try:
-        result = await agent_registry.update_agent(agent_id, **{**params, "id": agent_id})
-    except ValueError as exc:
-        msg = str(exc)
-        if "builtin" in msg.lower() or agent_id == "main":
-            raise RpcHandlerError(
-                "agent.builtin_immutable", msg, details={"agentId": agent_id}
-            ) from exc
-        raise
-    except KeyError as exc:
-        raise RpcHandlerError(
-            "agent.not_found",
-            f"Agent '{agent_id}' does not exist",
-            details={"agentId": agent_id},
-        ) from exc
-    return cast(dict, result)
+async def _handle_agents_update(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _agent_catalog(ctx).update(params)
 
 
-@_d.method("agents.delete", scope="operator.admin")
-async def _handle_agents_delete(params: dict | None, ctx: RpcContext) -> None:
-    if not isinstance(params, dict) or "id" not in params:
-        raise ValueError("params.id is required")
+async def _handle_agents_delete(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> None:
+    return await _agent_catalog(ctx).remove(params)
 
-    agent_id = normalize_agent_id(params["id"])
 
-    # Refuse to delete builtin agents
-    if agent_id == "main":
-        raise RpcHandlerError(
-            "agent.builtin_immutable",
-            "Cannot delete builtin agent: main",
-            details={"agentId": agent_id},
-        )
-
-    agent_registry = _get_agent_registry(ctx)
-    try:
-        await agent_registry.delete_agent(agent_id)
-    except KeyError as exc:
-        raise RpcHandlerError(
-            "agent.not_found",
-            f"Agent '{agent_id}' does not exist",
-            details={"agentId": agent_id},
-        ) from exc
-    return None
+for _agent_catalog_method, _agent_catalog_implementation in (
+    ("agents.list", _handle_agents_list),
+    ("agents.create", _handle_agents_create),
+    ("agents.update", _handle_agents_update),
+    ("agents.delete", _handle_agents_delete),
+):
+    register_agent_catalog_contract(
+        _d,
+        _agent_catalog_method,
+        _agent_catalog_implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
 
 
 @_d.method("agents.files.list", scope="operator.read")

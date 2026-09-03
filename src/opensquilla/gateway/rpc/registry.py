@@ -470,42 +470,11 @@ async def _health(params: Any, ctx: RpcContext) -> dict[str, Any]:
 
 
 async def _status(params: Any, ctx: RpcContext) -> dict[str, Any]:
-    from opensquilla.gateway.boot import _boot_time_ms
+    """Compatibility callable for tests and non-registry callers."""
+    from opensquilla.application.observability import RuntimeStatus
+    from opensquilla.gateway.adapters.observability import GatewayRuntimeStatusPort
 
-    now = int(time.time() * 1000)
-    uptime = now - _boot_time_ms if _boot_time_ms > 0 else 0
-
-    provider_name = None
-    if ctx.provider_selector is not None and getattr(
-        ctx.provider_selector, "is_configured", True
-    ):
-        # Configured provider id (e.g. "openrouter"), not the OpenAI-compatible
-        # backend class physically serving it. See app.api_system_status.
-        provider_name = getattr(ctx.provider_selector, "active_provider_id", None)
-        if not provider_name:
-            try:
-                p = ctx.provider_selector.resolve()
-                provider_name = getattr(p, "provider_name", None)
-            except Exception:
-                pass
-
-    active_sessions = 0
-    if ctx.session_manager is not None:
-        storage = get_session_storage(ctx.session_manager)
-        if storage is not None:
-            try:
-                sessions = await storage.list_sessions(limit=1000)
-                active_sessions = len(sessions)
-            except Exception:
-                pass
-
-    return {
-        "status": "running",
-        "version": __version__,
-        "uptime_ms": uptime,
-        "provider": provider_name,
-        "active_sessions": active_sessions,
-    }
+    return await RuntimeStatus(GatewayRuntimeStatusPort(ctx)).read()
 
 
 async def _config_get(params: Any, ctx: RpcContext) -> Any:
@@ -558,7 +527,6 @@ async def _last_heartbeat(params: Any, ctx: RpcContext) -> dict[str, Any]:
 
 # Register all built-in methods against the singleton.
 _registry.register("health", _health, "operator.read")
-_registry.register("status", _status, "operator.read")
 _registry.register("config.get", _config_get, "operator.read")
 _registry.register("sessions.get", _sessions_get, "operator.read")
 _registry.register("gateway.identity.get", _gateway_identity_get, "operator.read")

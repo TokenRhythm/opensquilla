@@ -15,6 +15,7 @@ import { createV4ArtifactPromptAnnotations } from './artifactPromptAnnotationsV4
 import { createV4WorkbenchResources } from './workbenchResourcesV4'
 import { createV4ArtifactContentAccess } from './artifactAccessV4'
 import { createV4AttachmentContentAccess } from './attachmentAccessV4'
+import { documentChangeEventContract } from './artifactWorkbenchContracts'
 
 interface RpcTransport {
   request<T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions): Promise<T>
@@ -41,10 +42,6 @@ interface AttachmentUploadClient {
   }): Promise<T>
 }
 
-const DOCUMENT_EVENTS = [
-  'session.event.artifact_state',
-  'document.state_changed',
-] as const
 const MAX_ARTIFACT_PAGE_LIMIT = 200
 
 interface ArtifactPageShape {
@@ -165,7 +162,7 @@ function createV4ArtifactCatalog(rpc: RpcTransport): ArtifactCatalog {
 }
 
 function documentChange(value: unknown): (ArtifactDocumentChange & { sequence: number }) | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  if (!documentChangeEventContract.validatePayload(value)) return null
   const raw = value as Record<string, unknown>
   const documentId = typeof raw.documentId === 'string'
     ? raw.documentId.trim()
@@ -195,7 +192,9 @@ export function createV4ArtifactWorkbench(
 
   const startLease = (): void => {
     if (wireSubscriptions.length > 0) return
-    wireSubscriptions = DOCUMENT_EVENTS.map(event => events.subscribe(event, emit))
+    wireSubscriptions = documentChangeEventContract.wireNames.map(
+      event => events.subscribe(event, emit),
+    )
   }
 
   const stopLease = (): void => {

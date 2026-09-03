@@ -42,6 +42,12 @@ from opensquilla.artifacts import (
     ArtifactStore,
     artifact_payload,
 )
+from opensquilla.gateway.adapters.artifact_workbench import (
+    GatewayArtifactWorkbenchAdapter,
+)
+from opensquilla.gateway.adapters.artifact_workbench_contract import (
+    register_artifact_workbench_contract,
+)
 from opensquilla.gateway.artifact_product_errors import (
     ArtifactProductErrorCode,
     artifact_product_error,
@@ -49,6 +55,7 @@ from opensquilla.gateway.artifact_product_errors import (
 )
 from opensquilla.gateway.document_resource_recovery import DocumentImportRecoverySource
 from opensquilla.gateway.event_bridge import EventBridge
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.rpc import (
     RpcContext,
     RpcHandlerError,
@@ -92,9 +99,7 @@ _MUTATION_OPERATION_TURN_PREFIX = {
     "revision.restore": "revision-restore",
     "change.revert": "change-revert",
 }
-_MUTATION_IMPORT_OPERATIONS = frozenset(
-    {"document.import", "workbench.resources.open"}
-)
+_MUTATION_IMPORT_OPERATIONS = frozenset({"document.import", "workbench.resources.open"})
 _MUTATION_PUBLISH_OPERATIONS = frozenset({"document.publish"})
 
 
@@ -423,9 +428,7 @@ def _legacy_attachment_id(
     index: int,
     sha256: str,
 ) -> str:
-    digest = hashlib.sha256(
-        f"{session_id}\0{message_id}\0{index}\0{sha256}".encode()
-    ).digest()[:18]
+    digest = hashlib.sha256(f"{session_id}\0{message_id}\0{index}\0{sha256}".encode()).digest()[:18]
     token = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
     return f"att_legacy_{token}"
 
@@ -1003,9 +1006,7 @@ async def _resource_inventory(
     binding_by_source = {
         (item.source_type.value, item.source_resource_id): item for item in bindings
     }
-    publication_by_artifact = {
-        item.deliverable_artifact_id: item for item in publications
-    }
+    publication_by_artifact = {item.deliverable_artifact_id: item for item in publications}
     store = ArtifactStore(media_root_from_config(ctx.config))
     deliverable_importable: dict[str, bool] = {}
     for deliverable in deliverables:
@@ -1101,11 +1102,7 @@ async def _preview_material(
         include_inline_urls=True,
     )
     resource = next(
-        (
-            item
-            for item in inventory[resource_type]
-            if item["resource"]["id"] == resource_id
-        ),
+        (item for item in inventory[resource_type] if item["resource"]["id"] == resource_id),
         None,
     )
     if resource is None:
@@ -1179,12 +1176,11 @@ async def _preview_material(
     expected_sha = str(resource.get("sha256") or "")
     expected_size = resource.get("size")
     if (
-        (_SHA256_RE.fullmatch(expected_sha) and hashlib.sha256(payload).hexdigest() != expected_sha)
-        or (
-            isinstance(expected_size, int)
-            and not isinstance(expected_size, bool)
-            and len(payload) != expected_size
-        )
+        _SHA256_RE.fullmatch(expected_sha) and hashlib.sha256(payload).hexdigest() != expected_sha
+    ) or (
+        isinstance(expected_size, int)
+        and not isinstance(expected_size, bool)
+        and len(payload) != expected_size
     ):
         raise _internal_product_error(
             ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
@@ -1788,8 +1784,7 @@ async def _emit_publish_events(
     await bridge.emit(session_key, "document.state_changed", payload)
 
 
-@_d.method("workbench.resources.list", scope="operator.read")
-async def _handle_resources_list(
+async def _execute_resources_list(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -1837,8 +1832,7 @@ async def _handle_resources_list(
     }
 
 
-@_d.method("workbench.resources.get", scope="operator.read")
-async def _handle_resources_get(
+async def _execute_resources_get(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -1852,11 +1846,7 @@ async def _handle_resources_get(
         include_inline_urls=True,
     )
     resource = next(
-        (
-            item
-            for item in inventory[resource_type]
-            if item["resource"]["id"] == resource_id
-        ),
+        (item for item in inventory[resource_type] if item["resource"]["id"] == resource_id),
         None,
     )
     if resource is None:
@@ -1888,11 +1878,7 @@ async def _current_document_open_response(
         include_inline_urls=True,
     )
     resource = next(
-        (
-            item
-            for item in inventory["document"]
-            if item["resource"]["id"] == document.document_id
-        ),
+        (item for item in inventory["document"] if item["resource"]["id"] == document.document_id),
         None,
     )
     if resource is None:
@@ -1975,8 +1961,7 @@ async def _mutation_resolution_payload(
     return response
 
 
-@_d.method("artifacts.mutations.resolve", scope="operator.write")
-async def _handle_mutation_resolve(
+async def _execute_mutation_resolve(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -2098,8 +2083,7 @@ def _open_idempotency_key(
     return "open-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
-@_d.method("workbench.resources.open", scope="operator.write")
-async def _handle_resources_open(
+async def _execute_resources_open(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -2116,8 +2100,7 @@ async def _handle_resources_open(
             raise ValueError("params.expectedSha256 must be a SHA-256 digest")
     requested_idempotency_key = (
         _idempotency_key(params)
-        if isinstance(params, dict)
-        and ("idempotencyKey" in params or "clientRequestId" in params)
+        if isinstance(params, dict) and ("idempotencyKey" in params or "clientRequestId" in params)
         else None
     )
     resource_type, resource_id = _resource_ref_with_legacy_alias(params)
@@ -2143,11 +2126,7 @@ async def _handle_resources_open(
         include_inline_urls=True,
     )
     resource = next(
-        (
-            item
-            for item in inventory[resource_type]
-            if item["resource"]["id"] == resource_id
-        ),
+        (item for item in inventory[resource_type] if item["resource"]["id"] == resource_id),
         None,
     )
     if resource is None:
@@ -2159,9 +2138,7 @@ async def _handle_resources_open(
         return _readonly_open_response(resource)
 
     relations = resource.get("relations")
-    related_document_id = (
-        relations.get("documentId") if isinstance(relations, dict) else None
-    )
+    related_document_id = relations.get("documentId") if isinstance(relations, dict) else None
     if isinstance(related_document_id, str) and related_document_id:
         return await _current_document_open_response(
             ctx,
@@ -2233,8 +2210,7 @@ async def _handle_resources_open(
     )
 
 
-@_d.method("workbench.previews.create", scope="operator.read")
-async def _handle_preview_create(
+async def _execute_preview_create(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -2262,16 +2238,14 @@ async def _handle_preview_create(
     }
 
 
-@_d.method("documents.import", scope="operator.write")
-async def _handle_documents_import(
+async def _execute_documents_import(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
     return await import_document_from_resource(params, ctx)
 
 
-@_d.method("documents.publish", scope="operator.write")
-async def _handle_documents_publish(
+async def _execute_documents_publish(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -2457,6 +2431,51 @@ async def _handle_documents_publish(
             ref=ref,
         )
     return _publish_response(result, ref, replayed=replayed)
+
+
+_WORKBENCH_RESOURCE_IMPLEMENTATIONS = (
+    ("workbench.resources.list", _execute_resources_list),
+    ("workbench.resources.get", _execute_resources_get),
+    ("artifacts.mutations.resolve", _execute_mutation_resolve),
+    ("workbench.resources.open", _execute_resources_open),
+    ("workbench.previews.create", _execute_preview_create),
+    ("documents.import", _execute_documents_import),
+    ("documents.publish", _execute_documents_publish),
+)
+
+(
+    _handle_resources_list,
+    _handle_resources_get,
+    _handle_mutation_resolve,
+    _handle_resources_open,
+    _handle_preview_create,
+    _handle_documents_import,
+    _handle_documents_publish,
+) = tuple(
+    GatewayArtifactWorkbenchAdapter.bind(method, implementation)
+    for method, implementation in _WORKBENCH_RESOURCE_IMPLEMENTATIONS
+)
+
+for _artifact_method, _artifact_implementation in zip(
+    (method for method, _implementation in _WORKBENCH_RESOURCE_IMPLEMENTATIONS),
+    (
+        _handle_resources_list,
+        _handle_resources_get,
+        _handle_mutation_resolve,
+        _handle_resources_open,
+        _handle_preview_create,
+        _handle_documents_import,
+        _handle_documents_publish,
+    ),
+    strict=True,
+):
+    register_artifact_workbench_contract(
+        _d,
+        _artifact_method,
+        _artifact_implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
 
 
 __all__ = [

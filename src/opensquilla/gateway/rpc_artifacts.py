@@ -12,6 +12,13 @@ from opensquilla.artifacts import (
     artifact_payload,
     validate_artifact_cursor,
 )
+from opensquilla.gateway.adapters.artifact_workbench import (
+    GatewayArtifactWorkbenchAdapter,
+)
+from opensquilla.gateway.adapters.artifact_workbench_contract import (
+    register_artifact_workbench_contract,
+)
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.protocol import ERROR_NOT_FOUND
 from opensquilla.gateway.rpc import (
     RpcContext,
@@ -101,8 +108,7 @@ def _empty_artifact_page(limit: int) -> dict[str, Any]:
     }
 
 
-@_d.method("artifacts.list", scope="operator.read")
-async def _handle_artifacts_list(
+async def _execute_artifacts_list(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -123,9 +129,7 @@ async def _handle_artifacts_list(
             before=before,
         )
     except OSError as exc:
-        raise RpcUnavailableError(
-            "Artifact storage is temporarily unavailable."
-        ) from exc
+        raise RpcUnavailableError("Artifact storage is temporarily unavailable.") from exc
     return {
         "artifacts": [artifact_payload(ref) for ref in page.refs],
         "has_more": page.has_more,
@@ -136,8 +140,7 @@ async def _handle_artifacts_list(
     }
 
 
-@_d.method("artifacts.get", scope="operator.read")
-async def _handle_artifacts_get(
+async def _execute_artifacts_get(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -166,7 +169,25 @@ async def _handle_artifacts_get(
             details={"sessionKey": session_key, "artifactId": artifact_id},
         ) from None
     except OSError as exc:
-        raise RpcUnavailableError(
-            "Artifact storage is temporarily unavailable."
-        ) from exc
+        raise RpcUnavailableError("Artifact storage is temporarily unavailable.") from exc
     return {"artifact": artifact_payload(ref)}
+
+
+_handle_artifacts_list = GatewayArtifactWorkbenchAdapter.bind(
+    "artifacts.list", _execute_artifacts_list
+)
+_handle_artifacts_get = GatewayArtifactWorkbenchAdapter.bind(
+    "artifacts.get", _execute_artifacts_get
+)
+
+for _artifact_method, _artifact_implementation in (
+    ("artifacts.list", _handle_artifacts_list),
+    ("artifacts.get", _handle_artifacts_get),
+):
+    register_artifact_workbench_contract(
+        _d,
+        _artifact_method,
+        _artifact_implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
