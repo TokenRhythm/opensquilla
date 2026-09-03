@@ -21,9 +21,10 @@ Policy (matches the bundle-route precedent):
   loopback HTTP Gateway. Normal web pages cannot forge their browser-controlled
   Origin, while this keeps Desktop development overrides interoperable.
 * A non-http(s) origin the operator explicitly lists in ``cors.allowed_origins``
-  (for example ``chrome-extension://<id>``) may reach a loopback HTTP Gateway
-  for the same reason: the Origin is browser-controlled, the match is exact,
-  and remote listeners are unaffected.
+  (for example ``chrome-extension://<id>``) may reach state-changing HTTP and
+  WebSocket endpoints through a loopback request authority. The Origin is
+  browser-controlled, the match is exact, and non-loopback request authorities
+  remain rejected by those guards regardless of the configured bind.
 * Everything else — including the opaque ``"null"`` origin and unparsable
   values — is rejected with 403 ``FORBIDDEN_ORIGIN``.
 """
@@ -214,7 +215,7 @@ def _listed_custom_scheme_origin_allowed(
     request_port: int | None,
     config: GatewayConfig | None,
 ) -> bool:
-    """Allow an operator-listed non-http(s) origin to reach a loopback Gateway.
+    """Allow a listed non-http(s) origin through a loopback request authority.
 
     Browser extension runtimes attach a custom-scheme ``Origin`` (for example
     ``chrome-extension://<id>``) that is not an http(s) origin: it can neither
@@ -222,7 +223,8 @@ def _listed_custom_scheme_origin_allowed(
     An operator who deliberately lists the exact origin in
     ``cors.allowed_origins`` gets the same treatment as the registered Desktop
     origin — loopback request authority only, ``*`` never accepted — because a
-    hostile web page cannot forge a browser-controlled Origin header.
+    hostile web page cannot forge a browser-controlled Origin header. CORS
+    response-header emission remains a separate, configuration-driven policy.
     """
     if config is None or origin == "null" or "://" not in origin:
         return False

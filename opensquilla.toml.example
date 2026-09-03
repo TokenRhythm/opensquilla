@@ -557,9 +557,9 @@ default_mode = "bypass"                 # off | on | bypass | full
 # Cross-origin browser access to the gateway HTTP API. Off by default: the
 # Web UI is served same-origin from the gateway itself and non-browser
 # clients (CLI, desktop app, curl) never need CORS. Only list origins here
-# if you host a separate frontend on another origin, or to let a local
-# browser extension (for example "chrome-extension://<id>") reach a loopback
-# gateway; avoid "*", especially together with allow_credentials.
+# if you host a separate frontend on another origin, or to let a local browser
+# extension (for example "chrome-extension://<id>") reach the gateway through
+# a loopback request address; avoid "*", especially with allow_credentials.
 # allowed_origins = []
 # allow_credentials = true
 

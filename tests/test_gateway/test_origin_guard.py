@@ -253,7 +253,7 @@ _EXTENSION_ORIGIN = "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 def test_listed_extension_origin_passes_on_loopback() -> None:
     # An operator who connects a local browser extension lists its exact
-    # origin; the same loopback-only courtesy as the registered Desktop origin.
+    # origin; the request targets the same loopback authority as the Web UI.
     config = GatewayConfig()
     config.cors.allowed_origins = [_EXTENSION_ORIGIN]
     with _client(config) as client:
@@ -264,6 +264,27 @@ def test_listed_extension_origin_passes_on_loopback() -> None:
         )
 
     assert response.status_code == 200, response.text
+
+
+def test_listed_extension_origin_accepts_loopback_authority_on_wildcard_bind() -> None:
+    # Bind reachability and request authority are separate: a wildcard bind
+    # still serves a local extension that explicitly targets 127.0.0.1.
+    config = GatewayConfig()
+    config.host = "0.0.0.0"
+    config.cors.allowed_origins = [_EXTENSION_ORIGIN]
+    with TestClient(
+        create_gateway_app(config),
+        base_url=_SAME_ORIGIN,
+        client=_OWNER_PEER,
+    ) as client:
+        response = client.post(
+            "/api/approvals/settings",
+            json={"mode": "prompt"},
+            headers={"Origin": _EXTENSION_ORIGIN},
+        )
+
+    payload = response.json()
+    assert payload.get("code") != "FORBIDDEN_ORIGIN", response.text
 
 
 def test_unlisted_extension_origin_is_rejected() -> None:
@@ -309,8 +330,9 @@ def test_wildcard_does_not_admit_extension_origins() -> None:
     assert response.json()["code"] == "FORBIDDEN_ORIGIN"
 
 
-def test_listed_extension_origin_never_reaches_a_remote_listener() -> None:
-    # The extension door is loopback-only, exactly like the Desktop origin.
+def test_listed_extension_origin_rejected_for_remote_request_authority() -> None:
+    # The unsafe-request door rejects a non-loopback request authority even
+    # when the gateway also listens on that interface.
     config = GatewayConfig()
     config.host = "0.0.0.0"
     config.cors.allowed_origins = [_EXTENSION_ORIGIN]
@@ -362,13 +384,24 @@ def test_listed_extension_origin_passes_the_ws_handshake_on_loopback() -> None:
     assert websocket_origin_allowed(ws, config) is True
 
 
+def test_listed_extension_origin_ws_accepts_loopback_authority_on_wildcard_bind() -> None:
+    config = GatewayConfig()
+    config.host = "0.0.0.0"
+    config.cors.allowed_origins = [_EXTENSION_ORIGIN]
+    ws = _StubWebSocket({"origin": _EXTENSION_ORIGIN}, URL("ws://127.0.0.1:18791/ws"))
+
+    assert websocket_origin_allowed(ws, config) is True
+
+
 def test_unlisted_extension_origin_fails_the_ws_handshake() -> None:
     ws = _StubWebSocket({"origin": _EXTENSION_ORIGIN}, URL("ws://127.0.0.1:18791/ws"))
 
     assert websocket_origin_allowed(ws, GatewayConfig()) is False
 
 
-def test_listed_extension_origin_ws_handshake_rejected_on_remote() -> None:
+def test_listed_extension_origin_ws_rejected_for_remote_request_authority() -> None:
+    # The same wildcard listener rejects the custom Origin when the request
+    # targets a non-loopback authority.
     config = GatewayConfig()
     config.host = "0.0.0.0"
     config.cors.allowed_origins = [_EXTENSION_ORIGIN]
@@ -422,6 +455,32 @@ def test_explicitly_configured_origin_still_gets_cors_headers() -> None:
 
     assert allowed.headers.get("access-control-allow-origin") == "https://frontend.example"
     assert "access-control-allow-origin" not in foreign.headers
+
+
+def test_extension_origin_cors_headers_remain_config_driven_on_remote_bind() -> None:
+    # This PR changes unsafe-request and WebSocket guards only. Exact CORS
+    # allowlist behavior, including on a remote-capable bind, remains intact.
+    config = GatewayConfig()
+    config.host = "0.0.0.0"
+    config.cors.allowed_origins = [_EXTENSION_ORIGIN]
+    with TestClient(
+        create_gateway_app(config),
+        base_url="http://192.0.2.10:18791",
+        client=("192.0.2.20", 51000),
+    ) as client:
+        response = client.get("/health", headers={"Origin": _EXTENSION_ORIGIN})
+        preflight = client.options(
+            "/api/config",
+            headers={
+                "Origin": _EXTENSION_ORIGIN,
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.headers.get("access-control-allow-origin") == _EXTENSION_ORIGIN
+    assert preflight.status_code == 200
+    assert preflight.headers.get("access-control-allow-origin") == _EXTENSION_ORIGIN
 
 
 # ── Boot-time wildcard warning ───────────────────────────────────────────────
