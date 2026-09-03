@@ -1214,17 +1214,30 @@ try {
     consented_at_utc: null,
     forced_off: false,
   })
+  const reliabilityCollectionSuppressed = [
+    'OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY',
+    'OPENSQUILLA_TELEMETRY_DISABLED',
+    'DO_NOT_TRACK',
+    'OPENSQUILLA_PRIVACY_DISABLE_RELIABILITY_DIAGNOSTICS',
+    'CI',
+    'GITHUB_ACTIONS',
+    'OPENSQUILLA_TESTING',
+  ].some((name) => ['1', 'true', 'yes', 'on'].includes(
+    String(process.env[name] || '').trim().toLowerCase(),
+  )) || String(process.env.PYTEST_CURRENT_TEST || '').trim().length > 0
+  const expectedReliabilitySpool = reliabilityCollectionSuppressed
+    ? ['keep.ready']
+    : ['.desktop-reliability-session.tmp', 'keep.ready']
   const reliabilitySpool = await waitFor(async () => {
     const entries = (await readDirectoryOrEmpty(join(earlySpoolRoot, 'reliability'))).sort()
-    return JSON.stringify(entries) === JSON.stringify([
-      '.desktop-reliability-session.tmp',
-      'keep.ready',
-    ]) ? entries : null
+    return JSON.stringify(entries) === JSON.stringify(expectedReliabilitySpool) ? entries : null
   }, 'consent-gated reliability session marker')
   assert.deepEqual(
     reliabilitySpool,
-    ['.desktop-reliability-session.tmp', 'keep.ready'],
-    'enabling reliability must preserve its queued event and start the consent-gated session marker',
+    expectedReliabilitySpool,
+    reliabilityCollectionSuppressed
+      ? 'automated environments must preserve existing local events without collecting new ones'
+      : 'enabling reliability must preserve its queued event and start the consent-gated session marker',
   )
   const remainingGrowthSpool = await readDirectoryOrEmpty(join(earlySpoolRoot, 'growth'))
   assert.deepEqual(remainingGrowthSpool, [])
