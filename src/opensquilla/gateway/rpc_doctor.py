@@ -12,6 +12,7 @@ from opensquilla.application.observability import (
     ReadinessDiagnostics,
     ReadinessQuery,
 )
+from opensquilla.application.provider_configuration import ProviderStatus
 from opensquilla.gateway.adapters.observability import (
     GatewayReadinessDataPort,
     GatewayReadinessEvaluationPort,
@@ -19,18 +20,14 @@ from opensquilla.gateway.adapters.observability import (
 from opensquilla.gateway.adapters.observability_contract import (
     register_observability_contract,
 )
+from opensquilla.gateway.adapters.provider_configuration import GatewayProviderStatusPort
+from opensquilla.gateway.channel_status_runtime import read_channel_status
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.log_status_runtime import read_log_status
 from opensquilla.gateway.memory_status_runtime import read_memory_status
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
-from opensquilla.gateway.rpc_channels import read_channel_status as _handle_channels_status
-from opensquilla.gateway.rpc_tools import (
-    read_provider_status as _handle_providers_status,
-)
-from opensquilla.gateway.rpc_tools import (
-    read_search_status as _handle_search_status,
-)
+from opensquilla.gateway.search_status_runtime import read_search_status
 from opensquilla.sandbox.status import status_payload as _sandbox_status_payload
 
 _d = get_dispatcher()
@@ -95,9 +92,13 @@ def _search_api_key_env(ctx: RpcContext, payload: dict[str, Any]) -> str:
         return ""
 
 
-async def _search_payload(ctx: RpcContext) -> dict[str, Any]:
+async def _search_payload(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    del params
     try:
-        payload = cast(dict[str, Any], await _handle_search_status({}, ctx))
+        payload = cast(dict[str, Any], await _search_runtime_payload({}, ctx))
         payload.setdefault("apiKeyEnv", _search_api_key_env(ctx, payload))
         return payload
     except (KeyError, ValueError) as exc:
@@ -114,6 +115,37 @@ async def _search_payload(ctx: RpcContext) -> dict[str, Any]:
             "buildable": False,
             "error": str(exc),
         }
+
+
+async def _search_runtime_payload(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    del ctx
+    provider = (params or {}).get("provider")
+    return read_search_status(str(provider) if provider else None)
+
+
+async def _provider_payload(params: dict[str, Any] | None, ctx: RpcContext) -> dict[str, Any]:
+    query = params or {}
+    return await ProviderStatus(GatewayProviderStatusPort(ctx)).read(
+        provider_id=query.get("provider"),
+        probe_models=bool(query.get("probeModels", False)),
+    )
+
+
+async def _channel_payload(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    del params
+    from opensquilla.gateway.boot import _boot_id
+
+    return await read_channel_status(
+        config=getattr(ctx, "config", None),
+        channel_manager=getattr(ctx, "channel_manager", None),
+        boot_id=_boot_id,
+    )
 
 
 def _sandbox_payload(ctx: RpcContext) -> dict[str, Any]:
@@ -428,17 +460,17 @@ async def _doctor_status_contract(
     params = params or {}
     port = GatewayReadinessDataPort(
         ctx,
-        provider=_handle_providers_status,
+        provider=_provider_payload,
         logs=lambda _params, context: _build_logs_status(context),
         memory=_handle_doctor_memory_status,
-        channels=_handle_channels_status,
+        channels=_channel_payload,
         sandbox=lambda _params, context: _sandbox_payload(context),
         router=lambda query, context: _router_payload(
             context, deep=bool((query or {}).get("deep", True))
         ),
         squilla_router=lambda _params, context: _squilla_router_runtime_payload(context),
         memory_embedding=lambda _params, context: _memory_embedding_payload(context),
-        search=lambda _params, context: _search_payload(context),
+        search=_search_payload,
         image_generation=lambda _params, context: _image_generation_payload(context),
         llm_ensemble=lambda _params, context: _llm_ensemble_payload(context),
     )

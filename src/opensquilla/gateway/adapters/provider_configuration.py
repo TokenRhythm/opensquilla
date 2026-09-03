@@ -5,14 +5,12 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
+from opensquilla.gateway.provider_status_runtime import read_provider_status
 from opensquilla.gateway.rpc import RpcContext
 
 ModelCatalogLoader = Callable[[RpcContext], Awaitable[dict[str, Any]]]
 RoutingReader = Callable[[RpcContext], Awaitable[dict[str, Any]]]
 RoutingWriter = Callable[[str, RpcContext], Awaitable[dict[str, Any]]]
-ProviderStatusLoader = Callable[
-    [str | None, bool, RpcContext], Awaitable[dict[str, Any]]
-]
 
 
 class RpcContextModelCatalogPort:
@@ -43,10 +41,11 @@ class RpcContextModelRoutingPort:
         return await self._writer(mode, self._ctx)
 
 
-class RpcContextProviderStatusPort:
-    def __init__(self, ctx: RpcContext, loader: ProviderStatusLoader) -> None:
+class GatewayProviderStatusPort:
+    """Provider status projection backed by concrete Gateway dependencies."""
+
+    def __init__(self, ctx: RpcContext) -> None:
         self._ctx = ctx
-        self._loader = loader
 
     async def load_provider_status(
         self,
@@ -54,4 +53,10 @@ class RpcContextProviderStatusPort:
         provider_id: str | None,
         probe_models: bool,
     ) -> Mapping[str, Any]:
-        return await self._loader(provider_id, probe_models, self._ctx)
+        return await read_provider_status(
+            config=getattr(self._ctx, "config", None),
+            provider_selector=getattr(self._ctx, "provider_selector", None),
+            provider_stats=getattr(self._ctx, "provider_stats", None),
+            provider_id=provider_id,
+            probe_models=probe_models,
+        )

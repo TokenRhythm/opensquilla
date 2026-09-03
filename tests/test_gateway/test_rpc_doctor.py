@@ -91,8 +91,8 @@ def _inactive_llm_ensemble(ctx: RpcContext) -> dict[str, Any]:
 
 def _patch_ready_support_surfaces(monkeypatch: pytest.MonkeyPatch, rpc_doctor: Any) -> None:
     monkeypatch.setattr(rpc_doctor, "_handle_doctor_memory_status", _ready_memory)
-    monkeypatch.setattr(rpc_doctor, "_handle_channels_status", _ready_channels)
-    monkeypatch.setattr(rpc_doctor, "_handle_search_status", _ready_search)
+    monkeypatch.setattr(rpc_doctor, "_channel_payload", _ready_channels)
+    monkeypatch.setattr(rpc_doctor, "_search_runtime_payload", _ready_search)
     monkeypatch.setattr(rpc_doctor, "_build_logs_status", _ready_logs)
     monkeypatch.setattr(rpc_doctor, "_router_payload", _ready_router)
     monkeypatch.setattr(rpc_doctor, "_llm_ensemble_payload", _inactive_llm_ensemble)
@@ -139,7 +139,7 @@ async def test_doctor_status_combines_runtime_findings(monkeypatch) -> None:
             ],
         }
 
-    monkeypatch.setattr(rpc_doctor, "_handle_providers_status", provider_status)
+    monkeypatch.setattr(rpc_doctor, "_provider_payload", provider_status)
     _patch_ready_support_surfaces(monkeypatch, rpc_doctor)
 
     cfg = GatewayConfig()
@@ -185,7 +185,7 @@ async def test_doctor_status_scopes_config_set_recovery_commands(monkeypatch) ->
             ],
         }
 
-    monkeypatch.setattr(rpc_doctor, "_handle_providers_status", provider_status)
+    monkeypatch.setattr(rpc_doctor, "_provider_payload", provider_status)
     _patch_ready_support_surfaces(monkeypatch, rpc_doctor)
     monkeypatch.setattr(rpc_doctor, "_build_logs_status", _disabled_file_logs)
 
@@ -253,10 +253,10 @@ async def test_doctor_status_includes_search_and_image_generation_findings(
             "source": "none",
         }
 
-    monkeypatch.setattr(rpc_doctor, "_handle_providers_status", provider_status)
+    monkeypatch.setattr(rpc_doctor, "_provider_payload", provider_status)
     monkeypatch.setattr(rpc_doctor, "_handle_doctor_memory_status", _ready_memory)
-    monkeypatch.setattr(rpc_doctor, "_handle_channels_status", _ready_channels)
-    monkeypatch.setattr(rpc_doctor, "_handle_search_status", search_status)
+    monkeypatch.setattr(rpc_doctor, "_channel_payload", _ready_channels)
+    monkeypatch.setattr(rpc_doctor, "_search_runtime_payload", search_status)
     monkeypatch.setattr(rpc_doctor, "_build_logs_status", _ready_logs)
     monkeypatch.setattr(rpc_doctor, "_router_payload", _ready_router)
     monkeypatch.setattr(rpc_doctor, "_image_generation_payload", image_generation_payload)
@@ -308,10 +308,10 @@ async def test_doctor_status_explains_missing_image_generation_env_key(
         }
 
     monkeypatch.delenv("CUSTOM_IMAGE_KEY", raising=False)
-    monkeypatch.setattr(rpc_doctor, "_handle_providers_status", provider_status)
+    monkeypatch.setattr(rpc_doctor, "_provider_payload", provider_status)
     monkeypatch.setattr(rpc_doctor, "_handle_doctor_memory_status", _ready_memory)
-    monkeypatch.setattr(rpc_doctor, "_handle_channels_status", _ready_channels)
-    monkeypatch.setattr(rpc_doctor, "_handle_search_status", _ready_search)
+    monkeypatch.setattr(rpc_doctor, "_channel_payload", _ready_channels)
+    monkeypatch.setattr(rpc_doctor, "_search_runtime_payload", _ready_search)
     monkeypatch.setattr(rpc_doctor, "_build_logs_status", _ready_logs)
 
     response = await get_dispatcher().dispatch(
@@ -367,10 +367,10 @@ async def test_doctor_status_reports_unknown_search_provider_as_reconfigurable(
     async def search_status(params: dict[str, Any], ctx: RpcContext) -> dict[str, Any]:
         raise ValueError("Unknown search provider 'serpapi'. Available: brave, duckduckgo")
 
-    monkeypatch.setattr(rpc_doctor, "_handle_providers_status", provider_status)
+    monkeypatch.setattr(rpc_doctor, "_provider_payload", provider_status)
     monkeypatch.setattr(rpc_doctor, "_handle_doctor_memory_status", _ready_memory)
-    monkeypatch.setattr(rpc_doctor, "_handle_channels_status", _ready_channels)
-    monkeypatch.setattr(rpc_doctor, "_handle_search_status", search_status)
+    monkeypatch.setattr(rpc_doctor, "_channel_payload", _ready_channels)
+    monkeypatch.setattr(rpc_doctor, "_search_runtime_payload", search_status)
     monkeypatch.setattr(rpc_doctor, "_build_logs_status", _ready_logs)
     monkeypatch.setattr(
         rpc_doctor,
@@ -444,7 +444,7 @@ async def test_doctor_status_includes_router_and_memory_embedding_findings(
             "error": "memory.embedding.remote.api_key is required",
         }
 
-    monkeypatch.setattr(rpc_doctor, "_handle_providers_status", provider_status)
+    monkeypatch.setattr(rpc_doctor, "_provider_payload", provider_status)
     _patch_ready_support_surfaces(monkeypatch, rpc_doctor)
     monkeypatch.setattr(rpc_doctor, "_router_payload", router_payload)
     monkeypatch.setattr(rpc_doctor, "_memory_embedding_payload", memory_embedding_payload)
@@ -630,7 +630,7 @@ async def test_doctor_status_accepts_deep_memory_flag(monkeypatch) -> None:
         seen_memory_params.update(params)
         return {"backend": "sqlite", "status": "ok", "pendingRepairCount": 0}
 
-    monkeypatch.setattr(rpc_doctor, "_handle_providers_status", provider_status)
+    monkeypatch.setattr(rpc_doctor, "_provider_payload", provider_status)
     _patch_ready_support_surfaces(monkeypatch, rpc_doctor)
     monkeypatch.setattr(rpc_doctor, "_handle_doctor_memory_status", memory_status)
 
@@ -717,7 +717,7 @@ async def test_doctor_provider_probe_is_disabled_by_default_and_opt_in(
         }
 
     _patch_ready_support_surfaces(monkeypatch, rpc_doctor)
-    monkeypatch.setattr(rpc_doctor, "_handle_providers_status", provider_status)
+    monkeypatch.setattr(rpc_doctor, "_provider_payload", provider_status)
     ctx = RpcContext(conn_id="test", config=GatewayConfig())
 
     first = await get_dispatcher().dispatch("req-default", "doctor.status", {}, ctx)
@@ -740,7 +740,7 @@ async def test_doctor_status_explains_recovery_when_collection_fails(monkeypatch
     async def provider_status(params: dict[str, Any], ctx: RpcContext) -> dict[str, Any]:
         raise RuntimeError("provider status crashed")
 
-    monkeypatch.setattr(rpc_doctor, "_handle_providers_status", provider_status)
+    monkeypatch.setattr(rpc_doctor, "_provider_payload", provider_status)
     _patch_ready_support_surfaces(monkeypatch, rpc_doctor)
 
     response = await get_dispatcher().dispatch(
@@ -788,7 +788,7 @@ async def test_doctor_status_degrades_when_noncritical_collection_fails(monkeypa
         raise RuntimeError("memory diagnostics crashed")
 
     _patch_ready_support_surfaces(monkeypatch, rpc_doctor)
-    monkeypatch.setattr(rpc_doctor, "_handle_providers_status", provider_status)
+    monkeypatch.setattr(rpc_doctor, "_provider_payload", provider_status)
     monkeypatch.setattr(rpc_doctor, "_handle_doctor_memory_status", memory_status)
 
     response = await get_dispatcher().dispatch(
@@ -841,8 +841,8 @@ async def test_doctor_status_treats_dead_channel_as_surface_degradation(monkeypa
         }
 
     _patch_ready_support_surfaces(monkeypatch, rpc_doctor)
-    monkeypatch.setattr(rpc_doctor, "_handle_providers_status", provider_status)
-    monkeypatch.setattr(rpc_doctor, "_handle_channels_status", channels_status)
+    monkeypatch.setattr(rpc_doctor, "_provider_payload", provider_status)
+    monkeypatch.setattr(rpc_doctor, "_channel_payload", channels_status)
 
     cfg = GatewayConfig()
     cfg.config_path = "/tmp/custom-opensquilla.toml"
@@ -915,8 +915,8 @@ async def test_doctor_status_reports_dingtalk_auth_invalid_without_stopped_dupli
         }
 
     _patch_ready_support_surfaces(monkeypatch, rpc_doctor)
-    monkeypatch.setattr(rpc_doctor, "_handle_providers_status", provider_status)
-    monkeypatch.setattr(rpc_doctor, "_handle_channels_status", channels_status)
+    monkeypatch.setattr(rpc_doctor, "_provider_payload", provider_status)
+    monkeypatch.setattr(rpc_doctor, "_channel_payload", channels_status)
 
     cfg = GatewayConfig()
     cfg.config_path = "/tmp/custom-opensquilla.toml"
@@ -969,8 +969,8 @@ async def test_doctor_status_treats_no_channels_as_optional_setup(monkeypatch) -
         return {"channels": []}
 
     _patch_ready_support_surfaces(monkeypatch, rpc_doctor)
-    monkeypatch.setattr(rpc_doctor, "_handle_providers_status", provider_status)
-    monkeypatch.setattr(rpc_doctor, "_handle_channels_status", channels_status)
+    monkeypatch.setattr(rpc_doctor, "_provider_payload", provider_status)
+    monkeypatch.setattr(rpc_doctor, "_channel_payload", channels_status)
 
     response = await get_dispatcher().dispatch(
         "req-1",
@@ -1008,10 +1008,10 @@ def _patch_all_but_llm_ensemble(monkeypatch: pytest.MonkeyPatch, rpc_doctor: Any
             ],
         }
 
-    monkeypatch.setattr(rpc_doctor, "_handle_providers_status", provider_status)
+    monkeypatch.setattr(rpc_doctor, "_provider_payload", provider_status)
     monkeypatch.setattr(rpc_doctor, "_handle_doctor_memory_status", _ready_memory)
-    monkeypatch.setattr(rpc_doctor, "_handle_channels_status", _ready_channels)
-    monkeypatch.setattr(rpc_doctor, "_handle_search_status", _ready_search)
+    monkeypatch.setattr(rpc_doctor, "_channel_payload", _ready_channels)
+    monkeypatch.setattr(rpc_doctor, "_search_runtime_payload", _ready_search)
     monkeypatch.setattr(rpc_doctor, "_build_logs_status", _ready_logs)
     monkeypatch.setattr(rpc_doctor, "_router_payload", _ready_router)
     monkeypatch.setattr(
@@ -1484,7 +1484,7 @@ async def test_doctor_status_has_no_migration_discovery_surface(monkeypatch) -> 
             ],
         }
 
-    monkeypatch.setattr(rpc_doctor, "_handle_providers_status", provider_status)
+    monkeypatch.setattr(rpc_doctor, "_provider_payload", provider_status)
     _patch_ready_support_surfaces(monkeypatch, rpc_doctor)
 
     response = await get_dispatcher().dispatch(
