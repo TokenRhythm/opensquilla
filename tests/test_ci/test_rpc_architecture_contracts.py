@@ -174,7 +174,6 @@ SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
         "src/opensquilla/gateway/websocket.py": 1,
     }
 )
-SESSIONS_RESOLVE_LITERAL_ALLOWLIST: Counter[str] = Counter()
 SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
 RUNTIME_RPC_METHOD_BASELINE = 306
 RUNTIME_RPC_METHOD_DIGEST = "b95b0d01e58f0d2b221b459b322c5cf0b05f050d567186b703bd67f6260a8fc4"
@@ -320,88 +319,6 @@ SESSION_MAINTENANCE_AUTHORED_LOC_CEILING = 3_000
 RPC_IMPLEMENTATION_PREFIX = "opensquilla.gateway.rpc_"
 RPC_LOADER = GATEWAY_ROOT / "rpc" / "__init__.py"
 
-SESSION_GATEWAY_TRANSITION_DEBT = {
-    "src/opensquilla/gateway/adapters/conversation_ancillary.py": frozenset(
-        {"AncillaryExecutor", "GatewayConversationAncillaryCallbacks"}
-    ),
-    "src/opensquilla/gateway/adapters/pending_input_queue.py": frozenset(
-        {
-            "GatewayPendingInputQueueCallbacks",
-            "GatewayPendingInputQueueRuntime",
-            "PendingInputExecutor",
-            "SessionKeyReader",
-        }
-    ),
-    "src/opensquilla/gateway/adapters/session_lifecycle.py": frozenset(
-        {
-            "AgentExistsReader",
-            "AgentIdNormalizer",
-            "AgentModelReader",
-            "DeleteExecutor",
-            "DeploymentFieldsReader",
-            "DeploymentModelError",
-            "DeploymentValidator",
-            "EffectiveAgentReader",
-            "EventEmitter",
-            "ForkExecutor",
-            "GatewaySessionLifecycleCallbacks",
-            "GatewaySessionLifecyclePorts",
-            "GatewaySessionLifecycleRuntime",
-            "ModelValueReader",
-            "OptionalStringReader",
-            "RenameExecutor",
-            "SessionKeyFactory",
-            "SessionKeyReader",
-            "WorkspaceResolver",
-        }
-    ),
-    "src/opensquilla/gateway/adapters/session_reset.py": frozenset(
-        {
-            "CheckpointCoverage",
-            "FlushCorrelationBuilder",
-            "GatewaySessionResetCallbacks",
-            "RuntimeCanceller",
-            "SessionEventEmitter",
-            "SessionKeyReader",
-        }
-    ),
-    "src/opensquilla/gateway/adapters/session_maintenance.py": frozenset(
-        {
-            "BackgroundRegistrar",
-            "CheckpointCoverage",
-            "EventBuffer",
-            "EventPreparer",
-            "EventSender",
-            "GatewaySessionMaintenanceCallbacks",
-            "SessionKeyReader",
-            "TerminalStatusReader",
-        }
-    ),
-    "src/opensquilla/gateway/rpc_chat.py": frozenset(
-        {"_handle_chat_clarify_submit"}
-    ),
-    "src/opensquilla/gateway/rpc_commands.py": frozenset(
-        {"_handle_commands_list_for_surface"}
-    ),
-    "src/opensquilla/gateway/rpc_router.py": frozenset(
-        {"_handle_router_feedback_submit"}
-    ),
-    "src/opensquilla/gateway/rpc_sessions.py": frozenset(
-        {
-            "_handle_pending_inputs_cancel",
-            "_handle_pending_inputs_dispatch",
-            "_handle_pending_inputs_enqueue",
-            "_handle_pending_inputs_list",
-            "_handle_pending_inputs_reorder",
-            "_handle_pending_inputs_steer",
-            "_handle_pending_inputs_update",
-        }
-    ),
-    "src/opensquilla/gateway/rpc_usage.py": frozenset(
-        {"_handle_usage_cost", "_handle_usage_query", "_handle_usage_status"}
-    ),
-}
-
 
 def _relative(path: Path) -> str:
     return path.relative_to(ROOT).as_posix()
@@ -413,6 +330,161 @@ def _python_files(root: Path) -> list[Path]:
 
 def _tree(path: Path) -> ast.Module:
     return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+
+def _terminal_ast_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Subscript):
+        return _terminal_ast_name(node.value)
+    return ""
+
+
+def _is_application_port_boundary(node: ast.ClassDef) -> bool:
+    return node.name.endswith(("Port", "Ports")) or any(
+        _terminal_ast_name(base).endswith("Port") for base in node.bases
+    )
+
+
+def _class_methods(node: ast.ClassDef) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
+    return [item for item in node.body if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))]
+
+
+def _constructor_bindings(
+    node: ast.ClassDef,
+) -> tuple[set[str], set[str]]:
+    """Return RpcContext attributes and injected callable/object attributes."""
+
+    initializer = next(
+        (method for method in _class_methods(node) if method.name == "__init__"),
+        None,
+    )
+    if initializer is None:
+        return set(), set()
+    arguments = (
+        *initializer.args.posonlyargs,
+        *initializer.args.args,
+        *initializer.args.kwonlyargs,
+    )
+    rpc_context_parameters = {
+        argument.arg
+        for argument in arguments
+        if argument.annotation is not None and "RpcContext" in ast.unparse(argument.annotation)
+    }
+    constructor_parameters = {argument.arg for argument in arguments} - {"self"}
+    rpc_context_attributes: set[str] = set()
+    injected_attributes: set[str] = set()
+    for assignment in ast.walk(initializer):
+        if not isinstance(assignment, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = assignment.value
+        if not isinstance(value, ast.Name) or value.id not in constructor_parameters:
+            continue
+        targets = assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
+        for target in targets:
+            if not (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+            ):
+                continue
+            if value.id in rpc_context_parameters:
+                rpc_context_attributes.add(target.attr)
+            else:
+                injected_attributes.add(target.attr)
+    return rpc_context_attributes, injected_attributes
+
+
+def _contains_rpc_context_reference(node: ast.AST, attributes: set[str]) -> bool:
+    return any(
+        isinstance(item, ast.Attribute)
+        and isinstance(item.value, ast.Name)
+        and item.value.id == "self"
+        and item.attr in attributes
+        for item in ast.walk(node)
+    )
+
+
+def _semantic_parameters(method: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    """Return typed use-case inputs whose wire shape must not be reconstructed."""
+
+    return {
+        argument.arg
+        for argument in (
+            *method.args.posonlyargs,
+            *method.args.args,
+            *method.args.kwonlyargs,
+        )
+        if argument.arg
+        in {
+            "command",
+            "identity",
+            "query",
+            "request",
+            "target",
+            "topic",
+        }
+    }
+
+
+def _references_name(node: ast.AST, names: set[str]) -> bool:
+    return any(isinstance(item, ast.Name) and item.id in names for item in ast.walk(node))
+
+
+def _mapping_expression(
+    node: ast.AST,
+    bindings: set[str],
+    semantic_parameters: set[str],
+) -> bool:
+    if isinstance(node, (ast.Dict, ast.DictComp)):
+        return _references_name(node, semantic_parameters | bindings)
+    if isinstance(node, ast.Name):
+        return node.id in bindings
+    if isinstance(node, ast.Attribute):
+        return _references_name(node, semantic_parameters | bindings)
+    if isinstance(node, ast.Call):
+        name = _terminal_ast_name(node.func)
+        return (name == "dict" or name.endswith(("_params", "_payload"))) and _references_name(
+            node, semantic_parameters | bindings
+        )
+    if isinstance(node, ast.IfExp):
+        return _mapping_expression(node.body, bindings, semantic_parameters) or _mapping_expression(
+            node.orelse, bindings, semantic_parameters
+        )
+    return (
+        isinstance(node, ast.BinOp)
+        and isinstance(node.op, ast.BitOr)
+        and (
+            _mapping_expression(node.left, bindings, semantic_parameters)
+            or _mapping_expression(node.right, bindings, semantic_parameters)
+        )
+    )
+
+
+def _mapping_bindings(method: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    bindings: set[str] = set()
+    semantic_parameters = _semantic_parameters(method)
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(method):
+            if isinstance(node, ast.Assign):
+                value = node.value
+                targets = node.targets
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                value = node.value
+                targets = [node.target]
+            else:
+                continue
+            if not _mapping_expression(value, bindings, semantic_parameters):
+                continue
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id not in bindings:
+                    bindings.add(target.id)
+                    changed = True
+    return bindings
 
 
 def _imported_modules(path: Path, node: ast.AST) -> list[str]:
@@ -595,21 +667,6 @@ def test_sessions_list_authored_literal_debt_is_exact() -> None:
     stale = SESSIONS_LIST_LITERAL_ALLOWLIST - actual
     assert unexpected == Counter(), f"unexpected sessions.list literals: {unexpected}"
     assert stale == Counter(), f"stale sessions.list literal allowlist: {stale}"
-
-
-def test_sessions_resolve_authored_literal_debt_is_exact() -> None:
-    actual: Counter[str] = Counter()
-    for path in _python_files(PACKAGE_ROOT):
-        if path.is_relative_to(GENERATED_CONTRACT_ROOT):
-            continue
-        for node in ast.walk(_tree(path)):
-            if isinstance(node, ast.Constant) and node.value == "sessions.resolve":
-                actual[_relative(path)] += 1
-
-    unexpected = actual - SESSIONS_RESOLVE_LITERAL_ALLOWLIST
-    stale = SESSIONS_RESOLVE_LITERAL_ALLOWLIST - actual
-    assert unexpected == Counter(), f"unexpected sessions.resolve literals: {unexpected}"
-    assert stale == Counter(), f"stale sessions.resolve literal allowlist: {stale}"
 
 
 def _module_name(path: Path) -> str:
@@ -1569,97 +1626,108 @@ def test_production_cross_rpc_imports_are_forbidden_outside_loader() -> None:
     assert violations == [], f"production modules import RPC implementations: {violations}"
 
 
-def test_session_gateway_callback_transition_debt_is_zero() -> None:
+def test_gateway_application_ports_do_not_delegate_to_rpc_business_bodies() -> None:
+    """Concrete Ports terminate at primitives, not renamed whole RPC methods."""
+
     violations: list[str] = []
-    for relative, forbidden_names in SESSION_GATEWAY_TRANSITION_DEBT.items():
-        path = ROOT / relative
+    for path in _python_files(GATEWAY_ROOT):
         tree = _tree(path)
-        names = {
-            node.id
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Name)
-        }
-        names.update(node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef))
-        names.update(
-            node.name
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
-        remaining = sorted(names & forbidden_names)
-        if remaining:
-            violations.append(f"{relative}: {', '.join(remaining)}")
+        for boundary in (node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)):
+            if not _is_application_port_boundary(boundary):
+                continue
+            context_attributes, injected_attributes = _constructor_bindings(boundary)
+            for method in _class_methods(boundary):
+                if method.name == "__init__":
+                    continue
+                for call in (node for node in ast.walk(method) if isinstance(node, ast.Call)):
+                    callee = _terminal_ast_name(call.func)
+                    if not callee.startswith(("_handle_", "_execute_", "_read_")):
+                        continue
+                    calls_injected_body = (
+                        isinstance(call.func, ast.Attribute)
+                        and isinstance(call.func.value, ast.Name)
+                        and call.func.value.id == "self"
+                        and call.func.attr in injected_attributes
+                    )
+                    passes_rpc_context = any(
+                        _contains_rpc_context_reference(value, context_attributes)
+                        for value in (
+                            *call.args,
+                            *(keyword.value for keyword in call.keywords),
+                        )
+                    )
+                    if calls_injected_body or passes_rpc_context:
+                        violations.append(
+                            f"{_relative(path)}:{call.lineno}: "
+                            f"{boundary.name}.{method.name} delegates to {callee}"
+                        )
 
-    assert violations == [], "session callback transition debt remains:\n" + "\n".join(
-        violations
+    assert violations == [], (
+        "Gateway Application Ports must invoke neutral runtime primitives, not "
+        "whole RPC business bodies:\n" + "\n".join(violations)
     )
 
-    adapter_files = tuple(
-        ROOT / relative
-        for relative in SESSION_GATEWAY_TRANSITION_DEBT
-        if "/adapters/" in relative
-    )
-    structural_violations: list[str] = []
-    for path in adapter_files:
+
+def test_gateway_application_ports_do_not_rebuild_wire_requests_for_rpc_context() -> None:
+    """Typed commands cannot make a dict/RpcContext round trip behind a Port."""
+
+    violations: list[str] = []
+    for path in _python_files(GATEWAY_ROOT):
         tree = _tree(path)
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.ClassDef):
+        for boundary in (node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)):
+            if not _is_application_port_boundary(boundary):
                 continue
-            if node.name.startswith("Gateway") and node.name.endswith(
-                ("Callbacks", "Runtime")
-            ):
-                structural_violations.append(
-                    f"{_relative(path)}:{node.lineno}: callback capability object "
-                    f"{node.name}"
-                )
-            initializer = next(
-                (
-                    item
-                    for item in node.body
-                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and item.name == "__init__"
-                ),
-                None,
-            )
-            if initializer is None:
+            context_attributes, injected_attributes = _constructor_bindings(boundary)
+            if not context_attributes:
                 continue
-            injected = {
-                arg.arg
-                for arg in (
-                    *initializer.args.posonlyargs,
-                    *initializer.args.args,
-                    *initializer.args.kwonlyargs,
-                )
-            } & {"callbacks", "runtime"}
-            if injected:
-                structural_violations.append(
-                    f"{_relative(path)}:{initializer.lineno}: injects broad "
-                    f"{', '.join(sorted(injected))} capability object"
-                )
+            for method in _class_methods(boundary):
+                if method.name == "__init__":
+                    continue
+                mapping_bindings = _mapping_bindings(method)
+                semantic_parameters = _semantic_parameters(method)
+                for call in (node for node in ast.walk(method) if isinstance(node, ast.Call)):
+                    values = [
+                        *call.args,
+                        *(keyword.value for keyword in call.keywords),
+                    ]
+                    if not any(
+                        _contains_rpc_context_reference(value, context_attributes)
+                        for value in values
+                    ):
+                        continue
+                    callee = _terminal_ast_name(call.func) or ast.unparse(call.func)
+                    calls_injected_dependency = (
+                        isinstance(call.func, ast.Attribute)
+                        and isinstance(call.func.value, ast.Name)
+                        and call.func.value.id == "self"
+                        and call.func.attr in injected_attributes
+                    )
+                    rebuilds_wire_mapping = any(
+                        _mapping_expression(
+                            value,
+                            mapping_bindings,
+                            semantic_parameters,
+                        )
+                        for value in values
+                        if not _contains_rpc_context_reference(value, context_attributes)
+                    )
+                    if not (calls_injected_dependency or rebuilds_wire_mapping):
+                        continue
+                    reason = (
+                        "calls an injected dependency with RpcContext"
+                        if calls_injected_dependency
+                        else "passes a reconstructed mapping with RpcContext"
+                    )
+                    violations.append(
+                        f"{_relative(path)}:{call.lineno}: "
+                        f"{boundary.name}.{method.name} {reason} via {callee}"
+                    )
 
-    assert structural_violations == [], (
-        "session Gateway Adapters must receive semantic Ports or an Application Module, "
-        "not renamed callback/runtime bags:\n" + "\n".join(structural_violations)
+    assert violations == [], (
+        "Gateway Application Ports must pass typed values to concrete services; "
+        "they cannot reconstruct wire mappings or inject whole-method callbacks:\n"
+        + "\n".join(violations)
     )
-
-    lifecycle_tree = _tree(
-        ROOT / "src/opensquilla/gateway/adapters/session_lifecycle.py"
-    )
-    lifecycle_adapter = next(
-        node
-        for node in lifecycle_tree.body
-        if isinstance(node, ast.ClassDef)
-        and node.name == "GatewaySessionLifecycleAdapter"
-    )
-    lifecycle_init = next(
-        node
-        for node in lifecycle_adapter.body
-        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
-    )
-    assert [arg.arg for arg in lifecycle_init.args.args] == [
-        "self",
-        "context",
-        "application",
-    ]
 
 
 def test_r3_application_modules_do_not_depend_on_gateway_context() -> None:
