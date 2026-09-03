@@ -22,9 +22,9 @@ from opensquilla.gateway.adapters.observability_contract import (
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.log_status_runtime import read_log_status
+from opensquilla.gateway.memory_status_runtime import read_memory_status
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
 from opensquilla.gateway.rpc_channels import read_channel_status as _handle_channels_status
-from opensquilla.gateway.rpc_system import read_memory_status as _handle_doctor_memory_status
 from opensquilla.gateway.rpc_tools import (
     read_provider_status as _handle_providers_status,
 )
@@ -50,6 +50,18 @@ def _build_logs_status(ctx: RpcContext) -> dict[str, Any]:
     return read_log_status(
         config=getattr(ctx, "config", None),
         diagnostics_state=getattr(ctx, "diagnostics_state", None),
+    )
+
+
+async def _handle_doctor_memory_status(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    return await read_memory_status(
+        params,
+        memory_backend=getattr(ctx, "memory_backend", None),
+        memory_managers=getattr(ctx, "memory_managers", None),
+        session_manager=getattr(ctx, "session_manager", None),
     )
 
 
