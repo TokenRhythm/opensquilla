@@ -1,8 +1,9 @@
-"""Transport-neutral session reset and manual-compaction use cases.
+"""Transport-neutral manual-compaction use case.
 
 The public Module exposes business commands instead of v4 method names.  The
 Gateway Adapter terminates ``RpcContext`` and owns legacy wire aliases, while
-the runtime Port preserves the existing reset/compaction state machines.
+the runtime Port preserves the existing compaction state machine. Session
+reset has its own coordinator and fine-grained Ports in ``session_reset``.
 """
 
 from __future__ import annotations
@@ -15,12 +16,6 @@ from opensquilla.session_key import canonicalize_session_key
 
 
 @dataclass(frozen=True, slots=True)
-class ResetSession:
-    session_key: str
-    force: bool = False
-
-
-@dataclass(frozen=True, slots=True)
 class CompactSession:
     session_key: str
     wait: bool = True
@@ -29,9 +24,7 @@ class CompactSession:
 
 
 class SessionMaintenanceRuntimePort(Protocol):
-    """Runtime boundary for the two existing lifecycle state machines."""
-
-    async def reset(self, command: ResetSession) -> Mapping[str, Any]: ...
+    """Runtime boundary for the existing compaction state machine."""
 
     async def compact(self, command: CompactSession) -> Mapping[str, Any]: ...
 
@@ -41,12 +34,6 @@ class SessionMaintenance:
 
     def __init__(self, runtime: SessionMaintenanceRuntimePort) -> None:
         self._runtime = runtime
-
-    async def reset(self, command: ResetSession) -> Mapping[str, Any]:
-        key = canonicalize_session_key(command.session_key)
-        if not key:
-            raise ValueError("session_key must be non-empty")
-        return await self._runtime.reset(replace(command, session_key=key))
 
     async def compact(self, command: CompactSession) -> Mapping[str, Any]:
         key = canonicalize_session_key(command.session_key)
@@ -61,7 +48,6 @@ class SessionMaintenance:
 
 __all__ = [
     "CompactSession",
-    "ResetSession",
     "SessionMaintenance",
     "SessionMaintenanceRuntimePort",
 ]

@@ -252,6 +252,7 @@ R3_APPLICATION_MODULE_FILES = (
     "src/opensquilla/application/session_read.py",
     "src/opensquilla/application/setup_workflow.py",
     "src/opensquilla/application/session_maintenance.py",
+    "src/opensquilla/application/session_reset.py",
     "src/opensquilla/application/observability.py",
     "src/opensquilla/application/skill_catalog.py",
     "src/opensquilla/application/skill_management.py",

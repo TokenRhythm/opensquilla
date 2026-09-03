@@ -8,7 +8,6 @@ from typing import Any
 
 from opensquilla.application.session_maintenance import (
     CompactSession,
-    ResetSession,
     SessionMaintenance,
     SessionMaintenanceRuntimePort,
 )
@@ -23,7 +22,6 @@ type SessionKeyReader = Callable[[dict[str, Any] | None], str]
 @dataclass(frozen=True, slots=True)
 class GatewaySessionMaintenanceCallbacks:
     require_key: SessionKeyReader
-    execute_reset: MaintenanceExecutor
     execute_compact: MaintenanceExecutor
 
 
@@ -37,12 +35,6 @@ class GatewaySessionMaintenanceRuntime(SessionMaintenanceRuntimePort):
     ) -> None:
         self._context = context
         self._callbacks = callbacks
-
-    async def reset(self, command: ResetSession) -> Mapping[str, Any]:
-        return await self._callbacks.execute_reset(
-            {"key": command.session_key, "force": command.force},
-            self._context,
-        )
 
     async def compact(self, command: CompactSession) -> Mapping[str, Any]:
         params: dict[str, Any] = {
@@ -68,11 +60,6 @@ class GatewaySessionMaintenanceAdapter:
         self._application = SessionMaintenance(
             GatewaySessionMaintenanceRuntime(context, callbacks)
         )
-
-    async def reset(self, params: dict[str, Any] | None) -> dict[str, Any]:
-        key = self._callbacks.require_key(params)
-        force = bool((params or {}).get("force", False))
-        return dict(await self._application.reset(ResetSession(key, force=force)))
 
     async def compact(self, params: dict[str, Any] | None) -> dict[str, Any]:
         key = self._callbacks.require_key(params)

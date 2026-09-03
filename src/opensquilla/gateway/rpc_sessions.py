@@ -114,6 +114,11 @@ from opensquilla.gateway.adapters.session_read_contract import (
     register_sessions_messages_unsubscribe_contract,
     register_sessions_preview_contract,
 )
+from opensquilla.gateway.adapters.session_reset import (
+    GatewaySessionResetAdapter,
+    GatewaySessionResetCallbacks,
+    build_gateway_session_reset_adapter,
+)
 from opensquilla.gateway.adapters.sessions_list_contract import (
     register_sessions_list_contract,
 )
@@ -1010,8 +1015,6 @@ def _normalize_session_send_source_hint(params: dict[str, Any]) -> dict[str, Any
 
 _STREAM_IDLE_TIMEOUT_CODE = "stream_idle_timeout"
 _STREAM_IDLE_TIMEOUT_MESSAGE = "Session event stream idle before terminal event"
-_RESET_RUNTIME_SETTLE_SECONDS = 0.25
-_RESET_RUNTIME_CANCEL_DRAIN_SECONDS = 2.0
 _ABORT_RUNTIME_CANCEL_DRAIN_SECONDS = 2.0
 _ABORT_OWNED_CLEANUP_SECONDS = 30.0
 _ABORT_SESSION_LOOKUP_SECONDS = 0.05
@@ -1581,58 +1584,6 @@ async def _cancel_task_owned_descendants(
             )
 
     return len(set(cancelled_task_ids))
-
-
-async def _drain_task_runtime_for_reset(task_runtime: Any, session_key: str) -> None:
-    """Cancel live runtime work without racing a just-finished turn.
-
-    The task runtime emits ``session.event.done`` from inside the turn handler,
-    then marks the runtime task terminal immediately after the handler returns.
-    A client that calls reset on the done event can arrive during that narrow
-    post-done/pre-terminal window. Give running tasks a short chance to settle
-    before issuing cancellation so reset does not append a false
-    ``[interrupted]`` marker into the transcript being flushed.
-    """
-    has_runtime_listing = hasattr(task_runtime, "list") and hasattr(task_runtime, "wait")
-
-    if has_runtime_listing:
-        try:
-            rows = await task_runtime.list(session_key=session_key)
-            for row in rows:
-                if _task_status_value(getattr(row, "status", None)) != "running":
-                    continue
-                try:
-                    await asyncio.wait_for(
-                        task_runtime.wait(row.task_id),
-                        timeout=_RESET_RUNTIME_SETTLE_SECONDS,
-                    )
-                except TimeoutError:
-                    pass
-        except Exception:
-            log.warning("sessions.reset.task_runtime_settle_failed", session_key=session_key)
-
-    await _cancel_task_runtime(
-        task_runtime,
-        session_key=session_key,
-        source="sessions_reset",
-        reason="session_reset",
-    )
-
-    if not has_runtime_listing:
-        return
-
-    try:
-        rows = await task_runtime.list(session_key=session_key)
-        for row in rows:
-            if _task_status_value(getattr(row, "status", None)) in _ACTIVE_TASK_STATUSES:
-                await asyncio.wait_for(
-                    task_runtime.wait(row.task_id),
-                    timeout=_RESET_RUNTIME_CANCEL_DRAIN_SECONDS,
-                )
-    except TimeoutError:
-        log.warning("sessions.reset.task_runtime_drain_timeout", session_key=session_key)
-    except Exception:
-        log.warning("sessions.reset.task_runtime_drain_failed", session_key=session_key)
 
 
 def _optional_positive_timeout(config: Any, attr: str, default: float) -> float | None:
@@ -9428,361 +9379,6 @@ _handle_sessions_rename_contract = register_session_lifecycle_contract(
 )
 
 
-async def _execute_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    """Synchronous session reset with FlushReceipt.
-
-    Sequence when ``ctx.flush_service`` is wired:
-    1. Drain any in-flight turn task so the per-session lock is free.
-    2. Acquire the per-session lock for the whole snapshot → flush → rotate
-       window (prevents a late turn write after flush).
-    3. Snapshot the transcript, execute the flush, then rotate via
-       ``apply_intent(RESET_SAME_KEY)``.
-
-    When ``ctx.flush_service`` is None (kill-switch path), falls back to
-    PR2-pre behavior: no flush, no ``flush_receipt`` field in the response.
-    """
-    from opensquilla.gateway.rpc import RpcHandlerError
-    from opensquilla.memory.session_flush import FlushReceipt
-    from opensquilla.session.models import SessionIntent
-
-    key = _require_key(params)
-
-    if ctx.session_manager is None:
-        raise KeyError("No session manager available")
-
-    storage = get_session_storage(ctx.session_manager)
-    if storage is None:
-        raise KeyError("No session storage available")
-
-    task_runtime = getattr(ctx, "task_runtime", None)
-    # Drain MUST run before any branch that clears session state — including the
-    # flush_service=None (kill-switch) path.  Skipping drain here would let a
-    # still-running turn write its final message into the transcript *after*
-    # apply_intent has rotated the session_id, producing an orphaned transcript
-    # entry that is never flushed and never visible to the new session.
-    # force=True does not bypass this: the operator wants a clean slate, not a
-    # corrupted one.  drain() is idempotent when no task is running.
-    if task_runtime is not None:
-        await _drain_task_runtime_for_reset(task_runtime, key)
-
-    force = bool((params or {}).get("force", False))
-
-    registry = get_agent_task_registry()
-    active = registry.get(key)
-    if active is not None and not active.done():
-        registry.cancel(key)
-        try:
-            await asyncio.wait_for(active, timeout=2.0)
-        except TimeoutError:
-            log.warning("sessions.reset.drain_timeout", session_key=key)
-        except asyncio.CancelledError:
-            log.debug("sessions.reset.drain_cancelled", session_key=key)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("sessions.reset.drain_failed", session_key=key, error=str(exc))
-
-    turn_runner = ctx.turn_runner
-    lock = get_session_lock(turn_runner, key)
-
-    async def _run_locked() -> dict[str, Any]:
-        session = await storage.get_session(key)
-        if session is None:
-            raise KeyError(f"Session not found: {key}")
-        previous_session_id = session.session_id
-        previous_epoch = int(getattr(session, "epoch", 0) or 0)
-        agent_id = normalize_agent_id(getattr(session, "agent_id", None) or "main")
-
-        transcript = await ctx.session_manager.get_transcript(key)
-        reset_flush_enabled = flush_trigger_enabled(ctx.config, "session_reset")
-
-        if not reset_flush_enabled:
-            updated, rotated = await ctx.session_manager.apply_intent(
-                key,
-                SessionIntent.RESET_SAME_KEY,
-            )
-            new_epoch = await _ensure_and_emit_reset_epoch(
-                ctx, storage, key, previous_epoch=previous_epoch
-            )
-            return {
-                "key": key,
-                "reset": True,
-                "rotated": rotated,
-                "previous_session_id": previous_session_id,
-                "session_id": updated.session_id,
-                "epoch": new_epoch,
-            }
-
-        if ctx.flush_service is None:
-            # Fail-closed when flush is unavailable: refuse to clear a non-empty
-            # transcript without an explicit admin override or a covering
-            # checkpoint receipt. The whole read -> gate -> rotate window stays
-            # under the same per-session lock used by sends.
-            if transcript and not force:
-                checkpoint_safe = await _durable_receipt_allows_covered_destructive_compaction(
-                    storage,
-                    key,
-                    previous_session_id,
-                    transcript,
-                )
-                if not checkpoint_safe:
-                    raise RpcHandlerError(
-                        code="flush_unavailable",
-                        message=(
-                            "Reset aborted: flush service is unavailable and the "
-                            "transcript is non-empty. Re-run with force=true (admin) "
-                            "to discard without backup."
-                        ),
-                        details={
-                            "key": key,
-                            "session_id": previous_session_id,
-                            "reason": "flush_service_disabled",
-                            "message_count": len(transcript),
-                        },
-                    )
-            if transcript and force and "operator.admin" not in ctx.principal.scopes:
-                raise RpcHandlerError(
-                    code="permission_denied",
-                    message="force=true on sessions.reset requires operator.admin scope.",
-                    details={"key": key, "session_id": previous_session_id},
-                )
-
-            updated, rotated = await ctx.session_manager.apply_intent(
-                key,
-                SessionIntent.RESET_SAME_KEY,
-            )
-            new_epoch = await _ensure_and_emit_reset_epoch(
-                ctx, storage, key, previous_epoch=previous_epoch
-            )
-            return {
-                "key": key,
-                "reset": True,
-                "rotated": rotated,
-                "previous_session_id": previous_session_id,
-                "session_id": updated.session_id,
-                "epoch": new_epoch,
-            }
-
-        if not transcript:
-            updated, rotated = await ctx.session_manager.apply_intent(
-                key, SessionIntent.RESET_SAME_KEY
-            )
-            new_epoch = await _ensure_and_emit_reset_epoch(
-                ctx, storage, key, previous_epoch=previous_epoch
-            )
-            receipt = FlushReceipt(
-                mode="skipped",
-                flushed_paths=[],
-                slug=None,
-                message_count=0,
-                duration_ms=0,
-                raw_reason=None,
-                error=None,
-            )
-            return _reset_response(
-                key,
-                rotated,
-                previous_session_id,
-                updated.session_id,
-                receipt,
-                new_epoch,
-            )
-
-        try:
-            flush_turn_id, flush_correlation = _build_session_flush_correlation(
-                ctx,
-                previous_session_id,
-            )
-            flush_kwargs: dict[str, Any] = {
-                "agent_id": agent_id,
-                "timeout": 30.0,
-                "message_window": 0,
-                "segment_mode": "auto",
-                "raw_capture_policy": "required",
-            }
-            if _accepts_keyword_arg(ctx.flush_service.execute, "turn_id"):
-                flush_kwargs["turn_id"] = flush_turn_id
-            if (
-                flush_correlation is not None
-                and _accepts_keyword_arg(
-                    ctx.flush_service.execute,
-                    "provider_request_correlation",
-                )
-            ):
-                flush_kwargs["provider_request_correlation"] = flush_correlation
-            receipt = await ctx.flush_service.execute(
-                transcript,
-                key,
-                **flush_kwargs,
-            )
-        except Exception as exc:  # noqa: BLE001 — both LLM and raw-dump failed
-            receipt = FlushReceipt(
-                mode="error",
-                flushed_paths=[],
-                slug=None,
-                message_count=len(transcript),
-                duration_ms=0,
-                raw_reason=None,
-                error=str(exc),
-                result_status="archive_failed",
-            )
-            raise RpcHandlerError(
-                code="flush_disk_error",
-                message=f"Reset aborted: flush failed ({receipt.error})",
-                details={
-                    "flush_receipt": receipt.to_dict(),
-                    "key": key,
-                    "session_id": previous_session_id,
-                },
-            ) from exc
-
-        durable_receipt_safe = await _durable_receipt_allows_covered_destructive_compaction(
-            storage,
-            key,
-            previous_session_id,
-            transcript,
-        )
-        memory_status = compaction_memory_status(
-            receipt,
-            deterministic_receipt_safe=durable_receipt_safe,
-            required=True,
-        )
-        if not memory_status.allows_destructive_compaction:
-            flush_status = flush_receipt_status_for_compaction(receipt, ctx.config)
-            raise RpcHandlerError(
-                code="flush_disk_error",
-                message=(
-                    f"Reset aborted: flush status {flush_status!r} is not sufficient "
-                    "for destructive reset."
-                ),
-                details={
-                    "flush_receipt": receipt.to_dict(),
-                    "key": key,
-                    "session_id": previous_session_id,
-                    "reason": "destructive_reset_requires_safe_flush",
-                    "flush_receipt_status": flush_status,
-                    "memory_safety_status": memory_status.safety_status,
-                    "semantic_memory_status": memory_status.semantic_status,
-                },
-            )
-
-        updated, rotated = await ctx.session_manager.apply_intent(key, SessionIntent.RESET_SAME_KEY)
-        new_epoch = await _ensure_and_emit_reset_epoch(
-            ctx, storage, key, previous_epoch=previous_epoch
-        )
-        return _reset_response(
-            key,
-            rotated,
-            previous_session_id,
-            updated.session_id,
-            receipt,
-            new_epoch,
-        )
-
-    async def _run_accounted() -> dict[str, Any]:
-        from opensquilla.engine.usage_accounting import bind_usage_accounting_scope
-        from opensquilla.gateway.usage_ledger_runtime import build_session_usage_scope
-
-        usage_scope = await build_session_usage_scope(
-            getattr(ctx, "usage_event_sink", None),
-            ctx.session_manager,
-            key,
-            run_kind="memory_flush",
-        )
-        with bind_usage_accounting_scope(usage_scope):
-            return await _run_locked()
-
-    if lock is None:
-        result = await _run_accounted()
-    else:
-        async with lock:
-            result = await _run_accounted()
-    keepalive_service = getattr(ctx, "prompt_cache_keepalive_service", None)
-    if keepalive_service is not None:
-        await keepalive_service.invalidate(key)
-    return result
-
-
-async def _ensure_and_emit_reset_epoch(
-    ctx: RpcContext,
-    storage: Any,
-    session_key: str,
-    *,
-    previous_epoch: int,
-) -> int:
-    """Broadcast the manager's reset epoch, incrementing only as a fallback.
-
-    ``SessionManager._rotate_session_id`` normally increments before rotating
-    to fence stale writers. Older/test managers may not, and the manager keeps
-    reset best-effort if that increment fails, so this RPC performs one durable
-    increment only when the stored epoch did not advance.
-    """
-    # The durable reset has already rotated the generation and removed the
-    # Goal row. Revoke the process-local execution lease before publishing the
-    # new epoch; the generation fence remains the final protection if this
-    # best-effort in-memory hook is unavailable.
-    goal_service = getattr(getattr(ctx, "task_runtime", None), "goal_service", None)
-    revoke_goal_lease = getattr(goal_service, "revoke_session", None)
-    if callable(revoke_goal_lease):
-        revoke_goal_lease(session_key)
-
-    increment_fn = getattr(storage, "increment_epoch", None)
-    if not callable(increment_fn):
-        return 0
-    new_epoch = previous_epoch
-    get_session = getattr(storage, "get_session", None)
-    if callable(get_session):
-        try:
-            current = await get_session(session_key)
-            new_epoch = int(getattr(current, "epoch", previous_epoch) or 0)
-        except Exception:
-            new_epoch = previous_epoch
-    try:
-        if new_epoch <= previous_epoch:
-            # Durable commit happens inside increment_epoch before it returns.
-            new_epoch = int(await increment_fn(session_key))
-    except Exception:
-        log.warning("sessions.reset.epoch_increment_failed", session_key=session_key)
-        return 0
-    # Invalidate / update the in-process epoch cache so subsequent _emit_to_subscribers
-    # calls read the new epoch without hitting the DB.
-    session_manager = getattr(ctx, "session_manager", None)
-    set_session_epoch(session_manager, session_key, new_epoch)
-    # Emit after the storage commit — failure here is non-fatal; epoch is already
-    # persisted and the client will re-sync on next reconnect.
-    try:
-        await _emit_to_subscribers(
-            ctx,
-            session_key,
-            "session.epoch_changed",
-            {"key": session_key, "epoch": new_epoch},
-        )
-    except Exception:
-        log.warning(
-            "sessions.reset.epoch_emit_failed",
-            session_key=session_key,
-            new_epoch=new_epoch,
-        )
-    return new_epoch
-
-
-def _reset_response(
-    key: str,
-    rotated: bool,
-    previous_session_id: str,
-    session_id: str,
-    receipt: Any,
-    epoch: int = 0,
-) -> dict[str, Any]:
-    return {
-        "key": key,
-        "reset": True,
-        "rotated": rotated,
-        "previous_session_id": previous_session_id,
-        "session_id": session_id,
-        "epoch": epoch,
-        "flush_receipt": flush_receipt_to_dict(receipt),
-    }
-
-
 async def _delete_session_with_lifecycle(
     *,
     canonical_key: str,
@@ -10697,14 +10293,26 @@ def _session_maintenance_adapter(ctx: RpcContext) -> GatewaySessionMaintenanceAd
         ctx,
         GatewaySessionMaintenanceCallbacks(
             require_key=_require_key,
-            execute_reset=_execute_sessions_reset,
             execute_compact=_execute_sessions_context_compact,
         ),
     )
 
 
+def _session_reset_adapter(ctx: RpcContext) -> GatewaySessionResetAdapter:
+    return build_gateway_session_reset_adapter(
+        ctx,
+        GatewaySessionResetCallbacks(
+            cancel_runtime=_cancel_task_runtime,
+            checkpoint_covers=_durable_receipt_allows_covered_destructive_compaction,
+            build_flush_correlation=_build_session_flush_correlation,
+            emit_session_event=_emit_to_subscribers,
+        ),
+        require_key=_require_key,
+    )
+
+
 async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    return await _session_maintenance_adapter(ctx).reset(params)
+    return await _session_reset_adapter(ctx).reset(params)
 
 
 async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext) -> dict:
