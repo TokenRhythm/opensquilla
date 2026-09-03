@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import json
 import uuid
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -58,7 +58,7 @@ _FINGERPRINT_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
-def _canonical_fingerprint_payload(params: dict[str, Any]) -> dict[str, Any]:
+def _canonical_fingerprint_payload(params: Mapping[str, Any]) -> dict[str, Any]:
     payload: dict[str, Any] = {}
     for canonical_name, aliases in _FINGERPRINT_FIELDS:
         for alias in aliases:
@@ -89,7 +89,7 @@ def _json_default(value: Any) -> Any:
     raise TypeError(f"Unsupported request fingerprint value: {type(value).__name__}")
 
 
-def request_fingerprint(params: dict[str, Any]) -> str:
+def request_fingerprint(params: Mapping[str, Any]) -> str:
     """Hash stable logical request fields without retaining user content."""
 
     encoded = json.dumps(
@@ -103,11 +103,11 @@ def request_fingerprint(params: dict[str, Any]) -> str:
 
 
 def request_identity(
-    params: dict[str, Any],
+    params: Mapping[str, Any],
     *,
     request_session_key: str,
     source_scope: str,
-    fingerprint_params: dict[str, Any] | None = None,
+    fingerprint_params: Mapping[str, Any] | None = None,
 ) -> TurnRequestIdentity:
     raw_request_id = params.get("clientRequestId", params.get("client_request_id"))
     if raw_request_id is None:

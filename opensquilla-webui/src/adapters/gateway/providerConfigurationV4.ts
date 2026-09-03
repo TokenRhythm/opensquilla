@@ -1,5 +1,5 @@
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
-import { readTransportFailure } from './privateTransports'
+import { readTransportFailure } from './transportTypes'
 import type {
   ModelCatalogResult,
   ModelDescriptor,

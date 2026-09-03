@@ -1,6 +1,6 @@
 import {
   readTransportFailure,
-} from './privateTransports'
+} from './transportTypes'
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import type {
   GatewayMigrationCandidate,

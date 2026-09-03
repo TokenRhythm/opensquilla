@@ -2707,7 +2707,7 @@ class TestSessionsSend:
             session_manager=FakeSessionManager([session]),
             task_runtime=runtime,
         )
-        result = await rpc_sessions._handle_sessions_send(
+        result = await rpc_sessions._handle_sessions_send_contract(
             {"key": session.session_key, "message": "hello"},
             ctx,
         )
@@ -2767,7 +2767,7 @@ class TestSessionsSend:
         if source_hint is not None:
             params["_source"] = source_hint
         with pytest.raises(rpc_sessions.RpcHandlerError) as raised:
-            await rpc_sessions._handle_sessions_send(params, ctx)
+            await rpc_sessions._handle_sessions_send_contract(params, ctx)
 
         assert raised.value.code == "SANDBOX_UNAVAILABLE"
 
@@ -2833,7 +2833,7 @@ class TestSessionsSend:
             config=config,
         )
 
-        await rpc_sessions._handle_sessions_send(
+        await rpc_sessions._handle_sessions_send_contract(
             {"key": session.session_key, "message": "hello"},
             ctx,
         )
@@ -2908,7 +2908,7 @@ class TestSessionsSend:
         )
 
         with pytest.raises(rpc_sessions.RpcHandlerError) as raised:
-            await rpc_sessions._handle_sessions_send(
+            await rpc_sessions._handle_sessions_send_contract(
                 {"key": session.session_key, "message": "hello"},
                 ctx,
             )

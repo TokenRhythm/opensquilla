@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from opensquilla.application.turn_admission import AdmitTurn
 from opensquilla.artifact_session import (
     Actor,
     ActorKind,
@@ -53,7 +54,7 @@ from opensquilla.gateway.model_routing import (
 )
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
-from opensquilla.gateway.rpc_sessions import _handle_sessions_send
+from opensquilla.gateway.rpc_sessions import _admit_turn
 from opensquilla.gateway.session_model_routing import (
     capture_accepted_model_routing_config,
 )
@@ -252,12 +253,13 @@ async def test_internal_send_can_supply_trusted_background_run_kind(tmp_path: Pa
             )
 
         stack.runtime._accepted_config_provider = accepted_config_provider
-        accepted = await _handle_sessions_send(
-            {
-                "key": SESSION_KEY,
-                "message": "trusted internal background input",
-                "clientRequestId": "trusted-internal-run-kind",
-            },
+        accepted = await _admit_turn(
+            AdmitTurn(
+                session_key=SESSION_KEY,
+                message="trusted internal background input",
+                surface="session",
+                attributes={"clientRequestId": "trusted-internal-run-kind"},
+            ),
             stack.context,
             trusted_run_kind="cron_turn",
         )

@@ -2,7 +2,7 @@ import type {
   TransportCallOptions as RpcCallOptions,
   TransportEventHandler as RpcEventHandler,
 } from './transportTypes'
-import { readTransportFailure } from './privateTransports'
+import { readTransportFailure } from './transportTypes'
 import type {
   MetaDraft,
   MetaDraftDiscardResult,

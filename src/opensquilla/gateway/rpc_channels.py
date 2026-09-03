@@ -11,9 +11,16 @@ import structlog
 
 from opensquilla.application.channel_administration import (
     ApprovePairing,
+    ChannelActionResult,
     ChannelAdministrationPort,
+    ChannelAdminResult,
+    ChannelGetResult,
     ChannelPairingPort,
+    ChannelProbeResult,
+    ChannelStatusResult,
     ChannelTarget,
+    PairingMutationResult,
+    PairingProjection,
     PairingQuery,
     PairingTarget,
     ProbeChannel,
@@ -153,170 +160,16 @@ async def read_channel_status(params: dict | None, ctx: RpcContext) -> dict[str,
     )
 
 
-async def _handle_channels_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    """Compatibility callable for tests and older in-process consumers."""
-    return await read_channel_status(params, ctx)
-
-
-async def _handle_channels_get(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    name = str((params or {}).get("name") or (params or {}).get("channel") or "")
-    if not name:
-        raise ValueError("channel name required")
-    from opensquilla.onboarding.redaction import redact_channel_entry
-
-    for entry in _configured_channel_entries(ctx):
-        if str(entry.get("name") or "") != name:
-            continue
-        channel_type = str(entry.get("type") or "")
-        redacted = redact_channel_entry(channel_type, entry)
-        return {
-            "entry": redacted,
-            "secretFields": [key for key, value in redacted.items() if value == "***"],
-        }
-    raise KeyError(f"Channel not found: {name}")
-
-
-async def _handle_channels_probe(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    """Run a non-mutating provider credential/network probe when implemented."""
-    from opensquilla.channels.registry import build_managed_channel, parse_channel_entry
-    from opensquilla.onboarding.mutations import (
-        merge_channel_entry_secrets,
-        validate_channel_entry,
-    )
-
-    raw_entry = (params or {}).get("entry")
-    if raw_entry is None:
-        name = str((params or {}).get("name") or "")
-        raw_entry = next(
-            (
-                entry
-                for entry in _configured_channel_entries(ctx)
-                if str(entry.get("name") or "") == name
-            ),
-            None,
-        )
-    if not isinstance(raw_entry, dict):
-        raise ValueError("channel entry or name required")
-
-    config = cast("GatewayConfig", getattr(ctx, "config", None))
-    normalized = validate_channel_entry(merge_channel_entry_secrets(config, raw_entry))
-    secret_values = _probe_secret_values(normalized)
-    entry = parse_channel_entry(normalized)
-    adapter = build_managed_channel(entry)
-    if adapter is None:
-        raise ValueError(f"unsupported channel type: {normalized.get('type')}")
-    probe = getattr(adapter, "probe_connection", None)
-    started = time.perf_counter()
-    try:
-        if not callable(probe):
-            return {
-                "status": "unsupported",
-                "connected": False,
-                "latencyMs": None,
-                "detail": "This adapter does not yet expose a safe non-mutating live probe.",
-            }
-        try:
-            result = await probe()
-        except Exception as exc:  # noqa: BLE001 - provider boundary is rendered as evidence
-            return {
-                "status": "failed",
-                "connected": False,
-                "latencyMs": round((time.perf_counter() - started) * 1000),
-                "detail": redact_error_text(
-                    str(exc),
-                    max_len=500,
-                    known_secrets=secret_values,
-                ),
-            }
-    finally:
-        stop = getattr(adapter, "stop", None)
-        close = getattr(adapter, "close", None)
-        if callable(stop):
-            with contextlib.suppress(Exception):
-                await stop()
-        elif callable(close):
-            with contextlib.suppress(Exception):
-                await close()
-    latency_ms = round((time.perf_counter() - started) * 1000)
-    payload = _redact_probe_result(result, secret_values) if isinstance(result, dict) else {}
-    supported = bool(payload.get("supported", True))
-    authenticated = bool(payload.get("authenticated", False))
-    return {
-        "status": ("verified" if supported and authenticated else "unsupported"),
-        "connected": authenticated,
-        "latencyMs": latency_ms,
-        "detail": str(payload.get("reason") or ""),
-        "result": payload,
-    }
-
-
-async def _handle_channels_logout(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    channel_name = None
-    if isinstance(params, dict):
-        channel_name = params.get("channel") or params.get("name")
-    if not channel_name:
-        raise ValueError("channel name required")
-    if ctx.channel_manager is None:
-        raise KeyError(f"Channel not found: {channel_name}")
-    if ctx.channel_manager.get(channel_name) is None:
-        raise KeyError(f"Channel not found: {channel_name}")
-    await ctx.channel_manager.stop_channel(channel_name)
-    return {"status": "disconnected", "channel": channel_name}
-
-
-async def _handle_channels_restart(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    channel_name = None
-    if isinstance(params, dict):
-        channel_name = params.get("channel") or params.get("name")
-    if not channel_name:
-        raise ValueError("channel name required")
-    # A configured-but-not-loaded channel (e.g. added since the last gateway
-    # start) cannot be restarted in place; a stable code lets the UI say
-    # "restart the gateway" instead of surfacing a coarse NOT_FOUND.
-    if ctx.channel_manager is None or ctx.channel_manager.get(channel_name) is None:
-        raise RpcHandlerError(
-            "channels.adapter_not_loaded",
-            f"Channel {channel_name!r} is not loaded in this gateway process; "
-            "restart the gateway to start it.",
-        )
-    await ctx.channel_manager.restart_channel(channel_name)
-    return {"status": "restarted", "channel": channel_name}
-
-
-async def _handle_channels_pairings(
-    params: dict | None,
-    ctx: RpcContext,
-) -> dict[str, Any]:
-    data = params or {}
-    channel_name = str(data.get("channelName") or "").strip()
-    if not channel_name:
-        raise ValueError("channelName required")
-    status = str(data.get("status") or "").strip() or None
-    limit_raw = data.get("limit")
-    offset_raw = data.get("offset")
-    limit = int(limit_raw) if limit_raw is not None else None
-    offset = int(offset_raw) if offset_raw is not None else 0
-    records = _pairing_store(ctx).list_pairings(
-        channel_name=channel_name,
-        status=status,
-        limit=limit,
-        offset=offset,
-    )
-    return {"pairings": [_pairing_payload(record) for record in records]}
-
-
-def _pairing_mutation_params(params: dict | None, ctx: RpcContext) -> tuple[str, str]:
+def _resolve_pairing_target(target: PairingTarget, ctx: RpcContext) -> tuple[str, str]:
     """Resolve the target pairing from ``pairingId`` or the 8-char ``pairingCode``.
 
     The code is what a sender's pairing notice shows and what the operator
     list renders, so mutations accept it directly instead of making operators
     hunt for the full id.
     """
-    channel_name = str((params or {}).get("channelName") or "").strip()
-    pairing_id = str((params or {}).get("pairingId") or "").strip()
-    pairing_code = str((params or {}).get("pairingCode") or "").strip()
-    if not channel_name:
-        raise ValueError("channelName required")
+    channel_name = target.channel_name
+    pairing_id = target.pairing_id or ""
+    pairing_code = target.pairing_code or ""
     if pairing_id:
         return channel_name, pairing_id
     if not pairing_code:
@@ -385,12 +238,11 @@ async def _send_pairing_approved_notice(ctx: RpcContext, record: Any) -> None:
         )
 
 
-async def _handle_channels_pairing_approve(
-    params: dict | None,
+async def _approve_pairing(
+    command: ApprovePairing,
     ctx: RpcContext,
-) -> dict[str, Any]:
-    channel_name, pairing_id = _pairing_mutation_params(params, ctx)
-    as_admin = bool((params or {}).get("asAdmin", False))
+) -> PairingMutationResult:
+    channel_name, pairing_id = _resolve_pairing_target(command.target, ctx)
     store = _pairing_store(ctx)
     # Re-approving an already-approved pairing must not re-notify the sender.
     was_approved = _pairing_status_of(store, channel_name, pairing_id) == "approved"
@@ -400,7 +252,7 @@ async def _handle_channels_pairing_approve(
         status="approved",
     )
     payload: dict[str, Any] = {"pairing": _pairing_payload(record)}
-    if as_admin:
+    if command.as_admin:
         # Deliberate, narrow scope expansion: an operator.pairing caller may
         # mark the sender they are approving RIGHT NOW as an admin of the
         # channel they are approving them on — never an arbitrary config
@@ -448,7 +300,7 @@ async def _handle_channels_pairing_approve(
                 ]
     if not was_approved:
         await _send_pairing_approved_notice(ctx, record)
-    return payload
+    return cast(PairingMutationResult, payload)
 
 
 def _set_channel_admin_sender(
@@ -504,10 +356,10 @@ def _set_channel_admin_sender(
     return admin_senders.get(channel_name, [])
 
 
-async def _handle_channels_admin_set(
-    params: dict | None,
+async def _set_channel_admin(
+    command: SetChannelAdmin,
     ctx: RpcContext,
-) -> dict[str, Any]:
+) -> ChannelAdminResult:
     """Grant or revoke a sender's channel-admin standing.
 
     The recoverable counterpart to the pairing-time admin grant: a mistaken
@@ -515,18 +367,9 @@ async def _handle_channels_admin_set(
     promoted or demoted from the same members view. Narrow by design — it
     only edits ``channel_admin_senders`` for the named channel.
     """
-    data = params or {}
-    channel_name = str(data.get("channelName") or "").strip()
-    sender_id = str(data.get("senderId") or "").strip()
-    admin_param = data.get("admin")
-    if not channel_name:
-        raise ValueError("channelName required")
-    if not sender_id:
-        raise ValueError("senderId required")
-    # An omitted admin flag must never default to a silent revoke.
-    if not isinstance(admin_param, bool):
-        raise ValueError("admin required (boolean)")
-    admin = admin_param
+    channel_name = command.channel_name
+    sender_id = command.sender_id
+    admin = command.admin
     # Grants are channel-bound: a typo'd channel name would persist a dormant
     # admin entry that silently activates if a channel with that name is ever
     # created. Revokes stay unvalidated on purpose — TOML-added admins on
@@ -539,19 +382,19 @@ async def _handle_channels_admin_set(
         sender_id=sender_id,
         admin=admin,
     )
-    return {
+    return cast(ChannelAdminResult, {
         "channelName": channel_name,
         "senderId": sender_id,
         "admin": sender_id in admins,
         "admins": admins,
-    }
+    })
 
 
-async def _handle_channels_pairing_revoke(
-    params: dict | None,
+async def _revoke_pairing(
+    target: PairingTarget,
     ctx: RpcContext,
-) -> dict[str, Any]:
-    channel_name, pairing_id = _pairing_mutation_params(params, ctx)
+) -> PairingMutationResult:
+    channel_name, pairing_id = _resolve_pairing_target(target, ctx)
     record = _pairing_store(ctx).set_pairing_status(
         channel_name=channel_name,
         pairing_id=pairing_id,
@@ -587,7 +430,7 @@ async def _handle_channels_pairing_revoke(
                 f"standing could not be removed ({type(exc).__name__}). "
                 "Remove it from the members view."
             ]
-    return payload
+    return cast(PairingMutationResult, payload)
 
 
 class _ChannelAdministrationRuntime(ChannelAdministrationPort):
@@ -596,25 +439,113 @@ class _ChannelAdministrationRuntime(ChannelAdministrationPort):
     def __init__(self, ctx: RpcContext) -> None:
         self._ctx = ctx
 
-    async def status(self) -> dict[str, Any]:
-        return await read_channel_status(None, self._ctx)
+    async def status(self) -> ChannelStatusResult:
+        return cast(ChannelStatusResult, await read_channel_status(None, self._ctx))
 
-    async def get(self, target: ChannelTarget) -> dict[str, Any]:
-        return await _handle_channels_get({"name": target.name}, self._ctx)
+    async def get(self, target: ChannelTarget) -> ChannelGetResult:
+        from opensquilla.onboarding.redaction import redact_channel_entry
 
-    async def probe(self, command: ProbeChannel) -> dict[str, Any]:
-        params = (
-            {"entry": dict(command.entry)}
-            if command.entry is not None
-            else {"name": command.name}
+        for entry in _configured_channel_entries(self._ctx):
+            if str(entry.get("name") or "") != target.name:
+                continue
+            redacted = redact_channel_entry(str(entry.get("type") or ""), entry)
+            return {
+                "entry": redacted,
+                "secretFields": [
+                    key for key, value in redacted.items() if value == "***"
+                ],
+            }
+        raise KeyError(f"Channel not found: {target.name}")
+
+    async def probe(self, command: ProbeChannel) -> ChannelProbeResult:
+        from opensquilla.channels.registry import build_managed_channel, parse_channel_entry
+        from opensquilla.onboarding.mutations import (
+            merge_channel_entry_secrets,
+            validate_channel_entry,
         )
-        return await _handle_channels_probe(params, self._ctx)
 
-    async def restart(self, target: ChannelTarget) -> dict[str, Any]:
-        return await _handle_channels_restart({"name": target.name}, self._ctx)
+        raw_entry = command.entry
+        if raw_entry is None:
+            raw_entry = next(
+                (
+                    entry
+                    for entry in _configured_channel_entries(self._ctx)
+                    if str(entry.get("name") or "") == command.name
+                ),
+                None,
+            )
+        if not isinstance(raw_entry, dict):
+            raise ValueError("channel entry or name required")
+        config = cast("GatewayConfig", getattr(self._ctx, "config", None))
+        normalized = validate_channel_entry(
+            merge_channel_entry_secrets(config, raw_entry)
+        )
+        secret_values = _probe_secret_values(normalized)
+        adapter = build_managed_channel(parse_channel_entry(normalized))
+        if adapter is None:
+            raise ValueError(f"unsupported channel type: {normalized.get('type')}")
+        probe = getattr(adapter, "probe_connection", None)
+        started = time.perf_counter()
+        try:
+            if not callable(probe):
+                return {
+                    "status": "unsupported",
+                    "connected": False,
+                    "latencyMs": None,
+                    "detail": "This adapter does not yet expose a safe non-mutating live probe.",
+                }
+            try:
+                result = await probe()
+            except Exception as exc:  # noqa: BLE001 - external provider boundary
+                return {
+                    "status": "failed",
+                    "connected": False,
+                    "latencyMs": round((time.perf_counter() - started) * 1000),
+                    "detail": redact_error_text(
+                        str(exc), max_len=500, known_secrets=secret_values
+                    ),
+                }
+        finally:
+            stop = getattr(adapter, "stop", None)
+            close = getattr(adapter, "close", None)
+            if callable(stop):
+                with contextlib.suppress(Exception):
+                    await stop()
+            elif callable(close):
+                with contextlib.suppress(Exception):
+                    await close()
+        payload = (
+            _redact_probe_result(result, secret_values)
+            if isinstance(result, dict)
+            else {}
+        )
+        supported = bool(payload.get("supported", True))
+        authenticated = bool(payload.get("authenticated", False))
+        return {
+            "status": "verified" if supported and authenticated else "unsupported",
+            "connected": authenticated,
+            "latencyMs": round((time.perf_counter() - started) * 1000),
+            "detail": str(payload.get("reason") or ""),
+            "result": payload,
+        }
 
-    async def logout(self, target: ChannelTarget) -> dict[str, Any]:
-        return await _handle_channels_logout({"name": target.name}, self._ctx)
+    async def restart(self, target: ChannelTarget) -> ChannelActionResult:
+        manager = self._ctx.channel_manager
+        if manager is None or manager.get(target.name) is None:
+            raise RpcHandlerError(
+                "channels.adapter_not_loaded",
+                f"Channel {target.name!r} is not loaded in this gateway process; "
+                "restart the gateway to start it.",
+            )
+        await manager.restart_channel(target.name)
+        return {"status": "restarted", "channel": target.name}
+
+    async def logout(self, target: ChannelTarget) -> ChannelActionResult:
+        manager = self._ctx.channel_manager
+        if manager is None or manager.get(target.name) is None:
+            raise KeyError(f"Channel not found: {target.name}")
+        await manager.stop_channel(target.name)
+        return {"status": "disconnected", "channel": target.name}
 
 
 class _ChannelPairingRuntime(ChannelPairingPort):
@@ -623,50 +554,23 @@ class _ChannelPairingRuntime(ChannelPairingPort):
     def __init__(self, ctx: RpcContext) -> None:
         self._ctx = ctx
 
-    @staticmethod
-    def _target(target: PairingTarget) -> dict[str, Any]:
-        return {
-            "channelName": target.channel_name,
-            **({"pairingId": target.pairing_id} if target.pairing_id else {}),
-            **({"pairingCode": target.pairing_code} if target.pairing_code else {}),
-        }
-
-    async def list(self, query: PairingQuery) -> list[dict[str, Any]]:
-        result = await _handle_channels_pairings(
-            {
-                "channelName": query.channel_name,
-                **({"status": query.status} if query.status else {}),
-                **({"limit": query.limit} if query.limit is not None else {}),
-                "offset": query.offset,
-            },
-            self._ctx,
+    async def list(self, query: PairingQuery) -> list[PairingProjection]:
+        records = _pairing_store(self._ctx).list_pairings(
+            channel_name=query.channel_name,
+            status=query.status,
+            limit=query.limit,
+            offset=query.offset,
         )
-        rows = result.get("pairings")
-        return rows if isinstance(rows, list) else []
+        return cast(list[PairingProjection], [_pairing_payload(row) for row in records])
 
-    async def approve(self, command: ApprovePairing) -> dict[str, Any]:
-        return await _handle_channels_pairing_approve(
-            {
-                **self._target(command.target),
-                **({"asAdmin": True} if command.as_admin else {}),
-            },
-            self._ctx,
-        )
+    async def approve(self, command: ApprovePairing) -> PairingMutationResult:
+        return await _approve_pairing(command, self._ctx)
 
-    async def revoke(self, target: PairingTarget) -> dict[str, Any]:
-        return await _handle_channels_pairing_revoke(
-            self._target(target), self._ctx
-        )
+    async def revoke(self, target: PairingTarget) -> PairingMutationResult:
+        return await _revoke_pairing(target, self._ctx)
 
-    async def set_admin(self, command: SetChannelAdmin) -> dict[str, Any]:
-        return await _handle_channels_admin_set(
-            {
-                "channelName": command.channel_name,
-                "senderId": command.sender_id,
-                "admin": command.admin,
-            },
-            self._ctx,
-        )
+    async def set_admin(self, command: SetChannelAdmin) -> ChannelAdminResult:
+        return await _set_channel_admin(command, self._ctx)
 
 
 def _channel_administration_adapter(ctx: RpcContext) -> GatewayChannelAdministrationAdapter:

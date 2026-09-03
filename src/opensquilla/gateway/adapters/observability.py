@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
-from typing import Any
+from typing import Any, cast
 
 from opensquilla import __version__
 from opensquilla.agent_ids import normalize_agent_id
@@ -13,7 +13,9 @@ from opensquilla.application.observability import (
     ReadinessEvaluationPort,
     ReadinessFinding,
     ReadinessFixStep,
+    ReadinessReport,
     RuntimeStatusPort,
+    RuntimeStatusResult,
 )
 from opensquilla.gateway.rpc import RpcContext
 from opensquilla.gateway.session_services import get_session_storage
@@ -38,7 +40,7 @@ class GatewayRuntimeStatusPort(RuntimeStatusPort):
     def __init__(self, context: RpcContext) -> None:
         self._context = context
 
-    async def snapshot(self) -> Mapping[str, Any]:
+    async def snapshot(self) -> RuntimeStatusResult:
         from opensquilla.gateway.boot import _boot_time_ms
 
         now = int(time.time() * 1000)
@@ -104,7 +106,7 @@ class GatewayReadinessEvaluationPort(ReadinessEvaluationPort):
         findings: Sequence[ReadinessFinding],
         *,
         config_path: str | None,
-    ) -> dict[str, Any]:
+    ) -> ReadinessReport:
         health_findings = [_to_health_finding(finding) for finding in findings]
         if config_path:
             health_findings = [
@@ -119,7 +121,7 @@ class GatewayReadinessEvaluationPort(ReadinessEvaluationPort):
                 )
                 for finding in health_findings
             ]
-        return build_report(health_findings)
+        return cast(ReadinessReport, build_report(health_findings))
 
 
 def _to_application_finding(finding: HealthFinding) -> ReadinessFinding:

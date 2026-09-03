@@ -126,6 +126,28 @@ describe('ArtifactWorkbench v4 Adapter', () => {
     expect(request).not.toHaveBeenCalled()
   })
 
+  it('keeps connection readiness private to semantic Workbench operations', async () => {
+    const { ready, request, workbench } = harness([{
+      resources: [],
+      totalCount: 0,
+    }])
+
+    await expect(workbench.resources.list('agent:main:webchat:test'))
+      .resolves.toMatchObject({ resources: [], totalCount: 0 })
+
+    expect('ready' in workbench).toBe(false)
+    expect(ready).toHaveBeenCalledWith(expect.objectContaining({
+      timeoutMs: 10_000,
+      timeoutAction: 'reject',
+      abortAction: 'reject',
+    }))
+    expect(request).toHaveBeenCalledWith(
+      'workbench.resources.list',
+      expect.objectContaining({ sessionKey: 'agent:main:webchat:test' }),
+      expect.any(Object),
+    )
+  })
+
   it('shares one event lease and dedupes canonical/legacy document changes by sequence', () => {
     const { close, handlers, workbench } = harness([])
     const listener = vi.fn()

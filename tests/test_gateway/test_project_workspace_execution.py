@@ -2805,7 +2805,7 @@ async def test_authenticated_project_safe_is_rejected_when_native_backend_is_una
         assert project is not None
 
         with pytest.raises(rpc_sessions.RpcHandlerError) as raised:
-            await rpc_sessions._handle_sessions_send(
+            await rpc_sessions._handle_sessions_send_contract(
                 {
                     "key": "agent:main:webchat:project-unavailable-proof",
                     "message": "write",

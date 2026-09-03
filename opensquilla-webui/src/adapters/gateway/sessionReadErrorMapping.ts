@@ -4,7 +4,7 @@ import {
   SessionReadLeaseClosedError,
   SessionReadSessionMissingError,
 } from '@/modules/sessionReadLifecycle'
-import { readTransportFailure } from './privateTransports'
+import { readTransportFailure } from './transportTypes'
 
 export function mapSessionReadError(error: unknown): Error {
   if (

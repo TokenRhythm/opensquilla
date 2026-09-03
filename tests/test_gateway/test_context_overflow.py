@@ -1370,21 +1370,29 @@ async def test_chat_send_accepts_turn_without_synchronous_context_overflow_gate(
     async def _unexpected_gate(*args: Any, **kwargs: Any) -> dict[str, Any]:
         raise AssertionError("chat.send must not synchronously refuse overflow")
 
-    async def _fake_sessions_send(
+    async def _fake_admit(
         params: dict[str, Any],
-        _ctx: Any,
-        **_kwargs: Any,
+        *,
+        surface: str,
     ) -> dict[str, Any]:
+        assert surface == "webchat"
         accepted.update(params)
-        return {"status": "accepted", "key": params["key"], "task_id": "task-long-context"}
+        key = params["sessionKey"]
+        return {
+            "ok": True,
+            "sessionKey": key,
+            "status": "accepted",
+            "key": key,
+            "task_id": "task-long-context",
+        }
 
     monkeypatch.setattr(
         "opensquilla.gateway.rpc_chat._enforce_context_overflow",
         _unexpected_gate,
     )
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_sessions._handle_sessions_send",
-        _fake_sessions_send,
+        "opensquilla.gateway.rpc_chat._chat_turn_admission_adapter",
+        lambda _ctx: SimpleNamespace(admit=_fake_admit),
     )
 
     result = await _handle_chat_send({"message": "m", "sessionKey": "s-auto"}, ctx)
@@ -1397,53 +1405,7 @@ async def test_chat_send_accepts_turn_without_synchronous_context_overflow_gate(
         "task_id": "task-long-context",
     }
     assert accepted["message"] == "m"
-    assert accepted["key"] == "s-auto"
-
-
-def test_chat_send_creates_webchat_session_with_agent_from_key(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cfg = _cfg(ContextOverflowPolicy.AUTO_SUMMARIZE, budget=10)
-    sm = SimpleNamespace(
-        get_or_create=AsyncMock(
-            return_value=SimpleNamespace(
-                session_key="agent:kid-project:webchat:abc",
-                agent_id="kid-project",
-            )
-        ),
-    )
-    ctx = SimpleNamespace(
-        config=cfg,
-        session_manager=sm,
-        principal=SimpleNamespace(role="owner"),
-    )
-
-    async def _fake_sessions_send(
-        params: dict[str, Any],
-        _ctx: Any,
-        **_kwargs: Any,
-    ) -> dict[str, Any]:
-        return {"status": "accepted", "key": params["key"], "task_id": "task-1"}
-
-    monkeypatch.setattr(
-        "opensquilla.gateway.rpc_sessions._handle_sessions_send",
-        _fake_sessions_send,
-    )
-
-    async def _run() -> dict[str, Any]:
-        return await _handle_chat_send(
-            {"message": "m", "sessionKey": "agent:kid-project:webchat:abc"},
-            ctx,
-        )
-
-    result = asyncio.run(_run())
-
-    assert result["ok"] is True
-    sm.get_or_create.assert_awaited_once_with(
-        session_key="agent:kid-project:webchat:abc",
-        agent_id="kid-project",
-        display_name="WebChat",
-    )
+    assert accepted["sessionKey"] == "s-auto"
 
 
 @pytest.mark.asyncio

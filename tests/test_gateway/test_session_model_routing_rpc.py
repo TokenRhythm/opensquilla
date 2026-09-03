@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from opensquilla.application.pending_input_queue import PendingInputRequest
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError
 from opensquilla.gateway.rpc_sessions import (
@@ -110,15 +111,17 @@ async def test_pending_input_rejects_new_session_routing_before_staging() -> Non
 
     with pytest.raises(RpcHandlerError) as caught:
         await _enqueue_pending_input(
-            {
-                "key": "agent:main:webchat:routing-pending",
-                "pendingInputId": "routing-pending-input",
-                "clientRequestId": "routing-pending-request",
-                "clientMessageId": "routing-pending-message",
-                "message": "queued first turn",
-                "intent": "new_chat",
-                "initialRoutingMode": "ensemble",
-            },
+            PendingInputRequest(
+                session_key="agent:main:webchat:routing-pending",
+                pending_input_id="routing-pending-input",
+                attributes={
+                    "clientRequestId": "routing-pending-request",
+                    "clientMessageId": "routing-pending-message",
+                    "message": "queued first turn",
+                    "intent": "new_chat",
+                    "initialRoutingMode": "ensemble",
+                },
+            ),
             ctx,
         )
 

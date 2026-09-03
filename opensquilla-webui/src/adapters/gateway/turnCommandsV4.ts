@@ -1,5 +1,5 @@
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
-import { readTransportFailure } from './privateTransports'
+import { readTransportFailure } from './transportTypes'
 import {
   CHAT_ABORT_METHOD,
   type ChatAbortParams,

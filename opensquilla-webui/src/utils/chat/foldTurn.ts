@@ -150,7 +150,7 @@ function asRenderedMessage(folded: {
  * Incremental live-turn accumulator.
  *
  * `foldTurn` below intentionally stays a pure replay oracle for history and
- * parity tests.  The live UI, however, must not replay the entire accepted
+ * deterministic fold tests. The live UI must not replay the entire accepted
  * frame log for every token.  This accumulator applies each frame once and
  * only derives the small render projection when the frame scheduler publishes
  * a snapshot.
@@ -559,8 +559,7 @@ export class TurnAccumulator {
         // The production live answer is rendered by StreamingTextPart from
         // canonical raw text. Parsing the same growing answer here produced an
         // invisible full-prefix Markdown pass on every visual flush. Keep the
-        // rendered HTML only for intermediate narration and for the DEV shadow
-        // renderer, which still needs an exact legacy parity surface.
+        // rendered HTML only for intermediate narration.
         // Only the current trailing answer is owned by StreamingTextPart. If
         // a later tool arrives, that provisional answer moves back into the
         // activity chronology and needs rendered HTML like any other

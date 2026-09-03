@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
-from opensquilla.application.observability import LogReader, LogReaderPort, LogTailQuery
+from opensquilla.application.observability import (
+    LogReader,
+    LogReaderPort,
+    LogStatusResult,
+    LogTailQuery,
+    LogTailResult,
+)
 from opensquilla.gateway.adapters.observability_contract import (
     register_observability_contract,
 )
@@ -23,21 +28,24 @@ class _GatewayLogReaderRuntime(LogReaderPort):
     def __init__(self, ctx: RpcContext) -> None:
         self._ctx = ctx
 
-    async def status(self) -> Mapping[str, Any]:
+    async def status(self) -> LogStatusResult:
         from opensquilla.gateway.log_status_runtime import read_log_status
 
-        return read_log_status(
-            config=getattr(self._ctx, "config", None),
-            diagnostics_state=getattr(self._ctx, "diagnostics_state", None),
+        return cast(
+            LogStatusResult,
+            read_log_status(
+                config=getattr(self._ctx, "config", None),
+                diagnostics_state=getattr(self._ctx, "diagnostics_state", None),
+            ),
         )
 
-    async def tail(self, query: LogTailQuery) -> Mapping[str, Any]:
-        return read_log_tail(query)
+    async def tail(self, query: LogTailQuery) -> LogTailResult:
+        return cast(LogTailResult, read_log_tail(query))
 
 
 async def _logs_status_contract(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     """Report log-related runtime switches without mutating filesystem state."""
-    return await LogReader(_GatewayLogReaderRuntime(ctx)).status()
+    return dict(await LogReader(_GatewayLogReaderRuntime(ctx)).status())
 
 
 @_d.method("logs.trace", scope="operator.read")
@@ -95,11 +103,13 @@ async def _logs_tail_contract(params: dict | None, ctx: RpcContext) -> dict[str,
     """Tail log file with cursor-based pagination and level filter."""
     p = params or {}
     reader = LogReader(_GatewayLogReaderRuntime(ctx))
-    return await reader.tail(
-        LogTailQuery(
-            cursor=int(p.get("cursor", 0)),
-            limit=int(p.get("limit", 100)),
-            level=str(p.get("level") or "") or None,
+    return dict(
+        await reader.tail(
+            LogTailQuery(
+                cursor=int(p.get("cursor", 0)),
+                limit=int(p.get("limit", 100)),
+                level=str(p.get("level") or "") or None,
+            )
         )
     )
 

@@ -2,7 +2,7 @@ import {
   ArtifactProductFailure,
   type ArtifactProductErrorCode,
 } from '@/utils/artifactProductErrors'
-import { readTransportFailure } from './privateTransports'
+import { readTransportFailure } from './transportTypes'
 
 const CURRENT_CODES = new Set<ArtifactProductErrorCode>([
   'DOCUMENT_CHANGED',

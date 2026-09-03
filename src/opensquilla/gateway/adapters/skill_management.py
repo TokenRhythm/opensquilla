@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any, cast
+from uuid import UUID
 
 from opensquilla.application.skill_management import (
     CancelSkillInstall,
@@ -37,7 +38,7 @@ class GatewaySkillManagementAdapter:
         command = InstallSkill(
             identifier=identifier,
             source=source,
-            operation_id=self._identity(params, "operationId", "operation_id"),
+            operation_id=self._operation_id(params),
             force=self._boolean(params, "force"),
             replace_source=self._boolean(params, "replaceSource"),
             risk_confirmation=self._identity(
@@ -49,9 +50,7 @@ class GatewaySkillManagementAdapter:
     async def cancel(self, params: dict[str, Any] | None) -> dict[str, Any]:
         if not isinstance(params, dict):
             raise ValueError("params.operationId is required")
-        operation_id = self._identity(params, "operationId", "operation_id")
-        if not operation_id:
-            raise ValueError("params.operationId is required")
+        operation_id = self._operation_id(params, required=True)
         return dict(
             await self._application.cancel(CancelSkillInstall(operation_id))
         )
@@ -107,6 +106,20 @@ class GatewaySkillManagementAdapter:
         if len(set(normalized)) > 1:
             raise ValueError(f"params.{camel} and params.{snake} must match")
         return normalized[0]
+
+    @classmethod
+    def _operation_id(
+        cls, params: Mapping[str, Any], *, required: bool = False
+    ) -> str:
+        value = cls._identity(params, "operationId", "operation_id")
+        if not value:
+            if required:
+                raise ValueError("params.operationId is required")
+            return ""
+        try:
+            return str(UUID(value))
+        except ValueError as exc:
+            raise ValueError("params.operationId must be a UUID") from exc
 
     @staticmethod
     def _boolean(params: Mapping[str, Any], name: str) -> bool:

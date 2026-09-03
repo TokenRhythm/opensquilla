@@ -94,6 +94,7 @@ class GatewayArtifactWorkbenchAdapter:
     async def dispatch(self, method: str) -> dict[str, Any]:
         p = self._params
         port = self._port
+        result: Mapping[str, object]
         if method == "artifacts.list":
             result = await ArtifactCatalog(cast(ArtifactCatalogPort, port)).list(
                 ArtifactCatalogQuery(

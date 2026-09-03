@@ -7,7 +7,7 @@ import type {
 import { ArtifactCatalogError } from '@/modules/artifactWorkbench'
 import {
   readTransportFailure,
-} from './privateTransports'
+} from './transportTypes'
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import {
   ARTIFACTS_LIST_METHOD,
@@ -227,14 +227,27 @@ export function createV4ArtifactWorkbench(
 
   const artifactContent = createV4ArtifactContentAccess(http)
   const attachmentContent = createV4AttachmentContentAccess(http)
+  const operationRpc: RpcTransport = {
+    async request<T>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions) {
+      await rpc.ready({
+        signal: options?.signal,
+        timeoutMs: 10_000,
+        timeoutAction: 'reject',
+        abortAction: 'reject',
+      })
+      return rpc.request<T>(method, params, options)
+    },
+    ready: options => rpc.ready(options),
+    supports: method => rpc.supports(method),
+    markUnsupported: method => rpc.markUnsupported(method),
+  }
   return {
     artifacts: createV4ArtifactCatalog(rpc),
-    documents: createV4ArtifactDocuments(rpc),
-    resources: createV4WorkbenchResources(rpc),
-    promptAnnotations: createV4ArtifactPromptAnnotations(rpc),
+    documents: createV4ArtifactDocuments(operationRpc),
+    resources: createV4WorkbenchResources(operationRpc),
+    promptAnnotations: createV4ArtifactPromptAnnotations(operationRpc),
     content: { ...artifactContent, ...attachmentContent },
     previews: createV4ArtifactPreviews(http),
-    ready: () => rpc.ready(),
     subscribeDocumentChanges(listener): ArtifactWorkbenchSubscription {
       listeners.add(listener)
       startLease()

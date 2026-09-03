@@ -390,7 +390,6 @@ export interface ArtifactWorkbench {
   readonly promptAnnotations: ArtifactPromptAnnotationProvider
   readonly content: ArtifactContentAccess
   readonly previews: ArtifactPreviewAccess
-  ready(): Promise<void>
   subscribeDocumentChanges(
     listener: (change: ArtifactDocumentChange) => void,
   ): ArtifactWorkbenchSubscription

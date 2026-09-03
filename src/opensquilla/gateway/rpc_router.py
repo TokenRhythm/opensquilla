@@ -22,7 +22,7 @@ import os
 import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 import structlog
 
@@ -34,6 +34,7 @@ from opensquilla.application.observability import (
     RouterLearningQuery,
     RouterLearningStatus,
     RouterLearningStatusPort,
+    RouterLearningStatusResult,
 )
 from opensquilla.engine.steps.router_decision_record import get_decision_writer
 from opensquilla.gateway.adapters.conversation_ancillary import (
@@ -378,8 +379,11 @@ class _GatewayRouterLearningStatusRuntime(RouterLearningStatusPort):
     def __init__(self, ctx: RpcContext) -> None:
         self._ctx = ctx
 
-    async def snapshot(self, query: RouterLearningQuery) -> Mapping[str, Any]:
-        return await read_router_learning_status(query.agent_id, self._ctx)
+    async def snapshot(self, query: RouterLearningQuery) -> RouterLearningStatusResult:
+        return cast(
+            RouterLearningStatusResult,
+            await read_router_learning_status(query.agent_id, self._ctx),
+        )
 
 
 async def _router_selflearning_status_contract(
@@ -388,7 +392,7 @@ async def _router_selflearning_status_contract(
     p = params if isinstance(params, dict) else {}
     agent_id = p.get("agentId") or p.get("agent_id") or "main"
     status = RouterLearningStatus(_GatewayRouterLearningStatusRuntime(ctx))
-    return await status.read(RouterLearningQuery(str(agent_id)))
+    return dict(await status.read(RouterLearningQuery(str(agent_id))))
 
 
 _handle_selflearning_status = register_observability_contract(

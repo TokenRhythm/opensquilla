@@ -52,7 +52,7 @@ from opensquilla.gateway.rpc_sessions import (
     _handle_plans_set_mode,
     _handle_sessions_delete,
     _handle_sessions_reset,
-    _handle_sessions_send,
+    _handle_sessions_send_contract,
 )
 from opensquilla.gateway.session_streams import SessionStreamRegistry
 from opensquilla.gateway.task_runtime import (
@@ -1302,7 +1302,7 @@ async def test_reset_turn_revokes_goal_lease_and_preserves_set_receipt(
             return None
 
         monkeypatch.setattr(stack.manager, "write_session_archive", skip_archive)
-        reset_turn = await _handle_sessions_send(
+        reset_turn = await _handle_sessions_send_contract(
             {
                 "key": SOURCE_KEY,
                 "message": "Start the reset generation.",
@@ -2895,7 +2895,7 @@ async def test_collect_into_queued_owned_goal_keeps_context_candidate_exclusive(
         blocker = await stack.runtime.enqueue(blocker_envelope, "global blocker")
         await asyncio.wait_for(blocker_started.wait(), timeout=2.0)
 
-        first = await _handle_sessions_send(
+        first = await _handle_sessions_send_contract(
             {
                 "key": SOURCE_KEY,
                 "message": "First collected Goal input",
@@ -2904,7 +2904,7 @@ async def test_collect_into_queued_owned_goal_keeps_context_candidate_exclusive(
             },
             stack.context,
         )
-        second = await _handle_sessions_send(
+        second = await _handle_sessions_send_contract(
             {
                 "key": SOURCE_KEY,
                 "message": "Second collected Goal input",

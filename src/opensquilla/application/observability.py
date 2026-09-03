@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, NotRequired, Protocol, TypedDict
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,18 +50,68 @@ class ReadinessFinding:
     restart_required: bool = False
 
 
+class RuntimeStatusResult(TypedDict):
+    status: str
+    version: str
+    uptime_ms: int
+    active_sessions: int
+    provider: NotRequired[str | None]
+
+
+class RouterLearningStatusResult(TypedDict):
+    agentId: str
+    enabled: bool
+    captureEnabled: bool
+    trainingReachable: bool
+    dream: Mapping[str, object]
+    activeModel: Mapping[str, object]
+    samples: Mapping[str, object] | None
+    gate: Mapping[str, object] | None
+    lastReceipt: Mapping[str, object] | None
+    error: NotRequired[str]
+
+
+class LogStatusResult(TypedDict):
+    raw_turn_call_log: Mapping[str, object]
+    gateway_file_log: Mapping[str, object]
+    diagnostics_enabled: Mapping[str, object]
+    trace_log: NotRequired[Mapping[str, object]]
+    diagnostics: NotRequired[Mapping[str, object]]
+    env: NotRequired[Mapping[str, object]]
+
+
+type LogEntry = str | Mapping[str, object]
+
+
+class LogTailResult(TypedDict):
+    lines: list[LogEntry]
+    cursor: int
+    has_more: bool
+
+
+class ReadinessReport(TypedDict):
+    status: str
+    ready: bool
+    summary: str
+    counts: Mapping[str, int]
+    impactCounts: Mapping[str, int]
+    findings: list[Mapping[str, object]]
+    agentId: str
+    configPath: NotRequired[str]
+
+
 class RuntimeStatusPort(Protocol):
-    async def snapshot(self) -> Mapping[str, Any]: ...
+    async def snapshot(self) -> RuntimeStatusResult: ...
 
 
 class RouterLearningStatusPort(Protocol):
-    async def snapshot(self, query: RouterLearningQuery) -> Mapping[str, Any]: ...
+    async def snapshot(self, query: RouterLearningQuery) -> RouterLearningStatusResult: ...
 
 
 class LogReaderPort(Protocol):
-    async def status(self) -> Mapping[str, Any]: ...
+    async def status(self) -> LogStatusResult: ...
 
-    async def tail(self, query: LogTailQuery) -> Mapping[str, Any]: ...
+    async def tail(self, query: LogTailQuery) -> LogTailResult: ...
 
 
 class ReadinessDataPort(Protocol):
@@ -100,34 +150,34 @@ class ReadinessEvaluationPort(Protocol):
         findings: Sequence[ReadinessFinding],
         *,
         config_path: str | None,
-    ) -> dict[str, Any]: ...
+    ) -> ReadinessReport: ...
 
 
 class RuntimeStatus:
     def __init__(self, port: RuntimeStatusPort) -> None:
         self._port = port
 
-    async def read(self) -> dict[str, Any]:
-        return dict(await self._port.snapshot())
+    async def read(self) -> RuntimeStatusResult:
+        return await self._port.snapshot()
 
 
 class RouterLearningStatus:
     def __init__(self, port: RouterLearningStatusPort) -> None:
         self._port = port
 
-    async def read(self, query: RouterLearningQuery) -> dict[str, Any]:
+    async def read(self, query: RouterLearningQuery) -> RouterLearningStatusResult:
         agent_id = str(query.agent_id or "main").strip() or "main"
-        return dict(await self._port.snapshot(RouterLearningQuery(agent_id)))
+        return await self._port.snapshot(RouterLearningQuery(agent_id))
 
 
 class LogReader:
     def __init__(self, port: LogReaderPort) -> None:
         self._port = port
 
-    async def status(self) -> dict[str, Any]:
-        return dict(await self._port.status())
+    async def status(self) -> LogStatusResult:
+        return await self._port.status()
 
-    async def tail(self, query: LogTailQuery) -> dict[str, Any]:
+    async def tail(self, query: LogTailQuery) -> LogTailResult:
         if query.cursor < 0:
             raise ValueError("cursor must be non-negative")
         if query.limit < 1:
@@ -137,7 +187,7 @@ class LogReader:
             limit=min(query.limit, 1000),
             level=(query.level or "").strip().upper() or None,
         )
-        return dict(await self._port.tail(bounded))
+        return await self._port.tail(bounded)
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,7 +229,7 @@ class ReadinessDiagnostics:
         *,
         connection_id: str,
         config_path: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> ReadinessReport:
         normalized = replace(
             query,
             agent_id=self._evaluation.normalize_agent_id(str(query.agent_id or "main")),
@@ -264,16 +314,21 @@ class ReadinessDiagnostics:
 __all__ = [
     "LogReader",
     "LogReaderPort",
+    "LogStatusResult",
     "LogTailQuery",
+    "LogTailResult",
     "ReadinessDataPort",
     "ReadinessDiagnostics",
     "ReadinessEvaluationPort",
     "ReadinessFinding",
     "ReadinessFixStep",
     "ReadinessQuery",
+    "ReadinessReport",
     "RouterLearningQuery",
     "RouterLearningStatus",
     "RouterLearningStatusPort",
+    "RouterLearningStatusResult",
     "RuntimeStatus",
     "RuntimeStatusPort",
+    "RuntimeStatusResult",
 ]

@@ -7,7 +7,10 @@ from pathlib import Path
 from typing import Any, cast
 
 from opensquilla.application.skill_proposal_review import (
+    AutoEnabledSkillListResult,
     AutoProposalRuntimePort,
+    ProposalListResult,
+    ProposalOperationResult,
     ProposalSettings,
     ProposalSettingsPatch,
     SkillProposalReview,
@@ -27,25 +30,40 @@ class FilesystemSkillProposalStore(SkillProposalStorePort):
         self._home = home
         self._invalidate_catalog = invalidate_catalog
 
-    async def list_proposals(self) -> Mapping[str, Any]:
-        return proposals_lib.list_proposals(self._home)
+    async def list_proposals(self) -> ProposalListResult:
+        return cast(ProposalListResult, proposals_lib.list_proposals(self._home))
 
-    async def show_proposal(self, proposal_id: str) -> Mapping[str, Any]:
-        return proposals_lib.show_proposal(self._home, proposal_id)
+    async def show_proposal(self, proposal_id: str) -> ProposalOperationResult:
+        return cast(
+            ProposalOperationResult,
+            proposals_lib.show_proposal(self._home, proposal_id),
+        )
 
     async def accept_proposal(
         self, proposal_id: str, *, force: bool
-    ) -> Mapping[str, Any]:
-        return proposals_lib.accept_proposal(self._home, proposal_id, force=force)
+    ) -> ProposalOperationResult:
+        return cast(
+            ProposalOperationResult,
+            proposals_lib.accept_proposal(self._home, proposal_id, force=force),
+        )
 
-    async def reject_proposal(self, proposal_id: str) -> Mapping[str, Any]:
-        return proposals_lib.reject_proposal(self._home, proposal_id)
+    async def reject_proposal(self, proposal_id: str) -> ProposalOperationResult:
+        return cast(
+            ProposalOperationResult,
+            proposals_lib.reject_proposal(self._home, proposal_id),
+        )
 
-    async def list_auto_enabled(self) -> Mapping[str, Any]:
-        return proposals_lib.list_auto_enabled_skills(self._home)
+    async def list_auto_enabled(self) -> AutoEnabledSkillListResult:
+        return cast(
+            AutoEnabledSkillListResult,
+            proposals_lib.list_auto_enabled_skills(self._home),
+        )
 
-    async def disable_auto_enabled(self, name: str) -> Mapping[str, Any]:
-        return proposals_lib.disable_auto_enabled_skill(self._home, name)
+    async def disable_auto_enabled(self, name: str) -> ProposalOperationResult:
+        return cast(
+            ProposalOperationResult,
+            proposals_lib.disable_auto_enabled_skill(self._home, name),
+        )
 
     def invalidate_catalog(self) -> None:
         self._invalidate_catalog()

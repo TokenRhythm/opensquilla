@@ -783,10 +783,6 @@ def _clean_cancel_source(value: Any, default: str) -> str:
     return (safe.strip("_") or default)[:80]
 
 
-def _cancel_source_from_params(params: dict | None, default: str) -> str:
-    return _clean_cancel_source((params or {}).get("source"), default)
-
-
 def _truncate_removed_entries(transcript: list[Any], max_messages: int) -> list[Any]:
     if max_messages < 0:
         return list(transcript)
@@ -916,7 +912,7 @@ def _channel_types_from_config(config: Any) -> dict[str, str]:
     return out
 
 
-def _normalize_session_send_source_hint(params: dict[str, Any]) -> dict[str, Any]:
+def _normalize_session_send_source_hint(params: Mapping[str, Any]) -> dict[str, Any]:
     raw_hint = params.get("_source")
     source_hint = dict(raw_hint) if isinstance(raw_hint, dict) else {}
     caller_kind = (
@@ -1604,7 +1600,7 @@ def _first_dict_value(*values: Any) -> dict[str, Any] | None:
 
 
 def _normalize_memory_capture_controls(
-    params: dict[str, Any],
+    params: Mapping[str, Any],
     *,
     trusted_run_kind: str | None = None,
 ) -> dict[str, Any]:
@@ -1663,8 +1659,10 @@ def _require_key(params: dict | None) -> str:
     return canonicalize_session_key(key)
 
 
-def _optional_string_param(params: dict | None, *names: str) -> str | None:
-    if not isinstance(params, dict):
+def _optional_string_param(
+    params: Mapping[str, Any] | None, *names: str
+) -> str | None:
+    if params is None:
         return None
     for name in names:
         if name not in params:
@@ -3481,22 +3479,22 @@ _INGRESS_TURN_AUTHORITY_SCOPE: ContextVar[_IngressTurnAuthorityScope | None] = C
 )
 
 
-async def _handle_sessions_send_impl(
-    params: dict | None,
+async def _run_turn_admission(
+    command: AdmitTurn,
     ctx: RpcContext,
     **kwargs: Any,
 ) -> dict:
     scope = _IngressTurnAuthorityScope()
     token = _INGRESS_TURN_AUTHORITY_SCOPE.set(scope)
     try:
-        return await _handle_sessions_send_impl_inner(params, ctx, **kwargs)
+        return await _run_turn_admission_inner(command, ctx, **kwargs)
     finally:
         _INGRESS_TURN_AUTHORITY_SCOPE.reset(token)
         await scope.close_untransferred()
 
 
-async def _handle_sessions_send_impl_inner(
-    params: dict | None,
+async def _run_turn_admission_inner(
+    command: AdmitTurn,
     ctx: RpcContext,
     *,
     fingerprint_params: dict[str, Any] | None = None,
@@ -3518,11 +3516,9 @@ async def _handle_sessions_send_impl_inner(
     _prompt_annotation_acceptance_retries: int = 1,
     trusted_run_kind: str | None = None,
 ) -> dict:
-    key = _require_key(params)
-    if not isinstance(params, dict) or "message" not in params:
-        raise ValueError("params.message is required")
-
-    message_text: str = params["message"]
+    key = command.session_key
+    message_text = command.message
+    params = command.attributes
     source_hint = _normalize_session_send_source_hint(params)
     raw_prompt_annotation_ids = params.get(
         "promptAnnotationIds",
@@ -3778,7 +3774,10 @@ async def _handle_sessions_send_impl_inner(
         raise KeyError("No session storage available")
     storage = cast(SessionStorage, storage_candidate)
 
-    effective_fingerprint_params = dict(fingerprint_params or params)
+    effective_fingerprint_params = dict(
+        fingerprint_params
+        or {"key": key, "message": message_text, **dict(params)}
+    )
     if raw_prompt_annotation_ids is not None:
         effective_fingerprint_params.pop("prompt_annotation_ids", None)
         effective_fingerprint_params["promptAnnotationIds"] = list(prompt_annotation_ids)
@@ -5901,8 +5900,8 @@ async def _handle_sessions_send_impl_inner(
                     authority_scope.authorities.clear()
                 return cast(
                     dict[Any, Any],
-                    await _handle_sessions_send_impl(
-                        params,
+                    await _run_turn_admission(
+                        command,
                         ctx,
                         fingerprint_params=fingerprint_params,
                         plan_revision_id=plan_revision_id,
@@ -6869,8 +6868,8 @@ async def _handle_sessions_send_impl_inner(
     raise AssertionError("unreachable: direct sends return before runtime dispatch")
 
 
-async def _handle_sessions_send(
-    params: dict | None,
+async def _admit_turn(
+    command: AdmitTurn,
     ctx: RpcContext,
     *,
     fingerprint_params: dict[str, Any] | None = None,
@@ -6899,15 +6898,15 @@ async def _handle_sessions_send(
     collaboration mode, or an idempotency replay.
     """
 
-    key = _require_key(params)
+    key = command.session_key
     runtime = getattr(ctx, "task_runtime", None)
     register = getattr(runtime, "explicit_ingress_intent", None)
 
     async def _send() -> dict:
         return cast(
             dict[Any, Any],
-            await _handle_sessions_send_impl(
-                params,
+            await _run_turn_admission(
+                command,
                 ctx,
                 fingerprint_params=fingerprint_params,
                 plan_revision_id=plan_revision_id,
@@ -6937,22 +6936,13 @@ async def _handle_sessions_send(
         return await _send()
 
 
-def _pending_input_param(params: dict | None, *names: str) -> str:
+def _pending_input_param(params: Mapping[str, Any] | None, *names: str) -> str:
     value = _optional_string_param(params, *names)
     if value is None:
         raise ValueError(f"params.{names[0]} is required")
     if len(value) > 256:
         raise ValueError(f"params.{names[0]} must not exceed 256 characters")
     return value
-
-
-def _pending_input_key(params: dict | None) -> str:
-    if not isinstance(params, dict):
-        raise ValueError("params.key is required")
-    raw = params.get("key", params.get("sessionKey"))
-    if not isinstance(raw, str) or not raw.strip():
-        raise ValueError("params.key is required")
-    return canonicalize_session_key(raw)
 
 
 def _pending_input_payload(row: PendingChatInput, *, replayed: bool = False) -> dict[str, Any]:
@@ -7009,7 +6999,9 @@ def _pending_input_payload(row: PendingChatInput, *, replayed: bool = False) -> 
     return result
 
 
-def _pending_input_send_payload(params: dict[str, Any], *, key: str) -> dict[str, Any]:
+def _pending_input_send_payload(
+    params: Mapping[str, Any], *, key: str
+) -> dict[str, Any]:
     message = params.get("message")
     if not isinstance(message, str) or not message.strip():
         raise ValueError("params.message must be a non-empty string")
@@ -7282,17 +7274,14 @@ async def _cleanup_unreferenced_pending_promotions(
 
 
 async def _enqueue_pending_input(
-    params: dict | None,
+    request: PendingInputRequest,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    if not isinstance(params, dict):
-        raise ValueError("params must be an object")
-    key = _pending_input_key(params)
-    pending_input_id = _pending_input_param(
-        params,
-        "pendingInputId",
-        "pending_input_id",
-    )
+    params = request.attributes
+    key = request.session_key
+    pending_input_id = request.pending_input_id
+    if pending_input_id is None:
+        raise ValueError("pending_input_id is required")
     raw_payload = _pending_input_send_payload(params, key=key)
     if raw_payload.get("initialRoutingMode") is not None:
         # A staged input is owned by an already-durable session, while an
@@ -7500,10 +7489,10 @@ async def _enqueue_pending_input(
 
 
 async def _list_pending_inputs(
-    params: dict | None,
+    request: PendingInputRequest,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    key = _pending_input_key(params)
+    key = request.session_key
     rows = await _pending_input_storage(ctx).list_pending_chat_inputs(key)
     return {
         "sessionKey": key,
@@ -7513,18 +7502,15 @@ async def _list_pending_inputs(
 
 
 async def _update_pending_input(
-    params: dict | None,
+    request: PendingInputRequest,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    if not isinstance(params, dict):
-        raise ValueError("params must be an object")
-    key = _pending_input_key(params)
-    pending_input_id = _pending_input_param(
-        params,
-        "pendingInputId",
-        "pending_input_id",
-    )
-    expected_revision = params.get("expectedRevision", params.get("expected_revision"))
+    params = request.attributes
+    key = request.session_key
+    pending_input_id = request.pending_input_id
+    if pending_input_id is None:
+        raise ValueError("pending_input_id is required")
+    expected_revision = request.expected_revision
     position = params.get("position")
     if isinstance(expected_revision, bool) or not isinstance(expected_revision, int):
         raise ValueError("params.expectedRevision must be an integer")
@@ -7555,12 +7541,11 @@ async def _update_pending_input(
 
 
 async def _reorder_pending_inputs(
-    params: dict | None,
+    request: PendingInputRequest,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    if not isinstance(params, dict):
-        raise ValueError("params must be an object")
-    key = _pending_input_key(params)
+    params = request.attributes
+    key = request.session_key
     raw_items = params.get("items")
     if not isinstance(raw_items, list) or not 2 <= len(raw_items) <= 5:
         raise ValueError("params.items must contain 2-5 rows")
@@ -7610,18 +7595,14 @@ async def _reorder_pending_inputs(
 
 
 async def _cancel_pending_input(
-    params: dict | None,
+    request: PendingInputRequest,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    if not isinstance(params, dict):
-        raise ValueError("params must be an object")
-    key = _pending_input_key(params)
-    pending_input_id = _pending_input_param(
-        params,
-        "pendingInputId",
-        "pending_input_id",
-    )
-    expected_revision = params.get("expectedRevision", params.get("expected_revision"))
+    key = request.session_key
+    pending_input_id = request.pending_input_id
+    if pending_input_id is None:
+        raise ValueError("pending_input_id is required")
+    expected_revision = request.expected_revision
     if expected_revision is not None and (
         isinstance(expected_revision, bool) or not isinstance(expected_revision, int)
     ):
@@ -7670,17 +7651,14 @@ async def _cancel_pending_input(
 
 
 async def _dispatch_pending_input(
-    params: dict | None,
+    request: PendingInputRequest,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    if not isinstance(params, dict):
-        raise ValueError("params must be an object")
-    key = _pending_input_key(params)
-    pending_input_id = _pending_input_param(
-        params,
-        "pendingInputId",
-        "pending_input_id",
-    )
+    params = request.attributes
+    key = request.session_key
+    pending_input_id = request.pending_input_id
+    if pending_input_id is None:
+        raise ValueError("pending_input_id is required")
     client_request_id = _pending_input_param(
         params,
         "clientRequestId",
@@ -7908,19 +7886,16 @@ async def _steer_v2_response(
 
 
 async def _steer_pending_input(
-    params: dict | None,
+    request: PendingInputRequest,
     ctx: RpcContext,
 ) -> dict[str, Any]:
     """Atomically convert one durable queued input into a same-turn steer."""
 
-    if not isinstance(params, dict):
-        raise ValueError("params must be an object")
-    key = _pending_input_key(params)
-    pending_input_id = _pending_input_param(
-        params,
-        "pendingInputId",
-        "pending_input_id",
-    )
+    params = request.attributes
+    key = request.session_key
+    pending_input_id = request.pending_input_id
+    if pending_input_id is None:
+        raise ValueError("pending_input_id is required")
     client_request_id = _pending_input_param(
         params,
         "clientRequestId",
@@ -7943,10 +7918,7 @@ async def _steer_pending_input(
             retryable=False,
             accepted=False,
         )
-    expected_revision = params.get(
-        "expectedRevision",
-        params.get("expected_revision"),
-    )
+    expected_revision = request.expected_revision
     if (
         isinstance(expected_revision, bool)
         or not isinstance(expected_revision, int)
@@ -8065,28 +8037,24 @@ async def _steer_pending_input(
         )
 
 
-async def _handle_sessions_steer_v2(params: dict | None, ctx: RpcContext) -> dict:
-    return await _handle_sessions_steer_v2_impl(params, ctx)
-
-
-async def _handle_sessions_steer_v2_impl(
-    params: dict | None,
-    ctx: RpcContext,
-    *,
-    pending_input_id: str | None = None,
-    pending_input_fingerprint: str | None = None,
-    pending_input_revision: int | None = None,
-    pending_source_scope: str | None = None,
-) -> dict:
+async def _steer_turn_durable(command: SteerTurn, ctx: RpcContext) -> dict:
     """Durably attach text to one explicitly named running turn."""
-
-    key = _require_key(params)
-    assert isinstance(params, dict)
-    raw_message = params.get("message")
-    if not isinstance(raw_message, str):
-        raise ValueError("params.message is required")
-    if not raw_message.strip():
-        raise ValueError("params.message must not be blank")
+    key = command.session_key
+    params = command.attributes
+    raw_message = command.message
+    pending_guard = command.pending_input
+    pending_input_id = (
+        pending_guard.pending_input_id if pending_guard is not None else None
+    )
+    pending_input_fingerprint = (
+        pending_guard.request_fingerprint if pending_guard is not None else None
+    )
+    pending_input_revision = (
+        pending_guard.expected_revision if pending_guard is not None else None
+    )
+    pending_source_scope = (
+        pending_guard.source_scope if pending_guard is not None else None
+    )
     expected_turn_id = _optional_string_param(
         params,
         "expected_turn_id",
@@ -8501,10 +8469,11 @@ async def _handle_sessions_steer_v2_impl(
     )
 
 
-async def _handle_sessions_steer(params: dict | None, ctx: RpcContext) -> dict:
+async def _steer_turn_legacy(command: SteerTurn, ctx: RpcContext) -> dict:
     """Inject text into the active turn, with a durable follow-up fallback."""
 
-    key = _require_key(params)
+    key = command.session_key
+    params = command.attributes
     log.info(
         "sessions.steer.legacy_used",
         session_key=key,
@@ -8512,11 +8481,7 @@ async def _handle_sessions_steer(params: dict | None, ctx: RpcContext) -> dict:
         replacement="sessions.steer.v2",
     )
     _emit_steer_metric("legacy_requested", session_key=key)
-    if not isinstance(params, dict) or not isinstance(params.get("message"), str):
-        raise ValueError("params.message is required")
-    raw_message = params["message"]
-    if not raw_message.strip():
-        raise ValueError("params.message must not be blank")
+    raw_message = command.message
     if ctx.session_manager is None:
         raise KeyError("No session manager available")
     storage = get_session_storage(ctx.session_manager)
@@ -8804,16 +8769,19 @@ async def _emit_to_subscribers(
     )
 
 
-async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
-    key = _require_key(params)
+async def _cancel_turn(command: CancelTurn, ctx: RpcContext) -> dict:
+    key = command.session_key
+    cancel_source = _clean_cancel_source(
+        command.source,
+        "webui_abort" if command.surface == "webchat" else "sessions_abort",
+    )
 
     if ctx.session_manager is None:
         return {"aborted": False, "key": key}
 
-    requested_task_id = _optional_string_param(params, "task_id", "taskId")
+    requested_task_id = command.task_id
     process_state_dir = getattr(getattr(ctx, "config", None), "state_dir", None)
-    abort_scope = _optional_string_param(params, "scope")
-    task_scoped = bool(abort_scope and abort_scope.lower() == "task")
+    task_scoped = command.task_scoped
     if task_scoped and requested_task_id is None:
         # Modern WebUI Stop is explicitly task-scoped. During the short
         # chat.send acceptance race it may not know the task id yet; fail
@@ -8842,7 +8810,7 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
         # Start every exact-identity safety operation before storage lookup or
         # runtime admission can consume the response deadline. Their own
         # cleanup deadline is independent from the bounded RPC observation.
-        exact_cancel_source = _cancel_source_from_params(params, "sessions_abort")
+        exact_cancel_source = cancel_source
         cleanup_deadline = time.monotonic() + _ABORT_OWNED_CLEANUP_SECONDS
         exact_runtime_cleanup = asyncio.create_task(
             _await_abort_operation(
@@ -9016,7 +8984,6 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
                 **({} if cancelled_count > 0 else {"reason": reason}),
             }
 
-        cancel_source = _cancel_source_from_params(params, "sessions_abort")
         approval_queue = get_approval_queue()
         processed_keys: set[str] = set()
         cancel_requested_task_ids: set[str] = set()
@@ -10737,8 +10704,16 @@ async def _handle_plans_implement(
         send_params["displayText"] = ""
     target_before_acceptance = await storage.get_session(key)
     current_session_implementation = send_params["intent"] == "continue"
-    result = await _handle_sessions_send(
-        send_params,
+    plan_attributes = dict(send_params)
+    plan_attributes.pop("key", None)
+    plan_attributes.pop("message", None)
+    result = await _admit_turn(
+        AdmitTurn(
+            session_key=key,
+            message=message,
+            surface="session",
+            attributes=plan_attributes,
+        ),
         ctx,
         fingerprint_params={
             "action": "plans.implement",
@@ -10892,8 +10867,16 @@ async def _handle_plans_revise(
     session = await storage.get_session(key)
     if session is None:
         raise KeyError(f"Session not found: {key}")
-    result = await _handle_sessions_send(
-        send_params,
+    revision_attributes = dict(send_params)
+    revision_attributes.pop("key", None)
+    revision_attributes.pop("message", None)
+    result = await _admit_turn(
+        AdmitTurn(
+            session_key=key,
+            message=provider_message,
+            surface="session",
+            attributes=revision_attributes,
+        ),
         ctx,
         fingerprint_params=fingerprint_params,
         plan_context_revision_id=revision_id,
@@ -11288,89 +11271,38 @@ class _GatewayTurnAdmissionPorts(
     def __init__(self, context: RpcContext) -> None:
         self._context = context
 
-    @staticmethod
-    def _params(
-        session_key: str,
-        message: str | None,
-        attributes: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        params = dict(attributes)
-        params["key"] = session_key
-        if message is not None:
-            params["message"] = message
-        return params
-
     async def admit(self, command: AdmitTurn) -> Mapping[str, Any]:
-        params = self._params(
-            command.session_key,
-            command.message,
-            command.attributes,
-        )
         if command.pending_input is not None:
             guard = command.pending_input
-            return await _handle_sessions_send(
-                params,
+            return await _admit_turn(
+                command,
                 self._context,
-                fingerprint_params=dict(params),
                 pending_input_id=guard.pending_input_id,
                 pending_input_fingerprint=guard.request_fingerprint,
                 pending_input_revision=guard.expected_revision,
             )
         if command.surface == "webchat":
-            params["sessionKey"] = command.session_key
-            return await _execute_webchat_turn(command, params, self._context)
-        return await _handle_sessions_send(params, self._context)
+            return await _execute_webchat_turn(command, self._context)
+        return await _admit_turn(command, self._context)
 
     async def cancel(self, command: CancelTurn) -> Mapping[str, Any]:
-        params = self._params(command.session_key, None, command.attributes)
-        if command.task_id is not None:
-            params["task_id"] = command.task_id
-        if command.task_scoped:
-            params["scope"] = "task"
-        if command.source is not None:
-            params["source"] = command.source
-        if command.surface != "webchat":
-            return await _handle_sessions_abort(params, self._context)
-        if self._context.session_manager is None:
-            return {
-                "ok": True,
-                "sessionKey": command.session_key,
-                "aborted": False,
-            }
-        params["source"] = command.source or "webui_abort"
-        result = await _handle_sessions_abort(params, self._context)
-        return {"sessionKey": command.session_key, **result}
+        return await _cancel_turn(command, self._context)
 
     async def steer(self, command: SteerTurn) -> Mapping[str, Any]:
-        params = self._params(
-            command.session_key,
-            command.message,
-            command.attributes,
-        )
-        if command.pending_input is not None:
-            guard = command.pending_input
-            return await _handle_sessions_steer_v2_impl(
-                params,
-                self._context,
-                pending_input_id=guard.pending_input_id,
-                pending_input_fingerprint=guard.request_fingerprint,
-                pending_input_revision=guard.expected_revision,
-                pending_source_scope=guard.source_scope,
-            )
         if command.mode == "durable":
-            return await _handle_sessions_steer_v2(params, self._context)
-        return await _handle_sessions_steer(params, self._context)
+            return await _steer_turn_durable(command, self._context)
+        return await _steer_turn_legacy(command, self._context)
 
 
 async def _execute_webchat_turn(
     command: AdmitTurn,
-    params: dict[str, Any],
     ctx: RpcContext,
 ) -> dict[str, Any]:
     """Project WebChat semantics onto the single durable session ingress."""
 
     message = command.message
     session_key = command.session_key
+    params = command.attributes
     agent_id = parse_agent_id(session_key)
     initial_collaboration_mode = command.initial_collaboration_mode
     initial_routing_mode = command.initial_routing_mode
@@ -11516,8 +11448,18 @@ async def _execute_webchat_turn(
         if prompt_annotation_ids is not None:
             send_params["promptAnnotationIds"] = prompt_annotation_ids
             fingerprint_params["promptAnnotationIds"] = prompt_annotation_ids
-        result = await _handle_sessions_send(
-            send_params,
+        send_attributes = dict(send_params)
+        send_attributes.pop("key", None)
+        send_attributes.pop("message", None)
+        result = await _admit_turn(
+            AdmitTurn(
+                session_key=session_key,
+                message=message,
+                surface="webchat",
+                attributes=send_attributes,
+                initial_collaboration_mode=initial_collaboration_mode,
+                initial_routing_mode=initial_routing_mode,
+            ),
             ctx,
             fingerprint_params=fingerprint_params,
             initial_collaboration_mode=initial_collaboration_mode,
@@ -11615,36 +11557,26 @@ class _GatewayPendingInputQueuePort(PendingInputQueuePort):
     def __init__(self, context: RpcContext) -> None:
         self._context = context
 
-    @staticmethod
-    def _params(request: PendingInputRequest) -> dict[str, Any]:
-        params = dict(request.attributes)
-        params["key"] = request.session_key
-        if request.pending_input_id is not None:
-            params["pendingInputId"] = request.pending_input_id
-        if request.expected_revision is not None:
-            params["expectedRevision"] = request.expected_revision
-        return params
-
     async def enqueue(self, request: PendingInputRequest) -> Mapping[str, Any]:
-        return await _enqueue_pending_input(self._params(request), self._context)
+        return await _enqueue_pending_input(request, self._context)
 
     async def list(self, request: PendingInputRequest) -> Mapping[str, Any]:
-        return await _list_pending_inputs(self._params(request), self._context)
+        return await _list_pending_inputs(request, self._context)
 
     async def update(self, request: PendingInputRequest) -> Mapping[str, Any]:
-        return await _update_pending_input(self._params(request), self._context)
+        return await _update_pending_input(request, self._context)
 
     async def reorder(self, request: PendingInputRequest) -> Mapping[str, Any]:
-        return await _reorder_pending_inputs(self._params(request), self._context)
+        return await _reorder_pending_inputs(request, self._context)
 
     async def cancel(self, request: PendingInputRequest) -> Mapping[str, Any]:
-        return await _cancel_pending_input(self._params(request), self._context)
+        return await _cancel_pending_input(request, self._context)
 
     async def dispatch(self, request: PendingInputRequest) -> Mapping[str, Any]:
-        return await _dispatch_pending_input(self._params(request), self._context)
+        return await _dispatch_pending_input(request, self._context)
 
     async def steer(self, request: PendingInputRequest) -> Mapping[str, Any]:
-        return await _steer_pending_input(self._params(request), self._context)
+        return await _steer_pending_input(request, self._context)
 
 
 def _pending_input_queue_adapter(ctx: RpcContext) -> GatewayPendingInputQueueAdapter:

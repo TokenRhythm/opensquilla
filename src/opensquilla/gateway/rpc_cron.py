@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import Any, TypeGuard
+from typing import Any, TypeGuard, cast
 
 import structlog
 
 from opensquilla.application.cron_scheduler import (
+    CronJobIdentityResult,
     CronJobMutation,
+    CronJobProjection,
     CronJobTarget,
     CronListQuery,
+    CronRunProjection,
     CronRunQuery,
     CronSchedulerPort,
     CronSubscriptionPort,
+    CronSubscriptionResult,
     CronTopic,
 )
 from opensquilla.gateway.adapters.cron_scheduler import (
@@ -580,28 +584,6 @@ def _handler_key_for_payload_kind(kind: str) -> str:
     return "agent_run"
 
 
-async def _handle_cron_list(params: dict | None, ctx: RpcContext) -> list[dict]:
-    scheduler = getattr(ctx, "cron_scheduler", None)
-    if scheduler is None:
-        return []
-    jobs = await scheduler.list_jobs()
-    result = [_job_to_wire(j) for j in jobs]
-    agent_id = (params or {}).get("agentId")
-    if agent_id:
-        result = [j for j in result if j.get("agentId") == agent_id]
-    return result
-
-
-async def _handle_cron_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    if not isinstance(params, dict) or "id" not in params:
-        raise ValueError("params.id is required")
-    scheduler = _require_scheduler(ctx)
-    job = await scheduler.get_job(params["id"])
-    if job is None:
-        raise KeyError(f"Cron job not found: {params['id']}")
-    return _job_to_wire(job)
-
-
 async def _handle_cron_add(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict):
         raise ValueError("params required: schedule (object) or expression (string)")
@@ -1006,114 +988,82 @@ async def _handle_cron_update(params: dict | None, ctx: RpcContext) -> dict[str,
     return _job_to_wire(job)
 
 
-async def _handle_cron_remove(params: dict | None, ctx: RpcContext) -> None:
-    if not isinstance(params, dict) or "id" not in params:
-        raise ValueError("params.id is required")
-    scheduler = _require_scheduler(ctx)
-    await scheduler.remove_job(params["id"])
-    return None
-
-
-async def _handle_cron_run(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    if not isinstance(params, dict) or "id" not in params:
-        raise ValueError("params.id is required")
-    scheduler = _require_scheduler(ctx)
-    result = await scheduler.run_job_now(params["id"])
-    return _manual_run_to_wire(result)
-
-
-async def _handle_cron_runs(params: dict | None, ctx: RpcContext) -> list[dict]:
-    if not isinstance(params, dict):
-        raise ValueError("params.id is required")
-    job_id = params.get("id") or params.get("job_id")
-    if not job_id:
-        raise ValueError("params.id is required")
-    limit = params.get("limit", 20)
-    scheduler = getattr(ctx, "cron_scheduler", None)
-    if scheduler is None:
-        return []
-    runs = await scheduler.get_runs(job_id, limit=limit)
-    return [
-        {
-            "id": r.id,
-            "started_at": r.started_at.isoformat() if r.started_at else None,
-            "finished_at": r.finished_at.isoformat() if r.finished_at else None,
-            "success": r.success,
-            "status": "ok" if r.success else "error",
-            "duration_ms": (
-                int((r.finished_at - r.started_at).total_seconds() * 1000)
-                if r.started_at and r.finished_at
-                else None
-            ),
-            "error": r.error,
-            "summary": r.summary,
-            "sessionKey": r.session_key or None,
-            "deliveryStatus": r.delivery_status or None,
-        }
-        for r in runs
-    ]
-
-
-async def _handle_cron_subscribe(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    """Subscribe this connection to cron events."""
-    sub_mgr = getattr(ctx, "subscription_manager", None)
-    if sub_mgr is None:
-        return {"ok": False, "error": "subscription_manager not available"}
-    conn_id = getattr(ctx, "conn_id", None)
-    if not conn_id:
-        return {"ok": False, "error": "no connection context"}
-    job_id = (params or {}).get("jobId")
-    topic = f"cron:{job_id}" if job_id else "cron:*"
-    sub_mgr.subscribe_topic(conn_id, topic)
-    return {"ok": True, "topic": topic}
-
-
-async def _handle_cron_unsubscribe(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    """Unsubscribe this connection from cron events."""
-    sub_mgr = getattr(ctx, "subscription_manager", None)
-    if sub_mgr is None:
-        return {"ok": False, "error": "subscription_manager not available"}
-    conn_id = getattr(ctx, "conn_id", None)
-    if not conn_id:
-        return {"ok": False, "error": "no connection context"}
-    job_id = (params or {}).get("jobId")
-    topic = f"cron:{job_id}" if job_id else "cron:*"
-    sub_mgr.unsubscribe_topic(conn_id, topic)
-    return {"ok": True, "topic": topic}
-
-
 class _CronSchedulerRuntime(CronSchedulerPort):
     """Bind typed cron commands directly to the configured SchedulerEngine."""
 
     def __init__(self, ctx: RpcContext) -> None:
         self._ctx = ctx
 
-    async def list_jobs(self, query: CronListQuery) -> list[dict[str, Any]]:
-        return await _handle_cron_list(
-            {"agentId": query.agent_id} if query.agent_id else None,
-            self._ctx,
+    async def list_jobs(self, query: CronListQuery) -> list[CronJobProjection]:
+        scheduler = getattr(self._ctx, "cron_scheduler", None)
+        if scheduler is None:
+            return []
+        rows = [_job_to_wire(job) for job in await scheduler.list_jobs()]
+        if query.agent_id:
+            rows = [row for row in rows if row.get("agentId") == query.agent_id]
+        return cast(list[CronJobProjection], rows)
+
+    async def get_job(self, target: CronJobTarget) -> CronJobProjection:
+        job = await _require_scheduler(self._ctx).get_job(target.job_id)
+        if job is None:
+            raise KeyError(f"Cron job not found: {target.job_id}")
+        return cast(CronJobProjection, _job_to_wire(job))
+
+    async def create_job(self, command: CronJobMutation) -> CronJobIdentityResult:
+        return cast(
+            CronJobIdentityResult,
+            await _handle_cron_add(dict(command.values), self._ctx),
         )
 
-    async def get_job(self, target: CronJobTarget) -> dict[str, Any]:
-        return await _handle_cron_status({"id": target.job_id}, self._ctx)
-
-    async def create_job(self, command: CronJobMutation) -> dict[str, Any]:
-        return await _handle_cron_add(dict(command.values), self._ctx)
-
-    async def update_job(self, command: CronJobMutation) -> dict[str, Any]:
-        return await _handle_cron_update(
-            {**dict(command.values), "id": command.job_id}, self._ctx
+    async def update_job(self, command: CronJobMutation) -> CronJobIdentityResult:
+        return cast(
+            CronJobIdentityResult,
+            await _handle_cron_update(
+                {**dict(command.values), "id": command.job_id}, self._ctx
+            ),
         )
 
     async def remove_job(self, target: CronJobTarget) -> None:
-        await _handle_cron_remove({"id": target.job_id}, self._ctx)
+        await _require_scheduler(self._ctx).remove_job(target.job_id)
 
-    async def run_job(self, target: CronJobTarget) -> dict[str, Any]:
-        return await _handle_cron_run({"id": target.job_id}, self._ctx)
+    async def run_job(self, target: CronJobTarget) -> CronRunProjection:
+        return cast(
+            CronRunProjection,
+            _manual_run_to_wire(
+                await _require_scheduler(self._ctx).run_job_now(target.job_id)
+            ),
+        )
 
-    async def list_runs(self, query: CronRunQuery) -> list[dict[str, Any]]:
-        return await _handle_cron_runs(
-            {"id": query.job_id, "limit": query.limit}, self._ctx
+    async def list_runs(self, query: CronRunQuery) -> list[CronRunProjection]:
+        scheduler = getattr(self._ctx, "cron_scheduler", None)
+        if scheduler is None:
+            return []
+        runs = await scheduler.get_runs(query.job_id, limit=query.limit)
+        return cast(
+            list[CronRunProjection],
+            [
+                {
+                    "id": run.id,
+                    "started_at": (
+                        run.started_at.isoformat() if run.started_at else None
+                    ),
+                    "finished_at": (
+                        run.finished_at.isoformat() if run.finished_at else None
+                    ),
+                    "success": run.success,
+                    "status": "ok" if run.success else "error",
+                    "duration_ms": (
+                        int((run.finished_at - run.started_at).total_seconds() * 1000)
+                        if run.started_at and run.finished_at
+                        else None
+                    ),
+                    "error": run.error,
+                    "summary": run.summary,
+                    "sessionKey": run.session_key or None,
+                    "deliveryStatus": run.delivery_status or None,
+                }
+                for run in runs
+            ],
         )
 
 
@@ -1123,15 +1073,25 @@ class _CronSubscriptionRuntime(CronSubscriptionPort):
     def __init__(self, ctx: RpcContext) -> None:
         self._ctx = ctx
 
-    @staticmethod
-    def _params(topic: CronTopic) -> dict[str, Any] | None:
-        return {"jobId": topic.job_id} if topic.job_id else None
+    async def subscribe(self, topic: CronTopic) -> CronSubscriptionResult:
+        return self._change_subscription(topic, subscribe=True)
 
-    async def subscribe(self, topic: CronTopic) -> dict[str, Any]:
-        return await _handle_cron_subscribe(self._params(topic), self._ctx)
+    async def unsubscribe(self, topic: CronTopic) -> CronSubscriptionResult:
+        return self._change_subscription(topic, subscribe=False)
 
-    async def unsubscribe(self, topic: CronTopic) -> dict[str, Any]:
-        return await _handle_cron_unsubscribe(self._params(topic), self._ctx)
+    def _change_subscription(
+        self, topic: CronTopic, *, subscribe: bool
+    ) -> CronSubscriptionResult:
+        manager = getattr(self._ctx, "subscription_manager", None)
+        if manager is None:
+            return {"ok": False, "error": "subscription_manager not available"}
+        connection_id = getattr(self._ctx, "conn_id", None)
+        if not connection_id:
+            return {"ok": False, "error": "no connection context"}
+        topic_name = f"cron:{topic.job_id}" if topic.job_id else "cron:*"
+        operation = manager.subscribe_topic if subscribe else manager.unsubscribe_topic
+        operation(connection_id, topic_name)
+        return {"ok": True, "topic": topic_name}
 
 
 def _cron_scheduler_adapter(ctx: RpcContext) -> GatewayCronSchedulerAdapter:
@@ -1210,3 +1170,5 @@ for _cron_method, _cron_implementation in (
         internal_error=RpcHandlerError,
         guest_allowed_checker=is_guest_rpc_method_allowed,
     )
+    CronRunProjection,
+    CronSubscriptionResult,

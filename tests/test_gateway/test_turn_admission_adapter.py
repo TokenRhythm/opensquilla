@@ -11,7 +11,15 @@ from opensquilla.application.turn_admission import (
 )
 from opensquilla.gateway.adapters.turn_admission import (
     GatewayTurnAdmissionAdapter,
+    webchat_session_key,
 )
+
+
+def test_webchat_session_key_preserves_agent_scope() -> None:
+    assert (
+        webchat_session_key("agent:kid-project:webchat:abc")
+        == "agent:kid-project:webchat:abc"
+    )
 
 
 class _Ports:
