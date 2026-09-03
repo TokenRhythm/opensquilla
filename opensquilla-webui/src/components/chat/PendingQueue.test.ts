@@ -26,7 +26,7 @@ async function mountQueue(
     text: string
     pendingInputId?: string
     pendingPersistenceState?: 'saving' | 'staged' | 'local_only' | 'retryable' | 'cancelling'
-    deliveryState?: 'steering' | 'retryable'
+    deliveryState?: 'steering' | 'replay_pending' | 'retryable'
     steerAttempt?: PendingSteerAttempt
     attachments?: Attachment[]
     hiddenControl?: boolean
@@ -274,35 +274,38 @@ describe('PendingQueue', () => {
     app.unmount()
   })
 
-  it('keeps a retryable item available for an explicit retry', async () => {
-    let steered = 0
-    let edited = 0
-    const { app, el } = await mountQueue({
-      onSteer: () => { steered += 1 },
-      onEdit: () => { edited += 1 },
-    }, [{ text: 'Retry this steer', deliveryState: 'retryable' }], {
-      steerAvailable: false,
-      steerUnavailableMessage: 'New messages will queue after the current response.',
-    })
+  it.each(['retryable', 'replay_pending'] as const)(
+    'keeps a %s item available for an explicit retry',
+    async (deliveryState) => {
+      let steered = 0
+      let edited = 0
+      const { app, el } = await mountQueue({
+        onSteer: () => { steered += 1 },
+        onEdit: () => { edited += 1 },
+      }, [{ text: 'Retry this send', deliveryState }], {
+        steerAvailable: false,
+        steerUnavailableMessage: 'New messages will queue after the current response.',
+      })
 
-    expect(el.querySelector('.chat-pending-card')?.hasAttribute('aria-busy')).toBe(false)
-    const retry = [...el.querySelectorAll<HTMLButtonElement>('button')]
-      .find(button => button.textContent?.includes('Retry'))
-    expect(retry?.disabled).toBe(false)
-    expect(retry?.title).toBe('Retry')
-    expect(el.querySelector('.chat-pending-steer-status')).toBeNull()
-    retry?.click()
-    expect(steered).toBe(1)
+      expect(el.querySelector('.chat-pending-card')?.hasAttribute('aria-busy')).toBe(false)
+      const retry = [...el.querySelectorAll<HTMLButtonElement>('button')]
+        .find(button => button.textContent?.includes('Retry'))
+      expect(retry?.disabled).toBe(false)
+      expect(retry?.title).toBe('Retry')
+      expect(el.querySelector('.chat-pending-steer-status')).toBeNull()
+      retry?.click()
+      expect(steered).toBe(1)
 
-    el.querySelector<HTMLButtonElement>('[aria-label="More"]')?.click()
-    await nextTick()
-    const edit = [...el.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
-      .find(button => button.textContent?.includes('Edit message'))
-    expect(edit?.disabled).toBe(true)
-    edit?.click()
-    expect(edited).toBe(0)
-    app.unmount()
-  })
+      el.querySelector<HTMLButtonElement>('[aria-label="More"]')?.click()
+      await nextTick()
+      const edit = [...el.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+        .find(button => button.textContent?.includes('Edit message'))
+      expect(edit?.disabled).toBe(true)
+      edit?.click()
+      expect(edited).toBe(0)
+      app.unmount()
+    },
+  )
 
   it('keeps hidden control input removable without exposing same-turn retry', async () => {
     let retried = 0

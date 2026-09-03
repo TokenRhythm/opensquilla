@@ -89,6 +89,7 @@ interface PendingQueueBroadcastMessage {
 export type BusySendMode = 'queue' | 'steer'
 export type PendingDeliveryOutcome =
   | 'accepted'
+  | 'acceptance_unknown'
   | 'deferred'
   | 'not_sent'
   | 'policy_blocked'
@@ -128,6 +129,8 @@ export interface UseChatPendingQueueOptions {
   pendingSessionIntent: Ref<string | null>
   isStreaming: Ref<boolean>
   isBlocked: () => boolean
+  /** Transport-only barrier used while resolving an acceptance-unknown receipt. */
+  isReceiptReplayBlocked?: () => boolean
   autoResizeTextarea: () => void
   sendCurrentInput: () => void
   resetInputHistory: () => void
@@ -194,7 +197,8 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   const hasDeliveryBarrier = computed(() =>
     pendingQueue.value.some(
       item => Boolean(
-        item.deliveryState
+        item.deliveryState === 'steering'
+        || item.deliveryState === 'retryable'
         || item.steerAttempt
         || item.pendingPersistenceState === 'saving'
         || item.pendingPersistenceState === 'cancelling',
@@ -1289,6 +1293,16 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       flushDeferredPendingDrain()
       return
     }
+    if (outcome === 'acceptance_unknown' && !item.steerAttempt) {
+      // Release the first delivery lease so the retained terminal-drain signal
+      // can perform one exact receipt lookup. If that replay is also unknown,
+      // sendQueuedFollowup returns retryable_failure and parks the item instead
+      // of creating a transport retry loop.
+      item.deliveryState = 'replay_pending'
+      deferredDrainRequested = true
+      flushDeferredPendingDrain()
+      return
+    }
     if (!item.steerAttempt) {
       item.deliveryState = outcome === 'retryable_failure' ? 'retryable' : undefined
     }
@@ -1783,9 +1797,12 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         deferredDrainRequested = false
         return
       }
+      const receiptReplay = pendingQueue.value[0]?.deliveryState === 'replay_pending'
       if (
         options.isStreaming.value
-        || options.isBlocked()
+        || (receiptReplay
+          ? options.isReceiptReplayBlocked?.() ?? options.isBlocked()
+          : options.isBlocked())
         || hasDeliveryBarrier.value
         || isReordering.value
       ) return

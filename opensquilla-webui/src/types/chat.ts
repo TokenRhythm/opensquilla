@@ -426,7 +426,7 @@ export interface ChatPendingItem {
   /** Slash-prefixed text that a complete command catalog classified as ordinary input. */
   confirmedPlainText?: boolean
   /** Generic non-v2 queue/hidden-control delivery lease. V2 Steer uses `steerAttempt`. */
-  deliveryState?: 'steering' | 'retryable'
+  deliveryState?: 'steering' | 'replay_pending' | 'retryable'
   /** Canonical transport identity/state for a not-yet-durable steer. */
   steerAttempt?: PendingSteerAttempt
   /** Session that owned this item when it entered the in-memory queue. */

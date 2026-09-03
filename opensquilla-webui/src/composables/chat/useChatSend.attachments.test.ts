@@ -2226,7 +2226,7 @@ describe('useChatSend attachment payloads', () => {
         validateActiveProjectBeforeSend,
       })
 
-      await expect(api.sendQueuedFollowup(queued)).resolves.toBe('retryable_failure')
+      await expect(api.sendQueuedFollowup(queued)).resolves.toBe('acceptance_unknown')
       const originalParams = rpc.call.mock.calls[0]?.[1]
       localPolicy.value = 'Cron sessions are read-only.'
       projectState.value = projectFailure
@@ -2263,6 +2263,54 @@ describe('useChatSend attachment payloads', () => {
     await expect(api.sendQueuedFollowup(queued)).resolves.toBe('retryable_failure')
     expect(validateActiveProjectBeforeSend).toHaveBeenCalledTimes(2)
     expect(rpc.call).toHaveBeenCalledOnce()
+  })
+
+  it('routes ordinary Retry through the original chat.send instead of Steer', async () => {
+    const originalAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 94,
+      name: 'retry-original.txt',
+      mime: 'text/plain',
+      file_uuid: 'retry-original-file',
+    }
+    const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-followup-retry-routing',
+      text: 'retry the original follow-up',
+      promptAnnotationIds: ['retry-original-annotation'],
+      attachments: [originalAttachment],
+      intent: null,
+      ownerSessionKey: 'agent:main:webchat:test',
+    }
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+        .mockResolvedValueOnce({
+          accepted: true,
+          replayed: true,
+          sessionKey: 'agent:main:webchat:test',
+          task_id: 'task-followup-retry',
+        }),
+    }
+    const { api } = makeOptions({ rpc })
+
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('acceptance_unknown')
+    const originalParams = rpc.call.mock.calls[0]?.[1]
+    queued.deliveryState = 'retryable'
+    queued.text = 'mutated current text'
+    queued.promptAnnotationIds = ['mutated-current-annotation']
+    queued.attachments = []
+
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('accepted')
+
+    expect(rpc.call.mock.calls.map(call => call[0])).toEqual(['chat.send', 'chat.send'])
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(originalParams)
+    expect(rpc.call.mock.calls[1]?.[1]).toMatchObject({
+      clientRequestId: originalParams.clientRequestId,
+      clientMessageId: originalParams.clientMessageId,
+      message: 'retry the original follow-up',
+      promptAnnotationIds: ['retry-original-annotation'],
+      attachments: [{ file_uuid: 'retry-original-file' }],
+    })
   })
 
   it('queues an immutable hidden confirmation while live delivery is blocked', async () => {
@@ -2489,6 +2537,7 @@ describe('useChatSend attachment payloads', () => {
     const imageInputAdmission = ref<'allowed' | 'blocked'>('allowed')
     const modelRoutingSettingsBusy = ref(false)
     let attachmentWorkPending = false
+    let currentAdmissionBlocked = false
     const queuedImage: Attachment = {
       kind: 'staged',
       local_id: 92,
@@ -2507,16 +2556,20 @@ describe('useChatSend attachment payloads', () => {
         }),
     }
     let sendApi!: ReturnType<typeof useChatSend>
-    const dispatchPendingItem = vi.fn((item: ChatPendingItem, ownerSessionKey: string) => (
-      sendApi.sendQueuedFollowup(item, ownerSessionKey)
-    ))
+    const dispatches: Array<ReturnType<typeof sendApi.sendQueuedFollowup>> = []
+    const dispatchPendingItem = vi.fn((item: ChatPendingItem, ownerSessionKey: string) => {
+      const delivery = sendApi.sendQueuedFollowup(item, ownerSessionKey)
+      dispatches.push(delivery)
+      return delivery
+    })
     const pending = useChatPendingQueue({
       sessionKey,
       inputText,
       pendingAttachments,
       pendingSessionIntent,
       isStreaming,
-      isBlocked: () => false,
+      isBlocked: () => currentAdmissionBlocked,
+      isReceiptReplayBlocked: () => false,
       autoResizeTextarea: vi.fn(),
       sendCurrentInput: vi.fn(),
       resetInputHistory: vi.fn(),
@@ -2547,14 +2600,19 @@ describe('useChatSend attachment payloads', () => {
       })
       const item = pending.pendingQueue.value[0]!
 
-      await expect(sendApi.sendQueuedFollowup(item, sessionKey.value))
-        .resolves.toBe('retryable_failure')
+      pending.schedulePendingDrainAfterTerminal()
+      await vi.advanceTimersByTimeAsync(50)
+      await nextTick()
+      await dispatches[0]
+      await nextTick()
+      expect(rpc.call).toHaveBeenCalledOnce()
+      expect(item.deliveryState).toBe('replay_pending')
       const originalParams = rpc.call.mock.calls[0]?.[1]
       policy.value = 'Cron sessions are read-only.'
       attachmentWorkPending = true
+      currentAdmissionBlocked = true
       imageInputAdmission.value = 'blocked'
       modelRoutingSettingsBusy.value = true
-      configured.stream.isStreaming.value = true
       item.text = ''
       item.attachments = [{
         kind: 'failed',
@@ -2565,11 +2623,12 @@ describe('useChatSend attachment payloads', () => {
       }]
       item.promptAnnotationIds = ['current-annotation']
 
-      pending.schedulePendingDrainAfterTerminal()
-      await vi.advanceTimersByTimeAsync(500)
+      await vi.advanceTimersByTimeAsync(50)
+      await nextTick()
+      await dispatches[1]
       await nextTick()
 
-      expect(dispatchPendingItem).toHaveBeenCalledOnce()
+      expect(dispatchPendingItem).toHaveBeenCalledTimes(2)
       expect(rpc.call).toHaveBeenCalledTimes(2)
       expect(rpc.call.mock.calls[1]?.[1]).toEqual(originalParams)
       expect(pending.pendingQueue.value).toEqual([])
@@ -4924,7 +4983,9 @@ describe('useChatSend attachment payloads', () => {
       hasPendingAttachmentWork: () => attachmentWorkPending,
     })
 
+    expect(api.exactReceiptReplayPendingForCurrentSession.value).toBe(false)
     await api.onSend()
+    expect(api.exactReceiptReplayPendingForCurrentSession.value).toBe(true)
     const originalParams = rpc.call.mock.calls[0]?.[1]
     attachmentWorkPending = true
     imageInputAdmission.value = 'blocked'
@@ -4933,6 +4994,7 @@ describe('useChatSend attachment payloads', () => {
 
     await api.onSend()
 
+    expect(api.exactReceiptReplayPendingForCurrentSession.value).toBe(false)
     expect(rpc.call).toHaveBeenCalledTimes(2)
     expect(rpc.call.mock.calls[1]?.[1]).toEqual(originalParams)
   })

@@ -206,6 +206,7 @@ interface SendAttempt {
 
 export type ChatSendOutcome =
   | 'accepted'
+  | 'acceptance_unknown'
   | 'deferred'
   | 'not_sent'
   | 'policy_blocked'
@@ -650,6 +651,11 @@ export function useChatSend(options: UseChatSendOptions) {
     acceptanceRecoveryVersion.value += 1
   }
 
+  function setRecoveredAttempt(attempt: SendAttempt | null) {
+    recoveredAttempt = attempt
+    noteAcceptanceRecoveryChanged()
+  }
+
   const acceptanceRecoveryPendingForCurrentSession: ComputedRef<boolean> = computed(() => {
     // Depend on an explicit version because the attempt registry is purposely
     // non-reactive and must remain request-owned across route switches.
@@ -663,6 +669,14 @@ export function useChatSend(options: UseChatSendOptions) {
       if (workerKey.startsWith(`${key}\u0000`)) return true
     }
     return false
+  })
+  const exactReceiptReplayPendingForCurrentSession = computed(() => {
+    acceptanceRecoveryVersion.value
+    return Boolean(
+      recoveredAttempt?.requiresIdempotentReplay
+      && recoveredAttempt.requestSessionKey === options.sessionKey.value
+      && !recoveredAttempt.acceptanceInFlight,
+    )
   })
   watch(acceptanceRecoveryPendingForCurrentSession, (pending) => {
     if (options.acceptanceRecoveryPending) {
@@ -1086,7 +1100,7 @@ export function useChatSend(options: UseChatSendOptions) {
           )) {
             clearAttemptStop(attempt)
             if (recoveredAttempt?.clientRequestId === attempt.clientRequestId) {
-              recoveredAttempt = null
+              setRecoveredAttempt(null)
             }
             return true
           }
@@ -1094,7 +1108,7 @@ export function useChatSend(options: UseChatSendOptions) {
         }
         clearAttemptStop(attempt)
         if (recoveredAttempt?.clientRequestId === attempt.clientRequestId) {
-          recoveredAttempt = null
+          setRecoveredAttempt(null)
         }
         if (isCurrentRequest) options.scheduleHistorySync()
         return true
@@ -1136,7 +1150,7 @@ export function useChatSend(options: UseChatSendOptions) {
     }
 
     if (!attempt.stopRequested) {
-      if (ownsRecoveredAttempt) recoveredAttempt = null
+      if (ownsRecoveredAttempt) setRecoveredAttempt(null)
       return true
     }
     if (terminalStatus) {
@@ -1144,7 +1158,7 @@ export function useChatSend(options: UseChatSendOptions) {
         handleTerminalResponse(response, null, { finishFreshStream: false })
       }
       clearAttemptStop(attempt)
-      if (ownsRecoveredAttempt) recoveredAttempt = null
+      if (ownsRecoveredAttempt) setRecoveredAttempt(null)
       return true
     }
 
@@ -1203,7 +1217,7 @@ export function useChatSend(options: UseChatSendOptions) {
               )
             }
             if (recoveredAttempt?.clientRequestId === attempt.clientRequestId) {
-              recoveredAttempt = null
+              setRecoveredAttempt(null)
             }
             return
           }
@@ -2547,13 +2561,16 @@ export function useChatSend(options: UseChatSendOptions) {
         ? 'retryable_failure'
         : outcome
     )
-    const blockedOutcome = () => preserveRetryState(
-      !retryAttempt
-      && !steerRetryAttempt
-      && options.sessionInteractivityBlockedReason?.value
+    const blockedOutcome = (): ChatSendOutcome => {
+      if (idempotentReplay) return 'acceptance_unknown'
+      return preserveRetryState(
+        !retryAttempt
+        && !steerRetryAttempt
+        && options.sessionInteractivityBlockedReason?.value
         ? 'policy_blocked'
         : delivery === 'followup' ? 'deferred' : 'not_sent',
-    )
+      )
+    }
     if (!ownerSessionKey || options.sessionKey.value !== ownerSessionKey) {
       return preserveRetryState('not_sent')
     }
@@ -2705,7 +2722,13 @@ export function useChatSend(options: UseChatSendOptions) {
     item: ChatPendingItem,
     expectedSessionKey?: string,
   ): Promise<ChatSendOutcome> {
-    return sendQueuedItem(item, 'steer', expectedSessionKey)
+    // PendingQueue uses one action for both a fresh Steer and Retry. An
+    // ordinary recovered chat.send must keep its original RPC and payload;
+    // only an item carrying a real steerAttempt belongs on sessions.steer.v2.
+    const delivery = !item.steerAttempt && recoveredQueuedAttempts.has(item)
+      ? 'followup'
+      : 'steer'
+    return sendQueuedItem(item, delivery, expectedSessionKey)
   }
 
   function sendQueuedFollowup(
@@ -3079,7 +3102,7 @@ export function useChatSend(options: UseChatSendOptions) {
       current: requestSessionKey,
     })
     if (!preserveComposer) {
-      recoveredAttempt = null
+      setRecoveredAttempt(null)
       const composerTextBeforeSend = options.inputText.value
       const preserveEditedComposer = Boolean(
         retryAttempt?.requiresIdempotentReplay
@@ -3191,7 +3214,7 @@ export function useChatSend(options: UseChatSendOptions) {
         options.scheduleHistorySync()
       }
       if (recoveredAttempt?.clientRequestId === attempt.clientRequestId) {
-        recoveredAttempt = null
+        setRecoveredAttempt(null)
       }
       // A draft becomes a routable session only after the gateway has durably
       // accepted its first turn. Keeping the intent until this point avoids
@@ -3345,7 +3368,7 @@ export function useChatSend(options: UseChatSendOptions) {
         acceptedError
         && recoveredAttempt?.clientRequestId === attempt.clientRequestId
       ) {
-        recoveredAttempt = null
+        setRecoveredAttempt(null)
       }
       if (acceptedError) consumeAcceptedSessionIntent(attempt)
       const acceptedSessionKey = acceptedError?.sessionKey || requestSessionKey
@@ -3357,13 +3380,13 @@ export function useChatSend(options: UseChatSendOptions) {
           if (sendOpts.rememberRetryableAttempt) {
             sendOpts.rememberRetryableAttempt(attempt)
           } else {
-            recoveredAttempt = attempt
+            setRecoveredAttempt(attempt)
           }
         } else if (acceptanceUnknown) {
           // The optimistic user bubble already owns this payload. Keep its
           // immutable request identity for exact replay without presenting the
           // same text as a new editable draft.
-          recoveredAttempt = attempt
+          setRecoveredAttempt(attempt)
         } else if (restoreComposer) {
           restoreSendAttempt(attempt, {
             requiresIdempotentReplay: false,
@@ -3475,9 +3498,14 @@ export function useChatSend(options: UseChatSendOptions) {
           ts: new Date().toISOString(),
         })
       }
-      return acceptedError ? 'accepted' : 'retryable_failure'
+      return acceptedError
+        ? 'accepted'
+        : hasUnknownAcceptance(err) && !requiresRecoveryReplay
+          ? 'acceptance_unknown'
+          : 'retryable_failure'
     } finally {
       attempt.acceptanceInFlight = false
+      noteAcceptanceRecoveryChanged()
       finishAcceptanceTransaction(acceptanceTransaction)
       finishResponseHandoff(responseHandoff)
     }
@@ -3615,7 +3643,7 @@ export function useChatSend(options: UseChatSendOptions) {
       options.pendingWorkspaceId.value = attempt.workspaceId
     }
     attempt.requiresIdempotentReplay = recovery.requiresIdempotentReplay
-    recoveredAttempt = attempt
+    setRecoveredAttempt(attempt)
     options.autoResizeTextarea()
   }
 
@@ -4478,5 +4506,6 @@ export function useChatSend(options: UseChatSendOptions) {
     sendHiddenMetaPreflightConfirmation,
     sendUsageBarrierReplay,
     acceptanceRecoveryPendingForCurrentSession,
+    exactReceiptReplayPendingForCurrentSession,
   }
 }

@@ -155,7 +155,7 @@ interface PendingQueueItem {
   displayTextOverride?: string
   hiddenControl?: boolean
   attachments?: Attachment[]
-  deliveryState?: 'steering' | 'retryable'
+  deliveryState?: 'steering' | 'replay_pending' | 'retryable'
   steerAttempt?: PendingSteerAttempt
   pendingPersistenceState?: 'saving' | 'staged' | 'local_only' | 'retryable' | 'cancelling'
 }
@@ -220,6 +220,7 @@ const showSteerUnavailableStatus = computed(() => (
   && !props.items.some(item => (
     isSteering(item)
     || item.deliveryState === 'retryable'
+    || item.deliveryState === 'replay_pending'
     || isSteerRetry(item)
   ))
   && props.items.some(item => (
@@ -261,7 +262,11 @@ function isSteerRetry(item: PendingQueueItem): boolean {
 
 function pendingCardState(item: PendingQueueItem): 'queued' | 'busy' | 'attention' {
   if (isSteering(item)) return 'busy'
-  if (item.deliveryState === 'retryable' || isSteerRetry(item)) return 'attention'
+  if (
+    item.deliveryState === 'retryable'
+    || item.deliveryState === 'replay_pending'
+    || isSteerRetry(item)
+  ) return 'attention'
   return 'queued'
 }
 
@@ -274,7 +279,9 @@ function steerActionLabel(item: PendingQueueItem): string {
     case 'acceptance_unknown':
       return t('chat.pending.steerRetryUnknown')
     default:
-      return item.deliveryState === 'retryable' ? t('chat.retry') : t('chat.steerMode')
+      return ['retryable', 'replay_pending'].includes(item.deliveryState || '')
+        ? t('chat.retry')
+        : t('chat.steerMode')
   }
 }
 
@@ -325,7 +332,11 @@ function pendingSteerBlocker(item: PendingQueueItem): PendingSteerBlocker | null
     && item.pendingPersistenceState === 'staged'
     && props.durableSteerAvailable !== true
   ) return 'capability'
-  if (!props.steerAvailable && item.deliveryState !== 'retryable' && !isSteerRetry(item)) {
+  if (
+    !props.steerAvailable
+    && !['retryable', 'replay_pending'].includes(item.deliveryState || '')
+    && !isSteerRetry(item)
+  ) {
     return 'capability'
   }
   if (props.items.some(
@@ -365,7 +376,9 @@ function steerTitle(item: PendingQueueItem): string {
       if (item.steerAttempt?.phase === 'acceptance_unknown') {
         return t('chat.pending.steerRetryUnknownHint')
       }
-      return item.deliveryState === 'retryable' ? t('chat.retry') : t('chat.pending.steerHint')
+      return ['retryable', 'replay_pending'].includes(item.deliveryState || '')
+        ? t('chat.retry')
+        : t('chat.pending.steerHint')
   }
 }
 

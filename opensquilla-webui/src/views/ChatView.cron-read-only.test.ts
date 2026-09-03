@@ -11,7 +11,9 @@ function sourceBetween(start: string, end: string): string {
 
 describe('Cron session read-only presentation', () => {
   it('replaces the composer with a localized status without floating dock clearance', () => {
-    expect(chatViewSource).toContain('v-if="turnActionsBlocked"')
+    expect(chatViewSource).toContain(
+      'v-if="turnActionsBlocked && !exactReceiptReplayPendingForCurrentSession"',
+    )
     expect(chatViewSource).toContain("? 'chat.cronSessionReadOnly'")
     expect(chatViewSource).toContain("sessionPolicyPending ? 'chat.loadingSession' : 'chat.sessionReadOnly'")
     expect(chatViewSource).toContain('<template v-else>')
@@ -38,12 +40,40 @@ describe('Cron session read-only presentation', () => {
     expect(chatViewSource).toContain('sessionInteractivityBlockedReason.value')
     expect(chatViewSource).toContain('sessionInteractivityBlockedReason,')
     expect(chatViewSource).toContain('idempotentReplayBlockedReason: liveSendBlockedReason')
+    expect(chatViewSource).toContain('exactReceiptReplayPendingForCurrentSession,')
     expect(chatViewSource).toContain(':message-actions-available="!turnActionsBlocked"')
     expect(chatViewSource).toContain('canMutateMessages: () => !turnActionsBlocked.value')
     expect(chatViewSource.match(/:turn-actions-disabled="turnActionsBlocked"/g)).toHaveLength(3)
     expect(chatViewSource).toContain('turnActionsBlocked: () => turnActionsBlocked.value')
     expect(chatViewSource).toContain('<MetaSkillSetupCard')
     expect(chatViewSource).toContain(':turn-actions-disabled="turnActionsBlocked"')
+  })
+
+  it('admits only an exact receipt replay through mutable composer gates', () => {
+    const composerSend = sourceBetween(
+      'async function onComposerSend()',
+      'sendCurrentInput = onComposerSend',
+    )
+    const composerBlock = sourceBetween(
+      'const composerSendBlockedMessage = computed(',
+      'const sendButtonTitle = computed(',
+    )
+
+    expect(chatViewSource).toContain(
+      ':session-routing-busy="modelRoutingSettingsBusy\n        && !exactReceiptReplayPendingForCurrentSession"',
+    )
+    expect(composerSend).toContain('if (composerSendBlockedMessage.value) return')
+    expect(composerSend).toContain('if (exactReceiptReplayPendingForCurrentSession.value)')
+    expect(composerSend).toContain('await dispatchCurrentInput()')
+    expect(composerSend.indexOf('exactReceiptReplayPendingForCurrentSession.value')).toBeLessThan(
+      composerSend.indexOf('modelRoutingSettingsBusy.value || planModeBusy.value'),
+    )
+    expect(composerSend.indexOf('await dispatchCurrentInput()')).toBeLessThan(
+      composerSend.indexOf('goalDraftArmed.value'),
+    )
+    expect(composerBlock).toContain('if (forkBlock) return forkBlock')
+    expect(composerBlock).toContain('if (exactReceiptReplayPendingForCurrentSession.value)')
+    expect(composerBlock).toContain("return liveSendBlockedReason.value || ''")
   })
 
   it('uses authoritative directory interactivity with a pending direct-route gate', () => {

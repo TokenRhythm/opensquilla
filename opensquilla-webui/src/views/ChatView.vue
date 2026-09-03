@@ -549,7 +549,7 @@
          anchor to the chat container's bottom edge. -->
     <div class="chat-composer-dock">
     <div
-      v-if="turnActionsBlocked"
+      v-if="turnActionsBlocked && !exactReceiptReplayPendingForCurrentSession"
       class="chat-composer-read-only"
       role="status"
       aria-live="polite"
@@ -685,7 +685,8 @@
       :run-mode-locked="runModeLocked"
       :run-mode-lock-message="t('chat.composer.runModeLocked')"
       :session-routing-mode="modelRoutingMode"
-      :session-routing-busy="modelRoutingSettingsBusy"
+      :session-routing-busy="modelRoutingSettingsBusy
+        && !exactReceiptReplayPendingForCurrentSession"
       :session-routing-control-blocked="goalBusy"
       :session-routing-available="sessionRoutingAvailable"
       :coding-mode-enabled="codingModeEnabled"
@@ -1926,6 +1927,7 @@ let dispatchPlanComposerPrompt: (prompt: string, composerText: string) => void =
 let isCompactInFlightForCurrentSession: () => boolean = () => false
 let isQueuedDeliveryBlocked: () => boolean = () => false
 let isLiveDeliveryBlocked: () => boolean = () => true
+let isReceiptReplayBlocked: () => boolean = () => true
 let dispatchQueuedHiddenControl: (
   item: ChatPendingItem,
   ownerSessionKey: string,
@@ -1960,6 +1962,7 @@ const chatPendingQueue = useChatPendingQueue({
     || hasPendingAttachmentWork()
     || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
   ),
+  isReceiptReplayBlocked: () => isReceiptReplayBlocked(),
   autoResizeTextarea,
   sendCurrentInput: () => sendCurrentInput(),
   resetInputHistory: () => resetComposerInputHistory(),
@@ -2885,6 +2888,7 @@ const effectiveSendBlockedReason = computed<string | null>(() => (
   || promptAnnotationSendBlockedReason.value
 ))
 isLiveDeliveryBlocked = () => Boolean(liveSendBlockedReason.value)
+isReceiptReplayBlocked = () => Boolean(liveSendBlockedReason.value)
 watch(
   livePhase,
   phase => appStore.setChatLivePhase(phase),
@@ -3513,6 +3517,7 @@ const {
   restoreHiddenControls,
   sendHiddenMetaPreflightConfirmation,
   recoverResponseHandoffs,
+  exactReceiptReplayPendingForCurrentSession,
 } = chatSend
 sendUsageBarrierReplay = dispatchUsageBarrierReplay
 void recoverResponseHandoffs()
@@ -3723,6 +3728,13 @@ async function onComposerSend() {
   // All composer submission modes, including keyboard-driven plan revision,
   // share the same fail-closed delivery gate.
   if (composerSendBlockedMessage.value) return
+  // A receipt replay belongs to the already-attempted immutable request. It
+  // must not be reinterpreted as a Goal or Plan mutation, and it must not wait
+  // for mutable routing state that cannot change the replayed request.
+  if (exactReceiptReplayPendingForCurrentSession.value) {
+    await dispatchCurrentInput()
+    return
+  }
   // Serialize session-routing and plan mutations before accepting another
   // composer turn, so the send cannot race either CAS update.
   if (modelRoutingSettingsBusy.value || planModeBusy.value) return
@@ -4644,8 +4656,8 @@ const activeProjectComposerBlockMessage = computed(() => {
   }
 })
 
-const composerSendBlockedMessage = computed(() =>
-  (forkTransition.value
+const composerSendBlockedMessage = computed(() => {
+  const forkBlock = forkTransition.value
     ? t(
         forkTransition.value.phase === 'error'
           ? 'chat.forkOpenFailed'
@@ -4655,11 +4667,15 @@ const composerSendBlockedMessage = computed(() =>
               ? 'chat.forkReturning'
               : 'chat.forkOpening',
       )
-    : '')
-  || modelImageSendBlockedMessage.value
-  || effectiveSendBlockedReason.value
-  || activeProjectComposerBlockMessage.value,
-)
+    : ''
+  if (forkBlock) return forkBlock
+  if (exactReceiptReplayPendingForCurrentSession.value) {
+    return liveSendBlockedReason.value || ''
+  }
+  return modelImageSendBlockedMessage.value
+    || effectiveSendBlockedReason.value
+    || activeProjectComposerBlockMessage.value
+})
 
 const sendButtonTitle = computed(() => {
   if (replanActive.value) return t('chat.plan.reviseSend')
