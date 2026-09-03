@@ -17,6 +17,7 @@
   },
   "x-opensquilla-method": {
     "name": "sessions.contextCompact", "kind": "command", "scope": "operator.write", "guestAllowed": false,
+    "lifecycle": "stable", "compatibilityAliases": ["sessions.compact"],
     "idempotency": "non-idempotent", "timeout": { "policy": "caller" },
     "capability": { "kind": "method-availability", "name": "sessions.contextCompact" },
     "request": "#/$defs/SessionsContextCompactRequestFrame", "params": "#/$defs/SessionsContextCompactParams",

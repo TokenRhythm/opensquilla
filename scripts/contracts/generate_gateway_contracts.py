@@ -32,6 +32,7 @@ AJV_GENERATOR = ROOT / "scripts/contracts/generate_gateway_contract_ajv.mjs"
 JSON_SCHEMA_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 GATEWAY_PROTOCOL = "opensquilla-websocket-json"
 REGISTRATION_OUTPUT = PYTHON_OUTPUT_ROOT / "gateway_contract_registry.py"
+COMPATIBILITY_MANIFEST_OUTPUT = CONTRACT_ROOT / "compatibility-manifest.generated.json"
 
 PINNED_CODEGEN = {
     "python": {
@@ -59,6 +60,7 @@ LEGACY_GENERATORS = {
 
 WIRE_NAME_PATTERN = re.compile(r"^[a-z][a-zA-Z0-9_]*(?:\.[a-z][a-zA-Z0-9_]*)+$")
 LEGACY_ROOT_METHOD_NAMES = frozenset({"status"})
+LEGACY_HYPHENATED_WIRE_NAMES = frozenset({"sandbox.path.create-directory"})
 SCOPE_PATTERN = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$")
 ERROR_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -68,6 +70,7 @@ METHOD_KINDS = frozenset({"query", "command"})
 IDEMPOTENCY_KINDS = frozenset({"read-only", "idempotent", "non-idempotent"})
 TIMEOUT_POLICIES = frozenset({"caller", "server", "transport"})
 CAPABILITY_KINDS = frozenset({"method-availability"})
+METHOD_LIFECYCLES = frozenset({"stable", "legacy"})
 
 Mode = Literal["write", "check", "verify-determinism"]
 
@@ -270,6 +273,7 @@ def load_contract(schema: Path, *, contract_root: Path = CONTRACT_ROOT) -> Contr
         if (
             not WIRE_NAME_PATTERN.fullmatch(wire_name)
             and wire_name not in LEGACY_ROOT_METHOD_NAMES
+            and wire_name not in LEGACY_HYPHENATED_WIRE_NAMES
         ):
             raise ContractConfigurationError(
                 f"{schema}: method name {wire_name!r} is not a legal dotted identifier"
@@ -355,10 +359,56 @@ def load_contract(schema: Path, *, contract_root: Path = CONTRACT_ROOT) -> Contr
             if (
                 not WIRE_NAME_PATTERN.fullmatch(capability_name)
                 and capability_name not in LEGACY_ROOT_METHOD_NAMES
+                and capability_name not in LEGACY_HYPHENATED_WIRE_NAMES
             ):
                 raise ContractConfigurationError(
                     f"{schema}: capability name {capability_name!r} is not legal"
                 )
+        lifecycle = metadata.get("lifecycle", "stable")
+        if lifecycle not in METHOD_LIFECYCLES:
+            raise ContractConfigurationError(
+                f"{schema}: method lifecycle {lifecycle!r} is not supported"
+            )
+        canonical_alias = metadata.get("canonicalAlias")
+        if lifecycle == "legacy":
+            if not isinstance(canonical_alias, str) or not canonical_alias:
+                raise ContractConfigurationError(
+                    f"{schema}: legacy method must declare canonicalAlias"
+                )
+            if (
+                not WIRE_NAME_PATTERN.fullmatch(canonical_alias)
+                and canonical_alias not in LEGACY_ROOT_METHOD_NAMES
+                and canonical_alias not in LEGACY_HYPHENATED_WIRE_NAMES
+            ):
+                raise ContractConfigurationError(
+                    f"{schema}: canonicalAlias {canonical_alias!r} is not legal"
+                )
+            if canonical_alias == wire_name:
+                raise ContractConfigurationError(
+                    f"{schema}: legacy method canonicalAlias must differ from its name"
+                )
+        elif canonical_alias is not None:
+            raise ContractConfigurationError(
+                f"{schema}: stable method must not declare canonicalAlias"
+            )
+        compatibility_aliases = metadata.get("compatibilityAliases", [])
+        if not isinstance(compatibility_aliases, list) or any(
+            not isinstance(alias, str)
+            or not alias
+            or (
+                not WIRE_NAME_PATTERN.fullmatch(alias)
+                and alias not in LEGACY_ROOT_METHOD_NAMES
+                and alias not in LEGACY_HYPHENATED_WIRE_NAMES
+            )
+            for alias in compatibility_aliases
+        ):
+            raise ContractConfigurationError(
+                f"{schema}: compatibilityAliases must contain legal wire names"
+            )
+        if len(set(compatibility_aliases)) != len(compatibility_aliases):
+            raise ContractConfigurationError(
+                f"{schema}: compatibilityAliases must not contain duplicates"
+            )
         contract_type: Literal["method", "event"] = "method"
     else:
         metadata = _require_mapping(event, label="x-opensquilla-event", schema=schema)
@@ -368,6 +418,21 @@ def load_contract(schema: Path, *, contract_root: Path = CONTRACT_ROOT) -> Contr
                 f"{schema}: event name {wire_name!r} is not a legal dotted identifier"
             )
         _require_string(metadata, "delivery", schema=schema)
+        wire_names = metadata.get("wireNames")
+        if wire_names is not None:
+            if (
+                not isinstance(wire_names, list)
+                or not wire_names
+                or any(
+                    not isinstance(name, str)
+                    or not WIRE_NAME_PATTERN.fullmatch(name)
+                    for name in wire_names
+                )
+                or len(set(wire_names)) != len(wire_names)
+            ):
+                raise ContractConfigurationError(
+                    f"{schema}: event wireNames must be unique legal wire names"
+                )
         schema_version = metadata.get("schemaVersion")
         if type(schema_version) is not int or schema_version < 1:
             raise ContractConfigurationError(
@@ -1389,6 +1454,148 @@ def _run_registration_descriptor(specs: tuple[ContractSpec, ...], mode: Mode) ->
     return 0
 
 
+def _canonical_schema_bytes(spec: ContractSpec) -> bytes:
+    return json.dumps(
+        spec.document,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _schema_digest(spec: ContractSpec) -> str:
+    return hashlib.sha256(_canonical_schema_bytes(spec)).hexdigest()
+
+
+def _schema_tree_digest(specs: tuple[ContractSpec, ...]) -> str:
+    digest = hashlib.sha256()
+    for spec in sorted(specs, key=lambda item: item.relative_schema.as_posix()):
+        digest.update(spec.relative_schema.as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(_canonical_schema_bytes(spec))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def render_compatibility_manifest(specs: tuple[ContractSpec, ...]) -> str:
+    """Render the Schema-owned method lifecycle and event-family identities."""
+
+    method_specs = {
+        spec.wire_name: spec for spec in specs if spec.contract_type == "method"
+    }
+    for spec in method_specs.values():
+        lifecycle = str(spec.metadata.get("lifecycle", "stable"))
+        if lifecycle == "legacy":
+            canonical_name = str(spec.metadata["canonicalAlias"])
+            canonical = method_specs.get(canonical_name)
+            if canonical is None:
+                raise ContractConfigurationError(
+                    f"{spec.schema}: canonicalAlias {canonical_name!r} has no method Contract"
+                )
+            if canonical.metadata.get("lifecycle", "stable") != "stable":
+                raise ContractConfigurationError(
+                    f"{spec.schema}: canonicalAlias {canonical_name!r} is not stable"
+                )
+            aliases = canonical.metadata.get("compatibilityAliases", [])
+            if spec.wire_name not in aliases:
+                raise ContractConfigurationError(
+                    f"{canonical.schema}: compatibilityAliases must include "
+                    f"legacy method {spec.wire_name!r}"
+                )
+        else:
+            for alias in spec.metadata.get("compatibilityAliases", []):
+                legacy = method_specs.get(alias)
+                if (
+                    legacy is None
+                    or legacy.metadata.get("lifecycle") != "legacy"
+                    or legacy.metadata.get("canonicalAlias") != spec.wire_name
+                ):
+                    raise ContractConfigurationError(
+                        f"{spec.schema}: compatibility alias {alias!r} must be backed "
+                        "by a legacy method Contract"
+                    )
+
+    methods: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
+    for spec in specs:
+        schema_path = spec.relative_schema.as_posix()
+        schema_digest = _schema_digest(spec)
+        if spec.contract_type == "method":
+            lifecycle = str(spec.metadata.get("lifecycle", "stable"))
+            entry: dict[str, Any] = {
+                "name": spec.wire_name,
+                "lifecycle": lifecycle,
+                "schema": schema_path,
+                "schemaSha256": schema_digest,
+            }
+            if lifecycle == "legacy":
+                entry["canonicalName"] = spec.metadata["canonicalAlias"]
+            aliases = spec.metadata.get("compatibilityAliases", [])
+            if aliases:
+                entry["compatibilityAliases"] = list(aliases)
+            methods.append(entry)
+            continue
+
+        declared_wire_names = spec.metadata.get("wireNames")
+        wire_names = (
+            list(declared_wire_names)
+            if isinstance(declared_wire_names, list)
+            else [spec.wire_name]
+        )
+        events.append(
+            {
+                "family": spec.wire_name,
+                "wireNames": wire_names,
+                "delivery": spec.metadata["delivery"],
+                "schemaVersion": spec.metadata["schemaVersion"],
+                "schema": schema_path,
+                "schemaSha256": schema_digest,
+            }
+        )
+
+    methods.sort(key=lambda entry: str(entry["name"]))
+    events.sort(key=lambda entry: str(entry["family"]))
+    manifest = {
+        "format": 1,
+        "protocol": GATEWAY_PROTOCOL,
+        "wireVersion": 4,
+        "source": {
+            "schemaCount": len(specs),
+            "methodCount": len(methods),
+            "eventFamilyCount": len(events),
+            "schemaTreeSha256": _schema_tree_digest(specs),
+            "generatorSha256": _generator_digest(),
+        },
+        "methods": methods,
+        "events": events,
+    }
+    return json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+
+
+def _run_compatibility_manifest(
+    specs: tuple[ContractSpec, ...],
+    mode: Mode,
+) -> int:
+    rendered = render_compatibility_manifest(specs)
+    if mode == "verify-determinism":
+        return int(rendered != render_compatibility_manifest(specs))
+    if mode == "write":
+        _write_text_lf(COMPATIBILITY_MANIFEST_OUTPUT, rendered)
+        return 0
+    current = (
+        COMPATIBILITY_MANIFEST_OUTPUT.read_text(encoding="utf-8")
+        if COMPATIBILITY_MANIFEST_OUTPUT.exists()
+        else None
+    )
+    if current != rendered:
+        print(
+            f"stale generated Gateway Contract artifact: {COMPATIBILITY_MANIFEST_OUTPUT}",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 GENERATED_MARKERS = (
     "@generated by scripts/contracts/generate_gateway_contracts.py",
     "@generated by scripts/contracts/generate_sessions_list_contract.py",
@@ -1445,7 +1652,7 @@ def reconcile_orphans(
 
 def expected_artifacts(specs: tuple[ContractSpec, ...]) -> frozenset[Path]:
     return frozenset(
-        [REGISTRATION_OUTPUT]
+        [REGISTRATION_OUTPUT, COMPATIBILITY_MANIFEST_OUTPUT]
         + [output for spec in specs for output in spec.outputs]
     )
 
@@ -1541,6 +1748,7 @@ def run(mode: Mode, specs: tuple[ContractSpec, ...] | None = None) -> int:
         result = _run_legacy(spec, mode) if spec.uses_legacy_generator else _run_generic(spec, mode)
         failed = bool(result) or failed
     failed = bool(_run_registration_descriptor(selected, mode)) or failed
+    failed = bool(_run_compatibility_manifest(selected, mode)) or failed
     failed = bool(
         reconcile_orphans(expected_artifacts(selected), mode=mode)
     ) or failed

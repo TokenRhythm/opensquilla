@@ -1,0 +1,262 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opensquilla.dev/contracts/gateway/v4/platform/onboarding-channel-enable.schema.json",
+  "title": "OpenSquilla onboarding.channel.enable Contract",
+  "description": "Language-neutral Contract for the existing onboarding.channel.enable Gateway v4 wire behavior.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "request": {
+      "$ref": "#/$defs/OnboardingChannelEnableRequestFrame"
+    },
+    "response": {
+      "$ref": "#/$defs/OnboardingChannelEnableResponseFrame"
+    }
+  },
+  "x-opensquilla-wire": {
+    "protocol": "opensquilla-websocket-json",
+    "version": 4,
+    "compatibility": "exact-json-tree"
+  },
+  "x-opensquilla-codegen": {
+    "python": {
+      "tool": "datamodel-code-generator",
+      "version": "0.75.1",
+      "target": "pydantic_v2.BaseModel"
+    },
+    "typescript": {
+      "tool": "json-schema-to-typescript",
+      "version": "15.0.4"
+    },
+    "runtimeValidation": {
+      "tool": "ajv",
+      "version": "8.17.1",
+      "mode": "standalone-adapter-only"
+    }
+  },
+  "x-opensquilla-method": {
+    "name": "onboarding.channel.enable",
+    "kind": "command",
+    "scope": "operator.admin",
+    "guestAllowed": false,
+    "idempotency": "idempotent",
+    "timeout": {
+      "policy": "transport"
+    },
+    "capability": {
+      "kind": "method-availability",
+      "name": "onboarding.channel.enable"
+    },
+    "request": "#/$defs/OnboardingChannelEnableRequestFrame",
+    "params": "#/$defs/OnboardingChannelEnableParams",
+    "response": "#/$defs/OnboardingChannelEnableResponseFrame",
+    "result": "#/$defs/OnboardingChannelEnableResult",
+    "errors": [
+      {
+        "code": "INVALID_REQUEST"
+      },
+      {
+        "code": "UNAUTHORIZED"
+      },
+      {
+        "code": "UNAVAILABLE",
+        "retryable": true
+      },
+      {
+        "code": "INTERNAL_ERROR"
+      }
+    ]
+  },
+  "$defs": {
+    "ChannelLiveApplyOutcome": {
+      "type": "string",
+      "enum": [
+        "started",
+        "rebuilt",
+        "removed",
+        "unchanged",
+        "pending_restart",
+        "failed"
+      ]
+    },
+    "OnboardingChannelEnableParams": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "OnboardingChannelEnableResult": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "changed",
+        "restartRequired",
+        "liveApply",
+        "configPath",
+        "name",
+        "enabled"
+      ],
+      "properties": {
+        "changed": {
+          "type": "boolean"
+        },
+        "restartRequired": {
+          "type": "boolean"
+        },
+        "liveApply": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/ChannelLiveApplyOutcome"
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "configPath": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "enabled": {
+          "const": true
+        }
+      }
+    },
+    "OnboardingChannelEnableRequestFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "method",
+        "params"
+      ],
+      "properties": {
+        "type": {
+          "const": "req"
+        },
+        "id": {
+          "type": "string"
+        },
+        "method": {
+          "const": "onboarding.channel.enable"
+        },
+        "params": {
+          "$ref": "#/$defs/OnboardingChannelEnableParams"
+        }
+      }
+    },
+    "RpcError": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {},
+        "retryable": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "retry_after_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "accepted": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "OnboardingChannelEnableOkResponseFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "ok",
+        "payload"
+      ],
+      "properties": {
+        "type": {
+          "const": "res"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ok": {
+          "const": true
+        },
+        "payload": {
+          "$ref": "#/$defs/OnboardingChannelEnableResult"
+        },
+        "error": {
+          "type": "null"
+        }
+      }
+    },
+    "OnboardingChannelEnableErrorResponseFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "ok",
+        "error"
+      ],
+      "properties": {
+        "type": {
+          "const": "res"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ok": {
+          "const": false
+        },
+        "payload": {
+          "type": "null"
+        },
+        "error": {
+          "$ref": "#/$defs/RpcError"
+        }
+      }
+    },
+    "OnboardingChannelEnableResponseFrame": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/OnboardingChannelEnableOkResponseFrame"
+        },
+        {
+          "$ref": "#/$defs/OnboardingChannelEnableErrorResponseFrame"
+        }
+      ]
+    }
+  }
+}

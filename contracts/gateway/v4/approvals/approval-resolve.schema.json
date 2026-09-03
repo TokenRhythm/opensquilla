@@ -24,6 +24,7 @@
     "kind": "command",
     "scope": "operator.approvals",
     "guestAllowed": false,
+    "lifecycle": "stable",
     "idempotency": "idempotent",
     "timeout": { "policy": "caller" },
     "capability": { "kind": "method-availability", "name": "exec.approval.resolve" },
