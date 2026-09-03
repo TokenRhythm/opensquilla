@@ -7,6 +7,13 @@ import pytest
 import structlog
 
 import opensquilla.gateway.adapters.contract_method as contract_method_adapter
+from opensquilla.contracts.generated.v4.gateway_contract_registry import (
+    GATEWAY_METHOD_CONTRACTS,
+)
+from opensquilla.gateway.adapters._generated_contract_bindings import (
+    generated_contract_bindings,
+    register_generated_contract_binding,
+)
 from opensquilla.gateway.adapters.contract_method import (
     GatewayContractBinding,
     register_gateway_contract_method,
@@ -15,6 +22,10 @@ from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, RpcRegistry
 
 
 class _ContractViolationError(ValueError):
+    pass
+
+
+class _GeneratedContractViolationError(ValueError):
     pass
 
 
@@ -66,6 +77,85 @@ def _legacy_guest_denied(_method: str) -> bool:
     return False
 
 
+def test_generated_binding_mechanics_preserve_descriptor_and_validation() -> None:
+    bindings = generated_contract_bindings(
+        ("agents.list",),
+        _GeneratedContractViolationError,
+    )
+    binding = bindings["agents.list"]
+
+    assert binding.descriptor is GATEWAY_METHOD_CONTRACTS["agents.list"]
+    assert binding.observe_params(None) == ()
+    assert binding.observe_params([])
+    result = {"agents": []}
+    assert binding.validate_result(result) is result
+    with pytest.raises(
+        _GeneratedContractViolationError,
+        match="agents.list result violated the generated v4 Contract",
+    ):
+        binding.validate_result(None)
+
+
+def test_generated_binding_registration_preserves_provenance() -> None:
+    registry = RpcRegistry()
+    bindings = generated_contract_bindings(
+        ("agents.list",),
+        _GeneratedContractViolationError,
+    )
+
+    async def implementation(_params: Any, _ctx: Any) -> Any:
+        return {"agents": []}
+
+    handler = register_generated_contract_binding(
+        registry,
+        bindings,
+        "agents.list",
+        implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=_legacy_guest_denied,
+    )
+
+    entry = registry.get_entry("agents.list")
+    assert entry is not None
+    assert entry.handler is handler
+    assert entry.generated_contract_name == "agents.list"
+    assert entry.required_scope == GATEWAY_METHOD_CONTRACTS["agents.list"].scope
+
+
+def test_generated_binding_registration_preserves_domain_unsupported_error() -> None:
+    async def implementation(_params: Any, _ctx: Any) -> Any:
+        return None
+
+    with pytest.raises(
+        ValueError,
+        match="unsupported Agent catalog Contract method: missing.method",
+    ):
+        register_generated_contract_binding(
+            RpcRegistry(),
+            {},
+            "missing.method",
+            implementation,
+            internal_error=RpcHandlerError,
+            guest_allowed_checker=_legacy_guest_denied,
+            unsupported_contract="Agent catalog",
+        )
+
+
+def test_generated_binding_registration_keeps_mapping_lookup_error_by_default() -> None:
+    async def implementation(_params: Any, _ctx: Any) -> Any:
+        return None
+
+    with pytest.raises(KeyError, match="missing.method"):
+        register_generated_contract_binding(
+            RpcRegistry(),
+            {},
+            "missing.method",
+            implementation,
+            internal_error=RpcHandlerError,
+            guest_allowed_checker=_legacy_guest_denied,
+        )
+
+
 def test_plain_registry_registration_has_no_generated_contract_provenance() -> None:
     registry = RpcRegistry()
 
@@ -112,9 +202,7 @@ async def test_registers_one_handler_and_calls_one_implementation_without_rewrit
     assert implementation_calls == [(params, ctx)]
     assert implementation_calls[0][0] is params
     assert result is expected
-    assert [record["event"] for record in logs] == [
-        "example.query.request_contract_mismatch"
-    ]
+    assert [record["event"] for record in logs] == ["example.query.request_contract_mismatch"]
 
 
 def test_registry_rejects_mismatched_generated_contract_marker_before_write() -> None:

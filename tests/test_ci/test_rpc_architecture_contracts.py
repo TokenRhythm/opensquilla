@@ -23,83 +23,24 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         "src/opensquilla/gateway/adapters/sessions_search_contract.py",
         "src/opensquilla/contracts/adapters/sessions_changed_contract.py",
         "src/opensquilla/contracts/adapters/conversation_events.py",
-        # Approval wire models terminate at the dormant UI boundary and the
-        # strict Gateway registration Adapter; the queue remains the single
-        # business implementation.
+        # Approval wire models terminate at the dormant UI boundary.
         "src/opensquilla/contracts/adapters/approval_center_contract.py",
-        "src/opensquilla/gateway/adapters/approval_contract.py",
         # S17 keeps the two migrated Goal operations behind GoalCenter; the
         # remaining Goal mutations stay on the legacy path.  S18 adds the
         # Gateway registration boundary without changing their implementation.
         "src/opensquilla/contracts/adapters/goals_contract.py",
         "src/opensquilla/gateway/adapters/goals_contract.py",
         "src/opensquilla/gateway/adapters/plans_contract.py",
-        # Strict profile-import wire models terminate at their registration
-        # Adapter; the existing profile service and job runner remain the only
-        # business implementations.
-        "src/opensquilla/gateway/adapters/memory_profile_import_contract.py",
         # Session read Contracts are consumed only by the Gateway registration
         # Adapter; Application Modules and handlers receive domain values.
         "src/opensquilla/gateway/adapters/session_read_contract.py",
-        # Session control wire models terminate at the generated registration
-        # Adapter; session runtime owns subscriptions and routing state.
-        "src/opensquilla/gateway/adapters/session_control_contract.py",
-        # Session lifecycle wire models terminate at the registration Adapter;
-        # the Application Module receives transport-neutral typed commands.
-        "src/opensquilla/gateway/adapters/session_lifecycle_contract.py",
-        # Reset and compact wire models terminate at SessionMaintenance's
-        # generated registration Adapter.
-        "src/opensquilla/gateway/adapters/session_maintenance_contract.py",
-        # Canonical and legacy turn wire models terminate at TurnAdmission's
-        # generated registration Adapter.
-        "src/opensquilla/gateway/adapters/turn_admission_contract.py",
-        # Durable pending-input wire models terminate at the queue Adapter;
-        # the Application Module receives queue identities and revisions.
-        "src/opensquilla/gateway/adapters/pending_input_queue_contract.py",
-        # Usage, command, feedback, prompt-cache, and clarification wire
-        # models terminate at their generated registration Adapter.
-        "src/opensquilla/gateway/adapters/conversation_ancillary_contract.py",
-        # AgentCatalog wire models terminate at its generated registration
-        # Adapter; the Application Module sees explicit create/update commands.
-        "src/opensquilla/gateway/adapters/agent_catalog_contract.py",
-        # Channel administration wire models terminate at its generated
-        # registration Adapter; Application Modules see typed channel intents.
-        "src/opensquilla/gateway/adapters/channel_administration_contract.py",
-        # Cron scheduling and subscription wire models terminate at the
-        # generated registration Adapter; Application Modules stay transport-neutral.
-        "src/opensquilla/gateway/adapters/cron_scheduler_contract.py",
-        # Runtime/readiness/log wire models terminate at the Observability
-        # registration Adapter; collectors receive transport-neutral queries.
-        "src/opensquilla/gateway/adapters/observability_contract.py",
-        # SkillCatalog read wire models terminate at its generated registration
-        # Adapter; the Application Module sees domain identities and queries.
-        "src/opensquilla/gateway/adapters/skill_catalog_contract.py",
-        # SkillManagement wire models terminate at its generated registration
-        # Adapter; the Application Module sees explicit mutation commands.
-        "src/opensquilla/gateway/adapters/skill_management_contract.py",
-        # Proposal review wire models terminate at its registration Adapter;
-        # scheduler rollback and catalog invalidation stay in the Application Module.
-        "src/opensquilla/gateway/adapters/skill_proposal_review_contract.py",
-        # Artifact Workbench wire models terminate at its registration Adapter;
-        # the Application composition receives only typed domain commands.
-        "src/opensquilla/gateway/adapters/artifact_workbench_contract.py",
         # SandboxRuntime handlers stay legacy-compatible while generated
         # descriptors own registration metadata and success validation.
         "src/opensquilla/gateway/adapters/sandbox_runtime_contract.py",
-        # Platform setup wire models terminate at the generated registration
-        # Adapter; Application Modules receive transport-neutral commands.
-        "src/opensquilla/gateway/adapters/platform_setup_contract.py",
-        # Configuration wire models likewise terminate at their registration
-        # Adapter; settings, provider, and routing Modules remain wire-neutral.
-        "src/opensquilla/gateway/adapters/platform_configuration_contract.py",
-        # Workspace and path-picker wire models terminate at this registration
-        # Adapter; existing workspace and sandbox handlers keep behavior.
-        "src/opensquilla/gateway/adapters/workspace_catalog_contract.py",
-        # Meta recovery/setup and read-only migration wire models terminate at
-        # generated registration Adapters; existing handlers remain the only
-        # business implementations.
-        "src/opensquilla/gateway/adapters/meta_run_center_contract.py",
-        "src/opensquilla/gateway/adapters/migration_operations_contract.py",
+        # Repeated generated descriptor mechanics terminate at one private
+        # Gateway Adapter helper; domain registrars retain explicit ownership
+        # of their method inventories and public signatures.
+        "src/opensquilla/gateway/adapters/_generated_contract_bindings.py",
     }
 )
 GENERATED_METADATA_IMPORT_ALLOWLIST = frozenset(
@@ -714,14 +655,22 @@ def test_contract_gateway_adapters_do_not_join_a_gateway_cycle() -> None:
     resolve_adapter = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_resolve_contract.py"
     goals_adapter = PACKAGE_ROOT / "gateway" / "adapters" / "goals_contract.py"
     sandbox_adapter = PACKAGE_ROOT / "gateway" / "adapters" / "sandbox_runtime_contract.py"
+    generated_binding_helper = (
+        PACKAGE_ROOT / "gateway" / "adapters" / "_generated_contract_bindings.py"
+    )
     lifecycle_adapter = PACKAGE_ROOT / "gateway" / "adapters" / "session_lifecycle_contract.py"
-    for adapter_path in (
-        SESSIONS_LIST_GATEWAY_ADAPTER,
-        resolve_adapter,
-        goals_adapter,
-        sandbox_adapter,
-        lifecycle_adapter,
-    ):
+    expected_gateway_dependencies = {
+        SESSIONS_LIST_GATEWAY_ADAPTER: ["opensquilla.gateway.adapters.contract_method"],
+        resolve_adapter: ["opensquilla.gateway.adapters.contract_method"],
+        goals_adapter: ["opensquilla.gateway.adapters.contract_method"],
+        sandbox_adapter: ["opensquilla.gateway.adapters.contract_method"],
+        generated_binding_helper: ["opensquilla.gateway.adapters.contract_method"],
+        lifecycle_adapter: [
+            "opensquilla.gateway.adapters._generated_contract_bindings",
+            "opensquilla.gateway.adapters.contract_method",
+        ],
+    }
+    for adapter_path, expected_dependencies in expected_gateway_dependencies.items():
         adapter = _module_name(adapter_path)
         cycle_edges = sorted(
             dependency for dependency in graph[adapter] if _reaches(graph, dependency, adapter)
@@ -731,8 +680,8 @@ def test_contract_gateway_adapters_do_not_join_a_gateway_cycle() -> None:
             for dependency in graph[adapter]
             if dependency.startswith("opensquilla.gateway")
         )
-        assert gateway_dependencies == ["opensquilla.gateway.adapters.contract_method"], (
-            f"{adapter} may depend only on the generic registration Adapter: {gateway_dependencies}"
+        assert gateway_dependencies == expected_dependencies, (
+            f"{adapter} has unexpected Gateway dependencies: {gateway_dependencies}"
         )
         assert cycle_edges == [], f"{adapter} joined a Python import cycle: {cycle_edges}"
 
