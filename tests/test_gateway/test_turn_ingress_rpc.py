@@ -60,6 +60,7 @@ from opensquilla.gateway.session_model_routing import (
 from opensquilla.gateway.task_runtime import TaskRuntime
 from opensquilla.gateway.turn_ingress import request_fingerprint
 from opensquilla.gateway.uploads import UploadStore, get_upload_store, set_upload_store
+from opensquilla.paths import native_io_path
 from opensquilla.session.goals import GoalCommandRequest, StartGoalMutation, new_goal
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import (
@@ -1646,7 +1647,7 @@ async def test_pending_attachment_survives_restart_dispatches_once_and_cleans_ow
                 "pending-rpc-durable-attachment",
                 digest,
             )
-            assert owner_path.read_bytes() == payload
+            assert native_io_path(owner_path).read_bytes() == payload
 
             # The expiring upload is gone and the process-local upload store is
             # replaced, matching a Gateway restart. Dispatch must use only the
@@ -1687,11 +1688,12 @@ async def test_pending_attachment_survives_restart_dispatches_once_and_cleans_ow
             assert replayed.ok is True
             assert replayed.payload["message_id"] == accepted.payload["message_id"]
             assert not owner_path.exists()
-            assert transcript_material_path(
+            canonical_path = transcript_material_path(
                 Path(stack.context.config.attachments.media_root or ""),
                 stack.session_id,
                 digest,
-            ).read_bytes() == payload
+            )
+            assert native_io_path(canonical_path).read_bytes() == payload
             assert _table_counts(stack.db_path) == {
                 "transcript_entries": 1,
                 "agent_tasks": 1,
@@ -1745,7 +1747,7 @@ async def test_pending_attachment_cancel_removes_only_its_private_owner(
                 stack.session_id,
                 digest,
             )
-            assert owner_path.read_bytes() == payload
+            assert native_io_path(owner_path).read_bytes() == payload
             assert not canonical_path.exists()
 
             cancelled = await get_dispatcher().dispatch(
@@ -1804,7 +1806,7 @@ async def test_session_delete_reclaims_pending_attachment_owner(
                 "pending-rpc-delete-attachment",
                 digest,
             )
-            assert owner_path.read_bytes() == payload
+            assert native_io_path(owner_path).read_bytes() == payload
 
             deleted = await get_dispatcher().dispatch(
                 "pending-attachment-session-delete",
