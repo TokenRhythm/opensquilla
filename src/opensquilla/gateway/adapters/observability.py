@@ -22,6 +22,7 @@ from opensquilla.application.observability import (
     RouterLearningStatusPort,
     RuntimeStatusPort,
 )
+from opensquilla.gateway.log_status_runtime import read_log_status
 from opensquilla.gateway.rpc import RpcContext
 from opensquilla.gateway.session_services import get_session_storage
 from opensquilla.health.evaluator import (
@@ -47,7 +48,6 @@ type ContextReader = Callable[
 type RouterLearningReader = Callable[
     [str, RpcContext], Mapping[str, Any] | Awaitable[Mapping[str, Any]]
 ]
-type LogStatusReader = Callable[[RpcContext], Mapping[str, Any]]
 type LogTailReader = Callable[
     [LogTailQuery], Mapping[str, Any] | Awaitable[Mapping[str, Any]]
 ]
@@ -105,15 +105,16 @@ class GatewayLogReaderPort(LogReaderPort):
         self,
         context: RpcContext,
         *,
-        status_reader: LogStatusReader,
         tail_reader: LogTailReader,
     ) -> None:
         self._context = context
-        self._status_reader = status_reader
         self._tail_reader = tail_reader
 
     async def status(self) -> Mapping[str, Any]:
-        return self._status_reader(self._context)
+        return read_log_status(
+            config=getattr(self._context, "config", None),
+            diagnostics_state=getattr(self._context, "diagnostics_state", None),
+        )
 
     async def tail(self, query: LogTailQuery) -> Mapping[str, Any]:
         return await _resolve(self._tail_reader(query))
@@ -290,7 +291,6 @@ __all__ = [
     "GatewayReadinessEvaluationPort",
     "GatewayRouterLearningStatusPort",
     "GatewayRuntimeStatusPort",
-    "LogStatusReader",
     "LogTailReader",
     "RouterLearningReader",
 ]

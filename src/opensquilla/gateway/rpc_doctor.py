@@ -21,9 +21,9 @@ from opensquilla.gateway.adapters.observability_contract import (
 )
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
+from opensquilla.gateway.log_status_runtime import read_log_status
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
 from opensquilla.gateway.rpc_channels import read_channel_status as _handle_channels_status
-from opensquilla.gateway.rpc_logs import read_log_status as _build_logs_status
 from opensquilla.gateway.rpc_system import read_memory_status as _handle_doctor_memory_status
 from opensquilla.gateway.rpc_tools import (
     read_provider_status as _handle_providers_status,
@@ -44,6 +44,13 @@ _UNKNOWN_SEARCH_PROVIDER_RE = re.compile(
     r"|unknown search provider: ['\"]([^'\"]+)['\"]",
     re.IGNORECASE,
 )
+
+
+def _build_logs_status(ctx: RpcContext) -> dict[str, Any]:
+    return read_log_status(
+        config=getattr(ctx, "config", None),
+        diagnostics_state=getattr(ctx, "diagnostics_state", None),
+    )
 
 
 def _config_path(ctx: RpcContext) -> str | None:
