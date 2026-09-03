@@ -26,7 +26,11 @@ from typing import Any
 
 import structlog
 
-from opensquilla.application.observability import RouterLearningQuery, RouterLearningStatus
+from opensquilla.application.observability import (
+    RouterLearningQuery,
+    RouterLearningStatus,
+    RouterLearningStatusPort,
+)
 from opensquilla.engine.steps.router_decision_record import get_decision_writer
 from opensquilla.gateway.adapters.conversation_ancillary import (
     GatewayConversationAncillaryAdapter,
@@ -35,7 +39,6 @@ from opensquilla.gateway.adapters.conversation_ancillary import (
 from opensquilla.gateway.adapters.conversation_ancillary_contract import (
     register_conversation_ancillary_contract,
 )
-from opensquilla.gateway.adapters.observability import GatewayRouterLearningStatusPort
 from opensquilla.gateway.adapters.observability_contract import (
     register_observability_contract,
 )
@@ -366,14 +369,22 @@ async def read_router_learning_status(agent_id_value: str, ctx: RpcContext) -> d
     return payload
 
 
+class _GatewayRouterLearningStatusRuntime(RouterLearningStatusPort):
+    """Read router-learning state from its persisted/runtime primitives."""
+
+    def __init__(self, ctx: RpcContext) -> None:
+        self._ctx = ctx
+
+    async def snapshot(self, query: RouterLearningQuery) -> Mapping[str, Any]:
+        return await read_router_learning_status(query.agent_id, self._ctx)
+
+
 async def _router_selflearning_status_contract(
     params: Any, ctx: RpcContext
 ) -> dict[str, Any]:
     p = params if isinstance(params, dict) else {}
     agent_id = p.get("agentId") or p.get("agent_id") or "main"
-    status = RouterLearningStatus(
-        GatewayRouterLearningStatusPort(ctx, read_router_learning_status)
-    )
+    status = RouterLearningStatus(_GatewayRouterLearningStatusRuntime(ctx))
     return await status.read(RouterLearningQuery(str(agent_id)))
 
 

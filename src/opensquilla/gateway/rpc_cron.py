@@ -7,8 +7,16 @@ from typing import Any, TypeGuard
 
 import structlog
 
+from opensquilla.application.cron_scheduler import (
+    CronJobMutation,
+    CronJobTarget,
+    CronListQuery,
+    CronRunQuery,
+    CronSchedulerPort,
+    CronSubscriptionPort,
+    CronTopic,
+)
 from opensquilla.gateway.adapters.cron_scheduler import (
-    GatewayCronCallbacks,
     GatewayCronSchedulerAdapter,
 )
 from opensquilla.gateway.adapters.cron_scheduler_contract import (
@@ -1074,20 +1082,62 @@ async def _handle_cron_unsubscribe(params: dict | None, ctx: RpcContext) -> dict
     return {"ok": True, "topic": topic}
 
 
+class _CronSchedulerRuntime(CronSchedulerPort):
+    """Bind typed cron commands directly to the configured SchedulerEngine."""
+
+    def __init__(self, ctx: RpcContext) -> None:
+        self._ctx = ctx
+
+    async def list_jobs(self, query: CronListQuery) -> list[dict[str, Any]]:
+        return await _handle_cron_list(
+            {"agentId": query.agent_id} if query.agent_id else None,
+            self._ctx,
+        )
+
+    async def get_job(self, target: CronJobTarget) -> dict[str, Any]:
+        return await _handle_cron_status({"id": target.job_id}, self._ctx)
+
+    async def create_job(self, command: CronJobMutation) -> dict[str, Any]:
+        return await _handle_cron_add(dict(command.values), self._ctx)
+
+    async def update_job(self, command: CronJobMutation) -> dict[str, Any]:
+        return await _handle_cron_update(
+            {**dict(command.values), "id": command.job_id}, self._ctx
+        )
+
+    async def remove_job(self, target: CronJobTarget) -> None:
+        await _handle_cron_remove({"id": target.job_id}, self._ctx)
+
+    async def run_job(self, target: CronJobTarget) -> dict[str, Any]:
+        return await _handle_cron_run({"id": target.job_id}, self._ctx)
+
+    async def list_runs(self, query: CronRunQuery) -> list[dict[str, Any]]:
+        return await _handle_cron_runs(
+            {"id": query.job_id, "limit": query.limit}, self._ctx
+        )
+
+
+class _CronSubscriptionRuntime(CronSubscriptionPort):
+    """Keep connection-scoped subscription state inside the Gateway Adapter."""
+
+    def __init__(self, ctx: RpcContext) -> None:
+        self._ctx = ctx
+
+    @staticmethod
+    def _params(topic: CronTopic) -> dict[str, Any] | None:
+        return {"jobId": topic.job_id} if topic.job_id else None
+
+    async def subscribe(self, topic: CronTopic) -> dict[str, Any]:
+        return await _handle_cron_subscribe(self._params(topic), self._ctx)
+
+    async def unsubscribe(self, topic: CronTopic) -> dict[str, Any]:
+        return await _handle_cron_unsubscribe(self._params(topic), self._ctx)
+
+
 def _cron_scheduler_adapter(ctx: RpcContext) -> GatewayCronSchedulerAdapter:
     return GatewayCronSchedulerAdapter(
-        ctx,
-        GatewayCronCallbacks(
-            list_jobs=_handle_cron_list,
-            status=_handle_cron_status,
-            create=_handle_cron_add,
-            update=_handle_cron_update,
-            remove=_handle_cron_remove,
-            run=_handle_cron_run,
-            runs=_handle_cron_runs,
-            subscribe=_handle_cron_subscribe,
-            unsubscribe=_handle_cron_unsubscribe,
-        ),
+        _CronSchedulerRuntime(ctx),
+        _CronSubscriptionRuntime(ctx),
     )
 
 

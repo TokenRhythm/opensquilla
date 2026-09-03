@@ -859,6 +859,83 @@ def test_cron_scheduler_application_does_not_depend_on_gateway() -> None:
     assert "RpcContext" not in imported_names
 
 
+def test_r5_gateway_adapters_depend_on_typed_ports_not_rpc_callbacks() -> None:
+    adapter_paths = (
+        PACKAGE_ROOT / "gateway" / "adapters" / "channel_administration.py",
+        PACKAGE_ROOT / "gateway" / "adapters" / "cron_scheduler.py",
+        PACKAGE_ROOT / "gateway" / "adapters" / "observability.py",
+        PACKAGE_ROOT / "gateway" / "adapters" / "skill_catalog.py",
+        PACKAGE_ROOT / "gateway" / "adapters" / "skill_management.py",
+    )
+    forbidden_names = {
+        "GatewayChannelAdministrationCallbacks",
+        "GatewayCronCallbacks",
+        "GatewayLogReaderPort",
+        "GatewayReadinessDataPort",
+        "GatewayRouterLearningStatusPort",
+        "GatewaySkillCatalogReadPort",
+        "GatewaySkillManagementPort",
+    }
+    violations: list[str] = []
+
+    for path in adapter_paths:
+        tree = _tree(path)
+        relative = path.relative_to(ROOT).as_posix()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name in forbidden_names:
+                    violations.append(f"{relative}:{node.lineno}: defines {node.name}")
+            elif isinstance(node, ast.Name) and node.id == "Callable":
+                violations.append(f"{relative}:{node.lineno}: references Callable")
+            elif (
+                isinstance(node, ast.Name)
+                and node.id == "RpcContext"
+                and path.name != "observability.py"
+            ):
+                violations.append(f"{relative}:{node.lineno}: references RpcContext")
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    forbidden_imports = forbidden_names | {"Callable"}
+                    if path.name != "observability.py":
+                        forbidden_imports.add("RpcContext")
+                    if alias.name in forbidden_imports:
+                        violations.append(
+                            f"{relative}:{node.lineno}: imports {alias.name}"
+                        )
+
+    assert violations == [], "R5 Gateway callback seams returned:\n" + "\n".join(violations)
+
+
+def test_r5_rpc_factories_bind_concrete_typed_runtime_ports() -> None:
+    expected_bindings = {
+        "rpc_channels.py": (
+            "_ChannelAdministrationRuntime(ctx)",
+            "_ChannelPairingRuntime(ctx)",
+        ),
+        "rpc_cron.py": (
+            "_CronSchedulerRuntime(ctx)",
+            "_CronSubscriptionRuntime(ctx)",
+        ),
+        "rpc_doctor.py": ("_GatewayReadinessRuntime(ctx)",),
+        "rpc_logs.py": ("_GatewayLogReaderRuntime(ctx)",),
+        "rpc_router.py": ("_GatewayRouterLearningStatusRuntime(ctx)",),
+        "rpc_skills.py": (
+            "_SkillCatalogRuntime(ctx)",
+            "_SkillManagementRuntime(ctx)",
+        ),
+    }
+
+    for filename, bindings in expected_bindings.items():
+        source = (PACKAGE_ROOT / "gateway" / filename).read_text(encoding="utf-8")
+        for binding in bindings:
+            assert binding in source, f"{filename} must bind {binding}"
+
+    proposal_source = (PACKAGE_ROOT / "gateway" / "rpc_proposals.py").read_text(
+        encoding="utf-8"
+    )
+    assert "opensquilla.gateway.rpc_cron" not in proposal_source
+
+
 def test_rpc_context_does_not_grow_past_pinned_main() -> None:
     tree = _tree(RPC_CONTEXT)
     context = next(

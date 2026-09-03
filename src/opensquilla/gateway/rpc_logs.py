@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
-from opensquilla.application.observability import LogReader, LogTailQuery
-from opensquilla.gateway.adapters.observability import GatewayLogReaderPort
+from opensquilla.application.observability import LogReader, LogReaderPort, LogTailQuery
 from opensquilla.gateway.adapters.observability_contract import (
     register_observability_contract,
 )
@@ -17,14 +17,27 @@ from opensquilla.observability.trace import load_trace_events
 _d = get_dispatcher()
 
 
+class _GatewayLogReaderRuntime(LogReaderPort):
+    """Read log projections directly from configured filesystem/runtime state."""
+
+    def __init__(self, ctx: RpcContext) -> None:
+        self._ctx = ctx
+
+    async def status(self) -> Mapping[str, Any]:
+        from opensquilla.gateway.log_status_runtime import read_log_status
+
+        return read_log_status(
+            config=getattr(self._ctx, "config", None),
+            diagnostics_state=getattr(self._ctx, "diagnostics_state", None),
+        )
+
+    async def tail(self, query: LogTailQuery) -> Mapping[str, Any]:
+        return read_log_tail(query)
+
+
 async def _logs_status_contract(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     """Report log-related runtime switches without mutating filesystem state."""
-    return await LogReader(
-        GatewayLogReaderPort(
-            ctx,
-            tail_reader=read_log_tail,
-        )
-    ).status()
+    return await LogReader(_GatewayLogReaderRuntime(ctx)).status()
 
 
 @_d.method("logs.trace", scope="operator.read")
@@ -81,12 +94,7 @@ def read_log_tail(query: LogTailQuery) -> dict[str, Any]:
 async def _logs_tail_contract(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     """Tail log file with cursor-based pagination and level filter."""
     p = params or {}
-    reader = LogReader(
-        GatewayLogReaderPort(
-            ctx,
-            tail_reader=read_log_tail,
-        )
-    )
+    reader = LogReader(_GatewayLogReaderRuntime(ctx))
     return await reader.tail(
         LogTailQuery(
             cursor=int(p.get("cursor", 0)),

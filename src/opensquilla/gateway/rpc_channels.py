@@ -9,9 +9,18 @@ from typing import TYPE_CHECKING, Any, cast
 
 import structlog
 
+from opensquilla.application.channel_administration import (
+    ApprovePairing,
+    ChannelAdministrationPort,
+    ChannelPairingPort,
+    ChannelTarget,
+    PairingQuery,
+    PairingTarget,
+    ProbeChannel,
+    SetChannelAdmin,
+)
 from opensquilla.gateway.adapters.channel_administration import (
     GatewayChannelAdministrationAdapter,
-    GatewayChannelAdministrationCallbacks,
 )
 from opensquilla.gateway.adapters.channel_administration_contract import (
     register_channel_administration_contract,
@@ -581,20 +590,89 @@ async def _handle_channels_pairing_revoke(
     return payload
 
 
+class _ChannelAdministrationRuntime(ChannelAdministrationPort):
+    """Bind channel use cases directly to the configured runtime primitives."""
+
+    def __init__(self, ctx: RpcContext) -> None:
+        self._ctx = ctx
+
+    async def status(self) -> dict[str, Any]:
+        return await read_channel_status(None, self._ctx)
+
+    async def get(self, target: ChannelTarget) -> dict[str, Any]:
+        return await _handle_channels_get({"name": target.name}, self._ctx)
+
+    async def probe(self, command: ProbeChannel) -> dict[str, Any]:
+        params = (
+            {"entry": dict(command.entry)}
+            if command.entry is not None
+            else {"name": command.name}
+        )
+        return await _handle_channels_probe(params, self._ctx)
+
+    async def restart(self, target: ChannelTarget) -> dict[str, Any]:
+        return await _handle_channels_restart({"name": target.name}, self._ctx)
+
+    async def logout(self, target: ChannelTarget) -> dict[str, Any]:
+        return await _handle_channels_logout({"name": target.name}, self._ctx)
+
+
+class _ChannelPairingRuntime(ChannelPairingPort):
+    """Bind pairing orchestration to the durable store and ChannelManager."""
+
+    def __init__(self, ctx: RpcContext) -> None:
+        self._ctx = ctx
+
+    @staticmethod
+    def _target(target: PairingTarget) -> dict[str, Any]:
+        return {
+            "channelName": target.channel_name,
+            **({"pairingId": target.pairing_id} if target.pairing_id else {}),
+            **({"pairingCode": target.pairing_code} if target.pairing_code else {}),
+        }
+
+    async def list(self, query: PairingQuery) -> list[dict[str, Any]]:
+        result = await _handle_channels_pairings(
+            {
+                "channelName": query.channel_name,
+                **({"status": query.status} if query.status else {}),
+                **({"limit": query.limit} if query.limit is not None else {}),
+                "offset": query.offset,
+            },
+            self._ctx,
+        )
+        rows = result.get("pairings")
+        return rows if isinstance(rows, list) else []
+
+    async def approve(self, command: ApprovePairing) -> dict[str, Any]:
+        return await _handle_channels_pairing_approve(
+            {
+                **self._target(command.target),
+                **({"asAdmin": True} if command.as_admin else {}),
+            },
+            self._ctx,
+        )
+
+    async def revoke(self, target: PairingTarget) -> dict[str, Any]:
+        return await _handle_channels_pairing_revoke(
+            self._target(target), self._ctx
+        )
+
+    async def set_admin(self, command: SetChannelAdmin) -> dict[str, Any]:
+        return await _handle_channels_admin_set(
+            {
+                "channelName": command.channel_name,
+                "senderId": command.sender_id,
+                "admin": command.admin,
+            },
+            self._ctx,
+        )
+
+
 def _channel_administration_adapter(ctx: RpcContext) -> GatewayChannelAdministrationAdapter:
     return GatewayChannelAdministrationAdapter(
-        ctx,
-        GatewayChannelAdministrationCallbacks(
-            status=read_channel_status,
-            get=_handle_channels_get,
-            probe=_handle_channels_probe,
-            restart=_handle_channels_restart,
-            logout=_handle_channels_logout,
-            pairings=_handle_channels_pairings,
-            approve_pairing=_handle_channels_pairing_approve,
-            revoke_pairing=_handle_channels_pairing_revoke,
-            set_admin=_handle_channels_admin_set,
-        ),
+        _ChannelAdministrationRuntime(ctx),
+        _ChannelPairingRuntime(ctx),
     )
 
 

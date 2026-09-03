@@ -1,74 +1,72 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
 
+from opensquilla.application.channel_administration import (
+    ApprovePairing,
+    ChannelAdministrationPort,
+    ChannelPairingPort,
+    ChannelTarget,
+    PairingQuery,
+    PairingTarget,
+)
 from opensquilla.gateway.adapters.channel_administration import (
     GatewayChannelAdministrationAdapter,
-    GatewayChannelAdministrationCallbacks,
 )
-from opensquilla.gateway.rpc import RpcContext
 
 
-def _callbacks() -> GatewayChannelAdministrationCallbacks:
-    return GatewayChannelAdministrationCallbacks(
-        status=AsyncMock(return_value={"channels": [{"name": "ops"}]}),
-        get=AsyncMock(return_value={"entry": {"name": "ops"}, "secretFields": []}),
-        probe=AsyncMock(return_value={"status": "verified", "connected": True}),
-        restart=AsyncMock(return_value={"status": "restarted", "channel": "ops"}),
-        logout=AsyncMock(return_value={"status": "disconnected", "channel": "ops"}),
-        pairings=AsyncMock(
-            return_value={
-                "pairings": [
-                    {
-                        "pairingId": "pair-1",
-                        "channelName": "ops",
-                        "senderId": "user-1",
-                        "status": "pending",
-                    }
-                ]
-            }
-        ),
-        approve_pairing=AsyncMock(
-            return_value={
-                "pairing": {
-                    "pairingId": "pair-1",
-                    "channelName": "ops",
-                    "senderId": "user-1",
-                    "status": "approved",
-                },
-                "adminGranted": True,
-            }
-        ),
-        revoke_pairing=AsyncMock(
-            return_value={
-                "pairing": {
-                    "pairingId": "pair-1",
-                    "channelName": "ops",
-                    "senderId": "user-1",
-                    "status": "revoked",
-                }
-            }
-        ),
-        set_admin=AsyncMock(
-            return_value={
-                "channelName": "ops",
-                "senderId": "user-1",
-                "admin": True,
-                "admins": ["user-1"],
-            }
-        ),
-    )
+def _ports() -> tuple[AsyncMock, AsyncMock]:
+    administration = AsyncMock(spec=ChannelAdministrationPort)
+    administration.status.return_value = {"channels": [{"name": "ops"}]}
+    administration.get.return_value = {
+        "entry": {"name": "ops"},
+        "secretFields": [],
+    }
+    administration.probe.return_value = {"status": "verified", "connected": True}
+    administration.restart.return_value = {"status": "restarted", "channel": "ops"}
+    administration.logout.return_value = {"status": "disconnected", "channel": "ops"}
+
+    pairings = AsyncMock(spec=ChannelPairingPort)
+    pairings.list.return_value = [
+        {
+            "pairingId": "pair-1",
+            "channelName": "ops",
+            "senderId": "user-1",
+            "status": "pending",
+        }
+    ]
+    pairings.approve.return_value = {
+        "pairing": {
+            "pairingId": "pair-1",
+            "channelName": "ops",
+            "senderId": "user-1",
+            "status": "approved",
+        },
+        "adminGranted": True,
+    }
+    pairings.revoke.return_value = {
+        "pairing": {
+            "pairingId": "pair-1",
+            "channelName": "ops",
+            "senderId": "user-1",
+            "status": "revoked",
+        }
+    }
+    pairings.set_admin.return_value = {
+        "channelName": "ops",
+        "senderId": "user-1",
+        "admin": True,
+        "admins": ["user-1"],
+    }
+    return administration, pairings
 
 
 @pytest.mark.asyncio
 async def test_channel_adapter_projects_typed_channel_and_pairing_intents() -> None:
-    callbacks = _callbacks()
-    context = cast(RpcContext, SimpleNamespace())
-    adapter = GatewayChannelAdministrationAdapter(context, callbacks)
+    administration, pairings = _ports()
+    adapter = GatewayChannelAdministrationAdapter(administration, pairings)
 
     assert await adapter.get({"name": " ops "}) == {
         "entry": {"name": "ops"},
@@ -90,25 +88,24 @@ async def test_channel_adapter_projects_typed_channel_and_pairing_intents() -> N
         {"channelName": "ops", "pairingCode": "abcdef12", "asAdmin": True}
     )
 
-    cast(AsyncMock, callbacks.get).assert_awaited_once_with({"name": "ops"}, context)
-    cast(AsyncMock, callbacks.pairings).assert_awaited_once_with(
-        {"channelName": "ops", "status": "pending", "limit": 10, "offset": 1},
-        context,
+    administration.get.assert_awaited_once_with(ChannelTarget("ops"))
+    pairings.list.assert_awaited_once_with(
+        PairingQuery(channel_name="ops", status="pending", limit=10, offset=1)
     )
-    cast(AsyncMock, callbacks.approve_pairing).assert_awaited_once_with(
-        {"channelName": "ops", "pairingCode": "abcdef12", "asAdmin": True},
-        context,
+    pairings.approve.assert_awaited_once_with(
+        ApprovePairing(
+            PairingTarget(channel_name="ops", pairing_code="abcdef12"),
+            as_admin=True,
+        )
     )
 
 
 @pytest.mark.asyncio
 async def test_channel_adapter_rejects_invalid_admin_before_runtime() -> None:
-    callbacks = _callbacks()
-    adapter = GatewayChannelAdministrationAdapter(
-        cast(RpcContext, SimpleNamespace()), callbacks
-    )
+    administration, pairings = _ports()
+    adapter = GatewayChannelAdministrationAdapter(administration, pairings)
 
     with pytest.raises(ValueError, match="admin required"):
         await adapter.set_admin({"channelName": "ops", "senderId": "user-1"})
 
-    cast(AsyncMock, callbacks.set_admin).assert_not_awaited()
+    pairings.set_admin.assert_not_awaited()

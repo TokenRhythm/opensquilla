@@ -6,23 +6,30 @@ import asyncio
 import os
 import shutil
 import weakref
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
 
-from opensquilla.gateway.adapters.skill_catalog import (
-    GatewaySkillCatalogAdapter,
-    GatewaySkillCatalogReadPort,
+from opensquilla.application.skill_catalog import (
+    SkillCatalogReadPort,
+    SkillIdentity,
+    SkillSearchPage,
+    SkillSearchQuery,
 )
+from opensquilla.application.skill_management import (
+    CancelSkillInstall,
+    InstallSkill,
+    InstallSkillDependencies,
+    SkillManagementPort,
+    UninstallSkill,
+)
+from opensquilla.gateway.adapters.skill_catalog import GatewaySkillCatalogAdapter
 from opensquilla.gateway.adapters.skill_catalog_contract import (
     register_skill_catalog_contract,
 )
-from opensquilla.gateway.adapters.skill_management import (
-    GatewaySkillManagementAdapter,
-    GatewaySkillManagementPort,
-)
+from opensquilla.gateway.adapters.skill_management import GatewaySkillManagementAdapter
 from opensquilla.gateway.adapters.skill_management_contract import (
     register_skill_management_contract,
 )
@@ -1188,15 +1195,62 @@ async def _read_skills_search(params: dict | None, ctx: RpcContext) -> dict[str,
     return payload
 
 
+class _SkillCatalogRuntime(SkillCatalogReadPort):
+    """Read one pinned Skill catalog generation without RPC callback indirection."""
+
+    def __init__(self, ctx: RpcContext) -> None:
+        self._ctx = ctx
+
+    async def list(self, *, include_lifecycle: bool) -> Sequence[Mapping[str, Any]]:
+        params = {"includeLifecycle": True} if include_lifecycle else None
+        if include_lifecycle:
+            async with _committed_lifecycle_read(self._ctx):
+                payload = await _read_skills_list(params, self._ctx)
+        else:
+            payload = await _read_skills_list(params, self._ctx)
+        return cast(Sequence[Mapping[str, Any]], payload.get("skills", ()))
+
+    async def detail(
+        self,
+        identity: SkillIdentity,
+        *,
+        include_lifecycle: bool,
+    ) -> Mapping[str, Any]:
+        params: dict[str, Any] = {
+            **({"name": identity.name} if identity.name is not None else {}),
+            **({"instanceId": identity.instance_id} if identity.instance_id else {}),
+            **({"installId": identity.install_id} if identity.install_id else {}),
+            **({"includeLifecycle": True} if include_lifecycle else {}),
+        }
+        if include_lifecycle or bool(identity.install_id):
+            async with _committed_lifecycle_read(self._ctx):
+                return await _read_skills_get(params, self._ctx)
+        return await _read_skills_get(params, self._ctx)
+
+    async def search(self, query: SkillSearchQuery) -> SkillSearchPage:
+        payload = await _read_skills_search(
+            {
+                "query": query.query,
+                "limit": query.limit,
+                **({"source": query.source} if query.source is not None else {}),
+            },
+            self._ctx,
+        )
+        return SkillSearchPage(
+            results=cast(Sequence[Mapping[str, Any]], payload.get("results", ())),
+            diagnostics=cast(
+                Sequence[Mapping[str, Any]], payload.get("diagnostics", ())
+            ),
+            message=str(payload.get("message", "")),
+            partial=cast(bool | None, payload.get("partial")),
+            all_sources_unavailable=cast(
+                bool | None, payload.get("allSourcesUnavailable")
+            ),
+        )
+
+
 def _skill_catalog(ctx: RpcContext) -> GatewaySkillCatalogAdapter:
-    reader = GatewaySkillCatalogReadPort(
-        ctx,
-        list_reader=_read_skills_list,
-        detail_reader=_read_skills_get,
-        search_reader=_read_skills_search,
-        committed_read=lambda: _committed_lifecycle_read(ctx),
-    )
-    return GatewaySkillCatalogAdapter(reader)
+    return GatewaySkillCatalogAdapter(_SkillCatalogRuntime(ctx))
 
 
 async def _handle_skills_search(
@@ -1699,16 +1753,67 @@ async def _execute_skills_deps_install(
     }
 
 
+class _SkillManagementRuntime(SkillManagementPort):
+    """Bind typed mutations to the durable, fenced Skill management runtime."""
+
+    def __init__(self, ctx: RpcContext) -> None:
+        self._ctx = ctx
+
+    async def reload(self) -> Mapping[str, Any]:
+        return await _execute_skills_reload(None, self._ctx)
+
+    async def install(self, command: InstallSkill) -> Mapping[str, Any]:
+        return await _execute_skills_install(
+            {
+                "identifier": command.identifier,
+                "source": command.source,
+                **({"operationId": command.operation_id} if command.operation_id else {}),
+                **({"force": True} if command.force else {}),
+                **({"replaceSource": True} if command.replace_source else {}),
+                **(
+                    {"riskConfirmation": command.risk_confirmation}
+                    if command.risk_confirmation
+                    else {}
+                ),
+            },
+            self._ctx,
+        )
+
+    async def cancel(self, command: CancelSkillInstall) -> Mapping[str, Any]:
+        return await _execute_skills_install_cancel(
+            {"operationId": command.operation_id}, self._ctx
+        )
+
+    async def install_dependencies(
+        self, command: InstallSkillDependencies
+    ) -> Mapping[str, Any]:
+        return await _execute_skills_deps_install(
+            {
+                "install_id": command.dependency_id,
+                **({"name": command.name} if command.name else {}),
+                **(
+                    {"installId": command.skill_install_id}
+                    if command.skill_install_id
+                    else {}
+                ),
+                **({"instanceId": command.instance_id} if command.instance_id else {}),
+            },
+            self._ctx,
+        )
+
+    async def uninstall(self, command: UninstallSkill) -> Mapping[str, Any]:
+        return await _execute_skills_uninstall(
+            {
+                **({"name": command.name} if command.name else {}),
+                **({"installId": command.install_id} if command.install_id else {}),
+                **({"allowDrift": True} if command.allow_drift else {}),
+            },
+            self._ctx,
+        )
+
+
 def _skill_management(ctx: RpcContext) -> GatewaySkillManagementAdapter:
-    port = GatewaySkillManagementPort(
-        ctx,
-        reload=_execute_skills_reload,
-        install=_execute_skills_install,
-        cancel=_execute_skills_install_cancel,
-        install_dependencies=_execute_skills_deps_install,
-        uninstall=_execute_skills_uninstall,
-    )
-    return GatewaySkillManagementAdapter(port)
+    return GatewaySkillManagementAdapter(_SkillManagementRuntime(ctx))
 
 
 async def _handle_skills_reload(

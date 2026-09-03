@@ -9,7 +9,7 @@ from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE
 
 
-async def _ready_memory(params: dict[str, Any], ctx: RpcContext) -> dict[str, Any]:
+async def _ready_memory(params: dict[str, Any], **_runtime: Any) -> dict[str, Any]:
     return {"backend": "sqlite", "status": "ok", "pendingRepairCount": 0}
 
 
@@ -90,7 +90,7 @@ def _inactive_llm_ensemble(ctx: RpcContext) -> dict[str, Any]:
 
 
 def _patch_ready_support_surfaces(monkeypatch: pytest.MonkeyPatch, rpc_doctor: Any) -> None:
-    monkeypatch.setattr(rpc_doctor, "_handle_doctor_memory_status", _ready_memory)
+    monkeypatch.setattr(rpc_doctor, "read_memory_status", _ready_memory)
     monkeypatch.setattr(rpc_doctor, "_channel_payload", _ready_channels)
     monkeypatch.setattr(rpc_doctor, "_search_runtime_payload", _ready_search)
     monkeypatch.setattr(rpc_doctor, "_build_logs_status", _ready_logs)
@@ -254,7 +254,7 @@ async def test_doctor_status_includes_search_and_image_generation_findings(
         }
 
     monkeypatch.setattr(rpc_doctor, "_provider_payload", provider_status)
-    monkeypatch.setattr(rpc_doctor, "_handle_doctor_memory_status", _ready_memory)
+    monkeypatch.setattr(rpc_doctor, "read_memory_status", _ready_memory)
     monkeypatch.setattr(rpc_doctor, "_channel_payload", _ready_channels)
     monkeypatch.setattr(rpc_doctor, "_search_runtime_payload", search_status)
     monkeypatch.setattr(rpc_doctor, "_build_logs_status", _ready_logs)
@@ -309,7 +309,7 @@ async def test_doctor_status_explains_missing_image_generation_env_key(
 
     monkeypatch.delenv("CUSTOM_IMAGE_KEY", raising=False)
     monkeypatch.setattr(rpc_doctor, "_provider_payload", provider_status)
-    monkeypatch.setattr(rpc_doctor, "_handle_doctor_memory_status", _ready_memory)
+    monkeypatch.setattr(rpc_doctor, "read_memory_status", _ready_memory)
     monkeypatch.setattr(rpc_doctor, "_channel_payload", _ready_channels)
     monkeypatch.setattr(rpc_doctor, "_search_runtime_payload", _ready_search)
     monkeypatch.setattr(rpc_doctor, "_build_logs_status", _ready_logs)
@@ -368,7 +368,7 @@ async def test_doctor_status_reports_unknown_search_provider_as_reconfigurable(
         raise ValueError("Unknown search provider 'serpapi'. Available: brave, duckduckgo")
 
     monkeypatch.setattr(rpc_doctor, "_provider_payload", provider_status)
-    monkeypatch.setattr(rpc_doctor, "_handle_doctor_memory_status", _ready_memory)
+    monkeypatch.setattr(rpc_doctor, "read_memory_status", _ready_memory)
     monkeypatch.setattr(rpc_doctor, "_channel_payload", _ready_channels)
     monkeypatch.setattr(rpc_doctor, "_search_runtime_payload", search_status)
     monkeypatch.setattr(rpc_doctor, "_build_logs_status", _ready_logs)
@@ -626,13 +626,13 @@ async def test_doctor_status_accepts_deep_memory_flag(monkeypatch) -> None:
             ],
         }
 
-    async def memory_status(params: dict[str, Any], ctx: RpcContext) -> dict[str, Any]:
+    async def memory_status(params: dict[str, Any], **_runtime: Any) -> dict[str, Any]:
         seen_memory_params.update(params)
         return {"backend": "sqlite", "status": "ok", "pendingRepairCount": 0}
 
     monkeypatch.setattr(rpc_doctor, "_provider_payload", provider_status)
     _patch_ready_support_surfaces(monkeypatch, rpc_doctor)
-    monkeypatch.setattr(rpc_doctor, "_handle_doctor_memory_status", memory_status)
+    monkeypatch.setattr(rpc_doctor, "read_memory_status", memory_status)
 
     response = await get_dispatcher().dispatch(
         "req-1",
@@ -652,12 +652,12 @@ async def test_doctor_status_defaults_to_deep_memory_diagnostics(monkeypatch) ->
 
     seen_memory_params: dict[str, Any] = {}
 
-    async def memory_status(params: dict[str, Any], ctx: RpcContext) -> dict[str, Any]:
+    async def memory_status(params: dict[str, Any], **_runtime: Any) -> dict[str, Any]:
         seen_memory_params.update(params)
         return {"backend": "sqlite", "status": "ok", "pendingRepairCount": 0}
 
     _patch_ready_support_surfaces(monkeypatch, rpc_doctor)
-    monkeypatch.setattr(rpc_doctor, "_handle_doctor_memory_status", memory_status)
+    monkeypatch.setattr(rpc_doctor, "read_memory_status", memory_status)
 
     response = await get_dispatcher().dispatch(
         "req-1",
@@ -676,12 +676,12 @@ async def test_doctor_status_can_skip_deep_memory_diagnostics(monkeypatch) -> No
 
     seen_memory_params: dict[str, Any] = {}
 
-    async def memory_status(params: dict[str, Any], ctx: RpcContext) -> dict[str, Any]:
+    async def memory_status(params: dict[str, Any], **_runtime: Any) -> dict[str, Any]:
         seen_memory_params.update(params)
         return {"backend": "sqlite", "status": "ok", "pendingRepairCount": 0}
 
     _patch_ready_support_surfaces(monkeypatch, rpc_doctor)
-    monkeypatch.setattr(rpc_doctor, "_handle_doctor_memory_status", memory_status)
+    monkeypatch.setattr(rpc_doctor, "read_memory_status", memory_status)
 
     response = await get_dispatcher().dispatch(
         "req-1",
@@ -784,12 +784,12 @@ async def test_doctor_status_degrades_when_noncritical_collection_fails(monkeypa
             ],
         }
 
-    async def memory_status(params: dict[str, Any], ctx: RpcContext) -> dict[str, Any]:
+    async def memory_status(params: dict[str, Any], **_runtime: Any) -> dict[str, Any]:
         raise RuntimeError("memory diagnostics crashed")
 
     _patch_ready_support_surfaces(monkeypatch, rpc_doctor)
     monkeypatch.setattr(rpc_doctor, "_provider_payload", provider_status)
-    monkeypatch.setattr(rpc_doctor, "_handle_doctor_memory_status", memory_status)
+    monkeypatch.setattr(rpc_doctor, "read_memory_status", memory_status)
 
     response = await get_dispatcher().dispatch(
         "req-1",
@@ -1009,7 +1009,7 @@ def _patch_all_but_llm_ensemble(monkeypatch: pytest.MonkeyPatch, rpc_doctor: Any
         }
 
     monkeypatch.setattr(rpc_doctor, "_provider_payload", provider_status)
-    monkeypatch.setattr(rpc_doctor, "_handle_doctor_memory_status", _ready_memory)
+    monkeypatch.setattr(rpc_doctor, "read_memory_status", _ready_memory)
     monkeypatch.setattr(rpc_doctor, "_channel_payload", _ready_channels)
     monkeypatch.setattr(rpc_doctor, "_search_runtime_payload", _ready_search)
     monkeypatch.setattr(rpc_doctor, "_build_logs_status", _ready_logs)
