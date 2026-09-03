@@ -75,6 +75,7 @@ def _channel_error() -> Iterator[None]:
             details={"fields": details} if details else None,
         ) from exc
 
+
 log = structlog.get_logger(__name__)
 
 _d = get_dispatcher()
@@ -287,9 +288,7 @@ def _status_payload(ctx: RpcContext) -> dict[str, Any]:
         "memoryEmbeddingSource": s.memory_embedding_source,
         "memoryEmbeddingEnvKey": s.memory_embedding_env_key,
         "capabilityConfiguration": {
-            capability_id: {
-                "resettable": capability_resettable(cfg, capability_id=capability_id)
-            }
+            capability_id: {"resettable": capability_resettable(cfg, capability_id=capability_id)}
             for capability_id in (
                 "search",
                 "image_generation",
@@ -497,8 +496,8 @@ def _setup_application_ports(ctx: RpcContext) -> tuple[Any, Any]:
         refresh_catalog=_refresh_setup_catalog,
         broadcast_routing=_broadcast_setup_routing,
         discard_profile=discard_profile_credential_pool,
-        reconcile_profile=lambda previous, current, provider: (
-            _reconcile_saved_llm_profile(previous, current, provider)
+        reconcile_profile=lambda previous, current, provider: _reconcile_saved_llm_profile(
+            previous, current, provider
         ),
     )
     return config, runtime
@@ -585,13 +584,9 @@ async def _models_discover(params: Any, ctx: RpcContext) -> dict[str, Any]:
     return await _provider_setup(ctx).discover_primary_models(command)
 
 
-async def _image_generation_models_discover(
-    params: Any, ctx: RpcContext
-) -> dict[str, Any]:
+async def _image_generation_models_discover(params: Any, ctx: RpcContext) -> dict[str, Any]:
 
-    return await _provider_setup(ctx).discover_image_models(
-        str(_require(params, "providerId"))
-    )
+    return await _provider_setup(ctx).discover_image_models(str(_require(params, "providerId")))
 
 
 def _profile_probe_command(params: Any) -> Any:
@@ -624,18 +619,12 @@ async def _llm_profile_draft_probe(params: Any, ctx: RpcContext) -> dict[str, An
     return await _profile_lifecycle(ctx).probe_draft(_profile_probe_command(params))
 
 
-async def _llm_profile_models_discover(
-    params: Any, ctx: RpcContext
-) -> dict[str, Any]:
+async def _llm_profile_models_discover(params: Any, ctx: RpcContext) -> dict[str, Any]:
     return await _profile_lifecycle(ctx).discover_models(_profile_probe_command(params))
 
 
-async def _llm_profile_draft_models_discover(
-    params: Any, ctx: RpcContext
-) -> dict[str, Any]:
-    return await _profile_lifecycle(ctx).discover_draft_models(
-        _profile_probe_command(params)
-    )
+async def _llm_profile_draft_models_discover(params: Any, ctx: RpcContext) -> dict[str, Any]:
+    return await _profile_lifecycle(ctx).discover_draft_models(_profile_probe_command(params))
 
 
 async def _onboarding_status(_params: Any, ctx: RpcContext) -> dict[str, Any]:
@@ -710,9 +699,9 @@ def _request_changes_active_provider_connection(params: Any, cfg: Any) -> bool:
         canonical_tokenrhythm_base_url,
     )
 
-    requested_provider = str(
-        params.get("providerId") or getattr(llm, "provider", "") or ""
-    ).strip().lower()
+    requested_provider = (
+        str(params.get("providerId") or getattr(llm, "provider", "") or "").strip().lower()
+    )
 
     comparisons = (
         ("apiKey", "api_key"),
@@ -800,9 +789,7 @@ async def _provider_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
             proxy=str(_param(params, "proxy", "")),
             preset_id=str(_param(params, "presetId", "")),
             router_action=str(_param(params, "routerAction", "preserve")),
-            image_generation_intent=str(
-                _param(params, "imageGenerationIntent", "preserve")
-            ),
+            image_generation_intent=str(_param(params, "imageGenerationIntent", "preserve")),
         )
         result = await _provider_setup(ctx).configure_primary(command)
     return result.to_payload()
@@ -888,9 +875,7 @@ async def _llm_profile_active_remove(params: Any, ctx: RpcContext) -> dict[str, 
     replacement_provider_id = str(_require(params, "replacementProviderId"))
     replacement_model = str(_param(params, "replacementModel", "") or "")
     router_action = str(_param(params, "routerAction", "preserve"))
-    image_generation_intent = str(
-        _param(params, "imageGenerationIntent", "preserve")
-    )
+    image_generation_intent = str(_param(params, "imageGenerationIntent", "preserve"))
     try:
         result = await _profile_lifecycle(ctx).remove_active(
             RemoveActiveProfile(
@@ -903,12 +888,8 @@ async def _llm_profile_active_remove(params: Any, ctx: RpcContext) -> dict[str, 
         )
     except LlmProfileActivationError as exc:
         code_by_reason = {
-            "primary_pool_unsupported": (
-                "onboarding.llmProfile.primary_pool_unsupported"
-            ),
-            "router_provider_conflict": (
-                "onboarding.llmProfile.router_provider_conflict"
-            ),
+            "primary_pool_unsupported": ("onboarding.llmProfile.primary_pool_unsupported"),
+            "router_provider_conflict": ("onboarding.llmProfile.router_provider_conflict"),
         }
         raise RpcHandlerError(
             code_by_reason.get(exc.reason, "onboarding.llmProfile.invalid"),
@@ -967,12 +948,8 @@ async def _llm_profile_activate(params: Any, ctx: RpcContext) -> dict[str, Any]:
         )
     except LlmProfileActivationError as exc:
         code_by_reason = {
-            "primary_pool_unsupported": (
-                "onboarding.llmProfile.primary_pool_unsupported"
-            ),
-            "router_provider_conflict": (
-                "onboarding.llmProfile.router_provider_conflict"
-            ),
+            "primary_pool_unsupported": ("onboarding.llmProfile.primary_pool_unsupported"),
+            "router_provider_conflict": ("onboarding.llmProfile.router_provider_conflict"),
         }
         code = code_by_reason.get(exc.reason, "onboarding.llmProfile.invalid")
         details = {
@@ -1204,9 +1181,7 @@ async def _llm_profile_draft_probe_impl(params: Any, ctx: RpcContext) -> dict[st
     return result.to_payload()
 
 
-async def _llm_profile_models_discover_impl(
-    params: Any, ctx: RpcContext
-) -> dict[str, Any]:
+async def _llm_profile_models_discover_impl(params: Any, ctx: RpcContext) -> dict[str, Any]:
     """Discover picker-safe models through one stored profile deployment."""
     from opensquilla.onboarding.probe import discover_selectable_provider_models
 
@@ -1242,9 +1217,7 @@ async def _llm_profile_models_discover_impl(
     return result.to_payload()
 
 
-async def _llm_profile_draft_models_discover_impl(
-    params: Any, ctx: RpcContext
-) -> dict[str, Any]:
+async def _llm_profile_draft_models_discover_impl(params: Any, ctx: RpcContext) -> dict[str, Any]:
     """Discover models through the editor's unsaved profile deployment."""
     from opensquilla.onboarding.probe import discover_selectable_provider_models
 
@@ -1415,8 +1388,8 @@ async def _provider_credential_reveal(params: Any, ctx: RpcContext) -> dict[str,
     credentials = RpcContextCredentialResolutionPort(
         ctx,
         reveal=_active_llm_credential_reveal_payload,
-        describe=lambda current, provider, active: (
-            _credential_clear_effective_payload(current, provider, active=active)
+        describe=lambda current, provider, active: _credential_clear_effective_payload(
+            current, provider, active=active
         ),
     )
     return ProviderCredentials(
@@ -1439,8 +1412,8 @@ async def _provider_credential_clear(params: Any, ctx: RpcContext) -> dict[str, 
     credentials = RpcContextCredentialResolutionPort(
         ctx,
         reveal=_active_llm_credential_reveal_payload,
-        describe=lambda current, provider, active: (
-            _credential_clear_effective_payload(current, provider, active=active)
+        describe=lambda current, provider, active: _credential_clear_effective_payload(
+            current, provider, active=active
         ),
     )
     with _validation_error("onboarding.provider.invalid"):
@@ -1511,13 +1484,9 @@ async def _models_discover_impl(params: Any, ctx: RpcContext) -> dict[str, Any]:
             api_key_env=api_key_env,
             base_url=base_url,
             proxy=proxy,
-            allow_default_api_key_env=(
-                not same_provider or reuse_stored_credentials
-            ),
+            allow_default_api_key_env=(not same_provider or reuse_stored_credentials),
             force_refresh=force_refresh,
-            persist_catalog=(
-                same_provider and reuse_stored_credentials and not request_overrides
-            ),
+            persist_catalog=(same_provider and reuse_stored_credentials and not request_overrides),
             catalog_config=cfg,
         )
     return result.to_payload()
@@ -1625,9 +1594,7 @@ async def _channel_probe(params: Any, ctx: RpcContext) -> dict[str, Any]:
         "probeKind": "local_validation",
         "restartRequired": True,
         "entry": redact_channel_entry(type_name, normalized),
-        "warnings": [
-            "Configuration is locally valid; no provider connection was attempted."
-        ],
+        "warnings": ["Configuration is locally valid; no provider connection was attempted."],
     }
 
 
@@ -1794,9 +1761,7 @@ async def _audio_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
 async def _capability_reset(params: Any, ctx: RpcContext) -> dict[str, Any]:
 
     with _validation_error("onboarding.capability.invalid"):
-        result = await _capability_setup(ctx).reset(
-            str(_require(params, "capabilityId"))
-        )
+        result = await _capability_setup(ctx).reset(str(_require(params, "capabilityId")))
     return result.to_payload()
 
 
@@ -1937,9 +1902,7 @@ _PLATFORM_SETUP_IMPLEMENTATIONS = {
     "onboarding.llmProfile.probe": _llm_profile_probe,
     "onboarding.llmProfile.draft.probe": _llm_profile_draft_probe,
     "onboarding.llmProfile.models.discover": _llm_profile_models_discover,
-    "onboarding.llmProfile.draft.models.discover": (
-        _llm_profile_draft_models_discover
-    ),
+    "onboarding.llmProfile.draft.models.discover": (_llm_profile_draft_models_discover),
     "onboarding.router.configure": _router_configure,
     "onboarding.ensemble.configure": _ensemble_configure,
     "onboarding.search.configure": _search_configure,
