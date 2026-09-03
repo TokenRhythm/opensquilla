@@ -223,9 +223,7 @@ F2_TRANSPORT_FOUNDATION_FILES = (
     "opensquilla-webui/src/adapters/gateway/privateTransports.ts",
     "src/opensquilla/gateway/adapters/contract_method.py",
 )
-F2_GATEWAY_COMPOSITION_ROOT = (
-    "opensquilla-webui/src/adapters/gateway/gatewayAdapters.ts"
-)
+F2_GATEWAY_COMPOSITION_ROOT = "opensquilla-webui/src/adapters/gateway/gatewayAdapters.ts"
 # F2 adds three explicitly reviewed HTTP hardening slices on top of the
 # initial 849-line foundation: 58 lines for body lifecycle ownership, 103
 # lines for filename/method/body validation (less 9 lines from native brand
@@ -443,7 +441,14 @@ def _mapping_expression(
     if isinstance(node, ast.Name):
         return node.id in bindings
     if isinstance(node, ast.Attribute):
-        return _references_name(node, semantic_parameters | bindings)
+        return node.attr in {
+            "attributes",
+            "filters",
+            "options",
+            "params",
+            "payload",
+            "values",
+        } and _references_name(node, semantic_parameters | bindings)
     if isinstance(node, ast.Call):
         name = _terminal_ast_name(node.func)
         return (name == "dict" or name.endswith(("_params", "_payload"))) and _references_name(
@@ -709,9 +714,7 @@ def test_contract_gateway_adapters_do_not_join_a_gateway_cycle() -> None:
     resolve_adapter = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_resolve_contract.py"
     goals_adapter = PACKAGE_ROOT / "gateway" / "adapters" / "goals_contract.py"
     sandbox_adapter = PACKAGE_ROOT / "gateway" / "adapters" / "sandbox_runtime_contract.py"
-    lifecycle_adapter = (
-        PACKAGE_ROOT / "gateway" / "adapters" / "session_lifecycle_contract.py"
-    )
+    lifecycle_adapter = PACKAGE_ROOT / "gateway" / "adapters" / "session_lifecycle_contract.py"
     for adapter_path in (
         SESSIONS_LIST_GATEWAY_ADAPTER,
         resolve_adapter,
@@ -767,9 +770,7 @@ def test_sandbox_application_module_is_transport_neutral_and_typed() -> None:
                 imported_typing_names.update(alias.name for alias in node.names)
 
     forbidden_imports = sorted(
-        module
-        for module in imported_modules
-        if module.startswith(forbidden_import_prefixes)
+        module for module in imported_modules if module.startswith(forbidden_import_prefixes)
     )
     leaked_wire_fields = sorted(
         {
@@ -850,9 +851,7 @@ def test_session_lifecycle_application_module_is_transport_neutral_and_typed() -
                 imported_typing_names.update(alias.name for alias in node.names)
 
     forbidden_imports = sorted(
-        module
-        for module in imported_modules
-        if module.startswith(forbidden_import_prefixes)
+        module for module in imported_modules if module.startswith(forbidden_import_prefixes)
     )
     leaked_wire_fields = sorted(
         {
@@ -1029,9 +1028,7 @@ def test_r5_gateway_adapters_depend_on_typed_ports_not_rpc_callbacks() -> None:
                     if path.name != "observability.py":
                         forbidden_imports.add("RpcContext")
                     if alias.name in forbidden_imports:
-                        violations.append(
-                            f"{relative}:{node.lineno}: imports {alias.name}"
-                        )
+                        violations.append(f"{relative}:{node.lineno}: imports {alias.name}")
 
     assert violations == [], "R5 Gateway callback seams returned:\n" + "\n".join(violations)
 
@@ -1060,9 +1057,7 @@ def test_r5_rpc_factories_bind_concrete_typed_runtime_ports() -> None:
         for binding in bindings:
             assert binding in source, f"{filename} must bind {binding}"
 
-    proposal_source = (PACKAGE_ROOT / "gateway" / "rpc_proposals.py").read_text(
-        encoding="utf-8"
-    )
+    proposal_source = (PACKAGE_ROOT / "gateway" / "rpc_proposals.py").read_text(encoding="utf-8")
     assert "opensquilla.gateway.rpc_cron" not in proposal_source
 
 
@@ -1112,9 +1107,8 @@ def test_z1_webui_legacy_transport_surface_is_closed() -> None:
         if leaked:
             forbidden_identifiers[relative] = leaked
         if (
-            ("@/stores/rpc" in source or "./stores/rpc" in source or "../stores/rpc" in source)
-            and relative not in {"main.ts", "stores/rpc.ts"}
-        ):
+            "@/stores/rpc" in source or "./stores/rpc" in source or "../stores/rpc" in source
+        ) and relative not in {"main.ts", "stores/rpc.ts"}:
             raw_store_imports.append(relative)
 
     assert forbidden_identifiers == {}, (
@@ -1148,8 +1142,7 @@ def test_f2_gateway_composition_root_stays_declarative() -> None:
     }
     leaked = [label for token, label in forbidden.items() if token in source]
     assert leaked == [], (
-        "Gateway Adapter composition root must remain declarative; found "
-        + ", ".join(leaked)
+        "Gateway Adapter composition root must remain declarative; found " + ", ".join(leaked)
     )
 
 
@@ -1346,9 +1339,7 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
         ARTIFACT_WORKBENCH_CONTRACT_METHODS,
     )
 
-    assert [
-        site for site in sites if site[2] in ARTIFACT_WORKBENCH_CONTRACT_METHODS
-    ] == []
+    assert [site for site in sites if site[2] in ARTIFACT_WORKBENCH_CONTRACT_METHODS] == []
 
 
 def test_artifact_workbench_has_no_callback_transition_path() -> None:
@@ -1610,9 +1601,7 @@ def test_production_cross_rpc_imports_are_forbidden_outside_loader() -> None:
                     relative = path.relative_to(PACKAGE_ROOT)
                     package = ("opensquilla", *relative.parent.parts)
                     base = package[: len(package) - node.level + 1]
-                    module = ".".join(
-                        (*base, *(node.module.split(".") if node.module else ()))
-                    )
+                    module = ".".join((*base, *(node.module.split(".") if node.module else ())))
                 else:
                     module = node.module or ""
                 if module:
