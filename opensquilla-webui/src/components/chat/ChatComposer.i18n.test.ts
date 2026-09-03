@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 
 import { afterEach, describe, expect, it } from 'vitest'
-import { createApp, nextTick } from 'vue'
+import { createApp, h, nextTick, ref } from 'vue'
 
 import i18n, { loadLocaleMessages } from '@/i18n'
 import type { Attachment } from '@/types/chat'
@@ -35,6 +35,46 @@ afterEach(() => {
 })
 
 describe('ChatComposer attachment localization', () => {
+  it('renders and removes the intended attachment when recovered and new IDs differ', async () => {
+    const attachments = ref<Attachment[]>([
+      {
+        kind: 'staged',
+        local_id: -1,
+        name: 'recovered.txt',
+        mime: 'text/plain',
+        file_uuid: 'recovered-upload',
+      },
+      {
+        kind: 'staged',
+        local_id: 1,
+        name: 'new.txt',
+        mime: 'text/plain',
+        file_uuid: 'new-upload',
+      },
+    ])
+    const el = document.createElement('div')
+    document.body.appendChild(el)
+    const app = createApp({
+      render: () => h(ChatComposer, {
+        ...BASE_PROPS,
+        attachments: attachments.value,
+        onRemoveAttachment: (index: number) => attachments.value.splice(index, 1),
+      } as any),
+    })
+    app.use(i18n)
+    app.mount(el)
+    await nextTick()
+
+    expect([...el.querySelectorAll('.attachment-chip__name')].map(node => node.textContent))
+      .toEqual(['recovered.txt', 'new.txt'])
+    el.querySelectorAll<HTMLButtonElement>('.attachment-remove')[0]?.click()
+    await nextTick()
+    expect([...el.querySelectorAll('.attachment-chip__name')].map(node => node.textContent))
+      .toEqual(['new.txt'])
+
+    app.unmount()
+  })
+
   it('localizes failed status, fallback file label, and retry accessibility text', async () => {
     await loadLocaleMessages('zh-Hans')
     i18n.global.locale.value = 'zh-Hans'

@@ -11,6 +11,7 @@ import {
   beginSessionHandoffDiag,
   finishSessionHandoffDiag,
 } from '@/utils/chat/sessionNavigationDiag'
+import { canonicalSessionKey } from '@/utils/chat/sessionKeys'
 
 export interface ChatUsageAccumulator {
   input: number
@@ -79,6 +80,7 @@ export interface UseChatSessionRuntimeOptions {
   resetSavingsPopupCooldown: () => void
   restoreWidgetState: () => void
   resetStreamLiveTurnState: () => void
+  retireAttachments?: () => void
   resetDraftComposer?: () => void
 }
 
@@ -120,7 +122,7 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     return (
       handoffEpoch === epoch
       && handoffTargetKey === targetKey
-      && options.sessionKey.value === sourceKey
+      && canonicalSessionKey(options.sessionKey.value) === sourceKey
     )
   }
 
@@ -181,28 +183,30 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     key: string,
     pendingQueuePolicy:
       | { kind: 'navigate' }
+      | { kind: 'draft_materialization' }
       | { kind: 'response_handoff'; ownerRequestId: string },
   ): Promise<ResponseSessionAdoptionResult | undefined> {
     if (!key) return
-    const sourceKey = options.sessionKey.value
-    const { epoch, signal: handoffSignal } = beginHandoff(key)
-    if (key === sourceKey) {
+    const targetKey = canonicalSessionKey(key)
+    const sourceKey = canonicalSessionKey(options.sessionKey.value)
+    const { epoch, signal: handoffSignal } = beginHandoff(targetKey)
+    if (targetKey === sourceKey) {
       finishHandoff(epoch, 'unchanged')
       return
     }
-    const shouldCommit = () => isCurrentHandoff(epoch, key, sourceKey)
+    const shouldCommit = () => isCurrentHandoff(epoch, targetKey, sourceKey)
 
     try {
       if (pendingQueuePolicy.kind === 'response_handoff') {
         await options.adoptPendingQueue(
-          key,
+          targetKey,
           pendingQueuePolicy.ownerRequestId,
           shouldCommit,
           handoffSignal,
         )
       } else {
         const pendingQueueSwitch = options.switchPendingQueue(
-          key,
+          targetKey,
           shouldCommit,
           handoffSignal,
         )
@@ -217,14 +221,15 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
       return
     }
 
+    if (pendingQueuePolicy.kind === 'navigate') options.retireAttachments?.()
     // Commit is deliberately synchronous from the logical cancellation
     // through the next bootstrap. unsubscribeSession sends its generation-
     // pinned frame before cancelSessionBootstrap returns, so B never waits for
     // A's ACK and no connected event can observe a half-switched route.
     options.cancelSessionBootstrap()
     resetCompactState()
-    options.beginSessionResolution?.(key)
-    options.persistSession(key, { source: 'runtime.switchToSession' })
+    options.beginSessionResolution?.(targetKey)
+    options.persistSession(targetKey, { source: 'runtime.switchToSession' })
     resetSessionRuntimeState()
     options.pendingSessionIntent.value = null
     options.applySessionRunState({ run_status: 'idle' })
@@ -246,7 +251,7 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
       () => {
         if (
           handoffEpoch === epoch
-          && options.sessionKey.value === key
+          && canonicalSessionKey(options.sessionKey.value) === targetKey
         ) {
           void Promise.resolve()
             .then(() => options.loadCurrentSessionUsage())
@@ -268,7 +273,7 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     if (
       subscriptionOutcome.cancelled === true
       && handoffEpoch === epoch
-      && options.sessionKey.value === key
+      && canonicalSessionKey(options.sessionKey.value) === targetKey
     ) {
       const current = options.currentSessionBootstrap?.()
       if (current && current.generation !== bootstrap.generation) {
@@ -279,7 +284,10 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
         subscriptionOutcome = await current.live
       }
     }
-    if (handoffEpoch !== epoch || options.sessionKey.value !== key) return
+    if (
+      handoffEpoch !== epoch
+      || canonicalSessionKey(options.sessionKey.value) !== targetKey
+    ) return
     return {
       authoritative: subscriptionOutcome?.authoritative === true,
       authoritativeIdle: subscriptionOutcome?.authoritative === true
@@ -297,25 +305,31 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     return switchSession(key, { kind: 'response_handoff', ownerRequestId })
   }
 
+  function adoptMaterializedSession(key: string) {
+    return switchSession(key, { kind: 'draft_materialization' })
+  }
+
   async function rebindDraftSession(
     key: string,
     guard: DraftSessionRebindGuard,
   ): Promise<SessionSubscriptionResult> {
-    const sourceSessionKey = options.sessionKey.value
-    if (!key || !guard(sourceSessionKey)) return false
-    const { epoch, signal: handoffSignal } = beginHandoff(key)
-    if (key === sourceSessionKey) {
+    const guardedSourceKey = options.sessionKey.value
+    if (!key || !guard(guardedSourceKey)) return false
+    const sourceKey = canonicalSessionKey(guardedSourceKey)
+    const targetKey = canonicalSessionKey(key)
+    const { epoch, signal: handoffSignal } = beginHandoff(targetKey)
+    if (targetKey === sourceKey) {
       finishHandoff(epoch, 'unchanged')
       return false
     }
     const shouldCommit = () => (
-      isCurrentHandoff(epoch, key, sourceSessionKey)
-      && guard(sourceSessionKey)
+      isCurrentHandoff(epoch, targetKey, sourceKey)
+      && guard(guardedSourceKey)
     )
 
     try {
       const pendingQueueSwitch = options.switchPendingQueue(
-        key,
+        targetKey,
         shouldCommit,
         handoffSignal,
       )
@@ -332,7 +346,7 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     resetCompactState()
     // A recovered provisional draft remains a draft: do not write it to the URL
     // or active-session storage before the first accepted send.
-    options.sessionKey.value = key
+    options.sessionKey.value = targetKey
     resetSessionRuntimeState()
     options.pendingSessionIntent.value = 'new_chat'
     options.applySessionRunState({ run_status: 'idle' })
@@ -345,7 +359,8 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
       finishHandoff(epoch, 'committed')
     }
     const outcome = await live
-    return handoffEpoch === epoch && options.sessionKey.value === key
+    return handoffEpoch === epoch
+      && canonicalSessionKey(options.sessionKey.value) === targetKey
       ? outcome
       : false
   }
@@ -353,13 +368,17 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
   // Drafts keep their provisional key out of the URL and local storage; it
   // only persists once the first message actually goes out.
   async function startDraftSession(agentId?: string) {
-    const key = options.createSessionKey(agentId)
-    const sourceKey = options.sessionKey.value
-    const { epoch, signal: handoffSignal } = beginHandoff(key)
-    const shouldCommit = () => isCurrentHandoff(epoch, key, sourceKey)
+    const targetKey = canonicalSessionKey(options.createSessionKey(agentId))
+    const sourceKey = canonicalSessionKey(options.sessionKey.value)
+    const { epoch, signal: handoffSignal } = beginHandoff(targetKey)
+    if (targetKey === sourceKey) {
+      finishHandoff(epoch, 'unchanged')
+      return
+    }
+    const shouldCommit = () => isCurrentHandoff(epoch, targetKey, sourceKey)
     try {
       const pendingQueueSwitch = options.switchPendingQueue(
-        key,
+        targetKey,
         shouldCommit,
         handoffSignal,
       )
@@ -372,9 +391,10 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
       finishHandoff(epoch, 'superseded')
       return
     }
+    options.retireAttachments?.()
     options.cancelSessionBootstrap()
     resetCompactState()
-    options.sessionKey.value = key
+    options.sessionKey.value = targetKey
     resetSessionRuntimeState()
     // A brand-new provisional key cannot own a durable Gateway task yet. Its
     // first send must not wait for optional draft bootstrap metadata.
@@ -393,6 +413,7 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     resetCurrentSessionAfterSlash,
     startDraftSession,
     switchToSession,
+    adoptMaterializedSession,
     adoptResponseSession,
     rebindDraftSession,
   }

@@ -953,6 +953,7 @@ import {
   optionalSessionRpcCallOptions,
 } from '@/composables/chat/sessionBootstrapAdmission'
 import { useChatSessionRuntime } from '@/composables/chat/useChatSessionRuntime'
+import { switchChatViewSession } from '@/views/chatViewSessionNavigation'
 import {
   useChatSessionSubscription,
 } from '@/composables/chat/useChatSessionSubscription'
@@ -1870,6 +1871,7 @@ const {
   onFileInputChange,
   addAttachments,
   removeAttachment,
+  retireAttachments,
   retryAttachment,
   hasPendingAttachmentWork,
   prepareAttachmentsForSend,
@@ -2977,9 +2979,9 @@ const chatSessionRuntime = useChatSessionRuntime({
   resetSavingsPopupCooldown,
   restoreWidgetState,
   resetStreamLiveTurnState,
+  retireAttachments,
   resetDraftComposer: () => {
     inputText.value = ''
-    pendingAttachments.value = []
     resetComposerInputHistory()
     autoResizeTextarea()
   },
@@ -2988,17 +2990,26 @@ const {
   resetCurrentSessionAfterSlash,
   startDraftSession,
   switchToSession: switchRuntimeToSession,
+  adoptMaterializedSession: adoptRuntimeMaterializedSession,
   adoptResponseSession,
   rebindDraftSession,
 } = chatSessionRuntime
 switchToPlanSession = switchToSession
 
 async function switchToSession(nextSessionKey: string) {
-  const outcome = await switchRuntimeToSession(nextSessionKey)
-  if (outcome?.authoritative) {
-    await handleAuthoritativeSessionSubscription(nextSessionKey)
-  }
-  return outcome
+  return switchChatViewSession(
+    nextSessionKey,
+    switchRuntimeToSession,
+    handleAuthoritativeSessionSubscription,
+  )
+}
+
+async function adoptMaterializedSession(nextSessionKey: string) {
+  return switchChatViewSession(
+    nextSessionKey,
+    adoptRuntimeMaterializedSession,
+    handleAuthoritativeSessionSubscription,
+  )
 }
 
 const metaSkillSetup = useMetaSkillSetup({
@@ -3150,7 +3161,7 @@ const chatGoals = useChatGoals({
       ) return ''
     }
     if (workspaceId) freshTaskDraft.bindMaterializedProjectTask(key, workspaceId)
-    await switchToSession(key)
+    await adoptMaterializedSession(key)
     return key
   },
   ensureSubscribed: async key => {
@@ -3613,6 +3624,7 @@ function isPristineDraftForRecovery(expectedSessionKey: string, agentId: string)
     && pendingSessionIntent.value === 'new_chat'
     && messages.value.length === 0
     && inputText.value.length === 0
+    && !attachmentWorkBusy.value
     && pendingAttachments.value.length === 0
     && pendingQueue.value.length === 0
     && pendingAutoSend.value.length === 0

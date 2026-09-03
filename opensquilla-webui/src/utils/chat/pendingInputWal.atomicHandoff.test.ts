@@ -269,7 +269,219 @@ class ControlledObjectStore {
   }
 }
 
-describe('BrowserPendingInputWal atomic handoff cancellation', () => {
+describe('BrowserPendingInputWal atomic mutations', () => {
+  it('acquires a cancelling tombstone only from the expected live revision', async () => {
+    const factory = new ControlledIdbFactory()
+    const wal = createPendingInputWal(factory.idbFactory)
+    expect(wal).not.toBeNull()
+    const localOnly: PendingInputWalRecord = {
+      schemaVersion: 1,
+      pendingInputId: 'pending-cancel-cas',
+      sessionKey: 'agent:main:webchat:cancel-cas',
+      clientRequestId: 'request-cancel-cas',
+      clientMessageId: 'message-cancel-cas',
+      text: 'cancel only while this row is live',
+      attachments: [],
+      intent: null,
+      state: 'local_only',
+      mayHaveServerCopy: false,
+      walRevision: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    const cancelling = {
+      ...localOnly,
+      state: 'cancelling' as const,
+      retainAfterCancel: true,
+      walRevision: 2,
+    }
+    await wal!.put(localOnly)
+
+    await expect(wal!.beginCancellation!(cancelling, 1)).resolves.toMatchObject({
+      applied: true,
+      record: {
+        state: 'cancelling',
+        retainAfterCancel: true,
+        walRevision: 2,
+      },
+    })
+    await expect(wal!.beginCancellation!(cancelling, 1)).resolves.toMatchObject({
+      applied: false,
+      record: { state: 'cancelling', walRevision: 2 },
+    })
+    await wal!.delete(localOnly.pendingInputId)
+    await expect(wal!.beginCancellation!(cancelling, 2)).resolves.toEqual({
+      applied: false,
+      record: null,
+    })
+    expect(factory.record(PENDING_STORE, localOnly.pendingInputId)).toBeUndefined()
+    wal!.close()
+  })
+
+  it('acquires and retains a canonical cancellation from a legacy alias row', async () => {
+    const factory = new ControlledIdbFactory()
+    const wal = createPendingInputWal(factory.idbFactory)
+    expect(wal).not.toBeNull()
+    const legacySession = 'agent:default:webchat:cancel-alias'
+    const canonicalSession = 'agent:main:webchat:cancel-alias'
+    const legacy: PendingInputWalRecord = {
+      schemaVersion: 1,
+      pendingInputId: 'pending-cancel-alias',
+      sessionKey: legacySession,
+      clientRequestId: 'request-cancel-alias',
+      clientMessageId: 'message-cancel-alias',
+      text: 'cancel the legacy alias row',
+      attachments: [],
+      intent: null,
+      state: 'local_only',
+      mayHaveServerCopy: false,
+      walRevision: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    const cancelling = {
+      ...legacy,
+      sessionKey: canonicalSession,
+      state: 'cancelling' as const,
+      retainAfterCancel: true,
+      walRevision: 2,
+    }
+    await wal!.put(legacy)
+
+    await expect(wal!.beginCancellation!(cancelling, 1, [legacySession]))
+      .resolves.toMatchObject({
+        applied: true,
+        record: { sessionKey: canonicalSession, state: 'cancelling', walRevision: 2 },
+      })
+    await expect(wal!.retainCancelled!({
+      ...cancelling,
+      state: 'local_only',
+      walRevision: 3,
+    }, 2, [legacySession])).resolves.toMatchObject({
+      applied: true,
+      record: { sessionKey: canonicalSession, state: 'local_only', walRevision: 3 },
+    })
+    wal!.close()
+  })
+
+  it('does not retain a cancelled draft after another owner deletes its WAL row', async () => {
+    const factory = new ControlledIdbFactory()
+    const wal = createPendingInputWal(factory.idbFactory)
+    expect(wal).not.toBeNull()
+    const cancelling: PendingInputWalRecord = {
+      schemaVersion: 1,
+      pendingInputId: 'pending-retain-cas',
+      sessionKey: 'agent:main:webchat:retain-cas',
+      clientRequestId: 'request-retain-cas',
+      clientMessageId: 'message-retain-cas',
+      text: 'retain only while this tombstone owns the row',
+      attachments: [],
+      intent: null,
+      state: 'cancelling',
+      mayHaveServerCopy: false,
+      retainAfterCancel: true,
+      walRevision: 2,
+      createdAt: 1,
+      updatedAt: 2,
+    }
+    const retained = {
+      ...cancelling,
+      state: 'local_only' as const,
+      walRevision: 3,
+    }
+    await wal!.put(cancelling)
+    await wal!.delete(cancelling.pendingInputId)
+
+    await expect(wal!.retainCancelled!(retained, 2)).resolves.toEqual({
+      applied: false,
+      record: null,
+    })
+    expect(factory.record(PENDING_STORE, cancelling.pendingInputId)).toBeUndefined()
+
+    await wal!.put(cancelling)
+    await expect(wal!.retainCancelled!(retained, 2)).resolves.toMatchObject({
+      applied: true,
+      record: {
+        state: 'local_only',
+        retainAfterCancel: true,
+        walRevision: 3,
+      },
+    })
+    expect(factory.record(PENDING_STORE, cancelling.pendingInputId)).toMatchObject({
+      state: 'local_only',
+      walRevision: 3,
+    })
+    await expect(wal!.retainCancelled!(retained, 2)).resolves.toMatchObject({
+      applied: false,
+      record: {
+        state: 'local_only',
+        walRevision: 3,
+      },
+    })
+    wal!.close()
+  })
+
+  it('commits equivalent legacy session aliases under the canonical reorder owner', async () => {
+    const factory = new ControlledIdbFactory()
+    const wal = createPendingInputWal(factory.idbFactory)
+    expect(wal).not.toBeNull()
+    const canonicalSession = 'agent:main:webchat:alias-order'
+    const legacySession = 'agent:default:webchat:alias-order'
+    const record = (
+      pendingInputId: string,
+      sessionKey: string,
+      text: string,
+      position: number,
+    ): PendingInputWalRecord => ({
+      schemaVersion: 1,
+      pendingInputId,
+      sessionKey,
+      clientRequestId: `request-${pendingInputId}`,
+      clientMessageId: `message-${pendingInputId}`,
+      text,
+      attachments: [],
+      intent: null,
+      state: 'local_only',
+      mayHaveServerCopy: false,
+      position,
+      walRevision: 1,
+      createdAt: position + 1,
+      updatedAt: position + 1,
+    })
+    const legacy = record('legacy-row', legacySession, 'legacy', 0)
+    const canonical = record('canonical-row', canonicalSession, 'canonical', 1)
+    await wal!.put(legacy)
+    await wal!.put(canonical)
+
+    const result = await wal!.commitOrder!(
+      canonicalSession,
+      ['canonical-row', 'legacy-row'],
+      { 'legacy-row': 1, 'canonical-row': 1 },
+      [canonicalSession, legacySession],
+    )
+
+    expect(result.records).toMatchObject([
+      {
+        pendingInputId: 'canonical-row',
+        sessionKey: canonicalSession,
+        position: 0,
+        walRevision: 2,
+      },
+      {
+        pendingInputId: 'legacy-row',
+        sessionKey: canonicalSession,
+        position: 1,
+        walRevision: 2,
+      },
+    ])
+    expect(factory.record(PENDING_STORE, 'legacy-row')).toMatchObject({
+      sessionKey: canonicalSession,
+      position: 1,
+      walRevision: 2,
+    })
+    wal!.close()
+  })
+
   it('rolls back both stores when the handoff epoch aborts after both writes are queued', async () => {
     const factory = new ControlledIdbFactory()
     const wal = createPendingInputWal(factory.idbFactory)
@@ -360,6 +572,60 @@ describe('BrowserPendingInputWal atomic handoff cancellation', () => {
       walRevision: 2,
     })
 
+    wal!.close()
+  })
+
+  it('accepts a handoff without migrating its cancellation tombstone', async () => {
+    const factory = new ControlledIdbFactory()
+    const wal = createPendingInputWal(factory.idbFactory)
+    expect(wal).not.toBeNull()
+    const ownerRequestId = 'owner-cancelling-handoff'
+    const sourceSessionKey = 'agent:main:webchat:cancel-source'
+    const targetSessionKey = 'agent:main:webchat:cancel-target'
+    const pending: PendingInputWalRecord = {
+      schemaVersion: 1,
+      pendingInputId: 'pending-cancelling-handoff',
+      sessionKey: sourceSessionKey,
+      clientRequestId: 'request-cancelling-handoff',
+      clientMessageId: 'message-cancelling-handoff',
+      text: 'do not migrate the tombstone',
+      attachments: [],
+      intent: null,
+      ownerRequestId,
+      state: 'cancelling',
+      mayHaveServerCopy: true,
+      walRevision: 2,
+      createdAt: 1,
+      updatedAt: 2,
+    }
+    await wal!.put(pending)
+    await wal!.putHandoff!({
+      schemaVersion: 1,
+      ownerRequestId,
+      requestSessionKey: sourceSessionKey,
+      clientRequestId: ownerRequestId,
+      clientMessageId: pending.clientMessageId,
+      params: {
+        sessionKey: sourceSessionKey,
+        message: pending.text,
+        clientRequestId: ownerRequestId,
+        clientMessageId: pending.clientMessageId,
+      },
+      composerText: pending.text,
+      recoveryAttachments: [],
+      state: 'submitting',
+      createdAt: 1,
+      updatedAt: 1,
+    })
+
+    const committed = await wal!.acceptHandoff!(ownerRequestId, targetSessionKey)
+
+    expect(committed?.records).toEqual([])
+    expect(committed?.handoff).toMatchObject({
+      state: 'accepted',
+      acceptedSessionKey: targetSessionKey,
+    })
+    expect(factory.record(PENDING_STORE, pending.pendingInputId)).toEqual(pending)
     wal!.close()
   })
 })

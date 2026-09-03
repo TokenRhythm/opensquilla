@@ -1,4 +1,10 @@
 import { expect, test, type Download, type Page } from '@playwright/test'
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/chat/new'
 const HISTORY_IMAGE_DATA = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII='
@@ -42,10 +48,21 @@ async function mockRpc(page: Page, capturedSends: CapturedSend[], options: MockR
     ws.onMessage(message => {
       try {
         const frame = JSON.parse(String(message))
+        if (frame?.type === 'ping') {
+          ws.send(JSON.stringify({ type: 'pong' }))
+          return
+        }
         if (frame?.type !== 'req') return
         const method = String(frame.method || '')
+        const sessionKey = String(frame.params?.key || frame.params?.sessionKey || '')
         if (method === 'connect') {
-          ws.send(JSON.stringify({ protocol: 3, policy: { tick_interval_ms: 30000 } }))
+          ws.send(JSON.stringify({
+            protocol: 3,
+            policy: {
+              tick_interval_ms: 30000,
+              concurrent_history_reads: true,
+            },
+          }))
           return
         }
         if (method === 'chat.send') {
@@ -78,7 +95,7 @@ async function mockRpc(page: Page, capturedSends: CapturedSend[], options: MockR
         }
         if (method === 'chat.history') {
           options.historyRequests?.push(frame.params || {})
-          ws.send(wsResponse(String(frame.id), { messages: historyMessages, has_more: false }))
+          ws.send(wsResponse(String(frame.id), chatHistoryPayload(historyMessages)))
           return
         }
 
@@ -91,12 +108,9 @@ async function mockRpc(page: Page, capturedSends: CapturedSend[], options: MockR
             skills: {},
           },
           'sessions.list': { sessions: [], has_more: false },
-          'sessions.messages.subscribe': {
-            subscribed: true,
-            replay_complete: true,
-            current_stream_seq: 0,
-            run_status: 'idle',
-          },
+          'sessions.messages.snapshot': sessionMessagesSnapshotPayload(sessionKey),
+          'sessions.messages.subscribe': sessionMessagesSubscribePayload(sessionKey),
+          'sessions.messages.hydrate': sessionMessagesHydratePayload(sessionKey),
           'usage.status': { sessions: [] },
         }
 

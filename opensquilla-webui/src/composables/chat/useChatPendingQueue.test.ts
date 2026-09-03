@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import {
   useChatPendingQueue,
+  type PendingQueueOwnerContext,
   type UseChatPendingQueueOptions,
 } from './useChatPendingQueue'
 import { createLegacyPendingInputQueue } from '@/adapters/gateway/pendingInputQueueV4'
@@ -115,12 +116,38 @@ function memoryWal(initial: PendingInputWalRecord[] = []) {
         records.set(record.pendingInputId, structuredClone(record))
       }
     }),
+    retainCancelled: vi.fn(async (record, expectedWalRevision) => {
+      const current = records.get(record.pendingInputId)
+      if (
+        !current
+        || current.sessionKey !== record.sessionKey
+        || current.clientRequestId !== record.clientRequestId
+        || current.clientMessageId !== record.clientMessageId
+        || current.state !== 'cancelling'
+        || current.retainAfterCancel !== true
+        || (current.walRevision ?? 1) !== expectedWalRevision
+      ) return {
+        applied: false,
+        record: current ? structuredClone(current) : null,
+      }
+      const retained = {
+        ...structuredClone(record),
+        state: 'local_only' as const,
+        retainAfterCancel: true,
+        walRevision: expectedWalRevision + 1,
+        updatedAt: Date.now(),
+      }
+      records.set(record.pendingInputId, retained)
+      return { applied: true, record: structuredClone(retained) }
+    }),
     commitOrder: vi.fn(async (
       sessionKey: string,
       orderedIds: string[],
       expectedWalRevisions: Record<string, number>,
+      equivalentSessionKeys: string[] = [],
     ) => {
-      const current = [...records.values()].filter(record => record.sessionKey === sessionKey)
+      const sessionKeys = new Set([sessionKey, ...equivalentSessionKeys])
+      const current = [...records.values()].filter(record => sessionKeys.has(record.sessionKey))
       if (
         current.length !== orderedIds.length
         || orderedIds.some(id => !current.some(record => record.pendingInputId === id))
@@ -131,6 +158,7 @@ function memoryWal(initial: PendingInputWalRecord[] = []) {
         if (expectedWalRevisions[pendingInputId] !== revision) throw new Error('conflict')
         const next = {
           ...record,
+          sessionKey,
           position,
           walRevision: revision + 1,
           updatedAt: Date.now(),
@@ -164,6 +192,7 @@ function memoryWal(initial: PendingInputWalRecord[] = []) {
       handoffs.set(ownerRequestId, handoff)
       const moved = [...records.values()]
         .filter(record => record.ownerRequestId === ownerRequestId)
+        .filter(record => record.state !== 'cancelling')
         .map(record => ({
           ...record,
           sessionKey: acceptedSessionKey,
@@ -182,6 +211,97 @@ function memoryWal(initial: PendingInputWalRecord[] = []) {
     close: vi.fn(),
   }
   return { records, handoffs, wal }
+}
+
+function enableAtomicPendingMutations(
+  wal: PendingInputWal,
+  records: Map<string, PendingInputWalRecord>,
+) {
+  const compareAndSwap: NonNullable<PendingInputWal['compareAndSwapPendingInput']> = vi.fn(
+    async (record, expectedWalRevision, equivalentSessionKeys = []) => {
+      const current = records.get(record.pendingInputId)
+      const sessionKeys = new Set([record.sessionKey, ...equivalentSessionKeys])
+      if (
+        !current
+        || !sessionKeys.has(current.sessionKey)
+        || current.clientRequestId !== record.clientRequestId
+        || current.clientMessageId !== record.clientMessageId
+        || (current.walRevision ?? 1) !== expectedWalRevision
+      ) {
+        return {
+          applied: false,
+          record: current ? structuredClone(current) : null,
+        }
+      }
+      const updated = {
+        ...structuredClone(record),
+        walRevision: expectedWalRevision + 1,
+        updatedAt: Date.now(),
+      }
+      records.set(record.pendingInputId, updated)
+      return { applied: true, record: structuredClone(updated) }
+    },
+  )
+  wal.compareAndSwapPendingInput = compareAndSwap
+  wal.compareAndDeletePendingInput = vi.fn(
+    async (record, expectedWalRevision, equivalentSessionKeys = []) => {
+      const current = records.get(record.pendingInputId)
+      const sessionKeys = new Set([record.sessionKey, ...equivalentSessionKeys])
+      if (
+        !current
+        || !sessionKeys.has(current.sessionKey)
+        || current.clientRequestId !== record.clientRequestId
+        || current.clientMessageId !== record.clientMessageId
+        || (current.walRevision ?? 1) !== expectedWalRevision
+      ) return {
+        applied: false,
+        record: current ? structuredClone(current) : null,
+      }
+      records.delete(record.pendingInputId)
+      return { applied: true, record: null }
+    },
+  )
+  const compareAndSwapMany: NonNullable<PendingInputWal['compareAndSwapPendingInputs']> = vi.fn(
+    async (
+      nextRecords: PendingInputWalRecord[],
+      expectedWalRevisions: Record<string, number>,
+      equivalentSessionKeys: string[] = [],
+    ) => {
+      const targetSessionKey = nextRecords[0]?.sessionKey || ''
+      const sessionKeys = new Set([targetSessionKey, ...equivalentSessionKeys])
+      const current = [...records.values()].filter(record => sessionKeys.has(record.sessionKey))
+      const currentById = new Map(current.map(record => [record.pendingInputId, record]))
+      const valid = Boolean(targetSessionKey)
+        && nextRecords.length === current.length
+        && new Set(nextRecords.map(record => record.pendingInputId)).size === nextRecords.length
+        && nextRecords.every(record => {
+          const live = currentById.get(record.pendingInputId)
+          return live
+            && live.clientRequestId === record.clientRequestId
+            && live.clientMessageId === record.clientMessageId
+            && (live.walRevision ?? 1) === expectedWalRevisions[record.pendingInputId]
+        })
+      if (!valid) {
+        return { applied: false, records: current.map(record => structuredClone(record)) }
+      }
+      const updated = nextRecords.map(record => ({
+        ...structuredClone(record),
+        walRevision: expectedWalRevisions[record.pendingInputId]! + 1,
+        updatedAt: Date.now(),
+      }))
+      for (const record of updated) records.set(record.pendingInputId, record)
+      return { applied: true, records: updated.map(record => structuredClone(record)) }
+    },
+  )
+  wal.compareAndSwapPendingInputs = compareAndSwapMany
+  wal.beginCancellation = vi.fn(async (record, expectedWalRevision, equivalentSessionKeys) => (
+    compareAndSwap(
+      { ...record, state: 'cancelling' },
+      expectedWalRevision,
+      equivalentSessionKeys,
+    )
+  ))
+  return compareAndSwap
 }
 
 class TestBroadcastChannel {
@@ -632,6 +752,120 @@ describe('useChatPendingQueue delivery state', () => {
       expect(queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('staged')
     })
     queue.cleanup()
+  })
+
+  it('does not restage an attachment after removal during delayed preparation', async () => {
+    const { wal, records } = memoryWal()
+    enableAtomicPendingMutations(wal, records)
+    let markPreparationStarted!: () => void
+    let releasePreparation!: () => void
+    const preparationStarted = new Promise<void>(resolve => { markPreparationStarted = resolve })
+    const preparationGate = new Promise<void>(resolve => { releasePreparation = resolve })
+    const prepareAttachmentsForSend = vi.fn(async () => {
+      markPreparationStarted()
+      await preparationGate
+      return true
+    })
+    const rpcCall = vi.fn(async (method: string): Promise<unknown> => {
+      if (method === 'sessions.pending_inputs.list') return { items: [] }
+      if (method === 'sessions.pending_inputs.cancel') return { cancelled: true }
+      throw new Error(`unexpected method: ${method}`)
+    })
+    const rpc: LegacyQueueRpc = {
+      call: <T = unknown>(method: string, params?: Record<string, unknown>) => {
+        void params
+        return rpcCall(method) as Promise<T>
+      },
+    }
+    const { inputText, pendingAttachments, queue } = makeQueue(
+      undefined,
+      () => false,
+      undefined,
+      undefined,
+      {
+        pendingInputWal: wal,
+        rpc,
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
+        prepareAttachmentsForSend,
+      },
+    )
+    try {
+      inputText.value = 'remove during attachment preparation'
+      pendingAttachments.value = [{
+        kind: 'staged',
+        local_id: 11,
+        name: 'delayed.txt',
+        mime: 'text/plain',
+        file_uuid: 'delayed-upload',
+        file: new File(['delayed'], 'delayed.txt', { type: 'text/plain' }),
+      }]
+      await expect(queue.enqueuePendingInput(inputText.value)).resolves.toBe(true)
+      await preparationStarted
+
+      expect(queue.removePendingChip(pendingUiId(queue, 0))).toBe(true)
+      await vi.waitFor(() => expect(records.size).toBe(0))
+      releasePreparation()
+
+      await vi.waitFor(() => expect(queue.pendingQueue.value).toEqual([]))
+      expect(records.size).toBe(0)
+      expect(rpcCall.mock.calls.map(call => call[0]))
+        .not.toContain('sessions.pending_inputs.enqueue')
+    } finally {
+      queue.cleanup()
+    }
+  })
+
+  it('does not rewrite saving after removal wins an unknown enqueue response', async () => {
+    const { wal, records } = memoryWal()
+    enableAtomicPendingMutations(wal, records)
+    let markEnqueueStarted!: () => void
+    let rejectEnqueue!: (error: unknown) => void
+    const enqueueStarted = new Promise<void>(resolve => { markEnqueueStarted = resolve })
+    const enqueueResult = new Promise<never>((_resolve, reject) => { rejectEnqueue = reject })
+    const rpcCall = vi.fn((method: string): Promise<unknown> => {
+      if (method === 'sessions.pending_inputs.list') return Promise.resolve({ items: [] })
+      if (method === 'sessions.pending_inputs.cancel') {
+        return Promise.resolve({ cancelled: true })
+      }
+      if (method === 'sessions.pending_inputs.enqueue') {
+        markEnqueueStarted()
+        return enqueueResult
+      }
+      return Promise.reject(new Error(`unexpected method: ${method}`))
+    })
+    const rpc: LegacyQueueRpc = {
+      call: <T = unknown>(method: string, params?: Record<string, unknown>) => {
+        void params
+        return rpcCall(method) as Promise<T>
+      },
+    }
+    const { inputText, queue } = makeQueue(
+      undefined,
+      () => false,
+      undefined,
+      undefined,
+      {
+        pendingInputWal: wal,
+        rpc,
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
+      },
+    )
+    try {
+      inputText.value = 'remove during unknown enqueue response'
+      await expect(queue.enqueuePendingInput(inputText.value)).resolves.toBe(true)
+      await enqueueStarted
+
+      expect(queue.removePendingChip(pendingUiId(queue, 0))).toBe(true)
+      await vi.waitFor(() => expect(records.size).toBe(0))
+      rejectEnqueue(new Error('connection closed after request'))
+
+      await vi.waitFor(() => expect(queue.pendingQueue.value).toEqual([]))
+      expect(records.size).toBe(0)
+      await queue.hydratePendingQueue()
+      expect(queue.pendingQueue.value).toEqual([])
+    } finally {
+      queue.cleanup()
+    }
   })
 
   it('retries an unknown enqueue result with the same durable identities', async () => {
@@ -1110,6 +1344,228 @@ describe('useChatPendingQueue delivery state', () => {
     }
   })
 
+  it('does not rewrite a retained WAL row after a peer removes it', async () => {
+    vi.stubGlobal(
+      'BroadcastChannel',
+      TestBroadcastChannel as unknown as typeof BroadcastChannel,
+    )
+    const { wal, records } = memoryWal()
+    const first = makeQueue(
+      undefined,
+      () => false,
+      undefined,
+      undefined,
+      { pendingInputWal: wal, hasRpcMethod: () => false },
+    )
+    const second = makeQueue(
+      undefined,
+      () => false,
+      undefined,
+      undefined,
+      { pendingInputWal: wal, hasRpcMethod: () => false },
+    )
+    try {
+      first.inputText.value = 'peer removal wins'
+      await expect(first.queue.enqueuePendingInput(first.inputText.value)).resolves.toBe(true)
+      await vi.waitFor(() => {
+        expect(first.queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('local_only')
+      })
+      await second.queue.hydratePendingQueue()
+
+      const pendingId = first.queue.pendingQueue.value[0]!.pendingInputId!
+      const retainCancelled = wal.retainCancelled!
+      let releaseRetainedWrite!: () => void
+      let markRetainedWriteStarted!: () => void
+      const retainedWriteStarted = new Promise<void>(resolve => {
+        markRetainedWriteStarted = resolve
+      })
+      const retainedWriteGate = new Promise<void>(resolve => { releaseRetainedWrite = resolve })
+      wal.retainCancelled = vi.fn(async (record, expectedWalRevision) => {
+        if (record.pendingInputId === pendingId) {
+          markRetainedWriteStarted()
+          await retainedWriteGate
+        }
+        return retainCancelled(record, expectedWalRevision)
+      })
+
+      expect(first.queue.editPendingItem(pendingUiId(first.queue, 0))).toBe(true)
+      await retainedWriteStarted
+      expect(second.queue.removePendingChip(pendingUiId(second.queue, 0))).toBe(true)
+      await vi.waitFor(() => {
+        expect(first.queue.pendingQueue.value).toEqual([])
+        expect(second.queue.pendingQueue.value).toEqual([])
+        expect(records.size).toBe(0)
+      })
+
+      releaseRetainedWrite()
+      await vi.waitFor(() => expect(records.size).toBe(0))
+      expect(first.inputText.value).toBe('')
+      await first.queue.hydratePendingQueue()
+      expect(first.queue.pendingQueue.value).toEqual([])
+    } finally {
+      first.queue.cleanup()
+      second.queue.cleanup()
+      vi.unstubAllGlobals()
+      TestBroadcastChannel.channels.clear()
+    }
+  })
+
+  it('does not recreate a tombstone when delayed cancellation acquisition loses to delete', async () => {
+    vi.stubGlobal(
+      'BroadcastChannel',
+      TestBroadcastChannel as unknown as typeof BroadcastChannel,
+    )
+    const { wal, records } = memoryWal()
+    const beginCancellation: NonNullable<PendingInputWal['beginCancellation']> = vi.fn(
+      async (record, expectedWalRevision) => {
+        const current = records.get(record.pendingInputId)
+        if (
+          !current
+          || current.sessionKey !== record.sessionKey
+          || current.clientRequestId !== record.clientRequestId
+          || current.clientMessageId !== record.clientMessageId
+          || (current.walRevision ?? 1) !== expectedWalRevision
+        ) {
+          return {
+            applied: false,
+            record: current ? structuredClone(current) : null,
+          }
+        }
+        const cancelling = {
+          ...structuredClone(record),
+          state: 'cancelling' as const,
+          walRevision: expectedWalRevision + 1,
+          updatedAt: Date.now(),
+        }
+        records.set(record.pendingInputId, cancelling)
+        return { applied: true, record: structuredClone(cancelling) }
+      },
+    )
+    let markDelayedBegin!: () => void
+    let releaseDelayedBegin!: () => void
+    const delayedBegin = new Promise<void>(resolve => { markDelayedBegin = resolve })
+    const delayedBeginGate = new Promise<void>(resolve => { releaseDelayedBegin = resolve })
+    const retainingWal: PendingInputWal = {
+      ...wal,
+      beginCancellation: vi.fn(async (record, expectedWalRevision) => {
+        markDelayedBegin()
+        await delayedBeginGate
+        return beginCancellation(record, expectedWalRevision)
+      }),
+    }
+    const destructiveWal: PendingInputWal = { ...wal, beginCancellation }
+    const retaining = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: retainingWal,
+      hasRpcMethod: () => false,
+    })
+    const destructive = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: destructiveWal,
+      hasRpcMethod: () => false,
+    })
+    try {
+      retaining.inputText.value = 'peer delete wins before cancellation acquisition'
+      await expect(retaining.queue.enqueuePendingInput(retaining.inputText.value))
+        .resolves.toBe(true)
+      await destructive.queue.hydratePendingQueue()
+
+      expect(retaining.queue.editPendingItem(pendingUiId(retaining.queue, 0))).toBe(true)
+      await delayedBegin
+      expect(destructive.queue.removePendingChip(pendingUiId(destructive.queue, 0))).toBe(true)
+      await vi.waitFor(() => expect(records.size).toBe(0))
+
+      releaseDelayedBegin()
+      await vi.waitFor(() => {
+        expect(retaining.queue.pendingQueue.value).toEqual([])
+        expect(destructive.queue.pendingQueue.value).toEqual([])
+        expect(records.size).toBe(0)
+      })
+      expect(retaining.inputText.value).toBe('')
+      await retaining.queue.hydratePendingQueue()
+      expect(retaining.queue.pendingQueue.value).toEqual([])
+    } finally {
+      retaining.queue.cleanup()
+      destructive.queue.cleanup()
+      vi.unstubAllGlobals()
+      TestBroadcastChannel.channels.clear()
+    }
+  })
+
+  it('does not turn a peer-owned destructive tombstone back into a retained draft', async () => {
+    const { wal, records } = memoryWal()
+    const sharedRetain = wal.retainCancelled!
+    let markDestructiveWrite!: () => void
+    const destructiveWrite = new Promise<void>(resolve => { markDestructiveWrite = resolve })
+    const retainingWal: PendingInputWal = {
+      ...wal,
+      retainCancelled: vi.fn(async (record, expectedWalRevision) => {
+        await destructiveWrite
+        return sharedRetain(record, expectedWalRevision)
+      }),
+    }
+    const retaining = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: retainingWal,
+      hasRpcMethod: () => false,
+    })
+    const destructive = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      hasRpcMethod: () => false,
+    })
+    try {
+      retaining.inputText.value = 'destructive peer owns this tombstone'
+      await expect(retaining.queue.enqueuePendingInput(retaining.inputText.value))
+        .resolves.toBe(true)
+      await destructive.queue.hydratePendingQueue()
+      const pendingInputId = retaining.queue.pendingQueue.value[0]!.pendingInputId!
+      const writeWal = wal.put
+      wal.put = vi.fn(async record => {
+        await writeWal(record)
+        if (
+          record.pendingInputId === pendingInputId
+          && record.state === 'cancelling'
+          && record.retainAfterCancel !== true
+        ) markDestructiveWrite()
+      })
+      wal.delete = vi.fn(() => new Promise<void>(() => {
+        // Model a destructive owner closing after its tombstone commit but
+        // before the final IndexedDB delete settles.
+      }))
+
+      expect(retaining.queue.editPendingItem(pendingUiId(retaining.queue, 0))).toBe(true)
+      expect(destructive.queue.removePendingChip(pendingUiId(destructive.queue, 0))).toBe(true)
+
+      await vi.waitFor(() => {
+        expect(records.get(pendingInputId)?.state).toBe('cancelling')
+        expect(records.get(pendingInputId)?.retainAfterCancel).toBeUndefined()
+        expect(retaining.queue.pendingQueue.value[0]?.pendingPersistenceState)
+          .toBe('cancelling')
+        expect(retaining.queue.pendingQueue.value[0]?.pendingRetainAfterCancel)
+          .toBeUndefined()
+        expect(destructive.queue.pendingQueue.value[0]?.pendingPersistenceState)
+          .toBe('cancelling')
+        expect(destructive.queue.pendingQueue.value[0]?.pendingRetainAfterCancel)
+          .toBeUndefined()
+      })
+      expect(retaining.inputText.value).toBe('')
+
+      const reloaded = makeQueue(undefined, () => false, undefined, undefined, {
+        pendingInputWal: wal,
+        hasRpcMethod: () => false,
+      })
+      try {
+        await reloaded.queue.hydratePendingQueue()
+        expect(reloaded.queue.pendingQueue.value[0]?.pendingPersistenceState)
+          .toBe('cancelling')
+        expect(reloaded.queue.pendingQueue.value[0]?.pendingRetainAfterCancel)
+          .toBeUndefined()
+      } finally {
+        reloaded.queue.cleanup()
+      }
+    } finally {
+      retaining.queue.cleanup()
+      destructive.queue.cleanup()
+    }
+  })
+
   it('resolves a queued action by stable UI identity after a peer deletion shifts indexes', async () => {
     const { inputText, queue } = makeQueue()
     inputText.value = 'peer removes this first row'
@@ -1130,6 +1586,1049 @@ describe('useChatPendingQueue delivery state', () => {
       expect(inputText.value).toBe('edit this surviving row')
     })
     queue.cleanup()
+  })
+
+  it('restores multiple durable drafts in queue order when cancellation resolves in reverse', async () => {
+    const { wal } = memoryWal()
+    const writeWal = wal.put
+    const cancellationReleases = new Map<string, () => void>()
+    let markBothStarted!: () => void
+    const bothStarted = new Promise<void>(resolve => { markBothStarted = resolve })
+    wal.put = vi.fn(async record => {
+      if (record.state === 'cancelling') {
+        await new Promise<void>(resolve => {
+          cancellationReleases.set(record.pendingInputId, resolve)
+          if (cancellationReleases.size === 2) markBothStarted()
+        })
+      }
+      await writeWal(record)
+    })
+    const {
+      inputText,
+      pendingAttachments,
+      pendingSessionIntent,
+      queue,
+    } = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      hasRpcMethod: () => false,
+    })
+    try {
+      inputText.value = 'A'
+      pendingAttachments.value = [{
+        kind: 'staged',
+        local_id: 281,
+        name: 'A.txt',
+        mime: 'text/plain',
+        file_uuid: 'upload-A',
+      }]
+      pendingSessionIntent.value = 'intent:A'
+      await expect(queue.enqueuePendingInput(inputText.value)).resolves.toBe(true)
+
+      inputText.value = 'B'
+      pendingAttachments.value = [{
+        kind: 'staged',
+        local_id: 282,
+        name: 'B.txt',
+        mime: 'text/plain',
+        file_uuid: 'upload-B',
+      }]
+      pendingSessionIntent.value = 'intent:B'
+      await expect(queue.enqueuePendingInput(inputText.value)).resolves.toBe(true)
+      await vi.waitFor(() => expect(queue.pendingQueue.value.every(item => (
+        item.pendingPersistenceState === 'local_only'
+      ))).toBe(true))
+      const [firstId, secondId] = queue.pendingQueue.value.map(item => item.pendingInputId!)
+
+      expect(queue.popAllPendingIntoComposer()).toBe(true)
+      await bothStarted
+      cancellationReleases.get(secondId)?.()
+      await vi.waitFor(() => {
+        expect(queue.pendingQueue.value.find(item => item.pendingInputId === secondId))
+          .toMatchObject({ pendingPersistenceState: 'local_only' })
+      })
+      expect(inputText.value).toBe('')
+      expect(pendingAttachments.value).toEqual([])
+
+      cancellationReleases.get(firstId)?.()
+      await vi.waitFor(() => {
+        expect(inputText.value).toBe('A\nB')
+        expect(queue.pendingQueue.value).toEqual([])
+      })
+      expect(pendingAttachments.value.map(attachment => attachment.name)).toEqual([
+        'A.txt',
+        'B.txt',
+      ])
+      expect(pendingSessionIntent.value).toBe('intent:A')
+    } finally {
+      queue.cleanup()
+    }
+  })
+
+  it('re-keys colliding attachment IDs from independently persisted queue rows', async () => {
+    const record = (
+      pendingInputId: string,
+      text: string,
+      position: number,
+    ): PendingInputWalRecord => ({
+      schemaVersion: 1,
+      pendingInputId,
+      sessionKey: 'agent:main:webchat:test',
+      clientRequestId: `request-${text}`,
+      clientMessageId: `message-${text}`,
+      text,
+      attachments: [{
+        kind: 'staged',
+        local_id: 1,
+        name: `${text}.txt`,
+        mime: 'text/plain',
+        file_uuid: `upload-${text}`,
+      }],
+      intent: null,
+      state: 'local_only',
+      mayHaveServerCopy: false,
+      position,
+      walRevision: 1,
+      createdAt: position + 1,
+      updatedAt: position + 1,
+    })
+    const { wal } = memoryWal([
+      record('pending-tab-A', 'A', 0),
+      record('pending-tab-B', 'B', 1),
+    ])
+    const { inputText, pendingAttachments, queue } = makeQueue(
+      undefined,
+      () => false,
+      undefined,
+      undefined,
+      { pendingInputWal: wal, hasRpcMethod: () => false },
+    )
+    try {
+      await queue.hydratePendingQueue()
+      expect(queue.popAllPendingIntoComposer()).toBe(true)
+      await vi.waitFor(() => expect(queue.pendingQueue.value).toEqual([]))
+
+      expect(inputText.value).toBe('A\nB')
+      expect(pendingAttachments.value.map(attachment => attachment.name))
+        .toEqual(['A.txt', 'B.txt'])
+      expect(pendingAttachments.value.map(attachment => attachment.local_id))
+        .toEqual([1, -1])
+      expect(new Set(pendingAttachments.value.map(attachment => attachment.local_id)).size)
+        .toBe(2)
+    } finally {
+      queue.cleanup()
+    }
+  })
+
+  it('keeps later retained drafts queued behind an earlier cancellation failure', async () => {
+    const { wal } = memoryWal()
+    const { inputText, queue } = makeQueue(
+      undefined,
+      () => false,
+      undefined,
+      undefined,
+      { pendingInputWal: wal, hasRpcMethod: () => false },
+    )
+    try {
+      for (const text of ['A', 'B']) {
+        inputText.value = text
+        await expect(queue.enqueuePendingInput(text)).resolves.toBe(true)
+      }
+      await vi.waitFor(() => expect(queue.pendingQueue.value.every(item => (
+        item.pendingPersistenceState === 'local_only'
+      ))).toBe(true))
+      const firstId = queue.pendingQueue.value[0]!.pendingInputId!
+      const writeWal = wal.put
+      wal.put = vi.fn(async record => {
+        if (record.pendingInputId === firstId && record.state === 'cancelling') {
+          throw new Error('lost cancellation acknowledgement')
+        }
+        await writeWal(record)
+      })
+
+      expect(queue.popAllPendingIntoComposer()).toBe(true)
+      await vi.waitFor(() => {
+        expect(queue.pendingQueue.value[1]).toMatchObject({
+          text: 'B',
+          pendingPersistenceState: 'local_only',
+          pendingRetainAfterCancel: true,
+        })
+      })
+      expect(inputText.value).toBe('')
+      expect(queue.pendingQueue.value.map(item => item.text)).toEqual(['A', 'B'])
+    } finally {
+      queue.cleanup()
+    }
+  })
+
+  it('preserves mixed queue order when delayed cancellation loses the composer lease', async () => {
+    const { wal } = memoryWal()
+    const writeWal = wal.put
+    const cancellationReleases = new Map<string, () => void>()
+    let markBothStarted!: () => void
+    const bothStarted = new Promise<void>(resolve => { markBothStarted = resolve })
+    wal.put = vi.fn(async record => {
+      if (record.state === 'cancelling') {
+        await new Promise<void>(resolve => {
+          cancellationReleases.set(record.pendingInputId, resolve)
+          if (cancellationReleases.size === 2) markBothStarted()
+        })
+      }
+      await writeWal(record)
+    })
+    const { inputText, queue, sessionKey } = makeQueue(
+      undefined,
+      () => false,
+      undefined,
+      undefined,
+      { pendingInputWal: wal, hasRpcMethod: () => false },
+    )
+    try {
+      for (const text of ['A', 'C']) {
+        inputText.value = text
+        await expect(queue.enqueuePendingInput(text)).resolves.toBe(true)
+      }
+      await vi.waitFor(() => expect(queue.pendingQueue.value.every(item => (
+        item.pendingPersistenceState === 'local_only'
+      ))).toBe(true))
+      queue.pendingQueue.value.splice(1, 0, {
+        pendingUiId: 'pending-server-B',
+        pendingInputId: 'pending-server-B',
+        pendingClientRequestId: 'request-server-B',
+        pendingClientMessageId: 'message-server-B',
+        pendingPersistenceState: 'staged',
+        pendingMayHaveServerCopy: true,
+        pendingWalRevision: 1,
+        pendingCreatedAt: 2,
+        ownerSessionKey: sessionKey.value,
+        text: 'B',
+        attachments: [{
+          kind: 'staged',
+          local_id: 283,
+          name: 'server-B.txt',
+          mime: 'text/plain',
+          durable_material: true,
+        }],
+        intent: null,
+      })
+
+      expect(queue.popAllPendingIntoComposer()).toBe(true)
+      await bothStarted
+      expect(queue.pendingQueue.value.map(item => item.text)).toEqual(['A', 'B', 'C'])
+
+      inputText.value = 'new composer text'
+      await nextTick()
+      for (const release of cancellationReleases.values()) release()
+      await vi.waitFor(() => expect(queue.pendingQueue.value.every(item => (
+        item.pendingPersistenceState === 'local_only'
+        || item.pendingPersistenceState === 'staged'
+      ))).toBe(true))
+      expect(queue.pendingQueue.value.map(item => item.text)).toEqual(['A', 'B', 'C'])
+      expect(inputText.value).toBe('new composer text')
+    } finally {
+      queue.cleanup()
+    }
+  })
+
+  it('preserves mixed queue order when an earlier cancellation fails', async () => {
+    const { wal } = memoryWal()
+    const writeWal = wal.put
+    const { inputText, queue, sessionKey } = makeQueue(
+      undefined,
+      () => false,
+      undefined,
+      undefined,
+      { pendingInputWal: wal, hasRpcMethod: () => false },
+    )
+    try {
+      for (const text of ['A', 'C']) {
+        inputText.value = text
+        await expect(queue.enqueuePendingInput(text)).resolves.toBe(true)
+      }
+      await vi.waitFor(() => expect(queue.pendingQueue.value.every(item => (
+        item.pendingPersistenceState === 'local_only'
+      ))).toBe(true))
+      const firstId = queue.pendingQueue.value[0]!.pendingInputId!
+      queue.pendingQueue.value.splice(1, 0, {
+        pendingUiId: 'pending-server-B',
+        pendingInputId: 'pending-server-B',
+        pendingClientRequestId: 'request-server-B',
+        pendingClientMessageId: 'message-server-B',
+        pendingPersistenceState: 'staged',
+        pendingMayHaveServerCopy: true,
+        pendingWalRevision: 1,
+        pendingCreatedAt: 2,
+        ownerSessionKey: sessionKey.value,
+        text: 'B',
+        attachments: [{
+          kind: 'staged',
+          local_id: 284,
+          name: 'server-B.txt',
+          mime: 'text/plain',
+          durable_material: true,
+        }],
+        intent: null,
+      })
+      wal.put = vi.fn(async record => {
+        if (record.pendingInputId === firstId && record.state === 'cancelling') {
+          throw new Error('lost cancellation acknowledgement')
+        }
+        await writeWal(record)
+      })
+
+      expect(queue.popAllPendingIntoComposer()).toBe(true)
+      await vi.waitFor(() => expect(queue.pendingQueue.value[2]).toMatchObject({
+        text: 'C',
+        pendingPersistenceState: 'local_only',
+        pendingRetainAfterCancel: true,
+      }))
+      expect(queue.pendingQueue.value.map(item => item.text)).toEqual(['A', 'B', 'C'])
+      expect(inputText.value).toBe('')
+    } finally {
+      queue.cleanup()
+    }
+  })
+
+  it('keeps adjacent drafts ordered when different tabs win their retain CAS', async () => {
+    vi.stubGlobal(
+      'BroadcastChannel',
+      TestBroadcastChannel as unknown as typeof BroadcastChannel,
+    )
+    const { wal, records } = memoryWal()
+    const sharedRetain = wal.retainCancelled!
+    let retainCalls = 0
+    let releaseRetainCalls!: () => void
+    const allRetainCalls = new Promise<void>(resolve => { releaseRetainCalls = resolve })
+    const waitForAllRetainCalls = async () => {
+      retainCalls += 1
+      if (retainCalls === 4) releaseRetainCalls()
+      await allRetainCalls
+    }
+    let markFirstWonA!: () => void
+    let markSecondWonB!: () => void
+    const firstWonA = new Promise<void>(resolve => { markFirstWonA = resolve })
+    const secondWonB = new Promise<void>(resolve => { markSecondWonB = resolve })
+    let firstId = ''
+    let secondId = ''
+    const firstWal: PendingInputWal = {
+      ...wal,
+      retainCancelled: vi.fn(async (record, expectedWalRevision) => {
+        await waitForAllRetainCalls()
+        if (record.pendingInputId === firstId) {
+          const result = await sharedRetain(record, expectedWalRevision)
+          markFirstWonA()
+          return result
+        }
+        await secondWonB
+        return sharedRetain(record, expectedWalRevision)
+      }),
+    }
+    const secondWal: PendingInputWal = {
+      ...wal,
+      retainCancelled: vi.fn(async (record, expectedWalRevision) => {
+        await waitForAllRetainCalls()
+        if (record.pendingInputId === secondId) {
+          const result = await sharedRetain(record, expectedWalRevision)
+          markSecondWonB()
+          return result
+        }
+        await firstWonA
+        return sharedRetain(record, expectedWalRevision)
+      }),
+    }
+    const first = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: firstWal,
+      hasRpcMethod: () => false,
+    })
+    const second = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: secondWal,
+      hasRpcMethod: () => false,
+    })
+    try {
+      for (const text of ['A', 'B']) {
+        first.inputText.value = text
+        await expect(first.queue.enqueuePendingInput(text)).resolves.toBe(true)
+      }
+      await second.queue.hydratePendingQueue()
+      firstId = first.queue.pendingQueue.value[0]!.pendingInputId!
+      secondId = first.queue.pendingQueue.value[1]!.pendingInputId!
+
+      expect(first.queue.popAllPendingIntoComposer()).toBe(true)
+      expect(second.queue.popAllPendingIntoComposer()).toBe(true)
+
+      await vi.waitFor(() => {
+        expect(first.inputText.value).toBe('A')
+        expect(second.inputText.value).toBe('')
+        expect(first.queue.pendingQueue.value.map(item => item.text)).toEqual(['B'])
+        expect(second.queue.pendingQueue.value.map(item => item.text)).toEqual(['B'])
+        expect([...records.values()].map(record => record.text)).toEqual(['B'])
+      })
+    } finally {
+      first.queue.cleanup()
+      second.queue.cleanup()
+      vi.unstubAllGlobals()
+      TestBroadcastChannel.channels.clear()
+    }
+  })
+
+  it.each([
+    'editPendingItem',
+    'popPendingTail',
+    'popAllPendingIntoComposer',
+  ] as const)(
+    'keeps an attachment draft parked in A when %s cancellation settles after navigating to B',
+    async recoveryPath => {
+      const sessionA = 'agent:main:webchat:test'
+      const sessionB = 'agent:main:webchat:B'
+      const { wal, records } = memoryWal()
+      const writeWal = wal.put
+      let releaseCancel!: () => void
+      let markCancelStarted!: () => void
+      const cancelStarted = new Promise<void>(resolve => { markCancelStarted = resolve })
+      const cancelGate = new Promise<void>(resolve => { releaseCancel = resolve })
+      wal.put = vi.fn(async record => {
+        if (record.state === 'cancelling') {
+          markCancelStarted()
+          await cancelGate
+        }
+        await writeWal(record)
+      })
+      const {
+        inputText,
+        pendingAttachments,
+        pendingSessionIntent,
+        queue,
+        sessionKey,
+      } = makeQueue(undefined, () => false, undefined, undefined, {
+        pendingInputWal: wal,
+        hasRpcMethod: () => false,
+      })
+      const sourceAttachment: Attachment = {
+        kind: 'staged',
+        local_id: 301,
+        name: 'source-a.txt',
+        mime: 'text/plain',
+        size: 8,
+        file_uuid: 'source-a-upload',
+      }
+      const targetAttachment: Attachment = {
+        kind: 'staged',
+        local_id: 302,
+        name: 'target-b.txt',
+        mime: 'text/plain',
+        size: 8,
+        file_uuid: 'target-b-upload',
+      }
+      try {
+        inputText.value = 'source A draft'
+        pendingAttachments.value = [sourceAttachment]
+        pendingSessionIntent.value = 'intent:A'
+        await expect(queue.enqueuePendingInput(inputText.value)).resolves.toBe(true)
+        await vi.waitFor(() => {
+          expect(queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('local_only')
+        })
+        const itemId = pendingUiId(queue, 0)
+
+        const started = recoveryPath === 'editPendingItem'
+          ? queue.editPendingItem(itemId)
+          : recoveryPath === 'popPendingTail'
+            ? queue.popPendingTail()
+            : queue.popAllPendingIntoComposer()
+        expect(started).toBe(true)
+        await cancelStarted
+
+        queue.switchPendingQueue(sessionB)
+        sessionKey.value = sessionB
+        inputText.value = 'target B draft'
+        pendingAttachments.value = [targetAttachment]
+        pendingSessionIntent.value = 'intent:B'
+        releaseCancel()
+
+        await vi.waitFor(() => {
+          expect([...records.values()][0]).toMatchObject({
+            sessionKey: sessionA,
+            state: 'local_only',
+            retainAfterCancel: true,
+          })
+        })
+        expect(inputText.value).toBe('target B draft')
+        expect(pendingAttachments.value).toEqual([targetAttachment])
+        expect(pendingSessionIntent.value).toBe('intent:B')
+        expect(queue.pendingQueue.value).toEqual([])
+
+        queue.switchPendingQueue(sessionA)
+        sessionKey.value = sessionA
+        await nextTick()
+        expect(queue.pendingQueue.value).toHaveLength(1)
+        expect(queue.pendingQueue.value[0]).toMatchObject({
+          text: 'source A draft',
+          ownerSessionKey: sessionA,
+          pendingPersistenceState: 'local_only',
+          attachments: [{ name: 'source-a.txt' }],
+        })
+      } finally {
+        queue.cleanup()
+      }
+    },
+  )
+
+  it('keeps a retained queue item when the composer changes during delayed recovery', async () => {
+    const { wal, records } = memoryWal()
+    const writeWal = wal.put
+    let releaseCancel!: () => void
+    let markCancelStarted!: () => void
+    const cancelStarted = new Promise<void>(resolve => { markCancelStarted = resolve })
+    const cancelGate = new Promise<void>(resolve => { releaseCancel = resolve })
+    wal.put = vi.fn(async record => {
+      if (record.state === 'cancelling') {
+        markCancelStarted()
+        await cancelGate
+      }
+      await writeWal(record)
+    })
+    const {
+      inputText,
+      pendingAttachments,
+      pendingSessionIntent,
+      queue,
+    } = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      hasRpcMethod: () => false,
+    })
+    const sourceAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 311,
+      name: 'queued-source.txt',
+      mime: 'text/plain',
+      file_uuid: 'queued-source-upload',
+    }
+    const newAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 312,
+      name: 'new-composer.txt',
+      mime: 'text/plain',
+      file_uuid: 'new-composer-upload',
+    }
+    try {
+      inputText.value = 'queued source draft'
+      pendingAttachments.value = [sourceAttachment]
+      pendingSessionIntent.value = 'intent:queued'
+      await expect(queue.enqueuePendingInput(inputText.value)).resolves.toBe(true)
+      await vi.waitFor(() => {
+        expect(queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('local_only')
+      })
+
+      expect(queue.popPendingTail()).toBe(true)
+      await cancelStarted
+      inputText.value = 'new composer draft'
+      pendingAttachments.value = [newAttachment]
+      pendingSessionIntent.value = 'intent:new'
+      releaseCancel()
+
+      await vi.waitFor(() => {
+        expect([...records.values()][0]).toMatchObject({
+          state: 'local_only',
+          retainAfterCancel: true,
+        })
+      })
+      expect(inputText.value).toBe('new composer draft')
+      expect(pendingAttachments.value).toEqual([newAttachment])
+      expect(pendingSessionIntent.value).toBe('intent:new')
+      expect(queue.pendingQueue.value).toMatchObject([{
+        text: 'queued source draft',
+        pendingPersistenceState: 'local_only',
+        attachments: [{ name: 'queued-source.txt' }],
+      }])
+    } finally {
+      queue.cleanup()
+    }
+  })
+
+  it('chains a destructive clear after an in-flight retained cancellation', async () => {
+    const { wal, records } = memoryWal()
+    const retainCancelled = wal.retainCancelled!
+    let releaseRetain!: () => void
+    let markRetainStarted!: () => void
+    const retainStarted = new Promise<void>(resolve => { markRetainStarted = resolve })
+    const retainGate = new Promise<void>(resolve => { releaseRetain = resolve })
+    wal.retainCancelled = vi.fn(async (record, expectedWalRevision) => {
+      markRetainStarted()
+      await retainGate
+      return retainCancelled(record, expectedWalRevision)
+    })
+    const initial = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      hasRpcMethod: () => false,
+    })
+    try {
+      initial.inputText.value = 'clear this retained draft'
+      await expect(initial.queue.enqueuePendingInput(initial.inputText.value)).resolves.toBe(true)
+      await vi.waitFor(() => {
+        expect(initial.queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('local_only')
+      })
+
+      expect(initial.queue.editPendingItem(pendingUiId(initial.queue, 0))).toBe(true)
+      await retainStarted
+      initial.inputText.value = 'new composer text'
+      initial.queue.clearPendingQueue()
+      releaseRetain()
+
+      await vi.waitFor(() => {
+        expect(initial.queue.pendingQueue.value).toEqual([])
+        expect(records.size).toBe(0)
+      })
+      expect(initial.inputText.value).toBe('new composer text')
+
+      const reloaded = makeQueue(undefined, () => false, undefined, undefined, {
+        pendingInputWal: wal,
+        hasRpcMethod: () => false,
+      })
+      try {
+        await reloaded.queue.hydratePendingQueue()
+        expect(reloaded.queue.pendingQueue.value).toEqual([])
+      } finally {
+        reloaded.queue.cleanup()
+      }
+    } finally {
+      initial.queue.cleanup()
+    }
+  })
+
+  it.each([
+    'editPendingItem',
+    'popAllPendingIntoComposer',
+  ] as const)(
+    'trash invalidates an in-flight %s restore before destructive cleanup',
+    async recoveryPath => {
+      const { wal, records } = memoryWal()
+      const retainCancelled = wal.retainCancelled!
+      let releaseRetain!: () => void
+      let markRetainStarted!: () => void
+      const retainStarted = new Promise<void>(resolve => { markRetainStarted = resolve })
+      const retainGate = new Promise<void>(resolve => { releaseRetain = resolve })
+      wal.retainCancelled = vi.fn(async (record, expectedWalRevision) => {
+        markRetainStarted()
+        await retainGate
+        return retainCancelled(record, expectedWalRevision)
+      })
+      const initial = makeQueue(undefined, () => false, undefined, undefined, {
+        pendingInputWal: wal,
+        hasRpcMethod: () => false,
+      })
+      try {
+        initial.inputText.value = `trash ${recoveryPath} restore`
+        await expect(initial.queue.enqueuePendingInput(initial.inputText.value))
+          .resolves.toBe(true)
+        await vi.waitFor(() => {
+          expect(initial.queue.pendingQueue.value[0]?.pendingPersistenceState)
+            .toBe('local_only')
+        })
+        const pendingId = pendingUiId(initial.queue, 0)
+
+        const restoring = recoveryPath === 'editPendingItem'
+          ? initial.queue.editPendingItem(pendingId)
+          : initial.queue.popAllPendingIntoComposer()
+        expect(restoring).toBe(true)
+        await retainStarted
+        expect(initial.queue.removePendingChip(pendingId)).toBe(true)
+        releaseRetain()
+
+        await vi.waitFor(() => {
+          expect(initial.queue.pendingQueue.value).toEqual([])
+          expect(records.size).toBe(0)
+        })
+        expect(initial.inputText.value).toBe('')
+
+        const reloaded = makeQueue(undefined, () => false, undefined, undefined, {
+          pendingInputWal: wal,
+          hasRpcMethod: () => false,
+        })
+        try {
+          await reloaded.queue.hydratePendingQueue()
+          expect(reloaded.queue.pendingQueue.value).toEqual([])
+        } finally {
+          reloaded.queue.cleanup()
+        }
+      } finally {
+        initial.queue.cleanup()
+      }
+    },
+  )
+
+  it('keeps the source recovery fence after context targets B but session remains A', async () => {
+    const sourceSessionKey = 'agent:main:webchat:test'
+    const targetSessionKey = 'agent:main:webchat:delayed-handoff-target'
+    const ownerRequestId = 'owner-delayed-handoff-recovery'
+    const ownerContext = ref<PendingQueueOwnerContext | null>(null)
+    const { handoffs, records, wal } = memoryWal()
+    enableAtomicPendingMutations(wal, records)
+    handoffs.set(ownerRequestId, {
+      schemaVersion: 1,
+      ownerRequestId,
+      requestSessionKey: sourceSessionKey,
+      clientRequestId: ownerRequestId,
+      clientMessageId: 'message-delayed-handoff-recovery',
+      params: {
+        sessionKey: sourceSessionKey,
+        message: 'handoff this queue',
+        clientRequestId: ownerRequestId,
+        clientMessageId: 'message-delayed-handoff-recovery',
+      },
+      composerText: 'handoff this queue',
+      recoveryAttachments: [],
+      state: 'submitting',
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    const retainCancelled = wal.retainCancelled!
+    let markRetainStarted!: () => void
+    let releaseRetain!: () => void
+    const retainStarted = new Promise<void>(resolve => { markRetainStarted = resolve })
+    const retainGate = new Promise<void>(resolve => { releaseRetain = resolve })
+    wal.retainCancelled = vi.fn(async (record, expectedWalRevision, equivalentSessionKeys) => {
+      markRetainStarted()
+      await retainGate
+      return retainCancelled(record, expectedWalRevision, equivalentSessionKeys)
+    })
+    const acceptHandoff = wal.acceptHandoff!
+    let markAcceptStarted!: () => void
+    let releaseAccept!: () => void
+    const acceptStarted = new Promise<void>(resolve => { markAcceptStarted = resolve })
+    const acceptGate = new Promise<void>(resolve => { releaseAccept = resolve })
+    wal.acceptHandoff = vi.fn(async (
+      currentOwnerRequestId,
+      acceptedSessionKey,
+      shouldAccept,
+      handoffSignal,
+    ) => {
+      markAcceptStarted()
+      await acceptGate
+      return acceptHandoff(
+        currentOwnerRequestId,
+        acceptedSessionKey,
+        shouldAccept,
+        handoffSignal,
+      )
+    })
+    const initial = makeQueue(undefined, () => false, undefined, undefined, {
+      ownerContext,
+      pendingInputWal: wal,
+      hasRpcMethod: () => false,
+    })
+    try {
+      initial.inputText.value = 'source text with attachment'
+      initial.pendingAttachments.value = [{
+        kind: 'staged',
+        local_id: 501,
+        name: 'source.txt',
+        mime: 'text/plain',
+        file_uuid: 'source-upload',
+      }]
+      await initial.queue.enqueuePendingInput(
+        initial.inputText.value,
+        { ownerRequestId },
+      )
+      initial.inputText.value = 'second source item'
+      await initial.queue.enqueuePendingInput(initial.inputText.value, { ownerRequestId })
+      const firstId = pendingUiId(initial.queue, 0)
+
+      expect(initial.queue.editPendingItem(firstId)).toBe(true)
+      await retainStarted
+      ownerContext.value = {
+        sessionKey: targetSessionKey,
+        sourceSessionKey,
+        ownerRequestId,
+      }
+      const adoption = initial.queue.adoptPendingQueue(targetSessionKey, ownerRequestId)
+      await acceptStarted
+
+      expect(initial.sessionKey.value).toBe(sourceSessionKey)
+      expect(initial.queue.popPendingTail()).toBe(false)
+      expect(initial.queue.popAllPendingIntoComposer()).toBe(false)
+      releaseRetain()
+      await vi.waitFor(() => {
+        expect(initial.inputText.value).toBe('')
+        expect(initial.pendingAttachments.value).toEqual([])
+      })
+
+      releaseAccept()
+      await adoption
+      initial.sessionKey.value = targetSessionKey
+      expect(initial.inputText.value).toBe('')
+      expect(initial.pendingAttachments.value).toEqual([])
+    } finally {
+      initial.queue.cleanup()
+    }
+  })
+
+  it('retains delayed composer recovery in the WAL after cleanup for the next hydrate', async () => {
+    const { wal, records } = memoryWal()
+    const writeWal = wal.put
+    let releaseCancel!: () => void
+    let markCancelStarted!: () => void
+    const cancelStarted = new Promise<void>(resolve => { markCancelStarted = resolve })
+    const cancelGate = new Promise<void>(resolve => { releaseCancel = resolve })
+    wal.put = vi.fn(async record => {
+      if (record.state === 'cancelling') {
+        markCancelStarted()
+        await cancelGate
+      }
+      await writeWal(record)
+    })
+    const initial = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      hasRpcMethod: () => false,
+    })
+    initial.inputText.value = 'survive cleanup'
+    initial.pendingAttachments.value = [{
+      kind: 'staged',
+      local_id: 321,
+      name: 'survive-cleanup.txt',
+      mime: 'text/plain',
+      file_uuid: 'survive-cleanup-upload',
+    }]
+    await expect(initial.queue.enqueuePendingInput(initial.inputText.value)).resolves.toBe(true)
+    await vi.waitFor(() => {
+      expect(initial.queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('local_only')
+    })
+
+    expect(initial.queue.editPendingItem(pendingUiId(initial.queue, 0))).toBe(true)
+    await cancelStarted
+    initial.queue.cleanup()
+    releaseCancel()
+    await vi.waitFor(() => {
+      expect([...records.values()][0]).toMatchObject({
+        state: 'local_only',
+        retainAfterCancel: true,
+        attachments: [{ name: 'survive-cleanup.txt' }],
+      })
+    })
+    expect(initial.inputText.value).toBe('')
+    expect(initial.pendingAttachments.value).toEqual([])
+
+    const restored = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      hasRpcMethod: () => false,
+    })
+    try {
+      await vi.waitFor(() => {
+        expect(restored.queue.pendingQueue.value).toMatchObject([{
+          text: 'survive cleanup',
+          pendingPersistenceState: 'local_only',
+          attachments: [{ name: 'survive-cleanup.txt' }],
+        }])
+      })
+      expect(restored.inputText.value).toBe('')
+      expect(restored.pendingAttachments.value).toEqual([])
+    } finally {
+      restored.queue.cleanup()
+    }
+  })
+
+  it('deduplicates reconnect cancellation while a durable draft is returning to the composer', async () => {
+    const { wal, records } = memoryWal()
+    let serverRow: Awaited<ReturnType<PendingInputQueuePort['list']>>[number] | null = null
+    let releaseCancel!: () => void
+    let markCancelStarted!: () => void
+    const cancelStarted = new Promise<void>(resolve => { markCancelStarted = resolve })
+    const cancelGate = new Promise<void>(resolve => { releaseCancel = resolve })
+    const pendingInputQueue: PendingInputQueuePort = {
+      supportsQueue: () => true,
+      supportsReorder: () => false,
+      enqueue: vi.fn(async request => {
+        serverRow = {
+          pendingInputId: request.pendingInputId,
+          clientRequestId: request.clientRequestId || 'request-reconnect',
+          clientMessageId: request.clientMessageId || 'message-reconnect',
+          message: request.message,
+          displayText: request.displayText,
+          position: 0,
+          revision: 1,
+          requestFingerprint: 'fingerprint-reconnect',
+        }
+        return {
+          requestFingerprint: 'fingerprint-reconnect',
+          revision: 1,
+          position: 0,
+        }
+      }),
+      list: vi.fn(async () => serverRow ? [serverRow] : []),
+      cancel: vi.fn(async () => {
+        markCancelStarted()
+        await cancelGate
+        serverRow = null
+      }),
+      reorder: vi.fn(async () => ({ items: [] })),
+    }
+    const { inputText, queue } = makeQueue(
+      undefined,
+      () => false,
+      undefined,
+      undefined,
+      { pendingInputWal: wal, pendingInputQueue },
+    )
+    try {
+      inputText.value = 'restore once after reconnect'
+      await expect(queue.enqueuePendingInput(inputText.value)).resolves.toBe(true)
+      await vi.waitFor(() => {
+        expect(queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('staged')
+      })
+
+      expect(queue.editPendingItem(pendingUiId(queue, 0))).toBe(true)
+      await cancelStarted
+      await queue.hydratePendingQueue()
+      expect(pendingInputQueue.cancel).toHaveBeenCalledTimes(1)
+
+      releaseCancel()
+      await vi.waitFor(() => {
+        expect(inputText.value).toBe('restore once after reconnect')
+        expect(queue.pendingQueue.value).toEqual([])
+        expect(records.size).toBe(0)
+      })
+      await queue.hydratePendingQueue()
+      expect(queue.pendingQueue.value).toEqual([])
+      expect(pendingInputQueue.cancel).toHaveBeenCalledTimes(1)
+    } finally {
+      queue.cleanup()
+    }
+  })
+
+  it('hydrates and parks a legacy alias WAL row under its canonical queue owner', async () => {
+    const legacySession = 'agent:default:webchat:alias-draft'
+    const canonicalSession = 'agent:main:webchat:alias-draft'
+    const { wal, records } = memoryWal([{
+      schemaVersion: 1,
+      pendingInputId: 'pending-alias-draft',
+      sessionKey: legacySession,
+      clientRequestId: 'request-alias-draft',
+      clientMessageId: 'message-alias-draft',
+      text: 'legacy alias attachment draft',
+      attachments: [{
+        kind: 'staged',
+        local_id: 331,
+        name: 'legacy-alias.txt',
+        mime: 'text/plain',
+        file_uuid: 'legacy-alias-upload',
+      }],
+      intent: null,
+      state: 'local_only',
+      mayHaveServerCopy: false,
+      createdAt: 1,
+      updatedAt: 2,
+    }])
+    enableAtomicPendingMutations(wal, records)
+    const sessionKey = ref(canonicalSession)
+    const { queue } = makeQueue(undefined, () => false, undefined, undefined, {
+      sessionKey,
+      pendingInputWal: wal,
+      hasRpcMethod: () => false,
+    })
+    try {
+      await vi.waitFor(() => {
+        expect(queue.pendingQueue.value).toMatchObject([{
+          pendingInputId: 'pending-alias-draft',
+          ownerSessionKey: canonicalSession,
+          attachments: [{ name: 'legacy-alias.txt' }],
+        }])
+      })
+
+      queue.switchPendingQueue('agent:main:webchat:other')
+      sessionKey.value = 'agent:main:webchat:other'
+      expect(queue.pendingQueue.value).toEqual([])
+
+      queue.switchPendingQueue(canonicalSession)
+      sessionKey.value = canonicalSession
+      expect(queue.pendingQueue.value).toMatchObject([{
+        pendingInputId: 'pending-alias-draft',
+        ownerSessionKey: canonicalSession,
+      }])
+
+      expect(queue.editPendingItem(pendingUiId(queue, 0))).toBe(true)
+      await vi.waitFor(() => {
+        expect(queue.pendingQueue.value).toEqual([])
+        expect(records.size).toBe(0)
+      })
+      expect(wal.beginCancellation).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionKey: canonicalSession }),
+        1,
+        expect.arrayContaining([legacySession, canonicalSession]),
+      )
+    } finally {
+      queue.cleanup()
+    }
+  })
+
+  it('atomically reorders legacy alias and canonical WAL rows under the canonical owner', async () => {
+    const legacySession = 'agent:default:webchat:alias-reorder'
+    const canonicalSession = 'agent:main:webchat:alias-reorder'
+    const baseRecord = {
+      schemaVersion: 1 as const,
+      attachments: [],
+      intent: null,
+      state: 'local_only' as const,
+      mayHaveServerCopy: false,
+      walRevision: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    const { wal, records } = memoryWal([
+      {
+        ...baseRecord,
+        pendingInputId: 'pending-legacy-first',
+        sessionKey: legacySession,
+        clientRequestId: 'request-legacy-first',
+        clientMessageId: 'message-legacy-first',
+        text: 'legacy first',
+        position: 0,
+      },
+      {
+        ...baseRecord,
+        pendingInputId: 'pending-canonical-second',
+        sessionKey: canonicalSession,
+        clientRequestId: 'request-canonical-second',
+        clientMessageId: 'message-canonical-second',
+        text: 'canonical second',
+        position: 1,
+      },
+    ])
+    const first = makeQueue(undefined, () => false, undefined, undefined, {
+      sessionKey: ref(canonicalSession),
+      pendingInputWal: wal,
+      hasRpcMethod: () => false,
+    })
+    await vi.waitFor(() => {
+      expect(first.queue.pendingQueue.value.map(item => item.text)).toEqual([
+        'legacy first',
+        'canonical second',
+      ])
+    })
+
+    expect(first.queue.beginPendingReorder(1)).toBe(true)
+    expect(first.queue.reorderPendingItem(1, 0)).toBe(true)
+    await first.queue.endPendingReorder()
+    expect(first.queue.pendingQueue.value.map(item => item.text)).toEqual([
+      'canonical second',
+      'legacy first',
+    ])
+    expect([...records.values()].every(record => (
+      record.sessionKey === canonicalSession
+    ))).toBe(true)
+    first.queue.cleanup()
+
+    const reloaded = makeQueue(undefined, () => false, undefined, undefined, {
+      sessionKey: ref(canonicalSession),
+      pendingInputWal: wal,
+      hasRpcMethod: () => false,
+    })
+    try {
+      await vi.waitFor(() => {
+        expect(reloaded.queue.pendingQueue.value.map(item => item.text)).toEqual([
+          'canonical second',
+          'legacy first',
+        ])
+      })
+    } finally {
+      reloaded.queue.cleanup()
+    }
   })
 
   it('does not edit a queued annotation batch into plain text', async () => {
@@ -1234,6 +2733,266 @@ describe('useChatPendingQueue delivery state', () => {
       || method === 'sessions.pending_inputs.cancel'
     ))).toBe(true)
     queue.cleanup()
+  })
+
+  it('does not let an in-flight server hydrate overwrite a peer cancellation tombstone', async () => {
+    const pendingInputId = 'pending-peer-cancel-during-hydrate'
+    const initialRecord: PendingInputWalRecord = {
+      schemaVersion: 1,
+      pendingInputId,
+      sessionKey: 'agent:main:webchat:test',
+      clientRequestId: 'request-peer-cancel-during-hydrate',
+      clientMessageId: 'message-peer-cancel-during-hydrate',
+      text: 'peer cancellation must win',
+      attachments: [],
+      intent: null,
+      state: 'staged',
+      mayHaveServerCopy: true,
+      requestFingerprint: 'sha256:peer-cancel-during-hydrate',
+      serverRevision: 4,
+      walRevision: 1,
+      createdAt: 1,
+      updatedAt: 2,
+    }
+    const { wal, records } = memoryWal([initialRecord])
+    enableAtomicPendingMutations(wal, records)
+    let markListStarted!: () => void
+    let releaseList!: () => void
+    const listStarted = new Promise<void>(resolve => { markListStarted = resolve })
+    const listGate = new Promise<void>(resolve => { releaseList = resolve })
+    const pendingInputQueue: PendingInputQueuePort = {
+      supportsQueue: () => true,
+      supportsReorder: () => false,
+      enqueue: vi.fn(async () => ({
+        requestFingerprint: initialRecord.requestFingerprint!,
+        revision: 4,
+        position: 0,
+      })),
+      list: vi.fn(async () => {
+        markListStarted()
+        await listGate
+        return [{
+          pendingInputId,
+          clientRequestId: initialRecord.clientRequestId,
+          clientMessageId: initialRecord.clientMessageId,
+          message: initialRecord.text,
+          position: 0,
+          revision: 4,
+          requestFingerprint: initialRecord.requestFingerprint!,
+        }]
+      }),
+      cancel: vi.fn(async () => {
+        throw new Error('keep the tombstone for inspection')
+      }),
+      reorder: vi.fn(async () => ({ items: [] })),
+    }
+    const { queue } = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      pendingInputQueue,
+    })
+    try {
+      await listStarted
+      records.set(pendingInputId, {
+        ...initialRecord,
+        state: 'cancelling',
+        walRevision: 2,
+        updatedAt: 3,
+      })
+      releaseList()
+
+      await vi.waitFor(() => {
+        expect(queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('cancelling')
+      })
+      expect(records.get(pendingInputId)).toMatchObject({
+        state: 'cancelling',
+      })
+      expect(records.get(pendingInputId)!.walRevision).toBeGreaterThanOrEqual(2)
+      await vi.waitFor(() => expect(pendingInputQueue.cancel).toHaveBeenCalled())
+      expect(wal.compareAndSwapPendingInput).toHaveBeenCalledWith(
+        expect.objectContaining({ state: 'staged' }),
+        1,
+        expect.any(Array),
+      )
+    } finally {
+      queue.cleanup()
+    }
+  })
+
+  it('does not let a stale offline hydrate recreate a peer cancellation tombstone', async () => {
+    const pendingInputId = 'pending-peer-cancel-during-offline-hydrate'
+    const initialRecord: PendingInputWalRecord = {
+      schemaVersion: 1,
+      pendingInputId,
+      sessionKey: 'agent:main:webchat:test',
+      clientRequestId: 'request-peer-cancel-during-offline-hydrate',
+      clientMessageId: 'message-peer-cancel-during-offline-hydrate',
+      text: 'offline cancellation must win',
+      attachments: [],
+      intent: null,
+      state: 'retryable',
+      mayHaveServerCopy: true,
+      walRevision: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    const { wal, records } = memoryWal([initialRecord])
+    enableAtomicPendingMutations(wal, records)
+    const listWal = wal.list
+    let markListStarted!: () => void
+    let releaseList!: () => void
+    const listStarted = new Promise<void>(resolve => { markListStarted = resolve })
+    const listGate = new Promise<void>(resolve => { releaseList = resolve })
+    wal.list = vi.fn(async sessionKey => {
+      const snapshot = await listWal(sessionKey)
+      markListStarted()
+      await listGate
+      return snapshot
+    })
+    const { queue } = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      hasRpcMethod: () => false,
+    })
+    try {
+      await listStarted
+      records.set(pendingInputId, {
+        ...initialRecord,
+        state: 'cancelling',
+        retainAfterCancel: undefined,
+        walRevision: 2,
+        updatedAt: 2,
+      })
+      releaseList()
+
+      await vi.waitFor(() => {
+        expect(queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('cancelling')
+      })
+      expect(records.get(pendingInputId)).toMatchObject({
+        state: 'cancelling',
+        walRevision: 2,
+      })
+    } finally {
+      queue.cleanup()
+    }
+  })
+
+  it('does not let a stale server omission delete a newer retained draft', async () => {
+    const pendingInputId = 'pending-retained-during-server-list'
+    const initialRecord: PendingInputWalRecord = {
+      schemaVersion: 1,
+      pendingInputId,
+      sessionKey: 'agent:main:webchat:test',
+      clientRequestId: 'request-retained-during-server-list',
+      clientMessageId: 'message-retained-during-server-list',
+      text: 'retain while the list is stale',
+      attachments: [],
+      intent: null,
+      state: 'staged',
+      mayHaveServerCopy: true,
+      requestFingerprint: 'sha256:retained-during-server-list',
+      serverRevision: 1,
+      walRevision: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    const { wal, records } = memoryWal([initialRecord])
+    enableAtomicPendingMutations(wal, records)
+    let markListStarted!: () => void
+    let releaseList!: () => void
+    const listStarted = new Promise<void>(resolve => { markListStarted = resolve })
+    const listGate = new Promise<void>(resolve => { releaseList = resolve })
+    const pendingInputQueue: PendingInputQueuePort = {
+      supportsQueue: () => true,
+      supportsReorder: () => false,
+      enqueue: vi.fn(async () => ({})),
+      list: vi.fn(async () => {
+        markListStarted()
+        await listGate
+        return []
+      }),
+      cancel: vi.fn(async () => {}),
+      reorder: vi.fn(async () => ({ items: [] })),
+    }
+    const { queue } = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      pendingInputQueue,
+    })
+    try {
+      await listStarted
+      records.set(pendingInputId, {
+        ...initialRecord,
+        state: 'local_only',
+        retainAfterCancel: true,
+        mayHaveServerCopy: false,
+        requestFingerprint: undefined,
+        serverRevision: undefined,
+        walRevision: 2,
+        updatedAt: 2,
+      })
+      releaseList()
+
+      await vi.waitFor(() => {
+        expect(queue.pendingQueue.value[0]).toMatchObject({
+          pendingPersistenceState: 'local_only',
+          pendingRetainAfterCancel: true,
+          pendingWalRevision: 2,
+        })
+      })
+      expect(records.get(pendingInputId)).toMatchObject({
+        state: 'local_only',
+        retainAfterCancel: true,
+        walRevision: 2,
+      })
+    } finally {
+      queue.cleanup()
+    }
+  })
+
+  it('adopts a newer peer local reorder during hydrate', async () => {
+    const sessionKey = 'agent:main:webchat:test'
+    const initial = ['A', 'B'].map((text, position): PendingInputWalRecord => ({
+      schemaVersion: 1,
+      pendingInputId: `pending-peer-order-${text}`,
+      sessionKey,
+      clientRequestId: `request-peer-order-${text}`,
+      clientMessageId: `message-peer-order-${text}`,
+      text,
+      attachments: [],
+      intent: null,
+      state: 'local_only',
+      mayHaveServerCopy: false,
+      position,
+      walRevision: 1,
+      createdAt: position + 1,
+      updatedAt: position + 1,
+    }))
+    const { wal, records } = memoryWal(initial)
+    const { queue } = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      hasRpcMethod: () => false,
+    })
+    try {
+      await vi.waitFor(() => {
+        expect(queue.pendingQueue.value.map(item => item.text)).toEqual(['A', 'B'])
+      })
+      records.set(initial[0]!.pendingInputId, {
+        ...initial[0]!,
+        position: 1,
+        walRevision: 2,
+        updatedAt: 3,
+      })
+      records.set(initial[1]!.pendingInputId, {
+        ...initial[1]!,
+        position: 0,
+        walRevision: 2,
+        updatedAt: 3,
+      })
+
+      await queue.hydratePendingQueue(sessionKey)
+      expect(queue.pendingQueue.value.map(item => item.text)).toEqual(['B', 'A'])
+      expect(queue.pendingQueue.value.map(item => item.pendingWalRevision)).toEqual([2, 2])
+    } finally {
+      queue.cleanup()
+    }
   })
 
   it('retains a reclassified draft when the cancel acknowledgement is lost', async () => {
@@ -2356,6 +4115,215 @@ describe('useChatPendingQueue delivery state', () => {
       ownerRequestId,
     })
     source.queue.cleanup()
+  })
+
+  it('keeps a trash tombstone when cancellation commits before handoff acceptance', async () => {
+    const sourceSessionKey = 'agent:main:webchat:test'
+    const targetSessionKey = 'agent:main:webchat:handoff-cancel-first'
+    const ownerRequestId = 'owner-handoff-cancel-first'
+    const { handoffs, records, wal } = memoryWal()
+    enableAtomicPendingMutations(wal, records)
+    handoffs.set(ownerRequestId, {
+      schemaVersion: 1,
+      ownerRequestId,
+      requestSessionKey: sourceSessionKey,
+      clientRequestId: ownerRequestId,
+      clientMessageId: 'message-handoff-cancel-first',
+      params: {
+        sessionKey: sourceSessionKey,
+        message: 'cancel before accepting the handoff',
+        clientRequestId: ownerRequestId,
+        clientMessageId: 'message-handoff-cancel-first',
+      },
+      composerText: 'cancel before accepting the handoff',
+      recoveryAttachments: [],
+      state: 'submitting',
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    const beginCancellation = wal.beginCancellation!
+    let markCancellationCommitted!: () => void
+    let releaseCancellation!: () => void
+    const cancellationCommitted = new Promise<void>(resolve => {
+      markCancellationCommitted = resolve
+    })
+    const cancellationGate = new Promise<void>(resolve => { releaseCancellation = resolve })
+    wal.beginCancellation = vi.fn(async (record, expectedWalRevision, equivalentSessionKeys) => {
+      const mutation = await beginCancellation(
+        record,
+        expectedWalRevision,
+        equivalentSessionKeys,
+      )
+      markCancellationCommitted()
+      await cancellationGate
+      return mutation
+    })
+    const source = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      hasRpcMethod: () => false,
+    })
+    try {
+      source.inputText.value = 'cancel before accepting the handoff'
+      await source.queue.enqueuePendingInput(source.inputText.value, { ownerRequestId })
+      const pendingInputId = source.queue.pendingQueue.value[0]!.pendingInputId!
+
+      expect(source.queue.removePendingChip(pendingUiId(source.queue, 0))).toBe(true)
+      await cancellationCommitted
+      await source.queue.recoverPendingQueueHandoff(
+        sourceSessionKey,
+        targetSessionKey,
+        ownerRequestId,
+      )
+      expect(records.get(pendingInputId)).toMatchObject({
+        sessionKey: sourceSessionKey,
+        ownerRequestId,
+        state: 'cancelling',
+      })
+
+      releaseCancellation()
+      await vi.waitFor(() => expect([...records.values()]).toEqual([]))
+      source.queue.switchPendingQueue(targetSessionKey)
+      source.sessionKey.value = targetSessionKey
+      await source.queue.hydratePendingQueue(targetSessionKey)
+      expect(source.queue.pendingQueue.value).toEqual([])
+    } finally {
+      source.queue.cleanup()
+    }
+  })
+
+  it('lets destructive trash follow an identity migrated by handoff acceptance', async () => {
+    const sourceSessionKey = 'agent:main:webchat:test'
+    const targetSessionKey = 'agent:main:webchat:handoff-accept-first'
+    const ownerRequestId = 'owner-handoff-accept-first'
+    const { handoffs, records, wal } = memoryWal()
+    enableAtomicPendingMutations(wal, records)
+    handoffs.set(ownerRequestId, {
+      schemaVersion: 1,
+      ownerRequestId,
+      requestSessionKey: sourceSessionKey,
+      clientRequestId: ownerRequestId,
+      clientMessageId: 'message-handoff-accept-first',
+      params: {
+        sessionKey: sourceSessionKey,
+        message: 'accept while destructive trash is waiting',
+        clientRequestId: ownerRequestId,
+        clientMessageId: 'message-handoff-accept-first',
+      },
+      composerText: 'accept while destructive trash is waiting',
+      recoveryAttachments: [],
+      state: 'submitting',
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    const beginCancellation = wal.beginCancellation!
+    let markCancellationStarted!: () => void
+    let releaseCancellation!: () => void
+    const cancellationStarted = new Promise<void>(resolve => { markCancellationStarted = resolve })
+    const cancellationGate = new Promise<void>(resolve => { releaseCancellation = resolve })
+    let firstAttempt = true
+    let firstMutation: Awaited<ReturnType<NonNullable<PendingInputWal['beginCancellation']>>>
+    wal.beginCancellation = vi.fn(async (record, expectedWalRevision, equivalentSessionKeys) => {
+      if (firstAttempt) {
+        firstAttempt = false
+        markCancellationStarted()
+        await cancellationGate
+      }
+      const mutation = await beginCancellation(
+        record,
+        expectedWalRevision,
+        equivalentSessionKeys,
+      )
+      firstMutation ??= mutation
+      return mutation
+    })
+    const source = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      hasRpcMethod: () => false,
+    })
+    try {
+      source.inputText.value = 'accept while destructive trash is waiting'
+      await source.queue.enqueuePendingInput(source.inputText.value, { ownerRequestId })
+      const queuedItem = source.queue.pendingQueue.value[0]!
+      const pendingInputId = queuedItem.pendingInputId!
+
+      expect(source.queue.removePendingChip(pendingUiId(source.queue, 0))).toBe(true)
+      await cancellationStarted
+      await source.queue.recoverPendingQueueHandoff(
+        sourceSessionKey,
+        targetSessionKey,
+        ownerRequestId,
+      )
+      expect(records.get(pendingInputId)).toMatchObject({
+        sessionKey: targetSessionKey,
+        ownerRequestId: undefined,
+        state: 'saving',
+      })
+
+      releaseCancellation()
+      await vi.waitFor(() => expect(firstMutation).toBeDefined())
+      expect(firstMutation!.record).toMatchObject({
+        sessionKey: targetSessionKey,
+        clientRequestId: queuedItem.pendingClientRequestId,
+        clientMessageId: queuedItem.pendingClientMessageId,
+      })
+      await vi.waitFor(() => expect(records.get(pendingInputId)?.state).not.toBe('saving'))
+      expect(wal.beginCancellation).toHaveBeenCalledTimes(2)
+      await vi.waitFor(() => expect([...records.values()]).toEqual([]))
+      source.queue.switchPendingQueue(targetSessionKey)
+      source.sessionKey.value = targetSessionKey
+      await source.queue.hydratePendingQueue(targetSessionKey)
+      expect(source.queue.pendingQueue.value).toEqual([])
+      expect(wal.beginCancellation).toHaveBeenCalledTimes(2)
+    } finally {
+      source.queue.cleanup()
+    }
+  })
+
+  it('does not let failed-handoff reclassification overwrite peer cancellation', async () => {
+    const ownerRequestId = 'owner-failed-handoff-cancellation'
+    const { records, wal } = memoryWal()
+    const compareAndSwap = enableAtomicPendingMutations(wal, records)
+    const source = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      hasRpcMethod: () => false,
+    })
+    try {
+      source.inputText.value = 'keep cancellation over failed handoff'
+      await source.queue.enqueuePendingInput(source.inputText.value, { ownerRequestId })
+      const item = source.queue.pendingQueue.value[0]!
+      const pendingInputId = item.pendingInputId!
+      let markReclassificationStarted!: () => void
+      let releaseReclassification!: () => void
+      const reclassificationStarted = new Promise<void>(resolve => {
+        markReclassificationStarted = resolve
+      })
+      const reclassificationGate = new Promise<void>(resolve => {
+        releaseReclassification = resolve
+      })
+      vi.mocked(compareAndSwap).mockImplementationOnce(async () => {
+        markReclassificationStarted()
+        await reclassificationGate
+        const current = records.get(pendingInputId)
+        return { applied: false, record: current ? structuredClone(current) : null }
+      })
+
+      const failed = source.queue.failPendingQueueHandoff(ownerRequestId)
+      await reclassificationStarted
+      records.set(pendingInputId, {
+        ...records.get(pendingInputId)!,
+        state: 'cancelling',
+        retainAfterCancel: undefined,
+        walRevision: (records.get(pendingInputId)!.walRevision ?? 1) + 1,
+        updatedAt: Date.now(),
+      })
+      releaseReclassification()
+      await failed
+
+      expect(records.get(pendingInputId)).toMatchObject({ state: 'cancelling' })
+      expect(item.pendingPersistenceState).toBe('cancelling')
+    } finally {
+      source.queue.cleanup()
+    }
   })
 
   it('commits a staged reorder through the batch RPC before releasing drain', async () => {

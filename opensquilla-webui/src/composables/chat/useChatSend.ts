@@ -33,6 +33,7 @@ import type {
 import type { MetaRunCenter } from '@/modules/metaRunCenter'
 import type { ChatRpcStreamApi } from '@/composables/chat/useChatRpcEventHandlers'
 import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
+import type { AttachmentPreparationOptions } from '@/composables/chat/useChatAttachments'
 import type {
   BusySendMode,
   PendingCancelOptions,
@@ -227,6 +228,7 @@ interface ComposerSnapshot {
 }
 
 interface DispatchSendOptions {
+  attachmentOwnership: 'composer' | 'detached'
   composerText?: string
   promptAnnotationIds?: readonly string[]
   queueMode?: 'steer'
@@ -421,6 +423,12 @@ function sameSendableAttachments(
   })
 }
 
+const responseHandoffAttachmentOwners = new WeakMap<Attachment, string>()
+
+function responseHandoffAttachmentOwner(ownerRequestId: string, index: number): string {
+  return `${ownerRequestId}\u0000${index}`
+}
+
 function normalizeDocumentContext(value: unknown): TurnDocumentContext | null {
   if (!value || typeof value !== 'object') return null
   const raw = value as Record<string, unknown>
@@ -553,10 +561,7 @@ export interface UseChatSendOptions {
   bindActiveStreamTask?: (taskId: string) => void
   isCompactInFlightForCurrentSession: () => boolean
   hasPendingAttachmentWork: () => boolean
-  prepareAttachmentsForSend?: (options?: {
-    isCurrent?: () => boolean
-    attachments?: Attachment[]
-  }) => Promise<boolean>
+  prepareAttachmentsForSend?: (options?: AttachmentPreparationOptions) => Promise<boolean>
   preparePromptAnnotationsForSend?: (
     ids: readonly string[],
     options?: { isCurrent?: () => boolean },
@@ -800,6 +805,11 @@ export function useChatSend(options: UseChatSendOptions) {
       ? context.ownerRequestId
       : null
     return currentOwnerRequestId === snapshot.queueOwnerRequestId
+      || Boolean(
+        snapshot.queueOwnerRequestId === null
+        && currentOwnerRequestId === activeResponseHandoff?.ownerRequestId
+        && activeResponseHandoff.requestSessionKey === options.sessionKey.value,
+      )
   }
 
   function queueOwnerFromSnapshot(snapshot: ComposerSnapshot): PendingQueueOwner | undefined {
@@ -1262,8 +1272,10 @@ export function useChatSend(options: UseChatSendOptions) {
       durableRecord,
     }
     activeResponseHandoff = gate
-    if (durableRecord) {
-      options.pendingQueueOwnerContext.value = { sessionKey: requestSessionKey, ownerRequestId }
+    options.pendingQueueOwnerContext.value = {
+      sessionKey: requestSessionKey,
+      sourceSessionKey: requestSessionKey,
+      ownerRequestId,
     }
     return gate
   }
@@ -1562,6 +1574,7 @@ export function useChatSend(options: UseChatSendOptions) {
     if (activeResponseHandoff === gate) {
       options.pendingQueueOwnerContext.value = {
         sessionKey: key,
+        sourceSessionKey: gate.requestSessionKey,
         ownerRequestId: gate.ownerRequestId,
       }
     }
@@ -1703,17 +1716,30 @@ export function useChatSend(options: UseChatSendOptions) {
         .filter(Boolean)
         .join('\n')
     }
-    const existingAttachmentIds = new Set(
+    const usedLocalIds = new Set(
       options.pendingAttachments.value.map(attachment => attachment.local_id),
     )
-    const missingAttachments = record.recoveryAttachments.filter(attachment => (
-      !existingAttachmentIds.has(attachment.local_id)
-    ))
+    let nextRecoveredLocalId = -1
+    const missingAttachments = record.recoveryAttachments.flatMap((attachment, index) => {
+      const owner = responseHandoffAttachmentOwner(record.ownerRequestId, index)
+      if (options.pendingAttachments.value.some(candidate => (
+        responseHandoffAttachmentOwners.get(candidate) === owner
+      ))) return []
+      while (usedLocalIds.has(nextRecoveredLocalId)) nextRecoveredLocalId -= 1
+      const localId = nextRecoveredLocalId
+      usedLocalIds.add(localId)
+      nextRecoveredLocalId -= 1
+      return [{ attachment: { ...attachment, local_id: localId }, owner }]
+    })
     if (missingAttachments.length > 0) {
       options.pendingAttachments.value = [
-        ...missingAttachments.map(attachment => ({ ...attachment })),
+        ...missingAttachments.map(entry => entry.attachment),
         ...options.pendingAttachments.value,
       ]
+      for (const [index, entry] of missingAttachments.entries()) {
+        const restored = options.pendingAttachments.value[index]
+        if (restored) responseHandoffAttachmentOwners.set(restored, entry.owner)
+      }
     }
     const forkBeforeMessageId = typeof record.params.forkBeforeMessageId === 'string'
       ? record.params.forkBeforeMessageId
@@ -1801,6 +1827,7 @@ export function useChatSend(options: UseChatSendOptions) {
               const ready = await options.prepareAttachmentsForSend!({
                 attachments: refreshed,
                 isCurrent: () => true,
+                ownership: 'detached',
               })
               const sendable = refreshed.filter(isSendableAttachment)
               if (ready && sendable.length === refreshed.length) {
@@ -2289,6 +2316,7 @@ export function useChatSend(options: UseChatSendOptions) {
       if (options.sessionKey.value !== requestSessionKey) return
       if (replayBlockedReason?.value) return
       await dispatchSend(exactReplayAttempt.text, {
+        attachmentOwnership: 'detached',
         composerText,
         promptAnnotationIds: exactReplayAttempt.promptAnnotationIds,
         queueMode: exactReplayAttempt.queueMode,
@@ -2344,6 +2372,7 @@ export function useChatSend(options: UseChatSendOptions) {
       })
     ) {
       await dispatchSend(text, {
+        attachmentOwnership: 'composer',
         composerText,
         promptAnnotationIds: recoveredAttempt.promptAnnotationIds,
         queueMode: recoveredAttempt.queueMode,
@@ -2483,6 +2512,7 @@ export function useChatSend(options: UseChatSendOptions) {
     if (!hasPayload || !options.sessionKey.value) return
 
     await dispatchSend(text, {
+      attachmentOwnership: 'composer',
       composerText,
       promptAnnotationIds: composerSnapshot.promptAnnotationIds,
       payload: payloadFromSnapshot(composerSnapshot),
@@ -2644,6 +2674,7 @@ export function useChatSend(options: UseChatSendOptions) {
       return dispatchSteerV2(text, { queuedItem: item })
     }
     const outcome = await dispatchSend(dispatchText, {
+      attachmentOwnership: 'detached',
       composerText: item.text,
       promptAnnotationIds: item.promptAnnotationIds || [],
       payload: {
@@ -2686,7 +2717,7 @@ export function useChatSend(options: UseChatSendOptions) {
 
   async function dispatchSend(
     text: string,
-    sendOpts: DispatchSendOptions = {},
+    sendOpts: DispatchSendOptions,
   ): Promise<ChatSendOutcome> {
     const requestSessionKey = options.sessionKey.value
     if (!requestSessionKey) return 'not_sent'
@@ -2816,10 +2847,15 @@ export function useChatSend(options: UseChatSendOptions) {
       ? sendOpts.durablePendingItem
       : undefined
     if (!retryAttempt && !serverStagedPendingItem && options.prepareAttachmentsForSend) {
-      const ready = await options.prepareAttachmentsForSend({
-        isCurrent: () => options.sessionKey.value === requestSessionKey,
-        ...(sendOpts.payload ? { attachments: sourceAttachments } : {}),
-      })
+      const isCurrent = () => options.sessionKey.value === requestSessionKey
+      const preparationOptions: AttachmentPreparationOptions = sendOpts.attachmentOwnership === 'detached'
+        ? { ownership: 'detached', attachments: sourceAttachments, isCurrent }
+        : {
+            ownership: 'composer',
+            isCurrent,
+            ...(sendOpts.payload ? { attachments: sourceAttachments } : {}),
+          }
+      const ready = await options.prepareAttachmentsForSend(preparationOptions)
       if (!ready) return 'not_sent'
       if (options.sessionKey.value !== requestSessionKey) return 'not_sent'
       if (!preDispatchAllowed()) return 'not_sent'
@@ -2909,12 +2945,47 @@ export function useChatSend(options: UseChatSendOptions) {
       return true
     }
     let durableHandoffRecord: ResponseHandoffWalRecord | null = null
+    const responseHandoffState: { gate: ResponseHandoffGate | null } = { gate: null }
+    let consumeComposerSnapshotAfterHandoffPersistence = false
+    const ensureResponseHandoffSourceFence = (): ResponseHandoffGate | null => {
+      const currentAttempt = attempt
+      if (!currentAttempt) return null
+      responseHandoffState.gate ||= beginResponseHandoff(
+        requestSessionKey,
+        currentAttempt.clientRequestId,
+        durableHandoffRecord,
+      )
+      return responseHandoffState.gate
+    }
+    const persistResponseHandoffIntoGate = async (
+      requirePrepared = false,
+    ): Promise<ResponseHandoffWalRecord | null> => {
+      const currentAttempt = attempt
+      const gate = ensureResponseHandoffSourceFence()
+      if (!currentAttempt || !gate) return null
+      const record = await persistResponseHandoff(currentAttempt, requirePrepared)
+      if (record) gate.durableRecord = record
+      return record
+    }
     const rejectBeforeDispatch = async (): Promise<ChatSendOutcome> => {
       if (attempt && sendOpts.acceptedVisibleReplay) {
         sendOpts.rememberRetryableAttempt?.(attempt)
       }
       await discardUnsentResponseHandoff(durableHandoffRecord)
+      finishResponseHandoff(responseHandoffState.gate)
+      responseHandoffState.gate = null
       return 'not_sent'
+    }
+    const revalidateAfterHandoffPersistence = (): boolean => {
+      if (options.sessionKey.value !== requestSessionKey) return false
+      if (
+        sendOpts.composerSnapshot
+        && !composerMatchesSnapshot(sendOpts.composerSnapshot)
+      ) {
+        preserveComposer = true
+        consumeComposerSnapshotAfterHandoffPersistence = true
+      }
+      return preDispatchAllowed()
     }
     if (!attempt) {
       const durablePendingItem = sendOpts.durablePendingItem
@@ -2978,14 +3049,13 @@ export function useChatSend(options: UseChatSendOptions) {
         params,
       }
       if (attempt.forkBeforeMessageId) {
-        durableHandoffRecord = await persistResponseHandoff(
-          attempt,
+        durableHandoffRecord = await persistResponseHandoffIntoGate(
           sendOpts.requirePreparedHandoff,
         )
         if (sendOpts.requirePreparedHandoff && !durableHandoffRecord) {
           return rejectBeforeDispatch()
         }
-        if (!preDispatchAllowed()) return rejectBeforeDispatch()
+        if (!revalidateAfterHandoffPersistence()) return rejectBeforeDispatch()
       }
       if (!sendOpts.acceptedVisibleReplay) {
         const now = new Date().toISOString()
@@ -3005,14 +3075,13 @@ export function useChatSend(options: UseChatSendOptions) {
       }
     }
     if (attempt.forkBeforeMessageId && !durableHandoffRecord) {
-      durableHandoffRecord = await persistResponseHandoff(
-        attempt,
+      durableHandoffRecord = await persistResponseHandoffIntoGate(
         sendOpts.requirePreparedHandoff,
       )
       if (sendOpts.requirePreparedHandoff && !durableHandoffRecord) {
         return rejectBeforeDispatch()
       }
-      if (!preDispatchAllowed()) return rejectBeforeDispatch()
+      if (!revalidateAfterHandoffPersistence()) return rejectBeforeDispatch()
     }
     if (!preDispatchAllowed()) return rejectBeforeDispatch()
     if (!preserveComposer) options.closeSlashMenu()
@@ -3039,6 +3108,21 @@ export function useChatSend(options: UseChatSendOptions) {
       options.pendingAttachments.value = options.pendingAttachments.value.filter(
         attachment => !originalAttachmentRefs.has(attachment),
       )
+      if (consumeComposerSnapshotAfterHandoffPersistence) {
+        if (options.inputText.value === sendOpts.composerSnapshot.inputText) {
+          options.inputText.value = ''
+        }
+        if (options.pendingSessionIntent.value === sendOpts.composerSnapshot.intent) {
+          options.pendingSessionIntent.value = null
+        }
+        if (
+          options.pendingForkBeforeMessageId.value
+          === sendOpts.composerSnapshot.forkBeforeMessageId
+        ) {
+          options.pendingForkBeforeMessageId.value = null
+        }
+        options.autoResizeTextarea()
+      }
     }
     // A steer send rides an already-active stream; restarting it would wipe
     // the partial output of the run being steered.
@@ -3068,8 +3152,12 @@ export function useChatSend(options: UseChatSendOptions) {
         return rejectBeforeDispatch()
       }
       durableHandoffRecord = armed
+      if (responseHandoffState.gate) responseHandoffState.gate.durableRecord = armed
       if (!preDispatchAllowed('before_rpc')) {
         durableHandoffRecord = await disarmResponseHandoff(armed, attempt) || armed
+        if (responseHandoffState.gate) {
+          responseHandoffState.gate.durableRecord = durableHandoffRecord
+        }
         if (freshSendToken && activeFreshSendToken === freshSendToken) {
           activeFreshSendToken = null
           options.activeStreamTaskId.value = ''
@@ -3080,15 +3168,7 @@ export function useChatSend(options: UseChatSendOptions) {
       }
     }
     options.aborted.value = false
-    let responseHandoff = (
-      attempt.forkBeforeMessageId
-        ? beginResponseHandoff(
-            requestSessionKey,
-            attempt.clientRequestId,
-            durableHandoffRecord,
-        )
-        : null
-    )
+    if (attempt.forkBeforeMessageId) ensureResponseHandoffSourceFence()
     const acceptanceTransaction = beginAcceptanceTransaction(
       requestSessionKey,
       freshSendToken,
@@ -3142,12 +3222,12 @@ export function useChatSend(options: UseChatSendOptions) {
       const accepted = noteAcceptedTask(res, requestSessionKey)
       const taskId = accepted.taskId
       const terminalStatus = terminalResponseStatus(res)
-      if (responseHandoff) {
-        responseHandoff.acceptedTaskId = taskId
-        responseHandoff.terminalResponse = Boolean(terminalStatus)
+      if (responseHandoffState.gate) {
+        responseHandoffState.gate.acceptedTaskId = taskId
+        responseHandoffState.gate.terminalResponse = Boolean(terminalStatus)
       }
       const stoppedByUser = acceptanceTransaction.stoppedByUser
-        || responseHandoff?.stoppedByUser === true
+        || responseHandoffState.gate?.stoppedByUser === true
       const lostFreshStream = !wasStreaming
         && !freshSendStillOwnsStream(freshSendToken, requestSessionKey)
       if (stoppedByUser || lostFreshStream) {
@@ -3197,18 +3277,17 @@ export function useChatSend(options: UseChatSendOptions) {
           && options.sessionKey.value === requestSessionKey
           && acceptedSessionKey !== requestSessionKey
         ) {
-          durableHandoffRecord ||= await persistResponseHandoff(attempt)
-          responseHandoff ||= beginResponseHandoff(
-            requestSessionKey,
-            attempt.clientRequestId,
-            durableHandoffRecord,
-          )
+          const responseHandoff = ensureResponseHandoffSourceFence()!
+          durableHandoffRecord ||= await persistResponseHandoffIntoGate()
           responseHandoff.stoppedByUser = true
           responseHandoff.acceptedTaskId = taskId
           responseHandoff.terminalResponse = Boolean(terminalStatus)
           await handoffResponseSession(acceptedSessionKey, responseHandoff)
-        } else if (responseHandoff && acceptedSessionKey === requestSessionKey) {
-          await handoffResponseSession(requestSessionKey, responseHandoff)
+        } else if (
+          responseHandoffState.gate
+          && acceptedSessionKey === requestSessionKey
+        ) {
+          await handoffResponseSession(requestSessionKey, responseHandoffState.gate)
         }
         return 'accepted'
       }
@@ -3242,17 +3321,13 @@ export function useChatSend(options: UseChatSendOptions) {
           responseSession: decision.responseSessionKey,
           current: options.sessionKey.value,
         })
-        durableHandoffRecord ||= await persistResponseHandoff(attempt)
-        responseHandoff ||= beginResponseHandoff(
-          requestSessionKey,
-          attempt.clientRequestId,
-          durableHandoffRecord,
-        )
+        const responseHandoff = ensureResponseHandoffSourceFence()!
+        durableHandoffRecord ||= await persistResponseHandoffIntoGate()
         responseHandoff.acceptedTaskId = taskId
         responseHandoff.terminalResponse = Boolean(terminalStatus)
         await handoffResponseSession(decision.responseSessionKey, responseHandoff)
-      } else if (responseHandoff && decision.reason === 'same_session') {
-        await handoffResponseSession(requestSessionKey, responseHandoff)
+      } else if (responseHandoffState.gate && decision.reason === 'same_session') {
+        await handoffResponseSession(requestSessionKey, responseHandoffState.gate)
       } else if (decision.reason === 'current_session_changed') {
         recordSessionNavigationDiag('send.response.stale', {
           requestSession: requestSessionKey,
@@ -3313,7 +3388,7 @@ export function useChatSend(options: UseChatSendOptions) {
         }
       }
       const stoppedByUser = acceptanceTransaction.stoppedByUser
-        || responseHandoff?.stoppedByUser === true
+        || responseHandoffState.gate?.stoppedByUser === true
       if (stoppedByUser) {
         if (acceptedError?.terminalWithoutTask || rpcError?.accepted === false) {
           clearAcceptanceStop(acceptanceTransaction)
@@ -3352,12 +3427,8 @@ export function useChatSend(options: UseChatSendOptions) {
           options.activeStreamSessionKey.value = ''
           options.stream.endStreaming()
         }
-        durableHandoffRecord ||= await persistResponseHandoff(attempt)
-        responseHandoff ||= beginResponseHandoff(
-          requestSessionKey,
-          attempt.clientRequestId,
-          durableHandoffRecord,
-        )
+        const responseHandoff = ensureResponseHandoffSourceFence()!
+        durableHandoffRecord ||= await persistResponseHandoffIntoGate()
         responseHandoff.stoppedByUser = stoppedByUser
         responseHandoff.terminalResponse = acceptedError.terminalWithoutTask
         await handoffResponseSession(acceptedSessionKey, responseHandoff)
@@ -3374,8 +3445,8 @@ export function useChatSend(options: UseChatSendOptions) {
         return 'accepted'
       }
       if (acceptedError && options.sessionKey.value === requestSessionKey) {
-        if (responseHandoff && acceptedSessionKey === requestSessionKey) {
-          await handoffResponseSession(requestSessionKey, responseHandoff)
+        if (responseHandoffState.gate && acceptedSessionKey === requestSessionKey) {
+          await handoffResponseSession(requestSessionKey, responseHandoffState.gate)
         }
         bindUserMessageId(attempt.clientMessageId, acceptedError.messageId)
         options.scheduleHistorySync()
@@ -3401,11 +3472,11 @@ export function useChatSend(options: UseChatSendOptions) {
         options.activeStreamSessionKey.value = ''
         options.stream.endStreaming()
       }
-      if (responseHandoff && rpcError?.accepted === false) {
+      if (responseHandoffState.gate && rpcError?.accepted === false) {
         if (sendOpts.requirePreparedHandoff && rpcError.retryable !== false) {
-          await resetResponseHandoffForRetry(responseHandoff, attempt)
+          await resetResponseHandoffForRetry(responseHandoffState.gate, attempt)
         } else if (rpcError.retryable === false) {
-          await markResponseHandoffFailed(responseHandoff, err)
+          await markResponseHandoffFailed(responseHandoffState.gate, err)
         }
       }
       rememberRetryableAttempt(true)
@@ -3421,7 +3492,7 @@ export function useChatSend(options: UseChatSendOptions) {
     } finally {
       attempt.acceptanceInFlight = false
       finishAcceptanceTransaction(acceptanceTransaction)
-      finishResponseHandoff(responseHandoff)
+      finishResponseHandoff(responseHandoffState.gate)
     }
   }
 
@@ -3465,6 +3536,9 @@ export function useChatSend(options: UseChatSendOptions) {
         && (anchor.attachments?.length ?? 0) === 0,
       )
     }
+    const replayOwnsResponseFence = () => (
+      activeResponseHandoff?.ownerRequestId === stableClientRequestId
+    )
     const replayIsBlocked = (allowOwnedStream = false) => (
       options.sessionKey.value !== requestSessionKey
       || !replayAnchorIsCurrent()
@@ -3473,10 +3547,13 @@ export function useChatSend(options: UseChatSendOptions) {
       || (!allowOwnedStream && options.stream.isStreaming.value)
       || hasAuthoritativeWork()
       || options.isCompactInFlightForCurrentSession()
-      || responseHandoffBlocksCurrentSession()
+      || (responseHandoffBlocksCurrentSession() && !replayOwnsResponseFence())
       || Boolean(handoffRecoveryPromise)
       || options.hasPendingQueueWork?.() === true
-      || options.pendingQueueOwnerContext.value?.sessionKey === requestSessionKey
+      || (
+        options.pendingQueueOwnerContext.value?.sessionKey === requestSessionKey
+        && options.pendingQueueOwnerContext.value.ownerRequestId !== stableClientRequestId
+      )
     )
     if (replayIsBlocked()) return false
 
@@ -3504,6 +3581,7 @@ export function useChatSend(options: UseChatSendOptions) {
     usageBarrierReplayInFlight = true
     try {
       const outcome = await dispatchSend(text, {
+        attachmentOwnership: 'detached',
         payload: {
           attachments: [],
           intent: null,
@@ -3548,7 +3626,7 @@ export function useChatSend(options: UseChatSendOptions) {
     ) {
       options.inputText.value = [attempt.composerText, currentText].filter(Boolean).join('\n')
     }
-    restoreSendableAttachments(attempt.attachments)
+    restoreSendableAttachments(attempt.attachments, attempt.clientRequestId)
     if (!options.pendingSessionIntent.value) options.pendingSessionIntent.value = attempt.intent
     if (!options.pendingForkBeforeMessageId.value) {
       options.pendingForkBeforeMessageId.value = attempt.forkBeforeMessageId
@@ -3561,12 +3639,46 @@ export function useChatSend(options: UseChatSendOptions) {
     options.autoResizeTextarea()
   }
 
-  function restoreSendableAttachments(attachments: SendableAttachment[]) {
+  function restoreSendableAttachments(
+    attachments: SendableAttachment[],
+    ownerRequestId: string,
+  ) {
     if (attachments.length === 0) return
-    const currentLocalIds = new Set(options.pendingAttachments.value.map(attachment => attachment.local_id))
-    const missing = attachments.filter(attachment => !currentLocalIds.has(attachment.local_id))
-    if (missing.length > 0) {
-      options.pendingAttachments.value = [...missing, ...options.pendingAttachments.value]
+    const additions: Array<{ attachment: SendableAttachment, owner: string }> = []
+    const usedLocalIds = new Set(
+      options.pendingAttachments.value.map(attachment => attachment.local_id),
+    )
+    let nextRecoveredLocalId = -1
+    for (const [index, attachment] of attachments.entries()) {
+      const owner = responseHandoffAttachmentOwner(ownerRequestId, index)
+      const current = options.pendingAttachments.value.find(candidate => (
+        isSendableAttachment(candidate)
+        && candidate.local_id === attachment.local_id
+        && JSON.stringify(serializeSendableAttachment(candidate))
+          === JSON.stringify(serializeSendableAttachment(attachment))
+      ))
+      if (current) {
+        responseHandoffAttachmentOwners.set(current, owner)
+      } else {
+        let restored = attachment
+        if (usedLocalIds.has(restored.local_id)) {
+          while (usedLocalIds.has(nextRecoveredLocalId)) nextRecoveredLocalId -= 1
+          restored = { ...restored, local_id: nextRecoveredLocalId }
+          nextRecoveredLocalId -= 1
+        }
+        usedLocalIds.add(restored.local_id)
+        additions.push({ attachment: restored, owner })
+      }
+    }
+    if (additions.length > 0) {
+      options.pendingAttachments.value = [
+        ...additions.map(entry => entry.attachment),
+        ...options.pendingAttachments.value,
+      ]
+      for (const [index, entry] of additions.entries()) {
+        const restored = options.pendingAttachments.value[index]
+        if (restored) responseHandoffAttachmentOwners.set(restored, entry.owner)
+      }
     }
   }
 

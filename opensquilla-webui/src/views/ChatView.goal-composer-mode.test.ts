@@ -28,7 +28,7 @@ describe('ChatView Goal and Plan composer mode exclusivity', () => {
     const bindProject = source.indexOf(
       'freshTaskDraft.bindMaterializedProjectTask(key, workspaceId)',
     )
-    const switchSession = source.indexOf('await switchToSession(key)')
+    const adoptSession = source.indexOf('await adoptMaterializedSession(key)')
 
     expect(start).toBeGreaterThanOrEqual(0)
     expect(end).toBeGreaterThan(start)
@@ -42,10 +42,27 @@ describe('ChatView Goal and Plan composer mode exclusivity', () => {
     expect(staleNavigationFence).toBeGreaterThan(createSession)
     expect(staleProjectFence).toBeGreaterThan(staleNavigationFence)
     expect(persistRouting).toBeGreaterThan(staleProjectFence)
-    expect(persistRouting).toBeLessThan(switchSession)
+    expect(persistRouting).toBeLessThan(adoptSession)
     expect(bindProject).toBeGreaterThan(staleProjectFence)
-    expect(bindProject).toBeLessThan(switchSession)
-    expect(switchSession).toBeGreaterThan(createSession)
+    expect(bindProject).toBeLessThan(adoptSession)
+    expect(adoptSession).toBeGreaterThan(createSession)
+    expect(source).not.toContain('await switchToSession(key)')
+  })
+
+  it('preserves Goal draft attachments for accepted and rejected registration', () => {
+    const start = chatViewSource.indexOf('async function onComposerSend()')
+    const end = chatViewSource.indexOf('\nsendCurrentInput = onComposerSend', start)
+    const source = chatViewSource.slice(start, end)
+    const startGoal = source.indexOf('const started = await startGoal(goalText)')
+    const rejectGoal = source.indexOf('if (!started) return', startGoal)
+    const clearText = source.indexOf("inputText.value = ''", rejectGoal)
+
+    expect(start).toBeGreaterThanOrEqual(0)
+    expect(end).toBeGreaterThan(start)
+    expect(startGoal).toBeGreaterThanOrEqual(0)
+    expect(rejectGoal).toBeGreaterThan(startGoal)
+    expect(clearText).toBeGreaterThan(rejectGoal)
+    expect(source).not.toContain('pendingAttachments.value')
   })
 
   it('projects the durably accepted Goal source row before history catches up', () => {

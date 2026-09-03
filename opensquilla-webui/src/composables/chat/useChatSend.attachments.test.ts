@@ -39,6 +39,7 @@ import {
 import { RpcTransportError } from '@/lib/rpc'
 import type {
   PendingInputWal,
+  PendingInputWalRecord,
   ResponseHandoffWalRecord,
 } from '@/utils/chat/pendingInputWal'
 
@@ -270,6 +271,244 @@ function usageReplayMessages(): ChatMessage[] {
     },
   ]
 }
+
+describe('useChatSend response-handoff persistence boundary', () => {
+  function delayedHandoffWal() {
+    let retained: ResponseHandoffWalRecord | null = null
+    let markPersistStarted!: () => void
+    let releasePersist!: () => void
+    let firstWrite = true
+    const persistStarted = new Promise<void>(resolve => { markPersistStarted = resolve })
+    const persistGate = new Promise<void>(resolve => { releasePersist = resolve })
+    const wal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      putHandoff: vi.fn(async record => {
+        retained = structuredClone(record)
+        if (firstWrite) {
+          firstWrite = false
+          markPersistStarted()
+          await persistGate
+        }
+      }),
+      deleteHandoff: vi.fn(async () => { retained = null }),
+      acceptHandoff: async (ownerRequestId, acceptedSessionKey) => {
+        if (!retained || retained.ownerRequestId !== ownerRequestId) {
+          throw new Error('missing handoff')
+        }
+        const handoff: ResponseHandoffWalRecord = {
+          ...retained,
+          state: 'accepted',
+          acceptedSessionKey,
+          updatedAt: Date.now(),
+        }
+        retained = handoff
+        return { handoff, records: [] }
+      },
+      close: () => {},
+    }
+    return {
+      wal,
+      persistStarted,
+      releasePersist,
+      retained: () => retained,
+    }
+  }
+
+  it('stops a delayed fork send after A-to-B navigation without touching B composer', async () => {
+    const parentSessionKey = 'agent:main:webchat:persist-parent'
+    const childSessionKey = 'agent:main:webchat:persist-other'
+    const sessionKey = ref(parentSessionKey)
+    const inputText = ref('parent draft')
+    const parentAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 31,
+      name: 'parent.txt',
+      mime: 'text/plain',
+      file_uuid: 'parent-upload',
+    }
+    const childAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 32,
+      name: 'child.txt',
+      mime: 'text/plain',
+      file_uuid: 'child-upload',
+    }
+    const pendingAttachments = ref<Attachment[]>([parentAttachment])
+    const pendingSessionIntent = ref<string | null>(null)
+    const pendingForkBeforeMessageId = ref<string | null>('parent-message')
+    const pendingQueueOwnerContext = ref<UseChatSendOptions['pendingQueueOwnerContext']['value']>(null)
+    const queuedRecords = new Map<string, PendingInputWalRecord>()
+    const pendingQueue = useChatPendingQueue({
+      sessionKey,
+      ownerContext: pendingQueueOwnerContext,
+      inputText,
+      pendingAttachments,
+      pendingSessionIntent,
+      isStreaming: ref(false),
+      isBlocked: () => false,
+      autoResizeTextarea: vi.fn(),
+      sendCurrentInput: vi.fn(),
+      resetInputHistory: vi.fn(),
+      hasComposer: () => true,
+      pendingInputWal: {
+        put: async record => { queuedRecords.set(record.pendingInputId, structuredClone(record)) },
+        list: async key => [...queuedRecords.values()].filter(record => record.sessionKey === key),
+        delete: async pendingInputId => { queuedRecords.delete(pendingInputId) },
+        close: () => {},
+      },
+    })
+    inputText.value = 'queued source draft'
+    expect(await pendingQueue.enqueuePendingInput(inputText.value)).toBe(true)
+    const queuedSourceId = pendingQueue.pendingQueue.value[0]!.pendingUiId
+    inputText.value = 'parent draft'
+    pendingAttachments.value = [parentAttachment]
+    const delayed = delayedHandoffWal()
+    const { api, options, rpc } = makeOptions({
+      sessionKey,
+      inputText,
+      pendingAttachments,
+      pendingSessionIntent,
+      pendingForkBeforeMessageId,
+      pendingQueueOwnerContext,
+      pendingInputWal: delayed.wal,
+    })
+
+    const sending = api.onSend()
+    await delayed.persistStarted
+    expect(pendingQueueOwnerContext.value).toMatchObject({
+      sessionKey: parentSessionKey,
+      sourceSessionKey: parentSessionKey,
+    })
+    expect(pendingQueue.editPendingItem(queuedSourceId)).toBe(false)
+    expect(pendingQueue.popPendingTail()).toBe(false)
+    expect(pendingQueue.popAllPendingIntoComposer()).toBe(false)
+    sessionKey.value = childSessionKey
+    inputText.value = 'child draft'
+    pendingAttachments.value = [childAttachment]
+    pendingForkBeforeMessageId.value = null
+    delayed.releasePersist()
+    await sending
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.messages.value).toEqual([])
+    expect(inputText.value).toBe('child draft')
+    expect(pendingAttachments.value).toEqual([childAttachment])
+    expect(delayed.retained()).toBeNull()
+    expect(pendingQueueOwnerContext.value).toBeNull()
+    pendingQueue.cleanup()
+  })
+
+  it('releases the source fence when prepared handoff persistence fails', async () => {
+    let markPrepareStarted!: () => void
+    let releasePrepare!: () => void
+    const prepareStarted = new Promise<void>(resolve => { markPrepareStarted = resolve })
+    const prepareGate = new Promise<void>(resolve => { releasePrepare = resolve })
+    const pendingInputWal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      prepareHandoff: async () => {
+        markPrepareStarted()
+        await prepareGate
+        return { applied: false, record: null }
+      },
+      compareAndSwapHandoff: async () => ({ applied: false, record: null }),
+      close: () => {},
+    }
+    const pendingQueueOwnerContext = ref<UseChatSendOptions['pendingQueueOwnerContext']['value']>(null)
+    const { api, rpc } = makeOptions({
+      messages: ref(usageReplayMessages()),
+      pendingInputWal,
+      pendingQueueOwnerContext,
+    })
+
+    const replay = api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })
+    await prepareStarted
+    expect(pendingQueueOwnerContext.value).toMatchObject({
+      sessionKey: 'agent:main:webchat:test',
+      sourceSessionKey: 'agent:main:webchat:test',
+    })
+
+    releasePrepare()
+
+    expect(await replay).toBe(false)
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(pendingQueueOwnerContext.value).toBeNull()
+  })
+
+  it('does not mistake its own source fence for a composer edit', async () => {
+    const sessionKey = ref('agent:main:webchat:persist-unchanged')
+    const inputText = ref('unchanged draft')
+    const pendingForkBeforeMessageId = ref<string | null>('parent-message')
+    const delayed = delayedHandoffWal()
+    const { api, rpc } = makeOptions({
+      sessionKey,
+      inputText,
+      pendingForkBeforeMessageId,
+      pendingInputWal: delayed.wal,
+    })
+    rpc.call.mockResolvedValue({ sessionKey: sessionKey.value })
+
+    const sending = api.onSend()
+    await delayed.persistStarted
+    delayed.releasePersist()
+    await sending
+
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(inputText.value).toBe('')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+  })
+
+  it('sends only the persisted snapshot while preserving newer same-session content', async () => {
+    const sessionKey = ref('agent:main:webchat:persist-same-session')
+    const inputText = ref('persisted draft')
+    const persistedAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 41,
+      name: 'persisted.txt',
+      mime: 'text/plain',
+      file_uuid: 'persisted-upload',
+    }
+    const newerAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 42,
+      name: 'newer.txt',
+      mime: 'text/plain',
+      file_uuid: 'newer-upload',
+    }
+    const pendingAttachments = ref<Attachment[]>([persistedAttachment])
+    const pendingForkBeforeMessageId = ref<string | null>('parent-message')
+    const delayed = delayedHandoffWal()
+    const { api, rpc } = makeOptions({
+      sessionKey,
+      inputText,
+      pendingAttachments,
+      pendingForkBeforeMessageId,
+      pendingInputWal: delayed.wal,
+    })
+    rpc.call.mockResolvedValue({ sessionKey: sessionKey.value })
+
+    const sending = api.onSend()
+    await delayed.persistStarted
+    inputText.value = 'newer draft'
+    pendingAttachments.value = [persistedAttachment, newerAttachment]
+    delayed.releasePersist()
+    await sending
+
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      sessionKey: sessionKey.value,
+      message: 'persisted draft',
+      attachments: [expect.objectContaining({ name: 'persisted.txt' })],
+    }))
+    expect(inputText.value).toBe('newer draft')
+    expect(pendingAttachments.value).toEqual([newerAttachment])
+  })
+})
 
 describe('useChatSend dedicated usage-barrier replay', () => {
   it('atomically admits only one of two cross-tab clicks for the same barrier', async () => {
@@ -1273,8 +1512,88 @@ describe('useChatSend attachment payloads', () => {
 
     expect(rpc.call).not.toHaveBeenCalled()
     expect(inputText.value).toBe('restore the fork draft')
-    expect(pendingAttachments.value).toEqual([attachment])
+    expect(pendingAttachments.value).toEqual([{
+      ...attachment,
+      local_id: -1,
+    }])
     expect(pendingForkBeforeMessageId.value).toBe('fork-source-message')
+    expect(retained).toBeNull()
+  })
+
+  it('restores a delayed failed handoff attachment when a new upload reuses its local id', async () => {
+    const sessionKey = 'agent:main:webchat:failed-fork-reload'
+    const recoveredAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 1,
+      name: 'recover-after-reload.txt',
+      mime: 'text/plain',
+      file_uuid: 'old-handoff-upload',
+    }
+    const newAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 1,
+      name: 'new-after-reload.txt',
+      mime: 'text/plain',
+      file_uuid: 'new-upload',
+    }
+    const record: ResponseHandoffWalRecord = {
+      schemaVersion: 1,
+      ownerRequestId: 'failed-reload-request',
+      requestSessionKey: sessionKey,
+      clientRequestId: 'failed-reload-request',
+      clientMessageId: 'failed-reload-message',
+      composerText: 'restore after delayed hydration',
+      recoveryAttachments: [recoveredAttachment],
+      params: {
+        sessionKey,
+        clientRequestId: 'failed-reload-request',
+        clientMessageId: 'failed-reload-message',
+        message: 'restore after delayed hydration',
+        forkBeforeMessageId: 'fork-before-reload',
+      },
+      state: 'failed',
+      errorCode: 'ATTACHMENT_EXPIRED',
+      createdAt: 1,
+      updatedAt: 2,
+    }
+    let retained: ResponseHandoffWalRecord | null = record
+    let releaseList!: () => void
+    let markListStarted!: () => void
+    const listStarted = new Promise<void>(resolve => { markListStarted = resolve })
+    const listGate = new Promise<void>(resolve => { releaseList = resolve })
+    const pendingInputWal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      listHandoffs: async () => {
+        markListStarted()
+        await listGate
+        return retained ? [structuredClone(retained)] : []
+      },
+      deleteHandoff: async () => { retained = null },
+      close: () => {},
+    }
+    const inputText = ref('')
+    const pendingAttachments = ref<Attachment[]>([])
+    const { api } = makeOptions({
+      sessionKey: ref(sessionKey),
+      inputText,
+      pendingAttachments,
+      pendingInputWal,
+    })
+
+    const recovery = api.recoverResponseHandoffs()
+    await listStarted
+    pendingAttachments.value = [newAttachment]
+    releaseList()
+    await recovery
+
+    expect(inputText.value).toBe('restore after delayed hydration')
+    expect(pendingAttachments.value).toEqual([
+      { ...recoveredAttachment, local_id: -1 },
+      newAttachment,
+    ])
+    expect(new Set(pendingAttachments.value.map(attachment => attachment.local_id)).size).toBe(2)
     expect(retained).toBeNull()
   })
 
@@ -1356,6 +1675,10 @@ describe('useChatSend attachment payloads', () => {
     await api.recoverResponseHandoffs()
 
     expect(prepareAttachmentsForSend).toHaveBeenCalledOnce()
+    expect(prepareAttachmentsForSend).toHaveBeenCalledWith(expect.objectContaining({
+      ownership: 'detached',
+      isCurrent: expect.any(Function),
+    }))
     expect(rpc.call).toHaveBeenCalledTimes(2)
     const replay = rpc.call.mock.calls[1]?.[1] as { attachments?: Array<{ file_uuid?: string }> }
     expect(replay.attachments?.[0]?.file_uuid).toBe('refreshed-upload')
@@ -2939,6 +3262,11 @@ describe('useChatSend attachment payloads', () => {
     await api.onSend()
 
     expect(prepareAttachmentsForSend).toHaveBeenCalledTimes(1)
+    expect(prepareAttachmentsForSend).toHaveBeenCalledWith(expect.objectContaining({
+      ownership: 'composer',
+      attachments: expect.any(Array),
+      isCurrent: expect.any(Function),
+    }))
     expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
       attachments: [
         { type: 'application/pdf', file_uuid: 'file-fresh', mime: 'application/pdf', name: 'ready.pdf' },
@@ -3337,6 +3665,44 @@ describe('useChatSend attachment payloads', () => {
     expect(pendingAttachments.value).toEqual([])
     expect(pendingSessionIntent.value).toBeNull()
     expect(pendingForkBeforeMessageId.value).toBeNull()
+  })
+
+  it('re-keys a rejected attempt attachment that collides with a newer draft', async () => {
+    const attempted: Attachment = {
+      kind: 'staged',
+      local_id: 1,
+      name: 'attempted.pdf',
+      mime: 'application/pdf',
+      file_uuid: 'file-attempted',
+    }
+    const newer: Attachment = {
+      kind: 'staged',
+      local_id: 1,
+      name: 'newer.pdf',
+      mime: 'application/pdf',
+      file_uuid: 'file-newer',
+    }
+    let rejectSend!: (error: unknown) => void
+    const rpc = {
+      call: vi.fn(() => new Promise<never>((_resolve, reject) => { rejectSend = reject })),
+    }
+    const inputText = ref('attempt this send')
+    const pendingAttachments = ref<Attachment[]>([attempted])
+    const { api } = makeOptions({ rpc, inputText, pendingAttachments })
+
+    const sending = api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalled())
+    inputText.value = 'newer composer draft'
+    pendingAttachments.value = [newer]
+    rejectSend(Object.assign(new Error('database busy'), { accepted: false }))
+    await sending
+
+    expect(pendingAttachments.value.map(attachment => attachment.name))
+      .toEqual(['attempted.pdf', 'newer.pdf'])
+    expect(pendingAttachments.value.map(attachment => attachment.local_id))
+      .toEqual([-1, 1])
+    expect(new Set(pendingAttachments.value.map(attachment => attachment.local_id)).size)
+      .toBe(2)
   })
 
   it('moves an ambiguous v2 steer into an exact-id retry instead of resending as follow-up', async () => {
