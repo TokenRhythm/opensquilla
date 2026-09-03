@@ -1537,7 +1537,6 @@ async def _ensemble_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
     return result.to_payload()
 
 
-@_d.method("onboarding.channel.probe", scope="operator.admin")
 async def _channel_probe(params: Any, ctx: RpcContext) -> dict[str, Any]:
     from opensquilla.onboarding.mutations import (
         merge_channel_entry_secrets,
@@ -1774,7 +1773,6 @@ def _live_apply_fields(live: dict[str, str] | None, names: list[str]) -> dict[st
     return {"restartRequired": pending, "liveApply": live}
 
 
-@_d.method("onboarding.channel.upsert", scope="operator.admin")
 async def _channel_upsert(params: Any, ctx: RpcContext) -> dict[str, Any]:
     from opensquilla.onboarding.mutations import upsert_channel
 
@@ -1799,7 +1797,6 @@ async def _channel_upsert(params: Any, ctx: RpcContext) -> dict[str, Any]:
     }
 
 
-@_d.method("onboarding.channel.remove", scope="operator.admin")
 async def _channel_remove(params: Any, ctx: RpcContext) -> dict[str, Any]:
     from opensquilla.onboarding.mutations import remove_channel
 
@@ -1841,12 +1838,10 @@ async def _toggle(ctx: RpcContext, params: Any, enabled: bool) -> dict[str, Any]
     }
 
 
-@_d.method("onboarding.channel.enable", scope="operator.admin")
 async def _channel_enable(params: Any, ctx: RpcContext) -> dict[str, Any]:
     return await _toggle(ctx, params, True)
 
 
-@_d.method("onboarding.channel.disable", scope="operator.admin")
 async def _channel_disable(params: Any, ctx: RpcContext) -> dict[str, Any]:
     return await _toggle(ctx, params, False)
 
@@ -1886,6 +1881,11 @@ _PLATFORM_SETUP_IMPLEMENTATIONS = {
     "onboarding.memory_embedding.configure": _memory_embedding_configure,
     "onboarding.audio.configure": _audio_configure,
     "onboarding.capability.reset": _capability_reset,
+    "onboarding.channel.probe": _channel_probe,
+    "onboarding.channel.upsert": _channel_upsert,
+    "onboarding.channel.remove": _channel_remove,
+    "onboarding.channel.enable": _channel_enable,
+    "onboarding.channel.disable": _channel_disable,
 }
 
 _PLATFORM_SETUP_CONTRACT_HANDLERS = {

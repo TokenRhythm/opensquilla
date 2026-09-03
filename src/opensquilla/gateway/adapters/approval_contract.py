@@ -24,6 +24,9 @@ APPROVAL_CONTRACT_METHODS: Final = (
     "exec.approval.snapshot",
     "exec.approval.resolve",
     "exec.approval.extend",
+    "plugin.approval.status",
+    "plugin.approval.resolve",
+    "plugin.approval.extend",
 )
 
 

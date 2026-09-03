@@ -19,6 +19,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from opensquilla.gateway.adapters.memory_profile_import_contract import (
+    register_memory_profile_import_contract,
+)
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
 from opensquilla.provider.auxiliary_budget import (
     ensure_auxiliary_text_fits,
@@ -1162,7 +1166,6 @@ async def _artifact_agent(
     return normalize_agent_id(str(agent_id or "main"))
 
 
-@_d.method("memory.import.info", scope="operator.read")
 async def _handle_memory_import_info(
     params: dict | None,
     ctx: RpcContext,
@@ -1227,7 +1230,6 @@ async def _handle_memory_import_preview(
     return wire
 
 
-@_d.method("memory.import.start", scope="operator.admin")
 async def _handle_memory_import_start(
     params: dict | None,
     ctx: RpcContext,
@@ -1264,7 +1266,6 @@ async def _handle_memory_import_start(
     return wire
 
 
-@_d.method("memory.import.status", scope="operator.admin")
 async def _handle_memory_import_status(
     params: dict | None,
     ctx: RpcContext,
@@ -1289,7 +1290,6 @@ async def _handle_memory_import_status(
     return wire
 
 
-@_d.method("memory.import.retry", scope="operator.admin")
 async def _handle_memory_import_retry(
     params: dict | None,
     ctx: RpcContext,
@@ -1322,7 +1322,6 @@ async def _handle_memory_import_retry(
     return wire
 
 
-@_d.method("memory.import.cancel", scope="operator.admin")
 async def _handle_memory_import_cancel(
     params: dict | None,
     ctx: RpcContext,
@@ -1348,7 +1347,6 @@ async def _handle_memory_import_cancel(
     return wire
 
 
-@_d.method("memory.import.apply", scope="operator.admin")
 async def _handle_memory_import_apply(
     params: dict | None,
     ctx: RpcContext,
@@ -1387,7 +1385,6 @@ async def _handle_memory_import_apply(
     return wire
 
 
-@_d.method("memory.import.undo", scope="operator.admin")
 async def _handle_memory_import_undo(
     params: dict | None,
     ctx: RpcContext,
@@ -1448,7 +1445,6 @@ async def _handle_memory_import_undo(
     return wire
 
 
-@_d.method("memory.import.discard", scope="operator.admin")
 async def _handle_memory_import_discard(
     params: dict | None,
     ctx: RpcContext,
@@ -1500,3 +1496,26 @@ async def _handle_memory_import_discard(
             }
         )
     return wire
+
+
+_MEMORY_PROFILE_IMPORT_CONTRACT_IMPLEMENTATIONS = {
+    "memory.import.info": _handle_memory_import_info,
+    "memory.import.start": _handle_memory_import_start,
+    "memory.import.status": _handle_memory_import_status,
+    "memory.import.retry": _handle_memory_import_retry,
+    "memory.import.cancel": _handle_memory_import_cancel,
+    "memory.import.apply": _handle_memory_import_apply,
+    "memory.import.undo": _handle_memory_import_undo,
+    "memory.import.discard": _handle_memory_import_discard,
+}
+
+_MEMORY_PROFILE_IMPORT_CONTRACT_HANDLERS = {
+    method: register_memory_profile_import_contract(
+        _d,
+        method,
+        implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+    for method, implementation in _MEMORY_PROFILE_IMPORT_CONTRACT_IMPLEMENTATIONS.items()
+}

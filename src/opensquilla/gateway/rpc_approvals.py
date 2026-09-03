@@ -347,7 +347,6 @@ async def _handle_exec_approval_extend(params: dict | None, ctx: RpcContext) -> 
     return approval_extend_rpc_payload(queue, params["id"], seconds)
 
 
-@_d.method("plugin.approval.extend", scope="operator.approvals")
 async def _handle_plugin_approval_extend(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict) or "id" not in params:
         raise ValueError("params.id is required")
@@ -384,7 +383,6 @@ async def _handle_plugin_approval_wait_decision(
     )
 
 
-@_d.method("plugin.approval.status", scope="operator.approvals")
 async def _handle_plugin_approval_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict) or not str(params.get("id") or "").strip():
         raise ValueError("params.id is required")
@@ -395,7 +393,6 @@ async def _handle_plugin_approval_status(params: dict | None, ctx: RpcContext) -
     )
 
 
-@_d.method("plugin.approval.resolve", scope="operator.approvals")
 async def _handle_plugin_approval_resolve(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict) or "id" not in params:
         raise ValueError("params.id is required")
@@ -422,6 +419,9 @@ _EXEC_APPROVAL_CONTRACT_IMPLEMENTATIONS = {
     "exec.approval.snapshot": _handle_exec_approval_snapshot,
     "exec.approval.resolve": _handle_exec_approval_resolve,
     "exec.approval.extend": _handle_exec_approval_extend,
+    "plugin.approval.status": _handle_plugin_approval_status,
+    "plugin.approval.resolve": _handle_plugin_approval_resolve,
+    "plugin.approval.extend": _handle_plugin_approval_extend,
 }
 
 _EXEC_APPROVAL_CONTRACT_HANDLERS = {

@@ -27,6 +27,13 @@ EXPECTED_PLATFORM_CONFIGURATION_METHODS = (
     "models.routing.get",
     "models.routing.set",
 )
+EXPECTED_CHANNEL_SETUP_METHODS = (
+    "onboarding.channel.probe",
+    "onboarding.channel.upsert",
+    "onboarding.channel.remove",
+    "onboarding.channel.enable",
+    "onboarding.channel.disable",
+)
 
 
 def test_platform_configuration_contract_owns_the_existing_methods() -> None:
@@ -59,11 +66,19 @@ def test_platform_configuration_registration_uses_generated_identity_and_scope(
 
 def test_onboarding_catalog_is_part_of_the_existing_setup_contract() -> None:
     assert "onboarding.catalog" in PLATFORM_SETUP_CONTRACT_METHODS
+    assert all(
+        method in PLATFORM_SETUP_CONTRACT_METHODS
+        for method in EXPECTED_CHANNEL_SETUP_METHODS
+    )
 
 
 @pytest.mark.parametrize(
     "method",
-    (*EXPECTED_PLATFORM_CONFIGURATION_METHODS, "onboarding.catalog"),
+    (
+        *EXPECTED_PLATFORM_CONFIGURATION_METHODS,
+        "onboarding.catalog",
+        *EXPECTED_CHANNEL_SETUP_METHODS,
+    ),
 )
 def test_runtime_platform_entries_are_generated_contract_bound(method: str) -> None:
     entry = get_dispatcher().get_entry(method)

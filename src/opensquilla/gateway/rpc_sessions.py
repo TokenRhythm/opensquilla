@@ -73,6 +73,7 @@ from opensquilla.gateway.adapters.pending_input_queue_contract import (
 )
 from opensquilla.gateway.adapters.plans_contract import (
     register_plans_cancel_run_contract,
+    register_plans_capabilities_contract,
     register_plans_implement_contract,
     register_plans_revise_contract,
     register_plans_set_mode_contract,
@@ -11548,7 +11549,6 @@ async def _goal_owned_plan_run_for_revision(
     )
 
 
-@_d.method("plans.capabilities", scope="operator.read")
 async def _handle_plans_capabilities(
     _params: dict | None,
     _ctx: RpcContext,
@@ -12289,6 +12289,12 @@ _handle_plans_revise_contract = register_plans_revise_contract(
 _handle_plans_cancel_run_contract = register_plans_cancel_run_contract(
     _d,
     _handle_plans_cancel_run,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_plans_capabilities_contract = register_plans_capabilities_contract(
+    _d,
+    _handle_plans_capabilities,
     internal_error=RpcHandlerError,
     guest_allowed_checker=is_guest_rpc_method_allowed,
 )

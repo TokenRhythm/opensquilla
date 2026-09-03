@@ -22,18 +22,27 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         "src/opensquilla/gateway/adapters/sessions_search_contract.py",
         "src/opensquilla/contracts/adapters/sessions_changed_contract.py",
         "src/opensquilla/contracts/adapters/conversation_events.py",
-        # S16-A keeps approval wire models at the dormant ApprovalCenter
-        # boundary; no Gateway handler or UI consumer may import them yet.
+        # Approval wire models terminate at the dormant UI boundary and the
+        # strict Gateway registration Adapter; the queue remains the single
+        # business implementation.
         "src/opensquilla/contracts/adapters/approval_center_contract.py",
+        "src/opensquilla/gateway/adapters/approval_contract.py",
         # S17 keeps the two migrated Goal operations behind GoalCenter; the
         # remaining Goal mutations stay on the legacy path.  S18 adds the
         # Gateway registration boundary without changing their implementation.
         "src/opensquilla/contracts/adapters/goals_contract.py",
         "src/opensquilla/gateway/adapters/goals_contract.py",
         "src/opensquilla/gateway/adapters/plans_contract.py",
+        # Strict profile-import wire models terminate at their registration
+        # Adapter; the existing profile service and job runner remain the only
+        # business implementations.
+        "src/opensquilla/gateway/adapters/memory_profile_import_contract.py",
         # Session read Contracts are consumed only by the Gateway registration
         # Adapter; Application Modules and handlers receive domain values.
         "src/opensquilla/gateway/adapters/session_read_contract.py",
+        # Session control wire models terminate at the generated registration
+        # Adapter; session runtime owns subscriptions and routing state.
+        "src/opensquilla/gateway/adapters/session_control_contract.py",
         # Session lifecycle wire models terminate at the registration Adapter;
         # the Application Module receives transport-neutral typed commands.
         "src/opensquilla/gateway/adapters/session_lifecycle_contract.py",
@@ -79,6 +88,12 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         # Platform setup wire models terminate at the generated registration
         # Adapter; Application Modules receive transport-neutral commands.
         "src/opensquilla/gateway/adapters/platform_setup_contract.py",
+        # Configuration wire models likewise terminate at their registration
+        # Adapter; settings, provider, and routing Modules remain wire-neutral.
+        "src/opensquilla/gateway/adapters/platform_configuration_contract.py",
+        # Workspace and path-picker wire models terminate at this registration
+        # Adapter; existing workspace and sandbox handlers keep behavior.
+        "src/opensquilla/gateway/adapters/workspace_catalog_contract.py",
     }
 )
 GENERATED_METADATA_IMPORT_ALLOWLIST = frozenset(
@@ -156,7 +171,7 @@ SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
 SESSIONS_RESOLVE_LITERAL_ALLOWLIST: Counter[str] = Counter()
 SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
 RUNTIME_RPC_METHOD_BASELINE = 306
-STATIC_RPC_DECORATOR_BASELINE = 140
+STATIC_RPC_DECORATOR_BASELINE = 103
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
 # closure measurement below.  The temporary S2a cumulative growth budget was
@@ -1052,6 +1067,26 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "doctor.status",
             "logs.status",
             "logs.tail",
+            "plugin.approval.status",
+            "plugin.approval.resolve",
+            "plugin.approval.extend",
+            "memory.import.info",
+            "memory.import.start",
+            "memory.import.status",
+            "memory.import.retry",
+            "memory.import.cancel",
+            "memory.import.apply",
+            "memory.import.undo",
+            "memory.import.discard",
+            "onboarding.channel.probe",
+            "onboarding.channel.upsert",
+            "onboarding.channel.remove",
+            "onboarding.channel.enable",
+            "onboarding.channel.disable",
+            "plans.capabilities",
+            "sandbox.path.list",
+            "sandbox.path.create-directory",
+            "sandbox.path.pick",
         }
     ] == []
     assert [

@@ -21,6 +21,9 @@ from opensquilla.gateway.adapters.contract_method import (
 
 WORKSPACE_CATALOG_CONTRACT_METHODS: Final = (
     "workspaces.list",
+    "sandbox.path.list",
+    "sandbox.path.create-directory",
+    "sandbox.path.pick",
 )
 
 
