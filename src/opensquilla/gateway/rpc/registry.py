@@ -22,7 +22,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 import structlog
@@ -497,7 +497,7 @@ async def _status(params: Any, ctx: RpcContext) -> dict[str, Any]:
     from opensquilla.application.observability import RuntimeStatus
     from opensquilla.gateway.adapters.observability import GatewayRuntimeStatusPort
 
-    return await RuntimeStatus(GatewayRuntimeStatusPort(ctx)).read()
+    return cast(dict[str, Any], await RuntimeStatus(GatewayRuntimeStatusPort(ctx)).read())
 
 
 async def _config_get(params: Any, ctx: RpcContext) -> Any:
