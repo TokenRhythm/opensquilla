@@ -16,6 +16,8 @@ from opensquilla.session_key import canonicalize_session_key
 
 type TurnAdmissionSurface = Literal["webchat", "session"]
 type TurnSteerMode = Literal["durable", "legacy"]
+type InitialCollaborationMode = Literal["default", "plan"]
+type InitialRoutingMode = Literal["direct", "router", "ensemble"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +34,8 @@ class AdmitTurn:
     message: str
     surface: TurnAdmissionSurface
     attributes: Mapping[str, Any]
+    initial_collaboration_mode: InitialCollaborationMode | None = None
+    initial_routing_mode: InitialRoutingMode | None = None
     pending_input: PendingInputGuard | None = None
 
 
@@ -54,12 +58,20 @@ class SteerTurn:
     pending_input: PendingInputGuard | None = None
 
 
-class TurnAdmissionRuntimePort(Protocol):
-    """Existing durable ingress/runtime state machines, hidden from callers."""
+class TurnIngressPort(Protocol):
+    """Durably accept one typed turn command."""
 
     async def admit(self, command: AdmitTurn) -> Mapping[str, Any]: ...
 
+
+class TurnCancellationPort(Protocol):
+    """Cancel runtime work without widening an exact-task request."""
+
     async def cancel(self, command: CancelTurn) -> Mapping[str, Any]: ...
+
+
+class TurnSteeringPort(Protocol):
+    """Attach input to the selected running-turn steering state machine."""
 
     async def steer(self, command: SteerTurn) -> Mapping[str, Any]: ...
 
@@ -67,15 +79,23 @@ class TurnAdmissionRuntimePort(Protocol):
 class TurnAdmission:
     """One application implementation for canonical and legacy turn commands."""
 
-    def __init__(self, runtime: TurnAdmissionRuntimePort) -> None:
-        self._runtime = runtime
+    def __init__(
+        self,
+        *,
+        ingress: TurnIngressPort,
+        cancellation: TurnCancellationPort,
+        steering: TurnSteeringPort,
+    ) -> None:
+        self._ingress = ingress
+        self._cancellation = cancellation
+        self._steering = steering
 
     async def admit(self, command: AdmitTurn) -> Mapping[str, Any]:
         key = self._session_key(command.session_key)
         if not isinstance(command.message, str):
             raise ValueError("message must be a string")
         self._validate_pending_guard(command.pending_input)
-        return await self._runtime.admit(replace(command, session_key=key))
+        return await self._ingress.admit(replace(command, session_key=key))
 
     async def cancel(self, command: CancelTurn) -> Mapping[str, Any]:
         key = self._session_key(command.session_key)
@@ -85,7 +105,7 @@ class TurnAdmission:
         if command.task_scoped and task_id is None:
             # Never broaden an exact-task cancellation into a session-wide one.
             return {"aborted": False, "key": key, "reason": "task_id_required"}
-        return await self._runtime.cancel(
+        return await self._cancellation.cancel(
             replace(command, session_key=key, task_id=task_id)
         )
 
@@ -96,7 +116,7 @@ class TurnAdmission:
         if not command.message.strip():
             raise ValueError("message must not be blank")
         self._validate_pending_guard(command.pending_input, require_source=True)
-        return await self._runtime.steer(replace(command, session_key=key))
+        return await self._steering.steer(replace(command, session_key=key))
 
     @staticmethod
     def _validate_pending_guard(
@@ -124,10 +144,14 @@ class TurnAdmission:
 __all__ = [
     "AdmitTurn",
     "CancelTurn",
+    "InitialCollaborationMode",
+    "InitialRoutingMode",
     "PendingInputGuard",
     "SteerTurn",
     "TurnAdmission",
-    "TurnAdmissionRuntimePort",
+    "TurnCancellationPort",
+    "TurnIngressPort",
     "TurnAdmissionSurface",
+    "TurnSteeringPort",
     "TurnSteerMode",
 ]

@@ -36,7 +36,16 @@ from opensquilla.application.session_read import (
     SessionWorkspaceState,
     deferred_session_read_metadata,
 )
-from opensquilla.application.turn_admission import PendingInputGuard
+from opensquilla.application.turn_admission import (
+    AdmitTurn,
+    CancelTurn,
+    PendingInputGuard,
+    SteerTurn,
+    TurnAdmission,
+    TurnCancellationPort,
+    TurnIngressPort,
+    TurnSteeringPort,
+)
 from opensquilla.artifacts import enrich_artifact_event_dict
 from opensquilla.attachment_refs import (
     PENDING_CHAT_INPUT_MATERIAL_STORE,
@@ -48,6 +57,8 @@ from opensquilla.attachment_refs import (
     read_pending_chat_input_promotions,
     transcript_material_path,
 )
+from opensquilla.chat.conversation import ChatSendRequest, sessions_send_params
+from opensquilla.chat.source import chat_source_metadata
 from opensquilla.contracts.adapters.sessions_changed_contract import (
     SESSIONS_CHANGED_EVENT,
     observe_sessions_changed_payload,
@@ -131,7 +142,6 @@ from opensquilla.gateway.adapters.sessions_search_contract import (
 )
 from opensquilla.gateway.adapters.turn_admission import (
     GatewayTurnAdmissionAdapter,
-    GatewayTurnAdmissionCallbacks,
 )
 from opensquilla.gateway.adapters.turn_admission_contract import (
     register_turn_admission_contract,
@@ -11214,49 +11224,277 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
     }
 
 
-async def _execute_pending_session_send(
+class _GatewayTurnAdmissionPorts(
+    TurnIngressPort,
+    TurnCancellationPort,
+    TurnSteeringPort,
+):
+    """Concrete request-scoped Ports over the existing durable state machines."""
+
+    def __init__(self, context: RpcContext) -> None:
+        self._context = context
+
+    @staticmethod
+    def _params(
+        session_key: str,
+        message: str | None,
+        attributes: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        params = dict(attributes)
+        params["key"] = session_key
+        if message is not None:
+            params["message"] = message
+        return params
+
+    async def admit(self, command: AdmitTurn) -> Mapping[str, Any]:
+        params = self._params(
+            command.session_key,
+            command.message,
+            command.attributes,
+        )
+        if command.pending_input is not None:
+            guard = command.pending_input
+            return await _handle_sessions_send(
+                params,
+                self._context,
+                fingerprint_params=dict(params),
+                pending_input_id=guard.pending_input_id,
+                pending_input_fingerprint=guard.request_fingerprint,
+                pending_input_revision=guard.expected_revision,
+            )
+        if command.surface == "webchat":
+            params["sessionKey"] = command.session_key
+            return await _execute_webchat_turn(command, params, self._context)
+        return await _handle_sessions_send(params, self._context)
+
+    async def cancel(self, command: CancelTurn) -> Mapping[str, Any]:
+        params = self._params(command.session_key, None, command.attributes)
+        if command.task_id is not None:
+            params["task_id"] = command.task_id
+        if command.task_scoped:
+            params["scope"] = "task"
+        if command.source is not None:
+            params["source"] = command.source
+        if command.surface != "webchat":
+            return await _handle_sessions_abort(params, self._context)
+        if self._context.session_manager is None:
+            return {
+                "ok": True,
+                "sessionKey": command.session_key,
+                "aborted": False,
+            }
+        params["source"] = command.source or "webui_abort"
+        result = await _handle_sessions_abort(params, self._context)
+        return {"sessionKey": command.session_key, **result}
+
+    async def steer(self, command: SteerTurn) -> Mapping[str, Any]:
+        params = self._params(
+            command.session_key,
+            command.message,
+            command.attributes,
+        )
+        if command.pending_input is not None:
+            guard = command.pending_input
+            return await _handle_sessions_steer_v2_impl(
+                params,
+                self._context,
+                pending_input_id=guard.pending_input_id,
+                pending_input_fingerprint=guard.request_fingerprint,
+                pending_input_revision=guard.expected_revision,
+                pending_source_scope=guard.source_scope,
+            )
+        if command.mode == "durable":
+            return await _handle_sessions_steer_v2(params, self._context)
+        return await _handle_sessions_steer(params, self._context)
+
+
+async def _execute_webchat_turn(
+    command: AdmitTurn,
     params: dict[str, Any],
     ctx: RpcContext,
-    guard: PendingInputGuard,
 ) -> dict[str, Any]:
-    return await _handle_sessions_send(
-        params,
-        ctx,
-        fingerprint_params=dict(params),
-        pending_input_id=guard.pending_input_id,
-        pending_input_fingerprint=guard.request_fingerprint,
-        pending_input_revision=guard.expected_revision,
+    """Project WebChat semantics onto the single durable session ingress."""
+
+    message = command.message
+    session_key = command.session_key
+    agent_id = parse_agent_id(session_key)
+    initial_collaboration_mode = command.initial_collaboration_mode
+    initial_routing_mode = command.initial_routing_mode
+    prompt_annotation_ids = params.get(
+        "promptAnnotationIds",
+        params.get("prompt_annotation_ids"),
     )
+    document_context = params.get(
+        "documentContext",
+        params.get("document_context"),
+    )
+    if prompt_annotation_ids is not None:
+        if not isinstance(prompt_annotation_ids, list):
+            raise ValueError("params.promptAnnotationIds must be an array")
+        if any(
+            not isinstance(item, str) or not item.strip()
+            for item in prompt_annotation_ids
+        ):
+            raise ValueError(
+                "params.promptAnnotationIds must contain non-empty strings"
+            )
+        prompt_annotation_ids = [item.strip() for item in prompt_annotation_ids]
+
+    if ctx.session_manager is None:
+        if prompt_annotation_ids or document_context is not None:
+            raise RpcUnavailableError("Artifact context requires durable session storage")
+        if initial_collaboration_mode is not None or initial_routing_mode is not None:
+            raise RpcUnavailableError(
+                "Initial session controls require atomic turn acceptance"
+            )
+        return {"ok": True, "sessionKey": session_key, "instant_accept": True}
+
+    mgr = ctx.session_manager
+    intent = params.get("intent")
+    intent_was_provided = intent is not None
+    requested_intent = intent
+    if intent is None and (
+        isinstance(params.get("workspaceId"), str)
+        or isinstance(params.get("workspace_id"), str)
+    ):
+        intent = "new_chat"
+
+    try:
+        if intent != "new_chat":
+            storage = getattr(mgr, "storage", None) or getattr(mgr, "_storage", None)
+            get_session = getattr(storage, "get_session", None)
+            if callable(get_session):
+                try:
+                    if await get_session(session_key) is None:
+                        intent = "new_chat"
+                except Exception as exc:
+                    raise RpcUnavailableError(
+                        f"Failed to inspect chat session: {exc}"
+                    ) from exc
+            else:
+                try:
+                    await mgr.get_or_create(
+                        session_key=session_key,
+                        agent_id=agent_id,
+                        display_name="WebChat",
+                    )
+                except Exception as exc:
+                    raise RpcUnavailableError(
+                        f"Failed to initialize chat session: {exc}"
+                    ) from exc
+
+        incoming_source = params.get("_source")
+        if not isinstance(incoming_source, dict):
+            incoming_source = {}
+
+        elevated_hint = incoming_source.get("elevated")
+        run_mode_hint = incoming_source.get("runMode") or incoming_source.get(
+            "run_mode"
+        )
+        attachments = params.get("attachments")
+        extra: dict[str, Any] = {}
+        for source_key, target_key in (
+            ("noMemoryCapture", "noMemoryCapture"),
+            ("no_memory_capture", "no_memory_capture"),
+            ("inputProvenance", "inputProvenance"),
+            ("input_provenance", "input_provenance"),
+            ("inputProvenanceKind", "inputProvenanceKind"),
+            ("input_provenance_kind", "input_provenance_kind"),
+            ("provenance_kind", "provenance_kind"),
+            ("runKind", "runKind"),
+            ("run_kind", "run_kind"),
+            ("queueMode", "queueMode"),
+            ("queue_mode", "queue_mode"),
+            ("forkBeforeMessageId", "forkBeforeMessageId"),
+            ("fork_before_message_id", "fork_before_message_id"),
+            ("clientRequestId", "clientRequestId"),
+            ("client_request_id", "client_request_id"),
+            ("clientMessageId", "clientMessageId"),
+            ("client_message_id", "client_message_id"),
+            ("surfaceId", "surfaceId"),
+            ("surface_id", "surface_id"),
+            ("workspaceId", "workspaceId"),
+            ("workspace_id", "workspace_id"),
+            ("promptAnnotationIds", "promptAnnotationIds"),
+            ("prompt_annotation_ids", "promptAnnotationIds"),
+            ("documentContext", "documentContext"),
+            ("document_context", "documentContext"),
+            ("initialRoutingMode", "initialRoutingMode"),
+            ("initial_routing_mode", "initial_routing_mode"),
+        ):
+            if source_key in params:
+                extra[target_key] = params[source_key]
+        send_params = sessions_send_params(
+            ChatSendRequest(
+                session_key=session_key,
+                message=message,
+                attachments=attachments if isinstance(attachments, list) else [],
+                display_text=(
+                    params.get("displayText") if "displayText" in params else None
+                ),
+                intent=cast(str, intent) if intent is not None else None,
+                extra=extra,
+            ),
+            chat_source_metadata(
+                caller_kind="web",
+                channel_kind="webchat",
+                channel_id=f"webchat:{session_key}",
+                sender_id=ctx.principal.role,
+                source_kind="webui",
+                source_name="WebChat",
+                elevated=(
+                    elevated_hint if isinstance(elevated_hint, str) else None
+                ),
+                run_mode=run_mode_hint if isinstance(run_mode_hint, str) else None,
+            ),
+        )
+        fingerprint_params = dict(send_params)
+        if intent_was_provided:
+            fingerprint_params["intent"] = requested_intent
+        else:
+            fingerprint_params.pop("intent", None)
+        if initial_collaboration_mode is not None:
+            fingerprint_params["initialCollaborationMode"] = (
+                initial_collaboration_mode
+            )
+        if initial_routing_mode is not None:
+            fingerprint_params["initialRoutingMode"] = initial_routing_mode
+        if prompt_annotation_ids is not None:
+            send_params["promptAnnotationIds"] = prompt_annotation_ids
+            fingerprint_params["promptAnnotationIds"] = prompt_annotation_ids
+        result = await _handle_sessions_send(
+            send_params,
+            ctx,
+            fingerprint_params=fingerprint_params,
+            initial_collaboration_mode=initial_collaboration_mode,
+            initial_routing_mode=initial_routing_mode,
+        )
+        result_session_key = result.get("sessionKey") or result.get("key") or session_key
+        return {"ok": True, "sessionKey": result_session_key, **result}
+    except Exception:
+        marker = getattr(ctx, "turn_runner", None)
+        clear = getattr(marker, "clear_compacted_this_turn", None)
+        if callable(clear):
+            clear(session_key)
+        raise
 
 
-async def _execute_pending_session_steer(
-    params: dict[str, Any],
+def build_gateway_turn_admission_adapter(
     ctx: RpcContext,
-    guard: PendingInputGuard,
-) -> dict[str, Any]:
-    return await _handle_sessions_steer_v2_impl(
-        params,
-        ctx,
-        pending_input_id=guard.pending_input_id,
-        pending_input_fingerprint=guard.request_fingerprint,
-        pending_input_revision=guard.expected_revision,
-        pending_source_scope=guard.source_scope,
+) -> GatewayTurnAdmissionAdapter:
+    """Compose the request-scoped Gateway Ports for every turn wire alias."""
+    ports = _GatewayTurnAdmissionPorts(ctx)
+    return GatewayTurnAdmissionAdapter(
+        TurnAdmission(
+            ingress=ports,
+            cancellation=ports,
+            steering=ports,
+        )
     )
 
 
 def _session_turn_admission_adapter(ctx: RpcContext) -> GatewayTurnAdmissionAdapter:
-    return GatewayTurnAdmissionAdapter(
-        ctx,
-        GatewayTurnAdmissionCallbacks(
-            require_key=_require_key,
-            execute_session_send=_handle_sessions_send,
-            execute_session_abort=_handle_sessions_abort,
-            execute_durable_steer=_handle_sessions_steer_v2,
-            execute_legacy_steer=_handle_sessions_steer,
-            execute_pending_send=_execute_pending_session_send,
-            execute_pending_steer=_execute_pending_session_steer,
-        ),
-    )
+    return build_gateway_turn_admission_adapter(ctx)
 
 
 async def _handle_sessions_send_contract(

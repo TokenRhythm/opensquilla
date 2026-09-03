@@ -322,16 +322,6 @@ SESSION_MAINTENANCE_AUTHORED_LOC_CEILING = 3_000
 APPROVED_PRIVATE_RPC_IMPORTS: Counter[tuple[str, str, str]] = Counter(
     {
         (
-            "src/opensquilla/gateway/rpc_chat.py",
-            "opensquilla.gateway.rpc_sessions",
-            "_handle_sessions_abort",
-        ): 1,
-        (
-            "src/opensquilla/gateway/rpc_chat.py",
-            "opensquilla.gateway.rpc_sessions",
-            "_handle_sessions_send",
-        ): 1,
-        (
             "src/opensquilla/gateway/rpc_sessions.py",
             "opensquilla.gateway.rpc_chat",
             "_handle_chat_history",

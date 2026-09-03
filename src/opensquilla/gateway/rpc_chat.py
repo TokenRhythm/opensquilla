@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any, cast
 from urllib.parse import quote
 from uuid import uuid4
@@ -19,9 +19,7 @@ from opensquilla.artifact_session import (
     MutationAttemptStatus,
     document_mutation_outcome_from_attempt,
 )
-from opensquilla.chat.conversation import ChatSendRequest, sessions_send_params
 from opensquilla.chat.history import transcript_entries_to_chat_messages
-from opensquilla.chat.source import chat_source_metadata
 from opensquilla.gateway.adapters.conversation_ancillary import (
     GatewayConversationAncillaryAdapter,
     GatewayConversationAncillaryCallbacks,
@@ -38,7 +36,7 @@ from opensquilla.gateway.adapters.session_read_contract import (
 )
 from opensquilla.gateway.adapters.turn_admission import (
     GatewayTurnAdmissionAdapter,
-    GatewayTurnAdmissionCallbacks,
+    webchat_session_key,
 )
 from opensquilla.gateway.adapters.turn_admission_contract import (
     register_turn_admission_contract,
@@ -71,7 +69,6 @@ from opensquilla.observability.network_policy import (
 from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.session.compaction import build_compaction_config_from_provider
 from opensquilla.session.compaction_lifecycle import new_compaction_id
-from opensquilla.session.keys import build_webchat_key, canonicalize_session_key, parse_agent_id
 from opensquilla.session.storage import (
     StorageBusyError,
     bounded_interactive_storage_reads,
@@ -86,11 +83,25 @@ from opensquilla.turn_outcome_projection import (
 _d = get_dispatcher()
 log = structlog.get_logger(__name__)
 
-_WEBCHAT_SESSION_KEY = build_webchat_key()
 _CHAT_HISTORY_DEFAULT_LIMIT = 50
 _CHAT_HISTORY_MAX_LIMIT = 200
 _CHAT_HISTORY_LOCK_BUDGET_SECONDS = 2.0
 _CHAT_HISTORY_RETRY_AFTER_MS = 100
+type TurnAdmissionAdapterFactory = Callable[
+    [RpcContext],
+    GatewayTurnAdmissionAdapter,
+]
+_turn_admission_adapter_factory: TurnAdmissionAdapterFactory | None = None
+
+
+def bind_turn_admission_adapter_factory(
+    factory: TurnAdmissionAdapterFactory,
+) -> None:
+    """Wire the fixed TurnAdmission composition after session RPC import."""
+    global _turn_admission_adapter_factory
+    _turn_admission_adapter_factory = factory
+
+
 _TURN_USAGE_PROJECTION_FIELDS = frozenset(
     {
         "input_tokens",
@@ -205,46 +216,7 @@ def _clear_history_usage_for_indexes(
 
 def _canonical_webchat_session_key(value: object = None) -> str:
     """Map legacy WebChat defaults onto the canonical WebChat session."""
-    raw = str(value or "").strip()
-    if not raw or raw in {"default", "webchat:default", "unknown"}:
-        return _WEBCHAT_SESSION_KEY
-    if raw.startswith("sess-"):
-        return f"agent:main:webchat:{raw[len('sess-') :]}"
-    return canonicalize_session_key(raw)
-
-
-def _requested_initial_collaboration_mode(params: dict[str, Any]) -> str | None:
-    mode = params.get("collaborationMode")
-    snake_mode = params.get("collaboration_mode")
-    if mode is not None and snake_mode is not None and mode != snake_mode:
-        raise ValueError("collaborationMode and collaboration_mode must match")
-    if mode is None:
-        mode = snake_mode
-    if mode is None:
-        return None
-    if not isinstance(mode, str) or mode not in {"default", "plan"}:
-        raise ValueError("collaborationMode must be default or plan")
-    if params.get("intent") != "new_chat":
-        raise ValueError("collaborationMode requires explicit new_chat intent")
-    return mode
-
-
-def _requested_initial_routing_mode(params: dict[str, Any]) -> str | None:
-    """Read the first-turn-only durable model-routing selection."""
-
-    mode = params.get("initialRoutingMode")
-    snake_mode = params.get("initial_routing_mode")
-    if mode is not None and snake_mode is not None and mode != snake_mode:
-        raise ValueError("initialRoutingMode and initial_routing_mode must match")
-    if mode is None:
-        mode = snake_mode
-    if mode is None:
-        return None
-    if not isinstance(mode, str) or mode not in {"direct", "router", "ensemble"}:
-        raise ValueError("initialRoutingMode must be direct, router, or ensemble")
-    if params.get("intent") != "new_chat":
-        raise ValueError("initialRoutingMode requires explicit new_chat intent")
-    return mode
+    return webchat_session_key(value)
 
 
 def _require_chat_session_manager(ctx: RpcContext):
@@ -939,211 +911,25 @@ async def _enforce_context_overflow(
     return None
 
 
+def _chat_turn_admission_adapter(ctx: RpcContext) -> GatewayTurnAdmissionAdapter:
+    factory = _turn_admission_adapter_factory
+    if factory is None:
+        raise RuntimeError("TurnAdmission composition is not initialized")
+    return factory(ctx)
+
+
 async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
-    if not isinstance(params, dict) or "message" not in params:
-        raise ValueError("params.message is required")
-
-    message = params["message"]
-    session_key = _canonical_webchat_session_key(params.get("sessionKey"))
-    agent_id = parse_agent_id(session_key)
-    initial_collaboration_mode = _requested_initial_collaboration_mode(params)
-    initial_routing_mode = _requested_initial_routing_mode(params)
-    prompt_annotation_ids = params.get(
-        "promptAnnotationIds",
-        params.get("prompt_annotation_ids"),
+    return await _chat_turn_admission_adapter(ctx).admit(
+        params,
+        surface="webchat",
     )
-    document_context = params.get(
-        "documentContext",
-        params.get("document_context"),
-    )
-    if prompt_annotation_ids is not None:
-        if not isinstance(prompt_annotation_ids, list):
-            raise ValueError("params.promptAnnotationIds must be an array")
-        if any(not isinstance(item, str) or not item.strip() for item in prompt_annotation_ids):
-            raise ValueError("params.promptAnnotationIds must contain non-empty strings")
-        prompt_annotation_ids = [item.strip() for item in prompt_annotation_ids]
-
-    # Fresh-WebUI / smoke path: when no session manager is wired (webui
-    # simulator, dispatcher-only boot), instant-accept without kicking off a
-    # turn. This matches the roundtrip the WebUI observes on first paint
-    # before the sessions engine is attached.
-    if ctx.session_manager is None:
-        if prompt_annotation_ids or document_context is not None:
-            raise RpcUnavailableError("Artifact context requires durable session storage")
-        if initial_collaboration_mode is not None or initial_routing_mode is not None:
-            raise RpcUnavailableError(
-                "Initial session controls require atomic turn acceptance"
-            )
-        return {"ok": True, "sessionKey": session_key, "instant_accept": True}
-
-    mgr = _require_chat_session_manager(ctx)
-    intent = params.get("intent")
-    intent_was_provided = intent is not None
-    requested_intent = intent
-    if intent is None and (
-        isinstance(params.get("workspaceId"), str) or isinstance(params.get("workspace_id"), str)
-    ):
-        # A project draft is always a first-turn request. Keeping this intent
-        # stable on retries lets sessions.send consult the durable ingress
-        # receipt before an already-created session can change the strategy.
-        intent = "new_chat"
-
-    # WebChat must accept the turn even when existing history is oversized.
-    # Context shaping happens inside TurnRunner so it can produce a request-scoped
-    # sendable view instead of making the RPC layer a terminal overflow gate.
-
-    try:
-        if intent != "new_chat":
-            # Detect a draft without creating it yet. sessions.send folds the
-            # session row into the same durable acceptance transaction as the
-            # first message/task/receipt.
-            storage = getattr(mgr, "storage", None) or getattr(mgr, "_storage", None)
-            get_session = getattr(storage, "get_session", None)
-            if callable(get_session):
-                try:
-                    if await get_session(session_key) is None:
-                        intent = "new_chat"
-                except Exception as exc:
-                    raise RpcUnavailableError(f"Failed to inspect chat session: {exc}") from exc
-            else:
-                # Compatibility for minimal test/simulator managers that do
-                # not expose storage: retain the historical initializer.
-                try:
-                    await mgr.get_or_create(
-                        session_key=session_key,
-                        agent_id=agent_id,
-                        display_name="WebChat",
-                    )
-                except Exception as exc:
-                    raise RpcUnavailableError(f"Failed to initialize chat session: {exc}") from exc
-
-        from opensquilla.gateway.rpc_sessions import _handle_sessions_send
-
-        incoming_source = params.get("_source")
-        if not isinstance(incoming_source, dict):
-            incoming_source = {}
-
-        elevated_hint = incoming_source.get("elevated")
-        run_mode_hint = incoming_source.get("runMode") or incoming_source.get("run_mode")
-        attachments = params.get("attachments")
-        extra: dict = {}
-        for source_key, target_key in (
-            ("noMemoryCapture", "noMemoryCapture"),
-            ("no_memory_capture", "no_memory_capture"),
-            ("inputProvenance", "inputProvenance"),
-            ("input_provenance", "input_provenance"),
-            ("inputProvenanceKind", "inputProvenanceKind"),
-            ("input_provenance_kind", "input_provenance_kind"),
-            ("provenance_kind", "provenance_kind"),
-            ("runKind", "runKind"),
-            ("run_kind", "run_kind"),
-            ("queueMode", "queueMode"),
-            ("queue_mode", "queue_mode"),
-            ("forkBeforeMessageId", "forkBeforeMessageId"),
-            ("fork_before_message_id", "fork_before_message_id"),
-            ("clientRequestId", "clientRequestId"),
-            ("client_request_id", "client_request_id"),
-            ("clientMessageId", "clientMessageId"),
-            ("client_message_id", "client_message_id"),
-            ("surfaceId", "surfaceId"),
-            ("surface_id", "surface_id"),
-            ("workspaceId", "workspaceId"),
-            ("workspace_id", "workspace_id"),
-            ("promptAnnotationIds", "promptAnnotationIds"),
-            ("prompt_annotation_ids", "promptAnnotationIds"),
-            ("documentContext", "documentContext"),
-            ("document_context", "documentContext"),
-            ("initialRoutingMode", "initialRoutingMode"),
-            ("initial_routing_mode", "initial_routing_mode"),
-        ):
-            if source_key in params:
-                extra[target_key] = params[source_key]
-        send_params = sessions_send_params(
-            ChatSendRequest(
-                session_key=session_key,
-                message=message,
-                attachments=attachments if isinstance(attachments, list) else [],
-                display_text=params.get("displayText") if "displayText" in params else None,
-                intent=cast(str, intent) if intent is not None else None,
-                extra=extra,
-            ),
-            chat_source_metadata(
-                caller_kind="web",
-                channel_kind="webchat",
-                channel_id=f"webchat:{session_key}",
-                sender_id=ctx.principal.role,
-                source_kind="webui",
-                source_name="WebChat",
-                elevated=elevated_hint if isinstance(elevated_hint, str) else None,
-                run_mode=run_mode_hint if isinstance(run_mode_hint, str) else None,
-            ),
-        )
-        # Keep the public handler params free of fingerprint-control fields.
-        # The logical request fingerprint uses the caller's original intent,
-        # while the actual send may use the internal ``continue`` ->
-        # ``new_chat`` strategy to create a first session atomically.
-        fingerprint_params = dict(send_params)
-        if intent_was_provided:
-            fingerprint_params["intent"] = requested_intent
-        else:
-            fingerprint_params.pop("intent", None)
-        if initial_collaboration_mode is not None:
-            # Both public spellings represent the same logical request. Keep
-            # one canonical field in the durable idempotency fingerprint.
-            fingerprint_params["initialCollaborationMode"] = initial_collaboration_mode
-        if initial_routing_mode is not None:
-            fingerprint_params["initialRoutingMode"] = initial_routing_mode
-        if prompt_annotation_ids is not None:
-            send_params["promptAnnotationIds"] = prompt_annotation_ids
-            fingerprint_params["promptAnnotationIds"] = prompt_annotation_ids
-        result = await _handle_sessions_send(
-            send_params,
-            ctx,
-            fingerprint_params=fingerprint_params,
-            initial_collaboration_mode=initial_collaboration_mode,
-            initial_routing_mode=initial_routing_mode,
-        )
-        result_session_key = result.get("sessionKey") or result.get("key") or session_key
-        return {"ok": True, "sessionKey": result_session_key, **result}
-    except Exception:
-        marker = getattr(ctx, "turn_runner", None)
-        clear = getattr(marker, "clear_compacted_this_turn", None)
-        if callable(clear):
-            clear(session_key)
-        raise
 
 
 async def _handle_chat_abort(params: dict | None, ctx: RpcContext) -> dict:
-    raw_params = params or {}
-    session_key = _canonical_webchat_session_key(raw_params.get("sessionKey"))
-    # Fresh-WebUI / smoke path: abort always returns an ok envelope keyed by
-    # sessionKey, regardless of whether a live task exists to cancel.
-    if ctx.session_manager is None:
-        return {"ok": True, "sessionKey": session_key, "aborted": False}
-    _require_chat_session_manager(ctx)
-    from opensquilla.gateway.rpc_sessions import _handle_sessions_abort
-
-    abort_params = {
-        "key": session_key,
-        "source": raw_params.get("source") or "webui_abort",
-    }
-    task_id_present = "taskId" in raw_params or "task_id" in raw_params
-    task_id = raw_params.get("taskId") or raw_params.get("task_id")
-    if isinstance(task_id, str) and task_id.strip():
-        abort_params["task_id"] = task_id.strip()
-        # chat.abort task ids are always session-bound, even for clients that
-        # predate the explicit scope marker.
-        abort_params["scope"] = "task"
-    elif (
-        task_id_present
-        or str(raw_params.get("scope") or "").strip().lower() == "task"
-    ):
-        abort_params["scope"] = "task"
-    result = await _handle_sessions_abort(
-        abort_params,
-        ctx,
+    return await _chat_turn_admission_adapter(ctx).cancel(
+        params,
+        surface="webchat",
     )
-    return {"sessionKey": session_key, **result}
 
 
 async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
@@ -1296,17 +1082,7 @@ _handle_chat_history_contract = register_chat_history_contract(
 
 
 def _clarify_fields_to_text(fields: dict[str, object]) -> str:
-    """Serialise a clarify-form submission into a ``key: value\\n`` reply.
-
-    The synthetic message is fed back through ``chat.send`` so it
-    traverses the regular meta-resolution pipeline:
-      peek_awaiting → parse_clarify_reply (key:value mode) →
-      try_claim_resume → DAG continues.
-
-    Bools are rendered as ``true``/``false``; everything else uses
-    Python's natural string representation. Empty / None values are
-    skipped — they signal "optional field omitted".
-    """
+    """Serialize a clarify form into the existing text reply protocol."""
     lines: list[str] = []
     for key, value in fields.items():
         if value is None or value == "":
@@ -1320,19 +1096,6 @@ def _clarify_fields_to_text(fields: dict[str, object]) -> str:
 
 
 async def _handle_chat_clarify_submit(params: dict | None, ctx: RpcContext) -> dict:
-    """Accept a structured clarify-form submission from a Web UI surface.
-
-    Params:
-      ``sessionKey``  (str)  — same WebChat session that triggered the pause
-      ``fields``      (dict) — ``{field_name: value}`` collected by the form
-      ``run_id``      (str, optional) — awaiting run id for trace/log only;
-                                          the awaiting branch in meta_resolution
-                                          uses ``session_key`` for the CAS
-
-    A request carrying ``request_id`` resolves the exact deferred tool call and
-    continues its existing turn. Legacy Meta clarifications have no request id;
-    those remain a cross-turn protocol and are fed through ``chat.send``.
-    """
     if not isinstance(params, dict):
         raise ValueError("params required: sessionKey, fields")
     fields = params.get("fields")
@@ -1348,7 +1111,9 @@ async def _handle_chat_clarify_submit(params: dict | None, ctx: RpcContext) -> d
         task_runtime = getattr(ctx, "task_runtime", None)
         resolve_user_input = getattr(task_runtime, "resolve_user_input", None)
         if not callable(resolve_user_input):
-            raise RpcUnavailableError("Deferred user-input resolution is not available")
+            raise RpcUnavailableError(
+                "Deferred user-input resolution is not available"
+            )
         result = await resolve_user_input(
             session_key=session_key,
             request_id=request_id,
@@ -1364,7 +1129,6 @@ async def _handle_chat_clarify_submit(params: dict | None, ctx: RpcContext) -> d
         return {"sessionKey": session_key, **result}
 
     text = _clarify_fields_to_text(fields)
-
     run_id = params.get("run_id")
     log.info(
         "chat.clarify_submit.params",
@@ -1372,15 +1136,9 @@ async def _handle_chat_clarify_submit(params: dict | None, ctx: RpcContext) -> d
         field_count=len(fields),
         run_id=run_id if isinstance(run_id, str) and run_id else None,
     )
-
-    send_params: dict = {
+    send_params: dict[str, Any] = {
         "message": text,
         "sessionKey": session_key,
-        # meta_resolution's awaiting branch keys off session_key, not
-        # intent — so we deliberately stay on the default "continue"
-        # intent (SessionIntent enum rejects unknown values). The
-        # provenance tag is the observability hook for distinguishing
-        # form submits from typed replies downstream.
         "inputProvenance": {"kind": "clarify_form", "source": "webui"},
     }
     if isinstance(run_id, str) and run_id:
@@ -1392,11 +1150,7 @@ async def _handle_chat_clarify_submit(params: dict | None, ctx: RpcContext) -> d
             "source_name": "WebChat",
             "clarify_run_id": run_id,
         }
-    result = await _chat_turn_admission_adapter(ctx).admit(
-        send_params,
-        surface="webchat",
-    )
-    return cast(dict, result)
+    return cast(dict, await _handle_chat_send(send_params, ctx))
 
 
 @_d.method("chat.inject", scope="operator.admin")
@@ -1426,36 +1180,18 @@ async def _handle_chat_inject(params: dict | None, ctx: RpcContext) -> dict:
     return {"ok": True, "sessionKey": session_key}
 
 
-def _require_chat_turn_key(params: dict[str, Any] | None) -> str:
-    raw = params or {}
-    return _canonical_webchat_session_key(
-        raw.get("sessionKey", raw.get("session_key", raw.get("key")))
-    )
-
-
-def _chat_turn_admission_adapter(ctx: RpcContext) -> GatewayTurnAdmissionAdapter:
-    return GatewayTurnAdmissionAdapter(
-        ctx,
-        GatewayTurnAdmissionCallbacks(
-            require_key=_require_chat_turn_key,
-            execute_chat_send=_handle_chat_send,
-            execute_chat_abort=_handle_chat_abort,
-        ),
-    )
-
-
 async def _handle_chat_send_contract(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    return await _chat_turn_admission_adapter(ctx).admit(params, surface="webchat")
+    return await _handle_chat_send(params, ctx)
 
 
 async def _handle_chat_abort_contract(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    return await _chat_turn_admission_adapter(ctx).cancel(params, surface="webchat")
+    return await _handle_chat_abort(params, ctx)
 
 
 _handle_chat_send_generated_contract = register_turn_admission_contract(

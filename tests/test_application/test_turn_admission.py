@@ -35,7 +35,11 @@ class _Runtime:
 
 async def test_canonical_and_legacy_commands_share_one_application_entry() -> None:
     runtime = _Runtime()
-    application = TurnAdmission(runtime)
+    application = TurnAdmission(
+        ingress=runtime,
+        cancellation=runtime,
+        steering=runtime,
+    )
 
     await application.admit(
         AdmitTurn(" agent:main:webchat:one ", "hello", "webchat", {"intent": "continue"})
@@ -60,7 +64,11 @@ async def test_canonical_and_legacy_commands_share_one_application_entry() -> No
 
 async def test_exact_task_cancel_fails_closed_before_runtime() -> None:
     runtime = _Runtime()
-    application = TurnAdmission(runtime)
+    application = TurnAdmission(
+        ingress=runtime,
+        cancellation=runtime,
+        steering=runtime,
+    )
 
     result = await application.cancel(
         CancelTurn(
@@ -83,7 +91,11 @@ async def test_exact_task_cancel_fails_closed_before_runtime() -> None:
 
 async def test_pending_steer_requires_complete_atomic_guard() -> None:
     runtime = _Runtime()
-    application = TurnAdmission(runtime)
+    application = TurnAdmission(
+        ingress=runtime,
+        cancellation=runtime,
+        steering=runtime,
+    )
 
     with pytest.raises(ValueError, match="source scope"):
         await application.steer(

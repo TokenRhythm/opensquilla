@@ -2,130 +2,30 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from opensquilla.application.turn_admission import (
     AdmitTurn,
     CancelTurn,
+    InitialCollaborationMode,
+    InitialRoutingMode,
     PendingInputGuard,
     SteerTurn,
     TurnAdmission,
-    TurnAdmissionRuntimePort,
 )
-from opensquilla.gateway.rpc import RpcContext
+from opensquilla.session.keys import build_webchat_key, canonicalize_session_key
 
-type TurnExecutor = Callable[
-    [dict[str, Any] | None, RpcContext], Awaitable[dict[str, Any]]
-]
-type SessionKeyReader = Callable[[dict[str, Any] | None], str]
-type PendingTurnExecutor = Callable[
-    [dict[str, Any], RpcContext, PendingInputGuard], Awaitable[dict[str, Any]]
-]
+_WEBCHAT_SESSION_KEY = build_webchat_key()
 
 
-@dataclass(frozen=True, slots=True)
-class GatewayTurnAdmissionCallbacks:
-    require_key: SessionKeyReader
-    execute_chat_send: TurnExecutor | None = None
-    execute_session_send: TurnExecutor | None = None
-    execute_chat_abort: TurnExecutor | None = None
-    execute_session_abort: TurnExecutor | None = None
-    execute_durable_steer: TurnExecutor | None = None
-    execute_legacy_steer: TurnExecutor | None = None
-    execute_pending_send: PendingTurnExecutor | None = None
-    execute_pending_steer: PendingTurnExecutor | None = None
-
-
-def _executor(value: TurnExecutor | None, operation: str) -> TurnExecutor:
-    if value is None:
-        raise RuntimeError(f"TurnAdmission runtime does not provide {operation}")
-    return value
-
-
-class GatewayTurnAdmissionRuntime(TurnAdmissionRuntimePort):
-    """Request-scoped Port; the complete ``RpcContext`` terminates here."""
-
-    def __init__(
-        self,
-        context: RpcContext,
-        callbacks: GatewayTurnAdmissionCallbacks,
-    ) -> None:
-        self._context = context
-        self._callbacks = callbacks
-
-    @staticmethod
-    def _params(
-        session_key: str,
-        message: str | None,
-        attributes: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        params = dict(attributes)
-        params["key"] = session_key
-        if message is not None:
-            params["message"] = message
-        return params
-
-    async def admit(self, command: AdmitTurn) -> Mapping[str, Any]:
-        if command.pending_input is not None:
-            pending_callback = self._callbacks.execute_pending_send
-            if pending_callback is None:
-                raise RuntimeError("TurnAdmission runtime does not provide pending send")
-            return await pending_callback(
-                self._params(command.session_key, command.message, command.attributes),
-                self._context,
-                command.pending_input,
-            )
-        callback = _executor(
-            self._callbacks.execute_chat_send
-            if command.surface == "webchat"
-            else self._callbacks.execute_session_send,
-            f"{command.surface} send",
-        )
-        params = self._params(command.session_key, command.message, command.attributes)
-        if command.surface == "webchat":
-            params["sessionKey"] = command.session_key
-        return await callback(params, self._context)
-
-    async def cancel(self, command: CancelTurn) -> Mapping[str, Any]:
-        callback = _executor(
-            self._callbacks.execute_chat_abort
-            if command.surface == "webchat"
-            else self._callbacks.execute_session_abort,
-            f"{command.surface} abort",
-        )
-        params = self._params(command.session_key, None, command.attributes)
-        if command.surface == "webchat":
-            params["sessionKey"] = command.session_key
-        if command.task_id is not None:
-            params["task_id"] = command.task_id
-        if command.task_scoped:
-            params["scope"] = "task"
-        if command.source is not None:
-            params["source"] = command.source
-        return await callback(params, self._context)
-
-    async def steer(self, command: SteerTurn) -> Mapping[str, Any]:
-        if command.pending_input is not None:
-            pending_callback = self._callbacks.execute_pending_steer
-            if pending_callback is None:
-                raise RuntimeError("TurnAdmission runtime does not provide pending steer")
-            return await pending_callback(
-                self._params(command.session_key, command.message, command.attributes),
-                self._context,
-                command.pending_input,
-            )
-        callback = _executor(
-            self._callbacks.execute_durable_steer
-            if command.mode == "durable"
-            else self._callbacks.execute_legacy_steer,
-            f"{command.mode} steer",
-        )
-        return await callback(
-            self._params(command.session_key, command.message, command.attributes),
-            self._context,
-        )
+def webchat_session_key(value: object = None) -> str:
+    """Map retained WebChat defaults onto the canonical session identity."""
+    raw = str(value or "").strip()
+    if not raw or raw in {"default", "webchat:default", "unknown"}:
+        return _WEBCHAT_SESSION_KEY
+    if raw.startswith("sess-"):
+        return f"agent:main:webchat:{raw[len('sess-') :]}"
+    return canonicalize_session_key(raw)
 
 
 class GatewayTurnAdmissionAdapter:
@@ -133,11 +33,59 @@ class GatewayTurnAdmissionAdapter:
 
     def __init__(
         self,
-        context: RpcContext,
-        callbacks: GatewayTurnAdmissionCallbacks,
+        application: TurnAdmission,
     ) -> None:
-        self._callbacks = callbacks
-        self._application = TurnAdmission(GatewayTurnAdmissionRuntime(context, callbacks))
+        self._application = application
+
+    @staticmethod
+    def _key(params: dict[str, Any] | None, *, surface: str) -> str:
+        raw = params if isinstance(params, dict) else {}
+        if surface == "webchat":
+            return webchat_session_key(
+                raw.get("sessionKey", raw.get("session_key", raw.get("key")))
+            )
+        if "key" not in raw:
+            raise ValueError("params.key is required")
+        key = raw["key"]
+        if not isinstance(key, str):
+            raise ValueError("params.key must be a string")
+        return canonicalize_session_key(key)
+
+    @staticmethod
+    def _initial_collaboration_mode(
+        params: dict[str, Any],
+    ) -> InitialCollaborationMode | None:
+        mode = params.get("collaborationMode")
+        snake_mode = params.get("collaboration_mode")
+        if mode is not None and snake_mode is not None and mode != snake_mode:
+            raise ValueError("collaborationMode and collaboration_mode must match")
+        if mode is None:
+            mode = snake_mode
+        if mode is None:
+            return None
+        if not isinstance(mode, str) or mode not in {"default", "plan"}:
+            raise ValueError("collaborationMode must be default or plan")
+        if params.get("intent") != "new_chat":
+            raise ValueError("collaborationMode requires explicit new_chat intent")
+        return cast(InitialCollaborationMode, mode)
+
+    @staticmethod
+    def _initial_routing_mode(
+        params: dict[str, Any],
+    ) -> InitialRoutingMode | None:
+        mode = params.get("initialRoutingMode")
+        snake_mode = params.get("initial_routing_mode")
+        if mode is not None and snake_mode is not None and mode != snake_mode:
+            raise ValueError("initialRoutingMode and initial_routing_mode must match")
+        if mode is None:
+            mode = snake_mode
+        if mode is None:
+            return None
+        if not isinstance(mode, str) or mode not in {"direct", "router", "ensemble"}:
+            raise ValueError("initialRoutingMode must be direct, router, or ensemble")
+        if params.get("intent") != "new_chat":
+            raise ValueError("initialRoutingMode requires explicit new_chat intent")
+        return cast(InitialRoutingMode, mode)
 
     @staticmethod
     def _attributes(params: dict[str, Any]) -> dict[str, Any]:
@@ -154,13 +102,23 @@ class GatewayTurnAdmissionAdapter:
     ) -> dict[str, Any]:
         if not isinstance(params, dict) or "message" not in params:
             raise ValueError("params.message is required")
-        key = self._callbacks.require_key(params)
+        key = self._key(params, surface=surface)
         result = await self._application.admit(
             AdmitTurn(
                 session_key=key,
                 message=params["message"],
                 surface="webchat" if surface == "webchat" else "session",
                 attributes=self._attributes(params),
+                initial_collaboration_mode=(
+                    self._initial_collaboration_mode(params)
+                    if surface == "webchat"
+                    else None
+                ),
+                initial_routing_mode=(
+                    self._initial_routing_mode(params)
+                    if surface == "webchat"
+                    else None
+                ),
             )
         )
         return dict(result)
@@ -172,7 +130,7 @@ class GatewayTurnAdmissionAdapter:
         surface: str,
     ) -> dict[str, Any]:
         raw = params if isinstance(params, dict) else {}
-        key = self._callbacks.require_key(params)
+        key = self._key(params, surface=surface)
         raw_task_id = raw.get("task_id", raw.get("taskId"))
         task_id = raw_task_id if isinstance(raw_task_id, str) else None
         task_scoped = "task_id" in raw or "taskId" in raw or (
@@ -202,7 +160,7 @@ class GatewayTurnAdmissionAdapter:
     ) -> dict[str, Any]:
         if not isinstance(params, dict) or "message" not in params:
             raise ValueError("params.message is required")
-        key = self._callbacks.require_key(params)
+        key = self._key(params, surface="session")
         result = await self._application.steer(
             SteerTurn(
                 session_key=key,
@@ -220,7 +178,7 @@ class GatewayTurnAdmissionAdapter:
     ) -> dict[str, Any]:
         if "message" not in params:
             raise ValueError("params.message is required")
-        key = self._callbacks.require_key(params)
+        key = self._key(params, surface="session")
         result = await self._application.admit(
             AdmitTurn(
                 session_key=key,
@@ -239,7 +197,7 @@ class GatewayTurnAdmissionAdapter:
     ) -> dict[str, Any]:
         if "message" not in params:
             raise ValueError("params.message is required")
-        key = self._callbacks.require_key(params)
+        key = self._key(params, surface="session")
         result = await self._application.steer(
             SteerTurn(
                 session_key=key,
@@ -254,6 +212,5 @@ class GatewayTurnAdmissionAdapter:
 
 __all__ = [
     "GatewayTurnAdmissionAdapter",
-    "GatewayTurnAdmissionCallbacks",
-    "GatewayTurnAdmissionRuntime",
+    "webchat_session_key",
 ]

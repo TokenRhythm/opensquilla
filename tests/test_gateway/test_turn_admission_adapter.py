@@ -1,41 +1,54 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-from typing import cast
+from typing import Any
 from unittest.mock import AsyncMock
 
+from opensquilla.application.turn_admission import (
+    AdmitTurn,
+    CancelTurn,
+    SteerTurn,
+    TurnAdmission,
+)
 from opensquilla.gateway.adapters.turn_admission import (
     GatewayTurnAdmissionAdapter,
-    GatewayTurnAdmissionCallbacks,
 )
-from opensquilla.gateway.rpc import RpcContext
+
+
+class _Ports:
+    def __init__(self) -> None:
+        self.admit_call = AsyncMock(
+            return_value={"status": "accepted", "key": "canonical"}
+        )
+        self.cancel_call = AsyncMock(return_value={"aborted": True, "key": "canonical"})
+        self.steer_call = AsyncMock(return_value={"accepted": True, "key": "canonical"})
+
+    async def admit(self, command: AdmitTurn) -> dict[str, Any]:
+        return await self.admit_call(command)
+
+    async def cancel(self, command: CancelTurn) -> dict[str, Any]:
+        return await self.cancel_call(command)
+
+    async def steer(self, command: SteerTurn) -> dict[str, Any]:
+        return await self.steer_call(command)
 
 
 def _adapter() -> tuple[
     GatewayTurnAdmissionAdapter,
-    RpcContext,
-    AsyncMock,
-    AsyncMock,
-    AsyncMock,
+    _Ports,
 ]:
-    session_send = AsyncMock(return_value={"status": "accepted", "key": "canonical"})
-    session_abort = AsyncMock(return_value={"aborted": True, "key": "canonical"})
-    durable_steer = AsyncMock(return_value={"accepted": True, "key": "canonical"})
-    context = cast(RpcContext, SimpleNamespace())
+    ports = _Ports()
     adapter = GatewayTurnAdmissionAdapter(
-        context,
-        GatewayTurnAdmissionCallbacks(
-            require_key=lambda params: str((params or {})["key"]),
-            execute_session_send=session_send,
-            execute_session_abort=session_abort,
-            execute_durable_steer=durable_steer,
-        ),
+        TurnAdmission(
+            ingress=ports,
+            cancellation=ports,
+            steering=ports,
+        )
     )
-    return adapter, context, session_send, session_abort, durable_steer
+    return adapter, ports
 
 
 async def test_adapter_projects_semantic_commands_to_existing_runtime() -> None:
-    adapter, context, session_send, session_abort, durable_steer = _adapter()
+    adapter, ports = _adapter()
 
     await adapter.admit(
         {"key": "canonical", "message": "hello", "intent": "continue"},
@@ -59,28 +72,24 @@ async def test_adapter_projects_semantic_commands_to_existing_runtime() -> None:
         durable=True,
     )
 
-    session_send.assert_awaited_once_with(
-        {"key": "canonical", "message": "hello", "intent": "continue"},
-        context,
-    )
-    session_abort.assert_awaited_once_with(
-        {
-            "key": "canonical",
-            "taskId": "task-1",
-            "scope": "task",
-            "source": "test",
-            "task_id": "task-1",
-        },
-        context,
-    )
-    durable_steer.assert_awaited_once_with(
-        {"key": "canonical", "message": "guide", "expectedTurnId": "turn-1"},
-        context,
-    )
+    admitted = ports.admit_call.await_args.args[0]
+    assert admitted.session_key == "canonical"
+    assert admitted.message == "hello"
+    assert admitted.attributes == {"intent": "continue"}
+    cancelled = ports.cancel_call.await_args.args[0]
+    assert cancelled.session_key == "canonical"
+    assert cancelled.task_id == "task-1"
+    assert cancelled.task_scoped is True
+    assert cancelled.source == "test"
+    steered = ports.steer_call.await_args.args[0]
+    assert steered.session_key == "canonical"
+    assert steered.message == "guide"
+    assert steered.mode == "durable"
+    assert steered.attributes == {"expectedTurnId": "turn-1"}
 
 
 async def test_adapter_preserves_task_scoped_abort_fence() -> None:
-    adapter, _context, _session_send, session_abort, _durable_steer = _adapter()
+    adapter, ports = _adapter()
 
     result = await adapter.cancel(
         {"key": "canonical", "taskId": None, "scope": "task"},
@@ -93,4 +102,4 @@ async def test_adapter_preserves_task_scoped_abort_fence() -> None:
         "reason": "task_id_required",
         "sessionKey": "canonical",
     }
-    session_abort.assert_not_awaited()
+    ports.cancel_call.assert_not_awaited()
