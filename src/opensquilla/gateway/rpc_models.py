@@ -249,7 +249,6 @@ async def _load_models(ctx: RpcContext) -> dict[str, Any]:
     return {"models": models, "errors": errors}
 
 
-@_d.method("models.list", scope="operator.read")
 async def _handle_models_list(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     from opensquilla.application.provider_configuration import ModelCatalog
     from opensquilla.gateway.adapters.provider_configuration import (
@@ -314,7 +313,6 @@ def _model_routing(ctx: RpcContext) -> ApplicationModelRouting:
     )
 
 
-@_d.method("models.routing.get", scope="operator.read")
 async def _handle_models_routing_get(
     _params: dict | None,
     ctx: RpcContext,
@@ -330,3 +328,31 @@ async def _handle_models_routing_set(
     if not isinstance(params, dict) or not isinstance(params.get("mode"), str):
         raise ValueError("params.mode is required")
     return await _model_routing(ctx).set_mode(params["mode"])
+
+
+# Generated descriptors own identity/scope/validation for the contracted
+# Platform configuration methods. ``models.routing.set`` remains on its
+# existing registration until its mutation boundary is closed separately.
+from opensquilla.gateway.adapters.platform_configuration_contract import (  # noqa: E402
+    register_platform_configuration_contract,
+)
+from opensquilla.gateway.guest_rpc_policy import (  # noqa: E402
+    is_guest_rpc_method_allowed,
+)
+from opensquilla.gateway.rpc import RpcHandlerError  # noqa: E402
+
+_PLATFORM_CONFIGURATION_IMPLEMENTATIONS = {
+    "models.list": _handle_models_list,
+    "models.routing.get": _handle_models_routing_get,
+}
+
+_PLATFORM_CONFIGURATION_CONTRACT_HANDLERS = {
+    method: register_platform_configuration_contract(
+        _d,
+        method,
+        implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+    for method, implementation in _PLATFORM_CONFIGURATION_IMPLEMENTATIONS.items()
+}

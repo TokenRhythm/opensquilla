@@ -642,7 +642,6 @@ async def _onboarding_status(_params: Any, ctx: RpcContext) -> dict[str, Any]:
     return await _setup_workflow(ctx).status()
 
 
-@_d.method("onboarding.catalog", scope="operator.read")
 async def _onboarding_catalog(_params: Any, ctx: RpcContext) -> dict[str, Any]:
     return await _setup_workflow(ctx).catalog()
 
@@ -1862,6 +1861,7 @@ from opensquilla.gateway.adapters.platform_setup_contract import (  # noqa: E402
 
 _PLATFORM_SETUP_IMPLEMENTATIONS = {
     "onboarding.status": _onboarding_status,
+    "onboarding.catalog": _onboarding_catalog,
     "onboarding.provider.configure": _provider_configure,
     "onboarding.provider.probe": _provider_probe,
     "onboarding.models.discover": _models_discover,

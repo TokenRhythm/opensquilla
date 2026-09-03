@@ -403,7 +403,6 @@ async def read_provider_status(params: dict | None, ctx: RpcContext) -> dict[str
     )
 
 
-@_d.method("providers.status", scope="operator.read")
 async def _handle_providers_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     return await read_provider_status(params, ctx)
 
@@ -517,3 +516,29 @@ async def _handle_search_query(params: dict | None, ctx: RpcContext) -> dict[str
     if payload.get("attempts") is not None:
         result["attempts"] = payload.get("attempts")
     return result
+
+
+# Generated descriptors own identity/scope/validation for contracted
+# Platform configuration reads; search methods retain their existing handlers.
+from opensquilla.gateway.adapters.platform_configuration_contract import (  # noqa: E402
+    register_platform_configuration_contract,
+)
+from opensquilla.gateway.guest_rpc_policy import (  # noqa: E402
+    is_guest_rpc_method_allowed,
+)
+from opensquilla.gateway.rpc import RpcHandlerError  # noqa: E402
+
+_PLATFORM_CONFIGURATION_IMPLEMENTATIONS = {
+    "providers.status": _handle_providers_status,
+}
+
+_PLATFORM_CONFIGURATION_CONTRACT_HANDLERS = {
+    method: register_platform_configuration_contract(
+        _d,
+        method,
+        implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+    for method, implementation in _PLATFORM_CONFIGURATION_IMPLEMENTATIONS.items()
+}

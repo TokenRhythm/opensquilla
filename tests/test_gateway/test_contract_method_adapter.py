@@ -66,6 +66,19 @@ def _legacy_guest_denied(_method: str) -> bool:
     return False
 
 
+def test_plain_registry_registration_has_no_generated_contract_provenance() -> None:
+    registry = RpcRegistry()
+
+    async def handler(_params: Any, _ctx: Any) -> Any:
+        return {"ok": True}
+
+    registry.register("example.query", handler, "operator.read")
+
+    entry = registry.get_entry("example.query")
+    assert entry is not None
+    assert entry.generated_contract_name is None
+
+
 @pytest.mark.asyncio
 async def test_registers_one_handler_and_calls_one_implementation_without_rewriting() -> None:
     registry = RpcRegistry()
@@ -95,12 +108,56 @@ async def test_registers_one_handler_and_calls_one_implementation_without_rewrit
     assert entry is not None
     assert entry.handler is handler
     assert entry.required_scope == "operator.read"
+    assert entry.generated_contract_name == "example.query"
     assert implementation_calls == [(params, ctx)]
     assert implementation_calls[0][0] is params
     assert result is expected
     assert [record["event"] for record in logs] == [
         "example.query.request_contract_mismatch"
     ]
+
+
+def test_registry_rejects_mismatched_generated_contract_marker_before_write() -> None:
+    registry = RpcRegistry()
+
+    async def handler(_params: Any, _ctx: Any) -> Any:
+        return {"ok": True}
+
+    setattr(handler, "_opensquilla_generated_contract_name", "other.query")
+
+    with pytest.raises(ValueError, match="generated Contract marker"):
+        registry.register("example.query", handler, "operator.read")
+
+    assert registry.get_entry("example.query") is None
+
+
+def test_registration_write_failure_is_not_retried_and_receives_marker() -> None:
+    calls: list[tuple[str, str | None, str]] = []
+
+    class FailingRegistry:
+        def register(self, name: str, handler: Any, scope: str) -> None:
+            calls.append(
+                (
+                    name,
+                    getattr(handler, "_opensquilla_generated_contract_name", None),
+                    scope,
+                )
+            )
+            raise RuntimeError("registry write failed")
+
+    async def implementation(_params: Any, _ctx: Any) -> Any:
+        return {"ok": True}
+
+    with pytest.raises(RuntimeError, match="registry write failed"):
+        register_gateway_contract_method(
+            FailingRegistry(),
+            _binding(observe_params=lambda _params: (), validate_result=lambda _result: None),
+            implementation,
+            internal_error=RpcHandlerError,
+            guest_allowed_checker=_legacy_guest_denied,
+        )
+
+    assert calls == [("example.query", "example.query", "operator.read")]
 
 
 @pytest.mark.asyncio

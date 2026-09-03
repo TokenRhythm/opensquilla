@@ -1,4 +1,4 @@
-"""Generated Contract bindings for Platform setup Gateway methods."""
+"""Generated Contract bindings for Platform configuration Gateway methods."""
 
 from __future__ import annotations
 
@@ -19,36 +19,19 @@ from opensquilla.gateway.adapters.contract_method import (
     register_gateway_contract_method,
 )
 
-PLATFORM_SETUP_CONTRACT_METHODS: Final = (
-    "onboarding.status",
-    "onboarding.catalog",
-    "onboarding.provider.configure",
-    "onboarding.provider.probe",
-    "onboarding.models.discover",
-    "onboarding.imageGeneration.models.discover",
-    "onboarding.provider.credential.reveal",
-    "onboarding.provider.credential.clear",
-    "onboarding.llmProfile.upsert",
-    "onboarding.llmProfile.activate",
-    "onboarding.llmProfile.remove",
-    "onboarding.llmProfile.active.remove",
-    "onboarding.llmProfile.credential.clear",
-    "onboarding.llmProfile.probe",
-    "onboarding.llmProfile.draft.probe",
-    "onboarding.llmProfile.models.discover",
-    "onboarding.llmProfile.draft.models.discover",
-    "onboarding.router.configure",
-    "onboarding.ensemble.configure",
-    "onboarding.search.configure",
-    "onboarding.imageGeneration.configure",
-    "onboarding.memory_embedding.configure",
-    "onboarding.audio.configure",
-    "onboarding.capability.reset",
+PLATFORM_CONFIGURATION_CONTRACT_METHODS: Final = (
+    "config.get",
+    "config.effective",
+    "config.patch",
+    "config.patch.safe",
+    "models.list",
+    "providers.status",
+    "models.routing.get",
 )
 
 
-class PlatformSetupContractError(ValueError):
-    """A setup success payload violated its generated Contract."""
+class PlatformConfigurationContractError(ValueError):
+    """A Platform configuration success payload violated its generated Contract."""
 
 
 def _params_observer(
@@ -87,7 +70,7 @@ def _result_validator(
         try:
             descriptor.result_model.model_validate(result)
         except ValidationError as exc:
-            raise PlatformSetupContractError(
+            raise PlatformConfigurationContractError(
                 f"{method} result violated the generated v4 Contract"
             ) from exc
         return result
@@ -96,24 +79,26 @@ def _result_validator(
 
 
 def _binding(method: str) -> GatewayContractBinding[Any]:
-    if method not in PLATFORM_SETUP_CONTRACT_METHODS:
-        raise ValueError(f"unsupported Platform setup Contract method: {method}")
+    if method not in PLATFORM_CONFIGURATION_CONTRACT_METHODS:
+        raise ValueError(f"unsupported Platform configuration Contract method: {method}")
     descriptor = GATEWAY_METHOD_CONTRACTS[method]
     return GatewayContractBinding(
         descriptor=descriptor,
         observe_params=_params_observer(method, descriptor),
         validate_result=_result_validator(method, descriptor),
-        result_validation_errors=(PlatformSetupContractError,),
+        result_validation_errors=(PlatformConfigurationContractError,),
         response_error_message=f"{method} response violated its v4 contract",
         request_mismatch_event=f"{method}.request_contract_mismatch",
         response_violation_event=f"{method}.contract_violation",
     )
 
 
-_BINDINGS: Final = {method: _binding(method) for method in PLATFORM_SETUP_CONTRACT_METHODS}
+_BINDINGS: Final = {
+    method: _binding(method) for method in PLATFORM_CONFIGURATION_CONTRACT_METHODS
+}
 
 
-def register_platform_setup_contract[ContextT, ResultT](
+def register_platform_configuration_contract[ContextT, ResultT](
     registry: MethodRegistry[ContextT],
     method: str,
     implementation: Callable[[Any, ContextT], Awaitable[ResultT]],
@@ -124,7 +109,9 @@ def register_platform_setup_contract[ContextT, ResultT](
     try:
         binding = _BINDINGS[method]
     except KeyError as exc:
-        raise ValueError(f"unsupported Platform setup Contract method: {method}") from exc
+        raise ValueError(
+            f"unsupported Platform configuration Contract method: {method}"
+        ) from exc
     return register_gateway_contract_method(
         registry,
         cast(GatewayContractBinding[ResultT], binding),
@@ -135,7 +122,7 @@ def register_platform_setup_contract[ContextT, ResultT](
 
 
 __all__ = [
-    "PLATFORM_SETUP_CONTRACT_METHODS",
-    "PlatformSetupContractError",
-    "register_platform_setup_contract",
+    "PLATFORM_CONFIGURATION_CONTRACT_METHODS",
+    "PlatformConfigurationContractError",
+    "register_platform_configuration_contract",
 ]

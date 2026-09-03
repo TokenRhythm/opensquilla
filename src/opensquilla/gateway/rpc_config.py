@@ -1047,7 +1047,6 @@ def _app_settings(ctx: RpcContext) -> AppSettings:
     return AppSettings(port, port)
 
 
-@_d.method("config.patch", scope="operator.admin")
 async def _handle_config_patch(
     params: dict | None,
     ctx: RpcContext,
@@ -1076,7 +1075,6 @@ async def _handle_config_patch(
     )
 
 
-@_d.method("config.patch.safe", scope="operator.write")
 async def _handle_config_patch_safe(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict):
         raise ValueError("params.patches is required")
@@ -1418,9 +1416,37 @@ async def _execute_config_effective(ctx: RpcContext) -> dict[str, Any]:
     return {"fields": fields}
 
 
-@_d.method("config.effective", scope="operator.read")
 async def _handle_config_effective(
     _params: dict | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
     return await _app_settings(ctx).read_effective()
+
+
+# Generated descriptors own identity/scope/validation for the contracted
+# Platform configuration methods. Keep the implementations importable for
+# compatibility tests and route all runtime registration through one seam.
+from opensquilla.gateway.adapters.platform_configuration_contract import (  # noqa: E402
+    register_platform_configuration_contract,
+)
+from opensquilla.gateway.guest_rpc_policy import (  # noqa: E402
+    is_guest_rpc_method_allowed,
+)
+from opensquilla.gateway.rpc import RpcHandlerError  # noqa: E402
+
+_PLATFORM_CONFIGURATION_IMPLEMENTATIONS = {
+    "config.patch": _handle_config_patch,
+    "config.patch.safe": _handle_config_patch_safe,
+    "config.effective": _handle_config_effective,
+}
+
+_PLATFORM_CONFIGURATION_CONTRACT_HANDLERS = {
+    method: register_platform_configuration_contract(
+        _d,
+        method,
+        implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+    for method, implementation in _PLATFORM_CONFIGURATION_IMPLEMENTATIONS.items()
+}

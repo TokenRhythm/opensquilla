@@ -32,7 +32,11 @@ if TYPE_CHECKING:
 
 from opensquilla import __version__
 from opensquilla.gateway.auth import Principal
-from opensquilla.gateway.guest_rpc_policy import GuestRpcPolicy, GuestRpcPolicyError
+from opensquilla.gateway.guest_rpc_policy import (
+    GuestRpcPolicy,
+    GuestRpcPolicyError,
+    is_guest_rpc_method_allowed,
+)
 from opensquilla.gateway.protocol import (
     ERROR_INVALID_REQUEST,
     ERROR_METHOD_NOT_FOUND,
@@ -212,6 +216,7 @@ class RpcMethodEntry:
     name: str
     handler: RpcHandlerFn
     required_scope: str
+    generated_contract_name: str | None = None
 
 
 class RpcUnavailableError(RuntimeError):
@@ -285,7 +290,25 @@ class RpcRegistry:
             raise ScopeDriftError(
                 f"RPC registry is locked; refusing late registration for {name!r}"
             )
-        self._methods[name] = RpcMethodEntry(name=name, handler=handler, required_scope=scope)
+        generated_contract_name = getattr(
+            handler,
+            "_opensquilla_generated_contract_name",
+            None,
+        )
+        if generated_contract_name is not None:
+            if not isinstance(generated_contract_name, str) or not generated_contract_name:
+                raise TypeError("generated Contract marker must be a non-empty string")
+            if generated_contract_name != name:
+                raise ValueError(
+                    f"generated Contract marker {generated_contract_name!r} "
+                    f"does not match registered method {name!r}"
+                )
+        self._methods[name] = RpcMethodEntry(
+            name=name,
+            handler=handler,
+            required_scope=scope,
+            generated_contract_name=generated_contract_name,
+        )
 
     def lock_registration(self) -> None:
         """Prevent additional methods from being registered after boot."""
@@ -527,10 +550,31 @@ async def _last_heartbeat(params: Any, ctx: RpcContext) -> dict[str, Any]:
 
 # Register all built-in methods against the singleton.
 _registry.register("health", _health, "operator.read")
-_registry.register("config.get", _config_get, "operator.read")
 _registry.register("sessions.get", _sessions_get, "operator.read")
 _registry.register("gateway.identity.get", _gateway_identity_get, "operator.read")
 _registry.register("last-heartbeat", _last_heartbeat, "operator.read")
+
+# Generated descriptors own identity, scope, and validation for contracted
+# methods. The callable stays here so existing imports and behavior remain
+# unchanged while registry provenance becomes explicit.
+from opensquilla.gateway.adapters.platform_configuration_contract import (  # noqa: E402
+    register_platform_configuration_contract,
+)
+
+_PLATFORM_CONFIGURATION_IMPLEMENTATIONS = {
+    "config.get": _config_get,
+}
+
+_PLATFORM_CONFIGURATION_CONTRACT_HANDLERS = {
+    method: register_platform_configuration_contract(
+        _registry,
+        method,
+        implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+    for method, implementation in _PLATFORM_CONFIGURATION_IMPLEMENTATIONS.items()
+}
 
 
 def get_registry() -> RpcRegistry:
