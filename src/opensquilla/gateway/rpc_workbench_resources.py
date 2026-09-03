@@ -7,11 +7,22 @@ import base64
 import hashlib
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from opensquilla.application.artifact_workbench import (
+    DocumentImport,
+    DocumentPublish,
+    MutationResolution,
+    WorkbenchPreviewCreate,
+    WorkbenchResourceListQuery,
+    WorkbenchResourceOpen,
+    WorkbenchResourceQuery,
+    WorkbenchResourceRef,
+)
 from opensquilla.artifact_session import (
     Actor,
     ActorKind,
@@ -82,7 +93,6 @@ _d = get_dispatcher()
 _ATTACHMENT_ID_RE = re.compile(r"^att_[A-Za-z0-9_-]{8,160}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SUPPORTED_SOURCE_TYPES = frozenset({"attachment", "deliverable"})
-_RESOURCE_TYPES = frozenset({"attachment", "document", "deliverable", "url"})
 _RESOURCE_ID_FIELDS = {
     "attachment": "attachmentId",
     "document": "documentId",
@@ -91,7 +101,6 @@ _RESOURCE_ID_FIELDS = {
 }
 _HTML_MIMES = frozenset({"text/html", "application/xhtml+xml"})
 _OFFICE_SUFFIXES = frozenset({".docx", ".xlsx", ".pptx"})
-_MAX_RESOURCE_LIMIT = 500
 _MAX_CURSOR_BYTES = 1024
 _MAX_EDITABLE_HTML_BYTES = 2 * 1024 * 1024
 _MAX_PREVIEWABLE_HTML_BYTES = 5 * 1024 * 1024
@@ -144,78 +153,6 @@ class _FormatProfile:
     reason_code: str | None
 
 
-def _require_string(params: dict[str, Any] | None, name: str, *, max_bytes: int = 2048) -> str:
-    if not isinstance(params, dict) or name not in params:
-        raise ValueError(f"params.{name} is required")
-    value = params[name]
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"params.{name} must be a non-empty string")
-    normalized = value.strip()
-    if len(normalized.encode("utf-8")) > max_bytes:
-        raise ValueError(f"params.{name} is too long")
-    return normalized
-
-
-def _optional_string(
-    params: dict[str, Any] | None,
-    name: str,
-    *,
-    max_bytes: int = 2048,
-) -> str | None:
-    if not isinstance(params, dict) or params.get(name) is None:
-        return None
-    return _require_string(params, name, max_bytes=max_bytes)
-
-
-def _idempotency_key(params: dict[str, Any] | None) -> str:
-    """Accept the durable request identifier under either additive field name."""
-
-    idempotency_key = _optional_string(params, "idempotencyKey", max_bytes=256)
-    client_request_id = _optional_string(params, "clientRequestId", max_bytes=256)
-    if (
-        idempotency_key is not None
-        and client_request_id is not None
-        and idempotency_key != client_request_id
-    ):
-        raise ValueError("params.idempotencyKey and params.clientRequestId must match")
-    request_id = idempotency_key or client_request_id
-    if request_id is None:
-        raise ValueError("params.idempotencyKey or params.clientRequestId is required")
-    return request_id
-
-
-def _mutation_resolution_request_id(params: dict[str, Any] | None) -> str:
-    """Read the public request identity while retaining additive aliases."""
-
-    request_id = _optional_string(params, "requestId", max_bytes=256)
-    client_request_id = _optional_string(params, "clientRequestId", max_bytes=256)
-    idempotency_key = _optional_string(params, "idempotencyKey", max_bytes=256)
-    supplied = tuple(
-        value for value in (request_id, client_request_id, idempotency_key) if value is not None
-    )
-    if not supplied or len(set(supplied)) != 1:
-        raise artifact_product_error(ArtifactProductErrorCode.INVALID_REQUEST)
-    return supplied[0]
-
-
-def _required_sha256(params: dict[str, Any] | None, name: str) -> str:
-    value = _require_string(params, name, max_bytes=64).lower()
-    if _SHA256_RE.fullmatch(value) is None:
-        raise ValueError(f"params.{name} must be a SHA-256 digest")
-    return value
-
-
-def _bounded_limit(params: dict[str, Any] | None) -> int:
-    value = params.get("limit", 100) if isinstance(params, dict) else 100
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError("params.limit must be a positive integer")
-    return min(value, _MAX_RESOURCE_LIMIT)
-
-
-def _session_key(params: dict[str, Any] | None) -> str:
-    return canonicalize_session_key(_require_string(params, "sessionKey"))
-
-
 def _actor(ctx: RpcContext) -> Actor:
     public_id = getattr(ctx.principal, "token_public_id", None)
     actor_id = public_id if isinstance(public_id, str) and public_id else None
@@ -225,10 +162,10 @@ def _actor(ctx: RpcContext) -> Actor:
 
 
 async def _scope(
-    params: dict[str, Any] | None,
+    session_key: str,
     ctx: RpcContext,
 ) -> tuple[str, str, ArtifactSessionService]:
-    session_key = _session_key(params)
+    session_key = canonicalize_session_key(session_key)
     try:
         session_id = await session_id_for_key(ctx.session_manager, session_key)
     except SessionServiceUnavailableError as exc:
@@ -295,45 +232,7 @@ def _resource_ref_payload(resource_type: str, resource_id: str) -> dict[str, str
     return {"type": resource_type, id_field: resource_id, "id": resource_id}
 
 
-def _resource_ref(params: dict[str, Any] | None, name: str = "resource") -> tuple[str, str]:
-    raw = params.get(name) if isinstance(params, dict) else None
-    if not isinstance(raw, dict):
-        raise ValueError(f"params.{name} must be an object")
-    resource_type = _require_string(raw, "type", max_bytes=32).lower()
-    if resource_type not in _RESOURCE_TYPES:
-        raise ValueError(f"params.{name}.type is unsupported")
-    id_field = _RESOURCE_ID_FIELDS[resource_type]
-    canonical_id = _optional_string(raw, id_field, max_bytes=512)
-    legacy_id = _optional_string(raw, "id", max_bytes=512)
-    if canonical_id is not None and legacy_id is not None and canonical_id != legacy_id:
-        raise ValueError(f"params.{name}.{id_field} and params.{name}.id must match")
-    resource_id = canonical_id or legacy_id
-    if resource_id is None:
-        raise ValueError(f"params.{name}.{id_field} or params.{name}.id is required")
-    return resource_type, resource_id
-
-
-def _resource_ref_with_legacy_alias(
-    params: dict[str, Any] | None,
-) -> tuple[str, str]:
-    """Read the canonical resourceRef field while accepting the resource alias."""
-
-    if isinstance(params, dict) and isinstance(params.get("resourceRef"), dict):
-        return _resource_ref(params, "resourceRef")
-    return _resource_ref(params, "resource")
-
-
-def _requested_types(params: dict[str, Any] | None) -> frozenset[str]:
-    raw = params.get("types") if isinstance(params, dict) else None
-    if raw is None:
-        return _RESOURCE_TYPES
-    if not isinstance(raw, list) or not raw:
-        raise ValueError("params.types must be a non-empty array")
-    values: set[str] = set()
-    for item in raw:
-        if not isinstance(item, str) or item not in _RESOURCE_TYPES:
-            raise ValueError("params.types contains an unsupported resource type")
-        values.add(item)
+def _requested_types(values: Sequence[str]) -> frozenset[str]:
     return frozenset(values)
 
 
@@ -374,13 +273,12 @@ def _encode_resource_cursor(
 
 
 def _decode_resource_cursor(
-    params: dict[str, Any] | None,
+    raw: str | None,
     *,
     session_id: str,
     requested_types: frozenset[str],
     resources: list[dict[str, Any]],
 ) -> int:
-    raw = params.get("cursor") if isinstance(params, dict) else None
     if raw is None:
         return 0
     if not isinstance(raw, str) or not raw.startswith("wrc_"):
@@ -1564,22 +1462,26 @@ def _import_response(result: DocumentImportResult, *, replayed: bool) -> dict[st
     }
 
 
-async def import_document_from_resource(
-    params: dict[str, Any] | None,
+async def _document_import(
+    command: DocumentImport,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    """Shared implementation used by documents.import and the legacy open adapter."""
+    """Reserve, publish, and commit one durable copy-import exactly once."""
 
-    session_key, session_id, service = await _scope(params, ctx)
-    source_type, resource_id = _resource_ref(params, "source")
+    session_key, session_id, service = await _scope(command.session_key, ctx)
+    source_type = command.source.resource_type
+    resource_id = command.source.resource_id
     if source_type not in _SUPPORTED_SOURCE_TYPES:
-        raise ValueError("params.source.type must be attachment or deliverable")
-    mode = _require_string(params, "mode", max_bytes=16).lower()
+        raise ValueError("document import source must be attachment or deliverable")
+    mode = command.mode
     if mode != DocumentImportMode.COPY.value:
-        raise ValueError("params.mode must be copy")
-    idempotency_key = _idempotency_key(params)
-    requested_name = _optional_string(params, "name", max_bytes=512)
-    expected_sha256 = _required_sha256(params, "expectedSha256")
+        raise ValueError("document import mode must be copy")
+    idempotency_key = command.idempotency_key
+    requested_name = command.name
+    expected_sha256 = command.expected_sha256
+    if expected_sha256 is None or _SHA256_RE.fullmatch(expected_sha256.lower()) is None:
+        raise ValueError("expected document import digest must be a SHA-256 value")
+    expected_sha256 = expected_sha256.lower()
 
     replayed = False
     try:
@@ -1796,13 +1698,13 @@ async def _emit_publish_events(
     await bridge.emit(session_key, "document.state_changed", payload)
 
 
-async def _execute_resources_list(
-    params: dict[str, Any] | None,
+async def _resources_list(
+    query: WorkbenchResourceListQuery,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(params, ctx)
-    requested = _requested_types(params)
-    limit = _bounded_limit(params)
+    session_key, session_id, service = await _scope(query.session_key, ctx)
+    requested = _requested_types(query.resource_types)
+    limit = query.limit
     inventory = await _resource_inventory(
         ctx,
         session_key=session_key,
@@ -1817,7 +1719,7 @@ async def _execute_resources_list(
         for item in inventory[kind]
     ]
     offset = _decode_resource_cursor(
-        params,
+        query.cursor,
         session_id=session_id,
         requested_types=requested,
         resources=selected,
@@ -1844,12 +1746,13 @@ async def _execute_resources_list(
     }
 
 
-async def _execute_resources_get(
-    params: dict[str, Any] | None,
+async def _resources_get(
+    query: WorkbenchResourceQuery,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(params, ctx)
-    resource_type, resource_id = _resource_ref_with_legacy_alias(params)
+    session_key, session_id, service = await _scope(query.session_key, ctx)
+    resource_type = query.resource.resource_type
+    resource_id = query.resource.resource_id
     inventory = await _resource_inventory(
         ctx,
         session_key=session_key,
@@ -1973,18 +1876,18 @@ async def _mutation_resolution_payload(
     return response
 
 
-async def _execute_mutation_resolve(
-    params: dict[str, Any] | None,
+async def _mutation_resolve(
+    query: MutationResolution,
     ctx: RpcContext,
 ) -> dict[str, Any]:
     """Resolve a response-loss-safe Artifact mutation without replaying it."""
 
-    session_key, session_id, service = await _scope(params, ctx)
-    operation = _require_string(params, "operation", max_bytes=64)
-    request_id = _mutation_resolution_request_id(params)
+    session_key, session_id, service = await _scope(query.session_key, ctx)
+    operation = query.operation
+    request_id = query.request_id
 
     if operation in _MUTATION_OPERATION_TURN_PREFIX:
-        document_id = _optional_string(params, "documentId", max_bytes=256)
+        document_id = query.document_id
         if document_id is None:
             raise artifact_product_error(ArtifactProductErrorCode.INVALID_REQUEST)
         await _scoped_document(
@@ -2095,27 +1998,24 @@ def _open_idempotency_key(
     return "open-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
-async def _execute_resources_open(
-    params: dict[str, Any] | None,
+async def _resources_open(
+    command: WorkbenchResourceOpen,
     ctx: RpcContext,
 ) -> dict[str, Any]:
     """Resolve a resource to its current editable Document when supported."""
 
-    session_key, session_id, service = await _scope(params, ctx)
-    intent = _optional_string(params, "intent", max_bytes=32) or "edit-current"
+    session_key, session_id, service = await _scope(command.session_key, ctx)
+    intent = command.intent
     if intent != "edit-current":
-        raise ValueError("params.intent must be edit-current")
-    expected_sha256 = _optional_string(params, "expectedSha256", max_bytes=64)
+        raise ValueError("resource open intent must be edit-current")
+    expected_sha256 = command.expected_sha256
     if expected_sha256 is not None:
         expected_sha256 = expected_sha256.lower()
         if _SHA256_RE.fullmatch(expected_sha256) is None:
-            raise ValueError("params.expectedSha256 must be a SHA-256 digest")
-    requested_idempotency_key = (
-        _idempotency_key(params)
-        if isinstance(params, dict) and ("idempotencyKey" in params or "clientRequestId" in params)
-        else None
-    )
-    resource_type, resource_id = _resource_ref_with_legacy_alias(params)
+            raise ValueError("expected resource digest must be a SHA-256 value")
+    requested_idempotency_key = command.idempotency_key
+    resource_type = command.resource.resource_type
+    resource_id = command.resource.resource_id
     if resource_type == "document":
         response = await _current_document_open_response(
             ctx,
@@ -2185,21 +2085,21 @@ async def _execute_resources_open(
         readonly["reasonCode"] = "resource_digest_unavailable"
         return readonly
 
-    imported = await import_document_from_resource(
-        {
-            "sessionKey": session_key,
-            "source": _resource_ref_payload(resource_type, resource_id),
-            "mode": DocumentImportMode.COPY.value,
-            "expectedSha256": sha256,
-            "idempotencyKey": requested_idempotency_key
+    imported = await _document_import(
+        DocumentImport(
+            session_key=session_key,
+            source=WorkbenchResourceRef(resource_type, resource_id),
+            mode=DocumentImportMode.COPY.value,
+            expected_sha256=sha256,
+            idempotency_key=requested_idempotency_key
             or _open_idempotency_key(
                 session_id=session_id,
                 resource_type=resource_type,
                 resource_id=resource_id,
                 sha256=sha256,
             ),
-            "name": resource["name"],
-        },
+            name=resource["name"],
+        ),
         ctx,
     )
     document = imported.get("document")
@@ -2222,20 +2122,16 @@ async def _execute_resources_open(
     )
 
 
-async def _execute_preview_create(
-    params: dict[str, Any] | None,
+async def _preview_create(
+    command: WorkbenchPreviewCreate,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(params, ctx)
-    raw_ref = params.get("resourceRef") if isinstance(params, dict) else None
-    if raw_ref is None and isinstance(params, dict):
-        raw_ref = params.get("resource")
-    projected = dict(params or {})
-    projected["resource"] = raw_ref
-    resource_type, resource_id = _resource_ref(projected)
-    mode = _optional_string(params, "mode", max_bytes=32) or "isolated"
+    session_key, session_id, service = await _scope(command.session_key, ctx)
+    resource_type = command.resource.resource_type
+    resource_id = command.resource.resource_id
+    mode = command.mode
     if mode != "isolated":
-        raise ValueError("params.mode must be isolated")
+        raise ValueError("preview mode must be isolated")
     resource, payload = await _preview_material(
         ctx,
         session_key=session_key,
@@ -2250,22 +2146,15 @@ async def _execute_preview_create(
     }
 
 
-async def _execute_documents_import(
-    params: dict[str, Any] | None,
+async def _document_publish(
+    command: DocumentPublish,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    return await import_document_from_resource(params, ctx)
-
-
-async def _execute_documents_publish(
-    params: dict[str, Any] | None,
-    ctx: RpcContext,
-) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(params, ctx)
-    document_id = _require_string(params, "documentId", max_bytes=256)
-    idempotency_key = _idempotency_key(params)
-    requested_name = _optional_string(params, "name", max_bytes=512)
-    revision_id = _require_string(params, "revisionId", max_bytes=256)
+    session_key, session_id, service = await _scope(command.session_key, ctx)
+    document_id = command.document_id
+    idempotency_key = command.idempotency_key
+    requested_name = command.name
+    revision_id = command.revision_id
 
     try:
         attempt = await service.get_document_publish_attempt(
@@ -2445,14 +2334,42 @@ async def _execute_documents_publish(
     return _publish_response(result, ref, replayed=replayed)
 
 
-_WORKBENCH_RESOURCE_IMPLEMENTATIONS = (
-    ("workbench.resources.list", _execute_resources_list),
-    ("workbench.resources.get", _execute_resources_get),
-    ("artifacts.mutations.resolve", _execute_mutation_resolve),
-    ("workbench.resources.open", _execute_resources_open),
-    ("workbench.previews.create", _execute_preview_create),
-    ("documents.import", _execute_documents_import),
-    ("documents.publish", _execute_documents_publish),
+class _WorkbenchResourceRuntimePort:
+    """Bind typed resource commands to the durable Workbench implementation."""
+
+    def __init__(self, ctx: RpcContext) -> None:
+        self._ctx = ctx
+
+    async def list_resources(self, query: WorkbenchResourceListQuery) -> dict[str, Any]:
+        return await _resources_list(query, self._ctx)
+
+    async def get_resource(self, query: WorkbenchResourceQuery) -> dict[str, Any]:
+        return await _resources_get(query, self._ctx)
+
+    async def open_resource(self, command: WorkbenchResourceOpen) -> dict[str, Any]:
+        return await _resources_open(command, self._ctx)
+
+    async def create_preview(self, command: WorkbenchPreviewCreate) -> dict[str, Any]:
+        return await _preview_create(command, self._ctx)
+
+    async def import_document(self, command: DocumentImport) -> dict[str, Any]:
+        return await _document_import(command, self._ctx)
+
+    async def publish_document(self, command: DocumentPublish) -> dict[str, Any]:
+        return await _document_publish(command, self._ctx)
+
+    async def resolve_mutation(self, query: MutationResolution) -> dict[str, Any]:
+        return await _mutation_resolve(query, self._ctx)
+
+
+_WORKBENCH_RESOURCE_METHODS = (
+    "workbench.resources.list",
+    "workbench.resources.get",
+    "artifacts.mutations.resolve",
+    "workbench.resources.open",
+    "workbench.previews.create",
+    "documents.import",
+    "documents.publish",
 )
 
 (
@@ -2464,12 +2381,12 @@ _WORKBENCH_RESOURCE_IMPLEMENTATIONS = (
     _handle_documents_import,
     _handle_documents_publish,
 ) = tuple(
-    GatewayArtifactWorkbenchAdapter.bind(method, implementation)
-    for method, implementation in _WORKBENCH_RESOURCE_IMPLEMENTATIONS
+    GatewayArtifactWorkbenchAdapter.bind(method, _WorkbenchResourceRuntimePort)
+    for method in _WORKBENCH_RESOURCE_METHODS
 )
 
 for _artifact_method, _artifact_implementation in zip(
-    (method for method, _implementation in _WORKBENCH_RESOURCE_IMPLEMENTATIONS),
+    _WORKBENCH_RESOURCE_METHODS,
     (
         _handle_resources_list,
         _handle_resources_get,
@@ -2498,6 +2415,5 @@ __all__ = [
     "_handle_resources_list",
     "_handle_resources_open",
     "adopt_generated_deliverable_if_editable",
-    "import_document_from_resource",
     "resolve_recovery_import_source",
 ]

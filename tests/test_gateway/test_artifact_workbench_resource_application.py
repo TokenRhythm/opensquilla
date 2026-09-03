@@ -76,7 +76,9 @@ class RecordingPort:
 async def test_prompt_annotation_application_uses_explicit_commands() -> None:
     port = RecordingPort()
     application = PromptAnnotationApplication(port)
-    selection = PromptAnnotationSelection("selection-1", "p", "0/1", "a" * 64)
+    selection = PromptAnnotationSelection(
+        "selection-1", "p", '[["","html",1]]', "a" * 64
+    )
     commands = [
         ("annotations.list", application.list(PromptAnnotationQuery("session-1"))),
         (
@@ -127,7 +129,7 @@ async def test_resource_transfer_and_outcome_applications_keep_distinct_ports() 
     )
     await previews.create(WorkbenchPreviewCreate("session-1", resource))
     await transfers.import_document(
-        DocumentImport("session-1", resource, "import-1", client_request_id="request-1")
+        DocumentImport("session-1", resource, "import-1", client_request_id="import-1")
     )
     await transfers.publish_document(
         DocumentPublish("session-1", "document-1", "revision-1", "publish-1")

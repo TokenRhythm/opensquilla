@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
+
+_OPAQUE_ANNOTATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_HTML_TAG_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9:-]{0,127}$")
+_SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
+_MAX_PROMPT_ANNOTATION_BYTES = 16_384
+_MAX_SOURCE_PATCHES = 100
 
 
 def _identity(value: str, label: str) -> str:
@@ -238,6 +245,11 @@ class SourcePatch:
             raise ValueError("expected state revision must be positive")
         if not self.edits:
             raise ValueError("at least one source edit is required")
+        if len(self.edits) > _MAX_SOURCE_PATCHES:
+            raise ValueError("too many source edits")
+        if _SHA256_RE.fullmatch(self.expected_source_sha256.lower()) is None:
+            raise ValueError("expected source digest must be a SHA-256 value")
+        object.__setattr__(self, "expected_source_sha256", self.expected_source_sha256.lower())
         edit_session_fields = (
             self.edit_session_id,
             self.expected_edit_session_state_revision,
@@ -265,6 +277,17 @@ class PromptAnnotationSelection:
             (self.element_proof_sha256, "selection element proof"),
         ):
             _identity(value, label)
+        if _OPAQUE_ANNOTATION_ID_RE.fullmatch(self.selection_id) is None:
+            raise ValueError("selection id is invalid")
+        if _HTML_TAG_NAME_RE.fullmatch(self.tag_name) is None:
+            raise ValueError("selection tag name is invalid")
+        object.__setattr__(self, "tag_name", self.tag_name.lower())
+        if len(self.element_path) > 4096:
+            raise ValueError("selection element path is too long")
+        if _SHA256_RE.fullmatch(self.element_proof_sha256) is None:
+            raise ValueError("selection element proof must be a SHA-256 value")
+        if self.dom_sha256 is not None and _SHA256_RE.fullmatch(self.dom_sha256) is None:
+            raise ValueError("selection DOM proof must be a SHA-256 value")
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,8 +318,15 @@ class PromptAnnotationCreate:
     def __post_init__(self) -> None:
         DocumentIdentity(self.session_key, self.document_id)
         _identity(self.annotation_id, "annotation id")
+        if _OPAQUE_ANNOTATION_ID_RE.fullmatch(self.annotation_id) is None:
+            raise ValueError("annotation id is invalid")
         if self.revision_id is not None:
             _identity(self.revision_id, "revision id")
+        self._validate_body()
+
+    def _validate_body(self) -> None:
+        if self.body is not None and len(self.body.encode("utf-8")) > _MAX_PROMPT_ANNOTATION_BYTES:
+            raise ValueError("annotation body must be no larger than 16 KiB")
 
 
 @dataclass(frozen=True, slots=True)
@@ -307,6 +337,8 @@ class PromptAnnotationIdentity:
     def __post_init__(self) -> None:
         _identity(self.session_key, "session key")
         _identity(self.annotation_id, "annotation id")
+        if _OPAQUE_ANNOTATION_ID_RE.fullmatch(self.annotation_id) is None:
+            raise ValueError("annotation id is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,6 +352,8 @@ class PromptAnnotationMutation:
         PromptAnnotationIdentity(self.session_key, self.annotation_id)
         if self.expected_state_revision < 1:
             raise ValueError("expected annotation state revision must be positive")
+        if self.body is not None and len(self.body.encode("utf-8")) > _MAX_PROMPT_ANNOTATION_BYTES:
+            raise ValueError("annotation body must be no larger than 16 KiB")
 
 
 @dataclass(frozen=True, slots=True)
@@ -379,6 +413,12 @@ class WorkbenchResourceOpen:
             raise ValueError("unsupported resource open intent")
         if self.idempotency_key is not None:
             _identity(self.idempotency_key, "idempotency key")
+            if len(self.idempotency_key.encode("utf-8")) > 256:
+                raise ValueError("idempotency key is too long")
+        if self.expected_sha256 is not None and _SHA256_RE.fullmatch(
+            self.expected_sha256.lower()
+        ) is None:
+            raise ValueError("expected resource digest must be a SHA-256 value")
 
 
 @dataclass(frozen=True, slots=True)
@@ -408,6 +448,13 @@ class DocumentImport:
         _identity(self.idempotency_key, "idempotency key")
         if self.mode != "copy":
             raise ValueError("unsupported document import mode")
+        if len(self.idempotency_key.encode("utf-8")) > 256:
+            raise ValueError("idempotency key is too long")
+        if (
+            self.client_request_id is not None
+            and self.client_request_id != self.idempotency_key
+        ):
+            raise ValueError("idempotency key and client request id must match")
 
 
 @dataclass(frozen=True, slots=True)
@@ -423,6 +470,13 @@ class DocumentPublish:
         DocumentIdentity(self.session_key, self.document_id)
         _identity(self.revision_id, "revision id")
         _identity(self.idempotency_key, "idempotency key")
+        if len(self.idempotency_key.encode("utf-8")) > 256:
+            raise ValueError("idempotency key is too long")
+        if (
+            self.client_request_id is not None
+            and self.client_request_id != self.idempotency_key
+        ):
+            raise ValueError("idempotency key and client request id must match")
 
 
 @dataclass(frozen=True, slots=True)

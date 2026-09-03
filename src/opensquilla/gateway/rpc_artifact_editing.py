@@ -13,12 +13,34 @@ import hashlib
 import json
 import re
 import secrets
+from collections.abc import Sequence
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
 from lxml import etree  # type: ignore[import-untyped]
 
+from opensquilla.application.artifact_workbench import (
+    ChangeIdentity,
+    ChangeListQuery,
+    ChangeRevert,
+    DocumentCapabilitiesQuery,
+    DocumentIdentity,
+    DocumentOpen,
+    DocumentRename,
+    EditSessionMutation,
+    EditSessionStart,
+    PromptAnnotationCreate,
+    PromptAnnotationIdentity,
+    PromptAnnotationMutation,
+    PromptAnnotationQuery,
+    RevisionListQuery,
+    RevisionRestore,
+    SessionDocumentsQuery,
+    SourceEdit,
+    SourcePatch,
+    SourceRead,
+)
 from opensquilla.artifact_session import (
     Actor,
     ActorKind,
@@ -616,10 +638,7 @@ _element_at_path = shared_element_at_path
 _element_proof_sha256 = shared_element_proof_sha256
 
 
-def _validate_source_offset_encoding(container: object) -> str:
-    if not isinstance(container, dict):
-        return _SOURCE_OFFSET_ENCODING
-    value = container.get("offsetEncoding")
+def _validate_source_offset_encoding(value: str | None) -> str:
     # Omission remains compatible with the first ArtifactSession clients,
     # whose offsets were already Python/Unicode-code-point indexes.
     if value is None:
@@ -627,46 +646,6 @@ def _validate_source_offset_encoding(container: object) -> str:
     if value != _SOURCE_OFFSET_ENCODING:
         raise ValueError(f"offsetEncoding must be {_SOURCE_OFFSET_ENCODING}")
     return _SOURCE_OFFSET_ENCODING
-
-
-def _require_string(params: dict[str, Any] | None, name: str) -> str:
-    if not isinstance(params, dict) or name not in params:
-        raise ValueError(f"params.{name} is required")
-    value = params[name]
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"params.{name} must be a non-empty string")
-    value = value.strip()
-    if len(value) > 2048:
-        raise ValueError(f"params.{name} is too long")
-    return value
-
-
-def _optional_string(params: dict[str, Any] | None, name: str) -> str | None:
-    if not isinstance(params, dict) or params.get(name) is None:
-        return None
-    return _require_string(params, name)
-
-
-def _require_positive_int(params: dict[str, Any] | None, name: str) -> int:
-    if not isinstance(params, dict) or name not in params:
-        raise ValueError(f"params.{name} is required")
-    value = params[name]
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError(f"params.{name} must be a positive integer")
-    return int(value)
-
-
-def _bounded_limit(params: dict[str, Any] | None, *, default: int = 100) -> int:
-    value = params.get("limit") if isinstance(params, dict) else None
-    if value is None:
-        return default
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError("params.limit must be a positive integer")
-    return min(int(value), 500)
-
-
-def _session_key(params: dict[str, Any] | None) -> str:
-    return canonicalize_session_key(_require_string(params, "sessionKey"))
 
 
 def _actor(ctx: RpcContext) -> Actor:
@@ -689,10 +668,10 @@ async def _service(ctx: RpcContext) -> ArtifactSessionService:
 
 
 async def _scope(
-    params: dict[str, Any] | None,
+    session_key: str,
     ctx: RpcContext,
 ) -> tuple[str, str, ArtifactSessionService]:
-    session_key = _session_key(params)
+    session_key = canonicalize_session_key(session_key)
     try:
         session_id = await session_id_for_key(ctx.session_manager, session_key)
     except SessionServiceUnavailableError as exc:
@@ -716,10 +695,10 @@ async def _session_epoch(ctx: RpcContext, session_key: str) -> int:
     return int(await storage.get_epoch(session_key))
 
 
-def _prompt_annotation_body(params: dict[str, Any] | None) -> str:
-    value = params.get("body", "") if isinstance(params, dict) else ""
+def _prompt_annotation_body(value: str | None) -> str:
+    value = "" if value is None else value
     if not isinstance(value, str) or len(value.encode("utf-8")) > _MAX_PROMPT_ANNOTATION_BYTES:
-        raise ValueError("params.body must be a string no larger than 16 KiB")
+        raise ValueError("annotation body must be no larger than 16 KiB")
     return value
 
 
@@ -1372,15 +1351,16 @@ async def _commit_revision_copy_mutation(
     return result, committed_change, False
 
 
-async def _execute_artifact_capabilities(
-    params: dict[str, Any] | None,
+async def _artifact_capabilities(
+    query: DocumentCapabilitiesQuery,
     ctx: RpcContext,
 ) -> dict[str, Any]:
     formats = {name: _capabilities(name) for name in ("docx", "xlsx", "pptx", "html")}
-    document_id = _optional_string(params, "documentId")
+    document_id = query.document_id
     if document_id is None:
         return {"formats": formats, "desktopFirst": True}
-    session_key, session_id, service = await _scope(params, ctx)
+    assert query.session_key is not None
+    session_key, session_id, service = await _scope(query.session_key, ctx)
     document = await _scoped_document(
         service,
         document_id=document_id,
@@ -1396,12 +1376,12 @@ async def _execute_artifact_capabilities(
     }
 
 
-async def _execute_document_open(
-    params: dict[str, Any] | None,
+async def _document_open(
+    command: DocumentOpen,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(params, ctx)
-    artifact_id = _require_string(params, "artifactId")
+    session_key, session_id, service = await _scope(command.session_key, ctx)
+    artifact_id = command.artifact_id
     store = ArtifactStore(media_root_from_config(ctx.config))
     try:
         ref, _ = await asyncio.to_thread(
@@ -1448,39 +1428,39 @@ async def _execute_document_open(
     }
 
 
-async def _execute_documents_list(
-    params: dict[str, Any] | None,
+async def _documents_list(
+    query: SessionDocumentsQuery,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(params, ctx)
+    session_key, session_id, service = await _scope(query.session_key, ctx)
     documents = await service.list_documents(
         session_key=session_key,
         session_id=session_id,
-        limit=_bounded_limit(params),
+        limit=query.limit,
     )
     return {"documents": [await _document_with_head(ctx, service, item) for item in documents]}
 
 
-async def _execute_document_get(
-    params: dict[str, Any] | None,
+async def _document_get(
+    identity: DocumentIdentity,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(params, ctx)
+    session_key, session_id, service = await _scope(identity.session_key, ctx)
     document = await _scoped_document(
         service,
-        document_id=_require_string(params, "documentId"),
+        document_id=identity.document_id,
         session_key=session_key,
         session_id=session_id,
     )
     return {"document": await _document_with_head(ctx, service, document)}
 
 
-async def _execute_document_rename(
-    params: dict[str, Any] | None,
+async def _document_rename(
+    command: DocumentRename,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(params, ctx)
-    document_id = _require_string(params, "documentId")
+    session_key, session_id, service = await _scope(command.session_key, ctx)
+    document_id = command.document_id
     await _scoped_document(
         service,
         document_id=document_id,
@@ -1490,8 +1470,8 @@ async def _execute_document_rename(
     try:
         document = await service.rename_document(
             document_id=document_id,
-            expected_state_revision=_require_positive_int(params, "expectedStateRevision"),
-            name=_require_string(params, "name"),
+            expected_state_revision=command.expected_state_revision,
+            name=command.name,
             actor=_actor(ctx),
         )
     except ArtifactConflictError as exc:
@@ -1511,14 +1491,14 @@ async def _execute_document_rename(
     return {"document": await _document_with_head(ctx, service, document)}
 
 
-async def _execute_document_close(
-    params: dict[str, Any] | None,
+async def _document_close(
+    identity: DocumentIdentity,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(params, ctx)
+    session_key, session_id, service = await _scope(identity.session_key, ctx)
     document = await _scoped_document(
         service,
-        document_id=_require_string(params, "documentId"),
+        document_id=identity.document_id,
         session_key=session_key,
         session_id=session_id,
     )
@@ -1552,26 +1532,23 @@ def _new_edit_session_id(
     return f"edit_{digest}"
 
 
-async def _execute_edit_session_start(
-    params: dict[str, Any] | None,
+async def _edit_session_start(
+    command: EditSessionStart,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(params, ctx)
-    document_id = _require_string(params, "documentId")
+    session_key, session_id, service = await _scope(command.session_key, ctx)
+    document_id = command.document_id
     await _scoped_document(
         service,
         document_id=document_id,
         session_key=session_key,
         session_id=session_id,
     )
-    mode = params.get("mode", "edit") if isinstance(params, dict) else "edit"
-    if mode != "edit":
-        raise ValueError("params.mode must be edit")
     actor = _actor(ctx)
     edit_session_id = _new_edit_session_id(
         session_id=session_id,
         actor=actor,
-        client_request_id=_optional_string(params, "clientRequestId"),
+        client_request_id=command.client_request_id,
     )
     try:
         edit_session = await service.start_edit_session(
@@ -1590,12 +1567,12 @@ async def _execute_edit_session_start(
     return {"editSession": _edit_session_payload(edit_session)}
 
 
-async def _execute_edit_session_heartbeat(
-    params: dict[str, Any] | None,
+async def _edit_session_heartbeat(
+    command: EditSessionMutation,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(params, ctx)
-    edit_session_id = _require_string(params, "editSessionId")
+    session_key, session_id, service = await _scope(command.session_key, ctx)
+    edit_session_id = command.edit_session_id
     actor = _actor(ctx)
     await _scoped_edit_session(
         service,
@@ -1608,10 +1585,7 @@ async def _execute_edit_session_heartbeat(
         edit_session = await service.heartbeat_edit_session(
             edit_session_id=edit_session_id,
             user_id=actor.actor_id,
-            expected_state_revision=_require_positive_int(
-                params,
-                "expectedStateRevision",
-            ),
+            expected_state_revision=command.expected_state_revision,
             ttl_ms=_EDIT_SESSION_TTL_MS,
             actor=actor,
         )
@@ -1624,12 +1598,12 @@ async def _execute_edit_session_heartbeat(
     return {"editSession": _edit_session_payload(edit_session)}
 
 
-async def _execute_edit_session_close(
-    params: dict[str, Any] | None,
+async def _edit_session_close(
+    command: EditSessionMutation,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(params, ctx)
-    edit_session_id = _require_string(params, "editSessionId")
+    session_key, session_id, service = await _scope(command.session_key, ctx)
+    edit_session_id = command.edit_session_id
     actor = _actor(ctx)
     await _scoped_edit_session(
         service,
@@ -1642,10 +1616,7 @@ async def _execute_edit_session_close(
         edit_session = await service.close_edit_session(
             edit_session_id=edit_session_id,
             user_id=actor.actor_id,
-            expected_state_revision=_require_positive_int(
-                params,
-                "expectedStateRevision",
-            ),
+            expected_state_revision=command.expected_state_revision,
             actor=actor,
         )
     except ArtifactConflictError as exc:
@@ -1657,45 +1628,45 @@ async def _execute_edit_session_close(
     return {"editSession": _edit_session_payload(edit_session)}
 
 
-async def _execute_revisions_list(
-    params: dict[str, Any] | None,
+async def _revisions_list(
+    query: RevisionListQuery,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(params, ctx)
+    session_key, session_id, service = await _scope(query.session_key, ctx)
     document = await _scoped_document(
         service,
-        document_id=_require_string(params, "documentId"),
+        document_id=query.document_id,
         session_key=session_key,
         session_id=session_id,
     )
     revisions = await service.list_revisions(
         document.document_id,
-        limit=_bounded_limit(params),
+        limit=query.limit,
     )
     return {"revisions": [_revision_payload(item) for item in revisions]}
 
 
-async def _execute_revision_restore(
-    params: dict[str, Any] | None,
+async def _revision_restore(
+    command: RevisionRestore,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(params, ctx)
-    document_id = _require_string(params, "documentId")
+    session_key, session_id, service = await _scope(command.session_key, ctx)
+    document_id = command.document_id
     document = await _scoped_document(
         service,
         document_id=document_id,
         session_key=session_key,
         session_id=session_id,
     )
-    target_id = _require_string(params, "revisionId")
+    target_id = command.revision_id
     target_revision = await _scoped_revision(
         service,
         document=document,
         revision_id=target_id,
     )
-    expected_head = _require_string(params, "expectedHeadRevisionId")
-    expected_state_revision = _require_positive_int(params, "expectedStateRevision")
-    request_id = _manual_mutation_request_id(params)
+    expected_head = command.expected_head_revision_id
+    expected_state_revision = command.expected_state_revision
+    request_id = command.request_id
     turn_id = f"revision-restore:{request_id}"
     operations: tuple[dict[str, Any], ...] = (
         {
@@ -1748,36 +1719,36 @@ async def _execute_revision_restore(
     }
 
 
-async def _execute_changes_list(
-    params: dict[str, Any] | None,
+async def _changes_list(
+    query: ChangeListQuery,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(params, ctx)
+    session_key, session_id, service = await _scope(query.session_key, ctx)
     document = await _scoped_document(
         service,
-        document_id=_require_string(params, "documentId"),
+        document_id=query.document_id,
         session_key=session_key,
         session_id=session_id,
     )
     changes = await service.list_change_sets(
         document.document_id,
-        limit=_bounded_limit(params),
+        limit=query.limit,
     )
     return {"changeSets": [_change_set_payload(item) for item in changes]}
 
 
-async def _execute_change_get(
-    params: dict[str, Any] | None,
+async def _change_get(
+    identity: ChangeIdentity,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(params, ctx)
+    session_key, session_id, service = await _scope(identity.session_key, ctx)
     document = await _scoped_document(
         service,
-        document_id=_require_string(params, "documentId"),
+        document_id=identity.document_id,
         session_key=session_key,
         session_id=session_id,
     )
-    change_id = _require_string(params, "changeSetId")
+    change_id = identity.change_set_id
     try:
         change_set = await service.get_change_set(change_id)
     except ArtifactSessionNotFoundError:
@@ -1787,19 +1758,19 @@ async def _execute_change_get(
     return {"changeSet": _change_set_payload(change_set)}
 
 
-async def _execute_change_revert(
-    params: dict[str, Any] | None,
+async def _change_revert(
+    command: ChangeRevert,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(params, ctx)
-    document_id = _require_string(params, "documentId")
+    session_key, session_id, service = await _scope(command.session_key, ctx)
+    document_id = command.document_id
     document = await _scoped_document(
         service,
         document_id=document_id,
         session_key=session_key,
         session_id=session_id,
     )
-    change_id = _require_string(params, "changeSetId")
+    change_id = command.change_set_id
     try:
         change_set = await service.get_change_set(change_id)
     except ArtifactSessionNotFoundError:
@@ -1816,9 +1787,9 @@ async def _execute_change_revert(
         document=document,
         revision_id=change_set.base_revision_id,
     )
-    expected_head = _require_string(params, "expectedHeadRevisionId")
-    expected_state_revision = _require_positive_int(params, "expectedStateRevision")
-    request_id = _manual_mutation_request_id(params)
+    expected_head = command.expected_head_revision_id
+    expected_state_revision = command.expected_state_revision
+    request_id = command.request_id
     turn_id = f"change-revert:{request_id}"
     operations: tuple[dict[str, Any], ...] = (
         {
@@ -1893,42 +1864,6 @@ async def _execute_change_revert(
             change_set=mutation_change,
         ),
     }
-
-
-def _annotation_selection(
-    params: dict[str, Any] | None,
-) -> tuple[str, str, str, str | None, str]:
-    selection = params.get("selection") if isinstance(params, dict) else None
-    if not isinstance(selection, dict):
-        raise ValueError("params.selection is required")
-    selection_id = selection.get("selectionId")
-    tag_name = selection.get("tagName")
-    element_path = selection.get("elementPath")
-    dom_sha256 = selection.get("domSha256")
-    element_proof_sha256 = selection.get("elementProofSha256")
-    if (
-        not isinstance(selection_id, str)
-        or not _OPAQUE_ANNOTATION_ID_RE.fullmatch(selection_id)
-        or not isinstance(tag_name, str)
-        or not _HTML_TAG_NAME_RE.fullmatch(tag_name)
-        or not isinstance(element_path, str)
-        or not 1 <= len(element_path) <= 4096
-        or (
-            dom_sha256 is not None
-            and (not isinstance(dom_sha256, str) or not _SHA256_RE.fullmatch(dom_sha256))
-        )
-        or not isinstance(element_proof_sha256, str)
-        or not _SHA256_RE.fullmatch(element_proof_sha256)
-    ):
-        raise ValueError("params.selection is invalid")
-    _parse_element_path(element_path)
-    return (
-        selection_id,
-        tag_name.lower(),
-        element_path,
-        dom_sha256,
-        element_proof_sha256,
-    )
 
 
 async def _trusted_annotation_selection(
@@ -2087,13 +2022,13 @@ async def _idempotent_prompt_annotation_create(
     return annotation, anchor
 
 
-async def _execute_prompt_annotations_list(
-    params: dict[str, Any] | None,
+async def _prompt_annotations_list(
+    query: PromptAnnotationQuery,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(params, ctx)
+    session_key, session_id, service = await _scope(query.session_key, ctx)
     session_epoch = await _session_epoch(ctx, session_key)
-    document_id = _optional_string(params, "documentId")
+    document_id = query.document_id
     if document_id is not None:
         await _scoped_document(
             service,
@@ -2101,22 +2036,17 @@ async def _execute_prompt_annotations_list(
             session_key=session_key,
             session_id=session_id,
         )
-    raw_status = _optional_string(params, "status")
     try:
-        status = (
-            PromptAnnotationStatus.DRAFT
-            if raw_status is None
-            else PromptAnnotationStatus(raw_status)
-        )
+        status = PromptAnnotationStatus(query.status)
     except ValueError as exc:
-        raise ValueError("params.status is unsupported") from exc
+        raise ValueError("annotation status is unsupported") from exc
     annotations = await service.list_prompt_annotations(
         session_key=session_key,
         session_id=session_id,
         session_epoch=session_epoch,
         status=status,
         document_id=document_id,
-        limit=_bounded_limit(params, default=500),
+        limit=query.limit,
     )
     documents: dict[str, Document] = {}
     payloads: list[dict[str, Any]] = []
@@ -2140,33 +2070,32 @@ async def _execute_prompt_annotations_list(
     return {"annotations": payloads}
 
 
-async def _execute_prompt_annotation_create(
-    params: dict[str, Any] | None,
+async def _prompt_annotation_create(
+    command: PromptAnnotationCreate,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(params, ctx)
+    session_key, session_id, service = await _scope(command.session_key, ctx)
     session_epoch = await _session_epoch(ctx, session_key)
-    annotation_id = _require_string(params, "annotationId")
+    annotation_id = command.annotation_id
     if not _OPAQUE_ANNOTATION_ID_RE.fullmatch(annotation_id):
-        raise ValueError("params.annotationId is invalid")
+        raise ValueError("annotation id is invalid")
     document = await _scoped_document(
         service,
-        document_id=_require_string(params, "documentId"),
+        document_id=command.document_id,
         session_key=session_key,
         session_id=session_id,
     )
-    revision_id = _optional_string(params, "revisionId") or document.head_revision_id
+    revision_id = command.revision_id or document.head_revision_id
     if revision_id != document.head_revision_id:
         raise artifact_product_error(ArtifactProductErrorCode.DOCUMENT_CHANGED)
     revision = await _scoped_revision(service, document=document, revision_id=revision_id)
-    (
-        selection_id,
-        tag_name,
-        element_path,
-        dom_sha256,
-        element_proof_sha256,
-    ) = _annotation_selection(params)
-    body = _prompt_annotation_body(params)
+    selection_id = command.selection.selection_id
+    tag_name = command.selection.tag_name
+    element_path = command.selection.element_path
+    dom_sha256 = command.selection.dom_sha256
+    element_proof_sha256 = command.selection.element_proof_sha256
+    _parse_element_path(element_path)
+    body = _prompt_annotation_body(command.body)
     replayed = await _idempotent_prompt_annotation_create(
         service,
         annotation_id=annotation_id,
@@ -2256,15 +2185,15 @@ async def _execute_prompt_annotation_create(
     }
 
 
-async def _execute_prompt_annotation_focus(
-    params: dict[str, Any] | None,
+async def _prompt_annotation_focus(
+    identity: PromptAnnotationIdentity,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(params, ctx)
+    session_key, session_id, service = await _scope(identity.session_key, ctx)
     session_epoch = await _session_epoch(ctx, session_key)
-    annotation_id = _require_string(params, "annotationId")
+    annotation_id = identity.annotation_id
     if not _OPAQUE_ANNOTATION_ID_RE.fullmatch(annotation_id):
-        raise ValueError("params.annotationId is invalid")
+        raise ValueError("annotation id is invalid")
     annotation = await _scoped_prompt_annotation(
         service,
         annotation_id=annotation_id,
@@ -2409,15 +2338,15 @@ async def _execute_prompt_annotation_focus(
     }
 
 
-async def _execute_prompt_annotation_update(
-    params: dict[str, Any] | None,
+async def _prompt_annotation_update(
+    command: PromptAnnotationMutation,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(params, ctx)
+    session_key, session_id, service = await _scope(command.session_key, ctx)
     session_epoch = await _session_epoch(ctx, session_key)
     annotation = await _scoped_prompt_annotation(
         service,
-        annotation_id=_require_string(params, "annotationId"),
+        annotation_id=command.annotation_id,
         session_key=session_key,
         session_id=session_id,
         session_epoch=session_epoch,
@@ -2431,8 +2360,8 @@ async def _execute_prompt_annotation_update(
     try:
         annotation = await service.update_prompt_annotation(
             annotation_id=annotation.annotation_id,
-            expected_state_revision=_require_positive_int(params, "expectedStateRevision"),
-            body=_prompt_annotation_body(params),
+            expected_state_revision=command.expected_state_revision,
+            body=_prompt_annotation_body(command.body),
         )
     except ArtifactConflictError as exc:
         raise _conflict(
@@ -2449,15 +2378,15 @@ async def _execute_prompt_annotation_update(
     }
 
 
-async def _execute_prompt_annotation_discard(
-    params: dict[str, Any] | None,
+async def _prompt_annotation_discard(
+    command: PromptAnnotationMutation,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(params, ctx)
+    session_key, session_id, service = await _scope(command.session_key, ctx)
     session_epoch = await _session_epoch(ctx, session_key)
     annotation = await _scoped_prompt_annotation(
         service,
-        annotation_id=_require_string(params, "annotationId"),
+        annotation_id=command.annotation_id,
         session_key=session_key,
         session_id=session_id,
         session_epoch=session_epoch,
@@ -2471,7 +2400,7 @@ async def _execute_prompt_annotation_discard(
     try:
         annotation = await service.discard_prompt_annotation(
             annotation_id=annotation.annotation_id,
-            expected_state_revision=_require_positive_int(params, "expectedStateRevision"),
+            expected_state_revision=command.expected_state_revision,
         )
     except ArtifactConflictError as exc:
         raise _conflict(
@@ -2562,18 +2491,18 @@ async def _resolve_source_revision(
     return revision, ref, path, source
 
 
-async def _execute_source_read(
-    params: dict[str, Any] | None,
+async def _source_read(
+    query: SourceRead,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(params, ctx)
+    session_key, session_id, service = await _scope(query.session_key, ctx)
     document = await _scoped_document(
         service,
-        document_id=_require_string(params, "documentId"),
+        document_id=query.document_id,
         session_key=session_key,
         session_id=session_id,
     )
-    revision_id = _optional_string(params, "revisionId") or document.head_revision_id
+    revision_id = query.revision_id or document.head_revision_id
     revision, _ref, _path, source = await _resolve_source_revision(
         ctx=ctx,
         service=service,
@@ -2602,27 +2531,17 @@ async def _execute_source_read(
 
 def _apply_source_patches(
     source: str,
-    raw_patches: object,
+    edits: Sequence[SourceEdit],
 ) -> tuple[str, tuple[dict[str, object], ...], dict[str, object]]:
-    if not isinstance(raw_patches, list) or not raw_patches:
-        raise ValueError("params.patches must be a non-empty array")
-    if len(raw_patches) > _MAX_SOURCE_PATCHES:
-        raise ValueError("params.patches contains too many edits")
+    if not edits:
+        raise ValueError("at least one source edit is required")
+    if len(edits) > _MAX_SOURCE_PATCHES:
+        raise ValueError("too many source edits")
     patches: list[tuple[int, int, str]] = []
-    for item in raw_patches:
-        if not isinstance(item, dict):
-            raise ValueError("each source patch must be an object")
-        start = item.get("startOffset")
-        end = item.get("endOffset")
-        replacement = item.get("replacement")
-        if (
-            isinstance(start, bool)
-            or not isinstance(start, int)
-            or isinstance(end, bool)
-            or not isinstance(end, int)
-            or not isinstance(replacement, str)
-        ):
-            raise ValueError("source patch offsets and replacement are invalid")
+    for item in edits:
+        start = item.start_offset
+        end = item.end_offset
+        replacement = item.replacement
         if start < 0 or end < start or end > len(source):
             raise ValueError("source patch range is out of bounds")
         patches.append((start, end, replacement))
@@ -2646,26 +2565,6 @@ def _apply_source_patches(
         for start, end, replacement in patches
     )
     return result, audit_patches, adapter_validation
-
-
-def _manual_mutation_request_id(params: dict[str, Any] | None) -> str:
-    request_id = _optional_string(params, "clientRequestId")
-    if request_id is not None:
-        if len(request_id) > 256:
-            raise ValueError("params.clientRequestId is too long")
-        return request_id
-    # Older clients do not send an idempotency key. Hash their validated JSON
-    # request so a transport-loss retry still resolves the same durable receipt
-    # without persisting source text or replacement content in the turn id.
-    if not isinstance(params, dict):
-        raise ValueError("params are required")
-    canonical = json.dumps(
-        params,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    return f"legacy-{hashlib.sha256(canonical).hexdigest()}"
 
 
 def _mutation_receipt_payload(
@@ -2781,12 +2680,12 @@ async def _source_patch_response(
     return payload
 
 
-async def _execute_source_patch(
-    params: dict[str, Any] | None,
+async def _source_patch(
+    command: SourcePatch,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(params, ctx)
-    document_id = _require_string(params, "documentId")
+    session_key, session_id, service = await _scope(command.session_key, ctx)
+    document_id = command.document_id
     document = await _scoped_document(
         service,
         document_id=document_id,
@@ -2794,30 +2693,13 @@ async def _execute_source_patch(
         session_id=session_id,
     )
     actor = _actor(ctx)
-    edit_session_id = _optional_string(params, "editSessionId")
-    edit_session_state_revision: int | None = None
-    edit_session_last_saved_revision_id: str | None = None
+    edit_session_id = command.edit_session_id
+    edit_session_state_revision = command.expected_edit_session_state_revision
+    edit_session_last_saved_revision_id = command.expected_last_saved_revision_id
     edit_session: EditSession | None = None
-    edit_session_keys = (
-        "editSessionId",
-        "expectedEditSessionStateRevision",
-        "expectedLastSavedRevisionId",
-    )
-    if edit_session_id is None:
-        if isinstance(params, dict) and any(name in params for name in edit_session_keys):
-            raise ValueError(
-                "editSessionId, expectedEditSessionStateRevision, and "
-                "expectedLastSavedRevisionId must be supplied together"
-            )
-    else:
-        edit_session_state_revision = _require_positive_int(
-            params,
-            "expectedEditSessionStateRevision",
-        )
-        edit_session_last_saved_revision_id = _require_string(
-            params,
-            "expectedLastSavedRevisionId",
-        )
+    if edit_session_id is not None:
+        assert edit_session_state_revision is not None
+        assert edit_session_last_saved_revision_id is not None
         edit_session, edit_document = await _scoped_edit_session(
             service,
             edit_session_id=edit_session_id,
@@ -2831,7 +2713,7 @@ async def _execute_source_patch(
                 code=ArtifactProductErrorCode.EDIT_SESSION_RENEWAL_REQUIRED,
                 operation="edit_session.validate_save",
             )
-    expected_head = _require_string(params, "expectedHeadRevisionId")
+    expected_head = command.expected_head_revision_id
     revision, ref, _path, source = await _resolve_source_revision(
         ctx=ctx,
         service=service,
@@ -2839,10 +2721,10 @@ async def _execute_source_patch(
         document=document,
         revision_id=expected_head,
     )
-    expected_sha = _require_string(params, "expectedSourceSha256").lower()
-    expected_state_revision = _require_positive_int(params, "expectedStateRevision")
+    expected_sha = command.expected_source_sha256.lower()
+    expected_state_revision = command.expected_state_revision
     try:
-        _validate_source_offset_encoding(params)
+        _validate_source_offset_encoding(command.offset_encoding)
     except ValueError:
         raise artifact_product_error(
             ArtifactProductErrorCode.INVALID_REQUEST,
@@ -2854,7 +2736,7 @@ async def _execute_source_patch(
     try:
         updated, audit_patches, adapter_validation = _apply_source_patches(
             source,
-            params.get("patches") if isinstance(params, dict) else None,
+            command.edits,
         )
     except (DocumentAdapterError, ValueError):
         raise artifact_product_error(
@@ -2862,7 +2744,7 @@ async def _execute_source_patch(
             reason_code="invalid_source_edit",
         ) from None
     patch_count = len(audit_patches)
-    request_id = _manual_mutation_request_id(params)
+    request_id = command.request_id
     turn_id = f"manual-source-patch:{request_id}"
     updated_bytes = updated.encode("utf-8")
     updated_sha256 = hashlib.sha256(updated_bytes).hexdigest()
@@ -3194,28 +3076,97 @@ async def _execute_source_patch(
     )
 
 
-_ARTIFACT_EDITING_IMPLEMENTATIONS = (
-    ("artifacts.edit.capabilities", _execute_artifact_capabilities),
-    ("artifacts.documents.open", _execute_document_open),
-    ("artifacts.documents.list", _execute_documents_list),
-    ("artifacts.documents.get", _execute_document_get),
-    ("artifacts.documents.rename", _execute_document_rename),
-    ("artifacts.documents.close", _execute_document_close),
-    ("documents.editSessions.start", _execute_edit_session_start),
-    ("documents.editSessions.heartbeat", _execute_edit_session_heartbeat),
-    ("documents.editSessions.close", _execute_edit_session_close),
-    ("artifacts.revisions.list", _execute_revisions_list),
-    ("artifacts.revisions.restore", _execute_revision_restore),
-    ("artifacts.changes.list", _execute_changes_list),
-    ("artifacts.changes.get", _execute_change_get),
-    ("artifacts.changes.revert", _execute_change_revert),
-    ("artifacts.prompt_annotations.list", _execute_prompt_annotations_list),
-    ("artifacts.prompt_annotations.create", _execute_prompt_annotation_create),
-    ("artifacts.prompt_annotations.focus", _execute_prompt_annotation_focus),
-    ("artifacts.prompt_annotations.update", _execute_prompt_annotation_update),
-    ("artifacts.prompt_annotations.discard", _execute_prompt_annotation_discard),
-    ("artifacts.source.read", _execute_source_read),
-    ("artifacts.source.patch", _execute_source_patch),
+class _ArtifactEditingRuntimePort:
+    """Bind typed Workbench commands to the existing artifact-session implementation."""
+
+    def __init__(self, ctx: RpcContext) -> None:
+        self._ctx = ctx
+
+    async def capabilities(self, query: DocumentCapabilitiesQuery) -> dict[str, Any]:
+        return await _artifact_capabilities(query, self._ctx)
+
+    async def open_document(self, command: DocumentOpen) -> dict[str, Any]:
+        return await _document_open(command, self._ctx)
+
+    async def list_documents(self, query: SessionDocumentsQuery) -> dict[str, Any]:
+        return await _documents_list(query, self._ctx)
+
+    async def get_document(self, identity: DocumentIdentity) -> dict[str, Any]:
+        return await _document_get(identity, self._ctx)
+
+    async def rename_document(self, command: DocumentRename) -> dict[str, Any]:
+        return await _document_rename(command, self._ctx)
+
+    async def close_document(self, identity: DocumentIdentity) -> dict[str, Any]:
+        return await _document_close(identity, self._ctx)
+
+    async def start_edit_session(self, command: EditSessionStart) -> dict[str, Any]:
+        return await _edit_session_start(command, self._ctx)
+
+    async def heartbeat_edit_session(self, command: EditSessionMutation) -> dict[str, Any]:
+        return await _edit_session_heartbeat(command, self._ctx)
+
+    async def close_edit_session(self, command: EditSessionMutation) -> dict[str, Any]:
+        return await _edit_session_close(command, self._ctx)
+
+    async def list_revisions(self, query: RevisionListQuery) -> dict[str, Any]:
+        return await _revisions_list(query, self._ctx)
+
+    async def restore_revision(self, command: RevisionRestore) -> dict[str, Any]:
+        return await _revision_restore(command, self._ctx)
+
+    async def list_changes(self, query: ChangeListQuery) -> dict[str, Any]:
+        return await _changes_list(query, self._ctx)
+
+    async def get_change(self, identity: ChangeIdentity) -> dict[str, Any]:
+        return await _change_get(identity, self._ctx)
+
+    async def revert_change(self, command: ChangeRevert) -> dict[str, Any]:
+        return await _change_revert(command, self._ctx)
+
+    async def list_annotations(self, query: PromptAnnotationQuery) -> dict[str, Any]:
+        return await _prompt_annotations_list(query, self._ctx)
+
+    async def create_annotation(self, command: PromptAnnotationCreate) -> dict[str, Any]:
+        return await _prompt_annotation_create(command, self._ctx)
+
+    async def focus_annotation(self, identity: PromptAnnotationIdentity) -> dict[str, Any]:
+        return await _prompt_annotation_focus(identity, self._ctx)
+
+    async def update_annotation(self, command: PromptAnnotationMutation) -> dict[str, Any]:
+        return await _prompt_annotation_update(command, self._ctx)
+
+    async def discard_annotation(self, command: PromptAnnotationMutation) -> dict[str, Any]:
+        return await _prompt_annotation_discard(command, self._ctx)
+
+    async def read_source(self, query: SourceRead) -> dict[str, Any]:
+        return await _source_read(query, self._ctx)
+
+    async def patch_source(self, command: SourcePatch) -> dict[str, Any]:
+        return await _source_patch(command, self._ctx)
+
+_ARTIFACT_EDITING_METHODS = (
+    "artifacts.edit.capabilities",
+    "artifacts.documents.open",
+    "artifacts.documents.list",
+    "artifacts.documents.get",
+    "artifacts.documents.rename",
+    "artifacts.documents.close",
+    "documents.editSessions.start",
+    "documents.editSessions.heartbeat",
+    "documents.editSessions.close",
+    "artifacts.revisions.list",
+    "artifacts.revisions.restore",
+    "artifacts.changes.list",
+    "artifacts.changes.get",
+    "artifacts.changes.revert",
+    "artifacts.prompt_annotations.list",
+    "artifacts.prompt_annotations.create",
+    "artifacts.prompt_annotations.focus",
+    "artifacts.prompt_annotations.update",
+    "artifacts.prompt_annotations.discard",
+    "artifacts.source.read",
+    "artifacts.source.patch",
 )
 
 (
@@ -3241,12 +3192,12 @@ _ARTIFACT_EDITING_IMPLEMENTATIONS = (
     _handle_source_read,
     _handle_source_patch,
 ) = tuple(
-    GatewayArtifactWorkbenchAdapter.bind(method, implementation)
-    for method, implementation in _ARTIFACT_EDITING_IMPLEMENTATIONS
+    GatewayArtifactWorkbenchAdapter.bind(method, _ArtifactEditingRuntimePort)
+    for method in _ARTIFACT_EDITING_METHODS
 )
 
 for _artifact_method, _artifact_implementation in zip(
-    (method for method, _implementation in _ARTIFACT_EDITING_IMPLEMENTATIONS),
+    _ARTIFACT_EDITING_METHODS,
     (
         _handle_artifact_capabilities,
         _handle_document_open,

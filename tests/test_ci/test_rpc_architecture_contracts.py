@@ -1144,6 +1144,19 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
     ] == []
 
 
+def test_artifact_workbench_has_no_callback_transition_path() -> None:
+    paths = (
+        ROOT / "src/opensquilla/gateway/adapters/artifact_workbench.py",
+        ROOT / "src/opensquilla/gateway/rpc_artifacts.py",
+        ROOT / "src/opensquilla/gateway/rpc_artifact_editing.py",
+        ROOT / "src/opensquilla/gateway/rpc_workbench_resources.py",
+    )
+    source = "\n".join(path.read_text(encoding="utf-8") for path in paths)
+    assert "class _CallbackPort" not in source
+    assert "del request" not in source
+    assert "async def _execute_" not in source
+
+
 def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter() -> None:
     from opensquilla.contracts.generated.v4.sessions_list_metadata import (
         SESSIONS_LIST_METHOD,
