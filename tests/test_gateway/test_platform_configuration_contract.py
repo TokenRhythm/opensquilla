@@ -25,10 +25,11 @@ EXPECTED_PLATFORM_CONFIGURATION_METHODS = (
     "models.list",
     "providers.status",
     "models.routing.get",
+    "models.routing.set",
 )
 
 
-def test_platform_configuration_contract_owns_the_seven_existing_methods() -> None:
+def test_platform_configuration_contract_owns_the_existing_methods() -> None:
     assert PLATFORM_CONFIGURATION_CONTRACT_METHODS == EXPECTED_PLATFORM_CONFIGURATION_METHODS
 
 

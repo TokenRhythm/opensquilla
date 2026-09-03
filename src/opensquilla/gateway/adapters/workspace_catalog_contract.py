@@ -1,4 +1,4 @@
-"""Generated Contract bindings for Platform configuration Gateway methods."""
+"""Generated Contract bindings for persisted project workspace Gateway methods."""
 
 from __future__ import annotations
 
@@ -19,24 +19,18 @@ from opensquilla.gateway.adapters.contract_method import (
     register_gateway_contract_method,
 )
 
-PLATFORM_CONFIGURATION_CONTRACT_METHODS: Final = (
-    "config.get",
-    "config.effective",
-    "config.patch",
-    "config.patch.safe",
-    "models.list",
-    "providers.status",
-    "models.routing.get",
-    "models.routing.set",
+WORKSPACE_CATALOG_CONTRACT_METHODS: Final = (
+    "workspaces.list",
 )
 
 
-class PlatformConfigurationContractError(ValueError):
-    """A Platform configuration success payload violated its generated Contract."""
+class WorkspaceCatalogContractError(ValueError):
+    """A workspace success payload violated its generated Contract."""
 
 
 def _params_observer(
-    method: str, descriptor: GatewayMethodContract
+    method: str,
+    descriptor: GatewayMethodContract,
 ) -> Callable[[Any], tuple[dict[str, Any], ...]]:
     def observe(params: Any) -> tuple[dict[str, Any], ...]:
         try:
@@ -65,13 +59,14 @@ def _params_observer(
 
 
 def _result_validator(
-    method: str, descriptor: GatewayMethodContract
+    method: str,
+    descriptor: GatewayMethodContract,
 ) -> Callable[[Any], Any]:
     def validate(result: Any) -> Any:
         try:
             descriptor.result_model.model_validate(result)
         except ValidationError as exc:
-            raise PlatformConfigurationContractError(
+            raise WorkspaceCatalogContractError(
                 f"{method} result violated the generated v4 Contract"
             ) from exc
         return result
@@ -80,14 +75,14 @@ def _result_validator(
 
 
 def _binding(method: str) -> GatewayContractBinding[Any]:
-    if method not in PLATFORM_CONFIGURATION_CONTRACT_METHODS:
-        raise ValueError(f"unsupported Platform configuration Contract method: {method}")
+    if method not in WORKSPACE_CATALOG_CONTRACT_METHODS:
+        raise ValueError(f"unsupported workspace Contract method: {method}")
     descriptor = GATEWAY_METHOD_CONTRACTS[method]
     return GatewayContractBinding(
         descriptor=descriptor,
         observe_params=_params_observer(method, descriptor),
         validate_result=_result_validator(method, descriptor),
-        result_validation_errors=(PlatformConfigurationContractError,),
+        result_validation_errors=(WorkspaceCatalogContractError,),
         response_error_message=f"{method} response violated its v4 contract",
         request_mismatch_event=f"{method}.request_contract_mismatch",
         response_violation_event=f"{method}.contract_violation",
@@ -95,11 +90,11 @@ def _binding(method: str) -> GatewayContractBinding[Any]:
 
 
 _BINDINGS: Final = {
-    method: _binding(method) for method in PLATFORM_CONFIGURATION_CONTRACT_METHODS
+    method: _binding(method) for method in WORKSPACE_CATALOG_CONTRACT_METHODS
 }
 
 
-def register_platform_configuration_contract[ContextT, ResultT](
+def register_workspace_catalog_contract[ContextT, ResultT](
     registry: MethodRegistry[ContextT],
     method: str,
     implementation: Callable[[Any, ContextT], Awaitable[ResultT]],
@@ -110,9 +105,7 @@ def register_platform_configuration_contract[ContextT, ResultT](
     try:
         binding = _BINDINGS[method]
     except KeyError as exc:
-        raise ValueError(
-            f"unsupported Platform configuration Contract method: {method}"
-        ) from exc
+        raise ValueError(f"unsupported workspace Contract method: {method}") from exc
     return register_gateway_contract_method(
         registry,
         cast(GatewayContractBinding[ResultT], binding),
@@ -123,7 +116,7 @@ def register_platform_configuration_contract[ContextT, ResultT](
 
 
 __all__ = [
-    "PLATFORM_CONFIGURATION_CONTRACT_METHODS",
-    "PlatformConfigurationContractError",
-    "register_platform_configuration_contract",
+    "WORKSPACE_CATALOG_CONTRACT_METHODS",
+    "WorkspaceCatalogContractError",
+    "register_workspace_catalog_contract",
 ]

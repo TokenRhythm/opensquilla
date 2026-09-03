@@ -77,6 +77,9 @@ from opensquilla.gateway.adapters.plans_contract import (
     register_plans_revise_contract,
     register_plans_set_mode_contract,
 )
+from opensquilla.gateway.adapters.session_control_contract import (
+    register_session_control_contract,
+)
 from opensquilla.gateway.adapters.session_lifecycle import (
     GatewaySessionLifecycleAdapter,
     GatewaySessionLifecycleCallbacks,
@@ -10926,7 +10929,6 @@ async def _handle_sessions_truncate(params: dict | None, ctx: RpcContext) -> dic
         return await _run_accounted()
 
 
-@_d.method("sessions.subscribe", scope="operator.read")
 async def _handle_sessions_subscribe(params: dict | None, ctx: RpcContext) -> None:
     subscription_mgr = getattr(ctx, "subscription_manager", None)
     if subscription_mgr is not None:
@@ -10934,7 +10936,6 @@ async def _handle_sessions_subscribe(params: dict | None, ctx: RpcContext) -> No
     return None
 
 
-@_d.method("sessions.unsubscribe", scope="operator.read")
 async def _handle_sessions_unsubscribe(params: dict | None, ctx: RpcContext) -> None:
     subscription_mgr = getattr(ctx, "subscription_manager", None)
     if subscription_mgr is not None:
@@ -11561,7 +11562,6 @@ async def _handle_plans_capabilities(
     }
 
 
-@_d.method("sessions.routing.get", scope="operator.read")
 async def _handle_sessions_routing_get(
     params: dict | None,
     ctx: RpcContext,
@@ -11578,7 +11578,6 @@ async def _handle_sessions_routing_get(
     }
 
 
-@_d.method("sessions.routing.set", scope="operator.write")
 async def _handle_sessions_routing_set(
     params: dict | None,
     ctx: RpcContext,
@@ -12653,3 +12652,22 @@ for _pending_method, _pending_implementation in (
         internal_error=RpcHandlerError,
         guest_allowed_checker=is_guest_rpc_method_allowed,
     )
+
+
+_SESSION_CONTROL_CONTRACT_IMPLEMENTATIONS = {
+    "sessions.subscribe": _handle_sessions_subscribe,
+    "sessions.unsubscribe": _handle_sessions_unsubscribe,
+    "sessions.routing.get": _handle_sessions_routing_get,
+    "sessions.routing.set": _handle_sessions_routing_set,
+}
+
+_SESSION_CONTROL_CONTRACT_HANDLERS = {
+    method: register_session_control_contract(
+        _d,
+        method,
+        implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+    for method, implementation in _SESSION_CONTROL_CONTRACT_IMPLEMENTATIONS.items()
+}

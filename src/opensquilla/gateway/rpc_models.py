@@ -320,7 +320,6 @@ async def _handle_models_routing_get(
     return await _model_routing(ctx).read()
 
 
-@_d.method("models.routing.set", scope="operator.write")
 async def _handle_models_routing_set(
     params: dict | None,
     ctx: RpcContext,
@@ -331,8 +330,7 @@ async def _handle_models_routing_set(
 
 
 # Generated descriptors own identity/scope/validation for the contracted
-# Platform configuration methods. ``models.routing.set`` remains on its
-# existing registration until its mutation boundary is closed separately.
+# Platform configuration methods.
 from opensquilla.gateway.adapters.platform_configuration_contract import (  # noqa: E402
     register_platform_configuration_contract,
 )
@@ -344,6 +342,7 @@ from opensquilla.gateway.rpc import RpcHandlerError  # noqa: E402
 _PLATFORM_CONFIGURATION_IMPLEMENTATIONS = {
     "models.list": _handle_models_list,
     "models.routing.get": _handle_models_routing_get,
+    "models.routing.set": _handle_models_routing_set,
 }
 
 _PLATFORM_CONFIGURATION_CONTRACT_HANDLERS = {
