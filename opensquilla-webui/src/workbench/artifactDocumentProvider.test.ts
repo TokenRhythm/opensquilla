@@ -573,6 +573,11 @@ describe('artifact document provider', () => {
     const saved = await provider.patchSource({
       sessionKey: 'session-a',
       documentId: 'doc-html',
+      expectedHeadRevisionId: 'rev-1',
+      expectedSourceSha256: 'a'.repeat(64),
+      expectedStateRevision: 1,
+      offsetEncoding: 'unicode-code-point',
+      patches: [{ startOffset: 0, endOffset: 0, replacement: '<main />' }],
       editSessionId: heartbeat!.editSessionId,
       expectedEditSessionStateRevision: heartbeat!.stateRevision,
       expectedLastSavedRevisionId: heartbeat!.lastSavedRevisionId,
@@ -839,5 +844,14 @@ describe('artifact document provider', () => {
     expect(workspace.revisions).toHaveLength(1)
     expect(workspace.changeSets).toEqual([])
     expect(workspace.document.capabilities.reason).toBe('office-editor-unavailable')
+  })
+
+  it('rejects non-object results before legacy projection', async () => {
+    const provider = createRpcArtifactDocumentProvider({
+      call: vi.fn().mockResolvedValue(7) as unknown as GenericRpcCall,
+      hasRpcMethod: () => true,
+    })
+
+    await expect(provider.getCapabilities()).rejects.toThrow('invalid response')
   })
 })

@@ -1,4 +1,33 @@
 import type { RpcCallOptions } from '@/lib/rpc'
+import {
+  STATUS_METHOD,
+  type Result as RuntimeStatusResult,
+} from '@/contracts/generated/v4/runtimeStatus'
+import { validateResult as validateRuntimeStatusResult } from '@/contracts/generated/v4/runtimeStatusValidators.mjs'
+import {
+  ROUTER_SELFLEARNING_STATUS_METHOD,
+  type Result as RouterSelflearningStatusResult,
+} from '@/contracts/generated/v4/routerSelflearningStatus'
+import { validateResult as validateRouterSelflearningStatusResult } from '@/contracts/generated/v4/routerSelflearningStatusValidators.mjs'
+import {
+  DOCTOR_STATUS_METHOD,
+  type Result as DoctorStatusResult,
+} from '@/contracts/generated/v4/doctorStatus'
+import { validateResult as validateDoctorStatusResult } from '@/contracts/generated/v4/doctorStatusValidators.mjs'
+import {
+  LOGS_STATUS_METHOD,
+  type Result as LogsStatusResult,
+} from '@/contracts/generated/v4/logsStatus'
+import { validateResult as validateLogsStatusResult } from '@/contracts/generated/v4/logsStatusValidators.mjs'
+import {
+  LOGS_TAIL_METHOD,
+  type Result as LogsTailResult,
+} from '@/contracts/generated/v4/logsTail'
+import { validateResult as validateLogsTailResult } from '@/contracts/generated/v4/logsTailValidators.mjs'
+import { USAGE_QUERY_METHOD } from '@/contracts/generated/v4/usageQuery'
+import { validateResult as validateUsageQueryResult } from '@/contracts/generated/v4/usageQueryValidators.mjs'
+import { USAGE_STATUS_METHOD } from '@/contracts/generated/v4/usageStatus'
+import { validateResult as validateUsageStatusResult } from '@/contracts/generated/v4/usageStatusValidators.mjs'
 import type {
   GatewayLogBatch,
   GatewayLogEntry,
@@ -44,14 +73,6 @@ interface HttpTransport {
   }>
 }
 
-const USAGE_QUERY_METHOD = 'usage.query'
-const USAGE_STATUS_METHOD = 'usage.status'
-const DOCTOR_STATUS_METHOD = 'doctor.status'
-const LOGS_STATUS_METHOD = 'logs.status'
-const LOGS_TAIL_METHOD = 'logs.tail'
-const GATEWAY_STATUS_METHOD = 'status'
-const SELF_LEARNING_STATUS_METHOD = 'router.selflearning.status'
-
 const callOptions = (signal?: AbortSignal): RpcCallOptions => ({
   timeoutMs: 15_000,
   timeoutAction: 'reject',
@@ -59,11 +80,9 @@ const callOptions = (signal?: AbortSignal): RpcCallOptions => ({
   ...(signal ? { signal } : {}),
 })
 
-const asRecord = (value: unknown): Record<string, unknown> => (
-  value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : {}
-)
+function invalid(method: string): Error {
+  return new Error(`${method} returned an invalid response`)
+}
 
 function methodNotFound(error: unknown): boolean {
   const code = typeof error === 'object' && error && 'code' in error
@@ -119,19 +138,25 @@ export function createV4Observability(rpc: RpcTransport, http: HttpTransport): O
   return {
     async gatewayStatus(options) {
       await rpc.ready({ signal: options?.signal })
-      return asRecord(await rpc.request(
-        GATEWAY_STATUS_METHOD,
+      const result = await rpc.request<RuntimeStatusResult>(
+        STATUS_METHOD,
         {},
         callOptions(options?.signal),
-      )) as GatewayStatus
+      )
+      if (!validateRuntimeStatusResult(result)) throw invalid(STATUS_METHOD)
+      return result as GatewayStatus
     },
     async selfLearningStatus(options) {
       await rpc.ready({ signal: options?.signal })
-      return asRecord(await rpc.request(
-        SELF_LEARNING_STATUS_METHOD,
+      const result = await rpc.request<RouterSelflearningStatusResult>(
+        ROUTER_SELFLEARNING_STATUS_METHOD,
         {},
         callOptions(options?.signal),
-      )) as SelfLearningStatus
+      )
+      if (!validateRouterSelflearningStatusResult(result)) {
+        throw invalid(ROUTER_SELFLEARNING_STATUS_METHOD)
+      }
+      return result as SelfLearningStatus
     },
     async usage(range, options = {}) {
       await rpc.ready({ signal: options.signal })
@@ -144,21 +169,25 @@ export function createV4Observability(rpc: RpcTransport, http: HttpTransport): O
       let transientQueryFailure = false
       if (rpc.supports(USAGE_QUERY_METHOD)) {
         try {
-          return normalizeUsageQueryResponse(await rpc.request<UsageQueryResponse>(
+          const result = await rpc.request<UsageQueryResponse>(
             USAGE_QUERY_METHOD,
             usageQueryParams(range, timezone, options),
             callOptions(options.signal),
-          ))
+          )
+          if (!validateUsageQueryResult(result)) throw invalid(USAGE_QUERY_METHOD)
+          return normalizeUsageQueryResponse(result)
         } catch (error) {
           if (methodNotFound(error)) {
             rpc.markUnsupported(USAGE_QUERY_METHOD)
           } else if (timezone !== 'UTC' && invalidTimezone(error)) {
             try {
-              const snapshot = normalizeUsageQueryResponse(await rpc.request<UsageQueryResponse>(
+              const result = await rpc.request<UsageQueryResponse>(
                 USAGE_QUERY_METHOD,
                 usageQueryParams(range, 'UTC', options),
                 callOptions(options.signal),
-              ))
+              )
+              if (!validateUsageQueryResult(result)) throw invalid(USAGE_QUERY_METHOD)
+              const snapshot = normalizeUsageQueryResponse(result)
               return {
                 ...snapshot,
                 timezoneFallback: {
@@ -182,6 +211,7 @@ export function createV4Observability(rpc: RpcTransport, http: HttpTransport): O
           undefined,
           callOptions(options.signal),
         )
+        if (!validateUsageStatusResult(status)) throw invalid(USAGE_STATUS_METHOD)
         if (transientQueryFailure && matchingLedgerCache) return matchingLedgerCache
         return normalizeUsageStatusResponse(
           status,
@@ -195,23 +225,27 @@ export function createV4Observability(rpc: RpcTransport, http: HttpTransport): O
     },
     async readiness(options) {
       await rpc.ready({ signal: options.signal })
-      return asRecord(await rpc.request(
+      const result = await rpc.request<DoctorStatusResult>(
         DOCTOR_STATUS_METHOD,
         { agentId: options.agentId || 'main', deep: options.deep },
         callOptions(options.signal),
-      )) as ReadinessReport
+      )
+      if (!validateDoctorStatusResult(result)) throw invalid(DOCTOR_STATUS_METHOD)
+      return result as ReadinessReport
     },
     async logStatus(options) {
       await rpc.ready({ signal: options?.signal })
-      return asRecord(await rpc.request(
+      const result = await rpc.request<LogsStatusResult>(
         LOGS_STATUS_METHOD,
         {},
         callOptions(options?.signal),
-      )) as GatewayLogStatus
+      )
+      if (!validateLogsStatusResult(result)) throw invalid(LOGS_STATUS_METHOD)
+      return result as GatewayLogStatus
     },
     async tailLogs(options) {
       await rpc.ready({ signal: options.signal })
-      const raw = asRecord(await rpc.request(
+      const raw = await rpc.request<LogsTailResult>(
         LOGS_TAIL_METHOD,
         {
           cursor: options.cursor,
@@ -219,14 +253,11 @@ export function createV4Observability(rpc: RpcTransport, http: HttpTransport): O
           level: options.level ?? null,
         },
         callOptions(options.signal),
-      ))
-      const entries = Array.isArray(raw.lines)
-        ? raw.lines
-        : Array.isArray(raw.entries) ? raw.entries : []
+      )
+      if (!validateLogsTailResult(raw)) throw invalid(LOGS_TAIL_METHOD)
       return {
-        entries: entries.filter(item => typeof item === 'string'
-          || (item !== null && typeof item === 'object' && !Array.isArray(item))) as GatewayLogEntry[],
-        cursor: Number.isInteger(raw.cursor) ? Number(raw.cursor) : null,
+        entries: raw.lines as GatewayLogEntry[],
+        cursor: raw.cursor,
       } satisfies GatewayLogBatch
     },
     async updateNotice(options) {

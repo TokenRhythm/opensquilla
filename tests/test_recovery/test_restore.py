@@ -354,6 +354,7 @@ def test_restore_missing_backup_lock_authority_fails_without_mutating_backup(
     assert not (tmp_path / ".opensquilla.profile-replace.json").exists()
 
 
+@pytest.mark.ci_serial
 def test_restore_holds_candidate_legacy_lock_before_publication(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

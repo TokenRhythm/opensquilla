@@ -1,7 +1,7 @@
 import { hasInjectionContext, inject, reactive } from 'vue'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
-import { SESSION_CONVERSATION_KEY, type SessionConversation } from '@/modules/sessionConversation'
+import { ROUTE_FEEDBACK_KEY, type RouteFeedback } from '@/modules/routeFeedback'
 
 export type RouteFeedbackRating = 'up' | 'down'
 
@@ -12,14 +12,14 @@ export type RouteFeedbackRating = 'up' | 'down'
 const selected = reactive(new Map<string, RouteFeedbackRating>())
 const inFlight = reactive(new Set<string>())
 
-export function useChatRouteFeedback(conversation?: SessionConversation) {
+export function useChatRouteFeedback(feedback?: RouteFeedback) {
   const { pushToast } = useToasts()
-  let sessionConversation = conversation
-    ?? (hasInjectionContext() ? inject(SESSION_CONVERSATION_KEY, null) : null)
+  const routeFeedback = feedback
+    ?? (hasInjectionContext() ? inject(ROUTE_FEEDBACK_KEY, null) : null)
 
-  function resolveConversation(): SessionConversation {
-    if (sessionConversation) return sessionConversation
-    throw new Error('SessionConversation was not provided')
+  function resolveFeedback(): RouteFeedback {
+    if (routeFeedback) return routeFeedback
+    throw new Error('RouteFeedback was not provided')
   }
 
   function ratingFor(decisionId: string | undefined): RouteFeedbackRating | undefined {
@@ -42,7 +42,7 @@ export function useChatRouteFeedback(conversation?: SessionConversation) {
 
     inFlight.add(decisionId)
     try {
-      const res = await resolveConversation().submitRouteFeedback(decisionId, effective)
+      const res = await resolveFeedback().submit(decisionId, effective)
       if (!res?.accepted) {
         rollback(decisionId, previous)
         pushToast(

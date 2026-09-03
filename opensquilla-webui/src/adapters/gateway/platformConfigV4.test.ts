@@ -31,6 +31,13 @@ function rpc() {
       count: 1,
     } as T
     if (method === 'onboarding.status') return { ready: true } as T
+    if (method === 'onboarding.router.configure') return {
+      changed: true,
+      restartRequired: false,
+      configPath: '/tmp/config.toml',
+      entry: { mode: 'recommended' },
+      warnings: [],
+    } as T
     if (method === 'migration.sources.list') return {
       schemaVersion: 1,
       mode: 'preview_only',
@@ -60,8 +67,21 @@ describe('Platform configuration adapters', () => {
     expect(await settings.read('theme')).toBe('dark')
     expect(await settings.readAll()).toEqual({ theme: 'dark' })
     expect(await settings.readEffective()).toEqual({ fields: { theme: { value: 'dark', source: 'config' } } })
+    expect(source.request).toHaveBeenCalledWith(
+      'config.get',
+      undefined,
+      expect.objectContaining({
+        timeoutMs: 10_000,
+        timeoutAction: 'reconnect',
+        abortAction: 'reject',
+      }),
+    )
     expect(await settings.patchSafe([{ path: 'theme', value: 'light' }])).toEqual({ patched: ['theme'], restartRequired: true })
-    expect(source.request).toHaveBeenCalledWith('config.patch.safe', { patches: { theme: 'light' } }, expect.any(Object))
+    expect(source.request).toHaveBeenCalledWith(
+      'config.patch.safe',
+      { patches: { theme: 'light' } },
+      expect.objectContaining({ timeoutAction: 'reject', abortAction: 'reject' }),
+    )
     await settings.merge({ llm: { model: 'gpt-4' } })
     expect(source.request).toHaveBeenCalledWith('config.patch', { patch: { llm: { model: 'gpt-4' } } }, expect.any(Object))
   })
@@ -86,7 +106,10 @@ describe('Platform configuration adapters', () => {
     expect(source.request).toHaveBeenCalledWith('models.routing.set', { mode: 'ensemble' }, expect.any(Object))
     const setup = createV4SetupWorkflow(source)
     expect(await setup.status()).toEqual({ ready: true })
-    await expect(setup.capability.configure('router', { mode: 'recommended' })).resolves.toEqual({})
+    await expect(setup.capability.configureRouter({ mode: 'recommended' })).resolves.toMatchObject({
+      changed: true,
+      restartRequired: false,
+    })
     expect(source.request).toHaveBeenCalledWith('onboarding.router.configure', { mode: 'recommended' }, expect.any(Object))
   })
 

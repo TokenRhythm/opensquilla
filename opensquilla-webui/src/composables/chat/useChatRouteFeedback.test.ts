@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { sessionConversationTestDouble } from '@/testing/sessionConversation.test-helper'
+import { routeFeedbackTestDouble } from '@/testing/conversationAncillary.test-helper'
 
 const submitRouteFeedback = vi.fn()
-const sessionConversation = sessionConversationTestDouble({ submitRouteFeedback })
+const routeFeedback = routeFeedbackTestDouble({ submit: submitRouteFeedback })
 
 const pushToast = vi.fn()
 vi.mock('@/composables/useToasts', () => ({
@@ -23,7 +23,7 @@ describe('useChatRouteFeedback', () => {
 
   it('submits a rating and records optimistic state', async () => {
     submitRouteFeedback.mockResolvedValue({ accepted: true, recorded: 'up' })
-    const fb = useChatRouteFeedback(sessionConversation)
+    const fb = useChatRouteFeedback(routeFeedback)
 
     await fb.submit('dec-1', 'up')
 
@@ -34,7 +34,7 @@ describe('useChatRouteFeedback', () => {
 
   it('clicking the active thumb again revokes with neutral', async () => {
     submitRouteFeedback.mockResolvedValue({ accepted: true })
-    const fb = useChatRouteFeedback(sessionConversation)
+    const fb = useChatRouteFeedback(routeFeedback)
 
     await fb.submit('dec-2', 'down')
     expect(fb.ratingFor('dec-2')).toBe('down')
@@ -46,7 +46,7 @@ describe('useChatRouteFeedback', () => {
 
   it('clicking the other thumb revises the rating', async () => {
     submitRouteFeedback.mockResolvedValue({ accepted: true })
-    const fb = useChatRouteFeedback(sessionConversation)
+    const fb = useChatRouteFeedback(routeFeedback)
 
     await fb.submit('dec-3', 'down')
     await fb.submit('dec-3', 'up')
@@ -57,7 +57,7 @@ describe('useChatRouteFeedback', () => {
 
   it('rolls back and toasts when the decision expired', async () => {
     submitRouteFeedback.mockResolvedValue({ accepted: false, reason: 'decision_not_found' })
-    const fb = useChatRouteFeedback(sessionConversation)
+    const fb = useChatRouteFeedback(routeFeedback)
 
     await fb.submit('dec-4', 'up')
 
@@ -67,7 +67,7 @@ describe('useChatRouteFeedback', () => {
 
   it('rolls back to the previous rating on a transport error', async () => {
     submitRouteFeedback.mockResolvedValueOnce({ accepted: true })
-    const fb = useChatRouteFeedback(sessionConversation)
+    const fb = useChatRouteFeedback(routeFeedback)
     await fb.submit('dec-5', 'up')
 
     submitRouteFeedback.mockRejectedValueOnce(new Error('boom'))

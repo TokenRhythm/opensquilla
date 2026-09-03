@@ -57,6 +57,20 @@ describe('App sidebar chrome contract', () => {
     expect(appSource).not.toContain('useSessionListSubscription')
   })
 
+  it('admits the app-wide cron lease after critical chat bootstrap traffic', () => {
+    const subscribeStart = appSource.indexOf('function subscribeCronEventsWhenAdmitted')
+    const subscribeEnd = appSource.indexOf('function resumeAutomaticAppRpc', subscribeStart)
+    const subscribeCron = appSource.slice(subscribeStart, subscribeEnd)
+    expect(subscribeCron).toContain('optionalSessionRpcAllowed.value')
+    expect(subscribeCron).toContain('cronFinishedSubscription = cronScheduler.subscribe')
+
+    const mountedStart = appSource.indexOf('onMounted(() =>')
+    const mountedEnd = appSource.indexOf('onUnmounted(() =>', mountedStart)
+    expect(appSource.slice(mountedStart, mountedEnd)).not.toContain(
+      'cronFinishedSubscription = cronScheduler.subscribe',
+    )
+  })
+
   it('keeps app-wide approval awareness behind ApprovalCenter', () => {
     expect(appSource).toContain('APPROVAL_CENTER_KEY')
     expect(appSource).toContain('approvalCenter.snapshot()')

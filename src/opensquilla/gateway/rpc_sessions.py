@@ -36,6 +36,7 @@ from opensquilla.application.session_read import (
     SessionWorkspaceState,
     deferred_session_read_metadata,
 )
+from opensquilla.application.turn_admission import PendingInputGuard
 from opensquilla.artifacts import enrich_artifact_event_dict
 from opensquilla.attachment_refs import (
     PENDING_CHAT_INPUT_MATERIAL_STORE,
@@ -63,6 +64,13 @@ from opensquilla.engine.steps.router_decision_record import (
     drain_pending_flushes_for_sessions,
 )
 from opensquilla.gateway import attachment_ingest as _attachment_ingest
+from opensquilla.gateway.adapters.pending_input_queue import (
+    GatewayPendingInputQueueAdapter,
+    GatewayPendingInputQueueCallbacks,
+)
+from opensquilla.gateway.adapters.pending_input_queue_contract import (
+    register_pending_input_queue_contract,
+)
 from opensquilla.gateway.adapters.plans_contract import (
     register_plans_cancel_run_contract,
     register_plans_implement_contract,
@@ -75,6 +83,13 @@ from opensquilla.gateway.adapters.session_lifecycle import (
 )
 from opensquilla.gateway.adapters.session_lifecycle_contract import (
     register_session_lifecycle_contract,
+)
+from opensquilla.gateway.adapters.session_maintenance import (
+    GatewaySessionMaintenanceAdapter,
+    GatewaySessionMaintenanceCallbacks,
+)
+from opensquilla.gateway.adapters.session_maintenance_contract import (
+    register_session_maintenance_contract,
 )
 from opensquilla.gateway.adapters.session_preview import (
     SystemClock,
@@ -103,6 +118,13 @@ from opensquilla.gateway.adapters.sessions_resolve_contract import (
 )
 from opensquilla.gateway.adapters.sessions_search_contract import (
     register_sessions_search_contract,
+)
+from opensquilla.gateway.adapters.turn_admission import (
+    GatewayTurnAdmissionAdapter,
+    GatewayTurnAdmissionCallbacks,
+)
+from opensquilla.gateway.adapters.turn_admission_contract import (
+    register_turn_admission_contract,
 )
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
 from opensquilla.gateway.artifact_product_errors import (
@@ -3444,7 +3466,6 @@ _INGRESS_TURN_AUTHORITY_SCOPE: ContextVar[_IngressTurnAuthorityScope | None] = C
 )
 
 
-@_d.method("sessions.send", scope="operator.write")
 async def _handle_sessions_send_impl(
     params: dict | None,
     ctx: RpcContext,
@@ -7245,7 +7266,6 @@ async def _cleanup_unreferenced_pending_promotions(
                 )
 
 
-@_d.method("sessions.pending_inputs.enqueue", scope="operator.write")
 async def _handle_pending_inputs_enqueue(
     params: dict | None,
     ctx: RpcContext,
@@ -7464,7 +7484,6 @@ async def _handle_pending_inputs_enqueue(
     return {"status": "staged", **_pending_input_payload(row, replayed=replayed)}
 
 
-@_d.method("sessions.pending_inputs.list", scope="operator.read")
 async def _handle_pending_inputs_list(
     params: dict | None,
     ctx: RpcContext,
@@ -7478,7 +7497,6 @@ async def _handle_pending_inputs_list(
     }
 
 
-@_d.method("sessions.pending_inputs.update", scope="operator.write")
 async def _handle_pending_inputs_update(
     params: dict | None,
     ctx: RpcContext,
@@ -7521,7 +7539,6 @@ async def _handle_pending_inputs_update(
     return {"status": "updated", **_pending_input_payload(row)}
 
 
-@_d.method("sessions.pending_inputs.reorder", scope="operator.write")
 async def _handle_pending_inputs_reorder(
     params: dict | None,
     ctx: RpcContext,
@@ -7577,7 +7594,6 @@ async def _handle_pending_inputs_reorder(
     }
 
 
-@_d.method("sessions.pending_inputs.cancel", scope="operator.write")
 async def _handle_pending_inputs_cancel(
     params: dict | None,
     ctx: RpcContext,
@@ -7638,7 +7654,6 @@ async def _handle_pending_inputs_cancel(
     }
 
 
-@_d.method("sessions.pending_inputs.dispatch", scope="operator.write")
 async def _handle_pending_inputs_dispatch(
     params: dict | None,
     ctx: RpcContext,
@@ -7743,13 +7758,13 @@ async def _handle_pending_inputs_dispatch(
                 accepted=False,
             )
         try:
-            response = await _handle_sessions_send(
+            response = await _session_turn_admission_adapter(ctx).admit_pending(
                 dict(row.payload),
-                ctx,
-                fingerprint_params=dict(row.payload),
-                pending_input_id=row.pending_input_id,
-                pending_input_fingerprint=row.request_fingerprint,
-                pending_input_revision=row.state_revision,
+                PendingInputGuard(
+                    pending_input_id=row.pending_input_id,
+                    request_fingerprint=row.request_fingerprint,
+                    expected_revision=row.state_revision,
+                ),
             )
         except PendingChatInputNotFoundError as exc:
             raise RpcHandlerError(
@@ -7877,7 +7892,6 @@ async def _steer_v2_response(
     return payload
 
 
-@_d.method("sessions.pending_inputs.steer", scope="operator.write")
 async def _handle_pending_inputs_steer(
     params: dict | None,
     ctx: RpcContext,
@@ -8025,17 +8039,17 @@ async def _handle_pending_inputs_steer(
                 else params.get("_source")
             ),
         }
-        return await _handle_sessions_steer_v2_impl(
+        return await _session_turn_admission_adapter(ctx).steer_pending(
             steer_params,
-            ctx,
-            pending_input_id=pending_input_id,
-            pending_input_fingerprint=supplied_fingerprint,
-            pending_input_revision=expected_revision,
-            pending_source_scope=source_scope,
+            PendingInputGuard(
+                pending_input_id=pending_input_id,
+                request_fingerprint=supplied_fingerprint,
+                expected_revision=expected_revision,
+                source_scope=source_scope,
+            ),
         )
 
 
-@_d.method("sessions.steer.v2", scope="operator.write")
 async def _handle_sessions_steer_v2(params: dict | None, ctx: RpcContext) -> dict:
     return await _handle_sessions_steer_v2_impl(params, ctx)
 
@@ -8472,7 +8486,6 @@ async def _handle_sessions_steer_v2_impl(
     )
 
 
-@_d.method("sessions.steer", scope="operator.write")
 async def _handle_sessions_steer(params: dict | None, ctx: RpcContext) -> dict:
     """Inject text into the active turn, with a durable follow-up fallback."""
 
@@ -8823,7 +8836,6 @@ async def _emit_to_subscribers(
     )
 
 
-@_d.method("sessions.abort", scope="operator.write")
 async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
     key = _require_key(params)
 
@@ -9417,8 +9429,7 @@ _handle_sessions_rename_contract = register_session_lifecycle_contract(
 )
 
 
-@_d.method("sessions.reset", scope="operator.write")
-async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def _execute_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     """Synchronous session reset with FlushReceipt.
 
     Sequence when ``ctx.flush_service`` is wired:
@@ -9877,8 +9888,7 @@ _handle_sessions_delete_contract = register_session_lifecycle_contract(
 )
 
 
-@_d.method("sessions.contextCompact", scope="operator.write")
-async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext) -> dict:
+async def _execute_sessions_context_compact(params: dict | None, ctx: RpcContext) -> dict:
     key = _require_key(params)
     if ctx.session_manager is None:
         raise KeyError("No session manager available")
@@ -10683,9 +10693,52 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
     }
 
 
-@_d.method("sessions.compact", scope="operator.write")
+def _session_maintenance_adapter(ctx: RpcContext) -> GatewaySessionMaintenanceAdapter:
+    return GatewaySessionMaintenanceAdapter(
+        ctx,
+        GatewaySessionMaintenanceCallbacks(
+            require_key=_require_key,
+            execute_reset=_execute_sessions_reset,
+            execute_compact=_execute_sessions_context_compact,
+        ),
+    )
+
+
+async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    return await _session_maintenance_adapter(ctx).reset(params)
+
+
+async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext) -> dict:
+    return await _session_maintenance_adapter(ctx).compact(params)
+
+
 async def _handle_sessions_compact(params: dict | None, ctx: RpcContext) -> dict:
-    return cast(dict, await _handle_sessions_context_compact(params, ctx))
+    return await _session_maintenance_adapter(ctx).compact(params)
+
+
+_handle_sessions_reset_contract = register_session_maintenance_contract(
+    _d,
+    "sessions.reset",
+    _handle_sessions_reset,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+_handle_sessions_context_compact_contract = register_session_maintenance_contract(
+    _d,
+    "sessions.contextCompact",
+    _handle_sessions_context_compact,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+_handle_sessions_compact_contract = register_session_maintenance_contract(
+    _d,
+    "sessions.compact",
+    _handle_sessions_compact,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 @_d.method("sessions.truncate", scope="operator.write")
@@ -12421,3 +12474,182 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
         "epoch": epoch,
         "stream_cursor": stream_cursor,
     }
+
+
+async def _execute_pending_session_send(
+    params: dict[str, Any],
+    ctx: RpcContext,
+    guard: PendingInputGuard,
+) -> dict[str, Any]:
+    return await _handle_sessions_send(
+        params,
+        ctx,
+        fingerprint_params=dict(params),
+        pending_input_id=guard.pending_input_id,
+        pending_input_fingerprint=guard.request_fingerprint,
+        pending_input_revision=guard.expected_revision,
+    )
+
+
+async def _execute_pending_session_steer(
+    params: dict[str, Any],
+    ctx: RpcContext,
+    guard: PendingInputGuard,
+) -> dict[str, Any]:
+    return await _handle_sessions_steer_v2_impl(
+        params,
+        ctx,
+        pending_input_id=guard.pending_input_id,
+        pending_input_fingerprint=guard.request_fingerprint,
+        pending_input_revision=guard.expected_revision,
+        pending_source_scope=guard.source_scope,
+    )
+
+
+def _session_turn_admission_adapter(ctx: RpcContext) -> GatewayTurnAdmissionAdapter:
+    return GatewayTurnAdmissionAdapter(
+        ctx,
+        GatewayTurnAdmissionCallbacks(
+            require_key=_require_key,
+            execute_session_send=_handle_sessions_send,
+            execute_session_abort=_handle_sessions_abort,
+            execute_durable_steer=_handle_sessions_steer_v2,
+            execute_legacy_steer=_handle_sessions_steer,
+            execute_pending_send=_execute_pending_session_send,
+            execute_pending_steer=_execute_pending_session_steer,
+        ),
+    )
+
+
+async def _handle_sessions_send_contract(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    return await _session_turn_admission_adapter(ctx).admit(params, surface="session")
+
+
+async def _handle_sessions_abort_contract(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    return await _session_turn_admission_adapter(ctx).cancel(params, surface="session")
+
+
+async def _handle_sessions_steer_v2_contract(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    return await _session_turn_admission_adapter(ctx).steer(params, durable=True)
+
+
+async def _handle_sessions_steer_contract(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    return await _session_turn_admission_adapter(ctx).steer(params, durable=False)
+
+
+_handle_sessions_send_generated_contract = register_turn_admission_contract(
+    _d,
+    "sessions.send",
+    _handle_sessions_send_contract,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_sessions_abort_generated_contract = register_turn_admission_contract(
+    _d,
+    "sessions.abort",
+    _handle_sessions_abort_contract,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_sessions_steer_v2_generated_contract = register_turn_admission_contract(
+    _d,
+    "sessions.steer.v2",
+    _handle_sessions_steer_v2_contract,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_sessions_steer_generated_contract = register_turn_admission_contract(
+    _d,
+    "sessions.steer",
+    _handle_sessions_steer_contract,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
+def _pending_input_queue_adapter(ctx: RpcContext) -> GatewayPendingInputQueueAdapter:
+    return GatewayPendingInputQueueAdapter(
+        ctx,
+        GatewayPendingInputQueueCallbacks(
+            require_key=_pending_input_key,
+            enqueue=_handle_pending_inputs_enqueue,
+            list=_handle_pending_inputs_list,
+            update=_handle_pending_inputs_update,
+            reorder=_handle_pending_inputs_reorder,
+            cancel=_handle_pending_inputs_cancel,
+            dispatch=_handle_pending_inputs_dispatch,
+            steer=_handle_pending_inputs_steer,
+        ),
+    )
+
+
+async def _handle_pending_inputs_enqueue_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _pending_input_queue_adapter(ctx).enqueue(params)
+
+
+async def _handle_pending_inputs_list_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _pending_input_queue_adapter(ctx).list(params)
+
+
+async def _handle_pending_inputs_update_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _pending_input_queue_adapter(ctx).update(params)
+
+
+async def _handle_pending_inputs_reorder_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _pending_input_queue_adapter(ctx).reorder(params)
+
+
+async def _handle_pending_inputs_cancel_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _pending_input_queue_adapter(ctx).cancel(params)
+
+
+async def _handle_pending_inputs_dispatch_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _pending_input_queue_adapter(ctx).dispatch(params)
+
+
+async def _handle_pending_inputs_steer_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _pending_input_queue_adapter(ctx).steer(params)
+
+
+for _pending_method, _pending_implementation in (
+    ("sessions.pending_inputs.enqueue", _handle_pending_inputs_enqueue_contract),
+    ("sessions.pending_inputs.list", _handle_pending_inputs_list_contract),
+    ("sessions.pending_inputs.update", _handle_pending_inputs_update_contract),
+    ("sessions.pending_inputs.reorder", _handle_pending_inputs_reorder_contract),
+    ("sessions.pending_inputs.cancel", _handle_pending_inputs_cancel_contract),
+    ("sessions.pending_inputs.dispatch", _handle_pending_inputs_dispatch_contract),
+    ("sessions.pending_inputs.steer", _handle_pending_inputs_steer_contract),
+):
+    register_pending_input_queue_contract(
+        _d,
+        _pending_method,
+        _pending_implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )

@@ -3242,6 +3242,7 @@ def test_windows_lock_reacquire_failure_preserves_profile_transaction(
     assert inspected.stable_code == "transaction_incomplete"
 
 
+@pytest.mark.ci_serial
 def test_published_candidate_holds_legacy_gateway_lock_during_validation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

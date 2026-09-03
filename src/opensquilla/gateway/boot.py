@@ -3136,14 +3136,11 @@ async def build_services(
     if session_storage is not None and callable(
         getattr(session_storage, "_write_transaction", None)
     ):
+        from opensquilla.application.artifact_workbench import ArtifactRecoveryApplication
         from opensquilla.artifact_session import ArtifactSessionService
         from opensquilla.artifacts import ArtifactStore
-        from opensquilla.gateway.artifact_mutation_recovery import (
-            reconcile_pending_artifact_mutations,
-            reject_orphaned_artifact_drafts,
-        )
-        from opensquilla.gateway.document_resource_recovery import (
-            reconcile_pending_document_resources,
+        from opensquilla.gateway.adapters.artifact_recovery import (
+            GatewayArtifactRecoveryPort,
         )
         from opensquilla.gateway.rpc import RpcContext
         from opensquilla.gateway.rpc_workbench_resources import (
@@ -3159,17 +3156,8 @@ async def build_services(
             session_manager=session_manager,
             config=config,
         )
-
-        try:
-            draft_recovery_summary = await reject_orphaned_artifact_drafts(
-                artifact_recovery_service,
-                ArtifactStore(media_root_from_config(config)),
-            )
-            recovery_summary = await reconcile_pending_artifact_mutations(
-                artifact_recovery_service,
-                ArtifactStore(media_root_from_config(config)),
-            )
-            resource_recovery_summary = await reconcile_pending_document_resources(
+        artifact_recovery = ArtifactRecoveryApplication(
+            GatewayArtifactRecoveryPort(
                 artifact_recovery_service,
                 ArtifactStore(media_root_from_config(config)),
                 import_source_resolver=lambda attempt: resolve_recovery_import_source(
@@ -3177,38 +3165,50 @@ async def build_services(
                     attempt,
                 ),
             )
+        )
+
+        try:
+            recovery_report = await artifact_recovery.reconcile()
         finally:
             await artifact_recovery_service.close()
-        if recovery_summary.examined:
+        recovery_summary = recovery_report.mutations
+        draft_recovery_summary = recovery_report.drafts
+        resource_recovery_summary = recovery_report.resources
+        if recovery_summary.get("examined", 0):
             log.info(
                 "build_services.artifact_mutations_reconciled",
-                examined=recovery_summary.examined,
-                applied=recovery_summary.applied,
-                failed=recovery_summary.failed,
-                ambiguous=recovery_summary.ambiguous,
-                deleted_candidates=recovery_summary.deleted_candidates,
+                examined=recovery_summary.get("examined", 0),
+                applied=recovery_summary.get("applied", 0),
+                failed=recovery_summary.get("failed", 0),
+                ambiguous=recovery_summary.get("ambiguous", 0),
+                deleted_candidates=recovery_summary.get("deleted_candidates", 0),
             )
-        if draft_recovery_summary.examined:
+        if draft_recovery_summary.get("examined", 0):
             log.info(
                 "build_services.artifact_drafts_reconciled",
-                examined=draft_recovery_summary.examined,
-                rejected=draft_recovery_summary.rejected,
-                ambiguous=draft_recovery_summary.ambiguous,
-                deleted_candidates=draft_recovery_summary.deleted_candidates,
+                examined=draft_recovery_summary.get("examined", 0),
+                rejected=draft_recovery_summary.get("rejected", 0),
+                ambiguous=draft_recovery_summary.get("ambiguous", 0),
+                deleted_candidates=draft_recovery_summary.get("deleted_candidates", 0),
             )
-        if resource_recovery_summary.examined:
+        if (
+            resource_recovery_summary.get("imports_examined", 0)
+            + resource_recovery_summary.get("publishes_examined", 0)
+        ):
             log.info(
                 "build_services.document_resources_reconciled",
-                imports_examined=resource_recovery_summary.imports_examined,
-                imports_applied=resource_recovery_summary.imports_applied,
-                imports_failed=resource_recovery_summary.imports_failed,
-                imports_ambiguous=resource_recovery_summary.imports_ambiguous,
-                publishes_examined=resource_recovery_summary.publishes_examined,
-                publishes_applied=resource_recovery_summary.publishes_applied,
-                publishes_failed=resource_recovery_summary.publishes_failed,
-                publishes_ambiguous=resource_recovery_summary.publishes_ambiguous,
-                deleted_candidates=resource_recovery_summary.deleted_candidates,
-                promoted_deliverables=resource_recovery_summary.promoted_deliverables,
+                imports_examined=resource_recovery_summary.get("imports_examined", 0),
+                imports_applied=resource_recovery_summary.get("imports_applied", 0),
+                imports_failed=resource_recovery_summary.get("imports_failed", 0),
+                imports_ambiguous=resource_recovery_summary.get("imports_ambiguous", 0),
+                publishes_examined=resource_recovery_summary.get("publishes_examined", 0),
+                publishes_applied=resource_recovery_summary.get("publishes_applied", 0),
+                publishes_failed=resource_recovery_summary.get("publishes_failed", 0),
+                publishes_ambiguous=resource_recovery_summary.get("publishes_ambiguous", 0),
+                deleted_candidates=resource_recovery_summary.get("deleted_candidates", 0),
+                promoted_deliverables=resource_recovery_summary.get(
+                    "promoted_deliverables", 0
+                ),
             )
     from opensquilla.application.approval_queue import get_approval_queue
 

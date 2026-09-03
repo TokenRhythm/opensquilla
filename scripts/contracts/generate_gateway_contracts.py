@@ -58,6 +58,7 @@ LEGACY_GENERATORS = {
 }
 
 WIRE_NAME_PATTERN = re.compile(r"^[a-z][a-zA-Z0-9_]*(?:\.[a-z][a-zA-Z0-9_]*)+$")
+LEGACY_ROOT_METHOD_NAMES = frozenset({"status"})
 SCOPE_PATTERN = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$")
 ERROR_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -266,7 +267,10 @@ def load_contract(schema: Path, *, contract_root: Path = CONTRACT_ROOT) -> Contr
     if method is not None:
         metadata = _require_mapping(method, label="x-opensquilla-method", schema=schema)
         wire_name = _require_string(metadata, "name", schema=schema)
-        if not WIRE_NAME_PATTERN.fullmatch(wire_name):
+        if (
+            not WIRE_NAME_PATTERN.fullmatch(wire_name)
+            and wire_name not in LEGACY_ROOT_METHOD_NAMES
+        ):
             raise ContractConfigurationError(
                 f"{schema}: method name {wire_name!r} is not a legal dotted identifier"
             )
@@ -348,7 +352,10 @@ def load_contract(schema: Path, *, contract_root: Path = CONTRACT_ROOT) -> Contr
                 raise ContractConfigurationError(
                     f"{schema}: unsupported capability kind {capability_kind!r}"
                 )
-            if not WIRE_NAME_PATTERN.fullmatch(capability_name):
+            if (
+                not WIRE_NAME_PATTERN.fullmatch(capability_name)
+                and capability_name not in LEGACY_ROOT_METHOD_NAMES
+            ):
                 raise ContractConfigurationError(
                     f"{schema}: capability name {capability_name!r} is not legal"
                 )

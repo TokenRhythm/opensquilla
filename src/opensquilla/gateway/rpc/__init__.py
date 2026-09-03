@@ -68,6 +68,7 @@ import opensquilla.gateway.rpc_memory_import  # noqa: E402, F401
 import opensquilla.gateway.rpc_meta_runs  # noqa: E402, F401
 import opensquilla.gateway.rpc_migration  # noqa: E402, F401
 import opensquilla.gateway.rpc_models  # noqa: E402, F401
+import opensquilla.gateway.rpc_observability  # noqa: E402, F401
 import opensquilla.gateway.rpc_onboarding  # noqa: E402, F401
 import opensquilla.gateway.rpc_prompt_cache_keepalive  # noqa: E402, F401
 import opensquilla.gateway.rpc_proposals  # noqa: E402, F401

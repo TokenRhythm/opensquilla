@@ -2,55 +2,43 @@
 
 from __future__ import annotations
 
-import inspect
 import re
-from collections.abc import Awaitable, Callable
-from dataclasses import replace
 from typing import Any, cast
 
-from opensquilla.gateway.config import GatewayConfig
-from opensquilla.gateway.rpc import RpcContext, get_dispatcher
-from opensquilla.gateway.rpc_channels import _handle_channels_status
-from opensquilla.gateway.rpc_logs import _build_logs_status
-from opensquilla.gateway.rpc_system import _handle_doctor_memory_status
-from opensquilla.gateway.rpc_tools import _handle_providers_status, _handle_search_status
-from opensquilla.health.evaluator import (
-    evaluate_channels,
-    evaluate_image_generation,
-    evaluate_llm_ensemble,
-    evaluate_logs,
-    evaluate_memory,
-    evaluate_memory_embedding,
-    evaluate_provider,
-    evaluate_router,
-    evaluate_sandbox,
-    evaluate_search,
-    evaluate_squilla_router_runtime,
+from opensquilla.application.observability import (
+    _COLLECTION_INSPECT_COMMANDS as _APPLICATION_COLLECTION_INSPECT_COMMANDS,
 )
-from opensquilla.health.model import FixStep, HealthFinding, HealthSeverity, build_report
-from opensquilla.health.recovery_commands import command_with_config as _command_with_config
+from opensquilla.application.observability import (
+    ReadinessDiagnostics,
+    ReadinessQuery,
+)
+from opensquilla.gateway.adapters.observability import (
+    GatewayReadinessDataPort,
+    GatewayReadinessEvaluationPort,
+)
+from opensquilla.gateway.adapters.observability_contract import (
+    register_observability_contract,
+)
+from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
+from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
+from opensquilla.gateway.rpc_channels import read_channel_status as _handle_channels_status
+from opensquilla.gateway.rpc_logs import read_log_status as _build_logs_status
+from opensquilla.gateway.rpc_system import read_memory_status as _handle_doctor_memory_status
+from opensquilla.gateway.rpc_tools import (
+    read_provider_status as _handle_providers_status,
+)
+from opensquilla.gateway.rpc_tools import (
+    read_search_status as _handle_search_status,
+)
 from opensquilla.sandbox.status import status_payload as _sandbox_status_payload
-from opensquilla.session.keys import normalize_agent_id
 
 _d = get_dispatcher()
 
-Collector = Callable[[], dict[str, Any] | Awaitable[dict[str, Any]]]
-Evaluator = Callable[[dict[str, Any]], list[HealthFinding]]
+# Compatibility export for recovery-command consumers; the Application Module
+# remains the single owner of the command mapping.
+_COLLECTION_INSPECT_COMMANDS = _APPLICATION_COLLECTION_INSPECT_COMMANDS
 
-_COLLECTION_INSPECT_COMMANDS = {
-    "provider": "opensquilla providers status --json",
-    "logs": "opensquilla diagnostics status",
-    "memory": "opensquilla memory status --deep --json",
-    "channels": "opensquilla channels status --json",
-    "sandbox": "opensquilla sandbox status --json",
-    "router": "opensquilla diagnostics status",
-    "squilla_router": "opensquilla diagnostics status",
-    "memory_embedding": "opensquilla memory status --deep --json",
-    "search": "opensquilla search status --json",
-    "image_generation": "opensquilla onboard status --json",
-    "llm_ensemble": "opensquilla diagnostics status",
-}
-_READINESS_CRITICAL_COLLECTIONS = {"provider"}
 _UNKNOWN_SEARCH_PROVIDER_RE = re.compile(
     r"Unknown search provider ['\"]([^'\"]+)['\"]"
     r"|unknown search provider: ['\"]([^'\"]+)['\"]",
@@ -58,53 +46,10 @@ _UNKNOWN_SEARCH_PROVIDER_RE = re.compile(
 )
 
 
-def _collection_error(surface: str, exc: Exception) -> HealthFinding:
-    inspect_command = _COLLECTION_INSPECT_COMMANDS.get(surface)
-    fix_steps = []
-    if inspect_command:
-        fix_steps.append(FixStep(label=f"Inspect {surface}", command=inspect_command))
-    if inspect_command != "opensquilla diagnostics status":
-        fix_steps.append(
-            FixStep(label="Inspect diagnostics", command="opensquilla diagnostics status")
-        )
-    fix_steps.append(FixStep(label="Restart gateway", command="opensquilla gateway restart"))
-    severity: HealthSeverity = (
-        "error" if surface in _READINESS_CRITICAL_COLLECTIONS else "warn"
-    )
-    return HealthFinding(
-        id=f"{surface}.diagnostic.unavailable",
-        severity=severity,
-        surface=surface,
-        title=f"{surface.title()} diagnostics unavailable",
-        detail=f"{type(exc).__name__}: {exc}",
-        evidence={"errorType": type(exc).__name__},
-        fix_steps=fix_steps,
-        restart_required=True,
-    )
-
-
 def _config_path(ctx: RpcContext) -> str | None:
     config = getattr(ctx, "config", None)
     value = getattr(config, "config_path", None)
     return str(value) if value else None
-
-
-def _with_config_recovery_steps(
-    findings: list[HealthFinding],
-    config_path: str | None,
-) -> list[HealthFinding]:
-    if not config_path:
-        return findings
-    adjusted: list[HealthFinding] = []
-    for finding in findings:
-        fix_steps = [
-            replace(step, command=_command_with_config(step.command, config_path))
-            if step.command
-            else step
-            for step in finding.fix_steps
-        ]
-        adjusted.append(replace(finding, fix_steps=fix_steps))
-    return adjusted
 
 
 def _unknown_search_provider(exc: Exception) -> str:
@@ -456,87 +401,43 @@ def _memory_embedding_payload(ctx: RpcContext) -> dict[str, Any]:
     }
 
 
-async def _evaluate_collection(
-    surface: str,
-    collect: Collector,
-    evaluate: Evaluator,
-) -> list[HealthFinding]:
-    try:
-        value = collect()
-        payload = await value if inspect.isawaitable(value) else value
-        return evaluate(payload)
-    except Exception as exc:  # noqa: BLE001 - doctor reports partial diagnostic failures.
-        return [_collection_error(surface, exc)]
-
-
-@_d.method("doctor.status", scope="operator.read")
-async def _handle_doctor_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def _doctor_status_contract(
+    params: dict | None, ctx: RpcContext
+) -> dict[str, Any]:
     if params is not None and not isinstance(params, dict):
         raise ValueError("params must be an object")
     params = params or {}
-    agent_id = normalize_agent_id(str(params.get("agentId") or "main"))
-    deep = bool(params.get("deep", True))
-    probe_providers = bool(params.get("probeProviders", False))
+    port = GatewayReadinessDataPort(
+        ctx,
+        provider=_handle_providers_status,
+        logs=lambda _params, context: _build_logs_status(context),
+        memory=_handle_doctor_memory_status,
+        channels=_handle_channels_status,
+        sandbox=lambda _params, context: _sandbox_payload(context),
+        router=lambda query, context: _router_payload(
+            context, deep=bool((query or {}).get("deep", True))
+        ),
+        squilla_router=lambda _params, context: _squilla_router_runtime_payload(context),
+        memory_embedding=lambda _params, context: _memory_embedding_payload(context),
+        search=lambda _params, context: _search_payload(context),
+        image_generation=lambda _params, context: _image_generation_payload(context),
+        llm_ensemble=lambda _params, context: _llm_ensemble_payload(context),
+    )
+    return await ReadinessDiagnostics(port, GatewayReadinessEvaluationPort()).assess(
+        ReadinessQuery(
+            agent_id=str(params.get("agentId") or "main"),
+            deep=bool(params.get("deep", True)),
+            probe_providers=bool(params.get("probeProviders", False)),
+        ),
+        connection_id=ctx.conn_id,
+        config_path=_config_path(ctx),
+    )
 
-    findings: list[HealthFinding] = [
-        HealthFinding(
-            id="gateway.rpc.ready",
-            severity="ok",
-            surface="gateway",
-            title="Gateway RPC ready",
-            detail="The gateway accepted and handled doctor.status.",
-            evidence={"connId": ctx.conn_id},
-        )
-    ]
 
-    collectors: list[tuple[str, Collector, Evaluator]] = [
-        (
-            "provider",
-            lambda: _handle_providers_status(
-                {"probeModels": probe_providers},
-                ctx,
-            ),
-            evaluate_provider,
-        ),
-        ("logs", lambda: _build_logs_status(ctx), evaluate_logs),
-        (
-            "memory",
-            lambda: _handle_doctor_memory_status({"agentId": agent_id, "deep": deep}, ctx),
-            evaluate_memory,
-        ),
-        ("channels", lambda: _handle_channels_status({}, ctx), evaluate_channels),
-        ("sandbox", lambda: _sandbox_payload(ctx), evaluate_sandbox),
-        ("router", lambda: _router_payload(ctx, deep=deep), evaluate_router),
-        (
-            "squilla_router",
-            lambda: _squilla_router_runtime_payload(ctx),
-            evaluate_squilla_router_runtime,
-        ),
-        (
-            "memory_embedding",
-            lambda: _memory_embedding_payload(ctx),
-            evaluate_memory_embedding,
-        ),
-        ("search", lambda: _search_payload(ctx), evaluate_search),
-        (
-            "image_generation",
-            lambda: _image_generation_payload(ctx),
-            evaluate_image_generation,
-        ),
-        (
-            "llm_ensemble",
-            lambda: _llm_ensemble_payload(ctx),
-            evaluate_llm_ensemble,
-        ),
-    ]
-
-    for surface, collect, evaluate in collectors:
-        findings.extend(await _evaluate_collection(surface, collect, evaluate))
-
-    config_path = _config_path(ctx)
-    findings = _with_config_recovery_steps(findings, config_path)
-    report = build_report(findings)
-    report["agentId"] = agent_id
-    if config_path:
-        report["configPath"] = config_path
-    return report
+_handle_doctor_status = register_observability_contract(
+    _d,
+    "doctor.status",
+    _doctor_status_contract,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)

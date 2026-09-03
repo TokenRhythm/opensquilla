@@ -6,8 +6,14 @@ import os
 from pathlib import Path
 from typing import Any
 
+from opensquilla.application.observability import LogReader, LogTailQuery
+from opensquilla.gateway.adapters.observability import GatewayLogReaderPort
+from opensquilla.gateway.adapters.observability_contract import (
+    register_observability_contract,
+)
 from opensquilla.gateway.diagnostics import diagnostics_status_payload
-from opensquilla.gateway.rpc import RpcContext, get_dispatcher
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
+from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
 from opensquilla.observability.trace import load_trace_events
 from opensquilla.observability.turn_call_log import (
     LOG_DIR_ENV,
@@ -81,7 +87,7 @@ def _config_value(ctx: RpcContext, name: str, default: Any) -> Any:
     return getattr(config, name, default)
 
 
-def _build_logs_status(ctx: RpcContext) -> dict[str, Any]:
+def read_log_status(ctx: RpcContext) -> dict[str, Any]:
     raw_dir, raw_dir_source = resolve_turn_call_log_dir_with_source()
     configured_debug_log, configured_debug_log_source = _configured_debug_log_path()
     trace_dir, trace_dir_source = _configured_trace_log_dir()
@@ -145,11 +151,15 @@ def _build_logs_status(ctx: RpcContext) -> dict[str, Any]:
     }
 
 
-@_d.method("logs.status", scope="operator.read")
-async def _handle_logs_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def _logs_status_contract(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     """Report log-related runtime switches without mutating filesystem state."""
-
-    return _build_logs_status(ctx)
+    return await LogReader(
+        GatewayLogReaderPort(
+            ctx,
+            status_reader=read_log_status,
+            tail_reader=read_log_tail,
+        )
+    ).status()
 
 
 @_d.method("logs.trace", scope="operator.read")
@@ -175,35 +185,64 @@ async def _handle_logs_trace(params: dict | None, ctx: RpcContext) -> dict[str, 
     }
 
 
-@_d.method("logs.tail", scope="operator.read")
-async def _handle_logs_tail(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    """Tail log file with cursor-based pagination and level filter."""
-    p = params or {}
-    limit = min(p.get("limit", 100), 1000)
-    level_filter = (p.get("level", "") or "").upper()
-    cursor = p.get("cursor", 0)
-
+def read_log_tail(query: LogTailQuery) -> dict[str, Any]:
+    """Read one bounded log batch after Application-level normalization."""
     log_file = _find_log_file()
     if log_file is None or not log_file.exists():
         return {"lines": [], "cursor": 0, "has_more": False}
 
     file_size = log_file.stat().st_size
-    if cursor >= file_size:
+    if query.cursor >= file_size:
         return {"lines": [], "cursor": file_size, "has_more": False}
 
     with open(log_file, encoding="utf-8", errors="replace") as f:
-        f.seek(cursor)
+        f.seek(query.cursor)
         raw_lines = f.readlines()
         new_cursor = f.tell()
 
     # Apply level filter if specified
-    if level_filter:
-        filtered = [ln for ln in raw_lines if level_filter in ln.upper()]
+    if query.level:
+        filtered = [ln for ln in raw_lines if query.level in ln.upper()]
     else:
         filtered = raw_lines
 
     # Limit output
-    has_more = len(filtered) > limit
-    lines = [ln.rstrip() for ln in filtered[-limit:]]
+    has_more = len(filtered) > query.limit
+    lines = [ln.rstrip() for ln in filtered[-query.limit :]]
 
     return {"lines": lines, "cursor": new_cursor, "has_more": has_more}
+
+
+async def _logs_tail_contract(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    """Tail log file with cursor-based pagination and level filter."""
+    p = params or {}
+    reader = LogReader(
+        GatewayLogReaderPort(
+            ctx,
+            status_reader=read_log_status,
+            tail_reader=read_log_tail,
+        )
+    )
+    return await reader.tail(
+        LogTailQuery(
+            cursor=int(p.get("cursor", 0)),
+            limit=int(p.get("limit", 100)),
+            level=str(p.get("level") or "") or None,
+        )
+    )
+
+
+_handle_logs_status = register_observability_contract(
+    _d,
+    "logs.status",
+    _logs_status_contract,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_logs_tail = register_observability_contract(
+    _d,
+    "logs.tail",
+    _logs_tail_contract,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)

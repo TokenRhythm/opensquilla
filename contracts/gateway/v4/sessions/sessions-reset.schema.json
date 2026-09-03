@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opensquilla.dev/contracts/gateway/v4/sessions/sessions-reset.schema.json",
+  "title": "OpenSquilla sessions.reset Contract",
+  "description": "Language-neutral Contract for the v4 sessions.reset command.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "request": { "$ref": "#/$defs/SessionsResetRequestFrame" },
+    "response": { "$ref": "#/$defs/SessionsResetResponseFrame" }
+  },
+  "x-opensquilla-wire": {
+    "protocol": "opensquilla-websocket-json",
+    "version": 4,
+    "compatibility": "exact-json-tree"
+  },
+  "x-opensquilla-codegen": {
+    "python": { "tool": "datamodel-code-generator", "version": "0.75.1", "target": "pydantic_v2.BaseModel" },
+    "typescript": { "tool": "json-schema-to-typescript", "version": "15.0.4" },
+    "runtimeValidation": { "tool": "ajv", "version": "8.17.1", "mode": "standalone-adapter-only" }
+  },
+  "x-opensquilla-method": {
+    "name": "sessions.reset",
+    "kind": "command",
+    "scope": "operator.write",
+    "guestAllowed": false,
+    "idempotency": "non-idempotent",
+    "timeout": { "policy": "caller" },
+    "capability": { "kind": "method-availability", "name": "sessions.reset" },
+    "request": "#/$defs/SessionsResetRequestFrame",
+    "params": "#/$defs/SessionsResetParams",
+    "response": "#/$defs/SessionsResetResponseFrame",
+    "result": "#/$defs/SessionsResetResult",
+    "errors": [
+      { "code": "INVALID_PARAMS" },
+      { "code": "NOT_FOUND" },
+      { "code": "UNAUTHORIZED" },
+      { "code": "PERMISSION_DENIED" },
+      { "code": "FLUSH_UNAVAILABLE", "retryable": true, "details": true },
+      { "code": "FLUSH_DISK_ERROR", "retryable": true, "details": true },
+      { "code": "INTERNAL_ERROR" }
+    ]
+  },
+  "$defs": {
+    "SessionsResetParams": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["key"],
+      "properties": {
+        "key": { "type": "string", "minLength": 1 },
+        "force": { "type": "boolean", "default": false }
+      }
+    },
+    "SessionsResetRequestFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "method"],
+      "properties": {
+        "type": { "const": "req" },
+        "id": { "type": "string" },
+        "method": { "const": "sessions.reset" },
+        "params": {}
+      }
+    },
+    "SessionsResetResult": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["key", "reset", "rotated", "previous_session_id", "session_id", "epoch"],
+      "properties": {
+        "key": { "type": "string" },
+        "reset": { "const": true },
+        "rotated": { "type": "boolean" },
+        "previous_session_id": { "type": "string" },
+        "session_id": { "type": "string" },
+        "epoch": { "type": "integer" },
+        "flush_receipt": { "type": ["object", "null"], "additionalProperties": true }
+      }
+    },
+    "RpcError": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["code", "message"],
+      "properties": { "code": { "type": "string" }, "message": { "type": "string" } }
+    },
+    "SessionsResetOkResponseFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "ok", "payload"],
+      "properties": {
+        "type": { "const": "res" }, "id": { "type": "string" }, "ok": { "const": true },
+        "payload": { "$ref": "#/$defs/SessionsResetResult" }, "error": { "type": "null" }
+      }
+    },
+    "SessionsResetErrorResponseFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "ok", "error"],
+      "properties": {
+        "type": { "const": "res" }, "id": { "type": "string" }, "ok": { "const": false },
+        "payload": { "type": "null" }, "error": { "$ref": "#/$defs/RpcError" }
+      }
+    },
+    "SessionsResetResponseFrame": {
+      "oneOf": [
+        { "$ref": "#/$defs/SessionsResetOkResponseFrame" },
+        { "$ref": "#/$defs/SessionsResetErrorResponseFrame" }
+      ]
+    }
+  }
+}
