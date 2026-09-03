@@ -6,6 +6,7 @@ import tomllib
 
 import pytest
 
+import opensquilla.gateway.adapters.setup_config as setup_config_adapter
 import opensquilla.gateway.rpc_onboarding as rpc_onboarding  # noqa: F401
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
@@ -161,7 +162,7 @@ async def test_profile_remove_discards_pool_only_after_persist(
         llm_profiles={"deepseek": {"api_key": "synthetic-profile-key"}},
     )
     events: list[str] = []
-    real_persist = rpc_onboarding._persist
+    real_persist = setup_config_adapter.persist_setup_candidate
 
     def recording_persist(*args, **kwargs):
         result = real_persist(*args, **kwargs)
@@ -169,7 +170,8 @@ async def test_profile_remove_discards_pool_only_after_persist(
         return result
 
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_onboarding._persist", recording_persist
+        "opensquilla.gateway.adapters.setup_config.persist_setup_candidate",
+        recording_persist,
     )
     monkeypatch.setattr(
         "opensquilla.gateway.llm_runtime.discard_profile_credential_pool",
@@ -197,7 +199,7 @@ async def test_profile_upsert_persist_failure_preserves_pool(
     )
     discarded: list[str] = []
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_onboarding._persist",
+        "opensquilla.gateway.adapters.setup_config.persist_setup_candidate",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             OSError("synthetic write failure")
         ),
@@ -295,24 +297,26 @@ async def test_active_profile_remove_persists_and_hot_syncs_once(
     )
     ctx = _admin_ctx(cfg)
     syncs: list[tuple[str, str]] = []
+
+    class RecordingSelector:
+        def sync_primary(self, config) -> None:
+            syncs.append(("selector", config.provider))
+
+    ctx.provider_selector = RecordingSelector()
     transitions: list[tuple[str, str, str]] = []
     persist_calls: list[str] = []
-    real_persist = rpc_onboarding._persist
+    real_persist = setup_config_adapter.persist_setup_candidate
 
     def recording_persist(*args, **kwargs):
         persist_calls.append("persist")
         return real_persist(*args, **kwargs)
 
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_onboarding._persist",
+        "opensquilla.gateway.adapters.setup_config.persist_setup_candidate",
         recording_persist,
     )
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_onboarding._sync_provider_selector",
-        lambda _ctx, llm: syncs.append(("selector", llm.provider)),
-    )
-    monkeypatch.setattr(
-        "opensquilla.gateway.rpc_onboarding._sync_image_generation",
+        "opensquilla.gateway.setup_config_runtime.sync_media_runtime",
         lambda config: syncs.append(("media", config.llm.provider)),
     )
     monkeypatch.setattr(
@@ -412,19 +416,19 @@ async def test_active_profile_remove_reference_failure_does_not_partially_activa
     before = cfg.model_dump(mode="python")
     mutation_attempts: list[str] = []
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_onboarding._persist",
+        "opensquilla.gateway.adapters.setup_config.persist_setup_candidate",
         lambda *args, **kwargs: mutation_attempts.append("persist"),
     )
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_onboarding._apply_inplace",
+        "opensquilla.gateway.adapters.setup_config.install_gateway_config_candidate",
         lambda *args, **kwargs: mutation_attempts.append("apply"),
     )
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_onboarding._sync_provider_selector",
+        "opensquilla.gateway.provider_runtime.sync_provider_selector",
         lambda *args: mutation_attempts.append("selector"),
     )
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_onboarding._sync_image_generation",
+        "opensquilla.gateway.setup_config_runtime.sync_media_runtime",
         lambda *args: mutation_attempts.append("media"),
     )
 
@@ -855,7 +859,7 @@ async def test_profile_activate_persists_then_hot_syncs_without_secret_echo(
     media_syncs: list[str] = []
     catalog_syncs: list[str] = []
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_onboarding._sync_image_generation",
+        "opensquilla.gateway.setup_config_runtime.sync_media_runtime",
         lambda config: media_syncs.append(config.llm.provider),
     )
 
@@ -1270,15 +1274,15 @@ async def test_profile_activate_persist_failure_leaves_live_runtime_untouched(
     ctx = _admin_ctx(cfg)
     sync_attempts: list[str] = []
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_onboarding._persist",
+        "opensquilla.gateway.adapters.setup_config.persist_setup_candidate",
         lambda *args, **kwargs: (_ for _ in ()).throw(OSError("synthetic write failure")),
     )
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_onboarding._sync_provider_selector",
+        "opensquilla.gateway.provider_runtime.sync_provider_selector",
         lambda *args: sync_attempts.append("selector"),
     )
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_onboarding._sync_image_generation",
+        "opensquilla.gateway.setup_config_runtime.sync_media_runtime",
         lambda *args: sync_attempts.append("media"),
     )
 

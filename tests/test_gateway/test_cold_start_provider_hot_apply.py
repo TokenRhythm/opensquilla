@@ -18,12 +18,10 @@ import pytest
 
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.provider_runtime import sync_provider_selector
 from opensquilla.gateway.rpc.registry import RpcContext, _status
 from opensquilla.gateway.rpc_config import (
     _sync_provider_selector as config_sync_provider_selector,
-)
-from opensquilla.gateway.rpc_onboarding import (
-    _sync_provider_selector as onboarding_sync_provider_selector,
 )
 from opensquilla.provider.selector import (
     ModelSelector,
@@ -81,7 +79,7 @@ def test_config_sync_brings_cold_boot_selector_live_without_restart() -> None:
     assert cloned.active_provider_id == "openrouter"
 
 
-def test_onboarding_sync_brings_cold_boot_selector_live_without_restart() -> None:
+def test_shared_runtime_sync_brings_cold_boot_selector_live_without_restart() -> None:
     selector = _cold_boot_selector()
     runner = TurnRunner(provider_selector=selector)
     assert runner._resolve_provider() == (None, None)
@@ -93,7 +91,7 @@ def test_onboarding_sync_brings_cold_boot_selector_live_without_restart() -> Non
             "api_key": "test-key",
         }
     )
-    onboarding_sync_provider_selector(_ctx(selector, config), config.llm)
+    sync_provider_selector(_ctx(selector, config), config)
 
     assert selector.is_configured is True
     provider, _ = runner._resolve_provider()

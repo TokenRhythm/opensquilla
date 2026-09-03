@@ -24,13 +24,9 @@ from typing import TYPE_CHECKING, Any, cast
 import structlog
 
 from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
-from opensquilla.gateway.model_routing import broadcast_model_routing_changed
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
 from opensquilla.gateway.setup_config_runtime import (
     active_gateway_config as _active_config,
-)
-from opensquilla.gateway.setup_config_runtime import (
-    gateway_config_path as _config_path_for,
 )
 from opensquilla.gateway.setup_config_runtime import (
     install_gateway_config_candidate as _apply_inplace,
@@ -38,19 +34,26 @@ from opensquilla.gateway.setup_config_runtime import (
 from opensquilla.gateway.setup_config_runtime import (
     persist_setup_candidate as _persist,
 )
-from opensquilla.gateway.setup_config_runtime import (
-    sync_media_runtime as _sync_image_generation,
-)
 from opensquilla.onboarding.redaction import is_redacted_secret_sentinel
 from opensquilla.search.types import DEFAULT_SEARCH_MAX_RESULTS
 
 if TYPE_CHECKING:
     from opensquilla.application.capability_setup import CapabilitySetup
-    from opensquilla.application.profile_lifecycle import ProfileLifecycle
-    from opensquilla.application.provider_setup import ProviderSetup
+    from opensquilla.application.profile_lifecycle import ProfileLifecycle, ProfileProbeCommand
+    from opensquilla.application.provider_setup import (
+        DiscoverPrimaryModels,
+        ImageModelDiscoveryResult,
+        ProbePrimaryProvider,
+        ProviderModelDiscoveryResult,
+        ProviderSetup,
+    )
+    from opensquilla.application.provider_setup import (
+        ProviderProbeResult as ProviderProbePayload,
+    )
     from opensquilla.application.setup_workflow import SetupWorkflow
-    from opensquilla.onboarding.config_store import CredentialBackupRedaction
-    from opensquilla.onboarding.probe import ProviderProbeResult
+    from opensquilla.onboarding.probe import (
+        ProviderProbeResult as ProviderProbeExecutionResult,
+    )
 
 
 @contextmanager
@@ -94,347 +97,85 @@ log = structlog.get_logger(__name__)
 _d = get_dispatcher()
 
 
-def _sync_provider_selector(ctx: RpcContext, llm_cfg: Any) -> None:
-    selector = getattr(ctx, "provider_selector", None)
-    if selector is None or llm_cfg is None or not hasattr(selector, "sync_primary"):
-        return
-    config = getattr(ctx, "config", None)
-    if config is not None:
-        from opensquilla.gateway.llm_runtime import resolve_llm_runtime_config
-
-        # Resolve on a throwaway deep copy: resolve_llm_runtime_config
-        # mutates config.llm in place (env application) and records override
-        # provenance, but this sync only needs the resolved runtime VALUES
-        # for the selector. After _apply_inplace, ctx.config.llm IS the
-        # mutation result's llm submodel — resolving against the live graph
-        # would clobber an explicit operator base_url/proxy with the env
-        # value right before _persist writes the file, and would record the
-        # override on ctx.config only, desynchronizing it from the config
-        # the persist layer actually consults.
-        scratch = config.model_copy(deep=True)
-        runtime = resolve_llm_runtime_config(scratch)
-        api_key = runtime.api_key
-        base_url = runtime.base_url
-        proxy = runtime.proxy
-        # Preserve the one live-config side effect the old in-place resolve
-        # provided: an env-resolved api_key must stay marked as a runtime
-        # secret on the running config so no persist path can write it out.
-        if runtime.api_key_from_env and hasattr(config, "mark_runtime_secret"):
-            config.mark_runtime_secret("llm.api_key")
-    else:
-        api_key = llm_cfg.api_key
-        base_url = llm_cfg.base_url
-        proxy = getattr(llm_cfg, "proxy", "")
-    from opensquilla.provider.selector import ProviderConfig
-
-    selector.sync_primary(
-        ProviderConfig(
-            provider=llm_cfg.provider,
-            model=llm_cfg.model,
-            api_key=api_key,
-            base_url=base_url,
-            proxy=proxy,
-            provider_routing=getattr(llm_cfg, "provider_routing", {}),
-        )
-    )
-
-
-def _sync_search_provider(config: Any) -> None:
-    from opensquilla.tools.builtin.web import configure_search
-
-    configure_search(
-        provider_name=config.search_provider,
-        max_results=config.search_max_results,
-        api_key=config.search_api_key,
-        api_key_env=getattr(config, "search_api_key_env", ""),
-        proxy=config.search_proxy,
-        use_env_proxy=config.search_use_env_proxy,
-        fallback_policy=config.search_fallback_policy,
-        diagnostics=config.search_diagnostics,
-    )
-
-
-def _provider_backup_credential_redaction(
-    provider_id: str,
-) -> CredentialBackupRedaction:
-    """Build a secret-safe backup scrub request for one provider."""
-
-    from opensquilla.onboarding.config_store import CredentialBackupRedaction
-
-    return CredentialBackupRedaction(
-        provider_id=str(provider_id or "").strip().lower(),
-    )
-
-
 def _status_payload(ctx: RpcContext) -> dict[str, Any]:
-    from opensquilla.onboarding.legacy_data import legacy_data_payload
-    from opensquilla.onboarding.mutations import capability_resettable
-    from opensquilla.onboarding.next_steps import env_recovery_commands
-    from opensquilla.onboarding.probe_history import load_probe_history
-    from opensquilla.onboarding.status import get_onboarding_status
+    from opensquilla.gateway.adapters.setup_workflow import setup_status
 
-    cfg = _active_config(ctx)
-    s = get_onboarding_status(cfg, probe_history=load_probe_history(cfg))
-    llm_credential_status = dict(s.llm_credential_status)
-    llm_credential_status["revealAllowed"] = bool(
-        ctx.principal.is_owner
-        and llm_credential_status.get("available") is True
-        and llm_credential_status.get("source") in {"explicit", "env"}
+    return cast(
+        dict[str, Any],
+        setup_status(
+            _active_config(ctx),
+            is_owner=ctx.principal.is_owner,
+        ),
     )
-    return {
-        "configPath": _config_path_for(ctx, cfg) or s.config_path,
-        "hasConfig": s.has_config,
-        "llmConfigured": s.llm_configured,
-        "llmSource": s.llm_source,
-        "llmEnvKey": s.llm_env_key,
-        "llmCredentialStatus": llm_credential_status,
-        "llmProfileStatus": list(s.llm_profile_status),
-        "imageGenerationConfigured": s.image_generation_configured,
-        "imageGenerationEnabled": s.image_generation_enabled,
-        "imageGenerationSource": s.image_generation_source,
-        "imageGenerationProvider": s.image_generation_provider,
-        "imageGenerationPrimary": s.image_generation_primary,
-        "imageGenerationEnvKey": s.image_generation_env_key,
-        "imageGenerationState": s.image_generation_state,
-        "audioConfigured": s.audio_configured,
-        "audioEnabled": s.audio_enabled,
-        "audioSource": s.audio_source,
-        "audioProvider": s.audio_provider,
-        "audioEnvKey": s.audio_env_key,
-        "searchConfigured": s.search_configured,
-        "searchProvider": s.search_provider,
-        "searchSource": s.search_source,
-        "searchEnvKey": s.search_env_key,
-        "memoryEmbeddingConfigured": s.memory_embedding_configured,
-        "memoryEmbeddingProvider": s.memory_embedding_provider,
-        "memoryEmbeddingSource": s.memory_embedding_source,
-        "memoryEmbeddingEnvKey": s.memory_embedding_env_key,
-        "capabilityConfiguration": {
-            capability_id: {
-                "resettable": capability_resettable(cfg, capability_id=capability_id)
-            }
-            for capability_id in (
-                "search",
-                "image_generation",
-                "audio",
-                "memory_embedding",
-            )
-        },
-        "channelCount": s.channel_count,
-        "channelsConfigured": s.channels_configured,
-        "ensembleCredentialStatus": list(s.ensemble_credential_status),
-        "needsOnboarding": s.needs_onboarding,
-        "sections": {name: state.value for name, state in s.sections.items()},
-        "sectionDetails": s.section_details,
-        "envRecoveryCommands": env_recovery_commands(s),
-        "warnings": list(s.warnings),
-        # Frozen compatibility key. Discovery moved to the settings-only
-        # migration RPC and this value remains null through this major.
-        "legacyData": legacy_data_payload(),
-    }
-
-
-def _active_llm_credential_reveal_payload(ctx: RpcContext, provider_id: str) -> dict[str, Any]:
-    from opensquilla.gateway.llm_runtime import resolve_llm_credential
-    from opensquilla.onboarding.provider_specs import get_provider_setup_spec
-
-    if not ctx.principal.is_owner:
-        raise RpcHandlerError(
-            "onboarding.provider.credential.not_owner",
-            "Only the local gateway owner can reveal provider credentials.",
-        )
-
-    cfg = _active_config(ctx)
-    llm = getattr(cfg, "llm", None)
-    active_provider = str(getattr(llm, "provider", "") or "").strip().lower()
-    requested_provider = str(provider_id or "").strip().lower()
-    if requested_provider != active_provider:
-        raise RpcHandlerError(
-            "onboarding.provider.credential.inactive_provider",
-            "Credential reveal only supports the active provider.",
-        )
-
-    try:
-        spec = get_provider_setup_spec(active_provider)
-    except KeyError as exc:
-        raise RpcHandlerError(
-            "onboarding.provider.credential.unsupported_provider",
-            f"Unsupported active provider: {active_provider}",
-        ) from exc
-    credential = resolve_llm_credential(
-        cfg,
-        registry_env_key=str(getattr(spec, "env_key", "") or "").strip(),
-        include_runtime_cache=False,
-    )
-    if credential.source in {"explicit", "env"} and credential.api_key:
-        return {
-            "ok": True,
-            "provider": active_provider,
-            "source": credential.source,
-            "envKey": credential.env_name,
-            "apiKey": credential.api_key,
-        }
-    raise RpcHandlerError(
-        "onboarding.provider.credential.unavailable",
-        "No revealable credential is available for the active provider.",
-    )
-
-
-def _credential_clear_effective_payload(
-    config: Any,
-    provider_id: str,
-    *,
-    active: bool,
-) -> dict[str, Any]:
-    """Describe post-clear credential availability without exposing a value.
-
-    Clearing removes stored sources only. Provider registry environment
-    variables are process-owned external inputs, so an exported default key
-    can remain effective after the config fields are gone. Report that state
-    explicitly so clients never promise that an external credential was
-    deleted.
-    """
-    from opensquilla.onboarding.status import get_onboarding_status
-
-    provider = str(provider_id or "").strip().lower()
-    status = get_onboarding_status(config)
-    if active:
-        row = dict(status.llm_credential_status)
-        source = str(row.get("source") or "none")
-        env_key = str(row.get("envKey") or "")
-        available = bool(row.get("available"))
-    else:
-        row = next(
-            (
-                dict(candidate)
-                for candidate in status.llm_profile_status
-                if str(candidate.get("provider") or "").strip().lower() == provider
-            ),
-            {},
-        )
-        raw_source = str(row.get("credentialSource") or "none")
-        if raw_source in {
-            "member_env",
-            "profile_env",
-            "profile_pool",
-            "profile_pool_env",
-            "registry_env",
-        }:
-            source = "env"
-        elif raw_source == "keyless":
-            source = "not_required"
-        elif raw_source in {"member", "profile", "inherited"}:
-            source = "explicit"
-        else:
-            source = "none"
-        env_key = str(row.get("credentialEnv") or "")
-        available = source in {"explicit", "env", "not_required"}
-    return {
-        "credentialAvailable": available,
-        "credentialSource": source,
-        "credentialEnv": env_key,
-        "externalCredentialActive": source == "env",
-    }
-
-
-async def _read_onboarding_status(ctx: RpcContext) -> dict[str, Any]:
-    return _status_payload(ctx)
-
-
-async def _read_onboarding_catalog(_ctx: RpcContext) -> dict[str, Any]:
-    from opensquilla.onboarding.setup_engine import setup_catalog_payload
-
-    return setup_catalog_payload()
 
 
 def _setup_workflow(ctx: RpcContext) -> SetupWorkflow:
     from opensquilla.application.setup_workflow import SetupWorkflow
     from opensquilla.gateway.adapters.setup_workflow import (
-        RpcContextSetupWorkflowPort,
+        GatewaySetupWorkflowPort,
     )
 
-    port = RpcContextSetupWorkflowPort(
-        ctx,
-        catalog_reader=_read_onboarding_catalog,
-        status_reader=_read_onboarding_status,
+    port = GatewaySetupWorkflowPort(
+        _active_config(ctx),
+        is_owner=ctx.principal.is_owner,
     )
     return SetupWorkflow(port, port)
-
-
-def _persist_setup_candidate(
-    ctx: RpcContext,
-    candidate: Any,
-    *,
-    restart_required: bool,
-    backup_credential_provider: str | None = None,
-    remove_paths: tuple[str, ...] = (),
-) -> str:
-    backup_redaction = (
-        _provider_backup_credential_redaction(backup_credential_provider)
-        if backup_credential_provider
-        else None
-    )
-    return _persist(
-        ctx,
-        candidate,
-        restart_required=restart_required,
-        backup_credential_redaction=backup_redaction,
-        remove_paths=remove_paths,
-    )
-
-
-async def _refresh_setup_catalog(config: Any) -> None:
-    from opensquilla.gateway.model_catalog_refresh import refresh_live_model_catalog
-
-    await refresh_live_model_catalog(config)
-
-
-async def _broadcast_setup_routing(
-    ctx: RpcContext,
-    config: Any,
-    source: str,
-) -> None:
-    await broadcast_model_routing_changed(ctx, source=source, config=config)
 
 
 def _setup_application_ports(ctx: RpcContext) -> tuple[Any, Any]:
     """Bind the Gateway context to narrow setup configuration/runtime Ports."""
 
+    from opensquilla.gateway.adapters.setup_config import GatewaySetupConfigPort
     from opensquilla.gateway.adapters.setup_mutations import (
-        RpcContextSetupConfigPort,
-        RpcContextSetupRuntimePort,
+        GatewaySetupRuntimePort,
     )
-    from opensquilla.gateway.llm_runtime import discard_profile_credential_pool
 
-    config = RpcContextSetupConfigPort(
-        ctx,
-        active=_active_config,
-        persist=_persist_setup_candidate,
-        install=_apply_inplace,
-    )
-    runtime = RpcContextSetupRuntimePort(
-        ctx,
-        sync_primary=lambda current: _sync_provider_selector(ctx, current.llm),
-        sync_media=_sync_image_generation,
-        sync_search=_sync_search_provider,
-        refresh_catalog=_refresh_setup_catalog,
-        broadcast_routing=_broadcast_setup_routing,
-        discard_profile=discard_profile_credential_pool,
-        reconcile_profile=lambda previous, current, provider: (
-            _reconcile_saved_llm_profile(previous, current, provider)
-        ),
+    config = GatewaySetupConfigPort(ctx)
+    runtime = GatewaySetupRuntimePort(
+        ctx.provider_selector,
+        ctx.subscription_manager,
     )
     return config, runtime
 
 
-def _provider_probe_port(ctx: RpcContext) -> Any:
-    from opensquilla.gateway.adapters.setup_mutations import RpcContextProviderProbePort
+class _GatewayProviderProbeRuntime:
+    def __init__(self, config: Any, usage_event_sink: Any) -> None:
+        self._config = config
+        self._usage_event_sink = usage_event_sink
 
-    return RpcContextProviderProbePort(
-        ctx,
-        probe=_provider_probe_impl,
-        discover=_models_discover_impl,
-        discover_images=_image_generation_models_discover_impl,
+    async def probe_primary(
+        self, command: ProbePrimaryProvider
+    ) -> ProviderProbePayload:
+        return cast(
+            "ProviderProbePayload",
+            await _probe_primary_provider(
+                command,
+                config=self._config,
+                usage_event_sink=self._usage_event_sink,
+            ),
+        )
+
+    async def discover_primary_models(
+        self, command: DiscoverPrimaryModels
+    ) -> ProviderModelDiscoveryResult:
+        return cast(
+            "ProviderModelDiscoveryResult",
+            await _discover_primary_models(command, config=self._config),
+        )
+
+    async def discover_image_models(
+        self, provider_id: str
+    ) -> ImageModelDiscoveryResult:
+        return cast(
+            "ImageModelDiscoveryResult",
+            await _discover_image_models(provider_id),
+        )
+
+
+def _provider_probe_port(ctx: RpcContext) -> Any:
+    return _GatewayProviderProbeRuntime(
+        _active_config(ctx),
+        ctx.usage_event_sink,
     )
 
 
@@ -442,6 +183,17 @@ def _setup_mutation_port() -> Any:
     from opensquilla.gateway.adapters.setup_mutations import OnboardingSetupMutationPort
 
     return OnboardingSetupMutationPort()
+
+
+def _credential_resolution_port(ctx: RpcContext) -> Any:
+    from opensquilla.gateway.adapters.setup_mutations import (
+        GatewayCredentialResolutionPort,
+    )
+
+    return GatewayCredentialResolutionPort(
+        _active_config(ctx),
+        is_owner=ctx.principal.is_owner,
+    )
 
 
 def _provider_setup(ctx: RpcContext) -> ProviderSetup:
@@ -463,15 +215,74 @@ def _capability_setup(ctx: RpcContext) -> CapabilitySetup:
     return CapabilitySetup(config, runtime, _setup_mutation_port())
 
 
-def _profile_probe_port(ctx: RpcContext) -> Any:
-    from opensquilla.gateway.adapters.setup_mutations import RpcContextProfileProbePort
+class _GatewayProfileProbeRuntime:
+    def __init__(
+        self,
+        config: Any,
+        *,
+        connection_id: str,
+        usage_event_sink: Any,
+    ) -> None:
+        self._config = config
+        self._connection_id = connection_id
+        self._usage_event_sink = usage_event_sink
 
-    return RpcContextProfileProbePort(
-        ctx,
-        probe_saved=_llm_profile_probe_impl,
-        probe_draft=_llm_profile_draft_probe_impl,
-        discover_saved=_llm_profile_models_discover_impl,
-        discover_draft=_llm_profile_draft_models_discover_impl,
+    async def probe_saved(
+        self, command: ProfileProbeCommand
+    ) -> ProviderProbePayload:
+        return cast(
+            "ProviderProbePayload",
+            await _probe_saved_profile(
+                command,
+                config=self._config,
+                connection_id=self._connection_id,
+                usage_event_sink=self._usage_event_sink,
+            ),
+        )
+
+    async def probe_draft(
+        self, command: ProfileProbeCommand
+    ) -> ProviderProbePayload:
+        return cast(
+            "ProviderProbePayload",
+            await _probe_draft_profile(
+                command,
+                config=self._config,
+                connection_id=self._connection_id,
+                usage_event_sink=self._usage_event_sink,
+            ),
+        )
+
+    async def discover_saved(
+        self, command: ProfileProbeCommand
+    ) -> ProviderModelDiscoveryResult:
+        return cast(
+            "ProviderModelDiscoveryResult",
+            await _discover_saved_profile_models(
+                command,
+                config=self._config,
+                connection_id=self._connection_id,
+            ),
+        )
+
+    async def discover_draft(
+        self, command: ProfileProbeCommand
+    ) -> ProviderModelDiscoveryResult:
+        return cast(
+            "ProviderModelDiscoveryResult",
+            await _discover_draft_profile_models(
+                command,
+                config=self._config,
+                connection_id=self._connection_id,
+            ),
+        )
+
+
+def _profile_probe_port(ctx: RpcContext) -> Any:
+    return _GatewayProfileProbeRuntime(
+        _active_config(ctx),
+        connection_id=ctx.conn_id,
+        usage_event_sink=ctx.usage_event_sink,
     )
 
 
@@ -708,22 +519,6 @@ def _llm_profile_credential_signature(config: Any, provider_id: str) -> tuple[ob
     )
 
 
-async def _reconcile_saved_llm_profile(
-    previous_config: Any,
-    current_config: Any,
-    provider_id: str,
-) -> None:
-    from opensquilla.gateway.model_catalog_refresh import (
-        reconcile_tokenrhythm_profile_transition,
-    )
-
-    await reconcile_tokenrhythm_profile_transition(
-        previous_config,
-        current_config,
-        provider_id=provider_id,
-    )
-
-
 async def _provider_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
     from opensquilla.application.provider_setup import (
         ConfigurePrimaryProvider,
@@ -790,10 +585,8 @@ async def _llm_profile_credential_clear(params: Any, ctx: RpcContext) -> dict[st
         result = await _profile_lifecycle(ctx).clear_credentials(provider_id)
     entry = {
         **result.entry,
-        **_credential_clear_effective_payload(
-            _active_config(ctx),
-            provider_id,
-            active=False,
+        **_credential_resolution_port(ctx).describe_clear_result(
+            _active_config(ctx), provider_id, active=False
         ),
     }
     return {
@@ -931,9 +724,9 @@ async def _llm_profile_activate(params: Any, ctx: RpcContext) -> dict[str, Any]:
     return cast(dict[str, Any], result.to_payload())
 
 
-def _llm_profile_rpc_session_key(ctx: RpcContext, provider_id: str) -> str:
+def _llm_profile_rpc_session_key(connection_id: str, provider_id: str) -> str:
     provider = str(provider_id or "").strip().lower()
-    return f"onboarding-profile-rpc:{ctx.conn_id}:{provider}"
+    return f"onboarding-profile-rpc:{connection_id}:{provider}"
 
 
 def _resolved_llm_profile_config(
@@ -983,34 +776,35 @@ def _report_llm_profile_rpc_failure(
     report_profile_credential_failure(provider_id, session_key, kind)
 
 
-def _draft_llm_profile_config(params: Any, ctx: RpcContext) -> tuple[str, Any]:
+def _profile_draft_config(
+    command: ProfileProbeCommand,
+    config: Any,
+) -> tuple[str, Any]:
     """Build an in-memory profile draft without persisting or hot-applying it."""
     from opensquilla.onboarding.mutations import upsert_llm_profile
 
-    provider_id = str(_require(params, "providerId"))
-    provider = provider_id.strip().lower()
-    p = params if isinstance(params, dict) else {}
-    preserve_value = p.get("keepCurrentSecret", True)
+    provider = command.provider_id.strip().lower()
+    values = command.values
+    preserve_value = values.get("keepCurrentSecret", True)
     if not isinstance(preserve_value, bool):
         raise ValueError("params.keepCurrentSecret must be a boolean")
-    cfg = _active_config(ctx)
-    profiles = getattr(cfg, "llm_profiles", None) or {}
+    profiles = getattr(config, "llm_profiles", None) or {}
     if not any(str(key or "").strip().lower() == provider for key in profiles):
         raise ValueError(f"provider profile {provider!r} does not exist")
     draft = upsert_llm_profile(
-        cfg,
+        config,
         provider_id=provider,
-        api_key=p.get("apiKey") if "apiKey" in p else None,
-        api_key_env=p.get("apiKeyEnv") if "apiKeyEnv" in p else None,
+        api_key=values.get("apiKey") if "apiKey" in values else None,
+        api_key_env=values.get("apiKeyEnv") if "apiKeyEnv" in values else None,
         preserve_api_key=preserve_value,
-        base_url=p.get("baseUrl") if "baseUrl" in p else None,
-        proxy=p.get("proxy") if "proxy" in p else None,
+        base_url=values.get("baseUrl") if "baseUrl" in values else None,
+        proxy=values.get("proxy") if "proxy" in values else None,
     )
     return provider, draft.config
 
 
 async def _usage_accounted_provider_probe(
-    ctx: RpcContext,
+    usage_event_sink: Any,
     *,
     provider_id: str,
     model: str,
@@ -1019,7 +813,7 @@ async def _usage_accounted_provider_probe(
     base_url: str,
     proxy: str,
     allow_default_api_key_env: bool,
-) -> ProviderProbeResult:
+) -> ProviderProbeExecutionResult:
     """Probe one deployment under the shared physical-call usage boundary."""
     import uuid
 
@@ -1034,10 +828,10 @@ async def _usage_accounted_provider_probe(
 
     usage_scope = None
     chat_stream_factory = None
-    if ctx.usage_event_sink is not None:
+    if usage_event_sink is not None:
         execution_id = uuid.uuid4().hex
         usage_scope = UsageAccountingScope(
-            sink=ctx.usage_event_sink,
+            sink=usage_event_sink,
             context=UsageExecutionContext(
                 execution_id=execution_id,
                 agent_run_id=execution_id,
@@ -1075,12 +869,20 @@ async def _usage_accounted_provider_probe(
         return await probe_llm_provider(**probe_kwargs)
 
 
-async def _llm_profile_probe_impl(params: Any, ctx: RpcContext) -> dict[str, Any]:
+async def _probe_saved_profile(
+    command: ProfileProbeCommand,
+    *,
+    config: Any,
+    connection_id: str,
+    usage_event_sink: Any,
+) -> dict[str, Any]:
     """Run a small live probe using the stored profile's resolved deployment."""
-    provider_id = str(_require(params, "providerId"))
-    model = str(_require(params, "model") or "").strip()
-    cfg = _active_config(ctx)
-    session_key = _llm_profile_rpc_session_key(ctx, provider_id)
+    provider_id = command.provider_id
+    if "model" not in command.values:
+        raise ValueError("params.model is required")
+    model = str(command.values.get("model") or "").strip()
+    cfg = config
+    session_key = _llm_profile_rpc_session_key(connection_id, provider_id)
     with _validation_error("onboarding.llmProfile.invalid"):
         resolution = _resolved_llm_profile_config(
             cfg,
@@ -1090,7 +892,7 @@ async def _llm_profile_probe_impl(params: Any, ctx: RpcContext) -> dict[str, Any
         )
         deployment = resolution.provider_config
         result = await _usage_accounted_provider_probe(
-            ctx,
+            usage_event_sink,
             provider_id=deployment.provider,
             model=deployment.model,
             api_key=deployment.api_key,
@@ -1111,12 +913,20 @@ async def _llm_profile_probe_impl(params: Any, ctx: RpcContext) -> dict[str, Any
     return result.to_payload()
 
 
-async def _llm_profile_draft_probe_impl(params: Any, ctx: RpcContext) -> dict[str, Any]:
+async def _probe_draft_profile(
+    command: ProfileProbeCommand,
+    *,
+    config: Any,
+    connection_id: str,
+    usage_event_sink: Any,
+) -> dict[str, Any]:
     """Probe the editor's current profile draft without saving any field."""
-    model = str(_require(params, "model") or "").strip()
+    if "model" not in command.values:
+        raise ValueError("params.model is required")
+    model = str(command.values.get("model") or "").strip()
     with _validation_error("onboarding.llmProfile.invalid"):
-        provider_id, draft = _draft_llm_profile_config(params, ctx)
-        session_key = _llm_profile_rpc_session_key(ctx, provider_id)
+        provider_id, draft = _profile_draft_config(command, config)
+        session_key = _llm_profile_rpc_session_key(connection_id, provider_id)
         resolution = _resolved_llm_profile_config(
             draft,
             provider_id,
@@ -1125,7 +935,7 @@ async def _llm_profile_draft_probe_impl(params: Any, ctx: RpcContext) -> dict[st
         )
         deployment = resolution.provider_config
         result = await _usage_accounted_provider_probe(
-            ctx,
+            usage_event_sink,
             provider_id=deployment.provider,
             model=deployment.model,
             api_key=deployment.api_key,
@@ -1144,16 +954,19 @@ async def _llm_profile_draft_probe_impl(params: Any, ctx: RpcContext) -> dict[st
     return result.to_payload()
 
 
-async def _llm_profile_models_discover_impl(
-    params: Any, ctx: RpcContext
+async def _discover_saved_profile_models(
+    command: ProfileProbeCommand,
+    *,
+    config: Any,
+    connection_id: str,
 ) -> dict[str, Any]:
     """Discover picker-safe models through one stored profile deployment."""
     from opensquilla.onboarding.probe import discover_selectable_provider_models
 
-    provider_id = str(_require(params, "providerId"))
-    cfg = _active_config(ctx)
+    provider_id = command.provider_id
+    cfg = config
     placeholder_model = str(getattr(cfg.llm, "model", "") or "profile-discovery")
-    session_key = _llm_profile_rpc_session_key(ctx, provider_id)
+    session_key = _llm_profile_rpc_session_key(connection_id, provider_id)
     with _validation_error("onboarding.llmProfile.invalid"):
         resolution = _resolved_llm_profile_config(
             cfg,
@@ -1169,7 +982,7 @@ async def _llm_profile_models_discover_impl(
             base_url=deployment.base_url,
             proxy=deployment.proxy,
             allow_default_api_key_env=False,
-            force_refresh=_bool_param(params, "forceRefresh"),
+            force_refresh=_bool_param(command.values, "forceRefresh"),
             persist_catalog=True,
             catalog_config=cfg,
         )
@@ -1182,16 +995,19 @@ async def _llm_profile_models_discover_impl(
     return result.to_payload()
 
 
-async def _llm_profile_draft_models_discover_impl(
-    params: Any, ctx: RpcContext
+async def _discover_draft_profile_models(
+    command: ProfileProbeCommand,
+    *,
+    config: Any,
+    connection_id: str,
 ) -> dict[str, Any]:
     """Discover models through the editor's unsaved profile deployment."""
     from opensquilla.onboarding.probe import discover_selectable_provider_models
 
     with _validation_error("onboarding.llmProfile.invalid"):
-        provider_id, draft = _draft_llm_profile_config(params, ctx)
+        provider_id, draft = _profile_draft_config(command, config)
         placeholder_model = str(getattr(draft.llm, "model", "") or "profile-discovery")
-        session_key = _llm_profile_rpc_session_key(ctx, provider_id)
+        session_key = _llm_profile_rpc_session_key(connection_id, provider_id)
         resolution = _resolved_llm_profile_config(
             draft,
             provider_id,
@@ -1206,7 +1022,7 @@ async def _llm_profile_draft_models_discover_impl(
             base_url=deployment.base_url,
             proxy=deployment.proxy,
             allow_default_api_key_env=False,
-            force_refresh=_bool_param(params, "forceRefresh"),
+            force_refresh=_bool_param(command.values, "forceRefresh"),
             persist_catalog=False,
             catalog_config=draft,
         )
@@ -1219,23 +1035,36 @@ async def _llm_profile_draft_models_discover_impl(
     return result.to_payload()
 
 
-async def _provider_probe_impl(params: Any, ctx: RpcContext) -> dict[str, Any]:
+async def _probe_primary_provider(
+    command: ProbePrimaryProvider,
+    *,
+    config: Any,
+    usage_event_sink: Any,
+) -> dict[str, Any]:
     """Live one-token probe of a candidate provider config (nothing is saved)."""
-    provider_id = _require(params, "providerId")
-    p = params if isinstance(params, dict) else {}
-    cfg = _active_config(ctx)
-    api_key = str(p.get("apiKey", "") or "")
+    provider_id = command.provider_id
+    cfg = config
+    api_key = str(command.api_key or "")
     if is_redacted_secret_sentinel(api_key):
         # A round-tripped redaction mask is a display value, not a
         # credential: fall through to the stored-credential reuse below
         # instead of probing with a literal '***' bearer token.
         api_key = ""
-    api_key_env = str(p.get("apiKeyEnv", "") or "")
-    base_url = str(p.get("baseUrl", "") or "")
-    proxy = str(p.get("proxy", "") or "")
+    api_key_env = str(command.api_key_env or "")
+    base_url = str(command.base_url or "")
+    proxy = str(command.proxy or "")
     # Draft probes carry explicit fields; only a bare providerId(+model)
     # request verifies the saved deployment and may update probe history.
-    request_overrides = _request_changes_active_provider_connection(p, cfg)
+    request_overrides = _request_changes_active_provider_connection(
+        {
+            "providerId": provider_id,
+            "apiKey": api_key,
+            "apiKeyEnv": api_key_env,
+            "baseUrl": base_url,
+            "proxy": proxy,
+        },
+        cfg,
+    )
     # A provider id is not an endpoint identity for configurable providers.
     # Stored credentials may follow an omitted URL or a same-origin path
     # change, but never a scheme/host/effective-port change.
@@ -1252,10 +1081,10 @@ async def _provider_probe_impl(params: Any, ctx: RpcContext) -> dict[str, Any]:
             base_url = str(getattr(cfg.llm, "base_url", "") or "")
         if not proxy:
             proxy = str(getattr(cfg.llm, "proxy", "") or "")
-    model = str(p.get("model", "") or "")
+    model = str(command.model or "")
     with _validation_error("onboarding.provider.invalid"):
         result = await _usage_accounted_provider_probe(
-            ctx,
+            usage_event_sink,
             provider_id=str(provider_id),
             model=model,
             api_key=api_key,
@@ -1286,24 +1115,14 @@ async def _provider_probe_impl(params: Any, ctx: RpcContext) -> dict[str, Any]:
 
 async def _provider_credential_reveal(params: Any, ctx: RpcContext) -> dict[str, Any]:
     from opensquilla.application.provider_credentials import ProviderCredentials
-    from opensquilla.gateway.adapters.setup_mutations import (
-        RpcContextCredentialResolutionPort,
-    )
 
     config, runtime = _setup_application_ports(ctx)
-    credentials = RpcContextCredentialResolutionPort(
-        ctx,
-        reveal=_active_llm_credential_reveal_payload,
-        describe=lambda current, provider, active: (
-            _credential_clear_effective_payload(current, provider, active=active)
-        ),
-    )
     return cast(
         dict[str, Any],
         ProviderCredentials(
             config,
             runtime,
-            credentials,
+            _credential_resolution_port(ctx),
             _setup_mutation_port(),
         ).reveal_active(str(_require(params, "providerId"))),
     )
@@ -1312,24 +1131,14 @@ async def _provider_credential_reveal(params: Any, ctx: RpcContext) -> dict[str,
 async def _provider_credential_clear(params: Any, ctx: RpcContext) -> dict[str, Any]:
     """Clear stored credentials for the active provider, preserving its setup."""
     from opensquilla.application.provider_credentials import ProviderCredentials
-    from opensquilla.gateway.adapters.setup_mutations import (
-        RpcContextCredentialResolutionPort,
-    )
 
     provider_id = str(_require(params, "providerId"))
     config, runtime = _setup_application_ports(ctx)
-    credentials = RpcContextCredentialResolutionPort(
-        ctx,
-        reveal=_active_llm_credential_reveal_payload,
-        describe=lambda current, provider, active: (
-            _credential_clear_effective_payload(current, provider, active=active)
-        ),
-    )
     with _validation_error("onboarding.provider.invalid"):
         result = await ProviderCredentials(
             config,
             runtime,
-            credentials,
+            _credential_resolution_port(ctx),
             _setup_mutation_port(),
         ).clear_active(provider_id)
     live_config = _active_config(ctx)
@@ -1342,7 +1151,11 @@ async def _provider_credential_clear(params: Any, ctx: RpcContext) -> dict[str, 
     return cast(dict[str, Any], result.to_payload())
 
 
-async def _models_discover_impl(params: Any, ctx: RpcContext) -> dict[str, Any]:
+async def _discover_primary_models(
+    command: DiscoverPrimaryModels,
+    *,
+    config: Any,
+) -> dict[str, Any]:
     """List verified picker-safe models without persisting anything.
 
     Admin-scoped (like ``onboarding.provider.probe``): the request carries
@@ -1360,19 +1173,27 @@ async def _models_discover_impl(params: Any, ctx: RpcContext) -> dict[str, Any]:
     """
     from opensquilla.onboarding.probe import discover_selectable_provider_models
 
-    provider_id = _require(params, "providerId")
-    p = params if isinstance(params, dict) else {}
-    cfg = _active_config(ctx)
-    api_key = str(p.get("apiKey", "") or "")
+    provider_id = command.provider_id
+    cfg = config
+    api_key = str(command.api_key or "")
     if is_redacted_secret_sentinel(api_key):
         # Same keep-current boundary as onboarding.provider.probe: never
         # send a round-tripped '***' mask upstream as a bearer token.
         api_key = ""
-    api_key_env = str(p.get("apiKeyEnv", "") or "")
-    base_url = str(p.get("baseUrl", "") or "")
-    proxy = str(p.get("proxy", "") or "")
-    force_refresh = _bool_param(params, "forceRefresh")
-    request_overrides = _request_changes_active_provider_connection(p, cfg)
+    api_key_env = str(command.api_key_env or "")
+    base_url = str(command.base_url or "")
+    proxy = str(command.proxy or "")
+    force_refresh = command.force_refresh
+    request_overrides = _request_changes_active_provider_connection(
+        {
+            "providerId": provider_id,
+            "apiKey": api_key,
+            "apiKeyEnv": api_key_env,
+            "baseUrl": base_url,
+            "proxy": proxy,
+        },
+        cfg,
+    )
     same_provider, reuse_stored_credentials = _provider_candidate_identity(
         cfg,
         str(provider_id),
@@ -1405,10 +1226,7 @@ async def _models_discover_impl(params: Any, ctx: RpcContext) -> dict[str, Any]:
     return result.to_payload()
 
 
-async def _image_generation_models_discover_impl(
-    params: Any,
-    ctx: RpcContext,
-) -> dict[str, Any]:
+async def _discover_image_models(provider_id: str) -> dict[str, Any]:
     """List image-output-capable models without persisting configuration.
 
     Unlike the general LLM picker, this endpoint only uses provider image
@@ -1420,7 +1238,6 @@ async def _image_generation_models_discover_impl(
         discover_image_generation_models,
     )
 
-    provider_id = _require(params, "providerId")
     with _validation_error("onboarding.imageGeneration.invalid"):
         return await discover_image_generation_models(str(provider_id))
 

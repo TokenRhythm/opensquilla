@@ -502,9 +502,9 @@ async def _status(params: Any, ctx: RpcContext) -> dict[str, Any]:
 
 async def _config_get(params: Any, ctx: RpcContext) -> Any:
     from opensquilla.application.app_settings import AppSettings
-    from opensquilla.gateway.adapters.app_settings import RpcContextAppSettingsPort
+    from opensquilla.gateway.adapters.app_settings import GatewayAppSettingsPort
 
-    settings = AppSettings(RpcContextAppSettingsPort(ctx))
+    settings = AppSettings(GatewayAppSettingsPort(ctx.config))
     if isinstance(params, dict):
         path = params.get("path")
         if path:

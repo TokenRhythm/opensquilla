@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
-from typing import Any, cast
+from collections.abc import Mapping
+from typing import Any, Protocol, cast
 
 from opensquilla.application.app_settings import (
     EffectiveSettings,
@@ -11,28 +11,39 @@ from opensquilla.application.app_settings import (
     SettingsObject,
     SettingsValue,
 )
-from opensquilla.gateway.rpc import RpcContext
-
-PatchRunner = Callable[[dict[str, Any], RpcContext, str], Awaitable[dict[str, Any]]]
-EffectiveReader = Callable[[RpcContext], Awaitable[dict[str, Any]]]
 
 
-class RpcContextAppSettingsPort:
+class AppSettingsRuntime(Protocol):
+    """Gateway-owned settings persistence and reconciliation primitives."""
+
+    async def read_effective_settings(self) -> EffectiveSettings: ...
+
+    async def patch_settings(
+        self,
+        changes: Mapping[str, SettingsValue],
+        *,
+        safe: bool,
+    ) -> SettingsMutation: ...
+
+    async def merge_settings(
+        self, patch: Mapping[str, SettingsValue]
+    ) -> SettingsMutation: ...
+
+
+class GatewayAppSettingsPort:
     """Adapt the Gateway composition context to application capabilities."""
 
     def __init__(
         self,
-        ctx: RpcContext,
+        config: Any,
         *,
-        patch_runner: PatchRunner | None = None,
-        effective_reader: EffectiveReader | None = None,
+        runtime: AppSettingsRuntime | None = None,
     ) -> None:
-        self._ctx = ctx
-        self._patch_runner = patch_runner
-        self._effective_reader = effective_reader
+        self._config = config
+        self._runtime = runtime
 
     async def read_public_settings(self) -> SettingsObject:
-        config = self._ctx.config
+        config = self._config
         if config is None:
             return {}
         value = (
@@ -45,9 +56,9 @@ class RpcContextAppSettingsPort:
         return cast(SettingsObject, dict(value)) if isinstance(value, Mapping) else {}
 
     async def read_effective_settings(self) -> EffectiveSettings:
-        if self._effective_reader is None:
+        if self._runtime is None:
             raise RuntimeError("effective settings reader is not configured")
-        return cast(EffectiveSettings, await self._effective_reader(self._ctx))
+        return cast(EffectiveSettings, await self._runtime.read_effective_settings())
 
     async def patch_settings(
         self,
@@ -55,18 +66,20 @@ class RpcContextAppSettingsPort:
         *,
         safe: bool,
     ) -> SettingsMutation:
-        if self._patch_runner is None:
+        if self._runtime is None:
             raise RuntimeError("settings mutation runner is not configured")
-        source = "config.patch.safe" if safe else "config.patch"
         return cast(
             SettingsMutation,
-            await self._patch_runner({"patches": dict(changes)}, self._ctx, source),
+            await self._runtime.patch_settings(changes, safe=safe),
         )
 
     async def merge_settings(self, patch: Mapping[str, SettingsValue]) -> SettingsMutation:
-        if self._patch_runner is None:
+        if self._runtime is None:
             raise RuntimeError("settings mutation runner is not configured")
         return cast(
             SettingsMutation,
-            await self._patch_runner({"patch": dict(patch)}, self._ctx, "config.patch"),
+            await self._runtime.merge_settings(patch),
         )
+
+
+__all__ = ["AppSettingsRuntime", "GatewayAppSettingsPort"]

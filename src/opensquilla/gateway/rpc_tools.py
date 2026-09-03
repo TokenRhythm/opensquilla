@@ -88,7 +88,13 @@ async def read_provider_status(params: dict | None, ctx: RpcContext) -> dict[str
     if params is not None and not isinstance(params, dict):
         raise ValueError("params must be an object")
     query = params or {}
-    status = ProviderStatus(GatewayProviderStatusPort(ctx))
+    status = ProviderStatus(
+        GatewayProviderStatusPort(
+            config=ctx.config,
+            provider_selector=ctx.provider_selector,
+            provider_stats=ctx.provider_stats,
+        )
+    )
     return cast(
         dict[str, Any],
         await status.read(

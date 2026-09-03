@@ -1,14 +1,13 @@
 """Gateway adapters for setup mutation Application ports.
 
-The adapters bind a single ``RpcContext`` to narrow configuration, runtime,
-probe, and credential ports.  Application Modules never receive or import the
-context itself.
+The adapters bind explicit Gateway dependencies to narrow configuration,
+runtime, and credential ports. Application Modules never receive or import a
+transport context.
 """
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping, Sequence
-from typing import Any, cast
+from typing import Any
 
 from opensquilla.application.capability_setup import (
     CapabilityMutationPort,
@@ -22,8 +21,6 @@ from opensquilla.application.capability_setup import (
 from opensquilla.application.profile_lifecycle import (
     ActivateProfile,
     ProfileMutationPort,
-    ProfileProbeCommand,
-    ProfileProbePort,
     RemoveActiveProfile,
     UpsertProfile,
 )
@@ -35,28 +32,9 @@ from opensquilla.application.provider_credentials import (
 )
 from opensquilla.application.provider_setup import (
     ConfigurePrimaryProvider,
-    DiscoverPrimaryModels,
-    ImageModelDiscoveryResult,
     PrimaryProviderMutationPort,
-    ProbePrimaryProvider,
-    ProviderModelDiscoveryResult,
-    ProviderProbePort,
-    ProviderProbeResult,
 )
-from opensquilla.application.setup_mutations import SetupConfigPort, SetupRuntimePort
-from opensquilla.gateway.rpc import RpcContext
-
-ActiveConfig = Callable[[RpcContext], Any]
-PersistCandidate = Callable[..., str]
-InstallCandidate = Callable[[RpcContext, Any], None]
-RuntimeEffect = Callable[[RpcContext, Any], Awaitable[None]]
-ConfigEffect = Callable[[Any], None]
-ProfileEffect = Callable[[str], None]
-ProfileReconcile = Callable[[Any, Any, str], Awaitable[None]]
-RoutingBroadcast = Callable[[RpcContext, Any, str], Awaitable[None]]
-ProviderProbe = Callable[[Mapping[str, Any], RpcContext], Awaitable[Mapping[str, Any]]]
-CredentialReveal = Callable[[RpcContext, str], Mapping[str, Any]]
-CredentialDescribe = Callable[[Any, str, bool], Mapping[str, Any]]
+from opensquilla.application.setup_mutations import SetupRuntimePort
 
 
 class OnboardingSetupMutationPort(
@@ -244,83 +222,81 @@ class OnboardingSetupMutationPort(
         return reset_capability(config, capability_id=capability_id)
 
 
-class RpcContextSetupConfigPort(SetupConfigPort):
-    def __init__(
-        self,
-        ctx: RpcContext,
-        *,
-        active: ActiveConfig,
-        persist: PersistCandidate,
-        install: InstallCandidate,
-    ) -> None:
-        self._ctx = ctx
-        self._active = active
-        self._persist = persist
-        self._install = install
+class GatewaySetupRuntimePort(SetupRuntimePort):
+    """Apply post-commit setup effects through concrete runtime primitives."""
 
-    def active_config(self) -> Any:
-        return self._active(self._ctx)
-
-    def persist_candidate(
-        self,
-        candidate: Any,
-        *,
-        restart_required: bool,
-        backup_credential_provider: str | None = None,
-        remove_paths: Sequence[str] = (),
-    ) -> str:
-        return self._persist(
-            self._ctx,
-            candidate,
-            restart_required=restart_required,
-            backup_credential_provider=backup_credential_provider,
-            remove_paths=tuple(remove_paths),
-        )
-
-    def install_candidate(self, candidate: Any) -> Any:
-        self._install(self._ctx, candidate)
-        return self.active_config()
-
-
-class RpcContextSetupRuntimePort(SetupRuntimePort):
-    def __init__(
-        self,
-        ctx: RpcContext,
-        *,
-        sync_primary: ConfigEffect,
-        sync_media: ConfigEffect,
-        sync_search: ConfigEffect,
-        refresh_catalog: Callable[[Any], Awaitable[None]],
-        broadcast_routing: RoutingBroadcast,
-        discard_profile: ProfileEffect,
-        reconcile_profile: ProfileReconcile,
-    ) -> None:
-        self._ctx = ctx
-        self._sync_primary = sync_primary
-        self._sync_media = sync_media
-        self._sync_search = sync_search
-        self._refresh_catalog = refresh_catalog
-        self._broadcast_routing = broadcast_routing
-        self._discard_profile = discard_profile
-        self._reconcile_profile = reconcile_profile
+    def __init__(self, provider_selector: Any, subscription_manager: Any) -> None:
+        self._provider_selector = provider_selector
+        self._subscription_manager = subscription_manager
 
     async def sync_primary_provider(self, config: Any) -> None:
-        self._sync_primary(config)
+        from opensquilla.gateway.llm_runtime import resolve_llm_runtime_config
+        from opensquilla.provider.selector import ProviderConfig
+
+        if self._provider_selector is None or not hasattr(
+            self._provider_selector, "sync_primary"
+        ):
+            return
+        scratch = config.model_copy(deep=True)
+        runtime = resolve_llm_runtime_config(scratch)
+        if runtime.api_key_from_env and hasattr(config, "mark_runtime_secret"):
+            config.mark_runtime_secret("llm.api_key")
+        self._provider_selector.sync_primary(
+            ProviderConfig(
+                provider=runtime.provider,
+                model=runtime.model,
+                api_key=runtime.api_key,
+                base_url=runtime.base_url,
+                proxy=runtime.proxy,
+                provider_routing=runtime.provider_routing,
+            )
+        )
 
     async def sync_media(self, config: Any) -> None:
-        self._sync_media(config)
+        from opensquilla.gateway.setup_config_runtime import sync_media_runtime
+
+        sync_media_runtime(config)
 
     async def sync_search(self, config: Any) -> None:
-        self._sync_search(config)
+        from opensquilla.tools.builtin.web import configure_search
+
+        configure_search(
+            provider_name=config.search_provider,
+            max_results=config.search_max_results,
+            api_key=config.search_api_key,
+            api_key_env=getattr(config, "search_api_key_env", ""),
+            proxy=config.search_proxy,
+            use_env_proxy=config.search_use_env_proxy,
+            fallback_policy=config.search_fallback_policy,
+            diagnostics=config.search_diagnostics,
+        )
 
     async def refresh_model_catalog(self, config: Any) -> None:
-        await self._refresh_catalog(config)
+        from opensquilla.gateway.model_catalog_refresh import refresh_live_model_catalog
+
+        await refresh_live_model_catalog(config)
 
     async def broadcast_model_routing(self, config: Any, *, source: str) -> None:
-        await self._broadcast_routing(self._ctx, config, source)
+        if self._subscription_manager is None:
+            return
+        from opensquilla.gateway.event_bridge import EventBridge
+        from opensquilla.gateway.model_routing import model_routing_public_snapshot
+        from opensquilla.gateway.scopes import READ_SCOPE
+        from opensquilla.gateway.websocket import get_registry
+
+        await EventBridge(
+            self._subscription_manager,
+            get_registry(),
+        ).broadcast_scoped(
+            "models.routing.changed",
+            {**model_routing_public_snapshot(config), "source": source},
+            required_scope=READ_SCOPE,
+        )
 
     async def discard_profile_credentials(self, provider_id: str) -> None:
-        self._discard_profile(provider_id)
+        from opensquilla.gateway.llm_runtime import discard_profile_credential_pool
+
+        discard_profile_credential_pool(provider_id)
 
     async def reconcile_profile_transition(
         self,
@@ -329,141 +305,114 @@ class RpcContextSetupRuntimePort(SetupRuntimePort):
         *,
         provider_id: str,
     ) -> None:
-        await self._reconcile_profile(previous_config, current_config, provider_id)
-
-
-class RpcContextProviderProbePort(ProviderProbePort):
-    def __init__(
-        self,
-        ctx: RpcContext,
-        *,
-        probe: ProviderProbe,
-        discover: ProviderProbe,
-        discover_images: ProviderProbe,
-    ) -> None:
-        self._ctx = ctx
-        self._probe = probe
-        self._discover = discover
-        self._discover_images = discover_images
-
-    async def probe_primary(self, command: ProbePrimaryProvider) -> ProviderProbeResult:
-        return cast(
-            ProviderProbeResult,
-            await self._probe(_provider_probe_params(command), self._ctx),
+        from opensquilla.gateway.model_catalog_refresh import (
+            reconcile_tokenrhythm_profile_transition,
         )
 
-    async def discover_primary_models(
-        self, command: DiscoverPrimaryModels
-    ) -> ProviderModelDiscoveryResult:
-        return cast(
-            ProviderModelDiscoveryResult,
-            await self._discover(_provider_discovery_params(command), self._ctx),
-        )
-
-    async def discover_image_models(self, provider_id: str) -> ImageModelDiscoveryResult:
-        return cast(
-            ImageModelDiscoveryResult,
-            await self._discover_images({"providerId": provider_id}, self._ctx),
+        await reconcile_tokenrhythm_profile_transition(
+            previous_config,
+            current_config,
+            provider_id=provider_id,
         )
 
 
-class RpcContextProfileProbePort(ProfileProbePort):
-    def __init__(
-        self,
-        ctx: RpcContext,
-        *,
-        probe_saved: ProviderProbe,
-        probe_draft: ProviderProbe,
-        discover_saved: ProviderProbe,
-        discover_draft: ProviderProbe,
-    ) -> None:
-        self._ctx = ctx
-        self._probe_saved = probe_saved
-        self._probe_draft = probe_draft
-        self._discover_saved = discover_saved
-        self._discover_draft = discover_draft
-
-    async def probe_saved(self, command: ProfileProbeCommand) -> ProviderProbeResult:
-        return cast(
-            ProviderProbeResult,
-            await self._probe_saved(dict(command.values), self._ctx),
-        )
-
-    async def probe_draft(self, command: ProfileProbeCommand) -> ProviderProbeResult:
-        return cast(
-            ProviderProbeResult,
-            await self._probe_draft(dict(command.values), self._ctx),
-        )
-
-    async def discover_saved(
-        self, command: ProfileProbeCommand
-    ) -> ProviderModelDiscoveryResult:
-        return cast(
-            ProviderModelDiscoveryResult,
-            await self._discover_saved(dict(command.values), self._ctx),
-        )
-
-    async def discover_draft(
-        self, command: ProfileProbeCommand
-    ) -> ProviderModelDiscoveryResult:
-        return cast(
-            ProviderModelDiscoveryResult,
-            await self._discover_draft(dict(command.values), self._ctx),
-        )
-
-
-class RpcContextCredentialResolutionPort(CredentialResolutionPort):
-    def __init__(
-        self,
-        ctx: RpcContext,
-        *,
-        reveal: CredentialReveal,
-        describe: CredentialDescribe,
-    ) -> None:
-        self._ctx = ctx
-        self._reveal = reveal
-        self._describe = describe
+class GatewayCredentialResolutionPort(CredentialResolutionPort):
+    def __init__(self, config: Any, *, is_owner: bool) -> None:
+        self._config = config
+        self._is_owner = is_owner
 
     def reveal_active(self, provider_id: str) -> CredentialRevealResult:
-        return cast(CredentialRevealResult, self._reveal(self._ctx, provider_id))
+        from opensquilla.gateway.llm_runtime import resolve_llm_credential
+        from opensquilla.gateway.rpc import RpcHandlerError
+        from opensquilla.onboarding.provider_specs import get_provider_setup_spec
+
+        if not self._is_owner:
+            raise RpcHandlerError(
+                "onboarding.provider.credential.not_owner",
+                "Only the local gateway owner can reveal provider credentials.",
+            )
+        llm = getattr(self._config, "llm", None)
+        active_provider = str(getattr(llm, "provider", "") or "").strip().lower()
+        requested_provider = str(provider_id or "").strip().lower()
+        if requested_provider != active_provider:
+            raise RpcHandlerError(
+                "onboarding.provider.credential.inactive_provider",
+                "Credential reveal only supports the active provider.",
+            )
+        try:
+            spec = get_provider_setup_spec(active_provider)
+        except KeyError as exc:
+            raise RpcHandlerError(
+                "onboarding.provider.credential.unsupported_provider",
+                f"Unsupported active provider: {active_provider}",
+            ) from exc
+        credential = resolve_llm_credential(
+            self._config,
+            registry_env_key=str(getattr(spec, "env_key", "") or "").strip(),
+            include_runtime_cache=False,
+        )
+        if credential.source in {"explicit", "env"} and credential.api_key:
+            return CredentialRevealResult(
+                ok=True,
+                provider=active_provider,
+                source=credential.source,
+                envKey=credential.env_name,
+                apiKey=credential.api_key,
+            )
+        raise RpcHandlerError(
+            "onboarding.provider.credential.unavailable",
+            "No revealable credential is available for the active provider.",
+        )
 
     def describe_clear_result(
         self, config: Any, provider_id: str, *, active: bool
     ) -> CredentialClearDescription:
-        return cast(
-            CredentialClearDescription,
-            self._describe(config, provider_id, active),
+        from opensquilla.onboarding.status import get_onboarding_status
+
+        provider = str(provider_id or "").strip().lower()
+        status = get_onboarding_status(config)
+        if active:
+            row = dict(status.llm_credential_status)
+            source = str(row.get("source") or "none")
+            env_key = str(row.get("envKey") or "")
+            available = bool(row.get("available"))
+        else:
+            row = next(
+                (
+                    dict(candidate)
+                    for candidate in status.llm_profile_status
+                    if str(candidate.get("provider") or "").strip().lower()
+                    == provider
+                ),
+                {},
+            )
+            raw_source = str(row.get("credentialSource") or "none")
+            if raw_source in {
+                "member_env",
+                "profile_env",
+                "profile_pool",
+                "profile_pool_env",
+                "registry_env",
+            }:
+                source = "env"
+            elif raw_source == "keyless":
+                source = "not_required"
+            elif raw_source in {"member", "profile", "inherited"}:
+                source = "explicit"
+            else:
+                source = "none"
+            env_key = str(row.get("credentialEnv") or "")
+            available = source in {"explicit", "env", "not_required"}
+        return CredentialClearDescription(
+            credentialAvailable=available,
+            credentialSource=source,
+            credentialEnv=env_key,
+            externalCredentialActive=source == "env",
         )
 
 
-def _provider_probe_params(command: ProbePrimaryProvider) -> dict[str, Any]:
-    return {
-        "providerId": command.provider_id,
-        "model": command.model,
-        "apiKey": command.api_key,
-        "apiKeyEnv": command.api_key_env,
-        "baseUrl": command.base_url,
-        "proxy": command.proxy,
-        "preserveApiKey": command.preserve_api_key,
-    }
-
-
-def _provider_discovery_params(command: DiscoverPrimaryModels) -> dict[str, Any]:
-    return {
-        "providerId": command.provider_id,
-        "apiKey": command.api_key,
-        "apiKeyEnv": command.api_key_env,
-        "baseUrl": command.base_url,
-        "proxy": command.proxy,
-        "forceRefresh": command.force_refresh,
-    }
-
-
 __all__ = [
+    "GatewayCredentialResolutionPort",
+    "GatewaySetupRuntimePort",
     "OnboardingSetupMutationPort",
-    "RpcContextCredentialResolutionPort",
-    "RpcContextProfileProbePort",
-    "RpcContextProviderProbePort",
-    "RpcContextSetupConfigPort",
-    "RpcContextSetupRuntimePort",
 ]

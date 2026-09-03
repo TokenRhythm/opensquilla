@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, cast
 
 import structlog
 
+from opensquilla.application.app_settings import (
+    EffectiveSettings,
+    SettingsMutation,
+    SettingsValue,
+)
 from opensquilla.gateway.config_persistence import persist_gateway_config
 from opensquilla.gateway.config_secrets import (
     REDACTED_PUBLIC_VALUE as _REDACTED_PUBLIC_VALUE,
@@ -47,6 +53,7 @@ from opensquilla.gateway.setup_config_runtime import (
 
 if TYPE_CHECKING:
     from opensquilla.application.app_settings import AppSettings
+    from opensquilla.application.provider_configuration import ModelRoutingSnapshot
 
 log = structlog.get_logger(__name__)
 
@@ -72,10 +79,9 @@ def _update_config_in_place(old: Any, new: Any) -> None:
         old.reconcile_runtime_overrides(new)
 
 
-async def _notify_goal_config_changed(ctx: RpcContext, previous_config: Any) -> None:
+async def _notify_goal_config_changed(task_runtime: Any, previous_config: Any) -> None:
     """Apply the committed Goal kill-switch transition to the live service."""
 
-    task_runtime = getattr(ctx, "task_runtime", None)
     goal_service = getattr(task_runtime, "goal_service", None)
     hook = getattr(goal_service, "on_config_changed", None)
     if not callable(hook):
@@ -782,7 +788,7 @@ async def _handle_config_set(params: dict | None, ctx: RpcContext) -> dict[str, 
     # instead of silently diverging until the next restart reverts memory.
     persist_gateway_config(new_config)
     _update_config_in_place(ctx.config, new_config)
-    await _notify_goal_config_changed(ctx, previous_config)
+    await _notify_goal_config_changed(getattr(ctx, "task_runtime", None), previous_config)
     _sync_resolved_provider_selector(ctx, provider_config)
     _sync_image_generation(new_config)
     _sync_model_catalog_overrides(new_config)
@@ -814,31 +820,74 @@ async def _handle_config_set(params: dict | None, ctx: RpcContext) -> dict[str, 
     return response
 
 
-async def _execute_config_patch(
-    params: dict | None,
-    ctx: RpcContext,
+class _GatewayAppSettingsRuntime:
+    """Settings persistence assembled from explicit Gateway dependencies."""
+
+    def __init__(
+        self,
+        *,
+        config: Any,
+        task_runtime: Any,
+        provider_selector: Any,
+        subscription_manager: Any,
+    ) -> None:
+        self.config = config
+        self.task_runtime = task_runtime
+        self.provider_selector = provider_selector
+        self.subscription_manager = subscription_manager
+
+    async def read_effective_settings(self) -> EffectiveSettings:
+        return cast(EffectiveSettings, _effective_settings(self.config))
+
+    async def patch_settings(
+        self,
+        changes: Mapping[str, SettingsValue],
+        *,
+        safe: bool,
+    ) -> SettingsMutation:
+        return cast(
+            SettingsMutation,
+            await _apply_public_settings_patch(
+                {},
+                dict(changes),
+                self,
+                "config.patch.safe" if safe else "config.patch",
+            ),
+        )
+
+    async def merge_settings(
+        self, patch: Mapping[str, SettingsValue]
+    ) -> SettingsMutation:
+        return cast(
+            SettingsMutation,
+            await _apply_public_settings_patch(
+                dict(patch),
+                {},
+                self,
+                "config.patch",
+            ),
+        )
+
+
+async def _apply_public_settings_patch(
+    patch_data: dict[str, Any],
+    dot_patches: dict[str, Any],
+    runtime: _GatewayAppSettingsRuntime,
     model_routing_source: str = "config.patch",
 ) -> dict[str, Any]:
-    if not isinstance(params, dict):
-        raise ValueError("params.patch or params.patches is required")
-
-    # Accept both "patch" (dict merge) and "patches" (dot-path key-value pairs)
-    patch_data = params.get("patch") or {}
-    dot_patches = params.get("patches") or {}
-
     if not patch_data and not dot_patches:
         raise ValueError("params.patch or params.patches is required")
 
-    if ctx.config is None:
+    if runtime.config is None:
         raise ValueError("No config available")
 
-    previous_config = ctx.config.model_copy(deep=True)
-    old_model_routing = model_routing_public_snapshot(ctx.config)
-    old_live_catalog_fingerprint = _live_catalog_fingerprint(ctx.config)
-    old_memory_fingerprint = _memory_restart_fingerprint(ctx.config)
-    old_channels_fingerprint = _channels_restart_fingerprint(ctx.config)
-    old_sandbox_posture_fingerprint = _sandbox_posture_restart_fingerprint(ctx.config)
-    cfg_dict = ctx.config.model_dump() if hasattr(ctx.config, "model_dump") else {}
+    previous_config = runtime.config.model_copy(deep=True)
+    old_model_routing = model_routing_public_snapshot(runtime.config)
+    old_live_catalog_fingerprint = _live_catalog_fingerprint(runtime.config)
+    old_memory_fingerprint = _memory_restart_fingerprint(runtime.config)
+    old_channels_fingerprint = _channels_restart_fingerprint(runtime.config)
+    old_sandbox_posture_fingerprint = _sandbox_posture_restart_fingerprint(runtime.config)
+    cfg_dict = runtime.config.model_dump() if hasattr(runtime.config, "model_dump") else {}
     source_cfg_dict = copy.deepcopy(cfg_dict) if isinstance(cfg_dict, dict) else {}
     redacted_paths: set[str] = set()
     force_persist_paths: set[tuple[str, ...]] = set()
@@ -892,8 +941,12 @@ async def _execute_config_patch(
         for path in force_persist_paths
         if not _is_public_derived_config_path(".".join(path))
     }
-    _align_auto_router_profile_for_provider_patch(ctx.config, cfg_dict, explicit_paths)
-    linked_paths = _link_dream_for_self_learning_patch(ctx.config, cfg_dict, explicit_paths)
+    _align_auto_router_profile_for_provider_patch(
+        runtime.config, cfg_dict, explicit_paths
+    )
+    linked_paths = _link_dream_for_self_learning_patch(
+        runtime.config, cfg_dict, explicit_paths
+    )
     explicit_paths.update(linked_paths)
     force_persist_paths.update(tuple(path.split(".")) for path in linked_paths)
 
@@ -905,7 +958,7 @@ async def _execute_config_patch(
     validate_compaction_deployment_write(cfg_dict)
     new_config = GatewayConfig(**cfg_dict)
     routing_changes = reconcile_model_routing_write(
-        new_config, explicit_paths, previous=ctx.config
+        new_config, explicit_paths, previous=runtime.config
     )
     if routing_changes:
         routing_paths = set(routing_changes)
@@ -913,13 +966,15 @@ async def _execute_config_patch(
         force_persist_paths.update(tuple(item.split(".")) for item in routing_paths)
     if _memory_restart_required_for_paths(explicit_paths):
         _validate_memory_embedding_semantics(new_config)
-    inherit_then_clear_explicit(ctx.config, new_config, explicit_paths - redacted_paths)
+    inherit_then_clear_explicit(
+        runtime.config, new_config, explicit_paths - redacted_paths
+    )
     new_config._mark_env_absorbed_secrets(cfg_dict)
 
     # Runtime-override provenance must ride the candidate BEFORE runtime
     # resolution applies env values, so persist can un-bake them.
     if hasattr(new_config, "inherit_persist_provenance"):
-        new_config.inherit_persist_provenance(ctx.config)
+        new_config.inherit_persist_provenance(runtime.config)
     _mark_explicit_provider_resolution(new_config, explicit_paths)
     explicit_force_paths = force_persist_paths - {
         tuple(path.split(".")) for path in redacted_paths
@@ -931,15 +986,20 @@ async def _execute_config_patch(
     # fails, memory and disk stay consistent (both keep the old state).
     persist_gateway_config(new_config)
     # Update in-memory config so subsequent requests see changes immediately
-    _update_config_in_place(ctx.config, new_config)
-    await _notify_goal_config_changed(ctx, previous_config)
-    _sync_resolved_provider_selector(ctx, provider_config)
+    _update_config_in_place(runtime.config, new_config)
+    await _notify_goal_config_changed(runtime.task_runtime, previous_config)
+    if provider_config is not None and hasattr(
+        runtime.provider_selector, "sync_primary"
+    ):
+        runtime.provider_selector.sync_primary(provider_config)
     _sync_image_generation(new_config)
     _sync_model_catalog_overrides(new_config)
     await _reconcile_tokenrhythm_profile_after_config_change(
-        previous_config, ctx.config
+        previous_config, runtime.config
     )
-    await _refresh_live_catalog_after_change(old_live_catalog_fingerprint, ctx.config)
+    await _refresh_live_catalog_after_change(
+        old_live_catalog_fingerprint, runtime.config
+    )
 
     change_meta = _change_meta(
         old_memory_fingerprint=old_memory_fingerprint,
@@ -955,26 +1015,38 @@ async def _execute_config_patch(
     if linked_paths:
         response["linked"] = linked_paths
         await _reconcile_dream_crons_live(response)
-    model_routing = await broadcast_model_routing_changed_if_needed(
-        ctx,
-        previous=old_model_routing,
-        source=model_routing_source,
-        config=new_config,
-    )
-    if model_routing is not None:
-        response["model_routing"] = model_routing
+    current_model_routing = model_routing_public_snapshot(new_config)
+    if current_model_routing != old_model_routing:
+        from opensquilla.gateway.adapters.provider_configuration import (
+            GatewayModelRoutingRuntimePort,
+        )
+
+        await GatewayModelRoutingRuntimePort(
+            runtime.provider_selector,
+            runtime.subscription_manager,
+        ).publish_changed(
+            cast("ModelRoutingSnapshot", old_model_routing),
+            new_config,
+            source=model_routing_source,
+        )
+        response["model_routing"] = {
+            **current_model_routing,
+            "source": model_routing_source,
+        }
     return response
 
 
 def _app_settings(ctx: RpcContext) -> AppSettings:
     from opensquilla.application.app_settings import AppSettings
-    from opensquilla.gateway.adapters.app_settings import RpcContextAppSettingsPort
+    from opensquilla.gateway.adapters.app_settings import GatewayAppSettingsPort
 
-    port = RpcContextAppSettingsPort(
-        ctx,
-        patch_runner=_execute_config_patch,
-        effective_reader=_execute_config_effective,
+    runtime = _GatewayAppSettingsRuntime(
+        config=ctx.config,
+        task_runtime=getattr(ctx, "task_runtime", None),
+        provider_selector=getattr(ctx, "provider_selector", None),
+        subscription_manager=getattr(ctx, "subscription_manager", None),
     )
+    port = GatewayAppSettingsPort(ctx.config, runtime=runtime)
     return AppSettings(port, port)
 
 
@@ -997,7 +1069,17 @@ async def _handle_config_patch(
     if patch_data and dot_patches:
         # Preserve the legacy combined mutation shape. New domain consumers
         # deliberately choose either semantic merge or dotted changes.
-        return await _execute_config_patch(params, ctx, _model_routing_source)
+        return await _apply_public_settings_patch(
+            patch_data,
+            dot_patches,
+            _GatewayAppSettingsRuntime(
+                config=ctx.config,
+                task_runtime=getattr(ctx, "task_runtime", None),
+                provider_selector=getattr(ctx, "provider_selector", None),
+                subscription_manager=getattr(ctx, "subscription_manager", None),
+            ),
+            _model_routing_source,
+        )
     settings = _app_settings(ctx)
     if patch_data:
         return cast(dict[str, Any], await settings.merge(patch_data))
@@ -1097,7 +1179,9 @@ async def _handle_config_apply(params: dict | None, ctx: RpcContext) -> dict[str
     persist_gateway_config(new_config)
     if ctx.config is not None:
         _update_config_in_place(ctx.config, new_config)
-        await _notify_goal_config_changed(ctx, previous_config)
+        await _notify_goal_config_changed(
+            getattr(ctx, "task_runtime", None), previous_config
+        )
     _sync_resolved_provider_selector(ctx, provider_config)
     _sync_image_generation(new_config)
     _sync_model_catalog_overrides(new_config)
@@ -1236,7 +1320,7 @@ async def _handle_config_reload(params: dict | None, ctx: RpcContext) -> dict[st
 
     # Step 4: swap values + runtime-secret markers into the live config.
     _update_config_in_place(ctx.config, candidate)
-    await _notify_goal_config_changed(ctx, previous_config)
+    await _notify_goal_config_changed(getattr(ctx, "task_runtime", None), previous_config)
     _sync_image_generation(candidate)
     _sync_model_catalog_overrides(candidate)
     await _reconcile_tokenrhythm_profile_after_config_change(
@@ -1316,7 +1400,7 @@ async def _handle_config_schema_lookup(params: dict | None, ctx: RpcContext) -> 
     }
 
 
-async def _execute_config_effective(ctx: RpcContext) -> dict[str, Any]:
+def _effective_settings(config: Any) -> dict[str, Any]:
     """Effective LLM routing values with per-field provenance.
 
     Wire shape (public contract, frozen by
@@ -1334,14 +1418,14 @@ async def _execute_config_effective(ctx: RpcContext) -> dict[str, Any]:
     ``redact_public_config`` BEFORE provenance-wrapping so that any
     container-shaped value has secret-named members masked.
     """
-    if ctx.config is None:
+    if config is None:
         raise ValueError("No config available")
 
     from opensquilla.gateway.config import is_sensitive_config_key, redact_public_config
     from opensquilla.provider.model_catalog import shared_catalog
     from opensquilla.provider.resolution import resolve_effective_llm
 
-    resolved = resolve_effective_llm(ctx.config, shared_catalog())
+    resolved = resolve_effective_llm(config, shared_catalog())
     fields: dict[str, dict[str, Any]] = {}
     for path, field in resolved.items():
         if any(is_sensitive_config_key(segment) for segment in path.split(".")):

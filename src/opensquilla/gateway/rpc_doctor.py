@@ -123,7 +123,13 @@ async def _provider_payload(
     query = params or {}
     return cast(
         dict[str, Any],
-        await ProviderStatus(GatewayProviderStatusPort(ctx)).read(
+        await ProviderStatus(
+            GatewayProviderStatusPort(
+                config=ctx.config,
+                provider_selector=ctx.provider_selector,
+                provider_stats=ctx.provider_stats,
+            )
+        ).read(
             provider_id=query.get("provider"),
             probe_models=bool(query.get("probeModels", False)),
         ),
