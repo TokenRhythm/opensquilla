@@ -42,6 +42,28 @@ function wsEvent(event: string, payload: unknown) {
   return JSON.stringify({ type: 'event', event, payload })
 }
 
+function sessionListPayload(sessionKey: string) {
+  return {
+    sessions: [{
+      key: sessionKey,
+      title: 'Assistant activity session',
+      sessionKind: 'chat',
+      surface: 'webchat',
+      conversationKind: 'direct',
+      effectiveAgentId: 'main',
+      updatedAt: 100,
+      messageCount: 0,
+      status: 'ok',
+      runStatus: 'idle',
+    }],
+    has_more: false,
+  }
+}
+
+function routeSessionKey(page: Page, fallback: string): string {
+  return new URL(page.url()).searchParams.get('session') || fallback
+}
+
 async function mockActivityHistory(page: Page, fixture: ActivityFixture = {}) {
   const isSearchFixture = fixture.searchTargets === true
   await page.addInitScript(() => {
@@ -118,6 +140,13 @@ async function mockActivityHistory(page: Page, fixture: ActivityFixture = {}) {
         ws.send(wsResponse(frame.id as string | number, sessionMessagesHydratePayload(
           key,
         )))
+        return
+      }
+      if (frame.method === 'sessions.list') {
+        ws.send(wsResponse(
+          frame.id as string | number,
+          sessionListPayload(routeSessionKey(page, SESSION_KEY)),
+        ))
         return
       }
       ws.send(JSON.stringify({ type: 'res', id: frame.id, ok: true, payload: {} }))
@@ -228,7 +257,7 @@ async function mockUnifiedTurnReceiptHistory(page: Page) {
           skills: {},
         },
         'onboarding.status': { audioConfigured: false },
-        'sessions.list': { sessions: [], has_more: false },
+        'sessions.list': sessionListPayload(sessionKey),
         'sessions.messages.subscribe': sessionMessagesSubscribePayload(
           sessionKey,
         ),
@@ -378,7 +407,7 @@ async function mockControlledActivityLifecycle(
           skills: {},
         },
         'onboarding.status': { audioConfigured: false },
-        'sessions.list': { sessions: [], has_more: false },
+        'sessions.list': sessionListPayload(LIFECYCLE_SESSION_KEY),
         'sessions.messages.subscribe': sessionMessagesSubscribePayload(
           LIFECYCLE_SESSION_KEY,
         ),
