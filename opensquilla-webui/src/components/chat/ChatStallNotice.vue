@@ -16,6 +16,7 @@
         {{ t('chat.stall.keepWaiting') }}
       </button>
       <button
+        v-if="canInterrupt"
         class="btn stall-notice__interrupt"
         type="button"
         data-testid="chat-stall-interrupt"
@@ -32,10 +33,14 @@ import { useI18n } from 'vue-i18n'
 
 const { t } = useI18n()
 
-defineProps<{
+withDefaults(defineProps<{
   /** Seconds of content silence, live-updated by the watchdog. */
   seconds: number
-}>()
+  /** Whether this session policy permits the active turn to be interrupted. */
+  canInterrupt?: boolean
+}>(), {
+  canInterrupt: true,
+})
 
 defineEmits<{
   /** "Keep waiting" — suppress this silence episode until real progress. */

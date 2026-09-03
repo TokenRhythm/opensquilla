@@ -4,7 +4,12 @@ import { createApp, nextTick } from 'vue'
 import i18n from '@/i18n'
 import ChatStallNotice from './ChatStallNotice.vue'
 
-async function mountNotice(props: { seconds: number; onWait?: () => void; onInterrupt?: () => void }) {
+async function mountNotice(props: {
+  seconds: number
+  canInterrupt?: boolean
+  onWait?: () => void
+  onInterrupt?: () => void
+}) {
   const el = document.createElement('div')
   document.body.appendChild(el)
   const app = createApp(ChatStallNotice, props)
@@ -51,6 +56,15 @@ describe('ChatStallNotice', () => {
 
     expect(onWait).toHaveBeenCalledTimes(1)
     expect(onInterrupt).toHaveBeenCalledTimes(1)
+    app.unmount()
+  })
+
+  it('keeps the neutral wait action but hides interrupt when policy is read-only', async () => {
+    const { app, el } = await mountNotice({ seconds: 90, canInterrupt: false })
+
+    expect(el.querySelector('[data-testid="chat-stall-notice"]')).toBeTruthy()
+    expect(el.querySelector('[data-testid="chat-stall-wait"]')).toBeTruthy()
+    expect(el.querySelector('[data-testid="chat-stall-interrupt"]')).toBeNull()
     app.unmount()
   })
 })

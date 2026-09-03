@@ -458,6 +458,7 @@
         <ChatStallNotice
           v-if="stallActive"
           :seconds="stallSeconds"
+          :can-interrupt="!turnActionsBlocked"
           @wait="stallWatchdog.dismiss()"
           @interrupt="onStop"
         />
@@ -3473,6 +3474,7 @@ const chatSend = useChatSend({
   autoScroll,
   stream: chatStream,
   canStop: () => canStop.value,
+  turnActionsBlocked: () => turnActionsBlocked.value,
   normalizeElevatedMode,
   adoptResponseSession: async (key, ownerRequestId) => {
     const sourceKey = sessionKey.value

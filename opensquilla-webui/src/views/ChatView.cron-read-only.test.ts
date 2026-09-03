@@ -48,6 +48,8 @@ describe('Cron session read-only presentation', () => {
       'v-if="!turnActionsBlocked || exactReceiptReplayPendingForCurrentSession"',
     )
     expect(chatViewSource).toContain(':can-stop="!turnActionsBlocked && canStop"')
+    expect(chatViewSource).toContain(':can-interrupt="!turnActionsBlocked"')
+    expect(chatViewSource).toContain('turnActionsBlocked: () => turnActionsBlocked.value,')
     expect(chatViewSource).toContain(
       'v-if="!turnActionsBlocked && executionDockRun"',
     )

@@ -7454,6 +7454,19 @@ describe('useChatSend attachment payloads', () => {
     expect(activeStreamTaskId.value).toBe('task-old')
   })
 
+  it('does not stop active work when the selected session is read-only', () => {
+    const { api, rpc, stream } = makeOptions({
+      canStop: () => true,
+      turnActionsBlocked: () => true,
+    })
+    stream.isStreaming.value = true
+
+    api.onStop()
+
+    expect(rpc.call).not.toHaveBeenCalledWith('chat.abort', expect.anything())
+    expect(stream.endStreaming).not.toHaveBeenCalled()
+  })
+
   it('prefers the server steer turn when the rendered stream id is stale', () => {
     const { api, rpc, stream } = makeOptions({
       activeStreamTaskId: ref('task-rendered-stale'),

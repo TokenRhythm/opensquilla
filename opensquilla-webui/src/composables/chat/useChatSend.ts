@@ -545,6 +545,8 @@ export interface UseChatSendOptions {
   autoScroll: Ref<boolean>
   stream: ChatRpcStreamApi
   canStop?: () => boolean
+  /** Permanent selected-session policy gate; Stop must never bypass it. */
+  turnActionsBlocked?: () => boolean
   normalizeElevatedMode: (mode: string) => string
   adoptResponseSession: (
     key: string,
@@ -3677,6 +3679,7 @@ export function useChatSend(options: UseChatSendOptions) {
   }
 
   function onStop() {
+    if (options.turnActionsBlocked?.()) return
     // A first Stop can race durable ingress before chat.send returns a task id.
     // Keep that transaction latched until its ACK/reconcile so a double click
     // cannot widen the second request into legacy whole-session cancellation.
