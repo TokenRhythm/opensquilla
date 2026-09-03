@@ -1147,6 +1147,46 @@ async def test_goal_writes_reject_cron_before_any_durable_side_effect(
             for table in counts_before
         } == counts_before
 
+    async with _open_goal_rpc_stack(
+        tmp_path / "goal-cron-pause-clear.sqlite",
+        session_key=session_key,
+    ) as stack:
+        created = await _handle_goals_set(
+            {**_set_params(), "sessionKey": session_key},
+            stack.context,
+        )
+        await _mark_source_as_cron(stack, session_key)
+        transcript_before = await stack.manager.get_transcript(session_key)
+        goal_before = await stack.storage.get_goal(session_key)
+        counts_before = {
+            table: await _table_count(stack.storage, table)
+            for table in (
+                "agent_tasks",
+                "goal_command_receipts",
+                "turn_ingress_receipts",
+                "transcript_entries",
+            )
+        }
+        for handler, request_index in (
+            (_handle_goals_pause, 2),
+            (_handle_goals_clear, 3),
+        ):
+            with pytest.raises(RpcHandlerError) as exc_info:
+                await handler(
+                    {
+                        **_mutation_params(created["goal"], request_index=request_index),
+                        "sessionKey": session_key,
+                    },
+                    stack.context,
+                )
+            assert exc_info.value.code == "SESSION_NOT_INTERACTIVE"
+            assert await stack.storage.get_goal(session_key) == goal_before
+            assert await stack.manager.get_transcript(session_key) == transcript_before
+            assert {
+                table: await _table_count(stack.storage, table)
+                for table in counts_before
+            } == counts_before
+
 
 @pytest.mark.asyncio
 async def test_goal_exact_receipts_replay_after_session_becomes_cron(
@@ -1165,18 +1205,21 @@ async def test_goal_exact_receipts_replay_after_session_becomes_cron(
             "objective": "Replay the accepted Goal commands exactly.",
         }
         edited = await _handle_goals_edit(edit_params, stack.context)
-        paused = await _handle_goals_pause(
-            {
-                **_mutation_params(edited["goal"], request_index=3),
-                "sessionKey": session_key,
-            },
-            stack.context,
-        )
+        pause_params = {
+            **_mutation_params(edited["goal"], request_index=3),
+            "sessionKey": session_key,
+        }
+        paused = await _handle_goals_pause(pause_params, stack.context)
         resume_params = {
             **_mutation_params(paused["goal"], request_index=4),
             "sessionKey": session_key,
         }
         resumed = await _handle_goals_resume(resume_params, stack.context)
+        clear_params = {
+            **_mutation_params(resumed["goal"], request_index=5),
+            "sessionKey": session_key,
+        }
+        cleared = await _handle_goals_clear(clear_params, stack.context)
         await _mark_source_as_cron(stack, session_key)
         counts_before = {
             table: await _table_count(stack.storage, table)
@@ -1191,9 +1234,15 @@ async def test_goal_exact_receipts_replay_after_session_becomes_cron(
         replays = (
             await _handle_goals_set(dict(set_params), stack.context),
             await _handle_goals_edit(dict(edit_params), stack.context),
+            await _handle_goals_pause(dict(pause_params), stack.context),
             await _handle_goals_resume(dict(resume_params), stack.context),
+            await _handle_goals_clear(dict(clear_params), stack.context),
         )
-        for replay, accepted in zip(replays, (created, edited, resumed), strict=True):
+        for replay, accepted in zip(
+            replays,
+            (created, edited, paused, resumed, cleared),
+            strict=True,
+        ):
             assert {key: value for key, value in replay.items() if key != "continuityToken"} == {
                 key: value for key, value in accepted.items() if key != "continuityToken"
             }

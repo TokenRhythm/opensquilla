@@ -1385,6 +1385,7 @@ class GoalService:
                 outcome="replayed",
             )
             return dict(replay.response)
+        await self._require_interactive_session(key)
         async with self._lock(key):
             goal = await self._storage.get_goal(key)
             if goal is None:
