@@ -35,6 +35,9 @@ const normalized = path => path.replace(/\\/g, '/')
 const isTestFile = rel => /\.(test|spec)\.(?:[cm]?[jt]sx?)$/.test(rel)
 const isGatewayAdapter = rel => rel.startsWith('src/adapters/gateway/')
 const isGeneratedContract = rel => rel.startsWith('src/contracts/generated/')
+const isPrivateHttpTransportImplementation = rel => (
+  rel === 'src/adapters/gateway/privateHttpTransport.ts'
+)
 const isStaticAssetTransportImplementation = rel => rel === 'src/platform/staticAssets.ts'
 const isRawConversationWireName = value => (
   value.startsWith('session.event.') || /^task\.[a-z0-9_.-]+$/i.test(value)
@@ -217,8 +220,7 @@ export function evaluateRpcArchitectureGate({ root = defaultRoot } = {}) {
     analysis: sourceAnalysis,
   })) {
     if (
-      isGatewayAdapter(operation.rel)
-      || isRpcTransportImplementation(operation.rel)
+      isPrivateHttpTransportImplementation(operation.rel)
       || isStaticAssetTransportImplementation(operation.rel)
     ) continue
     increment(actualByKind.get(operation.kind), operation.rel)
@@ -256,7 +258,7 @@ function runCli() {
   console.log(
     'Transport boundary guard passed '
     + `(outside allowed boundaries: RPC=${rpcTotal}, HTTP=${httpTotal}; `
-    + 'Gateway Adapter HTTP remains boundary-private).',
+    + 'raw HTTP is confined to the private transport and static assets).',
   )
 }
 

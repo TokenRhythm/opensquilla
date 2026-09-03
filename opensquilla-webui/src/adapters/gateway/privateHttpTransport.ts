@@ -1,4 +1,5 @@
 const DEFAULT_TIMEOUT_MS = 15_000
+const PREVIEW_HOSTNAME_PATTERN = /^p-[0-9a-f]{32}\.localhost$/
 const WS_TOKEN_KEY = 'opensquilla.wsToken'
 
 export type HttpTransportErrorKind =
@@ -33,6 +34,7 @@ export class HttpTransportError extends Error {
 export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
 
 interface HttpRequestBase {
+  keepalive?: boolean
   sessionKey?: string
   timeoutMs?: number
   signal?: AbortSignal
@@ -48,6 +50,8 @@ export type HttpRequestOptions = HttpRequestBase & (
 
 /** Raw HTTP capability private to Gateway Adapters and the composition root. */
 export interface HttpTransport {
+  clearPreviewOrigin(previewOrigin: string): Promise<void>
+  fetchExternalArtifact(endpoint: string, signal?: AbortSignal): Promise<HttpBinaryResponse>
   requestJson<T>(endpoint: string, options?: HttpRequestOptions): Promise<T>
   requestBinary(endpoint: string, options?: HttpRequestOptions): Promise<HttpBinaryResponse>
   requestBlob(endpoint: string, options?: HttpRequestOptions): Promise<Blob>
@@ -95,45 +99,29 @@ function defaultAuthToken(): string {
   }
 }
 
+function invalidEndpoint(message: string, cause?: unknown): HttpTransportError {
+  return new HttpTransportError('invalid-endpoint', message, undefined, undefined, cause)
+}
 function resolveBaseUrl(value?: string | URL): URL {
   try {
     if (value instanceof URL) return new URL(value.href)
     if (value) return new URL(value, globalThis.location?.href)
     if (globalThis.location?.href) return new URL(globalThis.location.href)
   } catch (cause) {
-    throw new HttpTransportError(
-      'invalid-endpoint',
-      'Gateway HTTP base URL is invalid.',
-      undefined,
-      undefined,
-      cause,
-    )
+    throw invalidEndpoint('Gateway HTTP base URL is invalid.', cause)
   }
-  throw new HttpTransportError(
-    'invalid-endpoint',
-    'Gateway HTTP base URL is unavailable.',
-  )
+  throw invalidEndpoint('Gateway HTTP base URL is unavailable.')
 }
 
 function resolveEndpoint(baseUrl: URL, endpoint: string): URL {
-  if (typeof endpoint !== 'string') {
-    throw new HttpTransportError('invalid-endpoint', 'Gateway HTTP endpoint is invalid.')
-  }
+  if (typeof endpoint !== 'string') throw invalidEndpoint('Gateway HTTP endpoint is invalid.')
   const candidate = endpoint.trim()
-  if (!candidate) {
-    throw new HttpTransportError('invalid-endpoint', 'Gateway HTTP endpoint is empty.')
-  }
+  if (!candidate) throw invalidEndpoint('Gateway HTTP endpoint is empty.')
   let resolved: URL
   try {
     resolved = new URL(candidate, baseUrl)
   } catch (cause) {
-    throw new HttpTransportError(
-      'invalid-endpoint',
-      'Gateway HTTP endpoint is invalid.',
-      undefined,
-      undefined,
-      cause,
-    )
+    throw invalidEndpoint('Gateway HTTP endpoint is invalid.', cause)
   }
   if (
     (resolved.protocol !== 'http:' && resolved.protocol !== 'https:')
@@ -141,22 +129,39 @@ function resolveEndpoint(baseUrl: URL, endpoint: string): URL {
     || resolved.username
     || resolved.password
   ) {
-    throw new HttpTransportError(
-      'invalid-endpoint',
-      'Gateway HTTP endpoint must stay on the configured origin.',
-    )
+    throw invalidEndpoint('Gateway HTTP endpoint must stay on the configured origin.')
   }
+  return resolved
+}
+
+function resolvePreviewCleanupUrl(previewOrigin: string): URL {
+  const origin = resolveBaseUrl(previewOrigin)
+  if (
+    origin.protocol !== 'http:' || !PREVIEW_HOSTNAME_PATTERN.test(origin.hostname) || !origin.port
+    || !!(origin.username || origin.password)
+    || origin.pathname !== '/' || !!(origin.search || origin.hash)
+    || previewOrigin !== origin.origin
+  ) {
+    throw invalidEndpoint('Preview cleanup origin is invalid.')
+  }
+  return new URL('/.opensquilla/clear-site-data', origin.origin)
+}
+
+function resolveExternalArtifactUrl(baseUrl: URL, endpoint: string): URL {
+  let resolved: URL
+  try { resolved = new URL(endpoint) } catch (cause) {
+    throw invalidEndpoint('External artifact endpoint is invalid.', cause)
+  }
+  if (
+    (resolved.protocol !== 'http:' && resolved.protocol !== 'https:')
+    || resolved.origin === baseUrl.origin || !!(resolved.username || resolved.password)
+  ) throw invalidEndpoint('External artifact endpoint is invalid.')
   return resolved
 }
 
 function requestTimeout(value: number | undefined, fallback: number): number {
   const timeoutMs = value ?? fallback
-  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
-    throw new HttpTransportError(
-      'invalid-endpoint',
-      'Gateway HTTP timeout must be a finite non-negative number.',
-    )
-  }
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) throw invalidEndpoint('Gateway HTTP timeout must be finite and non-negative.')
   return timeoutMs
 }
 
@@ -197,6 +202,23 @@ function requestSignal(signal: AbortSignal | undefined, timeoutMs: number): Requ
     timedOut: () => didTimeOut,
     dispose,
   }
+}
+
+function requestFailure(
+  linkedSignal: RequestSignal,
+  callerSignal: AbortSignal | undefined,
+  cause: unknown,
+  kind: 'network' | 'decode',
+  message: string,
+  status?: number,
+): HttpTransportError {
+  if (linkedSignal.timedOut()) {
+    return new HttpTransportError('timeout', 'Gateway HTTP request timed out.', undefined, undefined, cause)
+  }
+  if (callerSignal?.aborted || linkedSignal.signal.aborted) {
+    return new HttpTransportError('aborted', 'Gateway HTTP request was aborted.', undefined, undefined, cause)
+  }
+  return new HttpTransportError(kind, message, status, undefined, cause)
 }
 
 function binaryContentLength(value: string | null): number | undefined {
@@ -473,7 +495,7 @@ function binaryResponse(initialResponse: Response, lifecycle: ResponseBodyLifecy
   signalListener = abortBody
   lifecycle.signal.addEventListener('abort', signalListener, { once: true })
   if (lifecycle.signal.aborted) abortBody()
-  function takeStream(): ReadableStream<Uint8Array> | null {
+  function takeStream(claimEmpty = true): ReadableStream<Uint8Array> | null {
     try {
       lifecycle.assertActive()
     } catch (cause) {
@@ -487,14 +509,15 @@ function binaryResponse(initialResponse: Response, lifecycle: ResponseBodyLifecy
         status,
       )
     }
-    consumed = true
     const source = body
     body = null
     detachSignalListener()
     if (!source) {
+      consumed = claimEmpty
       releaseLifecycle()
       return null
     }
+    consumed = true
     try {
       return managedBinaryStream(source, lifecycle)
     } catch (cause) {
@@ -505,7 +528,7 @@ function binaryResponse(initialResponse: Response, lifecycle: ResponseBodyLifecy
   }
   return {
     metadata,
-    stream: takeStream,
+    stream: () => takeStream(false),
     async blob() {
       const stream = takeStream()
       if (!stream) return new Blob([], contentType ? { type: contentType } : undefined)
@@ -524,7 +547,6 @@ function binaryResponse(initialResponse: Response, lifecycle: ResponseBodyLifecy
     },
   }
 }
-
 async function errorPayload(
   response: Response,
   lifecycle: ResponseBodyLifecycle,
@@ -590,8 +612,11 @@ export function createPrivateHttpTransport(
     endpoint: string,
     requestOptions: HttpRequestOptions = {},
     decoder: ResponseDecoder<T>,
+    externalArtifact = false,
   ): Promise<T> {
-    const url = resolveEndpoint(baseUrl, endpoint)
+    const url = externalArtifact
+      ? resolveExternalArtifactUrl(baseUrl, endpoint)
+      : resolveEndpoint(baseUrl, endpoint)
     let method: HttpMethod = 'GET'
     let hasJson = false
     let hasForm = false
@@ -659,22 +684,24 @@ export function createPrivateHttpTransport(
       )
     }
 
-    let headers: Headers
-    try {
-      headers = new Headers()
-      const token = authToken()?.trim() ?? ''
-      if (token) headers.set('Authorization', `Bearer ${token}`)
-      const sessionKey = requestOptions.sessionKey?.trim() ?? ''
-      if (sessionKey) headers.set('x-opensquilla-session-key', sessionKey)
-      if (hasJson) headers.set('Content-Type', 'application/json')
-    } catch (cause) {
-      throw new HttpTransportError(
-        'encode',
-        'Gateway HTTP request headers could not be constructed.',
-        undefined,
-        undefined,
-        cause,
-      )
+    let headers: Headers | undefined
+    if (!externalArtifact) {
+      try {
+        headers = new Headers()
+        const token = authToken()?.trim() ?? ''
+        if (token) headers.set('Authorization', `Bearer ${token}`)
+        const sessionKey = requestOptions.sessionKey?.trim() ?? ''
+        if (sessionKey) headers.set('x-opensquilla-session-key', sessionKey)
+        if (hasJson) headers.set('Content-Type', 'application/json')
+      } catch (cause) {
+        throw new HttpTransportError(
+          'encode',
+          'Gateway HTTP request headers could not be constructed.',
+          undefined,
+          undefined,
+          cause,
+        )
+      }
     }
 
     const linkedSignal = requestSignal(
@@ -689,35 +716,14 @@ export function createPrivateHttpTransport(
           method,
           headers,
           body,
-          credentials: 'same-origin',
+          credentials: externalArtifact ? 'omit' : 'same-origin',
+          keepalive: requestOptions.keepalive,
           redirect: 'error',
           signal: linkedSignal.signal,
         })
       } catch (cause) {
-        if (linkedSignal.timedOut()) {
-          throw new HttpTransportError(
-            'timeout',
-            'Gateway HTTP request timed out.',
-            undefined,
-            undefined,
-            cause,
-          )
-        }
-        if (callerSignal?.aborted || linkedSignal.signal.aborted) {
-          throw new HttpTransportError(
-            'aborted',
-            'Gateway HTTP request was aborted.',
-            undefined,
-            undefined,
-            cause,
-          )
-        }
-        throw new HttpTransportError(
-          'network',
-          'Gateway HTTP request failed.',
-          undefined,
-          undefined,
-          cause,
+        throw requestFailure(
+          linkedSignal, callerSignal, cause, 'network', 'Gateway HTTP request failed.',
         )
       }
 
@@ -735,30 +741,13 @@ export function createPrivateHttpTransport(
         },
         transportError(cause) {
           if (cause instanceof HttpTransportError) return cause
-          if (linkedSignal.timedOut()) {
-            return new HttpTransportError(
-              'timeout',
-              'Gateway HTTP request timed out.',
-              undefined,
-              undefined,
-              cause,
-            )
-          }
-          if (callerSignal?.aborted || linkedSignal.signal.aborted) {
-            return new HttpTransportError(
-              'aborted',
-              'Gateway HTTP request was aborted.',
-              undefined,
-              undefined,
-              cause,
-            )
-          }
-          return new HttpTransportError(
+          return requestFailure(
+            linkedSignal,
+            callerSignal,
+            cause,
             'network',
             'Gateway HTTP response body failed.',
             responseStatus,
-            undefined,
-            cause,
           )
         },
       }
@@ -780,30 +769,13 @@ export function createPrivateHttpTransport(
         lifecycleTransferred = decoder.ownsBodyLifecycle === true
         return decoded
       } catch (cause) {
-        if (linkedSignal.timedOut()) {
-          throw new HttpTransportError(
-            'timeout',
-            'Gateway HTTP request timed out.',
-            undefined,
-            undefined,
-            cause,
-          )
-        }
-        if (callerSignal?.aborted || linkedSignal.signal.aborted) {
-          throw new HttpTransportError(
-            'aborted',
-            'Gateway HTTP request was aborted.',
-            undefined,
-            undefined,
-            cause,
-          )
-        }
-        throw new HttpTransportError(
+        throw requestFailure(
+          linkedSignal,
+          callerSignal,
+          cause,
           'decode',
           decoder.failureMessage,
           responseStatus,
-          undefined,
-          cause,
         )
       }
     } finally {
@@ -814,13 +786,41 @@ export function createPrivateHttpTransport(
   const requestBinary = async (
     endpoint: string,
     requestOptions?: HttpRequestOptions,
+    externalArtifact = false,
   ): Promise<HttpBinaryResponse> => request(endpoint, requestOptions, {
     decode: async (response, lifecycle) => binaryResponse(response, lifecycle),
     failureMessage: 'Gateway HTTP response could not be decoded as binary data.',
     ownsBodyLifecycle: true,
-  })
+  }, externalArtifact)
 
   return {
+    async clearPreviewOrigin(previewOrigin: string) {
+      const url = resolvePreviewCleanupUrl(previewOrigin)
+      const linkedSignal = requestSignal(undefined, 2_000)
+      try {
+        try {
+          await fetchImpl(url, {
+            method: 'GET',
+            cache: 'no-store',
+            credentials: 'omit',
+            keepalive: true,
+            mode: 'no-cors',
+            redirect: 'error',
+            referrerPolicy: 'no-referrer',
+            signal: linkedSignal.signal,
+          })
+        } catch (cause) {
+          throw requestFailure(
+            linkedSignal, undefined, cause, 'network', 'Preview origin cleanup failed.',
+          )
+        }
+      } finally {
+        linkedSignal.dispose()
+      }
+    },
+    fetchExternalArtifact(endpoint: string, signal?: AbortSignal) {
+      return requestBinary(endpoint, { signal, timeoutMs: 0 }, true)
+    },
     async requestJson<T>(endpoint: string, requestOptions?: HttpRequestOptions) {
       return request(endpoint, requestOptions, {
         async decode(response) {

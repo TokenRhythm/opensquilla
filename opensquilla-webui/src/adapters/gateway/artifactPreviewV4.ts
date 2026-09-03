@@ -1,12 +1,34 @@
-import { onUnmounted, ref, shallowRef } from 'vue'
-import type { ArtifactPayload } from '@/types/artifacts'
+import { ref, shallowRef } from 'vue'
+import type {
+  ArtifactPreviewController,
+  ArtifactPreviewErrorCode,
+  ArtifactPreviewOptions,
+  ArtifactPreviewState,
+} from '@/modules/artifactWorkbench'
 import {
-  artifactAccessHeaders,
   artifactAccessUrl,
   artifactThumbnailAccessUrl,
   isSameOriginArtifactUrl,
   runtimeArtifactBaseOrigin,
 } from './artifactAccessV4'
+
+interface ArtifactPreviewBinaryResponse {
+  readonly metadata: {
+    readonly contentLength?: number
+    readonly contentType?: string
+  }
+  blob(): Promise<Blob>
+  stream(): ReadableStream<Uint8Array> | null
+}
+
+interface ArtifactPreviewHttpTransport {
+  fetchExternalArtifact(endpoint: string, signal?: AbortSignal): Promise<ArtifactPreviewBinaryResponse>
+  requestBinary(endpoint: string, options?: {
+    sessionKey?: string
+    signal?: AbortSignal
+    timeoutMs?: number
+  }): Promise<ArtifactPreviewBinaryResponse>
+}
 
 /**
  * Shared preview loader for artifact thumbnails and full images.
@@ -25,30 +47,6 @@ import {
  *    full-size blob URLs are tracked in a bounded LRU and the oldest is revoked
  *    past the cap. Thumbnails are tiny and kept with the card.
  */
-
-export type ArtifactPreviewState = 'idle' | 'loading' | 'loaded' | 'timeout' | 'error'
-export type ArtifactPreviewErrorCode = 'network' | 'too_large' | 'unsupported' | null
-
-export interface ArtifactPreviewOptions {
-  /** Semantic artifact whose bytes the Gateway Adapter resolves and authenticates. */
-  artifact: () => ArtifactPayload
-  /** Session scope used by the authenticated artifact endpoint. */
-  sessionKey?: () => string | undefined
-  /** Prefer the backend-provided thumbnail when one exists. */
-  variant?: 'content' | 'thumbnail'
-  /** Full-size previews participate in the bounded LRU; thumbnails do not. */
-  fullSize?: boolean
-  /** Per-attempt timeout in ms. */
-  timeoutMs?: number
-  /** Max automatic-eligible retries (manual retry always allowed afterwards). */
-  maxRetries?: number
-  /** Maximum response bytes retained for a preview. Omit for no size cap. */
-  maxBytes?: number
-  /** Reject cross-origin URLs before any unauthenticated preview request. */
-  requireSameOrigin?: boolean
-  /** Validate response bytes before allocating an object URL. */
-  acceptBlob?: (blob: Blob) => boolean
-}
 
 const CONCURRENCY = 3
 const FULL_LRU_LIMIT = 8
@@ -107,25 +105,15 @@ function untrackFullUrl(token: string) {
 
 let tokenSeq = 0
 
-export interface ArtifactPreviewController {
-  state: ReturnType<typeof ref<ArtifactPreviewState>>
-  errorCode: ReturnType<typeof ref<ArtifactPreviewErrorCode>>
-  progress: ReturnType<typeof ref<number | null>>
-  objectUrl: ReturnType<typeof shallowRef<string>>
-  load: () => void
-  retry: () => void
-  observe: (el: Element | null) => void
-  release: () => void
-  /** Permanently dispose the controller (release + ignore further calls). */
-  dispose: () => void
-}
-
 /**
- * Lifecycle-free preview controller. A list component that owns many cards can
- * create one of these per card and dispose them itself; `useArtifactPreview`
- * wraps it with `onUnmounted` for single-instance call sites.
+ * Lifecycle-free preview controller. Its domain owner creates one per preview
+ * and disposes it explicitly when the owning UI lifecycle ends.
  */
-export function createArtifactPreview(options: ArtifactPreviewOptions): ArtifactPreviewController {
+export function createArtifactPreview(
+  http: Pick<ArtifactPreviewHttpTransport, 'fetchExternalArtifact' | 'requestBinary'>,
+  options: ArtifactPreviewOptions,
+  baseOriginSource: () => string = runtimeArtifactBaseOrigin,
+): ArtifactPreviewController {
   const state = ref<ArtifactPreviewState>('idle')
   const errorCode = ref<ArtifactPreviewErrorCode>(null)
   // null progress = indeterminate (no Content-Length); 0–100 otherwise.
@@ -165,7 +153,7 @@ export function createArtifactPreview(options: ArtifactPreviewOptions): Artifact
     if (disposed || inFlight) return
     if (state.value === 'loaded' && objectUrl.value) return
     const artifact = options.artifact()
-    const baseOrigin = runtimeArtifactBaseOrigin()
+    const baseOrigin = baseOriginSource()
     const url = options.variant === 'thumbnail'
       ? artifactThumbnailAccessUrl(artifact, baseOrigin)
       : artifactAccessUrl(artifact, baseOrigin)
@@ -197,17 +185,15 @@ export function createArtifactPreview(options: ArtifactPreviewOptions): Artifact
       if (options.requireSameOrigin && !isSame) {
         throw new ArtifactPreviewLoadError('network', 'Cross-origin preview is not allowed')
       }
-      const response = await fetch(url, {
-        method: 'GET',
-        headers: artifactAccessHeaders(url, {
-          baseOrigin,
+      const response = isSame
+        ? await http.requestBinary(url, {
           sessionKey: options.sessionKey?.(),
-        }),
-        credentials: isSame ? 'same-origin' : 'omit',
-        signal: controller.signal,
-        redirect: 'error',
-      })
-      if (!response.ok) throw new Error(`status ${response.status}`)
+          signal: controller.signal,
+          // The preview controller owns its timeout so retries and UI state
+          // stay domain-defined instead of inheriting the transport default.
+          timeoutMs: 0,
+        })
+        : await http.fetchExternalArtifact(url, controller.signal)
 
       const blob = await readBlobWithProgress(response, p => {
         if (seq === runSeq) progress.value = p
@@ -316,15 +302,6 @@ export function createArtifactPreview(options: ArtifactPreviewOptions): Artifact
 }
 
 /**
- * Single-instance wrapper: ties controller disposal to the component lifecycle.
- */
-export function useArtifactPreview(options: ArtifactPreviewOptions): ArtifactPreviewController {
-  const controller = createArtifactPreview(options)
-  onUnmounted(() => controller.dispose())
-  return controller
-}
-
-/**
  * Stream the response body so a Content-Length header yields a real percentage
  * for slow transfers; without it, progress stays indeterminate (null).
  */
@@ -336,14 +313,13 @@ class ArtifactPreviewLoadError extends Error {
 }
 
 async function readBlobWithProgress(
-  response: Response,
+  response: ArtifactPreviewBinaryResponse,
   onProgress: (percent: number | null) => void,
   maxBytes = Number.POSITIVE_INFINITY,
 ): Promise<Blob> {
-  const lengthHeader = response.headers.get('Content-Length')
-  const total = lengthHeader ? Number(lengthHeader) : 0
-  const body = response.body
-  const type = response.headers.get('Content-Type') || ''
+  const total = response.metadata.contentLength ?? 0
+  const body = response.stream()
+  const type = response.metadata.contentType || ''
   const hasKnownTotal = Number.isFinite(total) && total > 0
 
   if (hasKnownTotal && total > maxBytes) {

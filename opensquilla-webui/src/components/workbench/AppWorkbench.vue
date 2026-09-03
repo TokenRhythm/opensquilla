@@ -377,6 +377,7 @@ function onBrowserWorkbenchOpen(event: Event) {
 
 for (const definition of createArtifactWorkbenchDefinitions({
   artifactContent: artifactWorkbench.content,
+  artifactPreviews: artifactWorkbench.previews,
   artifactDocuments,
   promptAnnotations: props.promptAnnotationsEnabled ? {
     create: request => artifactPromptAnnotations.create(request),

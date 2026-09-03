@@ -130,6 +130,12 @@ export function createGatewayAdapters(
 ): GatewayAdapters {
   const transports = createPrivateGatewayTransports(source)
   const http: HttpTransport = options.http ?? {
+    clearPreviewOrigin: async () => {
+      throw new Error('Gateway HTTP transport is unavailable.')
+    },
+    fetchExternalArtifact: async () => {
+      throw new Error('Gateway HTTP transport is unavailable.')
+    },
     requestJson: async () => {
       throw new Error('Gateway HTTP transport is unavailable.')
     },

@@ -1,63 +1,35 @@
-import type { NativeWorkbenchApi, PlatformId } from '@/platform/types'
+import type { PlatformId } from '@/platform/types'
+import {
+  ArtifactPreviewLeaseError,
+  type ArtifactPreviewLease,
+  type ArtifactPreviewLeaseRenewal,
+  type ArtifactPreviewLeaseRequest,
+  type ArtifactPreviewLeaseSource,
+  type ArtifactPreviewMode,
+} from '@/modules/artifactWorkbench'
 import type { ArtifactPayload } from '@/types/artifacts'
 import {
-  artifactAccessHeaders,
-  runtimeArtifactAuthToken,
-} from './artifactAccessV4'
+  HttpTransportError,
+} from './privateHttpTransport'
 
-export type ArtifactPreviewMode = 'full' | 'offline'
-export type ArtifactPreviewCollectionStatus = 'complete' | 'partial' | 'not_applicable'
-
-export interface ArtifactPreviewLeaseSource {
-  kind: 'bundle' | 'single_file'
-  collection_status: ArtifactPreviewCollectionStatus
-  file_count: number
-  total_bytes: number
-  warning_codes: string[]
+interface ArtifactPreviewLeaseHttpTransport {
+  requestJson<T>(endpoint: string, options: {
+    method: 'POST'
+    json?: unknown
+    sessionKey?: string
+    timeoutMs?: number
+  }): Promise<T>
+  requestBlob(endpoint: string, options: {
+    keepalive: true
+    method: 'DELETE'
+    sessionKey?: string
+    timeoutMs?: number
+  }): Promise<Blob>
 }
 
-export interface ArtifactPreviewLease {
-  version: 1
-  lease_id: string
-  effective_mode: ArtifactPreviewMode
-  launch_url: string
-  entrypoint: string
-  expires_at: string
-  preview_origin: string | null
-  idle_timeout_seconds: number
-  source: ArtifactPreviewLeaseSource
-}
-
-export interface ArtifactPreviewLeaseRenewal {
-  version: 1
-  lease_id: string
-  expires_at: string
-}
-
-export type ArtifactPreviewNativeBroker = Pick<
-  NativeWorkbenchApi,
-  | 'createArtifactPreviewLease'
-  | 'renewArtifactPreviewLease'
-  | 'revokeArtifactPreviewLease'
->
-
-export interface ArtifactPreviewLeaseContext {
+interface ArtifactPreviewLeaseContext extends ArtifactPreviewLeaseRequest {
   authToken?: string
   baseOrigin: string
-  fetchImpl?: typeof fetch
-  nativeBroker?: ArtifactPreviewNativeBroker
-  sessionKey?: string
-}
-
-export class ArtifactPreviewLeaseError extends Error {
-  constructor(
-    message: string,
-    readonly status: number,
-    readonly code = '',
-  ) {
-    super(message)
-    this.name = 'ArtifactPreviewLeaseError'
-  }
 }
 
 export function artifactPreviewId(artifact: ArtifactPayload): string {
@@ -80,29 +52,13 @@ function normalizedBaseOrigin(baseOrigin: string): string {
   return new URL(baseOrigin || fallback).origin
 }
 
-function fetcher(context: ArtifactPreviewLeaseContext): typeof fetch {
-  if (context.fetchImpl) return context.fetchImpl
-  if (typeof fetch !== 'function') {
-    throw new ArtifactPreviewLeaseError('Preview leases are unavailable.', 0)
-  }
-  return fetch.bind(globalThis)
-}
-
-function controlHeaders(
-  url: string,
-  context: ArtifactPreviewLeaseContext,
-  includeJson = false,
-): Record<string, string> {
-  return {
-    ...artifactAccessHeaders(url, context),
-    ...(includeJson ? { 'Content-Type': 'application/json' } : {}),
-  }
-}
-
 function resolvedAuthToken(context: ArtifactPreviewLeaseContext): string {
-  return context.authToken === undefined
-    ? runtimeArtifactAuthToken()
-    : context.authToken
+  if (context.authToken !== undefined) return context.authToken
+  try {
+    return globalThis.sessionStorage?.getItem('opensquilla.wsToken')?.trim() || ''
+  } catch {
+    return ''
+  }
 }
 
 function previewLeaseUrl(
@@ -131,24 +87,33 @@ function leaseControlUrl(
   ).toString()
 }
 
-async function responseError(response: Response): Promise<ArtifactPreviewLeaseError> {
+function transportError(error: HttpTransportError): ArtifactPreviewLeaseError {
   let code = ''
-  let message = `Artifact preview request failed (${response.status}).`
-  try {
-    const payload = await response.json() as {
+  const status = typeof error.status === 'number' ? error.status : 0
+  let message = status > 0
+    ? `Artifact preview request failed (${status}).`
+    : 'Artifact preview request failed.'
+  const payload = error.payload
+  if (payload && typeof payload === 'object') {
+    const raw = payload as {
       code?: unknown
       detail?: unknown
       error?: unknown
       message?: unknown
     }
-    if (typeof payload.code === 'string') code = payload.code
-    const detail = typeof payload.detail === 'string'
-      ? payload.detail
-      : typeof payload.message === 'string' ? payload.message : ''
-    const error = typeof payload.error === 'string' ? payload.error : ''
-    if (detail || error) message = detail || error
-  } catch {}
-  return new ArtifactPreviewLeaseError(message, response.status, code)
+    if (typeof raw.code === 'string') code = raw.code
+    const detail = typeof raw.detail === 'string'
+      ? raw.detail
+      : typeof raw.message === 'string' ? raw.message : ''
+    const payloadError = typeof raw.error === 'string' ? raw.error : ''
+    if (detail || payloadError) message = detail || payloadError
+  }
+  return new ArtifactPreviewLeaseError(message, status, code)
+}
+
+function translateTransportError(error: unknown): never {
+  if (error instanceof HttpTransportError) throw transportError(error)
+  throw error
 }
 
 function stringField(raw: Record<string, unknown>, key: string): string {
@@ -280,6 +245,7 @@ function desktopBrokerUnavailable(): ArtifactPreviewLeaseError {
 }
 
 export async function createArtifactPreviewLease(
+  http: Pick<ArtifactPreviewLeaseHttpTransport, 'requestJson'>,
   artifact: ArtifactPayload,
   mode: ArtifactPreviewMode,
   client: PlatformId,
@@ -309,17 +275,21 @@ export async function createArtifactPreviewLease(
     return parseArtifactPreviewLease(result.payload, context.baseOrigin)
   }
   const url = previewLeaseUrl(artifact, context)
-  const response = await fetcher(context)(url, {
-    method: 'POST',
-    credentials: 'same-origin',
-    headers: controlHeaders(url, context, true),
-    body: JSON.stringify({ version: 1, mode, client }),
-  })
-  if (!response.ok) throw await responseError(response)
-  return parseArtifactPreviewLease(await response.json(), context.baseOrigin)
+  try {
+    const payload = await http.requestJson<unknown>(url, {
+      method: 'POST',
+      json: { version: 1, mode, client },
+      sessionKey: context.sessionKey,
+      timeoutMs: 0,
+    })
+    return parseArtifactPreviewLease(payload, context.baseOrigin)
+  } catch (error) {
+    translateTransportError(error)
+  }
 }
 
 export async function renewArtifactPreviewLease(
+  http: Pick<ArtifactPreviewLeaseHttpTransport, 'requestJson'>,
   leaseId: string,
   context: ArtifactPreviewLeaseContext,
 ): Promise<ArtifactPreviewLeaseRenewal> {
@@ -342,16 +312,20 @@ export async function renewArtifactPreviewLease(
     return parseArtifactPreviewLeaseRenewal(result.payload)
   }
   const url = leaseControlUrl(leaseId, context, '/renew')
-  const response = await fetcher(context)(url, {
-    method: 'POST',
-    credentials: 'same-origin',
-    headers: controlHeaders(url, context),
-  })
-  if (!response.ok) throw await responseError(response)
-  return parseArtifactPreviewLeaseRenewal(await response.json())
+  try {
+    const payload = await http.requestJson<unknown>(url, {
+      method: 'POST',
+      sessionKey: context.sessionKey,
+      timeoutMs: 0,
+    })
+    return parseArtifactPreviewLeaseRenewal(payload)
+  } catch (error) {
+    translateTransportError(error)
+  }
 }
 
 export async function revokeArtifactPreviewLease(
+  http: Pick<ArtifactPreviewLeaseHttpTransport, 'requestBlob'>,
   leaseId: string,
   context: ArtifactPreviewLeaseContext,
 ): Promise<void> {
@@ -376,13 +350,19 @@ export async function revokeArtifactPreviewLease(
     return
   }
   const url = leaseControlUrl(leaseId, context)
-  const response = await fetcher(context)(url, {
-    method: 'DELETE',
-    credentials: 'same-origin',
-    headers: controlHeaders(url, context),
-    keepalive: true,
-  })
-  if (!response.ok && response.status !== 404 && response.status !== 410) {
-    throw await responseError(response)
+  try {
+    await http.requestBlob(url, {
+      keepalive: true,
+      method: 'DELETE',
+      sessionKey: context.sessionKey,
+      timeoutMs: 0,
+    })
+  } catch (error) {
+    if (
+      error instanceof HttpTransportError
+      && error.kind === 'http-status'
+      && (error.status === 404 || error.status === 410)
+    ) return
+    translateTransportError(error)
   }
 }

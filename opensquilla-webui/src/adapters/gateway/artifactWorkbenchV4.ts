@@ -15,7 +15,12 @@ import { createV4ArtifactPromptAnnotations } from './artifactPromptAnnotationsV4
 import { createV4WorkbenchResources } from './workbenchResourcesV4'
 import { createV4ArtifactContentAccess } from './artifactAccessV4'
 import { createV4AttachmentContentAccess } from './attachmentAccessV4'
+import { createV4ArtifactPreviews } from './artifactPreviewsV4'
 import { documentChangeEventContract } from './artifactWorkbenchContracts'
+
+type ArtifactWorkbenchHttpTransport = Parameters<typeof createV4ArtifactContentAccess>[0]
+  & Parameters<typeof createV4AttachmentContentAccess>[0]
+  & Parameters<typeof createV4ArtifactPreviews>[0]
 
 interface RpcTransport {
   request<T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions): Promise<T>
@@ -33,13 +38,6 @@ interface TransportSubscription {
 
 interface EventTransport {
   subscribe(event: string, handler: (payload: unknown) => void): TransportSubscription
-}
-
-interface AttachmentUploadClient {
-  requestJson<T>(endpoint: string, options: {
-    method: 'POST'
-    form: FormData
-  }): Promise<T>
 }
 
 const MAX_ARTIFACT_PAGE_LIMIT = 200
@@ -176,7 +174,7 @@ function documentChange(value: unknown): (ArtifactDocumentChange & { sequence: n
 export function createV4ArtifactWorkbench(
   rpc: RpcTransport,
   events: EventTransport,
-  http: AttachmentUploadClient,
+  http: ArtifactWorkbenchHttpTransport,
 ): ArtifactWorkbench {
   const listeners = new Set<(change: ArtifactDocumentChange) => void>()
   const seenSequences = new Map<string, number>()
@@ -204,7 +202,7 @@ export function createV4ArtifactWorkbench(
     seenSequences.clear()
   }
 
-  const artifactContent = createV4ArtifactContentAccess()
+  const artifactContent = createV4ArtifactContentAccess(http)
   const attachmentContent = createV4AttachmentContentAccess(http)
   return {
     artifacts: createV4ArtifactCatalog(rpc),
@@ -212,6 +210,7 @@ export function createV4ArtifactWorkbench(
     resources: createV4WorkbenchResources(rpc),
     promptAnnotations: createV4ArtifactPromptAnnotations(rpc),
     content: { ...artifactContent, ...attachmentContent },
+    previews: createV4ArtifactPreviews(http),
     ready: () => rpc.ready(),
     subscribeDocumentChanges(listener): ArtifactWorkbenchSubscription {
       listeners.add(listener)

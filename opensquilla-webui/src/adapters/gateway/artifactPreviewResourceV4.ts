@@ -1,92 +1,56 @@
-import { onUnmounted, ref, shallowRef } from 'vue'
-import type { Ref, ShallowRef } from 'vue'
+import { ref, shallowRef } from 'vue'
+import type {
+  ArtifactPreviewResourceController,
+  ArtifactPreviewResourceErrorCode,
+  ArtifactPreviewResourceOptions,
+  ArtifactPreviewResourceState,
+} from '@/modules/artifactWorkbench'
 import type { ArtifactPayload } from '@/types/artifacts'
 import { artifactExtension, artifactName } from '@/utils/chat/artifacts'
 import {
-  artifactAccessHeaders,
   artifactAccessUrl,
   isTrustedArtifactTransportUrl,
   runtimeArtifactBaseOrigin,
 } from './artifactAccessV4'
 import {
+  HttpTransportError,
+} from './privateHttpTransport'
+import {
+  type ArtifactWorkbenchPreviewKind,
   artifactPreviewLimit,
   artifactWorkbenchPreviewKind,
   buildOfflineArtifactHtml,
   detectArtifactHtmlRelativeResources,
   renderArtifactMarkdown,
   responseMatchesArtifactPreviewKind,
-  type ArtifactWorkbenchPreviewKind,
 } from '@/utils/workbench/artifactPreview'
-
-export type ArtifactPreviewResourceState =
-  | 'crashed'
-  | 'error'
-  | 'idle'
-  | 'loading'
-  | 'missing-resource'
-  | 'offline'
-  | 'ready'
-  | 'ready-with-warnings'
-  | 'suspended'
-  | 'unsupported'
-
-export type ArtifactPreviewErrorCode =
-  | 'download-failed'
-  | 'integrity-error'
-  | 'invalid-content'
-  | 'missing-url'
-  | 'native-error'
-  | 'native-crashed'
-  | 'offline'
-  | 'preview-blocked'
-  | 'too-large'
-  | 'unsupported'
-
-export interface NativeHtmlArtifactResource {
-  artifact: ArtifactPayload
-  data: ArrayBuffer
-  hasRelativeResources: boolean
-  mime: string
-  relativeResourceCount: number
-  sessionKey: string
-}
-
-export interface ArtifactPreviewResourceOptions {
-  artifact: () => ArtifactPayload
-  authToken?: () => string
-  baseOrigin?: () => string
-  createObjectUrl?: (blob: Blob) => string
-  fetchImpl?: typeof fetch
-  htmlCollectionStatus?: () => 'complete' | 'partial' | 'not_applicable'
-  htmlLaunchUrl?: () => string
-  htmlLeaseState?: () => 'ready' | 'pending' | 'blocked'
-  nativeHtml?: () => boolean
-  onNativeHtmlReady?: (resource: NativeHtmlArtifactResource) => void
-  revokeObjectUrl?: (url: string) => void
-  sessionKey?: () => string
-}
-
-export interface ArtifactPreviewResourceController {
-  errorCode: Ref<ArtifactPreviewErrorCode | null>
-  kind: Ref<ArtifactWorkbenchPreviewKind>
-  markdownHtml: ShallowRef<string>
-  objectUrl: ShallowRef<string>
-  progress: Ref<number | null>
-  relativeResources: ShallowRef<string[]>
-  state: Ref<ArtifactPreviewResourceState>
-  text: ShallowRef<string>
-  dispose: () => void
-  load: () => Promise<void>
-  markNativeCrashed: () => void
-  markNativeError: () => void
-  reload: () => Promise<void>
-  resume: () => Promise<void>
-  suspend: () => void
-}
 
 class ArtifactPreviewTooLargeError extends Error {}
 class ArtifactPreviewInvalidContentError extends Error {}
 class ArtifactPreviewIntegrityError extends Error {}
+
+interface ArtifactPreviewResourceBinaryResponse {
+  readonly metadata: {
+    readonly contentLength?: number
+    readonly contentType?: string
+    readonly status: number
+  }
+  blob(): Promise<Blob>
+  stream(): ReadableStream<Uint8Array> | null
+}
+
+interface ArtifactPreviewResourceHttpTransport {
+  requestBinary(endpoint: string, options?: {
+    sessionKey?: string
+    signal?: AbortSignal
+    timeoutMs?: number
+  }): Promise<ArtifactPreviewResourceBinaryResponse>
+}
+
+interface ArtifactPreviewResourceAdapterOptions extends ArtifactPreviewResourceOptions {
+  /** Adapter-only endpoint origin; domain consumers receive a bound capability. */
+  baseOrigin?: () => string
+}
 
 const INLINE_WORKBENCH_ATTACHMENT_URL_PATTERN =
   /^data:([a-z0-9][a-z0-9.+-]*\/[a-z0-9][a-z0-9.+-]*(?:;charset=[^;,]+)?);base64,([a-z0-9+/=]*)$/i
@@ -115,7 +79,10 @@ function isInlineWorkbenchAttachmentUrl(artifact: ArtifactPayload, url: string):
   return INLINE_WORKBENCH_ATTACHMENT_URL_PATTERN.test(url)
 }
 
-function inlineWorkbenchAttachmentResponse(url: string, limit: number): Response {
+function inlineWorkbenchAttachmentResponse(
+  url: string,
+  limit: number,
+): ArtifactPreviewResourceBinaryResponse {
   const match = url.match(INLINE_WORKBENCH_ATTACHMENT_URL_PATTERN)
   if (!match) throw new ArtifactPreviewInvalidContentError()
 
@@ -139,13 +106,16 @@ function inlineWorkbenchAttachmentResponse(url: string, limit: number): Response
   for (let index = 0; index < decoded.length; index += 1) {
     bytes[index] = decoded.charCodeAt(index)
   }
-  return new Response(bytesToArrayBuffer(bytes), {
-    status: 200,
-    headers: {
-      'Content-Length': String(bytes.byteLength),
-      'Content-Type': contentType,
+  const blob = new Blob([bytesToArrayBuffer(bytes)], { type: contentType })
+  return {
+    metadata: {
+      status: 200,
+      contentLength: bytes.byteLength,
+      contentType,
     },
-  })
+    blob: async () => blob,
+    stream: () => blob.stream(),
+  }
 }
 
 async function verifyInlineWorkbenchAttachmentIntegrity(
@@ -184,42 +154,29 @@ function defaultRevokeObjectUrl(url: string) {
 }
 
 function isAbortError(error: unknown): boolean {
-  return !!error && typeof error === 'object' && 'name' in error && error.name === 'AbortError'
+  return error instanceof HttpTransportError
+    ? error.kind === 'aborted'
+    : !!error && typeof error === 'object' && 'name' in error && error.name === 'AbortError'
 }
 
 function isOfflineError(error: unknown): boolean {
   if (typeof navigator !== 'undefined' && navigator.onLine === false) return true
+  if (error instanceof HttpTransportError) return error.kind === 'network'
   return error instanceof TypeError && /fetch|network|offline/i.test(error.message)
 }
 
-function contentLength(response: Response): number | null {
-  const raw = response.headers.get('Content-Length')
-  if (!raw) return null
-  const value = Number(raw)
+function contentLength(response: ArtifactPreviewResourceBinaryResponse): number | null {
+  const value = response.metadata.contentLength
+  if (value === undefined) return null
   return Number.isFinite(value) && value >= 0 ? value : null
 }
 
-async function cancelResponseBody(response: Response) {
-  try { await response.body?.cancel() } catch {}
-}
-
-async function responseErrorCode(response: Response): Promise<string> {
-  if (response.status !== 409) {
-    await cancelResponseBody(response)
-    return ''
-  }
-  try {
-    const payload: unknown = await response.json()
-    if (!payload || typeof payload !== 'object' || !('code' in payload)) return ''
-    const code = (payload as { code?: unknown }).code
-    return typeof code === 'string' ? code : ''
-  } catch {
-    return ''
-  }
+async function cancelResponseBody(response: ArtifactPreviewResourceBinaryResponse) {
+  try { await response.stream()?.cancel() } catch {}
 }
 
 async function readResponseBytes(
-  response: Response,
+  response: ArtifactPreviewResourceBinaryResponse,
   limit: number,
   signal: AbortSignal,
   onProgress: (progress: number | null) => void,
@@ -230,12 +187,13 @@ async function readResponseBytes(
     throw new ArtifactPreviewTooLargeError()
   }
 
-  const body = response.body
+  const body = response.stream()
   if (!body) {
     onProgress(null)
-    const bytes = new Uint8Array(await response.arrayBuffer())
-    if (bytes.byteLength > limit) throw new ArtifactPreviewTooLargeError()
-    return bytes
+    const blob = await response.blob()
+    if (signal.aborted) throw new DOMException('Aborted', 'AbortError')
+    if (blob.size > limit) throw new ArtifactPreviewTooLargeError()
+    return new Uint8Array(await blob.arrayBuffer())
   }
 
   const reader = body.getReader()
@@ -280,11 +238,12 @@ function bytesToArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 }
 
 export function createArtifactPreviewResource(
-  options: ArtifactPreviewResourceOptions,
+  http: Pick<ArtifactPreviewResourceHttpTransport, 'requestBinary'>,
+  options: ArtifactPreviewResourceAdapterOptions,
 ): ArtifactPreviewResourceController {
   const state = ref<ArtifactPreviewResourceState>('idle')
   const kind = ref<ArtifactWorkbenchPreviewKind>('unsupported')
-  const errorCode = ref<ArtifactPreviewErrorCode | null>(null)
+  const errorCode = ref<ArtifactPreviewResourceErrorCode | null>(null)
   const progress = ref<number | null>(null)
   const objectUrl = shallowRef('')
   const text = shallowRef('')
@@ -328,7 +287,7 @@ export function createArtifactPreviewResource(
 
   function setFailure(
     nextState: Extract<ArtifactPreviewResourceState, 'error' | 'offline' | 'unsupported'>,
-    code: ArtifactPreviewErrorCode,
+    code: ArtifactPreviewResourceErrorCode,
   ) {
     state.value = nextState
     errorCode.value = code
@@ -399,44 +358,21 @@ export function createArtifactPreviewResource(
     state.value = 'loading'
 
     try {
-      let response: Response
+      let response: ArtifactPreviewResourceBinaryResponse
       if (inlineAttachment) {
         response = inlineWorkbenchAttachmentResponse(url, limit)
       } else {
-        const fetchImpl = options.fetchImpl
-          || (typeof fetch !== 'undefined' ? fetch.bind(globalThis) : null)
-        if (!fetchImpl) {
-          setFailure('error', 'download-failed')
-          return
-        }
-        const authToken = options.authToken?.()
-        response = await fetchImpl(url, {
-          method: 'GET',
-          credentials: 'same-origin',
-          headers: artifactAccessHeaders(url, {
-            baseOrigin,
-            sessionKey: options.sessionKey?.() || '',
-            ...(authToken === undefined ? {} : { authToken }),
-          }),
-          redirect: 'error',
+        response = await http.requestBinary(url, {
+          sessionKey: options.sessionKey?.() || '',
           signal: controller.signal,
+          timeoutMs: 0,
         })
       }
       if (disposed || suspended || run !== generation) {
         await cancelResponseBody(response)
         return
       }
-      if (!response.ok) {
-        const code = await responseErrorCode(response)
-        if (disposed || suspended || run !== generation) return
-        setFailure(
-          'error',
-          code === 'INTEGRITY_ERROR' ? 'integrity-error' : 'download-failed',
-        )
-        return
-      }
-
-      const responseMime = response.headers.get('Content-Type') || ''
+      const responseMime = response.metadata.contentType || ''
       if (!responseMatchesArtifactPreviewKind(nextKind, responseMime)) {
         await cancelResponseBody(response)
         if (disposed || suspended || run !== generation) return
@@ -518,6 +454,16 @@ export function createArtifactPreviewResource(
       } else if (error instanceof ArtifactPreviewInvalidContentError) {
         setFailure('error', 'invalid-content')
       } else if (error instanceof ArtifactPreviewIntegrityError) {
+        setFailure('error', 'integrity-error')
+      } else if (
+        error instanceof HttpTransportError
+        && error.kind === 'http-status'
+        && error.status === 409
+        && error.payload
+        && typeof error.payload === 'object'
+        && 'code' in error.payload
+        && (error.payload as { code?: unknown }).code === 'INTEGRITY_ERROR'
+      ) {
         setFailure('error', 'integrity-error')
       } else if (isOfflineError(error)) {
         setFailure('offline', 'offline')
@@ -604,12 +550,4 @@ export function createArtifactPreviewResource(
     resume,
     suspend,
   }
-}
-
-export function useArtifactPreviewResource(
-  options: ArtifactPreviewResourceOptions,
-): ArtifactPreviewResourceController {
-  const controller = createArtifactPreviewResource(options)
-  onUnmounted(() => controller.dispose())
-  return controller
 }

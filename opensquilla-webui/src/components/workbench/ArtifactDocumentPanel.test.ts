@@ -1,11 +1,14 @@
 // @vitest-environment happy-dom
 
-import { createApp, h, nextTick, ref } from 'vue'
+import { createApp, h, nextTick, ref, type App } from 'vue'
 import { createI18n } from 'vue-i18n'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createPinia } from 'pinia'
 
 import en from '@/locales/en.json'
+import { createV4ArtifactPreviews } from '@/adapters/gateway/artifactPreviewsV4'
+import { ARTIFACT_WORKBENCH_KEY, type ArtifactWorkbench } from '@/modules/artifactWorkbench'
+import { httpTransportTestDouble } from '@/testing/httpTransport.test-helper'
 import type { ArtifactDocumentWorkspaceSnapshot } from '@/types/artifactDocuments'
 import type { ArtifactPayload } from '@/types/artifacts'
 import { createLegacyArtifactWorkspace } from '@/workbench/artifactDocumentProvider'
@@ -35,6 +38,14 @@ function snapshot(artifact = officeArtifact): ArtifactDocumentWorkspaceSnapshot 
   }
 }
 
+function provideArtifactWorkbench(app: App): void {
+  app.provide(ARTIFACT_WORKBENCH_KEY, {
+    previews: createV4ArtifactPreviews(httpTransportTestDouble(), {
+      baseOrigin: () => 'http://localhost',
+    }),
+  } as ArtifactWorkbench)
+}
+
 function mountPanel(props: Record<string, unknown>) {
   const element = document.createElement('div')
   document.body.append(element)
@@ -45,6 +56,7 @@ function mountPanel(props: Record<string, unknown>) {
     messages: { en },
   }))
   app.use(createPinia())
+  provideArtifactWorkbench(app)
   app.mount(element)
   return {
     element,
@@ -185,6 +197,7 @@ describe('ArtifactDocumentPanel', () => {
     })
     app.use(createI18n({ legacy: false, locale: 'en', messages: { en } }))
     app.use(createPinia())
+    provideArtifactWorkbench(app)
     app.mount(element)
     await nextTick()
 

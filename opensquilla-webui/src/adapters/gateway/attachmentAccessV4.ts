@@ -4,24 +4,37 @@ import type {
   ArtifactContentAccess,
   AttachmentUploadReceipt,
 } from '@/modules/artifactWorkbench'
-import { filenameFromContentDisposition } from '@/utils/browser'
+import {
+  HttpTransportError,
+} from './privateHttpTransport'
 
-interface AttachmentUploadClient {
+interface AttachmentBinaryResponse {
+  readonly metadata: {
+    readonly filename?: string
+    readonly status: number
+  }
+  blob(): Promise<Blob>
+}
+
+interface AttachmentHttpTransport {
+  requestBinary(endpoint: string, options?: {
+    sessionKey?: string
+    signal?: AbortSignal
+    timeoutMs?: number
+  }): Promise<AttachmentBinaryResponse>
   requestJson<T>(endpoint: string, options: {
     method: 'POST'
     form: FormData
   }): Promise<T>
 }
 
-export interface AttachmentDownloadOptions {
+interface AttachmentDownloadOptions {
   baseOrigin?: string
   sessionKey?: string
-  authToken?: string
-  fetchImpl?: typeof fetch
   signal?: AbortSignal
 }
 
-export type AttachmentDownloadResult =
+type AttachmentDownloadResult =
   | {
       ok: true
       status: number
@@ -73,7 +86,9 @@ function safeFilename(value: unknown): string {
 }
 
 function isAbortError(error: unknown): boolean {
-  return !!error && typeof error === 'object' && 'name' in error && error.name === 'AbortError'
+  return error instanceof HttpTransportError
+    ? error.kind === 'aborted'
+    : !!error && typeof error === 'object' && 'name' in error && error.name === 'AbortError'
 }
 
 function base64Bytes(value: string): Uint8Array | null {
@@ -89,14 +104,8 @@ function base64Bytes(value: string): Uint8Array | null {
   }
 }
 
-export function attachmentAccessHeaders(options: AttachmentDownloadOptions = {}): Record<string, string> {
-  const headers: Record<string, string> = {}
-  if (options.sessionKey) headers['x-opensquilla-session-key'] = options.sessionKey
-  if (options.authToken) headers.Authorization = `Bearer ${options.authToken}`
-  return headers
-}
-
 export async function fetchDisplayAttachmentBlob(
+  http: Pick<AttachmentHttpTransport, 'requestBinary'>,
   attachment: DisplayAttachment,
   options: AttachmentDownloadOptions = {},
 ): Promise<AttachmentDownloadResult> {
@@ -144,39 +153,40 @@ export async function fetchDisplayAttachmentBlob(
     }
   }
 
-  const fetchImpl = options.fetchImpl || (typeof fetch !== 'undefined' ? fetch.bind(globalThis) : null)
-  if (!fetchImpl) {
-    return { ok: false, status: 0, source: 'staged', url, message: 'Attachment download is unavailable.' }
-  }
   try {
-    const response = await fetchImpl(url, {
-      method: 'GET',
-      headers: attachmentAccessHeaders(options),
-      credentials: 'same-origin',
-      redirect: 'error',
+    const response = await http.requestBinary(url, {
+      sessionKey: options.sessionKey,
       signal: options.signal,
+      timeoutMs: 0,
     })
-    if (!response.ok) {
-      return {
-        ok: false,
-        status: response.status,
-        source: 'staged',
-        url,
-        message: `Attachment download failed (HTTP ${response.status}).`,
-      }
-    }
     return {
       ok: true,
-      status: response.status,
+      status: response.metadata.status,
       source: 'staged',
       url,
       blob: await response.blob(),
-      filename: safeFilename(
-        filenameFromContentDisposition(response.headers.get('content-disposition')) || filename,
-      ),
+      filename: safeFilename(response.metadata.filename || filename),
     }
   } catch (error) {
-    if (isAbortError(error)) throw error
+    if (isAbortError(error)) {
+      if (error instanceof HttpTransportError) {
+        throw new DOMException('Aborted', 'AbortError')
+      }
+      throw error
+    }
+    if (
+      error instanceof HttpTransportError
+      && error.kind === 'http-status'
+      && typeof error.status === 'number'
+    ) {
+      return {
+        ok: false,
+        status: error.status,
+        source: 'staged',
+        url,
+        message: `Attachment download failed (HTTP ${error.status}).`,
+      }
+    }
     return { ok: false, status: 0, source: 'staged', url, message: 'Attachment download failed.' }
   }
 }
@@ -200,12 +210,7 @@ function uploadResponseMeta(value: unknown): AttachmentUploadReceipt {
 }
 
 function runtimeOptions(request: ArtifactAccessRequest = {}): AttachmentDownloadOptions {
-  let authToken = ''
-  try {
-    authToken = globalThis.sessionStorage?.getItem('opensquilla.wsToken')?.trim() || ''
-  } catch {}
   return {
-    authToken,
     baseOrigin: typeof window !== 'undefined' && window.location?.origin
       ? window.location.origin
       : DEFAULT_BASE_ORIGIN,
@@ -214,13 +219,13 @@ function runtimeOptions(request: ArtifactAccessRequest = {}): AttachmentDownload
   }
 }
 
-export function createV4AttachmentContentAccess(http: AttachmentUploadClient): Pick<
+export function createV4AttachmentContentAccess(http: AttachmentHttpTransport): Pick<
   ArtifactContentAccess,
   'fetchAttachment' | 'uploadAttachment'
 > {
   return {
     fetchAttachment: (attachment, request) => (
-      fetchDisplayAttachmentBlob(attachment, runtimeOptions(request))
+      fetchDisplayAttachmentBlob(http, attachment, runtimeOptions(request))
     ),
     async uploadAttachment(file, mime) {
       const form = new FormData()

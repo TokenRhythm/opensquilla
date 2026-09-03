@@ -153,7 +153,7 @@ describe('transport architecture hard-zero integration', () => {
     })
   })
 
-  it('keeps HTTP boundary hard-zero while retaining Adapter and static-asset exemptions', () => {
+  it('keeps HTTP boundary hard-zero outside the private transport and static assets', () => {
     const root = fixture({
       'src/platform/staticAssets.ts': `
         export async function readStaticJson(path: string) {
@@ -172,15 +172,24 @@ describe('transport architecture hard-zero integration', () => {
           return await fetch(path)
         }
       `,
+      'src/adapters/gateway/privateHttpTransport.ts': `
+        export async function request(path: string) {
+          return await fetch(path)
+        }
+      `,
     })
     const result = evaluateRpcArchitectureGate({ root })
 
     expect(result.failures).toContain(
       'src/composables/copiedAssetReader.ts: unexpected raw transport httpRequest (1); add a domain Adapter instead.',
     )
+    expect(result.failures).toContain(
+      'src/adapters/gateway/legacyHttpV4.ts: unexpected raw transport httpRequest (1); add a domain Adapter instead.',
+    )
     expect(result.failures.some(failure => failure.includes('src/platform/staticAssets.ts'))).toBe(false)
-    expect(result.failures.some(failure => failure.includes('src/adapters/gateway/legacyHttpV4.ts')))
+    expect(result.failures.some(failure => failure.includes('src/adapters/gateway/privateHttpTransport.ts')))
       .toBe(false)
+    expect(result).toMatchObject({ httpTotal: 4, total: 4 })
   })
 
   it('rejects an Adapter that bypasses the private transport composition', () => {
