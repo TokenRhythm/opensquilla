@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, NotRequired, Protocol, TypedDict
+from typing import NotRequired, Protocol, TypedDict
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,9 +23,46 @@ class CronRunQuery:
     limit: int = 20
 
 
+class CronJobMutationValues(TypedDict, total=False):
+    """Explicit cron mutation fields after Gateway alias validation."""
+
+    name: str
+    schedule: Mapping[str, object]
+    expression: str
+    tz: str
+    timezone: str
+    text: str
+    prompt: str
+    message: str
+    payloadKind: str
+    agentId: str
+    workspaceId: str
+    workspace_id: str
+    templateId: str
+    template_id: str
+    sessionTarget: str
+    targetSessionKey: str
+    target_session_key: str
+    originSessionKey: str
+    sessionKey: str
+    session_key: str
+    delivery: Mapping[str, object]
+    enabled: bool
+    timeout: int | float
+    wakeMode: str
+    wake_mode: str
+    toolPolicy: Mapping[str, object]
+    tool_policy: Mapping[str, object]
+    jitterSeconds: int | float
+    staggerSeconds: int | float
+    exact: bool
+    idempotencyKey: str
+    idempotency_key: str
+
+
 @dataclass(frozen=True, slots=True)
 class CronJobMutation:
-    values: Mapping[str, Any]
+    values: CronJobMutationValues
     job_id: str | None = None
 
 
@@ -115,9 +152,7 @@ class CronScheduler:
     async def list_runs(self, query: CronRunQuery) -> Sequence[CronRunProjection]:
         if query.limit < 1:
             raise ValueError("limit must be positive")
-        return await self._port.list_runs(
-            CronRunQuery(self._job_id(query.job_id), query.limit)
-        )
+        return await self._port.list_runs(CronRunQuery(self._job_id(query.job_id), query.limit))
 
     @staticmethod
     def _job_id(value: str | None) -> str:
@@ -150,6 +185,7 @@ class CronSubscriptions:
 
 __all__ = [
     "CronJobMutation",
+    "CronJobMutationValues",
     "CronJobTarget",
     "CronListQuery",
     "CronRunQuery",

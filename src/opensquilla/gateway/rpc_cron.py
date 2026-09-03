@@ -10,6 +10,7 @@ import structlog
 from opensquilla.application.cron_scheduler import (
     CronJobIdentityResult,
     CronJobMutation,
+    CronJobMutationValues,
     CronJobProjection,
     CronJobTarget,
     CronListQuery,
@@ -114,11 +115,7 @@ def _job_to_wire(j: Any) -> dict[str, Any]:
         else str(schedule_kind_value)
     )
     last_run = d.get("last_run_at")
-    last_status = (
-        "error"
-        if d.get("last_error")
-        else ("ok" if last_run is not None else None)
-    )
+    last_status = "error" if d.get("last_error") else ("ok" if last_run is not None else None)
     return {  # noqa: PIE810 — wire schema favors flat literal dict
         "id": d.get("id"),
         "name": d.get("name", ""),
@@ -193,9 +190,7 @@ async def _apply_workspace_binding(
     payload["_workspace_name"] = validated.workspace.display_name
 
 
-_WORKSPACE_REQUIRED_TEMPLATE_IDS = frozenset(
-    {"weekly-report", "project-risk", "knowledge-review"}
-)
+_WORKSPACE_REQUIRED_TEMPLATE_IDS = frozenset({"weekly-report", "project-risk", "knowledge-review"})
 
 
 def _apply_template_contract(params: dict[str, Any], payload: dict[str, Any]) -> None:
@@ -218,9 +213,7 @@ def _idempotency_key_from_params(params: dict[str, Any]) -> str:
     if not key:
         raise ValueError("idempotencyKey must not be empty")
     if len(key) > _MAX_IDEMPOTENCY_KEY_LENGTH:
-        raise ValueError(
-            f"idempotencyKey must be at most {_MAX_IDEMPOTENCY_KEY_LENGTH} characters"
-        )
+        raise ValueError(f"idempotencyKey must be at most {_MAX_IDEMPOTENCY_KEY_LENGTH} characters")
     return key
 
 
@@ -258,9 +251,7 @@ def _delivery_to_wire(delivery: Any) -> dict[str, Any]:
             "threadId": delivery.get("thread_id", ""),
             "webhookUrl": delivery.get("webhook_url", "") or "",
             "bestEffort": bool(delivery.get("best_effort", False)),
-            "failureDestination": _failure_destination_to_wire(
-                delivery.get("failure_destination")
-            ),
+            "failureDestination": _failure_destination_to_wire(delivery.get("failure_destination")),
         }
     return {
         "mode": (
@@ -463,9 +454,7 @@ def _build_failure_destination(raw: Any) -> FailureDestination | None:
     if mode_norm == "webhook":
         url = raw.get("webhookUrl") or raw.get("to") or ""
         if not url:
-            raise ValueError(
-                "failureDestination mode='webhook' requires webhookUrl"
-            )
+            raise ValueError("failureDestination mode='webhook' requires webhookUrl")
         validate_webhook_url(str(url))
         return FailureDestination(
             mode=DeliveryMode.WEBHOOK,
@@ -489,9 +478,7 @@ def _build_webhook_delivery(delivery_raw: dict[str, Any]) -> DeliveryConfig:
     token = delivery_raw.get("webhookToken") or delivery_raw.get("token") or ""
     best_effort = bool(delivery_raw.get("bestEffort", False))
     validate_webhook_url(str(url))
-    failure_destination = _build_failure_destination(
-        delivery_raw.get("failureDestination")
-    )
+    failure_destination = _build_failure_destination(delivery_raw.get("failureDestination"))
     return DeliveryConfig(
         mode=DeliveryMode.WEBHOOK,
         webhook_url=str(url),
@@ -584,9 +571,11 @@ def _handler_key_for_payload_kind(kind: str) -> str:
     return "agent_run"
 
 
-async def _handle_cron_add(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    if not isinstance(params, dict):
-        raise ValueError("params required: schedule (object) or expression (string)")
+async def _create_cron_job(
+    command: CronJobMutation,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    params = cast(dict[str, Any], command.values)
     schedule_kind, schedule_value, schedule_tz = _schedule_from_params(params)
     session_target = _resolve_session_target(params)
     payload_kind_name, payload = _build_payload(params, session_target, require_text=True)
@@ -762,12 +751,17 @@ async def _finalize_cron_add(
 
 # Alias: cron.js sends cron.create for new jobs; generated registration below
 # routes both names into this single implementation.
-async def _handle_cron_update(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    if not isinstance(params, dict) or "id" not in params:
-        raise ValueError("params.id is required")
+async def _update_cron_job(
+    command: CronJobMutation,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    params = cast(dict[str, Any], command.values)
+    job_id = command.job_id
+    if job_id is None:
+        raise ValueError("cron job id is required")
     scheduler = _require_scheduler(ctx)
 
-    patch = {}
+    patch: dict[str, Any] = {}
     if "name" in params:
         patch["name"] = params["name"]
 
@@ -777,9 +771,7 @@ async def _handle_cron_update(params: dict | None, ctx: RpcContext) -> dict[str,
         patch["schedule_kind"] = sched_kind
         patch["schedule_value"] = sched_value
         schedule_raw = params.get("schedule")
-        schedule_tz_was_supplied = (
-            isinstance(schedule_raw, dict) and "tz" in schedule_raw
-        )
+        schedule_tz_was_supplied = isinstance(schedule_raw, dict) and "tz" in schedule_raw
         if sched_kind == ScheduleKind.CRON and (
             sched_tz or tz_was_supplied or schedule_tz_was_supplied
         ):
@@ -794,7 +786,7 @@ async def _handle_cron_update(params: dict | None, ctx: RpcContext) -> dict[str,
         # sibling field updates in the same request (text/schedule/…) are
         # applied too, and so a DISABLED/FAILED job (not just PAUSED) can be
         # revived — those are exactly the states a user runs `--enabled` to fix.
-        job = await scheduler.get_job(params["id"])
+        job = await scheduler.get_job(job_id)
         if params["enabled"]:
             revivable = {
                 JobStatus.PAUSED.value,
@@ -802,13 +794,13 @@ async def _handle_cron_update(params: dict | None, ctx: RpcContext) -> dict[str,
                 JobStatus.FAILED.value,
             }
             if job is not None and job.status.value in revivable:
-                await scheduler.resume_job(params["id"])
+                await scheduler.resume_job(job_id)
         else:
-            await scheduler.pause_job(params["id"])
+            await scheduler.pause_job(job_id)
 
-    current_job = await scheduler.get_job(params["id"])
+    current_job = await scheduler.get_job(job_id)
     if current_job is None:
-        raise KeyError(f"Cron job not found: {params['id']}")
+        raise KeyError(f"Cron job not found: {job_id}")
 
     if (
         tz_was_supplied
@@ -907,9 +899,7 @@ async def _handle_cron_update(params: dict | None, ctx: RpcContext) -> dict[str,
 
     if "templateId" in params or "template_id" in params:
         template_payload = dict(patch.get("payload", current_job.payload))
-        if not template_payload.get("_template_id") and current_job.payload.get(
-            "_template_id"
-        ):
+        if not template_payload.get("_template_id") and current_job.payload.get("_template_id"):
             template_payload["_template_id"] = current_job.payload["_template_id"]
         _apply_template_contract(params, template_payload)
         patch["payload"] = template_payload
@@ -953,10 +943,7 @@ async def _handle_cron_update(params: dict | None, ctx: RpcContext) -> dict[str,
                     delivery_raw.get("failureDestination")
                 ),
             )
-        elif (
-            isinstance(delivery_raw, dict)
-            and delivery_raw.get("failureDestination") is not None
-        ):
+        elif isinstance(delivery_raw, dict) and delivery_raw.get("failureDestination") is not None:
             # Standalone FD patch: keep the existing primary delivery target,
             # only update the failure_destination side.
             existing = current_job.delivery
@@ -971,21 +958,47 @@ async def _handle_cron_update(params: dict | None, ctx: RpcContext) -> dict[str,
                 webhook_url=existing.webhook_url,
                 webhook_token=existing.webhook_token,
                 best_effort=existing.best_effort,
-                failure_destination=_build_failure_destination(
-                    delivery_raw["failureDestination"]
-                ),
+                failure_destination=_build_failure_destination(delivery_raw["failureDestination"]),
             )
 
     if "toolPolicy" in params or "tool_policy" in params:
         patch["tool_policy"] = _tool_policy_from_params(params)
 
     if patch:
-        job = await scheduler.update_job(params["id"], **patch)
+        job = await scheduler.update_job(job_id, **patch)
     else:
         job = current_job
     if job is None:
-        raise KeyError(f"Cron job not found: {params['id']}")
+        raise KeyError(f"Cron job not found: {job_id}")
     return _job_to_wire(job)
+
+
+async def _handle_cron_add(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    """Compatibility entry point for direct callers outside contract registration."""
+
+    if not isinstance(params, dict):
+        raise ValueError("params required: schedule (object) or expression (string)")
+    return await _create_cron_job(
+        CronJobMutation(cast(CronJobMutationValues, params)),
+        ctx,
+    )
+
+
+async def _handle_cron_update(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    """Compatibility entry point for direct callers outside contract registration."""
+
+    if not isinstance(params, dict) or "id" not in params:
+        raise ValueError("params.id is required")
+    return await _update_cron_job(
+        CronJobMutation(
+            cast(
+                CronJobMutationValues,
+                {key: value for key, value in params.items() if key != "id"},
+            ),
+            cast(str, params["id"]),
+        ),
+        ctx,
+    )
 
 
 class _CronSchedulerRuntime(CronSchedulerPort):
@@ -1012,15 +1025,13 @@ class _CronSchedulerRuntime(CronSchedulerPort):
     async def create_job(self, command: CronJobMutation) -> CronJobIdentityResult:
         return cast(
             CronJobIdentityResult,
-            await _handle_cron_add(dict(command.values), self._ctx),
+            await _create_cron_job(command, self._ctx),
         )
 
     async def update_job(self, command: CronJobMutation) -> CronJobIdentityResult:
         return cast(
             CronJobIdentityResult,
-            await _handle_cron_update(
-                {**dict(command.values), "id": command.job_id}, self._ctx
-            ),
+            await _update_cron_job(command, self._ctx),
         )
 
     async def remove_job(self, target: CronJobTarget) -> None:
@@ -1029,9 +1040,7 @@ class _CronSchedulerRuntime(CronSchedulerPort):
     async def run_job(self, target: CronJobTarget) -> CronRunProjection:
         return cast(
             CronRunProjection,
-            _manual_run_to_wire(
-                await _require_scheduler(self._ctx).run_job_now(target.job_id)
-            ),
+            _manual_run_to_wire(await _require_scheduler(self._ctx).run_job_now(target.job_id)),
         )
 
     async def list_runs(self, query: CronRunQuery) -> list[CronRunProjection]:
@@ -1044,12 +1053,8 @@ class _CronSchedulerRuntime(CronSchedulerPort):
             [
                 {
                     "id": run.id,
-                    "started_at": (
-                        run.started_at.isoformat() if run.started_at else None
-                    ),
-                    "finished_at": (
-                        run.finished_at.isoformat() if run.finished_at else None
-                    ),
+                    "started_at": (run.started_at.isoformat() if run.started_at else None),
+                    "finished_at": (run.finished_at.isoformat() if run.finished_at else None),
                     "success": run.success,
                     "status": "ok" if run.success else "error",
                     "duration_ms": (
@@ -1079,9 +1084,7 @@ class _CronSubscriptionRuntime(CronSubscriptionPort):
     async def unsubscribe(self, topic: CronTopic) -> CronSubscriptionResult:
         return self._change_subscription(topic, subscribe=False)
 
-    def _change_subscription(
-        self, topic: CronTopic, *, subscribe: bool
-    ) -> CronSubscriptionResult:
+    def _change_subscription(self, topic: CronTopic, *, subscribe: bool) -> CronSubscriptionResult:
         manager = getattr(self._ctx, "subscription_manager", None)
         if manager is None:
             return {"ok": False, "error": "subscription_manager not available"}
@@ -1105,21 +1108,15 @@ async def _cron_list_contract(params: dict[str, Any] | None, ctx: RpcContext) ->
     return await _cron_scheduler_adapter(ctx).list_jobs(params)
 
 
-async def _cron_status_contract(
-    params: dict[str, Any] | None, ctx: RpcContext
-) -> dict[str, Any]:
+async def _cron_status_contract(params: dict[str, Any] | None, ctx: RpcContext) -> dict[str, Any]:
     return await _cron_scheduler_adapter(ctx).status(params)
 
 
-async def _cron_create_contract(
-    params: dict[str, Any] | None, ctx: RpcContext
-) -> dict[str, Any]:
+async def _cron_create_contract(params: dict[str, Any] | None, ctx: RpcContext) -> dict[str, Any]:
     return await _cron_scheduler_adapter(ctx).create(params)
 
 
-async def _cron_update_contract(
-    params: dict[str, Any] | None, ctx: RpcContext
-) -> dict[str, Any]:
+async def _cron_update_contract(params: dict[str, Any] | None, ctx: RpcContext) -> dict[str, Any]:
     return await _cron_scheduler_adapter(ctx).update(params)
 
 
@@ -1127,15 +1124,11 @@ async def _cron_remove_contract(params: dict[str, Any] | None, ctx: RpcContext) 
     await _cron_scheduler_adapter(ctx).remove(params)
 
 
-async def _cron_run_contract(
-    params: dict[str, Any] | None, ctx: RpcContext
-) -> dict[str, Any]:
+async def _cron_run_contract(params: dict[str, Any] | None, ctx: RpcContext) -> dict[str, Any]:
     return await _cron_scheduler_adapter(ctx).run(params)
 
 
-async def _cron_runs_contract(
-    params: dict[str, Any] | None, ctx: RpcContext
-) -> list[dict]:
+async def _cron_runs_contract(params: dict[str, Any] | None, ctx: RpcContext) -> list[dict]:
     return await _cron_scheduler_adapter(ctx).runs(params)
 
 
@@ -1170,5 +1163,5 @@ for _cron_method, _cron_implementation in (
         internal_error=RpcHandlerError,
         guest_allowed_checker=is_guest_rpc_method_allowed,
     )
-    CronRunProjection,
-    CronSubscriptionResult,
+    (CronRunProjection,)
+    (CronSubscriptionResult,)
