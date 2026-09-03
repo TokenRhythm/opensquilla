@@ -37,7 +37,7 @@ from opensquilla.application.session_reset import (
 )
 from opensquilla.engine.usage_accounting import bind_usage_accounting_scope
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
-from opensquilla.gateway.rpc import RpcContext, RpcHandlerError
+from opensquilla.gateway.rpc.registry import RpcContext, RpcHandlerError
 from opensquilla.gateway.session_services import (
     get_session_lock,
     get_session_storage,
