@@ -70,7 +70,7 @@ class _TokenRhythmSnapshotSidecars:
 # fallback), "default" is a hardcoded engine default.
 MaxTokensSource = Literal["override", "catalog", "default"]
 ContextWindowSource = Literal[
-    "override", "config", "catalog", "inferred", "default"
+    "override", "config", "catalog", "default"
 ]
 
 # Local runtimes (Ollama, …) have unqualified model ids that miss the catalog
@@ -280,49 +280,6 @@ def _corrections_budget_fallback(model_id: str) -> tuple[int, int] | None:
         min(windows) if windows else 0,
     )
 
-
-# ---------------------------------------------------------------------------
-# Custom-endpoint context-window inference
-#
-# When *no* catalog layer resolved a window (no snapshot, no corrections, no
-# live catalog field), infer a reasonable default from the model-id naming
-# convention. This gives custom-provider operators a sensible starting point
-# instead of the cloud-fallback 200 k.  If catalog *did* resolve, trust it
-# — inference is only a last-resort bridge.
-# ---------------------------------------------------------------------------
-
-_INFERENCE_WINDOW_FLASH = 1_000_000   # ~1 M tokens
-_INFERENCE_WINDOW_SMALL = 200_000     # ~200 k tokens
-_PARAM_SMALL_THRESHOLD  = 250         # billion parameters
-
-#: Pattern matching a trailing param-scale suffix like "3b", "8b", "250b".
-_RE_PARAM_SUFFIX = re.compile(r"\b(\d+(?:\.\d+)?)\s*b\b", re.IGNORECASE)
-
-#: Suffixes that signal a large-window model (case-insensitive).
-_LARGE_MODEL_SUFFIXES = frozenset({"flash", "pro", "plus", "max"})
-
-
-def _infer_context_window_from_model_id(model_id: str) -> int:
-    """Return an inferred context window in tokens, or 0 when inconclusive."""
-    mid = model_id.strip().lower()
-    if not mid:
-        return 0
-
-    # 1) Param-scale suffix: detect explicit parameter count.
-    m = _RE_PARAM_SUFFIX.search(mid)
-    if m:
-        params_billion = float(m.group(1))
-        return _INFERENCE_WINDOW_SMALL if params_billion < _PARAM_SMALL_THRESHOLD else _INFERENCE_WINDOW_FLASH
-
-    # 2) Naming-convention suffix: flash / pro / plus / max at the very end.
-    #    Version-trailing ids like "gemini-2.5-plus-preview" keep the tier
-    #    token anywhere in the trailing segment, so match on any hyphen-
-    #    separated token instead of only the strict end.
-    tokens = [t for t in mid.replace("_", "-").split("-") if t]
-    if any(t in _LARGE_MODEL_SUFFIXES for t in tokens):
-        return _INFERENCE_WINDOW_FLASH
-
-    return 0
 
 
 def _live_layer_fields(info: ModelInfo | None) -> dict[str, Any]:
@@ -1689,17 +1646,6 @@ class ModelCatalog:
         profile_window = self._profile_default_windows.get(provider_id)
         if profile_window and int(profile_window) > 0:
             return int(profile_window), "config"
-        # Custom / unknown endpoint without any catalog data — infer from the
-        # model-id naming convention.  Only for non-local providers: an
-        # unqualified local id ("llama3:3b") must keep the conservative runtime
-        # window, never a cloud-scale guessed one.
-        if not (
-            provider
-            and str(provider).strip().lower() in LOCAL_RUNTIME_PROVIDERS
-        ):
-            inferred = _infer_context_window_from_model_id(model_id)
-            if inferred > 0:
-                return inferred, "inferred"
         if provider and provider.strip().lower() in LOCAL_RUNTIME_PROVIDERS:
             return _LOCAL_CONTEXT_WINDOW, "default"
         return DEFAULT_CONTEXT_WINDOW, "default"

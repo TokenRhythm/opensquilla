@@ -510,65 +510,6 @@ def _infer(model_id: str) -> int:
     )
     return f(model_id)
 
-
-def test_infer_context_window_suffix_flash_pro_plus_max() -> None:
-    """Naming-convention suffix → large window (1 M)."""
-    assert _infer("qwen3.8-flash") == 1_000_000
-    assert _infer("glm-5.3-flash") == 1_000_000
-    assert _infer("deepseek-v4-pro") == 1_000_000
-    assert _infer("gemini-2.5-plus-preview") == 1_000_000
-    assert _infer("gpt-4o-max") == 1_000_000
-
-
-def test_infer_context_window_param_suffix_small_and_large() -> None:
-    """Explicit param count: <250B→200k, ≥250B→1M."""
-    assert _infer("Qwen/Qwen3-8B") == 200_000
-    assert _infer("llama3-70b") == 200_000
-    assert _infer("mixtral-260b") == 1_000_000
-
-
-def test_infer_context_window_no_match_returns_zero() -> None:
-    """No recognizable pattern → 0 (catalog default path)."""
-    assert _infer("unknown-foo") == 0
-    assert _infer("") == 0
-    assert _infer("   ") == 0
-
-
-def test_inferred_source_labelled_distinctly() -> None:
-    """Inference returns the dedicated "inferred" source, not "default".
-
-    Ensemble member budget rebinding trusts explicit sources
-    (override/config/catalog/inferred) but historically skipped "default";
-    relabelling inference as "inferred" lets it join that trust set while
-    the hardcoded fallback stays excluded.
-    """
-    catalog = ModelCatalog()
-    window, source = catalog.resolve_context_window_with_source(
-        "glm-5.3-flash", provider="tokenrhythm"
-    )
-    assert window == 1_000_000
-    assert source == "inferred"
-
-
-def test_local_runtime_window_wins_over_inference() -> None:
-    """Local runtimes (ollama etc.) keep the conservative runtime window.
-
-    Unqualified local ids like "llama3:3b" and "qwen3:8b" carry patterns
-    inference would match, but local deployments must never inherit a
-    cloud-scale guessed window; the runtime's own conservative default
-    stays authoritative.
-    """
-    from opensquilla.provider.model_catalog import _LOCAL_CONTEXT_WINDOW
-
-    catalog = ModelCatalog()
-    for local_id in ("llama3:3b", "qwen3:8b"):
-        window, source = catalog.resolve_context_window_with_source(
-            local_id, provider="ollama"
-        )
-        assert window == _LOCAL_CONTEXT_WINDOW
-        assert source == "default"
-
-
 def test_profile_default_window_layer_resolves_as_config() -> None:
     """[llm_profiles.<id>].context_window_tokens activates as "config" source."""
     catalog = ModelCatalog()
