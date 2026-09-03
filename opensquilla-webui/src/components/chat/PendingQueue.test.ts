@@ -392,6 +392,33 @@ describe('PendingQueue', () => {
     app.unmount()
   })
 
+  it('renders an acceptance-unknown Steer as the only immutable retry action', async () => {
+    const onSteer = vi.fn()
+    const { app, el } = await mountQueue({ onSteer }, [{
+      text: 'Retry the exact Steer receipt',
+      steerAttempt: {
+        phase: 'acceptance_unknown',
+        request: {
+          key: 'agent:main:webchat:test',
+          message: 'Retry the exact Steer receipt',
+          expected_turn_id: 'turn-current',
+          client_request_id: 'request-steer',
+          client_message_id: 'message-steer',
+        },
+      },
+    }], {
+      immutableRetryOnly: true,
+      steerAvailable: false,
+    })
+
+    const buttons = [...el.querySelectorAll<HTMLButtonElement>('button')]
+    expect(buttons).toHaveLength(1)
+    expect(buttons[0]?.disabled).toBe(false)
+    buttons[0]?.click()
+    expect(onSteer).toHaveBeenCalledOnce()
+    app.unmount()
+  })
+
   it('keeps hidden control input removable without exposing same-turn retry', async () => {
     let retried = 0
     let removed = 0

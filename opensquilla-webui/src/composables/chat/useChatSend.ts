@@ -695,9 +695,15 @@ export function useChatSend(options: UseChatSendOptions) {
   function isQueuedExactReceiptReplay(item: ChatPendingItem): boolean {
     acceptanceRecoveryVersion.value
     const attempt = recoveredQueuedAttempts.get(item)
-    return Boolean(
-      attempt?.requiresIdempotentReplay
-      && attempt.requestSessionKey === options.sessionKey.value,
+    const followupReplay = Boolean(
+      ['retryable', 'replay_pending'].includes(item.deliveryState || '')
+      && attempt?.requiresIdempotentReplay
+      && attempt.requestSessionKey === options.sessionKey.value
+    )
+    const steerAttempt = options.steerDelivery.attemptForItem(item)
+    return followupReplay || Boolean(
+      steerAttempt?.phase === 'acceptance_unknown'
+      && steerAttempt.request.key === options.sessionKey.value,
     )
   }
 

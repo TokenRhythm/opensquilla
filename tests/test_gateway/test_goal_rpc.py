@@ -1155,6 +1155,7 @@ async def test_goal_writes_reject_cron_before_any_durable_side_effect(
             {**_set_params(), "sessionKey": session_key},
             stack.context,
         )
+        await _settle_set_task(stack, created)
         await _mark_source_as_cron(stack, session_key)
         transcript_before = await stack.manager.get_transcript(session_key)
         goal_before = await stack.storage.get_goal(session_key)
@@ -1171,6 +1172,13 @@ async def test_goal_writes_reject_cron_before_any_durable_side_effect(
             (_handle_goals_pause, 2),
             (_handle_goals_clear, 3),
         ):
+            idle_notified = asyncio.Event()
+
+            async def observe_production_idle(key: str) -> None:
+                await stack.service.on_runtime_idle(key)
+                idle_notified.set()
+
+            stack.runtime.set_idle_listener(observe_production_idle)
             with pytest.raises(RpcHandlerError) as exc_info:
                 await handler(
                     {
@@ -1180,6 +1188,10 @@ async def test_goal_writes_reject_cron_before_any_durable_side_effect(
                     stack.context,
                 )
             assert exc_info.value.code == "SESSION_NOT_INTERACTIVE"
+            await asyncio.wait_for(idle_notified.wait(), timeout=2.0)
+            scheduled = stack.service._kick_tasks.get(session_key)
+            if scheduled is not None:
+                await asyncio.wait_for(asyncio.shield(scheduled), timeout=2.0)
             assert await stack.storage.get_goal(session_key) == goal_before
             assert await stack.manager.get_transcript(session_key) == transcript_before
             assert {
@@ -1246,6 +1258,64 @@ async def test_goal_exact_receipts_replay_after_session_becomes_cron(
             assert {key: value for key, value in replay.items() if key != "continuityToken"} == {
                 key: value for key, value in accepted.items() if key != "continuityToken"
             }
+        assert {
+            table: await _table_count(stack.storage, table)
+            for table in counts_before
+        } == counts_before
+
+
+@pytest.mark.asyncio
+async def test_goal_reattach_rejects_cron_before_authority_side_effects(
+    tmp_path: Path,
+) -> None:
+    session_key = "legacy-scheduled-goal-reattach"
+    async with _open_goal_rpc_stack(
+        tmp_path / "goal-cron-reattach.sqlite",
+        session_key=session_key,
+    ) as stack:
+        created = await _handle_goals_set(
+            {**_set_params(), "sessionKey": session_key},
+            stack.context,
+        )
+        await _settle_set_task(stack, created)
+        lease = stack.service._leases[session_key]
+        stack.service._detach_authority(session_key, expected=lease)
+        await _mark_source_as_cron(stack, session_key)
+
+        goal_before = await stack.storage.get_goal(session_key)
+        transcript_before = await stack.manager.get_transcript(session_key)
+        leases_before = dict(stack.service._leases)
+        grants_before = dict(stack.service._continuity_grants)
+        events_before = list(stack.events)
+        counts_before = {
+            table: await _table_count(stack.storage, table)
+            for table in (
+                "agent_tasks",
+                "goal_command_receipts",
+                "turn_ingress_receipts",
+                "transcript_entries",
+            )
+        }
+
+        with pytest.raises(RpcHandlerError) as exc_info:
+            await _handle_goals_reattach(
+                {
+                    **_reattach_params(
+                        created,
+                        continuity_token=created["continuityToken"],
+                    ),
+                    "sessionKey": session_key,
+                },
+                stack.context,
+            )
+
+        assert exc_info.value.code == "SESSION_NOT_INTERACTIVE"
+        assert stack.service._leases == leases_before
+        assert stack.service._continuity_grants == grants_before
+        assert stack.service._kick_tasks == {}
+        assert await stack.storage.get_goal(session_key) == goal_before
+        assert await stack.manager.get_transcript(session_key) == transcript_before
+        assert stack.events == events_before
         assert {
             table: await _table_count(stack.storage, table)
             for table in counts_before

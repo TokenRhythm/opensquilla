@@ -43,6 +43,7 @@ describe('Cron session read-only presentation', () => {
     expect(chatViewSource).toContain('exactReceiptReplayPendingForCurrentSession,')
     expect(chatViewSource).toContain('isQueuedExactReceiptReplay,')
     expect(chatViewSource).toContain('const queueReceiptReplayItems = computed(')
+    expect(chatViewSource).toContain('pendingQueue.value.filter(isQueuedExactReceiptReplay)')
     expect(chatViewSource).toContain(':immutable-retry-only="turnActionsBlocked"')
     expect(chatViewSource).toContain(
       'v-if="!turnActionsBlocked || exactReceiptReplayPendingForCurrentSession"',
@@ -102,6 +103,9 @@ describe('Cron session read-only presentation', () => {
     expect(pendingRetry).toContain("['retryable', 'replay_pending'].includes")
     expect(pendingRetry).toContain('? await retryQueuedItem(item)')
     expect(pendingRetry).toContain(': await sendQueuedSteer(item)')
+    expect(pendingRetry).toContain('pendingSteerClicks.has(candidate)')
+    expect(pendingRetry).toContain('pendingSteerClicks.add(candidate)')
+    expect(pendingRetry).toContain('pendingSteerClicks.delete(item)')
   })
 
   it('does not let Escape stop work or pop drafts while receipt replay is read-only', () => {

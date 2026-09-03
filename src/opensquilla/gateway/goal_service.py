@@ -1253,6 +1253,7 @@ class GoalService:
 
         self._require_execution_available()
         key = canonicalize_session_key(session_key)
+        await self._require_interactive_session(key)
         self._require_subscription(ctx, key)
         source_kind = "cli" if source_kind == "cli" else "web"
         async with self._lock(key):
@@ -1846,6 +1847,18 @@ class GoalService:
                 )
             return
         session = await self._storage.get_session(session_key)
+        if session_key.startswith("cron:") or (
+            session is not None
+            and is_noninteractive_cron_session(
+                session,
+                channel_types=channel_types_from_config(self._config),
+            )
+        ):
+            _emit_goal_metric(
+                "goal_continuation_deferred_total",
+                reason="noninteractive",
+            )
+            return
         if (
             session is not None
             and str(getattr(session, "collaboration_mode", "default")) == "plan"

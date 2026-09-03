@@ -4149,6 +4149,10 @@ describe('useChatSend attachment payloads', () => {
     expect(inputText.value).toBe('')
     expect(pendingQueue.value).toHaveLength(1)
     expect(pendingQueue.value[0]?.steerAttempt?.phase).toBe('acceptance_unknown')
+    expect(api.isQueuedExactReceiptReplay(pendingQueue.value[0]!)).toBe(true)
+    options.sessionKey.value = 'agent:main:webchat:other'
+    expect(api.isQueuedExactReceiptReplay(pendingQueue.value[0]!)).toBe(false)
+    options.sessionKey.value = 'agent:main:webchat:test'
 
     // Even if the active task settles before the retry, the original target
     // and request id are replayed; this must never become chat.send follow-up.
@@ -4246,6 +4250,7 @@ describe('useChatSend attachment payloads', () => {
 
       await expect(api.sendQueuedSteer(queued)).resolves.toBe('retryable_failure')
       expect(queued.steerAttempt?.phase).toBe('retryable_rejected')
+      expect(api.isQueuedExactReceiptReplay(queued)).toBe(false)
       const originalRequest = queued.steerAttempt?.request
       if (policyGate === 'interactivity') {
         sessionPolicy.value = 'Cron sessions are read-only.'

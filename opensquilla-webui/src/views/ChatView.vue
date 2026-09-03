@@ -3529,10 +3529,9 @@ const {
   exactReceiptReplayPendingForCurrentSession,
   isQueuedExactReceiptReplay,
 } = chatSend
-const queueReceiptReplayItems = computed(() => pendingQueue.value.filter(item => (
-  ['retryable', 'replay_pending'].includes(item.deliveryState || '')
-  && isQueuedExactReceiptReplay(item)
-)))
+const queueReceiptReplayItems = computed(() => (
+  pendingQueue.value.filter(isQueuedExactReceiptReplay)
+))
 const exactReceiptReplayVisibleForCurrentSession = computed(() => (
   exactReceiptReplayPendingForCurrentSession.value
   || queueReceiptReplayItems.value.length > 0
