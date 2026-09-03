@@ -415,6 +415,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   interface BackgroundReceiptTask {
     clientMessageId: string
     terminalSeen: boolean
+    allowProjection: boolean
   }
 
   const pendingBackgroundReceiptClientIds = new Set<string>()
@@ -480,6 +481,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     clientMessageId: string,
     taskId: string,
     terminalSeen = false,
+    allowProjection = true,
   ) {
     const normalizedClientId = String(clientMessageId || '').trim()
     const normalizedTaskId = String(taskId || '').trim()
@@ -493,6 +495,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     backgroundReceiptTasks.set(normalizedTaskId, {
       clientMessageId: normalizedClientId,
       terminalSeen: terminalSeen || existing?.terminalSeen === true,
+      allowProjection: allowProjection && existing?.allowProjection !== false,
     })
   }
 
@@ -500,6 +503,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     clientMessageId: string,
     taskId: string,
     terminal: boolean | string = false,
+    allowProjection = true,
   ) {
     const normalizedClientId = String(clientMessageId || '').trim()
     const normalizedTaskId = String(taskId || '').trim()
@@ -507,10 +511,18 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       ? terminal.trim().toLowerCase()
       : terminal ? 'succeeded' : ''
     rememberBackgroundReceiptClient(normalizedClientId)
-    rememberBackgroundReceiptTask(normalizedClientId, normalizedTaskId, Boolean(terminalStatus))
+    rememberBackgroundReceiptTask(
+      normalizedClientId,
+      normalizedTaskId,
+      Boolean(terminalStatus),
+      allowProjection,
+    )
     if (terminalStatus) {
       if (normalizedTaskId) options.taskOwnership?.noteTerminal(normalizedTaskId)
-      if (!reconciledBackgroundReceiptClientIds.has(normalizedClientId)) {
+      if (
+        allowProjection
+        && !reconciledBackgroundReceiptClientIds.has(normalizedClientId)
+      ) {
         dirtyBackgroundReceiptClientIds.add(normalizedClientId)
         flushBackgroundReceiptReconciliationIfReady()
       }
@@ -519,7 +531,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         normalizedTaskId,
         terminalStatus,
         {},
-        true,
+        allowProjection,
       )
     }
   }
@@ -598,16 +610,21 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   function matchingBackgroundReceiptIdentity(payload: SessionEventPayload): {
     clientMessageId: string
     taskId: string
+    allowProjection: boolean
   } | null {
     for (const identity of receiptEventIdentities(payload)) {
       const tracked = backgroundReceiptTasks.get(identity.taskId)
       if (tracked) {
-        return { clientMessageId: tracked.clientMessageId, taskId: identity.taskId }
+        return {
+          clientMessageId: tracked.clientMessageId,
+          taskId: identity.taskId,
+          allowProjection: tracked.allowProjection,
+        }
       }
       if (
         identity.clientMessageId
         && backgroundReceiptClientIds.has(identity.clientMessageId)
-      ) return identity
+      ) return { ...identity, allowProjection: true }
     }
     return null
   }
@@ -646,7 +663,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (!isCurrentSessionPayload(payload)) return false
     const identity = matchingBackgroundReceiptIdentity(payload)
     if (!identity) return false
-    const { clientMessageId: owner, taskId } = identity
+    const { clientMessageId: owner, taskId, allowProjection } = identity
     const terminalEvent = eventKind === 'sessions-changed'
       ? sessionChangeIsTerminal(payload)
       : isTerminalEvent(eventKind)
@@ -661,8 +678,11 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     } else if (terminalEvent) {
       options.taskOwnership?.noteTerminal(taskId)
       markTaskSettled(payload)
-      rememberBackgroundReceiptTask(owner, taskId, true)
-      if (!reconciledBackgroundReceiptClientIds.has(owner)) {
+      rememberBackgroundReceiptTask(owner, taskId, true, allowProjection)
+      if (
+        allowProjection
+        && !reconciledBackgroundReceiptClientIds.has(owner)
+      ) {
         dirtyBackgroundReceiptClientIds.add(owner)
       }
       flushBackgroundReceiptReconciliationIfReady()
@@ -690,7 +710,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
           || (eventKind === 'sessions-changed' ? '' : eventTaskTerminalStatus(eventKind))
           || (eventKind === 'turn-failed' ? 'failed' : 'succeeded'),
         terminalTask || payload,
-        !hasContinuation,
+        !hasContinuation && allowProjection,
       )
     }
     return true

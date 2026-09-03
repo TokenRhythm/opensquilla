@@ -2646,6 +2646,15 @@ describe('useChatSend attachment payloads', () => {
       const adoptResponseSession = vi.fn(async (key: string) => {
         sessionKey.value = key
       })
+      let finishProjectValidation = () => {}
+      const validateActiveProjectBeforeSend = delayRetirement && shouldSendNewEdit
+        ? vi.fn()
+            .mockResolvedValueOnce(null)
+            .mockResolvedValueOnce(null)
+            .mockImplementationOnce(() => new Promise<null>(resolve => {
+              finishProjectValidation = () => resolve(null)
+            }))
+        : null
       const rpc = {
         call: vi.fn()
           .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
@@ -2670,6 +2679,7 @@ describe('useChatSend attachment payloads', () => {
         validateMessageEditOwner: messageActions.validateEditOwner,
         commitMessageEdit: messageActions.commitEdit,
         adoptRejectedMessageEditRows: messageActions.adoptRejectedEditRows,
+        ...(validateActiveProjectBeforeSend ? { validateActiveProjectBeforeSend } : {}),
       })
 
       await harness.api.onSend()
@@ -2704,16 +2714,26 @@ describe('useChatSend attachment payloads', () => {
       if (delayRetirement) vi.useFakeTimers()
       try {
         const sendNewEdit = harness.api.onSend()
-        let repeatedSend: Promise<void> | null = null
+        let repeatedSends: Promise<void>[] = []
         if (delayRetirement) {
           await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledTimes(2))
-          repeatedSend = harness.api.onSend()
+          await vi.waitFor(() => {
+            expect(recoverPendingQueueHandoff).toHaveBeenCalledOnce()
+          })
+          await vi.advanceTimersByTimeAsync(0)
+          repeatedSends = [harness.api.onSend(), harness.api.onSend()]
           await vi.advanceTimersByTimeAsync(0)
           expect(rpc.call).toHaveBeenCalledTimes(2)
           if (!shouldSendNewEdit) inputText.value = 'changed while retirement was pending'
           await vi.advanceTimersByTimeAsync(250)
+          if (validateActiveProjectBeforeSend) {
+            await vi.waitFor(() => {
+              expect(validateActiveProjectBeforeSend).toHaveBeenCalledTimes(3)
+            })
+            finishProjectValidation()
+          }
         }
-        await Promise.all([sendNewEdit, repeatedSend])
+        await Promise.all([sendNewEdit, ...repeatedSends])
       } finally {
         if (delayRetirement) vi.useRealTimers()
       }
@@ -3579,6 +3599,7 @@ describe('useChatSend attachment payloads', () => {
       _clientMessageId: string,
       _taskId: string,
       _terminal?: boolean | string,
+      _allowProjection?: boolean,
     ) => {}
     const beginBackgroundReceiptReplay = vi.fn((id: string, holdHistory?: boolean) => {
       beginReplay(id, holdHistory)
@@ -3590,12 +3611,14 @@ describe('useChatSend attachment payloads', () => {
       id: string,
       taskId: string,
       terminal?: boolean | string,
+      allowProjection?: boolean,
     ) => {
-      trackReplay(id, taskId, terminal)
+      trackReplay(id, taskId, terminal, allowProjection)
     })
     const applySessionRunState = vi.fn()
     const scheduleHistorySync = vi.fn()
     const schedulePendingDrainAfterTerminal = vi.fn()
+    const scheduleRecoveredQueueDrain = vi.fn()
     let resolveQueueRelease!: (released: boolean) => void
     const recoverPendingQueueHandoff = vi.fn(() => new Promise<boolean>(resolve => {
       resolveQueueRelease = resolve
@@ -3611,6 +3634,7 @@ describe('useChatSend attachment payloads', () => {
       finishBackgroundReceiptReplay,
       trackBackgroundReceiptTask,
       scheduleHistorySync,
+      schedulePendingDrainAfterTerminal: scheduleRecoveredQueueDrain,
       recoverPendingQueueHandoff,
       messageEditActive: ref(true),
       prepareAttachmentsForSend: vi.fn(async ({ attachments }) => {
@@ -3682,20 +3706,6 @@ describe('useChatSend attachment payloads', () => {
       expect(rpc.call.mock.calls[1]?.[1]?.attachments?.[0]?.file_uuid).toBe(
         'refreshed-recovery-file',
       )
-      resolveRecovery({
-        sessionKey: child,
-        task_id: 'recovered-task',
-        task_status: 'failed',
-      })
-      await vi.waitFor(() => expect(recoverPendingQueueHandoff).toHaveBeenCalledOnce())
-      expect(trackBackgroundReceiptTask).toHaveBeenCalledWith(
-        clientMessageId,
-        'recovered-task',
-        false,
-      )
-      expect(applySessionRunState).not.toHaveBeenCalled()
-      expect(schedulePendingDrainAfterTerminal).not.toHaveBeenCalled()
-      expect(finishBackgroundReceiptReplay).not.toHaveBeenCalled()
       const deliver = (eventName: string, payload: Record<string, unknown>) => {
         rpcEvents.onConversationEvent({
           kind: 'conversation',
@@ -3707,12 +3717,44 @@ describe('useChatSend attachment payloads', () => {
       deliver('task.queued', {
         session_key: parent,
         task_id: 'recovered-task',
+        client_message_id: clientMessageId,
+      })
+      deliver('task.running', {
+        session_key: parent,
+        task_id: 'recovered-task',
+        client_message_id: clientMessageId,
+      })
+      expect(activeStreamTaskId.value).toBe('')
+      expect(taskOwnership.runningTaskId.value).toBe('recovered-task')
+      resolveRecovery({
+        sessionKey: child,
+        task_id: 'recovered-task',
+        task_status: 'failed',
+      })
+      await vi.waitFor(() => expect(recoverPendingQueueHandoff).toHaveBeenCalledOnce())
+      expect(trackBackgroundReceiptTask).toHaveBeenCalledWith(
+        clientMessageId,
+        'recovered-task',
+        'failed',
+        false,
+      )
+      expect(applySessionRunState).not.toHaveBeenCalled()
+      expect(schedulePendingDrainAfterTerminal).not.toHaveBeenCalled()
+      expect(scheduleRecoveredQueueDrain).toHaveBeenCalledOnce()
+      expect(finishBackgroundReceiptReplay).not.toHaveBeenCalled()
+      deliver('task.queued', {
+        session_key: parent,
+        task_id: 'recovered-task',
       })
       deliver('session.event.text_delta', {
         session_key: parent,
         task_id: 'recovered-task',
         stream_seq: 1,
         text: 'old recovered output',
+      })
+      deliver('task.succeeded', {
+        session_key: parent,
+        task_id: 'recovered-task',
       })
       rpcEvents.onConversationEvent({
         kind: 'sessions-changed',
@@ -3728,6 +3770,7 @@ describe('useChatSend attachment payloads', () => {
 
       expect(activeStreamTaskId.value).toBe('')
       expect(taskOwnership.runningTaskId.value).toBe('')
+      expect([...taskOwnership.queuedTaskIds.value]).toEqual([])
       expect(recovery.stream.appendDelta).not.toHaveBeenCalled()
       expect(applySessionRunState).not.toHaveBeenCalled()
       expect(schedulePendingDrainAfterTerminal).not.toHaveBeenCalled()

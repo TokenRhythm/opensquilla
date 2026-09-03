@@ -204,6 +204,7 @@ interface SendAttempt {
   /** A background receipt was rejected and only its durable retirement remains. */
   backgroundRejectionPending?: boolean
   backgroundRejectionError?: unknown
+  backgroundRejectionContinuationClaimed?: boolean
   acceptedTaskId?: string
   acceptedSessionKey?: string
   stopAbortPromise?: Promise<boolean> | null
@@ -645,6 +646,7 @@ export interface UseChatSendOptions {
     clientMessageId: string,
     taskId: string,
     terminal?: boolean | string,
+    allowProjection?: boolean,
   ) => void
   /** Release the pre-response event quarantine for an older receipt replay. */
   finishBackgroundReceiptReplay?: (clientMessageId: string) => void
@@ -1216,6 +1218,12 @@ export function useChatSend(options: UseChatSendOptions) {
 
   function acceptanceAttemptKey(attempt: Pick<SendAttempt, 'requestSessionKey' | 'clientRequestId'>) {
     return `${attempt.requestSessionKey}\u0000${attempt.clientRequestId}`
+  }
+
+  function claimBackgroundRejectionContinuation(attempt: SendAttempt): boolean {
+    if (attempt.backgroundRejectionContinuationClaimed) return false
+    attempt.backgroundRejectionContinuationClaimed = true
+    return true
   }
 
   function beginFreshStream(
@@ -2479,13 +2487,15 @@ export function useChatSend(options: UseChatSendOptions) {
             })
             const targetSessionKey = response.sessionKey || replayRecord.requestSessionKey
             if (replayRecord.backgroundOnly) {
+              const allowTerminalProjection = (
+                targetSessionKey === replayRecord.requestSessionKey
+                && targetSessionKey === options.sessionKey.value
+              )
               options.trackBackgroundReceiptTask?.(
                 replayRecord.clientMessageId,
                 acceptedTaskId(response),
-                targetSessionKey === replayRecord.requestSessionKey
-                  && targetSessionKey === options.sessionKey.value
-                  ? terminalResponseStatus(response)
-                  : false,
+                terminalResponseStatus(response),
+                allowTerminalProjection,
               )
               await finalizeRecoveredBackgroundHandoff(replayRecord, targetSessionKey)
             } else {
@@ -3014,6 +3024,38 @@ export function useChatSend(options: UseChatSendOptions) {
       const replayBlockedReason = options.idempotentReplayBlockedReason
         || options.sendBlockedReason
       if (replayBlockedReason?.value) return
+      if (exactReplayAttempt.backgroundRejectionPending) {
+        const pendingRejectionSnapshot = captureComposerSnapshot()
+        const replayingSupersededEditOwner = Boolean(
+          recoveredAttemptHasUnrelatedComposer(
+            exactReplayAttempt,
+            pendingRejectionSnapshot,
+          )
+          && pendingRejectionSnapshot.messageEditActive
+          && pendingRejectionSnapshot.messageEditGeneration !== null
+          && exactReplayAttempt.messageEditTranscriptOwner
+          && pendingRejectionSnapshot.messageEditGeneration
+            !== exactReplayAttempt.messageEditTranscriptOwner.generation
+        )
+        if (
+          !replayingSupersededEditOwner
+          || !messageEditOwnerMatchesSnapshot(pendingRejectionSnapshot, true)
+        ) return
+        const rejectionRetirement = scheduleAcceptanceRecovery(exactReplayAttempt)
+        if (rejectionRetirement) await rejectionRetirement
+        if (
+          exactReplayAttempt.backgroundRejectionPending
+          || !exactReplayAttempt.acceptanceResolved
+          || options.sessionKey.value !== requestSessionKey
+          || !sameComposerOwnershipSnapshot(
+            captureComposerSnapshot(),
+            pendingRejectionSnapshot,
+          )
+          || !messageEditOwnerMatchesSnapshot(pendingRejectionSnapshot, true)
+        ) return
+        if (!claimBackgroundRejectionContinuation(exactReplayAttempt)) return
+        return onSend(invocation)
+      }
       if (options.validateActiveProjectBeforeSend) {
         if (await refreshedActiveProjectBlocksSend()) return
       }
@@ -3037,10 +3079,10 @@ export function useChatSend(options: UseChatSendOptions) {
         && !validateAttemptMessageEditTranscript(exactReplayAttempt)
       ) return
       if (replayBlockedReason?.value) return
-      const rejectionAlreadyPending = exactReplayAttempt.backgroundRejectionPending === true
       let rejectedReplayRetired = false
       let rejectedReplayRetirement: Promise<void> | null = null
-      const dispatchExactReplay = () => dispatchSend(exactReplayAttempt.text, {
+      let waitedForRejectionRetirement = false
+      const replayOutcome = await dispatchSend(exactReplayAttempt.text, {
         composerText,
         composerSnapshot: replayComposerSnapshot,
         promptAnnotationIds: exactReplayAttempt.promptAnnotationIds,
@@ -3086,23 +3128,20 @@ export function useChatSend(options: UseChatSendOptions) {
           )
         ),
       })
-      const replayOutcome = rejectionAlreadyPending ? null : await dispatchExactReplay()
-      if (rejectionAlreadyPending) {
-        rejectedReplayRetirement = scheduleAcceptanceRecovery(exactReplayAttempt)
-        if (rejectedReplayRetirement) await rejectedReplayRetirement
-        if (
-          exactReplayAttempt.backgroundRejectionPending
-          || !exactReplayAttempt.acceptanceResolved
-        ) return
-      } else if (replayOutcome !== 'accepted' && !rejectedReplayRetired) {
+      if (!replayingSupersededEditOwner) return
+      if (replayOutcome !== 'accepted' && !rejectedReplayRetired) {
         if (!rejectedReplayRetirement) return
         await rejectedReplayRetirement
+        waitedForRejectionRetirement = true
       }
-      if (!replayingSupersededEditOwner) return
       if (
         options.sessionKey.value !== requestSessionKey
         || !sameComposerOwnershipSnapshot(captureComposerSnapshot(), replayComposerSnapshot)
         || !messageEditOwnerMatchesSnapshot(replayComposerSnapshot, true)
+      ) return
+      if (
+        waitedForRejectionRetirement
+        && !claimBackgroundRejectionContinuation(exactReplayAttempt)
       ) return
     }
 
