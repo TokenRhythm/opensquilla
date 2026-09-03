@@ -37,7 +37,6 @@ function makeStream(): ChatRpcStreamApi {
     showThinkingIndicator: vi.fn(),
     hideThinkingIndicator: vi.fn(),
     appendFrame: vi.fn(),
-    useReducer: ref(false),
   }
 }
 

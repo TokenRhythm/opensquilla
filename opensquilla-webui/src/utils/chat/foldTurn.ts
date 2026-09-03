@@ -211,6 +211,28 @@ export class TurnAccumulator {
     return this.finalText ?? this.rawText
   }
 
+  /** Read bounded tool metadata without materializing the full render tree. */
+  currentToolCall(toolId: string): ChatToolCall | null {
+    const call = this.toolCallsById.get(toolId)
+    return call ? { ...call } : null
+  }
+
+  /** Return the first running tool using the same ordering as the live timeline. */
+  currentRunningToolCall(): ChatToolCall | null {
+    const call = this.toolCalls.find(candidate => candidate.isRunning)
+    return call ? { ...call } : null
+  }
+
+  hasToolBoundary(): boolean {
+    return this.toolCalls.length > 0
+      || this.segments.some(segment => segment.type === 'tool-group')
+  }
+
+  currentToolTiming(toolId: string): { startedAt: number; endedAt?: number } | null {
+    const timing = this.toolTimes.get(toolId)
+    return timing ? { ...timing } : null
+  }
+
   private ensureReasoningBlock(
     blockId: string | undefined,
     blockIndex: number | undefined,

@@ -73,7 +73,6 @@ function createHarness(options: {
     showThinkingIndicator: vi.fn(),
     hideThinkingIndicator: vi.fn(),
     appendFrame: vi.fn(),
-    useReducer: ref(false),
   }
   const markEnsembleHandoff = vi.fn()
   const bindRouterDecisionToModelCall = vi.fn()
@@ -602,7 +601,10 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
       })
 
       expect(stream.resetLiveTurnState).toHaveBeenCalledOnce()
-      expect(api.streamThinkingText.value).toBe('Recovered reasoning')
+      expect(stream.appendFrame).toHaveBeenCalledWith(expect.objectContaining({
+        kind: 'thinking',
+        text: 'Recovered reasoning',
+      }))
       expect(stream.appendToolCall).toHaveBeenCalledWith(expect.objectContaining({
         id: 'tool-1',
       }))
@@ -2130,7 +2132,6 @@ describe('useChatRpcEventHandlers reasoning timer replay', () => {
         list.push({ role: 'assistant', text: 'answer', ts: 'now' })
       },
     })
-    stream.useReducer.value = true
     stream.getThinkingText = vi.fn(() => 'folded reasoning')
     try {
       api.handlers.onWireEventFixture('session.event.thinking', {
@@ -2144,7 +2145,6 @@ describe('useChatRpcEventHandlers reasoning timer replay', () => {
         text: 'reasoning',
       })
 
-      expect(api.streamThinkingText.value).toBe('')
       expect(stream.appendFrame).toHaveBeenCalledTimes(2)
       api.handlers.onWireEventFixture('session.event.done', {
         session_key: 'agent:main:test',
@@ -2157,9 +2157,8 @@ describe('useChatRpcEventHandlers reasoning timer replay', () => {
     }
   })
 
-  it('records structured start, delta, and end frames without losing legacy text', () => {
+  it('records structured start, delta, and end frames', () => {
     const { api, stream, stop } = createHarness()
-    stream.useReducer.value = 'shadow'
 
     try {
       api.handlers.onWireEventFixture('session.event.thinking_start', {
@@ -2186,7 +2185,6 @@ describe('useChatRpcEventHandlers reasoning timer replay', () => {
         ended_at: Date.now(),
       })
 
-      expect(api.streamThinkingText.value).toBe('inspect')
       expect(stream.appendFrame).toHaveBeenNthCalledWith(1, expect.objectContaining({
         kind: 'thinking-start',
         blockId: 'reasoning-1',
@@ -2210,7 +2208,11 @@ describe('useChatRpcEventHandlers reasoning timer replay', () => {
   it('keeps elapsed time across A to B to A replay without leaking into B', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(105_000)
-    const { api, sessionKey, lastStreamSeq, stop } = createHarness()
+    const { api, sessionKey, lastStreamSeq, messages, stop } = createHarness({
+      endStreaming(list) {
+        list.push({ role: 'assistant', text: 'answer', ts: 'now' })
+      },
+    })
 
     try {
       api.handlers.onWireEventFixture('session.event.thinking', {
@@ -2219,14 +2221,10 @@ describe('useChatRpcEventHandlers reasoning timer replay', () => {
         text: 'first',
         started_at: 100_000,
       })
-      expect(api.streamThinkingElapsedText.value).toBe('5s')
-
       vi.setSystemTime(108_000)
       sessionKey.value = 'agent:main:other'
       lastStreamSeq.value = 0
       await nextTick()
-      expect(api.streamThinkingText.value).toBe('')
-
       sessionKey.value = 'agent:main:test'
       lastStreamSeq.value = 0
       await nextTick()
@@ -2236,8 +2234,6 @@ describe('useChatRpcEventHandlers reasoning timer replay', () => {
         text: 'first',
         started_at: 100_000,
       })
-      expect(api.streamThinkingElapsedText.value).toBe('8s')
-
       vi.setSystemTime(110_000)
       api.handlers.onWireEventFixture('session.event.thinking', {
         session_key: 'agent:main:test',
@@ -2245,7 +2241,17 @@ describe('useChatRpcEventHandlers reasoning timer replay', () => {
         text: ' second',
         started_at: 109_000,
       })
-      expect(api.streamThinkingElapsedText.value).toBe('10s')
+      api.handlers.onWireEventFixture('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 3,
+        text: 'answer',
+        reasoning_content: 'first second',
+        emitted_at: 110_000,
+      })
+      expect(messages.value[0]?.reasoning).toEqual({
+        text: 'first second',
+        seconds: 10,
+      })
     } finally {
       stop()
       vi.useRealTimers()
@@ -2297,7 +2303,7 @@ describe('useChatRpcEventHandlers reasoning timer replay', () => {
         5_000_000 - 60 * 60 * 1_000 - 1,
         Number.NaN,
       ]) {
-        const { api, stop } = createHarness()
+        const { api, stream, stop } = createHarness()
         try {
           api.handlers.onWireEventFixture('session.event.thinking', {
             session_key: 'agent:main:test',
@@ -2305,7 +2311,10 @@ describe('useChatRpcEventHandlers reasoning timer replay', () => {
             text: 'reasoning',
             started_at: startedAt,
           })
-          expect(api.streamThinkingElapsedText.value).toBe('0s')
+          expect(stream.appendFrame).toHaveBeenCalledWith(expect.objectContaining({
+            kind: 'thinking',
+            at: 5_000_000,
+          }))
         } finally {
           stop()
         }

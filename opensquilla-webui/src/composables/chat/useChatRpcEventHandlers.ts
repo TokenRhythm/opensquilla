@@ -1,4 +1,4 @@
-import { computed, onScopeDispose, ref, watch, type Ref } from 'vue'
+import { onScopeDispose, ref, watch, type Ref } from 'vue'
 import type {
   ChatMessage,
   ChatModelCallSegment,
@@ -40,7 +40,6 @@ import {
 import type { SessionBootstrapRun } from '@/composables/chat/useChatSessionBootstrap'
 import type { FrameInput, ReasoningBlock } from '@/types/turnlog'
 import type { StatusPart } from '@/types/parts'
-import type { FoldLiveTurnMode } from '@/composables/chat/useChatTurnLog'
 import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
 import { chatTaskId } from '@/composables/chat/useChatTaskOwnership'
 import {
@@ -126,12 +125,10 @@ export interface ChatRpcStreamApi {
   recordCompactionActivity?: (payload: CompactionPayload) => void
   showThinkingIndicator: () => void
   hideThinkingIndicator: () => void
-  // live-turn shadow log: the thinking ref lives here, so this composable appends
-  // its own thinking frames into the stream-owned log after the legacy mutation.
+  // Accepted reasoning events enter the stream-owned turn log.
   appendFrame: (frame: FrameInput) => void
   setAcceptedActivityOrder?: (order: number | undefined) => void
   noteReasoningPresentationDelta?: (text: string) => void
-  useReducer: Ref<FoldLiveTurnMode>
   getThinkingText?: () => string
 }
 
@@ -304,7 +301,6 @@ const TASK_TERMINAL_STATUSES = new Set([
 ])
 
 type LiveThinking = {
-  text: string
   startedAt: number
   serverStartedAt: number | null
 }
@@ -842,17 +838,14 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (authoritativeReasoningSnapshot) {
       const now = Date.now()
       streamThinking.value = {
-        text: authoritativeReasoningSnapshot,
         startedAt: now,
         serverStartedAt: null,
       }
-      if (stream.useReducer.value) {
-        stream.appendFrame({
-          kind: 'thinking',
-          text: authoritativeReasoningSnapshot,
-          at: now,
-        })
-      }
+      stream.appendFrame({
+        kind: 'thinking',
+        text: authoritativeReasoningSnapshot,
+        at: now,
+      })
     }
     stream.resetStreamIdleTimer()
 
@@ -1087,73 +1080,33 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     return true
   }
 
-  // 1s ticker so the live "Thinking · Ns" label advances on a clock while
-  // reasoning is open, not only when a new reasoning delta happens to arrive.
-  const elapsedTick = ref(0)
-  let elapsedTimer: ReturnType<typeof setInterval> | null = null
-  watch(
-    () => stream.isStreaming.value && !!streamThinking.value,
-    (active) => {
-      if (active && !elapsedTimer) {
-        elapsedTimer = setInterval(() => { elapsedTick.value++ }, 1000)
-      } else if (!active && elapsedTimer) {
-        clearInterval(elapsedTimer)
-        elapsedTimer = null
-      }
-    },
-  )
-  onScopeDispose(() => { if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null } })
-
-  const streamThinkingText = computed(() => streamThinking.value?.text || '')
-  // Recomputed per delta AND on the 1s tick so the label keeps pace between
-  // deltas; the final "Thought for Ns" uses the measured wall clock at done.
-  const streamThinkingElapsedText = computed(() => {
-    elapsedTick.value
-    const current = streamThinking.value
-    if (!current) return ''
-    const seconds = Math.max(0, Math.floor((Date.now() - current.startedAt) / 1000))
-    return `${seconds}s`
-  })
-
   function appendThinkingDelta(text: string, payload: SessionEventPayload) {
     if (!text) return
     if (!stream.isStreaming.value) stream.startStreaming()
     stream.noteReasoningPresentationDelta?.(text)
     const current = streamThinking.value
-    if (current) {
-      // Production renders reasoning from the non-reactive accumulator on the
-      // shared publish clock. Rebuilding this reactive prefix for every delta
-      // invalidated Vue 20,000 times and retained old strings between frames.
-      if (stream.useReducer.value !== true) {
-        streamThinking.value = { ...current, text: current.text + text }
-      }
-    } else {
+    if (!current) {
       const now = Date.now()
       const serverStartedAt = trustedReasoningStartedAt(payload.started_at, now)
       streamThinking.value = {
-        text: stream.useReducer.value === true ? '' : text,
         startedAt: serverStartedAt ?? now,
         serverStartedAt,
       }
     }
-    // The fold concats the same text into its thinkingText. Gating already
-    // passed upstream through the semantic reducer, so this mirrors an accepted delta.
-    if (stream.useReducer.value) {
-      const blockId = typeof payload.block_id === 'string'
-        ? payload.block_id
-        : typeof payload.blockId === 'string'
-          ? payload.blockId
-          : undefined
-      const rawBlockIndex = payload.block_index ?? payload.blockIndex
-      const blockIndex = typeof rawBlockIndex === 'number' ? rawBlockIndex : undefined
-      stream.appendFrame({
-        kind: 'thinking',
-        text,
-        at: trustedReasoningStartedAt(payload.started_at, Date.now()) ?? Date.now(),
-        ...(blockId ? { blockId } : {}),
-        ...(blockIndex !== undefined ? { blockIndex } : {}),
-      })
-    }
+    const blockId = typeof payload.block_id === 'string'
+      ? payload.block_id
+      : typeof payload.blockId === 'string'
+        ? payload.blockId
+        : undefined
+    const rawBlockIndex = payload.block_index ?? payload.blockIndex
+    const blockIndex = typeof rawBlockIndex === 'number' ? rawBlockIndex : undefined
+    stream.appendFrame({
+      kind: 'thinking',
+      text,
+      at: trustedReasoningStartedAt(payload.started_at, Date.now()) ?? Date.now(),
+      ...(blockId ? { blockId } : {}),
+      ...(blockIndex !== undefined ? { blockIndex } : {}),
+    })
     // Reasoning growth must re-pin the thread to the bottom just like answer
     // text and tool deltas. Schedule the same batched render/scroll flush so a
     // long thinking phase keeps following the live turn instead of only
@@ -1167,7 +1120,6 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
 
   function handleThinkingStart(payload: SessionEventPayload) {
     if (!stream.isStreaming.value) stream.startStreaming()
-    if (!stream.useReducer.value) return
     const blockId = typeof payload.block_id === 'string'
       ? payload.block_id
       : typeof payload.blockId === 'string'
@@ -1187,7 +1139,6 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   }
 
   function handleThinkingEnd(payload: SessionEventPayload) {
-    if (!stream.useReducer.value) return
     const blockId = typeof payload.block_id === 'string'
       ? payload.block_id
       : typeof payload.blockId === 'string'
@@ -2429,10 +2380,8 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         ? rawReasoningContent.trim()
         : ''
       const liveThinking = streamThinking.value
-      const foldedReasoning = stream.useReducer.value === true
-        ? stream.getThinkingText?.().trim() || ''
-        : ''
-      const reasoningText = doneReasoning || foldedReasoning || liveThinking?.text.trim() || ''
+      const foldedReasoning = stream.getThinkingText?.().trim() || ''
+      const reasoningText = doneReasoning || foldedReasoning
       const reasoningSeconds = (() => {
         if (!liveThinking) return 0
         const now = Date.now()
@@ -2805,8 +2754,6 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     onConversationEvent: handleConversationEvent,
     bindActiveStreamTask,
     restoreLiveTurnSnapshot,
-    streamThinkingText,
-    streamThinkingElapsedText,
     attachTurnReasoning,
     awaitingCommitTaskIds,
   }

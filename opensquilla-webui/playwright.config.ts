@@ -60,17 +60,12 @@ export default defineConfig({
           ? { launchOptions: { executablePath: chromiumExecutablePath } }
           : {}),
       },
-      // The fold-authoritative spec pins its flag explicitly and runs in the
-      // dedicated project below. The ordinary project excludes that live-only
-      // proof; production itself defaults to the fold unless explicitly set OFF.
+      // The append-only live-turn proof runs in the dedicated project below.
       testIgnore: /fold-live-turn\.spec\.ts/,
     },
     {
-      // Fold-authoritative proof: drive the live-stream paths with the fold authoritative
-      // (opensquilla.chat.foldLiveTurn=1, set per-page in the spec). The spec
-      // attaches the `[live-turn parity]` hard-fail, so this project is the
-      // deterministic proof the ON path renders byte-faithfully to legacy.
-      name: 'chromium-fold-on',
+      // Drive the real live-stream path through the sole turn projection.
+      name: 'chromium-live-turn',
       use: {
         ...devices['Desktop Chrome'],
         ...(chromiumExecutablePath

@@ -339,7 +339,7 @@ describe('useChatStream render coalescing', () => {
     api.cleanup()
   })
 
-  it('coalesces rapid deltas into a single frame flush and defers highlighting', () => {
+  it('coalesces rapid deltas into one publication without parsing the trailing answer', () => {
     const { api, scrollToBottom, renderMarkdown } = makeStream()
 
     api.appendDelta('a')
@@ -353,13 +353,8 @@ describe('useChatStream render coalescing', () => {
     vi.advanceTimersByTime(50) // past MIN_FLUSH_INTERVAL_MS
     rafCbs[0](0)
 
-    // Rendered once over the combined text, with highlighting deferred.
-    expect(renderMarkdown).toHaveBeenCalledTimes(1)
-    expect(renderMarkdown).toHaveBeenCalledWith('abc', {
-      highlight: false,
-      cache: 'none',
-      math: 'defer',
-    })
+    expect(renderMarkdown).not.toHaveBeenCalled()
+    expect(api.foldedTurn.value.rawText).toBe('abc')
     expect(scrollToBottom).toHaveBeenCalledTimes(1)
 
     api.cleanup()
@@ -375,7 +370,7 @@ describe('useChatStream render coalescing', () => {
     vi.advanceTimersByTime(50)
     rafCbs[0](0)
 
-    expect(renderMarkdown).toHaveBeenCalledTimes(1)
+    expect(renderMarkdown).not.toHaveBeenCalled()
     expect(api.foldedTurn.value.rawText).toHaveLength(2_048)
     expect(scrollToBottom).toHaveBeenCalledTimes(1)
     api.cleanup()
@@ -479,8 +474,6 @@ describe('useChatStream render coalescing', () => {
 
   it('does not parse the growing answer in the production reducer path', () => {
     const { api, renderMarkdown } = makeStream()
-    api.useReducer.value = true
-
     for (let index = 0; index < 2_048; index += 1) api.appendDelta('x')
     vi.advanceTimersByTime(50)
     rafCbs[0](0)
@@ -505,18 +498,15 @@ describe('useChatStream render coalescing', () => {
     expect(rafCbs.length).toBe(1)
     vi.advanceTimersByTime(50)
     rafCbs[0](0)
-    expect(renderMarkdown).toHaveBeenCalledTimes(1)
+    expect(renderMarkdown).not.toHaveBeenCalled()
+    expect(api.foldedTurn.value.rawText).toBe('a')
 
     api.appendDelta('b')
     expect(rafCbs.length).toBe(2) // a new frame is scheduled after the prior flush
     vi.advanceTimersByTime(50)
     rafCbs[1](0)
-    expect(renderMarkdown).toHaveBeenCalledTimes(2)
-    expect(renderMarkdown).toHaveBeenLastCalledWith('ab', {
-      highlight: false,
-      cache: 'none',
-      math: 'defer',
-    })
+    expect(renderMarkdown).not.toHaveBeenCalled()
+    expect(api.foldedTurn.value.rawText).toBe('ab')
 
     api.cleanup()
   })
@@ -1292,10 +1282,10 @@ describe('useChatStream render coalescing', () => {
 
   it('keeps production text solely in the accumulator across reconcile and steer', () => {
     const { api, messages } = makeStream()
-    api.useReducer.value = true
-
     api.appendDelta('before')
-    expect(api.streamTimelineItems.value).toEqual([])
+    expect(api.streamTimelineItems.value).toEqual([
+      expect.objectContaining({ type: 'text', rawText: 'before' }),
+    ])
     expect(api.foldedTurn.value.rawText).toBe('before')
     api.checkpointForUserMessage('turn-production-steer', 'steer-production')
     expect(messages.value[0]).toMatchObject({ role: 'assistant', text: 'before' })
@@ -1304,7 +1294,9 @@ describe('useChatStream render coalescing', () => {
     api.acknowledgeSteerBoundary('steer-production')
     api.appendDelta('stale')
     api.reconcileFinalText('canonical')
-    expect(api.streamTimelineItems.value).toEqual([])
+    expect(api.streamTimelineItems.value).toEqual([
+      expect.objectContaining({ type: 'text', rawText: 'canonical' }),
+    ])
     expect(api.foldedTurn.value.rawText).toBe('canonical')
     api.endStreaming()
     expect(messages.value[1]).toMatchObject({ role: 'assistant', text: 'canonical' })
@@ -1313,8 +1305,6 @@ describe('useChatStream render coalescing', () => {
 
   it('commits the complete production tool input from the accumulator', () => {
     const { api, messages } = makeStream()
-    api.useReducer.value = true
-
     api.appendToolCall({ tool_use_id: 'tool-long', tool_name: 'web_search' })
     for (let index = 0; index < 1_000; index += 1) {
       api.appendToolDelta({
@@ -1346,7 +1336,6 @@ describe('useChatStream render coalescing', () => {
 
   it('ignores provisional deltas for primary-only tools and commits the end snapshot', () => {
     const { api } = makeStream()
-    api.useReducer.value = true
     const presentation = {
       category: 'network_read' as const,
       primaryArguments: ['url'],
