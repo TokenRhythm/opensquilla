@@ -281,7 +281,11 @@ def _client_launch_daily_key(
     analytics_user_id = payload.get("analytics_user_id")
     surface = payload.get("surface")
     occurred_at = payload.get("occurred_at_utc")
-    if not all(isinstance(value, str) for value in (analytics_user_id, surface, occurred_at)):
+    if (
+        not isinstance(analytics_user_id, str)
+        or not isinstance(surface, str)
+        or not isinstance(occurred_at, str)
+    ):
         raise StorageCompatibilityError
     return analytics_user_id, surface, occurred_at[:10]
 
@@ -442,8 +446,13 @@ class TelemetryIngestStorage:
         cursor = await connection.execute(
             "SELECT schema_version, scope, protocol_fingerprint FROM meta WHERE singleton = 1"
         )
-        metadata = await cursor.fetchone()
+        metadata_row = await cursor.fetchone()
         await cursor.close()
+        metadata: tuple[int, str, str] | None = (
+            None
+            if metadata_row is None
+            else (int(metadata_row[0]), str(metadata_row[1]), str(metadata_row[2]))
+        )
         cursor = await connection.execute("PRAGMA user_version")
         user_version_row = await cursor.fetchone()
         await cursor.close()

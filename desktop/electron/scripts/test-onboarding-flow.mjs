@@ -1214,8 +1214,15 @@ try {
     consented_at_utc: null,
     forced_off: false,
   })
+  const reliabilitySpool = await waitFor(async () => {
+    const entries = (await readDirectoryOrEmpty(join(earlySpoolRoot, 'reliability'))).sort()
+    return JSON.stringify(entries) === JSON.stringify([
+      '.desktop-reliability-session.tmp',
+      'keep.ready',
+    ]) ? entries : null
+  }, 'consent-gated reliability session marker')
   assert.deepEqual(
-    (await readdir(join(earlySpoolRoot, 'reliability'))).sort(),
+    reliabilitySpool,
     ['.desktop-reliability-session.tmp', 'keep.ready'],
     'enabling reliability must preserve its queued event and start the consent-gated session marker',
   )

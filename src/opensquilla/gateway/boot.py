@@ -4076,10 +4076,8 @@ def build_turn_runner_from_services(
                 None,
             )
         ),
+        growth_event_sink=getattr(svc, "growth_event_sink", None),
     )
-    # Private, typed producer handle for owner-authenticated telemetry RPCs.
-    # It is never populated from request metadata or a client-provided value.
-    runner.growth_event_sink = getattr(svc, "growth_event_sink", None)
     return runner
 
 

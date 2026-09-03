@@ -4663,6 +4663,7 @@ class TurnRunner:
         file_parse_reliability_sink: FileParseReliabilitySink | None = None,
         turn_growth_started_sink: GrowthMilestoneSink | None = None,
         turn_growth_succeeded_sink: GrowthMilestoneSink | None = None,
+        growth_event_sink: Any | None = None,
     ) -> None:
         self._provider_selector = provider_selector
         self._tool_registry = tool_registry
@@ -4687,6 +4688,9 @@ class TurnRunner:
         self._file_parse_reliability_sink = file_parse_reliability_sink
         self._turn_growth_started_sink = turn_growth_started_sink
         self._turn_growth_succeeded_sink = turn_growth_succeeded_sink
+        # Owner-authenticated telemetry RPCs need the durable launch producer;
+        # keep the handle explicit rather than attaching an undeclared field.
+        self.growth_event_sink = growth_event_sink
         self._reliability_clock = time.monotonic
         # Populated alongside the existing session-id lookup so live usage
         # events retain reset fencing without a second storage round trip.

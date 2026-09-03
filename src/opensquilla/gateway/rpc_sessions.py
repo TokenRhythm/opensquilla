@@ -5175,14 +5175,7 @@ async def _handle_sessions_send_impl_inner(
             from opensquilla.gateway.rpc_telemetry import is_registered_tui_connection
             from opensquilla.telemetry.contracts.common import ClientSurface, ExecutionMode
 
-            terminal_dimensions = (
-                {
-                    "telemetry_surface": ClientSurface.TUI,
-                    "telemetry_execution_mode": ExecutionMode.GATEWAY,
-                }
-                if is_registered_tui_connection(ctx.conn_id)
-                else {}
-            )
+            tui_connection = is_registered_tui_connection(ctx.conn_id)
             raw_stream = ctx.turn_runner.run(
                 provider_message_text,
                 key,
@@ -5197,7 +5190,8 @@ async def _handle_sessions_send_impl_inner(
                 semantic_message=semantic_message_text,
                 fresh_user_session=fresh_user_session,
                 root_turn_id=turn_id,
-                **terminal_dimensions,
+                telemetry_surface=ClientSurface.TUI if tui_connection else None,
+                telemetry_execution_mode=ExecutionMode.GATEWAY if tui_connection else None,
             )
             raw_stream_idle_timeout = effective_agent_stream_idle_timeout_seconds(ctx.config)
             stream_idle_timeout: float | None = (

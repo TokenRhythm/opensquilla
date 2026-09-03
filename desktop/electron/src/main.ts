@@ -2474,6 +2474,21 @@ function ensembleConfigTomlLines(credential: DesktopConnection): string[] {
 
 function privacyConfigTomlLines(
   credential: DesktopConnection,
+): string[] {
+  if (!desktopConfigShouldWritePrivacySection(credential)) return []
+  return [
+    '',
+    '[privacy]',
+    `disable_network_observability = ${credential.disableNetworkObservability ? 'true' : 'false'}`,
+  ]
+}
+
+function desktopConfigShouldWritePrivacySection(credential: DesktopConnection): boolean {
+  return credential.disableNetworkObservability || readDesktopConfigNetworkObservabilitySetting() !== null
+}
+
+function scopedPrivacyConfigTomlLines(
+  credential: DesktopConnection,
   existingRaw: string | null,
   consentOverride: DesktopTelemetryConsent | null,
 ): string[] {
@@ -2484,6 +2499,11 @@ function privacyConfigTomlLines(
     || persistedLegacy !== null
     || consent.reliability.enabled !== null
     || consent.growth.enabled !== null
+  if (
+    consentOverride === null
+    && consent.reliability.enabled === null
+    && consent.growth.enabled === null
+  ) return privacyConfigTomlLines(credential)
   return desktopPrivacyTomlLines(
     credential.disableNetworkObservability,
     consent,
@@ -3353,6 +3373,9 @@ function renderDesktopConfigAfterPreflight(
   defaultLocale: DesktopLocale,
   consentOverride: DesktopTelemetryConsent | null = null,
 ): string {
+  // Retain the legacy privacy writer as the no-scoped-consent path. The
+  // scoped writer extends it only when an explicit v2 decision exists.
+  const basePrivacyLines = privacyConfigTomlLines(credential)
   let preservedForeignSections: string[] = []
   let preservedForeignPreamble: string[] = []
   const preservedControlUiLocale = persistedControlUiDefaultLocale(existingRaw)
@@ -3380,7 +3403,11 @@ function renderDesktopConfigAfterPreflight(
     '',
     ...routerConfigTomlLines(credential),
     ...ensembleConfigTomlLines(credential),
-    ...privacyConfigTomlLines(credential, existingRaw, consentOverride),
+    ...(consentOverride === null
+      && parseDesktopTelemetryConsent(existingRaw).reliability.enabled === null
+      && parseDesktopTelemetryConsent(existingRaw).growth.enabled === null
+      ? basePrivacyLines
+      : scopedPrivacyConfigTomlLines(credential, existingRaw, consentOverride)),
     '',
     ...freshDesktopSandboxConfigLines(existingRaw, process.platform),
     '[control_ui]',
@@ -9433,6 +9460,8 @@ async function startGateway(): Promise<GatewayState> {
 }
 
 async function startGatewayWithPortRecovery(): Promise<GatewayState> {
+  const telemetryAttempt = createGatewayStartTelemetryAttempt()
+  gatewayStartTelemetryAttempt = telemetryAttempt
   // Begin each fresh recovery sequence at the first port so a previously-used
   // port that is now free is reused. The cursor still advances within this loop
   // to skip a port whose bind lost a post-probe race, but it must not persist
@@ -9441,17 +9470,26 @@ async function startGatewayWithPortRecovery(): Promise<GatewayState> {
   if (!hasExplicitGatewayPort()) gatewayPortCursor = GATEWAY_PORT_FIRST
   const maxAttempts = hasExplicitGatewayPort() ? 1 : GATEWAY_PORT_LAST - GATEWAY_PORT_FIRST + 1
   let lastError: unknown = null
-  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    try {
-      return await startGateway()
-    } catch (err) {
-      lastError = err
-      const message = err instanceof Error ? err.message : String(err)
-      if (hasExplicitGatewayPort() || !gatewayExitLooksLikePortInUse(message)) throw err
-      desktopLog('gateway_port_retry', { attempt: attempt + 1 })
+  try {
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      try {
+        const state = await startGateway()
+        finishGatewayStartTelemetry(telemetryAttempt, null)
+        return state
+      } catch (err) {
+        lastError = err
+        const message = err instanceof Error ? err.message : String(err)
+        if (hasExplicitGatewayPort() || !gatewayExitLooksLikePortInUse(message)) throw err
+        desktopLog('gateway_port_retry', { attempt: attempt + 1 })
+      }
     }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError || 'Gateway port retry exhausted.'))
+  } catch (error) {
+    finishGatewayStartTelemetry(telemetryAttempt, error)
+    throw error
+  } finally {
+    if (gatewayStartTelemetryAttempt === telemetryAttempt) gatewayStartTelemetryAttempt = null
   }
-  throw lastError instanceof Error ? lastError : new Error(String(lastError || 'Gateway port retry exhausted.'))
 }
 
 // The normal application renderer has a stable, local origin. Gateway HTTP and
@@ -9808,22 +9846,9 @@ function ensureGatewayStarted(): Promise<GatewayState> {
     gatewayState.status = 'starting'
     gatewayState.error = undefined
     publishGatewayConnection()
-    const telemetryAttempt = createGatewayStartTelemetryAttempt()
-    gatewayStartTelemetryAttempt = telemetryAttempt
-    gatewayStartPromise = startGatewayWithPortRecovery()
-      .then((state) => {
-        finishGatewayStartTelemetry(telemetryAttempt, null)
-        return state
-      }, (error) => {
-        finishGatewayStartTelemetry(telemetryAttempt, error)
-        throw error
-      })
-      .finally(() => {
-        gatewayStartPromise = null
-        if (gatewayStartTelemetryAttempt === telemetryAttempt) {
-          gatewayStartTelemetryAttempt = null
-        }
-      })
+    gatewayStartPromise = startGatewayWithPortRecovery().finally(() => {
+      gatewayStartPromise = null
+    })
   }
   return gatewayStartPromise
 }
@@ -10053,13 +10078,15 @@ async function openOrResumeDesktopApp(): Promise<void> {
         // bounded the active profile. Sync before publishing that inspection's
         // terminal result so existing opt-in users retain profile-start facts;
         // new/unset consent remains fail-closed.
-        try {
-          await syncDesktopConsentMirror()
-        } catch (error) {
-          desktopTelemetryRuntimeGate.close()
-          desktopLog('desktop_telemetry_consent_preflight_failed', {
-            error: error instanceof Error ? error.message : 'unknown error',
-          })
+        if (profileReady) {
+          try {
+            await syncDesktopConsentMirror()
+          } catch (error) {
+            desktopTelemetryRuntimeGate.close()
+            desktopLog('desktop_telemetry_consent_preflight_failed', {
+              error: error instanceof Error ? error.message : 'unknown error',
+            })
+          }
         }
         if (!profileReady && operationIsCurrent()) {
           finishAppStartFailure(new Error('profile recovery required'), {

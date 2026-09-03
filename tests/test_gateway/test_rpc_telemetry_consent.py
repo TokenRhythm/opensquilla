@@ -133,14 +133,17 @@ def _context(
     coordinator: ScopeConsentCoordinator | None = None,
     scopes: tuple[str, ...] = ("operator.write",),
 ) -> RpcContext:
-    return RpcContext(
+    context = RpcContext(
         conn_id="telemetry-consent-test",
         principal=_principal(*scopes),
         config=config,
-        telemetry_consent_coordinator=coordinator,
-        telemetry_consent_cleanup=cleanup,
-        telemetry_growth_eligibility_cleanup=eligibility_cleanup,
     )
+    # These are narrow host/test extension hooks resolved with getattr by the
+    # telemetry boundary; they do not expand the shared request context schema.
+    context.telemetry_consent_coordinator = coordinator
+    context.telemetry_consent_cleanup = cleanup
+    context.telemetry_growth_eligibility_cleanup = eligibility_cleanup
+    return context
 
 
 def _mirror(config: GatewayConfig) -> dict[str, Any]:
@@ -324,13 +327,13 @@ async def test_declined_scope_is_cleaned_before_it_can_be_enabled(
         assert _mirror(config)["reliability"]["enabled"] is False
         order.append("cleanup")
 
-    real_persist = rpc_telemetry._persist_config
+    real_persist = rpc_telemetry.persist_gateway_config
 
     def persist(candidate: GatewayConfig) -> None:
         order.append("persist")
         real_persist(candidate)
 
-    monkeypatch.setattr(rpc_telemetry, "_persist_config", persist)
+    monkeypatch.setattr(rpc_telemetry, "persist_gateway_config", persist)
     monkeypatch.setattr(rpc_telemetry, "_utc_now", lambda: _NOW)
 
     result = await _handle_telemetry_consent_set(
@@ -377,7 +380,7 @@ async def test_persist_failure_does_not_open_gate_or_run_withdrawal_cleanup(
     def fail_persist(_: GatewayConfig) -> None:
         raise OSError("synthetic persist failure")
 
-    monkeypatch.setattr(rpc_telemetry, "_persist_config", fail_persist)
+    monkeypatch.setattr(rpc_telemetry, "persist_gateway_config", fail_persist)
     with pytest.raises(RpcHandlerError) as raised:
         await _handle_telemetry_consent_set(
             {"scope": "reliability", "enabled": False},
@@ -454,14 +457,14 @@ async def test_repeated_withdrawal_retries_cleanup_without_rewriting_config(
         nonlocal cleanup_calls
         cleanup_calls += 1
 
-    real_persist = rpc_telemetry._persist_config
+    real_persist = rpc_telemetry.persist_gateway_config
 
     def persist(candidate: GatewayConfig) -> None:
         nonlocal persist_calls
         persist_calls += 1
         real_persist(candidate)
 
-    monkeypatch.setattr(rpc_telemetry, "_persist_config", persist)
+    monkeypatch.setattr(rpc_telemetry, "persist_gateway_config", persist)
     context = _context(config, cleanup=cleanup)
     first = await _handle_telemetry_consent_set({"scope": "reliability", "enabled": False}, context)
     second = await _handle_telemetry_consent_set(

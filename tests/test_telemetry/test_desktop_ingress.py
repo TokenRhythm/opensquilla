@@ -191,6 +191,40 @@ async def test_valid_scope_is_claimed_enqueued_then_deleted(tmp_path: Path) -> N
     assert not list(tmp_path.rglob("*.processing.*"))
 
 
+async def test_claim_refresh_falls_back_when_nofollow_utime_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ready = _write_ready(tmp_path, "growth", _growth_payload())
+    enqueued: list[object] = []
+    real_utime = os.utime
+
+    def windows_style_utime(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        times: tuple[float, float] | None = None,
+        *,
+        follow_symlinks: bool = True,
+    ) -> None:
+        if not follow_symlinks:
+            raise NotImplementedError("no-follow utime is unavailable")
+        real_utime(path, times)
+
+    monkeypatch.setattr(os, "utime", windows_style_utime)
+    config = _config()
+    stats = await drain_desktop_early_spool(
+        tmp_path,
+        config=config,
+        recorders=_recorders(config, enqueued.append),
+        env={},
+        now=NOW,
+    )
+
+    assert stats.enqueued == 1
+    assert len(enqueued) == 1
+    assert not ready.exists()
+    assert not list(tmp_path.rglob("*.processing.*"))
+
+
 @pytest.mark.parametrize(
     ("config", "payload"),
     [

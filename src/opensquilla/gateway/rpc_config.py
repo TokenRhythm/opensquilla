@@ -63,6 +63,12 @@ def _update_config_in_place(old: Any, new: Any) -> None:
         old.reconcile_runtime_overrides(new)
 
 
+def update_gateway_config_in_place(old: Any, new: Any) -> None:
+    """Public persistence-boundary wrapper for non-config RPC domains."""
+
+    _update_config_in_place(old, new)
+
+
 async def _notify_goal_config_changed(ctx: RpcContext, previous_config: Any) -> None:
     """Apply the committed Goal kill-switch transition to the live service."""
 
@@ -116,6 +122,12 @@ def _persist_config(config: Any) -> None:
         path=str(result.path),
         backup=str(result.backup_path) if result.backup_path else None,
     )
+
+
+def persist_gateway_config(config: Any) -> None:
+    """Persist a validated Gateway config through the shared durable writer."""
+
+    _persist_config(config)
 
 
 _PUBLIC_DERIVED_CONFIG_PATHS = frozenset(

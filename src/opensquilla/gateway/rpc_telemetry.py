@@ -10,10 +10,15 @@ from typing import Any
 
 import structlog
 
+from opensquilla.gateway.adapters.telemetry_contract import register_telemetry_contract
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.config_secrets import inherit_then_clear_explicit
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
-from opensquilla.gateway.rpc_config import _persist_config, _update_config_in_place
+from opensquilla.gateway.rpc_config import (
+    persist_gateway_config,
+    update_gateway_config_in_place,
+)
 from opensquilla.observability.network_policy import telemetry_scope_forced_off_reasons
 from opensquilla.telemetry.consent import (
     CURRENT_PRODUCT_ANALYTICS_NOTICE_VERSION,
@@ -199,8 +204,8 @@ def _commit_record(
 
     # Durable state wins before the shared live object changes. On failure the
     # old gate remains authoritative in both memory and the config file.
-    _persist_config(candidate)
-    _update_config_in_place(ctx.config, candidate)
+    persist_gateway_config(candidate)
+    update_gateway_config_in_place(ctx.config, candidate)
     return True
 
 
@@ -319,7 +324,6 @@ def _response(
     }
 
 
-@_d.method("telemetry.consent.set", scope="operator.write")
 async def _handle_telemetry_consent_set(
     params: dict[str, Any] | None,
     ctx: RpcContext,
@@ -477,7 +481,6 @@ async def _handle_telemetry_consent_set(
         )
 
 
-@_d.method("telemetry.client_launch.record", scope="operator.write")
 async def _handle_client_launch_record(
     params: dict[str, Any] | None,
     ctx: RpcContext,
@@ -507,6 +510,22 @@ async def _handle_client_launch_record(
         execution_mode=ExecutionMode.GATEWAY,
     )
     return {"recorded": bool(recorded)}
+
+
+_handle_telemetry_consent_set_contract = register_telemetry_contract(
+    _d,
+    "telemetry.consent.set",
+    _handle_telemetry_consent_set,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_client_launch_record_contract = register_telemetry_contract(
+    _d,
+    "telemetry.client_launch.record",
+    _handle_client_launch_record,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 __all__ = [

@@ -245,6 +245,8 @@ class GrowthEventSink:
                 if existing is not None:
                     if existing.status is GrowthMilestoneStatus.ENQUEUED:
                         return None
+                    if not isinstance(existing.event, ClientLaunch):
+                        raise GrowthStateError("client launch state contains another event type")
                     return key, existing.event
                 event = ClientLaunch(
                     event_name="client_launch",

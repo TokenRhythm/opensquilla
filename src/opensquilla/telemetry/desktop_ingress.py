@@ -124,6 +124,32 @@ def _restore_processing_claim(processing: Path, ready: Path, now_timestamp: floa
     return _unlink_best_effort(processing)
 
 
+def _mark_processing_claim_current(path: Path, now_timestamp: float) -> bool:
+    """Refresh a claimed file without requiring no-follow ``utime`` on Windows."""
+
+    timestamps = (now_timestamp, now_timestamp)
+    try:
+        os.utime(path, timestamps, follow_symlinks=False)
+        return True
+    except NotImplementedError:
+        # CPython does not expose no-follow utime on every Windows filesystem.
+        # Revalidate the claimed path before using the portable path-based call.
+        metadata = _lstat(path)
+        if (
+            metadata is None
+            or stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+        ):
+            return False
+        try:
+            os.utime(path, timestamps)
+            return True
+        except OSError:
+            return False
+    except OSError:
+        return False
+
+
 def _recover_stale_processing(
     scope_directory: Path,
     *,
@@ -351,9 +377,7 @@ async def drain_desktop_early_spool(
             _unlink_best_effort(processing)
             rejected += 1
             continue
-        try:
-            os.utime(processing, (now_timestamp, now_timestamp), follow_symlinks=False)
-        except OSError:
+        if not _mark_processing_claim_current(processing, now_timestamp):
             if _restore_processing_claim(processing, candidate.path, now_timestamp):
                 retried += 1
             continue

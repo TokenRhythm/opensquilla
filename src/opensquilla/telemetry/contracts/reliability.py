@@ -294,7 +294,7 @@ class TurnResult(ReliabilityEventBase):
 class TurnResultV2(TurnResult):
     """Turn result with a trusted client surface and execution topology."""
 
-    event_version: Literal[2]
+    event_version: Literal[2]  # type: ignore[assignment]
     surface: ClientSurface
     execution_mode: ExecutionMode
 
@@ -302,7 +302,7 @@ class TurnResultV2(TurnResult):
 class TurnResultV3(TurnResult):
     """Turn result with a closed failure stage and optional client dimensions."""
 
-    event_version: Literal[3]
+    event_version: Literal[3]  # type: ignore[assignment]
     surface: ClientSurface | None = None
     execution_mode: ExecutionMode | None = None
     failure_stage: TurnFailureStage | None
@@ -337,7 +337,7 @@ class ToolCallResult(ReliabilityEventBase):
 class ToolCallResultV2(ToolCallResult):
     """Tool result with the surface of its enclosing public turn."""
 
-    event_version: Literal[2]
+    event_version: Literal[2]  # type: ignore[assignment]
     surface: ClientSurface
     execution_mode: ExecutionMode
 
@@ -360,7 +360,7 @@ class FileParseResult(ReliabilityEventBase):
 class FileParseResultV2(FileParseResult):
     """File parse result with the surface of its enclosing public turn."""
 
-    event_version: Literal[2]
+    event_version: Literal[2]  # type: ignore[assignment]
     surface: ClientSurface
     execution_mode: ExecutionMode
 

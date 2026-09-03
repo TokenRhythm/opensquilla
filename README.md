@@ -434,6 +434,8 @@ automatic desktop update checks. It does not create, erase, or replace either
 saved per-scope consent decision. CI, test, and `DO_NOT_TRACK` environments
 also fail closed for telemetry. Other user-initiated actions may still contact
 configured providers, search services, channels, or release hosts.
+Explicit update-availability checks remain disabled while the unified or
+legacy update opt-out controls are active.
 
 Legacy opt-out environment variables remain honored:
 
