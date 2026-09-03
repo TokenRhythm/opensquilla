@@ -103,6 +103,36 @@ class CapabilityMutationPort(Protocol):
     def reset(self, config: Any, capability_id: str) -> Any: ...
 
 
+class AudioCapabilityMutationPort(Protocol):
+    def configure_audio(self, config: Any, command: ConfigureAudio) -> Any: ...
+
+
+class AudioCapabilityRuntimePort(Protocol):
+    async def sync_media(self, config: Any) -> None: ...
+
+
+class AudioCapabilitySetup:
+    """Configure audio through the shared durable setup transaction."""
+
+    def __init__(
+        self,
+        config: SetupConfigPort,
+        runtime: AudioCapabilityRuntimePort,
+        mutations: AudioCapabilityMutationPort,
+    ) -> None:
+        self._config = config
+        self._runtime = runtime
+        self._mutations = mutations
+
+    async def configure(self, command: ConfigureAudio) -> SetupMutation:
+        result = self._mutations.configure_audio(
+            self._config.active_config(), command
+        )
+        return await commit_setup_mutation(
+            result, config_port=self._config, effects=(self._runtime.sync_media,)
+        )
+
+
 class CapabilitySetup:
     def __init__(
         self,
@@ -172,12 +202,11 @@ class CapabilitySetup:
         return await commit_setup_mutation(result, config_port=self._config)
 
     async def configure_audio(self, command: ConfigureAudio) -> SetupMutation:
-        result = self._mutations.configure_audio(
-            self._config.active_config(), command
-        )
-        return await commit_setup_mutation(
-            result, config_port=self._config, effects=(self._runtime.sync_media,)
-        )
+        return await AudioCapabilitySetup(
+            self._config,
+            self._runtime,
+            self._mutations,
+        ).configure(command)
 
     async def reset(self, capability_id: str) -> SetupMutation:
         result = self._mutations.reset(self._config.active_config(), capability_id)
@@ -211,6 +240,9 @@ class CapabilitySetup:
 
 
 __all__ = [
+    "AudioCapabilityMutationPort",
+    "AudioCapabilityRuntimePort",
+    "AudioCapabilitySetup",
     "CapabilitySetup",
     "CapabilityMutationPort",
     "ConfigureAudio",

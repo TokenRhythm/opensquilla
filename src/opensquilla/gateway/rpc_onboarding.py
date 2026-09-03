@@ -23,10 +23,24 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from opensquilla.gateway.config_secrets import inherit_runtime_secrets
 from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.model_routing import broadcast_model_routing_changed
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
+from opensquilla.gateway.setup_config_runtime import (
+    active_gateway_config as _active_config,
+)
+from opensquilla.gateway.setup_config_runtime import (
+    gateway_config_path as _config_path_for,
+)
+from opensquilla.gateway.setup_config_runtime import (
+    install_gateway_config_candidate as _apply_inplace,
+)
+from opensquilla.gateway.setup_config_runtime import (
+    persist_setup_candidate as _persist,
+)
+from opensquilla.gateway.setup_config_runtime import (
+    sync_media_runtime as _sync_image_generation,
+)
 from opensquilla.onboarding.redaction import is_redacted_secret_sentinel
 from opensquilla.search.types import DEFAULT_SEARCH_MAX_RESULTS
 
@@ -80,48 +94,6 @@ log = structlog.get_logger(__name__)
 _d = get_dispatcher()
 
 
-def _active_config(ctx: RpcContext) -> Any:
-    """Return the gateway's running config when available, else load from disk."""
-    if ctx.config is not None:
-        return ctx.config
-    from opensquilla.onboarding.config_store import load_config
-
-    return load_config()
-
-
-def _config_path_for(ctx: RpcContext, source: Any) -> str | None:
-    """Resolve the persistence path that matches ``source``.
-
-    Prefers the path stored on the running ``GatewayConfig`` so RPCs save back
-    to wherever the gateway booted from (e.g. ``./opensquilla.toml``) rather
-    than the env-default user config.
-    """
-    path = getattr(source, "config_path", None)
-    if path:
-        return str(path)
-    return None
-
-
-def _apply_inplace(ctx: RpcContext, new_cfg: Any) -> None:
-    """Mirror new config fields into ``ctx.config`` so the running gateway sees them."""
-    if ctx.config is None or ctx.config is new_cfg:
-        return
-    for field_name in type(new_cfg).model_fields:
-        setattr(ctx.config, field_name, getattr(new_cfg, field_name))
-    inherit_runtime_secrets(new_cfg, ctx.config)
-    # The mutation clone started from a deep copy of ctx.config's provenance
-    # state and then applied the operator's clear_runtime_override /
-    # mark_force_persist decisions, so it is authoritative — adopt it
-    # wholesale. Without this, a runtime-override record cleared on the
-    # clone never reaches the live config, and the stale live record makes a
-    # later unrelated persist rewrite the field back to the value the
-    # operator just replaced (env-URL / user-URL flip-flops on disk).
-    if hasattr(ctx.config, "inherit_persist_provenance") and hasattr(
-        new_cfg, "_runtime_field_overrides"
-    ):
-        ctx.config.inherit_persist_provenance(new_cfg)
-
-
 def _sync_provider_selector(ctx: RpcContext, llm_cfg: Any) -> None:
     selector = getattr(ctx, "provider_selector", None)
     if selector is None or llm_cfg is None or not hasattr(selector, "sync_primary"):
@@ -167,18 +139,6 @@ def _sync_provider_selector(ctx: RpcContext, llm_cfg: Any) -> None:
     )
 
 
-def _sync_image_generation(config: Any) -> None:
-    from opensquilla.tools.builtin.media import configure_audio, configure_image_generation
-
-    configure_image_generation(
-        getattr(config, "image_generation", None),
-        gateway_config=config,
-        llm_config=getattr(config, "llm", None),
-        squilla_router_config=getattr(config, "squilla_router", None),
-    )
-    configure_audio(getattr(config, "audio", None))
-
-
 def _sync_search_provider(config: Any) -> None:
     from opensquilla.tools.builtin.web import configure_search
 
@@ -192,43 +152,6 @@ def _sync_search_provider(config: Any) -> None:
         fallback_policy=config.search_fallback_policy,
         diagnostics=config.search_diagnostics,
     )
-
-
-def _persist(
-    ctx: RpcContext,
-    new_cfg: Any,
-    *,
-    restart_required: bool,
-    backup_credential_redaction: CredentialBackupRedaction | None = None,
-    remove_paths: tuple[str, ...] = (),
-) -> str:
-    from opensquilla.onboarding.config_store import persist_config
-
-    # Mutation results are cloned from the active config and carry their own
-    # authoritative runtime-secret markers.  Do not re-inherit the live set
-    # here: an explicit credential replacement deliberately clears its old
-    # env-derived marker so the new value is persisted.  Copying the marker
-    # back would silently omit the replacement from disk and keep exposing the
-    # startup environment credential through the live settings UI.
-    path = _config_path_for(ctx, new_cfg) or _config_path_for(ctx, ctx.config)
-    persist = persist_config(
-        new_cfg,
-        path=path,
-        restart_required=restart_required,
-        backup_credential_redaction=backup_credential_redaction,
-        remove_paths=remove_paths,
-    )
-    # Preserve the resolved path on the running config so subsequent saves
-    # round-trip to the same file.
-    if hasattr(new_cfg, "config_path") and not getattr(new_cfg, "config_path", None):
-        new_cfg.config_path = str(persist.path)
-    if (
-        ctx.config is not None
-        and hasattr(ctx.config, "config_path")
-        and not getattr(ctx.config, "config_path", None)
-    ):
-        ctx.config.config_path = str(persist.path)
-    return str(persist.path)
 
 
 def _provider_backup_credential_redaction(
@@ -1634,98 +1557,24 @@ async def _memory_embedding_configure(params: Any, ctx: RpcContext) -> dict[str,
     return result.to_payload()
 
 
-async def apply_audio_provider_configuration(
-    config_holder: Any,
-    *,
-    provider_id: str,
-    api_key: str = "",
-    api_key_env: str = "",
-    base_url: str = "",
-    enabled: bool = True,
-    tts_voice: str = "",
-    tts_model: str = "",
-    language_code: str = "",
-) -> dict[str, Any]:
-    """Validate, persist, and hot-apply one audio provider configuration.
-
-    The single safe write path for audio config, shared by the
-    ``onboarding.audio.configure`` RPC and the agent-facing ``audio_config``
-    builtin tool. ``config_holder`` only needs a ``config`` attribute carrying
-    the live ``GatewayConfig`` (an ``RpcContext``, or a shim for tools).
-
-    The returned mapping is secret-safe: ``entry`` is the mutation's redacted
-    public payload and never carries the API key.
-    """
+async def _audio_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
     from opensquilla.application.capability_setup import ConfigureAudio
 
-    result = await _capability_setup(config_holder).configure_audio(
-        ConfigureAudio(
-            provider_id=provider_id,
-            api_key=api_key,
-            api_key_env=api_key_env,
-            base_url=base_url,
-            enabled=enabled,
-            tts_voice=tts_voice,
-            tts_model=tts_model,
-            language_code=language_code,
-        )
-    )
-    return result.to_payload()
-
-
-async def apply_agent_audio_provider_configuration(
-    config_holder: Any,
-    *,
-    provider_id: str,
-    api_key: str = "",
-    api_key_env: str = "",
-    enabled: bool = True,
-    tts_voice: str = "",
-    tts_model: str = "",
-    language_code: str = "",
-) -> dict[str, Any]:
-    """Apply the constrained audio configuration exposed to agents.
-
-    Operator-facing RPCs may configure compatible endpoints and custom
-    credential environment variables. The agent tool is deliberately pinned
-    to the provider registry so it cannot redirect an unrelated environment
-    credential to a model-selected endpoint.
-    """
-    from opensquilla.onboarding.audio_specs import get_audio_provider_setup_spec
-
-    spec = get_audio_provider_setup_spec(provider_id)
-    if api_key_env and api_key_env != spec.env_key:
-        raise ValueError(
-            f"audio provider {provider_id!r} only accepts api_key_env={spec.env_key!r} "
-            "through this tool"
-        )
-    return await apply_audio_provider_configuration(
-        config_holder,
-        provider_id=provider_id,
-        api_key=api_key,
-        api_key_env=api_key_env,
-        base_url=spec.default_base_url,
-        enabled=enabled,
-        tts_voice=tts_voice,
-        tts_model=tts_model,
-        language_code=language_code,
-    )
-
-
-async def _audio_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
     provider_id = _require(params, "providerId")
     p = params if isinstance(params, dict) else {}
-    return await apply_audio_provider_configuration(
-        ctx,
-        provider_id=provider_id,
-        api_key=p.get("apiKey", ""),
-        api_key_env=p.get("apiKeyEnv", ""),
-        base_url=p.get("baseUrl", ""),
-        enabled=p.get("enabled", True),
-        tts_voice=p.get("ttsVoice", ""),
-        tts_model=p.get("ttsModel", ""),
-        language_code=p.get("languageCode", ""),
+    result = await _capability_setup(ctx).configure_audio(
+        ConfigureAudio(
+            provider_id=provider_id,
+            api_key=p.get("apiKey", ""),
+            api_key_env=p.get("apiKeyEnv", ""),
+            base_url=p.get("baseUrl", ""),
+            enabled=p.get("enabled", True),
+            tts_voice=p.get("ttsVoice", ""),
+            tts_model=p.get("ttsModel", ""),
+            language_code=p.get("languageCode", ""),
+        ),
     )
+    return result.to_payload()
 
 
 async def _capability_reset(params: Any, ctx: RpcContext) -> dict[str, Any]:

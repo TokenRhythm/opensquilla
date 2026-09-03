@@ -6,10 +6,6 @@ import inspect
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
-from opensquilla.gateway.model_routing import (
-    model_routing_patches,
-    model_routing_public_snapshot,
-)
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.provider.model_catalog import ModelCatalog
 
@@ -268,48 +264,20 @@ async def _handle_models_list(params: dict | None, ctx: RpcContext) -> dict[str,
     )
 
 
-async def _read_model_routing(ctx: RpcContext) -> dict[str, Any]:
-    if ctx.config is None:
-        raise ValueError("No config available")
-    return model_routing_public_snapshot(ctx.config)
-
-
-async def _write_model_routing(
-    mode: str,
-    ctx: RpcContext,
-) -> dict[str, Any]:
-    if ctx.config is None:
-        raise ValueError("No config available")
-
-    # Reuse the safe write transaction so persistence, validation, runtime
-    # synchronization, and old config.patch.safe clients keep one contract.
-    from opensquilla.gateway.rpc_config import _handle_config_patch_safe
-
-    patch_result = await _handle_config_patch_safe(
-        {"patches": model_routing_patches(ctx.config, mode)},
-        ctx,
-    )
-    return {
-        **model_routing_public_snapshot(ctx.config),
-        "patched": list(patch_result.get("patched") or []),
-        "restart_required": bool(
-            patch_result.get("restartRequired", patch_result.get("restart_required", False))
-        ),
-    }
-
-
 def _model_routing(ctx: RpcContext) -> ApplicationModelRouting:
     from opensquilla.application.provider_configuration import ModelRouting
     from opensquilla.gateway.adapters.provider_configuration import (
-        RpcContextModelRoutingPort,
+        GatewayModelRoutingPolicyPort,
+        RpcContextModelRoutingRuntimePort,
     )
+    from opensquilla.gateway.adapters.setup_config import GatewaySetupConfigPort
 
+    if ctx.config is None:
+        raise ValueError("No config available")
     return ModelRouting(
-        RpcContextModelRoutingPort(
-            ctx,
-            reader=_read_model_routing,
-            writer=_write_model_routing,
-        )
+        GatewaySetupConfigPort(ctx),
+        GatewayModelRoutingPolicyPort(),
+        RpcContextModelRoutingRuntimePort(ctx),
     )
 
 

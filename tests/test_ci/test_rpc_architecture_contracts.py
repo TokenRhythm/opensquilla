@@ -332,11 +332,6 @@ APPROVED_PRIVATE_RPC_IMPORTS: Counter[tuple[str, str, str]] = Counter(
             "_handle_sessions_send",
         ): 1,
         (
-            "src/opensquilla/gateway/rpc_models.py",
-            "opensquilla.gateway.rpc_config",
-            "_handle_config_patch_safe",
-        ): 1,
-        (
             "src/opensquilla/gateway/rpc_sessions.py",
             "opensquilla.gateway.rpc_chat",
             "_handle_chat_history",

@@ -31,7 +31,19 @@ from opensquilla.gateway.model_routing import (
     model_routing_public_snapshot,
     reconcile_model_routing_write,
 )
+from opensquilla.gateway.provider_runtime import (
+    resolve_provider_selector_config as _resolve_provider_selector_config,
+)
+from opensquilla.gateway.provider_runtime import (
+    sync_provider_selector as _sync_provider_selector,
+)
+from opensquilla.gateway.provider_runtime import (
+    sync_resolved_provider_selector as _sync_resolved_provider_selector,
+)
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
+from opensquilla.gateway.setup_config_runtime import (
+    sync_media_runtime as _sync_image_generation,
+)
 
 if TYPE_CHECKING:
     from opensquilla.application.app_settings import AppSettings
@@ -421,50 +433,6 @@ def _validate_memory_embedding_semantics(config: Any) -> None:
     from opensquilla.memory.embedding_resolver import resolve_memory_embedding
 
     resolve_memory_embedding(memory_cfg, local_available=lambda *_: False)
-
-
-def _resolve_provider_selector_config(config: Any) -> Any | None:
-    llm_cfg = getattr(config, "llm", None)
-    if llm_cfg is None:
-        return None
-
-    from opensquilla.gateway.llm_runtime import resolve_llm_runtime_config
-    from opensquilla.provider.selector import ProviderConfig
-
-    runtime = resolve_llm_runtime_config(config)
-    return ProviderConfig(
-        provider=runtime.provider,
-        model=runtime.model,
-        api_key=runtime.api_key,
-        base_url=runtime.base_url,
-        proxy=runtime.proxy,
-        provider_routing=runtime.provider_routing,
-    )
-
-
-def _sync_resolved_provider_selector(ctx: RpcContext, provider_config: Any | None) -> None:
-    if provider_config is None:
-        return
-    selector = getattr(ctx, "provider_selector", None)
-    if selector is None or not hasattr(selector, "sync_primary"):
-        return
-    selector.sync_primary(provider_config)
-
-
-def _sync_provider_selector(ctx: RpcContext, config: Any) -> None:
-    _sync_resolved_provider_selector(ctx, _resolve_provider_selector_config(config))
-
-
-def _sync_image_generation(config: Any) -> None:
-    from opensquilla.tools.builtin.media import configure_audio, configure_image_generation
-
-    configure_image_generation(
-        getattr(config, "image_generation", None),
-        gateway_config=config,
-        llm_config=getattr(config, "llm", None),
-        squilla_router_config=getattr(config, "squilla_router", None),
-    )
-    configure_audio(getattr(config, "audio", None))
 
 
 def _sync_model_catalog_overrides(config: Any) -> None:
