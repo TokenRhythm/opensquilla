@@ -661,6 +661,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       return
     }
     mergeWalRecords(records, sessionKey)
+    // A terminal receipt may have been recorded before its released owner rows
+    // became visible. Hydration is the final boundary that can make them
+    // drainable, so re-check the deferred signal after merging the WAL.
+    flushDeferredPendingDrain()
     const walIds = new Set(records.map(record => record.pendingInputId))
 
     if (!supportsServerQueue()) {
@@ -1411,10 +1415,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     sourceSessionKey: string,
     targetSessionKey: string,
     ownerRequestId: string,
-  ): Promise<void> {
-    if (!sourceSessionKey || !targetSessionKey || !ownerRequestId) return
+  ): Promise<boolean> {
+    if (!sourceSessionKey || !targetSessionKey || !ownerRequestId) return false
     const committed = await acceptDurableHandoff(targetSessionKey, ownerRequestId)
-    if (!committed) return
+    if (!committed) return false
     if (options.sessionKey.value === targetSessionKey) {
       const restored = parkedQueues.get(targetSessionKey) || []
       parkedQueues.delete(targetSessionKey)
@@ -1426,6 +1430,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     }
     broadcastChange(sourceSessionKey)
     broadcastChange(targetSessionKey)
+    return true
   }
 
   async function failPendingQueueHandoff(ownerRequestId: string): Promise<void> {

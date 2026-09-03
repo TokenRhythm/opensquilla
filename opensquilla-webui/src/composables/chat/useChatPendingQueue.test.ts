@@ -1849,6 +1849,63 @@ describe('useChatPendingQueue delivery state', () => {
     }
   })
 
+  it('flushes a deferred terminal drain when its released WAL row hydrates later', async () => {
+    vi.useFakeTimers()
+    const sessionKey = 'agent:main:webchat:test'
+    const record: PendingInputWalRecord = {
+      schemaVersion: 1,
+      pendingInputId: 'pending-late-hydrate-drain',
+      sessionKey,
+      clientRequestId: 'request-late-hydrate-drain',
+      clientMessageId: 'message-late-hydrate-drain',
+      text: 'dispatch after hydrate',
+      attachments: [],
+      intent: null,
+      state: 'local_only',
+      mayHaveServerCopy: false,
+      walRevision: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    const { wal } = memoryWal([record])
+    const baseList = wal.list
+    let releaseHydrate!: () => void
+    wal.list = vi.fn(async key => {
+      await new Promise<void>(resolve => {
+        releaseHydrate = resolve
+      })
+      return baseList(key)
+    })
+    let blocked = true
+    const dispatchPendingItem = vi.fn(async () => 'accepted' as const)
+    const harness = makeQueue(
+      dispatchPendingItem,
+      () => blocked,
+      undefined,
+      undefined,
+      { pendingInputWal: wal, hasRpcMethod: () => false },
+    )
+    try {
+      await vi.waitFor(() => expect(releaseHydrate).toBeTypeOf('function'))
+      expect(harness.queue.pendingQueue.value).toEqual([])
+      harness.queue.schedulePendingDrainAfterTerminal()
+
+      blocked = false
+      releaseHydrate()
+      await vi.waitFor(() => expect(harness.queue.pendingQueue.value).toHaveLength(1))
+      await vi.advanceTimersByTimeAsync(50)
+      await nextTick()
+
+      expect(dispatchPendingItem).toHaveBeenCalledWith(
+        expect.objectContaining({ pendingInputId: record.pendingInputId }),
+        sessionKey,
+      )
+    } finally {
+      harness.queue.cleanup()
+      vi.useRealTimers()
+    }
+  })
+
   it('drains an image queue item exactly once after the live capability unblocks', async () => {
     vi.useFakeTimers()
     let blocked = true

@@ -362,4 +362,80 @@ describe('BrowserPendingInputWal atomic handoff cancellation', () => {
 
     wal!.close()
   })
+
+  it('releases a failed owned handoff only back to its source session', async () => {
+    const factory = new ControlledIdbFactory()
+    const wal = createPendingInputWal(factory.idbFactory)
+    expect(wal).not.toBeNull()
+
+    const ownerRequestId = 'owner-failed-release'
+    const sourceSessionKey = 'agent:main:webchat:source'
+    const pendingInputId = 'pending-failed-release'
+    const pending: PendingInputWalRecord = {
+      schemaVersion: 1,
+      pendingInputId,
+      sessionKey: sourceSessionKey,
+      clientRequestId: 'pending-client-request',
+      clientMessageId: 'pending-client-message',
+      text: 'return to the source queue',
+      attachments: [],
+      intent: null,
+      ownerRequestId,
+      state: 'saving',
+      walRevision: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    const handoff: ResponseHandoffWalRecord = {
+      schemaVersion: 1,
+      ownerRequestId,
+      requestSessionKey: sourceSessionKey,
+      clientRequestId: ownerRequestId,
+      clientMessageId: 'failed-receipt-message',
+      params: {
+        sessionKey: sourceSessionKey,
+        message: 'rejected fork',
+        clientRequestId: ownerRequestId,
+        clientMessageId: 'failed-receipt-message',
+      },
+      composerText: 'rejected fork',
+      recoveryAttachments: [],
+      backgroundOnly: true,
+      walOwnerId: 'failed-wal-owner',
+      walRevision: 3,
+      state: 'failed',
+      errorCode: 'rejected',
+      createdAt: 1,
+      updatedAt: 2,
+    }
+
+    await wal!.put(pending)
+    await wal!.putHandoff!(handoff)
+
+    await expect(wal!.acceptHandoff!(
+      ownerRequestId,
+      'agent:main:webchat:other',
+    )).rejects.toThrow('Response handoff is not durably accepted')
+
+    const released = await wal!.acceptHandoff!(ownerRequestId, sourceSessionKey)
+    expect(released?.handoff).toMatchObject({
+      state: 'accepted',
+      acceptedSessionKey: sourceSessionKey,
+    })
+    expect(released?.records).toEqual([
+      expect.objectContaining({
+        pendingInputId,
+        sessionKey: sourceSessionKey,
+        ownerRequestId: undefined,
+        state: 'saving',
+        walRevision: 2,
+      }),
+    ])
+    expect(factory.record(PENDING_STORE, pendingInputId)).toMatchObject({
+      sessionKey: sourceSessionKey,
+      ownerRequestId: undefined,
+    })
+
+    wal!.close()
+  })
 })

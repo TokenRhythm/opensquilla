@@ -1697,6 +1697,18 @@ const isStopPending = computed(() => (
   || acceptanceRecoveryPending.value
 ))
 let bindActiveStreamTask = (taskId: string) => { activeStreamTaskId.value = taskId }
+let beginBackgroundReceiptReplay = (_clientMessageId: string, _holdHistory = false) => {}
+let trackBackgroundReceiptTask = (
+  _clientMessageId: string,
+  _taskId: string,
+  _terminal: boolean | string = false,
+  _allowProjection = true,
+  _retireParentProjection = false,
+  _acceptedStatus = '',
+) => {}
+let finishBackgroundReceiptReplay = (_clientMessageId: string) => {}
+let holdBackgroundReceiptReconciliation = () => {}
+let releaseBackgroundReceiptReconciliation = () => {}
 let restoreLiveTurnSnapshot = (_snapshot: SessionReadSnapshot) => {}
 
 function projectWorkspaceFromSessionRead(
@@ -2387,6 +2399,8 @@ const {
   loadEarlierHistory,
   retryHistory: retryHistoryRequest,
   scheduleHistorySync,
+  holdHistorySync,
+  releaseHistorySync,
   cancelAnchorStabilization,
   cancelActiveHistory,
   markSessionMissing,
@@ -2541,6 +2555,7 @@ const voiceCapability = useSetupStatus<{ audioConfigured?: boolean }>(injectedSe
 const voiceReady = computed(() => voiceCapability.data.value?.audioConfigured === true)
 
 const chatMessageActions = useChatMessageActions({
+  sessionKey,
   messages,
   inputText,
   isStreaming,
@@ -2563,11 +2578,25 @@ const chatMessageActions = useChatMessageActions({
   },
   notifyMessagePending: () => pushToast(t('chat.toast.messageStillSaving'), { tone: 'info' }),
   notifyEditBlocked: () => pushToast(t('chat.pending.editWhileStreaming'), { tone: 'info' }),
+  onEditStarted: () => {
+    holdBackgroundReceiptReconciliation()
+    holdHistorySync()
+  },
+  onEditSettled: () => {
+    releaseBackgroundReceiptReconciliation()
+    releaseHistorySync()
+  },
 })
 const {
   copyMessage,
   regenerateMessage,
   editMessage,
+  cancelEdit,
+  commitEdit,
+  validateEditOwner,
+  adoptRejectedEditRows,
+  editGeneration,
+  editActive,
 } = chatMessageActions
 
 async function handleRegenerateMessage(
@@ -3311,6 +3340,7 @@ const chatComposerShortcuts = useChatComposerShortcuts({
   popPendingTail,
   enqueuePendingInput,
   sendCurrentInput: () => sendCurrentInput(),
+  cancelMessageEdit: () => cancelEdit(),
 })
 const {
   onTextareaBeforeInput,
@@ -3338,6 +3368,11 @@ const chatSend = useChatSend({
   runMode,
   pendingAttachments,
   composerRevision,
+  messageEditGeneration: editGeneration,
+  messageEditActive: editActive,
+  validateMessageEditOwner: validateEditOwner,
+  commitMessageEdit: commitEdit,
+  adoptRejectedMessageEditRows: adoptRejectedEditRows,
   pendingSessionIntent,
   pendingWorkspaceId,
   sendBlockedReason: effectiveSendBlockedReason,
@@ -3437,6 +3472,29 @@ const chatSend = useChatSend({
   restoreSteerIntoComposer: text => appendComposerText(text),
   popAllPendingIntoComposer,
   reconcileTaskOwnership: () => retrySessionMetadata(),
+  beginBackgroundReceiptReplay: (clientMessageId, holdHistory) => (
+    beginBackgroundReceiptReplay(clientMessageId, holdHistory)
+  ),
+  trackBackgroundReceiptTask: (
+    clientMessageId,
+    taskId,
+    terminal,
+    allowProjection,
+    retireParentProjection,
+    acceptedStatus,
+  ) => (
+    trackBackgroundReceiptTask(
+      clientMessageId,
+      taskId,
+      terminal,
+      allowProjection,
+      retireParentProjection,
+      acceptedStatus,
+    )
+  ),
+  finishBackgroundReceiptReplay: clientMessageId => (
+    finishBackgroundReceiptReplay(clientMessageId)
+  ),
   classifySlashCommand,
   executeSlashCommand,
   closeSlashMenu,
@@ -3897,6 +3955,11 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   refreshRunModePreference: refreshPostBootstrapMetadata,
 })
 bindActiveStreamTask = rpcEventHandlers.bindActiveStreamTask
+beginBackgroundReceiptReplay = rpcEventHandlers.beginBackgroundReceiptReplay
+trackBackgroundReceiptTask = rpcEventHandlers.trackBackgroundReceiptTask
+finishBackgroundReceiptReplay = rpcEventHandlers.finishBackgroundReceiptReplay
+holdBackgroundReceiptReconciliation = rpcEventHandlers.holdBackgroundReceiptReconciliation
+releaseBackgroundReceiptReconciliation = rpcEventHandlers.releaseBackgroundReceiptReconciliation
 restoreLiveTurnSnapshot = rpcEventHandlers.restoreLiveTurnSnapshot
 const {
   streamThinkingText,

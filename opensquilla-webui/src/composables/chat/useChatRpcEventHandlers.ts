@@ -412,6 +412,427 @@ interface TurnActivityRecord {
 }
 
 export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions) {
+  interface BackgroundReceiptTask {
+    clientMessageId: string
+    terminalSeen: boolean
+    allowProjection: boolean
+    lifecycleStatus: string
+  }
+
+  interface DeferredBackgroundReceiptTerminal {
+    clientMessageId: string
+    eventKind: ConversationSemanticEventKind | 'sessions-changed'
+    payload: SessionEventPayload
+    status: string
+    terminalTask: object
+    priority: number
+  }
+
+  const pendingBackgroundReceiptClientIds = new Set<string>()
+  const backgroundReceiptClientIds = new Set<string>()
+  const backgroundReceiptTasks = new Map<string, BackgroundReceiptTask>()
+  const deferredBackgroundReceiptTerminals = new Map<
+    string,
+    DeferredBackgroundReceiptTerminal
+  >()
+  const dirtyBackgroundReceiptClientIds = new Set<string>()
+  const reconciledBackgroundReceiptClientIds = new Set<string>()
+  const settledBackgroundReceiptClientIds = new Set<string>()
+  let backgroundReceiptEditHeld = false
+  let backgroundReceiptHoldSessionKey = ''
+
+  function rememberBackgroundReceiptClient(clientMessageId: string) {
+    const normalizedClientId = String(clientMessageId || '').trim()
+    if (!normalizedClientId) return
+    if (!backgroundReceiptClientIds.has(normalizedClientId) && backgroundReceiptClientIds.size >= 256) {
+      const oldestClientId = backgroundReceiptClientIds.values().next().value
+      if (typeof oldestClientId === 'string') {
+        backgroundReceiptClientIds.delete(oldestClientId)
+        dirtyBackgroundReceiptClientIds.delete(oldestClientId)
+        reconciledBackgroundReceiptClientIds.delete(oldestClientId)
+        settledBackgroundReceiptClientIds.delete(oldestClientId)
+      }
+    }
+    backgroundReceiptClientIds.add(normalizedClientId)
+  }
+
+  function holdBackgroundReceiptReconciliation() {
+    if (!backgroundReceiptEditHeld) backgroundReceiptHoldSessionKey = sessionKey.value
+    backgroundReceiptEditHeld = true
+  }
+
+  function flushBackgroundReceiptReconciliationIfReady() {
+    if (backgroundReceiptEditHeld || dirtyBackgroundReceiptClientIds.size === 0) return
+    for (const clientMessageId of dirtyBackgroundReceiptClientIds) {
+      reconciledBackgroundReceiptClientIds.add(clientMessageId)
+    }
+    dirtyBackgroundReceiptClientIds.clear()
+    options.scheduleHistorySync()
+  }
+
+  function releaseBackgroundReceiptReconciliation() {
+    backgroundReceiptEditHeld = false
+    if (backgroundReceiptHoldSessionKey !== sessionKey.value) {
+      dirtyBackgroundReceiptClientIds.clear()
+      backgroundReceiptHoldSessionKey = ''
+      return
+    }
+    backgroundReceiptHoldSessionKey = ''
+    flushBackgroundReceiptReconciliationIfReady()
+  }
+
+  function beginBackgroundReceiptReplay(clientMessageId: string, holdHistory = false) {
+    const normalizedClientId = String(clientMessageId || '').trim()
+    if (!normalizedClientId) return
+    const isNewReceipt = !backgroundReceiptClientIds.has(normalizedClientId)
+    pendingBackgroundReceiptClientIds.add(normalizedClientId)
+    rememberBackgroundReceiptClient(normalizedClientId)
+    if (isNewReceipt) reconciledBackgroundReceiptClientIds.delete(normalizedClientId)
+    if (holdHistory) holdBackgroundReceiptReconciliation()
+  }
+
+  function rememberBackgroundReceiptTask(
+    clientMessageId: string,
+    taskId: string,
+    terminalSeen = false,
+    allowProjection?: boolean,
+    lifecycleStatus = '',
+  ) {
+    const normalizedClientId = String(clientMessageId || '').trim()
+    const normalizedTaskId = String(taskId || '').trim()
+    if (!normalizedClientId || !normalizedTaskId) return
+    rememberBackgroundReceiptClient(normalizedClientId)
+    const existing = backgroundReceiptTasks.get(normalizedTaskId)
+    if (!existing && backgroundReceiptTasks.size >= 256) {
+      const oldestTaskId = backgroundReceiptTasks.keys().next().value
+      if (typeof oldestTaskId === 'string') {
+        backgroundReceiptTasks.delete(oldestTaskId)
+        deferredBackgroundReceiptTerminals.delete(oldestTaskId)
+      }
+    }
+    backgroundReceiptTasks.set(normalizedTaskId, {
+      clientMessageId: normalizedClientId,
+      terminalSeen: terminalSeen || existing?.terminalSeen === true,
+      allowProjection: allowProjection ?? existing?.allowProjection ?? false,
+      lifecycleStatus: (
+        ['running', 'approval_pending'].includes(existing?.lifecycleStatus || '')
+        && !['running', 'approval_pending'].includes(lifecycleStatus)
+      )
+        ? existing!.lifecycleStatus
+        : lifecycleStatus || existing?.lifecycleStatus || '',
+    })
+  }
+
+  function trackBackgroundReceiptTask(
+    clientMessageId: string,
+    taskId: string,
+    terminal: boolean | string = false,
+    allowProjection = true,
+    retireParentProjection = false,
+    acceptedStatus = '',
+  ) {
+    const normalizedClientId = String(clientMessageId || '').trim()
+    const normalizedTaskId = String(taskId || '').trim()
+    const terminalStatus = typeof terminal === 'string'
+      ? terminal.trim().toLowerCase()
+      : terminal ? 'succeeded' : ''
+    rememberBackgroundReceiptClient(normalizedClientId)
+    rememberBackgroundReceiptTask(
+      normalizedClientId,
+      normalizedTaskId,
+      Boolean(terminalStatus),
+      allowProjection,
+    )
+    const deferredCandidate = normalizedTaskId
+      ? deferredBackgroundReceiptTerminals.get(normalizedTaskId)
+      : undefined
+    const deferredTerminal = deferredCandidate?.clientMessageId === normalizedClientId
+      ? deferredCandidate
+      : undefined
+    if (!allowProjection) {
+      if (normalizedTaskId && (terminalStatus || retireParentProjection)) {
+        options.taskOwnership?.noteTerminal(normalizedTaskId, false)
+      }
+      deferredBackgroundReceiptTerminals.delete(normalizedTaskId)
+      if (terminalStatus) {
+        settleBackgroundReceiptTerminal(
+          normalizedClientId,
+          normalizedTaskId,
+          terminalStatus,
+          {},
+          false,
+        )
+      }
+      return
+    }
+    if (deferredTerminal) {
+      deferredBackgroundReceiptTerminals.delete(normalizedTaskId)
+      options.taskOwnership?.noteTerminal(normalizedTaskId)
+      markTaskSettled(deferredTerminal.payload)
+      if (!reconciledBackgroundReceiptClientIds.has(normalizedClientId)) {
+        dirtyBackgroundReceiptClientIds.add(normalizedClientId)
+        flushBackgroundReceiptReconciliationIfReady()
+      }
+      const hasContinuation = deferredTerminal.eventKind === 'sessions-changed'
+        && applyBackgroundReceiptContinuation(deferredTerminal.payload, normalizedTaskId)
+      settleBackgroundReceiptTerminal(
+        normalizedClientId,
+        normalizedTaskId,
+        deferredTerminal.status,
+        deferredTerminal.terminalTask,
+        !hasContinuation,
+      )
+      return
+    }
+    if (terminalStatus) {
+      deferredBackgroundReceiptTerminals.delete(normalizedTaskId)
+      options.taskOwnership?.noteTerminal(normalizedTaskId)
+      if (!reconciledBackgroundReceiptClientIds.has(normalizedClientId)) {
+        dirtyBackgroundReceiptClientIds.add(normalizedClientId)
+        flushBackgroundReceiptReconciliationIfReady()
+      }
+      settleBackgroundReceiptTerminal(
+        normalizedClientId,
+        normalizedTaskId,
+        terminalStatus,
+        {},
+        true,
+      )
+      return
+    }
+    if (normalizedTaskId) {
+      const cachedStatus = backgroundReceiptTasks.get(normalizedTaskId)?.lifecycleStatus || ''
+      const lifecycleStatus = (
+        ['running', 'approval_pending'].includes(cachedStatus)
+          ? cachedStatus
+          : acceptedStatus || cachedStatus || 'queued'
+      )
+      options.taskOwnership?.noteAccepted(normalizedTaskId, lifecycleStatus)
+      if (lifecycleStatus === 'queued') {
+        options.applySessionRunState({
+          run_status: 'queued',
+          active_task: { task_id: normalizedTaskId, status: 'queued' },
+        })
+      } else if (['running', 'approval_pending'].includes(lifecycleStatus)) {
+        options.applySessionRunState({
+          run_status: lifecycleStatus,
+          active_task: { task_id: normalizedTaskId, status: lifecycleStatus },
+        })
+      }
+    }
+  }
+
+  function settleBackgroundReceiptTerminal(
+    clientMessageId: string,
+    taskId: string,
+    rawStatus: string,
+    terminalTask: object,
+    allowProjection: boolean,
+  ) {
+    if (!clientMessageId || settledBackgroundReceiptClientIds.has(clientMessageId)) return
+    settledBackgroundReceiptClientIds.add(clientMessageId)
+    // The receipt owns its history/task cleanup, but never the visible run
+    // projection while a newer foreground send still owns the stream.
+    if (
+      !allowProjection
+      || stream.isStreaming.value
+      || activeStreamTaskId.value === PENDING_STREAM_TASK_ID
+      || activeTaskGroups.value.size > 0
+      || options.taskOwnership?.hasAuthoritativeWork.value
+    ) return
+    const normalizedStatus = options.normalizeRunStatus(rawStatus)
+    const failed = ['failed', 'timeout', 'abandoned'].includes(normalizedStatus)
+    const interrupted = ['cancelled', 'interrupted'].includes(normalizedStatus)
+    clearLiveThinking()
+    options.clearPendingRouterDecision()
+    options.applySessionRunState({
+      run_status: failed ? 'failed' : interrupted ? 'cancelled' : 'idle',
+      last_task: {
+        ...terminalTask,
+        ...(taskId ? { task_id: taskId } : {}),
+        status: normalizedStatus || (failed ? 'failed' : 'succeeded'),
+      },
+    })
+    if (pendingQueue.value.length > 0 && !interrupted) {
+      options.schedulePendingDrainAfterTerminal()
+    }
+  }
+
+  function finishBackgroundReceiptReplay(clientMessageId: string) {
+    pendingBackgroundReceiptClientIds.delete(String(clientMessageId || '').trim())
+  }
+
+  function receiptEventIdentities(payload: SessionEventPayload): Array<{
+    clientMessageId: string
+    taskId: string
+  }> {
+    const candidates = [
+      payload,
+      payload.changed_task,
+      payload.changedTask,
+      payload.last_task,
+      payload.lastTask,
+      payload.active_task,
+      payload.activeTask,
+    ]
+    const identities: Array<{ clientMessageId: string, taskId: string }> = []
+    for (const candidate of candidates) {
+      if (!candidate || typeof candidate !== 'object') continue
+      const record = candidate as Record<string, unknown>
+      const clientMessageId = String(
+        record.client_message_id || record.clientMessageId || '',
+      ).trim()
+      const taskId = String(
+        record.task_id || record.taskId || record.turn_id || record.turnId || '',
+      ).trim()
+      if (!taskId) continue
+      if (!identities.some(identity => (
+        identity.taskId === taskId && identity.clientMessageId === clientMessageId
+      ))) identities.push({ clientMessageId, taskId })
+    }
+    return identities
+  }
+
+  function matchingBackgroundReceiptIdentity(payload: SessionEventPayload): {
+    clientMessageId: string
+    taskId: string
+    allowProjection: boolean
+  } | null {
+    for (const identity of receiptEventIdentities(payload)) {
+      const tracked = backgroundReceiptTasks.get(identity.taskId)
+      if (tracked) {
+        return {
+          clientMessageId: tracked.clientMessageId,
+          taskId: identity.taskId,
+          allowProjection: tracked.allowProjection,
+        }
+      }
+      if (
+        identity.clientMessageId
+        && backgroundReceiptClientIds.has(identity.clientMessageId)
+      ) return { ...identity, allowProjection: false }
+    }
+    return null
+  }
+
+  function applyBackgroundReceiptContinuation(
+    payload: SessionEventPayload,
+    receiptTaskId: string,
+  ): boolean {
+    const activeTask = (payload.active_task || payload.activeTask) as Record<string, unknown> | undefined
+    const activeTaskId = activeTask
+      ? String(activeTask.task_id || activeTask.taskId || activeTask.turn_id || activeTask.turnId || '').trim()
+      : ''
+    if (!activeTask || !activeTaskId || activeTaskId === receiptTaskId) return false
+    const activeStatus = String(activeTask?.status || '').trim().toLowerCase()
+    if (activeStatus === 'queued') options.taskOwnership?.noteQueued(activeTask)
+    else options.taskOwnership?.noteRunning({ ...activeTask, status: activeStatus || 'running' })
+    const continuation: SessionEventPayload = {
+      ...payload,
+      reason: 'background_receipt_continuation',
+      run_status: activeStatus || 'running',
+    }
+    delete continuation.changed_task
+    delete continuation.changedTask
+    delete continuation.last_task
+    delete continuation.lastTask
+    delete continuation.status
+    handleRpcSessionsChanged(continuation)
+    return true
+  }
+
+  function deferredBackgroundReceiptTerminalPriority(
+    eventKind: ConversationSemanticEventKind | 'sessions-changed',
+    payload: SessionEventPayload,
+  ): number {
+    if (eventKind !== 'sessions-changed') return 1
+    const activeTask = payload.active_task || payload.activeTask
+    return activeTask && typeof activeTask === 'object' ? 3 : 2
+  }
+
+  function suppressBackgroundReceiptEvent(
+    eventKind: ConversationSemanticEventKind | 'sessions-changed',
+    payload: SessionEventPayload,
+  ): boolean {
+    if (isStaleEpoch(payload)) return false
+    if (!isCurrentSessionPayload(payload)) return false
+    const identity = matchingBackgroundReceiptIdentity(payload)
+    if (!identity) return false
+    const { clientMessageId: owner, taskId, allowProjection } = identity
+    const terminalEvent = eventKind === 'sessions-changed'
+      ? sessionChangeIsTerminal(payload)
+      : isTerminalEvent(eventKind)
+    // A matching lifecycle frame can beat the replay ACK. Bind only the exact
+    // client-message owner: unrelated same-session tasks from another tab must
+    // remain visible and must never enter this quarantine.
+    rememberBackgroundReceiptTask(owner, taskId)
+    if (eventKind === 'task-queued') {
+      rememberBackgroundReceiptTask(owner, taskId, false, undefined, 'queued')
+      if (allowProjection) {
+        options.taskOwnership?.noteQueued({ ...payload, status: 'queued' })
+      }
+    } else if (eventKind === 'task-running') {
+      rememberBackgroundReceiptTask(owner, taskId, false, undefined, 'running')
+      if (allowProjection) {
+        options.taskOwnership?.noteRunning({ ...payload, status: 'running' })
+      }
+    }
+    if (terminalEvent) {
+      const terminalTask = terminalSessionChangeTask(payload)
+      const rawStatus = String(
+        terminalTask?.status
+          || payload.status
+          || payload.task_status
+          || payload.run_status
+          || payload.runStatus
+          || '',
+      ).trim().toLowerCase()
+      const status = rawStatus
+        || (eventKind === 'sessions-changed' ? '' : eventTaskTerminalStatus(eventKind))
+        || (eventKind === 'turn-failed' ? 'failed' : 'succeeded')
+      rememberBackgroundReceiptTask(owner, taskId, true)
+      if (!allowProjection) {
+        const priority = deferredBackgroundReceiptTerminalPriority(eventKind, payload)
+        const existing = deferredBackgroundReceiptTerminals.get(taskId)
+        if (
+          !existing
+          || priority > existing.priority
+          || (priority === existing.priority && !existing.status && Boolean(status))
+        ) {
+          deferredBackgroundReceiptTerminals.set(taskId, {
+            clientMessageId: owner,
+            eventKind,
+            payload,
+            status,
+            terminalTask: terminalTask || payload,
+            priority,
+          })
+        }
+        return true
+      }
+      options.taskOwnership?.noteTerminal(taskId)
+      markTaskSettled(payload)
+      if (!reconciledBackgroundReceiptClientIds.has(owner)) {
+        dirtyBackgroundReceiptClientIds.add(owner)
+      }
+      flushBackgroundReceiptReconciliationIfReady()
+      // Keep the task identity through the complete terminal echo cluster
+      // (done -> sessions.changed -> task.* / turn.committed). For a terminal
+      // session projection, retain an unrelated successor task without allowing
+      // the receipt's history sync to replace the newer Edit transcript.
+      const hasContinuation = eventKind === 'sessions-changed'
+        && applyBackgroundReceiptContinuation(payload, taskId)
+      settleBackgroundReceiptTerminal(
+        owner,
+        taskId,
+        status,
+        terminalTask || payload,
+        !hasContinuation,
+      )
+    }
+    return true
+  }
+
   const {
     sessionKey,
     currentEpoch,
@@ -1357,6 +1778,15 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   }
 
   watch(sessionKey, () => {
+    pendingBackgroundReceiptClientIds.clear()
+    backgroundReceiptClientIds.clear()
+    backgroundReceiptTasks.clear()
+    deferredBackgroundReceiptTerminals.clear()
+    dirtyBackgroundReceiptClientIds.clear()
+    reconciledBackgroundReceiptClientIds.clear()
+    settledBackgroundReceiptClientIds.clear()
+    backgroundReceiptEditHeld = false
+    backgroundReceiptHoldSessionKey = ''
     streamThinking.value = null
     clearGenerationTracking()
     turnReasoningLog.length = 0
@@ -2584,7 +3014,10 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
    */
   function handleConversationEvent(message: ConversationEvent) {
     if (message.kind === 'sessions-changed') {
-      handleRpcSessionsChanged(message.payload as SessionEventPayload)
+      const payload = message.payload as SessionEventPayload
+      if (!suppressBackgroundReceiptEvent('sessions-changed', payload)) {
+        handleRpcSessionsChanged(payload)
+      }
       return
     }
 
@@ -2599,6 +3032,13 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     }
 
     const event = message.event
+    if (
+      event.kind === 'known'
+      && suppressBackgroundReceiptEvent(
+        event.semanticKind,
+        message.payload as SessionEventPayload,
+      )
+    ) return
     if (event.kind === 'known') {
       switch (event.semanticKind) {
         case 'answer-generation-reset':
@@ -2809,5 +3249,10 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     streamThinkingElapsedText,
     attachTurnReasoning,
     awaitingCommitTaskIds,
+    beginBackgroundReceiptReplay,
+    trackBackgroundReceiptTask,
+    finishBackgroundReceiptReplay,
+    holdBackgroundReceiptReconciliation,
+    releaseBackgroundReceiptReconciliation,
   }
 }

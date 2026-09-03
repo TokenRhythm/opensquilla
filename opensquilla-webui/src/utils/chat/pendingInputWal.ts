@@ -52,6 +52,8 @@ export interface ResponseHandoffWalRecord {
   recoveryAttachments: Attachment[]
   /** A protocol-owned replay must never be restored into the user composer. */
   restoreComposerOnFailure?: boolean
+  /** Accepted offscreen; recovery may retire it but must never adopt its target. */
+  backgroundOnly?: boolean
   /** Stable source-session + barrier identity used for cross-tab coordination. */
   replayCoordinationKey?: string
   /** Identifies the live dispatcher allowed to arm an unsubmitted handoff. */
@@ -60,6 +62,10 @@ export interface ResponseHandoffWalRecord {
   walRevision?: number
   state: ResponseHandoffWalState
   acceptedSessionKey?: string
+  /** Accepted task identity retained across a crash before owner retirement. */
+  acceptedTaskId?: string
+  /** Gateway lifecycle status paired with the accepted task identity. */
+  acceptedTaskStatus?: string
   errorCode?: string
   createdAt: number
   updatedAt: number
@@ -204,6 +210,10 @@ function isResponseHandoffWalRecord(value: unknown): value is ResponseHandoffWal
       || typeof record.restoreComposerOnFailure === 'boolean'
     )
     && (
+      record.backgroundOnly === undefined
+      || typeof record.backgroundOnly === 'boolean'
+    )
+    && (
       record.replayCoordinationKey === undefined
       || (
         typeof record.replayCoordinationKey === 'string'
@@ -219,6 +229,14 @@ function isResponseHandoffWalRecord(value: unknown): value is ResponseHandoffWal
       || (Number.isSafeInteger(record.walRevision) && record.walRevision >= 1)
     )
     && ['preparing', 'submitting', 'accepted', 'failed'].includes(String(record.state || ''))
+    && (
+      record.acceptedTaskId === undefined
+      || (typeof record.acceptedTaskId === 'string' && record.acceptedTaskId.length > 0)
+    )
+    && (
+      record.acceptedTaskStatus === undefined
+      || (typeof record.acceptedTaskStatus === 'string' && record.acceptedTaskStatus.length > 0)
+    )
     && (
       record.state !== 'preparing'
       || (
@@ -497,7 +515,15 @@ class BrowserPendingInputWal implements PendingInputWal {
         transaction.abort()
         throw new Error('Response handoff no longer exists')
       }
-      if (rawHandoff.walOwnerId && rawHandoff.state !== 'accepted') {
+      const releasesFailedOwnerToSource = (
+        rawHandoff.state === 'failed'
+        && acceptedSessionKey === rawHandoff.requestSessionKey
+      )
+      if (
+        rawHandoff.walOwnerId
+        && rawHandoff.state !== 'accepted'
+        && !releasesFailedOwnerToSource
+      ) {
         transaction.abort()
         throw new Error('Response handoff is not durably accepted')
       }

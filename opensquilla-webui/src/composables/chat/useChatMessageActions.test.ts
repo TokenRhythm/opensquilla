@@ -65,9 +65,12 @@ function makeOptions(
     opts?: { assistantBoundary?: boolean },
   ) => string = text => text,
   aiGeneratedLabel?: () => string,
+  overrides: Partial<UseChatMessageActionsOptions> = {},
 ) {
+  const sessionKey = ref('agent:main:webchat:A')
   const pendingForkBeforeMessageId = ref<string | null>(null)
   const options: UseChatMessageActionsOptions = {
+    sessionKey,
     messages: ref(messages),
     inputText: ref(''),
     isStreaming: ref(false),
@@ -82,8 +85,9 @@ function makeOptions(
     notifyMessagePending: vi.fn(),
     canDeliver: () => true,
     notifyDeliveryBlocked: vi.fn(),
+    ...overrides,
   }
-  return { api: useChatMessageActions(options), options, pendingForkBeforeMessageId }
+  return { api: useChatMessageActions(options), options, sessionKey, pendingForkBeforeMessageId }
 }
 
 beforeEach(() => {
@@ -111,6 +115,410 @@ describe('useChatMessageActions branching edits', () => {
     expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A'])
     expect(options.inputText.value).toBe('B')
     expect(options.focusComposer).toHaveBeenCalledOnce()
+  })
+
+  it('puts the transcript and the draft back when the edit is cancelled', () => {
+    // #1372: entering edit mode empties the transcript on the first click.
+    // Without a way back, Escape cleared the composer and left the empty state
+    // on screen, which reads as the conversation having been deleted.
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+      { role: 'assistant', text: 'ack B', ts: null, messageId: 'msg-b1' },
+    ])
+    options.inputText.value = 'half-written draft'
+
+    api.editMessage(renderedMessage({
+      role: 'user',
+      displayRole: 'user',
+      sourceIndex: 2,
+      messageId: 'msg-B',
+      text: 'B',
+    }))
+    expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A'])
+
+    expect(api.cancelEdit()).toBe(true)
+
+    expect(options.messages.value.map(message => message.text)).toEqual([
+      'A', 'ack A', 'B', 'ack B',
+    ])
+    // The draft the edit overwrote is part of what was lost, so it comes back
+    // too rather than the composer being left holding the edited message.
+    expect(options.inputText.value).toBe('half-written draft')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+  })
+
+  it('reports nothing to cancel when no edit is in flight', () => {
+    const { api, options } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+    ])
+    options.inputText.value = 'just a draft'
+
+    // Escape distinguishes the two: a false here is what lets it fall through
+    // to clearing the composer instead of swallowing the key.
+    expect(api.cancelEdit()).toBe(false)
+    expect(options.inputText.value).toBe('just a draft')
+    expect(options.messages.value.map(message => message.text)).toEqual(['A'])
+  })
+
+  it('cancels only once, so a later Escape cannot resurrect the transcript', () => {
+    const { api, options } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+    ])
+
+    api.editMessage(renderedMessage({
+      role: 'user',
+      displayRole: 'user',
+      sourceIndex: 2,
+      messageId: 'msg-B',
+      text: 'B',
+    }))
+    expect(api.cancelEdit()).toBe(true)
+    options.messages.value = [{ role: 'user', text: 'sent since', ts: null, messageId: 'msg-C' }]
+
+    expect(api.cancelEdit()).toBe(false)
+    expect(options.messages.value.map(message => message.text)).toEqual(['sent since'])
+  })
+
+  it('drops the restore point once the fork id has been consumed', () => {
+    // Sending makes the truncation real. `pendingForkBeforeMessageId` moving
+    // off the edit's id is the evidence, and restoring past it would put back
+    // messages the fork has already replaced.
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+    ])
+
+    api.editMessage(renderedMessage({
+      role: 'user',
+      displayRole: 'user',
+      sourceIndex: 2,
+      messageId: 'msg-B',
+      text: 'B',
+    }))
+    pendingForkBeforeMessageId.value = null
+
+    expect(api.cancelEdit()).toBe(false)
+    expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A'])
+  })
+
+  it('drops the restore point across a session switch, including after switching back', () => {
+    const { api, options, sessionKey } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+    ])
+
+    api.editMessage(renderedMessage({
+      role: 'user',
+      displayRole: 'user',
+      sourceIndex: 0,
+      messageId: 'msg-A',
+      text: 'A',
+    }))
+
+    sessionKey.value = 'agent:main:webchat:B'
+    options.messages.value = [
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+    ]
+    options.inputText.value = 'session B draft'
+
+    expect(api.cancelEdit()).toBe(false)
+    expect(options.messages.value.map(message => message.text)).toEqual(['B'])
+    expect(options.inputText.value).toBe('session B draft')
+
+    sessionKey.value = 'agent:main:webchat:A'
+    expect(api.cancelEdit()).toBe(false)
+    expect(options.messages.value.map(message => message.text)).toEqual(['B'])
+    expect(options.inputText.value).toBe('session B draft')
+  })
+
+  it('settles an active Edit exactly once when its session changes', () => {
+    const onEditStarted = vi.fn()
+    const onEditSettled = vi.fn()
+    const { api, sessionKey } = makeOptions(
+      [
+        { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+        { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      ],
+      text => text,
+      undefined,
+      { onEditStarted, onEditSettled },
+    )
+
+    api.editMessage(renderedMessage({
+      role: 'user',
+      displayRole: 'user',
+      sourceIndex: 0,
+      messageId: 'msg-A',
+      text: 'A',
+    }))
+    expect(onEditStarted).toHaveBeenCalledOnce()
+
+    sessionKey.value = 'agent:main:webchat:new-draft'
+    expect(api.editActive.value).toBe(false)
+    expect(onEditSettled).toHaveBeenCalledOnce()
+
+    sessionKey.value = 'agent:main:webchat:next'
+    expect(onEditSettled).toHaveBeenCalledOnce()
+    expect(api.cancelEdit()).toBe(false)
+    expect(onEditSettled).toHaveBeenCalledOnce()
+  })
+
+  it('retires the edit owner without restoring over a replacement transcript', () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+    ])
+
+    api.editMessage(renderedMessage({
+      role: 'user',
+      displayRole: 'user',
+      sourceIndex: 0,
+      messageId: 'msg-A',
+      text: 'A',
+    }))
+
+    options.messages.value = [
+      { role: 'user', text: 'new owner', ts: null, messageId: 'msg-new' },
+    ]
+    options.inputText.value = 'new owner draft'
+
+    expect(api.cancelEdit()).toBe(true)
+    expect(api.editGeneration.value).toBe(2)
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.messages.value.map(message => message.text)).toEqual(['new owner'])
+    expect(options.inputText.value).toBe('new owner draft')
+  })
+
+  it('retires the edit owner when transcript items are replaced in place', () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+    ])
+
+    api.editMessage(renderedMessage({
+      role: 'user',
+      displayRole: 'user',
+      sourceIndex: 2,
+      messageId: 'msg-B',
+      text: 'B',
+    }))
+    const currentOwner = options.messages.value
+    currentOwner.splice(0, 1, {
+      role: 'user', text: 'new same-session row', ts: null, messageId: 'msg-new',
+    })
+    options.inputText.value = 'new owner draft'
+
+    expect(api.cancelEdit()).toBe(true)
+    expect(api.editGeneration.value).toBe(2)
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.messages.value).toBe(currentOwner)
+    expect(options.messages.value.map(message => message.text)).toEqual([
+      'new same-session row', 'ack A',
+    ])
+    expect(options.inputText.value).toBe('new owner draft')
+  })
+
+  it('cancels nested edits one layer at a time without orphaning a fork', () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+      { role: 'assistant', text: 'ack B', ts: null, messageId: 'msg-b1' },
+    ])
+    options.inputText.value = 'unrelated original draft'
+
+    api.editMessage(renderedMessage({
+      role: 'user', displayRole: 'user', sourceIndex: 2, messageId: 'msg-B', text: 'B',
+    }))
+    options.inputText.value = 'edited B draft'
+    api.editMessage(renderedMessage({
+      role: 'user', displayRole: 'user', sourceIndex: 0, messageId: 'msg-A', text: 'A',
+    }))
+
+    expect(pendingForkBeforeMessageId.value).toBe('msg-A')
+    expect(api.cancelEdit()).toBe(true)
+    // The first Escape returns to the still-uncommitted B edit.
+    expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A'])
+    expect(options.inputText.value).toBe('edited B draft')
+    expect(pendingForkBeforeMessageId.value).toBe('msg-B')
+
+    expect(api.cancelEdit()).toBe(true)
+    expect(options.messages.value.map(message => message.text)).toEqual([
+      'A', 'ack A', 'B', 'ack B',
+    ])
+    expect(options.inputText.value).toBe('unrelated original draft')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(api.cancelEdit()).toBe(false)
+  })
+
+  it('keeps an active edit untouched when regenerate is requested', async () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+      { role: 'assistant', text: 'ack B', ts: null, messageId: 'msg-b1' },
+    ])
+    const originalOwner = options.messages.value
+
+    api.editMessage(renderedMessage({
+      role: 'user', displayRole: 'user', sourceIndex: 2, messageId: 'msg-B', text: 'B',
+    }))
+    options.inputText.value = 'edited B'
+    const editOwner = options.messages.value
+
+    const regenerated = await api.regenerateMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      sourceIndex: 1,
+      messageId: 'msg-a1',
+      text: 'ack A',
+    }))
+    await nextTick()
+
+    expect(regenerated).toBe(false)
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    expect(options.messages.value).toBe(editOwner)
+    expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A'])
+    expect(options.inputText.value).toBe('edited B')
+    expect(pendingForkBeforeMessageId.value).toBe('msg-B')
+
+    expect(api.cancelEdit()).toBe(true)
+    expect(options.messages.value).toBe(originalOwner)
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+  })
+
+  it('retires a committed edit so regenerate is immediately available', async () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+      { role: 'assistant', text: 'ack B', ts: null, messageId: 'msg-b1' },
+    ])
+
+    api.editMessage(renderedMessage({
+      role: 'user', displayRole: 'user', sourceIndex: 2, messageId: 'msg-B', text: 'B',
+    }))
+    const generation = api.editGeneration.value
+    options.messages.value.push(
+      { role: 'user', text: 'edited B', ts: null, messageId: 'msg-B-edited' },
+      { role: 'assistant', text: 'edited answer', ts: null, messageId: 'msg-b2' },
+    )
+    pendingForkBeforeMessageId.value = null
+
+    expect(api.commitEdit(generation)).toBe(true)
+    expect(api.editActive.value).toBe(false)
+    expect(api.cancelEdit()).toBe(false)
+    expect(api.regenerateMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      sourceIndex: 3,
+      messageId: 'msg-b2',
+      text: 'edited answer',
+    }))).toBe(true)
+    await nextTick()
+
+    expect(pendingForkBeforeMessageId.value).toBe('msg-B-edited')
+    expect(options.sendCurrentInput).toHaveBeenCalledOnce()
+  })
+
+  it('does not replace a foreign pending fork when entering edit mode', () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+    ])
+    const forkOwner = options.messages.value
+    pendingForkBeforeMessageId.value = 'msg-A'
+    options.inputText.value = 'pending regenerate draft'
+
+    api.editMessage(renderedMessage({
+      role: 'user', displayRole: 'user', sourceIndex: 2, messageId: 'msg-B', text: 'B',
+    }))
+
+    expect(options.messages.value).toBe(forkOwner)
+    expect(options.inputText.value).toBe('pending regenerate draft')
+    expect(pendingForkBeforeMessageId.value).toBe('msg-A')
+    expect(options.focusComposer).not.toHaveBeenCalled()
+    expect(api.editGeneration.value).toBe(0)
+    expect(api.cancelEdit()).toBe(false)
+  })
+
+  it('retires an edit during pre-dispatch validation when history replaced it', () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+    ])
+    api.editMessage(renderedMessage({
+      role: 'user', displayRole: 'user', sourceIndex: 0, messageId: 'msg-A', text: 'A',
+    }))
+    const generation = api.editGeneration.value
+    const replacement = [
+      { role: 'user' as const, text: 'authoritative', ts: null, messageId: 'msg-new' },
+    ]
+    options.messages.value = replacement
+    const replacementOwner = options.messages.value
+    options.inputText.value = 'authoritative draft'
+
+    expect(api.validateEditOwner(generation)).toBe(false)
+    expect(api.editGeneration.value).toBe(generation + 1)
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.messages.value).toBe(replacementOwner)
+    expect(options.inputText.value).toBe('authoritative draft')
+    expect(api.cancelEdit()).toBe(false)
+  })
+
+  it('adopts only exact rejected-send rows before restoring the original edit state', () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+    ])
+    options.inputText.value = 'original draft'
+    api.editMessage(renderedMessage({
+      role: 'user', displayRole: 'user', sourceIndex: 2, messageId: 'msg-B', text: 'B',
+    }))
+    const generation = api.editGeneration.value
+    const optimistic: ChatMessage = { role: 'user', text: 'edited B', ts: null }
+    const error: ChatMessage = { role: 'error', text: 'rejected', ts: null }
+    options.messages.value.push(optimistic, error)
+
+    expect(api.adoptRejectedEditRows(generation, [optimistic, error])).toBe(true)
+    expect(api.cancelEdit()).toBe(true)
+    expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A', 'B'])
+    expect(options.inputText.value).toBe('original draft')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+  })
+
+  it('retires instead of adopting rejected rows around an unrelated suffix', () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+    ])
+    api.editMessage(renderedMessage({
+      role: 'user', displayRole: 'user', sourceIndex: 2, messageId: 'msg-B', text: 'B',
+    }))
+    const generation = api.editGeneration.value
+    const optimistic: ChatMessage = { role: 'user', text: 'edited B', ts: null }
+    const unrelated: ChatMessage = { role: 'assistant', text: 'authoritative row', ts: null }
+    const error: ChatMessage = { role: 'error', text: 'rejected', ts: null }
+    options.messages.value.push(optimistic, unrelated, error)
+    const currentOwner = options.messages.value
+
+    expect(api.adoptRejectedEditRows(generation, [optimistic, error])).toBe(false)
+    expect(api.editGeneration.value).toBe(generation + 1)
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(api.cancelEdit()).toBe(false)
+    expect(options.messages.value).toBe(currentOwner)
+    expect(options.messages.value.map(message => message.text)).toEqual([
+      'A', 'ack A', 'edited B', 'authoritative row', 'rejected',
+    ])
   })
 
   it('records the previous user message id before regenerating', async () => {

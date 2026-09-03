@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import { effectScope, nextTick, ref } from 'vue'
 import { useChatRpcEventHandlers, type ChatRpcStreamApi } from './useChatRpcEventHandlers'
+import { useChatMessageActions } from './useChatMessageActions'
+import { useChatTaskOwnership } from './useChatTaskOwnership'
 import type { SessionBootstrapRun } from './useChatSessionBootstrap'
 import type {
   ChatMessage,
@@ -31,12 +33,14 @@ function createHarness(options: {
   handleSessionConnectionState?: (state: string) => SessionBootstrapRun | undefined
   loadCurrentSessionUsage?: () => void
   refreshRunModePreference?: () => void | Promise<void>
+  normalizeRunStatus?: (status: string) => string
   pendingQueue?: ChatPendingItem[]
   stream?: ChatRpcStreamApi
   restoreSteerIntoComposer?: (text: string) => void
   getCompactionPlacement?: (compactionId: string) => 'activity' | 'standalone' | undefined
   observeStreamGeneration?: (payload: unknown) => boolean
   supportsTurnCommitted?: boolean
+  taskOwnership?: ReturnType<typeof useChatTaskOwnership>
 } = {}) {
   const messages = ref<ChatMessage[]>(options.messages ?? [])
   const sessionKey = ref('agent:main:test')
@@ -78,6 +82,7 @@ function createHarness(options: {
   const markEnsembleHandoff = vi.fn()
   const bindRouterDecisionToModelCall = vi.fn()
   const queueRouterDecision = vi.fn()
+  const clearPendingRouterDecision = vi.fn()
   const schedulePendingDrainAfterTerminal = vi.fn()
   const scheduleHistorySync = vi.fn()
   const showCompactionToast = vi.fn()
@@ -112,7 +117,7 @@ function createHarness(options: {
     }),
     usageModel: ref(''),
     stream,
-    normalizeRunStatus: (status: string) => status,
+    normalizeRunStatus: options.normalizeRunStatus || ((status: string) => status),
     sessionRunStatus: options.sessionRunStatus || (() => ({ status: 'idle', label: 'Idle', task: null })),
     applySessionRunState,
     queueRouterDecision,
@@ -120,7 +125,7 @@ function createHarness(options: {
     appendEnsembleProgress: vi.fn(),
     markEnsembleHandoff,
     flushPendingRouterDecision: vi.fn(),
-    clearPendingRouterDecision: vi.fn(),
+    clearPendingRouterDecision,
     handleRouterControlReplay: vi.fn(),
     showCompactionToast,
     getCompactionPlacement: options.getCompactionPlacement,
@@ -137,6 +142,7 @@ function createHarness(options: {
     handleSessionConnectionState,
     loadCurrentSessionUsage,
     refreshRunModePreference,
+    taskOwnership: options.taskOwnership,
   }))!
   const api = {
     ...rawApi,
@@ -162,6 +168,7 @@ function createHarness(options: {
     markEnsembleHandoff,
     bindRouterDecisionToModelCall,
     queueRouterDecision,
+    clearPendingRouterDecision,
     schedulePendingDrainAfterTerminal,
     scheduleHistorySync,
     showCompactionToast,
@@ -255,6 +262,649 @@ describe('useChatRpcEventHandlers decoded conversation ingress', () => {
         { modelCallId: 'call-1', iteration: 1 },
       )
       expect(harness.lastStreamSeq.value).toBe(1)
+    } finally {
+      harness.stop()
+    }
+  })
+
+  it('defers an early terminal receipt until its same-session ACK allows projection', () => {
+    const taskOwnership = useChatTaskOwnership()
+    const harness = createHarness({
+      taskOwnership,
+      pendingQueue: [{
+        pendingUiId: 'pending-after-receipt',
+        text: 'send after receipt',
+        attachments: [],
+        intent: null,
+        ownerSessionKey: 'agent:main:test',
+      }],
+      messages: [{ role: 'assistant', text: 'current history', ts: null }],
+    })
+    harness.stream.isStreaming.value = false
+    const historyOwner = harness.messages.value
+    const payload = {
+      session_key: 'agent:main:test',
+      task_id: 'task-early-terminal',
+      client_message_id: 'client-early-terminal',
+    }
+    try {
+      harness.api.beginBackgroundReceiptReplay('client-early-terminal')
+      harness.api.onConversationEvent({
+        kind: 'conversation',
+        event: decodeConversationEvent('task.succeeded', payload, {}),
+        payload,
+        meta: {},
+      })
+
+      expect(harness.applySessionRunState).not.toHaveBeenCalled()
+      expect(harness.scheduleHistorySync).not.toHaveBeenCalled()
+      expect(harness.schedulePendingDrainAfterTerminal).not.toHaveBeenCalled()
+      expect(taskOwnership.hasAuthoritativeWork.value).toBe(false)
+      expect(harness.messages.value).toBe(historyOwner)
+
+      harness.api.trackBackgroundReceiptTask(
+        'client-early-terminal',
+        'task-early-terminal',
+        false,
+        true,
+      )
+
+      expect(harness.applySessionRunState).toHaveBeenCalledWith({
+        run_status: 'idle',
+        last_task: expect.objectContaining({
+          task_id: 'task-early-terminal',
+          status: 'succeeded',
+        }),
+      })
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+      expect(harness.schedulePendingDrainAfterTerminal).toHaveBeenCalledOnce()
+      expect(taskOwnership.hasAuthoritativeWork.value).toBe(false)
+      expect(harness.messages.value).toBe(historyOwner)
+    } finally {
+      harness.stop()
+    }
+  })
+
+  it('keeps a rich early terminal snapshot when a sparse echo arrives before ACK', () => {
+    const taskOwnership = useChatTaskOwnership()
+    const harness = createHarness({
+      taskOwnership,
+      pendingQueue: [{
+        pendingUiId: 'pending-after-successor',
+        text: 'wait for successor',
+        attachments: [],
+        intent: null,
+      }],
+    })
+    harness.stream.isStreaming.value = false
+    try {
+      harness.api.beginBackgroundReceiptReplay('client-rich-terminal')
+      harness.api.onConversationEvent({
+        kind: 'sessions-changed',
+        payload: {
+          session_key: 'agent:main:test',
+          reason: 'task_terminal',
+          run_status: 'running',
+          changed_task: {
+            task_id: 'task-rich-terminal',
+            client_message_id: 'client-rich-terminal',
+            status: 'succeeded',
+          },
+          last_task: {
+            task_id: 'task-rich-terminal',
+            client_message_id: 'client-rich-terminal',
+            status: 'succeeded',
+          },
+          active_task: {
+            task_id: 'task-rich-successor',
+            client_message_id: 'client-rich-successor',
+            status: 'running',
+          },
+        },
+        meta: {},
+      })
+      const sparsePayload = {
+        session_key: 'agent:main:test',
+        task_id: 'task-rich-terminal',
+        client_message_id: 'client-rich-terminal',
+      }
+      harness.api.onConversationEvent({
+        kind: 'conversation',
+        event: decodeConversationEvent('task.succeeded', sparsePayload, {}),
+        payload: sparsePayload,
+        meta: {},
+      })
+
+      expect(harness.applySessionRunState).not.toHaveBeenCalled()
+      expect(harness.scheduleHistorySync).not.toHaveBeenCalled()
+      harness.api.trackBackgroundReceiptTask(
+        'client-rich-terminal',
+        'task-rich-terminal',
+        false,
+        true,
+      )
+
+      expect(taskOwnership.runningTaskId.value).toBe('task-rich-successor')
+      expect(harness.applySessionRunState).toHaveBeenLastCalledWith(expect.objectContaining({
+        run_status: 'running',
+        active_task: expect.objectContaining({ task_id: 'task-rich-successor' }),
+      }))
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+      expect(harness.schedulePendingDrainAfterTerminal).not.toHaveBeenCalled()
+    } finally {
+      harness.stop()
+    }
+  })
+
+  it('quarantines live and terminal events from a background receipt replay', () => {
+    const harness = createHarness({
+      messages: [
+        { role: 'user', text: 'original question', ts: null, messageId: 'msg-original' },
+        { role: 'assistant', text: 'original answer', ts: null, messageId: 'msg-answer' },
+      ],
+    })
+    harness.stream.isStreaming.value = false
+    const originalOwner = harness.messages.value
+    const inputText = ref('unrelated draft')
+    const pendingForkBeforeMessageId = ref<string | null>(null)
+    const pendingAttachments = ref([{
+      kind: 'staged' as const,
+      local_id: 901,
+      name: 'new-edit.png',
+      mime: 'image/png',
+      file_uuid: 'new-edit-file',
+    }])
+    const promptAnnotationIds = ref(['current-edit-annotation'])
+    const pendingSessionIntent = ref<string | null>('new_chat')
+    const messageActions = useChatMessageActions({
+      sessionKey: harness.sessionKey,
+      messages: harness.messages,
+      inputText,
+      isStreaming: harness.stream.isStreaming,
+      sanitizeCopyText: text => text,
+      stripTimePrefix: text => text,
+      autoResizeTextarea: vi.fn(),
+      sendCurrentInput: vi.fn(),
+      sendUsageBarrierReplay: vi.fn(async () => true),
+      focusComposer: vi.fn(),
+      pendingForkBeforeMessageId,
+      onEditStarted: harness.api.holdBackgroundReceiptReconciliation,
+      onEditSettled: harness.api.releaseBackgroundReceiptReconciliation,
+    })
+    messageActions.editMessage({
+      role: 'user',
+      displayRole: 'user',
+      roleLabel: 'User',
+      text: 'original question',
+      timeStr: '',
+      showHeader: false,
+      sourceIndex: 0,
+      messageId: 'msg-original',
+    })
+    inputText.value = 'edited original question'
+    const editOwner = harness.messages.value
+    const attachmentOwner = pendingAttachments.value[0]
+    const deliver = (eventName: string, payload: Record<string, unknown>) => {
+      harness.api.onConversationEvent({
+        kind: 'conversation',
+        event: decodeConversationEvent(eventName, payload, {}),
+        payload,
+        meta: {},
+      })
+    }
+    try {
+      harness.api.beginBackgroundReceiptReplay('client-old-receipt')
+      deliver('task.queued', {
+        session_key: 'agent:main:test',
+        task_id: 'task-other-tab',
+        client_message_id: 'client-other-tab',
+      })
+      // A second tab's task is not owned merely because it interleaves with
+      // the receipt RPC window.
+      expect(harness.applySessionRunState).toHaveBeenCalledOnce()
+      harness.applySessionRunState.mockClear()
+
+      deliver('task.running', {
+        session_key: 'agent:main:test',
+        task_id: 'task-old-receipt',
+        client_message_id: 'client-old-receipt',
+      })
+      harness.api.trackBackgroundReceiptTask('client-old-receipt', 'task-old-receipt')
+      harness.api.finishBackgroundReceiptReplay('client-old-receipt')
+      deliver('session.event.text_delta', {
+        session_key: 'agent:main:test',
+        task_id: 'task-old-receipt',
+        stream_seq: 1,
+        text: 'old answer',
+      })
+      deliver('session.event.done', {
+        session_key: 'agent:main:test',
+        task_id: 'task-old-receipt',
+        stream_seq: 2,
+        text: 'old terminal answer',
+      })
+      harness.api.onConversationEvent({
+        kind: 'sessions-changed',
+        payload: {
+          session_key: 'agent:main:test',
+          reason: 'task_terminal',
+          run_status: 'running',
+          changed_task: {
+            task_id: 'task-old-receipt',
+            status: 'succeeded',
+          },
+          last_task: {
+            task_id: 'task-old-receipt',
+            status: 'succeeded',
+          },
+          active_task: {
+            task_id: 'task-successor',
+            client_message_id: 'client-successor',
+            status: 'running',
+          },
+        },
+        meta: {},
+      })
+      deliver('task.succeeded', {
+        session_key: 'agent:main:test',
+        task_id: 'task-old-receipt',
+        stream_seq: 3,
+      })
+      deliver('session.event.turn_committed', {
+        session_key: 'agent:main:test',
+        task_id: 'task-old-receipt',
+        stream_seq: 4,
+      })
+      harness.api.onConversationEvent({
+        kind: 'sessions-changed',
+        payload: {
+          session_key: 'agent:main:test',
+          reason: 'turn_complete',
+          turn_id: 'turn-old-direct',
+          client_message_id: 'client-old-receipt',
+          status: 'done',
+        },
+        meta: {},
+      })
+
+      expect(harness.activeStreamTaskId.value).toBe('')
+      expect(harness.stream.startStreaming).not.toHaveBeenCalled()
+      expect(harness.stream.appendDelta).not.toHaveBeenCalled()
+      expect(harness.stream.endStreaming).not.toHaveBeenCalled()
+      expect(harness.applySessionRunState).toHaveBeenCalledTimes(3)
+      expect(harness.applySessionRunState).toHaveBeenCalledWith({
+        run_status: 'running',
+        active_task: {
+          task_id: 'task-old-receipt',
+          status: 'running',
+        },
+      })
+      expect(harness.applySessionRunState).toHaveBeenCalledWith(expect.objectContaining({
+        run_status: 'running',
+        active_task: expect.objectContaining({ task_id: 'task-successor' }),
+      }))
+      expect(harness.messages.value).toBe(editOwner)
+      expect(harness.messages.value).toEqual([])
+      expect(harness.scheduleHistorySync).not.toHaveBeenCalled()
+      expect(inputText.value).toBe('edited original question')
+      expect(pendingForkBeforeMessageId.value).toBe('msg-original')
+      expect(pendingAttachments.value).toEqual([attachmentOwner])
+      expect(promptAnnotationIds.value).toEqual(['current-edit-annotation'])
+      expect(pendingSessionIntent.value).toBe('new_chat')
+
+      expect(messageActions.cancelEdit()).toBe(true)
+      expect(harness.messages.value).toBe(originalOwner)
+      expect(harness.messages.value.map(message => message.text)).toEqual([
+        'original question', 'original answer',
+      ])
+      expect(inputText.value).toBe('unrelated draft')
+      expect(pendingForkBeforeMessageId.value).toBeNull()
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+    } finally {
+      harness.stop()
+    }
+  })
+
+  it('drops deferred receipt reconciliation when Edit crosses into a new session', () => {
+    const harness = createHarness({
+      messages: [
+        { role: 'user', text: 'original question', ts: null, messageId: 'msg-original' },
+        { role: 'assistant', text: 'original answer', ts: null, messageId: 'msg-answer' },
+      ],
+    })
+    harness.stream.isStreaming.value = false
+    const messageActions = useChatMessageActions({
+      sessionKey: harness.sessionKey,
+      messages: harness.messages,
+      inputText: ref(''),
+      isStreaming: harness.stream.isStreaming,
+      sanitizeCopyText: text => text,
+      stripTimePrefix: text => text,
+      autoResizeTextarea: vi.fn(),
+      sendCurrentInput: vi.fn(),
+      sendUsageBarrierReplay: vi.fn(async () => true),
+      focusComposer: vi.fn(),
+      pendingForkBeforeMessageId: ref<string | null>(null),
+      onEditStarted: harness.api.holdBackgroundReceiptReconciliation,
+      onEditSettled: harness.api.releaseBackgroundReceiptReconciliation,
+    })
+    const deliver = (eventName: string, payload: Record<string, unknown>) => {
+      harness.api.onConversationEvent({
+        kind: 'conversation',
+        event: decodeConversationEvent(eventName, payload, {}),
+        payload,
+        meta: {},
+      })
+    }
+    try {
+      messageActions.editMessage({
+        role: 'user',
+        displayRole: 'user',
+        roleLabel: 'User',
+        text: 'original question',
+        timeStr: '',
+        showHeader: false,
+        sourceIndex: 0,
+        messageId: 'msg-original',
+      })
+      harness.api.beginBackgroundReceiptReplay('client-old-receipt')
+      deliver('task.running', {
+        session_key: 'agent:main:test',
+        task_id: 'task-old-receipt',
+        client_message_id: 'client-old-receipt',
+      })
+      harness.api.trackBackgroundReceiptTask('client-old-receipt', 'task-old-receipt')
+      harness.api.finishBackgroundReceiptReplay('client-old-receipt')
+      deliver('task.succeeded', {
+        session_key: 'agent:main:test',
+        task_id: 'task-old-receipt',
+      })
+      expect(harness.scheduleHistorySync).not.toHaveBeenCalled()
+
+      harness.sessionKey.value = 'agent:main:new-draft'
+      expect(messageActions.editActive.value).toBe(false)
+      expect(harness.scheduleHistorySync).not.toHaveBeenCalled()
+
+      harness.api.beginBackgroundReceiptReplay('client-new-receipt')
+      deliver('task.running', {
+        session_key: 'agent:main:new-draft',
+        task_id: 'task-new-receipt',
+        client_message_id: 'client-new-receipt',
+      })
+      harness.api.trackBackgroundReceiptTask('client-new-receipt', 'task-new-receipt')
+      harness.api.finishBackgroundReceiptReplay('client-new-receipt')
+      deliver('task.succeeded', {
+        session_key: 'agent:main:new-draft',
+        task_id: 'task-new-receipt',
+      })
+
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+    } finally {
+      harness.stop()
+    }
+  })
+
+  it('settles run state and drains queued work once for a background receipt terminal', () => {
+    const taskOwnership = useChatTaskOwnership()
+    const harness = createHarness({
+      taskOwnership,
+      pendingQueue: [{
+        pendingUiId: 'pending-after-receipt',
+        text: 'send after the old receipt settles',
+        attachments: [],
+        intent: null,
+      }],
+    })
+    harness.stream.isStreaming.value = false
+    const deliver = (eventName: string, payload: Record<string, unknown>) => {
+      harness.api.onConversationEvent({
+        kind: 'conversation',
+        event: decodeConversationEvent(eventName, payload, {}),
+        payload,
+        meta: {},
+      })
+    }
+    try {
+      harness.api.beginBackgroundReceiptReplay('client-old-receipt')
+      deliver('task.running', {
+        session_key: 'agent:main:test',
+        task_id: 'task-old-receipt',
+        client_message_id: 'client-old-receipt',
+      })
+      expect(taskOwnership.hasAuthoritativeWork.value).toBe(false)
+
+      harness.api.trackBackgroundReceiptTask(
+        'client-old-receipt',
+        'task-old-receipt',
+        'succeeded',
+      )
+
+      deliver('task.succeeded', {
+        session_key: 'agent:main:test',
+        task_id: 'task-old-receipt',
+        client_message_id: 'client-old-receipt',
+        status: 'succeeded',
+      })
+
+      expect(taskOwnership.hasAuthoritativeWork.value).toBe(false)
+      expect(harness.applySessionRunState).toHaveBeenLastCalledWith(expect.objectContaining({
+        run_status: 'idle',
+        last_task: expect.objectContaining({
+          task_id: 'task-old-receipt',
+          status: 'succeeded',
+        }),
+      }))
+      expect(harness.clearPendingRouterDecision).toHaveBeenCalledOnce()
+      expect(harness.schedulePendingDrainAfterTerminal).toHaveBeenCalledOnce()
+
+      deliver('session.event.turn_committed', {
+        session_key: 'agent:main:test',
+        task_id: 'task-old-receipt',
+        client_message_id: 'client-old-receipt',
+      })
+      expect(harness.schedulePendingDrainAfterTerminal).toHaveBeenCalledOnce()
+    } finally {
+      harness.stop()
+    }
+  })
+
+  it('does not let an old receipt terminal overwrite a newer pending foreground stream', () => {
+    const harness = createHarness({
+      pendingQueue: [{
+        pendingUiId: 'pending-after-foreground',
+        text: 'wait for the foreground turn',
+        attachments: [],
+        intent: null,
+      }],
+    })
+    harness.stream.isStreaming.value = true
+    harness.activeStreamTaskId.value = PENDING_STREAM_TASK_ID
+    try {
+      harness.api.beginBackgroundReceiptReplay('client-old-receipt')
+      harness.api.onConversationEvent({
+        kind: 'conversation',
+        event: decodeConversationEvent('task.succeeded', {
+          session_key: 'agent:main:test',
+          task_id: 'task-old-receipt',
+          client_message_id: 'client-old-receipt',
+        }, {}),
+        payload: {
+          session_key: 'agent:main:test',
+          task_id: 'task-old-receipt',
+          client_message_id: 'client-old-receipt',
+        },
+        meta: {},
+      })
+      harness.api.trackBackgroundReceiptTask(
+        'client-old-receipt',
+        'task-old-receipt',
+        false,
+        true,
+      )
+
+      expect(harness.applySessionRunState).not.toHaveBeenCalled()
+      expect(harness.clearPendingRouterDecision).not.toHaveBeenCalled()
+      expect(harness.schedulePendingDrainAfterTerminal).not.toHaveBeenCalled()
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+    } finally {
+      harness.stop()
+    }
+  })
+
+  it.each([
+    ['task.cancelled', 'cancelled', 'cancelled', false],
+    ['task.timeout', 'timeout', 'failed', true],
+    ['task.abandoned', 'abandoned', 'failed', true],
+  ] as const)(
+    'derives a missing receipt status from %s',
+    (eventName, expectedTaskStatus, expectedRunStatus, shouldDrain) => {
+      const harness = createHarness({
+        pendingQueue: [{
+          pendingUiId: 'pending-after-terminal',
+          text: 'continue after terminal',
+          attachments: [],
+          intent: null,
+        }],
+      })
+      harness.stream.isStreaming.value = false
+      try {
+        harness.api.beginBackgroundReceiptReplay('client-terminal-kind')
+        harness.api.onConversationEvent({
+          kind: 'conversation',
+          event: decodeConversationEvent(eventName, {
+            session_key: 'agent:main:test',
+            task_id: 'task-terminal-kind',
+            client_message_id: 'client-terminal-kind',
+          }, {}),
+          payload: {
+            session_key: 'agent:main:test',
+            task_id: 'task-terminal-kind',
+            client_message_id: 'client-terminal-kind',
+          },
+          meta: {},
+        })
+        harness.api.trackBackgroundReceiptTask(
+          'client-terminal-kind',
+          'task-terminal-kind',
+          false,
+          true,
+        )
+
+        expect(harness.applySessionRunState).toHaveBeenCalledWith(expect.objectContaining({
+          run_status: expectedRunStatus,
+          last_task: expect.objectContaining({ status: expectedTaskStatus }),
+        }))
+        if (shouldDrain) {
+          expect(harness.schedulePendingDrainAfterTerminal).toHaveBeenCalledOnce()
+        } else {
+          expect(harness.schedulePendingDrainAfterTerminal).not.toHaveBeenCalled()
+        }
+      } finally {
+        harness.stop()
+      }
+    },
+  )
+
+  it('normalizes a killed receipt echo as cancelled without draining queued work', () => {
+    const harness = createHarness({
+      normalizeRunStatus: status => status === 'killed' ? 'cancelled' : status,
+      pendingQueue: [{
+        pendingUiId: 'pending-after-killed',
+        text: 'do not drain after cancellation',
+        attachments: [],
+        intent: null,
+      }],
+    })
+    harness.stream.isStreaming.value = false
+    try {
+      harness.api.beginBackgroundReceiptReplay('client-killed-receipt')
+      harness.api.onConversationEvent({
+        kind: 'sessions-changed',
+        payload: {
+          session_key: 'agent:main:test',
+          reason: 'task_terminal',
+          run_status: 'killed',
+          changed_task: {
+            task_id: 'task-killed-receipt',
+            client_message_id: 'client-killed-receipt',
+            status: 'killed',
+          },
+          last_task: {
+            task_id: 'task-killed-receipt',
+            client_message_id: 'client-killed-receipt',
+            status: 'killed',
+          },
+        },
+        meta: {},
+      })
+      harness.api.trackBackgroundReceiptTask(
+        'client-killed-receipt',
+        'task-killed-receipt',
+        false,
+        true,
+      )
+
+      expect(harness.applySessionRunState).toHaveBeenCalledWith(expect.objectContaining({
+        run_status: 'cancelled',
+        last_task: expect.objectContaining({ status: 'cancelled' }),
+      }))
+      expect(harness.schedulePendingDrainAfterTerminal).not.toHaveBeenCalled()
+    } finally {
+      harness.stop()
+    }
+  })
+
+  it('does not learn receipt task ownership from a stale subscription epoch', () => {
+    const harness = createHarness()
+    const deliver = (eventName: string, payload: Record<string, unknown>) => {
+      harness.api.onConversationEvent({
+        kind: 'conversation',
+        event: decodeConversationEvent(eventName, payload, {}),
+        payload,
+        meta: {},
+      })
+    }
+    try {
+      harness.api.beginBackgroundReceiptReplay('client-old-epoch')
+      deliver('task.running', {
+        session_key: 'agent:main:test',
+        epoch: -1,
+        task_id: 'task-old-epoch',
+        client_message_id: 'client-old-epoch',
+      })
+      harness.api.finishBackgroundReceiptReplay('client-old-epoch')
+
+      deliver('session.event.text_delta', {
+        session_key: 'agent:main:test',
+        task_id: 'task-old-epoch',
+        stream_seq: 1,
+        text: 'current-epoch answer',
+      })
+
+      expect(harness.stream.appendDelta).toHaveBeenCalledWith('current-epoch answer')
+    } finally {
+      harness.stop()
+    }
+  })
+
+  it('does not re-arm reconciliation when the same receipt is registered again', () => {
+    const harness = createHarness()
+    try {
+      harness.api.beginBackgroundReceiptReplay('client-reconciled')
+      harness.api.trackBackgroundReceiptTask(
+        'client-reconciled',
+        'task-reconciled',
+        true,
+      )
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+
+      harness.api.beginBackgroundReceiptReplay('client-reconciled')
+      harness.api.trackBackgroundReceiptTask(
+        'client-reconciled',
+        'task-reconciled',
+        true,
+      )
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
     } finally {
       harness.stop()
     }
