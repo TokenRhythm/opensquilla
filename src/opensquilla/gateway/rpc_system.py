@@ -10,8 +10,8 @@ from opensquilla.contracts.generated.v4.sessions_list_metadata import (
 )
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.config_persistence import persist_gateway_config
+from opensquilla.gateway.memory_health import memory_health_from_durable_ledger
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, RpcUnavailableError, get_dispatcher
-from opensquilla.gateway.rpc_memory import memory_health_from_durable_ledger
 from opensquilla.session.keys import normalize_agent_id
 
 _d = get_dispatcher()
