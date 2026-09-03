@@ -30,7 +30,17 @@ describe('ChannelAdministration v4 Adapter', () => {
   })
 
   it('maps pairing and runtime operations to their exact v4 inputs', async () => {
-    const request = vi.fn(async () => ({ adminGranted: true }))
+    const pairing = {
+      pairingId: 'p1', channelName: 'ops', senderId: 'u1', status: 'approved',
+    }
+    const request = vi.fn(async (method: string) => {
+      if (method === 'channels.pairing.approve') return { pairing, adminGranted: true }
+      if (method === 'channels.admin.set') {
+        return { channelName: 'ops', senderId: 'u1', admin: false, admins: [] }
+      }
+      if (method === 'channels.restart') return { status: 'restarted', channel: 'ops' }
+      return {}
+    })
     const administration = createV4ChannelAdministration(
       { request: request as never, ready: vi.fn(async () => undefined) },
       { subscribe: vi.fn() },
@@ -46,5 +56,23 @@ describe('ChannelAdministration v4 Adapter', () => {
     })
     await administration.restart('ops')
     expect(request).toHaveBeenLastCalledWith('channels.restart', { name: 'ops' })
+  })
+
+  it('validates status events before notifying consumers', () => {
+    const subscribe = vi.fn((_event: string, handler: (payload: unknown) => void) => {
+      handler({ name: 'ops', status: 'running' })
+      handler({ name: 'ops' })
+      return { close: vi.fn() }
+    })
+    const listener = vi.fn()
+    const administration = createV4ChannelAdministration(
+      { request: vi.fn() as never, ready: vi.fn(async () => undefined) },
+      { subscribe },
+    )
+
+    administration.subscribeStatus(listener)
+
+    expect(subscribe).toHaveBeenCalledWith('channel.status', expect.any(Function))
+    expect(listener).toHaveBeenCalledTimes(1)
   })
 })

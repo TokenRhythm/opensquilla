@@ -51,14 +51,24 @@ describe('v4 SkillCatalog Adapter', () => {
 
   it('combines proposal projections without making one optional read fatal', async () => {
     const call = vi.fn(async (method: string) => {
-      if (method === 'exec.proposals.list') return { proposals: [{ proposal_id: 'p-1' }] }
+      if (method === 'exec.proposals.list') return { proposals: [{ proposal_id: 'deadbeef' }] }
       if (method === 'exec.proposals.auto_enabled.list') throw new Error('legacy gateway')
-      return { settings: { available: true, enabled: false } }
+      return {
+        available: true,
+        enabled: false,
+        on_dream_complete: false,
+        auto_enable: false,
+        auto_enable_max_risk: 'low',
+        cron: '0 5 * * *',
+        window_days: 30,
+        min_freq: 3,
+        top_k: 5,
+      }
     })
     const catalog = adapter(call)
 
     await expect(catalog.proposals()).resolves.toMatchObject({
-      proposals: [{ proposal_id: 'p-1' }],
+      proposals: [{ proposal_id: 'deadbeef' }],
       autoEnabledSkills: [],
       settings: { available: true, enabled: false },
     })

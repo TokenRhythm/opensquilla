@@ -74,6 +74,12 @@ from opensquilla.artifacts import (
     ArtifactRef,
     ArtifactStore,
 )
+from opensquilla.gateway.adapters.artifact_workbench import (
+    GatewayArtifactWorkbenchAdapter,
+)
+from opensquilla.gateway.adapters.artifact_workbench_contract import (
+    register_artifact_workbench_contract,
+)
 from opensquilla.gateway.artifact_product_errors import (
     ArtifactProductErrorCode,
     artifact_product_error,
@@ -84,6 +90,7 @@ from opensquilla.gateway.desktop_artifact_bridge import (
     get_desktop_artifact_bridge_client,
 )
 from opensquilla.gateway.event_bridge import EventBridge
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.rpc import (
     RpcContext,
     RpcHandlerError,
@@ -388,9 +395,7 @@ def _browser_dom_digest(root: etree._Element, *, source: str | None = None) -> s
             append_token("X")
             continue
         if kind == "text":
-            append_token(
-                json.dumps(["T", str(value)], ensure_ascii=False, separators=(",", ":"))
-            )
+            append_token(json.dumps(["T", str(value)], ensure_ascii=False, separators=(",", ":")))
             continue
 
         element = value
@@ -455,9 +460,7 @@ def _normalized_element_attributes(element: etree._Element) -> list[list[str]]:
         elif element_namespace == _MATHML_NAMESPACE and attr_name == "definitionurl":
             attr_name = "definitionURL"
         attributes.append([attr_namespace, attr_name, raw_value])
-    attributes.sort(
-        key=lambda item: json.dumps(item, ensure_ascii=False, separators=(",", ":"))
-    )
+    attributes.sort(key=lambda item: json.dumps(item, ensure_ascii=False, separators=(",", ":")))
     return attributes
 
 
@@ -1124,11 +1127,7 @@ def _prompt_annotation_payload(
         "anchor": _anchor_payload(anchor),
         "body": annotation.body,
         "status": annotation.status.value,
-        "freshness": (
-            "current"
-            if annotation.revision_id == current_head_revision_id
-            else "stale"
-        ),
+        "freshness": ("current" if annotation.revision_id == current_head_revision_id else "stale"),
         "targetStatus": target_status,
         "targetReason": target_reason,
         "targetKind": target_kind,
@@ -1201,9 +1200,7 @@ async def _mutation_document_payload(
     """
 
     head = (
-        result.revision
-        if result.document.head_revision_id == result.revision.revision_id
-        else None
+        result.revision if result.document.head_revision_id == result.revision.revision_id else None
     )
     return await _document_with_head(ctx, service, result.document, head)
 
@@ -1368,8 +1365,7 @@ async def _commit_revision_copy_mutation(
     return result, committed_change, False
 
 
-@_d.method("artifacts.edit.capabilities", scope="operator.read")
-async def _handle_artifact_capabilities(
+async def _execute_artifact_capabilities(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -1393,8 +1389,7 @@ async def _handle_artifact_capabilities(
     }
 
 
-@_d.method("artifacts.documents.open", scope="operator.write")
-async def _handle_document_open(
+async def _execute_document_open(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -1446,8 +1441,7 @@ async def _handle_document_open(
     }
 
 
-@_d.method("artifacts.documents.list", scope="operator.read")
-async def _handle_documents_list(
+async def _execute_documents_list(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -1457,13 +1451,10 @@ async def _handle_documents_list(
         session_id=session_id,
         limit=_bounded_limit(params),
     )
-    return {
-        "documents": [await _document_with_head(ctx, service, item) for item in documents]
-    }
+    return {"documents": [await _document_with_head(ctx, service, item) for item in documents]}
 
 
-@_d.method("artifacts.documents.get", scope="operator.read")
-async def _handle_document_get(
+async def _execute_document_get(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -1477,8 +1468,7 @@ async def _handle_document_get(
     return {"document": await _document_with_head(ctx, service, document)}
 
 
-@_d.method("artifacts.documents.rename", scope="operator.write")
-async def _handle_document_rename(
+async def _execute_document_rename(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -1514,8 +1504,7 @@ async def _handle_document_rename(
     return {"document": await _document_with_head(ctx, service, document)}
 
 
-@_d.method("artifacts.documents.close", scope="operator.write")
-async def _handle_document_close(
+async def _execute_document_close(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -1556,8 +1545,7 @@ def _new_edit_session_id(
     return f"edit_{digest}"
 
 
-@_d.method("documents.editSessions.start", scope="operator.write")
-async def _handle_edit_session_start(
+async def _execute_edit_session_start(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -1595,8 +1583,7 @@ async def _handle_edit_session_start(
     return {"editSession": _edit_session_payload(edit_session)}
 
 
-@_d.method("documents.editSessions.heartbeat", scope="operator.write")
-async def _handle_edit_session_heartbeat(
+async def _execute_edit_session_heartbeat(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -1630,8 +1617,7 @@ async def _handle_edit_session_heartbeat(
     return {"editSession": _edit_session_payload(edit_session)}
 
 
-@_d.method("documents.editSessions.close", scope="operator.write")
-async def _handle_edit_session_close(
+async def _execute_edit_session_close(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -1664,8 +1650,7 @@ async def _handle_edit_session_close(
     return {"editSession": _edit_session_payload(edit_session)}
 
 
-@_d.method("artifacts.revisions.list", scope="operator.read")
-async def _handle_revisions_list(
+async def _execute_revisions_list(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -1683,8 +1668,7 @@ async def _handle_revisions_list(
     return {"revisions": [_revision_payload(item) for item in revisions]}
 
 
-@_d.method("artifacts.revisions.restore", scope="operator.write")
-async def _handle_revision_restore(
+async def _execute_revision_restore(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -1757,8 +1741,7 @@ async def _handle_revision_restore(
     }
 
 
-@_d.method("artifacts.changes.list", scope="operator.read")
-async def _handle_changes_list(
+async def _execute_changes_list(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -1776,8 +1759,7 @@ async def _handle_changes_list(
     return {"changeSets": [_change_set_payload(item) for item in changes]}
 
 
-@_d.method("artifacts.changes.get", scope="operator.read")
-async def _handle_change_get(
+async def _execute_change_get(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -1798,8 +1780,7 @@ async def _handle_change_get(
     return {"changeSet": _change_set_payload(change_set)}
 
 
-@_d.method("artifacts.changes.revert", scope="operator.write")
-async def _handle_change_revert(
+async def _execute_change_revert(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -1993,8 +1974,7 @@ async def _trusted_annotation_selection(
         or getattr(resolved, "dom_sha256", None) != dom_sha256
         or getattr(resolved, "element_proof_sha256", None) != element_proof_sha256
         or getattr(resolved, "scope_id", None) != session_key
-        or getattr(resolved, "active_preview_artifact_id", None)
-        != active_preview_artifact_id
+        or getattr(resolved, "active_preview_artifact_id", None) != active_preview_artifact_id
     ):
         raise artifact_product_error(
             ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
@@ -2100,8 +2080,7 @@ async def _idempotent_prompt_annotation_create(
     return annotation, anchor
 
 
-@_d.method("artifacts.prompt_annotations.list", scope="operator.read")
-async def _handle_prompt_annotations_list(
+async def _execute_prompt_annotations_list(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -2154,8 +2133,7 @@ async def _handle_prompt_annotations_list(
     return {"annotations": payloads}
 
 
-@_d.method("artifacts.prompt_annotations.create", scope="operator.write")
-async def _handle_prompt_annotation_create(
+async def _execute_prompt_annotation_create(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -2271,8 +2249,7 @@ async def _handle_prompt_annotation_create(
     }
 
 
-@_d.method("artifacts.prompt_annotations.focus", scope="operator.write")
-async def _handle_prompt_annotation_focus(
+async def _execute_prompt_annotation_focus(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -2331,14 +2308,17 @@ async def _handle_prompt_annotation_focus(
             document=document,
             revision_id=old_revision.revision_id,
         )
-        _current_resolved, _current_ref, _current_path, current_source = (
-            await _resolve_source_revision(
-                ctx=ctx,
-                service=service,
-                session_id=session_id,
-                document=document,
-                revision_id=revision.revision_id,
-            )
+        (
+            _current_resolved,
+            _current_ref,
+            _current_path,
+            current_source,
+        ) = await _resolve_source_revision(
+            ctx=ctx,
+            service=service,
+            session_id=session_id,
+            document=document,
+            revision_id=revision.revision_id,
         )
         resolution = remap_html_anchor(
             old_source=old_source,
@@ -2422,8 +2402,7 @@ async def _handle_prompt_annotation_focus(
     }
 
 
-@_d.method("artifacts.prompt_annotations.update", scope="operator.write")
-async def _handle_prompt_annotation_update(
+async def _execute_prompt_annotation_update(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -2463,8 +2442,7 @@ async def _handle_prompt_annotation_update(
     }
 
 
-@_d.method("artifacts.prompt_annotations.discard", scope="operator.write")
-async def _handle_prompt_annotation_discard(
+async def _execute_prompt_annotation_discard(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -2577,8 +2555,7 @@ async def _resolve_source_revision(
     return revision, ref, path, source
 
 
-@_d.method("artifacts.source.read", scope="operator.read")
-async def _handle_source_read(
+async def _execute_source_read(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -2749,10 +2726,7 @@ async def _applied_mutation_replay(
         raise ArtifactConflictError(
             "clientRequestId was already used for a different document mutation"
         )
-    if (
-        change_set.status is not ChangeSetStatus.APPLIED
-        or change_set.applied_revision_id is None
-    ):
+    if change_set.status is not ChangeSetStatus.APPLIED or change_set.applied_revision_id is None:
         raise ArtifactConflictError("document mutation receipt is not applied")
     document = await service.get_document(document_id)
     revision = await service.get_revision(change_set.applied_revision_id)
@@ -2800,8 +2774,7 @@ async def _source_patch_response(
     return payload
 
 
-@_d.method("artifacts.source.patch", scope="operator.write")
-async def _handle_source_patch(
+async def _execute_source_patch(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
@@ -3095,9 +3068,7 @@ async def _handle_source_patch(
         ):
             try:
                 durable_document = await service.get_document(document_id)
-                durable_revision = await service.get_revision(
-                    durable_change.applied_revision_id
-                )
+                durable_revision = await service.get_revision(durable_change.applied_revision_id)
             except Exception:  # noqa: BLE001 - preserve bytes on ambiguous commit state
                 pass
             else:
@@ -3213,6 +3184,93 @@ async def _handle_source_patch(
         change_set=committed_change,
         patch_count=patch_count,
         edit_session=updated_edit_session,
+    )
+
+
+_ARTIFACT_EDITING_IMPLEMENTATIONS = (
+    ("artifacts.edit.capabilities", _execute_artifact_capabilities),
+    ("artifacts.documents.open", _execute_document_open),
+    ("artifacts.documents.list", _execute_documents_list),
+    ("artifacts.documents.get", _execute_document_get),
+    ("artifacts.documents.rename", _execute_document_rename),
+    ("artifacts.documents.close", _execute_document_close),
+    ("documents.editSessions.start", _execute_edit_session_start),
+    ("documents.editSessions.heartbeat", _execute_edit_session_heartbeat),
+    ("documents.editSessions.close", _execute_edit_session_close),
+    ("artifacts.revisions.list", _execute_revisions_list),
+    ("artifacts.revisions.restore", _execute_revision_restore),
+    ("artifacts.changes.list", _execute_changes_list),
+    ("artifacts.changes.get", _execute_change_get),
+    ("artifacts.changes.revert", _execute_change_revert),
+    ("artifacts.prompt_annotations.list", _execute_prompt_annotations_list),
+    ("artifacts.prompt_annotations.create", _execute_prompt_annotation_create),
+    ("artifacts.prompt_annotations.focus", _execute_prompt_annotation_focus),
+    ("artifacts.prompt_annotations.update", _execute_prompt_annotation_update),
+    ("artifacts.prompt_annotations.discard", _execute_prompt_annotation_discard),
+    ("artifacts.source.read", _execute_source_read),
+    ("artifacts.source.patch", _execute_source_patch),
+)
+
+(
+    _handle_artifact_capabilities,
+    _handle_document_open,
+    _handle_documents_list,
+    _handle_document_get,
+    _handle_document_rename,
+    _handle_document_close,
+    _handle_edit_session_start,
+    _handle_edit_session_heartbeat,
+    _handle_edit_session_close,
+    _handle_revisions_list,
+    _handle_revision_restore,
+    _handle_changes_list,
+    _handle_change_get,
+    _handle_change_revert,
+    _handle_prompt_annotations_list,
+    _handle_prompt_annotation_create,
+    _handle_prompt_annotation_focus,
+    _handle_prompt_annotation_update,
+    _handle_prompt_annotation_discard,
+    _handle_source_read,
+    _handle_source_patch,
+) = tuple(
+    GatewayArtifactWorkbenchAdapter.bind(method, implementation)
+    for method, implementation in _ARTIFACT_EDITING_IMPLEMENTATIONS
+)
+
+for _artifact_method, _artifact_implementation in zip(
+    (method for method, _implementation in _ARTIFACT_EDITING_IMPLEMENTATIONS),
+    (
+        _handle_artifact_capabilities,
+        _handle_document_open,
+        _handle_documents_list,
+        _handle_document_get,
+        _handle_document_rename,
+        _handle_document_close,
+        _handle_edit_session_start,
+        _handle_edit_session_heartbeat,
+        _handle_edit_session_close,
+        _handle_revisions_list,
+        _handle_revision_restore,
+        _handle_changes_list,
+        _handle_change_get,
+        _handle_change_revert,
+        _handle_prompt_annotations_list,
+        _handle_prompt_annotation_create,
+        _handle_prompt_annotation_focus,
+        _handle_prompt_annotation_update,
+        _handle_prompt_annotation_discard,
+        _handle_source_read,
+        _handle_source_patch,
+    ),
+    strict=True,
+):
+    register_artifact_workbench_contract(
+        _d,
+        _artifact_method,
+        _artifact_implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
     )
 
 

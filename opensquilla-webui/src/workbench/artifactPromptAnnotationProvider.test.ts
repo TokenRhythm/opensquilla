@@ -187,4 +187,12 @@ describe('artifact prompt annotation RPC provider', () => {
     await expect(provider.list('session-a')).resolves.toEqual([])
     expect(rememberUnsupportedMethod).toHaveBeenCalledWith(PROMPT_ANNOTATION_RPC_METHODS.list)
   })
+
+  it('rejects non-object results before legacy projection', async () => {
+    const provider = createRpcArtifactPromptAnnotationProvider({
+      call: vi.fn().mockResolvedValue('invalid-wire-result'),
+    })
+
+    await expect(provider.list('session-a')).rejects.toThrow('invalid response')
+  })
 })

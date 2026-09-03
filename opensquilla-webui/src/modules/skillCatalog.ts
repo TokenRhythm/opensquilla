@@ -73,6 +73,13 @@ export interface SkillProposalAction {
   readonly settings?: ProposalsSettings
 }
 
+export interface ProposalSettingsUpdate {
+  readonly enabled?: boolean
+  readonly on_dream_complete?: boolean
+  readonly auto_enable?: boolean
+  readonly auto_enable_max_risk?: 'low' | 'medium' | 'high'
+}
+
 export interface SkillCatalog {
   list(options?: { readonly signal?: AbortSignal }): Promise<readonly Skill[]>
   detail(skill: Pick<Skill, 'name' | 'instance_id' | 'install_id'>, options?: {
@@ -106,7 +113,7 @@ export interface SkillCatalog {
     readonly signal?: AbortSignal
   }): Promise<SkillInstallResult>
   proposals(options?: { readonly signal?: AbortSignal }): Promise<SkillProposalSnapshot>
-  updateProposalSettings(changes: Readonly<Record<string, boolean | string>>, options?: {
+  updateProposalSettings(changes: ProposalSettingsUpdate, options?: {
     readonly signal?: AbortSignal
   }): Promise<SkillProposalAction>
   proposal(proposalId: string, options?: { readonly signal?: AbortSignal }): Promise<SkillProposalDetail>

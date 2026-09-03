@@ -1,5 +1,9 @@
 import type { RpcCallOptions } from '@/lib/rpc'
 import type { ArtifactPromptAnnotationProvider } from '@/modules/artifactWorkbench'
+import {
+  acceptsWorkbenchResult,
+  promptAnnotationContracts,
+} from './artifactWorkbenchContracts'
 
 interface V4RpcTransport {
   request<T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions): Promise<T>
@@ -17,12 +21,16 @@ import type {
 } from '@/types/promptAnnotations'
 
 export const PROMPT_ANNOTATION_RPC_METHODS = {
-  create: 'artifacts.prompt_annotations.create',
-  list: 'artifacts.prompt_annotations.list',
-  update: 'artifacts.prompt_annotations.update',
-  discard: 'artifacts.prompt_annotations.discard',
-  focus: 'artifacts.prompt_annotations.focus',
+  create: promptAnnotationContracts.create.method,
+  list: promptAnnotationContracts.list.method,
+  update: promptAnnotationContracts.update.method,
+  discard: promptAnnotationContracts.discard.method,
+  focus: promptAnnotationContracts.focus.method,
 } as const
+
+const PROMPT_ANNOTATION_CONTRACTS_BY_METHOD = new Map(
+  Object.values(promptAnnotationContracts).map(contract => [contract.method, contract]),
+)
 
 type PromptAnnotationRpc = {
   hasRpcMethod?: (method: string) => boolean
@@ -236,7 +244,12 @@ export function createRpcArtifactPromptAnnotationProvider(
   ): Promise<T | null> {
     if (rpc.hasRpcMethod?.(method) === false) return null
     try {
-      return await rpc.call<T>(method, params, signalOptions(signal))
+      const result = await rpc.call<T>(method, params, signalOptions(signal))
+      const contract = PROMPT_ANNOTATION_CONTRACTS_BY_METHOD.get(method)
+      if (!contract || !acceptsWorkbenchResult(contract, result)) {
+        throw new Error(`${method} returned an invalid response`)
+      }
+      return result
     } catch (error) {
       if (!methodNotFound(error)) throw error
       rpc.rememberUnsupportedMethod?.(method)

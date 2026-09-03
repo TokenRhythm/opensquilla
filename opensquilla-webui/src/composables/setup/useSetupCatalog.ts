@@ -48,7 +48,11 @@ import { saveFailedMessage } from '@/lib/rpcErrors'
 import { copyTextWithFallback } from '@/utils/browser'
 import { TEXT_TIERS, normalizeRouterTier, routerTierLabelKey } from '@/utils/chat/routerTiers'
 import { APP_SETTINGS_KEY, type AppSettings, type SettingsValue } from '@/modules/appSettings'
-import { SETUP_WORKFLOW_KEY, type SetupWorkflow } from '@/modules/setupWorkflow'
+import {
+  SETUP_WORKFLOW_KEY,
+  type ConfigurePrimaryProvider,
+  type SetupWorkflow,
+} from '@/modules/setupWorkflow'
 import { PROVIDER_CONFIGURATION_KEY, type ProviderConfiguration } from '@/modules/providerConfiguration'
 
 // ---------------------------------------------------------------------------
@@ -688,11 +692,11 @@ function discoverTierProviderModels(providerId: string): Promise<void> {
         // matters when Model Service is currently editing a different saved
         // profile: the fixed-model picker must still discover the active
         // provider through its primary deployment.
-        res = await setupWorkflow.provider.discoverModels({ providerId: provider })
+        res = await setupWorkflow.provider.discoverPrimaryModels({ providerId: provider })
       } else {
         // The Adapter owns the legacy provider-discovery fallback so this
         // consumer never branches on RPC method availability.
-        res = await setupWorkflow.profile.discoverModels({ providerId: provider })
+        res = await setupWorkflow.profile.discoverProfileModels({ providerId: provider })
       }
       if (epoch !== tierModelDiscoveryEpoch) return
       const source = res?.ok && res.source === 'live' ? 'live' : 'none'
@@ -2513,7 +2517,7 @@ async function probeConfiguredProvider(value: string) {
     ? String(currentModel.value || representativeProviderModel(providerId))
     : representativeProviderModel(providerId)
   try {
-    const probe = active ? setupWorkflow.provider.probe : setupWorkflow.profile.probe
+    const probe = active ? setupWorkflow.provider.probePrimary : setupWorkflow.profile.probeProfile
     const res = await probe({ providerId, model }) as {
       ok?: boolean
       failureKind?: string
@@ -2573,7 +2577,7 @@ async function activateProvider(value: string) {
       error: '',
     }
     try {
-      await setupWorkflow.profile.activate({
+      await setupWorkflow.profile.activateProfile({
         providerId,
         ...(routerAction ? { routerAction } : {}),
         // Activating a stored profile is not controlled by the primary-provider
@@ -2723,7 +2727,7 @@ async function revealProviderCredential() {
   const providerId = String(providerForm.selectedProvider.value || '').trim()
   if (!providerId) return
   try {
-    const res = await setupWorkflow.provider.credentialReveal(providerId)
+    const res = await setupWorkflow.provider.revealActiveCredential(providerId)
     if (res?.ok && typeof res.apiKey === 'string' && res.apiKey.length > 0) {
       providerForm.setRevealedCredential(res.apiKey)
       return
@@ -2757,8 +2761,8 @@ async function removeProviderCredential() {
   providerForm.hideRevealedCredential()
   try {
     const response = (clearingPrimary
-      ? await setupWorkflow.provider.credentialClear(provider)
-      : await setupWorkflow.profile.credentialClear(provider)) as {
+      ? await setupWorkflow.provider.clearActiveCredential(provider)
+      : await setupWorkflow.profile.clearProfileCredential(provider)) as {
         entry?: {
           externalCredentialActive?: boolean
           credentialEnv?: string
@@ -2887,7 +2891,7 @@ async function removeProviderProfile(providerId: string) {
       // conflict up front and mirror activateProvider: keep the saved tiers,
       // turn the Router off, and let the operator re-enable it deliberately.
       routerAction = routerConflictsWithTarget(replacement.providerId) ? 'disable' : undefined
-      await setupWorkflow.profile.removeActive({
+      await setupWorkflow.profile.removeActiveProfile({
         providerId: provider,
         replacementProviderId: replacement.providerId,
         ...(routerAction ? { routerAction } : {}),
@@ -2896,7 +2900,7 @@ async function removeProviderProfile(providerId: string) {
         }),
       })
     } else {
-      await setupWorkflow.profile.remove(provider)
+      await setupWorkflow.profile.removeProfile(provider)
     }
     await loadData()
     const providerLabel = providerCatalogLabel(provider)
@@ -3320,7 +3324,7 @@ async function resetCapability(name: CapabilityId) {
 
   capabilityResetPending.value = name
   try {
-    const response = await setupWorkflow.capability.reset(name)
+    const response = await setupWorkflow.capability.resetCapability(name)
     // Refresh server-owned status while preserving unrelated drafts, then
     // reseed only the capability that the user explicitly reset.
     await loadData({ preserveFormDrafts: true, throwOnError: true })
@@ -3410,7 +3414,7 @@ function imageGenerationIntentPayload(
   }
 }
 
-function providerConfigurePayload(includeProviderModelDraft = false): Record<string, unknown> {
+function providerConfigurePayload(includeProviderModelDraft = false): ConfigurePrimaryProvider {
   const payload = providerForm.payload()
   if (editingPrimaryProvider.value && hasConfiguredPrimaryProvider.value) {
     // Model Routing owns the fixed-model draft. Provider saves must preserve
@@ -3550,7 +3554,7 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
       // it and the apparently-saved env choice would never take effect.
       if (payload.apiKeyEnv !== undefined) payload.apiKey = ''
       payload.keepCurrentSecret = selectedStoredProfile.value && !replacesCredential
-      await setupWorkflow.profile.upsert(payload)
+      await setupWorkflow.profile.upsertProfile(payload)
       if (options.reload !== false) {
         // Saving a routing-only profile refreshes its persisted status without
         // discarding drafts in any other Settings section. Provider-owned
@@ -3571,7 +3575,7 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
     // replace-primary flow: the legacy configure RPC atomically swaps the
     // provider, credential, endpoint, and default model after verification.
     const payload = providerConfigurePayload(options.includeProviderModelDraft === true)
-    await setupWorkflow.provider.configure(payload)
+    await setupWorkflow.provider.configurePrimary(payload)
     const restart = await patchConfig(promotedForm.providerPatches())
     // The per-model context-window override rides the deep-merge patch form. Key
     // it on the CURRENT canonical model draft rather than payload.model (which
@@ -3673,7 +3677,7 @@ async function saveRouter() {
   }
   try {
     if (routerForm.routingDirty.value) {
-      await setupWorkflow.capability.configure('router', routerForm.payload())
+      await setupWorkflow.capability.configureRouter(routerForm.payload())
     }
     const restart = await safePatchConfig(routerForm.visualModePatches())
     pushToast(restart ? t('setup.toast.routerSavedRestart') : t('setup.toast.routerSaved'))
@@ -3690,7 +3694,7 @@ async function saveEnsemble() {
     // loop reads [llm_ensemble] live.
     const params = ensembleForm.payload()
     if (Object.keys(params).length) {
-      await setupWorkflow.capability.configure('ensemble', params)
+      await setupWorkflow.capability.configureEnsemble(params)
     }
     pushToast(t('setup.toast.ensembleSaved'))
     await loadData()
@@ -3724,7 +3728,7 @@ async function saveModelStrategy(options: SaveOptions & {
   try {
     if (hasRouterWork) {
       if (routerRoutingPayload) {
-        await setupWorkflow.capability.configure('router', routerRoutingPayload)
+        await setupWorkflow.capability.configureRouter(routerRoutingPayload)
       }
       const restart = await safePatchConfig(routerVisualPatches)
       pushToast(restart ? t('setup.toast.routerSavedRestart') : t('setup.toast.routerSaved'))
@@ -3732,7 +3736,7 @@ async function saveModelStrategy(options: SaveOptions & {
     }
 
     if (hasEnsembleWork) {
-      await setupWorkflow.capability.configure('ensemble', ensemblePayload)
+      await setupWorkflow.capability.configureEnsemble(ensemblePayload)
       pushToast(t('setup.toast.ensembleSaved'))
       savedAny = true
     }
@@ -3745,7 +3749,7 @@ async function saveModelStrategy(options: SaveOptions & {
           pushToast(t('setup.toast.chooseProvider'), { tone: 'danger' })
           return false
         }
-        const response = await setupWorkflow.profile.activate({
+        const response = await setupWorkflow.profile.activateProfile({
           providerId,
           model: modelStrategyForm.fixedModel.value.trim(),
           ...imageGenerationIntentPayload(providerId, {
@@ -3782,7 +3786,7 @@ async function saveSearch(options: SaveOptions = {}): Promise<boolean> {
   }
   const params = capabilitiesForm.searchPayload()
   try {
-    await setupWorkflow.capability.configure('search', params)
+    await setupWorkflow.capability.configureSearch(params)
     pushToast(t('setup.toast.searchSaved'))
     if (options.reload !== false) await loadData()
     return true
@@ -3798,7 +3802,7 @@ async function saveMemory(options: SaveOptions = {}): Promise<boolean> {
     let envToastShown = false
     if (embeddingDirty) {
       const params = capabilitiesForm.memoryPayload()
-      const res = await setupWorkflow.capability.configure('memory_embedding', params) as {
+      const res = await setupWorkflow.capability.configureMemoryEmbedding(params) as {
         entry?: { remote?: { api_key_env?: string; api_key?: string } }
         restartRequired?: boolean
       }
@@ -3819,7 +3823,7 @@ async function saveMemory(options: SaveOptions = {}): Promise<boolean> {
 async function saveImage(options: SaveOptions = {}): Promise<boolean> {
   const params = capabilitiesForm.imagePayload()
   try {
-    const res = await setupWorkflow.capability.configure('imageGeneration', params) as {
+    const res = await setupWorkflow.capability.configureImageGeneration(params) as {
       entry?: { api_key_env?: string; api_key_source?: string; api_key?: string }
       restartRequired?: boolean
     }
@@ -3841,7 +3845,7 @@ async function saveAudio(options: SaveOptions = {}): Promise<boolean> {
     return true
   }
   try {
-    const res = await setupWorkflow.capability.configure('audio', promotedForm.audioPayload()) as {
+    const res = await setupWorkflow.capability.configureAudio(promotedForm.audioPayload()) as {
       entry?: { api_key_env?: string; api_key_source?: string; api_key?: string }
       restartRequired?: boolean
     }

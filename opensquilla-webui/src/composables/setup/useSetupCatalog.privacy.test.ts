@@ -97,18 +97,18 @@ async function mountCatalog() {
       { providerId },
     ),
     provider: {
-      configure: async (payload: Record<string, unknown>) => await rpcCall('onboarding.provider.configure', payload),
-      probe: (payload: Record<string, unknown>) => rpcCall('onboarding.provider.probe', payload),
-      discoverModels: (payload: Record<string, unknown>) => rpcCall('onboarding.models.discover', payload),
-      credentialReveal: async (providerId: string) => await rpcCall('onboarding.provider.credential.reveal', { providerId }),
-      credentialClear: async (providerId: string) => await rpcCall('onboarding.provider.credential.clear', { providerId }),
+      configurePrimary: async (payload: Record<string, unknown>) => await rpcCall('onboarding.provider.configure', payload),
+      probePrimary: (payload: Record<string, unknown>) => rpcCall('onboarding.provider.probe', payload),
+      discoverPrimaryModels: (payload: Record<string, unknown>) => rpcCall('onboarding.models.discover', payload),
+      revealActiveCredential: async (providerId: string) => await rpcCall('onboarding.provider.credential.reveal', { providerId }),
+      clearActiveCredential: async (providerId: string) => await rpcCall('onboarding.provider.credential.clear', { providerId }),
     },
     profile: {
-      upsert: async (payload: Record<string, unknown>) => await rpcCall('onboarding.llmProfile.upsert', payload),
-      activate: async (payload: Record<string, unknown>) => await rpcCall('onboarding.llmProfile.activate', payload),
-      probe: (payload: Record<string, unknown>) => rpcCall('onboarding.llmProfile.probe', payload),
-      probeDraft: (payload: Record<string, unknown>) => rpcCall('onboarding.llmProfile.draft.probe', payload),
-      discoverModels: (payload: Record<string, unknown>) => rpcCall(
+      upsertProfile: async (payload: Record<string, unknown>) => await rpcCall('onboarding.llmProfile.upsert', payload),
+      activateProfile: async (payload: Record<string, unknown>) => await rpcCall('onboarding.llmProfile.activate', payload),
+      probeProfile: (payload: Record<string, unknown>) => rpcCall('onboarding.llmProfile.probe', payload),
+      probeDraftProfile: (payload: Record<string, unknown>) => rpcCall('onboarding.llmProfile.draft.probe', payload),
+      discoverProfileModels: (payload: Record<string, unknown>) => rpcCall(
         'onboarding.llmProfile.models.discover',
         payload,
       ).catch((error: unknown) => {
@@ -116,22 +116,20 @@ async function mountCatalog() {
           if (!/method.*not found|unknown method|not registered/i.test(message)) throw error
           return rpcCall('onboarding.models.discover', payload)
         }),
-      discoverDraftModels: (payload: Record<string, unknown>) => rpcCall('onboarding.llmProfile.draft.models.discover', payload),
-      remove: async (providerId: string) => await rpcCall('onboarding.llmProfile.remove', { providerId }),
-      removeActive: async (payload: Record<string, unknown>) => await rpcCall('onboarding.llmProfile.active.remove', payload),
-      credentialClear: async (providerId: string) => await rpcCall('onboarding.llmProfile.credential.clear', { providerId }),
+      discoverDraftProfileModels: (payload: Record<string, unknown>) => rpcCall('onboarding.llmProfile.draft.models.discover', payload),
+      removeProfile: async (providerId: string) => await rpcCall('onboarding.llmProfile.remove', { providerId }),
+      removeActiveProfile: async (payload: Record<string, unknown>) => await rpcCall('onboarding.llmProfile.active.remove', payload),
+      clearProfileCredential: async (providerId: string) => await rpcCall('onboarding.llmProfile.credential.clear', { providerId }),
     },
     capability: {
-      configure: async (name: string, payload: Record<string, unknown>) => await rpcCall({
-        router: 'onboarding.router.configure',
-        ensemble: 'onboarding.ensemble.configure',
-        search: 'onboarding.search.configure',
-        imageGeneration: 'onboarding.imageGeneration.configure',
-        memory_embedding: 'onboarding.memory_embedding.configure',
-        audio: 'onboarding.audio.configure',
-      }[name] || name, payload),
-      reset: async (name: string) => await rpcCall('onboarding.capability.reset', {
-        capabilityId: name === 'imageGeneration' ? 'image_generation' : name,
+      configureRouter: async (payload: Record<string, unknown>) => await rpcCall('onboarding.router.configure', payload),
+      configureEnsemble: async (payload: Record<string, unknown>) => await rpcCall('onboarding.ensemble.configure', payload),
+      configureSearch: async (payload: Record<string, unknown>) => await rpcCall('onboarding.search.configure', payload),
+      configureImageGeneration: async (payload: Record<string, unknown>) => await rpcCall('onboarding.imageGeneration.configure', payload),
+      configureMemoryEmbedding: async (payload: Record<string, unknown>) => await rpcCall('onboarding.memory_embedding.configure', payload),
+      configureAudio: async (payload: Record<string, unknown>) => await rpcCall('onboarding.audio.configure', payload),
+      resetCapability: async (capabilityId: string) => await rpcCall('onboarding.capability.reset', {
+        capabilityId,
       }),
     },
   } as unknown as import('@/modules/setupWorkflow').SetupWorkflow)

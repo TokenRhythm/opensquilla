@@ -4,6 +4,15 @@ from __future__ import annotations
 
 from typing import Any, cast
 
+from opensquilla.application.conversation_ancillary import PromptCachePolicy
+from opensquilla.gateway.adapters.conversation_ancillary import (
+    GatewayConversationAncillaryAdapter,
+    GatewayConversationAncillaryCallbacks,
+)
+from opensquilla.gateway.adapters.conversation_ancillary_contract import (
+    register_conversation_ancillary_contract,
+)
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.prompt_cache_keepalive import (
     DEFAULT_IDLE_TIMEOUT_SECONDS,
     DEFAULT_TTL_SECONDS,
@@ -12,7 +21,12 @@ from opensquilla.gateway.prompt_cache_keepalive import (
     MIN_IDLE_TIMEOUT_SECONDS,
     MIN_TTL_SECONDS,
 )
-from opensquilla.gateway.rpc import RpcContext, RpcUnavailableError, get_dispatcher
+from opensquilla.gateway.rpc import (
+    RpcContext,
+    RpcHandlerError,
+    RpcUnavailableError,
+    get_dispatcher,
+)
 from opensquilla.gateway.session_services import get_session_storage
 
 _d = get_dispatcher()
@@ -40,13 +54,11 @@ def _service(ctx: RpcContext) -> Any:
     return service
 
 
-@_d.method("sessions.promptCacheKeepalive.status", scope="operator.read")
 async def _status(params: Any, ctx: RpcContext) -> dict[str, Any]:
     key = await _resolve_session(params, ctx)
     return cast(dict[str, Any], _service(ctx).status(key))
 
 
-@_d.method("sessions.promptCacheKeepalive.set", scope="operator.write")
 async def _set(params: Any, ctx: RpcContext) -> dict[str, Any]:
     key = await _resolve_session(params, ctx)
     assert isinstance(params, dict)
@@ -85,6 +97,51 @@ async def _set(params: Any, ctx: RpcContext) -> dict[str, Any]:
             idle_timeout_seconds=idle_timeout,
         ),
     )
+
+
+_PROMPT_CACHE_POLICY = PromptCachePolicy(
+    default_ttl_seconds=DEFAULT_TTL_SECONDS,
+    minimum_ttl_seconds=MIN_TTL_SECONDS,
+    maximum_ttl_seconds=MAX_TTL_SECONDS,
+    default_idle_timeout_seconds=DEFAULT_IDLE_TIMEOUT_SECONDS,
+    minimum_idle_timeout_seconds=MIN_IDLE_TIMEOUT_SECONDS,
+    maximum_idle_timeout_seconds=MAX_IDLE_TIMEOUT_SECONDS,
+)
+
+
+def _prompt_cache_adapter(ctx: RpcContext) -> GatewayConversationAncillaryAdapter:
+    return GatewayConversationAncillaryAdapter(
+        ctx,
+        GatewayConversationAncillaryCallbacks(
+            prompt_cache_status=_status,
+            prompt_cache_set=_set,
+        ),
+        prompt_cache_policy=_PROMPT_CACHE_POLICY,
+    )
+
+
+async def _status_contract(params: Any, ctx: RpcContext) -> dict[str, Any]:
+    return await _prompt_cache_adapter(ctx).prompt_cache_status(params)
+
+
+async def _set_contract(params: Any, ctx: RpcContext) -> dict[str, Any]:
+    return await _prompt_cache_adapter(ctx).prompt_cache_set(params)
+
+
+_status_generated_contract = register_conversation_ancillary_contract(
+    _d,
+    "sessions.promptCacheKeepalive.status",
+    _status_contract,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_set_generated_contract = register_conversation_ancillary_contract(
+    _d,
+    "sessions.promptCacheKeepalive.set",
+    _set_contract,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 __all__: list[str] = []

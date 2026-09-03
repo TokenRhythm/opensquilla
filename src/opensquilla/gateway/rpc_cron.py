@@ -7,7 +7,20 @@ from typing import Any, TypeGuard
 
 import structlog
 
-from opensquilla.gateway.rpc import RpcContext, RpcUnavailableError, get_dispatcher
+from opensquilla.gateway.adapters.cron_scheduler import (
+    GatewayCronCallbacks,
+    GatewayCronSchedulerAdapter,
+)
+from opensquilla.gateway.adapters.cron_scheduler_contract import (
+    register_cron_scheduler_contract,
+)
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
+from opensquilla.gateway.rpc import (
+    RpcContext,
+    RpcHandlerError,
+    RpcUnavailableError,
+    get_dispatcher,
+)
 from opensquilla.gateway.session_services import get_session_storage
 from opensquilla.project_workspaces import (
     ProjectWorkspaceStateError,
@@ -559,7 +572,6 @@ def _handler_key_for_payload_kind(kind: str) -> str:
     return "agent_run"
 
 
-@_d.method("cron.list", scope="operator.read")
 async def _handle_cron_list(params: dict | None, ctx: RpcContext) -> list[dict]:
     scheduler = getattr(ctx, "cron_scheduler", None)
     if scheduler is None:
@@ -572,7 +584,6 @@ async def _handle_cron_list(params: dict | None, ctx: RpcContext) -> list[dict]:
     return result
 
 
-@_d.method("cron.status", scope="operator.read")
 async def _handle_cron_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict) or "id" not in params:
         raise ValueError("params.id is required")
@@ -583,7 +594,6 @@ async def _handle_cron_status(params: dict | None, ctx: RpcContext) -> dict[str,
     return _job_to_wire(job)
 
 
-@_d.method("cron.add", scope="operator.admin")
 async def _handle_cron_add(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict):
         raise ValueError("params required: schedule (object) or expression (string)")
@@ -760,11 +770,8 @@ async def _finalize_cron_add(
     return _job_to_wire(job)
 
 
-# Alias: cron.js sends cron.create for new jobs
-_d.method("cron.create", scope="operator.admin")(_handle_cron_add)
-
-
-@_d.method("cron.update", scope="operator.admin")
+# Alias: cron.js sends cron.create for new jobs; generated registration below
+# routes both names into this single implementation.
 async def _handle_cron_update(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict) or "id" not in params:
         raise ValueError("params.id is required")
@@ -991,7 +998,6 @@ async def _handle_cron_update(params: dict | None, ctx: RpcContext) -> dict[str,
     return _job_to_wire(job)
 
 
-@_d.method("cron.remove", scope="operator.admin")
 async def _handle_cron_remove(params: dict | None, ctx: RpcContext) -> None:
     if not isinstance(params, dict) or "id" not in params:
         raise ValueError("params.id is required")
@@ -1000,7 +1006,6 @@ async def _handle_cron_remove(params: dict | None, ctx: RpcContext) -> None:
     return None
 
 
-@_d.method("cron.run", scope="operator.admin")
 async def _handle_cron_run(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict) or "id" not in params:
         raise ValueError("params.id is required")
@@ -1009,7 +1014,6 @@ async def _handle_cron_run(params: dict | None, ctx: RpcContext) -> dict[str, An
     return _manual_run_to_wire(result)
 
 
-@_d.method("cron.runs", scope="operator.read")
 async def _handle_cron_runs(params: dict | None, ctx: RpcContext) -> list[dict]:
     if not isinstance(params, dict):
         raise ValueError("params.id is required")
@@ -1042,7 +1046,6 @@ async def _handle_cron_runs(params: dict | None, ctx: RpcContext) -> list[dict]:
     ]
 
 
-@_d.method("cron.subscribe", scope="operator.read")
 async def _handle_cron_subscribe(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     """Subscribe this connection to cron events."""
     sub_mgr = getattr(ctx, "subscription_manager", None)
@@ -1057,7 +1060,6 @@ async def _handle_cron_subscribe(params: dict | None, ctx: RpcContext) -> dict[s
     return {"ok": True, "topic": topic}
 
 
-@_d.method("cron.unsubscribe", scope="operator.read")
 async def _handle_cron_unsubscribe(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     """Unsubscribe this connection from cron events."""
     sub_mgr = getattr(ctx, "subscription_manager", None)
@@ -1070,3 +1072,91 @@ async def _handle_cron_unsubscribe(params: dict | None, ctx: RpcContext) -> dict
     topic = f"cron:{job_id}" if job_id else "cron:*"
     sub_mgr.unsubscribe_topic(conn_id, topic)
     return {"ok": True, "topic": topic}
+
+
+def _cron_scheduler_adapter(ctx: RpcContext) -> GatewayCronSchedulerAdapter:
+    return GatewayCronSchedulerAdapter(
+        ctx,
+        GatewayCronCallbacks(
+            list_jobs=_handle_cron_list,
+            status=_handle_cron_status,
+            create=_handle_cron_add,
+            update=_handle_cron_update,
+            remove=_handle_cron_remove,
+            run=_handle_cron_run,
+            runs=_handle_cron_runs,
+            subscribe=_handle_cron_subscribe,
+            unsubscribe=_handle_cron_unsubscribe,
+        ),
+    )
+
+
+async def _cron_list_contract(params: dict[str, Any] | None, ctx: RpcContext) -> list[dict]:
+    return await _cron_scheduler_adapter(ctx).list_jobs(params)
+
+
+async def _cron_status_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _cron_scheduler_adapter(ctx).status(params)
+
+
+async def _cron_create_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _cron_scheduler_adapter(ctx).create(params)
+
+
+async def _cron_update_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _cron_scheduler_adapter(ctx).update(params)
+
+
+async def _cron_remove_contract(params: dict[str, Any] | None, ctx: RpcContext) -> None:
+    await _cron_scheduler_adapter(ctx).remove(params)
+
+
+async def _cron_run_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _cron_scheduler_adapter(ctx).run(params)
+
+
+async def _cron_runs_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> list[dict]:
+    return await _cron_scheduler_adapter(ctx).runs(params)
+
+
+async def _cron_subscribe_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _cron_scheduler_adapter(ctx).subscribe(params)
+
+
+async def _cron_unsubscribe_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _cron_scheduler_adapter(ctx).unsubscribe(params)
+
+
+for _cron_method, _cron_implementation in (
+    ("cron.list", _cron_list_contract),
+    ("cron.status", _cron_status_contract),
+    ("cron.add", _cron_create_contract),
+    ("cron.create", _cron_create_contract),
+    ("cron.update", _cron_update_contract),
+    ("cron.remove", _cron_remove_contract),
+    ("cron.run", _cron_run_contract),
+    ("cron.runs", _cron_runs_contract),
+    ("cron.subscribe", _cron_subscribe_contract),
+    ("cron.unsubscribe", _cron_unsubscribe_contract),
+):
+    register_cron_scheduler_contract(
+        _d,
+        _cron_method,
+        _cron_implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )

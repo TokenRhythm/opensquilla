@@ -22,16 +22,24 @@ import {
   normalizeArtifactDocument,
   normalizeArtifactRevision,
 } from './artifactDocumentsV4'
+import {
+  acceptsWorkbenchResult,
+  workbenchResourceContracts,
+} from './artifactWorkbenchContracts'
 
 export const WORKBENCH_RESOURCE_RPC_METHODS = {
-  list: 'workbench.resources.list',
-  get: 'workbench.resources.get',
-  open: 'workbench.resources.open',
-  createPreview: 'workbench.previews.create',
-  importDocument: 'documents.import',
-  publishDocument: 'documents.publish',
-  mutationResolve: 'artifacts.mutations.resolve',
+  list: workbenchResourceContracts.list.method,
+  get: workbenchResourceContracts.get.method,
+  open: workbenchResourceContracts.open.method,
+  createPreview: workbenchResourceContracts.createPreview.method,
+  importDocument: workbenchResourceContracts.importDocument.method,
+  publishDocument: workbenchResourceContracts.publishDocument.method,
+  mutationResolve: workbenchResourceContracts.mutationResolve.method,
 } as const
+
+const WORKBENCH_RESOURCE_CONTRACTS_BY_METHOD = new Map(
+  Object.values(workbenchResourceContracts).map(contract => [contract.method, contract]),
+)
 
 type WorkbenchResourceRpc = {
   hasRpcMethod?: (method: string) => boolean
@@ -252,7 +260,12 @@ export function createRpcWorkbenchResourceProvider(
   ): Promise<T> {
     if (!supports(method)) throw new Error('Workbench resource API is unavailable.')
     try {
-      return await rpc.call(method, params, { signal, timeoutMs: 15_000 }) as T
+      const result = await rpc.call(method, params, { signal, timeoutMs: 15_000 })
+      const contract = WORKBENCH_RESOURCE_CONTRACTS_BY_METHOD.get(method)
+      if (!contract || !acceptsWorkbenchResult(contract, result)) {
+        throw new Error(`${method} returned an invalid response`)
+      }
+      return result as T
     } catch (error) {
       if (isMethodNotFound(error)) rpc.rememberUnsupportedMethod?.(method)
       throw error

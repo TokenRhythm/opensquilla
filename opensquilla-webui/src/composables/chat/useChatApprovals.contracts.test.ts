@@ -4,6 +4,7 @@ import type { RpcEventHandler } from '@/lib/rpc'
 import type { InterruptViewState } from '@/types/parts'
 import { projectApprovalDisplayArgs } from '@/adapters/gateway/approvalCenterV4Contract'
 import { sessionConversationFromTestRpc } from '@/testing/sessionConversation.test-helper'
+import { clarificationSubmissionFromTestRpc } from '@/testing/conversationAncillary.test-helper'
 import {
   useChatApprovals,
 } from './useChatApprovals'
@@ -93,6 +94,12 @@ async function harness(statusResult: unknown = { found: true, pending: true, res
         handlers.set(event, handler)
         return () => handlers.delete(event)
       }),
+    }),
+    clarificationSubmission: clarificationSubmissionFromTestRpc({
+      call: rpcCall as (
+        method: string,
+        params?: Record<string, unknown>,
+      ) => Promise<unknown>,
     }),
     sessionKey: ref('agent:main:web'),
     runStatus: ref({ status: 'idle', label: '', task: null }),
@@ -453,7 +460,7 @@ describe('clarify tool-result recovery', () => {
       expect(runtime.rpcCall).toHaveBeenLastCalledWith('chat.clarify_submit', {
         sessionKey: 'agent:main:web',
         fields: { scope: 'focused' },
-        request_id: 'input-request-1',
+        requestId: 'input-request-1',
         run_id: 'plan-run-1',
       })
       expect(runtime.approvals.pendingClarify.value).toBeNull()
@@ -628,7 +635,7 @@ describe('clarify tool-result recovery', () => {
       const firstSubmit = runtime.approvals.submitClarify({ scope: 'focused' })
       await vi.waitFor(() => expect(runtime.rpcCall).toHaveBeenCalledWith(
         'chat.clarify_submit',
-        expect.objectContaining({ request_id: 'input-request-1' }),
+        expect.objectContaining({ requestId: 'input-request-1' }),
       ))
 
       handler?.({
