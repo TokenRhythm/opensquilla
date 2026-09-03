@@ -262,6 +262,8 @@ interface DispatchSendOptions {
   backgroundReceiptReplay?: boolean
   /** The rejected background receipt and its queue owner were durably retired. */
   onBackgroundRejectionRetired?: () => void
+  /** Wait for delayed retirement before continuing the same user action. */
+  onBackgroundRejectionRetirement?: (retirement: Promise<void>) => void
   /** Preserve an explicit empty attachment list on the chat.send wire. */
   includeEmptyAttachments?: boolean
   /** Revalidate protocol-owned sends after every awaited pre-dispatch step. */
@@ -1463,10 +1465,14 @@ export function useChatSend(options: UseChatSendOptions) {
     return markResponseHandoffBackgroundOnly(gate)
   }
 
-  function scheduleAcceptanceRecovery(attempt: SendAttempt) {
-    if ((attempt.acceptanceResolved && !attempt.stopRequested) || !attempt.acceptanceRequest) return
+  function scheduleAcceptanceRecovery(attempt: SendAttempt): Promise<void> | null {
+    if (
+      (attempt.acceptanceResolved && !attempt.stopRequested)
+      || !attempt.acceptanceRequest
+    ) return null
     const key = acceptanceAttemptKey(attempt)
-    if (acceptanceRecoveryWorkers.has(key)) return
+    const existing = acceptanceRecoveryWorkers.get(key)
+    if (existing) return existing
 
     const operation = (async () => {
       let recoveryAttempt = 0
@@ -1576,6 +1582,7 @@ export function useChatSend(options: UseChatSendOptions) {
     })
     acceptanceRecoveryWorkers.set(key, operation)
     noteAcceptanceRecoveryChanged()
+    return operation
   }
 
   function pendingQueueOwner(): PendingQueueOwner | undefined {
@@ -2341,6 +2348,41 @@ export function useChatSend(options: UseChatSendOptions) {
     }
   }
 
+  async function retireBackgroundHandoffUntilComplete(
+    initialRecord: ResponseHandoffWalRecord,
+    rejectionError?: unknown,
+  ): Promise<void> {
+    const wal = options.pendingInputWal
+    if (!wal?.listHandoffs) return
+    let record = initialRecord
+    let retryAttempt = 0
+    while (true) {
+      const retired = await retireFailedBackgroundHandoff(
+        record,
+        record.state === 'failed' ? undefined : rejectionError,
+      )
+      if (retired) return
+      const delayMs = acceptanceRecoveryDelaysMs[
+        Math.min(retryAttempt, acceptanceRecoveryDelaysMs.length - 1)
+      ]!
+      retryAttempt += 1
+      await new Promise<void>(resolve => globalThis.setTimeout(resolve, delayMs))
+      let records: ResponseHandoffWalRecord[]
+      try {
+        records = await wal.listHandoffs(record.requestSessionKey)
+      } catch {
+        continue
+      }
+      const current = records.find(candidate => (
+        candidate.ownerRequestId === record.ownerRequestId
+        && candidate.clientRequestId === record.clientRequestId
+        && candidate.clientMessageId === record.clientMessageId
+      ))
+      if (!current) return
+      record = current
+    }
+  }
+
   function restoreResponseHandoffDraft(record: ResponseHandoffWalRecord): boolean {
     if (options.sessionKey.value !== record.requestSessionKey) return false
     if (record.restoreComposerOnFailure === false) return true
@@ -2406,7 +2448,7 @@ export function useChatSend(options: UseChatSendOptions) {
         }
         if (record.state === 'failed') {
           if (record.backgroundOnly) {
-            await retireFailedBackgroundHandoff(record)
+            await retireBackgroundHandoffUntilComplete(record)
           } else if (restoreResponseHandoffDraft(record)) {
             await deleteResponseHandoff(record)
           }
@@ -2437,6 +2479,11 @@ export function useChatSend(options: UseChatSendOptions) {
             })
             const targetSessionKey = response.sessionKey || replayRecord.requestSessionKey
             if (replayRecord.backgroundOnly) {
+              options.trackBackgroundReceiptTask?.(
+                replayRecord.clientMessageId,
+                acceptedTaskId(response),
+                terminalResponseStatus(response),
+              )
               await finalizeRecoveredBackgroundHandoff(replayRecord, targetSessionKey)
             } else {
               await finalizeRecoveredHandoff(replayRecord, targetSessionKey)
@@ -2494,7 +2541,7 @@ export function useChatSend(options: UseChatSendOptions) {
               }
             }
             if (definitelyRejected && replayRecord.backgroundOnly) {
-              await retireFailedBackgroundHandoff(replayRecord, error)
+              await retireBackgroundHandoffUntilComplete(replayRecord, error)
             } else if (definitelyRejected && rpcError?.retryable === false) {
               await wal.putHandoff?.({
                 ...replayRecord,
@@ -2988,6 +3035,7 @@ export function useChatSend(options: UseChatSendOptions) {
       ) return
       if (replayBlockedReason?.value) return
       let rejectedReplayRetired = false
+      let rejectedReplayRetirement: Promise<void> | null = null
       const replayOutcome = await dispatchSend(exactReplayAttempt.text, {
         composerText,
         composerSnapshot: replayComposerSnapshot,
@@ -3013,6 +3061,9 @@ export function useChatSend(options: UseChatSendOptions) {
         onBackgroundRejectionRetired: () => {
           rejectedReplayRetired = true
         },
+        onBackgroundRejectionRetirement: (retirement) => {
+          rejectedReplayRetirement = retirement
+        },
         preDispatchGuard: stage => (
           forkSnapshotPreDispatchAllowed(
             replayComposerSnapshot,
@@ -3031,10 +3082,11 @@ export function useChatSend(options: UseChatSendOptions) {
           )
         ),
       })
-      if (
-        !replayingSupersededEditOwner
-        || (replayOutcome !== 'accepted' && !rejectedReplayRetired)
-      ) return
+      if (!replayingSupersededEditOwner) return
+      if (replayOutcome !== 'accepted' && !rejectedReplayRetired) {
+        if (!rejectedReplayRetirement) return
+        await rejectedReplayRetirement
+      }
       if (
         options.sessionKey.value !== requestSessionKey
         || !sameComposerOwnershipSnapshot(captureComposerSnapshot(), replayComposerSnapshot)
@@ -4405,7 +4457,8 @@ export function useChatSend(options: UseChatSendOptions) {
           attempt.backgroundRejectionPending = true
           attempt.backgroundRejectionError = err
           recoveredAttempt = attempt
-          scheduleAcceptanceRecovery(attempt)
+          const retirement = scheduleAcceptanceRecovery(attempt)
+          if (retirement) sendOpts.onBackgroundRejectionRetirement?.(retirement)
         }
       }
       if (options.sessionKey.value !== requestSessionKey) {

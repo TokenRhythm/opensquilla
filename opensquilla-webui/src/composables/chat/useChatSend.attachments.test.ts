@@ -2614,14 +2614,22 @@ describe('useChatSend attachment payloads', () => {
     ['accepted', () => Promise.resolve({
       sessionKey: 'agent:main:webchat:old-edit-child',
       task_id: 'old-edit-task',
-    })],
+    }), false, true],
     ['definitely rejected', () => Promise.reject(Object.assign(
       new Error('old Edit was rejected'),
       { accepted: false, retryable: false },
-    ))],
+    )), false, true],
+    ['rejected after delayed retirement', () => Promise.reject(Object.assign(
+      new Error('old Edit was rejected'),
+      { accepted: false, retryable: false },
+    )), true, true],
+    ['rejected after the newer Edit changes', () => Promise.reject(Object.assign(
+      new Error('old Edit was rejected'),
+      { accepted: false, retryable: false },
+    )), true, false],
   ] as const)(
     'settles an older %s Edit receipt before sending the newer Edit click',
-    async (_label, settleOldReceipt) => {
+    async (_label, settleOldReceipt, delayRetirement, shouldSendNewEdit) => {
       const newChildSessionKey = 'agent:main:webchat:new-edit-child'
       const {
         sessionKey,
@@ -2632,6 +2640,9 @@ describe('useChatSend attachment payloads', () => {
       } = makeEditedMessageState('older edited question')
       const pendingInputWal = memoryHandoffWal()
       const beginBackgroundReceiptReplay = vi.fn()
+      const recoverPendingQueueHandoff = vi.fn(async () => (
+        !delayRetirement || recoverPendingQueueHandoff.mock.calls.length > 1
+      ))
       const adoptResponseSession = vi.fn(async (key: string) => {
         sessionKey.value = key
       })
@@ -2652,6 +2663,7 @@ describe('useChatSend attachment payloads', () => {
         pendingForkBeforeMessageId,
         pendingInputWal,
         beginBackgroundReceiptReplay,
+        recoverPendingQueueHandoff,
         adoptResponseSession,
         messageEditGeneration: messageActions.editGeneration,
         messageEditActive: messageActions.editActive,
@@ -2689,10 +2701,30 @@ describe('useChatSend attachment payloads', () => {
       expect(pendingForkBeforeMessageId.value).toBe('new-edit-target')
       expect(inputText.value).toBe('newer edited question')
 
-      await harness.api.onSend()
+      if (delayRetirement) vi.useFakeTimers()
+      try {
+        const sendNewEdit = harness.api.onSend()
+        if (delayRetirement) {
+          await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledTimes(2))
+          if (!shouldSendNewEdit) inputText.value = 'changed while retirement was pending'
+          await vi.advanceTimersByTimeAsync(250)
+        }
+        await sendNewEdit
+      } finally {
+        if (delayRetirement) vi.useRealTimers()
+      }
 
-      expect(rpc.call).toHaveBeenCalledTimes(3)
+      expect(rpc.call).toHaveBeenCalledTimes(shouldSendNewEdit ? 3 : 2)
       expect(rpc.call.mock.calls[1]?.[1]).toEqual(oldParams)
+      if (!shouldSendNewEdit) {
+        expect(adoptResponseSession).not.toHaveBeenCalled()
+        expect(sessionKey.value).toBe('agent:main:webchat:test')
+        expect(messages.value).toBe(newerEditOwner)
+        expect(messageActions.editActive.value).toBe(true)
+        expect(inputText.value).toBe('changed while retirement was pending')
+        expect(await pendingInputWal.listHandoffs!()).toEqual([])
+        return
+      }
       expect(rpc.call.mock.calls[2]?.[1]).toMatchObject({
         message: 'newer edited question',
         forkBeforeMessageId: 'new-edit-target',
@@ -3296,6 +3328,129 @@ describe('useChatSend attachment payloads', () => {
     expect(await pendingInputWal.listHandoffs!()).toEqual([])
   })
 
+  it('retries a failed crash handoff queue release without waiting for reconnect', async () => {
+    vi.useFakeTimers()
+    try {
+      const parent = 'agent:main:webchat:failed-retry-parent'
+      const ownerRequestId = 'failed-retry-request'
+      const pendingInputWal = memoryHandoffWal()
+      await pendingInputWal.prepareHandoff!({
+        schemaVersion: 1,
+        ownerRequestId,
+        requestSessionKey: parent,
+        clientRequestId: ownerRequestId,
+        clientMessageId: 'failed-retry-message',
+        composerText: 'rejected receipt',
+        recoveryAttachments: [],
+        params: {
+          sessionKey: parent,
+          clientRequestId: ownerRequestId,
+          clientMessageId: 'failed-retry-message',
+          message: 'rejected receipt',
+          forkBeforeMessageId: 'failed-retry-anchor',
+        },
+        backgroundOnly: true,
+        walOwnerId: 'failed-retry-owner',
+        walRevision: 2,
+        state: 'failed',
+        errorCode: 'rejected',
+        createdAt: 1,
+        updatedAt: 2,
+      })
+      const recoverPendingQueueHandoff = vi.fn(async () => (
+        recoverPendingQueueHandoff.mock.calls.length > 1
+      ))
+      const harness = makeOptions({
+        sessionKey: ref(parent),
+        pendingInputWal,
+        recoverPendingQueueHandoff,
+      })
+
+      const recovery = harness.api.recoverResponseHandoffs()
+      await vi.waitFor(() => expect(recoverPendingQueueHandoff).toHaveBeenCalledOnce())
+      expect(await pendingInputWal.listHandoffs!()).toHaveLength(1)
+
+      await vi.advanceTimersByTimeAsync(250)
+      await recovery
+
+      expect(recoverPendingQueueHandoff).toHaveBeenCalledTimes(2)
+      expect(harness.rpc.call).not.toHaveBeenCalled()
+      expect(await pendingInputWal.listHandoffs!()).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('retries rejected crash replay retirement without resending the RPC', async () => {
+    vi.useFakeTimers()
+    try {
+      const parent = 'agent:main:webchat:rejected-retry-parent'
+      const ownerRequestId = 'rejected-retry-request'
+      const baseWal = memoryHandoffWal()
+      await baseWal.prepareHandoff!({
+        schemaVersion: 1,
+        ownerRequestId,
+        requestSessionKey: parent,
+        clientRequestId: ownerRequestId,
+        clientMessageId: 'rejected-retry-message',
+        composerText: 'rejected receipt',
+        recoveryAttachments: [],
+        params: {
+          sessionKey: parent,
+          clientRequestId: ownerRequestId,
+          clientMessageId: 'rejected-retry-message',
+          message: 'rejected receipt',
+          forkBeforeMessageId: 'rejected-retry-anchor',
+        },
+        backgroundOnly: true,
+        walOwnerId: 'rejected-retry-owner',
+        walRevision: 2,
+        state: 'submitting',
+        createdAt: 1,
+        updatedAt: 2,
+      })
+      let failRejectedTransition = true
+      const pendingInputWal: PendingInputWal = {
+        ...baseWal,
+        compareAndSwapHandoff: vi.fn(async (owner, walOwner, revision, record) => {
+          if (record?.state === 'failed' && failRejectedTransition) {
+            failRejectedTransition = false
+            return { applied: false, record: (await baseWal.listHandoffs!())[0] || null }
+          }
+          return baseWal.compareAndSwapHandoff!(owner, walOwner, revision, record)
+        }),
+      }
+      const recoverPendingQueueHandoff = vi.fn(async () => true)
+      const rpc = {
+        call: vi.fn().mockRejectedValue(Object.assign(new Error('rejected'), {
+          accepted: false,
+          retryable: false,
+        })),
+      }
+      const harness = makeOptions({
+        rpc,
+        sessionKey: ref(parent),
+        pendingInputWal,
+        recoverPendingQueueHandoff,
+      })
+
+      const recovery = harness.api.recoverResponseHandoffs()
+      await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledOnce())
+      expect(await pendingInputWal.listHandoffs!()).toEqual([
+        expect.objectContaining({ state: 'submitting', backgroundOnly: true }),
+      ])
+
+      await vi.advanceTimersByTimeAsync(250)
+      await recovery
+
+      expect(rpc.call).toHaveBeenCalledOnce()
+      expect(recoverPendingQueueHandoff).toHaveBeenCalledOnce()
+      expect(await pendingInputWal.listHandoffs!()).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('does not adopt a child from a background-only submitting WAL left by a crash', async () => {
     const parent = 'agent:main:webchat:parent-background'
     const child = 'agent:main:webchat:child-background'
@@ -3428,6 +3583,10 @@ describe('useChatSend attachment payloads', () => {
     })
     const applySessionRunState = vi.fn()
     const scheduleHistorySync = vi.fn()
+    let resolveQueueRelease!: (released: boolean) => void
+    const recoverPendingQueueHandoff = vi.fn(() => new Promise<boolean>(resolve => {
+      resolveQueueRelease = resolve
+    }))
     const recovery = makeOptions({
       rpc,
       sessionKey: ref(parent),
@@ -3438,6 +3597,7 @@ describe('useChatSend attachment payloads', () => {
       beginBackgroundReceiptReplay,
       finishBackgroundReceiptReplay,
       scheduleHistorySync,
+      recoverPendingQueueHandoff,
       messageEditActive: ref(true),
       prepareAttachmentsForSend: vi.fn(async ({ attachments }) => {
         const attachment = attachments?.[0]
@@ -3501,6 +3661,9 @@ describe('useChatSend attachment payloads', () => {
       expect(rpc.call.mock.calls[1]?.[1]?.attachments?.[0]?.file_uuid).toBe(
         'refreshed-recovery-file',
       )
+      resolveRecovery({ sessionKey: child, task_id: 'recovered-task' })
+      await vi.waitFor(() => expect(recoverPendingQueueHandoff).toHaveBeenCalledOnce())
+      expect(finishBackgroundReceiptReplay).not.toHaveBeenCalled()
       const deliver = (eventName: string, payload: Record<string, unknown>) => {
         rpcEvents.onConversationEvent({
           kind: 'conversation',
@@ -3512,7 +3675,6 @@ describe('useChatSend attachment payloads', () => {
       deliver('task.queued', {
         session_key: parent,
         task_id: 'recovered-task',
-        client_message_id: clientMessageId,
       })
       deliver('session.event.text_delta', {
         session_key: parent,
@@ -3540,7 +3702,7 @@ describe('useChatSend attachment payloads', () => {
       expect(messages.value).toEqual([expect.objectContaining({ text: 'current history' })])
       expect(scheduleHistorySync).not.toHaveBeenCalled()
 
-      resolveRecovery({ sessionKey: child, task_id: 'recovered-task' })
+      resolveQueueRelease(true)
       await restoring
 
       expect(finishBackgroundReceiptReplay).toHaveBeenCalledWith(clientMessageId)
