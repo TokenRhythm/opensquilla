@@ -263,9 +263,7 @@
                 :title="t('chat.composer.sessionModelRouting')"
                 :aria-label="t('chat.composer.sessionModelRouting')"
                 :aria-expanded="modelRoutingOpen ? 'true' : 'false'"
-                :aria-disabled="freshInputDisabled || sessionRoutingControlBlocked
-                  ? 'true'
-                  : 'false'"
+                :aria-disabled="freshInputDisabled ? 'true' : 'false'"
                 :disabled="freshInputDisabled"
                 @click="toggleModelRouting"
               >
