@@ -267,6 +267,64 @@ describe('useChatRpcEventHandlers decoded conversation ingress', () => {
     }
   })
 
+  it('defers an early terminal receipt until its same-session ACK allows projection', () => {
+    const taskOwnership = useChatTaskOwnership()
+    const harness = createHarness({
+      taskOwnership,
+      pendingQueue: [{
+        pendingUiId: 'pending-after-receipt',
+        text: 'send after receipt',
+        attachments: [],
+        intent: null,
+        ownerSessionKey: 'agent:main:test',
+      }],
+      messages: [{ role: 'assistant', text: 'current history', ts: null }],
+    })
+    harness.stream.isStreaming.value = false
+    const historyOwner = harness.messages.value
+    const payload = {
+      session_key: 'agent:main:test',
+      task_id: 'task-early-terminal',
+      client_message_id: 'client-early-terminal',
+    }
+    try {
+      harness.api.beginBackgroundReceiptReplay('client-early-terminal')
+      harness.api.onConversationEvent({
+        kind: 'conversation',
+        event: decodeConversationEvent('task.succeeded', payload, {}),
+        payload,
+        meta: {},
+      })
+
+      expect(harness.applySessionRunState).not.toHaveBeenCalled()
+      expect(harness.scheduleHistorySync).not.toHaveBeenCalled()
+      expect(harness.schedulePendingDrainAfterTerminal).not.toHaveBeenCalled()
+      expect(taskOwnership.hasAuthoritativeWork.value).toBe(false)
+      expect(harness.messages.value).toBe(historyOwner)
+
+      harness.api.trackBackgroundReceiptTask(
+        'client-early-terminal',
+        'task-early-terminal',
+        false,
+        true,
+      )
+
+      expect(harness.applySessionRunState).toHaveBeenCalledWith({
+        run_status: 'idle',
+        last_task: expect.objectContaining({
+          task_id: 'task-early-terminal',
+          status: 'succeeded',
+        }),
+      })
+      expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
+      expect(harness.schedulePendingDrainAfterTerminal).toHaveBeenCalledOnce()
+      expect(taskOwnership.hasAuthoritativeWork.value).toBe(false)
+      expect(harness.messages.value).toBe(historyOwner)
+    } finally {
+      harness.stop()
+    }
+  })
+
   it('quarantines live and terminal events from a background receipt replay', () => {
     const harness = createHarness({
       messages: [
@@ -535,7 +593,7 @@ describe('useChatRpcEventHandlers decoded conversation ingress', () => {
         task_id: 'task-old-receipt',
         client_message_id: 'client-old-receipt',
       })
-      expect(taskOwnership.hasAuthoritativeWork.value).toBe(true)
+      expect(taskOwnership.hasAuthoritativeWork.value).toBe(false)
 
       harness.api.trackBackgroundReceiptTask(
         'client-old-receipt',
@@ -599,6 +657,12 @@ describe('useChatRpcEventHandlers decoded conversation ingress', () => {
         },
         meta: {},
       })
+      harness.api.trackBackgroundReceiptTask(
+        'client-old-receipt',
+        'task-old-receipt',
+        false,
+        true,
+      )
 
       expect(harness.applySessionRunState).not.toHaveBeenCalled()
       expect(harness.clearPendingRouterDecision).not.toHaveBeenCalled()
@@ -641,6 +705,12 @@ describe('useChatRpcEventHandlers decoded conversation ingress', () => {
           },
           meta: {},
         })
+        harness.api.trackBackgroundReceiptTask(
+          'client-terminal-kind',
+          'task-terminal-kind',
+          false,
+          true,
+        )
 
         expect(harness.applySessionRunState).toHaveBeenCalledWith(expect.objectContaining({
           run_status: expectedRunStatus,
@@ -689,6 +759,12 @@ describe('useChatRpcEventHandlers decoded conversation ingress', () => {
         },
         meta: {},
       })
+      harness.api.trackBackgroundReceiptTask(
+        'client-killed-receipt',
+        'task-killed-receipt',
+        false,
+        true,
+      )
 
       expect(harness.applySessionRunState).toHaveBeenCalledWith(expect.objectContaining({
         run_status: 'cancelled',

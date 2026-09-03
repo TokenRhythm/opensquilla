@@ -1703,6 +1703,7 @@ let trackBackgroundReceiptTask = (
   _taskId: string,
   _terminal: boolean | string = false,
   _allowProjection = true,
+  _retireParentProjection = false,
 ) => {}
 let finishBackgroundReceiptReplay = (_clientMessageId: string) => {}
 let holdBackgroundReceiptReconciliation = () => {}
@@ -3473,8 +3474,20 @@ const chatSend = useChatSend({
   beginBackgroundReceiptReplay: (clientMessageId, holdHistory) => (
     beginBackgroundReceiptReplay(clientMessageId, holdHistory)
   ),
-  trackBackgroundReceiptTask: (clientMessageId, taskId, terminal, allowProjection) => (
-    trackBackgroundReceiptTask(clientMessageId, taskId, terminal, allowProjection)
+  trackBackgroundReceiptTask: (
+    clientMessageId,
+    taskId,
+    terminal,
+    allowProjection,
+    retireParentProjection,
+  ) => (
+    trackBackgroundReceiptTask(
+      clientMessageId,
+      taskId,
+      terminal,
+      allowProjection,
+      retireParentProjection,
+    )
   ),
   finishBackgroundReceiptReplay: clientMessageId => (
     finishBackgroundReceiptReplay(clientMessageId)

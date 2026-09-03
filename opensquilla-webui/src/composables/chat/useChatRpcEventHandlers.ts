@@ -418,9 +418,21 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     allowProjection: boolean
   }
 
+  interface DeferredBackgroundReceiptTerminal {
+    clientMessageId: string
+    eventKind: ConversationSemanticEventKind | 'sessions-changed'
+    payload: SessionEventPayload
+    status: string
+    terminalTask: object
+  }
+
   const pendingBackgroundReceiptClientIds = new Set<string>()
   const backgroundReceiptClientIds = new Set<string>()
   const backgroundReceiptTasks = new Map<string, BackgroundReceiptTask>()
+  const deferredBackgroundReceiptTerminals = new Map<
+    string,
+    DeferredBackgroundReceiptTerminal
+  >()
   const dirtyBackgroundReceiptClientIds = new Set<string>()
   const reconciledBackgroundReceiptClientIds = new Set<string>()
   const settledBackgroundReceiptClientIds = new Set<string>()
@@ -481,7 +493,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     clientMessageId: string,
     taskId: string,
     terminalSeen = false,
-    allowProjection = true,
+    allowProjection?: boolean,
   ) {
     const normalizedClientId = String(clientMessageId || '').trim()
     const normalizedTaskId = String(taskId || '').trim()
@@ -490,12 +502,15 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     const existing = backgroundReceiptTasks.get(normalizedTaskId)
     if (!existing && backgroundReceiptTasks.size >= 256) {
       const oldestTaskId = backgroundReceiptTasks.keys().next().value
-      if (typeof oldestTaskId === 'string') backgroundReceiptTasks.delete(oldestTaskId)
+      if (typeof oldestTaskId === 'string') {
+        backgroundReceiptTasks.delete(oldestTaskId)
+        deferredBackgroundReceiptTerminals.delete(oldestTaskId)
+      }
     }
     backgroundReceiptTasks.set(normalizedTaskId, {
       clientMessageId: normalizedClientId,
       terminalSeen: terminalSeen || existing?.terminalSeen === true,
-      allowProjection: allowProjection && existing?.allowProjection !== false,
+      allowProjection: allowProjection ?? existing?.allowProjection ?? false,
     })
   }
 
@@ -504,6 +519,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     taskId: string,
     terminal: boolean | string = false,
     allowProjection = true,
+    retireParentProjection = false,
   ) {
     const normalizedClientId = String(clientMessageId || '').trim()
     const normalizedTaskId = String(taskId || '').trim()
@@ -517,8 +533,17 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       Boolean(terminalStatus),
       allowProjection,
     )
+    const deferredCandidate = normalizedTaskId
+      ? deferredBackgroundReceiptTerminals.get(normalizedTaskId)
+      : undefined
+    const deferredTerminal = deferredCandidate?.clientMessageId === normalizedClientId
+      ? deferredCandidate
+      : undefined
+    if (normalizedTaskId && (terminalStatus || retireParentProjection)) {
+      options.taskOwnership?.noteTerminal(normalizedTaskId, allowProjection)
+    }
     if (terminalStatus) {
-      if (normalizedTaskId) options.taskOwnership?.noteTerminal(normalizedTaskId)
+      deferredBackgroundReceiptTerminals.delete(normalizedTaskId)
       if (
         allowProjection
         && !reconciledBackgroundReceiptClientIds.has(normalizedClientId)
@@ -533,6 +558,25 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         {},
         allowProjection,
       )
+    } else if (allowProjection && deferredTerminal) {
+      deferredBackgroundReceiptTerminals.delete(normalizedTaskId)
+      options.taskOwnership?.noteTerminal(normalizedTaskId)
+      markTaskSettled(deferredTerminal.payload)
+      if (!reconciledBackgroundReceiptClientIds.has(normalizedClientId)) {
+        dirtyBackgroundReceiptClientIds.add(normalizedClientId)
+        flushBackgroundReceiptReconciliationIfReady()
+      }
+      const hasContinuation = deferredTerminal.eventKind === 'sessions-changed'
+        && applyBackgroundReceiptContinuation(deferredTerminal.payload, normalizedTaskId)
+      settleBackgroundReceiptTerminal(
+        normalizedClientId,
+        normalizedTaskId,
+        deferredTerminal.status,
+        deferredTerminal.terminalTask,
+        !hasContinuation,
+      )
+    } else if (retireParentProjection) {
+      deferredBackgroundReceiptTerminals.delete(normalizedTaskId)
     }
   }
 
@@ -624,7 +668,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       if (
         identity.clientMessageId
         && backgroundReceiptClientIds.has(identity.clientMessageId)
-      ) return { ...identity, allowProjection: true }
+      ) return { ...identity, allowProjection: false }
     }
     return null
   }
@@ -671,28 +715,11 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     // client-message owner: unrelated same-session tasks from another tab must
     // remain visible and must never enter this quarantine.
     rememberBackgroundReceiptTask(owner, taskId)
-    if (eventKind === 'task-queued') {
+    if (eventKind === 'task-queued' && allowProjection) {
       options.taskOwnership?.noteQueued({ ...payload, status: 'queued' })
-    } else if (eventKind === 'task-running') {
+    } else if (eventKind === 'task-running' && allowProjection) {
       options.taskOwnership?.noteRunning({ ...payload, status: 'running' })
-    } else if (terminalEvent) {
-      options.taskOwnership?.noteTerminal(taskId)
-      markTaskSettled(payload)
-      rememberBackgroundReceiptTask(owner, taskId, true, allowProjection)
-      if (
-        allowProjection
-        && !reconciledBackgroundReceiptClientIds.has(owner)
-      ) {
-        dirtyBackgroundReceiptClientIds.add(owner)
-      }
-      flushBackgroundReceiptReconciliationIfReady()
     }
-    // Keep the task identity through the complete terminal echo cluster
-    // (done -> sessions.changed -> task.* / turn.committed). For a terminal
-    // session projection, retain an unrelated successor task without allowing
-    // the receipt's history sync to replace the newer Edit transcript.
-    const hasContinuation = eventKind === 'sessions-changed'
-      && applyBackgroundReceiptContinuation(payload, taskId)
     if (terminalEvent) {
       const terminalTask = terminalSessionChangeTask(payload)
       const rawStatus = String(
@@ -703,14 +730,38 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
           || payload.runStatus
           || '',
       ).trim().toLowerCase()
+      const status = rawStatus
+        || (eventKind === 'sessions-changed' ? '' : eventTaskTerminalStatus(eventKind))
+        || (eventKind === 'turn-failed' ? 'failed' : 'succeeded')
+      rememberBackgroundReceiptTask(owner, taskId, true)
+      if (!allowProjection) {
+        deferredBackgroundReceiptTerminals.set(taskId, {
+          clientMessageId: owner,
+          eventKind,
+          payload,
+          status,
+          terminalTask: terminalTask || payload,
+        })
+        return true
+      }
+      options.taskOwnership?.noteTerminal(taskId)
+      markTaskSettled(payload)
+      if (!reconciledBackgroundReceiptClientIds.has(owner)) {
+        dirtyBackgroundReceiptClientIds.add(owner)
+      }
+      flushBackgroundReceiptReconciliationIfReady()
+      // Keep the task identity through the complete terminal echo cluster
+      // (done -> sessions.changed -> task.* / turn.committed). For a terminal
+      // session projection, retain an unrelated successor task without allowing
+      // the receipt's history sync to replace the newer Edit transcript.
+      const hasContinuation = eventKind === 'sessions-changed'
+        && applyBackgroundReceiptContinuation(payload, taskId)
       settleBackgroundReceiptTerminal(
         owner,
         taskId,
-        rawStatus
-          || (eventKind === 'sessions-changed' ? '' : eventTaskTerminalStatus(eventKind))
-          || (eventKind === 'turn-failed' ? 'failed' : 'succeeded'),
+        status,
         terminalTask || payload,
-        !hasContinuation && allowProjection,
+        !hasContinuation,
       )
     }
     return true
@@ -1664,6 +1715,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     pendingBackgroundReceiptClientIds.clear()
     backgroundReceiptClientIds.clear()
     backgroundReceiptTasks.clear()
+    deferredBackgroundReceiptTerminals.clear()
     dirtyBackgroundReceiptClientIds.clear()
     reconciledBackgroundReceiptClientIds.clear()
     settledBackgroundReceiptClientIds.clear()

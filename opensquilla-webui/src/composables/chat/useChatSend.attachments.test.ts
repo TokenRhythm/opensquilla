@@ -3526,7 +3526,7 @@ describe('useChatSend attachment payloads', () => {
     expect(await pendingInputWal.listHandoffs?.()).toEqual([])
   })
 
-  it('quarantines task, turn, and session events during crashed background receipt recovery', async () => {
+  async function verifyCrashedChildReceiptRecovery(taskStatus: string) {
     const parent = 'agent:main:webchat:background-recovery-parent'
     const child = 'agent:main:webchat:background-recovery-child'
     const ownerRequestId = 'background-recovery-request'
@@ -3600,6 +3600,7 @@ describe('useChatSend attachment payloads', () => {
       _taskId: string,
       _terminal?: boolean | string,
       _allowProjection?: boolean,
+      _retireParentProjection?: boolean,
     ) => {}
     const beginBackgroundReceiptReplay = vi.fn((id: string, holdHistory?: boolean) => {
       beginReplay(id, holdHistory)
@@ -3612,8 +3613,9 @@ describe('useChatSend attachment payloads', () => {
       taskId: string,
       terminal?: boolean | string,
       allowProjection?: boolean,
+      retireParentProjection?: boolean,
     ) => {
-      trackReplay(id, taskId, terminal, allowProjection)
+      trackReplay(id, taskId, terminal, allowProjection, retireParentProjection)
     })
     const applySessionRunState = vi.fn()
     const scheduleHistorySync = vi.fn()
@@ -3724,19 +3726,27 @@ describe('useChatSend attachment payloads', () => {
         task_id: 'recovered-task',
         client_message_id: clientMessageId,
       })
+      deliver('task.succeeded', {
+        session_key: parent,
+        task_id: 'recovered-task',
+        client_message_id: clientMessageId,
+      })
       expect(activeStreamTaskId.value).toBe('')
-      expect(taskOwnership.runningTaskId.value).toBe('recovered-task')
+      expect(taskOwnership.runningTaskId.value).toBe('')
+      expect(applySessionRunState).not.toHaveBeenCalled()
+      expect(scheduleHistorySync).not.toHaveBeenCalled()
       resolveRecovery({
         sessionKey: child,
         task_id: 'recovered-task',
-        task_status: 'failed',
+        ...(taskStatus ? { task_status: taskStatus } : {}),
       })
       await vi.waitFor(() => expect(recoverPendingQueueHandoff).toHaveBeenCalledOnce())
       expect(trackBackgroundReceiptTask).toHaveBeenCalledWith(
         clientMessageId,
         'recovered-task',
-        'failed',
+        taskStatus,
         false,
+        true,
       )
       expect(applySessionRunState).not.toHaveBeenCalled()
       expect(schedulePendingDrainAfterTerminal).not.toHaveBeenCalled()
@@ -3786,7 +3796,17 @@ describe('useChatSend attachment payloads', () => {
     } finally {
       scope.stop()
     }
-  })
+  }
+
+  it.each([
+    ['terminal', 'failed'],
+    ['non-terminal', ''],
+  ] as const)(
+    'quarantines task, turn, and session events after a crashed %s child ACK',
+    async (_label, taskStatus) => {
+      await verifyCrashedChildReceiptRecovery(taskStatus)
+    },
+  )
 
   it('releases a crashed accepted background-only owner back to the parent drain', async () => {
     const parent = 'agent:main:webchat:accepted-background-parent'

@@ -647,6 +647,7 @@ export interface UseChatSendOptions {
     taskId: string,
     terminal?: boolean | string,
     allowProjection?: boolean,
+    retireParentProjection?: boolean,
   ) => void
   /** Release the pre-response event quarantine for an older receipt replay. */
   finishBackgroundReceiptReplay?: (clientMessageId: string) => void
@@ -2487,15 +2488,23 @@ export function useChatSend(options: UseChatSendOptions) {
             })
             const targetSessionKey = response.sessionKey || replayRecord.requestSessionKey
             if (replayRecord.backgroundOnly) {
+              const requestSessionIsCurrent = (
+                replayRecord.requestSessionKey === options.sessionKey.value
+              )
               const allowTerminalProjection = (
                 targetSessionKey === replayRecord.requestSessionKey
-                && targetSessionKey === options.sessionKey.value
+                && requestSessionIsCurrent
+              )
+              const retireParentProjection = (
+                requestSessionIsCurrent
+                && targetSessionKey !== replayRecord.requestSessionKey
               )
               options.trackBackgroundReceiptTask?.(
                 replayRecord.clientMessageId,
                 acceptedTaskId(response),
                 terminalResponseStatus(response),
                 allowTerminalProjection,
+                retireParentProjection,
               )
               await finalizeRecoveredBackgroundHandoff(replayRecord, targetSessionKey)
             } else {
