@@ -216,6 +216,14 @@ async def test_cancelled_turn_persists_trailing_text_segment(
     session = await manager.create(session_key)
     append_message = AsyncMock(wraps=manager.append_message)
     monkeypatch.setattr(manager, "append_message", append_message)
+    reconcile_usage = AsyncMock(
+        wraps=storage.reconcile_session_usage_totals_from_ledger
+    )
+    monkeypatch.setattr(
+        storage,
+        "reconcile_session_usage_totals_from_ledger",
+        reconcile_usage,
+    )
     usage_sink = SessionUsageEventSink(storage, start_retry_delays=(), retry_delays=())
     runner = TurnRunner(
         provider_selector=_ProviderSelector(_ToolThenHangingTextProvider()),
@@ -284,6 +292,9 @@ async def test_cancelled_turn_persists_trailing_text_segment(
         assert session.output_tokens == 1
         assert session.total_tokens == 2
         assert session.missing_cost_entries == 1
+        reconcile_usage.assert_awaited()
+        assert reconcile_usage.await_args.kwargs["expected_session_id"] == session.session_id
+        assert reconcile_usage.await_args.kwargs["expected_epoch"] == session.epoch
         assistant_append = next(
             call
             for call in append_message.await_args_list

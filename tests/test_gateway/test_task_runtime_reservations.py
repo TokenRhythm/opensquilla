@@ -394,6 +394,34 @@ async def test_activate_passes_session_and_run_kind_to_contextual_config_provide
 
 
 @pytest.mark.asyncio
+async def test_cron_turn_persists_terminal_assistant_payload() -> None:
+    storage = _TrackingStorage()
+
+    async def handler(run: Any) -> None:
+        assert run.assistant_message_sink is not None
+        run.assistant_message_sink("assistant-cron", "durable cron result")
+
+    runtime = TaskRuntime(storage=storage, turn_handler=handler)
+    handle = await runtime.enqueue(
+        _envelope(session_id="cron-owner", session_epoch=3),
+        "scheduled task",
+        run_kind="cron_turn",
+    )
+
+    terminal = await runtime.wait(handle.task_id, timeout=1.0)
+
+    assert terminal.status == AgentTaskStatus.SUCCEEDED
+    assert terminal.details is not None
+    assert terminal.details["session_id"] == "cron-owner"
+    assert terminal.details["session_epoch"] == 3
+    assert terminal.details["terminal_assistant_message_id"] == "assistant-cron"
+    assert (
+        terminal.details["terminal_assistant_message_content"]
+        == "durable cron result"
+    )
+
+
+@pytest.mark.asyncio
 async def test_freeze_acceptance_attaches_audit_before_commit_without_storage_update() -> None:
     storage = _TrackingStorage()
     captured = SimpleNamespace(

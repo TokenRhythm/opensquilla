@@ -211,7 +211,7 @@ async def test_t3_not_applicable_falls_through_to_preflight() -> None:
 
 
 @pytest.mark.asyncio
-async def test_admitted_owner_is_forwarded_to_turn_owned_compaction_only() -> None:
+async def test_admitted_owner_is_forwarded_to_compaction_and_history() -> None:
     stage, t3, preflight, history, _ = _make_stage()
 
     await stage.run(
@@ -221,11 +221,9 @@ async def test_admitted_owner_is_forwarded_to_turn_owned_compaction_only() -> No
         )
     )
 
-    for call in (t3.calls[0], preflight.calls[0]):
+    for call in (t3.calls[0], preflight.calls[0], history.calls[0]):
         assert call["expected_session_id"] == "session-admitted"
         assert call["expected_session_epoch"] == 7
-    assert "expected_session_id" not in history.calls[0]
-    assert "expected_session_epoch" not in history.calls[0]
 
 
 @pytest.mark.asyncio

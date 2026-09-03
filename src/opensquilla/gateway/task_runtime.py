@@ -690,8 +690,8 @@ class TaskRun:
         repr=False,
     )
     # Synchronous finalizer callback carrying the exact assistant transcript
-    # row and content produced by this turn. Channel tasks persist it for
-    # durable delivery after terminal commit; other run kinds leave it unset.
+    # row and content produced by this turn. Channel and cron tasks persist it
+    # for durable delivery after terminal commit; other run kinds leave it unset.
     assistant_message_sink: Callable[[str | None, str], None] | None = None
     input_mode: str = "user"
     persist_input: bool = False
@@ -4509,7 +4509,7 @@ class TaskRuntime:
                         provider_request_correlation=task.provider_request_correlation,
                         assistant_message_sink=(
                             task.capture_terminal_assistant_message
-                            if task.run_kind == "channel_turn"
+                            if task.run_kind in {"channel_turn", "cron_turn"}
                             else None
                         ),
                         document_mutation_outcome_sink=(

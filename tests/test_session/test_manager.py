@@ -4013,6 +4013,295 @@ async def test_inline_compaction_rejects_stale_source_without_partial_install(ma
 
 
 @pytest.mark.asyncio
+async def test_exact_transcript_read_rejects_reset_during_storage_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "exact-transcript-reset.db"
+    reader_storage = SessionStorage(str(db_path))
+    reset_storage = SessionStorage(str(db_path))
+    await reader_storage.connect()
+    await reset_storage.connect()
+    reader = SessionManager(reader_storage, inject_time_prefix=False)
+    resetter = SessionManager(reset_storage, inject_time_prefix=False)
+    key = "agent:main:exact-transcript-reset"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    admitted = await reader.create(key)
+    await reader.append_message(key, "user", "retired owner input")
+    read_started = asyncio.Event()
+    release_read = asyncio.Event()
+    original_get_transcript = reader_storage.get_transcript
+
+    async def paused_get_transcript(*args: Any, **kwargs: Any):
+        rows = await original_get_transcript(*args, **kwargs)
+        read_started.set()
+        await release_read.wait()
+        return rows
+
+    monkeypatch.setattr(reader_storage, "get_transcript", paused_get_transcript)
+    read_task = asyncio.create_task(
+        reader.get_transcript(
+            key,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=int(admitted.epoch or 0),
+        )
+    )
+    try:
+        await asyncio.wait_for(read_started.wait(), timeout=5)
+        replacement, rotated = await resetter.apply_intent(
+            key,
+            SessionIntent.RESET_SAME_KEY,
+        )
+        assert rotated is True
+        await resetter.append_message(key, "user", "replacement input")
+        release_read.set()
+
+        with pytest.raises(StaleEpochError, match="transcript read"):
+            await read_task
+
+        current = await resetter.get_session(key)
+        assert current is not None
+        assert current.session_id == replacement.session_id
+        assert [entry.content for entry in await resetter.get_transcript(key)] == [
+            "replacement input"
+        ]
+    finally:
+        release_read.set()
+        if not read_task.done():
+            read_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await read_task
+        await reset_storage.close()
+        await reader_storage.close()
+
+
+@pytest.mark.asyncio
+async def test_exact_summary_read_rejects_reset_during_storage_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "exact-summary-reset.db"
+    reader_storage = SessionStorage(str(db_path))
+    reset_storage = SessionStorage(str(db_path))
+    await reader_storage.connect()
+    await reset_storage.connect()
+    reader = SessionManager(reader_storage, inject_time_prefix=False)
+    resetter = SessionManager(reset_storage, inject_time_prefix=False)
+    key = "agent:main:exact-summary-reset"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    admitted = await reader.create(key)
+    await reader_storage.save_summary(
+        SessionSummary(
+            session_id=admitted.session_id,
+            session_key=key,
+            summary_text="retired owner summary",
+        )
+    )
+    read_started = asyncio.Event()
+    release_read = asyncio.Event()
+    original_get_all_summaries = reader_storage.get_all_summaries
+
+    async def paused_get_all_summaries(*args: Any, **kwargs: Any):
+        rows = await original_get_all_summaries(*args, **kwargs)
+        read_started.set()
+        await release_read.wait()
+        return rows
+
+    monkeypatch.setattr(
+        reader_storage,
+        "get_all_summaries",
+        paused_get_all_summaries,
+    )
+    read_task = asyncio.create_task(
+        reader.get_summaries(
+            key,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=int(admitted.epoch or 0),
+        )
+    )
+    try:
+        await asyncio.wait_for(read_started.wait(), timeout=5)
+        replacement, rotated = await resetter.apply_intent(
+            key,
+            SessionIntent.RESET_SAME_KEY,
+        )
+        assert rotated is True
+        await reset_storage.save_summary(
+            SessionSummary(
+                session_id=replacement.session_id,
+                session_key=key,
+                summary_text="replacement owner summary",
+            )
+        )
+        release_read.set()
+
+        with pytest.raises(StaleEpochError, match="summary read"):
+            await read_task
+    finally:
+        release_read.set()
+        if not read_task.done():
+            read_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await read_task
+        await reset_storage.close()
+        await reader_storage.close()
+
+
+@pytest.mark.asyncio
+async def test_exact_context_state_read_rejects_reset_during_storage_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "exact-context-reset.db"
+    reader_storage = SessionStorage(str(db_path))
+    reset_storage = SessionStorage(str(db_path))
+    await reader_storage.connect()
+    await reset_storage.connect()
+    reader = SessionManager(reader_storage, inject_time_prefix=False)
+    resetter = SessionManager(reset_storage, inject_time_prefix=False)
+    key = "agent:main:exact-context-reset"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    admitted = await reader.create(key)
+    await reader_storage.save_context_state(
+        SessionContextState(
+            session_id=admitted.session_id,
+            session_key=key,
+            state_kind="structured_summary_v1",
+            payload={"owner": "retired"},
+            portable=True,
+        )
+    )
+    read_started = asyncio.Event()
+    release_read = asyncio.Event()
+    original_get_context_states = reader_storage.get_context_states
+
+    async def paused_get_context_states(*args: Any, **kwargs: Any):
+        rows = await original_get_context_states(*args, **kwargs)
+        read_started.set()
+        await release_read.wait()
+        return rows
+
+    monkeypatch.setattr(
+        reader_storage,
+        "get_context_states",
+        paused_get_context_states,
+    )
+    read_task = asyncio.create_task(
+        reader.get_context_states(
+            key,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=int(admitted.epoch or 0),
+        )
+    )
+    try:
+        await asyncio.wait_for(read_started.wait(), timeout=5)
+        replacement, rotated = await resetter.apply_intent(
+            key,
+            SessionIntent.RESET_SAME_KEY,
+        )
+        assert rotated is True
+        await reset_storage.save_context_state(
+            SessionContextState(
+                session_id=replacement.session_id,
+                session_key=key,
+                state_kind="structured_summary_v1",
+                payload={"owner": "replacement"},
+                portable=True,
+            )
+        )
+        release_read.set()
+
+        with pytest.raises(StaleEpochError, match="context-state read"):
+            await read_task
+    finally:
+        release_read.set()
+        if not read_task.done():
+            read_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await read_task
+        await reset_storage.close()
+        await reader_storage.close()
+
+
+@pytest.mark.asyncio
+async def test_inline_compaction_exact_owner_rejects_reset_before_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "inline-compaction-owner-reset.db"
+    writer_storage = SessionStorage(str(db_path))
+    reset_storage = SessionStorage(str(db_path))
+    await writer_storage.connect()
+    await reset_storage.connect()
+    writer = SessionManager(writer_storage, inject_time_prefix=False)
+    resetter = SessionManager(reset_storage, inject_time_prefix=False)
+    key = "agent:main:inline-owner-reset"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    admitted = await writer.create(key)
+    await writer.append_message(key, "user", "old question")
+    active = await writer.append_message(key, "user", "active request")
+    source = await writer.capture_compaction_source(
+        key,
+        boundary_message_id=active.message_id,
+        expected_session_id=admitted.session_id,
+        expected_session_epoch=int(admitted.epoch or 0),
+    )
+    commit_started = asyncio.Event()
+    release_commit = asyncio.Event()
+    original_rewrite = writer_storage.rewrite_compacted_session
+
+    async def paused_rewrite(**kwargs: Any):
+        commit_started.set()
+        await release_commit.wait()
+        return await original_rewrite(**kwargs)
+
+    monkeypatch.setattr(writer_storage, "rewrite_compacted_session", paused_rewrite)
+    persist_task = asyncio.create_task(
+        writer.persist_compaction_result(
+            key,
+            "retired owner summary",
+            [{"role": "user", "content": "active request"}],
+            removed_count=1,
+            source_entries=source.entries,
+            source_preimage=source.preimage,
+            source_boundary_message_id=source.boundary_message_id,
+            source_boundary_entry_id=source.boundary_entry_id,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=int(admitted.epoch or 0),
+        )
+    )
+    try:
+        await asyncio.wait_for(commit_started.wait(), timeout=5)
+        replacement, rotated = await resetter.apply_intent(
+            key,
+            SessionIntent.RESET_SAME_KEY,
+        )
+        assert rotated is True
+        await resetter.append_message(key, "user", "replacement input")
+        release_commit.set()
+
+        with pytest.raises(StaleEpochError, match="owner mismatch"):
+            await persist_task
+
+        current = await resetter.get_session(key)
+        assert current is not None
+        assert current.session_id == replacement.session_id
+        assert current.compaction_count == 0
+        assert [entry.content for entry in await resetter.get_transcript(key)] == [
+            "replacement input"
+        ]
+        assert await reset_storage.get_all_summaries(replacement.session_id) == []
+    finally:
+        release_commit.set()
+        if not persist_task.done():
+            persist_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await persist_task
+        await reset_storage.close()
+        await writer_storage.close()
+
+
+@pytest.mark.asyncio
 async def test_canonical_transcript_page_crosses_multiple_compaction_boundaries(manager):
     node = await manager.create("agent:main:main")
     for index in range(10):

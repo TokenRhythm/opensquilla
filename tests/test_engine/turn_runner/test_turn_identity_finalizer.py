@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +24,7 @@ from opensquilla.engine.turn_runner.turn_finalizer_stage import (
     TurnFinalizerStageInput,
 )
 from opensquilla.engine.types import DoneEvent
+from opensquilla.memory.turn_capture import TurnCaptureService
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import SessionIntent
 from opensquilla.session.storage import SessionStorage, StaleEpochError
@@ -290,3 +293,116 @@ async def test_reset_after_append_fences_memory_capture_and_totals(
     assert current is not None
     assert current.session_id == replacement.session_id
     assert (current.input_tokens, current.output_tokens, current.total_tokens) == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_memory_capture_uses_immutable_owner_namespace_across_reset_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "memory-capture-reset.db"
+    capture_started = asyncio.Event()
+    release_capture = asyncio.Event()
+
+    class _PausingCaptureService(TurnCaptureService):
+        def __init__(self) -> None:
+            super().__init__(workspace_dir=tmp_path, turns_dir=tmp_path / "turns")
+            self.paths: list[str] = []
+            self._pause_next = True
+
+        async def capture_turn(
+            self,
+            *,
+            session_namespace: str | None = None,
+            **kwargs: Any,
+        ) -> str | None:
+            if self._pause_next:
+                self._pause_next = False
+                capture_started.set()
+                await release_capture.wait()
+            path = await super().capture_turn(
+                session_namespace=session_namespace,
+                **kwargs,
+            )
+            if path is not None:
+                self.paths.append(path)
+            return path
+
+    writer_storage = SessionStorage(str(db_path))
+    reset_storage = SessionStorage(str(db_path))
+    await writer_storage.connect()
+    await reset_storage.connect()
+    writer = SessionManager(writer_storage, inject_time_prefix=False)
+    resetter = SessionManager(reset_storage, inject_time_prefix=False)
+    key = "agent:main:memory-capture-reset"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    admitted = await writer.create(key)
+    capture_service = _PausingCaptureService()
+    runner = TurnRunner(
+        provider_selector=None,
+        session_manager=writer,
+        turn_capture_services={"main": capture_service},
+    )
+    old_capture = asyncio.create_task(
+        runner._capture_turn_memory(
+            agent_id="main",
+            session_key=key,
+            runtime_message="retired owner input",
+            final_text="retired owner answer",
+            input_mode="user",
+            tool_context=None,
+            input_provenance=None,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=int(admitted.epoch or 0),
+        )
+    )
+    try:
+        await asyncio.wait_for(capture_started.wait(), timeout=5)
+        replacement, rotated = await resetter.apply_intent(
+            key,
+            SessionIntent.RESET_SAME_KEY,
+        )
+        assert rotated is True
+        release_capture.set()
+        await old_capture
+
+        await runner._capture_turn_memory(
+            agent_id="main",
+            session_key=key,
+            runtime_message="replacement input",
+            final_text="replacement answer",
+            input_mode="user",
+            tool_context=None,
+            input_provenance=None,
+            expected_session_id=replacement.session_id,
+            expected_session_epoch=int(replacement.epoch or 0),
+        )
+
+        assert len(capture_service.paths) == 2
+        retired_path, replacement_path = (
+            tmp_path / relative_path for relative_path in capture_service.paths
+        )
+        assert retired_path.parent.name == admitted.session_id
+        assert replacement_path.parent.name == replacement.session_id
+        assert not (tmp_path / "turns" / "agent-main-memory-capture-reset").exists()
+        assert retired_path.parent != replacement_path.parent
+        retired_text = retired_path.read_text(encoding="utf-8")
+        replacement_text = replacement_path.read_text(encoding="utf-8")
+        assert f"- session_key: {key}" in retired_text
+        assert f"- session_key: {key}" in replacement_text
+        assert f"- session_key: {admitted.session_id}" not in retired_text
+        assert f"- session_key: {replacement.session_id}" not in replacement_text
+        assert admitted.session_id in retired_text
+        assert "retired owner input" in retired_text
+        assert admitted.session_id not in replacement_text
+        assert "retired owner input" not in replacement_text
+        assert replacement.session_id in replacement_text
+        assert "replacement input" in replacement_text
+    finally:
+        release_capture.set()
+        if not old_capture.done():
+            old_capture.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await old_capture
+        await reset_storage.close()
+        await writer_storage.close()

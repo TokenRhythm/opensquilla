@@ -64,16 +64,24 @@ def _durable_session_owner(value: Any) -> tuple[str, int] | None:
     return session_id, session_epoch
 
 
-def _accepts_keyword_arg(call: Any, name: str) -> bool:
+def _accepts_keyword_arg(
+    call: Any,
+    name: str,
+    *,
+    allow_var_keyword: bool = True,
+) -> bool:
     """Return whether a compatibility adapter accepts one keyword."""
 
     try:
-        parameters = inspect.signature(call).parameters.values()
+        parameters = inspect.signature(call).parameters
     except (TypeError, ValueError):
         return False
-    return any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD or parameter.name == name
-        for parameter in parameters
+    return name in parameters or (
+        allow_var_keyword
+        and any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
     )
 
 
@@ -322,7 +330,33 @@ def make_agent_run_handler(
                             workspace_id,
                         )
                         bound_workspace_dir = str(validated.canonical_path)
-                    await storage.bind_session_workspace(session_key, workspace_id)
+                    bind_workspace = storage.bind_session_workspace
+                    bind_kwargs: dict[str, Any] = {}
+                    if session_owner is not None:
+                        if not all(
+                            _accepts_keyword_arg(
+                                bind_workspace,
+                                name,
+                                allow_var_keyword=False,
+                            )
+                            for name in (
+                                "expected_session_id",
+                                "expected_session_epoch",
+                            )
+                        ):
+                            raise RuntimeError(
+                                "Project workspace binding cannot enforce the "
+                                "admitted session owner"
+                            )
+                        bind_kwargs = {
+                            "expected_session_id": session_owner[0],
+                            "expected_session_epoch": session_owner[1],
+                        }
+                    await bind_workspace(
+                        session_key,
+                        workspace_id,
+                        **bind_kwargs,
+                    )
                 append_kwargs: dict[str, Any] = {}
                 if session_owner is not None:
                     append_kwargs = {
@@ -381,7 +415,6 @@ def make_agent_run_handler(
             if task_runtime is not None:
                 from opensquilla.session.models import AgentTaskStatus
 
-                transcript_watermark = await _transcript_watermark(sm, session_key)
                 assert route_envelope is not None
                 enqueue_kwargs: dict[str, Any] = {}
                 if (
@@ -417,11 +450,20 @@ def make_agent_run_handler(
                 else:
                     success = getattr(record, "status", None) == AgentTaskStatus.SUCCEEDED
                     if success:
-                        result_text = await _latest_assistant_text_after(
-                            sm,
-                            session_key,
-                            transcript_watermark,
+                        task_details = getattr(record, "details", None)
+                        terminal_content = (
+                            task_details.get("terminal_assistant_message_content")
+                            if isinstance(task_details, dict)
+                            else None
                         )
+                        if isinstance(terminal_content, str):
+                            result_text = terminal_content
+                        elif isinstance(task_details, dict) and (
+                            "session_epoch" in task_details
+                        ):
+                            raise RuntimeError(
+                                "Cron task completed without durable terminal output"
+                            )
                     else:
                         error_message = (
                             getattr(record, "error_message", None)
@@ -641,38 +683,6 @@ def make_static_message_handler(
         )
 
     return static_message_handler
-
-
-async def _read_transcript_rows(sm: Any, session_key: str) -> list[Any]:
-    if sm is None:
-        return []
-    read_transcript = getattr(sm, "read_transcript", None)
-    if not callable(read_transcript):
-        return []
-    try:
-        rows = await read_transcript(session_key)
-    except Exception:
-        log.warning("agent_run_handler.read_transcript_failed", session_key=session_key)
-        return []
-    return list(rows or [])
-
-
-async def _transcript_watermark(sm: Any, session_key: str) -> int:
-    return len(await _read_transcript_rows(sm, session_key))
-
-
-async def _latest_assistant_text_after(sm: Any, session_key: str, start_index: int) -> str:
-    rows = await _read_transcript_rows(sm, session_key)
-    for row in reversed(rows[start_index:]):
-        role = row.get("role") if isinstance(row, dict) else getattr(row, "role", None)
-        content = row.get("content") if isinstance(row, dict) else getattr(row, "content", None)
-        if role == "assistant" and isinstance(content, str):
-            return content
-    return ""
-
-
-async def _latest_assistant_text(sm: Any, session_key: str) -> str:
-    return await _latest_assistant_text_after(sm, session_key, 0)
 
 
 async def _cancel_runtime_task(task_runtime: Any, task_id: str) -> None:

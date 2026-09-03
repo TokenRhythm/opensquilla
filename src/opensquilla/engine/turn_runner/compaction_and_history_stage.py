@@ -172,6 +172,8 @@ class HistoryLoaderPort(Protocol):
         bound_user_message_id: str | None = None,
         restricted_turn: bool = False,
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> str | None: ...
 
 @runtime_checkable
@@ -431,6 +433,9 @@ class CompactionAndHistoryStage:
         history_kwargs: dict[str, Any] = {}
         if inp.transcript_snapshot is not None:
             history_kwargs["transcript_snapshot"] = inp.transcript_snapshot
+        if inp.expected_session_id is not None or inp.expected_session_epoch is not None:
+            history_kwargs["expected_session_id"] = inp.expected_session_id
+            history_kwargs["expected_session_epoch"] = inp.expected_session_epoch
         loaded_compaction_summary_context = await self._history_loader.load(
             agent=inp.agent,
             session_key=inp.session_key,

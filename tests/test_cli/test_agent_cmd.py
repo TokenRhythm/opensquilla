@@ -33,7 +33,8 @@ from opensquilla.project_workspaces import (
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
 from opensquilla.session.manager import SessionManager
-from opensquilla.session.storage import SessionStorage
+from opensquilla.session.models import SessionIntent
+from opensquilla.session.storage import SessionStorage, StaleEpochError
 from opensquilla.tools.types import CallerKind, InteractionMode
 
 
@@ -210,6 +211,86 @@ async def test_run_agent_once_uses_agent_registry_model_when_model_not_explicit(
     assert captured["runner_config_model"] == "agent/default"
     assert captured["run_model"] == "agent/default"
     assert captured["tool_context"].workspace_dir == str(agent_workspace)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_once_fences_reset_owner_across_cli_route(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "cli-owner.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    key = "agent:main:cli-owner"
+    admitted = await manager.create(key)
+    append_calls: list[dict[str, Any]] = []
+    run_call: dict[str, Any] = {}
+    route_call: dict[str, Any] = {}
+    replacement = None
+    original_append = manager.append_message
+
+    async def recording_append(*args: Any, **kwargs: Any) -> Any:
+        append_calls.append(dict(kwargs))
+        return await original_append(*args, **kwargs)
+
+    manager.append_message = recording_append  # type: ignore[method-assign]
+
+    class FakeTurnRunner:
+        def __init__(self, **kwargs: Any) -> None:
+            return None
+
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            nonlocal replacement
+            run_call.update(kwargs)
+            replacement, rotated = await manager.apply_intent(
+                key,
+                SessionIntent.RESET_SAME_KEY,
+            )
+            assert rotated is True
+            await manager.append_message(
+                key,
+                role="assistant",
+                content="late answer",
+                expected_session_id=kwargs["expected_session_id"],
+                expected_session_epoch=kwargs["expected_session_epoch"],
+            )
+            yield DoneEvent(text="unreachable")
+
+    async def fake_build_services(*, config: GatewayConfig, **kwargs: Any) -> _FakeServices:
+        return _FakeServices(config, manager)
+
+    from opensquilla.gateway.routing import build_cli_route_envelope
+
+    def recording_route(**kwargs: Any) -> Any:
+        route_call.update(kwargs)
+        return build_cli_route_envelope(**kwargs)
+
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+    monkeypatch.setattr(
+        "opensquilla.gateway.routing.build_cli_route_envelope",
+        recording_route,
+    )
+    try:
+        with pytest.raises(StaleEpochError, match="owner mismatch"):
+            await run_agent_once(message="hello", session_id=key, config=GatewayConfig())
+        current = await manager.get_session(key)
+        transcript = await manager.get_transcript(key)
+    finally:
+        await storage.close()
+
+    owner = {
+        "expected_session_id": admitted.session_id,
+        "expected_session_epoch": int(admitted.epoch or 0),
+    }
+    assert {name: append_calls[0][name] for name in owner} == owner
+    assert {name: run_call[name] for name in owner} == owner
+    assert route_call["session_id"] == admitted.session_id
+    assert route_call["session_epoch"] == int(admitted.epoch or 0)
+    assert replacement is not None
+    assert current is not None
+    assert current.session_id == replacement.session_id
+    assert transcript == []
 
 
 @pytest.mark.asyncio

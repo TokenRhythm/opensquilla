@@ -46,6 +46,7 @@ from opensquilla.gateway.artifact_contexts import (
     BoundDocumentContext,
 )
 from opensquilla.gateway.auth import Principal
+from opensquilla.gateway.boot import dispatch_task_runtime_turn
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.model_routing import (
     capture_model_routing_config,
@@ -183,6 +184,94 @@ def _assert_no_runtime_acceptance_state(runtime: TaskRuntime) -> None:
     assert runtime._tasks == {}
     assert runtime._pending_by_session == {}
     assert runtime._running_by_session == {}
+
+
+@pytest.mark.asyncio
+async def test_reset_drains_real_task_runtime_while_provider_is_blocked(
+    tmp_path: Path,
+) -> None:
+    async with _open_real_stack(tmp_path / "provider-reset-race.db") as stack:
+        provider_started = asyncio.Event()
+        cancellation_started = asyncio.Event()
+        release_cancel_cleanup = asyncio.Event()
+        late_owner_write_finished = asyncio.Event()
+
+        class BlockingProviderTurnRunner:
+            def run(self, _message: str, session_key: str, **kwargs: Any):
+                async def events():
+                    provider_started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        cancellation_started.set()
+                        await release_cancel_cleanup.wait()
+                        await stack.manager.append_message(
+                            session_key,
+                            role="assistant",
+                            content="retired owner cancellation output",
+                            expected_session_id=kwargs["expected_session_id"],
+                            expected_session_epoch=kwargs["expected_session_epoch"],
+                        )
+                        late_owner_write_finished.set()
+                        raise
+                    yield SimpleNamespace(kind="done")
+
+                return events()
+
+        async def emit_event(
+            _session_key: str,
+            _event_name: str,
+            _payload: dict[str, Any],
+        ) -> None:
+            return None
+
+        turn_runner = BlockingProviderTurnRunner()
+
+        async def provider_turn_handler(run: Any) -> None:
+            await dispatch_task_runtime_turn(
+                run,
+                config=stack.context.config,
+                session_manager=stack.manager,
+                turn_runner=turn_runner,
+                event_emitter=emit_event,
+            )
+
+        stack.runtime._turn_handler = provider_turn_handler
+        accepted = await get_dispatcher().dispatch(
+            "rpc-provider-reset-race-send",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "wait for the provider",
+                "clientRequestId": "provider-reset-race",
+            },
+            stack.context,
+        )
+        assert accepted.ok is True
+        await asyncio.wait_for(provider_started.wait(), timeout=2.0)
+
+        reset_task = asyncio.create_task(
+            get_dispatcher().dispatch(
+                "rpc-provider-reset-race-reset",
+                "sessions.reset",
+                {"key": SESSION_KEY},
+                stack.context,
+            )
+        )
+        await asyncio.wait_for(cancellation_started.wait(), timeout=2.0)
+        await asyncio.sleep(0)
+        assert reset_task.done() is False
+
+        release_cancel_cleanup.set()
+        reset = await asyncio.wait_for(reset_task, timeout=2.0)
+
+        assert reset.ok is True
+        assert late_owner_write_finished.is_set()
+        current = await stack.storage.get_session(SESSION_KEY)
+        assert current is not None
+        assert current.session_id != stack.session_id
+        assert current.epoch == stack.session_epoch + 1
+        assert await stack.storage.get_transcript(current.session_id) == []
 
 
 @pytest.mark.asyncio

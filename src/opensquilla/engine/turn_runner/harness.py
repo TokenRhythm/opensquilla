@@ -342,8 +342,14 @@ class _TurnRunnerRouterContextAdapter(RouterContextPort):
         bound_user_message_id: str | None = None,
         include_capacity: bool = False,
         transcript_snapshot: Any | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> dict[str, Any]:
-        from opensquilla.engine.runtime import _accepts_keyword_arg
+        from opensquilla.engine.runtime import (
+            _accepts_explicit_keyword_arg,
+            _accepts_keyword_arg,
+            _has_session_storage,
+        )
 
         kwargs: dict[str, Any] = {
             "exclude_last_user": exclude_last_user,
@@ -359,6 +365,21 @@ class _TurnRunnerRouterContextAdapter(RouterContextPort):
             "transcript_snapshot",
         ):
             kwargs["transcript_snapshot"] = transcript_snapshot
+        if expected_session_id is not None or expected_session_epoch is not None:
+            supports_exact_owner = all(
+                _accepts_explicit_keyword_arg(
+                    self._runner._router_previous_assistant_context,
+                    name,
+                )
+                for name in ("expected_session_id", "expected_session_epoch")
+            )
+            if supports_exact_owner:
+                kwargs["expected_session_id"] = expected_session_id
+                kwargs["expected_session_epoch"] = expected_session_epoch
+            elif _has_session_storage(self._runner._session_manager):
+                raise RuntimeError(
+                    "session router context reader does not support exact ownership"
+                )
         return await self._runner._router_previous_assistant_context(
             session_key,
             **kwargs,
@@ -1293,8 +1314,14 @@ class _TurnRunnerHistoryLoaderAdapter(HistoryLoaderPort):
         bound_user_message_id: str | None = None,
         restricted_turn: bool = False,
         transcript_snapshot: Any | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> str | None:
-        from opensquilla.engine.runtime import _accepts_keyword_arg
+        from opensquilla.engine.runtime import (
+            _accepts_explicit_keyword_arg,
+            _accepts_keyword_arg,
+            _has_session_storage,
+        )
 
         kwargs: dict[str, Any] = {
             "trim_last_user": trim_last_user,
@@ -1307,6 +1334,18 @@ class _TurnRunnerHistoryLoaderAdapter(HistoryLoaderPort):
             "transcript_snapshot",
         ):
             kwargs["transcript_snapshot"] = transcript_snapshot
+        if expected_session_id is not None or expected_session_epoch is not None:
+            supports_exact_owner = all(
+                _accepts_explicit_keyword_arg(self._runner._load_history, name)
+                for name in ("expected_session_id", "expected_session_epoch")
+            )
+            if supports_exact_owner:
+                kwargs["expected_session_id"] = expected_session_id
+                kwargs["expected_session_epoch"] = expected_session_epoch
+            elif _has_session_storage(self._runner._session_manager):
+                raise RuntimeError(
+                    "session history reader does not support exact ownership"
+                )
         return await self._runner._load_history(
             agent,
             session_key,
@@ -1399,8 +1438,14 @@ class _TurnRunnerCompactionPersistAdapter(CompactionPersistPort):
         source_preimage: tuple[tuple[Any, ...], ...] | None = None,
         source_boundary_message_id: str | None = None,
         source_boundary_entry_id: int | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> bool | None:
         from opensquilla.engine.cache_break_monitor import notify_compaction
+        from opensquilla.engine.runtime import (
+            _accepts_explicit_keyword_arg,
+            _has_session_storage,
+        )
         from opensquilla.session.compaction_lifecycle import (
             COMPACTION_PERSISTED_EVENT,
             COMPACTION_TRIGGERED_EVENT,
@@ -1450,6 +1495,18 @@ class _TurnRunnerCompactionPersistAdapter(CompactionPersistPort):
             persist_kwargs["source_boundary_message_id"] = source_boundary_message_id
         if "source_boundary_entry_id" in params or accepts_kwargs:
             persist_kwargs["source_boundary_entry_id"] = source_boundary_entry_id
+        if expected_session_id is not None or expected_session_epoch is not None:
+            supports_exact_owner = all(
+                _accepts_explicit_keyword_arg(persist_method, name)
+                for name in ("expected_session_id", "expected_session_epoch")
+            )
+            if supports_exact_owner:
+                persist_kwargs["expected_session_id"] = expected_session_id
+                persist_kwargs["expected_session_epoch"] = expected_session_epoch
+            elif _has_session_storage(session_manager):
+                raise RuntimeError(
+                    "compaction persistence does not support exact ownership"
+                )
         async with self._runner._session_write_context(session_key):
             installed = await persist_method(
                 session_key,

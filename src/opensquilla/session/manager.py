@@ -2338,13 +2338,35 @@ class SessionManager:
         )
 
     async def get_transcript(
-        self, session_key: str, limit: int | None = None
+        self,
+        session_key: str,
+        limit: int | None = None,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> list[TranscriptEntry]:
         session_key = canonicalize_session_key(session_key)
         node = await self._storage.get_session(session_key)
         if node is None:
             raise KeyError(f"Session not found: {session_key}")
-        return await self._storage.get_transcript(node.session_id, limit=limit)
+        _require_expected_session_owner(
+            node,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+            operation="transcript read",
+        )
+        transcript = await self._storage.get_transcript(node.session_id, limit=limit)
+        if expected_session_id is not None or expected_session_epoch is not None:
+            current = await self._storage.get_session(session_key)
+            if current is None:
+                raise StaleEpochError("Session owner changed during transcript read")
+            _require_expected_session_owner(
+                current,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+                operation="transcript read",
+            )
+        return transcript
 
     async def capture_compaction_source(
         self,
@@ -2352,6 +2374,8 @@ class SessionManager:
         *,
         boundary_message_id: str | None = None,
         transcript_entries: Sequence[TranscriptEntry] | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> CompactionSourceSnapshot:
         """Freeze the exact durable prefix visible to the active turn.
 
@@ -2360,11 +2384,23 @@ class SessionManager:
         boundary cannot be found.
         """
 
-        transcript = (
-            list(transcript_entries)
-            if transcript_entries is not None
-            else await self.get_transcript(session_key)
-        )
+        if transcript_entries is not None:
+            node = await self._storage.get_session(session_key)
+            if node is None:
+                raise KeyError(f"Session not found: {session_key}")
+            _require_expected_session_owner(
+                node,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+                operation="compaction source capture",
+            )
+            transcript = list(transcript_entries)
+        else:
+            transcript = await self.get_transcript(
+                session_key,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+            )
         source_entries = transcript
         if boundary_message_id is not None:
             boundary_index = next(
@@ -2607,13 +2643,36 @@ class SessionManager:
             canonical_complete=canonical_complete,
         )
 
-    async def get_summaries(self, session_key: str) -> list[SessionSummary]:
+    async def get_summaries(
+        self,
+        session_key: str,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> list[SessionSummary]:
         """Return durable compaction summaries for a session key."""
         session_key = canonicalize_session_key(session_key)
         node = await self._storage.get_session(session_key)
         if node is None:
             raise KeyError(f"Session not found: {session_key}")
-        return await self._storage.get_all_summaries(node.session_id)
+        _require_expected_session_owner(
+            node,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+            operation="summary read",
+        )
+        summaries = await self._storage.get_all_summaries(node.session_id)
+        if expected_session_id is not None or expected_session_epoch is not None:
+            current = await self._storage.get_session(session_key)
+            if current is None:
+                raise StaleEpochError("Session owner changed during summary read")
+            _require_expected_session_owner(
+                current,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+                operation="summary read",
+            )
+        return summaries
 
     async def list_degraded_compactions(
         self,
@@ -2667,14 +2726,40 @@ class SessionManager:
         provider: str | None = None,
         state_kind: str | None = None,
         valid_only: bool = True,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> list[SessionContextState]:
         """Return context states for a session key without changing replay behavior."""
-        return await self._storage.get_context_states(
+        exact_owner = expected_session_id is not None or expected_session_epoch is not None
+        if exact_owner:
+            node = await self._storage.get_session(session_key)
+            if node is None:
+                raise KeyError(f"Session not found: {canonicalize_session_key(session_key)}")
+            _require_expected_session_owner(
+                node,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+                operation="context-state read",
+            )
+        context_states = await self._storage.get_context_states(
             session_key,
             provider=provider,
             state_kind=state_kind,
             valid_only=valid_only,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
         )
+        if exact_owner:
+            current = await self._storage.get_session(session_key)
+            if current is None:
+                raise StaleEpochError("Session owner changed during context-state read")
+            _require_expected_session_owner(
+                current,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+                operation="context-state read",
+            )
+        return context_states
 
     async def invalidate_context_states(
         self,
@@ -2839,7 +2924,11 @@ class SessionManager:
                 phase="snapshotting",
             )
             context_states = await await_compaction_phase(
-                self._storage.get_context_states(session_key),
+                self._storage.get_context_states(
+                    session_key,
+                    expected_session_id=expected_session_id,
+                    expected_session_epoch=expected_session_epoch,
+                ),
                 effective_config,
                 phase="snapshotting",
             )
@@ -3057,7 +3146,11 @@ class SessionManager:
                 phase="validating",
             )
             current_context_states = await await_compaction_phase(
-                self._storage.get_context_states(session_key),
+                self._storage.get_context_states(
+                    session_key,
+                    expected_session_id=expected_session_id,
+                    expected_session_epoch=expected_session_epoch,
+                ),
                 effective_config,
                 phase="validating",
             )
@@ -3151,6 +3244,8 @@ class SessionManager:
                         boundary.id if boundary is not None else None
                     ),
                     expected_context_fingerprint=previous_context_fingerprint,
+                    expected_session_id=expected_session_id,
+                    expected_session_epoch=expected_session_epoch,
                 )
             )
             installed, cancellation_reconciled = await _await_compaction_commit_barrier(
@@ -3201,6 +3296,8 @@ class SessionManager:
         source_preimage: Sequence[Sequence[Any]] | None = None,
         source_boundary_message_id: str | None = None,
         source_boundary_entry_id: int | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> bool:
         """Persist a pre-computed compaction result directly (no LLM re-compaction).
 
@@ -3241,6 +3338,12 @@ class SessionManager:
         if node is None:
             _log.warning("persist_compaction.session_not_found", session_key=session_key)
             return False
+        _require_expected_session_owner(
+            node,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+            operation="inline compaction snapshot",
+        )
 
         expected_source_entries: list[TranscriptEntry] | None = None
         expected_source_preimage: tuple[tuple[Any, ...], ...] | None = None
@@ -3419,6 +3522,8 @@ class SessionManager:
                 entries=rewritten_entries,
                 context_states=[context_state] if context_state is not None else None,
                 archived_entries=removed_entries if summary_record is not None else None,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
                 **rewrite_kwargs,
             )
         )

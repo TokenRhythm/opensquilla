@@ -4890,14 +4890,46 @@ class SessionStorage:
         self,
         session_key: str,
         workspace_id: str | None,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> None:
         session_key = canonicalize_session_key(session_key)
+        _validate_optional_session_owner(
+            session_id=expected_session_id,
+            session_epoch=expected_session_epoch,
+        )
+        if (expected_session_id is None) != (expected_session_epoch is None):
+            raise ValueError("workspace binding requires an exact session owner")
         async with self._write_transaction("bind_session_workspace") as conn:
-            cursor = await conn.execute(
-                "UPDATE sessions SET workspace_id = ? WHERE session_key = ?",
-                (workspace_id, session_key),
-            )
+            if expected_session_id is None:
+                cursor = await conn.execute(
+                    "UPDATE sessions SET workspace_id = ? WHERE session_key = ?",
+                    (workspace_id, session_key),
+                )
+            else:
+                assert expected_session_epoch is not None
+                cursor = await conn.execute(
+                    """
+                    UPDATE sessions SET workspace_id = ?
+                    WHERE session_key = ? AND session_id = ? AND epoch = ?
+                    """,
+                    (
+                        workspace_id,
+                        session_key,
+                        expected_session_id,
+                        expected_session_epoch,
+                    ),
+                )
             if int(cursor.rowcount or 0) == 0:
+                if expected_session_id is not None:
+                    assert expected_session_epoch is not None
+                    await self._raise_stale_epoch(
+                        conn,
+                        session_key=session_key,
+                        expected_epoch=expected_session_epoch,
+                        expected_session_id=expected_session_id,
+                    )
                 raise KeyError(f"Session not found: {session_key}")
 
     @_serialized_read
@@ -15059,12 +15091,38 @@ class SessionStorage:
         expected_source_boundary_message_id: str | None = None,
         expected_source_boundary_entry_id: int | None = None,
         expected_context_fingerprint: str | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> bool:
         """Atomically persist a compaction rewrite for one session."""
         node.session_key = canonicalize_session_key(node.session_key)
         node.agent_id = normalize_agent_id(node.agent_id)
+        _validate_optional_session_owner(
+            session_id=expected_session_id,
+            session_epoch=expected_session_epoch,
+        )
+        if (expected_session_id is None) != (expected_session_epoch is None):
+            raise ValueError("compaction rewrite requires an exact session owner")
 
         async with self._write_transaction("rewrite_compacted_session") as conn:
+            if expected_session_id is not None:
+                assert expected_session_epoch is not None
+                if (
+                    node.session_id != expected_session_id
+                    or int(node.epoch or 0) != expected_session_epoch
+                    or not await _matches_session_owner_on_conn(
+                        conn,
+                        session_key=node.session_key,
+                        session_id=expected_session_id,
+                        session_epoch=expected_session_epoch,
+                    )
+                ):
+                    await self._raise_stale_epoch(
+                        conn,
+                        session_key=node.session_key,
+                        expected_epoch=expected_session_epoch,
+                        expected_session_id=expected_session_id,
+                    )
             preserve_surviving_rows = expected_source_entries is not None
             if expected_source_entries is not None:
                 expected_prefix = list(expected_source_entries)
@@ -15410,10 +15468,35 @@ class SessionStorage:
         provider: str | None = None,
         state_kind: str | None = None,
         valid_only: bool = True,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> list[SessionContextState]:
         session_key = canonicalize_session_key(session_key)
+        _validate_optional_session_owner(
+            session_id=expected_session_id,
+            session_epoch=expected_session_epoch,
+        )
+        if (expected_session_id is None) != (expected_session_epoch is None):
+            raise ValueError("context state read requires an exact session owner")
+        if expected_session_id is not None:
+            assert expected_session_epoch is not None
+            if not await _matches_session_owner_on_conn(
+                self.conn,
+                session_key=session_key,
+                session_id=expected_session_id,
+                session_epoch=expected_session_epoch,
+            ):
+                await self._raise_stale_epoch(
+                    self.conn,
+                    session_key=session_key,
+                    expected_epoch=expected_session_epoch,
+                    expected_session_id=expected_session_id,
+                )
         clauses = ["session_key = ?"]
         params: list[Any] = [session_key]
+        if expected_session_id is not None:
+            clauses.append("session_id = ?")
+            params.append(expected_session_id)
         if provider is not None:
             clauses.append("provider = ?")
             params.append(provider)
@@ -15429,6 +15512,20 @@ class SessionStorage:
             params,
         ) as cur:
             rows = await cur.fetchall()
+        if expected_session_id is not None:
+            assert expected_session_epoch is not None
+            if not await _matches_session_owner_on_conn(
+                self.conn,
+                session_key=session_key,
+                session_id=expected_session_id,
+                session_epoch=expected_session_epoch,
+            ):
+                await self._raise_stale_epoch(
+                    self.conn,
+                    session_key=session_key,
+                    expected_epoch=expected_session_epoch,
+                    expected_session_id=expected_session_id,
+                )
         return [SessionContextState(**_deserialize_row(dict(row))) for row in rows]
 
     async def invalidate_context_states(
