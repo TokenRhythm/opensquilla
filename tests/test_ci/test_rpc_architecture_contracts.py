@@ -280,18 +280,15 @@ SANDBOX_RUNTIME_AUTHORED_FILES = (
 )
 SANDBOX_RUNTIME_AUTHORED_LOC_CEILING = 3_000
 
-# This ledger is deliberately separate from SandboxRuntime: it measures only
-# the authored SessionLifecycle Module/Port and Gateway Adapter seams.  The
-# large-PR plan requires the predefined split before this seam exceeds 3,000
-# physical lines; generated artifacts, fixtures, and the reused legacy writer
-# fencing Implementation in rpc_sessions.py are not newly authored seams.
+# This ledger is deliberately separate from SandboxRuntime.  At the reset
+# baseline it totalled 2,886 lines: 2,618 for lifecycle/admission/queue/
+# ancillary seams plus 268 for the old compaction seam.  Manual compaction
+# takes the predefined lifecycle/maintenance split, so this ledger retains
+# the unchanged 3,000-line ceiling and no longer hides maintenance growth.
 SESSION_LIFECYCLE_AUTHORED_FILES = (
     "src/opensquilla/application/session_lifecycle.py",
     "src/opensquilla/gateway/adapters/session_lifecycle.py",
     "src/opensquilla/gateway/adapters/session_lifecycle_contract.py",
-    "src/opensquilla/application/session_maintenance.py",
-    "src/opensquilla/gateway/adapters/session_maintenance.py",
-    "src/opensquilla/gateway/adapters/session_maintenance_contract.py",
     "src/opensquilla/application/turn_admission.py",
     "src/opensquilla/gateway/adapters/turn_admission.py",
     "src/opensquilla/gateway/adapters/turn_admission_contract.py",
@@ -303,6 +300,21 @@ SESSION_LIFECYCLE_AUTHORED_FILES = (
     "src/opensquilla/gateway/adapters/conversation_ancillary_contract.py",
 )
 SESSION_LIFECYCLE_AUTHORED_LOC_CEILING = 3_000
+
+# SessionMaintenance owns two high-risk workflows (reset and manual
+# compaction) behind one generated registration boundary.  The reset baseline
+# added 830 authored lines that the old mixed ledger did not represent; this
+# explicit five-file ledger covers both Applications and both Gateway
+# Adapters. Generated schemas and fixtures stay excluded, and it uses the
+# existing 3,000-line hard ceiling rather than widening it.
+SESSION_MAINTENANCE_AUTHORED_FILES = (
+    "src/opensquilla/application/session_reset.py",
+    "src/opensquilla/gateway/adapters/session_reset.py",
+    "src/opensquilla/application/session_maintenance.py",
+    "src/opensquilla/gateway/adapters/session_maintenance.py",
+    "src/opensquilla/gateway/adapters/session_maintenance_contract.py",
+)
+SESSION_MAINTENANCE_AUTHORED_LOC_CEILING = 3_000
 
 # Existing cross-rpc private imports are architectural debt. This exact ledger
 # prevents growth and also fails stale when an import is removed, so reductions
@@ -786,6 +798,14 @@ def test_session_lifecycle_authored_surface_stays_within_large_pr_ceiling() -> N
         f"SessionLifecycle authored seams total {current} lines; split the domain at its "
         f"predefined lifecycle/maintenance or Module/consumer boundary before exceeding "
         f"{SESSION_LIFECYCLE_AUTHORED_LOC_CEILING}"
+    )
+
+
+def test_session_maintenance_authored_surface_stays_within_large_pr_ceiling() -> None:
+    current = _physical_lines(SESSION_MAINTENANCE_AUTHORED_FILES)
+    assert current <= SESSION_MAINTENANCE_AUTHORED_LOC_CEILING, (
+        f"SessionMaintenance authored seams total {current} lines; split reset and "
+        f"manual compaction before exceeding {SESSION_MAINTENANCE_AUTHORED_LOC_CEILING}"
     )
 
 
