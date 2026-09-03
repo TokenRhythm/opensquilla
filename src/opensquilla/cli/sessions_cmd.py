@@ -14,7 +14,7 @@ from rich.table import Table
 from opensquilla.cli.chat.session_state import messages_to_markdown
 from opensquilla.cli.gateway_client import session_history_all
 from opensquilla.cli.gateway_rpc import default_gateway_url, run_gateway_sync
-from opensquilla.cli.output import print_json
+from opensquilla.cli.output import exit_invalid_request, print_json
 from opensquilla.cli.ui import ACCENT, ACCENT_HEADER, console, error_panel
 
 app = typer.Typer(help="Manage chat sessions.")
@@ -135,6 +135,12 @@ def sessions_list(
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ) -> None:
     """List recent sessions."""
+    if limit < 1:
+        exit_invalid_request(
+            "--limit must be >= 1",
+            json_output=json_output,
+            details={"parameter": "limit", "minimum": 1},
+        )
     since_dt = _parse_since(since)
 
     async def _run(client):

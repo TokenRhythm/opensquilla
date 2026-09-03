@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, NoReturn
 
 import typer
 
@@ -50,3 +50,20 @@ def emit_error(
         )
     else:
         typer.secho(f"Error: {message}", fg=typer.colors.RED, err=True)
+
+
+def exit_invalid_request(
+    message: str,
+    *,
+    json_output: bool = False,
+    details: Any | None = None,
+) -> NoReturn:
+    """Report invalid CLI input through the standard error envelope."""
+
+    emit_error(
+        message,
+        json_output=json_output,
+        code="INVALID_REQUEST",
+        details=details,
+    )
+    raise typer.Exit(2)

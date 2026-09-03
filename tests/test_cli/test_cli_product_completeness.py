@@ -946,6 +946,19 @@ def test_sessions_list_json_filters_client_side(monkeypatch):
     assert payload["sessions"][0]["key"] == "a"
 
 
+def test_sessions_list_rejects_negative_limit_before_gateway_call(monkeypatch):
+    fake = _install_fake_gateway(monkeypatch)
+
+    result = runner.invoke(app, ["sessions", "list", "--limit", "-1", "--json"])
+
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    payload = json.loads(result.stderr)
+    assert payload["error"]["code"] == "INVALID_REQUEST"
+    assert "--limit must be >= 1" in payload["error"]["message"]
+    assert fake.calls == []
+
+
 def test_sessions_list_uses_active_profile_managed_gateway_runtime_port(
     tmp_path: Path,
     monkeypatch,
@@ -1405,6 +1418,22 @@ def test_cron_run_yes_calls_existing_rpc(monkeypatch):
     assert result.exit_code == 0, result.stdout
     assert json.loads(result.stdout)["status"] == "accepted"
     assert ("cron.run", {"id": "job-1"}) in fake.calls
+
+
+def test_cron_runs_rejects_negative_limit_before_gateway_call(monkeypatch):
+    fake = _install_fake_gateway(monkeypatch)
+
+    result = runner.invoke(
+        app,
+        ["cron", "runs", "job-1", "--limit", "-1", "--json"],
+    )
+
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    payload = json.loads(result.stderr)
+    assert payload["error"]["code"] == "INVALID_REQUEST"
+    assert "--limit must be >= 1" in payload["error"]["message"]
+    assert fake.calls == []
 
 
 def test_cron_commands_use_existing_rpc_payloads(monkeypatch):
