@@ -40,6 +40,7 @@ async function mountQueue(
     steerAvailable?: boolean
     durableSteerAvailable?: boolean
     steerUnavailableMessage?: string
+    immutableRetryOnly?: boolean
   } = {},
 ) {
   const el = document.createElement('div')
@@ -353,6 +354,41 @@ describe('PendingQueue', () => {
     )].find(button => button.textContent?.includes('Retry'))
     expect(retry?.disabled).toBe(true)
     expect(retry?.title).toContain('another queued message is being delivered')
+    app.unmount()
+  })
+
+  it('renders only the immutable Retry action in a read-only queue', async () => {
+    const listeners = {
+      onClear: vi.fn(),
+      onEdit: vi.fn(),
+      onRemove: vi.fn(),
+      onReorder: vi.fn(),
+      onSteer: vi.fn(),
+    }
+    const { app, el } = await mountQueue(listeners, [
+      {
+        text: 'Retry the exact receipt',
+        deliveryState: 'retryable',
+      },
+      { text: 'Do not expose a fresh Steer' },
+    ], {
+      immutableRetryOnly: true,
+      steerAvailable: false,
+    })
+
+    const card = el.querySelector<HTMLElement>('.chat-pending-card')
+    const buttons = [...el.querySelectorAll<HTMLButtonElement>('button')]
+    expect(buttons).toHaveLength(1)
+    expect(buttons[0]?.textContent).toContain('Retry')
+    expect(buttons[0]?.disabled).toBe(false)
+    expect(card?.classList.contains('is-reorderable')).toBe(false)
+    expect(card?.hasAttribute('tabindex')).toBe(false)
+    buttons[0]?.click()
+    expect(listeners.onSteer).toHaveBeenCalledWith('pending-ui-0')
+    expect(listeners.onClear).not.toHaveBeenCalled()
+    expect(listeners.onEdit).not.toHaveBeenCalled()
+    expect(listeners.onRemove).not.toHaveBeenCalled()
+    expect(listeners.onReorder).not.toHaveBeenCalled()
     app.unmount()
   })
 

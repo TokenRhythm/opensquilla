@@ -690,6 +690,15 @@ export function useChatSend(options: UseChatSendOptions) {
 
   const recoveredQueuedAttempts = new WeakMap<ChatPendingItem, SendAttempt>()
 
+  function isQueuedExactReceiptReplay(item: ChatPendingItem): boolean {
+    acceptanceRecoveryVersion.value
+    const attempt = recoveredQueuedAttempts.get(item)
+    return Boolean(
+      attempt?.requiresIdempotentReplay
+      && attempt.requestSessionKey === options.sessionKey.value,
+    )
+  }
+
   function currentPromptAnnotationIds(): string[] {
     return [...(options.promptAnnotationIds?.value || [])]
       .map(value => String(value || '').trim())
@@ -2705,6 +2714,7 @@ export function useChatSend(options: UseChatSendOptions) {
       idempotentReplay,
       rememberRetryableAttempt: attempt => {
         recoveredQueuedAttempts.set(item, attempt)
+        noteAcceptanceRecoveryChanged()
       },
       ...(item.pendingInputId
         && item.pendingClientRequestId
@@ -2714,6 +2724,7 @@ export function useChatSend(options: UseChatSendOptions) {
     })
     if (outcome === 'accepted') {
       recoveredQueuedAttempts.delete(item)
+      noteAcceptanceRecoveryChanged()
     }
     return preserveRetryState(outcome)
   }
@@ -2736,6 +2747,15 @@ export function useChatSend(options: UseChatSendOptions) {
     expectedSessionKey?: string,
   ): Promise<ChatSendOutcome> {
     return sendQueuedItem(item, 'followup', expectedSessionKey)
+  }
+
+  function retryQueuedItem(
+    item: ChatPendingItem,
+    expectedSessionKey?: string,
+  ): Promise<ChatSendOutcome> {
+    return item.steerAttempt
+      ? sendQueuedSteer(item, expectedSessionKey)
+      : sendQueuedFollowup(item, expectedSessionKey)
   }
 
   async function dispatchSend(
@@ -4494,6 +4514,7 @@ export function useChatSend(options: UseChatSendOptions) {
     onStop,
     sendQueuedSteer,
     sendQueuedFollowup,
+    retryQueuedItem,
     supportsSameTurnSteer,
     dispatchComposerPrompt,
     dispatchHiddenSend,
@@ -4507,5 +4528,6 @@ export function useChatSend(options: UseChatSendOptions) {
     sendUsageBarrierReplay,
     acceptanceRecoveryPendingForCurrentSession,
     exactReceiptReplayPendingForCurrentSession,
+    isQueuedExactReceiptReplay,
   }
 }

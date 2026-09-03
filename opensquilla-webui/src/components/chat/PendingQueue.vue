@@ -73,6 +73,7 @@
           </span>
         </button>
         <button
+          v-if="!immutableRetryOnly"
           type="button"
           class="chat-pending-action chat-pending-action--icon"
           :aria-label="removeLabel(item, index)"
@@ -82,7 +83,7 @@
         >
           <Icon name="trash" :size="14" />
         </button>
-        <div v-if="!item.hiddenControl" class="chat-pending-more-wrap">
+        <div v-if="!immutableRetryOnly && !item.hiddenControl" class="chat-pending-more-wrap">
           <button
             type="button"
             class="chat-pending-action chat-pending-action--icon"
@@ -171,6 +172,7 @@ type PendingSteerBlocker =
 const props = withDefaults(defineProps<{
   items: PendingQueueItem[]
   maxPending: number
+  immutableRetryOnly?: boolean
   reorderEnabled?: boolean
   reorderPending?: boolean
   imageBlockedMessage?: string
@@ -234,7 +236,8 @@ function displayText(item: PendingQueueItem): string {
 }
 
 function queueCanReorder(): boolean {
-  return props.reorderEnabled !== false
+  return props.immutableRetryOnly !== true
+    && props.reorderEnabled !== false
     && props.reorderPending !== true
     && props.items.length > 1 && props.items.every(item => (
     !item.hiddenControl
@@ -299,6 +302,7 @@ function removeLabel(item: PendingQueueItem, index: number): string {
 
 function canShowSteer(item: PendingQueueItem): boolean {
   return !item.hiddenControl
+    && (props.immutableRetryOnly !== true || isPendingRetry(item))
 }
 
 function hasUnsendableAttachment(item: PendingQueueItem): boolean {

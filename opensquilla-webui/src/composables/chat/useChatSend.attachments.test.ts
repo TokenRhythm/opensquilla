@@ -2638,6 +2638,93 @@ describe('useChatSend attachment payloads', () => {
     }
   })
 
+  it('keeps an exact queued receipt Retry visible after bounded automatic recovery', async () => {
+    vi.useFakeTimers()
+    const sessionKey = ref('agent:main:webchat:test')
+    const inputText = ref('')
+    const pendingAttachments = ref<Attachment[]>([])
+    const pendingSessionIntent = ref<string | null>(null)
+    const isStreaming = ref(false)
+    const policy = ref<string | null>(null)
+    let currentAdmissionBlocked = false
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(new RpcTransportError('first response lost', null))
+        .mockRejectedValueOnce(new RpcTransportError('replay response lost', null))
+        .mockResolvedValueOnce({
+          accepted: true,
+          replayed: true,
+          sessionKey: sessionKey.value,
+          task_id: 'task-manual-queue-replay',
+        }),
+    }
+    let sendApi!: ReturnType<typeof useChatSend>
+    const dispatches: Array<ReturnType<typeof sendApi.sendQueuedFollowup>> = []
+    const pending = useChatPendingQueue({
+      sessionKey,
+      inputText,
+      pendingAttachments,
+      pendingSessionIntent,
+      isStreaming,
+      isBlocked: () => currentAdmissionBlocked,
+      isReceiptReplayBlocked: () => false,
+      autoResizeTextarea: vi.fn(),
+      sendCurrentInput: vi.fn(),
+      resetInputHistory: vi.fn(),
+      hasComposer: () => true,
+      pendingInputWal: memoryHandoffWal(),
+      dispatchPendingItem: (item, ownerSessionKey) => {
+        const delivery = sendApi.sendQueuedFollowup(item, ownerSessionKey)
+        dispatches.push(delivery)
+        return delivery
+      },
+    })
+    try {
+      const configured = makeOptions({
+        rpc,
+        sessionKey,
+        inputText,
+        pendingAttachments,
+        pendingSessionIntent,
+        busySendMode: pending.busySendMode,
+        sendBlockedReason: policy,
+        sessionInteractivityBlockedReason: policy,
+        idempotentReplayBlockedReason: ref(null),
+      })
+      sendApi = configured.api
+      await pending.enqueuePendingPayload({
+        text: 'recover this exact queued receipt',
+      })
+      const item = pending.pendingQueue.value[0]!
+
+      pending.schedulePendingDrainAfterTerminal()
+      await vi.advanceTimersByTimeAsync(50)
+      await dispatches[0]
+      await nextTick()
+      expect(item.deliveryState).toBe('replay_pending')
+      expect(sendApi.isQueuedExactReceiptReplay(item)).toBe(true)
+      const originalParams = rpc.call.mock.calls[0]?.[1]
+
+      policy.value = 'Cron sessions are read-only.'
+      currentAdmissionBlocked = true
+      await vi.advanceTimersByTimeAsync(50)
+      await dispatches[1]
+      await nextTick()
+      expect(item.deliveryState).toBe('retryable')
+      expect(sendApi.isQueuedExactReceiptReplay(item)).toBe(true)
+      expect(rpc.call).toHaveBeenCalledTimes(2)
+
+      const outcome = await sendApi.retryQueuedItem(item, sessionKey.value)
+      pending.settlePendingDelivery(item, outcome)
+      expect(outcome).toBe('accepted')
+      expect(rpc.call.mock.calls[2]?.[1]).toEqual(originalParams)
+      expect(pending.pendingQueue.value).toEqual([])
+    } finally {
+      pending.cleanup()
+      vi.useRealTimers()
+    }
+  })
+
   it('keeps an unattempted hidden control blocked by the local policy after remount', async () => {
     const hiddenControlStorage = memoryStorage()
     const localPolicy = ref<string | null>('Cron sessions are read-only.')
@@ -8784,6 +8871,49 @@ describe('useChatSend slash-prefixed input fall-through', () => {
       }
     },
   )
+
+  it('retries an unattempted queued slash attachment as a fresh follow-up', async () => {
+    let classification: 'unavailable' | 'unknown' = 'unavailable'
+    const classifySlashCommand = vi.fn(async () => classification)
+    const rpc = {
+      call: vi.fn().mockResolvedValue({
+        accepted: true,
+        sessionKey: 'agent:main:webchat:test',
+        task_id: 'task-recovered-slash-followup',
+      }),
+    }
+    const { api } = makeOptions({ rpc, classifySlashCommand })
+    const attachment: Attachment = {
+      kind: 'staged',
+      local_id: 95,
+      name: 'slash-retry.pdf',
+      mime: 'application/pdf',
+      file_uuid: 'file-slash-retry',
+    }
+    const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-slash-retry',
+      text: '/literal prompt',
+      confirmedPlainText: true,
+      attachments: [attachment],
+      intent: null,
+      deliveryState: 'retryable',
+      ownerSessionKey: 'agent:main:webchat:test',
+    }
+
+    await expect(api.retryQueuedItem(queued)).resolves.toBe('retryable_failure')
+    expect(rpc.call).not.toHaveBeenCalled()
+
+    classification = 'unknown'
+    await expect(api.retryQueuedItem(queued)).resolves.toBe('accepted')
+
+    expect(classifySlashCommand).toHaveBeenCalledTimes(2)
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      message: '/literal prompt',
+      attachments: [expect.objectContaining({ file_uuid: 'file-slash-retry' })],
+      queueMode: 'followup',
+    }))
+    expect(rpc.call.mock.calls[0]?.[0]).not.toBe('sessions.steer.v2')
+  })
 
   it('keeps a queued slash item when its workspace becomes unavailable during classification', async () => {
     let resolveClassification!: (classification: 'unknown') => void

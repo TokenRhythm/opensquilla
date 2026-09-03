@@ -10751,6 +10751,27 @@ class SessionStorage:
             pending_input_id=pending_input_id.strip(),
         )
 
+    @_serialized_read
+    async def find_pending_chat_input_dispatch_receipts(
+        self,
+        *,
+        pending_input_id: str,
+        session_key: str,
+        source_scope: str,
+        client_request_id: str,
+        client_message_id: str,
+    ) -> list[PendingChatInputDispatchReceipt]:
+        """Find every dispatch tombstone colliding with a stable queue identity."""
+
+        return await self._find_pending_chat_input_dispatch_receipts(
+            self.conn,
+            pending_input_id=pending_input_id.strip(),
+            session_key=canonicalize_session_key(session_key),
+            source_scope=source_scope.strip(),
+            client_request_id=client_request_id.strip(),
+            client_message_id=client_message_id.strip(),
+        )
+
     async def consume_replayed_pending_chat_input(
         self,
         *,

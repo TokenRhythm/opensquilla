@@ -668,6 +668,16 @@ async def test_pending_attachment_raw_replay_uses_dispatch_tombstone_before_cron
             assert conflict.ok is False
             assert conflict.error is not None
             assert conflict.error.code == "PENDING_INPUT_CONFLICT"
+
+            identity_conflict = await get_dispatcher().dispatch(
+                "pending-attachment-cron-replay-identity-conflict",
+                "sessions.pending_inputs.enqueue",
+                {**params, "pendingInputId": "pending-attachment-cron-replay-new-id"},
+                stack.context,
+            )
+            assert identity_conflict.ok is False
+            assert identity_conflict.error is not None
+            assert identity_conflict.error.code == "PENDING_INPUT_CONFLICT"
             assert await stack.storage.list_pending_chat_inputs(session_key) == []
     finally:
         set_upload_store(original_store)

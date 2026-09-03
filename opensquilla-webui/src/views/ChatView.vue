@@ -549,7 +549,7 @@
          anchor to the chat container's bottom edge. -->
     <div class="chat-composer-dock">
     <div
-      v-if="turnActionsBlocked && !exactReceiptReplayPendingForCurrentSession"
+      v-if="turnActionsBlocked && !exactReceiptReplayVisibleForCurrentSession"
       class="chat-composer-read-only"
       role="status"
       aria-live="polite"
@@ -563,7 +563,7 @@
          transcript. Keeping it immediately above the composer also lets a
          execution surfaces reuse this dock across multiple turns. -->
     <Transition name="plan-run-dock">
-      <div v-if="executionDockRun" class="plan-run-dock">
+      <div v-if="!turnActionsBlocked && executionDockRun" class="plan-run-dock">
         <PlanRunRibbon
           :run="executionDockRun"
           :cancel-busy="planActionPending === 'cancel-run'"
@@ -576,7 +576,7 @@
     <!-- Long-running goal progress lives in the same dock as plan execution so
          the active objective stays visible above the composer across turns. -->
     <Transition name="goal-run-dock">
-      <div v-if="activeGoalRun" ref="goalRunDockRef" class="goal-run-dock">
+      <div v-if="!turnActionsBlocked && activeGoalRun" ref="goalRunDockRef" class="goal-run-dock">
         <GoalRibbon
           :goal="activeGoalRun"
           :elapsed="goalElapsed"
@@ -609,7 +609,7 @@
       </button>
     </Transition>
     <!-- Slash command menu -->
-    <div v-if="slashOpen" ref="slashMenuRef" class="chat-slash">
+    <div v-if="!turnActionsBlocked && slashOpen" ref="slashMenuRef" class="chat-slash">
       <div
         v-for="(cmd, i) in filteredSlashCmds"
         :key="cmd.cmd"
@@ -627,8 +627,10 @@
     </div>
 
     <PendingQueue
-      :items="pendingQueue"
+      v-if="!turnActionsBlocked || queueReceiptReplayItems.length > 0"
+      :items="turnActionsBlocked ? queueReceiptReplayItems : pendingQueue"
       :max-pending="maxPending"
+      :immutable-retry-only="turnActionsBlocked"
       :reorder-enabled="canReorderPendingQueue"
       :reorder-pending="pendingQueueReorderPending"
       :image-blocked-message="queuedImageSendBlockedMessage"
@@ -645,7 +647,7 @@
     />
 
     <div
-      v-if="dockedPlanQuestionnaire"
+      v-if="!turnActionsBlocked && dockedPlanQuestionnaire"
       class="plan-questionnaire-dock"
       @wheel="handlePlanQuestionnaireWheel"
       @touchstart.passive="onPlanQuestionnaireTouchStart"
@@ -664,6 +666,7 @@
     </div>
 
     <ChatComposer
+      v-if="!turnActionsBlocked || exactReceiptReplayPendingForCurrentSession"
       ref="composerRef"
       v-model="inputText"
       :attachments="pendingAttachments"
@@ -3510,6 +3513,7 @@ const {
   onStop,
   sendQueuedSteer,
   sendQueuedFollowup,
+  retryQueuedItem,
   sendUsageBarrierReplay: dispatchUsageBarrierReplay,
   dispatchComposerPrompt,
   dispatchHiddenSend,
@@ -3521,7 +3525,16 @@ const {
   sendHiddenMetaPreflightConfirmation,
   recoverResponseHandoffs,
   exactReceiptReplayPendingForCurrentSession,
+  isQueuedExactReceiptReplay,
 } = chatSend
+const queueReceiptReplayItems = computed(() => pendingQueue.value.filter(item => (
+  ['retryable', 'replay_pending'].includes(item.deliveryState || '')
+  && isQueuedExactReceiptReplay(item)
+)))
+const exactReceiptReplayVisibleForCurrentSession = computed(() => (
+  exactReceiptReplayPendingForCurrentSession.value
+  || queueReceiptReplayItems.value.length > 0
+))
 sendUsageBarrierReplay = dispatchUsageBarrierReplay
 void recoverResponseHandoffs()
 watch(
@@ -3796,6 +3809,10 @@ async function steerPendingMessage(pendingUiId: string) {
       || pendingSteerClicks.has(candidate)
     )
   ) return
+  const retryAction = Boolean(
+    candidate?.steerAttempt
+    || ['retryable', 'replay_pending'].includes(candidate?.deliveryState || ''),
+  )
   const item = candidate?.steerAttempt
     ? candidate
     : beginPendingDelivery(pendingUiId, candidate?.hiddenControl === true)
@@ -3806,7 +3823,9 @@ async function steerPendingMessage(pendingUiId: string) {
   try {
     outcome = item.hiddenControl
       ? await dispatchQueuedHiddenSend(item, item.ownerSessionKey || sessionKey.value)
-      : await sendQueuedSteer(item)
+      : retryAction
+        ? await retryQueuedItem(item)
+        : await sendQueuedSteer(item)
   } finally {
     settlePendingDelivery(item, outcome)
     pendingSteerClicks.delete(item)

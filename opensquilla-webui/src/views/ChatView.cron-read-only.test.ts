@@ -12,7 +12,7 @@ function sourceBetween(start: string, end: string): string {
 describe('Cron session read-only presentation', () => {
   it('replaces the composer with a localized status without floating dock clearance', () => {
     expect(chatViewSource).toContain(
-      'v-if="turnActionsBlocked && !exactReceiptReplayPendingForCurrentSession"',
+      'v-if="turnActionsBlocked && !exactReceiptReplayVisibleForCurrentSession"',
     )
     expect(chatViewSource).toContain("? 'chat.cronSessionReadOnly'")
     expect(chatViewSource).toContain("sessionPolicyPending ? 'chat.loadingSession' : 'chat.sessionReadOnly'")
@@ -41,6 +41,18 @@ describe('Cron session read-only presentation', () => {
     expect(chatViewSource).toContain('sessionInteractivityBlockedReason,')
     expect(chatViewSource).toContain('idempotentReplayBlockedReason: liveSendBlockedReason')
     expect(chatViewSource).toContain('exactReceiptReplayPendingForCurrentSession,')
+    expect(chatViewSource).toContain('isQueuedExactReceiptReplay,')
+    expect(chatViewSource).toContain('const queueReceiptReplayItems = computed(')
+    expect(chatViewSource).toContain(':immutable-retry-only="turnActionsBlocked"')
+    expect(chatViewSource).toContain(
+      'v-if="!turnActionsBlocked || exactReceiptReplayPendingForCurrentSession"',
+    )
+    expect(chatViewSource).toContain(
+      'v-if="!turnActionsBlocked && executionDockRun"',
+    )
+    expect(chatViewSource).toContain(
+      'v-if="!turnActionsBlocked && activeGoalRun"',
+    )
     expect(chatViewSource).toContain(':fresh-input-disabled="turnActionsBlocked"')
     expect(chatViewSource).toContain('canMutate: () => !turnActionsBlocked.value')
     expect(chatViewSource).toContain(':message-actions-available="!turnActionsBlocked"')
@@ -76,6 +88,17 @@ describe('Cron session read-only presentation', () => {
     expect(composerBlock).toContain('if (forkBlock) return forkBlock')
     expect(composerBlock).toContain('if (exactReceiptReplayPendingForCurrentSession.value)')
     expect(composerBlock).toContain("return liveSendBlockedReason.value || ''")
+  })
+
+  it('routes ordinary queue retries through follow-up admission, not fresh Steer', () => {
+    const pendingRetry = sourceBetween(
+      'async function steerPendingMessage(',
+      'const chatApprovals = useChatApprovals(',
+    )
+
+    expect(pendingRetry).toContain("['retryable', 'replay_pending'].includes")
+    expect(pendingRetry).toContain('? await retryQueuedItem(item)')
+    expect(pendingRetry).toContain(': await sendQueuedSteer(item)')
   })
 
   it('uses authoritative directory interactivity with a pending direct-route gate', () => {

@@ -7346,19 +7346,24 @@ async def _handle_pending_inputs_enqueue(
                 ):
                     return existing, True
 
-            dispatch_receipt = (
-                await storage.get_pending_chat_input_dispatch_receipt(
-                    pending_input_id
-                )
+            dispatch_receipts = await storage.find_pending_chat_input_dispatch_receipts(
+                pending_input_id=pending_input_id,
+                session_key=key,
+                source_scope=source_scope,
+                client_request_id=raw_payload["clientRequestId"],
+                client_message_id=raw_payload["clientMessageId"],
             )
             raw_fingerprint = request_fingerprint(raw_payload)
-            if dispatch_receipt is not None:
+            if dispatch_receipts:
+                dispatch_receipt = dispatch_receipts[0]
                 replay_fingerprint = (
                     dispatch_receipt.enqueue_request_fingerprint
                     or dispatch_receipt.request_fingerprint
                 )
                 if (
-                    dispatch_receipt.session_key == key
+                    len(dispatch_receipts) == 1
+                    and dispatch_receipt.pending_input_id == pending_input_id
+                    and dispatch_receipt.session_key == key
                     and dispatch_receipt.source_scope == source_scope
                     and dispatch_receipt.client_request_id
                     == raw_payload["clientRequestId"]
