@@ -231,8 +231,20 @@ async def test_reset_holds_all_writer_fences_through_snapshot_and_rotation():
         assert active_fences == {"background", "runtime", "direct", "write"}
         order.append("turn:drain")
 
+    @asynccontextmanager
+    async def runtime_fence(
+        keys,
+        *,
+        cancel_source: str,
+        cancel_reason: str,
+    ):
+        assert cancel_source == "sessions_reset"
+        assert cancel_reason == "session_reset"
+        async with fence("runtime", keys):
+            yield
+
     task_runtime = _make_task_runtime()
-    task_runtime.quiesce_sessions = lambda keys: fence("runtime", keys)
+    task_runtime.quiesce_sessions = runtime_fence
     ctx = _make_ctx(flush_service=None, task_runtime=task_runtime)
     manager = ctx.session_manager
     original_get_transcript = manager.get_transcript

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
@@ -46,6 +47,7 @@ from opensquilla.project_workspaces import ProjectWorkspaceStateError
 from opensquilla.run_mode import RunMode, config_run_mode, project_default_run_mode
 from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY, RunContext
 from opensquilla.session.models import SessionStatus
+from opensquilla.session.storage import SessionStorage
 
 type DeploymentFields = tuple[bool, str | None, bool, str | None]
 type DeploymentFieldsReader = Callable[[dict[str, Any]], DeploymentFields]
@@ -63,6 +65,25 @@ type ForkExecutor = Callable[..., Awaitable[object]]
 type RenameExecutor = Callable[..., Awaitable[dict[str, Any]]]
 type DeleteExecutor = Callable[..., Awaitable[None]]
 type EventEmitter = Callable[..., Awaitable[None]]
+
+
+def _accepts_keyword_arg(
+    call: Any,
+    name: str,
+    *,
+    allow_var_keyword: bool,
+) -> bool:
+    try:
+        parameters = inspect.signature(call).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in parameters or (
+        allow_var_keyword
+        and any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+    )
 
 
 class _ProjectWorkspaceView(Protocol):
@@ -124,6 +145,7 @@ class GatewaySessionLifecyclePorts(
         self._callbacks = callbacks
         self._manager = context.session_manager
         self._storage = get_session_storage(self._manager)
+        self._created_session_owners: dict[str, tuple[str, int]] = {}
 
     @property
     def available(self) -> bool:
@@ -216,6 +238,19 @@ class GatewaySessionLifecyclePorts(
                 ).to_origin_payload()
             }
         created = await self._manager.create(**create_kwargs)
+        session_id = getattr(created, "session_id", None)
+        epoch = getattr(created, "epoch", None)
+        if (
+            isinstance(session_id, str)
+            and session_id
+            and isinstance(epoch, int)
+            and not isinstance(epoch, bool)
+            and epoch >= 0
+        ):
+            self._created_session_owners[str(created.session_key)] = (
+                session_id,
+                epoch,
+            )
         return SessionIdentity(
             session_key=str(created.session_key),
             session_id=str(created.session_id),
@@ -226,7 +261,35 @@ class GatewaySessionLifecyclePorts(
             raise RpcUnavailableError(
                 "sessions.create(message=...) requires a session manager"
             )
-        await self._manager.append_message(session_key, role="user", content=message)
+        append_message = self._manager.append_message
+        durable_storage = isinstance(self._storage, SessionStorage)
+        supports_exact_owner = all(
+            _accepts_keyword_arg(
+                append_message,
+                name,
+                allow_var_keyword=durable_storage,
+            )
+            for name in ("expected_session_id", "expected_session_epoch")
+        )
+        if durable_storage and not supports_exact_owner:
+            raise RuntimeError("Session writer cannot enforce a durable owner")
+        owner = self._created_session_owners.get(session_key)
+        if supports_exact_owner and owner is None:
+            raise RuntimeError("Created session has no durable owner")
+        owner_kwargs = (
+            {
+                "expected_session_id": owner[0],
+                "expected_session_epoch": owner[1],
+            }
+            if supports_exact_owner and owner is not None
+            else {}
+        )
+        await append_message(
+            session_key,
+            role="user",
+            content=message,
+            **owner_kwargs,
+        )
 
     async def rename(self, session_key: str, display_name: str) -> None:
         if self._manager is None:

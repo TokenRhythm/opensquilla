@@ -1807,6 +1807,7 @@ async def test_concurrent_execution_fences_cannot_erase_driver_change_signal(
     async def controlled_drain(
         keys: tuple[str, ...],
         _key_set: frozenset[str],
+        **_kwargs: Any,
     ) -> None:
         nonlocal first_drain_calls
         if keys == (first_key,):

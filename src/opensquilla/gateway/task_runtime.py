@@ -1927,6 +1927,9 @@ class TaskRuntime:
     async def quiesce_sessions(
         self,
         session_keys: Iterable[str],
+        *,
+        cancel_source: str = "workspace_history_delete",
+        cancel_reason: str = "project_history_deleted",
     ) -> AsyncIterator[None]:
         """Fence runtime work for a stable, ordered set of sessions.
 
@@ -1955,7 +1958,12 @@ class TaskRuntime:
             await asyncio.gather(
                 *(self.cancel_auxiliary(key) for key in keys),
             )
-            await self._cancel_and_drain_session_drivers(keys, key_set)
+            await self._cancel_and_drain_session_drivers(
+                keys,
+                key_set,
+                cancel_source=cancel_source,
+                cancel_reason=cancel_reason,
+            )
 
             async with contextlib.AsyncExitStack() as fences:
                 for session_key in keys:
@@ -1967,6 +1975,8 @@ class TaskRuntime:
                         execution_lock,
                         keys,
                         key_set,
+                        cancel_source=cancel_source,
+                        cancel_reason=cancel_reason,
                     )
                     fences.callback(execution_lock.release)
                 for session_key in keys:
@@ -2000,6 +2010,9 @@ class TaskRuntime:
         execution_lock: asyncio.Lock,
         keys: Sequence[str],
         key_set: frozenset[str],
+        *,
+        cancel_source: str = "workspace_history_delete",
+        cancel_reason: str = "project_history_deleted",
     ) -> None:
         """Acquire one execution fence without waiting behind an uncancelled driver."""
 
@@ -2012,7 +2025,12 @@ class TaskRuntime:
                 # this one, so concurrent quiescers cannot erase each other's
                 # wake-up by clearing shared state.
                 driver_state_changed = self._driver_state_changed
-                await self._cancel_and_drain_session_drivers(keys, key_set)
+                await self._cancel_and_drain_session_drivers(
+                    keys,
+                    key_set,
+                    cancel_source=cancel_source,
+                    cancel_reason=cancel_reason,
+                )
                 if acquiring.done():
                     break
                 if driver_state_changed.is_set():
@@ -2060,6 +2078,9 @@ class TaskRuntime:
         self,
         keys: Sequence[str],
         key_set: frozenset[str],
+        *,
+        cancel_source: str = "workspace_history_delete",
+        cancel_reason: str = "project_history_deleted",
     ) -> None:
         async with self._state_lock:
             runtime_tasks = [
@@ -2081,8 +2102,8 @@ class TaskRuntime:
         if runtime_tasks:
             await self._cancel_runtime_tasks(
                 runtime_tasks,
-                source="workspace_history_delete",
-                reason="project_history_deleted",
+                source=cancel_source,
+                reason=cancel_reason,
             )
         if drivers:
             await asyncio.gather(*drivers, return_exceptions=True)

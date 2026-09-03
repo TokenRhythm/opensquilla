@@ -4915,6 +4915,8 @@ class TurnRunner:
         input_provenance: dict[str, Any] | None,
         run_kind: str = "default",
         no_memory_capture: bool = False,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> None:
         memory_cfg = getattr(self._config, "memory", None)
         if not self._turn_memory_capture_allowed(
@@ -4933,11 +4935,21 @@ class TurnRunner:
         if capture_service is None:
             return
         session = await self._session_manager.get_session(session_key)
-        if session is None:
-            return
+        if expected_session_id is not None or expected_session_epoch is not None:
+            if (
+                session is None
+                or getattr(session, "session_id", None) != expected_session_id
+                or int(getattr(session, "epoch", 0) or 0) != expected_session_epoch
+            ):
+                raise StaleEpochError("Turn session owner changed before memory capture")
+            capture_session_id = expected_session_id or ""
+        else:
+            if session is None:
+                return
+            capture_session_id = getattr(session, "session_id", "")
         await capture_service.capture_turn(
             session_key=session_key,
-            session_id=getattr(session, "session_id", ""),
+            session_id=capture_session_id,
             user_text=runtime_message,
             assistant_text=final_text,
             source=self._build_turn_call_source(
@@ -6297,6 +6309,8 @@ class TurnRunner:
                         session_key=session_key,
                         agent_id=agent_id,
                         history_has_persisted_user=history_has_persisted_user,
+                        expected_session_id=expected_session_id,
+                        expected_session_epoch=expected_session_epoch,
                         bound_user_message_id=bound_user_message_id,
                         provider_request_correlation=compaction_correlation,
                         consumer_admission=consumer_admission,
@@ -10874,6 +10888,8 @@ class TurnRunner:
         turn_id: str,
         source: str,
         compaction_config: Any | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> bool:
         if self._session_manager is None:
             return False
@@ -10897,6 +10913,9 @@ class TurnRunner:
                 "compaction_config",
             ):
                 checkpoint_kwargs["compaction_config"] = compaction_config
+            if expected_session_id is not None or expected_session_epoch is not None:
+                checkpoint_kwargs["expected_session_id"] = expected_session_id
+                checkpoint_kwargs["expected_session_epoch"] = expected_session_epoch
             receipt = await checkpoint_method(
                 session_key,
                 list(transcript),
@@ -11418,6 +11437,8 @@ class TurnRunner:
         consumer_admission: Any | None = None,
         consumer_admission_fingerprint: str = "",
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> str:
         """Flush memory and compact transcript when the router upgrades into t3.
 
@@ -11697,6 +11718,8 @@ class TurnRunner:
                 turn_id=compaction_id,
                 source="t3_upgrade_compaction",
                 compaction_config=compaction_config,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
             )
         except asyncio.CancelledError:
             notify_compaction(
@@ -11852,6 +11875,9 @@ class TurnRunner:
                     )
                 if _accepts_keyword_arg(compact_method, "context_window_chars"):
                     compact_kwargs["context_window_chars"] = history_capacity_chars
+                if expected_session_id is not None or expected_session_epoch is not None:
+                    compact_kwargs["expected_session_id"] = expected_session_id
+                    compact_kwargs["expected_session_epoch"] = expected_session_epoch
                 if provider_request_correlation is not None and _accepts_keyword_arg(
                     compact_method,
                     "provider_request_correlation",
@@ -12081,6 +12107,8 @@ class TurnRunner:
         consumer_admission: Any | None = None,
         consumer_admission_fingerprint: str = "",
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> None:
         """Compact proactively if session history exceeds token budget.
 
@@ -12347,6 +12375,8 @@ class TurnRunner:
                 turn_id=compaction_id,
                 source="preflight_compaction",
                 compaction_config=compaction_config,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
             )
         except asyncio.CancelledError:
             notify_compaction(
@@ -12503,6 +12533,9 @@ class TurnRunner:
                     )
                 if _accepts_keyword_arg(compact_method, "context_window_chars"):
                     compact_kwargs["context_window_chars"] = history_capacity_chars
+                if expected_session_id is not None or expected_session_epoch is not None:
+                    compact_kwargs["expected_session_id"] = expected_session_id
+                    compact_kwargs["expected_session_epoch"] = expected_session_epoch
                 if provider_request_correlation is not None and _accepts_keyword_arg(
                     compact_method,
                     "provider_request_correlation",

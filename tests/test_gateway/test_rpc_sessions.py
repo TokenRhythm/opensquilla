@@ -644,6 +644,28 @@ def make_ctx(session_manager=None, **kwargs) -> RpcContext:
     return ctx
 
 
+async def _reset_durable_session(
+    storage: SessionStorage,
+    current: SessionNode,
+    *,
+    replacement_session_id: str,
+) -> SessionNode:
+    replacement = current.model_copy(deep=True)
+    replacement.session_id = replacement_session_id
+    replacement.epoch = int(current.epoch or 0) + 1
+
+    async def _ignore_archive(_snapshot: Any) -> None:
+        return None
+
+    await storage.reset_session(
+        replacement,
+        expected_session_id=current.session_id,
+        expected_epoch=int(current.epoch or 0),
+        archive_writer=_ignore_archive,
+    )
+    return replacement
+
+
 def _capture_compaction_emits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> list[tuple[str, str, dict[str, Any]]]:
@@ -1069,6 +1091,132 @@ class TestSessionsCreate:
         assert res.ok is True
         assert res.payload["seededMessage"] is True
         assert session_manager.created_messages == [(res.payload["key"], "user", "hello")]
+
+    @pytest.mark.asyncio
+    async def test_create_with_message_passes_owner_to_capable_storage_proxy(
+        self,
+        dispatcher,
+    ) -> None:
+        class OwnerCapableManager(FakeSessionManager):
+            owner: tuple[str | None, int | None] | None = None
+
+            async def append_message(
+                self,
+                key: str,
+                role: str = "user",
+                content: str = "",
+                *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None,
+            ) -> Any:
+                self.owner = (expected_session_id, expected_session_epoch)
+                return await super().append_message(key, role, content)
+
+        session_manager = OwnerCapableManager()
+        response = await dispatcher.dispatch(
+            "r-create-owner-proxy",
+            "sessions.create",
+            {"agentId": "myagent", "message": "hello"},
+            make_ctx(session_manager=session_manager),
+        )
+
+        assert response.ok is True
+        assert session_manager.owner == (response.payload["sessionId"], 0)
+
+    @pytest.mark.asyncio
+    async def test_create_with_message_keeps_kwargs_only_legacy_writer_ownerless(
+        self,
+        dispatcher,
+    ) -> None:
+        class LegacyKwargsManager(FakeSessionManager):
+            append_kwargs: dict[str, Any] | None = None
+
+            async def append_message(
+                self,
+                key: str,
+                role: str = "user",
+                content: str = "",
+                **kwargs: Any,
+            ) -> Any:
+                self.append_kwargs = kwargs
+                return await super().append_message(key, role, content)
+
+        session_manager = LegacyKwargsManager()
+        response = await dispatcher.dispatch(
+            "r-create-ownerless-kwargs",
+            "sessions.create",
+            {"agentId": "legacy", "message": "hello"},
+            make_ctx(session_manager=session_manager),
+        )
+
+        assert response.ok is True
+        assert session_manager.append_kwargs == {}
+
+    @pytest.mark.asyncio
+    async def test_create_with_message_reset_before_append_preserves_replacement(
+        self,
+        dispatcher,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from opensquilla.session.manager import SessionManager
+
+        key = "agent:main:create-owner-race"
+        storage = await SessionStorage.open(str(tmp_path / "create-owner-race.db"))
+        manager = SessionManager(storage, inject_time_prefix=False)
+        original_append = manager.append_message
+        admitted: SessionNode | None = None
+        original_create = manager.create
+
+        async def _capture_create(*args: Any, **kwargs: Any) -> SessionNode:
+            nonlocal admitted
+            admitted = await original_create(*args, **kwargs)
+            return admitted
+
+        async def _reset_before_append(*args: Any, **kwargs: Any) -> TranscriptEntry:
+            assert admitted is not None
+            assert (
+                kwargs.get("expected_session_id"),
+                kwargs.get("expected_session_epoch"),
+            ) == (admitted.session_id, int(admitted.epoch or 0))
+            replacement = await _reset_durable_session(
+                storage,
+                admitted,
+                replacement_session_id="create-replacement-session",
+            )
+            await original_append(
+                key,
+                role="assistant",
+                content="replacement transcript",
+                message_id="create-replacement-message",
+                expected_session_id=replacement.session_id,
+                expected_session_epoch=int(replacement.epoch or 0),
+            )
+            return await original_append(*args, **kwargs)
+
+        monkeypatch.setattr(rpc_sessions, "_create_session_key", lambda _agent, _kind=None: key)
+        monkeypatch.setattr(manager, "create", _capture_create)
+        monkeypatch.setattr(manager, "append_message", _reset_before_append)
+        try:
+            response = await dispatcher.dispatch(
+                "r-create-owner-race",
+                "sessions.create",
+                {"agentId": "main", "message": "stale seed"},
+                make_ctx(session_manager=manager),
+            )
+            replacement = await storage.get_session(key)
+            assert replacement is not None
+            replacement_transcript = await storage.get_transcript(replacement.session_id)
+        finally:
+            await storage.close()
+
+        assert response.ok is False
+        assert response.error.code == "INTERNAL_ERROR"
+        assert "owner mismatch" in response.error.message.lower()
+        assert replacement.session_id == "create-replacement-session"
+        assert [entry.content for entry in replacement_transcript] == [
+            "replacement transcript"
+        ]
 
     @pytest.mark.asyncio
     async def test_create_uses_agent_registry_model_when_model_not_explicit(self, dispatcher):

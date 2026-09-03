@@ -4058,6 +4058,7 @@ class SessionStorage:
         *,
         session_key: str,
         expected_epoch: int,
+        expected_session_id: str | None = None,
     ) -> SessionNode | None:
         """Set compatibility session totals from the ledger, idempotently.
 
@@ -4076,13 +4077,17 @@ class SessionStorage:
             if session_row is None:
                 return None
             actual_epoch = max(0, int(session_row["epoch"] or 0))
-            if actual_epoch != expected_epoch:
+            actual_session_id = str(session_row["session_id"])
+            if actual_epoch != expected_epoch or (
+                expected_session_id is not None
+                and actual_session_id != expected_session_id
+            ):
                 await self._raise_stale_epoch(
                     conn,
                     session_key=stable_key,
                     expected_epoch=expected_epoch,
                 )
-            session_id = str(session_row["session_id"])
+            session_id = actual_session_id
 
             async with conn.execute(
                 """
@@ -4200,7 +4205,7 @@ class SessionStorage:
                     + max(0, int(live["estimated_cost_entries"] or 0))
                 ),
             )
-            await conn.execute(
+            cursor = await conn.execute(
                 """
                 UPDATE sessions
                 SET input_tokens = ?, output_tokens = ?, total_tokens = ?,
@@ -4210,7 +4215,7 @@ class SessionStorage:
                     cache_read = ?, cache_write = ?,
                     model_override = COALESCE(?, model_override),
                     model_provider = COALESCE(?, model_provider)
-                WHERE session_key = ? AND epoch = ?
+                WHERE session_key = ? AND session_id = ? AND epoch = ?
                 """,
                 (
                     input_tokens,
@@ -4235,9 +4240,16 @@ class SessionStorage:
                         else None
                     ),
                     stable_key,
+                    session_id,
                     expected_epoch,
                 ),
             )
+            if int(cursor.rowcount or 0) != 1:
+                await self._raise_stale_epoch(
+                    conn,
+                    session_key=stable_key,
+                    expected_epoch=expected_epoch,
+                )
             async with conn.execute(
                 "SELECT * FROM sessions WHERE session_key = ?",
                 (stable_key,),
@@ -5110,18 +5122,23 @@ class SessionStorage:
         node: SessionNode,
         *,
         expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> None:
         """Insert or update a session, optionally fencing an existing generation.
 
-        ``expected_session_id`` is for delayed mutations of an already-read
-        session. When supplied, a missing row or a different session id raises
-        ``KeyError`` inside the write transaction, before the UPSERT can recreate
-        a deleted row or overwrite a same-key replacement. Omitting it preserves
-        the create/repair behavior of the legacy UPSERT.
+        The expected owner is for delayed mutations of an already-read session.
+        When supplied, a missing row or a different owner raises ``KeyError``
+        inside the write transaction, before the UPSERT can recreate a deleted
+        row or overwrite a same-key replacement. Omitting it preserves the
+        create/repair behavior of the legacy UPSERT.
         """
 
         node.session_key = canonicalize_session_key(node.session_key)
         node.agent_id = normalize_agent_id(node.agent_id)
+        _validate_optional_session_owner(
+            session_id=expected_session_id,
+            session_epoch=expected_session_epoch,
+        )
         data = node.model_dump()
         cols = list(data.keys())
         placeholders = ", ".join("?" for _ in cols)
@@ -5158,16 +5175,21 @@ class SessionStorage:
                     int(previous_identity["model_routing_revision"] or 0),
                 )
             if expected_session_id is not None:
-                if node.session_id != expected_session_id:
+                if node.session_id != expected_session_id or (
+                    expected_session_epoch is not None
+                    and int(node.epoch or 0) != expected_session_epoch
+                ):
                     raise KeyError(
                         f"Session generation changed: {node.session_key}"
                     )
-                async with conn.execute(
-                    "SELECT session_id FROM sessions WHERE session_key = ?",
-                    (node.session_key,),
-                ) as cursor:
-                    row = await cursor.fetchone()
-                if row is None or str(row["session_id"]) != expected_session_id:
+                if previous_identity is None or (
+                    str(previous_identity["session_id"]) != expected_session_id
+                    or (
+                        expected_session_epoch is not None
+                        and int(previous_identity["epoch"] or 0)
+                        != expected_session_epoch
+                    )
+                ):
                     raise KeyError(
                         f"Session generation changed: {node.session_key}"
                     )
@@ -9071,6 +9093,7 @@ class SessionStorage:
         receipt: MemoryDurableReceipt,
         *,
         expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> MemoryDurableReceipt:
         """Upsert a receipt, optionally requiring its live session generation.
 
@@ -9080,6 +9103,10 @@ class SessionStorage:
         """
 
         receipt.session_key = canonicalize_session_key(receipt.session_key)
+        _validate_optional_session_owner(
+            session_id=expected_session_id,
+            session_epoch=expected_session_epoch,
+        )
         receipt.updated_at = _now_ms()
         data = receipt.model_dump()
         cols = list(data.keys())
@@ -9097,11 +9124,18 @@ class SessionStorage:
                         f"Session generation changed: {receipt.session_key}"
                     )
                 async with conn.execute(
-                    "SELECT session_id FROM sessions WHERE session_key = ?",
+                    "SELECT session_id, epoch FROM sessions WHERE session_key = ?",
                     (receipt.session_key,),
                 ) as cursor:
                     row = await cursor.fetchone()
-                if row is None or str(row["session_id"]) != expected_session_id:
+                if (
+                    row is None
+                    or str(row["session_id"]) != expected_session_id
+                    or (
+                        expected_session_epoch is not None
+                        and int(row["epoch"] or 0) != expected_session_epoch
+                    )
+                ):
                     raise KeyError(
                         f"Session generation changed: {receipt.session_key}"
                     )

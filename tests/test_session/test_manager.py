@@ -698,6 +698,35 @@ async def test_update_fields(manager):
 
 
 @pytest.mark.asyncio
+async def test_update_expected_owner_rejects_epoch_change_before_write(
+    manager,
+    monkeypatch,
+):
+    key = "agent:main:update-owner-race"
+    admitted = await manager.create(key)
+    original_upsert = manager._storage.upsert_session
+
+    async def advance_epoch_before_upsert(node, **kwargs):
+        await manager._storage.increment_epoch(key)
+        return await original_upsert(node, **kwargs)
+
+    monkeypatch.setattr(manager._storage, "upsert_session", advance_epoch_before_upsert)
+
+    with pytest.raises(KeyError, match="Session generation changed"):
+        await manager.update(
+            key,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=int(admitted.epoch or 0),
+            display_name="Late title",
+        )
+
+    persisted = await manager.get_session(key)
+    assert persisted is not None
+    assert persisted.epoch == 1
+    assert persisted.display_name != "Late title"
+
+
+@pytest.mark.asyncio
 async def test_finish_sets_status(manager):
     await manager.create("agent:main:main")
     node = await manager.finish("agent:main:main")
@@ -2952,6 +2981,61 @@ async def test_compact_with_result_skips_rewrite_when_transcript_changes(manager
     assert await manager.get_summaries("agent:main:main") == []
     transcript = await manager.get_transcript("agent:main:main")
     assert [entry.content for entry in transcript] == original_contents + ["late queued followup"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rotate_on_entry", "operation"),
+    [(1, "compaction snapshot"), (2, "compaction commit")],
+)
+async def test_compact_with_result_rejects_owner_rotated_at_exact_boundaries(
+    manager,
+    tmp_path,
+    monkeypatch,
+    rotate_on_entry,
+    operation,
+):
+    key = "agent:main:main"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    admitted = await manager.create(key)
+    for i in range(20):
+        await manager.append_message(
+            key,
+            "user",
+            f"msg {i} " + ("x" * 500),
+            token_count=200,
+        )
+    context_entries = 0
+    replacement = None
+
+    @contextlib.asynccontextmanager
+    async def mutation_context():
+        nonlocal context_entries, replacement
+        context_entries += 1
+        if context_entries == rotate_on_entry:
+            replacement, rotated = await manager.apply_intent(
+                key,
+                SessionIntent.RESET_SAME_KEY,
+            )
+            assert rotated is True
+        yield
+
+    with pytest.raises(StaleEpochError, match=operation):
+        await manager.compact_with_result(
+            key,
+            context_window_tokens=1000,
+            mutation_context=mutation_context,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=int(admitted.epoch or 0),
+        )
+
+    assert replacement is not None
+    current = await manager.get_session(key)
+    assert current is not None
+    assert current.session_id == replacement.session_id
+    assert current.compaction_count == 0
+    assert await manager.get_transcript(key) == []
+    assert await manager.get_summaries(key) == []
 
 
 @pytest.mark.asyncio

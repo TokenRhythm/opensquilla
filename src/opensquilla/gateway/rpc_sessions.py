@@ -9750,7 +9750,18 @@ async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[s
 
                 quiesce_runtime = getattr(task_runtime, "quiesce_sessions", None)
                 if callable(quiesce_runtime):
-                    await fences.enter_async_context(quiesce_runtime(session_keys))
+                    quiesce_kwargs: dict[str, str] = {}
+                    if all(
+                        _accepts_keyword_arg(quiesce_runtime, name)
+                        for name in ("cancel_source", "cancel_reason")
+                    ):
+                        quiesce_kwargs = {
+                            "cancel_source": "sessions_reset",
+                            "cancel_reason": "session_reset",
+                        }
+                    await fences.enter_async_context(
+                        quiesce_runtime(session_keys, **quiesce_kwargs)
+                    )
 
                 await fences.enter_async_context(
                     get_agent_task_registry().quiesce_sessions(session_keys)

@@ -102,6 +102,8 @@ class _CompactionSingleflightKey:
     """Secret-free identity for one frozen durable compaction input."""
 
     session_key: str
+    expected_session_id: str | None
+    expected_session_epoch: int | None
     frozen_prefix_hash: str
     target_fingerprint: str
 
@@ -126,6 +128,33 @@ _COMPACTION_SINGLEFLIGHTS: dict[
     tuple[asyncio.AbstractEventLoop, int, _CompactionSingleflightKey],
     _CompactionSingleflight,
 ] = {}
+
+
+def _require_expected_session_owner(
+    node: SessionNode,
+    *,
+    expected_session_id: str | None,
+    expected_session_epoch: int | None,
+    operation: str,
+) -> None:
+    supplied = expected_session_id is not None or expected_session_epoch is not None
+    if not supplied:
+        return
+    if (
+        not isinstance(expected_session_id, str)
+        or not expected_session_id
+        or not isinstance(expected_session_epoch, int)
+        or isinstance(expected_session_epoch, bool)
+        or expected_session_epoch < 0
+    ):
+        raise ValueError(
+            "expected_session_id and expected_session_epoch must form a valid pair"
+        )
+    if (
+        node.session_id != expected_session_id
+        or int(node.epoch or 0) != expected_session_epoch
+    ):
+        raise StaleEpochError(f"Session owner changed before {operation}")
 
 
 def _acquire_compaction_singleflight(
@@ -1174,12 +1203,25 @@ class SessionManager:
         )
         return node
 
-    async def update(self, session_key: str, **fields: Any) -> SessionNode:
+    async def update(
+        self,
+        session_key: str,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+        **fields: Any,
+    ) -> SessionNode:
         """Merge fields into an existing session and persist."""
         session_key = canonicalize_session_key(session_key)
         node = await self._storage.get_session(session_key)
         if node is None:
             raise KeyError(f"Session not found: {session_key}")
+        _require_expected_session_owner(
+            node,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+            operation="update",
+        )
         for k, v in fields.items():
             if hasattr(node, k):
                 setattr(node, k, v)
@@ -1187,6 +1229,12 @@ class SessionManager:
         await self._storage.upsert_session(
             node,
             expected_session_id=node.session_id,
+            expected_session_epoch=(
+                expected_session_epoch
+                if expected_session_id is not None
+                or expected_session_epoch is not None
+                else None
+            ),
         )
         return node
 
@@ -2348,6 +2396,8 @@ class SessionManager:
         turn_id: str | None = None,
         source: str = "session_manager",
         compaction_config: CompactionConfig | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> MemoryDurableReceipt:
         """Persist a durable transcript checkpoint receipt before compaction."""
         from opensquilla.memory.checkpoint import (
@@ -2372,6 +2422,12 @@ class SessionManager:
         )
         if node is None:
             raise KeyError(f"Session not found: {session_key}")
+        _require_expected_session_owner(
+            node,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+            operation="memory checkpoint",
+        )
         if transcript is not None:
             entries = list(transcript)
         else:
@@ -2450,6 +2506,7 @@ class SessionManager:
                 persist_failure = self._storage.upsert_memory_durable_receipt(
                     receipt,
                     expected_session_id=node.session_id,
+                    expected_session_epoch=int(node.epoch or 0),
                 )
                 if compaction_config is None:
                     await persist_failure
@@ -2494,6 +2551,7 @@ class SessionManager:
         persisted_call = self._storage.upsert_memory_durable_receipt(
             receipt,
             expected_session_id=node.session_id,
+            expected_session_epoch=int(node.epoch or 0),
         )
         persisted = (
             await await_compaction_phase(
@@ -2717,6 +2775,8 @@ class SessionManager:
         consumer_admission: Callable[[str, list[dict[str, Any]]], Any] | None = None,
         consumer_admission_fingerprint: str = "",
         protected_boundary_message_id: str | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> CompactionResult:
         """Compact the session transcript and return full compaction metadata."""
 
@@ -2739,6 +2799,12 @@ class SessionManager:
             )
             if node is None:
                 raise KeyError(f"Session not found: {session_key}")
+            _require_expected_session_owner(
+                node,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+                operation="compaction snapshot",
+            )
 
             entries = await await_compaction_phase(
                 self._storage.get_transcript(node.session_id),
@@ -2802,6 +2868,8 @@ class SessionManager:
 
         singleflight_key = _CompactionSingleflightKey(
             session_key=session_key,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
             frozen_prefix_hash=_frozen_compaction_prefix_hash(
                 preimage=preimage,
                 previous_summary=previous_summary,
@@ -2837,6 +2905,8 @@ class SessionManager:
                 mutation_context=mutation_context,
                 provider_request_correlation=provider_request_correlation,
                 consumer_admission=consumer_admission,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
             ),
         )
         if is_owner:
@@ -2879,6 +2949,8 @@ class SessionManager:
         mutation_context: Callable[[], contextlib.AbstractAsyncContextManager[None]] | None,
         provider_request_correlation: ProviderRequestCorrelation | None,
         consumer_admission: Callable[[str, list[dict[str, Any]]], Any] | None,
+        expected_session_id: str | None,
+        expected_session_epoch: int | None,
     ) -> CompactionResult:
         """Generate and atomically install one frozen compaction candidate."""
 
@@ -2943,6 +3015,12 @@ class SessionManager:
             )
             if current_node is None:
                 raise KeyError(f"Session not found: {session_key}")
+            _require_expected_session_owner(
+                current_node,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+                operation="compaction commit",
+            )
             current_entries = await await_compaction_phase(
                 self._storage.get_transcript(current_node.session_id),
                 effective_config,
