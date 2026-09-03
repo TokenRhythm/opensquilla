@@ -1001,6 +1001,7 @@ def test_r5_gateway_adapters_depend_on_typed_ports_not_rpc_callbacks() -> None:
         "GatewayCronCallbacks",
         "GatewayLogReaderPort",
         "GatewayReadinessDataPort",
+        "GatewayReadinessEvaluationPort",
         "GatewayRouterLearningStatusPort",
         "GatewaySkillCatalogReadPort",
         "GatewaySkillManagementPort",
@@ -1031,6 +1032,33 @@ def test_r5_gateway_adapters_depend_on_typed_ports_not_rpc_callbacks() -> None:
                         violations.append(f"{relative}:{node.lineno}: imports {alias.name}")
 
     assert violations == [], "R5 Gateway callback seams returned:\n" + "\n".join(violations)
+
+
+def test_observability_readiness_ports_return_typed_findings() -> None:
+    path = PACKAGE_ROOT / "application" / "observability.py"
+    tree = _tree(path)
+    data_port = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "ReadinessDataPort"
+    )
+    methods = [
+        node
+        for node in data_port.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+    assert methods
+    assert {
+        ast.unparse(method.returns) if method.returns is not None else ""
+        for method in methods
+    } == {"Sequence[ReadinessFinding]"}
+    assert not any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "typing"
+        and any(alias.name == "Any" for alias in node.names)
+        for node in ast.walk(tree)
+    )
 
 
 def test_r5_rpc_factories_bind_concrete_typed_runtime_ports() -> None:

@@ -11,11 +11,13 @@ from opensquilla.application.observability import (
 from opensquilla.application.observability import (
     ReadinessDataPort,
     ReadinessDiagnostics,
+    ReadinessFinding,
     ReadinessQuery,
 )
 from opensquilla.application.provider_configuration import ProviderStatus
 from opensquilla.gateway.adapters.observability import (
-    GatewayReadinessEvaluationPort,
+    GatewayReadinessReportPort,
+    evaluate_readiness_surface,
 )
 from opensquilla.gateway.adapters.observability_contract import (
     register_observability_contract,
@@ -334,9 +336,7 @@ def _router_payload(ctx: RpcContext, *, deep: bool = False) -> dict[str, Any]:
         "error": error,
         "activeProvider": active_provider,
         "crossProviderTiers": bool(getattr(router, "cross_provider_tiers", False)),
-        "tierProviderMismatch": str(
-            getattr(router, "tier_provider_mismatch", "route") or "route"
-        ),
+        "tierProviderMismatch": str(getattr(router, "tier_provider_mismatch", "route") or "route"),
         "mismatchedTierProviders": mismatched_tier_providers,
         "routerProviderRoles": provider_roles,
     }
@@ -403,27 +403,21 @@ def _llm_ensemble_payload(ctx: RpcContext) -> dict[str, Any]:
             decorated["apiKeyEnv"] = str(
                 get_provider_spec(static_profile.provider_id).env_key or ""
             )
-            decorated["credentialAvailable"] = bool(
-                decorated["configurationReady"]
-            )
+            decorated["credentialAvailable"] = bool(decorated["configurationReady"])
         elif decorated["enabled"] and decorated["selectionMode"] == CUSTOM_B5_SELECTION_MODE:
             decorated["lineupReady"] = bool(decorated["configurationReady"])
-            decorated["lineupBlockedReason"] = str(
-                decorated["blockedReason"] or ""
-            )
+            decorated["lineupBlockedReason"] = str(decorated["blockedReason"] or "")
         return decorated
 
     payload = decorate(ensemble_runtime_status(config))
     configured_policy = str(
-        getattr(config.llm_ensemble, "all_failed_policy", "fallback_single")
-        or "fallback_single"
+        getattr(config.llm_ensemble, "all_failed_policy", "fallback_single") or "fallback_single"
     ).strip()
     payload.setdefault("configuredAllFailedPolicy", configured_policy)
     payload.setdefault("effectiveAllFailedPolicy", configured_policy)
     payload.setdefault("policyDeprecated", False)
     payload["tierEnsembleStatuses"] = {
-        tier: decorate(runtime)
-        for tier, runtime in tier_ensemble_runtime_statuses(config).items()
+        tier: decorate(runtime) for tier, runtime in tier_ensemble_runtime_statuses(config).items()
     }
     return payload
 
@@ -469,16 +463,14 @@ def _memory_embedding_payload(ctx: RpcContext) -> dict[str, Any]:
     }
 
 
-async def _doctor_status_contract(
-    params: dict | None, ctx: RpcContext
-) -> dict[str, Any]:
+async def _doctor_status_contract(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if params is not None and not isinstance(params, dict):
         raise ValueError("params must be an object")
     params = params or {}
     port = _GatewayReadinessRuntime(ctx)
     return cast(
         dict[str, Any],
-        await ReadinessDiagnostics(port, GatewayReadinessEvaluationPort()).assess(
+        await ReadinessDiagnostics(port, GatewayReadinessReportPort()).assess(
             ReadinessQuery(
                 agent_id=str(params.get("agentId") or "main"),
                 deep=bool(params.get("deep", True)),
@@ -496,46 +488,53 @@ class _GatewayReadinessRuntime(ReadinessDataPort):
     def __init__(self, ctx: RpcContext) -> None:
         self._ctx = ctx
 
-    async def provider(self, query: ReadinessQuery) -> dict[str, Any]:
-        return await _readiness_provider(query, self._ctx)
+    @staticmethod
+    def _findings(
+        surface: str,
+        payload: dict[str, Any],
+    ) -> tuple[ReadinessFinding, ...]:
+        return evaluate_readiness_surface(surface, payload)
 
-    async def logs(self, query: ReadinessQuery) -> dict[str, Any]:
+    async def provider(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
+        return self._findings("provider", await _readiness_provider(query, self._ctx))
+
+    async def logs(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
         del query
-        return _build_logs_status(self._ctx)
+        return self._findings("logs", _build_logs_status(self._ctx))
 
-    async def memory(self, query: ReadinessQuery) -> dict[str, Any]:
-        return await _readiness_memory(query, self._ctx)
+    async def memory(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
+        return self._findings("memory", await _readiness_memory(query, self._ctx))
 
-    async def channels(self, query: ReadinessQuery) -> dict[str, Any]:
+    async def channels(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
         del query
-        return await _channel_payload(None, self._ctx)
+        return self._findings("channels", await _channel_payload(None, self._ctx))
 
-    async def sandbox(self, query: ReadinessQuery) -> dict[str, Any]:
+    async def sandbox(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
         del query
-        return _sandbox_payload(self._ctx)
+        return self._findings("sandbox", _sandbox_payload(self._ctx))
 
-    async def router(self, query: ReadinessQuery) -> dict[str, Any]:
-        return _router_payload(self._ctx, deep=bool(query.deep))
+    async def router(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
+        return self._findings("router", _router_payload(self._ctx, deep=bool(query.deep)))
 
-    async def squilla_router(self, query: ReadinessQuery) -> dict[str, Any]:
+    async def squilla_router(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
         del query
-        return _squilla_router_runtime_payload(self._ctx)
+        return self._findings("squilla_router", _squilla_router_runtime_payload(self._ctx))
 
-    async def memory_embedding(self, query: ReadinessQuery) -> dict[str, Any]:
+    async def memory_embedding(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
         del query
-        return _memory_embedding_payload(self._ctx)
+        return self._findings("memory_embedding", _memory_embedding_payload(self._ctx))
 
-    async def search(self, query: ReadinessQuery) -> dict[str, Any]:
+    async def search(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
         del query
-        return await _search_payload(None, self._ctx)
+        return self._findings("search", await _search_payload(None, self._ctx))
 
-    async def image_generation(self, query: ReadinessQuery) -> dict[str, Any]:
+    async def image_generation(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
         del query
-        return _image_generation_payload(self._ctx)
+        return self._findings("image_generation", _image_generation_payload(self._ctx))
 
-    async def llm_ensemble(self, query: ReadinessQuery) -> dict[str, Any]:
+    async def llm_ensemble(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
         del query
-        return _llm_ensemble_payload(self._ctx)
+        return self._findings("llm_ensemble", _llm_ensemble_payload(self._ctx))
 
 
 _handle_doctor_status = register_observability_contract(

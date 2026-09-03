@@ -5,15 +5,15 @@ from __future__ import annotations
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
-from typing import Any, cast
+from typing import cast
 
 from opensquilla import __version__
 from opensquilla.agent_ids import normalize_agent_id
 from opensquilla.application.observability import (
-    ReadinessEvaluationPort,
     ReadinessFinding,
     ReadinessFixStep,
     ReadinessReport,
+    ReadinessReportPort,
     RuntimeStatusPort,
     RuntimeStatusResult,
 )
@@ -89,17 +89,21 @@ _READINESS_EVALUATORS = {
 }
 
 
-class GatewayReadinessEvaluationPort(ReadinessEvaluationPort):
+def evaluate_readiness_surface(
+    surface: str,
+    payload: Mapping[str, object],
+) -> tuple[ReadinessFinding, ...]:
+    """Translate one Gateway-owned health payload into domain findings."""
+
+    return tuple(
+        _to_application_finding(finding)
+        for finding in _READINESS_EVALUATORS[surface](dict(payload))
+    )
+
+
+class GatewayReadinessReportPort(ReadinessReportPort):
     def normalize_agent_id(self, value: str) -> str:
         return normalize_agent_id(value)
-
-    def evaluate(
-        self, surface: str, payload: Mapping[str, Any]
-    ) -> Sequence[ReadinessFinding]:
-        return tuple(
-            _to_application_finding(finding)
-            for finding in _READINESS_EVALUATORS[surface](dict(payload))
-        )
 
     def build_report(
         self,
@@ -159,6 +163,7 @@ def _to_health_finding(finding: ReadinessFinding) -> HealthFinding:
 
 
 __all__ = [
-    "GatewayReadinessEvaluationPort",
+    "GatewayReadinessReportPort",
     "GatewayRuntimeStatusPort",
+    "evaluate_readiness_surface",
 ]
