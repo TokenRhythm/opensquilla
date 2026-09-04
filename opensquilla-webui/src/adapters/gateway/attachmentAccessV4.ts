@@ -7,6 +7,12 @@ import type {
 import {
   HttpTransportError,
 } from './privateHttpTransport'
+import {
+  artifactHttpAttachmentUrl,
+  bindAttachmentBinaryRequest,
+  runtimeAttachmentHttpBaseOrigin,
+  uploadArtifactAttachment,
+} from './privateArtifactHttpTransport'
 
 interface AttachmentBinaryResponse {
   readonly metadata: {
@@ -51,32 +57,13 @@ type AttachmentDownloadResult =
       message: string
     }
 
-const DEFAULT_BASE_ORIGIN = 'http://localhost'
-const CREDENTIAL_QUERY_KEYS = /(token|session)/i
-
 export function attachmentAccessUrl(raw: unknown, baseOrigin: string): string {
-  if (typeof raw !== 'string' || !raw.trim()) return ''
-  try {
-    const base = new URL(baseOrigin)
-    const url = new URL(raw, base)
-    if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.origin !== base.origin) {
-      return ''
-    }
-    if (url.username || url.password) return ''
-    for (const key of [...url.searchParams.keys()]) {
-      if (CREDENTIAL_QUERY_KEYS.test(key)) url.searchParams.delete(key)
-    }
-    url.hash = ''
-    return url.pathname + url.search
-  } catch {
-    return ''
-  }
+  return artifactHttpAttachmentUrl(raw, baseOrigin)
 }
 
 function resolveBaseOrigin(baseOrigin?: string): string {
   if (baseOrigin) return baseOrigin
-  if (typeof window !== 'undefined' && window.location?.origin) return window.location.origin
-  return DEFAULT_BASE_ORIGIN
+  return runtimeAttachmentHttpBaseOrigin()
 }
 
 function safeFilename(value: unknown): string {
@@ -140,8 +127,8 @@ export async function fetchDisplayAttachmentBlob(
   }
 
   const baseOrigin = resolveBaseOrigin(options.baseOrigin)
-  const url = attachmentAccessUrl(attachment.download_url, baseOrigin)
-  if (!url) {
+  const request = bindAttachmentBinaryRequest(http, attachment.download_url, { baseOrigin })
+  if (!request) {
     return {
       ok: false,
       status: 0,
@@ -152,9 +139,10 @@ export async function fetchDisplayAttachmentBlob(
         : 'Attachment is no longer available.',
     }
   }
+  const url = request.url
 
   try {
-    const response = await http.requestBinary(url, {
+    const response = await request.execute({
       sessionKey: options.sessionKey,
       signal: options.signal,
       timeoutMs: 0,
@@ -211,9 +199,7 @@ function uploadResponseMeta(value: unknown): AttachmentUploadReceipt {
 
 function runtimeOptions(request: ArtifactAccessRequest = {}): AttachmentDownloadOptions {
   return {
-    baseOrigin: typeof window !== 'undefined' && window.location?.origin
-      ? window.location.origin
-      : DEFAULT_BASE_ORIGIN,
+    baseOrigin: runtimeAttachmentHttpBaseOrigin(),
     sessionKey: request.sessionKey,
     signal: request.signal,
   }
@@ -231,10 +217,7 @@ export function createV4AttachmentContentAccess(http: AttachmentHttpTransport): 
       const form = new FormData()
       form.append('file', file, file.name)
       form.append('mime', mime)
-      return uploadResponseMeta(await http.requestJson('/api/v1/files/upload', {
-        method: 'POST',
-        form,
-      }))
+      return uploadResponseMeta(await uploadArtifactAttachment(http, form))
     },
   }
 }

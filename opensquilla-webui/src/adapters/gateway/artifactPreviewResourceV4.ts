@@ -8,10 +8,10 @@ import type {
 import type { ArtifactPayload } from '@/types/artifacts'
 import { artifactExtension, artifactName } from '@/utils/chat/artifacts'
 import {
-  artifactAccessUrl,
-  isTrustedArtifactTransportUrl,
-  runtimeArtifactBaseOrigin,
-} from './artifactAccessV4'
+  artifactHttpAccessUrl,
+  bindArtifactBinaryRequest,
+  runtimeArtifactHttpBaseOrigin,
+} from './privateArtifactHttpTransport'
 import {
   HttpTransportError,
 } from './privateHttpTransport'
@@ -68,7 +68,7 @@ const GENERIC_IMAGE_MIME_BY_EXTENSION: Record<string, string> = {
 }
 
 function defaultBaseOrigin(): string {
-  return runtimeArtifactBaseOrigin()
+  return runtimeArtifactHttpBaseOrigin()
 }
 
 function isInlineWorkbenchAttachmentUrl(artifact: ArtifactPayload, url: string): boolean {
@@ -345,9 +345,15 @@ export function createArtifactPreviewResource(
     }
 
     const baseOrigin = options.baseOrigin?.() || defaultBaseOrigin()
-    const url = artifactAccessUrl(artifact, baseOrigin)
+    const url = artifactHttpAccessUrl(artifact, baseOrigin)
     const inlineAttachment = isInlineWorkbenchAttachmentUrl(artifact, url)
-    if (!url || (!inlineAttachment && !isTrustedArtifactTransportUrl(url, baseOrigin))) {
+    const request = inlineAttachment
+      ? null
+      : bindArtifactBinaryRequest(http, artifact, {
+        baseOrigin,
+        policy: 'trusted-origin',
+      })
+    if (!url || (!inlineAttachment && !request)) {
       setFailure('error', 'missing-url')
       return
     }
@@ -362,7 +368,7 @@ export function createArtifactPreviewResource(
       if (inlineAttachment) {
         response = inlineWorkbenchAttachmentResponse(url, limit)
       } else {
-        response = await http.requestBinary(url, {
+        response = await request!.execute({
           sessionKey: options.sessionKey?.() || '',
           signal: controller.signal,
           timeoutMs: 0,

@@ -113,6 +113,11 @@ function resolveBaseUrl(value?: string | URL): URL {
   throw invalidEndpoint('Gateway HTTP base URL is unavailable.')
 }
 
+function isDesktopGatewayUrl(url: URL): boolean {
+  return url.protocol === 'opensquilla-app:' && url.hostname === 'desktop'
+    && !(url.port || url.username || url.password)
+}
+
 function resolveEndpoint(baseUrl: URL, endpoint: string): URL {
   if (typeof endpoint !== 'string') throw invalidEndpoint('Gateway HTTP endpoint is invalid.')
   const candidate = endpoint.trim()
@@ -123,12 +128,12 @@ function resolveEndpoint(baseUrl: URL, endpoint: string): URL {
   } catch (cause) {
     throw invalidEndpoint('Gateway HTTP endpoint is invalid.', cause)
   }
-  if (
-    (resolved.protocol !== 'http:' && resolved.protocol !== 'https:')
-    || resolved.origin !== baseUrl.origin
-    || resolved.username
-    || resolved.password
-  ) {
+  // Opaque origins cannot establish authority: compare the Desktop fields explicitly.
+  const sameGateway = isDesktopGatewayUrl(baseUrl) && isDesktopGatewayUrl(resolved)
+    ? resolved.pathname === '/api' || resolved.pathname.startsWith('/api/')
+    : (resolved.protocol === 'http:' || resolved.protocol === 'https:')
+      && resolved.origin === baseUrl.origin
+  if (!sameGateway || resolved.username || resolved.password) {
     throw invalidEndpoint('Gateway HTTP endpoint must stay on the configured origin.')
   }
   return resolved
@@ -273,29 +278,18 @@ function isHttpMethod(value: unknown): value is HttpMethod {
 function isFormBody(value: unknown): value is FormData | URLSearchParams {
   if (value === null || typeof value !== 'object') return false
   try {
-    if (typeof FormData === 'function' && FormData.prototype) {
-      // Calling a native method performs the platform's internal-slot brand
-      // check. Do not trust Symbol.toStringTag or an object's own prototype:
-      // both are user-controlled and can make a plain object look like a form.
-      const get = FormData.prototype.get
-      if (typeof get === 'function') {
-        try {
-          get.call(value, '')
-          return true
-        } catch {
-          // Not a FormData instance; try URLSearchParams below.
-        }
-      }
-    }
-    if (typeof URLSearchParams === 'function' && URLSearchParams.prototype) {
-      const get = URLSearchParams.prototype.get
-      if (typeof get === 'function') {
-        try {
-          get.call(value, '')
-          return true
-        } catch {
-          // A spoofed prototype/tag is not a supported form body.
-        }
+    // Native internal-slot checks reject spoofed prototypes and toStringTag values.
+    // Resolve each constructor lazily so a successful FormData check needs no fallback.
+    for (const name of ['FormData', 'URLSearchParams'] as const) {
+      const constructor = globalThis[name]
+      if (typeof constructor !== 'function') continue
+      const get = constructor.prototype?.get
+      if (typeof get !== 'function') continue
+      try {
+        get.call(value, '')
+        return true
+      } catch {
+        // Not this native form type; try the remaining brand.
       }
     }
   } catch {

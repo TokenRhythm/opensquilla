@@ -11,6 +11,15 @@ import type { ArtifactPayload } from '@/types/artifacts'
 import {
   HttpTransportError,
 } from './privateHttpTransport'
+import {
+  artifactHttpBrokerAuthToken,
+  artifactHttpPreviewId,
+  createArtifactPreviewLeaseHttp,
+  renewArtifactPreviewLeaseHttp,
+  resolveArtifactPreviewLaunch,
+  revokeArtifactPreviewLeaseHttp,
+  validArtifactPreviewLeaseId,
+} from './privateArtifactHttpTransport'
 
 interface ArtifactPreviewLeaseHttpTransport {
   requestJson<T>(endpoint: string, options: {
@@ -33,58 +42,11 @@ interface ArtifactPreviewLeaseContext extends ArtifactPreviewLeaseRequest {
 }
 
 export function artifactPreviewId(artifact: ArtifactPayload): string {
-  const direct = typeof artifact.id === 'string' ? artifact.id.trim() : ''
-  if (direct) return direct
-  const downloadUrl = typeof artifact.download_url === 'string' ? artifact.download_url : ''
-  const match = downloadUrl.match(/\/api\/v1\/artifacts\/([^/?#]+)/)
-  if (!match) return ''
-  try {
-    return decodeURIComponent(match[1])
-  } catch {
-    return ''
-  }
-}
-
-function normalizedBaseOrigin(baseOrigin: string): string {
-  const fallback = typeof window === 'undefined'
-    ? 'http://localhost'
-    : window.location.origin
-  return new URL(baseOrigin || fallback).origin
+  return artifactHttpPreviewId(artifact)
 }
 
 function resolvedAuthToken(context: ArtifactPreviewLeaseContext): string {
-  if (context.authToken !== undefined) return context.authToken
-  try {
-    return globalThis.sessionStorage?.getItem('opensquilla.wsToken')?.trim() || ''
-  } catch {
-    return ''
-  }
-}
-
-function previewLeaseUrl(
-  artifact: ArtifactPayload,
-  context: ArtifactPreviewLeaseContext,
-): string {
-  const id = artifactPreviewId(artifact)
-  if (!id) throw new ArtifactPreviewLeaseError('Artifact preview is unavailable.', 0)
-  return new URL(
-    `/api/v1/artifacts/${encodeURIComponent(id)}/preview-leases`,
-    normalizedBaseOrigin(context.baseOrigin),
-  ).toString()
-}
-
-function leaseControlUrl(
-  leaseId: string,
-  context: ArtifactPreviewLeaseContext,
-  suffix = '',
-): string {
-  if (!leaseId || /[\u0000-\u001f/\\]/.test(leaseId)) {
-    throw new ArtifactPreviewLeaseError('Artifact preview lease is invalid.', 0)
-  }
-  return new URL(
-    `/api/v1/artifact-preview-leases/${encodeURIComponent(leaseId)}${suffix}`,
-    normalizedBaseOrigin(context.baseOrigin),
-  ).toString()
+  return artifactHttpBrokerAuthToken(context.authToken)
 }
 
 function transportError(error: HttpTransportError): ArtifactPreviewLeaseError {
@@ -157,10 +119,11 @@ export function parseArtifactPreviewLease(
   const leaseId = stringField(raw, 'lease_id')
   const entrypoint = stringField(raw, 'entrypoint')
   const expiresAt = stringField(raw, 'expires_at')
-  let launch: URL
-  try {
-    launch = new URL(launchUrl, normalizedBaseOrigin(baseOrigin))
-  } catch {
+  const previewOrigin = typeof raw.preview_origin === 'string' && raw.preview_origin
+    ? raw.preview_origin
+    : null
+  const launch = resolveArtifactPreviewLaunch(launchUrl, previewOrigin, baseOrigin)
+  if (!launch.ok && launch.reason === 'syntax') {
     throw new ArtifactPreviewLeaseError('Artifact preview returned an invalid launch URL.', 502)
   }
   if (
@@ -168,30 +131,18 @@ export function parseArtifactPreviewLease(
     || !leaseId
     || !entrypoint
     || !expiresAt
-    || !['http:', 'https:'].includes(launch.protocol)
-    || launch.username
-    || launch.password
+    || (!launch.ok && launch.reason === 'url')
   ) {
     throw new ArtifactPreviewLeaseError('Artifact preview returned an invalid lease.', 502)
   }
-  const previewOrigin = typeof raw.preview_origin === 'string' && raw.preview_origin
-    ? raw.preview_origin
-    : null
-  if (previewOrigin !== null && previewOrigin !== launch.origin) {
-    throw new ArtifactPreviewLeaseError('Artifact preview returned an invalid origin.', 502)
-  }
-  if (
-    previewOrigin === null
-    && baseOrigin
-    && launch.origin !== normalizedBaseOrigin(baseOrigin)
-  ) {
+  if (!launch.ok) {
     throw new ArtifactPreviewLeaseError('Artifact preview returned an invalid origin.', 502)
   }
   return {
     version: 1,
     lease_id: leaseId,
     effective_mode: effectiveMode,
-    launch_url: launch.toString(),
+    launch_url: launch.url,
     entrypoint,
     expires_at: expiresAt,
     preview_origin: previewOrigin,
@@ -274,14 +225,18 @@ export async function createArtifactPreviewLease(
     if (!result.ok) throw brokerError(result)
     return parseArtifactPreviewLease(result.payload, context.baseOrigin)
   }
-  const url = previewLeaseUrl(artifact, context)
+  const artifactId = artifactPreviewId(artifact)
+  if (!artifactId) {
+    throw new ArtifactPreviewLeaseError('Artifact preview is unavailable.', 0)
+  }
   try {
-    const payload = await http.requestJson<unknown>(url, {
-      method: 'POST',
-      json: { version: 1, mode, client },
-      sessionKey: context.sessionKey,
-      timeoutMs: 0,
-    })
+    const payload = await createArtifactPreviewLeaseHttp<unknown>(
+      http,
+      artifactId,
+      mode,
+      client,
+      context,
+    )
     return parseArtifactPreviewLease(payload, context.baseOrigin)
   } catch (error) {
     translateTransportError(error)
@@ -311,13 +266,11 @@ export async function renewArtifactPreviewLease(
     if (!result.ok) throw brokerError(result)
     return parseArtifactPreviewLeaseRenewal(result.payload)
   }
-  const url = leaseControlUrl(leaseId, context, '/renew')
+  if (!validArtifactPreviewLeaseId(leaseId)) {
+    throw new ArtifactPreviewLeaseError('Artifact preview lease is invalid.', 0)
+  }
   try {
-    const payload = await http.requestJson<unknown>(url, {
-      method: 'POST',
-      sessionKey: context.sessionKey,
-      timeoutMs: 0,
-    })
+    const payload = await renewArtifactPreviewLeaseHttp<unknown>(http, leaseId, context)
     return parseArtifactPreviewLeaseRenewal(payload)
   } catch (error) {
     translateTransportError(error)
@@ -349,14 +302,11 @@ export async function revokeArtifactPreviewLease(
     }
     return
   }
-  const url = leaseControlUrl(leaseId, context)
+  if (!validArtifactPreviewLeaseId(leaseId)) {
+    throw new ArtifactPreviewLeaseError('Artifact preview lease is invalid.', 0)
+  }
   try {
-    await http.requestBlob(url, {
-      keepalive: true,
-      method: 'DELETE',
-      sessionKey: context.sessionKey,
-      timeoutMs: 0,
-    })
+    await revokeArtifactPreviewLeaseHttp(http, leaseId, context)
   } catch (error) {
     if (
       error instanceof HttpTransportError

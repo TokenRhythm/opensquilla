@@ -6,11 +6,9 @@ import type {
   ArtifactPreviewState,
 } from '@/modules/artifactWorkbench'
 import {
-  artifactAccessUrl,
-  artifactThumbnailAccessUrl,
-  isSameOriginArtifactUrl,
-  runtimeArtifactBaseOrigin,
-} from './artifactAccessV4'
+  bindArtifactBinaryRequest,
+  runtimeArtifactHttpBaseOrigin,
+} from './privateArtifactHttpTransport'
 
 interface ArtifactPreviewBinaryResponse {
   readonly metadata: {
@@ -112,7 +110,7 @@ let tokenSeq = 0
 export function createArtifactPreview(
   http: Pick<ArtifactPreviewHttpTransport, 'fetchExternalArtifact' | 'requestBinary'>,
   options: ArtifactPreviewOptions,
-  baseOriginSource: () => string = runtimeArtifactBaseOrigin,
+  baseOriginSource: () => string = runtimeArtifactHttpBaseOrigin,
 ): ArtifactPreviewController {
   const state = ref<ArtifactPreviewState>('idle')
   const errorCode = ref<ArtifactPreviewErrorCode>(null)
@@ -154,10 +152,12 @@ export function createArtifactPreview(
     if (state.value === 'loaded' && objectUrl.value) return
     const artifact = options.artifact()
     const baseOrigin = baseOriginSource()
-    const url = options.variant === 'thumbnail'
-      ? artifactThumbnailAccessUrl(artifact, baseOrigin)
-      : artifactAccessUrl(artifact, baseOrigin)
-    if (!url) {
+    const request = bindArtifactBinaryRequest(http, artifact, {
+      baseOrigin,
+      policy: options.requireSameOrigin ? 'same-origin' : 'allow-external',
+      variant: options.variant === 'thumbnail' ? 'thumbnail' : 'content',
+    })
+    if (!request) {
       state.value = 'error'
       errorCode.value = 'network'
       return
@@ -181,19 +181,13 @@ export function createArtifactPreview(
     let timedOut = false
 
     try {
-      const isSame = isSameOriginArtifactUrl(url, baseOrigin)
-      if (options.requireSameOrigin && !isSame) {
-        throw new ArtifactPreviewLoadError('network', 'Cross-origin preview is not allowed')
-      }
-      const response = isSame
-        ? await http.requestBinary(url, {
-          sessionKey: options.sessionKey?.(),
-          signal: controller.signal,
-          // The preview controller owns its timeout so retries and UI state
-          // stay domain-defined instead of inheriting the transport default.
-          timeoutMs: 0,
-        })
-        : await http.fetchExternalArtifact(url, controller.signal)
+      const response = await request.execute({
+        sessionKey: options.sessionKey?.(),
+        signal: controller.signal,
+        // The preview controller owns its timeout so retries and UI state
+        // stay domain-defined instead of inheriting the transport default.
+        timeoutMs: 0,
+      })
 
       const blob = await readBlobWithProgress(response, p => {
         if (seq === runSeq) progress.value = p
