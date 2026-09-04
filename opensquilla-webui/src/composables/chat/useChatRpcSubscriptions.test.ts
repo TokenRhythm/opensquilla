@@ -146,7 +146,6 @@ describe('useChatRpcSubscriptions', () => {
     sourceState.emit?.({
       kind: 'sessions-changed',
       payload: {},
-      meta: {},
     })
     expect(event).toHaveBeenCalledOnce()
     bridge.unsubscribe()

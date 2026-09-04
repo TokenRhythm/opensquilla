@@ -1,4 +1,8 @@
-import type { SessionEventPayload, StreamEventEnvelope } from '@/types/chat'
+import type {
+  ConversationEventData,
+  ConversationEventIdentity,
+} from '@/modules/conversationEventContent'
+
 import type { ConversationSemanticEventKind } from '@/modules/conversationEvents'
 import {
   createConversationRuntime,
@@ -10,50 +14,17 @@ export interface StreamSeqDecision {
   nextStreamSeq: number
 }
 
-/**
- * Translate legacy v4 spellings at the transport edge.  ConversationRuntime
- * intentionally accepts only these canonical facts, so aliases do not leak
- * into domain Modules.  Invalid optional cursor values are omitted to retain
- * the v4 client's historical leniency for unversioned events.
- */
-export function conversationCursorSignal(source: unknown): ConversationCursorSignal {
-  const value = source && typeof source === 'object'
-    ? source as Record<string, unknown>
-    : {}
-  const text = (...keys: string[]): string | undefined => {
-    for (const key of keys) {
-      const candidate = value[key]
-      // Do not trim legacy identifiers at this compatibility edge. The old
-      // helpers compared the first truthy wire spelling byte-for-byte; domain
-      // Contract validation can tighten this in a later versioned adapter.
-      if (typeof candidate === 'string' && candidate) return candidate
-    }
-    return undefined
+/** The Adapter has already resolved every accepted cursor spelling. */
+export function conversationCursorSignal(source: ConversationEventIdentity | null | undefined): ConversationCursorSignal {
+  return {
+    sessionKey: source?.key,
+    sessionEpoch: source?.epoch,
+    streamGeneration: source?.stream_generation,
+    streamSeq: source?.stream_seq,
+    currentStreamSeq: source?.current_stream_seq,
+    replayComplete: source?.replay_complete,
+    replayGapReason: source?.replay_gap_reason,
   }
-  const numberValue = (...keys: string[]): number | undefined => {
-    for (const key of keys) {
-      const candidate = value[key]
-      if (
-        typeof candidate === 'number'
-        && Number.isFinite(candidate)
-      ) return candidate
-    }
-    return undefined
-  }
-  const signal: ConversationCursorSignal = {
-    sessionKey: text('key', 'session_key', 'sessionKey'),
-    sessionEpoch: numberValue('epoch'),
-    streamGeneration: text('stream_generation', 'streamGeneration'),
-    streamSeq: numberValue('stream_seq', 'streamSeq'),
-    currentStreamSeq: numberValue('current_stream_seq', 'currentStreamSeq'),
-    replayComplete: typeof value.replay_complete === 'boolean'
-      ? value.replay_complete
-      : typeof value.replayComplete === 'boolean'
-        ? value.replayComplete
-        : undefined,
-    replayGapReason: text('replay_gap_reason', 'replayGapReason'),
-  }
-  return signal
 }
 
 export type NormalizeRunStatus = (status: string) => string
@@ -68,28 +39,14 @@ export const FINISHED_STREAM_TASK_ID = '__opensquilla_finished_stream_task__'
 
 const cursorRuntime = createConversationRuntime()
 
-export function payloadSessionKey(payload: StreamEventEnvelope | null | undefined): string {
-  return payload?.key || payload?.session_key || payload?.sessionKey || ''
-}
-
-export function isCurrentSessionPayload(payload: StreamEventEnvelope | null | undefined, sessionKey: string): boolean {
+export function isCurrentSessionPayload(payload: ConversationEventIdentity | null | undefined, sessionKey: string): boolean {
   const signal = conversationCursorSignal(payload)
   const key = signal.sessionKey || ''
   return !key || !sessionKey || key === sessionKey
 }
 
-export function payloadTaskId(payload: StreamEventEnvelope | null | undefined): string {
-  const record = (payload && typeof payload === 'object' ? payload : {}) as Record<string, unknown>
-  const direct = record.task_id ?? record.taskId
-  if (typeof direct === 'string') return direct
-  for (const key of ['active_task', 'activeTask', 'last_task', 'lastTask']) {
-    const nested = record[key]
-    if (!nested || typeof nested !== 'object') continue
-    const nestedRecord = nested as Record<string, unknown>
-    const nestedId = nestedRecord.task_id ?? nestedRecord.taskId
-    if (typeof nestedId === 'string') return nestedId
-  }
-  return ''
+export function payloadTaskId(payload: ConversationEventIdentity | null | undefined): string {
+  return payload?.task_id ?? ''
 }
 
 // Identity guard for the live stream: an event belongs to the current turn
@@ -98,7 +55,7 @@ export function payloadTaskId(payload: StreamEventEnvelope | null | undefined): 
 // with no task_id (non-TaskRuntime events: approvals, task groups, router…)
 // always passes, so only positively-mismatched TaskRuntime events are dropped.
 export function isCurrentTaskPayload(
-  payload: StreamEventEnvelope | null | undefined,
+  payload: ConversationEventIdentity | null | undefined,
   activeTaskId: string,
 ): boolean {
   if (!activeTaskId) return true
@@ -107,7 +64,7 @@ export function isCurrentTaskPayload(
   return taskId === activeTaskId
 }
 
-export function isStaleEpoch(payload: StreamEventEnvelope | null | undefined, currentEpoch: number): boolean {
+export function isStaleEpoch(payload: ConversationEventIdentity | null | undefined, currentEpoch: number): boolean {
   return cursorRuntime.isStaleEpoch(
     cursorRuntime.createCursor('', { sessionEpoch: currentEpoch }),
     conversationCursorSignal(payload).sessionEpoch,
@@ -115,7 +72,7 @@ export function isStaleEpoch(payload: StreamEventEnvelope | null | undefined, cu
 }
 
 export function acceptStreamSeq(
-  payload: StreamEventEnvelope | null | undefined,
+  payload: ConversationEventIdentity | null | undefined,
   sessionKey: string,
   lastStreamSeq: number,
 ): StreamSeqDecision {
@@ -130,12 +87,12 @@ export function acceptStreamSeq(
   }
 }
 
-export function taskGroupId(payload: SessionEventPayload | null | undefined): string {
+export function taskGroupId(payload: ConversationEventData | null | undefined): string {
   const id = payload?.group_id
   return typeof id === 'string' && id ? id : ''
 }
 
-export function activeTaskGroupRunState(payload: SessionEventPayload = {}, activeTaskGroupCount: number) {
+export function activeTaskGroupRunState(payload: ConversationEventData = {}, activeTaskGroupCount: number) {
   return {
     run_status: 'running',
     active_task: { ...(payload || {}), status: 'running', task_group_count: activeTaskGroupCount },
@@ -143,14 +100,14 @@ export function activeTaskGroupRunState(payload: SessionEventPayload = {}, activ
 }
 
 export function sessionChangeIsTerminal(
-  payload: SessionEventPayload,
+  payload: ConversationEventData,
   normalizeRunStatus: NormalizeRunStatus,
 ): boolean {
   const reason = String(payload?.reason || '').toLowerCase()
   if (reason === 'turn_complete' || reason === 'task_terminal') return true
   const lifecycle = String(payload?.status || '').toLowerCase()
   if (['done', 'failed', 'killed', 'timeout'].includes(lifecycle)) return true
-  const runStatus = normalizeRunStatus(String(payload?.run_status || payload?.runStatus || ''))
+  const runStatus = normalizeRunStatus(String(payload?.run_status || ''))
   return ['failed', 'timeout', 'cancelled', 'interrupted'].includes(runStatus)
 }
 
@@ -167,7 +124,7 @@ export function taskTerminalStatus(event: ConversationSemanticEventKind): string
 
 export function taskTerminalAsSessionEvent(
   event: ConversationSemanticEventKind,
-  payload: SessionEventPayload | null | undefined,
+  payload: ConversationEventData | null | undefined,
 ) {
   // The rich completion receipt carries final text + usage, but TaskRuntime
   // also emits a lifecycle success after its handler returns. Treat that
@@ -181,10 +138,7 @@ export function taskTerminalAsSessionEvent(
   }
   const status = taskTerminalStatus(event)
   if (!['failed', 'timeout', 'abandoned'].includes(status)) return null
-  const outcome = payload?.turn_outcome && typeof payload.turn_outcome === 'object'
-    ? payload.turn_outcome as Record<string, unknown>
-    : {}
-  const rawCode = payload?.code ?? payload?.error_class ?? outcome.error_class
+  const rawCode = payload?.code ?? payload?.error_class ?? payload?.terminalOutcome?.errorClass
   const payloadCode = typeof rawCode === 'string' ? rawCode.trim().toLowerCase() : ''
   const rawReason = payload?.terminal_reason
   const terminalReason = typeof rawReason === 'string' ? rawReason.trim().toLowerCase() : ''
@@ -197,7 +151,7 @@ export function taskTerminalAsSessionEvent(
   }
 }
 
-export function taskTerminalMessage(status: string, payload: SessionEventPayload | null | undefined): string {
+export function taskTerminalMessage(status: string, payload: ConversationEventData | null | undefined): string {
   if (typeof payload?.terminal_message === 'string' && payload.terminal_message.trim()) return payload.terminal_message.trim()
   if (status === 'timeout') return 'The task timed out before it could finish.'
   if (status === 'abandoned') return 'The task stopped before it could finish.'
@@ -206,7 +160,7 @@ export function taskTerminalMessage(status: string, payload: SessionEventPayload
   return 'The task ended before it could finish.'
 }
 
-export function sessionErrorMessage(payload: SessionEventPayload | null | undefined): string {
+export function sessionErrorMessage(payload: ConversationEventData | null | undefined): string {
   if (typeof payload?.terminal_message === 'string' && payload.terminal_message.trim()) return payload.terminal_message.trim()
   const message = typeof payload?.message === 'string' ? payload.message : ''
   const code = typeof payload?.code === 'string' ? payload.code.toLowerCase() : ''

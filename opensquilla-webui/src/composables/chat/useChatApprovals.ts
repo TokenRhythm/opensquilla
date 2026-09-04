@@ -1,6 +1,13 @@
+import type {
+  ConversationToolContent,
+} from '@/modules/conversationEventContent'
 import { computed, ref, watch, type Ref } from 'vue'
-import type { ChatRunStatus } from '@/types/chat'
-import type { ApprovalStatusPayload, ToolResultPayload } from '@/types/chat'
+import type {
+  ChatRunStatus,
+} from '@/types/chat'
+import type {
+  ApprovalStatusPayload,
+} from '@/types/chat'
 import type {
   InterruptApprovalData,
   InterruptClarifyData,
@@ -180,9 +187,9 @@ export function resolutionFromResolveResponse(
   return payload.approved ? 'approved' : 'denied'
 }
 
-function parseClarifyRequest(payload: ToolResultPayload): ChatClarifyRequest | null {
-  return clarifyRequestFromValue(payload.result)
-    ?? clarifyRequestFromValue((payload as Record<string, unknown>).arguments)
+function parseClarifyRequest(payload: ConversationToolContent): ChatClarifyRequest | null {
+  return clarifyRequestFromValue(payload.approvalResult)
+    ?? clarifyRequestFromValue(payload.arguments)
 }
 
 /**
@@ -566,10 +573,10 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     })
   }
 
-  function handleToolResult(payload: ToolResultPayload) {
+  function handleToolResult(payload: ConversationToolContent) {
     if (!payload || typeof payload !== 'object') return
     if (!isCurrentSessionPayload(payload, sessionKey.value)) return
-    const outcome = userInputOutcomeFromValue(payload.result)
+    const outcome = userInputOutcomeFromValue(payload.approvalResult)
     if (outcome) {
       clarifySubmitAttempts.delete(outcome.requestId)
       setInterruptState(outcome.requestId, {
@@ -606,13 +613,12 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
       approvalId: key,
       data: clarifyData,
       at: Number(
-        (payload as Record<string, unknown>).emitted_at
-        || (payload as Record<string, unknown>).started_at,
+        payload.emitted_at || payload.started_at,
       ) || Date.now(),
       activityOrder: (
-        Number.isSafeInteger((payload as Record<string, unknown>).stream_seq)
-        && Number((payload as Record<string, unknown>).stream_seq) > 0
-          ? Number((payload as Record<string, unknown>).stream_seq)
+        Number.isSafeInteger(payload.stream_seq)
+        && Number(payload.stream_seq) > 0
+          ? Number(payload.stream_seq)
           : undefined
       ),
     })
@@ -689,7 +695,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
         message.kind !== 'conversation'
         || message.event.semanticKind !== 'tool-result'
       ) return
-      handleToolResult(message.payload as ToolResultPayload)
+      handleToolResult(message.event.payload)
     })
     const approvalEvents = approvalCenter.subscribe(event => {
       if (event.kind === 'requested') handleApprovalRequested(event)

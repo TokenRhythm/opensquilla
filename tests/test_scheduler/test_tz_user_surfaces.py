@@ -11,7 +11,15 @@ import json
 from typing import Any
 
 from opensquilla.gateway.rpc import RpcContext
-from opensquilla.gateway.rpc_cron import _handle_cron_add, _handle_cron_update, _job_to_wire
+from opensquilla.gateway.rpc_cron import (
+    _cron_create_contract as _handle_cron_add,
+)
+from opensquilla.gateway.rpc_cron import (
+    _cron_update_contract as _handle_cron_update,
+)
+from opensquilla.gateway.rpc_cron import (
+    _job_to_wire,
+)
 from opensquilla.scheduler.payloads import AGENT_TURN_KIND
 from opensquilla.scheduler.types import CronJob, DeliveryConfig, SessionTarget
 

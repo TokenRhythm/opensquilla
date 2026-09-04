@@ -24,10 +24,7 @@ import {
   type Result as LogsTailResult,
 } from '@/contracts/generated/v4/logsTail'
 import { validateResult as validateLogsTailResult } from '@/contracts/generated/v4/logsTailValidators.mjs'
-import { USAGE_QUERY_METHOD } from '@/contracts/generated/v4/usageQuery'
-import { validateResult as validateUsageQueryResult } from '@/contracts/generated/v4/usageQueryValidators.mjs'
-import { USAGE_STATUS_METHOD } from '@/contracts/generated/v4/usageStatus'
-import { validateResult as validateUsageStatusResult } from '@/contracts/generated/v4/usageStatusValidators.mjs'
+import { createV4UsageReporting } from './usageReportingV4'
 import type {
   GatewayLogBatch,
   GatewayLogEntry,
@@ -38,17 +35,6 @@ import type {
   SelfLearningStatus,
   UpdateNotice,
 } from '@/modules/observability'
-import type {
-  UsageQueryResponse,
-  UsageRangeSelection,
-  UsageStatusData,
-} from '@/types/usage'
-import {
-  browserTimeZone,
-  normalizeUsageQueryResponse,
-  normalizeUsageStatusResponse,
-  usagePresetForRange,
-} from '@/composables/usage/useUsageQuery'
 
 interface RpcTransport {
   request<T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions): Promise<T>
@@ -84,36 +70,6 @@ function invalid(method: string): Error {
   return new Error(`${method} returned an invalid response`)
 }
 
-function methodNotFound(error: unknown): boolean {
-  const code = typeof error === 'object' && error && 'code' in error
-    ? String((error as { code?: unknown }).code ?? '')
-    : ''
-  const message = error instanceof Error ? error.message : String(error)
-  return code === 'METHOD_NOT_FOUND' || /method not found/i.test(message)
-}
-
-function invalidTimezone(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error)
-  return /unknown iana timezone|invalid timezone|time zone/i.test(message)
-}
-
-function usageQueryParams(
-  range: UsageRangeSelection,
-  timezone: string,
-  options: Parameters<Observability['usage']>[1],
-): Record<string, unknown> {
-  return {
-    schemaVersion: 1,
-    range: { preset: usagePresetForRange(range) },
-    timezone,
-    include: {
-      days: options?.days ?? true,
-      models: options?.models ?? true,
-      sessions: options?.sessions ?? true,
-    },
-  }
-}
-
 function updateNotice(value: unknown): UpdateNotice | null | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
   const raw = value as Record<string, unknown>
@@ -135,6 +91,7 @@ function updateNotice(value: unknown): UpdateNotice | null | undefined {
 }
 
 export function createV4Observability(rpc: RpcTransport, http: HttpTransport): Observability {
+  const usageReporting = createV4UsageReporting(rpc)
   return {
     async gatewayStatus(options) {
       await rpc.ready({ signal: options?.signal })
@@ -158,70 +115,8 @@ export function createV4Observability(rpc: RpcTransport, http: HttpTransport): O
       }
       return result as SelfLearningStatus
     },
-    async usage(range, options = {}) {
-      await rpc.ready({ signal: options.signal })
-      const timezone = options.timezone || browserTimeZone()
-      const requestedPreset = usagePresetForRange(range)
-      const matchingLedgerCache = options.cachedSnapshot?.source === 'usage_ledger'
-        && options.cachedSnapshot.range.preset === requestedPreset
-        ? options.cachedSnapshot
-        : null
-      let transientQueryFailure = false
-      if (rpc.supports(USAGE_QUERY_METHOD)) {
-        try {
-          const result = await rpc.request<UsageQueryResponse>(
-            USAGE_QUERY_METHOD,
-            usageQueryParams(range, timezone, options),
-            callOptions(options.signal),
-          )
-          if (!validateUsageQueryResult(result)) throw invalid(USAGE_QUERY_METHOD)
-          return normalizeUsageQueryResponse(result)
-        } catch (error) {
-          if (methodNotFound(error)) {
-            rpc.markUnsupported(USAGE_QUERY_METHOD)
-          } else if (timezone !== 'UTC' && invalidTimezone(error)) {
-            try {
-              const result = await rpc.request<UsageQueryResponse>(
-                USAGE_QUERY_METHOD,
-                usageQueryParams(range, 'UTC', options),
-                callOptions(options.signal),
-              )
-              if (!validateUsageQueryResult(result)) throw invalid(USAGE_QUERY_METHOD)
-              const snapshot = normalizeUsageQueryResponse(result)
-              return {
-                ...snapshot,
-                timezoneFallback: {
-                  requestedTimezone: timezone,
-                  effectiveTimezone: snapshot.timezone,
-                  reason: 'invalid_timezone',
-                },
-              }
-            } catch (utcError) {
-              if (methodNotFound(utcError)) rpc.markUnsupported(USAGE_QUERY_METHOD)
-              else transientQueryFailure = true
-            }
-          } else {
-            transientQueryFailure = true
-          }
-        }
-      }
-      try {
-        const status = await rpc.request<UsageStatusData>(
-          USAGE_STATUS_METHOD,
-          undefined,
-          callOptions(options.signal),
-        )
-        if (!validateUsageStatusResult(status)) throw invalid(USAGE_STATUS_METHOD)
-        if (transientQueryFailure && matchingLedgerCache) return matchingLedgerCache
-        return normalizeUsageStatusResponse(
-          status,
-          options.fallbackRange || range,
-          timezone,
-        )
-      } catch (error) {
-        if (matchingLedgerCache) return matchingLedgerCache
-        throw error
-      }
+    usage(range, options = {}) {
+      return usageReporting.snapshot(range, options)
     },
     async readiness(options) {
       await rpc.ready({ signal: options.signal })

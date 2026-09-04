@@ -99,7 +99,7 @@ import Icon from '@/components/Icon.vue'
 import UsageModelBreakdown from '@/components/usage/UsageModelBreakdown.vue'
 
 const { t } = useI18n()
-import type { BreakdownRow, SessionRow, SortedRow, TableColumn } from '@/types/usage'
+import type { BreakdownRow, SortedRow, TableColumn, UsageSession } from '@/types/usage'
 
 defineProps<{
   tableColumns: TableColumn[]
@@ -113,18 +113,18 @@ defineProps<{
     cost: number | null | undefined,
     opts?: { decimals?: number; source?: object },
   ) => string
-  costSourceLabel: (row: SessionRow) => string
-  costSourceTooltip: (row: SessionRow) => string
-  costSourceClasses: (row: SessionRow) => Record<string, boolean>
+  costSourceLabel: (row: UsageSession) => string
+  costSourceTooltip: (row: UsageSession) => string
+  costSourceClasses: (row: UsageSession) => Record<string, boolean>
   costSourceClassesForBreakdown: (row: BreakdownRow) => Record<string, boolean>
   costSourceLabelForBreakdown: (row: BreakdownRow) => string
   costSourceTooltipForBreakdown: (row: BreakdownRow) => string
-  modelDisplayLabel: (row: SessionRow) => string
-  rowKey: (row: SessionRow) => string
-  rowBreakdown: (row: SessionRow) => BreakdownRow[]
-  rowBreakdownTotalTokens: (row: SessionRow) => number
-  rowBreakdownTotalCost: (row: SessionRow) => number
-  rowBreakdownAnyProrated: (row: SessionRow) => boolean
+  modelDisplayLabel: (row: UsageSession) => string
+  rowKey: (row: UsageSession) => string
+  rowBreakdown: (row: UsageSession) => BreakdownRow[]
+  rowBreakdownTotalTokens: (row: UsageSession) => number
+  rowBreakdownTotalCost: (row: UsageSession) => number
+  rowBreakdownAnyProrated: (row: UsageSession) => boolean
 }>()
 
 const emit = defineEmits<{

@@ -1,6 +1,6 @@
 import type { InjectionKey } from 'vue'
 import type { ConversationCursorSignal } from '@/modules/conversationRuntime'
-import type { MetaSetupReadiness } from '@/types/metaSetup'
+import type { MetaSetupJob, MetaSetupReadiness } from '@/types/metaSetup'
 
 /** A wire-independent MetaSkill draft used by recovery UI. */
 export interface MetaDraft {
@@ -209,6 +209,19 @@ export class MetaRunCenterError extends Error {
   }
 }
 
+/** Setup failures reject with MetaRunCenterError; successful results need no wire envelope. */
+export interface MetaSetupPlan {
+  readonly readiness: MetaSetupReadiness
+}
+
+export interface MetaSetupStatus {
+  readonly job: MetaSetupJob
+}
+
+export type MetaSetupInstallation =
+  | { readonly alreadyReady: true; readonly readiness?: MetaSetupReadiness; readonly job?: never }
+  | { readonly job: MetaSetupJob; readonly alreadyReady?: false }
+
 /**
  * Domain seam for MetaSkill runs and durable launch recovery.
  *
@@ -238,9 +251,9 @@ export interface MetaRunCenter {
     options?: MetaRunRequestOptions,
   ): Promise<MetaPreflightConfirmation>
   replay(input: MetaReplayInput, options?: MetaRunRequestOptions): Promise<MetaReplay>
-  setupPlan(name: string, options?: MetaRunRequestOptions): Promise<Record<string, unknown>>
-  setupStatus(input: { jobId: string; sessionKey: string }, options?: MetaRunRequestOptions): Promise<Record<string, unknown>>
-  setupInstall(input: { name: string; sessionKey: string; confirmed: boolean; actionIds: readonly string[] }, options?: MetaRunRequestOptions): Promise<Record<string, unknown>>
+  setupPlan(name: string, options?: MetaRunRequestOptions): Promise<MetaSetupPlan>
+  setupStatus(input: { jobId: string; sessionKey: string }, options?: MetaRunRequestOptions): Promise<MetaSetupStatus>
+  setupInstall(input: { name: string; sessionKey: string; confirmed: boolean; actionIds: readonly string[] }, options?: MetaRunRequestOptions): Promise<MetaSetupInstallation>
   subscribe(listener: (event: MetaEvent) => void): MetaRunSubscription
 }
 

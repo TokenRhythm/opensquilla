@@ -1,3 +1,7 @@
+import type {
+  ConversationCompactionContent,
+  ConversationToolContent,
+} from '@/modules/conversationEventContent'
 import { computed, ref, type Ref } from 'vue'
 import i18n from '@/i18n'
 import type {
@@ -10,13 +14,7 @@ import type {
   ChatTimelineSegment,
   RawToolCallPayload,
 } from '@/types/chat'
-import type {
-  CompactionPayload,
-  ToolDeltaPayload,
-  ToolEndPayload,
-  ToolResultPayload,
-  ToolUsePayload,
-} from '@/types/chat'
+
 import type { ArtifactPayload } from '@/types/artifacts'
 import type {
   InterruptApprovalData,
@@ -404,7 +402,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     setStreamActivity(label, key, true)
   }
 
-  function recordCompactionActivity(payload: CompactionPayload) {
+  function recordCompactionActivity(payload: ConversationCompactionContent) {
     noteStreamSignal()
     const rawStatus = String(payload.status || '').toLowerCase()
     const state = rawStatus === 'skipped'
@@ -418,7 +416,7 @@ export function useChatStream(options: UseChatStreamOptions) {
             : ['failed', 'error', 'timed_out'].includes(rawStatus)
               ? 'failed'
               : 'running'
-    const id = String(payload.compaction_id || payload.compactionId || 'current')
+    const id = String(payload.compaction_id || 'current')
     appendFrame({
       kind: 'status',
       action: 'context_compaction',
@@ -1162,8 +1160,8 @@ export function useChatStream(options: UseChatStreamOptions) {
   // trusted and we fall back to the local clock — capping any residual error rather
   // than letting a skewed clock render a wildly wrong duration. On synced clocks
   // (e.g. the gateway serving its own UI) this is exact.
-  function serverToolStartedAt(payload: ToolUsePayload | ToolResultPayload): number | null {
-    const raw = (payload as ToolUsePayload).started_at
+  function serverToolStartedAt(payload: ConversationToolContent): number | null {
+    const raw = payload.started_at
     if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) return null
     const now = Date.now()
     if (raw > now + SERVER_CLOCK_TOLERANCE_MS) return null
@@ -1171,15 +1169,15 @@ export function useChatStream(options: UseChatStreamOptions) {
     return raw
   }
 
-  function ensureStreamToolCall(payload: ToolUsePayload | ToolResultPayload, optionsArg: { running: boolean }): ChatToolCall | null {
+  function ensureStreamToolCall(payload: ConversationToolContent, optionsArg: { running: boolean }): ChatToolCall | null {
     if (!payload) return null
-    const name = normalizeToolName(payload)
+    const name = normalizeToolName({ name: payload.name })
     if (!name) return null
     if (isInternalToolName(name)) return null
     if (!isStreaming.value) startStreaming()
     const presentation = normalizeToolPresentation(payload)
     const input = toolDisplayInputText(payload, presentation)
-    const toolId = payload.tool_use_id || payload.toolUseId || payload.id || `${name}:${payload.stream_seq || Date.now()}`
+    const toolId = payload.id || `${name}:${payload.stream_seq || Date.now()}`
 
     const existing = peekToolCall(toolId)
     if (existing) {
@@ -1238,18 +1236,17 @@ export function useChatStream(options: UseChatStreamOptions) {
     }
   }
 
-  function appendToolCall(payload: ToolUsePayload) {
+  function appendToolCall(payload: ConversationToolContent) {
     const tc = ensureStreamToolCall(payload, { running: true })
     if (!tc) return
     narrateToolCall(tc)
     scheduleRender()
   }
 
-  function appendToolDelta(payload: ToolDeltaPayload) {
+  function appendToolDelta(payload: ConversationToolContent) {
     if (!payload || options.aborted.value) return
-    const toolId = payload.tool_use_id || payload.toolUseId || payload.id || ''
-    const fragment = payload.json_fragment ?? payload.jsonFragment ?? payload.fragment ?? ''
-    const fragmentText = typeof fragment === 'string' ? fragment : String(fragment || '')
+    const toolId = payload.id || ''
+    const fragmentText = payload.input_delta || ''
     if (!toolId || !fragmentText) return
 
     const existing = peekToolCall(toolId)
@@ -1263,9 +1260,9 @@ export function useChatStream(options: UseChatStreamOptions) {
     scheduleRender()
   }
 
-  function appendToolEnd(payload: ToolEndPayload) {
+  function appendToolEnd(payload: ConversationToolContent) {
     if (!payload || options.aborted.value) return
-    const toolId = payload.tool_use_id || payload.toolUseId || payload.id || ''
+    const toolId = payload.id || ''
     if (!toolId) return
     const tc = peekToolCall(toolId)
       || ensureStreamToolCall(payload, { running: true })
@@ -1286,14 +1283,14 @@ export function useChatStream(options: UseChatStreamOptions) {
     scheduleRender()
   }
 
-  function appendToolResult(payload: ToolResultPayload) {
+  function appendToolResult(payload: ConversationToolContent) {
     if (!payload) return
-    const name = normalizeToolName(payload)
+    const name = normalizeToolName({ name: payload.name })
     if (name && isInternalToolName(name)) return
     if (!isStreaming.value) startStreaming()
-    const raw = payload.result || payload.content || payload.output || ''
+    const raw = payload.result || ''
     const content = typeof raw === 'string' ? raw : JSON.stringify(raw, null, 2)
-    const toolId = payload.tool_use_id || payload.toolUseId || payload.id || ''
+    const toolId = payload.id || ''
 
     const tc = peekToolCall(toolId) || ensureStreamToolCall(payload, { running: false })
     if (tc) {

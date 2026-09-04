@@ -243,14 +243,19 @@ async def test_clarify_submit_logs_safe_entry_metadata(monkeypatch):
     exposing field values in gateway logs."""
     captured: dict = {}
 
-    async def _fake_send(send_params, ctx):
+    async def _fake_send(send_params, *, surface):
+        assert surface == "webchat"
         return {"ok": True, "sessionKey": send_params["sessionKey"]}
 
     def _fake_info(event, **kwargs):
         captured["event"] = event
         captured["kwargs"] = kwargs
 
-    monkeypatch.setattr(rpc_chat_module, "_handle_chat_send", _fake_send)
+    monkeypatch.setattr(
+        rpc_chat_module,
+        "_chat_turn_admission_adapter",
+        lambda _ctx: SimpleNamespace(admit=_fake_send),
+    )
     real_log = rpc_chat_module.log
 
     class _InfoLog:

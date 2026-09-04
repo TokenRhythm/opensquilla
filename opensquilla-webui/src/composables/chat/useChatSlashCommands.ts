@@ -749,9 +749,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       case '/usage':
         usageReporting.status()
           .then((result) => {
-            const totals = result?.totals || {}
-            const tokens = Number(result?.totalTokens ?? result?.total_tokens ?? totals.tokens ?? 0)
-            console.info(`Usage: ${tokens.toLocaleString()} tokens`)
+            console.info(`Usage: ${result.totalTokens.toLocaleString()} tokens`)
           })
           .catch((err: unknown) => console.warn('Usage failed:', err instanceof Error ? err.message : String(err)))
         break

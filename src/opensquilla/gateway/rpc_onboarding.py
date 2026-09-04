@@ -498,27 +498,6 @@ def _request_changes_active_provider_connection(params: Any, cfg: Any) -> bool:
     return False
 
 
-def _llm_profile_for(config: Any, provider_id: str) -> Any | None:
-    provider = str(provider_id or "").strip().lower()
-    for key, profile in (getattr(config, "llm_profiles", None) or {}).items():
-        if str(key or "").strip().lower() == provider:
-            return profile
-    return None
-
-
-def _llm_profile_credential_signature(config: Any, provider_id: str) -> tuple[object, ...]:
-    """Return the in-memory credential-source shape for pool invalidation."""
-
-    profile = _llm_profile_for(config, provider_id)
-    if profile is None:
-        return ()
-    return (
-        str(getattr(profile, "api_key", "") or ""),
-        str(getattr(profile, "api_key_env", "") or ""),
-        tuple(getattr(profile, "api_key_env_pool", None) or ()),
-    )
-
-
 async def _provider_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
     from opensquilla.application.provider_setup import (
         ConfigurePrimaryProvider,

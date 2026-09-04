@@ -35,7 +35,6 @@ from opensquilla.gateway.adapters.channel_administration_contract import (
 from opensquilla.gateway.channel_status_runtime import (
     ADMISSION_ADMIT_REASONS,
     configured_channel_entries,
-    status_for,
 )
 from opensquilla.gateway.channel_status_runtime import (
     read_channel_status as _read_channel_status,
@@ -58,23 +57,6 @@ _ADMISSION_ADMIT_REASONS = ADMISSION_ADMIT_REASONS
 
 def _configured_channel_entries(ctx: RpcContext) -> list[dict[str, Any]]:
     return configured_channel_entries(getattr(ctx, "config", None))
-
-
-def _status_for(
-    *,
-    connected: bool,
-    enabled: bool,
-    dispatch_state: str | None,
-    connection_phase: str | None,
-) -> str:
-    """Compatibility export for status projection tests and in-process users."""
-
-    return status_for(
-        connected=connected,
-        enabled=enabled,
-        dispatch_state=dispatch_state,
-        connection_phase=connection_phase,
-    )
 
 
 def _pairing_store(ctx: RpcContext) -> Any:

@@ -11,14 +11,15 @@ from unittest.mock import AsyncMock
 import pytest
 
 from opensquilla.gateway import context_overflow
+from opensquilla.gateway.compaction_target import resolve_gateway_compaction_target
 from opensquilla.gateway.config import ContextOverflowPolicy, GatewayConfig
 from opensquilla.gateway.context_overflow import (
     OverflowOutcome,
     apply_context_overflow_policy,
 )
-from opensquilla.gateway.rpc_chat import _enforce_context_overflow, _handle_chat_send
+from opensquilla.gateway.rpc_chat import _handle_chat_send
 from opensquilla.provider.types import ProviderRequestCorrelation
-from opensquilla.session.compaction import CompactionConfig
+from opensquilla.session.compaction import CompactionConfig, build_compaction_config_from_provider
 from opensquilla.session.compaction_state import (
     StructuredCompactionSummary,
     render_structured_summary,
@@ -1387,7 +1388,7 @@ async def test_chat_send_accepts_turn_without_synchronous_context_overflow_gate(
         }
 
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_chat._enforce_context_overflow",
+        "opensquilla.gateway.context_overflow.apply_context_overflow_policy",
         _unexpected_gate,
     )
     monkeypatch.setattr(
@@ -1420,9 +1421,24 @@ async def test_rpc_chat_auto_summarize_builds_provider_compaction_config() -> No
     selector = _FakeProviderSelector()
     ctx = SimpleNamespace(config=cfg, session_manager=sm, provider_selector=selector)
 
-    refusal = await _enforce_context_overflow(ctx, "s-auto", "m")
+    session = await sm._storage.get_session("s-auto")
+    target = resolve_gateway_compaction_target(ctx, session)
+    outcome = await apply_context_overflow_policy(
+        config=cfg,
+        message="m",
+        transcript=sm._transcript,
+        session_key="s-auto",
+        session_manager=sm,
+        compaction_config=build_compaction_config_from_provider(
+            target.provider,
+            model_override=target.model,
+            compaction_config=cfg.compaction,
+            compaction_plan=target.plan,
+        ),
+    )
 
-    assert refusal is None
+    assert outcome.refusal is None
+    assert outcome.summarized is True
     config = sm.compact_calls[0][2]
     assert isinstance(config, CompactionConfig)
     assert config.api_key == "overflow-provider-key"

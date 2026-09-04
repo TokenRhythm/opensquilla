@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
 from collections import Counter
 from pathlib import Path
 
@@ -218,26 +219,13 @@ SANDBOX_RUNTIME_AUTHORED_FILES = (
 )
 SANDBOX_RUNTIME_AUTHORED_LOC_CEILING = 3_000
 
-# This ledger is deliberately separate from SandboxRuntime.  At the reset
-# baseline it totalled 2,886 lines: 2,618 for lifecycle/admission/queue/
-# ancillary seams plus 268 for the old compaction seam.  Manual compaction
-# takes the predefined lifecycle/maintenance split, so this ledger retains
-# the unchanged 3,000-line ceiling and no longer hides maintenance growth.
-SESSION_LIFECYCLE_AUTHORED_FILES = (
-    "src/opensquilla/application/session_lifecycle.py",
-    "src/opensquilla/gateway/adapters/session_lifecycle.py",
-    "src/opensquilla/gateway/adapters/session_lifecycle_contract.py",
-    "src/opensquilla/application/turn_admission.py",
-    "src/opensquilla/gateway/adapters/turn_admission.py",
-    "src/opensquilla/gateway/adapters/turn_admission_contract.py",
-    "src/opensquilla/application/pending_input_queue.py",
-    "src/opensquilla/gateway/adapters/pending_input_queue.py",
-    "src/opensquilla/gateway/adapters/pending_input_queue_contract.py",
-    "src/opensquilla/application/conversation_ancillary.py",
-    "src/opensquilla/gateway/adapters/conversation_ancillary.py",
-    "src/opensquilla/gateway/adapters/conversation_ancillary_contract.py",
+# Each domain includes its current business bodies, concrete primitives and
+# registrations, not just the thin Application/Adapter files. The explicit
+# symbol inventory makes moving or deleting a mixed-module implementation an
+# accounting change that must be reviewed together with its callers.
+SESSION_DOMAIN_OWNERSHIP = json.loads(
+    (ROOT / ".github/ci/session-domain-ownership.json").read_text(encoding="utf-8")
 )
-SESSION_LIFECYCLE_AUTHORED_LOC_CEILING = 3_000
 
 # SessionMaintenance owns two high-risk workflows (reset and manual
 # compaction) behind one generated registration boundary.  The reset baseline
@@ -840,13 +828,89 @@ def test_session_lifecycle_application_module_is_transport_neutral_and_typed() -
     assert production_fakes == [], f"test fakes leaked into production: {production_fakes}"
 
 
-def test_session_lifecycle_authored_surface_stays_within_large_pr_ceiling() -> None:
-    current = _physical_lines(SESSION_LIFECYCLE_AUTHORED_FILES)
-    assert current <= SESSION_LIFECYCLE_AUTHORED_LOC_CEILING, (
-        f"SessionLifecycle authored seams total {current} lines; split the domain at its "
-        f"predefined lifecycle/maintenance or Module/consumer boundary before exceeding "
-        f"{SESSION_LIFECYCLE_AUTHORED_LOC_CEILING}"
+def _session_domain_authored_ledger(domain: str) -> dict[str, int]:
+    spec = SESSION_DOMAIN_OWNERSHIP["domains"][domain]
+    ledger = {
+        path: _physical_lines((path,)) for path in spec["whole_files"]
+    }
+    assert not (set(spec["whole_files"]) & set(spec["owned_symbols"]))
+    borrowed = {
+        (entry["path"], entry["symbol"])
+        for entry in SESSION_DOMAIN_OWNERSHIP["cross_domain_boundaries"]
+        if entry["owner"] != domain
+    }
+    registrars = set(spec["registrars"])
+    for path, names in spec["owned_symbols"].items():
+        tree = _tree(ROOT / path)
+        definitions = {
+            node.name: node for node in tree.body
+            if isinstance(node, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef)
+        }
+        missing = set(names) - definitions.keys()
+        assert not missing, (
+            f"{domain}: relocated/deleted bodies need an ownership review: {missing}"
+        )
+        for name in names:
+            node = definitions[name]
+            local_dependencies = {
+                child.id for child in ast.walk(node) if isinstance(child, ast.Name)
+            } & definitions.keys()
+            unaccounted = {
+                dependency for dependency in local_dependencies
+                if dependency not in names and (path, dependency) not in borrowed
+            }
+            assert not unaccounted, f"{domain}: uncounted primitives in {path}: {unaccounted}"
+            start = min([node.lineno, *(item.lineno for item in node.decorator_list)])
+            assert node.end_lineno is not None
+            ledger[f"{path}:{name}"] = node.end_lineno - start + 1
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            if any(
+                isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+                and child.func.id in registrars for child in ast.walk(node)
+            ):
+                assert node.end_lineno is not None
+                ledger[f"{path}:registration@{node.lineno}"] = node.end_lineno - node.lineno + 1
+    return ledger
+
+
+def test_session_domain_ownership_covers_each_borrowed_implementation() -> None:
+    manifest = SESSION_DOMAIN_OWNERSHIP
+    assert manifest["line_budget_policy"] == "accounting-only"
+    assert set(manifest["domains"]) == {"SessionLifecycle", "TurnAdmission", "PendingInputQueue"}
+    for entry in manifest["cross_domain_boundaries"]:
+        owner = manifest["domains"][entry["owner"]]
+        assert entry["symbol"] in owner["owned_symbols"][entry["path"]]
+    for domain in manifest["domains"]:
+        assert _session_domain_authored_ledger(domain)
+
+
+def _assert_session_domain_accounting(domain: str) -> None:
+    spec = SESSION_DOMAIN_OWNERSHIP["domains"][domain]
+    whole_files = spec["whole_files"]
+    assert len(whole_files) == len(set(whole_files)), f"{domain}: duplicate whole-file ownership"
+    declared_units = set(whole_files)
+    for path, names in spec["owned_symbols"].items():
+        assert len(names) == len(set(names)), f"{domain}: duplicate symbol ownership in {path}"
+        declared_units.update(f"{path}:{name}" for name in names)
+    ledger = _session_domain_authored_ledger(domain)
+    assert declared_units <= ledger.keys(), f"{domain}: declared production units were omitted"
+    assert ledger and all(lines > 0 for lines in ledger.values()), (
+        f"{domain}: missing or empty production units must not silently leave the ledger"
     )
+
+
+def test_session_lifecycle_authored_surface_has_complete_accounting() -> None:
+    _assert_session_domain_accounting("SessionLifecycle")
+
+
+def test_turn_admission_authored_surface_has_complete_accounting() -> None:
+    _assert_session_domain_accounting("TurnAdmission")
+
+
+def test_pending_input_queue_authored_surface_has_complete_accounting() -> None:
+    _assert_session_domain_accounting("PendingInputQueue")
 
 
 def test_session_maintenance_authored_surface_stays_within_large_pr_ceiling() -> None:

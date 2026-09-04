@@ -269,22 +269,6 @@ def _desktop_router_preload_enabled() -> bool:
     return not _desktop_fast_start_enabled()
 
 
-def _make_auto_propose_tool_invoker(
-    registry: ToolRegistry,
-    *,
-    allowed_tools: frozenset[str] = _AUTO_PROPOSE_TOOL_ALLOWLIST,
-) -> Callable[[str, dict[str, Any]], Any]:
-    """Build the unattended auto-propose tool invoker through dispatch policy."""
-
-    from opensquilla.skills.meta.orchestrator import make_tool_invoker_from_handler
-    from opensquilla.tools.dispatch import build_tool_handler
-
-    ctx = _make_auto_propose_tool_context(allowed_tools=allowed_tools)
-    return make_tool_invoker_from_handler(
-        tool_handler=build_tool_handler(registry, ctx),
-    )
-
-
 def _make_auto_propose_tool_context(
     *,
     agent_id: str = "auto_propose",

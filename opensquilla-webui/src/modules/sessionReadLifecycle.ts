@@ -5,6 +5,7 @@ import type {
   ConversationRuntime,
 } from './conversationRuntime'
 import type { ConversationSemanticEventKind } from './conversationEvents'
+import type { ConversationRoutingSnapshot } from './conversationEventContent'
 import type {
   ConversationSubscriptionAttempt,
   ConversationSubscriptionLifecycle,
@@ -52,8 +53,7 @@ export interface SessionReadMetadata {
 
 export interface SessionReadSnapshotEvent {
   readonly semanticKind: ConversationSemanticEventKind
-  /** The event payload is immutable but otherwise opaque to this read Module. */
-  readonly payload: SessionReadJsonObject
+  readonly payload: import('./conversationEventContent').ConversationEventData
 }
 
 export interface SessionReadSnapshot {
@@ -94,7 +94,7 @@ export interface SessionReadMessage {
   readonly text: string
   readonly createdAt: SessionReadTimestamp
   readonly reasoningContent: string | null
-  readonly routerDecision: SessionReadJsonObject | null
+  readonly routerDecision: ConversationRoutingSnapshot | null
   readonly artifacts: readonly SessionReadJsonObject[]
   readonly toolCalls: readonly unknown[]
   readonly timeline: readonly unknown[]

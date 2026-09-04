@@ -12,12 +12,31 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any, Literal, Protocol, TypedDict
 
+from opensquilla.application.turn_acceptance_ports import (
+    AdmissionCollaborationSnapshot,
+    AdmissionRoutingSnapshot,
+)
+from opensquilla.application.turn_input import (
+    DocumentTurnContext,
+    IncomingTurnSource,
+    MemoryCapturePolicy,
+    PlanAdmissionContext,
+)
 from opensquilla.session_key import canonicalize_session_key
 
 type TurnAdmissionSurface = Literal["webchat", "session"]
 type TurnSteerMode = Literal["durable", "legacy"]
 type InitialCollaborationMode = Literal["default", "plan"]
 type InitialRoutingMode = Literal["direct", "router", "ensemble"]
+
+
+class AcceptedCollaboration(TypedDict):
+    mode: str
+    revision: int
+
+
+class AcceptedRouting(TypedDict):
+    mode: str
 
 
 class AdmitTurnResult(TypedDict, total=False):
@@ -34,6 +53,8 @@ class AdmitTurnResult(TypedDict, total=False):
     user_message_id: str | None
     client_message_id: str | None
     clientMessageId: str | None
+    client_request_id: str | None
+    clientRequestId: str | None
     task_id: str | None
     taskId: str | None
     turn_id: str | None
@@ -48,6 +69,12 @@ class AdmitTurnResult(TypedDict, total=False):
     reason: str | None
     acceptedPromptAnnotationIds: list[str] | None
     accepted_prompt_annotation_ids: list[str] | None
+    surface_id: str | None
+    surfaceId: str | None
+    acceptedCollaboration: AcceptedCollaboration
+    collaboration: AdmissionCollaborationSnapshot
+    acceptedRouting: AcceptedRouting
+    routing: AdmissionRoutingSnapshot
 
 
 class CancelTurnResult(TypedDict, total=False):
@@ -65,6 +92,8 @@ class CancelTurnResult(TypedDict, total=False):
     cancelled: bool | None
     cancelled_tasks: int
     cancelled_processes: int
+    cancelled_sessions: int
+    cancelled_compactions: int
 
 
 class SteerTurnResult(TypedDict, total=False):
@@ -111,10 +140,32 @@ class AdmitTurn:
     session_key: str
     message: str
     surface: TurnAdmissionSurface
-    attributes: Mapping[str, Any]
+    source: IncomingTurnSource = IncomingTurnSource()
+    capture: MemoryCapturePolicy = MemoryCapturePolicy()
+    client_request_id: str = ""
+    request_fingerprint: str = ""
+    source_scope: str = ""
+    explicit_request_id: bool = False
+    client_message_id: str | None = None
+    surface_id: str | None = None
+    attachments: tuple[dict[str, Any], ...] = ()
+    intent: str = "continue"
+    intent_was_provided: bool = False
+    fork_before_message_id: str | None = None
+    workspace_id: str | None = None
+    prompt_annotation_ids: tuple[str, ...] = ()
+    document_context: DocumentTurnContext | None = None
+    display_text: str | None = None
+    queue_mode: str | None = None
     initial_collaboration_mode: InitialCollaborationMode | None = None
     initial_routing_mode: InitialRoutingMode | None = None
     pending_input: PendingInputGuard | None = None
+
+    # Only internal Plan/background producers supply these controls. Gateway
+    # decoders never derive them from untrusted request fields.
+    plan: PlanAdmissionContext | None = None
+    trusted_run_kind: str | None = None
+    explicit_intent_registered: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,7 +175,6 @@ class CancelTurn:
     task_id: str | None
     task_scoped: bool
     source: str | None
-    attributes: Mapping[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,7 +182,14 @@ class SteerTurn:
     session_key: str
     message: str
     mode: TurnSteerMode
-    attributes: Mapping[str, Any]
+    expected_turn_id: str | None = None
+    client_request_id: str | None = None
+    client_message_id: str | None = None
+    surface_id: str | None = None
+    source_scope: str = ""
+    request_fingerprint: str = ""
+    is_web_source: bool = True
+    has_non_text_input: bool = False
     pending_input: PendingInputGuard | None = None
 
 

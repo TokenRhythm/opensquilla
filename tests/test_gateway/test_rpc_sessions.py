@@ -2679,7 +2679,9 @@ class TestSessionsSend:
         async def report(_config):
             return unavailable
 
-        monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+        monkeypatch.setattr(
+            "opensquilla.gateway.admission_preparation.current_sandbox_capability_report", report
+        )
         session = FakeSession(
             session_key="agent:main:webchat:safe-fallback",
             origin={
@@ -2748,7 +2750,9 @@ class TestSessionsSend:
         async def report(_config):
             return unavailable
 
-        monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+        monkeypatch.setattr(
+            "opensquilla.gateway.admission_preparation.current_sandbox_capability_report", report
+        )
         session = FakeSession(session_key="agent:main:webchat:guest-no-fallback")
         guest = Principal(
             role="operator",
@@ -2808,7 +2812,9 @@ class TestSessionsSend:
                     status="queued",
                 )
 
-        monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+        monkeypatch.setattr(
+            "opensquilla.gateway.admission_preparation.current_sandbox_capability_report", report
+        )
         configured_workspace = tmp_path / "real-project"
         configured_workspace.mkdir()
         state_dir = tmp_path / "state"
@@ -2887,7 +2893,9 @@ class TestSessionsSend:
                 "GUEST_DEFAULT_WORKSPACE_UNSAFE: guest scratch directory is retargeted"
             )
 
-        monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+        monkeypatch.setattr(
+            "opensquilla.gateway.admission_preparation.current_sandbox_capability_report", report
+        )
         monkeypatch.setattr(rpc_sessions, "_guest_profile_for_principal", fail_profile)
         session = FakeSession(session_key="agent:main:webchat:guest-boundary")
         guest = Principal(
@@ -3411,7 +3419,9 @@ class TestSessionsSend:
         async def report(_config):
             return unavailable
 
-        monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+        monkeypatch.setattr(
+            "opensquilla.gateway.admission_preparation.current_sandbox_capability_report", report
+        )
 
         class RecordingTaskRuntime:
             def __init__(self) -> None:

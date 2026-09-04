@@ -323,23 +323,6 @@ def _sandbox_posture_restart_fingerprint(config: Any) -> dict[str, Any]:
     }
 
 
-def _restart_required(
-    *,
-    old_memory_fingerprint: dict[str, Any],
-    old_channels_fingerprint: Any,
-    old_sandbox_posture_fingerprint: dict[str, Any],
-    new_config: Any,
-) -> bool:
-    return bool(
-        _restart_sections(
-            old_memory_fingerprint=old_memory_fingerprint,
-            old_channels_fingerprint=old_channels_fingerprint,
-            old_sandbox_posture_fingerprint=old_sandbox_posture_fingerprint,
-            new_config=new_config,
-        )
-    )
-
-
 def _restart_sections(
     *,
     old_memory_fingerprint: dict[str, Any],
@@ -349,9 +332,8 @@ def _restart_sections(
 ) -> list[str]:
     """Top-level sections whose restart fingerprint changed old→new.
 
-    Mirrors :func:`_restart_required` but names the gated sections so
-    responses can report *why* a restart is required and so the
-    ``liveApplied`` diff can exclude exactly those sections. The sandbox
+    Names the gated sections so responses can explain a required restart and
+    the ``liveApplied`` diff can exclude exactly those sections. The sandbox
     posture fingerprint spans two top-level sections (``permissions`` and
     ``sandbox``); they are compared per key so the response names only the
     one that actually changed.
@@ -413,9 +395,7 @@ def _change_meta(
 ) -> dict[str, Any]:
     """Build the shared ``restartRequired`` / ``restartSections`` /
     ``liveApplied`` response fields from old fingerprints + old dump vs the
-    candidate config. ``restartRequired`` is ``bool(restartSections)`` and
-    agrees with :func:`_restart_required` (same fingerprints, same
-    comparisons — only named per section)."""
+    candidate config. ``restartRequired`` is ``bool(restartSections)``."""
     restart_sections = _restart_sections(
         old_memory_fingerprint=old_memory_fingerprint,
         old_channels_fingerprint=old_channels_fingerprint,

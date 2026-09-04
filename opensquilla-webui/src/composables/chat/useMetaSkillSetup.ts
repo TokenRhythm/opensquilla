@@ -2,12 +2,9 @@ import { getCurrentScope, onScopeDispose, ref, watch, type Ref } from 'vue'
 
 import { MetaRunCenterError, type MetaRunCenter } from '@/modules/metaRunCenter'
 import type {
-  MetaSetupInstallResponse,
   MetaSetupJob,
-  MetaSetupPlanResponse,
   MetaSetupReadiness,
   MetaSetupState,
-  MetaSetupStatusResponse,
 } from '@/types/metaSetup'
 import type { HiddenControlDispatchResult } from '@/types/chat'
 import { createClientRequestId } from '@/utils/chat/messageIdentity'
@@ -398,9 +395,8 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
       const result = await options.metaRunCenter.setupStatus({
         jobId,
         sessionKey,
-      }) as unknown as MetaSetupStatusResponse
+      })
       if (!isCurrent(token)) return
-      if (!result?.job) throw new Error(result?.error || 'Setup status is unavailable')
       await applyJob(result.job, token)
     } catch (error) {
       if (!isCurrent(token) || !setupState.value) return
@@ -429,10 +425,10 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
         sessionKey: current.sessionKey,
         confirmed: true,
         actionIds: current.actionIds,
-      }) as unknown as MetaSetupInstallResponse
+      })
       if (!isCurrent(token)) return
 
-      if (result?.already_ready) {
+      if (result.alreadyReady) {
         await resumeAfterSetup(
           current.name,
           current.sessionKey,
@@ -441,7 +437,6 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
         )
         return
       }
-      if (!result?.job) throw new Error(result?.error || 'Setup did not start')
       persistJob(current.sessionKey, result.job.job_id)
       persistLaunch(
         current.sessionKey,
@@ -501,17 +496,11 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
       const result = await options.metaRunCenter.setupStatus({
         jobId: persistedJobId,
         sessionKey: originatingSessionKey,
-      }) as unknown as MetaSetupStatusResponse
+      })
       if (options.currentSessionKey.value !== originatingSessionKey) {
         return 'deferred' as const
       }
       if (!isCurrent(token)) return
-      if (!result?.job) {
-        const unavailable = result?.error || 'Setup status is unavailable'
-        if (!isMissingJobError(unavailable)) throw new Error(unavailable)
-        setupState.value = recoverFromMissingJob(originatingSessionKey, next)
-        return
-      }
       const checkpoint = readPersistedSetupCheckpoint(originatingSessionKey)
       const persistedLaunch = readPersistedLaunch(originatingSessionKey)
       const incumbentLaunch = checkpoint?.launchText || persistedLaunch
@@ -693,12 +682,9 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
       return
     }
     try {
-      const result = await options.metaRunCenter.setupPlan(current.name) as unknown as MetaSetupPlanResponse
+      const result = await options.metaRunCenter.setupPlan(current.name)
       if (!isCurrent(token) || !setupState.value) return
       if (options.currentSessionKey.value !== current.sessionKey) return
-      if (!result?.ok || !result.readiness) {
-        throw new Error(result?.error || 'MetaSkill readiness could not be checked')
-      }
 
       if (result.readiness.ready) {
         await resumeAfterSetup(
@@ -910,14 +896,8 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
       const result = await options.metaRunCenter.setupStatus({
         jobId,
         sessionKey,
-      }) as unknown as MetaSetupStatusResponse
+      })
       if (!isCurrent(token) || sessionKey !== options.currentSessionKey.value) return
-      if (!result?.job) {
-        const unavailable = result?.error || 'Setup status is unavailable'
-        if (!isMissingJobError(unavailable)) throw new Error(unavailable)
-        setupState.value = recoverFromMissingJob(sessionKey)
-        return
-      }
       const readiness = result.job.readiness || {}
       setupState.value = {
         ...(checkpoint || {}),

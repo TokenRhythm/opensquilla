@@ -114,7 +114,7 @@ function snapshotResult(
       payload: {
         task_id: 'task-snapshot',
         text_delta: 'hello',
-        opaque_payload: { snake_value: true },
+        input: { snake_value: true },
       },
     }],
     ...patch,
@@ -133,7 +133,7 @@ function historyResult(
       text: 'hello',
       timestamp: 1_725_199_200,
       reasoning_content: '  thinking exactly  ',
-      router_decision: { selected_tier: 'c1' },
+      router_decision: { tier: 'c1' },
       artifacts: [{ artifact_id: 'artifact-1' }],
       tool_calls: [{ tool_name: 'read' }],
       timeline: [{ segment_kind: 'thinking' }],
@@ -260,6 +260,94 @@ async function flushAsyncWork() {
 }
 
 describe('v4 SessionReadPort Adapter', () => {
+  it.each([
+    {
+      name: 'an empty canonical key',
+      wire: { key: '', sessionKey: 'alpha', stream_seq: 1 },
+      expected: { key: 'alpha', stream_seq: 1 },
+    },
+    {
+      name: 'conflicting legacy spellings',
+      wire: { key: 'alpha', sessionKey: 'other', stream_seq: 1, streamSeq: 2 },
+      expected: { key: 'alpha', stream_seq: 1 },
+    },
+    {
+      name: 'finite fractional cursors',
+      wire: { key: 'alpha', epoch: 1.5, stream_seq: 1.5 },
+      expected: { key: 'alpha', epoch: 1.5, stream_seq: 1.5 },
+    },
+    {
+      name: 'finite negative cursors',
+      wire: { key: 'alpha', epoch: -1, stream_seq: -1 },
+      expected: { key: 'alpha', epoch: -1, stream_seq: -1 },
+    },
+    {
+      name: 'a correctly typed legacy fallback',
+      wire: { key: 7, sessionKey: 'alpha', stream_seq: 'bad', streamSeq: 1 },
+      expected: { key: 'alpha', stream_seq: 1 },
+    },
+  ])('preserves snapshot compatibility for $name', async ({ wire, expected }) => {
+    const harness = makeHarness()
+    harness.results.set(SESSIONS_MESSAGES_SNAPSHOT_METHOD, snapshotResult({ events: [{
+      event: 'session.event.text_delta',
+      payload: { ...wire, text: 'visible content' },
+    }] }))
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    try {
+      const live = await lease.live
+      expect(live.snapshot?.events).toEqual([{
+        semanticKind: 'text-delta',
+        payload: { ...expected, text: 'visible content' },
+      }])
+    } finally {
+      await lease.close()
+    }
+  })
+
+  it.each([
+    { event: 'session.event.turn_committed', invalid: { schema_version: 2 } },
+    { event: 'session.event.turn_committed', invalid: { stream_seq: -1 } },
+    { event: 'session.event.turn_committed', invalid: { stream_seq: 1.5 } },
+    { event: 'session.event.turn_committed', invalid: { client_message_id: null } },
+    { event: 'session.event.turn_committed', invalid: { taskId: 'conflicting-task' } },
+  ])('rejects invalid external snapshot receipts through the event boundary: $invalid', async ({ event, invalid }) => {
+    const harness = makeHarness()
+    harness.results.set(SESSIONS_MESSAGES_SNAPSHOT_METHOD, snapshotResult({ events: [{ event, payload: {
+      schema_version: 1, session_key: 'alpha', task_id: 'task-1', turn_id: 'turn-1',
+      status: 'succeeded', terminal_reason: 'completed', finished_at: 123, stream_seq: 2,
+      ...invalid,
+    } }] }))
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    await expect(lease.live).rejects.toThrow()
+    await lease.close()
+  })
+
+  it('projects snapshot identity, terminal proof and authoritative empty resets once', async () => {
+    const harness = makeHarness()
+    harness.results.set(SESSIONS_MESSAGES_SNAPSHOT_METHOD, snapshotResult({ events: [
+      { event: 'session.event.error', payload: {
+        key: 'alpha', activeTask: { taskId: 'task-1', status: 'failed' },
+        streamGeneration: 'stream-1', streamSeq: 2, code: 'usage_accounting_busy',
+        usage_call_index: 1, no_prior_provider_dispatch: true, replay_safe: true,
+        user_message_id: 'user-1', turn_outcome: { kind: 'blocked', reason: 'usage_accounting_busy' },
+      } },
+      { event: 'session.event.answer_generation_reset', payload: {
+        key: 'alpha', task_id: 'task-1', old_generation_epoch: 1, new_generation_epoch: 2,
+        authoritative_text_snapshot: '', authoritativeTextSnapshot: 'stale',
+      } },
+      { event: 'session.event.future_snapshot_event', payload: { key: 'alpha', status: 'failed' } },
+    ] }))
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    const live = await lease.live
+    expect(live.snapshot?.events).toHaveLength(2)
+    expect(live.snapshot?.events[0]).toMatchObject({ semanticKind: 'turn-failed', payload: {
+      key: 'alpha', task_id: 'task-1', stream_generation: 'stream-1', stream_seq: 2,
+      terminalOutcome: { turnId: 'task-1', replaySafe: true, noPriorProviderDispatch: true, userMessageId: 'user-1' },
+    } })
+    expect(live.snapshot?.events[1]).toMatchObject({ semanticKind: 'answer-generation-reset', payload: { authoritative_text_snapshot: '' } })
+    await lease.close()
+  })
+
   it('preserves the established retryability of coded and uncoded failures', () => {
     expect(mapSessionReadError(Object.assign(new Error('invalid'), {
       code: 'INVALID_REQUEST',
@@ -314,7 +402,7 @@ describe('v4 SessionReadPort Adapter', () => {
         sessionKey: 'alpha',
         events: [{
           semanticKind: 'text-delta',
-          payload: { task_id: 'task-snapshot', text_delta: 'hello' },
+          payload: { task_id: 'task-snapshot', text: 'hello' },
         }],
       },
       cursor: {
@@ -328,10 +416,10 @@ describe('v4 SessionReadPort Adapter', () => {
     })
     const snapshotPayload = live.snapshot?.events[0]?.payload
     expect(snapshotPayload).toMatchObject({
-      opaque_payload: { snake_value: true },
+      input: { snake_value: true },
     })
     expect(Object.isFrozen(snapshotPayload)).toBe(true)
-    expect(Object.isFrozen(snapshotPayload?.opaque_payload)).toBe(true)
+    expect(Object.isFrozen(snapshotPayload?.input)).toBe(true)
     let metadataSettled = false
     let historySettled = false
     void lease.metadata.finally(() => { metadataSettled = true })
@@ -403,7 +491,7 @@ describe('v4 SessionReadPort Adapter', () => {
         text: 'hello',
         createdAt: 1_725_199_200,
         reasoningContent: '  thinking exactly  ',
-        routerDecision: { selected_tier: 'c1' },
+        routerDecision: { tier: 'c1' },
         artifacts: [{ artifact_id: 'artifact-1' }],
         toolCalls: [{ tool_name: 'read' }],
         timeline: [{ segment_kind: 'thinking' }],

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from typing import Any, cast
-from uuid import uuid4
 
 import structlog
 
@@ -30,13 +29,6 @@ from opensquilla.gateway.adapters.turn_admission import (
 from opensquilla.gateway.adapters.turn_admission_contract import (
     register_turn_admission_contract,
 )
-from opensquilla.gateway.compaction_target import (
-    effective_session_model,
-    resolve_gateway_compaction_target,
-    resolve_selected_compaction_provider,
-)
-from opensquilla.gateway.config import GatewayConfig
-from opensquilla.gateway.context_overflow import apply_context_overflow_policy
 from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.rpc import (
     RpcContext,
@@ -44,12 +36,6 @@ from opensquilla.gateway.rpc import (
     RpcUnavailableError,
     get_dispatcher,
 )
-from opensquilla.observability.network_policy import (
-    provider_request_correlation_disabled,
-)
-from opensquilla.provider.types import ProviderRequestCorrelation
-from opensquilla.session.compaction import build_compaction_config_from_provider
-from opensquilla.session.compaction_lifecycle import new_compaction_id
 
 _d = get_dispatcher()
 log = structlog.get_logger(__name__)
@@ -76,130 +62,6 @@ def _canonical_webchat_session_key(value: object = None) -> str:
     return webchat_session_key(value)
 
 
-
-
-def _effective_compaction_model(session: object | None) -> str | None:
-    return effective_session_model(session)
-
-
-def _resolve_compaction_provider(ctx: RpcContext, session: object | None) -> object | None:
-    return resolve_selected_compaction_provider(ctx, session)
-
-
-async def _build_context_overflow_compaction_config(ctx: RpcContext, session_key: str):
-    session = None
-    storage = getattr(getattr(ctx, "session_manager", None), "_storage", None)
-    if storage is not None:
-        try:
-            session = await storage.get_session(session_key)
-        except Exception:  # noqa: BLE001
-            session = None
-    compaction_target = resolve_gateway_compaction_target(ctx, session)
-    return build_compaction_config_from_provider(
-        compaction_target.provider,
-        model_override=compaction_target.model or _effective_compaction_model(session),
-        compaction_config=getattr(getattr(ctx, "config", None), "compaction", None),
-        compaction_plan=compaction_target.plan,
-    )
-
-
-async def _enforce_context_overflow(
-    ctx: RpcContext,
-    session_key: str,
-    message: str,
-    *,
-    restricted_turn: bool = False,
-) -> dict | None:
-    """Apply the configured context-overflow policy before a turn runs.
-
-    Returns a stable error envelope when the policy is REFUSE and the
-    payload exceeds the budget; returns ``None`` for every other path
-    (policy consults pass, HARD_TRUNCATE dropped some history in place,
-    AUTO_SUMMARIZE kicked off a compaction). The caller short-circuits
-    on a non-None return.
-    """
-
-    config = ctx.config if isinstance(ctx.config, GatewayConfig) else GatewayConfig()
-
-    transcript: list = []
-    if ctx.session_manager is not None:
-        try:
-            transcript = list(await ctx.session_manager.get_transcript(session_key))
-        except Exception:  # noqa: BLE001 — missing transcript just means "no history"
-            transcript = []
-
-    # Per-session context-budget overrides are independent from runtime/request
-    # timeout resolution, which happens in TurnRunner.
-    # A session-scoped context_budget_tokens override is supported via
-    # ctx.session_manager.get_config(session_key) if present.
-    budget_override = None
-    policy_override = None
-    if ctx.session_manager is not None and hasattr(ctx.session_manager, "get_session_config"):
-        try:
-            session_cfg = await ctx.session_manager.get_session_config(session_key)
-            if session_cfg is not None:
-                budget_override = getattr(session_cfg, "context_budget_tokens", None)
-                policy_override = getattr(session_cfg, "context_overflow_policy", None)
-        except Exception:  # noqa: BLE001
-            pass
-
-    from opensquilla.engine.usage_accounting import bind_usage_accounting_scope
-    from opensquilla.gateway.usage_ledger_runtime import build_session_usage_scope
-
-    usage_scope = await build_session_usage_scope(
-        getattr(ctx, "usage_event_sink", None),
-        ctx.session_manager,
-        session_key,
-        run_kind="session_compaction",
-    )
-    root_operation_id = new_compaction_id()
-    provider_request_correlation = None
-    if not provider_request_correlation_disabled(config=config):
-        try:
-            session = await ctx.session_manager.get_session(session_key)
-        except Exception:  # noqa: BLE001 - observability is best-effort
-            session = None
-        durable_session_id = getattr(session, "session_id", None)
-        if isinstance(durable_session_id, str) and durable_session_id:
-            provider_request_correlation = ProviderRequestCorrelation(
-                session_id=durable_session_id,
-                turn_id=root_operation_id,
-                execution_id=uuid4().hex,
-                call_kind="auxiliary.compaction",
-            )
-    with bind_usage_accounting_scope(usage_scope):
-        outcome = await apply_context_overflow_policy(
-            config=config,
-            message=message,
-            transcript=transcript,
-            session_key=session_key,
-            session_manager=ctx.session_manager,
-            compaction_config=await _build_context_overflow_compaction_config(ctx, session_key),
-            flush_service=getattr(ctx, "flush_service", None),
-            compaction_marker=getattr(ctx, "turn_runner", None),
-            policy_override=policy_override,
-            budget_override=budget_override,
-            provider_request_correlation=provider_request_correlation,
-            root_operation_id=root_operation_id,
-            restricted_turn=restricted_turn,
-        )
-
-    if outcome.refusal is not None:
-        log.warning(
-            "chat_send.context_overflow_refused",
-            session_key=session_key,
-            estimated_tokens=outcome.estimated_tokens,
-            budget_tokens=outcome.budget_tokens,
-        )
-        return outcome.refusal
-
-    if outcome.compacted_this_turn:
-        marker = getattr(ctx, "turn_runner", None)
-        mark = getattr(marker, "mark_compacted_this_turn", None)
-        if callable(mark):
-            mark(session_key)
-
-    return None
 
 
 def _chat_turn_admission_adapter(ctx: RpcContext) -> GatewayTurnAdmissionAdapter:

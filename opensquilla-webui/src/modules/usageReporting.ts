@@ -1,66 +1,63 @@
 import type { InjectionKey } from 'vue'
+import type {
+  UsageRangeSelection,
+  UsageSession,
+  UsageSnapshot,
+} from '@/types/usage'
 
 export interface UsageReportingRequestOptions {
   readonly signal?: AbortSignal
   readonly timeoutMs?: number
 }
 
-export interface UsageStatusSession {
-  readonly session?: string
-  readonly sessionKey?: string
-  readonly key?: string
-  readonly input_tokens?: number
-  readonly inputTokens?: number
-  readonly output_tokens?: number
-  readonly outputTokens?: number
-  readonly cache_read_tokens?: number
-  readonly cacheReadTokens?: number
-  readonly cache_write_tokens?: number
-  readonly cacheWriteTokens?: number
-  readonly cost_usd?: number
-  readonly costUsd?: number
-  readonly model?: string
-  readonly contextStatus?: Readonly<Record<string, unknown>> | null
-  readonly context_status?: Readonly<Record<string, unknown>> | null
-  readonly [key: string]: unknown
+export interface UsageSnapshotRequestOptions extends UsageReportingRequestOptions {
+  readonly days?: boolean
+  readonly models?: boolean
+  readonly sessions?: boolean
+  readonly timezone?: string
+  readonly fallbackRange?: UsageRangeSelection
+  readonly cachedSnapshot?: UsageSnapshot | null
+}
+
+export interface UsageContextStatus {
+  readonly contextTokens: number
+  readonly contextWindowTokens: number
+  readonly pressure: number
+  readonly warningRatio: number
+}
+
+export interface UsageStatusSession extends UsageSession {
+  readonly contextStatus: UsageContextStatus | null
 }
 
 export interface UsageStatusResult {
-  readonly sessions?: readonly UsageStatusSession[]
-  readonly totals?: Readonly<{ tokens?: number; [key: string]: unknown }>
-  readonly totalTokens?: number
-  readonly total_tokens?: number
-  readonly [key: string]: unknown
+  readonly sessions: readonly UsageStatusSession[]
+  readonly totalSessions: number
+  readonly activeSessions: number
+  readonly totalInputTokens: number
+  readonly totalOutputTokens: number
+  readonly totalTokens: number
+  readonly totalCostUsd: number
+  readonly totalCacheReadTokens: number
+  readonly totalCacheWriteTokens: number
 }
 
-export interface UsageReportQuery {
-  readonly schemaVersion?: number
-  readonly range?: Readonly<{ preset?: string }>
-  readonly timezone?: string
-  readonly include?: Readonly<{
-    days?: boolean
-    models?: boolean
-    sessions?: boolean
-  }>
+export interface UsageCostBreakdown {
+  readonly totalCostUsd: number
+  readonly sessions: readonly UsageSession[]
 }
 
-export type UsageQueryResult = Readonly<Record<string, unknown>>
-export type UsageCostBreakdown = Readonly<Record<string, unknown>>
-
-/** Business usage reporting; Gateway method availability stays in the Adapter. */
+/** Business usage reporting; wire availability and compatibility stay in the Adapter. */
 export interface UsageReporting {
+  snapshot(
+    range: UsageRangeSelection,
+    options?: UsageSnapshotRequestOptions,
+  ): Promise<UsageSnapshot>
   status(
     sessionKey?: string,
     options?: UsageReportingRequestOptions,
   ): Promise<UsageStatusResult>
-  query(
-    query: UsageReportQuery,
-    options?: UsageReportingRequestOptions,
-  ): Promise<UsageQueryResult>
-  costBreakdown(
-    query?: UsageReportQuery,
-    options?: UsageReportingRequestOptions,
-  ): Promise<UsageCostBreakdown>
+  costBreakdown(options?: UsageReportingRequestOptions): Promise<UsageCostBreakdown>
 }
 
 export const USAGE_REPORTING_KEY: InjectionKey<UsageReporting> = Symbol('UsageReporting')

@@ -2,25 +2,17 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import uuid
-from collections.abc import Awaitable, Mapping
-from dataclasses import dataclass
+from collections.abc import Mapping
 from typing import Any
 
+from opensquilla.application.turn_admission import AdmitTurnResult
+from opensquilla.application.turn_input import TurnRequestIdentity as TurnRequestIdentity
+from opensquilla.application.turn_input import complete_durable_ingress as complete_durable_ingress
 from opensquilla.session.keys import canonicalize_session_key
 from opensquilla.session.storage import TurnAcceptanceResult
-
-
-@dataclass(frozen=True)
-class TurnRequestIdentity:
-    source_scope: str
-    request_session_key: str
-    client_request_id: str
-    request_fingerprint: str
-
 
 _FINGERPRINT_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("message", ("message",)),
@@ -132,9 +124,9 @@ def accepted_turn_payload(
     result: TurnAcceptanceResult,
     *,
     client_request_id: str,
-) -> dict[str, Any]:
+) -> AdmitTurnResult:
     receipt = result.receipt
-    payload = {
+    payload: AdmitTurnResult = {
         "status": "accepted",
         "accepted": True,
         "key": receipt.accepted_session_key,
@@ -151,23 +143,3 @@ def accepted_turn_payload(
         payload["task_status"] = task_status
         payload["taskStatus"] = task_status
     return payload
-
-
-async def complete_durable_ingress[T](awaitable: Awaitable[T]) -> T:
-    """Finish an ingress commit/activation pair even if its caller is cancelled.
-
-    Once queue admission has been reserved, cancellation must not split the
-    durable acceptance transaction from runtime activation.  The inner task is
-    shielded and repeated cancellation requests are deferred until that small
-    critical section settles.  Returning its result intentionally consumes the
-    caller cancellation: a disconnected transport may drop the response, while
-    its stable request id makes a later replay safe.
-    """
-
-    task = asyncio.ensure_future(awaitable)
-    while True:
-        try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            if task.done():
-                return task.result()

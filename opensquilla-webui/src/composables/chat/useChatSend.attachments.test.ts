@@ -5477,11 +5477,11 @@ describe('useChatSend attachment payloads', () => {
 
       rpcEvents.handlers.onTaskRunning({
         task_id: 'task-A',
-        session_key: 'agent:main:webchat:test',
+        key: 'agent:main:webchat:test',
       })
       rpcEvents.handlers.onTextDelta({
         task_id: 'task-A',
-        session_key: 'agent:main:webchat:test',
+        key: 'agent:main:webchat:test',
         stream_seq: 1,
         text: 'A token before B ACK',
       })

@@ -1,15 +1,20 @@
+import type {
+  ConversationEnsembleProgress,
+  ConversationRoutingDecision,
+} from '@/modules/conversationEventContent'
 import { ref, type Ref } from 'vue'
-import type { ChatEnsembleMeta, ChatEnsembleMetaModel, ChatMessage } from '@/types/chat'
-import type { EnsembleProgressPayload, RouterDecisionPayload } from '@/types/chat'
+import type {
+  ChatEnsembleMeta,
+  ChatEnsembleMetaModel,
+  ChatMessage,
+} from '@/types/chat'
+
 import { normalizeEnsembleMemberRole } from '@/utils/ensembleRoles'
 import {
   type NormalizedRouterDecision,
   normalizeRouterDecision,
   shortModelName,
 } from '@/composables/chat/useChatRenderedMessages'
-
-const LEGACY_QUORUM_CANCELLED_ERROR =
-  /^proposer cancelled after \d+(?:\.\d+)?s ensemble quorum grace$/
 
 export interface UseChatRouterDecisionRuntimeOptions {
   messages: Ref<ChatMessage[]>
@@ -29,7 +34,7 @@ export interface UseChatRouterDecisionRuntimeOptions {
 
 export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRuntimeOptions) {
   const pendingRouterDecision = ref<{
-    payload: RouterDecisionPayload
+    payload: ConversationRoutingDecision
     decision: NormalizedRouterDecision
     messageId: string
   } | null>(null)
@@ -50,8 +55,8 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     scrollToBottomIfFollowing()
   }
 
-  function payloadTurnId(payload: RouterDecisionPayload | EnsembleProgressPayload): string {
-    return String(payload.turn_id || payload.turnId || payload.task_id || payload.taskId || '').trim()
+  function payloadTurnId(payload: ConversationRoutingDecision | ConversationEnsembleProgress): string {
+    return String(payload.turn_id || payload.task_id || '').trim()
   }
 
   function latestExplicitTurnId(): string {
@@ -113,7 +118,7 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     turnId: string,
   ): NormalizedRouterDecision {
     const acceptedMode = String(
-      decision.accepted_routing_mode || decision.acceptedRoutingMode || '',
+      decision.accepted_routing_mode || '',
     ).trim()
     const expectedTurnId = String(options.activeTurnId.value || '').trim()
     if (
@@ -149,7 +154,7 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
   }
 
   function routerDecisionMessageId(
-    payload: RouterDecisionPayload,
+    payload: ConversationRoutingDecision,
     identityStreamSeq?: number,
   ): string {
     const streamSeq = validIdentityStreamSeq(payload.stream_seq)
@@ -160,7 +165,7 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
   }
 
   function appendRouterDecision(
-    payload: RouterDecisionPayload,
+    payload: ConversationRoutingDecision,
     decision: NormalizedRouterDecision,
     messageId: string,
   ) {
@@ -181,7 +186,7 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     scrollToBottomIfFollowing()
   }
 
-  function queueRouterDecision(payload: RouterDecisionPayload, identityStreamSeq?: number) {
+  function queueRouterDecision(payload: ConversationRoutingDecision, identityStreamSeq?: number) {
     const normalizedDecision = normalizeRouterDecision(payload)
     if (!normalizedDecision) return
     const decision = freezeAcceptedRoutingMode(
@@ -223,16 +228,14 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     }
   }
 
-  function memberFromEnsembleProgress(payload: EnsembleProgressPayload): ChatEnsembleMetaModel | null {
+  function memberFromEnsembleProgress(payload: ConversationEnsembleProgress): ChatEnsembleMetaModel | null {
     const model = String(payload.proposer_model || '').trim()
     const isAggregator = payload.event_type === 'aggregator_start' || payload.event_type === 'aggregator_finish'
     if (!model && !isAggregator) return null
     const role = normalizeEnsembleMemberRole(isAggregator ? 'aggregator' : 'proposer')
     const finished = payload.event_type === 'proposer_finish' || payload.event_type === 'aggregator_finish'
     const error = String(payload.error || '').trim()
-    const explicitErrorCode = String(payload.error_code || '').trim()
-    const errorCode = explicitErrorCode
-      || (LEGACY_QUORUM_CANCELLED_ERROR.test(error) ? 'quorum_cancelled' : '')
+    const errorCode = String(payload.error_code || '').trim()
     return {
       role,
       label: role,
@@ -275,9 +278,9 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
 
   function isEnsembleRouterMessage(message: ChatMessage): boolean {
     const decision = message.routerDecision || null
-    const source = String(decision?.source || decision?.routing_source || '').toLowerCase()
+    const source = String(decision?.source || '').toLowerCase()
     const acceptedMode = String(
-      decision?.accepted_routing_mode || decision?.acceptedRoutingMode || '',
+      decision?.accepted_routing_mode || '',
     ).toLowerCase()
     return source.includes('ensemble')
       || acceptedMode === 'ensemble'
@@ -335,7 +338,7 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
   // Accumulate an ensemble_progress delta onto the live turn's router message so
   // the strip reveals members incrementally. Mirrors appendRouterDecision: find
   // the in-flight router message, else synthesize one.
-  function appendEnsembleProgress(payload: EnsembleProgressPayload) {
+  function appendEnsembleProgress(payload: ConversationEnsembleProgress) {
     const member = memberFromEnsembleProgress(payload)
     if (!member) return
 

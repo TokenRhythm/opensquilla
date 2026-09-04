@@ -34,7 +34,7 @@ import {
   validateSessionsMessagesUnsubscribeParams,
   validateSessionsMessagesUnsubscribeResult,
 } from '@/contracts/generated/v4/sessionsMessagesUnsubscribeValidators.mjs'
-import { conversationSemanticEventKind } from './conversationEventsV4'
+import { projectConversationSnapshotEvent } from './conversationContentV4'
 import {
   requestV4SessionHistory,
   type SessionHistoryV4Policy,
@@ -331,10 +331,10 @@ function projectSnapshot(value: SessionsMessagesSnapshotResult): SessionReadSnap
   return Object.freeze({
     sessionKey: value.key,
     taskId: value.task_id,
-    events: Object.freeze(value.events.map(event => Object.freeze({
-      semanticKind: conversationSemanticEventKind(event.event),
-      payload: projectObject(event.payload) ?? Object.freeze({}),
-    }))),
+    events: Object.freeze(value.events.flatMap(event => {
+      const projected = projectConversationSnapshotEvent(event.event, projectObject(event.payload))
+      return projected ? [Object.freeze({ ...projected, payload: Object.freeze(projected.payload) })] : []
+    })),
   })
 }
 

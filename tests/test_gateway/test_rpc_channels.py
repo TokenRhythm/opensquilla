@@ -15,9 +15,9 @@ from opensquilla.channels.contract import (
     ChannelPlatformCategories,
 )
 from opensquilla.gateway.auth import Principal
+from opensquilla.gateway.channel_status_runtime import status_for as _status_for
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
-from opensquilla.gateway.rpc_channels import _status_for
 from opensquilla.onboarding.mutations import upsert_channel
 
 

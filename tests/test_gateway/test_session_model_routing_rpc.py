@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import pytest
 
-from opensquilla.application.pending_input_queue import PendingInputRequest
+from opensquilla.gateway.adapters.pending_input_queue import GatewayPendingInputQueueAdapter
+from opensquilla.gateway.admission_input import decode_admit_turn
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.pending_input_primitives import pending_input_payload
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError
 from opensquilla.gateway.rpc_sessions import (
-    _enqueue_pending_input,
     _handle_sessions_routing_get,
     _handle_sessions_routing_set,
-    _pending_input_send_payload,
 )
 from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
 from opensquilla.session.manager import SessionManager
@@ -91,38 +91,36 @@ def test_session_routing_rpc_scopes_are_explicit() -> None:
 
 
 def test_pending_input_payload_preserves_initial_routing_mode() -> None:
-    payload = _pending_input_send_payload(
+    turn = decode_admit_turn(
         {
+            "key": "agent:main:webchat:routing-pending",
             "message": "queued first turn",
             "clientRequestId": "routing-pending-request",
             "clientMessageId": "routing-pending-message",
             "intent": "new_chat",
             "initialRoutingMode": "ensemble",
         },
-        key="agent:main:webchat:routing-pending",
     )
+    payload = pending_input_payload(turn, False)
 
     assert payload["initialRoutingMode"] == "ensemble"
 
 
 @pytest.mark.asyncio
 async def test_pending_input_rejects_new_session_routing_before_staging() -> None:
-    ctx = RpcContext(conn_id="routing-pending", config=GatewayConfig())
+    adapter = GatewayPendingInputQueueAdapter(object())
 
     with pytest.raises(RpcHandlerError) as caught:
-        await _enqueue_pending_input(
-            PendingInputRequest(
-                session_key="agent:main:webchat:routing-pending",
-                pending_input_id="routing-pending-input",
-                attributes={
-                    "clientRequestId": "routing-pending-request",
-                    "clientMessageId": "routing-pending-message",
-                    "message": "queued first turn",
-                    "intent": "new_chat",
-                    "initialRoutingMode": "ensemble",
-                },
-            ),
-            ctx,
+        await adapter.enqueue(
+            {
+                "key": "agent:main:webchat:routing-pending",
+                "pendingInputId": "routing-pending-input",
+                "clientRequestId": "routing-pending-request",
+                "clientMessageId": "routing-pending-message",
+                "message": "queued first turn",
+                "intent": "new_chat",
+                "initialRoutingMode": "ensemble",
+            }
         )
 
     assert caught.value.code == "PENDING_INITIAL_ROUTING_UNSUPPORTED"

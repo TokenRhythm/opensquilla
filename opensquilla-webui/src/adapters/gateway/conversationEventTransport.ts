@@ -9,6 +9,7 @@ import {
   decodeConversationEvent,
 } from './conversationEventsV4'
 import type { TransportEventHandler } from './transportTypes'
+import { projectConversationContent, projectConversationEvent } from './conversationContentV4'
 
 interface ConversationEventWireSource {
   subscribe(
@@ -67,8 +68,7 @@ export function createConversationEventTransport(events: ConversationEventWireSo
       if (eventName === 'sessions.changed') {
         handlers.onEvent?.({
           kind: 'sessions-changed',
-          payload: rawPayload,
-          meta: rawMeta,
+          payload: projectConversationContent(rawPayload),
         })
         return
       }
@@ -79,20 +79,16 @@ export function createConversationEventTransport(events: ConversationEventWireSo
           kind: 'approval',
           action: semanticKind === 'approval-requested' ? 'requested' : 'resolved',
           sessionKey: rawSessionKey(rawPayload),
-          payload: rawPayload,
-          meta: rawMeta,
+          payload: projectConversationContent(rawPayload),
         })
         return
       }
 
       try {
         const decoded = decodeConversationEvent(eventName, rawPayload, rawMeta)
-        const { name: _wireName, ...event } = decoded
         handlers.onEvent?.({
           kind: 'conversation',
-          event: event as ConversationEventProjection,
-          payload: rawPayload,
-          meta: rawMeta,
+          event: projectConversationEvent(decoded),
         })
       } catch (error) {
         // A malformed or unrelated frame must not take down the shared event

@@ -3776,7 +3776,7 @@ async def test_hot_kill_switch_pauses_leased_goal_and_blocks_new_provider_turn(
             runtime_budget_seconds=3_600,
         )
 
-        await _notify_goal_config_changed(stack.context, previous_config)
+        await _notify_goal_config_changed(stack.runtime, previous_config)
         paused = await stack.storage.get_goal(SOURCE_KEY)
         assert paused is not None
         assert paused.status == "paused"

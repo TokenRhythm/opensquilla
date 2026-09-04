@@ -10,7 +10,6 @@ import structlog
 from opensquilla.application.cron_scheduler import (
     CronJobIdentityResult,
     CronJobMutation,
-    CronJobMutationValues,
     CronJobProjection,
     CronJobTarget,
     CronListQuery,
@@ -56,7 +55,6 @@ from opensquilla.scheduler.payloads import (
     payload_text,
 )
 from opensquilla.scheduler.schedule_normalizer import (
-    coerce_schedule,
     coerce_schedule_from_params,
 )
 from opensquilla.scheduler.types import (
@@ -354,15 +352,6 @@ def _iso(dt: object) -> str | None:
     if isinstance(dt, str):
         return dt
     return dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
-
-
-def _coerce_schedule(raw: Any) -> tuple[ScheduleKind, str, str]:
-    if not isinstance(raw, dict):
-        raise ValueError(
-            "schedule must be an object {kind:'cron'|'every'|'at', ...}; "
-            f"got {type(raw).__name__}"
-        )
-    return coerce_schedule(raw)
 
 
 def _schedule_from_params(params: dict[str, Any]) -> tuple[ScheduleKind, str, str]:
@@ -971,34 +960,6 @@ async def _update_cron_job(
     if job is None:
         raise KeyError(f"Cron job not found: {job_id}")
     return _job_to_wire(job)
-
-
-async def _handle_cron_add(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    """Compatibility entry point for direct callers outside contract registration."""
-
-    if not isinstance(params, dict):
-        raise ValueError("params required: schedule (object) or expression (string)")
-    return await _create_cron_job(
-        CronJobMutation(cast(CronJobMutationValues, params)),
-        ctx,
-    )
-
-
-async def _handle_cron_update(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    """Compatibility entry point for direct callers outside contract registration."""
-
-    if not isinstance(params, dict) or "id" not in params:
-        raise ValueError("params.id is required")
-    return await _update_cron_job(
-        CronJobMutation(
-            cast(
-                CronJobMutationValues,
-                {key: value for key, value in params.items() if key != "id"},
-            ),
-            cast(str, params["id"]),
-        ),
-        ctx,
-    )
 
 
 class _CronSchedulerRuntime(CronSchedulerPort):

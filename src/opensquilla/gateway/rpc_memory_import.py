@@ -28,7 +28,6 @@ from opensquilla.gateway.profile_import_startup import (
     run_profile_import_startup_maintenance,
     run_profile_import_startup_recovery,
     shared_profile_state_dir,
-    startup_profile_import_service,
 )
 from opensquilla.gateway.profile_import_startup import (
     bounded_await as _bounded_await,
@@ -787,14 +786,6 @@ async def _refresh_recovered_runtime(
         batch_ids=batch_ids,
         force_full_sync=force_full_sync,
         timeout_seconds=timeout_seconds,
-    )
-
-
-def _startup_profile_import_service(ctx: RpcContext, agent_id: str) -> Any:
-    return startup_profile_import_service(
-        config=getattr(ctx, "config", None),
-        memory_managers=getattr(ctx, "memory_managers", None) or {},
-        agent_id=agent_id,
     )
 
 

@@ -432,10 +432,10 @@ describe('clarify tool-result recovery', () => {
     const runtime = await harness()
     try {
       runtime.emitToolResult({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result,
+        approvalResult: result,
       })
 
       expect(runtime.approvals.pendingClarify.value).toEqual({
@@ -498,10 +498,10 @@ describe('clarify tool-result recovery', () => {
     const runtime = await harness()
     try {
       runtime.emitToolResult({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: planClarifyResult,
+        approvalResult: planClarifyResult,
       })
       runtime.rpcCall.mockRejectedValueOnce(new Error('connection lost after send'))
       await runtime.approvals.submitClarify({ scope: 'focused' })
@@ -531,10 +531,10 @@ describe('clarify tool-result recovery', () => {
     const runtime = await harness()
     try {
       runtime.emitToolResult({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: planClarifyResult,
+        approvalResult: planClarifyResult,
       })
       runtime.rpcCall.mockRejectedValueOnce(new Error('gateway unavailable'))
       await runtime.approvals.submitClarify({ scope: 'focused' })
@@ -556,16 +556,16 @@ describe('clarify tool-result recovery', () => {
     try {
       const handler = runtime.emitToolResult
       handler({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: clarifyResult,
+        approvalResult: clarifyResult,
       })
       handler({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: {
+        approvalResult: {
           kind: 'user_input',
           status: 'answered',
           paused: false,
@@ -594,10 +594,10 @@ describe('clarify tool-result recovery', () => {
     const runtime = await harness()
     try {
       runtime.emitToolResult({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: planClarifyResult,
+        approvalResult: planClarifyResult,
       })
       runtime.rpcCall.mockRejectedValueOnce(new Error('gateway unavailable'))
 
@@ -627,10 +627,10 @@ describe('clarify tool-result recovery', () => {
     try {
       const handler = runtime.emitToolResult
       handler({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: planClarifyResult,
+        approvalResult: planClarifyResult,
       })
       runtime.rpcCall.mockImplementationOnce(async <T,>() => await submitted.promise as T)
       const firstSubmit = runtime.approvals.submitClarify({ scope: 'focused' })
@@ -640,10 +640,10 @@ describe('clarify tool-result recovery', () => {
       ))
 
       handler({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-2',
+        key: 'agent:main:web',
+        id: 'request-input-2',
         name: 'request_user_input',
-        result: {
+        approvalResult: {
           ...planClarifyResult,
           request_id: 'input-request-2',
           run_id: 'plan-run-2',
@@ -671,20 +671,20 @@ describe('clarify tool-result recovery', () => {
     try {
       const handler = runtime.emitToolResult
       handler({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-2',
+        key: 'agent:main:web',
+        id: 'request-input-2',
         name: 'request_user_input',
-        result: {
+        approvalResult: {
           ...planClarifyResult,
           request_id: 'input-request-2',
           run_id: 'plan-run-2',
         },
       })
       handler({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: {
+        approvalResult: {
           kind: 'user_input',
           status: 'answered',
           paused: false,
@@ -707,10 +707,10 @@ describe('clarify tool-result recovery', () => {
     try {
       const handler = runtime.emitToolResult
       handler({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: {
+        approvalResult: {
           kind: 'user_input',
           status: 'answered',
           paused: false,
@@ -721,10 +721,10 @@ describe('clarify tool-result recovery', () => {
       const appendCount = runtime.appendInterruptFrame.mock.calls.length
 
       handler({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: planClarifyResult,
+        approvalResult: planClarifyResult,
       })
 
       expect(runtime.approvals.pendingClarify.value).toBeNull()
@@ -741,10 +741,10 @@ describe('clarify tool-result recovery', () => {
     const runtime = await harness()
     try {
       runtime.emitToolResult({
-        session_key: 'agent:main:web',
-        tool_use_id: 'legacy-clarify',
+        key: 'agent:main:web',
+        id: 'legacy-clarify',
         name: 'request_user_input',
-        result: {
+        approvalResult: {
           ...clarifyResult,
           request_id: undefined,
         },

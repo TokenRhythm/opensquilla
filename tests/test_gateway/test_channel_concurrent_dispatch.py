@@ -517,7 +517,6 @@ async def test_cap_full_no_transcript_pollution() -> None:
             "opensquilla.gateway.channel_dispatch._record_delivery_context",
             new=AsyncMock(return_value=(MagicMock(), False)),
         ),
-        patch("opensquilla.gateway.channel_dispatch._should_skip_unmentioned", return_value=False),
         patch(
             "opensquilla.gateway.channel_dispatch._ingest_channel_message_attachments",
             new=AsyncMock(return_value=MagicMock(text="hello", attachments=[])),
@@ -796,7 +795,6 @@ async def test_apply_overflow_policy_invoked_when_channel_override_present() -> 
             "opensquilla.gateway.channel_dispatch._record_delivery_context",
             new=AsyncMock(return_value=(MagicMock(), False)),
         ),
-        patch("opensquilla.gateway.channel_dispatch._should_skip_unmentioned", return_value=False),
         patch(
             "opensquilla.gateway.channel_dispatch._ingest_channel_message_attachments",
             new=AsyncMock(return_value=MagicMock(text="hello", attachments=[])),
@@ -907,7 +905,6 @@ async def test_apply_overflow_policy_not_invoked_without_channel_override() -> N
             "opensquilla.gateway.channel_dispatch._record_delivery_context",
             new=AsyncMock(return_value=(MagicMock(), False)),
         ),
-        patch("opensquilla.gateway.channel_dispatch._should_skip_unmentioned", return_value=False),
         patch(
             "opensquilla.gateway.channel_dispatch._ingest_channel_message_attachments",
             new=AsyncMock(return_value=MagicMock(text="hello", attachments=[])),

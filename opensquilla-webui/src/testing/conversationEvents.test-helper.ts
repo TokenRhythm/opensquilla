@@ -7,11 +7,12 @@ import {
   conversationEventSessionKey,
   type ConversationEvent,
 } from '@/modules/conversationEvents'
+import type { ConversationEventData } from '@/modules/conversationEventContent'
 
 export interface ConversationEventsTestHarness {
   readonly events: ConversationEventHub<ConversationEvent>
   emit(event: ConversationEvent): void
-  emitToolResult(payload: Readonly<Record<string, unknown>>): void
+  emitToolResult(payload: ConversationEventData): void
 }
 
 /** Domain-level Conversation event source for consumer tests. */
@@ -34,20 +35,14 @@ export function createConversationEventsTestHarness(): ConversationEventsTestHar
     events,
     emit,
     emitToolResult(payload) {
-      const sessionKey = typeof payload.sessionKey === 'string'
-        ? payload.sessionKey
-        : typeof payload.session_key === 'string'
-          ? payload.session_key
-          : null
+      const sessionKey = payload.key ?? null
       emit({
         kind: 'conversation',
         event: {
           kind: 'known',
           semanticKind: 'tool-result',
-          isKnown: true,
           payload,
-          rawPayload: payload,
-          meta: null,
+          meta: {},
           sessionKey,
           taskId: null,
           turnId: null,
@@ -55,11 +50,7 @@ export function createConversationEventsTestHarness(): ConversationEventsTestHar
           streamSeq: null,
           connectionSeq: null,
           generationEpoch: null,
-          schemaVersion: 1,
-          legacy: false,
         },
-        payload,
-        meta: null,
       })
     },
   }

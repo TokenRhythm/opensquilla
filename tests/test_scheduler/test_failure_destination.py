@@ -18,7 +18,12 @@ from typing import Any
 import pytest
 
 from opensquilla.gateway.rpc import RpcContext
-from opensquilla.gateway.rpc_cron import _handle_cron_add, _job_to_wire
+from opensquilla.gateway.rpc_cron import (
+    _cron_create_contract as _handle_cron_add,
+)
+from opensquilla.gateway.rpc_cron import (
+    _job_to_wire,
+)
 from opensquilla.scheduler.delivery import DeliveryChain
 from opensquilla.scheduler.jobs import (
     execute_with_timeout,

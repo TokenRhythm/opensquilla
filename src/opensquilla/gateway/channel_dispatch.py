@@ -4,7 +4,7 @@ The main ``run_channel_dispatch`` function is a thin orchestrator (~25 lines)
 that delegates to private helpers for each concern:
 
 - ``_record_delivery_context`` — persist routing fields on session (Gap 1)
-- ``_should_skip_unmentioned`` — mention gating for groups (Gap 2)
+- ``decide_channel_admission`` — mention gating for groups (Gap 2)
 - ``_start_typing_keepalive`` — background typing indicator (Gap 3)
 - ``_run_turn_with_streaming`` — streaming or batch reply (Gap 4)
 - ``_emit_events`` — broadcast session events to WS subscribers (Gap 5)
@@ -1923,19 +1923,6 @@ async def resolve_delivery_target(
     }
 
 
-# ── Gap 2: Authenticated admission / mention gating ─────────────────────
-
-
-def _should_skip_unmentioned(
-    channel: Any,
-    msg: IncomingMessage,
-    session_key: str,
-) -> bool:
-    """Compatibility wrapper around the shared pre-dispatch admission decision."""
-
-    return not decide_channel_admission(channel, msg, session_key).admit
-
-
 # ── Gap 3: Typing indicator ──────────────────────────────────────────────
 
 
@@ -2027,21 +2014,6 @@ async def _emit_run_heartbeat(
             "message": event.message,
         },
     )
-
-
-def _is_channel_admin_sender(config: Any, envelope: Any) -> bool:
-    """Compatibility matcher for callers that only have a route envelope.
-
-    This helper intentionally does not authorize a turn.  Channel dispatch
-    uses ``_stamp_channel_admin_principal`` below, which also proves the
-    authenticated ingress principal.
-    """
-
-    source_name = getattr(envelope, "source_name", None)
-    sender_id = getattr(envelope, "sender_id", None)
-    if not isinstance(source_name, str) or not isinstance(sender_id, str):
-        return False
-    return _sender_is_channel_admin(config, source_name, sender_id)
 
 
 def _stamp_channel_admin_principal(

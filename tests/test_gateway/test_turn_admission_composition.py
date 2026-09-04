@@ -90,7 +90,13 @@ async def test_wire_surfaces_execute_one_shared_turn_application_once(
         ),
         (
             "sessions.steer.v2",
-            {"key": "agent:main:webchat:shared", "message": "guide"},
+            {
+                "key": "agent:main:webchat:shared",
+                "message": "guide",
+                "expected_turn_id": "turn-1",
+                "client_request_id": "request-1",
+                "client_message_id": "client-1",
+            },
             SteerTurn,
             "durable",
         ),

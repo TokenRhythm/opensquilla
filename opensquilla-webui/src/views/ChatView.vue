@@ -4099,8 +4099,8 @@ const chatRpcSubscriptions = useChatRpcSubscriptions({
   // The private v4 adapter emits one semantic message. Feed that projection to
   // both business consumers without exposing protocol names in the view.
   onEvent: (message) => {
-    if (message.kind === 'conversation') {
-      stallWatchdog.noteEvent(message.event.semanticKind, message.payload)
+    if (message.kind === 'conversation' && message.event.kind === 'known' && message.event.semanticKind !== 'cron-result') {
+      stallWatchdog.noteEvent(message.event.semanticKind, message.event.payload)
     } else if (message.kind === 'approval') {
       stallWatchdog.noteEvent(
         message.action === 'requested' ? 'approval-requested' : 'approval-resolved',

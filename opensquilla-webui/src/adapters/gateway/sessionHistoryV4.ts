@@ -21,6 +21,7 @@ import {
   type SessionReadTurnOutcome,
 } from '@/modules/sessionReadLifecycle'
 import { mapSessionReadError } from './sessionReadErrorMapping'
+import { projectConversationRoutingSnapshot } from './conversationContentV4'
 
 const DEFAULT_HISTORY_BUDGET_MS = 15_000
 
@@ -142,6 +143,7 @@ function projectMessage(value: ChatHistoryMessage, index: number): SessionReadMe
   const messageId = textValue(value.message_id)
   const transcriptId = textValue(value.transcript_id)
   const usageRaw = objectValue(raw.turn_usage ?? raw.turnUsage ?? raw.usage)
+  const routing = objectValue(raw.router_decision ?? raw.routerDecision)
   const reasoning = raw.reasoning_content ?? raw.reasoningContent
   const timestamp = value.timestamp ?? value.ts
   return Object.freeze({
@@ -155,7 +157,9 @@ function projectMessage(value: ChatHistoryMessage, index: number): SessionReadMe
       : null,
     // Reasoning can intentionally contain leading/trailing whitespace.
     reasoningContent: typeof reasoning === 'string' ? reasoning : null,
-    routerDecision: projectObject(raw.router_decision ?? raw.routerDecision),
+    routerDecision: routing
+      ? Object.freeze(projectConversationRoutingSnapshot(projectJson(routing)))
+      : null,
     artifacts: projectObjectArray(raw.artifacts),
     toolCalls: projectUnknownArray(raw.tool_calls ?? raw.toolCalls),
     timeline: projectUnknownArray(raw.timeline),
