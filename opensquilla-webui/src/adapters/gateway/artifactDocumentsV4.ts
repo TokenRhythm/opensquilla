@@ -1,5 +1,12 @@
 import type { RpcCallOptions } from '@/lib/rpc'
-import type { ArtifactDocumentProvider } from '@/modules/artifactWorkbench'
+import type {
+  ArtifactDocumentProvider,
+  CloseArtifactDocument,
+  ReadArtifactSource,
+  RenameArtifactDocument,
+  RestoreArtifactRevision,
+  RevertArtifactChangeSet,
+} from '@/modules/artifactWorkbench'
 
 interface V4RpcTransport {
   request<T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions): Promise<T>
@@ -31,29 +38,37 @@ import type {
 } from '@/types/artifactDocuments'
 import type { ArtifactPayload } from '@/types/artifacts'
 import { isOfficeArtifact } from '@/utils/chat/artifacts'
+import {
+  acceptsWorkbenchResult,
+  artifactDocumentContracts,
+} from './artifactWorkbenchContracts'
 
 export { isOfficeArtifact } from '@/utils/chat/artifacts'
 
 export const ARTIFACT_DOCUMENT_RPC_METHODS = {
-  capabilities: 'artifacts.edit.capabilities',
-  documentsList: 'artifacts.documents.list',
-  documentsGet: 'artifacts.documents.get',
-  documentsOpen: 'artifacts.documents.open',
-  documentsClose: 'artifacts.documents.close',
-  documentsRename: 'artifacts.documents.rename',
-  revisionsList: 'artifacts.revisions.list',
-  revisionsRestore: 'artifacts.revisions.restore',
-  changesList: 'artifacts.changes.list',
-  changesGet: 'artifacts.changes.get',
-  changesRevert: 'artifacts.changes.revert',
-  sourceRead: 'artifacts.source.read',
-  sourcePatch: 'artifacts.source.patch',
-  mutationResolve: 'artifacts.mutations.resolve',
-  editSessionStart: 'documents.editSessions.start',
-  editSessionHeartbeat: 'documents.editSessions.heartbeat',
-  editSessionClose: 'documents.editSessions.close',
-  legacyGet: 'artifacts.get',
+  capabilities: artifactDocumentContracts.capabilities.method,
+  documentsList: artifactDocumentContracts.documentsList.method,
+  documentsGet: artifactDocumentContracts.documentsGet.method,
+  documentsOpen: artifactDocumentContracts.documentsOpen.method,
+  documentsClose: artifactDocumentContracts.documentsClose.method,
+  documentsRename: artifactDocumentContracts.documentsRename.method,
+  revisionsList: artifactDocumentContracts.revisionsList.method,
+  revisionsRestore: artifactDocumentContracts.revisionsRestore.method,
+  changesList: artifactDocumentContracts.changesList.method,
+  changesGet: artifactDocumentContracts.changesGet.method,
+  changesRevert: artifactDocumentContracts.changesRevert.method,
+  sourceRead: artifactDocumentContracts.sourceRead.method,
+  sourcePatch: artifactDocumentContracts.sourcePatch.method,
+  mutationResolve: artifactDocumentContracts.mutationResolve.method,
+  editSessionStart: artifactDocumentContracts.editSessionStart.method,
+  editSessionHeartbeat: artifactDocumentContracts.editSessionHeartbeat.method,
+  editSessionClose: artifactDocumentContracts.editSessionClose.method,
+  legacyGet: artifactDocumentContracts.legacyGet.method,
 } as const
+
+const ARTIFACT_DOCUMENT_CONTRACTS_BY_METHOD = new Map(
+  Object.values(artifactDocumentContracts).map(contract => [contract.method, contract]),
+)
 
 type ArtifactDocumentRpc = {
   hasRpcMethod?: (method: string) => boolean
@@ -701,7 +716,12 @@ export function createRpcArtifactDocumentProvider(
   ): Promise<T | null> {
     if (!supports(method)) return null
     try {
-      return await rpc.call<T>(method, params, signalOptions(signal))
+      const result = await rpc.call<T>(method, params, signalOptions(signal))
+      const contract = ARTIFACT_DOCUMENT_CONTRACTS_BY_METHOD.get(method)
+      if (!contract || !acceptsWorkbenchResult(contract, result)) {
+        throw new Error(`${method} returned an invalid response`)
+      }
+      return result
     } catch (error) {
       if (!methodNotFound(error)) throw error
       rpc.rememberUnsupportedMethod?.(method)
@@ -881,7 +901,7 @@ export function createRpcArtifactDocumentProvider(
 
   async function responseDocument(
     method: string,
-    request: Readonly<Record<string, unknown>>,
+    request: CloseArtifactDocument | RenameArtifactDocument,
     signal?: AbortSignal,
   ) {
     const response = await optionalCall<Record<string, unknown>>(
@@ -898,7 +918,7 @@ export function createRpcArtifactDocumentProvider(
 
   async function responseRevision(
     method: string,
-    request: Readonly<Record<string, unknown>>,
+    request: RestoreArtifactRevision,
     signal?: AbortSignal,
   ) {
     const response = await optionalCall<Record<string, unknown>>(
@@ -911,7 +931,7 @@ export function createRpcArtifactDocumentProvider(
 
   async function responseChangeSet(
     method: string,
-    request: Readonly<Record<string, unknown>>,
+    request: RevertArtifactChangeSet,
     signal?: AbortSignal,
   ) {
     const response = await optionalCall<ArtifactChangeSetResponse>(
@@ -1065,7 +1085,7 @@ export function createRpcArtifactDocumentProvider(
 
   async function sourceResponse(
     method: string,
-    request: Readonly<Record<string, unknown>>,
+    request: ReadArtifactSource,
     signal?: AbortSignal,
   ): Promise<ArtifactSourceSnapshot | null> {
     const response = await optionalCall<Record<string, unknown>>(

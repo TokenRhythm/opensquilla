@@ -27,15 +27,6 @@ export function sessionConversationTestDouble(
   overrides: Partial<SessionConversation> = {},
 ): SessionConversation {
   return {
-    ready: async () => {},
-    reset: async () => unconfigured('reset'),
-    compact: async () => unconfigured('compact'),
-    usage: async () => unconfigured('usage'),
-    listCommands: async () => unconfigured('listCommands'),
-    submitRouteFeedback: async () => unconfigured('submitRouteFeedback'),
-    promptCacheStatus: async () => unconfigured('promptCacheStatus'),
-    setPromptCacheStatus: async () => unconfigured('setPromptCacheStatus'),
-    submitClarify: async () => unconfigured('submitClarify'),
     subscribeToolResults: () => unconfigured('subscribeToolResults'),
     subscribeRoutingChanged: () => unconfigured('subscribeRoutingChanged'),
     supports: () => false,
@@ -48,23 +39,6 @@ export function sessionConversationFromTestRpc(
   rpc: SessionConversationTestRpc,
 ): SessionConversation {
   return createV4SessionConversation(
-    {
-      request: (method, params, options) => options === undefined
-        ? rpc.call(method, params)
-        : rpc.call(method, params, options),
-      ready: options => {
-        if (!rpc.ready) return Promise.resolve()
-        return rpc.ready(
-          options?.timeoutMs,
-          options?.signal,
-          {
-            timeoutAction: options?.timeoutAction,
-            abortAction: options?.abortAction,
-          },
-        )
-      },
-      supports: method => rpc.hasRpcMethod?.(method) !== false,
-    },
     {
       subscribe(event, handler) {
         const close = rpc.on?.(event, handler)

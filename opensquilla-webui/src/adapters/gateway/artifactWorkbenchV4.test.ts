@@ -109,6 +109,11 @@ describe('ArtifactWorkbench v4 Adapter', () => {
       documentId: 'document-1',
       artifactEventSeq: 5,
     })
+    handlers.get('document.state_changed')?.({
+      documentId: 'document-1',
+      artifactEventSeq: 0,
+    })
+    handlers.get('session.event.artifact_state')?.({ document_id: 'document-2' })
 
     expect(listener).toHaveBeenCalledTimes(2)
     expect(listener).toHaveBeenLastCalledWith({ documentId: 'document-1' })

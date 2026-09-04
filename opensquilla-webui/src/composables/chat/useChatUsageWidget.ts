@@ -1,8 +1,8 @@
 import { computed, ref, type Ref } from 'vue'
 import type {
-  SessionConversation,
-  SessionConversationRequestOptions,
-} from '@/modules/sessionConversation'
+  UsageReporting,
+  UsageReportingRequestOptions,
+} from '@/modules/usageReporting'
 
 export interface ChatUsageAccumulator {
   input: number
@@ -15,8 +15,8 @@ export interface ChatUsageAccumulator {
 }
 
 export interface UseChatUsageWidgetOptions {
-  sessionConversation: SessionConversation
-  readCallOptions?: SessionConversationRequestOptions
+  usageReporting: UsageReporting
+  readCallOptions?: UsageReportingRequestOptions
   sessionKey: Ref<string>
   tokenVizEnabled: () => boolean
 }
@@ -61,7 +61,7 @@ export function createEmptyUsageAccumulator(): ChatUsageAccumulator {
 }
 
 export function useChatUsageWidget(options: UseChatUsageWidgetOptions) {
-  const conversation = options.sessionConversation
+  const usageReporting = options.usageReporting
   const usageAccum = ref<ChatUsageAccumulator>(createEmptyUsageAccumulator())
   const usageModel = ref('')
   const savingsPopupLastTs = ref(0)
@@ -126,8 +126,10 @@ export function useChatUsageWidget(options: UseChatUsageWidgetOptions) {
   async function loadCurrentSessionUsage() {
     if (!options.sessionKey.value) return
     try {
-      await conversation.ready(options.readCallOptions)
-      const usage = await conversation.usage(options.sessionKey.value, options.readCallOptions)
+      const usage = await usageReporting.status(
+        options.sessionKey.value,
+        options.readCallOptions,
+      )
       const sessions = usage?.sessions || []
       const current = sessions.find(s => (s.session || s.sessionKey || s.key) === options.sessionKey.value)
       if (current) {

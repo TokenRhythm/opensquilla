@@ -5,7 +5,7 @@ import { effectScope } from 'vue'
 
 import { useCronForm } from './useCronForm'
 import { DEFAULT_CRON_EXPRESSION } from '@/utils/cron/schedule'
-import type { CronScheduler } from '@/modules/cronScheduler'
+import type { CronJobMutation, CronScheduler } from '@/modules/cronScheduler'
 
 const rpcCall = vi.fn()
 const toasts: { message: string; tone?: string }[] = []
@@ -15,9 +15,9 @@ vi.mock('vue-router', () => ({
 }))
 
 const scheduler = {
-  saveJob: (input: Record<string, unknown>, options: { existing: boolean }) =>
+  saveJob: (input: CronJobMutation, options: { existing: boolean }) =>
     rpcCall(options.existing ? 'cron.update' : 'cron.create', input),
-} as CronScheduler
+} as unknown as CronScheduler
 
 vi.mock('@/composables/useToasts', () => ({
   useToasts: () => ({

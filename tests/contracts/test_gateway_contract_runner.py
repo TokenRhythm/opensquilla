@@ -299,6 +299,23 @@ def test_invalid_generation_metadata_fails_before_tool_execution(
         runner.load_contract(schema, contract_root=tmp_path)
 
 
+def test_only_the_legacy_status_root_method_is_accepted(tmp_path: Path) -> None:
+    status = _write_schema(
+        tmp_path,
+        "runtime-status.schema.json",
+        _method_schema("status"),
+    )
+    assert runner.load_contract(status, contract_root=tmp_path).wire_name == "status"
+
+    health = _write_schema(
+        tmp_path,
+        "health.schema.json",
+        _method_schema("health"),
+    )
+    with pytest.raises(runner.ContractConfigurationError, match="method name"):
+        runner.load_contract(health, contract_root=tmp_path)
+
+
 def test_only_the_exact_production_sessions_list_schema_is_grandfathered(
     tmp_path: Path,
 ) -> None:

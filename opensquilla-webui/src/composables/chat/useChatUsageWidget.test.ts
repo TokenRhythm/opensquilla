@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { useChatUsageWidget } from './useChatUsageWidget'
 import type { RpcCallOptions } from '@/lib/rpc'
-import { sessionConversationFromTestRpc } from '@/testing/sessionConversation.test-helper'
+import { usageReportingFromTestRpc } from '@/testing/conversationAncillary.test-helper'
 
 describe('useChatUsageWidget background reads', () => {
   it('uses the injected bounded options without changing its public loader', async () => {
@@ -23,7 +23,7 @@ describe('useChatUsageWidget background reads', () => {
       }),
     }
     const api = useChatUsageWidget({
-      sessionConversation: sessionConversationFromTestRpc(rpc),
+      usageReporting: usageReportingFromTestRpc(rpc),
       readCallOptions,
       sessionKey: ref('agent:main:webchat:usage'),
       tokenVizEnabled: () => false,
@@ -31,18 +31,16 @@ describe('useChatUsageWidget background reads', () => {
 
     await api.loadCurrentSessionUsage()
 
-    expect(rpc.ready).toHaveBeenCalledWith(
-      2_000,
-      undefined,
-      {
-        timeoutAction: 'reject',
-        abortAction: 'reject',
-      },
-    )
+    expect(rpc.ready).not.toHaveBeenCalled()
     expect(rpc.call).toHaveBeenCalledWith(
       'usage.status',
       { sessionKey: 'agent:main:webchat:usage' },
-      readCallOptions,
+      {
+        timeoutMs: 2_000,
+        signal: undefined,
+        timeoutAction: 'reject',
+        abortAction: 'reject',
+      },
     )
     expect(api.usageAccum.value).toMatchObject({ input: 12, output: 8 })
   })

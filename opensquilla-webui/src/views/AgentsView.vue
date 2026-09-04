@@ -292,6 +292,7 @@ import { useDialogA11y } from '@/composables/useDialogA11y'
 import type { Agent } from '@/types/agents'
 import { useToasts } from '@/composables/useToasts'
 import { AGENT_CATALOG_KEY } from '@/modules/agentCatalog'
+import type { CreateAgentCommand } from '@/modules/agentCatalog'
 
 // ---------------------------------------------------------------------------
 // State
@@ -392,8 +393,7 @@ async function onInlineAdd() {
   const id = newId.value.trim()
   const name = newName.value.trim()
   if (!id) return
-  const payload: Record<string, unknown> = { id }
-  if (name) payload.name = name
+  const payload: CreateAgentCommand = { id, ...(name ? { name } : {}) }
   try {
     await agentCatalog.create(payload)
     pushToast(t('console.agents.toastCreated', { id }), { tone: 'ok' })

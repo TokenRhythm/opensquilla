@@ -11,7 +11,15 @@ import asyncio
 from typing import Any
 
 from opensquilla.engine.commands import DEFAULT_REGISTRY, CommandDef, Surface, parse_surface
-from opensquilla.gateway.rpc import RpcContext, get_dispatcher
+from opensquilla.gateway.adapters.conversation_ancillary import (
+    GatewayConversationAncillaryAdapter,
+    GatewayConversationAncillaryCallbacks,
+)
+from opensquilla.gateway.adapters.conversation_ancillary_contract import (
+    register_conversation_ancillary_contract,
+)
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
+from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
 
 _d = get_dispatcher()
 
@@ -121,7 +129,6 @@ async def _meta_skill_argument_choices(ctx: RpcContext) -> list[dict[str, Any]]:
     return await asyncio.to_thread(project_choices)
 
 
-@_d.method("commands.list_for_surface", scope="operator.read")
 async def _handle_commands_list_for_surface(
     params: dict | None, ctx: RpcContext
 ) -> dict[str, Any]:
@@ -143,3 +150,26 @@ async def _handle_commands_list_for_surface(
                 entry["argument_choices"] = meta_choices
                 break
     return {"surface": surface.value, "commands": commands}
+
+
+async def _handle_commands_list_for_surface_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    adapter = GatewayConversationAncillaryAdapter(
+        ctx,
+        GatewayConversationAncillaryCallbacks(
+            command_catalog=_handle_commands_list_for_surface,
+        ),
+    )
+    return await adapter.list_commands(params)
+
+
+_handle_commands_list_for_surface_generated_contract = (
+    register_conversation_ancillary_contract(
+        _d,
+        "commands.list_for_surface",
+        _handle_commands_list_for_surface_contract,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+)

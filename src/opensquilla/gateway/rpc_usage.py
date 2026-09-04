@@ -6,6 +6,14 @@ import time
 from collections.abc import Mapping
 from typing import Any
 
+from opensquilla.gateway.adapters.conversation_ancillary import (
+    GatewayConversationAncillaryAdapter,
+    GatewayConversationAncillaryCallbacks,
+)
+from opensquilla.gateway.adapters.conversation_ancillary_contract import (
+    register_conversation_ancillary_contract,
+)
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.rpc import (
     RpcContext,
     RpcHandlerError,
@@ -609,7 +617,6 @@ def _usage_totals(rows: list[dict[str, Any]]) -> dict[str, int | float]:
     }
 
 
-@_d.method("usage.status", scope="operator.read")
 async def _handle_usage_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     now_ms = _now_ms()
     requested_session_key = None
@@ -724,7 +731,6 @@ async def _handle_usage_status(params: dict | None, ctx: RpcContext) -> dict[str
         }
 
 
-@_d.method("usage.query", scope="operator.read")
 async def _handle_usage_query(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     """Aggregate timestamped usage events for one explicit calendar range.
 
@@ -744,7 +750,6 @@ async def _handle_usage_query(params: dict | None, ctx: RpcContext) -> dict[str,
         raise RpcHandlerError("INVALID_REQUEST", str(exc)) from exc
 
 
-@_d.method("usage.cost", scope="operator.read")
 async def _handle_usage_cost(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     now_ms = _now_ms()
     tracker_rows = _tracker_rows(ctx, now_ms=now_ms)
@@ -794,3 +799,46 @@ async def _handle_usage_cost(params: dict | None, ctx: RpcContext) -> dict[str, 
             "breakdown": tracker_rows,
             "totalCostUsd": round(float(_usage_totals(tracker_rows)["cost"]), 6),
         }
+
+
+def _usage_reporting_adapter(ctx: RpcContext) -> GatewayConversationAncillaryAdapter:
+    return GatewayConversationAncillaryAdapter(
+        ctx,
+        GatewayConversationAncillaryCallbacks(
+            usage_status=_handle_usage_status,
+            usage_query=_handle_usage_query,
+            usage_cost=_handle_usage_cost,
+        ),
+    )
+
+
+async def _handle_usage_status_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _usage_reporting_adapter(ctx).usage_status(params)
+
+
+async def _handle_usage_query_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _usage_reporting_adapter(ctx).usage_query(params)
+
+
+async def _handle_usage_cost_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _usage_reporting_adapter(ctx).usage_cost(params)
+
+
+for _usage_method, _usage_implementation in (
+    ("usage.status", _handle_usage_status_contract),
+    ("usage.query", _handle_usage_query_contract),
+    ("usage.cost", _handle_usage_cost_contract),
+):
+    register_conversation_ancillary_contract(
+        _d,
+        _usage_method,
+        _usage_implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )

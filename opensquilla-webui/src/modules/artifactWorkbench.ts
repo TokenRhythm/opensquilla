@@ -35,6 +35,60 @@ import type {
   PromptAnnotationUpdateRequest,
 } from '@/types/promptAnnotations'
 
+export interface OpenArtifactDocument {
+  readonly sessionKey: string
+  readonly artifactId: string
+}
+
+export interface CloseArtifactDocument {
+  readonly sessionKey: string
+  readonly documentId: string
+}
+
+export interface RenameArtifactDocument extends CloseArtifactDocument {
+  readonly expectedStateRevision: number
+  readonly name: string
+}
+
+export interface RestoreArtifactRevision extends CloseArtifactDocument {
+  readonly revisionId: string
+  readonly expectedHeadRevisionId: string
+  readonly expectedStateRevision: number
+  readonly clientRequestId?: string
+  readonly idempotencyKey?: string
+}
+
+export interface RevertArtifactChangeSet extends CloseArtifactDocument {
+  readonly changeSetId: string
+  readonly expectedHeadRevisionId: string
+  readonly expectedStateRevision: number
+  readonly clientRequestId?: string
+  readonly idempotencyKey?: string
+}
+
+export interface ReadArtifactSource extends CloseArtifactDocument {
+  readonly revisionId?: string
+}
+
+export interface ArtifactSourceChange {
+  readonly startOffset: number
+  readonly endOffset: number
+  readonly replacement: string
+}
+
+export interface PatchArtifactSource extends CloseArtifactDocument {
+  readonly expectedHeadRevisionId: string
+  readonly expectedSourceSha256: string
+  readonly expectedStateRevision: number
+  readonly patches: readonly [ArtifactSourceChange, ...ArtifactSourceChange[]]
+  readonly offsetEncoding?: 'unicode-code-point'
+  readonly editSessionId?: string
+  readonly expectedEditSessionStateRevision?: number
+  readonly expectedLastSavedRevisionId?: string
+  readonly clientRequestId?: string
+  readonly idempotencyKey?: string
+}
+
 export interface ArtifactDocumentProvider {
   getCapabilities(signal?: AbortSignal): Promise<ArtifactEditCapabilities>
   listDocuments(sessionKey: string, signal?: AbortSignal): Promise<ArtifactDocument[]>
@@ -43,13 +97,13 @@ export interface ArtifactDocumentProvider {
   listRevisions(documentId: string, sessionKey: string, signal?: AbortSignal): Promise<ArtifactRevision[]>
   listChangeSets(documentId: string, sessionKey: string, signal?: AbortSignal): Promise<ArtifactChangeSet[]>
   getChangeSet(documentId: string, changeSetId: string, sessionKey: string, signal?: AbortSignal): Promise<ArtifactChangeSet | null>
-  openDocument(request: Readonly<Record<string, unknown>>, signal?: AbortSignal): Promise<{ document: ArtifactDocument | null; editSession: ArtifactEditSession | null }>
-  closeDocument(request: Readonly<Record<string, unknown>>, signal?: AbortSignal): Promise<ArtifactDocument | null>
-  renameDocument(request: Readonly<Record<string, unknown>>, signal?: AbortSignal): Promise<ArtifactDocument | null>
-  restoreRevision(request: Readonly<Record<string, unknown>>, signal?: AbortSignal): Promise<ArtifactRevision | null>
-  revertChangeSet(request: Readonly<Record<string, unknown>>, signal?: AbortSignal): Promise<ArtifactChangeSet | null>
-  readSource(request: Readonly<Record<string, unknown>>, signal?: AbortSignal): Promise<ArtifactSourceSnapshot | null>
-  patchSource(request: Readonly<Record<string, unknown>>, signal?: AbortSignal): Promise<ArtifactSourcePatchResult | null>
+  openDocument(request: OpenArtifactDocument, signal?: AbortSignal): Promise<{ document: ArtifactDocument | null; editSession: ArtifactEditSession | null }>
+  closeDocument(request: CloseArtifactDocument, signal?: AbortSignal): Promise<ArtifactDocument | null>
+  renameDocument(request: RenameArtifactDocument, signal?: AbortSignal): Promise<ArtifactDocument | null>
+  restoreRevision(request: RestoreArtifactRevision, signal?: AbortSignal): Promise<ArtifactRevision | null>
+  revertChangeSet(request: RevertArtifactChangeSet, signal?: AbortSignal): Promise<ArtifactChangeSet | null>
+  readSource(request: ReadArtifactSource, signal?: AbortSignal): Promise<ArtifactSourceSnapshot | null>
+  patchSource(request: PatchArtifactSource, signal?: AbortSignal): Promise<ArtifactSourcePatchResult | null>
   resolveMutation?(request: ArtifactMutationResolutionRequest, signal?: AbortSignal): Promise<ArtifactMutationResolution | null>
   startEditSession?(request: ArtifactEditSessionStartRequest, signal?: AbortSignal): Promise<ArtifactEditSession | null>
   heartbeatEditSession?(request: ArtifactEditSessionHeartbeatRequest, signal?: AbortSignal): Promise<ArtifactEditSession | null>
