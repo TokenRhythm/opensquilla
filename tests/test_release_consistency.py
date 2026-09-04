@@ -905,7 +905,8 @@ def test_release_docs_describe_unsigned_windows_policy() -> None:
 
     assert "PRIVACY.md" in readme
     assert "THIRD_PARTY_NOTICES.md" in readme
-    assert "Installation Telemetry" in privacy_policy
+    assert "### Reliability diagnostics" in privacy_policy
+    assert "### Product and growth analytics" in privacy_policy
     assert "OPENSQUILLA_TELEMETRY_DISABLED=true" in privacy_policy
     assert "future signing plan" not in readme
 
@@ -966,7 +967,8 @@ def test_privacy_docs_describe_network_observability_controls() -> None:
         assert "OPENSQUILLA_UPDATE_CHECK_DISABLED=true" in text, path
 
     privacy = docs["PRIVACY.md"]
-    assert "automatic install telemetry" in privacy
+    assert "The automatic installation upload at `/v1/install`" in privacy
+    assert "are retired" in privacy
     assert "passive update checks" in privacy
     assert "automatic desktop update checks at startup" in privacy
     assert "during long-running app sessions" in privacy

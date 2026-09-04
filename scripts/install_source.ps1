@@ -44,7 +44,8 @@ if ($env:OPENSQUILLA_PREFIX) {
 }
 
 $dryRun = $env:OPENSQUILLA_INSTALL_DRY_RUN -eq '1'
-$webuiDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'opensquilla-webui'
+$sourceRoot = Split-Path -Parent $PSScriptRoot
+$webuiDir = Join-Path $sourceRoot 'opensquilla-webui'
 $nodeVersionFile = Join-Path $webuiDir '.node-version'
 if (-not (Test-Path $nodeVersionFile -PathType Leaf)) {
     Write-Error "install_source.ps1: required Node.js version file is missing: $nodeVersionFile"
@@ -118,9 +119,9 @@ switch ($profile) {
 
 $targetExtras += $installExtras
 $installTarget = if ($targetExtras.Count -gt 0) {
-    ".[$($targetExtras -join ',')]"
+    "${sourceRoot}[$($targetExtras -join ',')]"
 } else {
-    '.'
+    $sourceRoot
 }
 
 function Test-SquillaRouterAssets {
@@ -132,7 +133,7 @@ function Test-SquillaRouterAssets {
         return
     }
 
-    $modelRoot = 'src/opensquilla/squilla_router/models'
+    $modelRoot = Join-Path $sourceRoot 'src/opensquilla/squilla_router/models'
     $required = @(
         "$modelRoot/v4.2_phase3_inference/lgbm_main.bin",
         "$modelRoot/v4.2_phase3_inference/router.runtime.yaml",
@@ -454,6 +455,16 @@ if ($dryRun) {
 
 # --- execute ---------------------------------------------------------------
 
+$sourceCommitId = $null
+$gitCommand = Get-Command git -ErrorAction SilentlyContinue
+if ($gitCommand) {
+    $candidate = (& $gitCommand.Source -C $sourceRoot rev-parse --verify HEAD 2>$null |
+        Select-Object -First 1)
+    if ($LASTEXITCODE -eq 0 -and $candidate -cmatch '^[0-9a-f]{40}$') {
+        $sourceCommitId = $candidate
+    }
+}
+
 Test-SquillaRouterAssets
 Build-WebUI
 Install-WindowsVCRedistIfNeeded
@@ -480,6 +491,7 @@ try {
     $receipt = [ordered]@{
         version        = 1
         install_method = $receiptMethod
+        source_commit_id = $sourceCommitId
         installed_at   = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
         entrypoints    = @()
         owned_paths    = @()

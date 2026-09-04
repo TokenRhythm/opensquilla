@@ -115,43 +115,6 @@ def _log_gateway_startup_phase(
     return time.monotonic()
 
 
-def _start_background_install_telemetry(config: GatewayConfig) -> None:
-    def _log_result(result: Any) -> None:
-        log.debug(
-            "gateway.install_telemetry",
-            skipped_reason=result.skipped_reason,
-            telemetry_event=result.event,
-            sent=result.sent,
-            uploaded=result.uploaded,
-            endpoint_configured=result.endpoint_configured,
-        )
-
-    try:
-        from opensquilla.observability.install_telemetry import (
-            start_background_install_telemetry,
-        )
-
-        start_background_install_telemetry(config=config, on_result=_log_result)
-    except Exception:
-        log.debug("gateway.install_telemetry_skipped", exc_info=True)
-
-
-def _prewarm_tokenrhythm_install_id(config: GatewayConfig) -> None:
-    """Prime the optional TokenRhythm install header without delaying boot."""
-
-    try:
-        from opensquilla.provider.tokenrhythm_correlation import (
-            prewarm_tokenrhythm_install_id,
-        )
-
-        prewarm_tokenrhythm_install_id(config=config)
-    except Exception:
-        # Install identity is best-effort request metadata.  A resolver or
-        # thread-start failure must never make the gateway/standalone runtime
-        # unavailable.
-        log.debug("gateway.tokenrhythm_install_id_prewarm_skipped", exc_info=True)
-
-
 def _auto_propose_usage_execution_context(
     agent_id: str,
     usage_event_sink: Any | None,
@@ -711,6 +674,9 @@ class ServiceContainer:
     turn_error_writer: Any = None
     router_calibration_service: Any = None
     provider_stats: Any = None  # ProviderStatsStore | None (rolling call latency samples)
+    telemetry_runtime: Any = None  # ScopedTelemetryRuntime | None
+    reliability_event_sink: Any = None  # ReliabilityEventSink | None
+    growth_event_sink: Any = None  # GrowthEventSink | None
     task_runtime: Any = None
     goal_service: Any = None
     heartbeat_loop: Any = None
@@ -895,6 +861,22 @@ class ServiceContainer:
                 set_task_runtime(None)
             except Exception:
                 pass
+
+        # Turn/tool producers are stopped above. Closing scoped telemetry now
+        # preserves any unsent queue without forcing network I/O at shutdown.
+        if self.growth_event_sink is not None:
+            try:
+                await self.growth_event_sink.close()
+            except Exception:
+                log.debug("gateway.growth_event_sink_close_failed", exc_info=True)
+            self.growth_event_sink = None
+
+        if self.telemetry_runtime is not None:
+            try:
+                await self.telemetry_runtime.close()
+            except Exception:
+                log.debug("gateway.telemetry_runtime_close_failed", exc_info=True)
+            self.telemetry_runtime = None
 
         if self.usage_event_sink is not None:
             try:
@@ -1528,9 +1510,7 @@ def build_session_artifact_cleanup(config: Any) -> Any:
     from opensquilla.paths import media_root_from_config
 
     async def _cleanup(session_id: str, _session_key: str) -> None:
-        ArtifactStore(media_root_from_config(config)).delete_session_internal_artifacts(
-            session_id
-        )
+        ArtifactStore(media_root_from_config(config)).delete_session_internal_artifacts(session_id)
 
     return _cleanup
 
@@ -1560,9 +1540,7 @@ def build_task_runtime_run_kwargs(
         "no_memory_capture": run.no_memory_capture,
         "input_mode": getattr(run, "input_mode", "user"),
         "persist_input": bool(getattr(run, "persist_input", False)),
-        "history_has_persisted_user": bool(
-            getattr(run, "history_has_persisted_user", True)
-        ),
+        "history_has_persisted_user": bool(getattr(run, "history_has_persisted_user", True)),
         "fresh_user_session": bool(getattr(run, "fresh_user_session", False)),
         "ingress_pipeline_steps": ingress_steps,
         "pending_input_provider": getattr(run, "pending_input_provider", None),
@@ -1884,8 +1862,7 @@ async def _emit_task_runtime_stream_events(
             raw_terminal_failure_kind = event_dict.get("terminal_failure_kind")
             failure_kind = (
                 str(raw_terminal_failure_kind)
-                if isinstance(raw_terminal_failure_kind, str)
-                and raw_terminal_failure_kind
+                if isinstance(raw_terminal_failure_kind, str) and raw_terminal_failure_kind
                 else None
             )
             terminal_reason = "error"
@@ -1922,16 +1899,12 @@ async def _emit_task_runtime_stream_events(
             error_code = str(code) if code else None
             raw_retry_after_ms = event_dict.pop("retry_after_ms", None)
             raw_usage_call_index = event_dict.pop("usage_call_index", None)
-            raw_no_prior_provider_dispatch = event_dict.pop(
-                "no_prior_provider_dispatch", None
-            )
+            raw_no_prior_provider_dispatch = event_dict.pop("no_prior_provider_dispatch", None)
             raw_replay_safe = event_dict.pop("replay_safe", None)
             # Keep the normalized provider classification internal to the
             # durable task outcome; it is not part of the public stream event.
             raw_failure_kind = event_dict.pop("failure_kind", None)
-            failure_kind = (
-                str(raw_failure_kind) if isinstance(raw_failure_kind, str) else None
-            )
+            failure_kind = str(raw_failure_kind) if isinstance(raw_failure_kind, str) else None
             if failure_kind:
                 error_message = safe_provider_failure_message(failure_kind)
                 error_code = safe_provider_failure_code(error_code, failure_kind)
@@ -2076,9 +2049,7 @@ async def _emit_task_runtime_stream_events(
             retry_after_ms=retry_after_ms,
             activity_snapshot=activity_snapshot,
             usage_call_index=replay_proof.get("usage_call_index"),
-            no_prior_provider_dispatch=(
-                replay_proof.get("no_prior_provider_dispatch") is True
-            ),
+            no_prior_provider_dispatch=(replay_proof.get("no_prior_provider_dispatch") is True),
             replay_safe=replay_proof.get("replay_safe") is True,
         )
 
@@ -2366,8 +2337,7 @@ class GatewayServer:
         """Gracefully shut down: stop channels, broadcast shutdown, close WS, stop server."""
         runtime_shutdown_result: TaskRuntimeShutdownResult | None = None
         runtime_shutdown_clean = bool(
-            self._services is None
-            or getattr(self._services, "task_runtime", None) is None
+            self._services is None or getattr(self._services, "task_runtime", None) is None
         )
         try:
             # Drain in-flight turns FIRST so replies are not lost. A bounded
@@ -2391,8 +2361,7 @@ class GatewayServer:
                         graceful=True, graceful_timeout=drain_budget
                     )
                     runtime_shutdown_clean = (
-                        runtime_shutdown_result is None
-                        or runtime_shutdown_result.clean
+                        runtime_shutdown_result is None or runtime_shutdown_result.clean
                     )
                 except Exception:
                     runtime_shutdown_clean = False
@@ -2412,12 +2381,8 @@ class GatewayServer:
                     elapsed_ms=runtime_shutdown_result.elapsed_ms,
                     abandoned_tasks=runtime_shutdown_result.abandoned_task_count,
                     remaining_drivers=runtime_shutdown_result.remaining_driver_count,
-                    remaining_reservations=(
-                        runtime_shutdown_result.remaining_reservation_count
-                    ),
-                    remaining_auxiliary=(
-                        runtime_shutdown_result.remaining_auxiliary_count
-                    ),
+                    remaining_reservations=(runtime_shutdown_result.remaining_reservation_count),
+                    remaining_auxiliary=(runtime_shutdown_result.remaining_auxiliary_count),
                 )
 
             if self._background_completion_manager is not None and runtime_shutdown_clean:
@@ -2435,9 +2400,7 @@ class GatewayServer:
                     pass
                 self._background_completion_manager = None
             elif self._background_completion_manager is not None:
-                log.warning(
-                    "gateway.background_completion_close_skipped_for_live_runtime"
-                )
+                log.warning("gateway.background_completion_close_skipped_for_live_runtime")
 
             # Stop channels after task_runtime is drained (no in-flight turns remain)
             live_channel_manager = self._channel_manager
@@ -2971,7 +2934,6 @@ async def build_services(
         if config.config_path:
             log.info("build_services.config_loaded", path=config.config_path)
 
-    _prewarm_tokenrhythm_install_id(config)
     deferred_warmups: list[Callable[[], Any]] = []
     sandbox_setup_task: asyncio.Task[Any] | None = None
     _warn_workspace_state_mismatch(config)
@@ -3107,9 +3069,7 @@ async def build_services(
         storage = SessionStorage(storage_db_path)
         await storage.connect(
             goal_pause_reason=(
-                "process_restart"
-                if config.goal.execution_enabled
-                else "feature_disabled"
+                "process_restart" if config.goal.execution_enabled else "feature_disabled"
             )
         )
         log.info(
@@ -3545,9 +3505,7 @@ async def build_services(
                 "build_services.skill_transaction_recovery",
                 **diagnostic.to_dict(),
             )
-        managed_recovery_required = any(
-            item.blocking for item in recovery_diagnostics
-        )
+        managed_recovery_required = any(item.blocking for item in recovery_diagnostics)
         if managed_recovery_required:
             log.warning(
                 "build_services.skill_managed_layer_quarantined",
@@ -3925,6 +3883,35 @@ async def build_services(
 
     provider_stats = ProviderStatsStore()
 
+    # The v2 runtime is isolated from legacy install/usage telemetry. It is
+    # lazy and fail-closed: no scope files or network calls occur without a
+    # current explicit consent record. Engine observers receive only
+    # synchronous, content-free adapter callables below.
+    telemetry_runtime = None
+    reliability_event_sink = None
+    growth_event_sink = None
+    try:
+        from opensquilla.telemetry.consent import TelemetryScope, resolve_scope_consent
+        from opensquilla.telemetry.growth_sink import GrowthEventSink
+        from opensquilla.telemetry.reliability_sink import ReliabilityEventSink
+        from opensquilla.telemetry.runtime import ScopedTelemetryRuntime
+
+        telemetry_runtime = ScopedTelemetryRuntime(config=config)
+        reliability_event_sink = ReliabilityEventSink(telemetry_runtime)
+        growth_event_sink = GrowthEventSink(telemetry_runtime, config=config)
+        if any(resolve_scope_consent(scope, config=config).enabled for scope in TelemetryScope):
+            await telemetry_runtime.start()
+    except Exception:
+        log.debug("build_services.telemetry_runtime_unavailable", exc_info=True)
+        if telemetry_runtime is not None:
+            try:
+                await telemetry_runtime.close()
+            except Exception:
+                pass
+        telemetry_runtime = None
+        reliability_event_sink = None
+        growth_event_sink = None
+
     svc = ServiceContainer(
         config=config,
         provider_selector=provider_selector,
@@ -3952,6 +3939,9 @@ async def build_services(
         turn_error_writer=turn_error_writer,
         router_calibration_service=router_calibration_service,
         provider_stats=provider_stats,
+        telemetry_runtime=telemetry_runtime,
+        reliability_event_sink=reliability_event_sink,
+        growth_event_sink=growth_event_sink,
         deferred_warmups=deferred_warmups,
         sandbox_setup_task=sandbox_setup_task,
     )
@@ -4030,7 +4020,7 @@ def build_turn_runner_from_services(
     def _standalone_lock_provider(session_key: str) -> _asyncio.Lock:
         return _standalone_locks.setdefault(session_key, _asyncio.Lock())
 
-    return TurnRunner(
+    runner = TurnRunner(
         provider_selector=svc.provider_selector,
         tool_registry=svc.tool_registry,
         session_manager=svc.session_manager,
@@ -4055,7 +4045,40 @@ def build_turn_runner_from_services(
         meta_run_writer=getattr(svc, "meta_run_writer", None),
         turn_error_writer=getattr(svc, "turn_error_writer", None),
         provider_call_observer=build_provider_call_observer(getattr(svc, "provider_stats", None)),
+        turn_reliability_sink=(
+            getattr(getattr(svc, "reliability_event_sink", None), "observe_turn", None)
+        ),
+        tool_reliability_sink=(
+            getattr(
+                getattr(svc, "reliability_event_sink", None),
+                "observe_tool_call",
+                None,
+            )
+        ),
+        file_parse_reliability_sink=(
+            getattr(
+                getattr(svc, "reliability_event_sink", None),
+                "observe_file_parse",
+                None,
+            )
+        ),
+        turn_growth_started_sink=(
+            getattr(
+                getattr(svc, "growth_event_sink", None),
+                "observe_turn_started",
+                None,
+            )
+        ),
+        turn_growth_succeeded_sink=(
+            getattr(
+                getattr(svc, "growth_event_sink", None),
+                "observe_turn_succeeded",
+                None,
+            )
+        ),
+        growth_event_sink=getattr(svc, "growth_event_sink", None),
     )
+    return runner
 
 
 async def _run_deferred_warmups(svc: ServiceContainer) -> None:
@@ -4557,9 +4580,7 @@ async def start_gateway_server(
     task_runtime.set_activation_listener(goal_service.on_task_activation)
     task_runtime.set_idle_listener(goal_service.on_runtime_idle)
     task_runtime.set_goal_service(goal_service)
-    subscription_manager.set_message_unsubscribe_listener(
-        goal_service.on_subscription_lost
-    )
+    subscription_manager.set_message_unsubscribe_listener(goal_service.on_subscription_lost)
     # Wire task_runtime's short write-lock provider into turn_runner.
     turn_runner.set_session_lock_provider(task_runtime._get_session_lock_for_turn)
     svc.task_runtime = task_runtime
@@ -5261,34 +5282,7 @@ async def start_gateway_server(
     listener_ready = not run
     runtime_state_ready = False
     gateway_ready_phase_emitted = False
-    post_ready_observability_started = False
     gateway_ready_wait_started_at = startup_phase_started_at
-
-    def _start_post_ready_observability() -> None:
-        nonlocal post_ready_observability_started
-        if post_ready_observability_started:
-            return
-        post_ready_observability_started = True
-
-        # Anonymous install telemetry is best-effort. Its daemon worker is
-        # never joined during shutdown, so a slow proxy cannot delay bind or
-        # exit. Daily usage keeps its existing owned/cancelled asyncio task.
-        _start_background_install_telemetry(config)
-        try:
-            from opensquilla.observability.usage_telemetry import (
-                run_daily_usage_upload_loop,
-            )
-
-            daily_usage_storage = get_session_storage(svc.session_manager)
-            if daily_usage_storage is not None:
-                svc.daily_usage_telemetry_task = create_background_task(
-                    run_daily_usage_upload_loop(
-                        daily_usage_storage,
-                        config=config,
-                    )
-                )
-        except Exception:
-            log.debug("gateway.usage_telemetry_upload_skipped", exc_info=True)
 
     def _publish_gateway_ready_if_complete() -> None:
         nonlocal gateway_ready_phase_emitted
@@ -5306,7 +5300,6 @@ async def start_gateway_server(
         svc.sandbox_setup_task = create_background_task(
             _ensure_sandbox_setup_on_boot(config)
         )
-        _start_post_ready_observability()
 
     server_handle = GatewayServer(app=app, config=config)
     server_handle._pid_lock = _pid_lock
@@ -5334,9 +5327,7 @@ async def start_gateway_server(
             desktop_bridge_available = get_desktop_artifact_bridge_client() is not None
         except Exception:  # noqa: BLE001 - listener startup remains fail-closed
             desktop_bridge_available = False
-        if preview_service is not None and (
-            config.control_ui.enabled or desktop_bridge_available
-        ):
+        if preview_service is not None and (config.control_ui.enabled or desktop_bridge_available):
             preview_socket: socket.socket | None = None
             try:
                 from opensquilla.gateway.artifact_preview import (

@@ -1,0 +1,36 @@
+{
+  "batch_limits": {
+    "growth": { "max_bytes": 65536, "max_events": 50 },
+    "reliability": { "max_bytes": 131072, "max_events": 100 }
+  },
+  "batch_version": 1,
+  "events": [
+    { "event_name": "app_start_result", "event_version": 1, "scope": "reliability" },
+    { "event_name": "gateway_start_result", "event_version": 1, "scope": "reliability" },
+    { "event_name": "app_crash_detected", "event_version": 1, "scope": "reliability" },
+    { "event_name": "turn_result", "event_version": 1, "scope": "reliability" },
+    { "event_name": "turn_result", "event_version": 2, "scope": "reliability" },
+    { "event_name": "turn_result", "event_version": 3, "scope": "reliability" },
+    { "event_name": "tool_call_result", "event_version": 1, "scope": "reliability" },
+    { "event_name": "tool_call_result", "event_version": 2, "scope": "reliability" },
+    { "event_name": "file_parse_result", "event_version": 1, "scope": "reliability" },
+    { "event_name": "file_parse_result", "event_version": 2, "scope": "reliability" },
+    { "event_name": "update_result", "event_version": 1, "scope": "reliability" },
+    { "event_name": "performance_summary", "event_version": 1, "scope": "reliability" },
+    { "event_name": "landing_view", "event_version": 1, "scope": "growth" },
+    { "event_name": "download_click", "event_version": 1, "scope": "growth" },
+    { "event_name": "download_served", "event_version": 1, "scope": "growth" },
+    { "event_name": "install_started", "event_version": 1, "scope": "growth" },
+    { "event_name": "install_result", "event_version": 1, "scope": "growth" },
+    { "event_name": "registration_started", "event_version": 1, "scope": "growth" },
+    { "event_name": "registration_result", "event_version": 1, "scope": "growth" },
+    { "event_name": "onboarding_result", "event_version": 1, "scope": "growth" },
+    { "event_name": "first_app_ready", "event_version": 1, "scope": "growth" },
+    { "event_name": "first_turn_started", "event_version": 1, "scope": "growth" },
+    { "event_name": "first_turn_result", "event_version": 1, "scope": "growth" },
+    { "event_name": "client_launch", "event_version": 1, "scope": "growth" }
+  ],
+  "manifest_version": 1,
+  "notice_versions": { "growth": "growth-v1", "reliability": "reliability-v1" },
+  "wire_limits": { "max_event_bytes": 16384, "max_nesting_depth": 16 }
+}

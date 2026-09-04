@@ -140,6 +140,9 @@ from opensquilla.engine.turn_runner import (
     TurnTranscriptSnapshot,
     rebind_attachment_prompt,
 )
+from opensquilla.engine.turn_runner.attachment_stage import (
+    _AttachmentPreparationCancelledError,
+)
 from opensquilla.engine.turn_runner.context import (
     control_terminal_event_for_context,
     set_execution_deadline_if_missing,
@@ -175,7 +178,6 @@ from opensquilla.engine.turn_runner.harness import (
     _TurnRunnerTranscriptAppendAdapter,
     _TurnRunnerTurnErrorPersistAdapter,
     _TurnRunnerTurnMemoryCaptureAdapter,
-    _TurnRunnerUsageTelemetryAdapter,
     create_turn_execution_context,
 )
 from opensquilla.engine.turn_runner.prompt_assembler_stage import (
@@ -189,10 +191,14 @@ from opensquilla.engine.turn_runner.stream_consumer_stage import (
 from opensquilla.engine.types import (
     AgentConfig,
     AgentEvent,
+    AnswerGenerationResetEvent,
+    ControlTerminalEvent,
     ControlTerminalReason,
     DoneEvent,
     ErrorEvent,
     RouterControlReplayEvent,
+    RunHeartbeatEvent,
+    TextDeltaEvent,
     ThinkingLevel,
     ToolResultEvent,
     WarningEvent,
@@ -334,6 +340,36 @@ from opensquilla.session.terminal_reply import (
     sanitize_agent_error,
 )
 from opensquilla.skills.toolchains.manager import managed_toolchain_state_scope
+from opensquilla.telemetry.contracts.common import (
+    ClientSurface,
+    ExecutionMode,
+    ResultOutcome,
+)
+from opensquilla.telemetry.contracts.reliability import (
+    FileParseErrorCode,
+    TurnErrorCode,
+    TurnFailureStage,
+)
+from opensquilla.telemetry.file_parse_facts import (
+    FileParseReliabilityFacts,
+    FileParseReliabilitySink,
+    file_size_bucket,
+    file_type_for_media_type,
+)
+from opensquilla.telemetry.runtime_facts import (
+    GrowthMilestoneSink,
+    ToolReliabilitySink,
+    TurnFactAccumulator,
+    TurnReliabilitySink,
+    classify_control_terminal,
+    classify_turn_error,
+    current_turn_failure_stage,
+    mark_current_turn_failure_stage,
+    reset_client_runtime_dimensions,
+    reset_current_turn_failure_stage,
+    set_client_runtime_dimensions,
+    set_current_turn_failure_stage,
+)
 from opensquilla.token_estimation import estimate_tokens
 from opensquilla.tools.description_overrides import resolve_tool_description_overrides
 from opensquilla.tools.run_mode import effective_run_mode_for_context
@@ -3892,6 +3928,65 @@ def _render_preview_only_attachment_text(
     )
 
 
+def _publish_file_parse_fact(
+    sink: Callable[[FileParseReliabilityFacts], object] | None,
+    *,
+    media_type: str,
+    size_bytes: int,
+    started_at: float,
+    error_code: FileParseErrorCode | None = None,
+    outcome: ResultOutcome | None = None,
+) -> None:
+    if sink is None:
+        return
+    file_type = file_type_for_media_type(media_type)
+    if file_type is None:
+        return
+    resolved_outcome = outcome or (
+        ResultOutcome.SUCCESS if error_code is None else ResultOutcome.FAIL
+    )
+    facts = FileParseReliabilityFacts(
+        file_type=file_type,
+        size_bucket=file_size_bucket(size_bytes),
+        outcome=resolved_outcome,
+        error_code=error_code,
+        duration_ms=max(0, int((time.monotonic() - started_at) * 1000)),
+    )
+    try:
+        sink(facts)
+    except BaseException:
+        return
+
+
+def _pdf_parse_error_code(error: ValueError) -> FileParseErrorCode:
+    local_reason = str(error).casefold()
+    if "requires" in local_reason or "dependency" in local_reason:
+        return FileParseErrorCode.PARSER_DEPENDENCY_MISSING
+    if "no extractable text" in local_reason:
+        return FileParseErrorCode.NO_EXTRACTABLE_TEXT
+    return FileParseErrorCode.MALFORMED_PDF
+
+
+def _office_parse_error_code(error: ValueError) -> FileParseErrorCode:
+    local_reason = str(error).casefold()
+    if "decompresses beyond" in local_reason:
+        return FileParseErrorCode.DECOMPRESSION_LIMIT
+    if "missing dependency" in local_reason or "requires" in local_reason:
+        return FileParseErrorCode.PARSER_DEPENDENCY_MISSING
+    if "no extractable text" in local_reason:
+        return FileParseErrorCode.NO_EXTRACTABLE_TEXT
+    return FileParseErrorCode.INVALID_OFFICE_CONTAINER
+
+
+def _email_parse_error_code(error: ValueError) -> FileParseErrorCode:
+    local_reason = str(error).casefold()
+    if "optional 'extract-msg'" in local_reason or "requires" in local_reason:
+        return FileParseErrorCode.PARSER_DEPENDENCY_MISSING
+    if "no extractable text" in local_reason:
+        return FileParseErrorCode.NO_EXTRACTABLE_TEXT
+    return FileParseErrorCode.INTERNAL_ERROR
+
+
 def _extract_pdf_attachment_text(
     raw_bytes: bytes,
     filename: str,
@@ -3921,6 +4016,8 @@ def _extract_pdf_attachment_text(
                 page_text = page.extract_text() or ""
                 if page_text.strip():
                     page_texts.append(f"--- Page {index} ---\n{page_text}")
+    except (_AttachmentPreparationCancelledError, TimeoutError):
+        raise
     except Exception as exc:  # noqa: BLE001 - pdfplumber raises several parser errors
         raise ValueError(f"PDF attachment {filename!r} could not be read: {exc}") from exc
 
@@ -3990,7 +4087,7 @@ def _office_zip_guard(
                                 "byte safety limit"
                             )
             return total
-    except ValueError:
+    except (ValueError, _AttachmentPreparationCancelledError, TimeoutError):
         raise
     except Exception as exc:  # noqa: BLE001 - zipfile raises several error types
         raise ValueError(
@@ -4110,7 +4207,7 @@ def _extract_office_attachment_text(
         cancel_check()
     try:
         extracted = extractor(raw_bytes).strip()
-    except ValueError:
+    except (ValueError, _AttachmentPreparationCancelledError, TimeoutError):
         raise
     except ImportError as exc:  # pragma: no cover - dependency is declared
         raise ValueError(
@@ -4561,6 +4658,12 @@ class TurnRunner:
             Callable[[PromptCacheKeepaliveCandidate], None] | None
         ) = None,
         prompt_cache_keepalive_armed: Callable[[str], bool] | None = None,
+        turn_reliability_sink: TurnReliabilitySink | None = None,
+        tool_reliability_sink: ToolReliabilitySink | None = None,
+        file_parse_reliability_sink: FileParseReliabilitySink | None = None,
+        turn_growth_started_sink: GrowthMilestoneSink | None = None,
+        turn_growth_succeeded_sink: GrowthMilestoneSink | None = None,
+        growth_event_sink: Any | None = None,
     ) -> None:
         self._provider_selector = provider_selector
         self._tool_registry = tool_registry
@@ -4580,6 +4683,15 @@ class TurnRunner:
         self._usage_event_sink = usage_event_sink
         self._prompt_cache_keepalive_recorder = prompt_cache_keepalive_recorder
         self._prompt_cache_keepalive_armed = prompt_cache_keepalive_armed
+        self._turn_reliability_sink = turn_reliability_sink
+        self._tool_reliability_sink = tool_reliability_sink
+        self._file_parse_reliability_sink = file_parse_reliability_sink
+        self._turn_growth_started_sink = turn_growth_started_sink
+        self._turn_growth_succeeded_sink = turn_growth_succeeded_sink
+        # Owner-authenticated telemetry RPCs need the durable launch producer;
+        # keep the handle explicit rather than attaching an undeclared field.
+        self.growth_event_sink = growth_event_sink
+        self._reliability_clock = time.monotonic
         # Populated alongside the existing session-id lookup so live usage
         # events retain reset fencing without a second storage round trip.
         self._usage_session_epoch_by_key: dict[str, int] = {}
@@ -4705,7 +4817,6 @@ class TurnRunner:
             turn_memory_capture=_TurnRunnerTurnMemoryCaptureAdapter(self),
             session_totals=_TurnRunnerSessionTotalsAdapter(self),
             turn_error_persist=_TurnRunnerTurnErrorPersistAdapter(self),
-            usage_telemetry=_TurnRunnerUsageTelemetryAdapter(self),
         )
 
     def _turn_config(self) -> Any:
@@ -5075,6 +5186,220 @@ class TurnRunner:
         root_turn_id: str | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
         assistant_message_id: str | None = None,
+        telemetry_surface: ClientSurface | None = None,
+        telemetry_execution_mode: ExecutionMode | None = None,
+    ) -> AsyncIterator[AgentEvent]:
+        """Run one public turn and publish exactly one content-free result fact."""
+
+        if (telemetry_surface is None) != (telemetry_execution_mode is None):
+            raise ValueError("telemetry runtime dimensions must be supplied together")
+        telemetry_token = (
+            None
+            if telemetry_surface is None or telemetry_execution_mode is None
+            else set_client_runtime_dimensions(
+                telemetry_surface,
+                telemetry_execution_mode,
+            )
+        )
+
+        clock = getattr(self, "_reliability_clock", time.monotonic)
+        accumulator = TurnFactAccumulator(started_at=clock())
+        failure_stage_token = set_current_turn_failure_stage(TurnFailureStage.TURN_SETUP)
+        outcome = ResultOutcome.SUCCESS
+        error_code: TurnErrorCode | None = None
+        failure_stage: TurnFailureStage | None = None
+        terminal_observed = False
+        growth_turn = input_mode == "user" and run_kind == "default"
+        growth_success_published = False
+        if growth_turn:
+            self._publish_growth_milestone(
+                getattr(self, "_turn_growth_started_sink", None),
+                warning_event="turn_runner.growth_started_sink_failed",
+            )
+        try:
+            stream = cast(
+                AsyncGenerator[AgentEvent, None],
+                self._run_without_reliability(
+                    message,
+                    session_key,
+                    tool_context,
+                    agent_id=agent_id,
+                    model=model,
+                    attachments=attachments,
+                    timeout=timeout,
+                    max_iterations=max_iterations,
+                    iteration_timeout=iteration_timeout,
+                    tool_timeout=tool_timeout,
+                    request_timeout=request_timeout,
+                    max_provider_retries=max_provider_retries,
+                    length_capped_continuations=length_capped_continuations,
+                    input_mode=input_mode,
+                    persist_input=persist_input,
+                    input_provenance=input_provenance,
+                    history_has_persisted_user=history_has_persisted_user,
+                    fresh_user_session=fresh_user_session,
+                    session_intent=session_intent,
+                    semantic_message=semantic_message,
+                    run_kind=run_kind,
+                    heartbeat_ack_max_chars=heartbeat_ack_max_chars,
+                    bootstrap_context_mode=bootstrap_context_mode,
+                    no_memory_capture=no_memory_capture,
+                    ingress_pipeline_steps=ingress_pipeline_steps,
+                    router_control_replay_depth=router_control_replay_depth,
+                    pending_input_provider=pending_input_provider,
+                    bound_user_message_id=bound_user_message_id,
+                    assistant_message_sink=assistant_message_sink,
+                    document_mutation_outcome_sink=document_mutation_outcome_sink,
+                    root_turn_id=root_turn_id,
+                    provider_request_correlation=provider_request_correlation,
+                    assistant_message_id=assistant_message_id,
+                ),
+            )
+            async with contextlib.aclosing(stream):
+                async for event in stream:
+                    now = clock()
+                    if isinstance(event, (TextDeltaEvent, DoneEvent)) and bool(event.text):
+                        accumulator.observe_text(now)
+                    elif isinstance(event, RunHeartbeatEvent):
+                        accumulator.observe_heartbeat(now, idle_ms=event.idle_ms)
+                    else:
+                        accumulator.observe_progress(now)
+                    if isinstance(event, AnswerGenerationResetEvent) and event.terminal:
+                        outcome, error_code = classify_turn_error(
+                            code=event.terminal_error_code,
+                            failure_kind=event.terminal_failure_kind,
+                        )
+                        failure_stage = current_turn_failure_stage()
+                        terminal_observed = True
+                    elif isinstance(event, ErrorEvent):
+                        outcome, error_code = classify_turn_error(
+                            code=event.code,
+                            failure_kind=event.failure_kind,
+                        )
+                        failure_stage = current_turn_failure_stage()
+                        terminal_observed = True
+                    elif isinstance(event, ControlTerminalEvent):
+                        outcome, error_code = classify_control_terminal(event.reason)
+                        failure_stage = current_turn_failure_stage()
+                        terminal_observed = True
+                    elif isinstance(event, DoneEvent):
+                        terminal_observed = True
+                    if (
+                        growth_turn
+                        and not growth_success_published
+                        and isinstance(event, DoneEvent)
+                        and outcome is ResultOutcome.SUCCESS
+                    ):
+                        # DoneEvent is the authoritative successful terminal.
+                        # Settle before yielding so a consumer that closes the
+                        # generator immediately after Done cannot lose it.
+                        growth_success_published = True
+                        self._publish_growth_milestone(
+                            getattr(self, "_turn_growth_succeeded_sink", None),
+                            warning_event="turn_runner.growth_succeeded_sink_failed",
+                        )
+                    yield event
+        except asyncio.CancelledError:
+            if not terminal_observed:
+                outcome = ResultOutcome.CANCEL
+                error_code = TurnErrorCode.UNKNOWN
+                failure_stage = current_turn_failure_stage()
+            raise
+        except GeneratorExit:
+            if not terminal_observed:
+                outcome = ResultOutcome.CANCEL
+                error_code = TurnErrorCode.UNKNOWN
+                failure_stage = current_turn_failure_stage()
+            raise
+        except TimeoutError:
+            outcome = ResultOutcome.TIMEOUT
+            error_code = TurnErrorCode.PROVIDER_TIMEOUT
+            failure_stage = current_turn_failure_stage()
+            raise
+        except BaseException:
+            outcome = ResultOutcome.FAIL
+            error_code = TurnErrorCode.INTERNAL_ERROR
+            failure_stage = current_turn_failure_stage()
+            raise
+        finally:
+            facts = accumulator.finish(
+                clock(),
+                outcome=outcome,
+                error_code=error_code,
+                failure_stage=failure_stage,
+            )
+            sink = self._turn_reliability_sink
+            if sink is not None:
+                try:
+                    sink_result = sink(facts)
+                    if inspect.isawaitable(sink_result):
+                        close = getattr(sink_result, "close", None)
+                        if callable(close):
+                            close()
+                        log.warning("turn_runner.reliability_sink_must_be_synchronous")
+                except BaseException as exc:  # observer must never change the turn
+                    log.warning(
+                        "turn_runner.reliability_sink_failed",
+                        error_type=type(exc).__name__,
+                    )
+            if telemetry_token is not None:
+                reset_client_runtime_dimensions(telemetry_token)
+            reset_current_turn_failure_stage(failure_stage_token)
+
+    @staticmethod
+    def _publish_growth_milestone(
+        sink: GrowthMilestoneSink | None,
+        *,
+        warning_event: str,
+    ) -> None:
+        if sink is None:
+            return
+        try:
+            sink_result = sink()
+            if inspect.isawaitable(sink_result):
+                close = getattr(sink_result, "close", None)
+                if callable(close):
+                    close()
+                log.warning("turn_runner.growth_sink_must_be_synchronous")
+        except BaseException as exc:
+            log.warning(warning_event, error_type=type(exc).__name__)
+
+    async def _run_without_reliability(
+        self,
+        message: str,
+        session_key: str,
+        tool_context: ToolContext,
+        agent_id: str = "main",
+        model: str | None = None,
+        attachments: list[dict] | None = None,
+        timeout: float | None = None,
+        max_iterations: int | None = None,
+        iteration_timeout: float | None = None,
+        tool_timeout: float | None = None,
+        request_timeout: float | None = None,
+        max_provider_retries: int | None = None,
+        length_capped_continuations: int | None = None,
+        input_mode: str = "user",
+        persist_input: bool = False,
+        input_provenance: dict[str, Any] | str | None = None,
+        history_has_persisted_user: bool = True,
+        fresh_user_session: bool | None = None,
+        session_intent: str | None = None,
+        semantic_message: str | None = None,
+        run_kind: str = "default",
+        heartbeat_ack_max_chars: int = 300,
+        bootstrap_context_mode: str | None = None,
+        no_memory_capture: bool = False,
+        ingress_pipeline_steps: list[PipelineStepRecord] | None = None,
+        router_control_replay_depth: int = 0,
+        *,
+        pending_input_provider: PendingInputProvider | None = None,
+        bound_user_message_id: str | None = None,
+        assistant_message_sink: Callable[[str | None, str], None] | None = None,
+        document_mutation_outcome_sink: Callable[[dict[str, Any]], None] | None = None,
+        root_turn_id: str | None = None,
+        provider_request_correlation: ProviderRequestCorrelation | None = None,
+        assistant_message_id: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run one agent turn with full orchestration.
 
@@ -5181,63 +5506,9 @@ class TurnRunner:
                     git_mode_scope(),
                     process_scope(),
                 ):
-                    async for event in self._run_turn(
-                        message,
-                        session_key,
-                        agent_id,
-                        model,
-                        attachments or [],
-                        effective_tool_context,
-                        timeout=timeout,
-                        max_iterations=max_iterations,
-                        iteration_timeout=iteration_timeout,
-                        tool_timeout=tool_timeout,
-                        request_timeout=request_timeout,
-                        max_provider_retries=max_provider_retries,
-                        length_capped_continuations=length_capped_continuations,
-                        input_mode=input_mode,
-                        persist_input=persist_input,
-                        input_provenance=normalized_input_provenance,
-                        history_has_persisted_user=history_has_persisted_user,
-                        fresh_user_session=fresh_user_session,
-                        session_intent=session_intent,
-                        semantic_message=semantic_message,
-                        pending_input_provider=pending_input_provider,
-                        run_kind=run_kind,
-                        heartbeat_ack_max_chars=heartbeat_ack_max_chars,
-                        bootstrap_context_mode=bootstrap_context_mode,
-                        no_memory_capture=no_memory_capture,
-                        ingress_pipeline_steps=ingress_pipeline_steps,
-                        router_control_replay_depth=router_control_replay_depth,
-                        bound_user_message_id=bound_user_message_id,
-                        assistant_message_sink=assistant_message_sink,
-                        document_mutation_outcome_sink=document_mutation_outcome_sink,
-                        root_turn_id=logical_turn_id,
-                        provider_request_correlation=provider_request_correlation,
-                        assistant_message_id=assistant_message_id,
-                        execution_context=execution_context,
-                    ):
-                        yield event
-            finally:
-                self.clear_compaction_turn_state(session_key)
-                await execution_context.close()
-        else:
-            async with lock:
-                # Record this Task as the lock owner in the ContextVar so that
-                # any nested call to run() within the same Task can detect re-entry.
-                _map: dict[int, asyncio.Task[Any]] = dict(owner_map or {})
-                if current_task is not None:
-                    _map[id(lock)] = current_task
-                _token = _SESSION_LOCK_OWNER.set(_map)
-                try:
-                    with (
-                        managed_toolchain_state_scope(configured_state_dir),
-                        runtime_pack_state_scope(configured_state_dir),
-                        policy_scope(),
-                        git_mode_scope(),
-                        process_scope(),
-                    ):
-                        async for event in self._run_turn(
+                    turn_stream = cast(
+                        AsyncGenerator[AgentEvent, None],
+                        self._run_turn(
                             message,
                             session_key,
                             agent_id,
@@ -5272,8 +5543,76 @@ class TurnRunner:
                             provider_request_correlation=provider_request_correlation,
                             assistant_message_id=assistant_message_id,
                             execution_context=execution_context,
-                        ):
+                        ),
+                    )
+                    async with contextlib.aclosing(turn_stream):
+                        async for event in turn_stream:
                             yield event
+            finally:
+                self.clear_compaction_turn_state(session_key)
+                await execution_context.close()
+        else:
+            async with lock:
+                # Record this Task as the lock owner in the ContextVar so that
+                # any nested call to run() within the same Task can detect re-entry.
+                _map: dict[int, asyncio.Task[Any]] = dict(owner_map or {})
+                if current_task is not None:
+                    _map[id(lock)] = current_task
+                _token = _SESSION_LOCK_OWNER.set(_map)
+                try:
+                    with (
+                        managed_toolchain_state_scope(configured_state_dir),
+                        runtime_pack_state_scope(configured_state_dir),
+                        policy_scope(),
+                        git_mode_scope(),
+                        process_scope(),
+                    ):
+                        turn_stream = cast(
+                            AsyncGenerator[AgentEvent, None],
+                            self._run_turn(
+                                message,
+                                session_key,
+                                agent_id,
+                                model,
+                                attachments or [],
+                                effective_tool_context,
+                                timeout=timeout,
+                                max_iterations=max_iterations,
+                                iteration_timeout=iteration_timeout,
+                                tool_timeout=tool_timeout,
+                                request_timeout=request_timeout,
+                                max_provider_retries=max_provider_retries,
+                                length_capped_continuations=length_capped_continuations,
+                                input_mode=input_mode,
+                                persist_input=persist_input,
+                                input_provenance=normalized_input_provenance,
+                                history_has_persisted_user=history_has_persisted_user,
+                                fresh_user_session=fresh_user_session,
+                                session_intent=session_intent,
+                                semantic_message=semantic_message,
+                                pending_input_provider=pending_input_provider,
+                                run_kind=run_kind,
+                                heartbeat_ack_max_chars=heartbeat_ack_max_chars,
+                                bootstrap_context_mode=bootstrap_context_mode,
+                                no_memory_capture=no_memory_capture,
+                                ingress_pipeline_steps=ingress_pipeline_steps,
+                                router_control_replay_depth=router_control_replay_depth,
+                                bound_user_message_id=bound_user_message_id,
+                                assistant_message_sink=assistant_message_sink,
+                                document_mutation_outcome_sink=(
+                                    document_mutation_outcome_sink
+                                ),
+                                root_turn_id=logical_turn_id,
+                                provider_request_correlation=(
+                                    provider_request_correlation
+                                ),
+                                assistant_message_id=assistant_message_id,
+                                execution_context=execution_context,
+                            ),
+                        )
+                        async with contextlib.aclosing(turn_stream):
+                            async for event in turn_stream:
+                                yield event
                 finally:
                     self.clear_compaction_turn_state(session_key)
                     _SESSION_LOCK_OWNER.reset(_token)
@@ -5317,6 +5656,7 @@ class TurnRunner:
         assistant_message_id: str | None = None,
         execution_context: TurnExecutionContext | None = None,
     ) -> AsyncIterator[AgentEvent]:
+        mark_current_turn_failure_stage(TurnFailureStage.TURN_SETUP)
         # Observability: bracket turn setup + stream loop with monotonic clock
         # so latency_ms reflects the full turn.
         turn_started_at = time.monotonic()
@@ -5418,6 +5758,7 @@ class TurnRunner:
             else:
                 provider_request_correlation = None
 
+            mark_current_turn_failure_stage(TurnFailureStage.INPUT_PROCESSING)
             input_out = await self._input_stage.run(
                 InputStageInput(
                     message=message,
@@ -5448,6 +5789,7 @@ class TurnRunner:
 
             transcript_snapshot = TurnTranscriptSnapshot[Any](_load_turn_transcript)
 
+            mark_current_turn_failure_stage(TurnFailureStage.PROVIDER_AND_TOOLS)
             pt_outcome = await self._provider_and_tools_stage.run(
                 ProviderAndToolsStageInput(
                     session_key=session_key,
@@ -5518,6 +5860,7 @@ class TurnRunner:
                 and timeout > 0
                 else None
             )
+            mark_current_turn_failure_stage(TurnFailureStage.ATTACHMENT_PROCESSING)
             att_outcome = await self._attachment_stage.run(
                 AttachmentStageInput(
                     effective_runtime_message=runtime_message,
@@ -5535,6 +5878,23 @@ class TurnRunner:
                 )
             )
             att_out = att_outcome.require_output()
+            file_parse_sink = getattr(self, "_file_parse_reliability_sink", None)
+            if file_parse_sink is not None:
+                for file_parse_facts in att_out.file_parse_facts:
+                    try:
+                        sink_result = file_parse_sink(file_parse_facts)
+                        if inspect.isawaitable(sink_result):
+                            close = getattr(sink_result, "close", None)
+                            if callable(close):
+                                close()
+                            log.warning(
+                                "turn_runner.file_parse_reliability_sink_must_be_synchronous"
+                            )
+                    except BaseException as exc:
+                        log.warning(
+                            "turn_runner.file_parse_reliability_sink_failed",
+                            error_type=type(exc).__name__,
+                        )
 
             turn_usage_scope: UsageAccountingScope | None = None
             if self._usage_event_sink is not None:
@@ -5553,6 +5913,7 @@ class TurnRunner:
                 )
 
             with bind_usage_accounting_scope(turn_usage_scope):
+                mark_current_turn_failure_stage(TurnFailureStage.PROMPT_ASSEMBLY)
                 pa_outcome = await self._prompt_assembler_stage.run(
                     PromptAssemblerStageInput(
                         runtime_message=runtime_message,
@@ -5682,6 +6043,7 @@ class TurnRunner:
                 input_mode=input_mode,
                 turn_metadata=turn.metadata,
             )
+            mark_current_turn_failure_stage(TurnFailureStage.AGENT_BOOTSTRAP)
             ab_outcome = await self._agent_bootstrap_stage.run(
                 AgentBootstrapStageInput(
                     provider=provider,
@@ -5714,6 +6076,13 @@ class TurnRunner:
             )
             ab_out = ab_outcome.require_output()
             agent = ab_out.agent
+            tool_reliability_setter = getattr(
+                agent,
+                "set_tool_reliability_sink",
+                None,
+            )
+            if callable(tool_reliability_setter):
+                tool_reliability_setter(self._tool_reliability_sink)
             keepalive_capture_enabled = False
             if (
                 self._prompt_cache_keepalive_recorder is not None
@@ -6163,6 +6532,7 @@ class TurnRunner:
                 attachment_count=len(attachments),
             )
             with bind_usage_accounting_scope(turn_usage_scope):
+                mark_current_turn_failure_stage(TurnFailureStage.CONTEXT_PREPARATION)
                 compaction_correlation = derive_provider_request_correlation(
                     provider_request_correlation,
                     execution_id=uuid.uuid4().hex,
@@ -6291,6 +6661,7 @@ class TurnRunner:
             # CancelledError handler below still sees them.
             error_message: str | None = None
             pending_error_event: ErrorEvent | None = None
+            pending_error_failure_stage: TurnFailureStage | None = None
             done_event: DoneEvent | None = None
             turn_input = attachment_turn_input
 
@@ -6335,51 +6706,82 @@ class TurnRunner:
                 execution_context=execution_context,
             )
             router_control_replay_event: RouterControlReplayEvent | None = None
-            with bind_usage_accounting_scope(turn_usage_scope):
-                async for event in self._stream_consumer_stage.run(stream_inp):
-                    if isinstance(event, RouterControlReplayEvent):
-                        router_control_replay_event = event
+            mark_current_turn_failure_stage(TurnFailureStage.AGENT_EXECUTION)
+            stage_stream = self._stream_consumer_stage.run(stream_inp)
+            stage_stream_exhausted = False
+            try:
+                with bind_usage_accounting_scope(turn_usage_scope):
+                    async for event in stage_stream:
+                        if isinstance(event, RouterControlReplayEvent):
+                            router_control_replay_event = event
+                            yield event
+                            break
                         yield event
-                        break
-                    yield event
+                    else:
+                        stage_stream_exhausted = True
+            finally:
+                stage_close = getattr(stage_stream, "aclose", None)
+                if callable(stage_close):
+                    await stage_close()
+                if not stage_stream_exhausted:
+                    reliability_close = getattr(
+                        agent,
+                        "settle_pending_tool_reliability_on_stream_close",
+                        None,
+                    )
+                    if callable(reliability_close):
+                        try:
+                            reliability_close()
+                        except BaseException as exc:  # observer cannot alter the turn
+                            log.warning(
+                                "turn_runner.tool_reliability_close_failed",
+                                error_type=type(exc).__name__,
+                            )
             if router_control_replay_event is not None:
-                async for replayed_event in self._run_turn(
-                    message,
-                    session_key,
-                    agent_id,
-                    model,
-                    attachments,
-                    tool_context,
-                    timeout=timeout,
-                    max_iterations=max_iterations,
-                    iteration_timeout=iteration_timeout,
-                    tool_timeout=tool_timeout,
-                    request_timeout=request_timeout,
-                    max_provider_retries=max_provider_retries,
-                    length_capped_continuations=length_capped_continuations,
-                    input_mode=input_mode,
-                    persist_input=False,
-                    input_provenance=input_provenance,
-                    history_has_persisted_user=True,
-                    fresh_user_session=False,
-                    session_intent=session_intent,
-                    semantic_message=semantic_message,
-                    pending_input_provider=pending_input_provider,
-                    bound_user_message_id=bound_user_message_id,
-                    run_kind=run_kind,
-                    heartbeat_ack_max_chars=heartbeat_ack_max_chars,
-                    bootstrap_context_mode=bootstrap_context_mode,
-                    no_memory_capture=no_memory_capture,
-                    ingress_pipeline_steps=ingress_pipeline_steps,
-                    router_control_replay_depth=router_control_replay_depth + 1,
-                    assistant_message_sink=assistant_message_sink,
-                    document_mutation_outcome_sink=document_mutation_outcome_sink,
-                    root_turn_id=turn_id,
-                    provider_request_correlation=provider_request_correlation,
-                    assistant_message_id=assistant_message_id,
-                    execution_context=execution_context,
-                ):
-                    yield replayed_event
+                replay_stream = cast(
+                    AsyncGenerator[AgentEvent, None],
+                    self._run_turn(
+                        message,
+                        session_key,
+                        agent_id,
+                        model,
+                        attachments,
+                        tool_context,
+                        timeout=timeout,
+                        max_iterations=max_iterations,
+                        iteration_timeout=iteration_timeout,
+                        tool_timeout=tool_timeout,
+                        request_timeout=request_timeout,
+                        max_provider_retries=max_provider_retries,
+                        length_capped_continuations=length_capped_continuations,
+                        input_mode=input_mode,
+                        persist_input=False,
+                        input_provenance=input_provenance,
+                        history_has_persisted_user=True,
+                        fresh_user_session=False,
+                        session_intent=session_intent,
+                        semantic_message=semantic_message,
+                        pending_input_provider=pending_input_provider,
+                        bound_user_message_id=bound_user_message_id,
+                        run_kind=run_kind,
+                        heartbeat_ack_max_chars=heartbeat_ack_max_chars,
+                        bootstrap_context_mode=bootstrap_context_mode,
+                        no_memory_capture=no_memory_capture,
+                        ingress_pipeline_steps=ingress_pipeline_steps,
+                        router_control_replay_depth=router_control_replay_depth + 1,
+                        assistant_message_sink=assistant_message_sink,
+                        document_mutation_outcome_sink=(
+                            document_mutation_outcome_sink
+                        ),
+                        root_turn_id=turn_id,
+                        provider_request_correlation=provider_request_correlation,
+                        assistant_message_id=assistant_message_id,
+                        execution_context=execution_context,
+                    ),
+                )
+                async with contextlib.aclosing(replay_stream):
+                    async for replayed_event in replay_stream:
+                        yield replayed_event
                 return
             # Read terminal state off the shared _StreamState. The
             # five pass-by-reference lists were mutated in place, so
@@ -6389,6 +6791,8 @@ class TurnRunner:
             current_text_parts = stream_state.current_text_parts
             error_message = stream_state.error_message
             pending_error_event = stream_state.pending_error_event
+            if pending_error_event is not None:
+                pending_error_failure_stage = current_turn_failure_stage()
             done_event = stream_state.done_event
             if (
                 done_event is not None
@@ -6415,6 +6819,7 @@ class TurnRunner:
             # fire in legacy order: heartbeat normalize -> transcript
             # append -> memory capture (try/except) -> error persist ->
             # session totals rollup (try/except).
+            mark_current_turn_failure_stage(TurnFailureStage.RESULT_FINALIZATION)
             fin_outcome = await self._turn_finalizer_stage.run(
                 TurnFinalizerStageInput(
                     final_text_parts=final_text_parts,
@@ -6572,6 +6977,9 @@ class TurnRunner:
                 pending_error_event is not None
                 and not stream_state.terminal_generation_reset
             ):
+                mark_current_turn_failure_stage(
+                    pending_error_failure_stage or TurnFailureStage.AGENT_EXECUTION
+                )
                 yield pending_error_event
 
         except asyncio.CancelledError as exc:
@@ -13657,6 +14065,8 @@ class TurnRunner:
         session_id: str | None = None,
         workspace_attachment_budget_bytes: int | None = None,
         cancel_check: Callable[[], None] | None = None,
+        file_parse_fact_sink: Callable[[FileParseReliabilityFacts], object]
+        | None = None,
     ) -> list | None:
         """Build a multimodal user message that carries the attachments.
 
@@ -13788,6 +14198,7 @@ class TurnRunner:
                 if material_marker:
                     attachment_blocks.append(ContentBlockText(text=material_marker))
             elif media_type == "application/pdf":
+                parse_started_at = time.monotonic()
                 try:
                     extracted_pdf_text = _extract_pdf_attachment_text(
                         raw_bytes,
@@ -13795,8 +14206,42 @@ class TurnRunner:
                         cancel_check=cancel_check,
                     )
                 except ValueError as exc:
+                    _publish_file_parse_fact(
+                        file_parse_fact_sink,
+                        media_type=media_type,
+                        size_bytes=len(raw_bytes),
+                        started_at=parse_started_at,
+                        error_code=_pdf_parse_error_code(exc),
+                    )
                     extracted_pdf_text = (
                         f"[attachment unavailable: PDF text could not be extracted: {exc}]"
+                    )
+                except _AttachmentPreparationCancelledError:
+                    _publish_file_parse_fact(
+                        file_parse_fact_sink,
+                        media_type=media_type,
+                        size_bytes=len(raw_bytes),
+                        started_at=parse_started_at,
+                        error_code=FileParseErrorCode.CANCELLED,
+                        outcome=ResultOutcome.CANCEL,
+                    )
+                    raise
+                except TimeoutError:
+                    _publish_file_parse_fact(
+                        file_parse_fact_sink,
+                        media_type=media_type,
+                        size_bytes=len(raw_bytes),
+                        started_at=parse_started_at,
+                        error_code=FileParseErrorCode.PARSE_TIMEOUT,
+                        outcome=ResultOutcome.TIMEOUT,
+                    )
+                    raise
+                else:
+                    _publish_file_parse_fact(
+                        file_parse_fact_sink,
+                        media_type=media_type,
+                        size_bytes=len(raw_bytes),
+                        started_at=parse_started_at,
                     )
                 if material_marker:
                     extracted_pdf_text = "\n\n".join(
@@ -13813,6 +14258,7 @@ class TurnRunner:
                 wrapped = _render_file_context_block(filename, media_type, extracted_pdf_text)
                 attachment_blocks.append(ContentBlockText(text=wrapped))
             elif media_type in _OFFICE_ATTACHMENT_MIMES:
+                parse_started_at = time.monotonic()
                 try:
                     extracted_office_text = _extract_office_attachment_text(
                         raw_bytes,
@@ -13822,9 +14268,43 @@ class TurnRunner:
                         cancel_check=cancel_check,
                     )
                 except ValueError as exc:
+                    _publish_file_parse_fact(
+                        file_parse_fact_sink,
+                        media_type=media_type,
+                        size_bytes=len(raw_bytes),
+                        started_at=parse_started_at,
+                        error_code=_office_parse_error_code(exc),
+                    )
                     extracted_office_text = (
                         "[attachment unavailable: document text could not be "
                         f"extracted: {exc}]"
+                    )
+                except _AttachmentPreparationCancelledError:
+                    _publish_file_parse_fact(
+                        file_parse_fact_sink,
+                        media_type=media_type,
+                        size_bytes=len(raw_bytes),
+                        started_at=parse_started_at,
+                        error_code=FileParseErrorCode.CANCELLED,
+                        outcome=ResultOutcome.CANCEL,
+                    )
+                    raise
+                except TimeoutError:
+                    _publish_file_parse_fact(
+                        file_parse_fact_sink,
+                        media_type=media_type,
+                        size_bytes=len(raw_bytes),
+                        started_at=parse_started_at,
+                        error_code=FileParseErrorCode.PARSE_TIMEOUT,
+                        outcome=ResultOutcome.TIMEOUT,
+                    )
+                    raise
+                else:
+                    _publish_file_parse_fact(
+                        file_parse_fact_sink,
+                        media_type=media_type,
+                        size_bytes=len(raw_bytes),
+                        started_at=parse_started_at,
                     )
                 if material_marker:
                     extracted_office_text = "\n\n".join(
@@ -13835,14 +14315,29 @@ class TurnRunner:
                 )
                 attachment_blocks.append(ContentBlockText(text=wrapped))
             elif media_type in _EMAIL_ATTACHMENT_MIMES:
+                parse_started_at = time.monotonic()
                 try:
                     extracted_email_text = _extract_email_attachment_text(
                         raw_bytes, filename, media_type
                     )
                 except ValueError as exc:
+                    _publish_file_parse_fact(
+                        file_parse_fact_sink,
+                        media_type=media_type,
+                        size_bytes=len(raw_bytes),
+                        started_at=parse_started_at,
+                        error_code=_email_parse_error_code(exc),
+                    )
                     extracted_email_text = (
                         "[attachment unavailable: email could not be "
                         f"extracted: {exc}]"
+                    )
+                else:
+                    _publish_file_parse_fact(
+                        file_parse_fact_sink,
+                        media_type=media_type,
+                        size_bytes=len(raw_bytes),
+                        started_at=parse_started_at,
                     )
                 if material_marker:
                     extracted_email_text = "\n\n".join(
@@ -13853,6 +14348,7 @@ class TurnRunner:
                 )
                 attachment_blocks.append(ContentBlockText(text=wrapped))
             elif media_type in _ENGINE_TEXT_FAMILY_MIMES:
+                parse_started_at = time.monotonic()
                 if (
                     is_attachment_ref(att)
                     and att.get("_provider_inline_policy") == "preview_only"
@@ -13871,9 +14367,33 @@ class TurnRunner:
                             limit=_TEXT_ATTACHMENT_TEXT_LIMIT,
                         )
                     except UnicodeDecodeError:
+                        _publish_file_parse_fact(
+                            file_parse_fact_sink,
+                            media_type=media_type,
+                            size_bytes=len(raw_bytes),
+                            started_at=parse_started_at,
+                            error_code=FileParseErrorCode.INVALID_UTF8,
+                        )
                         decoded_text = (
                             "[attachment unavailable: declared text content is not valid UTF-8]"
                         )
+                    else:
+                        _publish_file_parse_fact(
+                            file_parse_fact_sink,
+                            media_type=media_type,
+                            size_bytes=len(raw_bytes),
+                            started_at=parse_started_at,
+                        )
+                if (
+                    is_attachment_ref(att)
+                    and att.get("_provider_inline_policy") == "preview_only"
+                ):
+                    _publish_file_parse_fact(
+                        file_parse_fact_sink,
+                        media_type=media_type,
+                        size_bytes=len(raw_bytes),
+                        started_at=parse_started_at,
+                    )
                 if material_marker:
                     decoded_text = "\n\n".join([decoded_text, material_marker])
                 wrapped = _render_file_context_block(filename, media_type, decoded_text)

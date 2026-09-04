@@ -282,9 +282,7 @@ _d = get_dispatcher()
 
 _SESSION_ROUTING_MODES = frozenset({"direct", "router", "ensemble"})
 
-_PENDING_INPUT_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = (
-    weakref.WeakValueDictionary()
-)
+_PENDING_INPUT_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
 
 def _pending_input_lock_for(pending_input_id: str) -> asyncio.Lock:
@@ -312,6 +310,8 @@ async def _pending_input_enqueue_lock(
         else:
             async with session_lock:
                 yield
+
+
 log = structlog.get_logger(__name__)
 _ELEVATED_MODES = frozenset({"full"})
 _TRUSTED_ELEVATED_ALIASES = frozenset({"on", "bypass"})
@@ -381,10 +381,7 @@ def _desktop_artifact_bridge_supports_candidate_loop(capabilities: Any) -> bool:
         _flag("restoreCanonicalPreview", "restore_canonical_preview"),
     )
     return (
-        isinstance(version, int)
-        and not isinstance(version, bool)
-        and version >= 4
-        and all(values)
+        isinstance(version, int) and not isinstance(version, bool) and version >= 4 and all(values)
     )
 
 
@@ -471,8 +468,7 @@ def _artifact_state_event_emitter(
             if value is not None and (not isinstance(value, str) or not value):
                 raise ValueError("invalid artifact state event identifier")
         safe_payload = {
-            field_name: payload.get(field_name)
-            for field_name in _ARTIFACT_STATE_EVENT_FIELDS
+            field_name: payload.get(field_name) for field_name in _ARTIFACT_STATE_EVENT_FIELDS
         }
         # Dual-publish while existing clients still subscribe to the artifact
         # event name. Both notifications carry the same metadata-only payload.
@@ -807,8 +803,7 @@ async def _cancel_task_runtime(
         # an older/custom runtime.  Both identities are required so a stale or
         # forged task id cannot cancel work owned by another session.
         if not (
-            _accepts_keyword_arg(cancel, "task_id")
-            and _accepts_keyword_arg(cancel, "session_key")
+            _accepts_keyword_arg(cancel, "task_id") and _accepts_keyword_arg(cancel, "session_key")
         ):
             raise _TaskScopedCancelUnsupportedError
         kwargs["task_id"] = task_id
@@ -946,12 +941,8 @@ def _guest_profile_for_principal(
                 from opensquilla.sandbox.runtime_launcher import bundled_runtime_resolver
 
                 legacy = bundled_runtime_resolver()
-                runtime_roots = (
-                    legacy.runtime_roots(runtime_policy) if legacy is not None else ()
-                )
-                runtime_path = (
-                    legacy.bundled_path(runtime_policy) if legacy is not None else ()
-                )
+                runtime_roots = legacy.runtime_roots(runtime_policy) if legacy is not None else ()
+                runtime_path = legacy.bundled_path(runtime_policy) if legacy is not None else ()
         except (OSError, RuntimeError, ValueError):
             # Guest remains strictly managed with an empty PATH. Runtime state
             # corruption must not make session creation or Gateway boot fail.
@@ -971,10 +962,7 @@ def _is_remote_web_guest(principal: Any, source_hint: dict[str, Any]) -> bool:
     # weaken the server-computed authority of an unauthenticated guest.
     del source_hint
     has_capability = getattr(principal, "has", lambda _capability: False)
-    return bool(
-        has_capability("guest.safe")
-        and not principal_has_host_execute(principal)
-    )
+    return bool(has_capability("guest.safe") and not principal_has_host_execute(principal))
 
 
 def _channel_types_from_config(config: Any) -> dict[str, str]:
@@ -1368,10 +1356,7 @@ async def _drain_cancelled_task_runtime(
             )
         return
 
-    waiters = {
-        asyncio.create_task(task_runtime.wait(task_id)): task_id
-        for task_id in task_ids
-    }
+    waiters = {asyncio.create_task(task_runtime.wait(task_id)): task_id for task_id in task_ids}
     done, pending = await asyncio.wait(waiters, timeout=timeout)
     for waiter in done:
         try:
@@ -1416,9 +1401,7 @@ async def _cancel_task_owned_auxiliary_work(
     completion_task = asyncio.create_task(
         cancel_background_completion_for_task(session_key, task_id)
     )
-    process_task = asyncio.create_task(
-        cancel_background_processes_for_task(session_key, task_id)
-    )
+    process_task = asyncio.create_task(cancel_background_processes_for_task(session_key, task_id))
     persisted_process_task = asyncio.create_task(
         cancel_persisted_processes_for_task(process_state_dir, session_key, task_id)
     )
@@ -1441,9 +1424,7 @@ async def _cancel_task_owned_auxiliary_work(
         default=0,
     )
     return (
-        int(cancelled_completions)
-        + int(cancelled_processes)
-        + int(cancelled_persisted_processes)
+        int(cancelled_completions) + int(cancelled_processes) + int(cancelled_persisted_processes)
     )
 
 
@@ -2215,11 +2196,7 @@ def _normalize_terminal_event_payload(event_name: str, payload: dict[str, Any]) 
         code=str(code) if code else None,
         message=safe_error_message,
         error_class=str(code) if code else None,
-        failure_kind=(
-            str(prior_failure_kind)
-            if isinstance(prior_failure_kind, str)
-            else None
-        ),
+        failure_kind=(str(prior_failure_kind) if isinstance(prior_failure_kind, str) else None),
     )
     sensitive_provider_fields = {
         "provider_error_message",
@@ -2230,9 +2207,7 @@ def _normalize_terminal_event_payload(event_name: str, payload: dict[str, Any]) 
         "response_body",
     }
     safe_payload = {
-        key: value
-        for key, value in payload.items()
-        if key not in sensitive_provider_fields
+        key: value for key, value in payload.items() if key not in sensitive_provider_fields
     }
     return {
         **safe_payload,
@@ -2333,20 +2308,14 @@ async def _overlay_runtime_task_snapshot(
 
     running_value = getattr(snapshot, "running_task_id", None)
     running_task_id = (
-        running_value.strip()
-        if isinstance(running_value, str) and running_value.strip()
-        else None
+        running_value.strip() if isinstance(running_value, str) and running_value.strip() else None
     )
     raw_queued_ids = getattr(snapshot, "queued_task_ids", ())
     queued_task_ids: list[str] = []
     if isinstance(raw_queued_ids, (list, tuple)):
         for value in raw_queued_ids:
             task_id = value.strip() if isinstance(value, str) else ""
-            if (
-                task_id
-                and task_id != running_task_id
-                and task_id not in queued_task_ids
-            ):
+            if task_id and task_id != running_task_id and task_id not in queued_task_ids:
                 queued_task_ids.append(task_id)
     raw_cancel_requested_ids = getattr(snapshot, "cancel_requested_task_ids", ())
     cancel_requested_task_ids = {
@@ -2374,16 +2343,14 @@ async def _overlay_runtime_task_snapshot(
                             task
                             for task in task_state.get("tasks", [])
                             if isinstance(task, dict)
-                            and str(task.get("status") or "").strip().lower()
-                            == "queued"
+                            and str(task.get("status") or "").strip().lower() == "queued"
                         ),
                         key=lambda task: (
                             int(task.get("created_at") or 0),
                             str(task.get("task_id") or ""),
                         ),
                     )
-                    if isinstance(task, dict)
-                    and str(task.get("task_id") or "").strip()
+                    if isinstance(task, dict) and str(task.get("task_id") or "").strip()
                 ]
                 if durable_task_id not in queued_task_ids:
                     queued_task_ids.insert(0, durable_task_id)
@@ -2450,15 +2417,9 @@ async def _attach_active_steer_capability(
 
 def _active_task_run_mode(rows: list[Any]) -> str | None:
     active = [
-        row
-        for row in rows
-        if _enum_value(getattr(row, "status", None)) in _ACTIVE_TASK_STATUSES
+        row for row in rows if _enum_value(getattr(row, "status", None)) in _ACTIVE_TASK_STATUSES
     ]
-    running = [
-        row
-        for row in active
-        if _enum_value(getattr(row, "status", None)) == "running"
-    ]
+    running = [row for row in active if _enum_value(getattr(row, "status", None)) == "running"]
     candidates = _sorted_task_rows(running or active)
     for row in candidates:
         details = getattr(row, "details", None)
@@ -2485,8 +2446,7 @@ def _run_mode_lock_payload(
     principal: Any,
 ) -> dict[str, Any]:
     has_active_task = any(
-        _enum_value(getattr(row, "status", None)) in _ACTIVE_TASK_STATUSES
-        for row in task_rows
+        _enum_value(getattr(row, "status", None)) in _ACTIVE_TASK_STATUSES for row in task_rows
     )
     has_background_group = bool(active_task_group_ids)
     if not has_active_task and not has_background_group:
@@ -2687,11 +2647,7 @@ def _encode_session_list_cursor(cursor: SessionListCursor | None) -> str | None:
 def _decode_session_list_cursor(value: Any) -> SessionListCursor | None:
     if value is None:
         return None
-    if (
-        not isinstance(value, str)
-        or not value
-        or len(value) > _SESSION_LIST_CURSOR_MAX_CHARS
-    ):
+    if not isinstance(value, str) or not value or len(value) > _SESSION_LIST_CURSOR_MAX_CHARS:
         raise RpcHandlerError(
             code="INVALID_PARAMS",
             message="params.cursor must be a valid sessions.list cursor",
@@ -3249,9 +3205,7 @@ async def _load_followup_annotation_focus(
         for index, entry in enumerate(entries):
             if getattr(entry, "role", None) != "user":
                 continue
-            snapshots = prompt_annotations_from_transcript_envelope(
-                getattr(entry, "content", None)
-            )
+            snapshots = prompt_annotations_from_transcript_envelope(getattr(entry, "content", None))
             if snapshots:
                 user_entries.append((index, entry, snapshots))
         if not user_entries:
@@ -3268,9 +3222,7 @@ async def _load_followup_annotation_focus(
             return None
 
         later_user_turns = sum(
-            1
-            for entry in entries[annotation_index + 1 :]
-            if getattr(entry, "role", None) == "user"
+            1 for entry in entries[annotation_index + 1 :] if getattr(entry, "role", None) == "user"
         )
         if later_user_turns > 1:
             return None
@@ -3520,13 +3472,8 @@ async def _handle_sessions_send_impl_inner(
             raise ValueError("params.promptAnnotationIds must be an array")
         if len(raw_prompt_annotation_ids) > 16:
             raise ValueError("params.promptAnnotationIds supports at most 16 items")
-        if any(
-            not isinstance(item, str) or not item.strip()
-            for item in raw_prompt_annotation_ids
-        ):
-            raise ValueError(
-                "params.promptAnnotationIds must contain non-empty strings"
-            )
+        if any(not isinstance(item, str) or not item.strip() for item in raw_prompt_annotation_ids):
+            raise ValueError("params.promptAnnotationIds must contain non-empty strings")
         prompt_annotation_ids = tuple(item.strip() for item in raw_prompt_annotation_ids)
         if len(set(prompt_annotation_ids)) != len(prompt_annotation_ids):
             raise ValueError("params.promptAnnotationIds must contain unique ids")
@@ -3551,9 +3498,7 @@ async def _handle_sessions_send_impl_inner(
             "head_revision_id",
         }
         if not set(raw_document_context) <= allowed_document_context_keys:
-            raise ValueError(
-                "params.documentContext accepts only documentId and headRevisionId"
-            )
+            raise ValueError("params.documentContext accepts only documentId and headRevisionId")
         if (
             "documentId" in raw_document_context
             and "document_id" in raw_document_context
@@ -3563,8 +3508,7 @@ async def _handle_sessions_send_impl_inner(
         if (
             "headRevisionId" in raw_document_context
             and "head_revision_id" in raw_document_context
-            and raw_document_context["headRevisionId"]
-            != raw_document_context["head_revision_id"]
+            and raw_document_context["headRevisionId"] != raw_document_context["head_revision_id"]
         ):
             raise ValueError("Conflicting headRevisionId aliases")
         raw_document_id = raw_document_context.get(
@@ -3682,9 +3626,7 @@ async def _handle_sessions_send_impl_inner(
             SessionIntent.CONTINUE,
             SessionIntent.NEW_CHAT,
         }:
-            raise ValueError(
-                "Plan implementation supports continue or new_chat intent only"
-            )
+            raise ValueError("Plan implementation supports continue or new_chat intent only")
         if fork_before_message_id is not None:
             raise ValueError("Plan implementation cannot be combined with a transcript fork")
     if plan_context_revision_id is not None:
@@ -3703,45 +3645,31 @@ async def _handle_sessions_send_impl_inner(
         raise ValueError("plan_run_driver_id is valid only for a goal plan run")
     if required_collaboration_mode not in {None, "default", "plan"}:
         raise ValueError("required_collaboration_mode must be default or plan")
-    if (
-        required_collaboration_revision is not None
-        and (
-            not isinstance(required_collaboration_revision, int)
-            or isinstance(required_collaboration_revision, bool)
-            or required_collaboration_revision < 0
-        )
+    if required_collaboration_revision is not None and (
+        not isinstance(required_collaboration_revision, int)
+        or isinstance(required_collaboration_revision, bool)
+        or required_collaboration_revision < 0
     ):
         raise ValueError("required_collaboration_revision must be a non-negative integer")
-    if (
-        initial_collaboration_mode is not None
-        and (
-            not isinstance(initial_collaboration_mode, str)
-            or initial_collaboration_mode not in {"default", "plan"}
-        )
+    if initial_collaboration_mode is not None and (
+        not isinstance(initial_collaboration_mode, str)
+        or initial_collaboration_mode not in {"default", "plan"}
     ):
         raise ValueError("initial_collaboration_mode must be default or plan")
     if initial_collaboration_mode is not None:
         if session_intent is not SessionIntent.NEW_CHAT:
-            raise ValueError(
-                "initial_collaboration_mode requires new_chat intent"
-            )
+            raise ValueError("initial_collaboration_mode requires new_chat intent")
         if fork_before_message_id is not None:
-            raise ValueError(
-                "initial_collaboration_mode cannot be combined with a transcript fork"
-            )
+            raise ValueError("initial_collaboration_mode cannot be combined with a transcript fork")
         if plan_revision_id is not None or plan_context_revision_id is not None:
-            raise ValueError(
-                "initial_collaboration_mode cannot be combined with a plan operation"
-            )
+            raise ValueError("initial_collaboration_mode cannot be combined with a plan operation")
         if (
             required_collaboration_mode is not None
             and required_collaboration_mode != initial_collaboration_mode
         ):
             raise ValueError("Conflicting required collaboration modes")
         required_collaboration_mode = initial_collaboration_mode
-        required_collaboration_revision = (
-            1 if initial_collaboration_mode == "plan" else 0
-        )
+        required_collaboration_revision = 1 if initial_collaboration_mode == "plan" else 0
     if initial_routing_mode is not None:
         if initial_routing_mode not in _SESSION_ROUTING_MODES:
             raise ValueError("initialRoutingMode must be direct, router, or ensemble")
@@ -3769,9 +3697,7 @@ async def _handle_sessions_send_impl_inner(
         effective_fingerprint_params["promptAnnotationIds"] = list(prompt_annotation_ids)
     if raw_document_context is not None:
         effective_fingerprint_params.pop("document_context", None)
-        effective_fingerprint_params["documentContext"] = dict(
-            document_context_request or {}
-        )
+        effective_fingerprint_params["documentContext"] = dict(document_context_request or {})
     ingress_identity = request_identity(
         params,
         request_session_key=key,
@@ -3803,8 +3729,7 @@ async def _handle_sessions_send_impl_inner(
                     requested_client_message_id is None
                     or pending_input_fingerprint is None
                     or pending_input_revision is None
-                    or pending_input_fingerprint
-                    != ingress_identity.request_fingerprint
+                    or pending_input_fingerprint != ingress_identity.request_fingerprint
                 ):
                     raise PendingChatInputConflictError(
                         "pending input replay identity is incomplete or inconsistent"
@@ -3833,9 +3758,7 @@ async def _handle_sessions_send_impl_inner(
                     previous_acceptance.receipt.accepted_session_key
                 )
                 if current_session is not None:
-                    replay_response["collaboration"] = (
-                        _plan_collaboration_snapshot(current_session)
-                    )
+                    replay_response["collaboration"] = _plan_collaboration_snapshot(current_session)
             if initial_routing_mode is not None:
                 replay_response["acceptedRouting"] = {
                     "mode": initial_routing_mode,
@@ -3848,9 +3771,11 @@ async def _handle_sessions_send_impl_inner(
 
     if prompt_annotation_ids or document_context_request is not None:
         existing_annotation_session = await storage.get_session(key)
-        existing_collaboration_mode = str(
-            getattr(existing_annotation_session, "collaboration_mode", "default") or "default"
-        ).strip().lower()
+        existing_collaboration_mode = (
+            str(getattr(existing_annotation_session, "collaboration_mode", "default") or "default")
+            .strip()
+            .lower()
+        )
         if (
             plan_revision_id is not None
             or plan_context_revision_id is not None
@@ -3916,12 +3841,8 @@ async def _handle_sessions_send_impl_inner(
             pending = list(pending_user_inputs(key) or [])
             if pending:
                 request = pending[0]
-                request_id = str(
-                    request.get("request_id") or request.get("requestId") or ""
-                )
-                task_id = str(
-                    request.get("run_id") or request.get("runId") or ""
-                )
+                request_id = str(request.get("request_id") or request.get("requestId") or "")
+                task_id = str(request.get("run_id") or request.get("runId") or "")
                 log.info(
                     "plan_implementation.admission_rejected",
                     session_key=key,
@@ -4015,9 +3936,7 @@ async def _handle_sessions_send_impl_inner(
     if (
         initial_collaboration_mode is not None or initial_routing_mode is not None
     ) and not supports_task_runtime_activation:
-        raise RpcUnavailableError(
-            "Initial session controls require atomic turn acceptance"
-        )
+        raise RpcUnavailableError("Initial session controls require atomic turn acceptance")
 
     async def _prepare_or_apply_intent() -> tuple[Any, Any | None]:
         existing_session = await storage.get_session(key)
@@ -4055,12 +3974,9 @@ async def _handle_sessions_send_impl_inner(
         raise _preaccept_storage_busy_error(exc) from exc
 
     if (initial_collaboration_mode is not None or initial_routing_mode is not None) and (
-        atomic_intent_plan is None
-        or getattr(atomic_intent_plan, "action", None) != "create"
+        atomic_intent_plan is None or getattr(atomic_intent_plan, "action", None) != "create"
     ):
-        raise ValueError(
-            "Initial session controls require atomic session creation"
-        )
+        raise ValueError("Initial session controls require atomic session creation")
 
     if fork_before_message_id is not None:
         parent_key = key
@@ -4148,9 +4064,7 @@ async def _handle_sessions_send_impl_inner(
         )
 
         try:
-            artifact_session_service = await ArtifactSessionService.from_session_storage(
-                storage
-            )
+            artifact_session_service = await ArtifactSessionService.from_session_storage(storage)
             prompt_annotation_rows = await artifact_session_service.preflight_prompt_annotations(
                 annotation_ids=prompt_annotation_ids,
                 session_key=key,
@@ -4228,9 +4142,7 @@ async def _handle_sessions_send_impl_inner(
             for order, (annotation, anchor) in enumerate(
                 zip(prompt_annotation_rows, annotation_anchors, strict=True)
             ):
-                old_revision = await artifact_session_service.get_revision(
-                    annotation.revision_id
-                )
+                old_revision = await artifact_session_service.get_revision(annotation.revision_id)
                 if old_revision.document_id != annotation_document.document_id:
                     raise ArtifactPromptAnnotationConflictError(
                         "prompt annotation revision belongs to another document"
@@ -4308,16 +4220,12 @@ async def _handle_sessions_send_impl_inner(
                         },
                     }
                 )
-            prompt_annotation_snapshots = normalize_prompt_annotation_snapshots(
-                raw_snapshots
-            )
+            prompt_annotation_snapshots = normalize_prompt_annotation_snapshots(raw_snapshots)
             request_context_prompt = render_active_prompt_annotation_context(
                 prompt_annotation_snapshots
             )
             if request_context_prompt is None:
-                raise ArtifactPromptAnnotationValidationError(
-                    "prompt annotation context is empty"
-                )
+                raise ArtifactPromptAnnotationValidationError("prompt annotation context is empty")
             operation_class = (
                 "selection_edit" if len(prompt_annotation_rows) == 1 else "structural_edit"
             )
@@ -4366,9 +4274,7 @@ async def _handle_sessions_send_impl_inner(
         )
 
         try:
-            artifact_session_service = await ArtifactSessionService.from_session_storage(
-                storage
-            )
+            artifact_session_service = await ArtifactSessionService.from_session_storage(storage)
             current_head = await artifact_session_service.get_document_head(
                 document_context_request["documentId"],
             )
@@ -4406,7 +4312,7 @@ async def _handle_sessions_send_impl_inner(
                 "The currently opened HTML document is bound to this turn. If the user asks "
                 "to inspect or modify the open page, use the bound document tools, not "
                 "workspace file tools. The first source read MUST be document_read with "
-                "view=source and no cursor, or cursor=\"\" only when the provider adapter "
+                'view=source and no cursor, or cursor="" only when the provider adapter '
                 "requires that field. Never invent a non-empty cursor: only pass the exact "
                 "nextCursor returned by the preceding document_read response when hasMore "
                 "is true. To modify the open page, call document_patch with the sha256 "
@@ -4426,9 +4332,7 @@ async def _handle_sessions_send_impl_inner(
                 tool_names=DOCUMENT_CONTEXT_TOOL_NAMES,
                 operation_class="document_edit",
                 request_context_prompt="\n\n".join(
-                    part
-                    for part in (base_document_context_prompt, followup_focus)
-                    if part
+                    part for part in (base_document_context_prompt, followup_focus) if part
                 ),
             )
             artifact_event_emitter = _artifact_state_event_emitter(ctx, key)
@@ -4524,11 +4428,7 @@ async def _handle_sessions_send_impl_inner(
                 session_epoch=int(getattr(session, "epoch", 0) or 0),
                 plan_revision_id=selected_plan_revision_id,
                 driver_kind=plan_run_driver_kind or "manual",
-                driver_id=(
-                    plan_run_driver_id
-                    if plan_run_driver_kind == "goal"
-                    else None
-                ),
+                driver_id=(plan_run_driver_id if plan_run_driver_kind == "goal" else None),
                 status="queued",
                 step_states=[],
             )
@@ -4538,8 +4438,7 @@ async def _handle_sessions_send_impl_inner(
             raise KeyError(f"Plan revision not found: {plan_context_revision_id}")
         if (
             getattr(atomic_intent_plan, "action", "continue") == "continue"
-            and getattr(session, "active_plan_revision_id", None)
-            != plan_context_revision_id
+            and getattr(session, "active_plan_revision_id", None) != plan_context_revision_id
         ):
             raise RpcHandlerError(
                 "PLAN_REVISION_CHANGED",
@@ -4712,18 +4611,16 @@ async def _handle_sessions_send_impl_inner(
                     "correlation_id": candidate.correlation_id,
                 }
                 if candidate.control_kind == "replay":
-                    durable_meta_control_payload.update({
-                        "run_id": candidate.replay_run_id,
-                        "mode": candidate.replay_mode,
-                    })
+                    durable_meta_control_payload.update(
+                        {
+                            "run_id": candidate.replay_run_id,
+                            "mode": candidate.replay_mode,
+                        }
+                    )
         explicit_request_id = any(
             field in params for field in ("clientRequestId", "client_request_id")
         )
-        if (
-            parsed_control is not None
-            and durable_meta_control is None
-            and explicit_request_id
-        ):
+        if parsed_control is not None and durable_meta_control is None and explicit_request_id:
             legacy_match = False
             if parsed_control["kind"] == "manual":
                 from opensquilla.engine.steps.meta_command import pending_meta_launch_peek
@@ -4907,11 +4804,9 @@ async def _handle_sessions_send_impl_inner(
         route_envelope.metadata["guest_safe"] = True
         route_envelope.metadata["guest_profile_root"] = str(guest_profile.root)
         route_envelope.metadata["guest_managed_root"] = str(guest_profile.managed_root)
-        route_envelope.metadata["guest_environment"] = dict(
-            guest_profile.environment
-        )
-        route_envelope.runtime_services["guest_profile_factory"] = (
-            lambda task_id: _guest_profile_for_principal(
+        route_envelope.metadata["guest_environment"] = dict(guest_profile.environment)
+        route_envelope.runtime_services["guest_profile_factory"] = lambda task_id: (
+            _guest_profile_for_principal(
                 ctx.principal,
                 task_id,
                 state_dir=ctx.config.state_dir,
@@ -4928,8 +4823,7 @@ async def _handle_sessions_send_impl_inner(
 
         if (
             isinstance(artifact_turn_context, BoundPromptAnnotationContext)
-            and
-            route_envelope.source_kind.value == "web"
+            and route_envelope.source_kind.value == "web"
             and route_envelope.interaction_mode.value == "interactive"
             and ctx.principal.is_owner
             and not guest_safe
@@ -4975,9 +4869,7 @@ async def _handle_sessions_send_impl_inner(
                     bound_desktop_artifact_bridge = None
                     bridge_capabilities = None
                 if (
-                    not _desktop_artifact_bridge_supports_candidate_loop(
-                        bridge_capabilities
-                    )
+                    not _desktop_artifact_bridge_supports_candidate_loop(bridge_capabilities)
                     or turn_authority_cleanup is None
                 ):
                     if turn_authority_cleanup is not None:
@@ -4992,9 +4884,9 @@ async def _handle_sessions_send_impl_inner(
                     route_envelope.runtime_services["turn_authority_cleanup"] = (
                         turn_authority_cleanup
                     )
-                    route_envelope.runtime_services.setdefault(
-                        "turn_cleanup_callbacks", []
-                    ).append(turn_authority_cleanup.aclose)
+                    route_envelope.runtime_services.setdefault("turn_cleanup_callbacks", []).append(
+                        turn_authority_cleanup.aclose
+                    )
             else:
                 # A browser-less web client must not receive the autonomous
                 # writer/finish contract.  It can still use the durable
@@ -5021,8 +4913,8 @@ async def _handle_sessions_send_impl_inner(
             )
 
             if artifact_session_service is None:
-                artifact_session_service = (
-                    await ArtifactSessionService.from_session_storage(storage)
+                artifact_session_service = await ArtifactSessionService.from_session_storage(
+                    storage
                 )
             route_envelope.runtime_services["generated_artifact_adopter"] = (
                 GeneratedArtifactAdopter(
@@ -5143,11 +5035,7 @@ async def _handle_sessions_send_impl_inner(
                 else {}
             ),
             **(
-                {
-                    "required_collaboration_revision": (
-                        required_collaboration_revision
-                    )
-                }
+                {"required_collaboration_revision": (required_collaboration_revision)}
                 if required_collaboration_revision is not None
                 else {}
             ),
@@ -5269,9 +5157,7 @@ async def _handle_sessions_send_impl_inner(
                 execution_run_context,
                 principal_is_owner=ctx.principal.is_owner,
             )
-            execution_workspace_dir = (
-                execution_run_context.workspace or configured_workspace_dir
-            )
+            execution_workspace_dir = execution_run_context.workspace or configured_workspace_dir
             workspace_strict = getattr(ctx.config, "workspace_strict", None)
             if not isinstance(workspace_strict, bool):
                 workspace_strict = bool(execution_workspace_dir)
@@ -5286,6 +5172,10 @@ async def _handle_sessions_send_impl_inner(
             from opensquilla.sandbox.policy_store import pin_sandbox_policy
 
             pin_sandbox_policy(tool_ctx, ctx.config)
+            from opensquilla.gateway.rpc_telemetry import is_registered_tui_connection
+            from opensquilla.telemetry.contracts.common import ClientSurface, ExecutionMode
+
+            tui_connection = is_registered_tui_connection(ctx.conn_id)
             raw_stream = ctx.turn_runner.run(
                 provider_message_text,
                 key,
@@ -5300,6 +5190,8 @@ async def _handle_sessions_send_impl_inner(
                 semantic_message=semantic_message_text,
                 fresh_user_session=fresh_user_session,
                 root_turn_id=turn_id,
+                telemetry_surface=ClientSurface.TUI if tui_connection else None,
+                telemetry_execution_mode=ExecutionMode.GATEWAY if tui_connection else None,
             )
             raw_stream_idle_timeout = effective_agent_stream_idle_timeout_seconds(ctx.config)
             stream_idle_timeout: float | None = (
@@ -5326,8 +5218,7 @@ async def _handle_sessions_send_impl_inner(
                 if event_kind == "artifact":
                     event_dict = enrich_artifact_event_dict(event_dict)
                 if event_kind in ("done", "error") or (
-                    event_kind == "answer_generation_reset"
-                    and event_dict.get("terminal") is True
+                    event_kind == "answer_generation_reset" and event_dict.get("terminal") is True
                 ):
                     await _emit_terminal_once(f"session.event.{event_kind}", event_dict)
                 else:
@@ -5469,15 +5360,11 @@ async def _handle_sessions_send_impl_inner(
     persisted_entry = None
     expected_epoch = 0
     if plan_run is not None and not atomic_runtime_acceptance:
-        raise RpcUnavailableError(
-            "Plan implementation requires atomic TaskRuntime acceptance"
-        )
+        raise RpcUnavailableError("Plan implementation requires atomic TaskRuntime acceptance")
     if (
         initial_collaboration_mode is not None or initial_routing_mode is not None
     ) and not atomic_runtime_acceptance:
-        raise RpcUnavailableError(
-            "Initial session controls require atomic TaskRuntime acceptance"
-        )
+        raise RpcUnavailableError("Initial session controls require atomic TaskRuntime acceptance")
 
     if durable_meta_control is not None and not atomic_runtime_acceptance:
         raise RpcHandlerError(
@@ -5623,9 +5510,7 @@ async def _handle_sessions_send_impl_inner(
                 accepted_session_updates["collaboration_mode"] = "plan"
             elif atomic_collaboration_mode_update:
                 assert required_collaboration_mode is not None
-                accepted_session_updates["collaboration_mode"] = (
-                    required_collaboration_mode
-                )
+                accepted_session_updates["collaboration_mode"] = required_collaboration_mode
             acceptance = await _accept_turn_with_fork_title(
                 persisted_entry,
                 expected_epoch=expected_epoch,
@@ -5659,9 +5544,7 @@ async def _handle_sessions_send_impl_inner(
                 plan_run=accepted_plan_run,
                 merge_into_task=merge_into_task,
                 meta_control_intent_id=(
-                    durable_meta_control.intent_id
-                    if durable_meta_control is not None
-                    else None
+                    durable_meta_control.intent_id if durable_meta_control is not None else None
                 ),
                 workspace_guard=workspace_guard,
                 expected_collaboration_revision=expected_collaboration_revision,
@@ -5865,9 +5748,7 @@ async def _handle_sessions_send_impl_inner(
                 return await _commit_and_activate()
 
         try:
-            acceptance = await complete_durable_ingress(
-                _commit_with_session_admission()
-            )
+            acceptance = await complete_durable_ingress(_commit_with_session_admission())
         except (
             ArtifactPromptAnnotationConflictError,
             ArtifactPromptAnnotationNotFoundError,
@@ -6026,8 +5907,7 @@ async def _handle_sessions_send_impl_inner(
             if (
                 expected_active_plan_revision_id is not None
                 and latest is not None
-                and latest.active_plan_revision_id
-                != expected_active_plan_revision_id
+                and latest.active_plan_revision_id != expected_active_plan_revision_id
             ):
                 log.info(
                     "plan_implementation.admission_rejected",
@@ -6044,8 +5924,7 @@ async def _handle_sessions_send_impl_inner(
             if (
                 expected_collaboration_revision is not None
                 and latest is not None
-                and int(latest.collaboration_revision or 0)
-                != expected_collaboration_revision
+                and int(latest.collaboration_revision or 0) != expected_collaboration_revision
             ):
                 log.info(
                     "plan_implementation.admission_rejected",
@@ -6228,9 +6107,7 @@ async def _handle_sessions_send_impl_inner(
             response["acceptedCollaboration"] = accepted_collaboration
             current_session = await storage.get_session(key)
             if current_session is not None:
-                response["collaboration"] = _plan_collaboration_snapshot(
-                    current_session
-                )
+                response["collaboration"] = _plan_collaboration_snapshot(current_session)
             if not acceptance.replayed:
                 try:
                     await _emit_to_subscribers(
@@ -6305,9 +6182,7 @@ async def _handle_sessions_send_impl_inner(
             task = asyncio.create_task(_run_direct_turn())
             setattr(task, "_opensquilla_started", False)
             setattr(task, "_opensquilla_terminal_emitted", False)
-            turn_authority = route_envelope.runtime_services.get(
-                "turn_authority_cleanup"
-            )
+            turn_authority = route_envelope.runtime_services.get("turn_authority_cleanup")
             try:
                 direct_registry.register(
                     key,
@@ -6556,9 +6431,7 @@ async def _handle_sessions_send_impl_inner(
             task = asyncio.create_task(_run_direct_turn())
             setattr(task, "_opensquilla_started", False)
             setattr(task, "_opensquilla_terminal_emitted", False)
-            turn_authority = route_envelope.runtime_services.get(
-                "turn_authority_cleanup"
-            )
+            turn_authority = route_envelope.runtime_services.get("turn_authority_cleanup")
             try:
                 direct_registry.register(
                     key,
@@ -7037,11 +6910,7 @@ def _pending_input_send_payload(params: dict[str, Any], *, key: str) -> dict[str
             retryable=False,
             accepted=False,
         )
-    if (
-        display_text is not None
-        and display_control != control
-        and not literal_slash_escape
-    ):
+    if display_text is not None and display_control != control and not literal_slash_escape:
         raise RpcHandlerError(
             "PENDING_DISPLAY_TEXT_MISMATCH",
             "Pending display text must match the provider message or an exact literal slash escape",
@@ -7065,13 +6934,8 @@ def _pending_input_send_payload(params: dict[str, Any], *, key: str) -> dict[str
             raise ValueError("params.promptAnnotationIds must be an array")
         if len(raw_prompt_annotation_ids) > 16:
             raise ValueError("params.promptAnnotationIds supports at most 16 items")
-        if any(
-            not isinstance(item, str) or not item.strip()
-            for item in raw_prompt_annotation_ids
-        ):
-            raise ValueError(
-                "params.promptAnnotationIds must contain non-empty strings"
-            )
+        if any(not isinstance(item, str) or not item.strip() for item in raw_prompt_annotation_ids):
+            raise ValueError("params.promptAnnotationIds must contain non-empty strings")
         prompt_annotation_ids = [item.strip() for item in raw_prompt_annotation_ids]
         if len(set(prompt_annotation_ids)) != len(prompt_annotation_ids):
             raise ValueError("params.promptAnnotationIds must contain unique ids")
@@ -7298,9 +7162,7 @@ async def _handle_pending_inputs_enqueue(
     attachments = list(raw_payload.get("attachments") or [])
     position = params.get("position")
     if position is not None and (
-        isinstance(position, bool)
-        or not isinstance(position, int)
-        or position < 0
+        isinstance(position, bool) or not isinstance(position, int) or position < 0
     ):
         raise ValueError("params.position must be a non-negative integer")
 
@@ -7355,9 +7217,7 @@ async def _handle_pending_inputs_enqueue(
                             )
                             else None
                         ),
-                        accept_opaque=bool(
-                            getattr(attachments_cfg, "accept_opaque", True)
-                        ),
+                        accept_opaque=bool(getattr(attachments_cfg, "accept_opaque", True)),
                         opaque_limit_bytes=(
                             getattr(attachments_cfg, "opaque_max_bytes", None)
                             if isinstance(
@@ -7567,9 +7427,7 @@ async def _handle_pending_inputs_reorder(
             or not isinstance(expected_revision, int)
             or expected_revision < 1
         ):
-            raise ValueError(
-                f"params.items[{index}].expectedRevision must be a positive integer"
-            )
+            raise ValueError(f"params.items[{index}].expectedRevision must be a positive integer")
         expected_revisions.append((pending_input_id, expected_revision))
     if len({pending_input_id for pending_input_id, _ in expected_revisions}) != len(
         expected_revisions
@@ -7695,10 +7553,8 @@ async def _handle_pending_inputs_dispatch(
                 _normalize_session_send_source_hint(params),
                 ctx,
             )
-            dispatch_receipt = (
-                await storage.get_pending_chat_input_dispatch_receipt(
-                    pending_input_id
-                )
+            dispatch_receipt = await storage.get_pending_chat_input_dispatch_receipt(
+                pending_input_id
             )
             if dispatch_receipt is None or (
                 dispatch_receipt.session_key != key
@@ -7865,9 +7721,7 @@ async def _steer_v2_response(
         "task_id": target_turn_id,
         "turn_id": target_turn_id,
         "client_request_id": client_request_id,
-        "client_message_id": (
-            context.get("client_message_id") or client_message_id
-        ),
+        "client_message_id": (context.get("client_message_id") or client_message_id),
         "user_message_id": receipt.message_id,
         "surface_id": context.get("surface_id") or surface_id,
         "disposition": disposition,
@@ -7947,9 +7801,7 @@ async def _handle_pending_inputs_steer(
     async with _pending_input_lock_for(pending_input_id):
         row = await storage.get_pending_chat_input(pending_input_id)
         if row is None:
-            receipt = await storage.get_pending_chat_input_dispatch_receipt(
-                pending_input_id
-            )
+            receipt = await storage.get_pending_chat_input_dispatch_receipt(pending_input_id)
             if receipt is None or (
                 receipt.session_key != key
                 or receipt.source_scope != source_scope
@@ -8197,15 +8049,9 @@ async def _handle_sessions_steer_v2_impl(
     semantic_message = normalized.semantic_message
     default_surface_id = str(
         source_hint.get("channel_id")
-        or (
-            f"{source_hint.get('caller_kind', 'rpc')}:"
-            f"{source_hint.get('channel_kind', 'rpc')}"
-        )
+        or (f"{source_hint.get('caller_kind', 'rpc')}:{source_hint.get('channel_kind', 'rpc')}")
     )
-    surface_id = (
-        _optional_string_param(params, "surface_id", "surfaceId")
-        or default_surface_id
-    )
+    surface_id = _optional_string_param(params, "surface_id", "surfaceId") or default_surface_id
     if pending_input_id is not None:
         if (
             pending_input_fingerprint is None
@@ -8250,10 +8096,7 @@ async def _handle_sessions_steer_v2_impl(
             client_request_id=ingress_identity.client_request_id,
         )
         if previous is not None:
-            if (
-                previous.receipt.request_fingerprint
-                != ingress_identity.request_fingerprint
-            ):
+            if previous.receipt.request_fingerprint != ingress_identity.request_fingerprint:
                 raise RpcHandlerError(
                     "IDEMPOTENCY_CONFLICT",
                     "client_request_id was already used for a different steer",
@@ -8289,9 +8132,7 @@ async def _handle_sessions_steer_v2_impl(
     prepare_message = getattr(ctx.session_manager, "prepare_message", None)
     accept_turn = getattr(storage, "accept_turn", None)
     if not callable(prepare_message) or not callable(accept_turn):
-        raise RpcUnavailableError(
-            "Same-turn steer requires durable atomic session storage"
-        )
+        raise RpcUnavailableError("Same-turn steer requires durable atomic session storage")
     turn_context = {
         "turn_id": expected_turn_id,
         "target_turn_id": expected_turn_id,
@@ -9024,11 +8865,7 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
                     default=0,
                 )
             )
-            cancelled_count = (
-                int(cancelled_result)
-                + cancelled_auxiliary
-                + cancelled_descendants
-            )
+            cancelled_count = int(cancelled_result) + cancelled_auxiliary + cancelled_descendants
             reason = "task_not_active"
             if cancelled_count <= 0:
                 # Classification is diagnostic only.  The exact cancel above
@@ -9248,49 +9085,26 @@ async def _apply_sessions_patch(
         auth_profile_override,
     ) = _rpc_session_deployment_fields(params)
     model_present = "model" in params
-    existing_provider_value = _model_value(
-        getattr(session, "provider_override", None)
-    )
-    existing_provider = (
-        existing_provider_value.lower() if existing_provider_value else None
-    )
+    existing_provider_value = _model_value(getattr(session, "provider_override", None))
+    existing_provider = existing_provider_value.lower() if existing_provider_value else None
     existing_model = _model_value(getattr(session, "model", None))
-    existing_auth_profile = _model_value(
-        getattr(session, "auth_profile_override", None)
-    )
+    existing_auth_profile = _model_value(getattr(session, "auth_profile_override", None))
     final_provider = provider_override if provider_present else existing_provider
-    final_auth_profile = (
-        auth_profile_override
-        if auth_profile_present
-        else existing_auth_profile
-    )
+    final_auth_profile = auth_profile_override if auth_profile_present else existing_auth_profile
     raw_model = params.get("model")
     requested_model = _model_value(raw_model) if model_present else existing_model
     final_model = requested_model if model_present else existing_model
 
-    provider_changed = bool(
-        provider_present and provider_override != existing_provider
-    )
+    provider_changed = bool(provider_present and provider_override != existing_provider)
     auth_profile_changed = bool(
-        auth_profile_present
-        and auth_profile_override != existing_auth_profile
+        auth_profile_present and auth_profile_override != existing_auth_profile
     )
-    if (
-        (provider_changed and provider_override)
-        or (auth_profile_changed and auth_profile_override)
-    ):
-        if (
-            not model_present
-            or not isinstance(raw_model, str)
-            or requested_model is None
-        ):
+    if (provider_changed and provider_override) or (auth_profile_changed and auth_profile_override):
+        if not model_present or not isinstance(raw_model, str) or requested_model is None:
             _raise_explicit_session_deployment_model_required()
 
     if model_present and (
-        provider_present
-        or auth_profile_present
-        or existing_provider
-        or existing_auth_profile
+        provider_present or auth_profile_present or existing_provider or existing_auth_profile
     ):
         if raw_model is not None and not isinstance(raw_model, str):
             raise ValueError("params.model must be a string or null")
@@ -9319,10 +9133,7 @@ async def _apply_sessions_patch(
             update_values[attr] = params[field]
             updated_fields.append(field)
     if model_present and (
-        provider_present
-        or auth_profile_present
-        or existing_provider
-        or existing_auth_profile
+        provider_present or auth_profile_present or existing_provider or existing_auth_profile
     ):
         update_values["model"] = final_model
     if provider_present:
@@ -9330,17 +9141,11 @@ async def _apply_sessions_patch(
         updated_fields.append("provider")
     if auth_profile_present:
         update_values["auth_profile_override"] = auth_profile_override
-        update_values["auth_profile_override_source"] = (
-            "rpc" if auth_profile_override else None
-        )
+        update_values["auth_profile_override_source"] = "rpc" if auth_profile_override else None
         updated_fields.append("authProfile")
 
     model_changed = bool(model_present and final_model != existing_model)
-    deployment_binding_changed = bool(
-        provider_changed
-        or auth_profile_changed
-        or model_changed
-    )
+    deployment_binding_changed = bool(provider_changed or auth_profile_changed or model_changed)
     if deployment_binding_changed:
         # Physical provenance describes the deployment that already executed.
         # Once an operator changes the future session binding it is no longer a
@@ -9388,9 +9193,7 @@ async def _handle_sessions_patch(params: dict | None, ctx: RpcContext) -> dict:
         raise KeyError("No session storage available")
 
     assert isinstance(params, dict)
-    deployment_patch = any(
-        field in params for field in _SESSION_DEPLOYMENT_PATCH_FIELDS
-    )
+    deployment_patch = any(field in params for field in _SESSION_DEPLOYMENT_PATCH_FIELDS)
     lock = get_session_lock(ctx.turn_runner, key) if deployment_patch else None
     if lock is not None:
         async with lock:
@@ -9601,12 +9404,9 @@ async def _execute_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[
             }
             if _accepts_keyword_arg(ctx.flush_service.execute, "turn_id"):
                 flush_kwargs["turn_id"] = flush_turn_id
-            if (
-                flush_correlation is not None
-                and _accepts_keyword_arg(
-                    ctx.flush_service.execute,
-                    "provider_request_correlation",
-                )
+            if flush_correlation is not None and _accepts_keyword_arg(
+                ctx.flush_service.execute,
+                "provider_request_correlation",
             ):
                 flush_kwargs["provider_request_correlation"] = flush_correlation
             receipt = await ctx.flush_service.execute(
@@ -9796,18 +9596,14 @@ async def _delete_session_with_lifecycle(
     async with contextlib.AsyncExitStack() as fences:
         # Child completion can schedule a parent wake while the runtime task is
         # draining, so fence that path before cancelling the task driver.
-        await fences.enter_async_context(
-            quiesce_background_completion_sessions(session_keys)
-        )
+        await fences.enter_async_context(quiesce_background_completion_sessions(session_keys))
 
         task_runtime = getattr(ctx, "task_runtime", None)
         quiesce_runtime = getattr(task_runtime, "quiesce_sessions", None)
         if callable(quiesce_runtime):
             await fences.enter_async_context(quiesce_runtime(session_keys))
 
-        await fences.enter_async_context(
-            get_agent_task_registry().quiesce_sessions(session_keys)
-        )
+        await fences.enter_async_context(get_agent_task_registry().quiesce_sessions(session_keys))
 
         lock = get_session_lock(ctx.turn_runner, canonical_key)
         if lock is not None:
@@ -9906,8 +9702,8 @@ async def _execute_sessions_context_compact(params: dict | None, ctx: RpcContext
         requested_context_window_tokens,
     )
     context_window_tokens = consumer_budget.context_window_tokens
-    consumer_admission, consumer_admission_fingerprint = (
-        build_gateway_consumer_admission(consumer_budget)
+    consumer_admission, consumer_admission_fingerprint = build_gateway_consumer_admission(
+        consumer_budget
     )
     custom_instructions = (params or {}).get("instructions")
     if custom_instructions is not None and not isinstance(custom_instructions, str):
@@ -9926,9 +9722,7 @@ async def _execute_sessions_context_compact(params: dict | None, ctx: RpcContext
     compaction_stage = "admission"
     compaction_settings = getattr(getattr(ctx, "config", None), "compaction", None)
     try:
-        total_timeout_seconds = float(
-            getattr(compaction_settings, "total_timeout_seconds", 120.0)
-        )
+        total_timeout_seconds = float(getattr(compaction_settings, "total_timeout_seconds", 120.0))
     except (TypeError, ValueError):
         total_timeout_seconds = 120.0
     if total_timeout_seconds <= 0:
@@ -10110,8 +9904,8 @@ async def _execute_sessions_context_compact(params: dict | None, ctx: RpcContext
             requested_context_window_tokens,
         )
         context_window_tokens = consumer_budget.context_window_tokens
-        consumer_admission, consumer_admission_fingerprint = (
-            build_gateway_consumer_admission(consumer_budget)
+        consumer_admission, consumer_admission_fingerprint = build_gateway_consumer_admission(
+            consumer_budget
         )
         durable_session_id = getattr(session, "session_id", None)
         compaction_correlation = (
@@ -10195,16 +9989,11 @@ async def _execute_sessions_context_compact(params: dict | None, ctx: RpcContext
                             "raw_capture_policy": "required",
                             "turn_id": compaction_id,
                         }
-                        if (
-                            flush_correlation is not None
-                            and _accepts_keyword_arg(
-                                ctx.flush_service.execute,
-                                "provider_request_correlation",
-                            )
+                        if flush_correlation is not None and _accepts_keyword_arg(
+                            ctx.flush_service.execute,
+                            "provider_request_correlation",
                         ):
-                            flush_kwargs["provider_request_correlation"] = (
-                                flush_correlation
-                            )
+                            flush_kwargs["provider_request_correlation"] = flush_correlation
                         receipt = await await_compaction_phase(
                             ctx.flush_service.execute(
                                 transcript,
@@ -10305,16 +10094,11 @@ async def _execute_sessions_context_compact(params: dict | None, ctx: RpcContext
                     compact_with_result, "flush_receipt_status"
                 ):
                     compact_kwargs["flush_receipt_status"] = flush_receipt_status
-                if (
-                    compaction_correlation is not None
-                    and _accepts_keyword_arg(
-                        compact_with_result,
-                        "provider_request_correlation",
-                    )
+                if compaction_correlation is not None and _accepts_keyword_arg(
+                    compact_with_result,
+                    "provider_request_correlation",
                 ):
-                    compact_kwargs["provider_request_correlation"] = (
-                        compaction_correlation
-                    )
+                    compact_kwargs["provider_request_correlation"] = compaction_correlation
                 if _accepts_keyword_arg(compact_with_result, "context_window_chars"):
                     compact_kwargs["context_window_chars"] = (
                         consumer_budget.provider_request_max_chars
@@ -10357,10 +10141,7 @@ async def _execute_sessions_context_compact(params: dict | None, ctx: RpcContext
                 replaced_previous_summary = bool(
                     getattr(result, "replaced_previous_summary", False)
                 )
-                applied = bool(
-                    summary
-                    and (removed_count > 0 or replaced_previous_summary)
-                )
+                applied = bool(summary and (removed_count > 0 or replaced_previous_summary))
                 durable_commit_won = applied
                 if durable_commit_won:
                     committed_terminal_payload = {
@@ -10500,9 +10281,7 @@ async def _execute_sessions_context_compact(params: dict | None, ctx: RpcContext
             payload["flush_receipt"] = flush_receipt_to_dict(receipt)
         if flush_receipt_status is not None:
             payload["flush_receipt_status"] = flush_receipt_status
-        final_event = (
-            COMPACTION_PERSISTED_EVENT if applied else COMPACTION_TRIGGERED_EVENT
-        )
+        final_event = COMPACTION_PERSISTED_EVENT if applied else COMPACTION_TRIGGERED_EVENT
         final_lifecycle_payload = compaction_lifecycle_payload(compaction_id, final_event)
         final_lifecycle_payload.pop("coverage_status", None)
         final_status = terminal_status
@@ -10821,12 +10600,9 @@ async def _handle_sessions_truncate(params: dict | None, ctx: RpcContext) -> dic
                     }
                     if _accepts_keyword_arg(ctx.flush_service.execute, "turn_id"):
                         flush_kwargs["turn_id"] = flush_turn_id
-                    if (
-                        flush_correlation is not None
-                        and _accepts_keyword_arg(
-                            ctx.flush_service.execute,
-                            "provider_request_correlation",
-                        )
+                    if flush_correlation is not None and _accepts_keyword_arg(
+                        ctx.flush_service.execute,
+                        "provider_request_correlation",
                     ):
                         flush_kwargs["provider_request_correlation"] = flush_correlation
                     receipt = await ctx.flush_service.execute(
@@ -10976,8 +10752,7 @@ async def _build_sessions_messages_subscription_payload(
         if conn is not None:
             client_caps: frozenset[str] = getattr(conn, "client_caps", frozenset())
             replay_deadline = (
-                asyncio.get_running_loop().time()
-                + _SESSION_SUBSCRIBE_REPLAY_BUDGET_SECONDS
+                asyncio.get_running_loop().time() + _SESSION_SUBSCRIBE_REPLAY_BUDGET_SECONDS
             )
             for event in replay.events:
                 projected = project_session_event_for_client(
@@ -11514,9 +11289,7 @@ async def _resolve_session_routing_snapshot(
     getter = getattr(manager, "get_session_routing", None)
     try:
         if callable(getter):
-            return _session_routing_snapshot(
-                await getter(key, fallback_mode=fallback)
-            )
+            return _session_routing_snapshot(await getter(key, fallback_mode=fallback))
         storage = get_session_storage(manager)
         resolver = getattr(storage, "resolve_model_routing_mode", None)
         if callable(resolver):
@@ -11540,11 +11313,7 @@ async def _goal_owned_plan_run_for_revision(
     if not callable(getter):
         return None
     run = await getter(revision_id)
-    return (
-        run
-        if run is not None and str(getattr(run, "driver_kind", "") or "") == "goal"
-        else None
-    )
+    return run if run is not None and str(getattr(run, "driver_kind", "") or "") == "goal" else None
 
 
 @_d.method("plans.capabilities", scope="operator.read")
@@ -11783,9 +11552,7 @@ async def _handle_plans_set_mode(
             str(exc),
             details={
                 "collaboration": (
-                    _plan_collaboration_snapshot(latest)
-                    if latest is not None
-                    else None
+                    _plan_collaboration_snapshot(latest) if latest is not None else None
                 )
             },
             retryable=True,
@@ -11858,11 +11625,14 @@ async def _handle_plans_implement(
             retryable=False,
             accepted=False,
         )
-    client_request_id = _optional_string_param(
-        params,
-        "clientRequestId",
-        "client_request_id",
-    ) or uuid.uuid4().hex
+    client_request_id = (
+        _optional_string_param(
+            params,
+            "clientRequestId",
+            "client_request_id",
+        )
+        or uuid.uuid4().hex
+    )
     intent = _optional_string_param(params, "intent")
     revision = await storage.get_plan_revision(revision_id)
     if revision is None:
@@ -11881,31 +11651,18 @@ async def _handle_plans_implement(
             request_session_key=key,
             client_request_id=client_request_id,
         )
-        previous_task_id = (
-            previous.receipt.task_id if previous is not None else None
-        )
-        previous_task = (
-            await storage.get_agent_task(previous_task_id)
-            if previous_task_id
-            else None
-        )
+        previous_task_id = previous.receipt.task_id if previous is not None else None
+        previous_task = await storage.get_agent_task(previous_task_id) if previous_task_id else None
         previous_details = (
             previous_task.details
-            if previous_task is not None
-            and isinstance(previous_task.details, dict)
+            if previous_task is not None and isinstance(previous_task.details, dict)
             else {}
         )
         previous_metadata = previous_details.get("metadata")
-        previous_metadata = (
-            previous_metadata if isinstance(previous_metadata, dict) else {}
-        )
-        accepted_revision_id = str(
-            previous_metadata.get("plan_revision_id") or ""
-        ).strip()
+        previous_metadata = previous_metadata if isinstance(previous_metadata, dict) else {}
+        accepted_revision_id = str(previous_metadata.get("plan_revision_id") or "").strip()
         accepted_revision = (
-            await storage.get_plan_revision(accepted_revision_id)
-            if accepted_revision_id
-            else None
+            await storage.get_plan_revision(accepted_revision_id) if accepted_revision_id else None
         )
         if accepted_revision is None:
             raise KeyError(f"Plan revision not found: {revision_id}")
@@ -11951,19 +11708,12 @@ async def _handle_plans_implement(
         required_collaboration_mode="default",
         expected_collaboration_revision=(
             int(target_before_acceptance.collaboration_revision or 0)
-            if current_session_implementation
-            and target_before_acceptance is not None
+            if current_session_implementation and target_before_acceptance is not None
             else None
         ),
-        expected_active_plan_revision_id=(
-            revision_id if current_session_implementation else None
-        ),
-        require_idle_for_current_plan_implementation=(
-            current_session_implementation
-        ),
-        _explicit_ingress_intent_registered=(
-            _explicit_ingress_intent_registered
-        ),
+        expected_active_plan_revision_id=(revision_id if current_session_implementation else None),
+        require_idle_for_current_plan_implementation=(current_session_implementation),
+        _explicit_ingress_intent_registered=(_explicit_ingress_intent_registered),
     )
     accepted_key = str(result.get("session_key") or key)
     task_id = str(result.get("turn_id") or result.get("task_id") or "").strip()
@@ -11976,9 +11726,7 @@ async def _handle_plans_implement(
     task_metadata = task_details.get("metadata")
     task_metadata = task_metadata if isinstance(task_metadata, dict) else {}
     accepted_run_id = str(task_metadata.get("plan_run_id") or "").strip()
-    accepted_revision_id = str(
-        task_metadata.get("plan_revision_id") or ""
-    ).strip()
+    accepted_revision_id = str(task_metadata.get("plan_revision_id") or "").strip()
     if not accepted_run_id or not accepted_revision_id:
         raise RuntimeError("Accepted plan implementation lost its durable binding")
     accepted_run = await storage.get_plan_run(accepted_run_id)
@@ -12059,11 +11807,14 @@ async def _handle_plans_revise(
             retryable=False,
             accepted=False,
         )
-    client_request_id = _optional_string_param(
-        params,
-        "clientRequestId",
-        "client_request_id",
-    ) or uuid.uuid4().hex
+    client_request_id = (
+        _optional_string_param(
+            params,
+            "clientRequestId",
+            "client_request_id",
+        )
+        or uuid.uuid4().hex
+    )
     provider_message = (
         "Create a complete replacement for the current plan revision. "
         "Preserve still-valid context, incorporate the user's requested changes, "
@@ -12101,9 +11852,7 @@ async def _handle_plans_revise(
         expected_collaboration_revision=int(session.collaboration_revision or 0),
         expected_active_plan_revision_id=revision_id,
         atomic_collaboration_mode_update=True,
-        _explicit_ingress_intent_registered=(
-            _explicit_ingress_intent_registered
-        ),
+        _explicit_ingress_intent_registered=(_explicit_ingress_intent_registered),
     )
     accepted_session = await storage.get_session(key)
     collaboration = (
@@ -12162,9 +11911,7 @@ async def _handle_plans_cancel_run(params: dict | None, ctx: RpcContext) -> dict
         return RpcHandlerError(
             "PLAN_RUN_CHANGED",
             str(exc),
-            details={
-                "planRun": plan_run_snapshot(latest) if latest is not None else None
-            },
+            details={"planRun": plan_run_snapshot(latest) if latest is not None else None},
             retryable=True,
             accepted=False,
         )
@@ -12195,11 +11942,7 @@ async def _handle_plans_cancel_run(params: dict | None, ctx: RpcContext) -> dict
             task_runtime = getattr(ctx, "task_runtime", None)
             runtime_cancel = getattr(task_runtime, "cancel", None)
             runtime_wait = getattr(task_runtime, "wait", None)
-            if (
-                task_runtime is None
-                or not callable(runtime_cancel)
-                or not callable(runtime_wait)
-            ):
+            if task_runtime is None or not callable(runtime_cancel) or not callable(runtime_wait):
                 raise RpcUnavailableError(
                     "Task runtime is unavailable; the implementation was not cancelled"
                 )
@@ -12352,14 +12095,10 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
         )
     else:
         queued_count = sum(
-            1
-            for row in task_rows
-            if _enum_value(getattr(row, "status", None)) == "queued"
+            1 for row in task_rows if _enum_value(getattr(row, "status", None)) == "queued"
         )
         running_count = sum(
-            1
-            for row in task_rows
-            if _enum_value(getattr(row, "status", None)) == "running"
+            1 for row in task_rows if _enum_value(getattr(row, "status", None)) == "running"
         )
     agent_id = _effective_agent_id_for_session(session, session_key)
     agent_identity = await _bootstrap_agent_identity(ctx, agent_id)
@@ -12383,12 +12122,8 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
             )
             workspace = bootstrap_run_context.workspace or default_workspace
         except ProjectWorkspaceStateError:
-            snapshot_path = (
-                project_snapshot.get("path") if project_snapshot is not None else None
-            )
-            workspace = (
-                str(snapshot_path) if isinstance(snapshot_path, str) else default_workspace
-            )
+            snapshot_path = project_snapshot.get("path") if project_snapshot is not None else None
+            workspace = str(snapshot_path) if isinstance(snapshot_path, str) else default_workspace
     from opensquilla.gateway.model_routing import (
         capture_model_routing_config,
         model_routing_snapshot,
@@ -12432,12 +12167,8 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
         )
     get_current_plan = getattr(storage, "get_current_plan_revision", None)
     get_active_run = getattr(storage, "get_active_plan_run", None)
-    current_plan = (
-        await get_current_plan(session_key) if callable(get_current_plan) else None
-    )
-    active_plan_run = (
-        await get_active_run(session_key) if callable(get_active_run) else None
-    )
+    current_plan = await get_current_plan(session_key) if callable(get_current_plan) else None
+    active_plan_run = await get_active_run(session_key) if callable(get_active_run) else None
     from opensquilla.session.plans import plan_revision_snapshot, plan_run_snapshot
 
     return {
@@ -12456,14 +12187,10 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
         "routing": routing,
         "collaboration": _plan_collaboration_snapshot(session),
         "currentPlan": (
-            plan_revision_snapshot(current_plan, current=True)
-            if current_plan is not None
-            else None
+            plan_revision_snapshot(current_plan, current=True) if current_plan is not None else None
         ),
         "activePlanRun": (
-            plan_run_snapshot(active_plan_run)
-            if active_plan_run is not None
-            else None
+            plan_run_snapshot(active_plan_run) if active_plan_run is not None else None
         ),
         "planCapabilities": {
             "planMode": True,

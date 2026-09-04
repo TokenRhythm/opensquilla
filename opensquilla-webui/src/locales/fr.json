@@ -1665,8 +1665,13 @@
     },
     "privacy": {
       "statusDisabledByEnv": "Désactivés par un paramètre d’environnement.",
-      "networkReportingLabel": "Diagnostics et mises à jour",
-      "networkReportingDesc": "Partage des données de diagnostic produit limitées et recherche les mises à jour. Le contenu des conversations, les fichiers et les requêtes de modèle ne sont pas envoyés."
+      "statusNotChosen": "Aucun choix n’a encore été enregistré. Aucune donnée n’est envoyée avant l’activation.",
+      "reliabilityDiagnosticsLabel": "Diagnostics de stabilité",
+      "reliabilityDiagnosticsDesc": "Partagez les résultats d’opération, les durées et des empreintes d’erreur respectueuses de la vie privée afin de diagnostiquer les plantages et les échecs. Le contenu des conversations et des fichiers n’est jamais inclus.",
+      "productAnalyticsLabel": "Analyse du produit et de la croissance",
+      "productAnalyticsDesc": "Partagez des jalons d’activation uniques pour mesurer les abandons lors de la configuration et de la première conversation. Le contenu des conversations et les identifiants de compte bruts ne sont jamais inclus ; un identifiant analytique aléatoire et dédié est utilisé.",
+      "networkReportingLabel": "Interrupteur principal des diagnostics réseau",
+      "networkReportingDesc": "Contrôle principal des diagnostics réseau, des analyses et des recherches de mises à jour. Sa désactivation remplace les deux choix ci-dessous."
     },
     "toast": {
       "loadFailed": "Échec du chargement des paramètres : {error}",

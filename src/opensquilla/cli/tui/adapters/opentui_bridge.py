@@ -23,6 +23,7 @@ async def run_concurrent_repl(
     queue_max_size: int,
     abort_active_turn: Callable[[], Awaitable[None]] | None = None,
     steer_active_turn: Callable[[str], Awaitable[bool]] | None = None,
+    on_surface_ready: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """Run OpenTUI footer chat without exposing concrete adapters to chat_cmd."""
     await run_opentui_chat_runtime(
@@ -32,6 +33,7 @@ async def run_concurrent_repl(
         queue_max_size=queue_max_size,
         abort_active_turn=abort_active_turn,
         steer_active_turn=steer_active_turn,
+        on_surface_ready=on_surface_ready,
     )
 
 

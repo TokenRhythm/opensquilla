@@ -9,8 +9,13 @@ from typing import Any
 NETWORK_OBSERVABILITY_DISABLED_ENV = (
     "OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY"
 )
+RELIABILITY_DIAGNOSTICS_DISABLED_ENV = (
+    "OPENSQUILLA_PRIVACY_DISABLE_RELIABILITY_DIAGNOSTICS"
+)
+PRODUCT_ANALYTICS_DISABLED_ENV = "OPENSQUILLA_PRIVACY_DISABLE_PRODUCT_ANALYTICS"
 LEGACY_TELEMETRY_DISABLED_ENV = "OPENSQUILLA_TELEMETRY_DISABLED"
 LEGACY_UPDATE_CHECK_DISABLED_ENV = "OPENSQUILLA_UPDATE_CHECK_DISABLED"
+DO_NOT_TRACK_ENV = "DO_NOT_TRACK"
 
 _DISABLE_ENV_VARS = (
     NETWORK_OBSERVABILITY_DISABLED_ENV,
@@ -21,11 +26,20 @@ _PROVIDER_INSTALL_ID_DISABLE_ENV_VARS = (
     NETWORK_OBSERVABILITY_DISABLED_ENV,
     LEGACY_TELEMETRY_DISABLED_ENV,
 )
+_SCOPED_TELEMETRY_DISABLE_ENV_VARS = (
+    NETWORK_OBSERVABILITY_DISABLED_ENV,
+    LEGACY_TELEMETRY_DISABLED_ENV,
+)
 _AUTO_SUPPRESS_ENV_VARS = (
     "GITHUB_ACTIONS",
     "PYTEST_CURRENT_TEST",
     "OPENSQUILLA_TESTING",
 )
+_SCOPED_TELEMETRY_AUTO_SUPPRESS_ENV_VARS = ("CI", *_AUTO_SUPPRESS_ENV_VARS)
+_TELEMETRY_SCOPE_DISABLE_ENV = {
+    "reliability": RELIABILITY_DIAGNOSTICS_DISABLED_ENV,
+    "growth": PRODUCT_ANALYTICS_DISABLED_ENV,
+}
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 
 
@@ -64,14 +78,11 @@ def provider_install_id_disabled(
     config: Any | None = None,
     env: Mapping[str, str | None] | None = None,
 ) -> bool:
-    """Return whether the TokenRhythm installation identifier is disabled.
+    """Return whether the legacy install-id resolver is privacy-suppressed.
 
-    The installation identifier is passive telemetry metadata even though it
-    travels with a provider request.  It therefore honors both the unified
-    privacy switch and the legacy telemetry switch, but intentionally does not
-    inherit the update-check-only switch.  Automated CI/test environments use
-    the same suppression rules as installation telemetry so they neither
-    create telemetry state nor emit an identifier accidentally.
+    The public TokenRhythm install-id helpers are retired no-ops.  This policy
+    remains for private, read-only compatibility tests of existing local state;
+    it is not a production authorization path.
     """
 
     env_source = os.environ if env is None else env
@@ -97,6 +108,50 @@ def _provider_install_id_environment_suppressed(
         if _is_truthy(value):
             return True
     return False
+
+
+def telemetry_scope_forced_off_reasons(
+    scope: str,
+    *,
+    config: Any | None = None,
+    env: Mapping[str, str | None] | None = None,
+) -> tuple[str, ...]:
+    """Return transient/global vetoes for one scoped telemetry stream.
+
+    This function intentionally does not inspect the scope's persisted consent
+    value.  A user decision of ``False`` is durable opt-out state, whereas the
+    reasons returned here are effective-policy vetoes that must not rewrite or
+    erase that decision.  Callers can therefore pause for CI or a remote/global
+    kill switch and later resume only an independently valid consent record.
+    """
+
+    normalized_scope = str(scope).strip().lower()
+    scope_disable_env = _TELEMETRY_SCOPE_DISABLE_ENV.get(normalized_scope)
+    if scope_disable_env is None:
+        valid = ", ".join(sorted(_TELEMETRY_SCOPE_DISABLE_ENV))
+        raise ValueError(f"telemetry scope must be one of {{{valid}}}")
+
+    env_source = os.environ if env is None else env
+    reasons: list[str] = []
+    if _config_disables_network_observability(config):
+        reasons.append("config:privacy.disable_network_observability")
+    for name in _SCOPED_TELEMETRY_DISABLE_ENV_VARS:
+        if _is_truthy(env_source.get(name)):
+            reasons.append(f"env:{name}")
+    if _is_truthy(env_source.get(scope_disable_env)):
+        reasons.append(f"env:{scope_disable_env}")
+    if _is_truthy(env_source.get(DO_NOT_TRACK_ENV)):
+        reasons.append(f"env:{DO_NOT_TRACK_ENV}")
+    for name in _SCOPED_TELEMETRY_AUTO_SUPPRESS_ENV_VARS:
+        if _automated_environment_value_is_active(name, env_source.get(name)):
+            reasons.append(f"environment:{name}")
+    return tuple(dict.fromkeys(reasons))
+
+
+def _automated_environment_value_is_active(name: str, value: object) -> bool:
+    if name == "PYTEST_CURRENT_TEST":
+        return isinstance(value, str) and bool(value.strip())
+    return _is_truthy(value)
 
 
 def _config_disables_network_observability(config: Any | None) -> bool:

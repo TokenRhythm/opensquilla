@@ -331,6 +331,10 @@ METHOD_SCOPES: dict[str, str] = {
     "sandbox.path.create-directory": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded path creation.
     # OpenSquilla-only; explicit override of `config.` admin prefix.
     "config.patch.safe": WRITE_SCOPE,
+    # Explicit, notice-bound user consent. Server-authored metadata and
+    # withdrawal cleanup keep this separate from generic config mutation.
+    "telemetry.consent.set": WRITE_SCOPE,
+    "telemetry.client_launch.record": WRITE_SCOPE,
     # OpenSquilla-only; manual ``/meta`` command launch stamp.
     "meta.run": WRITE_SCOPE,
     # Raw prompts remain owner/admin-gated inside the handlers. WRITE_SCOPE is

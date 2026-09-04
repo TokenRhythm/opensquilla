@@ -1753,8 +1753,13 @@
     },
     "privacy": {
       "statusDisabledByEnv": "Disabled by an environment setting.",
-      "networkReportingLabel": "Diagnostics and updates",
-      "networkReportingDesc": "Share limited product diagnostics and check for updates. Conversation content, files, and model request content are not uploaded."
+      "statusNotChosen": "No choice has been saved yet. Data is not sent until you turn this on.",
+      "reliabilityDiagnosticsLabel": "Stability diagnostics",
+      "reliabilityDiagnosticsDesc": "Share operation outcomes, timings, and privacy-safe error fingerprints to help diagnose crashes and failures. Conversation and file content are never included.",
+      "productAnalyticsLabel": "Product and growth analytics",
+      "productAnalyticsDesc": "Share one-time activation milestones to measure setup and first-conversation drop-off. Conversation content and raw account IDs are never included; a random, purpose-specific analytics identifier is used.",
+      "networkReportingLabel": "Network diagnostics master switch",
+      "networkReportingDesc": "Master control for network diagnostics, analytics, and update checks. Turning it off overrides both choices below."
     },
     "toast": {
       "loadFailed": "Failed to load settings: {error}",

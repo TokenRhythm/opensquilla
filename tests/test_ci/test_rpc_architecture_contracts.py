@@ -79,6 +79,9 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         # Platform setup wire models terminate at the generated registration
         # Adapter; Application Modules receive transport-neutral commands.
         "src/opensquilla/gateway/adapters/platform_setup_contract.py",
+        # Scoped telemetry wire models terminate at the generated registration
+        # Adapter before reaching the consent mutation handler.
+        "src/opensquilla/gateway/adapters/telemetry_contract.py",
     }
 )
 GENERATED_METADATA_IMPORT_ALLOWLIST = frozenset(
@@ -155,7 +158,7 @@ SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
 )
 SESSIONS_RESOLVE_LITERAL_ALLOWLIST: Counter[str] = Counter()
 SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
-RUNTIME_RPC_METHOD_BASELINE = 306
+RUNTIME_RPC_METHOD_BASELINE = 308
 STATIC_RPC_DECORATOR_BASELINE = 140
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
@@ -1062,6 +1065,8 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "doctor.status",
             "logs.status",
             "logs.tail",
+            "telemetry.consent.set",
+            "telemetry.client_launch.record",
         }
     ] == []
     assert [

@@ -150,6 +150,7 @@ class GatewayRunInputLoop(Protocol):
         dispatch: Callable[[str], Coroutine[Any, Any, bool]],
         abort_active_turn: Callable[[], Awaitable[None]] | None = None,
         steer_active_turn: Callable[[str], Awaitable[bool]] | None = None,
+        on_surface_ready: Callable[[], Awaitable[None]] | None = None,
     ) -> None: ...
 
 
@@ -307,9 +308,7 @@ class _ExternalTurnFence:
         if turn_id in self._turn_ids:
             return
         self._turn_ids.add(turn_id)
-        self._pending.append(
-            _ExternalTurnIdentity(session_key=session_key, turn_id=turn_id)
-        )
+        self._pending.append(_ExternalTurnIdentity(session_key=session_key, turn_id=turn_id))
         self._sync_projection()
 
     def settle(self, turn_id: str) -> None:
@@ -535,10 +534,7 @@ async def _watch_model_routing_events(
         payload = frame.get("payload")
         snapshot = payload if isinstance(payload, dict) else {}
         event_key = str(
-            snapshot.get("sessionKey")
-            or snapshot.get("session_key")
-            or snapshot.get("key")
-            or ""
+            snapshot.get("sessionKey") or snapshot.get("session_key") or snapshot.get("key") or ""
         )
         current_key = str(scope.get("session_key") or "")
         if event_key and event_key != current_key:
@@ -970,9 +966,7 @@ async def run_gateway_chat(
                             model=session_context.model,
                             session_id=session_context.session_key,
                             workspace_label=(
-                                switch_workspace
-                                if isinstance(switch_workspace, str)
-                                else None
+                                switch_workspace if isinstance(switch_workspace, str) else None
                             ),
                             permission=elevated_state.get("mode"),
                         )
@@ -991,10 +985,7 @@ async def run_gateway_chat(
             external_identity = external_turn_fence.current(turn_session_key)
             if not external_turn_fence.is_idle():
                 steer_external = getattr(client, "steer_session", None)
-                if (
-                    external_identity is not None
-                    and callable(steer_external)
-                ):
+                if external_identity is not None and callable(steer_external):
                     try:
                         steered = await steer_external(
                             turn_session_key,
@@ -1068,10 +1059,7 @@ async def run_gateway_chat(
                     text,
                     expected_turn_id=external_identity.turn_id,
                 )
-                if (
-                    not bool(result.get("accepted"))
-                    and result.get("fallback_safe") is not True
-                ):
+                if not bool(result.get("accepted")) and result.get("fallback_safe") is not True:
                     raise GatewayRPCError(
                         "sessions.steer.v2",
                         code=str(result.get("failure_code") or "STEER_REJECTED"),
@@ -1089,6 +1077,10 @@ async def run_gateway_chat(
         from opensquilla.cli.tui.opentui.host_runtime import HostRuntimeError
 
         try:
+
+            async def _record_surface_ready() -> None:
+                await client.call("telemetry.client_launch.record", {})
+
             input_loop_kwargs: dict[str, Any] = {
                 "scope": session_context.scope,
                 "dispatch": _dispatch_input,
@@ -1105,6 +1097,12 @@ async def run_gateway_chat(
                     for parameter in parameters
                 ):
                     input_loop_kwargs["steer_active_turn"] = _steer_active_turn
+                if any(
+                    parameter.name == "on_surface_ready"
+                    or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
+                ):
+                    input_loop_kwargs["on_surface_ready"] = _record_surface_ready
             await deps.run_input_loop(**input_loop_kwargs)
         except ConnectionError:
             exit_reason = "gateway_disconnect"

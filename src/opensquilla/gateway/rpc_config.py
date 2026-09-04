@@ -32,6 +32,9 @@ from opensquilla.gateway.model_routing import (
 )
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.paths import default_opensquilla_home
+from opensquilla.telemetry.consent_transition import (
+    global_network_observability_transition,
+)
 
 if TYPE_CHECKING:
     from opensquilla.application.app_settings import AppSettings
@@ -58,6 +61,12 @@ def _update_config_in_place(old: Any, new: Any) -> None:
         new, "_runtime_field_overrides"
     ):
         old.reconcile_runtime_overrides(new)
+
+
+def update_gateway_config_in_place(old: Any, new: Any) -> None:
+    """Public persistence-boundary wrapper for non-config RPC domains."""
+
+    _update_config_in_place(old, new)
 
 
 async def _notify_goal_config_changed(ctx: RpcContext, previous_config: Any) -> None:
@@ -115,11 +124,19 @@ def _persist_config(config: Any) -> None:
     )
 
 
+def persist_gateway_config(config: Any) -> None:
+    """Persist a validated Gateway config through the shared durable writer."""
+
+    _persist_config(config)
+
+
 _PUBLIC_DERIVED_CONFIG_PATHS = frozenset(
     {
         "llm_ensemble.selection_configured",
         "llm_ensemble.activation_preview",
         "privacy.network_observability_disabled_effective",
+        "privacy.reliability_diagnostics_forced_off",
+        "privacy.product_analytics_forced_off",
     }
 )
 
@@ -142,10 +159,19 @@ def _strip_public_derived_config_fields(payload: dict[str, Any]) -> dict[str, An
         ensemble.pop("activation_preview", None)
         payload["llm_ensemble"] = ensemble
     privacy = payload.get("privacy")
-    if isinstance(privacy, dict) and "network_observability_disabled_effective" in privacy:
+    if isinstance(privacy, dict) and any(
+        key in privacy
+        for key in (
+            "network_observability_disabled_effective",
+            "reliability_diagnostics_forced_off",
+            "product_analytics_forced_off",
+        )
+    ):
         payload = dict(payload)
         privacy = dict(privacy)
         privacy.pop("network_observability_disabled_effective", None)
+        privacy.pop("reliability_diagnostics_forced_off", None)
+        privacy.pop("product_analytics_forced_off", None)
         payload["privacy"] = privacy
     return payload
 
@@ -582,10 +608,26 @@ async def _reconcile_tokenrhythm_profile_after_config_change(
     )
 
 
+# Consent records are server-authored by telemetry.consent.set.  Keeping all
+# three fields for each scope behind the same boundary prevents generic config
+# clients from manufacturing a grant, notice acknowledgement, or timestamp.
+_SCOPED_TELEMETRY_CONSENT_PATHS = frozenset(
+    {
+        "privacy.reliability_diagnostics_enabled",
+        "privacy.reliability_notice_version",
+        "privacy.reliability_consented_at_utc",
+        "privacy.product_analytics_enabled",
+        "privacy.product_analytics_notice_version",
+        "privacy.product_analytics_consented_at_utc",
+    }
+)
+
 # Read-only paths that cannot be modified via config.set/patch/apply.
 # config_version is the migration stamp owned by migrate_config_payload;
 # client writes to it could re-run or skip one-time migrations.
-_READONLY_PATHS = frozenset({"auth.token", "auth.password", "config_version"})
+_READONLY_PATHS = frozenset(
+    {"auth.token", "auth.password", "config_version"}
+) | _SCOPED_TELEMETRY_CONSENT_PATHS
 _READONLY_PATH_SEGMENTS = frozenset(tuple(path.split(".")) for path in _READONLY_PATHS)
 
 
@@ -606,8 +648,8 @@ def _prune_readonly_paths(patch: dict[str, Any]) -> dict[str, Any]:
     """Return a copy of ``patch`` with every read-only path protected.
 
     Mirrors the ``continue`` guard the dot-path form applies to
-    ``_READONLY_PATHS`` (auth.token, auth.password, config_version), so the
-    dict-merge form cannot smuggle a write to those paths past the guard. A
+    ``_READONLY_PATHS``, so the dict-merge form cannot smuggle a write to those
+    paths past the guard. A
     non-mapping replacement of a read-only ancestor is dropped because it
     would otherwise replace or delete the protected descendants wholesale.
     """
@@ -687,6 +729,22 @@ def _set_path(obj: dict, path: str, value: Any) -> None:
             current[part] = {}
         current = current[part]
     current[parts[-1]] = value
+
+
+def _preserve_readonly_config_values(
+    payload: dict[str, Any],
+    current_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Strip client-authored read-only values and restore the live values."""
+
+    cleaned = _prune_readonly_paths(payload)
+    for path in sorted(_READONLY_PATHS):
+        try:
+            value = _resolve_path(current_payload, path)
+        except KeyError:
+            continue
+        _set_path(cleaned, path, copy.deepcopy(value))
+    return cleaned
 
 
 def _deep_merge(base: dict, patch: dict) -> dict:
@@ -849,8 +907,9 @@ async def _handle_config_set(params: dict | None, ctx: RpcContext) -> dict[str, 
     # Persist the candidate BEFORE mutating the live config: if the write
     # fails, memory and disk stay consistent (both keep the old state)
     # instead of silently diverging until the next restart reverts memory.
-    _persist_config(new_config)
-    _update_config_in_place(ctx.config, new_config)
+    async with global_network_observability_transition(ctx.config, new_config):
+        _persist_config(new_config)
+        _update_config_in_place(ctx.config, new_config)
     await _notify_goal_config_changed(ctx, previous_config)
     _sync_resolved_provider_selector(ctx, provider_config)
     _sync_image_generation(new_config)
@@ -998,9 +1057,10 @@ async def _execute_config_patch(
     provider_config = _resolve_provider_selector_config(new_config)
     # Persist the candidate BEFORE mutating the live config: if the write
     # fails, memory and disk stay consistent (both keep the old state).
-    _persist_config(new_config)
-    # Update in-memory config so subsequent requests see changes immediately
-    _update_config_in_place(ctx.config, new_config)
+    async with global_network_observability_transition(ctx.config, new_config):
+        _persist_config(new_config)
+        # Update in-memory config so subsequent requests see changes immediately
+        _update_config_in_place(ctx.config, new_config)
     await _notify_goal_config_changed(ctx, previous_config)
     _sync_resolved_provider_selector(ctx, provider_config)
     _sync_image_generation(new_config)
@@ -1138,14 +1198,16 @@ async def _handle_config_apply(params: dict | None, ctx: RpcContext) -> dict[str
     )
     old_model_routing = model_routing_public_snapshot(ctx.config)
     config_payload, redacted_paths = _restore_redacted_values(config_payload, old_payload)
+    config_payload = _preserve_readonly_config_values(config_payload, old_payload)
     config_payload = _strip_public_derived_config_fields(config_payload)
+    explicit_paths = _collect_paths(config_payload) - _READONLY_PATHS
 
     # Validate and persist the full replacement config
     validate_compaction_deployment_write(config_payload)
     new_config = GatewayConfig(**config_payload)
     _validate_memory_embedding_semantics(new_config)
     inherit_then_clear_explicit(
-        ctx.config, new_config, _collect_paths(config_payload) - redacted_paths
+        ctx.config, new_config, explicit_paths - redacted_paths
     )
     new_config._mark_env_absorbed_secrets(config_payload)
     # Runtime-override provenance must ride the candidate BEFORE runtime
@@ -1154,14 +1216,16 @@ async def _handle_config_apply(params: dict | None, ctx: RpcContext) -> dict[str
         new_config.inherit_persist_provenance(ctx.config)
     _mark_explicit_provider_resolution(
         new_config,
-        _collect_paths(config_payload),
+        explicit_paths,
     )
     provider_config = _resolve_provider_selector_config(new_config)
     # Persist the candidate BEFORE mutating the live config: if the write
     # fails, memory and disk stay consistent (both keep the old state).
-    _persist_config(new_config)
+    async with global_network_observability_transition(ctx.config, new_config):
+        _persist_config(new_config)
+        if ctx.config is not None:
+            _update_config_in_place(ctx.config, new_config)
     if ctx.config is not None:
-        _update_config_in_place(ctx.config, new_config)
         await _notify_goal_config_changed(ctx, previous_config)
     _sync_resolved_provider_selector(ctx, provider_config)
     _sync_image_generation(new_config)
@@ -1268,6 +1332,12 @@ async def _handle_config_reload(params: dict | None, ctx: RpcContext) -> dict[st
     target, _source = resolve_config_path(getattr(ctx.config, "config_path", None) or None)
     try:
         candidate = load_config(target)
+        # A reload may hot-apply ordinary hand-edited settings, but consent is
+        # mutated only through telemetry.consent.set.  Preserve the live record
+        # instead of allowing a TOML edit submitted through this RPC to bypass
+        # the dedicated notice/timestamp and cleanup transaction.
+        for path in sorted(_SCOPED_TELEMETRY_CONSENT_PATHS):
+            _set_config_attr(candidate, path, _get_config_attr(ctx.config, path))
         _validate_memory_embedding_semantics(candidate)
     except Exception as exc:  # noqa: BLE001 — rollback contract: config untouched
         return {"ok": False, "path": str(target), "error": str(exc)}
@@ -1300,7 +1370,8 @@ async def _handle_config_reload(params: dict | None, ctx: RpcContext) -> dict[st
     )
 
     # Step 4: swap values + runtime-secret markers into the live config.
-    _update_config_in_place(ctx.config, candidate)
+    async with global_network_observability_transition(ctx.config, candidate):
+        _update_config_in_place(ctx.config, candidate)
     await _notify_goal_config_changed(ctx, previous_config)
     _sync_image_generation(candidate)
     _sync_model_catalog_overrides(candidate)

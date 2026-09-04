@@ -389,54 +389,34 @@ full reference.
 
 ---
 
-## Installation Privacy
+## Telemetry Privacy
 
-OpenSquilla uses pseudonymous installation telemetry to estimate install
-counts, version adoption, and runtime compatibility. Data is sent on first
-gateway startup and once per OpenSquilla version. It also records content-free daily
-aggregates of completed top-level conversations and token usage by UTC date,
-and attempts to upload pending cumulative UTC-day snapshots to the telemetry
-service at startup and once per hour. OpenSquilla may also make
-passive update checks, including automatic desktop update checks at startup
-and, while the app remains open, at most once per day. Uploads use a short
-timeout and never block startup.
+OpenSquilla has two isolated, optional telemetry scopes. Both remain off until
+the user saves consent for the current notice version in Privacy settings:
 
-See [`PRIVACY.md`](PRIVACY.md) for the full privacy policy covering local data,
-provider requests, network observability, logs, release downloads, and deletion.
+- **Reliability diagnostics** records bounded operation results for app and
+  Gateway startup, crashes, turns, tools, file parsing, updates, and session
+  performance.
+- **Product and growth analytics** records one-time acquisition, onboarding,
+  app-readiness, registration, and first-successful-turn milestones.
 
-What is sent:
+Each scope has its own consent, random purpose-specific identifier, durable
+queue, upload endpoint, retention policy, and deletion path. Reliability events
+go to `/v1/reliability/events`; growth events go to `/v1/growth/events`.
+Retries reuse `event_id` for server-side deduplication, and growth events are
+not sampled.
 
-- schema version
-- locally generated stable `install_id` digest
-- OpenSquilla version
-- event type (`install`, `version_seen`, or `daily_usage`)
-- install method (`pip`, `source`, `docker`, `desktop`, or `unknown`)
-- operating system, OS version, CPU architecture, and Python major/minor
-  version
-- first-seen and sent timestamps
-- CI/test-environment marker (`ci_environment`)
-- completed UTC day, conversation count, and aggregate input/output/cache/cache-write
-  token counts for daily-usage events
+Telemetry never includes prompts, responses, file names, file paths, file
+contents, tool arguments, task parameters, provider configuration, raw account
+IDs, order data, MAC addresses, IP addresses, or device fingerprints. Complete
+crash stacks stay local unless the user explicitly prepares and shares a
+support bundle.
 
-The `install_id` is a local one-way SHA-256 digest derived from usable MAC
-addresses, then local IP addresses when no MAC is available, with a random
-persisted fallback. Raw MAC/IP values are not uploaded.
+The former automatic `/v1/install` upload, `/v1/usage` daily token aggregate,
+and `X-OpenSquilla-Install-Id` provider header are retired. OpenSquilla no
+longer creates or sends an identifier derived from a MAC address or local IP.
 
-By default, requests sent directly to the official TokenRhythm HTTPS API may
-also carry the same pseudonymous, cross-session installation identifier in the
-optional `X-OpenSquilla-Install-Id` header. Only the exact official
-`tokenrhythm.studio` and `api.tokenrhythm.studio` HTTPS hosts on port 443 are
-eligible; custom proxies, OpenRouter, other providers, browser pages,
-redirected nonofficial targets, and returned image/CDN downloads are excluded.
-The raw MAC/IP values are never sent. The header is omitted if its background
-resolution is not ready or fails, so requests continue normally.
-
-What is not sent: usernames, hostnames, paths, API keys, provider config,
-chat/session/memory/agent content, file names, or file contents. Source IP may
-be visible to HTTP servers at the transport layer, but is not part of the
-payload.
-
-To disable non-user-initiated network observability before startup:
+To force all non-user-initiated network observability off before startup:
 
 ```sh
 OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY=true
@@ -449,15 +429,13 @@ or set:
 disable_network_observability = true
 ```
 
-That unified switch covers automatic install telemetry, daily aggregate usage
-telemetry, passive update checks, and automatic desktop update checks at
-startup and during long-running app sessions, as well as the TokenRhythm
-installation header. Explicit update-availability checks remain disabled while
-the unified or legacy opt-out is active. CI and test environments also
-suppress the installation header and installation telemetry automatically.
-Other user-initiated actions may still
-contact network services after user intent, including release downloads and
-configured providers, search, or channels.
+This is a hard veto over both telemetry scopes, passive update checks, and
+automatic desktop update checks. It does not create, erase, or replace either
+saved per-scope consent decision. CI, test, and `DO_NOT_TRACK` environments
+also fail closed for telemetry. Other user-initiated actions may still contact
+configured providers, search services, channels, or release hosts.
+Explicit update-availability checks remain disabled while the unified or
+legacy update opt-out controls are active.
 
 Legacy opt-out environment variables remain honored:
 
@@ -466,18 +444,9 @@ OPENSQUILLA_TELEMETRY_DISABLED=true
 OPENSQUILLA_UPDATE_CHECK_DISABLED=true
 ```
 
-The legacy telemetry opt-out suppresses the TokenRhythm installation header;
-the update-check opt-out by itself does not. TokenRhythm must treat the header
-as optional and untrusted, and must not use it for authentication,
-authorization, billing, rate limiting, or anti-abuse decisions. See
-[`PRIVACY.md`](PRIVACY.md#tokenrhythm-installation-identifier) for the complete
-target and data-handling rules.
-
-Advanced deployments can use their own installation telemetry endpoint:
-
-```sh
-OPENSQUILLA_TELEMETRY_ENDPOINT=https://example.com/v1/install
-```
+The legacy telemetry variable is retained only as a global telemetry veto; it
+does not re-enable the retired endpoints. See [`PRIVACY.md`](PRIVACY.md) for
+the complete data, consent, deletion, update, and external-producer rules.
 
 ---
 

@@ -1,5 +1,5 @@
 import { strict as assert } from 'node:assert'
-import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -47,6 +47,15 @@ async function fileExists(path) {
     return true
   } catch (error) {
     if (error?.code === 'ENOENT') return false
+    throw error
+  }
+}
+
+async function readDirectoryOrEmpty(path) {
+  try {
+    return await readdir(path)
+  } catch (error) {
+    if (error?.code === 'ENOENT') return []
     throw error
   }
 }
@@ -114,6 +123,12 @@ async function setOnboardingBaseUrl(page, baseUrl) {
   await page.locator('#baseUrl').evaluate((input, value) => {
     input.value = value
   }, baseUrl)
+}
+
+function isManagedTelemetrySpoolEntry(name) {
+  return name.endsWith('.ready')
+    || name.includes('.processing.')
+    || (name.startsWith('.') && name.endsWith('.tmp'))
 }
 
 async function readOnboardingTelemetry(userDataDir) {
@@ -478,6 +493,11 @@ async function installPendingSaveStub(app) {
   })
 }
 
+async function chooseTelemetryConsent(page, reliability = false, growth = false) {
+  await page.locator(`input[name="reliabilityDiagnosticsEnabled"][value="${reliability}"]`).check()
+  await page.locator(`input[name="productAnalyticsEnabled"][value="${growth}"]`).check()
+}
+
 async function pendingSaveState(app) {
   return await app.evaluate(() => {
     const state = globalThis.__opensquillaOnboardingSaveTest
@@ -594,6 +614,7 @@ async function verifySubmitFeedbackAndSingleFlight() {
     const apiKey = page.locator('#apiKey')
     await apiKey.fill('synthetic-submit-key')
     await page.locator('#onboardingLocale').selectOption('de')
+    await chooseTelemetryConsent(page, true, false)
     await installPendingSaveStub(app)
 
     await page.locator('#providerSelectToggle').click()
@@ -626,6 +647,8 @@ async function verifySubmitFeedbackAndSingleFlight() {
     await assertSubmitActionsDoNotOverlap(page)
     const firstState = await pendingSaveState(app)
     assert.equal(firstState.lastPayload?.apiKey, 'synthetic-submit-key')
+    assert.equal(firstState.lastPayload?.reliabilityDiagnosticsEnabled, true)
+    assert.equal(firstState.lastPayload?.productAnalyticsEnabled, false)
 
     await page.locator('#finish').evaluate((button) => {
       button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
@@ -725,6 +748,7 @@ async function verifyProbeBeforePersistenceAndRetry() {
     await page.locator('[data-provider-option="openai"]').click()
     await page.locator('#apiKey').fill(syntheticKey)
     await setOnboardingBaseUrl(page, probeServer.baseUrl)
+    await chooseTelemetryConsent(page, true, false)
     const submittedModel = await page.locator('#model').inputValue()
 
     await page.locator('#finish').click()
@@ -795,7 +819,10 @@ try {
   const desktopPage = await waitFor(async () => {
     for (const candidate of app.windows()) {
       if (candidate.isClosed()) continue
-      if (candidate.url().startsWith('opensquilla-app://desktop/')) return candidate
+      if (
+        candidate.url().startsWith('opensquilla-app://desktop/')
+        && await candidate.locator('#app').count() === 1
+      ) return candidate
     }
     return null
   }, 'local Desktop renderer')
@@ -1110,6 +1137,42 @@ try {
   assert.equal(await page.locator('#searchApiKeyError').innerText(), '')
   assert.equal(await page.locator('#apiKey').inputValue(), 'synthetic-tokenrhythm-key')
   await setOnboardingBaseUrl(page, successfulProbeServer.baseUrl)
+  assert.equal(
+    await page.locator('input[name="reliabilityDiagnosticsEnabled"]:checked').count(),
+    0,
+    'stability diagnostics must remain unset until the user chooses',
+  )
+  assert.equal(
+    await page.locator('input[name="productAnalyticsEnabled"]:checked').count(),
+    0,
+    'growth analytics must remain unset until the user chooses',
+  )
+  await page.locator('#finish').click()
+  assert.match(await page.locator('#telemetryConsentError').innerText(), /Choose an option for both data categories/)
+  assert.equal(
+    await page.locator('input[name="reliabilityDiagnosticsEnabled"][value="true"]').getAttribute('aria-invalid'),
+    'true',
+  )
+  const earlySpoolRoot = join(
+    userDataDir,
+    'opensquilla',
+    'state',
+    'telemetry',
+    'desktop-early-spool',
+  )
+  await mkdir(join(earlySpoolRoot, 'reliability'), { recursive: true })
+  await mkdir(join(earlySpoolRoot, 'growth'), { recursive: true })
+  await writeFile(join(earlySpoolRoot, 'reliability', 'keep.ready'), '{}')
+  await writeFile(join(earlySpoolRoot, 'growth', 'remove.ready'), '{}')
+  const growthIdentityPath = join(
+    userDataDir,
+    'opensquilla',
+    'state',
+    'telemetry',
+    'growth_identity.json',
+  )
+  await writeFile(growthIdentityPath, '{"synthetic":"identity"}\n')
+  await chooseTelemetryConsent(page, true, false)
   await page.locator('#finish').click()
 
   const saved = await waitFor(async () => {
@@ -1129,6 +1192,61 @@ try {
   assert.equal(credential.provider, 'tokenrhythm')
   assert.equal(credential.modelRoutingMode, 'squilla_router')
   assert.equal(credential.routerMode, 'recommended')
+  assert.match(config, /reliability_diagnostics_enabled = true/)
+  assert.match(config, /reliability_notice_version = "reliability-v1"/)
+  assert.match(config, /reliability_consented_at_utc = "[^"\r\n]+Z"/)
+  assert.match(config, /product_analytics_enabled = false/)
+  assert.doesNotMatch(config, /product_analytics_notice_version/)
+  assert.doesNotMatch(config, /product_analytics_consented_at_utc/)
+  const consentMirror = JSON.parse(await readFile(
+    join(userDataDir, 'opensquilla', 'state', 'telemetry', 'desktop-consent-mirror.json'),
+    'utf8',
+  ))
+  assert.deepEqual(consentMirror.reliability, {
+    enabled: true,
+    notice_version: 'reliability-v1',
+    consented_at_utc: config.match(/reliability_consented_at_utc = "([^"\r\n]+)"/)?.[1],
+    forced_off: false,
+  })
+  assert.deepEqual(consentMirror.growth, {
+    enabled: false,
+    notice_version: null,
+    consented_at_utc: null,
+    forced_off: false,
+  })
+  const reliabilityCollectionSuppressed = [
+    'OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY',
+    'OPENSQUILLA_TELEMETRY_DISABLED',
+    'DO_NOT_TRACK',
+    'OPENSQUILLA_PRIVACY_DISABLE_RELIABILITY_DIAGNOSTICS',
+    'CI',
+    'GITHUB_ACTIONS',
+    'OPENSQUILLA_TESTING',
+  ].some((name) => ['1', 'true', 'yes', 'on'].includes(
+    String(process.env[name] || '').trim().toLowerCase(),
+  )) || String(process.env.PYTEST_CURRENT_TEST || '').trim().length > 0
+  const expectedReliabilitySpool = reliabilityCollectionSuppressed
+    ? ['keep.ready']
+    : ['.desktop-reliability-session.tmp', 'keep.ready']
+  const reliabilitySpool = await waitFor(async () => {
+    const entries = (await readDirectoryOrEmpty(join(earlySpoolRoot, 'reliability'))).sort()
+    return JSON.stringify(entries) === JSON.stringify(expectedReliabilitySpool) ? entries : null
+  }, 'consent-gated reliability session marker')
+  assert.deepEqual(
+    reliabilitySpool,
+    expectedReliabilitySpool,
+    reliabilityCollectionSuppressed
+      ? 'automated environments must preserve existing local events without collecting new ones'
+      : 'enabling reliability must preserve its queued event and start the consent-gated session marker',
+  )
+  const remainingGrowthSpool = await readDirectoryOrEmpty(join(earlySpoolRoot, 'growth'))
+  assert.deepEqual(remainingGrowthSpool, [])
+  assert.equal(remainingGrowthSpool.some(isManagedTelemetrySpoolEntry), false)
+  await assert.rejects(
+    () => readFile(growthIdentityPath),
+    (error) => error?.code === 'ENOENT',
+    'declining growth analytics must delete the random analytics identity',
+  )
   assert.equal(credential.routerDefaultTier, 'c1')
   assert.equal(credential.model, 'deepseek-v4-pro-0813')
   assert.equal(credential.routerTiers.c0.model, 'deepseek-v4-flash-0731')

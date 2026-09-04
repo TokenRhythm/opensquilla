@@ -52,6 +52,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("cli", "search"),
     ("cli", "session"),
     ("cli", "skills"),
+    # CLI surfaces emit only closed, consent-gated lifecycle facts through the
+    # telemetry package; telemetry never imports the CLI back.
+    ("cli", "telemetry"),
     ("cli", "tools"),
     ("cli", "uninstall"),
     # code-task assembles the subagent's per-run config from the operator's
@@ -99,6 +102,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("engine", "session"),
     ("engine", "skills"),
     ("engine", "squilla_router"),
+    # Turn and file-parse lifecycle observers terminate in the lower-level
+    # scoped telemetry sink and do not expose user content.
+    ("engine", "telemetry"),
     ("engine", "tools"),
     # The measurement-only eval harness observes providers (and pricing) through
     # their public surface; nothing imports eval back, so it joins no cycle.
@@ -135,6 +141,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     # Gateway's post-dream hook drives the opt-in router self-learning
     # orchestrator (offline retrain; default-off, fail-open).
     ("gateway", "squilla_router"),
+    # Gateway composition owns scoped telemetry lifecycle and its authenticated
+    # consent RPC boundary; telemetry does not import Gateway implementation.
+    ("gateway", "telemetry"),
     ("gateway", "tools"),
     # The reusable Python Gateway client shares the bounded WebSocket receive
     # contract with the CLI client; contracts remains implementation-free.
@@ -249,6 +258,10 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("skills", "provider"),
     ("skills", "safety"),
     ("skills", "tools"),
+    # Telemetry uses the shared async-SQLite shim and passive-network privacy
+    # policy; both remain lower-level dependencies and introduce no cycle.
+    ("telemetry", "compat"),
+    ("telemetry", "observability"),
     ("tools", "agents"),
     ("tools", "artifact_session"),
     ("tools", "channels"),

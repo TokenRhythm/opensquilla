@@ -1592,6 +1592,8 @@ class _TurnRunnerAttachmentMessageBuilderAdapter(AttachmentMessageBuilderPort):
     them to the outer ``_run_turn`` terminal handler.
     """
 
+    supports_file_parse_facts = True
+
     def __init__(self, runner: TurnRunner) -> None:
         self._runner = runner
 
@@ -1623,6 +1625,7 @@ class _TurnRunnerAttachmentMessageBuilderAdapter(AttachmentMessageBuilderPort):
         workspace_dir: str | Path | None = None,
         session_id: str | None = None,
         cancel_check: Callable[[], None],
+        file_parse_fact_sink: Callable[[Any], object] | None = None,
     ) -> list[Any] | None:
         return self._runner._build_attachment_messages(
             message,
@@ -1635,6 +1638,7 @@ class _TurnRunnerAttachmentMessageBuilderAdapter(AttachmentMessageBuilderPort):
                 workspace_attachment_budget_from_config(self._runner._config)
             ),
             cancel_check=cancel_check,
+            file_parse_fact_sink=file_parse_fact_sink,
         )
 
 
