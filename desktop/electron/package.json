@@ -59,6 +59,7 @@
     "test:telemetry-consent": "npm run build && node scripts/test-telemetry-consent.mjs",
     "test:telemetry-early-spool": "npm run build && node scripts/test-telemetry-early-spool.mjs",
     "test:telemetry-protocol": "npm run build && node scripts/test-telemetry-protocol.mjs",
+    "test:telemetry-build-identity": "npm run build && node scripts/test-telemetry-build-identity.mjs",
     "test:telemetry-reliability": "npm run build && node scripts/test-telemetry-reliability.mjs",
     "test:telemetry-growth": "npm run build && node scripts/test-telemetry-growth.mjs",
     "test:router-tier-normalization": "npm run build && node scripts/test-router-tier-normalization.mjs",

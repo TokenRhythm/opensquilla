@@ -770,6 +770,7 @@ jobs:
           node scripts/test-ci-case-telemetry.mjs
           node scripts/test-telemetry-consent.mjs
           node scripts/test-telemetry-early-spool.mjs
+          node scripts/test-telemetry-build-identity.mjs
           node scripts/test-telemetry-reliability.mjs
           node scripts/test-telemetry-growth.mjs
           node scripts/test-telemetry-protocol.mjs

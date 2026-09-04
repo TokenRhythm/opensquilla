@@ -75,6 +75,10 @@ import {
   type GatewayStartFailureStage,
   type UpdateErrorCode,
 } from './telemetry/reliability.js'
+import {
+  readSourceCommitId,
+  sourceTelemetryVersion,
+} from './telemetry/build-identity.js'
 import { runTelemetrySideEffectFailOpen } from './telemetry/fail-open.js'
 import {
   clearDesktopGrowthTelemetryState,
@@ -480,6 +484,11 @@ const defaultRepoRoot = resolve(packageRoot, '..', '..')
 const repoRoot = process.env.OPENSQUILLA_DESKTOP_REPO_ROOT
   ? resolve(process.env.OPENSQUILLA_DESKTOP_REPO_ROOT)
   : defaultRepoRoot
+// Official packaged Desktop builds have no checkout metadata and must keep
+// their ordinary semver.  An unpackaged shell launched from this repository
+// may safely identify the exact source commit for reliability diagnostics;
+// the helper is bounded, read-only, and never invokes Git.
+const desktopSourceCommitId = app.isPackaged ? null : readSourceCommitId(repoRoot)
 const shouldUseNativeApplicationMenu = process.platform === 'darwin'
 
 let mainWindow: BrowserWindow | null = null
@@ -554,6 +563,11 @@ const desktopProcessStartedAt = Date.now()
 const desktopReliabilityTelemetry = new DesktopReliabilityTelemetry({
   runtimeGate: desktopTelemetryRuntimeGate,
   appVersion: () => app.getVersion(),
+  ...(desktopSourceCommitId === null
+    ? {}
+    : {
+        telemetryAppVersion: () => sourceTelemetryVersion(app.getVersion(), desktopSourceCommitId),
+      }),
   platform: process.platform === 'darwin'
     ? 'macos'
     : process.platform === 'win32'

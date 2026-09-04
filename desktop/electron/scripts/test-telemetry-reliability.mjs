@@ -34,6 +34,10 @@ function deterministicIds(start = 1) {
   return () => uuid(counter++)
 }
 
+const SOURCE_COMMIT = '0123456789abcdef0123456789abcdef01234567'
+const SOURCE_VERSION_053 = `0.5.3+source.${SOURCE_COMMIT}`
+const SOURCE_VERSION_054 = `0.5.4+source.${SOURCE_COMMIT}`
+
 function clock(start = Date.parse('2026-09-02T00:00:00.000Z')) {
   let now = start
   return {
@@ -95,7 +99,7 @@ function readyEvents(root) {
 }
 
 function telemetry(options) {
-  return new DesktopReliabilityTelemetry({
+  const telemetryOptions = {
     runtimeGate: options.runtimeGate ?? openGate(),
     appVersion: () => options.appVersion ?? '0.5.3',
     platform: 'macos',
@@ -105,7 +109,11 @@ function telemetry(options) {
     nowDate: options.clock.nowDate,
     randomId: options.randomId,
     env: {},
-  })
+  }
+  if (options.telemetryAppVersion !== undefined) {
+    telemetryOptions.telemetryAppVersion = () => options.telemetryAppVersion
+  }
+  return new DesktopReliabilityTelemetry(telemetryOptions)
 }
 
 const root = mkdtempSync(join(tmpdir(), 'opensquilla-reliability-'))
@@ -297,6 +305,8 @@ try {
       clock: fakeClock,
       appSessionId: uuid(100),
       randomId: deterministicIds(101),
+      appVersion: '0.5.4',
+      telemetryAppVersion: SOURCE_VERSION_054,
     })
     runtime.setForeground(true)
     runtime.synchronize(factPaths)
@@ -333,6 +343,7 @@ try {
       ['app_start_result', 'gateway_start_result', 'performance_summary', 'update_result'],
     )
     const summary = events.find((event) => event.event_name === 'performance_summary')
+    assert.ok(events.every((event) => event.app_version === SOURCE_VERSION_054))
     assert.equal(summary.summary_kind, 'session_end')
     assert.equal(summary.coverage, 'complete')
     assert.equal(summary.monitored_request_count, 1)
@@ -694,6 +705,7 @@ try {
       appSessionId: uuid(400),
       randomId: deterministicIds(401),
       appVersion: '0.5.3',
+      telemetryAppVersion: SOURCE_VERSION_053,
     })
     oldRuntime.synchronize(updatePaths)
     assert.equal(oldRuntime.markUpdateHandoff('0.5.4'), true)
@@ -707,6 +719,7 @@ try {
       appSessionId: uuid(500),
       randomId: deterministicIds(501),
       appVersion: '0.5.4',
+      telemetryAppVersion: SOURCE_VERSION_054,
     })
     newRuntime.synchronize(updatePaths)
     fakeClock.advance(800)
@@ -722,8 +735,10 @@ try {
     assert.equal(install?.outcome, 'success')
     assert.equal(install?.old_version, '0.5.3')
     assert.equal(install?.new_version, '0.5.4')
+    assert.equal(install?.app_version, SOURCE_VERSION_054)
     assert.equal(restart?.outcome, 'success')
     assert.equal(restart?.app_session_id, uuid(500))
+    assert.equal(restart?.app_version, SOURCE_VERSION_054)
     assert.equal(
       existsSync(join(updatePaths.spoolRoot, 'reliability', '.desktop-update-transition.tmp')),
       false,
@@ -955,6 +970,8 @@ try {
   {
     const mainSource = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8')
     for (const pattern of [
+      /readSourceCommitId\(repoRoot\)/,
+      /telemetryAppVersion: \(\) => sourceTelemetryVersion\(app\.getVersion\(\), desktopSourceCommitId\)/,
       /desktopReliabilityTelemetry\.synchronize\(/,
       /process\.on\('uncaughtExceptionMonitor'/,
       /app\.on\('child-process-gone'/,

@@ -318,7 +318,16 @@ class PerformanceAccumulator {
 
 export interface DesktopReliabilityTelemetryOptions {
   runtimeGate: DesktopTelemetryRuntimeGate
+  /**
+   * The plain application version used by updater handoff state and semver
+   * comparisons.  Keep this separate from the telemetry identity below.
+   */
   appVersion: () => string
+  /**
+   * Optional version identity for reliability events.  Source builds may
+   * append a validated commit id while updater state remains plain semver.
+   */
+  telemetryAppVersion?: () => string
   platform: DesktopPlatform
   processStartedAtMs: number
   env?: Readonly<Record<string, string | undefined>>
@@ -333,6 +342,7 @@ export class DesktopReliabilityTelemetry {
 
   private readonly runtimeGate: DesktopTelemetryRuntimeGate
   private readonly appVersion: () => string
+  private readonly telemetryAppVersion: () => string
   private readonly platform: DesktopPlatform
   private readonly processStartedAtMs: number
   private readonly env: Readonly<Record<string, string | undefined>>
@@ -354,6 +364,7 @@ export class DesktopReliabilityTelemetry {
   constructor(options: DesktopReliabilityTelemetryOptions) {
     this.runtimeGate = options.runtimeGate
     this.appVersion = options.appVersion
+    this.telemetryAppVersion = options.telemetryAppVersion ?? options.appVersion
     this.platform = options.platform
     this.processStartedAtMs = options.processStartedAtMs
     this.env = options.env ?? process.env
@@ -562,7 +573,7 @@ export class DesktopReliabilityTelemetry {
             input.errorCode,
             input.reason,
             input.signature ?? 'unknown',
-            this.appVersion(),
+            this.telemetryAppVersion(),
           ),
           occurred_at_utc: now.toISOString(),
           runtime_ms: runtimeMs,
@@ -684,7 +695,7 @@ export class DesktopReliabilityTelemetry {
       schema_version: 2,
       marker_kind: 'desktop_reliability_session',
       app_session_id: this.appSessionId,
-      app_version: this.appVersion(),
+      app_version: this.telemetryAppVersion(),
       started_at_ms: nowMs,
       last_observed_at_ms: nowMs,
       crash_event_id: this.randomId(),
@@ -1101,7 +1112,7 @@ export class DesktopReliabilityTelemetry {
     source: Source,
     eventId = this.randomId(),
     occurredAt = this.safeNowDate().toISOString(),
-    appVersion = this.appVersion(),
+    appVersion = this.telemetryAppVersion(),
   ) {
     return {
       event_name: eventName,
