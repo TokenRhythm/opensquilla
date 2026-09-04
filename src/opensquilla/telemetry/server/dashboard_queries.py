@@ -23,6 +23,7 @@ from opensquilla.telemetry.contracts.reliability import (
 
 _SCHEMA_VERSION: Final = 1
 _MAX_COHORT_DAYS: Final = 366
+_MAX_VERSION_BREAKDOWN_ROWS: Final = 24
 _REQUIRED_EVENT_COLUMNS: Final = frozenset(
     {
         "event_id",
@@ -208,6 +209,7 @@ class DashboardQueries:
                 "asOfReceivedUtc": watermark,
                 "dailyTrend": self._daily_reliability_trend(connection, window),
                 "hourlyTrend": self._hourly_reliability_trend(connection, window),
+                "byVersion": self._reliability_by_version(connection, window),
                 "appStart": app_start,
                 "gatewayStart": gateway_start,
                 "crashFreeSessions": self._crash_free_sessions(connection, window),
@@ -265,6 +267,136 @@ class DashboardQueries:
                     "estimatedIssues": issues,
                 }
             )
+        return result
+
+    def _reliability_by_version(
+        self,
+        connection: sqlite3.Connection,
+        window: UtcCohortWindow,
+    ) -> list[dict[str, Any]]:
+        """Aggregate stability volume and issues by release and source revision."""
+
+        rows = connection.execute(
+            """
+            WITH sanitized AS (
+                SELECT
+                    CASE
+                        WHEN typeof(app_version) = 'text'
+                          AND length(app_version) BETWEEN 1 AND 64
+                          AND substr(app_version, 1, 1) GLOB '[A-Za-z0-9]'
+                          AND app_version NOT GLOB '*[^A-Za-z0-9._+-]*'
+                        THEN app_version
+                        ELSE NULL
+                    END AS safe_version,
+                    1.0 / sample_rate AS event_weight,
+                    CASE
+                        WHEN event_name = 'app_crash_detected'
+                          OR outcome IN ('fail', 'timeout', 'cancel', 'denied')
+                        THEN 1.0 / sample_rate
+                        ELSE 0
+                    END AS issue_weight
+                FROM events
+                WHERE occurred_at_utc >= ?
+                  AND occurred_at_utc < ?
+                  AND sample_rate > 0
+            ), classified AS (
+                SELECT
+                    safe_version,
+                    event_weight,
+                    issue_weight,
+                    CASE
+                        WHEN length(safe_version) > 48
+                          AND substr(safe_version, -48, 8) = '+source.'
+                          AND substr(safe_version, -40) NOT GLOB '*[^0-9a-f]*'
+                        THEN 1
+                        WHEN length(safe_version) > 49
+                          AND substr(safe_version, -49, 9) = '+source.g'
+                          AND substr(safe_version, -40) NOT GLOB '*[^0-9a-f]*'
+                        THEN 2
+                        ELSE 0
+                    END AS source_style
+                FROM sanitized
+            ), normalized AS (
+                SELECT
+                    CASE source_style
+                        WHEN 1 THEN substr(safe_version, 1, length(safe_version) - 48)
+                        WHEN 2 THEN substr(safe_version, 1, length(safe_version) - 49)
+                        ELSE safe_version
+                    END AS app_version,
+                    CASE WHEN source_style > 0 THEN substr(safe_version, -40) END
+                        AS source_commit_id,
+                    event_weight,
+                    issue_weight
+                FROM classified
+            ), grouped AS (
+                SELECT
+                    app_version,
+                    source_commit_id,
+                    SUM(event_weight) AS estimated_events,
+                    SUM(issue_weight) AS estimated_issues
+                FROM normalized
+                GROUP BY app_version, source_commit_id
+            ), ranked AS (
+                SELECT
+                    app_version,
+                    source_commit_id,
+                    estimated_events,
+                    estimated_issues,
+                    ROW_NUMBER() OVER (
+                        ORDER BY estimated_events DESC,
+                                 COALESCE(app_version, ''),
+                                 COALESCE(source_commit_id, '')
+                    ) AS row_number
+                FROM grouped
+            ), bucketed AS (
+                SELECT
+                    CASE WHEN row_number < ? THEN app_version END AS app_version,
+                    CASE WHEN row_number < ? THEN source_commit_id END AS source_commit_id,
+                    CASE WHEN row_number < ? THEN 0 ELSE 1 END AS is_collapsed,
+                    estimated_events,
+                    estimated_issues
+                FROM ranked
+            )
+            SELECT
+                app_version,
+                source_commit_id,
+                is_collapsed,
+                COUNT(*) AS dimension_count,
+                SUM(estimated_events) AS estimated_events,
+                SUM(estimated_issues) AS estimated_issues
+            FROM bucketed
+            GROUP BY is_collapsed, app_version, source_commit_id
+            ORDER BY is_collapsed,
+                     estimated_events DESC,
+                     COALESCE(app_version, ''),
+                     COALESCE(source_commit_id, '')
+            """,
+            (
+                *window.sql_params,
+                _MAX_VERSION_BREAKDOWN_ROWS,
+                _MAX_VERSION_BREAKDOWN_ROWS,
+                _MAX_VERSION_BREAKDOWN_ROWS,
+            ),
+        ).fetchall()
+
+        raw_rows: list[tuple[sqlite3.Row, float, float]] = []
+        for row in rows:
+            raw_rows.append(
+                (row, float(row["estimated_events"]), float(row["estimated_issues"]))
+            )
+
+        result: list[dict[str, Any]] = []
+        for row, events, issues in raw_rows:
+            item: dict[str, Any] = {
+                "appVersion": row["app_version"],
+                "sourceCommitId": row["source_commit_id"],
+                "estimatedEvents": _public_count(events),
+                "estimatedIssues": _public_count(issues),
+                "issueRate": _rate(issues, events),
+            }
+            if int(row["is_collapsed"]):
+                item["collapsedDimensions"] = int(row["dimension_count"])
+            result.append(item)
         return result
 
     def _hourly_reliability_trend(

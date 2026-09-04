@@ -105,6 +105,7 @@ def _insert(
     event_name: str,
     occurred_at: str,
     event_version: int = 1,
+    app_version: str | None = "1.0.0",
     outcome: str | None = None,
     error_code: str | None = None,
     duration_ms: int | None = None,
@@ -121,7 +122,7 @@ def _insert(
         "event_version": event_version,
         "occurred_at_utc": occurred_at,
         "source": "desktop",
-        "app_version": "1.0.0",
+        "app_version": app_version,
         "platform": "macos",
         "outcome": outcome,
         "error_code": error_code,
@@ -453,6 +454,119 @@ def test_hourly_reliability_trend_is_weighted_zero_filled_and_half_open(
         point["estimatedIssues"] for point in result["dailyTrend"]
     )
     _assert_no_sensitive_output(trend)
+
+
+def test_reliability_is_grouped_by_version_and_controlled_source_commit(
+    tmp_path: Path,
+) -> None:
+    queries, reliability, _ = _queries(tmp_path)
+    source_sha1 = "a" * 40
+    events = (
+        (30, f"1.0.0+source.{source_sha1}", "success", 0.5),
+        (31, f"1.0.0+source.g{source_sha1}", "fail", 1.0),
+        (32, "1.0.0", "success", 1.0),
+        (33, "1.0.0", "timeout", 0.5),
+        (34, "2.0.0", "cancel", 0.25),
+    )
+    for sequence, app_version, outcome, sample_rate in events:
+        _insert(
+            reliability,
+            sequence=sequence,
+            event_name="turn_result",
+            occurred_at=f"2026-09-03T{sequence - 30:02d}:00:00.000Z",
+            app_version=app_version,
+            outcome=outcome,
+            sample_rate=sample_rate,
+        )
+
+    result = queries.reliability(_window())
+
+    assert result["byVersion"] == [
+        {
+            "appVersion": "2.0.0",
+            "sourceCommitId": None,
+            "estimatedEvents": 4,
+            "estimatedIssues": 4,
+            "issueRate": 1.0,
+        },
+        {
+            "appVersion": "1.0.0",
+            "sourceCommitId": None,
+            "estimatedEvents": 3,
+            "estimatedIssues": 2,
+            "issueRate": pytest.approx(2 / 3),
+        },
+        {
+            "appVersion": "1.0.0",
+            "sourceCommitId": source_sha1,
+            "estimatedEvents": 3,
+            "estimatedIssues": 1,
+            "issueRate": pytest.approx(1 / 3),
+        },
+    ]
+    assert sum(item["estimatedEvents"] for item in result["byVersion"]) == sum(
+        point["estimatedEvents"] for point in result["dailyTrend"]
+    )
+    _assert_no_sensitive_output(result["byVersion"])
+
+
+def test_reliability_version_breakdown_is_bounded_and_preserves_tail_metrics(
+    tmp_path: Path,
+) -> None:
+    queries, reliability, _ = _queries(tmp_path)
+    for sequence in range(30):
+        _insert(
+            reliability,
+            sequence=100 + sequence,
+            event_name="turn_result",
+            occurred_at=f"2026-09-03T00:00:{sequence:02d}.000Z",
+            app_version=f"1.0.{sequence}",
+            outcome="fail" if sequence % 3 == 0 else "success",
+            sample_rate=0.3,
+        )
+
+    result = queries.reliability(_window())
+    breakdown = result["byVersion"]
+
+    assert len(breakdown) == 24
+    assert breakdown[-1]["collapsedDimensions"] == 7
+    assert breakdown[-1]["estimatedEvents"] == pytest.approx(23.333)
+    assert breakdown[-1]["estimatedIssues"] == pytest.approx(10)
+    assert all(0 <= item["estimatedIssues"] <= item["estimatedEvents"] for item in breakdown)
+    assert all(0 <= item["issueRate"] <= 1 for item in breakdown)
+    _assert_no_sensitive_output(breakdown)
+
+
+def test_reliability_version_tail_never_inherits_rounding_residual(
+    tmp_path: Path,
+) -> None:
+    queries, reliability, _ = _queries(tmp_path)
+    for sequence in range(23):
+        _insert(
+            reliability,
+            sequence=200 + sequence,
+            event_name="turn_result",
+            occurred_at=f"2026-09-03T00:00:{sequence:02d}.000Z",
+            app_version=f"2.0.{sequence}",
+            outcome="fail",
+            sample_rate=0.6,
+        )
+    for sequence in range(2):
+        _insert(
+            reliability,
+            sequence=300 + sequence,
+            event_name="turn_result",
+            occurred_at=f"2026-09-03T00:01:{sequence:02d}.000Z",
+            app_version=f"3.0.{sequence}",
+            outcome="success",
+        )
+
+    tail = queries.reliability(_window())["byVersion"][-1]
+
+    assert tail["collapsedDimensions"] == 2
+    assert tail["estimatedEvents"] == 2
+    assert tail["estimatedIssues"] == 0
+    assert tail["issueRate"] == 0
 
 
 def test_growth_funnels_keep_identifiers_separate_and_use_fixed_windows(

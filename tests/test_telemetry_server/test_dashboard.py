@@ -23,6 +23,7 @@ _BASE = "/telemetry-v2-preview"
 _CLOCK = datetime(2026, 9, 30, 12, 0, tzinfo=UTC)
 _RAW_EVENT_ID = "00000000-0000-4000-8000-000000000001"
 _RAW_SESSION_ID = "00000000-0000-4000-8000-000000000002"
+_SOURCE_COMMIT_ID = "c" * 40
 
 
 @pytest.fixture(scope="module")
@@ -88,7 +89,7 @@ def _database(tmp_path: Path, scope: str) -> Path:
                 """
                 INSERT INTO events VALUES (
                     ?, ?, 'app_start_result', 1, '2026-09-02T00:00:00.000Z',
-                    'desktop', '1.2.3', 'macos', 'success', NULL, 125, 1.0,
+                    'desktop', ?, 'macos', 'success', NULL, 125, 1.0,
                     'reliability-v1', ?, NULL, NULL, ?, NULL,
                     '2026-09-02T00:00:01.000Z'
                 )
@@ -96,6 +97,7 @@ def _database(tmp_path: Path, scope: str) -> Path:
                 (
                     _RAW_EVENT_ID,
                     "a" * 64,
+                    f"1.2.3+source.{_SOURCE_COMMIT_ID}",
                     _RAW_SESSION_ID,
                     json.dumps({"failure_stage": None}),
                 ),
@@ -396,12 +398,32 @@ def test_authenticated_page_and_api_contain_aggregates_but_no_telemetry_ids(
     assert 'id="reliability-hourly-trend"' in page.text
     assert page.text.count('data-hour-utc="') == 24
     assert 'data-hour-utc="0" data-events="2" data-issues="1"' in page.text
+    assert "版本稳定性" in page.text
+    assert "按客户端版本和源码基准提交分别统计" in page.text
+    assert "源码基准 cccccccc" in page.text
+    assert _SOURCE_COMMIT_ID not in page.text
     assert "landing_view" not in page.text
     assert "first_app_ready" not in page.text
     assert '<progress' in page.text
     assert api.status_code == 200
     assert api.json()["reliability"]["appStart"]["estimatedEvents"] == 1
     assert len(api.json()["reliability"]["hourlyTrend"]) == 24
+    assert api.json()["reliability"]["byVersion"] == [
+        {
+            "appVersion": "1.2.3",
+            "sourceCommitId": None,
+            "estimatedEvents": 1,
+            "estimatedIssues": 1,
+            "issueRate": 1.0,
+        },
+        {
+            "appVersion": "1.2.3",
+            "sourceCommitId": _SOURCE_COMMIT_ID,
+            "estimatedEvents": 1,
+            "estimatedIssues": 0,
+            "issueRate": 0.0,
+        },
+    ]
     assert api.json()["legacyInstallation"]["installations"] == 1
     combined = page.text + api.text
     for forbidden in (

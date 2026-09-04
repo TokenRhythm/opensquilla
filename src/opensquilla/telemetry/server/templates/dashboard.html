@@ -103,6 +103,11 @@
       .bar-row { display: grid; grid-template-columns: minmax(108px,.8fr) minmax(120px,2fr) auto; align-items: center; gap: 12px; }
       .bar-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 700; }
       .bar-value { min-width: 42px; text-align: right; font: 700 12px "SFMono-Regular",Consolas,monospace; }
+      .version-panel { margin-top: 18px; padding: 24px 26px; }
+      .version-list .bar-row { grid-template-columns: minmax(220px,1fr) minmax(140px,2fr) minmax(210px,auto); }
+      .version-name { display: flex; min-width: 0; align-items: center; gap: 8px; }
+      .version-name > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .version-commit { flex: none; padding: 2px 7px; border: 1px solid #bed7df; border-radius: 99px; background: #f4fafb; color: var(--blue); font: 700 10px "SFMono-Regular",Consolas,monospace; }
       progress { width: 100%; height: 9px; overflow: hidden; border: 0; border-radius: 99px; background: #edf2f3; accent-color: var(--blue); }
       progress::-webkit-progress-bar { border-radius: 99px; background: #edf2f3; }
       progress::-webkit-progress-value { border-radius: 99px; background: var(--blue); }
@@ -142,8 +147,10 @@
         .evolution-step { border-right: 0; border-bottom: 1px solid var(--line); }
         .evolution-step:last-child { border-bottom: 0; }
         .evolution-step::after { top: auto; right: 22px; bottom: -13px; transform: rotate(90deg); }
-        .trend-side, .breakdown, .funnel, .coverage-panel { padding: 20px 15px; }
+        .trend-side, .breakdown, .funnel, .coverage-panel, .version-panel { padding: 20px 15px; }
         .bar-row { grid-template-columns: 92px minmax(90px,1fr) 38px; gap: 8px; }
+        .version-list .bar-row { grid-template-columns: 1fr; gap: 7px; }
+        .version-list .bar-value { text-align: left; }
         .section-title { align-items: start; flex-direction: column; gap: 4px; }
       }
     </style>
@@ -221,6 +228,12 @@
       {% set reliability_metrics = [('应用启动','客户端启动',summary.reliability.appStart),('网关启动','网关启动',summary.reliability.gatewayStart),('AI 对话','AI 对话',summary.reliability.turns),('工具调用','工具调用',summary.reliability.tools),('文件解析','文件解析',summary.reliability.fileParsing),('应用更新','应用更新',summary.reliability.updates)] %}
       <section class="health-grid">
         {% for label, description, metric in reliability_metrics %}<article class="health-card"><svg class="ring" viewBox="0 0 84 84" data-rate="{{ metric.successRate if metric.successRate is not none else 0 }}" aria-hidden="true"><circle class="ring-track" cx="42" cy="42" r="34" pathLength="100"></circle><circle class="ring-meter" cx="42" cy="42" r="34" pathLength="100"></circle></svg><div><h3>{{ label }}</h3><p class="rate-value">{{ percent(metric.successRate) }}</p><div class="health-meta"><span>{{ description }}</span><span>估算事件数：<strong>{{ metric.estimatedEvents }}</strong></span><span>P95 <strong>{{ metric.p95DurationMs if metric.p95DurationMs is not none else '—' }} 毫秒</strong></span></div></div></article>{% endfor %}
+      </section>
+
+      {% set version_max = summary.reliability.dailyTrend | sum(attribute='estimatedEvents') %}
+      <section class="panel version-panel" id="reliability-version-breakdown">
+        <div class="panel-head"><div><h2>版本稳定性</h2><p>按客户端版本和源码基准提交分别统计；源码安装显示完整提交号的前 8 位</p></div><p>{{ start_date }} → {{ end_date }}</p></div>
+        <div class="bar-list version-list">{% for item in summary.reliability.byVersion %}<div class="bar-row"><span class="bar-name version-name">{% if item.collapsedDimensions is defined %}<span>其他 {{ item.collapsedDimensions }} 个版本或提交</span>{% else %}<span>{{ item.appVersion if item.appVersion is not none else '未知版本' }}</span>{% if item.sourceCommitId %}<code class="version-commit">源码基准 {{ item.sourceCommitId[:8] }}</code>{% endif %}{% endif %}</span><progress max="{{ version_max if version_max else 1 }}" value="{{ item.estimatedEvents }}"></progress><span class="bar-value">{{ item.estimatedEvents }} 事件 · {{ item.estimatedIssues }} 问题 · 问题率 {{ percent(item.issueRate) }}</span></div>{% else %}<div class="empty">暂无版本稳定性数据</div>{% endfor %}</div>
       </section>
 
       <section class="breakdown-grid">

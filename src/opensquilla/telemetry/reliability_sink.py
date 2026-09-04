@@ -9,6 +9,7 @@ from typing import Protocol
 from uuid import UUID
 
 from opensquilla import __version__
+from opensquilla.telemetry.build_identity import reliability_app_version
 from opensquilla.telemetry.contracts import CURRENT_NOTICE_VERSION_BY_SCOPE
 from opensquilla.telemetry.contracts.common import (
     ConsentScope,
@@ -58,13 +59,18 @@ class ReliabilityEventSink:
         self,
         runtime: ScopedTelemetryRuntime,
         *,
-        app_version: str = __version__,
+        app_version: str | None = None,
         platform: Platform | None = None,
         app_session_id: UUID | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._runtime = runtime
-        self._app_version = app_version
+        # ``None`` means the running package itself, whose source provenance
+        # can be resolved safely.  Explicit versions belong to the caller and
+        # must remain byte-for-byte unchanged.
+        self._app_version = (
+            reliability_app_version(__version__) if app_version is None else app_version
+        )
         self._platform = platform or current_platform()
         self._app_session_id = app_session_id or new_app_session_id()
         self._clock = clock or (lambda: datetime.now(UTC))

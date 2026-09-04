@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID
 
+from opensquilla import __version__
 from opensquilla.telemetry.contracts.common import (
     ClientSurface,
     ExecutionMode,
@@ -108,6 +109,85 @@ def test_turn_facts_become_one_closed_contract_event() -> None:
             "surface",
             "execution_mode",
         }
+
+
+def test_default_app_version_includes_source_commit_for_runtime_events(monkeypatch) -> None:
+    runtime = CapturingRuntime()
+    commit_id = "0123456789abcdef0123456789abcdef01234567"
+    monkeypatch.setattr(
+        "opensquilla.telemetry.reliability_sink.reliability_app_version",
+        lambda version: f"{version}+source.{commit_id}",
+    )
+    sink = ReliabilityEventSink(
+        runtime,  # type: ignore[arg-type]
+        platform=Platform.LINUX,
+        app_session_id=UUID("00000000-0000-4000-8000-000000000900"),
+        clock=lambda: datetime(2026, 9, 2, 1, 2, 3, tzinfo=UTC),
+    )
+
+    sink.observe_turn(
+        TurnFacts(
+            outcome=ResultOutcome.SUCCESS,
+            error_code=None,
+            failure_stage=None,
+            duration_ms=10,
+            ttft_ms=2,
+            stall_count=0,
+        )
+    )
+    sink.observe_tool_call(
+        ToolFacts(
+            outcome=ToolOutcome.SUCCESS,
+            error_code=None,
+            duration_ms=5,
+            tool_category=ToolCategory.SHELL,
+            retry_count=0,
+        )
+    )
+    sink.observe_file_parse(
+        FileParseReliabilityFacts(
+            file_type=FileType.TEXT,
+            size_bucket=FileSizeBucket.LT_100_KIB,
+            outcome=ResultOutcome.SUCCESS,
+            error_code=None,
+            duration_ms=3,
+        )
+    )
+
+    assert len(runtime.events) == 3
+    assert {event.app_version for event in runtime.events} == {
+        f"{__version__}+source.{commit_id}"
+    }
+
+
+def test_explicit_app_version_is_not_rewritten_even_when_it_matches_package_version(
+    monkeypatch,
+) -> None:
+    runtime = CapturingRuntime()
+    monkeypatch.setattr(
+        "opensquilla.telemetry.reliability_sink.reliability_app_version",
+        lambda _version: "unexpected",
+    )
+    sink = ReliabilityEventSink(
+        runtime,  # type: ignore[arg-type]
+        app_version=__version__,
+        platform=Platform.LINUX,
+        app_session_id=UUID("00000000-0000-4000-8000-000000000900"),
+        clock=lambda: datetime(2026, 9, 2, 1, 2, 3, tzinfo=UTC),
+    )
+
+    sink.observe_turn(
+        TurnFacts(
+            outcome=ResultOutcome.SUCCESS,
+            error_code=None,
+            failure_stage=None,
+            duration_ms=10,
+            ttft_ms=2,
+            stall_count=0,
+        )
+    )
+
+    assert runtime.events[0].app_version == __version__
 
 
 def test_tool_facts_never_require_name_arguments_or_result_content() -> None:
