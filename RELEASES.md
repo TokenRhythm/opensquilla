@@ -49,7 +49,7 @@ must tell users to back up that directory. RC4 and later NSIS packages set
 `deleteAppDataOnUninstall=false`.
 
 Container tags follow a separate policy: each release publishes
-`ghcr.io/opensquilla/opensquilla:<git-tag>`, and Docker `:latest`
+`ghcr.io/tokenrhythm/opensquilla:<git-tag>`, and Docker `:latest`
 tracks the most recently pushed release tag, including previews and backports.
 If a backport moves `:latest`, rerun the container workflow from the newest tag
 to restore the intended ordering. The fixed release tag is the rollback and
@@ -101,11 +101,25 @@ without native update support refresh the passive Control UI notice through the
 local gateway. These long-running checks are included starting with RC4, so an
 already-installed Windows RC3 still requires a manual, in-place RC4 upgrade.
 
+The organization transfer keeps existing v1 update channels compatible with
+shipped 0.5.3 and 0.5.4 clients: their `releaseUrl` continues to use the legacy
+`https://github.com/opensquilla/opensquilla/releases/tag/<tag>` spelling.
+Current clients accept both official repository spellings; new GitHub release
+metadata comes from `TokenRhythm/opensquilla`. Keep the legacy v1 field even
+when new API and download links use TokenRhythm.
+
+Before publishing a final release after the transfer, both official 0.5.3 and
+0.5.4 baselines must pass the Draft upgrade audits on macOS and Windows.
+Pre-stage immutable assets for those audits, publish only after they pass, and
+advance the moving OSS channels last. An RC must be tested through an in-place
+installer replacement: installed stable builds cannot discover a prerelease as
+their next automatic update.
+
 README install commands must use tag-pinned URLs such as:
 
-- `https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-mac-arm64.dmg`
-- `https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-win-x64.exe`
-- `https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl`
+- `https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-mac-arm64.dmg`
+- `https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-win-x64.exe`
+- `https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl`
 
 ## Release SOP
 
@@ -143,17 +157,17 @@ README install commands must use tag-pinned URLs such as:
    must not contain `OpenSquilla-*-portable.zip` or
    `OpenSquilla-windows-x64-portable.zip`.
 9. Verify GHCR before publishing broadly. For the first container release, make
-   the newly created `ghcr.io/opensquilla/opensquilla` package public, then
+   the newly created `ghcr.io/tokenrhythm/opensquilla` package public, then
    confirm both `v0.5.4` and `latest` resolve to an amd64/arm64 manifest and
    pass a gateway health smoke test.
 10. Publish the GitHub Release only after maintainer confirmation, then run the
    post-publish tag URL checks:
 
    ```sh
-   curl --fail --head --location https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-mac-arm64.dmg
-   curl --fail --head --location https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-win-x64.exe
-   curl --fail --head --location https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl
-   curl --fail --head --location https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/SHA256SUMS
+   curl --fail --head --location https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-mac-arm64.dmg
+   curl --fail --head --location https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-win-x64.exe
+   curl --fail --head --location https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl
+   curl --fail --head --location https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/SHA256SUMS
    ```
 
 11. If a release tag is wrong before publication, stop and report its peeled

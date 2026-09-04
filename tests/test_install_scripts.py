@@ -428,3 +428,46 @@ def test_install_scripts_both_locate_entry_point_by_absolute_path() -> None:
     ps1 = SOURCE_PS1.read_text(encoding="utf-8")
     assert "uv tool dir --bin" in sh
     assert "uv tool dir --bin" in ps1
+
+
+@pytest.mark.parametrize("shell", ["bash", "powershell"])
+@pytest.mark.parametrize("repository", [None, "opensquilla/opensquilla", "example/custom-runtime"])
+def test_release_installer_repository_defaults_and_overrides(
+    shell: str,
+    repository: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if shell == "bash":
+        if sys.platform.startswith("win"):
+            pytest.skip("Bash release installer targets Linux and macOS")
+        executable = shutil.which("bash")
+        arguments = [str(RELEASE_SH), "--version", CURRENT_RELEASE_TAG, "--profile", "core"]
+    else:
+        executable = shutil.which("pwsh") or shutil.which("powershell")
+        arguments = [
+            "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(RELEASE_PS1),
+            "-Version", CURRENT_RELEASE_TAG, "-Profile", "core",
+        ]
+    if executable is None:
+        pytest.skip(f"{shell} is not installed")
+
+    monkeypatch.setenv("OPENSQUILLA_INSTALL_DRY_RUN", "1")
+    monkeypatch.delenv("OPENSQUILLA_INSTALL_EXTRAS", raising=False)
+    if repository is None:
+        monkeypatch.delenv("OPENSQUILLA_REPOSITORY", raising=False)
+    else:
+        monkeypatch.setenv("OPENSQUILLA_REPOSITORY", repository)
+
+    result = subprocess.run(
+        [executable, *arguments], cwd=tmp_path, capture_output=True, text=True, check=False,
+    )
+
+    expected_repository = repository or "TokenRhythm/opensquilla"
+    release_version = CURRENT_RELEASE_TAG.removeprefix("v")
+    assert result.returncode == 0, result.stderr
+    assert "dry-run" in result.stdout
+    assert (
+        f"https://github.com/{expected_repository}/releases/download/{CURRENT_RELEASE_TAG}/"
+        f"opensquilla-{release_version}-py3-none-any.whl"
+    ) in result.stdout

@@ -54,6 +54,41 @@ class PaginatedGitHubClient:
         return self.pages.pop(0)
 
 
+def test_migrated_repository_resolves_its_historical_issue_references() -> None:
+    sync = _load_sync_module()
+    parsed = sync.parse_linked_issues(
+        "\n".join(
+            [
+                "Fixes opensquilla/opensquilla#100",
+                "Closes TokenRhythm/opensquilla#100",
+                "Fixes #100",
+                "Resolves https://github.com/OpenSquilla/OpenSquilla/issues/101",
+                "Refs https://github.com/TokenRhythm/opensquilla/issues/102",
+                "Refs opensquilla/opensquilla#103",
+                "Fixes unrelated/opensquilla#999",
+                "Fixes opensquilla/runtime-packs#998",
+                "Fixes TokenRhythm/runtime-packs#997",
+            ]
+        ),
+        owner="TokenRhythm",
+        repo="opensquilla",
+    )
+    assert parsed.closing == (100, 101)
+    assert parsed.references == (102, 103)
+
+
+def test_repository_alias_is_not_applied_to_forks_or_companion_repositories() -> None:
+    sync = _load_sync_module()
+    for owner, repo in (("unrelated", "opensquilla"), ("TokenRhythm", "runtime-packs")):
+        parsed = sync.parse_linked_issues(
+            "Fixes opensquilla/opensquilla#100\nRefs opensquilla/runtime-packs#101\nFixes #102",
+            owner=owner,
+            repo=repo,
+        )
+        assert parsed.closing == (102,)
+        assert parsed.references == ()
+
+
 def test_parse_linked_issues_splits_closing_and_reference_keywords() -> None:
     sync = _load_sync_module()
 

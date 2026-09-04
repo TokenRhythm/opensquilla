@@ -24,7 +24,7 @@ internals unless the detail is needed to help users operate the product.
 the pencil edit flow to propose a change. Contributors without repository
 write access will submit this through a fork and pull request.
 2. If you are not sure of the fix, open a
-   [documentation issue](https://github.com/opensquilla/opensquilla/issues/new?template=docs_report.yml)
+   [documentation issue](https://github.com/TokenRhythm/opensquilla/issues/new?template=docs_report.yml)
    with the affected page and expected outcome.
 3. Open documentation pull requests against `main`.
 4. Keep docs changes small and topic-focused.
@@ -66,4 +66,4 @@ artifacts should not be merged into one broad mechanism page.
 
 ---
 
-[Docs index](README.md) · [Product guide](../README.product.md) · [Report a docs issue](https://github.com/opensquilla/opensquilla/issues/new?template=docs_report.yml) · [Contributing](../CONTRIBUTING.md)
+[Docs index](README.md) · [Product guide](../README.product.md) · [Report a docs issue](https://github.com/TokenRhythm/opensquilla/issues/new?template=docs_report.yml) · [Contributing](../CONTRIBUTING.md)

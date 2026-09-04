@@ -20,7 +20,7 @@ from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 import httpx
 from bs4 import BeautifulSoup
 
-USER_AGENT = "OpenSquilla-multi-search-engine/0.2 (+https://github.com/opensquilla/opensquilla)"
+USER_AGENT = "OpenSquilla-multi-search-engine/0.2 (+https://github.com/TokenRhythm/opensquilla)"
 TIMEOUT_S = 8.0
 MAX_ATTEMPTS = 3
 _RETRY_STATUS_CODES = {429, *range(500, 600)}

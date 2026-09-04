@@ -29,7 +29,7 @@ Python, no Git, no build tools.
 ## Quick Start with the Prebuilt Image
 
 Prebuilt multi-arch images are published to
-[`ghcr.io/opensquilla/opensquilla`](https://github.com/opensquilla/opensquilla/pkgs/container/opensquilla)
+[`ghcr.io/tokenrhythm/opensquilla`](https://github.com/TokenRhythm/opensquilla/pkgs/container/opensquilla)
 for each release tag. The immutable `v0.5.4` tag identifies the 0.5.4 stable release, while
 `latest` follows the most recently pushed release tag, including previews and
 backports. If a backport moves `latest`, the newest release workflow is rerun to
@@ -46,7 +46,7 @@ Create a directory for the deployment and write this `compose.yaml`:
 services:
   gateway:
     # Pin v0.5.4 for reproducibility; latest follows the most recent tag push.
-    image: ghcr.io/opensquilla/opensquilla:v0.5.4
+    image: ghcr.io/tokenrhythm/opensquilla:v0.5.4
     environment:
       # In-container bind. Keep it 0.0.0.0 — what the network can reach is
       # decided by `ports` below, not by this value.
@@ -218,6 +218,11 @@ docker compose exec gateway opensquilla gateway status
 
 ## Upgrade and Roll Back
 
+For deployments created before the repository moved to TokenRhythm, update
+`image:` (or `OPENSQUILLA_GATEWAY_IMAGE`) to
+`ghcr.io/tokenrhythm/opensquilla:<tag>` before pulling. Keep the same Compose
+project and state volume so the replacement container uses your existing data.
+
 State lives in the volume, so containers are disposable:
 
 ```sh
@@ -237,7 +242,7 @@ defaults to a self-built `opensquilla:local` image (override with
 
 ```sh
 sudo apt install -y git git-lfs
-git clone https://github.com/opensquilla/opensquilla.git
+git clone https://github.com/TokenRhythm/opensquilla.git
 cd opensquilla
 git lfs pull --include="src/opensquilla/squilla_router/models/**"
 docker build -t opensquilla:local .
@@ -265,4 +270,4 @@ and keep source builds for development machines.
 
 ---
 
-[Docs index](README.md) · [Product guide](../README.product.md) · [Improve this page](contributing-docs.md) · [Report a docs issue](https://github.com/opensquilla/opensquilla/issues/new?template=docs_report.yml)
+[Docs index](README.md) · [Product guide](../README.product.md) · [Improve this page](contributing-docs.md) · [Report a docs issue](https://github.com/TokenRhythm/opensquilla/issues/new?template=docs_report.yml)
