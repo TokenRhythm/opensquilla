@@ -44,7 +44,10 @@ import { SETTINGS_SECTIONS, type SettingsSectionId } from '@/composables/setup/s
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 import { useToasts } from '@/composables/useToasts'
 import { useConfirm } from '@/composables/useConfirm'
-import { saveFailedMessage } from '@/lib/rpcErrors'
+import {
+  isSetupCapabilityUnsupported,
+  setupSaveFailedMessage as saveFailedMessage,
+} from '@/utils/setupErrorPresentation'
 import { copyTextWithFallback } from '@/utils/browser'
 import { TEXT_TIERS, normalizeRouterTier, routerTierLabelKey } from '@/utils/chat/routerTiers'
 import { APP_SETTINGS_KEY, type AppSettings, type SettingsValue } from '@/modules/appSettings'
@@ -2472,7 +2475,7 @@ function providerRpcErrorMessage(err: unknown): string {
 }
 
 function isRpcMethodUnavailableError(err: unknown): boolean {
-  return /method.*not found|unknown method|not registered/i.test(saveFailedMessage(err))
+  return isSetupCapabilityUnsupported(err)
 }
 
 function representativeProviderModel(providerId: string): string {

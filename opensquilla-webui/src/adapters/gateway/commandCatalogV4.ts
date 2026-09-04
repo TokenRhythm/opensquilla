@@ -1,4 +1,4 @@
-import type { RpcCallOptions } from '@/lib/rpc'
+import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import {
   COMMANDS_LIST_FOR_SURFACE_METHOD,
   type Params as CommandCatalogParams,

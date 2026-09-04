@@ -24,7 +24,6 @@ import { SETUP_WORKFLOW_KEY } from './modules/setupWorkflow'
 import { MIGRATION_OPERATIONS_KEY } from './modules/migrationOperations'
 import { WORKSPACE_CATALOG_KEY } from './modules/workspaceCatalog'
 import { SANDBOX_RUNTIME_KEY } from './modules/sandboxRuntime'
-import { SESSION_CONVERSATION_KEY } from './modules/sessionConversation'
 import { USAGE_REPORTING_KEY } from './modules/usageReporting'
 import { COMMAND_CATALOG_KEY } from './modules/commandCatalog'
 import { ROUTE_FEEDBACK_KEY } from './modules/routeFeedback'
@@ -105,7 +104,6 @@ app.provide(SETUP_WORKFLOW_KEY, gatewayAdapters.setupWorkflow)
 app.provide(MIGRATION_OPERATIONS_KEY, gatewayAdapters.migrationOperations)
 app.provide(WORKSPACE_CATALOG_KEY, gatewayAdapters.workspaceCatalog)
 app.provide(SANDBOX_RUNTIME_KEY, gatewayAdapters.sandboxRuntime)
-app.provide(SESSION_CONVERSATION_KEY, gatewayAdapters.sessionConversation)
 app.provide(USAGE_REPORTING_KEY, gatewayAdapters.usageReporting)
 app.provide(COMMAND_CATALOG_KEY, gatewayAdapters.commandCatalog)
 app.provide(ROUTE_FEEDBACK_KEY, gatewayAdapters.routeFeedback)

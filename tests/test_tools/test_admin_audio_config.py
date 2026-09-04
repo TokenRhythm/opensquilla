@@ -150,3 +150,32 @@ async def test_requires_a_wired_gateway_config() -> None:
     admin_mod.set_gateway_config(None)
     with pytest.raises(ToolError):
         await audio_config_tool(provider="elevenlabs", api_key=SECRET)
+
+
+@pytest.mark.asyncio
+async def test_persist_failure_does_not_install_or_hot_apply(
+    live_config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg, target = live_config
+    hot_applied: list[object] = []
+
+    def fail_persist(*_args, **_kwargs):
+        raise OSError("synthetic disk failure")
+
+    monkeypatch.setattr(
+        "opensquilla.onboarding.config_store.persist_config",
+        fail_persist,
+    )
+    monkeypatch.setattr(
+        media_mod,
+        "configure_audio",
+        lambda audio_cfg: hot_applied.append(audio_cfg),
+    )
+
+    with pytest.raises(OSError, match="synthetic disk failure"):
+        await audio_config_tool(provider="elevenlabs", api_key=SECRET)
+
+    assert cfg.audio.enabled is False
+    assert hot_applied == []
+    assert not target.exists()

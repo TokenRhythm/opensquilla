@@ -1,0 +1,1470 @@
+{
+  "events": [
+    {
+      "delivery": "live-only-best-effort",
+      "family": "approval.events",
+      "schema": "approvals/approval-events.schema.json",
+      "schemaSha256": "2a037d7a1039a08b68b4fc5eb2ded7d85053b52ab985c7763acef8b8aa4e1f1f",
+      "schemaVersion": 1,
+      "wireNames": [
+        "exec.approval.requested",
+        "exec.approval.updated",
+        "exec.approval.resolved",
+        "plugin.approval.requested",
+        "plugin.approval.updated",
+        "plugin.approval.resolved"
+      ]
+    },
+    {
+      "delivery": "live-only-best-effort",
+      "family": "channel.status",
+      "schema": "channels/channel-status-event.schema.json",
+      "schemaSha256": "a48ff171944852c30bdc89e242c2ad46e4289481270a006f86cddc802ab4ba5b",
+      "schemaVersion": 1,
+      "wireNames": [
+        "channel.status"
+      ]
+    },
+    {
+      "delivery": "live-only-best-effort",
+      "family": "conversation.events",
+      "schema": "conversation/conversation-events.schema.json",
+      "schemaSha256": "3a853963ea7b33c87edef960338dd1e181f6e5140a49762a9e345fea8b6bc37c",
+      "schemaVersion": 1,
+      "wireNames": [
+        "chat.done",
+        "session.epoch_changed",
+        "session.event.answer_generation_reset",
+        "session.event.approval_required",
+        "session.event.artifact",
+        "session.event.artifact_state",
+        "session.event.collaboration_mode",
+        "session.event.compaction",
+        "session.event.cron_result",
+        "session.event.done",
+        "session.event.ensemble_progress",
+        "session.event.error",
+        "session.event.goal",
+        "session.event.goal_run",
+        "session.event.input_disposition",
+        "session.event.meta_preflight",
+        "session.event.meta_run_announced",
+        "session.event.meta_run_completed",
+        "session.event.meta_step_state",
+        "session.event.plan_revision",
+        "session.event.plan_run",
+        "session.event.provider_activity",
+        "session.event.router_control_replay",
+        "session.event.router_decision",
+        "session.event.run_heartbeat",
+        "session.event.state_change",
+        "session.event.steer",
+        "session.event.subagent_completion",
+        "session.event.task_group.done",
+        "session.event.task_group.failed",
+        "session.event.task_group.synthesizing",
+        "session.event.task_group.waiting",
+        "session.event.text_delta",
+        "session.event.thinking",
+        "session.event.thinking_end",
+        "session.event.thinking_start",
+        "session.event.tool_result",
+        "session.event.tool_use_delta",
+        "session.event.tool_use_end",
+        "session.event.tool_use_start",
+        "session.event.turn_committed",
+        "session.event.warning",
+        "task.abandoned",
+        "task.cancelled",
+        "task.failed",
+        "task.queued",
+        "task.running",
+        "task.succeeded",
+        "task.timeout"
+      ]
+    },
+    {
+      "delivery": "live-only-best-effort",
+      "family": "cron.run.finished",
+      "schema": "cron/cron-run-finished-event.schema.json",
+      "schemaSha256": "c2ae9854fd9b0e198e15c30a922415d41711afde21ecddd7b7c65c7d7be72354",
+      "schemaVersion": 1,
+      "wireNames": [
+        "cron.run.finished"
+      ]
+    },
+    {
+      "delivery": "live-only-best-effort",
+      "family": "document.state_changed",
+      "schema": "workbench/artifact-document-changed-event.schema.json",
+      "schemaSha256": "102a9083c7c83038d4103f3036848d5418ff2eb4121bde88024852c791b34f96",
+      "schemaVersion": 1,
+      "wireNames": [
+        "document.state_changed",
+        "session.event.artifact_state"
+      ]
+    },
+    {
+      "delivery": "live-only-best-effort",
+      "family": "models.routing.changed",
+      "schema": "platform/models-routing-changed-event.schema.json",
+      "schemaSha256": "6192662b072656af02d79feaa6d7a1c5fbf791949e68605286e8ce8e9306bb87",
+      "schemaVersion": 1,
+      "wireNames": [
+        "models.routing.changed"
+      ]
+    },
+    {
+      "delivery": "live-only-best-effort",
+      "family": "sandbox.run_mode.preference.changed",
+      "schema": "sandbox/sandbox-run-mode-preference-changed.schema.json",
+      "schemaSha256": "dd9aa3cd5fbb35ba2e4ca5c20b4cab57f161e3209b8ab82f2d65ba4a9d1ef462",
+      "schemaVersion": 1,
+      "wireNames": [
+        "sandbox.run_mode.preference.changed"
+      ]
+    },
+    {
+      "delivery": "live-only-best-effort",
+      "family": "sessions.changed",
+      "schema": "sessions/sessions-changed.schema.json",
+      "schemaSha256": "3d2c50338a2dbdca1b618350ad8697a105893a6f9e4779bec06c7b679b607f5e",
+      "schemaVersion": 1,
+      "wireNames": [
+        "sessions.changed"
+      ]
+    },
+    {
+      "delivery": "live-only-best-effort",
+      "family": "sessions.routing.changed",
+      "schema": "sessions/sessions-routing-changed.schema.json",
+      "schemaSha256": "7693f117cc094803f34b3097518f1bf5c3eefcc5683277294ff1624adb9c4bda",
+      "schemaVersion": 1,
+      "wireNames": [
+        "sessions.routing.changed"
+      ]
+    }
+  ],
+  "format": 1,
+  "methods": [
+    {
+      "lifecycle": "stable",
+      "name": "agents.create",
+      "schema": "agents/agents-create.schema.json",
+      "schemaSha256": "fae9c1cf9c71e11b28abf3684abd4e992486f42d0b09f215aedc79f3da8de03d"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "agents.delete",
+      "schema": "agents/agents-delete.schema.json",
+      "schemaSha256": "0a86d61cd7895d14bdf964ee9a800992c2a106dfccc996f2583f784e538dd559"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "agents.list",
+      "schema": "agents/agents-list.schema.json",
+      "schemaSha256": "ae45bdd852da8354ac077ec185185b09337d0c02a4ea4e431656190ba9ff8623"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "agents.update",
+      "schema": "agents/agents-update.schema.json",
+      "schemaSha256": "72ccd86e22f150789a5578b16315815370c1a00546a6fc5284a5c475ce6d0bef"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "artifacts.changes.get",
+      "schema": "workbench/artifacts-changes-get.schema.json",
+      "schemaSha256": "75d9f78d614872d498a26308da24a9ef95c30f4ad41e75d2ba16a3becf0ff7e3"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "artifacts.changes.list",
+      "schema": "workbench/artifacts-changes-list.schema.json",
+      "schemaSha256": "fdde6500f924b847826f89858602788be91354e83245581c1949622bb7a86404"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "artifacts.changes.revert",
+      "schema": "workbench/artifacts-changes-revert.schema.json",
+      "schemaSha256": "aee2886e9574a71ca8d3cd7224ed22aa7e0392f8260615b6df116cb5caa8462f"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "artifacts.documents.close",
+      "schema": "workbench/artifacts-documents-close.schema.json",
+      "schemaSha256": "c160ac8d0c305dbfd7b48819c7384855906fbcd0d96d6670ed127e9d1430bbc7"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "artifacts.documents.get",
+      "schema": "workbench/artifacts-documents-get.schema.json",
+      "schemaSha256": "87fe1fedc6a8f6e8b612ce6e0abe1ecafd2ced96f008bb3481f5830250371e47"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "artifacts.documents.list",
+      "schema": "workbench/artifacts-documents-list.schema.json",
+      "schemaSha256": "ea23fa541d2075b76aca41eab6e04f1c3d5f87747a6e398146c4bd8ee65d192c"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "artifacts.documents.open",
+      "schema": "workbench/artifacts-documents-open.schema.json",
+      "schemaSha256": "4972660afdb16e6bd0f33f1af058575b0705e7cf93dc68a5f0e79ef63341e64c"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "artifacts.documents.rename",
+      "schema": "workbench/artifacts-documents-rename.schema.json",
+      "schemaSha256": "daa88e1159d196b517d243a102c0f3265a14e6181e8f8049fe368d785ab6dd84"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "artifacts.edit.capabilities",
+      "schema": "workbench/artifacts-edit-capabilities.schema.json",
+      "schemaSha256": "01b6393e7d95215a357ff1a241343f6d39c8e2e807f2c9e8041ea08fe3ec029d"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "artifacts.get",
+      "schema": "workbench/artifacts-get.schema.json",
+      "schemaSha256": "02d8dfd32bf3f970fbcc66e1f986cc08587825518cc6d84ac2348a66bf9fbbec"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "artifacts.list",
+      "schema": "workbench/artifacts-list.schema.json",
+      "schemaSha256": "4ceba19e23d2f4a87548a61dbf52b5ed58f4fd9f203ea86bb1ded2b90d3274b2"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "artifacts.mutations.resolve",
+      "schema": "workbench/artifacts-mutations-resolve.schema.json",
+      "schemaSha256": "29574ff5871897ffc3090080790ef5726d5c01d69bef97813bbea46249280088"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "artifacts.prompt_annotations.create",
+      "schema": "workbench/artifacts-prompt-annotations-create.schema.json",
+      "schemaSha256": "31ddc88ed95a86369645860a767ec17aa07074a5a46744ef1febee66c6b51784"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "artifacts.prompt_annotations.discard",
+      "schema": "workbench/artifacts-prompt-annotations-discard.schema.json",
+      "schemaSha256": "bcea0a06c1171b6671a28bee82369141ea890d504f25e2b40377585b928b4d58"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "artifacts.prompt_annotations.focus",
+      "schema": "workbench/artifacts-prompt-annotations-focus.schema.json",
+      "schemaSha256": "943dab2a1546c02b8b20c3a76805441b3a352b2f42508d0ff770f13b7f1a6890"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "artifacts.prompt_annotations.list",
+      "schema": "workbench/artifacts-prompt-annotations-list.schema.json",
+      "schemaSha256": "f199f2c488228a52879d1eb135e0afdd98573c875e0ad8186fca8c0c1b8fdee0"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "artifacts.prompt_annotations.update",
+      "schema": "workbench/artifacts-prompt-annotations-update.schema.json",
+      "schemaSha256": "24fdd283e2de59bfcb7594d60f747778453fe575fdaf8a79ec697274ab362f07"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "artifacts.revisions.list",
+      "schema": "workbench/artifacts-revisions-list.schema.json",
+      "schemaSha256": "52685bf7b69f09f698693799a11e7ac1848858043f9a515038f56726e4da296c"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "artifacts.revisions.restore",
+      "schema": "workbench/artifacts-revisions-restore.schema.json",
+      "schemaSha256": "66ce079b166a1d5e6925e090abaa32aabc4bd547f3ad1284e22cb211f7f30cd6"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "artifacts.source.patch",
+      "schema": "workbench/artifacts-source-patch.schema.json",
+      "schemaSha256": "3471d7d026d648ee6012450e5f27dee19c0994b0a5900b5e816d8ec634948134"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "artifacts.source.read",
+      "schema": "workbench/artifacts-source-read.schema.json",
+      "schemaSha256": "3be343245ca8797d5397af3f3b7a16405e772ff9787d1a260c3572bc098cbb60"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "channels.admin.set",
+      "schema": "channels/channels-admin-set.schema.json",
+      "schemaSha256": "26393ba759ad77feb31af2cc2d3829586892373ab00cadb37c265756b75feb1f"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "channels.get",
+      "schema": "channels/channels-get.schema.json",
+      "schemaSha256": "ca967d1b85c284ca930b106e6198c5dfef20ab67a1164742a58b7fd63cd8f16c"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "channels.logout",
+      "schema": "channels/channels-logout.schema.json",
+      "schemaSha256": "295a6eda240cdc7eddc0d49c7574430a8f7539fce16ef909950a7c1821bdab11"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "channels.pairing.approve",
+      "schema": "channels/channels-pairing-approve.schema.json",
+      "schemaSha256": "ea4d717bd54c4af36a7b64d7c62d89d3d6df4cf8eafbd5bdc1436e844a0bcf78"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "channels.pairing.revoke",
+      "schema": "channels/channels-pairing-revoke.schema.json",
+      "schemaSha256": "b44529ba250e210b7787bb1fe0333dfe2d17066e941d29d32530abbadbb85c7b"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "channels.pairings",
+      "schema": "channels/channels-pairings.schema.json",
+      "schemaSha256": "53edb61ca3a3e19367ff38086765897291fcd47e8d77d33882482af335f7060b"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "channels.probe",
+      "schema": "channels/channels-probe.schema.json",
+      "schemaSha256": "c73c806a7b274fda84250dce0c15c1d3e919480bae02e461a8a61d3a281e6bcd"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "channels.restart",
+      "schema": "channels/channels-restart.schema.json",
+      "schemaSha256": "2ca3aeaa0fd5ab39de705330acc37d9577b5a94b30e001e4053a509ec607f4c6"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "channels.status",
+      "schema": "channels/channels-status.schema.json",
+      "schemaSha256": "5a86a03a7bbe6830692ab1405ac95c8604a6f87727f63a62bc4c773a40d8eefe"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "chat.abort",
+      "schema": "conversation/chat-abort.schema.json",
+      "schemaSha256": "a4042faba44ecc2f0efbe1b6df140ec6297b093856bb174814871bac62d62e7c"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "chat.clarify_submit",
+      "schema": "conversation/chat-clarify-submit.schema.json",
+      "schemaSha256": "58ec833adc647ea6877ca3e708f4a3e62be0de7a6d4521fdd78144452b8abc62"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "chat.history",
+      "schema": "conversation/chat-history.schema.json",
+      "schemaSha256": "6661f0685e8196504534e01705197c55d484e979cf19de7789463b5891c06fac"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "chat.send",
+      "schema": "conversation/chat-send.schema.json",
+      "schemaSha256": "ee0da1e5d87a98bcd4c73cffc666b71f76f9d0500fb50f245ad251f549a47a17"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "commands.list_for_surface",
+      "schema": "conversation/commands-list-for-surface.schema.json",
+      "schemaSha256": "563d06855ab412a812d75223cb0e0980768f6199eae85fb65bd952e815bd85b8"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "config.effective",
+      "schema": "platform/config-effective.schema.json",
+      "schemaSha256": "12b2d1131e1904f190dde8cb468b92b13436c412f4f382da8e13197cefb50bce"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "config.get",
+      "schema": "platform/config-get.schema.json",
+      "schemaSha256": "bc14f47aae0654c6736b9473de6f03b0d31d52b4c903861eb3e691c972b497b4"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "config.patch",
+      "schema": "platform/config-patch.schema.json",
+      "schemaSha256": "a41e9e9f715642fb55191e807e719fc1516ba312ecf3b13d99146197f3d8549d"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "config.patch.safe",
+      "schema": "platform/config-patch-safe.schema.json",
+      "schemaSha256": "f638fc27348411265f12995eb8642212f9e01b052d2a1f68cc190f5e85119f6c"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "cron.add",
+      "schema": "cron/cron-add.schema.json",
+      "schemaSha256": "423cfc15f92aae668792c87c924343a0845737cb19e0eedca42ac3f2ead066c6"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "cron.create",
+      "schema": "cron/cron-create.schema.json",
+      "schemaSha256": "0083741c9f6b18c9596847431afa6ef9fa39b41ef64f4f603eb5223c6a6b9eea"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "cron.list",
+      "schema": "cron/cron-list.schema.json",
+      "schemaSha256": "d46997c5221e73b317366cbc49546c0743e87c8bbf28e6152036a1bebc0304da"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "cron.remove",
+      "schema": "cron/cron-remove.schema.json",
+      "schemaSha256": "4cb6082c9a279d381a50b5e0d0e4ef59e50fc0b4fea42aea246ff267792b7592"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "cron.run",
+      "schema": "cron/cron-run.schema.json",
+      "schemaSha256": "c10aab660fe1355f9921851ef225e1fad9aa9c307a1f23774f9581f45fecca06"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "cron.runs",
+      "schema": "cron/cron-runs.schema.json",
+      "schemaSha256": "b5c4cf6bb6750baf01b4ad30089b0dd03ab6e4ce988a8022745da977dbabc368"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "cron.status",
+      "schema": "cron/cron-status.schema.json",
+      "schemaSha256": "931902d0b1960978a615ea5d1da60515dcc855d231c3553ff0e1de3661b8fc30"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "cron.subscribe",
+      "schema": "cron/cron-subscribe.schema.json",
+      "schemaSha256": "66cba3ffe5f07179a92efd9ecaac2ea7aa2fa1de45ddcdf005e25bf9d70999b6"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "cron.unsubscribe",
+      "schema": "cron/cron-unsubscribe.schema.json",
+      "schemaSha256": "4852c3e4c5881e3d3255acdc84dd439e596b735cdeb67f18fa42e18dc73b1321"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "cron.update",
+      "schema": "cron/cron-update.schema.json",
+      "schemaSha256": "c854836618d52e15f5b5052c3b0e2f6100d21841cbd72b8c195ac93dc0e578ce"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "doctor.status",
+      "schema": "observability/doctor-status.schema.json",
+      "schemaSha256": "6250105e7ea721bd3b1f6b22d42497c078321fc15114518be136b7699a7d0535"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "documents.editSessions.close",
+      "schema": "workbench/documents-edit-sessions-close.schema.json",
+      "schemaSha256": "3259b4e550e1e01e685bbad6d0547dd07f7b6688813c56627df2080185571f9d"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "documents.editSessions.heartbeat",
+      "schema": "workbench/documents-edit-sessions-heartbeat.schema.json",
+      "schemaSha256": "c0fddc8a1ea601c0d9cce64f26d370b557b59865a2ab73a52782e699a257112a"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "documents.editSessions.start",
+      "schema": "workbench/documents-edit-sessions-start.schema.json",
+      "schemaSha256": "0caf70c3626b0544f643d05e26a179aff3ab3f02a14c312c5a1ddbfe489c7596"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "documents.import",
+      "schema": "workbench/documents-import.schema.json",
+      "schemaSha256": "fe4e605ef1bb893455cc98ce23a1738edb56555cb5a65d6406cb87d8d6b72795"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "documents.publish",
+      "schema": "workbench/documents-publish.schema.json",
+      "schemaSha256": "2bf4f8c077cd13b11f9321fb2d9754c98e912cd9969b858b6fa6e3738b81aafc"
+    },
+    {
+      "compatibilityAliases": [
+        "plugin.approval.extend"
+      ],
+      "lifecycle": "stable",
+      "name": "exec.approval.extend",
+      "schema": "approvals/approval-extend.schema.json",
+      "schemaSha256": "07db8e0517f963a9ea9c6f2c0ee29b97d03eeb7327ba3e9503dc9b1c62d326af"
+    },
+    {
+      "compatibilityAliases": [
+        "plugin.approval.resolve"
+      ],
+      "lifecycle": "stable",
+      "name": "exec.approval.resolve",
+      "schema": "approvals/approval-resolve.schema.json",
+      "schemaSha256": "e1b1bbf2900a284caff16a8bf5df7668f858f317b9c29f904ed372ae839c36a8"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "exec.approval.snapshot",
+      "schema": "approvals/approval-snapshot.schema.json",
+      "schemaSha256": "55918aa6eb107af7aa3cc457922be55b0ca3f158b6cdb124ab145ef746e06e12"
+    },
+    {
+      "compatibilityAliases": [
+        "plugin.approval.status"
+      ],
+      "lifecycle": "stable",
+      "name": "exec.approval.status",
+      "schema": "approvals/approval-status.schema.json",
+      "schemaSha256": "dbb1d884eec2ffe8328788589863c7857a5689652aab153b6adf099898c8bde3"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "exec.proposals.accept",
+      "schema": "skills/exec-proposals-accept.schema.json",
+      "schemaSha256": "2a2f83bf2c9dd2805d549bbce2c3d33738ae16dcebbaf67338a9da3ec5114102"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "exec.proposals.auto_enabled.disable",
+      "schema": "skills/exec-proposals-auto-enabled-disable.schema.json",
+      "schemaSha256": "d288fc97698ed0db4f6b5cf74ac0df67bd2b99c07457b090e16e7fc87878e686"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "exec.proposals.auto_enabled.list",
+      "schema": "skills/exec-proposals-auto-enabled-list.schema.json",
+      "schemaSha256": "5b16a3b74e5a344b5707bae6fa6b8d58d6850a6ef636132cb741a169b63466f8"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "exec.proposals.list",
+      "schema": "skills/exec-proposals-list.schema.json",
+      "schemaSha256": "a302e330f99f5b65cdb64eaaef5fee4680d22db6d1d192f3b7b7b40b027373f2"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "exec.proposals.reject",
+      "schema": "skills/exec-proposals-reject.schema.json",
+      "schemaSha256": "2c99d204c5e7b8ac9fd24eccd5abcde51a0ade9aca6608bc6d2a295c1a6cd991"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "exec.proposals.settings.get",
+      "schema": "skills/exec-proposals-settings-get.schema.json",
+      "schemaSha256": "2f398e60657f42448dbc378502f18df3c45046a0b6f4e501c1539fb575e0bf33"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "exec.proposals.settings.set",
+      "schema": "skills/exec-proposals-settings-set.schema.json",
+      "schemaSha256": "df2e9d9830f222e4bc91c18e0508bb530e68c3e45ccf71725dac56dd8f45ea59"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "exec.proposals.show",
+      "schema": "skills/exec-proposals-show.schema.json",
+      "schemaSha256": "eca810b9e3383db222a84c69204b8ef1c9e2b9ef43b63282a1bf0e62667b7ed9"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "goals.capabilities",
+      "schema": "goals/goals-capabilities.schema.json",
+      "schemaSha256": "af06932edad864a22dbdd3f30bac3f6f5379121092d947f4d1b1bc4190cc6bb1"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "goals.clear",
+      "schema": "goals/goals-clear.schema.json",
+      "schemaSha256": "93573115f350051a9da06228b8053bba211a93d5fa5d859aa52440b0d38a74f7"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "goals.edit",
+      "schema": "goals/goals-edit.schema.json",
+      "schemaSha256": "5d613b7aba7558ba2f974ab84363b46d6493b93128e8aa8cc8750839dc429655"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "goals.pause",
+      "schema": "goals/goals-pause.schema.json",
+      "schemaSha256": "a9e03ca9d6359d5de91ae473b7edd4effa44301276252f42b046e34ca538f40d"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "goals.reattach",
+      "schema": "goals/goals-reattach.schema.json",
+      "schemaSha256": "a1e95d8b99a2bcc2e3986a6f6a464a8020c9ef9f58fb4d7efe2fc0d3b4ef0d27"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "goals.resume",
+      "schema": "goals/goals-resume.schema.json",
+      "schemaSha256": "4ba4f28a6dd18fa3db8f6c1d794cf0468a15c9e0e900f9b2a8c55562642132a8"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "goals.set",
+      "schema": "goals/goals-set.schema.json",
+      "schemaSha256": "d90e7a12aa6d31fda9c38736b9ab8da7837e20c2b4ac2836c8cf2436a8a389e9"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "goals.status",
+      "schema": "goals/goals-status.schema.json",
+      "schemaSha256": "205a9e4cea7413f760cc7b56b1d385dd71e37e3ac9b2d0d5da0e0d54fe81b7e4"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "logs.status",
+      "schema": "observability/logs-status.schema.json",
+      "schemaSha256": "b4225a941247b1491bac54d94ed3beacfcbaf364126f934c909cd592944b85d5"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "logs.tail",
+      "schema": "observability/logs-tail.schema.json",
+      "schemaSha256": "8a9adc810d8284995147513754e21c144eede6ccefe3ba7f8864210064a01a09"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "memory.import.apply",
+      "schema": "memory/memory-import-apply.schema.json",
+      "schemaSha256": "70490c883ff6928d8b6d87f76163c0928d3fe0b10764514f34f6fe570ca50bf4"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "memory.import.cancel",
+      "schema": "memory/memory-import-cancel.schema.json",
+      "schemaSha256": "b2030496ce155de58ec65d90c59ca8fcbdce9db5eaaa042187f89e9479083e3f"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "memory.import.discard",
+      "schema": "memory/memory-import-discard.schema.json",
+      "schemaSha256": "4eaa0768672013e67dd86209a6428f67fdc8ab171dbe02e63da2e5d50bbbb76b"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "memory.import.info",
+      "schema": "memory/memory-import-info.schema.json",
+      "schemaSha256": "8b2d48d5f335ae9c4eb2e68790e6603df40f3bac09ed9c4681221f0f80278206"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "memory.import.retry",
+      "schema": "memory/memory-import-retry.schema.json",
+      "schemaSha256": "c471772e7819124bbeab9d9c69b58e257d3bfb6a8dbe6853678b4c6033cd3ab4"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "memory.import.start",
+      "schema": "memory/memory-import-start.schema.json",
+      "schemaSha256": "a0d6105e241cab21407e386ed57ec2f7b48bf568a6518e9488bcf108c51fda68"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "memory.import.status",
+      "schema": "memory/memory-import-status.schema.json",
+      "schemaSha256": "0bd125888efe37af9e20d9dcaacb8cf6a598ddb1cf48a61ea0513091e0659107"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "memory.import.undo",
+      "schema": "memory/memory-import-undo.schema.json",
+      "schemaSha256": "6d9f4764c5bcc61ddd0867259e4e2c525f66b1095369bcc6c85f6c5ed74f773c"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "meta.drafts.discard",
+      "schema": "meta/meta-drafts-discard.schema.json",
+      "schemaSha256": "9a76f2da28b6d423968ebf8e24d75a7a8f4478404e7d16af3266419fb052c9d3"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "meta.drafts.list",
+      "schema": "meta/meta-drafts-list.schema.json",
+      "schemaSha256": "ed0fb32d0f7ae0658bd2b285202a267e2fb1241ed6681e50e92a9970c58f8abc"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "meta.run",
+      "schema": "meta/meta-run.schema.json",
+      "schemaSha256": "9a07117a5189afc6a757041cc890f22b5ed2b32b2c93bfbf499fb7cc404a3905"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "meta.runs.confirm_preflight",
+      "schema": "meta/meta-runs-confirm-preflight.schema.json",
+      "schemaSha256": "9ba62bf02ae35771662d34bc0528e58a6a1bfb8a23148e10a0b8652fa64f16f0"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "meta.runs.recovery",
+      "schema": "meta/meta-runs-recovery.schema.json",
+      "schemaSha256": "62e131b617d8a603e9db4ccf5f5f7da1cdb1e8b92b9c0aee649b8cff4b54def6"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "meta.runs.replay",
+      "schema": "meta/meta-runs-replay.schema.json",
+      "schemaSha256": "94877264021e519224204c2ff7328f2302c1b207b8ada97d0e24d92d572ff09f"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "meta.setup.install",
+      "schema": "meta/meta-setup-install.schema.json",
+      "schemaSha256": "b85028c3b064c6d6cd86b0fd73f5334256f203c7494d0d4dac7b84d7d226c860"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "meta.setup.plan",
+      "schema": "meta/meta-setup-plan.schema.json",
+      "schemaSha256": "71aa47eea68acb30fc45af243a79814b7df075b64ca15a5096e320c841e20a50"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "meta.setup.status",
+      "schema": "meta/meta-setup-status.schema.json",
+      "schemaSha256": "513891f57c0f8890d5c73aa403a1d3a18c4dfd0ae05663b2e62aeade59b36156"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "migration.sources.list",
+      "schema": "platform/migration-sources-list.schema.json",
+      "schemaSha256": "29d2999440e0b278e655394d39bd3782cbf7ad4ec5051d09174be6c1f761d5f2"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "migration.sources.preview",
+      "schema": "platform/migration-sources-preview.schema.json",
+      "schemaSha256": "7d89ea10bff333c3a5c92fb157ea887fbc5823685808e6531fab1cb9426597ff"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "models.list",
+      "schema": "platform/models-list.schema.json",
+      "schemaSha256": "0b6014c8008e8836f2c063735dbd760479ff6e28426f4229816c42b4e3bcb4a5"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "models.routing.get",
+      "schema": "platform/models-routing-get.schema.json",
+      "schemaSha256": "4edbf830e79f2cc2cf4a92606a10fc19f2856a97170333000dbbe31a49dcc8d9"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "models.routing.set",
+      "schema": "platform/models-routing-set.schema.json",
+      "schemaSha256": "071191f07419453b6258d09c1995736279d188e15defa82bf6ead3345f5b81eb"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.audio.configure",
+      "schema": "platform/onboarding-audio-configure.schema.json",
+      "schemaSha256": "ea795cbf246b20aa5b79e1b26f1dd2a815b461579a742af56561f19e0bc8479e"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.capability.reset",
+      "schema": "platform/onboarding-capability-reset.schema.json",
+      "schemaSha256": "61a4d754fd9396c808be6ad5e2b78d52ffb0bc55189e2d0fbdf8e7147c325fe4"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.catalog",
+      "schema": "platform/onboarding-catalog.schema.json",
+      "schemaSha256": "2ae8ca5eb92169c4756a7a0c32514e06768fe1cb955d80c47cf310bbba280209"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.channel.disable",
+      "schema": "platform/onboarding-channel-disable.schema.json",
+      "schemaSha256": "eb4a983d3247021fea23c1ab1eeb8c0dc7947eda7ad6aaf8ceb95b6c8be0720d"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.channel.enable",
+      "schema": "platform/onboarding-channel-enable.schema.json",
+      "schemaSha256": "d3735f7f2b9719ef76639f66b8ab7a01b82ad2ae95f3858d69b05f68483aa701"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.channel.probe",
+      "schema": "platform/onboarding-channel-probe.schema.json",
+      "schemaSha256": "9587b1fbed27ddf85f8f466f16e7903671b175e182ee904b3f2c54b503c16bee"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.channel.remove",
+      "schema": "platform/onboarding-channel-remove.schema.json",
+      "schemaSha256": "2a81b19ee5f43596187b934f12a1c6018341a12598b5f992bc2c422fb8f8a891"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.channel.upsert",
+      "schema": "platform/onboarding-channel-upsert.schema.json",
+      "schemaSha256": "bcdb4ba615c09f69b2dad120546d607fc8280d482a2fc81e6692d09f0e31701d"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.ensemble.configure",
+      "schema": "platform/onboarding-ensemble-configure.schema.json",
+      "schemaSha256": "fdf8e410557592b3613b6a7ebdac3ad8529468c6a9d67732c74cdfa0172ddbc1"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.imageGeneration.configure",
+      "schema": "platform/onboarding-image-generation-configure.schema.json",
+      "schemaSha256": "8d55244a29ff6ad05aa580c26b1d116c961677cd438358512ec044a20dbe7bbc"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.imageGeneration.models.discover",
+      "schema": "platform/onboarding-image-generation-models-discover.schema.json",
+      "schemaSha256": "2d0b455d1f7637ca2a7d566266f05ae3406004bc324ca061a8b0026c7910e0c8"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.llmProfile.activate",
+      "schema": "platform/onboarding-llm-profile-activate.schema.json",
+      "schemaSha256": "799740d7609646896db85e83ddaaef3f610a9bb12339d7fed7d5709467f3c12c"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.llmProfile.active.remove",
+      "schema": "platform/onboarding-llm-profile-active-remove.schema.json",
+      "schemaSha256": "806a4d3b9df73edeb4b6fad8e14ce6422b5e3b937adfe5bf1f92cf45a26efc0e"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.llmProfile.credential.clear",
+      "schema": "platform/onboarding-llm-profile-credential-clear.schema.json",
+      "schemaSha256": "fd36177cae8a3f32c9c524877032cc618a693b848b35136aab508749d5622621"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.llmProfile.draft.models.discover",
+      "schema": "platform/onboarding-llm-profile-draft-models-discover.schema.json",
+      "schemaSha256": "3c0dd856a60c56816e487960551c56beafd1dcabf6c59654854fed4963738190"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.llmProfile.draft.probe",
+      "schema": "platform/onboarding-llm-profile-draft-probe.schema.json",
+      "schemaSha256": "b87c847bb7a4116bad627baafb3d17b205d59bc46b6cceaf2cafcfee1e0e4e06"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.llmProfile.models.discover",
+      "schema": "platform/onboarding-llm-profile-models-discover.schema.json",
+      "schemaSha256": "a830afa13fc03d39e558db00ba300a4342d1ac0c32f70954bb7f2fa55967fe4a"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.llmProfile.probe",
+      "schema": "platform/onboarding-llm-profile-probe.schema.json",
+      "schemaSha256": "1d906e26d4631a43464c148552c8372555b91c6a51b8ddeb233db083c9c3a6f0"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.llmProfile.remove",
+      "schema": "platform/onboarding-llm-profile-remove.schema.json",
+      "schemaSha256": "ecd479c79d4a2e446198ad2ca805c555e475161138babf7ab8e60adb0997374a"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.llmProfile.upsert",
+      "schema": "platform/onboarding-llm-profile-upsert.schema.json",
+      "schemaSha256": "92d08ff66eb60914825f778365a21d146b1d81f5af2e5a077844c652654e74ff"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.memory_embedding.configure",
+      "schema": "platform/onboarding-memory-embedding-configure.schema.json",
+      "schemaSha256": "0f1eb7452d7bdb97510e73c5ff16bb81daa17bde32ea02b94b22a0872feac5d6"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.models.discover",
+      "schema": "platform/onboarding-models-discover.schema.json",
+      "schemaSha256": "5a6a8a2b9113c623f04b137dddb93b4ada24d7d696b0421040e4487db460569f"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.provider.configure",
+      "schema": "platform/onboarding-provider-configure.schema.json",
+      "schemaSha256": "630b4fd36ea57c1f7c8fcaf7b9d06094c00e5604754ad4c7b69d2eca25a26ad8"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.provider.credential.clear",
+      "schema": "platform/onboarding-provider-credential-clear.schema.json",
+      "schemaSha256": "73a888aff14f160000b6ccc2649c650211dae7ae3d555826a10ebe625c6b0c8e"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.provider.credential.reveal",
+      "schema": "platform/onboarding-provider-credential-reveal.schema.json",
+      "schemaSha256": "59d661517249977ad898329a177455f1959decbfa203a4a4696bf5164451a027"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.provider.probe",
+      "schema": "platform/onboarding-provider-probe.schema.json",
+      "schemaSha256": "4bba8e8fbca95f2c8343a94dde1000b1b9724d447992d7b391317ca0469e565e"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.router.configure",
+      "schema": "platform/onboarding-router-configure.schema.json",
+      "schemaSha256": "ff69dba95d85610859125ec3ee974e539f399cff1cbc8538937b274958fe9bb2"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.search.configure",
+      "schema": "platform/onboarding-search-configure.schema.json",
+      "schemaSha256": "522b311acac1f2c53210ab7e85ea6a7f19b4f0968a2f3390a89ba26a1410401b"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "onboarding.status",
+      "schema": "platform/onboarding-status.schema.json",
+      "schemaSha256": "703d7f9b7934261128356f722c7c5aead682b08c96bba232714097c456d19cba"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "plans.cancelRun",
+      "schema": "plans/plans-cancel-run.schema.json",
+      "schemaSha256": "978cedbd62bbcde55b0b5c4676ce706a974432f588210308a9e0305b2402bb61"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "plans.capabilities",
+      "schema": "plans/plans-capabilities.schema.json",
+      "schemaSha256": "13a63d5b926459c784b9d59ace1779c4bb5791111d5d5e5eb9182b480c0fe13d"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "plans.implement",
+      "schema": "plans/plans-implement.schema.json",
+      "schemaSha256": "91a30d7e089e7c652c5f620033c8f7bd1916b1b3a29bb11af82f95474ac8b40a"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "plans.revise",
+      "schema": "plans/plans-revise.schema.json",
+      "schemaSha256": "5fb5bfef7b62bd4099c1ee0807347e48e8f31daf774674aa66ab65bd659c56e2"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "plans.setMode",
+      "schema": "plans/plans-set-mode.schema.json",
+      "schemaSha256": "2db551e448ed9bd6118b6f8e73ebdc9dfbc332bc4cba641b921f443747c30456"
+    },
+    {
+      "canonicalName": "exec.approval.extend",
+      "lifecycle": "legacy",
+      "name": "plugin.approval.extend",
+      "schema": "approvals/plugin-approval-extend.schema.json",
+      "schemaSha256": "19bdb6094889170d895f9b7da893348b952b9be2b79c7742d2ae741ca2adabd1"
+    },
+    {
+      "canonicalName": "exec.approval.resolve",
+      "lifecycle": "legacy",
+      "name": "plugin.approval.resolve",
+      "schema": "approvals/plugin-approval-resolve.schema.json",
+      "schemaSha256": "416d53af020fa8220b21d7f433b20916d070667ae6381809890a53b58197396d"
+    },
+    {
+      "canonicalName": "exec.approval.status",
+      "lifecycle": "legacy",
+      "name": "plugin.approval.status",
+      "schema": "approvals/plugin-approval-status.schema.json",
+      "schemaSha256": "84b70d8dbc41e4f03a398a79c83da8b3550c5006bb9613a9e275bb9c90e375ee"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "providers.status",
+      "schema": "platform/providers-status.schema.json",
+      "schemaSha256": "141f47808deb3bba8b9b5c49ba5a16a8e196ef737904dbd0bf852bdaa06d10a4"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "router.feedback.submit",
+      "schema": "conversation/router-feedback-submit.schema.json",
+      "schemaSha256": "a164a2fb7fe47602198b6a8e4ae5d7162ef9bd7759e4f27ea2e80695f9998ee3"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "router.selflearning.status",
+      "schema": "observability/router-selflearning-status.schema.json",
+      "schemaSha256": "1d121d811eed2c0bab0a7d7ea7d450a20fab57c0775e6fbd7190f774bc7157c2"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sandbox.capability.status",
+      "schema": "sandbox/sandbox-capability-status.schema.json",
+      "schemaSha256": "c3fe2d856b862e5f971754f6949acc528fd06868a70bfd5f3800866a21edd7a2"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sandbox.path.create-directory",
+      "schema": "sandbox/sandbox-path-create-directory.schema.json",
+      "schemaSha256": "5ebcf39ad2ef33886594af9a9f13b7bcb753904898bd980088d5116df08f117f"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sandbox.path.list",
+      "schema": "sandbox/sandbox-path-list.schema.json",
+      "schemaSha256": "d8eae7fe51b05c2a897c3abce5336c994eaf10b408533e9203d26bae9900b41b"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sandbox.path.pick",
+      "schema": "sandbox/sandbox-path-pick.schema.json",
+      "schemaSha256": "bd4ad1cb54f1141ab08d39593a87fcabf2d7515442c9898b0bac69c6cb805b97"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sandbox.policy.defaults",
+      "schema": "sandbox/sandbox-policy-defaults.schema.json",
+      "schemaSha256": "7d7470da9e1feb8dfee54f1d7b688f0410b91540286ac132eea0220c0356100e"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sandbox.policy.get",
+      "schema": "sandbox/sandbox-policy-get.schema.json",
+      "schemaSha256": "74fb425cb3f15154354f98492dbeaed5d0dda9b09f89654ce2d9b4a0070ee18a"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sandbox.policy.update",
+      "schema": "sandbox/sandbox-policy-update.schema.json",
+      "schemaSha256": "807d200babb0ba1a2360101a24f912e06df2cb90a7086c2cfaa0584352bd52d2"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sandbox.resume",
+      "schema": "sandbox/sandbox-resume.schema.json",
+      "schemaSha256": "5b2ec80e0c0fd64ededfa52f268deb88df9ab65b21f60b0238a66f4f39e45c81"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sandbox.run_mode.preference.get",
+      "schema": "sandbox/sandbox-run-mode-preference-get.schema.json",
+      "schemaSha256": "78416ba000d482fe93a98d92e4ecc010c02c04950dcb2b277b9c2f037ef700b2"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sandbox.run_mode.preference.set",
+      "schema": "sandbox/sandbox-run-mode-preference-set.schema.json",
+      "schemaSha256": "3e633a83afd55475a3f0cb76b0491a92ef25c1e266082c923c7a3f3225e7efcb"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sandbox.runtime.cancel",
+      "schema": "sandbox/sandbox-runtime-cancel.schema.json",
+      "schemaSha256": "c2e7192cb851a99a69871f50e383a840870985b2a22dcba6a9474e05090d3cd5"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sandbox.runtime.discard_download",
+      "schema": "sandbox/sandbox-runtime-discard-download.schema.json",
+      "schemaSha256": "fc462e3239449635d593768960bf66786431ae493f98d9f32b55c0271acb9ad2"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sandbox.runtime.install",
+      "schema": "sandbox/sandbox-runtime-install.schema.json",
+      "schemaSha256": "5a26009eb4275dd417ed47bf135588ed60bfcabe26b17f62709b52fa64ccf68d"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sandbox.runtime.remove",
+      "schema": "sandbox/sandbox-runtime-remove.schema.json",
+      "schemaSha256": "cfae56111de7f06067d99cfa89b774acc6c5bacf44e9b67ae9c311e88675ee82"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sandbox.runtime.status",
+      "schema": "sandbox/sandbox-runtime-status.schema.json",
+      "schemaSha256": "0dd83654256b0dec857395ba9b3b16a9369d6ed7511036e7dfd242833f7bb937"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sandbox.setup.ensure",
+      "schema": "sandbox/sandbox-setup-ensure.schema.json",
+      "schemaSha256": "9858288f4e3328c52026eed50219fb30e0a034f60560c2efdaa21f4d8b1e2b79"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sandbox.setup.status",
+      "schema": "sandbox/sandbox-setup-status.schema.json",
+      "schemaSha256": "03dcc55a73fe1245d9997e044220e76fb4086585c74c784576feb1ef71f138dc"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.abort",
+      "schema": "conversation/sessions-abort.schema.json",
+      "schemaSha256": "61016f834fc17da15718f70abf40bd2fa5428a4f93237ab682a919e4c97a44b7"
+    },
+    {
+      "canonicalName": "sessions.contextCompact",
+      "lifecycle": "legacy",
+      "name": "sessions.compact",
+      "schema": "sessions/sessions-compact.schema.json",
+      "schemaSha256": "a035ca2d92acc1ea3fcff706c084b243e23b204f26cd2157319f161a87cdc085"
+    },
+    {
+      "compatibilityAliases": [
+        "sessions.compact"
+      ],
+      "lifecycle": "stable",
+      "name": "sessions.contextCompact",
+      "schema": "sessions/sessions-context-compact.schema.json",
+      "schemaSha256": "87974f8351a1db92724c35dc5d57a2191b08b199c538b288e23c8be9d53b58bb"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.create",
+      "schema": "sessions/sessions-create.schema.json",
+      "schemaSha256": "2b58f923bdb9fb6dffa43a5b54a3c9bb37170a82fb7fc5cf4fa22209ebe8e60c"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.delete",
+      "schema": "sessions/sessions-delete.schema.json",
+      "schemaSha256": "c9e1b7f977f68d6e0a1f08aea30f6315d011aacf6ca2a81030ff8f8ad38d2b2f"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.fork",
+      "schema": "sessions/sessions-fork.schema.json",
+      "schemaSha256": "10da0ca1f37930fa2a12ecaa8b0b58210d021d499d71bda5fa2d9a7da5e5d72b"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.forkThroughTurn",
+      "schema": "sessions/sessions-fork-through-turn.schema.json",
+      "schemaSha256": "ae9ad402c0723ba7ea227956e4cab5e61c8a6e83a4fbeef9975dfd002967b519"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.list",
+      "schema": "sessions/sessions-list.schema.json",
+      "schemaSha256": "e13b34434d00fed6f244999312f4208c68577234ecb8c02f98b0c6d0823835b4"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.messages.hydrate",
+      "schema": "sessions/sessions-messages-hydrate.schema.json",
+      "schemaSha256": "57e664a72a0557c5f6d1f3920c98cef41bb3f4e655230f9c5095f659a2ff74b0"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.messages.snapshot",
+      "schema": "sessions/sessions-messages-snapshot.schema.json",
+      "schemaSha256": "749b2487795d64862cf7faa762c018873e7c67a86997fb3d393aec16e29db6dd"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.messages.subscribe",
+      "schema": "sessions/sessions-messages-subscribe.schema.json",
+      "schemaSha256": "3cd9dc014552f9f959d1e4f6aac8bc9621b994c645b7d43030651e4e8b28cedb"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.messages.unsubscribe",
+      "schema": "sessions/sessions-messages-unsubscribe.schema.json",
+      "schemaSha256": "bb7db7328ec62314ede3bd8aa119962c749418aa4f9eac7b1b2f08242e48cbd2"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.pending_inputs.cancel",
+      "schema": "sessions/sessions-pending-inputs-cancel.schema.json",
+      "schemaSha256": "ede6cf3701d1c7f2937329348056ddcad8ff167369c88390a60f3b57923e2327"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.pending_inputs.dispatch",
+      "schema": "conversation/pending-inputs-dispatch.schema.json",
+      "schemaSha256": "8a9e3c72828bb6e40c0710699933a743e5ee3b90bc43678c06b1675d47d349bc"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.pending_inputs.enqueue",
+      "schema": "sessions/sessions-pending-inputs-enqueue.schema.json",
+      "schemaSha256": "a101c15c0c2dedd640c9c818b728f3f405d13c65385a51416a828b10022edcef"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.pending_inputs.list",
+      "schema": "sessions/sessions-pending-inputs-list.schema.json",
+      "schemaSha256": "7cbe1acf30fbe054bffe3bcb9364a635537fc1137542fe8d156fbc61c16530eb"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.pending_inputs.reorder",
+      "schema": "sessions/sessions-pending-inputs-reorder.schema.json",
+      "schemaSha256": "446c8e8dc8ba0ddb87910734444fb19d4827b118a3850c7fce7bb9a2de6c88cd"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.pending_inputs.steer",
+      "schema": "conversation/pending-inputs-steer.schema.json",
+      "schemaSha256": "8df0121e7f8d8d8d1e6a3995848ed4aa23eb8388cd2cf3f37d254bd798a68673"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.pending_inputs.update",
+      "schema": "sessions/sessions-pending-inputs-update.schema.json",
+      "schemaSha256": "fe59ea83a5994db0d3ac7e55fcab0cbe9a09b3acffb51cb467bac29ec9558095"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.preview",
+      "schema": "sessions/sessions-preview.schema.json",
+      "schemaSha256": "d5e57d5953b10c37edbdd4d99b5f366563159aebcb7f38f0ecd559339dabe6f3"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.promptCacheKeepalive.set",
+      "schema": "conversation/prompt-cache-keepalive-set.schema.json",
+      "schemaSha256": "1dbd3dfc5b1555bea1c94b3dee64bfba596bd620f8346dd6183679b6dc901ac4"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.promptCacheKeepalive.status",
+      "schema": "conversation/prompt-cache-keepalive-status.schema.json",
+      "schemaSha256": "a18ecb9697d6737d904f24adf7f770c62de87755ecd85d20f49a03b5355c08fa"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.rename",
+      "schema": "sessions/sessions-rename.schema.json",
+      "schemaSha256": "8660b331d9864128d728dac9d66773b909041d5a080d6a9ada51c6eed66fcf6c"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.reset",
+      "schema": "sessions/sessions-reset.schema.json",
+      "schemaSha256": "4ca0f4c42081a27af2368de7d9b7ce7c0677e9d4f3643d70097d46479d7d5ae9"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.resolve",
+      "schema": "sessions/sessions-resolve.schema.json",
+      "schemaSha256": "822c791349141898f3bbd2a278799aafefd3ba36fd6734eac5185eadd5978d1b"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.routing.get",
+      "schema": "sessions/sessions-routing-get.schema.json",
+      "schemaSha256": "79c4c50696ed7906a8bf02d140fe44704edc7956302afe7ab8fd6e07704c6918"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.routing.set",
+      "schema": "sessions/sessions-routing-set.schema.json",
+      "schemaSha256": "2b42db49f3124cbfd4144065f7b75cc764d3434447b5e6dace497571a20f8111"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.search",
+      "schema": "sessions/sessions-search.schema.json",
+      "schemaSha256": "465efda3f2b659b42a72baee4392a8761b68d4a24dcfe701d1fe30c2c8f3fa5d"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.send",
+      "schema": "conversation/sessions-send.schema.json",
+      "schemaSha256": "3382c9945ecbccda159ee5389b93af498ffdad1aa5716aedf961feb553b82ce7"
+    },
+    {
+      "canonicalName": "sessions.steer.v2",
+      "lifecycle": "legacy",
+      "name": "sessions.steer",
+      "schema": "conversation/sessions-steer.schema.json",
+      "schemaSha256": "e2a30e5b774165eef3924cbc029eb26b916a39638ff3ece7087f6bd2d02875e3"
+    },
+    {
+      "compatibilityAliases": [
+        "sessions.steer"
+      ],
+      "lifecycle": "stable",
+      "name": "sessions.steer.v2",
+      "schema": "conversation/sessions-steer-v2.schema.json",
+      "schemaSha256": "664be659078f5b9a3bbcbbb51a40f2821fb28e87c686fb94b8eddc82ff2d309d"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.subscribe",
+      "schema": "sessions/sessions-subscribe.schema.json",
+      "schemaSha256": "f6e28500bf1e405688d04b07b486b583aa4b57b76b7651c9fc333cc8ee43f7dc"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.unsubscribe",
+      "schema": "sessions/sessions-unsubscribe.schema.json",
+      "schemaSha256": "25416c677d35cd546a28b48f8f171a728a77d027e4d02c0602324f11ef8eaf95"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "skills.deps.install",
+      "schema": "skills/skills-deps-install.schema.json",
+      "schemaSha256": "7814ba61c9c2b7e533856c656a462abee3510d952c236321afd084db5f38d927"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "skills.get",
+      "schema": "skills/skills-get.schema.json",
+      "schemaSha256": "652e7c40ffb29d15a33b8bd816726e7a6a75768f479655ce9f21bbb21a4c1574"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "skills.install",
+      "schema": "skills/skills-install.schema.json",
+      "schemaSha256": "b296349777fa88f2994907a6c06983b4ff9b6909d0f4563e333fb621fdf3bcdd"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "skills.install.cancel",
+      "schema": "skills/skills-install-cancel.schema.json",
+      "schemaSha256": "e22bfcec3766dab93bb4db02d25847fceb3b31446c7fe1807b6ea8fdc0cac666"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "skills.list",
+      "schema": "skills/skills-list.schema.json",
+      "schemaSha256": "6a908eab50a8bd5355b9ccbfe8da690d1e52fcaeca82c1bb0e98268deff1bc52"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "skills.reload",
+      "schema": "skills/skills-reload.schema.json",
+      "schemaSha256": "387c98b0255ad6a53657678bedfa85fee872c70827f4b8441e99046673d51b4f"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "skills.search",
+      "schema": "skills/skills-search.schema.json",
+      "schemaSha256": "c605a95128daf337219ffb2ed042998291f46eb5b677dd330e0a60653114c3a7"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "skills.uninstall",
+      "schema": "skills/skills-uninstall.schema.json",
+      "schemaSha256": "885545084af7fbae8338df1bb0ef559cc262fd7f09f0af529db8eb9e1070c37c"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "status",
+      "schema": "observability/runtime-status.schema.json",
+      "schemaSha256": "26eb20f0df30900801b1583d6c6c78fd62faa4d80f28d9b56dbe0644bab0459b"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "usage.cost",
+      "schema": "conversation/usage-cost.schema.json",
+      "schemaSha256": "9b2cc19bcf92c659bd92ce18d4ddf58ade65a0ae6ba8e78a0c4c2f3f0cbca206"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "usage.query",
+      "schema": "conversation/usage-query.schema.json",
+      "schemaSha256": "c290414be7a93f7a36dd7babcc0eee3b746323a4c49e9e7a85105b69c1a25a21"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "usage.status",
+      "schema": "conversation/usage-status.schema.json",
+      "schemaSha256": "cadad25c14544e7fb012be503c9a15f323e05b0f22115e8803f13b65567fa533"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "workbench.previews.create",
+      "schema": "workbench/workbench-previews-create.schema.json",
+      "schemaSha256": "5e5b80248dd4072b85af245604684d446566f7a7179e8765e644693759ada9c4"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "workbench.resources.get",
+      "schema": "workbench/workbench-resources-get.schema.json",
+      "schemaSha256": "1c96067ad3609c909179f65ef76fac1815bc15374d379c0164b1e149e1b76088"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "workbench.resources.list",
+      "schema": "workbench/workbench-resources-list.schema.json",
+      "schemaSha256": "2329c99c18dfb558e4acf163a7dc265674dcbd0a9146e96c518d00ad1dae8fdb"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "workbench.resources.open",
+      "schema": "workbench/workbench-resources-open.schema.json",
+      "schemaSha256": "aa407e99c2a003fb64b2dfa42d3c41b0c8249a98041e5d9f4c3d5aa1ebd7f566"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "workspaces.history.delete",
+      "schema": "workspaces/workspaces-history-delete.schema.json",
+      "schemaSha256": "8f934b8a6c04c5b386aa63c368831f5a3294c6e2238c1c9f3cdebaaeee09d4cf"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "workspaces.list",
+      "schema": "workspaces/workspaces-list.schema.json",
+      "schemaSha256": "1dc9b4acd036127e3230cc3910862dd85661005a6807b9f05f246c34ac67ed2a"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "workspaces.open",
+      "schema": "workspaces/workspaces-open.schema.json",
+      "schemaSha256": "5eb38deaaaefe31693fa2ede17f4077f22d7e7e7bb5e7dccbd62a8b1c02dc45c"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "workspaces.pin",
+      "schema": "workspaces/workspaces-pin.schema.json",
+      "schemaSha256": "9833ea6908570663fb3f43f85746f50beea88d732e457222255eb35f5373d06a"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "workspaces.remove",
+      "schema": "workspaces/workspaces-remove.schema.json",
+      "schemaSha256": "57e0a55fcec7ec8d8811166e9f02d7c03f8d60da31ad858a9923c24405d27892"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "workspaces.update",
+      "schema": "workspaces/workspaces-update.schema.json",
+      "schemaSha256": "c4b354b7cd53646f14b85aab8161034dc26816e0836cf0f98a0833521a5f0480"
+    }
+  ],
+  "protocol": "opensquilla-websocket-json",
+  "source": {
+    "eventFamilyCount": 9,
+    "generatorSha256": "ad40cd44840fcc9cb1a00fbdc1d884bb8e4643bf943f10053e6b8c84309f6261",
+    "methodCount": 215,
+    "schemaCount": 224,
+    "schemaTreeSha256": "be85f40cb1443712d8888287242ad212abd4fecfbc7e30e300444d412436e20e"
+  },
+  "wireVersion": 4
+}

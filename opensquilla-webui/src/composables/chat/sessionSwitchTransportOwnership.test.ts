@@ -16,6 +16,7 @@ import {
 } from './useChatSessionSubscription'
 import type { SessionBootstrapPhaseContext } from './sessionBootstrapContract'
 import { createV4SessionReadPort } from '@/adapters/gateway/sessionReadPortV4'
+import { createConversationEventTransport } from '@/adapters/gateway/conversationEventTransport'
 import { createConversationRuntime } from '@/modules/conversationRuntime'
 import { createConversationSubscriptionLifecycle } from '@/modules/conversationSubscriptionLifecycle'
 import {
@@ -173,8 +174,8 @@ function snapshotPayload(key: string, marker = key) {
     task_id: null,
     stream_generation: 'test-stream-generation',
     events: [{
-      event: 'session.event.state_changed',
-      payload: { marker },
+      event: 'session.event.text_delta',
+      payload: { key, text: marker },
     }],
     current_stream_seq: 0,
   }
@@ -325,7 +326,7 @@ function createHarness(options: {
           onLiveSnapshot: payload => {
             liveSnapshots.push({
               ...(payload as unknown as Record<string, unknown>),
-              marker: payload.events[0]?.payload.marker,
+              marker: payload.events[0]?.payload.text,
             })
           },
         }
@@ -584,20 +585,23 @@ describe('session switch transport ownership', () => {
     )[0]!
 
     const rendered: string[] = []
-    const offEvent = harness.rpc.on('session.event.text_delta', payload => {
-      const event = payload as {
-        session_key?: string
-        stream_seq?: number
-        text?: string
-      }
-      const decision = acceptStreamSeq(
-        event,
-        harness.sessionKey.value,
-        harness.lastStreamSeq.value,
-      )
-      if (!decision.accepted) return
-      harness.lastStreamSeq.value = decision.nextStreamSeq
-      if (event.text) rendered.push(event.text)
+    const events = createConversationEventTransport({
+      subscribe: (name, handler) => ({ close: harness.rpc.on(name, handler) }),
+    })
+    const offEvent = events.subscribe({
+      onEvent: message => {
+        if (message.kind !== 'conversation' || message.event.kind !== 'known'
+          || message.event.semanticKind !== 'text-delta') return
+        const event = message.event.payload
+        const decision = acceptStreamSeq(
+          event,
+          harness.sessionKey.value,
+          harness.lastStreamSeq.value,
+        )
+        if (!decision.accepted) return
+        harness.lastStreamSeq.value = decision.nextStreamSeq
+        if (event.text) rendered.push(event.text)
+      },
     })
 
     const switching = harness.runtime.switchToSession(SESSION_B)

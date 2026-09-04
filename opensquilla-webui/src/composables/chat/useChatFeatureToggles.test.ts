@@ -7,7 +7,10 @@ import type {
   ModelRoutingCapabilitiesByMode,
   ModelRoutingMode,
 } from '@/types/modelRouting'
-import { sessionConversationFromTestRpc } from '@/testing/sessionConversation.test-helper'
+import {
+  ProviderConfigurationError,
+  type ModelRoutingSnapshot,
+} from '@/modules/providerConfiguration'
 
 type RpcResult = Record<string, unknown> | Error | Promise<unknown>
 
@@ -41,8 +44,16 @@ function createHarness(options: {
   const configGetResults = [...(options.configGetResults ?? [{}])]
   const routingGetResults = [...(options.routingGetResults ?? [])]
   const patchResults = [...(options.patchResults ?? [])]
-  const eventHandlers = new Map<string, (payload: unknown) => void>()
   const ready = vi.fn(async () => {})
+  let routingChangedListener: ((snapshot: ModelRoutingSnapshot) => void) | null = null
+  const subscribeChanged = vi.fn((listener: (snapshot: ModelRoutingSnapshot) => void) => {
+    routingChangedListener = listener
+    return {
+      close() {
+        if (routingChangedListener === listener) routingChangedListener = null
+      },
+    }
+  })
   const setGlobalElevatedMode = vi.fn()
   const loadCurrentSessionUsage = vi.fn()
   const call = vi.fn(async (method: string, _params?: Record<string, unknown>): Promise<unknown> => {
@@ -53,7 +64,10 @@ function createHarness(options: {
     }
     if (method === 'models.routing.get') {
       if (options.hasRpcMethod?.('models.routing.get') === false) {
-        throw Object.assign(new Error('method not found'), { code: 'METHOD_NOT_FOUND' })
+        throw new ProviderConfigurationError(
+          'unsupported',
+          'Model routing is unsupported.',
+        )
       }
       const result = routingGetResults.shift()
       if (result === undefined) throw new Error('canonical routing unavailable')
@@ -73,17 +87,7 @@ function createHarness(options: {
     params?: Record<string, unknown>,
     callOptions?: RpcCallOptions,
   ) => Promise<unknown>
-  const rpc = {
-    ready,
-    call: call as <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>,
-    on: vi.fn((event: string, handler: (payload: unknown) => void) => {
-      eventHandlers.set(event, handler)
-      return () => eventHandlers.delete(event)
-    }),
-    hasRpcMethod: options.hasRpcMethod,
-  }
   const api = useChatFeatureToggles({
-    sessionConversation: sessionConversationFromTestRpc(rpc),
     appSettings: {
       readAll: vi.fn(async () => {
         return await rpcRequest('config.get', undefined, options.readCallOptions) as import('@/modules/appSettings').SettingsObject
@@ -104,15 +108,16 @@ function createHarness(options: {
         await rpcRequest('models.routing.set', { mode })
         return { mode: mode as import('@/modules/providerConfiguration').RoutingMode }
       }),
+      subscribeChanged,
     },
-    readCallOptions: options.readCallOptions,
+    readOptions: options.readCallOptions,
     setGlobalElevatedMode,
     loadCurrentSessionUsage,
   })
   return {
     api,
-    rpc: { ready, call, on: rpc.on },
-    emit: (event: string, payload: unknown) => eventHandlers.get(event)?.(payload),
+    rpc: { ready, call, subscribeChanged },
+    emitRouting: (snapshot: ModelRoutingSnapshot) => routingChangedListener?.(snapshot),
     setGlobalElevatedMode,
     loadCurrentSessionUsage,
   }
@@ -378,14 +383,14 @@ describe('useChatFeatureToggles model routing mode', () => {
       addEventListener: vi.fn(),
       removeEventListener: vi.fn(),
     })
-    const { api, rpc, emit } = createHarness()
+    const { api, rpc, emitRouting } = createHarness()
     const cleanup = api.bindFeatureRefresh()
 
-    emit('models.routing.changed', { mode: 'ensemble', selection_mode: 'router_dynamic' })
+    emitRouting({ mode: 'ensemble', selection_mode: 'router_dynamic' })
     expect(api.modelRoutingMode.value).toBe('llm_ensemble')
     expect(api.llmEnsembleSelectionMode.value).toBe('router_dynamic')
 
-    emit('models.routing.changed', {
+    emitRouting({
       mode: 'router',
       image_input: {
         admission: 'allowed',
@@ -395,8 +400,8 @@ describe('useChatFeatureToggles model routing mode', () => {
     expect(api.globalImageInputAdmission.value).toBe('allowed')
 
     cleanup()
-    expect(rpc.on).toHaveBeenCalledWith('models.routing.changed', expect.any(Function))
-    emit('models.routing.changed', { mode: 'direct' })
+    expect(rpc.subscribeChanged).toHaveBeenCalledWith(expect.any(Function))
+    emitRouting({ mode: 'direct' })
     expect(api.modelRoutingMode.value).toBe('squilla_router')
   })
 
@@ -461,7 +466,7 @@ describe('useChatFeatureToggles model routing mode', () => {
       removeEventListener: vi.fn(),
     })
     const pending = deferred<Record<string, unknown>>()
-    const { api, emit, rpc } = createHarness({
+    const { api, emitRouting, rpc } = createHarness({
       configGetResults: [{}],
       routingGetResults: [pending.promise],
     })
@@ -471,7 +476,7 @@ describe('useChatFeatureToggles model routing mode', () => {
       expect(rpc.call.mock.calls.filter(([method]) => method === 'models.routing.get')).toHaveLength(1)
     })
 
-    emit('models.routing.changed', {
+    emitRouting({
       mode: 'router',
       image_input: CAPABILITIES_BY_MODE.router.image_input,
       capabilities_by_mode: CAPABILITIES_BY_MODE,

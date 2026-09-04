@@ -1,6 +1,7 @@
 import type { ArtifactPayload } from './artifacts'
 import type { PromptAnnotationSnapshot } from './promptAnnotations'
 import type { IconName } from '@/utils/icons'
+import type { ConversationRoutingSnapshot } from '@/modules/conversationEventContent'
 
 export interface RawSessionTask {
   status?: string
@@ -18,76 +19,6 @@ export interface RawSessionTask {
   documentMutationOutcome?: Record<string, unknown>
   steer_capability?: ChatSteerCapability
   steerCapability?: ChatSteerCapability
-}
-
-export interface StreamEventEnvelope {
-  key?: string
-  session_key?: string
-  sessionKey?: string
-  epoch?: number
-  stream_generation?: string
-  streamGeneration?: string
-  generation_epoch?: number
-  generationEpoch?: number
-  assistant_message_id?: string
-  assistantMessageId?: string
-  stream_seq?: number
-  [key: string]: unknown
-}
-
-export interface SessionEventPayload extends StreamEventEnvelope {
-  task_id?: string
-  taskId?: string
-  turn_id?: string
-  turnId?: string
-  started_at?: number
-  emitted_at?: number
-  reason?: string
-  status?: string
-  run_status?: string
-  runStatus?: string
-  terminal_message?: string
-  terminal_reason?: string
-  message?: string
-  code?: string
-  group_id?: string
-  to_state?: string
-  toState?: string
-  active_task?: RawSessionTask | null
-  last_task?: RawSessionTask | null
-  [key: string]: unknown
-}
-
-export interface AnswerGenerationResetPayload extends SessionEventPayload {
-  kind?: 'answer_generation_reset'
-  old_generation_epoch?: number
-  oldGenerationEpoch?: number
-  new_generation_epoch?: number
-  newGenerationEpoch?: number
-  preserve_completed_tools?: boolean
-  preserveCompletedTools?: boolean
-  authoritative_text_snapshot?: string
-  authoritativeTextSnapshot?: string
-  authoritative_reasoning_snapshot?: string
-  authoritativeReasoningSnapshot?: string
-  sequence?: number
-  terminal?: boolean
-  terminal_text_snapshot?: string | null
-  terminalTextSnapshot?: string | null
-}
-
-export interface WarningPayload extends SessionEventPayload {
-  message?: string
-  code?: string
-}
-
-/** Content-free invalidation signal for one stable Artifact IDE document. */
-export interface ArtifactStateEventPayload extends SessionEventPayload {
-  artifactEventSeq?: number
-  documentId?: string
-  revisionId?: string | null
-  changeSetId?: string | null
-  action?: string
 }
 
 export type ProviderActivityPhase =
@@ -109,44 +40,6 @@ export type ProviderActivityReason =
   | 'context_overflow'
   | 'unknown'
 
-export interface ProviderActivityPayload extends SessionEventPayload {
-  schema_version?: 1
-  activity_id?: string
-  phase?: ProviderActivityPhase
-  reason?: ProviderActivityReason
-  retry_attempt?: number
-  retry_limit?: number
-  retry_after_ms?: number
-  started_at?: number
-  heartbeat?: boolean
-}
-
-export interface CronResultMessagePayload {
-  role?: string
-  text?: string
-  timestamp?: string | number | null
-  messageId?: string
-  message_id?: string
-  provenanceKind?: string
-  provenanceSourceTool?: string
-  provenanceSourceSessionKey?: string
-}
-
-export type CronResultPayload = StreamEventEnvelope & {
-  message?: CronResultMessagePayload
-}
-
-export interface SubagentCompletionPayload extends SessionEventPayload {
-  type?: 'subagent_completion'
-  parent_session_key?: string
-  child_session_key?: string
-  status?: string
-  terminal_reason?: string
-  message_id?: string
-  messageId?: string
-  result?: { text?: string; [key: string]: unknown }
-}
-
 export interface ApprovalStatusPayload {
   found?: boolean
   id?: string
@@ -160,94 +53,8 @@ export interface ApprovalStatusPayload {
   deadline?: number
 }
 
-export interface TextDeltaPayload extends SessionEventPayload {
-  text?: string
-  /** Gateway-owned semantic role for this text span. */
-  presentation?: 'intermediate' | 'answer'
-  model_call_id?: string
-  modelCallId?: string
-  iteration?: number
-}
-
 export type AssistantDelivery = 'visible' | 'suppressed'
 export type AssistantSuppressionReason = 'no_reply' | 'heartbeat_ack'
-
-/**
- * Additive terminal-delivery contract. Older gateways omit these fields; the
- * client then retains the conservative presentation-only sentinel fallback.
- */
-export interface SessionDonePayload extends SessionEventPayload {
-  text?: string
-  text_snapshot?: string | null
-  textSnapshot?: string | null
-  delivery?: AssistantDelivery
-  suppression_reason?: AssistantSuppressionReason | null
-  suppressionReason?: AssistantSuppressionReason | null
-  /** Additive turn provenance; snake_case is the canonical gateway spelling. */
-  input_mode?: string
-  inputMode?: string
-  run_kind?: string
-  runKind?: string
-}
-
-/** Durable-success receipt emitted only after transcript and task commits. */
-export interface TurnCommittedPayload extends SessionEventPayload {
-  schema_version: 1
-  session_key: string
-  session_id?: string
-  task_id: string
-  turn_id: string
-  status: 'succeeded'
-  terminal_reason: 'completed'
-  finished_at: number
-  client_message_id?: string
-  user_message_id?: string
-  surface_id?: string
-}
-
-export interface ToolUsePayload extends SessionEventPayload {
-  id?: string
-  toolId?: string
-  tool_use_id?: string
-  toolUseId?: string
-  tool_id?: string
-  name?: string
-  tool_name?: string
-  input?: unknown
-  input_delta?: string
-  inputDelta?: string
-  json_fragment?: string
-  jsonFragment?: string
-  fragment?: string
-  // Server wall-clock tool start time (epoch ms). Present on tool_use_start so a
-  // running tool's elapsed timer survives page switches / stream replay instead of
-  // restarting from a fresh local clock on remount (issue #329). 0/absent => use
-  // the local clock.
-  started_at?: number
-  tool_presentation?: ToolPresentation
-}
-
-export interface ToolDeltaPayload extends ToolUsePayload {
-  delta?: string
-  input_delta?: string
-}
-
-export interface ToolEndPayload extends ToolUsePayload {
-  arguments?: Record<string, unknown>
-  synthetic_from_text?: boolean
-}
-
-export interface ToolResultPayload extends ToolUsePayload {
-  arguments?: Record<string, unknown>
-  result?: unknown
-  content?: unknown
-  output?: unknown
-  error?: unknown
-  is_error?: boolean
-  isError?: boolean
-  execution_status?: { status?: string }
-  executionStatus?: { status?: string }
-}
 
 export interface ChatSendAttachmentPayload {
   type: string
@@ -274,88 +81,6 @@ export interface SessionSteerV2Params {
   expectedRevision?: number
   surface_id?: string
   _source?: { elevated?: string; runMode?: 'safe' | 'full' }
-}
-
-export interface InputDispositionPayload extends SessionEventPayload {
-  target_turn_id?: string
-  client_request_id?: string
-  client_message_id?: string
-  user_message_id?: string
-  disposition?: ChatSteerDisposition
-  promoted_from_turn_id?: string
-  promoted_turn_id?: string
-  applied_iteration?: number
-  model_call_id?: string
-  failure_code?: string
-  retryable?: boolean
-  recovery?: string
-  fallback_safe?: boolean
-  revision?: number
-}
-
-export interface RouterDecisionPayload extends SessionEventPayload {
-  tier?: string
-  model?: string
-  routed_model?: string
-  source?: string
-  routing_applied?: boolean
-  decision?: unknown
-  router_tier_snapshot?: unknown
-  routerTierSnapshot?: unknown
-}
-
-/* ── LLM ensemble progress ─────────────────────────────────────────────
- * Mid-turn `session.event.ensemble_progress` frames announce each ensemble
- * proposer/aggregator starting and finishing, so the router strip can reveal
- * members incrementally before the terminal `done` event lands.
- */
-export interface EnsembleProgressPayload extends SessionEventPayload {
-  event_type?: 'proposer_start' | 'proposer_finish' | 'aggregator_start' | 'aggregator_finish'
-  proposer_index?: number
-  proposer_label?: string
-  proposer_model?: string
-  proposer_provider?: string
-  sample_index?: number
-  elapsed_ms?: number
-  input_tokens?: number
-  output_tokens?: number
-  cost_usd?: number
-  error?: string
-}
-
-export interface CompactionPayload extends SessionEventPayload {
-  status?:
-    | 'started'
-    | 'observed'
-    | 'completed'
-    | 'skipped'
-    | 'stale'
-    | 'failed'
-    | 'error'
-    | 'cancelled'
-    | 'timed_out'
-    | 'emergency_ephemeral'
-    | (string & {})
-  compacted?: boolean
-  detail?: string
-  reason?: string
-  skip_reason?: string
-  source?: string
-  phase?: string
-  compaction_id?: string
-  compactionId?: string
-  sequence?: number
-  heartbeat?: boolean
-  heartbeat_at?: number
-  elapsed_ms?: number
-  stage?: string
-  refused?: boolean
-  safe_to_send?: boolean
-  safeToSend?: boolean
-  applied?: boolean
-  durability?: 'durable' | 'request_scoped' | (string & {})
-  user_visible?: boolean
-  userVisible?: boolean
 }
 
 export interface Attachment {
@@ -700,6 +425,8 @@ export interface ChatTurnOutcome {
 }
 
 export interface ChatRunTask {
+  /** Control ownership projected independently from persisted outcome identity. */
+  ownershipTaskId?: string
   status?: string
   cancel_requested?: boolean
   cancelRequested?: boolean
@@ -957,7 +684,7 @@ export interface ChatMessage {
   reasoningPresentationPending?: boolean
   activitySnapshot?: ActivitySnapshotV2
   activitySnapshotIncomplete?: boolean
-  routerDecision?: RouterDecisionPayload | null
+  routerDecision?: ConversationRoutingSnapshot | null
   /** Routing-only usage projection for a split historical answer segment. */
   routerUsage?: ChatUsagePayload
   routerModelCallId?: string

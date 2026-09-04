@@ -2806,7 +2806,10 @@ def test_desktop_gateway_bundle_collects_usage_ledger_and_verifies_query_ui() ->
 
     assert "'--collect-all',\n  'opensquilla'," in build_script
     assert migration.is_file()
-    assert "import type { Observability } from '@/modules/observability'" in usage_query
+    assert re.search(
+        r"import type \{[^}]*\bObservability\b[^}]*\} from '@/modules/observability'",
+        usage_query,
+    )
     assert "return observability.usage(range, options)" in usage_query
     assert "controlUiVerifier" in build_script
     assert "spawnSync(process.execPath, [controlUiVerifier, controlUiDistDir]" in build_script

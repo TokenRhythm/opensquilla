@@ -55,6 +55,7 @@ async function mountCatalog() {
     streamIdleTimeoutMs: null,
     concurrentHistoryReads: false,
     detachedSessionHydration: false,
+    turnCommittedEvents: false,
     subscriptionEpoch: 0,
     loadConnectionEndpoint: () => 'ws://example.invalid/ws',
     connect: async () => undefined,

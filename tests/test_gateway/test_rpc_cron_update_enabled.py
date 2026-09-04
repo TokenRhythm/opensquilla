@@ -5,7 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from opensquilla.gateway.rpc import RpcContext
-from opensquilla.gateway.rpc_cron import _handle_cron_add, _handle_cron_update
+from opensquilla.gateway.rpc_cron import (
+    _cron_create_contract as _handle_cron_add,
+)
+from opensquilla.gateway.rpc_cron import (
+    _cron_update_contract as _handle_cron_update,
+)
 from opensquilla.scheduler.engine import SchedulerEngine
 from opensquilla.scheduler.jobs import apply_result
 from opensquilla.scheduler.payloads import make_agent_turn_payload, payload_text

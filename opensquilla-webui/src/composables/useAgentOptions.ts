@@ -1,8 +1,7 @@
 import { ref } from 'vue'
 import { normalizeAgentId } from '@/utils/chat/sessionKeys'
 import type { AgentOption } from '@/types/agents'
-import type { RpcCallOptions } from '@/lib/rpc'
-import type { AgentCatalog } from '@/modules/agentCatalog'
+import type { AgentCatalog, AgentCatalogRequestOptions } from '@/modules/agentCatalog'
 
 /** The implicit default agent every chat surface can always start against. */
 const MAIN_AGENT: AgentOption = { id: 'main', name: 'Main Agent' }
@@ -21,14 +20,14 @@ let loadPromise: Promise<void> | null = null
  */
 export function useAgentOptions(
   catalog: AgentCatalog,
-  readCallOptions?: RpcCallOptions,
+  readOptions?: AgentCatalogRequestOptions,
 ) {
   function loadAgents(): Promise<void> {
     if (loadPromise) return loadPromise
     loadPromise = (async () => {
       agentListError.value = false
       try {
-        const listed = await catalog.list({ signal: readCallOptions?.signal })
+        const listed = await catalog.list({ signal: readOptions?.signal })
         agents.value = listed
           .map(a => ({
             id: normalizeAgentId(a.id || a.name || ''),

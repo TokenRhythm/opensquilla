@@ -7,6 +7,14 @@ import type { ArtifactPayload } from '@/types/artifacts'
 import { ARTIFACT_WORKBENCH_KEY, type ArtifactWorkbench } from '@/modules/artifactWorkbench'
 import { GATEWAY_ACCESS_KEY, type GatewayAccess } from '@/modules/gatewayAccess'
 import { createV4ArtifactContentAccess } from '@/adapters/gateway/artifactAccessV4'
+import { createV4ArtifactPreviews } from '@/adapters/gateway/artifactPreviewsV4'
+import { HttpTransportError } from '@/adapters/gateway/privateHttpTransport'
+import {
+  httpBinaryResponse,
+  httpTransportTestDouble,
+  type TestHttpBinaryResponse,
+  type TestHttpTransport,
+} from '@/testing/httpTransport.test-helper'
 import ChatArtifactList from './ChatArtifactList.vue'
 
 const videoArtifact: ArtifactPayload = {
@@ -25,6 +33,7 @@ async function settle() {
 }
 
 async function mountList(
+  http: TestHttpTransport,
   onDownload = vi.fn(),
   artifacts: ArtifactPayload[] = [videoArtifact],
 ) {
@@ -43,7 +52,8 @@ async function mountList(
     isLocalOwner: false,
   } as GatewayAccess)
   app.provide(ARTIFACT_WORKBENCH_KEY, {
-    content: createV4ArtifactContentAccess(),
+    content: createV4ArtifactContentAccess(http),
+    previews: createV4ArtifactPreviews(http, { baseOrigin: () => 'http://localhost' }),
   } as ArtifactWorkbench)
   app.mount(el)
   await settle()
@@ -56,12 +66,9 @@ async function requestPreview(el: HTMLElement) {
 }
 
 function successfulVideoResponse() {
-  return new Response(new Blob(['video-bytes'], { type: 'video/mp4' }), {
-    status: 200,
-    headers: {
-      'Content-Length': '11',
-      'Content-Type': 'video/mp4',
-    },
+  return httpBinaryResponse('video-bytes', {
+    contentLength: 11,
+    contentType: 'video/mp4',
   })
 }
 
@@ -80,25 +87,22 @@ beforeEach(() => {
 
 describe('ChatArtifactList video previews', () => {
   it('renders an authenticated inline player and preserves download', async () => {
-    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
-      successfulVideoResponse())
-    vi.stubGlobal('fetch', fetchImpl)
-    const { app, el, onDownload } = await mountList()
+    const requestBinary = vi.fn(async (_endpoint: string, _options?: unknown) => (
+      successfulVideoResponse()
+    ))
+    const http = httpTransportTestDouble({ requestBinary })
+    const { app, el, onDownload } = await mountList(http)
 
-    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(requestBinary).not.toHaveBeenCalled()
     expect(el.querySelector('.msg-video-card__load')?.textContent).toContain('Load video preview')
     await requestPreview(el)
 
-    expect(fetchImpl).toHaveBeenCalledWith('/api/v1/artifacts/art-video', expect.objectContaining({
-      method: 'GET',
-      credentials: 'same-origin',
-      headers: {
-        'x-opensquilla-session-key': 'agent:main:webchat:video',
-        Authorization: 'Bearer secret',
-      },
+    expect(requestBinary).toHaveBeenCalledWith('/api/v1/artifacts/art-video', expect.objectContaining({
+      sessionKey: 'agent:main:webchat:video',
+      timeoutMs: 0,
     }))
-    expect(String(fetchImpl.mock.calls[0]?.[0])).not.toContain('token=')
-    expect(String(fetchImpl.mock.calls[0]?.[0])).not.toContain('sessionKey=')
+    expect(String(requestBinary.mock.calls[0]?.[0])).not.toContain('token=')
+    expect(String(requestBinary.mock.calls[0]?.[0])).not.toContain('sessionKey=')
 
     const player = el.querySelector<HTMLVideoElement>('.msg-video-card__video')
     expect(player).toBeTruthy()
@@ -117,8 +121,10 @@ describe('ChatArtifactList video previews', () => {
   })
 
   it('shows a browser playback fallback while keeping retry and download available', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => successfulVideoResponse()))
-    const { app, el, onDownload } = await mountList()
+    const http = httpTransportTestDouble({
+      requestBinary: vi.fn(async () => successfulVideoResponse()),
+    })
+    const { app, el, onDownload } = await mountList(http)
     await requestPreview(el)
 
     el.querySelector<HTMLVideoElement>('.msg-video-card__video')
@@ -141,11 +147,11 @@ describe('ChatArtifactList video previews', () => {
 
   it('recovers from a failed authenticated preview fetch', async () => {
     vi.useFakeTimers()
-    const fetchImpl = vi.fn()
-      .mockResolvedValueOnce(new Response('', { status: 503 }))
+    const requestBinary = vi.fn()
+      .mockRejectedValueOnce(new HttpTransportError('http-status', 'unavailable', 503))
       .mockResolvedValueOnce(successfulVideoResponse())
-    vi.stubGlobal('fetch', fetchImpl)
-    const { app, el } = await mountList()
+    const http = httpTransportTestDouble({ requestBinary })
+    const { app, el } = await mountList(http)
     await requestPreview(el)
 
     expect(el.querySelector('.msg-video-card__fallback')?.textContent)
@@ -154,14 +160,16 @@ describe('ChatArtifactList video previews', () => {
     await vi.advanceTimersByTimeAsync(300)
     await settle()
 
-    expect(fetchImpl).toHaveBeenCalledTimes(2)
+    expect(requestBinary).toHaveBeenCalledTimes(2)
     expect(el.querySelector('.msg-video-card__video')).toBeTruthy()
     app.unmount()
   })
 
   it('lets the user explicitly unload a buffered video preview', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => successfulVideoResponse()))
-    const { app, el } = await mountList()
+    const http = httpTransportTestDouble({
+      requestBinary: vi.fn(async () => successfulVideoResponse()),
+    })
+    const { app, el } = await mountList(http)
     await requestPreview(el)
 
     expect(el.querySelector('.msg-video-card__video')).toBeTruthy()
@@ -176,14 +184,13 @@ describe('ChatArtifactList video previews', () => {
 
   it('rejects a video that exceeds the bounded preview response size', async () => {
     const tooLarge = 128 * 1024 * 1024 + 1
-    vi.stubGlobal('fetch', vi.fn(async () => new Response('small-test-body', {
-      status: 200,
-      headers: {
-        'Content-Length': String(tooLarge),
-        'Content-Type': 'video/mp4',
-      },
-    })))
-    const { app, el } = await mountList()
+    const http = httpTransportTestDouble({
+      requestBinary: vi.fn(async () => httpBinaryResponse('small-test-body', {
+        contentLength: tooLarge,
+        contentType: 'video/mp4',
+      })),
+    })
+    const { app, el } = await mountList(http)
     await requestPreview(el)
 
     expect(el.querySelector('.msg-video-card__fallback')?.textContent)
@@ -194,16 +201,18 @@ describe('ChatArtifactList video previews', () => {
 
   it('shows slow-load guidance and cancels the active request', async () => {
     let requestSignal: AbortSignal | null = null
-    vi.stubGlobal('fetch', vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
-      requestSignal = init?.signal || null
-      return new Promise<Response>((_resolve, reject) => {
-        requestSignal?.addEventListener('abort', () => {
-          reject(new DOMException('Aborted', 'AbortError'))
+    const http = httpTransportTestDouble({
+      requestBinary: vi.fn((_url, options) => {
+        requestSignal = options?.signal || null
+        return new Promise<TestHttpBinaryResponse>((_resolve, reject) => {
+          requestSignal?.addEventListener('abort', () => {
+            reject(new HttpTransportError('aborted', 'Aborted'))
+          })
         })
-      })
-    }))
+      }),
+    })
     const activeRequestWasAborted = () => requestSignal?.aborted === true
-    const { app, el } = await mountList()
+    const { app, el } = await mountList(http)
 
     el.querySelector<HTMLButtonElement>('.msg-video-card__load')?.click()
     await settle()
@@ -228,8 +237,10 @@ describe('ChatArtifactList video previews', () => {
     }))
     let urlIndex = 0
     vi.mocked(URL.createObjectURL).mockImplementation(() => `blob:opensquilla-video-${urlIndex += 1}`)
-    vi.stubGlobal('fetch', vi.fn(async () => successfulVideoResponse()))
-    const { app, el } = await mountList(vi.fn(), artifacts)
+    const http = httpTransportTestDouble({
+      requestBinary: vi.fn(async () => successfulVideoResponse()),
+    })
+    const { app, el } = await mountList(http, vi.fn(), artifacts)
     const cards = [...el.querySelectorAll<HTMLElement>('.msg-video-card')]
 
     for (const card of cards) {

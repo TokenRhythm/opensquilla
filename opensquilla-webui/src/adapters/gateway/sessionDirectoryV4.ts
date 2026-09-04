@@ -1,5 +1,5 @@
 import i18n from '@/i18n'
-import type { RpcCallOptions } from '@/lib/rpc'
+import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import {
   SESSIONS_LIST_METHOD,
   type SessionRow,

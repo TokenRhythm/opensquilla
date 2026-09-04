@@ -61,6 +61,31 @@ export interface PendingInputReorderResult {
   items: PendingInputServerItem[]
 }
 
+export type PendingInputQueueErrorKind =
+  | 'unsupported'
+  | 'cancelled'
+  | 'already-dispatched'
+  | 'attachment-expired'
+  | 'attachment-lost'
+  | 'rejected'
+  | 'unavailable'
+  | 'invalid'
+
+/** Durable-queue failure projected by the Gateway Adapter. */
+export class PendingInputQueueError extends Error {
+  constructor(
+    readonly kind: PendingInputQueueErrorKind,
+    message: string,
+    readonly accepted: boolean | null = null,
+    readonly retryable = false,
+    readonly retryAfterMs = 0,
+    readonly cause?: unknown,
+  ) {
+    super(message)
+    this.name = 'PendingInputQueueError'
+  }
+}
+
 /**
  * Stable domain port for durable pending-input operations. RPC method names,
  * wire aliases and transport generations stay behind the Gateway Adapter.

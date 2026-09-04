@@ -18,16 +18,17 @@ async def test_skill_management_adapter_projects_aliases_to_typed_commands() -> 
     adapter = GatewaySkillManagementAdapter(port)
 
     await adapter.reload(None)
+    operation_id = "00000000-0000-4000-8000-000000000001"
     await adapter.install(
         {
             "identifier": "@acme/demo",
             "source": "clawhub",
-            "operation_id": "operation-1",
+            "operation_id": operation_id,
             "force": True,
             "risk_confirmation": "ack",
         }
     )
-    await adapter.cancel({"operationId": "operation-1"})
+    await adapter.cancel({"operationId": operation_id})
     await adapter.install_dependencies(
         {
             "name": "demo",
@@ -40,7 +41,7 @@ async def test_skill_management_adapter_projects_aliases_to_typed_commands() -> 
 
     install = port.install.await_args.args[0]
     assert install.identifier == "@acme/demo"
-    assert install.operation_id == "operation-1"
+    assert install.operation_id == operation_id
     assert install.risk_confirmation == "ack"
     dependency = port.install_dependencies.await_args.args[0]
     assert dependency.dependency_id == "python"

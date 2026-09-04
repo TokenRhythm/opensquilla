@@ -1,11 +1,11 @@
 import { ref } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { RpcTimeoutError } from '@/lib/rpc'
 import type {
   SessionReadLease,
   SessionReadLifecycle,
 } from '@/modules/sessionReadLifecycle'
+import { SessionReadFailure } from '@/modules/sessionReadLifecycle'
 import type { SessionSubscriptionOutcome } from './useChatSessionSubscription'
 import {
   autoSendDraftIsUnchanged,
@@ -115,7 +115,7 @@ describe('useChatSessionBootstrap', () => {
       loadHistory: async () => {
         attempt += 1
         return attempt === 1
-          ? { ok: false, error: new RpcTimeoutError('chat.history', 7_000) }
+          ? { ok: false, error: new SessionReadFailure('timeout', 'chat.history timed out', true) }
           : { ok: true }
       },
     })
@@ -238,7 +238,10 @@ describe('useChatSessionBootstrap', () => {
     const { api } = createBootstrap({
       loadHistory: async context => {
         historyContexts.push(context)
-        return { ok: false, error: new RpcTimeoutError('chat.history', 7_000) }
+        return {
+          ok: false,
+          error: new SessionReadFailure('timeout', 'chat.history timed out', true),
+        }
       },
       subscribeSession: async context => {
         liveContexts.push(context)
@@ -246,7 +249,11 @@ describe('useChatSessionBootstrap', () => {
           authoritative: false,
           live: false,
           backgroundOnly: false,
-          error: new RpcTimeoutError('sessions.messages.subscribe', 7_000),
+          error: new SessionReadFailure(
+            'timeout',
+            'sessions.messages.subscribe timed out',
+            true,
+          ),
         }
       },
     })
@@ -262,11 +269,7 @@ describe('useChatSessionBootstrap', () => {
 
   it('retries STORAGE_BUSY after the server delay without disturbing live', async () => {
     vi.useFakeTimers()
-    const busy = Object.assign(new Error('storage busy'), {
-      code: 'STORAGE_BUSY',
-      retryable: true,
-      retry_after_ms: 100,
-    })
+    const busy = new SessionReadFailure('busy', 'storage busy', true, 100)
     let attempt = 0
     const { api, loadHistory, subscribeSession } = createBootstrap({
       loadHistory: async () => {
@@ -287,10 +290,7 @@ describe('useChatSessionBootstrap', () => {
 
   it('retries failed history manually on the same lease', async () => {
     let recover = false
-    const failure = Object.assign(new Error('history unavailable'), {
-      code: 'HISTORY_UNAVAILABLE',
-      retryable: true,
-    })
+    const failure = new SessionReadFailure('unavailable', 'history unavailable', true)
     const { api, loadHistory, subscribeSession, openSessionRead } = createBootstrap({
       loadHistory: async () => recover ? { ok: true } : { ok: false, error: failure },
     })
@@ -308,10 +308,7 @@ describe('useChatSessionBootstrap', () => {
 
   it('reopens a dead lease before retrying history', async () => {
     let recover = false
-    const failure = Object.assign(new Error('history unavailable'), {
-      code: 'HISTORY_UNAVAILABLE',
-      retryable: false,
-    })
+    const failure = new SessionReadFailure('unavailable', 'history unavailable', false)
     const {
       api,
       loadHistory,
@@ -453,13 +450,11 @@ describe('useChatSessionBootstrap', () => {
     expect(autoSendDraftIsUnchanged(
       'draft', 'draft', [attachment], [attachment], 1, 2,
     )).toBe(false)
-    expect(shouldRetrySessionPhase(Object.assign(new Error('temporarily unavailable'), {
-      code: 'UNAVAILABLE',
-      retryable: true,
-    }))).toBe(true)
-    expect(shouldRetrySessionPhase(Object.assign(new Error('not authorized'), {
-      code: 'FORBIDDEN',
-      retryable: false,
-    }))).toBe(false)
+    expect(shouldRetrySessionPhase(
+      new SessionReadFailure('unavailable', 'temporarily unavailable', true),
+    )).toBe(true)
+    expect(shouldRetrySessionPhase(
+      new SessionReadFailure('unavailable', 'not authorized', false),
+    )).toBe(false)
   })
 })

@@ -154,14 +154,13 @@ import VideoArtifactCard from '@/components/chat/VideoArtifactCard.vue'
 import type { ArtifactPayload } from '@/types/artifacts'
 import { useToasts } from '@/composables/useToasts'
 import {
-  createArtifactPreview,
-  type ArtifactPreviewController,
-  type ArtifactPreviewState,
-} from '@/composables/chat/useArtifactPreview'
-import {
   isActiveDocumentArtifactCandidate,
 } from '@/utils/chat/artifactAccess'
-import { ARTIFACT_WORKBENCH_KEY } from '@/modules/artifactWorkbench'
+import {
+  ARTIFACT_WORKBENCH_KEY,
+  type ArtifactPreviewController,
+  type ArtifactPreviewState,
+} from '@/modules/artifactWorkbench'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 import { usePlatform } from '@/platform'
 import {
@@ -238,7 +237,7 @@ function controllerFor(artifact: ArtifactPayload): ArtifactPreviewController {
   const key = artifactKey(artifact)
   let controller = controllers.get(key)
   if (!controller) {
-    controller = createArtifactPreview({
+    controller = artifactWorkbench.previews.create({
       artifact: () => artifact,
       sessionKey: () => props.sessionKey,
       variant: 'thumbnail',

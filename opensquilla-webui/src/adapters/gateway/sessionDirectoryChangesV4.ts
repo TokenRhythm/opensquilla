@@ -1,4 +1,7 @@
-import type { RpcCallOptions, RpcEventHandler } from '@/lib/rpc'
+import type {
+  TransportCallOptions as RpcCallOptions,
+  TransportEventHandler as RpcEventHandler,
+} from './transportTypes'
 import {
   SESSIONS_SUBSCRIBE_METHOD,
 } from '@/contracts/generated/v4/sessionsSubscribe'

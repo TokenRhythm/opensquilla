@@ -1,7 +1,16 @@
 // @vitest-environment happy-dom
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createArtifactPreview } from './useArtifactPreview'
+import { createArtifactPreview } from '@/adapters/gateway/artifactPreviewV4'
+import {
+  httpTransportTestDouble,
+  type TestHttpBinaryResponse,
+  type TestHttpTransport,
+} from '@/testing/httpTransport.test-helper'
+
+function httpTransport(requestBinary: TestHttpTransport['requestBinary']): TestHttpTransport {
+  return httpTransportTestDouble({ requestBinary })
+}
 
 afterEach(() => {
   vi.restoreAllMocks()
@@ -9,17 +18,18 @@ afterEach(() => {
 })
 
 describe('createArtifactPreview', () => {
-  it('derives the sanitized endpoint and credentials from an artifact session request', async () => {
-    sessionStorage.setItem('opensquilla.wsToken', 'adapter-secret')
-    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response('image-bytes', {
-        status: 200,
-        headers: { 'content-type': 'image/png' },
-      }),
-    )
+  it('derives the sanitized endpoint and scope for the private transport', async () => {
+    const blob = new Blob(['image-bytes'], { type: 'image/png' })
+    const response: TestHttpBinaryResponse = {
+      metadata: { status: 200, contentLength: blob.size, contentType: blob.type },
+      blob: async () => blob,
+      stream: () => blob.stream(),
+    }
+    const requestBinary = vi.fn(async () => response)
+    const http = httpTransport(requestBinary)
     vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:artifact-image')
     vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
-    const controller = createArtifactPreview({
+    const controller = createArtifactPreview(http, {
       artifact: () => ({
         id: 'image',
         name: 'image.png',
@@ -32,32 +42,27 @@ describe('createArtifactPreview', () => {
     controller.load()
     await vi.waitFor(() => expect(controller.state.value).toBe('loaded'))
 
-    expect(fetchMock).toHaveBeenCalledWith('/api/v1/artifacts/image', {
-      method: 'GET',
-      headers: {
-        'x-opensquilla-session-key': 'agent:main:webchat:ok',
-        Authorization: 'Bearer adapter-secret',
-      },
-      credentials: 'same-origin',
+    expect(requestBinary).toHaveBeenCalledWith('/api/v1/artifacts/image', {
+      sessionKey: 'agent:main:webchat:ok',
       signal: expect.any(AbortSignal),
-      redirect: 'error',
+      timeoutMs: 0,
     })
     controller.dispose()
   })
 
   it('aborts an active preview request when disposed', async () => {
     const observed: { signal?: AbortSignal } = {}
-    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(
-      (_input: RequestInfo | URL, init?: RequestInit) => {
-        observed.signal = init?.signal as AbortSignal
-        return new Promise<Response>((_resolve, reject) => {
+    const requestBinary = vi.fn(
+      (_input: string, options?: Parameters<TestHttpTransport['requestBinary']>[1]) => {
+        observed.signal = options?.signal
+        return new Promise<TestHttpBinaryResponse>((_resolve, reject) => {
           observed.signal?.addEventListener('abort', () => {
             reject(new DOMException('cancelled', 'AbortError'))
           }, { once: true })
         })
       },
     )
-    const controller = createArtifactPreview({
+    const controller = createArtifactPreview(httpTransport(requestBinary), {
       artifact: () => ({
         id: 'image',
         name: 'image.png',
@@ -67,7 +72,7 @@ describe('createArtifactPreview', () => {
     })
 
     controller.load()
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce())
+    await vi.waitFor(() => expect(requestBinary).toHaveBeenCalledOnce())
     expect(observed.signal?.aborted).toBe(false)
 
     controller.dispose()
@@ -76,5 +81,38 @@ describe('createArtifactPreview', () => {
     expect(observed.signal?.reason).toBe('cancelled')
     expect(controller.state.value).toBe('idle')
     await Promise.resolve()
+  })
+
+  it('loads cross-origin previews through the credential-free artifact capability', async () => {
+    const blob = new Blob(['external-image'], { type: 'image/png' })
+    const response: TestHttpBinaryResponse = {
+      metadata: { status: 200, contentLength: blob.size, contentType: blob.type },
+      blob: async () => blob,
+      stream: () => blob.stream(),
+    }
+    const requestBinary = vi.fn(async () => response)
+    const fetchExternalArtifact = vi.fn(async () => response)
+    const endpoint = 'https://files.example.test/image.png?signature=fixture'
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:external-image')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    const controller = createArtifactPreview(
+      httpTransportTestDouble({ fetchExternalArtifact, requestBinary }),
+      {
+        artifact: () => ({
+          id: 'external-image',
+          name: 'image.png',
+          mime: 'image/png',
+          download_url: endpoint,
+        }),
+      },
+      () => 'http://127.0.0.1:18791',
+    )
+
+    controller.load()
+    await vi.waitFor(() => expect(controller.state.value).toBe('loaded'))
+
+    expect(fetchExternalArtifact).toHaveBeenCalledWith(endpoint, expect.any(AbortSignal))
+    expect(requestBinary).not.toHaveBeenCalled()
+    controller.dispose()
   })
 })

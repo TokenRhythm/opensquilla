@@ -1,5 +1,4 @@
 import { computed, ref } from 'vue'
-import type { RpcCallOptions } from '@/lib/rpc'
 
 const activeHolds = ref(0)
 let primedRelease: (() => void) | null = null
@@ -12,17 +11,15 @@ let primedRelease: (() => void) | null = null
  */
 export const optionalSessionRpcAllowed = computed(() => activeHolds.value === 0)
 
-export const OPTIONAL_SESSION_RPC_TIMEOUT_MS = 10_000
+export const OPTIONAL_SESSION_READ_TIMEOUT_MS = 10_000
 
-export const optionalSessionRpcCallOptions: RpcCallOptions = {
-  timeoutMs: OPTIONAL_SESSION_RPC_TIMEOUT_MS,
-  // Give ordinary metadata latency enough room to avoid interrupting an
-  // active stream. If a request is genuinely stuck, the Gateway's serialized
-  // dispatcher cannot serve later frames, so reconnect as a last resort.
-  timeoutAction: 'reconnect',
-  // Navigation owns this waiter/request, never the shared transport. A
-  // superseded Session may abandon its result without recycling the socket.
-  abortAction: 'reject',
+export interface OptionalSessionReadOptions {
+  readonly timeoutMs: number
+  readonly signal?: AbortSignal
+}
+
+export const optionalSessionReadOptions: OptionalSessionReadOptions = {
+  timeoutMs: OPTIONAL_SESSION_READ_TIMEOUT_MS,
 }
 
 function createSessionBootstrapAdmission(): () => void {

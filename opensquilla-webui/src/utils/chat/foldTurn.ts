@@ -150,7 +150,7 @@ function asRenderedMessage(folded: {
  * Incremental live-turn accumulator.
  *
  * `foldTurn` below intentionally stays a pure replay oracle for history and
- * parity tests.  The live UI, however, must not replay the entire accepted
+ * deterministic fold tests. The live UI must not replay the entire accepted
  * frame log for every token.  This accumulator applies each frame once and
  * only derives the small render projection when the frame scheduler publishes
  * a snapshot.
@@ -209,6 +209,28 @@ export class TurnAccumulator {
    */
   currentRawText(): string {
     return this.finalText ?? this.rawText
+  }
+
+  /** Read bounded tool metadata without materializing the full render tree. */
+  currentToolCall(toolId: string): ChatToolCall | null {
+    const call = this.toolCallsById.get(toolId)
+    return call ? { ...call } : null
+  }
+
+  /** Return the first running tool using the same ordering as the live timeline. */
+  currentRunningToolCall(): ChatToolCall | null {
+    const call = this.toolCalls.find(candidate => candidate.isRunning)
+    return call ? { ...call } : null
+  }
+
+  hasToolBoundary(): boolean {
+    return this.toolCalls.length > 0
+      || this.segments.some(segment => segment.type === 'tool-group')
+  }
+
+  currentToolTiming(toolId: string): { startedAt: number; endedAt?: number } | null {
+    const timing = this.toolTimes.get(toolId)
+    return timing ? { ...timing } : null
   }
 
   private ensureReasoningBlock(
@@ -537,8 +559,7 @@ export class TurnAccumulator {
         // The production live answer is rendered by StreamingTextPart from
         // canonical raw text. Parsing the same growing answer here produced an
         // invisible full-prefix Markdown pass on every visual flush. Keep the
-        // rendered HTML only for intermediate narration and for the DEV shadow
-        // renderer, which still needs an exact legacy parity surface.
+        // rendered HTML only for intermediate narration.
         // Only the current trailing answer is owned by StreamingTextPart. If
         // a later tool arrives, that provisional answer moves back into the
         // activity chronology and needs rendered HTML like any other
