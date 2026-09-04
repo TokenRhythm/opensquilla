@@ -105,6 +105,9 @@ function panel(overrides: Record<string, unknown> = {}) {
     providerEnvCommand: '',
     llmTimeoutSeconds: 120,
     contextWindowTokens: '',
+    maxOutputTokens: '',
+    modelSupportsVision: false,
+    modelSupportsVideo: false,
     contextWindowGlobal: null,
     effectiveMaxTokens: null,
     providerIsLocal: false,
@@ -159,18 +162,18 @@ function testButton(el: HTMLElement): HTMLButtonElement | null {
 
 beforeEach(() => {
   i18n.global.locale.value = 'en'
-  // The context-window keys land in the locale JSONs via the i18n merge step;
+  // The model-parameter keys land in the locale JSONs via the i18n merge step;
   // inject them here so assertions exercise interpolation, not raw key names.
   i18n.global.mergeLocaleMessage('en', {
     setup: {
       provider: {
-        contextWindowLabel: 'Context window override (tokens)',
-        contextWindowDesc: 'desc',
         contextWindowAuto: 'auto',
-        contextWindowUnknown: 'unknown',
-        contextWindowNone: 'none',
-        contextWindowReadout: 'auto-detected {auto} · override {override} · effective {effective}',
         contextWindowLocalWarning: 'Effective context window is {tokens} tokens.',
+        modelOverridesTitle: 'Model parameters',
+        contextWindowField: 'Context window',
+        maxOutputField: 'Max output tokens',
+        modelCapVision: 'Image input',
+        modelCapVideo: 'Video input',
       },
     },
   })
@@ -1608,7 +1611,8 @@ describe('SetupProviderPanel — editor scope', () => {
     expect(routingLink?.textContent).toContain('Set up model routing')
     routingLink?.click()
     expect(onGoToSection).toHaveBeenCalledWith('modelStrategy')
-    expect(el.textContent).toContain('Context window · DeepSeek / deepseek-chat')
+    expect(modelOwner?.textContent).toContain('Model parameters')
+    expect(modelOwner?.querySelector('input[name="setup_provider_context_window"]')).toBeTruthy()
     const timeout = el.querySelector<HTMLInputElement>('input[name="setup_provider_request_timeout"]')
     expect(timeout).toBeTruthy()
     expect(timeout?.closest('details')?.textContent).toContain('Runtime defaults · All providers')
@@ -1954,58 +1958,188 @@ describe('SetupProviderPanel — effective output limit', () => {
   })
 })
 
-describe('SetupProviderPanel — context-window override', () => {
-  function contextInput(el: HTMLElement): HTMLInputElement | null {
-    return el.querySelector<HTMLInputElement>('input[name="setup_provider_context_window"]')
+describe('SetupProviderPanel — per-model parameter overrides', () => {
+  // With a live catalog the parameter controls dock inside the teleported
+  // dropdown, so they are reached through document.body once the list is open;
+  // in degraded mode they stay inline under the input.
+  function dockedRoot(): HTMLElement | null {
+    return document.querySelector<HTMLElement>('.setup-model-combobox__popup')
   }
 
-  function readout(el: HTMLElement): string {
-    return el.querySelector('.setup-context-window__readout')?.textContent || ''
+  async function openDropdown(el: HTMLElement): Promise<HTMLElement | null> {
+    el.querySelector<HTMLInputElement>('input[role="combobox"]')?.dispatchEvent(new Event('focus'))
+    await nextTick()
+    return dockedRoot()
+  }
+
+  function contextInput(scope: HTMLElement | null): HTMLInputElement | null {
+    return scope?.querySelector<HTMLInputElement>('input[name="setup_provider_context_window"]') ?? null
+  }
+
+  function maxOutputInput(scope: HTMLElement | null): HTMLInputElement | null {
+    return scope?.querySelector<HTMLInputElement>('input[name="setup_provider_max_output_tokens"]') ?? null
   }
 
   const modelValue = (value: string) =>
     (field: { name: string }) => (field.name === 'model' ? value : '')
 
-  it('shows the auto-detected window for the current model with no override', async () => {
+  it('renders the inline override controls with engine-fallback hints when no catalog exists', async () => {
     const { app, el } = await mountPanel({
-      connection: connection({ phase: 'verified', models: DISCOVERED, modelSource: 'live' }),
+      configuredProviders: [],
       providerFieldValue: modelValue('test-vendor/alpha'),
     })
 
     const input = contextInput(el)
     expect(input).toBeTruthy()
     expect(input?.disabled).toBe(false)
-    expect(input?.placeholder).toBe('auto')
-    expect(el.querySelector('.setup-context-window__readout')?.getAttribute('aria-live')).toBe('polite')
-    expect(readout(el)).toContain('auto-detected 262144')
-    expect(readout(el)).toContain('override none')
-    expect(readout(el)).toContain('effective 262144')
+    // No discovery row → the gray hint names the engine's 200k cloud floor.
+    expect(input?.placeholder).toBe('200000')
+    expect(maxOutputInput(el)?.placeholder).toBe('16384')
     expect(el.querySelector('.setup-warning')).toBeNull()
 
     app.unmount()
   })
 
-  it('reports unknown when the model has no discovery row', async () => {
+  it('hints the catalog context window when the model is discovered', async () => {
     const { app, el } = await mountPanel({
-      providerFieldValue: modelValue('unlisted-model'),
+      configuredProviders: [],
+      connection: connection({ phase: 'verified', models: DISCOVERED, modelSource: 'live' }),
+      providerFieldValue: modelValue('test-vendor/alpha'),
     })
 
-    expect(readout(el)).toContain('auto-detected unknown')
-    expect(readout(el)).toContain('effective unknown')
+    const popup = await openDropdown(el)
+    expect(contextInput(popup)?.placeholder).toBe('262144')
 
     app.unmount()
   })
 
-  it('an override beats auto-detection and warns for small local windows', async () => {
+  // Regression (2026-09-04): editing the *active* provider replaces the model
+  // combobox with the read-only routing card, so the parameter controls must
+  // render inline under that card — otherwise the primary provider has no edit
+  // affordance at all (the exact hole reported from the live UI).
+  it('renders editable parameter controls inline under the configured-primary card', async () => {
+    const onUpdateContextWindow = vi.fn()
+    const onUpdateMaxOutputTokens = vi.fn()
+    const onUpdateCap = vi.fn()
     const { app, el } = await mountPanel({
       connection: connection({ phase: 'verified', models: DISCOVERED, modelSource: 'live' }),
+      providerFieldValue: modelValue('test-vendor/alpha'),
+    }, { onUpdateContextWindow, onUpdateMaxOutputTokens, onUpdateCap })
+
+    // Card branch is active: combobox is gone, card is present.
+    expect(el.querySelector('[data-testid="configured-primary-model-readonly"]')).toBeTruthy()
+    expect(el.querySelector('input[role="combobox"]')).toBeNull()
+
+    // Controls live inside the card, not in a teleported popup.
+    const card = el.querySelector<HTMLElement>('[data-testid="configured-primary-model-readonly"]')!
+    const ctx = card.querySelector<HTMLInputElement>('input[name="setup_provider_context_window"]')
+    const max = card.querySelector<HTMLInputElement>('input[name="setup_provider_max_output_tokens"]')
+    expect(ctx).toBeTruthy()
+    expect(ctx?.disabled).toBe(false)
+    expect(max?.disabled).toBe(false)
+    expect(document.querySelector('.setup-model-combobox__popup')).toBeNull()
+
+    ctx!.value = '131072'
+    ctx!.dispatchEvent(new Event('input'))
+    max!.value = '8192'
+    max!.dispatchEvent(new Event('input'))
+    const vision = card.querySelector<HTMLInputElement>('input[name="setup_provider_supports_vision"]')!
+    vision.checked = true
+    vision.dispatchEvent(new Event('change'))
+    await nextTick()
+
+    expect(onUpdateContextWindow).toHaveBeenCalledWith('131072')
+    expect(onUpdateMaxOutputTokens).toHaveBeenCalledWith('8192')
+    expect(onUpdateCap).toHaveBeenCalledWith('vision', true)
+
+    app.unmount()
+  })
+
+  it('disables the inline parameter controls while the primary model is empty', async () => {
+    const { app, el } = await mountPanel()
+
+    const card = el.querySelector<HTMLElement>('[data-testid="configured-primary-model-readonly"]')!
+    expect(card).toBeTruthy()
+    expect(card.querySelector<HTMLInputElement>('input[name="setup_provider_context_window"]')?.disabled).toBe(true)
+
+    app.unmount()
+  })
+
+  it('docks the parameter controls inside the dropdown when a catalog exists', async () => {
+    const { app, el } = await mountPanel({
+      configuredProviders: [],
+      connection: connection({ phase: 'verified', models: DISCOVERED, modelSource: 'live' }),
+      providerFieldValue: modelValue('test-vendor/alpha'),
+    })
+
+    // Closed dropdown → nothing rendered: neither inline nor in the popup.
+    expect(contextInput(el)).toBeNull()
+    expect(dockedRoot()).toBeNull()
+
+    const popup = await openDropdown(el)
+    expect(popup).toBeTruthy()
+    // Docked controls are the popup's pinned footer, outside the scrolling list.
+    expect(popup?.querySelector('.setup-model-combobox__overrides--docked')).toBeTruthy()
+    expect(popup?.querySelector('[role="listbox"] .setup-model-combobox__overrides')).toBeNull()
+    expect(contextInput(popup)?.disabled).toBe(false)
+
+    app.unmount()
+  })
+
+  it('emits updateContextWindow from the docked control without closing the list', async () => {
+    const onUpdateContextWindow = vi.fn()
+    const { app, el } = await mountPanel(
+      {
+        configuredProviders: [],
+        connection: connection({ phase: 'verified', models: DISCOVERED, modelSource: 'live' }),
+        providerFieldValue: modelValue('test-vendor/alpha'),
+      },
+      { onUpdateContextWindow },
+    )
+
+    let popup = await openDropdown(el)
+    const input = contextInput(popup)!
+    // Focus moves from the model input into the docked control: the dropdown
+    // hosting it must stay open.
+    input.focus()
+    el.querySelector<HTMLInputElement>('input[role="combobox"]')?.dispatchEvent(
+      new FocusEvent('blur', { relatedTarget: input }),
+    )
+    await nextTick()
+    expect(dockedRoot()).toBeTruthy()
+
+    input.value = '131072'
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+    expect(onUpdateContextWindow).toHaveBeenCalledWith('131072')
+    popup = dockedRoot()
+    expect(popup).toBeTruthy()
+
+    app.unmount()
+  })
+
+  it('hints the local 8k fallbacks for a local provider without catalog data', async () => {
+    const { app, el } = await mountPanel({
+      configuredProviders: [],
+      providerFieldValue: modelValue('test-vendor/alpha'),
+      providerIsLocal: true,
+    })
+
+    expect(contextInput(el)?.placeholder).toBe('8192')
+    expect(maxOutputInput(el)?.placeholder).toBe('8192')
+
+    app.unmount()
+  })
+
+  it('warns for a small override on a local provider', async () => {
+    const { app, el } = await mountPanel({
+      configuredProviders: [],
       providerFieldValue: modelValue('test-vendor/alpha'),
       contextWindowTokens: '4096',
       providerIsLocal: true,
     })
 
-    expect(readout(el)).toContain('override 4096')
-    expect(readout(el)).toContain('effective 4096')
+    expect(contextInput(el)?.value).toBe('4096')
     expect(el.querySelector('.setup-warning')?.textContent).toContain('4096 tokens')
 
     app.unmount()
@@ -2013,6 +2147,7 @@ describe('SetupProviderPanel — context-window override', () => {
 
   it('does not warn for the same small window on a hosted provider', async () => {
     const { app, el } = await mountPanel({
+      configuredProviders: [],
       providerFieldValue: modelValue('test-vendor/alpha'),
       contextWindowTokens: '4096',
       providerIsLocal: false,
@@ -2023,38 +2158,9 @@ describe('SetupProviderPanel — context-window override', () => {
     app.unmount()
   })
 
-  it('falls back to the global llm.context_window_tokens layer when no override is set', async () => {
-    const { app, el } = await mountPanel({
-      connection: connection({ phase: 'verified', models: DISCOVERED, modelSource: 'live' }),
-      providerFieldValue: modelValue('test-vendor/alpha'),
-      contextWindowTokens: '',
-      contextWindowGlobal: 100000,
-    })
-
-    // No per-model override → effective takes the global config layer, not auto.
-    expect(readout(el)).toContain('override none')
-    expect(readout(el)).toContain('auto-detected 262144')
-    expect(readout(el)).toContain('effective 100000')
-
-    app.unmount()
-  })
-
-  it('a per-model override beats the global config layer', async () => {
-    const { app, el } = await mountPanel({
-      connection: connection({ phase: 'verified', models: DISCOVERED, modelSource: 'live' }),
-      providerFieldValue: modelValue('test-vendor/alpha'),
-      contextWindowTokens: '4096',
-      contextWindowGlobal: 100000,
-    })
-
-    expect(readout(el)).toContain('override 4096')
-    expect(readout(el)).toContain('effective 4096')
-
-    app.unmount()
-  })
-
   it('warns for a small global window on a local provider with no override', async () => {
     const { app, el } = await mountPanel({
+      configuredProviders: [],
       providerFieldValue: modelValue('test-vendor/alpha'),
       contextWindowTokens: '',
       contextWindowGlobal: 8192,
@@ -2066,10 +2172,26 @@ describe('SetupProviderPanel — context-window override', () => {
     app.unmount()
   })
 
-  it('disables the input while the model field is empty', async () => {
-    const { app, el } = await mountPanel()
+  it('shows saved override values in the inline parameter controls', async () => {
+    const { app, el } = await mountPanel({
+      configuredProviders: [],
+      providerFieldValue: modelValue('test-vendor/alpha'),
+      contextWindowTokens: '131072',
+      maxOutputTokens: '32768',
+      modelSupportsVision: true,
+    })
+
+    expect(contextInput(el)?.value).toBe('131072')
+    expect(maxOutputInput(el)?.value).toBe('32768')
+
+    app.unmount()
+  })
+
+  it('disables the override controls while the model field is empty', async () => {
+    const { app, el } = await mountPanel({ configuredProviders: [] })
 
     expect(contextInput(el)?.disabled).toBe(true)
+    expect(maxOutputInput(el)?.disabled).toBe(true)
 
     app.unmount()
   })
@@ -2077,7 +2199,7 @@ describe('SetupProviderPanel — context-window override', () => {
   it('emits updateContextWindow with the raw input string', async () => {
     const onUpdateContextWindow = vi.fn()
     const { app, el } = await mountPanel(
-      { providerFieldValue: modelValue('test-vendor/alpha') },
+      { configuredProviders: [], providerFieldValue: modelValue('test-vendor/alpha') },
       { onUpdateContextWindow },
     )
 
@@ -2087,6 +2209,28 @@ describe('SetupProviderPanel — context-window override', () => {
     await nextTick()
 
     expect(onUpdateContextWindow).toHaveBeenCalledWith('16384')
+
+    app.unmount()
+  })
+
+  it('emits updateMaxOutputTokens and updateCap from the override controls', async () => {
+    const onUpdateMaxOutputTokens = vi.fn()
+    const onUpdateCap = vi.fn()
+    const { app, el } = await mountPanel(
+      { configuredProviders: [], providerFieldValue: modelValue('test-vendor/alpha') },
+      { onUpdateMaxOutputTokens, onUpdateCap },
+    )
+
+    const maxOut = maxOutputInput(el)!
+    maxOut.value = '8192'
+    maxOut.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+    expect(onUpdateMaxOutputTokens).toHaveBeenCalledWith('8192')
+
+    const vision = el.querySelector<HTMLInputElement>('input[name="setup_provider_supports_vision"]')!
+    vision.click()
+    await nextTick()
+    expect(onUpdateCap).toHaveBeenCalledWith('vision', true)
 
     app.unmount()
   })

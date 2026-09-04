@@ -10,13 +10,14 @@ import SetupCommandBlock from '@/components/setup/SetupCommandBlock.vue'
 import SetupProviderCredentialCard from '@/components/setup/SetupProviderCredentialCard.vue'
 import SetupProviderRecommendation from '@/components/setup/SetupProviderRecommendation.vue'
 import SetupModelCombobox from '@/components/setup/SetupModelCombobox.vue'
+import SetupModelOverrides from '@/components/setup/SetupModelOverrides.vue'
 import SetupProviderCatalogDialog from '@/components/setup/SetupProviderCatalogDialog.vue'
 import type {
   ConnectionState,
   DiscoveredModel,
   ProviderCredentialPanelState,
 } from '@/composables/setup/useSetupProviderForm'
-import { parseContextWindowInput } from '@/composables/setup/useSettingsPromotedForm'
+import { parseTokenCountInput } from '@/composables/setup/useSettingsPromotedForm'
 import { localizedRelativeTime } from '@/utils/messageTime'
 
 const { t, locale } = useI18n()
@@ -52,6 +53,9 @@ interface ProviderPanelContract {
   providerEnvCommand: string
   llmTimeoutSeconds: number
   contextWindowTokens: string
+  maxOutputTokens: string
+  modelSupportsVision: boolean
+  modelSupportsVideo: boolean
   contextWindowGlobal: number | null
   effectiveMaxTokens: {
     value: number
@@ -111,6 +115,8 @@ const emit = defineEmits<{
   updateProviderField: [name: string, value: unknown]
   updateLlmTimeout: [value: number]
   updateContextWindow: [value: string]
+  updateMaxOutputTokens: [value: string]
+  updateCap: [name: 'vision' | 'video', value: boolean]
   probeConnection: []
   refreshModels: []
   saveProvider: []
@@ -746,34 +752,44 @@ const contextWindowAuto = computed<number | null>(() => {
   return typeof row?.contextWindow === 'number' ? row.contextWindow : null
 })
 
-const contextWindowOverride = computed<number | null>(() => (
-  parseContextWindowInput(props.panel.contextWindowTokens)
-))
-
-// Precedence mirrors the backend resolver (provider/resolution.py): a per-model
-// override wins, else the global llm.context_window_tokens layer, else the
-// auto-detected discovery window.
-const contextWindowEffective = computed<{ value: number | null; source: 'override' | 'config' | 'auto' }>(() => {
-  if (contextWindowOverride.value != null) {
-    return { value: contextWindowOverride.value, source: 'override' }
-  }
-  if (props.panel.contextWindowGlobal != null && props.panel.contextWindowGlobal > 0) {
-    return { value: props.panel.contextWindowGlobal, source: 'config' }
-  }
-  return { value: contextWindowAuto.value, source: 'auto' }
+const maxOutputAuto = computed<number | null>(() => {
+  if (!currentModelId.value) return null
+  const row = props.panel.connection.models.find(m => m.id === currentModelId.value)
+  return typeof row?.maxOutputTokens === 'number' && row.maxOutputTokens > 0
+    ? row.maxOutputTokens
+    : null
 })
 
-const contextWindowReadout = computed(() => t('setup.provider.contextWindowReadout', {
-  auto: contextWindowAuto.value != null
-    ? String(contextWindowAuto.value)
-    : t('setup.provider.contextWindowUnknown'),
-  override: contextWindowOverride.value != null
-    ? String(contextWindowOverride.value)
-    : t('setup.provider.contextWindowNone'),
-  effective: contextWindowEffective.value.value != null
-    ? String(contextWindowEffective.value.value)
-    : t('setup.provider.contextWindowUnknown'),
-}))
+// Engine-fallback placeholders (not a precedence reimplementation): the input's
+// gray hint shows what the engine will assume when the field is left blank —
+// local runtimes default to 8k, cloud deployments to the 200k floor (mirrors
+// provider/model_catalog.py DEFAULT_CONTEXT_WINDOW and the local 8192 num_ctx).
+const contextWindowHint = computed(() => {
+  if (contextWindowAuto.value != null) return String(contextWindowAuto.value)
+  return props.panel.providerIsLocal ? '8192' : '200000'
+})
+
+const maxOutputHint = computed(() => {
+  if (maxOutputAuto.value != null) return String(maxOutputAuto.value)
+  return props.panel.providerIsLocal ? '8192' : '16384'
+})
+
+// Warn only from the saved/override picture: local runtimes commonly truncate
+// silently below this window.
+const effectiveContextForWarning = computed<number | null>(() => {
+  const override = parseTokenCountInput(props.panel.contextWindowTokens)
+  if (override != null) return override
+  if (props.panel.contextWindowGlobal != null && props.panel.contextWindowGlobal > 0) {
+    return props.panel.contextWindowGlobal
+  }
+  return contextWindowAuto.value
+})
+
+const showContextWindowWarning = computed(() => (
+  props.panel.providerIsLocal
+  && effectiveContextForWarning.value != null
+  && effectiveContextForWarning.value <= LOCAL_CONTEXT_WINDOW_WARN_TOKENS
+))
 
 const effectiveMaxTokensReadout = computed(() => {
   if (props.panel.effectiveMaxTokensPending) {
@@ -804,11 +820,15 @@ const catalogSyncReadout = computed(() => {
   return ago ? t('setup.provider.modelCatalogSynced', { ago }) : ''
 })
 
-const showContextWindowWarning = computed(() => (
-  props.panel.providerIsLocal
-  && contextWindowEffective.value.value != null
-  && contextWindowEffective.value.value <= LOCAL_CONTEXT_WINDOW_WARN_TOKENS
-))
+const modelOverridesProp = computed(() => ({
+  contextWindow: props.panel.contextWindowTokens,
+  maxOutputTokens: props.panel.maxOutputTokens,
+  supportsVision: props.panel.modelSupportsVision,
+  supportsVideo: props.panel.modelSupportsVideo,
+  contextWindowHint: contextWindowHint.value,
+  maxOutputHint: maxOutputHint.value,
+  disabled: !currentModelId.value,
+}))
 
 const showTokenRhythmRecommendation = computed(() => {
   const hasTokenRhythm = props.panel.runtimeProviders.some(
@@ -1063,6 +1083,17 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
           {{ t('setup.provider.configureModelRouting') }}
           <Icon name="chevronRight" :size="15" aria-hidden="true" />
         </button>
+        <!-- The read-only card replaces the model combobox, which would be the
+             home of the per-model parameter controls. Render them inline here
+             so the active provider's params stay editable; model *selection*
+             itself remains owned by Model Routing. -->
+        <SetupModelOverrides
+          class="setup-model-combobox__overrides"
+          v-bind="modelOverridesProp"
+          @update-context-window="emit('updateContextWindow', $event)"
+          @update-max-output-tokens="emit('updateMaxOutputTokens', $event)"
+          @update-cap="(name, value) => emit('updateCap', name, value)"
+        />
       </div>
       <template v-else v-for="field in modelFields" :key="field.name">
         <SetupModelCombobox
@@ -1071,7 +1102,11 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
           :value="panel.providerFieldValue(field)"
           :models="panel.connection.models"
           :model-source="panel.connection.modelSource"
+          :overrides="modelOverridesProp"
           @update="(val) => emit('updateProviderField', 'model', val)"
+          @update-context-window="emit('updateContextWindow', $event)"
+          @update-max-output-tokens="emit('updateMaxOutputTokens', $event)"
+          @update-cap="(name, value) => emit('updateCap', name, value)"
         />
         <SetupField
           v-else
@@ -1144,34 +1179,13 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
         </template>
       </section>
 
-      <section v-if="panel.editingPrimary && modelFields.length" class="setup-provider-options__group">
-      <label class="control-row">
-        <div class="control-row__label-block">
-          <span class="control-row__label">{{ t('setup.provider.contextWindowIdentityLabel', { provider: selectedProviderLabel, model: currentModelId || t('setup.provider.contextWindowNoModel') }) }}</span>
-          <span class="control-row__desc">{{ t('setup.provider.contextWindowIdentityDesc') }}</span>
-        </div>
-        <div class="control-row__control setup-context-window">
-          <input
-            class="control-input control-input--narrow"
-            :value="panel.contextWindowTokens"
-            name="setup_provider_context_window"
-            type="number"
-            min="0"
-            step="1024"
-            inputmode="numeric"
-            :placeholder="t('setup.provider.contextWindowAuto')"
-            :disabled="!currentModelId"
-            @input="emit('updateContextWindow', ($event.target as HTMLInputElement).value)"
-          >
-          <span class="setup-context-window__readout" aria-live="polite">{{ contextWindowReadout }}</span>
-        </div>
-      </label>
-      <div v-if="showContextWindowWarning" class="setup-warning">
-        {{ t('setup.provider.contextWindowLocalWarning', { tokens: contextWindowEffective.value }) }}
+      <div
+        v-if="panel.editingPrimary && modelFields.length && showContextWindowWarning"
+        class="setup-warning"
+      >
+        {{ t('setup.provider.contextWindowLocalWarning', { tokens: effectiveContextForWarning }) }}
       </div>
-      </section>
     </details>
-
     <details v-if="panel.editingPrimary" class="setup-provider-global-settings" :open="panel.providerAdvancedOpen">
       <summary class="control-row control-row--divider">
         {{ t('setup.provider.runtimeDefaultsTitle') }}

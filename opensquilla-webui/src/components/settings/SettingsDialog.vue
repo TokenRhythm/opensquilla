@@ -133,6 +133,8 @@
               @update-provider-field="updateProviderField"
               @update-llm-timeout="updateLlmTimeout"
               @update-context-window="updateContextWindow"
+              @update-max-output-tokens="updateMaxOutputTokens"
+              @update-cap="updateModelCap"
               @probe-connection="probeProviderConnection"
               @refresh-models="refreshProviderModels"
               @save-provider="saveProvider"
@@ -313,6 +315,8 @@ const {
   updateProviderField,
   updateLlmTimeout,
   updateContextWindow,
+  updateMaxOutputTokens,
+  updateModelCap,
   probeProviderConnection,
   refreshProviderModels,
   probeConfiguredProvider,

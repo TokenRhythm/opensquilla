@@ -297,6 +297,7 @@ def _live_layer_fields(info: ModelInfo | None) -> dict[str, Any]:
         "supports_reasoning": info.supports_reasoning,
         "supports_tools": info.supports_tools,
         "supports_vision": info.supports_vision,
+        "supports_video": info.supports_video,
     }
     if info.display_name:
         fields["display_name"] = info.display_name
@@ -386,6 +387,7 @@ def _snapshot_layer_fields(provider_id: str, model_id: str) -> dict[str, Any]:
         ("reasoning", "supports_reasoning"),
         ("tools", "supports_tools"),
         ("vision", "supports_vision"),
+        ("video", "supports_video"),
     ):
         if snapshot_key in entry:
             fields[field_name] = bool(entry[snapshot_key])
@@ -420,6 +422,7 @@ def _capabilities_from_entry(entry: ModelCatalogEntry) -> ModelCapabilities:
         supports_reasoning=supports_reasoning,
         supports_tools=entry.supports_tools,
         supports_vision=entry.supports_vision,
+        supports_video=entry.supports_video,
         reasoning_format=reasoning_format if supports_reasoning else "none",
     )
 
@@ -506,6 +509,7 @@ class ModelCatalog:
                 supports_reasoning="reasoning" in supported or "reasoning_effort" in supported,
                 supports_tools="tools" in supported or "tool_choice" in supported,
                 supports_vision="image" in input_modalities,
+                supports_video="video" in input_modalities,
                 input_cost_per_1k=_price_per_1k(pricing.get("prompt")),
                 output_cost_per_1k=_price_per_1k(pricing.get("completion")),
             )
@@ -565,14 +569,18 @@ class ModelCatalog:
         ):
             supports_tools = info.supports_tools
             supports_vision = info.supports_vision
+            supports_video = info.supports_video
             if isinstance(override_fields.get("supports_tools"), bool):
                 supports_tools = override_fields["supports_tools"]
             if isinstance(override_fields.get("supports_vision"), bool):
                 supports_vision = override_fields["supports_vision"]
+            if isinstance(override_fields.get("supports_video"), bool):
+                supports_video = override_fields["supports_video"]
             return ModelCapabilities(
                 supports_reasoning=True,
                 supports_tools=supports_tools,
                 supports_vision=supports_vision,
+                supports_video=supports_video,
                 reasoning_format=(
                     override_reasoning_format
                     if isinstance(override_reasoning_format, str)
@@ -1300,6 +1308,7 @@ class ModelCatalog:
             ("reasoning", "supports_reasoning"),
             ("tools", "supports_tools"),
             ("vision", "supports_vision"),
+            ("video", "supports_video"),
         ):
             value = None
             if declared is not None:
@@ -1399,6 +1408,7 @@ class ModelCatalog:
                     for value, field_name in (
                         (declared.capabilities.tools, "supports_tools"),
                         (declared.capabilities.vision, "supports_vision"),
+                        (declared.capabilities.video, "supports_video"),
                     ):
                         if value is not None:
                             fields[field_name] = value

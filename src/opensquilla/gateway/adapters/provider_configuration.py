@@ -121,6 +121,12 @@ def model_info_to_projection(model: dict[str, Any]) -> dict[str, Any]:
             capabilities.append("vision")
     elif model.get("supports_tools"):
         capabilities.append("tools")
+    # Catalog/override knowledge of video input rides the resolved entry for
+    # every provider (mirrors the tools/vision layering above; TokenRhythm's
+    # declared/published metadata does not carry a video flag yet, so the
+    # shared catalog row decides).
+    if entry.supports_video:
+        capabilities.append("video")
 
     return {
         "id": model_id,

@@ -390,6 +390,7 @@ def _discover_model_row(info: ModelInfo, provider_id: str) -> dict[str, object]:
     )
     safe_vision = info.supports_vision or entry.supports_vision
     vision_enabled = False if vision is False else safe_vision
+    video_enabled = info.supports_video or entry.supports_video
     capabilities: list[str] = ["chat"]
     if tools_enabled:
         capabilities.append("tools")
@@ -397,6 +398,8 @@ def _discover_model_row(info: ModelInfo, provider_id: str) -> dict[str, object]:
         capabilities.append("reasoning")
     if vision_enabled:
         capabilities.append("vision")
+    if video_enabled:
+        capabilities.append("video")
 
     pricing: dict[str, float] | None = None
     if info.input_cost_per_1k > 0 or info.output_cost_per_1k > 0:

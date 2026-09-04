@@ -95,6 +95,26 @@ def test_model_row_values_map_from_model_info() -> None:
     assert row["metadata"] is None
 
 
+def test_video_capability_from_catalog_entry_is_projected(monkeypatch) -> None:
+    # Video input knowledge rides the resolved catalog entry (user override,
+    # correction, live layer) for every provider, not just TokenRhythm.
+    class _Catalog:
+        def resolve_entry(self, _model_id, *, provider):
+            return SimpleNamespace(
+                context_window=32_000,
+                max_output_tokens=4_096,
+                source="user",
+                reasoning_format="none",
+                supports_video=True,
+            )
+
+    monkeypatch.setattr("opensquilla.gateway.rpc_models._catalog", _Catalog())
+
+    row = _model_info_to_wire(_synthetic_model())
+
+    assert "video" in row["capabilities"]
+
+
 def test_model_row_carries_normalized_provider_metadata() -> None:
     metadata = {
         "schemaVersion": 1,
@@ -129,6 +149,7 @@ def test_tokenrhythm_wire_prefers_declared_values_and_explicit_false(monkeypatch
                 max_output_tokens=8_192,
                 source="corrections",
                 reasoning_format="qwen",
+                supports_video=False,
             )
 
         def get_capabilities(self, _model_id, provider):
@@ -184,6 +205,7 @@ def test_tokenrhythm_wire_uses_authority_resolved_model_info_without_rewriting_m
                 max_output_tokens=131_072,
                 source="corrections",
                 reasoning_format="none",
+                supports_video=False,
             )
 
     monkeypatch.setattr(

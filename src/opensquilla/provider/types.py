@@ -387,6 +387,7 @@ class ModelCapabilities:
     supports_tools: bool = True
     supports_streaming: bool = True
     supports_vision: bool = False
+    supports_video: bool = False
     reasoning_format: str = "none"
     # "none" | "openrouter" | "deepseek" | "think_tags"
 
@@ -496,6 +497,7 @@ class ModelInfo(BaseModel):
     supports_tools: bool = True
     supports_streaming: bool = True
     supports_vision: bool = False
+    supports_video: bool = False
     input_cost_per_1k: float = 0.0
     output_cost_per_1k: float = 0.0
     # Additive, normalized provider facts for discovery/RPC projection.

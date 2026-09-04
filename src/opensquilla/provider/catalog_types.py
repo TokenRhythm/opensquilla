@@ -45,6 +45,7 @@ class ModelCatalogEntry:
     supports_reasoning: bool = False
     supports_tools: bool = True
     supports_vision: bool = False
+    supports_video: bool = False
     reasoning_format: str = "none"
     input_cost_per_mtok: float | None = None
     output_cost_per_mtok: float | None = None
@@ -60,7 +61,9 @@ class ModelCatalogEntry:
 # fields (provider_id, model_id) and the derived ``source`` are excluded on
 # purpose: they describe the resolution, not the model.
 _INT_FIELDS = frozenset({"context_window", "max_output_tokens"})
-_BOOL_FIELDS = frozenset({"supports_reasoning", "supports_tools", "supports_vision"})
+_BOOL_FIELDS = frozenset(
+    {"supports_reasoning", "supports_tools", "supports_vision", "supports_video"}
+)
 _FLOAT_FIELDS = frozenset(
     {
         "input_cost_per_mtok",
