@@ -219,9 +219,14 @@ def _normalize_repo_ref(raw_ref: str, *, owner: str, repo: str) -> int | None:
     if local is not None:
         return int(local.group("number"))
 
+    accepted_owners = {owner.lower()}
+    if (owner.lower(), repo.lower()) == ("tokenrhythm", "opensquilla"):
+        # Historical issue references follow this repository's organization move.
+        accepted_owners.add("opensquilla")
+
     repo_ref = REPO_REF_RE.match(raw_ref)
     if repo_ref is not None:
-        if repo_ref.group("owner").lower() != owner.lower():
+        if repo_ref.group("owner").lower() not in accepted_owners:
             return None
         if repo_ref.group("repo").lower() != repo.lower():
             return None
@@ -229,7 +234,7 @@ def _normalize_repo_ref(raw_ref: str, *, owner: str, repo: str) -> int | None:
 
     issue_url = ISSUE_URL_RE.match(raw_ref)
     if issue_url is not None:
-        if issue_url.group("owner").lower() != owner.lower():
+        if issue_url.group("owner").lower() not in accepted_owners:
             return None
         if issue_url.group("repo").lower() != repo.lower():
             return None

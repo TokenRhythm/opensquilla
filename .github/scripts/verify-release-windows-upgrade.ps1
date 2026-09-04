@@ -7,17 +7,19 @@ param(
   [switch]$VerifyLongRunningUpdateBanner,
   [string]$RealUpdateChannelManifest = '',
   [ValidateSet('custom', 'default')]
-  [string]$InstallMode = 'custom'
+  [string]$InstallMode = 'custom',
+  [ValidateSet('0.5.3', '0.5.4')]
+  [string]$BaselineVersion = '0.5.3'
 )
 
 $ErrorActionPreference = 'Stop'
-$repository = 'opensquilla/opensquilla'
-$oldTag = 'v0.5.3'
-$oldAsset = 'OpenSquilla-0.5.3-win-x64.exe'
+$repository = 'TokenRhythm/opensquilla'
+$oldTag = "v$BaselineVersion"
+$oldAsset = "OpenSquilla-$BaselineVersion-win-x64.exe"
 $candidate = (Resolve-Path -LiteralPath $CandidateInstaller).Path
 $candidateName = [IO.Path]::GetFileName($candidate)
-$sandbox = Join-Path $env:RUNNER_TEMP "opensquilla-release-preservation-$Label-$InstallMode"
-$oldDir = Join-Path $sandbox 'v0.5.3'
+$sandbox = Join-Path $env:RUNNER_TEMP "opensquilla-release-preservation-$Label-$InstallMode-$BaselineVersion"
+$oldDir = Join-Path $sandbox $oldTag
 $appData = Join-Path $sandbox 'appdata'
 $localAppData = Join-Path $sandbox 'localappdata'
 $userData = Join-Path $appData 'OpenSquilla'
@@ -41,12 +43,20 @@ if ($RealUpdateChannelManifest) {
   $rehearsalManifest = Get-Content -LiteralPath $RealUpdateChannelManifest -Raw |
     ConvertFrom-Json
   $expectedInstalledVersion = [string]$rehearsalManifest.version
-  if ($expectedInstalledVersion -notmatch '^\d+\.\d+\.\d+$') {
+  if ($expectedInstalledVersion -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
     throw "Stable updater rehearsal has an invalid expected version: $expectedInstalledVersion"
+  }
+  if (
+    $rehearsalManifest.schemaVersion -ne 1 -or
+    $rehearsalManifest.tag -ne "v$expectedInstalledVersion" -or
+    $rehearsalManifest.prerelease -ne $false -or
+    [version]$expectedInstalledVersion -le [version]$BaselineVersion
+  ) {
+    throw "Stable updater rehearsal must advance v$BaselineVersion to a final release."
   }
 }
 gh release download $oldTag --repo $repository --pattern $oldAsset --dir $oldDir
-if ($LASTEXITCODE -ne 0) { throw 'Failed to download the v0.5.3 Windows installer.' }
+if ($LASTEXITCODE -ne 0) { throw "Failed to download the $oldTag Windows installer." }
 $oldInstaller = Join-Path $oldDir $oldAsset
 
 function Stop-InstalledProcesses {
@@ -71,32 +81,50 @@ try {
   if ($InstallMode -eq 'custom') { $oldArguments += "/D=$installDir" }
   $old = Start-Process -FilePath $oldInstaller -ArgumentList $oldArguments `
     -Wait -PassThru
-  if ($old.ExitCode -ne 0) { throw "v0.5.3 installer failed with exit code $($old.ExitCode)." }
+  if ($old.ExitCode -ne 0) { throw "$oldTag installer failed with exit code $($old.ExitCode)." }
 
   if ($InstallMode -eq 'default') {
     $oldApp = Get-ChildItem -LiteralPath $localAppData -Filter 'OpenSquilla.exe' -File -Recurse |
       Select-Object -First 1
-    if (-not $oldApp) { throw 'v0.5.3 default installation did not publish OpenSquilla.exe.' }
+    if (-not $oldApp) { throw "$oldTag default installation did not publish OpenSquilla.exe." }
     $installDir = $oldApp.Directory.FullName
   }
 
-  $oldRuntime = Join-Path $installDir 'resources\runtime\developer\windows-x64'
-  foreach ($oldExecutable in @(
-    (Join-Path $oldRuntime 'python\python.exe'),
-    (Join-Path $oldRuntime 'node\node.exe'),
-    (Join-Path $oldRuntime 'git-bash\bin\bash.exe')
-  )) {
-    if (-not (Test-Path -LiteralPath $oldExecutable -PathType Leaf)) {
-      throw "v0.5.3 bundled runtime is missing: $oldExecutable"
+  $oldAppPath = Join-Path $installDir 'OpenSquilla.exe'
+  $oldProductVersion = ([Diagnostics.FileVersionInfo]::GetVersionInfo($oldAppPath)).ProductVersion
+  if (-not $oldProductVersion -or $oldProductVersion.Trim() -ne $BaselineVersion) {
+    throw "Expected official $oldTag, found installed version: $oldProductVersion"
+  }
+  # v0.5.3 bundles developer tools; v0.5.4 uses the slim Runtime Pack layout.
+  if ($BaselineVersion -eq '0.5.3') {
+    $oldRuntime = Join-Path $installDir 'resources\runtime\developer\windows-x64'
+    foreach ($oldExecutable in @(
+      (Join-Path $oldRuntime 'python\python.exe'),
+      (Join-Path $oldRuntime 'node\node.exe'),
+      (Join-Path $oldRuntime 'git-bash\bin\bash.exe')
+    )) {
+      if (-not (Test-Path -LiteralPath $oldExecutable -PathType Leaf)) {
+        throw "$oldTag bundled runtime is missing: $oldExecutable"
+      }
+    }
+  } else {
+    $oldRuntime = Join-Path $installDir 'resources\runtime'
+    if (Test-Path -LiteralPath (Join-Path $oldRuntime 'developer')) {
+      throw "$oldTag unexpectedly contains bundled developer runtimes."
+    }
+    foreach ($metadata in @('runtime-manifest.json', 'runtime-pack-catalog.json')) {
+      if (-not (Test-Path -LiteralPath (Join-Path $oldRuntime $metadata) -PathType Leaf)) {
+        throw "$oldTag is missing runtime metadata: $metadata"
+      }
     }
   }
 
   python $probe seed --home $profile --label $Label --external-root $externalSentinels
-  if ($LASTEXITCODE -ne 0) { throw 'Failed to seed the synthetic v0.5.3 profile.' }
+  if ($LASTEXITCODE -ne 0) { throw "Failed to seed the synthetic $oldTag profile." }
 
   if ($RealUpdateChannelManifest) {
     # Gate boundary: this proves updater discovery/download integrity, behavior while
-    # v0.5.3 is running, successful normal NSIS handoff, and post-install preservation.
+    # the baseline is running, successful normal NSIS handoff, and post-install preservation.
     # electron-builder's NSIS upgrade is not transactional after the old uninstaller
     # starts; disk, power, or extraction failures in that later window are out of scope.
     $candidateSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $candidate).Hash.ToLowerInvariant()
@@ -106,6 +134,7 @@ try {
       '--user-data-dir', $userData,
       '--channel-manifest', $RealUpdateChannelManifest,
       '--expected-version', $expectedInstalledVersion,
+      '--baseline-version', $BaselineVersion,
       '--mode', 'manual',
       '--ready-output', $realUpdateResult,
       '--expected-sha256', $candidateSha256
@@ -116,11 +145,13 @@ try {
       $driverArguments += @('--install-dir', $installDir)
     }
     & node @driverArguments
-    if ($LASTEXITCODE -ne 0) { throw 'Official v0.5.3 real updater rehearsal failed.' }
+    if ($LASTEXITCODE -ne 0) { throw "Official $oldTag real updater rehearsal failed." }
     $updateResult = Get-Content -LiteralPath $realUpdateResult -Raw | ConvertFrom-Json
     if (
       -not $updateResult.ok -or
-      $updateResult.fromVersion -ne '0.5.3' -or
+      $updateResult.fromVersion -ne $BaselineVersion -or
+      $updateResult.toVersion -ne $expectedInstalledVersion -or
+      $updateResult.tag -ne "v$expectedInstalledVersion" -or
       $updateResult.source -ne 'oss' -or
       $updateResult.installMode -ne 'manual' -or
       $updateResult.sha256 -ne $candidateSha256 -or
@@ -133,7 +164,7 @@ try {
       throw "Unexpected official updater result: $($updateResult | ConvertTo-Json -Compress)"
     }
     if ((Get-FileHash -Algorithm SHA256 -LiteralPath $updateResult.downloadedInstaller).Hash.ToLowerInvariant() -ne $candidateSha256) {
-      throw 'Official v0.5.3 downloaded installer bytes differ from the Draft candidate.'
+      throw "Official $oldTag downloaded installer bytes differ from the Draft candidate."
     }
   } else {
     $installed = Start-Process -FilePath $candidate -ArgumentList @('/S', "/D=$installDir") `
@@ -143,11 +174,11 @@ try {
     }
   }
   python $probe verify --home $profile --label $Label --external-root $externalSentinels
-  if ($LASTEXITCODE -ne 0) { throw 'Candidate installation changed v0.5.3 profile data.' }
+  if ($LASTEXITCODE -ne 0) { throw "Candidate installation changed $oldTag profile data." }
 
   $candidateRuntime = Join-Path $installDir 'resources\runtime'
   if (Test-Path -LiteralPath (Join-Path $candidateRuntime 'developer')) {
-    throw 'Candidate installation retained the v0.5.3 bundled developer runtimes.'
+    throw 'Candidate installation retained bundled developer runtimes.'
   }
   foreach ($metadata in @('runtime-manifest.json', 'runtime-pack-catalog.json')) {
     if (-not (Test-Path -LiteralPath (Join-Path $candidateRuntime $metadata) -PathType Leaf)) {
@@ -234,7 +265,7 @@ try {
     throw 'Candidate selected a different state directory after upgrade.'
   }
   python $probe verify --home $profile --label $Label --external-root $externalSentinels
-  if ($LASTEXITCODE -ne 0) { throw 'Candidate launch changed v0.5.3 profile data.' }
+  if ($LASTEXITCODE -ne 0) { throw "Candidate launch changed $oldTag profile data." }
 
   $uninstaller = Get-ChildItem -LiteralPath $installDir -Filter 'Uninstall*.exe' -File |
     Select-Object -First 1
@@ -255,7 +286,7 @@ try {
     throw 'Candidate uninstaller did not remove OpenSquilla.exe.'
   }
   python $probe verify --home $profile --label $Label --external-root $externalSentinels
-  if ($LASTEXITCODE -ne 0) { throw 'Candidate uninstaller changed v0.5.3 profile data.' }
+  if ($LASTEXITCODE -ne 0) { throw "Candidate uninstaller changed $oldTag profile data." }
 } finally {
   Stop-InstalledProcesses
 }

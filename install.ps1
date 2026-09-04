@@ -13,7 +13,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $defaultVersion = 'v0.5.4'
-$repoSlug = if ($env:OPENSQUILLA_REPOSITORY) { $env:OPENSQUILLA_REPOSITORY } else { 'opensquilla/opensquilla' }
+$repoSlug = if ($env:OPENSQUILLA_REPOSITORY) { $env:OPENSQUILLA_REPOSITORY } else { 'TokenRhythm/opensquilla' }
 $pythonVersion = if ($env:OPENSQUILLA_PYTHON_VERSION) { $env:OPENSQUILLA_PYTHON_VERSION } else { '3.12' }
 $originalPath = if ($env:Path) { $env:Path } else { '' }
 $dryRun = $env:OPENSQUILLA_INSTALL_DRY_RUN -eq '1'
