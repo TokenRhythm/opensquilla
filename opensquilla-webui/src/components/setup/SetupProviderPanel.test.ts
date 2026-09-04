@@ -6,6 +6,7 @@ import { createPinia } from 'pinia'
 import i18n from '@/i18n'
 import zhHans from '@/locales/zh-Hans.json'
 import SetupProviderPanel from './SetupProviderPanel.vue'
+import { useRpcStore } from '@/stores/rpc'
 import type { ConnectionState, DiscoveredModel } from '@/composables/setup/useSetupProviderForm'
 
 function connection(overrides: Partial<ConnectionState> = {}): ConnectionState {
@@ -147,12 +148,13 @@ async function mountPanel(props: Record<string, unknown> = {}, listeners: Record
   const el = document.createElement('div')
   document.body.appendChild(el)
   const panelState = reactive(panel(props))
+  const pinia = createPinia()
   const app = createApp(SetupProviderPanel, { panel: panelState, ...listeners })
   app.use(i18n)
-  app.use(createPinia())
+  app.use(pinia)
   app.mount(el)
   await nextTick()
-  return { app, el, panelState }
+  return { app, el, panelState, pinia }
 }
 
 function testButton(el: HTMLElement): HTMLButtonElement | null {
@@ -2263,6 +2265,158 @@ describe('SetupProviderPanel — model strategy wayfinding', () => {
 
     expect(onGoToSection).toHaveBeenCalledTimes(1)
     expect(onGoToSection).toHaveBeenCalledWith('modelStrategy')
+    app.unmount()
+  })
+})
+
+describe('SetupProviderPanel — custom provider creation with per-model parameters', () => {
+  type RpcCallRecord = [method: string, params?: Record<string, unknown>]
+
+  function stubRpc(pinia: ReturnType<typeof createPinia>): RpcCallRecord[] {
+    const calls: RpcCallRecord[] = []
+    const impl = async (method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> => {
+      calls.push([method, params])
+      return {}
+    }
+    vi.spyOn(useRpcStore(pinia), 'call').mockImplementation(impl)
+    return calls
+  }
+
+  function fillCustomForm(dialog: HTMLElement, values: Record<string, string>) {
+    for (const [name, value] of Object.entries(values)) {
+      const input = dialog.querySelector<HTMLInputElement>(`input[name="${name}"]`)
+      if (!input) continue
+      input.value = value
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+    }
+  }
+
+  async function openCustomForm() {
+    document.querySelector<HTMLElement>('[data-custom-provider-trigger]')!.click()
+    await nextTick()
+    const dialog = document.querySelector<HTMLElement>('#setup-provider-editor-dialog')
+    expect(dialog).toBeTruthy()
+    return dialog as HTMLElement
+  }
+
+  async function addOneModelRow(dialog: HTMLElement, modelId: string) {
+    const addModel = Array.from(dialog.querySelectorAll<HTMLButtonElement>('button'))
+      .find(btn => (btn.textContent || '').trim() === 'Add model')
+    expect(addModel).toBeTruthy()
+    addModel!.click()
+    await nextTick()
+    const item = dialog.querySelector<HTMLElement>('.setup-provider-custom-form__model-item')
+    expect(item).toBeTruthy()
+    const modelIdInput = item!.querySelector<HTMLInputElement>('input[type="text"]')
+    modelIdInput!.value = modelId
+    modelIdInput!.dispatchEvent(new Event('input', { bubbles: true }))
+    return item as HTMLElement
+  }
+
+  function findCreateButton(dialog: HTMLElement): HTMLButtonElement {
+    const createBtn = Array.from(dialog.querySelectorAll<HTMLButtonElement>('footer button.btn--primary'))
+      .find(btn => (btn.textContent || '').includes('Save changes'))
+    expect(createBtn).toBeTruthy()
+    return createBtn as HTMLButtonElement
+  }
+
+  it('renders a per-model parameter block per row and persists it before creating the provider', async () => {
+    const { app, pinia } = await mountPanel()
+    const calls = stubRpc(pinia)
+
+    const dialog = await openCustomForm()
+    fillCustomForm(dialog, {
+      custom_provider_id: 'myprovider',
+      custom_display_name: 'My Provider',
+      custom_base_url: 'https://api.example.com/v1',
+      custom_api_key: 'sk-test',
+    })
+    const item = await addOneModelRow(dialog, 'test/model-1')
+
+    // The parameter block is visible by default — no extra click required.
+    const ctxInput = item.querySelector<HTMLInputElement>('input[name="setup_provider_context_window"]')
+    expect(ctxInput).toBeTruthy()
+    ctxInput!.value = '8192'
+    ctxInput!.dispatchEvent(new Event('input', { bubbles: true }))
+    const vision = item.querySelector<HTMLInputElement>('input[name="setup_provider_supports_vision"]')
+    vision!.click()
+    await nextTick()
+
+    const createBtn = findCreateButton(dialog)
+    expect(createBtn.disabled).toBe(false)
+    createBtn.click()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    await nextTick()
+
+    expect(calls).toContainEqual([
+      'config.patch',
+      { patch: { models: { myprovider: { 'test/model-1': { context_window: 8192, supports_vision: true } } } } },
+    ])
+    const upsert = calls.find(([method]) => method === 'onboarding.llmProfile.upsert')
+    expect(upsert).toBeTruthy()
+    expect(upsert![1]).toMatchObject({
+      providerId: 'myprovider',
+      baseUrl: 'https://api.example.com/v1',
+      model: 'test/model-1',
+    })
+    // Parameter persistence lands before the profile upsert.
+    expect(calls.findIndex(([m]) => m === 'config.patch'))
+      .toBeLessThan(calls.findIndex(([m]) => m === 'onboarding.llmProfile.upsert'))
+    app.unmount()
+  })
+
+  it('skips the config.patch call entirely when no parameter is set', async () => {
+    const { app, pinia } = await mountPanel()
+    const calls = stubRpc(pinia)
+
+    const dialog = await openCustomForm()
+    fillCustomForm(dialog, {
+      custom_provider_id: 'myprovider',
+      custom_base_url: 'https://api.example.com/v1',
+      custom_api_key: 'sk-test',
+    })
+    await addOneModelRow(dialog, 'test/model-1')
+    await nextTick()
+
+    findCreateButton(dialog).click()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    await nextTick()
+
+    expect(calls.some(([method]) => method === 'config.patch')).toBe(false)
+    expect(calls.some(([method]) => method === 'onboarding.llmProfile.upsert')).toBe(true)
+    app.unmount()
+  })
+
+  it('keeps the provider uncreated when parameter persistence fails', async () => {
+    const { app, pinia } = await mountPanel()
+    const store = useRpcStore(pinia)
+    const calls: RpcCallRecord[] = []
+    vi.spyOn(store, 'call').mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+      calls.push([method, params])
+      if (method === 'config.patch') throw new Error('disk full')
+      return {}
+    })
+
+    const dialog = await openCustomForm()
+    fillCustomForm(dialog, {
+      custom_provider_id: 'myprovider',
+      custom_base_url: 'https://api.example.com/v1',
+      custom_api_key: 'sk-test',
+    })
+    const item = await addOneModelRow(dialog, 'test/model-1')
+    const ctxInput = item.querySelector<HTMLInputElement>('input[name="setup_provider_context_window"]')
+    ctxInput!.value = '4096'
+    ctxInput!.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+
+    findCreateButton(dialog).click()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    await nextTick()
+
+    expect(calls.some(([method]) => method === 'onboarding.llmProfile.upsert')).toBe(false)
+    // Form stays open with the failure surfaced.
+    expect(document.querySelector('#setup-provider-editor-dialog')).toBeTruthy()
+    expect(document.body.textContent).toContain('Failed to save the model parameters: disk full')
     app.unmount()
   })
 })

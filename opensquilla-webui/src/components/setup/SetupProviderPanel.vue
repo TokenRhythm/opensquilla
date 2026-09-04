@@ -147,7 +147,23 @@ const dialogInvoker = ref<HTMLElement | null>(null)
 // Cherry-style custom provider form state. Shown in the add dialog as the
 // default view; the original provider catalog opens one level deeper from it.
 // ---------------------------------------------------------------------------
-interface CustomModelRow { id: string; name: string }
+interface CustomModelParams {
+  contextWindow: string
+  maxOutputTokens: string
+  supportsVision: boolean
+  supportsVideo: boolean
+}
+
+interface CustomModelRow {
+  id: string
+  name: string
+  params: CustomModelParams
+  paramsOpen: boolean
+}
+
+function emptyCustomModelParams(): CustomModelParams {
+  return { contextWindow: '', maxOutputTokens: '', supportsVision: false, supportsVideo: false }
+}
 
 const customFormVisible = ref(false)
 const customProviderId = ref('')
@@ -205,7 +221,40 @@ const customFormReady = computed(() => {
 const isAddFlow = computed(() => addOpen.value || customFormVisible.value)
 
 function addCustomModelRow() {
-  customModels.value.push({ id: '', name: '' })
+  customModels.value.push({ id: '', name: '', params: emptyCustomModelParams(), paramsOpen: true })
+}
+
+function updateCustomModelCap(row: CustomModelRow, name: 'vision' | 'video', value: boolean) {
+  if (name === 'vision') row.params.supportsVision = value
+  else row.params.supportsVideo = value
+}
+
+// Build the deep-merge payload for the `models.<provider>."<model_id>"` config
+// subtree (the same layer the Settings per-model override UI writes). Blank
+// numeric fields and unchecked capability switches are omitted so catalog
+// values stay in charge.
+function customModelOverridePayload(providerId: string): Record<string, unknown> | null {
+  const byModel: Record<string, Record<string, unknown>> = {}
+  for (const row of customModels.value) {
+    const modelId = row.id.trim()
+    if (!modelId) continue
+    const fields: Record<string, unknown> = {}
+    const contextWindow = parseTokenCountInput(row.params.contextWindow)
+    if (contextWindow !== null) fields.context_window = contextWindow
+    const maxOutput = parseTokenCountInput(row.params.maxOutputTokens)
+    if (maxOutput !== null) fields.max_output_tokens = maxOutput
+    if (row.params.supportsVision) fields.supports_vision = true
+    if (row.params.supportsVideo) fields.supports_video = true
+    if (Object.keys(fields).length) byModel[modelId] = fields
+  }
+  if (!Object.keys(byModel).length) return null
+  return { models: { [providerId]: byModel } }
+}
+
+async function saveCustomModelOverrides(providerId: string): Promise<void> {
+  const patch = customModelOverridePayload(providerId)
+  if (!patch) return
+  await rpc.call('config.patch', { patch })
 }
 
 function removeCustomModelRow(index: number) {
@@ -246,7 +295,12 @@ async function fetchCustomModels() {
       }))
       .filter(item => item.id)
     if (discovered.length > 0) {
-      customModels.value = discovered.map(item => ({ id: item.id, name: item.name || item.id }))
+      customModels.value = discovered.map(item => ({
+        id: item.id,
+        name: item.name || item.id,
+        params: emptyCustomModelParams(),
+        paramsOpen: true,
+      }))
       customManualHint.value = false
     } else {
       customManualHint.value = true
@@ -267,6 +321,14 @@ async function createCustomProvider() {
   customCreating.value = true
   customError.value = ''
   try {
+    // Persist the per-model parameters first: on failure the provider is not
+    // created and the form stays open, so nothing partial is left behind.
+    try {
+      await saveCustomModelOverrides(providerId)
+    } catch (err) {
+      customError.value = t('setup.provider.customErrorSaveParams', { detail: discoverErrorDetail(err) })
+      return
+    }
     await rpc.call('onboarding.llmProfile.upsert', {
       providerId,
       baseUrl: customBaseUrl.value.trim(),
@@ -1415,29 +1477,54 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
                   <div
                     v-for="(row, index) in customModels"
                     :key="index"
-                    class="setup-provider-custom-form__model-row"
+                    class="setup-provider-custom-form__model-item"
                   >
-                    <input
-                      v-model="row.id"
-                      class="control-input"
-                      type="text"
-                      spellcheck="false"
-                      :placeholder="t('setup.provider.customModelIdPlaceholder')"
-                    >
-                    <input
-                      v-model="row.name"
-                      class="control-input"
-                      type="text"
-                      :placeholder="t('setup.provider.customModelNamePlaceholder')"
-                    >
-                    <button
-                      type="button"
-                      class="btn btn--ghost btn--icon"
-                      :aria-label="t('setup.provider.customModelsRemove')"
-                      @click="removeCustomModelRow(index)"
-                    >
-                      <Icon name="x" :size="15" aria-hidden="true" />
-                    </button>
+                    <div class="setup-provider-custom-form__model-row">
+                      <input
+                        v-model="row.id"
+                        class="control-input"
+                        type="text"
+                        spellcheck="false"
+                        :placeholder="t('setup.provider.customModelIdPlaceholder')"
+                      >
+                      <input
+                        v-model="row.name"
+                        class="control-input"
+                        type="text"
+                        :placeholder="t('setup.provider.customModelNamePlaceholder')"
+                      >
+                      <button
+                        type="button"
+                        class="btn btn--ghost btn--icon setup-provider-custom-form__params-toggle"
+                        :class="{ 'is-open': row.paramsOpen }"
+                        :aria-label="t('setup.provider.modelOverridesTitle')"
+                        :aria-expanded="row.paramsOpen ? 'true' : 'false'"
+                        @click="row.paramsOpen = !row.paramsOpen"
+                      >
+                        <Icon name="chevronDown" :size="15" aria-hidden="true" />
+                      </button>
+                      <button
+                        type="button"
+                        class="btn btn--ghost btn--icon"
+                        :aria-label="t('setup.provider.customModelsRemove')"
+                        @click="removeCustomModelRow(index)"
+                      >
+                        <Icon name="x" :size="15" aria-hidden="true" />
+                      </button>
+                    </div>
+                    <SetupModelOverrides
+                      v-if="row.paramsOpen"
+                      class="setup-provider-custom-form__model-params"
+                      :context-window="row.params.contextWindow"
+                      :max-output-tokens="row.params.maxOutputTokens"
+                      :supports-vision="row.params.supportsVision"
+                      :supports-video="row.params.supportsVideo"
+                      :context-window-hint="t('setup.provider.contextWindowAuto')"
+                      :max-output-hint="t('setup.provider.contextWindowAuto')"
+                      @update-context-window="row.params.contextWindow = $event"
+                      @update-max-output-tokens="row.params.maxOutputTokens = $event"
+                      @update-cap="(name, value) => updateCustomModelCap(row, name, value)"
+                    />
                   </div>
 
                   <button
@@ -2266,6 +2353,15 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 
 .setup-provider-custom-form__model-row .control-input {
   flex: 1 1 0;
+}
+
+.setup-provider-custom-form__model-item {
+  display: grid;
+  gap: var(--sp-2);
+}
+
+.setup-provider-custom-form__params-toggle.is-open {
+  transform: rotate(180deg);
 }
 
 .setup-provider-custom-form__empty {
