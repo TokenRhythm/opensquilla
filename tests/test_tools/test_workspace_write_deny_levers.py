@@ -555,7 +555,7 @@ async def test_exec_command_mutator_passes_through_by_default(
     _configure_ctx(workspace, ["tests/**"])
 
     result = await shell.exec_command(
-        "sed -i 's/assert a/assert b/' tests/test_a.py", workdir=str(workspace)
+        "sed -i.bak 's/assert a/assert b/' tests/test_a.py", workdir=str(workspace)
     )
 
     assert result.startswith("exit_code=0")

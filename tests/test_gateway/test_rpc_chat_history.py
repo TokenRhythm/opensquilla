@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import pytest
 
-import opensquilla.gateway.rpc_chat as rpc_chat_module
 from opensquilla.artifact_session import (
     Actor,
     ActorKind,
@@ -13,6 +12,7 @@ from opensquilla.artifact_session import (
     ArtifactKind,
     ArtifactSessionService,
 )
+from opensquilla.gateway.adapters import session_history_projection
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.rpc_chat import _handle_chat_history
 from opensquilla.session.manager import SessionManager
@@ -1800,7 +1800,11 @@ async def test_chat_history_waits_for_same_connection_compaction_rewrite(
 async def test_chat_history_session_lock_wait_is_bounded_and_retryable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(rpc_chat_module, "_CHAT_HISTORY_LOCK_BUDGET_SECONDS", 0.05)
+    monkeypatch.setattr(
+        session_history_projection,
+        "_CHAT_HISTORY_LOCK_BUDGET_SECONDS",
+        0.05,
+    )
     session_key = "agent:main:webchat:bounded-history-lock"
     mutation_lock = asyncio.Lock()
     await mutation_lock.acquire()
@@ -1854,7 +1858,11 @@ async def test_chat_history_session_lock_wait_is_bounded_and_retryable(
 async def test_chat_history_busy_maps_to_retryable_wire_envelope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(rpc_chat_module, "_CHAT_HISTORY_LOCK_BUDGET_SECONDS", 0.01)
+    monkeypatch.setattr(
+        session_history_projection,
+        "_CHAT_HISTORY_LOCK_BUDGET_SECONDS",
+        0.01,
+    )
     session_key = "agent:main:webchat:history-wire-busy"
     mutation_lock = asyncio.Lock()
     await mutation_lock.acquire()

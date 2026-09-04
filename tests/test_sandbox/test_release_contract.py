@@ -23,7 +23,7 @@ def test_saved_safe_policy_is_pinned_at_every_gateway_turn_boundary() -> None:
     for path in (
         "src/opensquilla/gateway/boot.py",
         "src/opensquilla/gateway/channel_dispatch.py",
-        "src/opensquilla/gateway/rpc_sessions.py",
+        "src/opensquilla/gateway/direct_turn_runtime.py",
         "src/opensquilla/cli/agent_cmd.py",
     ):
         assert "pin_sandbox_policy" in _text(path), path

@@ -106,17 +106,16 @@
 import { computed, inject, nextTick, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
-import {
-  createArtifactPreview,
-  type ArtifactPreviewController,
-  type ArtifactPreviewState,
-} from '@/composables/chat/useArtifactPreview'
 import { useArtifactImageLightbox } from '@/composables/chat/useArtifactImageLightbox'
 import { useDialogLayer } from '@/composables/useDialogA11y'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { useToasts } from '@/composables/useToasts'
 import type { ArtifactPayload } from '@/types/artifacts'
-import { ARTIFACT_WORKBENCH_KEY } from '@/modules/artifactWorkbench'
+import {
+  ARTIFACT_WORKBENCH_KEY,
+  type ArtifactPreviewController,
+  type ArtifactPreviewState,
+} from '@/modules/artifactWorkbench'
 import {
   artifactCategory,
   artifactFileTitle,
@@ -189,7 +188,7 @@ function disposeFull() {
 
 function loadFull(artifact: ArtifactPayload, sessionKey: string) {
   disposeFull()
-  fullController = createArtifactPreview({
+  fullController = artifactWorkbench.previews.create({
     artifact: () => artifact,
     sessionKey: () => sessionKey,
     variant: 'content',

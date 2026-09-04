@@ -1,8 +1,7 @@
-"""Tests that _drain_task_runtime_for_reset is called on every reset branch.
+"""Tests that runtime quiescence is called on every reset branch.
 
-Asserts that ``_drain_task_runtime_for_reset`` is invoked regardless of
-whether ``flush_service`` is None or wired, and regardless of the
-``force`` flag.
+Asserts that the concrete reset quiescence Port is invoked regardless of
+whether ``flush_service`` is None or wired, and regardless of the force flag.
 """
 
 from __future__ import annotations
@@ -111,7 +110,10 @@ async def test_drain_called_when_flush_service_none():
     task_runtime = _make_task_runtime()
     ctx = _make_ctx(flush_service=None, task_runtime=task_runtime)
 
-    target = "opensquilla.gateway.rpc_sessions._drain_task_runtime_for_reset"
+    target = (
+        "opensquilla.gateway.adapters.session_reset."
+        "GatewaySessionResetPorts._quiesce_task_runtime"
+    )
     with patch(target, new_callable=AsyncMock) as mock_drain:
         result = await get_dispatcher().dispatch(
             "r1",
@@ -146,7 +148,10 @@ async def test_drain_called_with_flush_service():
 
     ctx = _make_ctx(flush_service=fake_flush_service, task_runtime=task_runtime)
 
-    target = "opensquilla.gateway.rpc_sessions._drain_task_runtime_for_reset"
+    target = (
+        "opensquilla.gateway.adapters.session_reset."
+        "GatewaySessionResetPorts._quiesce_task_runtime"
+    )
     with patch(target, new_callable=AsyncMock) as mock_drain:
         result = await get_dispatcher().dispatch(
             "r1",

@@ -1,6 +1,6 @@
 import { computed, type ComputedRef, type Ref } from 'vue'
 import i18n from '@/i18n'
-import type { SessionRow, SortedRow } from '@/types/usage'
+import type { SortedRow, UsageSession } from '@/types/usage'
 
 const t = i18n.global.t
 
@@ -8,26 +8,22 @@ function nonEmptyText(value: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
 }
 
-function usageRowIdentity(row: SessionRow, sessionKey: string, sessionLabel: string): string {
+function usageRowIdentity(row: UsageSession, sessionKey: string, sessionLabel: string): string {
   return nonEmptyText(sessionKey)
     || nonEmptyText(row.sessionId)
-    || nonEmptyText(row.session_id)
     || nonEmptyText(row.session)
-    || nonEmptyText(row.key)
     || sessionLabel
 }
 
 export function useUsageSessionRows(options: {
-  visibleSessions: ComputedRef<SessionRow[]>
+  visibleSessions: ComputedRef<UsageSession[]>
   rangeHiddenHint: ComputedRef<string>
   sortCol: Ref<string>
   sortAsc: Ref<boolean>
-  rowVal: (row: Record<string, unknown>, ...keys: string[]) => unknown
-  numericRowVal: (row: Record<string, unknown>, ...keys: string[]) => number | null
-  sessionTimestamp: (row: SessionRow) => number | null
+  sessionTimestamp: (row: UsageSession) => number | null
   relTime: (timestamp: number | string) => string
-  sortVal: (row: SessionRow, key: string) => string | number
-  taskName: (row: SessionRow) => string
+  sortVal: (row: UsageSession, key: string) => string | number
+  taskName: (row: UsageSession) => string
 }) {
   const sortedRows = computed((): SortedRow[] => {
     const sorted = [...options.visibleSessions.value].sort((a, b) => {
@@ -40,9 +36,8 @@ export function useUsageSessionRows(options: {
     })
 
     return sorted.map(row => {
-      const sessionKey = (options.rowVal(row, 'sessionKey', 'key') || '') as string
+      const sessionKey = row.sessionKey
       const sessionLabel = options.taskName(row)
-      const cost = options.rowVal(row, 'cost_usd', 'costUsd')
       const timestamp = options.sessionTimestamp(row)
       const modified = timestamp != null ? options.relTime(timestamp) : '-'
       const bd = row.modelBreakdown
@@ -54,11 +49,11 @@ export function useUsageSessionRows(options: {
         sessionLabel,
         rowIdentity: usageRowIdentity(row, sessionKey, sessionLabel),
         modified,
-        inputTokens: options.numericRowVal(row, 'input_tokens', 'inputTokens'),
-        outputTokens: options.numericRowVal(row, 'output_tokens', 'outputTokens'),
-        cacheReadTokens: options.numericRowVal(row, 'cache_read_tokens', 'cacheReadTokens'),
-        cacheWriteTokens: options.numericRowVal(row, 'cache_write_tokens', 'cacheWriteTokens'),
-        cost: cost != null ? Number(cost) : null,
+        inputTokens: row.inputTokens,
+        outputTokens: row.outputTokens,
+        cacheReadTokens: row.cacheReadTokens,
+        cacheWriteTokens: row.cacheWriteTokens,
+        cost: row.costUsd,
         hasModelBreakdown,
       }
     })

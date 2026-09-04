@@ -1,7 +1,7 @@
 import { computed, onBeforeUnmount, ref, watch, type Ref } from 'vue'
-import { localizeGoalRpcError } from '@/lib/rpcErrors'
+import { goalErrorMessage as localizeGoalRpcError } from '@/utils/goalErrorPresentation'
 import { createClientRequestId } from '@/utils/chat/messageIdentity'
-import type { GoalCenter } from '@/modules/goalCenter'
+import { GoalCenterError, type GoalCenter } from '@/modules/goalCenter'
 import type { GoalContinuity, GoalEvent } from '@/modules/goalContinuity'
 
 export type GoalStatus = 'active' | 'paused' | 'blocked' | 'usage_limited' | 'complete'
@@ -1061,7 +1061,7 @@ export function useChatGoals(options: UseChatGoalsOptions) {
     const normalized = String(objective || '').trim()
     if (!goalObjectiveIsValid(normalized)) {
       options.notify?.(localizeGoalRpcError(
-        Object.assign(new Error(), { code: 'INVALID_GOAL_OBJECTIVE' }),
+        new GoalCenterError('invalid', '', { reason: 'invalid-objective' }),
       ))
       return Promise.resolve(false)
     }

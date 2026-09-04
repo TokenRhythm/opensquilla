@@ -16,16 +16,16 @@ import {
   normalizeRouterVisualMode,
 } from '@/utils/chat/routerVisualMode'
 import { useRouterVisualEffectsPreference } from '@/composables/useRouterVisualEffectsPreference'
-import type { RpcCallOptions } from '@/lib/rpc'
 import type { AppSettings } from '@/modules/appSettings'
-import type { ModelRouting } from '@/modules/providerConfiguration'
-import type { SessionConversation } from '@/modules/sessionConversation'
+import {
+  ProviderConfigurationError,
+  type ModelRouting,
+} from '@/modules/providerConfiguration'
 
 export interface UseChatFeatureTogglesOptions {
-  sessionConversation?: SessionConversation
   appSettings: AppSettings
   modelRouting: ModelRouting
-  readCallOptions?: RpcCallOptions
+  readOptions?: { readonly signal?: AbortSignal }
   setGlobalElevatedMode: (mode: string) => void
   loadCurrentSessionUsage: () => void | Promise<void>
 }
@@ -93,11 +93,7 @@ function parseCapabilitiesByMode(value: unknown): ModelRoutingCapabilitiesByMode
 }
 
 function isMethodNotFound(error: unknown): boolean {
-  const candidate = record(error)
-  const message = error instanceof Error
-    ? error.message
-    : String(candidate?.message || error || '')
-  return candidate?.code === 'METHOD_NOT_FOUND' || /method not found/i.test(message)
+  return error instanceof ProviderConfigurationError && error.code === 'unsupported'
 }
 
 export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
@@ -245,7 +241,7 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     const eventGeneration = modelRoutingEventGeneration
     let cfg: ChatFeatureConfig | undefined
     try {
-      cfg = await options.appSettings.readAll({ signal: options.readCallOptions?.signal }) as ChatFeatureConfig
+      cfg = await options.appSettings.readAll({ signal: options.readOptions?.signal }) as ChatFeatureConfig
       if (requestGeneration !== modelRoutingRequestGeneration) return
       await applyFeatureConfig(cfg, { refreshUsage: true })
       if (requestGeneration !== modelRoutingRequestGeneration) return
@@ -259,7 +255,7 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
         return
       }
       try {
-        const routing = await options.modelRouting.get({ signal: options.readCallOptions?.signal })
+        const routing = await options.modelRouting.get({ signal: options.readOptions?.signal })
         if (
           requestGeneration === modelRoutingRequestGeneration
           && eventGeneration === modelRoutingEventGeneration
@@ -390,9 +386,9 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
       if (document.visibilityState === 'visible') schedule()
     }
     const onFocus = () => schedule()
-    const unbindRouting = options.sessionConversation?.subscribeRoutingChanged((payload) => {
+    const unbindRouting = options.modelRouting.subscribeChanged((payload) => {
       modelRoutingEventGeneration += 1
-      applyModelRoutingSnapshot(payload as ModelRoutingSnapshot)
+      applyModelRoutingSnapshot(payload)
       scheduleHistorySync?.()
     })
     document.addEventListener('visibilitychange', onVisibility)

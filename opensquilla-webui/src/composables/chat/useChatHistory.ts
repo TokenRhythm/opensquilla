@@ -565,9 +565,7 @@ type AcceptedEnsembleMode = 'ensemble' | 'llm_ensemble'
 function acceptedEnsembleMode(message: ChatMessage): AcceptedEnsembleMode | null {
   if (message.role !== 'router' || !message.routerDecision) return null
   const raw = String(
-    message.routerDecision.accepted_routing_mode
-    || message.routerDecision.acceptedRoutingMode
-    || '',
+    message.routerDecision.accepted_routing_mode || '',
   ).trim().toLowerCase()
   return raw === 'ensemble' || raw === 'llm_ensemble' ? raw : null
 }

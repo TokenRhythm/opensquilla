@@ -1,4 +1,5 @@
-import type { RpcCallOptions } from '@/lib/rpc'
+import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
+import { readTransportFailure } from './transportTypes'
 import type {
   AppSettings,
   EffectiveSettings,
@@ -7,6 +8,7 @@ import type {
   SettingsObject,
   SettingsValue,
 } from '@/modules/appSettings'
+import { AppSettingsError } from '@/modules/appSettings'
 import { CONFIG_GET_METHOD } from '@/contracts/generated/v4/configGet'
 import { validateResult as validateConfigGetResult } from '@/contracts/generated/v4/configGetValidators.mjs'
 import { CONFIG_EFFECTIVE_METHOD } from '@/contracts/generated/v4/configEffective'
@@ -81,10 +83,41 @@ function mutationOptions(signal?: AbortSignal): RpcCallOptions {
   return { timeoutMs: 15_000, timeoutAction: 'reject', abortAction: 'reject', ...(signal ? { signal } : {}) }
 }
 
+function mapSettingsError(error: unknown): AppSettingsError {
+  if (error instanceof AppSettingsError) return error
+  const failure = readTransportFailure(error)
+  const code = failure.code
+  const domainCode = code === 'METHOD_NOT_FOUND'
+    ? 'unsupported'
+    : code === 'NOT_FOUND'
+      ? 'not-found'
+      : code === 'UNAUTHORIZED' || code === 'FORBIDDEN'
+        ? 'forbidden'
+        : code?.includes('CONFLICT')
+          ? 'conflict'
+          : code?.startsWith('INVALID_')
+            ? 'invalid'
+            : 'unavailable'
+  return new AppSettingsError(domainCode, failure.message)
+}
+
+async function requestSettings<T>(
+  rpc: RpcTransport,
+  method: string,
+  params: Record<string, unknown> | undefined,
+  requestOptions: RpcCallOptions,
+): Promise<T> {
+  try {
+    return await rpc.request<T>(method, params, requestOptions)
+  } catch (error) {
+    throw mapSettingsError(error)
+  }
+}
+
 export function createV4AppSettings(rpc: RpcTransport): AppSettings {
   return {
     async readAll(request) {
-      const result = await rpc.request(CONFIG_GET_METHOD, undefined, readOptions(request?.signal))
+      const result = await requestSettings(rpc, CONFIG_GET_METHOD, undefined, readOptions(request?.signal))
       if (!validateConfigGetResult(result) || !result || typeof result !== 'object' || Array.isArray(result)) {
         throw new Error(`${CONFIG_GET_METHOD} returned an invalid response`)
       }
@@ -93,22 +126,22 @@ export function createV4AppSettings(rpc: RpcTransport): AppSettings {
     async read(path, request) {
       const normalizedPath = path.trim()
       if (!normalizedPath) throw new Error('Setting path must not be empty')
-      const result = await rpc.request(CONFIG_GET_METHOD, { path: normalizedPath }, readOptions(request?.signal))
+      const result = await requestSettings(rpc, CONFIG_GET_METHOD, { path: normalizedPath }, readOptions(request?.signal))
       if (!validateConfigGetResult(result)) throw new Error(`${CONFIG_GET_METHOD} returned an invalid response`)
       return result as SettingsValue | null
     },
     async readEffective(request) {
-      const result = await rpc.request(CONFIG_EFFECTIVE_METHOD, undefined, readOptions(request?.signal))
+      const result = await requestSettings(rpc, CONFIG_EFFECTIVE_METHOD, undefined, readOptions(request?.signal))
       if (!validateConfigEffectiveResult(result)) throw new Error(`${CONFIG_EFFECTIVE_METHOD} returned an invalid response`)
       return effective(result)
     },
     async patch(patches, request) {
-      const result = await rpc.request(CONFIG_PATCH_METHOD, { patches: patchMap(patches) }, mutationOptions(request?.signal))
+      const result = await requestSettings(rpc, CONFIG_PATCH_METHOD, { patches: patchMap(patches) }, mutationOptions(request?.signal))
       if (!validateConfigPatchResult(result)) throw new Error(`${CONFIG_PATCH_METHOD} returned an invalid response`)
       return mutation(result)
     },
     async patchSafe(patches, request) {
-      const result = await rpc.request(CONFIG_PATCH_SAFE_METHOD, { patches: patchMap(patches) }, mutationOptions(request?.signal))
+      const result = await requestSettings(rpc, CONFIG_PATCH_SAFE_METHOD, { patches: patchMap(patches) }, mutationOptions(request?.signal))
       if (!validateConfigPatchSafeResult(result)) throw new Error(`${CONFIG_PATCH_SAFE_METHOD} returned an invalid response`)
       return mutation(result)
     },
@@ -116,7 +149,7 @@ export function createV4AppSettings(rpc: RpcTransport): AppSettings {
       if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
         throw new Error('Config merge patch must be an object')
       }
-      const result = await rpc.request(CONFIG_PATCH_METHOD, { patch }, mutationOptions(request?.signal))
+      const result = await requestSettings(rpc, CONFIG_PATCH_METHOD, { patch }, mutationOptions(request?.signal))
       if (!validateConfigPatchResult(result)) throw new Error(`${CONFIG_PATCH_METHOD} returned an invalid response`)
       return mutation(result)
     },

@@ -9,7 +9,7 @@ import {
 import { approvalChoiceForDecision } from '@/modules/approvalCenter'
 import type { ChatApprovalEntry } from './useChatApprovals'
 import type { InterruptViewState } from '@/types/parts'
-import { sessionConversationFromTestRpc } from '@/testing/sessionConversation.test-helper'
+import { createConversationEventsTestHarness } from '@/testing/conversationEvents.test-helper'
 import { clarificationSubmissionFromTestRpc } from '@/testing/conversationAncillary.test-helper'
 
 afterEach(() => {
@@ -53,6 +53,7 @@ function approvalHarness(statusResponse: Record<string, unknown> = {
 }) {
   const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map())
   const rpcCall = vi.fn(async () => statusResponse)
+  const conversationEvents = createConversationEventsTestHarness()
   const approvals = useChatApprovals({
     approvalCenter: {
       setElevatedMode: vi.fn(async () => undefined),
@@ -73,13 +74,7 @@ function approvalHarness(statusResponse: Record<string, unknown> = {
       subscribeAvailability: vi.fn(() => ({ close: vi.fn() })),
       dispose: vi.fn(),
     },
-    sessionConversation: sessionConversationFromTestRpc({
-      call: rpcCall as <T = unknown>(
-        method: string,
-        params?: Record<string, unknown>,
-      ) => Promise<T>,
-      on: vi.fn(() => () => {}),
-    }),
+    conversationEvents: conversationEvents.events,
     clarificationSubmission: clarificationSubmissionFromTestRpc({
       call: rpcCall as (
         method: string,

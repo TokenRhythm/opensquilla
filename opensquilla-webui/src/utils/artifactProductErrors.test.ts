@@ -7,13 +7,18 @@ import {
   classifyArtifactProductError,
   isKnownArtifactProductErrorCode,
 } from './artifactProductErrors'
+import { mapArtifactProductFailure } from '@/adapters/gateway/artifactErrorMapping'
+
+function mapped(
+  code: string,
+  fields: Record<string, unknown> = {},
+) {
+  return mapArtifactProductFailure(Object.assign(new Error('private detail'), { code, ...fields }))
+}
 
 describe('artifact product error classification', () => {
   it('maps compatibility codes without exposing their raw messages', () => {
-    const error = Object.assign(new Error('lease 44 on revision abc failed'), {
-      code: 'ARTIFACT_EDIT_SESSION_STALE',
-      retryable: true,
-    })
+    const error = mapped('ARTIFACT_EDIT_SESSION_STALE', { retryable: true })
 
     expect(classifyArtifactProductError(error)).toMatchObject({
       code: 'EDIT_SESSION_RENEWAL_REQUIRED',
@@ -45,9 +50,7 @@ describe('artifact product error classification', () => {
     ['INVALID_PARAMS', 'INVALID_REQUEST'],
     ['BAD_REQUEST', 'INVALID_REQUEST'],
   ] as const)('maps legacy %s to the stable %s recovery category', (legacy, stable) => {
-    expect(classifyArtifactProductError(Object.assign(new Error('private detail'), {
-      code: legacy,
-    })).code).toBe(stable)
+    expect(classifyArtifactProductError(mapped(legacy)).code).toBe(stable)
   })
 
   it('uses a safe internal category for unknown raw failures', () => {
@@ -58,27 +61,20 @@ describe('artifact product error classification', () => {
   })
 
   it('does not query a known rejected write and preserves pending transport writes', () => {
-    expect(artifactMutationOutcomeMayBePending(Object.assign(new Error('rejected'), {
-      code: 'DOCUMENT_CHANGED',
+    expect(artifactMutationOutcomeMayBePending(mapped('DOCUMENT_CHANGED', {
       accepted: false,
     }))).toBe(false)
-    expect(artifactMutationOutcomeMayBePending(Object.assign(new Error('timeout'), {
-      code: 'RPC_TIMEOUT',
-    }))).toBe(true)
-    expect(artifactMutationOutcomeMayBePending(Object.assign(new Error('closed'), {
-      code: 'RPC_TRANSPORT_ERROR',
+    expect(artifactMutationOutcomeMayBePending(mapped('RPC_TIMEOUT'))).toBe(true)
+    expect(artifactMutationOutcomeMayBePending(mapped('RPC_TRANSPORT_ERROR', {
       accepted: null,
     }))).toBe(true)
-    expect(artifactMutationOutcomeMayBePending(Object.assign(new Error('not connected'), {
-      code: 'RPC_TRANSPORT_ERROR',
+    expect(artifactMutationOutcomeMayBePending(mapped('RPC_TRANSPORT_ERROR', {
       accepted: false,
     }))).toBe(false)
   })
 
   it('presents read transport failures as unavailable while writes resolve uncertainty', () => {
-    const timeout = Object.assign(new Error('private timeout detail'), {
-      code: 'RPC_TIMEOUT',
-    })
+    const timeout = mapped('RPC_TIMEOUT')
     expect(classifyArtifactProductError(timeout)).toMatchObject({
       code: 'DOCUMENT_UNAVAILABLE',
       recovery: 'retry-same-request',
@@ -100,10 +96,18 @@ describe('artifact product error classification', () => {
     expect(artifactProductReasonCode(new Error('localized text is not protocol'))).toBeNull()
   })
 
+  it('projects the legacy not-draft rejection into the canonical annotation reason', () => {
+    const error = mapped('ARTIFACT_ANNOTATION_NOT_DRAFT')
+    expect(error.code).toBe('ANNOTATION_UNAVAILABLE')
+    expect(artifactProductReasonCode(error)).toBe('not_draft')
+  })
+
   it('identifies artifact-scoped codes without claiming generic chat failures', () => {
     expect(isKnownArtifactProductErrorCode('ANNOTATION_UNAVAILABLE')).toBe(true)
-    expect(isKnownArtifactProductErrorCode('DOCUMENT_IMPORT_FORMAT_UNSUPPORTED')).toBe(true)
-    expect(isKnownArtifactProductErrorCode('WORKBENCH_PREVIEW_UNSUPPORTED')).toBe(true)
+    expect(isKnownArtifactProductErrorCode(
+      mapped('DOCUMENT_IMPORT_FORMAT_UNSUPPORTED').code,
+    )).toBe(true)
+    expect(isKnownArtifactProductErrorCode(mapped('WORKBENCH_PREVIEW_UNSUPPORTED').code)).toBe(true)
     expect(isKnownArtifactProductErrorCode('INVALID_REQUEST')).toBe(false)
     expect(isKnownArtifactProductErrorCode('INTERNAL_ERROR')).toBe(false)
     expect(isKnownArtifactProductErrorCode('SOME_CHAT_FAILURE')).toBe(false)

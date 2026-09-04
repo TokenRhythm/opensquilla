@@ -6,6 +6,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from opensquilla.application.provider_setup import (
+    ProviderModelDiscoveryResult,
+    ProviderProbeResult,
+)
 from opensquilla.application.setup_mutations import (
     SetupConfigPort,
     SetupMutation,
@@ -50,13 +54,17 @@ class ProfileProbeCommand:
 
 
 class ProfileProbePort(Protocol):
-    async def probe_saved(self, command: ProfileProbeCommand) -> Mapping[str, Any]: ...
+    async def probe_saved(self, command: ProfileProbeCommand) -> ProviderProbeResult: ...
 
-    async def probe_draft(self, command: ProfileProbeCommand) -> Mapping[str, Any]: ...
+    async def probe_draft(self, command: ProfileProbeCommand) -> ProviderProbeResult: ...
 
-    async def discover_saved(self, command: ProfileProbeCommand) -> Mapping[str, Any]: ...
+    async def discover_saved(
+        self, command: ProfileProbeCommand
+    ) -> ProviderModelDiscoveryResult: ...
 
-    async def discover_draft(self, command: ProfileProbeCommand) -> Mapping[str, Any]: ...
+    async def discover_draft(
+        self, command: ProfileProbeCommand
+    ) -> ProviderModelDiscoveryResult: ...
 
 
 class ProfileMutationPort(Protocol):
@@ -168,19 +176,21 @@ class ProfileLifecycle:
             backup_credential_provider=provider_id,
         )
 
-    async def probe(self, command: ProfileProbeCommand) -> dict[str, Any]:
-        return dict(await self._probes.probe_saved(command))
+    async def probe(self, command: ProfileProbeCommand) -> ProviderProbeResult:
+        return await self._probes.probe_saved(command)
 
-    async def probe_draft(self, command: ProfileProbeCommand) -> dict[str, Any]:
-        return dict(await self._probes.probe_draft(command))
+    async def probe_draft(self, command: ProfileProbeCommand) -> ProviderProbeResult:
+        return await self._probes.probe_draft(command)
 
-    async def discover_models(self, command: ProfileProbeCommand) -> dict[str, Any]:
-        return dict(await self._probes.discover_saved(command))
+    async def discover_models(
+        self, command: ProfileProbeCommand
+    ) -> ProviderModelDiscoveryResult:
+        return await self._probes.discover_saved(command)
 
     async def discover_draft_models(
         self, command: ProfileProbeCommand
-    ) -> dict[str, Any]:
-        return dict(await self._probes.discover_draft(command))
+    ) -> ProviderModelDiscoveryResult:
+        return await self._probes.discover_draft(command)
 
 
 def _credential_signature(config: Any, provider_id: str) -> tuple[object, ...]:

@@ -269,22 +269,6 @@ def _desktop_router_preload_enabled() -> bool:
     return not _desktop_fast_start_enabled()
 
 
-def _make_auto_propose_tool_invoker(
-    registry: ToolRegistry,
-    *,
-    allowed_tools: frozenset[str] = _AUTO_PROPOSE_TOOL_ALLOWLIST,
-) -> Callable[[str, dict[str, Any]], Any]:
-    """Build the unattended auto-propose tool invoker through dispatch policy."""
-
-    from opensquilla.skills.meta.orchestrator import make_tool_invoker_from_handler
-    from opensquilla.tools.dispatch import build_tool_handler
-
-    ctx = _make_auto_propose_tool_context(allowed_tools=allowed_tools)
-    return make_tool_invoker_from_handler(
-        tool_handler=build_tool_handler(registry, ctx),
-    )
-
-
 def _make_auto_propose_tool_context(
     *,
     agent_id: str = "auto_propose",
@@ -3143,7 +3127,7 @@ async def build_services(
             GatewayArtifactRecoveryPort,
         )
         from opensquilla.gateway.rpc import RpcContext
-        from opensquilla.gateway.rpc_workbench_resources import (
+        from opensquilla.gateway.workbench_resource_runtime import (
             resolve_recovery_import_source,
         )
         from opensquilla.paths import media_root_from_config
@@ -4247,7 +4231,7 @@ async def start_gateway_server(
     # HTTP server can observe a half-published batch. Recovery is deliberately
     # serial because every agent shares the same profile operation lock.
     try:
-        from opensquilla.gateway.rpc_memory_import import (
+        from opensquilla.gateway.profile_import_startup import (
             run_profile_import_startup_recovery,
         )
 
@@ -4307,7 +4291,7 @@ async def start_gateway_server(
     # refresh are best-effort and may continue after readiness.
     async def maintain_profile_imports() -> None:
         try:
-            from opensquilla.gateway.rpc_memory_import import (
+            from opensquilla.gateway.profile_import_startup import (
                 run_profile_import_startup_maintenance,
             )
 

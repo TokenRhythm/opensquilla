@@ -1,4 +1,5 @@
-import type { RpcCallOptions } from '@/lib/rpc'
+import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
+import { readTransportFailure } from './transportTypes'
 import {
   CHAT_ABORT_METHOD,
   type ChatAbortParams,
@@ -44,12 +45,45 @@ import {
   type TurnCommandCapability,
   type TurnCommands,
   type TurnCommandRequestOptions,
+  TurnCommandError,
   type TurnSendParams,
   type TurnSendResponse,
   type TurnSteerDisposition,
   type TurnSteerRequest,
   type TurnSteerResponse,
 } from '@/modules/turnCommands'
+import { mapArtifactProductFailure } from './artifactErrorMapping'
+
+function mapTurnCommandError(error: unknown): TurnCommandError {
+  if (error instanceof TurnCommandError) return error
+  const failure = readTransportFailure(error)
+  const code = failure.code
+  const kind = code === 'RPC_ABORTED'
+    ? 'aborted'
+    : code === 'RPC_TIMEOUT'
+      ? 'timeout'
+      : code === 'RPC_TRANSPORT_ERROR'
+        ? 'transport'
+        : code === 'QUEUE_FULL' || code === 'QUEUE_FULL_DIRTY'
+          ? 'queue-capacity'
+          : code === 'SESSION_CHANGED'
+            ? 'session-changed'
+            : code?.includes('CONFLICT')
+              ? 'conflict'
+              : code === 'UNAVAILABLE' || code === 'STORAGE_BUSY' || code === 'CANCEL_TIMEOUT'
+                ? 'unavailable'
+                : 'rejected'
+  return new TurnCommandError(
+    kind,
+    failure.message,
+    code,
+    failure.accepted,
+    failure.retryable,
+    failure.retryAfterMs,
+    failure.details,
+    mapArtifactProductFailure(error),
+  )
+}
 
 /** Narrow wire port owned by this Adapter. */
 export interface TurnCommandsTransport {
@@ -442,9 +476,12 @@ function forward<T>(
   options?: TurnCommandRequestOptions,
 ): Promise<T> {
   const rpcOptions = requestOptions(options)
-  return rpcOptions
+  const request = rpcOptions
     ? transport.request<T>(method, params, rpcOptions)
     : transport.request<T>(method, params)
+  return request.catch(error => {
+    throw mapTurnCommandError(error)
+  })
 }
 
 /**

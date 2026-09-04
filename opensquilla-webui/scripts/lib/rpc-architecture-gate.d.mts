@@ -1,17 +1,11 @@
-export interface RpcDebtLane {
-  lane: string
-  debt: Record<string, Record<string, number>>
-}
-
 export interface RpcArchitectureGateResult {
   failures: string[]
+  /** Forbidden operations found outside their allowed transport boundary. */
   total: number
   rpcTotal: number
   httpTotal: number
-  debtByLane: Map<string, number>
 }
 
 export function evaluateRpcArchitectureGate(options?: {
   root?: string
-  debtLanes?: RpcDebtLane[]
 }): RpcArchitectureGateResult

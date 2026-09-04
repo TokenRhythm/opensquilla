@@ -1,37 +1,41 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
 
+from opensquilla.application.cron_scheduler import (
+    CronJobMutation,
+    CronJobTarget,
+    CronListQuery,
+    CronRunQuery,
+    CronSchedulerPort,
+    CronSubscriptionPort,
+    CronTopic,
+)
 from opensquilla.gateway.adapters.cron_scheduler import (
-    GatewayCronCallbacks,
     GatewayCronSchedulerAdapter,
 )
-from opensquilla.gateway.rpc import RpcContext
 
 
-def _callbacks() -> GatewayCronCallbacks:
-    return GatewayCronCallbacks(
-        list_jobs=AsyncMock(return_value=[{"id": "daily"}]),
-        status=AsyncMock(return_value={"id": "daily"}),
-        create=AsyncMock(return_value={"id": "daily"}),
-        update=AsyncMock(return_value={"id": "daily", "enabled": False}),
-        remove=AsyncMock(return_value=None),
-        run=AsyncMock(return_value={"runId": "run-1", "success": True}),
-        runs=AsyncMock(return_value=[{"id": "run-1", "success": True}]),
-        subscribe=AsyncMock(return_value={"ok": True, "topic": "cron:daily"}),
-        unsubscribe=AsyncMock(return_value={"ok": True, "topic": "cron:*"}),
-    )
+def _ports() -> tuple[AsyncMock, AsyncMock]:
+    scheduler = AsyncMock(spec=CronSchedulerPort)
+    scheduler.list_jobs.return_value = [{"id": "daily"}]
+    scheduler.get_job.return_value = {"id": "daily"}
+    scheduler.create_job.return_value = {"id": "daily"}
+    scheduler.update_job.return_value = {"id": "daily", "enabled": False}
+    scheduler.run_job.return_value = {"runId": "run-1", "success": True}
+    scheduler.list_runs.return_value = [{"id": "run-1", "success": True}]
+    subscriptions = AsyncMock(spec=CronSubscriptionPort)
+    subscriptions.subscribe.return_value = {"ok": True, "topic": "cron:daily"}
+    subscriptions.unsubscribe.return_value = {"ok": True, "topic": "cron:*"}
+    return scheduler, subscriptions
 
 
 @pytest.mark.asyncio
 async def test_cron_adapter_projects_typed_queries_and_mutations() -> None:
-    callbacks = _callbacks()
-    context = cast(RpcContext, SimpleNamespace())
-    adapter = GatewayCronSchedulerAdapter(context, callbacks)
+    scheduler, subscriptions = _ports()
+    adapter = GatewayCronSchedulerAdapter(scheduler, subscriptions)
 
     assert await adapter.list_jobs({"agentId": " main "}) == [{"id": "daily"}]
     assert await adapter.status({"id": " daily "}) == {"id": "daily"}
@@ -41,36 +45,30 @@ async def test_cron_adapter_projects_typed_queries_and_mutations() -> None:
         "enabled": False,
     }
 
-    cast(AsyncMock, callbacks.list_jobs).assert_awaited_once_with(
-        {"agentId": "main"}, context
-    )
-    cast(AsyncMock, callbacks.status).assert_awaited_once_with({"id": "daily"}, context)
-    cast(AsyncMock, callbacks.create).assert_awaited_once_with(
-        {"name": "Daily"}, context
-    )
-    cast(AsyncMock, callbacks.update).assert_awaited_once_with(
-        {"enabled": False, "id": "daily"}, context
+    scheduler.list_jobs.assert_awaited_once_with(CronListQuery("main"))
+    scheduler.get_job.assert_awaited_once_with(CronJobTarget("daily"))
+    scheduler.create_job.assert_awaited_once_with(CronJobMutation({"name": "Daily"}))
+    scheduler.update_job.assert_awaited_once_with(
+        CronJobMutation({"enabled": False}, "daily")
     )
 
 
 @pytest.mark.asyncio
 async def test_cron_add_and_create_share_one_application_implementation() -> None:
-    callbacks = _callbacks()
-    context = cast(RpcContext, SimpleNamespace())
-    adapter = GatewayCronSchedulerAdapter(context, callbacks)
+    scheduler, subscriptions = _ports()
+    adapter = GatewayCronSchedulerAdapter(scheduler, subscriptions)
 
     await adapter.create({"name": "Daily"})
     await adapter.create({"name": "Weekly"})
 
-    assert cast(AsyncMock, callbacks.create).await_count == 2
-    assert cast(AsyncMock, callbacks.update).await_count == 0
+    assert scheduler.create_job.await_count == 2
+    assert scheduler.update_job.await_count == 0
 
 
 @pytest.mark.asyncio
 async def test_cron_adapter_preserves_legacy_run_id_and_subscription_topics() -> None:
-    callbacks = _callbacks()
-    context = cast(RpcContext, SimpleNamespace())
-    adapter = GatewayCronSchedulerAdapter(context, callbacks)
+    scheduler, subscriptions = _ports()
+    adapter = GatewayCronSchedulerAdapter(scheduler, subscriptions)
 
     assert await adapter.runs({"job_id": " daily ", "limit": 3}) == [
         {"id": "run-1", "success": True}
@@ -78,10 +76,6 @@ async def test_cron_adapter_preserves_legacy_run_id_and_subscription_topics() ->
     await adapter.subscribe({"jobId": " daily "})
     await adapter.unsubscribe(None)
 
-    cast(AsyncMock, callbacks.runs).assert_awaited_once_with(
-        {"id": "daily", "limit": 3}, context
-    )
-    cast(AsyncMock, callbacks.subscribe).assert_awaited_once_with(
-        {"jobId": "daily"}, context
-    )
-    cast(AsyncMock, callbacks.unsubscribe).assert_awaited_once_with(None, context)
+    scheduler.list_runs.assert_awaited_once_with(CronRunQuery("daily", 3))
+    subscriptions.subscribe.assert_awaited_once_with(CronTopic("daily"))
+    subscriptions.unsubscribe.assert_awaited_once_with(CronTopic())

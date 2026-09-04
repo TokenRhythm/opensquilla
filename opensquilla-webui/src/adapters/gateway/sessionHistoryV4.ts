@@ -1,4 +1,4 @@
-import type { RpcCallOptions } from '@/lib/rpc'
+import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import {
   CHAT_HISTORY_METHOD,
   type ChatHistoryMessage,
@@ -12,7 +12,6 @@ import {
   validateChatHistoryResult,
 } from '@/contracts/generated/v4/chatHistoryValidators.mjs'
 import {
-  SessionReadSessionMissingError,
   type SessionReadCompactionSummary,
   type SessionReadHistoryPage,
   type SessionReadJsonObject,
@@ -21,6 +20,8 @@ import {
   type SessionReadTurnContext,
   type SessionReadTurnOutcome,
 } from '@/modules/sessionReadLifecycle'
+import { mapSessionReadError } from './sessionReadErrorMapping'
+import { projectConversationRoutingSnapshot } from './conversationContentV4'
 
 const DEFAULT_HISTORY_BUDGET_MS = 15_000
 
@@ -49,21 +50,6 @@ function objectValue(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : null
-}
-
-function historyError(error: unknown): unknown {
-  if (error instanceof SessionReadSessionMissingError) return error
-  const source = objectValue(error)
-  const data = objectValue(source?.data)
-  const rawCode = source?.code ?? data?.code
-  const code = typeof rawCode === 'string' ? rawCode.toUpperCase() : ''
-  if (code === 'NOT_FOUND' || code === 'SESSION_NOT_FOUND') {
-    return new SessionReadSessionMissingError(
-      error instanceof Error ? error.message : 'The requested session does not exist.',
-      error,
-    )
-  }
-  return error
 }
 
 function projectJson(value: unknown): unknown {
@@ -157,6 +143,7 @@ function projectMessage(value: ChatHistoryMessage, index: number): SessionReadMe
   const messageId = textValue(value.message_id)
   const transcriptId = textValue(value.transcript_id)
   const usageRaw = objectValue(raw.turn_usage ?? raw.turnUsage ?? raw.usage)
+  const routing = objectValue(raw.router_decision ?? raw.routerDecision)
   const reasoning = raw.reasoning_content ?? raw.reasoningContent
   const timestamp = value.timestamp ?? value.ts
   return Object.freeze({
@@ -170,7 +157,9 @@ function projectMessage(value: ChatHistoryMessage, index: number): SessionReadMe
       : null,
     // Reasoning can intentionally contain leading/trailing whitespace.
     reasoningContent: typeof reasoning === 'string' ? reasoning : null,
-    routerDecision: projectObject(raw.router_decision ?? raw.routerDecision),
+    routerDecision: routing
+      ? Object.freeze(projectConversationRoutingSnapshot(projectJson(routing)))
+      : null,
     artifacts: projectObjectArray(raw.artifacts),
     toolCalls: projectUnknownArray(raw.tool_calls ?? raw.toolCalls),
     timeline: projectUnknownArray(raw.timeline),
@@ -375,7 +364,7 @@ export async function requestV4SessionHistory(
   try {
     raw = await rpc.request(CHAT_HISTORY_METHOD, params, callOptions)
   } catch (error) {
-    throw historyError(error)
+    throw mapSessionReadError(error)
   }
   const normalized = withLegacyCanonicalDefaults(raw)
   if (!validateChatHistoryResult(normalized.value)) {

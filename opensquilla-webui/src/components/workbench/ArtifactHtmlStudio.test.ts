@@ -14,6 +14,19 @@ import {
   createLegacyArtifactWorkspace,
 } from '@/workbench/artifactDocumentProvider'
 import ArtifactHtmlStudio from './ArtifactHtmlStudio.vue'
+import { ArtifactProductFailure } from '@/utils/artifactProductErrors'
+
+function ambiguousArtifactFailure(message: string): ArtifactProductFailure {
+  return new ArtifactProductFailure(
+    'DOCUMENT_UNAVAILABLE',
+    message,
+    undefined,
+    false,
+    null,
+    null,
+    true,
+  )
+}
 
 const copyTextWithFallback = vi.hoisted(() => vi.fn().mockResolvedValue(undefined))
 
@@ -753,10 +766,7 @@ describe('ArtifactHtmlStudio', () => {
   })
 
   it('reuses an opaque save identity after response loss without aliasing another patch', async () => {
-    const transportLoss = (message: string) => Object.assign(new Error(message), {
-      code: 'RPC_TRANSPORT_ERROR',
-      accepted: null,
-    })
+    const transportLoss = ambiguousArtifactFailure
     const patchSource = vi.fn()
       .mockRejectedValueOnce(transportLoss('response lost'))
       .mockRejectedValueOnce(transportLoss('response still unavailable'))
@@ -846,10 +856,9 @@ describe('ArtifactHtmlStudio', () => {
   })
 
   it('resolves a committed response loss without replaying the source write', async () => {
-    const patchSource = vi.fn().mockRejectedValue(Object.assign(new Error('private disconnect'), {
-      code: 'RPC_TRANSPORT_ERROR',
-      accepted: null,
-    }))
+    const patchSource = vi.fn().mockRejectedValue(
+      ambiguousArtifactFailure('private disconnect'),
+    )
     const resolveMutation = vi.fn().mockResolvedValue({
       status: 'applied',
       retryAfterMs: null,
