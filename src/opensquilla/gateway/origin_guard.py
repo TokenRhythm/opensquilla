@@ -20,6 +20,11 @@ Policy (matches the bundle-route precedent):
 * The exact registered ``opensquilla-app://desktop`` origin may reach a
   loopback HTTP Gateway. Normal web pages cannot forge their browser-controlled
   Origin, while this keeps Desktop development overrides interoperable.
+* A non-http(s) origin the operator explicitly lists in ``cors.allowed_origins``
+  (for example ``chrome-extension://<id>``) may reach state-changing HTTP and
+  WebSocket endpoints through a loopback request authority. The Origin is
+  browser-controlled, the match is exact, and non-loopback request authorities
+  remain rejected by those guards regardless of the configured bind.
 * Everything else — including the opaque ``"null"`` origin and unparsable
   values — is rejected with 403 ``FORBIDDEN_ORIGIN``.
 """
@@ -202,6 +207,45 @@ def _desktop_renderer_origin_allowed(
     )
 
 
+def _listed_custom_scheme_origin_allowed(
+    *,
+    origin: str,
+    request_scheme: str,
+    request_hostname: str | None,
+    request_port: int | None,
+    config: GatewayConfig | None,
+) -> bool:
+    """Allow a listed non-http(s) origin through a loopback request authority.
+
+    Browser extension runtimes attach a custom-scheme ``Origin`` (for example
+    ``chrome-extension://<id>``) that is not an http(s) origin: it can neither
+    match the gateway's own origin nor be parsed for the standard CORS list.
+    An operator who deliberately lists the exact origin in
+    ``cors.allowed_origins`` gets the same treatment as the registered Desktop
+    origin — loopback request authority only, ``*`` never accepted — because a
+    hostile web page cannot forge a browser-controlled Origin header. CORS
+    response-header emission remains a separate, configuration-driven policy.
+    """
+    if config is None or origin == "null" or "://" not in origin:
+        return False
+    scheme = origin.split("://", 1)[0].casefold()
+    if not scheme or scheme in _BROWSER_ORIGIN_SCHEMES:
+        return False
+    if not any(allowed == origin for allowed in config.cors.allowed_origins):
+        return False
+    if not _is_loopback_hostname(request_hostname):
+        return False
+    normalized_request_scheme = _http_equivalent_scheme(request_scheme)
+    if normalized_request_scheme != "http":
+        return False
+    return _request_authority_matches_config(
+        request_scheme=normalized_request_scheme,
+        request_hostname=request_hostname or "",
+        request_port=request_port,
+        config=config,
+    )
+
+
 def _origin_allowed(
     *,
     origin: str | None,
@@ -213,6 +257,14 @@ def _origin_allowed(
     if origin is None:
         return True
     if _desktop_renderer_origin_allowed(
+        origin=origin,
+        request_scheme=request_scheme,
+        request_hostname=request_hostname,
+        request_port=request_port,
+        config=config,
+    ):
+        return True
+    if _listed_custom_scheme_origin_allowed(
         origin=origin,
         request_scheme=request_scheme,
         request_hostname=request_hostname,

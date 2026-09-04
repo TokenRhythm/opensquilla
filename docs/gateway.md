@@ -95,6 +95,28 @@ that entry. OpenSquilla intentionally does not trust arbitrary `Host` values on
 a wildcard listener, because doing so would permit DNS rebinding; `"*"` is not
 accepted for this purpose.
 
+A browser extension connects with a custom-scheme Origin such as
+`chrome-extension://<id>`. The CORS list can express that value, but the
+unsafe-request and WebSocket origin guards previously rejected it. To let a
+local extension reach a gateway through a loopback request address — from the
+CLI-managed gateway or the desktop app's — list its exact origin in
+`cors.allowed_origins`:
+
+```toml
+[cors]
+allowed_origins = ["chrome-extension://<extension-id>"]
+```
+
+Find the id on the extension's detail page in `chrome://extensions`. The match
+is exact and `"*"` is not accepted. For state-changing HTTP requests and
+WebSocket handshakes, a listed extension origin is honored only when the
+request targets a loopback IP or localhost name over HTTP/WS. A gateway bound
+to `0.0.0.0` can therefore still serve a local extension that connects to
+`127.0.0.1`, while requests targeting a LAN address or remote hostname remain
+rejected by those guards. Read-only cross-origin HTTP access continues to
+follow the exact CORS list and authentication policy; this setting does not
+make Origin an authentication credential.
+
 ## Configuration Path
 
 Use a specific config file:

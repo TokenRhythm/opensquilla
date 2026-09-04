@@ -411,6 +411,14 @@ def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
         Path("tests/test_live_long_task_case_driver.py"),
         "test_fault_429_case_proves_retry_after_was_not_violated",
     )
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_recovery/test_atomic_and_locking.py"),
+        "test_moved_legacy_lock_can_be_rebound_without_dropping_exclusion",
+    )
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_recovery/test_transaction.py"),
+        "test_transaction_recovery_locks_parked_backup_before_restoring_target",
+    )
 
 
 @pytest.mark.parametrize(
