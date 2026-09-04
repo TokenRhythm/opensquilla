@@ -18,31 +18,18 @@ $oldTag = "v$BaselineVersion"
 $oldAsset = "OpenSquilla-$BaselineVersion-win-x64.exe"
 $candidate = (Resolve-Path -LiteralPath $CandidateInstaller).Path
 $candidateName = [IO.Path]::GetFileName($candidate)
-$sandbox = Join-Path $env:RUNNER_TEMP "opensquilla-release-preservation-$Label-$InstallMode-$BaselineVersion"
-$oldDir = Join-Path $sandbox $oldTag
-$appData = Join-Path $sandbox 'appdata'
-$localAppData = Join-Path $sandbox 'localappdata'
-$userData = Join-Path $appData 'OpenSquilla'
-$profile = Join-Path $userData 'opensquilla'
-$probe = Join-Path $PWD '.github\scripts\verify-release-profile-preservation.py'
-$updateBannerSmoke = Join-Path $PWD 'desktop\electron\scripts\test-packaged-update-banner.mjs'
-$sessionRecoverySmoke = Join-Path $PWD 'desktop\electron\scripts\test-packaged-session-recovery.mjs'
-$realUpdateDriver = Join-Path $PWD 'desktop\electron\scripts\test-packaged-real-update-flow.mjs'
-$realUpdateResult = Join-Path $sandbox 'real-update-result.json'
-$externalSentinels = Join-Path $sandbox 'synthetic-system-tools'
-$expectedInstalledVersion = ''
-$env:APPDATA = $appData
-$env:LOCALAPPDATA = $localAppData
-$env:OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE = '1'
-$env:OPENSQUILLA_RECOVERY_OFFLINE = '1'
-
-New-Item -ItemType Directory -Force -Path $oldDir, $appData, $localAppData | Out-Null
-$installDir = if ($InstallMode -eq 'custom') { Join-Path $sandbox 'OpenSquilla' } else { '' }
+$candidatePattern = '^OpenSquilla-(?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc(0|[1-9][0-9]*))?)-win-x64\.exe\z'
+if ($candidateName -cnotmatch $candidatePattern) {
+  throw "Candidate installer must have a canonical stable or RC asset name: $candidateName"
+}
+$expectedInstalledVersion = $Matches['version']
 if ($RealUpdateChannelManifest) {
   $RealUpdateChannelManifest = (Resolve-Path -LiteralPath $RealUpdateChannelManifest).Path
   $rehearsalManifest = Get-Content -LiteralPath $RealUpdateChannelManifest -Raw |
     ConvertFrom-Json
-  $expectedInstalledVersion = [string]$rehearsalManifest.version
+  if ([string]$rehearsalManifest.version -cne $expectedInstalledVersion) {
+    throw "Stable updater manifest version does not match installer version $expectedInstalledVersion."
+  }
   if ($expectedInstalledVersion -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
     throw "Stable updater rehearsal has an invalid expected version: $expectedInstalledVersion"
   }
@@ -55,6 +42,25 @@ if ($RealUpdateChannelManifest) {
     throw "Stable updater rehearsal must advance v$BaselineVersion to a final release."
   }
 }
+$sandbox = Join-Path $env:RUNNER_TEMP "opensquilla-release-preservation-$Label-$InstallMode-$BaselineVersion"
+$oldDir = Join-Path $sandbox $oldTag
+$appData = Join-Path $sandbox 'appdata'
+$localAppData = Join-Path $sandbox 'localappdata'
+$userData = Join-Path $appData 'OpenSquilla'
+$profile = Join-Path $userData 'opensquilla'
+$probe = Join-Path $PWD '.github\scripts\verify-release-profile-preservation.py'
+$updateBannerSmoke = Join-Path $PWD 'desktop\electron\scripts\test-packaged-update-banner.mjs'
+$sessionRecoverySmoke = Join-Path $PWD 'desktop\electron\scripts\test-packaged-session-recovery.mjs'
+$realUpdateDriver = Join-Path $PWD 'desktop\electron\scripts\test-packaged-real-update-flow.mjs'
+$realUpdateResult = Join-Path $sandbox 'real-update-result.json'
+$externalSentinels = Join-Path $sandbox 'synthetic-system-tools'
+$env:APPDATA = $appData
+$env:LOCALAPPDATA = $localAppData
+$env:OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE = '1'
+$env:OPENSQUILLA_RECOVERY_OFFLINE = '1'
+
+New-Item -ItemType Directory -Force -Path $oldDir, $appData, $localAppData | Out-Null
+$installDir = if ($InstallMode -eq 'custom') { Join-Path $sandbox 'OpenSquilla' } else { '' }
 gh release download $oldTag --repo $repository --pattern $oldAsset --dir $oldDir
 if ($LASTEXITCODE -ne 0) { throw "Failed to download the $oldTag Windows installer." }
 $oldInstaller = Join-Path $oldDir $oldAsset
@@ -190,18 +196,16 @@ try {
   if (-not (Test-Path -LiteralPath $app -PathType Leaf)) {
     throw 'Candidate installation did not publish OpenSquilla.exe.'
   }
-  if ($expectedInstalledVersion) {
-    $actualProductVersion = ([Diagnostics.FileVersionInfo]::GetVersionInfo($app)).ProductVersion
-    if (-not $actualProductVersion) {
-      throw 'Installed OpenSquilla.exe does not declare a ProductVersion.'
-    }
-    $actualProductVersion = $actualProductVersion.Trim()
-    if ($actualProductVersion -ne $expectedInstalledVersion) {
-      throw (
-        "Installed OpenSquilla.exe ProductVersion $actualProductVersion does not match " +
-        "the rehearsed version $expectedInstalledVersion."
-      )
-    }
+  $actualProductVersion = ([Diagnostics.FileVersionInfo]::GetVersionInfo($app)).ProductVersion
+  if (-not $actualProductVersion) {
+    throw 'Installed OpenSquilla.exe does not declare a ProductVersion.'
+  }
+  $actualProductVersion = $actualProductVersion.Trim()
+  if ($actualProductVersion -cne $expectedInstalledVersion) {
+    throw (
+      "Installed OpenSquilla.exe ProductVersion $actualProductVersion does not match " +
+      "the rehearsed version $expectedInstalledVersion."
+    )
   }
   # Preserve the original packaged launch gate for every channel. The RC-only
   # long-running banner smoke below is additive; stable candidates must not

@@ -282,3 +282,257 @@ def test_rehearsal_driver_rejects_invalid_versions_before_launch(
     assert result.returncode != 0
     assert message in result.stderr
     assert "SYNTHETIC_DESKTOP_LAUNCHED" not in result.stdout
+
+
+@pytest.fixture
+def windows_upgrade_harness(tmp_path: Path) -> tuple[str, Path]:
+    pwsh = shutil.which("pwsh")
+    if not pwsh:
+        message = "PowerShell is required to execute the Windows upgrade helper contract"
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            pytest.fail(message)
+        pytest.skip(message)
+    wrapper = tmp_path / "upgrade-harness.ps1"
+    # Exercise the real helper with synthetic Win32 version resources. Only external
+    # downloads, installer execution, and profile probes are replaced; no Windows
+    # executable runs, so the same regression also runs under PowerShell on POSIX.
+    wrapper.write_text(
+        r'''
+$ErrorActionPreference = 'Stop'
+function New-SyntheticDesktop {
+  param([string]$Path, [string]$Version)
+  $fileVersion = $Version.Split('-')[0] + '.0'
+  $source = @"
+[assembly: System.Reflection.AssemblyInformationalVersion("$Version")]
+[assembly: System.Reflection.AssemblyFileVersion("$fileVersion")]
+public class SyntheticDesktop {}
+"@
+  $tree = [Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree]::ParseText($source)
+  $reference = [Microsoft.CodeAnalysis.MetadataReference]::CreateFromFile(
+    [object].Assembly.Location
+  )
+  $options = [Microsoft.CodeAnalysis.CSharp.CSharpCompilationOptions]::new(
+    [Microsoft.CodeAnalysis.OutputKind]::DynamicallyLinkedLibrary
+  )
+  $compilation = [Microsoft.CodeAnalysis.CSharp.CSharpCompilation]::Create(
+    [IO.Path]::GetFileNameWithoutExtension($Path), [Microsoft.CodeAnalysis.SyntaxTree[]]@($tree),
+    [Microsoft.CodeAnalysis.MetadataReference[]]@($reference), $options
+  )
+  # Add-Type alone omits Win32 resources. Unix FileVersionInfo falls back to
+  # managed metadata, whereas Windows requires this native version resource.
+  $resources = $compilation.CreateDefaultWin32Resources($true, $false, $null, $null)
+  $stream = [IO.File]::Create($Path)
+  try {
+    $result = $compilation.Emit($stream, $null, $null, $resources, $null, $null,
+      [Threading.CancellationToken]::None)
+    if (-not $result.Success) { throw ($result.Diagnostics -join "`n") }
+  } finally {
+    $stream.Dispose()
+    $resources.Dispose()
+  }
+  $reader = [Reflection.PortableExecutable.PEReader]::new([IO.File]::OpenRead($Path))
+  try {
+    $directory = $reader.PEHeaders.PEHeader.ResourceTableDirectory
+    if ($directory.RelativeVirtualAddress -le 0 -or $directory.Size -le 0) {
+      throw 'Synthetic PE is missing its Win32 resource directory.'
+    }
+    $resourceBytes = $reader.GetSectionData($directory.RelativeVirtualAddress).GetContent(
+      0, $directory.Size
+    )
+    $resourceText = [Text.Encoding]::Unicode.GetString([byte[]]$resourceBytes)
+    if ($resourceText -cnotmatch ('ProductVersion\x00+' + [regex]::Escape($Version) + '\x00')) {
+      throw 'Synthetic PE is missing its exact native ProductVersion.'
+    }
+    if ($resourceText -cnotmatch ('FileVersion\x00+' + [regex]::Escape($fileVersion) + '\x00')) {
+      throw 'Synthetic PE is missing its exact native FileVersion.'
+    }
+  } finally {
+    $reader.Dispose()
+  }
+}
+$baselinePe = Join-Path $PSScriptRoot 'baseline.exe'
+New-SyntheticDesktop -Path $baselinePe -Version '0.5.4'
+$replacementPe = Join-Path $PSScriptRoot 'replacement.exe'
+if ($env:SYNTHETIC_INSTALLED_VERSION -ne 'no-op') {
+  New-SyntheticDesktop -Path $replacementPe -Version $env:SYNTHETIC_INSTALLED_VERSION
+}
+$script:installerCount = 0
+function gh {
+  Write-Host 'BASELINE_DOWNLOAD_REACHED'
+  $global:LASTEXITCODE = 0
+}
+function python { $global:LASTEXITCODE = 0 }
+function Get-Process { param($Name, $ErrorAction) }
+function Start-Process {
+  param($FilePath, $ArgumentList, [switch]$Wait, [switch]$PassThru)
+  if ([IO.Path]::GetFileName($FilePath) -eq 'OpenSquilla.exe') {
+    throw 'POST_INSTALL_LAUNCH_REACHED'
+  }
+  $script:installerCount += 1
+  $destination = @($ArgumentList | Where-Object { $_.StartsWith('/D=') })
+  $installPath = if ($destination.Count) { $destination[0].Substring(3) } else {
+    Join-Path $env:LOCALAPPDATA 'Programs/OpenSquilla'
+  }
+  $runtime = Join-Path $installPath 'resources/runtime'
+  New-Item -ItemType Directory -Force -Path $runtime | Out-Null
+  foreach ($metadata in @('runtime-manifest.json', 'runtime-pack-catalog.json')) {
+    Set-Content -LiteralPath (Join-Path $runtime $metadata) -Value '{}'
+  }
+  $app = Join-Path $installPath 'OpenSquilla.exe'
+  if ($script:installerCount -eq 1) {
+    Copy-Item -LiteralPath $baselinePe -Destination $app
+  } elseif ($env:SYNTHETIC_INSTALLED_VERSION -ne 'no-op') {
+    Copy-Item -LiteralPath $replacementPe -Destination $app -Force
+  }
+  Write-Host "SYNTHETIC_INSTALLER_EXIT_ZERO:$script:installerCount"
+  return [PSCustomObject]@{ ExitCode = 0 }
+}
+$arguments = @{
+  CandidateInstaller = $env:SYNTHETIC_CANDIDATE
+  Label = 'version-regression'
+  BaselineVersion = '0.5.4'
+  InstallMode = $env:SYNTHETIC_INSTALL_MODE
+}
+if ($env:SYNTHETIC_MANIFEST) {
+  $arguments.RealUpdateChannelManifest = $env:SYNTHETIC_MANIFEST
+}
+try {
+  & $env:SYNTHETIC_HELPER @arguments
+  throw 'HELPER_COMPLETED_UNEXPECTEDLY'
+} catch {
+  [Console]::Error.WriteLine($_.Exception.Message)
+  exit 1
+}
+''',
+        encoding="utf-8",
+    )
+    return pwsh, wrapper
+
+
+@pytest.mark.parametrize("github_actions", ["true", ""])
+def test_windows_upgrade_requires_powershell_in_ci(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, github_actions: str
+) -> None:
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    monkeypatch.setenv("GITHUB_ACTIONS", github_actions)
+    expected = pytest.fail.Exception if github_actions == "true" else pytest.skip.Exception
+    with pytest.raises(expected, match="PowerShell is required"):
+        windows_upgrade_harness.__wrapped__(tmp_path)
+
+
+def _run_windows_upgrade_helper(
+    harness: tuple[str, Path],
+    *,
+    candidate_name: str,
+    installed_version: str = "no-op",
+    install_mode: str = "custom",
+    manifest: dict[str, object] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    pwsh, wrapper = harness
+    candidate = wrapper.parent / candidate_name
+    candidate.touch()
+    manifest_path = wrapper.parent / "channel.json"
+    if manifest is not None:
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return subprocess.run(
+        [pwsh, "-NoProfile", "-NonInteractive", "-File", str(wrapper)],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "RUNNER_TEMP": str(wrapper.parent / "runner"),
+            "SYNTHETIC_HELPER": str(SCRIPTS / "verify-release-windows-upgrade.ps1"),
+            "SYNTHETIC_CANDIDATE": str(candidate),
+            "SYNTHETIC_INSTALLED_VERSION": installed_version,
+            "SYNTHETIC_INSTALL_MODE": install_mode,
+            "SYNTHETIC_MANIFEST": str(manifest_path) if manifest is not None else "",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=45,
+    )
+
+
+@pytest.mark.parametrize("install_mode", ["default", "custom"])
+@pytest.mark.parametrize(
+    ("candidate", "installed"),
+    [
+        ("0.5.5", "no-op"),
+        ("0.5.5-rc1", "no-op"),
+        ("0.5.5-rc1", "0.5.5-rc0"),
+        ("0.5.5-rc1", "0.5.5-RC1"),
+    ],
+)
+def test_windows_replacement_rejects_successful_installer_with_stale_app(
+    windows_upgrade_harness: tuple[str, Path],
+    install_mode: str,
+    candidate: str,
+    installed: str,
+) -> None:
+    result = _run_windows_upgrade_helper(
+        windows_upgrade_harness,
+        candidate_name=f"OpenSquilla-{candidate}-win-x64.exe",
+        installed_version=installed,
+        install_mode=install_mode,
+    )
+    assert result.returncode != 0
+    assert "SYNTHETIC_INSTALLER_EXIT_ZERO:2" in result.stdout
+    actual = "0.5.4" if installed == "no-op" else installed
+    expected_error = f"ProductVersion {actual} does not match the rehearsed version {candidate}"
+    assert expected_error in result.stderr
+    assert "POST_INSTALL_LAUNCH_REACHED" not in result.stderr
+
+
+@pytest.mark.parametrize("install_mode", ["default", "custom"])
+@pytest.mark.parametrize("candidate", ["0.5.5", "0.5.5-rc1"])
+def test_windows_replacement_accepts_exact_installed_candidate_version(
+    windows_upgrade_harness: tuple[str, Path], install_mode: str, candidate: str
+) -> None:
+    result = _run_windows_upgrade_helper(
+        windows_upgrade_harness,
+        candidate_name=f"OpenSquilla-{candidate}-win-x64.exe",
+        installed_version=candidate,
+        install_mode=install_mode,
+    )
+    assert result.returncode != 0  # Stop before any real application is launched.
+    assert "SYNTHETIC_INSTALLER_EXIT_ZERO:2" in result.stdout
+    assert "POST_INSTALL_LAUNCH_REACHED" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "candidate_name",
+    [
+        "OpenSquilla-0.05.5-win-x64.exe",
+        "OpenSquilla-0.5.5rc1-win-x64.exe",
+        "OpenSquilla-0.5.5-rc01-win-x64.exe",
+        "OpenSquilla-0.5.5-win-arm64.exe",
+    ],
+)
+def test_windows_upgrade_rejects_noncanonical_asset_before_side_effects(
+    windows_upgrade_harness: tuple[str, Path], candidate_name: str
+) -> None:
+    result = _run_windows_upgrade_helper(windows_upgrade_harness, candidate_name=candidate_name)
+    assert result.returncode != 0
+    assert "canonical stable or RC asset name" in result.stderr
+    assert "BASELINE_DOWNLOAD_REACHED" not in result.stdout
+    assert not (windows_upgrade_harness[1].parent / "runner").exists()
+
+
+@pytest.mark.parametrize("manifest_version", ["0.5.6", "0.5.5-rc1"])
+def test_windows_upgrade_rejects_manifest_candidate_mismatch_before_side_effects(
+    windows_upgrade_harness: tuple[str, Path], manifest_version: str
+) -> None:
+    result = _run_windows_upgrade_helper(
+        windows_upgrade_harness,
+        candidate_name="OpenSquilla-0.5.5-win-x64.exe",
+        manifest={
+            "schemaVersion": 1,
+            "version": manifest_version,
+            "tag": f"v{manifest_version}",
+            "prerelease": False,
+        },
+    )
+    assert result.returncode != 0
+    assert "manifest version does not match installer version 0.5.5" in result.stderr
+    assert "BASELINE_DOWNLOAD_REACHED" not in result.stdout
+    assert not (windows_upgrade_harness[1].parent / "runner").exists()
