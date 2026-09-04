@@ -179,6 +179,23 @@ def build_terminal_reply(
             "preserved the recoverable state; retry with a narrower request "
             "or a larger-context model."
         )
+    if error_class == "attachment_capacity_too_large":
+        return (
+            "The attachment request still exceeds the selected deployment's "
+            "known context capacity. Reduce the attachment or session context, "
+            "run /compact, or start a new session before retrying."
+        )
+    if error_class == "attachment_capacity_unknown":
+        return (
+            "OpenSquilla could not verify the selected attachment deployment's "
+            "context capacity. For a custom or catalog-unknown model, set "
+            "llm.context_window_tokens to the deployment's verified context limit."
+        )
+    if error_class == "attachment_capacity_unavailable":
+        return (
+            "No model deployment has proven capacity for this attachment request. "
+            "Check the model context limit or reduce the request before retrying."
+        )
     if (
         error_class == "empty_response"
         and error_message == _REASONING_ONLY_OUTPUT_BUDGET_ERROR_MESSAGE

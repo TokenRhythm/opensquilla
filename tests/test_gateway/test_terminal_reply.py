@@ -144,6 +144,24 @@ RAW_INTERNAL_STRINGS = (
             },
             "single-model routing mode",
         ),
+        (
+            {
+                "status": "failed",
+                "terminal_reason": "error",
+                "error_class": "attachment_capacity_too_large",
+                "error_message": "internal estimator detail",
+            },
+            "/compact",
+        ),
+        (
+            {
+                "status": "failed",
+                "terminal_reason": "error",
+                "error_class": "attachment_capacity_unknown",
+                "error_message": "internal catalog detail",
+            },
+            "llm.context_window_tokens",
+        ),
     ],
 )
 def test_build_terminal_reply_returns_user_readable_messages(
@@ -190,6 +208,44 @@ def test_ensemble_multimodal_reply_is_actionable_and_stable() -> None:
         "Ensemble does not support image input yet. "
         "Switch to a single-model routing mode and try again."
     )
+
+
+@pytest.mark.parametrize(
+    ("error_class", "expected_reply"),
+    [
+        (
+            "attachment_capacity_too_large",
+            "The attachment request still exceeds the selected deployment's known "
+            "context capacity. Reduce the attachment or session context, run /compact, "
+            "or start a new session before retrying.",
+        ),
+        (
+            "attachment_capacity_unknown",
+            "OpenSquilla could not verify the selected attachment deployment's context "
+            "capacity. For a custom or catalog-unknown model, set "
+            "llm.context_window_tokens to the deployment's verified context limit.",
+        ),
+        (
+            "attachment_capacity_unavailable",
+            "No model deployment has proven capacity for this attachment request. Check "
+            "the model context limit or reduce the request before retrying.",
+        ),
+    ],
+)
+def test_attachment_capacity_replies_are_actionable_and_stable(
+    error_class: str,
+    expected_reply: str,
+) -> None:
+    reply = build_terminal_reply(
+        {
+            "status": "failed",
+            "terminal_reason": "error",
+            "error_class": error_class,
+            "error_message": "private internal capacity detail must not win",
+        }
+    )
+
+    assert reply == expected_reply
 
 
 def test_image_input_unsupported_reply_is_actionable_and_stable() -> None:

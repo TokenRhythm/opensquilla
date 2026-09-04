@@ -58,26 +58,24 @@ def _bounded_fallback_chain_required(turn_metadata: dict[str, Any]) -> bool:
     )
 
 
-def _provider_config_has_request_capacity(
+def _provider_config_capacity_assessment(
     config: Any,
     turn_metadata: dict[str, Any],
     *,
     provider: str = "",
     model: str = "",
-) -> bool:
-    """Validate one final physical deployment against the routed material."""
+) -> Any:
+    """Return the structured request-capacity proof for one deployment."""
 
-    if not _large_context_capacity_required(turn_metadata):
-        return True
     from opensquilla.engine.capacity_admission import (
         MAX_THINKING_BUDGET_TOKENS,
-        model_has_request_capacity,
+        assess_model_request_capacity,
     )
 
     thinking_budget = turn_metadata.get("large_context_thinking_budget_tokens")
     if not isinstance(thinking_budget, int) or isinstance(thinking_budget, bool):
         thinking_budget = MAX_THINKING_BUDGET_TOKENS
-    return model_has_request_capacity(
+    return assess_model_request_capacity(
         provider=(
             str(getattr(config, "provider", "") or "").strip()
             or str(provider or "").strip()
@@ -113,6 +111,84 @@ def _provider_config_has_request_capacity(
     )
 
 
+def _provider_config_has_request_capacity(
+    config: Any,
+    turn_metadata: dict[str, Any],
+    *,
+    provider: str = "",
+    model: str = "",
+) -> bool:
+    """Validate one final physical deployment against the routed material."""
+
+    if not _large_context_capacity_required(turn_metadata):
+        return True
+    return _provider_config_capacity_assessment(
+        config,
+        turn_metadata,
+        provider=provider,
+        model=model,
+    ).fits
+
+
+def _provisional_capacity_binding_allowed(
+    config: Any,
+    turn_metadata: dict[str, Any],
+    assessment: Any,
+    *,
+    provider: str,
+    model: str,
+) -> bool:
+    """Permit only the exact known deployment needed to reach compaction."""
+
+    if (
+        turn_metadata.get("large_context_capacity_retry_pending") is not True
+        or turn_metadata.get("large_context_capacity_retry_attempted") is True
+        or getattr(assessment, "status", None)
+        != "known_capacity_request_too_large"
+    ):
+        return False
+    actual_provider = (
+        str(getattr(config, "provider", "") or "").strip()
+        or str(provider or "").strip()
+    ).lower()
+    actual_model = (
+        str(getattr(config, "model", "") or "").strip()
+        or str(model or "").strip()
+    )
+    expected_provider = str(
+        turn_metadata.get("large_context_capacity_provisional_provider") or ""
+    ).strip().lower()
+    expected_model = str(
+        turn_metadata.get("large_context_capacity_provisional_model") or ""
+    ).strip()
+    if (
+        not expected_provider
+        or not expected_model
+        or actual_provider != expected_provider
+        or actual_model != expected_model
+    ):
+        return False
+    safe_input_tokens = getattr(assessment, "safe_input_tokens", None)
+    if not isinstance(safe_input_tokens, int) or isinstance(safe_input_tokens, bool):
+        return False
+    request_input_tokens = _metadata_nonnegative_int(
+        turn_metadata,
+        "large_context_request_input_tokens",
+    )
+    history_tokens = _metadata_nonnegative_int(
+        turn_metadata,
+        "large_context_history_tokens",
+    )
+    if history_tokens <= 0 or request_input_tokens - history_tokens > safe_input_tokens:
+        return False
+    turn_metadata["large_context_capacity_provisional_bound"] = True
+    turn_metadata["large_context_capacity_provisional_physical_provider"] = (
+        actual_provider
+    )
+    turn_metadata["large_context_capacity_provisional_physical_model"] = actual_model
+    return True
+
+
 def _require_provider_config_capacity(
     config: Any,
     turn_metadata: dict[str, Any],
@@ -121,22 +197,63 @@ def _require_provider_config_capacity(
     provider: str = "",
     model: str = "",
 ) -> None:
-    if _provider_config_has_request_capacity(
+    if not _large_context_capacity_required(turn_metadata):
+        return
+    assessment = _provider_config_capacity_assessment(
         config,
         turn_metadata,
+        provider=provider,
+        model=model,
+    )
+    if assessment.fits or _provisional_capacity_binding_allowed(
+        config,
+        turn_metadata,
+        assessment,
         provider=provider,
         model=model,
     ):
         return
     from opensquilla.engine.capacity_admission import (
         CAPACITY_CONFIGURATION_HINT,
+        CAPACITY_REDUCTION_HINT,
         LargeContextCapacityError,
     )
 
     turn_metadata["large_context_capacity_blocked"] = True
-    actionable_reason = f"{reason} {CAPACITY_CONFIGURATION_HINT}"
+    turn_metadata["large_context_capacity_status"] = assessment.status
+    hint = (
+        CAPACITY_REDUCTION_HINT
+        if assessment.status == "known_capacity_request_too_large"
+        else CAPACITY_CONFIGURATION_HINT
+    )
+    actionable_reason = f"{reason} {hint}"
     turn_metadata["large_context_capacity_block_reason"] = actionable_reason
-    raise LargeContextCapacityError(actionable_reason)
+    raise LargeContextCapacityError(
+        actionable_reason,
+        status=assessment.status,
+    )
+
+
+def require_current_selector_capacity(
+    selector: Any,
+    turn_metadata: dict[str, Any],
+    *,
+    reason: str,
+) -> None:
+    """Revalidate the selector's bound physical head without executing it."""
+
+    if turn_metadata.get("large_context_capacity_blocked") is True:
+        from opensquilla.engine.capacity_admission import LargeContextCapacityError
+
+        raise LargeContextCapacityError(
+            str(turn_metadata.get("large_context_capacity_block_reason") or reason),
+            status=turn_metadata.get("large_context_capacity_status"),
+        )
+    _require_provider_config_capacity(
+        getattr(selector, "current_config", None),
+        turn_metadata,
+        reason=reason,
+    )
 
 
 def _materialize_fallback_configs(
@@ -560,7 +677,10 @@ def apply_model_override(
             turn_metadata.get("large_context_capacity_block_reason")
             or "No deployment has proven capacity for this attachment request."
         )
-        raise LargeContextCapacityError(reason)
+        raise LargeContextCapacityError(
+            reason,
+            status=turn_metadata.get("large_context_capacity_status"),
+        )
 
     if tier_provider_config is not None and hasattr(selector, "override_provider_config"):
         _require_provider_config_capacity(
