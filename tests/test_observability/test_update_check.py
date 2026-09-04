@@ -429,6 +429,43 @@ def test_channel_endpoints_are_static_and_rc_scoped(monkeypatch) -> None:
     assert update_check._endpoint(preview) == "https://updates.example.test/custom.json"
 
 
+@pytest.mark.parametrize("owner", ["opensquilla", "TokenRhythm"])
+def test_manifest_reads_both_repositories_and_returns_current_release_url(owner: str) -> None:
+    manifest = _manifest(
+        tag="v0.5.5",
+        version="0.5.5",
+        base="0.5.5",
+        prerelease=False,
+        release_url=f"https://github.com/{owner}/opensquilla/releases/tag/v0.5.5",
+    )
+
+    assert update_check._manifest_release(manifest, update_check._channel_for("0.5.4")) == (
+        "0.5.5",
+        "https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.5",
+    )
+    assert update_check.DEFAULT_RELEASES_PAGE == (
+        "https://github.com/TokenRhythm/opensquilla/releases"
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://github.com/TokenRhythm/another-repo/releases/tag/v0.5.0rc5",
+        "https://github.com/another-owner/opensquilla/releases/tag/v0.5.0rc5",
+        "https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.0rc4",
+        "https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.0rc5?download=1",
+        "https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.0rc5/extra",
+        "https://github.com.example.test/TokenRhythm/opensquilla/releases/tag/v0.5.0rc5",
+    ],
+)
+def test_manifest_repository_allowlist_is_exact(url: str) -> None:
+    with pytest.raises(ValueError, match="releaseUrl is not canonical"):
+        update_check._manifest_release(
+            _manifest(release_url=url), update_check._channel_for("0.5.0rc4")
+        )
+
+
 @pytest.mark.parametrize(
     ("current", "payload", "expected"),
     [
@@ -442,7 +479,7 @@ def test_channel_endpoints_are_static_and_rc_scoped(monkeypatch) -> None:
             ),
             (
                 "0.5.0",
-                "https://github.com/opensquilla/opensquilla/releases/tag/v0.5.0",
+                "https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.0",
                 None,
             ),
         ),
@@ -451,7 +488,7 @@ def test_channel_endpoints_are_static_and_rc_scoped(monkeypatch) -> None:
             _manifest(),
             (
                 "0.5.0-rc5",
-                "https://github.com/opensquilla/opensquilla/releases/tag/v0.5.0rc5",
+                "https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.0rc5",
                 None,
             ),
         ),
@@ -465,7 +502,7 @@ def test_channel_endpoints_are_static_and_rc_scoped(monkeypatch) -> None:
             ),
             (
                 "0.5.0",
-                "https://github.com/opensquilla/opensquilla/releases/tag/v0.5.0",
+                "https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.0",
                 None,
             ),
         ),

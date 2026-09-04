@@ -288,4 +288,4 @@ running maintainer integration tests for terminal rendering.
 - [`features/tui-product-contract.md`](features/tui-product-contract.md) for
   ownership, shared-session, fallback, and legacy-freeze rules.
 
-[Docs index](README.md) · [Product guide](../README.product.md) · [Improve this page](contributing-docs.md) · [Report a docs issue](https://github.com/opensquilla/opensquilla/issues/new?template=docs_report.yml)
+[Docs index](README.md) · [Product guide](../README.product.md) · [Improve this page](contributing-docs.md) · [Report a docs issue](https://github.com/TokenRhythm/opensquilla/issues/new?template=docs_report.yml)

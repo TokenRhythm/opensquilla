@@ -241,15 +241,18 @@ _NONCRITICAL_CI_SCRIPT_TARGETS: Final[dict[str, tuple[str, ...]]] = {
         "tests/test_scripts/test_prestage_release_to_oss.py",
     ),
     ".github/scripts/verify-release-macos-real-update.sh": (
+        "tests/test_ci/test_upgrade_baselines.py",
         "tests/test_release_consistency.py",
     ),
     ".github/scripts/verify-release-macos-upgrade.sh": (
+        "tests/test_ci/test_upgrade_baselines.py",
         "tests/test_release_consistency.py",
     ),
     ".github/scripts/verify-release-profile-preservation.py": (
         "tests/test_release_consistency.py",
     ),
     ".github/scripts/verify-release-windows-upgrade.ps1": (
+        "tests/test_ci/test_upgrade_baselines.py",
         "tests/test_release_consistency.py",
     ),
     ".github/scripts/verify_desktop_slim_size.py": (
@@ -1486,6 +1489,8 @@ def _add_noncritical_ci_path(
     if path.startswith(".github/workflows/"):
         suites.add("python-targeted")
         targets.add("tests/test_ci/test_workflows.py")
+        if path == ".github/workflows/wheelhouse-release.yml":
+            targets.add("tests/test_ci/test_upgrade_baselines.py")
         reasons.add("workflow_contract_changed")
         return True
     script_targets = _NONCRITICAL_CI_SCRIPT_TARGETS.get(path)

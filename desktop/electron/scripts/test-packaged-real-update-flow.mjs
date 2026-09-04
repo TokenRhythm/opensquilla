@@ -18,6 +18,21 @@ const userDataDir = resolve(requiredOption('--user-data-dir'))
 const manifestPath = resolve(requiredOption('--channel-manifest'))
 const expectedVersion = requiredOption('--expected-version')
 const mode = requiredOption('--mode')
+const baselineVersion = process.argv.includes('--baseline-version')
+  ? requiredOption('--baseline-version')
+  : '0.5.3'
+if (!['0.5.3', '0.5.4'].includes(baselineVersion)) {
+  throw new Error('--baseline-version must be 0.5.3 or 0.5.4')
+}
+if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(expectedVersion)) {
+  throw new Error('--expected-version must be a canonical stable version')
+}
+const baselineParts = baselineVersion.split('.').map(Number)
+const candidateParts = expectedVersion.split('.').map(Number)
+const firstDifference = candidateParts.findIndex((part, index) => part !== baselineParts[index])
+if (firstDifference < 0 || candidateParts[firstDifference] <= baselineParts[firstDifference]) {
+  throw new Error(`The candidate must be newer than baseline ${baselineVersion}`)
+}
 const readyOutputIndex = process.argv.indexOf('--ready-output')
 const readyOutput = readyOutputIndex >= 0 ? resolve(process.argv[readyOutputIndex + 1]) : null
 const installDirIndex = process.argv.indexOf('--install-dir')
@@ -47,7 +62,7 @@ const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
 assert.equal(manifest.schemaVersion, 1)
 assert.equal(manifest.version, expectedVersion)
 assert.equal(manifest.tag, `v${expectedVersion}`)
-assert.equal(manifest.prerelease, false, 'v0.5.3 stable must rehearse a final update')
+assert.equal(manifest.prerelease, false, `v${baselineVersion} stable must rehearse a final update`)
 
 let channelRequests = 0
 let channelAvailable = false
@@ -94,11 +109,11 @@ try {
   const page = await app.firstWindow({ timeout: 60_000 })
   await waitFor(
     () => page.evaluate(() => typeof window.opensquillaDesktop?.checkForUpdates === 'function'),
-    'the official v0.5.3 updater bridge',
+    `the official v${baselineVersion} updater bridge`,
   )
 
   const initial = await page.evaluate(() => window.opensquillaDesktop.getUpdateState())
-  assert.equal(initial.currentVersion, '0.5.3')
+  assert.equal(initial.currentVersion, baselineVersion)
 
   // A failed discovery must leave the old, fully functional client running;
   // no installer handoff is allowed until an exact candidate has been found
@@ -169,7 +184,7 @@ try {
       }),
     ])
 
-    // Start the exact installer while v0.5.3 is still running. It may reject,
+    // Start the exact installer while the baseline is still running. It may reject,
     // wait, or close the old process; it must never report success while the
     // old process remains live over a partially overwritten installation.
     let collisionOutcome
@@ -201,7 +216,7 @@ try {
       assert.equal(
         appClosed,
         true,
-        'installer reported success while the official v0.5.3 process remained live',
+        `installer reported success while the official v${baselineVersion} process remained live`,
       )
       collisionOutcome = 'closed-running-client'
     }
@@ -227,7 +242,7 @@ try {
     await Promise.race([
       closed,
       delay(180_000).then(() => {
-        throw new Error('official v0.5.3 did not hand off to quitAndInstall')
+        throw new Error(`official v${baselineVersion} did not hand off to quitAndInstall`)
       }),
     ])
     handedOff = true
