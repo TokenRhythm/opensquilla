@@ -8,6 +8,12 @@ import type { ArtifactPayload } from '@/types/artifacts'
 import { ARTIFACT_WORKBENCH_KEY, type ArtifactWorkbench } from '@/modules/artifactWorkbench'
 import { GATEWAY_ACCESS_KEY, type GatewayAccess } from '@/modules/gatewayAccess'
 import { createV4ArtifactContentAccess } from '@/adapters/gateway/artifactAccessV4'
+import { createV4ArtifactPreviews } from '@/adapters/gateway/artifactPreviewsV4'
+import {
+  httpBinaryResponse,
+  httpTransportTestDouble,
+  type TestHttpTransport,
+} from '@/testing/httpTransport.test-helper'
 import ChatArtifactList from './ChatArtifactList.vue'
 
 const platformState = vi.hoisted(() => ({
@@ -38,6 +44,7 @@ async function settle() {
 }
 
 async function mountList(options: {
+  http: TestHttpTransport
   isOwner: boolean
   artifact?: ArtifactPayload
   preferWorkbench?: boolean
@@ -61,7 +68,8 @@ async function mountList(options: {
     isLocalOwner: options.isOwner,
   } as GatewayAccess)
   app.provide(ARTIFACT_WORKBENCH_KEY, {
-    content: createV4ArtifactContentAccess(),
+    content: createV4ArtifactContentAccess(options.http),
+    previews: createV4ArtifactPreviews(options.http, { baseOrigin: () => 'http://localhost' }),
   } as ArtifactWorkbench)
   app.mount(el)
   await nextTick()
@@ -87,9 +95,9 @@ beforeEach(() => {
 
 describe('ChatArtifactList native HTML open', () => {
   it('posts HTML artifacts to the gateway native-open endpoint for owner Web sessions', async () => {
-    const fetchImpl = vi.fn(async () => new Response('{"ok":true}', { status: 202 }))
-    vi.stubGlobal('fetch', fetchImpl)
-    const { app, el } = await mountList({ isOwner: true })
+    const requestBinary = vi.fn(async () => httpBinaryResponse('{"ok":true}', { status: 202 }))
+    const http = httpTransportTestDouble({ requestBinary })
+    const { app, el } = await mountList({ http, isOwner: true })
 
     const open = Array.from(el.querySelectorAll<HTMLButtonElement>('.msg-artifact-action'))
       .find(button => button.textContent?.includes('Open'))
@@ -97,22 +105,19 @@ describe('ChatArtifactList native HTML open', () => {
     open?.click()
     await settle()
 
-    expect(fetchImpl).toHaveBeenCalledWith('/api/v1/artifacts/art-html/open', {
+    expect(requestBinary).toHaveBeenCalledWith('/api/v1/artifacts/art-html/open', {
       method: 'POST',
-      headers: {
-        'x-opensquilla-session-key': 'agent:main:webchat:ok',
-        Authorization: 'Bearer secret',
-      },
-      credentials: 'same-origin',
+      sessionKey: 'agent:main:webchat:ok',
+      timeoutMs: 0,
     })
     app.unmount()
   })
 
   it('renders HTML artifacts as download-only for non-owner Web sessions', async () => {
-    const fetchImpl = vi.fn()
-    vi.stubGlobal('fetch', fetchImpl)
+    const requestBinary = vi.fn()
+    const http = httpTransportTestDouble({ requestBinary })
     const onDownload = vi.fn()
-    const { app, el } = await mountList({ isOwner: false, onDownload })
+    const { app, el } = await mountList({ http, isOwner: false, onDownload })
 
     expect(el.textContent).not.toContain('Open')
     expect(el.textContent).toContain('Download')
@@ -120,7 +125,7 @@ describe('ChatArtifactList native HTML open', () => {
     await nextTick()
 
     expect(onDownload).toHaveBeenCalledWith(htmlArtifact)
-    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(requestBinary).not.toHaveBeenCalled()
     app.unmount()
   })
 
@@ -134,11 +139,12 @@ describe('ChatArtifactList native HTML open', () => {
       ok: false,
       message: diagnostic,
     })
-    vi.stubGlobal('fetch', vi.fn(async () => new Response('<p>fixture</p>', {
-      status: 200,
-      headers: { 'content-type': 'text/html' },
-    })))
-    const { app, el } = await mountList({ isOwner: true })
+    const http = httpTransportTestDouble({
+      requestBinary: vi.fn(async () => httpBinaryResponse('<p>fixture</p>', {
+        contentType: 'text/html',
+      })),
+    })
+    const { app, el } = await mountList({ http, isOwner: true })
 
     const open = Array.from(el.querySelectorAll<HTMLButtonElement>('.msg-artifact-action'))
       .find(button => button.textContent?.includes('Open'))
@@ -158,10 +164,11 @@ describe('ChatArtifactList native HTML open', () => {
   })
 
   it('routes previewable artifacts to the Workbench without fetching or opening a popup', async () => {
-    const fetchImpl = vi.fn()
-    vi.stubGlobal('fetch', fetchImpl)
+    const requestBinary = vi.fn()
+    const http = httpTransportTestDouble({ requestBinary })
     const onOpen = vi.fn()
     const { app, el } = await mountList({
+      http,
       isOwner: false,
       preferWorkbench: true,
       onOpen,
@@ -172,13 +179,13 @@ describe('ChatArtifactList native HTML open', () => {
     await nextTick()
 
     expect(onOpen).toHaveBeenCalledWith(htmlArtifact)
-    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(requestBinary).not.toHaveBeenCalled()
     app.unmount()
   })
 
   it('routes Office files to the Workbench download-only document panel', async () => {
-    const fetchImpl = vi.fn()
-    vi.stubGlobal('fetch', fetchImpl)
+    const requestBinary = vi.fn()
+    const http = httpTransportTestDouble({ requestBinary })
     const onOpen = vi.fn()
     const officeArtifact: ArtifactPayload = {
       id: 'art-office',
@@ -187,6 +194,7 @@ describe('ChatArtifactList native HTML open', () => {
       download_url: '/api/v1/artifacts/art-office',
     }
     const { app, el } = await mountList({
+      http,
       isOwner: false,
       artifact: officeArtifact,
       preferWorkbench: true,
@@ -198,16 +206,15 @@ describe('ChatArtifactList native HTML open', () => {
     await nextTick()
 
     expect(onOpen).toHaveBeenCalledWith(officeArtifact)
-    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(requestBinary).not.toHaveBeenCalled()
     app.unmount()
   })
 
   it('keeps video in the transcript player even when Workbench routing is preferred', async () => {
-    const fetchImpl = vi.fn(async () => new Response('video', {
-      status: 200,
-      headers: { 'content-type': 'video/webm' },
+    const requestBinary = vi.fn(async () => httpBinaryResponse('video', {
+      contentType: 'video/webm',
     }))
-    vi.stubGlobal('fetch', fetchImpl)
+    const http = httpTransportTestDouble({ requestBinary })
     vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('probably')
     vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
     vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:inline-video')
@@ -220,6 +227,7 @@ describe('ChatArtifactList native HTML open', () => {
       download_url: '/api/v1/artifacts/art-video',
     }
     const { app, el } = await mountList({
+      http,
       isOwner: false,
       artifact: videoArtifact,
       preferWorkbench: true,
@@ -228,14 +236,14 @@ describe('ChatArtifactList native HTML open', () => {
 
     expect(el.querySelectorAll('.msg-video-card')).toHaveLength(1)
     expect(el.querySelectorAll('.msg-artifact-chip')).toHaveLength(0)
-    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(requestBinary).not.toHaveBeenCalled()
 
     el.querySelector<HTMLButtonElement>('.msg-video-card__action')?.click()
     await settle()
     await new Promise(resolve => setTimeout(resolve, 0))
     await nextTick()
 
-    expect(fetchImpl).toHaveBeenCalledOnce()
+    expect(requestBinary).toHaveBeenCalledOnce()
     expect(el.querySelector('.msg-video-card__player')).toBeTruthy()
     expect(onOpen).not.toHaveBeenCalled()
     app.unmount()

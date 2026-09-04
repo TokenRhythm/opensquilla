@@ -300,7 +300,7 @@ describe('appendEnsembleProgress', () => {
     })
   })
 
-  it('narrowly recognizes the legacy quorum-grace message without matching embedded text', () => {
+  it('uses the projected cancellation category without interpreting diagnostic text', () => {
     const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0 }])
 
     runtime.appendEnsembleProgress({
@@ -310,6 +310,7 @@ describe('appendEnsembleProgress', () => {
       proposer_provider: 'openrouter',
       proposer_model: 'legacy-model',
       error: 'proposer cancelled after 5.5s ensemble quorum grace',
+      error_code: 'quorum_cancelled',
     })
     runtime.appendEnsembleProgress({
       event_type: 'proposer_finish',

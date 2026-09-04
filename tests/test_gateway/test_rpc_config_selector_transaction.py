@@ -175,7 +175,7 @@ async def test_generic_config_profile_credential_change_reconciles_after_persist
     )
     events: list[str] = []
     observed: list[tuple[str, str]] = []
-    real_persist = rpc_config._persist_config
+    real_persist = rpc_config.persist_gateway_config
 
     def recording_persist(candidate: Any) -> None:
         real_persist(candidate)
@@ -191,7 +191,7 @@ async def test_generic_config_profile_credential_change_reconciles_after_persist
             )
         )
 
-    monkeypatch.setattr(rpc_config, "_persist_config", recording_persist)
+    monkeypatch.setattr(rpc_config, "persist_gateway_config", recording_persist)
     monkeypatch.setattr(
         "opensquilla.gateway.llm_runtime.discard_profile_credential_pool",
         lambda provider: events.append(f"discard:{provider}"),

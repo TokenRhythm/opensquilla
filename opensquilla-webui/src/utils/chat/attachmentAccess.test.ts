@@ -1,9 +1,19 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { DisplayAttachment } from '@/types/chat'
 import {
+  httpTransportTestDouble,
+  type TestHttpTransport,
+} from '@/testing/httpTransport.test-helper'
+import {
   attachmentAccessUrl,
   fetchDisplayAttachmentBlob,
-} from './attachmentAccess'
+} from '@/adapters/gateway/attachmentAccessV4'
+
+function httpTransport(
+  requestBinary = vi.fn<TestHttpTransport['requestBinary']>(),
+): TestHttpTransport {
+  return httpTransportTestDouble({ requestBinary })
+}
 
 function attachment(overrides: Partial<DisplayAttachment> = {}): DisplayAttachment {
   return {
@@ -31,14 +41,14 @@ describe('attachmentAccessUrl', () => {
 describe('fetchDisplayAttachmentBlob', () => {
   it('prefers the local file over inline bytes and staged URLs', async () => {
     const localFile = new File(['local'], '../local.html', { type: 'text/html' })
-    const fetchImpl = vi.fn()
+    const http = httpTransport()
 
-    const result = await fetchDisplayAttachmentBlob(attachment({
+    const result = await fetchDisplayAttachmentBlob(http, attachment({
       name: '../local.html',
       localFile,
       downloadData: 'aW5saW5l',
       download_url: '/api/v1/attachments/a',
-    }), { baseOrigin: 'http://127.0.0.1:18793', fetchImpl })
+    }), { baseOrigin: 'http://127.0.0.1:18793' })
 
     expect(result.ok).toBe(true)
     if (result.ok) {
@@ -46,11 +56,11 @@ describe('fetchDisplayAttachmentBlob', () => {
       expect(result.blob).toBe(localFile)
       expect(result.filename).toBe('local.html')
     }
-    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(http.requestBinary).not.toHaveBeenCalled()
   })
 
   it('decodes inline HTML bytes to a Blob without constructing a data URL', async () => {
-    const result = await fetchDisplayAttachmentBlob(attachment({
+    const result = await fetchDisplayAttachmentBlob(httpTransport(), attachment({
       name: 'page.html',
       mime: 'text/html',
       downloadData: 'PGgxPk9LPC9oMT4=',
@@ -65,15 +75,21 @@ describe('fetchDisplayAttachmentBlob', () => {
   })
 
   it('fetches staged bytes with sanitized URL and WebUI credentials', async () => {
-    const fetchImpl = vi.fn(async () => new Response('staged', {
-      status: 200,
-      headers: {
-        'content-type': 'application/pdf',
-        'content-disposition': 'attachment; filename="server.pdf"',
+    const blob = new Blob(['staged'], { type: 'application/pdf' })
+    const response = {
+      metadata: {
+        status: 200,
+        contentLength: blob.size,
+        contentType: blob.type,
+        filename: 'server.pdf',
       },
-    }))
+      blob: async () => blob,
+      stream: () => blob.stream(),
+    }
+    const requestBinary = vi.fn(async () => response)
+    const http = httpTransport(requestBinary)
 
-    const result = await fetchDisplayAttachmentBlob(attachment({
+    const result = await fetchDisplayAttachmentBlob(http, attachment({
       kind: 'staged',
       name: 'fallback.pdf',
       mime: 'application/pdf',
@@ -81,31 +97,24 @@ describe('fetchDisplayAttachmentBlob', () => {
     }), {
       baseOrigin: 'http://127.0.0.1:18793',
       sessionKey: 'agent:main:webchat:ok',
-      authToken: 'secret',
-      fetchImpl,
     })
 
     expect(result.ok).toBe(true)
-    expect(fetchImpl).toHaveBeenCalledWith('/api/v1/attachments/a', {
-      method: 'GET',
-      headers: {
-        'x-opensquilla-session-key': 'agent:main:webchat:ok',
-        Authorization: 'Bearer secret',
-      },
-      credentials: 'same-origin',
-      redirect: 'error',
+    expect(requestBinary).toHaveBeenCalledWith('/api/v1/attachments/a', {
+      sessionKey: 'agent:main:webchat:ok',
       signal: undefined,
+      timeoutMs: 0,
     })
     if (result.ok) expect(result.filename).toBe('server.pdf')
   })
 
   it('fails closed before fetch for cross-origin staged URLs', async () => {
-    const fetchImpl = vi.fn()
-    const result = await fetchDisplayAttachmentBlob(attachment({
+    const http = httpTransport()
+    const result = await fetchDisplayAttachmentBlob(http, attachment({
       download_url: 'https://files.example.test/report.txt?token=secret',
-    }), { baseOrigin: 'http://127.0.0.1:18793', fetchImpl })
+    }), { baseOrigin: 'http://127.0.0.1:18793' })
 
     expect(result.ok).toBe(false)
-    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(http.requestBinary).not.toHaveBeenCalled()
   })
 })

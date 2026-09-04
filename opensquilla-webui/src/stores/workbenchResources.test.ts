@@ -3,7 +3,20 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { WorkbenchResource } from '@/types/workbenchResources'
 import type { WorkbenchResourceProvider } from '@/modules/artifactWorkbench'
+import { ArtifactProductFailure } from '@/utils/artifactProductErrors'
 import { useWorkbenchResourcesStore } from './workbenchResources'
+
+function ambiguousArtifactFailure(message: string): ArtifactProductFailure {
+  return new ArtifactProductFailure(
+    'DOCUMENT_UNAVAILABLE',
+    message,
+    undefined,
+    false,
+    null,
+    null,
+    true,
+  )
+}
 
 const attachment: WorkbenchResource = {
   resource: { type: 'attachment', id: 'att-a' },
@@ -321,10 +334,7 @@ describe('workbench resources store', () => {
       document: { documentId: 'doc-after-retry' },
       revision: { revisionId: 'rev-after-retry' },
     } as Awaited<ReturnType<WorkbenchResourceProvider['importDocument']>>
-    const responseLost = Object.assign(new Error('private transport detail'), {
-      code: 'RPC_TRANSPORT_ERROR',
-      accepted: null,
-    })
+    const responseLost = ambiguousArtifactFailure('private transport detail')
     const importDocument = vi.fn<WorkbenchResourceProvider['importDocument']>()
       .mockRejectedValueOnce(responseLost)
       .mockResolvedValueOnce(imported)
@@ -355,10 +365,7 @@ describe('workbench resources store', () => {
   })
 
   it('uses an applied resolution without replaying the import write', async () => {
-    const responseLost = Object.assign(new Error('private transport detail'), {
-      code: 'RPC_TRANSPORT_ERROR',
-      accepted: null,
-    })
+    const responseLost = ambiguousArtifactFailure('private transport detail')
     const importDocument = vi.fn<WorkbenchResourceProvider['importDocument']>()
       .mockRejectedValue(responseLost)
     const canonicalDocument = {
@@ -399,10 +406,7 @@ describe('workbench resources store', () => {
   })
 
   it('resolves a pending open without replaying and keeps applied after a read failure', async () => {
-    const responseLost = Object.assign(new Error('private transport detail'), {
-      code: 'RPC_TRANSPORT_ERROR',
-      accepted: null,
-    })
+    const responseLost = ambiguousArtifactFailure('private transport detail')
     const open = vi.fn<NonNullable<WorkbenchResourceProvider['open']>>()
       .mockRejectedValue(responseLost)
     const canonicalDocument = {
@@ -468,10 +472,7 @@ describe('workbench resources store', () => {
       },
     })
     const publishDocument = vi.fn<WorkbenchResourceProvider['publishDocument']>()
-      .mockRejectedValueOnce(Object.assign(new Error('response lost'), {
-        code: 'RPC_TRANSPORT_ERROR',
-        accepted: null,
-      }))
+      .mockRejectedValueOnce(ambiguousArtifactFailure('response lost'))
       .mockResolvedValueOnce(appliedPublication('a'))
       .mockResolvedValueOnce(appliedPublication('b'))
     const provider = {
@@ -500,10 +501,7 @@ describe('workbench resources store', () => {
   })
 
   it('does not replay a publish write after the resolver proves it applied', async () => {
-    const responseLost = Object.assign(new Error('private transport detail'), {
-      code: 'RPC_TRANSPORT_ERROR',
-      accepted: null,
-    })
+    const responseLost = ambiguousArtifactFailure('private transport detail')
     const publishDocument = vi.fn<WorkbenchResourceProvider['publishDocument']>()
       .mockRejectedValue(responseLost)
     const provider = {

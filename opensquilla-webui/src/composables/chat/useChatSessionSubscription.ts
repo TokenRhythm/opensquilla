@@ -12,8 +12,7 @@ import {
   type SessionReadRunModeLock,
   type SessionReadSnapshot,
 } from '@/modules/sessionReadLifecycle'
-import type { ConversationRuntime } from '@/modules/conversationRuntime'
-import { conversationCursorSignal } from '@/utils/chat/streamEvents'
+import type { ConversationCursorSignal, ConversationRuntime } from '@/modules/conversationRuntime'
 import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
 import { chatTaskId } from '@/composables/chat/useChatTaskOwnership'
 import {
@@ -185,10 +184,10 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
    * The event-handler integration calls this first so a restarted Gateway's low
    * sequence numbers are accepted instead of compared with the retired stream.
    */
-  function observeStreamGeneration(source: unknown): boolean {
+  function observeStreamGeneration(signal: ConversationCursorSignal): boolean {
     const transition = conversationRuntime.observeGeneration(
       cursor(),
-      conversationCursorSignal(source),
+      signal,
     )
     if (!transition.changed) return false
     syncCursor(transition.cursor)

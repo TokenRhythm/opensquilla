@@ -1,4 +1,4 @@
-import type { RpcCallOptions } from '@/lib/rpc'
+import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import {
   SESSIONS_MESSAGES_HYDRATE_METHOD,
   type SessionsMessagesHydrateParams,
@@ -34,14 +34,13 @@ import {
   validateSessionsMessagesUnsubscribeParams,
   validateSessionsMessagesUnsubscribeResult,
 } from '@/contracts/generated/v4/sessionsMessagesUnsubscribeValidators.mjs'
-import { conversationSemanticEventKind } from './conversationEventsV4'
+import { projectConversationSnapshotEvent } from './conversationContentV4'
 import {
   requestV4SessionHistory,
   type SessionHistoryV4Policy,
 } from './sessionHistoryV4'
 import {
   SessionReadContractError,
-  SessionReadSessionMissingError,
   type SessionReadActivity,
   type SessionReadHistoryPage,
   type SessionReadJsonObject,
@@ -53,6 +52,7 @@ import {
   type SessionReadPortOpenRequest,
   type SessionReadSnapshot,
 } from '@/modules/sessionReadLifecycle'
+import { mapSessionReadError } from './sessionReadErrorMapping'
 
 const READY_TIMEOUT_MS = 15_000
 const READ_TIMEOUT_MS = 15_000
@@ -159,14 +159,7 @@ function isMissingMethod(error: unknown): boolean {
 }
 
 function subscriptionError(error: unknown): unknown {
-  if (error instanceof SessionReadSessionMissingError) return error
-  if (['NOT_FOUND', 'SESSION_NOT_FOUND'].includes(errorCode(error))) {
-    return new SessionReadSessionMissingError(
-      error instanceof Error ? error.message : 'The requested session does not exist.',
-      error,
-    )
-  }
-  return error
+  return mapSessionReadError(error)
 }
 
 function invalidContract(method: string): SessionReadContractError {
@@ -338,10 +331,10 @@ function projectSnapshot(value: SessionsMessagesSnapshotResult): SessionReadSnap
   return Object.freeze({
     sessionKey: value.key,
     taskId: value.task_id,
-    events: Object.freeze(value.events.map(event => Object.freeze({
-      semanticKind: conversationSemanticEventKind(event.event),
-      payload: projectObject(event.payload) ?? Object.freeze({}),
-    }))),
+    events: Object.freeze(value.events.flatMap(event => {
+      const projected = projectConversationSnapshotEvent(event.event, projectObject(event.payload))
+      return projected ? [Object.freeze({ ...projected, payload: Object.freeze(projected.payload) })] : []
+    })),
   })
 }
 
@@ -353,11 +346,16 @@ async function hydrate(
 ): Promise<SessionReadMetadata> {
   const params: SessionsMessagesHydrateParams = { key: sessionKey }
   requireParams(SESSIONS_MESSAGES_HYDRATE_METHOD, params, validateSessionsMessagesHydrateParams)
-  const raw = await rpc.request(
-    SESSIONS_MESSAGES_HYDRATE_METHOD,
-    params,
-    callOptions(signal, READ_TIMEOUT_MS, expectedGeneration),
-  )
+  let raw: unknown
+  try {
+    raw = await rpc.request(
+      SESSIONS_MESSAGES_HYDRATE_METHOD,
+      params,
+      callOptions(signal, READ_TIMEOUT_MS, expectedGeneration),
+    )
+  } catch (error) {
+    throw mapSessionReadError(error)
+  }
   const result = requireResult<SessionsMessagesHydrateResult>(
     SESSIONS_MESSAGES_HYDRATE_METHOD,
     raw,
@@ -392,8 +390,9 @@ async function optionalSnapshot(
       latch.sent(expectedGeneration)
       return null
     }
-    latch.failed(error)
-    throw error
+    const projected = mapSessionReadError(error)
+    latch.failed(projected)
+    throw projected
   }
 }
 
@@ -630,7 +629,9 @@ export function createV4SessionReadPort(
           readHistory,
           retryMetadata,
         }
-      })()
+      })().catch(error => {
+        throw mapSessionReadError(error)
+      })
       void setup.catch(() => {})
 
       const historyRead = (historyRequest: SessionReadPortHistoryRequest) => setup.then(

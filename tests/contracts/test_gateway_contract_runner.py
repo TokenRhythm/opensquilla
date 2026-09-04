@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -299,6 +300,94 @@ def test_invalid_generation_metadata_fails_before_tool_execution(
         runner.load_contract(schema, contract_root=tmp_path)
 
 
+@pytest.mark.parametrize(
+    "error_code",
+    (
+        "onboarding.channel.invalid",
+        "onboarding.channel.not_found",
+    ),
+)
+def test_only_declared_legacy_channel_error_codes_allow_dots(
+    tmp_path: Path,
+    error_code: str,
+) -> None:
+    document = _method_schema("onboarding.channel.probe")
+    document["x-opensquilla-method"]["errors"] = [
+        {"code": error_code},
+        {"code": "INTERNAL_ERROR"},
+    ]
+    schema = _write_schema(
+        tmp_path,
+        "platform/onboarding-channel-probe.schema.json",
+        document,
+    )
+
+    spec = runner.load_contract(schema, contract_root=tmp_path)
+
+    assert spec.metadata["errors"][0]["code"] == error_code
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    (
+        "migration.invalid_params",
+        "migration.candidate_unavailable",
+        "migration.unavailable",
+        "migration.preview_unavailable",
+    ),
+)
+def test_only_declared_legacy_migration_error_codes_allow_dots(
+    tmp_path: Path,
+    error_code: str,
+) -> None:
+    document = _method_schema("migration.sources.preview")
+    document["x-opensquilla-method"]["errors"] = [
+        {"code": error_code},
+        {"code": "INTERNAL_ERROR"},
+    ]
+    schema = _write_schema(
+        tmp_path,
+        "platform/migration-sources-preview.schema.json",
+        document,
+    )
+
+    spec = runner.load_contract(schema, contract_root=tmp_path)
+
+    assert spec.metadata["errors"][0]["code"] == error_code
+
+
+def test_undeclared_migration_dotted_error_code_remains_rejected(
+    tmp_path: Path,
+) -> None:
+    document = _method_schema("migration.sources.preview")
+    document["x-opensquilla-method"]["errors"] = [
+        {"code": "migration.unknown"}
+    ]
+    schema = _write_schema(
+        tmp_path,
+        "platform/migration-sources-preview.schema.json",
+        document,
+    )
+
+    with pytest.raises(runner.ContractConfigurationError, match="error code"):
+        runner.load_contract(schema, contract_root=tmp_path)
+
+
+def test_undeclared_dotted_error_code_remains_rejected(tmp_path: Path) -> None:
+    document = _method_schema("onboarding.channel.probe")
+    document["x-opensquilla-method"]["errors"] = [
+        {"code": "onboarding.channel.unknown"}
+    ]
+    schema = _write_schema(
+        tmp_path,
+        "platform/onboarding-channel-probe.schema.json",
+        document,
+    )
+
+    with pytest.raises(runner.ContractConfigurationError, match="error code"):
+        runner.load_contract(schema, contract_root=tmp_path)
+
+
 def test_only_the_legacy_status_root_method_is_accepted(tmp_path: Path) -> None:
     status = _write_schema(
         tmp_path,
@@ -314,6 +403,58 @@ def test_only_the_legacy_status_root_method_is_accepted(tmp_path: Path) -> None:
     )
     with pytest.raises(runner.ContractConfigurationError, match="method name"):
         runner.load_contract(health, contract_root=tmp_path)
+
+
+def test_exact_legacy_sandbox_create_directory_method_is_accepted(
+    tmp_path: Path,
+) -> None:
+    document = _method_schema("sandbox.path.create_directory")
+    method = document["x-opensquilla-method"]
+    method["name"] = "sandbox.path.create-directory"
+    method["capability"]["name"] = "sandbox.path.create-directory"
+    schema = _write_schema(
+        tmp_path,
+        "sandbox/sandbox-path-create-directory.schema.json",
+        document,
+    )
+
+    spec = runner.load_contract(schema, contract_root=tmp_path)
+
+    assert spec.wire_name == "sandbox.path.create-directory"
+    assert spec.python_stem == "sandbox_path_create_directory"
+    assert spec.typescript_stem == "sandboxPathCreateDirectory"
+    assert spec.constant_prefix == "SANDBOX_PATH_CREATE_DIRECTORY"
+
+
+@pytest.mark.parametrize("metadata_key", ["name", "capability"])
+@pytest.mark.parametrize(
+    "wire_name",
+    [
+        "sandbox.path.create-file",
+        "sandbox.path.-create",
+        "sandbox.path.create--directory",
+        "sandbox.path.create-directory-",
+    ],
+)
+def test_other_hyphenated_method_and_capability_names_remain_illegal(
+    tmp_path: Path,
+    metadata_key: str,
+    wire_name: str,
+) -> None:
+    document = _method_schema("sandbox.path.create_directory")
+    method = document["x-opensquilla-method"]
+    if metadata_key == "name":
+        method["name"] = wire_name
+    else:
+        method["capability"]["name"] = wire_name
+    schema = _write_schema(
+        tmp_path,
+        "sandbox/sandbox-path-create-directory.schema.json",
+        document,
+    )
+
+    with pytest.raises(runner.ContractConfigurationError, match=metadata_key):
+        runner.load_contract(schema, contract_root=tmp_path)
 
 
 def test_only_the_exact_production_sessions_list_schema_is_grandfathered(
@@ -334,6 +475,87 @@ def test_only_the_exact_production_sessions_list_schema_is_grandfathered(
     )
     with pytest.raises(runner.ContractConfigurationError, match="declare kind"):
         runner.load_contract(copied_schema, contract_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("lifecycle", "canonical_alias", "message"),
+    [
+        ("legacy", None, "canonicalAlias"),
+        ("stable", "sessions.contextCompact", "stable method"),
+        ("legacy", "bad alias", "canonicalAlias"),
+    ],
+)
+def test_legacy_method_lifecycle_requires_one_legal_canonical_alias(
+    tmp_path: Path,
+    lifecycle: str,
+    canonical_alias: str | None,
+    message: str,
+) -> None:
+    document = _method_schema("sessions.compact")
+    method = document["x-opensquilla-method"]
+    method["lifecycle"] = lifecycle
+    if canonical_alias is not None:
+        method["canonicalAlias"] = canonical_alias
+    schema = _write_schema(
+        tmp_path,
+        "sessions/sessions-compact.schema.json",
+        document,
+    )
+
+    with pytest.raises(runner.ContractConfigurationError, match=message):
+        runner.load_contract(schema, contract_root=tmp_path)
+
+
+def test_compatibility_manifest_is_schema_derived_and_deterministic() -> None:
+    specs = runner.discover_contracts()
+
+    first = runner.render_compatibility_manifest(specs)
+    second = runner.render_compatibility_manifest(specs)
+    manifest = json.loads(first)
+
+    assert first == second
+    assert manifest["format"] == 1
+    assert manifest["protocol"] == runner.GATEWAY_PROTOCOL
+    assert manifest["wireVersion"] == 4
+    assert manifest["source"] == {
+        "schemaCount": 224,
+        "methodCount": 215,
+        "eventFamilyCount": 9,
+        "schemaTreeSha256": runner._schema_tree_digest(specs),
+        "generatorSha256": runner._generator_digest(),
+    }
+    assert Counter(entry["lifecycle"] for entry in manifest["methods"]) == {
+        "stable": 210,
+        "legacy": 5,
+    }
+    assert {
+        entry["name"]: entry["canonicalName"]
+        for entry in manifest["methods"]
+        if entry["lifecycle"] == "legacy"
+    } == {
+        "sessions.compact": "sessions.contextCompact",
+        "sessions.steer": "sessions.steer.v2",
+        "plugin.approval.status": "exec.approval.status",
+        "plugin.approval.resolve": "exec.approval.resolve",
+        "plugin.approval.extend": "exec.approval.extend",
+    }
+    assert all(
+        runner.SHA256_PATTERN.fullmatch(entry["schemaSha256"])
+        for entry in [*manifest["methods"], *manifest["events"]]
+    )
+    event_families = {entry["family"]: entry for entry in manifest["events"]}
+    assert len(event_families) == 9
+    assert event_families["models.routing.changed"]["wireNames"] == [
+        "models.routing.changed"
+    ]
+    assert "session.event.artifact_state" in event_families[
+        "conversation.events"
+    ]["wireNames"]
+    assert "session.event.artifact_state" in event_families[
+        "document.state_changed"
+    ]["wireNames"]
+    assert "private" not in first.lower()
+    assert "allowlist" not in first.lower()
 
 
 @pytest.mark.parametrize(
@@ -403,6 +625,12 @@ def test_aggregate_run_dispatches_every_discovered_contract(
         "_run_registration_descriptor",
         lambda specs, mode: 0,
     )
+    manifest_calls: list[str] = []
+    monkeypatch.setattr(
+        runner,
+        "_run_compatibility_manifest",
+        lambda specs, mode: manifest_calls.append(mode) or 0,
+    )
     monkeypatch.setattr(
         runner,
         "reconcile_orphans",
@@ -411,6 +639,7 @@ def test_aggregate_run_dispatches_every_discovered_contract(
 
     assert runner.run("check", (legacy, generic)) == 0
     assert calls == [("sessions.list", "check"), ("sessions.resolve", "check")]
+    assert manifest_calls == ["check"]
 
 
 def test_generic_renderer_derives_all_adapter_only_artifacts(

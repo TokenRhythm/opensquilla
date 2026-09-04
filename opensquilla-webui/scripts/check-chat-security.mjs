@@ -27,7 +27,7 @@ assertAbsent(
 )
 
 assertPresent(
-  'src/adapters/gateway/artifactAccessV4.ts',
+  'src/adapters/gateway/privateArtifactHttpTransport.ts',
   /searchParams\.delete\(['"]token['"]\)[\s\S]+searchParams\.delete\(['"]sessionKey['"]\)[\s\S]+searchParams\.delete\(['"]session_key['"]\)/,
   'artifact URL sanitizer must strip sensitive same-origin query params.',
 )
@@ -84,13 +84,13 @@ assertPresent(
 )
 
 assertPresent(
-  'src/adapters/gateway/attachmentAccessV4.ts',
+  'src/adapters/gateway/privateArtifactHttpTransport.ts',
   /url\.protocol !== 'http:'[\s\S]+url\.protocol !== 'https:'[\s\S]+url\.origin !== base\.origin/,
   'attachment downloads must reject non-HTTP(S) and cross-origin staged URLs.',
 )
 
 assertPresent(
-  'src/adapters/gateway/attachmentAccessV4.ts',
+  'src/adapters/gateway/privateArtifactHttpTransport.ts',
   /CREDENTIAL_QUERY_KEYS[\s\S]+url\.searchParams\.delete\(key\)/,
   'attachment downloads must strip token and session query credentials.',
 )

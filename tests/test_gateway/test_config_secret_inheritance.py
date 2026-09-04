@@ -29,8 +29,8 @@ import opensquilla.gateway.rpc_config  # noqa: F401  ensures config.* handlers r
 from opensquilla.gateway import config_secrets
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.config_persistence import persist_gateway_config
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
-from opensquilla.gateway.rpc_config import _persist_config
 from opensquilla.onboarding.mutations import upsert_llm_provider
 from opensquilla.onboarding.redaction import REDACTED_PLACEHOLDER
 
@@ -303,7 +303,7 @@ def test_persist_config_fresh_file_has_owner_only_posix_mode(tmp_path, monkeypat
         cfg = GatewayConfig()
         cfg_path = tmp_path / "fresh" / "config.toml"
         cfg.config_path = str(cfg_path)
-        _persist_config(cfg)
+        persist_gateway_config(cfg)
     finally:
         os.umask(old_umask)
 

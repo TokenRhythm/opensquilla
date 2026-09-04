@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import { buildUsageCsv } from './usageCsv'
 import { effectiveCnyPerUsd } from './nativeBilling'
-import { normalizeUsageQueryResponse } from './useUsageQuery'
+import { usageSession, usageSnapshot, usageTotals } from '@/testing/usage.test-helper'
 
 function parseCsvLine(line: string): string[] {
   const cells: string[] = []
@@ -29,7 +29,7 @@ function parseCsvLine(line: string): string[] {
 }
 
 describe('usage CSV native billing compatibility', () => {
-  it('retains existing columns and appends lossless native receipt fields', () => {
+  it('retains existing columns and appends lossless native receipt fields', async () => {
     const native = {
       CNY: {
         amountNanos: '6975000000',
@@ -39,12 +39,7 @@ describe('usage CSV native billing compatibility', () => {
         normalizationRatesNativePerUsd: ['6.975'],
       },
     }
-    const totals = {
-      inputTokens: 10,
-      outputTokens: 2,
-      costNanos: '1000000000',
-      billedCostNanos: '1000000000',
-      estimatedCostNanos: '0',
+    const nativeTotals = {
       costSource: 'provider_billed',
       costSourceCounts: { provider_billed: 1 },
       nativeBilledByCurrency: native,
@@ -52,19 +47,20 @@ describe('usage CSV native billing compatibility', () => {
       nativeBillingExpectedReceiptCount: 1,
       nativeBillingMissingConfirmedReceiptCount: 0,
     }
-    const snapshot = normalizeUsageQueryResponse({
-      schemaVersion: 1,
-      range: { preset: 'all', timezone: 'UTC', fromMs: null, toMs: 999 },
-      totals,
-      sessions: [{ sessionKey: 'session-1', totals }],
+    const snapshot = usageSnapshot({
+      range: { preset: 'all', fromMs: null, toMs: 999 },
+      totals: usageTotals({ input: 10, output: 2, cost: 1, billedCost: 1, ...nativeTotals }),
+      sessions: [usageSession({
+        session: 'session-1', sessionKey: 'session-1',
+        inputTokens: 10, outputTokens: 2, costUsd: 1, billedCostUsd: 1,
+        estimatedCostUsd: 0, estimatedEventCount: 0, missingCostEntries: 0,
+        ...nativeTotals,
+      })],
       coverage: {
-        status: 'complete',
+        ...usageSnapshot().coverage,
         nativeBilling: {
-          status: 'complete',
-          exactFromMs: 123,
-          reasonCodes: [],
-          missingConfirmedReceiptCount: 0,
-          pendingReceiptCount: 0,
+          status: 'complete', exactFromMs: 123, reasonCodes: [],
+          missingConfirmedReceiptCount: 0, pendingReceiptCount: 0,
         },
       },
     })
@@ -130,5 +126,20 @@ describe('usage CSV native billing compatibility', () => {
     ).split('\n')
     expect(parseCsvLine(exactSummary)[13]).toBe('6.975000000')
     expect(parseCsvLine(exactSession)[13]).toBe('6.975000')
+  })
+  it('exports unknown measurements as empty cells and zeroes as recorded values', () => {
+    const rows = [
+      usageSession({ session: 'unknown' }),
+      usageSession({
+        session: 'zero', inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
+        cacheWriteTokens: 0, costUsd: 0, billedCostUsd: 0, estimatedCostUsd: 0,
+        estimatedEventCount: 0, missingCostEntries: 0,
+      }),
+    ]
+    const lines = buildUsageCsv(null, rows).split('\n').map(parseCsvLine)
+    expect(lines[2].slice(8, 17)).toEqual(['', '', '', '', '', '', '', '', ''])
+    expect(lines[3].slice(8, 17)).toEqual([
+      '0', '0', '0', '0', '0.000000', '0.000000', '0.000000', '0.000000', '0',
+    ])
   })
 })

@@ -4,7 +4,11 @@ import type {
   ArtifactWorkbench,
   ArtifactWorkbenchSubscription,
 } from '@/modules/artifactWorkbench'
-import type { RpcCallOptions } from '@/lib/rpc'
+import { ArtifactCatalogError } from '@/modules/artifactWorkbench'
+import {
+  readTransportFailure,
+} from './transportTypes'
+import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import {
   ARTIFACTS_LIST_METHOD,
 } from '@/contracts/generated/v4/artifactsList'
@@ -15,7 +19,12 @@ import { createV4ArtifactPromptAnnotations } from './artifactPromptAnnotationsV4
 import { createV4WorkbenchResources } from './workbenchResourcesV4'
 import { createV4ArtifactContentAccess } from './artifactAccessV4'
 import { createV4AttachmentContentAccess } from './attachmentAccessV4'
+import { createV4ArtifactPreviews } from './artifactPreviewsV4'
 import { documentChangeEventContract } from './artifactWorkbenchContracts'
+
+type ArtifactWorkbenchHttpTransport = Parameters<typeof createV4ArtifactContentAccess>[0]
+  & Parameters<typeof createV4AttachmentContentAccess>[0]
+  & Parameters<typeof createV4ArtifactPreviews>[0]
 
 interface RpcTransport {
   request<T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions): Promise<T>
@@ -33,13 +42,6 @@ interface TransportSubscription {
 
 interface EventTransport {
   subscribe(event: string, handler: (payload: unknown) => void): TransportSubscription
-}
-
-interface AttachmentUploadClient {
-  requestJson<T>(endpoint: string, options: {
-    method: 'POST'
-    form: FormData
-  }): Promise<T>
 }
 
 const MAX_ARTIFACT_PAGE_LIMIT = 200
@@ -86,10 +88,19 @@ function methodNotFound(error: unknown): boolean {
     || /method not found/i.test(error instanceof Error ? error.message : String(error || ''))
 }
 
-function markCatalogPhase(error: unknown, phase: 'connect' | 'list'): void {
-  if (error && typeof error === 'object') {
-    ;(error as { artifactCatalogPhase?: string }).artifactCatalogPhase = phase
-  }
+function catalogError(
+  error: unknown,
+  phase: 'connect' | 'list',
+): ArtifactCatalogError {
+  if (error instanceof ArtifactCatalogError) return error
+  const failure = readTransportFailure(error)
+  const code = failure.code?.toUpperCase()
+  const kind = code === 'RPC_ABORTED' || (error instanceof Error && error.name === 'AbortError')
+    ? 'aborted'
+    : code === 'RPC_TIMEOUT'
+      ? 'timeout'
+      : 'unavailable'
+  return new ArtifactCatalogError(kind, phase, failure.message, error)
 }
 
 function createV4ArtifactCatalog(rpc: RpcTransport): ArtifactCatalog {
@@ -103,8 +114,7 @@ function createV4ArtifactCatalog(rpc: RpcTransport): ArtifactCatalog {
           abortAction: 'reject',
         })
       } catch (error) {
-        markCatalogPhase(error, 'connect')
-        throw error
+        throw catalogError(error, 'connect')
       }
       if (!rpc.supports(ARTIFACTS_LIST_METHOD)) return null
       const limit = typeof options.limit === 'number' && Number.isFinite(options.limit)
@@ -135,7 +145,13 @@ function createV4ArtifactCatalog(rpc: RpcTransport): ArtifactCatalog {
             !Array.isArray(response.artifacts)
             || (!canonical && typeof response.hasMore !== 'boolean')
             || typeof (response.has_more ?? response.hasMore) !== 'boolean'
-          ) throw new Error('Artifact catalog response violated its v4 contract')
+          ) {
+            throw new ArtifactCatalogError(
+              'invalid',
+              'list',
+              'Artifact catalog response violated its v4 contract',
+            )
+          }
           const page = artifactPageItems(response)
           collected = mergeArtifacts(page, collected)
           if (!Boolean(response.has_more ?? response.hasMore)) break
@@ -144,15 +160,20 @@ function createV4ArtifactCatalog(rpc: RpcTransport): ArtifactCatalog {
             typeof cursor !== 'string'
             || page.length === 0
             || visitedCursors.has(cursor)
-          ) throw new Error('Artifact pagination did not provide an advancing cursor')
+          ) {
+            throw new ArtifactCatalogError(
+              'invalid',
+              'list',
+              'Artifact pagination did not provide an advancing cursor',
+            )
+          }
           visitedCursors.add(cursor)
           before = cursor
         }
         return collected
       } catch (error) {
         if (!methodNotFound(error)) {
-          markCatalogPhase(error, 'list')
-          throw error
+          throw catalogError(error, 'list')
         }
         rpc.markUnsupported(ARTIFACTS_LIST_METHOD)
         return null
@@ -176,7 +197,7 @@ function documentChange(value: unknown): (ArtifactDocumentChange & { sequence: n
 export function createV4ArtifactWorkbench(
   rpc: RpcTransport,
   events: EventTransport,
-  http: AttachmentUploadClient,
+  http: ArtifactWorkbenchHttpTransport,
 ): ArtifactWorkbench {
   const listeners = new Set<(change: ArtifactDocumentChange) => void>()
   const seenSequences = new Map<string, number>()
@@ -204,15 +225,29 @@ export function createV4ArtifactWorkbench(
     seenSequences.clear()
   }
 
-  const artifactContent = createV4ArtifactContentAccess()
+  const artifactContent = createV4ArtifactContentAccess(http)
   const attachmentContent = createV4AttachmentContentAccess(http)
+  const operationRpc: RpcTransport = {
+    async request<T>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions) {
+      await rpc.ready({
+        signal: options?.signal,
+        timeoutMs: 10_000,
+        timeoutAction: 'reject',
+        abortAction: 'reject',
+      })
+      return rpc.request<T>(method, params, options)
+    },
+    ready: options => rpc.ready(options),
+    supports: method => rpc.supports(method),
+    markUnsupported: method => rpc.markUnsupported(method),
+  }
   return {
     artifacts: createV4ArtifactCatalog(rpc),
-    documents: createV4ArtifactDocuments(rpc),
-    resources: createV4WorkbenchResources(rpc),
-    promptAnnotations: createV4ArtifactPromptAnnotations(rpc),
+    documents: createV4ArtifactDocuments(operationRpc),
+    resources: createV4WorkbenchResources(operationRpc),
+    promptAnnotations: createV4ArtifactPromptAnnotations(operationRpc),
     content: { ...artifactContent, ...attachmentContent },
-    ready: () => rpc.ready(),
+    previews: createV4ArtifactPreviews(http),
     subscribeDocumentChanges(listener): ArtifactWorkbenchSubscription {
       listeners.add(listener)
       startLease()

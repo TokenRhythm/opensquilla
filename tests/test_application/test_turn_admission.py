@@ -35,20 +35,20 @@ class _Runtime:
 
 async def test_canonical_and_legacy_commands_share_one_application_entry() -> None:
     runtime = _Runtime()
-    application = TurnAdmission(runtime)
+    application = TurnAdmission(
+        ingress=runtime,
+        cancellation=runtime,
+        steering=runtime,
+    )
 
     await application.admit(
-        AdmitTurn(" agent:main:webchat:one ", "hello", "webchat", {"intent": "continue"})
+        AdmitTurn(" agent:main:webchat:one ", "hello", "webchat", intent="continue")
     )
     await application.admit(
-        AdmitTurn(" agent:main:webchat:one ", "hello", "session", {"intent": "continue"})
+        AdmitTurn(" agent:main:webchat:one ", "hello", "session", intent="continue")
     )
-    await application.steer(
-        SteerTurn(" agent:main:webchat:one ", "guide", "durable", {})
-    )
-    await application.steer(
-        SteerTurn(" agent:main:webchat:one ", "guide", "legacy", {})
-    )
+    await application.steer(SteerTurn(" agent:main:webchat:one ", "guide", "durable"))
+    await application.steer(SteerTurn(" agent:main:webchat:one ", "guide", "legacy"))
 
     assert {command.surface for command in runtime.admissions} == {"webchat", "session"}
     assert {command.mode for command in runtime.steers} == {"durable", "legacy"}
@@ -60,7 +60,11 @@ async def test_canonical_and_legacy_commands_share_one_application_entry() -> No
 
 async def test_exact_task_cancel_fails_closed_before_runtime() -> None:
     runtime = _Runtime()
-    application = TurnAdmission(runtime)
+    application = TurnAdmission(
+        ingress=runtime,
+        cancellation=runtime,
+        steering=runtime,
+    )
 
     result = await application.cancel(
         CancelTurn(
@@ -69,7 +73,6 @@ async def test_exact_task_cancel_fails_closed_before_runtime() -> None:
             task_id=None,
             task_scoped=True,
             source="webui_abort",
-            attributes={},
         )
     )
 
@@ -83,7 +86,11 @@ async def test_exact_task_cancel_fails_closed_before_runtime() -> None:
 
 async def test_pending_steer_requires_complete_atomic_guard() -> None:
     runtime = _Runtime()
-    application = TurnAdmission(runtime)
+    application = TurnAdmission(
+        ingress=runtime,
+        cancellation=runtime,
+        steering=runtime,
+    )
 
     with pytest.raises(ValueError, match="source scope"):
         await application.steer(
@@ -91,7 +98,6 @@ async def test_pending_steer_requires_complete_atomic_guard() -> None:
                 "agent:main:webchat:one",
                 "guide",
                 "durable",
-                {},
                 pending_input=PendingInputGuard("pending-1", "fingerprint", 2),
             )
         )

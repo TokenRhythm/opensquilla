@@ -19,6 +19,34 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from opensquilla.gateway.adapters.memory_profile_import_contract import (
+    register_memory_profile_import_contract,
+)
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
+from opensquilla.gateway.profile_import_startup import (
+    ProfileImportUnavailableError,
+    run_profile_import_startup_maintenance,
+    run_profile_import_startup_recovery,
+    shared_profile_state_dir,
+)
+from opensquilla.gateway.profile_import_startup import (
+    bounded_await as _bounded_await,
+)
+from opensquilla.gateway.profile_import_startup import (
+    index_receipt_sources as _index_receipt_sources,
+)
+from opensquilla.gateway.profile_import_startup import (
+    maybe_await as _maybe_await,
+)
+from opensquilla.gateway.profile_import_startup import (
+    persist_index_status as _persist_index_status,
+)
+from opensquilla.gateway.profile_import_startup import (
+    profile_import_paths as _resolve_profile_import_paths,
+)
+from opensquilla.gateway.profile_import_startup import (
+    refresh_recovered_runtime as _refresh_profile_import_runtime,
+)
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
 from opensquilla.provider.auxiliary_budget import (
     ensure_auxiliary_text_fits,
@@ -72,17 +100,6 @@ def _to_wire(value: Any) -> Any:
     if isinstance(value, Path):
         return value.as_posix()
     return value
-
-
-async def _maybe_await(value: Any) -> Any:
-    return await value if inspect.isawaitable(value) else value
-
-
-async def _bounded_await(value: Any, *, timeout_seconds: float) -> Any:
-    if not inspect.isawaitable(value):
-        return value
-    async with asyncio.timeout(timeout_seconds):
-        return await value
 
 
 def _consume_background_task(task: asyncio.Future[Any]) -> None:
@@ -179,10 +196,7 @@ def _injected_service(ctx: RpcContext, agent_id: str) -> Any | None:
 
 
 def _shared_state_dir(ctx: RpcContext) -> Path:
-    from opensquilla.agents.scope import default_state_dir
-
-    configured = getattr(getattr(ctx, "config", None), "state_dir", None)
-    return Path(configured).expanduser() if configured else default_state_dir()
+    return shared_profile_state_dir(getattr(ctx, "config", None))
 
 
 def _is_loopback_deployment(provider: str, base_url: str) -> bool:
@@ -195,33 +209,18 @@ def _is_loopback_deployment(provider: str, base_url: str) -> bool:
 
 
 def _profile_import_paths(ctx: RpcContext, agent_id: str) -> Any:
-    from opensquilla.agents.scope import resolve_agent_workspace_dir
-    from opensquilla.memory.profile_import import ProfileImportPaths
-
     managers = getattr(ctx, "memory_managers", None) or {}
-    manager = managers.get(agent_id)
-    if manager is None:
+    try:
+        return _resolve_profile_import_paths(
+            config=getattr(ctx, "config", None),
+            memory_managers=managers,
+            agent_id=agent_id,
+        )
+    except ProfileImportUnavailableError as exc:
         raise RpcHandlerError(
             "MEMORY_IMPORT_UNAVAILABLE",
-            f"Memory is not configured for agent {agent_id!r}.",
-        )
-    memory_root = getattr(manager, "workspace_dir", None) or getattr(
-        manager, "memory_dir", None
-    )
-    if memory_root is None:
-        raise RpcHandlerError(
-            "MEMORY_IMPORT_UNAVAILABLE",
-            f"Memory source is not configured for agent {agent_id!r}.",
-        )
-    config = getattr(ctx, "config", None)
-    state_dir = _shared_state_dir(ctx).expanduser().resolve(strict=False)
-    return ProfileImportPaths(
-        agent_id=agent_id,
-        agent_workspace_dir=Path(resolve_agent_workspace_dir(agent_id, config)),
-        memory_workspace_dir=Path(memory_root),
-        state_dir=state_dir,
-        profile_home_dir=state_dir.parent,
-    )
+            str(exc),
+        ) from exc
 
 
 class _GatewayFusionCompletion:
@@ -770,73 +769,6 @@ def _preview_request(params: dict[str, Any]) -> Any:
     )
 
 
-async def _index_receipt_sources(
-    service: Any,
-    manager: Any,
-    receipt_id: str,
-    *,
-    timeout_seconds: float = _DERIVED_REFRESH_TIMEOUT_SECONDS,
-) -> bool | None:
-    """Index committed MEMORY/IMPORT sources; return None for injected old seams."""
-
-    domain_store = getattr(service, "store", None)
-    load_receipt = getattr(domain_store, "load_receipt", None)
-    index_store = getattr(manager, "store", None)
-    index_file = getattr(index_store, "index_file", None)
-    remove_file = getattr(index_store, "remove_file", None)
-    if not callable(load_receipt) or not callable(index_file) or not callable(remove_file):
-        return None
-
-    from opensquilla.memory.profile_import.files import read_text_image, target_path
-    from opensquilla.memory.types import MemorySource
-
-    try:
-        async with asyncio.timeout(timeout_seconds):
-            receipt = load_receipt(receipt_id)
-            for plan in receipt.files:
-                target = str(
-                    getattr(getattr(plan, "target", None), "value", plan.target)
-                )
-                if target not in {"MEMORY", "IMPORT"}:
-                    continue
-                root, path = target_path(service.paths, plan)
-                exists, content, _mode = read_text_image(root, path)
-                if exists:
-                    await _maybe_await(
-                        index_file(
-                            path=plan.relative_path,
-                            content=content,
-                            source=MemorySource.memory,
-                        )
-                    )
-                else:
-                    await _maybe_await(remove_file(plan.relative_path))
-        return True
-    except Exception:  # noqa: BLE001 - index is derived; source files remain authoritative
-        return False
-
-
-async def _persist_index_status(
-    service: Any,
-    receipt_id: str,
-    status: str,
-    *,
-    timeout_seconds: float = _DERIVED_REFRESH_TIMEOUT_SECONDS,
-) -> None:
-    update = getattr(service, "set_index_status", None)
-    if not callable(update):
-        return
-    try:
-        await _bounded_await(
-            update(receipt_id, status),
-            timeout_seconds=timeout_seconds,
-        )
-    except Exception:
-        # Diagnostic metadata may lag; source files and the dirty retry marker
-        # remain authoritative.
-        return
-
-
 async def _refresh_recovered_runtime(
     ctx: RpcContext,
     *,
@@ -846,209 +778,15 @@ async def _refresh_recovered_runtime(
     force_full_sync: bool = False,
     timeout_seconds: float = _DERIVED_REFRESH_TIMEOUT_SECONDS,
 ) -> None:
-    """Refresh derived state after journal recovery changed canonical files."""
-
-    if not batch_ids and not force_full_sync:
-        return
-    derived_ok = True
-    runner = getattr(ctx, "turn_runner", None)
-    for name in ("invalidate_profile_snapshot", "refresh_memory_snapshot"):
-        callback = getattr(runner, name, None)
-        if not callable(callback):
-            continue
-        try:
-            await _bounded_await(
-                callback(agent_id),
-                timeout_seconds=timeout_seconds,
-            )
-        except Exception:  # noqa: BLE001 - canonical files remain authoritative
-            derived_ok = False
-
-    managers = getattr(ctx, "memory_managers", None) or {}
-    manager = managers.get(agent_id)
-    receipts: list[Any] = []
-    domain_store = getattr(service, "store", None)
-    load_by_batch = getattr(domain_store, "load_receipt_by_batch", None)
-    for batch_id in batch_ids:
-        if not callable(load_by_batch):
-            break
-        try:
-            receipt = load_by_batch(batch_id)
-        except Exception:  # noqa: BLE001 - recovery itself already completed safely
-            derived_ok = False
-            continue
-        if receipt is not None:
-            receipts.append(receipt)
-
-    if manager is None:
-        for receipt in receipts:
-            await _persist_index_status(service, str(receipt.receipt_id), "pending")
-        return
-
-    mark_dirty = getattr(getattr(manager, "sync_manager", None), "mark_dirty", None)
-    if callable(mark_dirty):
-        try:
-            mark_dirty()
-        except Exception:  # noqa: BLE001 - derived index remains retryable
-            derived_ok = False
-
-    requires_full_sync = force_full_sync or len(receipts) != len(batch_ids)
-    receipt_indexed: dict[str, bool] = {}
-    for receipt in receipts:
-        receipt_id = str(receipt.receipt_id)
-        indexed = await _index_receipt_sources(
-            service,
-            manager,
-            receipt_id,
-            timeout_seconds=timeout_seconds,
-        )
-        if indexed is None:
-            requires_full_sync = True
-        else:
-            receipt_indexed[receipt_id] = indexed
-
-    full_sync_ok = True
-    if requires_full_sync:
-        sync = getattr(manager, "sync", None)
-        if callable(sync):
-            try:
-                await _bounded_await(
-                    sync(reason="profile_import_recovery", force=True),
-                    timeout_seconds=timeout_seconds,
-                )
-            except Exception:  # noqa: BLE001 - source files stay authoritative
-                full_sync_ok = False
-        else:
-            full_sync_ok = False
-
-    for receipt in receipts:
-        receipt_id = str(receipt.receipt_id)
-        indexed = receipt_indexed.get(receipt_id, full_sync_ok)
-        status = "ready" if indexed and derived_ok else "pending"
-        await _persist_index_status(
-            service,
-            receipt_id,
-            status,
-            timeout_seconds=timeout_seconds,
-        )
-
-
-def _startup_profile_import_service(ctx: RpcContext, agent_id: str) -> Any:
-    from opensquilla.memory.profile_import import ModelIdentity, ProfileImportService
-
-    return ProfileImportService(
-        _profile_import_paths(ctx, agent_id),
-        ModelIdentity(
-            provider="startup-maintenance",
-            model="startup-maintenance",
-        ),
-        None,
+    await _refresh_profile_import_runtime(
+        memory_managers=getattr(ctx, "memory_managers", None) or {},
+        turn_runner=getattr(ctx, "turn_runner", None),
+        service=service,
+        agent_id=agent_id,
+        batch_ids=batch_ids,
+        force_full_sync=force_full_sync,
+        timeout_seconds=timeout_seconds,
     )
-
-
-async def run_profile_import_startup_recovery(
-    *,
-    config: Any,
-    memory_managers: dict[str, Any],
-) -> dict[str, list[str]]:
-    """Recover canonical profile files serially before Gateway readiness."""
-
-    ctx = RpcContext(
-        conn_id="profile-import-recovery",
-        config=config,
-        memory_managers=memory_managers,
-    )
-    recovered: dict[str, list[str]] = {}
-    for agent_id in sorted(memory_managers):
-        service = _startup_profile_import_service(ctx, agent_id)
-        try:
-            recovered[agent_id] = await service.recover()
-        except BaseException as exc:
-            if isinstance(exc, asyncio.CancelledError):
-                raise
-            raise RuntimeError(
-                f"profile import startup recovery failed for agent {agent_id!r}: {exc}"
-            ) from exc
-    return recovered
-
-
-async def run_profile_import_startup_maintenance(
-    *,
-    config: Any,
-    memory_managers: dict[str, Any],
-    turn_runner: Any = None,
-    recovered_batches: dict[str, list[str]] | None = None,
-    timeout_seconds: float = _DERIVED_REFRESH_TIMEOUT_SECONDS,
-) -> dict[str, str]:
-    """Run non-canonical cleanup and derived refresh after Gateway readiness."""
-
-    from datetime import UTC, datetime
-
-    from opensquilla.memory.profile_import.store import (
-        cleanup_expired_profile_import_raw,
-        harden_profile_import_private_state,
-    )
-
-    failures: dict[str, str] = {}
-    state_dir = _shared_state_dir(
-        RpcContext(
-            conn_id="profile-import-maintenance",
-            config=config,
-        )
-    )
-    try:
-        await asyncio.to_thread(
-            lambda: (
-                harden_profile_import_private_state(state_dir),
-                cleanup_expired_profile_import_raw(state_dir, datetime.now(UTC)),
-            )
-        )
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - cleanup is best-effort after readiness
-        failures["_raw"] = str(exc)
-
-    ctx = RpcContext(
-        conn_id="profile-import-maintenance",
-        config=config,
-        memory_managers=memory_managers,
-        turn_runner=turn_runner,
-    )
-
-    async def maintain_agent(agent_id: str) -> tuple[str, str | None]:
-        service = _startup_profile_import_service(ctx, agent_id)
-        try:
-            await _refresh_recovered_runtime(
-                ctx,
-                service=service,
-                agent_id=agent_id,
-                batch_ids=(recovered_batches or {}).get(agent_id, []),
-                timeout_seconds=timeout_seconds,
-            )
-            # Purging expired preview metadata is private-state maintenance, not
-            # canonical recovery. It remains serial with the shared profile
-            # operation lock and is cancellable with this lifecycle task.
-            await service.info()
-            return agent_id, None
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - one agent must not block boot
-            return agent_id, str(exc)
-
-    # ProfileOperationLock is shared by every agent under one profile home.
-    # Serial maintenance avoids self-contention and preserves deterministic
-    # shutdown/cancellation behavior.
-    results = []
-    for agent_id in sorted(memory_managers):
-        results.append(await maintain_agent(agent_id))
-    failures.update(
-        {
-            agent_id: error
-            for agent_id, error in results
-            if error is not None
-        }
-    )
-    return failures
 
 
 async def _refresh_runtime(
@@ -1162,7 +900,6 @@ async def _artifact_agent(
     return normalize_agent_id(str(agent_id or "main"))
 
 
-@_d.method("memory.import.info", scope="operator.read")
 async def _handle_memory_import_info(
     params: dict | None,
     ctx: RpcContext,
@@ -1227,7 +964,6 @@ async def _handle_memory_import_preview(
     return wire
 
 
-@_d.method("memory.import.start", scope="operator.admin")
 async def _handle_memory_import_start(
     params: dict | None,
     ctx: RpcContext,
@@ -1264,7 +1000,6 @@ async def _handle_memory_import_start(
     return wire
 
 
-@_d.method("memory.import.status", scope="operator.admin")
 async def _handle_memory_import_status(
     params: dict | None,
     ctx: RpcContext,
@@ -1289,7 +1024,6 @@ async def _handle_memory_import_status(
     return wire
 
 
-@_d.method("memory.import.retry", scope="operator.admin")
 async def _handle_memory_import_retry(
     params: dict | None,
     ctx: RpcContext,
@@ -1322,7 +1056,6 @@ async def _handle_memory_import_retry(
     return wire
 
 
-@_d.method("memory.import.cancel", scope="operator.admin")
 async def _handle_memory_import_cancel(
     params: dict | None,
     ctx: RpcContext,
@@ -1348,7 +1081,6 @@ async def _handle_memory_import_cancel(
     return wire
 
 
-@_d.method("memory.import.apply", scope="operator.admin")
 async def _handle_memory_import_apply(
     params: dict | None,
     ctx: RpcContext,
@@ -1387,7 +1119,6 @@ async def _handle_memory_import_apply(
     return wire
 
 
-@_d.method("memory.import.undo", scope="operator.admin")
 async def _handle_memory_import_undo(
     params: dict | None,
     ctx: RpcContext,
@@ -1448,7 +1179,6 @@ async def _handle_memory_import_undo(
     return wire
 
 
-@_d.method("memory.import.discard", scope="operator.admin")
 async def _handle_memory_import_discard(
     params: dict | None,
     ctx: RpcContext,
@@ -1500,3 +1230,32 @@ async def _handle_memory_import_discard(
             }
         )
     return wire
+
+
+_MEMORY_PROFILE_IMPORT_CONTRACT_IMPLEMENTATIONS = {
+    "memory.import.info": _handle_memory_import_info,
+    "memory.import.start": _handle_memory_import_start,
+    "memory.import.status": _handle_memory_import_status,
+    "memory.import.retry": _handle_memory_import_retry,
+    "memory.import.cancel": _handle_memory_import_cancel,
+    "memory.import.apply": _handle_memory_import_apply,
+    "memory.import.undo": _handle_memory_import_undo,
+    "memory.import.discard": _handle_memory_import_discard,
+}
+
+_MEMORY_PROFILE_IMPORT_CONTRACT_HANDLERS = {
+    method: register_memory_profile_import_contract(
+        _d,
+        method,
+        implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+    for method, implementation in _MEMORY_PROFILE_IMPORT_CONTRACT_IMPLEMENTATIONS.items()
+}
+
+
+__all__ = [
+    "run_profile_import_startup_maintenance",
+    "run_profile_import_startup_recovery",
+]

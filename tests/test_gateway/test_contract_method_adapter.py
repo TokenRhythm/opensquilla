@@ -5,8 +5,16 @@ from typing import Any, cast
 
 import pytest
 import structlog
+from pydantic import ValidationError
 
 import opensquilla.gateway.adapters.contract_method as contract_method_adapter
+from opensquilla.contracts.generated.v4.gateway_contract_registry import (
+    GATEWAY_METHOD_CONTRACTS,
+)
+from opensquilla.gateway.adapters._generated_contract_bindings import (
+    generated_contract_bindings,
+    register_generated_contract_binding,
+)
 from opensquilla.gateway.adapters.contract_method import (
     GatewayContractBinding,
     register_gateway_contract_method,
@@ -14,7 +22,56 @@ from opensquilla.gateway.adapters.contract_method import (
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, RpcRegistry
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method",
+    (
+        "sandbox.path.list",
+        "workspaces.open",
+        "workspaces.update",
+        "workspaces.pin",
+        "workspaces.remove",
+        "workspaces.history.delete",
+    ),
+)
+async def test_real_registration_fixture_fails_closed_with_declared_error(
+    method: str,
+) -> None:
+    descriptor = GATEWAY_METHOD_CONTRACTS[method]
+    registry = RpcRegistry()
+
+    async def invalid_implementation(_params: object, _ctx: object) -> object:
+        return {"unexpected": True}
+
+    binding = GatewayContractBinding(
+        descriptor=descriptor,
+        observe_params=lambda _params: (),
+        validate_result=descriptor.result_model.model_validate,
+        result_validation_errors=(ValidationError,),
+        response_error_message=f"{method} response violated its v4 contract",
+        request_mismatch_event=f"{method}.request_contract_mismatch",
+        response_violation_event=f"{method}.contract_violation",
+    )
+    handler = register_gateway_contract_method(
+        registry,
+        binding,
+        invalid_implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=lambda _method: False,
+    )
+
+    with pytest.raises(RpcHandlerError) as error:
+        await handler({}, object())
+
+    assert error.value.code == "INTERNAL_ERROR"
+    assert error.value.message == f"{method} response violated its v4 contract"
+
+
 class _ContractViolationError(ValueError):
+    pass
+
+
+class _GeneratedContractViolationError(ValueError):
     pass
 
 
@@ -66,6 +123,98 @@ def _legacy_guest_denied(_method: str) -> bool:
     return False
 
 
+def test_generated_binding_mechanics_preserve_descriptor_and_validation() -> None:
+    bindings = generated_contract_bindings(
+        ("agents.list",),
+        _GeneratedContractViolationError,
+    )
+    binding = bindings["agents.list"]
+
+    assert binding.descriptor is GATEWAY_METHOD_CONTRACTS["agents.list"]
+    assert binding.observe_params(None) == ()
+    assert binding.observe_params([])
+    result = {"agents": []}
+    assert binding.validate_result(result) is result
+    with pytest.raises(
+        _GeneratedContractViolationError,
+        match="agents.list result violated the generated v4 Contract",
+    ):
+        binding.validate_result(None)
+
+
+def test_generated_binding_registration_preserves_provenance() -> None:
+    registry = RpcRegistry()
+    bindings = generated_contract_bindings(
+        ("agents.list",),
+        _GeneratedContractViolationError,
+    )
+
+    async def implementation(_params: Any, _ctx: Any) -> Any:
+        return {"agents": []}
+
+    handler = register_generated_contract_binding(
+        registry,
+        bindings,
+        "agents.list",
+        implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=_legacy_guest_denied,
+    )
+
+    entry = registry.get_entry("agents.list")
+    assert entry is not None
+    assert entry.handler is handler
+    assert entry.generated_contract_name == "agents.list"
+    assert entry.required_scope == GATEWAY_METHOD_CONTRACTS["agents.list"].scope
+
+
+def test_generated_binding_registration_preserves_domain_unsupported_error() -> None:
+    async def implementation(_params: Any, _ctx: Any) -> Any:
+        return None
+
+    with pytest.raises(
+        ValueError,
+        match="unsupported Agent catalog Contract method: missing.method",
+    ):
+        register_generated_contract_binding(
+            RpcRegistry(),
+            {},
+            "missing.method",
+            implementation,
+            internal_error=RpcHandlerError,
+            guest_allowed_checker=_legacy_guest_denied,
+            unsupported_contract="Agent catalog",
+        )
+
+
+def test_generated_binding_registration_keeps_mapping_lookup_error_by_default() -> None:
+    async def implementation(_params: Any, _ctx: Any) -> Any:
+        return None
+
+    with pytest.raises(KeyError, match="missing.method"):
+        register_generated_contract_binding(
+            RpcRegistry(),
+            {},
+            "missing.method",
+            implementation,
+            internal_error=RpcHandlerError,
+            guest_allowed_checker=_legacy_guest_denied,
+        )
+
+
+def test_plain_registry_registration_has_no_generated_contract_provenance() -> None:
+    registry = RpcRegistry()
+
+    async def handler(_params: Any, _ctx: Any) -> Any:
+        return {"ok": True}
+
+    registry.register("example.query", handler, "operator.read")
+
+    entry = registry.get_entry("example.query")
+    assert entry is not None
+    assert entry.generated_contract_name is None
+
+
 @pytest.mark.asyncio
 async def test_registers_one_handler_and_calls_one_implementation_without_rewriting() -> None:
     registry = RpcRegistry()
@@ -95,12 +244,54 @@ async def test_registers_one_handler_and_calls_one_implementation_without_rewrit
     assert entry is not None
     assert entry.handler is handler
     assert entry.required_scope == "operator.read"
+    assert entry.generated_contract_name == "example.query"
     assert implementation_calls == [(params, ctx)]
     assert implementation_calls[0][0] is params
     assert result is expected
-    assert [record["event"] for record in logs] == [
-        "example.query.request_contract_mismatch"
-    ]
+    assert [record["event"] for record in logs] == ["example.query.request_contract_mismatch"]
+
+
+def test_registry_rejects_mismatched_generated_contract_marker_before_write() -> None:
+    registry = RpcRegistry()
+
+    async def handler(_params: Any, _ctx: Any) -> Any:
+        return {"ok": True}
+
+    setattr(handler, "_opensquilla_generated_contract_name", "other.query")
+
+    with pytest.raises(ValueError, match="generated Contract marker"):
+        registry.register("example.query", handler, "operator.read")
+
+    assert registry.get_entry("example.query") is None
+
+
+def test_registration_write_failure_is_not_retried_and_receives_marker() -> None:
+    calls: list[tuple[str, str | None, str]] = []
+
+    class FailingRegistry:
+        def register(self, name: str, handler: Any, scope: str) -> None:
+            calls.append(
+                (
+                    name,
+                    getattr(handler, "_opensquilla_generated_contract_name", None),
+                    scope,
+                )
+            )
+            raise RuntimeError("registry write failed")
+
+    async def implementation(_params: Any, _ctx: Any) -> Any:
+        return {"ok": True}
+
+    with pytest.raises(RuntimeError, match="registry write failed"):
+        register_gateway_contract_method(
+            FailingRegistry(),
+            _binding(observe_params=lambda _params: (), validate_result=lambda _result: None),
+            implementation,
+            internal_error=RpcHandlerError,
+            guest_allowed_checker=_legacy_guest_denied,
+        )
+
+    assert calls == [("example.query", "example.query", "operator.read")]
 
 
 @pytest.mark.asyncio

@@ -8,11 +8,15 @@ from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcContext
 from opensquilla.gateway.rpc_cron import (
     _build_payload,
-    _handle_cron_add,
-    _handle_cron_update,
     _resolve_origin_session_key,
     _resolve_session_target,
     _resolve_target_session_key,
+)
+from opensquilla.gateway.rpc_cron import (
+    _cron_create_contract as _handle_cron_add,
+)
+from opensquilla.gateway.rpc_cron import (
+    _cron_update_contract as _handle_cron_update,
 )
 from opensquilla.scheduler.delivery import DeliveryChain
 from opensquilla.scheduler.handlers import (

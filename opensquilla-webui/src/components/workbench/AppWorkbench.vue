@@ -377,6 +377,7 @@ function onBrowserWorkbenchOpen(event: Event) {
 
 for (const definition of createArtifactWorkbenchDefinitions({
   artifactContent: artifactWorkbench.content,
+  artifactPreviews: artifactWorkbench.previews,
   artifactDocuments,
   promptAnnotations: props.promptAnnotationsEnabled ? {
     create: request => artifactPromptAnnotations.create(request),
@@ -1266,7 +1267,7 @@ watch(
       return
     }
     if (props.routeActive && sessionKey) {
-      void artifactWorkbench.ready().then(() => workbenchResources.load(sessionKey, true)).then(() => {
+      void workbenchResources.load(sessionKey, true).then(() => {
         refreshResourceCollectionItem(sessionKey)
       }).catch(() => undefined)
     }
@@ -1279,8 +1280,7 @@ onMounted(() => {
   stopArtifactEvents = () => documentChanges.close()
   const sessionKey = store.activeSessionId || props.sessionId
   if (props.routeActive && sessionKey) {
-    void artifactWorkbench.ready().then(() => refreshOpenArtifactDocuments(sessionKey))
-      .catch(() => undefined)
+    refreshOpenArtifactDocuments(sessionKey)
   }
   window.addEventListener(BROWSER_WORKBENCH_OPEN_EVENT, onBrowserWorkbenchOpen)
   window.addEventListener(ARTIFACT_PROMPT_ANNOTATION_FOCUS_EVENT, onPromptAnnotationFocus)

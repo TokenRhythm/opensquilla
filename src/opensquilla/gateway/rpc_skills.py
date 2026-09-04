@@ -6,23 +6,36 @@ import asyncio
 import os
 import shutil
 import weakref
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, cast
-from uuid import UUID
 
-from opensquilla.gateway.adapters.skill_catalog import (
-    GatewaySkillCatalogAdapter,
-    GatewaySkillCatalogReadPort,
+from opensquilla.application.skill_catalog import (
+    SkillCatalogReadPort,
+    SkillIdentity,
+    SkillProjection,
+    SkillSearchDiagnostic,
+    SkillSearchPage,
+    SkillSearchProjection,
+    SkillSearchQuery,
 )
+from opensquilla.application.skill_management import (
+    CancelSkillInstall,
+    InstallSkill,
+    InstallSkillDependencies,
+    SkillCancelResult,
+    SkillDependencyInstallResult,
+    SkillManagementPort,
+    SkillMutationResult,
+    SkillReloadResult,
+    UninstallSkill,
+)
+from opensquilla.gateway.adapters.skill_catalog import GatewaySkillCatalogAdapter
 from opensquilla.gateway.adapters.skill_catalog_contract import (
     register_skill_catalog_contract,
 )
-from opensquilla.gateway.adapters.skill_management import (
-    GatewaySkillManagementAdapter,
-    GatewaySkillManagementPort,
-)
+from opensquilla.gateway.adapters.skill_management import GatewaySkillManagementAdapter
 from opensquilla.gateway.adapters.skill_management_contract import (
     register_skill_management_contract,
 )
@@ -93,16 +106,6 @@ def _deps_lock_for(name: str, install_id: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _deps_locks[key] = lock
     return lock
-
-
-def _skill_install_operation_id(params: dict[str, Any]) -> str:
-    raw = _exact_identity_param(params, "operationId", "operation_id")
-    if not raw:
-        return ""
-    try:
-        return str(UUID(raw))
-    except ValueError as exc:
-        raise ValueError("params.operationId must be a UUID") from exc
 
 
 def _skill_install_operation_key(ctx: RpcContext, operation_id: str) -> tuple[str, str]:
@@ -892,11 +895,13 @@ async def _handle_skills_status(params: dict | None, ctx: RpcContext) -> list[di
     ]
 
 
-async def _read_skills_list(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def _list_catalog_skills(
+    *, include_lifecycle: bool, ctx: RpcContext
+) -> Sequence[SkillProjection]:
     """List installed skills."""
     loader = _get_loader(ctx)
     if loader is None:
-        return {"skills": []}
+        return ()
 
     ctx_eligible = _eligibility_context(ctx)
     snapshot = await _catalog_snapshot(loader, reason="rpc.skills.list")
@@ -908,19 +913,21 @@ async def _read_skills_list(params: dict | None, ctx: RpcContext) -> dict[str, A
         for skill in all_skills
         if skill.user_invocable and is_skill_available_live(skill.name)
     ]
-    if isinstance(params, dict) and params.get("includeLifecycle") is True:
-        return {
-            "skills": _lifecycle_rows(
+    if include_lifecycle:
+        return cast(
+            Sequence[SkillProjection],
+            _lifecycle_rows(
                 loader=loader,
                 snapshot=snapshot,
                 base_skills=skills,
                 skill_index=skill_index,
                 eligibility_ctx=ctx_eligible,
                 lockfile_path=_management_lockfile_path(ctx),
-            )
-        }
-    return {
-        "skills": [
+            ),
+        )
+    return cast(
+        Sequence[SkillProjection],
+        [
             _skill_to_dict(
                 skill,
                 diagnose_eligibility(skill, ctx_eligible),
@@ -930,8 +937,8 @@ async def _read_skills_list(params: dict | None, ctx: RpcContext) -> dict[str, A
                 eligibility_ctx=ctx_eligible,
             )
             for skill in skills
-        ]
-    }
+        ],
+    )
 
 
 async def _handle_skills_list(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
@@ -960,18 +967,16 @@ async def _handle_skills_bins(params: dict | None, ctx: RpcContext) -> dict[str,
     return bins_status
 
 
-async def _read_skills_get(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def _get_catalog_skill(
+    identity: SkillIdentity,
+    *,
+    include_lifecycle: bool,
+    ctx: RpcContext,
+) -> SkillProjection:
     """Get a winner by name or an exact lifecycle-v2 candidate identity."""
-    if not isinstance(params, dict):
-        raise ValueError("params.name is required")
-
-    instance_id = _exact_identity_param(params, "instanceId", "instance_id")
-    install_id = _exact_identity_param(params, "installId", "install_id")
-    if "name" not in params and not instance_id and not install_id:
-        raise ValueError("params.name is required")
-    requested_name = params.get("name")
-    if requested_name is not None and not isinstance(requested_name, str):
-        raise ValueError("params.name must be a string")
+    instance_id = identity.instance_id
+    install_id = identity.install_id
+    requested_name = identity.name
 
     loader = _get_loader(ctx)
     if loader is None:
@@ -1040,7 +1045,7 @@ async def _read_skills_get(params: dict | None, ctx: RpcContext) -> dict[str, An
     # never an unrelated winner with the same manifest name.
     if skill is None:
         assert doctor_item is not None
-        return _doctor_placeholder_row(doctor_item)
+        return cast(SkillProjection, _doctor_placeholder_row(doctor_item))
 
     ctx_eligible = _eligibility_context(ctx)
     result = _skill_to_dict(
@@ -1058,7 +1063,7 @@ async def _read_skills_get(params: dict | None, ctx: RpcContext) -> dict[str, An
     if exact_lookup:
         result["instance_id"] = getattr(skill, "instance_id", "")
         result["install_id"] = doctor_item.install_id if doctor_item is not None else ""
-    if params.get("includeLifecycle") is True and loader.managed_dir is not None:
+    if include_lifecycle and loader.managed_dir is not None:
         if doctor_report is None:
             doctor_report = SkillDoctor(
                 managed_dir=loader.managed_dir,
@@ -1121,18 +1126,17 @@ async def _read_skills_get(params: dict | None, ctx: RpcContext) -> dict[str, An
                     "invocation": lifecycle.invocation.to_dict(),
                 }
             )
-    return result
+    return cast(SkillProjection, result)
 
 
 async def _handle_skills_get(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     return await _skill_catalog(ctx).detail(params)
 
 
-async def _read_skills_search(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def _search_skill_catalog(
+    query: SkillSearchQuery, ctx: RpcContext
+) -> SkillSearchPage:
     """Search for skills across Community sources."""
-    if not isinstance(params, dict) or "query" not in params:
-        raise ValueError("params.query is required")
-
     management_service = getattr(ctx, "skill_management_service", None)
     router = getattr(management_service, "router", None)
     if router is None:
@@ -1140,21 +1144,12 @@ async def _read_skills_search(params: dict | None, ctx: RpcContext) -> dict[str,
     if router is None:
         router = _get_default_router()
     if router is None:
-        return {"results": [], "message": "No skill sources configured"}
-
-    query = params["query"]
-    try:
-        limit = min(int(params.get("limit", 20)), 100)
-    except (TypeError, ValueError):
-        limit = 20
-    source_id = params.get("source")
-    if source_id is not None and not isinstance(source_id, str):
-        source_id = None
+        return SkillSearchPage(results=(), message="No skill sources configured")
     report = await search_router_with_diagnostics(
         router,
-        query,
-        limit=limit,
-        source_id=source_id,
+        query.query,
+        limit=query.limit,
+        source_id=query.source,
     )
     results = report.results
     search_diagnostics = [item.to_dict() for item in report.diagnostics]
@@ -1165,8 +1160,9 @@ async def _read_skills_search(params: dict | None, ctx: RpcContext) -> dict[str,
         installed = Lockfile.load(Path(injected_lockfile))
     else:
         installed = installed_skill_lockfile()
-    payload: dict[str, Any] = {
-        "results": [
+    projections = cast(
+        Sequence[SkillSearchProjection],
+        [
             {
                 "name": r.name,
                 "description": r.description,
@@ -1179,24 +1175,60 @@ async def _read_skills_search(params: dict | None, ctx: RpcContext) -> dict[str,
                 "installed": is_skill_meta_installed(r, installed),
             }
             for r in results
-        ]
-    }
-    if search_diagnostics:
-        payload["diagnostics"] = search_diagnostics
-        payload["partial"] = report.partial
-        payload["allSourcesUnavailable"] = report.all_sources_unavailable
-    return payload
+        ],
+    )
+    return SkillSearchPage(
+        results=projections,
+        diagnostics=cast(Sequence[SkillSearchDiagnostic], search_diagnostics),
+        partial=report.partial if search_diagnostics else None,
+        all_sources_unavailable=(
+            report.all_sources_unavailable if search_diagnostics else None
+        ),
+    )
+
+
+class _SkillCatalogRuntime(SkillCatalogReadPort):
+    """Read one pinned Skill catalog generation without RPC callback indirection."""
+
+    def __init__(self, ctx: RpcContext) -> None:
+        self._ctx = ctx
+
+    async def list(self, *, include_lifecycle: bool) -> Sequence[SkillProjection]:
+        if include_lifecycle:
+            async with _committed_lifecycle_read(self._ctx):
+                return await _list_catalog_skills(
+                    include_lifecycle=True, ctx=self._ctx
+                )
+        else:
+            return await _list_catalog_skills(
+                include_lifecycle=False, ctx=self._ctx
+            )
+
+    async def detail(
+        self,
+        identity: SkillIdentity,
+        *,
+        include_lifecycle: bool,
+    ) -> SkillProjection:
+        if include_lifecycle or bool(identity.install_id):
+            async with _committed_lifecycle_read(self._ctx):
+                return await _get_catalog_skill(
+                    identity,
+                    include_lifecycle=include_lifecycle,
+                    ctx=self._ctx,
+                )
+        return await _get_catalog_skill(
+            identity,
+            include_lifecycle=False,
+            ctx=self._ctx,
+        )
+
+    async def search(self, query: SkillSearchQuery) -> SkillSearchPage:
+        return await _search_skill_catalog(query, self._ctx)
 
 
 def _skill_catalog(ctx: RpcContext) -> GatewaySkillCatalogAdapter:
-    reader = GatewaySkillCatalogReadPort(
-        ctx,
-        list_reader=_read_skills_list,
-        detail_reader=_read_skills_get,
-        search_reader=_read_skills_search,
-        committed_read=lambda: _committed_lifecycle_read(ctx),
-    )
-    return GatewaySkillCatalogAdapter(reader)
+    return GatewaySkillCatalogAdapter(_SkillCatalogRuntime(ctx))
 
 
 async def _handle_skills_search(
@@ -1220,11 +1252,14 @@ for _skill_catalog_method, _skill_catalog_implementation in (
     )
 
 
-async def _execute_skills_reload(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def _reload_skills(ctx: RpcContext) -> SkillReloadResult:
     """Force a rescan of the running Gateway's Skill catalog."""
     loader = _get_loader(ctx)
     if loader is None:
-        return _reload_failure_payload("No skill loader configured", loader=None)
+        return cast(
+            SkillReloadResult,
+            _reload_failure_payload("No skill loader configured", loader=None),
+        )
 
     from opensquilla.engine.steps.skills_filter import (
         invalidate_skill_eligibility_cache,
@@ -1237,19 +1272,22 @@ async def _execute_skills_reload(params: dict | None, ctx: RpcContext) -> dict[s
             reason="rpc.skills.reload",
         )
     except Exception as exc:  # Keep the RPC response shape stable on unexpected failures.
-        return _reload_failure_payload(str(exc) or type(exc).__name__, loader=loader)
+        return cast(
+            SkillReloadResult,
+            _reload_failure_payload(str(exc) or type(exc).__name__, loader=loader),
+        )
     finally:
         # A force reload is also the operator's escape hatch after changing
         # binaries/environment outside the catalog writer paths.
         invalidate_skill_eligibility_cache()
-    return result.to_dict()
+    return cast(SkillReloadResult, result.to_dict())
 
 
-async def _execute_skills_install(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def _install_skill(
+    command: InstallSkill, ctx: RpcContext
+) -> SkillMutationResult:
     """Install a skill from a Community source."""
-    if not isinstance(params, dict) or "identifier" not in params:
-        raise ValueError("params.identifier is required")
-    operation_id = _skill_install_operation_id(params)
+    operation_id = command.operation_id
     operation_key = (
         _skill_install_operation_key(ctx, operation_id) if operation_id else None
     )
@@ -1260,7 +1298,7 @@ async def _execute_skills_install(params: dict | None, ctx: RpcContext) -> dict[
     if operation_key and pending_cancellations is not None:
         if operation_key in pending_cancellations:
             pending_cancellations.discard(operation_key)
-            return _skill_install_cancelled_payload()
+            return cast(SkillMutationResult, _skill_install_cancelled_payload())
         task = asyncio.current_task()
         if task is None:
             raise RuntimeError("Skill installation is not running in an asyncio task")
@@ -1270,20 +1308,22 @@ async def _execute_skills_install(params: dict | None, ctx: RpcContext) -> dict[
         active_installs[operation_key] = task
 
     try:
-        return await _run_skill_install(params, ctx)
+        return await _run_skill_install(command, ctx)
     except asyncio.CancelledError:
         if not operation_id:
             raise
-        return _skill_install_cancelled_payload()
+        return cast(SkillMutationResult, _skill_install_cancelled_payload())
     finally:
         if operation_key and active_installs is not None:
             active_installs.pop(operation_key, None)
 
 
-async def _run_skill_install(params: dict[str, Any], ctx: RpcContext) -> dict[str, Any]:
+async def _run_skill_install(
+    command: InstallSkill, ctx: RpcContext
+) -> SkillMutationResult:
     recovery_failure = _recovery_required_payload(ctx)
     if recovery_failure is not None:
-        return recovery_failure
+        return cast(SkillMutationResult, recovery_failure)
     loader = _get_loader(ctx)
     if loader is None:
         return {"success": False, "message": "No skill loader configured"}
@@ -1292,51 +1332,47 @@ async def _run_skill_install(params: dict[str, Any], ctx: RpcContext) -> dict[st
     if installer is None:
         return {"success": False, "message": "No skill installer configured"}
 
-    identifier = params["identifier"]
-    source_id = params.get("source", "clawhub")
-    force = _boolean_param(params, "force")
-    replace_source = _boolean_param(params, "replaceSource")
-    risk_confirmation = _exact_identity_param(
-        params,
-        "riskConfirmation",
-        "risk_confirmation",
-    )
+    identifier = command.identifier
+    source_id = command.source
+    force = command.force
+    replace_source = command.replace_source
+    risk_confirmation = command.risk_confirmation
     install = installer.install
     if replace_source and not supports_keyword_argument(install, "replace_source"):
-        return _install_result_to_dict(
+        return cast(SkillMutationResult, _install_result_to_dict(
             unsupported_installer_result(
                 operation="install",
                 capability="replaceSource",
                 name=str(identifier),
             )
-        )
+        ))
     if force and not supports_keyword_argument(install, "force"):
-        return _install_result_to_dict(
+        return cast(SkillMutationResult, _install_result_to_dict(
             unsupported_installer_result(
                 operation="install",
                 capability="force",
                 name=str(identifier),
             )
-        )
+        ))
     if risk_confirmation and not supports_keyword_argument(install, "risk_confirmation"):
-        return _install_result_to_dict(
+        return cast(SkillMutationResult, _install_result_to_dict(
             unsupported_installer_result(
                 operation="install",
                 capability="riskConfirmation",
                 name=str(identifier),
             )
-        )
+        ))
     if not isinstance(installer, SkillManagementService) and force and (
         not risk_confirmation
         or not supports_keyword_argument(install, "risk_confirmation")
     ):
-        return _install_result_to_dict(
+        return cast(SkillMutationResult, _install_result_to_dict(
             unsupported_installer_result(
                 operation="install",
                 capability="riskConfirmation",
                 name=str(identifier),
             )
-        )
+        ))
     install_kwargs = supported_keyword_arguments(
         install,
         {
@@ -1354,21 +1390,15 @@ async def _run_skill_install(params: dict[str, Any], ctx: RpcContext) -> dict[st
             operation=lambda: install(identifier, source_id, **install_kwargs),
             did_change=lambda value: bool(value.success),
         )
-    return _install_result_to_dict(result)
+    return cast(SkillMutationResult, _install_result_to_dict(result))
 
 
-async def _execute_skills_install_cancel(
-    params: dict | None,
+async def _cancel_skill_install(
+    command: CancelSkillInstall,
     ctx: RpcContext,
-) -> dict[str, Any]:
+) -> SkillCancelResult:
     """Cancel one install owned by this connection and await its cleanup."""
-    if not isinstance(params, dict):
-        raise ValueError("params.operationId is required")
-    operation_id = _skill_install_operation_id(params)
-    if not operation_id:
-        raise ValueError("params.operationId is required")
-
-    operation_key = _skill_install_operation_key(ctx, operation_id)
+    operation_key = _skill_install_operation_key(ctx, command.operation_id)
     active_installs = _active_skill_installs(ctx)
     task = active_installs.get(operation_key)
     if task is None:
@@ -1379,7 +1409,10 @@ async def _execute_skills_install_cancel(
         if len(pending) >= _MAX_PENDING_SKILL_INSTALL_CANCELLATIONS:
             pending.pop()
         pending.add(operation_key)
-        return {**_skill_install_cancelled_payload(), "pending": True}
+        return cast(
+            SkillCancelResult,
+            {**_skill_install_cancelled_payload(), "pending": True},
+        )
 
     task.cancel()
     try:
@@ -1387,7 +1420,10 @@ async def _execute_skills_install_cancel(
     except asyncio.CancelledError:
         if not task.cancelled():
             raise
-    return {**_skill_install_cancelled_payload(), "pending": False}
+    return cast(
+        SkillCancelResult,
+        {**_skill_install_cancelled_payload(), "pending": False},
+    )
 
 
 @_d.method("skills.update", scope="operator.admin")
@@ -1474,24 +1510,22 @@ async def _handle_skills_update(params: dict | None, ctx: RpcContext) -> dict[st
     }
 
 
-async def _execute_skills_uninstall(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def _uninstall_skill(
+    command: UninstallSkill, ctx: RpcContext
+) -> SkillMutationResult:
     """Uninstall a managed skill."""
-    if not isinstance(params, dict):
-        raise ValueError("params.name or params.installId is required")
-    install_id = _exact_identity_param(params, "installId", "install_id")
-    if "name" not in params and not install_id:
-        raise ValueError("params.name or params.installId is required")
-    name = str(params.get("name") or "")
+    install_id = command.install_id
+    name = command.name
     recovery_failure = _recovery_required_payload(ctx, name=name)
     if recovery_failure is not None:
-        return recovery_failure
+        return cast(SkillMutationResult, recovery_failure)
 
     installer = _management_service(ctx)
     if installer is None:
         return {"success": False, "message": "No skill installer configured"}
 
     loader = _get_loader(ctx)
-    allow_drift = _boolean_param(params, "allowDrift")
+    allow_drift = command.allow_drift
     if isinstance(installer, SkillManagementService):
         result = await installer.uninstall(
             name,
@@ -1501,23 +1535,23 @@ async def _execute_skills_uninstall(params: dict | None, ctx: RpcContext) -> dic
     else:
         uninstall = installer.uninstall
         if install_id and not supports_keyword_argument(uninstall, "install_id"):
-            return _install_result_to_dict(
+            return cast(SkillMutationResult, _install_result_to_dict(
                 unsupported_installer_result(
                     operation="uninstall",
                     capability="installId",
                     name=name,
                     install_id=install_id,
                 )
-            )
+            ))
         if allow_drift and not supports_keyword_argument(uninstall, "allow_drift"):
-            return _install_result_to_dict(
+            return cast(SkillMutationResult, _install_result_to_dict(
                 unsupported_installer_result(
                     operation="uninstall",
                     capability="allowDrift",
                     name=name,
                     install_id=install_id,
                 )
-            )
+            ))
         uninstall_kwargs = supported_keyword_arguments(
             uninstall,
             {"install_id": install_id, "allow_drift": allow_drift},
@@ -1528,7 +1562,7 @@ async def _execute_skills_uninstall(params: dict | None, ctx: RpcContext) -> dic
             operation=lambda: uninstall(name, **uninstall_kwargs),
             did_change=lambda value: bool(value.success),
         )
-    return _install_result_to_dict(result)
+    return cast(SkillMutationResult, _install_result_to_dict(result))
 
 
 async def _read_skills_doctor(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
@@ -1589,9 +1623,9 @@ async def _handle_skills_doctor(params: dict | None, ctx: RpcContext) -> dict[st
         return await _read_skills_doctor(params, ctx)
 
 
-async def _execute_skills_deps_install(
-    params: dict | None, ctx: RpcContext
-) -> dict[str, Any]:
+async def _install_skill_dependencies(
+    command: InstallSkillDependencies, ctx: RpcContext
+) -> SkillDependencyInstallResult:
     """Install runtime dependencies for an already-loaded skill.
 
     Looks up the skill by name, finds the matching SkillInstallSpec by id in
@@ -1601,17 +1635,10 @@ async def _execute_skills_deps_install(
     Note: `kind == "download"` is non-idempotent — re-running re-downloads.
     Callers should consult `missing_still` before retrying.
     """
-    if not isinstance(params, dict):
-        raise ValueError("params must be a dict")
-    exact_install_id = _exact_identity_param(params, "installId", "skill_install_id")
-    instance_id = _exact_identity_param(params, "instanceId", "instance_id")
-    if "name" not in params and not exact_install_id and not instance_id:
-        raise ValueError("params.name, params.installId, or params.instanceId is required")
-    if "install_id" not in params:
-        raise ValueError("params.install_id is required")
-
-    name = str(params.get("name") or "")
-    install_id = params["install_id"]
+    exact_install_id = command.skill_install_id
+    instance_id = command.instance_id
+    name = command.name
+    install_id = command.dependency_id
     loader = _get_loader(ctx)
     if loader is None:
         raise KeyError("No skill loader available")
@@ -1699,16 +1726,32 @@ async def _execute_skills_deps_install(
     }
 
 
+class _SkillManagementRuntime(SkillManagementPort):
+    """Bind typed mutations to the durable, fenced Skill management runtime."""
+
+    def __init__(self, ctx: RpcContext) -> None:
+        self._ctx = ctx
+
+    async def reload(self) -> SkillReloadResult:
+        return await _reload_skills(self._ctx)
+
+    async def install(self, command: InstallSkill) -> SkillMutationResult:
+        return await _install_skill(command, self._ctx)
+
+    async def cancel(self, command: CancelSkillInstall) -> SkillCancelResult:
+        return await _cancel_skill_install(command, self._ctx)
+
+    async def install_dependencies(
+        self, command: InstallSkillDependencies
+    ) -> SkillDependencyInstallResult:
+        return await _install_skill_dependencies(command, self._ctx)
+
+    async def uninstall(self, command: UninstallSkill) -> SkillMutationResult:
+        return await _uninstall_skill(command, self._ctx)
+
+
 def _skill_management(ctx: RpcContext) -> GatewaySkillManagementAdapter:
-    port = GatewaySkillManagementPort(
-        ctx,
-        reload=_execute_skills_reload,
-        install=_execute_skills_install,
-        cancel=_execute_skills_install_cancel,
-        install_dependencies=_execute_skills_deps_install,
-        uninstall=_execute_skills_uninstall,
-    )
-    return GatewaySkillManagementAdapter(port)
+    return GatewaySkillManagementAdapter(_SkillManagementRuntime(ctx))
 
 
 async def _handle_skills_reload(

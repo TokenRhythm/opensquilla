@@ -339,7 +339,7 @@ describe('useChatStream render coalescing', () => {
     api.cleanup()
   })
 
-  it('coalesces rapid deltas into a single frame flush and defers highlighting', () => {
+  it('coalesces rapid deltas into one publication without parsing the trailing answer', () => {
     const { api, scrollToBottom, renderMarkdown } = makeStream()
 
     api.appendDelta('a')
@@ -353,13 +353,8 @@ describe('useChatStream render coalescing', () => {
     vi.advanceTimersByTime(50) // past MIN_FLUSH_INTERVAL_MS
     rafCbs[0](0)
 
-    // Rendered once over the combined text, with highlighting deferred.
-    expect(renderMarkdown).toHaveBeenCalledTimes(1)
-    expect(renderMarkdown).toHaveBeenCalledWith('abc', {
-      highlight: false,
-      cache: 'none',
-      math: 'defer',
-    })
+    expect(renderMarkdown).not.toHaveBeenCalled()
+    expect(api.foldedTurn.value.rawText).toBe('abc')
     expect(scrollToBottom).toHaveBeenCalledTimes(1)
 
     api.cleanup()
@@ -375,7 +370,7 @@ describe('useChatStream render coalescing', () => {
     vi.advanceTimersByTime(50)
     rafCbs[0](0)
 
-    expect(renderMarkdown).toHaveBeenCalledTimes(1)
+    expect(renderMarkdown).not.toHaveBeenCalled()
     expect(api.foldedTurn.value.rawText).toHaveLength(2_048)
     expect(scrollToBottom).toHaveBeenCalledTimes(1)
     api.cleanup()
@@ -479,8 +474,6 @@ describe('useChatStream render coalescing', () => {
 
   it('does not parse the growing answer in the production reducer path', () => {
     const { api, renderMarkdown } = makeStream()
-    api.useReducer.value = true
-
     for (let index = 0; index < 2_048; index += 1) api.appendDelta('x')
     vi.advanceTimersByTime(50)
     rafCbs[0](0)
@@ -505,18 +498,15 @@ describe('useChatStream render coalescing', () => {
     expect(rafCbs.length).toBe(1)
     vi.advanceTimersByTime(50)
     rafCbs[0](0)
-    expect(renderMarkdown).toHaveBeenCalledTimes(1)
+    expect(renderMarkdown).not.toHaveBeenCalled()
+    expect(api.foldedTurn.value.rawText).toBe('a')
 
     api.appendDelta('b')
     expect(rafCbs.length).toBe(2) // a new frame is scheduled after the prior flush
     vi.advanceTimersByTime(50)
     rafCbs[1](0)
-    expect(renderMarkdown).toHaveBeenCalledTimes(2)
-    expect(renderMarkdown).toHaveBeenLastCalledWith('ab', {
-      highlight: false,
-      cache: 'none',
-      math: 'defer',
-    })
+    expect(renderMarkdown).not.toHaveBeenCalled()
+    expect(api.foldedTurn.value.rawText).toBe('ab')
 
     api.cleanup()
   })
@@ -540,8 +530,8 @@ describe('useChatStream render coalescing', () => {
     const suffix = 'suffix'
 
     api.appendDelta(prefix)
-    api.appendToolCall({ tool_use_id: 'tool-1', tool_name: 'web_search' })
-    api.appendToolResult({ tool_use_id: 'tool-1', tool_name: 'web_search', result: 'ok' })
+    api.appendToolCall({ id: 'tool-1', name: 'web_search' })
+    api.appendToolResult({ id: 'tool-1', name: 'web_search', result: 'ok' })
     api.appendDelta(prefix + suffix)
 
     expect(api.foldedTurn.value.rawText).toBe(prefix + suffix)
@@ -677,13 +667,13 @@ describe('useChatStream render coalescing', () => {
     api.setAssistantMessageId('assistant-1')
     api.appendDelta('partial old')
     api.appendFrame({ kind: 'thinking', text: 'old reasoning', at: 1 })
-    api.appendToolCall({ tool_use_id: 'tool-completed', tool_name: 'web_search' })
+    api.appendToolCall({ id: 'tool-completed', name: 'web_search' })
     api.appendToolResult({
-      tool_use_id: 'tool-completed',
-      tool_name: 'web_search',
+      id: 'tool-completed',
+      name: 'web_search',
       result: 'completed result',
     })
-    api.appendToolCall({ tool_use_id: 'tool-pending', tool_name: 'exec_command' })
+    api.appendToolCall({ id: 'tool-pending', name: 'exec_command' })
     api.appendArtifact({ id: 'artifact-1', name: 'kept.txt' })
 
     api.resetAnswerGeneration({
@@ -729,8 +719,8 @@ describe('useChatStream render coalescing', () => {
     const { api, messages } = makeStream()
 
     api.appendDelta('prefix')
-    api.appendToolCall({ tool_use_id: 'tool-1', tool_name: 'web_search' })
-    api.appendToolResult({ tool_use_id: 'tool-1', tool_name: 'web_search', result: 'ok' })
+    api.appendToolCall({ id: 'tool-1', name: 'web_search' })
+    api.appendToolResult({ id: 'tool-1', name: 'web_search', result: 'ok' })
     api.appendDelta('suffix')
 
     expect(api.foldedTurn.value.rawText).toBe('prefixsuffix')
@@ -745,10 +735,10 @@ describe('useChatStream render coalescing', () => {
     const { api, messages } = makeStream()
 
     api.appendDelta('stale streamed answer')
-    api.appendToolCall({ tool_use_id: 'tool-1', tool_name: 'web_search' })
+    api.appendToolCall({ id: 'tool-1', name: 'web_search' })
     api.appendToolResult({
-      tool_use_id: 'tool-1',
-      tool_name: 'web_search',
+      id: 'tool-1',
+      name: 'web_search',
       result: 'found',
     })
     api.appendArtifact({ id: 'artifact-1', name: 'result.txt', mime: 'text/plain' })
@@ -785,10 +775,10 @@ describe('useChatStream render coalescing', () => {
     const { api, messages } = makeStream()
 
     api.appendDelta('NO_REPLY')
-    api.appendToolCall({ tool_use_id: 'tool-1', tool_name: 'web_search' })
+    api.appendToolCall({ id: 'tool-1', name: 'web_search' })
     api.appendToolResult({
-      tool_use_id: 'tool-1',
-      tool_name: 'web_search',
+      id: 'tool-1',
+      name: 'web_search',
       result: 'found',
     })
     api.endStreaming()
@@ -803,8 +793,8 @@ describe('useChatStream render coalescing', () => {
   it('keeps intermediate and answer text in separate live segments', () => {
     const { api, messages } = makeStream()
 
-    api.appendToolCall({ tool_use_id: 'tool-1', tool_name: 'web_search' })
-    api.appendToolResult({ tool_use_id: 'tool-1', tool_name: 'web_search', result: 'ok' })
+    api.appendToolCall({ id: 'tool-1', name: 'web_search' })
+    api.appendToolResult({ id: 'tool-1', name: 'web_search', result: 'ok' })
     api.appendDelta('Checking.', 'intermediate')
     api.appendDelta('Verified answer.', 'answer')
 
@@ -1131,8 +1121,8 @@ describe('useChatStream render coalescing', () => {
 
     api.appendDelta('before')
     api.appendToolCall({
-      tool_use_id: 'tool-running',
-      tool_name: 'web_search',
+      id: 'tool-running',
+      name: 'web_search',
       input: { query: 'before steer' },
     })
     const phaseBeforeSteer = api.streamPhaseLabel.value
@@ -1164,8 +1154,8 @@ describe('useChatStream render coalescing', () => {
     ])
 
     api.appendToolResult({
-      tool_use_id: 'tool-running',
-      tool_name: 'web_search',
+      id: 'tool-running',
+      name: 'web_search',
       result: 'ok',
     })
     api.acknowledgeSteerBoundary('steer-activity')
@@ -1190,8 +1180,8 @@ describe('useChatStream render coalescing', () => {
     const { api, messages } = makeStream()
 
     api.appendToolCall({
-      tool_use_id: 'tool-only',
-      tool_name: 'exec_command',
+      id: 'tool-only',
+      name: 'exec_command',
       input: { cmd: 'sleep 30' },
     })
 
@@ -1268,8 +1258,8 @@ describe('useChatStream render coalescing', () => {
     const { api, messages } = makeStream()
 
     api.appendDelta('stale preface')
-    api.appendToolCall({ tool_use_id: 'tool-1', tool_name: 'web_search' })
-    api.appendToolResult({ tool_use_id: 'tool-1', tool_name: 'web_search', result: 'ok' })
+    api.appendToolCall({ id: 'tool-1', name: 'web_search' })
+    api.appendToolResult({ id: 'tool-1', name: 'web_search', result: 'ok' })
     api.appendDelta('stale retry')
     api.reconcileFinalText('Canonical answer')
 
@@ -1292,10 +1282,10 @@ describe('useChatStream render coalescing', () => {
 
   it('keeps production text solely in the accumulator across reconcile and steer', () => {
     const { api, messages } = makeStream()
-    api.useReducer.value = true
-
     api.appendDelta('before')
-    expect(api.streamTimelineItems.value).toEqual([])
+    expect(api.streamTimelineItems.value).toEqual([
+      expect.objectContaining({ type: 'text', rawText: 'before' }),
+    ])
     expect(api.foldedTurn.value.rawText).toBe('before')
     api.checkpointForUserMessage('turn-production-steer', 'steer-production')
     expect(messages.value[0]).toMatchObject({ role: 'assistant', text: 'before' })
@@ -1304,23 +1294,44 @@ describe('useChatStream render coalescing', () => {
     api.acknowledgeSteerBoundary('steer-production')
     api.appendDelta('stale')
     api.reconcileFinalText('canonical')
-    expect(api.streamTimelineItems.value).toEqual([])
+    expect(api.streamTimelineItems.value).toEqual([
+      expect.objectContaining({ type: 'text', rawText: 'canonical' }),
+    ])
     expect(api.foldedTurn.value.rawText).toBe('canonical')
     api.endStreaming()
     expect(messages.value[1]).toMatchObject({ role: 'assistant', text: 'canonical' })
     api.cleanup()
   })
 
+  it('keeps projected tool input fragments through completion', () => {
+    const { api, messages } = makeStream()
+    api.appendToolCall({ id: 'projected-tool', name: 'web_search' })
+    api.appendToolDelta({
+      id: 'projected-tool',
+      name: 'web_search',
+      input_delta: '{"query":',
+    })
+    api.appendToolDelta({ id: 'projected-tool', input_delta: '"report"}' })
+    api.appendToolResult({ id: 'projected-tool', name: 'web_search', result: 'ok' })
+
+    expect(api.foldedTurn.value.toolCalls[0]?.inputRaw).toBe('{"query":"report"}')
+    api.endStreaming()
+    expect(messages.value[0]?.tool_calls?.[0]).toMatchObject({
+      id: 'projected-tool',
+      input: '{"query":"report"}',
+      result: 'ok',
+    })
+    api.cleanup()
+  })
+
   it('commits the complete production tool input from the accumulator', () => {
     const { api, messages } = makeStream()
-    api.useReducer.value = true
-
-    api.appendToolCall({ tool_use_id: 'tool-long', tool_name: 'web_search' })
+    api.appendToolCall({ id: 'tool-long', name: 'web_search' })
     for (let index = 0; index < 1_000; index += 1) {
       api.appendToolDelta({
-        tool_use_id: 'tool-long',
-        tool_name: 'web_search',
-        fragment: 'x',
+        id: 'tool-long',
+        name: 'web_search',
+        input_delta: 'x',
       })
     }
     const liveTool = api.foldedTurn.value.toolCalls[0]
@@ -1329,8 +1340,8 @@ describe('useChatStream render coalescing', () => {
     expect(liveTool!.inputPreview).toHaveLength(200)
 
     api.appendToolResult({
-      tool_use_id: 'tool-long',
-      tool_name: 'web_search',
+      id: 'tool-long',
+      name: 'web_search',
       result: 'ok',
     })
     expect(api.foldedTurn.value.toolCalls[0]?.inputRaw).toHaveLength(1_000)
@@ -1346,7 +1357,6 @@ describe('useChatStream render coalescing', () => {
 
   it('ignores provisional deltas for primary-only tools and commits the end snapshot', () => {
     const { api } = makeStream()
-    api.useReducer.value = true
     const presentation = {
       category: 'network_read' as const,
       primaryArguments: ['url'],
@@ -1355,23 +1365,23 @@ describe('useChatStream render coalescing', () => {
     }
 
     api.appendToolCall({
-      tool_use_id: 'fetch-1',
-      tool_name: 'http_request',
+      id: 'fetch-1',
+      name: 'http_request',
       tool_presentation: presentation,
     })
     expect(api.foldedTurn.value.toolCalls[0]?.presentation).toEqual(presentation)
     for (let index = 0; index < 1_000; index += 1) {
       api.appendToolDelta({
-        tool_use_id: 'fetch-1',
-        tool_name: 'http_request',
-        fragment: 'private',
+        id: 'fetch-1',
+        name: 'http_request',
+        input_delta: 'private',
       })
     }
     expect(api.foldedTurn.value.toolCalls[0]?.inputRaw).toBe('')
 
     api.appendToolEnd({
-      tool_use_id: 'fetch-1',
-      tool_name: 'http_request',
+      id: 'fetch-1',
+      name: 'http_request',
       arguments: {
         url: 'https://example.test/report',
         headers: { Authorization: 'secret' },
@@ -1396,15 +1406,15 @@ describe('useChatStream render coalescing', () => {
     }
 
     api.appendToolCall({
-      tool_use_id: 'fetch-legacy',
-      tool_name: 'http_request',
+      id: 'fetch-legacy',
+      name: 'http_request',
       input: { headers: { Authorization: 'secret' } },
     })
     expect(api.foldedTurn.value.toolCalls[0]?.inputRaw).toContain('secret')
 
     api.appendToolResult({
-      tool_use_id: 'fetch-legacy',
-      tool_name: 'http_request',
+      id: 'fetch-legacy',
+      name: 'http_request',
       arguments: {},
       result: 'ok',
       tool_presentation: presentation,
@@ -1418,8 +1428,8 @@ describe('useChatStream render coalescing', () => {
     const { api, messages } = makeStream()
 
     api.appendDelta('stale text')
-    api.appendToolCall({ tool_use_id: 'tool-1', tool_name: 'web_search' })
-    api.appendToolResult({ tool_use_id: 'tool-1', tool_name: 'web_search', result: 'ok' })
+    api.appendToolCall({ id: 'tool-1', name: 'web_search' })
+    api.appendToolResult({ id: 'tool-1', name: 'web_search', result: 'ok' })
     api.reconcileFinalText('')
 
     expect(api.foldedTurn.value.rawText).toBe('')
@@ -1475,7 +1485,7 @@ describe('useChatStream render coalescing', () => {
     vi.setSystemTime(100_000)
 
     // Server says the tool started 5s before "now".
-    api.appendToolCall({ tool_use_id: 'tool-1', tool_name: 'web_search', started_at: 95_000 })
+    api.appendToolCall({ id: 'tool-1', name: 'web_search', started_at: 95_000 })
 
     expect(api.streamToolElapsedText({ toolId: 'tool-1' })).toBe('5s')
     api.cleanup()
@@ -1486,8 +1496,8 @@ describe('useChatStream render coalescing', () => {
     vi.setSystemTime(100_000)
 
     // No started_at, and the 0 "unstamped" sentinel: both fall back to now -> 0s.
-    api.appendToolCall({ tool_use_id: 'tool-2', tool_name: 'web_search' })
-    api.appendToolCall({ tool_use_id: 'tool-3', tool_name: 'web_search', started_at: 0 })
+    api.appendToolCall({ id: 'tool-2', name: 'web_search' })
+    api.appendToolCall({ id: 'tool-3', name: 'web_search', started_at: 0 })
 
     expect(api.streamToolElapsedText({ toolId: 'tool-2' })).toBe('0s')
     expect(api.streamToolElapsedText({ toolId: 'tool-3' })).toBe('0s')
@@ -1503,9 +1513,9 @@ describe('useChatStream render coalescing', () => {
     vi.setSystemTime(5_000_000)
 
     // Future start (server clock ahead) -> distrusted -> local clock -> 0s.
-    api.appendToolCall({ tool_use_id: 'tool-4', tool_name: 'web_search', started_at: 5_100_000 })
+    api.appendToolCall({ id: 'tool-4', name: 'web_search', started_at: 5_100_000 })
     // Implausibly old start (server far behind / garbage) -> distrusted -> 0s.
-    api.appendToolCall({ tool_use_id: 'tool-5', tool_name: 'web_search', started_at: 1_000 })
+    api.appendToolCall({ id: 'tool-5', name: 'web_search', started_at: 1_000 })
 
     expect(api.streamToolElapsedText({ toolId: 'tool-4' })).toBe('0s')
     expect(api.streamToolElapsedText({ toolId: 'tool-5' })).toBe('0s')

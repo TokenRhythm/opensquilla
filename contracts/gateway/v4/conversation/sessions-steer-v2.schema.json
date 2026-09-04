@@ -13,6 +13,7 @@
   },
   "x-opensquilla-method": {
     "name": "sessions.steer.v2", "kind": "command", "scope": "operator.write", "guestAllowed": false,
+    "lifecycle": "stable", "compatibilityAliases": ["sessions.steer"],
     "idempotency": "idempotent", "timeout": { "policy": "caller" },
     "capability": { "kind": "method-availability", "name": "sessions.steer.v2" },
     "request": "#/$defs/SessionsSteerV2RequestFrame", "params": "#/$defs/SessionsSteerV2Params",

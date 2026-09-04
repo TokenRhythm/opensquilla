@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Mapping
 from typing import Any, cast
+from uuid import UUID
 
 from opensquilla.application.skill_management import (
     CancelSkillInstall,
@@ -13,85 +14,6 @@ from opensquilla.application.skill_management import (
     SkillManagementPort,
     UninstallSkill,
 )
-from opensquilla.gateway.rpc import RpcContext
-
-type MutationHandler = Callable[
-    [dict[str, Any] | None, RpcContext], Awaitable[dict[str, Any]]
-]
-
-
-class GatewaySkillManagementPort(SkillManagementPort):
-    """Terminate typed commands at the existing fenced Skill runtime."""
-
-    def __init__(
-        self,
-        context: RpcContext,
-        *,
-        reload: MutationHandler,
-        install: MutationHandler,
-        cancel: MutationHandler,
-        install_dependencies: MutationHandler,
-        uninstall: MutationHandler,
-    ) -> None:
-        self._context = context
-        self._reload = reload
-        self._install = install
-        self._cancel = cancel
-        self._install_dependencies = install_dependencies
-        self._uninstall = uninstall
-
-    async def reload(self) -> Mapping[str, Any]:
-        return await self._reload(None, self._context)
-
-    async def install(self, command: InstallSkill) -> Mapping[str, Any]:
-        return await self._install(
-            {
-                "identifier": command.identifier,
-                "source": command.source,
-                **({"operationId": command.operation_id} if command.operation_id else {}),
-                **({"force": True} if command.force else {}),
-                **({"replaceSource": True} if command.replace_source else {}),
-                **(
-                    {"riskConfirmation": command.risk_confirmation}
-                    if command.risk_confirmation
-                    else {}
-                ),
-            },
-            self._context,
-        )
-
-    async def cancel(self, command: CancelSkillInstall) -> Mapping[str, Any]:
-        return await self._cancel(
-            {"operationId": command.operation_id},
-            self._context,
-        )
-
-    async def install_dependencies(
-        self, command: InstallSkillDependencies
-    ) -> Mapping[str, Any]:
-        return await self._install_dependencies(
-            {
-                "install_id": command.dependency_id,
-                **({"name": command.name} if command.name else {}),
-                **(
-                    {"installId": command.skill_install_id}
-                    if command.skill_install_id
-                    else {}
-                ),
-                **({"instanceId": command.instance_id} if command.instance_id else {}),
-            },
-            self._context,
-        )
-
-    async def uninstall(self, command: UninstallSkill) -> Mapping[str, Any]:
-        return await self._uninstall(
-            {
-                **({"name": command.name} if command.name else {}),
-                **({"installId": command.install_id} if command.install_id else {}),
-                **({"allowDrift": True} if command.allow_drift else {}),
-            },
-            self._context,
-        )
 
 
 class GatewaySkillManagementAdapter:
@@ -116,7 +38,7 @@ class GatewaySkillManagementAdapter:
         command = InstallSkill(
             identifier=identifier,
             source=source,
-            operation_id=self._identity(params, "operationId", "operation_id"),
+            operation_id=self._operation_id(params),
             force=self._boolean(params, "force"),
             replace_source=self._boolean(params, "replaceSource"),
             risk_confirmation=self._identity(
@@ -128,9 +50,7 @@ class GatewaySkillManagementAdapter:
     async def cancel(self, params: dict[str, Any] | None) -> dict[str, Any]:
         if not isinstance(params, dict):
             raise ValueError("params.operationId is required")
-        operation_id = self._identity(params, "operationId", "operation_id")
-        if not operation_id:
-            raise ValueError("params.operationId is required")
+        operation_id = self._operation_id(params, required=True)
         return dict(
             await self._application.cancel(CancelSkillInstall(operation_id))
         )
@@ -187,6 +107,20 @@ class GatewaySkillManagementAdapter:
             raise ValueError(f"params.{camel} and params.{snake} must match")
         return normalized[0]
 
+    @classmethod
+    def _operation_id(
+        cls, params: Mapping[str, Any], *, required: bool = False
+    ) -> str:
+        value = cls._identity(params, "operationId", "operation_id")
+        if not value:
+            if required:
+                raise ValueError("params.operationId is required")
+            return ""
+        try:
+            return str(UUID(value))
+        except ValueError as exc:
+            raise ValueError("params.operationId must be a UUID") from exc
+
     @staticmethod
     def _boolean(params: Mapping[str, Any], name: str) -> bool:
         if name not in params:
@@ -197,4 +131,4 @@ class GatewaySkillManagementAdapter:
         return value
 
 
-__all__ = ["GatewaySkillManagementAdapter", "GatewaySkillManagementPort"]
+__all__ = ["GatewaySkillManagementAdapter"]

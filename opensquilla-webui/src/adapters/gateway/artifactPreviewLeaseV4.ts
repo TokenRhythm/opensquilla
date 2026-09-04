@@ -1,154 +1,81 @@
-import type { NativeWorkbenchApi, PlatformId } from '@/platform/types'
+import type { PlatformId } from '@/platform/types'
+import {
+  ArtifactPreviewLeaseError,
+  type ArtifactPreviewLease,
+  type ArtifactPreviewLeaseRenewal,
+  type ArtifactPreviewLeaseRequest,
+  type ArtifactPreviewLeaseSource,
+  type ArtifactPreviewMode,
+} from '@/modules/artifactWorkbench'
 import type { ArtifactPayload } from '@/types/artifacts'
 import {
-  artifactAccessHeaders,
-  runtimeArtifactAuthToken,
-} from './artifactAccessV4'
+  HttpTransportError,
+} from './privateHttpTransport'
+import {
+  artifactHttpBrokerAuthToken,
+  artifactHttpPreviewId,
+  createArtifactPreviewLeaseHttp,
+  renewArtifactPreviewLeaseHttp,
+  resolveArtifactPreviewLaunch,
+  revokeArtifactPreviewLeaseHttp,
+  validArtifactPreviewLeaseId,
+} from './privateArtifactHttpTransport'
 
-export type ArtifactPreviewMode = 'full' | 'offline'
-export type ArtifactPreviewCollectionStatus = 'complete' | 'partial' | 'not_applicable'
-
-export interface ArtifactPreviewLeaseSource {
-  kind: 'bundle' | 'single_file'
-  collection_status: ArtifactPreviewCollectionStatus
-  file_count: number
-  total_bytes: number
-  warning_codes: string[]
+interface ArtifactPreviewLeaseHttpTransport {
+  requestJson<T>(endpoint: string, options: {
+    method: 'POST'
+    json?: unknown
+    sessionKey?: string
+    timeoutMs?: number
+  }): Promise<T>
+  requestBlob(endpoint: string, options: {
+    keepalive: true
+    method: 'DELETE'
+    sessionKey?: string
+    timeoutMs?: number
+  }): Promise<Blob>
 }
 
-export interface ArtifactPreviewLease {
-  version: 1
-  lease_id: string
-  effective_mode: ArtifactPreviewMode
-  launch_url: string
-  entrypoint: string
-  expires_at: string
-  preview_origin: string | null
-  idle_timeout_seconds: number
-  source: ArtifactPreviewLeaseSource
-}
-
-export interface ArtifactPreviewLeaseRenewal {
-  version: 1
-  lease_id: string
-  expires_at: string
-}
-
-export type ArtifactPreviewNativeBroker = Pick<
-  NativeWorkbenchApi,
-  | 'createArtifactPreviewLease'
-  | 'renewArtifactPreviewLease'
-  | 'revokeArtifactPreviewLease'
->
-
-export interface ArtifactPreviewLeaseContext {
+interface ArtifactPreviewLeaseContext extends ArtifactPreviewLeaseRequest {
   authToken?: string
   baseOrigin: string
-  fetchImpl?: typeof fetch
-  nativeBroker?: ArtifactPreviewNativeBroker
-  sessionKey?: string
-}
-
-export class ArtifactPreviewLeaseError extends Error {
-  constructor(
-    message: string,
-    readonly status: number,
-    readonly code = '',
-  ) {
-    super(message)
-    this.name = 'ArtifactPreviewLeaseError'
-  }
 }
 
 export function artifactPreviewId(artifact: ArtifactPayload): string {
-  const direct = typeof artifact.id === 'string' ? artifact.id.trim() : ''
-  if (direct) return direct
-  const downloadUrl = typeof artifact.download_url === 'string' ? artifact.download_url : ''
-  const match = downloadUrl.match(/\/api\/v1\/artifacts\/([^/?#]+)/)
-  if (!match) return ''
-  try {
-    return decodeURIComponent(match[1])
-  } catch {
-    return ''
-  }
-}
-
-function normalizedBaseOrigin(baseOrigin: string): string {
-  const fallback = typeof window === 'undefined'
-    ? 'http://localhost'
-    : window.location.origin
-  return new URL(baseOrigin || fallback).origin
-}
-
-function fetcher(context: ArtifactPreviewLeaseContext): typeof fetch {
-  if (context.fetchImpl) return context.fetchImpl
-  if (typeof fetch !== 'function') {
-    throw new ArtifactPreviewLeaseError('Preview leases are unavailable.', 0)
-  }
-  return fetch.bind(globalThis)
-}
-
-function controlHeaders(
-  url: string,
-  context: ArtifactPreviewLeaseContext,
-  includeJson = false,
-): Record<string, string> {
-  return {
-    ...artifactAccessHeaders(url, context),
-    ...(includeJson ? { 'Content-Type': 'application/json' } : {}),
-  }
+  return artifactHttpPreviewId(artifact)
 }
 
 function resolvedAuthToken(context: ArtifactPreviewLeaseContext): string {
-  return context.authToken === undefined
-    ? runtimeArtifactAuthToken()
-    : context.authToken
+  return artifactHttpBrokerAuthToken(context.authToken)
 }
 
-function previewLeaseUrl(
-  artifact: ArtifactPayload,
-  context: ArtifactPreviewLeaseContext,
-): string {
-  const id = artifactPreviewId(artifact)
-  if (!id) throw new ArtifactPreviewLeaseError('Artifact preview is unavailable.', 0)
-  return new URL(
-    `/api/v1/artifacts/${encodeURIComponent(id)}/preview-leases`,
-    normalizedBaseOrigin(context.baseOrigin),
-  ).toString()
-}
-
-function leaseControlUrl(
-  leaseId: string,
-  context: ArtifactPreviewLeaseContext,
-  suffix = '',
-): string {
-  if (!leaseId || /[\u0000-\u001f/\\]/.test(leaseId)) {
-    throw new ArtifactPreviewLeaseError('Artifact preview lease is invalid.', 0)
-  }
-  return new URL(
-    `/api/v1/artifact-preview-leases/${encodeURIComponent(leaseId)}${suffix}`,
-    normalizedBaseOrigin(context.baseOrigin),
-  ).toString()
-}
-
-async function responseError(response: Response): Promise<ArtifactPreviewLeaseError> {
+function transportError(error: HttpTransportError): ArtifactPreviewLeaseError {
   let code = ''
-  let message = `Artifact preview request failed (${response.status}).`
-  try {
-    const payload = await response.json() as {
+  const status = typeof error.status === 'number' ? error.status : 0
+  let message = status > 0
+    ? `Artifact preview request failed (${status}).`
+    : 'Artifact preview request failed.'
+  const payload = error.payload
+  if (payload && typeof payload === 'object') {
+    const raw = payload as {
       code?: unknown
       detail?: unknown
       error?: unknown
       message?: unknown
     }
-    if (typeof payload.code === 'string') code = payload.code
-    const detail = typeof payload.detail === 'string'
-      ? payload.detail
-      : typeof payload.message === 'string' ? payload.message : ''
-    const error = typeof payload.error === 'string' ? payload.error : ''
-    if (detail || error) message = detail || error
-  } catch {}
-  return new ArtifactPreviewLeaseError(message, response.status, code)
+    if (typeof raw.code === 'string') code = raw.code
+    const detail = typeof raw.detail === 'string'
+      ? raw.detail
+      : typeof raw.message === 'string' ? raw.message : ''
+    const payloadError = typeof raw.error === 'string' ? raw.error : ''
+    if (detail || payloadError) message = detail || payloadError
+  }
+  return new ArtifactPreviewLeaseError(message, status, code)
+}
+
+function translateTransportError(error: unknown): never {
+  if (error instanceof HttpTransportError) throw transportError(error)
+  throw error
 }
 
 function stringField(raw: Record<string, unknown>, key: string): string {
@@ -192,10 +119,11 @@ export function parseArtifactPreviewLease(
   const leaseId = stringField(raw, 'lease_id')
   const entrypoint = stringField(raw, 'entrypoint')
   const expiresAt = stringField(raw, 'expires_at')
-  let launch: URL
-  try {
-    launch = new URL(launchUrl, normalizedBaseOrigin(baseOrigin))
-  } catch {
+  const previewOrigin = typeof raw.preview_origin === 'string' && raw.preview_origin
+    ? raw.preview_origin
+    : null
+  const launch = resolveArtifactPreviewLaunch(launchUrl, previewOrigin, baseOrigin)
+  if (!launch.ok && launch.reason === 'syntax') {
     throw new ArtifactPreviewLeaseError('Artifact preview returned an invalid launch URL.', 502)
   }
   if (
@@ -203,30 +131,18 @@ export function parseArtifactPreviewLease(
     || !leaseId
     || !entrypoint
     || !expiresAt
-    || !['http:', 'https:'].includes(launch.protocol)
-    || launch.username
-    || launch.password
+    || (!launch.ok && launch.reason === 'url')
   ) {
     throw new ArtifactPreviewLeaseError('Artifact preview returned an invalid lease.', 502)
   }
-  const previewOrigin = typeof raw.preview_origin === 'string' && raw.preview_origin
-    ? raw.preview_origin
-    : null
-  if (previewOrigin !== null && previewOrigin !== launch.origin) {
-    throw new ArtifactPreviewLeaseError('Artifact preview returned an invalid origin.', 502)
-  }
-  if (
-    previewOrigin === null
-    && baseOrigin
-    && launch.origin !== normalizedBaseOrigin(baseOrigin)
-  ) {
+  if (!launch.ok) {
     throw new ArtifactPreviewLeaseError('Artifact preview returned an invalid origin.', 502)
   }
   return {
     version: 1,
     lease_id: leaseId,
     effective_mode: effectiveMode,
-    launch_url: launch.toString(),
+    launch_url: launch.url,
     entrypoint,
     expires_at: expiresAt,
     preview_origin: previewOrigin,
@@ -280,6 +196,7 @@ function desktopBrokerUnavailable(): ArtifactPreviewLeaseError {
 }
 
 export async function createArtifactPreviewLease(
+  http: Pick<ArtifactPreviewLeaseHttpTransport, 'requestJson'>,
   artifact: ArtifactPayload,
   mode: ArtifactPreviewMode,
   client: PlatformId,
@@ -308,18 +225,26 @@ export async function createArtifactPreviewLease(
     if (!result.ok) throw brokerError(result)
     return parseArtifactPreviewLease(result.payload, context.baseOrigin)
   }
-  const url = previewLeaseUrl(artifact, context)
-  const response = await fetcher(context)(url, {
-    method: 'POST',
-    credentials: 'same-origin',
-    headers: controlHeaders(url, context, true),
-    body: JSON.stringify({ version: 1, mode, client }),
-  })
-  if (!response.ok) throw await responseError(response)
-  return parseArtifactPreviewLease(await response.json(), context.baseOrigin)
+  const artifactId = artifactPreviewId(artifact)
+  if (!artifactId) {
+    throw new ArtifactPreviewLeaseError('Artifact preview is unavailable.', 0)
+  }
+  try {
+    const payload = await createArtifactPreviewLeaseHttp<unknown>(
+      http,
+      artifactId,
+      mode,
+      client,
+      context,
+    )
+    return parseArtifactPreviewLease(payload, context.baseOrigin)
+  } catch (error) {
+    translateTransportError(error)
+  }
 }
 
 export async function renewArtifactPreviewLease(
+  http: Pick<ArtifactPreviewLeaseHttpTransport, 'requestJson'>,
   leaseId: string,
   context: ArtifactPreviewLeaseContext,
 ): Promise<ArtifactPreviewLeaseRenewal> {
@@ -341,17 +266,19 @@ export async function renewArtifactPreviewLease(
     if (!result.ok) throw brokerError(result)
     return parseArtifactPreviewLeaseRenewal(result.payload)
   }
-  const url = leaseControlUrl(leaseId, context, '/renew')
-  const response = await fetcher(context)(url, {
-    method: 'POST',
-    credentials: 'same-origin',
-    headers: controlHeaders(url, context),
-  })
-  if (!response.ok) throw await responseError(response)
-  return parseArtifactPreviewLeaseRenewal(await response.json())
+  if (!validArtifactPreviewLeaseId(leaseId)) {
+    throw new ArtifactPreviewLeaseError('Artifact preview lease is invalid.', 0)
+  }
+  try {
+    const payload = await renewArtifactPreviewLeaseHttp<unknown>(http, leaseId, context)
+    return parseArtifactPreviewLeaseRenewal(payload)
+  } catch (error) {
+    translateTransportError(error)
+  }
 }
 
 export async function revokeArtifactPreviewLease(
+  http: Pick<ArtifactPreviewLeaseHttpTransport, 'requestBlob'>,
   leaseId: string,
   context: ArtifactPreviewLeaseContext,
 ): Promise<void> {
@@ -375,14 +302,17 @@ export async function revokeArtifactPreviewLease(
     }
     return
   }
-  const url = leaseControlUrl(leaseId, context)
-  const response = await fetcher(context)(url, {
-    method: 'DELETE',
-    credentials: 'same-origin',
-    headers: controlHeaders(url, context),
-    keepalive: true,
-  })
-  if (!response.ok && response.status !== 404 && response.status !== 410) {
-    throw await responseError(response)
+  if (!validArtifactPreviewLeaseId(leaseId)) {
+    throw new ArtifactPreviewLeaseError('Artifact preview lease is invalid.', 0)
+  }
+  try {
+    await revokeArtifactPreviewLeaseHttp(http, leaseId, context)
+  } catch (error) {
+    if (
+      error instanceof HttpTransportError
+      && error.kind === 'http-status'
+      && (error.status === 404 || error.status === 410)
+    ) return
+    translateTransportError(error)
   }
 }
