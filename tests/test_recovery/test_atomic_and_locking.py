@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import uuid
+from multiprocessing.connection import Connection
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -47,8 +48,10 @@ from opensquilla.recovery.atomic import (
 from opensquilla.recovery.config_patch import ConfigSnapshot
 from opensquilla.recovery.locking import (
     LegacyGatewayLock,
+    acquire_gateway_legacy_lease,
     acquire_legacy_gateway_locks,
     profile_lock_key,
+    release_gateway_legacy_lease,
     user_state_dir,
 )
 
@@ -149,17 +152,48 @@ def test_profile_lock_does_not_require_descriptor_chmod(
         assert profile_lock_path(tmp_path / "profile").is_file()
 
 
-def _contend_for_gateway(state_dir: str, queue: multiprocessing.Queue) -> None:
-    from opensquilla.gateway.pidlock import GatewayPidLock
-
-    lock = GatewayPidLock(state_dir)
+def _contend_for_gateway(state_dir: str, result_connection: Connection) -> None:
+    lease = None
     try:
-        lock.acquire()
-    except SystemExit:
-        queue.put("busy")
-    else:
-        queue.put("acquired")
-        lock.release()
+        lease = acquire_gateway_legacy_lease(state_dir)
+        result_connection.send("busy" if lease is None else "acquired")
+    finally:
+        try:
+            release_gateway_legacy_lease(lease)
+        finally:
+            result_connection.close()
+
+
+def _gateway_contention_result(state_dir: Path) -> str:
+    context = multiprocessing.get_context("spawn" if sys.platform == "win32" else "fork")
+    result_connection, child_connection = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_contend_for_gateway,
+        args=(str(state_dir), child_connection),
+    )
+    result_timeout = 15 if sys.platform == "win32" else 10
+    started = False
+    try:
+        process.start()
+        started = True
+        child_connection.close()
+        assert result_connection.poll(result_timeout), (
+            "gateway contender did not report within "
+            f"{result_timeout}s (exitcode={process.exitcode})"
+        )
+        result = result_connection.recv()
+        process.join(timeout=5)
+    finally:
+        child_connection.close()
+        result_connection.close()
+        if started and process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        if started and process.is_alive():
+            process.kill()
+            process.join(timeout=5)
+    assert process.exitcode == 0
+    return result
 
 
 def test_profile_lock_is_same_process_reentrant_and_external(
@@ -920,16 +954,7 @@ def test_legacy_gateway_lock_creates_and_keeps_absent_lock_in_existing_state(
 
     with LegacyGatewayLock(home):
         assert lock_path.is_file()
-        context = multiprocessing.get_context("spawn" if sys.platform == "win32" else "fork")
-        queue = context.Queue()
-        process = context.Process(
-            target=_contend_for_gateway,
-            args=(str(state), queue),
-        )
-        process.start()
-        process.join(timeout=10)
-        assert process.exitcode == 0
-        assert queue.get(timeout=1) == "busy"
+        assert _gateway_contention_result(state) == "busy"
 
     # Persistent identity prevents a successor from locking an unlinked inode
     # while a third process creates a new lock path.
@@ -1002,16 +1027,7 @@ def test_legacy_gateway_lock_covers_external_effective_state(
 
     with LegacyGatewayLock(home):
         assert (external_state / "gateway.pid.lock").is_file()
-        context = multiprocessing.get_context("spawn" if sys.platform == "win32" else "fork")
-        queue = context.Queue()
-        process = context.Process(
-            target=_contend_for_gateway,
-            args=(str(external_state), queue),
-        )
-        process.start()
-        process.join(timeout=10)
-        assert process.exitcode == 0
-        assert queue.get(timeout=1) == "busy"
+        assert _gateway_contention_result(external_state) == "busy"
 
 
 def test_multi_root_legacy_acquisition_is_sorted_and_releases_partial_claims(
@@ -1149,16 +1165,7 @@ def test_windows_real_legacy_lock_survives_profile_move_and_rebind(tmp_path: Pat
     with LegacyGatewayLock(source):
         move_profile_no_replace(source, destination)
         with LegacyGatewayLock(destination):
-            context = multiprocessing.get_context("spawn")
-            queue = context.Queue()
-            process = context.Process(
-                target=_contend_for_gateway,
-                args=(str(destination / "state"), queue),
-            )
-            process.start()
-            process.join(timeout=15)
-            assert process.exitcode == 0
-            assert queue.get(timeout=2) == "busy"
+            assert _gateway_contention_result(destination / "state") == "busy"
 
 
 @pytest.mark.ci_serial
@@ -1173,17 +1180,8 @@ def test_windows_real_replacement_locks_survive_two_profile_moves(tmp_path: Path
     with LegacyGatewayLock(target), LegacyGatewayLock(staging):
         move_profile_no_replace(target, backup)
         move_profile_no_replace(staging, target)
-        context = multiprocessing.get_context("spawn")
         for state_root in (backup / "state", target / "state"):
-            queue = context.Queue()
-            process = context.Process(
-                target=_contend_for_gateway,
-                args=(str(state_root), queue),
-            )
-            process.start()
-            process.join(timeout=15)
-            assert process.exitcode == 0
-            assert queue.get(timeout=2) == "busy"
+            assert _gateway_contention_result(state_root) == "busy"
 
 
 @pytest.mark.ci_serial
@@ -1382,6 +1380,7 @@ def test_windows_handoff_keeps_external_state_lock_open(
         assert external_claim.fd == external_fd
 
 
+@pytest.mark.ci_serial
 def test_moved_legacy_lock_can_be_rebound_without_dropping_exclusion(
     tmp_path: Path,
 ) -> None:
@@ -1392,16 +1391,7 @@ def test_moved_legacy_lock_can_be_rebound_without_dropping_exclusion(
     with LegacyGatewayLock(staging):
         move_profile_no_replace(staging, target)
         with LegacyGatewayLock(target):
-            context = multiprocessing.get_context("spawn" if sys.platform == "win32" else "fork")
-            queue = context.Queue()
-            process = context.Process(
-                target=_contend_for_gateway,
-                args=(str(target / "state"), queue),
-            )
-            process.start()
-            process.join(timeout=10)
-            assert process.exitcode == 0
-            assert queue.get(timeout=1) == "busy"
+            assert _gateway_contention_result(target / "state") == "busy"
 
 
 @pytest.mark.skipif(
