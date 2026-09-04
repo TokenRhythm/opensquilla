@@ -41,6 +41,7 @@ export type ConversationEventData = ConversationEventIdentity & {
   active_task?: ChatRunTask | null
   last_task?: ChatRunTask | null
   changed_task?: ChatRunTask | null
+  steer_capability?: ChatRunTask['steer_capability']
   turn_outcome?: ChatRunTask['turn_outcome']
   terminalOutcome?: ChatTurnOutcome
   document_mutation_outcome?: ChatRunTask['document_mutation_outcome']

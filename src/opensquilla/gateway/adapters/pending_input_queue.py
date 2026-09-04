@@ -127,10 +127,14 @@ class GatewayPendingInputQueueAdapter:
 
     async def cancel(self, params: dict[str, Any] | None) -> dict[str, Any]:
         raw = params or {}
+        key = self._key(params)
+        revision = raw.get("expectedRevision", raw.get("expected_revision"))
+        if revision is not None and (isinstance(revision, bool) or not isinstance(revision, int)):
+            raise ValueError("params.expectedRevision must be an integer")
         command = CancelPendingInput(
-            self._key(params),
+            key,
             self._optional_string(raw, "pendingInputId", "pending_input_id") or "",
-            self._optional_revision(raw),
+            revision,
         )
         try:
             return dict(await self._application.cancel(command))

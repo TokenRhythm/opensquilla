@@ -248,7 +248,7 @@ export function projectConversationContent(payload: unknown, kind?: Conversation
   }
   const taskId = eventTaskIdentity(source)
   if (taskId !== undefined) result.task_id = taskId
-  for (const key of ['turn_outcome', 'document_mutation_outcome', 'execution_status', 'usage', 'route_plan', 'ensemble_trace']) {
+  for (const key of ['steer_capability', 'turn_outcome', 'document_mutation_outcome', 'execution_status', 'usage', 'route_plan', 'ensemble_trace']) {
     const value = alias(source, key)
     if (value && typeof value === 'object' && !Array.isArray(value)) result[key] = value
   }

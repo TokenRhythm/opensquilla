@@ -1756,6 +1756,146 @@ async def test_pending_attachment_cancel_removes_only_its_private_owner(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("revision_params", "expected_error"),
+    [
+        pytest.param({"expectedRevision": "1"}, "INVALID_REQUEST", id="string"),
+        pytest.param({"expectedRevision": True}, "INVALID_REQUEST", id="boolean"),
+        pytest.param({"expectedRevision": 1.5}, "INVALID_REQUEST", id="float"),
+        pytest.param({"expectedRevision": 1.0}, "INVALID_REQUEST", id="integer-float"),
+        pytest.param({"expected_revision": "1"}, "INVALID_REQUEST", id="legacy-string"),
+        pytest.param({"expected_revision": True}, "INVALID_REQUEST", id="legacy-boolean"),
+        pytest.param({"expected_revision": 1.5}, "INVALID_REQUEST", id="legacy-float"),
+        pytest.param({"expectedRevision": 0}, "INVALID_REQUEST", id="zero"),
+        pytest.param({"expectedRevision": -1}, "INVALID_REQUEST", id="negative"),
+        pytest.param({"expected_revision": 0}, "INVALID_REQUEST", id="legacy-zero"),
+        pytest.param({"expected_revision": -1}, "INVALID_REQUEST", id="legacy-negative"),
+        pytest.param({"expectedRevision": 1}, "PENDING_INPUT_CONFLICT", id="stale"),
+        pytest.param({"expected_revision": 1}, "PENDING_INPUT_CONFLICT", id="legacy-stale"),
+        pytest.param({"expectedRevision": 2}, None, id="matching"),
+        pytest.param({"expected_revision": 2}, None, id="legacy-matching"),
+        pytest.param({}, None, id="omitted"),
+        pytest.param({"expectedRevision": None}, None, id="null"),
+        pytest.param({"expected_revision": None}, None, id="legacy-null"),
+        pytest.param(
+            {"expectedRevision": None, "expected_revision": 1},
+            None,
+            id="canonical-null-wins",
+        ),
+        pytest.param(
+            {"expectedRevision": 1, "expected_revision": 2},
+            "PENDING_INPUT_CONFLICT",
+            id="canonical-stale-wins",
+        ),
+        pytest.param(
+            {"expectedRevision": "1", "expected_revision": 2},
+            "INVALID_REQUEST",
+            id="canonical-invalid-wins",
+        ),
+        pytest.param(
+            {"expectedRevision": 2, "expected_revision": "1"},
+            None,
+            id="canonical-matching-wins",
+        ),
+    ],
+)
+async def test_pending_input_cancel_preserves_revision_preconditions(
+    tmp_path: Path,
+    revision_params: dict[str, Any],
+    expected_error: str | None,
+) -> None:
+    original_store = get_upload_store()
+    upload_store = UploadStore(tmp_path / "revision-upload-markers")
+    set_upload_store(upload_store)
+    try:
+        async with _open_real_stack(tmp_path / "pending-cancel-revision.db") as stack:
+            payload = b"synthetic queued attachment protected by revision\n"
+            digest = hashlib.sha256(payload).hexdigest()
+            file_uuid = await upload_store.put("revision.txt", "text/plain", payload)
+            pending_id = "pending-cancel-revision"
+            identity = {"key": SESSION_KEY, "pendingInputId": pending_id}
+            staged = await get_dispatcher().dispatch(
+                "pending-revision-enqueue",
+                "sessions.pending_inputs.enqueue",
+                {
+                    **identity,
+                    "clientRequestId": "pending-revision-request",
+                    "clientMessageId": "pending-revision-message",
+                    "message": "Keep this queued attachment until its revision is accepted.",
+                    "attachments": [
+                        {"type": "text/plain", "name": "revision.txt", "file_uuid": file_uuid}
+                    ],
+                },
+                stack.context,
+            )
+            assert staged.ok is True
+            assert staged.payload["revision"] == 1
+            updated = await get_dispatcher().dispatch(
+                "pending-revision-update",
+                "sessions.pending_inputs.update",
+                {**identity, "expectedRevision": 1, "position": 0},
+                stack.context,
+            )
+            assert updated.ok is True
+            assert updated.payload["revision"] == 2
+            before = await stack.storage.get_pending_chat_input(pending_id)
+            assert before is not None
+            media_root = Path(stack.context.config.attachments.media_root or "")
+            owner_path = pending_chat_input_material_path(
+                media_root, stack.session_id, pending_id, digest
+            )
+            canonical_path = transcript_material_path(media_root, stack.session_id, digest)
+            assert owner_path.read_bytes() == payload
+            assert not canonical_path.exists()
+            async with stack.storage.conn.execute(
+                "SELECT COUNT(*) FROM pending_chat_input_cancellations WHERE pending_input_id = ?",
+                (pending_id,),
+            ) as cursor:
+                assert (await cursor.fetchone())[0] == 0
+
+            cancelled = await get_dispatcher().dispatch(
+                "pending-revision-cancel",
+                "sessions.pending_inputs.cancel",
+                {**identity, **revision_params},
+                stack.context,
+            )
+            remaining = await stack.storage.get_pending_chat_input(pending_id)
+            listed = await get_dispatcher().dispatch(
+                "pending-revision-list",
+                "sessions.pending_inputs.list",
+                {"key": SESSION_KEY},
+                stack.context,
+            )
+            assert listed.ok is True
+            async with stack.storage.conn.execute(
+                "SELECT COUNT(*) FROM pending_chat_input_cancellations WHERE pending_input_id = ?",
+                (pending_id,),
+            ) as cursor:
+                cancellation_count = (await cursor.fetchone())[0]
+            if expected_error is not None:
+                assert cancelled.ok is False
+                assert cancelled.error is not None
+                assert cancelled.error.code == expected_error
+                assert remaining == before
+                assert cancellation_count == 0
+                assert owner_path.read_bytes() == payload
+                assert len(listed.payload["items"]) == 1
+                assert listed.payload["items"][0]["pendingInputId"] == pending_id
+                assert listed.payload["items"][0]["revision"] == 2
+            else:
+                assert cancelled.ok is True
+                assert cancelled.payload["cancelled"] is True
+                assert cancelled.payload["alreadyMissing"] is False
+                assert remaining is None
+                assert cancellation_count == 1
+                assert not owner_path.exists()
+                assert listed.payload["items"] == []
+            assert not canonical_path.exists()
+    finally:
+        set_upload_store(original_store)
+
+
+@pytest.mark.asyncio
 async def test_session_delete_reclaims_pending_attachment_owner(
     tmp_path: Path,
 ) -> None:

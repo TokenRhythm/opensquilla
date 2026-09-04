@@ -16,6 +16,7 @@ import {
 import { createConversationEventTransport } from '@/adapters/gateway/conversationEventTransport'
 import type { TransportEventHandler } from '@/adapters/gateway/transportTypes'
 import type { ConversationCursorSignal } from '@/modules/conversationRuntime'
+import { steerUnavailableReason } from '@/utils/chat/steerAvailability'
 
 function createHarness(options: {
   messages?: ChatMessage[]
@@ -181,6 +182,91 @@ function createHarness(options: {
     stop: () => { detach(); scope.stop() },
   }
 }
+
+describe('live task steer capability', () => {
+  const capability = {
+    mode: 'same_turn',
+    expected_turn_id: 'turn-live',
+    input_kinds: ['text'],
+    reason: null,
+  }
+
+  it.each([
+    { spelling: 'steer_capability', schemaVersion: 1 },
+    { spelling: 'steerCapability', schemaVersion: 1 },
+    { spelling: 'steer_capability', schemaVersion: undefined },
+    { spelling: 'steerCapability', schemaVersion: undefined },
+  ])('enables Steer from a live $spelling frame with schema version $schemaVersion', ({ spelling, schemaVersion }) => {
+    const subject = createHarness()
+    try {
+      subject.api.handlers.onWireEventFixture('task.running', {
+        session_key: 'agent:main:test',
+        task_id: 'turn-live',
+        ...(schemaVersion === undefined ? {} : { schema_version: schemaVersion }),
+        [spelling]: capability,
+      })
+
+      const calls = subject.applySessionRunState.mock.calls
+      const runState: ChatRunStatusSource | undefined = calls[calls.length - 1]?.[0]
+      expect(runState).toMatchObject({
+        run_status: 'running',
+        active_task: { task_id: 'turn-live', status: 'running', steer_capability: capability },
+      })
+      expect(runState?.active_task).not.toHaveProperty('steerCapability')
+      expect(steerUnavailableReason({
+        isStreaming: subject.stream.isStreaming.value,
+        methodAvailable: true,
+        modelRoutingMode: 'auto',
+        capability: runState?.active_task?.steer_capability ?? null,
+        activeTaskId: subject.activeStreamTaskId.value,
+      })).toBeNull()
+    } finally {
+      subject.stop()
+    }
+  })
+
+  it.each([
+    { taskField: 'active_task', capabilityField: 'steer_capability' },
+    { taskField: 'activeTask', capabilityField: 'steerCapability' },
+  ])('retains the nested $taskField capability in session task updates', ({ taskField, capabilityField }) => {
+    const subject = createHarness()
+    try {
+      subject.api.handlers.onWireEventFixture('sessions.changed', {
+        key: 'agent:main:test',
+        run_status: 'running',
+        [taskField]: { task_id: 'turn-live', status: 'running', [capabilityField]: capability },
+      })
+
+      expect(subject.applySessionRunState).toHaveBeenLastCalledWith(expect.objectContaining({
+        active_task: expect.objectContaining({ task_id: 'turn-live', steer_capability: capability }),
+      }))
+    } finally {
+      subject.stop()
+    }
+  })
+
+  it('keeps Steer unavailable when the live frame has no capability', () => {
+    const subject = createHarness()
+    try {
+      subject.api.handlers.onWireEventFixture('task.running', {
+        session_key: 'agent:main:test', task_id: 'turn-live',
+      })
+
+      const calls = subject.applySessionRunState.mock.calls
+      const runState: ChatRunStatusSource | undefined = calls[calls.length - 1]?.[0]
+      expect(runState?.active_task).not.toHaveProperty('steer_capability')
+      expect(steerUnavailableReason({
+        isStreaming: subject.stream.isStreaming.value,
+        methodAvailable: true,
+        modelRoutingMode: 'auto',
+        capability: runState?.active_task?.steer_capability ?? null,
+        activeTaskId: subject.activeStreamTaskId.value,
+      })).toBe('capabilityPending')
+    } finally {
+      subject.stop()
+    }
+  })
+})
 
 describe('useChatRpcEventHandlers route-card ownership', () => {
   it('binds text and thinking events to their physical provider calls', () => {
