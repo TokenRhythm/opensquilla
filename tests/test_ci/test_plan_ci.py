@@ -1223,6 +1223,75 @@ def test_unregistered_github_script_fails_closed(
 
 
 @pytest.mark.parametrize(
+    ("path", "existing_target"),
+    [
+        (".github/workflows/wheelhouse-release.yml", "tests/test_ci/test_workflows.py"),
+        (".github/scripts/verify-release-macos-upgrade.sh", "tests/test_release_consistency.py"),
+        (
+            ".github/scripts/verify-release-macos-real-update.sh",
+            "tests/test_release_consistency.py",
+        ),
+        (".github/scripts/verify-release-windows-upgrade.ps1", "tests/test_release_consistency.py"),
+    ],
+)
+def test_upgrade_source_only_changes_select_baseline_contract(
+    tmp_path: Path,
+    suite_config: dict[str, Any],
+    path: str,
+    existing_target: str,
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+
+    assert plan["python_targets"] == sorted(
+        [existing_target, "tests/test_ci/test_upgrade_baselines.py"]
+    )
+    assert "python-targeted" in plan["required_suites"]
+    assert plan["full_fallback"] is False
+    assert plan["desktop_matrix"] == []
+    assert plan["python_matrix"] == {"ubuntu": [], "windows": []}
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ".github/workflows/wheelhouse-release.yml",
+        "desktop/electron/scripts/test-packaged-real-update-flow.mjs",
+        "tests/test_ci/test_upgrade_baselines.py",
+    ],
+)
+def test_upgrade_contract_inputs_change_release_packaging_digest(
+    tmp_path: Path, suite_config: dict[str, Any], path: str
+) -> None:
+    dependency = tmp_path / path
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text("first\n", encoding="utf-8")
+    first = _plan(
+        tmp_path, suite_config, ".github/scripts/verify-release-macos-upgrade.sh"
+    )
+
+    dependency.write_text("second\n", encoding="utf-8")
+    second = _plan(
+        tmp_path, suite_config, ".github/scripts/verify-release-macos-upgrade.sh"
+    )
+
+    for suite in ("python-targeted", "release-packaging"):
+        assert first["suite_execution_digests"][suite] != second["suite_execution_digests"][suite]
+
+
+def test_release_packaging_executes_upgrade_baseline_contract() -> None:
+    import yaml
+
+    workflow = yaml.safe_load(Path(".github/workflows/ci.yml").read_text(encoding="utf-8"))
+    job = workflow["jobs"]["release-packaging"]
+    step = next(
+        step for step in job["steps"] if step["name"] == "Run release packaging contract tests"
+    )
+    assert "command -v node" in step["run"]
+    assert "command -v pwsh" in step["run"]
+    assert "tests/test_ci/test_upgrade_baselines.py" in step["run"].split()
+
+
+@pytest.mark.parametrize(
     "path",
     MERGE_CRITICAL_INPUTS,
 )

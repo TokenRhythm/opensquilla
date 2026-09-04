@@ -151,7 +151,7 @@ def _openrouter_chat(
         headers={
             "authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}",
             "content-type": "application/json",
-            "http-referer": "https://github.com/opensquilla/opensquilla",
+            "http-referer": "https://github.com/TokenRhythm/opensquilla",
             "x-title": "OpenSquilla provider output recovery live evidence",
         },
         method="POST",

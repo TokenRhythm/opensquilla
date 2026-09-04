@@ -47,8 +47,11 @@ def test_desktop_electron_release_config_matches_current_release() -> None:
     assert not re.search(r"(?<=\d)(?:a|b|rc)\d+$", package["version"])
     assert package["repository"] == {
         "type": "git",
-        "url": "https://github.com/opensquilla/opensquilla.git",
+        "url": "https://github.com/TokenRhythm/opensquilla.git",
     }
+    assert build["publish"] == [
+        {"provider": "github", "owner": "TokenRhythm", "repo": "opensquilla"}
+    ]
     assert build["appId"] == "ai.opensquilla.desktop"
     assert build["productName"] == "OpenSquilla"
     assert build["artifactName"] == "OpenSquilla-${version}-${os}-${arch}.${ext}"
@@ -204,7 +207,7 @@ fi
             "FAKE_RELEASE_STATE": json.dumps(
                 {"assets": [], "isDraft": draft, "isPrerelease": prerelease}
             ),
-            "GH_REPO": "opensquilla/opensquilla",
+            "GH_REPO": "TokenRhythm/opensquilla",
             "GH_TOKEN": "synthetic-test-token",
             "PATH": (
                 f"{fake_bin}{os.pathsep}{Path(sys.executable).parent}{os.pathsep}{env['PATH']}"
@@ -632,7 +635,7 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
     assert "runtime/developer/darwin-arm64" in mac_helper
     assert "test ! -e \"${candidate_runtime}/developer\"" in mac_helper
     assert "resources\\runtime\\developer\\windows-x64" in windows_helper
-    assert "retained the v0.5.3 bundled developer runtimes" in windows_helper
+    assert "retained bundled developer runtimes" in windows_helper
 
     assert "test-packaged-update-banner.mjs" in windows_helper
     assert "if ($VerifyLongRunningUpdateBanner)" in windows_helper
@@ -760,7 +763,7 @@ def test_release_workflow_prestages_draft_without_advancing_channels() -> None:
         "checkForUpdates()",
         "downloadUpdate()",
         "relaunchToUpdate()",
-        "installer reported success while the official v0.5.3 process remained live",
+        "installer reported success while the official v${baselineVersion} process remained live",
     ):
         assert contract in driver
 
@@ -1134,7 +1137,7 @@ def test_all_readmes_default_install_paths_to_the_current_preview() -> None:
         assert f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-win-x64.exe" in text, path
         assert all(url in text for url in oss_latest_assets), path
         assert wheel_url in text, path
-        assert "ghcr.io/opensquilla/opensquilla:latest" in text, path
+        assert "ghcr.io/tokenrhythm/opensquilla:latest" in text, path
         assert "0.5.0-Preview-2-Desktop" not in text, path
 
 

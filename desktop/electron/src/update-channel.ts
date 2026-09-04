@@ -3,11 +3,14 @@ import { parseOpenSquillaReleaseTag, type ParsedReleaseTag } from './update-feed
 export const UPDATE_OSS_RELEASE_ROOT =
   'https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases'
 export const UPDATE_GITHUB_RELEASE_ROOT =
-  'https://github.com/opensquilla/opensquilla/releases/download'
+  'https://github.com/TokenRhythm/opensquilla/releases/download'
 export const UPDATE_GITHUB_RELEASE_PAGE_ROOT =
-  'https://github.com/opensquilla/opensquilla/releases/tag'
+  'https://github.com/TokenRhythm/opensquilla/releases/tag'
 export const UPDATE_GITHUB_RELEASES_API_URL =
-  'https://api.github.com/repos/opensquilla/opensquilla/releases?per_page=100'
+  'https://api.github.com/repos/TokenRhythm/opensquilla/releases?per_page=100'
+// Published v1 channels retain this spelling for already-installed clients.
+const LEGACY_V1_RELEASE_PAGE_ROOT =
+  'https://github.com/opensquilla/opensquilla/releases/tag'
 
 export type DesktopUpdatePlatform = 'darwin-arm64' | 'win32-x64'
 export type DesktopUpdateSource = 'oss' | 'github'
@@ -247,7 +250,10 @@ export function validateUpdateChannelManifest(payload: unknown): UpdateChannelMa
     return invalid('channel manifest publishedAt is invalid')
   }
   const releaseUrl = `${UPDATE_GITHUB_RELEASE_PAGE_ROOT}/${tag}`
-  if (raw.releaseUrl !== releaseUrl) return invalid('channel manifest releaseUrl is not canonical')
+  const legacyReleaseUrl = `${LEGACY_V1_RELEASE_PAGE_ROOT}/${tag}`
+  if (raw.releaseUrl !== releaseUrl && raw.releaseUrl !== legacyReleaseUrl) {
+    return invalid('channel manifest releaseUrl is not canonical')
+  }
   const sha256sums = safeFilename(raw.sha256sums, 'sha256sums')
   if (sha256sums !== 'SHA256SUMS') return invalid('channel manifest sha256sums is invalid')
 
