@@ -59,11 +59,13 @@
       .legend-value { color: var(--ink); font: 700 14px "SFMono-Regular",Consolas,monospace; }
       .trend-side { min-width: 0; padding: 24px 26px 16px; }
       #reliability-trend { display: block; width: 100%; min-height: 285px; overflow: visible; }
+      #reliability-hourly-trend { display: block; width: 100%; min-height: 285px; overflow: visible; }
       #terminal-trend { display: block; width: 100%; min-height: 285px; overflow: visible; }
       .chart-empty-note { margin: -9px 0 9px; color: var(--muted); font-size: 11px; text-align: center; }
       .chart-grid { stroke: #e2ecee; stroke-width: 1; }
       .chart-axis { fill: var(--muted); font: 10px "SFMono-Regular",Consolas,monospace; }
       .chart-area { fill: url(#trend-area-fill); }
+      .hourly-chart-area { fill: url(#hourly-area-fill); }
       .terminal-chart-area { fill: url(#terminal-area-fill); }
       .chart-events { fill: none; stroke: var(--teal); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
       .chart-issues { fill: none; stroke: var(--rose); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 7 5; }
@@ -210,6 +212,10 @@
         <div class="trend-summary"><div><div class="summary-label">稳定性概览</div><div class="trend-number">{{ reliability_total }}</div><div class="summary-note">采样校正后的操作结果</div></div><div class="trend-legend"><div class="legend-item"><span class="legend-label"><i class="legend-swatch"></i>事件量</span><span class="legend-value">{{ summary.reliability.dailyTrend | sum(attribute='estimatedEvents') }}</span></div><div class="legend-item"><span class="legend-label"><i class="legend-swatch issue"></i>问题量</span><span class="legend-value">{{ summary.reliability.dailyTrend | sum(attribute='estimatedIssues') }}</span></div></div></div>
         <div class="trend-side"><div class="panel-head"><div><h2>每日稳定性趋势</h2><p>实线为事件量，虚线为失败、超时、取消、拒绝或崩溃</p></div><p>{{ start_date }} → {{ end_date }}</p></div><svg id="reliability-trend" viewBox="0 0 960 285" role="img" aria-label="每日稳定性事件及问题趋势图"></svg>{% if summary.reliability.dailyTrend | sum(attribute='estimatedEvents') == 0 %}<p class="chart-empty-note" role="status">当前时间范围暂无稳定性上报；接入生产客户端后趋势会自动出现。</p>{% endif %}<div id="trend-data" hidden>{% for point in summary.reliability.dailyTrend %}<span data-date="{{ point.date }}" data-events="{{ point.estimatedEvents }}" data-issues="{{ point.estimatedIssues }}"></span>{% endfor %}</div></div>
       </section>
+      <section class="panel trend-panel">
+        <div class="trend-summary"><div><div class="summary-label">日内时段</div><div class="trend-number">24</div><div class="summary-note">每日 24 个 UTC 小时段</div></div><div class="trend-legend"><div class="legend-item"><span class="legend-label"><i class="legend-swatch"></i>事件量</span><span class="legend-value">{{ summary.reliability.hourlyTrend | sum(attribute='estimatedEvents') }}</span></div><div class="legend-item"><span class="legend-label"><i class="legend-swatch issue"></i>问题量</span><span class="legend-value">{{ summary.reliability.hourlyTrend | sum(attribute='estimatedIssues') }}</span></div></div></div>
+        <div class="trend-side"><div class="panel-head"><div><h2>日内稳定性时段分布</h2><p>所选日期范围内按每日 UTC 小时汇总；实线为事件量，虚线为问题量</p></div><p>{{ start_date }} → {{ end_date }}</p></div><svg id="reliability-hourly-trend" viewBox="0 0 960 285" role="img" aria-label="所选日期范围内按 UTC 小时汇总的稳定性事件及问题分布图"></svg>{% if summary.reliability.hourlyTrend | sum(attribute='estimatedEvents') == 0 %}<p class="chart-empty-note" role="status">当前时间范围暂无稳定性上报，日内时段分布暂为空。</p>{% endif %}<div id="hourly-trend-data" hidden>{% for point in summary.reliability.hourlyTrend %}<span data-hour-utc="{{ point.hourUtc }}" data-events="{{ point.estimatedEvents }}" data-issues="{{ point.estimatedIssues }}"></span>{% endfor %}</div></div>
+      </section>
 
       <div class="section-title"><div><p class="eyebrow">稳定性</p><h2>稳定性质量</h2></div><p>环图展示成功率；同时保留样本量与 P95 延迟</p></div>
       {% set reliability_metrics = [('应用启动','客户端启动',summary.reliability.appStart),('网关启动','网关启动',summary.reliability.gatewayStart),('AI 对话','AI 对话',summary.reliability.turns),('工具调用','工具调用',summary.reliability.tools),('文件解析','文件解析',summary.reliability.fileParsing),('应用更新','应用更新',summary.reliability.updates)] %}
@@ -270,7 +276,7 @@
           if (text !== null) node.textContent = text;
           return node;
         };
-        const drawTrend = ({svgSelector, data, series, areaId, areaClass, colors, title}) => {
+        const drawTrend = ({svgSelector, data, series, areaId, areaClass, colors, title, axisLabel, tooltipText}) => {
           const svg = document.querySelector(svgSelector);
           if (!svg || !data.length) return;
           const width = 960, height = 285, left = 46, right = 14, top = 16, bottom = 38;
@@ -296,16 +302,21 @@
           plotted.forEach(item => svg.append(make('polyline', {class: item.lineClass, points: item.coordinates.join(' ')})));
           const labelIndexes = new Set([0, data.length - 1]);
           for (let index = 1; index < 4; index += 1) labelIndexes.add(Math.round((data.length - 1) * index / 4));
-          [...labelIndexes].sort((a,b) => a - b).forEach(index => svg.append(make('text', {class: 'chart-axis', x: x(index), y: height - 11, 'text-anchor': index === 0 ? 'start' : (index === data.length - 1 ? 'end' : 'middle')}, data[index].date.slice(5))));
+          const formatAxisLabel = axisLabel || (point => point.date.slice(5));
+          const formatTooltip = tooltipText || (point => `${point.date} · ${title} ${point[series[0].key]}`);
+          [...labelIndexes].sort((a,b) => a - b).forEach(index => svg.append(make('text', {class: 'chart-axis', x: x(index), y: height - 11, 'text-anchor': index === 0 ? 'start' : (index === data.length - 1 ? 'end' : 'middle')}, formatAxisLabel(data[index]))));
           if (data.length <= 62) data.forEach((point, index) => {
             const dot = make('circle', {class: series[0].pointClass, cx: x(index), cy: y(point[series[0].key]), r: 3.2, tabindex: 0});
-            dot.append(make('title', {}, `${point.date} · ${title} ${point[series[0].key]}`)); svg.append(dot);
+            dot.append(make('title', {}, formatTooltip(point))); svg.append(dot);
           });
         };
         const installData = Array.from(document.querySelectorAll('#install-trend-data [data-date]')).map(node => ({date: node.dataset.date, installations: Number(node.dataset.installations) || 0}));
         drawTrend({svgSelector: '#install-trend', data: installData, series: [{key: 'installations', lineClass: 'chart-installs', pointClass: 'install-point'}], areaId: 'install-area-fill', areaClass: 'install-chart-area', colors: ['#356f9f'], title: '首次安装'});
         const reliabilityData = Array.from(document.querySelectorAll('#trend-data [data-date]')).map(node => ({date: node.dataset.date, events: Number(node.dataset.events) || 0, issues: Number(node.dataset.issues) || 0}));
         drawTrend({svgSelector: '#reliability-trend', data: reliabilityData, series: [{key: 'events', lineClass: 'chart-events', pointClass: 'chart-point'}, {key: 'issues', lineClass: 'chart-issues', pointClass: 'chart-point'}], areaId: 'trend-area-fill', areaClass: 'chart-area', colors: ['#43a99d'], title: '稳定性事件'});
+        const hourlyData = Array.from(document.querySelectorAll('#hourly-trend-data [data-hour-utc]')).map(node => ({hourUtc: Number(node.dataset.hourUtc) || 0, events: Number(node.dataset.events) || 0, issues: Number(node.dataset.issues) || 0}));
+        const hourlyLabel = point => `${String(point.hourUtc).padStart(2, '0')}:00`;
+        drawTrend({svgSelector: '#reliability-hourly-trend', data: hourlyData, series: [{key: 'events', lineClass: 'chart-events', pointClass: 'chart-point'}, {key: 'issues', lineClass: 'chart-issues', pointClass: 'chart-point'}], areaId: 'hourly-area-fill', areaClass: 'hourly-chart-area', colors: ['#43a99d'], title: '稳定性事件', axisLabel: hourlyLabel, tooltipText: point => `${hourlyLabel(point)} UTC · 事件量 ${point.events} · 问题量 ${point.issues}`});
         const terminalData = Array.from(document.querySelectorAll('#terminal-trend-data [data-date]')).map(node => ({date: node.dataset.date, tui: Number(node.dataset.tui) || 0, cli: Number(node.dataset.cli) || 0}));
         drawTrend({svgSelector: '#terminal-trend', data: terminalData, series: [{key: 'tui', lineClass: 'chart-tui', pointClass: 'chart-point'}, {key: 'cli', lineClass: 'chart-cli', pointClass: 'install-point'}], areaId: 'terminal-area-fill', areaClass: 'terminal-chart-area', colors: ['#43a99d'], title: 'TUI 用户'});
       })();

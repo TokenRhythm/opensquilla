@@ -207,6 +207,7 @@ class DashboardQueries:
             return {
                 "asOfReceivedUtc": watermark,
                 "dailyTrend": self._daily_reliability_trend(connection, window),
+                "hourlyTrend": self._hourly_reliability_trend(connection, window),
                 "appStart": app_start,
                 "gatewayStart": gateway_start,
                 "crashFreeSessions": self._crash_free_sessions(connection, window),
@@ -260,6 +261,53 @@ class DashboardQueries:
             result.append(
                 {
                     "date": day,
+                    "estimatedEvents": events,
+                    "estimatedIssues": issues,
+                }
+            )
+        return result
+
+    def _hourly_reliability_trend(
+        self,
+        connection: sqlite3.Connection,
+        window: UtcCohortWindow,
+    ) -> list[dict[str, Any]]:
+        """Return a zero-filled UTC hour-of-day volume and issue series."""
+
+        rows = connection.execute(
+            """
+            SELECT
+                substr(occurred_at_utc, 12, 2) AS utc_hour,
+                COALESCE(SUM(1.0 / sample_rate), 0.0) AS estimated_events,
+                COALESCE(SUM(
+                    CASE
+                        WHEN event_name = 'app_crash_detected'
+                          OR outcome IN ('fail', 'timeout', 'cancel', 'denied')
+                        THEN 1.0 / sample_rate
+                        ELSE 0
+                    END
+                ), 0.0) AS estimated_issues
+            FROM events
+            WHERE occurred_at_utc >= ?
+              AND occurred_at_utc < ?
+              AND sample_rate > 0
+            GROUP BY substr(occurred_at_utc, 12, 2)
+            """,
+            window.sql_params,
+        ).fetchall()
+        by_hour = {
+            str(row["utc_hour"]): (
+                _public_count(float(row["estimated_events"])),
+                _public_count(float(row["estimated_issues"])),
+            )
+            for row in rows
+        }
+        result: list[dict[str, Any]] = []
+        for hour in range(24):
+            events, issues = by_hour.get(f"{hour:02d}", (0, 0))
+            result.append(
+                {
+                    "hourUtc": hour,
                     "estimatedEvents": events,
                     "estimatedIssues": issues,
                 }

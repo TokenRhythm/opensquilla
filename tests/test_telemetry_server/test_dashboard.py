@@ -391,11 +391,17 @@ def test_authenticated_page_and_api_contain_aggregates_but_no_telemetry_ids(
     assert "每日稳定性趋势" in page.text
     assert 'id="reliability-trend"' in page.text
     assert 'data-events="2"' in page.text
+    assert "日内稳定性时段分布" in page.text
+    assert "所选日期范围内按每日 UTC 小时汇总" in page.text
+    assert 'id="reliability-hourly-trend"' in page.text
+    assert page.text.count('data-hour-utc="') == 24
+    assert 'data-hour-utc="0" data-events="2" data-issues="1"' in page.text
     assert "landing_view" not in page.text
     assert "first_app_ready" not in page.text
     assert '<progress' in page.text
     assert api.status_code == 200
     assert api.json()["reliability"]["appStart"]["estimatedEvents"] == 1
+    assert len(api.json()["reliability"]["hourlyTrend"]) == 24
     assert api.json()["legacyInstallation"]["installations"] == 1
     combined = page.text + api.text
     for forbidden in (
@@ -508,6 +514,7 @@ def test_one_scope_failure_does_not_hide_the_healthy_scope(
 
     assert page.status_code == 200
     assert 'id="reliability-trend"' in page.text
+    assert 'id="reliability-hourly-trend"' in page.text
     assert 'data-events="2"' in page.text
     assert "用户增长数据暂不可用" in page.text
     assert api.status_code == 200

@@ -396,6 +396,65 @@ def test_reliability_queries_return_weighted_aggregates_only(tmp_path: Path) -> 
     _assert_no_sensitive_output(result)
 
 
+def test_hourly_reliability_trend_is_weighted_zero_filled_and_half_open(
+    tmp_path: Path,
+) -> None:
+    queries, reliability, _ = _queries(tmp_path)
+    window = UtcCohortWindow.from_dates("2026-09-01", "2026-09-02")
+    events = (
+        (20, "app_start_result", "2026-08-31T23:59:59.999Z", "fail", 0.1),
+        (21, "app_start_result", "2026-09-01T00:00:00.000Z", "success", 0.5),
+        (22, "tool_call_result", "2026-09-01T00:59:59.999Z", "denied", 0.25),
+        (23, "app_crash_detected", "2026-09-02T00:15:00.000Z", "detected", 0.5),
+        (24, "app_start_result", "2026-09-02T12:00:00.000Z", "detected", 0.5),
+        (25, "turn_result", "2026-09-02T23:59:59.999Z", "cancel", 0.2),
+        (26, "turn_result", "2026-09-03T00:00:00.000Z", "fail", 0.1),
+    )
+    for sequence, event_name, occurred_at, outcome, sample_rate in events:
+        _insert(
+            reliability,
+            sequence=sequence,
+            event_name=event_name,
+            occurred_at=occurred_at,
+            outcome=outcome,
+            sample_rate=sample_rate,
+        )
+
+    result = queries.reliability(window)
+    trend = result["hourlyTrend"]
+
+    assert [point["hourUtc"] for point in trend] == list(range(24))
+    assert trend[0] == {
+        "hourUtc": 0,
+        "estimatedEvents": 8,
+        "estimatedIssues": 6,
+    }
+    assert trend[1] == {
+        "hourUtc": 1,
+        "estimatedEvents": 0,
+        "estimatedIssues": 0,
+    }
+    assert trend[12] == {
+        "hourUtc": 12,
+        "estimatedEvents": 2,
+        "estimatedIssues": 0,
+    }
+    assert trend[23] == {
+        "hourUtc": 23,
+        "estimatedEvents": 5,
+        "estimatedIssues": 5,
+    }
+    assert sum(point["estimatedEvents"] for point in trend) == 15
+    assert sum(point["estimatedIssues"] for point in trend) == 11
+    assert sum(point["estimatedEvents"] for point in trend) == sum(
+        point["estimatedEvents"] for point in result["dailyTrend"]
+    )
+    assert sum(point["estimatedIssues"] for point in trend) == sum(
+        point["estimatedIssues"] for point in result["dailyTrend"]
+    )
+    _assert_no_sensitive_output(trend)
+
+
 def test_growth_funnels_keep_identifiers_separate_and_use_fixed_windows(
     tmp_path: Path,
 ) -> None:
