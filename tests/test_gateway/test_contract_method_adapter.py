@@ -5,6 +5,7 @@ from typing import Any, cast
 
 import pytest
 import structlog
+from pydantic import ValidationError
 
 import opensquilla.gateway.adapters.contract_method as contract_method_adapter
 from opensquilla.contracts.generated.v4.gateway_contract_registry import (
@@ -19,6 +20,51 @@ from opensquilla.gateway.adapters.contract_method import (
     register_gateway_contract_method,
 )
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, RpcRegistry
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method",
+    (
+        "sandbox.path.list",
+        "workspaces.open",
+        "workspaces.update",
+        "workspaces.pin",
+        "workspaces.remove",
+        "workspaces.history.delete",
+    ),
+)
+async def test_real_registration_fixture_fails_closed_with_declared_error(
+    method: str,
+) -> None:
+    descriptor = GATEWAY_METHOD_CONTRACTS[method]
+    registry = RpcRegistry()
+
+    async def invalid_implementation(_params: object, _ctx: object) -> object:
+        return {"unexpected": True}
+
+    binding = GatewayContractBinding(
+        descriptor=descriptor,
+        observe_params=lambda _params: (),
+        validate_result=descriptor.result_model.model_validate,
+        result_validation_errors=(ValidationError,),
+        response_error_message=f"{method} response violated its v4 contract",
+        request_mismatch_event=f"{method}.request_contract_mismatch",
+        response_violation_event=f"{method}.contract_violation",
+    )
+    handler = register_gateway_contract_method(
+        registry,
+        binding,
+        invalid_implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=lambda _method: False,
+    )
+
+    with pytest.raises(RpcHandlerError) as error:
+        await handler({}, object())
+
+    assert error.value.code == "INTERNAL_ERROR"
+    assert error.value.message == f"{method} response violated its v4 contract"
 
 
 class _ContractViolationError(ValueError):

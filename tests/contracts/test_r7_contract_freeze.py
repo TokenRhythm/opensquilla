@@ -10,11 +10,6 @@ from pydantic import ValidationError
 from opensquilla.contracts.generated.v4.gateway_contract_registry import (
     GATEWAY_METHOD_CONTRACTS,
 )
-from opensquilla.gateway.adapters.contract_method import (
-    GatewayContractBinding,
-    register_gateway_contract_method,
-)
-from opensquilla.gateway.rpc import RpcHandlerError, RpcRegistry
 from scripts.contracts.generate_gateway_contracts import discover_contracts
 
 EXPECTED_METHOD_METADATA = {
@@ -266,41 +261,6 @@ def test_contract_error_metadata_matches_reachable_gateway_codes() -> None:
 
     for method, expected in EXPECTED_ACCURATE_ERROR_CODES.items():
         assert tuple(error["code"] for error in specs[method].metadata["errors"]) == expected
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("method", RESPONSE_VALIDATED_METHODS)
-async def test_real_registration_fixture_fails_closed_with_declared_error(
-    method: str,
-) -> None:
-    descriptor = GATEWAY_METHOD_CONTRACTS[method]
-    registry = RpcRegistry()
-
-    async def invalid_implementation(_params: object, _ctx: object) -> object:
-        return {"unexpected": True}
-
-    binding = GatewayContractBinding(
-        descriptor=descriptor,
-        observe_params=lambda _params: (),
-        validate_result=descriptor.result_model.model_validate,
-        result_validation_errors=(ValidationError,),
-        response_error_message=f"{method} response violated its v4 contract",
-        request_mismatch_event=f"{method}.request_contract_mismatch",
-        response_violation_event=f"{method}.contract_violation",
-    )
-    handler = register_gateway_contract_method(
-        registry,
-        binding,
-        invalid_implementation,
-        internal_error=RpcHandlerError,
-        guest_allowed_checker=lambda _method: False,
-    )
-
-    with pytest.raises(RpcHandlerError) as error:
-        await handler({}, object())
-
-    assert error.value.code == "INTERNAL_ERROR"
-    assert error.value.message == f"{method} response violated its v4 contract"
 
 
 def test_portable_hash_manifest_includes_protocol_identity_manifest() -> None:
