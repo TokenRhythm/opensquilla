@@ -975,4 +975,227 @@ describe('reconcileRunningHistoryMessages', () => {
       inputDisposition: 'steering',
     })
   })
+
+  it.each([
+    { historyKind: 'current history', canonicalTurnId: 'turn-live' },
+    { historyKind: 'legacy history without turn context', canonicalTurnId: undefined },
+  ])('keeps the first physical route when an early steer meets $historyKind', ({ canonicalTurnId }) => {
+    const previous = [
+      msg({
+        role: 'user',
+        text: 'draft a release note',
+        messageId: 'user-original',
+        clientId: 'user-original-local',
+      }),
+      msg({
+        role: 'router',
+        text: '',
+        messageId: 'router-call-1.0',
+        turnId: 'turn-live',
+        routerModelCallId: '1.0',
+        routerIteration: 1,
+      }),
+      msg({
+        role: 'assistant',
+        text: 'First streaming segment.',
+        turnId: 'turn-live',
+      }),
+      msg({
+        role: 'user',
+        text: 'keep it concise',
+        messageId: 'user-steer',
+        clientId: 'user-steer-local',
+        turnId: 'turn-live',
+        inputDisposition: 'applied',
+        inputDispositionRevision: 2,
+      }),
+      msg({
+        role: 'assistant',
+        text: 'Continuation after steering.',
+        turnId: 'turn-live',
+      }),
+    ]
+    const incoming = [
+      msg({
+        role: 'user',
+        text: 'draft a release note',
+        messageId: 'user-original',
+        ...(canonicalTurnId ? { turnId: canonicalTurnId } : {}),
+        restoredFromHistory: true,
+      }),
+      msg({
+        role: 'user',
+        text: 'keep it concise',
+        messageId: 'user-steer',
+        ...(canonicalTurnId ? { turnId: canonicalTurnId } : {}),
+        inputDisposition: 'applied',
+        inputDispositionRevision: 2,
+        restoredFromHistory: true,
+      }),
+    ]
+
+    const out = reconcileRunningHistoryMessages(previous, incoming)
+
+    expect(out.map(message => [
+      message.role,
+      message.messageId,
+      message.routerModelCallId,
+      message.routerIteration,
+      message.text,
+    ])).toEqual([
+      ['user', 'user-original', undefined, undefined, 'draft a release note'],
+      ['router', 'router-call-1.0', '1.0', 1, ''],
+      ['assistant', undefined, undefined, undefined, 'First streaming segment.'],
+      ['user', 'user-steer', undefined, undefined, 'keep it concise'],
+      ['assistant', undefined, undefined, undefined, 'Continuation after steering.'],
+    ])
+  })
+
+  it('keeps multiple steers and physical calls in causal order across a running refresh', () => {
+    const previous = [
+      msg({ role: 'user', text: 'prepare a summary', messageId: 'user-original' }),
+      msg({
+        role: 'router',
+        text: '',
+        messageId: 'router-1.0',
+        turnId: 'turn-live',
+        routerModelCallId: '1.0',
+        routerIteration: 1,
+      }),
+      msg({ role: 'assistant', text: 'segment one', turnId: 'turn-live' }),
+      msg({
+        role: 'user',
+        text: 'add risks',
+        messageId: 'steer-1',
+        turnId: 'turn-live',
+        inputDisposition: 'applied',
+      }),
+      msg({
+        role: 'router',
+        text: '',
+        messageId: 'router-2.0',
+        turnId: 'turn-live',
+        routerModelCallId: '2.0',
+        routerIteration: 2,
+      }),
+      msg({ role: 'assistant', text: 'segment two', turnId: 'turn-live' }),
+      msg({
+        role: 'user',
+        text: 'finish with actions',
+        messageId: 'steer-2',
+        turnId: 'turn-live',
+        inputDisposition: 'applied',
+      }),
+      msg({
+        role: 'router',
+        text: '',
+        messageId: 'router-3.1',
+        turnId: 'turn-live',
+        routerModelCallId: '3.1',
+        routerIteration: 3,
+      }),
+      msg({ role: 'assistant', text: 'segment three', turnId: 'turn-live' }),
+    ]
+    const incoming = [
+      msg({
+        role: 'user',
+        text: 'prepare a summary',
+        messageId: 'user-original',
+        turnId: 'turn-live',
+        restoredFromHistory: true,
+      }),
+      msg({
+        role: 'user',
+        text: 'add risks',
+        messageId: 'steer-1',
+        turnId: 'turn-live',
+        inputDisposition: 'applied',
+        restoredFromHistory: true,
+      }),
+      msg({
+        role: 'user',
+        text: 'finish with actions',
+        messageId: 'steer-2',
+        turnId: 'turn-live',
+        inputDisposition: 'applied',
+        restoredFromHistory: true,
+      }),
+    ]
+
+    const out = reconcileRunningHistoryMessages(previous, incoming)
+
+    expect(out.map(message => [message.role, message.text])).toEqual([
+      ['user', 'prepare a summary'],
+      ['router', ''],
+      ['assistant', 'segment one'],
+      ['user', 'add risks'],
+      ['router', ''],
+      ['assistant', 'segment two'],
+      ['user', 'finish with actions'],
+      ['router', ''],
+      ['assistant', 'segment three'],
+    ])
+    expect(out.filter(message => message.role === 'router').map(message => [
+      message.messageId,
+      message.routerModelCallId,
+      message.routerIteration,
+    ])).toEqual([
+      ['router-1.0', '1.0', 1],
+      ['router-2.0', '2.0', 2],
+      ['router-3.1', '3.1', 3],
+    ])
+  })
+
+  it('does not pull an earlier turn across a user boundary without matching identity', () => {
+    const previous = [
+      msg({ role: 'user', text: 'older request', messageId: 'user-old' }),
+      msg({ role: 'assistant', text: 'older live answer', turnId: 'turn-old' }),
+      msg({
+        role: 'user',
+        text: 'current request',
+        messageId: 'user-current',
+        turnId: 'turn-current',
+      }),
+      msg({
+        role: 'router',
+        text: '',
+        messageId: 'router-current',
+        turnId: 'turn-current',
+        routerModelCallId: '1.0',
+        routerIteration: 1,
+      }),
+      msg({
+        role: 'user',
+        text: 'current steer',
+        messageId: 'steer-current',
+        turnId: 'turn-current',
+        inputDisposition: 'applied',
+      }),
+    ]
+    const incoming = [
+      msg({ role: 'user', text: 'older request', messageId: 'user-old', turnId: 'turn-old' }),
+      msg({
+        role: 'user',
+        text: 'current request',
+        messageId: 'user-current',
+        turnId: 'turn-current',
+      }),
+      msg({
+        role: 'user',
+        text: 'current steer',
+        messageId: 'steer-current',
+        turnId: 'turn-current',
+      }),
+    ]
+
+    const out = reconcileRunningHistoryMessages(previous, incoming)
+
+    expect(out.map(message => [message.role, message.text])).toEqual([
+      ['user', 'older request'],
+      ['user', 'current request'],
+      ['router', ''],
+      ['user', 'current steer'],
+    ])
+    expect(out.some(message => message.turnId === 'turn-old' && message.role === 'assistant')).toBe(false)
+  })
 })
