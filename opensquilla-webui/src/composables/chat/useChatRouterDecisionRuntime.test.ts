@@ -153,6 +153,82 @@ describe('router decision identity', () => {
 })
 
 describe('appendEnsembleProgress', () => {
+  it('promotes a same-turn provisional card when its real decision arrives', () => {
+    const { runtime, messagesRef } = makeRuntime([
+      { role: 'user', text: 'q', ts: 0, turnId: 'turn-1' },
+    ])
+
+    runtime.appendEnsembleProgress({
+      event_type: 'proposer_finish',
+      turn_id: 'turn-1',
+      proposer_provider: 'openrouter',
+      proposer_model: 'qwen/qwen3.7-plus',
+    })
+    const provisional = messagesRef.value.find(message => message.role === 'router')!
+    ;(provisional as ChatMessage & { routerExecutionModel?: string }).routerExecutionModel = 'fallback-model'
+
+    runtime.queueRouterDecision({
+      turn_id: 'turn-1',
+      stream_seq: 12,
+      tier: 'c1',
+      model: 'provider/selected',
+      source: 'squilla_router',
+    })
+
+    const routers = messagesRef.value.filter(message => message.role === 'router')
+    expect(routers).toHaveLength(1)
+    expect(routers[0]).toMatchObject({
+      messageId: 'router-sess-12',
+      turnId: 'turn-1',
+      routerDecision: { model: 'provider/selected' },
+    })
+    expect(routers[0]?.ensemble?.models).toHaveLength(1)
+    expect((routers[0] as ChatMessage & { routerExecutionModel?: string }).routerExecutionModel)
+      .toBe('fallback-model')
+  })
+
+  it('does not promote a provisional card across a router control replay boundary', () => {
+    const { runtime, messagesRef } = makeRuntime([
+      { role: 'user', text: 'q', ts: 0, turnId: 'turn-1' },
+    ])
+
+    runtime.appendEnsembleProgress({
+      event_type: 'proposer_start',
+      turn_id: 'turn-1',
+      proposer_provider: 'openrouter',
+      proposer_model: 'qwen/qwen3.7-plus',
+    })
+    runtime.handleRouterControlReplay()
+    runtime.queueRouterDecision({
+      turn_id: 'turn-1',
+      stream_seq: 13,
+      tier: 'c1',
+      model: 'provider/replayed',
+      source: 'squilla_router',
+    })
+
+    expect(messagesRef.value.filter(message => message.role === 'router')).toHaveLength(2)
+  })
+
+  it('promotes a handoff card without dropping its identity', () => {
+    const { runtime, messagesRef } = makeRuntime([
+      { role: 'user', text: 'q', ts: 0, turnId: 'turn-1' },
+    ])
+
+    runtime.markEnsembleHandoff()
+    runtime.queueRouterDecision({
+      turn_id: 'turn-1',
+      stream_seq: 14,
+      tier: 'c1',
+      model: 'provider/selected',
+      source: 'squilla_router',
+    })
+
+    const routers = messagesRef.value.filter(message => message.role === 'router')
+    expect(routers).toHaveLength(1)
+    expect(routers[0]).toMatchObject({ messageId: 'router-sess-14', turnId: 'turn-1' })
+  })
+
   it('normalizes every internal candidate label to the public Proposer role', () => {
     const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0 }])
 
