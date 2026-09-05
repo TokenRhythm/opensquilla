@@ -2360,6 +2360,10 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
   gap: var(--sp-2);
 }
 
+.setup-provider-custom-form__model-item + .setup-provider-custom-form__model-item {
+  margin-top: var(--sp-1);
+}
+
 .setup-provider-custom-form__params-toggle.is-open {
   transform: rotate(180deg);
 }
