@@ -1,8 +1,7 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, inject, nextTick, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
-import { useRpcStore } from '@/stores/rpc'
 import ControlSwitch from '@/components/ControlSwitch.vue'
 import SetupField from '@/components/SetupField.vue'
 import SetupNeedList from '@/components/SetupNeedList.vue'
@@ -17,11 +16,14 @@ import type {
   DiscoveredModel,
   ProviderCredentialPanelState,
 } from '@/composables/setup/useSetupProviderForm'
+import { APP_SETTINGS_KEY } from '@/modules/appSettings'
+import { SETUP_WORKFLOW_KEY } from '@/modules/setupWorkflow'
 import { formatTokenCountInput, parseTokenCountInput } from '@/composables/setup/useSettingsPromotedForm'
 import { localizedRelativeTime } from '@/utils/messageTime'
 
 const { t, locale } = useI18n()
-const rpc = useRpcStore()
+const appSettings = inject(APP_SETTINGS_KEY)!
+const setupWorkflow = inject(SETUP_WORKFLOW_KEY)!
 
 interface ProviderOption {
   providerId: string
@@ -250,11 +252,10 @@ function customModelOverridePayload(providerId: string): Record<string, unknown>
   if (!Object.keys(byModel).length) return null
   return { models: { [providerId]: byModel } }
 }
-
 async function saveCustomModelOverrides(providerId: string): Promise<void> {
   const patch = customModelOverridePayload(providerId)
   if (!patch) return
-  await rpc.call('config.patch', { patch })
+  await appSettings.merge(patch as import('@/modules/appSettings').SettingsObject)
 }
 
 function removeCustomModelRow(index: number) {
@@ -278,7 +279,7 @@ async function fetchCustomModels() {
   customFetching.value = true
   customError.value = ''
   try {
-    const res = await rpc.call<Record<string, unknown>>('onboarding.customProvider.models.discover', {
+    const res = await setupWorkflow.provider.discoverCustomProviderModels({
       baseUrl,
       apiKey: customApiKey.value.trim(),
     })
@@ -329,12 +330,11 @@ async function createCustomProvider() {
       customError.value = t('setup.provider.customErrorSaveParams', { detail: discoverErrorDetail(err) })
       return
     }
-    await rpc.call('onboarding.llmProfile.upsert', {
+    await setupWorkflow.profile.upsertProfile({
       providerId,
       baseUrl: customBaseUrl.value.trim(),
       apiKey: customApiKey.value.trim(),
       model: models[0] || '',
-      displayName: customDisplayName.value.trim(),
     })
     resetCustomProviderForm()
     closeAddPicker()

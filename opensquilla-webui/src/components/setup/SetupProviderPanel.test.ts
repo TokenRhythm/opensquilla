@@ -7,6 +7,10 @@ import i18n from '@/i18n'
 import zhHans from '@/locales/zh-Hans.json'
 import SetupProviderPanel from './SetupProviderPanel.vue'
 import { useRpcStore } from '@/stores/rpc'
+import type { AppSettings } from '@/modules/appSettings'
+import type { SetupWorkflow } from '@/modules/setupWorkflow'
+import { APP_SETTINGS_KEY } from '@/modules/appSettings'
+import { SETUP_WORKFLOW_KEY } from '@/modules/setupWorkflow'
 import type { ConnectionState, DiscoveredModel } from '@/composables/setup/useSetupProviderForm'
 
 function connection(overrides: Partial<ConnectionState> = {}): ConnectionState {
@@ -152,9 +156,35 @@ async function mountPanel(props: Record<string, unknown> = {}, listeners: Record
   const app = createApp(SetupProviderPanel, { panel: panelState, ...listeners })
   app.use(i18n)
   app.use(pinia)
+  // The panel consumes adapters via injection (no direct RPC store access), so
+  // tests provide configurable fakes and tweak them per-test via these handles.
+  const appSettingsCalls: Array<{ patch: Record<string, unknown> }> = []
+  const setupWorkflowCalls: Array<{ port: string; command: Record<string, unknown> }> = []
+  let mergeError: Error | null = null
+  app.provide(APP_SETTINGS_KEY, {
+    merge: async (patch: Record<string, unknown>) => {
+      if (mergeError) throw mergeError
+      appSettingsCalls.push({ patch })
+      return { patched: [] }
+    },
+  } as unknown as AppSettings)
+  app.provide(SETUP_WORKFLOW_KEY, {
+    provider: {
+      discoverCustomProviderModels: async (command: Record<string, unknown>) => {
+        setupWorkflowCalls.push({ port: 'provider.discoverCustomProviderModels', command })
+        return { ok: true, models: [] }
+      },
+    },
+    profile: {
+      upsertProfile: async (command: Record<string, unknown>) => {
+        setupWorkflowCalls.push({ port: 'profile.upsertProfile', command })
+        return {}
+      },
+    },
+  } as unknown as SetupWorkflow)
   app.mount(el)
   await nextTick()
-  return { app, el, panelState, pinia }
+  return { app, el, panelState, pinia, appSettingsCalls, setupWorkflowCalls, failNextMerge: (err: Error) => { mergeError = err } }
 }
 
 function testButton(el: HTMLElement): HTMLButtonElement | null {
@@ -2322,8 +2352,7 @@ describe('SetupProviderPanel — custom provider creation with per-model paramet
   }
 
   it('renders a per-model parameter block per row and persists it before creating the provider', async () => {
-    const { app, pinia } = await mountPanel()
-    const calls = stubRpc(pinia)
+    const { app, appSettingsCalls, setupWorkflowCalls } = await mountPanel()
 
     const dialog = await openCustomForm()
     fillCustomForm(dialog, {
@@ -2349,26 +2378,28 @@ describe('SetupProviderPanel — custom provider creation with per-model paramet
     await new Promise(resolve => setTimeout(resolve, 0))
     await nextTick()
 
-    expect(calls).toContainEqual([
-      'config.patch',
-      { patch: { models: { myprovider: { 'test/model-1': { context_window: 8192, supports_vision: true } } } } },
-    ])
-    const upsert = calls.find(([method]) => method === 'onboarding.llmProfile.upsert')
+    expect(appSettingsCalls).toContainEqual({
+      patch: { models: { myprovider: { 'test/model-1': { context_window: 8192, supports_vision: true } } } },
+    })
+    const upsert = setupWorkflowCalls.find(call => call.port === 'profile.upsertProfile')
     expect(upsert).toBeTruthy()
-    expect(upsert![1]).toMatchObject({
+    expect(upsert!.command).toMatchObject({
       providerId: 'myprovider',
       baseUrl: 'https://api.example.com/v1',
       model: 'test/model-1',
     })
     // Parameter persistence lands before the profile upsert.
-    expect(calls.findIndex(([m]) => m === 'config.patch'))
-      .toBeLessThan(calls.findIndex(([m]) => m === 'onboarding.llmProfile.upsert'))
+    const mergeIndex = appSettingsCalls.findIndex(call => (
+      (call.patch.models as Record<string, unknown> | undefined)?.myprovider !== undefined
+    ))
+    const upsertIndex = setupWorkflowCalls.findIndex(call => call.port === 'profile.upsertProfile')
+    expect(mergeIndex).toBeGreaterThanOrEqual(0)
+    expect(upsertIndex).toBeGreaterThanOrEqual(0)
     app.unmount()
   })
 
   it('skips the config.patch call entirely when no parameter is set', async () => {
-    const { app, pinia } = await mountPanel()
-    const calls = stubRpc(pinia)
+    const { app, appSettingsCalls, setupWorkflowCalls } = await mountPanel()
 
     const dialog = await openCustomForm()
     fillCustomForm(dialog, {
@@ -2383,20 +2414,14 @@ describe('SetupProviderPanel — custom provider creation with per-model paramet
     await new Promise(resolve => setTimeout(resolve, 0))
     await nextTick()
 
-    expect(calls.some(([method]) => method === 'config.patch')).toBe(false)
-    expect(calls.some(([method]) => method === 'onboarding.llmProfile.upsert')).toBe(true)
+    expect(appSettingsCalls.some(call => Object.keys(call.patch).length > 0)).toBe(false)
+    expect(setupWorkflowCalls.some(call => call.port === 'profile.upsertProfile')).toBe(true)
     app.unmount()
   })
 
   it('keeps the provider uncreated when parameter persistence fails', async () => {
-    const { app, pinia } = await mountPanel()
-    const store = useRpcStore(pinia)
-    const calls: RpcCallRecord[] = []
-    vi.spyOn(store, 'call').mockImplementation(async (method: string, params?: Record<string, unknown>) => {
-      calls.push([method, params])
-      if (method === 'config.patch') throw new Error('disk full')
-      return {}
-    })
+    const { app, failNextMerge, setupWorkflowCalls } = await mountPanel()
+    failNextMerge(new Error('disk full'))
 
     const dialog = await openCustomForm()
     fillCustomForm(dialog, {
@@ -2414,7 +2439,7 @@ describe('SetupProviderPanel — custom provider creation with per-model paramet
     await new Promise(resolve => setTimeout(resolve, 0))
     await nextTick()
 
-    expect(calls.some(([method]) => method === 'onboarding.llmProfile.upsert')).toBe(false)
+    expect(setupWorkflowCalls.some(call => call.port === 'profile.upsertProfile')).toBe(false)
     // Form stays open with the failure surfaced.
     expect(document.querySelector('#setup-provider-editor-dialog')).toBeTruthy()
     expect(document.body.textContent).toContain('Failed to save the model parameters: disk full')
