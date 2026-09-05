@@ -27,6 +27,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from opensquilla.asyncio_utils import reset_contextvar_token
 from opensquilla.managed_artifacts import (
     DownloadVerificationError,
     ManagedArtifactError,
@@ -162,7 +163,7 @@ def runtime_pack_state_scope(configured_state_dir: str | Path | None):
     try:
         yield
     finally:
-        _configured_state_dir.reset(token)
+        reset_contextvar_token(_configured_state_dir, token)
 
 
 def runtime_packs_root(configured_state_dir: str | Path | None = None) -> Path:

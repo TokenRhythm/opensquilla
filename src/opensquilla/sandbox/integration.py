@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 from urllib.parse import urlparse
 
+from opensquilla.asyncio_utils import reset_contextvar_token
 from opensquilla.sandbox.backend import Backend, NoopBackend, UnavailableBackend, select_backend
 from opensquilla.sandbox.capability_profile import capability_profile_for_command
 from opensquilla.sandbox.config import EffectiveMode, SandboxSettings
@@ -160,7 +161,7 @@ def sandbox_policy_scope(policy: StoredSandboxPolicy):
     try:
         yield
     finally:
-        _ACTIVE_SANDBOX_POLICY.reset(token)
+        reset_contextvar_token(_ACTIVE_SANDBOX_POLICY, token)
 
 
 # ─── Approval queue / context protocols ──────────────────────────────────

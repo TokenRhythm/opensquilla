@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
@@ -186,13 +187,14 @@ async def run_direct_turn(
             "agent_stream_heartbeat_interval_seconds",
             15.0,
         )
-        async for event in wrap_stream(
+        composed_stream = wrap_stream(
             raw_stream,
             idle_timeout=idle_timeout,
             heartbeat_interval=heartbeat_interval,
             heartbeat_message="Agent run is still active",
             context_bound=is_context_bound_owner(runner),
-        ):
+        )
+        async for event in composed_stream:
             if isinstance(event, AnswerGenerationResetEvent):
                 event_dict = serialize_public_event(event)
             else:
@@ -275,6 +277,27 @@ async def run_direct_turn(
             {"message": error_message, "code": event_code},
         )
     finally:
+        # Close the stream chain deterministically in the task that consumed
+        # it. On an aborted turn the ``async for`` above unwinds on
+        # CancelledError without closing the wrapped ``TurnRunner.run``
+        # generator, so finalization used to fall to asyncio's async-generator
+        # finalizer, which runs ``athrow()`` in a fresh Context — where the
+        # run generator's scope stack (process/policy/git/toolchain
+        # ContextVars) cannot reset its tokens and the orphan task crashed
+        # with ``ValueError: ... was created in a different Context``
+        # (issue #1569). Closing here unwinds the wrappers and, via the
+        # heartbeat driver's own cleanup, the underlying run generator in the
+        # Context that entered its scope stack.
+        if "composed_stream" in locals():
+            stream_to_close: Any | None = composed_stream
+        elif "raw_stream" in locals():
+            stream_to_close = raw_stream
+        else:
+            stream_to_close = None
+        close = getattr(stream_to_close, "aclose", None)
+        if close is not None:
+            with contextlib.suppress(Exception):
+                await close()
         if guest_profile is not None:
             guest_profile.cleanup()
         if "turn_scope" in locals():
