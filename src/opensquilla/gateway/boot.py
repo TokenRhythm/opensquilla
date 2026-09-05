@@ -635,6 +635,7 @@ class ServiceContainer:
     router_calibration_service: Any = None
     provider_stats: Any = None  # ProviderStatsStore | None (rolling call latency samples)
     task_runtime: Any = None
+    turn_runner: Any = field(default=None, repr=False)
     heartbeat_loop: Any = None
     heartbeat_watcher: Any = None
     daily_usage_telemetry_task: asyncio.Task[Any] | None = field(default=None, repr=False)
@@ -743,6 +744,23 @@ class ServiceContainer:
                 set_task_runtime(None)
             except Exception:
                 pass
+
+        # Native model work can outlive a cancelled request. Drain TurnRunner's
+        # private model queue while session storage is still available, then
+        # close its cached model runtimes and executor exactly once.
+        turn_runner = self.turn_runner
+        self.turn_runner = None
+        if turn_runner is not None:
+            close_turn_runner = getattr(turn_runner, "aclose", None)
+            if not callable(close_turn_runner):
+                close_turn_runner = getattr(turn_runner, "close", None)
+            if callable(close_turn_runner):
+                try:
+                    result = close_turn_runner()
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    log.warning("gateway.turn_runner_close_failed", exc_info=True)
 
         if self.usage_event_sink is not None:
             try:
@@ -2990,7 +3008,7 @@ def build_turn_runner_from_services(
     def _standalone_lock_provider(session_key: str) -> _asyncio.Lock:
         return _standalone_locks.setdefault(session_key, _asyncio.Lock())
 
-    return TurnRunner(
+    turn_runner = TurnRunner(
         provider_selector=svc.provider_selector,
         tool_registry=svc.tool_registry,
         session_manager=svc.session_manager,
@@ -3016,6 +3034,11 @@ def build_turn_runner_from_services(
         turn_error_writer=getattr(svc, "turn_error_writer", None),
         provider_call_observer=build_provider_call_observer(getattr(svc, "provider_stats", None)),
     )
+    # ServiceContainer owns teardown for gateway and standalone/CLI callers.
+    # ``svc`` remains Any for lightweight test doubles, all of which permit the
+    # same attribute assignment used by the real dataclass.
+    svc.turn_runner = turn_runner
+    return turn_runner
 
 
 async def _run_deferred_warmups(svc: ServiceContainer) -> None:

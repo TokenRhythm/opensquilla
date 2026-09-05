@@ -311,6 +311,9 @@ _ARTIFACT_DELIVERY_TOOL_NAMES: Final[frozenset[str]] = frozenset(
 )
 _ARTIFACT_DELIVERY_FAILURE_MAX_CHARS: Final[int] = 360
 _HOOKS_FEATURE_ENV: Final[str] = "OPENSQUILLA_HOOKS"
+_FIXED_FOUR_TIER_V2_MAX_OUTSTANDING_JOBS: Final[int] = 8
+_FIXED_FOUR_TIER_V2_CLOSE_TIMEOUT_SECONDS: Final[float] = 5.0
+_FIXED_FOUR_TIER_V2_RELEASE_TIMEOUT_SECONDS: Final[float] = 5.0
 
 
 def _is_materializable_attachment_mime(mime: Any) -> bool:
@@ -1397,6 +1400,87 @@ def _fixed_route_visible_transcript_text(role: str, content: Any) -> str:
     if role == "user":
         text = TIME_PREFIX_RE.sub("", text, count=1)
     return text.strip()
+
+
+_FIXED_ROUTE_CLARIFICATION_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:\b(?:clarif(?:y|ication)|ask[_ -]?user|need[_ -]?input)\b|"
+    r"could you (?:clarify|provide)|please (?:specify|provide)|clarify which|"
+    r"能否|请\s*提供|需要(?:更多|具体).{0,8}信息)",
+    re.IGNORECASE,
+)
+_FIXED_ROUTE_FAILURE_OUTCOME_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:\b(?:error|fail(?:ed|ure)?|timeout|abort(?:ed)?|cancel(?:led|ed)?)\b|"
+    r"错误|失败|超时|取消)",
+    re.IGNORECASE,
+)
+
+
+def _fixed_route_tool_call_names(value: Any) -> tuple[str, ...]:
+    """Extract only observable tool names from a persisted assistant row."""
+
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return ()
+    names: list[str] = []
+    for raw in value:
+        if not isinstance(raw, Mapping):
+            continue
+        name = raw.get("name") or raw.get("tool_name")
+        function = raw.get("function")
+        if not name and isinstance(function, Mapping):
+            name = function.get("name")
+        if isinstance(name, str) and name.strip():
+            names.append(name.strip())
+    return tuple(names)
+
+
+def _fixed_route_previous_outcome(
+    *,
+    route: Any | None,
+    assistant_entry: Any | None,
+    assistant_text: str | None,
+) -> Literal["success", "failure", "clarification", "unknown"]:
+    """Derive the prior outcome from durable route and assistant evidence.
+
+    Route failure is authoritative.  A successful route may still have ended
+    by asking the user for missing information, which is a distinct training
+    label.  Rows written before fixed routing existed have no route record, so
+    their persisted stop/outcome fields are used when present.
+    """
+
+    execution_status = str(getattr(route, "execution_status", "") or "").casefold()
+    if execution_status in {"failed", "cancelled", "canceled"}:
+        return "failure"
+
+    signals: list[str] = []
+    for raw_container in (
+        getattr(assistant_entry, "turn_context", None),
+        getattr(assistant_entry, "turn_usage", None),
+    ):
+        if not isinstance(raw_container, Mapping):
+            continue
+        for key in (
+            "agent_loop_stop_reason",
+            "stop_reason",
+            "outcome",
+            "execution_status",
+            "error_code",
+        ):
+            value = raw_container.get(key)
+            if isinstance(value, str) and value.strip():
+                signals.append(value.strip())
+
+    tool_names = _fixed_route_tool_call_names(getattr(assistant_entry, "tool_calls", None))
+    clarification_signal = " ".join((*signals, *tool_names, assistant_text or ""))
+    if _FIXED_ROUTE_CLARIFICATION_RE.search(clarification_signal):
+        return "clarification"
+
+    if execution_status == "succeeded":
+        return "success"
+    if any(_FIXED_ROUTE_FAILURE_OUTCOME_RE.search(signal) for signal in signals):
+        return "failure"
+    if signals:
+        return "success"
+    return "unknown"
 
 
 _FIXED_ROUTE_NATIVE_USAGE_SENSITIVE_KEYS = frozenset(
@@ -4462,8 +4546,36 @@ class TurnRunner:
         self._router_dynamic_last_routes: dict[str, dict[str, Any]] = {}
         # Stateless classifier facades keyed by accepted four_tier_mapping config hash.
         # Durable task state lives in the session DB, never in this cache.
-        self._fixed_four_tier_v2_router_lock = threading.Lock()
+        # The lock also guards a model runner while it is executing, so a hot
+        # configuration swap cannot close an in-flight native session.
+        self._fixed_four_tier_v2_router_lock = threading.RLock()
         self._fixed_four_tier_v2_routers: OrderedDict[str, Any] = OrderedDict()
+        # Native registered-model inference is serialized on a runner-owned
+        # executor. Using the event loop's shared default executor here lets a
+        # burst of requests occupy every worker while they all wait on the same
+        # model lock, starving unrelated ``asyncio.to_thread`` work.
+        self._fixed_four_tier_v2_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="opensquilla-fixed-four-tier",
+        )
+        self._fixed_four_tier_v2_lifecycle_lock = threading.RLock()
+        self._fixed_four_tier_v2_pending_futures: set[concurrent.futures.Future[Any]] = set()
+        self._fixed_four_tier_v2_release_future: concurrent.futures.Future[Any] | None = None
+        self._fixed_four_tier_v2_close_future: concurrent.futures.Future[Any] | None = None
+        self._fixed_four_tier_v2_router_cache_populated = False
+        # Bound running + queued request work. Maintenance jobs are separately
+        # coalesced and never wait for admission on the event-loop thread.
+        self._fixed_four_tier_v2_admission = threading.BoundedSemaphore(
+            _FIXED_FOUR_TIER_V2_MAX_OUTSTANDING_JOBS
+        )
+        self._fixed_four_tier_v2_close_timeout_seconds = _FIXED_FOUR_TIER_V2_CLOSE_TIMEOUT_SECONDS
+        self._fixed_four_tier_v2_close_timeout_reported = False
+        self._fixed_four_tier_v2_release_timeout_seconds = (
+            _FIXED_FOUR_TIER_V2_RELEASE_TIMEOUT_SECONDS
+        )
+        self._fixed_four_tier_v2_release_timeout_future: concurrent.futures.Future[Any] | None = (
+            None
+        )
         # Optional KV-affinity evidence is intentionally isolated from B5 route
         # continuity. Both containers are process-local and non-persistent, but
         # this state is epoch/topology keyed and never enters TurnContext metadata.
@@ -4588,8 +4700,251 @@ class TurnRunner:
         # config object in accepted_turn_config_scope().
         return accepted
 
+    def _track_fixed_four_tier_v2_future_locked(
+        self,
+        future: concurrent.futures.Future[Any],
+        *,
+        admitted_request: bool = False,
+    ) -> None:
+        """Track one private-executor job while the lifecycle lock is held."""
+
+        self._fixed_four_tier_v2_pending_futures.add(future)
+
+        def _discard(done: concurrent.futures.Future[Any]) -> None:
+            with self._fixed_four_tier_v2_lifecycle_lock:
+                self._fixed_four_tier_v2_pending_futures.discard(done)
+                if admitted_request:
+                    self._fixed_four_tier_v2_admission.release()
+
+        future.add_done_callback(_discard)
+
+    def _submit_fixed_four_tier_v2_job(
+        self,
+        callback: Callable[[], Any],
+    ) -> concurrent.futures.Future[Any]:
+        """Submit model work without consuming the event loop's default pool."""
+
+        with self._fixed_four_tier_v2_lifecycle_lock:
+            if self._fixed_four_tier_v2_close_future is not None:
+                raise RuntimeError("TurnRunner fixed four-tier runtime is closed")
+            if not self._fixed_four_tier_v2_admission.acquire(blocking=False):
+                raise RuntimeError("TurnRunner fixed four-tier runtime queue is full")
+            try:
+                future = self._fixed_four_tier_v2_executor.submit(callback)
+            except BaseException:
+                self._fixed_four_tier_v2_admission.release()
+                raise
+            self._track_fixed_four_tier_v2_future_locked(
+                future,
+                admitted_request=True,
+            )
+            return future
+
+    async def _run_fixed_four_tier_v2_job(self, callback: Callable[[], Any]) -> Any:
+        """Await private model work, cancelling only jobs that have not started."""
+
+        future = self._submit_fixed_four_tier_v2_job(callback)
+        wrapped = asyncio.wrap_future(future)
+
+        def _consume_unobserved_failure(done: asyncio.Future[Any]) -> None:
+            if not done.cancelled():
+                done.exception()
+
+        # A running native call can finish after its disconnected waiter. Keep
+        # its proxy observed so a later exception does not become an unhandled
+        # event-loop warning.
+        wrapped.add_done_callback(_consume_unobserved_failure)
+        try:
+            return await asyncio.shield(wrapped)
+        except asyncio.CancelledError:
+            # Queued work is removable and immediately returns its admission
+            # slot. A running native call cannot be killed safely; cancel()
+            # returns False and the single worker drains it before maintenance.
+            future.cancel()
+            raise
+
+    def _close_fixed_four_tier_v2_resource(self, resource: Any, *, phase: str) -> None:
+        """Close one model owner without breaking routing or shutdown."""
+
+        close = getattr(resource, "close", None)
+        if not callable(close):
+            return
+        try:
+            close()
+        except Exception:  # noqa: BLE001 - model cleanup is deliberately fail-open.
+            log.warning(
+                "fixed_four_tier_v2.router_close_failed",
+                phase=phase,
+                resource_type=type(resource).__name__,
+                exc_info=True,
+            )
+
+    def _close_cached_fixed_four_tier_v2_routers(self, *, phase: str) -> None:
+        """Synchronously clear cached routers on the private model worker."""
+
+        with self._fixed_four_tier_v2_router_lock:
+            routers = tuple(self._fixed_four_tier_v2_routers.values())
+            self._fixed_four_tier_v2_routers.clear()
+            with self._fixed_four_tier_v2_lifecycle_lock:
+                self._fixed_four_tier_v2_router_cache_populated = False
+            for router in routers:
+                self._close_fixed_four_tier_v2_resource(router, phase=phase)
+
+    async def _release_fixed_four_tier_v2_routers(self) -> None:
+        """Queue cache release after prior native work when the mode is left."""
+
+        with self._fixed_four_tier_v2_lifecycle_lock:
+            if self._fixed_four_tier_v2_close_future is not None:
+                return
+            release_future = self._fixed_four_tier_v2_release_future
+            if (
+                release_future is self._fixed_four_tier_v2_release_timeout_future
+                and release_future is not None
+                and not release_future.done()
+            ):
+                # The first mode-switch request already paid the bounded wait.
+                # Do not impose the same delay on every subsequent non-fixed turn.
+                return
+            if release_future is None or release_future.done():
+                pending_model_work = any(
+                    not future.done()
+                    for future in self._fixed_four_tier_v2_pending_futures
+                    if future is not release_future
+                )
+                if not self._fixed_four_tier_v2_router_cache_populated and not pending_model_work:
+                    return
+                release_future = self._fixed_four_tier_v2_executor.submit(
+                    lambda: self._close_cached_fixed_four_tier_v2_routers(
+                        phase="selection_mode_changed"
+                    )
+                )
+                self._fixed_four_tier_v2_release_future = release_future
+                self._fixed_four_tier_v2_release_timeout_future = None
+                self._track_fixed_four_tier_v2_future_locked(release_future)
+
+        wrapped = asyncio.wrap_future(release_future)
+
+        def _consume_unobserved_failure(done: asyncio.Future[Any]) -> None:
+            if not done.cancelled():
+                done.exception()
+
+        wrapped.add_done_callback(_consume_unobserved_failure)
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(wrapped),
+                timeout=self._fixed_four_tier_v2_release_timeout_seconds,
+            )
+        except TimeoutError:
+            with self._fixed_four_tier_v2_lifecycle_lock:
+                should_report = (
+                    self._fixed_four_tier_v2_release_timeout_future is not release_future
+                )
+                self._fixed_four_tier_v2_release_timeout_future = release_future
+                outstanding_jobs = sum(
+                    not future.done()
+                    for future in self._fixed_four_tier_v2_pending_futures
+                    if future is not release_future
+                )
+            if should_report:
+                log.warning(
+                    "fixed_four_tier_v2.release_timed_out",
+                    timeout_seconds=self._fixed_four_tier_v2_release_timeout_seconds,
+                    outstanding_jobs=outstanding_jobs,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - mode-switch cleanup is fail-open.
+            log.warning(
+                "fixed_four_tier_v2.release_failed",
+                exc_info=True,
+            )
+
+    def _shutdown_fixed_four_tier_v2_executor_no_wait(self) -> None:
+        """Reject new executor work without joining its current worker."""
+
+        try:
+            self._fixed_four_tier_v2_executor.shutdown(
+                wait=False,
+                cancel_futures=False,
+            )
+        except Exception:  # noqa: BLE001 - teardown remains best effort.
+            log.warning(
+                "fixed_four_tier_v2.executor_close_failed",
+                exc_info=True,
+            )
+
+    def _shutdown_fixed_four_tier_v2_runtime(self) -> None:
+        """Run at the tail of the private queue and stop its executor."""
+
+        try:
+            self._close_cached_fixed_four_tier_v2_routers(phase="turn_runner_close")
+        finally:
+            # This method itself runs on the executor worker. ``wait=False``
+            # marks it shut down without attempting to join the current thread.
+            self._shutdown_fixed_four_tier_v2_executor_no_wait()
+
+    async def aclose(self) -> None:
+        """Drain native model work and release runner-owned resources once."""
+
+        with self._fixed_four_tier_v2_lifecycle_lock:
+            close_future = self._fixed_four_tier_v2_close_future
+            if close_future is None:
+                close_future = self._fixed_four_tier_v2_executor.submit(
+                    self._shutdown_fixed_four_tier_v2_runtime
+                )
+                self._fixed_four_tier_v2_close_future = close_future
+                self._track_fixed_four_tier_v2_future_locked(close_future)
+
+        wrapped = asyncio.wrap_future(close_future)
+
+        def _consume_unobserved_failure(done: asyncio.Future[Any]) -> None:
+            if not done.cancelled():
+                done.exception()
+
+        wrapped.add_done_callback(_consume_unobserved_failure)
+        try:
+            # Shielding preserves the queued drain if the shutdown caller is
+            # cancelled. A bounded wait prevents one wedged native call from
+            # hanging gateway shutdown, while the queued cleanup remains the
+            # sole owner allowed to close its model after that call returns.
+            await asyncio.wait_for(
+                asyncio.shield(wrapped),
+                timeout=self._fixed_four_tier_v2_close_timeout_seconds,
+            )
+        except TimeoutError:
+            with self._fixed_four_tier_v2_lifecycle_lock:
+                should_report = not self._fixed_four_tier_v2_close_timeout_reported
+                self._fixed_four_tier_v2_close_timeout_reported = True
+                outstanding_jobs = sum(
+                    not future.done()
+                    for future in self._fixed_four_tier_v2_pending_futures
+                    if future is not close_future
+                )
+            if should_report:
+                log.warning(
+                    "fixed_four_tier_v2.runtime_close_timed_out",
+                    timeout_seconds=self._fixed_four_tier_v2_close_timeout_seconds,
+                    outstanding_jobs=outstanding_jobs,
+                )
+            # Mark the executor shut down now so even private/direct submitters
+            # cannot extend the queue. cancel_futures=False preserves the tail
+            # cleanup job, which closes the runner only after native work exits.
+            self._shutdown_fixed_four_tier_v2_executor_no_wait()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - ServiceContainer teardown is fail-open.
+            log.warning(
+                "fixed_four_tier_v2.runtime_close_failed",
+                exc_info=True,
+            )
+
+    async def close(self) -> None:
+        """Compatibility alias for async resource owners."""
+
+        await self.aclose()
+
     def _fixed_four_tier_v2_router_for_config(self, ensemble_cfg: Any) -> Any:
-        """Return the mock router bound to one accepted configuration snapshot."""
+        """Return the router bound to one accepted configuration snapshot."""
 
         from opensquilla.engine.routing.fixed_four_tier_v2 import FixedFourTierV2Router
 
@@ -4614,17 +4969,65 @@ class TurnRunner:
                     Any,
                     str(getattr(route_cfg, "default_new_task_tier", "c1") or "c1"),
                 )
-                router = FixedFourTierV2Router(
-                    mock_seed=getattr(route_cfg, "mock_seed", None),
-                    default_new_task_tier=default_tier,
-                    intent_min_confidence=float(getattr(route_cfg, "intent_min_confidence", 0.5)),
-                    tier_min_confidence=float(getattr(route_cfg, "tier_min_confidence", 0.5)),
-                    min_margin=float(getattr(route_cfg, "min_margin", 0.05)),
-                    policy_config=payload,
-                )
+                classifier_cfg = getattr(route_cfg, "classifier", None)
+                classifier_backend = str(getattr(classifier_cfg, "backend", "") or "")
+                if not classifier_backend:
+                    raise RuntimeError("four_tier_mapping classifier configuration is unavailable")
+                classifier = None
+                if classifier_backend == "registered_model":
+                    from opensquilla.engine.routing.registered_model import (
+                        RegisteredModelClassifier,
+                    )
+
+                    classifier = RegisteredModelClassifier(
+                        artifact_root=str(getattr(classifier_cfg, "artifact_root", "") or ""),
+                        metadata_db=str(getattr(classifier_cfg, "metadata_db", "") or ""),
+                        model_set_id=str(getattr(classifier_cfg, "model_set_id", "") or ""),
+                        expected_manifest_hash=str(
+                            getattr(classifier_cfg, "expected_manifest_hash", "") or ""
+                        ),
+                        allow_candidate=bool(getattr(classifier_cfg, "allow_candidate", False)),
+                    )
+                elif classifier_backend != "random_mock":
+                    raise RuntimeError(
+                        f"unsupported four_tier_mapping classifier backend: {classifier_backend}"
+                    )
+                try:
+                    router = FixedFourTierV2Router(
+                        intent_classifier=classifier,
+                        tier_classifier=classifier,
+                        mock_seed=(
+                            getattr(classifier_cfg, "seed", None)
+                            if classifier_backend == "random_mock"
+                            else None
+                        ),
+                        default_new_task_tier=default_tier,
+                        intent_min_confidence=float(
+                            getattr(route_cfg, "intent_min_confidence", 0.5)
+                        ),
+                        tier_min_confidence=float(getattr(route_cfg, "tier_min_confidence", 0.5)),
+                        min_margin=float(getattr(route_cfg, "min_margin", 0.05)),
+                        policy_config=payload,
+                    )
+                except BaseException:
+                    if classifier is not None:
+                        self._close_fixed_four_tier_v2_resource(
+                            classifier,
+                            phase="router_construction_rollback",
+                        )
+                    raise
             self._fixed_four_tier_v2_routers[config_hash] = router
-            while len(self._fixed_four_tier_v2_routers) > 8:
-                self._fixed_four_tier_v2_routers.popitem(last=False)
+            with self._fixed_four_tier_v2_lifecycle_lock:
+                self._fixed_four_tier_v2_router_cache_populated = True
+            # A BERT model set can own several large native sessions. Keep one
+            # accepted configuration resident and deterministically release a
+            # replaced runner instead of retaining the previous mock-era LRU=8.
+            while len(self._fixed_four_tier_v2_routers) > 1:
+                _, evicted = self._fixed_four_tier_v2_routers.popitem(last=False)
+                self._close_fixed_four_tier_v2_resource(
+                    evicted,
+                    phase="config_replaced",
+                )
             return router
 
     def _persistent_canary_rollout_ledger(self, turn_config: Any) -> Any | None:
@@ -8896,6 +9299,20 @@ class TurnRunner:
                 "four_tier_mapping tier mapping is unavailable",
                 reason="tier_mapping_unavailable",
             )
+        classifier_cfg = getattr(mode_cfg, "classifier", None)
+        classifier_backend = str(getattr(classifier_cfg, "backend", "") or "")
+        if classifier_backend not in {"random_mock", "registered_model"}:
+            raise FixedFourTierRoutingError(
+                "four_tier_mapping classifier configuration is unavailable",
+                reason="classifier_configuration_unavailable",
+            )
+        if classifier_backend == "registered_model" and not callable(
+            getattr(session_manager, "list_recent_fixed_four_tier_decisions", None)
+        ):
+            raise FixedFourTierRoutingError(
+                "registered four_tier_mapping requires bounded route history storage",
+                reason="route_history_storage_unavailable",
+            )
 
         metadata = turn.metadata
         history_value = metadata.get("router_history_user_texts")
@@ -8983,6 +9400,9 @@ class TurnRunner:
         parent_decision: Any | None = None
         redo_child_task_start_message_id: str | None = None
         feature_session_key = turn.session_key
+        feature_session_id = durable_session_id
+        feature_session_epoch = session_epoch
+        feature_route_before_ms = claimed_at_ms
         redo_feature_transcript: list[Any] | None = None
         feature_task_start_message_id = (
             task_state.task_start_input_message_id if task_state is not None else None
@@ -9087,6 +9507,9 @@ class TurnRunner:
                 expected_state_version = None
                 redo_parent_route_id = parent_decision.route_id
                 feature_session_key = parent_decision.session_key
+                feature_session_id = parent_decision.session_id
+                feature_session_epoch = int(parent_decision.session_epoch)
+                feature_route_before_ms = int(parent_decision.decided_at_ms)
                 feature_task_start_message_id = source_task_start_message_id
                 feature_current_message_id = parent_decision.input_message_id
                 get_canonical_transcript = getattr(
@@ -9172,7 +9595,10 @@ class TurnRunner:
                 "four_tier_mapping feature boundaries are reversed",
                 reason="invalid_feature_boundary_order",
             )
-        prior_feature_entries = feature_transcript[feature_start_index:feature_end_index]
+        # The trained Router contract retains the latest cross-task history.
+        # Task boundaries still govern state/context reuse, but must not hide
+        # route-before user turns from the classifiers.
+        prior_feature_entries = feature_transcript[:feature_end_index]
         user_history = tuple(
             text
             for entry in prior_feature_entries
@@ -9184,6 +9610,13 @@ class TurnRunner:
                 )
             )
         )
+        task_anchor = ""
+        if feature_task_start_message_id:
+            task_anchor_entry = feature_transcript[feature_start_index]
+            task_anchor = _fixed_route_visible_transcript_text(
+                "user",
+                getattr(task_anchor_entry, "content", ""),
+            )
         previous_route = parent_decision
         if previous_route is None and persisted_state is not None and persisted_state.last_route_id:
             previous_route = await session_manager.get_fixed_four_tier_decision_by_route(
@@ -9207,6 +9640,25 @@ class TurnRunner:
                     feature_start_index <= response_index < feature_end_index
                 ):
                     previous_assistant_entry = response_entry
+        # A session can enable this routing mode after earlier turns already
+        # exist. In that case there is no fixed-route response binding yet,
+        # but the last route-before assistant row is still observable input.
+        # Do not use this fallback for a bound route whose response is absent:
+        # combining an older answer with a newer route outcome would be false.
+        if (
+            classifier_backend == "registered_model"
+            and previous_assistant_entry is None
+            and previous_route is None
+        ):
+            previous_assistant_entry = next(
+                (
+                    entry
+                    for entry in reversed(prior_feature_entries)
+                    if getattr(entry, "role", None) == "assistant"
+                ),
+                None,
+            )
+        previous_assistant_text: str | None
         if previous_assistant_entry is not None:
             previous_assistant_text = _fixed_route_visible_transcript_text(
                 "assistant",
@@ -9236,6 +9688,128 @@ class TurnRunner:
                     len(previous_route_trace.get("attempt_ids") or []) - 1,
                 ),
             }
+        previous_outcome = _fixed_route_previous_outcome(
+            route=previous_route,
+            assistant_entry=previous_assistant_entry,
+            assistant_text=previous_assistant_text,
+        )
+
+        list_recent_routes = getattr(
+            session_manager,
+            "list_recent_fixed_four_tier_decisions",
+            None,
+        )
+        recent_routes = []
+        if classifier_backend == "registered_model" and callable(list_recent_routes):
+            history_before_ms = feature_route_before_ms
+            history_limit = 5
+            if parent_decision is not None:
+                # The parent itself occupies the fifth slot below. Querying
+                # through its millisecond would let unordered same-tick peers
+                # crowd genuinely older routes out before we can filter them.
+                history_before_ms = feature_route_before_ms - 1
+                history_limit = 4
+            if history_before_ms >= 0:
+                recent_routes = list(
+                    await list_recent_routes(
+                        session_id=feature_session_id,
+                        session_epoch=feature_session_epoch,
+                        since_ms=max(0, feature_route_before_ms - 30 * 60 * 1_000),
+                        before_ms=history_before_ms,
+                        limit=history_limit,
+                    )
+                )
+            if parent_decision is not None:
+                parent_route_id = str(getattr(parent_decision, "route_id", "") or "")
+                parent_decided_at_ms = int(parent_decision.decided_at_ms)
+                recent_routes = [
+                    route
+                    for route in recent_routes
+                    if str(getattr(route, "route_id", "") or "") != parent_route_id
+                    and int(route.decided_at_ms) < parent_decided_at_ms
+                ]
+                # The redo boundary itself is route-before evidence for the
+                # replacement request. Same-millisecond peers have no causal
+                # order, so retain only strictly older records and append the
+                # already authenticated parent explicitly.
+                recent_routes.append(parent_decision)
+                recent_routes = recent_routes[-5:]
+        route_history: list[dict[str, Any]] = []
+        for historical_route in recent_routes:
+            history_entry: dict[str, Any] = {
+                "tier_id": str(getattr(historical_route, "final_tier", "") or "").upper()
+            }
+            tier_audit = getattr(historical_route, "tier", None)
+            probabilities = (
+                tier_audit.get("probabilities") if isinstance(tier_audit, Mapping) else None
+            )
+            if isinstance(probabilities, Mapping):
+                normalized_probabilities: dict[str, float] = {}
+                for raw_tier, raw_probability in probabilities.items():
+                    try:
+                        probability = float(raw_probability)
+                    except (TypeError, ValueError):
+                        normalized_probabilities = {}
+                        break
+                    tier_name = str(raw_tier).upper()
+                    if tier_name not in {"C0", "C1", "C2", "C3"} or not math.isfinite(probability):
+                        normalized_probabilities = {}
+                        break
+                    normalized_probabilities[tier_name] = probability
+                if set(normalized_probabilities) == {"C0", "C1", "C2", "C3"}:
+                    ordered_probabilities = sorted(normalized_probabilities.values(), reverse=True)
+                    history_entry["difficulty"] = sum(
+                        index * normalized_probabilities[f"C{index}"] for index in range(4)
+                    )
+                    history_entry["margin"] = ordered_probabilities[0] - ordered_probabilities[1]
+            route_history.append(history_entry)
+
+        context: dict[str, Any] = {
+            "turn_index": len(route_history),
+            "context_tokens_est": (
+                len(str(turn.semantic_message or turn.message or ""))
+                + sum(len(value) for value in user_history)
+                + len(previous_assistant_text or "")
+            )
+            // 4,
+        }
+        surface_kind = str(getattr(turn, "surface_kind", "") or "").strip()
+        channel_kind = str(metadata.get("channel_kind") or "").strip()
+        if surface_kind and surface_kind != "unknown":
+            context["entrypoint"] = surface_kind
+        if channel_kind:
+            context["platform"] = channel_kind
+        available_tools = sorted(
+            {
+                name
+                for tool in (turn.tool_defs or [])
+                if (
+                    name := str(
+                        tool.get("name") if isinstance(tool, Mapping) else getattr(tool, "name", "")
+                    ).strip()
+                )
+            }
+        )
+        tool_state = {"available_tools": available_tools} if available_tools else {}
+        normalized_modalities = normalize_attachment_modalities(turn.attachments or [])
+        router_attachments: list[dict[str, Any]] = []
+        if normalized_modalities is not None:
+            for attachment, modality in zip(turn.attachments or [], normalized_modalities):
+                safe_attachment: dict[str, Any] = {"type": modality}
+                if isinstance(attachment, Mapping):
+                    for key in (
+                        "mime_type",
+                        "media_type",
+                        "parse_status",
+                        "status",
+                        "summary",
+                        "truncated",
+                        "token_count",
+                    ):
+                        value = attachment.get(key)
+                        if isinstance(value, (str, int, float, bool)) or value is None:
+                            safe_attachment[key] = value
+                router_attachments.append(safe_attachment)
         route_request = RoutingRequest(
             session_id=durable_session_id,
             request_id=request_id,
@@ -9246,11 +9820,17 @@ class TurnRunner:
             input_message_id=(
                 feature_current_message_id if parent_decision is not None else bound_user_message_id
             ),
+            task_anchor=task_anchor,
             user_history=user_history,
             previous_assistant_text=previous_assistant_text,
             previous_assistant_usage=previous_usage,
+            previous_outcome=cast(Any, previous_outcome),
+            route_history=tuple(route_history),
+            context=context,
+            tool_state=tool_state,
+            attachments=tuple(router_attachments),
             attachment_count=len(turn.attachments or []),
-            attachment_modalities=normalize_attachment_modalities(turn.attachments or []),
+            attachment_modalities=normalized_modalities,
             control_event=str(control_event) if control_event is not None else None,
         )
         claim_id = uuid.uuid4().hex
@@ -9304,20 +9884,18 @@ class TurnRunner:
                     else "duplicate_request_replay"
                 ),
             )
+
+        def _load_and_decide_fixed_route() -> tuple[Any, Any]:
+            # Loading and native inference are blocking.  The shared lock keeps
+            # a hot config replacement from closing this runner mid-request.
+            with self._fixed_four_tier_v2_router_lock:
+                router = self._fixed_four_tier_v2_router_for_config(ensemble_cfg)
+                return cast(tuple[Any, Any], router.decide(route_request, task_state))
+
         try:
-            router = self._fixed_four_tier_v2_router_for_config(ensemble_cfg)
-        except BaseException as exc:
-            terminal_status = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
-            reason = str(getattr(exc, "reason", "") or type(exc).__name__)
-            if isinstance(exc, asyncio.CancelledError):
-                await _finish_required_cancel_cleanup(
-                    _settle_claim_terminal(terminal_status, reason)
-                )
-            else:
-                await _settle_claim_terminal(terminal_status, reason)
-            raise
-        try:
-            decision, next_task_state = router.decide(route_request, task_state)
+            decision, next_task_state = await self._run_fixed_four_tier_v2_job(
+                _load_and_decide_fixed_route
+            )
             if parent_decision is not None:
                 if not str(redo_child_task_start_message_id or "").strip():
                     raise FixedFourTierRoutingError(
@@ -9354,7 +9932,10 @@ class TurnRunner:
             target_model = str(getattr(tier_cfg, "model", "") or "").strip()
             reasoning = str(getattr(tier_cfg, "reasoning", "") or "").strip().casefold()
             deployment_version = str(getattr(tier_cfg, "deployment_version", "") or "").strip()
-            route_trace = decision.trace(provider=target_provider, model=target_model)
+            route_trace = decision.trace(
+                provider=target_provider or None,
+                model=target_model or None,
+            )
             route_trace.update(
                 {
                     "session_id": durable_session_id,
@@ -9362,16 +9943,18 @@ class TurnRunner:
                     "claim_id": claim_id,
                     "execution_id": execution_id,
                     "session_key_hash": hashlib.sha256(
-                        turn.session_key.encode("utf-8")
+                        canonicalize_session_key(turn.session_key).encode("utf-8")
                     ).hexdigest(),
                     "input_message_id": bound_user_message_id,
                     "redo_parent_route_id": redo_parent_route_id,
                     "task_start_input_message_id": (next_task_state.task_start_input_message_id),
+                    "state_version_before": expected_state_version,
                     "attempt_id": None,
                     "attempt_ids": [],
                     "response_id": None,
                     "execution_status": "pending",
                     "state_committed": False,
+                    "reasoning": reasoning or None,
                     "deployment_version": deployment_version or None,
                     "deployment_version_attested": False,
                     "execution_lease": {
@@ -9817,6 +10400,7 @@ class TurnRunner:
                 updated_at_ms=time.time_ns() // 1_000_000,
             )
             route_trace["state_committed"] = True
+            route_trace["state_version_after"] = durable_next_state.version
             await session_manager.commit_fixed_four_tier_decision(
                 route_id=decision.route_id,
                 state=durable_next_state,
@@ -10782,6 +11366,11 @@ class TurnRunner:
             and str(getattr(initial_ensemble_cfg, "selection_mode", "") or "").strip().casefold()
             == "four_tier_mapping"
         )
+        if not fixed_four_tier_v2_active:
+            # A newly accepted non-fixed configuration is a reliable point at
+            # which to retire any model cached by the previous mode. The close
+            # is queued behind in-flight native work on the same private worker.
+            await self._release_fixed_four_tier_v2_routers()
 
         def _copy_router_turn(turn: TurnContext) -> TurnContext:
             metadata: dict[str, Any] = {}

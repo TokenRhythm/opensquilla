@@ -23,7 +23,7 @@ from opensquilla.search.types import MAX_SEARCH_RESULTS
 # Schema version stamped into every migrated payload. Bump this together with
 # a new ``_MIGRATIONS`` entry whenever a one-time value migration is added.
 # ``GatewayConfig.config_version`` (gateway/config.py) defaults to this value.
-LATEST_CONFIG_VERSION = 1
+LATEST_CONFIG_VERSION = 2
 
 DEPRECATED_MEMORY_FIELDS: frozenset[str] = frozenset(
     {
@@ -79,6 +79,19 @@ DEPRECATED_AGENT_TOKEN_SAVING_LEAVES: frozenset[str] = frozenset(
 )
 _LEGACY_LLM_ENSEMBLE_TIMEOUT_SECONDS = frozenset({120.0, 300.0})
 _DEFAULT_LLM_ENSEMBLE_TIMEOUT_SECONDS = 3600.0
+_FIXED_FOUR_TIER_SCHEMA = "fixed-four-tier-v2-v3"
+_LEGACY_FIXED_FOUR_TIER_SCHEMAS = frozenset(
+    {
+        "fixed-four-tier-v2-mock-v1",
+        "fixed-four-tier-v2-mock-v2",
+    }
+)
+_FIXED_FOUR_TIER_DEPLOYMENT_VERSIONS = {
+    "c0": "qwen3.7-flash-thinking",
+    "c1": "deepseek-v4-flash-0731",
+    "c2": "deepseek-v4-pro-0813",
+    "c3": "glm-5.3",
+}
 
 
 def _legacy_llm_ensemble_timeout_number(value: Any) -> float | None:
@@ -314,6 +327,7 @@ def migrate_config_payload(
     _park_unknown_channel_entries(builder, emit_diagnostics=emit_diagnostics)
     _disable_unverifiable_feishu_webhook_entries(builder)
     _clear_mismatched_router_tier_profile(builder)
+    _normalize_fixed_four_tier_classifier(builder)
 
     stamped_version = _payload_config_version(builder.payload)
     for version, migrate in _MIGRATIONS:
@@ -610,6 +624,68 @@ def _clear_mismatched_router_tier_profile(builder: _MigrationBuilder) -> None:
     )
 
 
+def _normalize_fixed_four_tier_classifier(builder: _MigrationBuilder) -> None:
+    """Always-run: normalize legacy fixed-four-tier mock classifier fields.
+
+    This is deliberately independent of ``config_version``. A stamped config
+    can still be hand-edited with the old route schema or top-level
+    ``mock_seed`` and must be normalized before strict model validation.
+    """
+    llm_ensemble = builder.payload.get("llm_ensemble")
+    if not isinstance(llm_ensemble, dict):
+        return
+    route = llm_ensemble.get("four_tier_mapping")
+    if not isinstance(route, dict):
+        return
+
+    schema_version = route.get("schema_version")
+    legacy_schema = schema_version in _LEGACY_FIXED_FOUR_TIER_SCHEMAS
+    has_mock_seed = "mock_seed" in route
+    has_classifier = "classifier" in route
+
+    # Preserve the strict direct-construction contract for ambiguous input:
+    # the Pydantic compatibility validator rejects a top-level seed combined
+    # with an explicit classifier instead of silently choosing one.
+    if has_mock_seed and has_classifier:
+        return
+
+    prefix = "llm_ensemble.four_tier_mapping"
+    if legacy_schema:
+        route["schema_version"] = _FIXED_FOUR_TIER_SCHEMA
+        builder.changes.append(
+            f"{prefix}.schema_version: {schema_version} -> {_FIXED_FOUR_TIER_SCHEMA}"
+        )
+
+        if schema_version == "fixed-four-tier-v2-mock-v1":
+            tiers = route.get("tiers")
+            if isinstance(tiers, dict):
+                for tier, deployment_version in _FIXED_FOUR_TIER_DEPLOYMENT_VERSIONS.items():
+                    deployment = tiers.get(tier)
+                    if not isinstance(deployment, dict) or "deployment_version" in deployment:
+                        continue
+                    deployment["deployment_version"] = deployment_version
+                    builder.changes.append(
+                        f"{prefix}.tiers.{tier}.deployment_version: added "
+                        f"{deployment_version}"
+                    )
+
+        if "max_session_states" in route:
+            route.pop("max_session_states")
+            builder.removed_fields.append(f"{prefix}.max_session_states")
+
+    if has_mock_seed:
+        seed = route.pop("mock_seed")
+        classifier: dict[str, Any] = {"backend": "random_mock"}
+        if seed is not None:
+            classifier["seed"] = seed
+        route["classifier"] = classifier
+        builder.changes.append(f"{prefix}.mock_seed -> {prefix}.classifier.seed")
+        builder.removed_fields.append(f"{prefix}.mock_seed")
+    elif legacy_schema and not has_classifier:
+        route["classifier"] = {"backend": "random_mock"}
+        builder.changes.append(f"{prefix}.classifier: initialized random_mock")
+
+
 def _migrate_v1_llm_ensemble_legacy_timeouts(builder: _MigrationBuilder) -> None:
     """Version 1: bump matching legacy llm_ensemble timeout defaults to 3600s."""
     llm_ensemble = builder.payload.get("llm_ensemble")
@@ -637,11 +713,38 @@ def _migrate_v1_llm_ensemble_legacy_timeouts(builder: _MigrationBuilder) -> None
             )
 
 
+def _migrate_v2_explicit_fixed_four_tier_classifier(builder: _MigrationBuilder) -> None:
+    """Preserve selection-only configs accepted before classifier was required.
+
+    New v2/direct configurations fail closed unless they name a classifier.
+    A v0/v1 file that previously enabled four-tier mapping without a subtree,
+    however, already meant the historical random backend. Materialize that
+    meaning once so upgrading does not turn a formerly valid file into a boot
+    failure while still making the unsafe choice visible on disk.
+    """
+
+    llm_ensemble = builder.payload.get("llm_ensemble")
+    if not isinstance(llm_ensemble, dict):
+        return
+    if llm_ensemble.get("selection_mode") != "four_tier_mapping":
+        return
+    if "four_tier_mapping" in llm_ensemble:
+        return
+    llm_ensemble["four_tier_mapping"] = {
+        "schema_version": _FIXED_FOUR_TIER_SCHEMA,
+        "classifier": {"backend": "random_mock"},
+    }
+    builder.changes.append(
+        "llm_ensemble.four_tier_mapping: materialized explicit legacy random_mock"
+    )
+
+
 # One-time value migrations, walked in ascending version order. An entry with
 # version N runs only when the payload's config_version stamp is below N.
 # Keep versions strictly increasing and cap them at LATEST_CONFIG_VERSION.
 _MIGRATIONS: list[tuple[int, Callable[[_MigrationBuilder], None]]] = [
     (1, _migrate_v1_llm_ensemble_legacy_timeouts),
+    (2, _migrate_v2_explicit_fixed_four_tier_classifier),
 ]
 
 

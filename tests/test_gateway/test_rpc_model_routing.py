@@ -185,6 +185,9 @@ def test_fixed_four_tier_snapshot_is_an_independent_ensemble_strategy() -> None:
             "enabled": True,
             "mode": "single",
             "selection_mode": "four_tier_mapping",
+            "four_tier_mapping": {
+                "classifier": {"backend": "random_mock"},
+            },
         },
         squilla_router={"enabled": False, "rollout_phase": "observe"},
     )
@@ -210,6 +213,9 @@ def test_live_switch_to_fixed_four_tier_disables_only_legacy_router_dependency()
             "enabled": True,
             "mode": "single",
             "selection_mode": "four_tier_mapping",
+            "four_tier_mapping": {
+                "classifier": {"backend": "random_mock"},
+            },
         },
         squilla_router={"enabled": True, "rollout_phase": "prompt_only"},
     )

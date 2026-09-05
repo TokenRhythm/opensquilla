@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+import opensquilla.session.storage as storage_module
 from opensquilla.engine.routing.fixed_four_tier_v2 import (
     FixedFourTierV2Router,
     RoutingRequest,
@@ -18,7 +21,7 @@ from opensquilla.session.models import (
     FixedFourTierRequestClaim,
     FixedFourTierState,
 )
-from opensquilla.session.storage import SessionStorage
+from opensquilla.session.storage import FixedFourTierStateConflictError, SessionStorage
 from opensquilla.session.turn_context import turn_context_scope
 from opensquilla.session.usage_ledger import UsageEventCompletion, UsageEventStart
 
@@ -31,13 +34,14 @@ def _claim(
     claimed_at_ms: int,
     lease_expires_at_ms: int,
     input_message_id: str = "input-1",
+    request_id: str = "request-1",
 ) -> FixedFourTierRequestClaim:
     return FixedFourTierRequestClaim(
         claim_id=claim_id,
         session_id=session.session_id,
         session_key=session.session_key,
         session_epoch=session.epoch,
-        request_id="request-1",
+        request_id=request_id,
         execution_id=execution_id,
         input_message_id=input_message_id,
         claimed_at_ms=claimed_at_ms,
@@ -46,11 +50,17 @@ def _claim(
     )
 
 
-def _decision(session: Any, claim: FixedFourTierRequestClaim) -> FixedFourTierDecisionRecord:
+def _decision(
+    session: Any,
+    claim: FixedFourTierRequestClaim,
+    *,
+    route_id: str = "route-1",
+    task_id: str = "task-1",
+) -> FixedFourTierDecisionRecord:
     core_decision, next_state = FixedFourTierV2Router(
         mock_seed=7,
-        route_id_factory=lambda: "route-1",
-        task_id_factory=lambda: "task-1",
+        route_id_factory=lambda: route_id,
+        task_id_factory=lambda: task_id,
         clock_ms=lambda: claim.claimed_at_ms,
     ).decide(
         RoutingRequest(
@@ -65,9 +75,21 @@ def _decision(session: Any, claim: FixedFourTierRequestClaim) -> FixedFourTierDe
     route_trace = core_decision.trace(provider=provider, model=model)
     route_trace.update(
         {
+            "session_id": session.session_id,
+            "session_epoch": session.epoch,
             "claim_id": claim.claim_id,
             "execution_id": claim.execution_id,
+            "session_key_hash": hashlib.sha256(session.session_key.encode("utf-8")).hexdigest(),
+            "input_message_id": claim.input_message_id,
+            "redo_parent_route_id": None,
+            "task_start_input_message_id": next_state.task_start_input_message_id,
+            "state_version_before": None,
+            "state_version_after": None,
             "execution_status": "pending",
+            "response_id": None,
+            "state_committed": False,
+            "reasoning": "max",
+            "deployment_version": "0731",
             "preflight": {"status": "pending"},
             "dispatch": {
                 "physical_request_started": False,
@@ -96,10 +118,28 @@ def _decision(session: Any, claim: FixedFourTierRequestClaim) -> FixedFourTierDe
         context_action=core_decision.context_action,
         selected_provider=provider,
         selected_model=model,
+        reasoning="max",
         deployment_version="0731",
         config_version=core_decision.schema_version,
         route_trace=route_trace,
     )
+
+
+def _committed_trace(
+    trace: dict[str, Any],
+    *,
+    state_version: int,
+) -> dict[str, Any]:
+    preflight = dict(trace.get("preflight") or {})
+    preflight["status"] = "passed"
+    trace.update(
+        {
+            "preflight": preflight,
+            "state_committed": True,
+            "state_version_after": state_version,
+        }
+    )
+    return trace
 
 
 async def test_request_claim_is_atomic_for_concurrent_executions() -> None:
@@ -134,6 +174,68 @@ async def test_request_claim_is_atomic_for_concurrent_executions() -> None:
         loser_view = next(record for acquired, record in results if not acquired)
         assert loser_view.claim_id == winner.claim_id
         assert loser_view.execution_id == winner.execution_id
+    finally:
+        await storage.close()
+
+
+async def test_request_claim_rejects_non_current_schema() -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    try:
+        session = await manager.create("agent:main:fixed-claim-schema")
+        claim = _claim(
+            session,
+            claim_id="claim-schema",
+            execution_id="execution-schema",
+            claimed_at_ms=1_000,
+            lease_expires_at_ms=20_000,
+        )
+        claim.schema_version = 2
+
+        with pytest.raises(ValueError, match="claim must use schema version 1"):
+            await storage.claim_fixed_four_tier_request(claim)
+
+        assert (
+            await storage.reconcile_stale_fixed_four_tier_request(
+                session_id=session.session_id,
+                request_id=claim.request_id,
+                now_ms=1_001,
+            )
+            is None
+        )
+    finally:
+        await storage.close()
+
+
+async def test_request_claim_rejects_forged_lifecycle_fields() -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    try:
+        session = await manager.create("agent:main:fixed-claim-forgery")
+        claim = _claim(
+            session,
+            claim_id="claim-forgery",
+            execution_id="execution-forgery",
+            claimed_at_ms=1_000,
+            lease_expires_at_ms=20_000,
+        )
+        claim.route_id = "forged-route"
+        claim.terminal_at_ms = 999
+        claim.error_code = "forged-error"
+
+        with pytest.raises(ValueError, match="request claim must be pristine"):
+            await storage.claim_fixed_four_tier_request(claim)
+
+        assert (
+            await storage.reconcile_stale_fixed_four_tier_request(
+                session_id=session.session_id,
+                request_id=claim.request_id,
+                now_ms=1_001,
+            )
+            is None
+        )
     finally:
         await storage.close()
 
@@ -192,11 +294,32 @@ async def test_terminal_settlement_persists_actual_identity_usage_and_first_term
         assert (await storage.claim_fixed_four_tier_request(claim))[0] is True
         staged_decision = _decision(session, claim)
         await storage.stage_fixed_four_tier_decision(staged_decision)
+        committed_trace = _committed_trace(staged_decision.route_trace, state_version=1)
+        await storage.commit_fixed_four_tier_decision(
+            route_id=staged_decision.route_id,
+            state=FixedFourTierState(
+                session_id=session.session_id,
+                session_key=session.session_key,
+                session_epoch=session.epoch,
+                version=1,
+                task_id=staged_decision.task_id,
+                tier=staged_decision.final_tier,
+                task_turn_count=staged_decision.task_turn_index + 1,
+                task_start_input_message_id=staged_decision.task_start_input_message_id,
+                last_request_id=staged_decision.request_id,
+                last_route_id=staged_decision.route_id,
+                updated_at_ms=2_000,
+            ),
+            expected_version=None,
+            route_trace=committed_trace,
+            updated_at_ms=2_000,
+        )
         route_trace = {
-            **staged_decision.route_trace,
+            **committed_trace,
             "claim_id": claim.claim_id,
             "execution_id": claim.execution_id,
             "execution_status": "succeeded",
+            "response_id": "response-1",
             "dispatch": {
                 "physical_request_started": True,
                 "physical_request_count": 1,
@@ -258,6 +381,642 @@ async def test_terminal_settlement_persists_actual_identity_usage_and_first_term
         assert claim_view is not None
         assert claim_view.status == "succeeded"
         assert claim_view.terminal_at_ms == 3_000
+    finally:
+        await storage.close()
+
+
+async def test_stage_rejects_row_trace_conflict_before_writing() -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    try:
+        session = await manager.create("agent:main:fixed-stage-trace-conflict")
+        claim = _claim(
+            session,
+            claim_id="claim-stage-trace-conflict",
+            execution_id="execution-stage-trace-conflict",
+            claimed_at_ms=1_000,
+            lease_expires_at_ms=20_000,
+        )
+        assert (await storage.claim_fixed_four_tier_request(claim))[0] is True
+        decision = _decision(session, claim)
+        decision.route_trace["execution_status"] = "failed"
+
+        with pytest.raises(ValueError, match="route trace is incompatible"):
+            await storage.stage_fixed_four_tier_decision(decision)
+
+        assert await storage.get_fixed_four_tier_decision_by_route(decision.route_id) is None
+    finally:
+        await storage.close()
+
+
+async def test_stage_rejects_self_consistent_forged_terminal_lifecycle() -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    try:
+        session = await manager.create("agent:main:fixed-stage-terminal-forgery")
+        claim = _claim(
+            session,
+            claim_id="claim-stage-terminal-forgery",
+            execution_id="execution-stage-terminal-forgery",
+            claimed_at_ms=1_000,
+            lease_expires_at_ms=20_000,
+        )
+        assert (await storage.claim_fixed_four_tier_request(claim))[0] is True
+        decision = _decision(session, claim)
+        decision.preflight_status = "passed"
+        decision.state_committed = True
+        decision.state_version_after = 1
+        decision.execution_status = "succeeded"
+        decision.response_id = "forged-response"
+        decision.route_trace.update(
+            {
+                "preflight": {"status": "passed"},
+                "state_committed": True,
+                "state_version_after": 1,
+                "execution_status": "succeeded",
+                "response_id": "forged-response",
+            }
+        )
+
+        with pytest.raises(
+            FixedFourTierStateConflictError,
+            match="must be pristine",
+        ):
+            await storage.stage_fixed_four_tier_decision(decision)
+
+        assert await storage.get_fixed_four_tier_decision_by_route(decision.route_id) is None
+        assert await storage.get_fixed_four_tier_state(session.session_id) is None
+    finally:
+        await storage.close()
+
+
+async def test_stage_rejects_new_legacy_schema_record() -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    try:
+        session = await manager.create("agent:main:fixed-new-legacy-schema")
+        claim = _claim(
+            session,
+            claim_id="claim-new-legacy-schema",
+            execution_id="execution-new-legacy-schema",
+            claimed_at_ms=1_000,
+            lease_expires_at_ms=20_000,
+        )
+        assert (await storage.claim_fixed_four_tier_request(claim))[0] is True
+        decision = _decision(session, claim)
+        decision.config_version = "fixed-four-tier-v2-mock-v2"
+        decision.route_trace["schema_version"] = "fixed-four-tier-v2-mock-v2"
+        decision.route_trace.pop("classifier_backend")
+        decision.route_trace.pop("classifier_identity")
+
+        with pytest.raises(
+            FixedFourTierStateConflictError,
+            match="must use the current trace schema",
+        ):
+            await storage.stage_fixed_four_tier_decision(decision)
+
+        assert await storage.get_fixed_four_tier_decision_by_route(decision.route_id) is None
+    finally:
+        await storage.close()
+
+
+async def test_commit_rejects_row_trace_conflict_before_state_write() -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    try:
+        session = await manager.create("agent:main:fixed-commit-trace-conflict")
+        claim = _claim(
+            session,
+            claim_id="claim-commit-trace-conflict",
+            execution_id="execution-commit-trace-conflict",
+            claimed_at_ms=1_000,
+            lease_expires_at_ms=20_000,
+        )
+        assert (await storage.claim_fixed_four_tier_request(claim))[0] is True
+        decision = _decision(session, claim)
+        await storage.stage_fixed_four_tier_decision(decision)
+
+        with pytest.raises(ValueError, match="route trace is incompatible"):
+            await storage.commit_fixed_four_tier_decision(
+                route_id=decision.route_id,
+                state=FixedFourTierState(
+                    session_id=session.session_id,
+                    session_key=session.session_key,
+                    session_epoch=session.epoch,
+                    version=1,
+                    task_id=decision.task_id,
+                    tier=decision.final_tier,
+                    task_turn_count=1,
+                    task_start_input_message_id=claim.input_message_id,
+                    last_request_id=claim.request_id,
+                    last_route_id=decision.route_id,
+                    updated_at_ms=1_500,
+                ),
+                expected_version=None,
+                route_trace=decision.route_trace,
+                updated_at_ms=1_500,
+            )
+
+        assert await storage.get_fixed_four_tier_state(session.session_id) is None
+        persisted = await storage.get_fixed_four_tier_decision_by_route(decision.route_id)
+        assert persisted is not None
+        assert persisted.state_committed is False
+        assert persisted.preflight_status == "pending"
+    finally:
+        await storage.close()
+
+
+async def test_commit_binds_decision_prior_version_to_cas_expectation() -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    try:
+        session = await manager.create("agent:main:fixed-prior-version-binding")
+        claim = _claim(
+            session,
+            claim_id="claim-prior-version-binding",
+            execution_id="execution-prior-version-binding",
+            claimed_at_ms=1_000,
+            lease_expires_at_ms=20_000,
+        )
+        assert (await storage.claim_fixed_four_tier_request(claim))[0] is True
+        decision = _decision(session, claim)
+        decision.state_version_before = 7
+        decision.route_trace["state_version_before"] = 7
+        await storage.stage_fixed_four_tier_decision(decision)
+
+        with pytest.raises(
+            FixedFourTierStateConflictError,
+            match="inconsistent prior state version",
+        ):
+            await storage.commit_fixed_four_tier_decision(
+                route_id=decision.route_id,
+                state=FixedFourTierState(
+                    session_id=session.session_id,
+                    session_key=session.session_key,
+                    session_epoch=session.epoch,
+                    version=1,
+                    task_id=decision.task_id,
+                    tier=decision.final_tier,
+                    task_turn_count=decision.task_turn_index + 1,
+                    task_start_input_message_id=decision.task_start_input_message_id,
+                    last_request_id=decision.request_id,
+                    last_route_id=decision.route_id,
+                    updated_at_ms=1_500,
+                ),
+                expected_version=None,
+                route_trace=_committed_trace(decision.route_trace, state_version=1),
+                updated_at_ms=1_500,
+            )
+
+        assert await storage.get_fixed_four_tier_state(session.session_id) is None
+    finally:
+        await storage.close()
+
+
+async def test_commit_rejects_non_current_state_schema() -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    try:
+        session = await manager.create("agent:main:fixed-state-schema")
+        claim = _claim(
+            session,
+            claim_id="claim-state-schema",
+            execution_id="execution-state-schema",
+            claimed_at_ms=1_000,
+            lease_expires_at_ms=20_000,
+        )
+        assert (await storage.claim_fixed_four_tier_request(claim))[0] is True
+        decision = _decision(session, claim)
+        await storage.stage_fixed_four_tier_decision(decision)
+        state = FixedFourTierState(
+            session_id=session.session_id,
+            session_key=session.session_key,
+            session_epoch=session.epoch,
+            version=1,
+            task_id=decision.task_id,
+            tier=decision.final_tier,
+            task_turn_count=decision.task_turn_index + 1,
+            task_start_input_message_id=decision.task_start_input_message_id,
+            last_request_id=decision.request_id,
+            last_route_id=decision.route_id,
+            updated_at_ms=1_500,
+            schema_version=2,
+        )
+
+        with pytest.raises(
+            FixedFourTierStateConflictError,
+            match="task state must use schema version 1",
+        ):
+            await storage.commit_fixed_four_tier_decision(
+                route_id=decision.route_id,
+                state=state,
+                expected_version=None,
+                route_trace=_committed_trace(decision.route_trace, state_version=1),
+                updated_at_ms=1_500,
+            )
+
+        assert await storage.get_fixed_four_tier_state(session.session_id) is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        ("task_id", "wrong-task"),
+        ("tier", "wrong-tier"),
+        ("task_turn_count", 99),
+        ("task_start_input_message_id", "wrong-task-start"),
+        ("last_request_id", "wrong-request"),
+        ("last_route_id", "wrong-route"),
+    ],
+)
+async def test_commit_binds_authoritative_state_to_staged_decision(
+    field_name: str,
+    invalid_value: Any,
+) -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    try:
+        session = await manager.create(f"agent:main:fixed-state-binding-{field_name}")
+        claim = _claim(
+            session,
+            claim_id=f"claim-state-binding-{field_name}",
+            execution_id=f"execution-state-binding-{field_name}",
+            claimed_at_ms=1_000,
+            lease_expires_at_ms=20_000,
+        )
+        assert (await storage.claim_fixed_four_tier_request(claim))[0] is True
+        decision = _decision(session, claim)
+        await storage.stage_fixed_four_tier_decision(decision)
+        valid_state = FixedFourTierState(
+            session_id=session.session_id,
+            session_key=session.session_key,
+            session_epoch=session.epoch,
+            version=1,
+            task_id=decision.task_id,
+            tier=decision.final_tier,
+            task_turn_count=decision.task_turn_index + 1,
+            task_start_input_message_id=decision.task_start_input_message_id,
+            last_request_id=decision.request_id,
+            last_route_id=decision.route_id,
+            updated_at_ms=1_500,
+        )
+        invalid_state = valid_state.model_copy(update={field_name: invalid_value})
+
+        with pytest.raises(
+            FixedFourTierStateConflictError,
+            match="next task state conflicts with its decision",
+        ):
+            await storage.commit_fixed_four_tier_decision(
+                route_id=decision.route_id,
+                state=invalid_state,
+                expected_version=None,
+                route_trace=_committed_trace(decision.route_trace, state_version=1),
+                updated_at_ms=1_500,
+            )
+
+        assert await storage.get_fixed_four_tier_state(session.session_id) is None
+    finally:
+        await storage.close()
+
+
+async def test_settle_rejects_row_trace_conflict_before_terminal_write() -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    try:
+        session = await manager.create("agent:main:fixed-settle-trace-conflict")
+        claim = _claim(
+            session,
+            claim_id="claim-settle-trace-conflict",
+            execution_id="execution-settle-trace-conflict",
+            claimed_at_ms=1_000,
+            lease_expires_at_ms=20_000,
+        )
+        assert (await storage.claim_fixed_four_tier_request(claim))[0] is True
+        decision = _decision(session, claim)
+        await storage.stage_fixed_four_tier_decision(decision)
+
+        with pytest.raises(ValueError, match="route trace is incompatible"):
+            await storage.settle_fixed_four_tier_decision(
+                route_id=decision.route_id,
+                execution_status="failed",
+                preflight_status="failed",
+                error_code="terminal-failure",
+                route_trace={
+                    **decision.route_trace,
+                    "preflight": {"status": "failed"},
+                },
+                updated_at_ms=2_000,
+            )
+
+        persisted = await storage.get_fixed_four_tier_decision_by_route(decision.route_id)
+        assert persisted is not None
+        assert persisted.execution_status == "pending"
+        assert persisted.error_code is None
+    finally:
+        await storage.close()
+
+
+async def test_settle_rejects_success_before_task_state_commit() -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    try:
+        session = await manager.create("agent:main:fixed-premature-success")
+        claim = _claim(
+            session,
+            claim_id="claim-premature-success",
+            execution_id="execution-premature-success",
+            claimed_at_ms=1_000,
+            lease_expires_at_ms=20_000,
+        )
+        assert (await storage.claim_fixed_four_tier_request(claim))[0] is True
+        decision = _decision(session, claim)
+        await storage.stage_fixed_four_tier_decision(decision)
+        premature_trace = {
+            **decision.route_trace,
+            "preflight": {"status": "failed"},
+            "execution_status": "succeeded",
+            "response_id": "premature-response",
+        }
+
+        with pytest.raises(
+            FixedFourTierStateConflictError,
+            match="cannot succeed before task state commit",
+        ):
+            await storage.settle_fixed_four_tier_decision(
+                route_id=decision.route_id,
+                execution_status="succeeded",
+                preflight_status="failed",
+                response_id="premature-response",
+                route_trace=premature_trace,
+                updated_at_ms=2_000,
+            )
+
+        persisted = await storage.get_fixed_four_tier_decision_by_route(decision.route_id)
+        assert persisted is not None
+        assert persisted.execution_status == "pending"
+        assert persisted.state_committed is False
+    finally:
+        await storage.close()
+
+
+async def test_decision_settlement_cannot_conflict_with_terminal_claim() -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    try:
+        session = await manager.create("agent:main:fixed-terminal-claim-conflict")
+        claim = _claim(
+            session,
+            claim_id="claim-terminal-conflict",
+            execution_id="execution-terminal-conflict",
+            claimed_at_ms=1_000,
+            lease_expires_at_ms=20_000,
+        )
+        assert (await storage.claim_fixed_four_tier_request(claim))[0] is True
+        decision = _decision(session, claim)
+        await storage.stage_fixed_four_tier_decision(decision)
+        committed_trace = _committed_trace(decision.route_trace, state_version=1)
+        await storage.commit_fixed_four_tier_decision(
+            route_id=decision.route_id,
+            state=FixedFourTierState(
+                session_id=session.session_id,
+                session_key=session.session_key,
+                session_epoch=session.epoch,
+                version=1,
+                task_id=decision.task_id,
+                tier=decision.final_tier,
+                task_turn_count=decision.task_turn_index + 1,
+                task_start_input_message_id=decision.task_start_input_message_id,
+                last_request_id=decision.request_id,
+                last_route_id=decision.route_id,
+                updated_at_ms=1_500,
+            ),
+            expected_version=None,
+            route_trace=committed_trace,
+            updated_at_ms=1_500,
+        )
+        assert await storage.settle_fixed_four_tier_request_claim(
+            claim_id=claim.claim_id,
+            execution_status="failed",
+            error_code="claim-failed-first",
+            updated_at_ms=1_600,
+        )
+
+        with pytest.raises(
+            FixedFourTierStateConflictError,
+            match="no active request claim",
+        ):
+            await storage.settle_fixed_four_tier_decision(
+                route_id=decision.route_id,
+                execution_status="succeeded",
+                response_id="late-response",
+                route_trace={
+                    **committed_trace,
+                    "execution_status": "succeeded",
+                    "response_id": "late-response",
+                },
+                updated_at_ms=1_700,
+            )
+
+        persisted = await storage.get_fixed_four_tier_decision_by_route(decision.route_id)
+        assert persisted is not None
+        assert persisted.execution_status == "pending"
+        claim_view = await storage.reconcile_stale_fixed_four_tier_request(
+            session_id=session.session_id,
+            request_id=claim.request_id,
+            now_ms=1_800,
+        )
+        assert claim_view is not None
+        assert claim_view.status == "failed"
+    finally:
+        await storage.close()
+
+
+async def test_pending_settlement_cannot_persist_partial_execution_evidence() -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    try:
+        session = await manager.create("agent:main:fixed-pending-partial")
+        claim = _claim(
+            session,
+            claim_id="claim-pending-partial",
+            execution_id="execution-pending-partial",
+            claimed_at_ms=1_000,
+            lease_expires_at_ms=2_000,
+        )
+        assert (await storage.claim_fixed_four_tier_request(claim))[0] is True
+        decision = _decision(session, claim)
+        await storage.stage_fixed_four_tier_decision(decision)
+        partial_trace = {
+            **decision.route_trace,
+            "executed_provider": "openrouter",
+            "executed_model": "deepseek/deepseek-v4-flash",
+            "dispatch": {
+                "physical_request_started": True,
+                "physical_request_count": 1,
+                "executed_provider": "openrouter",
+                "executed_model": "deepseek/deepseek-v4-flash",
+            },
+        }
+
+        with pytest.raises(
+            FixedFourTierStateConflictError,
+            match="pending four_tier_mapping settlement cannot mutate",
+        ):
+            await storage.settle_fixed_four_tier_decision(
+                route_id=decision.route_id,
+                execution_status="pending",
+                route_trace=partial_trace,
+                updated_at_ms=1_500,
+            )
+
+        restored = await storage.get_fixed_four_tier_decision_by_route(decision.route_id)
+        assert restored is not None
+        assert restored.executed_provider is None
+        assert restored.executed_model is None
+    finally:
+        await storage.close()
+
+
+async def test_recent_decisions_are_bounded_committed_session_epoch_history() -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    try:
+        session = await manager.create("agent:main:fixed-recent-history")
+        other_session = await manager.create("agent:main:fixed-recent-history-other")
+        state_versions: dict[str, int] = {}
+
+        async def record(
+            owner: Any,
+            *,
+            label: str,
+            decided_at_ms: int,
+            committed: bool = True,
+        ) -> FixedFourTierDecisionRecord:
+            claim = _claim(
+                owner,
+                claim_id=f"claim-{label}",
+                execution_id=f"execution-{label}",
+                request_id=f"request-{label}",
+                input_message_id=f"input-{label}",
+                claimed_at_ms=decided_at_ms,
+                lease_expires_at_ms=10_000,
+            )
+            assert (await storage.claim_fixed_four_tier_request(claim))[0] is True
+            decision = _decision(
+                owner,
+                claim,
+                route_id=f"route-{label}",
+                task_id=f"task-{owner.session_id}",
+            )
+            expected_version = state_versions.get(owner.session_id)
+            decision.state_version_before = expected_version
+            decision.route_trace["state_version_before"] = expected_version
+            await storage.stage_fixed_four_tier_decision(decision)
+            if not committed:
+                return decision
+
+            next_version = (expected_version or 0) + 1
+            await storage.commit_fixed_four_tier_decision(
+                route_id=decision.route_id,
+                state=FixedFourTierState(
+                    session_id=owner.session_id,
+                    session_key=owner.session_key,
+                    session_epoch=owner.epoch,
+                    version=next_version,
+                    task_id=decision.task_id,
+                    tier=decision.final_tier,
+                    task_turn_count=decision.task_turn_index + 1,
+                    task_start_input_message_id=decision.input_message_id,
+                    last_request_id=decision.request_id,
+                    last_route_id=decision.route_id,
+                    updated_at_ms=decided_at_ms + 1,
+                ),
+                expected_version=expected_version,
+                route_trace=_committed_trace(
+                    decision.route_trace,
+                    state_version=next_version,
+                ),
+                updated_at_ms=decided_at_ms + 1,
+            )
+            state_versions[owner.session_id] = next_version
+            return decision
+
+        for label, decided_at_ms in (
+            ("below-since", 999),
+            ("at-since", 1_000),
+            ("one", 1_100),
+            ("two", 1_200),
+            ("three", 1_300),
+            ("four", 1_400),
+            ("five", 1_500),
+            ("at-before", 2_000),
+            ("above-before", 2_001),
+        ):
+            await record(session, label=label, decided_at_ms=decided_at_ms)
+        await record(
+            session,
+            label="staged",
+            decided_at_ms=1_450,
+            committed=False,
+        )
+        await record(other_session, label="other-session", decided_at_ms=1_475)
+
+        recent = await manager.list_recent_fixed_four_tier_decisions(
+            session_id=session.session_id,
+            session_epoch=session.epoch,
+            since_ms=1_000,
+            before_ms=2_000,
+        )
+
+        assert [decision.route_id for decision in recent] == [
+            "route-two",
+            "route-three",
+            "route-four",
+            "route-five",
+            "route-at-before",
+        ]
+        assert [decision.decided_at_ms for decision in recent] == sorted(
+            decision.decided_at_ms for decision in recent
+        )
+        assert len(recent) == 5
+
+        lower_boundary = await manager.list_recent_fixed_four_tier_decisions(
+            session_id=session.session_id,
+            session_epoch=session.epoch,
+            since_ms=1_000,
+            before_ms=1_001,
+        )
+        assert [decision.route_id for decision in lower_boundary] == ["route-at-since"]
+
+        same_millisecond_boundary = await manager.list_recent_fixed_four_tier_decisions(
+            session_id=session.session_id,
+            session_epoch=session.epoch,
+            since_ms=2_000,
+            before_ms=2_000,
+        )
+        assert [decision.route_id for decision in same_millisecond_boundary] == ["route-at-before"]
+
+        wrong_epoch = await manager.list_recent_fixed_four_tier_decisions(
+            session_id=session.session_id,
+            session_epoch=session.epoch + 1,
+            since_ms=1_000,
+            before_ms=2_000,
+        )
+        assert wrong_epoch == []
     finally:
         await storage.close()
 
@@ -334,6 +1093,173 @@ async def test_claim_terminal_retry_is_an_immutable_idempotent_noop() -> None:
         await storage.close()
 
 
+async def test_claim_only_settlement_cannot_claim_success() -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    try:
+        session = await manager.create("agent:main:fixed-claim-success-forgery")
+        claim = _claim(
+            session,
+            claim_id="claim-success-forgery",
+            execution_id="execution-success-forgery",
+            claimed_at_ms=1_000,
+            lease_expires_at_ms=20_000,
+        )
+        assert (await storage.claim_fixed_four_tier_request(claim))[0] is True
+
+        with pytest.raises(ValueError, match="claim terminal status"):
+            await storage.settle_fixed_four_tier_request_claim(
+                claim_id=claim.claim_id,
+                execution_status="succeeded",
+                updated_at_ms=2_000,
+            )
+
+        restored = await storage.reconcile_stale_fixed_four_tier_request(
+            session_id=session.session_id,
+            request_id=claim.request_id,
+            now_ms=2_001,
+        )
+        assert restored is not None
+        assert restored.status == "claimed"
+    finally:
+        await storage.close()
+
+
+async def test_terminal_claim_reconciliation_keeps_decision_trace_consistent() -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    try:
+        session = await manager.create("agent:main:fixed-terminal-claim-reconcile")
+        claim = _claim(
+            session,
+            claim_id="claim-terminal-reconcile",
+            execution_id="execution-terminal-reconcile",
+            claimed_at_ms=1_000,
+            lease_expires_at_ms=20_000,
+        )
+        assert (await storage.claim_fixed_four_tier_request(claim))[0] is True
+        decision = _decision(session, claim)
+        await storage.stage_fixed_four_tier_decision(decision)
+        assert await storage.settle_fixed_four_tier_request_claim(
+            claim_id=claim.claim_id,
+            execution_status="failed",
+            error_code="claim-failed",
+            updated_at_ms=2_000,
+        )
+
+        await storage.reconcile_stale_fixed_four_tier_request(
+            session_id=session.session_id,
+            request_id=claim.request_id,
+            now_ms=2_001,
+        )
+        restored = await storage.get_fixed_four_tier_decision_by_route(decision.route_id)
+
+        assert restored is not None
+        assert restored.execution_status == "failed"
+        assert restored.preflight_status == "failed"
+        assert restored.error_code == "claim-failed"
+        assert restored.route_trace["execution_status"] == "failed"
+        assert restored.route_trace["preflight"]["status"] == "failed"
+        assert restored.route_trace["error_code"] == "claim-failed"
+    finally:
+        await storage.close()
+
+
+async def test_terminal_claim_reconciliation_rejects_cross_bound_identity() -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    try:
+        session = await manager.create("agent:main:fixed-terminal-cross-binding")
+        claim = _claim(
+            session,
+            claim_id="claim-terminal-cross-binding",
+            execution_id="execution-terminal-cross-binding",
+            claimed_at_ms=1_000,
+            lease_expires_at_ms=20_000,
+        )
+        assert (await storage.claim_fixed_four_tier_request(claim))[0] is True
+        decision = _decision(session, claim)
+        await storage.stage_fixed_four_tier_decision(decision)
+        assert await storage.settle_fixed_four_tier_request_claim(
+            claim_id=claim.claim_id,
+            execution_status="failed",
+            error_code="claim-failed",
+            updated_at_ms=2_000,
+        )
+        async with storage._write_transaction("test_corrupt_terminal_claim_identity") as conn:
+            await conn.execute(
+                """
+                UPDATE fixed_four_tier_request_claims
+                SET execution_id = ?
+                WHERE claim_id = ?
+                """,
+                ("execution-owned-by-another-turn", claim.claim_id),
+            )
+
+        with pytest.raises(ValueError, match="does not own its decision: execution_id"):
+            await storage.reconcile_stale_fixed_four_tier_request(
+                session_id=session.session_id,
+                request_id=claim.request_id,
+                now_ms=2_001,
+            )
+
+        restored = await storage.get_fixed_four_tier_decision_by_route(decision.route_id)
+        assert restored is not None
+        assert restored.execution_status == "pending"
+        async with storage.conn.execute(
+            "SELECT status FROM fixed_four_tier_request_claims WHERE claim_id = ?",
+            (claim.claim_id,),
+        ) as cursor:
+            persisted_claim = await cursor.fetchone()
+        assert persisted_claim is not None
+        assert persisted_claim["status"] == "failed"
+    finally:
+        await storage.close()
+
+
+async def test_orphan_reconciliation_records_failed_preflight_consistently() -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    try:
+        session = await manager.create("agent:main:fixed-orphan-reconcile")
+        claim = _claim(
+            session,
+            claim_id="claim-orphan-reconcile",
+            execution_id="execution-orphan-reconcile",
+            claimed_at_ms=1_000,
+            lease_expires_at_ms=20_000,
+        )
+        assert (await storage.claim_fixed_four_tier_request(claim))[0] is True
+        decision = _decision(session, claim)
+        await storage.stage_fixed_four_tier_decision(decision)
+        async with storage._write_transaction("test_delete_route_claim") as conn:
+            await conn.execute(
+                "DELETE FROM fixed_four_tier_request_claims WHERE claim_id = ?",
+                (claim.claim_id,),
+            )
+
+        await storage.reconcile_stale_fixed_four_tier_request(
+            session_id=session.session_id,
+            request_id=claim.request_id,
+            now_ms=2_000,
+        )
+        restored = await storage.get_fixed_four_tier_decision_by_route(decision.route_id)
+
+        assert restored is not None
+        assert restored.execution_status == "failed"
+        assert restored.preflight_status == "failed"
+        assert restored.state_committed is False
+        assert restored.error_code == "execution_claim_missing"
+        assert restored.route_trace["execution_status"] == "failed"
+        assert restored.route_trace["preflight"]["status"] == "failed"
+    finally:
+        await storage.close()
+
+
 async def test_crash_reconcile_recovers_response_actual_identity_usage_and_cost() -> None:
     storage = SessionStorage(":memory:")
     await storage.connect()
@@ -372,7 +1298,7 @@ async def test_crash_reconcile_recovers_response_actual_identity_usage_and_cost(
                 updated_at_ms=1_500,
             ),
             expected_version=None,
-            route_trace=decision.route_trace,
+            route_trace=_committed_trace(decision.route_trace, state_version=1),
             updated_at_ms=1_500,
         )
         await storage.start_usage_event(
@@ -663,13 +1589,62 @@ async def test_restart_reconciles_crashed_pending_execution(tmp_path: Path) -> N
 @pytest.mark.parametrize(
     "trace_patch",
     [
-        {"schema_version": "unknown"},
-        {"route_id": "different-route"},
+        pytest.param({"schema_version": "unknown"}, id="incompatible-schema"),
+        pytest.param({"route_id": "different-route"}, id="route-id"),
+        pytest.param({"session_id": "different-session"}, id="session-id"),
+        pytest.param({"session_epoch": 2}, id="session-epoch"),
+        pytest.param({"claim_id": "different-claim"}, id="claim-id"),
+        pytest.param({"execution_id": "different-execution"}, id="execution-id"),
+        pytest.param({"session_key_hash": "0" * 64}, id="session-key-hash"),
+        pytest.param({"input_message_id": "different-input"}, id="input-message-id"),
+        pytest.param(
+            {"task_start_input_message_id": "different-task-start"},
+            id="task-start-input-message-id",
+        ),
+        pytest.param({"redo_parent_route_id": "different-parent"}, id="redo-parent-route-id"),
+        pytest.param({"state_version_before": 7}, id="state-version-before"),
+        pytest.param({"provider": "different-provider"}, id="selected-provider"),
+        pytest.param({"model": "different-model"}, id="selected-model"),
+        pytest.param({"reasoning": "thinking"}, id="reasoning"),
+        pytest.param({"deployment_version": "different-deployment"}, id="deployment-version"),
+        pytest.param({"execution_status": "failed"}, id="execution-status"),
+        pytest.param({"state_committed": False}, id="state-committed"),
+        pytest.param({"state_version_after": 2}, id="state-version-after"),
+        pytest.param({"response_id": "different-response"}, id="response-id"),
+        pytest.param({"error_code": "different-error"}, id="error-code"),
+        pytest.param({"executed_provider": "different-provider"}, id="executed-provider"),
+        pytest.param({"executed_model": "different-model"}, id="executed-model"),
+        pytest.param(
+            {"executed_deployment_version": "different-deployment"},
+            id="executed-deployment-version",
+        ),
+        pytest.param({"provider_usage": {"input_tokens": 1}}, id="provider-usage"),
+        pytest.param({"preflight": {"status": "failed"}}, id="preflight-status"),
+        pytest.param("session_id", id="missing-session-id"),
+        pytest.param("session_epoch", id="missing-session-epoch"),
+        pytest.param("claim_id", id="missing-claim-id"),
+        pytest.param("execution_id", id="missing-execution-id"),
+        pytest.param("session_key_hash", id="missing-session-key-hash"),
+        pytest.param("input_message_id", id="missing-input-message-id"),
+        pytest.param(
+            "task_start_input_message_id",
+            id="missing-task-start-input-message-id",
+        ),
+        pytest.param("redo_parent_route_id", id="missing-redo-parent-route-id"),
+        pytest.param("state_version_before", id="missing-state-version-before"),
+        pytest.param("provider", id="missing-selected-provider"),
+        pytest.param("model", id="missing-selected-model"),
+        pytest.param("reasoning", id="missing-reasoning"),
+        pytest.param("deployment_version", id="missing-deployment-version"),
+        pytest.param("execution_status", id="missing-execution-status"),
+        pytest.param("state_committed", id="missing-state-committed"),
+        pytest.param("response_id", id="missing-response-id"),
+        pytest.param("state_version_after", id="missing-state-version-after"),
+        pytest.param("preflight", id="missing-preflight"),
     ],
-    ids=["incompatible-schema", "mismatched-row-identity"],
 )
 async def test_fixed_route_getters_fail_closed_on_incompatible_persisted_trace(
-    trace_patch: dict[str, Any],
+    trace_patch: dict[str, Any] | str,
 ) -> None:
     storage = SessionStorage(":memory:")
     await storage.connect()
@@ -702,11 +1677,15 @@ async def test_fixed_route_getters_fail_closed_on_incompatible_persisted_trace(
                 updated_at_ms=1_500,
             ),
             expected_version=None,
-            route_trace=decision.route_trace,
+            route_trace=_committed_trace(decision.route_trace, state_version=1),
             updated_at_ms=1_500,
         )
 
-        incompatible_trace = {**decision.route_trace, **trace_patch}
+        incompatible_trace = dict(decision.route_trace)
+        if isinstance(trace_patch, str):
+            incompatible_trace.pop(trace_patch)
+        else:
+            incompatible_trace.update(trace_patch)
         async with storage._write_transaction("test_corrupt_fixed_route_trace") as conn:
             await conn.execute(
                 "UPDATE fixed_four_tier_decisions SET route_trace = ? WHERE route_id = ?",
@@ -726,6 +1705,276 @@ async def test_fixed_route_getters_fail_closed_on_incompatible_persisted_trace(
                 session_id=session.session_id,
                 input_message_id=claim.input_message_id,
             )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.parametrize(
+    "column",
+    [
+        "route_id",
+        "request_id",
+        "task_id",
+        "decided_at_ms",
+        "intent",
+        "tier",
+        "previous_tier",
+        "final_tier",
+        "task_turn_index",
+        "context_action",
+        "config_version",
+        "schema_version",
+        "session_id",
+        "session_key",
+        "session_epoch",
+        "claim_id",
+        "execution_id",
+        "input_message_id",
+        "task_start_input_message_id",
+        "redo_parent_route_id",
+        "state_version_before",
+        "selected_provider",
+        "selected_model",
+        "reasoning",
+        "deployment_version",
+        "state_version_after",
+        "preflight_status",
+        "state_committed",
+        "execution_status",
+        "response_id",
+        "error_code",
+        "executed_provider",
+        "executed_model",
+        "executed_deployment_version",
+        "usage_summary",
+    ],
+)
+async def test_fixed_route_replay_rejects_tampered_duplicate_semantic_column(
+    column: str,
+) -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    try:
+        session = await manager.create("agent:main:fixed-corrupt-row-semantics")
+        claim = _claim(
+            session,
+            claim_id="claim-corrupt-row-semantics",
+            execution_id="execution-corrupt-row-semantics",
+            claimed_at_ms=1_000,
+            lease_expires_at_ms=20_000,
+        )
+        assert (await storage.claim_fixed_four_tier_request(claim))[0] is True
+        decision = _decision(session, claim)
+        await storage.stage_fixed_four_tier_decision(decision)
+        await storage.commit_fixed_four_tier_decision(
+            route_id=decision.route_id,
+            state=FixedFourTierState(
+                session_id=session.session_id,
+                session_key=session.session_key,
+                session_epoch=session.epoch,
+                version=1,
+                task_id=decision.task_id,
+                tier=decision.final_tier,
+                task_turn_count=1,
+                task_start_input_message_id=claim.input_message_id,
+                last_request_id=claim.request_id,
+                last_route_id=decision.route_id,
+                updated_at_ms=1_500,
+            ),
+            expected_version=None,
+            route_trace=_committed_trace(decision.route_trace, state_version=1),
+            updated_at_ms=1_500,
+        )
+
+        if column == "route_id":
+            tampered_value: Any = "route-row-tampered"
+        elif column == "request_id":
+            tampered_value = "request-row-tampered"
+        elif column == "task_id":
+            tampered_value = "task-row-tampered"
+        elif column == "decided_at_ms":
+            tampered_value = decision.decided_at_ms + 1
+        elif column == "intent":
+            tampered_value = {**decision.intent, "version": "tampered-intent-version"}
+        elif column == "tier":
+            tampered_value = {**decision.tier, "version": "tampered-tier-version"}
+        elif column == "previous_tier":
+            tampered_value = "c0"
+        elif column == "final_tier":
+            tampered_value = "c1" if decision.final_tier != "c1" else "c2"
+        elif column == "task_turn_index":
+            tampered_value = decision.task_turn_index + 1
+        elif column == "context_action":
+            tampered_value = "keep" if decision.context_action == "reset" else "reset"
+        elif column == "config_version":
+            tampered_value = "tampered-config-version"
+        elif column == "schema_version":
+            tampered_value = 2
+        elif column == "session_id":
+            tampered_value = "session-row-tampered"
+        elif column == "session_key":
+            tampered_value = "agent:main:fixed-row-tampered"
+        elif column == "session_epoch":
+            tampered_value = session.epoch + 1
+        elif column == "claim_id":
+            tampered_value = "claim-row-tampered"
+        elif column == "execution_id":
+            tampered_value = "execution-row-tampered"
+        elif column == "input_message_id":
+            tampered_value = "input-row-tampered"
+        elif column == "task_start_input_message_id":
+            tampered_value = "task-start-row-tampered"
+        elif column == "redo_parent_route_id":
+            tampered_value = "redo-parent-row-tampered"
+        elif column == "state_version_before":
+            tampered_value = 7
+        elif column == "selected_provider":
+            tampered_value = "provider-row-tampered"
+        elif column == "selected_model":
+            tampered_value = "model-row-tampered"
+        elif column == "reasoning":
+            tampered_value = "thinking"
+        elif column == "deployment_version":
+            tampered_value = "deployment-row-tampered"
+        elif column == "state_version_after":
+            tampered_value = 2
+        elif column == "preflight_status":
+            tampered_value = "failed"
+        elif column == "state_committed":
+            tampered_value = 0
+        elif column == "execution_status":
+            tampered_value = "failed"
+        elif column == "response_id":
+            tampered_value = "response-row-tampered"
+        elif column == "error_code":
+            tampered_value = "error-row-tampered"
+        elif column == "executed_provider":
+            tampered_value = "executed-provider-row-tampered"
+        elif column == "executed_model":
+            tampered_value = "executed-model-row-tampered"
+        elif column == "executed_deployment_version":
+            tampered_value = "executed-deployment-row-tampered"
+        else:
+            tampered_value = {"input_tokens": 1}
+        sqlite_value = (
+            json.dumps(tampered_value) if isinstance(tampered_value, dict) else tampered_value
+        )
+        async with storage._write_transaction("test_corrupt_fixed_route_row") as conn:
+            await conn.execute(
+                f"UPDATE fixed_four_tier_decisions SET {column} = ? WHERE route_id = ?",
+                (sqlite_value, decision.route_id),
+            )
+
+        persisted_route_id = str(tampered_value) if column == "route_id" else decision.route_id
+        error = "persisted four_tier_mapping route trace is incompatible"
+        with pytest.raises(ValueError, match=error):
+            await storage.get_fixed_four_tier_decision_by_route(persisted_route_id)
+        if column == "state_committed":
+            history = await manager.list_recent_fixed_four_tier_decisions(
+                session_id=(str(tampered_value) if column == "session_id" else session.session_id),
+                session_epoch=(int(tampered_value) if column == "session_epoch" else session.epoch),
+                since_ms=0,
+                before_ms=2_000,
+            )
+            assert history == []
+        else:
+            with pytest.raises(ValueError, match=error):
+                await manager.list_recent_fixed_four_tier_decisions(
+                    session_id=(
+                        str(tampered_value) if column == "session_id" else session.session_id
+                    ),
+                    session_epoch=(
+                        int(tampered_value) if column == "session_epoch" else session.epoch
+                    ),
+                    since_ms=0,
+                    before_ms=2_000,
+                )
+    finally:
+        await storage.close()
+
+
+async def test_fixed_route_replay_accepts_legacy_mock_v2_trace_with_matching_row() -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    try:
+        session = await manager.create("agent:main:fixed-legacy-row-trace")
+        claim = _claim(
+            session,
+            claim_id="claim-legacy-row-trace",
+            execution_id="execution-legacy-row-trace",
+            claimed_at_ms=1_000,
+            lease_expires_at_ms=20_000,
+        )
+        assert (await storage.claim_fixed_four_tier_request(claim))[0] is True
+        decision = _decision(session, claim)
+        await storage.stage_fixed_four_tier_decision(decision)
+        committed_trace = _committed_trace(decision.route_trace, state_version=1)
+        await storage.commit_fixed_four_tier_decision(
+            route_id=decision.route_id,
+            state=FixedFourTierState(
+                session_id=session.session_id,
+                session_key=session.session_key,
+                session_epoch=session.epoch,
+                version=1,
+                task_id=decision.task_id,
+                tier=decision.final_tier,
+                task_turn_count=1,
+                task_start_input_message_id=claim.input_message_id,
+                last_request_id=claim.request_id,
+                last_route_id=decision.route_id,
+                updated_at_ms=1_500,
+            ),
+            expected_version=None,
+            route_trace=committed_trace,
+            updated_at_ms=1_500,
+        )
+        legacy_trace = dict(committed_trace)
+        legacy_trace["schema_version"] = "fixed-four-tier-v2-mock-v2"
+        legacy_trace.pop("classifier_backend")
+        legacy_trace.pop("classifier_identity")
+        for field_name in (
+            "session_id",
+            "session_epoch",
+            "claim_id",
+            "execution_id",
+            "session_key_hash",
+            "input_message_id",
+            "task_start_input_message_id",
+            "redo_parent_route_id",
+            "state_version_before",
+            "provider",
+            "model",
+            "reasoning",
+            "deployment_version",
+        ):
+            legacy_trace.pop(field_name)
+        async with storage._write_transaction("test_seed_legacy_fixed_route") as conn:
+            await conn.execute(
+                """
+                UPDATE fixed_four_tier_decisions
+                SET config_version = ?, route_trace = ?
+                WHERE route_id = ?
+                """,
+                (
+                    "fixed-four-tier-v2-mock-v2",
+                    json.dumps(legacy_trace),
+                    decision.route_id,
+                ),
+            )
+
+        restored = await storage.get_fixed_four_tier_decision_by_route(decision.route_id)
+        history = await manager.list_recent_fixed_four_tier_decisions(
+            session_id=session.session_id,
+            session_epoch=session.epoch,
+            since_ms=0,
+            before_ms=2_000,
+        )
+
+        assert restored is not None
+        assert restored.route_trace["schema_version"] == "fixed-four-tier-v2-mock-v2"
+        assert [record.route_id for record in history] == [decision.route_id]
     finally:
         await storage.close()
 
@@ -780,3 +2029,213 @@ async def test_crash_reconciliation_does_not_settle_a_corrupted_pending_trace() 
         assert decision_row["execution_status"] == "pending"
     finally:
         await storage.close()
+
+
+@pytest.mark.parametrize(
+    ("record_field", "trace_field", "invalid_value"),
+    [
+        ("selected_provider", "provider", {"invalid": True}),
+        ("state_version_before", "state_version_before", "7"),
+        ("task_start_input_message_id", "task_start_input_message_id", 7),
+    ],
+)
+async def test_stage_rejects_matching_but_invalid_supplemental_types(
+    record_field: str,
+    trace_field: str,
+    invalid_value: Any,
+) -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    try:
+        session = await manager.create(f"agent:main:fixed-invalid-type-{record_field}")
+        claim = _claim(
+            session,
+            claim_id=f"claim-invalid-type-{record_field}",
+            execution_id=f"execution-invalid-type-{record_field}",
+            claimed_at_ms=1_000,
+            lease_expires_at_ms=20_000,
+        )
+        assert (await storage.claim_fixed_four_tier_request(claim))[0] is True
+        decision = _decision(session, claim)
+        setattr(decision, record_field, invalid_value)
+        decision.route_trace[trace_field] = invalid_value
+
+        with pytest.raises(ValueError, match="invalid field types|route trace is incompatible"):
+            await storage.stage_fixed_four_tier_decision(decision)
+
+        assert await storage.get_fixed_four_tier_decision_by_route(decision.route_id) is None
+    finally:
+        await storage.close()
+
+
+async def test_claim_and_state_commit_strictly_revalidate_mutated_models() -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    try:
+        session = await manager.create("agent:main:fixed-strict-model-revalidation")
+        invalid_claim = _claim(
+            session,
+            claim_id="claim-invalid-schema-bool",
+            execution_id="execution-invalid-schema-bool",
+            claimed_at_ms=1_000,
+            lease_expires_at_ms=20_000,
+        )
+        invalid_claim.schema_version = True  # type: ignore[assignment]
+        with pytest.raises(ValueError, match="invalid field types"):
+            await storage.claim_fixed_four_tier_request(invalid_claim)
+
+        claim = _claim(
+            session,
+            claim_id="claim-invalid-state-bool",
+            execution_id="execution-invalid-state-bool",
+            claimed_at_ms=1_000,
+            lease_expires_at_ms=20_000,
+        )
+        assert (await storage.claim_fixed_four_tier_request(claim))[0] is True
+        decision = _decision(session, claim)
+        await storage.stage_fixed_four_tier_decision(decision)
+        state = FixedFourTierState(
+            session_id=session.session_id,
+            session_key=session.session_key,
+            session_epoch=session.epoch,
+            version=1,
+            task_id=decision.task_id,
+            tier=decision.final_tier,
+            task_turn_count=1,
+            task_start_input_message_id=claim.input_message_id,
+            last_request_id=claim.request_id,
+            last_route_id=decision.route_id,
+            updated_at_ms=1_500,
+        )
+        state.version = True  # type: ignore[assignment]
+        with pytest.raises(ValueError, match="invalid field types"):
+            await storage.commit_fixed_four_tier_decision(
+                route_id=decision.route_id,
+                state=state,
+                expected_version=None,
+                route_trace=_committed_trace(decision.route_trace, state_version=1),
+                updated_at_ms=1_500,
+            )
+    finally:
+        await storage.close()
+
+
+async def test_expired_claim_cannot_settle_another_claims_decision() -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    try:
+        session = await manager.create("agent:main:fixed-cross-claim-recovery")
+        owner_claim = _claim(
+            session,
+            claim_id="claim-owner",
+            execution_id="execution-owner",
+            claimed_at_ms=1_000,
+            lease_expires_at_ms=20_000,
+            request_id="request-owner",
+        )
+        assert (await storage.claim_fixed_four_tier_request(owner_claim))[0] is True
+        owner_decision = _decision(session, owner_claim)
+        await storage.stage_fixed_four_tier_decision(owner_decision)
+
+        foreign_claim = _claim(
+            session,
+            claim_id="claim-foreign",
+            execution_id="execution-foreign",
+            claimed_at_ms=1_000,
+            lease_expires_at_ms=2_000,
+            request_id="request-foreign",
+        )
+        assert (await storage.claim_fixed_four_tier_request(foreign_claim))[0] is True
+        async with storage._write_transaction("test_cross_bind_expired_claim") as conn:
+            await conn.execute(
+                """
+                UPDATE fixed_four_tier_request_claims
+                SET status = 'materialized', route_id = ?
+                WHERE claim_id = ?
+                """,
+                (owner_decision.route_id, foreign_claim.claim_id),
+            )
+
+        foreign_view = await storage.reconcile_stale_fixed_four_tier_request(
+            session_id=session.session_id,
+            request_id=foreign_claim.request_id,
+            now_ms=2_001,
+        )
+        owner_view = await storage.get_fixed_four_tier_decision_by_route(owner_decision.route_id)
+        owner_claim_view = await storage.reconcile_stale_fixed_four_tier_request(
+            session_id=session.session_id,
+            request_id=owner_claim.request_id,
+            now_ms=2_001,
+        )
+
+        assert foreign_view is not None
+        assert foreign_view.status == "failed"
+        assert foreign_view.error_code == "execution_decision_mismatch"
+        assert owner_view is not None
+        assert owner_view.execution_status == "pending"
+        assert owner_view.claim_id == owner_claim.claim_id
+        assert owner_claim_view is not None
+        assert owner_claim_view.status == "materialized"
+    finally:
+        await storage.close()
+
+
+async def test_startup_reconciliation_rolls_back_claim_and_decision_together(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "fixed-route-startup-rollback.db"
+    storage = await SessionStorage.open(str(db_path))
+    manager = SessionManager(storage)
+    session = await manager.create("agent:main:fixed-startup-rollback")
+    claim = _claim(
+        session,
+        claim_id="claim-startup-rollback",
+        execution_id="execution-startup-rollback",
+        claimed_at_ms=1_000,
+        lease_expires_at_ms=2_000,
+    )
+    assert (await storage.claim_fixed_four_tier_request(claim))[0] is True
+    decision = _decision(session, claim)
+    await storage.stage_fixed_four_tier_decision(decision)
+    await storage.close()
+
+    original_validate = storage_module._validate_fixed_four_tier_decision_trace
+    validation_calls = 0
+
+    def fail_prospective_validation(
+        trace: object,
+        *,
+        persisted_row: dict[str, Any],
+    ) -> dict[str, Any]:
+        nonlocal validation_calls
+        validation_calls += 1
+        validated = original_validate(trace, persisted_row=persisted_row)
+        if validation_calls == 2:
+            raise ValueError("forced prospective validation failure")
+        return validated
+
+    monkeypatch.setattr(
+        storage_module,
+        "_validate_fixed_four_tier_decision_trace",
+        fail_prospective_validation,
+    )
+    restarted = SessionStorage(str(db_path))
+    with pytest.raises(ValueError, match="forced prospective validation failure"):
+        await restarted.connect()
+    await restarted.close()
+
+    with sqlite3.connect(db_path) as raw_conn:
+        claim_status = raw_conn.execute(
+            "SELECT status FROM fixed_four_tier_request_claims WHERE claim_id = ?",
+            (claim.claim_id,),
+        ).fetchone()
+        decision_status = raw_conn.execute(
+            "SELECT execution_status FROM fixed_four_tier_decisions WHERE route_id = ?",
+            (decision.route_id,),
+        ).fetchone()
+    assert claim_status == ("materialized",)
+    assert decision_status == ("pending",)

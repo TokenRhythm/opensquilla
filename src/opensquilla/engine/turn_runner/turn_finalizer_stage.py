@@ -281,6 +281,7 @@ def _turn_usage_payload(
         "reasoning_tokens": int(done_event.reasoning_tokens or 0),
         "cached_tokens": int(done_event.cached_tokens or 0),
         "cache_write_tokens": int(done_event.cache_write_tokens or 0),
+        "duration_ms": max(0, int(getattr(done_event, "duration_ms", 0) or 0)),
         "cost_usd": float(done_event.cost_usd or 0.0),
         "billed_cost": float(done_event.billed_cost or 0.0),
         "cost_source": done_event.cost_source or "none",

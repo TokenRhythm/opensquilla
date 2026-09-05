@@ -4,12 +4,43 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from opensquilla.gateway.boot import GatewayServer, ServiceContainer
 from opensquilla.gateway.config import GatewayConfig
+
+
+@pytest.mark.asyncio
+async def test_service_close_drains_turn_runner_before_session_storage() -> None:
+    call_order: list[str] = []
+
+    class RecordingTurnRunner:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            call_order.append("turn_runner.aclose")
+
+    class RecordingStorage:
+        async def close(self) -> None:
+            call_order.append("session_storage.close")
+
+    turn_runner = RecordingTurnRunner()
+    services = ServiceContainer(
+        config=GatewayConfig(),
+        turn_runner=turn_runner,
+        session_manager=SimpleNamespace(storage=RecordingStorage()),
+    )
+
+    await services.close()
+    await services.close()
+
+    assert call_order[:2] == ["turn_runner.aclose", "session_storage.close"]
+    assert turn_runner.close_calls == 1
 
 
 @pytest.mark.asyncio

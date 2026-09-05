@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import sqlite3
 import time
 from collections.abc import AsyncIterator
@@ -90,6 +92,9 @@ async def _open_fork_stack(
                         "enabled": True,
                         "mode": "single",
                         "selection_mode": "four_tier_mapping",
+                        "four_tier_mapping": {
+                            "classifier": {"backend": "random_mock"},
+                        },
                     }
                 }
                 if fixed_four_tier_v2
@@ -219,7 +224,26 @@ async def _seed_fixed_redo_parent(
         provider="openrouter",
         model="deepseek/deepseek-v4-flash",
     )
-    route_trace["state_committed"] = False
+    route_trace.update(
+        {
+            "session_id": parent.session_id,
+            "session_epoch": parent.epoch,
+            "claim_id": claim_id,
+            "execution_id": "execution-parent",
+            "session_key_hash": hashlib.sha256(parent.session_key.encode("utf-8")).hexdigest(),
+            "input_message_id": anchor.message_id,
+            "redo_parent_route_id": None,
+            "task_start_input_message_id": next_state.task_start_input_message_id,
+            "state_version_before": None,
+            "state_version_after": None,
+            "execution_status": "pending",
+            "response_id": None,
+            "state_committed": False,
+            "reasoning": "max",
+            "deployment_version": "0731",
+            "preflight": {"status": "pending"},
+        }
+    )
     await stack.storage.stage_fixed_four_tier_decision(
         FixedFourTierDecisionRecord(
             route_id=core_decision.route_id,
@@ -240,13 +264,22 @@ async def _seed_fixed_redo_parent(
             context_action=core_decision.context_action,
             selected_provider="openrouter",
             selected_model="deepseek/deepseek-v4-flash",
+            reasoning="max",
+            deployment_version="0731",
             config_version=core_decision.schema_version,
             route_trace=route_trace,
             decided_at_ms=core_decision.decided_at_ms,
             updated_at_ms=now_ms + 1,
         )
     )
+    persisted_trace = route_trace
     if state_committed:
+        persisted_trace = {
+            **route_trace,
+            "state_committed": True,
+            "state_version_after": 1,
+            "preflight": {"status": "passed"},
+        }
         await stack.storage.commit_fixed_four_tier_decision(
             route_id=route_id,
             state=FixedFourTierState(
@@ -263,26 +296,33 @@ async def _seed_fixed_redo_parent(
                 updated_at_ms=now_ms + 2,
             ),
             expected_version=None,
-            route_trace={**route_trace, "state_committed": trace_committed},
+            route_trace=persisted_trace,
             updated_at_ms=now_ms + 2,
         )
     if execution_status != "pending":
+        terminal_trace = {
+            **persisted_trace,
+            "execution_status": execution_status,
+            "response_id": "response-parent",
+        }
+        if not state_committed:
+            terminal_trace["preflight"] = {"status": "failed"}
         await stack.storage.settle_fixed_four_tier_decision(
             route_id=route_id,
             execution_status=execution_status,
             preflight_status="failed" if not state_committed else None,
             response_id="response-parent",
-            route_trace=(
-                {
-                    **route_trace,
-                    "state_committed": False,
-                    "preflight": {"status": "failed"},
-                }
-                if not state_committed
-                else None
-            ),
+            route_trace=terminal_trace,
             updated_at_ms=now_ms + 3,
         )
+        persisted_trace = terminal_trace
+    if state_committed and not trace_committed:
+        corrupted_trace = {**persisted_trace, "state_committed": False}
+        async with stack.storage._write_transaction("test_corrupt_parent_route_trace") as conn:
+            await conn.execute(
+                "UPDATE fixed_four_tier_decisions SET route_trace = ? WHERE route_id = ?",
+                (json.dumps(corrupted_trace), route_id),
+            )
     return anchor.message_id
 
 

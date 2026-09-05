@@ -1943,10 +1943,23 @@ async def _handle_sessions_send(
                     retryable=False,
                     accepted=False,
                 )
-            parent_route = await storage.get_fixed_four_tier_decision_by_input_message(
-                session_id=parent_session_id,
-                input_message_id=fork_before_message_id,
-            )
+            try:
+                parent_route = await storage.get_fixed_four_tier_decision_by_input_message(
+                    session_id=parent_session_id,
+                    input_message_id=fork_before_message_id,
+                )
+            except ValueError as exc:
+                log.error(
+                    "four_tier_mapping.redo_parent_route_incompatible",
+                    session_id=parent_session_id,
+                    input_message_id=fork_before_message_id,
+                )
+                raise RpcHandlerError(
+                    "FOUR_TIER_MAPPING_REDO_ROUTE_UNAVAILABLE",
+                    "four_tier_mapping redo anchor has an incompatible route record",
+                    retryable=False,
+                    accepted=False,
+                ) from exc
             parent_route_trace = (
                 getattr(parent_route, "route_trace", None) if parent_route is not None else None
             )
