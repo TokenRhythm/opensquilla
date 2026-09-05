@@ -1,3 +1,4 @@
+import { loadContractValidators } from '../../../scripts/contracts/gateway_contract_verification.mjs'
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 
@@ -14,27 +15,27 @@ interface FixtureDocument {
   }>
 }
 
-const historyValidators = await import('./generated/v4/chatHistoryValidators.mjs') as {
+const historyValidators = await loadContractValidators('chat.history') as {
   validateChatHistoryRequestFrame: ContractValidator
   validateChatHistoryResponseFrame: ContractValidator
 }
-const subscribeValidators = await import('./generated/v4/sessionsMessagesSubscribeValidators.mjs') as {
+const subscribeValidators = await loadContractValidators('sessions.messages.subscribe') as {
   validateSessionsMessagesSubscribeRequestFrame: ContractValidator
   validateSessionsMessagesSubscribeResponseFrame: ContractValidator
 }
-const hydrateValidators = await import('./generated/v4/sessionsMessagesHydrateValidators.mjs') as {
+const hydrateValidators = await loadContractValidators('sessions.messages.hydrate') as {
   validateSessionsMessagesHydrateRequestFrame: ContractValidator
   validateSessionsMessagesHydrateResponseFrame: ContractValidator
 }
-const snapshotValidators = await import('./generated/v4/sessionsMessagesSnapshotValidators.mjs') as {
+const snapshotValidators = await loadContractValidators('sessions.messages.snapshot') as {
   validateSessionsMessagesSnapshotRequestFrame: ContractValidator
   validateSessionsMessagesSnapshotResponseFrame: ContractValidator
 }
-const unsubscribeValidators = await import('./generated/v4/sessionsMessagesUnsubscribeValidators.mjs') as {
+const unsubscribeValidators = await loadContractValidators('sessions.messages.unsubscribe') as {
   validateSessionsMessagesUnsubscribeRequestFrame: ContractValidator
   validateSessionsMessagesUnsubscribeResponseFrame: ContractValidator
 }
-const previewValidators = await import('./generated/v4/sessionsPreviewValidators.mjs') as {
+const previewValidators = await loadContractValidators('sessions.preview') as {
   validateSessionsPreviewRequestFrame: ContractValidator
   validateSessionsPreviewResponseFrame: ContractValidator
 }
