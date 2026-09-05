@@ -2320,7 +2320,57 @@ def _windows_with_powershell_proxy_defaults(command: str) -> str:
     return f"{prelude.rstrip(';')}; {command}"
 
 
+def _windows_host_python_process_prelude() -> str:
+    """PowerShell helpers that pass ``python -c`` argv without re-parsing.
+
+    Full Host used to feed the raw command string to ``powershell -Command``,
+    which re-tokenizes and strips/destroys nested quotes around ``-c`` payloads.
+    Standard/Managed already rewrite absolute Python invocations to
+    ``Invoke-OpenSquillaPythonProcess``; Full Host must install the same helper
+    and apply the same rewrite.
+    """
+    return (
+        "function ConvertTo-OpenSquillaNativeArgumentLine { "
+        "param([string[]]$Arguments) "
+        "$quoted = foreach ($arg in $Arguments) { "
+        "$value = [string]$arg; "
+        "if ($value.Length -eq 0) { '\"\"' } "
+        "elseif ($value -notmatch '[\\s\"]') { $value } "
+        "else { '\"' + (($value -replace '\\\\', '\\\\') -replace '\"', '\\\"') + '\"' } "
+        "}; "
+        "$quoted -join ' ' "
+        "}; "
+        "function Invoke-OpenSquillaPythonProcess { "
+        "param([Parameter(Mandatory=$true)][string]$FilePath, [string[]]$Arguments = @()) "
+        "$argumentLine = ConvertTo-OpenSquillaNativeArgumentLine -Arguments $Arguments; "
+        "$psi = New-Object System.Diagnostics.ProcessStartInfo; "
+        "$psi.FileName = $FilePath; "
+        "$psi.Arguments = $argumentLine; "
+        "$psi.WorkingDirectory = (Get-Location).Path; "
+        "$psi.UseShellExecute = $false; "
+        "$psi.RedirectStandardOutput = $true; "
+        "$psi.RedirectStandardError = $true; "
+        "$process = New-Object System.Diagnostics.Process; "
+        "$process.StartInfo = $psi; "
+        "[void]$process.Start(); "
+        "$stdout = $process.StandardOutput.ReadToEnd(); "
+        "$stderr = $process.StandardError.ReadToEnd(); "
+        "$process.WaitForExit(); "
+        "if ($stdout) { [Console]::Out.Write($stdout) }; "
+        "if ($stderr) { [Console]::Error.Write($stderr) }; "
+        "$global:LASTEXITCODE = $process.ExitCode; "
+        "if ($process.ExitCode -ne 0) { "
+        "Write-Error ('Python process exited with code ' + $process.ExitCode) "
+        "} "
+        "}; "
+    )
+
+
 def _windows_direct_powershell_argv(command: str) -> tuple[str, ...]:
+    # Apply the same python/npm/mkdir compat rewrite as Standard/Managed, then
+    # install Invoke-OpenSquillaPythonProcess so rewritten -c argv stays intact.
+    compatible = _windows_powershell_compat_command(command)
+    script = _windows_host_python_process_prelude() + compatible
     return (
         _trusted_windows_powershell_path(),
         "-NoLogo",
@@ -2329,7 +2379,7 @@ def _windows_direct_powershell_argv(command: str) -> tuple[str, ...]:
         "-ExecutionPolicy",
         "Bypass",
         "-Command",
-        _windows_with_powershell_proxy_defaults(command),
+        _windows_with_powershell_proxy_defaults(script),
     )
 
 
