@@ -215,6 +215,7 @@ Gateway-backed chat also supports session and operations commands:
 | `/goal [status\|edit\|pause\|resume\|clear]` | Inspect or manage the current Goal; see [`goal-mode.md`](goal-mode.md). |
 | `/sessions [limit]` | Open a searchable recent-session picker in TUI (table in plain mode). |
 | `/resume [id]` | Open the picker, or resume a specific session. |
+| `/rewind` | Rewind the conversation from an earlier user message into a new session (see below). |
 | `/delete <id>` | Delete a session. |
 | `/usage` | Show aggregate usage. |
 | `/meta` | List MetaSkills. |
@@ -226,6 +227,28 @@ Gateway-backed chat also supports session and operations commands:
 `/models` and `/forget` remain executable compatibility commands, but are hidden
 from the default palette. Use `/model` for session-model selection and
 `/approvals` for the current approval state.
+
+### Rewinding a conversation with `/rewind`
+
+`/rewind` rewinds the active conversation: it creates a new child session whose
+transcript contains everything before a chosen user message, activates that
+session, and preloads the composer with the message text so you can edit and
+resend it. This is the terminal equivalent of the WebUI's edit and regenerate
+actions.
+
+```text
+/rewind        # open the rewind picker listing your user messages
+/rewind 3      # rewind from the 3rd listed user message
+/rewind <id>   # rewind from a specific durable message id
+```
+
+Run `/rewind` with no argument: in the TUI it opens an interactive picker you
+can navigate with the arrow keys and confirm with **Enter** (type to filter by
+ordinal or preview text); in plain mode it prints a numbered table. Assistant
+replies are never rewind points.
+
+The original session is left untouched, so you can always return to it with
+`/resume`.
 
 Standalone chat supports the core commands above, but `/models`, `/meta`, and
 gateway-wide usage or approval commands require gateway mode.

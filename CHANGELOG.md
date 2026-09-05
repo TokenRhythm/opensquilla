@@ -103,11 +103,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   the current credential's declared model entitlements, exposes versioned
   `metadata.published` / `metadata.declared` fields, and reports stale catalog
   state without blocking normal model listing or turns.
-- The Sandbox settings module now covers Safe/Full defaults, versioned file,
-  command and network policies, bounded recursive-delete backups, pinned
-  bundled runtime versions, LAN listening/CIDR controls, and named tokens.
-- Safe availability is now decided by cached live process, filesystem worker,
-  deny-write, and authority-deny-read canaries instead of setup state alone.
+- TUI `/rewind` command rewinds a conversation from an earlier user message:
+  it forks the active session into a new child session that keeps everything
+  before the chosen message, activates it, and preloads the composer with the
+  message text so the user can edit and resend — the terminal equivalent of
+  the WebUI's edit/regenerate actions. Run `/rewind` with no argument to open
+  an interactive picker (arrow keys + Enter, filter by typing) listing the
+  user messages, then pick one to rewind to; `/rewind <#|message-id>` skips
+  the picker. The original session is left untouched.
 
 ### Fixed
 

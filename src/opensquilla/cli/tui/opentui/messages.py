@@ -379,6 +379,7 @@ PYTHON_TO_HOST_TYPES: dict[str, type | None] = {
     "theme.set": None,
     "theme.pick": None,
     "session.pick": None,
+    "rewind.pick": None,
     "approval.request": None,
     "approval.dismiss": ApprovalDismiss,
     "shutdown": None,
