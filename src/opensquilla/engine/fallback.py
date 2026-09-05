@@ -15,7 +15,6 @@ from opensquilla.provider.failures import ProviderFailureKind, classify_provider
 
 _RETRYABLE_FAILURE_KINDS = frozenset(
     {
-        ProviderFailureKind.RATE_LIMITED,
         ProviderFailureKind.PROVIDER_OVERLOADED,
         ProviderFailureKind.TRANSPORT_TRANSIENT,
         ProviderFailureKind.CONTEXT_OVERFLOW,
