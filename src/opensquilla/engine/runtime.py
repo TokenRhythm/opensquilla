@@ -9506,15 +9506,43 @@ class TurnRunner:
                     "missing_fixed_fallback: configure a non-empty fixed/direct "
                     "provider and model before enabling multi-model fusion"
                 )
-            turn.metadata["ensemble_fallback_provider"] = fixed_provider
-            turn.metadata["ensemble_fallback_model"] = fixed_model
+
+            # Attachment admission proves the routed logical deployment before
+            # Ensemble replaces it with the configured fixed baseline. If that
+            # baseline cannot carry the same request, keep the proven routed
+            # single-model path and its capacity-filtered selector fallback.
+            if turn.metadata.get("large_context_capacity_required") is True:
+                from opensquilla.engine.selector_override import (
+                    provider_config_has_request_capacity,
+                )
+
+                if not provider_config_has_request_capacity(
+                    initial_provider_config,
+                    turn.metadata,
+                ):
+                    fixed_baseline_ensemble = False
+                    turn.metadata["ensemble_wrap_skipped_reason"] = (
+                        "fixed_fallback_request_capacity"
+                    )
+                    turn.metadata["ensemble_capacity_bypassed"] = True
+                    log.warning(
+                        "llm_ensemble.wrap_skipped",
+                        reason="fixed_fallback_request_capacity",
+                        provider=fixed_provider,
+                        model=fixed_model,
+                    )
+
+            if fixed_baseline_ensemble:
+                turn.metadata["ensemble_fallback_provider"] = fixed_provider
+                turn.metadata["ensemble_fallback_model"] = fixed_model
 
             # Static/custom plans own their members' reasoning policy.  The
             # tier value remains stored as the reversible single-model draft,
             # but must not leak into the shared plan.  Legacy router_dynamic
             # continues to derive per-member thinking from its tier rows.
             if (
-                selection_mode != ROUTER_DYNAMIC_SELECTION_MODE
+                fixed_baseline_ensemble
+                and selection_mode != ROUTER_DYNAMIC_SELECTION_MODE
                 and turn.metadata.get("thinking_source") == "squilla_router_tier"
             ):
                 turn.metadata.pop("thinking_requested", None)
@@ -9702,7 +9730,7 @@ class TurnRunner:
             record_ensemble_unavailable("missing_primary_provider")
         if (
             provider is not None
-            and (ensemble_globally_enabled or tier_ensemble_mode)
+            and fixed_baseline_ensemble
             and artifact_ensemble_bypass is None
         ):
             from opensquilla.engine.selector_override import (
