@@ -7,7 +7,7 @@ export type IconName =
   | 'send' | 'play' | 'stop' | 'paperclip' | 'plus' | 'share' | 'trash'
   | 'refresh' | 'download' | 'save' | 'menu' | 'moreHorizontal' | 'user' | 'search' | 'eye' | 'eye-off'
   | 'edit' | 'info' | 'settings' | 'gear' | 'gauge' | 'router' | 'regenerate'
-  | 'pencil' | 'fork' | 'listChecks' | 'chevronDown' | 'chevronLeft' | 'chevronRight' | 'arrowUp'
+  | 'pencil' | 'wand' | 'fork' | 'listChecks' | 'chevronDown' | 'chevronLeft' | 'chevronRight' | 'arrowUp'
   | 'expand' | 'collapse'
   | 'panel-left-open' | 'panel-left-close' | 'panel-right-open' | 'panel-right-close'
   | 'sidebar-visible' | 'sidebar-hidden'
@@ -69,6 +69,7 @@ const ICONS: Record<IconName, IconDef> = {
   router:     { path: '<circle cx="7" cy="12" r="3"/><circle cx="17" cy="6" r="2.5"/><circle cx="17" cy="18" r="2.5"/><path d="M9.6 10.5 14.8 7.4"/><path d="M9.6 13.5 14.8 16.6"/>', strokeWidth: 1.7 },
   regenerate: { path: '<path d="M3 12a9 9 0 0 1 15.5-6.36L21 8"/><polyline points="21 3 21 8 16 8"/><path d="M21 12a9 9 0 0 1-15.5 6.36L3 16"/><polyline points="3 21 3 16 8 16"/>', strokeWidth: 1.5 },
   pencil:     { path: '<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4z"/>', strokeWidth: 1.5 },
+  wand:       { path: '<path d="M15 4V2"/><path d="M15 10V8"/><path d="M12 7h2"/><path d="M18 7h2"/><path d="M7 21l9-9"/><path d="M4 3l1.5 1.5"/><path d="M3.5 8H5"/><path d="M5 5.5l1 1"/>', strokeWidth: 1.6 },
   fork:       { path: '<circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9"/><path d="M12 12v3"/>', strokeWidth: 1.5 },
   listChecks: { path: '<path d="m3 7 2 2 4-4"/><path d="m3 17 2 2 4-4"/><path d="M13 6h8"/><path d="M13 12h8"/><path d="M13 18h8"/>', strokeWidth: 1.7 },
   chevronDown:{ path: '<polyline points="6 9 12 15 18 9"/>', strokeWidth: 1.5 },

@@ -4192,6 +4192,11 @@
       "expired": "このメッセージのルーティング記録は期限切れです",
       "failed": "評価を記録できませんでした"
     }
+,
+    "enhancePrompt": {
+      "enhanceLabel": "プロンプトを強化",
+      "emptyHint": "先にメッセージを入力すると強化できます"
+    }
   },
   "shared": {
     "loading": "読み込み中",
