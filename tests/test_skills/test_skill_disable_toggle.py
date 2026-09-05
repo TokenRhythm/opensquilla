@@ -63,6 +63,27 @@ class TestDeterministicGate:
         )
         assert {s.name for s in gated} == {"code-task"}
 
+    def test_drop_reasons_recorded_per_condition(self):
+        ctx = EligibilityContext.auto(disabled_set={"code-task"})
+        drop_reasons: dict[str, str] = {}
+        gated = skills_filter._deterministic_gate(
+            [_skill("code-task"), _skill("git-diff")],
+            available_tools=set(),
+            elig_ctx=ctx,
+            drop_reasons=drop_reasons,
+        )
+        assert {s.name for s in gated} == {"git-diff"}
+        assert drop_reasons == {"code-task": "eligibility_failed"}
+
+    def test_drop_reasons_optional_and_absent_by_default(self):
+        ctx = EligibilityContext.auto(disabled_set={"code-task"})
+        gated = skills_filter._deterministic_gate(
+            [_skill("code-task")], available_tools=set(), elig_ctx=ctx
+        )
+        assert gated == []
+        # No caller-provided dict: behaviour identical to pre-#54 signature.
+        assert skills_filter._deterministic_gate.__defaults__[-1] is None
+
 
 def test_disabled_skill_fails_eligibility():
     spec = _skill("code-task")
