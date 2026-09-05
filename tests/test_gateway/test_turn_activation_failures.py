@@ -3,16 +3,26 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import pytest
 
 from opensquilla.gateway.rpc import get_dispatcher
 from opensquilla.session.models import AgentTaskStatus
-from tests.test_gateway.test_channel_turn_ingress import _accept, _open_stack
+from tests.test_gateway.test_channel_turn_ingress import (
+    _accept,
+    _open_stack,
+)
+from tests.test_gateway.test_channel_turn_ingress import (
+    _seed_idle_active_goal as seed_channel_goal,
+)
 from tests.test_gateway.test_turn_ingress_rpc import (
     CLIENT_REQUEST_ID,
     SESSION_KEY,
     _open_real_stack,
+)
+from tests.test_gateway.test_turn_ingress_rpc import (
+    _seed_idle_active_goal as seed_web_goal,
 )
 
 
@@ -156,3 +166,52 @@ async def test_abort_cleanup_failure_requires_confirmed_reservation_revocation(
         assert compensation_calls == ([task_id] if abort_claimed else [])
         task = await stack.storage.get_agent_task(task_id)
         assert task is not None and task.status == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["web", "channel"])
+@pytest.mark.parametrize("compensation", ["none", "raises", "success"])
+@pytest.mark.parametrize(
+    "prior_status", [None, AgentTaskStatus.SUCCEEDED, AgentTaskStatus.ABANDONED]
+)
+async def test_compensation_preserves_actual_terminal_state_and_accepted_identity(
+    tmp_path, surface, compensation, prior_status
+):
+    async with ingress(tmp_path, surface) as (stack, send):
+        await (seed_web_goal if surface == "web" else seed_channel_goal)(stack)
+
+        async def compensate(context):
+            if compensation == "raises":
+                raise RuntimeError("synthetic compensation failure")
+            if compensation == "success":
+                if prior_status is None:
+                    await stack.storage.update_agent_task(
+                        context["taskId"], status=AgentTaskStatus.ABANDONED,
+                        terminal_reason="activation_failed", finished_at=123,
+                    )
+                return {"status": "paused"}
+            return None
+
+        async def fail_activation(reservation, **_kwargs):
+            if prior_status is not None:
+                await stack.storage.update_agent_task(
+                    reservation.task_id, status=prior_status,
+                    terminal_reason="already_settled", finished_at=123,
+                )
+            raise RuntimeError("synthetic activation failure")
+
+        stack.runtime.set_goal_service(SimpleNamespace(compensate_activation_failure=compensate))
+        stack.runtime.activate = fail_activation
+        task_id, status, replayed = await send()
+        expected = prior_status or (
+            AgentTaskStatus.ABANDONED if compensation == "success" else AgentTaskStatus.FAILED
+        )
+        task = await stack.storage.get_agent_task(task_id)
+        assert task is not None and task.status == expected
+        assert status == task.status and not replayed
+        if prior_status is not None:
+            assert task.terminal_reason == "already_settled"
+            assert task.finished_at == 123
+        replay_id, replay_status, replayed = await send()
+        assert replayed and replay_id == task_id and replay_status == expected
+        assert stack.runtime._reservations_by_session == {}
