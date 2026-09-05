@@ -5,10 +5,8 @@ import {
 } from '@/contracts/generated/v4/routerFeedbackSubmit'
 import { validateResult as validateRouteFeedbackResult } from '@/contracts/generated/v4/routerFeedbackSubmitValidators.mjs'
 import type { RouteFeedback } from '@/modules/routeFeedback'
+import type { RpcRequester as RouteFeedbackTransport } from './privateTransports'
 
-interface RouteFeedbackTransport {
-  request<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T>
-}
 export function createV4RouteFeedback(transport: RouteFeedbackTransport): RouteFeedback {
   return {
     async submit(decisionId, rating) {

@@ -190,6 +190,7 @@ export function collectBoundaryArchitectureViolations({
   const publicDataSource = sourceByRel.get(PUBLIC_DATA_MODULE)
   const publicDataAlias = approvedPublicDataAlias(ts, root, publicDataSource)
   const publicDataSymbol = publicDataAlias ? analysis.symbolAt(publicDataAlias.name) : null
+  const requesterSymbol = analysis.exportedSymbol('src/adapters/gateway/privateTransports.ts', 'RpcRequester')
   if (publicDataSource && !publicDataAlias) {
     failures.push(`${PUBLIC_DATA_MODULE}: only the approved type-only RouteFeedbackResult data projection is allowed.`)
   }
@@ -242,6 +243,10 @@ export function collectBoundaryArchitectureViolations({
       if (origin) return origin
     }
     for (const declaration of symbol.declarations ?? []) {
+      if (ts.isParameter(declaration) && declaration.type) {
+        const [kind] = typeBoundaryKinds(declaration.type, nextSeen)
+        if (kind) return kind
+      }
       if (ts.isVariableDeclaration(declaration) && declaration.initializer) {
         const [kind] = valueBoundaryKinds(declaration.initializer, nextSeen)
         if (kind) return kind
@@ -330,6 +335,11 @@ export function collectBoundaryArchitectureViolations({
     const stateRel = analysis.relForSource(current.getSourceFile())
     const required = stateRel ? requireBoundaryKind(current, stateRel) : null
     if (required) kinds.add(required)
+    if (ts.isPropertyAccessExpression(current) || ts.isElementAccessExpression(current)) {
+      if (valueBoundaryKinds(current.expression, seen).has('private Gateway transport')) {
+        kinds.add('private Gateway transport')
+      }
+    }
     if (ts.isIdentifier(current) || ts.isPropertyAccessExpression(current)) {
       const node = ts.isPropertyAccessExpression(current) ? current.name : current
       const kind = symbolOrigin(rawSymbol(node), seen)
@@ -402,10 +412,16 @@ export function collectBoundaryArchitectureViolations({
       return kinds
     }
     if (ts.isCallExpression(current)) {
+      if (ts.isPropertyAccessExpression(current.expression) && current.expression.name.text === 'bind') {
+        for (const kind of valueBoundaryKinds(current.expression.expression, seen)) kinds.add(kind)
+      }
       const signature = checker.getResolvedSignature(current)
       const declaration = signature?.declaration
       if (declaration?.type) {
         for (const kind of typeBoundaryKinds(declaration.type, seen)) kinds.add(kind)
+      }
+      if (declaration?.body) {
+        for (const kind of functionReturnKinds(declaration, seen)) kinds.add(kind)
       }
       return kinds
     }
@@ -414,8 +430,16 @@ export function collectBoundaryArchitectureViolations({
 
   function functionExposureKinds(node, seen = new Set()) {
     const kinds = new Set()
+    // A typed Adapter factory consumes its one private request dependency.
+    // Return annotations and returned values remain subject to the export fence.
+    const parameterType = node.parameters?.length === 1 ? node.parameters[0].type : null
+    const injectsRequester = requesterSymbol && ts.isFunctionDeclaration(node)
+      && isGatewayAdapter(analysis.relForSource(node.getSourceFile()) ?? '')
+      && parameterType && ts.isTypeReferenceNode(parameterType)
+      && analysis.canonicalSymbol(rawSymbol(parameterType.typeName)) === requesterSymbol
+      && node.type && ts.isTypeReferenceNode(node.type) && !node.typeParameters?.length
     for (const parameter of node.parameters ?? []) {
-      if (parameter.type) {
+      if (parameter.type && !injectsRequester) {
         for (const kind of typeBoundaryKinds(parameter.type, seen)) kinds.add(kind)
       }
     }
@@ -427,14 +451,22 @@ export function collectBoundaryArchitectureViolations({
         for (const kind of typeBoundaryKinds(parameter.constraint, seen)) kinds.add(kind)
       }
     }
+    for (const kind of functionReturnKinds(node, seen)) kinds.add(kind)
+    return kinds
+  }
+
+  function functionReturnKinds(node, seen) {
+    const kinds = new Set()
+    if (seen.has(node)) return kinds
+    const nextSeen = new Set(seen).add(node)
     if (node.body && !ts.isBlock(node.body)) {
-      for (const kind of valueBoundaryKinds(node.body, seen)) kinds.add(kind)
+      for (const kind of valueBoundaryKinds(node.body, nextSeen)) kinds.add(kind)
       return kinds
     }
     function visit(current) {
       if (ts.isFunctionLike(current) && current !== node) return
       if (ts.isReturnStatement(current) && current.expression) {
-        for (const kind of valueBoundaryKinds(current.expression, seen)) kinds.add(kind)
+        for (const kind of valueBoundaryKinds(current.expression, nextSeen)) kinds.add(kind)
         return
       }
       ts.forEachChild(current, visit)
