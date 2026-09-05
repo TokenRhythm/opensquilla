@@ -173,6 +173,27 @@ dependencies, and runtime policy.
 The media tool family includes image, PDF, and TTS helpers. Availability can
 depend on provider config, optional dependencies, and runtime policy.
 
+Atlas Cloud can back the `tts`, `music_generate`, and `song_generate` tools:
+
+```toml
+[audio]
+enabled = true
+provider = "atlascloud"
+
+[audio.providers.atlascloud]
+api_key_env = "ATLASCLOUD_API_KEY"
+tts_model = "elevenlabs/v3/text-to-speech"
+tts_voice = "hpp4J3VqNfWAUOO0d1Us"
+music_model = "minimax/music-2.6"
+```
+
+The Atlas adapter submits asynchronous audio predictions, polls them to a
+terminal state, and downloads generated audio without forwarding the API key
+to the media host. The Atlas music model does not expose exact duration
+control, so `duration_seconds` is not sent for Atlas requests. ElevenLabs
+remains the provider for transcription, voice search, voice cloning,
+conversion, and dubbing.
+
 Use media helpers when the requested output is naturally a file or asset rather
 than a plain text answer.
 

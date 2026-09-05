@@ -1619,10 +1619,21 @@ class AudioElevenLabsProviderConfig(BaseModel):
     music_output_format: str = "mp3_44100_128"
 
 
+class AudioAtlasCloudProviderConfig(BaseModel):
+    base_url: str = "https://api.atlascloud.ai"
+    api_key: str = ""
+    api_key_env: str = "ATLASCLOUD_API_KEY"
+    tts_model: str = "elevenlabs/v3/text-to-speech"
+    tts_voice: str = "hpp4J3VqNfWAUOO0d1Us"
+    music_model: str = "minimax/music-2.6"
+    music_output_format: str = "mp3_44100_256"
+
+
 class AudioProvidersConfig(BaseModel):
     elevenlabs: AudioElevenLabsProviderConfig = Field(
         default_factory=AudioElevenLabsProviderConfig
     )
+    atlascloud: AudioAtlasCloudProviderConfig = Field(default_factory=AudioAtlasCloudProviderConfig)
 
 
 class AudioTTSConfig(BaseModel):
@@ -1645,6 +1656,7 @@ class AudioConfig(BaseSettings):
     )
 
     enabled: bool = False
+    provider: Literal["elevenlabs", "atlascloud"] = "elevenlabs"
     tts: AudioTTSConfig = Field(default_factory=AudioTTSConfig)
     providers: AudioProvidersConfig = Field(default_factory=AudioProvidersConfig)
 
@@ -2988,14 +3000,19 @@ class GatewayConfig(BaseSettings):
         # operator explicitly entered the key (recorded by
         # ``clear_runtime_secret``) — an explicit entry must persist even
         # when it coincides with the env value.
-        if "audio.providers.elevenlabs.api_key" not in self._explicit_secret_paths:
-            _delete_env_sourced_secret(
-                data,
-                "audio.providers.elevenlabs.api_key",
-                "audio.providers.elevenlabs.api_key_env",
-                default_env="ELEVENLABS_API_KEY",
-                settings_env="OPENSQUILLA_AUDIO_PROVIDERS__ELEVENLABS__API_KEY",
-            )
+        for provider_id, default_env in (
+            ("elevenlabs", "ELEVENLABS_API_KEY"),
+            ("atlascloud", "ATLASCLOUD_API_KEY"),
+        ):
+            secret_path = f"audio.providers.{provider_id}.api_key"
+            if secret_path not in self._explicit_secret_paths:
+                _delete_env_sourced_secret(
+                    data,
+                    secret_path,
+                    f"audio.providers.{provider_id}.api_key_env",
+                    default_env=default_env,
+                    settings_env=(f"OPENSQUILLA_AUDIO_PROVIDERS__{provider_id.upper()}__API_KEY"),
+                )
         router = data.get("squilla_router")
         if isinstance(router, dict) and router.get("tier_profile"):
             profile = str(router["tier_profile"]).strip().lower()

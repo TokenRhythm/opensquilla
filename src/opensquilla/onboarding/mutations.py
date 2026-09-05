@@ -2091,7 +2091,7 @@ def upsert_audio_provider(
         raise ValueError(
             f"audio provider {provider_id!r} is not runtime-supported and cannot be configured"
         )
-    if provider_id != "elevenlabs":
+    if provider_id not in {"elevenlabs", "atlascloud"}:
         raise ValueError(f"audio provider {provider_id!r} is not supported")
 
     current_provider_cfg = _audio_provider_config(config, provider_id)
@@ -2148,12 +2148,20 @@ def upsert_audio_provider(
             f"audio provider {provider_id!r} requires an api_key or {spec.env_key}"
         )
 
-    effective_tts_voice = tts_voice or config.audio.tts.voice or spec.default_tts_voice
-    effective_tts_model = tts_model or config.audio.tts.model or spec.default_tts_model
-    effective_language_code = language_code or config.audio.tts.language_code
+    same_provider = config.audio.provider == provider_id
+    effective_tts_voice = (
+        tts_voice or (config.audio.tts.voice if same_provider else "") or spec.default_tts_voice
+    )
+    effective_tts_model = (
+        tts_model or (config.audio.tts.model if same_provider else "") or spec.default_tts_model
+    )
+    effective_language_code = language_code or (
+        config.audio.tts.language_code if same_provider else spec.default_language_code
+    )
 
     new_cfg = _clone(config)
     new_cfg.audio.enabled = bool(enabled)
+    new_cfg.audio.provider = cast(Literal["elevenlabs", "atlascloud"], provider_id)
     # Preserve an explicit legacy-client disabled decision even though false
     # equals the schema default and sparse persistence would otherwise omit it.
     new_cfg.mark_force_persist("audio.enabled")
@@ -2161,6 +2169,10 @@ def upsert_audio_provider(
     next_provider_cfg.api_key = effective_api_key
     next_provider_cfg.api_key_env = env_key
     next_provider_cfg.base_url = effective_base_url
+    if hasattr(next_provider_cfg, "tts_voice"):
+        next_provider_cfg.tts_voice = effective_tts_voice
+    if hasattr(next_provider_cfg, "tts_model"):
+        next_provider_cfg.tts_model = effective_tts_model
     if explicit_env_key == spec.env_key and not base_url_allows_credential_reuse(
         spec.default_base_url,
         effective_base_url,

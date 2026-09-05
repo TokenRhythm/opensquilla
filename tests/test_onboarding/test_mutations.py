@@ -3162,6 +3162,21 @@ def test_audio_explicit_enabled_decision_is_force_persisted(tmp_path):
     assert data["audio"]["enabled"] is False
 
 
+def test_upsert_atlascloud_audio_selects_provider_defaults() -> None:
+    res = upsert_audio_provider(
+        GatewayConfig(),
+        provider_id="atlascloud",
+        api_key_env="MY_ATLAS_KEY",
+    )
+
+    assert res.config.audio.enabled is True
+    assert res.config.audio.provider == "atlascloud"
+    assert res.config.audio.providers.atlascloud.api_key_env == "MY_ATLAS_KEY"
+    assert res.config.audio.tts.model == "elevenlabs/v3/text-to-speech"
+    assert res.config.audio.tts.voice == "hpp4J3VqNfWAUOO0d1Us"
+    assert res.public_payload["api_key"] == ""
+
+
 def test_upsert_channel_blank_secret_keeps_stored_value():
     cfg = GatewayConfig()
     res1 = upsert_channel(
