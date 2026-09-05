@@ -108,9 +108,12 @@ def test_video_capability_from_catalog_entry_is_projected(monkeypatch) -> None:
                 supports_video=True,
             )
 
-    monkeypatch.setattr("opensquilla.gateway.rpc_models._catalog", _Catalog())
+    monkeypatch.setattr(
+        "opensquilla.gateway.adapters.provider_configuration._catalog",
+        _Catalog(),
+    )
 
-    row = _model_info_to_wire(_synthetic_model())
+    row = model_info_to_projection(_synthetic_model())
 
     assert "video" in row["capabilities"]
 
