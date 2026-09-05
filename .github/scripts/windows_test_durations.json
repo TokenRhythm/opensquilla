@@ -753,6 +753,7 @@
     "tests/test_gateway/test_terminal_activity.py": 0.01,
     "tests/test_gateway/test_terminal_reply.py": 0.045,
     "tests/test_gateway/test_transcript_attachment_persistence.py": 0.135,
+    "tests/test_gateway/test_turn_activation_failures.py": 0.01,
     "tests/test_gateway/test_turn_admission_composition.py": 0.01,
     "tests/test_gateway/test_turn_committed_sqlite_timing.py": 0.01,
     "tests/test_gateway/test_turn_ingress_fork.py": 2.731,
