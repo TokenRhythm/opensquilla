@@ -4031,3 +4031,65 @@ async def test_chat_send_forwards_client_request_id_into_atomic_acceptance(
             "agent_tasks": 1,
             "turn_ingress_receipts": 1,
         }
+@pytest.mark.asyncio
+@pytest.mark.parametrize("compensation", ["none", "raises", "success"])
+@pytest.mark.parametrize(
+    "prior_status", [None, AgentTaskStatus.SUCCEEDED, AgentTaskStatus.ABANDONED]
+)
+async def test_activation_compensation_preserves_terminal_state_and_accepted_identity(
+    tmp_path: Path, compensation: str, prior_status: AgentTaskStatus | None
+) -> None:
+    async with _open_real_stack(tmp_path / "compensation.sqlite") as stack:
+        await _seed_idle_active_goal(stack)
+
+        async def compensate(context):
+            if compensation == "raises":
+                raise RuntimeError("synthetic compensation failure")
+            if compensation == "success":
+                if prior_status is None:
+                    await stack.storage.update_agent_task(
+                        context["taskId"],
+                        status=AgentTaskStatus.ABANDONED,
+                        terminal_reason="activation_failed",
+                        finished_at=123,
+                    )
+                return {"status": "paused"}
+            return None
+
+        async def fail_activation(reservation, **_kwargs):
+            if prior_status is not None:
+                await stack.storage.update_agent_task(
+                    reservation.task_id,
+                    status=prior_status,
+                    terminal_reason="already_settled",
+                    finished_at=123,
+                )
+            raise RuntimeError("synthetic activation failure")
+
+        stack.runtime.set_goal_service(SimpleNamespace(compensate_activation_failure=compensate))
+        stack.runtime.activate = fail_activation
+        params = {
+            "key": SESSION_KEY,
+            "message": "accepted compensation regression",
+            "clientRequestId": CLIENT_REQUEST_ID,
+        }
+        response = await get_dispatcher().dispatch(
+            "compensation-test", "sessions.send", params, stack.context
+        )
+        expected = prior_status or (
+            AgentTaskStatus.ABANDONED if compensation == "success" else AgentTaskStatus.FAILED
+        )
+        assert response.ok and response.payload["accepted"] is True
+        task_id = response.payload["task_id"]
+        task = await stack.storage.get_agent_task(task_id)
+        assert task is not None and task.status == expected
+        assert response.payload["task_status"] == expected
+        if prior_status is not None:
+            assert task.terminal_reason == "already_settled"
+            assert task.finished_at == 123
+        replay = await get_dispatcher().dispatch(
+            "compensation-replay", "sessions.send", params, stack.context
+        )
+        assert replay.ok and replay.payload["replayed"] is True
+        assert replay.payload["task_id"] == task_id and replay.payload["task_status"] == expected
+        assert stack.runtime._reservations_by_session == {}

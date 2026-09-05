@@ -1248,3 +1248,55 @@ async def test_debounce_registers_user_intent_before_goal_idle_admission(
             with pytest.raises(asyncio.CancelledError):
                 await dispatch
             await coordinator.cancel_all()
+@pytest.mark.asyncio
+@pytest.mark.parametrize("compensation", ["none", "raises", "success"])
+@pytest.mark.parametrize(
+    "prior_status", [None, AgentTaskStatus.SUCCEEDED, AgentTaskStatus.ABANDONED]
+)
+async def test_channel_activation_compensation_returns_the_actual_task_state(
+    tmp_path: Path, compensation: str, prior_status: AgentTaskStatus | None
+) -> None:
+    async with _open_stack(tmp_path / "compensation.sqlite") as stack:
+        await _seed_idle_active_goal(stack)
+
+        async def compensate(context):
+            if compensation == "raises":
+                raise RuntimeError("synthetic compensation failure")
+            if compensation == "success":
+                if prior_status is None:
+                    await stack.storage.update_agent_task(
+                        context["taskId"],
+                        status=AgentTaskStatus.ABANDONED,
+                        terminal_reason="activation_failed",
+                        finished_at=123,
+                    )
+                return {"status": "paused"}
+            return None
+
+        async def fail_activation(reservation, **_kwargs):
+            if prior_status is not None:
+                await stack.storage.update_agent_task(
+                    reservation.task_id,
+                    status=prior_status,
+                    terminal_reason="already_settled",
+                    finished_at=123,
+                )
+            raise RuntimeError("synthetic activation failure")
+
+        stack.runtime.set_goal_service(SimpleNamespace(compensate_activation_failure=compensate))
+        stack.runtime.activate = fail_activation
+        handle, _, _, replayed = await _accept(stack, "accepted compensation regression")
+        expected = prior_status or (
+            AgentTaskStatus.ABANDONED if compensation == "success" else AgentTaskStatus.FAILED
+        )
+        assert handle is not None and not replayed
+        task = await stack.storage.get_agent_task(handle.task_id)
+        assert task is not None and task.status == expected
+        assert handle.status == task.status
+        if prior_status is not None:
+            assert task.terminal_reason == "already_settled"
+            assert task.finished_at == 123
+        duplicate, _, _, replayed = await _accept(stack, "accepted compensation regression")
+        assert replayed and duplicate is not None
+        assert duplicate.task_id == handle.task_id and duplicate.status == expected
+        assert stack.runtime._reservations_by_session == {}
