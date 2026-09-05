@@ -586,6 +586,32 @@ class AnthropicProvider:
         # indices that were never opened at all remain protocol errors.
         non_tool_block_indices: set[Any] = set()
 
+        def _partial_usage_breakdown() -> list[dict[str, Any]]:
+            """Return a usage receipt row when the stream already reported tokens.
+
+            ``message_start`` carries the input-token bill; a mid-stream error
+            (invalid frame, incomplete stream, timeout, ...) must not discard
+            it, or the session ledger records a zero-cost turn even though the
+            provider billed partial input.  Before ``message_start`` nothing
+            billable has been reported, so the row is omitted and the
+            ErrorEvent stays unknown to the ledger (unchanged behavior).
+            """
+            if not message_started:
+                return []
+            return [
+                {
+                    "provider": self.provider_id,
+                    "model": self._model,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "reasoning_tokens": 0,
+                    "cached_tokens": cached_tokens,
+                    "cache_write_tokens": cache_creation_tokens,
+                    "billed_cost": 0.0,
+                    "cost_source": "opensquilla_estimate",
+                }
+            ]
+
         try:
             async with httpx.AsyncClient(
                 timeout=cfg.timeout,
@@ -662,13 +688,18 @@ class AnthropicProvider:
                             yield ErrorEvent(
                                 message=message,
                                 code="invalid_stream_frame",
+                                model_usage_breakdown=_partial_usage_breakdown(),
                             )
                             return
 
                         if not isinstance(event, dict):
                             message = "Anthropic stream contained a non-object data frame"
                             trace.record_error(code="invalid_stream_frame", message=message)
-                            yield ErrorEvent(message=message, code="invalid_stream_frame")
+                            yield ErrorEvent(
+                                message=message,
+                                code="invalid_stream_frame",
+                                model_usage_breakdown=_partial_usage_breakdown(),
+                            )
                             return
                         etype = event.get("type", "")
                         # Error frames may echo the active credential.  They
@@ -685,7 +716,11 @@ class AnthropicProvider:
                         }:
                             message = "Anthropic stream mutated content after message_delta"
                             trace.record_error(code="invalid_stream_order", message=message)
-                            yield ErrorEvent(message=message, code="invalid_stream_order")
+                            yield ErrorEvent(
+                                message=message,
+                                code="invalid_stream_order",
+                                model_usage_breakdown=_partial_usage_breakdown(),
+                            )
                             return
                         if etype in {
                             "content_block_start",
@@ -702,7 +737,11 @@ class AnthropicProvider:
                             if message_started:
                                 message = "Anthropic stream repeated message_start"
                                 trace.record_error(code="invalid_stream_order", message=message)
-                                yield ErrorEvent(message=message, code="invalid_stream_order")
+                                yield ErrorEvent(
+                                    message=message,
+                                    code="invalid_stream_order",
+                                    model_usage_breakdown=_partial_usage_breakdown(),
+                                )
                                 return
                             message_started = True
                             message_id = event.get("message", {}).get("id")
@@ -971,13 +1010,21 @@ class AnthropicProvider:
                                 api_key=self._api_key,
                             )
                             trace.record_error(code=error_code, message=error_message)
-                            yield ErrorEvent(message=error_message, code=error_code)
+                            yield ErrorEvent(
+                                message=error_message,
+                                code=error_code,
+                                model_usage_breakdown=_partial_usage_breakdown(),
+                            )
                             return
 
                     if not message_stopped:
                         message = "Anthropic stream ended before message_stop"
                         trace.record_error(code="incomplete_stream", message=message)
-                        yield ErrorEvent(message=message, code="incomplete_stream")
+                        yield ErrorEvent(
+                            message=message,
+                            code="incomplete_stream",
+                            model_usage_breakdown=_partial_usage_breakdown(),
+                        )
                         return
 
                     pending_tool_calls = tools_acc.pending_raw_arguments()
@@ -990,7 +1037,11 @@ class AnthropicProvider:
                     ):
                         message = "Anthropic response ended with an incomplete tool call"
                         trace.record_error(code="incomplete_tool_call", message=message)
-                        yield ErrorEvent(message=message, code="incomplete_tool_call")
+                        yield ErrorEvent(
+                            message=message,
+                            code="incomplete_tool_call",
+                            model_usage_breakdown=_partial_usage_breakdown(),
+                        )
                         return
 
                     # Tool block completion is provisional until the response
@@ -1063,7 +1114,11 @@ class AnthropicProvider:
                 limit=exc.limit,
                 observed=exc.observed,
             )
-            yield ErrorEvent(message=message, code="candidate_artifact_limit_exceeded")
+            yield ErrorEvent(
+                message=message,
+                code="candidate_artifact_limit_exceeded",
+                model_usage_breakdown=_partial_usage_breakdown(),
+            )
         except httpx.TimeoutException as exc:
             message = redact_upstream_error_text(
                 f"Request timed out: {str(exc) or repr(exc)}",
@@ -1071,7 +1126,11 @@ class AnthropicProvider:
                 max_len=2000,
             )
             trace.record_error(code="timeout", message=message)
-            yield ErrorEvent(message=message, code="timeout")
+            yield ErrorEvent(
+                message=message,
+                code="timeout",
+                model_usage_breakdown=_partial_usage_breakdown(),
+            )
         except httpx.RequestError as exc:
             message = redact_upstream_error_text(
                 f"Request error: {str(exc) or repr(exc)}",
@@ -1079,7 +1138,11 @@ class AnthropicProvider:
                 max_len=2000,
             )
             trace.record_error(code="request_error", message=message)
-            yield ErrorEvent(message=message, code="request_error")
+            yield ErrorEvent(
+                message=message,
+                code="request_error",
+                model_usage_breakdown=_partial_usage_breakdown(),
+            )
         except Exception as exc:  # noqa: BLE001 - chat() contract: ErrorEvent instead of raising
             message = redact_upstream_error_text(
                 f"Provider response handling failed: {str(exc) or repr(exc)}",
@@ -1099,6 +1162,7 @@ class AnthropicProvider:
             yield ErrorEvent(
                 message=message,
                 code="provider_internal",
+                model_usage_breakdown=_partial_usage_breakdown(),
             )
 
     async def list_models(self) -> list[ModelInfo]:
