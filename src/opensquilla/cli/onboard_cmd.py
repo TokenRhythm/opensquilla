@@ -1644,6 +1644,12 @@ def configure_command(
                         "presetId": preset,
                     },
                 )
+                if router:
+                    # An explicit --router is authoritative (the help promises
+                    # recommended | openrouter-mix | disabled); an omitted one
+                    # keeps the stored/synthesized router state untouched on a
+                    # re-save, mirroring the `onboard --provider` contract.
+                    engine.apply("router", {"mode": router})
                 result = engine.persist()
                 _print_saved_path(result.path)
                 _print_restart_guidance(result, config_path)
