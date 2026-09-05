@@ -633,6 +633,55 @@ async def test_rpc_skills_list_exposes_dependency_summary(
 
 
 @pytest.mark.asyncio
+async def test_rpc_skills_exposes_tool_dependency_registration(
+    tmp_path: Path,
+) -> None:
+    _write_skill(
+        tmp_path,
+        "tool-linked",
+        """---
+name: tool-linked
+description: Declares runtime tool dependencies.
+metadata:
+  opensquilla:
+    requires_tools:
+      - ptc_run
+      - read_file
+      - missing_tool
+---
+
+# body
+""",
+    )
+    loader = SkillLoader(bundled_dir=tmp_path, snapshot_path=tmp_path / "snapshot.json")
+
+    class FakeToolRegistry:
+        @staticmethod
+        def list_names() -> list[str]:
+            return ["ptc_run", "read_file"]
+
+    ctx = RpcContext(
+        conn_id="test",
+        skill_loader=loader,
+        tool_registry=FakeToolRegistry(),
+    )
+
+    listed = await rpc_skills._handle_skills_list(None, ctx)
+    row = next(skill for skill in listed["skills"] if skill["name"] == "tool-linked")
+    detail = await rpc_skills._handle_skills_get({"name": "tool-linked"}, ctx)
+
+    expected = [
+        {"name": "ptc_run", "registered": True},
+        {"name": "read_file", "registered": True},
+        {"name": "missing_tool", "registered": False},
+    ]
+    assert row["required_tools"] == ["ptc_run", "read_file", "missing_tool"]
+    assert row["tool_dependencies"] == expected
+    assert detail["required_tools"] == row["required_tools"]
+    assert detail["tool_dependencies"] == expected
+
+
+@pytest.mark.asyncio
 async def test_rpc_skills_status_exposes_dependency_summary_and_legacy_fields(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

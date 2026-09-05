@@ -38,6 +38,28 @@
           </div>
         </div>
 
+        <div v-if="toolDependencies.length" class="sk-detail__section">
+          <div class="sk-detail__section-title">
+            {{ t('cronSkills.skillDetail.toolDependencies', {
+              registered: registeredToolCount,
+              total: toolDependencies.length,
+            }) }}
+          </div>
+          <div class="sk-detail__sub-list">
+            <code
+              v-for="dependency in toolDependencies"
+              :key="dependency.name"
+              class="sk-chip sk-chip--tool"
+              :class="{
+                'sk-chip--ok': dependency.registered === true,
+                'sk-chip--warn': dependency.registered === false,
+                'sk-chip--unverified': dependency.registered === null,
+              }"
+              :title="toolDependencyStatus(dependency.registered)"
+            >{{ dependency.name }}</code>
+          </div>
+        </div>
+
         <div class="sk-detail__section">
           <div class="sk-detail__section-title">{{ t('cronSkills.skillDetail.declaredDependencies') }}</div>
           <div class="sk-detail__dependency-grid">
@@ -252,6 +274,9 @@ const dependencyCounts = computed(() => props.skill
 const installActions = computed(() => props.skill
   ? installActionsForCurrentDependencies(props.skill)
   : [])
+const toolDependencies = computed(() => props.skill?.tool_dependencies || [])
+const registeredToolCount = computed(() => toolDependencies.value
+  .filter(dependency => dependency.registered === true).length)
 const hasDeclaredDependencies = computed(() => {
   const declared = dependencySummary.value.declared
   return declared.python_packages.length > 0
@@ -265,6 +290,12 @@ const hasSubSkillRollup = computed(() => {
   const rollup = dependencySummary.value.sub_skill_dependencies
   return rollup.skills.length > 0 || rollup.missing_references.length > 0
 })
+
+function toolDependencyStatus(registered: boolean | null): string {
+  if (registered === true) return t('cronSkills.skillDetail.toolRegistered')
+  if (registered === false) return t('cronSkills.skillDetail.toolMissing')
+  return t('cronSkills.skillDetail.toolUnknown')
+}
 
 function childAdvisoryCount(summary: ReturnType<typeof skillDependencySummary>): number {
   return summary.inferred.python_imports.length

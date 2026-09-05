@@ -520,6 +520,33 @@ def _provider_check_at_launch(
     )
 
 
+def _registered_tool_names(ctx: RpcContext) -> set[str] | None:
+    """Return live Gateway registry names for dependency diagnostics."""
+    registry = getattr(ctx, "tool_registry", None)
+    if registry is None:
+        return None
+    try:
+        return {str(name) for name in registry.list_names()}
+    except (AttributeError, TypeError):
+        return None
+
+
+def _tool_dependency_rows(
+    spec: Any,
+    registered_tool_names: set[str] | None,
+) -> list[dict[str, Any]]:
+    required_tools = [str(name) for name in getattr(spec, "requires_tools", []) if str(name)]
+    return [
+        {
+            "name": name,
+            "registered": (
+                None if registered_tool_names is None else name in registered_tool_names
+            ),
+        }
+        for name in required_tools
+    ]
+
+
 def _skill_to_dict(
     spec: Any,
     report: EligibilityReport,
@@ -528,6 +555,7 @@ def _skill_to_dict(
     skill_index: dict[str, Any] | None = None,
     loader: SkillLoader | None = None,
     eligibility_ctx: EligibilityContext | None = None,
+    registered_tool_names: set[str] | None = None,
 ) -> dict[str, Any]:
     """Convert a SkillSpec to a dict with eligibility diagnostics.
 
@@ -606,6 +634,8 @@ def _skill_to_dict(
         "install": install_entries,
         "kind": kind,
         "sub_skills": sub_skills,
+        "required_tools": list(getattr(spec, "requires_tools", []) or []),
+        "tool_dependencies": _tool_dependency_rows(spec, registered_tool_names),
         "provider_check_at_launch": _provider_check_at_launch(
             spec,
             skill_index=skill_index,
@@ -726,6 +756,7 @@ def _lifecycle_rows(
     base_skills: list[Any],
     skill_index: dict[str, Any],
     eligibility_ctx: EligibilityContext,
+    registered_tool_names: set[str] | None,
     lockfile_path: Path,
 ) -> list[dict[str, Any]]:
     """Serialize the opt-in lifecycle view without changing default list."""
@@ -805,6 +836,7 @@ def _lifecycle_rows(
                     skill_index=skill_index,
                     loader=loader,
                     eligibility_ctx=eligibility_ctx,
+                    registered_tool_names=registered_tool_names,
                 ),
                 spec,
                 selected=True,
@@ -834,6 +866,7 @@ def _lifecycle_rows(
                 skill_index=skill_index,
                 loader=loader,
                 eligibility_ctx=eligibility_ctx,
+                registered_tool_names=registered_tool_names,
             )
         else:
             row = {
@@ -882,6 +915,7 @@ async def _handle_skills_status(params: dict | None, ctx: RpcContext) -> list[di
         if is_skill_available_live(s.name)
     ]
     skill_index = {skill.name: skill for skill in skills}
+    registered_tool_names = _registered_tool_names(ctx)
     return [
         _skill_to_dict(
             skill,
@@ -890,6 +924,7 @@ async def _handle_skills_status(params: dict | None, ctx: RpcContext) -> list[di
             skill_index=skill_index,
             loader=loader,
             eligibility_ctx=ctx_eligible,
+            registered_tool_names=registered_tool_names,
         )
         for skill in skills
     ]
@@ -907,6 +942,7 @@ async def _list_catalog_skills(
     snapshot = await _catalog_snapshot(loader, reason="rpc.skills.list")
     all_skills = snapshot.skills
     skill_index = {skill.name: skill for skill in all_skills}
+    registered_tool_names = _registered_tool_names(ctx)
     # Operator gate: coding-mode-gated skills (code-task when OFF) stay out.
     skills = [
         skill
@@ -922,6 +958,7 @@ async def _list_catalog_skills(
                 base_skills=skills,
                 skill_index=skill_index,
                 eligibility_ctx=ctx_eligible,
+                registered_tool_names=registered_tool_names,
                 lockfile_path=_management_lockfile_path(ctx),
             ),
         )
@@ -935,6 +972,7 @@ async def _list_catalog_skills(
                 skill_index=skill_index,
                 loader=loader,
                 eligibility_ctx=ctx_eligible,
+                registered_tool_names=registered_tool_names,
             )
             for skill in skills
         ],
@@ -1055,6 +1093,7 @@ async def _get_catalog_skill(
         skill_index=skill_index,
         loader=loader,
         eligibility_ctx=ctx_eligible,
+        registered_tool_names=_registered_tool_names(ctx),
     )
     result["content"] = skill.content
     result["file_path"] = skill.file_path

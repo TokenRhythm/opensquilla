@@ -147,6 +147,11 @@ export interface SkillDependencyInstallOutcome {
   missingStill: SkillInstallMissingStill
 }
 
+export interface SkillToolDependency {
+  name: string
+  registered: boolean | null
+}
+
 export interface Skill {
   name: string
   description?: string
@@ -159,6 +164,8 @@ export interface Skill {
   layer?: string
   kind?: string
   sub_skills?: string[]
+  required_tools?: string[]
+  tool_dependencies?: SkillToolDependency[]
   triggers?: string[]
   missing_bins?: string[]
   missing_env?: string[]
