@@ -12,27 +12,6 @@ const requireFromWebui = createRequire(resolve(repoRoot, 'opensquilla-webui/pack
 const Ajv2020 = requireFromWebui('ajv/dist/2020').default
 const standaloneCode = requireFromWebui('ajv/dist/standalone').default
 
-const schemaPath = process.argv[2]
-if (!schemaPath) throw new Error('usage: generate_gateway_contract_ajv.mjs <schema>')
-const esm = process.argv.includes('--esm')
-
-const schema = JSON.parse(readFileSync(schemaPath, 'utf8'))
-const method = schema['x-opensquilla-method']
-const event = schema['x-opensquilla-event']
-if ((method === undefined) === (event === undefined)) {
-  throw new Error('Contract must declare exactly one method or event metadata block')
-}
-
-const eventTargets = event === undefined
-  ? []
-  : ['frame', 'payload'].filter(role => Object.hasOwn(event, role))
-if (event !== undefined && eventTargets.length !== 1) {
-  throw new Error('event Contract must declare exactly one of frame or payload')
-}
-const targets = method === undefined
-  ? [event[eventTargets[0]]]
-  : [method.request, method.params, method.response, method.result]
-
 function directDefinitionName(reference) {
   const prefix = '#/$defs/'
   if (typeof reference !== 'string' || !reference.startsWith(prefix)) {
@@ -44,14 +23,6 @@ function directDefinitionName(reference) {
   }
   return name
 }
-
-const ajv = new Ajv2020({
-  allErrors: true,
-  strict: true,
-  strictRequired: false,
-  allowUnionTypes: true,
-  code: { esm, source: true, optimize: true },
-})
 
 // AJV 8.17 can emit a CommonJS runtime reference even when standalone
 // generation is configured for ESM (currently this happens for maxLength /
@@ -78,7 +49,7 @@ const ESM_UCS2_LENGTH_SOURCE = `function ${ESM_UCS2_LENGTH}(str) {
 }
 `
 
-function browserSafeEsm(source) {
+function browserSafeEsm(source, esm) {
   if (!esm) return source
   let usedUcs2Length = false
   const normalized = source.replace(
@@ -112,21 +83,69 @@ function collectExtensionKeywords(value, keywords = new Set()) {
   return keywords
 }
 
-for (const keyword of [...collectExtensionKeywords(schema)].sort()) {
-  ajv.addKeyword({ keyword, valid: true })
-}
-ajv.addSchema(schema)
-
-const exports = {}
-for (const reference of targets) {
-  const name = directDefinitionName(reference)
-  const id = `urn:opensquilla:contract:v4:${name}`
-  ajv.addSchema({
-    $id: id,
-    $schema: schema.$schema,
-    $ref: `${schema.$id}${reference}`,
+/** Resolve logical roles without depending on generated filenames or aliases. */
+export function contractTargets(schema, roles) {
+  const method = schema['x-opensquilla-method']
+  const event = schema['x-opensquilla-event']
+  if ((method === undefined) === (event === undefined)) {
+    throw new Error('Contract must declare exactly one method or event metadata block')
+  }
+  const metadata = method ?? event
+  const available = method === undefined
+    ? ['frame', 'payload'].filter(role => Object.hasOwn(event, role))
+    : ['request', 'params', 'response', 'result']
+  if (method === undefined && available.length !== 1) {
+    throw new Error('event Contract must declare exactly one of frame or payload')
+  }
+  if (roles !== undefined && (
+    !Array.isArray(roles) || roles.length === 0 || new Set(roles).size !== roles.length
+    || roles.some(role => !available.includes(role))
+  )) {
+    throw new Error('validator roles must be unique declared Contract roles')
+  }
+  return available.filter(role => roles === undefined || roles.includes(role)).map(role => {
+    const reference = metadata[role]
+    const definition = directDefinitionName(reference)
+    if (!Object.hasOwn(schema.$defs ?? {}, definition)) {
+      throw new Error(`missing validator definition: ${definition}`)
+    }
+    return { role, reference, definition, exportName: `validate${definition}` }
   })
-  exports[`validate${name}`] = id
 }
 
-process.stdout.write(browserSafeEsm(standaloneCode(ajv, exports)))
+/** Compile selected entry points; schema assertions and AJV options stay identical. */
+export function compileContract(schema, { esm = true, roles } = {}) {
+  const targets = contractTargets(schema, roles)
+  const ajv = new Ajv2020({
+    allErrors: true,
+    strict: true,
+    strictRequired: false,
+    allowUnionTypes: true,
+    code: { esm, source: true, optimize: true },
+  })
+  for (const keyword of [...collectExtensionKeywords(schema)].sort()) {
+    ajv.addKeyword({ keyword, valid: true })
+  }
+  ajv.addSchema(schema)
+  const exports = {}
+  for (const { reference, definition, exportName } of targets) {
+    const id = `urn:opensquilla:contract:v4:${definition}`
+    if (Object.hasOwn(exports, exportName)) throw new Error(`duplicate target: ${exportName}`)
+    ajv.addSchema({
+      $id: id,
+      $schema: schema.$schema,
+      $ref: `${schema.$id}${reference}`,
+    })
+    exports[exportName] = id
+  }
+  return browserSafeEsm(standaloneCode(ajv, exports), esm)
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const schemaPath = process.argv[2]
+  if (!schemaPath) throw new Error('usage: generate_gateway_contract_ajv.mjs <schema> [--esm] [--roles result,params]')
+  const rolesIndex = process.argv.indexOf('--roles')
+  const roles = rolesIndex === -1 ? undefined : (process.argv[rolesIndex + 1] ?? '').split(',')
+  const schema = JSON.parse(readFileSync(schemaPath, 'utf8'))
+  process.stdout.write(compileContract(schema, { esm: process.argv.includes('--esm'), roles }))
+}

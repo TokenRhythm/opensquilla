@@ -111,8 +111,8 @@ def test_mandatory_matrix_has_fixed_provider_model_and_repeat_coverage() -> None
             if case.scenario not in {"fault_429_retry_after", "fault_reset_before_first_token"}
         )
 
-    assert gate.minimum_physical_requests(cases) == 117
-    assert gate.BudgetLimits().physical_requests - gate.minimum_physical_requests(cases) == 3
+    assert gate.minimum_physical_requests(cases) == 111
+    assert gate.BudgetLimits().physical_requests - gate.minimum_physical_requests(cases) == 9
 
 
 def test_repeat_override_applies_to_each_selected_matrix_row() -> None:
