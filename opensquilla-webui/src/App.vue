@@ -401,7 +401,9 @@
     </button>
   </nav>
 
-  <ToastHost />
+  <Teleport to="body">
+    <ToastHost />
+  </Teleport>
 
   <ConfirmModal />
 
