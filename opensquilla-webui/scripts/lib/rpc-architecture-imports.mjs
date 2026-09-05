@@ -2,6 +2,56 @@ import { dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 
 import { createRpcAnalysisProgram } from './rpc-typescript-program.mjs'
 
+const PUBLIC_DATA_MODULE = 'src/contracts/publicData.ts'
+const PUBLIC_DATA_SOURCE = 'src/contracts/generated/v4/routerFeedbackSubmit'
+
+/** Approve one explicit data projection, without trusting arbitrary wire aliases. */
+function approvedPublicDataAlias(ts, root, source) {
+  if (!source || source.statements.length !== 2) return null
+  const [declaration, alias] = source.statements
+  if (
+    !ts.isImportDeclaration(declaration)
+    || !declaration.importClause?.isTypeOnly
+    || declaration.importClause.name
+    || !ts.isStringLiteral(declaration.moduleSpecifier)
+    || resolveSourceImport(root, PUBLIC_DATA_MODULE, declaration.moduleSpecifier.text)
+      ?.replace(/\.ts$/, '') !== resolve(root, PUBLIC_DATA_SOURCE)
+    || !ts.isNamedImports(declaration.importClause.namedBindings)
+    || declaration.importClause.namedBindings.elements.length !== 1
+    || !ts.isTypeAliasDeclaration(alias)
+    || alias.name.text !== 'RouteFeedbackResult'
+    || alias.typeParameters?.length
+    || alias.modifiers?.length !== 1
+    || alias.modifiers[0].kind !== ts.SyntaxKind.ExportKeyword
+  ) return null
+  const imported = declaration.importClause.namedBindings.elements[0]
+  if ((imported.propertyName ?? imported.name).text !== 'Result') return null
+  const readonly = alias.type
+  if (
+    !ts.isTypeReferenceNode(readonly)
+    || readonly.typeName.getText(source) !== 'Readonly'
+    || readonly.typeArguments?.length !== 1
+  ) return null
+  const pick = readonly.typeArguments[0]
+  if (
+    !ts.isTypeReferenceNode(pick)
+    || pick.typeName.getText(source) !== 'Pick'
+    || pick.typeArguments?.length !== 2
+  ) return null
+  const [wire, keys] = pick.typeArguments
+  if (
+    !ts.isTypeReferenceNode(wire)
+    || wire.typeName.getText(source) !== imported.name.text
+    || wire.typeArguments?.length
+    || !ts.isUnionTypeNode(keys)
+    || keys.types.length !== 3
+    || !keys.types.every(key => ts.isLiteralTypeNode(key) && ts.isStringLiteral(key.literal))
+  ) return null
+  return keys.types.map(key => key.literal.text).sort().join(',') === 'accepted,reason,recorded'
+    ? alias
+    : null
+}
+
 function normalized(path) {
   return path.replace(/\\/g, '/')
 }
@@ -44,11 +94,16 @@ export function resolveSourceImport(root, importer, specifier) {
   return null
 }
 
-export function generatedContractImportViolation({ root, importer, specifier }) {
+export function generatedContractImportViolation({ root, importer, specifier, typeOnly = false }) {
   const normalizedImporter = normalized(importer)
   const target = resolveSourceImport(root, normalizedImporter, specifier)
   const generatedRoot = resolve(root, 'src/contracts/generated')
   if (!target || !isWithin(generatedRoot, target)) return null
+  if (
+    normalizedImporter === PUBLIC_DATA_MODULE
+    && typeOnly
+    && target.replace(/\.ts$/, '') === resolve(root, PUBLIC_DATA_SOURCE)
+  ) return null
   if (
     isGatewayAdapter(normalizedImporter)
     || isTestFile(normalizedImporter)
@@ -132,6 +187,12 @@ export function collectBoundaryArchitectureViolations({
   const failures = []
   const originBySymbol = new Map()
   const sourceByRel = new Map(analysis.sources.map(entry => [entry.rel, entry.source]))
+  const publicDataSource = sourceByRel.get(PUBLIC_DATA_MODULE)
+  const publicDataAlias = approvedPublicDataAlias(ts, root, publicDataSource)
+  const publicDataSymbol = publicDataAlias ? analysis.symbolAt(publicDataAlias.name) : null
+  if (publicDataSource && !publicDataAlias) {
+    failures.push(`${PUBLIC_DATA_MODULE}: only the approved type-only RouteFeedbackResult data projection is allowed.`)
+  }
 
   function markExportOrigins(rel, kind, only = null) {
     const source = sourceByRel.get(rel)
@@ -169,6 +230,9 @@ export function collectBoundaryArchitectureViolations({
 
   function symbolOrigin(symbol, seen = new Set()) {
     if (!symbol || seen.has(symbol)) return null
+    if (publicDataSymbol && (
+      symbol === publicDataSymbol || analysis.canonicalSymbol(symbol) === publicDataSymbol
+    )) return null
     const nextSeen = new Set(seen).add(symbol)
     const direct = originBySymbol.get(symbol)
     if (direct) return direct
@@ -513,6 +577,7 @@ export function collectBoundaryArchitectureViolations({
     }
 
     for (const statement of source.statements) {
+      if (statement === publicDataAlias) continue
       const isExported = Boolean(ts.getModifiers(statement)?.some(modifier => (
         modifier.kind === ts.SyntaxKind.ExportKeyword
       )))

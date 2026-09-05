@@ -49,6 +49,7 @@ def _observe_request(
                     "params": params,
                 }
             )
+            descriptor.params_model.model_validate({} if params is None else params)
         except ValidationError as exc:
             return _validation_errors(exc)
         return ()

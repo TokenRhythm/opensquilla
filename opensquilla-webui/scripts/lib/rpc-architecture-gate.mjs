@@ -149,8 +149,16 @@ export function evaluateRpcArchitectureGate({ root = defaultRoot } = {}) {
         }
         const generatedFailure = generatedContractImportViolation({
           root, importer: rel, specifier,
+          typeOnly: ts.isImportDeclaration(node) && node.importClause?.isTypeOnly === true,
         })
         if (generatedFailure) failures.push(generatedFailure)
+        if (
+          targetRel === 'src/contracts/publicData'
+          && !((ts.isImportDeclaration(node) && node.importClause?.isTypeOnly)
+            || (ts.isExportDeclaration(node) && node.isTypeOnly))
+        ) {
+          failures.push(`${rel}: public Contract data must be imported or exported with type-only syntax.`)
+        }
         const privateFailure = privateGatewayTransportImportViolation({
           root, importer: rel, specifier,
         })
