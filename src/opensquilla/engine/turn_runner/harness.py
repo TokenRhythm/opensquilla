@@ -870,6 +870,20 @@ class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):
                 "tool_result_projection_max_inline_chars",
                 60_000,
             ),
+            tool_result_history_projection_enabled=bool(
+                getattr(
+                    agent_token_cfg,
+                    "tool_result_history_projection_enabled",
+                    False,
+                )
+            ),
+            tool_result_history_projection_keep_recent_turns=int(
+                getattr(
+                    agent_token_cfg,
+                    "tool_result_history_projection_keep_recent_turns",
+                    3,
+                )
+            ),
             tool_result_fresh_diagnostic_policy_enabled=getattr(
                 agent_token_cfg,
                 "tool_result_fresh_diagnostic_policy_enabled",

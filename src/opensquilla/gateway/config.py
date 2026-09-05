@@ -1406,6 +1406,10 @@ class AgentTokenSavingConfig(BaseSettings):
     tool_result_fresh_diagnostic_inline_max_chars: int = Field(default=64_000, ge=0)
     tool_result_dispatch_max_chars: int = Field(default=0, ge=0)
     tool_result_dispatch_turn_max_chars: int = Field(default=0, ge=0)
+    # Context-waterline projection of oversized historical tool results in
+    # the provider request view. Opt-in: changes the shared turn path.
+    tool_result_history_projection_enabled: bool = Field(default=False)
+    tool_result_history_projection_keep_recent_turns: int = Field(default=3, ge=0)
     tool_result_store_full_trace: bool = Field(default=False)
     tool_result_store_max_bytes: int = Field(default=8 * 1024 * 1024, ge=0)
     tool_result_store_disk_budget_bytes: int = Field(default=256 * 1024 * 1024, ge=0)
@@ -2693,6 +2697,9 @@ class GatewayConfig(BaseSettings):
     context_budget_tokens: int = 100_000
     context_overflow_policy: ContextOverflowPolicy = ContextOverflowPolicy.AUTO_SUMMARIZE
     preflight_compact_ratio: float = Field(default=0.85, gt=0.0, le=1.0)
+    # Advisory context waterline: emit a one-shot system-message alert once
+    # durable history crosses this ratio of the active context window.
+    context_waterline_alert_ratio: float = Field(default=0.70, gt=0.0, le=1.0)
 
     # Agent runtime timeout (whole turn lifecycle). ``None`` means use the
     # long built-in runtime default; ``0`` disables the runtime budget.
