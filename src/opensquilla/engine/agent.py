@@ -6798,6 +6798,67 @@ class Agent:
         )
         last_provider_sequence = -1
 
+        # Optional Rust turn kernel (OSPP_RUST_KERNEL=1): delegate no-tool
+        # turns (without meta resume/replay) to the Rust state machine in
+        # `ospp_core` (built from rust/ospp_core/, driven through the
+        # scripts/ospp_bridge.py dedicated-loop bridge). Off by default;
+        # any failure falls back to the Python path below.
+        _meta = self.config.metadata or {}
+        if (
+            os.environ.get("OSPP_RUST_KERNEL") == "1"
+            and not self.tool_definitions
+            and not _meta.get("meta_resume")
+            and not _meta.get("meta_replay")
+            and not _meta.get("meta_replay_error")
+        ):
+            try:
+                import ospp_core  # noqa: PLC0415
+
+                from opensquilla.engine.types import (  # noqa: PLC0415
+                    AgentState as RustAgentState,
+                )
+                from opensquilla.engine.types import (
+                    DoneEvent as EngineDoneEvent,
+                )
+                from opensquilla.engine.types import (
+                    ErrorEvent as EngineErrorEvent,
+                )
+                from opensquilla.engine.types import (
+                    StateChangeEvent,
+                )
+                from opensquilla.engine.types import (
+                    TextDeltaEvent as EngineTextDeltaEvent,
+                )
+
+                spec = await asyncio.to_thread(ospp_core.run_turn, self.provider, message)
+                for ev in spec["events"]:
+                    kind = ev.get("kind")
+                    if kind == "state_change":
+                        yield StateChangeEvent(
+                            from_state=RustAgentState(ev["from_state"]),
+                            to_state=RustAgentState(ev["to_state"]),
+                        )
+                    elif kind == "text_delta":
+                        yield EngineTextDeltaEvent(
+                            text=ev.get("text", ""),
+                            presentation=ev.get("presentation", "answer"),
+                        )
+                    elif kind == "done":
+                        yield EngineDoneEvent(
+                            text=ev.get("text", ""),
+                            iterations=ev.get("iterations", 0),
+                            input_tokens=ev.get("input_tokens", 0),
+                            output_tokens=ev.get("output_tokens", 0),
+                            model=ev.get("model", ""),
+                        )
+                    elif kind == "error":
+                        yield EngineErrorEvent(
+                            message=ev.get("message", ""), code="rust_kernel"
+                        )
+                return
+            except Exception as exc:  # noqa: BLE001 - fall back to Python kernel
+                logger.warning("rust_kernel.fallback", error=str(exc))
+
         # ------ IDLE → THINKING ------
         yield self._transition(AgentState.THINKING)
 
