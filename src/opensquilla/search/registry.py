@@ -28,6 +28,12 @@ _provider_specs: dict[str, SearchProviderSpec] = {
         env_key="IQS_SEARCH_API_KEY",
         capabilities=frozenset({"web", "freshness", "domain_filter", "content"}),
     ),
+    "serpdive": SearchProviderSpec(
+        provider_id="serpdive",
+        requires_api_key=True,
+        env_key="SERPDIVE_API_KEY",
+        capabilities=frozenset({"web", "content"}),
+    ),
     "tavily": SearchProviderSpec(
         provider_id="tavily",
         requires_api_key=True,

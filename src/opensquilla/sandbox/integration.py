@@ -136,6 +136,7 @@ _SEARCH_PROVIDER_SYSTEM_DOMAINS: dict[str, tuple[str, ...]] = {
     "duckduckgo": ("html.duckduckgo.com",),
     "exa": ("api.exa.ai",),
     "iqs": ("cloud-iqs.aliyuncs.com",),
+    "serpdive": ("api.serpdive.com",),
     "tavily": ("api.tavily.com",),
 }
 

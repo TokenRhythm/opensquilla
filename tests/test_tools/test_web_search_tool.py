@@ -256,7 +256,7 @@ async def test_web_search_benchmark_blocklist_blocks_query_without_calling_core(
         ({"query": 123}, "query must be a non-empty string."),
         (
             {"query": "python release", "provider": "serpapi"},
-            "Invalid provider. Expected one of: auto, bocha, brave, duckduckgo, exa, iqs, tavily.",
+            "Invalid provider. Expected one of: auto, bocha, brave, duckduckgo, exa, iqs, serpdive, tavily.",
         ),
         (
             {"query": "python release", "mode": "invalid"},

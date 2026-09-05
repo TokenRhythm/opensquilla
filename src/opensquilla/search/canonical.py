@@ -226,6 +226,7 @@ def _ensure_builtin_search_providers() -> None:
     for module_name in (
         "opensquilla.search.providers.bocha",
         "opensquilla.search.providers.iqs",
+        "opensquilla.search.providers.serpdive",
         "opensquilla.search.providers.tavily",
         "opensquilla.search.providers.brave",
         "opensquilla.search.providers.exa",

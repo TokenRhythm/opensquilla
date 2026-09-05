@@ -90,7 +90,7 @@ _SEARCH_BENCHMARK_BLOCKLIST_DEFAULT_TERMS = (
 _VALID_SEARCH_MODES: frozenset[str] = frozenset({"auto", "news", "technical", "broad"})
 _VALID_SEARCH_RECENCIES: frozenset[str] = frozenset({"day", "week", "month", "year"})
 _VALID_SEARCH_PROVIDERS: frozenset[str] = frozenset(
-    {"auto", "bocha", "tavily", "brave", "duckduckgo", "exa", "iqs"}
+    {"auto", "bocha", "serpdive", "tavily", "brave", "duckduckgo", "exa", "iqs"}
 )
 
 def _network_http_request(args: Mapping[str, Any]) -> NetworkOperationRequest:
@@ -648,6 +648,7 @@ def _ensure_builtin_search_providers() -> None:
     import opensquilla.search.providers.duckduckgo  # noqa: F401
     import opensquilla.search.providers.exa  # noqa: F401
     import opensquilla.search.providers.iqs  # noqa: F401
+    import opensquilla.search.providers.serpdive  # noqa: F401
     import opensquilla.search.providers.tavily  # noqa: F401
 
 
@@ -1150,7 +1151,7 @@ def _search_error_payload(
         "provider": {
             "type": "string",
             "description": "Optional provider override.",
-            "enum": ["auto", "bocha", "tavily", "brave", "duckduckgo", "exa", "iqs"],
+            "enum": ["auto", "bocha", "serpdive", "tavily", "brave", "duckduckgo", "exa", "iqs"],
         },
     },
     required=["query"],
