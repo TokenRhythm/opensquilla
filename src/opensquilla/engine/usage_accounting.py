@@ -252,11 +252,18 @@ def bind_usage_accounting_scope(scope: UsageAccountingScope | None) -> Iterator[
     if scope is None:
         yield
         return
+    previous = _ACTIVE_USAGE_SCOPE.get()
     token = _ACTIVE_USAGE_SCOPE.set(scope)
     try:
         yield
     finally:
-        _ACTIVE_USAGE_SCOPE.reset(token)
+        try:
+            _ACTIVE_USAGE_SCOPE.reset(token)
+        except ValueError:
+            # Async-generator cleanup can run in a different Context after a
+            # router-control replay interrupt; restore only if we still own it.
+            if _ACTIVE_USAGE_SCOPE.get() is scope:
+                _ACTIVE_USAGE_SCOPE.set(previous)
 
 
 def provider_accounts_physical_usage(provider: object) -> bool:
