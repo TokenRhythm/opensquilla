@@ -23,10 +23,10 @@ import pytest
 from opensquilla.git_runtime import git_run_mode_scope
 from opensquilla.process_tree import task_process_scope
 from opensquilla.run_mode import RunMode
+from opensquilla.runtime_packs.manager import runtime_pack_state_scope
 from opensquilla.sandbox.integration import sandbox_policy_scope
 from opensquilla.sandbox.policy_models import SandboxPolicy as StoredSandboxPolicy
 from opensquilla.skills.toolchains.manager import managed_toolchain_state_scope
-from opensquilla.runtime_packs.manager import runtime_pack_state_scope
 
 
 class _SlowRunEvent:

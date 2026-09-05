@@ -289,11 +289,15 @@ async def run_direct_turn(
         # heartbeat driver's own cleanup, the underlying run generator in the
         # Context that entered its scope stack.
         if "composed_stream" in locals():
-            with contextlib.suppress(Exception):
-                await composed_stream.aclose()
+            stream_to_close: Any | None = composed_stream
         elif "raw_stream" in locals():
+            stream_to_close = raw_stream
+        else:
+            stream_to_close = None
+        close = getattr(stream_to_close, "aclose", None)
+        if close is not None:
             with contextlib.suppress(Exception):
-                await raw_stream.aclose()
+                await close()
         if guest_profile is not None:
             guest_profile.cleanup()
         if "turn_scope" in locals():
