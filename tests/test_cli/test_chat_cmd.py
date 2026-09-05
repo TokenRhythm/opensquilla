@@ -2134,6 +2134,44 @@ async def test_gateway_stream_cancelled_error_aborts_turn(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_gateway_stream_interrupt_tolerates_abort_failure(monkeypatch) -> None:
+    class BrokenAbortGatewayClient(_FakeGatewayClient):
+        async def send_message(self, session_key, message, attachments=None, elevated=None):
+            self.send_calls.append(
+                {
+                    "session_key": session_key,
+                    "message": message,
+                    "attachments": attachments,
+                    "elevated": elevated,
+                }
+            )
+            raise KeyboardInterrupt
+            yield {}
+
+        async def abort_session(self, session_key: str) -> dict[str, object]:
+            self.abort_calls.append(session_key)
+            raise ConnectionError(
+                "Gateway connection lost; restart chat or reconnect before "
+                "sending another command."
+            )
+
+    BrokenAbortGatewayClient.instances = []
+    monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", BrokenAbortGatewayClient)
+    fake = BrokenAbortGatewayClient()
+
+    result = await chat_cmd._stream_response_gateway(
+        fake,
+        "agent:main:abc123",
+        "hello",
+        {"mode": None},
+    )
+
+    assert result.cancelled is True
+    assert fake.abort_calls == ["agent:main:abc123"]
+    assert fake.send_calls[0]["message"] == "hello"
+
+
+@pytest.mark.asyncio
 async def test_gateway_stream_renders_task_group_status_without_buffer_pollution(
     monkeypatch,
 ) -> None:
