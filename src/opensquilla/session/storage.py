@@ -8841,6 +8841,49 @@ class SessionStorage:
                 rows_by_id[task.task_id] = task
         return [rows_by_id[task_id] for task_id in ids if task_id in rows_by_id]
 
+    async def fail_queued_agent_task_activation(
+        self,
+        task_id: str,
+        *,
+        session_key: str,
+        error_class: str,
+        error_message: str,
+    ) -> AgentTaskRecord | None:
+        """Fail an exact accepted task only while its ledger is still queued.
+
+        The caller must first revoke its unactivated runtime reservation. A
+        zero-row update may mean another writer already settled the task; the
+        record returned from this transaction is the authoritative outcome.
+        """
+        session_key = canonicalize_session_key(session_key)
+        timestamp = _now_ms()
+        async with self._write_transaction("fail_queued_agent_task_activation") as conn:
+            await conn.execute(
+                """
+                UPDATE agent_tasks
+                SET status = ?, finished_at = ?, updated_at = ?,
+                    terminal_reason = 'activation_failed', error_class = ?, error_message = ?
+                WHERE task_id = ? AND session_key = ? AND status = ?
+                """,
+                (
+                    AgentTaskStatus.FAILED.value,
+                    timestamp,
+                    timestamp,
+                    error_class,
+                    error_message,
+                    task_id,
+                    session_key,
+                    AgentTaskStatus.QUEUED.value,
+                ),
+            )
+            async with conn.execute(
+                "SELECT * FROM agent_tasks WHERE task_id = ? AND session_key = ?",
+                (task_id, session_key),
+            ) as cur:
+                row = await cur.fetchone()
+            result = AgentTaskRecord(**_deserialize_row(dict(row))) if row is not None else None
+        return result
+
     async def update_agent_task(self, task_id: str, **fields: Any) -> AgentTaskRecord:
         if not fields:
             existing = await self.get_agent_task(task_id)

@@ -23,6 +23,8 @@ export interface RpcTransport {
   readonly generation: number
 }
 
+export type RpcRequester = Pick<RpcTransport, 'request'>
+
 export interface EventTransport {
   subscribe(event: string, handler: TransportEventHandler): TransportSubscription
   supports(event: string): boolean

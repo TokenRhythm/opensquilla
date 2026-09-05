@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from opensquilla.gateway.config_secrets import inherit_runtime_secrets
+from opensquilla.application.config_secrets import inherit_runtime_secrets
 
 if TYPE_CHECKING:
     from opensquilla.onboarding.config_store import CredentialBackupRedaction

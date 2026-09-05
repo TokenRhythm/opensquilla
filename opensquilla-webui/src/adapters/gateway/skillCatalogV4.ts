@@ -234,7 +234,8 @@ export function createV4SkillCatalog(rpc: RpcTransport): SkillCatalog {
       return result as unknown as SkillInstallResult
     },
     async uninstall(request) {
-      const params: SkillsUninstallParams = {
+      // Missing identifiers still reach the Gateway's existing error path.
+      const params: Partial<SkillsUninstallParams> = {
         ...(request.name ? { name: request.name } : {}),
         ...(request.installId ? { installId: request.installId } : {}),
       }
