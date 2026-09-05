@@ -2269,10 +2269,23 @@ async def create_owned_subprocess_exec(*argv: str, **kwargs: Any) -> Any:
     raise ProcessTreeOwnershipError(f"unsupported process-tree platform: {os.name}")
 
 
+def default_command_shell() -> str:
+    """Name the interpreter that runs agent shell commands on this host.
+
+    Windows never sets ``SHELL``, so reading it there yields an empty string.
+    ``create_owned_subprocess_shell`` execs ``COMSPEC`` on Windows, which makes
+    that the honest answer. POSIX keeps reporting the login shell it always has.
+    """
+    if os.name == "nt":
+        return os.environ.get("COMSPEC", "cmd.exe")
+    return os.environ.get("SHELL", "")
+
+
 async def create_owned_subprocess_shell(command: str, **kwargs: Any) -> Any:
     if os.name == "nt":
-        comspec = os.environ.get("COMSPEC", "cmd.exe")
-        return await create_owned_subprocess_exec(comspec, "/d", "/s", "/c", command, **kwargs)
+        return await create_owned_subprocess_exec(
+            default_command_shell(), "/d", "/s", "/c", command, **kwargs
+        )
     if os.name != "posix":
         raise ProcessTreeOwnershipError(f"unsupported process-tree platform: {os.name}")
     child_kwargs = dict(kwargs)
@@ -3001,6 +3014,7 @@ __all__ = [
     "create_owned_popen",
     "create_owned_subprocess_exec",
     "create_owned_subprocess_shell",
+    "default_command_shell",
     "main",
     "reconcile_persisted_processes",
     "task_process_scope",

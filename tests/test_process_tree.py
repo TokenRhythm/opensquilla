@@ -3060,3 +3060,41 @@ async def test_windows_job_kills_descendant_after_direct_leader_exits(tmp_path) 
         assert kernel32.WaitForSingleObject(child_handle, 5000) == 0
     finally:
         kernel32.CloseHandle(child_handle)
+
+
+def test_default_command_shell_reports_comspec_on_windows(monkeypatch) -> None:
+    """On Windows the reported shell must name the interpreter that actually runs
+    commands. create_owned_subprocess_shell execs COMSPEC there, so SHELL --
+    which Windows never sets -- left the field empty."""
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.delenv("SHELL", raising=False)
+    monkeypatch.setenv("COMSPEC", r"C:\WINDOWS\system32\cmd.exe")
+
+    assert process_tree.default_command_shell() == r"C:\WINDOWS\system32\cmd.exe"
+
+
+def test_default_command_shell_falls_back_when_comspec_missing(monkeypatch) -> None:
+    """COMSPEC is effectively always set on Windows, but the field must never be
+    empty even if it is not."""
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.delenv("SHELL", raising=False)
+    monkeypatch.delenv("COMSPEC", raising=False)
+
+    assert process_tree.default_command_shell() == "cmd.exe"
+
+
+def test_default_command_shell_keeps_posix_shell(monkeypatch) -> None:
+    """Control: POSIX behaviour is unchanged -- still the login shell."""
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+
+    assert process_tree.default_command_shell() == "/bin/zsh"
+
+
+def test_default_command_shell_is_empty_when_posix_shell_unset(monkeypatch) -> None:
+    """Control: the POSIX empty case is pre-existing behaviour, not a regression
+    this change is expected to fix."""
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.delenv("SHELL", raising=False)
+
+    assert process_tree.default_command_shell() == ""
