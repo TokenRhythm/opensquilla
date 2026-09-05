@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { useSettingsPromotedForm, parseTokenCountInput } from './useSettingsPromotedForm'
+import { useSettingsPromotedForm, formatTokenCountInput, parseTokenCountInput } from './useSettingsPromotedForm'
 
 // The audio TTS tuning fields (voice/model/base_url/language_code) are accepted
 // and applied by the backend (mutations.upsert_audio_provider); these cover the
@@ -230,5 +230,29 @@ describe('parseTokenCountInput', () => {
     expect(parseTokenCountInput('0')).toBeNull()
     expect(parseTokenCountInput('-5')).toBeNull()
     expect(parseTokenCountInput('abc')).toBeNull()
+  })
+
+  it('accepts k/M unit suffixes case-insensitively', () => {
+    expect(parseTokenCountInput('64k')).toBe(64000)
+    expect(parseTokenCountInput('64K')).toBe(64000)
+    expect(parseTokenCountInput('1M')).toBe(1_000_000)
+    expect(parseTokenCountInput('1m')).toBe(1_000_000)
+    expect(parseTokenCountInput('1.5M')).toBe(1_500_000)
+    expect(parseTokenCountInput('0.5k')).toBe(500)
+    expect(parseTokenCountInput(' 1M ')).toBe(1_000_000)
+    expect(parseTokenCountInput('1kb')).toBeNull()
+    expect(parseTokenCountInput('k')).toBeNull()
+    expect(parseTokenCountInput('1MB')).toBeNull()
+  })
+
+  it('formats saved counts losslessly in compact k/M form', () => {
+    expect(formatTokenCountInput(1024000)).toBe('1024k')
+    expect(formatTokenCountInput(1_000_000)).toBe('1M')
+    expect(formatTokenCountInput(960000)).toBe('960k')
+    expect(formatTokenCountInput(8192)).toBe('8192')
+    expect(formatTokenCountInput(0)).toBe('')
+    expect(formatTokenCountInput(null)).toBe('')
+    // Round-trips back through the parser unchanged.
+    expect(parseTokenCountInput(formatTokenCountInput(1024000))).toBe(1024000)
   })
 })

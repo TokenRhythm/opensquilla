@@ -10,9 +10,28 @@ export const DEFAULT_LLM_TIMEOUT_SECONDS = 120
 // Parse a raw token-count input string into a positive token count, or null
 // when it is blank/zero/non-numeric ("use the auto-detected value"). Shared
 // with SetupProviderPanel so the field and its readout agree on the rule.
+// Accepts plain counts plus k/M unit suffixes (case-insensitive, decimal
+// scale to match the compact catalog readouts): "64k" → 64000, "1M" → 1e6.
 export function parseTokenCountInput(value: unknown): number | null {
-  const parsed = Number(value)
-  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null
+  const raw = String(value ?? '').trim().toLowerCase()
+  if (!raw) return null
+  const match = /^(\d+(?:\.\d+)?)([km])?$/.exec(raw)
+  if (!match) return null
+  const magnitude = Number(match[1])
+  if (!Number.isFinite(magnitude) || magnitude <= 0) return null
+  const scale = match[2] === 'k' ? 1_000 : match[2] === 'm' ? 1_000_000 : 1
+  return Math.floor(magnitude * scale)
+}
+
+// Compact lossless display form for a saved token count: prefer k/M suffixes
+// when they divide evenly (1024000 → "1024k", 1000000 → "1M"), else the plain
+// integer (8192). Round-trips through parseTokenCountInput unchanged.
+export function formatTokenCountInput(count: number | null | undefined): string {
+  if (typeof count !== 'number' || !Number.isFinite(count) || count <= 0) return ''
+  const floored = Math.floor(count)
+  if (floored % 1_000_000 === 0) return `${floored / 1_000_000}M`
+  if (floored % 1_000 === 0) return `${floored / 1_000}k`
+  return String(floored)
 }
 
 interface PromotedConfigData {
@@ -178,12 +197,18 @@ export function useSettingsPromotedForm() {
   // override that belongs to a different provider+model pair.
   function reseedModelOverrides(config: PromotedConfigData, provider: string, model: string) {
     const saved = modelOverrideFor(config, provider, model)
-    contextWindowTokens.value = typeof saved.context_window === 'number' && saved.context_window > 0
-      ? String(Math.floor(saved.context_window))
-      : ''
-    maxOutputTokens.value = typeof saved.max_output_tokens === 'number' && saved.max_output_tokens > 0
-      ? String(Math.floor(saved.max_output_tokens))
-      : ''
+    // Display saved counts in compact k/M form (1024000 → "1024k"); the
+    // parser accepts both forms so the round-trip stays lossless.
+    contextWindowTokens.value = formatTokenCountInput(
+      typeof saved.context_window === 'number' && saved.context_window > 0
+        ? Math.floor(saved.context_window)
+        : null,
+    )
+    maxOutputTokens.value = formatTokenCountInput(
+      typeof saved.max_output_tokens === 'number' && saved.max_output_tokens > 0
+        ? Math.floor(saved.max_output_tokens)
+        : null,
+    )
     modelSupportsVision.value = saved.supports_vision === true
     modelSupportsVideo.value = saved.supports_video === true
     commitModelOverrideBaselines()

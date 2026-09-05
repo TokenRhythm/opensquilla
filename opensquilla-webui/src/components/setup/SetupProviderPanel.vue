@@ -17,7 +17,7 @@ import type {
   DiscoveredModel,
   ProviderCredentialPanelState,
 } from '@/composables/setup/useSetupProviderForm'
-import { parseTokenCountInput } from '@/composables/setup/useSettingsPromotedForm'
+import { formatTokenCountInput, parseTokenCountInput } from '@/composables/setup/useSettingsPromotedForm'
 import { localizedRelativeTime } from '@/utils/messageTime'
 
 const { t, locale } = useI18n()
@@ -827,13 +827,13 @@ const maxOutputAuto = computed<number | null>(() => {
 // local runtimes default to 8k, cloud deployments to the 200k floor (mirrors
 // provider/model_catalog.py DEFAULT_CONTEXT_WINDOW and the local 8192 num_ctx).
 const contextWindowHint = computed(() => {
-  if (contextWindowAuto.value != null) return String(contextWindowAuto.value)
-  return props.panel.providerIsLocal ? '8192' : '200000'
+  if (contextWindowAuto.value != null) return formatTokenCountInput(contextWindowAuto.value)
+  return props.panel.providerIsLocal ? '8192' : '200k'
 })
 
 const maxOutputHint = computed(() => {
-  if (maxOutputAuto.value != null) return String(maxOutputAuto.value)
-  return props.panel.providerIsLocal ? '8192' : '16384'
+  if (maxOutputAuto.value != null) return formatTokenCountInput(maxOutputAuto.value)
+  return props.panel.providerIsLocal ? '8192' : '16k'
 })
 
 // Warn only from the saved/override picture: local runtimes commonly truncate

@@ -1994,9 +1994,10 @@ describe('SetupProviderPanel — per-model parameter overrides', () => {
     const input = contextInput(el)
     expect(input).toBeTruthy()
     expect(input?.disabled).toBe(false)
-    // No discovery row → the gray hint names the engine's 200k cloud floor.
-    expect(input?.placeholder).toBe('200000')
-    expect(maxOutputInput(el)?.placeholder).toBe('16384')
+    // No discovery row → the gray hint names the engine's 200k cloud floor
+    // (rendered in the same compact k/M form the parser accepts).
+    expect(input?.placeholder).toBe('200k')
+    expect(maxOutputInput(el)?.placeholder).toBe('16k')
     expect(el.querySelector('.setup-warning')).toBeNull()
 
     app.unmount()
