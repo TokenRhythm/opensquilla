@@ -1598,6 +1598,23 @@ class SessionManager:
             input_message_id=input_message_id,
         )
 
+    async def list_recent_fixed_four_tier_decisions(
+        self,
+        *,
+        session_id: str,
+        session_epoch: int,
+        before_ms: int,
+        since_ms: int,
+        limit: int = 5,
+    ) -> list[FixedFourTierDecisionRecord]:
+        return await self._storage.list_recent_fixed_four_tier_decisions(
+            session_id=session_id,
+            session_epoch=session_epoch,
+            before_ms=before_ms,
+            since_ms=since_ms,
+            limit=limit,
+        )
+
     async def stage_fixed_four_tier_decision(
         self,
         record: FixedFourTierDecisionRecord,

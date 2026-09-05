@@ -7,10 +7,12 @@ DeprecationWarning is emitted per process.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
 import stat
+import tomllib
 import warnings
 from pathlib import Path
 
@@ -315,6 +317,140 @@ def test_llm_ensemble_timeout_migration_preserves_mixed_legacy_and_custom_values
     assert result.changed is False
     assert result.payload["llm_ensemble"]["proposer_timeout_seconds"] == 120.0
     assert result.payload["llm_ensemble"]["aggregator_timeout_seconds"] == 900.0
+
+
+@pytest.mark.parametrize(
+    "legacy_schema",
+    ["fixed-four-tier-v2-mock-v1", "fixed-four-tier-v2-mock-v2"],
+)
+def test_fixed_four_tier_compat_migration_is_always_run_and_idempotent(
+    legacy_schema: str,
+) -> None:
+    payload = {
+        "config_version": migration_module.LATEST_CONFIG_VERSION,
+        "llm_ensemble": {
+            "four_tier_mapping": {
+                "schema_version": legacy_schema,
+                "mock_seed": 17,
+                "max_session_states": 128,
+            }
+        },
+    }
+    original = copy.deepcopy(payload)
+
+    result = migration_module.migrate_config_payload(payload)
+
+    assert payload == original
+    assert result.changed is True
+    route = result.payload["llm_ensemble"]["four_tier_mapping"]
+    assert route == {
+        "schema_version": "fixed-four-tier-v2-v3",
+        "classifier": {"backend": "random_mock", "seed": 17},
+    }
+    assert (
+        "llm_ensemble.four_tier_mapping.mock_seed"
+        in result.removed_fields
+    )
+    assert (
+        "llm_ensemble.four_tier_mapping.max_session_states"
+        in result.removed_fields
+    )
+    assert any("schema_version" in change for change in result.changes)
+    assert any("classifier.seed" in change for change in result.changes)
+
+    second = migration_module.migrate_config_payload(result.payload)
+    assert second.payload == result.payload
+    assert second.changed is False
+    assert second.changes == ()
+    assert second.removed_fields == ()
+
+
+def test_fixed_four_tier_top_level_seed_normalizes_in_current_schema() -> None:
+    result = migration_module.migrate_config_payload(
+        {
+            "config_version": migration_module.LATEST_CONFIG_VERSION,
+            "llm_ensemble": {
+                "four_tier_mapping": {
+                    "schema_version": "fixed-four-tier-v2-v3",
+                    "mock_seed": 19,
+                }
+            },
+        }
+    )
+
+    route = result.payload["llm_ensemble"]["four_tier_mapping"]
+    assert route["classifier"] == {"backend": "random_mock", "seed": 19}
+    assert "mock_seed" not in route
+    assert result.changed is True
+
+
+def test_v1_selection_only_four_tier_config_materializes_explicit_legacy_mock() -> None:
+    payload = {
+        "config_version": 1,
+        "llm_ensemble": {
+            "enabled": True,
+            "mode": "single",
+            "selection_mode": "four_tier_mapping",
+        },
+    }
+
+    result = migration_module.migrate_config_payload(payload)
+
+    assert result.changed is True
+    assert result.payload["config_version"] == 2
+    assert result.payload["llm_ensemble"]["four_tier_mapping"] == {
+        "schema_version": "fixed-four-tier-v2-v3",
+        "classifier": {"backend": "random_mock"},
+    }
+    assert any("legacy random_mock" in change for change in result.changes)
+
+    second = migration_module.migrate_config_payload(result.payload)
+    assert second.payload == result.payload
+    assert second.changed is False
+
+
+def test_load_from_toml_persists_fixed_four_tier_compat_migration(
+    tmp_path: Path,
+) -> None:
+    toml_path = tmp_path / "config.toml"
+    original = "\n".join(
+        [
+            f"config_version = {migration_module.LATEST_CONFIG_VERSION}",
+            "",
+            "[llm_ensemble]",
+            "enabled = true",
+            'mode = "single"',
+            'selection_mode = "four_tier_mapping"',
+            "",
+            "[llm_ensemble.four_tier_mapping]",
+            'schema_version = "fixed-four-tier-v2-mock-v2"',
+            "mock_seed = 23",
+            "max_session_states = 128",
+            "",
+        ]
+    )
+    toml_path.write_text(original, encoding="utf-8")
+
+    cfg = GatewayConfig.load_from_toml(toml_path)
+
+    route = cfg.llm_ensemble.four_tier_mapping
+    assert route is not None
+    assert route.schema_version == "fixed-four-tier-v2-v3"
+    assert route.mock_seed == 23
+    [backup] = list(tmp_path.glob("config.toml.backup.*"))
+    assert backup.read_text(encoding="utf-8") == original
+
+    migrated = tomllib.loads(toml_path.read_text(encoding="utf-8"))
+    migrated_route = migrated["llm_ensemble"]["four_tier_mapping"]
+    assert migrated_route == {
+        "schema_version": "fixed-four-tier-v2-v3",
+        "classifier": {"backend": "random_mock", "seed": 23},
+    }
+
+    persisted = toml_path.read_text(encoding="utf-8")
+    GatewayConfig.load_from_toml(toml_path)
+    assert toml_path.read_text(encoding="utf-8") == persisted
+    assert len(list(tmp_path.glob("config.toml.backup.*"))) == 1
 
 
 # ---------------------------------------------------------------------------

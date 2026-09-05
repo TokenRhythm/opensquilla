@@ -1,39 +1,13 @@
-"""opensquilla.engine — Agent core state machine.
+"""opensquilla.engine — dependency-light lazy Agent public surface.
 
-The public surface is **lazy** for everything except ``.types``:
-``from opensquilla.engine import Agent`` continues to work (PEP 562
-``__getattr__`` resolves the symbol on first access), but
-``import opensquilla.engine.types`` does NOT transitively drag in the
-``agent`` / ``context`` / ``subagent`` modules — keeping tooling that
-only needs the type stubs (mypy probes, IDE inspection, packaging
-gates, the public-tool-surface lint at ``test_public_tool_surface.py``)
-fast and dependency-free.
+Focused engine submodules, including the route-only Benchmark worker, must be
+importable without eagerly loading the Agent, Provider, or tool stacks.  PEP
+562 keeps all historical ``from opensquilla.engine import ...`` names intact.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
-
-from .types import (
-    THINKING_BUDGETS,
-    AgentConfig,
-    AgentEvent,
-    AgentState,
-    ArtifactEvent,
-    DoneEvent,
-    ErrorEvent,
-    RouterControlReplayEvent,
-    RunHeartbeatEvent,
-    StateChangeEvent,
-    TextDeltaEvent,
-    ThinkingEvent,
-    ThinkingLevel,
-    ToolCall,
-    ToolResult,
-    ToolResultEvent,
-    ToolUseStartEvent,
-    WarningEvent,
-)
 
 if TYPE_CHECKING:
     from .agent import Agent, ToolHandler
@@ -44,6 +18,26 @@ if TYPE_CHECKING:
         SubagentRegistry,
         SubagentSpec,
     )
+    from .types import (
+        THINKING_BUDGETS,
+        AgentConfig,
+        AgentEvent,
+        AgentState,
+        ArtifactEvent,
+        DoneEvent,
+        ErrorEvent,
+        RouterControlReplayEvent,
+        RunHeartbeatEvent,
+        StateChangeEvent,
+        TextDeltaEvent,
+        ThinkingEvent,
+        ThinkingLevel,
+        ToolCall,
+        ToolResult,
+        ToolResultEvent,
+        ToolUseStartEvent,
+        WarningEvent,
+    )
 
 
 # Map of lazy attribute name → (module_path, attribute_name). Loaded on
@@ -51,6 +45,24 @@ if TYPE_CHECKING:
 # / channels/ / provider/ stacks that the type-stub consumers do not
 # need.
 _LAZY_MAP: dict[str, tuple[str, str]] = {
+    "THINKING_BUDGETS": ("opensquilla.engine.types", "THINKING_BUDGETS"),
+    "AgentConfig": ("opensquilla.engine.types", "AgentConfig"),
+    "AgentEvent": ("opensquilla.engine.types", "AgentEvent"),
+    "AgentState": ("opensquilla.engine.types", "AgentState"),
+    "ArtifactEvent": ("opensquilla.engine.types", "ArtifactEvent"),
+    "DoneEvent": ("opensquilla.engine.types", "DoneEvent"),
+    "ErrorEvent": ("opensquilla.engine.types", "ErrorEvent"),
+    "RouterControlReplayEvent": ("opensquilla.engine.types", "RouterControlReplayEvent"),
+    "RunHeartbeatEvent": ("opensquilla.engine.types", "RunHeartbeatEvent"),
+    "StateChangeEvent": ("opensquilla.engine.types", "StateChangeEvent"),
+    "TextDeltaEvent": ("opensquilla.engine.types", "TextDeltaEvent"),
+    "ThinkingEvent": ("opensquilla.engine.types", "ThinkingEvent"),
+    "ThinkingLevel": ("opensquilla.engine.types", "ThinkingLevel"),
+    "ToolCall": ("opensquilla.engine.types", "ToolCall"),
+    "ToolResult": ("opensquilla.engine.types", "ToolResult"),
+    "ToolResultEvent": ("opensquilla.engine.types", "ToolResultEvent"),
+    "ToolUseStartEvent": ("opensquilla.engine.types", "ToolUseStartEvent"),
+    "WarningEvent": ("opensquilla.engine.types", "WarningEvent"),
     "Agent": ("opensquilla.engine.agent", "Agent"),
     "ToolHandler": ("opensquilla.engine.agent", "ToolHandler"),
     "ContextAssembly": ("opensquilla.engine.context", "ContextAssembly"),
@@ -67,13 +79,19 @@ def __getattr__(name: str) -> Any:
         import importlib
 
         mod_path, attr = _LAZY_MAP[name]
-        return getattr(importlib.import_module(mod_path), attr)
+        value = getattr(importlib.import_module(mod_path), attr)
+        globals()[name] = value
+        return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
 
 
 __all__ = [
     "THINKING_BUDGETS",
-    # Types (eager)
+    # Types (lazy)
     "AgentConfig",
     "AgentEvent",
     "AgentState",

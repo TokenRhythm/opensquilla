@@ -4,18 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
+import hashlib
 import json
 import logging
 import random
 import sqlite3
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Concatenate, cast
+
+from pydantic import BaseModel
 
 from opensquilla.compat import aiosqlite
 from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id
@@ -972,30 +976,257 @@ def _deserialize_fixed_four_tier_decision_row(
     return result
 
 
+def _strict_fixed_four_tier_model[ModelT: BaseModel](
+    model_type: type[ModelT],
+    values: Mapping[str, Any],
+    *,
+    subject: str,
+) -> ModelT:
+    """Revalidate a mutable SQLModel snapshot without Pydantic coercion."""
+
+    try:
+        return model_type.model_validate(dict(values), strict=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"four_tier_mapping {subject} has invalid field types") from exc
+
+
+def _fixed_four_tier_claim_decision_identity_mismatches(
+    claim: Mapping[str, Any],
+    decision: Mapping[str, Any],
+    *,
+    require_route_binding: bool,
+) -> list[str]:
+    """Return fields that prevent a claim from owning a decision."""
+
+    fields = (
+        "claim_id",
+        "session_id",
+        "session_key",
+        "session_epoch",
+        "request_id",
+        "execution_id",
+        "input_message_id",
+    )
+    mismatches = [
+        field
+        for field in fields
+        if type(claim.get(field)) is not type(decision.get(field))
+        or claim.get(field) != decision.get(field)
+    ]
+    if require_route_binding and (
+        type(claim.get("route_id")) is not type(decision.get("route_id"))
+        or claim.get("route_id") != decision.get("route_id")
+    ):
+        mismatches.append("route_id")
+    return mismatches
+
+
 def _validate_fixed_four_tier_decision_trace(
     trace: object,
     *,
-    route_id: object,
-    request_id: object,
-    task_id: object,
+    persisted_row: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Validate one persisted core trace and its duplicated row identity."""
+    """Validate one persisted core trace against every duplicated semantic column."""
 
-    from opensquilla.engine.routing.fixed_four_tier_v2 import FixedFourTierDecision
+    from opensquilla.engine.routing.fixed_four_tier_v2 import (
+        LEGACY_SCHEMA_VERSIONS,
+        FixedFourTierDecision,
+    )
 
-    persisted_route_id = str(route_id or "")
-    if not isinstance(trace, dict):
+    persisted_route_id = str(persisted_row.get("route_id") or "")
+    record_schema_version = persisted_row.get("schema_version")
+    if (
+        isinstance(record_schema_version, bool)
+        or not isinstance(record_schema_version, int)
+        or record_schema_version != 1
+        or not isinstance(trace, dict)
+    ):
         raise ValueError(
             f"persisted four_tier_mapping route trace is incompatible: {persisted_route_id}"
         )
     try:
         decision = FixedFourTierDecision.from_trace(trace)
-        if (
-            decision.route_id != persisted_route_id
-            or decision.request_id != str(request_id or "")
-            or decision.task_id != str(task_id or "")
+        duplicated_semantics: dict[str, Any] = {
+            "route_id": decision.route_id,
+            "request_id": decision.request_id,
+            "task_id": decision.task_id,
+            "decided_at_ms": decision.decided_at_ms,
+            "intent": decision.intent.trace(),
+            "tier": decision.tier.trace(),
+            "previous_tier": decision.previous_tier,
+            "final_tier": decision.final_tier,
+            "task_turn_index": decision.task_turn_index,
+            "context_action": decision.context_action,
+            "config_version": decision.schema_version,
+        }
+        supplemental_trace_fields = {
+            "session_id": "session_id",
+            "session_epoch": "session_epoch",
+            "claim_id": "claim_id",
+            "execution_id": "execution_id",
+            "input_message_id": "input_message_id",
+            "task_start_input_message_id": "task_start_input_message_id",
+            "redo_parent_route_id": "redo_parent_route_id",
+            "state_version_before": "state_version_before",
+            "selected_provider": "provider",
+            "selected_model": "model",
+            "reasoning": "reasoning",
+            "deployment_version": "deployment_version",
+        }
+        required_supplemental_fields = {
+            "session_key_hash",
+            *supplemental_trace_fields.values(),
+        }
+        is_legacy_trace = decision.schema_version in LEGACY_SCHEMA_VERSIONS
+        if is_legacy_trace:
+            forbidden_legacy_fields = {
+                "classifier_backend",
+                "classifier_identity",
+            }.intersection(trace)
+            if forbidden_legacy_fields:
+                raise ValueError(
+                    "four_tier_mapping legacy trace carries unsupported provenance: "
+                    + ", ".join(sorted(forbidden_legacy_fields))
+                )
+        if not is_legacy_trace:
+            missing_fields = required_supplemental_fields.difference(trace)
+            if missing_fields:
+                raise ValueError(
+                    "four_tier_mapping decision trace lacks persisted semantics: "
+                    + ", ".join(sorted(missing_fields))
+                )
+
+        required_string_fields = {
+            "session_id",
+            "claim_id",
+            "execution_id",
+            "input_message_id",
+        }
+        optional_string_fields = {
+            "task_start_input_message_id",
+            "redo_parent_route_id",
+            "provider",
+            "model",
+            "reasoning",
+            "deployment_version",
+        }
+        for field_name in required_string_fields:
+            if not is_legacy_trace or field_name in trace:
+                field_value = trace.get(field_name)
+                if not isinstance(field_value, str) or not field_value.strip():
+                    raise ValueError(f"four_tier_mapping decision {field_name} is invalid")
+        for field_name in optional_string_fields:
+            if not is_legacy_trace or field_name in trace:
+                field_value = trace.get(field_name)
+                if field_value is not None and (
+                    not isinstance(field_value, str) or not field_value.strip()
+                ):
+                    raise ValueError(f"four_tier_mapping decision {field_name} is invalid")
+        if not is_legacy_trace or "session_epoch" in trace:
+            session_epoch = trace.get("session_epoch")
+            if (
+                isinstance(session_epoch, bool)
+                or not isinstance(session_epoch, int)
+                or session_epoch < 0
+            ):
+                raise ValueError("four_tier_mapping decision session_epoch is invalid")
+        if not is_legacy_trace or "state_version_before" in trace:
+            state_version_before = trace.get("state_version_before")
+            if state_version_before is not None and (
+                isinstance(state_version_before, bool)
+                or not isinstance(state_version_before, int)
+                or state_version_before < 0
+            ):
+                raise ValueError("four_tier_mapping decision prior state version is invalid")
+        for row_field, trace_field in supplemental_trace_fields.items():
+            if trace_field in trace:
+                duplicated_semantics[row_field] = trace.get(trace_field)
+
+        if "session_key_hash" in trace:
+            session_key = persisted_row.get("session_key")
+            session_key_hash = trace.get("session_key_hash")
+            if (
+                not isinstance(session_key, str)
+                or not isinstance(session_key_hash, str)
+                or len(session_key_hash) != 64
+                or any(character not in "0123456789abcdef" for character in session_key_hash)
+                or session_key_hash != hashlib.sha256(session_key.encode("utf-8")).hexdigest()
+            ):
+                raise ValueError("four_tier_mapping decision session key hash is inconsistent")
+
+        preflight = trace.get("preflight")
+        if not is_legacy_trace and (
+            not isinstance(preflight, Mapping) or "status" not in preflight
         ):
-            raise ValueError("four_tier_mapping decision trace identity is inconsistent")
+            raise ValueError("four_tier_mapping decision preflight trace is incomplete")
+        if isinstance(preflight, Mapping) and "status" in preflight:
+            preflight_status = preflight.get("status")
+            if preflight_status not in {"pending", "passed", "failed"}:
+                raise ValueError("four_tier_mapping decision preflight status is invalid")
+            duplicated_semantics["preflight_status"] = preflight_status
+
+        dynamic_required_fields = {
+            "execution_status",
+            "state_committed",
+            "response_id",
+        }
+        if not is_legacy_trace:
+            missing_fields = dynamic_required_fields.difference(trace)
+            if missing_fields:
+                raise ValueError(
+                    "four_tier_mapping decision trace lacks execution semantics: "
+                    + ", ".join(sorted(missing_fields))
+                )
+        if "execution_status" in trace:
+            execution_status = trace.get("execution_status")
+            if execution_status not in {"pending", "succeeded", "failed", "cancelled"}:
+                raise ValueError("four_tier_mapping decision execution status is invalid")
+            duplicated_semantics["execution_status"] = execution_status
+        if "state_committed" in trace:
+            state_committed = trace.get("state_committed")
+            if not isinstance(state_committed, bool):
+                raise ValueError("four_tier_mapping decision committed state is invalid")
+            duplicated_semantics["state_committed"] = state_committed
+
+        dynamic_optional_string_fields = {
+            "response_id": "response_id",
+            "error_code": "error_code",
+            "executed_provider": "executed_provider",
+            "executed_model": "executed_model",
+            "executed_deployment_version": "executed_deployment_version",
+        }
+        for row_field, trace_field in dynamic_optional_string_fields.items():
+            if not is_legacy_trace or trace_field in trace:
+                value = trace.get(trace_field)
+                if value is not None and (not isinstance(value, str) or not value.strip()):
+                    raise ValueError(f"four_tier_mapping decision {trace_field} is invalid")
+                duplicated_semantics[row_field] = value
+
+        if not is_legacy_trace or "provider_usage" in trace:
+            usage_summary = trace.get("provider_usage")
+            if usage_summary is not None and not isinstance(usage_summary, dict):
+                raise ValueError("four_tier_mapping decision provider usage is invalid")
+            duplicated_semantics["usage_summary"] = usage_summary
+
+        if not is_legacy_trace or "state_version_after" in trace:
+            state_version_after = trace.get("state_version_after")
+            if state_version_after is not None and (
+                isinstance(state_version_after, bool)
+                or not isinstance(state_version_after, int)
+                or state_version_after < 0
+            ):
+                raise ValueError("four_tier_mapping decision next state version is invalid")
+            duplicated_semantics["state_version_after"] = state_version_after
+        inconsistent_fields = [
+            field_name
+            for field_name, trace_value in duplicated_semantics.items()
+            if persisted_row.get(field_name) != trace_value
+        ]
+        if inconsistent_fields:
+            raise ValueError(
+                "four_tier_mapping decision row conflicts with its trace: "
+                + ", ".join(inconsistent_fields)
+            )
     except (TypeError, ValueError) as exc:
         raise ValueError(
             f"persisted four_tier_mapping route trace is incompatible: {persisted_route_id}"
@@ -1008,12 +1239,11 @@ def _rehydrate_fixed_four_tier_decision_row(
 ) -> FixedFourTierDecisionRecord:
     """Rehydrate one four_tier_mapping record only after validating its core trace."""
 
-    record = FixedFourTierDecisionRecord(**_deserialize_fixed_four_tier_decision_row(row))
+    decoded = _deserialize_fixed_four_tier_decision_row(row)
+    record = FixedFourTierDecisionRecord(**decoded)
     _validate_fixed_four_tier_decision_trace(
         record.route_trace,
-        route_id=record.route_id,
-        request_id=record.request_id,
-        task_id=record.task_id,
+        persisted_row=decoded,
     )
     return record
 
@@ -1470,11 +1700,11 @@ class SessionStorage:
         # Hard DB-level guarantee: epoch can never decrease via UPDATE.
         await self._conn.execute(_CREATE_EPOCH_ROLLBACK_TRIGGER)
         await self._conn.commit()
-        await self._reconcile_stale_fixed_four_tier_claims_on_connection(
-            self._conn,
-            now_ms=time.time_ns() // 1_000_000,
-        )
-        await self._conn.commit()
+        async with self._write_transaction("startup_fixed_four_tier_reconciliation") as conn:
+            await self._reconcile_stale_fixed_four_tier_claims_on_connection(
+                conn,
+                now_ms=time.time_ns() // 1_000_000,
+            )
         # Migrate older databases — add the epoch column if missing.
         await self._migrate_epoch_column()
         await self._migrate_derived_title_column()
@@ -5292,11 +5522,26 @@ class SessionStorage:
             )
             return
         decoded = _deserialize_fixed_four_tier_decision_row(dict(decision_row))
+        identity_mismatches = _fixed_four_tier_claim_decision_identity_mismatches(
+            claim,
+            decoded,
+            require_route_binding=True,
+        )
+        if identity_mismatches:
+            await conn.execute(
+                """
+                UPDATE fixed_four_tier_request_claims
+                SET status = 'failed', terminal_at_ms = COALESCE(terminal_at_ms, ?),
+                    error_code = 'execution_decision_mismatch', updated_at_ms = ?
+                WHERE claim_id = ? AND status IN ('claimed', 'materialized')
+                  AND lease_expires_at_ms <= ?
+                """,
+                (now_ms, now_ms, claim_id, now_ms),
+            )
+            return
         route_trace = _validate_fixed_four_tier_decision_trace(
             decoded.get("route_trace"),
-            route_id=decoded.get("route_id"),
-            request_id=decoded.get("request_id"),
-            task_id=decoded.get("task_id"),
+            persisted_row=decoded,
         )
         decision_status = str(decision_row["execution_status"])
         if decision_status != "pending":
@@ -5324,23 +5569,31 @@ class SessionStorage:
             decision=decoded,
             now_ms=now_ms,
         )
+        execution_status: str
+        error_code: str | None
+        recovery_outcome: str
         if evidence["turn_error"] is not None:
             execution_status = "failed"
             error_code = "execution_failed_before_route_settlement"
             recovery_outcome = "durable_turn_error"
         elif evidence["response_status"] in {"succeeded", "failed", "cancelled"}:
             execution_status = str(evidence["response_status"])
-            error_code = (
-                None
-                if execution_status == "succeeded"
-                else evidence["response_error_code"]
-                or (
-                    "cancelled"
-                    if execution_status == "cancelled"
-                    else "execution_failed_before_route_settlement"
+            if execution_status == "succeeded" and not bool(decoded["state_committed"]):
+                execution_status = "failed"
+                error_code = "task_state_uncommitted_after_crash"
+                recovery_outcome = "durable_response_without_state_commit"
+            else:
+                error_code = (
+                    None
+                    if execution_status == "succeeded"
+                    else evidence["response_error_code"]
+                    or (
+                        "cancelled"
+                        if execution_status == "cancelled"
+                        else "execution_failed_before_route_settlement"
+                    )
                 )
-            )
-            recovery_outcome = "durable_response_binding"
+                recovery_outcome = "durable_response_binding"
         elif evidence["attempt_ids"]:
             execution_status = "failed"
             error_code = "execution_outcome_unknown_after_crash"
@@ -5366,8 +5619,27 @@ class SessionStorage:
             route_trace["error_code"] = error_code
         route_trace["attempt_ids"] = list(evidence["attempt_ids"])
         route_trace["attempt_id"] = evidence["attempt_ids"][0] if evidence["attempt_ids"] else None
-        if evidence["response_id"] is not None:
-            route_trace["response_id"] = evidence["response_id"]
+        response_id = (
+            decoded.get("response_id")
+            if decoded.get("response_id") is not None
+            else evidence["response_id"]
+        )
+        executed_provider = (
+            decoded.get("executed_provider")
+            if decoded.get("executed_provider") is not None
+            else evidence["actual_provider"]
+        )
+        executed_model = (
+            decoded.get("executed_model")
+            if decoded.get("executed_model") is not None
+            else evidence["actual_model"]
+        )
+        usage_summary = (
+            decoded.get("usage_summary")
+            if decoded.get("usage_summary") is not None
+            else evidence["usage_summary"]
+        )
+        route_trace["response_id"] = response_id
         dispatch_value = route_trace.get("dispatch")
         dispatch = dict(dispatch_value) if isinstance(dispatch_value, dict) else {}
         if evidence["finalized_count"]:
@@ -5391,10 +5663,12 @@ class SessionStorage:
                 }
             )
         route_trace["dispatch"] = dispatch
-        route_trace["executed_provider"] = evidence["actual_provider"]
-        route_trace["executed_model"] = evidence["actual_model"]
-        if evidence["usage_summary"] is not None:
-            route_trace["provider_usage"] = evidence["usage_summary"]
+        route_trace["executed_provider"] = executed_provider
+        route_trace["executed_model"] = executed_model
+        if usage_summary is None:
+            route_trace.pop("provider_usage", None)
+        else:
+            route_trace["provider_usage"] = usage_summary
         route_trace["lease_reconciliation"] = {
             "status": "expired",
             "outcome": recovery_outcome,
@@ -5410,6 +5684,26 @@ class SessionStorage:
                 preflight["status"] = "failed"
                 preflight["error_code"] = error_code
             route_trace["preflight"] = preflight
+        preflight_status = str(decoded["preflight_status"])
+        if not bool(decoded["state_committed"]) and preflight_status == "pending":
+            preflight_status = "failed"
+        prospective_decision = {
+            **decoded,
+            "execution_status": execution_status,
+            "preflight_status": preflight_status,
+            "error_code": error_code,
+            "response_id": response_id,
+            "executed_provider": executed_provider,
+            "executed_model": executed_model,
+            "usage_summary": usage_summary,
+            "terminal_at_ms": decoded.get("terminal_at_ms") or now_ms,
+            "route_trace": route_trace,
+            "updated_at_ms": now_ms,
+        }
+        _validate_fixed_four_tier_decision_trace(
+            route_trace,
+            persisted_row=prospective_decision,
+        )
         await conn.execute(
             """
             UPDATE fixed_four_tier_decisions
@@ -5485,7 +5779,16 @@ class SessionStorage:
             """
             SELECT decision.*, claim.status AS claim_status,
                    claim.error_code AS claim_error_code,
-                   claim.terminal_at_ms AS claim_terminal_at_ms
+                   claim.terminal_at_ms AS claim_terminal_at_ms,
+                   claim.claim_id AS owner_claim_id,
+                   claim.session_id AS claim_session_id,
+                   claim.session_key AS claim_session_key,
+                   claim.session_epoch AS claim_session_epoch,
+                   claim.request_id AS claim_request_id,
+                   claim.execution_id AS claim_execution_id,
+                   claim.input_message_id AS claim_input_message_id,
+                   claim.route_id AS claim_route_id,
+                   claim.schema_version AS claim_schema_version
             FROM fixed_four_tier_decisions AS decision
             JOIN fixed_four_tier_request_claims AS claim
               ON claim.claim_id = decision.claim_id
@@ -5497,22 +5800,76 @@ class SessionStorage:
             terminal_claim_rows = await cur.fetchall()
         for row in terminal_claim_rows:
             decoded = _deserialize_fixed_four_tier_decision_row(dict(row))
+            claim_identity = {
+                "claim_id": row["owner_claim_id"],
+                "session_id": row["claim_session_id"],
+                "session_key": row["claim_session_key"],
+                "session_epoch": row["claim_session_epoch"],
+                "request_id": row["claim_request_id"],
+                "execution_id": row["claim_execution_id"],
+                "input_message_id": row["claim_input_message_id"],
+                "route_id": row["claim_route_id"],
+            }
+            identity_mismatches = _fixed_four_tier_claim_decision_identity_mismatches(
+                claim_identity,
+                decoded,
+                require_route_binding=True,
+            )
+            if row["claim_schema_version"] != 1 or identity_mismatches:
+                details = ", ".join(identity_mismatches) or "schema_version"
+                raise ValueError(
+                    "four_tier_mapping terminal request claim does not own its decision: " + details
+                )
             route_trace = _validate_fixed_four_tier_decision_trace(
                 decoded.get("route_trace"),
-                route_id=decoded.get("route_id"),
-                request_id=decoded.get("request_id"),
-                task_id=decoded.get("task_id"),
+                persisted_row=decoded,
             )
             claim_status = str(row["claim_status"])
             claim_error_code = row["claim_error_code"]
             terminal_at_ms = int(row["claim_terminal_at_ms"] or now_ms)
+            if claim_status == "succeeded" and not bool(decoded["state_committed"]):
+                claim_status = "failed"
+                claim_error_code = "task_state_uncommitted_before_claim_success"
+                await conn.execute(
+                    """
+                    UPDATE fixed_four_tier_request_claims
+                    SET status = 'failed', error_code = ?, updated_at_ms = ?
+                    WHERE claim_id = ? AND status = 'succeeded'
+                    """,
+                    (claim_error_code, max(now_ms, terminal_at_ms), str(row["claim_id"])),
+                )
+            preflight_status = str(decoded["preflight_status"])
+            if claim_status != "succeeded" and not bool(decoded["state_committed"]):
+                preflight_status = "failed"
             route_trace["execution_status"] = claim_status
-            if claim_error_code is not None:
-                route_trace["error_code"] = str(claim_error_code)
+            effective_error_code = decoded.get("error_code") or claim_error_code
+            if effective_error_code is None:
+                route_trace.pop("error_code", None)
+            else:
+                route_trace["error_code"] = str(effective_error_code)
+            preflight_value = route_trace.get("preflight")
+            preflight = dict(preflight_value) if isinstance(preflight_value, dict) else {}
+            preflight["status"] = preflight_status
+            if preflight_status == "failed" and effective_error_code is not None:
+                preflight["error_code"] = str(effective_error_code)
+            route_trace["preflight"] = preflight
             route_trace["claim_reconciliation"] = {
                 "status": "terminal_claim",
                 "reconciled_at_ms": now_ms,
             }
+            prospective_decision = {
+                **decoded,
+                "execution_status": claim_status,
+                "preflight_status": preflight_status,
+                "error_code": effective_error_code,
+                "terminal_at_ms": decoded.get("terminal_at_ms") or terminal_at_ms,
+                "route_trace": route_trace,
+                "updated_at_ms": max(now_ms, terminal_at_ms),
+            }
+            _validate_fixed_four_tier_decision_trace(
+                route_trace,
+                persisted_row=prospective_decision,
+            )
             await conn.execute(
                 """
                 UPDATE fixed_four_tier_decisions
@@ -5563,21 +5920,37 @@ class SessionStorage:
             decoded = _deserialize_fixed_four_tier_decision_row(dict(row))
             route_trace = _validate_fixed_four_tier_decision_trace(
                 decoded.get("route_trace"),
-                route_id=decoded.get("route_id"),
-                request_id=decoded.get("request_id"),
-                task_id=decoded.get("task_id"),
+                persisted_row=decoded,
             )
             error_code = "execution_claim_missing"
             route_trace["execution_status"] = "failed"
             route_trace["error_code"] = error_code
+            preflight_value = route_trace.get("preflight")
+            preflight = dict(preflight_value) if isinstance(preflight_value, dict) else {}
+            preflight["status"] = "failed"
+            preflight["error_code"] = error_code
+            route_trace["preflight"] = preflight
             route_trace["claim_reconciliation"] = {
                 "status": "missing",
                 "reconciled_at_ms": now_ms,
             }
+            prospective_decision = {
+                **decoded,
+                "execution_status": "failed",
+                "preflight_status": "failed",
+                "error_code": error_code,
+                "terminal_at_ms": decoded.get("terminal_at_ms") or now_ms,
+                "route_trace": route_trace,
+                "updated_at_ms": now_ms,
+            }
+            _validate_fixed_four_tier_decision_trace(
+                route_trace,
+                persisted_row=prospective_decision,
+            )
             await conn.execute(
                 """
                 UPDATE fixed_four_tier_decisions
-                SET execution_status = 'failed', error_code = ?,
+                SET execution_status = 'failed', preflight_status = 'failed', error_code = ?,
                     terminal_at_ms = COALESCE(terminal_at_ms, ?),
                     route_trace = ?, updated_at_ms = ?
                 WHERE route_id = ? AND execution_status = 'pending'
@@ -5616,7 +5989,13 @@ class SessionStorage:
                 (session_id, request_id),
             ) as cur:
                 row = await cur.fetchone()
-        return FixedFourTierRequestClaim(**_deserialize_row(dict(row))) if row else None
+        if row is None:
+            return None
+        return _strict_fixed_four_tier_model(
+            FixedFourTierRequestClaim,
+            _deserialize_row(dict(row)),
+            subject="persisted request claim",
+        )
 
     async def claim_fixed_four_tier_request(
         self,
@@ -5624,9 +6003,23 @@ class SessionStorage:
     ) -> tuple[bool, FixedFourTierRequestClaim]:
         """Acquire the durable pre-classification lease for one request."""
 
+        claim = _strict_fixed_four_tier_model(
+            FixedFourTierRequestClaim,
+            claim.model_copy(deep=True).model_dump(warnings=False),
+            subject="request claim",
+        )
         claim.session_key = canonicalize_session_key(claim.session_key)
+        if claim.schema_version != 1:
+            raise ValueError("a new four_tier_mapping request claim must use schema version 1")
         if claim.status != "claimed":
             raise ValueError("a new four_tier_mapping request claim must be claimed")
+        if (
+            claim.route_id is not None
+            or claim.terminal_at_ms is not None
+            or claim.error_code is not None
+            or claim.updated_at_ms != claim.claimed_at_ms
+        ):
+            raise ValueError("a new four_tier_mapping request claim must be pristine")
         for field in (
             "claim_id",
             "session_id",
@@ -5635,8 +6028,20 @@ class SessionStorage:
             "execution_id",
             "input_message_id",
         ):
-            if not str(getattr(claim, field, "") or "").strip():
+            value = getattr(claim, field, None)
+            if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{field} is required for a four_tier_mapping request claim")
+        for field in (
+            "session_epoch",
+            "claimed_at_ms",
+            "updated_at_ms",
+            "lease_expires_at_ms",
+        ):
+            value = getattr(claim, field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    f"{field} must be a non-negative integer for a four_tier_mapping request claim"
+                )
         if claim.lease_expires_at_ms <= claim.claimed_at_ms:
             raise ValueError("four_tier_mapping request lease must expire after it is claimed")
         async with self._write_transaction("claim_fixed_four_tier_request") as conn:
@@ -5668,7 +6073,12 @@ class SessionStorage:
             ) as cur:
                 existing = await cur.fetchone()
             if existing is not None:
-                return False, FixedFourTierRequestClaim(**_deserialize_row(dict(existing)))
+                existing_claim = _strict_fixed_four_tier_model(
+                    FixedFourTierRequestClaim,
+                    _deserialize_row(dict(existing)),
+                    subject="persisted request claim",
+                )
+                return False, existing_claim
             data = claim.model_dump()
             columns = list(data)
             try:
@@ -5694,9 +6104,19 @@ class SessionStorage:
     ) -> bool:
         """Terminalize a claim when no materialized decision can do it."""
 
-        if execution_status not in {"succeeded", "failed", "cancelled"}:
+        if not isinstance(claim_id, str) or not claim_id.strip():
+            raise ValueError("claim_id is required for four_tier_mapping claim settlement")
+        if execution_status not in {"failed", "cancelled"}:
             raise ValueError("invalid four_tier_mapping claim terminal status")
+        if error_code is not None and (not isinstance(error_code, str) or not error_code.strip()):
+            raise ValueError("invalid four_tier_mapping claim error code")
         terminal_at_ms = updated_at_ms if updated_at_ms is not None else time.time_ns() // 1_000_000
+        if (
+            isinstance(terminal_at_ms, bool)
+            or not isinstance(terminal_at_ms, int)
+            or terminal_at_ms < 0
+        ):
+            raise ValueError("invalid four_tier_mapping claim settlement time")
         async with self._write_transaction("settle_fixed_four_tier_request_claim") as conn:
             async with conn.execute(
                 "SELECT status FROM fixed_four_tier_request_claims WHERE claim_id = ?",
@@ -5738,7 +6158,13 @@ class SessionStorage:
             (session_id,),
         ) as cur:
             row = await cur.fetchone()
-        return FixedFourTierState(**_deserialize_row(dict(row))) if row is not None else None
+        if row is None:
+            return None
+        return _strict_fixed_four_tier_model(
+            FixedFourTierState,
+            _deserialize_row(dict(row)),
+            subject="persisted task state",
+        )
 
     @_serialized_read
     async def get_usage_event_ids_for_turn(
@@ -5816,12 +6242,73 @@ class SessionStorage:
             row = await cur.fetchone()
         return _rehydrate_fixed_four_tier_decision_row(dict(row)) if row is not None else None
 
+    @_serialized_read
+    async def list_recent_fixed_four_tier_decisions(
+        self,
+        *,
+        session_id: str,
+        session_epoch: int,
+        before_ms: int,
+        since_ms: int,
+        limit: int = 5,
+    ) -> list[FixedFourTierDecisionRecord]:
+        """Return prior committed routes in chronological order.
+
+        This bounded query is the authoritative route-before history consumed
+        by the trained Router. Staged/uncommitted decisions are excluded; the
+        current decision is not persisted yet, so a closed millisecond upper
+        bound retains same-tick prior decisions without including itself.
+        """
+
+        if not session_id:
+            raise ValueError("session_id must be non-empty")
+        if (
+            isinstance(session_epoch, bool)
+            or not isinstance(session_epoch, int)
+            or session_epoch < 0
+        ):
+            raise ValueError("session_epoch must be a non-negative integer")
+        if (
+            any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in (before_ms, since_ms)
+            )
+            or since_ms > before_ms
+        ):
+            raise ValueError("invalid fixed-four-tier decision time window")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 5:
+            raise ValueError("fixed-four-tier decision history limit must be between 1 and 5")
+        async with self.conn.execute(
+            """
+            SELECT * FROM fixed_four_tier_decisions
+            WHERE session_id = ?
+              AND session_epoch = ?
+              AND state_committed = 1
+              AND decided_at_ms >= ?
+              AND decided_at_ms <= ?
+            ORDER BY decided_at_ms DESC, route_id DESC
+            LIMIT ?
+            """,
+            (session_id, session_epoch, since_ms, before_ms, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        records = [_rehydrate_fixed_four_tier_decision_row(dict(row)) for row in rows]
+        records.reverse()
+        return records
+
     async def stage_fixed_four_tier_decision(
         self,
         record: FixedFourTierDecisionRecord,
     ) -> FixedFourTierDecisionRecord:
         """Persist classification before deployment/context preflight begins."""
 
+        from opensquilla.engine.routing.fixed_four_tier_v2 import SCHEMA_VERSION
+
+        record = _strict_fixed_four_tier_model(
+            FixedFourTierDecisionRecord,
+            record.model_copy(deep=True).model_dump(warnings=False),
+            subject="decision record",
+        )
         record.session_key = canonicalize_session_key(record.session_key)
         for field in (
             "route_id",
@@ -5833,9 +6320,55 @@ class SessionStorage:
             "input_message_id",
             "task_id",
         ):
-            if not str(getattr(record, field, "") or "").strip():
+            value = getattr(record, field, None)
+            if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{field} is required for a four_tier_mapping decision")
+        for field in (
+            "session_epoch",
+            "decided_at_ms",
+            "updated_at_ms",
+            "task_turn_index",
+        ):
+            value = getattr(record, field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    f"{field} must be a non-negative integer for a four_tier_mapping decision"
+                )
+        initial_state = {
+            "state_version_after": None,
+            "executed_provider": None,
+            "executed_model": None,
+            "executed_deployment_version": None,
+            "usage_summary": None,
+            "preflight_status": "pending",
+            "state_committed": False,
+            "execution_status": "pending",
+            "response_id": None,
+            "error_code": None,
+            "terminal_at_ms": None,
+        }
+        invalid_initial_fields = [
+            field_name
+            for field_name, expected_value in initial_state.items()
+            if getattr(record, field_name) != expected_value
+        ]
+        if invalid_initial_fields:
+            raise FixedFourTierStateConflictError(
+                "a staged four_tier_mapping decision must be pristine: "
+                + ", ".join(invalid_initial_fields)
+            )
+        if (
+            record.config_version != SCHEMA_VERSION
+            or record.route_trace.get("schema_version") != SCHEMA_VERSION
+        ):
+            raise FixedFourTierStateConflictError(
+                "new four_tier_mapping decisions must use the current trace schema"
+            )
         data = record.model_dump()
+        _validate_fixed_four_tier_decision_trace(
+            record.route_trace,
+            persisted_row=data,
+        )
         cols = list(data.keys())
         placeholders = ", ".join("?" for _ in cols)
         try:
@@ -5849,9 +6382,14 @@ class SessionStorage:
                     raise FixedFourTierStateConflictError(
                         "four_tier_mapping decision has no durable request claim"
                     )
-                claim = FixedFourTierRequestClaim(**_deserialize_row(dict(claim_row)))
+                claim = _strict_fixed_four_tier_model(
+                    FixedFourTierRequestClaim,
+                    _deserialize_row(dict(claim_row)),
+                    subject="persisted request claim",
+                )
                 if (
                     claim.status != "claimed"
+                    or claim.schema_version != 1
                     or claim.session_id != record.session_id
                     or claim.session_key != record.session_key
                     or claim.session_epoch != record.session_epoch
@@ -5900,8 +6438,66 @@ class SessionStorage:
     ) -> FixedFourTierState:
         """CAS-commit semantic state only after fixed route preflight passes."""
 
+        state = _strict_fixed_four_tier_model(
+            FixedFourTierState,
+            state.model_copy(deep=True).model_dump(warnings=False),
+            subject="task state",
+        )
+        route_trace = copy.deepcopy(route_trace)
         state.session_key = canonicalize_session_key(state.session_key)
+        if not isinstance(route_id, str) or not route_id.strip():
+            raise ValueError("route_id is required for a four_tier_mapping task state commit")
+        if expected_version is not None and (
+            isinstance(expected_version, bool)
+            or not isinstance(expected_version, int)
+            or expected_version < 0
+        ):
+            raise ValueError("four_tier_mapping expected task state version is invalid")
+        if (
+            isinstance(updated_at_ms, bool)
+            or not isinstance(updated_at_ms, int)
+            or updated_at_ms < 0
+        ):
+            raise ValueError("four_tier_mapping task state update time is invalid")
+        if not isinstance(route_trace, dict):
+            raise ValueError("four_tier_mapping committed route trace must be an object")
+        for field in ("session_id", "session_key", "task_id", "tier"):
+            value = getattr(state, field, None)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field} is required for a four_tier_mapping task state")
+        for field in ("task_start_input_message_id", "last_request_id", "last_route_id"):
+            value = getattr(state, field, None)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"four_tier_mapping task state {field} is invalid")
+        for field in (
+            "session_epoch",
+            "version",
+            "task_turn_count",
+            "updated_at_ms",
+            "schema_version",
+        ):
+            value = getattr(state, field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"four_tier_mapping task state {field} is invalid")
+        if state.schema_version != 1:
+            raise FixedFourTierStateConflictError(
+                "four_tier_mapping task state must use schema version 1"
+            )
         async with self._write_transaction("commit_fixed_four_tier_decision") as conn:
+            async with conn.execute(
+                "SELECT * FROM fixed_four_tier_decisions WHERE route_id = ? AND session_id = ?",
+                (route_id, state.session_id),
+            ) as cur:
+                decision_row = await cur.fetchone()
+            if decision_row is None:
+                raise FixedFourTierStateConflictError(
+                    "four_tier_mapping staged decision is unavailable"
+                )
+            decoded_decision = _deserialize_fixed_four_tier_decision_row(dict(decision_row))
+            _validate_fixed_four_tier_decision_trace(
+                decoded_decision.get("route_trace"),
+                persisted_row=decoded_decision,
+            )
             async with conn.execute(
                 """
                 SELECT claim.*
@@ -5913,11 +6509,29 @@ class SessionStorage:
                 (route_id, state.session_id),
             ) as cur:
                 claim_row = await cur.fetchone()
-            if claim_row is None or str(claim_row["status"]) != "materialized":
+            if claim_row is None:
                 raise FixedFourTierStateConflictError(
                     "four_tier_mapping staged decision has no active request claim"
                 )
-            if int(claim_row["lease_expires_at_ms"]) <= updated_at_ms:
+            claim_values = _deserialize_row(dict(claim_row))
+            persisted_claim = _strict_fixed_four_tier_model(
+                FixedFourTierRequestClaim,
+                claim_values,
+                subject="persisted request claim",
+            )
+            if (
+                persisted_claim.status != "materialized"
+                or persisted_claim.schema_version != 1
+                or _fixed_four_tier_claim_decision_identity_mismatches(
+                    claim_values,
+                    decoded_decision,
+                    require_route_binding=True,
+                )
+            ):
+                raise FixedFourTierStateConflictError(
+                    "four_tier_mapping staged decision has no compatible request claim"
+                )
+            if persisted_claim.lease_expires_at_ms <= updated_at_ms:
                 raise FixedFourTierStateConflictError(
                     "four_tier_mapping request claim expired before route commit"
                 )
@@ -5944,15 +6558,50 @@ class SessionStorage:
                 raise FixedFourTierStateConflictError(
                     "four_tier_mapping task state changed before route commit"
                 )
+            if decoded_decision.get("state_version_before") != expected_version:
+                raise FixedFourTierStateConflictError(
+                    "four_tier_mapping decision has an inconsistent prior state version"
+                )
             if current is not None and int(current["session_epoch"] or 0) != state.session_epoch:
                 raise FixedFourTierStateConflictError(
                     "four_tier_mapping task state belongs to another session epoch"
+                )
+            state_bindings = {
+                "task_id": decoded_decision["task_id"],
+                "tier": decoded_decision["final_tier"],
+                "task_turn_count": int(decoded_decision["task_turn_index"]) + 1,
+                "task_start_input_message_id": decoded_decision["task_start_input_message_id"],
+                "last_request_id": decoded_decision["request_id"],
+                "last_route_id": route_id,
+            }
+            conflicting_state_fields = [
+                field_name
+                for field_name, expected_value in state_bindings.items()
+                if getattr(state, field_name) != expected_value
+            ]
+            if conflicting_state_fields:
+                raise FixedFourTierStateConflictError(
+                    "four_tier_mapping next task state conflicts with its decision: "
+                    + ", ".join(conflicting_state_fields)
                 )
             expected_next_version = 1 if expected_version is None else expected_version + 1
             if state.version != expected_next_version:
                 raise FixedFourTierStateConflictError(
                     "four_tier_mapping next state version is not monotonic"
                 )
+
+            prospective_decision = {
+                **decoded_decision,
+                "preflight_status": "passed",
+                "state_committed": True,
+                "state_version_after": state.version,
+                "route_trace": route_trace,
+                "updated_at_ms": updated_at_ms,
+            }
+            _validate_fixed_four_tier_decision_trace(
+                route_trace,
+                persisted_row=prospective_decision,
+            )
 
             data = state.model_dump()
             if current is None:
@@ -6011,11 +6660,31 @@ class SessionStorage:
     ) -> bool:
         """Record a preflight or terminal outcome without changing task state."""
 
+        route_trace = copy.deepcopy(route_trace)
+        if not isinstance(route_id, str) or not route_id.strip():
+            raise ValueError("route_id is required for four_tier_mapping decision settlement")
         if execution_status not in {"pending", "succeeded", "failed", "cancelled"}:
             raise ValueError("invalid four_tier_mapping execution status")
         if preflight_status not in {None, "pending", "passed", "failed"}:
             raise ValueError("invalid four_tier_mapping preflight status")
+        for field_name, value in (("response_id", response_id), ("error_code", error_code)):
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"invalid four_tier_mapping {field_name}")
+        if route_trace is not None and not isinstance(route_trace, dict):
+            raise ValueError("four_tier_mapping settled route trace must be an object")
+        if execution_status == "pending" and any(
+            value is not None for value in (preflight_status, response_id, error_code, route_trace)
+        ):
+            raise FixedFourTierStateConflictError(
+                "a pending four_tier_mapping settlement cannot mutate audit state"
+            )
         settled_at_ms = updated_at_ms if updated_at_ms is not None else time.time_ns() // 1_000_000
+        if (
+            isinstance(settled_at_ms, bool)
+            or not isinstance(settled_at_ms, int)
+            or settled_at_ms < 0
+        ):
+            raise ValueError("invalid four_tier_mapping decision settlement time")
         fields: dict[str, Any] = {
             "execution_status": execution_status,
             "updated_at_ms": settled_at_ms,
@@ -6069,20 +6738,83 @@ class SessionStorage:
         )
         async with self._write_transaction("settle_fixed_four_tier_decision") as conn:
             async with conn.execute(
-                "SELECT claim_id, execution_status FROM fixed_four_tier_decisions "
-                "WHERE route_id = ?",
+                "SELECT * FROM fixed_four_tier_decisions WHERE route_id = ?",
                 (route_id,),
             ) as cur:
                 existing = await cur.fetchone()
             if existing is None:
                 return False
             existing_status = str(existing["execution_status"])
+            decoded_existing = _deserialize_fixed_four_tier_decision_row(dict(existing))
+            _validate_fixed_four_tier_decision_trace(
+                decoded_existing.get("route_trace"),
+                persisted_row=decoded_existing,
+            )
+            async with conn.execute(
+                "SELECT * FROM fixed_four_tier_request_claims WHERE claim_id = ?",
+                (str(existing["claim_id"]),),
+            ) as cur:
+                claim_row = await cur.fetchone()
+            if claim_row is None:
+                raise FixedFourTierStateConflictError(
+                    "four_tier_mapping decision has no compatible request claim"
+                )
+            claim_values = _deserialize_row(dict(claim_row))
+            persisted_claim = _strict_fixed_four_tier_model(
+                FixedFourTierRequestClaim,
+                claim_values,
+                subject="persisted request claim",
+            )
+            if (
+                persisted_claim.schema_version != 1
+                or _fixed_four_tier_claim_decision_identity_mismatches(
+                    claim_values,
+                    decoded_existing,
+                    require_route_binding=True,
+                )
+            ):
+                raise FixedFourTierStateConflictError(
+                    "four_tier_mapping decision has no compatible request claim"
+                )
+            claim_status = persisted_claim.status
             if existing_status != "pending":
                 # A terminal route is an immutable audit fact.  Exact-status
                 # retries are idempotent no-ops; a conflicting terminal retry
                 # is rejected.  In particular, a late duplicate must not
                 # overwrite response/trace/usage or move updated_at backwards.
-                return existing_status == execution_status
+                if existing_status != execution_status:
+                    return False
+                if claim_status != execution_status:
+                    raise FixedFourTierStateConflictError(
+                        "four_tier_mapping terminal decision conflicts with its request claim"
+                    )
+                return True
+            if claim_status != "materialized":
+                raise FixedFourTierStateConflictError(
+                    "four_tier_mapping pending decision has no active request claim"
+                )
+            prospective_decision = {**decoded_existing, **fields}
+            if terminal and decoded_existing.get("terminal_at_ms") is not None:
+                prospective_decision["terminal_at_ms"] = decoded_existing["terminal_at_ms"]
+            if terminal:
+                state_committed = prospective_decision.get("state_committed") is True
+                prospective_preflight = prospective_decision.get("preflight_status")
+                if state_committed and prospective_preflight != "passed":
+                    raise FixedFourTierStateConflictError(
+                        "four_tier_mapping terminal settlement violates preflight lifecycle"
+                    )
+                if execution_status == "succeeded" and not state_committed:
+                    raise FixedFourTierStateConflictError(
+                        "four_tier_mapping cannot succeed before task state commit"
+                    )
+                if not state_committed and prospective_preflight not in {"passed", "failed"}:
+                    raise FixedFourTierStateConflictError(
+                        "four_tier_mapping terminal settlement lacks a preflight outcome"
+                    )
+            _validate_fixed_four_tier_decision_trace(
+                prospective_decision.get("route_trace"),
+                persisted_row=prospective_decision,
+            )
             async with conn.execute(
                 f"UPDATE fixed_four_tier_decisions SET {assignments} "
                 "WHERE route_id = ? AND execution_status = 'pending'",
@@ -6093,7 +6825,7 @@ class SessionStorage:
             ) as cur:
                 updated = (cur.rowcount or 0) == 1
             if updated and terminal:
-                await conn.execute(
+                async with conn.execute(
                     """
                     UPDATE fixed_four_tier_request_claims
                     SET status = ?, error_code = COALESCE(?, error_code),
@@ -6109,7 +6841,11 @@ class SessionStorage:
                         str(existing["claim_id"]),
                         execution_status,
                     ),
-                )
+                ) as cur:
+                    if (cur.rowcount or 0) != 1:
+                        raise FixedFourTierStateConflictError(
+                            "four_tier_mapping request claim could not be settled atomically"
+                        )
             return updated
 
     # ── SessionContextState CRUD ─────────────────────────────────────────────

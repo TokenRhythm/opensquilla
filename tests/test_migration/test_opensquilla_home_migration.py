@@ -526,7 +526,12 @@ def test_profile_import_preserves_unmodified_toml_bytes_and_comments(
     report = _run(source, target, apply=True)
 
     assert not _errors(report)
-    assert (target / "config.toml").read_bytes() == source_config
+    expected_target = source_config.replace(
+        b"config_version = 1\n",
+        f"config_version = {config_migration_module.LATEST_CONFIG_VERSION}\n".encode(),
+    )
+    assert (target / "config.toml").read_bytes() == expected_target
+    assert (source / "config.toml").read_bytes() == source_config
 
 
 def test_profile_import_losslessly_patches_legacy_paths_and_secret_comments(

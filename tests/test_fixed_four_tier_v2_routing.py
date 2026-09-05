@@ -14,6 +14,7 @@ from opensquilla.engine.routing.fixed_four_tier_v2 import (
     FEATURE_VECTOR_DIM,
     FEATURE_VECTOR_STATUS,
     INTENTS,
+    SCHEMA_VERSION,
     TIERS,
     ClassifierPrediction,
     FixedFourTierDecision,
@@ -47,6 +48,11 @@ class _ScriptedIntentClassifier:
     results: list[ClassifierPrediction | Exception]
     snapshots: list[dict[str, Any]] = field(default_factory=list)
     version: str = "scripted-intent-v1"
+    backend: str = "injected"
+    identity: Mapping[str, Any] | None = None
+    feature_schema_version: str = FEATURE_SCHEMA_VERSION
+    feature_vector_dim: int | None = FEATURE_VECTOR_DIM
+    feature_vector_status: str = FEATURE_VECTOR_STATUS
 
     def predict(self, snapshot: Mapping[str, Any]) -> ClassifierPrediction:
         self.snapshots.append(dict(snapshot))
@@ -63,6 +69,11 @@ class _ScriptedTierClassifier:
     results: list[ClassifierPrediction | Exception]
     calls: list[tuple[dict[str, Any], tuple[Tier, ...]]] = field(default_factory=list)
     version: str = "scripted-tier-v1"
+    backend: str = "injected"
+    identity: Mapping[str, Any] | None = None
+    feature_schema_version: str = FEATURE_SCHEMA_VERSION
+    feature_vector_dim: int | None = FEATURE_VECTOR_DIM
+    feature_vector_status: str = FEATURE_VECTOR_STATUS
 
     def predict(
         self,
@@ -85,8 +96,14 @@ def _request(
     session_id: str = "session-a",
     control_event: str | None = None,
     user_history: tuple[str, ...] = (),
+    task_anchor: str | None = None,
     previous_assistant_text: str | None = None,
     previous_assistant_usage: Mapping[str, Any] | None = None,
+    previous_outcome: str = "unknown",
+    route_history: tuple[Mapping[str, Any], ...] = (),
+    context: Mapping[str, Any] | None = None,
+    tool_state: Mapping[str, Any] | None = None,
+    attachments: tuple[Mapping[str, Any], ...] = (),
     input_message_id: str | None = None,
     attachment_count: int = 0,
     attachment_modalities: tuple[str, ...] | None = None,
@@ -97,9 +114,15 @@ def _request(
         message=message,
         input_message_id=input_message_id,
         control_event=control_event,
+        task_anchor=task_anchor,
         user_history=user_history,
         previous_assistant_text=previous_assistant_text,
         previous_assistant_usage=previous_assistant_usage,
+        previous_outcome=previous_outcome,
+        route_history=route_history,
+        context=context,
+        tool_state=tool_state,
+        attachments=attachments,
         attachment_count=attachment_count,
         attachment_modalities=attachment_modalities,
     )
@@ -114,6 +137,26 @@ def _id_factory(prefix: str) -> Any:
         return f"{prefix}-{counter}"
 
     return _next
+
+
+def _registered_identity(
+    *,
+    feature_schema_version: str = "lightgbm_380.v1",
+    registry_status: str = "VALIDATED",
+) -> dict[str, str]:
+    model_type = "bert" if feature_schema_version == "bert_text88.v1" else "lightgbm"
+    return {
+        "schema_version": "local_runner_identity.v2",
+        "model_set_id": "router-production-a1",
+        "model_manifest_hash": "sha256:" + ("a" * 64),
+        "artifact_closure_hash": "sha256:" + ("b" * 64),
+        "runner_digest": "sha256:" + ("c" * 64),
+        "environment_digest": "sha256:" + ("d" * 64),
+        "model_type": model_type,
+        "execution_mode": "native_embedded",
+        "registry_status": registry_status,
+        "input_schema_version": feature_schema_version,
+    }
 
 
 def test_first_request_is_new_task_and_skips_intent_classifier() -> None:
@@ -296,6 +339,18 @@ def test_classifier_failures_use_conservative_fallbacks() -> None:
     assert continued.final_tier == "c1"
 
 
+def test_classifier_authorization_failure_is_not_downgraded_to_fallback() -> None:
+    class AuthorizationError(RuntimeError):
+        fail_closed = True
+
+    router = FixedFourTierV2Router(
+        tier_classifier=_ScriptedTierClassifier([AuthorizationError("revoked")]),
+    )
+
+    with pytest.raises(AuthorizationError, match="revoked"):
+        router.decide(_request("request-revoked"))
+
+
 def test_uncertain_redo_holds_current_tier() -> None:
     intent = _ScriptedIntentClassifier([])
     tier = _ScriptedTierClassifier(
@@ -425,7 +480,7 @@ def test_feature_snapshot_is_bounded_and_trace_contains_only_safe_audit() -> Non
     assert snapshot["feature_vector_status"] == FEATURE_VECTOR_STATUS
     assert "feature_vector" not in snapshot
     assert len(snapshot["current_request"]) == 2_040
-    assert snapshot["task_user_history"][0] == "task start"
+    assert snapshot["task_user_history"][0] == "discarded two"
     assert len(snapshot["task_user_history"]) == 4
     assert len(snapshot["task_user_history"][1]) == 2_040
     assert snapshot["truncated"] == {
@@ -464,7 +519,7 @@ def test_feature_snapshot_is_bounded_and_trace_contains_only_safe_audit() -> Non
         == hashlib.sha256(current_text.encode("utf-8")).hexdigest()
     )
     assert feature_input["content_hashes"]["task_user_history_segments"] == [
-        hashlib.sha256(value.encode("utf-8")).hexdigest() for value in (history[0], *history[-3:])
+        hashlib.sha256(value.encode("utf-8")).hexdigest() for value in history[-4:]
     ]
     serialized_trace = json.dumps(trace, ensure_ascii=False)
     assert "CURRENT-SECRET" not in serialized_trace
@@ -653,6 +708,158 @@ def test_new_task_reset_mask_keeps_missing_flags_without_old_task_leakage() -> N
     assert decision.feature_input_audit.truncated_history is True
 
 
+def test_new_task_snapshot_preserves_complete_cross_task_router_input() -> None:
+    intent = _ScriptedIntentClassifier([])
+    tier = _ScriptedTierClassifier([_prediction("c2"), _prediction("c3")])
+    router = FixedFourTierV2Router(
+        intent_classifier=intent,
+        tier_classifier=tier,
+    )
+    _, state = router.decide(_request("request-1"))
+    current_request = "新建任务：" + ("原文" * 1_100)
+    history = (
+        "任务甲-较早",
+        "任务甲-结束",
+        "任务乙-开始",
+        "任务乙-结束",
+        "任务丙-开始",
+        "任务丙-最近",
+    )
+    previous_usage = {
+        "input_tokens": 101,
+        "output_tokens": 202,
+        "reasoning_tokens": 33,
+        "cached_tokens": 44,
+        "cache_write_tokens": 55,
+        "cost_usd": 0.125,
+    }
+    route_history = (
+        {"intent": "continue", "tier": "C1"},
+        {"intent": "redo", "tier": "C2"},
+    )
+    context = {"surface": "cli", "workspace_kind": "git"}
+    tool_state = {"available": ["shell", "browser"], "last_error": None}
+    attachments = (
+        {"mime_type": "application/pdf", "size_bytes": 123},
+        {"mime_type": "image/png", "size_bytes": 456},
+    )
+
+    router.decide(
+        _request(
+            "request-2",
+            current_request,
+            task_anchor="跨任务保留的锚点",
+            user_history=history,
+            previous_assistant_text="上一任务的完整回答",
+            previous_assistant_usage=previous_usage,
+            previous_outcome="failure",
+            route_history=route_history,
+            context=context,
+            tool_state=tool_state,
+            attachments=attachments,
+            attachment_count=2,
+            attachment_modalities=("document", "image"),
+        ),
+        state,
+    )
+
+    snapshot, _ = tier.calls[1]
+    assert snapshot["task_reset_mask"] is True
+    assert snapshot["task_user_history"] == []
+    assert snapshot["previous_assistant_text"] is None
+    assert len(snapshot["current_request"]) == 2_040
+    assert snapshot["router_input"] == {
+        "current_request": current_request,
+        "task_anchor": "跨任务保留的锚点",
+        "history_user": list(history[-4:]),
+        "previous_answer": "上一任务的完整回答",
+        "previous_usage": previous_usage,
+        "previous_outcome": "failure",
+        "active_route_tier": "C2",
+        "route_history": [dict(value) for value in route_history],
+        "context": context,
+        "tool_state": tool_state,
+        "attachments": [dict(value) for value in attachments],
+    }
+
+
+def test_registered_new_task_without_state_audits_canonical_cross_task_text() -> None:
+    identity = _registered_identity()
+    classifier_metadata = {
+        "backend": "registered_model",
+        "identity": identity,
+        "feature_schema_version": "lightgbm_380.v1",
+        "feature_vector_dim": 380,
+        "feature_vector_status": "materialized",
+    }
+    intent = _ScriptedIntentClassifier([], **classifier_metadata)
+    tier = _ScriptedTierClassifier([_prediction("c2")], **classifier_metadata)
+    router = FixedFourTierV2Router(
+        intent_classifier=intent,
+        tier_classifier=tier,
+        route_id_factory=lambda: "route-canonical-audit",
+        task_id_factory=lambda: "task-canonical-audit",
+        clock_ms=lambda: 123,
+    )
+    history = (
+        "任务甲-较早",
+        "任务甲-结束",
+        "任务乙-开始",
+        "任务乙-结束",
+        "任务丙-开始",
+        "任务丙-最近",
+    )
+    previous_answer = "跨任务上一回答" + ("答" * 2_100)
+    request = _request(
+        "request-canonical-audit",
+        "新任务请求" + ("问" * 2_100),
+        user_history=history,
+        previous_assistant_text=previous_answer,
+    )
+
+    decision = router.route(request)
+
+    snapshot, _ = tier.calls[0]
+    router_input = snapshot["router_input"]
+    assert router_input["history_user"] == list(history[-4:])
+    assert router_input["previous_answer"] == previous_answer
+    audit = decision.feature_input_audit
+    assert audit.input_contract == "canonical_router_input"
+    assert audit.history_observed_count == len(history)
+    assert audit.history_retained_count == 4
+    assert audit.history_content_hashes == tuple(
+        hashlib.sha256(value.encode("utf-8")).hexdigest() for value in history[-4:]
+    )
+    assert (
+        audit.previous_assistant_content_hash
+        == hashlib.sha256(previous_answer.encode("utf-8")).hexdigest()
+    )
+    assert (
+        audit.classifier_snapshot_hash
+        == hashlib.sha256(
+            json.dumps(
+                router_input,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    )
+    assert audit.truncated_current_request is False
+    assert audit.truncated_history is True
+    assert audit.truncated_history_window is True
+    assert audit.truncated_history_segments == (False, False, False, False)
+    assert audit.truncated_previous_assistant is False
+    content_hashes = decision.trace()["feature_input"]["content_hashes"]
+    assert set(content_hashes) == {
+        "current_request",
+        "history_user_segments",
+        "history_user_aggregate",
+        "previous_answer",
+    }
+    assert "task_user_history_segments" not in content_hashes
+
+
 def test_attachment_metadata_bundle_is_normalized_all_or_nothing() -> None:
     assert normalize_attachment_modalities([]) == ()
     assert normalize_attachment_modalities(
@@ -827,6 +1034,7 @@ def test_decision_trace_round_trip_and_corruption_rejection() -> None:
     trace = decision.trace(provider="openrouter", model="deepseek/example")
 
     assert trace["mode"] == "four_tier_mapping"
+    assert trace["schema_version"] == SCHEMA_VERSION
     assert FixedFourTierDecision.from_trace(trace) == decision
 
     corruptions: list[tuple[tuple[str, ...], object]] = [
@@ -859,6 +1067,153 @@ def test_decision_trace_round_trip_and_corruption_rejection() -> None:
     del invalid_probabilities["tier"]["probabilities"]["c3"]
     with pytest.raises(ValueError, match="probability labels"):
         FixedFourTierDecision.from_trace(invalid_probabilities)
+
+
+def test_legacy_mock_v2_decision_trace_remains_rehydratable() -> None:
+    router = FixedFourTierV2Router(
+        mock_seed=7,
+        route_id_factory=lambda: "legacy-route",
+        task_id_factory=lambda: "legacy-task",
+        clock_ms=lambda: 123,
+    )
+    trace = router.route(_request("legacy-request")).trace()
+    trace["schema_version"] = "fixed-four-tier-v2-mock-v2"
+    trace.pop("classifier_backend")
+    trace.pop("classifier_identity")
+
+    restored = FixedFourTierDecision.from_trace(trace)
+
+    assert restored.schema_version == "fixed-four-tier-v2-mock-v2"
+    assert restored.classifier_backend == "random_mock"
+    assert restored.classifier_identity is None
+    assert restored.feature_input_audit.input_contract == "legacy_mock_snapshot"
+    assert set(trace["feature_input"]["content_hashes"]) == {
+        "current_request",
+        "task_user_history_segments",
+        "task_user_history_aggregate",
+        "previous_assistant",
+    }
+
+
+@pytest.mark.parametrize(
+    ("feature_schema_version", "feature_vector_dim"),
+    [("lightgbm_380.v1", 380), ("bert_text88.v1", 88)],
+)
+@pytest.mark.parametrize("registry_status", ["VALIDATED", "CANDIDATE"])
+def test_materialized_model_trace_identity_and_feature_schema_round_trip(
+    feature_schema_version: str,
+    feature_vector_dim: int,
+    registry_status: str,
+) -> None:
+    identity = _registered_identity(
+        feature_schema_version=feature_schema_version,
+        registry_status=registry_status,
+    )
+    classifier_metadata = {
+        "backend": "registered_model",
+        "identity": identity,
+        "feature_schema_version": feature_schema_version,
+        "feature_vector_dim": feature_vector_dim,
+        "feature_vector_status": "materialized",
+    }
+    intent = _ScriptedIntentClassifier([], **classifier_metadata)
+    tier = _ScriptedTierClassifier([_prediction("c2")], **classifier_metadata)
+    router = FixedFourTierV2Router(
+        intent_classifier=intent,
+        tier_classifier=tier,
+        route_id_factory=lambda: "route-materialized",
+        task_id_factory=lambda: "task-materialized",
+        clock_ms=lambda: 123,
+    )
+
+    decision = router.route(_request("request-materialized"))
+    trace = json.loads(json.dumps(decision.trace(provider="local", model="router-production-a1")))
+
+    assert trace["schema_version"] == SCHEMA_VERSION
+    assert trace["classifier_backend"] == "registered_model"
+    assert trace["classifier_identity"] == identity
+    assert trace["feature_schema_version"] == feature_schema_version
+    assert trace["feature_vector_dim"] == feature_vector_dim
+    assert trace["feature_vector_status"] == "materialized"
+    assert trace["feature_input"]["content_hashes"].keys() == {
+        "current_request",
+        "history_user_segments",
+        "history_user_aggregate",
+        "previous_answer",
+    }
+    assert FixedFourTierDecision.from_trace(trace) == decision
+
+    missing_identity = copy.deepcopy(trace)
+    missing_identity["classifier_identity"] = None
+    with pytest.raises(ValueError, match="runtime identity"):
+        FixedFourTierDecision.from_trace(missing_identity)
+
+
+def test_registered_model_trace_rejects_feature_and_identity_tampering() -> None:
+    identity = _registered_identity()
+    classifier_metadata = {
+        "backend": "registered_model",
+        "identity": identity,
+        "feature_schema_version": "lightgbm_380.v1",
+        "feature_vector_dim": 380,
+        "feature_vector_status": "materialized",
+    }
+    router = FixedFourTierV2Router(
+        intent_classifier=_ScriptedIntentClassifier([], **classifier_metadata),
+        tier_classifier=_ScriptedTierClassifier([_prediction("c2")], **classifier_metadata),
+        route_id_factory=lambda: "route-materialized",
+        task_id_factory=lambda: "task-materialized",
+        clock_ms=lambda: 123,
+    )
+    trace = router.route(_request("request-materialized")).trace()
+
+    corruptions: list[tuple[tuple[str, ...], object]] = [
+        (("feature_schema_version",), "unknown_features.v1"),
+        (("feature_vector_dim",), 88),
+        (("feature_vector_status",), "mock_not_materialized"),
+        (("classifier_identity", "schema_version"), "local_runner_identity.v1"),
+        (("classifier_identity", "model_set_id"), ""),
+        (("classifier_identity", "model_type"), "bert"),
+        (
+            ("classifier_identity", "execution_mode"),
+            "native_isolated_subprocess",
+        ),
+        (("classifier_identity", "registry_status"), "DEPRECATED"),
+        (("classifier_identity", "input_schema_version"), "bert_text88.v1"),
+    ]
+    corruptions.extend(
+        (("classifier_identity", field_name), "sha256:" + ("f" * 63))
+        for field_name in (
+            "model_manifest_hash",
+            "artifact_closure_hash",
+            "runner_digest",
+            "environment_digest",
+        )
+    )
+    for path, value in corruptions:
+        invalid = copy.deepcopy(trace)
+        target: dict[str, Any] = invalid
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = value
+        with pytest.raises(ValueError):
+            FixedFourTierDecision.from_trace(invalid)
+
+    for field_name in identity:
+        missing_field = copy.deepcopy(trace)
+        del missing_field["classifier_identity"][field_name]
+        with pytest.raises(ValueError, match="runtime identity"):
+            FixedFourTierDecision.from_trace(missing_field)
+
+    legacy_audit = copy.deepcopy(trace)
+    content_hashes = legacy_audit["feature_input"]["content_hashes"]
+    content_hashes["task_user_history_segments"] = content_hashes.pop("history_user_segments")
+    content_hashes["task_user_history_aggregate"] = content_hashes.pop("history_user_aggregate")
+    content_hashes["previous_assistant"] = content_hashes.pop("previous_answer")
+    truncated = legacy_audit["feature_input"]["truncated"]
+    truncated["previous_assistant"] = truncated.pop("previous_answer")
+    with pytest.raises(ValueError, match="canonical RouterInput audit"):
+        FixedFourTierDecision.from_trace(legacy_audit)
 
 
 def test_malformed_classifier_probabilities_fail_safe_without_fake_audit_values() -> None:

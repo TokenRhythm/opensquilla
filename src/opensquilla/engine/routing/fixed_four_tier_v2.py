@@ -1,10 +1,9 @@
 """Fixed four-tier single-model routing state machine.
 
-The production design uses one shared feature snapshot and two local
-classifiers.  This first implementation intentionally keeps the classifier
-facades while replacing both models with injectable pseudo-random mocks.  The
-state machine, conservative fallbacks, task boundary handling, and audit shape
-are therefore production-shaped even though the predictions are not.
+The state machine accepts either the legacy deterministic random mock or one
+hash-pinned model set produced by routing-training-platform.  Both classifier
+heads receive the same complete route-before input; policy rules decide which
+head is authoritative for a turn.
 """
 
 from __future__ import annotations
@@ -21,20 +20,25 @@ from dataclasses import dataclass, replace
 from typing import Any, Final, Literal, Protocol, cast
 
 MODE: Final = "four_tier_mapping"
-SCHEMA_VERSION: Final = "fixed-four-tier-v2-mock-v2"
+SCHEMA_VERSION: Final = "fixed-four-tier-v2-v3"
+LEGACY_SCHEMA_VERSIONS: Final = frozenset({"fixed-four-tier-v2-mock-v2"})
 RULE_VERSION: Final = "fixed-four-tier-v2-rules-v1"
 MOCK_CLASSIFIER_VERSION: Final = "random-mock-v2"
 FEATURE_SCHEMA_VERSION: Final = "fixed-four-tier-v2-features-mock-v2"
 FEATURE_VECTOR_DIM: Final = 413
 FEATURE_VECTOR_STATUS: Final = "mock_not_materialized"
 _MAX_SEGMENT_CHARS: Final = 2_040
-_RECENT_TASK_USER_MESSAGES: Final = 3
+_HISTORY_USER_MESSAGES: Final = 4
 
 type Intent = Literal["continue", "redo", "new_task"]
 type Tier = Literal["c0", "c1", "c2", "c3"]
 type ClassifierSource = Literal["rule", "classifier", "fallback", "not_run"]
 type ClassifierRunStatus = Literal["ran", "not_run", "error"]
 type ContextAction = Literal["keep", "reset"]
+type FeatureAuditInputContract = Literal[
+    "legacy_mock_snapshot",
+    "canonical_router_input",
+]
 type AttachmentModality = Literal[
     "document",
     "image",
@@ -46,6 +50,14 @@ type AttachmentModality = Literal[
 
 INTENTS: Final[tuple[Intent, ...]] = ("continue", "redo", "new_task")
 TIERS: Final[tuple[Tier, ...]] = ("c0", "c1", "c2", "c3")
+FIXED_FOUR_TIER_DEPLOYMENT_SPECS: Final[
+    tuple[tuple[Tier, str, str, Literal["thinking", "max"], str], ...]
+] = (
+    ("c0", "openrouter", "qwen/qwen3.7-flash", "thinking", "qwen3.7-flash-thinking"),
+    ("c1", "openrouter", "deepseek/deepseek-v4-flash", "max", "deepseek-v4-flash-0731"),
+    ("c2", "openrouter", "deepseek/deepseek-v4-pro", "max", "deepseek-v4-pro-0813"),
+    ("c3", "openrouter", "z-ai/glm-5.3", "max", "glm-5.3"),
+)
 ATTACHMENT_MODALITIES: Final[tuple[AttachmentModality, ...]] = (
     "document",
     "image",
@@ -74,10 +86,103 @@ _PREVIOUS_EXECUTION_KEYS: Final = frozenset(
         "retry_count",
     }
 )
+_REGISTERED_FEATURE_CONTRACTS: Final = {
+    "lightgbm_380.v1": ("lightgbm", 380),
+    "bert_text88.v1": ("bert", 88),
+}
+_REGISTERED_IDENTITY_HASH_FIELDS: Final = (
+    "model_manifest_hash",
+    "artifact_closure_hash",
+    "runner_digest",
+    "environment_digest",
+)
+
+
+def fixed_four_tier_semantic_policy_config(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the portable policy projection used by ``policy_hash``.
+
+    Registered model filesystem locations select where one already-identified
+    artifact is loaded; they do not change routing semantics.  Keeping those
+    host-local paths in the policy fingerprint made the same Manifest produce
+    different policy identities after an otherwise transparent deployment
+    move.  The exact ``model_set_id`` and Manifest Hash remain part of the
+    projection, as do authorization, thresholds, and the frozen ladder.
+    """
+
+    payload = dict(value)
+    raw_classifier = payload.get("classifier")
+    if isinstance(raw_classifier, Mapping):
+        classifier = dict(raw_classifier)
+        if classifier.get("backend") == "registered_model":
+            classifier.pop("artifact_root", None)
+            classifier.pop("metadata_db", None)
+        payload["classifier"] = classifier
+    return payload
 
 
 def _is_sha256(value: str) -> bool:
     return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+def _is_tagged_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith("sha256:")
+        and _is_sha256(value.removeprefix("sha256:"))
+    )
+
+
+def _validate_registered_classifier_contract(
+    *,
+    identity: Mapping[str, Any] | None,
+    feature_schema_version: str,
+    feature_vector_dim: int | None,
+    feature_vector_status: str,
+) -> None:
+    contract = _REGISTERED_FEATURE_CONTRACTS.get(feature_schema_version)
+    if contract is None:
+        raise ValueError("registered model decision feature schema is incompatible")
+    expected_model_type, expected_dimension = contract
+    if feature_vector_dim != expected_dimension:
+        raise ValueError("registered model decision feature dimension is incompatible")
+    if feature_vector_status != "materialized":
+        raise ValueError("registered model decision features must be materialized")
+    if not isinstance(identity, Mapping) or not identity:
+        raise ValueError("registered model decision requires a runtime identity")
+
+    required_fields = {
+        "schema_version",
+        "model_set_id",
+        *_REGISTERED_IDENTITY_HASH_FIELDS,
+        "model_type",
+        "execution_mode",
+        "registry_status",
+        "input_schema_version",
+    }
+    if not required_fields.issubset(identity):
+        raise ValueError("registered model decision runtime identity is incomplete")
+    if identity.get("schema_version") != "local_runner_identity.v2":
+        raise ValueError("registered model decision runtime identity schema is incompatible")
+    model_set_id = identity.get("model_set_id")
+    if (
+        not isinstance(model_set_id, str)
+        or not model_set_id.strip()
+        or model_set_id != model_set_id.strip()
+    ):
+        raise ValueError("registered model decision has an invalid model-set identity")
+    for field_name in _REGISTERED_IDENTITY_HASH_FIELDS:
+        if not _is_tagged_sha256(identity.get(field_name)):
+            raise ValueError(f"registered model decision runtime identity has invalid {field_name}")
+    if identity.get("model_type") != expected_model_type:
+        raise ValueError("registered model decision model type conflicts with its feature schema")
+    if identity.get("execution_mode") != "native_embedded":
+        raise ValueError("registered model decision execution mode is incompatible")
+    if identity.get("registry_status") not in {"VALIDATED", "CANDIDATE"}:
+        raise ValueError("registered model decision registry status is incompatible")
+    if identity.get("input_schema_version") != feature_schema_version:
+        raise ValueError("registered model decision runtime input schema is inconsistent")
 
 
 _NEW_TASK_CONTROL_EVENTS = frozenset(
@@ -188,7 +293,11 @@ def _stable_mock_choice(
 class RandomMockIntentClassifier:
     """Request-stable random intent mock with the production output schema."""
 
+    backend = "random_mock"
     version = MOCK_CLASSIFIER_VERSION
+    feature_schema_version = FEATURE_SCHEMA_VERSION
+    feature_vector_dim = FEATURE_VECTOR_DIM
+    feature_vector_status = FEATURE_VECTOR_STATUS
 
     def __init__(self, seed: int | None = None) -> None:
         self._seed = seed if seed is not None else random.SystemRandom().getrandbits(64)
@@ -214,7 +323,11 @@ class RandomMockIntentClassifier:
 class RandomMockTierClassifier:
     """Request-stable random tier mock restricted to the allowed tier set."""
 
+    backend = "random_mock"
     version = MOCK_CLASSIFIER_VERSION
+    feature_schema_version = FEATURE_SCHEMA_VERSION
+    feature_vector_dim = FEATURE_VECTOR_DIM
+    feature_vector_status = FEATURE_VECTOR_STATUS
 
     def __init__(self, seed: int | None = None) -> None:
         self._seed = seed if seed is not None else random.SystemRandom().getrandbits(64)
@@ -374,15 +487,21 @@ class ClassificationAudit:
 
 @dataclass(frozen=True)
 class RoutingRequest:
-    """Only pre-route data visible to the mock classifiers."""
+    """Truth-free, route-before data visible to the classifiers."""
 
     session_id: str
     request_id: str
     message: str
     input_message_id: str | None = None
+    task_anchor: str | None = None
     user_history: tuple[str, ...] = ()
     previous_assistant_text: str | None = None
     previous_assistant_usage: Mapping[str, Any] | None = None
+    previous_outcome: Literal["success", "failure", "clarification", "unknown"] = "unknown"
+    route_history: tuple[Mapping[str, Any], ...] = ()
+    context: Mapping[str, Any] | None = None
+    tool_state: Mapping[str, Any] | None = None
+    attachments: tuple[Mapping[str, Any], ...] = ()
     attachment_count: int = 0
     attachment_modalities: tuple[AttachmentModality, ...] | None = None
     control_event: str | None = None
@@ -398,6 +517,8 @@ class RoutingRequest:
             not isinstance(self.input_message_id, str) or not self.input_message_id.strip()
         ):
             raise ValueError("input_message_id must be non-empty when provided")
+        if self.task_anchor is not None and not isinstance(self.task_anchor, str):
+            raise ValueError("task_anchor must be a string when provided")
         if not isinstance(self.user_history, tuple) or any(
             not isinstance(value, str) for value in self.user_history
         ):
@@ -410,6 +531,21 @@ class RoutingRequest:
             self.previous_assistant_usage, Mapping
         ):
             raise ValueError("previous_assistant_usage must be an object when provided")
+        if self.previous_outcome not in {"success", "failure", "clarification", "unknown"}:
+            raise ValueError("previous_outcome is invalid")
+        if (
+            not isinstance(self.route_history, tuple)
+            or len(self.route_history) > 5
+            or any(not isinstance(value, Mapping) for value in self.route_history)
+        ):
+            raise ValueError("route_history must contain at most five objects")
+        for name, value in (("context", self.context), ("tool_state", self.tool_state)):
+            if value is not None and not isinstance(value, Mapping):
+                raise ValueError(f"{name} must be an object when provided")
+        if not isinstance(self.attachments, tuple) or any(
+            not isinstance(value, Mapping) for value in self.attachments
+        ):
+            raise ValueError("attachments must be a tuple of objects")
         if self.control_event is not None and not isinstance(self.control_event, str):
             raise ValueError("control_event must be a string when provided")
         if (
@@ -491,14 +627,15 @@ def normalize_attachment_modalities(
 
 @dataclass(frozen=True)
 class FeatureInputAudit:
-    """Content-safe audit summary of the exact pre-route mock feature input.
+    """Content-safe audit summary of the classifier's effective text input.
 
-    Raw transcript text stays in durable transcript storage.  The decision
-    trace carries only durable message references, counts, content hashes and
-    data-quality masks; it never pretends that the future 413-vector was
-    materialized by this random-mock implementation.
+    Registered classifiers audit the canonical ``RouterInput`` that their
+    training runtime consumes.  Legacy mocks retain their task-scoped audit
+    vocabulary so persisted mock-v2 traces remain readable. Raw transcript
+    text stays in durable transcript storage in both cases.
     """
 
+    input_contract: FeatureAuditInputContract
     classifier_snapshot_hash: str
     current_request_content_hash: str
     history_content_hashes: tuple[str, ...]
@@ -521,6 +658,11 @@ class FeatureInputAudit:
     truncated_previous_assistant: bool
 
     def __post_init__(self) -> None:
+        if self.input_contract not in {
+            "legacy_mock_snapshot",
+            "canonical_router_input",
+        }:
+            raise ValueError("four_tier_mapping feature audit input contract is invalid")
         for field_name, value in (
             ("classifier_snapshot_hash", self.classifier_snapshot_hash),
             ("current_request_content_hash", self.current_request_content_hash),
@@ -536,13 +678,13 @@ class FeatureInputAudit:
             raise ValueError(
                 "four_tier_mapping feature audit has invalid previous assistant content hash"
             )
-        for field_name, value in (
+        for count_field_name, count_value in (
             ("history_observed_count", self.history_observed_count),
             ("history_retained_count", self.history_retained_count),
             ("attachment_count", self.attachment_count),
         ):
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError(f"four_tier_mapping feature audit has invalid {field_name}")
+            if isinstance(count_value, bool) or not isinstance(count_value, int) or count_value < 0:
+                raise ValueError(f"four_tier_mapping feature audit has invalid {count_field_name}")
         if self.history_retained_count != len(self.history_content_hashes):
             raise ValueError(
                 "four_tier_mapping feature audit retained history count is inconsistent"
@@ -557,7 +699,7 @@ class FeatureInputAudit:
             self.truncated_history_window or any(self.truncated_history_segments)
         ):
             raise ValueError("four_tier_mapping feature audit history truncation is inconsistent")
-        for field_name, value in (
+        for bool_field_name, bool_value in (
             ("missing_context", self.missing_context),
             ("missing_usage", self.missing_usage),
             ("missing_execution", self.missing_execution),
@@ -567,8 +709,8 @@ class FeatureInputAudit:
             ("truncated_history_window", self.truncated_history_window),
             ("truncated_previous_assistant", self.truncated_previous_assistant),
         ):
-            if not isinstance(value, bool):
-                raise ValueError(f"four_tier_mapping feature audit has invalid {field_name}")
+            if not isinstance(bool_value, bool):
+                raise ValueError(f"four_tier_mapping feature audit has invalid {bool_field_name}")
         if any(not isinstance(value, bool) for value in self.truncated_history_segments):
             raise ValueError(
                 "four_tier_mapping feature audit has invalid history segment truncation"
@@ -580,22 +722,33 @@ class FeatureInputAudit:
                 raise ValueError("missing attachment metadata must zero its modality bundle")
         elif len(self.attachment_modalities) != self.attachment_count:
             raise ValueError("attachment metadata must cover every attachment")
-        for field_name, value in (
+        for ref_field_name, ref_value in (
             ("input_message_id", self.input_message_id),
             ("task_start_input_message_id", self.task_start_input_message_id),
         ):
-            if value is not None and not value.strip():
-                raise ValueError(f"four_tier_mapping feature audit has invalid {field_name}")
+            if ref_value is not None and not ref_value.strip():
+                raise ValueError(f"four_tier_mapping feature audit has invalid {ref_field_name}")
 
     def trace(self) -> dict[str, Any]:
-        return {
-            "classifier_snapshot_hash": self.classifier_snapshot_hash,
-            "content_hashes": {
+        if self.input_contract == "canonical_router_input":
+            content_hashes = {
+                "current_request": self.current_request_content_hash,
+                "history_user_segments": list(self.history_content_hashes),
+                "history_user_aggregate": self.history_aggregate_content_hash,
+                "previous_answer": self.previous_assistant_content_hash,
+            }
+            previous_truncation_key = "previous_answer"
+        else:
+            content_hashes = {
                 "current_request": self.current_request_content_hash,
                 "task_user_history_segments": list(self.history_content_hashes),
                 "task_user_history_aggregate": self.history_aggregate_content_hash,
                 "previous_assistant": self.previous_assistant_content_hash,
-            },
+            }
+            previous_truncation_key = "previous_assistant"
+        return {
+            "classifier_snapshot_hash": self.classifier_snapshot_hash,
+            "content_hashes": content_hashes,
             "history_observed_count": self.history_observed_count,
             "history_retained_count": self.history_retained_count,
             "attachment_count": self.attachment_count,
@@ -615,7 +768,7 @@ class FeatureInputAudit:
                 "history": self.truncated_history,
                 "history_window": self.truncated_history_window,
                 "history_segments": list(self.truncated_history_segments),
-                "previous_assistant": self.truncated_previous_assistant,
+                previous_truncation_key: self.truncated_previous_assistant,
             },
         }
 
@@ -648,12 +801,30 @@ class FeatureInputAudit:
         transcript_refs = cast(Mapping[str, Any], transcript_refs)
         missing = cast(Mapping[str, Any], missing)
         truncated = cast(Mapping[str, Any], truncated)
-        if set(content_hashes) != {
+        legacy_content_hash_fields = {
             "current_request",
             "task_user_history_segments",
             "task_user_history_aggregate",
             "previous_assistant",
-        }:
+        }
+        canonical_content_hash_fields = {
+            "current_request",
+            "history_user_segments",
+            "history_user_aggregate",
+            "previous_answer",
+        }
+        content_hash_fields = set(content_hashes)
+        if content_hash_fields == canonical_content_hash_fields:
+            input_contract: FeatureAuditInputContract = "canonical_router_input"
+            history_segments_key = "history_user_segments"
+            history_aggregate_key = "history_user_aggregate"
+            previous_answer_key = "previous_answer"
+        elif content_hash_fields == legacy_content_hash_fields:
+            input_contract = "legacy_mock_snapshot"
+            history_segments_key = "task_user_history_segments"
+            history_aggregate_key = "task_user_history_aggregate"
+            previous_answer_key = "previous_assistant"
+        else:
             raise ValueError("four_tier_mapping feature content hashes are incompatible")
         if set(transcript_refs) != {
             "input_message_id",
@@ -667,15 +838,16 @@ class FeatureInputAudit:
             "attachment_metadata",
         }:
             raise ValueError("four_tier_mapping feature missing mask is incompatible")
-        if set(truncated) != {
+        expected_truncated_fields = {
             "current_request",
             "history",
             "history_window",
             "history_segments",
-            "previous_assistant",
-        }:
+            previous_answer_key,
+        }
+        if set(truncated) != expected_truncated_fields:
             raise ValueError("four_tier_mapping feature truncation mask is incompatible")
-        history_hashes = content_hashes.get("task_user_history_segments")
+        history_hashes = content_hashes.get(history_segments_key)
         history_segments = truncated.get("history_segments")
         attachment_modalities = value.get("attachment_modalities")
         if not isinstance(history_hashes, Sequence) or isinstance(history_hashes, (str, bytes)):
@@ -707,9 +879,9 @@ class FeatureInputAudit:
                 raise ValueError(f"four_tier_mapping feature input has invalid {name}")
             return raw
 
-        previous_hash = content_hashes.get("previous_assistant")
+        previous_hash = content_hashes.get(previous_answer_key)
         if previous_hash is not None and not isinstance(previous_hash, str):
-            raise ValueError("four_tier_mapping feature input has invalid previous assistant hash")
+            raise ValueError("four_tier_mapping feature input has invalid previous answer hash")
 
         def required_hash(container: Mapping[str, Any], name: str) -> str:
             raw = container.get(name)
@@ -720,12 +892,11 @@ class FeatureInputAudit:
         if any(not isinstance(item, str) for item in history_hashes):
             raise ValueError("four_tier_mapping feature input history hashes are malformed")
         return cls(
+            input_contract=input_contract,
             classifier_snapshot_hash=required_hash(value, "classifier_snapshot_hash"),
             current_request_content_hash=required_hash(content_hashes, "current_request"),
             history_content_hashes=tuple(history_hashes),
-            history_aggregate_content_hash=required_hash(
-                content_hashes, "task_user_history_aggregate"
-            ),
+            history_aggregate_content_hash=required_hash(content_hashes, history_aggregate_key),
             history_observed_count=required_count("history_observed_count"),
             history_retained_count=required_count("history_retained_count"),
             previous_assistant_content_hash=previous_hash,
@@ -743,7 +914,7 @@ class FeatureInputAudit:
             truncated_history_segments=tuple(
                 required_bool({"segment": item}, "segment") for item in history_segments
             ),
-            truncated_previous_assistant=required_bool(truncated, "previous_assistant"),
+            truncated_previous_assistant=required_bool(truncated, previous_answer_key),
         )
 
 
@@ -768,6 +939,11 @@ class FixedFourTierDecision:
     feature_input_audit: FeatureInputAudit
     decided_at_ms: int
     policy_hash: str
+    classifier_backend: str
+    classifier_identity: Mapping[str, Any] | None
+    feature_schema_version: str
+    feature_vector_dim: int | None
+    feature_vector_status: str
     effective_mock_seed: int | None
     schema_version: str = SCHEMA_VERSION
 
@@ -778,8 +954,40 @@ class FixedFourTierDecision:
             raise ValueError("four_tier_mapping decision classifier audit is malformed")
         if not isinstance(self.feature_input_audit, FeatureInputAudit):
             raise ValueError("four_tier_mapping decision feature input audit is malformed")
-        if self.schema_version != SCHEMA_VERSION:
+        if self.schema_version not in {SCHEMA_VERSION, *LEGACY_SCHEMA_VERSIONS}:
             raise ValueError("four_tier_mapping decision schema_version is incompatible")
+        if self.classifier_backend not in {"random_mock", "registered_model", "injected"}:
+            raise ValueError("four_tier_mapping decision classifier backend is incompatible")
+        if self.classifier_identity is not None:
+            if not isinstance(self.classifier_identity, Mapping) or not self.classifier_identity:
+                raise ValueError("four_tier_mapping decision classifier identity is invalid")
+            try:
+                json.dumps(self.classifier_identity, sort_keys=True, separators=(",", ":"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "four_tier_mapping decision classifier identity is not JSON-safe"
+                ) from exc
+        if not isinstance(self.feature_schema_version, str) or not self.feature_schema_version:
+            raise ValueError("four_tier_mapping decision feature schema is invalid")
+        if self.feature_vector_dim is not None and (
+            isinstance(self.feature_vector_dim, bool)
+            or not isinstance(self.feature_vector_dim, int)
+            or self.feature_vector_dim <= 0
+        ):
+            raise ValueError("four_tier_mapping decision feature dimension is invalid")
+        if self.feature_vector_status not in {"mock_not_materialized", "materialized"}:
+            raise ValueError("four_tier_mapping decision feature status is invalid")
+        if self.feature_vector_status == "materialized" and self.classifier_identity is None:
+            raise ValueError("materialized classifier features require a runtime identity")
+        if self.classifier_backend == "registered_model":
+            _validate_registered_classifier_contract(
+                identity=self.classifier_identity,
+                feature_schema_version=self.feature_schema_version,
+                feature_vector_dim=self.feature_vector_dim,
+                feature_vector_status=self.feature_vector_status,
+            )
+            if self.feature_input_audit.input_contract != "canonical_router_input":
+                raise ValueError("registered model decision requires a canonical RouterInput audit")
         for field_name, value in (
             ("route_id", self.route_id),
             ("task_id", self.task_id),
@@ -805,13 +1013,17 @@ class FixedFourTierDecision:
         expected_switched = self.previous_tier is not None and self.previous_tier != self.final_tier
         if self.switched != expected_switched:
             raise ValueError("four_tier_mapping decision switched flag is inconsistent")
-        for field_name, value in (
+        for numeric_field_name, numeric_value in (
             ("history_turns_to_keep", self.history_turns_to_keep),
             ("task_turn_index", self.task_turn_index),
             ("decided_at_ms", self.decided_at_ms),
         ):
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError(f"four_tier_mapping decision has invalid {field_name}")
+            if (
+                isinstance(numeric_value, bool)
+                or not isinstance(numeric_value, int)
+                or numeric_value < 0
+            ):
+                raise ValueError(f"four_tier_mapping decision has invalid {numeric_field_name}")
         if not _is_sha256(self.input_snapshot_hash):
             raise ValueError("four_tier_mapping decision has invalid input snapshot hash")
         if self.tier_snapshot_hash is not None and not _is_sha256(self.tier_snapshot_hash):
@@ -824,6 +1036,8 @@ class FixedFourTierDecision:
             or not 0 <= self.effective_mock_seed <= (1 << 64) - 1
         ):
             raise ValueError("four_tier_mapping decision has invalid effective mock seed")
+        if self.classifier_backend == "registered_model" and self.effective_mock_seed is not None:
+            raise ValueError("registered model decision cannot carry a mock seed")
 
         intent = cast(Intent, self.intent.final)
         if intent == "new_task":
@@ -882,11 +1096,15 @@ class FixedFourTierDecision:
             "task_id": self.task_id,
             "request_id": self.request_id,
             "decided_at_ms": self.decided_at_ms,
-            "feature_schema_version": FEATURE_SCHEMA_VERSION,
-            "feature_vector_dim": FEATURE_VECTOR_DIM,
-            "feature_vector_status": FEATURE_VECTOR_STATUS,
+            "feature_schema_version": self.feature_schema_version,
+            "feature_vector_dim": self.feature_vector_dim,
+            "feature_vector_status": self.feature_vector_status,
             "feature_input": self.feature_input_audit.trace(),
             "policy_hash": self.policy_hash,
+            "classifier_backend": self.classifier_backend,
+            "classifier_identity": (
+                dict(self.classifier_identity) if self.classifier_identity is not None else None
+            ),
             "effective_mock_seed": self.effective_mock_seed,
             "intent": self.intent.trace(),
             "tier": self.tier.trace(),
@@ -909,14 +1127,39 @@ class FixedFourTierDecision:
 
         if value.get("mode") != MODE:
             raise ValueError("four_tier_mapping decision mode is incompatible")
-        if value.get("schema_version") != SCHEMA_VERSION:
+        schema_version_value = value.get("schema_version")
+        if schema_version_value not in {SCHEMA_VERSION, *LEGACY_SCHEMA_VERSIONS}:
             raise ValueError("four_tier_mapping decision schema_version is incompatible")
-        if value.get("feature_schema_version") != FEATURE_SCHEMA_VERSION:
+        feature_schema_value = value.get("feature_schema_version")
+        feature_dim_value = value.get("feature_vector_dim")
+        feature_status_value = value.get("feature_vector_status")
+        if not isinstance(feature_schema_value, str) or not feature_schema_value:
             raise ValueError("four_tier_mapping decision feature schema is incompatible")
-        if value.get("feature_vector_dim") != FEATURE_VECTOR_DIM:
+        if feature_dim_value is not None and (
+            isinstance(feature_dim_value, bool)
+            or not isinstance(feature_dim_value, int)
+            or feature_dim_value <= 0
+        ):
             raise ValueError("four_tier_mapping decision feature dimension is incompatible")
-        if value.get("feature_vector_status") != FEATURE_VECTOR_STATUS:
+        if feature_status_value not in {"mock_not_materialized", "materialized"}:
             raise ValueError("four_tier_mapping decision feature status is incompatible")
+        if schema_version_value in LEGACY_SCHEMA_VERSIONS and (
+            feature_schema_value != FEATURE_SCHEMA_VERSION
+            or feature_dim_value != FEATURE_VECTOR_DIM
+            or feature_status_value != FEATURE_VECTOR_STATUS
+        ):
+            raise ValueError("four_tier_mapping legacy decision feature contract is incompatible")
+        classifier_backend_value = value.get("classifier_backend")
+        classifier_identity_value = value.get("classifier_identity")
+        if schema_version_value in LEGACY_SCHEMA_VERSIONS:
+            classifier_backend_value = "random_mock"
+            classifier_identity_value = None
+        if classifier_backend_value not in {"random_mock", "registered_model", "injected"}:
+            raise ValueError("four_tier_mapping decision classifier backend is incompatible")
+        if classifier_identity_value is not None and (
+            not isinstance(classifier_identity_value, Mapping) or not classifier_identity_value
+        ):
+            raise ValueError("four_tier_mapping decision classifier identity is incompatible")
 
         def audit(
             name: str,
@@ -1085,8 +1328,17 @@ class FixedFourTierDecision:
             feature_input_audit=FeatureInputAudit.from_trace(value.get("feature_input")),
             decided_at_ms=cast(int, decided_at_value),
             policy_hash=required_string("policy_hash"),
+            classifier_backend=cast(str, classifier_backend_value),
+            classifier_identity=(
+                dict(classifier_identity_value)
+                if isinstance(classifier_identity_value, Mapping)
+                else None
+            ),
+            feature_schema_version=feature_schema_value,
+            feature_vector_dim=cast(int | None, feature_dim_value),
+            feature_vector_status=cast(str, feature_status_value),
             effective_mock_seed=cast(int | None, effective_seed_value),
-            schema_version=SCHEMA_VERSION,
+            schema_version=cast(str, schema_version_value),
         )
 
 
@@ -1143,7 +1395,7 @@ class FixedFourTierTaskState:
         }
         if set(payload) != expected_keys:
             raise ValueError("four_tier_mapping task state payload shape is incompatible")
-        if payload.get("schema_version") != SCHEMA_VERSION:
+        if payload.get("schema_version") not in {SCHEMA_VERSION, *LEGACY_SCHEMA_VERSIONS}:
             raise ValueError("four_tier_mapping task state schema_version is incompatible")
         task_id = payload.get("task_id")
         tier_value = payload.get("tier")
@@ -1188,13 +1440,11 @@ def _snapshot_hash(snapshot: Mapping[str, Any]) -> str:
 
 
 def _bounded_text(value: str | None) -> tuple[str | None, bool]:
-    """Apply the mock feature contract's deterministic 510-token proxy bound.
+    """Apply the legacy audit/mock contract's deterministic proxy bound.
 
-    The production extractor will tokenize with the frozen BGE tokenizer.  The
-    classifier is intentionally mocked in this version, so a conservative
-    four-characters-per-token proxy keeps snapshots bounded without pretending
-    that a tokenizer/model artifact ran.  Head/tail truncation follows the
-    documented 3:1 split and is explicitly audited.
+    A registered model reads the unmodified nested ``router_input`` and lets
+    its frozen tokenizer own truncation.  This bounded projection keeps legacy
+    random-mock snapshots and their content-safe audit stable.
     """
 
     if value is None:
@@ -1210,7 +1460,7 @@ def _bounded_text(value: str | None) -> tuple[str | None, bool]:
 def _bounded_task_history(
     history: Sequence[str],
 ) -> tuple[list[str], bool, list[bool]]:
-    """Keep task-start plus at most the three most recent user messages."""
+    """Keep the four most recent route-before user messages."""
 
     normalized, history_truncated = _retained_task_history(history)
     bounded: list[str] = []
@@ -1224,9 +1474,9 @@ def _bounded_task_history(
 
 def _retained_task_history(history: Sequence[str]) -> tuple[list[str], bool]:
     normalized = [str(value) for value in history]
-    history_truncated = len(normalized) > (_RECENT_TASK_USER_MESSAGES + 1)
+    history_truncated = len(normalized) > _HISTORY_USER_MESSAGES
     if history_truncated:
-        normalized = [normalized[0], *normalized[-_RECENT_TASK_USER_MESSAGES:]]
+        normalized = normalized[-_HISTORY_USER_MESSAGES:]
     return normalized, history_truncated
 
 
@@ -1293,9 +1543,9 @@ def _feature_input_audit(
     request: RoutingRequest,
     state: FixedFourTierTaskState | None,
     snapshot: Mapping[str, Any],
+    *,
+    classifier_backend: str,
 ) -> FeatureInputAudit:
-    active_history = request.user_history if state is not None else ()
-    retained_history, _ = _retained_task_history(active_history)
     missing = snapshot.get("missing")
     truncated = snapshot.get("truncated")
     if not isinstance(missing, Mapping) or not isinstance(truncated, Mapping):
@@ -1303,13 +1553,6 @@ def _feature_input_audit(
             "four_tier_mapping feature masks are unavailable",
             reason="feature_masks_unavailable",
         )
-    history_segments = truncated.get("history_segments")
-    if not isinstance(history_segments, Sequence) or isinstance(history_segments, (str, bytes)):
-        raise FixedFourTierRoutingError(
-            "four_tier_mapping history truncation mask is unavailable",
-            reason="feature_masks_unavailable",
-        )
-    previous_assistant = request.previous_assistant_text if state is not None else None
     attachment_modalities_value = snapshot.get("attachment_modalities")
     if not isinstance(attachment_modalities_value, Sequence) or isinstance(
         attachment_modalities_value, (str, bytes)
@@ -1318,12 +1561,74 @@ def _feature_input_audit(
             "four_tier_mapping attachment metadata bundle is unavailable",
             reason="feature_masks_unavailable",
         )
+
+    if classifier_backend == "registered_model":
+        router_input = snapshot.get("router_input")
+        if not isinstance(router_input, Mapping):
+            raise FixedFourTierRoutingError(
+                "four_tier_mapping canonical RouterInput is unavailable",
+                reason="canonical_router_input_unavailable",
+            )
+        current_request = router_input.get("current_request")
+        history_user = router_input.get("history_user")
+        previous_answer = router_input.get("previous_answer")
+        if (
+            not isinstance(current_request, str)
+            or not isinstance(history_user, Sequence)
+            or isinstance(history_user, (str, bytes))
+            or any(not isinstance(value, str) for value in history_user)
+            or not isinstance(previous_answer, str)
+        ):
+            raise FixedFourTierRoutingError(
+                "four_tier_mapping canonical RouterInput text bundle is malformed",
+                reason="canonical_router_input_unavailable",
+            )
+        retained_history = [str(value) for value in history_user]
+        if tuple(retained_history) != request.user_history[-_HISTORY_USER_MESSAGES:]:
+            raise FixedFourTierRoutingError(
+                "four_tier_mapping canonical RouterInput history is inconsistent",
+                reason="canonical_router_input_unavailable",
+            )
+        history_window_truncated = len(request.user_history) > len(retained_history)
+        input_contract: FeatureAuditInputContract = "canonical_router_input"
+        classifier_snapshot_hash = _snapshot_hash(router_input)
+        history_aggregate_content_hash = _snapshot_hash({"history_user": retained_history})
+        history_observed_count = len(request.user_history)
+        history_segments = (False,) * len(retained_history)
+        truncated_current_request = False
+        truncated_history = history_window_truncated
+        truncated_previous_assistant = False
+        previous_assistant = previous_answer or None
+    else:
+        active_history = request.user_history if state is not None else ()
+        retained_history, _ = _retained_task_history(active_history)
+        raw_history_segments = truncated.get("history_segments")
+        if not isinstance(raw_history_segments, Sequence) or isinstance(
+            raw_history_segments, (str, bytes)
+        ):
+            raise FixedFourTierRoutingError(
+                "four_tier_mapping history truncation mask is unavailable",
+                reason="feature_masks_unavailable",
+            )
+        input_contract = "legacy_mock_snapshot"
+        classifier_snapshot_hash = _snapshot_hash(snapshot)
+        current_request = request.message
+        history_aggregate_content_hash = _snapshot_hash({"task_user_history": list(active_history)})
+        history_observed_count = len(active_history)
+        history_segments = tuple(bool(value) for value in raw_history_segments)
+        history_window_truncated = bool(truncated.get("history_window"))
+        truncated_current_request = bool(truncated.get("current_request"))
+        truncated_history = bool(truncated.get("history"))
+        truncated_previous_assistant = bool(truncated.get("previous_assistant"))
+        previous_assistant = request.previous_assistant_text if state is not None else None
+
     return FeatureInputAudit(
-        classifier_snapshot_hash=_snapshot_hash(snapshot),
-        current_request_content_hash=_content_hash(request.message),
+        input_contract=input_contract,
+        classifier_snapshot_hash=classifier_snapshot_hash,
+        current_request_content_hash=_content_hash(current_request),
         history_content_hashes=tuple(_content_hash(value) for value in retained_history),
-        history_aggregate_content_hash=_snapshot_hash({"task_user_history": list(active_history)}),
-        history_observed_count=len(active_history),
+        history_aggregate_content_hash=history_aggregate_content_hash,
+        history_observed_count=history_observed_count,
         history_retained_count=len(retained_history),
         previous_assistant_content_hash=(
             _content_hash(previous_assistant) if previous_assistant is not None else None
@@ -1338,11 +1643,11 @@ def _feature_input_audit(
         missing_usage=bool(missing.get("usage")),
         missing_execution=bool(missing.get("execution")),
         missing_attachment_metadata=bool(missing.get("attachment_metadata")),
-        truncated_current_request=bool(truncated.get("current_request")),
-        truncated_history=bool(truncated.get("history")),
-        truncated_history_window=bool(truncated.get("history_window")),
-        truncated_history_segments=tuple(bool(value) for value in history_segments),
-        truncated_previous_assistant=bool(truncated.get("previous_assistant")),
+        truncated_current_request=truncated_current_request,
+        truncated_history=truncated_history,
+        truncated_history_window=history_window_truncated,
+        truncated_history_segments=tuple(history_segments),
+        truncated_previous_assistant=truncated_previous_assistant,
     )
 
 
@@ -1377,6 +1682,8 @@ def _classifier_audit(
     try:
         result = predict()
     except Exception as exc:  # noqa: BLE001 - local model failures have a defined fallback
+        if getattr(exc, "fail_closed", False) is True:
+            raise
         return ClassificationAudit(
             source="fallback",
             run_status="error",
@@ -1551,10 +1858,62 @@ class FixedFourTierV2Router:
         self._effective_mock_seed = (
             effective_mock_seed if intent_classifier is None or tier_classifier is None else None
         )
+        classifier_backends = {
+            str(getattr(classifier, "backend", "") or "injected")
+            for classifier in (self._intent_classifier, self._tier_classifier)
+        }
+        self._classifier_backend = (
+            next(iter(classifier_backends)) if len(classifier_backends) == 1 else "injected"
+        )
+        classifier_identities = [
+            getattr(classifier, "identity", None)
+            for classifier in (self._intent_classifier, self._tier_classifier)
+        ]
+        self._classifier_identity = (
+            dict(classifier_identities[0])
+            if isinstance(classifier_identities[0], Mapping)
+            and classifier_identities[0] == classifier_identities[1]
+            else None
+        )
+        feature_schemas = {
+            str(getattr(classifier, "feature_schema_version", FEATURE_SCHEMA_VERSION))
+            for classifier in (self._intent_classifier, self._tier_classifier)
+        }
+        feature_statuses = {
+            str(getattr(classifier, "feature_vector_status", FEATURE_VECTOR_STATUS))
+            for classifier in (self._intent_classifier, self._tier_classifier)
+        }
+        feature_dimensions = {
+            getattr(classifier, "feature_vector_dim", FEATURE_VECTOR_DIM)
+            for classifier in (self._intent_classifier, self._tier_classifier)
+        }
+        self._feature_schema_version = (
+            next(iter(feature_schemas)) if len(feature_schemas) == 1 else FEATURE_SCHEMA_VERSION
+        )
+        self._feature_vector_status = (
+            next(iter(feature_statuses)) if len(feature_statuses) == 1 else FEATURE_VECTOR_STATUS
+        )
+        self._feature_vector_dim = (
+            next(iter(feature_dimensions)) if len(feature_dimensions) == 1 else FEATURE_VECTOR_DIM
+        )
+        # Registry status is live authorization evidence and can legitimately
+        # move from CANDIDATE to VALIDATED while this exact hash-pinned model is
+        # resident.  The opt-in policy is already frozen in ``policy_config``;
+        # exclude the mutable observed status so the policy identity remains
+        # stable across that administrative transition.
+        policy_classifier_identity = (
+            dict(self._classifier_identity) if self._classifier_identity is not None else None
+        )
+        if policy_classifier_identity is not None:
+            policy_classifier_identity.pop("registry_status", None)
         policy_payload = {
             "schema_version": SCHEMA_VERSION,
             "rule_version": RULE_VERSION,
-            "feature_schema_version": FEATURE_SCHEMA_VERSION,
+            "feature_schema_version": self._feature_schema_version,
+            "feature_vector_dim": self._feature_vector_dim,
+            "feature_vector_status": self._feature_vector_status,
+            "classifier_backend": self._classifier_backend,
+            "classifier_identity": policy_classifier_identity,
             "intent_classifier_version": str(getattr(self._intent_classifier, "version", "") or ""),
             "tier_classifier_version": str(getattr(self._tier_classifier, "version", "") or ""),
             "effective_mock_seed": self._effective_mock_seed,
@@ -1587,6 +1946,25 @@ class FixedFourTierV2Router:
         previous_usage, previous_execution = _previous_metadata_bundles(
             request.previous_assistant_usage if state is not None else None
         )
+        # This nested object is the canonical training/serving contract.  It
+        # intentionally uses the raw route-before text and the latest four
+        # cross-task user turns; the frozen training feature runtime owns all
+        # tokenization and truncation.  The surrounding legacy fields remain
+        # bounded for mock compatibility and content-safe auditing.
+        model_previous_usage, _ = _previous_metadata_bundles(request.previous_assistant_usage)
+        router_input = {
+            "current_request": request.message,
+            "task_anchor": request.task_anchor or "",
+            "history_user": list(request.user_history[-4:]),
+            "previous_answer": request.previous_assistant_text or "",
+            "previous_usage": model_previous_usage or {},
+            "previous_outcome": request.previous_outcome,
+            "active_route_tier": state.tier.upper() if state is not None else None,
+            "route_history": [dict(value) for value in request.route_history[-5:]],
+            "context": dict(request.context or {}),
+            "tool_state": dict(request.tool_state or {}),
+            "attachments": [dict(value) for value in request.attachments],
+        }
         snapshot = {
             "schema_version": SCHEMA_VERSION,
             "feature_schema_version": FEATURE_SCHEMA_VERSION,
@@ -1603,6 +1981,7 @@ class FixedFourTierV2Router:
             "previous_assistant_text": previous_assistant_text,
             "previous_assistant_usage": previous_usage,
             "previous_execution": previous_execution,
+            "router_input": router_input,
             # Count and modalities form one optional schema bundle. If any
             # item's metadata is missing, zero all base values and use the
             # missing mask instead of exposing a partially populated group.
@@ -1670,6 +2049,8 @@ class FixedFourTierV2Router:
                 "task_reset_mask": True,
             }
         )
+        # Never mask ``router_input``.  The trained contract defines new_task
+        # as the current intent label, not as absence of route-before history.
         return masked
 
     def _intent_decision(
@@ -1818,6 +2199,7 @@ class FixedFourTierV2Router:
             request,
             state,
             classifier_snapshot,
+            classifier_backend=self._classifier_backend,
         )
         intent_audit = self._intent_decision(request, state, classifier_snapshot)
         intent_value = intent_audit.final
@@ -1881,6 +2263,20 @@ class FixedFourTierV2Router:
                 task_start_input_message_id=state.task_start_input_message_id,
             )
 
+        decision_classifier_identity = self._classifier_identity
+        if self._classifier_backend == "registered_model":
+            current_intent_identity = getattr(self._intent_classifier, "identity", None)
+            current_tier_identity = getattr(self._tier_classifier, "identity", None)
+            if (
+                not isinstance(current_intent_identity, Mapping)
+                or current_intent_identity != current_tier_identity
+            ):
+                raise FixedFourTierRoutingError(
+                    "registered classifier runtime identity changed incompatibly",
+                    reason="classifier_identity_unavailable",
+                )
+            decision_classifier_identity = dict(current_intent_identity)
+
         decision = FixedFourTierDecision(
             route_id=self._route_id_factory(),
             task_id=task_id,
@@ -1901,9 +2297,27 @@ class FixedFourTierV2Router:
             feature_input_audit=feature_input_audit,
             decided_at_ms=self._clock_ms(),
             policy_hash=self._policy_hash,
+            classifier_backend=self._classifier_backend,
+            classifier_identity=decision_classifier_identity,
+            feature_schema_version=self._feature_schema_version,
+            feature_vector_dim=self._feature_vector_dim,
+            feature_vector_status=self._feature_vector_status,
             effective_mock_seed=self._effective_mock_seed,
         )
         return decision, next_state
+
+    def close(self) -> None:
+        """Release an injected model runtime once, if it owns resources."""
+
+        closed: set[int] = set()
+        for classifier in (self._intent_classifier, self._tier_classifier):
+            identity = id(classifier)
+            if identity in closed:
+                continue
+            closed.add(identity)
+            close = getattr(classifier, "close", None)
+            if callable(close):
+                close()
 
     def route(
         self,

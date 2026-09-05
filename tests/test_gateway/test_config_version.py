@@ -223,7 +223,7 @@ def test_env_config_version_never_overrides_payload_stamp(
     persist_target = tmp_path / "persisted.toml"
     config_store.persist_config(cfg, path=persist_target, backup=False)
     text = persist_target.read_text(encoding="utf-8")
-    assert "config_version = 1" in text
+    assert f"config_version = {LATEST_CONFIG_VERSION}" in text
     assert "config_version = 99" not in text
 
 
@@ -280,7 +280,7 @@ def test_migrating_load_writes_stamp_into_rewritten_file(tmp_path: Path) -> None
     assert cfg.llm_ensemble.proposer_timeout_seconds == 3600.0
     assert list(tmp_path.glob("config.toml.backup.*"))
     text = toml_path.read_text(encoding="utf-8")
-    assert "config_version = 1" in text
+    assert f"config_version = {LATEST_CONFIG_VERSION}" in text
     assert "proposer_timeout_seconds = 3600.0" in text
 
     # The stamped file must load cleanly with no further rewrite.
@@ -369,7 +369,7 @@ async def test_config_patch_skips_config_version(tmp_path: Path) -> None:
     assert cfg.config_version == LATEST_CONFIG_VERSION
     assert cfg.diagnostics_enabled is True
     persisted = config_path.read_text(encoding="utf-8")
-    assert "config_version = 1" in persisted
+    assert f"config_version = {LATEST_CONFIG_VERSION}" in persisted
     assert "config_version = 99" not in persisted
 
 

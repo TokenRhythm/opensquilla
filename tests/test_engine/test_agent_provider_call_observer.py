@@ -85,7 +85,7 @@ def test_observer_receives_one_sample_per_successful_call() -> None:
     def observer(**kwargs: Any) -> None:
         calls.append(kwargs)
 
-    _run_turn(
+    events = _run_turn(
         AgentConfig(
             max_iterations=2,
             provider_id="vllm",
@@ -103,6 +103,8 @@ def test_observer_receives_one_sample_per_successful_call() -> None:
     assert sample["ttft_ms"] is not None
     assert sample["ttft_ms"] >= 0
     assert sample["duration_ms"] >= 0
+    done = next(event for event in events if getattr(event, "kind", "") == "done")
+    assert abs(done.duration_ms - sample["duration_ms"]) <= 5
 
 
 def test_observer_falls_back_to_adapter_provider_name() -> None:

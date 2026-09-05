@@ -313,3 +313,12 @@ def test_turn_usage_payload_carries_decision_id() -> None:
     legacy = _turn_usage_payload(DoneEvent(input_tokens=5, output_tokens=3), resolved_model="m")
     assert legacy is not None
     assert legacy["decision_id"] is None
+
+
+def test_turn_usage_payload_carries_provider_duration_for_router_features() -> None:
+    done = DoneEvent(input_tokens=5, output_tokens=3, duration_ms=1234)
+
+    payload = _turn_usage_payload(done, resolved_model="m")
+
+    assert payload is not None
+    assert payload["duration_ms"] == 1234

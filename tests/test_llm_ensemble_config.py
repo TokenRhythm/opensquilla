@@ -11,11 +11,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import tomli_w
 from pydantic import ValidationError
 
 from opensquilla.eval.draco_experiment_config import load_draco_experiment_config
 from opensquilla.gateway.config import (
     FixedFourTierV2Config,
+    FixedFourTierV2RandomMockClassifierConfig,
+    FixedFourTierV2RegisteredModelClassifierConfig,
     GatewayConfig,
     LlmEnsembleConfig,
     LlmProviderProfile,
@@ -276,7 +279,13 @@ def test_fixed_four_tier_v2_defaults_match_the_frozen_ladder() -> None:
     route = cfg.llm_ensemble.four_tier_mapping
     assert route is not None
     assert route.mock_seed == 20260826
-    assert route.schema_version == "fixed-four-tier-v2-mock-v2"
+    assert route.schema_version == "fixed-four-tier-v2-v3"
+    assert route.classifier == FixedFourTierV2RandomMockClassifierConfig(seed=20260826)
+    assert route.model_dump(mode="json")["classifier"] == {
+        "backend": "random_mock",
+        "seed": 20260826,
+    }
+    assert "mock_seed" not in route.model_dump(mode="json")
     assert route.default_new_task_tier == "c1"
     assert {
         tier: (
@@ -315,6 +324,9 @@ def test_fixed_four_tier_v2_can_be_parked_without_losing_its_mode() -> None:
             "enabled": False,
             "mode": "single",
             "selection_mode": "four_tier_mapping",
+            "four_tier_mapping": {
+                "classifier": {"backend": "random_mock"},
+            },
         }
     )
 
@@ -322,6 +334,20 @@ def test_fixed_four_tier_v2_can_be_parked_without_losing_its_mode() -> None:
     assert cfg.llm_ensemble.mode == "single"
     assert cfg.llm_ensemble.selection_mode == "four_tier_mapping"
     assert cfg.llm_ensemble.four_tier_mapping is not None
+    assert cfg.llm_ensemble.four_tier_mapping.classifier.backend == "random_mock"
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_fixed_four_tier_v3_requires_an_explicit_classifier(enabled: bool) -> None:
+    with pytest.raises(ValidationError, match="classifier"):
+        GatewayConfig(
+            llm_ensemble={
+                "enabled": enabled,
+                "mode": "single",
+                "selection_mode": "four_tier_mapping",
+                "four_tier_mapping": {},
+            }
+        )
 
 
 def test_fixed_four_tier_v2_requires_single_execution_topology() -> None:
@@ -337,13 +363,173 @@ def test_fixed_four_tier_v2_requires_single_execution_topology() -> None:
 
 @pytest.mark.parametrize("mock_seed", [True, -1, 1 << 64])
 def test_fixed_four_tier_v2_rejects_invalid_mock_seed(mock_seed: object) -> None:
-    with pytest.raises(ValueError, match="mock_seed"):
+    with pytest.raises(ValueError, match="seed"):
         GatewayConfig(
             llm_ensemble={
                 "enabled": True,
                 "mode": "single",
                 "selection_mode": "four_tier_mapping",
                 "four_tier_mapping": {"mock_seed": mock_seed},
+            }
+        )
+
+
+@pytest.mark.parametrize("seed", [True, -1, 1 << 64])
+def test_fixed_four_tier_v2_rejects_invalid_nested_random_seed(seed: object) -> None:
+    with pytest.raises(ValidationError, match="seed"):
+        FixedFourTierV2Config(classifier={"backend": "random_mock", "seed": seed})
+
+
+def test_fixed_four_tier_v2_registered_model_config_round_trips() -> None:
+    route = FixedFourTierV2Config(
+        classifier={
+            "backend": "registered_model",
+            "artifact_root": "/root/routing-training-system/var/pai-full-v1/artifacts",
+            "metadata_db": "/root/routing-training-system/var/pai-full-v1/metadata.sqlite3",
+            "model_set_id": "router-bert-8m-99d6ff75-c7f4801-a3",
+            "expected_manifest_hash": f"sha256:{'a' * 64}",
+        }
+    )
+
+    assert route.mock_seed is None
+    assert route.classifier == FixedFourTierV2RegisteredModelClassifierConfig(
+        artifact_root=Path("/root/routing-training-system/var/pai-full-v1/artifacts"),
+        metadata_db=Path("/root/routing-training-system/var/pai-full-v1/metadata.sqlite3"),
+        model_set_id="router-bert-8m-99d6ff75-c7f4801-a3",
+        expected_manifest_hash=f"sha256:{'a' * 64}",
+    )
+    assert route.model_dump(mode="json")["classifier"] == {
+        "backend": "registered_model",
+        "artifact_root": "/root/routing-training-system/var/pai-full-v1/artifacts",
+        "metadata_db": "/root/routing-training-system/var/pai-full-v1/metadata.sqlite3",
+        "model_set_id": "router-bert-8m-99d6ff75-c7f4801-a3",
+        "expected_manifest_hash": f"sha256:{'a' * 64}",
+        "allow_candidate": False,
+    }
+    assert route.model_dump()["classifier"]["artifact_root"] == (
+        "/root/routing-training-system/var/pai-full-v1/artifacts"
+    )
+
+
+def test_fixed_four_tier_v2_registered_model_gateway_serialization_round_trips(
+    tmp_path: Path,
+) -> None:
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "enabled": True,
+            "mode": "single",
+            "selection_mode": "four_tier_mapping",
+            "four_tier_mapping": {
+                "classifier": {
+                    "backend": "registered_model",
+                    "artifact_root": "/artifacts",
+                    "metadata_db": "/metadata.sqlite3",
+                    "model_set_id": "router-bert-8m-a3",
+                    "expected_manifest_hash": f"sha256:{'a' * 64}",
+                }
+            },
+        }
+    )
+
+    model_classifier = cfg.model_dump()["llm_ensemble"]["four_tier_mapping"]["classifier"]
+    toml_classifier = cfg.to_toml_dict()["llm_ensemble"]["four_tier_mapping"]["classifier"]
+    public_classifier = cfg.to_public_dict()["llm_ensemble"]["four_tier_mapping"]["classifier"]
+    for classifier in (model_classifier, toml_classifier, public_classifier):
+        assert classifier["artifact_root"] == "/artifacts"
+        assert classifier["metadata_db"] == "/metadata.sqlite3"
+        assert isinstance(classifier["artifact_root"], str)
+        assert isinstance(classifier["metadata_db"], str)
+
+    toml_path = tmp_path / "config.toml"
+    toml_path.write_text(tomli_w.dumps(cfg.to_toml_dict()), encoding="utf-8")
+    restored = GatewayConfig.load_from_toml(toml_path)
+    restored_route = restored.llm_ensemble.four_tier_mapping
+    assert restored_route is not None
+    assert restored_route.classifier == cfg.llm_ensemble.four_tier_mapping.classifier
+
+    public_json = json.dumps(cfg.to_public_dict())
+    assert json.loads(public_json)["llm_ensemble"]["four_tier_mapping"]["classifier"] == (
+        public_classifier
+    )
+
+
+def test_fixed_four_tier_v2_registered_model_can_explicitly_allow_candidate() -> None:
+    route = FixedFourTierV2Config(
+        classifier={
+            "backend": "registered_model",
+            "artifact_root": "/artifacts",
+            "metadata_db": "/metadata.sqlite3",
+            "model_set_id": "router-lightgbm-a1",
+            "expected_manifest_hash": f"sha256:{'1' * 64}",
+            "allow_candidate": True,
+        }
+    )
+
+    assert isinstance(route.classifier, FixedFourTierV2RegisteredModelClassifierConfig)
+    assert route.classifier.allow_candidate is True
+
+
+@pytest.mark.parametrize("field", ["artifact_root", "metadata_db"])
+def test_fixed_four_tier_v2_registered_model_requires_absolute_paths(field: str) -> None:
+    classifier = {
+        "backend": "registered_model",
+        "artifact_root": "/artifacts",
+        "metadata_db": "/metadata.sqlite3",
+        "model_set_id": "router-bert-8m-a3",
+        "expected_manifest_hash": f"sha256:{'a' * 64}",
+    }
+    classifier[field] = "relative/path"
+
+    with pytest.raises(ValidationError, match="paths must be absolute"):
+        FixedFourTierV2Config(classifier=classifier)
+
+
+@pytest.mark.parametrize(
+    "model_set_id",
+    ["", "../router", "/router", "router/model", "router model", "a" * 257],
+)
+def test_fixed_four_tier_v2_registered_model_rejects_unsafe_id(model_set_id: str) -> None:
+    with pytest.raises(ValidationError, match="model_set_id"):
+        FixedFourTierV2Config(
+            classifier={
+                "backend": "registered_model",
+                "artifact_root": "/artifacts",
+                "metadata_db": "/metadata.sqlite3",
+                "model_set_id": model_set_id,
+                "expected_manifest_hash": f"sha256:{'a' * 64}",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "manifest_hash",
+    ["", "a" * 64, f"sha256:{'a' * 63}", f"sha256:{'A' * 64}"],
+)
+def test_fixed_four_tier_v2_registered_model_rejects_invalid_manifest_hash(
+    manifest_hash: str,
+) -> None:
+    with pytest.raises(ValidationError, match="expected_manifest_hash"):
+        FixedFourTierV2Config(
+            classifier={
+                "backend": "registered_model",
+                "artifact_root": "/artifacts",
+                "metadata_db": "/metadata.sqlite3",
+                "model_set_id": "router-bert-8m-a3",
+                "expected_manifest_hash": manifest_hash,
+            }
+        )
+
+
+def test_fixed_four_tier_v2_classifier_is_discriminated_and_forbids_extra_fields() -> None:
+    with pytest.raises(ValidationError, match="union_tag_invalid"):
+        FixedFourTierV2Config(classifier={"backend": "unknown"})
+
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        FixedFourTierV2Config(
+            classifier={
+                "backend": "random_mock",
+                "seed": 7,
+                "artifact_root": "/artifacts",
             }
         )
 
@@ -356,6 +542,7 @@ def test_fixed_four_tier_v2_requires_exactly_four_tiers() -> None:
                 "mode": "single",
                 "selection_mode": "four_tier_mapping",
                 "four_tier_mapping": {
+                    "classifier": {"backend": "random_mock"},
                     "tiers": {
                         "c0": {
                             "provider": "openrouter",
@@ -370,7 +557,9 @@ def test_fixed_four_tier_v2_requires_exactly_four_tiers() -> None:
 
 
 def test_fixed_four_tier_v2_rejects_ladder_override() -> None:
-    defaults = FixedFourTierV2Config().model_dump(mode="json")
+    defaults = FixedFourTierV2Config(
+        classifier={"backend": "random_mock"}
+    ).model_dump(mode="json")
     defaults["tiers"]["c3"]["model"] = "some/other-model"
 
     with pytest.raises(ValueError, match="frozen ladder"):
@@ -396,12 +585,23 @@ def test_fixed_four_tier_v2_rejects_explicit_null_config() -> None:
         )
 
 
-def test_fixed_four_tier_v1_config_migrates_without_mutating_input() -> None:
-    legacy = FixedFourTierV2Config().model_dump(mode="json")
-    legacy["schema_version"] = "fixed-four-tier-v2-mock-v1"
+@pytest.mark.parametrize(
+    "legacy_schema",
+    ["fixed-four-tier-v2-mock-v1", "fixed-four-tier-v2-mock-v2"],
+)
+def test_fixed_four_tier_legacy_config_migrates_without_mutating_input(
+    legacy_schema: str,
+) -> None:
+    legacy = FixedFourTierV2Config(
+        classifier={"backend": "random_mock"}
+    ).model_dump(mode="json")
+    legacy["schema_version"] = legacy_schema
+    legacy["mock_seed"] = 17
+    legacy.pop("classifier")
     legacy["max_session_states"] = 128
-    for deployment in legacy["tiers"].values():
-        deployment.pop("deployment_version")
+    if legacy_schema == "fixed-four-tier-v2-mock-v1":
+        for deployment in legacy["tiers"].values():
+            deployment.pop("deployment_version")
     original = copy.deepcopy(legacy)
 
     gateway = GatewayConfig(
@@ -416,7 +616,9 @@ def test_fixed_four_tier_v1_config_migrates_without_mutating_input() -> None:
 
     assert legacy == original
     assert migrated is not None
-    assert migrated.schema_version == "fixed-four-tier-v2-mock-v2"
+    assert migrated.schema_version == "fixed-four-tier-v2-v3"
+    assert migrated.classifier == FixedFourTierV2RandomMockClassifierConfig(seed=17)
+    assert migrated.mock_seed == 17
     assert {tier: deployment.deployment_version for tier, deployment in migrated.tiers.items()} == {
         "c0": "qwen3.7-flash-thinking",
         "c1": "deepseek-v4-flash-0731",
@@ -425,6 +627,15 @@ def test_fixed_four_tier_v1_config_migrates_without_mutating_input() -> None:
     }
     serialized = migrated.model_dump(mode="json")
     assert "max_session_states" not in serialized
+    assert "mock_seed" not in serialized
+
+
+def test_fixed_four_tier_top_level_mock_seed_conflict_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="mock_seed cannot be combined"):
+        FixedFourTierV2Config(
+            mock_seed=7,
+            classifier={"backend": "random_mock", "seed": 8},
+        )
 
 
 def test_fixed_four_tier_config_and_nested_ladder_are_deeply_immutable() -> None:
@@ -433,10 +644,14 @@ def test_fixed_four_tier_config_and_nested_ladder_are_deeply_immutable() -> None
 
     with pytest.raises(ValidationError, match="frozen"):
         route.default_new_task_tier = "c2"
+    with pytest.raises(ValidationError, match="frozen"):
+        route.mock_seed = 8
     with pytest.raises(TypeError, match="immutable"):
         route.tiers["c0"] = route.tiers["c1"]
     with pytest.raises(ValidationError, match="frozen"):
         route.tiers["c0"].model = "other/model"
+    with pytest.raises(ValidationError, match="frozen"):
+        route.classifier.seed = 8
 
     deep_copy = route.model_copy(deep=True)
     with pytest.raises(TypeError, match="immutable"):

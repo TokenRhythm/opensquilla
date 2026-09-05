@@ -816,6 +816,7 @@ def test_build_turn_runner_from_services_wires_memory_services(
     runner = boot.build_turn_runner_from_services(services)
 
     assert isinstance(runner, FakeTurnRunner)
+    assert services.turn_runner is runner
     assert captured["memory_sync_managers"] is services.memory_sync_managers
     assert captured["memory_retrievers"] is services.memory_retrievers
     assert captured["turn_capture_services"] is services.turn_capture_services

@@ -266,6 +266,10 @@ class DoneEvent:
     model_usage_ledger: list[dict[str, Any]] = field(default_factory=list)
     ensemble_calls: list[dict[str, Any]] = field(default_factory=list)
     physical_audit_schema: str = ""
+    # Sum of completed provider-call wall times for this turn. Appended for
+    # positional-construction compatibility and persisted as Router input for
+    # the frozen previous-duration features.
+    duration_ms: int = 0
 
     @property
     def upstream_cost_usd(self) -> float:

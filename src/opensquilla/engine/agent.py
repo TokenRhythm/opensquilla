@@ -5313,6 +5313,7 @@ class Agent:
         )
         turn_llm_calls = 0
         turn_tool_errors = 0
+        turn_provider_duration_ms = 0
 
         async def _review_inflight_sandbox_request(
             payload: dict[str, object],
@@ -7914,6 +7915,7 @@ class Agent:
                             )
 
                     call_duration_ms = int((time.monotonic() - call_started_at) * 1000)
+                    turn_provider_duration_ms += call_duration_ms
                     call_abandoned = bool(_stream_policy_preempt and not _got_done_event)
                     _notify_call_outcome(
                         ok=(provider_error_for_log is None and not call_abandoned),
@@ -12202,6 +12204,7 @@ class Agent:
                 model_usage_ledger=final_model_usage_ledger,
                 ensemble_calls=final_ensemble_calls,
                 physical_audit_schema=_AGENT_PHYSICAL_LEDGER_SCHEMA,
+                duration_ms=turn_provider_duration_ms,
                 estimate_basis=estimate_basis,
                 text_snapshot="".join(final_text_parts),
             )

@@ -22329,12 +22329,22 @@ def _apply_router_dynamic_registry_allowlist(
     rows = snapshot.get("models")
     if not isinstance(rows, list):
         raise ValueError("router_dynamic registry snapshot has no model rows")
+    source_rows = immutable_source.get("models")
+    if not isinstance(source_rows, list):
+        raise ValueError("router_dynamic source registry snapshot has no model rows")
     if expected_routes_raw is None and candidate_scope == "registry_all":
+        # ``build_model_registry_snapshot`` may merge operator candidates and
+        # Router tier deployments into the packaged snapshot.  A formal
+        # ``registry_all`` contract, however, freezes the exact immutable
+        # source registry named by the contract; deriving the allowlist from
+        # the merged snapshot would silently admit later Router/config models.
         derived_models: list[str] = []
-        for row in rows:
+        for row in source_rows:
             facts = row.get("registry_facts") if isinstance(row, Mapping) else None
             if not isinstance(facts, Mapping):
-                raise ValueError("router_dynamic registry snapshot row lacks registry facts")
+                raise ValueError(
+                    "router_dynamic source registry snapshot row lacks registry facts"
+                )
             provider = str(facts.get("provider") or "").strip().lower()
             model = str(facts.get("model_id") or "").strip().lower()
             if provider != "openrouter" or not model:
@@ -22403,7 +22413,10 @@ def _apply_router_dynamic_registry_allowlist(
     if len(retained) != expected_count_raw:
         raise ValueError("router_dynamic registry allowlist did not produce the exact pool size")
 
-    input_candidate_count = len(rows)
+    # Observability counts refer to the hash-pinned source registry, not to
+    # transient candidates that the runtime merged before applying this
+    # contract.
+    input_candidate_count = len(source_rows)
     snapshot["models"] = retained
     snapshot["source_snapshot_version"] = actual_source_version
     snapshot["snapshot_version"] = f"{actual_source_version}+{profile_id}+{expected_hash[:12]}"

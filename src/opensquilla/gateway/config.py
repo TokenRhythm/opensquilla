@@ -11,7 +11,7 @@ import warnings
 from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Annotated, Any, Literal, cast
 
 from pydantic import (
     AliasChoices,
@@ -20,6 +20,7 @@ from pydantic import (
     Field,
     PrivateAttr,
     SerializeAsAny,
+    field_serializer,
     field_validator,
     model_validator,
 )
@@ -27,6 +28,9 @@ from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 from opensquilla import __version__
+from opensquilla.engine.routing.fixed_four_tier_v2 import (
+    FIXED_FOUR_TIER_DEPLOYMENT_SPECS,
+)
 from opensquilla.gateway.config_migration import (
     LATEST_CONFIG_VERSION,
     backup_and_write_migrated_config,
@@ -780,30 +784,15 @@ def _default_fixed_four_tier_v2_tiers() -> dict[
     FixedFourTierV2TierConfig,
 ]:
     return {
-        "c0": FixedFourTierV2TierConfig(
-            provider="openrouter",
-            model="qwen/qwen3.7-flash",
-            reasoning="thinking",
-            deployment_version="qwen3.7-flash-thinking",
-        ),
-        "c1": FixedFourTierV2TierConfig(
-            provider="openrouter",
-            model="deepseek/deepseek-v4-flash",
-            reasoning="max",
-            deployment_version="deepseek-v4-flash-0731",
-        ),
-        "c2": FixedFourTierV2TierConfig(
-            provider="openrouter",
-            model="deepseek/deepseek-v4-pro",
-            reasoning="max",
-            deployment_version="deepseek-v4-pro-0813",
-        ),
-        "c3": FixedFourTierV2TierConfig(
-            provider="openrouter",
-            model="z-ai/glm-5.3",
-            reasoning="max",
-            deployment_version="glm-5.3",
-        ),
+        tier: FixedFourTierV2TierConfig(
+            provider=provider,
+            model=model,
+            reasoning=reasoning,
+            deployment_version=deployment_version,
+        )
+        for tier, provider, model, reasoning, deployment_version in (
+            FIXED_FOUR_TIER_DEPLOYMENT_SPECS
+        )
     }
 
 
@@ -851,13 +840,64 @@ class _FrozenFixedTierMap(dict[Literal["c0", "c1", "c2", "c3"], FixedFourTierV2T
         return type(self)(copy.deepcopy(dict(self), memo))
 
 
-class FixedFourTierV2Config(BaseModel):
-    """Configuration for the isolated fixed-four-tier v2 mock route."""
+class FixedFourTierV2RandomMockClassifierConfig(BaseModel):
+    """Explicit development-only random classifier selection."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal["fixed-four-tier-v2-mock-v2"] = "fixed-four-tier-v2-mock-v2"
-    mock_seed: int | None = Field(default=None, ge=0, le=(1 << 64) - 1)
+    backend: Literal["random_mock"] = "random_mock"
+    seed: int | None = Field(default=None, ge=0, le=(1 << 64) - 1)
+
+    @field_validator("seed", mode="before")
+    @classmethod
+    def _reject_boolean_seed(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("seed must be an unsigned 64-bit integer")
+        return value
+
+
+class FixedFourTierV2RegisteredModelClassifierConfig(BaseModel):
+    """One immutable registered intent+tier model-set selection."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    backend: Literal["registered_model"] = "registered_model"
+    artifact_root: Path
+    metadata_db: Path
+    model_set_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+    expected_manifest_hash: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    allow_candidate: bool = False
+
+    @field_serializer("artifact_root", "metadata_db")
+    def _serialize_path(self, value: Path) -> str:
+        return str(value)
+
+    @field_validator("artifact_root", "metadata_db")
+    @classmethod
+    def _require_absolute_path(cls, value: Path) -> Path:
+        if not value.is_absolute():
+            raise ValueError("registered model paths must be absolute")
+        return value
+
+
+type FixedFourTierV2ClassifierConfig = Annotated[
+    FixedFourTierV2RandomMockClassifierConfig
+    | FixedFourTierV2RegisteredModelClassifierConfig,
+    Field(discriminator="backend"),
+]
+
+
+class FixedFourTierV2Config(BaseModel):
+    """Configuration for the isolated fixed-four-tier v2 route."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["fixed-four-tier-v2-v3"] = "fixed-four-tier-v2-v3"
+    # New v3 configurations must choose a backend explicitly. Legacy v1/v2
+    # payloads are normalized to ``random_mock`` by the compatibility validator
+    # below, but a newly enabled production route must never silently dispatch
+    # paid traffic from a process-random classifier.
+    classifier: FixedFourTierV2ClassifierConfig
     default_new_task_tier: Literal["c0", "c1", "c2", "c3"] = "c1"
     intent_min_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     tier_min_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
@@ -869,35 +909,53 @@ class FixedFourTierV2Config(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _migrate_mock_v1(cls, value: object) -> object:
+    def _migrate_classifier_config(cls, value: object) -> object:
         if not isinstance(value, Mapping):
             return value
         payload = copy.deepcopy(dict(value))
-        if payload.get("schema_version") != "fixed-four-tier-v2-mock-v1":
-            return payload
-        payload["schema_version"] = "fixed-four-tier-v2-mock-v2"
-        payload.pop("max_session_states", None)
-        tiers = payload.get("tiers")
-        if isinstance(tiers, Mapping):
-            migrated_tiers: dict[str, Any] = copy.deepcopy(dict(tiers))
-            defaults = _default_fixed_four_tier_v2_tiers()
-            for tier, deployment in migrated_tiers.items():
-                if isinstance(deployment, Mapping) and tier in defaults:
-                    migrated = dict(deployment)
-                    migrated.setdefault(
-                        "deployment_version",
-                        defaults[cast(Any, tier)].deployment_version,
-                    )
-                    migrated_tiers[tier] = migrated
-            payload["tiers"] = migrated_tiers
+        schema_version = payload.get("schema_version")
+        if schema_version in {
+            "fixed-four-tier-v2-mock-v1",
+            "fixed-four-tier-v2-mock-v2",
+        }:
+            payload["schema_version"] = "fixed-four-tier-v2-v3"
+            payload.pop("max_session_states", None)
+            if schema_version == "fixed-four-tier-v2-mock-v1":
+                tiers = payload.get("tiers")
+                if isinstance(tiers, Mapping):
+                    migrated_tiers: dict[str, Any] = copy.deepcopy(dict(tiers))
+                    defaults = _default_fixed_four_tier_v2_tiers()
+                    for tier, deployment in migrated_tiers.items():
+                        if isinstance(deployment, Mapping) and tier in defaults:
+                            migrated = dict(deployment)
+                            migrated.setdefault(
+                                "deployment_version",
+                                defaults[cast(Any, tier)].deployment_version,
+                            )
+                            migrated_tiers[tier] = migrated
+                    payload["tiers"] = migrated_tiers
+
+        if "mock_seed" in payload:
+            if "classifier" in payload:
+                raise ValueError("mock_seed cannot be combined with classifier")
+            payload["classifier"] = {
+                "backend": "random_mock",
+                "seed": payload.pop("mock_seed"),
+            }
+        elif schema_version in {
+            "fixed-four-tier-v2-mock-v1",
+            "fixed-four-tier-v2-mock-v2",
+        } and "classifier" not in payload:
+            payload["classifier"] = {"backend": "random_mock", "seed": None}
         return payload
 
-    @field_validator("mock_seed", mode="before")
-    @classmethod
-    def _reject_boolean_mock_seed(cls, value: object) -> object:
-        if isinstance(value, bool):
-            raise ValueError("mock_seed must be an unsigned 64-bit integer")
-        return value
+    @property
+    def mock_seed(self) -> int | None:
+        """Read compatibility for callers that still consume ``mock_seed``."""
+
+        if isinstance(self.classifier, FixedFourTierV2RandomMockClassifierConfig):
+            return self.classifier.seed
+        return None
 
     @model_validator(mode="after")
     def _validate_fixed_ladder(self) -> FixedFourTierV2Config:
@@ -1016,7 +1074,7 @@ class LlmEnsembleConfig(BaseSettings):
 
     @model_validator(mode="before")
     @classmethod
-    def _materialize_fixed_four_tier_config(cls, value: object) -> object:
+    def _reject_removed_fixed_four_tier_config_names(cls, value: object) -> object:
         if not isinstance(value, Mapping):
             return value
         removed_subtree_names = {"fixed_four_tier_v2", "fixed-four-tier-v2"}
@@ -1025,14 +1083,7 @@ class LlmEnsembleConfig(BaseSettings):
                 "unsupported llm_ensemble configuration; "
                 "use llm_ensemble.four_tier_mapping"
             )
-        selection_mode = canonicalize_llm_ensemble_selection_mode(
-            value.get("selection_mode", "static_openrouter")
-        )
-        if selection_mode != FOUR_TIER_MAPPING_SELECTION_MODE or "four_tier_mapping" in value:
-            return value
-        materialized = dict(value)
-        materialized["four_tier_mapping"] = {}
-        return materialized
+        return value
 
     @field_validator("selection_mode", mode="before")
     @classmethod

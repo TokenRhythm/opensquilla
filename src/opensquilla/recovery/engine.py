@@ -46,7 +46,10 @@ from opensquilla.recovery.locking import (
 )
 from opensquilla.recovery.models import RecoveryOutcome, RecoveryReport, WorkspaceCandidate
 
-SUPPORTED_CONFIG_VERSION = 1
+# Keep in lockstep with gateway.config_migration.LATEST_CONFIG_VERSION. This
+# module intentionally stays independent of GatewayConfig during early profile
+# recovery, before a user-owned config is safe to construct.
+SUPPORTED_CONFIG_VERSION = 2
 _IMPORT_LAYOUT_RECEIPT_FIELDS = frozenset(
     {
         "schema_version",

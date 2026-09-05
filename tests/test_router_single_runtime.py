@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import hashlib
 import inspect
+import threading
 import time
 import weakref
 from collections.abc import AsyncIterator
@@ -141,6 +143,98 @@ def _fixed_four_tier_v2_config(*, mock_seed: int = 7) -> GatewayConfig:
             "four_tier_mapping": {"mock_seed": mock_seed},
         },
     )
+
+
+_REGISTERED_MODEL_MANIFEST_HASH = "sha256:" + ("a" * 64)
+
+
+def _registered_fixed_four_tier_v2_config(
+    tmp_path: Any,
+    *,
+    model_set_id: str = "router-runtime-a1",
+) -> GatewayConfig:
+    return GatewayConfig(
+        squilla_router=SquillaRouterConfig(enabled=True, rollout_phase="full"),
+        llm_ensemble={
+            "enabled": True,
+            "mode": "single",
+            "selection_mode": "four_tier_mapping",
+            "four_tier_mapping": {
+                "classifier": {
+                    "backend": "registered_model",
+                    "artifact_root": str(tmp_path / "router-artifacts"),
+                    "metadata_db": str(tmp_path / "router-metadata.sqlite3"),
+                    "model_set_id": model_set_id,
+                    "expected_manifest_hash": _REGISTERED_MODEL_MANIFEST_HASH,
+                }
+            },
+        },
+    )
+
+
+def _patch_fake_registered_model_classifier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[Any]:
+    from opensquilla.engine.routing import registered_model as registered_model_module
+    from opensquilla.engine.routing.fixed_four_tier_v2 import ClassifierPrediction
+
+    instances: list[Any] = []
+
+    class FakeRegisteredModelClassifier:
+        backend = "registered_model"
+        feature_schema_version = "lightgbm_380.v1"
+        feature_vector_dim = 380
+        feature_vector_status = "materialized"
+
+        def __init__(self, **kwargs: Any) -> None:
+            self.options = dict(kwargs)
+            self.identity = {
+                "schema_version": "local_runner_identity.v2",
+                "model_set_id": kwargs["model_set_id"],
+                "model_manifest_hash": kwargs["expected_manifest_hash"],
+                "artifact_closure_hash": "sha256:" + ("b" * 64),
+                "runner_digest": "sha256:" + ("c" * 64),
+                "environment_digest": "sha256:" + ("d" * 64),
+                "model_type": "lightgbm",
+                "execution_mode": "native_embedded",
+                "registry_status": "VALIDATED",
+                "input_schema_version": self.feature_schema_version,
+            }
+            self.version = f"{kwargs['model_set_id']}@fake"
+            self.calls: list[tuple[dict[str, Any], tuple[str, ...] | None]] = []
+            self.close_calls = 0
+            instances.append(self)
+
+        def predict(
+            self,
+            snapshot: Any,
+            allowed_tiers: Any = None,
+        ) -> ClassifierPrediction:
+            normalized_tiers = tuple(allowed_tiers) if allowed_tiers is not None else None
+            self.calls.append((dict(snapshot), normalized_tiers))
+            if normalized_tiers is None:
+                return ClassifierPrediction(
+                    label="continue",
+                    probabilities={"continue": 0.9, "redo": 0.05, "new_task": 0.05},
+                    confidence=0.9,
+                    version=self.version,
+                )
+            return ClassifierPrediction(
+                label="c1",
+                probabilities={"c0": 0.05, "c1": 0.85, "c2": 0.05, "c3": 0.05},
+                confidence=0.85,
+                version=self.version,
+            )
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    monkeypatch.setattr(
+        registered_model_module,
+        "RegisteredModelClassifier",
+        FakeRegisteredModelClassifier,
+    )
+    return instances
 
 
 class _FixedRouteSessionManager:
@@ -585,6 +679,123 @@ async def test_router_dynamic_never_calls_fixed_four_tier_resolver(
     assert "fixed_four_tier_v2_legacy_router_skipped" not in turn.metadata
 
 
+async def test_switching_away_from_fixed_four_tier_releases_cached_router(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = TurnRunner(provider_selector=None, config=_fixed_four_tier_v2_config())
+    cached_router = runner._fixed_four_tier_v2_router_for_config(runner._config.llm_ensemble)
+    close_threads: list[str] = []
+
+    def record_close() -> None:
+        close_threads.append(threading.current_thread().name)
+
+    monkeypatch.setattr(cached_router, "close", record_close)
+    runner._config = _router_single_config()
+
+    async def resolve_legacy(**kwargs: Any) -> Any:
+        del kwargs
+        return object()
+
+    monkeypatch.setattr(runner, "_resolve_router_single_provider", resolve_legacy)
+    try:
+        await runner._run_pipeline(
+            "hello",
+            "agent:main:fixed-mode-retired",
+            _NoChatProvider(),
+            _Selector(),
+            [],
+            "system",
+            [],
+        )
+
+        assert close_threads == ["opensquilla-fixed-four-tier_0"]
+        assert runner._fixed_four_tier_v2_routers == {}
+    finally:
+        await runner.aclose()
+
+
+async def test_switching_away_release_timeout_does_not_block_non_fixed_turns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.engine import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_FIXED_FOUR_TIER_V2_RELEASE_TIMEOUT_SECONDS", 0.05)
+    warnings: list[tuple[str, dict[str, Any]]] = []
+
+    class RecordingLog:
+        def warning(self, event: str, **kwargs: Any) -> None:
+            warnings.append((event, kwargs))
+
+    monkeypatch.setattr(runtime_module, "log", RecordingLog())
+    runner = TurnRunner(provider_selector=None, config=_fixed_four_tier_v2_config())
+    native_started = threading.Event()
+    native_release = threading.Event()
+    events: list[str] = []
+
+    class CachedRouter:
+        def close(self) -> None:
+            events.append("router-close")
+
+    runner._fixed_four_tier_v2_routers["cached"] = CachedRouter()
+    runner._fixed_four_tier_v2_router_cache_populated = True
+
+    def hung_native_call() -> None:
+        events.append("native-start")
+        native_started.set()
+        assert native_release.wait(timeout=3.0)
+        events.append("native-end")
+
+    native_waiter = asyncio.create_task(runner._run_fixed_four_tier_v2_job(hung_native_call))
+    try:
+        for _ in range(100):
+            if native_started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert native_started.is_set()
+
+        runner._config = _router_single_config()
+
+        async def resolve_legacy(**kwargs: Any) -> Any:
+            del kwargs
+            return object()
+
+        monkeypatch.setattr(runner, "_resolve_router_single_provider", resolve_legacy)
+        loop = asyncio.get_running_loop()
+        switched_at = loop.time()
+        await runner._run_pipeline(
+            "hello",
+            "agent:main:fixed-release-timeout",
+            _NoChatProvider(),
+            _Selector(),
+            [],
+            "system",
+            [],
+        )
+
+        assert loop.time() - switched_at < 0.5
+        assert events == ["native-start"]
+        assert [event for event, _ in warnings] == ["fixed_four_tier_v2.release_timed_out"]
+
+        # The same pending release was already bounded once; later non-fixed
+        # turns do not each inherit another timeout-sized delay.
+        await asyncio.wait_for(
+            runner._release_fixed_four_tier_v2_routers(),
+            timeout=0.02,
+        )
+
+        native_release.set()
+        await native_waiter
+        await runner.aclose()
+
+        assert events == ["native-start", "native-end", "router-close"]
+        assert [event for event, _ in warnings].count("fixed_four_tier_v2.release_timed_out") == 1
+    finally:
+        native_release.set()
+        if not native_waiter.done():
+            await native_waiter
+        await runner.aclose()
+
+
 async def test_explicit_model_cannot_bypass_fixed_four_tier_resolver(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -655,6 +866,343 @@ def test_fixed_four_tier_resolver_has_no_legacy_analyzer_or_fusion_dependency() 
     assert "analyze_task" not in source
     assert "build_ensemble_provider_from_config" not in source
     assert "fallbacks=[]" in source
+
+
+def test_fixed_four_tier_router_never_defaults_a_missing_classifier_to_random() -> None:
+    runner = TurnRunner(provider_selector=None, config=_fixed_four_tier_v2_config())
+    incomplete = SimpleNamespace(
+        four_tier_mapping=SimpleNamespace(
+            default_new_task_tier="c1",
+            intent_min_confidence=0.5,
+            tier_min_confidence=0.5,
+            min_margin=0.05,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="classifier configuration is unavailable"):
+        runner._fixed_four_tier_v2_router_for_config(incomplete)
+
+    assert runner._fixed_four_tier_v2_routers == {}
+
+
+def test_registered_four_tier_config_shares_one_classifier_between_both_heads(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    instances = _patch_fake_registered_model_classifier(monkeypatch)
+    config = _registered_fixed_four_tier_v2_config(tmp_path)
+    runner = TurnRunner(provider_selector=None, config=config)
+
+    router = runner._fixed_four_tier_v2_router_for_config(config.llm_ensemble)
+
+    assert len(instances) == 1
+    assert router._intent_classifier is instances[0]
+    assert router._tier_classifier is instances[0]
+    assert instances[0].options == {
+        "artifact_root": str(tmp_path / "router-artifacts"),
+        "metadata_db": str(tmp_path / "router-metadata.sqlite3"),
+        "model_set_id": "router-runtime-a1",
+        "expected_manifest_hash": _REGISTERED_MODEL_MANIFEST_HASH,
+        "allow_candidate": False,
+    }
+    assert runner._fixed_four_tier_v2_router_for_config(config.llm_ensemble) is router
+    assert len(instances) == 1
+
+
+def test_registered_four_tier_config_replacement_closes_old_shared_runner_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    instances = _patch_fake_registered_model_classifier(monkeypatch)
+    first_config = _registered_fixed_four_tier_v2_config(
+        tmp_path,
+        model_set_id="router-runtime-a1",
+    )
+    second_config = _registered_fixed_four_tier_v2_config(
+        tmp_path,
+        model_set_id="router-runtime-a2",
+    )
+    runner = TurnRunner(provider_selector=None, config=first_config)
+
+    first_router = runner._fixed_four_tier_v2_router_for_config(first_config.llm_ensemble)
+    second_router = runner._fixed_four_tier_v2_router_for_config(second_config.llm_ensemble)
+
+    assert first_router is not second_router
+    assert len(instances) == 2
+    assert instances[0].close_calls == 1
+    assert instances[1].close_calls == 0
+    assert list(runner._fixed_four_tier_v2_routers.values()) == [second_router]
+    assert runner._fixed_four_tier_v2_router_for_config(second_config.llm_ensemble) is second_router
+    assert len(instances) == 2
+    assert instances[0].close_calls == 1
+    assert instances[1].close_calls == 0
+
+
+async def test_fixed_four_tier_private_executor_drains_cancelled_work_before_close() -> None:
+    runner = TurnRunner(provider_selector=None, config=_fixed_four_tier_v2_config())
+    started = threading.Event()
+    release = threading.Event()
+    events: list[tuple[str, str]] = []
+
+    class CachedRouter:
+        def close(self) -> None:
+            events.append(("router-close", threading.current_thread().name))
+
+    runner._fixed_four_tier_v2_routers["cached"] = CachedRouter()
+    runner._fixed_four_tier_v2_router_cache_populated = True
+
+    def blocked_native_call() -> str:
+        events.append(("first-start", threading.current_thread().name))
+        started.set()
+        assert release.wait(timeout=2.0)
+        events.append(("first-end", threading.current_thread().name))
+        return "first"
+
+    def queued_native_call() -> str:
+        events.append(("second", threading.current_thread().name))
+        return "second"
+
+    first_waiter = asyncio.create_task(runner._run_fixed_four_tier_v2_job(blocked_native_call))
+    second_waiter: asyncio.Task[Any] | None = None
+    close_waiter: asyncio.Task[Any] | None = None
+    try:
+        for _ in range(100):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set()
+
+        first_waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first_waiter
+
+        second_waiter = asyncio.create_task(runner._run_fixed_four_tier_v2_job(queued_native_call))
+        await asyncio.sleep(0)
+        close_waiter = asyncio.create_task(runner.aclose())
+        await asyncio.sleep(0.05)
+
+        assert [event for event, _ in events] == ["first-start"]
+        assert not close_waiter.done()
+
+        release.set()
+        assert await second_waiter == "second"
+        await close_waiter
+        await runner.close()
+
+        assert [event for event, _ in events] == [
+            "first-start",
+            "first-end",
+            "second",
+            "router-close",
+        ]
+        assert {thread for _, thread in events} == {"opensquilla-fixed-four-tier_0"}
+        assert runner._fixed_four_tier_v2_executor._max_workers == 1
+        assert runner._fixed_four_tier_v2_executor._shutdown is True
+        with pytest.raises(RuntimeError, match="runtime is closed"):
+            await runner._run_fixed_four_tier_v2_job(lambda: None)
+    finally:
+        release.set()
+        if second_waiter is not None and not second_waiter.done():
+            await second_waiter
+        if close_waiter is not None and not close_waiter.done():
+            await close_waiter
+        await runner.aclose()
+
+
+async def test_fixed_four_tier_private_executor_bounds_and_cancels_queued_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.engine import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_FIXED_FOUR_TIER_V2_MAX_OUTSTANDING_JOBS", 2)
+    runner = TurnRunner(provider_selector=None, config=_fixed_four_tier_v2_config())
+    started = threading.Event()
+    release = threading.Event()
+    executed: list[str] = []
+
+    def blocked_native_call() -> str:
+        executed.append(threading.current_thread().name)
+        started.set()
+        assert release.wait(timeout=3.0)
+        return "running"
+
+    running_waiter = asyncio.create_task(runner._run_fixed_four_tier_v2_job(blocked_native_call))
+    queued_waiter: asyncio.Task[Any] | None = None
+    final_waiter: asyncio.Task[Any] | None = None
+    try:
+        for _ in range(100):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set()
+
+        queued_waiter = asyncio.create_task(
+            runner._run_fixed_four_tier_v2_job(lambda: executed.append("stale"))
+        )
+        await asyncio.sleep(0)
+        with pytest.raises(RuntimeError, match="queue is full"):
+            await runner._run_fixed_four_tier_v2_job(lambda: executed.append("overflow"))
+
+        queued_waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await queued_waiter
+
+        # Repeated disconnected requests reclaim their queue slot immediately;
+        # none can accumulate behind the one intentionally blocked native call.
+        for index in range(25):
+            disconnected = asyncio.create_task(
+                runner._run_fixed_four_tier_v2_job(
+                    lambda index=index: executed.append(f"disconnected-{index}")
+                )
+            )
+            await asyncio.sleep(0)
+            disconnected.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await disconnected
+
+        assert len(runner._fixed_four_tier_v2_pending_futures) == 1
+        final_waiter = asyncio.create_task(
+            runner._run_fixed_four_tier_v2_job(lambda: executed.append("final"))
+        )
+        await asyncio.sleep(0)
+        release.set()
+
+        assert await running_waiter == "running"
+        assert await final_waiter is None
+        assert executed == ["opensquilla-fixed-four-tier_0", "final"]
+    finally:
+        release.set()
+        if not running_waiter.done():
+            await running_waiter
+        if final_waiter is not None and not final_waiter.done():
+            await final_waiter
+        await runner.aclose()
+
+
+async def test_fixed_four_tier_close_timeout_leaves_running_model_owned_until_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.engine import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_FIXED_FOUR_TIER_V2_CLOSE_TIMEOUT_SECONDS", 0.05)
+    warnings: list[tuple[str, dict[str, Any]]] = []
+
+    class RecordingLog:
+        def warning(self, event: str, **kwargs: Any) -> None:
+            warnings.append((event, kwargs))
+
+    monkeypatch.setattr(runtime_module, "log", RecordingLog())
+    runner = TurnRunner(provider_selector=None, config=_fixed_four_tier_v2_config())
+    started = threading.Event()
+    release = threading.Event()
+    events: list[str] = []
+
+    class CachedRouter:
+        def close(self) -> None:
+            events.append("router-close")
+
+    runner._fixed_four_tier_v2_routers["cached"] = CachedRouter()
+    runner._fixed_four_tier_v2_router_cache_populated = True
+
+    def hung_native_call() -> str:
+        events.append("native-start")
+        started.set()
+        assert release.wait(timeout=3.0)
+        events.append("native-end")
+        return "done"
+
+    running_waiter = asyncio.create_task(runner._run_fixed_four_tier_v2_job(hung_native_call))
+    try:
+        for _ in range(100):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set()
+
+        loop = asyncio.get_running_loop()
+        close_started = loop.time()
+        await runner.aclose()
+        close_elapsed = loop.time() - close_started
+
+        assert close_elapsed < 0.5
+        assert events == ["native-start"]
+        assert runner._fixed_four_tier_v2_executor._shutdown is True
+        assert [event for event, _ in warnings] == ["fixed_four_tier_v2.runtime_close_timed_out"]
+
+        release.set()
+        assert await running_waiter == "done"
+        await runner.aclose()
+
+        assert events == ["native-start", "native-end", "router-close"]
+        assert [event for event, _ in warnings].count(
+            "fixed_four_tier_v2.runtime_close_timed_out"
+        ) == 1
+    finally:
+        release.set()
+        if not running_waiter.done():
+            await running_waiter
+        await runner.aclose()
+
+
+async def test_registered_router_construction_failure_rolls_back_classifier(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    from opensquilla.engine.routing import fixed_four_tier_v2 as fixed_module
+
+    instances = _patch_fake_registered_model_classifier(monkeypatch)
+    config = _registered_fixed_four_tier_v2_config(tmp_path)
+    runner = TurnRunner(provider_selector=None, config=config)
+
+    class BrokenRouter:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+            raise RuntimeError("router construction failed")
+
+    monkeypatch.setattr(fixed_module, "FixedFourTierV2Router", BrokenRouter)
+    try:
+        with pytest.raises(RuntimeError, match="router construction failed"):
+            runner._fixed_four_tier_v2_router_for_config(config.llm_ensemble)
+
+        assert len(instances) == 1
+        assert instances[0].close_calls == 1
+        assert runner._fixed_four_tier_v2_routers == {}
+    finally:
+        await runner.aclose()
+
+
+async def test_fixed_four_tier_close_failures_are_logged_and_fail_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.engine import runtime as runtime_module
+
+    warnings: list[tuple[str, dict[str, Any]]] = []
+
+    class RecordingLog:
+        def warning(self, event: str, **kwargs: Any) -> None:
+            warnings.append((event, kwargs))
+
+    class BrokenCloseRouter:
+        def close(self) -> None:
+            raise RuntimeError("close failed")
+
+    config = _fixed_four_tier_v2_config()
+    runner = TurnRunner(provider_selector=None, config=config)
+    runner._fixed_four_tier_v2_routers["old"] = BrokenCloseRouter()
+    runner._fixed_four_tier_v2_router_cache_populated = True
+    monkeypatch.setattr(runtime_module, "log", RecordingLog())
+
+    replacement = runner._fixed_four_tier_v2_router_for_config(config.llm_ensemble)
+    monkeypatch.setattr(replacement, "close", BrokenCloseRouter().close)
+
+    await runner.aclose()
+    await runner.close()
+
+    assert runner._fixed_four_tier_v2_routers == {}
+    assert [kwargs["phase"] for event, kwargs in warnings if event.endswith("close_failed")] == [
+        "config_replaced",
+        "turn_runner_close",
+    ]
 
 
 def _ranked_model(
@@ -747,6 +1295,58 @@ class _Catalog:
             supports_tools=True,
             supports_vision=True,
         )
+
+
+async def test_registered_four_tier_resolver_requires_route_history_api(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    from opensquilla.engine.pipeline import TurnContext
+    from opensquilla.engine.routing.fixed_four_tier_v2 import FixedFourTierRoutingError
+
+    instances = _patch_fake_registered_model_classifier(monkeypatch)
+    config = _registered_fixed_four_tier_v2_config(tmp_path)
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="openai/gpt-5.5",
+        api_key="synthetic",
+    )
+    selector = _Selector(inherited)
+    manager = _FixedRouteSessionManager()
+    manager.list_recent_fixed_four_tier_decisions = None
+    runner = TurnRunner(
+        provider_selector=selector,
+        session_manager=manager,
+        config=config,
+        model_catalog=_Catalog(),
+    )
+    turn = TurnContext(
+        message="route this request",
+        raw_message="route this request",
+        session_key="agent:main:registered-route-history-required",
+        config=config,
+        provider=_NoChatProvider(),
+        model=inherited.model,
+        tool_defs=[],
+        system_prompt="system",
+        attachments=[],
+        metadata={"fixed_four_tier_v2_request_id": "registered-route-history-required"},
+    )
+
+    with pytest.raises(FixedFourTierRoutingError) as exc_info:
+        await runner._resolve_fixed_four_tier_v2_provider(
+            turn=turn,
+            provider=turn.provider,
+            cloned_selector=selector,
+            turn_config=config,
+            ensemble_cfg=config.llm_ensemble,
+            turn_absolute_deadline=None,
+            bound_user_message_id="input-registered-route-history-required",
+        )
+
+    assert exc_info.value.reason == "route_history_storage_unavailable"
+    assert instances == []
+    assert manager.claims == {}
 
 
 async def test_fixed_four_tier_resolver_materializes_exactly_one_model() -> None:
@@ -891,7 +1491,26 @@ async def _persist_fixed_redo_parent_route(
         provider="openrouter",
         model="deepseek/deepseek-v4-flash",
     )
-    route_trace["state_committed"] = False
+    route_trace.update(
+        {
+            "session_id": parent.session_id,
+            "session_epoch": parent.epoch,
+            "claim_id": claim.claim_id,
+            "execution_id": execution_id,
+            "session_key_hash": hashlib.sha256(parent.session_key.encode("utf-8")).hexdigest(),
+            "input_message_id": input_message_id,
+            "redo_parent_route_id": None,
+            "task_start_input_message_id": next_state.task_start_input_message_id,
+            "state_version_before": None,
+            "state_version_after": None,
+            "execution_status": "pending",
+            "response_id": None,
+            "state_committed": False,
+            "reasoning": "max",
+            "deployment_version": "0731",
+            "preflight": {"status": "pending"},
+        }
+    )
     record = FixedFourTierDecisionRecord(
         route_id=core_decision.route_id,
         session_id=parent.session_id,
@@ -912,11 +1531,18 @@ async def _persist_fixed_redo_parent_route(
         context_action=core_decision.context_action,
         selected_provider="openrouter",
         selected_model="deepseek/deepseek-v4-flash",
+        reasoning="max",
+        deployment_version="0731",
         config_version=core_decision.schema_version,
         route_trace=route_trace,
     )
     await manager.stage_fixed_four_tier_decision(record)
-    committed_trace = {**route_trace, "state_committed": True}
+    committed_trace = {
+        **route_trace,
+        "state_committed": True,
+        "state_version_after": 1,
+        "preflight": {"status": "passed"},
+    }
     await manager.commit_fixed_four_tier_decision(
         route_id=route_id,
         state=FixedFourTierState(
@@ -940,7 +1566,11 @@ async def _persist_fixed_redo_parent_route(
         execution_status="succeeded",
         preflight_status="passed",
         response_id=response_id,
-        route_trace=committed_trace,
+        route_trace={
+            **committed_trace,
+            "execution_status": "succeeded",
+            "response_id": response_id,
+        },
         updated_at_ms=now_ms + 1,
     )
     return await manager.get_fixed_four_tier_decision_by_route(route_id)
@@ -952,6 +1582,7 @@ async def _persist_fixed_redo_parent_route(
 )
 async def test_fixed_four_tier_redo_maps_parent_boundary_to_exact_child_row(
     tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
     task_turn_index: int,
     canonical_incomplete: bool,
 ) -> None:
@@ -962,6 +1593,7 @@ async def test_fixed_four_tier_redo_maps_parent_boundary_to_exact_child_row(
     from opensquilla.session.storage import SessionStorage
 
     storage = SessionStorage(str(tmp_path / f"redo-{task_turn_index}-{canonical_incomplete}.db"))
+    runner: TurnRunner | None = None
     await storage.connect()
     try:
         manager = SessionManager(storage, inject_time_prefix=False)
@@ -994,6 +1626,36 @@ async def test_fixed_four_tier_redo_maps_parent_boundary_to_exact_child_row(
             task_turn_index=task_turn_index,
         )
         assert parent_route is not None
+        if not canonical_incomplete:
+            list_recent_routes = manager.list_recent_fixed_four_tier_decisions
+
+            async def list_with_same_millisecond_peer(**kwargs: Any) -> list[Any]:
+                assert kwargs["before_ms"] == parent_route.decided_at_ms - 1
+                assert kwargs["limit"] == 4
+                records = list(await list_recent_routes(**kwargs))
+                records.extend(
+                    SimpleNamespace(
+                        route_id=f"same-millisecond-route-{index}",
+                        decided_at_ms=parent_route.decided_at_ms,
+                        final_tier="c3",
+                        tier={
+                            "probabilities": {
+                                "c0": 0.0,
+                                "c1": 0.0,
+                                "c2": 0.0,
+                                "c3": 1.0,
+                            }
+                        },
+                    )
+                    for index in range(5)
+                )
+                return records
+
+            monkeypatch.setattr(
+                manager,
+                "list_recent_fixed_four_tier_decisions",
+                list_with_same_millisecond_peer,
+            )
         if task_turn_index == 1:
             parent_entries = await manager.get_transcript(parent.session_key)
             removed_entries = parent_entries[:2]
@@ -1047,7 +1709,11 @@ async def test_fixed_four_tier_redo_maps_parent_boundary_to_exact_child_row(
             expected_child_task_start = source_to_child[task_start.message_id]
             assert expected_child_task_start != task_start.message_id
 
-        config = _fixed_four_tier_v2_config(mock_seed=53 + task_turn_index)
+        instances = _patch_fake_registered_model_classifier(monkeypatch)
+        config = _registered_fixed_four_tier_v2_config(
+            tmp_path,
+            model_set_id=f"router-redo-{task_turn_index}-a1",
+        )
         inherited = ProviderConfig(
             provider="openrouter",
             model="openai/gpt-5.5",
@@ -1094,6 +1760,7 @@ async def test_fixed_four_tier_redo_maps_parent_boundary_to_exact_child_row(
                 )
             assert exc_info.value.reason == "redo_parent_canonical_transcript_incomplete"
             assert await manager.get_fixed_four_tier_state(plan.node.session_id) is None
+            assert instances == []
             return
 
         await runner._resolve_fixed_four_tier_v2_provider(
@@ -1117,7 +1784,17 @@ async def test_fixed_four_tier_redo_maps_parent_boundary_to_exact_child_row(
         }
         assert trace["history_turns_to_keep"] == task_turn_index
         assert trace["context_action"] == "keep"
+        assert len(instances) == 1
+        assert len(instances[0].calls) == 1
+        redo_router_input = instances[0].calls[0][0]["router_input"]
+        assert len(redo_router_input["route_history"]) == 1
+        assert (
+            redo_router_input["route_history"][-1]["tier_id"]
+            == str(parent_route.final_tier).upper()
+        )
     finally:
+        if runner is not None:
+            await runner.aclose()
         await storage.close()
 
 
@@ -1356,6 +2033,306 @@ async def test_fixed_four_tier_classifier_snapshot_excludes_envelopes_and_queued
     assert "customer-private-name.pdf" not in trace_text
     assert "ATTACHMENT_PRIVATE_CONTENT" not in trace_text
     assert "ATTACHMENT_PRIVATE_BASE64" not in trace_text
+
+
+async def test_registered_four_tier_real_resolver_builds_complete_router_input(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    from opensquilla.engine.pipeline import TurnContext
+
+    instances = _patch_fake_registered_model_classifier(monkeypatch)
+    config = _registered_fixed_four_tier_v2_config(tmp_path)
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="openai/gpt-5.5",
+        api_key="synthetic",
+    )
+    selector = _Selector(inherited)
+    manager = _FixedRouteSessionManager()
+    previous_usage = {
+        "input_tokens": 101,
+        "output_tokens": 202,
+        "reasoning_tokens": 33,
+        "cached_tokens": 44,
+        "cache_write_tokens": 55,
+        "cost_usd": 0.125,
+    }
+    previous_route = SimpleNamespace(
+        route_id="previous-route",
+        request_id="previous-request",
+        execution_status="failed",
+        error_code="provider_error",
+        response_id="previous-response",
+        route_trace={"attempt_ids": ["previous-attempt"]},
+        final_tier="c1",
+        tier={"probabilities": {"c0": 0.0, "c1": 1.0, "c2": 0.0, "c3": 0.0}},
+    )
+    manager.decisions[previous_route.route_id] = previous_route
+    manager.state = SimpleNamespace(
+        schema_version=1,
+        task_id="active-task",
+        tier="c1",
+        task_turn_count=1,
+        version=1,
+        task_start_input_message_id="task-anchor",
+        last_request_id=previous_route.request_id,
+        last_route_id=previous_route.route_id,
+    )
+    history_texts = (
+        "old task one",
+        "old task two",
+        "old task three",
+        "old task four",
+        "active task anchor",
+    )
+    manager.transcript = [
+        *[
+            SimpleNamespace(
+                message_id=f"history-{index}",
+                role="user",
+                content=text,
+                turn_usage=None,
+            )
+            for index, text in enumerate(history_texts[:-1], start=1)
+        ],
+        SimpleNamespace(
+            message_id="task-anchor",
+            role="user",
+            content=history_texts[-1],
+            turn_usage=None,
+        ),
+        SimpleNamespace(
+            message_id="previous-response",
+            role="assistant",
+            content="previous assistant answer",
+            turn_usage=previous_usage,
+        ),
+        SimpleNamespace(
+            message_id="input-current",
+            role="user",
+            content="current original request",
+            turn_usage=None,
+        ),
+    ]
+    recent_routes = [
+        SimpleNamespace(
+            final_tier="c3",
+            tier={"probabilities": {"c0": 0.0, "c1": 0.0, "c2": 0.0, "c3": 1.0}},
+        ),
+        previous_route,
+    ]
+    route_history_calls: list[dict[str, Any]] = []
+
+    async def list_recent_fixed_four_tier_decisions(**kwargs: Any) -> list[Any]:
+        route_history_calls.append(dict(kwargs))
+        return recent_routes
+
+    manager.list_recent_fixed_four_tier_decisions = list_recent_fixed_four_tier_decisions
+    runner = TurnRunner(
+        provider_selector=selector,
+        session_manager=manager,
+        config=config,
+        model_catalog=_Catalog(),
+    )
+    attachment = {
+        "mime_type": "application/pdf",
+        "parse_status": "parsed",
+        "summary": "safe attachment summary",
+        "token_count": 321,
+        "name": "private.pdf",
+        "content": "PRIVATE ATTACHMENT CONTENT",
+    }
+    turn = TurnContext(
+        message="decorated current request",
+        raw_message="current original request",
+        session_key="agent:main:registered-router-input",
+        config=config,
+        provider=_NoChatProvider(),
+        model=inherited.model,
+        tool_defs=[
+            ToolDefinition(
+                name="zeta_tool",
+                description="zeta",
+                input_schema=ToolInputSchema(),
+            ),
+            ToolDefinition(
+                name="alpha_tool",
+                description="alpha",
+                input_schema=ToolInputSchema(),
+            ),
+        ],
+        system_prompt="system",
+        attachments=[attachment],
+        metadata={
+            "fixed_four_tier_v2_request_id": "request-registered-router-input",
+            "channel_kind": "discord",
+        },
+        surface_kind="cli",
+    )
+
+    await runner._resolve_fixed_four_tier_v2_provider(
+        turn=turn,
+        provider=turn.provider,
+        cloned_selector=selector,
+        turn_config=config,
+        ensemble_cfg=config.llm_ensemble,
+        turn_absolute_deadline=None,
+        bound_user_message_id="input-current",
+    )
+
+    assert len(instances) == 1
+    assert len(instances[0].calls) == 1
+    snapshot, allowed_tiers = instances[0].calls[0]
+    assert allowed_tiers is None
+    router_input = snapshot["router_input"]
+    assert router_input["current_request"] == "current original request"
+    assert router_input["history_user"] == list(history_texts[-4:])
+    assert router_input["task_anchor"] == "active task anchor"
+    assert router_input["previous_answer"] == "previous assistant answer"
+    assert router_input["previous_usage"] == previous_usage
+    assert router_input["previous_outcome"] == "failure"
+    assert router_input["active_route_tier"] == "C1"
+    assert router_input["route_history"] == [
+        {"tier_id": "C3", "difficulty": 3.0, "margin": 1.0},
+        {"tier_id": "C1", "difficulty": 1.0, "margin": 1.0},
+    ]
+    assert router_input["context"] == {
+        "turn_index": 2,
+        "context_tokens_est": (
+            len("current original request")
+            + sum(len(value) for value in history_texts)
+            + len("previous assistant answer")
+        )
+        // 4,
+        "entrypoint": "cli",
+        "platform": "discord",
+    }
+    assert router_input["tool_state"] == {"available_tools": ["alpha_tool", "zeta_tool"]}
+    assert router_input["attachments"] == [
+        {
+            "type": "document",
+            "mime_type": "application/pdf",
+            "media_type": None,
+            "parse_status": "parsed",
+            "status": None,
+            "summary": "safe attachment summary",
+            "truncated": None,
+            "token_count": 321,
+        }
+    ]
+    assert route_history_calls[0]["session_id"] == manager.session_id
+    assert route_history_calls[0]["session_epoch"] == 0
+    assert route_history_calls[0]["limit"] == 5
+    assert route_history_calls[0]["since_ms"] < route_history_calls[0]["before_ms"]
+    trace = turn.metadata["fixed_four_tier_v2_decision"]
+    assert trace["classifier_backend"] == "registered_model"
+    assert trace["classifier_identity"] == instances[0].identity
+
+    await runner.aclose()
+
+
+async def test_registered_router_input_falls_back_to_latest_unbound_assistant(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """Enabling the mode mid-session must not erase observable prior context."""
+
+    from opensquilla.engine.pipeline import TurnContext
+
+    instances = _patch_fake_registered_model_classifier(monkeypatch)
+    config = _registered_fixed_four_tier_v2_config(tmp_path)
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="openai/gpt-5.5",
+        api_key="synthetic",
+    )
+    selector = _Selector(inherited)
+    manager = _FixedRouteSessionManager()
+    previous_usage = {
+        "input_tokens": 11,
+        "output_tokens": 22,
+        "reasoning_tokens": 3,
+        "cached_tokens": 4,
+        "cache_write_tokens": 5,
+        "cost_usd": 0.01,
+    }
+    manager.transcript = [
+        SimpleNamespace(
+            message_id="legacy-user",
+            role="user",
+            content="question before fixed routing was enabled",
+            turn_usage=None,
+            turn_context=None,
+            tool_calls=None,
+        ),
+        SimpleNamespace(
+            message_id="legacy-assistant",
+            role="assistant",
+            content="I need one detail before proceeding.",
+            turn_usage=previous_usage,
+            turn_context={"agent_loop_stop_reason": "end_turn"},
+            tool_calls=[{"type": "tool_use", "name": "ask_user"}],
+        ),
+        SimpleNamespace(
+            message_id="current-input",
+            role="user",
+            content="the missing detail is X",
+            turn_usage=None,
+            turn_context=None,
+            tool_calls=None,
+        ),
+    ]
+
+    route_history_calls: list[dict[str, Any]] = []
+
+    async def list_recent_fixed_four_tier_decisions(**kwargs: Any) -> list[Any]:
+        route_history_calls.append(dict(kwargs))
+        return []
+
+    manager.list_recent_fixed_four_tier_decisions = list_recent_fixed_four_tier_decisions
+    runner = TurnRunner(
+        provider_selector=selector,
+        session_manager=manager,
+        config=config,
+        model_catalog=_Catalog(),
+    )
+    turn = TurnContext(
+        message="the missing detail is X",
+        raw_message="the missing detail is X",
+        session_key="agent:main:registered-mid-session",
+        config=config,
+        provider=_NoChatProvider(),
+        model=inherited.model,
+        tool_defs=[],
+        system_prompt="system",
+        attachments=[],
+        metadata={"fixed_four_tier_v2_request_id": "registered-mid-session"},
+    )
+
+    try:
+        await runner._resolve_fixed_four_tier_v2_provider(
+            turn=turn,
+            provider=turn.provider,
+            cloned_selector=selector,
+            turn_config=config,
+            ensemble_cfg=config.llm_ensemble,
+            turn_absolute_deadline=None,
+            bound_user_message_id="current-input",
+        )
+
+        assert len(instances) == 1
+        assert len(instances[0].calls) == 1
+        router_input = instances[0].calls[0][0]["router_input"]
+        assert router_input["history_user"] == ["question before fixed routing was enabled"]
+        assert router_input["previous_answer"] == "I need one detail before proceeding."
+        assert router_input["previous_usage"] == previous_usage
+        assert router_input["previous_outcome"] == "clarification"
+        assert router_input["active_route_tier"] is None
+        assert router_input["route_history"] == []
+        assert len(route_history_calls) == 1
+    finally:
+        await runner.aclose()
 
 
 async def test_fixed_four_tier_missing_current_feature_anchor_fails_closed(
