@@ -228,7 +228,7 @@ from opensquilla.observability.prompt_report import PromptReport, build_prompt_r
 from opensquilla.observability.trace import TraceContext, TraceEvent, write_trace_event
 from opensquilla.observability.turn_call_log import TurnCallLogger, is_turn_call_log_enabled
 from opensquilla.paths import media_root_from_config
-from opensquilla.process_tree import task_process_scope
+from opensquilla.process_tree import default_command_shell, task_process_scope
 from opensquilla.provider import (
     ErrorEvent as ProviderErrorEvent,
 )
@@ -8680,7 +8680,7 @@ class TurnRunner:
             if restricted_tool_boundary
             else {
                 "os": os_name,
-                "shell": os.environ.get("SHELL", ""),
+                "shell": default_command_shell(),
                 "workspace_dir": str(workspace_dir or bootstrap_workspace_dir),
             }
         )
