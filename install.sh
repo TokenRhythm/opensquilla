@@ -121,6 +121,14 @@ case "${profile}" in
         ;;
 esac
 
+# ONNX Runtime no longer ships macOS x86_64 wheels. Do not leave an Intel Mac
+# user with an unsatisfiable dependency set: install the core runtime instead.
+if [[ "${profile}" == "recommended" && "$(uname -s)" == "Darwin" && "$(uname -m)" == "x86_64" ]]; then
+    echo "install.sh: SquillaRouter is unavailable on Intel macOS because ONNX Runtime has no macOS x86_64 wheel; installing the core single-model runtime instead." >&2
+    profile="core"
+    target_extras=()
+fi
+
 if (( ${#install_extras[@]} > 0 )); then
     target_extras+=("${install_extras[@]}")
 fi
