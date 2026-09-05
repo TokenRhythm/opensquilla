@@ -2361,7 +2361,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 }
 
 .setup-provider-custom-form__model-item + .setup-provider-custom-form__model-item {
-  margin-top: var(--sp-1);
+  margin-top: 10px;
 }
 
 .setup-provider-custom-form__params-toggle.is-open {
