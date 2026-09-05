@@ -2265,6 +2265,21 @@ _STREAM_RELAY_DEFAULT_COALESCE_MS = 0.0
 _STREAM_RELAY_DEFAULT_COALESCE_CHARS = 0
 
 
+def _channel_tool_progress_enabled(channel: Any, config: Any) -> bool:
+    """Hermes-style per-tool-call status bubbles (opt-out via channel config).
+
+    Enabled by default for adapters that can send messages; disable with
+    ``[channels] tool_progress = false`` in config.toml.
+    """
+
+    if not callable(getattr(channel, "send", None)):
+        return False
+    channels_cfg = getattr(config, "channels", None) if config is not None else None
+    if isinstance(channels_cfg, dict):
+        return bool(channels_cfg.get("tool_progress", True))
+    return bool(getattr(channels_cfg, "tool_progress", True))
+
+
 def _resolve_stream_relay_coalesce(config: Any) -> tuple[float, int]:
     """Return ``(window_seconds, char_threshold)`` for stream relay batching.
 
@@ -2321,6 +2336,148 @@ class _RuntimeChannelStreamRelay:
         coalesce_window_s, coalesce_chars = _resolve_stream_relay_coalesce(config)
         self._coalesce_window_s = coalesce_window_s
         self._coalesce_chars = coalesce_chars
+        # Hermes-style tool progress: one silent, accumulating status message
+        # edited in place as the turn runs (see notify_tool_start/end and the
+        # thinking feed in emit()). Lines: "⚙ tool `arg`" -> "✓/✗ ...", plus
+        # "💬 <last thinking sentence>" interleaved.
+        self._tool_status_ids: dict[str, str] = {}
+        self._tool_notify_enabled = _channel_tool_progress_enabled(channel, config)
+        # Accumulating progress bubble (Hermes-style single editable message).
+        self._progress_lines: list[str] = []
+        self._progress_ref: str | None = None
+        self._progress_last_edit = 0.0
+        self._progress_edit_interval = 1.5
+        self._progress_lock = asyncio.Lock()
+
+    def _tool_progress_text(
+        self, *, tool_name: str, tool_use_id: str, arguments: Any, done: bool, is_error: bool
+    ) -> str:
+        args_preview = ""
+        if isinstance(arguments, dict):
+            for key in ("command", "path", "pattern", "query", "url", "file_path", "name"):
+                val = arguments.get(key)
+                if isinstance(val, str) and val.strip():
+                    args_preview = val.strip().splitlines()[0][:80]
+                    break
+        suffix = f" `{args_preview}`" if args_preview else ""
+        if done:
+            return f"{'✗' if is_error else '✓'} {tool_name}{suffix}"
+        return f"⚙ {tool_name}{suffix}"
+
+    def _progress_reply_to(self) -> str | None:
+        meta = getattr(self._inbound, "metadata", None) or {}
+        thread = meta.get("thread_id") or meta.get("message_thread_id")
+        return thread or getattr(self._inbound, "channel_id", None)
+
+    async def _append_progress_line(self, line: str, *, replace_last: bool = False) -> None:
+        """Append (or update) one line in the accumulating progress bubble.
+
+        Hermes-style presentation: a single silent message, edited at most
+        once per ``_progress_edit_interval`` seconds, mirroring a CLI's
+        scrolling transcript of interleaved tool lines and thinking lines.
+        """
+
+        if not self._tool_notify_enabled:
+            return
+        async with self._progress_lock:
+            if replace_last and self._progress_lines:
+                self._progress_lines[-1] = line
+            else:
+                self._progress_lines.append(line)
+            await self._flush_progress(force=False)
+
+    async def _flush_progress(self, *, force: bool) -> None:
+        """Render the accumulated lines; throttled edit-in-place."""
+
+        now = asyncio.get_event_loop().time()
+        if not force and (now - self._progress_last_edit) < self._progress_edit_interval:
+            return
+        text = "\n".join(self._progress_lines[-30:])  # cap like Hermes' bubble split
+        send = getattr(self._channel, "send", None)
+        edit = getattr(self._channel, "edit", None)
+        reply_to = self._progress_reply_to()
+        try:
+            if self._progress_ref is not None and callable(edit):
+                await edit(self._progress_ref, text, chat_id=reply_to)
+            elif callable(send):
+                outgoing = OutgoingMessage(
+                    content=text,
+                    reply_to=reply_to,
+                    metadata={"disable_notification": True},
+                )
+                result = await send(outgoing)
+                ref: str | None = None
+                if isinstance(result, str) and result:
+                    ref = result
+                elif isinstance(result, dict):
+                    inner = result.get("result") if isinstance(result.get("result"), dict) else {}
+                    chat_raw = result.get("chat") or inner.get("chat") or {}
+                    chat = chat_raw.get("id") if isinstance(chat_raw, dict) else chat_raw
+                    msg_id = result.get("message_id") or inner.get("message_id")
+                    if msg_id is not None:
+                        ref = f"{chat or reply_to}|{msg_id}"
+                if ref:
+                    self._progress_ref = ref
+            self._progress_last_edit = now
+        except Exception:
+            # Lost bubble is cosmetic; reset so the next flush sends fresh.
+            self._progress_ref = None
+
+    def notify_tool_start(self, tool_call: Any) -> None:
+        """Real-time ToolHook target (sync): tool is about to execute."""
+
+        if not self._tool_notify_enabled:
+            return
+        text = self._tool_progress_text(
+            tool_name=str(getattr(tool_call, "tool_name", "?")),
+            tool_use_id="",
+            arguments=getattr(tool_call, "arguments", None),
+            done=False,
+            is_error=False,
+        )
+        try:
+            asyncio.get_running_loop().create_task(
+                self._append_progress_line(text)
+            )
+        except RuntimeError:
+            pass
+
+    def notify_tool_end(self, tool_call: Any, outcome: Any) -> None:
+        """Real-time ToolHook target (sync): tool finished (ok or error)."""
+
+        if not self._tool_notify_enabled:
+            return
+        is_error = getattr(outcome, "exception", None) is not None
+        result = getattr(outcome, "result", None)
+        if not is_error and result is not None and getattr(result, "is_error", False):
+            is_error = True
+        text = self._tool_progress_text(
+            tool_name=str(getattr(tool_call, "tool_name", "?")),
+            tool_use_id="",
+            arguments=getattr(tool_call, "arguments", None),
+            done=True,
+            is_error=is_error,
+        )
+        try:
+            asyncio.get_running_loop().create_task(
+                self._append_progress_line(text, replace_last=True)
+            )
+        except RuntimeError:
+            pass
+
+    def notify_thinking(self, text: str) -> None:
+        """Live thinking delta (from the unbuffered sink path in emit())."""
+
+        if not self._tool_notify_enabled or not text:
+            return
+        snippet = " ".join(text.split()[:30])
+        line = f"💬 {snippet}"
+        try:
+            asyncio.get_running_loop().create_task(
+                self._append_progress_line(line, replace_last=True)
+            )
+        except RuntimeError:
+            pass
 
     @classmethod
     def maybe_create(
@@ -2330,7 +2487,20 @@ class _RuntimeChannelStreamRelay:
         task_runtime: Any,
         config: Any = None,
     ) -> _RuntimeChannelStreamRelay | None:
-        if not resolve_channel_stream_policy(channel).relay_stream:
+        policy = resolve_channel_stream_policy(channel)
+        log.warning(
+            "channel_dispatch.relay_diag",
+            channel_type=type(channel).__name__,
+            policy_mode=policy.mode,
+            relay_stream=policy.relay_stream,
+            has_send_streaming=callable(getattr(channel, "send_streaming", None)),
+            has_enqueue=callable(getattr(task_runtime, "enqueue", None)),
+            enqueue_accepts_sink=(
+                callable(getattr(task_runtime, "enqueue", None))
+                and _accepts_keyword_arg(task_runtime.enqueue, "stream_event_sink")
+            ),
+        )
+        if not policy.relay_stream:
             return None
         enqueue = getattr(task_runtime, "enqueue", None)
         if not callable(enqueue) or not _accepts_keyword_arg(enqueue, "stream_event_sink"):
@@ -2355,6 +2525,15 @@ class _RuntimeChannelStreamRelay:
 
         if self._task is None and not self._closed:
             self._task = asyncio.create_task(self._run())
+            try:
+                from opensquilla.engine.runtime import register_channel_tool_progress_relay
+
+                register_channel_tool_progress_relay(
+                    str(getattr(self._inbound, "channel_id", "") or ""),
+                    self,
+                )
+            except Exception:
+                pass
 
     async def _run(self) -> Any:
         reply_kwargs = _streaming_reply_kwargs(self._channel, self._inbound)
@@ -2443,6 +2622,12 @@ class _RuntimeChannelStreamRelay:
                 return
 
     async def emit(self, event: Any) -> None:
+        # Live thinking deltas are unbuffered through this sink; mirror them
+        # into the progress bubble (Hermes-style 💬 lines between tool lines).
+        if self._tool_notify_enabled:
+            kind = getattr(event, "kind", None)
+            if kind == "thinking" and isinstance(getattr(event, "text", ""), str):
+                self.notify_thinking(event.text)
         artifact = _artifact_event_payload(event)
         if artifact is not None:
             self._artifacts.append(artifact)

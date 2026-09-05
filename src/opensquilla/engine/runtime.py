@@ -14,6 +14,7 @@ import contextlib
 import contextvars
 import copy
 import hashlib
+import weakref
 import inspect
 import json
 import math
@@ -743,6 +744,52 @@ def accepted_turn_config_scope(config: Any | None) -> Any:
         yield
     finally:
         _ACCEPTED_TURN_CONFIG.reset(token)
+
+
+# Real-time channel tool-progress registry: the active channel stream relay
+# per session registers here so the ToolHook path (fires synchronously at tool
+# execution time, unlike the transactional buffered ToolUse events) can push
+# status bubbles with Hermes-like latency.
+_CHANNEL_TOOL_PROGRESS_RELAYS: "weakref.WeakValueDictionary[str, Any]" = (
+    weakref.WeakValueDictionary()
+)
+
+
+def register_channel_tool_progress_relay(session_key: str, relay: Any) -> None:
+    if session_key:
+        _CHANNEL_TOOL_PROGRESS_RELAYS[session_key] = relay
+
+
+def _channel_tool_progress_hook(ctx: Any) -> Any:
+    """Return a ToolHook that mirrors tool start/end into the channel relay.
+
+    Only active when the turn's ToolContext is a channel caller with a live
+    relay registered for its session; otherwise None (zero-cost no-op).
+    """
+
+    if str(getattr(ctx, "caller_kind", "") or "") != "channel":
+        return None
+    # Keyed by channel id on both sides: the relay registers with
+    # inbound.channel_id and the ToolContext carries the same channel_id.
+    channel_id = str(getattr(ctx, "channel_id", "") or "")
+    relay = _CHANNEL_TOOL_PROGRESS_RELAYS.get(channel_id)
+    if relay is None:
+        return None
+
+    class _ChannelToolProgressHook:
+        def before_tool(self, call: Any) -> None:
+            try:
+                relay.notify_tool_start(call.tool_call)
+            except Exception:
+                pass
+
+        def after_tool(self, call: Any, outcome: Any) -> None:
+            try:
+                relay.notify_tool_end(call.tool_call, outcome)
+            except Exception:
+                pass
+
+    return _ChannelToolProgressHook()
 
 
 def _compute_route_input_savings_usd(
@@ -8022,10 +8069,18 @@ class TurnRunner:
                 or getattr(skill, "kind", "skill") != "meta"
             )
         }
+        # Real-time tool progress: fan tool start/end into the ambient channel
+        # stream sink. The buffered ToolUse events in the public stream are
+        # transactional (committed only after the provider round is validated),
+        # so they arrive in bursts at round end; the ToolHook path fires
+        # synchronously at execution time, which is the latency users see in
+        # Hermes-style status bubbles.
+        channel_progress_hook = _channel_tool_progress_hook(ctx)
         tool_handler = build_tool_handler(
             self._tool_registry,
             ctx,
             known_skill_names=known_skill_names,
+            tool_hooks=(channel_progress_hook,) if channel_progress_hook else None,
         )
         return tool_defs, tool_handler
 
