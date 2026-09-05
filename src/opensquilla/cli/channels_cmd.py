@@ -16,7 +16,7 @@ from opensquilla.cli.channel_fields import (
     parse_channel_field_pairs,
 )
 from opensquilla.cli.gateway_rpc import confirm_or_exit, run_gateway_sync
-from opensquilla.cli.output import print_json
+from opensquilla.cli.output import emit_error, print_json
 from opensquilla.cli.ui import ACCENT_HEADER, ACCENT_MARKUP
 from opensquilla.cli.ui import console as ui_console
 from opensquilla.onboarding.channel_specs import (
@@ -423,7 +423,7 @@ def channels_describe(
     try:
         spec = get_channel_setup_spec(type_name)
     except KeyError as exc:
-        typer.secho(f"Error: {exc}", fg=typer.colors.RED, err=True)
+        emit_error(str(exc), json_output=json_output, code="NOT_FOUND")
         raise typer.Exit(code=2) from exc
 
     if json_output:
