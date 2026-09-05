@@ -80,7 +80,7 @@ async def test_retryable_failures_then_success_drives_each_retry_hop() -> None:
     provider = _FakeProvider()
     injector = FailureInjector(
         script=[
-            ProviderFailureKind.RATE_LIMITED,
+            ProviderFailureKind.TRANSPORT_TRANSIENT,
             ProviderFailureKind.PROVIDER_OVERLOADED,
             "succeed",
         ]
@@ -96,13 +96,13 @@ async def test_retryable_failures_then_success_drives_each_retry_hop() -> None:
     assert done.text == "ok"
     assert len(provider.calls) == 1  # only the "succeed" outcome reached it
     assert injector.consumed == [
-        ProviderFailureKind.RATE_LIMITED,
+        ProviderFailureKind.TRANSPORT_TRANSIENT,
         ProviderFailureKind.PROVIDER_OVERLOADED,
         "succeed",
     ]
     retry_logs = [entry for entry in captured if entry.get("event") == "provider.retry"]
     assert [entry["kind"] for entry in retry_logs] == [
-        ProviderFailureKind.RATE_LIMITED.value,
+        ProviderFailureKind.TRANSPORT_TRANSIENT.value,
         ProviderFailureKind.PROVIDER_OVERLOADED.value,
     ]
 
@@ -113,7 +113,7 @@ async def test_exhausted_script_delegates_every_further_call() -> None:
     assert injector.consumed == []
 
     provider = _FakeProvider()
-    agent = _agent(provider, FailureInjector(script=[ProviderFailureKind.RATE_LIMITED]))
+    agent = _agent(provider, FailureInjector(script=[ProviderFailureKind.TRANSPORT_TRANSIENT]))
 
     events = [event async for event in agent.run_turn("hello")]
 
@@ -144,19 +144,19 @@ async def test_auth_invalid_surfaces_without_retry() -> None:
     assert not any(entry.get("event") == "provider.retry" for entry in captured)
 
 
-async def test_retry_exhaustion_surfaces_terminal_error() -> None:
+async def test_rate_limit_surfaces_without_same_deployment_retry() -> None:
     provider = _FakeProvider()
-    injector = FailureInjector(
-        script=[ProviderFailureKind.RATE_LIMITED, ProviderFailureKind.RATE_LIMITED]
-    )
-    agent = _agent(provider, injector, max_provider_retries=1)
+    injector = FailureInjector(script=[ProviderFailureKind.RATE_LIMITED, "succeed"])
+    agent = _agent(provider, injector, max_provider_retries=3)
 
-    events = [event async for event in agent.run_turn("hello")]
+    with structlog.testing.capture_logs() as captured:
+        events = [event async for event in agent.run_turn("hello")]
 
     error = next(event for event in events if event.kind == "error")
     assert error.code == "429"
     assert provider.calls == []
-    assert len(injector.consumed) == 2
+    assert injector.consumed == [ProviderFailureKind.RATE_LIMITED]
+    assert not any(entry.get("event") == "provider.retry" for entry in captured)
 
 
 # ---------------------------------------------------------------------------
@@ -181,16 +181,17 @@ def test_injected_kinds_map_to_rotation_decisions() -> None:
     )
 
 
-def test_fallback_model_rotation_order_after_exhaustion() -> None:
+def test_retry_classification_and_fallback_model_rotation_order() -> None:
     from opensquilla.engine.fallback import FallbackPolicy
 
     policy = FallbackPolicy(
         max_retries=1,
         fallback_models=["model-primary", "model-fb-1", "model-fb-2"],
     )
-    # Retry budget exhausts...
-    assert policy.should_retry(ProviderFailureKind.RATE_LIMITED, 0) is True
-    assert policy.should_retry(ProviderFailureKind.RATE_LIMITED, 1) is False
+    # Rate limits bypass same-deployment retries; transient overloads retain them.
+    assert policy.should_retry(ProviderFailureKind.RATE_LIMITED, 0) is False
+    assert policy.should_retry(ProviderFailureKind.PROVIDER_OVERLOADED, 0) is True
+    assert policy.should_retry(ProviderFailureKind.PROVIDER_OVERLOADED, 1) is False
     # ...then the fallback chain rotates in declared order and terminates.
     assert policy.get_fallback_model("model-primary") == "model-fb-1"
     assert policy.get_fallback_model("model-fb-1") == "model-fb-2"

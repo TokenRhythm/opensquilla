@@ -173,12 +173,49 @@ def test_selector_buffer_coalesces_tool_deltas_and_rejects_oversized_content() -
 
 
 @pytest.mark.asyncio
-async def test_agent_emits_structured_activity_and_honors_retry_after(
+async def test_agent_surfaces_rate_limit_without_same_deployment_retry_or_sleep(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = _SequenceProvider(
         [
             [ErrorEvent(message="synthetic rate limit", code="429", retry_after_s=8.0)],
+            [TextDeltaEvent(text="ok"), DoneEvent(stop_reason="stop")],
+        ]
+    )
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("opensquilla.engine.agent.asyncio.sleep", fake_sleep)
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_provider_retries=1,
+            retry_base_backoff_ms=1_000,
+            retry_max_backoff_ms=1_000,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+    activity = [event for event in events if isinstance(event, ProviderActivityEvent)]
+
+    terminal = next(event for event in events if isinstance(event, EngineErrorEvent))
+    assert provider.calls == 1
+    assert sleeps == []
+    assert not any(event.phase in {"retry_wait", "retrying"} for event in activity)
+    assert terminal.code == "429"
+    assert terminal.failure_kind == ProviderFailureKind.RATE_LIMITED.value
+    assert not any("synthetic rate limit" in repr(event) for event in activity)
+
+
+@pytest.mark.asyncio
+async def test_agent_retries_same_deployment_provider_overload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _SequenceProvider(
+        [
+            [ErrorEvent(message="synthetic overload", code="503", retry_after_s=8.0)],
             [TextDeltaEvent(text="ok"), DoneEvent(stop_reason="stop")],
         ]
     )
@@ -208,9 +245,9 @@ async def test_agent_emits_structured_activity_and_honors_retry_after(
         "retrying",
         "requesting",
     ]
-    assert activity[1].reason == "rate_limited"
+    assert activity[1].reason == ProviderFailureKind.PROVIDER_OVERLOADED.value
     assert activity[1].retry_after_ms == 8_000
-    assert not any("synthetic rate limit" in repr(event) for event in activity)
+    assert not any("synthetic overload" in repr(event) for event in activity)
 
 
 @pytest.mark.asyncio
@@ -262,7 +299,7 @@ async def test_retry_after_that_exceeds_turn_deadline_does_not_retry_early(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = _SequenceProvider(
-        [[ErrorEvent(message="synthetic rate limit", code="429", retry_after_s=8.0)]]
+        [[ErrorEvent(message="synthetic overload", code="503", retry_after_s=8.0)]]
     )
     sleeps: list[float] = []
 
@@ -289,7 +326,7 @@ async def test_retry_after_that_exceeds_turn_deadline_does_not_retry_early(
         and event.phase in {"retry_wait", "retrying"}
         for event in events
     )
-    assert any(isinstance(event, EngineErrorEvent) and event.code == "429" for event in events)
+    assert any(isinstance(event, EngineErrorEvent) and event.code == "503" for event in events)
 
 
 @pytest.mark.asyncio

@@ -1696,19 +1696,6 @@ def _run_rpc_case(
     counts["compactions"] = observation.compactions
     if case.scenario == "router":
         counts["router_decisions"] = asyncio.run(_router_decision_count(gateway, session_key))
-    if case.scenario == "fault_429_retry_after" and proxy is not None:
-        records_snapshot = proxy.records
-        if len(records_snapshot) >= 2:
-            retry_wait_ms = max(
-                0.0,
-                (
-                    records_snapshot[1].received_monotonic_ns
-                    - records_snapshot[0].received_monotonic_ns
-                )
-                / 1_000_000,
-            )
-            metrics["retry_wait_ms"] = retry_wait_ms
-            counts["retry_after_honored"] = int(retry_wait_ms >= 8_000)
     if case.scenario == "fallback":
         assert case.fallback_provider is not None
         counts["fallback_before_request"] = int(
@@ -1738,12 +1725,22 @@ def _run_rpc_case(
     )
 
     partial_terminal_is_expected = case.scenario == "fault_partial_then_reset"
+    rate_limit_terminal_is_expected = (
+        case.scenario == "fault_429_retry_after"
+        and observation.terminal_event == "session.event.error"
+        and physical_requests == 1
+        and _failure_class_from_records(records) == "rate-limit"
+    )
     passed = observation.completed or (
         partial_terminal_is_expected
         and bool(observation.terminal_event)
         and observation.text_chunks > 0
-    )
-    if not partial_terminal_is_expected and assistant_markers < 1:
+    ) or rate_limit_terminal_is_expected
+    if (
+        not partial_terminal_is_expected
+        and not rate_limit_terminal_is_expected
+        and assistant_markers < 1
+    ):
         passed = False
     if case.scenario == "tool_compaction" and observation.compactions < 1:
         passed = False
