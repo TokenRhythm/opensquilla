@@ -1,14 +1,13 @@
 import { expect, expectTypeOf, it, vi } from 'vitest'
 
-import { createV4RouteFeedback } from '../adapters/gateway/routeFeedbackV4'
-import type { RouteFeedbackResult } from './publicData'
+import type { Result as RouteFeedbackWireResult } from '@/contracts/generated/v4/routerFeedbackSubmit'
+import type { RouteFeedbackResult } from '@/modules/routeFeedback'
+import { createV4RouteFeedback } from './routeFeedbackV4'
 
 it('exposes only the reviewed data fields with their exact nullability', () => {
-  expectTypeOf<RouteFeedbackResult>().toEqualTypeOf<{
-    readonly accepted: boolean
-    readonly reason?: string | null
-    readonly recorded?: string | null
-  }>()
+  expectTypeOf<RouteFeedbackResult>().toEqualTypeOf<Readonly<
+    Pick<RouteFeedbackWireResult, 'accepted' | 'reason' | 'recorded'>
+  >>()
   expectTypeOf<keyof RouteFeedbackResult>().toEqualTypeOf<'accepted' | 'reason' | 'recorded'>()
 })
 

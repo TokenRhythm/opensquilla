@@ -2,7 +2,6 @@ export interface GeneratedContractImport {
   root: string
   importer: string
   specifier: string
-  typeOnly?: boolean
 }
 
 export function resolveSourceImport(

@@ -30,71 +30,21 @@ function seededFixture(feature: string, extra: Record<string, string> = {}): str
   })
 }
 
-describe('public Contract data projection', () => {
-  const projection = `
-    import type { Result as WireResult } from './generated/v4/routerFeedbackSubmit'
-    export type RouteFeedbackResult = Readonly<Pick<WireResult, 'accepted' | 'reason' | 'recorded'>>
-  `
-  const files = {
-    'src/contracts/generated/v4/routerFeedbackSubmit.ts': `
-      export const METHOD = 'router.feedback.submit'
-      export interface Result {
-        accepted: boolean
-        reason?: string | null
-        recorded?: string | null
-        [key: string]: unknown
-      }
-    `,
-    'src/contracts/publicData.ts': projection,
-  }
-
-  it('allows the approved projection through type-only imports and re-exports', () => {
+describe('transport architecture hard-zero integration', () => {
+  it('rejects generated wire types through data-only facades and Adapter re-exports', () => {
     const root = fixture({
-      ...files,
-      'src/modules/feedback.ts': `
-        import type { RouteFeedbackResult } from '../contracts/publicData'
-        export type { RouteFeedbackResult } from '../contracts/publicData'
-        export interface Feedback { submit(): Promise<RouteFeedbackResult> }
+      'src/contracts/generated/v4/routerFeedbackSubmit.ts': `
+        export interface Result {
+          accepted: boolean
+          reason?: string | null
+          recorded?: string | null
+          [key: string]: unknown
+        }
       `,
-      'src/feature.ts': `
-        import type { RouteFeedbackResult as FeedbackResult } from './modules/feedback'
-        export function accepted(result: FeedbackResult) { return result.accepted }
+      'src/contracts/publicData.ts': `
+        import type { Result as WireResult } from './generated/v4/routerFeedbackSubmit'
+        export type RouteFeedbackResult = Readonly<Pick<WireResult, 'accepted' | 'reason' | 'recorded'>>
       `,
-    })
-    expect(evaluateRpcArchitectureGate({ root }).failures).toEqual([])
-  })
-
-  it.each([
-    projection.replace('import type', 'import'),
-    projection.replace("'accepted' | 'reason' | 'recorded'", "keyof WireResult"),
-    projection.replace("'accepted' | 'reason' | 'recorded'", "'accepted' | 'reason' | 'other'"),
-    projection.replace("Readonly<Pick<WireResult, 'accepted' | 'reason' | 'recorded'>>", 'WireResult'),
-    projection.replace("Readonly<Pick<WireResult, 'accepted' | 'reason' | 'recorded'>>", 'any'),
-    projection + 'export type LeakedWire = WireResult',
-    projection + 'export const extra = 1',
-    projection.replace('routerFeedbackSubmit', 'otherContract'),
-  ])('rejects expanded or unverified facade exports (%#)', (source) => {
-    const root = fixture({ ...files, 'src/contracts/publicData.ts': source })
-    expect(evaluateRpcArchitectureGate({ root }).failures).toContain(
-      'src/contracts/publicData.ts: only the approved type-only RouteFeedbackResult data projection is allowed.',
-    )
-  })
-
-  it.each([
-    "import { RouteFeedbackResult } from './contracts/publicData'",
-    "export { RouteFeedbackResult } from './contracts/publicData'",
-    "export * from './contracts/publicData'",
-    "const facade = import('./contracts/publicData')",
-  ])('rejects runtime access to the data-only facade (%#)', (source) => {
-    const root = fixture({ ...files, 'src/feature.ts': source })
-    expect(evaluateRpcArchitectureGate({ root }).failures).toContain(
-      'src/feature.ts: public Contract data must be imported or exported with type-only syntax.',
-    )
-  })
-
-  it('still rejects direct generated types and adapter wire re-exports', () => {
-    const root = fixture({
-      ...files,
       'src/adapters/gateway/leak.ts': `
         export type { Result } from '../../contracts/generated/v4/routerFeedbackSubmit'
       `,
@@ -107,12 +57,13 @@ describe('public Contract data projection', () => {
       `,
     })
     const failures = evaluateRpcArchitectureGate({ root }).failures
+    expect(failures).toContain(
+      'src/contracts/publicData.ts: generated wire Contract import "./generated/v4/routerFeedbackSubmit" is allowed only in a Gateway Adapter or test.',
+    )
     expect(failures.some(failure => failure.startsWith('src/modules/leak.ts:'))).toBe(true)
     expect(failures.some(failure => failure.startsWith('src/feature.ts:'))).toBe(true)
   })
-})
 
-describe('transport architecture hard-zero integration', () => {
   const requesterFactoryFiles = {
     'src/adapters/gateway/privateTransports.ts': `
       export interface RpcTransport { request(method: string): Promise<unknown> }
