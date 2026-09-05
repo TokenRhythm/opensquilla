@@ -62,6 +62,7 @@ def test_cold_instance_synthesizes_unknown_model() -> None:
     assert entry.supports_tools is True
     assert entry.supports_reasoning is False
     assert entry.supports_vision is False
+    assert entry.supports_video is False
     assert entry.input_cost_per_mtok is None
     assert entry.output_cost_per_mtok is None
     assert entry.quality_prior is None
@@ -187,6 +188,34 @@ def test_corrections_beat_snapshot_and_snapshot_fills_unset(
     assert entry.max_output_tokens == 8_192  # snapshot fills unset fields
     assert entry.supports_tools is True
     assert entry.supports_reasoning is False
+
+
+def test_video_is_a_user_settable_capability_field() -> None:
+    # The user-override layer accepts supports_video and it beats the live
+    # layer's own reading of the catalog row, per-field.
+    catalog = _populated_catalog()
+    catalog.set_user_overrides(
+        {"openrouter/vendor/model-x": {"supports_video": True}}
+    )
+
+    entry = catalog.resolve_entry("vendor/model-x", provider="openrouter")
+
+    assert entry.source == "user"
+    assert entry.supports_video is True
+    assert entry.supports_vision is True  # live layer still fills unset fields
+
+
+def test_capabilities_resolution_carries_video() -> None:
+    catalog = _populated_catalog()
+    catalog.set_user_overrides(
+        {"openrouter/vendor/model-x": {"supports_video": True}}
+    )
+
+    caps = catalog.get_capabilities("vendor/model-x", "openrouter")
+
+    assert caps.supports_video is True
+    assert caps.supports_vision is True
+    assert caps.supports_tools is True
 
 
 def test_snapshot_beats_synthesized_but_floor_fills_gaps(

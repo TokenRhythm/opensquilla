@@ -2185,6 +2185,7 @@ class LlmProviderProfile(BaseModel):
     api_key_env_pool: list[str] = Field(default_factory=list)
     base_url: str = ""
     proxy: str = ""
+    context_window_tokens: int = 0
 
 
 class ModelCatalogConfig(BaseSettings):
@@ -2255,6 +2256,7 @@ class ModelOverrideConfig(BaseModel):
     supports_reasoning: bool | None = None
     supports_tools: bool | None = None
     supports_vision: bool | None = None
+    supports_video: bool | None = None
     input_cost_per_mtok: float | None = Field(default=None, ge=0)
     output_cost_per_mtok: float | None = Field(default=None, ge=0)
     cache_read_cost_per_mtok: float | None = Field(default=None, ge=0)

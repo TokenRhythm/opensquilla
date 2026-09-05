@@ -1323,7 +1323,9 @@ const providerNeeds = computed(() => {
 
 const providerAdvancedOpen = computed(() => {
   if (promotedForm.llmTimeoutSeconds.value !== DEFAULT_LLM_TIMEOUT_SECONDS) return true
+  if (promotedForm.modelOverridesDirty.value) return true
   if (promotedForm.contextWindowTokens.value.trim() !== '') return true
+  if (promotedForm.maxOutputTokens.value.trim() !== '') return true
   return providerAdvancedFields.value.some(f => {
     if (f.required) return true
     const val = providerForm.fieldValue(f, config.value.llm || {}).trim()
@@ -1787,6 +1789,9 @@ const providerFormPanel = providerForm.createPanel({
   providerEnvCommand,
   llmTimeoutSeconds: promotedForm.llmTimeoutSeconds,
   contextWindowTokens: promotedForm.contextWindowTokens,
+  maxOutputTokens: promotedForm.maxOutputTokens,
+  modelSupportsVision: promotedForm.modelSupportsVision,
+  modelSupportsVideo: promotedForm.modelSupportsVideo,
   contextWindowGlobal,
   effectiveMaxTokens,
   effectiveMaxTokensPending,
@@ -2236,7 +2241,7 @@ const providerDirty = computed(() => (
   providerForm.isDirty.value
   || (providerOwnsFixedModelDraft.value && modelStrategyForm.fixedModelDirty.value)
   || (editingPrimaryProvider.value && promotedForm.timeoutDirty.value)
-  || (editingPrimaryProvider.value && promotedForm.contextWindowDirty.value)
+  || (editingPrimaryProvider.value && promotedForm.modelOverridesDirty.value)
 ))
 const behaviorDirty = computed(() => behaviorForm.isDirty.value)
 const securityPrivacyDirty = computed(() => privacyDirty.value)
@@ -2385,7 +2390,7 @@ function applyConfiguredProviderSelection(value: string) {
     providerSelectionKind.value = 'profile'
     providerForm.initStoredProfile(provider, storedProfileConfig(provider))
   }
-  promotedForm.reseedContextWindow(
+  promotedForm.reseedModelOverrides(
     config.value,
     provider,
     provider === normalizeProviderId(currentProvider.value) ? currentFormModelValue() : '',
@@ -2650,7 +2655,7 @@ function onProviderChange() {
   // The context-window override is per provider+model, so a provider switch must
   // reseed the field (value + baseline) from the newly-selected provider's saved
   // override — otherwise it keeps showing/saving the previous provider's value.
-  promotedForm.reseedContextWindow(config.value, providerForm.selectedProvider.value, currentFormModelValue())
+  promotedForm.reseedModelOverrides(config.value, providerForm.selectedProvider.value, currentFormModelValue())
 }
 
 // The model id currently entered in the provider form (form value → saved
@@ -2696,7 +2701,7 @@ function updateFixedModel(value: string) {
     !== normalizeProviderId(currentProvider.value)
   ) return
   const model = String(value ?? '').trim()
-  promotedForm.reseedContextWindow(config.value, providerForm.selectedProvider.value, model)
+  promotedForm.reseedModelOverrides(config.value, providerForm.selectedProvider.value, model)
   // The configured-primary editor and Model Routing share this canonical
   // model. A verdict for the previous model must never remain marked verified.
   providerForm.invalidateProbeVerdict()
@@ -2720,7 +2725,7 @@ function updateProviderField(name: string, value: unknown) {
   // Editing the model field switches which per-model override applies, so reseed
   // the context-window field from the saved override for the new model id.
   if (name === 'model') {
-    promotedForm.reseedContextWindow(config.value, providerForm.selectedProvider.value, String(value ?? '').trim())
+    promotedForm.reseedModelOverrides(config.value, providerForm.selectedProvider.value, String(value ?? '').trim())
   }
 }
 
@@ -2954,6 +2959,16 @@ function updateLlmTimeout(value: number) {
 function updateContextWindow(value: string) {
   if (providerInteractionLocked()) return
   promotedForm.setContextWindowTokens(value)
+}
+
+function updateMaxOutputTokens(value: string) {
+  if (providerInteractionLocked()) return
+  promotedForm.setMaxOutputTokens(value)
+}
+
+function updateModelCap(name: 'vision' | 'video', value: boolean) {
+  if (providerInteractionLocked()) return
+  promotedForm.setModelCap(name, value)
 }
 
 function envRecoveryCommand(section: string): string {
@@ -3527,7 +3542,7 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
       // the fresh config even when the retained draft originated in Model
       // Routing rather than in this Provider editor. A foreign fixed-Provider
       // draft intentionally keeps the active Provider's persisted context.
-      promotedForm.reseedContextWindow(
+      promotedForm.reseedModelOverrides(
         config.value,
         modelStrategyForm.fixedProvider.value,
         modelStrategyForm.fixedModel.value,
@@ -3558,6 +3573,15 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
       if (payload.apiKeyEnv !== undefined) payload.apiKey = ''
       payload.keepCurrentSecret = selectedStoredProfile.value && !replacesCredential
       await setupWorkflow.profile.upsertProfile(payload)
+      // Per-model overrides ride the deep-merge patch form regardless of which
+      // save path took the payload (profile upsert or legacy replace) — model
+      // ids contain dots/colons that dot-path patches cannot address.
+      const savedProfileModel = typeof payload.model === 'string' ? payload.model.trim() : ''
+      const overridesModel = savedProfileModel || currentFormModelValue()
+      if (overridesModel) {
+        const overridesPatch = promotedForm.modelOverridesPatch(providerForm.selectedProvider.value, overridesModel)
+        if (overridesPatch) await deepPatchConfig(overridesPatch)
+      }
       if (options.reload !== false) {
         // Saving a routing-only profile refreshes its persisted status without
         // discarding drafts in any other Settings section. Provider-owned
@@ -3580,14 +3604,14 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
     const payload = providerConfigurePayload(options.includeProviderModelDraft === true)
     await setupWorkflow.provider.configurePrimary(payload)
     const restart = await patchConfig(promotedForm.providerPatches())
-    // The per-model context-window override rides the deep-merge patch form. Key
-    // it on the CURRENT canonical model draft rather than payload.model (which
+    // The per-model overrides ride the deep-merge patch form. Key
+    // them on the CURRENT canonical model draft rather than payload.model (which
     // deliberately preserves the saved primary model until Model Routing is
     // saved), and skip the patch entirely when no model is selected.
     const contextModel = currentFormModelValue()
     if (contextModel) {
-      const contextPatch = promotedForm.contextWindowPatch(providerForm.selectedProvider.value, contextModel)
-      if (contextPatch) await deepPatchConfig(contextPatch)
+      const overridesPatch = promotedForm.modelOverridesPatch(providerForm.selectedProvider.value, contextModel)
+      if (overridesPatch) await deepPatchConfig(overridesPatch)
     }
     if (options.reload !== false) {
       // Replacing the primary deployment on a legacy Gateway changes the
@@ -3984,6 +4008,8 @@ async function copyConfigPath() {
     updateProviderField,
     updateLlmTimeout,
     updateContextWindow,
+    updateMaxOutputTokens,
+    updateModelCap,
     probeProviderConnection,
     refreshProviderModels,
     probeConfiguredProvider,

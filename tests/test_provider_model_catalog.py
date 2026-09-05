@@ -502,3 +502,28 @@ def test_cloud_provider_context_window_unchanged() -> None:
     assert catalog.resolve_context_window("some-cloud-model", provider="openai") == (
         DEFAULT_CONTEXT_WINDOW
     )
+
+
+def _infer(model_id: str) -> int:
+    from opensquilla.provider.model_catalog import (
+        _infer_context_window_from_model_id as f,
+    )
+    return f(model_id)
+
+def test_profile_default_window_layer_resolves_as_config() -> None:
+    """[llm_profiles.<id>].context_window_tokens activates as "config" source."""
+    catalog = ModelCatalog()
+    catalog.set_profile_default_windows({"bailian": 1_000_000})
+    # Profile window applies to any model under that provider id.
+    window, source = catalog.resolve_context_window_with_source(
+        "any-unknown-model", provider="bailian"
+    )
+    assert window == 1_000_000
+    assert source == "config"
+    # Profile window outranks inference for the same model.
+    catalog.set_profile_default_windows({"bailian": 500_000})
+    window, source = catalog.resolve_context_window_with_source(
+        "qwen3.8-flash", provider="bailian"
+    )
+    assert window == 500_000
+    assert source == "config"

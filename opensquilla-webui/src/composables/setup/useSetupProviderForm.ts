@@ -56,6 +56,9 @@ interface ProviderPanelContext {
   providerEnvCommand: ComputedRef<string>
   llmTimeoutSeconds: Ref<number>
   contextWindowTokens: Ref<string>
+  maxOutputTokens: Ref<string>
+  modelSupportsVision: Ref<boolean>
+  modelSupportsVideo: Ref<boolean>
   contextWindowGlobal: ComputedRef<number | null>
   effectiveMaxTokens: ComputedRef<EffectiveMaxTokens | null>
   effectiveMaxTokensPending: ComputedRef<boolean>
@@ -1018,6 +1021,9 @@ export function useSetupProviderForm(setupWorkflow: SetupWorkflow) {
       providerEnvCommand: context.providerEnvCommand.value,
       llmTimeoutSeconds: context.llmTimeoutSeconds.value,
       contextWindowTokens: context.contextWindowTokens.value,
+      maxOutputTokens: context.maxOutputTokens.value,
+      modelSupportsVision: context.modelSupportsVision.value,
+      modelSupportsVideo: context.modelSupportsVideo.value,
       contextWindowGlobal: context.contextWindowGlobal.value,
       effectiveMaxTokens: context.effectiveMaxTokens.value,
       effectiveMaxTokensPending: context.effectiveMaxTokensPending.value,

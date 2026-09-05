@@ -673,3 +673,86 @@ def get_provider_spec(provider_id: str) -> ProviderSpec:
         raise UnknownProviderError(
             f"Unknown provider '{provider_id}'. Available: {available}"
         ) from exc
+
+
+def register_profile_provider(
+    provider_id: str,
+    base_url: str,
+    *,
+    api_key_env: str = "",
+) -> bool:
+    """Register a single dynamic OpenAI-compatible provider at runtime.
+
+    If ``provider_id`` is already registered, this is a no-op.  Returns
+    ``True`` when a new provider was registered, ``False`` otherwise.
+    """
+    pid = str(provider_id or "").strip().lower()
+    if not pid:
+        return False
+    if pid in _PROVIDER_SPECS:
+        return False
+    url = str(base_url or "").strip()
+    if not url:
+        return False
+    env_key = str(api_key_env or "").strip()
+    if not env_key:
+        env_key = f"{pid.upper().replace('-', '_')}_API_KEY"
+    spec = ProviderSpec(
+        provider_id=pid,
+        backend="openai_compat",
+        provider_kind="openai",
+        env_key=env_key,
+        required_fields=frozenset({"model", "base_url"}),
+        failure_family="openai_compat",
+    )
+    _register(spec)
+    return True
+
+
+def register_profile_providers(config: Any) -> int:
+    """Auto-register any ``[llm_profiles.<name>]`` with a ``base_url`` as a
+    first-class OpenAI-compatible provider.
+
+    Scans ``config.llm_profiles`` for provider ids not yet in the registry.
+    Each profile with a non-empty ``base_url`` becomes a dynamic provider
+    usable in router tiers and ``[llm]``. Already-registered providers
+    (``deepseek``, ``custom``, etc.) are skipped. Returns the count of newly
+    registered providers.
+
+    As a last-resort sweep, an ``[llm]`` block that references an unknown
+    provider id while carrying its own ``base_url`` registers that id too.
+    A profile can be deleted (or lost to a config rewrite) while ``[llm]``
+    still points at its provider id; without this sweep the deployment
+    becomes unresolvable after every restart (doctor: provider.active.unknown,
+    ensemble: fixed_fallback unknown) even though the active block is fully
+    self-sufficient. Registration is idempotent, so a profile that does
+    exist simply wins the race and the ``[llm]`` sweep becomes a no-op.
+    """
+    count = 0
+    for profile_id, profile in (getattr(config, "llm_profiles", None) or {}).items():
+        raw_id = str(profile_id or "").strip().lower()
+        if not raw_id:
+            continue
+        profile_base_url = str(getattr(profile, "base_url", "") or "").strip()
+        if not profile_base_url:
+            continue
+        if register_profile_provider(raw_id, profile_base_url):
+            count += 1
+    llm_cfg = getattr(config, "llm", None)
+    if llm_cfg is not None:
+        active_id = str(getattr(llm_cfg, "provider", "") or "").strip().lower()
+        active_base_url = str(getattr(llm_cfg, "base_url", "") or "").strip()
+        # Only an explicitly written base_url counts: the LlmProviderConfig
+        # default carries the tokenrhythm endpoint, and registering an
+        # unknown provider id against that fallback URL would silently point
+        # it at the wrong server. Pydantic records explicit assignments in
+        # model_fields_set (TOML keys and env overrides both land there).
+        fields_set = getattr(llm_cfg, "model_fields_set", None) or set()
+        if (
+            active_id
+            and active_base_url
+            and "base_url" in fields_set
+        ):
+            if register_profile_provider(active_id, active_base_url):
+                count += 1
+    return count

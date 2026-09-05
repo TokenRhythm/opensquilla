@@ -7,6 +7,7 @@
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import SetupModelOverrides from '@/components/setup/SetupModelOverrides.vue'
 import type { DiscoveredModel } from '@/composables/setup/useSetupProviderForm'
 
 const { t } = useI18n()
@@ -36,8 +37,7 @@ const props = defineProps<{
   // live inside a table cell (tier table); the field label becomes the input's
   // aria-label. Default (false) renders the full settings-row layout unchanged.
   cell?: boolean
-  disabled?: boolean
-  // Embedded form rows can opt into the shared input chrome without changing
+  disabled?: boolean  // Embedded form rows can opt into the shared input chrome without changing
   // compact tier-table cells that already provide their own styling.
   inputClass?: string
   // Optional status/help text rendered by the parent outside this component.
@@ -50,10 +50,26 @@ const props = defineProps<{
   // chooses a catalog row (or the "use typed value" row). This prevents a
   // search query from changing the saved processing mode while it is typed.
   commitOnSelect?: boolean
+  // Optional per-model parameter overrides. With a catalog they dock to the
+  // bottom of the dropdown (one "pick + tune" surface); with no catalog there
+  // is nothing to open, so they stay inline under the input — degraded mode
+  // must never lose the controls.
+  overrides?: {
+    contextWindow: string
+    maxOutputTokens: string
+    supportsVision: boolean
+    supportsVideo: boolean
+    contextWindowHint: string
+    maxOutputHint: string
+    disabled: boolean
+  } | null
 }>()
 
 const emit = defineEmits<{
   update: [value: string]
+  updateContextWindow: [value: string]
+  updateMaxOutputTokens: [value: string]
+  updateCap: [name: 'vision' | 'video', value: boolean]
 }>()
 
 const MAX_ROWS = 40
@@ -62,6 +78,9 @@ const MAX_ROWS = 40
 // live inside the settings dialog's scrolling panels, which clip an in-flow
 // absolute dropdown. Position is computed from the input's viewport rect.
 const DROPDOWN_MAX_HEIGHT = 280
+// Docked parameter controls take a fixed slice of the popup; without a taller
+// budget the model list would shrink to ~3 rows.
+const DROPDOWN_MAX_HEIGHT_DOCKED = 420
 // Table cells are intentionally compact, but the catalog needs enough room for
 // a model id, friendly name, and capability summary. The floating layer is
 // therefore wider than its anchor whenever the viewport allows it.
@@ -110,6 +129,17 @@ const catalogAvailable = computed(() => (
       && props.models.length > 0
     )
   )
+))
+// With a catalog the parameter controls dock to the bottom of the dropdown, so
+// picking and tuning a model happen in one surface. With no catalog there is
+// nothing to open, so they stay inline under the input: the degraded path must
+// never lose access to them. Each binding is the overrides object itself (so
+// the template can v-bind it) or null when that placement does not apply.
+const dockedOverrides = computed(() => (
+  props.overrides && catalogAvailable.value ? props.overrides : null
+))
+const inlineOverrides = computed(() => (
+  props.overrides && !catalogAvailable.value ? props.overrides : null
 ))
 const describedBy = computed(() => {
   const ids: string[] = []
@@ -316,6 +346,40 @@ function close(restoreCommitted = true) {
   }
 }
 
+// The dropdown is teleported to <body>, so "inside" means the input's own
+// wrapper or the popup. Focus moving into docked parameter controls must not
+// dismiss the list they live in.
+function isInsidePicker(node: Node | null): boolean {
+  if (!node) return false
+  const el = node instanceof Element ? node : node.parentElement
+  if (!el) return false
+  return Boolean(el.closest('.setup-model-combobox') || el.closest('.setup-model-combobox__popup'))
+}
+
+function onInputBlur(event: FocusEvent) {
+  if (isInsidePicker(event.relatedTarget as Node | null)) return
+  close(true)
+}
+
+// Once focus is inside the popup the input can no longer see the click that
+// leaves the picker, so close on any press that lands outside it.
+function onDocumentPointerDown(event: MouseEvent) {
+  if (!open.value) return
+  if (isInsidePicker(event.target as Node | null)) return
+  close(true)
+}
+
+// ...nor the Tab that leaves it: focus can walk out of the docked controls
+// without the input ever blurring. Close only when focus actually moves from
+// inside the picker to outside it.
+function onDocumentFocusOut(event: FocusEvent) {
+  if (!open.value) return
+  const from = event.target as Node | null
+  if (!isInsidePicker(from)) return
+  if (isInsidePicker(event.relatedTarget as Node | null)) return
+  close(true)
+}
+
 watch(catalogAvailable, available => {
   if (!available) close(true)
 })
@@ -363,8 +427,9 @@ function updateListPosition() {
   const viewportH = window.innerHeight
   const spaceBelow = viewportH - rect.bottom - DROPDOWN_GAP - DROPDOWN_MARGIN
   const spaceAbove = rect.top - DROPDOWN_GAP - DROPDOWN_MARGIN
-  const openUp = spaceBelow < DROPDOWN_MAX_HEIGHT && spaceAbove > spaceBelow
-  const maxHeight = Math.max(120, Math.min(DROPDOWN_MAX_HEIGHT, openUp ? spaceAbove : spaceBelow))
+  const budget = dockedOverrides.value ? DROPDOWN_MAX_HEIGHT_DOCKED : DROPDOWN_MAX_HEIGHT
+  const openUp = spaceBelow < budget && spaceAbove > spaceBelow
+  const maxHeight = Math.max(120, Math.min(budget, openUp ? spaceAbove : spaceBelow))
   const width = Math.min(
     Math.max(rect.width, DROPDOWN_PREFERRED_WIDTH),
     viewportW - 2 * DROPDOWN_MARGIN,
@@ -386,15 +451,21 @@ watch(open, isOpen => {
     // which never bubbles to window.
     window.addEventListener('scroll', updateListPosition, { capture: true, passive: true })
     window.addEventListener('resize', updateListPosition)
+    window.addEventListener('mousedown', onDocumentPointerDown, true)
+    window.addEventListener('focusout', onDocumentFocusOut)
   } else {
     window.removeEventListener('scroll', updateListPosition, { capture: true })
     window.removeEventListener('resize', updateListPosition)
+    window.removeEventListener('mousedown', onDocumentPointerDown, true)
+    window.removeEventListener('focusout', onDocumentFocusOut)
   }
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('scroll', updateListPosition, { capture: true })
   window.removeEventListener('resize', updateListPosition)
+  window.removeEventListener('mousedown', onDocumentPointerDown, true)
+  window.removeEventListener('focusout', onDocumentFocusOut)
 })
 
 function onKeydown(event: KeyboardEvent) {
@@ -493,7 +564,7 @@ function onKeydown(event: KeyboardEvent) {
         @input="onInput"
         @focus="openList"
         @click="onClick"
-        @blur="close(true)"
+        @blur="onInputBlur"
         @keydown="onKeydown"
       >
       <span v-if="catalogAvailable" :id="`${fieldId}-catalog-count`" class="setup-model-combobox__sr-only">
@@ -649,8 +720,27 @@ function onKeydown(event: KeyboardEvent) {
             {{ t('setup.provider.modelListTruncated', { shown: visibleModels.length, total: matches.length }) }}
           </div>
           <div v-if="provenance" class="setup-model-combobox__footer">{{ provenance }}</div>
+          <!-- Docked: part of the open list, dismissed with it. The overrides
+               object keys match SetupModelOverrides props one-to-one. -->
+          <SetupModelOverrides
+            v-if="dockedOverrides"
+            class="setup-model-combobox__overrides setup-model-combobox__overrides--docked"
+            v-bind="dockedOverrides"
+            @update-context-window="emit('updateContextWindow', $event)"
+            @update-max-output-tokens="emit('updateMaxOutputTokens', $event)"
+            @update-cap="(name, value) => emit('updateCap', name, value)"
+          />
         </div>
       </Teleport>
+      <!-- Degraded mode: no dropdown to open, so the controls stay inline. -->
+      <SetupModelOverrides
+        v-if="inlineOverrides"
+        class="setup-model-combobox__overrides"
+        v-bind="inlineOverrides"
+        @update-context-window="emit('updateContextWindow', $event)"
+        @update-max-output-tokens="emit('updateMaxOutputTokens', $event)"
+        @update-cap="(name, value) => emit('updateCap', name, value)"
+      />
     </div>
   </div>
 </template>
@@ -976,6 +1066,12 @@ function onKeydown(event: KeyboardEvent) {
   color: var(--text-dim);
   font-size: var(--fs-xs);
   padding: var(--sp-1) var(--sp-3);
+  flex-shrink: 0;
+}
+
+/* Docked inside the teleported popup the controls are a non-scrolling footer:
+   the list scrolls above them, the parameters stay pinned and reachable. */
+.setup-model-combobox__overrides--docked {
   flex-shrink: 0;
 }
 

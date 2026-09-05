@@ -2955,6 +2955,12 @@ async def build_services(
         if config.config_path:
             log.info("build_services.config_loaded", path=config.config_path)
 
+    # Auto-register llm_profiles with base_url as dynamic providers
+    from opensquilla.provider.registry import register_profile_providers
+    _registered_count = register_profile_providers(config)
+    if _registered_count > 0:
+        log.info("profile_providers.registered", count=_registered_count)
+
     _prewarm_tokenrhythm_install_id(config)
     deferred_warmups: list[Callable[[], Any]] = []
     sandbox_setup_task: asyncio.Task[Any] | None = None
@@ -3291,6 +3297,22 @@ async def build_services(
     # instance exists, so resolve_model_price/get_capabilities honor them
     # from the first turn onward.
     apply_model_catalog_overrides(model_catalog, config)
+
+    # [llm_profiles.<id>].context_window_tokens becomes the provider-level
+    # default window layer.
+    profile_default_windows: dict[str, int] = {}
+    for profile_id, profile in (getattr(config, "llm_profiles", None) or {}).items():
+        raw_profile_id = str(profile_id or "")
+        if not raw_profile_id or ":" in raw_profile_id:
+            continue
+        try:
+            profile_window = int(getattr(profile, "context_window_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if profile_window > 0:
+            profile_default_windows[raw_profile_id] = profile_window
+    if profile_default_windows:
+        model_catalog.set_profile_default_windows(profile_default_windows)
 
     from opensquilla.gateway.model_catalog_refresh import (
         TokenRhythmCatalogCoordinator,

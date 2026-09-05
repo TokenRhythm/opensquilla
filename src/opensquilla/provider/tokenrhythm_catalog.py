@@ -441,6 +441,7 @@ class TokenRhythmCapabilities:
     tools: bool | None = None
     reasoning: bool | None = None
     vision: bool | None = None
+    video: bool | None = None
     anthropic: bool | None = None
     responses: bool | None = None
     streaming: bool | None = None
@@ -490,10 +491,18 @@ class TokenRhythmCapabilities:
         )
         if vision is None and "vision" in capability_names:
             vision = True
+        video = _first_bool(
+            capabilities.get("video"),
+            row.get("supportsVideo"),
+            row.get("supports_video"),
+        )
+        if video is None and "video" in capability_names:
+            video = True
         return cls(
             tools=tools,
             reasoning=reasoning,
             vision=vision,
+            video=video,
             anthropic=_first_bool(
                 capabilities.get("anthropic"),
                 anthropic.get("available"),
@@ -523,6 +532,7 @@ class TokenRhythmCapabilities:
             tools=_bool(value.get("tools")),
             reasoning=_bool(value.get("reasoning")),
             vision=_bool(value.get("vision")),
+            video=_bool(value.get("video")),
             anthropic=_bool(value.get("anthropic")),
             responses=_bool(value.get("responses")),
             streaming=_bool(value.get("streaming")),
@@ -533,6 +543,7 @@ class TokenRhythmCapabilities:
             "tools": self.tools,
             "reasoning": self.reasoning,
             "vision": self.vision,
+            "video": self.video,
             "anthropic": self.anthropic,
             "responses": self.responses,
             "streaming": self.streaming,
@@ -1370,6 +1381,8 @@ def tokenrhythm_published_catalog_entries(
             fields["supports_tools"] = model.capabilities.tools
         if model.capabilities.vision is not None:
             fields["supports_vision"] = model.capabilities.vision
+        if model.capabilities.video is not None:
+            fields["supports_video"] = model.capabilities.video
         pricing = model.pricing
         if pricing is not None:
             for bucket_name, field_name in (

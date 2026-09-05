@@ -620,6 +620,34 @@ def test_declared_capabilities_array_is_positive_evidence_only() -> None:
     assert declared.capabilities.reasoning is True
     assert declared.capabilities.streaming is True
     assert declared.capabilities.vision is None
+    assert declared.capabilities.video is None
+
+
+def test_declared_video_flag_and_array_are_positive_evidence() -> None:
+    declared = parse_tokenrhythm_declared(
+        {
+            "data": [
+                {
+                    "id": "video-flag-model",
+                    "supports_video": True,
+                },
+                {
+                    "id": "video-array-model",
+                    "capabilities": ["video"],
+                },
+                {
+                    "id": "video-off-model",
+                    "supports_video": False,
+                },
+            ]
+        }
+    )
+
+    assert declared["video-flag-model"].capabilities.video is True
+    assert declared["video-array-model"].capabilities.video is True
+    assert declared["video-off-model"].capabilities.video is False
+    # Unknown models stay tri-state None, never an invented True.
+    assert declared["video-off-model"].capabilities.vision is None
 
 
 def test_merge_uses_auth_as_entitlement_and_filters_known_non_chat_or_offline() -> None:
