@@ -1,4 +1,5 @@
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
+import type { RpcRequester as RpcTransport } from './privateTransports'
 import { readTransportFailure } from './transportTypes'
 import type {
   AppSettings,
@@ -17,10 +18,6 @@ import { CONFIG_PATCH_METHOD } from '@/contracts/generated/v4/configPatch'
 import { validateResult as validateConfigPatchResult } from '@/contracts/generated/v4/configPatchValidators.mjs'
 import { CONFIG_PATCH_SAFE_METHOD } from '@/contracts/generated/v4/configPatchSafe'
 import { validateResult as validateConfigPatchSafeResult } from '@/contracts/generated/v4/configPatchSafeValidators.mjs'
-
-interface RpcTransport {
-  request<T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions): Promise<T>
-}
 
 function object(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}

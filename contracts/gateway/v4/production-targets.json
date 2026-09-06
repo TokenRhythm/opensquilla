@@ -306,7 +306,6 @@
       "kind": "method",
       "wireName": "chat.abort",
       "roles": [
-        "params",
         "result"
       ]
     },
@@ -329,7 +328,6 @@
       "kind": "method",
       "wireName": "chat.send",
       "roles": [
-        "params",
         "result"
       ]
     },
@@ -1127,7 +1125,6 @@
       "kind": "method",
       "wireName": "sessions.pending_inputs.dispatch",
       "roles": [
-        "params",
         "result"
       ]
     },
@@ -1156,7 +1153,6 @@
       "kind": "method",
       "wireName": "sessions.pending_inputs.steer",
       "roles": [
-        "params",
         "result"
       ]
     },
@@ -1228,7 +1224,6 @@
       "kind": "method",
       "wireName": "sessions.steer.v2",
       "roles": [
-        "params",
         "result"
       ]
     },

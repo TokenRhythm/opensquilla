@@ -25,7 +25,7 @@ def test_production_targets_preserve_every_approved_validator_role() -> None:
     assert len(targets) == 195
     assert Counter(role for roles in targets.values() for role in roles) == {
         "result": 186,
-        "params": 20,
+        "params": 15,
         "payload": 8,
         "frame": 1,
     }

@@ -135,20 +135,23 @@ async def test_exact_abort_still_uses_atomic_cancel_when_runtime_list_fails(
         session_manager=FakeSessionManager([session]),
         task_runtime=runtime,
     )
-    # A broken advisory list must not make this test (or a real Stop) wait for
-    # the normal multi-second drain budget.
-    monkeypatch.setattr(rpc_sessions, "_ABORT_RUNTIME_CANCEL_DRAIN_SECONDS", 0.05)
-
-    response = await get_dispatcher().dispatch(
-        f"abort-{list_failure}",
-        "chat.abort",
-        {
-            "sessionKey": session.session_key,
-            "taskId": "task-A",
-            "scope": "task",
-            "source": "webui_stop",
-        },
-        context,
+    # This verifies exact cancellation despite an unusable advisory list, not
+    # a 50 ms scheduling guarantee. Keep the normal response budget; the
+    # explicit deadline/unknown-result tests below cover observation expiry.
+    # A deadlock on the never-completing list must still fail this test.
+    response = await asyncio.wait_for(
+        get_dispatcher().dispatch(
+            f"abort-{list_failure}",
+            "chat.abort",
+            {
+                "sessionKey": session.session_key,
+                "taskId": "task-A",
+                "scope": "task",
+                "source": "webui_stop",
+            },
+            context,
+        ),
+        timeout=5.0,
     )
 
     assert response.ok is True

@@ -31,6 +31,103 @@ function seededFixture(feature: string, extra: Record<string, string> = {}): str
 }
 
 describe('transport architecture hard-zero integration', () => {
+  it('rejects generated wire types through data-only facades and Adapter re-exports', () => {
+    const root = fixture({
+      'src/contracts/generated/v4/routerFeedbackSubmit.ts': `
+        export interface Result {
+          accepted: boolean
+          reason?: string | null
+          recorded?: string | null
+          [key: string]: unknown
+        }
+      `,
+      'src/contracts/publicData.ts': `
+        import type { Result as WireResult } from './generated/v4/routerFeedbackSubmit'
+        export type RouteFeedbackResult = Readonly<Pick<WireResult, 'accepted' | 'reason' | 'recorded'>>
+      `,
+      'src/adapters/gateway/leak.ts': `
+        export type { Result } from '../../contracts/generated/v4/routerFeedbackSubmit'
+      `,
+      'src/modules/leak.ts': `
+        import type { Result } from '../adapters/gateway/leak'
+        export interface LeakedFeedback { submit(): Promise<Result> }
+      `,
+      'src/feature.ts': `
+        import type { Result } from './contracts/generated/v4/routerFeedbackSubmit'
+      `,
+    })
+    const failures = evaluateRpcArchitectureGate({ root }).failures
+    expect(failures).toContain(
+      'src/contracts/publicData.ts: generated wire Contract import "./generated/v4/routerFeedbackSubmit" is allowed only in a Gateway Adapter or test.',
+    )
+    expect(failures.some(failure => failure.startsWith('src/modules/leak.ts:'))).toBe(true)
+    expect(failures.some(failure => failure.startsWith('src/feature.ts:'))).toBe(true)
+  })
+
+  const requesterFactoryFiles = {
+    'src/adapters/gateway/privateTransports.ts': `
+      export interface RpcTransport { request(method: string): Promise<unknown> }
+      export type RpcRequester = Pick<RpcTransport, 'request'>
+    `,
+    'src/modules/example.ts': 'export interface Example { read(): Promise<unknown> }',
+  }
+
+  it('allows a typed Adapter factory to consume its narrow request dependency', () => {
+    const root = fixture({
+      ...requesterFactoryFiles,
+      'src/adapters/gateway/example.ts': `
+        import type { RpcRequester as Requester } from './privateTransports'
+        import type { Example } from '../../modules/example'
+        export function createExample(rpc: Requester): Example {
+          return { read: () => rpc.request('example.read') }
+        }
+      `,
+    })
+    expect(evaluateRpcArchitectureGate({ root }).failures).toEqual([])
+  })
+
+  it.each([
+    'return rpc',
+    'const alias = rpc; return alias',
+    'return { rpc }',
+    'return { read: () => rpc }',
+    'return rpc.request',
+    "return rpc['request']",
+    'return { read: rpc.request.bind(rpc) }',
+    'return (() => rpc)()',
+    'const leak = () => rpc.request; return leak()',
+    'return { read: () => (() => rpc)() }',
+  ])('rejects private values returned from request-consuming factories (%#)', (body) => {
+    const root = fixture({
+      ...requesterFactoryFiles,
+      'src/adapters/gateway/example.ts': `
+        import type { RpcRequester as Requester } from './privateTransports'
+        import type { Example } from '../../modules/example'
+        export function createExample(rpc: Requester): Example { ${body} }
+      `,
+    })
+    expect(evaluateRpcArchitectureGate({ root }).failures).toContain(
+      'src/adapters/gateway/example.ts: exported declaration exposes private Gateway transport symbols.',
+    )
+  })
+
+  it('still rejects request types exposed by modules or Adapter aliases', () => {
+    const root = fixture({
+      ...requesterFactoryFiles,
+      'src/adapters/gateway/leak.ts': `
+        import type { RpcRequester } from './privateTransports'
+        export type Leaked = RpcRequester
+      `,
+      'src/modules/leak.ts': `
+        import type { RpcRequester } from '../adapters/gateway/privateTransports'
+        export function consume(rpc: RpcRequester): Promise<unknown> { return rpc.request('x') }
+      `,
+    })
+    const failures = evaluateRpcArchitectureGate({ root }).failures
+    expect(failures).toContain('src/adapters/gateway/leak.ts: exported declaration exposes private Gateway transport symbols.')
+    expect(failures.some(failure => failure.startsWith('src/modules/leak.ts:'))).toBe(true)
+  })
+
   it('rejects every raw RPC operation outside its private boundary', () => {
     const root = seededFixture(`
       import { useRpcStore } from './stores/rpc'

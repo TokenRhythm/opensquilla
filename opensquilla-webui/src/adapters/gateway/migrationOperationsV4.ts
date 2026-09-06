@@ -2,6 +2,7 @@ import {
   readTransportFailure,
 } from './transportTypes'
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
+import type { RpcRequester as RpcTransport } from './privateTransports'
 import type {
   GatewayMigrationCandidate,
   GatewayMigrationPreview,
@@ -13,10 +14,6 @@ import { MIGRATION_SOURCES_LIST_METHOD } from '@/contracts/generated/v4/migratio
 import { validateResult as validateMigrationSourcesListResult } from '@/contracts/generated/v4/migrationSourcesListValidators.mjs'
 import { MIGRATION_SOURCES_PREVIEW_METHOD } from '@/contracts/generated/v4/migrationSourcesPreview'
 import { validateParams as validateMigrationSourcesPreviewParams, validateResult as validateMigrationSourcesPreviewResult } from '@/contracts/generated/v4/migrationSourcesPreviewValidators.mjs'
-
-interface RpcTransport {
-  request<T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions): Promise<T>
-}
 
 const options = (signal?: AbortSignal): RpcCallOptions => ({
   timeoutMs: 15_000,

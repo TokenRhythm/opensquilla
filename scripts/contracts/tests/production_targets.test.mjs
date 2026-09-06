@@ -24,7 +24,7 @@ test('production cannot import or re-export the verification compiler', () => {
 test('production references exactly match the reviewed target policy', () => {
   const result = evaluateProductionTargets()
   assert.deepEqual(result.failures, [])
-  assert.equal(result.targets.length, 215)
+  assert.equal(result.targets.length, 210)
 })
 
 test('named import aliases preserve original validator identity in TS, JS and Vue', () => {

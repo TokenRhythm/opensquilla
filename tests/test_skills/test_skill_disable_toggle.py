@@ -6,9 +6,9 @@ to ``skills.disabled`` via config.patch.safe.
 
 from __future__ import annotations
 
+from opensquilla.application.app_settings import _SAFE_WRITE_PATCH_PATHS
 from opensquilla.engine.steps import skills_filter
 from opensquilla.gateway.config import GatewayConfig, SkillsConfig
-from opensquilla.gateway.rpc_config import _SAFE_WRITE_PATCH_PATHS
 from opensquilla.skills.eligibility import EligibilityContext, check_eligibility
 from opensquilla.skills.types import SkillSpec
 
