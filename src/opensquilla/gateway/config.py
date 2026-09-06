@@ -1504,6 +1504,7 @@ class MCPServerEntry(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_MCP_SERVER_")
 
     name: str = ""
+    description: str = ""
     transport: str = "stdio"  # "stdio" | "sse"
     command: str | None = None  # for stdio
     args: list[str] = Field(default_factory=list)  # for stdio

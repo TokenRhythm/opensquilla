@@ -68,6 +68,7 @@ _CHANNEL_DEFAULT_ALLOW: frozenset[str] = frozenset(
         "web_discover",
         "web_fetch",
         "web_search",
+        "tool_search",
     }
 )
 
@@ -300,7 +301,7 @@ def is_tool_visible(rt: RegisteredTool, ctx: ToolContext | None = None) -> bool:
         )
     )
     if (
-        not rt.spec.exposed_by_default
+        rt.spec.default_access == "deny"
         and not explicitly_allowed
         and not surfaced
         and not channel_profile_visible

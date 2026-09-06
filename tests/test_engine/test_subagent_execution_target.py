@@ -111,6 +111,48 @@ def test_subagent_model_override_binds_child_provider_window_and_compaction_plan
     assert plan.primary.context_window_tokens == child.config.context_window_tokens
 
 
+@pytest.mark.asyncio
+async def test_subagent_inherits_a_working_progressive_tool_index() -> None:
+    import opensquilla.tools  # noqa: F401
+    from opensquilla.engine.types import ToolCall
+    from opensquilla.tools.dispatch import build_tool_handler
+    from opensquilla.tools.registry import get_default_registry
+    from opensquilla.tools.types import CallerKind, ToolContext
+
+    registry = get_default_registry()
+    parent_context = ToolContext(is_owner=True, caller_kind=CallerKind.AGENT)
+    authorized = registry.to_tool_definitions(parent_context)
+    model_surface = registry.to_model_tool_definitions(authorized, parent_context)
+    parent = Agent(
+        provider=_ModelProvider("parent-model"),
+        config=AgentConfig(
+            provider_id="fake",
+            model_id="parent-model",
+            context_window_tokens=100_000,
+            max_tokens=4096,
+        ),
+        tool_definitions=model_surface,
+        tool_handler=build_tool_handler(registry, parent_context),
+        tool_registry=registry,
+        tool_context=parent_context,
+    )
+
+    child = parent._make_child_agent(SubagentSpec(task="inspect this"), depth=1)
+    result = await child._execute_tool(
+        ToolCall(
+            tool_use_id="child-search",
+            tool_name="tool_search",
+            arguments={"query": "list directory contents"},
+        )
+    )
+
+    assert child._tool_context is not None
+    assert child._tool_context.tool_search_index is not None
+    assert result.is_error is False
+    assert "list_dir" in child._tool_context.disclosed_tool_names
+    assert "list_dir" in {tool.name for tool in child.tool_definitions}
+
+
 def test_selector_fallback_subagent_freezes_active_chain_and_model_override() -> None:
     selector = ModelSelector(
         SelectorConfig(
