@@ -675,6 +675,7 @@
       "tests/test_gateway/test_steer_restart_recovery.py",
       "tests/test_gateway/test_strict_contract_registration.py",
       "tests/test_gateway/test_subagent_announce_group_wake.py",
+      "tests/test_gateway/test_subagent_completion_owner.py",
       "tests/test_gateway/test_task_runtime_hard_deadline.py",
       "tests/test_gateway/test_task_runtime_overflow_policy.py",
       "tests/test_gateway/test_task_runtime_reservations.py",
