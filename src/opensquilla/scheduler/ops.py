@@ -32,6 +32,21 @@ from .types import (
 )
 
 
+def _reject_past_at(cron_expr: str, now: datetime) -> None:
+    """Reject a one-time ``at`` timestamp that is already in the past.
+
+    A past ``at`` fires on the next scheduler tick and the one-shot job is then
+    deleted, so the payload runs immediately with no future occurrence. That is
+    almost never what a caller scheduling a one-time reminder intends, so refuse
+    it at creation time instead of silently running it.
+    """
+    at_dt = parse_iso_at(cron_expr)
+    if at_dt < now:
+        raise ValueError(
+            f"schedule.at is in the past: {cron_expr}; one-time schedules must be in the future"
+        )
+
+
 def _validate_structured_schedule(
     kind: ScheduleKind | str,
     value: str,
@@ -211,11 +226,7 @@ class SchedulerOps:
         # fall back to ISOLATED instead of failing creation. Headless cron
         # callers (no session context) get an isolated run rather than a hard
         # error.
-        if (
-            session_target == SessionTarget.CURRENT
-            and not session_key
-            and not origin_session_key
-        ):
+        if session_target == SessionTarget.CURRENT and not session_key and not origin_session_key:
             session_target = SessionTarget.ISOLATED
 
         origin_session_key = normalize_origin_session_key(session_target, origin_session_key)
@@ -270,6 +281,7 @@ class SchedulerOps:
         )
 
         if kind == ScheduleKind.AT:
+            _reject_past_at(cron_expr, now)
             job.delete_after_run = True
             job.next_run_at = datetime.fromisoformat(cron_expr)
         elif kind == ScheduleKind.EVERY and cron_expr.isdigit():
@@ -312,6 +324,7 @@ class SchedulerOps:
             job.schedule_kind = kind
             job.cron_expr = cron_expr
             if kind == ScheduleKind.AT:
+                _reject_past_at(cron_expr, now)
                 job.anchor_at = None
                 job.next_run_at = datetime.fromisoformat(cron_expr)
             elif kind == ScheduleKind.EVERY:
