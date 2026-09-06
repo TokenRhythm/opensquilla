@@ -2212,7 +2212,10 @@ def _create_session_key(agent_id: str, kind: object = None) -> str:
     normalized_kind = str(kind or "").strip().lower().replace("_", "-")
     if normalized_kind == "web":
         normalized_kind = "webchat"
-    if normalized_kind in {"cli", "webchat"}:
+    # LOCAL-FORK(openai-bridge): 允许 "openai-bridge" kind 生成四段式 key，
+    # 使 session_view._surface_from_key() 能将其归类为 channel surface，
+    # 从而在 WebUI 侧边栏 Channels 分组下显示。上游无此分支。
+    if normalized_kind in {"cli", "webchat", "openai-bridge"}:
         return f"agent:{agent_id}:{normalized_kind}:{short_id}"
     return f"agent:{agent_id}:{short_id}"
 

@@ -3432,6 +3432,7 @@ async def build_services(
                 workspace_base=config.workspace_dir
                 if getattr(config.memory, "source", "state") == "workspace"
                 else None,
+                gateway_config=config,
             )
             log.info("build_services.memory_tools_registered", agents=list(memory_stores))
     except Exception as e:

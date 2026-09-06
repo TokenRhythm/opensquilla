@@ -8739,8 +8739,17 @@ class TurnRunner:
         return resolve_agent_memory_source_dir(agent_id, self._config, source=source)
 
     def _effective_memory_retrieval_metadata(self, agent_id: str) -> dict[str, str]:
+        from opensquilla.agents.scope import is_isolated_custom_agent
+
         retrievers = self._memory_retrievers or {}
-        for key in (agent_id, "main"):
+
+        # Isolation check: custom agents with their own workspace must not
+        # fall back to main's retriever (prevents memory leakage).
+        search_keys: tuple[str, ...] = (agent_id,)
+        if not is_isolated_custom_agent(self._config, agent_id):
+            search_keys = (agent_id, "main")
+
+        for key in search_keys:
             retriever = retrievers.get(key)
             metadata_fn = getattr(retriever, "effective_retrieval_metadata", None)
             if callable(metadata_fn):
