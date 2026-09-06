@@ -11331,8 +11331,14 @@ ipcMain.handle('desktop:preferences:save', async (event, payload: DesktopPrefere
 ipcMain.handle('desktop:artifact:open', async (_event, payload: ArtifactOpenRequest) => openArtifactWithDefaultApp(payload))
 ipcMain.handle('desktop:workspace:choose-directory', async (event, payload: unknown) => {
   if (!trustedControlUiIpc(event)) return null
+  const window = currentMainWindow()
+  if (!window) return null
+  if (process.platform === 'darwin') app.focus({ steal: true })
+  if (window.isMinimized()) window.restore()
+  window.show()
+  window.focus()
   const choice = await dialog.showOpenDialog(
-    currentMainWindow()!,
+    window,
     projectDirectoryDialogOptions(process.platform, payload),
   )
   if (choice.canceled || choice.filePaths.length !== 1) return null
