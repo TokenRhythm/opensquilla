@@ -5,6 +5,7 @@ import os
 import shutil
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -362,21 +363,48 @@ async def test_approval_queue_expired_event_payload_carries_reason(tmp_path) -> 
 
 
 @pytest.mark.asyncio
-async def test_approval_queue_extend_pushes_deadline_so_late_decision_wins(tmp_path) -> None:
+async def test_approval_queue_extend_pushes_deadline_so_late_decision_wins(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.application.approval_queue as queue_module
+
+    now = 1_000.0
+    monkeypatch.setattr(queue_module, "time", SimpleNamespace(time=lambda: now))
     db_path = tmp_path / "approval_queue.sqlite"
     queue = ApprovalQueue(db_path=str(db_path), default_timeout=10.0, poll_interval=0.01)
     approval_id = queue.request("exec", {"toolName": "exec_command", "command": "rm x"})
+    armed = asyncio.Event()
+    observed_late = asyncio.Event()
+    queue.add_event_listener(lambda event, _info: armed.set() if event == "updated" else None)
+    original_get = queue.get
+    waiter = None
+
+    def observe_get(request_id):
+        entry = original_get(request_id)
+        if now > 1_001.0 and asyncio.current_task() is waiter:
+            observed_late.set()
+        return entry
+
+    monkeypatch.setattr(queue, "get", observe_get)
     try:
-        waiter = asyncio.create_task(queue.wait(approval_id, timeout=0.05))
-        await asyncio.sleep(0.02)
-        queue.extend(approval_id, 5.0)
-        await asyncio.sleep(0.06)
+        waiter = asyncio.create_task(queue.wait(approval_id, timeout=1.0))
+        await asyncio.wait_for(armed.wait(), timeout=5.0)
+        original_deadline = queue.get(approval_id).deadline
+        extended_deadline = queue.extend(approval_id, 5.0)
+        now = original_deadline + 1.0
+        assert original_deadline < now < extended_deadline
+        await asyncio.wait_for(observed_late.wait(), timeout=5.0)
+        assert not waiter.done(), "approval expired at its old, extended deadline"
         queue.resolve(approval_id, True)
 
-        assert await asyncio.wait_for(waiter, timeout=1.0) is True
+        assert await asyncio.wait_for(waiter, timeout=5.0) is True
         entry = queue.get(approval_id)
         assert entry.resolution == "approved"
     finally:
+        if waiter is not None:
+            if not waiter.done():
+                waiter.cancel()
+            await asyncio.wait_for(asyncio.gather(waiter, return_exceptions=True), timeout=5.0)
         queue.close()
 
 

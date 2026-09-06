@@ -1,4 +1,5 @@
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
+import type { RpcRequester as CommandCatalogTransport } from './privateTransports'
 import {
   COMMANDS_LIST_FOR_SURFACE_METHOD,
   type Params as CommandCatalogParams,
@@ -6,14 +7,6 @@ import {
 } from '@/contracts/generated/v4/commandsListForSurface'
 import { validateResult as validateCommandCatalogResult } from '@/contracts/generated/v4/commandsListForSurfaceValidators.mjs'
 import type { CommandCatalog, CommandCatalogResult } from '@/modules/commandCatalog'
-
-interface CommandCatalogTransport {
-  request<T = unknown>(
-    method: string,
-    params?: Record<string, unknown>,
-    options?: RpcCallOptions,
-  ): Promise<T>
-}
 
 export function createV4CommandCatalog(transport: CommandCatalogTransport): CommandCatalog {
   return {

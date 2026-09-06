@@ -5,19 +5,18 @@ import {
   type ChatAbortParams,
   type ChatAbortResult,
 } from '@/contracts/generated/v4/chatAbort'
-import { validateChatAbortParams, validateChatAbortResult } from '@/contracts/generated/v4/chatAbortValidators.mjs'
+import { validateChatAbortResult } from '@/contracts/generated/v4/chatAbortValidators.mjs'
 import {
   CHAT_SEND_METHOD,
   type ChatSendResult,
 } from '@/contracts/generated/v4/chatSend'
-import { validateChatSendParams, validateChatSendResult } from '@/contracts/generated/v4/chatSendValidators.mjs'
+import { validateChatSendResult } from '@/contracts/generated/v4/chatSendValidators.mjs'
 import {
   SESSIONS_PENDING_INPUTS_DISPATCH_METHOD,
   type SessionsPendingInputsDispatchParams,
   type SessionsPendingInputsDispatchResult,
 } from '@/contracts/generated/v4/pendingInputsDispatch'
 import {
-  validatePendingInputsDispatchParams,
   validatePendingInputsDispatchResult,
 } from '@/contracts/generated/v4/pendingInputsDispatchValidators.mjs'
 import {
@@ -26,7 +25,6 @@ import {
   type SessionsPendingInputsSteerResult,
 } from '@/contracts/generated/v4/pendingInputsSteer'
 import {
-  validatePendingInputsSteerParams,
   validatePendingInputsSteerResult,
 } from '@/contracts/generated/v4/pendingInputsSteerValidators.mjs'
 import {
@@ -35,7 +33,6 @@ import {
   type SessionsSteerV2Result,
 } from '@/contracts/generated/v4/sessionsSteerV2'
 import {
-  validateSessionsSteerV2Params,
   validateSessionsSteerV2Result,
 } from '@/contracts/generated/v4/sessionsSteerV2Validators.mjs'
 import {
@@ -484,28 +481,6 @@ function forward<T>(
   })
 }
 
-/**
- * Validate request params without taking ownership of legacy rejection
- * semantics.  v4 historically forwards malformed values to the Gateway,
- * where the handler chooses the exact error code/message.  The Adapter still
- * runs the generated validator (and therefore exercises the Contract), but a
- * failed request check is advisory so old aliases and diagnostics remain
- * observable to existing callers.
- */
-function validateRequest(
-  _method: string,
-  validator: ContractValidator,
-  params: unknown,
-): void {
-  try {
-    validator(params)
-  } catch {
-    // A validator is an observer at this compatibility seam.  If a value is
-    // outside AJV's input domain (for example a host object), let the existing
-    // Gateway decide how to reject it instead of changing the v4 error path.
-  }
-}
-
 function response<T>(
   method: string,
   validator: ContractValidator,
@@ -527,11 +502,9 @@ function forwardContract<T>(
   transport: TurnCommandsTransport,
   method: string,
   params: Record<string, unknown>,
-  requestValidator: ContractValidator,
   responseValidator: ContractValidator,
   options?: TurnCommandRequestOptions,
 ): Promise<T> {
-  validateRequest(method, requestValidator, params)
   return forward<unknown>(transport, method, params, options).then(raw => (
     response<T>(method, responseValidator, raw)
   ))
@@ -561,7 +534,6 @@ export function createV4TurnCommands(transport: TurnCommandsTransport): TurnComm
           transport,
           SESSIONS_PENDING_INPUTS_DISPATCH_METHOD,
           params as unknown as Record<string, unknown>,
-          validatePendingInputsDispatchParams,
           validatePendingInputsDispatchResult,
           options,
         ).then(projectSendResult) as Promise<TurnSendResponse>
@@ -571,7 +543,6 @@ export function createV4TurnCommands(transport: TurnCommandsTransport): TurnComm
         transport,
         CHAT_SEND_METHOD,
         params,
-        validateChatSendParams,
         validateChatSendResult,
         options,
       ).then(projectSendResult)
@@ -586,7 +557,6 @@ export function createV4TurnCommands(transport: TurnCommandsTransport): TurnComm
         transport,
         CHAT_ABORT_METHOD,
         params as unknown as Record<string, unknown>,
-        validateChatAbortParams,
         validateChatAbortResult,
         options,
       ).then(projectCancelResult)
@@ -602,7 +572,6 @@ export function createV4TurnCommands(transport: TurnCommandsTransport): TurnComm
           transport,
           SESSIONS_PENDING_INPUTS_STEER_METHOD,
           params as unknown as Record<string, unknown>,
-          validatePendingInputsSteerParams,
           validatePendingInputsSteerResult,
           options,
         ).then(projectSteerResult)
@@ -612,7 +581,6 @@ export function createV4TurnCommands(transport: TurnCommandsTransport): TurnComm
         transport,
         SESSIONS_STEER_V2_METHOD,
         params as unknown as Record<string, unknown>,
-        validateSessionsSteerV2Params,
         validateSessionsSteerV2Result,
         options,
       ).then(projectSteerResult)

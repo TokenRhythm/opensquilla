@@ -103,6 +103,17 @@ class AdmissionTaskRecord(Protocol):
     def task_id(self) -> str: ...
 
 
+class ActivationTask(Protocol):
+    @property
+    def task_id(self) -> str: ...
+
+    @property
+    def session_key(self) -> str: ...
+
+    @property
+    def status(self) -> str: ...
+
+
 @runtime_checkable
 class AdmissionPlanRevision(Protocol):
     @property

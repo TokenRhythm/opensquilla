@@ -12,6 +12,7 @@ import sqlite3
 import time
 import uuid
 from dataclasses import replace
+from functools import partial
 from typing import Any, cast
 
 import structlog
@@ -52,7 +53,8 @@ from opensquilla.application.admission_views import (
     PreparedAdmissionIntent,
     SessionIdentity,
 )
-from opensquilla.application.turn_acceptance_ports import AdmissionPrimitives
+from opensquilla.application.turn_acceptance_ports import AdmissionPrimitives, AdmissionReservation
+from opensquilla.application.turn_activation import commit_reserved_turn
 from opensquilla.application.turn_admission import AcceptedCollaboration, AdmitTurn, AdmitTurnResult
 from opensquilla.application.turn_input import (
     PlanAdmissionContext,
@@ -1390,115 +1392,60 @@ async def _accept_turn(
                     _handle, collected_acceptance = collected
                     return collected_acceptance
 
-            reservation = await ports.reserve_turn(
-                atomic_task_runtime,
-                route_envelope,
-                provider_message_text,
-                attachments=raw_attachments,
-                mode=runtime_mode,
-                run_kind=run_kind,
-                no_memory_capture=bool(capture_controls["no_memory_capture"]),
-                semantic_message=semantic_message_text,
-                turn_id=turn_id,
-                accepted_run_mode_override=accepted_run_mode_override,
-            )
-            try:
-                if atomic_intent_plan.action in {"create", "fork"}:
-                    await ports.freeze_acceptance(
-                        atomic_task_runtime,
-                        reservation,
-                        session_node=atomic_intent_plan.node,
-                    )
-                else:
-                    await ports.freeze_acceptance(atomic_task_runtime, reservation)
-                acceptance = await _accept_task_record(reservation.task_record)
-            except BaseException:
-                await atomic_task_runtime.abort_reservation(reservation)
-                raise
-
-            if acceptance.replayed:
-                await atomic_task_runtime.abort_reservation(reservation)
-                return acceptance
-
-            if atomic_intent_plan.action == "reset":
-                set_cached_epoch = (
-                    session_manager.set_cached_epoch
-                    if session_manager.capabilities.cache_epoch
-                    else None
-                )
-                if callable(set_cached_epoch):
-                    set_cached_epoch(key, expected_epoch)
-            try:
-                await atomic_task_runtime.activate(
+            async def _freeze(reservation: AdmissionReservation) -> None:
+                await ports.freeze_acceptance(
+                    atomic_task_runtime,
                     reservation,
-                    persisted_user_message_id=acceptance.receipt.message_id,
-                    fresh_user_session=acceptance.fresh_user_session,
+                    session_node=(
+                        atomic_intent_plan.node
+                        if atomic_intent_plan.action in {"create", "fork"}
+                        else None
+                    ),
                 )
-            except Exception as exc:  # noqa: BLE001 - acceptance already committed.
-                log.error(
-                    "sessions.send.activation_failed",
-                    session_key=key,
-                    task_id=acceptance.receipt.task_id,
-                    error=str(exc),
-                    exc_info=True,
-                )
-                if reservation.activated:
-                    # The driver owns settlement after the irreversible
-                    # activation boundary.  Observer failures must not race it
-                    # with an abandoned/failed compensation write.
-                    log.warning(
-                        "sessions.send.activation_error_after_start",
-                        session_key=key,
-                        task_id=acceptance.receipt.task_id,
+
+            def _before_activate(_acceptance: AdmissionAcceptance) -> None:
+                if (
+                    atomic_intent_plan.action == "reset"
+                    and session_manager.capabilities.cache_epoch
+                ):
+                    session_manager.set_cached_epoch(key, expected_epoch)
+
+            def _on_unactivated() -> None:
+                if meta_launch_promotion == "promoted":
+                    ports.cancel_accepted_meta_launch(
+                        key, client_request_id=ingress_identity.client_request_id
                     )
-                else:
-                    goal_compensated = False
-                    goal_service = getattr(atomic_task_runtime, "goal_service", None)
-                    compensate_goal = getattr(
-                        goal_service,
-                        "compensate_activation_failure",
-                        None,
-                    )
-                    if acceptance.goal_context is not None and callable(compensate_goal):
-                        try:
-                            compensation = await compensate_goal(
-                                acceptance.goal_context.as_task_detail()
-                            )
-                            goal_compensated = compensation is not None
-                        except Exception:  # noqa: BLE001 - preserve accepted response.
-                            log.exception(
-                                "sessions.send.goal_activation_compensation_failed",
-                                task_id=acceptance.receipt.task_id,
-                            )
-                    if acceptance.receipt.task_id and not goal_compensated:
-                        try:
-                            await storage.update_agent_task(
-                                acceptance.receipt.task_id,
-                                status="failed",
-                                finished_at=int(time.time() * 1000),
-                                terminal_reason="activation_failed",
-                                error_class=type(exc).__name__,
-                                error_message=str(exc),
-                            )
-                        except Exception:  # noqa: BLE001 - preserve accepted response.
-                            log.exception(
-                                "sessions.send.activation_failure_record_failed",
-                                task_id=acceptance.receipt.task_id,
-                            )
-                    if meta_launch_promotion == "promoted":
-                        ports.cancel_accepted_meta_launch(
-                            key,
-                            client_request_id=ingress_identity.client_request_id,
-                        )
-                    try:
-                        await atomic_task_runtime.abort_reservation(reservation)
-                    except Exception:  # noqa: BLE001 - preserve accepted response.
-                        log.exception(
-                            "sessions.send.activation_abort_failed",
-                            task_id=acceptance.receipt.task_id,
-                        )
-                    acceptance = storage.failed_acceptance(acceptance)
-            return acceptance
+
+            outcome = await commit_reserved_turn(
+                runtime=atomic_task_runtime,
+                storage=storage,
+                reserve=partial(
+                    ports.reserve_turn,
+                    atomic_task_runtime,
+                    route_envelope,
+                    provider_message_text,
+                    attachments=raw_attachments,
+                    mode=runtime_mode,
+                    run_kind=run_kind,
+                    no_memory_capture=bool(capture_controls["no_memory_capture"]),
+                    semantic_message=semantic_message_text,
+                    turn_id=turn_id,
+                    accepted_run_mode_override=accepted_run_mode_override,
+                ),
+                freeze=_freeze,
+                commit=_accept_task_record,
+                before_activate=_before_activate,
+                on_unactivated=_on_unactivated,
+                compensate_goal=getattr(
+                    getattr(atomic_task_runtime, "goal_service", None),
+                    "compensate_activation_failure", None,
+                ),
+            )
+            return (
+                storage.with_task_status(outcome.acceptance, outcome.task_status)
+                if outcome.activation_failed
+                else outcome.acceptance
+            )
 
         async def _commit_with_session_admission() -> AdmissionAcceptance:
             # Serialize the full durable commit -> runtime activation boundary

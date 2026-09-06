@@ -687,6 +687,7 @@
       "tests/test_gateway/test_terminal_activity.py",
       "tests/test_gateway/test_terminal_reply.py",
       "tests/test_gateway/test_transcript_attachment_persistence.py",
+      "tests/test_gateway/test_turn_activation_failures.py",
       "tests/test_gateway/test_turn_admission_adapter.py",
       "tests/test_gateway/test_turn_admission_composition.py",
       "tests/test_gateway/test_turn_committed_sqlite_timing.py",

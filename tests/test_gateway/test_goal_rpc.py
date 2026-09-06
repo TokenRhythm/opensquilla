@@ -17,6 +17,7 @@ import pytest
 
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.start_turn import reserve_turn_via_runtime
+from opensquilla.gateway.adapters.app_settings import _notify_goal_config_changed
 from opensquilla.gateway.adapters.goals_contract import (
     register_goals_capabilities_contract,
     register_goals_reattach_contract,
@@ -35,7 +36,6 @@ from opensquilla.gateway.goal_service import GoalService
 from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.routing import build_web_route_envelope
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, RpcRegistry
-from opensquilla.gateway.rpc_config import _notify_goal_config_changed
 from opensquilla.gateway.rpc_goals import (
     _handle_goals_capabilities,
     _handle_goals_clear,

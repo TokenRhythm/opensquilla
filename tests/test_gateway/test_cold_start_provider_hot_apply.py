@@ -19,10 +19,10 @@ import pytest
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.provider_runtime import sync_provider_selector
-from opensquilla.gateway.rpc.registry import RpcContext, _status
-from opensquilla.gateway.rpc_config import (
-    _sync_provider_selector as config_sync_provider_selector,
+from opensquilla.gateway.provider_runtime import (
+    sync_provider_selector as config_sync_provider_selector,
 )
+from opensquilla.gateway.rpc.registry import RpcContext, _status
 from opensquilla.provider.selector import (
     ModelSelector,
     ProviderConfig,

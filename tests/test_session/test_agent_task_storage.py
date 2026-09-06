@@ -351,3 +351,90 @@ async def test_list_sessions_keeps_active_task_session_before_limit(tmp_path) ->
     keys = [row.session_key for row in rows]
     assert old_key in keys
     assert keys[0] == old_key
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", list(AgentTaskStatus))
+async def test_activation_failure_updates_only_queued_tasks(tmp_path, status):
+    storage = await SessionStorage.open(str(tmp_path / "activation.sqlite"))
+    key = "agent:main:webchat:activation-state"
+    try:
+        await storage.create_agent_task(AgentTaskRecord(
+            task_id="accepted-task", session_key=key, status=status,
+            terminal_reason="original", finished_at=123,
+        ))
+        result = await storage.fail_queued_agent_task_activation(
+            "accepted-task", session_key=key,
+            error_class="RuntimeError", error_message="synthetic activation failure",
+        )
+        assert result is not None
+        persisted = await storage.get_agent_task("accepted-task")
+        assert persisted is not None and persisted.model_dump() == result.model_dump()
+        if status == AgentTaskStatus.QUEUED:
+            assert result.status == AgentTaskStatus.FAILED
+            assert result.terminal_reason == "activation_failed"
+            assert result.error_class == "RuntimeError"
+        else:
+            assert result.status == status
+            assert result.terminal_reason == "original" and result.finished_at == 123
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_activation_failure_requires_exact_task_and_session(tmp_path):
+    storage = await SessionStorage.open(str(tmp_path / "activation.sqlite"))
+    key = "agent:main:webchat:activation-identity"
+    try:
+        await storage.create_agent_task(AgentTaskRecord(task_id="accepted-task", session_key=key))
+        for task_id, session_key in [
+            ("missing-task", key), ("accepted-task", "agent:main:webchat:other-session")
+        ]:
+            result = await storage.fail_queued_agent_task_activation(
+                task_id, session_key=session_key,
+                error_class="RuntimeError", error_message="synthetic activation failure",
+            )
+            assert result is None
+        task = await storage.get_agent_task("accepted-task")
+        assert task is not None and task.status == AgentTaskStatus.QUEUED
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_activation_failure_preserves_a_competing_terminal_commit(tmp_path, monkeypatch):
+    import asyncio
+    from contextlib import asynccontextmanager
+
+    storage = await SessionStorage.open(str(tmp_path / "activation.sqlite"))
+    key = "agent:main:webchat:activation-race"
+    entered = asyncio.Event()
+    proceed = asyncio.Event()
+    transaction = storage._write_transaction
+
+    @asynccontextmanager
+    async def delayed_transaction(operation, *args, **kwargs):
+        if operation == "fail_queued_agent_task_activation":
+            entered.set()
+            await proceed.wait()
+        async with transaction(operation, *args, **kwargs) as connection:
+            yield connection
+
+    try:
+        await storage.create_agent_task(AgentTaskRecord(task_id="accepted-task", session_key=key))
+        monkeypatch.setattr(storage, "_write_transaction", delayed_transaction)
+        compensation = asyncio.create_task(storage.fail_queued_agent_task_activation(
+            "accepted-task", session_key=key,
+            error_class="RuntimeError", error_message="synthetic activation failure",
+        ))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        settled = await storage.update_agent_task(
+            "accepted-task", status=AgentTaskStatus.CANCELLED,
+            terminal_reason="user_cancelled", finished_at=123,
+        )
+        proceed.set()
+        result = await asyncio.wait_for(compensation, timeout=2)
+        assert result is not None and result.model_dump() == settled.model_dump()
+    finally:
+        proceed.set()
+        await storage.close()

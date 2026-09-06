@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import copy
 import hashlib
 import importlib.util
 import json
@@ -1329,6 +1330,52 @@ def _render_validators(
     }
 
 
+def _typescript_params_schema(spec: ContractSpec) -> dict[str, Any]:
+    """Expose required-only object alternatives to the pinned TS compiler.
+
+    json-schema-to-typescript otherwise loses the surrounding properties when
+    an anyOf branch only names required fields. Distribute those constraints
+    in a private compiler input; the wire schema and runtime validators retain
+    their original source.
+    """
+
+    document = copy.deepcopy(spec.document)
+    if spec.contract_type != "method":
+        return document
+    for name in _reachable_definition_names(spec, spec.target("params")):
+        schema = document["$defs"][name]
+        branches = schema.get("anyOf")
+        properties = schema.get("properties")
+        if (
+            schema.get("type") != "object"
+            or not isinstance(properties, dict)
+            or not isinstance(branches, list)
+            or not branches
+            or any(key in schema for key in ("$id", "$anchor", "$dynamicAnchor", "$defs"))
+            or not all(
+                isinstance(branch, dict)
+                and set(branch) == {"required"}
+                and isinstance(branch["required"], list)
+                and all(isinstance(key, str) and key in properties for key in branch["required"])
+                for branch in branches
+            )
+        ):
+            continue
+        common = {key: value for key, value in schema.items() if key != "anyOf"}
+        document["$defs"][name] = {
+            "anyOf": [
+                {
+                    **common,
+                    "required": list(
+                        dict.fromkeys([*common.get("required", []), *branch["required"]])
+                    ),
+                }
+                for branch in branches
+            ]
+        }
+    return document
+
+
 def render_generic(
     spec: ContractSpec,
     *,
@@ -1345,6 +1392,11 @@ def render_generic(
         tmp = Path(raw_tmp)
         python_tmp = tmp / f"{spec.python_stem}.py"
         typescript_tmp = tmp / f"{spec.typescript_stem}.ts"
+        typescript_schema = _typescript_params_schema(spec)
+        typescript_input = spec.schema
+        if typescript_schema != spec.document:
+            typescript_input = tmp / spec.schema.name
+            _write_text_lf(typescript_input, json.dumps(typescript_schema, ensure_ascii=False))
         _run(
             [
                 sys.executable,
@@ -1385,7 +1437,9 @@ def render_generic(
                 "--",
                 "json2ts",
                 "--input",
-                str(spec.schema),
+                str(typescript_input),
+                "--cwd",
+                str(spec.schema.parent),
                 "--output",
                 str(typescript_tmp),
                 "--unreachableDefinitions",

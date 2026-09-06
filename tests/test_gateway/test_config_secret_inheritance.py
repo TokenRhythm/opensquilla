@@ -1,7 +1,7 @@
 """Redaction round-trip + D19 secret-inheritance regression tests.
 
 Pins the behavior of the consolidated secret-inheritance service
-(``opensquilla.gateway.config_secrets``) and proves that every config-mutation
+(``opensquilla.application.config_secrets``) and proves that every config-mutation
 surface routes through it identically:
 
 * the redaction round-trip restores a redaction *marker* back to the stored
@@ -26,7 +26,7 @@ import pytest
 import structlog
 
 import opensquilla.gateway.rpc_config  # noqa: F401  ensures config.* handlers register
-from opensquilla.gateway import config_secrets
+from opensquilla.application import config_secrets
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.config_persistence import persist_gateway_config
