@@ -104,7 +104,7 @@ async def agents_list() -> str:
         },
     },
     required=["action"],
-    exposed_by_default=False,
+    default_access="deny",
 )
 async def subagents(
     action: str,

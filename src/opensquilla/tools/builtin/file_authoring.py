@@ -406,7 +406,6 @@ async def create_xlsx(sheets: list[dict[str, Any]], name: str | None = None) -> 
         },
     },
     required=["slides"],
-    exposed_by_default=False,
     sandbox=SandboxToolDescriptor.artifact(kind="artifact.create_pptx"),
 )
 async def create_pptx(slides: list[dict[str, Any]], name: str | None = None) -> str:

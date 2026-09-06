@@ -8,7 +8,7 @@ is a routing guard: the actual behaviour happens inside
 returns a synthetic review/confirmation result. If this handler ever fires,
 something is misconfigured.
 
-Visibility: ``exposed_by_default=False``. ``submit`` is surfaced per-run via
+Visibility: ``default_access="deny"``. ``submit`` is surfaced per-run via
 ``ToolContext.surfaced_tools`` only when the ``submit_review`` lever is enabled
 (see ``engine/runtime.py``); with the lever off the tool is absent from the
 catalogue and the interception branch is dead, so behaviour is unchanged.
@@ -33,7 +33,7 @@ from opensquilla.tools.registry import tool
         },
     },
     required=[],
-    exposed_by_default=False,
+    default_access="deny",
 )
 async def submit(summary: str | None = None) -> str:  # noqa: ARG001 — unused in guard
     raise RuntimeError(

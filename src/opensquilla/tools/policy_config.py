@@ -22,7 +22,14 @@ _TOOL_GROUPS: Mapping[str, frozenset[str]] = {
         }
     ),
     "group:sessions": frozenset(
-        {"sessions_list", "sessions_history", "sessions_send", "sessions_spawn", "session_status"}
+        {
+            "sessions_list",
+            "sessions_history",
+            "sessions_send",
+            "sessions_spawn",
+            "sessions_yield",
+            "session_status",
+        }
     ),
     "group:memory": frozenset({"memory_search", "memory_get"}),
     "group:web": frozenset({"web_search", "web_discover", "web_fetch", "http_request"}),

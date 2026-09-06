@@ -718,7 +718,7 @@ def create_memory_tools(
             },
         },
         required=["content"],
-        exposed_by_default=False,
+        default_access="deny",
         registry=registry,
     )
     async def memory_save(content: str, path: str = "", mode: str = "append") -> str:
@@ -821,7 +821,7 @@ def create_memory_tools(
             },
         },
         required=["path"],
-        exposed_by_default=False,
+        default_access="deny",
         registry=registry,
     )
     async def memory_delete(path: str) -> str:

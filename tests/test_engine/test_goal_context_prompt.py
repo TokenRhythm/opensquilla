@@ -305,8 +305,8 @@ def test_goal_tools_do_not_terminate_the_turn() -> None:
     assert update_progress is not None
     assert update_goal.spec.terminates_turn is False
     assert update_progress.spec.terminates_turn is False
-    assert update_goal.spec.exposed_by_default is False
-    assert update_progress.spec.exposed_by_default is False
+    assert update_goal.spec.default_access == "deny"
+    assert update_progress.spec.default_access == "deny"
 
 
 def test_goal_tool_contract_requires_evidence_and_keeps_progress_optional() -> None:

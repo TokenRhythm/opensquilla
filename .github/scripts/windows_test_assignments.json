@@ -307,6 +307,7 @@
       "tests/test_tools/test_shell_self_kill_policy.py",
       "tests/test_tools/test_source_edit_tools.py",
       "tests/test_tools/test_source_edit_visibility.py",
+      "tests/test_tools/test_tool_search.py",
       "tests/test_tools/test_workspace_write_deny_effects.py",
       "tests/unit/cli/repl/test_chat_preflight.py",
       "tests/unit/cli/repl/test_opentui_chat_adapter.py",

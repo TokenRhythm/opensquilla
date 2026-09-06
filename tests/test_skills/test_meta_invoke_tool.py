@@ -47,7 +47,7 @@ def test_meta_invoke_not_exposed_by_default() -> None:
 
     registered = get_default_registry().get("meta_invoke")
     assert registered is not None  # exists in registry
-    assert registered.spec.exposed_by_default is False, (
+    assert registered.spec.default_access == "deny", (
         "meta_invoke should be conditionally surfaced, not always exposed"
     )
 

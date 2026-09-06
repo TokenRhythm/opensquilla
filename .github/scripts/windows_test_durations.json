@@ -1457,6 +1457,7 @@
     "tests/test_tools/test_subagents_ownership.py": 0.01,
     "tests/test_tools/test_tool_failure_envelope.py": 0.018,
     "tests/test_tools/test_tool_result_retrieval.py": 0.498,
+    "tests/test_tools/test_tool_search.py": 0.01,
     "tests/test_tools/test_tool_upgrade_compatibility.py": 0.01,
     "tests/test_tools/test_web_fetch.py": 0.074,
     "tests/test_tools/test_web_http_request.py": 0.116,

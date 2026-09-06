@@ -102,7 +102,7 @@ class ToolContext:
     # host execution; Safe mode stays sandboxed.
     elevated: str | None = None
     # Additive per-call tool surface overrides (surfaced tools are made visible even
-    # when exposed_by_default=False). Does NOT relax allowed_tools strict denylist.
+    # when default_access="deny"). Does NOT relax allowed_tools strict denylist.
     surfaced_tools: set[str] | None = None
     tool_policy: dict[str, Any] | None = None
     tool_result_budget_policy: Any | None = None
@@ -167,9 +167,9 @@ class ToolContext:
     # Runtime-only services are injected after durable turn acceptance. They
     # must never be serialized into task details or route metadata.
     plan_storage: Any | None = field(default=None, repr=False)
-    plan_event_emitter: (
-        Callable[[str, str, dict[str, Any]], Awaitable[None]] | None
-    ) = field(default=None, repr=False)
+    plan_event_emitter: Callable[[str, str, dict[str, Any]], Awaitable[None]] | None = field(
+        default=None, repr=False
+    )
     # Runtime-owned deferred interaction service. It returns structured answers
     # to the exact tool call instead of injecting a new user turn.
     user_input_provider: Any | None = field(default=None, repr=False)
@@ -196,17 +196,17 @@ class ToolContext:
     artifact_context: Any | None = field(default=None, repr=False)
     artifact_session: Any | None = field(default=None, repr=False)
     desktop_artifact_bridge: Any | None = field(default=None, repr=False)
-    artifact_event_emitter: (
-        Callable[[dict[str, Any]], Awaitable[None]] | None
-    ) = field(default=None, repr=False)
+    artifact_event_emitter: Callable[[dict[str, Any]], Awaitable[None]] | None = field(
+        default=None, repr=False
+    )
     # Narrow, runtime-only hook that turns a freshly published editable
     # deliverable into the session's canonical Document before the artifact
     # event crosses the public stream boundary. The engine never receives the
     # underlying persistence service and adoption failures remain recoverable
     # through the Workbench open path.
-    generated_artifact_adopter: (
-        Callable[[Any], Awaitable[None]] | None
-    ) = field(default=None, repr=False)
+    generated_artifact_adopter: Callable[[Any], Awaitable[None]] | None = field(
+        default=None, repr=False
+    )
     # Hard upper bound on the tools that may be exposed or dispatched during
     # this turn. Unlike ``allowed_tools``, declarative policy layers may never
     # widen this set. It is used only for narrowly scoped runtime authorities
@@ -262,6 +262,13 @@ class ToolContext:
         default_factory=dict,
         repr=False,
     )
+    # Complete post-policy catalog for this turn.  The model sees only the
+    # progressive disclosure surface; dispatch still enforces this authority.
+    # Appended to preserve ToolContext's positional compatibility contract.
+    authorized_tool_names: frozenset[str] | None = field(default=None, repr=False)
+    disclosed_tool_names: set[str] = field(default_factory=set, repr=False)
+    tool_search_index: Any | None = field(default=None, repr=False)
+    tool_search_namespaces: dict[str, str] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         # A restricted turn's ceiling is an authority boundary, not a policy
@@ -421,7 +428,10 @@ class ToolSpec:
     parameters: dict[str, Any]  # JSON Schema properties dict
     required: list[str] = field(default_factory=list)
     owner_only: bool = False
-    exposed_by_default: bool = True
+    # Registration-time policy used when no turn-specific rule has selected the
+    # tool.  An explicit deny always wins; "deny" tools must be deliberately
+    # added to ToolContext.surfaced_tools by the owning workflow.
+    default_access: Literal["allow", "deny"] | bool = "allow"
     execution_timeout_seconds: float | None = None
     execution_timeout_argument: str | None = None
     execution_timeout_padding: float = 0.0
@@ -453,6 +463,29 @@ class ToolSpec:
     # It never changes provider schemas, validation, authorization, or execution.
     # Appended for positional compatibility with embedded ToolSpec callers.
     presentation_category: ToolPresentationCategory | None = None
+    # Deprecated compatibility alias.  Older plugins used this keyword, while
+    # the sixth positional argument now lands in ``default_access`` as a bool.
+    # Both forms are normalized here so an old ``False`` cannot fail open.
+    exposed_by_default: bool | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        raw_access = self.default_access
+        legacy_access = self.exposed_by_default
+        if isinstance(raw_access, bool):
+            if legacy_access is not None and legacy_access is not raw_access:
+                raise ValueError("conflicting default_access and exposed_by_default values")
+            normalized: Literal["allow", "deny"] = "allow" if raw_access else "deny"
+        else:
+            if raw_access not in {"allow", "deny"}:
+                raise ValueError("default_access must be 'allow' or 'deny'")
+            normalized = raw_access
+            if legacy_access is not None:
+                legacy_normalized: Literal["allow", "deny"] = "allow" if legacy_access else "deny"
+                if raw_access == "deny" and legacy_normalized != raw_access:
+                    raise ValueError("conflicting default_access and exposed_by_default values")
+                normalized = legacy_normalized
+        self.default_access = normalized
+        self.exposed_by_default = normalized == "allow"
 
 
 # Registered tool implementation: async fn that accepts keyword args and returns str.
@@ -523,9 +556,7 @@ class ProjectedToolArgumentsError(SafeToolUserMessage, ValueError):
 class UnsupportedSurfaceError(SafeToolError):
     """Raised when a tool needs an interactive surface that is unavailable."""
 
-    user_message = (
-        "This tool requires a live approval surface, but the current run is unattended."
-    )
+    user_message = "This tool requires a live approval surface, but the current run is unattended."
 
 
 class UnsupportedURLSchemeError(SafeToolUserMessage, ValueError):
