@@ -2365,6 +2365,14 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
 
     is_guest = GuestRpcPolicy.is_guest(ctx)
     owner_id = getattr(ctx.principal, "guest_owner_id", None) if is_guest else None
+    if not is_guest:
+        try:
+            numeric_limit = int(limit)
+        except (TypeError, ValueError):
+            pass
+        else:
+            if numeric_limit < 1:
+                raise ValueError("params.limit must be >= 1")
     if count_only:
         count_sessions = getattr(storage, "count_sessions", None)
         if callable(count_sessions):
