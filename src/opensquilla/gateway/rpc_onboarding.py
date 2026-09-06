@@ -1020,7 +1020,7 @@ async def _probe_primary_provider(
     config: Any,
     usage_event_sink: Any,
 ) -> dict[str, Any]:
-    """Live one-token probe of a candidate provider config (nothing is saved)."""
+    """Live probe of a candidate provider config without saving it."""
     provider_id = command.provider_id
     cfg = config
     api_key = str(command.api_key or "")
@@ -1061,19 +1061,42 @@ async def _probe_primary_provider(
         if not proxy:
             proxy = str(getattr(cfg.llm, "proxy", "") or "")
     model = str(command.model or "")
+    allow_default_api_key_env = not same_provider or reuse_stored_credentials
     with _validation_error("onboarding.provider.invalid"):
-        result = await _usage_accounted_provider_probe(
-            usage_event_sink,
-            provider_id=str(provider_id),
-            model=model,
-            api_key=api_key,
-            api_key_env=api_key_env,
-            base_url=base_url,
-            proxy=proxy,
-            allow_default_api_key_env=(
-                not same_provider or reuse_stored_credentials
-            ),
-        )
+        if model.strip():
+            result = await _usage_accounted_provider_probe(
+                usage_event_sink,
+                provider_id=str(provider_id),
+                model=model,
+                api_key=api_key,
+                api_key_env=api_key_env,
+                base_url=base_url,
+                proxy=proxy,
+                allow_default_api_key_env=allow_default_api_key_env,
+            )
+        else:
+            # A model is unnecessary for an endpoint/credential connectivity
+            # check; model discovery exercises that path without a chat turn.
+            from opensquilla.onboarding.probe import (
+                ProviderProbeResult,
+                discover_provider_models,
+            )
+
+            listing = await discover_provider_models(
+                provider_id=str(provider_id),
+                api_key=api_key,
+                api_key_env=api_key_env,
+                base_url=base_url,
+                proxy=proxy,
+                allow_default_api_key_env=allow_default_api_key_env,
+            )
+            result = ProviderProbeResult(
+                ok=listing.ok,
+                provider_id=str(provider_id),
+                model="",
+                failure_kind=listing.failure_kind,
+                message=listing.detail,
+            )
     saved_model = str(getattr(cfg.llm, "model", "") or "").strip()
     if (
         same_provider

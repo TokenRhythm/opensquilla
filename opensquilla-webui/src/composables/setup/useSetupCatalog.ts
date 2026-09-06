@@ -1521,19 +1521,20 @@ const providerProbeModel = computed(() => {
 
 const providerProbeMissingFields = computed(() => {
   if (!providerForm.selectedProvider.value) return []
+  // Stored/draft profiles probe through onboarding.llmProfile[.draft].probe,
+  // which still resolves a concrete deployment model, so keep requiring one.
   if (providerSelectionKind.value === 'profile') {
     return providerProbeModel.value ? [] : [t('setup.common.model')]
   }
+  // For a draft primary-provider config the model id no longer gates the
+  // probe: an empty model makes onboarding.provider.probe verify reachability
+  // via the model-list endpoint instead of a chat turn (#792).
   return providerFields.value
     .filter(field => field.required === true && !isProviderCredentialField(field))
-    .filter(field => {
-      const value = field.name === 'model'
-        && editingPrimaryProvider.value
-        && hasConfiguredPrimaryProvider.value
-        ? currentFormModelValue()
-        : providerForm.fieldValue(field, currentProviderConfig.value)
-      return !String(value ?? '').trim()
-    })
+    .filter(field => field.name !== 'model')
+    .filter(field => !String(
+      providerForm.fieldValue(field, currentProviderConfig.value) ?? '',
+    ).trim())
     .map(providerProbeFieldLabel)
 })
 

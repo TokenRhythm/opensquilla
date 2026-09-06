@@ -5627,16 +5627,19 @@ describe('useSetupCatalog optional provider credentials', () => {
         source: 'not_required',
         probeReady: false,
       })
+      // The model id no longer gates the probe (#792): only the still-empty
+      // non-model required field (Base URL) blocks it.
       expect(credential?.probeDisabledReason).toBe(
-        'Complete required fields before verifying: Model, Base URL.',
+        'Complete required fields before verifying: Base URL.',
       )
 
       api.probeProviderConnection()
       expect(rpcCall.mock.calls.some(call => call[0] === 'onboarding.provider.probe')).toBe(false)
 
-      api.updateProviderField('model', 'test-model')
       api.updateProviderField('base_url', 'https://custom.example.test/v1')
       credential = api.providerPanel.value.credentialPanel
+      // An empty model is now allowed: reachability is verified via the
+      // model-list endpoint.
       expect(credential?.probeReady).toBe(true)
       expect(credential?.probeDisabledReason).toBe('')
 
@@ -5645,7 +5648,6 @@ describe('useSetupCatalog optional provider credentials', () => {
       expect(rpcCall).toHaveBeenCalledWith('onboarding.provider.probe', {
         providerId,
         baseUrl: 'https://custom.example.test/v1',
-        model: 'test-model',
       })
       app.unmount()
     },
