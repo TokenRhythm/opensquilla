@@ -401,7 +401,9 @@
     </button>
   </nav>
 
-  <ToastHost />
+  <Teleport to="body">
+    <ToastHost />
+  </Teleport>
 
   <ConfirmModal />
 
@@ -525,7 +527,7 @@ import { activeTaskWasDeletedWithProjectHistory } from './utils/projectHistory'
 import { createCoalescedRefresh } from './utils/coalescedRefresh'
 import {
   optionalSessionRpcAllowed,
-  optionalSessionRpcCallOptions,
+  optionalSessionReadOptions,
 } from './composables/chat/sessionBootstrapAdmission'
 import { markCronFinishNotified } from './utils/cron/notifications'
 import { AGENT_CATALOG_KEY } from './modules/agentCatalog'
@@ -740,7 +742,7 @@ function handleCronRunFinished(event: CronRunFinished) {
 installSessionNavigationDiagConsole()
 
 // Shared agents.list state + fetch (singleton) for sidebar session metadata.
-const { agents, loadAgents } = useAgentOptions(agentCatalog, optionalSessionRpcCallOptions)
+const { agents, loadAgents } = useAgentOptions(agentCatalog, optionalSessionReadOptions)
 const mobileKeyboardOpen = ref(false)
 const commandPaletteOpen = ref(false)
 const localChatSessions = ref<Record<string, { effectiveAgentId: string; title: string; updatedAt: number }>>({})
@@ -1701,7 +1703,7 @@ async function performSidebarLoad(): Promise<void> {
     && optionalSessionRpcAllowed.value
   ) {
     requests.push(
-      projectWorkspaces.loadWorkspaces(optionalSessionRpcCallOptions),
+      projectWorkspaces.loadWorkspaces(optionalSessionReadOptions),
     )
   }
   await Promise.allSettled(requests)
@@ -1738,8 +1740,12 @@ function subscribeCronEventsWhenAdmitted() {
     !appAutomaticRpcMounted
     || !optionalSessionRpcAllowed.value
     || !gatewayAccess.isAvailable
+    || cronFinishedSubscription
   ) return
-  void cronScheduler.resumeEvents().catch(() => undefined)
+  // CronScheduler's Adapter owns its generation-aware remote event lease, but
+  // App owns admission so the optional subscribe frame cannot enter the
+  // Gateway's serial dispatcher ahead of critical session recovery.
+  cronFinishedSubscription = cronScheduler.subscribe(handleCronRunFinished)
 }
 
 function resumeAutomaticAppRpc() {
@@ -1950,7 +1956,6 @@ onMounted(() => {
   resumeAutomaticAppRpc()
   // Keep the approval badge/count live app-wide, not just on the Approvals page.
   subscribeApprovals()
-  cronFinishedSubscription = cronScheduler.subscribe(handleCronRunFinished)
   // Seed now in case an approval was pending before mount. Availability events
   // re-seed after reconnects and clear stale data while transport recovers.
   void seedPendingApprovals()

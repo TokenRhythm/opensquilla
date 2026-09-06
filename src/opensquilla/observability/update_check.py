@@ -56,8 +56,10 @@ DEFAULT_UPDATE_CHECK_ENDPOINT = f"{DEFAULT_UPDATE_CHANNEL_ROOT}/stable.json"
 # this template before it reaches the network; keeping it as a named constant
 # also makes the public endpoint contract easy to exercise in tests.
 DEFAULT_RC_UPDATE_CHECK_ENDPOINT = f"{DEFAULT_UPDATE_CHANNEL_ROOT}/preview/{{base}}.json"
-DEFAULT_RELEASE_TAG_PAGE = "https://github.com/opensquilla/opensquilla/releases/tag"
-DEFAULT_RELEASES_INDEX_PAGE = "https://github.com/opensquilla/opensquilla/releases"
+DEFAULT_RELEASE_TAG_PAGE = "https://github.com/TokenRhythm/opensquilla/releases/tag"
+DEFAULT_RELEASES_INDEX_PAGE = "https://github.com/TokenRhythm/opensquilla/releases"
+# Published v1 channels retain the old repository URL for installed clients.
+LEGACY_V1_RELEASE_TAG_PAGE = "https://github.com/opensquilla/opensquilla/releases/tag"
 # Compatibility name for callers that imported the old fallback constant.
 # A lookup without an exact release URL leads to the generic index rather than
 # implying that any particular GitHub Release was selected.
@@ -613,7 +615,8 @@ def _manifest_release(
         raise ValueError("preview channel manifest contains another release line")
 
     canonical_release_url = f"{DEFAULT_RELEASE_TAG_PAGE}/{tag}"
-    if payload.get("releaseUrl") != canonical_release_url:
+    legacy_release_url = f"{LEGACY_V1_RELEASE_TAG_PAGE}/{tag}"
+    if payload.get("releaseUrl") not in (canonical_release_url, legacy_release_url):
         raise ValueError("channel manifest releaseUrl is not canonical")
     return version, canonical_release_url
 

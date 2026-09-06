@@ -17,13 +17,13 @@ from pathlib import Path
 import pytest
 
 from opensquilla.engine.pricing import PriceEntry, resolve_model_price
+from opensquilla.gateway.adapters.app_settings import _sync_model_catalog_overrides
 from opensquilla.gateway.boot import (
     apply_model_catalog_overrides,
     build_services,
     model_override_entries,
 )
 from opensquilla.gateway.config import GatewayConfig, ModelOverrideConfig
-from opensquilla.gateway.rpc_config import _sync_model_catalog_overrides
 from opensquilla.provider.model_catalog import ModelCatalog, set_shared_catalog, shared_catalog
 from opensquilla.sandbox.integration import reset_runtime
 

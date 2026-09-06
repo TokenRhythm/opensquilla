@@ -6,6 +6,7 @@ import {
   useChatGoals,
   type GoalContinuityStorage,
 } from './useChatGoals'
+import { GoalCenterError } from '@/modules/goalCenter'
 import type { GoalEvent, GoalReattachInput } from '@/modules/goalContinuity'
 
 const SESSION_KEY = 'agent:main:webchat:test'
@@ -1009,9 +1010,10 @@ describe('useChatGoals', () => {
         executionState: 'working',
       }),
     })
-    const error = Object.assign(
-      new Error('The Goal still owns an unsettled task'),
-      { code: 'GOAL_BUSY' },
+    const error = new GoalCenterError(
+      'conflict',
+      'The Goal still owns an unsettled task',
+      { reason: 'busy', retryable: true },
     )
     rpc.call.mockRejectedValueOnce(error)
 

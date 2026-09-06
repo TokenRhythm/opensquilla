@@ -40,7 +40,6 @@ function createHarness(overrides: Partial<UseChatSendOptions> = {}) {
     showThinkingIndicator: vi.fn(),
     hideThinkingIndicator: vi.fn(),
     appendFrame: vi.fn(),
-    useReducer: ref(false),
   }
   const options: UseChatSendOptions = {
     rpc,

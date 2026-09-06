@@ -2865,9 +2865,9 @@ async def test_direct_channel_unbound_turn_refreshes_durable_context(
     tmp_path: Path,
 ) -> None:
     from opensquilla.gateway.project_workspace_runtime import (
+        apply_run_context_route_metadata,
         authoritative_project_run_context,
     )
-    from opensquilla.gateway.rpc_sessions import _apply_run_context_route_metadata
 
     storage = await SessionStorage.open(str(tmp_path / "channel-unbound.db"))
     manager = SessionManager(storage, inject_time_prefix=False)
@@ -2915,7 +2915,7 @@ async def test_direct_channel_unbound_turn_refreshes_durable_context(
         default_workspace=str(default_workspace),
     )
     assert workspace_guard is None
-    _apply_run_context_route_metadata(
+    apply_run_context_route_metadata(
         envelope,
         stale_context,
         principal_is_owner=True,

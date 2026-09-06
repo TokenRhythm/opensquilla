@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opensquilla.dev/contracts/gateway/v4/skills/skills-deps-install.schema.json",
+  "title": "OpenSquilla skills.deps.install Contract",
+  "type": "object", "additionalProperties": false,
+  "properties": { "request": { "$ref": "#/$defs/Request" }, "response": { "$ref": "#/$defs/Response" } },
+  "x-opensquilla-wire": { "protocol": "opensquilla-websocket-json", "version": 4, "compatibility": "exact-json-tree" },
+  "x-opensquilla-codegen": {
+    "python": { "tool": "datamodel-code-generator", "version": "0.75.1", "target": "pydantic_v2.BaseModel" },
+    "typescript": { "tool": "json-schema-to-typescript", "version": "15.0.4" },
+    "runtimeValidation": { "tool": "ajv", "version": "8.17.1", "mode": "standalone-adapter-only" }
+  },
+  "x-opensquilla-method": {
+    "name": "skills.deps.install", "kind": "command", "scope": "operator.admin", "guestAllowed": false,
+    "idempotency": "non-idempotent", "timeout": { "policy": "caller" },
+    "capability": { "kind": "method-availability", "name": "skills.deps.install" },
+    "request": "#/$defs/Request", "params": "#/$defs/Params", "response": "#/$defs/Response", "result": "#/$defs/Result",
+    "errors": [{ "code": "INVALID_REQUEST" }, { "code": "UNAUTHORIZED" }, { "code": "NOT_FOUND" }, { "code": "INTERNAL_ERROR" }]
+  },
+  "$defs": {
+    "Params": { "type": "object", "additionalProperties": true, "required": ["install_id"], "properties": {
+      "install_id": { "type": "string" }, "name": { "type": "string" },
+      "installId": { "type": "string" }, "skill_install_id": { "type": "string" },
+      "instanceId": { "type": "string" }, "instance_id": { "type": "string" }
+    } },
+    "Request": { "type": "object", "additionalProperties": false, "required": ["type", "id", "method", "params"], "properties": { "type": { "const": "req" }, "id": { "type": "string" }, "method": { "const": "skills.deps.install" }, "params": { "$ref": "#/$defs/Params" } } },
+    "MissingStill": { "type": "object", "additionalProperties": false, "required": ["bins", "env", "env_any"], "properties": { "bins": { "type": "array", "items": { "type": "string" } }, "env": { "type": "array", "items": { "type": "string" } }, "env_any": { "type": "array", "items": { "type": "array", "items": { "type": "string" } } } } },
+    "Result": { "type": "object", "additionalProperties": true, "required": ["success", "kind", "message", "missing_still"], "properties": { "success": { "type": "boolean" }, "kind": { "type": "string" }, "message": { "type": "string" }, "missing_still": { "$ref": "#/$defs/MissingStill" } } },
+    "RpcError": { "type": "object", "additionalProperties": true, "required": ["code", "message"], "properties": { "code": { "type": "string" }, "message": { "type": "string" } } },
+    "Ok": { "type": "object", "additionalProperties": false, "required": ["type", "id", "ok", "payload"], "properties": { "type": { "const": "res" }, "id": { "type": "string" }, "ok": { "const": true }, "payload": { "$ref": "#/$defs/Result" } } },
+    "Err": { "type": "object", "additionalProperties": false, "required": ["type", "id", "ok", "error"], "properties": { "type": { "const": "res" }, "id": { "type": "string" }, "ok": { "const": false }, "payload": { "type": "null" }, "error": { "$ref": "#/$defs/RpcError" } } },
+    "Response": { "oneOf": [{ "$ref": "#/$defs/Ok" }, { "$ref": "#/$defs/Err" }] }
+  }
+}

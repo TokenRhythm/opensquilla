@@ -17,7 +17,7 @@ import pytest
 
 from opensquilla.application.approval_queue import ApprovalQueue
 from opensquilla.engine.types import DoneEvent
-from opensquilla.gateway import rpc_sessions
+from opensquilla.gateway import admission_preparation, rpc_sessions
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.boot import dispatch_task_runtime_turn
@@ -75,7 +75,7 @@ def _stable_safe_capability(monkeypatch: pytest.MonkeyPatch) -> None:
             ),
         )
 
-    monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+    monkeypatch.setattr(admission_preparation, "current_sandbox_capability_report", report)
 
 
 @dataclass
@@ -2901,14 +2901,14 @@ async def test_authenticated_project_safe_is_rejected_when_native_backend_is_una
     async def report(_config: Any) -> CapabilityReport:
         return unavailable
 
-    monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+    monkeypatch.setattr(admission_preparation, "current_sandbox_capability_report", report)
     async with open_stack(tmp_path / "sessions.db") as stack:
         project_path = tmp_path / "project"
         project = await add_project(stack, project_path)
         assert project is not None
 
         with pytest.raises(rpc_sessions.RpcHandlerError) as raised:
-            await rpc_sessions._handle_sessions_send(
+            await rpc_sessions._handle_sessions_send_contract(
                 {
                     "key": "agent:main:webchat:project-unavailable-proof",
                     "message": "write",

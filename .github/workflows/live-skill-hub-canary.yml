@@ -20,7 +20,7 @@ concurrency:
 jobs:
   live-skill-hub:
     name: Fetch, publish, view, verify immutable no-op, and uninstall
-    if: github.repository == 'opensquilla/opensquilla'
+    if: github.repository == 'TokenRhythm/opensquilla'
     runs-on: ubuntu-latest
     timeout-minutes: 15
 

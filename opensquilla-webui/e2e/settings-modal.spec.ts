@@ -85,6 +85,53 @@ test.describe('Settings modal', () => {
     await expect(page.locator('.toast', { hasText: /Copied/ }).first()).toBeVisible()
   })
 
+  test('renders a failure toast above Settings from the body portal', async ({ page }) => {
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        value: { writeText: () => Promise.reject(new Error('Clipboard denied')) },
+      })
+      Object.defineProperty(document, 'execCommand', {
+        configurable: true,
+        value: () => false,
+      })
+    })
+    await openFromSidebar(page)
+
+    await dialog(page).getByRole('button', { name: 'Copy config path' }).click()
+    const toast = page.locator('.toast.toast--danger', { hasText: /Copy failed/ }).first()
+    await expect(toast).toBeVisible()
+
+    const placement = await toast.evaluate(element => {
+      const host = element.closest('[data-testid="toast-host"]')
+      const app = document.querySelector('#app')
+      const rect = element.getBoundingClientRect()
+      const topmost = document.elementFromPoint(
+        rect.left + rect.width / 2,
+        rect.top + rect.height / 2,
+      )
+      return {
+        bodyChild: host?.parentElement === document.body,
+        outsideApp: Boolean(host && app && !app.contains(host)),
+        fullyInViewport: rect.left >= 0
+          && rect.top >= 0
+          && rect.right <= window.innerWidth
+          && rect.bottom <= window.innerHeight,
+        aboveModal: topmost === element || element.contains(topmost),
+      }
+    })
+    expect(placement).toEqual({
+      bodyChild: true,
+      outsideApp: true,
+      fullyInViewport: true,
+      aboveModal: true,
+    })
+
+    await toast.getByRole('button', { name: 'Dismiss notification' }).click()
+    await expect(toast).toHaveCount(0)
+    await expect(dialog(page)).toBeVisible()
+  })
+
   test('rail switches sections, marks the active tab, and syncs the URL with replace', async ({ page }) => {
     await openFromSidebar(page)
     await expect(page).toHaveURL(/\/settings$/)

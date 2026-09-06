@@ -167,7 +167,6 @@ export function useChannelMembers(
     try {
       // Cold-load guard: a deep-linked Members tab can fire before the WS
       // handshake completes; wait instead of hard-failing with a Retry.
-      await channelAdministration.ready()
       const result = await channelAdministration.listPairings(name)
       if (activeName.value !== name || id !== requestId) return
       pairings.value = [...result]

@@ -1,0 +1,267 @@
+{
+  "version": 1,
+  "line_budget_policy": "accounting-only",
+  "domains": {
+    "SessionLifecycle": {
+      "whole_files": [
+        "src/opensquilla/application/conversation_ancillary.py",
+        "src/opensquilla/application/session_lifecycle.py",
+        "src/opensquilla/gateway/adapters/conversation_ancillary.py",
+        "src/opensquilla/gateway/adapters/conversation_ancillary_contract.py",
+        "src/opensquilla/gateway/adapters/session_lifecycle.py",
+        "src/opensquilla/gateway/adapters/session_lifecycle_contract.py",
+        "src/opensquilla/gateway/usage_query.py"
+      ],
+      "owned_symbols": {
+        "src/opensquilla/gateway/rpc_chat.py": [
+          "_GatewayClarificationSubmissionPort",
+          "_canonical_webchat_session_key",
+          "_clarify_fields_to_text",
+          "_handle_chat_clarify_submit_contract",
+          "_submit_clarification"
+        ],
+        "src/opensquilla/gateway/rpc_commands.py": [
+          "_GatewayCommandCatalogPort",
+          "_command_catalog",
+          "_handle_commands_list_for_surface_contract",
+          "_meta_skill_argument_choices",
+          "_serialize"
+        ],
+        "src/opensquilla/gateway/rpc_prompt_cache_keepalive.py": [
+          "_GatewayPromptCacheLeasePort",
+          "_prompt_cache_adapter",
+          "_require_service",
+          "_set_contract",
+          "_status_contract",
+          "_stored_session_key"
+        ],
+        "src/opensquilla/gateway/rpc_router.py": [
+          "_GatewayRouteFeedbackPort",
+          "_handle_router_feedback_submit_contract",
+          "_submit_route_feedback"
+        ],
+        "src/opensquilla/gateway/rpc_sessions.py": [
+          "_GatewaySessionLifecyclePorts",
+          "_SessionLifecycleDeletionPort",
+          "_agent_registry_has",
+          "_agent_registry_model",
+          "_buffer_session_event",
+          "_channel_types_from_config",
+          "_cleanup_pending_input_scopes",
+          "_create_session_key",
+          "_delete_session_with_lifecycle",
+          "_effective_agent_id_for_session",
+          "_emit_to_subscribers",
+          "_fork_title_allocation_context",
+          "_fork_title_allocator_lock",
+          "_fork_title_family",
+          "_fork_title_state",
+          "_fork_with_numbered_title",
+          "_handle_sessions_create",
+          "_handle_sessions_delete",
+          "_handle_sessions_fork",
+          "_handle_sessions_fork_through_turn",
+          "_handle_sessions_rename",
+          "_list_transcript_titles",
+          "_model_value",
+          "_next_fork_display_name",
+          "_pending_input_attachment_scopes",
+          "_prepare_session_event_payload",
+          "_send_prepared_to_subscribers",
+          "_session_fork_title_family",
+          "_session_lifecycle_adapter",
+          "_session_sidebar_title",
+          "_validate_rpc_session_deployment"
+        ],
+        "src/opensquilla/gateway/rpc_usage.py": [
+          "_GatewayUsageReportingPort",
+          "_append_tracker_only_rows",
+          "_context_status",
+          "_field",
+          "_first_field",
+          "_handle_usage_cost_contract",
+          "_handle_usage_query_contract",
+          "_handle_usage_status_contract",
+          "_now_ms",
+          "_overlay_tracker_totals",
+          "_positive_int",
+          "_query_usage",
+          "_reconcile_breakdown_to_row",
+          "_resolve_context_window",
+          "_resolved_session_cost_fields",
+          "_row_can_overlay_tracker_totals",
+          "_row_has_usage",
+          "_tracker_rows",
+          "_transcript_entry_tokens",
+          "_usage_cost",
+          "_usage_query_value",
+          "_usage_reporting_adapter",
+          "_usage_row",
+          "_usage_status",
+          "_usage_totals"
+        ]
+      },
+      "registrars": [
+        "register_conversation_ancillary_contract",
+        "register_session_lifecycle_contract"
+      ]
+    },
+    "TurnAdmission": {
+      "whole_files": [
+        "src/opensquilla/application/admission_failures.py",
+        "src/opensquilla/application/admission_errors.py",
+        "src/opensquilla/application/admission_views.py",
+        "src/opensquilla/application/turn_acceptance.py",
+        "src/opensquilla/application/turn_acceptance_ports.py",
+        "src/opensquilla/application/turn_admission.py",
+        "src/opensquilla/application/turn_cancellation.py",
+        "src/opensquilla/application/turn_input.py",
+        "src/opensquilla/application/turn_steering.py",
+        "src/opensquilla/gateway/adapters/turn_admission.py",
+        "src/opensquilla/gateway/adapters/turn_admission_contract.py",
+        "src/opensquilla/gateway/admission_failures.py",
+        "src/opensquilla/gateway/admission_input.py",
+        "src/opensquilla/gateway/admission_preparation.py",
+        "src/opensquilla/gateway/admission_runtime.py",
+        "src/opensquilla/gateway/admission_storage.py",
+        "src/opensquilla/gateway/direct_turn_runtime.py",
+        "src/opensquilla/gateway/turn_ingress.py",
+        "src/opensquilla/gateway/turn_steering.py"
+      ],
+      "owned_symbols": {
+        "src/opensquilla/gateway/rpc_chat.py": [
+          "_chat_turn_admission_adapter",
+          "_handle_chat_abort",
+          "_handle_chat_abort_contract",
+          "_handle_chat_send",
+          "_handle_chat_send_contract",
+          "bind_turn_admission_adapter_factory"
+        ],
+        "src/opensquilla/gateway/rpc_sessions.py": [
+          "_GatewayAdmissionPrimitives",
+          "_GatewayCancellationPorts",
+          "_IngressTurnAuthorityScope",
+          "_accepted_turn_response",
+          "_active_task_runtime_ids",
+          "_agent_registry_model",
+          "_artifact_state_event_emitter",
+          "_await_abort_background_task",
+          "_await_abort_operation",
+          "_buffer_session_event",
+          "_cancel_task_owned_auxiliary_work",
+          "_cancel_task_owned_descendants",
+          "_channel_types_from_config",
+          "_coerce_positive_int",
+          "_consume_abort_background_result",
+          "_create_session_key",
+          "_desktop_artifact_bridge_supports_candidate_loop",
+          "_drain_cancelled_task_runtime",
+          "_effective_agent_id_for_session",
+          "_emit_steer_metric",
+          "_emit_to_subscribers",
+          "_fork_title_allocation_context",
+          "_fork_title_allocator_lock",
+          "_fork_title_family",
+          "_fork_title_state",
+          "_fork_with_numbered_title",
+          "_global_session_routing_snapshot",
+          "_guest_profile_for_principal",
+          "_handle_sessions_abort_contract",
+          "_handle_sessions_send_contract",
+          "_handle_sessions_steer_contract",
+          "_handle_sessions_steer_v2_contract",
+          "_is_remote_web_guest",
+          "_list_transcript_titles",
+          "_load_followup_annotation_focus",
+          "_model_value",
+          "_next_fork_display_name",
+          "_normalize_terminal_event_payload",
+          "_optional_string_param",
+          "_plan_collaboration_snapshot",
+          "_prepare_session_event_payload",
+          "_prompt_annotation_source_only_context",
+          "_publish_admission_collaboration",
+          "_publish_admission_disposition",
+          "_publish_admission_forked",
+          "_publish_admission_steer",
+          "_resolve_session_routing_snapshot",
+          "_schedule_auto_title",
+          "_send_prepared_to_subscribers",
+          "_session_fork_title_family",
+          "_session_routing_snapshot",
+          "_session_row_value",
+          "_session_sidebar_title",
+          "_session_tree_keys",
+          "_session_turn_admission_adapter",
+          "_session_turn_model",
+          "_should_auto_title",
+          "_task_owned_descendant_rows",
+          "_task_record_parent_identity",
+          "_task_record_session_key",
+          "_task_runtime_owns_session",
+          "_task_runtime_rows",
+          "_task_status_value",
+          "_trusted_elevated_hint",
+          "_trusted_run_mode_hint",
+          "_turn_source_scope",
+          "build_gateway_turn_admission_adapter",
+          "build_turn_admission_application"
+        ]
+      },
+      "registrars": [
+        "register_turn_admission_contract"
+      ]
+    },
+    "PendingInputQueue": {
+      "whole_files": [
+        "src/opensquilla/application/pending_input_queue.py",
+        "src/opensquilla/gateway/adapters/pending_input_queue.py",
+        "src/opensquilla/gateway/adapters/pending_input_queue_contract.py",
+        "src/opensquilla/gateway/pending_input_primitives.py",
+        "src/opensquilla/gateway/admission_input.py",
+        "src/opensquilla/application/turn_input.py"
+      ],
+      "owned_symbols": {
+        "src/opensquilla/gateway/rpc_sessions.py": [
+          "_GatewayPendingInputQueuePort",
+          "_accepted_turn_response",
+          "_cleanup_pending_input_scopes",
+          "_cleanup_unreferenced_pending_promotions",
+          "_handle_pending_inputs_cancel_contract",
+          "_handle_pending_inputs_dispatch_contract",
+          "_handle_pending_inputs_enqueue_contract",
+          "_handle_pending_inputs_list_contract",
+          "_handle_pending_inputs_reorder_contract",
+          "_handle_pending_inputs_steer_contract",
+          "_handle_pending_inputs_update_contract",
+          "_material_ids_in_transcript_content",
+          "_pending_input_attachment_scopes",
+          "_pending_input_current_session_id",
+          "_pending_input_lock_for",
+          "_pending_input_queue_adapter",
+          "_pending_input_storage"
+        ]
+      },
+      "registrars": [
+        "register_pending_input_queue_contract"
+      ]
+    }
+  },
+  "cross_domain_boundaries": [
+    {
+      "path": "src/opensquilla/gateway/rpc_sessions.py",
+      "symbol": "build_turn_admission_application",
+      "owner": "TurnAdmission"
+    },
+    {
+      "path": "src/opensquilla/gateway/rpc_sessions.py",
+      "symbol": "_session_turn_admission_adapter",
+      "owner": "TurnAdmission"
+    },
+    {
+      "path": "src/opensquilla/gateway/rpc_chat.py",
+      "symbol": "_chat_turn_admission_adapter",
+      "owner": "TurnAdmission"
+    }
+  ]
+}

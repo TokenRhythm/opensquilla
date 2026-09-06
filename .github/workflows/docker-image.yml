@@ -122,13 +122,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute image repository
+        id: image_repo
+        shell: bash
+        run: |
+          image_repository="$(printf '%s' "ghcr.io/${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          echo "repository=${image_repository}" >> "${GITHUB_OUTPUT}"
+
       # Release tags are PEP 440 (v0.5.0rc3), not strict semver, so the git
       # tag is mapped through as-is instead of via type=semver.
       - name: Compute image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ steps.image_repo.outputs.repository }}
           tags: |
             type=ref,event=tag,enable=${{ github.event_name == 'push' }}
             type=raw,value=edge,enable=${{ github.event_name == 'workflow_dispatch' }}
@@ -157,13 +164,15 @@ jobs:
         if: ${{ github.event_name == 'push' || inputs.publish == true }}
         id: pushed_image
         shell: bash
+        env:
+          IMAGE_REPOSITORY: ${{ steps.image_repo.outputs.repository }}
         run: |
           if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
             image_tag="${GITHUB_REF_NAME}"
           else
             image_tag="edge"
           fi
-          echo "ref=ghcr.io/${GITHUB_REPOSITORY}:${image_tag}" >> "${GITHUB_OUTPUT}"
+          echo "ref=${IMAGE_REPOSITORY}:${image_tag}" >> "${GITHUB_OUTPUT}"
 
       - name: Verify pushed manifest platforms
         if: ${{ github.event_name == 'push' || inputs.publish == true }}
@@ -278,7 +287,7 @@ jobs:
         if: github.event_name == 'push'
         env:
           IMAGE_REF: ${{ steps.pushed_image.outputs.ref }}
-          LATEST_REF: ghcr.io/${{ github.repository }}:latest
+          LATEST_REF: ${{ steps.image_repo.outputs.repository }}:latest
         run: |
           docker buildx imagetools create \
             --tag "${LATEST_REF}" \

@@ -4,7 +4,7 @@ The main ``run_channel_dispatch`` function is a thin orchestrator (~25 lines)
 that delegates to private helpers for each concern:
 
 - ``_record_delivery_context`` — persist routing fields on session (Gap 1)
-- ``_should_skip_unmentioned`` — mention gating for groups (Gap 2)
+- ``decide_channel_admission`` — mention gating for groups (Gap 2)
 - ``_start_typing_keepalive`` — background typing indicator (Gap 3)
 - ``_run_turn_with_streaming`` — streaming or batch reply (Gap 4)
 - ``_emit_events`` — broadcast session events to WS subscribers (Gap 5)
@@ -1929,7 +1929,9 @@ async def _apply_saved_channel_run_context(
     if route_envelope is None or session_manager is None or config is None:
         return
     try:
-        from opensquilla.gateway.rpc_sessions import _apply_run_context_route_metadata
+        from opensquilla.gateway.project_workspace_runtime import (
+            apply_run_context_route_metadata,
+        )
         from opensquilla.sandbox.run_context import (
             get_run_context,
             resolve_default_run_mode,
@@ -1963,7 +1965,7 @@ async def _apply_saved_channel_run_context(
             error_type=type(exc).__name__,
         )
         return
-    _apply_run_context_route_metadata(
+    apply_run_context_route_metadata(
         route_envelope,
         run_context,
         principal_is_owner=principal_is_owner,
@@ -2007,19 +2009,6 @@ async def resolve_delivery_target(
         "thread_id": node.last_thread_id,
         "delivery_context": node.delivery_context,
     }
-
-
-# ── Gap 2: Authenticated admission / mention gating ─────────────────────
-
-
-def _should_skip_unmentioned(
-    channel: Any,
-    msg: IncomingMessage,
-    session_key: str,
-) -> bool:
-    """Compatibility wrapper around the shared pre-dispatch admission decision."""
-
-    return not decide_channel_admission(channel, msg, session_key).admit
 
 
 # ── Gap 3: Typing indicator ──────────────────────────────────────────────
@@ -2115,21 +2104,6 @@ async def _emit_run_heartbeat(
     )
 
 
-def _is_channel_admin_sender(config: Any, envelope: Any) -> bool:
-    """Compatibility matcher for callers that only have a route envelope.
-
-    This helper intentionally does not authorize a turn.  Channel dispatch
-    uses ``_stamp_channel_admin_principal`` below, which also proves the
-    authenticated ingress principal.
-    """
-
-    source_name = getattr(envelope, "source_name", None)
-    sender_id = getattr(envelope, "sender_id", None)
-    if not isinstance(source_name, str) or not isinstance(sender_id, str):
-        return False
-    return _sender_is_channel_admin(config, source_name, sender_id)
-
-
 def _stamp_channel_admin_principal(
     config: Any,
     envelope: Any,
@@ -2187,6 +2161,7 @@ async def _run_turn_with_streaming(
     """
     from opensquilla.agents.scope import resolve_agent_workspace_dir
     from opensquilla.gateway.project_workspace_runtime import (
+        apply_run_context_route_metadata,
         authoritative_project_run_context,
     )
     from opensquilla.gateway.routing import build_channel_route_envelope, tool_context_from_envelope
@@ -2219,11 +2194,7 @@ async def _run_turn_with_streaming(
             config=config,
             default_workspace=(str(workspace_dir) if workspace_dir is not None else None),
         )
-        from opensquilla.gateway.rpc_sessions import (
-            _apply_run_context_route_metadata,
-        )
-
-        _apply_run_context_route_metadata(
+        apply_run_context_route_metadata(
             envelope,
             run_context,
             principal_is_owner=principal_is_owner,
@@ -3409,10 +3380,16 @@ async def _accept_channel_runtime_turn_impl(
 ) -> tuple[Any | None, str, _RuntimeChannelStreamRelay | None, bool]:
     """Atomically accept a channel message, task, and idempotency receipt."""
 
+    from functools import partial
+
+    from opensquilla.application.admission_views import AdmissionTaskRecord
+    from opensquilla.application.turn_acceptance_ports import AdmissionHandle, AdmissionReservation
+    from opensquilla.application.turn_activation import commit_reserved_turn
     from opensquilla.gateway.routing import delivery_fields_from_envelope
     from opensquilla.gateway.task_runtime import TaskHandle
     from opensquilla.session.manager import SessionIntent
     from opensquilla.session.models import AgentTaskStatus
+    from opensquilla.session.storage import TurnAcceptanceResult
 
     def _accepted_replay_handle(acceptance: Any) -> TaskHandle | None:
         """Attach redelivery to any accepted task instead of silently acking it.
@@ -3517,26 +3494,8 @@ async def _accept_channel_runtime_turn_impl(
         bool,
     ]:
         nonlocal stream_relay
-        reservation = await reserve_turn_via_runtime(
-            task_runtime,
-            route_envelope,
-            msg.content,
-            attachments=ingested.attachments,
-            mode=_resolve_channel_busy_input_mode(task_runtime, busy_input_mode),
-            run_kind="channel_turn",
-            semantic_message=raw_content,
-            stream_event_sink=(
-                stream_relay.emit if stream_relay is not None else None
-            ),
-            overflow_policy=overflow_policy,
-            goal_candidate=(
-                goal_claim_candidate.as_task_detail()
-                if goal_claim_candidate is not None
-                else None
-            ),
-            accepted_run_mode_override=accepted_run_mode_override,
-        )
-        try:
+
+        async def _freeze(reservation: AdmissionReservation) -> None:
             if intent_plan.action == "create":
                 from opensquilla.gateway.session_model_routing import (
                     capture_prepared_session_model_routing_config,
@@ -3551,11 +3510,13 @@ async def _accept_channel_runtime_turn_impl(
                 )
             else:
                 await task_runtime.freeze_acceptance(reservation)
-            acceptance = await storage.accept_turn(
+
+        async def _commit(task_record: AdmissionTaskRecord) -> TurnAcceptanceResult:
+            result = await storage.accept_turn(
                 entry,
                 expected_epoch=expected_epoch,
                 updated_at=int(time.time() * 1000),
-                task_record=reservation.task_record,
+                task_record=task_record,
                 source_scope=identity.source_scope,
                 request_session_key=identity.request_session_key,
                 client_request_id=identity.client_request_id,
@@ -3569,95 +3530,69 @@ async def _accept_channel_runtime_turn_impl(
                     else None
                 ),
             )
-        except BaseException:
-            await task_runtime.abort_reservation(reservation)
-            raise
+            if not isinstance(result, TurnAcceptanceResult):
+                raise TypeError("Channel commit did not return durable turn acceptance")
+            return result
 
-        if acceptance.replayed:
-            await task_runtime.abort_reservation(reservation)
-            return _accepted_replay_handle(acceptance), persisted_text, None, True
-
-        if stream_relay is not None:
-            try:
-                stream_relay.start()
-            except Exception:  # noqa: BLE001 - turn is already accepted.
-                log.warning(
-                    "channel.stream_relay_start_failed",
-                    session_key=session_key,
-                    task_id=acceptance.receipt.task_id,
-                    exc_info=True,
-                )
-                stream_relay = None
-        try:
-            handle = await task_runtime.activate(
-                reservation,
-                persisted_user_message_id=acceptance.receipt.message_id,
-                fresh_user_session=acceptance.fresh_user_session,
-            )
-        except Exception as exc:  # noqa: BLE001 - acceptance already committed.
-            log.error(
-                "channel.turn_activation_failed",
-                session_key=session_key,
-                task_id=acceptance.receipt.task_id,
-                exc_info=True,
-            )
-            if reservation.activated:
-                log.warning(
-                    "channel.turn_activation_error_after_start",
-                    session_key=session_key,
-                    task_id=acceptance.receipt.task_id,
-                )
-                handle = await task_runtime.activate(reservation)
-            else:
+        def _before_activate(acceptance: TurnAcceptanceResult) -> None:
+            nonlocal stream_relay
+            if stream_relay is not None:
                 try:
-                    await task_runtime.abort_reservation(reservation)
-                except Exception:  # noqa: BLE001 - preserve accepted channel handling.
+                    stream_relay.start()
+                except Exception:  # noqa: BLE001 - turn is already accepted.
                     log.warning(
-                        "channel.turn_activation_abort_failed",
+                        "channel.stream_relay_start_failed",
                         session_key=session_key,
                         task_id=acceptance.receipt.task_id,
                         exc_info=True,
                     )
-                goal_compensated = False
-                goal_service = getattr(task_runtime, "goal_service", None)
-                compensate_goal = getattr(
-                    goal_service,
-                    "compensate_activation_failure",
-                    None,
-                )
-                if acceptance.goal_context is not None and callable(compensate_goal):
-                    try:
-                        await compensate_goal(acceptance.goal_context.as_task_detail())
-                        goal_compensated = True
-                    except Exception:  # noqa: BLE001 - preserve accepted handling.
-                        log.warning(
-                            "channel.goal_activation_compensation_failed",
-                            session_key=session_key,
-                            task_id=acceptance.receipt.task_id,
-                            exc_info=True,
-                        )
-                if not goal_compensated:
-                    try:
-                        await storage.update_agent_task(
-                            acceptance.receipt.task_id,
-                            status="failed",
-                            finished_at=int(time.time() * 1000),
-                            terminal_reason="activation_failed",
-                            error_class=type(exc).__name__,
-                            error_message=str(exc),
-                        )
-                    except Exception:  # noqa: BLE001 - preserve accepted handling.
-                        log.warning(
-                            "channel.turn_activation_failure_record_failed",
-                            session_key=session_key,
-                            task_id=acceptance.receipt.task_id,
-                            exc_info=True,
-                        )
-                handle = TaskHandle(
-                    task_id=acceptance.receipt.task_id,
-                    session_key=acceptance.receipt.accepted_session_key,
-                    status=AgentTaskStatus.FAILED,
-                )
+                    stream_relay = None
+
+        outcome = await commit_reserved_turn(
+            runtime=task_runtime,
+            storage=storage,
+            reserve=partial(
+                reserve_turn_via_runtime,
+                task_runtime,
+                route_envelope,
+                msg.content,
+                attachments=ingested.attachments,
+                mode=_resolve_channel_busy_input_mode(task_runtime, busy_input_mode),
+                run_kind="channel_turn",
+                semantic_message=raw_content,
+                stream_event_sink=stream_relay.emit if stream_relay is not None else None,
+                overflow_policy=overflow_policy,
+                goal_candidate=(
+                    goal_claim_candidate.as_task_detail()
+                    if goal_claim_candidate is not None
+                    else None
+                ),
+                accepted_run_mode_override=accepted_run_mode_override,
+            ),
+            freeze=_freeze,
+            commit=_commit,
+            before_activate=_before_activate,
+            compensate_goal=getattr(
+                getattr(task_runtime, "goal_service", None),
+                "compensate_activation_failure",
+                None,
+            ),
+        )
+        acceptance = outcome.acceptance
+        if acceptance.replayed:
+            return _accepted_replay_handle(acceptance), persisted_text, None, True
+        handle: AdmissionHandle | None
+        if outcome.activation_failed and outcome.task_status is not None:
+            assert acceptance.receipt.task_id is not None
+            handle = TaskHandle(
+                task_id=acceptance.receipt.task_id,
+                session_key=acceptance.receipt.accepted_session_key,
+                status=AgentTaskStatus(outcome.task_status),
+            )
+        else:
+            # Retain the committed identity and its last known status when a
+            # current ledger read is unavailable; redelivery uses the same task.
+            handle = outcome.handle or _accepted_replay_handle(acceptance)
 
         try:
             session_manager.notify_message_appended(entry)

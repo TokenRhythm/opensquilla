@@ -1,12 +1,29 @@
 import { describe, expect, it, vi } from 'vitest'
+import { ArtifactPreviewLeaseError } from '@/modules/artifactWorkbench'
 import {
-  ArtifactPreviewLeaseError,
+  HttpTransportError,
+} from '@/adapters/gateway/privateHttpTransport'
+import {
+  httpTransportTestDouble,
+  type TestHttpTransport,
+} from '@/testing/httpTransport.test-helper'
+import {
   createArtifactPreviewLease,
   parseArtifactPreviewLease,
   parseArtifactPreviewLeaseRenewal,
   renewArtifactPreviewLease,
   revokeArtifactPreviewLease,
-} from './artifactPreviewLease'
+} from '@/adapters/gateway/artifactPreviewLeaseV4'
+
+function httpTransport(
+  overrides: Parameters<typeof httpTransportTestDouble>[0] = {},
+): TestHttpTransport {
+  return httpTransportTestDouble({
+    requestBlob: vi.fn(async () => new Blob()),
+    requestJson: vi.fn(async () => ({})),
+    ...overrides,
+  })
+}
 
 const lease = {
   version: 1,
@@ -28,20 +45,20 @@ const lease = {
 
 describe('artifact preview lease client', () => {
   it('creates Desktop leases through the native broker without browser fetch', async () => {
-    const fetchImpl = vi.fn()
+    const http = httpTransport()
     const create = vi.fn(async () => ({
       ok: true as const,
       status: 201,
       payload: lease,
     }))
     const result = await createArtifactPreviewLease(
+      http,
       { id: 'art-fixture' },
       'full',
       'desktop',
       {
         authToken: 'token',
         baseOrigin: 'http://127.0.0.1:18791',
-        fetchImpl: fetchImpl as typeof fetch,
         nativeBroker: {
           createArtifactPreviewLease: create,
         },
@@ -57,7 +74,7 @@ describe('artifact preview lease client', () => {
       scopeId: 'agent:main:webchat:1',
       authToken: 'token',
     })
-    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(http.requestJson).not.toHaveBeenCalled()
   })
 
   it('resolves the Desktop broker credential inside the gateway adapter', async () => {
@@ -71,6 +88,7 @@ describe('artifact preview lease client', () => {
     }))
     try {
       await createArtifactPreviewLease(
+        httpTransport(),
         { id: 'art-runtime' },
         'offline',
         'desktop',
@@ -96,21 +114,21 @@ describe('artifact preview lease client', () => {
   })
 
   it('fails explicitly instead of issuing a Desktop fetch without a broker', async () => {
-    const fetchImpl = vi.fn()
+    const http = httpTransport()
     await expect(createArtifactPreviewLease(
+      http,
       { id: 'art-fixture' },
       'full',
       'desktop',
       {
         baseOrigin: 'http://127.0.0.1:18791',
-        fetchImpl: fetchImpl as typeof fetch,
         sessionKey: 'agent:main:webchat:1',
       },
     )).rejects.toMatchObject({
       status: 0,
       code: 'DESKTOP_PREVIEW_BROKER_UNAVAILABLE',
     })
-    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(http.requestJson).not.toHaveBeenCalled()
   })
 
   it('renews and revokes without putting credentials in URLs', async () => {
@@ -119,33 +137,72 @@ describe('artifact preview lease client', () => {
       lease_id: 'lease-1',
       expires_at: '2026-07-29T00:15:00Z',
     }
-    const fetchImpl = vi.fn()
-      .mockResolvedValueOnce(new Response(JSON.stringify(renewal), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      }))
-      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+    const requestJson = vi.fn(async (_endpoint: string, _options?: unknown) => renewal)
+    const requestBlob = vi.fn(async (_endpoint: string, _options?: unknown) => new Blob())
+    const http = httpTransport({ requestBlob, requestJson })
     const context = {
       authToken: 'secret',
       baseOrigin: 'https://control.example',
-      fetchImpl: fetchImpl as typeof fetch,
       sessionKey: 'session-a',
     }
 
-    expect(await renewArtifactPreviewLease('lease-1', context)).toEqual(renewal)
-    await revokeArtifactPreviewLease('lease-1', context)
+    expect(await renewArtifactPreviewLease(http, 'lease-1', context)).toEqual(renewal)
+    await revokeArtifactPreviewLease(http, 'lease-1', context)
 
-    expect(fetchImpl.mock.calls[0]?.[0]).toBe(
+    expect(requestJson.mock.calls[0]?.[0]).toBe(
       'https://control.example/api/v1/artifact-preview-leases/lease-1/renew',
     )
-    expect(fetchImpl.mock.calls[1]?.[0]).toBe(
+    expect(requestBlob.mock.calls[0]?.[0]).toBe(
       'https://control.example/api/v1/artifact-preview-leases/lease-1',
     )
-    expect(String(fetchImpl.mock.calls[0]?.[0])).not.toContain('secret')
+    expect(requestJson).toHaveBeenCalledWith(expect.any(String), {
+      method: 'POST',
+      sessionKey: 'session-a',
+      timeoutMs: 0,
+    })
+    expect(requestBlob).toHaveBeenCalledWith(expect.any(String), {
+      keepalive: true,
+      method: 'DELETE',
+      sessionKey: 'session-a',
+      timeoutMs: 0,
+    })
+    expect(String(requestJson.mock.calls[0]?.[0])).not.toContain('secret')
+  })
+
+  it.each([404, 410])('treats Web lease revoke HTTP %s as idempotent', async (status) => {
+    const requestBlob = vi.fn(async (_endpoint: string, _options?: unknown) => {
+      throw new HttpTransportError('http-status', 'lease already gone', status)
+    })
+
+    await expect(revokeArtifactPreviewLease(
+      httpTransport({ requestBlob }),
+      'lease-1',
+      { baseOrigin: 'https://control.example', sessionKey: 'session-a' },
+    )).resolves.toBeUndefined()
+  })
+
+  it('maps non-idempotent Web lease revoke failures to the domain error', async () => {
+    const requestBlob = vi.fn(async (_endpoint: string, _options?: unknown) => {
+      throw new HttpTransportError('http-status', 'service unavailable', 503, {
+        code: 'PREVIEW_UNAVAILABLE',
+        detail: 'Preview service is unavailable.',
+      })
+    })
+
+    await expect(revokeArtifactPreviewLease(
+      httpTransport({ requestBlob }),
+      'lease-1',
+      { baseOrigin: 'https://control.example', sessionKey: 'session-a' },
+    )).rejects.toMatchObject({
+      name: 'ArtifactPreviewLeaseError',
+      status: 503,
+      code: 'PREVIEW_UNAVAILABLE',
+      message: 'Preview service is unavailable.',
+    })
   })
 
   it('renews and revokes Desktop leases through the same native broker', async () => {
-    const fetchImpl = vi.fn()
+    const http = httpTransport()
     const renew = vi.fn(async () => ({
       ok: true as const,
       status: 200,
@@ -163,7 +220,6 @@ describe('artifact preview lease client', () => {
     const context = {
       authToken: 'secret',
       baseOrigin: 'http://127.0.0.1:18791',
-      fetchImpl: fetchImpl as typeof fetch,
       nativeBroker: {
         renewArtifactPreviewLease: renew,
         revokeArtifactPreviewLease: revoke,
@@ -171,10 +227,10 @@ describe('artifact preview lease client', () => {
       sessionKey: 'session-a',
     }
 
-    expect(await renewArtifactPreviewLease('lease-1', context)).toMatchObject({
+    expect(await renewArtifactPreviewLease(http, 'lease-1', context)).toMatchObject({
       lease_id: 'lease-1',
     })
-    await revokeArtifactPreviewLease('lease-1', context)
+    await revokeArtifactPreviewLease(http, 'lease-1', context)
 
     expect(renew).toHaveBeenCalledWith({
       version: 1,
@@ -188,7 +244,8 @@ describe('artifact preview lease client', () => {
       scopeId: 'session-a',
       authToken: 'secret',
     })
-    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(http.requestJson).not.toHaveBeenCalled()
+    expect(http.requestBlob).not.toHaveBeenCalled()
   })
 
   it('rejects malformed launch URLs and preserves HTTP failure status', async () => {
@@ -205,20 +262,21 @@ describe('artifact preview lease client', () => {
       lease_id: 'lease-1',
     })).toThrow(ArtifactPreviewLeaseError)
 
-    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
-      code: 'LEASE_LIMIT',
-      detail: 'Close an existing preview.',
-    }), {
-      status: 429,
-      headers: { 'content-type': 'application/json' },
-    }))
+    const http = httpTransport({
+      requestJson: vi.fn(async () => {
+        throw new HttpTransportError('http-status', 'Too many leases', 429, {
+          code: 'LEASE_LIMIT',
+          detail: 'Close an existing preview.',
+        })
+      }),
+    })
     await expect(createArtifactPreviewLease(
+      http,
       { id: 'artifact-1' },
       'full',
       'web',
       {
         baseOrigin: 'https://control.example',
-        fetchImpl: fetchImpl as typeof fetch,
       },
     )).rejects.toMatchObject({
       status: 429,

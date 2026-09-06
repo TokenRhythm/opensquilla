@@ -3,7 +3,8 @@ import { effectScope, ref } from 'vue'
 import type { RpcEventHandler } from '@/lib/rpc'
 import type { InterruptViewState } from '@/types/parts'
 import { projectApprovalDisplayArgs } from '@/adapters/gateway/approvalCenterV4Contract'
-import { sessionConversationFromTestRpc } from '@/testing/sessionConversation.test-helper'
+import { createConversationEventsTestHarness } from '@/testing/conversationEvents.test-helper'
+import { clarificationSubmissionFromTestRpc } from '@/testing/conversationAncillary.test-helper'
 import {
   useChatApprovals,
 } from './useChatApprovals'
@@ -27,6 +28,7 @@ async function harness(statusResult: unknown = { found: true, pending: true, res
   const appendInterruptFrame = vi.fn()
   const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map())
   const scope = effectScope()
+  const conversationEvents = createConversationEventsTestHarness()
   const approvalCenter: any = {
     snapshot: vi.fn(async () => {
       const response = await fetch('/api/approvals')
@@ -84,15 +86,12 @@ async function harness(statusResult: unknown = { found: true, pending: true, res
   }
   const approvals = scope.run(() => useChatApprovals({
     approvalCenter,
-    sessionConversation: sessionConversationFromTestRpc({
-      call: rpcCall as <T = unknown>(
+    conversationEvents: conversationEvents.events,
+    clarificationSubmission: clarificationSubmissionFromTestRpc({
+      call: rpcCall as (
         method: string,
         params?: Record<string, unknown>,
-      ) => Promise<T>,
-      on: vi.fn((event: string, handler: RpcEventHandler) => {
-        handlers.set(event, handler)
-        return () => handlers.delete(event)
-      }),
+      ) => Promise<unknown>,
     }),
     sessionKey: ref('agent:main:web'),
     runStatus: ref({ status: 'idle', label: '', task: null }),
@@ -108,7 +107,16 @@ async function harness(statusResult: unknown = { found: true, pending: true, res
   const unsubscribe = approvals.subscribe()
   await vi.waitFor(() => expect(fetch).toHaveBeenCalled())
   vi.mocked(fetch).mockClear()
-  return { approvals, handlers, rpcCall, appendInterruptFrame, interruptState, unsubscribe, scope }
+  return {
+    approvals,
+    handlers,
+    rpcCall,
+    appendInterruptFrame,
+    interruptState,
+    emitToolResult: conversationEvents.emitToolResult,
+    unsubscribe,
+    scope,
+  }
 }
 
 function installSnapshot(pending: unknown[] = []) {
@@ -423,11 +431,11 @@ describe('clarify tool-result recovery', () => {
     installSnapshot()
     const runtime = await harness()
     try {
-      runtime.handlers.get('session.event.tool_result')?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+      runtime.emitToolResult({
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result,
+        approvalResult: result,
       })
 
       expect(runtime.approvals.pendingClarify.value).toEqual({
@@ -453,7 +461,7 @@ describe('clarify tool-result recovery', () => {
       expect(runtime.rpcCall).toHaveBeenLastCalledWith('chat.clarify_submit', {
         sessionKey: 'agent:main:web',
         fields: { scope: 'focused' },
-        request_id: 'input-request-1',
+        requestId: 'input-request-1',
         run_id: 'plan-run-1',
       })
       expect(runtime.approvals.pendingClarify.value).toBeNull()
@@ -489,11 +497,11 @@ describe('clarify tool-result recovery', () => {
     installSnapshot()
     const runtime = await harness()
     try {
-      runtime.handlers.get('session.event.tool_result')?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+      runtime.emitToolResult({
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: planClarifyResult,
+        approvalResult: planClarifyResult,
       })
       runtime.rpcCall.mockRejectedValueOnce(new Error('connection lost after send'))
       await runtime.approvals.submitClarify({ scope: 'focused' })
@@ -522,11 +530,11 @@ describe('clarify tool-result recovery', () => {
     installSnapshot()
     const runtime = await harness()
     try {
-      runtime.handlers.get('session.event.tool_result')?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+      runtime.emitToolResult({
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: planClarifyResult,
+        approvalResult: planClarifyResult,
       })
       runtime.rpcCall.mockRejectedValueOnce(new Error('gateway unavailable'))
       await runtime.approvals.submitClarify({ scope: 'focused' })
@@ -546,18 +554,18 @@ describe('clarify tool-result recovery', () => {
     installSnapshot()
     const runtime = await harness()
     try {
-      const handler = runtime.handlers.get('session.event.tool_result')
-      handler?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+      const handler = runtime.emitToolResult
+      handler({
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: clarifyResult,
+        approvalResult: clarifyResult,
       })
-      handler?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+      handler({
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: {
+        approvalResult: {
           kind: 'user_input',
           status: 'answered',
           paused: false,
@@ -585,11 +593,11 @@ describe('clarify tool-result recovery', () => {
     installSnapshot()
     const runtime = await harness()
     try {
-      runtime.handlers.get('session.event.tool_result')?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+      runtime.emitToolResult({
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: planClarifyResult,
+        approvalResult: planClarifyResult,
       })
       runtime.rpcCall.mockRejectedValueOnce(new Error('gateway unavailable'))
 
@@ -617,25 +625,25 @@ describe('clarify tool-result recovery', () => {
     const runtime = await harness()
     const submitted = deferred<unknown>()
     try {
-      const handler = runtime.handlers.get('session.event.tool_result')
-      handler?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+      const handler = runtime.emitToolResult
+      handler({
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: planClarifyResult,
+        approvalResult: planClarifyResult,
       })
       runtime.rpcCall.mockImplementationOnce(async <T,>() => await submitted.promise as T)
       const firstSubmit = runtime.approvals.submitClarify({ scope: 'focused' })
       await vi.waitFor(() => expect(runtime.rpcCall).toHaveBeenCalledWith(
         'chat.clarify_submit',
-        expect.objectContaining({ request_id: 'input-request-1' }),
+        expect.objectContaining({ requestId: 'input-request-1' }),
       ))
 
-      handler?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-2',
+      handler({
+        key: 'agent:main:web',
+        id: 'request-input-2',
         name: 'request_user_input',
-        result: {
+        approvalResult: {
           ...planClarifyResult,
           request_id: 'input-request-2',
           run_id: 'plan-run-2',
@@ -661,22 +669,22 @@ describe('clarify tool-result recovery', () => {
     installSnapshot()
     const runtime = await harness()
     try {
-      const handler = runtime.handlers.get('session.event.tool_result')
-      handler?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-2',
+      const handler = runtime.emitToolResult
+      handler({
+        key: 'agent:main:web',
+        id: 'request-input-2',
         name: 'request_user_input',
-        result: {
+        approvalResult: {
           ...planClarifyResult,
           request_id: 'input-request-2',
           run_id: 'plan-run-2',
         },
       })
-      handler?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+      handler({
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: {
+        approvalResult: {
           kind: 'user_input',
           status: 'answered',
           paused: false,
@@ -697,12 +705,12 @@ describe('clarify tool-result recovery', () => {
     installSnapshot()
     const runtime = await harness()
     try {
-      const handler = runtime.handlers.get('session.event.tool_result')
-      handler?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+      const handler = runtime.emitToolResult
+      handler({
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: {
+        approvalResult: {
           kind: 'user_input',
           status: 'answered',
           paused: false,
@@ -712,11 +720,11 @@ describe('clarify tool-result recovery', () => {
       })
       const appendCount = runtime.appendInterruptFrame.mock.calls.length
 
-      handler?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+      handler({
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: planClarifyResult,
+        approvalResult: planClarifyResult,
       })
 
       expect(runtime.approvals.pendingClarify.value).toBeNull()
@@ -732,11 +740,11 @@ describe('clarify tool-result recovery', () => {
     installSnapshot()
     const runtime = await harness()
     try {
-      runtime.handlers.get('session.event.tool_result')?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'legacy-clarify',
+      runtime.emitToolResult({
+        key: 'agent:main:web',
+        id: 'legacy-clarify',
         name: 'request_user_input',
-        result: {
+        approvalResult: {
           ...clarifyResult,
           request_id: undefined,
         },

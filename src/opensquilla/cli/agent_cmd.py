@@ -403,6 +403,7 @@ async def run_agent_once(
         )
         from opensquilla.gateway.project_workspace_runtime import (
             apply_accepted_run_mode_override,
+            apply_run_context_route_metadata,
             authoritative_project_run_context,
         )
         from opensquilla.gateway.session_services import get_session_storage
@@ -423,11 +424,7 @@ async def run_agent_once(
                 run_context,
                 accepted_run_mode_override,
             )
-            from opensquilla.gateway.rpc_sessions import (
-                _apply_run_context_route_metadata,
-            )
-
-            _apply_run_context_route_metadata(
+            apply_run_context_route_metadata(
                 route_envelope,
                 run_context,
                 principal_is_owner=True,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from opensquilla.application.artifact_workbench import ArtifactCatalogQuery, ArtifactIdentity
 from opensquilla.artifacts import (
     ArtifactNotFoundError,
     ArtifactStore,
@@ -12,6 +13,13 @@ from opensquilla.artifacts import (
     artifact_payload,
     validate_artifact_cursor,
 )
+from opensquilla.gateway.adapters.artifact_workbench import (
+    GatewayArtifactWorkbenchAdapter,
+)
+from opensquilla.gateway.adapters.artifact_workbench_contract import (
+    register_artifact_workbench_contract,
+)
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.protocol import ERROR_NOT_FOUND
 from opensquilla.gateway.rpc import (
     RpcContext,
@@ -19,76 +27,14 @@ from opensquilla.gateway.rpc import (
     RpcUnavailableError,
     get_dispatcher,
 )
-from opensquilla.gateway.session_services import get_session_storage
+from opensquilla.gateway.session_services import (
+    SessionServiceUnavailableError,
+    session_id_for_key,
+)
 from opensquilla.paths import media_root_from_config
 from opensquilla.session.keys import canonicalize_session_key
 
 _d = get_dispatcher()
-
-_DEFAULT_LIMIT = 100
-_MAX_LIMIT = 200
-
-
-def _require_string(params: dict[str, Any] | None, name: str) -> str:
-    if not isinstance(params, dict) or name not in params:
-        raise ValueError(f"params.{name} is required")
-    value = params[name]
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"params.{name} must be a non-empty string")
-    return value.strip()
-
-
-def _require_session_key(params: dict[str, Any] | None) -> str:
-    return canonicalize_session_key(_require_string(params, "sessionKey"))
-
-
-def _bounded_limit(value: Any) -> int:
-    if isinstance(value, bool):
-        return _DEFAULT_LIMIT
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        parsed = _DEFAULT_LIMIT
-    if parsed < 1:
-        return _DEFAULT_LIMIT
-    return min(parsed, _MAX_LIMIT)
-
-
-def _optional_before(params: dict[str, Any] | None) -> str | None:
-    if not isinstance(params, dict) or params.get("before") is None:
-        return None
-    value = params["before"]
-    if not isinstance(value, str):
-        raise ValueError("params.before must be a string")
-    stripped = value.strip()
-    if not stripped:
-        raise ValueError("params.before must be a non-empty artifact cursor")
-    return validate_artifact_cursor(stripped)
-
-
-async def _session_id_for_key(ctx: RpcContext, session_key: str) -> str | None:
-    manager = ctx.session_manager
-    if manager is None:
-        raise RpcUnavailableError("session manager is not wired")
-
-    get_session = getattr(manager, "get_session", None)
-    try:
-        if callable(get_session):
-            session = await get_session(session_key)
-        else:
-            storage = get_session_storage(manager)
-            if storage is None:
-                raise RpcUnavailableError("session storage is not wired")
-            session = await storage.get_session(session_key)
-    except KeyError:
-        session = None
-    if session is None:
-        return None
-    session_id = getattr(session, "session_id", None)
-    if not isinstance(session_id, str) or not session_id:
-        return None
-    return session_id
-
 
 def _empty_artifact_page(limit: int) -> dict[str, Any]:
     return {
@@ -101,72 +47,86 @@ def _empty_artifact_page(limit: int) -> dict[str, Any]:
     }
 
 
-@_d.method("artifacts.list", scope="operator.read")
-async def _handle_artifacts_list(
-    params: dict[str, Any] | None,
-    ctx: RpcContext,
-) -> dict[str, Any]:
-    """List one session's artifact metadata with backwards pagination."""
+class _ArtifactCatalogRuntimePort:
+    """Resolve session scope and storage behind typed catalog commands."""
 
-    session_key = _require_session_key(params)
-    limit = _bounded_limit(params.get("limit") if isinstance(params, dict) else None)
-    before = _optional_before(params)
-    session_id = await _session_id_for_key(ctx, session_key)
-    if session_id is None:
-        return _empty_artifact_page(limit)
-    store = ArtifactStore(media_root_from_config(ctx.config))
-    try:
-        page = await asyncio.to_thread(
-            store.list_refs,
-            session_id=session_id,
-            limit=limit,
-            before=before,
-        )
-    except OSError as exc:
-        raise RpcUnavailableError(
-            "Artifact storage is temporarily unavailable."
-        ) from exc
-    return {
-        "artifacts": [artifact_payload(ref) for ref in page.refs],
-        "has_more": page.has_more,
-        "oldest_cursor": artifact_cursor(page.refs[0]) if page.refs else None,
-        "newest_cursor": artifact_cursor(page.refs[-1]) if page.refs else None,
-        "total_count": page.total_count,
-        "page_size": limit,
-    }
+    def __init__(self, ctx: RpcContext) -> None:
+        self._ctx = ctx
+
+    async def list_artifacts(self, query: ArtifactCatalogQuery) -> dict[str, Any]:
+        session_key = canonicalize_session_key(query.session_key)
+        before = validate_artifact_cursor(query.before) if query.before is not None else None
+        try:
+            session_id = await session_id_for_key(self._ctx.session_manager, session_key)
+        except SessionServiceUnavailableError as exc:
+            raise RpcUnavailableError(str(exc)) from exc
+        if session_id is None:
+            return _empty_artifact_page(query.limit)
+        store = ArtifactStore(media_root_from_config(self._ctx.config))
+        try:
+            page = await asyncio.to_thread(
+                store.list_refs,
+                session_id=session_id,
+                limit=query.limit,
+                before=before,
+            )
+        except OSError as exc:
+            raise RpcUnavailableError("Artifact storage is temporarily unavailable.") from exc
+        return {
+            "artifacts": [artifact_payload(ref) for ref in page.refs],
+            "has_more": page.has_more,
+            "oldest_cursor": artifact_cursor(page.refs[0]) if page.refs else None,
+            "newest_cursor": artifact_cursor(page.refs[-1]) if page.refs else None,
+            "total_count": page.total_count,
+            "page_size": query.limit,
+        }
+
+    async def get_artifact(self, identity: ArtifactIdentity) -> dict[str, Any]:
+        session_key = canonicalize_session_key(identity.session_key)
+        artifact_id = validate_artifact_cursor(identity.artifact_id)
+        try:
+            session_id = await session_id_for_key(self._ctx.session_manager, session_key)
+        except SessionServiceUnavailableError as exc:
+            raise RpcUnavailableError(str(exc)) from exc
+        if session_id is None:
+            raise RpcHandlerError(
+                ERROR_NOT_FOUND,
+                "Artifact not found",
+                details={"sessionKey": session_key, "artifactId": artifact_id},
+            )
+        store = ArtifactStore(media_root_from_config(self._ctx.config))
+        try:
+            ref = await asyncio.to_thread(
+                store.get_ref,
+                session_id=session_id,
+                artifact_id=artifact_id,
+            )
+        except ArtifactNotFoundError:
+            raise RpcHandlerError(
+                ERROR_NOT_FOUND,
+                "Artifact not found",
+                details={"sessionKey": session_key, "artifactId": artifact_id},
+            ) from None
+        except OSError as exc:
+            raise RpcUnavailableError("Artifact storage is temporarily unavailable.") from exc
+        return {"artifact": artifact_payload(ref)}
 
 
-@_d.method("artifacts.get", scope="operator.read")
-async def _handle_artifacts_get(
-    params: dict[str, Any] | None,
-    ctx: RpcContext,
-) -> dict[str, Any]:
-    """Get one session-scoped artifact metadata record."""
+_handle_artifacts_list = GatewayArtifactWorkbenchAdapter.bind(
+    "artifacts.list", _ArtifactCatalogRuntimePort
+)
+_handle_artifacts_get = GatewayArtifactWorkbenchAdapter.bind(
+    "artifacts.get", _ArtifactCatalogRuntimePort
+)
 
-    session_key = _require_session_key(params)
-    artifact_id = validate_artifact_cursor(_require_string(params, "artifactId"))
-    session_id = await _session_id_for_key(ctx, session_key)
-    if session_id is None:
-        raise RpcHandlerError(
-            ERROR_NOT_FOUND,
-            "Artifact not found",
-            details={"sessionKey": session_key, "artifactId": artifact_id},
-        )
-    store = ArtifactStore(media_root_from_config(ctx.config))
-    try:
-        ref = await asyncio.to_thread(
-            store.get_ref,
-            session_id=session_id,
-            artifact_id=artifact_id,
-        )
-    except ArtifactNotFoundError:
-        raise RpcHandlerError(
-            ERROR_NOT_FOUND,
-            "Artifact not found",
-            details={"sessionKey": session_key, "artifactId": artifact_id},
-        ) from None
-    except OSError as exc:
-        raise RpcUnavailableError(
-            "Artifact storage is temporarily unavailable."
-        ) from exc
-    return {"artifact": artifact_payload(ref)}
+for _artifact_method, _artifact_implementation in (
+    ("artifacts.list", _handle_artifacts_list),
+    ("artifacts.get", _handle_artifacts_get),
+):
+    register_artifact_workbench_contract(
+        _d,
+        _artifact_method,
+        _artifact_implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )

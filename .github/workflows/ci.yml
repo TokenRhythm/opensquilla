@@ -509,16 +509,75 @@ jobs:
             --dist src/opensquilla/gateway/static/dist \
             --wheel "${wheels[0]}"
 
+  gateway-contract-verification-linux:
+    name: Complete Gateway Contract verification (Linux)
+    needs: [plan-ci]
+    if: ${{ always() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+          cache: npm
+          cache-dependency-path: opensquilla-webui/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: opensquilla-webui
+        run: npm ci
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install pinned Contract generators
+        run: uv sync --only-group dev --frozen
+
+      - name: Verify every Contract role in a separate output tree
+        shell: bash
+        env:
+          NODE_PATH: ${{ github.workspace }}/opensquilla-webui/node_modules
+        run: |
+          npm --prefix opensquilla-webui run test:contract-tooling
+          verification_root="$(mktemp -d "${RUNNER_TEMP}/gateway-verification.XXXXXX")"
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --write --profile verification --output-root "${verification_root}"
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --verify-determinism --profile verification --output-root "${verification_root}"
+          node scripts/contracts/verify_gateway_validator_profiles.mjs --verification-root "${verification_root}"
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --hash-manifest "${RUNNER_TEMP}/gateway-contract-verification-hashes.json" --profile verification --output-root "${verification_root}"
+
+      - name: Upload Linux verification hash manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-contract-verification-hashes-linux
+          path: ${{ runner.temp }}/gateway-contract-verification-hashes.json
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
   gateway-contract-windows:
     name: Gateway Contract determinism (Windows)
-    needs: [plan-ci, frontend-check]
+    needs: [plan-ci, frontend-check, gateway-contract-verification-linux]
     if: >-
       ${{ always()
           && needs.plan-ci.result == 'success'
           && needs.frontend-check.result == 'success'
+          && needs.gateway-contract-verification-linux.result == 'success'
           && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
     runs-on: windows-latest
-    timeout-minutes: 15
+    # Real-toolchain generation scales with the complete Contract inventory.
+    # Keep the full Windows check, determinism replay, tests, and cross-OS hash
+    # comparison within one bounded job instead of weakening the gate.
+    timeout-minutes: 60
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -553,8 +612,29 @@ jobs:
           PYTHONPATH: "${{ github.workspace }};${{ github.workspace }}/src"
         run: |
           uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --verify-determinism
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           uv run --no-sync pytest -q --confcutdir=tests/contracts tests/contracts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify every Windows Contract role in a separate output tree
+        shell: pwsh
+        env:
+          NODE_PATH: ${{ github.workspace }}/opensquilla-webui/node_modules
+        run: |
+          npm --prefix opensquilla-webui run test:contract-tooling
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $verificationRoot = Join-Path $env:RUNNER_TEMP ("gateway-verification-" + [guid]::NewGuid())
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --write --profile verification --output-root $verificationRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --verify-determinism --profile verification --output-root $verificationRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/contracts/verify_gateway_validator_profiles.mjs --verification-root $verificationRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $verificationManifest = Join-Path $env:RUNNER_TEMP "gateway-contract-verification-hashes-windows.json"
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --hash-manifest $verificationManifest --profile verification --output-root $verificationRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Download Linux Gateway Contract hash manifest
         uses: actions/download-artifact@v4
@@ -568,7 +648,23 @@ jobs:
           $windowsManifest = Join-Path $env:RUNNER_TEMP "gateway-contract-hashes-windows.json"
           $linuxManifest = Join-Path $env:RUNNER_TEMP "gateway-contract-hashes-linux/gateway-contract-hashes.json"
           uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --hash-manifest $windowsManifest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --compare-hash-manifests $linuxManifest $windowsManifest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Download Linux verification hash manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: gateway-contract-verification-hashes-linux
+          path: ${{ runner.temp }}/gateway-contract-verification-hashes-linux
+
+      - name: Compare Linux and Windows verification hashes
+        shell: pwsh
+        run: |
+          $windowsManifest = Join-Path $env:RUNNER_TEMP "gateway-contract-verification-hashes-windows.json"
+          $linuxManifest = Join-Path $env:RUNNER_TEMP "gateway-contract-verification-hashes-linux/gateway-contract-verification-hashes.json"
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --compare-hash-manifests $linuxManifest $windowsManifest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   webui-chat-recovery:
     name: WebUI chat recovery
@@ -1857,7 +1953,10 @@ jobs:
       - name: Run release packaging contract tests
         shell: bash
         run: |
+          command -v node
+          command -v pwsh
           uv run pytest \
+            tests/test_ci/test_upgrade_baselines.py \
             tests/test_scripts/test_build_wheelhouse_zip.py \
             tests/test_install_scripts.py \
             tests/test_root_start_scripts.py \
@@ -1982,6 +2081,7 @@ jobs:
       - readme-locale-check
       - frontend-artifact
       - frontend-check
+      - gateway-contract-verification-linux
       - gateway-contract-windows
       - webui-chat-recovery
       - tui-check
@@ -2067,6 +2167,7 @@ jobs:
           RESULT_README_LOCALE: ${{ needs.readme-locale-check.result }}
           RESULT_FRONTEND_ARTIFACT: ${{ needs.frontend-artifact.result }}
           RESULT_FRONTEND: ${{ needs.frontend-check.result }}
+          RESULT_CONTRACT_VERIFICATION_LINUX: ${{ needs.gateway-contract-verification-linux.result }}
           RESULT_CONTRACT_WINDOWS: ${{ needs.gateway-contract-windows.result }}
           RESULT_TUI: ${{ needs.tui-check.result }}
           RESULT_DESKTOP: ${{ needs.desktop-check.result }}

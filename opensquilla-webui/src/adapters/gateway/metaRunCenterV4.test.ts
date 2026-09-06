@@ -26,7 +26,10 @@ function source(response: unknown = {}) {
 
 describe('createV4MetaRunCenter', () => {
   it('keeps launch and setup wire names behind the Meta domain seam', async () => {
-    const fixture = source({ ok: true, sessionKey: 'agent:main:test', clientRequestId: 'req-1' })
+    const fixture = source({ ok: true, sessionKey: 'agent:main:test', clientRequestId: 'req-1', job: {
+      job_id: 'job-1', name: 'meta-paper-write', sessionKey: 'agent:main:test',
+      action_ids: [], status: 'queued', phase: 'queued',
+    } })
     const center = createV4MetaRunCenter(fixture.transport, fixture.events)
     await expect(center.launch({
       name: 'meta-paper-write',

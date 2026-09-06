@@ -1095,6 +1095,7 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert jobs["gateway-contract-windows"]["needs"] == [
         "plan-ci",
         "frontend-check",
+        "gateway-contract-verification-linux",
     ]
     assert "'frontend-validation'" in jobs["gateway-contract-windows"]["if"]
     assert "'tui'" in jobs["tui-check"]["if"]
@@ -1157,6 +1158,7 @@ def test_gateway_contract_hashes_are_compared_between_linux_and_windows() -> Non
     )
 
     assert windows["runs-on"] == "windows-latest"
+    assert windows["timeout-minutes"] == 60
     assert "tests/contracts" in linux_integration["run"]
     assert linux_integration["env"]["PYTHONPATH"] == (
         "${{ github.workspace }}:${{ github.workspace }}/src"
@@ -1193,6 +1195,7 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
         "readme-locale-check",
         "frontend-artifact",
         "frontend-check",
+        "gateway-contract-verification-linux",
         "gateway-contract-windows",
         "webui-chat-recovery",
         "tui-check",
@@ -1235,6 +1238,7 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
         "RESULT_FRONTEND_ARTIFACT",
         "RESULT_FRONTEND",
         "RESULT_CONTRACT_WINDOWS",
+        "RESULT_CONTRACT_VERIFICATION_LINUX",
         "RESULT_TUI",
         "RESULT_DESKTOP",
         "RESULT_UBUNTU",
@@ -2197,6 +2201,60 @@ def test_container_release_smoke_serves_control_ui_entry_assets() -> None:
     assert 'docker exec "${container_id}" curl --fail --silent --show-error' in script
     build = next(step for step in steps if step.get("name") == "Build multi-arch image")
     assert build["with"]["build-args"] == "OPENSQUILLA_FORBID_PERSONAL_BGM=1\n"
+
+
+@pytest.mark.parametrize("event,tag", [("push", "v0.5.5"), ("workflow_dispatch", "edge")])
+def test_container_repository_is_lowercase_through_verification_and_promotion(
+    tmp_path: Path, event: str, tag: str
+) -> None:
+    steps = _workflow("docker-image.yml")["jobs"]["build-and-publish"]["steps"]
+    by_id = {step["id"]: step for step in steps if "id" in step}
+    output = tmp_path / "output.txt"
+    env = {
+        **os.environ,
+        "GITHUB_REPOSITORY": "TokenRhythm/opensquilla",
+        "GITHUB_EVENT_NAME": event,
+        "GITHUB_REF_NAME": "v0.5.5",
+        "GITHUB_OUTPUT": str(output),
+    }
+    subprocess.run(
+        [_bash_executable(), "-e", "-c", by_id["image_repo"]["run"]], env=env, check=True
+    )
+    repository = output.read_text(encoding="utf-8").strip().removeprefix("repository=")
+    assert repository == "ghcr.io/tokenrhythm/opensquilla"
+    expression = "${{ steps.image_repo.outputs.repository }}"
+    assert by_id["meta"]["with"]["images"] == expression
+    assert by_id["pushed_image"]["env"]["IMAGE_REPOSITORY"] == expression
+    output.write_text("", encoding="utf-8")
+    subprocess.run(
+        [_bash_executable(), "-e", "-c", by_id["pushed_image"]["run"]],
+        env={**env, "IMAGE_REPOSITORY": repository},
+        check=True,
+    )
+    assert output.read_text(encoding="utf-8").strip() == f"ref={repository}:{tag}"
+    for name in (
+        "Verify pushed manifest platforms",
+        "Smoke pushed image HEALTHCHECK",
+        "Promote verified release image to latest",
+    ):
+        step = next(step for step in steps if step.get("name") == name)
+        assert step["env"]["IMAGE_REF"] == "${{ steps.pushed_image.outputs.ref }}"
+    assert step["env"]["LATEST_REF"] == f"{expression}:latest"
+
+
+def test_organization_guards_keep_the_maintainer_restriction() -> None:
+    jobs = _workflow("desktop-fault-injection.yml")["jobs"]
+    guards = [job["if"] for job in jobs.values() if "github.repository" in job.get("if", "")]
+    assert len(guards) == 3
+    for guard in guards:
+        assert "github.repository == 'TokenRhythm/opensquilla'" in guard
+        assert "github.actor == 'Open-Squilla'" in guard
+        assert "'opensquilla/opensquilla'" not in guard
+    canary = _workflow("live-skill-hub-canary.yml")["jobs"]
+    assert any(
+        job.get("if") == "github.repository == 'TokenRhythm/opensquilla'"
+        for job in canary.values()
+    )
 
 
 def test_wheelhouse_release_hydrates_current_router_bundle() -> None:

@@ -111,8 +111,7 @@ export function useCronJobs(scheduler: CronScheduler) {
 
   async function recoverAfterConnectionRecycle(): Promise<void> {
     try {
-      await scheduler.ready({ timeoutMs: 10_000 })
-      await refresh()
+      cronData.value = await scheduler.listJobs()
       pushToast(t('cronSkills.jobs.toastConnectionRecovered'), { tone: 'info' })
     } catch {
       pushToast(t('cronSkills.jobs.toastConnectionRetry'), { tone: 'warn' })

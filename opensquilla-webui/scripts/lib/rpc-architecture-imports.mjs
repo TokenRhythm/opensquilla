@@ -10,6 +10,10 @@ function isTestFile(importer) {
   return /\.(test|spec)\.(?:[cm]?[jt]sx?)$/.test(importer)
 }
 
+function isTestingSupport(importer) {
+  return importer.startsWith('src/testing/')
+}
+
 function isGatewayAdapter(importer) {
   return importer.startsWith('src/adapters/gateway/')
 }
@@ -75,16 +79,15 @@ export function privateGatewayTransportImportViolation({ root, importer, specifi
   return `${normalizedImporter}: private Gateway transports may be imported only by a Gateway Adapter or test.`
 }
 
-/** Gateway Adapters consume the private transport Interface, never Pinia directly. */
+/** Keep the Pinia RPC store seed private to the composition root. */
 export function gatewayAdapterRpcStoreImportViolation({ root, importer, specifier }) {
   const normalizedImporter = normalized(importer)
-  if (!isGatewayAdapter(normalizedImporter) || isTestFile(normalizedImporter)) return null
   const target = resolveSourceImport(root, normalizedImporter, specifier)
   const rpcStoreModule = resolve(root, 'src/stores/rpc')
   const normalizedTarget = target?.replace(/\.(?:vue|[cm]?[jt]sx?)$/, '')
   if (!normalizedTarget || normalizedTarget !== rpcStoreModule) return null
-  if (normalizedImporter === 'src/adapters/gateway/privateTransports.ts') return null
-  return `${normalizedImporter}: Gateway Adapters must consume the private transport Interface instead of useRpcStore.`
+  if (isCompositionRoot(normalizedImporter) || isTestFile(normalizedImporter)) return null
+  return `${normalizedImporter}: useRpcStore may be imported only by the composition root or tests.`
 }
 
 export function boundaryModuleKind({ root, importer, specifier }) {
@@ -129,6 +132,7 @@ export function collectBoundaryArchitectureViolations({
   const failures = []
   const originBySymbol = new Map()
   const sourceByRel = new Map(analysis.sources.map(entry => [entry.rel, entry.source]))
+  const requesterSymbol = analysis.exportedSymbol('src/adapters/gateway/privateTransports.ts', 'RpcRequester')
 
   function markExportOrigins(rel, kind, only = null) {
     const source = sourceByRel.get(rel)
@@ -175,6 +179,10 @@ export function collectBoundaryArchitectureViolations({
       if (origin) return origin
     }
     for (const declaration of symbol.declarations ?? []) {
+      if (ts.isParameter(declaration) && declaration.type) {
+        const [kind] = typeBoundaryKinds(declaration.type, nextSeen)
+        if (kind) return kind
+      }
       if (ts.isVariableDeclaration(declaration) && declaration.initializer) {
         const [kind] = valueBoundaryKinds(declaration.initializer, nextSeen)
         if (kind) return kind
@@ -263,6 +271,11 @@ export function collectBoundaryArchitectureViolations({
     const stateRel = analysis.relForSource(current.getSourceFile())
     const required = stateRel ? requireBoundaryKind(current, stateRel) : null
     if (required) kinds.add(required)
+    if (ts.isPropertyAccessExpression(current) || ts.isElementAccessExpression(current)) {
+      if (valueBoundaryKinds(current.expression, seen).has('private Gateway transport')) {
+        kinds.add('private Gateway transport')
+      }
+    }
     if (ts.isIdentifier(current) || ts.isPropertyAccessExpression(current)) {
       const node = ts.isPropertyAccessExpression(current) ? current.name : current
       const kind = symbolOrigin(rawSymbol(node), seen)
@@ -335,10 +348,16 @@ export function collectBoundaryArchitectureViolations({
       return kinds
     }
     if (ts.isCallExpression(current)) {
+      if (ts.isPropertyAccessExpression(current.expression) && current.expression.name.text === 'bind') {
+        for (const kind of valueBoundaryKinds(current.expression.expression, seen)) kinds.add(kind)
+      }
       const signature = checker.getResolvedSignature(current)
       const declaration = signature?.declaration
       if (declaration?.type) {
         for (const kind of typeBoundaryKinds(declaration.type, seen)) kinds.add(kind)
+      }
+      if (declaration?.body) {
+        for (const kind of functionReturnKinds(declaration, seen)) kinds.add(kind)
       }
       return kinds
     }
@@ -347,8 +366,16 @@ export function collectBoundaryArchitectureViolations({
 
   function functionExposureKinds(node, seen = new Set()) {
     const kinds = new Set()
+    // A typed Adapter factory consumes its one private request dependency.
+    // Return annotations and returned values remain subject to the export fence.
+    const parameterType = node.parameters?.length === 1 ? node.parameters[0].type : null
+    const injectsRequester = requesterSymbol && ts.isFunctionDeclaration(node)
+      && isGatewayAdapter(analysis.relForSource(node.getSourceFile()) ?? '')
+      && parameterType && ts.isTypeReferenceNode(parameterType)
+      && analysis.canonicalSymbol(rawSymbol(parameterType.typeName)) === requesterSymbol
+      && node.type && ts.isTypeReferenceNode(node.type) && !node.typeParameters?.length
     for (const parameter of node.parameters ?? []) {
-      if (parameter.type) {
+      if (parameter.type && !injectsRequester) {
         for (const kind of typeBoundaryKinds(parameter.type, seen)) kinds.add(kind)
       }
     }
@@ -360,14 +387,22 @@ export function collectBoundaryArchitectureViolations({
         for (const kind of typeBoundaryKinds(parameter.constraint, seen)) kinds.add(kind)
       }
     }
+    for (const kind of functionReturnKinds(node, seen)) kinds.add(kind)
+    return kinds
+  }
+
+  function functionReturnKinds(node, seen) {
+    const kinds = new Set()
+    if (seen.has(node)) return kinds
+    const nextSeen = new Set(seen).add(node)
     if (node.body && !ts.isBlock(node.body)) {
-      for (const kind of valueBoundaryKinds(node.body, seen)) kinds.add(kind)
+      for (const kind of valueBoundaryKinds(node.body, nextSeen)) kinds.add(kind)
       return kinds
     }
     function visit(current) {
       if (ts.isFunctionLike(current) && current !== node) return
       if (ts.isReturnStatement(current) && current.expression) {
-        for (const kind of valueBoundaryKinds(current.expression, seen)) kinds.add(kind)
+        for (const kind of valueBoundaryKinds(current.expression, nextSeen)) kinds.add(kind)
         return
       }
       ts.forEachChild(current, visit)
@@ -459,8 +494,7 @@ export function collectBoundaryArchitectureViolations({
       rel === 'src/adapters/gateway/privateTransports.ts'
       || rel === 'src/adapters/gateway/privateHttpTransport.ts'
     )
-    const adapter = isGatewayAdapter(rel) && !isTestFile(rel)
-    if (adapter && rel !== 'src/adapters/gateway/privateTransports.ts') {
+    if (!isCompositionRoot(rel) && !isTestFile(rel) && !isTestingSupport(rel)) {
       function namespaceExportsStoreFactory(name) {
         const raw = rawSymbol(name)
         const moduleSymbol = analysis.canonicalSymbol(raw) ?? raw
@@ -487,7 +521,7 @@ export function collectBoundaryArchitectureViolations({
           )
           if (importsStoreFactory) {
             failures.push(
-              `${rel}: Gateway Adapters must consume the private transport Interface instead of useRpcStore.`,
+              `${rel}: useRpcStore may be imported only by the composition root or tests.`,
             )
           }
         }
@@ -496,13 +530,13 @@ export function collectBoundaryArchitectureViolations({
           && symbolOrigin(rawSymbol(node.name)) === 'RPC store factory'
         ) {
           failures.push(
-            `${rel}: Gateway Adapters must consume the private transport Interface instead of useRpcStore.`,
+            `${rel}: useRpcStore may be imported only by the composition root or tests.`,
           )
         }
         const required = requireBoundaryKind(node, rel)
         if (required === 'RPC store factory') {
           failures.push(
-            `${rel}: Gateway Adapters must consume the private transport Interface instead of useRpcStore.`,
+            `${rel}: useRpcStore may be imported only by the composition root or tests.`,
           )
         }
         ts.forEachChild(node, checkStoreImports)
@@ -514,9 +548,8 @@ export function collectBoundaryArchitectureViolations({
       const isExported = Boolean(ts.getModifiers(statement)?.some(modifier => (
         modifier.kind === ts.SyntaxKind.ExportKeyword
       )))
-      if (isExported && !privateBoundaryModule) {
+      if (isExported && !privateBoundaryModule && !isTestingSupport(rel)) {
         for (const kind of exportedStatementKinds(statement)) {
-          if (kind === 'RPC store factory') continue
           if (kind === 'generated Contract' && generated) continue
           if (
             kind === 'private Gateway transport'
@@ -525,9 +558,12 @@ export function collectBoundaryArchitectureViolations({
           failures.push(`${rel}: exported declaration exposes ${kind} symbols.`)
         }
       }
-      if (ts.isExportAssignment(statement) && !privateBoundaryModule) {
+      if (
+        ts.isExportAssignment(statement)
+        && !privateBoundaryModule
+        && !isTestingSupport(rel)
+      ) {
         for (const kind of valueBoundaryKinds(statement.expression)) {
-          if (kind === 'RPC store factory') continue
           if (kind === 'generated Contract' && generated) continue
           failures.push(`${rel}: default export exposes ${kind} symbols.`)
         }
@@ -538,17 +574,17 @@ export function collectBoundaryArchitectureViolations({
         && statement.exportClause
         && ts.isNamedExports(statement.exportClause)
         && !privateBoundaryModule
+        && !isTestingSupport(rel)
       ) {
         for (const element of statement.exportClause.elements) {
           const kind = symbolOrigin(rawSymbol(element.propertyName ?? element.name))
-          if (!kind || kind === 'RPC store factory') continue
+          if (!kind) continue
           if (kind === 'generated Contract' && generated) continue
           failures.push(`${rel}: local export exposes ${kind} symbols.`)
         }
       }
       if (!privateBoundaryModule) {
         for (const kind of transitiveReexportBoundaryKinds(rel, statement)) {
-          if (kind === 'RPC store factory') continue
           if (kind === 'generated Contract' && generated) continue
           failures.push(`${rel}: ${kind} modules must not be re-exported through a barrel.`)
         }
@@ -564,7 +600,6 @@ export function collectBoundaryArchitectureViolations({
         )
       ) {
         for (const kind of valueBoundaryKinds(node.right)) {
-          if (kind === 'RPC store factory') continue
           if (kind === 'generated Contract' && generated) continue
           failures.push(`${rel}: CommonJS export exposes ${kind} symbols.`)
         }
@@ -579,7 +614,6 @@ export function collectBoundaryArchitectureViolations({
       ) {
         for (const argument of node.arguments.slice(1)) {
           for (const kind of valueBoundaryKinds(argument)) {
-            if (kind === 'RPC store factory') continue
             if (kind === 'generated Contract' && generated) continue
             failures.push(`${rel}: CommonJS export exposes ${kind} symbols.`)
           }
@@ -599,7 +633,6 @@ export function collectBoundaryArchitectureViolations({
           : node.arguments[1]
         if (descriptor) {
           for (const kind of valueBoundaryKinds(descriptor)) {
-            if (kind === 'RPC store factory') continue
             if (kind === 'generated Contract' && generated) continue
             failures.push(`${rel}: CommonJS export exposes ${kind} symbols.`)
           }

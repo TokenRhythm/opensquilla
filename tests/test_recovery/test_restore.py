@@ -28,25 +28,13 @@ from opensquilla.recovery.transaction import (
     finalize_committed_profile_transaction,
     recover_profile_transaction,
 )
+from tests.helpers.profile_lock_probe import contend_for_gateway
 
 runner = CliRunner()
 
 
 def _normalized_path(path: Path) -> str:
     return os.path.normcase(os.path.normpath(str(path.resolve())))
-
-
-def _contend_for_restored_gateway(state_dir: str, queue: multiprocessing.Queue) -> None:
-    from opensquilla.gateway.pidlock import GatewayPidLock
-
-    lock = GatewayPidLock(state_dir)
-    try:
-        lock.acquire()
-    except SystemExit:
-        queue.put("busy")
-    else:
-        queue.put("acquired")
-        lock.release()
 
 
 def _profile(home: Path, value: str, *, with_legacy_lock: bool = False) -> None:
@@ -354,6 +342,7 @@ def test_restore_missing_backup_lock_authority_fails_without_mutating_backup(
     assert not (tmp_path / ".opensquilla.profile-replace.json").exists()
 
 
+@pytest.mark.ci_serial
 def test_restore_holds_candidate_legacy_lock_before_publication(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -373,18 +362,16 @@ def test_restore_holds_candidate_legacy_lock_before_publication(
 
     original_validate = restore_module._validate_restored_target
     observations: list[str] = []
+    context = multiprocessing.get_context("spawn" if sys.platform == "win32" else "fork")
+    connection, worker_connection = context.Pipe()
+    process = context.Process(target=contend_for_gateway, args=(worker_connection,))
 
     def validate_while_old_gateway_contends(candidate: Path):
-        context = multiprocessing.get_context("spawn" if sys.platform == "win32" else "fork")
-        queue = context.Queue()
-        process = context.Process(
-            target=_contend_for_restored_gateway,
-            args=(str(candidate / "state"), queue),
-        )
-        process.start()
-        process.join(timeout=10)
+        connection.send(str(candidate / "state"))
+        assert connection.poll(10), "gateway lock probe did not finish while candidate was held"
+        observations.append(connection.recv())
+        process.join(timeout=5)
         assert process.exitcode == 0
-        observations.append(queue.get(timeout=1))
         return original_validate(candidate)
 
     monkeypatch.setattr(
@@ -393,7 +380,23 @@ def test_restore_holds_candidate_legacy_lock_before_publication(
         validate_while_old_gateway_contends,
     )
 
-    report = restore_profile(backup)
+    process.start()
+    worker_connection.close()
+    try:
+        # Windows spawn/import readiness is separate from the lock assertion.
+        assert connection.poll(30), "gateway lock probe did not start"
+        assert connection.recv() == "ready"
+        report = restore_profile(backup)
+    finally:
+        connection.close()
+        if process.is_alive():
+            process.terminate()
+        process.join(timeout=5)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=5)
+        assert not process.is_alive(), "gateway lock probe leaked after restore"
+        process.close()
 
     assert report.outcome == "ready"
     assert observations == ["busy"]

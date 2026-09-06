@@ -9,7 +9,8 @@ import {
 import { approvalChoiceForDecision } from '@/modules/approvalCenter'
 import type { ChatApprovalEntry } from './useChatApprovals'
 import type { InterruptViewState } from '@/types/parts'
-import { sessionConversationFromTestRpc } from '@/testing/sessionConversation.test-helper'
+import { createConversationEventsTestHarness } from '@/testing/conversationEvents.test-helper'
+import { clarificationSubmissionFromTestRpc } from '@/testing/conversationAncillary.test-helper'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -51,6 +52,8 @@ function approvalHarness(statusResponse: Record<string, unknown> = {
   resolutionInProgress: true,
 }) {
   const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map())
+  const rpcCall = vi.fn(async () => statusResponse)
+  const conversationEvents = createConversationEventsTestHarness()
   const approvals = useChatApprovals({
     approvalCenter: {
       setElevatedMode: vi.fn(async () => undefined),
@@ -71,12 +74,12 @@ function approvalHarness(statusResponse: Record<string, unknown> = {
       subscribeAvailability: vi.fn(() => ({ close: vi.fn() })),
       dispose: vi.fn(),
     },
-    sessionConversation: sessionConversationFromTestRpc({
-      call: vi.fn(async () => statusResponse) as <T = unknown>(
+    conversationEvents: conversationEvents.events,
+    clarificationSubmission: clarificationSubmissionFromTestRpc({
+      call: rpcCall as (
         method: string,
         params?: Record<string, unknown>,
-      ) => Promise<T>,
-      on: vi.fn(() => () => {}),
+      ) => Promise<unknown>,
     }),
     sessionKey: ref('agent:main:web'),
     runStatus: ref({ status: 'idle', label: '', task: null }),

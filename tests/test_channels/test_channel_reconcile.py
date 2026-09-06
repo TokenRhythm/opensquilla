@@ -234,9 +234,12 @@ async def test_concurrent_reconciles_never_orphan_tasks(manager: ChannelManager)
     import asyncio
 
     release = asyncio.Event()
+    started = asyncio.Event()
+    second_entered = asyncio.Event()
 
     class _SlowAdapter(_FakeAdapter):
         async def start(self) -> None:
+            started.set()
             await release.wait()
             self.started = True
 
@@ -249,25 +252,39 @@ async def test_concurrent_reconciles_never_orphan_tasks(manager: ChannelManager)
 
     original = mm.build_managed_channel
     mm.build_managed_channel = _build
+    tasks = []
+
+    async def reconcile_second():
+        second_entered.set()
+        return await manager.reconcile([_entry("x", token="v2")])
+
     try:
         task_a = asyncio.create_task(manager.reconcile([_entry("x", token="v1", slow=True)]))
-        await asyncio.sleep(0.05)  # A holds the lock inside _safe_start
-        task_b = asyncio.create_task(manager.reconcile([_entry("x", token="v2")]))
-        await asyncio.sleep(0.05)
+        tasks.append(task_a)
+        await asyncio.wait_for(started.wait(), timeout=5.0)
+        task_b = asyncio.create_task(reconcile_second())
+        tasks.append(task_b)
+        await asyncio.wait_for(second_entered.wait(), timeout=5.0)
+        assert not task_b.done(), "second reconcile bypassed the mutation lock"
         release.set()
-        result_a = await task_a
-        result_b = await task_b
+        result_a, result_b = await asyncio.wait_for(asyncio.gather(*tasks), timeout=5.0)
+        # Serialized: A applied v1, B rebuilt to v2 — and exactly one runtime.
+        assert result_a == {"x": "started"}
+        assert result_b == {"x": "rebuilt"}
+        assert manager.get("x").token == "v2"
+        dispatch_tasks = [t for t in manager._tasks.values() if not t.done()]
+        assert len(dispatch_tasks) == 1
+        assert len(manager._lease_tasks) == 1
     finally:
-        mm.build_managed_channel = original
-
-    # Serialized: A applied v1, B rebuilt to v2 — and exactly one runtime.
-    assert result_a == {"x": "started"}
-    assert result_b == {"x": "rebuilt"}
-    assert manager.get("x").token == "v2"
-    dispatch_tasks = [t for t in manager._tasks.values() if not t.done()]
-    assert len(dispatch_tasks) == 1
-    assert len(manager._lease_tasks) == 1
-    await _teardown(manager)
+        release.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5.0)
+        finally:
+            mm.build_managed_channel = original
+            await asyncio.wait_for(_teardown(manager), timeout=5.0)
 
 
 async def test_live_start_never_steals_a_pending_webhook_lease(

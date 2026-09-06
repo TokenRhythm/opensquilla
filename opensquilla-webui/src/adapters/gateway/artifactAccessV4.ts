@@ -4,15 +4,45 @@ import type {
   ArtifactContentAccess,
 } from '@/modules/artifactWorkbench'
 import { artifactFileTitle } from '@/utils/chat/artifacts'
+import { isActiveDocumentArtifact } from '@/utils/chat/artifactAccess'
 
-export interface ArtifactAuthContext {
-  baseOrigin?: string
-  sessionKey?: string
-  authToken?: string
+export {
+  isActiveDocumentArtifact,
+  isActiveDocumentArtifactCandidate,
+} from '@/utils/chat/artifactAccess'
+import {
+  HttpTransportError,
+} from './privateHttpTransport'
+import {
+  artifactHttpAccessUrl,
+  artifactHttpGatewayOpenUrl,
+  artifactHttpThumbnailUrl,
+  bindArtifactBinaryRequest,
+  bindArtifactOpenRequest,
+  isSameArtifactHttpOrigin,
+  isTrustedArtifactHttpUrl,
+  runtimeArtifactHttpBaseOrigin,
+} from './privateArtifactHttpTransport'
+
+interface ArtifactBinaryResponse {
+  readonly metadata: { readonly status: number }
+  blob(): Promise<Blob>
 }
 
-export interface ArtifactFetchOptions extends ArtifactAuthContext {
-  fetchImpl?: typeof fetch
+interface ArtifactAccessHttpTransport {
+  clearPreviewOrigin(previewOrigin: string): Promise<void>
+  fetchExternalArtifact(endpoint: string, signal?: AbortSignal): Promise<ArtifactBinaryResponse>
+  requestBinary(endpoint: string, options?: {
+    method?: 'GET' | 'POST'
+    sessionKey?: string
+    signal?: AbortSignal
+    timeoutMs?: number
+  }): Promise<ArtifactBinaryResponse>
+}
+
+interface ArtifactFetchOptions {
+  baseOrigin?: string
+  sessionKey?: string
   signal?: AbortSignal
   /** Require authenticated same-origin HTTP(S) bytes and reject redirects. */
   requireSameOrigin?: boolean
@@ -23,57 +53,33 @@ type ArtifactWindowHandle = Pick<Window, 'close'> & {
   location: Pick<Location, 'href'>
 }
 
-export interface ArtifactOpenOptions extends ArtifactFetchOptions {
+interface ArtifactOpenOptions extends ArtifactFetchOptions {
   createObjectUrl?: (blob: Blob) => string
   revokeObjectUrl?: (url: string) => void
   openWindow?: (url: string, target: string, features: string) => ArtifactWindowHandle | null
   scheduleRevoke?: (url: string, revoke: () => void) => void
 }
 
-export type ArtifactFetchResult =
+type ArtifactFetchResult =
   | { ok: true; status: number; url: string; blob: Blob }
   | { ok: false; status: number; url: string; message: string }
 
-export type ArtifactOpenResult =
+type ArtifactOpenResult =
   | { ok: true; status: number; url: string; objectUrl: string }
   | { ok: false; status: number; url: string; message: string }
 
-export type ArtifactGatewayOpenResult =
+type ArtifactGatewayOpenResult =
   | { ok: true; status: number; url: string }
   | { ok: false; status: number; url: string; message: string }
 
-const DEFAULT_BASE_ORIGIN = 'http://localhost'
 const BLOB_REVOKE_DELAY_MS = 60000
-const DESKTOP_RENDERER_PROTOCOL = 'opensquilla-app:'
-const DESKTOP_RENDERER_HOST = 'desktop'
 
 export function runtimeArtifactBaseOrigin(): string {
-  if (
-    typeof window !== 'undefined'
-    && window.location?.protocol === DESKTOP_RENDERER_PROTOCOL
-    && window.location.hostname === DESKTOP_RENDERER_HOST
-  ) {
-    return `${DESKTOP_RENDERER_PROTOCOL}//${DESKTOP_RENDERER_HOST}`
-  }
-  if (
-    typeof window !== 'undefined'
-    && window.location?.origin
-    && window.location.origin !== 'null'
-  ) return window.location.origin
-  return DEFAULT_BASE_ORIGIN
-}
-
-export function runtimeArtifactAuthToken(): string {
-  try {
-    return globalThis.sessionStorage?.getItem('opensquilla.wsToken')?.trim() || ''
-  } catch {
-    return ''
-  }
+  return runtimeArtifactHttpBaseOrigin()
 }
 
 function runtimeOptions(request: ArtifactAccessRequest = {}): ArtifactFetchOptions {
   return {
-    authToken: runtimeArtifactAuthToken(),
     baseOrigin: runtimeArtifactBaseOrigin(),
     requireSameOrigin: request.requireSameOrigin,
     sessionKey: request.sessionKey,
@@ -81,37 +87,23 @@ function runtimeOptions(request: ArtifactAccessRequest = {}): ArtifactFetchOptio
   }
 }
 
-function urlsShareArtifactOrigin(candidate: URL, base: URL): boolean {
-  if (candidate.origin !== 'null' || base.origin !== 'null') {
-    return candidate.origin === base.origin
-  }
-  // Opaque URL origins all serialize as "null". Compare the one supported
-  // custom transport by authority so an unrelated custom scheme is never
-  // mistaken for the privileged Desktop API proxy.
-  return candidate.protocol === DESKTOP_RENDERER_PROTOCOL
-    && base.protocol === DESKTOP_RENDERER_PROTOCOL
-    && candidate.hostname === DESKTOP_RENDERER_HOST
-    && base.hostname === DESKTOP_RENDERER_HOST
-    && candidate.port === base.port
-    && !candidate.username
-    && !candidate.password
-    && !base.username
-    && !base.password
-}
-
 function resolveBaseOrigin(baseOrigin?: string): string {
   if (baseOrigin) return baseOrigin
   return runtimeArtifactBaseOrigin()
 }
 
-function resolveFetch(fetchImpl?: typeof fetch): typeof fetch | null {
-  if (fetchImpl) return fetchImpl
-  if (typeof fetch !== 'undefined') return fetch.bind(globalThis)
-  return null
+function isAbortError(error: unknown): boolean {
+  return error instanceof HttpTransportError
+    ? error.kind === 'aborted'
+    : !!error && typeof error === 'object' && 'name' in error && error.name === 'AbortError'
 }
 
-function isAbortError(error: unknown): boolean {
-  return !!error && typeof error === 'object' && 'name' in error && error.name === 'AbortError'
+function httpErrorStatus(error: unknown): number {
+  return error instanceof HttpTransportError
+    && error.kind === 'http-status'
+    && typeof error.status === 'number'
+    ? error.status
+    : 0
 }
 
 function safeTitle(artifact: ArtifactPayload): string {
@@ -133,132 +125,35 @@ function isolateOpenedWindow(opened: ArtifactWindowHandle): boolean {
   }
 }
 
-function normalizedMime(value: unknown): string {
-  return typeof value === 'string' ? value.split(';', 1)[0].trim().toLowerCase() : ''
-}
-
-function artifactNameForSafety(artifact: ArtifactPayload): string {
-  return typeof artifact.name === 'string' ? artifact.name.trim().toLowerCase() : ''
-}
-
-function hasActiveDocumentExtension(artifact: ArtifactPayload): boolean {
-  const name = artifactNameForSafety(artifact)
-  return name.endsWith('.html') || name.endsWith('.htm') || name.endsWith('.xhtml')
-}
-
-export function isActiveDocumentArtifactCandidate(artifact: ArtifactPayload): boolean {
-  const artifactMime = normalizedMime(artifact.mime)
-  return artifactMime === 'text/html' || artifactMime === 'application/xhtml+xml' ||
-    hasActiveDocumentExtension(artifact)
-}
-
-export function isActiveDocumentArtifact(artifact: ArtifactPayload, blob: Blob): boolean {
-  const responseMime = normalizedMime(blob.type)
-  return responseMime === 'text/html' || responseMime === 'application/xhtml+xml' ||
-    isActiveDocumentArtifactCandidate(artifact)
-}
-
 export function isSameOriginArtifactUrl(url: string, baseOrigin: string): boolean {
-  try {
-    return urlsShareArtifactOrigin(new URL(url, baseOrigin), new URL(baseOrigin))
-  } catch {
-    return false
-  }
+  return isSameArtifactHttpOrigin(url, baseOrigin)
 }
 
 export function isTrustedArtifactTransportUrl(url: string, baseOrigin: string): boolean {
-  try {
-    const resolved = new URL(url, baseOrigin)
-    const base = new URL(baseOrigin)
-    if (!urlsShareArtifactOrigin(resolved, base)) return false
-    return resolved.protocol === 'http:'
-      || resolved.protocol === 'https:'
-      || (
-        resolved.protocol === DESKTOP_RENDERER_PROTOCOL
-        && resolved.hostname === DESKTOP_RENDERER_HOST
-      )
-  } catch {
-    return false
-  }
+  return isTrustedArtifactHttpUrl(url, baseOrigin)
 }
 
 interface ArtifactUrlOptions {
   readonly absolute?: boolean
 }
 
-function artifactDownloadUrl(
+export function artifactAccessUrl(
   artifact: ArtifactPayload,
   baseOrigin: string,
   options: ArtifactUrlOptions = {},
 ): string {
-  let raw = artifact?.download_url ? String(artifact.download_url) : ''
-  if (!raw && artifact?.id) raw = `/api/v1/artifacts/${encodeURIComponent(artifact.id)}`
-  if (!raw) return ''
-  try {
-    const url = new URL(raw, baseOrigin)
-    const base = new URL(baseOrigin)
-    const sameOrigin = urlsShareArtifactOrigin(url, base)
-    if (sameOrigin) {
-      url.searchParams.delete('token')
-      url.searchParams.delete('sessionKey')
-      url.searchParams.delete('session_key')
-    }
-    if (!sameOrigin || options.absolute) return url.toString()
-    return url.pathname + url.search + url.hash
-  } catch {
-    return raw
-  }
-}
-
-export function artifactAccessUrl(
-  artifact: ArtifactPayload,
-  baseOrigin: string,
-  options: { absolute?: boolean } = {},
-): string {
-  return artifactDownloadUrl(artifact, baseOrigin, {
-    absolute: options.absolute === true,
-  })
+  return artifactHttpAccessUrl(artifact, baseOrigin, options)
 }
 
 export function artifactThumbnailAccessUrl(
   artifact: ArtifactPayload,
   baseOrigin: string,
 ): string {
-  const thumbnailUrl = artifact?.thumbnail_url ? String(artifact.thumbnail_url) : ''
-  return artifactDownloadUrl(
-    thumbnailUrl ? { ...artifact, download_url: thumbnailUrl } : artifact,
-    baseOrigin,
-  )
-}
-
-export function artifactAccessHeaders(
-  url: string,
-  options: ArtifactAuthContext = {},
-): Record<string, string> {
-  const baseOrigin = resolveBaseOrigin(options.baseOrigin)
-  if (!isSameOriginArtifactUrl(url, baseOrigin)) return {}
-  const headers: Record<string, string> = {}
-  if (options.sessionKey) headers['x-opensquilla-session-key'] = options.sessionKey
-  const authToken = options.authToken === undefined
-    ? runtimeArtifactAuthToken()
-    : options.authToken
-  if (authToken) headers.Authorization = `Bearer ${authToken}`
-  return headers
+  return artifactHttpThumbnailUrl(artifact, baseOrigin)
 }
 
 export function artifactGatewayOpenUrl(artifact: ArtifactPayload, baseOrigin: string): string {
-  const rawId = artifact?.id ? String(artifact.id) : ''
-  if (rawId) return `/api/v1/artifacts/${encodeURIComponent(rawId)}/open`
-  const accessUrl = artifactAccessUrl(artifact, baseOrigin)
-  if (!accessUrl) return ''
-  try {
-    const url = new URL(accessUrl, baseOrigin)
-    if (!isSameOriginArtifactUrl(url.toString(), baseOrigin)) return ''
-    const match = url.pathname.match(/^\/api\/v1\/artifacts\/([^/]+)$/)
-    return match ? `/api/v1/artifacts/${match[1]}/open` : ''
-  } catch {
-    return ''
-  }
+  return artifactHttpGatewayOpenUrl(artifact, baseOrigin)
 }
 
 export function artifactOpenFailureMessage(status: number, title: string): string {
@@ -272,85 +167,70 @@ export function artifactOpenFailureMessage(status: number, title: string): strin
 }
 
 export async function openArtifactViaGateway(
+  http: Pick<ArtifactAccessHttpTransport, 'requestBinary'>,
   artifact: ArtifactPayload,
   options: ArtifactFetchOptions = {},
 ): Promise<ArtifactGatewayOpenResult> {
   const baseOrigin = resolveBaseOrigin(options.baseOrigin)
-  const url = artifactGatewayOpenUrl(artifact, baseOrigin)
+  const request = bindArtifactOpenRequest(http, artifact, { baseOrigin })
   const title = safeTitle(artifact)
-  if (!url) {
+  if (!request) {
     return { ok: false, status: 0, url: '', message: artifactOpenFailureMessage(0, title) }
   }
-
-  const fetchImpl = resolveFetch(options.fetchImpl)
-  if (!fetchImpl) {
-    return { ok: false, status: 0, url, message: artifactOpenFailureMessage(0, title) }
-  }
+  const url = request.url
 
   try {
-    const response = await fetchImpl(url, {
-      method: 'POST',
-      headers: artifactAccessHeaders(url, options),
-      credentials: 'same-origin',
+    const response = await request.execute({
+      sessionKey: options.sessionKey,
+      timeoutMs: 0,
     })
-    if (!response.ok) {
-      return {
-        ok: false,
-        status: response.status,
-        url,
-        message: artifactOpenFailureMessage(response.status, title),
-      }
-    }
-    return { ok: true, status: response.status, url }
-  } catch {
-    return { ok: false, status: 0, url, message: artifactOpenFailureMessage(0, title) }
+    await response.blob()
+    return { ok: true, status: response.metadata.status, url }
+  } catch (error) {
+    const status = httpErrorStatus(error)
+    return { ok: false, status, url, message: artifactOpenFailureMessage(status, title) }
   }
 }
 
 export async function fetchArtifactBlob(
+  http: Pick<ArtifactAccessHttpTransport, 'fetchExternalArtifact' | 'requestBinary'>,
   artifact: ArtifactPayload,
   options: ArtifactFetchOptions = {},
 ): Promise<ArtifactFetchResult> {
   const baseOrigin = resolveBaseOrigin(options.baseOrigin)
-  const url = artifactAccessUrl(artifact, baseOrigin)
+  const request = bindArtifactBinaryRequest(http, artifact, {
+    baseOrigin,
+    policy: options.requireSameOrigin ? 'trusted-origin' : 'allow-external',
+  })
+  const url = request?.url ?? artifactAccessUrl(artifact, baseOrigin)
   const title = safeTitle(artifact)
-  if (!url) {
-    return { ok: false, status: 0, url: '', message: artifactOpenFailureMessage(0, title) }
-  }
-
-  const fetchImpl = resolveFetch(options.fetchImpl)
-  if (!fetchImpl) {
-    return { ok: false, status: 0, url, message: artifactOpenFailureMessage(0, title) }
-  }
-
-  const sameOrigin = isSameOriginArtifactUrl(url, baseOrigin)
-  if (options.requireSameOrigin && !isTrustedArtifactTransportUrl(url, baseOrigin)) {
+  if (!request) {
     return { ok: false, status: 0, url, message: artifactOpenFailureMessage(0, title) }
   }
   try {
-    const response = await fetchImpl(url, {
-      method: 'GET',
-      headers: artifactAccessHeaders(url, options),
-      credentials: sameOrigin ? 'same-origin' : 'omit',
+    const response = await request.execute({
+      sessionKey: options.sessionKey,
       signal: options.signal,
-      ...(options.requireSameOrigin ? { redirect: 'error' as const } : {}),
+      timeoutMs: 0,
     })
-    if (!response.ok) {
-      return {
-        ok: false,
-        status: response.status,
-        url,
-        message: artifactOpenFailureMessage(response.status, title),
-      }
+    return {
+      ok: true,
+      status: response.metadata.status,
+      url,
+      blob: await response.blob(),
     }
-    return { ok: true, status: response.status, url, blob: await response.blob() }
   } catch (error) {
-    if (isAbortError(error)) throw error
-    return { ok: false, status: 0, url, message: artifactOpenFailureMessage(0, title) }
+    if (isAbortError(error)) {
+      if (error instanceof HttpTransportError) throw new DOMException('Aborted', 'AbortError')
+      throw error
+    }
+    const status = httpErrorStatus(error)
+    return { ok: false, status, url, message: artifactOpenFailureMessage(status, title) }
   }
 }
 
 export async function openArtifactBlobUrl(
+  http: Pick<ArtifactAccessHttpTransport, 'fetchExternalArtifact' | 'requestBinary'>,
   artifact: ArtifactPayload,
   options: ArtifactOpenOptions = {},
 ): Promise<ArtifactOpenResult> {
@@ -384,7 +264,7 @@ export async function openArtifactBlobUrl(
     }
   }
 
-  const fetched = await fetchArtifactBlob(artifact, options)
+  const fetched = await fetchArtifactBlob(http, artifact, options)
   if (!fetched.ok) {
     closeOpenedWindow(opened)
     return fetched
@@ -422,41 +302,17 @@ export async function openArtifactBlobUrl(
   return { ok: true, status: fetched.status, url: fetched.url, objectUrl }
 }
 
-export function createV4ArtifactContentAccess(): Pick<
+export function createV4ArtifactContentAccess(http: ArtifactAccessHttpTransport): Pick<
   ArtifactContentAccess,
   'fetchArtifact' | 'openArtifact' | 'openArtifactBlob' | 'clearPreviewStorage'
 > {
   return {
-    fetchArtifact: (artifact, request) => fetchArtifactBlob(artifact, runtimeOptions(request)),
-    openArtifact: (artifact, request) => openArtifactViaGateway(artifact, runtimeOptions(request)),
-    openArtifactBlob: (artifact, request) => openArtifactBlobUrl(artifact, runtimeOptions(request)),
+    fetchArtifact: (artifact, request) => fetchArtifactBlob(http, artifact, runtimeOptions(request)),
+    openArtifact: (artifact, request) => openArtifactViaGateway(http, artifact, runtimeOptions(request)),
+    openArtifactBlob: (artifact, request) => openArtifactBlobUrl(http, artifact, runtimeOptions(request)),
     async clearPreviewStorage(previewOrigin) {
-      let url: URL
       try {
-        const origin = new URL(previewOrigin)
-        if (
-          (origin.protocol !== 'http:' && origin.protocol !== 'https:')
-          || origin.username
-          || origin.password
-          || origin.pathname !== '/'
-          || origin.search
-          || origin.hash
-        ) return
-        url = new URL('/.opensquilla/clear-site-data', origin.origin)
-      } catch {
-        return
-      }
-      try {
-        await fetch(url, {
-          method: 'GET',
-          cache: 'no-store',
-          credentials: 'omit',
-          keepalive: true,
-          mode: 'no-cors',
-          redirect: 'error',
-          referrerPolicy: 'no-referrer',
-          signal: AbortSignal.timeout(2_000),
-        })
+        await http.clearPreviewOrigin(previewOrigin)
       } catch {}
     },
   }

@@ -18,6 +18,8 @@ from unittest.mock import ANY, AsyncMock
 import pytest
 from starlette.websockets import WebSocketState
 
+import opensquilla.engine.cache_break_monitor as cache_break_monitor
+import opensquilla.gateway.adapters.session_maintenance as session_maintenance_adapter
 from opensquilla.agents.registry import AgentRegistry
 from opensquilla.agents.scope import default_workspace_dir
 from opensquilla.attachment_refs import transcript_material_path
@@ -680,6 +682,11 @@ def _capture_compaction_emits(
         emitted.append((session_key, event_name, payload))
 
     monkeypatch.setattr(rpc_sessions, "_send_prepared_to_subscribers", _record_emit)
+    monkeypatch.setattr(
+        session_maintenance_adapter,
+        "send_prepared_to_subscribers",
+        _record_emit,
+    )
     return emitted
 
 
@@ -2920,7 +2927,9 @@ class TestSessionsSend:
         async def report(_config):
             return unavailable
 
-        monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+        monkeypatch.setattr(
+            "opensquilla.gateway.admission_preparation.current_sandbox_capability_report", report
+        )
         session = FakeSession(
             session_key="agent:main:webchat:safe-fallback",
             origin={
@@ -2948,7 +2957,7 @@ class TestSessionsSend:
             session_manager=FakeSessionManager([session]),
             task_runtime=runtime,
         )
-        result = await rpc_sessions._handle_sessions_send(
+        result = await rpc_sessions._handle_sessions_send_contract(
             {"key": session.session_key, "message": "hello"},
             ctx,
         )
@@ -2989,7 +2998,9 @@ class TestSessionsSend:
         async def report(_config):
             return unavailable
 
-        monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+        monkeypatch.setattr(
+            "opensquilla.gateway.admission_preparation.current_sandbox_capability_report", report
+        )
         session = FakeSession(session_key="agent:main:webchat:guest-no-fallback")
         guest = Principal(
             role="operator",
@@ -3008,7 +3019,7 @@ class TestSessionsSend:
         if source_hint is not None:
             params["_source"] = source_hint
         with pytest.raises(rpc_sessions.RpcHandlerError) as raised:
-            await rpc_sessions._handle_sessions_send(params, ctx)
+            await rpc_sessions._handle_sessions_send_contract(params, ctx)
 
         assert raised.value.code == "SANDBOX_UNAVAILABLE"
 
@@ -3049,7 +3060,9 @@ class TestSessionsSend:
                     status="queued",
                 )
 
-        monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+        monkeypatch.setattr(
+            "opensquilla.gateway.admission_preparation.current_sandbox_capability_report", report
+        )
         configured_workspace = tmp_path / "real-project"
         configured_workspace.mkdir()
         state_dir = tmp_path / "state"
@@ -3074,7 +3087,7 @@ class TestSessionsSend:
             config=config,
         )
 
-        await rpc_sessions._handle_sessions_send(
+        await rpc_sessions._handle_sessions_send_contract(
             {"key": session.session_key, "message": "hello"},
             ctx,
         )
@@ -3128,7 +3141,9 @@ class TestSessionsSend:
                 "GUEST_DEFAULT_WORKSPACE_UNSAFE: guest scratch directory is retargeted"
             )
 
-        monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+        monkeypatch.setattr(
+            "opensquilla.gateway.admission_preparation.current_sandbox_capability_report", report
+        )
         monkeypatch.setattr(rpc_sessions, "_guest_profile_for_principal", fail_profile)
         session = FakeSession(session_key="agent:main:webchat:guest-boundary")
         guest = Principal(
@@ -3149,7 +3164,7 @@ class TestSessionsSend:
         )
 
         with pytest.raises(rpc_sessions.RpcHandlerError) as raised:
-            await rpc_sessions._handle_sessions_send(
+            await rpc_sessions._handle_sessions_send_contract(
                 {"key": session.session_key, "message": "hello"},
                 ctx,
             )
@@ -3666,7 +3681,9 @@ class TestSessionsSend:
         async def report(_config):
             return unavailable
 
-        monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+        monkeypatch.setattr(
+            "opensquilla.gateway.admission_preparation.current_sandbox_capability_report", report
+        )
 
         class RecordingTaskRuntime:
             def __init__(self) -> None:
@@ -6409,7 +6426,7 @@ class TestSessionsAbort:
         monkeypatch.setattr(rpc_sessions, "_ABORT_RUNTIME_CANCEL_DRAIN_SECONDS", 0.05)
         monkeypatch.setattr(rpc_sessions, "_ABORT_SESSION_LOOKUP_SECONDS", 0.01)
         owner = asyncio.create_task(compaction_owner())
-        rpc_sessions.register_active_compaction(
+        cache_break_monitor.register_active_compaction(
             session_key,
             "cmp-slow-lookup",
             owner,
@@ -8027,7 +8044,7 @@ class TestSessionsContextCompact:
     ):
         events: list[tuple[str, dict[str, Any]]] = []
         monkeypatch.setattr(
-            rpc_sessions,
+            session_maintenance_adapter,
             "notify_compaction",
             lambda session_key, **payload: events.append((session_key, payload)),
         )
@@ -8070,7 +8087,7 @@ class TestSessionsContextCompact:
         events: list[tuple[str, dict[str, Any]]] = []
         emitted = _capture_compaction_emits(monkeypatch)
         monkeypatch.setattr(
-            rpc_sessions,
+            session_maintenance_adapter,
             "notify_compaction",
             lambda session_key, **payload: events.append((session_key, payload)),
         )
@@ -8120,7 +8137,7 @@ class TestSessionsContextCompact:
         events: list[tuple[str, dict[str, Any]]] = []
         emitted = _capture_compaction_emits(monkeypatch)
         monkeypatch.setattr(
-            rpc_sessions,
+            session_maintenance_adapter,
             "notify_compaction",
             lambda session_key, **payload: events.append((session_key, payload)),
         )
@@ -8234,8 +8251,8 @@ class TestSessionsContextCompact:
                 await release_started_broadcast.wait()
 
         monkeypatch.setattr(
-            rpc_sessions,
-            "_send_prepared_to_subscribers",
+            session_maintenance_adapter,
+            "send_prepared_to_subscribers",
             _block_started_broadcast,
         )
         monkeypatch.setattr(rpc_sessions, "_ABORT_RUNTIME_CANCEL_DRAIN_SECONDS", 0.1)
@@ -8360,8 +8377,8 @@ class TestSessionsContextCompact:
                 await hold_observed_emit.wait()
 
         monkeypatch.setattr(
-            rpc_sessions,
-            "_send_prepared_to_subscribers",
+            session_maintenance_adapter,
+            "send_prepared_to_subscribers",
             _block_first_observed_emit,
         )
 
@@ -8448,7 +8465,7 @@ class TestSessionsContextCompact:
         compaction_id = compact_response.payload["compaction_id"]
         await asyncio.wait_for(terminal_epoch_resolve_started.wait(), timeout=1.0)
 
-        assert rpc_sessions.compaction_terminal_status(compaction_id) is None
+        assert cache_break_monitor.compaction_terminal_status(compaction_id) is None
         replay_before_cancel = get_session_streams().replay(session.session_key, stream_cursor)
         assert not any(
             event.payload.get("compaction_id") == compaction_id
@@ -8480,7 +8497,7 @@ class TestSessionsContextCompact:
             in {"completed", "skipped", "failed", "cancelled", "timed_out"}
         ]
         assert [payload["status"] for payload in replayed_terminals] == ["cancelled"]
-        assert rpc_sessions.compaction_terminal_status(compaction_id) == "cancelled"
+        assert cache_break_monitor.compaction_terminal_status(compaction_id) == "cancelled"
 
     @pytest.mark.asyncio
     async def test_context_compact_emits_skipped_when_nothing_removed(
@@ -8495,7 +8512,7 @@ class TestSessionsContextCompact:
         events: list[tuple[str, dict[str, Any]]] = []
         emitted = _capture_compaction_emits(monkeypatch)
         monkeypatch.setattr(
-            rpc_sessions,
+            session_maintenance_adapter,
             "notify_compaction",
             lambda session_key, **payload: events.append((session_key, payload)),
         )
@@ -8555,7 +8572,7 @@ class TestSessionsContextCompact:
         ctx = make_ctx(session_manager=manager)
         events: list[tuple[str, dict[str, Any]]] = []
         monkeypatch.setattr(
-            rpc_sessions,
+            session_maintenance_adapter,
             "notify_compaction",
             lambda session_key, **payload: events.append((session_key, payload)),
         )
@@ -8599,7 +8616,7 @@ class TestSessionsContextCompact:
         ctx = make_ctx(session_manager=manager, config=config)
         events: list[tuple[str, dict[str, Any]]] = []
         monkeypatch.setattr(
-            rpc_sessions,
+            session_maintenance_adapter,
             "notify_compaction",
             lambda session_key, **payload: events.append((session_key, payload)),
         )
@@ -8635,7 +8652,7 @@ class TestSessionsContextCompact:
         events: list[tuple[str, dict[str, Any]]] = []
         emitted = _capture_compaction_emits(monkeypatch)
         monkeypatch.setattr(
-            rpc_sessions,
+            session_maintenance_adapter,
             "notify_compaction",
             lambda session_key, **payload: events.append((session_key, payload)),
         )
@@ -9034,7 +9051,7 @@ class TestSessionsContextCompact:
         events: list[tuple[str, dict[str, Any]]] = []
         emitted = _capture_compaction_emits(monkeypatch)
         monkeypatch.setattr(
-            rpc_sessions,
+            session_maintenance_adapter,
             "notify_compaction",
             lambda session_key, **payload: events.append((session_key, payload)),
         )

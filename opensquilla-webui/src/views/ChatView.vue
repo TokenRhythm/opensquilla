@@ -479,37 +479,6 @@
           </div>
         </div>
 
-        <!-- Legacy standalone approval / clarify block. The interrupt parts now
-             carry these through the fold (InterruptPart over the same cards), so
-             this side-list only renders on the foldLiveTurn=0 rollback branch —
-             the one-flag kill switch — to avoid a double-render. Kept for one
-             release as the rollback lever, mirroring the foldLiveTurn discipline. -->
-        <template v-if="foldLiveTurnMode === false">
-          <!-- In-thread approval cards: blocked runs ask for a decision here -->
-          <ApprovalCard
-            v-for="entry in approvalEntries"
-            :key="entry.approval.id"
-            :approval="entry.approval"
-            :resolution="entry.resolution"
-            :busy="approvalBusyIds.has(entry.approval.id)"
-            :error="entry.error"
-            @allow-once="resolveApproval(entry, 'allow-once')"
-            @allow-always="resolveApproval(entry, 'allow-always')"
-            @deny="resolveApproval(entry, 'deny')"
-            @extend="extendInterrupt(entry.approval.id)"
-          />
-
-          <!-- In-thread clarify card: pending agent questions render as a form -->
-          <ClarifyCard
-            v-if="pendingClarify"
-            :request="pendingClarify"
-            :submitted="clarifySubmitted"
-            :busy="clarifyBusy"
-            :error="clarifyError"
-            @submit="submitClarify"
-            @dismiss="dismissClarify"
-          />
-        </template>
         <div ref="bottomSentinelRef" class="chat-bottom-sentinel" aria-hidden="true" />
         </div>
         <ConversationMinimap
@@ -794,7 +763,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, inject, onMounted, onUnmounted, nextTick, watch, watchEffect } from 'vue'
+import { ref, computed, inject, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
@@ -826,7 +795,6 @@ import {
   notifyArtifactPromptAnnotationsAccepted,
   reuseArtifactPromptAnnotation,
 } from '@/workbench/promptAnnotations'
-import ApprovalCard from '@/components/chat/ApprovalCard.vue'
 import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
 import AssistantActivityTimeline from '@/components/chat/AssistantActivityTimeline.vue'
 import UnifiedAssistantActivityTimeline from '@/components/chat/UnifiedAssistantActivityTimeline.vue'
@@ -876,7 +844,14 @@ import { useChatElevatedMode } from '@/composables/chat/useChatElevatedMode'
 import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
 import { useChatSessionRouting } from '@/composables/chat/useChatSessionRouting'
 import { SESSION_ROUTING_KEY, type SessionRouting } from '@/modules/sessionRouting'
-import { SESSION_CONVERSATION_KEY, type SessionConversation } from '@/modules/sessionConversation'
+import { USAGE_REPORTING_KEY, type UsageReporting } from '@/modules/usageReporting'
+import { COMMAND_CATALOG_KEY, type CommandCatalog } from '@/modules/commandCatalog'
+import { PROMPT_CACHE_LEASE_KEY, type PromptCacheLease } from '@/modules/promptCacheLease'
+import {
+  CLARIFICATION_SUBMISSION_KEY,
+  type ClarificationSubmission,
+} from '@/modules/clarificationSubmission'
+import { SESSION_MAINTENANCE_KEY, type SessionMaintenance } from '@/modules/sessionMaintenance'
 import { TURN_COMMANDS_KEY, type TurnCommands } from '@/modules/turnCommands'
 import { APPROVAL_CENTER_KEY, type ApprovalCenter } from '@/modules/approvalCenter'
 import { GOAL_CENTER_KEY, type GoalCenter } from '@/modules/goalCenter'
@@ -942,7 +917,7 @@ import {
   acquireSessionBootstrapAdmission,
   claimSessionBootstrapAdmission,
   optionalSessionRpcAllowed,
-  optionalSessionRpcCallOptions,
+  optionalSessionReadOptions,
 } from '@/composables/chat/sessionBootstrapAdmission'
 import { useChatSessionRuntime } from '@/composables/chat/useChatSessionRuntime'
 import {
@@ -1067,7 +1042,11 @@ import {
   artifactWorkbenchPreviewKind,
 } from '@/utils/workbench/artifactPreview'
 import { findArtifactCard, focusArtifactInTranscript } from '@/utils/chat/artifactFocus'
-import { classifyArtifactProductError } from '@/utils/artifactProductErrors'
+import {
+  ArtifactProductFailure,
+  artifactProductReasonCode,
+  classifyArtifactProductError,
+} from '@/utils/artifactProductErrors'
 import {
   persistDeferredMetaDraft,
   takeDeferredMetaDrafts,
@@ -1206,9 +1185,23 @@ if (!injectedMetaRunCenter) throw new Error('MetaRunCenter was not provided')
 const metaRunCenter: MetaRunCenter = injectedMetaRunCenter
 const injectedAppSettings = inject(APP_SETTINGS_KEY)
 if (!injectedAppSettings) throw new Error('AppSettings was not provided')
-const injectedSessionConversation = inject(SESSION_CONVERSATION_KEY)
-if (!injectedSessionConversation) throw new Error('SessionConversation was not provided')
-const sessionConversation: SessionConversation = injectedSessionConversation
+const injectedUsageReporting = inject(USAGE_REPORTING_KEY)
+if (!injectedUsageReporting) throw new Error('UsageReporting was not provided')
+const usageReporting: UsageReporting = injectedUsageReporting
+const injectedCommandCatalog = inject(COMMAND_CATALOG_KEY)
+if (!injectedCommandCatalog) throw new Error('CommandCatalog was not provided')
+const commandCatalog: CommandCatalog = injectedCommandCatalog
+const injectedPromptCacheLease = inject(PROMPT_CACHE_LEASE_KEY)
+if (!injectedPromptCacheLease) throw new Error('PromptCacheLease was not provided')
+const promptCacheLease: PromptCacheLease = injectedPromptCacheLease
+const injectedClarificationSubmission = inject(CLARIFICATION_SUBMISSION_KEY)
+if (!injectedClarificationSubmission) {
+  throw new Error('ClarificationSubmission was not provided')
+}
+const clarificationSubmission: ClarificationSubmission = injectedClarificationSubmission
+const injectedSessionMaintenance = inject(SESSION_MAINTENANCE_KEY)
+if (!injectedSessionMaintenance) throw new Error('SessionMaintenance was not provided')
+const sessionMaintenance: SessionMaintenance = injectedSessionMaintenance
 const conversationEvents = inject(CONVERSATION_EVENTS_KEY)
 if (!conversationEvents) throw new Error('ConversationEvents was not provided')
 const sessionReadLifecycleFactory = inject(SESSION_READ_LIFECYCLE_FACTORY_KEY)
@@ -1414,12 +1407,6 @@ async function discardPromptAnnotation(annotationId: string) {
   }
 }
 
-function promptAnnotationRpcErrorCode(error: unknown): string {
-  if (!error || typeof error !== 'object') return ''
-  const code = (error as { code?: unknown }).code
-  return typeof code === 'string' ? code : ''
-}
-
 async function jumpPromptAnnotation(annotationId: string) {
   const annotation = artifactPromptAnnotationsStore.annotations[annotationId]
   if (!annotation) return
@@ -1435,11 +1422,15 @@ async function jumpPromptAnnotation(annotationId: string) {
   try {
     await artifactPromptAnnotationsStore.focus(annotationId)
   } catch (error) {
-    if (promptAnnotationRpcErrorCode(error) === 'ARTIFACT_REVISION_CHANGED') {
+    const failure = error instanceof ArtifactProductFailure ? error : null
+    if (failure?.code === 'DOCUMENT_CHANGED') {
       pushToast(t('chat.promptAnnotations.focusUnavailable'), { tone: 'warn' })
       return
     }
-    if (promptAnnotationRpcErrorCode(error) === 'ARTIFACT_ANNOTATION_NOT_DRAFT') {
+    if (
+      failure?.code === 'ANNOTATION_UNAVAILABLE'
+      && artifactProductReasonCode(failure) === 'not_draft'
+    ) {
       await artifactPromptAnnotationsStore.load(annotation.sessionKey, { force: true })
     }
     pushToast(t('chat.promptAnnotations.focusUnavailable'), { tone: 'warn' })
@@ -1465,7 +1456,7 @@ async function reusePromptAnnotation(annotation: PromptAnnotationSnapshot) {
 const promptCacheKeepaliveOpen = ref(false)
 const promptCacheKeepaliveStatus = ref<PromptCacheKeepaliveStatus | null>(null)
 const promptCacheKeepaliveAvailable = computed(() => (
-  sessionConversation.supports('prompt-cache-keepalive')
+  promptCacheLease.isAvailable()
 ))
 const workbenchEnabled = computed(() => appStore.features.artifactWorkbench === true)
 const promptAnnotationDesktopAvailable = computed(() => (
@@ -1740,7 +1731,7 @@ async function refreshPromptCacheKeepaliveStatus() {
     || !promptCacheKeepaliveSessionReady.value
   ) return
   try {
-    const next = await sessionConversation.promptCacheStatus(key)
+    const next = await promptCacheLease.status(key)
     if (sessionKey.value === key) promptCacheKeepaliveStatus.value = next
   } catch {
     // The settings dialog owns actionable RPC errors. Menu refresh is best effort.
@@ -1806,7 +1797,6 @@ const {
   streamArtifacts,
   streamBubble,
   streamHasVisibleOutput,
-  streamTimelineItems,
   streamActivityStale,
   streamPhaseElapsed,
   streamTurnElapsed,
@@ -1826,8 +1816,6 @@ const {
   isToolItemOpen,
   toggleToolItem,
   cleanup: cleanupStream,
-  assertLiveParity,
-  useReducer: foldLiveTurnMode,
   foldedTurn,
   appendInterruptFrame,
   ensureInterruptBubble,
@@ -2097,8 +2085,8 @@ watch(compactStatus, (status) => {
 }, { flush: 'sync' })
 
 const chatUsageWidget = useChatUsageWidget({
-  sessionConversation,
-  readCallOptions: optionalSessionRpcCallOptions,
+  usageReporting,
+  readOptions: optionalSessionReadOptions,
   sessionKey,
   tokenVizEnabled: () => appStore.features.tokenViz,
 })
@@ -2127,10 +2115,9 @@ const {
 } = chatSessionRoute
 
 const chatFeatureToggles = useChatFeatureToggles({
-  sessionConversation,
   appSettings: injectedAppSettings,
   modelRouting: injectedProviderConfiguration,
-  readCallOptions: optionalSessionRpcCallOptions,
+  readOptions: optionalSessionReadOptions,
   setGlobalElevatedMode,
   loadCurrentSessionUsage,
 })
@@ -3215,9 +3202,11 @@ const goalOutcomeHasMessageAnchor = computed(() => (
 ))
 
 const chatSlashCommands = useChatSlashCommands({
-  sessionConversation,
+  commandCatalog,
+  usageReporting,
+  sessionMaintenance,
   metaRunCenter,
-  catalogCallOptions: optionalSessionRpcCallOptions,
+  catalogCallOptions: optionalSessionReadOptions,
   inputText,
   sessionKey,
   autoResizeTextarea,
@@ -3744,7 +3733,8 @@ async function steerPendingMessage(pendingUiId: string) {
 }
 
 const chatApprovals = useChatApprovals({
-  sessionConversation,
+  conversationEvents: conversationSessionRuntime.events,
+  clarificationSubmission,
   approvalCenter,
   sessionKey,
   runStatus,
@@ -3753,13 +3743,10 @@ const chatApprovals = useChatApprovals({
   onSnapshotCount: count => appStore.setApprovalCount(count),
 })
 const {
-  approvalEntries,
-  approvalBusyIds,
   pendingClarify,
   clarifySubmitted,
   clarifyBusy,
   clarifyError,
-  resolveApproval,
   resolveInterrupt,
   extendInterrupt,
   submitClarify,
@@ -3881,7 +3868,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   showCompactionToast,
   getCompactionPlacement: id => getCompactionPlacement(id) || undefined,
   showWarningToast: message => pushToast(message || t('chat.warning.default'), { tone: 'warn', duration: 5000 }),
-  supportsTurnCommitted: () => sessionConversation.supports('turn-committed'),
+  supportsTurnCommitted: () => gatewayAccess.turnCommittedEvents,
   scheduleHistorySync,
   schedulePendingDrainAfterTerminal,
   popAllPendingIntoComposer,
@@ -3898,26 +3885,11 @@ const rpcEventHandlers = useChatRpcEventHandlers({
 })
 bindActiveStreamTask = rpcEventHandlers.bindActiveStreamTask
 restoreLiveTurnSnapshot = rpcEventHandlers.restoreLiveTurnSnapshot
-const {
-  streamThinkingText,
-  streamThinkingElapsedText,
-  attachTurnReasoning,
-} = rpcEventHandlers
+const { attachTurnReasoning } = rpcEventHandlers
 
-// live-turn shadow parity: in DEV/SHADOW, re-check the fold against the legacy
-// live surface whenever a frame lands (the fold and legacy refs are tracked by
-// assertLiveParity). Injects the thinking text owned by the event handlers.
-// In production ON mode this is a no-op; DEV/SHADOW performs the parity check,
-// while explicit OFF keeps the compatibility renderer without fold assertions.
-watchEffect(() => assertLiveParity(streamThinkingText))
-
-// Flag-selected live render source. In production the fold is authoritative by
-// default; only opensquilla.chat.foldLiveTurn=0 restores legacy. SHADOW and OFF
-// return the IDENTICAL legacy refs, so with the flag off the render is byte-identical.
-// The activity head (phase/elapsed) stays on the legacy activity refs.
-const liveTimelineItems = computed(() =>
-  foldLiveTurnMode.value === true ? foldedTurn.value.timelineItems : streamTimelineItems.value,
-)
+// The append-only turn log is the single live content projection. The activity
+// head (phase/elapsed) remains presentation state outside the transcript fold.
+const liveTimelineItems = computed(() => foldedTurn.value.timelineItems)
 const liveTimelineSplit = computed(() => splitLiveAssistantTimeline(liveTimelineItems.value, {
   keepToolTurnTextInActivity: true,
 }))
@@ -3934,9 +3906,7 @@ const liveAnswerPart = computed<Extract<ChatPart, { type: 'text' }> | null>(() =
 const liveActivityTimelineItems = computed<ChatStreamTimelineItem[]>(() =>
   liveTimelineSplit.value.activityItems,
 )
-const liveActivityStatusHistory = computed(() =>
-  foldLiveTurnMode.value === false ? [] : foldedTurn.value.statusHistory,
-)
+const liveActivityStatusHistory = computed(() => foldedTurn.value.statusHistory)
 const liveActivityProjection = computed(() =>
   {
     // The shared activity tick advances both the current phase duration and
@@ -3961,7 +3931,7 @@ const liveReasoningCollapseActive = computed(() =>
 )
 const liveToolStateScope = computed(() => JSON.stringify([sessionKey.value || '', 'stream']))
 // Elapsed readouts in the live turn round to whole seconds ("4s"), matching
-// streamPhaseElapsed and streamThinkingElapsedText. The shared tool formatter
+// streamPhaseElapsed. The shared tool formatter
 // (streamToolElapsedText, useChatStream.ts) emits tenths, so normalise its
 // output here at the call site instead of changing the shared formatter —
 // except sub-second finished tools, which keep their tenths so they never
@@ -3969,28 +3939,10 @@ const liveToolStateScope = computed(() => JSON.stringify([sessionKey.value || ''
 function liveToolElapsedText(call: Pick<ChatToolCall, 'toolId'>): string {
   return streamToolElapsedText(call).replace(/^([1-9]\d*)\.\d+s$/, '$1s')
 }
-const liveArtifacts = computed(() =>
-  foldLiveTurnMode.value === true ? foldedTurn.value.artifacts : streamArtifacts.value,
+const liveArtifacts = computed(() => foldedTurn.value.artifacts)
+const liveReasoningBlocks = computed<ReasoningBlock[]>(() =>
+  foldedTurn.value.reasoningBlocks.filter(block => block.text),
 )
-const liveThinkingText = computed(() =>
-  foldLiveTurnMode.value === true ? foldedTurn.value.thinkingText : streamThinkingText.value,
-)
-const liveReasoningBlocks = computed<ReasoningBlock[]>(() => {
-  if (foldLiveTurnMode.value === true) {
-    return foldedTurn.value.reasoningBlocks.filter(block => block.text)
-  }
-  if (!liveThinkingText.value) return []
-  const seconds = Number.parseInt(streamThinkingElapsedText.value, 10)
-  const elapsed = Number.isFinite(seconds) ? seconds : 0
-  return [{
-    id: 'legacy-live-reasoning',
-    index: 0,
-    text: liveThinkingText.value,
-    status: 'streaming',
-    startedAt: Date.now() - elapsed * 1000,
-    contentKind: 'reasoning',
-  }]
-})
 function validLiveActivityOrder(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
 }
@@ -4019,19 +3971,9 @@ const liveActivityStepCount = computed(() =>
 const liveActivityFailureCount = computed(() =>
   liveActivityProjection.value.activityClusters.filter(cluster => cluster.isFailure).length,
 )
-// Inline interrupt parts for the live turn come from the fold whenever it is
-// active (ON or SHADOW — frames are appended in both). Only the foldLiveTurn=0
-// OFF rollback renders the legacy standalone ApprovalCard/ClarifyCard block, so
-// the two never both show. Unlike the activity body (which has a legacy ref to
-// fall back to in SHADOW), interrupts have no legacy live ref, so SHADOW must
-// also render them from the fold.
-const liveInterruptParts = computed(() =>
-  foldLiveTurnMode.value === false
-    ? []
-    : foldedTurn.value.parts.filter(
-        (part): part is Extract<typeof part, { type: 'interrupt' }> => part.type === 'interrupt',
-      ),
-)
+const liveInterruptParts = computed(() => foldedTurn.value.parts.filter(
+  (part): part is Extract<typeof part, { type: 'interrupt' }> => part.type === 'interrupt',
+))
 const livePendingInterruptParts = computed(() =>
   liveInterruptParts.value.filter(part => !part.resolution),
 )
@@ -4157,8 +4099,8 @@ const chatRpcSubscriptions = useChatRpcSubscriptions({
   // The private v4 adapter emits one semantic message. Feed that projection to
   // both business consumers without exposing protocol names in the view.
   onEvent: (message) => {
-    if (message.kind === 'conversation') {
-      stallWatchdog.noteEvent(message.event.semanticKind, message.payload)
+    if (message.kind === 'conversation' && message.event.kind === 'known' && message.event.semanticKind !== 'cron-result') {
+      stallWatchdog.noteEvent(message.event.semanticKind, message.event.payload)
     } else if (message.kind === 'approval') {
       stallWatchdog.noteEvent(
         message.action === 'requested' ? 'approval-requested' : 'approval-resolved',
@@ -6438,8 +6380,6 @@ async function validateActiveProjectBeforeSend(): Promise<string | null> {
     const workspaces = await projectWorkspaces.loadWorkspaces({
       timeoutMs: Math.max(1, deadlineAt - Date.now()),
       signal: controller.signal,
-      timeoutAction: 'reconnect',
-      abortAction: 'reject',
     })
     if (sessionKey.value !== key || boundWorkspaceId.value !== workspaceId) {
       return activeWorkspaceSendBlockedReason.value || 'resolving'
@@ -6500,18 +6440,10 @@ async function syncDraftProjectFromRoute(generation: number): Promise<boolean> {
   const controller = draftProjectHydration.createController(generation)
   if (!controller) return false
   try {
-    await sessionConversation.ready({
-      timeoutMs: Math.max(1, deadlineAt - Date.now()),
-      signal: controller.signal,
-      timeoutAction: 'reject',
-      abortAction: 'reject',
-    })
     if (!draftProjectHydrationIsCurrent(generation, workspaceId)) return false
     await projectWorkspaces.loadWorkspaces({
       timeoutMs: Math.max(1, deadlineAt - Date.now()),
       signal: controller.signal,
-      timeoutAction: 'reconnect',
-      abortAction: 'reject',
     })
     if (!draftProjectHydrationIsCurrent(generation, workspaceId)) return false
     const workspace = projectWorkspaces.byId.value.get(workspaceId)

@@ -128,7 +128,6 @@ _WEBUI_ARCHITECTURE_TEST_TARGETS: Final = frozenset(
 )
 _WEBUI_BOUNDARY_PREFIXES: Final = (
     "opensquilla-webui/scripts/lib/",
-    "opensquilla-webui/scripts/rpc-debt/",
     "opensquilla-webui/src/adapters/gateway/",
     "opensquilla-webui/src/contracts/",
     "opensquilla-webui/src/modules/",
@@ -143,6 +142,7 @@ _WEBUI_BOUNDARY_EXACT: Final = frozenset(
         "opensquilla-webui/src/lib/rpc.ts",
         "opensquilla-webui/src/main.ts",
         "opensquilla-webui/src/stores/rpc.ts",
+        "src/opensquilla/application/artifact_workbench.py",
     }
 )
 _SKILL_HUB_TESTS: Final = frozenset(
@@ -170,7 +170,13 @@ _SKILL_HUB_TESTS: Final = frozenset(
         "tests/test_gateway/test_rpc_skills_exact_identity.py",
         "tests/test_gateway/test_rpc_skills_coding_gate.py",
         "tests/test_gateway/test_rpc_skills_reload.py",
+        "tests/test_gateway/test_skill_catalog_adapter.py",
+        "tests/test_gateway/test_skill_catalog_application.py",
+        "tests/test_gateway/test_skill_management_adapter.py",
+        "tests/test_gateway/test_skill_management_application.py",
         "tests/test_gateway/test_skill_management_service_injection.py",
+        "tests/test_gateway/test_skill_proposal_review_adapter.py",
+        "tests/test_gateway/test_skill_proposal_review_application.py",
         "tests/test_tools/test_skill_view_resources.py",
         "tests/test_scripts/test_bench_skill_integrity.py",
         "tests/test_cli/test_cli_product_completeness.py",
@@ -186,13 +192,23 @@ _SKILL_HUB_SOURCE_EXACT: Final = frozenset(
         "src/opensquilla/cli/main.py",
         "src/opensquilla/cli/skills_cmd.py",
         "src/opensquilla/cli/skills_meta_cmd.py",
+        "src/opensquilla/application/skill_catalog.py",
+        "src/opensquilla/application/skill_management.py",
+        "src/opensquilla/application/skill_proposal_review.py",
         "src/opensquilla/gateway/app.py",
+        "src/opensquilla/gateway/adapters/skill_catalog.py",
+        "src/opensquilla/gateway/adapters/skill_catalog_contract.py",
+        "src/opensquilla/gateway/adapters/skill_management.py",
+        "src/opensquilla/gateway/adapters/skill_management_contract.py",
+        "src/opensquilla/gateway/adapters/skill_proposal_review.py",
+        "src/opensquilla/gateway/adapters/skill_proposal_review_contract.py",
         "src/opensquilla/gateway/boot.py",
         "src/opensquilla/gateway/config.py",
         "src/opensquilla/gateway/protocol.py",
         "src/opensquilla/gateway/rpc/__init__.py",
         "src/opensquilla/gateway/rpc/registry.py",
         "src/opensquilla/gateway/rpc_skills.py",
+        "src/opensquilla/gateway/rpc_proposals.py",
         "src/opensquilla/gateway/scopes.py",
         "src/opensquilla/gateway/websocket.py",
         "src/opensquilla/tools/builtin/skill_tools.py",
@@ -204,6 +220,9 @@ _SKILL_HUB_SOURCE_EXACT: Final = frozenset(
 _SKILL_HUB_TEST_PREFIXES: Final = (
     "tests/test_cli/test_skills_",
     "tests/test_gateway/test_rpc_skills_",
+    "tests/test_gateway/test_skill_catalog_",
+    "tests/test_gateway/test_skill_management_",
+    "tests/test_gateway/test_skill_proposal_review_",
     "tests/test_skills/test_hub_",
     "tests/test_skills/test_loader_",
     "tests/test_skills_hub_",
@@ -221,15 +240,18 @@ _NONCRITICAL_CI_SCRIPT_TARGETS: Final[dict[str, tuple[str, ...]]] = {
         "tests/test_scripts/test_prestage_release_to_oss.py",
     ),
     ".github/scripts/verify-release-macos-real-update.sh": (
+        "tests/test_ci/test_upgrade_baselines.py",
         "tests/test_release_consistency.py",
     ),
     ".github/scripts/verify-release-macos-upgrade.sh": (
+        "tests/test_ci/test_upgrade_baselines.py",
         "tests/test_release_consistency.py",
     ),
     ".github/scripts/verify-release-profile-preservation.py": (
         "tests/test_release_consistency.py",
     ),
     ".github/scripts/verify-release-windows-upgrade.ps1": (
+        "tests/test_ci/test_upgrade_baselines.py",
         "tests/test_release_consistency.py",
     ),
     ".github/scripts/verify_desktop_slim_size.py": (
@@ -1466,6 +1488,8 @@ def _add_noncritical_ci_path(
     if path.startswith(".github/workflows/"):
         suites.add("python-targeted")
         targets.add("tests/test_ci/test_workflows.py")
+        if path == ".github/workflows/wheelhouse-release.yml":
+            targets.add("tests/test_ci/test_upgrade_baselines.py")
         reasons.add("workflow_contract_changed")
         return True
     script_targets = _NONCRITICAL_CI_SCRIPT_TARGETS.get(path)

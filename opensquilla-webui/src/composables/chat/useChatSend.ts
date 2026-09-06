@@ -1,7 +1,6 @@
 import { computed, ref, watch, type ComputedRef, type Ref } from 'vue'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
-import type { RpcClientError } from '@/lib/rpc'
 import type {
   Attachment,
   ChatMessage,
@@ -30,6 +29,7 @@ import type {
   TurnSteerRequest,
   TurnCommands,
 } from '@/modules/turnCommands'
+import { TurnCommandError } from '@/modules/turnCommands'
 import type { MetaRunCenter } from '@/modules/metaRunCenter'
 import type { ChatRpcStreamApi } from '@/composables/chat/useChatRpcEventHandlers'
 import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
@@ -309,9 +309,12 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
 
+function turnCommandFailure(err: unknown): TurnCommandError | null {
+  return err instanceof TurnCommandError ? err : null
+}
+
 function errorCode(err: unknown): string | undefined {
-  const code = (err as RpcClientError | null | undefined)?.code
-  return typeof code === 'string' && code ? code : undefined
+  return turnCommandFailure(err)?.failureCode
 }
 
 function paramsHaveArtifactContext(
@@ -322,8 +325,12 @@ function paramsHaveArtifactContext(
 
 function sendFailureMessage(err: unknown, artifactContext = false): string {
   const code = errorCode(err)
-  if (artifactContext || isKnownArtifactProductErrorCode(code)) {
-    const classified = classifyArtifactProductError(err)
+  const artifactFailure = turnCommandFailure(err)?.artifactFailure
+  if (
+    artifactContext
+    || (artifactFailure?.artifactScoped && isKnownArtifactProductErrorCode(artifactFailure.code))
+  ) {
+    const classified = classifyArtifactProductError(artifactFailure)
     const translated = String(i18n.global.t(classified.messageKey))
     return translated === classified.messageKey
       ? classified.fallbackMessage
@@ -336,28 +343,29 @@ function shouldRestoreSendAttempt(err: unknown): boolean {
   // Unknown acceptance (for example a lost response) is safe to retry because
   // the exact attempt keeps its durable clientRequestId. Only a positive
   // accepted signal proves that restoring the composer would be misleading.
-  return (err as RpcClientError | null | undefined)?.accepted !== true
+  return turnCommandFailure(err)?.accepted !== true
 }
 
 function hasUnknownAcceptance(err: unknown): boolean {
-  const accepted = (err as RpcClientError | null | undefined)?.accepted
+  const accepted = turnCommandFailure(err)?.accepted
   return accepted !== true && accepted !== false
 }
 
-function rpcErrorDetail(err: unknown, key: string): unknown {
-  const rpcError = err as RpcClientError | null | undefined
-  if (rpcError && Object.prototype.hasOwnProperty.call(rpcError, key)) {
-    return (rpcError as unknown as Record<string, unknown>)[key]
-  }
-  const details = rpcError?.details
+function turnFailureDetail(err: unknown, key: string): unknown {
+  const failure = turnCommandFailure(err)
+  if (!failure) return undefined
+  if (key === 'retryable') return failure.retryable
+  if (key === 'retry_after_ms' || key === 'retryAfterMs') return failure.retryAfterMs
+  if (key === 'accepted') return failure.accepted
+  const details = failure.details
   return details && typeof details === 'object'
     ? (details as Record<string, unknown>)[key]
     : undefined
 }
 
 function steerFallbackSafe(err: unknown): boolean {
-  return rpcErrorDetail(err, 'fallback_safe') === true
-    || rpcErrorDetail(err, 'fallbackSafe') === true
+  return turnFailureDetail(err, 'fallback_safe') === true
+    || turnFailureDetail(err, 'fallbackSafe') === true
 }
 
 interface AcceptedErrorInfo {
@@ -367,17 +375,17 @@ interface AcceptedErrorInfo {
 }
 
 function acceptedErrorInfo(err: unknown): AcceptedErrorInfo | null {
-  const rpcError = err as RpcClientError | null | undefined
-  if (rpcError?.accepted !== true) return null
-  const details = rpcError.details && typeof rpcError.details === 'object'
-    ? rpcError.details as Record<string, unknown>
+  const failure = turnCommandFailure(err)
+  if (failure?.accepted !== true) return null
+  const details = failure.details && typeof failure.details === 'object'
+    ? failure.details as Record<string, unknown>
     : {}
   const rawMessageId = details.orphan_message_id ?? details.orphanMessageId
   const rawSessionKey = details.session_key ?? details.sessionKey
   return {
     messageId: typeof rawMessageId === 'string' ? rawMessageId : '',
     sessionKey: typeof rawSessionKey === 'string' ? rawSessionKey : '',
-    terminalWithoutTask: rpcError.code === 'QUEUE_FULL_DIRTY',
+    terminalWithoutTask: failure.failureCode === 'QUEUE_FULL_DIRTY',
   }
 }
 
@@ -1170,16 +1178,16 @@ export function useChatSend(options: UseChatSendOptions) {
           )
           if (await settleRecoveredAcceptance(attempt, response)) return
         } catch (error: unknown) {
-          const rpcError = error as RpcClientError | null | undefined
+          const commandError = turnCommandFailure(error)
           const accepted = acceptedErrorInfo(error)
-          if (rpcError?.accepted === false || accepted?.terminalWithoutTask) {
+          if (commandError?.accepted === false || accepted?.terminalWithoutTask) {
             attempt.acceptanceResolved = true
             if (attempt.stopRequested) clearAttemptStop(attempt)
             if (
               attempt.hiddenControl
               && (
                 accepted?.terminalWithoutTask
-                || (rpcError?.accepted === false && rpcError.retryable === false)
+                || (commandError?.accepted === false && commandError.retryable === false)
               )
             ) {
               removeHiddenControl(
@@ -1778,9 +1786,9 @@ export function useChatSend(options: UseChatSendOptions) {
               await finalizeRecoveredHandoff(replayRecord, accepted.sessionKey)
               break
             }
-            const rpcError = error as RpcClientError | null | undefined
+            const commandError = turnCommandFailure(error)
             const code = errorCode(error)
-            const definitelyRejected = rpcError?.accepted === false
+            const definitelyRejected = commandError?.accepted === false
             const canRefreshExpiredAttachments = (
               definitelyRejected
               && !refreshedExpiredAttachments
@@ -1819,7 +1827,7 @@ export function useChatSend(options: UseChatSendOptions) {
                 continue
               }
             }
-            if (definitelyRejected && rpcError?.retryable === false) {
+            if (definitelyRejected && commandError?.retryable === false) {
               await wal.putHandoff?.({
                 ...replayRecord,
                 state: 'failed',
@@ -2181,7 +2189,7 @@ export function useChatSend(options: UseChatSendOptions) {
       }, pendingItem)
       return 'accepted'
     } catch (error: unknown) {
-      const accepted = (error as RpcClientError | null | undefined)?.accepted
+      const accepted = turnCommandFailure(error)?.accepted
       const sessionChanged = options.sessionKey.value !== requestSessionKey
       if (accepted === true) {
         if (sessionChanged) {
@@ -2193,12 +2201,12 @@ export function useChatSend(options: UseChatSendOptions) {
           clientMessageId: params.client_message_id,
           expectedTurnId: params.expected_turn_id,
           userMessageId: String(
-          rpcErrorDetail(error, 'user_message_id')
-          || rpcErrorDetail(error, 'message_id')
+          turnFailureDetail(error, 'user_message_id')
+          || turnFailureDetail(error, 'message_id')
           || '',
           ),
-          disposition: (rpcErrorDetail(error, 'disposition') || 'steering') as ChatMessage['inputDisposition'],
-          turnId: String(rpcErrorDetail(error, 'turn_id') || params.expected_turn_id),
+          disposition: (turnFailureDetail(error, 'disposition') || 'steering') as ChatMessage['inputDisposition'],
+          turnId: String(turnFailureDetail(error, 'turn_id') || params.expected_turn_id),
         }, pendingItem)
         return 'accepted'
       }
@@ -2213,15 +2221,15 @@ export function useChatSend(options: UseChatSendOptions) {
       if (accepted !== false) {
         options.steerDelivery.markRetryable(pendingItem, 'acceptance_unknown', {
           code: errorCode(error),
-          retryAfterMs: Number(rpcErrorDetail(error, 'retry_after_ms')) || undefined,
+          retryAfterMs: Number(turnFailureDetail(error, 'retry_after_ms')) || undefined,
         })
         if (!sessionChanged) options.scheduleHistorySync()
         return 'retryable_failure'
       }
-      if (rpcErrorDetail(error, 'retryable') === true) {
+      if (turnFailureDetail(error, 'retryable') === true) {
         options.steerDelivery.markRetryable(pendingItem, 'retryable_rejected', {
           code: errorCode(error),
-          retryAfterMs: Number(rpcErrorDetail(error, 'retry_after_ms')) || undefined,
+          retryAfterMs: Number(turnFailureDetail(error, 'retry_after_ms')) || undefined,
         })
         return 'retryable_failure'
       }
@@ -3275,7 +3283,7 @@ export function useChatSend(options: UseChatSendOptions) {
       }
       return 'accepted'
     } catch (err: unknown) {
-      const rpcError = err as RpcClientError | null | undefined
+      const commandError = turnCommandFailure(err)
       const acceptedError = acceptedErrorInfo(err)
       if (!acceptedError) setAttemptPromptAnnotations(attempt, [])
       if (acceptedError && !commitAcceptedVisibleReplay({
@@ -3315,7 +3323,7 @@ export function useChatSend(options: UseChatSendOptions) {
       const stoppedByUser = acceptanceTransaction.stoppedByUser
         || responseHandoff?.stoppedByUser === true
       if (stoppedByUser) {
-        if (acceptedError?.terminalWithoutTask || rpcError?.accepted === false) {
+        if (acceptedError?.terminalWithoutTask || commandError?.accepted === false) {
           clearAcceptanceStop(acceptanceTransaction)
         } else if (hasUnknownAcceptance(err)) {
           void options.reconcileTaskOwnership?.()
@@ -3326,7 +3334,7 @@ export function useChatSend(options: UseChatSendOptions) {
         if (attempt.stopRequested || attempt.autoRecoverAcceptance) {
           scheduleAcceptanceRecovery(attempt)
         }
-      } else if (rpcError?.accepted === false || acceptedError?.terminalWithoutTask) {
+      } else if (commandError?.accepted === false || acceptedError?.terminalWithoutTask) {
         attempt.acceptanceResolved = true
       }
       if (
@@ -3401,10 +3409,10 @@ export function useChatSend(options: UseChatSendOptions) {
         options.activeStreamSessionKey.value = ''
         options.stream.endStreaming()
       }
-      if (responseHandoff && rpcError?.accepted === false) {
-        if (sendOpts.requirePreparedHandoff && rpcError.retryable !== false) {
+      if (responseHandoff && commandError?.accepted === false) {
+        if (sendOpts.requirePreparedHandoff && commandError.retryable !== false) {
           await resetResponseHandoffForRetry(responseHandoff, attempt)
-        } else if (rpcError.retryable === false) {
+        } else if (commandError.retryable === false) {
           await markResponseHandoffFailed(responseHandoff, err)
         }
       }
@@ -4036,9 +4044,9 @@ export function useChatSend(options: UseChatSendOptions) {
         requestSessionKey,
       )
     } catch (err: unknown) {
-      const rpcError = err as RpcClientError | null | undefined
+      const commandError = turnCommandFailure(err)
       const acceptedError = acceptedErrorInfo(err)
-      const accepted = rpcError?.accepted
+      const accepted = commandError?.accepted
       if (accepted === true) {
         if (
           hiddenSessionIntent
@@ -4136,7 +4144,7 @@ export function useChatSend(options: UseChatSendOptions) {
           requestSessionKey,
         )
       }
-      if (accepted === false && rpcError?.retryable === false) {
+      if (accepted === false && commandError?.retryable === false) {
         removeHiddenControl(
           requestSessionKey,
           stableClientRequestId,

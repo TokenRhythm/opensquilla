@@ -3209,13 +3209,21 @@ class _SelectorFallbackProvider:
         }
         if getattr(active_provider, "execution_context_aware", False):
             primary_chat_kwargs["execution_context"] = execution_context
-        primary_stream = account_provider_stream(
-            lambda: _selector_safe_stream(
+
+        def primary_stream_factory() -> AsyncGenerator[Any, None]:
+            return _selector_safe_stream(
                 lambda: active_provider.chat(messages, **primary_chat_kwargs),
                 content_started=lambda: emitted_user_visible_content,
-            ),
-            provider=active_provider_id,
-            model=active_model,
+            )
+
+        primary_stream = (
+            primary_stream_factory()
+            if provider_accounts_physical_usage(active_provider)
+            else account_provider_stream(
+                primary_stream_factory,
+                provider=active_provider_id,
+                model=active_model,
+            )
         )
         try:
             async for event in primary_stream:
@@ -3566,8 +3574,8 @@ class _SelectorFallbackProvider:
                             event,
                         ),
                     )
-                    fallback_stream = account_provider_stream(
-                        lambda: _selector_safe_stream(
+                    def fallback_stream_factory() -> AsyncGenerator[Any, None]:
+                        return _selector_safe_stream(
                             lambda: fallback_provider.chat(
                                 messages,
                                 tools=tools,
@@ -3583,9 +3591,16 @@ class _SelectorFallbackProvider:
                                 ),
                             ),
                             content_started=lambda: fallback_committed,
-                        ),
-                        provider=fallback_provider_id,
-                        model=fallback_model,
+                        )
+
+                    fallback_stream = (
+                        fallback_stream_factory()
+                        if provider_accounts_physical_usage(fallback_provider)
+                        else account_provider_stream(
+                            fallback_stream_factory,
+                            provider=fallback_provider_id,
+                            model=fallback_model,
+                        )
                     )
                     fallback_buffer = _SelectorPreTextBuffer()
                     fallback_committed = False

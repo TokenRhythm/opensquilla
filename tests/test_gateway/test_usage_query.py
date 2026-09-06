@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from opensquilla.gateway.rpc.registry import RpcContext
-from opensquilla.gateway.rpc_usage import _handle_usage_query
+from opensquilla.gateway.rpc_usage import _query_usage
 from opensquilla.gateway.usage_query import (
     UsageQueryValidationError,
     _finish_totals,
@@ -1239,7 +1239,7 @@ async def test_usage_query_rpc_reads_the_additive_storage_surface() -> None:
         session_manager=SimpleNamespace(storage=storage),
     )
 
-    payload = await _handle_usage_query(
+    payload = await _query_usage(
         {
             "range": {"fromMs": now - 60_000, "toMs": now},
             "timezone": "UTC",

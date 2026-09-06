@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Browser extensions can now reach state-changing HTTP and WebSocket endpoints
+  through a loopback request authority when their exact custom-scheme origin
+  (for example `chrome-extension://<id>`) is listed in `cors.allowed_origins`.
+  Non-loopback request authorities remain rejected by those guards, `"*"` is
+  never accepted, and existing CORS response-header behavior is unchanged.
+
 ## [0.5.4] - 2026-08-25
 
 ### Added

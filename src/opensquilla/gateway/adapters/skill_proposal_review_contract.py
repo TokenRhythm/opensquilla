@@ -1,0 +1,62 @@
+"""Generated Contract registration for Skill proposal review methods."""
+
+from __future__ import annotations
+
+from collections.abc import Awaitable, Callable
+from typing import Any, Final
+
+from opensquilla.gateway.adapters._generated_contract_bindings import (
+    generated_contract_bindings,
+    register_generated_contract_binding,
+)
+from opensquilla.gateway.adapters.contract_method import (
+    ErrorFactory,
+    GuestAllowedChecker,
+    MethodRegistry,
+)
+
+SKILL_PROPOSAL_REVIEW_CONTRACT_METHODS: Final = (
+    "exec.proposals.list",
+    "exec.proposals.show",
+    "exec.proposals.accept",
+    "exec.proposals.reject",
+    "exec.proposals.auto_enabled.list",
+    "exec.proposals.auto_enabled.disable",
+    "exec.proposals.settings.get",
+    "exec.proposals.settings.set",
+)
+
+
+class SkillProposalReviewContractError(ValueError):
+    """A successful proposal response violated its generated Contract."""
+
+
+_BINDINGS: Final = generated_contract_bindings(
+    SKILL_PROPOSAL_REVIEW_CONTRACT_METHODS,
+    SkillProposalReviewContractError,
+)
+
+
+def register_skill_proposal_review_contract[ContextT, ResultT](
+    registry: MethodRegistry[ContextT],
+    method: str,
+    implementation: Callable[[Any, ContextT], Awaitable[ResultT]],
+    *,
+    internal_error: ErrorFactory,
+    guest_allowed_checker: GuestAllowedChecker,
+) -> Callable[[Any, ContextT], Awaitable[ResultT]]:
+    return register_generated_contract_binding(
+        registry,
+        _BINDINGS,
+        method,
+        implementation,
+        internal_error=internal_error,
+        guest_allowed_checker=guest_allowed_checker,
+    )
+
+
+__all__ = [
+    "SKILL_PROPOSAL_REVIEW_CONTRACT_METHODS",
+    "SkillProposalReviewContractError",
+    "register_skill_proposal_review_contract",
+]

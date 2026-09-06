@@ -1,4 +1,6 @@
 import type { InjectionKey } from 'vue'
+import type { Ref, ShallowRef } from 'vue'
+import type { NativeWorkbenchApi, PlatformId } from '@/platform/types'
 import type {
   ArtifactChangeSet,
   ArtifactDocument,
@@ -16,6 +18,7 @@ import type {
 } from '@/types/artifactDocuments'
 import type { ArtifactPayload } from '@/types/artifacts'
 import type { DisplayAttachment } from '@/types/chat'
+import type { ArtifactWorkbenchPreviewKind } from '@/utils/workbench/artifactPreview'
 import type {
   DocumentImportResponse,
   DocumentPublishResponse,
@@ -35,6 +38,60 @@ import type {
   PromptAnnotationUpdateRequest,
 } from '@/types/promptAnnotations'
 
+export interface OpenArtifactDocument {
+  readonly sessionKey: string
+  readonly artifactId: string
+}
+
+export interface CloseArtifactDocument {
+  readonly sessionKey: string
+  readonly documentId: string
+}
+
+export interface RenameArtifactDocument extends CloseArtifactDocument {
+  readonly expectedStateRevision: number
+  readonly name: string
+}
+
+export interface RestoreArtifactRevision extends CloseArtifactDocument {
+  readonly revisionId: string
+  readonly expectedHeadRevisionId: string
+  readonly expectedStateRevision: number
+  readonly clientRequestId?: string
+  readonly idempotencyKey?: string
+}
+
+export interface RevertArtifactChangeSet extends CloseArtifactDocument {
+  readonly changeSetId: string
+  readonly expectedHeadRevisionId: string
+  readonly expectedStateRevision: number
+  readonly clientRequestId?: string
+  readonly idempotencyKey?: string
+}
+
+export interface ReadArtifactSource extends CloseArtifactDocument {
+  readonly revisionId?: string
+}
+
+export interface ArtifactSourceChange {
+  readonly startOffset: number
+  readonly endOffset: number
+  readonly replacement: string
+}
+
+export interface PatchArtifactSource extends CloseArtifactDocument {
+  readonly expectedHeadRevisionId: string
+  readonly expectedSourceSha256: string
+  readonly expectedStateRevision: number
+  readonly patches: readonly [ArtifactSourceChange, ...ArtifactSourceChange[]]
+  readonly offsetEncoding?: 'unicode-code-point'
+  readonly editSessionId?: string
+  readonly expectedEditSessionStateRevision?: number
+  readonly expectedLastSavedRevisionId?: string
+  readonly clientRequestId?: string
+  readonly idempotencyKey?: string
+}
+
 export interface ArtifactDocumentProvider {
   getCapabilities(signal?: AbortSignal): Promise<ArtifactEditCapabilities>
   listDocuments(sessionKey: string, signal?: AbortSignal): Promise<ArtifactDocument[]>
@@ -43,13 +100,13 @@ export interface ArtifactDocumentProvider {
   listRevisions(documentId: string, sessionKey: string, signal?: AbortSignal): Promise<ArtifactRevision[]>
   listChangeSets(documentId: string, sessionKey: string, signal?: AbortSignal): Promise<ArtifactChangeSet[]>
   getChangeSet(documentId: string, changeSetId: string, sessionKey: string, signal?: AbortSignal): Promise<ArtifactChangeSet | null>
-  openDocument(request: Readonly<Record<string, unknown>>, signal?: AbortSignal): Promise<{ document: ArtifactDocument | null; editSession: ArtifactEditSession | null }>
-  closeDocument(request: Readonly<Record<string, unknown>>, signal?: AbortSignal): Promise<ArtifactDocument | null>
-  renameDocument(request: Readonly<Record<string, unknown>>, signal?: AbortSignal): Promise<ArtifactDocument | null>
-  restoreRevision(request: Readonly<Record<string, unknown>>, signal?: AbortSignal): Promise<ArtifactRevision | null>
-  revertChangeSet(request: Readonly<Record<string, unknown>>, signal?: AbortSignal): Promise<ArtifactChangeSet | null>
-  readSource(request: Readonly<Record<string, unknown>>, signal?: AbortSignal): Promise<ArtifactSourceSnapshot | null>
-  patchSource(request: Readonly<Record<string, unknown>>, signal?: AbortSignal): Promise<ArtifactSourcePatchResult | null>
+  openDocument(request: OpenArtifactDocument, signal?: AbortSignal): Promise<{ document: ArtifactDocument | null; editSession: ArtifactEditSession | null }>
+  closeDocument(request: CloseArtifactDocument, signal?: AbortSignal): Promise<ArtifactDocument | null>
+  renameDocument(request: RenameArtifactDocument, signal?: AbortSignal): Promise<ArtifactDocument | null>
+  restoreRevision(request: RestoreArtifactRevision, signal?: AbortSignal): Promise<ArtifactRevision | null>
+  revertChangeSet(request: RevertArtifactChangeSet, signal?: AbortSignal): Promise<ArtifactChangeSet | null>
+  readSource(request: ReadArtifactSource, signal?: AbortSignal): Promise<ArtifactSourceSnapshot | null>
+  patchSource(request: PatchArtifactSource, signal?: AbortSignal): Promise<ArtifactSourcePatchResult | null>
   resolveMutation?(request: ArtifactMutationResolutionRequest, signal?: AbortSignal): Promise<ArtifactMutationResolution | null>
   startEditSession?(request: ArtifactEditSessionStartRequest, signal?: AbortSignal): Promise<ArtifactEditSession | null>
   heartbeatEditSession?(request: ArtifactEditSessionHeartbeatRequest, signal?: AbortSignal): Promise<ArtifactEditSession | null>
@@ -85,6 +142,22 @@ export interface ArtifactCatalog {
     sessionKey: string,
     options?: { readonly limit?: number; readonly signal?: AbortSignal },
   ): Promise<ArtifactPayload[] | null>
+}
+
+export type ArtifactCatalogErrorKind = 'aborted' | 'timeout' | 'unavailable' | 'invalid'
+export type ArtifactCatalogPhase = 'connect' | 'list'
+
+/** Artifact-index read failure projected by the Gateway Adapter. */
+export class ArtifactCatalogError extends Error {
+  constructor(
+    readonly kind: ArtifactCatalogErrorKind,
+    readonly phase: ArtifactCatalogPhase,
+    message: string,
+    readonly cause?: unknown,
+  ) {
+    super(message)
+    this.name = 'ArtifactCatalogError'
+  }
 }
 
 export interface ArtifactWorkbenchSubscription {
@@ -150,6 +223,165 @@ export interface ArtifactContentAccess {
   uploadAttachment(file: File, mime: string): Promise<AttachmentUploadReceipt>
 }
 
+export type ArtifactPreviewState = 'idle' | 'loading' | 'loaded' | 'timeout' | 'error'
+export type ArtifactPreviewErrorCode = 'network' | 'too_large' | 'unsupported' | null
+
+export interface ArtifactPreviewOptions {
+  artifact: () => ArtifactPayload
+  sessionKey?: () => string | undefined
+  variant?: 'content' | 'thumbnail'
+  fullSize?: boolean
+  timeoutMs?: number
+  maxRetries?: number
+  maxBytes?: number
+  requireSameOrigin?: boolean
+  acceptBlob?: (blob: Blob) => boolean
+}
+
+export interface ArtifactPreviewController {
+  state: Ref<ArtifactPreviewState>
+  errorCode: Ref<ArtifactPreviewErrorCode>
+  progress: Ref<number | null>
+  objectUrl: ShallowRef<string>
+  load(): void
+  retry(): void
+  observe(el: Element | null): void
+  release(): void
+  dispose(): void
+}
+
+export type ArtifactPreviewResourceState =
+  | 'crashed'
+  | 'error'
+  | 'idle'
+  | 'loading'
+  | 'missing-resource'
+  | 'offline'
+  | 'ready'
+  | 'ready-with-warnings'
+  | 'suspended'
+  | 'unsupported'
+
+export type ArtifactPreviewResourceErrorCode =
+  | 'download-failed'
+  | 'integrity-error'
+  | 'invalid-content'
+  | 'missing-url'
+  | 'native-error'
+  | 'native-crashed'
+  | 'offline'
+  | 'preview-blocked'
+  | 'too-large'
+  | 'unsupported'
+
+export interface NativeHtmlArtifactResource {
+  artifact: ArtifactPayload
+  data: ArrayBuffer
+  hasRelativeResources: boolean
+  mime: string
+  relativeResourceCount: number
+  sessionKey: string
+}
+
+export interface ArtifactPreviewResourceOptions {
+  artifact: () => ArtifactPayload
+  createObjectUrl?: (blob: Blob) => string
+  htmlCollectionStatus?: () => 'complete' | 'partial' | 'not_applicable'
+  htmlLaunchUrl?: () => string
+  htmlLeaseState?: () => 'ready' | 'pending' | 'blocked'
+  nativeHtml?: () => boolean
+  onNativeHtmlReady?: (resource: NativeHtmlArtifactResource) => void
+  revokeObjectUrl?: (url: string) => void
+  sessionKey?: () => string
+}
+
+export interface ArtifactPreviewResourceController {
+  errorCode: Ref<ArtifactPreviewResourceErrorCode | null>
+  kind: Ref<ArtifactWorkbenchPreviewKind>
+  markdownHtml: ShallowRef<string>
+  objectUrl: ShallowRef<string>
+  progress: Ref<number | null>
+  relativeResources: ShallowRef<string[]>
+  state: Ref<ArtifactPreviewResourceState>
+  text: ShallowRef<string>
+  dispose(): void
+  load(): Promise<void>
+  markNativeCrashed(): void
+  markNativeError(): void
+  reload(): Promise<void>
+  resume(): Promise<void>
+  suspend(): void
+}
+
+export type ArtifactPreviewMode = 'full' | 'offline'
+export type ArtifactPreviewCollectionStatus = 'complete' | 'partial' | 'not_applicable'
+
+export interface ArtifactPreviewLeaseSource {
+  kind: 'bundle' | 'single_file'
+  collection_status: ArtifactPreviewCollectionStatus
+  file_count: number
+  total_bytes: number
+  warning_codes: string[]
+}
+
+export interface ArtifactPreviewLease {
+  version: 1
+  lease_id: string
+  effective_mode: ArtifactPreviewMode
+  launch_url: string
+  entrypoint: string
+  expires_at: string
+  preview_origin: string | null
+  idle_timeout_seconds: number
+  source: ArtifactPreviewLeaseSource
+}
+
+export interface ArtifactPreviewLeaseRenewal {
+  version: 1
+  lease_id: string
+  expires_at: string
+}
+
+export type ArtifactPreviewNativeBroker = Pick<
+  NativeWorkbenchApi,
+  | 'createArtifactPreviewLease'
+  | 'renewArtifactPreviewLease'
+  | 'revokeArtifactPreviewLease'
+>
+
+export interface ArtifactPreviewLeaseRequest {
+  nativeBroker?: ArtifactPreviewNativeBroker
+  sessionKey?: string
+}
+
+export class ArtifactPreviewLeaseError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code = '',
+  ) {
+    super(message)
+    this.name = 'ArtifactPreviewLeaseError'
+  }
+}
+
+/** Named preview capability; generic HTTP remains private to its v4 Adapter. */
+export interface ArtifactPreviewAccess {
+  create(options: ArtifactPreviewOptions): ArtifactPreviewController
+  createResource(options: ArtifactPreviewResourceOptions): ArtifactPreviewResourceController
+  createLease(
+    artifact: ArtifactPayload,
+    mode: ArtifactPreviewMode,
+    client: PlatformId,
+    request?: ArtifactPreviewLeaseRequest,
+  ): Promise<ArtifactPreviewLease>
+  renewLease(
+    leaseId: string,
+    request?: ArtifactPreviewLeaseRequest,
+  ): Promise<ArtifactPreviewLeaseRenewal>
+  revokeLease(leaseId: string, request?: ArtifactPreviewLeaseRequest): Promise<void>
+}
+
 /** One semantic Workbench boundary; wire methods stay in its v4 Adapter. */
 export interface ArtifactWorkbench {
   readonly artifacts: ArtifactCatalog
@@ -157,7 +389,7 @@ export interface ArtifactWorkbench {
   readonly resources: WorkbenchResourceProvider
   readonly promptAnnotations: ArtifactPromptAnnotationProvider
   readonly content: ArtifactContentAccess
-  ready(): Promise<void>
+  readonly previews: ArtifactPreviewAccess
   subscribeDocumentChanges(
     listener: (change: ArtifactDocumentChange) => void,
   ): ArtifactWorkbenchSubscription

@@ -34,8 +34,18 @@ import type { WorkspaceCatalog } from '@/modules/workspaceCatalog'
 import { createV4WorkspaceCatalog } from './workspaceCatalogV4'
 import type { SandboxRuntime } from '@/modules/sandboxRuntime'
 import { createV4SandboxRuntime } from './sandboxRuntimeV4'
-import type { SessionConversation } from '@/modules/sessionConversation'
-import { createV4SessionConversation } from './sessionConversationV4'
+import type { UsageReporting } from '@/modules/usageReporting'
+import { createV4UsageReporting } from './usageReportingV4'
+import type { CommandCatalog } from '@/modules/commandCatalog'
+import { createV4CommandCatalog } from './commandCatalogV4'
+import type { RouteFeedback } from '@/modules/routeFeedback'
+import { createV4RouteFeedback } from './routeFeedbackV4'
+import type { PromptCacheLease } from '@/modules/promptCacheLease'
+import { createV4PromptCacheLease } from './promptCacheLeaseV4'
+import type { ClarificationSubmission } from '@/modules/clarificationSubmission'
+import { createV4ClarificationSubmission } from './clarificationSubmissionV4'
+import type { SessionMaintenance } from '@/modules/sessionMaintenance'
+import { createV4SessionMaintenance } from './sessionMaintenanceV4'
 import type { Observability } from '@/modules/observability'
 import { createV4Observability } from './observabilityV4'
 import type { SkillCatalog } from '@/modules/skillCatalog'
@@ -89,7 +99,12 @@ export interface GatewayAdapters {
   readonly migrationOperations: MigrationOperations
   readonly workspaceCatalog: WorkspaceCatalog
   readonly sandboxRuntime: SandboxRuntime
-  readonly sessionConversation: SessionConversation
+  readonly usageReporting: UsageReporting
+  readonly commandCatalog: CommandCatalog
+  readonly routeFeedback: RouteFeedback
+  readonly promptCacheLease: PromptCacheLease
+  readonly clarificationSubmission: ClarificationSubmission
+  readonly sessionMaintenance: SessionMaintenance
   readonly observability: Observability
   readonly skillCatalog: SkillCatalog
   readonly agentCatalog: AgentCatalog
@@ -112,6 +127,12 @@ export function createGatewayAdapters(
 ): GatewayAdapters {
   const transports = createPrivateGatewayTransports(source)
   const http: HttpTransport = options.http ?? {
+    clearPreviewOrigin: async () => {
+      throw new Error('Gateway HTTP transport is unavailable.')
+    },
+    fetchExternalArtifact: async () => {
+      throw new Error('Gateway HTTP transport is unavailable.')
+    },
     requestJson: async () => {
       throw new Error('Gateway HTTP transport is unavailable.')
     },
@@ -128,12 +149,7 @@ export function createGatewayAdapters(
   const sessionReadLifecycleFactory = createSessionReadLifecycleFactory(
     createV4SessionReadPort(transports.rpc, { concurrentHistoryReads }),
   )
-  const conversationEvents = createConversationEventTransport({
-    on(event, handler) {
-      const subscription = transports.events.subscribe(event, handler)
-      return () => subscription.close()
-    },
-  })
+  const conversationEvents = createConversationEventTransport(transports.events)
   const adapters: GatewayAdapters = {
     gatewayAccess,
     conversationEvents,
@@ -157,12 +173,17 @@ export function createGatewayAdapters(
     planCenter: createV4PlanCenter(transports.rpc, transports.events),
     metaRunCenter: createV4MetaRunCenter(transports.rpc, transports.events),
     appSettings: createV4AppSettings(transports.rpc),
-    providerConfiguration: createV4ProviderConfiguration(transports.rpc),
+    providerConfiguration: createV4ProviderConfiguration(transports.rpc, transports.events),
     setupWorkflow: createV4SetupWorkflow(transports.rpc),
     migrationOperations: createV4MigrationOperations(transports.rpc),
     workspaceCatalog: createV4WorkspaceCatalog(transports.rpc),
     sandboxRuntime: createV4SandboxRuntime(transports.rpc, transports.events),
-    sessionConversation: createV4SessionConversation(transports.rpc, transports.events),
+    usageReporting: createV4UsageReporting(transports.rpc),
+    commandCatalog: createV4CommandCatalog(transports.rpc),
+    routeFeedback: createV4RouteFeedback(transports.rpc),
+    promptCacheLease: createV4PromptCacheLease(transports.rpc),
+    clarificationSubmission: createV4ClarificationSubmission(transports.rpc),
+    sessionMaintenance: createV4SessionMaintenance(transports.rpc),
     observability: createV4Observability(transports.rpc, http),
     skillCatalog: createV4SkillCatalog(transports.rpc),
     agentCatalog: createV4AgentCatalog(transports.rpc),

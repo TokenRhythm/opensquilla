@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -108,9 +109,7 @@ def test_event_contract_uses_declared_frame_as_validator_target(tmp_path: Path) 
 
     assert spec.contract_type == "event"
     assert spec.semantic_kind == "event"
-    assert spec.targets == (
-        ("frame", "SessionsChangedEventFrame"),
-    )
+    assert spec.targets == (("frame", "SessionsChangedEventFrame"),)
 
 
 def test_event_contract_rejects_boolean_schema_version(tmp_path: Path) -> None:
@@ -135,9 +134,7 @@ def test_event_contract_rejects_boolean_schema_version(tmp_path: Path) -> None:
 
 def test_event_python_renderer_tightens_reachable_optional_fields() -> None:
     spec = next(
-        spec
-        for spec in runner.discover_contracts()
-        if spec.wire_name == "sessions.changed"
+        spec for spec in runner.discover_contracts() if spec.wire_name == "sessions.changed"
     )
     generated = (
         "from pydantic import BaseModel\n\n"
@@ -155,9 +152,7 @@ def test_event_python_renderer_tightens_reachable_optional_fields() -> None:
 
 def test_json_number_renderer_accepts_one_line_pydantic_imports() -> None:
     spec = next(
-        spec
-        for spec in runner.discover_contracts()
-        if spec.wire_name == "sessions.changed"
+        spec for spec in runner.discover_contracts() if spec.wire_name == "sessions.changed"
     )
     generated = (
         "from __future__ import annotations\n"
@@ -199,48 +194,34 @@ def test_contract_cannot_overwrite_aggregate_registry(tmp_path: Path) -> None:
     ("mutation", "message"),
     [
         (
-            lambda schema: schema.update(
-                {"$schema": "http://json-schema.org/draft-07/schema#"}
-            ),
+            lambda schema: schema.update({"$schema": "http://json-schema.org/draft-07/schema#"}),
             "2020-12",
         ),
         (lambda schema: schema.pop("x-opensquilla-codegen"), "pinned toolchain"),
         (lambda schema: schema["x-opensquilla-method"].pop("scope"), "scope"),
         (
-            lambda schema: schema["x-opensquilla-method"].update(
-                {"guestAllowed": "yes"}
-            ),
+            lambda schema: schema["x-opensquilla-method"].update({"guestAllowed": "yes"}),
             "guestAllowed",
         ),
         (lambda schema: schema["x-opensquilla-method"].pop("errors"), "errors"),
         (
-            lambda schema: schema["x-opensquilla-wire"].update(
-                {"protocol": "invented-wire"}
-            ),
+            lambda schema: schema["x-opensquilla-wire"].update({"protocol": "invented-wire"}),
             "protocol",
         ),
         (
-            lambda schema: schema["x-opensquilla-method"].update(
-                {"name": "Sessions Invalid"}
-            ),
+            lambda schema: schema["x-opensquilla-method"].update({"name": "Sessions Invalid"}),
             "method name",
         ),
         (
-            lambda schema: schema["x-opensquilla-method"].update(
-                {"scope": "operator/read"}
-            ),
+            lambda schema: schema["x-opensquilla-method"].update({"scope": "operator/read"}),
             "scope",
         ),
         (
-            lambda schema: schema["x-opensquilla-method"].update(
-                {"kind": "stream"}
-            ),
+            lambda schema: schema["x-opensquilla-method"].update({"kind": "stream"}),
             "method kind",
         ),
         (
-            lambda schema: schema["x-opensquilla-method"].update(
-                {"idempotency": "sometimes"}
-            ),
+            lambda schema: schema["x-opensquilla-method"].update({"idempotency": "sometimes"}),
             "idempotency",
         ),
         (
@@ -278,9 +259,7 @@ def test_contract_cannot_overwrite_aggregate_registry(tmp_path: Path) -> None:
             "local \\$defs reference",
         ),
         (
-            lambda schema: schema["x-opensquilla-method"].update(
-                {"result": "#/$defs/not-legal"}
-            ),
+            lambda schema: schema["x-opensquilla-method"].update({"result": "#/$defs/not-legal"}),
             "legal identifier",
         ),
     ],
@@ -296,6 +275,159 @@ def test_invalid_generation_metadata_fails_before_tool_execution(
     schema = _write_schema(tmp_path, "sessions/sessions-resolve.schema.json", document)
 
     with pytest.raises(runner.ContractConfigurationError, match=message):
+        runner.load_contract(schema, contract_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    (
+        "onboarding.channel.invalid",
+        "onboarding.channel.not_found",
+    ),
+)
+def test_only_declared_legacy_channel_error_codes_allow_dots(
+    tmp_path: Path,
+    error_code: str,
+) -> None:
+    document = _method_schema("onboarding.channel.probe")
+    document["x-opensquilla-method"]["errors"] = [
+        {"code": error_code},
+        {"code": "INTERNAL_ERROR"},
+    ]
+    schema = _write_schema(
+        tmp_path,
+        "platform/onboarding-channel-probe.schema.json",
+        document,
+    )
+
+    spec = runner.load_contract(schema, contract_root=tmp_path)
+
+    assert spec.metadata["errors"][0]["code"] == error_code
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    (
+        "migration.invalid_params",
+        "migration.candidate_unavailable",
+        "migration.unavailable",
+        "migration.preview_unavailable",
+    ),
+)
+def test_only_declared_legacy_migration_error_codes_allow_dots(
+    tmp_path: Path,
+    error_code: str,
+) -> None:
+    document = _method_schema("migration.sources.preview")
+    document["x-opensquilla-method"]["errors"] = [
+        {"code": error_code},
+        {"code": "INTERNAL_ERROR"},
+    ]
+    schema = _write_schema(
+        tmp_path,
+        "platform/migration-sources-preview.schema.json",
+        document,
+    )
+
+    spec = runner.load_contract(schema, contract_root=tmp_path)
+
+    assert spec.metadata["errors"][0]["code"] == error_code
+
+
+def test_undeclared_migration_dotted_error_code_remains_rejected(
+    tmp_path: Path,
+) -> None:
+    document = _method_schema("migration.sources.preview")
+    document["x-opensquilla-method"]["errors"] = [{"code": "migration.unknown"}]
+    schema = _write_schema(
+        tmp_path,
+        "platform/migration-sources-preview.schema.json",
+        document,
+    )
+
+    with pytest.raises(runner.ContractConfigurationError, match="error code"):
+        runner.load_contract(schema, contract_root=tmp_path)
+
+
+def test_undeclared_dotted_error_code_remains_rejected(tmp_path: Path) -> None:
+    document = _method_schema("onboarding.channel.probe")
+    document["x-opensquilla-method"]["errors"] = [{"code": "onboarding.channel.unknown"}]
+    schema = _write_schema(
+        tmp_path,
+        "platform/onboarding-channel-probe.schema.json",
+        document,
+    )
+
+    with pytest.raises(runner.ContractConfigurationError, match="error code"):
+        runner.load_contract(schema, contract_root=tmp_path)
+
+
+def test_only_the_legacy_status_root_method_is_accepted(tmp_path: Path) -> None:
+    status = _write_schema(
+        tmp_path,
+        "runtime-status.schema.json",
+        _method_schema("status"),
+    )
+    assert runner.load_contract(status, contract_root=tmp_path).wire_name == "status"
+
+    health = _write_schema(
+        tmp_path,
+        "health.schema.json",
+        _method_schema("health"),
+    )
+    with pytest.raises(runner.ContractConfigurationError, match="method name"):
+        runner.load_contract(health, contract_root=tmp_path)
+
+
+def test_exact_legacy_sandbox_create_directory_method_is_accepted(
+    tmp_path: Path,
+) -> None:
+    document = _method_schema("sandbox.path.create_directory")
+    method = document["x-opensquilla-method"]
+    method["name"] = "sandbox.path.create-directory"
+    method["capability"]["name"] = "sandbox.path.create-directory"
+    schema = _write_schema(
+        tmp_path,
+        "sandbox/sandbox-path-create-directory.schema.json",
+        document,
+    )
+
+    spec = runner.load_contract(schema, contract_root=tmp_path)
+
+    assert spec.wire_name == "sandbox.path.create-directory"
+    assert spec.python_stem == "sandbox_path_create_directory"
+    assert spec.typescript_stem == "sandboxPathCreateDirectory"
+    assert spec.constant_prefix == "SANDBOX_PATH_CREATE_DIRECTORY"
+
+
+@pytest.mark.parametrize("metadata_key", ["name", "capability"])
+@pytest.mark.parametrize(
+    "wire_name",
+    [
+        "sandbox.path.create-file",
+        "sandbox.path.-create",
+        "sandbox.path.create--directory",
+        "sandbox.path.create-directory-",
+    ],
+)
+def test_other_hyphenated_method_and_capability_names_remain_illegal(
+    tmp_path: Path,
+    metadata_key: str,
+    wire_name: str,
+) -> None:
+    document = _method_schema("sandbox.path.create_directory")
+    method = document["x-opensquilla-method"]
+    if metadata_key == "name":
+        method["name"] = wire_name
+    else:
+        method["capability"]["name"] = wire_name
+    schema = _write_schema(
+        tmp_path,
+        "sandbox/sandbox-path-create-directory.schema.json",
+        document,
+    )
+
+    with pytest.raises(runner.ContractConfigurationError, match=metadata_key):
         runner.load_contract(schema, contract_root=tmp_path)
 
 
@@ -317,6 +449,81 @@ def test_only_the_exact_production_sessions_list_schema_is_grandfathered(
     )
     with pytest.raises(runner.ContractConfigurationError, match="declare kind"):
         runner.load_contract(copied_schema, contract_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("lifecycle", "canonical_alias", "message"),
+    [
+        ("legacy", None, "canonicalAlias"),
+        ("stable", "sessions.contextCompact", "stable method"),
+        ("legacy", "bad alias", "canonicalAlias"),
+    ],
+)
+def test_legacy_method_lifecycle_requires_one_legal_canonical_alias(
+    tmp_path: Path,
+    lifecycle: str,
+    canonical_alias: str | None,
+    message: str,
+) -> None:
+    document = _method_schema("sessions.compact")
+    method = document["x-opensquilla-method"]
+    method["lifecycle"] = lifecycle
+    if canonical_alias is not None:
+        method["canonicalAlias"] = canonical_alias
+    schema = _write_schema(
+        tmp_path,
+        "sessions/sessions-compact.schema.json",
+        document,
+    )
+
+    with pytest.raises(runner.ContractConfigurationError, match=message):
+        runner.load_contract(schema, contract_root=tmp_path)
+
+
+def test_compatibility_manifest_is_schema_derived_and_deterministic() -> None:
+    specs = runner.discover_contracts()
+
+    first = runner.render_compatibility_manifest(specs)
+    second = runner.render_compatibility_manifest(specs)
+    manifest = json.loads(first)
+
+    assert first == second
+    assert manifest["format"] == 1
+    assert manifest["protocol"] == runner.GATEWAY_PROTOCOL
+    assert manifest["wireVersion"] == 4
+    assert manifest["source"] == {
+        "schemaCount": 224,
+        "methodCount": 215,
+        "eventFamilyCount": 9,
+        "schemaTreeSha256": runner._schema_tree_digest(specs),
+        "generatorSha256": runner._generator_digest(),
+    }
+    assert Counter(entry["lifecycle"] for entry in manifest["methods"]) == {
+        "stable": 210,
+        "legacy": 5,
+    }
+    assert {
+        entry["name"]: entry["canonicalName"]
+        for entry in manifest["methods"]
+        if entry["lifecycle"] == "legacy"
+    } == {
+        "sessions.compact": "sessions.contextCompact",
+        "sessions.steer": "sessions.steer.v2",
+        "plugin.approval.status": "exec.approval.status",
+        "plugin.approval.resolve": "exec.approval.resolve",
+        "plugin.approval.extend": "exec.approval.extend",
+    }
+    assert all(
+        runner.SHA256_PATTERN.fullmatch(entry["schemaSha256"])
+        for entry in [*manifest["methods"], *manifest["events"]]
+    )
+    event_families = {entry["family"]: entry for entry in manifest["events"]}
+    assert len(event_families) == 9
+    assert event_families["models.routing.changed"]["wireNames"] == ["models.routing.changed"]
+    assert "session.event.artifact_state" in event_families["conversation.events"]["wireNames"]
+    assert "session.event.artifact_state" in event_families["document.state_changed"]["wireNames"]
+    assert "private" not in first.lower()
+    assert "allowlist" not in first.lower()
 
 
 @pytest.mark.parametrize(
@@ -361,39 +568,34 @@ def test_aggregate_run_dispatches_every_discovered_contract(
         "sessions/sessions-resolve.schema.json",
         _method_schema("sessions.resolve"),
     )
-    legacy = next(
-        spec for spec in runner.discover_contracts() if spec.wire_name == "sessions.list"
-    )
+    legacy = next(spec for spec in runner.discover_contracts() if spec.wire_name == "sessions.list")
     generic = runner.load_contract(generic_schema, contract_root=tmp_path)
-    calls: list[tuple[str, str]] = []
+    calls: list[str] = []
 
-    def record_call(spec: runner.ContractSpec, mode: runner.Mode) -> int:
-        calls.append((spec.wire_name, mode))
-        return 0
+    def render(spec: runner.ContractSpec, **_: object) -> dict[Path, str]:
+        calls.append(spec.wire_name)
+        return {path: f"artifact {path.name}\n" for path in spec.outputs}
 
+    monkeypatch.setattr(runner, "render_legacy", render)
+    monkeypatch.setattr(runner, "render_generic", render)
     monkeypatch.setattr(
         runner,
-        "_run_legacy",
-        record_call,
+        "_render_validators",
+        lambda spec, roles: {path: f"artifact {path.name}\n" for path in spec.outputs[3:]},
     )
-    monkeypatch.setattr(
-        runner,
-        "_run_generic",
-        record_call,
+    output = tmp_path / "verification"
+    selected = (legacy, generic)
+    assert runner.run("write", selected, profile="verification", output_root=output) == 0
+    assert calls == ["sessions.list", "sessions.resolve"]
+    assert (output / runner.REGISTRATION_OUTPUT.relative_to(runner.ROOT)).read_text() == (
+        runner.render_registration_descriptor(selected)
     )
-    monkeypatch.setattr(
-        runner,
-        "_run_registration_descriptor",
-        lambda specs, mode: 0,
+    assert (output / runner.COMPATIBILITY_MANIFEST_OUTPUT.relative_to(runner.ROOT)).read_text() == (
+        runner.render_compatibility_manifest(selected)
     )
-    monkeypatch.setattr(
-        runner,
-        "reconcile_orphans",
-        lambda expected, mode: 0,
-    )
-
-    assert runner.run("check", (legacy, generic)) == 0
-    assert calls == [("sessions.list", "check"), ("sessions.resolve", "check")]
+    calls.clear()
+    assert runner.run("check", selected, profile="verification", output_root=output) == 0
+    assert calls == ["sessions.list", "sessions.resolve"]
 
 
 def test_generic_renderer_derives_all_adapter_only_artifacts(
@@ -593,14 +795,8 @@ def test_registration_descriptor_exposes_uniform_validation_models() -> None:
     rendered = runner.render_registration_descriptor(specs)
 
     assert "class GatewayMethodContract:" in rendered
-    assert (
-        "GATEWAY_METHOD_CONTRACTS: Final[dict[str, GatewayMethodContract]]"
-        in rendered
-    )
-    assert (
-        "GATEWAY_EVENT_CONTRACTS: Final[dict[str, GatewayEventContract]]"
-        in rendered
-    )
+    assert "GATEWAY_METHOD_CONTRACTS: Final[dict[str, GatewayMethodContract]]" in rendered
+    assert "GATEWAY_EVENT_CONTRACTS: Final[dict[str, GatewayEventContract]]" in rendered
     assert "request_model: type[Any]" in rendered
     assert "params_model: type[Any]" in rendered
     assert "response_model: type[Any]" in rendered
@@ -647,9 +843,7 @@ def test_orphan_reconciliation_handles_contract_rename_and_delete(
     unowned = python_root / "keep_me.py"
     unowned.write_text("# maintained by a human\n", encoding="utf-8")
     expected = (
-        frozenset({python_root / expected_name})
-        if expected_name is not None
-        else frozenset()
+        frozenset({python_root / expected_name}) if expected_name is not None else frozenset()
     )
     roots = (python_root, typescript_root)
 
@@ -666,18 +860,14 @@ def test_hash_manifest_comparison_is_portable_and_fail_closed(tmp_path: Path) ->
     right = tmp_path / "windows.json"
     manifest: dict[str, Any] = {
         "format": 1,
-        "artifacts": {
-            "src/opensquilla/contracts/generated/v4/example.py": "a" * 64
-        },
+        "artifacts": {"src/opensquilla/contracts/generated/v4/example.py": "a" * 64},
     }
     left.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     right.write_text(json.dumps(manifest, separators=(",", ":")), encoding="utf-8")
     assert runner.compare_hash_manifests(left, right) == 0
 
     changed = copy.deepcopy(manifest)
-    changed["artifacts"]["src/opensquilla/contracts/generated/v4/example.py"] = (
-        "b" * 64
-    )
+    changed["artifacts"]["src/opensquilla/contracts/generated/v4/example.py"] = "b" * 64
     right.write_text(json.dumps(changed), encoding="utf-8")
     assert runner.compare_hash_manifests(left, right) == 1
 
@@ -754,19 +944,44 @@ def test_sessions_list_legacy_artifacts_remain_byte_exact() -> None:
     assert sessions_list.uses_legacy_generator is True
 
     expected = {
-        "sessions_list.py": "00a9ad628f2331690ef6db62ba1d6c8c6c5986dcef40564b32407fa3d8199c5d",
+        "sessions_list.py": "c8442279094b301bd1f903793bd58c091be96da896b9f6a031ee8defcbc042bf",
         "sessions_list_metadata.py": (
-            "d17a5ac76fbede14262c1f0c404059f9bf6ec870ab2974c24009b5de5916d122"
+            "62dce72764117870a9055bfcfbe90fc02a6ec32be405896f5eba8888f5d4fe4a"
         ),
-        "sessionsList.ts": "03c17fa7bf72d8be25e562451478c614f4151c7658efaf4f3a0b003cefc41e2f",
+        "sessionsList.ts": "6dff702e0480fca29be404bfcfe28c3231ccc07ede1289e4b79f5a0170c06819",
         "sessionsListValidators.cjs": (
-            "49a3dbb6d0cfc648273768d56036e1e8f4882fe1651b0c88034b0846190ef802"
+            "617ed876b51b73858f87bdfce69282ca7ca0d70ebd7a360ab02d7fd02e494712"
         ),
         "sessionsListValidators.d.cts": (
-            "86e783b3d1b504cf356ae6c1feeddffaccec12ac8b1db2d808bde2d20fa697d3"
+            "dae25ccdadf944a91e8545406bb4d8898aed8ce54351ccc0504dfbc2c6c06482"
         ),
     }
+    # Freeze every baseline byte except the separately verified generator
+    # provenance line: changing CLI publication must not change type/validator bodies.
+    generator_digest = hashlib.sha256(
+        runner.LEGACY_GENERATORS[sessions_list.schema].read_bytes()
+        + b"\0"
+        + (runner.ROOT / "scripts/contracts/generate_sessions_list_ajv.mjs").read_bytes()
+    ).hexdigest()
+
+    def body_digest(content: str) -> str:
+        lines = content.splitlines(keepends=True)
+        assert lines[2].strip() in {
+            f"# generator-sha256: {generator_digest}",
+            f"// generator-sha256: {generator_digest}",
+        }
+        return hashlib.sha256("".join(lines[:2] + lines[3:]).encode("utf-8")).hexdigest()
+
     assert {
-        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in sessions_list.outputs
-    } == expected
+        path.name: body_digest(path.read_text(encoding="utf-8"))
+        for path in sessions_list.outputs[:3]
+    } == {path.name: expected[path.name] for path in sessions_list.outputs[:3]}
+    # Frozen CJS bodies remain byte-oracles in the pinned toolchain job;
+    # they are no longer persisted in the production package.
+    import os
+
+    if os.environ.get("OPENSQUILLA_RUN_CONTRACT_TOOLCHAIN_INTEGRATION") == "1":
+        assert {
+            path.name: body_digest(content)
+            for path, content in runner.render_legacy(sessions_list).items()
+        } == expected

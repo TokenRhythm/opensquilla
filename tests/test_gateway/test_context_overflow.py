@@ -11,14 +11,15 @@ from unittest.mock import AsyncMock
 import pytest
 
 from opensquilla.gateway import context_overflow
+from opensquilla.gateway.compaction_target import resolve_gateway_compaction_target
 from opensquilla.gateway.config import ContextOverflowPolicy, GatewayConfig
 from opensquilla.gateway.context_overflow import (
     OverflowOutcome,
     apply_context_overflow_policy,
 )
-from opensquilla.gateway.rpc_chat import _enforce_context_overflow, _handle_chat_send
+from opensquilla.gateway.rpc_chat import _handle_chat_send
 from opensquilla.provider.types import ProviderRequestCorrelation
-from opensquilla.session.compaction import CompactionConfig
+from opensquilla.session.compaction import CompactionConfig, build_compaction_config_from_provider
 from opensquilla.session.compaction_state import (
     StructuredCompactionSummary,
     render_structured_summary,
@@ -1370,21 +1371,29 @@ async def test_chat_send_accepts_turn_without_synchronous_context_overflow_gate(
     async def _unexpected_gate(*args: Any, **kwargs: Any) -> dict[str, Any]:
         raise AssertionError("chat.send must not synchronously refuse overflow")
 
-    async def _fake_sessions_send(
+    async def _fake_admit(
         params: dict[str, Any],
-        _ctx: Any,
-        **_kwargs: Any,
+        *,
+        surface: str,
     ) -> dict[str, Any]:
+        assert surface == "webchat"
         accepted.update(params)
-        return {"status": "accepted", "key": params["key"], "task_id": "task-long-context"}
+        key = params["sessionKey"]
+        return {
+            "ok": True,
+            "sessionKey": key,
+            "status": "accepted",
+            "key": key,
+            "task_id": "task-long-context",
+        }
 
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_chat._enforce_context_overflow",
+        "opensquilla.gateway.context_overflow.apply_context_overflow_policy",
         _unexpected_gate,
     )
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_sessions._handle_sessions_send",
-        _fake_sessions_send,
+        "opensquilla.gateway.rpc_chat._chat_turn_admission_adapter",
+        lambda _ctx: SimpleNamespace(admit=_fake_admit),
     )
 
     result = await _handle_chat_send({"message": "m", "sessionKey": "s-auto"}, ctx)
@@ -1397,53 +1406,7 @@ async def test_chat_send_accepts_turn_without_synchronous_context_overflow_gate(
         "task_id": "task-long-context",
     }
     assert accepted["message"] == "m"
-    assert accepted["key"] == "s-auto"
-
-
-def test_chat_send_creates_webchat_session_with_agent_from_key(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cfg = _cfg(ContextOverflowPolicy.AUTO_SUMMARIZE, budget=10)
-    sm = SimpleNamespace(
-        get_or_create=AsyncMock(
-            return_value=SimpleNamespace(
-                session_key="agent:kid-project:webchat:abc",
-                agent_id="kid-project",
-            )
-        ),
-    )
-    ctx = SimpleNamespace(
-        config=cfg,
-        session_manager=sm,
-        principal=SimpleNamespace(role="owner"),
-    )
-
-    async def _fake_sessions_send(
-        params: dict[str, Any],
-        _ctx: Any,
-        **_kwargs: Any,
-    ) -> dict[str, Any]:
-        return {"status": "accepted", "key": params["key"], "task_id": "task-1"}
-
-    monkeypatch.setattr(
-        "opensquilla.gateway.rpc_sessions._handle_sessions_send",
-        _fake_sessions_send,
-    )
-
-    async def _run() -> dict[str, Any]:
-        return await _handle_chat_send(
-            {"message": "m", "sessionKey": "agent:kid-project:webchat:abc"},
-            ctx,
-        )
-
-    result = asyncio.run(_run())
-
-    assert result["ok"] is True
-    sm.get_or_create.assert_awaited_once_with(
-        session_key="agent:kid-project:webchat:abc",
-        agent_id="kid-project",
-        display_name="WebChat",
-    )
+    assert accepted["sessionKey"] == "s-auto"
 
 
 @pytest.mark.asyncio
@@ -1458,9 +1421,24 @@ async def test_rpc_chat_auto_summarize_builds_provider_compaction_config() -> No
     selector = _FakeProviderSelector()
     ctx = SimpleNamespace(config=cfg, session_manager=sm, provider_selector=selector)
 
-    refusal = await _enforce_context_overflow(ctx, "s-auto", "m")
+    session = await sm._storage.get_session("s-auto")
+    target = resolve_gateway_compaction_target(ctx, session)
+    outcome = await apply_context_overflow_policy(
+        config=cfg,
+        message="m",
+        transcript=sm._transcript,
+        session_key="s-auto",
+        session_manager=sm,
+        compaction_config=build_compaction_config_from_provider(
+            target.provider,
+            model_override=target.model,
+            compaction_config=cfg.compaction,
+            compaction_plan=target.plan,
+        ),
+    )
 
-    assert refusal is None
+    assert outcome.refusal is None
+    assert outcome.summarized is True
     config = sm.compact_calls[0][2]
     assert isinstance(config, CompactionConfig)
     assert config.api_key == "overflow-provider-key"

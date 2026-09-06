@@ -490,6 +490,7 @@ def test_generic_webui_change_does_not_wake_desktop_matrix(
 @pytest.mark.parametrize(
     "path",
     [
+        "contracts/gateway/v4/compatibility-manifest.generated.json",
         "contracts/gateway/v4/sandbox/sandbox-runtime-status.schema.json",
         "contracts/gateway/v4/sessions/sessions-list.schema.json",
         "contracts/gateway/v4/sessions/sessions-changed.schema.json",
@@ -532,7 +533,6 @@ def test_gateway_contract_changes_run_deterministic_generation(
     "path",
     [
         "opensquilla-webui/scripts/lib/rpc-architecture-gate.mjs",
-        "opensquilla-webui/scripts/rpc-debt/session-chat.mjs",
         "opensquilla-webui/src/adapters/gateway/sessionConversationV4.ts",
         "opensquilla-webui/src/modules/sessionConversation.ts",
         "opensquilla-webui/src/platform/desktop.ts",
@@ -553,6 +553,33 @@ def test_webui_boundary_changes_run_python_architecture_contracts(
         "tests/test_ci/test_architecture_import_contracts.py",
         "tests/test_ci/test_rpc_architecture_contracts.py",
     } <= set(plan["python_targets"])
+
+
+def test_webui_boundary_prefix_registry_is_explicit_and_current() -> None:
+    assert MODULE["_WEBUI_BOUNDARY_PREFIXES"] == (
+        "opensquilla-webui/scripts/lib/",
+        "opensquilla-webui/src/adapters/gateway/",
+        "opensquilla-webui/src/contracts/",
+        "opensquilla-webui/src/modules/",
+        "opensquilla-webui/src/platform/",
+        "opensquilla-webui/src/types/",
+        "src/opensquilla/contracts/",
+        "src/opensquilla/gateway/adapters/",
+    )
+
+
+def test_artifact_workbench_application_runs_full_python_architecture_suite(
+    tmp_path: Path,
+    suite_config: dict[str, Any],
+) -> None:
+    plan = _plan(
+        tmp_path,
+        suite_config,
+        "src/opensquilla/application/artifact_workbench.py",
+    )
+
+    assert "python-full" in plan["required_suites"]
+    assert plan["python_targets"] == ["tests"]
 
 
 def test_gateway_change_runs_browser_recovery_without_native_desktop(
@@ -1206,6 +1233,75 @@ def test_unregistered_github_script_fails_closed(
 
     assert plan["full_fallback"] is True
     assert plan["reason_codes"] == ["unregistered_ci_control_path"]
+
+
+@pytest.mark.parametrize(
+    ("path", "existing_target"),
+    [
+        (".github/workflows/wheelhouse-release.yml", "tests/test_ci/test_workflows.py"),
+        (".github/scripts/verify-release-macos-upgrade.sh", "tests/test_release_consistency.py"),
+        (
+            ".github/scripts/verify-release-macos-real-update.sh",
+            "tests/test_release_consistency.py",
+        ),
+        (".github/scripts/verify-release-windows-upgrade.ps1", "tests/test_release_consistency.py"),
+    ],
+)
+def test_upgrade_source_only_changes_select_baseline_contract(
+    tmp_path: Path,
+    suite_config: dict[str, Any],
+    path: str,
+    existing_target: str,
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+
+    assert plan["python_targets"] == sorted(
+        [existing_target, "tests/test_ci/test_upgrade_baselines.py"]
+    )
+    assert "python-targeted" in plan["required_suites"]
+    assert plan["full_fallback"] is False
+    assert plan["desktop_matrix"] == []
+    assert plan["python_matrix"] == {"ubuntu": [], "windows": []}
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ".github/workflows/wheelhouse-release.yml",
+        "desktop/electron/scripts/test-packaged-real-update-flow.mjs",
+        "tests/test_ci/test_upgrade_baselines.py",
+    ],
+)
+def test_upgrade_contract_inputs_change_release_packaging_digest(
+    tmp_path: Path, suite_config: dict[str, Any], path: str
+) -> None:
+    dependency = tmp_path / path
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text("first\n", encoding="utf-8")
+    first = _plan(
+        tmp_path, suite_config, ".github/scripts/verify-release-macos-upgrade.sh"
+    )
+
+    dependency.write_text("second\n", encoding="utf-8")
+    second = _plan(
+        tmp_path, suite_config, ".github/scripts/verify-release-macos-upgrade.sh"
+    )
+
+    for suite in ("python-targeted", "release-packaging"):
+        assert first["suite_execution_digests"][suite] != second["suite_execution_digests"][suite]
+
+
+def test_release_packaging_executes_upgrade_baseline_contract() -> None:
+    import yaml
+
+    workflow = yaml.safe_load(Path(".github/workflows/ci.yml").read_text(encoding="utf-8"))
+    job = workflow["jobs"]["release-packaging"]
+    step = next(
+        step for step in job["steps"] if step["name"] == "Run release packaging contract tests"
+    )
+    assert "command -v node" in step["run"]
+    assert "command -v pwsh" in step["run"]
+    assert "tests/test_ci/test_upgrade_baselines.py" in step["run"].split()
 
 
 @pytest.mark.parametrize(

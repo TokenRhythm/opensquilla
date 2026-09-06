@@ -1,6 +1,13 @@
+import type {
+  ConversationToolContent,
+} from '@/modules/conversationEventContent'
 import { computed, ref, watch, type Ref } from 'vue'
-import type { ChatRunStatus } from '@/types/chat'
-import type { ApprovalStatusPayload, ToolResultPayload } from '@/types/chat'
+import type {
+  ChatRunStatus,
+} from '@/types/chat'
+import type {
+  ApprovalStatusPayload,
+} from '@/types/chat'
 import type {
   InterruptApprovalData,
   InterruptClarifyData,
@@ -8,14 +15,17 @@ import type {
 } from '@/types/parts'
 import { clarifyRequestFromValue, userInputOutcomeFromValue } from '@/utils/chat/clarify'
 import { isCurrentSessionPayload } from '@/utils/chat/streamEvents'
-import type {
-  ApprovalCenter,
-  ApprovalAvailability,
-  ApprovalEvent,
-  ApprovalItem,
-  ApprovalDecision,
+import {
+  ApprovalCenterError,
+  type ApprovalCenter,
+  type ApprovalAvailability,
+  type ApprovalEvent,
+  type ApprovalItem,
+  type ApprovalDecision,
 } from '@/modules/approvalCenter'
-import type { SessionConversation } from '@/modules/sessionConversation'
+import type { ClarificationSubmission } from '@/modules/clarificationSubmission'
+import type { ConversationEventHub } from '@/modules/conversationEventHub'
+import type { ConversationEvent } from '@/modules/conversationEvents'
 
 const MAX_RESOLVED_OUTCOMES = 4
 
@@ -112,7 +122,8 @@ export interface ApprovalsStreamSurface {
 }
 
 export interface UseChatApprovalsOptions {
-  sessionConversation: SessionConversation
+  conversationEvents: Pick<ConversationEventHub<ConversationEvent>, 'open'>
+  clarificationSubmission: ClarificationSubmission
   approvalCenter: ApprovalCenter
   sessionKey: Ref<string>
   runStatus: Ref<ChatRunStatus>
@@ -176,9 +187,9 @@ export function resolutionFromResolveResponse(
   return payload.approved ? 'approved' : 'denied'
 }
 
-function parseClarifyRequest(payload: ToolResultPayload): ChatClarifyRequest | null {
-  return clarifyRequestFromValue(payload.result)
-    ?? clarifyRequestFromValue((payload as Record<string, unknown>).arguments)
+function parseClarifyRequest(payload: ConversationToolContent): ChatClarifyRequest | null {
+  return clarifyRequestFromValue(payload.approvalResult)
+    ?? clarifyRequestFromValue(payload.arguments)
 }
 
 /**
@@ -200,7 +211,8 @@ function parseClarifyRequest(payload: ToolResultPayload): ChatClarifyRequest | n
  */
 export function useChatApprovals(options: UseChatApprovalsOptions) {
   const { approvalCenter, sessionKey, stream, interruptState } = options
-  const conversation = options.sessionConversation
+  const conversationEvents = options.conversationEvents
+  const clarificationSubmission = options.clarificationSubmission
 
   const approvalEntries = ref<ChatApprovalEntry[]>([])
   const approvalBusyIds = ref<Set<string>>(new Set())
@@ -391,9 +403,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   }
 
   function isMethodNotFound(error: unknown): boolean {
-    const candidate = error as { code?: unknown; message?: unknown } | null
-    return candidate?.code === 'METHOD_NOT_FOUND'
-      || /method not found/i.test(error instanceof Error ? error.message : String(candidate?.message || error))
+    return error instanceof ApprovalCenterError && error.kind === 'unsupported'
   }
 
   function applyApprovalStatus(id: string, payload: ApprovalStatusPayload, generation: number) {
@@ -563,10 +573,10 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     })
   }
 
-  function handleToolResult(payload: ToolResultPayload) {
+  function handleToolResult(payload: ConversationToolContent) {
     if (!payload || typeof payload !== 'object') return
     if (!isCurrentSessionPayload(payload, sessionKey.value)) return
-    const outcome = userInputOutcomeFromValue(payload.result)
+    const outcome = userInputOutcomeFromValue(payload.approvalResult)
     if (outcome) {
       clarifySubmitAttempts.delete(outcome.requestId)
       setInterruptState(outcome.requestId, {
@@ -603,13 +613,12 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
       approvalId: key,
       data: clarifyData,
       at: Number(
-        (payload as Record<string, unknown>).emitted_at
-        || (payload as Record<string, unknown>).started_at,
+        payload.emitted_at || payload.started_at,
       ) || Date.now(),
       activityOrder: (
-        Number.isSafeInteger((payload as Record<string, unknown>).stream_seq)
-        && Number((payload as Record<string, unknown>).stream_seq) > 0
-          ? Number((payload as Record<string, unknown>).stream_seq)
+        Number.isSafeInteger(payload.stream_seq)
+        && Number(payload.stream_seq) > 0
+          ? Number(payload.stream_seq)
           : undefined
       ),
     })
@@ -680,8 +689,13 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
 
   /** Register stream listeners; returns the unsubscribe function. */
   function subscribe(): () => void {
-    const toolResultSubscription = conversation.subscribeToolResults((payload) => {
-      handleToolResult(payload as ToolResultPayload)
+    const toolResultHandle = conversationEvents.open('')
+    const detachToolResults = toolResultHandle.observe((message) => {
+      if (
+        message.kind !== 'conversation'
+        || message.event.semanticKind !== 'tool-result'
+      ) return
+      handleToolResult(message.event.payload)
     })
     const approvalEvents = approvalCenter.subscribe(event => {
       if (event.kind === 'requested') handleApprovalRequested(event)
@@ -693,7 +707,8 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     // before the listeners attached.
     hydrateApprovals()
     return () => {
-      toolResultSubscription.close()
+      detachToolResults()
+      toolResultHandle.close()
       approvalEvents.close()
       connection.close()
       stopFallbackPoll()
@@ -717,11 +732,13 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     }
     if (request.requestId) clarifySubmitAttempts.add(key)
     setInterruptState(key, { resolution: 'replied', busy: true, error: '' })
-    const params: Record<string, unknown> = { sessionKey: sessionKey.value, fields }
-    if (request.requestId) params.request_id = request.requestId
-    if (request.runId) params.run_id = request.runId
     try {
-      await conversation.submitClarify(params)
+      await clarificationSubmission.submit({
+        sessionKey: sessionKey.value,
+        fields,
+        ...(request.requestId ? { requestId: request.requestId } : {}),
+        ...(request.runId ? { runId: request.runId } : {}),
+      })
       clarifySubmitAttempts.delete(key)
       setInterruptState(key, { resolution: 'replied', busy: false })
       // request_id submissions resolve the exact paused tool call in the same

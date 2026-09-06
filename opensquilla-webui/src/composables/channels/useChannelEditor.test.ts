@@ -17,9 +17,8 @@ const setupCatalog = {
 } satisfies SetupCatalogPort
 
 const channelAdministration = {
-  ready: async () => undefined,
   get: (name: string) => rpcCall('channels.get', { name }),
-} as ChannelAdministration
+} as unknown as ChannelAdministration
 
 const channelSetup = {
   probeDraft: (entry: Record<string, unknown>) => rpcCall('onboarding.channel.probe', { entry }),

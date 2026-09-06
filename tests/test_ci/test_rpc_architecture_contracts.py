@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ast
+import hashlib
+import json
 from collections import Counter
 from pathlib import Path
 
@@ -22,8 +24,7 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         "src/opensquilla/gateway/adapters/sessions_search_contract.py",
         "src/opensquilla/contracts/adapters/sessions_changed_contract.py",
         "src/opensquilla/contracts/adapters/conversation_events.py",
-        # S16-A keeps approval wire models at the dormant ApprovalCenter
-        # boundary; no Gateway handler or UI consumer may import them yet.
+        # Approval wire models terminate at the dormant UI boundary.
         "src/opensquilla/contracts/adapters/approval_center_contract.py",
         # S17 keeps the two migrated Goal operations behind GoalCenter; the
         # remaining Goal mutations stay on the legacy path.  S18 adds the
@@ -34,12 +35,13 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         # Session read Contracts are consumed only by the Gateway registration
         # Adapter; Application Modules and handlers receive domain values.
         "src/opensquilla/gateway/adapters/session_read_contract.py",
-        # Session lifecycle wire models terminate at the registration Adapter;
-        # the Application Module receives transport-neutral typed commands.
-        "src/opensquilla/gateway/adapters/session_lifecycle_contract.py",
         # SandboxRuntime handlers stay legacy-compatible while generated
         # descriptors own registration metadata and success validation.
         "src/opensquilla/gateway/adapters/sandbox_runtime_contract.py",
+        # Repeated generated descriptor mechanics terminate at one private
+        # Gateway Adapter helper; domain registrars retain explicit ownership
+        # of their method inventories and public signatures.
+        "src/opensquilla/gateway/adapters/_generated_contract_bindings.py",
     }
 )
 GENERATED_METADATA_IMPORT_ALLOWLIST = frozenset(
@@ -114,10 +116,10 @@ SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
         "src/opensquilla/gateway/websocket.py": 1,
     }
 )
-SESSIONS_RESOLVE_LITERAL_ALLOWLIST: Counter[str] = Counter()
 SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
 RUNTIME_RPC_METHOD_BASELINE = 306
-STATIC_RPC_DECORATOR_BASELINE = 259
+RUNTIME_RPC_METHOD_DIGEST = "b95b0d01e58f0d2b221b459b322c5cf0b05f050d567186b703bd67f6260a8fc4"
+STATIC_RPC_DECORATOR_BASELINE = 87
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
 # closure measurement below.  The temporary S2a cumulative growth budget was
@@ -163,9 +165,7 @@ F2_TRANSPORT_FOUNDATION_FILES = (
     "opensquilla-webui/src/adapters/gateway/privateTransports.ts",
     "src/opensquilla/gateway/adapters/contract_method.py",
 )
-F2_GATEWAY_COMPOSITION_ROOT = (
-    "opensquilla-webui/src/adapters/gateway/gatewayAdapters.ts"
-)
+F2_GATEWAY_COMPOSITION_ROOT = "opensquilla-webui/src/adapters/gateway/gatewayAdapters.ts"
 # F2 adds three explicitly reviewed HTTP hardening slices on top of the
 # initial 849-line foundation: 58 lines for body lifecycle ownership, 103
 # lines for filename/method/body validation (less 9 lines from native brand
@@ -197,6 +197,13 @@ R3_APPLICATION_MODULE_FILES = (
     "src/opensquilla/application/sandbox_runtime.py",
     "src/opensquilla/application/session_read.py",
     "src/opensquilla/application/setup_workflow.py",
+    "src/opensquilla/application/session_maintenance.py",
+    "src/opensquilla/application/session_reset.py",
+    "src/opensquilla/application/observability.py",
+    "src/opensquilla/application/skill_catalog.py",
+    "src/opensquilla/application/skill_management.py",
+    "src/opensquilla/application/skill_proposal_review.py",
+    "src/opensquilla/application/artifact_workbench.py",
 )
 
 # Generated schema artifacts and consumer tests are intentionally excluded:
@@ -212,125 +219,32 @@ SANDBOX_RUNTIME_AUTHORED_FILES = (
 )
 SANDBOX_RUNTIME_AUTHORED_LOC_CEILING = 3_000
 
-# This ledger is deliberately separate from SandboxRuntime: it measures only
-# the authored SessionLifecycle Module/Port and Gateway Adapter seams.  The
-# large-PR plan requires the predefined split before this seam exceeds 3,000
-# physical lines; generated artifacts, fixtures, and the reused legacy writer
-# fencing Implementation in rpc_sessions.py are not newly authored seams.
-SESSION_LIFECYCLE_AUTHORED_FILES = (
-    "src/opensquilla/application/session_lifecycle.py",
-    "src/opensquilla/gateway/adapters/session_lifecycle.py",
-    "src/opensquilla/gateway/adapters/session_lifecycle_contract.py",
+# Each domain includes its current business bodies, concrete primitives and
+# registrations, not just the thin Application/Adapter files. The explicit
+# symbol inventory makes moving or deleting a mixed-module implementation an
+# accounting change that must be reviewed together with its callers.
+SESSION_DOMAIN_OWNERSHIP = json.loads(
+    (ROOT / ".github/ci/session-domain-ownership.json").read_text(encoding="utf-8")
 )
-SESSION_LIFECYCLE_AUTHORED_LOC_CEILING = 3_000
 
-# Existing cross-rpc private imports are architectural debt. This exact ledger
-# prevents growth and also fails stale when an import is removed, so reductions
-# must be made explicit instead of leaving an ever-growing allowlist.
-APPROVED_PRIVATE_RPC_IMPORTS: Counter[tuple[str, str, str]] = Counter(
-    {
-        (
-            "src/opensquilla/cli/agent_cmd.py",
-            "opensquilla.gateway.rpc_sessions",
-            "_apply_run_context_route_metadata",
-        ): 1,
-        (
-            "src/opensquilla/cli/tui/standalone_runtime.py",
-            "opensquilla.gateway.rpc_sessions",
-            "_apply_run_context_route_metadata",
-        ): 1,
-        (
-            "src/opensquilla/diagnostics_sources.py",
-            "opensquilla.gateway.rpc_logs",
-            "_build_logs_status",
-        ): 1,
-        (
-            "src/opensquilla/gateway/channel_dispatch.py",
-            "opensquilla.gateway.rpc_sessions",
-            "_apply_run_context_route_metadata",
-        ): 2,
-        (
-            "src/opensquilla/gateway/rpc_artifact_editing.py",
-            "opensquilla.gateway.rpc_artifacts",
-            "_session_id_for_key",
-        ): 1,
-        (
-            "src/opensquilla/gateway/rpc_channels.py",
-            "opensquilla.gateway.rpc_config",
-            "_persist_config",
-        ): 1,
-        (
-            "src/opensquilla/gateway/rpc_chat.py",
-            "opensquilla.gateway.rpc_sessions",
-            "_handle_sessions_abort",
-        ): 1,
-        (
-            "src/opensquilla/gateway/rpc_chat.py",
-            "opensquilla.gateway.rpc_sessions",
-            "_handle_sessions_send",
-        ): 1,
-        (
-            "src/opensquilla/gateway/rpc_doctor.py",
-            "opensquilla.gateway.rpc_channels",
-            "_handle_channels_status",
-        ): 1,
-        (
-            "src/opensquilla/gateway/rpc_doctor.py",
-            "opensquilla.gateway.rpc_logs",
-            "_build_logs_status",
-        ): 1,
-        (
-            "src/opensquilla/gateway/rpc_doctor.py",
-            "opensquilla.gateway.rpc_system",
-            "_handle_doctor_memory_status",
-        ): 1,
-        (
-            "src/opensquilla/gateway/rpc_doctor.py",
-            "opensquilla.gateway.rpc_tools",
-            "_handle_providers_status",
-        ): 1,
-        (
-            "src/opensquilla/gateway/rpc_doctor.py",
-            "opensquilla.gateway.rpc_tools",
-            "_handle_search_status",
-        ): 1,
-        (
-            "src/opensquilla/gateway/rpc_models.py",
-            "opensquilla.gateway.rpc_config",
-            "_handle_config_patch_safe",
-        ): 1,
-        (
-            "src/opensquilla/gateway/rpc_sessions.py",
-            "opensquilla.gateway.rpc_chat",
-            "_handle_chat_history",
-        ): 1,
-        (
-            "src/opensquilla/gateway/rpc_system.py",
-            "opensquilla.gateway.rpc_config",
-            "_persist_config",
-        ): 1,
-        (
-            "src/opensquilla/gateway/rpc_workbench_resources.py",
-            "opensquilla.gateway.rpc_artifacts",
-            "_session_id_for_key",
-        ): 1,
-        (
-            "src/opensquilla/session/naming.py",
-            "opensquilla.gateway.rpc_chat",
-            "_effective_compaction_model",
-        ): 1,
-        (
-            "src/opensquilla/session/naming.py",
-            "opensquilla.gateway.rpc_chat",
-            "_resolve_compaction_provider",
-        ): 1,
-        (
-            "src/opensquilla/session/naming.py",
-            "opensquilla.gateway.rpc_sessions",
-            "_emit_to_subscribers",
-        ): 1,
-    }
+# SessionMaintenance owns two high-risk workflows (reset and manual
+# compaction) behind one generated registration boundary.  The reset baseline
+# added 830 authored lines that the old mixed ledger did not represent; this
+# explicit five-file ledger covers both Applications and both Gateway
+# Adapters. Generated schemas and fixtures stay excluded, and it uses the
+# existing 3,000-line hard ceiling rather than widening it.
+SESSION_MAINTENANCE_AUTHORED_FILES = (
+    "src/opensquilla/application/session_reset.py",
+    "src/opensquilla/gateway/adapters/session_reset.py",
+    "src/opensquilla/application/session_maintenance.py",
+    "src/opensquilla/gateway/adapters/session_maintenance.py",
+    "src/opensquilla/gateway/adapters/session_maintenance_contract.py",
+    "src/opensquilla/gateway/session_maintenance_runtime.py",
 )
+SESSION_MAINTENANCE_AUTHORED_LOC_CEILING = 3_000
+
+RPC_IMPLEMENTATION_PREFIX = "opensquilla.gateway.rpc_"
+RPC_LOADER = GATEWAY_ROOT / "rpc" / "__init__.py"
 
 
 def _relative(path: Path) -> str:
@@ -343,6 +257,168 @@ def _python_files(root: Path) -> list[Path]:
 
 def _tree(path: Path) -> ast.Module:
     return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+
+def _terminal_ast_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Subscript):
+        return _terminal_ast_name(node.value)
+    return ""
+
+
+def _is_application_port_boundary(node: ast.ClassDef) -> bool:
+    return node.name.endswith(("Port", "Ports")) or any(
+        _terminal_ast_name(base).endswith("Port") for base in node.bases
+    )
+
+
+def _class_methods(node: ast.ClassDef) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
+    return [item for item in node.body if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))]
+
+
+def _constructor_bindings(
+    node: ast.ClassDef,
+) -> tuple[set[str], set[str]]:
+    """Return RpcContext attributes and injected callable/object attributes."""
+
+    initializer = next(
+        (method for method in _class_methods(node) if method.name == "__init__"),
+        None,
+    )
+    if initializer is None:
+        return set(), set()
+    arguments = (
+        *initializer.args.posonlyargs,
+        *initializer.args.args,
+        *initializer.args.kwonlyargs,
+    )
+    rpc_context_parameters = {
+        argument.arg
+        for argument in arguments
+        if argument.annotation is not None and "RpcContext" in ast.unparse(argument.annotation)
+    }
+    constructor_parameters = {argument.arg for argument in arguments} - {"self"}
+    rpc_context_attributes: set[str] = set()
+    injected_attributes: set[str] = set()
+    for assignment in ast.walk(initializer):
+        if not isinstance(assignment, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = assignment.value
+        if not isinstance(value, ast.Name) or value.id not in constructor_parameters:
+            continue
+        targets = assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
+        for target in targets:
+            if not (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+            ):
+                continue
+            if value.id in rpc_context_parameters:
+                rpc_context_attributes.add(target.attr)
+            else:
+                injected_attributes.add(target.attr)
+    return rpc_context_attributes, injected_attributes
+
+
+def _contains_rpc_context_reference(node: ast.AST, attributes: set[str]) -> bool:
+    return any(
+        isinstance(item, ast.Attribute)
+        and isinstance(item.value, ast.Name)
+        and item.value.id == "self"
+        and item.attr in attributes
+        for item in ast.walk(node)
+    )
+
+
+def _semantic_parameters(method: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    """Return typed use-case inputs whose wire shape must not be reconstructed."""
+
+    return {
+        argument.arg
+        for argument in (
+            *method.args.posonlyargs,
+            *method.args.args,
+            *method.args.kwonlyargs,
+        )
+        if argument.arg
+        in {
+            "command",
+            "identity",
+            "query",
+            "request",
+            "target",
+            "topic",
+        }
+    }
+
+
+def _references_name(node: ast.AST, names: set[str]) -> bool:
+    return any(isinstance(item, ast.Name) and item.id in names for item in ast.walk(node))
+
+
+def _mapping_expression(
+    node: ast.AST,
+    bindings: set[str],
+    semantic_parameters: set[str],
+) -> bool:
+    if isinstance(node, (ast.Dict, ast.DictComp)):
+        return _references_name(node, semantic_parameters | bindings)
+    if isinstance(node, ast.Name):
+        return node.id in bindings
+    if isinstance(node, ast.Attribute):
+        return node.attr in {
+            "attributes",
+            "filters",
+            "options",
+            "params",
+            "payload",
+            "values",
+        } and _references_name(node, semantic_parameters | bindings)
+    if isinstance(node, ast.Call):
+        name = _terminal_ast_name(node.func)
+        return (name == "dict" or name.endswith(("_params", "_payload"))) and _references_name(
+            node, semantic_parameters | bindings
+        )
+    if isinstance(node, ast.IfExp):
+        return _mapping_expression(node.body, bindings, semantic_parameters) or _mapping_expression(
+            node.orelse, bindings, semantic_parameters
+        )
+    return (
+        isinstance(node, ast.BinOp)
+        and isinstance(node.op, ast.BitOr)
+        and (
+            _mapping_expression(node.left, bindings, semantic_parameters)
+            or _mapping_expression(node.right, bindings, semantic_parameters)
+        )
+    )
+
+
+def _mapping_bindings(method: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    bindings: set[str] = set()
+    semantic_parameters = _semantic_parameters(method)
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(method):
+            if isinstance(node, ast.Assign):
+                value = node.value
+                targets = node.targets
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                value = node.value
+                targets = [node.target]
+            else:
+                continue
+            if not _mapping_expression(value, bindings, semantic_parameters):
+                continue
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id not in bindings:
+                    bindings.add(target.id)
+                    changed = True
+    return bindings
 
 
 def _imported_modules(path: Path, node: ast.AST) -> list[str]:
@@ -527,21 +603,6 @@ def test_sessions_list_authored_literal_debt_is_exact() -> None:
     assert stale == Counter(), f"stale sessions.list literal allowlist: {stale}"
 
 
-def test_sessions_resolve_authored_literal_debt_is_exact() -> None:
-    actual: Counter[str] = Counter()
-    for path in _python_files(PACKAGE_ROOT):
-        if path.is_relative_to(GENERATED_CONTRACT_ROOT):
-            continue
-        for node in ast.walk(_tree(path)):
-            if isinstance(node, ast.Constant) and node.value == "sessions.resolve":
-                actual[_relative(path)] += 1
-
-    unexpected = actual - SESSIONS_RESOLVE_LITERAL_ALLOWLIST
-    stale = SESSIONS_RESOLVE_LITERAL_ALLOWLIST - actual
-    assert unexpected == Counter(), f"unexpected sessions.resolve literals: {unexpected}"
-    assert stale == Counter(), f"stale sessions.resolve literal allowlist: {stale}"
-
-
 def _module_name(path: Path) -> str:
     relative = path.relative_to(PACKAGE_ROOT).with_suffix("")
     parts = list(relative.parts)
@@ -582,16 +643,22 @@ def test_contract_gateway_adapters_do_not_join_a_gateway_cycle() -> None:
     resolve_adapter = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_resolve_contract.py"
     goals_adapter = PACKAGE_ROOT / "gateway" / "adapters" / "goals_contract.py"
     sandbox_adapter = PACKAGE_ROOT / "gateway" / "adapters" / "sandbox_runtime_contract.py"
-    lifecycle_adapter = (
-        PACKAGE_ROOT / "gateway" / "adapters" / "session_lifecycle_contract.py"
+    generated_binding_helper = (
+        PACKAGE_ROOT / "gateway" / "adapters" / "_generated_contract_bindings.py"
     )
-    for adapter_path in (
-        SESSIONS_LIST_GATEWAY_ADAPTER,
-        resolve_adapter,
-        goals_adapter,
-        sandbox_adapter,
-        lifecycle_adapter,
-    ):
+    lifecycle_adapter = PACKAGE_ROOT / "gateway" / "adapters" / "session_lifecycle_contract.py"
+    expected_gateway_dependencies = {
+        SESSIONS_LIST_GATEWAY_ADAPTER: ["opensquilla.gateway.adapters.contract_method"],
+        resolve_adapter: ["opensquilla.gateway.adapters.contract_method"],
+        goals_adapter: ["opensquilla.gateway.adapters.contract_method"],
+        sandbox_adapter: ["opensquilla.gateway.adapters.contract_method"],
+        generated_binding_helper: ["opensquilla.gateway.adapters.contract_method"],
+        lifecycle_adapter: [
+            "opensquilla.gateway.adapters._generated_contract_bindings",
+            "opensquilla.gateway.adapters.contract_method",
+        ],
+    }
+    for adapter_path, expected_dependencies in expected_gateway_dependencies.items():
         adapter = _module_name(adapter_path)
         cycle_edges = sorted(
             dependency for dependency in graph[adapter] if _reaches(graph, dependency, adapter)
@@ -601,8 +668,8 @@ def test_contract_gateway_adapters_do_not_join_a_gateway_cycle() -> None:
             for dependency in graph[adapter]
             if dependency.startswith("opensquilla.gateway")
         )
-        assert gateway_dependencies == ["opensquilla.gateway.adapters.contract_method"], (
-            f"{adapter} may depend only on the generic registration Adapter: {gateway_dependencies}"
+        assert gateway_dependencies == expected_dependencies, (
+            f"{adapter} has unexpected Gateway dependencies: {gateway_dependencies}"
         )
         assert cycle_edges == [], f"{adapter} joined a Python import cycle: {cycle_edges}"
 
@@ -640,9 +707,7 @@ def test_sandbox_application_module_is_transport_neutral_and_typed() -> None:
                 imported_typing_names.update(alias.name for alias in node.names)
 
     forbidden_imports = sorted(
-        module
-        for module in imported_modules
-        if module.startswith(forbidden_import_prefixes)
+        module for module in imported_modules if module.startswith(forbidden_import_prefixes)
     )
     leaked_wire_fields = sorted(
         {
@@ -723,9 +788,7 @@ def test_session_lifecycle_application_module_is_transport_neutral_and_typed() -
                 imported_typing_names.update(alias.name for alias in node.names)
 
     forbidden_imports = sorted(
-        module
-        for module in imported_modules
-        if module.startswith(forbidden_import_prefixes)
+        module for module in imported_modules if module.startswith(forbidden_import_prefixes)
     )
     leaked_wire_fields = sorted(
         {
@@ -765,13 +828,278 @@ def test_session_lifecycle_application_module_is_transport_neutral_and_typed() -
     assert production_fakes == [], f"test fakes leaked into production: {production_fakes}"
 
 
-def test_session_lifecycle_authored_surface_stays_within_large_pr_ceiling() -> None:
-    current = _physical_lines(SESSION_LIFECYCLE_AUTHORED_FILES)
-    assert current <= SESSION_LIFECYCLE_AUTHORED_LOC_CEILING, (
-        f"SessionLifecycle authored seams total {current} lines; split the domain at its "
-        f"predefined lifecycle/maintenance or Module/consumer boundary before exceeding "
-        f"{SESSION_LIFECYCLE_AUTHORED_LOC_CEILING}"
+def _session_domain_authored_ledger(domain: str) -> dict[str, int]:
+    spec = SESSION_DOMAIN_OWNERSHIP["domains"][domain]
+    ledger = {
+        path: _physical_lines((path,)) for path in spec["whole_files"]
+    }
+    assert not (set(spec["whole_files"]) & set(spec["owned_symbols"]))
+    borrowed = {
+        (entry["path"], entry["symbol"])
+        for entry in SESSION_DOMAIN_OWNERSHIP["cross_domain_boundaries"]
+        if entry["owner"] != domain
+    }
+    registrars = set(spec["registrars"])
+    for path, names in spec["owned_symbols"].items():
+        tree = _tree(ROOT / path)
+        definitions = {
+            node.name: node for node in tree.body
+            if isinstance(node, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef)
+        }
+        missing = set(names) - definitions.keys()
+        assert not missing, (
+            f"{domain}: relocated/deleted bodies need an ownership review: {missing}"
+        )
+        for name in names:
+            node = definitions[name]
+            local_dependencies = {
+                child.id for child in ast.walk(node) if isinstance(child, ast.Name)
+            } & definitions.keys()
+            unaccounted = {
+                dependency for dependency in local_dependencies
+                if dependency not in names and (path, dependency) not in borrowed
+            }
+            assert not unaccounted, f"{domain}: uncounted primitives in {path}: {unaccounted}"
+            start = min([node.lineno, *(item.lineno for item in node.decorator_list)])
+            assert node.end_lineno is not None
+            ledger[f"{path}:{name}"] = node.end_lineno - start + 1
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            if any(
+                isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+                and child.func.id in registrars for child in ast.walk(node)
+            ):
+                assert node.end_lineno is not None
+                ledger[f"{path}:registration@{node.lineno}"] = node.end_lineno - node.lineno + 1
+    return ledger
+
+
+def test_session_domain_ownership_covers_each_borrowed_implementation() -> None:
+    manifest = SESSION_DOMAIN_OWNERSHIP
+    assert manifest["line_budget_policy"] == "accounting-only"
+    assert set(manifest["domains"]) == {"SessionLifecycle", "TurnAdmission", "PendingInputQueue"}
+    for entry in manifest["cross_domain_boundaries"]:
+        owner = manifest["domains"][entry["owner"]]
+        assert entry["symbol"] in owner["owned_symbols"][entry["path"]]
+    for domain in manifest["domains"]:
+        assert _session_domain_authored_ledger(domain)
+
+
+def _assert_session_domain_accounting(domain: str) -> None:
+    spec = SESSION_DOMAIN_OWNERSHIP["domains"][domain]
+    whole_files = spec["whole_files"]
+    assert len(whole_files) == len(set(whole_files)), f"{domain}: duplicate whole-file ownership"
+    declared_units = set(whole_files)
+    for path, names in spec["owned_symbols"].items():
+        assert len(names) == len(set(names)), f"{domain}: duplicate symbol ownership in {path}"
+        declared_units.update(f"{path}:{name}" for name in names)
+    ledger = _session_domain_authored_ledger(domain)
+    assert declared_units <= ledger.keys(), f"{domain}: declared production units were omitted"
+    assert ledger and all(lines > 0 for lines in ledger.values()), (
+        f"{domain}: missing or empty production units must not silently leave the ledger"
     )
+
+
+def test_session_lifecycle_authored_surface_has_complete_accounting() -> None:
+    _assert_session_domain_accounting("SessionLifecycle")
+
+
+def test_turn_admission_authored_surface_has_complete_accounting() -> None:
+    _assert_session_domain_accounting("TurnAdmission")
+
+
+def test_pending_input_queue_authored_surface_has_complete_accounting() -> None:
+    _assert_session_domain_accounting("PendingInputQueue")
+
+
+def test_session_maintenance_authored_surface_stays_within_large_pr_ceiling() -> None:
+    current = _physical_lines(SESSION_MAINTENANCE_AUTHORED_FILES)
+    assert current <= SESSION_MAINTENANCE_AUTHORED_LOC_CEILING, (
+        f"SessionMaintenance authored seams total {current} lines; split reset and "
+        f"manual compaction before exceeding {SESSION_MAINTENANCE_AUTHORED_LOC_CEILING}"
+    )
+
+
+def test_conversation_ancillary_application_does_not_depend_on_gateway() -> None:
+    path = PACKAGE_ROOT / "application" / "conversation_ancillary.py"
+    tree = _tree(path)
+    forbidden_imports: list[str] = []
+    imported_names: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module.startswith("opensquilla.gateway"):
+                forbidden_imports.append(module)
+            imported_names.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.startswith("opensquilla.gateway"):
+                    forbidden_imports.append(alias.name)
+
+    assert forbidden_imports == []
+    assert "RpcContext" not in imported_names
+
+
+def test_agent_catalog_application_does_not_depend_on_gateway() -> None:
+    path = PACKAGE_ROOT / "application" / "agent_catalog.py"
+    tree = _tree(path)
+    forbidden_imports: list[str] = []
+    imported_names: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module.startswith("opensquilla.gateway"):
+                forbidden_imports.append(module)
+            imported_names.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.startswith("opensquilla.gateway"):
+                    forbidden_imports.append(alias.name)
+
+    assert forbidden_imports == []
+    assert "RpcContext" not in imported_names
+
+
+def test_channel_administration_application_does_not_depend_on_gateway() -> None:
+    path = PACKAGE_ROOT / "application" / "channel_administration.py"
+    tree = _tree(path)
+    forbidden_imports: list[str] = []
+    imported_names: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module.startswith("opensquilla.gateway"):
+                forbidden_imports.append(module)
+            imported_names.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.startswith("opensquilla.gateway"):
+                    forbidden_imports.append(alias.name)
+
+    assert forbidden_imports == []
+    assert "RpcContext" not in imported_names
+
+
+def test_cron_scheduler_application_does_not_depend_on_gateway() -> None:
+    path = PACKAGE_ROOT / "application" / "cron_scheduler.py"
+    tree = _tree(path)
+    forbidden_imports: list[str] = []
+    imported_names: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module.startswith("opensquilla.gateway"):
+                forbidden_imports.append(module)
+            imported_names.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.startswith("opensquilla.gateway"):
+                    forbidden_imports.append(alias.name)
+
+    assert forbidden_imports == []
+    assert "RpcContext" not in imported_names
+
+
+def test_r5_gateway_adapters_depend_on_typed_ports_not_rpc_callbacks() -> None:
+    adapter_paths = (
+        PACKAGE_ROOT / "gateway" / "adapters" / "channel_administration.py",
+        PACKAGE_ROOT / "gateway" / "adapters" / "cron_scheduler.py",
+        PACKAGE_ROOT / "gateway" / "adapters" / "observability.py",
+        PACKAGE_ROOT / "gateway" / "adapters" / "skill_catalog.py",
+        PACKAGE_ROOT / "gateway" / "adapters" / "skill_management.py",
+    )
+    forbidden_names = {
+        "GatewayChannelAdministrationCallbacks",
+        "GatewayCronCallbacks",
+        "GatewayLogReaderPort",
+        "GatewayReadinessDataPort",
+        "GatewayReadinessEvaluationPort",
+        "GatewayRouterLearningStatusPort",
+        "GatewaySkillCatalogReadPort",
+        "GatewaySkillManagementPort",
+    }
+    violations: list[str] = []
+
+    for path in adapter_paths:
+        tree = _tree(path)
+        relative = path.relative_to(ROOT).as_posix()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name in forbidden_names:
+                    violations.append(f"{relative}:{node.lineno}: defines {node.name}")
+            elif isinstance(node, ast.Name) and node.id == "Callable":
+                violations.append(f"{relative}:{node.lineno}: references Callable")
+            elif (
+                isinstance(node, ast.Name)
+                and node.id == "RpcContext"
+                and path.name != "observability.py"
+            ):
+                violations.append(f"{relative}:{node.lineno}: references RpcContext")
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    forbidden_imports = forbidden_names | {"Callable"}
+                    if path.name != "observability.py":
+                        forbidden_imports.add("RpcContext")
+                    if alias.name in forbidden_imports:
+                        violations.append(f"{relative}:{node.lineno}: imports {alias.name}")
+
+    assert violations == [], "R5 Gateway callback seams returned:\n" + "\n".join(violations)
+
+
+def test_observability_readiness_ports_return_typed_findings() -> None:
+    path = PACKAGE_ROOT / "application" / "observability.py"
+    tree = _tree(path)
+    data_port = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "ReadinessDataPort"
+    )
+    methods = [
+        node
+        for node in data_port.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+    assert methods
+    assert {
+        ast.unparse(method.returns) if method.returns is not None else ""
+        for method in methods
+    } == {"Sequence[ReadinessFinding]"}
+    assert not any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "typing"
+        and any(alias.name == "Any" for alias in node.names)
+        for node in ast.walk(tree)
+    )
+
+
+def test_r5_rpc_factories_bind_concrete_typed_runtime_ports() -> None:
+    expected_bindings = {
+        "rpc_channels.py": (
+            "_ChannelAdministrationRuntime(ctx)",
+            "_ChannelPairingRuntime(ctx)",
+        ),
+        "rpc_cron.py": (
+            "_CronSchedulerRuntime(ctx)",
+            "_CronSubscriptionRuntime(ctx)",
+        ),
+        "rpc_doctor.py": ("_GatewayReadinessRuntime(ctx)",),
+        "rpc_logs.py": ("_GatewayLogReaderRuntime(ctx)",),
+        "rpc_router.py": ("_GatewayRouterLearningStatusRuntime(ctx)",),
+        "rpc_skills.py": (
+            "_SkillCatalogRuntime(ctx)",
+            "_SkillManagementRuntime(ctx)",
+        ),
+    }
+
+    for filename, bindings in expected_bindings.items():
+        source = (PACKAGE_ROOT / "gateway" / filename).read_text(encoding="utf-8")
+        for binding in bindings:
+            assert binding in source, f"{filename} must bind {binding}"
+
+    proposal_source = (PACKAGE_ROOT / "gateway" / "rpc_proposals.py").read_text(encoding="utf-8")
+    assert "opensquilla.gateway.rpc_cron" not in proposal_source
 
 
 def test_rpc_context_does_not_grow_past_pinned_main() -> None:
@@ -820,9 +1148,8 @@ def test_z1_webui_legacy_transport_surface_is_closed() -> None:
         if leaked:
             forbidden_identifiers[relative] = leaked
         if (
-            ("@/stores/rpc" in source or "./stores/rpc" in source or "../stores/rpc" in source)
-            and relative not in {"main.ts", "stores/rpc.ts"}
-        ):
+            "@/stores/rpc" in source or "./stores/rpc" in source or "../stores/rpc" in source
+        ) and relative not in {"main.ts", "stores/rpc.ts"}:
             raw_store_imports.append(relative)
 
     assert forbidden_identifiers == {}, (
@@ -856,8 +1183,7 @@ def test_f2_gateway_composition_root_stays_declarative() -> None:
     }
     leaked = [label for token, label in forbidden.items() if token in source]
     assert leaked == [], (
-        "Gateway Adapter composition root must remain declarative; found "
-        + ", ".join(leaked)
+        "Gateway Adapter composition root must remain declarative; found " + ", ".join(leaked)
     )
 
 
@@ -903,6 +1229,94 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "sessions.forkThroughTurn",
             "sessions.rename",
             "sessions.delete",
+            "sessions.reset",
+            "sessions.contextCompact",
+            "sessions.compact",
+            "chat.send",
+            "chat.abort",
+            "sessions.send",
+            "sessions.abort",
+            "sessions.steer.v2",
+            "sessions.steer",
+            "sessions.pending_inputs.enqueue",
+            "sessions.pending_inputs.list",
+            "sessions.pending_inputs.update",
+            "sessions.pending_inputs.reorder",
+            "sessions.pending_inputs.cancel",
+            "sessions.pending_inputs.dispatch",
+            "sessions.pending_inputs.steer",
+            "usage.status",
+            "usage.query",
+            "usage.cost",
+            "commands.list_for_surface",
+            "router.feedback.submit",
+            "sessions.promptCacheKeepalive.status",
+            "sessions.promptCacheKeepalive.set",
+            "chat.clarify_submit",
+            "agents.list",
+            "agents.create",
+            "agents.update",
+            "agents.delete",
+            "channels.status",
+            "channels.get",
+            "channels.probe",
+            "channels.logout",
+            "channels.restart",
+            "channels.pairings",
+            "channels.pairing.approve",
+            "channels.admin.set",
+            "channels.pairing.revoke",
+            "cron.list",
+            "cron.status",
+            "cron.add",
+            "cron.create",
+            "cron.update",
+            "cron.remove",
+            "cron.run",
+            "cron.runs",
+            "cron.subscribe",
+            "cron.unsubscribe",
+            "status",
+            "router.selflearning.status",
+            "doctor.status",
+            "logs.status",
+            "logs.tail",
+            "plugin.approval.status",
+            "plugin.approval.resolve",
+            "plugin.approval.extend",
+            "memory.import.info",
+            "memory.import.start",
+            "memory.import.status",
+            "memory.import.retry",
+            "memory.import.cancel",
+            "memory.import.apply",
+            "memory.import.undo",
+            "memory.import.discard",
+            "onboarding.channel.probe",
+            "onboarding.channel.upsert",
+            "onboarding.channel.remove",
+            "onboarding.channel.enable",
+            "onboarding.channel.disable",
+            "plans.capabilities",
+            "sandbox.path.list",
+            "sandbox.path.create-directory",
+            "sandbox.path.pick",
+            "workspaces.open",
+            "workspaces.update",
+            "workspaces.pin",
+            "workspaces.remove",
+            "workspaces.history.delete",
+            "meta.drafts.list",
+            "meta.drafts.discard",
+            "meta.run",
+            "meta.runs.confirm_preflight",
+            "meta.runs.recovery",
+            "meta.runs.replay",
+            "meta.setup.plan",
+            "meta.setup.install",
+            "meta.setup.status",
+            "migration.sources.list",
+            "migration.sources.preview",
         }
     ] == []
     assert [
@@ -962,6 +1376,25 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "sandbox.resume",
         }
     ] == []
+    from opensquilla.gateway.adapters.artifact_workbench_contract import (
+        ARTIFACT_WORKBENCH_CONTRACT_METHODS,
+    )
+
+    assert [site for site in sites if site[2] in ARTIFACT_WORKBENCH_CONTRACT_METHODS] == []
+
+
+def test_artifact_workbench_has_no_callback_transition_path() -> None:
+    paths = (
+        ROOT / "src/opensquilla/gateway/adapters/artifact_workbench.py",
+        ROOT / "src/opensquilla/gateway/rpc_artifacts.py",
+        ROOT / "src/opensquilla/gateway/rpc_artifact_editing.py",
+        ROOT / "src/opensquilla/gateway/rpc_workbench_resources.py",
+        ROOT / "src/opensquilla/gateway/workbench_resource_runtime.py",
+    )
+    source = "\n".join(path.read_text(encoding="utf-8") for path in paths)
+    assert "class _CallbackPort" not in source
+    assert "del request" not in source
+    assert "async def _execute_" not in source
 
 
 def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter() -> None:
@@ -975,6 +1408,8 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
     methods = registry.list_methods()
     assert len(methods) == RUNTIME_RPC_METHOD_BASELINE
     assert len(methods) == len(set(methods))
+    digest = hashlib.sha256(("\n".join(sorted(methods)) + "\n").encode()).hexdigest()
+    assert digest == RUNTIME_RPC_METHOD_DIGEST
 
     entry = registry.get_entry(SESSIONS_LIST_METHOD)
     assert entry is not None
@@ -1130,11 +1565,61 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
         assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
         assert entry.handler.__name__ == "handle_contract_method"
 
+    from opensquilla.gateway.adapters.agent_catalog_contract import (
+        AGENT_CATALOG_CONTRACT_METHODS,
+    )
+    from opensquilla.gateway.adapters.artifact_workbench_contract import (
+        ARTIFACT_WORKBENCH_CONTRACT_METHODS,
+    )
+    from opensquilla.gateway.adapters.channel_administration_contract import (
+        CHANNEL_ADMINISTRATION_CONTRACT_METHODS,
+    )
+    from opensquilla.gateway.adapters.conversation_ancillary_contract import (
+        CONVERSATION_ANCILLARY_CONTRACT_METHODS,
+    )
+    from opensquilla.gateway.adapters.cron_scheduler_contract import (
+        CRON_SCHEDULER_CONTRACT_METHODS,
+    )
+    from opensquilla.gateway.adapters.observability_contract import (
+        OBSERVABILITY_CONTRACT_METHODS,
+    )
+    from opensquilla.gateway.adapters.pending_input_queue_contract import (
+        PENDING_INPUT_QUEUE_CONTRACT_METHODS,
+    )
     from opensquilla.gateway.adapters.session_lifecycle_contract import (
         SESSION_LIFECYCLE_CONTRACT_METHODS,
     )
+    from opensquilla.gateway.adapters.session_maintenance_contract import (
+        SESSION_MAINTENANCE_CONTRACT_METHODS,
+    )
+    from opensquilla.gateway.adapters.skill_catalog_contract import (
+        SKILL_CATALOG_CONTRACT_METHODS,
+    )
+    from opensquilla.gateway.adapters.skill_management_contract import (
+        SKILL_MANAGEMENT_CONTRACT_METHODS,
+    )
+    from opensquilla.gateway.adapters.skill_proposal_review_contract import (
+        SKILL_PROPOSAL_REVIEW_CONTRACT_METHODS,
+    )
+    from opensquilla.gateway.adapters.turn_admission_contract import (
+        TURN_ADMISSION_CONTRACT_METHODS,
+    )
 
-    for method in SESSION_LIFECYCLE_CONTRACT_METHODS:
+    for method in (
+        *SESSION_LIFECYCLE_CONTRACT_METHODS,
+        *SESSION_MAINTENANCE_CONTRACT_METHODS,
+        *TURN_ADMISSION_CONTRACT_METHODS,
+        *PENDING_INPUT_QUEUE_CONTRACT_METHODS,
+        *CONVERSATION_ANCILLARY_CONTRACT_METHODS,
+        *AGENT_CATALOG_CONTRACT_METHODS,
+        *CHANNEL_ADMINISTRATION_CONTRACT_METHODS,
+        *CRON_SCHEDULER_CONTRACT_METHODS,
+        *OBSERVABILITY_CONTRACT_METHODS,
+        *SKILL_CATALOG_CONTRACT_METHODS,
+        *SKILL_MANAGEMENT_CONTRACT_METHODS,
+        *SKILL_PROPOSAL_REVIEW_CONTRACT_METHODS,
+        *ARTIFACT_WORKBENCH_CONTRACT_METHODS,
+    ):
         entry = registry.get_entry(method)
         assert entry is not None
         assert entry.name == method
@@ -1143,22 +1628,136 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
         assert entry.handler.__name__ == "handle_contract_method"
 
 
-def test_cross_rpc_private_import_debt_is_exact() -> None:
-    actual: Counter[tuple[str, str, str]] = Counter()
+def test_production_cross_rpc_imports_are_forbidden_outside_loader() -> None:
+    violations: list[tuple[str, int, str]] = []
     for path in _python_files(PACKAGE_ROOT):
+        if path == RPC_LOADER:
+            continue
         for node in ast.walk(_tree(path)):
-            if not isinstance(node, ast.ImportFrom) or not node.module:
-                continue
-            if not node.module.startswith("opensquilla.gateway.rpc_"):
-                continue
-            for alias in node.names:
-                if alias.name.startswith("_"):
-                    actual[(_relative(path), node.module, alias.name)] += 1
+            targets: list[str] = []
+            if isinstance(node, ast.Import):
+                targets.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:
+                    relative = path.relative_to(PACKAGE_ROOT)
+                    package = ("opensquilla", *relative.parent.parts)
+                    base = package[: len(package) - node.level + 1]
+                    module = ".".join((*base, *(node.module.split(".") if node.module else ())))
+                else:
+                    module = node.module or ""
+                if module:
+                    targets.append(module)
+                    if module == "opensquilla.gateway":
+                        targets.extend(f"{module}.{alias.name}" for alias in node.names)
+            for target in targets:
+                if target.startswith(RPC_IMPLEMENTATION_PREFIX):
+                    violations.append((_relative(path), node.lineno, target))
 
-    unexpected = actual - APPROVED_PRIVATE_RPC_IMPORTS
-    stale = APPROVED_PRIVATE_RPC_IMPORTS - actual
-    assert unexpected == Counter(), f"unexpected private RPC imports: {unexpected}"
-    assert stale == Counter(), f"stale private RPC import allowlist: {stale}"
+    assert violations == [], f"production modules import RPC implementations: {violations}"
+
+
+def test_gateway_application_ports_do_not_delegate_to_rpc_business_bodies() -> None:
+    """Concrete Ports terminate at primitives, not renamed whole RPC methods."""
+
+    violations: list[str] = []
+    for path in _python_files(GATEWAY_ROOT):
+        tree = _tree(path)
+        for boundary in (node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)):
+            if not _is_application_port_boundary(boundary):
+                continue
+            context_attributes, injected_attributes = _constructor_bindings(boundary)
+            for method in _class_methods(boundary):
+                if method.name == "__init__":
+                    continue
+                for call in (node for node in ast.walk(method) if isinstance(node, ast.Call)):
+                    callee = _terminal_ast_name(call.func)
+                    if not callee.startswith(("_handle_", "_execute_", "_read_")):
+                        continue
+                    calls_injected_body = (
+                        isinstance(call.func, ast.Attribute)
+                        and isinstance(call.func.value, ast.Name)
+                        and call.func.value.id == "self"
+                        and call.func.attr in injected_attributes
+                    )
+                    passes_rpc_context = any(
+                        _contains_rpc_context_reference(value, context_attributes)
+                        for value in (
+                            *call.args,
+                            *(keyword.value for keyword in call.keywords),
+                        )
+                    )
+                    if calls_injected_body or passes_rpc_context:
+                        violations.append(
+                            f"{_relative(path)}:{call.lineno}: "
+                            f"{boundary.name}.{method.name} delegates to {callee}"
+                        )
+
+    assert violations == [], (
+        "Gateway Application Ports must invoke neutral runtime primitives, not "
+        "whole RPC business bodies:\n" + "\n".join(violations)
+    )
+
+
+def test_gateway_application_ports_do_not_rebuild_wire_requests_for_rpc_context() -> None:
+    """Typed commands cannot make a dict/RpcContext round trip behind a Port."""
+
+    violations: list[str] = []
+    for path in _python_files(GATEWAY_ROOT):
+        tree = _tree(path)
+        for boundary in (node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)):
+            if not _is_application_port_boundary(boundary):
+                continue
+            context_attributes, injected_attributes = _constructor_bindings(boundary)
+            if not context_attributes:
+                continue
+            for method in _class_methods(boundary):
+                if method.name == "__init__":
+                    continue
+                mapping_bindings = _mapping_bindings(method)
+                semantic_parameters = _semantic_parameters(method)
+                for call in (node for node in ast.walk(method) if isinstance(node, ast.Call)):
+                    values = [
+                        *call.args,
+                        *(keyword.value for keyword in call.keywords),
+                    ]
+                    if not any(
+                        _contains_rpc_context_reference(value, context_attributes)
+                        for value in values
+                    ):
+                        continue
+                    callee = _terminal_ast_name(call.func) or ast.unparse(call.func)
+                    calls_injected_dependency = (
+                        isinstance(call.func, ast.Attribute)
+                        and isinstance(call.func.value, ast.Name)
+                        and call.func.value.id == "self"
+                        and call.func.attr in injected_attributes
+                    )
+                    rebuilds_wire_mapping = any(
+                        _mapping_expression(
+                            value,
+                            mapping_bindings,
+                            semantic_parameters,
+                        )
+                        for value in values
+                        if not _contains_rpc_context_reference(value, context_attributes)
+                    )
+                    if not (calls_injected_dependency or rebuilds_wire_mapping):
+                        continue
+                    reason = (
+                        "calls an injected dependency with RpcContext"
+                        if calls_injected_dependency
+                        else "passes a reconstructed mapping with RpcContext"
+                    )
+                    violations.append(
+                        f"{_relative(path)}:{call.lineno}: "
+                        f"{boundary.name}.{method.name} {reason} via {callee}"
+                    )
+
+    assert violations == [], (
+        "Gateway Application Ports must pass typed values to concrete services; "
+        "they cannot reconstruct wire mappings or inject whole-method callbacks:\n"
+        + "\n".join(violations)
+    )
 
 
 def test_r3_application_modules_do_not_depend_on_gateway_context() -> None:

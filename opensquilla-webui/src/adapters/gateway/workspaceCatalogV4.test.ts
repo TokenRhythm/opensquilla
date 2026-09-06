@@ -44,6 +44,26 @@ function transport() {
 }
 
 describe('createV4WorkspaceCatalog', () => {
+  it('accepts additional response fields and keeps path mutation cancellation options', async () => {
+    const request = vi.fn()
+      .mockResolvedValueOnce({ path: '/synthetic/new', name: 'new', kind: 'directory', extra: true })
+      .mockResolvedValueOnce({ path: null, kind: 'mount', extra: true })
+    const catalog = createV4WorkspaceCatalog({ request })
+    const signal = new AbortController().signal
+
+    await expect(catalog.createDirectory({
+      sessionKey: 'synthetic-session', parentPath: '/synthetic', name: 'new',
+    }, { signal })).resolves.toEqual({ path: '/synthetic/new', name: 'new', kind: 'directory' })
+    await expect(catalog.pickPath({ sessionKey: 'synthetic-session', kind: 'mount' }, { signal }))
+      .resolves.toEqual({ path: null, kind: 'mount' })
+    expect(request).toHaveBeenNthCalledWith(1, 'sandbox.path.create-directory', {
+      sessionKey: 'synthetic-session', parentPath: '/synthetic', name: 'new',
+    }, { signal, abortAction: 'reject', timeoutAction: 'reject' })
+    expect(request).toHaveBeenNthCalledWith(2, 'sandbox.path.pick', {
+      sessionKey: 'synthetic-session', kind: 'mount',
+    }, { signal, abortAction: 'reject', timeoutAction: 'reject' })
+  })
+
   it('maps workspace lifecycle methods to generated wire contracts', async () => {
     const source = transport()
     const catalog = createV4WorkspaceCatalog(source as never)

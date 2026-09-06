@@ -17,6 +17,7 @@ import pytest
 
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.start_turn import reserve_turn_via_runtime
+from opensquilla.gateway.adapters.app_settings import _notify_goal_config_changed
 from opensquilla.gateway.adapters.goals_contract import (
     register_goals_capabilities_contract,
     register_goals_reattach_contract,
@@ -35,7 +36,6 @@ from opensquilla.gateway.goal_service import GoalService
 from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.routing import build_web_route_envelope
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, RpcRegistry
-from opensquilla.gateway.rpc_config import _notify_goal_config_changed
 from opensquilla.gateway.rpc_goals import (
     _handle_goals_capabilities,
     _handle_goals_clear,
@@ -52,7 +52,7 @@ from opensquilla.gateway.rpc_sessions import (
     _handle_plans_set_mode,
     _handle_sessions_delete,
     _handle_sessions_reset,
-    _handle_sessions_send,
+    _handle_sessions_send_contract,
 )
 from opensquilla.gateway.session_streams import SessionStreamRegistry
 from opensquilla.gateway.task_runtime import (
@@ -1314,7 +1314,7 @@ async def test_reset_turn_revokes_goal_lease_and_preserves_set_receipt(
             return None
 
         monkeypatch.setattr(stack.manager, "write_session_archive", skip_archive)
-        reset_turn = await _handle_sessions_send(
+        reset_turn = await _handle_sessions_send_contract(
             {
                 "key": SOURCE_KEY,
                 "message": "Start the reset generation.",
@@ -2907,7 +2907,7 @@ async def test_collect_into_queued_owned_goal_keeps_context_candidate_exclusive(
         blocker = await stack.runtime.enqueue(blocker_envelope, "global blocker")
         await asyncio.wait_for(blocker_started.wait(), timeout=2.0)
 
-        first = await _handle_sessions_send(
+        first = await _handle_sessions_send_contract(
             {
                 "key": SOURCE_KEY,
                 "message": "First collected Goal input",
@@ -2916,7 +2916,7 @@ async def test_collect_into_queued_owned_goal_keeps_context_candidate_exclusive(
             },
             stack.context,
         )
-        second = await _handle_sessions_send(
+        second = await _handle_sessions_send_contract(
             {
                 "key": SOURCE_KEY,
                 "message": "Second collected Goal input",
@@ -3788,7 +3788,7 @@ async def test_hot_kill_switch_pauses_leased_goal_and_blocks_new_provider_turn(
             runtime_budget_seconds=3_600,
         )
 
-        await _notify_goal_config_changed(stack.context, previous_config)
+        await _notify_goal_config_changed(stack.runtime, previous_config)
         paused = await stack.storage.get_goal(SOURCE_KEY)
         assert paused is not None
         assert paused.status == "paused"

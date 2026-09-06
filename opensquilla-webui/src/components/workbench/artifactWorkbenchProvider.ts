@@ -13,7 +13,14 @@ import { promptAnnotationBodyWithinLimit } from '@/types/promptAnnotations'
 import {
   isActiveDocumentArtifactCandidate,
 } from '@/utils/chat/artifactAccess'
-import type { ArtifactContentAccess } from '@/modules/artifactWorkbench'
+import {
+  ArtifactPreviewLeaseError,
+  type ArtifactContentAccess,
+  type ArtifactPreviewAccess,
+  type ArtifactPreviewLease,
+  type ArtifactPreviewResourceState,
+  type NativeHtmlArtifactResource,
+} from '@/modules/artifactWorkbench'
 import {
   artifactFileSubtitle,
   artifactFileTitle,
@@ -47,17 +54,6 @@ import type {
   NativeWorkbenchSurfaceEvent,
   NativeWorkbenchSurfaceRectRequest,
 } from '@/platform/types'
-import type {
-  ArtifactPreviewResourceState,
-  NativeHtmlArtifactResource,
-} from '@/composables/workbench/useArtifactPreviewResource'
-import {
-  ArtifactPreviewLeaseError,
-  createArtifactPreviewLease,
-  renewArtifactPreviewLease,
-  revokeArtifactPreviewLease,
-  type ArtifactPreviewLease,
-} from '@/utils/workbench/artifactPreviewLease'
 import ArtifactDocumentPanel from './ArtifactDocumentPanel.vue'
 
 type Translate = (key: string, params?: Record<string, unknown>) => string
@@ -69,6 +65,7 @@ interface ArtifactPreviewPanelHandle {
 
 export interface ArtifactWorkbenchProviderOptions {
   artifactContent: ArtifactContentAccess
+  artifactPreviews: ArtifactPreviewAccess
   artifactDocuments?: {
     load(
       artifact: ArtifactPayload,
@@ -2112,12 +2109,11 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
 
     let lease: ArtifactPreviewLease
     try {
-      lease = await createArtifactPreviewLease(
+      lease = await this.options.artifactPreviews.createLease(
         artifact,
         this.mode,
         this.options.platform.id,
         {
-          baseOrigin: this.options.baseOrigin,
           nativeBroker: nativeApi,
           sessionKey: artifactSessionKey(this.item, this.options),
         },
@@ -2419,8 +2415,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     const lease = this.lease
     if (!lease || !this.context.isItemOpen()) return
     try {
-      const renewal = await renewArtifactPreviewLease(lease.lease_id, {
-        baseOrigin: this.options.baseOrigin,
+      const renewal = await this.options.artifactPreviews.renewLease(lease.lease_id, {
         nativeBroker: this.context.nativeWorkbenchApi,
         sessionKey: artifactSessionKey(this.item, this.options),
       })
@@ -2465,8 +2460,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       await this.options.artifactContent.clearPreviewStorage(lease.preview_origin)
     }
     try {
-      await revokeArtifactPreviewLease(lease.lease_id, {
-        baseOrigin: this.options.baseOrigin,
+      await this.options.artifactPreviews.revokeLease(lease.lease_id, {
         nativeBroker: this.context.nativeWorkbenchApi,
         sessionKey: artifactSessionKey(this.item, this.options),
       })
