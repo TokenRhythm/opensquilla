@@ -28,8 +28,10 @@ from opensquilla.memory.session_flush import FlushReceipt
 class _Quiescence:
     events: list[str]
 
-    async def quiesce(self, session_key: str) -> None:
+    @asynccontextmanager
+    async def quiesce(self, session_key: str) -> AsyncIterator[None]:
         self.events.append(f"quiesce:{session_key}")
+        yield
 
 
 @dataclass
@@ -232,9 +234,7 @@ def _application(
 async def test_reset_owns_quiesce_flush_rotate_epoch_and_invalidation_order() -> None:
     events: list[str] = []
 
-    result = await _application(events).reset(
-        ResetSession(" agent:main:webchat:one ")
-    )
+    result = await _application(events).reset(ResetSession(" agent:main:webchat:one "))
 
     assert result.session_id == "session-new"
     assert result.previous_session_id == "session-old"
@@ -342,9 +342,7 @@ async def test_flush_exception_becomes_typed_failure_without_rotation() -> None:
 async def test_empty_transcript_rotates_with_skipped_receipt_without_flushing() -> None:
     events: list[str] = []
 
-    result = await _application(events, transcript=()).reset(
-        ResetSession("agent:main:webchat:one")
-    )
+    result = await _application(events, transcript=()).reset(ResetSession("agent:main:webchat:one"))
 
     assert result.flush_receipt is not None
     assert result.flush_receipt.mode == "skipped"

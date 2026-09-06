@@ -166,6 +166,8 @@ class _RecordingCompactionPersist:
         source_preimage: tuple[tuple[Any, ...], ...] | None = None,
         source_boundary_message_id: str | None = None,
         source_boundary_entry_id: int | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> bool | None:
         self.calls.append(
             {
@@ -187,6 +189,8 @@ class _RecordingCompactionPersist:
                 "source_preimage": source_preimage,
                 "source_boundary_message_id": source_boundary_message_id,
                 "source_boundary_entry_id": source_boundary_entry_id,
+                "expected_session_id": expected_session_id,
+                "expected_session_epoch": expected_session_epoch,
             }
         )
         if self.raises is not None:
@@ -293,6 +297,8 @@ def _make_input(
     compaction_source_preimage: tuple[tuple[Any, ...], ...] | None = None,
     compaction_source_boundary_message_id: str | None = None,
     compaction_source_boundary_entry_id: int | None = None,
+    expected_session_id: str | None = None,
+    expected_session_epoch: int | None = None,
     execution_context: TurnExecutionContext | None = None,
 ) -> StreamConsumerStageInput:
     return StreamConsumerStageInput(
@@ -322,6 +328,8 @@ def _make_input(
             compaction_source_boundary_message_id
         ),
         compaction_source_boundary_entry_id=compaction_source_boundary_entry_id,
+        expected_session_id=expected_session_id,
+        expected_session_epoch=expected_session_epoch,
         input_mode=input_mode,
         execution_context=execution_context,
     )
@@ -1678,6 +1686,8 @@ async def test_compaction_handler_runs_persist_snapshot_prompt_in_order() -> Non
         compaction_source_preimage=source_preimage,
         compaction_source_boundary_message_id="source-boundary",
         compaction_source_boundary_entry_id=7,
+        expected_session_id="session-admitted",
+        expected_session_epoch=7,
     )
     await handler.handle(
         CompactionEvent(
@@ -1697,6 +1707,8 @@ async def test_compaction_handler_runs_persist_snapshot_prompt_in_order() -> Non
     assert persist.calls[0]["source_preimage"] is source_preimage
     assert persist.calls[0]["source_boundary_message_id"] == "source-boundary"
     assert persist.calls[0]["source_boundary_entry_id"] == 7
+    assert persist.calls[0]["expected_session_id"] == "session-admitted"
+    assert persist.calls[0]["expected_session_epoch"] == 7
     assert len(snapshot.calls) == 1
     assert len(prompt.calls) == 1
 

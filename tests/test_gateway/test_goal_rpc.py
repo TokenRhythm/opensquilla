@@ -644,6 +644,16 @@ async def test_set_is_atomic_emits_one_goal_event_and_creates_no_plan_state(
         # boundary, before TaskRuntime changes QUEUED to RUNNING.
         assert goal["executionState"] == "queued"
 
+        session = await stack.storage.get_session(SOURCE_KEY)
+        assert session is not None
+        assert response["sessionId"] == session.session_id
+        assert response["epoch"] == session.epoch
+        task = await stack.storage.get_agent_task(response["taskId"])
+        assert task is not None
+        assert task.details is not None
+        assert task.details["session_id"] == session.session_id
+        assert task.details["session_epoch"] == session.epoch
+
         assert len(captured) == 1
         run = captured[0]
         assert run.run_kind == "session_turn"
@@ -651,6 +661,8 @@ async def test_set_is_atomic_emits_one_goal_event_and_creates_no_plan_state(
         assert run.persist_input is False
         assert run.history_has_persisted_user is True
         assert run.goal_context is not None
+        assert run.envelope.session_id == session.session_id
+        assert run.envelope.session_epoch == session.epoch
 
         transcript = await stack.manager.get_transcript(SOURCE_KEY)
         assert len(transcript) == 1

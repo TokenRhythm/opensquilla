@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
@@ -39,6 +40,57 @@ if TYPE_CHECKING:
 log = structlog.get_logger(__name__)
 _STREAM_IDLE_TIMEOUT_CODE = "stream_idle_timeout"
 _STREAM_IDLE_TIMEOUT_MESSAGE = "Session event stream idle before terminal event"
+
+
+def _accepts_keyword_arg(callable_obj: Any, name: str) -> bool:
+    try:
+        params = inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):
+        return False
+    if name in params:
+        return True
+    return any(param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values())
+
+
+def _accepts_explicit_keyword_arg(callable_obj: Any, name: str) -> bool:
+    try:
+        parameter = inspect.signature(callable_obj).parameters.get(name)
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
+
+
+def _session_owner_kwargs(
+    operation: Any,
+    *,
+    session_id: str | None,
+    session_epoch: int | None,
+) -> dict[str, Any]:
+    if session_epoch is None:
+        if (
+            isinstance(session_id, str)
+            and session_id
+            and _accepts_keyword_arg(operation, "expected_session_id")
+        ):
+            return {"expected_session_id": session_id}
+        return {}
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(session_epoch, int)
+        or isinstance(session_epoch, bool)
+        or session_epoch < 0
+        or not _accepts_explicit_keyword_arg(operation, "expected_session_id")
+        or not _accepts_explicit_keyword_arg(operation, "expected_session_epoch")
+    ):
+        raise RuntimeError("Modern direct turn ownership requires an exact session-owner operation")
+    return {
+        "expected_session_id": session_id,
+        "expected_session_epoch": session_epoch,
+    }
 
 
 def _optional_positive_timeout(config: Any, attr: str, default: float) -> float | None:
@@ -90,6 +142,8 @@ async def run_direct_turn(
     def event_payload(payload: dict[str, Any]) -> dict[str, Any]:
         enriched = dict(payload)
         enriched.setdefault("session_id", session_id)
+        if isinstance(storage, SessionStorage) and route_envelope.session_epoch is not None:
+            enriched.setdefault("epoch", route_envelope.session_epoch)
         if not enriched.get("turn_id"):
             enriched["turn_id"] = turn_id
         enriched.setdefault("client_message_id", turn_context.get("client_message_id"))
@@ -97,6 +151,31 @@ async def run_direct_turn(
             enriched.setdefault("user_message_id", user_message_id)
         enriched.setdefault("surface_id", turn_context.get("surface_id"))
         return enriched
+
+    def owner_kwargs(operation: Any) -> dict[str, Any]:
+        if not isinstance(storage, SessionStorage):
+            if route_envelope.session_epoch is not None and all(
+                _accepts_explicit_keyword_arg(operation, field)
+                for field in ("expected_session_id", "expected_session_epoch")
+            ):
+                return {
+                    "expected_session_id": session_id,
+                    "expected_session_epoch": route_envelope.session_epoch,
+                }
+            return {}
+        return _session_owner_kwargs(
+            operation,
+            session_id=session_id,
+            session_epoch=route_envelope.session_epoch,
+        )
+
+    async def append_system_message(content: str) -> None:
+        await sessions.append_message(
+            session_key,
+            role="system",
+            content=content,
+            **owner_kwargs(sessions.append_message),
+        )
 
     async def emit_terminal_once(event_name: str, payload: dict[str, Any]) -> None:
         nonlocal terminal_emitted
@@ -120,16 +199,25 @@ async def run_direct_turn(
         turn_scope.__enter__()
         if runner is None:
             log.error("sessions.send.no_turn_runner", session_key=session_key)
-            await sessions.append_message(
-                session_key, role="system", content="Error: No turn runner available"
-            )
+            await append_system_message("Error: No turn runner available")
             await emit_terminal_once(
                 "session.event.error",
                 {"message": "No turn runner available", "code": "no_turn_runner"},
             )
             return
 
-        execution_session = await storage.get_session(session_key)
+        get_session = getattr(sessions, "get_session", None)
+        if callable(get_session):
+            execution_session = await get_session(
+                session_key,
+                **owner_kwargs(get_session),
+            )
+        elif not isinstance(storage, SessionStorage):
+            execution_session = await storage.get_session(session_key)
+        else:
+            raise RuntimeError(
+                "Modern direct turn ownership requires an exact session-owner lookup"
+            )
         if execution_session is None:
             raise KeyError(f"Session not found: {session_key}")
         if guest_profile is not None:
@@ -178,6 +266,7 @@ async def run_direct_turn(
             semantic_message=semantic_message,
             fresh_user_session=fresh_user_session,
             root_turn_id=turn_id,
+            **owner_kwargs(runner.run),
         )
         raw_idle_timeout = effective_agent_stream_idle_timeout_seconds(config)
         idle_timeout = raw_idle_timeout if raw_idle_timeout > 0 else None
@@ -231,7 +320,7 @@ async def run_direct_turn(
                 "error_message": _STREAM_IDLE_TIMEOUT_MESSAGE,
             }
         )
-        await sessions.append_message(session_key, role="system", content=timeout_message)
+        await append_system_message(timeout_message)
         await emit_terminal_once(
             "session.event.error",
             {"message": _STREAM_IDLE_TIMEOUT_MESSAGE, "code": _STREAM_IDLE_TIMEOUT_CODE},
@@ -243,9 +332,7 @@ async def run_direct_turn(
             session_key=session_key,
             reason=exc.reason,
         )
-        await sessions.append_message(
-            session_key, role="system", content=f"Error: {mapped.message}"
-        )
+        await append_system_message(f"Error: {mapped.message}")
         await emit_terminal_once(
             "session.event.error",
             {
@@ -269,7 +356,7 @@ async def run_direct_turn(
         log.error(
             "sessions.send.agent_failed", session_key=session_key, error=str(exc), exc_info=True
         )
-        await sessions.append_message(session_key, role="system", content=f"Error: {error_message}")
+        await append_system_message(f"Error: {error_message}")
         await emit_terminal_once(
             "session.event.error",
             {"message": error_message, "code": event_code},

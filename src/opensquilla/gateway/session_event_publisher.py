@@ -65,19 +65,25 @@ async def prepare_session_event_payload(
 
     prepared = dict(payload)
     if event_name.startswith("session.event.") or event_name == "sessions.changed":
-        session_manager = getattr(ctx, "session_manager", None)
-        cached_epoch = get_session_epoch(session_manager, session_key)
-        if cached_epoch is not None:
-            prepared["epoch"] = cached_epoch
+        if "epoch" in prepared:
+            try:
+                prepared["epoch"] = max(0, int(prepared["epoch"] or 0))
+            except (TypeError, ValueError):
+                pass
         else:
-            storage = get_session_storage(session_manager)
-            if storage is not None and hasattr(storage, "get_epoch"):
-                try:
-                    epoch = await storage.get_epoch(session_key)
-                    set_session_epoch(session_manager, session_key, epoch)
-                    prepared["epoch"] = epoch
-                except Exception:
-                    pass  # best-effort; never block event delivery
+            session_manager = getattr(ctx, "session_manager", None)
+            cached_epoch = get_session_epoch(session_manager, session_key)
+            if cached_epoch is not None:
+                prepared["epoch"] = cached_epoch
+            else:
+                storage = get_session_storage(session_manager)
+                if storage is not None and hasattr(storage, "get_epoch"):
+                    try:
+                        epoch = await storage.get_epoch(session_key)
+                        set_session_epoch(session_manager, session_key, epoch)
+                        prepared["epoch"] = epoch
+                    except Exception:
+                        pass  # best-effort; never block event delivery
     if event_name == SESSIONS_CHANGED_EVENT:
         prepared = observe_sessions_changed_payload(
             prepared,

@@ -208,6 +208,8 @@ class TranscriptAppendPort(Protocol):
         turn_usage: dict[str, Any] | None,
         token_count: int | None,
         assistant_message_id: str | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> TranscriptAppendResult | bool: ...
 
 @runtime_checkable
@@ -231,6 +233,8 @@ class TurnMemoryCapturePort(Protocol):
         input_provenance: dict[str, Any] | None,
         run_kind: str,
         no_memory_capture: bool,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> None: ...
 
 
@@ -462,6 +466,8 @@ class SessionTotalsPort(Protocol):
         session_key: str,
         done_event: DoneEvent,
         resolved_model: str,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> CostRollupResult | None: ...
 
 @runtime_checkable
@@ -480,6 +486,8 @@ class TurnErrorPersistPort(Protocol):
         session_key: str,
         event: ErrorEvent | None,
         append_transcript: bool = True,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> None: ...
 
 
@@ -573,6 +581,10 @@ class TurnFinalizerStageInput:
     heartbeat_ack_max_chars: int
     no_memory_capture: bool
 
+    # Immutable session-incarnation owner captured during task admission.
+    # ``None`` preserves direct and legacy TurnRunner callers.
+    expected_session_id: str | None = None
+    expected_session_epoch: int | None = None
     # Additive identity path.  ``None`` preserves direct/legacy stage callers;
     # an identity-aware TurnRunner supplies one id before streaming starts.
     assistant_message_id: str | None = None
@@ -835,6 +847,10 @@ class TurnFinalizerStage:
             }
             if assistant_message_id is not None:
                 append_kwargs["assistant_message_id"] = assistant_message_id
+            if inp.expected_session_id is not None:
+                append_kwargs["expected_session_id"] = inp.expected_session_id
+            if inp.expected_session_epoch is not None:
+                append_kwargs["expected_session_epoch"] = inp.expected_session_epoch
             append_result = await self._transcript_append.append_message(
                 inp.session_key,
                 **append_kwargs,
@@ -863,6 +879,13 @@ class TurnFinalizerStage:
                     )
             if transcript_appended and not inp.no_memory_capture:
                 try:
+                    capture_kwargs: dict[str, Any] = {}
+                    if (
+                        inp.expected_session_id is not None
+                        or inp.expected_session_epoch is not None
+                    ):
+                        capture_kwargs["expected_session_id"] = inp.expected_session_id
+                        capture_kwargs["expected_session_epoch"] = inp.expected_session_epoch
                     await self._turn_memory_capture.capture_turn(
                         agent_id=inp.agent_id,
                         session_key=inp.session_key,
@@ -873,6 +896,7 @@ class TurnFinalizerStage:
                         input_provenance=inp.input_provenance,
                         run_kind=inp.run_kind,
                         no_memory_capture=inp.no_memory_capture,
+                        **capture_kwargs,
                     )
                     memory_captured = True
                 except Exception as exc:  # noqa: BLE001 - log-and-continue intentional
@@ -891,11 +915,16 @@ class TurnFinalizerStage:
         # adapter folds the session-manager-None guard, and the helper
         # also guards event-is-None internally).
         if inp.error_message:
-            await self._turn_error_persist.persist_error(
-                session_key=inp.session_key,
-                event=inp.pending_error_event,
-                append_transcript=not inp.terminal_generation_reset,
-            )
+            error_kwargs: dict[str, Any] = {
+                "session_key": inp.session_key,
+                "event": inp.pending_error_event,
+                "append_transcript": not inp.terminal_generation_reset,
+            }
+            if inp.expected_session_id is not None:
+                error_kwargs["expected_session_id"] = inp.expected_session_id
+            if inp.expected_session_epoch is not None:
+                error_kwargs["expected_session_epoch"] = inp.expected_session_epoch
+            await self._turn_error_persist.persist_error(**error_kwargs)
 
         # 5. Session totals rollup (only when DoneEvent present; the
         # adapter folds the session-manager-None and
@@ -903,10 +932,18 @@ class TurnFinalizerStage:
         cost_rollup: CostRollupResult | None = None
         if done_event is not None:
             try:
+                totals_kwargs: dict[str, Any] = {}
+                if (
+                    inp.expected_session_id is not None
+                    or inp.expected_session_epoch is not None
+                ):
+                    totals_kwargs["expected_session_id"] = inp.expected_session_id
+                    totals_kwargs["expected_session_epoch"] = inp.expected_session_epoch
                 cost_rollup = await self._session_totals.rollup(
                     session_key=inp.session_key,
                     done_event=done_event,
                     resolved_model=inp.resolved_model,
+                    **totals_kwargs,
                 )
             except Exception as exc:  # noqa: BLE001 - log-and-continue intentional
                 log.warning(

@@ -326,6 +326,7 @@ from opensquilla.session.keys import (
     is_subagent_key,
     normalize_agent_id,
 )
+from opensquilla.session.storage import StaleEpochError
 from opensquilla.session.terminal_reply import (
     append_error_ref,
     build_terminal_reply,
@@ -782,6 +783,8 @@ class _EmergencyCompactionOverride:
     kept_entries: list[Any]
     reason: str
     compaction_id: str
+    expected_session_id: str | None = None
+    expected_session_epoch: int | None = None
 
 
 def _non_negative_int(value: object) -> int:
@@ -957,6 +960,47 @@ def _accepts_keyword_arg(callable_obj: Any, name: str) -> bool:
     if name in params:
         return True
     return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _accepts_explicit_keyword_arg(callable_obj: Any, name: str) -> bool:
+    """Return whether a durable-owner keyword is part of the declared contract."""
+    try:
+        parameter = inspect.signature(callable_obj).parameters.get(name)
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
+
+
+def _has_session_storage(session_manager: Any) -> bool:
+    return (
+        getattr(session_manager, "storage", None) is not None
+        or getattr(session_manager, "_storage", None) is not None
+    )
+
+
+def _require_optional_exact_session_owner(
+    expected_session_id: str | None,
+    expected_session_epoch: int | None,
+) -> bool:
+    """Validate an optional exact-owner pair and report whether it was supplied."""
+
+    supplied = expected_session_id is not None or expected_session_epoch is not None
+    if not supplied:
+        return False
+    if (
+        not isinstance(expected_session_id, str)
+        or not expected_session_id
+        or isinstance(expected_session_epoch, bool)
+        or not isinstance(expected_session_epoch, int)
+        or expected_session_epoch < 0
+    ):
+        raise ValueError(
+            "expected_session_id and expected_session_epoch must form a valid pair"
+        )
+    return True
 
 
 def _strip_context_summary_marker(content: str) -> str:
@@ -4527,6 +4571,38 @@ def _resolve_submit_review(config: object) -> bool:
     return bool(getattr(config, "submit_review_enabled", False))
 
 
+class _TaskOwnedSessionAppend:
+    """Bind legacy input-stage appends to one admitted session incarnation."""
+
+    def __init__(
+        self,
+        manager: Any,
+        *,
+        session_id: str,
+        session_epoch: int,
+    ) -> None:
+        self._manager = manager
+        self._session_id = session_id
+        self._session_epoch = session_epoch
+
+    async def append_message(
+        self,
+        session_key: str,
+        role: str,
+        content: str,
+        *,
+        provenance: dict[str, Any] | None = None,
+    ) -> Any:
+        return await self._manager.append_message(
+            session_key,
+            role,
+            content,
+            provenance=provenance,
+            expected_session_id=self._session_id,
+            expected_session_epoch=self._session_epoch,
+        )
+
+
 class TurnRunner:
     """Orchestrates a complete agent turn: provider → tools → prompt → pipeline → Agent.
 
@@ -4765,6 +4841,7 @@ class TurnRunner:
     def clear_compaction_turn_state(self, session_key: str) -> None:
         self._turn_compaction_attempted_sessions.discard(session_key)
         self._turn_compacted_sessions.discard(session_key)
+        getattr(self, "_emergency_compaction_overrides", {}).pop(session_key, None)
 
     def refresh_memory_snapshot(self, agent_id: str) -> None:
         """Refresh frozen snapshots for all sessions of the given agent.
@@ -4897,6 +4974,8 @@ class TurnRunner:
         input_provenance: dict[str, Any] | None,
         run_kind: str = "default",
         no_memory_capture: bool = False,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> None:
         memory_cfg = getattr(self._config, "memory", None)
         if not self._turn_memory_capture_allowed(
@@ -4915,11 +4994,31 @@ class TurnRunner:
         if capture_service is None:
             return
         session = await self._session_manager.get_session(session_key)
-        if session is None:
-            return
+        if expected_session_id is not None or expected_session_epoch is not None:
+            if (
+                session is None
+                or getattr(session, "session_id", None) != expected_session_id
+                or int(getattr(session, "epoch", 0) or 0) != expected_session_epoch
+            ):
+                raise StaleEpochError("Turn session owner changed before memory capture")
+            capture_session_id = expected_session_id or ""
+        else:
+            if session is None:
+                return
+            capture_session_id = getattr(session, "session_id", "")
+        capture_kwargs: dict[str, Any] = {}
+        if expected_session_id is not None or expected_session_epoch is not None:
+            if not _accepts_explicit_keyword_arg(
+                capture_service.capture_turn,
+                "session_namespace",
+            ):
+                raise RuntimeError(
+                    "turn memory capture does not support owner-scoped storage"
+                )
+            capture_kwargs["session_namespace"] = capture_session_id
         await capture_service.capture_turn(
             session_key=session_key,
-            session_id=getattr(session, "session_id", ""),
+            session_id=capture_session_id,
             user_text=runtime_message,
             assistant_text=final_text,
             source=self._build_turn_call_source(
@@ -4929,6 +5028,7 @@ class TurnRunner:
             ),
             captured_at=datetime.now(tz=UTC),
             no_memory_capture=no_memory_capture,
+            **capture_kwargs,
         )
 
     @staticmethod
@@ -5090,6 +5190,8 @@ class TurnRunner:
         root_turn_id: str | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
         assistant_message_id: str | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run one agent turn with full orchestration.
 
@@ -5104,6 +5206,19 @@ class TurnRunner:
         """
         session_key = canonicalize_session_key(session_key)
         agent_id = normalize_agent_id(agent_id)
+        owner_supplied = (
+            expected_session_id is not None or expected_session_epoch is not None
+        )
+        if owner_supplied and (
+            not isinstance(expected_session_id, str)
+            or not expected_session_id.strip()
+            or isinstance(expected_session_epoch, bool)
+            or not isinstance(expected_session_epoch, int)
+            or expected_session_epoch < 0
+        ):
+            raise ValueError(
+                "expected_session_id and expected_session_epoch must form a valid pair"
+            )
         normalized_input_provenance = self._normalize_input_provenance(input_provenance)
         lock = self.get_session_lock(session_key)
         # Resolved once per turn; ValueError propagates so a run manifest
@@ -5186,6 +5301,25 @@ class TurnRunner:
         current_task = asyncio.current_task()
         owner_map = _SESSION_LOCK_OWNER.get(None)
         _caller_holds_lock = owner_map is not None and id(lock) in owner_map
+
+        async def validate_standalone_owner() -> None:
+            if not owner_supplied or self._session_manager is None:
+                return
+            get_session = getattr(self._session_manager, "get_session", None)
+            if not callable(get_session):
+                # Compatibility-only managers remain protected at each
+                # transcript append, but cannot offer a pre-provider check.
+                return
+            current = await get_session(session_key)
+            if (
+                current is None
+                or getattr(current, "session_id", None) != expected_session_id
+                or getattr(current, "epoch", None) != expected_session_epoch
+            ):
+                raise StaleEpochError(
+                    "Turn session owner changed before provider dispatch"
+                )
+
         if _caller_holds_lock:
             # Same call chain already serializes this turn.
             try:
@@ -5230,6 +5364,8 @@ class TurnRunner:
                         root_turn_id=logical_turn_id,
                         provider_request_correlation=provider_request_correlation,
                         assistant_message_id=assistant_message_id,
+                        expected_session_id=expected_session_id,
+                        expected_session_epoch=expected_session_epoch,
                         execution_context=execution_context,
                     ):
                         yield event
@@ -5238,6 +5374,10 @@ class TurnRunner:
                 await execution_context.close()
         else:
             async with lock:
+                # Standalone/legacy runners do not have TaskRuntime's durable
+                # admission CAS. Validate while holding the same session lock
+                # that reset must acquire, before resolving any provider/tools.
+                await validate_standalone_owner()
                 # Record this Task as the lock owner in the ContextVar so that
                 # any nested call to run() within the same Task can detect re-entry.
                 _map: dict[int, asyncio.Task[Any]] = dict(owner_map or {})
@@ -5286,6 +5426,8 @@ class TurnRunner:
                             root_turn_id=logical_turn_id,
                             provider_request_correlation=provider_request_correlation,
                             assistant_message_id=assistant_message_id,
+                            expected_session_id=expected_session_id,
+                            expected_session_epoch=expected_session_epoch,
                             execution_context=execution_context,
                         ):
                             yield event
@@ -5330,6 +5472,8 @@ class TurnRunner:
         root_turn_id: str | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
         assistant_message_id: str | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
         execution_context: TurnExecutionContext | None = None,
     ) -> AsyncIterator[AgentEvent]:
         # Observability: bracket turn setup + stream loop with monotonic clock
@@ -5375,6 +5519,7 @@ class TurnRunner:
         turn_call_logger: TurnCallLogger | None = None
         trace_context = TraceContext.new(
             session_key=session_key,
+            session_id=expected_session_id,
             turn_id=turn_id,
             agent_id=agent_id,
         )
@@ -5414,7 +5559,11 @@ class TurnRunner:
             # an auxiliary provider call. This lookup is independent from the
             # optional usage sink and never falls back to the external
             # session_key, which may contain channel or user information.
-            pipeline_session_id = await self._resolve_session_id_for_log(session_key)
+            pipeline_session_id = (
+                expected_session_id
+                if expected_session_id is not None
+                else await self._resolve_session_id_for_log(session_key)
+            )
             if provider_request_correlation_disabled(config=self._turn_config()):
                 provider_request_correlation = None
             elif isinstance(correlation_seed, ProviderRequestCorrelation):
@@ -5433,6 +5582,17 @@ class TurnRunner:
             else:
                 provider_request_correlation = None
 
+            session_append: Any = self._session_manager
+            if (
+                session_append is not None
+                and expected_session_id is not None
+                and expected_session_epoch is not None
+            ):
+                session_append = _TaskOwnedSessionAppend(
+                    session_append,
+                    session_id=expected_session_id,
+                    session_epoch=expected_session_epoch,
+                )
             input_out = await self._input_stage.run(
                 InputStageInput(
                     message=message,
@@ -5442,7 +5602,7 @@ class TurnRunner:
                     input_provenance=input_provenance,
                     session_key=session_key,
                     tool_context=tool_context,
-                    session_append=self._session_manager,
+                    session_append=session_append,
                 )
             )
             runtime_message = input_out.runtime_message
@@ -5456,7 +5616,26 @@ class TurnRunner:
                 get_transcript = getattr(self._session_manager, "get_transcript", None)
                 if not callable(get_transcript):
                     return ()
-                entries = get_transcript(session_key)
+                transcript_kwargs: dict[str, Any] = {}
+                if expected_session_id is not None or expected_session_epoch is not None:
+                    if not (
+                        _accepts_explicit_keyword_arg(
+                            get_transcript,
+                            "expected_session_id",
+                        )
+                        and _accepts_explicit_keyword_arg(
+                            get_transcript,
+                            "expected_session_epoch",
+                        )
+                    ):
+                        if _has_session_storage(self._session_manager):
+                            raise RuntimeError(
+                                "session transcript reader does not support exact ownership"
+                            )
+                    else:
+                        transcript_kwargs["expected_session_id"] = expected_session_id
+                        transcript_kwargs["expected_session_epoch"] = expected_session_epoch
+                entries = get_transcript(session_key, **transcript_kwargs)
                 if inspect.isawaitable(entries):
                     entries = await entries
                 return entries or ()
@@ -5493,7 +5672,12 @@ class TurnRunner:
                         "error_chars": len(provider_error_event.message),
                     },
                 )
-                await self._persist_turn_error(session_key, provider_error_event)
+                await self._persist_turn_error(
+                    session_key,
+                    provider_error_event,
+                    expected_session_id=expected_session_id,
+                    expected_session_epoch=expected_session_epoch,
+                )
                 yield provider_error_event
                 return
             pt_out = pt_outcome.require_output()
@@ -5558,7 +5742,11 @@ class TurnRunner:
                     agent_run_id=turn_id,
                     turn_id=turn_id,
                     session_id=pipeline_session_id,
-                    session_epoch=self._usage_session_epoch_by_key.get(session_key, 0),
+                    session_epoch=(
+                        expected_session_epoch
+                        if expected_session_epoch is not None
+                        else self._usage_session_epoch_by_key.get(session_key, 0)
+                    ),
                     agent_id=agent_id,
                     run_kind=run_kind or "turn",
                 )
@@ -5601,6 +5789,8 @@ class TurnRunner:
                         skill_catalog=skill_catalog,
                         usage_execution_context=pipeline_usage_context,
                         transcript_snapshot=transcript_snapshot,
+                        expected_session_id=expected_session_id,
+                        expected_session_epoch=expected_session_epoch,
                         provider_request_correlation=provider_request_correlation,
                     )
                 )
@@ -5634,12 +5824,23 @@ class TurnRunner:
                 )
             resolved_model = pa_out.resolved_model
             provider_name = pa_out.provider_name
-            session_id_for_log = pa_out.session_id_for_log
+            # Prompt assembly may resolve the mutable current session after a
+            # task has already been admitted.  Keep every task-owned record on
+            # the admitted incarnation instead of relabelling it after reset.
+            session_id_for_log = (
+                expected_session_id
+                if expected_session_id is not None
+                else pa_out.session_id_for_log
+            )
             prompt_report_for_log = pa_out.prompt_report
             selector_model = pa_out.selector_model
             trace_context = replace(
                 trace_context,
-                session_id=pa_out.trace_context_session_id,
+                session_id=(
+                    expected_session_id
+                    if expected_session_id is not None
+                    else pa_out.trace_context_session_id
+                ),
             )
             if is_turn_call_log_enabled(self._diagnostics_state):
                 turn_call_logger = TurnCallLogger(
@@ -6199,6 +6400,8 @@ class TurnRunner:
                         session_key=session_key,
                         agent_id=agent_id,
                         history_has_persisted_user=history_has_persisted_user,
+                        expected_session_id=expected_session_id,
+                        expected_session_epoch=expected_session_epoch,
                         bound_user_message_id=bound_user_message_id,
                         provider_request_correlation=compaction_correlation,
                         consumer_admission=consumer_admission,
@@ -6236,6 +6439,26 @@ class TurnRunner:
                         capture_kwargs["transcript_entries"] = (
                             await transcript_snapshot.get_entries()
                         )
+                    if expected_session_id is not None or expected_session_epoch is not None:
+                        if not (
+                            _accepts_explicit_keyword_arg(
+                                capture_compaction_source,
+                                "expected_session_id",
+                            )
+                            and _accepts_explicit_keyword_arg(
+                                capture_compaction_source,
+                                "expected_session_epoch",
+                            )
+                        ):
+                            if _has_session_storage(self._session_manager):
+                                raise RuntimeError(
+                                    "compaction source reader does not support exact ownership"
+                                )
+                        else:
+                            capture_kwargs["expected_session_id"] = expected_session_id
+                            capture_kwargs["expected_session_epoch"] = (
+                                expected_session_epoch
+                            )
                     source_snapshot = await capture_compaction_source(
                         session_key,
                         boundary_message_id=(
@@ -6346,6 +6569,8 @@ class TurnRunner:
                 compaction_source_boundary_entry_id=(
                     compaction_source_boundary_entry_id
                 ),
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
                 input_mode=input_mode,
                 execution_context=execution_context,
             )
@@ -6392,6 +6617,8 @@ class TurnRunner:
                     root_turn_id=turn_id,
                     provider_request_correlation=provider_request_correlation,
                     assistant_message_id=assistant_message_id,
+                    expected_session_id=expected_session_id,
+                    expected_session_epoch=expected_session_epoch,
                     execution_context=execution_context,
                 ):
                     yield replayed_event
@@ -6448,6 +6675,8 @@ class TurnRunner:
                     run_kind=run_kind,
                     heartbeat_ack_max_chars=heartbeat_ack_max_chars,
                     no_memory_capture=no_memory_capture,
+                    expected_session_id=expected_session_id,
+                    expected_session_epoch=expected_session_epoch,
                     assistant_message_id=execution_context.identity.assistant_message_id,
                     execution_context=execution_context,
                     publication_ledger=execution_context.publication_ledger,
@@ -6746,6 +6975,10 @@ class TurnRunner:
                             execution_context.identity.assistant_message_id
                         ),
                     }
+                    if expected_session_id is not None:
+                        append_kwargs["expected_session_id"] = expected_session_id
+                    if expected_session_epoch is not None:
+                        append_kwargs["expected_session_epoch"] = expected_session_epoch
                     append_message = self._session_manager.append_message
                     if _accepts_keyword_arg(append_message, "turn_usage"):
                         append_kwargs["turn_usage"] = cancelled_turn_usage
@@ -6798,6 +7031,7 @@ class TurnRunner:
                         await _finish_required_cancel_cleanup(
                             reconcile_usage(
                                 session_key=session_key,
+                                expected_session_id=pipeline_usage_context.session_id,
                                 expected_epoch=pipeline_usage_context.session_epoch,
                             )
                         )
@@ -6843,6 +7077,17 @@ class TurnRunner:
             raise
 
         except Exception as exc:
+            if isinstance(exc, StaleEpochError):
+                # A reset retired this task's transcript authority. Never
+                # translate the rejected finalizer append into an unfenced
+                # system Error row in the replacement incarnation.
+                log.info(
+                    "turn_runner.stale_session_owner",
+                    session_key=session_key,
+                    expected_session_id=expected_session_id,
+                    expected_session_epoch=expected_session_epoch,
+                )
+                raise
             provider_boundary_failure_kind = str(
                 getattr(exc, "failure_kind", "") or ""
             ).strip()
@@ -6915,7 +7160,11 @@ class TurnRunner:
             error_id = await self._record_turn_error(
                 session_key=session_key,
                 turn_id=turn_id,
-                session_id=session_id_for_log,
+                session_id=(
+                    expected_session_id
+                    if expected_session_id is not None
+                    else session_id_for_log
+                ),
                 surface=input_mode or "unknown",
                 error_class=error_code or type(exc).__name__,
                 message=error_message,
@@ -6946,8 +7195,19 @@ class TurnRunner:
                     )
                 else:
                     transcript_message = f"Error: {append_error_ref(error_message, error_id)}"
+                error_append_kwargs: dict[str, Any] = {
+                    "role": "system",
+                    "content": transcript_message,
+                }
+                if expected_session_id is not None:
+                    error_append_kwargs["expected_session_id"] = expected_session_id
+                if expected_session_epoch is not None:
+                    error_append_kwargs["expected_session_epoch"] = (
+                        expected_session_epoch
+                    )
                 await self._append_session_message(
-                    session_key, role="system", content=transcript_message
+                    session_key,
+                    **error_append_kwargs,
                 )
             if turn_call_logger is not None:
                 turn_call_logger.write(
@@ -7253,6 +7513,8 @@ class TurnRunner:
         event: ErrorEvent | None,
         *,
         append_transcript: bool = True,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> None:
         """Best-effort durable transcript record for terminal turn errors."""
         if self._session_manager is None or event is None:
@@ -7279,7 +7541,7 @@ class TurnRunner:
             error_id = await self._record_turn_error(
                 session_key=session_key,
                 turn_id=None,
-                session_id=None,
+                session_id=expected_session_id,
                 surface="unknown",
                 error_class=event_code,
                 message=message,
@@ -7318,7 +7580,11 @@ class TurnRunner:
         else:
             transcript_message = f"Error: {append_error_ref(message, error_id)}"
         try:
-            if event_code == "current_turn_context_exhausted":
+            if (
+                event_code == "current_turn_context_exhausted"
+                and expected_session_id is None
+                and expected_session_epoch is None
+            ):
                 compact = getattr(self._session_manager, "compact", None)
                 if callable(compact):
                     budget = int(
@@ -7337,11 +7603,15 @@ class TurnRunner:
                             code=event_code,
                             error=str(exc),
                         )
-            await self._append_session_message(
-                session_key,
-                role="system",
-                content=transcript_message,
-            )
+            append_kwargs: dict[str, Any] = {
+                "role": "system",
+                "content": transcript_message,
+            }
+            if expected_session_id is not None:
+                append_kwargs["expected_session_id"] = expected_session_id
+            if expected_session_epoch is not None:
+                append_kwargs["expected_session_epoch"] = expected_session_epoch
+            await self._append_session_message(session_key, **append_kwargs)
             log.info(
                 "turn_runner.error_persisted",
                 session_key=session_key,
@@ -10276,6 +10546,10 @@ class TurnRunner:
                 "history_capacity_estimate_complete": True,
             }
         try:
+            exact_owner = _require_optional_exact_session_owner(
+                request.expected_session_id,
+                request.expected_session_epoch,
+            )
             get_transcript = getattr(self._session_manager, "get_transcript", None)
             if not callable(get_transcript):
                 return {"history_capacity_estimate_complete": False}
@@ -10283,7 +10557,24 @@ class TurnRunner:
             if snapshot is not None:
                 entries = list(await snapshot.get_entries())
             else:
-                transcript = get_transcript(session_key)
+                transcript_kwargs: dict[str, Any] = {}
+                if exact_owner:
+                    supports_exact_owner = all(
+                        _accepts_explicit_keyword_arg(get_transcript, name)
+                        for name in ("expected_session_id", "expected_session_epoch")
+                    )
+                    if supports_exact_owner:
+                        transcript_kwargs["expected_session_id"] = (
+                            request.expected_session_id
+                        )
+                        transcript_kwargs["expected_session_epoch"] = (
+                            request.expected_session_epoch
+                        )
+                    elif _has_session_storage(self._session_manager):
+                        raise RuntimeError(
+                            "session transcript reader does not support exact ownership"
+                        )
+                transcript = get_transcript(session_key, **transcript_kwargs)
                 if inspect.isawaitable(transcript):
                     transcript = await transcript
                 entries = list(transcript or [])
@@ -10303,6 +10594,8 @@ class TurnRunner:
                 max_history_turns=max_history_turns,
                 preserve_image_attachments=preserve_image_attachments,
                 reachable_provider_kinds=reachable_provider_kinds,
+                expected_session_id=request.expected_session_id,
+                expected_session_epoch=request.expected_session_epoch,
             )
         except Exception as exc:  # noqa: BLE001 - capacity admission fails closed
             # Never serialize the exception: storage/provider errors may echo
@@ -10324,8 +10617,15 @@ class TurnRunner:
         max_history_turns: int = 0,
         preserve_image_attachments: bool = False,
         reachable_provider_kinds: Collection[str] | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> dict[str, Any]:
         """Measure the route-specific pre-current replay projection."""
+
+        exact_owner = _require_optional_exact_session_owner(
+            expected_session_id,
+            expected_session_epoch,
+        )
 
         excluded_user_indexes: set[int] = set()
         if bound_index is not None:
@@ -10358,7 +10658,9 @@ class TurnRunner:
                     and bool(str(getattr(entry, "content", "")).strip())
                 ]
                 image_replay_entry_indexes = set(user_entry_indexes[-lookback:])
-                replay_session_id = await self._resolve_session_id_for_log(session_key)
+                replay_session_id = expected_session_id
+                if replay_session_id is None:
+                    replay_session_id = await self._resolve_session_id_for_log(session_key)
                 if replay_session_id is None:
                     replay_session_id = session_key
 
@@ -10389,11 +10691,31 @@ class TurnRunner:
             and (bound_user_message_id is None or bound_index is not None)
         )
         try:
+            summary_kwargs: dict[str, Any] = {}
+            context_kwargs: dict[str, Any] = {}
+            if exact_owner:
+                for method, kwargs, operation in (
+                    (get_summaries, summary_kwargs, "summary reader"),
+                    (get_context_states, context_kwargs, "context-state reader"),
+                ):
+                    if not callable(method):
+                        continue
+                    supports_exact_owner = all(
+                        _accepts_explicit_keyword_arg(method, name)
+                        for name in ("expected_session_id", "expected_session_epoch")
+                    )
+                    if supports_exact_owner:
+                        kwargs["expected_session_id"] = expected_session_id
+                        kwargs["expected_session_epoch"] = expected_session_epoch
+                    elif _has_session_storage(self._session_manager):
+                        raise RuntimeError(
+                            f"session {operation} does not support exact ownership"
+                        )
             pending: list[Any] = []
             if callable(get_summaries):
-                pending.append(get_summaries(session_key))
+                pending.append(get_summaries(session_key, **summary_kwargs))
             if callable(get_context_states):
-                pending.append(get_context_states(session_key))
+                pending.append(get_context_states(session_key, **context_kwargs))
             results = await asyncio.gather(*pending) if pending else []
             result_index = 0
             if callable(get_summaries):
@@ -10506,6 +10828,8 @@ class TurnRunner:
         bound_user_message_id: str | None = None,
         include_capacity: bool = False,
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> dict[str, Any]:
         """Return transcript context for the V4 router, excluding the current user turn."""
         if self._session_manager is None:
@@ -10526,10 +10850,29 @@ class TurnRunner:
                 else {}
             )
         try:
+            exact_owner = _require_optional_exact_session_owner(
+                expected_session_id,
+                expected_session_epoch,
+            )
             if transcript_snapshot is not None:
                 transcript = await transcript_snapshot.get_entries()
             else:
-                transcript = get_transcript(session_key)
+                transcript_kwargs: dict[str, Any] = {}
+                if exact_owner:
+                    supports_exact_owner = all(
+                        _accepts_explicit_keyword_arg(get_transcript, name)
+                        for name in ("expected_session_id", "expected_session_epoch")
+                    )
+                    if supports_exact_owner:
+                        transcript_kwargs["expected_session_id"] = expected_session_id
+                        transcript_kwargs["expected_session_epoch"] = (
+                            expected_session_epoch
+                        )
+                    elif _has_session_storage(self._session_manager):
+                        raise RuntimeError(
+                            "session transcript reader does not support exact ownership"
+                        )
+                transcript = get_transcript(session_key, **transcript_kwargs)
                 if inspect.isawaitable(transcript):
                     transcript = await transcript
         except Exception:  # noqa: BLE001 - router context must never block a turn
@@ -10574,6 +10917,8 @@ class TurnRunner:
                 exclude_last_user=exclude_last_user,
                 bound_user_message_id=bound_user_message_id,
                 bound_index=bound_index,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
             )
 
         user_texts: list[str] = []
@@ -10732,6 +11077,8 @@ class TurnRunner:
         turn_id: str,
         source: str,
         compaction_config: Any | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> bool:
         if self._session_manager is None:
             return False
@@ -10755,6 +11102,9 @@ class TurnRunner:
                 "compaction_config",
             ):
                 checkpoint_kwargs["compaction_config"] = compaction_config
+            if expected_session_id is not None or expected_session_epoch is not None:
+                checkpoint_kwargs["expected_session_id"] = expected_session_id
+                checkpoint_kwargs["expected_session_epoch"] = expected_session_epoch
             receipt = await checkpoint_method(
                 session_key,
                 list(transcript),
@@ -11225,6 +11575,9 @@ class TurnRunner:
     async def _durable_compaction_context_measure(
         self,
         session_key: str,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> tuple[int, int]:
         """Count the exact portable checkpoint projection replayed with history."""
 
@@ -11234,14 +11587,35 @@ class TurnRunner:
         get_context_states = getattr(self._session_manager, "get_context_states", None)
         if not callable(get_summaries) or not callable(get_context_states):
             return (0, 0)
+        summary_kwargs: dict[str, Any] = {}
+        context_kwargs: dict[str, Any] = {}
+        exact_owner = expected_session_id is not None or expected_session_epoch is not None
+        if exact_owner:
+            for method, kwargs, operation in (
+                (get_summaries, summary_kwargs, "summary reader"),
+                (get_context_states, context_kwargs, "context-state reader"),
+            ):
+                supports_exact_owner = all(
+                    _accepts_explicit_keyword_arg(method, name)
+                    for name in ("expected_session_id", "expected_session_epoch")
+                )
+                if supports_exact_owner:
+                    kwargs["expected_session_id"] = expected_session_id
+                    kwargs["expected_session_epoch"] = expected_session_epoch
+                elif _has_session_storage(self._session_manager):
+                    raise RuntimeError(f"session {operation} does not support exact ownership")
         try:
             summaries, context_states = await asyncio.gather(
-                get_summaries(session_key),
-                get_context_states(session_key),
+                get_summaries(session_key, **summary_kwargs),
+                get_context_states(session_key, **context_kwargs),
             )
         except KeyError:
+            if exact_owner and _has_session_storage(self._session_manager):
+                raise
             return (0, 0)
         except Exception as exc:  # noqa: BLE001 - trigger accounting is best-effort
+            if exact_owner and _has_session_storage(self._session_manager):
+                raise
             log.warning(
                 "compaction.durable_context_measure_failed",
                 session_key=session_key,
@@ -11276,6 +11650,8 @@ class TurnRunner:
         consumer_admission: Any | None = None,
         consumer_admission_fingerprint: str = "",
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> str:
         """Flush memory and compact transcript when the router upgrades into t3.
 
@@ -11358,17 +11734,34 @@ class TurnRunner:
             return _T3_HANDLED
 
         try:
-            transcript = (
-                list(await transcript_snapshot.get_entries())
-                if transcript_snapshot is not None
-                else await self._session_manager.get_transcript(session_key)
-            )
+            if transcript_snapshot is not None:
+                transcript = list(await transcript_snapshot.get_entries())
+            else:
+                get_transcript = self._session_manager.get_transcript
+                transcript_kwargs: dict[str, Any] = {}
+                if expected_session_id is not None or expected_session_epoch is not None:
+                    supports_exact_owner = all(
+                        _accepts_explicit_keyword_arg(get_transcript, name)
+                        for name in ("expected_session_id", "expected_session_epoch")
+                    )
+                    if supports_exact_owner:
+                        transcript_kwargs["expected_session_id"] = expected_session_id
+                        transcript_kwargs["expected_session_epoch"] = expected_session_epoch
+                    elif _has_session_storage(self._session_manager):
+                        raise RuntimeError(
+                            "session transcript reader does not support exact ownership"
+                        )
+                transcript = await get_transcript(session_key, **transcript_kwargs)
         except KeyError:
             return _T3_HANDLED
         (
             checkpoint_tokens,
             checkpoint_chars,
-        ) = await self._durable_compaction_context_measure(session_key)
+        ) = await self._durable_compaction_context_measure(
+            session_key,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+        )
         if not transcript and checkpoint_tokens <= 0 and checkpoint_chars <= 0:
             return _T3_HANDLED
         protected_suffix_count = self._protected_current_turn_suffix_count(
@@ -11510,6 +11903,8 @@ class TurnRunner:
                 reason="durable_compaction_circuit_open",
                 protected_recent_messages=protected_suffix_count,
                 history_capacity_chars=history_capacity_chars,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
             )
             return _T3_HANDLED
         if protected_suffix_count and not self._durable_compaction_accepts_config():
@@ -11523,6 +11918,8 @@ class TurnRunner:
                 reason="protected_history_boundary_unsupported",
                 protected_recent_messages=protected_suffix_count,
                 history_capacity_chars=history_capacity_chars,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
             )
             return _T3_HANDLED
 
@@ -11555,6 +11952,8 @@ class TurnRunner:
                 turn_id=compaction_id,
                 source="t3_upgrade_compaction",
                 compaction_config=compaction_config,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
             )
         except asyncio.CancelledError:
             notify_compaction(
@@ -11710,6 +12109,18 @@ class TurnRunner:
                     )
                 if _accepts_keyword_arg(compact_method, "context_window_chars"):
                     compact_kwargs["context_window_chars"] = history_capacity_chars
+                if expected_session_id is not None or expected_session_epoch is not None:
+                    supports_exact_owner = all(
+                        _accepts_explicit_keyword_arg(compact_method, name)
+                        for name in ("expected_session_id", "expected_session_epoch")
+                    )
+                    if supports_exact_owner:
+                        compact_kwargs["expected_session_id"] = expected_session_id
+                        compact_kwargs["expected_session_epoch"] = expected_session_epoch
+                    elif _has_session_storage(self._session_manager):
+                        raise RuntimeError(
+                            "session compactor does not support exact ownership"
+                        )
                 if provider_request_correlation is not None and _accepts_keyword_arg(
                     compact_method,
                     "provider_request_correlation",
@@ -11750,6 +12161,13 @@ class TurnRunner:
                 result = getattr(compaction_result, "summary", "") or ""
             else:
                 compact_call_kwargs: dict[str, Any] = {}
+                if (
+                    expected_session_id is not None
+                    or expected_session_epoch is not None
+                ) and _has_session_storage(self._session_manager):
+                    raise RuntimeError(
+                        "session compactor does not support exact ownership"
+                    )
                 if provider_request_correlation is not None:
                     compact_call_kwargs["provider_request_correlation"] = (
                         provider_request_correlation
@@ -11826,6 +12244,8 @@ class TurnRunner:
                         reason=skip_reason,
                         protected_recent_messages=protected_suffix_count,
                         history_capacity_chars=history_capacity_chars,
+                        expected_session_id=expected_session_id,
+                        expected_session_epoch=expected_session_epoch,
                     )
                     if emergency_applied:
                         return _T3_HANDLED
@@ -11902,6 +12322,8 @@ class TurnRunner:
                 reason="compact_failed",
                 protected_recent_messages=protected_suffix_count,
                 history_capacity_chars=history_capacity_chars,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
             )
             if emergency_applied:
                 return _T3_COMPACT_FAILED
@@ -11939,6 +12361,8 @@ class TurnRunner:
         consumer_admission: Any | None = None,
         consumer_admission_fingerprint: str = "",
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> None:
         """Compact proactively if session history exceeds token budget.
 
@@ -12014,17 +12438,34 @@ class TurnRunner:
             )
             return
         try:
-            transcript = (
-                list(await transcript_snapshot.get_entries())
-                if transcript_snapshot is not None
-                else await self._session_manager.get_transcript(session_key)
-            )
+            if transcript_snapshot is not None:
+                transcript = list(await transcript_snapshot.get_entries())
+            else:
+                get_transcript = self._session_manager.get_transcript
+                transcript_kwargs: dict[str, Any] = {}
+                if expected_session_id is not None or expected_session_epoch is not None:
+                    supports_exact_owner = all(
+                        _accepts_explicit_keyword_arg(get_transcript, name)
+                        for name in ("expected_session_id", "expected_session_epoch")
+                    )
+                    if supports_exact_owner:
+                        transcript_kwargs["expected_session_id"] = expected_session_id
+                        transcript_kwargs["expected_session_epoch"] = expected_session_epoch
+                    elif _has_session_storage(self._session_manager):
+                        raise RuntimeError(
+                            "session transcript reader does not support exact ownership"
+                        )
+                transcript = await get_transcript(session_key, **transcript_kwargs)
         except KeyError:
             return  # session doesn't exist yet
         (
             checkpoint_tokens,
             checkpoint_chars,
-        ) = await self._durable_compaction_context_measure(session_key)
+        ) = await self._durable_compaction_context_measure(
+            session_key,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+        )
         if not transcript and checkpoint_tokens <= 0 and checkpoint_chars <= 0:
             return
         protected_suffix_count = self._protected_current_turn_suffix_count(
@@ -12148,6 +12589,8 @@ class TurnRunner:
                 reason="durable_compaction_circuit_open",
                 protected_recent_messages=protected_suffix_count,
                 history_capacity_chars=history_capacity_chars,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
             )
             return
         if protected_suffix_count and not self._durable_compaction_accepts_config():
@@ -12161,6 +12604,8 @@ class TurnRunner:
                 reason="protected_history_boundary_unsupported",
                 protected_recent_messages=protected_suffix_count,
                 history_capacity_chars=history_capacity_chars,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
             )
             return
 
@@ -12205,6 +12650,8 @@ class TurnRunner:
                 turn_id=compaction_id,
                 source="preflight_compaction",
                 compaction_config=compaction_config,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
             )
         except asyncio.CancelledError:
             notify_compaction(
@@ -12361,6 +12808,18 @@ class TurnRunner:
                     )
                 if _accepts_keyword_arg(compact_method, "context_window_chars"):
                     compact_kwargs["context_window_chars"] = history_capacity_chars
+                if expected_session_id is not None or expected_session_epoch is not None:
+                    supports_exact_owner = all(
+                        _accepts_explicit_keyword_arg(compact_method, name)
+                        for name in ("expected_session_id", "expected_session_epoch")
+                    )
+                    if supports_exact_owner:
+                        compact_kwargs["expected_session_id"] = expected_session_id
+                        compact_kwargs["expected_session_epoch"] = expected_session_epoch
+                    elif _has_session_storage(self._session_manager):
+                        raise RuntimeError(
+                            "session compactor does not support exact ownership"
+                        )
                 if provider_request_correlation is not None and _accepts_keyword_arg(
                     compact_method,
                     "provider_request_correlation",
@@ -12401,6 +12860,13 @@ class TurnRunner:
                 result = getattr(compaction_result, "summary", "") or ""
             else:
                 compact_call_kwargs: dict[str, Any] = {}
+                if (
+                    expected_session_id is not None
+                    or expected_session_epoch is not None
+                ) and _has_session_storage(self._session_manager):
+                    raise RuntimeError(
+                        "session compactor does not support exact ownership"
+                    )
                 if provider_request_correlation is not None:
                     compact_call_kwargs["provider_request_correlation"] = (
                         provider_request_correlation
@@ -12496,6 +12962,8 @@ class TurnRunner:
                 reason="compact_failed",
                 protected_recent_messages=protected_suffix_count,
                 history_capacity_chars=history_capacity_chars,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
             )
             if emergency_applied:
                 return
@@ -12548,6 +13016,8 @@ class TurnRunner:
                 reason=skip_reason,
                 protected_recent_messages=protected_suffix_count,
                 history_capacity_chars=history_capacity_chars,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
             )
             if emergency_applied:
                 return
@@ -13047,6 +13517,8 @@ class TurnRunner:
         reason: str,
         protected_recent_messages: int = 0,
         history_capacity_chars: int | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> bool:
         if not transcript:
             return False
@@ -13114,6 +13586,8 @@ class TurnRunner:
             kept_entries=kept_entries,
             reason=reason,
             compaction_id=compaction_id,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
         )
         self.mark_compacted_this_turn(session_key)
         notify_compaction(
@@ -13174,6 +13648,8 @@ class TurnRunner:
         bound_user_message_id: str | None = None,
         restricted_turn: bool = False,
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> str | None:
         """Load existing transcript as agent history.
 
@@ -13191,16 +13667,36 @@ class TurnRunner:
         if self._session_manager is None:
             return None
 
-        transcript = (
-            list(await transcript_snapshot.get_entries())
-            if transcript_snapshot is not None
-            else await self._session_manager.get_transcript(session_key)
-        )
+        if transcript_snapshot is not None:
+            transcript = list(await transcript_snapshot.get_entries())
+        else:
+            get_transcript = self._session_manager.get_transcript
+            transcript_kwargs: dict[str, Any] = {}
+            if expected_session_id is not None or expected_session_epoch is not None:
+                if not (
+                    _accepts_explicit_keyword_arg(
+                        get_transcript,
+                        "expected_session_id",
+                    )
+                    and _accepts_explicit_keyword_arg(
+                        get_transcript,
+                        "expected_session_epoch",
+                    )
+                ):
+                    if _has_session_storage(self._session_manager):
+                        raise RuntimeError(
+                            "session history reader does not support exact ownership"
+                        )
+                else:
+                    transcript_kwargs["expected_session_id"] = expected_session_id
+                    transcript_kwargs["expected_session_epoch"] = expected_session_epoch
+            transcript = await get_transcript(session_key, **transcript_kwargs)
 
         from opensquilla.provider import Message
 
         history: list[Message] = []
         summary_markers: list[str] = []
+        exact_owner = expected_session_id is not None or expected_session_epoch is not None
         emergency_overrides = getattr(self, "_emergency_compaction_overrides", {})
         emergency_override = (
             None
@@ -13208,8 +13704,20 @@ class TurnRunner:
             else emergency_overrides.pop(session_key, None)
         )
         if emergency_override is not None:
-            transcript = list(emergency_override.kept_entries)
-            summary_markers.append(emergency_override.summary)
+            override_has_owner = (
+                emergency_override.expected_session_id is not None
+                or emergency_override.expected_session_epoch is not None
+            )
+            if exact_owner:
+                override_matches_owner = (
+                    emergency_override.expected_session_id == expected_session_id
+                    and emergency_override.expected_session_epoch == expected_session_epoch
+                )
+            else:
+                override_matches_owner = not override_has_owner
+            if override_matches_owner:
+                transcript = list(emergency_override.kept_entries)
+                summary_markers.append(emergency_override.summary)
 
         # Resolve the id-bound slice (see method docstring). Only active when we
         # would otherwise trim positionally.
@@ -13281,12 +13789,18 @@ class TurnRunner:
                 and bool(str(getattr(entry, "content", "")).strip())
             ]
             image_replay_entry_indexes = set(user_entry_indexes[-lookback:])
-            image_replay_session_id = await self._resolve_session_id_for_log(session_key)
+            image_replay_session_id = expected_session_id
+            if image_replay_session_id is None:
+                image_replay_session_id = await self._resolve_session_id_for_log(session_key)
             if image_replay_session_id is None:
                 image_replay_session_id = session_key
         attachment_replay_session_id = image_replay_session_id
         if attachment_replay_session_id is None and materialize_historical_attachments:
-            attachment_replay_session_id = await self._resolve_session_id_for_log(session_key)
+            attachment_replay_session_id = expected_session_id
+            if attachment_replay_session_id is None:
+                attachment_replay_session_id = await self._resolve_session_id_for_log(
+                    session_key
+                )
             if attachment_replay_session_id is None:
                 attachment_replay_session_id = session_key
         history_materializer: AttachmentWorkspaceMaterializer | None = None
@@ -13299,6 +13813,19 @@ class TurnRunner:
                 materializable_mimes=None,
                 disk_budget_bytes=workspace_attachment_budget_from_config(self._config),
             )
+        # For a durable exact-owner turn, validate the owner before replay can
+        # materialize transcript attachments into the shared workspace.  The
+        # same read is reused below for provider context; restricted turns
+        # intentionally omit its contents but still need the ownership fence.
+        context_states = (
+            await self._load_context_states(
+                session_key,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+            )
+            if exact_owner
+            else []
+        )
         replay = self._project_history_replay(
             transcript,
             excluded_entry_indexes=bound_skip_indexes,
@@ -13323,7 +13850,8 @@ class TurnRunner:
             if history:
                 agent.set_history(history)
             return None
-        context_states = await self._load_context_states(session_key)
+        if not exact_owner:
+            context_states = await self._load_context_states(session_key)
         provider = getattr(agent, "provider", None)
         provider_context = build_provider_compaction_context(
             context_states=context_states,
@@ -13338,17 +13866,45 @@ class TurnRunner:
             summary_markers,
             context_states=context_states,
             skip_covered_through_ids=provider_context.covered_through_ids,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
         )
 
-    async def _load_context_states(self, session_key: str) -> list[Any]:
+    async def _load_context_states(
+        self,
+        session_key: str,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> list[Any]:
         context_states: list[Any] = []
         get_context_states = getattr(self._session_manager, "get_context_states", None)
         if callable(get_context_states):
+            context_kwargs: dict[str, Any] = {}
+            exact_owner = (
+                expected_session_id is not None or expected_session_epoch is not None
+            )
+            if exact_owner:
+                supports_exact_owner = all(
+                    _accepts_explicit_keyword_arg(get_context_states, name)
+                    for name in ("expected_session_id", "expected_session_epoch")
+                )
+                if supports_exact_owner:
+                    context_kwargs["expected_session_id"] = expected_session_id
+                    context_kwargs["expected_session_epoch"] = expected_session_epoch
+                elif _has_session_storage(self._session_manager):
+                    raise RuntimeError(
+                        "session context-state reader does not support exact ownership"
+                    )
             try:
-                context_states = await get_context_states(session_key)
+                context_states = await get_context_states(session_key, **context_kwargs)
             except KeyError:
+                if exact_owner and _has_session_storage(self._session_manager):
+                    raise
                 context_states = []
             except Exception as exc:  # pragma: no cover - context state is best-effort
+                if exact_owner and _has_session_storage(self._session_manager):
+                    raise
                 log.warning(
                     "compaction_context_state.load_failed",
                     session_key=session_key,
@@ -13364,16 +13920,38 @@ class TurnRunner:
         *,
         context_states: list[Any] | None = None,
         skip_covered_through_ids: set[int] | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> str | None:
         """Return durable compaction summaries as request-scoped context."""
         summaries: list[Any] = []
         get_summaries = getattr(self._session_manager, "get_summaries", None)
         if callable(get_summaries):
+            summary_kwargs: dict[str, Any] = {}
+            exact_owner = (
+                expected_session_id is not None or expected_session_epoch is not None
+            )
+            if exact_owner:
+                supports_exact_owner = all(
+                    _accepts_explicit_keyword_arg(get_summaries, name)
+                    for name in ("expected_session_id", "expected_session_epoch")
+                )
+                if supports_exact_owner:
+                    summary_kwargs["expected_session_id"] = expected_session_id
+                    summary_kwargs["expected_session_epoch"] = expected_session_epoch
+                elif _has_session_storage(self._session_manager):
+                    raise RuntimeError(
+                        "session summary reader does not support exact ownership"
+                    )
             try:
-                summaries = await get_summaries(session_key)
+                summaries = await get_summaries(session_key, **summary_kwargs)
             except KeyError:
+                if exact_owner and _has_session_storage(self._session_manager):
+                    raise
                 summaries = []
             except Exception as exc:  # pragma: no cover - summary context is best-effort
+                if exact_owner and _has_session_storage(self._session_manager):
+                    raise
                 log.warning(
                     "compaction_summary_context.load_failed",
                     session_key=session_key,
@@ -13381,7 +13959,11 @@ class TurnRunner:
                 )
                 summaries = []
         loaded_context_states = (
-            await self._load_context_states(session_key)
+            await self._load_context_states(
+                session_key,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+            )
             if context_states is None
             else context_states
         )

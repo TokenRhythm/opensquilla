@@ -741,6 +741,7 @@
     "tests/test_gateway/test_status_version_provider.py": 0.016,
     "tests/test_gateway/test_steer_restart_recovery.py": 3.392,
     "tests/test_gateway/test_subagent_announce_group_wake.py": 0.027,
+    "tests/test_gateway/test_subagent_completion_owner.py": 0.01,
     "tests/test_gateway/test_task_runtime_hard_deadline.py": 0.558,
     "tests/test_gateway/test_task_runtime_overflow_policy.py": 0.044,
     "tests/test_gateway/test_task_runtime_reservations.py": 0.167,

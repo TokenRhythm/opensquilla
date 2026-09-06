@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -34,6 +35,9 @@ from opensquilla.application.session_reset import (
     SessionResetUnavailableError,
     SessionResetUsagePort,
 )
+from opensquilla.engine.steps.router_decision_record import (
+    drain_pending_flushes_for_sessions,
+)
 from opensquilla.engine.usage_accounting import bind_usage_accounting_scope
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
 from opensquilla.gateway.rpc.registry import RpcContext, RpcHandlerError
@@ -48,6 +52,7 @@ from opensquilla.gateway.session_services import (
     get_session_storage,
     set_session_epoch,
 )
+from opensquilla.gateway.subagent_announce import quiesce_background_completion_sessions
 from opensquilla.gateway.usage_ledger_runtime import build_session_usage_scope
 from opensquilla.memory.session_flush import FlushReceipt
 from opensquilla.session.compaction_lifecycle import (
@@ -109,28 +114,87 @@ class GatewaySessionResetPorts(
         self._context = context
         self._manager = context.session_manager
         self._storage = get_session_storage(self._manager)
+        self._locks_held_by_quiesce: set[str] = set()
 
-    async def quiesce(self, session_key: str) -> None:
+    def _session_reset_busy(
+        self, session_key: str, phase: str, exc: BaseException
+    ) -> RpcHandlerError:
+        log.warning(
+            "sessions.reset.quiesce_failed",
+            session_key=session_key,
+            phase=phase,
+            error_type=type(exc).__name__,
+        )
+        return RpcHandlerError(
+            code="STORAGE_BUSY",
+            message=(
+                "Reset aborted because session work could not be fully drained. "
+                "Wait for the active turn to settle and retry."
+            ),
+            details={"key": session_key, "phase": phase},
+            retryable=True,
+            retry_after_ms=250,
+        )
+
+    @asynccontextmanager
+    async def quiesce(self, session_key: str) -> AsyncIterator[None]:
         task_runtime = getattr(self._context, "task_runtime", None)
         if task_runtime is not None:
-            await self._quiesce_task_runtime(task_runtime, session_key)
+            try:
+                async with asyncio.timeout(
+                    _RESET_RUNTIME_SETTLE_SECONDS + _RESET_RUNTIME_CANCEL_DRAIN_SECONDS
+                ):
+                    await self._quiesce_task_runtime(task_runtime, session_key)
+            except Exception as exc:  # noqa: BLE001 - reset must fail closed.
+                raise self._session_reset_busy(session_key, "task_runtime_drain", exc) from exc
 
-        active = get_agent_task_registry().get(session_key)
-        if active is None or active.done():
-            return
-        get_agent_task_registry().cancel(session_key)
-        try:
-            await asyncio.wait_for(active, timeout=2.0)
-        except TimeoutError:
-            log.warning("sessions.reset.drain_timeout", session_key=session_key)
-        except asyncio.CancelledError:
-            log.debug("sessions.reset.drain_cancelled", session_key=session_key)
-        except Exception as exc:
-            log.warning(
-                "sessions.reset.drain_failed",
-                session_key=session_key,
-                error=str(exc),
-            )
+        session_keys = (session_key,)
+        turn_runner = getattr(self._context, "turn_runner", None)
+        lock = get_session_lock(turn_runner, session_key)
+        async with contextlib.AsyncExitStack() as fences:
+            try:
+                async with asyncio.timeout(_RESET_RUNTIME_CANCEL_DRAIN_SECONDS):
+                    await fences.enter_async_context(
+                        quiesce_background_completion_sessions(session_keys)
+                    )
+
+                    quiesce_runtime = getattr(task_runtime, "quiesce_sessions", None)
+                    if callable(quiesce_runtime):
+                        quiesce_kwargs: dict[str, str] = {}
+                        if all(
+                            _accepts_keyword_arg(quiesce_runtime, name)
+                            for name in ("cancel_source", "cancel_reason")
+                        ):
+                            quiesce_kwargs = {
+                                "cancel_source": "sessions_reset",
+                                "cancel_reason": "session_reset",
+                            }
+                        await fences.enter_async_context(
+                            quiesce_runtime(session_keys, **quiesce_kwargs)
+                        )
+
+                    await fences.enter_async_context(
+                        get_agent_task_registry().quiesce_sessions(session_keys)
+                    )
+
+                    if lock is not None:
+                        await fences.enter_async_context(lock)
+                        self._locks_held_by_quiesce.add(session_key)
+
+                    await drain_pending_flushes_for_sessions(session_keys)
+                    drain_turn_writes = getattr(
+                        turn_runner,
+                        "drain_session_background_writes",
+                        None,
+                    )
+                    if callable(drain_turn_writes):
+                        await drain_turn_writes(session_keys)
+            except Exception as exc:  # noqa: BLE001 - rotation must not follow partial drain.
+                raise self._session_reset_busy(session_key, "writer_quiesce", exc) from exc
+            try:
+                yield
+            finally:
+                self._locks_held_by_quiesce.discard(session_key)
 
     async def _quiesce_task_runtime(self, task_runtime: Any, session_key: str) -> None:
         """Let just-finished turns settle, then cancel and drain live work."""
@@ -183,14 +247,19 @@ class GatewaySessionResetPorts(
                 "sessions.reset.task_runtime_drain_timeout",
                 session_key=session_key,
             )
+            raise
         except Exception:
             log.warning(
                 "sessions.reset.task_runtime_drain_failed",
                 session_key=session_key,
             )
+            raise
 
     @asynccontextmanager
     async def hold(self, session_key: str) -> AsyncIterator[None]:
+        if session_key in self._locks_held_by_quiesce:
+            yield
+            return
         lock = get_session_lock(self._context.turn_runner, session_key)
         if lock is None:
             yield

@@ -66,6 +66,8 @@ class RouterHistoryReplayRequest:
         default=None,
         repr=False,
     )
+    expected_session_id: str | None = field(default=None, repr=False)
+    expected_session_epoch: int | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -185,6 +187,8 @@ class RouterContextPort(Protocol):
         bound_user_message_id: str | None = None,
         include_capacity: bool = False,
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> dict[str, Any]: ...
 
 @runtime_checkable
@@ -299,6 +303,8 @@ class PromptAssemblerStageInput:
         default=None,
         repr=False,
     )
+    expected_session_id: str | None = field(default=None, repr=False)
+    expected_session_epoch: int | None = field(default=None, repr=False)
 
 @dataclass(frozen=True)
 class PromptAssemblerStageOutput:
@@ -453,6 +459,14 @@ class PromptAssemblerStage:
         }
         if inp.transcript_snapshot is not None:
             router_context_kwargs["transcript_snapshot"] = inp.transcript_snapshot
+        if (
+            inp.expected_session_id is not None
+            or inp.expected_session_epoch is not None
+        ):
+            router_context_kwargs["expected_session_id"] = inp.expected_session_id
+            router_context_kwargs["expected_session_epoch"] = (
+                inp.expected_session_epoch
+            )
         router_context = await self._router_context.fetch_router_context(
             inp.session_key,
             **router_context_kwargs,
@@ -557,6 +571,8 @@ class PromptAssemblerStage:
                     ),
                     bound_user_message_id=inp.bound_user_message_id,
                     transcript_snapshot=inp.transcript_snapshot,
+                    expected_session_id=inp.expected_session_id,
+                    expected_session_epoch=inp.expected_session_epoch,
                 )
                 if inp.attachments
                 else None
