@@ -31,6 +31,7 @@ _NAMES = [
     "shell",
     "submit_tool",
     "tool_results",
+    "tool_search",
     "web",
     "web_fetch",
 ]

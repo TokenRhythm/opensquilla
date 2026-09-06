@@ -1116,7 +1116,7 @@ def _goal_publish_loop_registry(
                 "properties": {"steps": {"type": "array"}},
                 "required": ["steps"],
             },
-            exposed_by_default=False,
+            default_access="deny",
         ),
         update_goal_progress,
     )
@@ -1132,7 +1132,7 @@ def _goal_publish_loop_registry(
                 },
                 "required": ["status"],
             },
-            exposed_by_default=False,
+            default_access="deny",
         ),
         update_goal,
     )

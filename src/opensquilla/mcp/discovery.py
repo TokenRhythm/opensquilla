@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+import hashlib
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Any
+
+from anyascii import anyascii
 
 from opensquilla.mcp.client import MCPClient
 from opensquilla.mcp.types import MCPServerConfig, MCPToolDef
@@ -20,13 +25,73 @@ class ActiveMCPClient:
     server_name: str
     transport: str
     client: MCPClient
+    # Appended defaults preserve construction compatibility for integrations
+    # that used the previously exported four-field lifecycle record.
+    registry: ToolRegistry | None = field(default=None, repr=False)
+    namespace: str = ""
+    registered_tools: tuple[str, ...] = ()
 
     async def close(self) -> None:
-        await self.client.close()
+        try:
+            await self.client.close()
+        finally:
+            if self.registry is not None:
+                for tool_name in self.registered_tools:
+                    self.registry.unregister(tool_name)
+                if self.namespace:
+                    self.registry.unregister_mcp_namespace(self.namespace)
 
 
 # Module-level registry to keep clients alive for tool handlers.
 _active_clients: list[ActiveMCPClient] = []
+
+_PROVIDER_TOOL_NAME_MAX_LENGTH = 64
+_MCP_NAMESPACE_MAX_LENGTH = 32
+
+
+def _bounded_name(value: str, *, max_length: int, separator: str) -> str:
+    """Bound an identifier while preserving deterministic collision resistance."""
+
+    if len(value) <= max_length:
+        return value
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+    return f"{value[: max_length - len(digest) - 1]}{separator}{digest}"
+
+
+def mcp_namespace(server_name: str) -> str:
+    """Return a stable provider-safe namespace for one MCP server."""
+
+    normalized = re.sub(r"[^a-zA-Z0-9_-]+", "-", anyascii(server_name.strip()).lower()).strip("-_")
+    normalized = re.sub(r"-+", "-", normalized) or "server"
+    return _bounded_name(
+        f"mcp__{normalized}",
+        max_length=_MCP_NAMESPACE_MAX_LENGTH,
+        separator="-",
+    )
+
+
+def mcp_tool_name(namespace: str, tool_name: str) -> str:
+    """Return the exact provider-safe callable name for one MCP tool.
+
+    The advertised namespace remains ``mcp__<server>``. A second ``__``
+    separates it from the tool component because dots are rejected by common
+    function-calling APIs. Tool components that need normalization receive a
+    short source-name hash so two distinct MCP names cannot silently alias.
+    """
+
+    source_name = tool_name.strip()
+    ascii_name = anyascii(source_name)
+    normalized = re.sub(r"[^a-zA-Z0-9_-]+", "_", ascii_name)
+    normalized = re.sub(r"_+", "_", normalized).strip("-_") or "tool"
+    changed = normalized != source_name
+    available = _PROVIDER_TOOL_NAME_MAX_LENGTH - len(namespace) - 2
+    if available < 10:  # Defensive: mcp_namespace currently guarantees >= 30.
+        raise ValueError(f"MCP namespace is too long for a callable tool name: {namespace}")
+    if changed:
+        digest = hashlib.sha256(tool_name.encode("utf-8")).hexdigest()[:8]
+        normalized = f"{normalized}_{digest}"
+    normalized = _bounded_name(normalized, max_length=available, separator="_")
+    return f"{namespace}__{normalized}"
 
 
 def active_clients_snapshot() -> tuple[ActiveMCPClient, ...]:
@@ -71,19 +136,26 @@ def create_client(config: MCPServerConfig) -> MCPClient:
 
 def _make_tool_handler(
     client: MCPClient,
+    namespace: str,
     tool_name: str,
     tool_def: MCPToolDef,
     registry: ToolRegistry,
     timeout_seconds: float,
 ) -> None:
-    """Register a single MCP tool into the registry with an mcp_ prefix."""
+    """Register a single MCP tool in its server-scoped namespace."""
     # Extract properties and required from input_schema
     schema = tool_def.input_schema
-    properties: dict[str, Any] = schema.get("properties", {})
-    required: list[str] = schema.get("required", [])
+    raw_properties = schema.get("properties", {}) if isinstance(schema, Mapping) else {}
+    properties: dict[str, Any] = dict(raw_properties) if isinstance(raw_properties, Mapping) else {}
+    raw_required = schema.get("required", []) if isinstance(schema, Mapping) else []
+    required = (
+        [item for item in raw_required if isinstance(item, str)]
+        if isinstance(raw_required, list | tuple)
+        else []
+    )
 
     spec = ToolSpec(
-        name=f"mcp_{tool_name}",
+        name=mcp_tool_name(namespace, tool_name),
         description=tool_def.description,
         parameters=properties,
         required=required,
@@ -123,34 +195,53 @@ async def discover_and_register(
     The client is kept alive in module-level _active_clients so tool handlers can use it.
     """
     client = create_client(config)
-    entry: ActiveMCPClient | None = None
-
     registered: list[str] = []
+    namespace = mcp_namespace(config.name)
+    namespace_registered = False
     try:
         await client.connect()
-        entry = ActiveMCPClient(
-            owner=owner or config.name,
-            server_name=config.name,
-            transport=config.transport,
-            client=client,
-        )
-        _active_clients.append(entry)
         tools = await client.list_tools()
+        registry.register_mcp_namespace(
+            namespace,
+            config.description or f"Tools provided by the {config.name} MCP server.",
+        )
+        namespace_registered = True
         for t in tools:
+            registered_name = mcp_tool_name(namespace, t.name)
+            if registry.get(registered_name) is not None:
+                raise ValueError(f"MCP tool is already registered: {registered_name}")
+            # Track before registration so a partially failing custom registry
+            # implementation is still given an idempotent cleanup attempt.
+            registered.append(registered_name)
             _make_tool_handler(
                 client,
+                namespace,
                 t.name,
                 t,
                 registry,
                 timeout_seconds=config.tool_timeout_seconds,
             )
-            registered.append(f"mcp_{t.name}")
-    except Exception:
-        if entry is not None:
-            try:
-                _active_clients.remove(entry)
-            except ValueError:
-                pass
-        await client.close()
+        _active_clients.append(
+            ActiveMCPClient(
+                owner=owner or config.name,
+                server_name=config.name,
+                transport=config.transport,
+                client=client,
+                registry=registry,
+                namespace=namespace,
+                registered_tools=tuple(registered),
+            )
+        )
+    except BaseException:
+        for registered_name in registered:
+            registry.unregister(registered_name)
+        if namespace_registered:
+            registry.unregister_mcp_namespace(namespace)
+        try:
+            await asyncio.shield(client.close())
+        except BaseException:
+            # Preserve the discovery/cancellation failure. Lifecycle cleanup is
+            # best effort, and no registry entry remains callable at this point.
+            pass
         raise
     return registered

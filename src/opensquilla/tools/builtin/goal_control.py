@@ -69,7 +69,7 @@ def _optional_text(value: Any, *, field: str, max_chars: int) -> str | None:
         },
     },
     required=["status"],
-    exposed_by_default=False,
+    default_access="deny",
     terminates_turn=False,
 )
 async def update_goal(status: str, reason: str | None = None) -> str:
@@ -137,7 +137,7 @@ async def update_goal(status: str, reason: str | None = None) -> str:
         },
     },
     required=["steps"],
-    exposed_by_default=False,
+    default_access="deny",
     terminates_turn=False,
 )
 async def update_goal_progress(

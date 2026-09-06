@@ -1,9 +1,9 @@
 """TurnRunner._build_tools must actually expose ``submit`` under a
 restrictive profile allowlist when submit-review is enabled.
 
-``submit`` is registered with ``exposed_by_default=False``. Enabling
+``submit`` is registered with ``default_access="deny"``. Enabling
 submit-review adds it to ``ctx.surfaced_tools``, which lifts the
-exposed-by-default gate — but, by design, ``surfaced_tools`` does NOT
+default-access deny gate — but, by design, ``surfaced_tools`` does NOT
 relax the ``allowed_tools`` allowlist (see ``ToolContext.surfaced_tools``).
 Under the SWE profile ``repo_coding_scaffold_edit`` the allowlist is the
 10 scaffold tools, which omit ``submit``; so surfacing ALONE leaves the
@@ -22,7 +22,7 @@ import pytest
 
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.gateway.config import GatewayConfig
-from opensquilla.tools.registry import get_default_registry
+from opensquilla.tools.registry import DEFAULT_MODEL_TOOL_NAMES, get_default_registry
 from opensquilla.tools.types import ToolContext
 
 # The active SWE profile: exactly these ten tools, no ``submit``.
@@ -40,6 +40,7 @@ _SCAFFOLD_TOOLS = frozenset(
         "retrieve_tool_result",
     }
 )
+_MODEL_SCAFFOLD_TOOLS = (_SCAFFOLD_TOOLS & DEFAULT_MODEL_TOOL_NAMES) | {"tool_search"}
 
 
 def _runner_with_scaffold_profile() -> TurnRunner:
@@ -64,9 +65,7 @@ def test_build_tools_exposes_submit_under_scaffold_profile_when_enabled(
         "submit must reach the tool surface under the scaffold profile when "
         f"submit-review is on; got {sorted(names)}"
     )
-    # The tool surface is the 10 scaffold tools + submit == 11.
-    assert _SCAFFOLD_TOOLS <= names
-    assert len(names & (_SCAFFOLD_TOOLS | {"submit"})) == 11
+    assert names == _MODEL_SCAFFOLD_TOOLS | {"submit"}
     # surfaced_tools is mutated on the passed ctx before the policy step
     # reassigns it; the allowlist add happens on the internal (replaced) ctx,
     # so it is observable through the returned tool_defs above, not this ref.
@@ -123,9 +122,8 @@ def test_build_tools_exposes_plan_run_delivery_controls_under_scaffold_profile(
 
     assert "plan_run_checkpoint" in names
     assert "publish_artifact" in names
-    assert _SCAFFOLD_TOOLS <= names
     plan_run_tools = {"plan_run_checkpoint", "publish_artifact"}
-    assert len(names & (_SCAFFOLD_TOOLS | plan_run_tools)) == 12
+    assert names == _MODEL_SCAFFOLD_TOOLS | plan_run_tools
     assert ctx.surfaced_tools is not None
     assert plan_run_tools <= ctx.surfaced_tools
 
@@ -168,7 +166,7 @@ def test_build_tools_exposes_goal_controls_under_scaffold_profile(
 
     goal_tools = {"update_goal", "update_goal_progress"}
     assert goal_tools <= names
-    assert _SCAFFOLD_TOOLS <= names
+    assert names == _MODEL_SCAFFOLD_TOOLS | goal_tools
     assert ctx.surfaced_tools is not None
     assert goal_tools <= ctx.surfaced_tools
 

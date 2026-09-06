@@ -7962,7 +7962,13 @@ class TurnRunner:
                     hard_denied=None,
                 )
             ctx = self._apply_runtime_capability_denies(ctx)
-            # Surfacing lifts the exposed-by-default gate but deliberately does
+            # The discovery entry point is safe even under a restrictive
+            # allowlist because its index contains only already-authorized
+            # definitions.  An explicit deny still wins, and the exclusive
+            # ceiling below may still remove it.
+            if ctx.allowed_tools is not None and "tool_search" not in ctx.denied_tools:
+                ctx.allowed_tools = set(ctx.allowed_tools) | {"tool_search"}
+            # Surfacing lifts the default-access deny gate but deliberately does
             # not relax a profile allowlist. Restore only controls authorized
             # by this frozen turn context; explicit denies still win in the
             # registry visibility check.
@@ -8010,9 +8016,27 @@ class TurnRunner:
             denied_count=len(ctx.denied_tools) if ctx else 0,
         )
         tool_defs = self._tool_registry.to_tool_definitions(ctx)
+        if ctx is not None:
+            from opensquilla.tools.filter import filter_tools
+
+            tool_defs = filter_tools(
+                tool_defs,
+                allow=ctx.allowed_tools,
+                deny=ctx.denied_tools,
+            )
         profile = resolve_profile(ctx)
         tool_defs = filter_by_profile(tool_defs, profile, ctx)
+        authorized_tool_defs = tool_defs
+        tool_defs = self._tool_registry.to_model_tool_definitions(
+            authorized_tool_defs,
+            ctx,
+        )
         if ctx is not None:
+            if ctx is not caller_ctx:
+                caller_ctx.authorized_tool_names = ctx.authorized_tool_names
+                caller_ctx.disclosed_tool_names = ctx.disclosed_tool_names
+                caller_ctx.tool_search_index = ctx.tool_search_index
+                caller_ctx.tool_search_namespaces = ctx.tool_search_namespaces
             retrieval_available = any(
                 definition.name == "retrieve_tool_result" for definition in tool_defs
             )
@@ -8028,6 +8052,8 @@ class TurnRunner:
         )
         if metadata is not None:
             metadata["tool_profile"] = profile.value
+            metadata["authorized_tool_count"] = len(authorized_tool_defs)
+            metadata["model_tool_count"] = len(tool_defs)
         known_skill_names = {
             skill.name
             for skill in loaded_skills

@@ -20,6 +20,43 @@ def test_tool_decorator_preserves_legacy_owner_only_position() -> None:
     assert registered.spec.runtime_only_arguments == frozenset()
 
 
+def test_tool_decorator_preserves_legacy_exposure_position_and_keyword() -> None:
+    registry = ToolRegistry()
+
+    @tool("legacy_positional", "Legacy positional access.", {}, [], False, False, registry=registry)
+    async def legacy_positional() -> str:
+        return "ok"
+
+    @tool(
+        "legacy_keyword",
+        "Legacy keyword access.",
+        registry=registry,
+        exposed_by_default=False,
+    )
+    async def legacy_keyword() -> str:
+        return "ok"
+
+    for name in ("legacy_positional", "legacy_keyword"):
+        registered = registry.get(name)
+        assert registered is not None
+        assert registered.spec.default_access == "deny"
+        assert registered.spec.exposed_by_default is False
+
+
+def test_tool_spec_preserves_legacy_exposure_keyword() -> None:
+    from opensquilla.tools.types import ToolSpec
+
+    spec = ToolSpec(
+        name="legacy_spec",
+        description="Legacy direct ToolSpec construction.",
+        parameters={},
+        exposed_by_default=False,
+    )
+
+    assert spec.default_access == "deny"
+    assert spec.exposed_by_default is False
+
+
 def test_tool_runtime_only_arguments_is_keyword_only() -> None:
     parameters = inspect.signature(tool).parameters
 
@@ -108,4 +145,8 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
         "artifact_candidate_loop_controller",
         "artifact_preview_service",
         "tool_result_media",
+        "authorized_tool_names",
+        "disclosed_tool_names",
+        "tool_search_index",
+        "tool_search_namespaces",
     ]

@@ -30,7 +30,7 @@ _NODES_ACTIONS = ("list", "describe", "invoke")
         },
     },
     required=["action", "node_id"],
-    exposed_by_default=False,
+    default_access="deny",
 )
 async def canvas(
     action: str,
@@ -67,7 +67,7 @@ async def canvas(
         },
     },
     required=["action"],
-    exposed_by_default=False,
+    default_access="deny",
 )
 async def nodes(
     action: str,

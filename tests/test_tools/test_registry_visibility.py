@@ -17,12 +17,12 @@ async def _handler() -> str:
     return "ok"
 
 
-def _spec(name: str, *, exposed_by_default: bool = True) -> ToolSpec:
+def _spec(name: str, *, default_access: str = "allow") -> ToolSpec:
     return ToolSpec(
         name=name,
         description=f"{name} tool",
         parameters={},
-        exposed_by_default=exposed_by_default,
+        default_access=default_access,
     )
 
 
@@ -34,15 +34,14 @@ def test_register_overwrite_warns() -> None:
         registry.register(_spec("dup"), _handler)
 
     assert any(
-        event["event"] == "registry.tool_overwrite" and event["name"] == "dup"
-        for event in captured
+        event["event"] == "registry.tool_overwrite" and event["name"] == "dup" for event in captured
     )
 
 
 def test_surfaced_tools_make_hidden_tools_visible() -> None:
     registry = ToolRegistry()
     registry.register(_spec("visible"), _handler)
-    registry.register(_spec("hidden", exposed_by_default=False), _handler)
+    registry.register(_spec("hidden", default_access="deny"), _handler)
     ctx = ToolContext(
         is_owner=True,
         caller_kind=CallerKind.AGENT,
@@ -57,7 +56,7 @@ def test_surfaced_tools_make_hidden_tools_visible() -> None:
 def test_allowed_tools_remains_strict_when_tool_is_surfaced() -> None:
     registry = ToolRegistry()
     registry.register(_spec("visible"), _handler)
-    registry.register(_spec("hidden", exposed_by_default=False), _handler)
+    registry.register(_spec("hidden", default_access="deny"), _handler)
     ctx = ToolContext(
         is_owner=True,
         caller_kind=CallerKind.AGENT,
@@ -72,7 +71,7 @@ def test_allowed_tools_remains_strict_when_tool_is_surfaced() -> None:
 
 def test_exclusive_tool_ceiling_hides_policy_allowed_and_surfaced_tools() -> None:
     registry = ToolRegistry()
-    registry.register(_spec("artifact_reader", exposed_by_default=False), _handler)
+    registry.register(_spec("artifact_reader", default_access="deny"), _handler)
     registry.register(_spec("read_file"), _handler)
     ctx = ToolContext(
         is_owner=True,
@@ -126,15 +125,11 @@ def test_retired_update_plan_selector_is_ignored_for_upgrade_compatibility() -> 
     ctx = apply_tool_policy_from_config(
         ToolContext(is_owner=True, caller_kind=CallerKind.AGENT),
         available_tools=registry.list_names(),
-        config=GatewayConfig(
-            tools=ToolsConfig(profile="minimal", also_allow=["update_plan"])
-        ),
+        config=GatewayConfig(tools=ToolsConfig(profile="minimal", also_allow=["update_plan"])),
     )
 
     assert registry.get("update_plan") is None
-    assert "update_plan" not in {
-        tool.name for tool in registry.to_tool_definitions(ctx)
-    }
+    assert "update_plan" not in {tool.name for tool in registry.to_tool_definitions(ctx)}
 
 
 def test_owner_schema_keeps_canonical_tools_and_subagents_stays_explicit_only() -> None:
@@ -145,14 +140,13 @@ def test_owner_schema_keeps_canonical_tools_and_subagents_stays_explicit_only() 
     owner_ctx = ToolContext(is_owner=True, caller_kind=CallerKind.AGENT)
 
     default_names = {tool.name for tool in registry.to_tool_definitions(owner_ctx)}
-    assert {"image_generate", "sessions_spawn", "sessions_send"} <= default_names
+    assert {"create_pptx", "image_generate", "sessions_spawn", "sessions_send"} <= default_names
     assert "subagents" not in default_names
-    assert "create_pptx" not in default_names
 
     surfaced_ctx = ToolContext(
         is_owner=True,
         caller_kind=CallerKind.AGENT,
-        surfaced_tools={"create_pptx", "subagents"},
+        surfaced_tools={"subagents"},
     )
     surfaced_names = {tool.name for tool in registry.to_tool_definitions(surfaced_ctx)}
     assert "subagents" in surfaced_names
@@ -187,7 +181,7 @@ def test_node_runtime_stubs_stay_hidden_until_explicitly_surfaced() -> None:
     assert "unavailable" in surfaced_tools["canvas"]
 
 
-def test_web_owner_schema_hides_basic_pptx_fallback_by_default() -> None:
+def test_web_owner_schema_exposes_basic_pptx_fallback_by_default() -> None:
     import opensquilla.tools.builtin  # noqa: F401
     from opensquilla.tools.registry import get_default_registry
 
@@ -196,7 +190,7 @@ def test_web_owner_schema_hides_basic_pptx_fallback_by_default() -> None:
 
     names = {tool.name for tool in registry.to_tool_definitions(web_ctx)}
 
-    assert "create_pptx" not in names
+    assert "create_pptx" in names
     assert "execute_code" in names
 
 
@@ -316,7 +310,7 @@ def test_channel_media_policy_surfaces_basic_pptx_fallback_explicitly() -> None:
 
     registry = ToolRegistry()
     registry.register(_spec("session_status"), _handler)
-    registry.register(_spec("create_pptx", exposed_by_default=False), _handler)
+    registry.register(_spec("create_pptx", default_access="deny"), _handler)
     ctx = apply_tool_policy_from_config(
         ToolContext(
             is_owner=False,
@@ -369,8 +363,8 @@ def test_channel_hidden_tool_visibility_stays_on_channel_profile(
 ) -> None:
     monkeypatch.setenv("OPENSQUILLA_TOOL_PROFILE", "owner_full")
     registry = ToolRegistry()
-    registry.register(_spec("create_pptx", exposed_by_default=False), _handler)
-    registry.register(_spec("hidden_authoring", exposed_by_default=False), _handler)
+    registry.register(_spec("create_pptx", default_access="deny"), _handler)
+    registry.register(_spec("hidden_authoring", default_access="deny"), _handler)
     channel_ctx = ToolContext(is_owner=False, caller_kind=CallerKind.CHANNEL)
 
     names = {tool.name for tool in registry.to_tool_definitions(channel_ctx)}
@@ -543,9 +537,7 @@ def test_web_group_can_surface_owner_only_http_request_for_owner_only() -> None:
 
     registry = get_default_registry()
     available = registry.list_names()
-    config = GatewayConfig(
-        tools=ToolsConfig(profile="minimal", also_allow=["group:web"])
-    )
+    config = GatewayConfig(tools=ToolsConfig(profile="minimal", also_allow=["group:web"]))
 
     owner_ctx = apply_tool_policy_from_config(
         ToolContext(is_owner=True, caller_kind=CallerKind.AGENT),
@@ -579,7 +571,7 @@ async def test_list_tools_uses_visible_helper_and_stable_sorting() -> None:
     registry = ToolRegistry()
     registry.register(_spec("zeta"), _handler)
     registry.register(_spec("alpha"), _handler)
-    registry.register(_spec("hidden", exposed_by_default=False), _handler)
+    registry.register(_spec("hidden", default_access="deny"), _handler)
 
     tools = await registry.list_tools()
 
