@@ -1265,7 +1265,7 @@
       "lifecycle": "stable",
       "name": "sessions.reset",
       "schema": "sessions/sessions-reset.schema.json",
-      "schemaSha256": "4ca0f4c42081a27af2368de7d9b7ce7c0677e9d4f3643d70097d46479d7d5ae9"
+      "schemaSha256": "43ce0304359b7c4e81fa9d5b0edabab53d468c710b6c4522be93724262ac4587"
     },
     {
       "lifecycle": "stable",
@@ -1464,7 +1464,7 @@
     "generatorSha256": "a4d9386a5dc58a59682c72a551d23aac995b95619a0d504abec20ef047671e00",
     "methodCount": 215,
     "schemaCount": 224,
-    "schemaTreeSha256": "be85f40cb1443712d8888287242ad212abd4fecfbc7e30e300444d412436e20e"
+    "schemaTreeSha256": "4cad213cb5943a1f97618e7e6e6526761afe9e4a69db83ae2d5519309202be18"
   },
   "wireVersion": 4
 }

@@ -126,13 +126,14 @@ class GatewaySessionResetPorts(
             error_type=type(exc).__name__,
         )
         return RpcHandlerError(
-            code="session_reset_busy",
+            code="STORAGE_BUSY",
             message=(
                 "Reset aborted because session work could not be fully drained. "
                 "Wait for the active turn to settle and retry."
             ),
             details={"key": session_key, "phase": phase},
             retryable=True,
+            retry_after_ms=250,
         )
 
     @asynccontextmanager

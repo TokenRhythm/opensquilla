@@ -186,8 +186,9 @@ async def test_drain_failure_aborts_reset_without_rotating_session():
 
     assert result.ok is False
     assert result.error is not None
-    assert result.error.code == "session_reset_busy"
+    assert result.error.code == "STORAGE_BUSY"
     assert result.error.retryable is True
+    assert result.error.retry_after_ms == 250
     assert result.error.details == {
         "key": _SESSION_KEY,
         "phase": "task_runtime_drain",
