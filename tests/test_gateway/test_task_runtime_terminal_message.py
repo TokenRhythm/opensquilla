@@ -29,6 +29,8 @@ from opensquilla.silent_reply import (
 def _make_envelope(
     session_key: str = "agent-1::sess-1",
     *,
+    session_id: str | None = None,
+    session_epoch: int | None = None,
     metadata: dict[str, Any] | None = None,
     input_provenance: dict[str, Any] | None = None,
 ) -> RouteEnvelope:
@@ -37,8 +39,10 @@ def _make_envelope(
         source_name="test",
         agent_id="agent-1",
         session_key=session_key,
+        session_id=session_id,
         input_provenance=input_provenance or {"kind": "test"},
         metadata=metadata or {},
+        session_epoch=session_epoch,
     )
 
 
@@ -46,10 +50,23 @@ def _make_storage() -> Any:
     storage = MagicMock()
     task_db: dict[str, AgentTaskRecord] = {}
 
-    async def create(record: AgentTaskRecord) -> None:
+    async def create(
+        record: AgentTaskRecord,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> None:
+        del expected_session_id, expected_session_epoch
         task_db[record.task_id] = record
 
-    async def update(task_id: str, **kwargs: Any) -> None:
+    async def update(
+        task_id: str,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        del expected_session_id, expected_session_epoch
         rec = task_db.get(task_id)
         if rec is None:
             return
@@ -570,9 +587,13 @@ async def test_context_overflow_failure_is_sanitized_in_record_and_subagent_even
     handle = await runtime.enqueue(
         _make_envelope(
             session_key="agent:worker:subagent:overflow",
+            session_id="child-owner-a",
+            session_epoch=3,
             metadata={
                 "parent_session_key": "agent:main:webchat:parent",
                 "parent_task_id": "parent-task",
+                "parent_session_id": "parent-owner-a",
+                "parent_session_epoch": 5,
             },
         ),
         "summarize a very large result",
@@ -591,7 +612,20 @@ async def test_context_overflow_failure_is_sanitized_in_record_and_subagent_even
     assert record.details["turn_outcome"]["kind"] == "budgetLimited"
     assert record.details["turn_outcome"]["reason"] == "provider_request_too_large"
     assert terminal_events
-    event_payload = terminal_events[-1].to_payload()
+    event = terminal_events[-1]
+    assert (event.child_session_id, event.child_session_epoch) == (
+        "child-owner-a",
+        3,
+    )
+    assert (event.parent_session_id, event.parent_session_epoch) == (
+        "parent-owner-a",
+        5,
+    )
+    event_payload = event.to_payload()
+    assert "child_session_id" not in event_payload
+    assert "child_session_epoch" not in event_payload
+    assert "parent_session_id" not in event_payload
+    assert "parent_session_epoch" not in event_payload
     assert event_payload["error_class"] == "provider_request_too_large"
     assert "too large" in event_payload["error_message"].lower()
     assert raw_error not in event_payload["error_message"]

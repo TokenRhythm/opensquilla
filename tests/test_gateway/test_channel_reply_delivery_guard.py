@@ -268,7 +268,7 @@ async def test_busy_notice_send_failure_does_not_escape_dispatch_loop() -> None:
         ),
         patch(
             "opensquilla.gateway.channel_dispatch._record_delivery_context",
-            new=AsyncMock(),
+            new=AsyncMock(return_value=(SimpleNamespace(), False)),
         ),
     ):
         with pytest.raises(asyncio.CancelledError):

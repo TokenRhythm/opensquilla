@@ -33,6 +33,7 @@ from opensquilla.session.models import (
 from opensquilla.session.storage import (
     MetaLaunchDraftDiscardedError,
     SessionStorage,
+    StaleEpochError,
     StorageBusyError,
     TurnIngressConflictError,
 )
@@ -776,6 +777,8 @@ async def test_accept_turn_commits_message_session_task_and_receipt_together(tmp
         assert task.details["persisted_user_message_id"] == "message-one"
         assert task.details["persisted_user_message_ids"] == ["message-one"]
         assert task.details["message_count"] == 1
+        assert task.details["session_id"] == SESSION_ID
+        assert task.details["session_epoch"] == 0
         assert len(receipts) == 1
         receipt = receipts[0]
         assert receipt["receipt_id"]
@@ -807,6 +810,75 @@ async def test_accept_turn_commits_message_session_task_and_receipt_together(tmp
         assert _result_value(result, "message_id") == "message-one"
         assert _result_value(result, "task_id") == "task-one"
         assert _result_value(result, "session_id") == SESSION_ID
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_details",
+    [
+        {"session_id": None},
+        {"session_id": ""},
+        {"session_id": 17},
+        {"session_epoch": None},
+        {"session_epoch": True},
+        {"session_epoch": -1},
+    ],
+)
+async def test_accept_turn_rejects_present_invalid_task_owner_fields(
+    tmp_path: Path,
+    invalid_details: dict[str, Any],
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        await storage.upsert_session(_session())
+        task = _task("task-invalid-owner")
+        task.details = invalid_details
+
+        with pytest.raises(ValueError, match="session owner"):
+            await storage.accept_turn(
+                _entry("message-invalid-owner"),
+                expected_epoch=0,
+                updated_at=200,
+                task_record=task,
+                source_scope="webui",
+                request_session_key=SESSION_KEY,
+                client_request_id="request-invalid-owner",
+                request_fingerprint="sha256:request-invalid-owner",
+            )
+
+        assert await storage.get_transcript(SESSION_ID) == []
+        assert await storage.get_agent_task("task-invalid-owner") is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_accept_turn_rejects_mismatched_task_owner(tmp_path: Path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        await storage.upsert_session(_session())
+        task = _task("task-stale-owner")
+        task.details = {
+            "session_id": "retired-session",
+            "session_epoch": 0,
+        }
+
+        with pytest.raises(StaleEpochError, match="owner"):
+            await storage.accept_turn(
+                _entry("message-stale-owner"),
+                expected_epoch=0,
+                updated_at=200,
+                task_record=task,
+                source_scope="webui",
+                request_session_key=SESSION_KEY,
+                client_request_id="request-stale-owner",
+                request_fingerprint="sha256:request-stale-owner",
+            )
+
+        assert await storage.get_transcript(SESSION_ID) == []
+        assert await storage.get_agent_task("task-stale-owner") is None
     finally:
         await storage.close()
 
@@ -1268,6 +1340,8 @@ async def test_accept_turn_collects_into_existing_task_in_the_same_transaction(
         ]
         assert task.details["fresh_user_session"] is True
         assert task.details["existing_only"] == "preserved"
+        assert task.details["session_id"] == SESSION_ID
+        assert task.details["session_epoch"] == 0
         assert [
             entry.message_id for entry in await storage.get_transcript(SESSION_ID)
         ] == ["message-collected"]

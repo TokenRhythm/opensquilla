@@ -455,6 +455,50 @@ def _accepts_keyword_arg(callable_obj: Any, name: str) -> bool:
     return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
+def _accepts_explicit_keyword_arg(callable_obj: Any, name: str) -> bool:
+    """Return whether a durable-owner keyword is part of the declared contract."""
+
+    try:
+        parameter = inspect.signature(callable_obj).parameters.get(name)
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
+
+
+def _turn_runner_owner_kwargs(
+    run: Any,
+    *,
+    expected_session_id: str | None,
+    expected_session_epoch: int | None,
+) -> dict[str, Any]:
+    """Carry modern owners only across an explicitly declared runner contract."""
+
+    if expected_session_epoch is None:
+        if (
+            isinstance(expected_session_id, str)
+            and expected_session_id
+            and _accepts_keyword_arg(run, "expected_session_id")
+        ):
+            return {"expected_session_id": expected_session_id}
+        return {}
+    if (
+        not isinstance(expected_session_id, str)
+        or not expected_session_id
+        or not _accepts_explicit_keyword_arg(run, "expected_session_id")
+        or not _accepts_explicit_keyword_arg(run, "expected_session_epoch")
+    ):
+        raise RuntimeError(
+            "Modern channel turn ownership requires an exact turn-runner owner contract"
+        )
+    return {
+        "expected_session_id": expected_session_id,
+        "expected_session_epoch": expected_session_epoch,
+    }
+
+
 @contextlib.asynccontextmanager
 async def _maybe_lock(lock: asyncio.Lock | None) -> AsyncIterator[None]:
     """Yield under ``lock`` if provided; otherwise yield unlocked.
@@ -701,13 +745,14 @@ async def run_channel_dispatch(
             if not atomic_channel_acceptance:
                 # Legacy runners need the session before execution. Production
                 # TaskRuntime creates it inside the acceptance transaction.
-                await _record_delivery_context(
+                session, _created = await _record_delivery_context(
                     session_manager,
                     session_key,
                     msg,
                     session_prefix,
                     route_envelope=route_envelope,
                 )
+                route_envelope = _route_with_session_owner(route_envelope, session)
 
         ingested: AttachmentIngestResult | None = None
         if not atomic_channel_acceptance:
@@ -725,13 +770,14 @@ async def run_channel_dispatch(
 
         if not atomic_channel_acceptance:
             async with _maybe_lock(session_lock):
-                await _record_delivery_context(
+                session, _created = await _record_delivery_context(
                     session_manager,
                     session_key,
                     msg,
                     session_prefix,
                     route_envelope=route_envelope,
                 )
+                route_envelope = _route_with_session_owner(route_envelope, session)
 
         status_reactor = _status_reactor(channel)
         await status_reactor.received(msg)
@@ -1580,7 +1626,8 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
         # Mention gating already ran via the admission decision at the top of
         # this function; denied messages never reach this point.
         if not atomic_channel_acceptance:
-            await _record_delivery_context(session_manager, session_key, msg, session_prefix, route_envelope=route_envelope)  # noqa: E501
+            session, _created = await _record_delivery_context(session_manager, session_key, msg, session_prefix, route_envelope=route_envelope)  # noqa: E501
+            route_envelope = _route_with_session_owner(route_envelope, session)
 
     ingested: AttachmentIngestResult | None = None
     if not atomic_channel_acceptance:
@@ -1600,7 +1647,8 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
 
     if not atomic_channel_acceptance:
         async with _maybe_lock(session_lock):
-            await _record_delivery_context(session_manager, session_key, msg, session_prefix, route_envelope=route_envelope)  # noqa: E501
+            session, _created = await _record_delivery_context(session_manager, session_key, msg, session_prefix, route_envelope=route_envelope)  # noqa: E501
+            route_envelope = _route_with_session_owner(route_envelope, session)
 
     status_reactor = _status_reactor(channel)
     await status_reactor.received(msg)
@@ -1776,6 +1824,46 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
 
 
 # ── Gap 1: Delivery context ─────────────────────────────────────────────
+
+
+def _route_with_session_owner(route_envelope: Any, session: Any) -> Any:
+    """Freeze one channel route to the exact session generation it admitted."""
+
+    session_id = getattr(session, "session_id", None)
+    session_epoch = getattr(session, "epoch", None)
+    valid_session_id = isinstance(session_id, str) and bool(session_id)
+    valid_session_epoch = (
+        isinstance(session_epoch, int)
+        and not isinstance(session_epoch, bool)
+        and session_epoch >= 0
+    )
+    if not valid_session_id or not valid_session_epoch:
+        from opensquilla.session.models import SessionNode
+
+        if not isinstance(session, SessionNode):
+            # Compatibility for lightweight legacy embedders that do not
+            # expose durable SessionNode coordinates. Production admission
+            # always returns SessionNode and therefore cannot bypass binding.
+            return route_envelope
+    if not valid_session_id:
+        raise ValueError("Channel session has no durable identity")
+    if not valid_session_epoch:
+        raise ValueError("Channel session has no durable epoch")
+    admitted_session_id = getattr(route_envelope, "session_id", None)
+    admitted_session_epoch = getattr(route_envelope, "session_epoch", None)
+    if (
+        admitted_session_id is not None and admitted_session_id != session_id
+    ) or (
+        admitted_session_epoch is not None and admitted_session_epoch != session_epoch
+    ):
+        from opensquilla.session.storage import StaleEpochError
+
+        raise StaleEpochError("Channel session owner changed during admission")
+    return replace(
+        route_envelope,
+        session_id=session_id,
+        session_epoch=session_epoch,
+    )
 
 
 async def _record_delivery_context(
@@ -2098,6 +2186,7 @@ async def _run_turn_with_streaming(
         session = await storage.get_session(session_key)
         if session is None:
             raise KeyError(f"Session not found: {session_key}")
+        envelope = _route_with_session_owner(envelope, session)
         run_context, workspace_guard = await authoritative_project_run_context(
             storage=storage,
             session_manager=session_manager,
@@ -2151,6 +2240,8 @@ async def _run_turn_with_streaming(
             config,
             attachments,
             accepted_config=accepted_config,
+            expected_session_id=getattr(envelope, "session_id", None),
+            expected_session_epoch=getattr(envelope, "session_epoch", None),
         )
     else:
         await _run_turn_batch_path(
@@ -2164,6 +2255,8 @@ async def _run_turn_with_streaming(
             config,
             attachments,
             accepted_config=accepted_config,
+            expected_session_id=getattr(envelope, "session_id", None),
+            expected_session_epoch=getattr(envelope, "session_epoch", None),
         )
 
 
@@ -3354,6 +3447,7 @@ async def _accept_channel_runtime_turn_impl(
         agent_id=route_envelope.agent_id,
         **delivery_fields,
     )
+    route_envelope = _route_with_session_owner(route_envelope, intent_plan.node)
     from opensquilla.session.goals import ClaimGoalMutation, GoalClaimCandidate
 
     goal_claim_candidate: GoalClaimCandidate | None = None
@@ -4113,6 +4207,8 @@ async def _run_turn_batch_path(
     attachments: list[dict[str, Any]] | None = None,
     *,
     accepted_config: Any = None,
+    expected_session_id: str | None = None,
+    expected_session_epoch: int | None = None,
 ) -> None:
     """Batch mode: accumulate all text, send once at the end."""
     text_parts: list[str] = []
@@ -4134,6 +4230,13 @@ async def _run_turn_batch_path(
         run_kwargs["semantic_message"] = semantic_message
     if attachments and _accepts_keyword_arg(turn_runner.run, "attachments"):
         run_kwargs["attachments"] = attachments
+    run_kwargs.update(
+        _turn_runner_owner_kwargs(
+            turn_runner.run,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+        )
+    )
     try:
         from opensquilla.gateway.session_model_routing import (
             accepted_model_routing_stream,
@@ -4309,6 +4412,8 @@ async def _run_turn_streaming_path(
     attachments: list[dict[str, Any]] | None = None,
     *,
     accepted_config: Any = None,
+    expected_session_id: str | None = None,
+    expected_session_epoch: int | None = None,
 ) -> None:
     """Streaming mode: feed text deltas through an async queue to send_streaming.
 
@@ -4371,6 +4476,13 @@ async def _run_turn_streaming_path(
             run_kwargs["semantic_message"] = semantic_message
         if attachments and _accepts_keyword_arg(turn_runner.run, "attachments"):
             run_kwargs["attachments"] = attachments
+        run_kwargs.update(
+            _turn_runner_owner_kwargs(
+                turn_runner.run,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+            )
+        )
         from opensquilla.gateway.session_model_routing import (
             accepted_model_routing_stream,
         )

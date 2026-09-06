@@ -347,10 +347,7 @@ def renamed_session_to_v4(result: RenamedSession) -> dict[str, Any]:
 def deleted_sessions_to_v4(result: DeleteSessionsResult) -> dict[str, Any]:
     return {
         "deleted": list(result.deleted),
-        "errors": [
-            f"{failure.requested_key}: {failure.message}"
-            for failure in result.failures
-        ],
+        "errors": [f"{failure.requested_key}: {failure.message}" for failure in result.failures],
     }
 
 

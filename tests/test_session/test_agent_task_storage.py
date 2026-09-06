@@ -3,7 +3,53 @@ from __future__ import annotations
 import pytest
 
 from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus, SessionNode, SessionStatus
-from opensquilla.session.storage import SessionStorage
+from opensquilla.session.storage import SessionStorage, StaleEpochError
+
+
+@pytest.mark.asyncio
+async def test_agent_task_create_cas_rejects_replaced_session_owner(tmp_path) -> None:
+    storage = SessionStorage(str(tmp_path / "sessions.db"))
+    await storage.connect()
+    key = "agent:main:webchat:task-owner-cas"
+    admitted = SessionNode(
+        session_key=key,
+        session_id="task-owner-old",
+        epoch=0,
+    )
+    try:
+        await storage.upsert_session(admitted)
+        matching = AgentTaskRecord(
+            task_id="matching-owner-task",
+            session_key=key,
+            source_kind="web",
+        )
+        await storage.create_agent_task(
+            matching,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=0,
+        )
+        assert await storage.get_agent_task(matching.task_id) is not None
+
+        replacement = admitted.model_copy(deep=True)
+        replacement.session_id = "task-owner-new"
+        replacement.epoch = 1
+        await storage.upsert_session(replacement)
+        stale = AgentTaskRecord(
+            task_id="stale-owner-task",
+            session_key=key,
+            source_kind="cron",
+        )
+
+        with pytest.raises(StaleEpochError, match="durable admission"):
+            await storage.create_agent_task(
+                stale,
+                expected_session_id=admitted.session_id,
+                expected_session_epoch=0,
+            )
+
+        assert await storage.get_agent_task(stale.task_id) is None
+    finally:
+        await storage.close()
 
 
 @pytest.mark.asyncio

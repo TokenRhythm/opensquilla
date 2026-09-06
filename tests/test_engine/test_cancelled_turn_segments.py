@@ -7,6 +7,7 @@ import contextlib
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -203,13 +204,26 @@ def _registry() -> ToolRegistry:
 
 
 @pytest.mark.asyncio
-async def test_cancelled_turn_persists_trailing_text_segment(tmp_path) -> None:
+async def test_cancelled_turn_persists_trailing_text_segment(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
     session_key = "agent:main:webchat:cancel-trailing-text"
     await storage.initialize_usage_ledger(1)
-    await manager.create(session_key)
+    session = await manager.create(session_key)
+    append_message = AsyncMock(wraps=manager.append_message)
+    monkeypatch.setattr(manager, "append_message", append_message)
+    reconcile_usage = AsyncMock(
+        wraps=storage.reconcile_session_usage_totals_from_ledger
+    )
+    monkeypatch.setattr(
+        storage,
+        "reconcile_session_usage_totals_from_ledger",
+        reconcile_usage,
+    )
     usage_sink = SessionUsageEventSink(storage, start_retry_delays=(), retry_delays=())
     runner = TurnRunner(
         provider_selector=_ProviderSelector(_ToolThenHangingTextProvider()),
@@ -235,6 +249,8 @@ async def test_cancelled_turn_persists_trailing_text_segment(tmp_path) -> None:
             tool_context=tool_context,
             history_has_persisted_user=False,
             no_memory_capture=True,
+            expected_session_id=session.session_id,
+            expected_session_epoch=session.epoch,
         ):
             if isinstance(event, TextDeltaEvent) and PARTIAL_ANSWER in (event.text or ""):
                 partial_seen.set()
@@ -276,6 +292,16 @@ async def test_cancelled_turn_persists_trailing_text_segment(tmp_path) -> None:
         assert session.output_tokens == 1
         assert session.total_tokens == 2
         assert session.missing_cost_entries == 1
+        reconcile_usage.assert_awaited()
+        assert reconcile_usage.await_args.kwargs["expected_session_id"] == session.session_id
+        assert reconcile_usage.await_args.kwargs["expected_epoch"] == session.epoch
+        assistant_append = next(
+            call
+            for call in append_message.await_args_list
+            if call.kwargs.get("role") == "assistant"
+        )
+        assert assistant_append.kwargs["expected_session_id"] == session.session_id
+        assert assistant_append.kwargs["expected_session_epoch"] == session.epoch
     finally:
         if not task.done():
             task.cancel()

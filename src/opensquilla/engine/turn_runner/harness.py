@@ -342,8 +342,14 @@ class _TurnRunnerRouterContextAdapter(RouterContextPort):
         bound_user_message_id: str | None = None,
         include_capacity: bool = False,
         transcript_snapshot: Any | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> dict[str, Any]:
-        from opensquilla.engine.runtime import _accepts_keyword_arg
+        from opensquilla.engine.runtime import (
+            _accepts_explicit_keyword_arg,
+            _accepts_keyword_arg,
+            _has_session_storage,
+        )
 
         kwargs: dict[str, Any] = {
             "exclude_last_user": exclude_last_user,
@@ -359,6 +365,21 @@ class _TurnRunnerRouterContextAdapter(RouterContextPort):
             "transcript_snapshot",
         ):
             kwargs["transcript_snapshot"] = transcript_snapshot
+        if expected_session_id is not None or expected_session_epoch is not None:
+            supports_exact_owner = all(
+                _accepts_explicit_keyword_arg(
+                    self._runner._router_previous_assistant_context,
+                    name,
+                )
+                for name in ("expected_session_id", "expected_session_epoch")
+            )
+            if supports_exact_owner:
+                kwargs["expected_session_id"] = expected_session_id
+                kwargs["expected_session_epoch"] = expected_session_epoch
+            elif _has_session_storage(self._runner._session_manager):
+                raise RuntimeError(
+                    "session router context reader does not support exact ownership"
+                )
         return await self._runner._router_previous_assistant_context(
             session_key,
             **kwargs,
@@ -1109,6 +1130,8 @@ class _TurnRunnerT3UpgradeCompactionAdapter(T3UpgradeCompactionPort):
         consumer_admission: Any | None = None,
         consumer_admission_fingerprint: str = "",
         transcript_snapshot: Any | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> str:
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
@@ -1164,6 +1187,9 @@ class _TurnRunnerT3UpgradeCompactionAdapter(T3UpgradeCompactionPort):
             "transcript_snapshot",
         ):
             correlation_kwargs["transcript_snapshot"] = transcript_snapshot
+        if expected_session_id is not None or expected_session_epoch is not None:
+            correlation_kwargs["expected_session_id"] = expected_session_id
+            correlation_kwargs["expected_session_epoch"] = expected_session_epoch
         return await self._runner._maybe_compact_on_t3_upgrade(
             session_key,
             turn,
@@ -1199,6 +1225,8 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
         consumer_admission: Any | None = None,
         consumer_admission_fingerprint: str = "",
         transcript_snapshot: Any | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> None:
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
@@ -1254,6 +1282,9 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
             "transcript_snapshot",
         ):
             correlation_kwargs["transcript_snapshot"] = transcript_snapshot
+        if expected_session_id is not None or expected_session_epoch is not None:
+            correlation_kwargs["expected_session_id"] = expected_session_id
+            correlation_kwargs["expected_session_epoch"] = expected_session_epoch
         await self._runner._maybe_preflight_compact(
             session_key,
             context_window_tokens,
@@ -1283,8 +1314,14 @@ class _TurnRunnerHistoryLoaderAdapter(HistoryLoaderPort):
         bound_user_message_id: str | None = None,
         restricted_turn: bool = False,
         transcript_snapshot: Any | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> str | None:
-        from opensquilla.engine.runtime import _accepts_keyword_arg
+        from opensquilla.engine.runtime import (
+            _accepts_explicit_keyword_arg,
+            _accepts_keyword_arg,
+            _has_session_storage,
+        )
 
         kwargs: dict[str, Any] = {
             "trim_last_user": trim_last_user,
@@ -1297,6 +1334,18 @@ class _TurnRunnerHistoryLoaderAdapter(HistoryLoaderPort):
             "transcript_snapshot",
         ):
             kwargs["transcript_snapshot"] = transcript_snapshot
+        if expected_session_id is not None or expected_session_epoch is not None:
+            supports_exact_owner = all(
+                _accepts_explicit_keyword_arg(self._runner._load_history, name)
+                for name in ("expected_session_id", "expected_session_epoch")
+            )
+            if supports_exact_owner:
+                kwargs["expected_session_id"] = expected_session_id
+                kwargs["expected_session_epoch"] = expected_session_epoch
+            elif _has_session_storage(self._runner._session_manager):
+                raise RuntimeError(
+                    "session history reader does not support exact ownership"
+                )
         return await self._runner._load_history(
             agent,
             session_key,
@@ -1389,8 +1438,14 @@ class _TurnRunnerCompactionPersistAdapter(CompactionPersistPort):
         source_preimage: tuple[tuple[Any, ...], ...] | None = None,
         source_boundary_message_id: str | None = None,
         source_boundary_entry_id: int | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> bool | None:
         from opensquilla.engine.cache_break_monitor import notify_compaction
+        from opensquilla.engine.runtime import (
+            _accepts_explicit_keyword_arg,
+            _has_session_storage,
+        )
         from opensquilla.session.compaction_lifecycle import (
             COMPACTION_PERSISTED_EVENT,
             COMPACTION_TRIGGERED_EVENT,
@@ -1440,6 +1495,18 @@ class _TurnRunnerCompactionPersistAdapter(CompactionPersistPort):
             persist_kwargs["source_boundary_message_id"] = source_boundary_message_id
         if "source_boundary_entry_id" in params or accepts_kwargs:
             persist_kwargs["source_boundary_entry_id"] = source_boundary_entry_id
+        if expected_session_id is not None or expected_session_epoch is not None:
+            supports_exact_owner = all(
+                _accepts_explicit_keyword_arg(persist_method, name)
+                for name in ("expected_session_id", "expected_session_epoch")
+            )
+            if supports_exact_owner:
+                persist_kwargs["expected_session_id"] = expected_session_id
+                persist_kwargs["expected_session_epoch"] = expected_session_epoch
+            elif _has_session_storage(session_manager):
+                raise RuntimeError(
+                    "compaction persistence does not support exact ownership"
+                )
         async with self._runner._session_write_context(session_key):
             installed = await persist_method(
                 session_key,
@@ -1674,6 +1741,8 @@ class _TurnRunnerTranscriptAppendAdapter(TranscriptAppendPort):
         turn_usage: dict[str, Any] | None,
         token_count: int | None,
         assistant_message_id: str | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> TranscriptAppendResult:
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
@@ -1696,6 +1765,10 @@ class _TurnRunnerTranscriptAppendAdapter(TranscriptAppendPort):
             append_kwargs["turn_usage"] = turn_usage
         if _accepts_keyword_arg(session_manager.append_message, "token_count"):
             append_kwargs["token_count"] = token_count
+        if expected_session_id is not None:
+            append_kwargs["expected_session_id"] = expected_session_id
+        if expected_session_epoch is not None:
+            append_kwargs["expected_session_epoch"] = expected_session_epoch
         entry = await self._runner._append_session_message(session_key, **append_kwargs)
         raw_message_id = getattr(entry, "message_id", None)
         message_id = (
@@ -1728,7 +1801,13 @@ class _TurnRunnerTurnMemoryCaptureAdapter(TurnMemoryCapturePort):
         input_provenance: dict[str, Any] | None,
         run_kind: str,
         no_memory_capture: bool,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> None:
+        owner_kwargs: dict[str, Any] = {}
+        if expected_session_id is not None or expected_session_epoch is not None:
+            owner_kwargs["expected_session_id"] = expected_session_id
+            owner_kwargs["expected_session_epoch"] = expected_session_epoch
         await self._runner._capture_turn_memory(
             agent_id=agent_id,
             session_key=session_key,
@@ -1739,6 +1818,7 @@ class _TurnRunnerTurnMemoryCaptureAdapter(TurnMemoryCapturePort):
             input_provenance=input_provenance,
             run_kind=run_kind,
             no_memory_capture=no_memory_capture,
+            **owner_kwargs,
         )
 
 class _TurnRunnerSessionTotalsAdapter(SessionTotalsPort):
@@ -1762,6 +1842,8 @@ class _TurnRunnerSessionTotalsAdapter(SessionTotalsPort):
         session_key: str,
         done_event: DoneEvent,
         resolved_model: str,  # noqa: ARG002 - reserved for future model-pinning
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> CostRollupResult | None:
         from opensquilla.session.cost_rollup import (
             normalize_event_cost_source,
@@ -1786,7 +1868,16 @@ class _TurnRunnerSessionTotalsAdapter(SessionTotalsPort):
             if callable(reconcile):
                 reconciled = await reconcile(
                     session_key=session_key,
-                    expected_epoch=max(0, int(getattr(current_session, "epoch", 0) or 0)),
+                    expected_epoch=(
+                        expected_session_epoch
+                        if expected_session_epoch is not None
+                        else max(0, int(getattr(current_session, "epoch", 0) or 0))
+                    ),
+                    **(
+                        {"expected_session_id": expected_session_id}
+                        if expected_session_id is not None
+                        else {}
+                    ),
                 )
                 if reconciled is not None:
                     return CostRollupResult(
@@ -1936,6 +2027,15 @@ class _TurnRunnerSessionTotalsAdapter(SessionTotalsPort):
             # silently bypass squilla-router routing.
             await session_manager.update(
                 session_key,
+                **(
+                    {
+                        "expected_session_id": expected_session_id,
+                        "expected_session_epoch": expected_session_epoch,
+                    }
+                    if expected_session_id is not None
+                    or expected_session_epoch is not None
+                    else {}
+                ),
                 input_tokens=next_input_tokens,
                 output_tokens=next_output_tokens,
                 total_tokens=next_total_tokens,
@@ -1985,11 +2085,15 @@ class _TurnRunnerTurnErrorPersistAdapter(TurnErrorPersistPort):
         session_key: str,
         event: ErrorEvent | None,
         append_transcript: bool = True,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> None:
         await self._runner._persist_turn_error(
             session_key,
             event,
             append_transcript=append_transcript,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
         )
 
 

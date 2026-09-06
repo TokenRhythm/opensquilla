@@ -11,6 +11,7 @@ from opensquilla.engine.types import DoneEvent
 
 class _Manager:
     def __init__(self) -> None:
+        self.update_calls: list[dict[str, object]] = []
         self.session = SimpleNamespace(
             input_tokens=0,
             output_tokens=0,
@@ -33,6 +34,7 @@ class _Manager:
 
     async def update(self, session_key: str, **values):
         assert session_key == "agent:webchat:mixed-turn"
+        self.update_calls.append(dict(values))
         for name, value in values.items():
             setattr(self.session, name, value)
 
@@ -65,6 +67,8 @@ async def test_session_totals_rollup_splits_mixed_turn_cost_components() -> None
         session_key="agent:webchat:mixed-turn",
         done_event=done,
         resolved_model="deepseek/deepseek-v4-pro",
+        expected_session_id="session-admitted",
+        expected_session_epoch=7,
     )
 
     assert result is not None
@@ -75,6 +79,10 @@ async def test_session_totals_rollup_splits_mixed_turn_cost_components() -> None
     assert result.model_provider == "openrouter"
     assert runner._session_manager.session.model_provider == "openrouter"
     assert runner._session_manager.session.estimated_cost_component_usd == pytest.approx(0.02)
+    assert runner._session_manager.update_calls[-1]["expected_session_id"] == (
+        "session-admitted"
+    )
+    assert runner._session_manager.update_calls[-1]["expected_session_epoch"] == 7
 
 
 @pytest.mark.asyncio

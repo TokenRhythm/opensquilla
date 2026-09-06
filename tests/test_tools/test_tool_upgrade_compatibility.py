@@ -108,4 +108,5 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
         "artifact_candidate_loop_controller",
         "artifact_preview_service",
         "tool_result_media",
+        "session_id",
     ]
