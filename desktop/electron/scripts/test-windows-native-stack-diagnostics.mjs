@@ -67,14 +67,39 @@ function decodePublicDebuggerHelp(bytes) {
   return { encoding, text }
 }
 
+const cdbSwitchCapabilityVariants = Object.freeze({
+  noshell: Object.freeze(['-noshell', '-?']),
+  nosqm: Object.freeze(['-nosqm', '-?']),
+  'netsym-colon': Object.freeze(['-netsym:no', '-?']),
+  'netsyms-colon': Object.freeze(['-netsyms:no', '-?']),
+  'netsym-separated': Object.freeze(['-netsym', 'no', '-?']),
+  'netsyms-separated': Object.freeze(['-netsyms', 'no', '-?']),
+})
+
+function summarizePublicSwitchCapability(text) {
+  const errorLine = text.split(/\r?\n/).find(line =>
+    /^(?:cdb(?:\.exe)?:\s*)?(?:invalid switch|unknown (?:switch|option)|unrecognized (?:switch|option)|error\b|unable to\b|command line error\b)/i.test(line.trim()))
+  const helpStart = text.search(/^[ \t]*usage[ \t]*:/im)
+  return {
+    errorFirstLine: errorLine?.slice(0, 512) ?? null,
+    errorFirstLineTruncated: Boolean(errorLine && errorLine.length > 512),
+    helpPresent: helpStart !== -1,
+    helpSha256: helpStart === -1 ? null : createHash('sha256').update(text.slice(helpStart)).digest('hex'),
+    outputSha256: createHash('sha256').update(text).digest('hex'),
+  }
+}
+
 /**
  * @param {string} directory
- * @param {{kind: 'capabilities'} | {kind: 'initialization', child: import('node:child_process').ChildProcess,
+ * @param {{kind: 'capabilities'} | {kind: 'switch-capability', variant: keyof typeof cdbSwitchCapabilityVariants}
+ *   | {kind: 'initialization', child: import('node:child_process').ChildProcess,
  *   identity: {electronPid: number, windowsStartTimeTicks: string}}} mode
  */
 async function captureCdbCapabilities(directory, mode = { kind: 'capabilities' }) {
-  assert.ok(['capabilities', 'initialization'].includes(mode?.kind), 'Only fixed CDB selftest modes are supported')
+  assert.ok(['capabilities', 'switch-capability', 'initialization'].includes(mode?.kind), 'Only fixed CDB selftest modes are supported')
   const initialization = mode.kind === 'initialization'
+  const switchCapability = mode.kind === 'switch-capability'
+  if (switchCapability) assert.ok(Object.hasOwn(cdbSwitchCapabilityVariants, mode.variant), 'Only fixed public switch variants are supported')
   if (initialization) {
     assert.ok(Number.isSafeInteger(mode.identity?.electronPid) && mode.identity.electronPid > 0)
     assert.equal(mode.child?.pid, mode.identity.electronPid, 'Initialization can only inspect its owned Node child')
@@ -83,8 +108,9 @@ async function captureCdbCapabilities(directory, mode = { kind: 'capabilities' }
     assert.equal(mode.child.connected, true, 'Owned Node IPC must still be connected')
     assert.ok(typeof mode.identity.windowsStartTimeTicks === 'string' && /^\d{15,20}$/.test(mode.identity.windowsStartTimeTicks))
   }
-  const control = initialization ? 'native-cdb-initialization' : 'native-cdb-capabilities'
-  const maxBytes = (initialization ? 16 : 64) * 1024
+  const control = initialization ? 'native-cdb-initialization'
+    : switchCapability ? 'native-cdb-switch-capability' : 'native-cdb-capabilities'
+  const maxBytes = (initialization || switchCapability ? 16 : 64) * 1024
   const sdkRoot = process.env['ProgramFiles(x86)']
   const debuggerPath = sdkRoot && join(sdkRoot, 'Windows Kits', '10', 'Debuggers', 'x64', 'cdb.exe')
   let toolBytes
@@ -98,7 +124,8 @@ async function captureCdbCapabilities(directory, mode = { kind: 'capabilities' }
     return { status: 'unavailable' }
   }
   const sha256 = createHash('sha256').update(toolBytes).digest('hex')
-  const workDirectory = join(directory, initialization ? 'cdb-initialization-work' : 'cdb-capabilities-work')
+  const workDirectory = join(directory, initialization ? 'cdb-initialization-work'
+    : switchCapability ? `cdb-switch-${mode.variant}-work` : 'cdb-capabilities-work')
   await mkdir(workDirectory)
   const symbolDirectory = join(workDirectory, 'symbols')
   if (initialization) await mkdir(symbolDirectory)
@@ -106,14 +133,14 @@ async function captureCdbCapabilities(directory, mode = { kind: 'capabilities' }
   for (const name of ['SystemRoot', 'WINDIR', 'ComSpec', 'PATHEXT', 'PATH', 'TEMP', 'TMP', 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA']) {
     if (process.env[name] !== undefined) env[name] = process.env[name]
   }
-  // No arbitrary argv: either public usage or noninvasive initialization of
+  // No arbitrary argv: fixed public usage variants or noninvasive initialization of
   // this test's credential-free Node child, with only a fixed marker and detach.
   // Never request stack frames, registers, memory, dumps, or product inspection.
   const args = initialization ? [
     '-pvr', '-pd', '-noshell', '-nosqm', '-sins', '-ses', '-netsym:no',
     '-y', symbolDirectory, '-p', String(mode.identity.electronPid),
     '-c', '.echo OPENSQUILLA_NATIVE_INIT_READY;qd',
-  ] : ['-?']
+  ] : switchCapability ? cdbSwitchCapabilityVariants[mode.variant] : ['-?']
   const child = spawn(debuggerPath, args, {
     cwd: workDirectory, env, windowsHide: true, stdio: [initialization ? 'pipe' : 'ignore', 'pipe', 'pipe'],
   })
@@ -170,7 +197,7 @@ async function captureCdbCapabilities(directory, mode = { kind: 'capabilities' }
       ownedIdentity: { electronPid: mode.identity.electronPid, windowsStartTimeTicks: mode.identity.windowsStartTimeTicks },
       initializationReady,
       stdoutText: out.text, stderrText: err.text,
-    } : { helpText }) }
+    } : switchCapability ? { variant: mode.variant, ...summarizePublicSwitchCapability(helpText) } : { helpText }) }
   console.log(JSON.stringify(capabilities))
   assert.equal(closeObserved, true, 'Owned SDK selftest child must close within its cleanup deadline')
   return capabilities
@@ -342,6 +369,12 @@ Start-Sleep -Seconds 60
     // is mandatory. Only genuine missing-tool status skips the native positive.
     // Capability discovery runs first, with only -? and no target parameters.
     const capabilities = await captureCdbCapabilities(directory)
+    // Six fixed, target-free public-help commands identify the SDK grammar.
+    // A captured help response or its exit code never establishes flag support.
+    for (const variant of Object.keys(cdbSwitchCapabilityVariants)) {
+      const result = await captureCdbCapabilities(directory, { kind: 'switch-capability', variant })
+      if (result.sha256 && capabilities.sha256) assert.equal(result.sha256, capabilities.sha256)
+    }
     const initialization = await captureCdbCapabilities(directory, { kind: 'initialization', child: target, identity })
     // Initialization failure is diagnostic evidence, never a substitute for
     // the unchanged real native-capture assertions that follow.

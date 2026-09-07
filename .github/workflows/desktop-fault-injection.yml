@@ -299,6 +299,34 @@ jobs:
           "Source Release workflow head: $($source.head_sha) (run $env:SOURCE_RUN_ID); verification harness: $env:HARNESS_SHA" |
             Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
+      - name: Set up Node.js for signed first-send audit
+        if: inputs.run_windows_release_audit
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.12.0"
+          cache: npm
+          cache-dependency-path: desktop/electron/package-lock.json
+
+      - name: Build the verification harness
+        if: inputs.run_windows_release_audit
+        working-directory: desktop/electron
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'Harness dependencies failed.' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'Harness compilation failed.' }
+
+      - name: Validate native stack collector against an owned process
+        if: inputs.run_windows_release_audit
+        timeout-minutes: 3
+        working-directory: desktop/electron
+        shell: pwsh
+        run: |
+          Write-Host "Native stack collector runner: $env:RUNNER_OS / $env:ImageOS / $env:ImageVersion"
+          node scripts/test-windows-native-stack-diagnostics.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Native stack collector controls failed.' }
+
       - name: Download Windows installer
         uses: actions/download-artifact@v4
         with:
@@ -355,34 +383,6 @@ jobs:
             .github/scripts/verify-windows-signatures.ps1 -InstalledRoot $target
             if ($LASTEXITCODE -ne 0) { throw 'Installed executable signature verification failed.' }
           }
-
-      - name: Set up Node.js for signed first-send audit
-        if: inputs.run_windows_release_audit
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22.12.0"
-          cache: npm
-          cache-dependency-path: desktop/electron/package-lock.json
-
-      - name: Build the verification harness
-        if: inputs.run_windows_release_audit
-        working-directory: desktop/electron
-        shell: pwsh
-        run: |
-          npm ci
-          if ($LASTEXITCODE -ne 0) { throw 'Harness dependencies failed.' }
-          npm run build
-          if ($LASTEXITCODE -ne 0) { throw 'Harness compilation failed.' }
-
-      - name: Validate native stack collector against an owned process
-        if: inputs.run_windows_release_audit
-        timeout-minutes: 3
-        working-directory: desktop/electron
-        shell: pwsh
-        run: |
-          Write-Host "Native stack collector runner: $env:RUNNER_OS / $env:ImageOS / $env:ImageVersion"
-          node scripts/test-windows-native-stack-diagnostics.mjs
-          if ($LASTEXITCODE -ne 0) { throw 'Native stack collector controls failed.' }
 
       - name: Verify signed installed first-send
         id: first_send
