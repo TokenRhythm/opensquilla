@@ -1,5 +1,6 @@
 import { setTimeout as delay } from 'node:timers/promises'
 import { closeElectronWithDeadline } from './e2e-shutdown-helpers.mjs'
+import { captureWindowsProcessStart } from './windows-wait-chain-diagnostics.mjs'
 
 // Preserve the production Gateway's shutdown request, 80s exit observation,
 // and 6s + 5s hard-kill backstops without changing any interaction budget.
@@ -22,7 +23,9 @@ export async function captureFirstSendDiagnostic(operation, timeoutMs = 3_000) {
   }
 }
 
-export async function captureElectronProcessIdentity(app, timeoutMs = 3_000) {
+export async function captureElectronProcessIdentity(app, timeoutMs = 3_000, {
+  captureWindowsStartTime = false,
+} = {}) {
   // Playwright 1.60 launches cmd.exe on Windows. Its process() is the wrapper;
   // capture the actual Electron PID while the main-process protocol is live.
   const wrapperPid = app.process()?.pid ?? null
@@ -30,11 +33,17 @@ export async function captureElectronProcessIdentity(app, timeoutMs = 3_000) {
     () => app.evaluate(() => process.pid),
     timeoutMs,
   )
-  return {
+  const identity = {
     wrapperPid,
     electronPid: Number.isSafeInteger(result) && result > 0 ? result : null,
     ...(result?.diagnosticError ? { diagnosticError: result.diagnosticError } : {}),
   }
+  if (captureWindowsStartTime && process.platform === 'win32' && identity.electronPid) {
+    const windowsIdentity = await captureWindowsProcessStart(identity.electronPid)
+    if (windowsIdentity.status === 'complete') identity.windowsStartTimeTicks = windowsIdentity.startTicks
+    else identity.windowsIdentityDiagnostic = windowsIdentity.status
+  }
+  return identity
 }
 
 export function electronProcessSnapshot(identity) {
@@ -218,6 +227,7 @@ export async function cleanupPackagedFirstSend({
   emit = line => console.error(line),
   onPhase = () => {},
   electronTimeoutMs = ELECTRON_CLEANUP_TIMEOUT_MS,
+  diagnosticTimeoutMs = 3_000,
   providerTimeoutMs = PROVIDER_CLEANUP_TIMEOUT_MS,
 }) {
   const errors = []
@@ -236,6 +246,7 @@ export async function cleanupPackagedFirstSend({
         },
         phase: 'packaged-first-send',
         diagnostics,
+        diagnosticTimeoutMs,
         emit,
         timeoutMs: electronTimeoutMs,
       })

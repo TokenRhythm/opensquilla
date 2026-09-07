@@ -199,7 +199,7 @@ export async function closeElectronWithDeadline({
       processTreeReaped: false,
     }
   } catch (cause) {
-    const snapshot = await boundedDiagnostics(diagnostics, diagnosticTimeoutMs)
+    const snapshot = await boundedDiagnostics(diagnostics ? () => diagnostics(cause) : null, diagnosticTimeoutMs)
     let child = null
     const processState = (() => {
       try {

@@ -4,6 +4,9 @@ import { once } from 'node:events'
 import { createServer } from 'node:http'
 import { createConnection } from 'node:net'
 import { setTimeout as delay } from 'node:timers/promises'
+import { mkdtemp, rmdir, unlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import {
   closeHttpServerWithDeadline,
@@ -18,6 +21,7 @@ import {
   electronProcessSnapshot,
   quitElectronOnNextTurn,
 } from './packaged-first-send-cleanup.mjs'
+import { captureWindowsProcessStart, captureWindowsWaitChain } from './windows-wait-chain-diagnostics.mjs'
 
 const fixtureProcesses = []
 const fixtureServers = []
@@ -80,6 +84,54 @@ async function assertProcessExited(pid) {
 }
 
 try {
+  if (process.platform === 'win32') {
+    const target = await startChild()
+    const nativeIdentity = await captureWindowsProcessStart(target.child.pid)
+    assert.equal(nativeIdentity.status, 'complete')
+    const targetIdentity = { electronPid: target.child.pid, windowsStartTimeTicks: nativeIdentity.startTicks }
+    const nativeChain = await captureWindowsWaitChain(targetIdentity)
+    assert.equal(nativeChain.status, 'complete')
+    assert.ok(nativeChain.records.length > 0)
+    const missing = await captureWindowsWaitChain({ ...targetIdentity, electronPid: 2147483647 })
+    assert.equal(missing.records[0].status, 'not-found')
+    const mismatch = await captureWindowsWaitChain({
+      ...targetIdentity, windowsStartTimeTicks: String(BigInt(nativeIdentity.startTicks) + 1n),
+    })
+    assert.equal(mismatch.records[0].status, 'identity-mismatch')
+    const fixtureDirectory = await mkdtemp(join(tmpdir(), 'opensquilla-wct-test-'))
+    const fixturePath = join(fixtureDirectory, 'helper.ps1')
+    try {
+      await writeFile(fixturePath, 'param($TargetPid,$ExpectedStartTicks)\nStart-Sleep -Seconds 60\n')
+      const stalled = await captureWindowsWaitChain(targetIdentity, { helperPath: fixturePath, timeoutMs: 250 })
+      assert.equal(stalled.status, 'timeout')
+      assert.equal(stalled.helperExitObserved, true)
+      await assertProcessExited(stalled.helperPid)
+      assert.equal(target.child.exitCode, null, 'WCT containment must never terminate the target')
+      await writeFile(fixturePath, "param($TargetPid,$ExpectedStartTicks)\n[Console]::Out.Write('x' * 70000)\nStart-Sleep -Seconds 60\n")
+      const oversized = await captureWindowsWaitChain(targetIdentity, { helperPath: fixturePath })
+      assert.equal(oversized.status, 'output-limit')
+      assert.equal(Object.hasOwn(oversized, 'stdout'), false)
+      await assertProcessExited(oversized.helperPid)
+      await writeFile(fixturePath, `param($TargetPid,$ExpectedStartTicks)
+[Console]::Out.WriteLine('{"tid":123,"cycle":false,"nodes":[{"type":3,"status":6,"objectName":"synthetic-not-to-emit"}]}')
+`)
+      const filtered = await captureWindowsWaitChain(targetIdentity, { helperPath: fixturePath })
+      assert.equal(filtered.status, 'complete')
+      assert.equal(JSON.stringify(filtered).includes('synthetic-not-to-emit'), false)
+      assert.deepEqual(filtered.records[0].nodes, [{ type: 3, status: 6 }])
+      await writeFile(fixturePath, `param($TargetPid,$ExpectedStartTicks)
+[Console]::Out.WriteLine('{"tid":123,"cycle":false,"nodes":[{"type":8,"status":3,"pid":456,"tid":123},{"type":8,"status":6,"pid":789,"tid":0}]}')
+`)
+      const processOnlyTerminal = await captureWindowsWaitChain(targetIdentity, { helperPath: fixturePath })
+      assert.equal(processOnlyTerminal.status, 'complete')
+      assert.deepEqual(processOnlyTerminal.records[0].nodes[1], { type: 8, status: 6, pid: 789, tid: 0 })
+    } finally {
+      await unlink(fixturePath)
+      await rmdir(fixtureDirectory)
+    }
+    target.child.send('quit')
+    await assertProcessExited(target.child.pid)
+  }
   const naturalWrapper = await startChild()
   const naturalElectron = await startChild()
   await quitElectronOnNextTurn({
@@ -233,6 +285,7 @@ try {
     provider: hangingProvider,
     electronTimeoutMs: 25,
     providerTimeoutMs: 100,
+    diagnostics: cause => ({ timeoutCode: cause.code }),
     emit: line => shutdownLogs.push(JSON.parse(line)),
     onPhase: (phase, details) => hangingPhases.push({ phase, ...details }),
   }), error => {
@@ -246,6 +299,7 @@ try {
   assert.equal(forced.forcedExitSucceeded, true, 'even successful containment must fail this gate')
   assert.equal(hangingProvider.server.listening, false, 'provider cleanup must run after Electron failure')
   assert.equal(shutdownLogs[0].process.pid, hanging.child.pid)
+  assert.equal(shutdownLogs[0].diagnostics.timeoutCode, 'DESKTOP_E2E_SHUTDOWN_TIMEOUT')
   await assertProcessExited(hanging.child.pid)
   assert.equal(electronProcessSnapshot(identity).wrapperPidExists, false)
   assert.equal(electronProcessSnapshot(identity).electronPidExists, true)

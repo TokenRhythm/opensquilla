@@ -23,6 +23,7 @@ import {
   installQuitDiagnosticProbe,
 } from './packaged-first-send-cleanup.mjs'
 import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
+import { captureWindowsWaitChain } from './windows-wait-chain-diagnostics.mjs'
 
 const DEFAULT_ITERATIONS = 20
 const SEND_TIMEOUT_MS = 45_000
@@ -453,7 +454,9 @@ try {
       no_proxy: '127.0.0.1,localhost,::1',
     },
   })
-  electronProcessIdentity = await captureElectronProcessIdentity(app)
+  electronProcessIdentity = await captureElectronProcessIdentity(app, 3_000, {
+    captureWindowsStartTime: extendedQuitDiagnostics,
+  })
   reportPhase('electron-launch-complete', { processes: electronProcessIdentity })
 
   await app.context().route((url) => {
@@ -637,10 +640,14 @@ try {
       deferQuit,
       unrouteBeforeQuit,
       processIdentity: electronProcessIdentity,
-      diagnostics: async () => ({
+      diagnosticTimeoutMs: extendedQuitDiagnostics ? 6_000 : 3_000,
+      diagnostics: async cause => ({
         processes: electronProcessSnapshot(electronProcessIdentity),
         desktopLog: await readDesktopLogSummary(userDataDir),
         rendererBeforeCleanup: failureRendererSnapshot,
+        ...(extendedQuitDiagnostics && cause?.code === 'DESKTOP_E2E_SHUTDOWN_TIMEOUT'
+          ? { windowsWaitChain: await captureWindowsWaitChain(electronProcessIdentity) }
+          : {}),
       }),
       onPhase: reportPhase,
     })
