@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import runpy
 import sqlite3
 import subprocess
 import sys
@@ -274,6 +275,28 @@ def test_release_upload_derives_preview_state_from_each_tag(tmp_path: Path) -> N
     assert "release upload v9.9.9rc7" in preview_calls
 
 
+@pytest.mark.parametrize(
+    ("actual", "expected_summary"),
+    [
+        ('# changed comment\n[llm]\napi_key = "original-secret"\n', {"changed_paths": []}),
+        ('[llm]\napi_key = "replacement-secret"\n', {"changed_paths": ["llm.api_key"]}),
+        ('[llm]\napi_key = "invalid-secret', {"invalid_toml": True}),
+    ],
+)
+def test_release_profile_config_diagnostics_omit_values(
+    actual: str,
+    expected_summary: dict,
+) -> None:
+    probe = runpy.run_path(".github/scripts/verify-release-profile-preservation.py")
+    summary = probe["_config_change_summary"]('[llm]\napi_key = "original-secret"\n', actual)
+    parsed = json.loads(summary)
+
+    for key, value in expected_summary.items():
+        assert parsed[key] == value
+    assert "secret" not in summary
+    assert parsed["actual_text_sha256"] != parsed["expected_text_sha256"]
+
+
 def test_release_profile_preservation_probe_covers_identity_config_and_chat_db(
     tmp_path: Path,
 ) -> None:
@@ -417,6 +440,11 @@ def test_release_profile_preservation_probe_covers_identity_config_and_chat_db(
     )
     assert install_phase_rejected.returncode != 0
     assert "during installation" in install_phase_rejected.stderr
+    assert '"changed_paths": ["config_version", "control_ui.default_locale"]' in (
+        install_phase_rejected.stderr
+    )
+    assert '"expected_text_sha256"' in install_phase_rejected.stderr
+    assert '"actual_text_sha256"' in install_phase_rejected.stderr
 
     (home / "config.toml").write_text(config_text, encoding="utf-8", newline="")
 
