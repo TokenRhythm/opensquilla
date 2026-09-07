@@ -51,17 +51,19 @@ class _FakeSessionManager:
         # Simulate a successful compaction: collapse history into a single
         # short summary entry so the next estimate fits easily.
         self.compact_calls.append((session_key, budget, config))
-        self._transcript = [_FakeEntry(content="[summary]")]
-        return "[summary]"
+        self._transcript = [_FakeEntry(content="ok")]
+        return "ok"
 
 
 class _ResultCompactionSessionManager(_FakeSessionManager):
     async def compact_with_result(self, session_key: str, budget: int, config=None, **kwargs):
         self.compact_calls.append((session_key, budget, config))
         self.compact_kwargs.append(dict(kwargs))
-        self._transcript = [_FakeEntry(content="[summary]")]
+        # The success fixture must fit the tiny test budget even when the
+        # optional tokenizer is unavailable and conservative estimation is used.
+        self._transcript = [_FakeEntry(content="ok")]
         return SimpleNamespace(
-            summary="[summary]",
+            summary="ok",
             kept_entries=[{"role": "assistant", "content": "[tail]"}],
             removed_count=5,
             chunks_processed=2,
@@ -104,8 +106,8 @@ class _FailingCompactionSessionManager(_FakeSessionManager):
 class _LegacyCompactSessionManager(_FakeSessionManager):
     async def compact(self, session_key: str, budget: int) -> str:
         self.compact_calls.append((session_key, budget, None))
-        self._transcript = [_FakeEntry(content="[summary]")]
-        return "[summary]"
+        self._transcript = [_FakeEntry(content="ok")]
+        return "ok"
 
 
 def _assert_armed_compact_call(
@@ -540,6 +542,30 @@ async def test_auto_summarize_preserves_root_and_splits_auxiliary_executions() -
     assert flush_correlation.turn_id == compaction_correlation.turn_id
     assert flush_correlation.execution_id != compaction_correlation.execution_id
     assert flush_correlation.call_kind == "auxiliary.session_flush"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "manager_type",
+    [_FakeSessionManager, _ResultCompactionSessionManager, _LegacyCompactSessionManager],
+)
+async def test_auto_summarize_small_result_without_optional_tokenizer(
+    monkeypatch, manager_type,
+) -> None:
+    from opensquilla import token_estimation
+
+    monkeypatch.setattr(token_estimation, "_get_encoding", lambda: None)
+    manager = manager_type(_history(6, 40))
+    outcome = await apply_context_overflow_policy(
+        config=_cfg(ContextOverflowPolicy.AUTO_SUMMARIZE, budget=10),
+        message="m",
+        transcript=manager._transcript,
+        session_key="s-fallback-tokenizer",
+        session_manager=manager,
+    )
+
+    assert outcome.summarized is True
+    assert outcome.tokens_after <= 10
 
 
 @pytest.mark.asyncio
