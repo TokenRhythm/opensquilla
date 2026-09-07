@@ -17,6 +17,32 @@ macOS release packaging is handled separately through the Apple signing and
 notarization path configured by maintainers for macOS artifacts. This document's
 Windows signing policy applies to open-source community release artifacts.
 
+## Release Source And Validation
+
+Before any build or signing approval, Release Assets resolves the selected
+source to one commit and verifies that it contains the Windows signing scripts
+and a supported signing policy. The workflow commit and source commit are
+recorded separately. All build and audit jobs consume that same source commit.
+An existing-tag dispatch must originate from main and target a new or Draft
+release whose source already contains signing support. Historical unsigned
+tags and already published releases are rejected before signing; the workflow
+does not inject new signing scripts into old source trees.
+
+An approved empty-tag dispatch creates internal signed artifacts and audits the
+same Windows installer on independent Windows runners for both official
+baselines (0.5.3 and 0.5.4) and both default and custom installation paths.
+The audit verifies the downloaded signature, installation, launch, profile
+preservation, and uninstallation without access to KeyLocker credentials.
+When the candidate version equals a baseline, that case demonstrates
+reinstallation, not an upgrade to a newer release.
+
+Internal artifacts do not publish a GitHub Release or exercise OSS prestaging
+and real updater downloads. Before publishing a new version, the tag workflow
+must also pass the Draft download and real updater audit matrix. Draft upload
+and immutable OSS prestaging happen before these audits. Retry a failed audit
+with the original artifacts; rebuilding or signing again can change bytes and
+is not permitted to replace an immutable OSS object under the same version.
+
 ## User Verification
 
 Users should download OpenSquilla release artifacts from the official GitHub

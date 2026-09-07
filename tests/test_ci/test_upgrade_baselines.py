@@ -293,11 +293,37 @@ def windows_upgrade_harness(tmp_path: Path) -> tuple[str, Path]:
             pytest.fail(message)
         pytest.skip(message)
     wrapper = tmp_path / "upgrade-harness.ps1"
+    helper_scripts = tmp_path / ".github" / "scripts"
+    helper_scripts.mkdir(parents=True)
+    shutil.copyfile(
+        SCRIPTS / "verify-release-windows-upgrade.ps1",
+        helper_scripts / "verify-release-windows-upgrade.ps1",
+    )
+    # Isolate signature verification at its real script boundary. The production
+    # helper keeps mandatory verification; these version fixtures have no signed
+    # installer or installed uninstaller and also run under PowerShell on POSIX.
+    (helper_scripts / "verify-windows-signatures.ps1").write_text(
+        r"""
+param(
+  [Parameter(Mandatory = $true)][string]$InstallerPath,
+  [Parameter(Mandatory = $true)][string]$InstalledRoot
+)
+$ErrorActionPreference = 'Stop'
+@{ InstallerPath = $InstallerPath; InstalledRoot = $InstalledRoot } |
+  ConvertTo-Json -Compress | Set-Content -LiteralPath $env:SYNTHETIC_SIGNATURE_ARGUMENTS
+if ($env:SYNTHETIC_SIGNATURE_FAILURE -eq 'throw') {
+  throw 'SYNTHETIC_SIGNATURE_REJECTED'
+}
+if ($env:SYNTHETIC_SIGNATURE_FAILURE -eq 'exit') { exit 23 }
+$global:LASTEXITCODE = 0
+""",
+        encoding="utf-8",
+    )
     # Exercise the real helper with synthetic Win32 version resources. Only external
-    # downloads, installer execution, and profile probes are replaced; no Windows
+    # downloads, installer execution, signature checks, and profile probes are replaced; no Windows
     # executable runs, so the same regression also runs under PowerShell on POSIX.
     wrapper.write_text(
-        r'''
+        r"""
 $ErrorActionPreference = 'Stop'
 function New-SyntheticDesktop {
   param([string]$Path, [string]$Version)
@@ -403,7 +429,7 @@ try {
   [Console]::Error.WriteLine($_.Exception.Message)
   exit 1
 }
-''',
+""",
         encoding="utf-8",
     )
     return pwsh, wrapper
@@ -427,6 +453,7 @@ def _run_windows_upgrade_helper(
     installed_version: str = "no-op",
     install_mode: str = "custom",
     manifest: dict[str, object] | None = None,
+    signature_failure: str = "",
 ) -> subprocess.CompletedProcess[str]:
     pwsh, wrapper = harness
     candidate = wrapper.parent / candidate_name
@@ -436,21 +463,44 @@ def _run_windows_upgrade_helper(
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     return subprocess.run(
         [pwsh, "-NoProfile", "-NonInteractive", "-File", str(wrapper)],
-        cwd=ROOT,
+        cwd=wrapper.parent,
         env={
             **os.environ,
             "RUNNER_TEMP": str(wrapper.parent / "runner"),
-            "SYNTHETIC_HELPER": str(SCRIPTS / "verify-release-windows-upgrade.ps1"),
+            "SYNTHETIC_HELPER": str(
+                wrapper.parent / ".github/scripts/verify-release-windows-upgrade.ps1"
+            ),
             "SYNTHETIC_CANDIDATE": str(candidate),
             "SYNTHETIC_INSTALLED_VERSION": installed_version,
             "SYNTHETIC_INSTALL_MODE": install_mode,
             "SYNTHETIC_MANIFEST": str(manifest_path) if manifest is not None else "",
+            "SYNTHETIC_SIGNATURE_ARGUMENTS": str(wrapper.parent / "signature-arguments.json"),
+            "SYNTHETIC_SIGNATURE_FAILURE": signature_failure,
         },
         capture_output=True,
         text=True,
         check=False,
         timeout=45,
     )
+
+
+def _assert_windows_signature_arguments(
+    harness: tuple[str, Path], *, candidate: str, install_mode: str
+) -> None:
+    root = harness[1].parent
+    captured = json.loads((root / "signature-arguments.json").read_text(encoding="utf-8-sig"))
+    sandbox = (
+        root
+        / "runner"
+        / (f"opensquilla-release-preservation-version-regression-{install_mode}-0.5.4")
+    )
+    installed = (
+        sandbox / "OpenSquilla"
+        if install_mode == "custom"
+        else sandbox / "localappdata/Programs/OpenSquilla"
+    )
+    assert Path(captured["InstallerPath"]) == root / f"OpenSquilla-{candidate}-win-x64.exe"
+    assert Path(captured["InstalledRoot"]) == installed
 
 
 @pytest.mark.parametrize("install_mode", ["default", "custom"])
@@ -481,6 +531,9 @@ def test_windows_replacement_rejects_successful_installer_with_stale_app(
     expected_error = f"ProductVersion {actual} does not match the rehearsed version {candidate}"
     assert expected_error in result.stderr
     assert "POST_INSTALL_LAUNCH_REACHED" not in result.stderr
+    _assert_windows_signature_arguments(
+        windows_upgrade_harness, candidate=candidate, install_mode=install_mode
+    )
 
 
 @pytest.mark.parametrize("install_mode", ["default", "custom"])
@@ -497,6 +550,36 @@ def test_windows_replacement_accepts_exact_installed_candidate_version(
     assert result.returncode != 0  # Stop before any real application is launched.
     assert "SYNTHETIC_INSTALLER_EXIT_ZERO:2" in result.stdout
     assert "POST_INSTALL_LAUNCH_REACHED" in result.stderr
+    _assert_windows_signature_arguments(
+        windows_upgrade_harness, candidate=candidate, install_mode=install_mode
+    )
+
+
+@pytest.mark.parametrize("install_mode", ["default", "custom"])
+@pytest.mark.parametrize("signature_failure", ["exit", "throw"])
+def test_windows_upgrade_propagates_signature_failure_before_launch(
+    windows_upgrade_harness: tuple[str, Path], install_mode: str, signature_failure: str
+) -> None:
+    result = _run_windows_upgrade_helper(
+        windows_upgrade_harness,
+        candidate_name="OpenSquilla-0.5.5-win-x64.exe",
+        installed_version="0.5.5",
+        install_mode=install_mode,
+        signature_failure=signature_failure,
+    )
+    assert result.returncode != 0
+    assert "SYNTHETIC_INSTALLER_EXIT_ZERO:2" in result.stdout
+    message = (
+        "SYNTHETIC_SIGNATURE_REJECTED"
+        if signature_failure == "throw"
+        else "Candidate or installed Windows Authenticode verification failed."
+    )
+    assert message in result.stderr
+    assert "POST_INSTALL_LAUNCH_REACHED" not in result.stderr
+    assert "HELPER_COMPLETED_UNEXPECTEDLY" not in result.stderr
+    _assert_windows_signature_arguments(
+        windows_upgrade_harness, candidate="0.5.5", install_mode=install_mode
+    )
 
 
 @pytest.mark.parametrize(

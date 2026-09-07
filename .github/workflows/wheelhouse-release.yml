@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing tag to upload; leave empty for an internal test-package artifact
+        description: Tag containing signing support for a new/Draft release; leave empty for an internal signed test artifact
         required: false
         default: ""
 
@@ -26,18 +26,43 @@ env:
   OSSUTIL_SHA256: 3ae4d9fc85a7a6e9f5654d1599766f1a3a42a3692870887b5ae9338d582ef65a
 
 jobs:
+  release-preflight:
+    name: Validate release source before signing
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      source_sha: ${{ steps.source.outputs.source_sha }}
+    steps:
+      - name: Checkout workflow validation tooling
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.workflow_sha }}
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate immutable release source and Draft state
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: python .github/scripts/release_signing_preflight.py
+
   build-control-ui:
     name: Build verified Web UI artifact
+    needs: release-preflight
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
+      source_sha: ${{ needs.release-preflight.outputs.source_sha }}
       webui_mode: ${{ steps.webui-contract.outputs.mode }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           persist-credentials: false
-          ref: ${{ env.RELEASE_TAG != '' && env.RELEASE_TAG || github.ref }}
+          ref: ${{ needs.release-preflight.outputs.source_sha }}
 
       - name: Detect Web UI artifact contract
         id: webui-contract
@@ -140,6 +165,8 @@ jobs:
 
   build-release-assets:
     name: Build Python release assets
+    outputs:
+      source_sha: ${{ needs.build-control-ui.outputs.source_sha }}
     needs: build-control-ui
     runs-on: windows-latest
     timeout-minutes: 90
@@ -157,7 +184,7 @@ jobs:
         with:
           lfs: true
           persist-credentials: false
-          ref: ${{ env.RELEASE_TAG != '' && env.RELEASE_TAG || github.ref }}
+          ref: ${{ needs.build-control-ui.outputs.source_sha }}
 
       - name: Download verified Web UI artifact
         uses: actions/download-artifact@v4
@@ -357,7 +384,7 @@ jobs:
         with:
           lfs: true
           persist-credentials: false
-          ref: ${{ env.RELEASE_TAG != '' && env.RELEASE_TAG || github.ref }}
+          ref: ${{ needs.build-control-ui.outputs.source_sha }}
 
       - name: Download verified Web UI artifact
         uses: actions/download-artifact@v4
@@ -513,7 +540,7 @@ jobs:
         with:
           lfs: true
           persist-credentials: false
-          ref: ${{ env.RELEASE_TAG != '' && env.RELEASE_TAG || github.ref }}
+          ref: ${{ needs.build-control-ui.outputs.source_sha }}
 
       - name: Download verified Web UI artifact
         uses: actions/download-artifact@v4
@@ -713,6 +740,8 @@ jobs:
 
   publish-release:
     name: Publish release assets
+    outputs:
+      source_sha: ${{ needs.build-release-assets.outputs.source_sha }}
     needs:
       - build-release-assets
       - build-desktop-macos
@@ -727,7 +756,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ needs.build-release-assets.outputs.source_sha }}
 
       - name: Download release assets
         uses: actions/download-artifact@v4
@@ -1025,6 +1054,7 @@ jobs:
     permissions:
       contents: read
     outputs:
+      source_sha: ${{ needs.publish-release.outputs.source_sha }}
       prerelease: ${{ steps.draft-metadata.outputs.prerelease }}
     env:
       ALIYUN_OSS_BUCKET: ${{ vars.ALIYUN_OSS_BUCKET }}
@@ -1040,7 +1070,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ needs.publish-release.outputs.source_sha }}
 
       - name: Validate Draft and OSS prestage configuration
         shell: bash
@@ -1235,7 +1265,7 @@ jobs:
         with:
           lfs: false
           persist-credentials: false
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ needs.prestage-draft-updater-assets.outputs.source_sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -1414,7 +1444,7 @@ jobs:
         with:
           lfs: false
           persist-credentials: false
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ needs.prestage-draft-updater-assets.outputs.source_sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -1511,5 +1541,58 @@ jobs:
           .github/scripts/verify-release-windows-upgrade.ps1 `
             -CandidateInstaller $candidates[0].FullName `
             -Label "downloaded-preview-$env:INSTALL_MODE" `
+            -InstallMode $env:INSTALL_MODE `
+            -BaselineVersion $env:BASELINE_VERSION
+
+
+  audit-internal-windows-artifact:
+    name: Audit signed Windows test artifact (v${{ matrix.baseline-version }}, ${{ matrix.install-mode }})
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag == '' }}
+    needs: [build-control-ui, build-desktop-windows]
+    runs-on: windows-2022
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        baseline-version: ['0.5.3', '0.5.4']
+        install-mode: [default, custom]
+    steps:
+      - name: Checkout the signed artifact source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ needs.build-control-ui.outputs.source_sha }}
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.12.0"
+          cache: npm
+          cache-dependency-path: desktop/electron/package-lock.json
+      - name: Install release verification dependencies
+        working-directory: desktop/electron
+        run: npm ci
+      - name: Download the signed Windows test artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: opensquilla-electron-windows
+          path: release-audit
+      - name: Verify downloaded signature, install, launch, and uninstall
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASELINE_VERSION: ${{ matrix.baseline-version }}
+          INSTALL_MODE: ${{ matrix.install-mode }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidates = @(Get-ChildItem 'release-audit/OpenSquilla-*-win-x64.exe' -File)
+          if ($candidates.Count -ne 1) { throw 'Expected one signed test installer.' }
+          .github/scripts/verify-windows-signatures.ps1 -InstallerPath $candidates[0].FullName
+          .github/scripts/verify-release-windows-upgrade.ps1 `
+            -CandidateInstaller $candidates[0].FullName `
+            -Label "internal-$env:BASELINE_VERSION-$env:INSTALL_MODE" `
             -InstallMode $env:INSTALL_MODE `
             -BaselineVersion $env:BASELINE_VERSION

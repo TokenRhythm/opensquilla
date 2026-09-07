@@ -13,10 +13,45 @@ $policy = Get-Content -LiteralPath $policyPath -Raw | ConvertFrom-Json
 $expectedThumbprint = ([string]$policy.certificateSha1).ToUpperInvariant()
 $expectedPublisher = [string]$policy.publisherSubjectContains
 
-if (-not $SignToolPath) {
-    $command = Get-Command signtool.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $command) { throw 'signtool.exe was not found on PATH.' }
-    $SignToolPath = $command.Source
+function Resolve-SignToolFile([string]$Path, [string]$Source) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "$Source does not point to a SignTool file: $Path"
+    }
+    return (Get-Item -LiteralPath $Path).FullName
+}
+
+if ($PSBoundParameters.ContainsKey('SignToolPath')) {
+    $SignToolPath = Resolve-SignToolFile $SignToolPath '-SignToolPath'
+} elseif ($env:SIGNTOOL_PATH) {
+    $SignToolPath = Resolve-SignToolFile $env:SIGNTOOL_PATH 'SIGNTOOL_PATH'
+} else {
+    $command = Get-Command signtool.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $command) {
+        $SignToolPath = $command.Source
+    } else {
+        # Download-audit jobs do not inherit the signing job's PATH. Locate the
+        # latest installed Windows 10 SDK's x64 verifier without signing secrets.
+        $sdkTools = @(
+            foreach ($programFiles in @(${env:ProgramFiles(x86)}, $env:ProgramFiles) | Select-Object -Unique) {
+                if (-not $programFiles) { continue }
+                $sdkBin = Join-Path $programFiles 'Windows Kits/10/bin'
+                if (-not (Test-Path -LiteralPath $sdkBin -PathType Container)) { continue }
+                foreach ($directory in Get-ChildItem -LiteralPath $sdkBin -Directory) {
+                    $version = $null
+                    if (-not [version]::TryParse($directory.Name, [ref]$version)) { continue }
+                    $candidate = Join-Path $directory.FullName 'x64/signtool.exe'
+                    if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                        [pscustomobject]@{ Version = $version; Path = $candidate }
+                    }
+                }
+            }
+        )
+        $latest = $sdkTools | Sort-Object Version -Descending | Select-Object -First 1
+        if ($null -eq $latest) {
+            throw 'signtool.exe was not found on PATH or in a Windows 10 SDK x64 directory. Install the Windows SDK or set SIGNTOOL_PATH.'
+        }
+        $SignToolPath = $latest.Path
+    }
 }
 
 $targets = [ordered]@{}
