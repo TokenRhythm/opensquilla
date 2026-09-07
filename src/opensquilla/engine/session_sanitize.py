@@ -197,6 +197,90 @@ def project_historical_tool_payloads(
     )
 
 
+@dataclass
+class PrefixProjectionCache:
+    """Incremental cache for project_historical_tool_payloads over long sessions.
+
+    History grows by appending at the tail each turn; the leading message
+    objects stay identical across turns. We memoize the projected prefix and
+    its metric deltas, then only process the newly-appended tail.
+    """
+
+    prefix_ids: tuple[int, ...]
+    projected: list[Message]
+    tool_uses_projected: int
+    tool_results_projected: int
+    reasoning_chars_removed: int
+    payload_chars_before: int
+    payload_chars_after: int
+    recoverable_references: frozenset[tuple[str, str]]
+
+
+def project_historical_tool_payloads_cached(
+    messages: list[Message],
+    *,
+    preserve_reasoning_content: bool,
+    recoverable_references: frozenset[tuple[str, str]] = frozenset(),
+    cache: PrefixProjectionCache | None,
+) -> tuple[list[Message], HistoricalReplayProjectionResult, PrefixProjectionCache]:
+    """Like project_historical_tool_payloads with prefix reuse for long sessions.
+
+    Same safety argument as sanitize_session_messages_cached: per-message pure
+    transform, leading messages identical objects -> only the tail is projected.
+    """
+
+    ids = tuple(id(message) for message in messages)
+    if (
+        cache is not None
+        and len(ids) >= len(cache.prefix_ids)
+        and ids[: len(cache.prefix_ids)] == cache.prefix_ids
+        and recoverable_references == cache.recoverable_references
+    ):
+        tail = messages[len(cache.prefix_ids) :]
+        tail_projected, tail_result = project_historical_tool_payloads(
+            tail,
+            preserve_reasoning_content=preserve_reasoning_content,
+            recoverable_references=recoverable_references,
+        )
+        projected = cache.projected + tail_projected
+        result = HistoricalReplayProjectionResult(
+            messages_in=len(messages),
+            messages_out=len(projected),
+            payload_chars_before=cache.payload_chars_before + tail_result.payload_chars_before,
+            payload_chars_after=cache.payload_chars_after + tail_result.payload_chars_after,
+            tool_uses_projected=cache.tool_uses_projected + tail_result.tool_uses_projected,
+            tool_results_projected=cache.tool_results_projected + tail_result.tool_results_projected,
+            reasoning_chars_removed=cache.reasoning_chars_removed + tail_result.reasoning_chars_removed,
+        )
+        new_cache = PrefixProjectionCache(
+            prefix_ids=ids,
+            projected=projected,
+            tool_uses_projected=result.tool_uses_projected,
+            tool_results_projected=result.tool_results_projected,
+            reasoning_chars_removed=result.reasoning_chars_removed,
+            payload_chars_before=result.payload_chars_before,
+            payload_chars_after=result.payload_chars_after,
+            recoverable_references=recoverable_references,
+        )
+        return projected, result, new_cache
+    projected, result = project_historical_tool_payloads(
+        messages,
+        preserve_reasoning_content=preserve_reasoning_content,
+        recoverable_references=recoverable_references,
+    )
+    new_cache = PrefixProjectionCache(
+        prefix_ids=ids,
+        projected=list(projected),
+        tool_uses_projected=result.tool_uses_projected,
+        tool_results_projected=result.tool_results_projected,
+        reasoning_chars_removed=result.reasoning_chars_removed,
+        payload_chars_before=result.payload_chars_before,
+        payload_chars_after=result.payload_chars_after,
+        recoverable_references=recoverable_references,
+    )
+    return projected, result, new_cache
+
+
 def sanitize_session_messages(
     messages: list[Message],
 ) -> tuple[list[Message], SessionSanitizeResult]:
@@ -237,6 +321,65 @@ def sanitize_session_messages(
         payload_chars_after=payload_chars_after,
         metadata_keys_removed=metadata_keys_removed,
     )
+
+
+@dataclass
+class PrefixSanitizeCache:
+    """Incremental cache for sanitize_session_messages over append-only history.
+
+    History grows by appending at the tail each turn; the leading message
+    objects stay identical. We memoize the sanitized prefix and its metric
+    deltas, then only process the newly-appended tail.
+    """
+
+    prefix_ids: tuple[int, ...]
+    sanitized: list[Message]
+    metadata_keys_removed: int
+    payload_chars_before: int
+    payload_chars_after: int
+
+
+def sanitize_session_messages_cached(
+    messages: list[Message],
+    cache: PrefixSanitizeCache | None,
+) -> tuple[list[Message], SessionSanitizeResult, PrefixSanitizeCache]:
+    """Like sanitize_session_messages, but reuses work from a previous turn.
+
+    Safe because sanitize is a pure per-message transform: when the leading
+    messages are the same objects (same ids), their sanitized form is reused
+    and only the tail is processed. The payload_chars metrics are additive
+    approximations for the increment; they are log/metrics only.
+    """
+
+    ids = tuple(id(message) for message in messages)
+    if cache is not None and len(ids) >= len(cache.prefix_ids) and ids[: len(cache.prefix_ids)] == cache.prefix_ids:
+        tail = messages[len(cache.prefix_ids) :]
+        tail_sanitized, tail_result = sanitize_session_messages(tail)
+        sanitized = cache.sanitized + tail_sanitized
+        result = SessionSanitizeResult(
+            messages_in=len(messages),
+            messages_out=len(sanitized),
+            payload_chars_before=cache.payload_chars_before + tail_result.payload_chars_before,
+            payload_chars_after=cache.payload_chars_after + tail_result.payload_chars_after,
+            metadata_keys_removed=cache.metadata_keys_removed + tail_result.metadata_keys_removed,
+        )
+        new_cache = PrefixSanitizeCache(
+            prefix_ids=ids,
+            sanitized=sanitized,
+            metadata_keys_removed=result.metadata_keys_removed,
+            payload_chars_before=result.payload_chars_before,
+            payload_chars_after=result.payload_chars_after,
+        )
+        return sanitized, result, new_cache
+    sanitized, result = sanitize_session_messages(messages)
+    new_cache = PrefixSanitizeCache(
+        prefix_ids=ids,
+        sanitized=list(sanitized),
+        metadata_keys_removed=result.metadata_keys_removed,
+        payload_chars_before=result.payload_chars_before,
+        payload_chars_after=result.payload_chars_after,
+    )
+    return sanitized, result, new_cache
 
 
 def _project_historical_tool_use(
