@@ -144,7 +144,7 @@ def _text_only_tool_recovery_mode_from_env(
     raw = os.environ.get("OPENSQUILLA_TEXT_ONLY_TOOL_RECOVERY_MODE")
     if raw is None:
         raw = config_value
-    return normalize_runtime_recovery_mode(raw, default="off")
+    return normalize_runtime_recovery_mode(raw, default="warn_model")
 
 
 def _reasoning_prefill_recovery_mode_from_env() -> Literal["off", "log", "recover"]:

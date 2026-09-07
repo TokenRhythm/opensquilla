@@ -233,7 +233,7 @@ async def test_recovery_failure_emits_authoritative_empty_terminal_snapshot() ->
     provider = _SequenceProvider(
         [
             [
-                ProviderText(text="superseded answer"),
+                ProviderText(text="I will inspect the repository next."),
                 ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1),
             ],
             [ProviderError(message="fatal retry failure", code="400")],

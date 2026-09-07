@@ -241,7 +241,7 @@ def _run_rehearsal_driver(
         capture_output=True,
         text=True,
         check=False,
-        timeout=15,
+        timeout=30 if os.name == "nt" else 15,
     )
 
 

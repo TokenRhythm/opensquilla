@@ -11,6 +11,7 @@ from opensquilla.engine.turn_runner.agent_bootstrap_stage import (
     _runtime_recovery_mode_from_env,
     _source_diff_candidate_mode_from_env,
     _source_diff_preservation_mode_from_env,
+    _text_only_tool_recovery_mode_from_env,
     _tool_loop_observer_mode_from_env,
 )
 
@@ -72,6 +73,12 @@ def test_runtime_recovery_modes_from_env(monkeypatch) -> None:
     assert _final_diff_contract_mode_from_env() == "log"
     assert _post_tool_empty_recovery_mode_from_env() == "log"
     assert _reasoning_prefill_recovery_mode_from_env() == "log"
+
+
+def test_text_only_action_promise_recovery_defaults_on_and_allows_opt_out(monkeypatch) -> None:
+    monkeypatch.delenv("OPENSQUILLA_TEXT_ONLY_TOOL_RECOVERY_MODE", raising=False)
+    assert _text_only_tool_recovery_mode_from_env() == "warn_model"
+    assert _text_only_tool_recovery_mode_from_env("off") == "off"
 
 
 def test_source_diff_preservation_mode_from_env(monkeypatch) -> None:
