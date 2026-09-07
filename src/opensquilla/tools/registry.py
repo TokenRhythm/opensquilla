@@ -32,6 +32,46 @@ from opensquilla.tools.types import (
 
 log = structlog.get_logger(__name__)
 
+DEFAULT_MODEL_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "apply_patch",
+        "create_csv",
+        "create_pdf_report",
+        "create_pptx",
+        "create_xlsx",
+        "cron",
+        "edit_file",
+        "exec_command",
+        "execute_code",
+        "git_diff",
+        "git_status",
+        "glob_search",
+        "grep_search",
+        "image",
+        "image_generate",
+        "list_dir",
+        "pdf",
+        "publish_artifact",
+        "read_file",
+        "read_spreadsheet",
+        "write_file",
+        "sessions_send",
+        "sessions_spawn",
+        "sessions_yield",
+        "tool_search",
+        "web_discover",
+        "web_fetch",
+        "web_search",
+    }
+)
+
+CODING_MODE_MODEL_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "background_process",
+        "process",
+    }
+)
+
 # Once-per-session guard for the tool_description_overrides.applied runtime
 # event, keyed by (session_key, source, sha256 of the full key->text table):
 # to_tool_definitions runs multiple times per turn (debug logging, gateway
@@ -57,6 +97,7 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._tools: dict[str, RegisteredTool] = {}
+        self._mcp_namespaces: dict[str, str] = {}
 
     def register(self, spec: ToolSpec, handler: ToolHandler) -> None:
         if spec.name in self._tools:
@@ -72,6 +113,21 @@ class ToolRegistry:
     def unregister(self, name: str) -> bool:
         """Remove a tool by name. Returns True if it existed."""
         return self._tools.pop(name, None) is not None
+
+    def register_mcp_namespace(self, namespace: str, description: str) -> None:
+        """Record one connected MCP namespace for model-facing discovery."""
+
+        if namespace in self._mcp_namespaces:
+            raise ValueError(f"MCP namespace is already registered: {namespace}")
+        self._mcp_namespaces[namespace] = description.strip() or namespace
+
+    def unregister_mcp_namespace(self, namespace: str) -> bool:
+        """Remove disconnected MCP namespace metadata."""
+
+        return self._mcp_namespaces.pop(namespace, None) is not None
+
+    def mcp_namespaces(self) -> dict[str, str]:
+        return dict(sorted(self._mcp_namespaces.items()))
 
     def all_tools(self) -> list[RegisteredTool]:
         return list(self._tools.values())
@@ -125,17 +181,12 @@ class ToolRegistry:
 
     @staticmethod
     def _required_for(rt: RegisteredTool) -> list[str]:
-        return [
-            name
-            for name in rt.spec.required
-            if name not in rt.spec.runtime_only_arguments
-        ]
+        return [name for name in rt.spec.required if name not in rt.spec.runtime_only_arguments]
 
     def _parameters_for(self, rt: RegisteredTool, ctx: ToolContext) -> dict[str, Any]:
         raw_parameters = rt.spec.parameters
-        if (
-            raw_parameters.get("type") == "object"
-            and isinstance(raw_parameters.get("properties"), Mapping)
+        if raw_parameters.get("type") == "object" and isinstance(
+            raw_parameters.get("properties"), Mapping
         ):
             raw_parameters = raw_parameters["properties"]
         parameters = copy.deepcopy(raw_parameters)
@@ -153,11 +204,7 @@ class ToolRegistry:
                 if key in self._tools:
                     continue
                 tool_name, sep, param = key.partition(".")
-                if (
-                    sep
-                    and tool_name == rt.spec.name
-                    and isinstance(parameters.get(param), dict)
-                ):
+                if sep and tool_name == rt.spec.name and isinstance(parameters.get(param), dict):
                     parameters[param] = {**parameters[param], "description": text}
         if rt.spec.name != "router_control":
             return parameters
@@ -313,9 +360,7 @@ class ToolRegistry:
         # fingerprint in the payload lets attribution tie a turn to the exact
         # wording that was live.
         overrides_sha256 = hashlib.sha256(
-            json.dumps(dict(sorted(overrides.items())), ensure_ascii=False).encode(
-                "utf-8"
-            )
+            json.dumps(dict(sorted(overrides.items())), ensure_ascii=False).encode("utf-8")
         ).hexdigest()
         guard_key = (getattr(ctx, "session_key", None), source, overrides_sha256)
         if guard_key in _description_override_event_keys:
@@ -419,6 +464,92 @@ class ToolRegistry:
             definitions.append(definition)
         return definitions
 
+    def to_model_tool_definitions(
+        self,
+        authorized: list[ToolDefinition],
+        ctx: ToolContext | None = None,
+    ) -> list[ToolDefinition]:
+        """Project an authorized catalog into the model-visible surface.
+
+        The stable built-in baseline is followed by every authorized MCP tool.
+        Tools disclosed by ``tool_search`` are appended by the running Agent on
+        the next provider step, so providers only need ordinary top-level tool
+        calling support.
+        """
+
+        authorized_by_name = {definition.name: definition for definition in authorized}
+        # Embedded/custom registries may intentionally omit the discovery
+        # gateway. Hiding their complete surface would leave the model no path
+        # to discover a tool, so they keep the legacy full surface. A registry
+        # that contains tool_search but denies it for this turn must *not* fail
+        # open and expose every other authorized tool.
+        if "tool_search" not in authorized_by_name and self.get("tool_search") is None:
+            if ctx is not None:
+                from opensquilla.tools.search import ToolSearchIndex
+
+                ctx.authorized_tool_names = frozenset(authorized_by_name)
+                ctx.tool_search_index = ToolSearchIndex.from_definitions(authorized)
+                ctx.tool_search_namespaces = {}
+            return authorized
+        selected = set(DEFAULT_MODEL_TOOL_NAMES)
+        if ctx is not None:
+            if ctx.coding_mode:
+                selected.update(CODING_MODE_MODEL_TOOL_NAMES)
+            selected.update(ctx.disclosed_tool_names)
+            selected.update(ctx.surfaced_tools or set())
+            ctx.authorized_tool_names = frozenset(authorized_by_name)
+            from opensquilla.tools.search import ToolSearchIndex, tool_namespace
+
+            ctx.tool_search_index = ToolSearchIndex.from_definitions(authorized)
+            authorized_namespaces = {
+                tool_namespace(name)
+                for name in authorized_by_name
+                if tool_namespace(name) != "builtin"
+            }
+            if ctx.is_owner:
+                # A connected server with zero tools is still a connected MCP
+                # endpoint and must remain discoverable to its owner.
+                authorized_namespaces.update(self._mcp_namespaces)
+            ctx.tool_search_namespaces = {
+                namespace: description
+                for namespace, description in self.mcp_namespaces().items()
+                if namespace in authorized_namespaces
+            }
+
+        # Connected MCP tools use the same already-filtered authorization
+        # catalog as built-ins. Keep them after the direct built-in surface so
+        # ordering is deterministic and later tool_search hits can be appended.
+        selected.update(name for name in authorized_by_name if name.startswith("mcp__"))
+        definitions = [
+            definition.model_copy(deep=True)
+            for name, definition in sorted(authorized_by_name.items())
+            if name in selected and not name.startswith("mcp__")
+        ]
+        definitions.extend(
+            definition.model_copy(deep=True)
+            for name, definition in sorted(authorized_by_name.items())
+            if name in selected and name.startswith("mcp__")
+        )
+        tool_search_definition = next(
+            (definition for definition in definitions if definition.name == "tool_search"),
+            None,
+        )
+        if tool_search_definition is not None:
+            namespaces = ctx.tool_search_namespaces if ctx is not None else {}
+            if namespaces:
+                summary = "; ".join(
+                    f"{namespace}: {description}" for namespace, description in namespaces.items()
+                )
+            else:
+                summary = "No MCP servers are connected."
+            tool_search_definition.description = (
+                f"{tool_search_definition.description} Connected MCP namespaces: {summary}"
+            )
+            namespace_schema = tool_search_definition.input_schema.properties.get("namespace")
+            if isinstance(namespace_schema, dict):
+                namespace_schema["enum"] = ["builtin", *namespaces]
+        return definitions
+
     async def list_tools(
         self,
         profile: str | None = None,
@@ -431,8 +562,7 @@ class ToolRegistry:
         is_owner: bool = True,
     ) -> list[dict[str, Any]]:
         has_runtime_context = any(
-            value is not None
-            for value in (session_key, agent_id, caller_kind, interaction_mode)
+            value is not None for value in (session_key, agent_id, caller_kind, interaction_mode)
         )
         if has_runtime_context:
             ctx = self._effective_context(
@@ -460,7 +590,13 @@ class ToolRegistry:
                     "properties": self._parameters_for(rt, ctx),
                     "required": self._required_for(rt),
                 },
-                "source": "plugin" if "." in rt.spec.name else "builtin",
+                "source": (
+                    "mcp"
+                    if rt.spec.name.startswith("mcp__")
+                    else "plugin"
+                    if "." in rt.spec.name
+                    else "builtin"
+                ),
                 "enabled": True,
                 "presentation": resolve_tool_presentation(rt.spec).to_payload(),
             }
@@ -602,7 +738,7 @@ def tool(
     params: dict[str, Any] | None = None,
     required: list[str] | None = None,
     owner_only: bool = False,
-    exposed_by_default: bool = True,
+    default_access: Literal["allow", "deny"] | bool = "allow",
     execution_timeout_seconds: float | None = None,
     execution_timeout_argument: str | None = None,
     execution_timeout_padding: float = 0.0,
@@ -617,6 +753,7 @@ def tool(
     runtime_only_arguments: frozenset[str] | set[str] | tuple[str, ...] = (),
     allow_string_item_schema_projection: bool = False,
     presentation_category: ToolPresentationCategory | None = None,
+    exposed_by_default: bool | None = None,
 ) -> Any:
     """Decorator to register an async function as a tool.
 
@@ -634,6 +771,7 @@ def tool(
             required=required or [],
             runtime_only_arguments=frozenset(runtime_only_arguments),
             owner_only=owner_only,
+            default_access=default_access,
             exposed_by_default=exposed_by_default,
             execution_timeout_seconds=execution_timeout_seconds,
             execution_timeout_argument=execution_timeout_argument,
@@ -670,11 +808,7 @@ def tool(
             except TypeError:
                 arguments = dict(kwargs)
             ctx = current_tool_context.get()
-            workspace = (
-                Path(ctx.workspace_dir)
-                if ctx is not None and ctx.workspace_dir
-                else None
-            )
+            workspace = Path(ctx.workspace_dir) if ctx is not None and ctx.workspace_dir else None
             run_mode = getattr(ctx, "run_mode", None)
             guard = await prepare_tool_operation_guard(
                 spec.sandbox,

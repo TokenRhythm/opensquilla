@@ -470,7 +470,7 @@ def _line_ref_query(
         },
     },
     required=["handle"],
-    exposed_by_default=False,
+    default_access="deny",
     plan_access=PlanAccess.READ_ONLY,
     result_budget_class="code",
 )

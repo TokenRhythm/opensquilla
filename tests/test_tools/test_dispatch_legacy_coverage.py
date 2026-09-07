@@ -247,7 +247,7 @@ def _collect_executed_lines() -> set[int]:
                     parameters={"mutations": {"type": "array"}},
                     required=["mutations"],
                     runtime_only_arguments=frozenset({"_tool_use_id"}),
-                    exposed_by_default=False,
+                    default_access="deny",
                 ),
                 _writer,
             )
@@ -300,7 +300,7 @@ def _collect_executed_lines() -> set[int]:
                     name="document_finish",
                     description="coverage candidate finish",
                     parameters={},
-                    exposed_by_default=False,
+                    default_access="deny",
                 ),
                 _finish,
             )

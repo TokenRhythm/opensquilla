@@ -207,7 +207,7 @@ def _normalized_steps(steps: Any) -> list[dict[str, Any]]:
         },
     },
     required=["title", "markdown", "steps"],
-    exposed_by_default=False,
+    default_access="deny",
     plan_access=PlanAccess.CONTROL,
     terminates_turn=True,
 )
@@ -301,7 +301,7 @@ async def submit_plan(
         }
     },
     required=["questions"],
-    exposed_by_default=False,
+    default_access="deny",
     plan_access=PlanAccess.CONTROL,
 )
 async def request_user_input(questions: list[dict[str, Any]]) -> str:
@@ -449,7 +449,7 @@ async def request_user_input(questions: list[dict[str, Any]]) -> str:
         },
     },
     required=["step_id", "step_status"],
-    exposed_by_default=False,
+    default_access="deny",
 )
 async def plan_run_checkpoint(
     step_id: str,

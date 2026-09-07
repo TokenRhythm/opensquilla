@@ -619,7 +619,7 @@ def test_restricted_document_toolset_is_exactly_five_tools() -> None:
         registered = registry.get(name)
         assert registered is not None
         assert registered.spec.owner_only is True
-        assert registered.spec.exposed_by_default is False
+        assert registered.spec.default_access == "deny"
     for name in RETIRED_ANNOTATION_TOOL_NAMES:
         assert registry.get(name) is None
     writer = registry.get("document_apply")
@@ -644,7 +644,7 @@ def test_restricted_document_toolset_is_exactly_five_tools() -> None:
     patch_writer = registry.get("document_patch")
     assert patch_writer is not None
     assert patch_writer.spec.owner_only is True
-    assert patch_writer.spec.exposed_by_default is False
+    assert patch_writer.spec.default_access == "deny"
     assert set(patch_writer.spec.parameters["properties"]) == {
         "edits",
         "expectedSha256",

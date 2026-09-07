@@ -906,7 +906,7 @@ def _maybe_auto_enable_manual_proposal(
     ),
     params={"text": {"type": "string"}},
     required=["text"],
-    exposed_by_default=False,
+    default_access="deny",
 )
 async def emit_text_tool(text: str) -> str:
     return text
@@ -923,7 +923,7 @@ async def emit_text_tool(text: str) -> str:
         "gates": {"type": "string"},
     },
     required=["skill_md"],
-    exposed_by_default=False,
+    default_access="deny",
 )
 async def meta_skill_lint_run_tool(skill_md: str, gates: str = "G1,G2") -> str:
     import asyncio
@@ -942,7 +942,7 @@ async def meta_skill_lint_run_tool(skill_md: str, gates: str = "G1,G2") -> str:
         "classifier_model": {"type": "string"},
     },
     required=["skill_md"],
-    exposed_by_default=False,
+    default_access="deny",
 )
 async def meta_skill_smoke_run_tool(
     skill_md: str,
@@ -1045,7 +1045,7 @@ async def meta_skill_runtime_e2e_run(
         "baseline_model": {"type": "string"},
     },
     required=["skill_md"],
-    exposed_by_default=False,
+    default_access="deny",
 )
 async def meta_skill_runtime_e2e_run_tool(
     skill_md: str,
@@ -1078,7 +1078,7 @@ async def meta_skill_runtime_e2e_run_tool(
         "home": {"type": "string"},
     },
     required=["skill_md", "lint_result", "smoke_result"],
-    exposed_by_default=False,
+    default_access="deny",
 )
 async def meta_skill_persist_proposal_tool(
     skill_md: str,
@@ -1122,7 +1122,7 @@ _PATTERN_ENUM = sorted(PATTERN_SLOT_SCHEMA.keys())
         "slots_json": {"type": "string"},
     },
     required=["pattern_id", "slots_json"],
-    exposed_by_default=False,  # internal orchestrator dispatch only
+    default_access="deny",  # internal orchestrator dispatch only
 )
 async def meta_skill_assemble_tool(pattern_id: str, slots_json: str) -> str:
     return meta_skill_assemble(pattern_id, slots_json)
@@ -1140,7 +1140,7 @@ async def meta_skill_assemble_tool(pattern_id: str, slots_json: str) -> str:
         "user_intent": {"type": "string"},
     },
     required=["pattern_id", "history_summary", "user_intent"],
-    exposed_by_default=False,  # internal orchestrator dispatch only
+    default_access="deny",  # internal orchestrator dispatch only
 )
 async def meta_skill_fill_slots_tool(
     pattern_id: str, history_summary: str, user_intent: str,

@@ -3734,6 +3734,7 @@ async def build_services(
             try:
                 mcp_cfg = MCPServerConfig(
                     name=entry.name,
+                    description=entry.description,
                     transport=entry.transport,
                     command=entry.command,
                     args=entry.args,
@@ -4923,7 +4924,11 @@ async def start_gateway_server(
                 workspace_dir=workspace_str,
                 metadata=auto_metadata,
             )
-            tool_definitions = svc.tool_registry.to_tool_definitions(ctx)
+            authorized_tool_definitions = svc.tool_registry.to_tool_definitions(ctx)
+            tool_definitions = svc.tool_registry.to_model_tool_definitions(
+                authorized_tool_definitions,
+                ctx,
+            )
             auto_usage_context = _auto_propose_usage_execution_context(
                 agent_id,
                 usage_event_sink,
