@@ -283,8 +283,9 @@ function Invoke-NativeCapture {
         $debugger.StartInfo = $startInfo
         if (-not $debugger.Start()) { return }
         $state.cdbPid = $debugger.Id
-        # All commands are fixed at launch. Never forward caller stdin to CDB.
-        $debugger.StandardInput.Close()
+        # All commands are fixed at launch; never forward caller input. Keep
+        # this pipe open until qd or the helper deadline closes the debugger:
+        # an early EOF can end an interactive debugger before startup commands.
         $debuggerClock = [System.Diagnostics.Stopwatch]::StartNew()
         Write-NativePhase 'cdb-started'
 
