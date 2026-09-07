@@ -732,8 +732,10 @@ jobs:
         if: ${{ always() }}
         shell: pwsh
         run: |
-          if ($env:SM_CLIENT_CERT_FILE -and (Test-Path -LiteralPath $env:SM_CLIENT_CERT_FILE)) {
-            Remove-Item -LiteralPath $env:SM_CLIENT_CERT_FILE -Force
+          $ErrorActionPreference = 'Stop'
+          $clientCertificate = Join-Path $env:RUNNER_TEMP 'digicert-client-auth.p12'
+          if (Test-Path -LiteralPath $clientCertificate) {
+            Remove-Item -LiteralPath $clientCertificate -Force
           }
           $msi = Join-Path $env:RUNNER_TEMP 'Keylockertools-windows-x64.msi'
           if (Test-Path -LiteralPath $msi) { Remove-Item -LiteralPath $msi -Force }

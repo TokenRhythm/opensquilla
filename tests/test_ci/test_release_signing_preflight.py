@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import io
 import json
+import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from types import ModuleType
@@ -485,3 +488,122 @@ def test_reused_windows_audits_require_signatures_without_signing_credentials() 
         )
         == 1
     )
+
+
+def _run_signing_material_step(
+    name: str,
+    tmp_path: Path,
+    environment: dict[str, str],
+    *,
+    lock_certificate: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    powershell = shutil.which("pwsh") or shutil.which("powershell")
+    if not powershell:
+        pytest.skip("PowerShell is required to execute signing material cleanup")
+    jobs = yaml.safe_load((ROOT / ".github/workflows/wheelhouse-release.yml").read_text())["jobs"]
+    step = next(step for step in jobs["build-desktop-windows"]["steps"] if step["name"] == name)
+    if name == "Remove DigiCert client authentication material":
+        assert step["if"] == "${{ always() }}"
+    source = step["run"]
+    if lock_certificate:
+        source = (
+            "$locked = [IO.File]::Open((Join-Path $env:RUNNER_TEMP "
+            "'digicert-client-auth.p12'), 'Open', 'ReadWrite', 'None')\ntry {\n"
+            + source
+            + "\n} finally { $locked.Dispose() }\n"
+        )
+    script = tmp_path / "signing-material-step.ps1"
+    script.write_text(source, encoding="utf-8")
+    # No signing credentials or real user profile are inherited by these scripts.
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() in {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"}
+    }
+    env.update(
+        {
+            key: str(tmp_path)
+            for key in ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP")
+        }
+    )
+    env.update(environment)
+    return subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-File", str(script)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+    )
+
+
+def test_signing_cleanup_removes_certificate_after_environment_export_fails(tmp_path: Path) -> None:
+    runner_temp = tmp_path / "runner"
+    runner_temp.mkdir()
+    certificate = runner_temp / "digicert-client-auth.p12"
+    msi = runner_temp / "Keylockertools-windows-x64.msi"
+    msi.write_bytes(b"synthetic MSI; never executed")
+    sentinel = tmp_path / "external-sentinel.p12"
+    sentinel.write_bytes(b"outside signing cleanup")
+    dummy = b"synthetic client certificate bytes; no signing capability"
+    export_file = tmp_path / "missing-parent" / "github-env"
+    configured = _run_signing_material_step(
+        "Configure DigiCert KeyLocker credentials",
+        tmp_path,
+        {
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_ENV": str(export_file),
+            "SM_HOST_SECRET": "https://signing.example.invalid",
+            "SM_API_KEY_SECRET": "synthetic-api-key-no-access",
+            "SM_CLIENT_CERT_FILE_B64_SECRET": base64.b64encode(dummy).decode("ascii"),
+            "SM_CLIENT_CERT_PASSWORD_SECRET": "synthetic-password-no-access",
+        },
+    )
+    assert configured.returncode != 0
+    assert certificate.read_bytes() == dummy
+    assert not export_file.exists()
+    cleaned = _run_signing_material_step(
+        "Remove DigiCert client authentication material",
+        tmp_path,
+        {"RUNNER_TEMP": str(runner_temp)},
+    )
+    assert cleaned.returncode == 0, cleaned.stderr
+    assert not certificate.exists()
+    assert not msi.exists()
+    assert sentinel.read_bytes() == b"outside signing cleanup"
+
+
+def test_signing_cleanup_missing_certificate_does_not_follow_exported_path(tmp_path: Path) -> None:
+    runner_temp = tmp_path / "runner"
+    runner_temp.mkdir()
+    msi = runner_temp / "Keylockertools-windows-x64.msi"
+    msi.write_bytes(b"synthetic MSI; never executed")
+    sentinel = tmp_path / "external-sentinel.p12"
+    sentinel.write_bytes(b"outside signing cleanup")
+    environment = {"RUNNER_TEMP": str(runner_temp), "SM_CLIENT_CERT_FILE": str(sentinel)}
+    for _ in range(2):
+        cleaned = _run_signing_material_step(
+            "Remove DigiCert client authentication material", tmp_path, environment
+        )
+        assert cleaned.returncode == 0, cleaned.stderr
+        assert sentinel.read_bytes() == b"outside signing cleanup"
+        assert not msi.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows exclusive file handles prevent deletion")
+def test_signing_cleanup_delete_failure_fails_the_step(tmp_path: Path) -> None:
+    runner_temp = tmp_path / "runner"
+    runner_temp.mkdir()
+    certificate = runner_temp / "digicert-client-auth.p12"
+    certificate.write_bytes(b"synthetic client certificate bytes")
+    cleaned = _run_signing_material_step(
+        "Remove DigiCert client authentication material",
+        tmp_path,
+        {"RUNNER_TEMP": str(runner_temp), "SM_CLIENT_CERT_FILE": str(certificate)},
+        lock_certificate=True,
+    )
+    assert cleaned.returncode != 0
+    assert certificate.read_bytes() == b"synthetic client certificate bytes"
+    certificate.unlink()  # The helper must have released its owned exclusive handle.
