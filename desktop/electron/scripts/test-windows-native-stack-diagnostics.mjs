@@ -24,6 +24,15 @@ async function assertExited(pid) {
   assert.equal(exists(pid), false, 'Owned diagnostic fixture must be reaped')
 }
 
+async function within(promise, timeoutMs, message) {
+  let timer
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), timeoutMs)
+    })])
+  } finally { clearTimeout(timer) }
+}
+
 function literal(value) {
   return `'${value.replace(/'/g, "''")}'`
 }
@@ -230,7 +239,7 @@ Start-Sleep -Seconds 60
         if (lines.some(line => line.trim() === 'OPENSQUILLA_NATIVE_TEST_READY')) acknowledged = true
       })
       debuggerChild.stderr.on('data', chunk => { rawBytes += chunk.length })
-      const debuggerClosed = once(debuggerChild, 'close')
+      const debuggerClosed = new Promise(resolve => debuggerChild.once('close', (...result) => resolve(result)))
       try {
         const ackDeadline = Date.now() + 5_000
         while (!acknowledged && Date.now() < ackDeadline && !spawnFailed
@@ -240,21 +249,22 @@ Start-Sleep -Seconds 60
         assert.ok(rawBytes <= 256 * 1024, 'Owned CDB raw output must remain bounded and private')
         await targetResponsive()
         assert.equal(debuggerChild.exitCode, null)
-        debuggerChild.kill('SIGKILL')
-        const [exitCode, signal] = await Promise.race([
-          debuggerClosed,
-          delay(3_000).then(() => { throw new Error('Owned CDB force control did not close') }),
-        ])
-        assert.notEqual(exitCode, null)
+        assert.equal(debuggerChild.kill('SIGKILL'), true)
+        const [exitCode, signal] = await within(debuggerClosed, 3_000, 'Owned CDB force control did not close')
+        assert.ok((Number.isInteger(exitCode) && exitCode !== 0) || signal === 'SIGKILL')
         await assertExited(debuggerChild.pid)
         await targetResponsive()
         console.log(JSON.stringify({ control: 'native-cdb-forced-close', exitCode, signal, targetResponsive: true }))
         checks++
       } finally {
-        if (debuggerChild.exitCode === null) debuggerChild.kill('SIGKILL')
-        debuggerChild.stdin.destroy()
-        debuggerChild.stdout.destroy()
-        debuggerChild.stderr.destroy()
+        try {
+          if (debuggerChild.exitCode === null && debuggerChild.signalCode === null) debuggerChild.kill('SIGKILL')
+          await within(debuggerClosed, 3_000, 'Owned CDB fixture cleanup did not close')
+        } finally {
+          debuggerChild.stdin.destroy()
+          debuggerChild.stdout.destroy()
+          debuggerChild.stderr.destroy()
+        }
       }
     }
     await targetResponsive()
