@@ -25,12 +25,6 @@ export interface SessionItem {
   hasContractGaps: boolean
 }
 
-/** Scheduler-owned Cron sessions are intentionally read-only. */
-export function isCronSessionKey(key: string): boolean {
-  const parts = key.trim().split(':')
-  return parts.length >= 2 && parts[0] === 'cron' && Boolean(parts[1])
-}
-
 export interface SessionPage {
   items: SessionItem[]
   hasMore: boolean

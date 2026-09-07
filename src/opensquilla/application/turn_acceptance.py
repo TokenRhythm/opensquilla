@@ -67,7 +67,6 @@ from opensquilla.attachment_refs import (
 )
 from opensquilla.project_workspaces import ProjectWorkspaceStateError
 from opensquilla.run_mode import RunMode
-from opensquilla.session_key import is_cron_session_key
 
 log = structlog.get_logger(__name__)
 _SESSION_ROUTING_MODES = frozenset({"direct", "router", "ensemble"})
@@ -399,14 +398,6 @@ async def _accept_turn(
                     previous_acceptance.receipt.accepted_session_key,
                 )
             return replay_response
-
-    if is_cron_session_key(key):
-        raise AdmissionError(
-            "SESSION_NOT_INTERACTIVE",
-            "Cron sessions are read-only and cannot receive new turns.",
-            retryable=False,
-            accepted=False,
-        )
 
     if prompt_annotation_ids or document_context_request is not None:
         existing_annotation_session = await storage.get_session(key)

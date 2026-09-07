@@ -28,11 +28,4 @@ def canonicalize_session_key(session_key: str | None) -> str:
     return key
 
 
-def is_cron_session_key(session_key: str | None) -> bool:
-    """Return whether a key belongs to the scheduler-owned Cron namespace."""
-
-    parts = canonicalize_session_key(session_key).split(":")
-    return len(parts) >= 2 and parts[0] == "cron" and bool(parts[1])
-
-
-__all__ = ["canonicalize_session_key", "is_cron_session_key"]
+__all__ = ["canonicalize_session_key"]
