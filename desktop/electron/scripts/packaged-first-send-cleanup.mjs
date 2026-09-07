@@ -65,11 +65,63 @@ export function electronProcessSnapshot(identity) {
 }
 
 export async function installQuitDiagnosticProbe(app, diagnosticFile, { extended = false } = {}) {
-  await app.evaluate(({ app, BrowserWindow, webContents }, { file, extended }) => {
+  await app.evaluate(({ app, BrowserWindow, webContents, dialog }, { file, extended }) => {
     const fs = process.getBuiltinModule('fs')
-    const log = (event, detail = {}) => fs.appendFileSync(file, JSON.stringify({
-      event, at: new Date().toISOString(), pid: process.pid, ...detail,
-    }) + '\n')
+    const log = (event, detail = {}) => {
+      try {
+        fs.appendFileSync(file, JSON.stringify({
+          event, at: new Date().toISOString(), pid: process.pid, ...detail,
+        }) + '\n')
+      } catch (error) {
+        // Extended observations must not create a new uncaught exception or
+        // modal dialog. Keep the standard probe unchanged as a control.
+        if (!extended) throw error
+      }
+    }
+    if (extended) {
+      // The first-send caller admits only a new, isolated synthetic profile
+      // and scrubs provider secrets before launch. Never install these hooks
+      // for the standard gate or inspect environment/credential contents.
+      const boundedText = (value, limit) => typeof value === 'string'
+        ? value.slice(0, limit)
+          .replace(/\bBearer\s+[^\s"']+/gi, 'Bearer [redacted]')
+          .replace(/\b((?:api[_-]?key|access[_-]?token|token|password|secret)["']?\s*[:=]\s*["']?)[^\s,;"']+/gi, '$1[redacted]')
+          .slice(0, limit)
+        : '[non-string]'
+      let evidenceCount = 0
+      let recordingEvidence = false
+      const recordErrorEvidence = (event, details) => {
+        if (recordingEvidence || evidenceCount >= 4) return
+        recordingEvidence = true
+        evidenceCount++
+        try {
+          log(event, details())
+        } catch {
+          // Property access, formatting and writes are best-effort only.
+        } finally {
+          recordingEvidence = false
+        }
+      }
+      const originalShowErrorBox = dialog.showErrorBox
+      dialog.showErrorBox = function (...args) {
+        recordErrorEvidence('dialog-show-error-box', () => ({
+          title: boundedText(args[0], 256),
+          content: boundedText(args[1], 4_096),
+          callStack: boundedText(new Error('showErrorBox called').stack, 4_096),
+        }))
+        // Even failed diagnostics must call the original method exactly as
+        // requested; its blocking behavior, return value and error survive.
+        return Reflect.apply(originalShowErrorBox, this, args)
+      }
+      process.on('uncaughtExceptionMonitor', (error, origin) => {
+        recordErrorEvidence('uncaught-exception-monitor', () => ({
+          origin: origin === 'uncaughtException' || origin === 'unhandledRejection' ? origin : 'unknown',
+          name: boundedText(error?.name, 128),
+          message: boundedText(error?.message, 1_024),
+          stack: boundedText(error?.stack, 4_096),
+        }))
+      })
+    }
     const resourceSnapshot = () => {
       try {
         const resourceTypes = {}

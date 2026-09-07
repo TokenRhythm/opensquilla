@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { once } from 'node:events'
+import { EventEmitter, once } from 'node:events'
 import { createServer } from 'node:http'
 import { createConnection } from 'node:net'
 import { setTimeout as delay } from 'node:timers/promises'
-import { mkdtemp, rmdir, unlink, writeFile } from 'node:fs/promises'
+import { appendFileSync } from 'node:fs'
+import { mkdtemp, readFile, rmdir, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { runInNewContext } from 'node:vm'
 
 import {
   closeHttpServerWithDeadline,
@@ -19,6 +21,7 @@ import {
   closeElectronAndObserveExit,
   closeElectronAfterRemovingRoutes,
   electronProcessSnapshot,
+  installQuitDiagnosticProbe,
   quitElectronOnNextTurn,
 } from './packaged-first-send-cleanup.mjs'
 import { captureWindowsProcessStart, captureWindowsWaitChain } from './windows-wait-chain-diagnostics.mjs'
@@ -83,7 +86,131 @@ async function assertProcessExited(pid) {
   assert.fail(`Synthetic child ${pid} was not reaped`)
 }
 
+async function testExtendedErrorProbe() {
+  const directory = await mkdtemp(join(tmpdir(), 'opensquilla-quit-error-probe-'))
+  const paths = ['standard', 'extended', 'write-failure', 'fatal'].map(name => join(directory, `${name}.jsonl`))
+  const records = async path => (await readFile(path, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+  async function fixture(file, { extended = false, append = appendFileSync, original } = {}) {
+    const observedProcess = new EventEmitter()
+    Object.assign(observedProcess, {
+      pid: process.pid,
+      getBuiltinModule: name => {
+        assert.equal(name, 'fs')
+        return { appendFileSync: append }
+      },
+      getActiveResourcesInfo: () => [],
+      stdout: {}, stderr: {},
+    })
+    const electronApp = new EventEmitter()
+    electronApp.exit = () => 'original-exit-result'
+    const calls = []
+    const originalShowErrorBox = original || function (...args) {
+      calls.push({ receiver: this, args })
+      return 'original-dialog-result'
+    }
+    const dialog = { showErrorBox: originalShowErrorBox }
+    const electron = { app: electronApp, dialog,
+      BrowserWindow: { getAllWindows: () => [] }, webContents: { getAllWebContents: () => [] } }
+    await installQuitDiagnosticProbe({
+      evaluate: async (callback, options) => runInNewContext(`(${callback.toString()})(electron, options)`, {
+        electron, options, process: observedProcess,
+        setImmediate: () => ({ unref() {} }), setTimeout: () => ({ unref() {} }),
+      }),
+    }, file, { extended })
+    return { observedProcess, electronApp, dialog, originalShowErrorBox, calls }
+  }
+  try {
+    const standard = await fixture(paths[0])
+    assert.equal(standard.dialog.showErrorBox, standard.originalShowErrorBox)
+    assert.equal(standard.observedProcess.listenerCount('uncaughtExceptionMonitor'), 0)
+    assert.equal(standard.dialog.showErrorBox('standard title', 'standard content'), 'original-dialog-result')
+    assert.equal((await records(paths[0])).some(record => record.event === 'dialog-show-error-box'), false)
+
+    const extended = await fixture(paths[1], { extended: true })
+    assert.equal(extended.observedProcess.listenerCount('uncaughtException'), 0,
+      'an uncaughtException listener would suppress Electron default error handling')
+    const receiver = { syntheticReceiver: true }
+    const title = 'synthetic-title-'.repeat(100)
+    const content = 'Bearer synthetic-bearer-token token=synthetic-token "apiKey":"synthetic-api-key"\n' + 'x'.repeat(10_000)
+    assert.equal(extended.dialog.showErrorBox.call(receiver, title, content, 42), 'original-dialog-result')
+    assert.equal(extended.calls[0].receiver, receiver)
+    assert.deepEqual(extended.calls[0].args, [title, content, 42], 'redaction must never change original arguments')
+    const observedError = new Error('synthetic observed exception')
+    observedError.stack = 'synthetic-stack\n' + 's'.repeat(10_000)
+    extended.observedProcess.emit('uncaughtExceptionMonitor', observedError, 'uncaughtException')
+    for (let index = 0; index < 10; index++) extended.dialog.showErrorBox('bounded count', 'synthetic')
+    const errorRecords = (await records(paths[1])).filter(record => /dialog-show|uncaught-exception/.test(record.event))
+    assert.equal(errorRecords.length, 4, 'error evidence must stop after its shared bounded record budget')
+    assert.equal(extended.calls.length, 11, 'exhausted diagnostics must still invoke every original dialog')
+    const dialogRecord = errorRecords[0]
+    assert.equal(dialogRecord.title.length, 256)
+    assert.ok(dialogRecord.content.length <= 4_096 && dialogRecord.callStack.length <= 4_096)
+    assert.match(dialogRecord.callStack, /showErrorBox called/)
+    for (const canary of ['synthetic-bearer-token', 'synthetic-token', 'synthetic-api-key']) {
+      assert.equal(dialogRecord.content.includes(canary), false)
+    }
+    const monitorRecord = errorRecords.find(record => record.event === 'uncaught-exception-monitor')
+    assert.equal(monitorRecord.message, observedError.message)
+    assert.equal(monitorRecord.stack.length, 4_096)
+    assert.equal(monitorRecord.origin, 'uncaughtException')
+
+    let failingProbe
+    let failWrites = false
+    let writeAttempts = 0
+    let originalCalls = 0
+    const originalError = new Error('synthetic original dialog failure')
+    failingProbe = await fixture(paths[2], {
+      extended: true,
+      original: () => { originalCalls++; throw originalError },
+      append: (...args) => {
+        if (!failWrites) return appendFileSync(...args)
+        writeAttempts++
+        failingProbe.observedProcess.emit('uncaughtExceptionMonitor', new Error('synthetic recursive log failure'), 'uncaughtException')
+        throw new Error('synthetic write rejected')
+      },
+    })
+    failWrites = true
+    assert.throws(() => failingProbe.dialog.showErrorBox('write failure', 'synthetic'), error => error === originalError)
+    assert.equal(originalCalls, 1, 'the original throwing dialog must run once even when logging fails')
+    assert.equal(writeAttempts, 1, 'logging must not recurse through the error monitor')
+    assert.doesNotThrow(() => failingProbe.observedProcess.emit('uncaughtExceptionMonitor', {
+      get name() { throw new Error('synthetic inaccessible error property') },
+    }, 'uncaughtException'))
+    assert.equal(failingProbe.electronApp.exit(), 'original-exit-result', 'extended logging errors must not prevent app.exit')
+
+    // A real isolated Node process must still terminate on an uncaught error.
+    // Only its synthetic exception is logged; no real Electron/profile starts.
+    const childEnvironment = {}
+    for (const name of ['SystemRoot', 'WINDIR', 'TEMP', 'TMP']) {
+      if (process.env[name] !== undefined) childEnvironment[name] = process.env[name]
+    }
+    const childSource = `
+      import { EventEmitter } from 'node:events';
+      import { installQuitDiagnosticProbe } from ${JSON.stringify(new URL('./packaged-first-send-cleanup.mjs', import.meta.url).href)};
+      const app = new EventEmitter(); app.exit = () => {};
+      const electron = { app, dialog: { showErrorBox() {} }, BrowserWindow: { getAllWindows: () => [] }, webContents: { getAllWebContents: () => [] } };
+      await installQuitDiagnosticProbe({ evaluate: (callback, options) => callback(electron, options) }, ${JSON.stringify(paths[3])}, { extended: true });
+      if (process.listenerCount('uncaughtException') !== 0) throw new Error('unexpected exception handler');
+      setImmediate(() => { throw new Error('synthetic fatal monitor control'); });
+    `
+    const fatalChild = spawn(process.execPath, ['--input-type=module', '-e', childSource], {
+      env: childEnvironment, stdio: 'ignore', windowsHide: true,
+    })
+    fixtureProcesses.push(fatalChild)
+    assert.deepEqual(await once(fatalChild, 'close', { signal: AbortSignal.timeout(5_000) }), [1, null])
+    await assertProcessExited(fatalChild.pid)
+    const fatalRecord = (await records(paths[3])).find(record => record.event === 'uncaught-exception-monitor')
+    assert.equal(fatalRecord.message, 'synthetic fatal monitor control')
+    assert.match(fatalRecord.stack, /synthetic fatal monitor control/)
+    console.log('PASS extended error probe: original dialog semantics, bounded/redacted evidence, write failure/reentry, fatal monitor stays fatal')
+  } finally {
+    for (const path of paths) await unlink(path).catch(error => { if (error.code !== 'ENOENT') throw error })
+    await rmdir(directory)
+  }
+}
+
 try {
+  await testExtendedErrorProbe()
   if (process.platform === 'win32') {
     const target = await startChild()
     const nativeIdentity = await captureWindowsProcessStart(target.child.pid)
