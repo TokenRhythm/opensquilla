@@ -445,6 +445,54 @@ def _accepts_keyword_arg(func: Any, name: str) -> bool:
     )
 
 
+def _accepts_explicit_keyword_arg(func: Any, name: str) -> bool:
+    try:
+        parameter = inspect.signature(func).parameters.get(name)
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
+
+
+def _initial_user_message_owner_kwargs(
+    manager: Any,
+    identity: SessionIdentity,
+) -> dict[str, Any]:
+    append_message = getattr(manager, "append_message", None)
+    if not callable(append_message):
+        return {}
+
+    session_id = identity.session_id
+    session_epoch = identity.epoch
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(session_epoch, int)
+        or isinstance(session_epoch, bool)
+        or session_epoch < 0
+    ):
+        raise RuntimeError("sessions.create(message=...) received an invalid session owner")
+
+    owner_supported = all(
+        _accepts_explicit_keyword_arg(append_message, name)
+        for name in ("expected_session_id", "expected_session_epoch")
+    )
+    if owner_supported:
+        return {
+            "expected_session_id": session_id,
+            "expected_session_epoch": session_epoch,
+        }
+
+    if isinstance(get_session_storage(manager), SessionStorage):
+        raise RuntimeError(
+            "sessions.create(message=...) cannot enforce a durable owner; "
+            "append_message must accept expected_session_id and expected_session_epoch"
+        )
+    return {}
+
+
 def _artifact_state_event_emitter(
     ctx: RpcContext,
     session_key: str,
@@ -2730,12 +2778,22 @@ class _GatewaySessionLifecyclePorts(
         return SessionIdentity(
             session_key=str(created.session_key),
             session_id=str(created.session_id),
+            epoch=int(getattr(created, "epoch", 0) or 0),
         )
 
-    async def append_initial_user_message(self, session_key: str, message: str) -> None:
+    async def append_initial_user_message(
+        self,
+        session: SessionIdentity,
+        message: str,
+    ) -> None:
         if self._manager is None:
             raise RpcUnavailableError("sessions.create(message=...) requires a session manager")
-        await self._manager.append_message(session_key, role="user", content=message)
+        await self._manager.append_message(
+            session.session_key,
+            role="user",
+            content=message,
+            **_initial_user_message_owner_kwargs(self._manager, session),
+        )
 
     async def rename(self, session_key: str, display_name: str) -> None:
         if self._manager is None:

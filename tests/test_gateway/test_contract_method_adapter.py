@@ -168,6 +168,64 @@ def test_generated_binding_registration_preserves_provenance() -> None:
     assert entry.required_scope == GATEWAY_METHOD_CONTRACTS["agents.list"].scope
 
 
+@pytest.mark.parametrize(
+    "params,valid",
+    [
+        ({"patch": {"provider": {"model": "synthetic-model"}}}, True),
+        ({"patches": {"provider.model": "synthetic-model"}}, True),
+        ({"patch": {}, "patches": {}}, True),
+        ({}, False),
+        (None, False),
+        ({"patches": "synthetic-sensitive-value"}, False),
+        ({"patch": {}, "unexpected": True}, False),
+    ],
+)
+def test_generated_observation_checks_params_beyond_the_permissive_frame(
+    params: Any, valid: bool,
+) -> None:
+    binding = generated_contract_bindings(
+        ("config.patch",), _GeneratedContractViolationError,
+    )["config.patch"]
+    # This frame deliberately accepts legacy payloads. Its successful parse
+    # cannot establish whether the payload matches the Params contract.
+    binding.descriptor.request_model.model_validate(
+        {"type": "req", "id": "test", "method": "config.patch", "params": params}
+    )
+    errors = binding.observe_params(params)
+    assert bool(errors) is not valid
+    assert "synthetic-sensitive-value" not in repr(errors)
+    assert all("input" not in error and "ctx" not in error for error in errors)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("params", [None, {}, {"patches": "synthetic-sensitive-value"}])
+async def test_generated_params_mismatch_preserves_business_input_and_failure(
+    params: Any,
+) -> None:
+    calls: list[Any] = []
+    failure = ValueError("business failure")
+
+    async def implementation(raw_params: Any, _ctx: Any) -> Any:
+        calls.append(raw_params)
+        raise failure
+
+    handler = register_generated_contract_binding(
+        RpcRegistry(),
+        generated_contract_bindings(("config.patch",), _GeneratedContractViolationError),
+        "config.patch",
+        implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=_legacy_guest_denied,
+    )
+    with structlog.testing.capture_logs() as logs, pytest.raises(ValueError) as raised:
+        await handler(params, object())
+
+    assert raised.value is failure
+    assert len(calls) == 1 and calls[0] is params
+    assert any(log["event"] == "config.patch.request_contract_mismatch" for log in logs)
+    assert "synthetic-sensitive-value" not in repr(logs)
+
+
 def test_generated_binding_registration_preserves_domain_unsupported_error() -> None:
     async def implementation(_params: Any, _ctx: Any) -> Any:
         return None

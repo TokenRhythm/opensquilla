@@ -135,25 +135,31 @@ class GatewayAdmissionStorage:
             )
         return result if isinstance(result, MetaControlIntent) else None
 
-    async def update_agent_task(
+    async def get_agent_task(self, task_id: str) -> AgentTaskRecord | None:
+        with translate_admission_failure():
+            result = await getattr(self.raw, "get_agent_task")(task_id)
+        if result is None or isinstance(result, AgentTaskRecord):
+            return result
+        raise TypeError("Task lookup did not return a durable task")
+
+    async def fail_queued_agent_task_activation(
         self,
         task_id: str,
         *,
-        status: str,
-        finished_at: int,
-        terminal_reason: str,
+        session_key: str,
         error_class: str,
         error_message: str,
-    ) -> None:
+    ) -> AgentTaskRecord | None:
         with translate_admission_failure():
-            await getattr(self.raw, "update_agent_task")(
+            result = await getattr(self.raw, "fail_queued_agent_task_activation")(
                 task_id,
-                status=status,
-                finished_at=finished_at,
-                terminal_reason=terminal_reason,
+                session_key=session_key,
                 error_class=error_class,
                 error_message=error_message,
             )
+        if result is None or isinstance(result, AgentTaskRecord):
+            return result
+        raise TypeError("Activation compensation did not return a durable task")
 
     @staticmethod
     def new_plan_run(
@@ -226,10 +232,10 @@ class GatewayAdmissionStorage:
         )
 
     @staticmethod
-    def failed_acceptance(result: AdmissionAcceptance) -> AdmissionAcceptance:
+    def with_task_status(result: AdmissionAcceptance, status: str | None) -> AdmissionAcceptance:
         if not isinstance(result, TurnAcceptanceResult):
             raise TypeError("Failure projection requires durable turn acceptance")
-        return replace(result, task_status=AgentTaskStatus.FAILED)
+        return replace(result, task_status=AgentTaskStatus(status) if status is not None else None)
 
     async def accept_turn(self, command: AdmissionCommit) -> AdmissionAcceptance:
         with translate_admission_failure():

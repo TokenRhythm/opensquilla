@@ -43,6 +43,7 @@
         "src/opensquilla/gateway/rpc_sessions.py": [
           "_GatewaySessionLifecyclePorts",
           "_SessionLifecycleDeletionPort",
+          "_accepts_explicit_keyword_arg",
           "_agent_registry_has",
           "_agent_registry_model",
           "_buffer_session_event",
@@ -62,6 +63,7 @@
           "_handle_sessions_fork",
           "_handle_sessions_fork_through_turn",
           "_handle_sessions_rename",
+          "_initial_user_message_owner_kwargs",
           "_list_transcript_titles",
           "_model_value",
           "_next_fork_display_name",

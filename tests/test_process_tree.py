@@ -7,6 +7,7 @@ import ctypes
 import ctypes.wintypes as wintypes
 import errno
 import io
+import multiprocessing
 import os
 import shutil
 import signal
@@ -14,11 +15,13 @@ import sqlite3
 import subprocess
 import sys
 import textwrap
+import time
 from types import SimpleNamespace
 
 import pytest
 
 from opensquilla import private_paths, process_tree
+from tests.helpers.owner_registry_probe import write_owner
 
 
 def _synthetic_owner_reference(
@@ -1689,46 +1692,57 @@ def test_owner_registry_refuses_preexisting_symlink(
 @pytest.mark.ci_serial
 def test_owner_registry_supports_concurrent_process_writers(tmp_path) -> None:
     state_dir = tmp_path / "synthetic-runtime-state"
-    worker = textwrap.dedent(
-        """\
-        import os
-        import sys
-        from pathlib import Path
-        from opensquilla import process_tree
-
-        state_dir = Path(sys.argv[1])
-        owner_id = sys.argv[2]
-        with process_tree.task_process_scope(
-            state_dir,
-            session_key="synthetic-session",
-            task_id=owner_id,
-        ):
-            scope = process_tree._CURRENT_TASK_PROCESS_SCOPE.get()
-            process_tree._insert_owner_record(
-                scope,
-                owner_id=owner_id,
-                platform=process_tree._platform_kind(),
-                controller_pid=os.getpid(),
-            )
-        """
-    )
-
-    def write(index: int) -> None:
-        completed = subprocess.run(
-            [sys.executable, "-c", worker, str(state_dir), f"{index + 1:032x}"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=15.0,
-        )
-        assert completed.returncode == 0, (
-            f"owner registry writer {index} exited with {completed.returncode}\n"
-            f"stdout:\n{completed.stdout}\n"
-            f"stderr:\n{completed.stderr}"
-        )
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        list(executor.map(write, range(12)))
+    context = multiprocessing.get_context("spawn" if sys.platform == "win32" else "fork")
+    # Keep up to eight independent writers, but start their write budget only
+    # after every interpreter has imported its dependencies. Releasing a whole
+    # batch together also makes the intended database contention explicit.
+    for indices in (range(8), range(8, 12)):
+        workers = []
+        try:
+            startup_deadline = time.monotonic() + 30.0
+            for index in indices:
+                connection, child_connection = context.Pipe()
+                process = context.Process(
+                    target=write_owner,
+                    args=(child_connection, state_dir, f"{index + 1:032x}"),
+                )
+                try:
+                    process.start()
+                except BaseException:
+                    connection.close()
+                    process.close()
+                    raise
+                finally:
+                    child_connection.close()
+                workers.append((index, connection, process))
+            for index, connection, _process in workers:
+                assert connection.poll(max(0.0, startup_deadline - time.monotonic())), (
+                    f"owner registry writer {index} did not become ready"
+                )
+                assert connection.recv() == "ready"
+            write_deadline = time.monotonic() + 15.0
+            for _index, connection, _process in workers:
+                connection.send("write")
+            for index, connection, process in workers:
+                assert connection.poll(max(0.0, write_deadline - time.monotonic())), (
+                    f"owner registry writer {index} did not finish its write"
+                )
+                assert connection.recv() == "written"
+                process.join(timeout=max(0.0, write_deadline - time.monotonic()))
+                assert process.exitcode == 0, f"owner registry writer {index} failed to exit"
+        finally:
+            # Terminate every unfinished worker before joining any one of them.
+            for _index, connection, process in workers:
+                connection.close()
+                if process.is_alive():
+                    process.terminate()
+            for index, _connection, process in workers:
+                process.join(timeout=5.0)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=5.0)
+                assert not process.is_alive(), f"owner registry writer {index} leaked"
+                process.close()
 
     assert len(process_tree._load_owner_records(state_dir)) == 12
 

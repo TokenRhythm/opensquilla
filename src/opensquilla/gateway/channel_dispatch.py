@@ -455,6 +455,50 @@ def _accepts_keyword_arg(callable_obj: Any, name: str) -> bool:
     return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
+def _accepts_explicit_keyword_arg(callable_obj: Any, name: str) -> bool:
+    """Return whether a durable-owner keyword is part of the declared contract."""
+
+    try:
+        parameter = inspect.signature(callable_obj).parameters.get(name)
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
+
+
+def _turn_runner_owner_kwargs(
+    run: Any,
+    *,
+    expected_session_id: str | None,
+    expected_session_epoch: int | None,
+) -> dict[str, Any]:
+    """Carry modern owners only across an explicitly declared runner contract."""
+
+    if expected_session_epoch is None:
+        if (
+            isinstance(expected_session_id, str)
+            and expected_session_id
+            and _accepts_keyword_arg(run, "expected_session_id")
+        ):
+            return {"expected_session_id": expected_session_id}
+        return {}
+    if (
+        not isinstance(expected_session_id, str)
+        or not expected_session_id
+        or not _accepts_explicit_keyword_arg(run, "expected_session_id")
+        or not _accepts_explicit_keyword_arg(run, "expected_session_epoch")
+    ):
+        raise RuntimeError(
+            "Modern channel turn ownership requires an exact turn-runner owner contract"
+        )
+    return {
+        "expected_session_id": expected_session_id,
+        "expected_session_epoch": expected_session_epoch,
+    }
+
+
 @contextlib.asynccontextmanager
 async def _maybe_lock(lock: asyncio.Lock | None) -> AsyncIterator[None]:
     """Yield under ``lock`` if provided; otherwise yield unlocked.
@@ -701,13 +745,14 @@ async def run_channel_dispatch(
             if not atomic_channel_acceptance:
                 # Legacy runners need the session before execution. Production
                 # TaskRuntime creates it inside the acceptance transaction.
-                await _record_delivery_context(
+                session, _created = await _record_delivery_context(
                     session_manager,
                     session_key,
                     msg,
                     session_prefix,
                     route_envelope=route_envelope,
                 )
+                route_envelope = _route_with_session_owner(route_envelope, session)
 
         ingested: AttachmentIngestResult | None = None
         if not atomic_channel_acceptance:
@@ -725,13 +770,14 @@ async def run_channel_dispatch(
 
         if not atomic_channel_acceptance:
             async with _maybe_lock(session_lock):
-                await _record_delivery_context(
+                session, _created = await _record_delivery_context(
                     session_manager,
                     session_key,
                     msg,
                     session_prefix,
                     route_envelope=route_envelope,
                 )
+                route_envelope = _route_with_session_owner(route_envelope, session)
 
         status_reactor = _status_reactor(channel)
         await status_reactor.received(msg)
@@ -1580,7 +1626,8 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
         # Mention gating already ran via the admission decision at the top of
         # this function; denied messages never reach this point.
         if not atomic_channel_acceptance:
-            await _record_delivery_context(session_manager, session_key, msg, session_prefix, route_envelope=route_envelope)  # noqa: E501
+            session, _created = await _record_delivery_context(session_manager, session_key, msg, session_prefix, route_envelope=route_envelope)  # noqa: E501
+            route_envelope = _route_with_session_owner(route_envelope, session)
 
     ingested: AttachmentIngestResult | None = None
     if not atomic_channel_acceptance:
@@ -1600,7 +1647,8 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
 
     if not atomic_channel_acceptance:
         async with _maybe_lock(session_lock):
-            await _record_delivery_context(session_manager, session_key, msg, session_prefix, route_envelope=route_envelope)  # noqa: E501
+            session, _created = await _record_delivery_context(session_manager, session_key, msg, session_prefix, route_envelope=route_envelope)  # noqa: E501
+            route_envelope = _route_with_session_owner(route_envelope, session)
 
     status_reactor = _status_reactor(channel)
     await status_reactor.received(msg)
@@ -1776,6 +1824,46 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
 
 
 # ── Gap 1: Delivery context ─────────────────────────────────────────────
+
+
+def _route_with_session_owner(route_envelope: Any, session: Any) -> Any:
+    """Freeze one channel route to the exact session generation it admitted."""
+
+    session_id = getattr(session, "session_id", None)
+    session_epoch = getattr(session, "epoch", None)
+    valid_session_id = isinstance(session_id, str) and bool(session_id)
+    valid_session_epoch = (
+        isinstance(session_epoch, int)
+        and not isinstance(session_epoch, bool)
+        and session_epoch >= 0
+    )
+    if not valid_session_id or not valid_session_epoch:
+        from opensquilla.session.models import SessionNode
+
+        if not isinstance(session, SessionNode):
+            # Compatibility for lightweight legacy embedders that do not
+            # expose durable SessionNode coordinates. Production admission
+            # always returns SessionNode and therefore cannot bypass binding.
+            return route_envelope
+    if not valid_session_id:
+        raise ValueError("Channel session has no durable identity")
+    if not valid_session_epoch:
+        raise ValueError("Channel session has no durable epoch")
+    admitted_session_id = getattr(route_envelope, "session_id", None)
+    admitted_session_epoch = getattr(route_envelope, "session_epoch", None)
+    if (
+        admitted_session_id is not None and admitted_session_id != session_id
+    ) or (
+        admitted_session_epoch is not None and admitted_session_epoch != session_epoch
+    ):
+        from opensquilla.session.storage import StaleEpochError
+
+        raise StaleEpochError("Channel session owner changed during admission")
+    return replace(
+        route_envelope,
+        session_id=session_id,
+        session_epoch=session_epoch,
+    )
 
 
 async def _record_delivery_context(
@@ -2098,6 +2186,7 @@ async def _run_turn_with_streaming(
         session = await storage.get_session(session_key)
         if session is None:
             raise KeyError(f"Session not found: {session_key}")
+        envelope = _route_with_session_owner(envelope, session)
         run_context, workspace_guard = await authoritative_project_run_context(
             storage=storage,
             session_manager=session_manager,
@@ -2151,6 +2240,8 @@ async def _run_turn_with_streaming(
             config,
             attachments,
             accepted_config=accepted_config,
+            expected_session_id=getattr(envelope, "session_id", None),
+            expected_session_epoch=getattr(envelope, "session_epoch", None),
         )
     else:
         await _run_turn_batch_path(
@@ -2164,6 +2255,8 @@ async def _run_turn_with_streaming(
             config,
             attachments,
             accepted_config=accepted_config,
+            expected_session_id=getattr(envelope, "session_id", None),
+            expected_session_epoch=getattr(envelope, "session_epoch", None),
         )
 
 
@@ -3287,10 +3380,16 @@ async def _accept_channel_runtime_turn_impl(
 ) -> tuple[Any | None, str, _RuntimeChannelStreamRelay | None, bool]:
     """Atomically accept a channel message, task, and idempotency receipt."""
 
+    from functools import partial
+
+    from opensquilla.application.admission_views import AdmissionTaskRecord
+    from opensquilla.application.turn_acceptance_ports import AdmissionHandle, AdmissionReservation
+    from opensquilla.application.turn_activation import commit_reserved_turn
     from opensquilla.gateway.routing import delivery_fields_from_envelope
     from opensquilla.gateway.task_runtime import TaskHandle
     from opensquilla.session.manager import SessionIntent
     from opensquilla.session.models import AgentTaskStatus
+    from opensquilla.session.storage import TurnAcceptanceResult
 
     def _accepted_replay_handle(acceptance: Any) -> TaskHandle | None:
         """Attach redelivery to any accepted task instead of silently acking it.
@@ -3348,6 +3447,7 @@ async def _accept_channel_runtime_turn_impl(
         agent_id=route_envelope.agent_id,
         **delivery_fields,
     )
+    route_envelope = _route_with_session_owner(route_envelope, intent_plan.node)
     from opensquilla.session.goals import ClaimGoalMutation, GoalClaimCandidate
 
     goal_claim_candidate: GoalClaimCandidate | None = None
@@ -3394,26 +3494,8 @@ async def _accept_channel_runtime_turn_impl(
         bool,
     ]:
         nonlocal stream_relay
-        reservation = await reserve_turn_via_runtime(
-            task_runtime,
-            route_envelope,
-            msg.content,
-            attachments=ingested.attachments,
-            mode=_resolve_channel_busy_input_mode(task_runtime, busy_input_mode),
-            run_kind="channel_turn",
-            semantic_message=raw_content,
-            stream_event_sink=(
-                stream_relay.emit if stream_relay is not None else None
-            ),
-            overflow_policy=overflow_policy,
-            goal_candidate=(
-                goal_claim_candidate.as_task_detail()
-                if goal_claim_candidate is not None
-                else None
-            ),
-            accepted_run_mode_override=accepted_run_mode_override,
-        )
-        try:
+
+        async def _freeze(reservation: AdmissionReservation) -> None:
             if intent_plan.action == "create":
                 from opensquilla.gateway.session_model_routing import (
                     capture_prepared_session_model_routing_config,
@@ -3428,11 +3510,13 @@ async def _accept_channel_runtime_turn_impl(
                 )
             else:
                 await task_runtime.freeze_acceptance(reservation)
-            acceptance = await storage.accept_turn(
+
+        async def _commit(task_record: AdmissionTaskRecord) -> TurnAcceptanceResult:
+            result = await storage.accept_turn(
                 entry,
                 expected_epoch=expected_epoch,
                 updated_at=int(time.time() * 1000),
-                task_record=reservation.task_record,
+                task_record=task_record,
                 source_scope=identity.source_scope,
                 request_session_key=identity.request_session_key,
                 client_request_id=identity.client_request_id,
@@ -3446,95 +3530,69 @@ async def _accept_channel_runtime_turn_impl(
                     else None
                 ),
             )
-        except BaseException:
-            await task_runtime.abort_reservation(reservation)
-            raise
+            if not isinstance(result, TurnAcceptanceResult):
+                raise TypeError("Channel commit did not return durable turn acceptance")
+            return result
 
-        if acceptance.replayed:
-            await task_runtime.abort_reservation(reservation)
-            return _accepted_replay_handle(acceptance), persisted_text, None, True
-
-        if stream_relay is not None:
-            try:
-                stream_relay.start()
-            except Exception:  # noqa: BLE001 - turn is already accepted.
-                log.warning(
-                    "channel.stream_relay_start_failed",
-                    session_key=session_key,
-                    task_id=acceptance.receipt.task_id,
-                    exc_info=True,
-                )
-                stream_relay = None
-        try:
-            handle = await task_runtime.activate(
-                reservation,
-                persisted_user_message_id=acceptance.receipt.message_id,
-                fresh_user_session=acceptance.fresh_user_session,
-            )
-        except Exception as exc:  # noqa: BLE001 - acceptance already committed.
-            log.error(
-                "channel.turn_activation_failed",
-                session_key=session_key,
-                task_id=acceptance.receipt.task_id,
-                exc_info=True,
-            )
-            if reservation.activated:
-                log.warning(
-                    "channel.turn_activation_error_after_start",
-                    session_key=session_key,
-                    task_id=acceptance.receipt.task_id,
-                )
-                handle = await task_runtime.activate(reservation)
-            else:
+        def _before_activate(acceptance: TurnAcceptanceResult) -> None:
+            nonlocal stream_relay
+            if stream_relay is not None:
                 try:
-                    await task_runtime.abort_reservation(reservation)
-                except Exception:  # noqa: BLE001 - preserve accepted channel handling.
+                    stream_relay.start()
+                except Exception:  # noqa: BLE001 - turn is already accepted.
                     log.warning(
-                        "channel.turn_activation_abort_failed",
+                        "channel.stream_relay_start_failed",
                         session_key=session_key,
                         task_id=acceptance.receipt.task_id,
                         exc_info=True,
                     )
-                goal_compensated = False
-                goal_service = getattr(task_runtime, "goal_service", None)
-                compensate_goal = getattr(
-                    goal_service,
-                    "compensate_activation_failure",
-                    None,
-                )
-                if acceptance.goal_context is not None and callable(compensate_goal):
-                    try:
-                        await compensate_goal(acceptance.goal_context.as_task_detail())
-                        goal_compensated = True
-                    except Exception:  # noqa: BLE001 - preserve accepted handling.
-                        log.warning(
-                            "channel.goal_activation_compensation_failed",
-                            session_key=session_key,
-                            task_id=acceptance.receipt.task_id,
-                            exc_info=True,
-                        )
-                if not goal_compensated:
-                    try:
-                        await storage.update_agent_task(
-                            acceptance.receipt.task_id,
-                            status="failed",
-                            finished_at=int(time.time() * 1000),
-                            terminal_reason="activation_failed",
-                            error_class=type(exc).__name__,
-                            error_message=str(exc),
-                        )
-                    except Exception:  # noqa: BLE001 - preserve accepted handling.
-                        log.warning(
-                            "channel.turn_activation_failure_record_failed",
-                            session_key=session_key,
-                            task_id=acceptance.receipt.task_id,
-                            exc_info=True,
-                        )
-                handle = TaskHandle(
-                    task_id=acceptance.receipt.task_id,
-                    session_key=acceptance.receipt.accepted_session_key,
-                    status=AgentTaskStatus.FAILED,
-                )
+                    stream_relay = None
+
+        outcome = await commit_reserved_turn(
+            runtime=task_runtime,
+            storage=storage,
+            reserve=partial(
+                reserve_turn_via_runtime,
+                task_runtime,
+                route_envelope,
+                msg.content,
+                attachments=ingested.attachments,
+                mode=_resolve_channel_busy_input_mode(task_runtime, busy_input_mode),
+                run_kind="channel_turn",
+                semantic_message=raw_content,
+                stream_event_sink=stream_relay.emit if stream_relay is not None else None,
+                overflow_policy=overflow_policy,
+                goal_candidate=(
+                    goal_claim_candidate.as_task_detail()
+                    if goal_claim_candidate is not None
+                    else None
+                ),
+                accepted_run_mode_override=accepted_run_mode_override,
+            ),
+            freeze=_freeze,
+            commit=_commit,
+            before_activate=_before_activate,
+            compensate_goal=getattr(
+                getattr(task_runtime, "goal_service", None),
+                "compensate_activation_failure",
+                None,
+            ),
+        )
+        acceptance = outcome.acceptance
+        if acceptance.replayed:
+            return _accepted_replay_handle(acceptance), persisted_text, None, True
+        handle: AdmissionHandle | None
+        if outcome.activation_failed and outcome.task_status is not None:
+            assert acceptance.receipt.task_id is not None
+            handle = TaskHandle(
+                task_id=acceptance.receipt.task_id,
+                session_key=acceptance.receipt.accepted_session_key,
+                status=AgentTaskStatus(outcome.task_status),
+            )
+        else:
+            # Retain the committed identity and its last known status when a
+            # current ledger read is unavailable; redelivery uses the same task.
+            handle = outcome.handle or _accepted_replay_handle(acceptance)
 
         try:
             session_manager.notify_message_appended(entry)
@@ -4149,6 +4207,8 @@ async def _run_turn_batch_path(
     attachments: list[dict[str, Any]] | None = None,
     *,
     accepted_config: Any = None,
+    expected_session_id: str | None = None,
+    expected_session_epoch: int | None = None,
 ) -> None:
     """Batch mode: accumulate all text, send once at the end."""
     text_parts: list[str] = []
@@ -4170,6 +4230,13 @@ async def _run_turn_batch_path(
         run_kwargs["semantic_message"] = semantic_message
     if attachments and _accepts_keyword_arg(turn_runner.run, "attachments"):
         run_kwargs["attachments"] = attachments
+    run_kwargs.update(
+        _turn_runner_owner_kwargs(
+            turn_runner.run,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+        )
+    )
     try:
         from opensquilla.gateway.session_model_routing import (
             accepted_model_routing_stream,
@@ -4345,6 +4412,8 @@ async def _run_turn_streaming_path(
     attachments: list[dict[str, Any]] | None = None,
     *,
     accepted_config: Any = None,
+    expected_session_id: str | None = None,
+    expected_session_epoch: int | None = None,
 ) -> None:
     """Streaming mode: feed text deltas through an async queue to send_streaming.
 
@@ -4407,6 +4476,13 @@ async def _run_turn_streaming_path(
             run_kwargs["semantic_message"] = semantic_message
         if attachments and _accepts_keyword_arg(turn_runner.run, "attachments"):
             run_kwargs["attachments"] = attachments
+        run_kwargs.update(
+            _turn_runner_owner_kwargs(
+                turn_runner.run,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+            )
+        )
         from opensquilla.gateway.session_model_routing import (
             accepted_model_routing_stream,
         )

@@ -118,6 +118,47 @@ def _apply_config_tool_policy_to_context(
     )
 
 
+async def _standalone_session_owner_kwargs(
+    session_manager: Any,
+    turn_runner: Any,
+    session_key: str,
+    *,
+    session: Any | None = None,
+) -> dict[str, Any]:
+    from opensquilla.engine.runtime import _accepts_explicit_keyword_arg
+    from opensquilla.gateway.session_services import get_session_storage
+    from opensquilla.session.storage import SessionStorage
+
+    storage = get_session_storage(session_manager)
+    if not isinstance(storage, SessionStorage):
+        return {}
+    if not all(
+        _accepts_explicit_keyword_arg(session_manager.append_message, name)
+        for name in ("expected_session_id", "expected_session_epoch")
+    ):
+        raise RuntimeError("Session writer cannot enforce a durable owner")
+    if not all(
+        _accepts_explicit_keyword_arg(turn_runner.run, name)
+        for name in ("expected_session_id", "expected_session_epoch")
+    ):
+        raise RuntimeError("Turn runner cannot enforce a durable owner")
+    session = session if session is not None else await storage.get_session(session_key)
+    session_id = getattr(session, "session_id", None)
+    session_epoch = getattr(session, "epoch", None)
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or isinstance(session_epoch, bool)
+        or not isinstance(session_epoch, int)
+        or session_epoch < 0
+    ):
+        raise RuntimeError("Session has no durable owner")
+    return {
+        "expected_session_id": session_id,
+        "expected_session_epoch": session_epoch,
+    }
+
+
 async def run_agent_once(
     *,
     message: str,
@@ -262,7 +303,15 @@ async def run_agent_once(
     done: DoneEvent | None = None
 
     try:
-        await svc.session_manager.get_or_create(session_key, agent_id=agent_id)
+        session_result = await svc.session_manager.get_or_create(
+            session_key,
+            agent_id=agent_id,
+        )
+        admitted_session = (
+            session_result[0]
+            if isinstance(session_result, tuple) and session_result
+            else session_result
+        )
         attachments_cfg = getattr(service_cfg, "attachments", None)
         opaque_cap = getattr(attachments_cfg, "opaque_max_bytes", None)
         ingested_attachments = await _attachment_ingest.ingest_attachments(
@@ -274,6 +323,24 @@ async def run_agent_once(
         )
         message = ingested_attachments.text
         run_attachments = ingested_attachments.attachments
+        runner = build_turn_runner_from_services(svc)
+        owner_kwargs = await _standalone_session_owner_kwargs(
+            svc.session_manager,
+            runner,
+            session_key,
+            session=admitted_session,
+        )
+        if transcript_path and owner_kwargs:
+            from opensquilla.engine.runtime import _accepts_explicit_keyword_arg
+
+            if not all(
+                _accepts_explicit_keyword_arg(
+                    svc.session_manager.get_transcript,
+                    name,
+                )
+                for name in ("expected_session_id", "expected_session_epoch")
+            ):
+                raise RuntimeError("Session reader cannot enforce a durable owner")
         if run_attachments:
             from opensquilla.gateway.transcripts import build_transcript_attachment_envelope
 
@@ -289,17 +356,27 @@ async def run_agent_once(
             persist_content, _writes = build_transcript_attachment_envelope(
                 text=message,
                 attachments=run_attachments,
-                session_id=session_key.split(":")[-1] or session_key,
+                session_id=str(
+                    owner_kwargs.get("expected_session_id")
+                    or session_key.split(":")[-1]
+                    or session_key
+                ),
                 media_root=media_root,
                 persist_enabled=persist_enabled,
                 disk_budget_bytes=disk_budget if isinstance(disk_budget, int) else None,
             )
             await svc.session_manager.append_message(
-                session_key, role="user", content=persist_content
+                session_key,
+                role="user",
+                content=persist_content,
+                **owner_kwargs,
             )
         else:
             _persisted = await svc.session_manager.append_message(
-                session_key, role="user", content=message
+                session_key,
+                role="user",
+                content=message,
+                **owner_kwargs,
             )
             if _persisted is not None and isinstance(_persisted.content, str):
                 message = _persisted.content
@@ -315,6 +392,14 @@ async def run_agent_once(
             ),
             elevated=elevated,
             run_mode=run_mode,
+            **(
+                {
+                    "session_id": owner_kwargs["expected_session_id"],
+                    "session_epoch": owner_kwargs["expected_session_epoch"],
+                }
+                if owner_kwargs
+                else {}
+            ),
         )
         from opensquilla.gateway.project_workspace_runtime import (
             apply_accepted_run_mode_override,
@@ -366,7 +451,6 @@ async def run_agent_once(
             tool_registry=getattr(svc, "tool_registry", None),
         )
 
-        runner = build_turn_runner_from_services(svc)
         bootstrap_context_mode = _bootstrap_context_mode(
             unattended=unattended,
             stateless=stateless,
@@ -390,6 +474,7 @@ async def run_agent_once(
             no_memory_capture=no_memory_capture,
             attachments=run_attachments,
             bootstrap_context_mode=bootstrap_context_mode,
+            **owner_kwargs,
         ):
             if event_sink is not None:
                 event_sink(event)
@@ -427,7 +512,10 @@ async def run_agent_once(
         usage = _usage_from_done(done, effective_model)
         transcript_usage = _to_transcript_usage(usage)
         if transcript_path:
-            transcript = await svc.session_manager.get_transcript(session_key)
+            transcript = await svc.session_manager.get_transcript(
+                session_key,
+                **owner_kwargs,
+            )
             _write_jsonl(transcript_path, _to_benchmark_transcript(transcript, transcript_usage))
     finally:
         await svc.close()

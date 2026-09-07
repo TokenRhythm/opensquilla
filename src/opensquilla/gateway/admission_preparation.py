@@ -579,6 +579,7 @@ async def prepare_route(
 
     workspace_dir = run_context.workspace or workspace_dir
     host_execute_allowed = principal_has_host_execute(principal)
+    session_epoch = int(getattr(session, "epoch", 0) or 0)
     if command.source.caller_kind == "cli" or command.source.channel_kind == "cli":
         route_envelope = build_cli_route_envelope(
             session_key=key,
@@ -587,6 +588,7 @@ async def prepare_route(
             channel_id=command.source.channel_id or "cli:rpc",
             sender_id=command.source.sender_id,
             session_id=getattr(session, "session_id", None),
+            session_epoch=session_epoch,
             principal_is_owner=principal.is_owner,
             principal_host_execute=host_execute_allowed,
             run_mode=run_context.run_mode.value,
@@ -601,6 +603,7 @@ async def prepare_route(
             source_name=command.source.source_name or "RPC",
             tool_source_kind=command.source.source_kind,
             session_id=getattr(session, "session_id", None),
+            session_epoch=session_epoch,
             principal_is_owner=principal.is_owner,
             principal_host_execute=host_execute_allowed,
         )

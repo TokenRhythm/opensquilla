@@ -109,9 +109,7 @@ def test_event_contract_uses_declared_frame_as_validator_target(tmp_path: Path) 
 
     assert spec.contract_type == "event"
     assert spec.semantic_kind == "event"
-    assert spec.targets == (
-        ("frame", "SessionsChangedEventFrame"),
-    )
+    assert spec.targets == (("frame", "SessionsChangedEventFrame"),)
 
 
 def test_event_contract_rejects_boolean_schema_version(tmp_path: Path) -> None:
@@ -136,9 +134,7 @@ def test_event_contract_rejects_boolean_schema_version(tmp_path: Path) -> None:
 
 def test_event_python_renderer_tightens_reachable_optional_fields() -> None:
     spec = next(
-        spec
-        for spec in runner.discover_contracts()
-        if spec.wire_name == "sessions.changed"
+        spec for spec in runner.discover_contracts() if spec.wire_name == "sessions.changed"
     )
     generated = (
         "from pydantic import BaseModel\n\n"
@@ -156,9 +152,7 @@ def test_event_python_renderer_tightens_reachable_optional_fields() -> None:
 
 def test_json_number_renderer_accepts_one_line_pydantic_imports() -> None:
     spec = next(
-        spec
-        for spec in runner.discover_contracts()
-        if spec.wire_name == "sessions.changed"
+        spec for spec in runner.discover_contracts() if spec.wire_name == "sessions.changed"
     )
     generated = (
         "from __future__ import annotations\n"
@@ -200,48 +194,34 @@ def test_contract_cannot_overwrite_aggregate_registry(tmp_path: Path) -> None:
     ("mutation", "message"),
     [
         (
-            lambda schema: schema.update(
-                {"$schema": "http://json-schema.org/draft-07/schema#"}
-            ),
+            lambda schema: schema.update({"$schema": "http://json-schema.org/draft-07/schema#"}),
             "2020-12",
         ),
         (lambda schema: schema.pop("x-opensquilla-codegen"), "pinned toolchain"),
         (lambda schema: schema["x-opensquilla-method"].pop("scope"), "scope"),
         (
-            lambda schema: schema["x-opensquilla-method"].update(
-                {"guestAllowed": "yes"}
-            ),
+            lambda schema: schema["x-opensquilla-method"].update({"guestAllowed": "yes"}),
             "guestAllowed",
         ),
         (lambda schema: schema["x-opensquilla-method"].pop("errors"), "errors"),
         (
-            lambda schema: schema["x-opensquilla-wire"].update(
-                {"protocol": "invented-wire"}
-            ),
+            lambda schema: schema["x-opensquilla-wire"].update({"protocol": "invented-wire"}),
             "protocol",
         ),
         (
-            lambda schema: schema["x-opensquilla-method"].update(
-                {"name": "Sessions Invalid"}
-            ),
+            lambda schema: schema["x-opensquilla-method"].update({"name": "Sessions Invalid"}),
             "method name",
         ),
         (
-            lambda schema: schema["x-opensquilla-method"].update(
-                {"scope": "operator/read"}
-            ),
+            lambda schema: schema["x-opensquilla-method"].update({"scope": "operator/read"}),
             "scope",
         ),
         (
-            lambda schema: schema["x-opensquilla-method"].update(
-                {"kind": "stream"}
-            ),
+            lambda schema: schema["x-opensquilla-method"].update({"kind": "stream"}),
             "method kind",
         ),
         (
-            lambda schema: schema["x-opensquilla-method"].update(
-                {"idempotency": "sometimes"}
-            ),
+            lambda schema: schema["x-opensquilla-method"].update({"idempotency": "sometimes"}),
             "idempotency",
         ),
         (
@@ -279,9 +259,7 @@ def test_contract_cannot_overwrite_aggregate_registry(tmp_path: Path) -> None:
             "local \\$defs reference",
         ),
         (
-            lambda schema: schema["x-opensquilla-method"].update(
-                {"result": "#/$defs/not-legal"}
-            ),
+            lambda schema: schema["x-opensquilla-method"].update({"result": "#/$defs/not-legal"}),
             "legal identifier",
         ),
     ],
@@ -360,9 +338,7 @@ def test_undeclared_migration_dotted_error_code_remains_rejected(
     tmp_path: Path,
 ) -> None:
     document = _method_schema("migration.sources.preview")
-    document["x-opensquilla-method"]["errors"] = [
-        {"code": "migration.unknown"}
-    ]
+    document["x-opensquilla-method"]["errors"] = [{"code": "migration.unknown"}]
     schema = _write_schema(
         tmp_path,
         "platform/migration-sources-preview.schema.json",
@@ -375,9 +351,7 @@ def test_undeclared_migration_dotted_error_code_remains_rejected(
 
 def test_undeclared_dotted_error_code_remains_rejected(tmp_path: Path) -> None:
     document = _method_schema("onboarding.channel.probe")
-    document["x-opensquilla-method"]["errors"] = [
-        {"code": "onboarding.channel.unknown"}
-    ]
+    document["x-opensquilla-method"]["errors"] = [{"code": "onboarding.channel.unknown"}]
     schema = _write_schema(
         tmp_path,
         "platform/onboarding-channel-probe.schema.json",
@@ -545,15 +519,9 @@ def test_compatibility_manifest_is_schema_derived_and_deterministic() -> None:
     )
     event_families = {entry["family"]: entry for entry in manifest["events"]}
     assert len(event_families) == 9
-    assert event_families["models.routing.changed"]["wireNames"] == [
-        "models.routing.changed"
-    ]
-    assert "session.event.artifact_state" in event_families[
-        "conversation.events"
-    ]["wireNames"]
-    assert "session.event.artifact_state" in event_families[
-        "document.state_changed"
-    ]["wireNames"]
+    assert event_families["models.routing.changed"]["wireNames"] == ["models.routing.changed"]
+    assert "session.event.artifact_state" in event_families["conversation.events"]["wireNames"]
+    assert "session.event.artifact_state" in event_families["document.state_changed"]["wireNames"]
     assert "private" not in first.lower()
     assert "allowlist" not in first.lower()
 
@@ -600,46 +568,34 @@ def test_aggregate_run_dispatches_every_discovered_contract(
         "sessions/sessions-resolve.schema.json",
         _method_schema("sessions.resolve"),
     )
-    legacy = next(
-        spec for spec in runner.discover_contracts() if spec.wire_name == "sessions.list"
-    )
+    legacy = next(spec for spec in runner.discover_contracts() if spec.wire_name == "sessions.list")
     generic = runner.load_contract(generic_schema, contract_root=tmp_path)
-    calls: list[tuple[str, str]] = []
+    calls: list[str] = []
 
-    def record_call(spec: runner.ContractSpec, mode: runner.Mode) -> int:
-        calls.append((spec.wire_name, mode))
-        return 0
+    def render(spec: runner.ContractSpec, **_: object) -> dict[Path, str]:
+        calls.append(spec.wire_name)
+        return {path: f"artifact {path.name}\n" for path in spec.outputs}
 
+    monkeypatch.setattr(runner, "render_legacy", render)
+    monkeypatch.setattr(runner, "render_generic", render)
     monkeypatch.setattr(
         runner,
-        "_run_legacy",
-        record_call,
+        "_render_validators",
+        lambda spec, roles: {path: f"artifact {path.name}\n" for path in spec.outputs[3:]},
     )
-    monkeypatch.setattr(
-        runner,
-        "_run_generic",
-        record_call,
+    output = tmp_path / "verification"
+    selected = (legacy, generic)
+    assert runner.run("write", selected, profile="verification", output_root=output) == 0
+    assert calls == ["sessions.list", "sessions.resolve"]
+    assert (output / runner.REGISTRATION_OUTPUT.relative_to(runner.ROOT)).read_text() == (
+        runner.render_registration_descriptor(selected)
     )
-    monkeypatch.setattr(
-        runner,
-        "_run_registration_descriptor",
-        lambda specs, mode: 0,
+    assert (output / runner.COMPATIBILITY_MANIFEST_OUTPUT.relative_to(runner.ROOT)).read_text() == (
+        runner.render_compatibility_manifest(selected)
     )
-    manifest_calls: list[str] = []
-    monkeypatch.setattr(
-        runner,
-        "_run_compatibility_manifest",
-        lambda specs, mode: manifest_calls.append(mode) or 0,
-    )
-    monkeypatch.setattr(
-        runner,
-        "reconcile_orphans",
-        lambda expected, mode: 0,
-    )
-
-    assert runner.run("check", (legacy, generic)) == 0
-    assert calls == [("sessions.list", "check"), ("sessions.resolve", "check")]
-    assert manifest_calls == ["check"]
+    calls.clear()
+    assert runner.run("check", selected, profile="verification", output_root=output) == 0
+    assert calls == ["sessions.list", "sessions.resolve"]
 
 
 def test_generic_renderer_derives_all_adapter_only_artifacts(
@@ -839,14 +795,8 @@ def test_registration_descriptor_exposes_uniform_validation_models() -> None:
     rendered = runner.render_registration_descriptor(specs)
 
     assert "class GatewayMethodContract:" in rendered
-    assert (
-        "GATEWAY_METHOD_CONTRACTS: Final[dict[str, GatewayMethodContract]]"
-        in rendered
-    )
-    assert (
-        "GATEWAY_EVENT_CONTRACTS: Final[dict[str, GatewayEventContract]]"
-        in rendered
-    )
+    assert "GATEWAY_METHOD_CONTRACTS: Final[dict[str, GatewayMethodContract]]" in rendered
+    assert "GATEWAY_EVENT_CONTRACTS: Final[dict[str, GatewayEventContract]]" in rendered
     assert "request_model: type[Any]" in rendered
     assert "params_model: type[Any]" in rendered
     assert "response_model: type[Any]" in rendered
@@ -893,9 +843,7 @@ def test_orphan_reconciliation_handles_contract_rename_and_delete(
     unowned = python_root / "keep_me.py"
     unowned.write_text("# maintained by a human\n", encoding="utf-8")
     expected = (
-        frozenset({python_root / expected_name})
-        if expected_name is not None
-        else frozenset()
+        frozenset({python_root / expected_name}) if expected_name is not None else frozenset()
     )
     roots = (python_root, typescript_root)
 
@@ -912,18 +860,14 @@ def test_hash_manifest_comparison_is_portable_and_fail_closed(tmp_path: Path) ->
     right = tmp_path / "windows.json"
     manifest: dict[str, Any] = {
         "format": 1,
-        "artifacts": {
-            "src/opensquilla/contracts/generated/v4/example.py": "a" * 64
-        },
+        "artifacts": {"src/opensquilla/contracts/generated/v4/example.py": "a" * 64},
     }
     left.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     right.write_text(json.dumps(manifest, separators=(",", ":")), encoding="utf-8")
     assert runner.compare_hash_manifests(left, right) == 0
 
     changed = copy.deepcopy(manifest)
-    changed["artifacts"]["src/opensquilla/contracts/generated/v4/example.py"] = (
-        "b" * 64
-    )
+    changed["artifacts"]["src/opensquilla/contracts/generated/v4/example.py"] = "b" * 64
     right.write_text(json.dumps(changed), encoding="utf-8")
     assert runner.compare_hash_manifests(left, right) == 1
 
@@ -1000,19 +944,44 @@ def test_sessions_list_legacy_artifacts_remain_byte_exact() -> None:
     assert sessions_list.uses_legacy_generator is True
 
     expected = {
-        "sessions_list.py": "00a9ad628f2331690ef6db62ba1d6c8c6c5986dcef40564b32407fa3d8199c5d",
+        "sessions_list.py": "c8442279094b301bd1f903793bd58c091be96da896b9f6a031ee8defcbc042bf",
         "sessions_list_metadata.py": (
-            "d17a5ac76fbede14262c1f0c404059f9bf6ec870ab2974c24009b5de5916d122"
+            "62dce72764117870a9055bfcfbe90fc02a6ec32be405896f5eba8888f5d4fe4a"
         ),
-        "sessionsList.ts": "03c17fa7bf72d8be25e562451478c614f4151c7658efaf4f3a0b003cefc41e2f",
+        "sessionsList.ts": "6dff702e0480fca29be404bfcfe28c3231ccc07ede1289e4b79f5a0170c06819",
         "sessionsListValidators.cjs": (
-            "49a3dbb6d0cfc648273768d56036e1e8f4882fe1651b0c88034b0846190ef802"
+            "617ed876b51b73858f87bdfce69282ca7ca0d70ebd7a360ab02d7fd02e494712"
         ),
         "sessionsListValidators.d.cts": (
-            "86e783b3d1b504cf356ae6c1feeddffaccec12ac8b1db2d808bde2d20fa697d3"
+            "dae25ccdadf944a91e8545406bb4d8898aed8ce54351ccc0504dfbc2c6c06482"
         ),
     }
+    # Freeze every baseline byte except the separately verified generator
+    # provenance line: changing CLI publication must not change type/validator bodies.
+    generator_digest = hashlib.sha256(
+        runner.LEGACY_GENERATORS[sessions_list.schema].read_bytes()
+        + b"\0"
+        + (runner.ROOT / "scripts/contracts/generate_sessions_list_ajv.mjs").read_bytes()
+    ).hexdigest()
+
+    def body_digest(content: str) -> str:
+        lines = content.splitlines(keepends=True)
+        assert lines[2].strip() in {
+            f"# generator-sha256: {generator_digest}",
+            f"// generator-sha256: {generator_digest}",
+        }
+        return hashlib.sha256("".join(lines[:2] + lines[3:]).encode("utf-8")).hexdigest()
+
     assert {
-        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in sessions_list.outputs
-    } == expected
+        path.name: body_digest(path.read_text(encoding="utf-8"))
+        for path in sessions_list.outputs[:3]
+    } == {path.name: expected[path.name] for path in sessions_list.outputs[:3]}
+    # Frozen CJS bodies remain byte-oracles in the pinned toolchain job;
+    # they are no longer persisted in the production package.
+    import os
+
+    if os.environ.get("OPENSQUILLA_RUN_CONTRACT_TOOLCHAIN_INTEGRATION") == "1":
+        assert {
+            path.name: body_digest(content)
+            for path, content in runner.render_legacy(sessions_list).items()
+        } == expected

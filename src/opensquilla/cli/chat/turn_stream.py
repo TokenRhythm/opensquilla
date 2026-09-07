@@ -155,6 +155,45 @@ def image_prompt_and_attachments(command: str) -> tuple[str, list[dict[str, str]
     raise ValueError("Image attachments are not configured.")
 
 
+async def _standalone_session_owner_kwargs(
+    session_manager: Any,
+    turn_runner: Any,
+    session_key: str,
+) -> dict[str, Any]:
+    from opensquilla.engine.runtime import _accepts_explicit_keyword_arg
+    from opensquilla.gateway.session_services import get_session_storage
+    from opensquilla.session.storage import SessionStorage
+
+    storage = get_session_storage(session_manager)
+    if not isinstance(storage, SessionStorage):
+        return {}
+    if not all(
+        _accepts_explicit_keyword_arg(session_manager.append_message, name)
+        for name in ("expected_session_id", "expected_session_epoch")
+    ):
+        raise RuntimeError("Session writer cannot enforce a durable owner")
+    if not all(
+        _accepts_explicit_keyword_arg(turn_runner.run, name)
+        for name in ("expected_session_id", "expected_session_epoch")
+    ):
+        raise RuntimeError("Turn runner cannot enforce a durable owner")
+    session = await storage.get_session(session_key)
+    session_id = getattr(session, "session_id", None)
+    session_epoch = getattr(session, "epoch", None)
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or isinstance(session_epoch, bool)
+        or not isinstance(session_epoch, int)
+        or session_epoch < 0
+    ):
+        raise RuntimeError("Session has no durable owner")
+    return {
+        "expected_session_id": session_id,
+        "expected_session_epoch": session_epoch,
+    }
+
+
 def default_turn_stream_dependencies(
     *,
     renderer_factory: Callable[..., Any] | None = None,
@@ -1287,8 +1326,18 @@ async def stream_response_turnrunner(
     stream_deps = _resolve_tui_event_sink_for_output(stream_deps, tui_output)
     session_manager = getattr(svc, "session_manager", None) if svc is not None else None
     config = getattr(svc, "config", None) if svc is not None else None
+    owner_kwargs = await _standalone_session_owner_kwargs(
+        session_manager,
+        turn_runner,
+        session_key,
+    )
     if session_manager is not None:
-        _persisted = await session_manager.append_message(session_key, role="user", content=message)
+        _persisted = await session_manager.append_message(
+            session_key,
+            role="user",
+            content=message,
+            **owner_kwargs,
+        )
         if _persisted is not None and isinstance(_persisted.content, str):
             message = _persisted.content
     from opensquilla.gateway.session_model_routing import (
@@ -1362,6 +1411,7 @@ async def stream_response_turnrunner(
                         model=model,
                         timeout=timeout,
                         pending_input_provider=pending_input_provider,
+                        **owner_kwargs,
                     ),
                     accepted_config,
                 )
@@ -1700,8 +1750,18 @@ async def handle_image_command_turnrunner(
 
     session_manager = getattr(svc, "session_manager", None) if svc is not None else None
     config = getattr(svc, "config", None) if svc is not None else None
+    owner_kwargs = await _standalone_session_owner_kwargs(
+        session_manager,
+        turn_runner,
+        session_key,
+    )
     if session_manager is not None:
-        _persisted = await session_manager.append_message(session_key, role="user", content=prompt)
+        _persisted = await session_manager.append_message(
+            session_key,
+            role="user",
+            content=prompt,
+            **owner_kwargs,
+        )
         if _persisted is not None and isinstance(_persisted.content, str):
             prompt = _persisted.content
     from opensquilla.gateway.session_model_routing import (
@@ -1748,6 +1808,7 @@ async def handle_image_command_turnrunner(
                         attachments=attachments,
                         timeout=timeout,
                         pending_input_provider=pending_input_provider,
+                        **owner_kwargs,
                     ),
                     accepted_config,
                 )

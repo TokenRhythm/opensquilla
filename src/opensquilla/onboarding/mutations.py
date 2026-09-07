@@ -10,6 +10,11 @@ from typing import Any, Literal, cast, get_args
 
 from pydantic import ValidationError
 
+from opensquilla.application.config_secrets import (
+    clear_runtime_secret_paths,
+    forget_secret_provenance_paths,
+    inherit_runtime_secrets,
+)
 from opensquilla.channels.registry import discover_all, parse_channel_entry
 from opensquilla.gateway.config import (
     AudioConfig,
@@ -22,11 +27,6 @@ from opensquilla.gateway.config import (
     MemoryEmbeddingConfig,
     SquillaRouterConfig,
     _default_tiers,
-)
-from opensquilla.gateway.config_secrets import (
-    clear_runtime_secret_paths,
-    forget_secret_provenance_paths,
-    inherit_runtime_secrets,
 )
 from opensquilla.gateway.model_routing import (
     apply_model_routing_mode,

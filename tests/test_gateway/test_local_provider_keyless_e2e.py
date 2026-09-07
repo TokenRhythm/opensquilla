@@ -20,7 +20,7 @@ from opensquilla.engine.pricing import lookup_price
 from opensquilla.engine.usage import SessionUsage
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.llm_runtime import resolve_llm_runtime_config
-from opensquilla.gateway.rpc_config import _sync_provider_selector
+from opensquilla.gateway.provider_runtime import sync_provider_selector as _sync_provider_selector
 from opensquilla.provider.model_catalog import (
     DEFAULT_CONTEXT_WINDOW,
     ModelCatalog,

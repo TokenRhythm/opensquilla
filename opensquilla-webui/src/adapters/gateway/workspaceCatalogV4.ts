@@ -1,4 +1,5 @@
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
+import type { RpcRequester as WorkspaceTransport } from './privateTransports'
 import {
   WORKSPACES_LIST_METHOD,
   type Result as WorkspacesListResult,
@@ -40,38 +41,23 @@ import {
   type Result as SandboxPathListResult,
 } from '@/contracts/generated/v4/sandboxPathList'
 import { validateResult as validateSandboxPathListResult } from '@/contracts/generated/v4/sandboxPathListValidators.mjs'
+import {
+  SANDBOX_PATH_CREATE_DIRECTORY_METHOD,
+  type SandboxPathCreateDirectoryParams,
+  type SandboxPathCreateDirectoryResult,
+} from '@/contracts/generated/v4/sandboxPathCreateDirectory'
+import {
+  SANDBOX_PATH_PICK_METHOD,
+  type SandboxPathPickParams,
+  type SandboxPathPickResult,
+} from '@/contracts/generated/v4/sandboxPathPick'
 import type {
   WorkspaceCatalog,
   WorkspaceHistoryDeletion,
   WorkspaceItem,
-  WorkspacePathKind,
   WorkspacePathListing,
   WorkspacePathSelection,
 } from '@/modules/workspaceCatalog'
-
-interface WorkspaceTransport {
-  request<T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions): Promise<T>
-}
-
-// The two path mutation methods retain their historical hyphenated names and
-// are not yet accepted by the generic schema generator. Keep the wire types
-// private to this Adapter until that generator seam is promoted.
-const SANDBOX_PATH_CREATE_DIRECTORY_METHOD = 'sandbox.path.create-directory'
-const SANDBOX_PATH_PICK_METHOD = 'sandbox.path.pick'
-type SandboxPathCreateDirectoryParams = {
-  sessionKey: string
-  parentPath: string
-  name: string
-  kind?: WorkspacePathKind
-}
-type SandboxPathCreateDirectoryResult = { path: string; name: string; kind: 'directory' }
-type SandboxPathPickParams = {
-  sessionKey: string
-  initialPath?: string
-  kind?: WorkspacePathKind
-  access?: 'ro' | 'rw'
-}
-type SandboxPathPickResult = { path: string | null; kind: WorkspacePathKind }
 
 function validCreateDirectory(value: unknown): value is SandboxPathCreateDirectoryResult {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
@@ -225,7 +211,7 @@ export function createV4WorkspaceCatalog(transport: WorkspaceTransport): Workspa
         ...(request.access ? { access: request.access } : {}),
       }
       const result = await mutate<SandboxPathPickResult>(SANDBOX_PATH_PICK_METHOD, params as unknown as Record<string, unknown>, options?.signal, validPick)
-      return { path: result.path, kind: result.kind as WorkspacePathKind }
+      return { path: result.path, kind: result.kind }
     },
   }
 }

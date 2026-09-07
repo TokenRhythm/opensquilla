@@ -123,6 +123,7 @@ class TurnCommittedWire(BaseModel):
     schema_version: int = Field(strict=True, ge=1, le=1)
     session_key: str = Field(min_length=1)
     session_id: str | None = None
+    epoch: int | None = Field(default=None, ge=0)
     task_id: str = Field(min_length=1)
     turn_id: str = Field(min_length=1)
     status: Literal["succeeded"]

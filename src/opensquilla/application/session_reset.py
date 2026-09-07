@@ -58,8 +58,7 @@ class SessionResetFlushSafetyError(RuntimeError):
 
     def __str__(self) -> str:
         return (
-            "session reset requires a durable memory flush "
-            f"(status={self.assessment.flush_status})"
+            f"session reset requires a durable memory flush (status={self.assessment.flush_status})"
         )
 
 
@@ -115,7 +114,7 @@ class SessionResetResult:
 
 
 class SessionQuiescencePort(Protocol):
-    async def quiesce(self, session_key: str) -> None: ...
+    def quiesce(self, session_key: str) -> AbstractAsyncContextManager[None]: ...
 
 
 class SessionResetLockPort(Protocol):
@@ -211,65 +210,61 @@ class SessionResetApplication:
             raise ValueError("session_key must be non-empty")
         command = replace(command, session_key=key)
 
-        await self._quiescence.quiesce(key)
-        if not self._store.storage_available:
-            raise SessionResetUnavailableError
-        async with self._lock.hold(key):
-            async with self._usage.account_memory_flush(key):
-                snapshot = await self._store.load(key)
-                if snapshot is None:
-                    raise SessionResetNotFoundError(key)
-                receipt: SessionResetFlushReceipt | None = None
-                if self._memory.flush_enabled and not self._memory.flush_available:
-                    if snapshot.transcript and not command.force:
-                        checkpoint_safe = await self._memory.checkpoint_covers(snapshot)
-                        if not checkpoint_safe:
-                            raise SessionResetFlushUnavailableError(
+        async with self._quiescence.quiesce(key):
+            if not self._store.storage_available:
+                raise SessionResetUnavailableError
+            async with self._lock.hold(key):
+                async with self._usage.account_memory_flush(key):
+                    snapshot = await self._store.load(key)
+                    if snapshot is None:
+                        raise SessionResetNotFoundError(key)
+                    receipt: SessionResetFlushReceipt | None = None
+                    if self._memory.flush_enabled and not self._memory.flush_available:
+                        if snapshot.transcript and not command.force:
+                            checkpoint_safe = await self._memory.checkpoint_covers(snapshot)
+                            if not checkpoint_safe:
+                                raise SessionResetFlushUnavailableError(
+                                    session_key=key,
+                                    session_id=snapshot.session_id,
+                                    message_count=len(snapshot.transcript),
+                                )
+                        if snapshot.transcript and command.force and not command.force_authorized:
+                            raise SessionResetForcePermissionError(
                                 session_key=key,
                                 session_id=snapshot.session_id,
-                                message_count=len(snapshot.transcript),
                             )
-                    if (
-                        snapshot.transcript
-                        and command.force
-                        and not command.force_authorized
-                    ):
-                        raise SessionResetForcePermissionError(
-                            session_key=key,
-                            session_id=snapshot.session_id,
-                        )
-                elif self._memory.flush_enabled and not snapshot.transcript:
-                    receipt = self._memory.skipped_receipt()
-                elif self._memory.flush_enabled:
-                    try:
-                        receipt = await self._memory.flush(snapshot)
-                    except Exception as exc:
-                        failed_receipt = self._memory.failed_receipt(
-                            message_count=len(snapshot.transcript),
-                            error=str(exc),
-                        )
-                        raise SessionResetFlushExecutionError(
-                            snapshot=snapshot,
-                            receipt=failed_receipt,
-                        ) from exc
-                    assessment = await self._memory.assess(snapshot, receipt)
-                    if not assessment.allows_reset:
-                        raise SessionResetFlushSafetyError(
-                            snapshot=snapshot,
-                            receipt=receipt,
-                            assessment=assessment,
-                        )
-                rotation = await self._store.rotate(key)
-                epoch = await self._store.ensure_durable_epoch(key, snapshot.epoch)
-                self._goal_leases.revoke(key)
-                if epoch > 0:
-                    self._epochs.update_cache(key, epoch)
-                    try:
-                        await self._epochs.publish(key, epoch)
-                    except Exception:
-                        # The durable epoch is authoritative; reconnect replay heals
-                        # a best-effort process-local publication failure.
-                        pass
+                    elif self._memory.flush_enabled and not snapshot.transcript:
+                        receipt = self._memory.skipped_receipt()
+                    elif self._memory.flush_enabled:
+                        try:
+                            receipt = await self._memory.flush(snapshot)
+                        except Exception as exc:
+                            failed_receipt = self._memory.failed_receipt(
+                                message_count=len(snapshot.transcript),
+                                error=str(exc),
+                            )
+                            raise SessionResetFlushExecutionError(
+                                snapshot=snapshot,
+                                receipt=failed_receipt,
+                            ) from exc
+                        assessment = await self._memory.assess(snapshot, receipt)
+                        if not assessment.allows_reset:
+                            raise SessionResetFlushSafetyError(
+                                snapshot=snapshot,
+                                receipt=receipt,
+                                assessment=assessment,
+                            )
+                    rotation = await self._store.rotate(key)
+                    epoch = await self._store.ensure_durable_epoch(key, snapshot.epoch)
+                    self._goal_leases.revoke(key)
+                    if epoch > 0:
+                        self._epochs.update_cache(key, epoch)
+                        try:
+                            await self._epochs.publish(key, epoch)
+                        except Exception:
+                            # The durable epoch is authoritative; reconnect replay heals
+                            # a best-effort process-local publication failure.
+                            pass
 
         await self._prompt_cache.invalidate(key)
         return SessionResetResult(

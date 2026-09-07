@@ -33,7 +33,8 @@ from opensquilla.scheduler.types import (
     SessionTarget,
 )
 from opensquilla.session.manager import SessionManager
-from opensquilla.session.storage import SessionStorage
+from opensquilla.session.models import SessionNode
+from opensquilla.session.storage import SessionStorage, StaleEpochError
 
 SESSION_KEY = "agent:main:webchat:abc123"
 CRON_SESSION_KEY = "cron:drink:run:def456"
@@ -100,7 +101,11 @@ class _FakeSessionManager:
         if provenance is not None:
             row["provenance"] = provenance
         self.rows.setdefault(session_key, []).append(row)
-        return SimpleNamespace(role=role, content=content)
+        return SimpleNamespace(
+            role=role,
+            content=content,
+            message_id=f"message-{len(self.rows[session_key])}",
+        )
 
     async def read_transcript(self, session_key):
         return list(self.rows.get(session_key, []))
@@ -165,18 +170,251 @@ async def test_agent_run_binds_the_isolated_session_to_the_job_workspace() -> No
     assert session_manager.workspace_bindings == [(result.session_key, "project-123")]
 
 
+@pytest.mark.asyncio
+async def test_agent_run_workspace_binding_rejects_reset_owner(tmp_path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "cron-workspace-owner.db"))
+
+    class RotatingSessionManager(_FakeSessionManager):
+        def __init__(self) -> None:
+            super().__init__()
+            self.admitted = SessionNode(
+                session_key=SESSION_KEY,
+                session_id="cron-workspace-owner-old",
+                epoch=4,
+            )
+            self.bind_owner = None
+            self._storage = SimpleNamespace(
+                bind_session_workspace=self._bind_rotating_workspace,
+            )
+
+        async def get_or_create(self, **kwargs):
+            self.created.append(kwargs)
+            return self.admitted, False
+
+        async def _bind_rotating_workspace(
+            self,
+            session_key,
+            workspace_id,
+            *,
+            expected_session_id=None,
+            expected_session_epoch=None,
+        ):
+            self.bind_owner = (expected_session_id, expected_session_epoch)
+            await storage.upsert_session(
+                SessionNode(
+                    session_key=session_key,
+                    session_id="cron-workspace-owner-new",
+                    epoch=5,
+                )
+            )
+            await storage.bind_session_workspace(
+                session_key,
+                workspace_id,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+            )
+
+    session_manager = RotatingSessionManager()
+    await storage.upsert_session(session_manager.admitted)
+    turn_runner = _FakeTurnRunner(session_manager)
+    job = CronJob(
+        id="project-owner-race",
+        name="Project owner race",
+        handler_key="agent_run",
+        payload={
+            "kind": AGENT_TURN_KIND,
+            "task": "inspect the project",
+            "agent_id": "main",
+            "_workspace_id": "project-123",
+        },
+        session_target=SessionTarget.CURRENT,
+        session_key=SESSION_KEY,
+    )
+    handler = make_agent_run_handler(
+        DeliveryChain(),
+        turn_runner_ref=lambda: turn_runner,
+        session_manager_ref=lambda: session_manager,
+    )
+
+    try:
+        with pytest.raises(StaleEpochError, match="cron-workspace-owner-old@4"):
+            await handler(job)
+
+        current = await storage.get_session(SESSION_KEY)
+        assert session_manager.bind_owner == ("cron-workspace-owner-old", 4)
+        assert current is not None
+        assert (current.session_id, current.epoch, current.workspace_id) == (
+            "cron-workspace-owner-new",
+            5,
+            None,
+        )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_run_workspace_binding_rejects_kwargs_only_proxy() -> None:
+    class KwargsOnlySessionManager(_FakeSessionManager):
+        def __init__(self) -> None:
+            super().__init__()
+            self._storage = SimpleNamespace(
+                bind_session_workspace=self._bind_without_cas,
+            )
+
+        async def get_or_create(self, **kwargs):
+            self.created.append(kwargs)
+            return SimpleNamespace(session_id="cron-owner", epoch=2), False
+
+        async def _bind_without_cas(self, *args, **kwargs):
+            raise AssertionError("kwargs-only proxy must not receive an owner write")
+
+    session_manager = KwargsOnlySessionManager()
+    job = CronJob(
+        id="project-owner-proxy",
+        name="Project owner proxy",
+        handler_key="agent_run",
+        payload={
+            "kind": AGENT_TURN_KIND,
+            "task": "inspect the project",
+            "agent_id": "main",
+            "_workspace_id": "project-123",
+        },
+        session_target=SessionTarget.CURRENT,
+        session_key=SESSION_KEY,
+    )
+    handler = make_agent_run_handler(
+        DeliveryChain(),
+        turn_runner_ref=lambda: _FakeTurnRunner(session_manager),
+        session_manager_ref=lambda: session_manager,
+    )
+
+    with pytest.raises(RuntimeError, match="cannot enforce the admitted session owner"):
+        await handler(job)
+
+
+@pytest.mark.asyncio
+async def test_agent_run_rejects_dropping_runner_for_modern_owner() -> None:
+    class ModernSessionManager(_FakeSessionManager):
+        def __init__(self) -> None:
+            super().__init__()
+            self.append_owner = None
+
+        async def get_or_create(self, **kwargs):
+            self.created.append(kwargs)
+            return SimpleNamespace(session_id="cron-modern-owner", epoch=3), False
+
+        async def append_message(
+            self,
+            session_key,
+            role,
+            content,
+            provenance=None,
+            *,
+            expected_session_id=None,
+            expected_session_epoch=None,
+        ):
+            self.append_owner = (expected_session_id, expected_session_epoch)
+            return await super().append_message(
+                session_key,
+                role,
+                content,
+                provenance=provenance,
+            )
+
+    class DroppingTurnRunner:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def run(self, **kwargs):
+            self.calls.append(kwargs)
+
+            async def events():
+                yield SimpleNamespace(kind="done")
+
+            return events()
+
+    session_manager = ModernSessionManager()
+    runner = DroppingTurnRunner()
+    job = CronJob(
+        id="modern-owner-runner-proxy",
+        name="Modern owner runner proxy",
+        handler_key="agent_run",
+        payload={"kind": AGENT_TURN_KIND, "task": "stay fenced", "agent_id": "main"},
+        session_target=SessionTarget.CURRENT,
+        session_key=SESSION_KEY,
+    )
+    handler = make_agent_run_handler(
+        DeliveryChain(),
+        turn_runner_ref=lambda: runner,
+        session_manager_ref=lambda: session_manager,
+    )
+
+    with pytest.raises(RuntimeError, match="cannot enforce the admitted session owner"):
+        await handler(job)
+
+    assert session_manager.append_owner == ("cron-modern-owner", 3)
+    assert runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_agent_run_rejects_dropping_writer_for_modern_owner() -> None:
+    class DroppingSessionManager(_FakeSessionManager):
+        def __init__(self) -> None:
+            super().__init__()
+            self.append_calls = []
+
+        async def get_or_create(self, **kwargs):
+            self.created.append(kwargs)
+            return SimpleNamespace(session_id="cron-modern-owner", epoch=3), False
+
+        async def append_message(self, *args, **kwargs):
+            self.append_calls.append((args, kwargs))
+            return await super().append_message(*args, **kwargs)
+
+    session_manager = DroppingSessionManager()
+    runner = _FakeTurnRunner(session_manager)
+    job = CronJob(
+        id="modern-owner-writer-proxy",
+        name="Modern owner writer proxy",
+        handler_key="agent_run",
+        payload={"kind": AGENT_TURN_KIND, "task": "stay fenced", "agent_id": "main"},
+        session_target=SessionTarget.CURRENT,
+        session_key=SESSION_KEY,
+    )
+    handler = make_agent_run_handler(
+        DeliveryChain(),
+        turn_runner_ref=lambda: runner,
+        session_manager_ref=lambda: session_manager,
+    )
+
+    with pytest.raises(RuntimeError, match="writer cannot enforce the admitted session owner"):
+        await handler(job)
+
+    assert session_manager.append_calls == []
+    assert runner.calls == []
+
+
 class _FakeTaskRuntime:
     def __init__(self, record) -> None:
         self.record = record
         self.enqueued = []
 
-    async def enqueue(self, route_envelope, task, *, mode, run_kind):
+    async def enqueue(
+        self,
+        route_envelope,
+        task,
+        *,
+        mode,
+        run_kind,
+        persisted_user_message_id=None,
+    ):
         self.enqueued.append(
             {
                 "route_envelope": route_envelope,
                 "task": task,
                 "mode": mode,
                 "run_kind": run_kind,
+                "persisted_user_message_id": persisted_user_message_id,
             }
         )
         return SimpleNamespace(task_id="task-1")
@@ -750,6 +988,114 @@ async def test_cron_safe_admission_failure_happens_before_session_or_message_per
     assert session_manager.created == []
     assert await session_manager.read_transcript(SESSION_KEY) == []
     assert task_runtime.enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_cron_runtime_envelope_freezes_owner_across_persist_enqueue_reset() -> None:
+    class RotatingSessionManager(_FakeSessionManager):
+        def __init__(self) -> None:
+            super().__init__()
+            self.admitted = SimpleNamespace(session_id="cron-owner-old", epoch=4)
+            self.current = self.admitted
+            self.append_owner = None
+
+        async def get_or_create(self, **kwargs):
+            self.created.append(kwargs)
+            return self.admitted, False
+
+        async def append_message(
+            self,
+            session_key,
+            role,
+            content,
+            provenance=None,
+            *,
+            expected_session_id=None,
+            expected_session_epoch=None,
+        ):
+            self.append_owner = (expected_session_id, expected_session_epoch)
+            persisted = await super().append_message(
+                session_key,
+                role,
+                content,
+                provenance=provenance,
+            )
+            # Deterministically model reset after old-owner persistence but
+            # before the handler reaches TaskRuntime.enqueue.
+            self.current = SimpleNamespace(session_id="cron-owner-new", epoch=5)
+            return persisted
+
+    class ResettingTaskRuntime(_FakeTaskRuntime):
+        async def wait(self, task_id, *, timeout):
+            session_manager.rows[SESSION_KEY] = [
+                {"role": "user", "content": "replacement prompt"},
+                {"role": "assistant", "content": "replacement owner result"},
+            ]
+            return await super().wait(task_id, timeout=timeout)
+
+    session_manager = RotatingSessionManager()
+    task_runtime = ResettingTaskRuntime(
+        SimpleNamespace(
+            status="succeeded",
+            details={
+                "session_id": "cron-owner-old",
+                "session_epoch": 4,
+                "terminal_assistant_message_content": "admitted owner result",
+            },
+        )
+    )
+    job = CronJob(
+        id="owner-race",
+        name="Owner race",
+        handler_key="agent_run",
+        payload={"kind": AGENT_TURN_KIND, "task": "fenced task", "agent_id": "main"},
+        session_target=SessionTarget.CURRENT,
+        session_key=SESSION_KEY,
+    )
+    handler = make_agent_run_handler(
+        DeliveryChain(),
+        task_runtime_ref=lambda: task_runtime,
+        session_manager_ref=lambda: session_manager,
+    )
+
+    result = await handler(job)
+
+    envelope = task_runtime.enqueued[0]["route_envelope"]
+    assert session_manager.append_owner == ("cron-owner-old", 4)
+    assert (session_manager.current.session_id, session_manager.current.epoch) == (
+        "cron-owner-new",
+        5,
+    )
+    assert (envelope.session_id, envelope.session_epoch) == ("cron-owner-old", 4)
+    assert task_runtime.enqueued[0]["persisted_user_message_id"] == "message-1"
+    assert result.summary == "admitted owner result"
+
+
+@pytest.mark.asyncio
+async def test_cron_runtime_missing_owner_bound_terminal_payload_fails_closed() -> None:
+    session_manager = _FakeSessionManager()
+    task_runtime = _FakeTaskRuntime(
+        SimpleNamespace(
+            status="succeeded",
+            details={"session_id": "cron-owner", "session_epoch": 1},
+        )
+    )
+    job = CronJob(
+        id="owner-output-missing",
+        name="Owner output missing",
+        handler_key="agent_run",
+        payload={"kind": AGENT_TURN_KIND, "task": "fenced task", "agent_id": "main"},
+        session_target=SessionTarget.CURRENT,
+        session_key=SESSION_KEY,
+    )
+    handler = make_agent_run_handler(
+        DeliveryChain(),
+        task_runtime_ref=lambda: task_runtime,
+        session_manager_ref=lambda: session_manager,
+    )
+
+    with pytest.raises(RuntimeError, match="durable terminal output"):
+        await handler(job)
 
 
 @pytest.mark.asyncio

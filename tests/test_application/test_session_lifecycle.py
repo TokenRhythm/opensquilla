@@ -52,9 +52,7 @@ class _CreationPolicy:
         model: str | None,
         auth_profile: str | None,
     ) -> None:
-        self.events.append(
-            f"deployment:{session_key}:{provider}:{model}:{auth_profile}"
-        )
+        self.events.append(f"deployment:{session_key}:{provider}:{model}:{auth_profile}")
 
     async def resolve_workspace(self, workspace_id: str) -> SessionWorkspaceBinding:
         self.events.append(f"workspace:{workspace_id}")
@@ -78,8 +76,12 @@ class _Store:
         self.created = session
         return SessionIdentity(session.session_key, "session-id")
 
-    async def append_initial_user_message(self, session_key: str, message: str) -> None:
-        self.events.append(f"seed:{session_key}:{message}")
+    async def append_initial_user_message(
+        self,
+        session: SessionIdentity,
+        message: str,
+    ) -> None:
+        self.events.append(f"seed:{session.session_key}:{message}")
 
     async def rename(self, session_key: str, display_name: str) -> None:
         self.events.append(f"rename:{session_key}:{display_name}")
@@ -291,9 +293,7 @@ async def test_delete_settles_irreversible_operation_before_propagating_cancella
     events: list[str] = []
     deletion = _FencedDeletion(events, fail_after_release=fail_after_release)
     application = _application(events, deletion=deletion)
-    task = asyncio.create_task(
-        application.delete(DeleteSessions(("agent:main:webchat:session",)))
-    )
+    task = asyncio.create_task(application.delete(DeleteSessions(("agent:main:webchat:session",))))
     await deletion.started.wait()
 
     task.cancel()

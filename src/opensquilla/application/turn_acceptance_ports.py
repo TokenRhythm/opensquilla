@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict
 
 from opensquilla.application.admission_views import (
+    ActivationTask,
     AdmissionAcceptance,
     AdmissionAnnotation,
     AdmissionAnnotationTarget,
@@ -173,6 +174,9 @@ class AdmissionReservation(Protocol):
     @property
     def activated(self) -> bool: ...
 
+    @property
+    def aborted(self) -> bool: ...
+
 
 class AdmissionRuntime(Protocol):
     async def try_collect_atomically(
@@ -279,16 +283,16 @@ class AdmissionStorage(Protocol):
         correlation_id: str,
     ) -> AdmissionMetaControl | None: ...
 
-    async def update_agent_task(
+    async def get_agent_task(self, task_id: str) -> ActivationTask | None: ...
+
+    async def fail_queued_agent_task_activation(
         self,
         task_id: str,
         *,
-        status: str,
-        finished_at: int,
-        terminal_reason: str,
+        session_key: str,
         error_class: str,
         error_message: str,
-    ) -> None: ...
+    ) -> ActivationTask | None: ...
 
     def new_plan_run(
         self,
@@ -326,7 +330,9 @@ class AdmissionStorage(Protocol):
         details: dict[str, Any],
     ) -> AdmissionTaskRecord: ...
 
-    def failed_acceptance(self, result: AdmissionAcceptance) -> AdmissionAcceptance: ...
+    def with_task_status(
+        self, result: AdmissionAcceptance, status: str | None
+    ) -> AdmissionAcceptance: ...
 
     async def accept_turn(self, command: AdmissionCommit) -> AdmissionAcceptance: ...
 

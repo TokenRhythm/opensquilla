@@ -158,6 +158,72 @@ async def test_concurrent_reset_during_write_atomic(storage):
     assert entries == [], f"No rows must be written after stale epoch; found {entries}"
 
 
+@pytest.mark.asyncio
+async def test_exact_owner_cas_rejects_replaced_id_at_same_epoch(storage):
+    """Epoch equality alone cannot authorize a retired session incarnation."""
+    admitted = await _make_session(storage)
+    await storage.conn.execute(
+        "UPDATE sessions SET session_id = ? WHERE session_key = ?",
+        ("sid-replacement", admitted.session_key),
+    )
+    await storage.conn.commit()
+    manager = SessionManager(storage)
+
+    with pytest.raises(StaleEpochError, match="owner mismatch"):
+        await manager.append_message(
+            admitted.session_key,
+            "assistant",
+            "late finalizer",
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=int(admitted.epoch or 0),
+        )
+
+    assert await storage.get_transcript("sid-replacement") == []
+
+
+# ── event payload ownership ───────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_prepare_event_payload_preserves_explicit_old_epoch(storage):
+    """A producer-owned epoch must not be relabeled after the cache advances."""
+    from opensquilla.gateway.rpc_sessions import _prepare_session_event_payload
+
+    node = await _make_session(storage)
+    manager = SessionManager(storage)
+    manager.set_cached_epoch(node.session_key, 7)
+    ctx = SimpleNamespace(session_manager=manager)
+
+    prepared = await _prepare_session_event_payload(
+        ctx,
+        node.session_key,
+        "session.event.done",
+        {"epoch": 0, "reason": "complete"},
+    )
+
+    assert prepared["epoch"] == 0
+
+
+@pytest.mark.asyncio
+async def test_prepare_event_payload_fills_missing_legacy_epoch(storage):
+    """Legacy producers without an epoch retain the current-cache fallback."""
+    from opensquilla.gateway.rpc_sessions import _prepare_session_event_payload
+
+    node = await _make_session(storage)
+    manager = SessionManager(storage)
+    manager.set_cached_epoch(node.session_key, 7)
+    ctx = SimpleNamespace(session_manager=manager)
+
+    prepared = await _prepare_session_event_payload(
+        ctx,
+        node.session_key,
+        "session.event.done",
+        {"reason": "complete"},
+    )
+
+    assert prepared["epoch"] == 7
+
+
 # ── _emit_to_subscribers uses cache after warm-up ──────────────────────────
 
 

@@ -1095,6 +1095,7 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert jobs["gateway-contract-windows"]["needs"] == [
         "plan-ci",
         "frontend-check",
+        "gateway-contract-verification-linux",
     ]
     assert "'frontend-validation'" in jobs["gateway-contract-windows"]["if"]
     assert "'tui'" in jobs["tui-check"]["if"]
@@ -1194,6 +1195,7 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
         "readme-locale-check",
         "frontend-artifact",
         "frontend-check",
+        "gateway-contract-verification-linux",
         "gateway-contract-windows",
         "webui-chat-recovery",
         "tui-check",
@@ -1236,6 +1238,7 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
         "RESULT_FRONTEND_ARTIFACT",
         "RESULT_FRONTEND",
         "RESULT_CONTRACT_WINDOWS",
+        "RESULT_CONTRACT_VERIFICATION_LINUX",
         "RESULT_TUI",
         "RESULT_DESKTOP",
         "RESULT_UBUNTU",

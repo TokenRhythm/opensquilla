@@ -16,6 +16,7 @@ import base64
 import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -47,7 +48,9 @@ from opensquilla.session.context_view import (
     build_provider_compaction_context,
     format_compaction_summary_context,
 )
-from opensquilla.session.models import SessionContextState, SessionSummary
+from opensquilla.session.manager import SessionManager
+from opensquilla.session.models import SessionContextState, SessionIntent, SessionSummary
+from opensquilla.session.storage import SessionStorage
 from opensquilla.token_estimation import estimate_tokens
 
 
@@ -885,6 +888,178 @@ async def test_router_capacity_request_resolves_bound_and_queued_users_from_snap
     assert context["history_capacity_estimate_complete"] is True
     assert context["history_capacity_message_count"] == 2
     assert context["history_capacity_estimated_tokens"] < estimate_tokens(bound.content)
+
+
+@pytest.mark.asyncio
+async def test_router_capacity_exact_owner_rejects_replacement_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "router-capacity-owner.db"
+    reader_storage = SessionStorage(str(db_path))
+    reset_storage = SessionStorage(str(db_path))
+    await reader_storage.connect()
+    await reset_storage.connect()
+    reader = SessionManager(reader_storage, inject_time_prefix=False)
+    resetter = SessionManager(reset_storage, inject_time_prefix=False)
+    key = "agent:main:router-capacity-owner"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    admitted = await reader.create(key)
+    bound = await reader.append_message(key, "user", "owner A attachment turn")
+    owner = (admitted.session_id, int(admitted.epoch or 0))
+
+    async def load_owner_a() -> list[Any]:
+        return await reader.get_transcript(
+            key,
+            expected_session_id=owner[0],
+            expected_session_epoch=owner[1],
+        )
+
+    snapshot = TurnTranscriptSnapshot(load_owner_a)
+    await snapshot.get_entries()
+    try:
+        replacement, rotated = await resetter.apply_intent(
+            key,
+            SessionIntent.RESET_SAME_KEY,
+        )
+        assert rotated is True
+        await reset_storage.save_summary(
+            SessionSummary(
+                session_id=replacement.session_id,
+                session_key=key,
+                summary_text="replacement private summary " + ("x" * 12_000),
+                covered_through_id=1,
+            )
+        )
+
+        context = await _new_runner(reader)._router_history_capacity_for_request(
+            key,
+            RouterHistoryReplayRequest(
+                exclude_last_user=True,
+                bound_user_message_id=bound.message_id,
+                transcript_snapshot=snapshot,
+                expected_session_id=owner[0],
+                expected_session_epoch=owner[1],
+            ),
+            max_history_turns=1,
+            preserve_image_attachments=False,
+            reachable_provider_kinds={"tokenrhythm"},
+        )
+
+        assert snapshot.load_count == 1
+        assert context["history_capacity_estimated_tokens"] == 0
+        assert context["history_capacity_message_count"] == 0
+        assert context["history_capacity_estimate_complete"] is False
+    finally:
+        await reset_storage.close()
+        await reader_storage.close()
+
+
+@pytest.mark.asyncio
+async def test_router_capacity_durable_kwargs_only_readers_fail_closed() -> None:
+    class _KwargsOnlyDurableManager(_FakeSessionManager):
+        def __init__(self) -> None:
+            super().__init__()
+            self._storage = object()
+            self.side_read_count = 0
+
+        async def get_summaries(self, session_key: str, **kwargs: Any) -> list[Any]:
+            self.side_read_count += 1
+            return await super().get_summaries(session_key)
+
+        async def get_context_states(
+            self,
+            session_key: str,
+            **kwargs: Any,
+        ) -> list[Any]:
+            self.side_read_count += 1
+            return await super().get_context_states(session_key)
+
+    manager = _KwargsOnlyDurableManager()
+    key = "agent:main:router-capacity-kwargs-only"
+    admitted = await manager.create(key)
+    bound = await manager.append_message(key, "user", "current")
+    snapshot = TurnTranscriptSnapshot(lambda: manager.get_transcript(key))
+
+    context = await _new_runner(manager)._router_history_capacity_for_request(
+        key,
+        RouterHistoryReplayRequest(
+            exclude_last_user=True,
+            bound_user_message_id=bound.message_id,
+            transcript_snapshot=snapshot,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=0,
+        ),
+        max_history_turns=1,
+        preserve_image_attachments=False,
+    )
+
+    assert manager.side_read_count == 0
+    assert context["history_capacity_estimate_complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_router_capacity_image_namespace_uses_admitted_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _ExactOwnerManager(_FakeSessionManager):
+        def __init__(self) -> None:
+            super().__init__()
+            self._storage = object()
+            self.owner_reads: list[tuple[str | None, int | None]] = []
+
+        async def get_summaries(
+            self,
+            session_key: str,
+            *,
+            expected_session_id: str | None = None,
+            expected_session_epoch: int | None = None,
+        ) -> list[Any]:
+            self.owner_reads.append((expected_session_id, expected_session_epoch))
+            return await super().get_summaries(session_key)
+
+        async def get_context_states(
+            self,
+            session_key: str,
+            *,
+            expected_session_id: str | None = None,
+            expected_session_epoch: int | None = None,
+        ) -> list[Any]:
+            self.owner_reads.append((expected_session_id, expected_session_epoch))
+            return await super().get_context_states(session_key)
+
+    manager = _ExactOwnerManager()
+    key = "agent:main:router-capacity-image-owner"
+    admitted = await manager.create(key)
+    historical = await manager.append_message(key, "user", "historical image")
+    bound = await manager.append_message(key, "user", "current")
+    snapshot = TurnTranscriptSnapshot(lambda: manager.get_transcript(key))
+    runner = _new_runner(manager)
+    projected_session_ids: list[str | None] = []
+    original_project = runner._project_history_replay
+
+    def capture_project(*args: Any, **kwargs: Any):
+        projected_session_ids.append(kwargs.get("session_id"))
+        return original_project(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_project_history_replay", capture_project)
+    context = await runner._router_history_capacity_for_request(
+        key,
+        RouterHistoryReplayRequest(
+            exclude_last_user=True,
+            bound_user_message_id=bound.message_id,
+            transcript_snapshot=snapshot,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=0,
+        ),
+        max_history_turns=1,
+        preserve_image_attachments=True,
+    )
+
+    assert historical.message_id is not None
+    assert projected_session_ids == [admitted.session_id]
+    assert manager.owner_reads == [(admitted.session_id, 0), (admitted.session_id, 0)]
+    assert context["history_capacity_estimate_complete"] is True
 
 
 @pytest.mark.asyncio

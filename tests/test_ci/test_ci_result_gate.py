@@ -42,6 +42,19 @@ def test_ci_result_gate_accepts_baseline_plan() -> None:
     assert check_ci_results(_env_for(BASELINE_SUITES)) == []
 
 
+@pytest.mark.parametrize("result", ["skipped", "failure", "cancelled", ""])
+def test_frontend_requires_complete_verification_profile(result: str) -> None:
+    env = _env_for(BASELINE_SUITES | {"frontend-validation"})
+    env["RESULT_CONTRACT_VERIFICATION_LINUX"] = result
+    assert any("Complete Gateway Contract verification" in error for error in check_ci_results(env))
+
+
+def test_wheel_only_does_not_require_verification_profile() -> None:
+    env = _env_for(BASELINE_SUITES | {"wheel-webui-roundtrip"})
+    assert env["RESULT_CONTRACT_VERIFICATION_LINUX"] == "skipped"
+    assert check_ci_results(env) == []
+
+
 def test_ci_result_gate_accepts_complete_full_plan() -> None:
     assert check_ci_results(_env_for(set(KNOWN_SUITES))) == []
 

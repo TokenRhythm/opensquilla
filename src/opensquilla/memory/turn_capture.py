@@ -174,16 +174,18 @@ class TurnCaptureService:
         self,
         *,
         session_key: str,
+        session_namespace: str | None,
         captured_at: datetime,
         entry: str,
     ) -> tuple[str, Path, str | None, str]:
         roll_max_chars = self._turn_roll_max_chars()
+        path_namespace = session_namespace or session_key
 
         for part in range(1, 1000):
             rel_path = (
-                self._turn_rel_path(session_key, captured_at)
+                self._turn_rel_path(path_namespace, captured_at)
                 if part == 1
-                else self._turn_part_rel_path(session_key, captured_at, part)
+                else self._turn_part_rel_path(path_namespace, captured_at, part)
             )
             abs_path = (self._turns_parent / rel_path).resolve()
             try:
@@ -217,6 +219,7 @@ class TurnCaptureService:
         source: dict[str, Any] | None = None,
         captured_at: datetime | None = None,
         no_memory_capture: bool = False,
+        session_namespace: str | None = None,
     ) -> str | None:
         if no_memory_capture:
             return None
@@ -247,6 +250,7 @@ class TurnCaptureService:
         )
         rel_path, abs_path, previous_content, new_content = self._select_turn_target(
             session_key=session_key,
+            session_namespace=session_namespace,
             captured_at=captured_at,
             entry=entry,
         )

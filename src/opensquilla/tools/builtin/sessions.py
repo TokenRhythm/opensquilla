@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import json
 import uuid
+from dataclasses import replace
+from typing import Any
 
 import structlog
 
@@ -25,7 +28,13 @@ from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
 from opensquilla.session.keys import build_subagent_session_key, parse_agent_id
 from opensquilla.tools.registry import tool
 from opensquilla.tools.run_mode import current_run_mode, full_host_access_for_context
-from opensquilla.tools.types import PlanAccess, SafeToolError, ToolError, current_tool_context
+from opensquilla.tools.types import (
+    PlanAccess,
+    SafeToolError,
+    ToolContext,
+    ToolError,
+    current_tool_context,
+)
 
 _log = structlog.get_logger("opensquilla.tools.sessions")
 
@@ -33,6 +42,77 @@ _VALID_STATUSES = ("running", "done", "failed", "killed", "timeout")
 _TERMINAL_STATUSES = ("done", "failed", "killed", "timeout")
 _MAX_SPAWN_DEPTH = MAX_SPAWN_DEPTH
 _MAX_SESSION_TITLE_CHARS = 512
+
+
+def _durable_session_owner(value: object) -> tuple[str, int] | None:
+    """Extract a complete owner from a modern SessionManager create result."""
+
+    if isinstance(value, dict):
+        session_id = value.get("session_id")
+        session_epoch = value.get("epoch")
+    else:
+        session_id = getattr(value, "session_id", None)
+        session_epoch = getattr(value, "epoch", None)
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(session_epoch, int)
+        or isinstance(session_epoch, bool)
+        or session_epoch < 0
+    ):
+        return None
+    return session_id, session_epoch
+
+
+def _accepts_keyword_arg(call: Any, name: str) -> bool:
+    """Return whether a compatibility runtime accepts one keyword."""
+
+    try:
+        parameters = inspect.signature(call).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD or parameter.name == name
+        for parameter in parameters
+    )
+
+
+def _accepts_explicit_keyword_arg(call: Any, name: str) -> bool:
+    """Return whether a modern owner keyword is a declared contract."""
+
+    try:
+        parameter = inspect.signature(call).parameters.get(name)
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
+
+
+def _admitted_parent_session_owner(
+    context: ToolContext | None,
+) -> tuple[str, int | None] | None:
+    """Return the immutable parent owner admitted with this tool turn."""
+
+    if context is None:
+        return None
+    session_id = context.session_id
+    session_epoch = context.session_epoch
+    if session_id is None and session_epoch is None:
+        return None
+    if not isinstance(session_id, str) or not session_id:
+        raise RuntimeError("Admitted parent session owner is malformed")
+    if session_epoch is None:
+        return session_id, None
+    if (
+        not isinstance(session_epoch, int)
+        or isinstance(session_epoch, bool)
+        or session_epoch < 0
+    ):
+        raise RuntimeError("Admitted parent session owner is malformed")
+    return session_id, session_epoch
+
 
 # Subagent grounding also has a per-turn system-prompt fallback in
 # engine.steps.inject_subagent_grounding. Keep this spawn prompt text in
@@ -496,6 +576,50 @@ async def sessions_spawn(
         if current_depth >= _MAX_SPAWN_DEPTH:
             raise ToolError(f"Max spawn depth ({_MAX_SPAWN_DEPTH}) exceeded")
 
+        # Freeze the admitted parent incarnation before creating the child.
+        # Modern ToolContexts carry this owner from their RouteEnvelope; the
+        # read also rejects a cross-process reset that already replaced it.
+        parent_owner = _admitted_parent_session_owner(ctx)
+        parent_session = None
+        get_parent_session = getattr(mgr, "get_session", None)
+        if callable(get_parent_session):
+            parent_owner_kwargs: dict[str, object] = {}
+            if parent_owner is not None:
+                parent_owner_kwargs["expected_session_id"] = parent_owner[0]
+                if parent_owner[1] is None:
+                    if not _accepts_keyword_arg(
+                        get_parent_session,
+                        "expected_session_id",
+                    ):
+                        parent_owner_kwargs = {}
+                elif all(
+                    _accepts_explicit_keyword_arg(get_parent_session, name)
+                    for name in ("expected_session_id", "expected_session_epoch")
+                ):
+                    parent_owner_kwargs["expected_session_epoch"] = parent_owner[1]
+                else:
+                    raise RuntimeError(
+                        "Modern subagent admission requires an exact parent-owner read"
+                    )
+            try:
+                parent_session = await get_parent_session(
+                    parent_session_key,
+                    **parent_owner_kwargs,
+                )
+            except (AttributeError, NotImplementedError):
+                if parent_owner is not None and parent_owner[1] is not None:
+                    raise RuntimeError(
+                        "Modern subagent admission requires an exact parent-owner read"
+                    )
+                parent_session = None
+            if parent_owner is not None and parent_session is None:
+                raise ToolError("Parent session is no longer current")
+            parent_owner = parent_owner or _durable_session_owner(parent_session)
+        elif parent_owner is not None and parent_owner[1] is not None:
+            raise RuntimeError(
+                "Modern subagent admission requires an exact parent-owner read"
+            )
+
         # ── Caller-side subagent policy (allow_agents, max_children) ──
         caller_agent_id = (ctx.agent_id if ctx is not None else None) or parse_agent_id(
             parent_session_key
@@ -558,6 +682,8 @@ async def sessions_spawn(
             session_key=session_key,
             parent_session_key=parent_session_key,
             agent_id=resolved_agent_id,
+            parent_session_id=(parent_owner[0] if parent_owner is not None else None),
+            parent_session_epoch=(parent_owner[1] if parent_owner is not None else None),
             run_id=subagent_run_id,
             parent_task_id=parent_task_id,
             spawn_depth=spawn_depth,
@@ -576,6 +702,7 @@ async def sessions_spawn(
             "kind": "subagent",
             "parent_session_key": parent_session_key,
             "parent_task_id": parent_task_id,
+            "task_id": subagent_run_id,
             "task": task,
             "execution_task": grounded_task,
         }
@@ -593,12 +720,7 @@ async def sessions_spawn(
         }
         if session_title:
             create_kwargs["derived_title"] = session_title
-        get_parent_session = getattr(mgr, "get_session", None)
-        if callable(get_parent_session):
-            try:
-                parent_session = await get_parent_session(parent_session_key)
-            except (AttributeError, NotImplementedError):
-                parent_session = None
+        if parent_session is not None:
             workspace_id = getattr(parent_session, "workspace_id", None)
             if isinstance(workspace_id, str) and workspace_id.strip():
                 create_kwargs["workspace_id"] = workspace_id
@@ -622,10 +744,36 @@ async def sessions_spawn(
                         f"'{parent_session_key}'"
                     )
             create = getattr(mgr, "create", None) or getattr(mgr, "create_session")
-            await create(
+            created_session = await create(
                 **create_kwargs,
             )
-            await mgr.append_message(session_key, role="user", content=grounded_task)
+            session_owner = _durable_session_owner(created_session)
+            append_kwargs: dict[str, object] = {}
+            if session_owner is not None:
+                append_kwargs = {
+                    "expected_session_id": session_owner[0],
+                    "expected_session_epoch": session_owner[1],
+                }
+            persisted_input = await mgr.append_message(
+                session_key,
+                role="user",
+                content=grounded_task,
+                **append_kwargs,
+            )
+            if session_owner is not None:
+                envelope = replace(
+                    envelope,
+                    session_id=session_owner[0],
+                    session_epoch=session_owner[1],
+                )
+        persisted_user_message_id = getattr(persisted_input, "message_id", None)
+        enqueue_kwargs: dict[str, object] = {}
+        if (
+            isinstance(persisted_user_message_id, str)
+            and persisted_user_message_id
+            and _accepts_keyword_arg(runtime.enqueue, "persisted_user_message_id")
+        ):
+            enqueue_kwargs["persisted_user_message_id"] = persisted_user_message_id
         handle = await runtime.enqueue(
             envelope,
             grounded_task,
@@ -633,6 +781,7 @@ async def sessions_spawn(
             run_kind="subagent",
             task_id=subagent_run_id,
             provider_request_correlation=provider_request_correlation,
+            **enqueue_kwargs,
         )
         return json.dumps(
             {
@@ -827,6 +976,8 @@ async def sessions_yield(
                         ctx.task_id,
                         session_manager=mgr,
                         task_runtime=runtime,
+                        parent_session_id=ctx.session_id,
+                        parent_session_epoch=ctx.session_epoch,
                     )
         yield_payload: dict[str, object] = {
             "status": "yielded",

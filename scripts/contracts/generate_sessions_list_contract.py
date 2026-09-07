@@ -234,10 +234,6 @@ def _check(rendered: Rendered) -> int:
         stale.append(PYTHON_METADATA_OUTPUT)
     if _current(TYPESCRIPT_OUTPUT) != rendered.typescript:
         stale.append(TYPESCRIPT_OUTPUT)
-    if _current(VALIDATOR_OUTPUT) != rendered.validator_javascript:
-        stale.append(VALIDATOR_OUTPUT)
-    if _current(VALIDATOR_DECLARATIONS_OUTPUT) != rendered.validator_declarations:
-        stale.append(VALIDATOR_DECLARATIONS_OUTPUT)
     if stale:
         for path in stale:
             print(f"stale generated sessions.list Contract artifact: {path}", file=sys.stderr)
@@ -250,8 +246,6 @@ def _write(rendered: Rendered) -> None:
         (PYTHON_OUTPUT, rendered.python),
         (PYTHON_METADATA_OUTPUT, rendered.python_metadata),
         (TYPESCRIPT_OUTPUT, rendered.typescript),
-        (VALIDATOR_OUTPUT, rendered.validator_javascript),
-        (VALIDATOR_DECLARATIONS_OUTPUT, rendered.validator_declarations),
     ):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")

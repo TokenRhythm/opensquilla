@@ -1768,7 +1768,7 @@ async def read_file(path: str, offset: int | None = None, limit: int | None = No
         },
     },
     required=["path"],
-    exposed_by_default=False,
+    default_access="deny",
     plan_access=PlanAccess.READ_ONLY,
 )
 async def read_source(path: str, start_line: int = 1, end_line: int | None = None) -> str:
@@ -2261,7 +2261,7 @@ def _resolve_scratch_write_path(path: str) -> tuple[Path, str]:
         },
     },
     required=["path", "content"],
-    exposed_by_default=False,
+    default_access="deny",
     sandbox=SandboxToolDescriptor.filesystem(
         kind="fs.write",
         argv_factory=lambda a: ("fs.write_scratch", str(a.get("path", ""))),
@@ -2327,7 +2327,7 @@ async def write_scratch(path: str, content: str) -> str:
     },
     required=["path", "content"],
     runtime_only_arguments=("approval_id",),
-    exposed_by_default=False,
+    default_access="deny",
     sandbox=SandboxToolDescriptor.filesystem(
         kind="fs.write",
         argv_factory=lambda a: ("fs.create_source", str(a.get("path", ""))),
@@ -2877,7 +2877,7 @@ async def edit_file(
     },
     required=["path", "expected_revision", "edits"],
     runtime_only_arguments=("approval_id",),
-    exposed_by_default=False,
+    default_access="deny",
     sandbox=SandboxToolDescriptor.filesystem(
         kind="fs.edit",
         argv_factory=lambda a: ("fs.edit", str(a.get("path", ""))),
@@ -3908,7 +3908,7 @@ def _source_symbol_query_matches(
         },
     },
     required=[],
-    exposed_by_default=False,
+    default_access="deny",
     plan_access=PlanAccess.READ_ONLY,
 )
 async def source_symbols(

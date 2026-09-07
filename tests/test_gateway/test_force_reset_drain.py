@@ -6,6 +6,7 @@ whether ``flush_service`` is None or wired, and regardless of the force flag.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -111,8 +112,7 @@ async def test_drain_called_when_flush_service_none():
     ctx = _make_ctx(flush_service=None, task_runtime=task_runtime)
 
     target = (
-        "opensquilla.gateway.adapters.session_reset."
-        "GatewaySessionResetPorts._quiesce_task_runtime"
+        "opensquilla.gateway.adapters.session_reset.GatewaySessionResetPorts._quiesce_task_runtime"
     )
     with patch(target, new_callable=AsyncMock) as mock_drain:
         result = await get_dispatcher().dispatch(
@@ -149,8 +149,7 @@ async def test_drain_called_with_flush_service():
     ctx = _make_ctx(flush_service=fake_flush_service, task_runtime=task_runtime)
 
     target = (
-        "opensquilla.gateway.adapters.session_reset."
-        "GatewaySessionResetPorts._quiesce_task_runtime"
+        "opensquilla.gateway.adapters.session_reset.GatewaySessionResetPorts._quiesce_task_runtime"
     )
     with patch(target, new_callable=AsyncMock) as mock_drain:
         result = await get_dispatcher().dispatch(
@@ -162,3 +161,156 @@ async def test_drain_called_with_flush_service():
 
     assert result.error is None, result.error
     mock_drain.assert_awaited_once_with(task_runtime, _SESSION_KEY)
+
+
+@pytest.mark.asyncio
+async def test_drain_failure_aborts_reset_without_rotating_session():
+    """A writer that cannot drain leaves the durable session owner unchanged."""
+    task_runtime = _make_task_runtime()
+    ctx = _make_ctx(flush_service=None, task_runtime=task_runtime)
+
+    target = (
+        "opensquilla.gateway.adapters.session_reset.GatewaySessionResetPorts._quiesce_task_runtime"
+    )
+    with patch(
+        target,
+        new_callable=AsyncMock,
+        side_effect=TimeoutError("synthetic stubborn writer"),
+    ) as mock_drain:
+        result = await get_dispatcher().dispatch(
+            "r1",
+            "sessions.reset",
+            {"key": _SESSION_KEY},
+            ctx,
+        )
+
+    assert result.ok is False
+    assert result.error is not None
+    assert result.error.code == "STORAGE_BUSY"
+    assert result.error.retryable is True
+    assert result.error.retry_after_ms == 250
+    assert result.error.details == {
+        "key": _SESSION_KEY,
+        "phase": "task_runtime_drain",
+    }
+    assert ctx.session_manager.applied_intents == []
+    current = await ctx.session_manager._storage.get_session(_SESSION_KEY)
+    assert current is not None
+    assert current.session_id == _SESSION_ID
+    mock_drain.assert_awaited_once_with(task_runtime, _SESSION_KEY)
+
+
+@pytest.mark.asyncio
+async def test_reset_holds_all_writer_fences_through_snapshot_and_rotation():
+    """The destructive window begins only after every writer has drained."""
+    order: list[str] = []
+    active_fences: set[str] = set()
+
+    @asynccontextmanager
+    async def fence(name: str, keys):
+        assert tuple(keys) == (_SESSION_KEY,)
+        order.append(f"{name}:enter")
+        active_fences.add(name)
+        try:
+            yield
+        finally:
+            active_fences.remove(name)
+            order.append(f"{name}:exit")
+
+    class _WriteLock:
+        async def __aenter__(self):
+            order.append("write:enter")
+            active_fences.add("write")
+            return self
+
+        async def __aexit__(self, *_args):
+            active_fences.remove("write")
+            order.append("write:exit")
+
+    async def drain_router(keys) -> None:
+        assert tuple(keys) == (_SESSION_KEY,)
+        assert active_fences == {"background", "runtime", "direct", "write"}
+        order.append("router:drain")
+
+    async def drain_turn(keys) -> None:
+        assert tuple(keys) == (_SESSION_KEY,)
+        assert active_fences == {"background", "runtime", "direct", "write"}
+        order.append("turn:drain")
+
+    @asynccontextmanager
+    async def runtime_fence(
+        keys,
+        *,
+        cancel_source: str,
+        cancel_reason: str,
+    ):
+        assert cancel_source == "sessions_reset"
+        assert cancel_reason == "session_reset"
+        async with fence("runtime", keys):
+            yield
+
+    task_runtime = _make_task_runtime()
+    task_runtime.quiesce_sessions = runtime_fence
+    ctx = _make_ctx(flush_service=None, task_runtime=task_runtime)
+    manager = ctx.session_manager
+    original_get_transcript = manager.get_transcript
+    original_apply_intent = manager.apply_intent
+
+    async def observed_get_transcript(key: str) -> list:
+        assert active_fences == {"background", "runtime", "direct", "write"}
+        order.append("snapshot")
+        return await original_get_transcript(key)
+
+    async def observed_apply_intent(key: str, intent: object, **kwargs):
+        assert active_fences == {"background", "runtime", "direct", "write"}
+        order.append("rotate")
+        return await original_apply_intent(key, intent, **kwargs)
+
+    manager.get_transcript = observed_get_transcript
+    manager.apply_intent = observed_apply_intent
+    ctx.turn_runner = SimpleNamespace(
+        get_session_lock=lambda _key: _WriteLock(),
+        drain_session_background_writes=drain_turn,
+    )
+
+    with (
+        patch(
+            "opensquilla.gateway.adapters.session_reset."
+            "GatewaySessionResetPorts._quiesce_task_runtime",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "opensquilla.gateway.adapters.session_reset.quiesce_background_completion_sessions",
+            side_effect=lambda keys: fence("background", keys),
+        ),
+        patch(
+            "opensquilla.gateway.adapters.session_reset.get_agent_task_registry",
+            return_value=SimpleNamespace(quiesce_sessions=lambda keys: fence("direct", keys)),
+        ),
+        patch(
+            "opensquilla.gateway.adapters.session_reset.drain_pending_flushes_for_sessions",
+            side_effect=drain_router,
+        ),
+    ):
+        result = await get_dispatcher().dispatch(
+            "r1",
+            "sessions.reset",
+            {"key": _SESSION_KEY},
+            ctx,
+        )
+
+    assert result.error is None, result.error
+    assert order == [
+        "background:enter",
+        "runtime:enter",
+        "direct:enter",
+        "write:enter",
+        "router:drain",
+        "turn:drain",
+        "snapshot",
+        "rotate",
+        "write:exit",
+        "direct:exit",
+        "runtime:exit",
+        "background:exit",
+    ]
