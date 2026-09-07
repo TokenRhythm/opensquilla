@@ -14,6 +14,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   Non-loopback request authorities remain rejected by those guards, `"*"` is
   never accepted, and existing CORS response-header behavior is unchanged.
 
+### Fixed
+
+- Aborting a turn no longer leaves an orphan task that crashes while the turn
+  generator is finalized. The gateway now closes the runner stream when the
+  consuming task exits, and the turn scope stack (process ownership, sandbox
+  policy, Git run mode, runtime pack, and managed toolchain state) tolerates
+  being unwound from a different asyncio Context, such as asyncio's
+  async-generator finalizer. Previously every `chat.abort` logged
+  `Task exception was never retrieved` with a nested
+  `ValueError: ... was created in a different Context` chain, and the
+  subscriber-visible turn-terminal event could be lost.
+
 ## [0.5.4] - 2026-08-25
 
 ### Added

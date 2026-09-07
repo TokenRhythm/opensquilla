@@ -374,6 +374,48 @@ async def test_internal_send_can_supply_trusted_background_run_kind(tmp_path: Pa
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("method", "key_field"),
+    [("chat.send", "sessionKey"), ("sessions.send", "key")],
+)
+async def test_public_send_rejects_cron_session_without_acceptance_side_effects(
+    tmp_path: Path,
+    method: str,
+    key_field: str,
+) -> None:
+    async with _open_real_stack(tmp_path / "cron-send.db") as stack:
+        cron_key = "cron:job-1:run:run-1"
+        await stack.manager.create(
+            cron_key,
+            agent_id="main",
+            display_name="Cron run",
+        )
+
+        response = await get_dispatcher().dispatch(
+            f"rpc-cron-send-{method}",
+            method,
+            {
+                key_field: cron_key,
+                "message": "unexpected follow-up",
+                "clientRequestId": f"cron-send-{method}",
+            },
+            stack.context,
+        )
+
+        assert response.ok is False
+        assert response.error is not None
+        assert response.error.code == "SESSION_NOT_INTERACTIVE"
+        assert response.error.retryable is False
+        assert response.error.accepted is False
+        assert _table_counts(stack.db_path) == {
+            "transcript_entries": 0,
+            "agent_tasks": 0,
+            "turn_ingress_receipts": 0,
+        }
+        _assert_no_runtime_acceptance_state(stack.runtime)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("message", "display_text"),
     [("/coding", "//coding"), ("//usr/bin/env", "///usr/bin/env")],
 )
