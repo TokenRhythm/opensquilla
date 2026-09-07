@@ -400,6 +400,7 @@ try {
     'cli-fail',
   ])
   await import('./test-packaged-first-send-cleanup.mjs')
+  await import('./test-session-recovery-transport-contract.mjs')
   console.log('Desktop E2E case telemetry checks passed')
 } finally {
   await rm(root, { recursive: true, force: true })

@@ -62,53 +62,27 @@ def test_fresh_release_audits_build_and_import_harness_before_installing(
     assert preparation_index < min(installer_indices)
 
 
-@pytest.mark.parametrize(
-    ("overrides", "expected_error"),
-    [
-        ({}, None),
-        ({"concurrentHistoryReads": False}, "hello must advertise concurrent history reads"),
-        ({"concurrentHistoryReads": None}, "hello must advertise concurrent history reads"),
-        ({"concurrentHistoryReads": "true"}, "hello must advertise concurrent history reads"),
-        ({"socketCount": 0}, "exactly one target WebSocket"),
-        ({"socketCount": 2}, "exactly one target WebSocket"),
-        ({"newSocketCount": 1}, "must not create a replacement WebSocket"),
-        ({"closeCount": 1}, "must not close the healthy WebSocket"),
-    ],
-)
-def test_packaged_recovery_requires_concurrent_transport_continuity(
-    overrides: dict[str, object], expected_error: str | None
-) -> None:
-    node = shutil.which("node")
-    if not node:
-        pytest.skip("Node.js is required for the packaged recovery contract")
-    contract = ROOT / "desktop/electron/scripts/session-recovery-transport-contract.mjs"
-    sample = {
-        "concurrentHistoryReads": True,
-        "socketCount": 1,
-        "newSocketCount": 0,
-        "closeCount": 0,
-        **overrides,
-    }
-    result = subprocess.run(
-        [
-            node,
-            "--input-type=module",
-            "-e",
-            f"import {{ assertConcurrentRecoveryTransport }} from {json.dumps(contract.as_uri())};"
-            f"console.log(JSON.stringify(assertConcurrentRecoveryTransport({json.dumps(sample)})));",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=10,
+def test_packaged_recovery_transport_contract_runs_in_desktop_node_ci() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
+    unit_step = next(
+        step
+        for step in workflow["jobs"]["desktop-check"]["steps"]
+        if step.get("name") == "Run desktop unit tests"
     )
-    if expected_error:
-        assert result.returncode != 0
-        assert expected_error in result.stderr
-        assert not result.stdout
-    else:
-        assert result.returncode == 0, result.stderr
-        assert json.loads(result.stdout) == sample
+    assert "node scripts/test-ci-case-telemetry.mjs" in unit_step["run"].splitlines()
+    telemetry = ROOT / "desktop/electron/scripts/test-ci-case-telemetry.mjs"
+    native_test = ROOT / "desktop/electron/scripts/test-session-recovery-transport-contract.mjs"
+    assert "await import('./test-session-recovery-transport-contract.mjs')" in telemetry.read_text(
+        encoding="utf-8"
+    )
+    assert "from './session-recovery-transport-contract.mjs'" in native_test.read_text(
+        encoding="utf-8"
+    )
+    suites = json.loads((ROOT / ".github/ci/suites.v1.json").read_text(encoding="utf-8"))
+    for suite in ("python-targeted", "release-packaging"):
+        inputs = suites["suites"][suite]["execution_inputs"]
+        assert telemetry.relative_to(ROOT).as_posix() in inputs
+        assert native_test.relative_to(ROOT).as_posix() in inputs
 
 
 @pytest.mark.parametrize(
