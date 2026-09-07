@@ -616,6 +616,15 @@ try {
     'each new-task iteration must materialize one distinct session',
   )
   reportPhase('renderer-checks-complete', { completedChatSends: rpcSendCounts.size })
+  if (extendedQuitDiagnostics) {
+    // Compare the same launch identity while Electron is still responsive.
+    // This diagnostic runs after the business timing marker and has no bearing
+    // on either renderer assertions or the later natural-exit requirement.
+    const windowsWaitChain = await captureFirstSendDiagnostic(
+      () => captureWindowsWaitChain(electronProcessIdentity), 6_000,
+    )
+    reportPhase('healthy-windows-wait-chain', { windowsWaitChain })
+  }
 } catch (error) {
   runError = error
   // Report the original failure before attempting any potentially slow cleanup.

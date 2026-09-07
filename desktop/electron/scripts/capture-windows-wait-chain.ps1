@@ -7,8 +7,9 @@ synchronous WCT calls cannot be cancelled in-process. The caller must supply the
 owned process identity recorded at launch and must terminate only this helper if
 the deadline expires.
 
-Output is JSONL containing object type/status, thread PID/TID, cycle, and control
-or API errors. Object names and raw native buffers are never read or serialized.
+Output is JSONL containing fixed diagnostic phases, elapsed milliseconds, object
+type/status, thread PID/TID, cycle, and control or API errors. Object names and
+raw native buffers are never read or serialized.
 No privileges are enabled. Flags are zero, so another process can appear as a
 terminal thread node but its wait chain is not followed. Unsupported waits may
 produce only one node; that does not establish the absence of a hang.
@@ -31,6 +32,27 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$diagnosticClock = [System.Diagnostics.Stopwatch]::StartNew()
+
+function Write-WaitChainPhase {
+    param(
+        [ValidateSet('script-start', 'identity-verified', 'threads-enumerated', 'interop-ready', 'query-start', 'query-returned', 'complete')]
+        [string]$Phase,
+        [uint32]$ThreadId = 0
+    )
+
+    # Only fixed enum strings and numbers enter this JSON. Bypass pipeline
+    # formatting and flush each line so a bounded helper can retain progress.
+    $phaseJson = '{"kind":"phase","phase":"' + $Phase + '","pid":' + $TargetPid +
+        ',"elapsedMs":' + $diagnosticClock.ElapsedMilliseconds.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+    if ($ThreadId -ne 0) {
+        $phaseJson += ',"tid":' + $ThreadId
+    }
+    [Console]::Out.WriteLine($phaseJson + '}')
+    [Console]::Out.Flush()
+}
+
+Write-WaitChainPhase 'script-start'
 
 try {
     $ownedTarget = Get-Process -Id $TargetPid -ErrorAction Stop
@@ -44,6 +66,7 @@ if ($ownedTarget.StartTime.ToUniversalTime().Ticks.ToString() -ne $ExpectedStart
     @{ kind = 'target'; pid = $TargetPid; status = 'identity-mismatch' } | ConvertTo-Json -Compress
     exit 3
 }
+Write-WaitChainPhase 'identity-verified'
 
 $ownedTids = @($ownedTarget.Threads | ForEach-Object { [uint32]$_.Id })
 if ($TargetTid -ne 0) {
@@ -58,6 +81,7 @@ if ($TargetTid -ne 0) {
     }
     $ownedTids = @($TargetTid)
 }
+Write-WaitChainPhase 'threads-enumerated'
 
 Add-Type -TypeDefinition @'
 using System;
@@ -134,9 +158,12 @@ public static class WaitChainMetadata
     }
 }
 '@
+Write-WaitChainPhase 'interop-ready'
 
 foreach ($ownedTid in ($ownedTids | Select-Object -First 64)) {
+    Write-WaitChainPhase 'query-start' $ownedTid
     $metadataJson = [WaitChainMetadata]::Query($ownedTid)
+    Write-WaitChainPhase 'query-returned' $ownedTid
     try {
         $currentTarget = Get-Process -Id $TargetPid -ErrorAction Stop
     }
@@ -159,5 +186,7 @@ foreach ($ownedTid in ($ownedTids | Select-Object -First 64)) {
         } | ConvertTo-Json -Compress
         exit 7
     }
-    $metadataJson
+    [Console]::Out.WriteLine($metadataJson)
+    [Console]::Out.Flush()
 }
+Write-WaitChainPhase 'complete'

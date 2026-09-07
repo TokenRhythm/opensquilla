@@ -3,6 +3,11 @@ import { fileURLToPath } from 'node:url'
 
 const WAIT_CHAIN_HELPER = fileURLToPath(new URL('./capture-windows-wait-chain.ps1', import.meta.url))
 const MAX_OUTPUT_BYTES = 64 * 1024
+const MAX_OUTPUT_LINES = 256
+const PHASES = new Set([
+  'script-start', 'identity-verified', 'threads-enumerated', 'interop-ready',
+  'query-start', 'query-returned', 'complete',
+])
 const TARGET_STATUSES = new Set([
   'not-found', 'identity-mismatch', 'thread-not-in-target', 'exited-during-query',
   'identity-changed-during-query', 'thread-identity-changed',
@@ -23,7 +28,7 @@ async function runHelper(args, timeoutMs) {
     const child = spawn('pwsh.exe', ['-NoProfile', '-NonInteractive', ...args], {
       windowsHide: true, env, stdio: ['ignore', 'pipe', 'pipe'],
     })
-    let stdout = ''
+    const stdoutChunks = []
     let stdoutBytes = 0
     let stderrBytes = 0
     let status = null
@@ -46,7 +51,7 @@ async function runHelper(args, timeoutMs) {
         helperExitObserved: exitObserved,
         stdoutBytes, stderrBytes,
         // Callers must validate and reconstruct this; never emit raw output.
-        stdout,
+        stdout: Buffer.concat(stdoutChunks).toString('utf8'),
       })
     }
     const stop = reason => {
@@ -57,9 +62,10 @@ async function runHelper(args, timeoutMs) {
     }
     const timer = setTimeout(() => stop('timeout'), timeoutMs)
     child.stdout.on('data', chunk => {
+      const remainingBytes = Math.max(0, MAX_OUTPUT_BYTES - stdoutBytes - stderrBytes)
+      if (remainingBytes > 0) stdoutChunks.push(chunk.subarray(0, remainingBytes))
       stdoutBytes += chunk.length
       if (stdoutBytes + stderrBytes > MAX_OUTPUT_BYTES) stop('output-limit')
-      else stdout += chunk.toString('utf8')
     })
     child.stderr.on('data', chunk => {
       stderrBytes += chunk.length
@@ -87,7 +93,19 @@ export async function captureWindowsProcessStart(pid, { timeoutMs = 2_000 } = {}
   }
 }
 
-function sanitizeRecord(record) {
+function sanitizeRecord(record, expectedPid) {
+  if (record?.kind === 'phase') {
+    if (!PHASES.has(record.phase) || record.pid !== expectedPid
+      || !Number.isSafeInteger(record.elapsedMs) || record.elapsedMs < 0
+      || (record.tid !== undefined && !isPid(record.tid))
+      || (record.phase.startsWith('query-') && !isPid(record.tid))) {
+      throw new Error('phase')
+    }
+    return {
+      kind: 'phase', phase: record.phase, pid: record.pid, elapsedMs: record.elapsedMs,
+      ...(record.tid === undefined ? {} : { tid: record.tid }),
+    }
+  }
   if (record?.kind === 'target' && isPid(record.pid) && TARGET_STATUSES.has(record.status)) {
     return {
       kind: 'target', pid: record.pid, status: record.status,
@@ -117,6 +135,35 @@ function sanitizeRecord(record) {
   }
 }
 
+function parseRecords(stdout, helperStatus, expectedPid) {
+  const lines = stdout.split(/\r?\n/)
+  const tail = lines.pop()
+  const interrupted = !['complete', 'exit-error'].includes(helperStatus)
+  // A killed helper may have been partway through a JSON write. Only complete
+  // lines are evidence in that case, even if the tail happens to parse as JSON.
+  const discardedTailLines = interrupted && tail ? 1 : 0
+  if (!interrupted && tail) lines.push(tail)
+  const completeLines = lines.filter(line => line.trim())
+  const records = []
+  let invalidLines = 0
+  for (const line of completeLines.slice(0, MAX_OUTPUT_LINES)) {
+    try {
+      records.push(sanitizeRecord(JSON.parse(line), expectedPid))
+    } catch {
+      invalidLines += 1
+    }
+  }
+  const excessLines = Math.max(0, completeLines.length - MAX_OUTPUT_LINES)
+  const parseStatus = excessLines ? 'record-limit'
+    : invalidLines ? 'invalid-record'
+      : discardedTailLines ? 'incomplete-tail'
+        : records.length ? 'complete' : 'empty'
+  return {
+    records,
+    outputParse: { status: parseStatus, invalidLines, discardedTailLines, excessLines },
+  }
+}
+
 export async function captureWindowsWaitChain(identity, {
   timeoutMs = 5_000,
   helperPath = WAIT_CHAIN_HELPER,
@@ -130,12 +177,8 @@ export async function captureWindowsWaitChain(identity, {
     '-TargetPid', String(identity.electronPid),
     '-ExpectedStartTicks', identity.windowsStartTimeTicks,
   ], timeoutMs)
-  if (!['complete', 'exit-error'].includes(result.status)) return result
-  try {
-    const lines = stdout.trim().split(/\r?\n/).filter(Boolean)
-    if (!lines.length || lines.length > 65) throw new Error('record count')
-    return { ...result, records: lines.map(line => sanitizeRecord(JSON.parse(line))) }
-  } catch {
-    return { ...result, status: 'invalid-output' }
-  }
+  const parsed = parseRecords(stdout, result.status, identity.electronPid)
+  const invalidOutput = ['complete', 'exit-error'].includes(result.status)
+    && parsed.outputParse.status !== 'complete'
+  return { ...result, ...(invalidOutput ? { status: 'invalid-output' } : {}), ...parsed }
 }

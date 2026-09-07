@@ -91,13 +91,15 @@ try {
     const targetIdentity = { electronPid: target.child.pid, windowsStartTimeTicks: nativeIdentity.startTicks }
     const nativeChain = await captureWindowsWaitChain(targetIdentity)
     assert.equal(nativeChain.status, 'complete')
-    assert.ok(nativeChain.records.length > 0)
+    assert.ok(nativeChain.records.some(record => !record.kind
+      && (Array.isArray(record.nodes) || Number.isSafeInteger(record.error))),
+    'phase markers alone do not establish that a native query returned')
     const missing = await captureWindowsWaitChain({ ...targetIdentity, electronPid: 2147483647 })
-    assert.equal(missing.records[0].status, 'not-found')
+    assert.equal(missing.records.find(record => record.kind === 'target').status, 'not-found')
     const mismatch = await captureWindowsWaitChain({
       ...targetIdentity, windowsStartTimeTicks: String(BigInt(nativeIdentity.startTicks) + 1n),
     })
-    assert.equal(mismatch.records[0].status, 'identity-mismatch')
+    assert.equal(mismatch.records.find(record => record.kind === 'target').status, 'identity-mismatch')
     const fixtureDirectory = await mkdtemp(join(tmpdir(), 'opensquilla-wct-test-'))
     const fixturePath = join(fixtureDirectory, 'helper.ps1')
     try {
@@ -107,11 +109,55 @@ try {
       assert.equal(stalled.helperExitObserved, true)
       await assertProcessExited(stalled.helperPid)
       assert.equal(target.child.exitCode, null, 'WCT containment must never terminate the target')
-      await writeFile(fixturePath, "param($TargetPid,$ExpectedStartTicks)\n[Console]::Out.Write('x' * 70000)\nStart-Sleep -Seconds 60\n")
+      const phase = { kind: 'phase', phase: 'query-start', pid: target.child.pid, tid: 123, elapsedMs: 0 }
+      const chain = { tid: 123, cycle: false, nodes: [{ type: 3, status: 6 }] }
+      const safePrefix = `param($TargetPid,$ExpectedStartTicks)
+[Console]::Out.WriteLine('${JSON.stringify({ ...phase, objectName: 'synthetic-not-to-emit' })}')
+[Console]::Out.WriteLine('${JSON.stringify({ ...chain, nodes: [{ ...chain.nodes[0], objectName: 'synthetic-not-to-emit' }] })}')
+`
+      await writeFile(fixturePath, `${safePrefix}
+[Console]::Error.WriteLine('synthetic-stderr-not-to-emit')
+[Console]::Out.Write('{"kind":"phase","phase":"query-ret')
+[Console]::Out.Flush()
+Start-Sleep -Seconds 60
+`)
+      const partial = await captureWindowsWaitChain(targetIdentity, { helperPath: fixturePath })
+      assert.equal(partial.status, 'timeout', 'partial records must never promote timeout to success')
+      assert.equal(partial.helperExitObserved, true)
+      assert.deepEqual(partial.records, [phase, chain])
+      assert.deepEqual(partial.outputParse, {
+        status: 'incomplete-tail', invalidLines: 0, discardedTailLines: 1, excessLines: 0,
+      })
+      assert.equal(JSON.stringify(partial).includes('synthetic-'), false)
+      assert.equal(Object.hasOwn(partial, 'stdout'), false)
+      assert.equal(Object.hasOwn(partial, 'stderr'), false)
+      await assertProcessExited(partial.helperPid)
+      assert.equal(target.child.exitCode, null, 'partial WCT timeout must leave the target alive')
+      await writeFile(fixturePath, `${safePrefix}
+[Console]::Out.WriteLine('complete-invalid-json')
+[Console]::Out.Write('x' * 70000)
+Start-Sleep -Seconds 60
+`)
       const oversized = await captureWindowsWaitChain(targetIdentity, { helperPath: fixturePath })
       assert.equal(oversized.status, 'output-limit')
+      assert.deepEqual(oversized.records, [phase, chain])
+      assert.deepEqual(oversized.outputParse, {
+        status: 'invalid-record', invalidLines: 1, discardedTailLines: 1, excessLines: 0,
+      })
       assert.equal(Object.hasOwn(oversized, 'stdout'), false)
+      assert.equal(JSON.stringify(oversized).includes('synthetic-'), false)
+      assert.equal(oversized.helperExitObserved, true)
       await assertProcessExited(oversized.helperPid)
+      assert.equal(target.child.exitCode, null, 'output containment must leave the target alive')
+      await writeFile(fixturePath, `${safePrefix}
+[Console]::Out.WriteLine('{"kind":"phase","phase":"unknown","pid":${target.child.pid},"elapsedMs":0}')
+`)
+      const invalidPhase = await captureWindowsWaitChain(targetIdentity, { helperPath: fixturePath })
+      assert.equal(invalidPhase.status, 'invalid-output', 'a complete invalid line must not look successful')
+      assert.deepEqual(invalidPhase.records, [phase, chain])
+      assert.deepEqual(invalidPhase.outputParse, {
+        status: 'invalid-record', invalidLines: 1, discardedTailLines: 0, excessLines: 0,
+      })
       await writeFile(fixturePath, `param($TargetPid,$ExpectedStartTicks)
 [Console]::Out.WriteLine('{"tid":123,"cycle":false,"nodes":[{"type":3,"status":6,"objectName":"synthetic-not-to-emit"}]}')
 `)
