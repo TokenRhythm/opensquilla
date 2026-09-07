@@ -2934,7 +2934,7 @@ def test_desktop_renderer_logging_is_trusted_bounded_and_lifecycle_aware() -> No
         "function currentMainWindow(): BrowserWindow | null",
     )
 
-    assert "details.frame !== window.webContents.mainFrame" in create_window
+    assert "if (!isLiveMainFrameConsoleMessage(window, details)) return" in create_window
     assert "new RendererConsoleLogLimiter()" in create_window
     assert "app.getPath('home')" in create_window
     assert "webContents.on('render-process-gone'" in create_window

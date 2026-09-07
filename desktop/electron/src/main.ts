@@ -133,6 +133,7 @@ import {
 import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
 import {
   buildRendererConsoleLogEntry,
+  isLiveMainFrameConsoleMessage,
   buildRendererGoneLogEntry,
   buildRendererStateLogEntry,
   RendererConsoleLogLimiter,
@@ -8924,7 +8925,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
   // folder without a reproduction. Only the trusted main frame is accepted: an
   // artifact or other child frame must not be able to write to the lifecycle log.
   window.webContents.on('console-message', (details) => {
-    if (details.frame !== window.webContents.mainFrame) return
+    if (!isLiveMainFrameConsoleMessage(window, details)) return
     const entry = buildRendererConsoleLogEntry({
       level: details.level,
       message: details.message,
@@ -14048,11 +14049,8 @@ app.on('before-quit', (event) => {
     void drain.then((exited) => {
       if (exited) {
         setAppExitPhase('committed', 'all lifecycle-owned Gateways exited')
-        desktopLog('quit_commit_step', { step: 'exit-phase-set', pid: process.pid })
         destroyWindowsTray()
-        desktopLog('quit_commit_step', { step: 'tray-destroyed', pid: process.pid })
         void desktopArtifactBridgeLoopback.close()
-        desktopLog('quit_commit_step', { step: 'app-exit-requested', pid: process.pid })
         app.exit(0)
         return
       }
