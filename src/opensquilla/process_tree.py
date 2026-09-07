@@ -36,6 +36,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from opensquilla.asyncio_utils import reset_contextvar_token
 from opensquilla.private_paths import (
     _WindowsPrivateDaclVerificationError,
     apply_windows_private_dacl,
@@ -235,7 +236,7 @@ def task_process_scope(
     try:
         yield
     finally:
-        _CURRENT_TASK_PROCESS_SCOPE.reset(token)
+        reset_contextvar_token(_CURRENT_TASK_PROCESS_SCOPE, token)
 
 
 def _current_task_process_scope() -> _TaskProcessScope | None:
