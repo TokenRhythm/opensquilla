@@ -3602,6 +3602,7 @@
     "provenance": {
       "cron": "定时",
       "scheduled": "定时任务",
+      "scheduledTrigger": "定时触发",
       "cronSource": "由 {tool} 定时触发"
     },
     "sandboxSetup": {

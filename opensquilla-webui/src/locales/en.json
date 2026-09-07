@@ -3602,6 +3602,7 @@
     "provenance": {
       "cron": "Cron",
       "scheduled": "Scheduled",
+      "scheduledTrigger": "Scheduled trigger",
       "cronSource": "Scheduled by {tool}"
     },
     "sandboxSetup": {

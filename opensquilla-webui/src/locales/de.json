@@ -3512,6 +3512,7 @@
     "provenance": {
       "cron": "Cron",
       "scheduled": "Geplant",
+      "scheduledTrigger": "Geplante Auslösung",
       "cronSource": "Geplant von {tool}"
     },
     "sandboxSetup": {

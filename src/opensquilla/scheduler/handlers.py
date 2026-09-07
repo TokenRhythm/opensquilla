@@ -391,6 +391,11 @@ def make_agent_run_handler(
                     session_key,
                     role="user",
                     content=task,
+                    provenance={
+                        "kind": "cron",
+                        "source_session_key": session_key,
+                        "source_tool": f"cron:{job.id}",
+                    },
                     **append_kwargs,
                 )
                 if _persisted is not None and isinstance(_persisted.content, str):

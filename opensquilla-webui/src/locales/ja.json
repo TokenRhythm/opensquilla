@@ -3512,6 +3512,7 @@
     "provenance": {
       "cron": "Cron",
       "scheduled": "スケジュール実行",
+      "scheduledTrigger": "スケジュールによる開始",
       "cronSource": "{tool} によるスケジュール実行"
     },
     "sandboxSetup": {
