@@ -17,6 +17,7 @@ import { SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD } from '@/contracts/generated/v4/s
 import {
   SessionReadContractError,
   SessionReadFailure,
+  SessionReadHistoryCursorError,
   SessionReadSessionMissingError,
 } from '@/modules/sessionReadLifecycle'
 import { createV4SessionReadPort } from './sessionReadPortV4'
@@ -359,6 +360,21 @@ describe('v4 SessionReadPort Adapter', () => {
       kind: 'unavailable',
       retryable: true,
     } satisfies Partial<SessionReadFailure>)
+  })
+
+  it.each([
+    ['HISTORY_CURSOR_INVALID', 'invalid'],
+    ['history_cursor_invalidated', 'stale'],
+  ] as const)('maps %s to reload-latest cursor recovery', (code, reason) => {
+    const cause = Object.assign(new Error('cursor rejected'), { code })
+
+    expect(mapSessionReadError(cause)).toMatchObject({
+      name: 'SessionReadHistoryCursorError',
+      code: 'history-cursor-rejected',
+      reason,
+      recovery: 'reload-latest',
+      cause,
+    } satisfies Partial<SessionReadHistoryCursorError>)
   })
 
   it('queues critical frames in order while live, metadata and history settle independently', async () => {
