@@ -1,0 +1,97 @@
+name: Sync to Gitee
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "**"
+  release:
+    types: [published]
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run git push --dry-run without changing Gitee"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-to-gitee
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: https://github.com/opensquilla/opensquilla.git
+  GITEE_REPO: git@gitee.com:opensquilla/opensquilla.git
+
+jobs:
+  mirror:
+    name: Mirror Git refs and LFS
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check mirror secret
+        id: secret
+        env:
+          GITEE_SSH_PRIVATE_KEY: ${{ secrets.GITEE_SSH_PRIVATE_KEY }}
+        run: |
+          if [ -z "$GITEE_SSH_PRIVATE_KEY" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::GITEE_SSH_PRIVATE_KEY is not configured; skipping Gitee mirror sync."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Git LFS
+        if: steps.secret.outputs.configured == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-lfs
+          git lfs install --skip-repo
+
+      - name: Configure SSH for Gitee
+        if: steps.secret.outputs.configured == 'true'
+        env:
+          GITEE_SSH_PRIVATE_KEY: ${{ secrets.GITEE_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$GITEE_SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan gitee.com >> ~/.ssh/known_hosts
+
+      - name: Mirror repository to Gitee
+        if: steps.secret.outputs.configured == 'true'
+        env:
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          GIT_SSH_COMMAND: ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o StrictHostKeyChecking=yes
+        run: |
+          set -euo pipefail
+          git clone --mirror "$SOURCE_REPO" repo.git
+          cd repo.git
+          git remote add gitee "$GITEE_REPO"
+          git lfs fetch --all origin
+
+          if [ "$DRY_RUN" = "true" ]; then
+            git push --mirror --dry-run gitee
+            git lfs push --all --dry-run gitee
+          else
+            git push --mirror gitee
+            git lfs push --all gitee
+          fi
+
+      - name: Verify Gitee HEAD
+        if: steps.secret.outputs.configured == 'true'
+        env:
+          GIT_SSH_COMMAND: ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o StrictHostKeyChecking=yes
+        run: |
+          set -euo pipefail
+          git ls-remote "$GITEE_REPO" HEAD
