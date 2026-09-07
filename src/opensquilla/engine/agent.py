@@ -23182,6 +23182,8 @@ class Agent:
             )
         else:
             self._tool_failure_loop_counts.pop(failure_signature, None)
+            if tc.tool_name == "tool_search":
+                self._sync_progressive_tool_definitions()
             if tc.tool_name in {
                 "apply_patch",
                 "background_process",
@@ -23194,6 +23196,30 @@ class Agent:
             }:
                 self._tool_failure_loop_counts.clear()
         return result
+
+    def _sync_progressive_tool_definitions(self) -> None:
+        """Expose successful tool_search matches on the next provider call."""
+
+        ctx = self._tool_context
+        registry = self._tool_registry
+        if ctx is None or registry is None or not ctx.disclosed_tool_names:
+            return
+        authorized = ctx.authorized_tool_names or frozenset()
+        existing = {definition.name for definition in self.tool_definitions}
+        requested = set(ctx.disclosed_tool_names) & set(authorized) - existing
+        if not requested:
+            return
+        definitions = {
+            definition.name: definition
+            for definition in registry.to_tool_definitions(ctx)
+            if definition.name in requested
+        }
+        for name in sorted(requested):
+            definition = definitions.get(name)
+            if definition is None:
+                continue
+            self.tool_definitions.append(definition)
+            self._tool_definition_by_name[name] = definition
 
     def _matched_meta_skill_name_from_metadata(self) -> str | None:
         metadata = self.config.metadata or {}
@@ -24722,6 +24748,14 @@ class Agent:
             call_kind="subagent.chat",
         )
         parent_ctx = current_tool_context.get() or self._tool_context
+        parent_authorized_tool_names = getattr(
+            parent_ctx,
+            "authorized_tool_names",
+            None,
+        )
+        parent_disclosed_tool_names = set(
+            getattr(parent_ctx, "disclosed_tool_names", set()) or set()
+        )
         parent_run_context = getattr(parent_ctx, "sandbox_run_context", None)
         if isinstance(parent_run_context, RunContext):
             parent_run_context = run_context_for_subagent(parent_run_context)
@@ -24795,6 +24829,12 @@ class Agent:
             channel_id=f"subagent:{parent_session_key}",
             sender_id=parent_session_key,
             denied_tools=set(SUBAGENT_TOOL_DENY),
+            allowed_tools=(
+                set(parent_authorized_tool_names)
+                if parent_authorized_tool_names is not None
+                else None
+            ),
+            disclosed_tool_names=parent_disclosed_tool_names - set(SUBAGENT_TOOL_DENY),
             run_mode=parent_run_mode,
             sandbox_mounts=parent_sandbox_mounts,
             sandbox_run_context=parent_run_context,
@@ -24817,6 +24857,18 @@ class Agent:
                 else None
             ),
         )
+        if self._tool_registry is not None and parent_authorized_tool_names is not None:
+            from opensquilla.tools.filter import filter_tools
+
+            child_authorized_definitions = filter_tools(
+                self._tool_registry.to_tool_definitions(subagent_ctx),
+                allow=subagent_ctx.allowed_tools,
+                deny=subagent_ctx.denied_tools,
+            )
+            filtered_defs = self._tool_registry.to_model_tool_definitions(
+                child_authorized_definitions,
+                subagent_ctx,
+            )
         self._prepare_subagent_execution_task(
             spec,
             execution_id=child_execution_id,
@@ -25006,6 +25058,7 @@ class Agent:
             tool_definitions=filtered_defs,
             tool_handler=_subagent_tool_handler,
             subagent_manager=SubagentManager(spawn_depth=depth),
+            tool_registry=self._tool_registry,
             tool_context=subagent_ctx,
             usage_event_sink=self._usage_event_sink,
             usage_execution_context=child_usage_context,
