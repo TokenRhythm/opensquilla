@@ -70,6 +70,8 @@ def _default_aux(
         flush_workspace_dir="/tmp/flush",
         tool_result_store_dir="/tmp/tool-results",
         tool_result_store_session_id="session-test",
+        tool_result_history_projection_enabled=False,
+        tool_result_history_projection_keep_recent_turns=3,
         flush_enabled=True,
         flush_triggers=["session_reset", "manual", "idle", "pre_compaction"],
         flush_pre_compaction=True,

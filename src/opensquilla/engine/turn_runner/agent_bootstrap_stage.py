@@ -448,6 +448,8 @@ class _AgentConfigAuxiliaries:
     compaction_heartbeat_interval_seconds: float
     # Agent-token-cfg-derived
     tool_result_projection_max_inline_chars: int
+    tool_result_history_projection_enabled: bool
+    tool_result_history_projection_keep_recent_turns: int
     tool_result_fresh_diagnostic_policy_enabled: bool
     tool_result_diagnostic_retrieval_gate_enabled: bool
     tool_result_fresh_diagnostic_inline_max_chars: int
@@ -1081,6 +1083,18 @@ class AgentBootstrapStage:
             model_vision_support=catalog.vision_support,
             thinking=aux.thinking,
             tool_result_projection_max_inline_chars=(aux.tool_result_projection_max_inline_chars),
+            tool_result_history_projection_enabled=(
+                _bool_from_env(
+                    "OPENSQUILLA_TOOL_RESULT_HISTORY_PROJECTION_ENABLED",
+                    aux.tool_result_history_projection_enabled,
+                )
+            ),
+            tool_result_history_projection_keep_recent_turns=(
+                _nonnegative_int_from_env(
+                    "OPENSQUILLA_TOOL_RESULT_HISTORY_PROJECTION_KEEP_RECENT_TURNS",
+                    aux.tool_result_history_projection_keep_recent_turns,
+                )
+            ),
             tool_result_fresh_diagnostic_policy_enabled=(
                 _bool_from_env(
                     "OPENSQUILLA_TOOL_RESULT_FRESH_DIAGNOSTIC_POLICY_ENABLED",
