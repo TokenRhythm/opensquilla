@@ -954,7 +954,7 @@ class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):
             text_only_tool_recovery_mode=getattr(
                 runner._config,
                 "text_only_tool_recovery_mode",
-                "off",
+                "warn_model",
             ),
             finalize_evidence_gate=bool(
                 getattr(

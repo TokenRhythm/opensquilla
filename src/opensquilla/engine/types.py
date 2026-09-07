@@ -998,7 +998,7 @@ class AgentConfig:
     source_diff_candidate_mode: Literal["off", "log", "warn_model"] = "log"
     runtime_state_capsule_mode: Literal["off", "log", "inject"] = "off"
     post_tool_empty_recovery_mode: Literal["off", "log", "warn_model"] = "log"
-    text_only_tool_recovery_mode: Literal["off", "log", "warn_model"] = "off"
+    text_only_tool_recovery_mode: Literal["off", "log", "warn_model"] = "warn_model"
     reasoning_prefill_recovery_mode: Literal["off", "log", "recover"] = "log"
     runtime_events_path: str | None = None
     tool_result_store_dir: str | None = None

@@ -2741,9 +2741,9 @@ class GatewayConfig(BaseSettings):
     # coding turns. ``log`` records telemetry only; ``inject`` adds it to the
     # provider request view.
     runtime_state_capsule_mode: Literal["off", "log", "inject"] = "off"
-    # Text-only tool recovery is an opt-in guard for tool-capable turns where
-    # a model emits prose instead of a tool call.
-    text_only_tool_recovery_mode: Literal["off", "log", "warn_model"] = "off"
+    # Recover a concrete next-action promise that contains no corresponding
+    # tool call. Explicit "off" keeps the legacy stop-on-text behavior.
+    text_only_tool_recovery_mode: Literal["off", "log", "warn_model"] = "warn_model"
     # Provider request timeout (single LLM HTTP/streaming request).
     llm_request_timeout_seconds: float = 120.0
     # Agent stream liveness events. The heartbeat interval only affects

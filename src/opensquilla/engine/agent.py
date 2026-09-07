@@ -443,11 +443,43 @@ _PROVIDER_OUTPUT_CONTINUE_PROMPT = (
 _TEXT_ONLY_TOOL_RECOVERY_LIMIT = 2
 _TEXT_ONLY_TOOL_RECOVERY_MESSAGE = (
     "[Runtime recovery]\n"
-    "Previous assistant turn had text only and no tool calls. If the task still "
-    "requires repo inspection, editing, or verification, call the appropriate tool "
-    "now; if complete, answer briefly."
+    "The previous assistant message described a next action but did not call a tool. "
+    "If that action is still required, call the appropriate tool now; if it is already "
+    "complete, answer briefly with the evidence."
+)
+_ENGLISH_FOLLOW_UP_ACTION = re.compile(
+    r"\b(?:"
+    r"i(?:'ll| will| am going to| need to| should)|let me|"
+    r"(?:now|next|then)[,:]?\s+(?:i(?:'ll| will| am going to)|let me|let's)"
+    r")\s+(?!not\b|never\b)"
+    r"(?:(?:now|next|then|immediately|first|just)\s+)*"
+    r"(?:apply|build|call|change|check|commit|configure|create|delete|deploy|"
+    r"download|edit|execute|fetch|fix|inspect|install|launch|merge|open|push|"
+    r"remove|restart|run|send|start|stop|test|update|upload|verify|write)\b",
+    re.IGNORECASE,
+)
+_CHINESE_FOLLOW_UP_ACTION = re.compile(
+    r"(?:我(?:会|将|要|准备|打算|需要|应该)|现在|接下来|下一步|然后|随后|马上|立即)"
+    r"(?![^。！？\n]{0,24}(?:不会|不能|不再|无需|无须))"
+    r"[^。！？\n]{0,100}"
+    r"(?:启动|运行|执行|创建|写入|编辑|修改|更新|修复|删除|安装|配置|部署|"
+    r"重启|停止|测试|验证|检查|查看|打开|获取|下载|上传|发送|应用|构建|提交|"
+    r"推送|合并|调用|继续处理)",
 )
 _PLAN_RUN_RECONCILIATION_LIMIT = 1
+
+
+def _promises_follow_up_action(text: str) -> bool:
+    """Recognize a concrete next-action promise in the response tail."""
+
+    tail = (text or "").strip()[-1_000:]
+    return bool(
+        tail
+        and (
+            _ENGLISH_FOLLOW_UP_ACTION.search(tail)
+            or _CHINESE_FOLLOW_UP_ACTION.search(tail)
+        )
+    )
 
 
 def _plan_run_steps_ready_for_delivery(run: Any) -> bool:
@@ -13653,7 +13685,7 @@ class Agent:
                         text_only_mode = getattr(
                             self.config,
                             "text_only_tool_recovery_mode",
-                            "off",
+                            "warn_model",
                         )
                         self.config.metadata[
                             "text_only_tool_recovery_next_action_errors"
@@ -13780,7 +13812,7 @@ class Agent:
                     text_only_mode = getattr(
                         self.config,
                         "text_only_tool_recovery_mode",
-                        "off",
+                        "warn_model",
                     )
                     next_action = (
                         "tool_call"
@@ -14259,7 +14291,7 @@ class Agent:
                     text_only_mode = getattr(
                         self.config,
                         "text_only_tool_recovery_mode",
-                        "off",
+                        "warn_model",
                     )
                     tool_choice_none = (
                         isinstance(call_chat_cfg.tool_choice, str)
@@ -14268,9 +14300,9 @@ class Agent:
                     text_only_candidate = (
                         text_only_mode != "off"
                         and bool(visible_text.strip())
+                        and _promises_follow_up_action(visible_text)
                         and bool(provider_tools_for_call)
                         and not tool_choice_none
-                        and not last_executed_results
                         and not max_iterations_finalization_pending
                         and not artifact_delivery_final_response_pending
                         and not post_write_convergence_finalization_pending
@@ -14302,6 +14334,7 @@ class Agent:
                             details={
                                 "visible_text_chars": len(visible_text),
                                 "available_tool_count": len(provider_tools_for_call or []),
+                                "prior_tool_result_count": len(last_executed_results),
                                 "recovery_injections": text_only_tool_recovery_injections,
                                 "limit": _TEXT_ONLY_TOOL_RECOVERY_LIMIT,
                             },
@@ -14337,8 +14370,8 @@ class Agent:
                             yield WarningEvent(
                                 code="text_only_tool_recovery",
                                 message=(
-                                    "The model returned text without a tool call; "
-                                    "asking it to call tools if the task is not complete."
+                                    "The model described a next action without calling a tool; "
+                                    "asking it to perform or close that action."
                                 ),
                             )
                             continue

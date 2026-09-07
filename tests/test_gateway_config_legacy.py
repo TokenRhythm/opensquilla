@@ -672,3 +672,7 @@ def test_gateway_config_accepts_text_only_tool_recovery_mode() -> None:
     cfg = GatewayConfig.model_validate({"text_only_tool_recovery_mode": "warn_model"})
 
     assert cfg.text_only_tool_recovery_mode == "warn_model"
+
+
+def test_gateway_config_enables_bounded_action_promise_recovery_by_default() -> None:
+    assert GatewayConfig().text_only_tool_recovery_mode == "warn_model"
