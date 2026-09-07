@@ -1,0 +1,1 @@
+"""Offline Gateway integration fixtures."""

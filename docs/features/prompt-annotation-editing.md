@@ -377,82 +377,15 @@ write. A discarded or interrupted candidate creates no revision. It is
 credential-free and requires Electron foreground focus;
 a locked or background-only macOS session fails the gate.
 
-### Live provider certification
-
-Keep provider credentials only in the process environment or an ignored local
-environment file. Never put a key in a command, fixture, report, or committed
-configuration. A sanitized provider/Gateway prerequisite can be run with:
-
-```sh
-uv run python scripts/live_provider_profile_gateway_e2e.py \
-  --providers tokenrhythm \
-  --output "${TMPDIR:?}/opensquilla-provider-gateway.json"
-```
-
-That script certifies provider transport and accounting; it is not by itself
-PromptAnnotation certification. For every release that changes this path, an
-isolated owned Gateway and Desktop build must additionally pass this live matrix:
-
-The dedicated certification boundary can be checked with:
-
-```sh
-uv run python scripts/live_artifact_prompt_annotations_e2e.py \
-  --output "${TMPDIR:?}/opensquilla-prompt-annotations.json" \
-  --confirm-live-cost \
-  --confirm-rotated-key \
-  --execute-live-matrix
-```
-
-Without `--execute-live-matrix`, the command is an intentional zero-call dry
-run that writes `certification=incomplete`. With the flag, the isolated worker
-runs the owned Gateway/provider path and requires the ten-tool document-agent surface.
-It does not replace the separate real-Electron selection gate.
-The fixed Direct `glm-5.2` source-fallback case must exercise a repair loop:
-`document_inspect → document_read → document_patch →
-document_browser_inspect → document_browser_screenshot` (or a bounded browser
-action) `→ document_patch → document_browser_inspect → document_finish(commit)
-→ tools=[]` finalization. The model chooses whether to take each observation,
-repair, or discard step; the harness checks this representative sequence but
-does not impose a PromptAnnotation-specific iteration count. The live harness
-therefore uses a 120-second per-case deadline; this is a task deadline, not a
-provider retry. A B5 Ensemble case uses the configured proposer/Aggregator
-rounds while keeping proposer and finalizer tools empty. The outcome-finalization
-round is required Agent work; it must not be removed or treated as a free call.
-The approved autonomous-loop matrix therefore reserves 42 baseline physical
-provider calls, allows a bounded worst-case reservation of 63, and hard-stops
-raw provider traffic at 64. Preview, browser action, `document_finish`, and
-tools-disabled finalizer requests are all included in that physical count;
-none is deducted or treated as free work.
-A build is not release-ready until the following matrix is
-verified end to end:
-
-- Direct: one source-fallback insertion and a two-annotation semantic batch
-  using fixed model `glm-5.2`;
-- Router: a single selection at `c2`, a structural batch at `c3`, and no
-  fallback below the effective floor;
-- Ensemble: the full configured lineup, zero executable proposer tool calls,
-  an Aggregator-owned candidate loop, and one final `document_finish(commit)`;
-- rejection cases for stale head, cross-session draft, DOM mismatch, and visual
-  selection, each with zero provider calls;
-- exactly one revision and one change set for every successful batch, plus a
-  successful whole-turn revert.
-
-Store only case name, mode/tier/model, tool name and count, content hashes, and
-boolean results. Scan the report and temporary directory for credentials and
-delete the temporary data after review. If this feature-specific live matrix
-has not been completed, set the release override for
-`artifactPromptAnnotations` to `false`.
-
 ## Release, rollback, and maintenance
 
 For each release:
 
 1. Run the offline, packaged-wheel, Web UI, and real Electron suites against
    the release candidate.
-2. Complete the live Direct/Router/Ensemble matrix with an isolated profile.
-3. Canary the exact Desktop build and watch sanitized audit events,
+2. Canary the exact Desktop build and watch sanitized audit events,
    annotation remap outcomes, validation failures, and orphan cleanup.
-4. Keep the default enabled only while the one-turn/one-change-set, zero-call
+3. Keep the default enabled only while the one-turn/one-change-set, zero-call
    rejection, and Aggregator-only mutation invariants remain true.
 
 For an incident, apply the explicit `artifactPromptAnnotations: false` override

@@ -1,23 +1,7 @@
-#!/usr/bin/env python3
-"""Fail-closed live certification harness for prompt-driven HTML edits.
-
-The worker owns an isolated Gateway and an authenticated, typed Desktop bridge
-fixture.  It exercises the real PromptAnnotation RPC ingress and shared turn
-runtime; the bridge fixture certifies only the Gateway/provider path and does
-not replace the separate real-Electron E2E gate.
-
-The worker receives the rotated credential only as ``TOKENRHYTHM_API_KEY``.
-Prompts, responses, annotation bodies, runtime identifiers, paths, bridge
-tokens, and raw traces remain inside its 0700 temporary tree and are never part
-of the 0600 public report.  Certification covers the three V1 zero-call
-preflights plus the Direct, Router, and Ensemble mutation matrix.  Product
-feature defaults are recorded as release evidence but do not change the live
-provider result.
-"""
+"""Loopback-only Gateway and Desktop bridge fixtures for offline Workbench tests."""
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import base64
 import hashlib
@@ -27,9 +11,9 @@ import json
 import os
 import re
 import secrets
+import socket
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import urllib.error
@@ -38,55 +22,55 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Literal
+from urllib.parse import urlsplit
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+from opensquilla.artifact_session.html_anchors import canonical_selection_proofs
+from opensquilla.artifacts import ArtifactStore
+from opensquilla.gateway_client import GatewayRPCClient, GatewayRPCError
+from opensquilla.subprocess_encoding import apply_utf8_child_env
+from scripts.live_harness_security import child_environment, provider_secret_names
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
 SRC_DIR = REPO_ROOT / "src"
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
 
-from opensquilla.artifact_session.html_anchors import (  # noqa: E402
-    canonical_selection_proofs,
-)
-from opensquilla.artifacts import ArtifactStore  # noqa: E402
-from opensquilla.gateway_client import GatewayRPCClient, GatewayRPCError  # noqa: E402
-from opensquilla.subprocess_encoding import apply_utf8_child_env  # noqa: E402
-from scripts.live_harness_security import (  # noqa: E402
-    child_environment,
-    classify_failure,
-    is_temporary_report_path,
-    provider_secret_names,
-    registry_endpoint,
-    report_contains_secret,
-    sanitize_report,
-    scan_and_remove_temporary_tree,
-    write_safe_report,
-)
-from scripts.smoke_v4_phase3_router import (  # noqa: E402
-    _free_port,
-    _read_turn_call_records,
-    _stop_gateway,
-    _wait_for_gateway_health,
-)
 
 PROVIDER_ID = "tokenrhythm"
+
+
 KEY_ENV = "TOKENRHYTHM_API_KEY"
+
+
 BASE_URL_ENV = "TOKENRHYTHM_BASE_URL"
+
+
 DESKTOP_BRIDGE_URL_ENV = "OPENSQUILLA_DESKTOP_ARTIFACT_BRIDGE_URL"
+
+
 DESKTOP_BRIDGE_TOKEN_ENV = "OPENSQUILLA_DESKTOP_ARTIFACT_BRIDGE_TOKEN"
+
+
 DESKTOP_BRIDGE_VERSION = 3
+
+
 DESKTOP_BRIDGE_V4_VERSION = 4
+
+
 DESKTOP_BRIDGE_V5_VERSION = 5
 
+
 DIRECT_MODEL = "glm-5.2"
+
+
 ROUTER_MODELS = {
     "c0": "deepseek-v4-flash",
     "c1": "deepseek-v4-pro",
     "c2": "kimi-k2.7-code",
     "c3": "glm-5.2",
 }
+
 
 _FIXTURE_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><style>
@@ -97,12 +81,20 @@ _FIXTURE_HTML = """<!doctype html>
 <button id="btn-confirm" class="btn-primary">Confirm</button>
 <button id="btn-reset" class="btn-outline">Reset</button>
 </main></body></html>"""
+
+
 _TITLE_TEXT = "PromptAnnotation applied"
+
+
 _SINGLE_ANNOTATION_BODY = (
     "Set only this selected button's inline background-color to #ef4444. "
     "Preserve its id, class list, text, and every other element."
 )
+
+
 _SOURCE_PATCH_INSERTION = '<span id="reset-status" role="status">Ready</span>'
+
+
 _SOURCE_PATCH_ANNOTATION_BODY = (
     "Exercise the autonomous candidate-repair loop using separate model iterations. First "
     "inspect the bound Document, then read its source. Stage a provisional source patch that "
@@ -113,14 +105,20 @@ _SOURCE_PATCH_ANNOTATION_BODY = (
     "Preserve the selected button and every other existing byte. Call only one tool per model "
     "response in this certification flow."
 )
+
+
 _TITLE_ANNOTATION_BODY = (
     f"Replace only this selected heading's text with {_TITLE_TEXT!r}. "
     "Preserve its tag and attributes."
 )
+
+
 _TURN_PROMPT = (
     "Apply every attached artifact annotation safely. Verify the bound preview, repair if needed, "
     "then explicitly commit or discard the candidate."
 )
+
+
 _ELEMENT_PATHS = {
     "title": json.dumps(
         [["", "html", 1], ["", "body", 1], ["", "main", 1], ["", "h1", 1]],
@@ -132,30 +130,9 @@ _ELEMENT_PATHS = {
     ),
 }
 
-# The six annotation cases use raw provider-request accounting. Preview
-# inspection, screenshot/action, repair, explicit finish, and the tools=[]
-# finalizer are all physical requests and must never be deducted from the
-# matrix budget.
-# Each full B5 Ensemble case needs one five-member fusion round,
-# then four stateful primary-aggregator continuations that reuse the admitted
-# proposer evidence. A single
-# controlled scenario retry plus bounded in-place transient retries may consume
-# at most sixteen extra requests; one additional full Ensemble tool round is
-# five requests. Sixty-four remains an absolute guardrail, not a target.
-EXPECTED_PHYSICAL_CALLS = 42
-TRANSIENT_RETRY_ALLOWANCE = 16
-ENSEMBLE_EXTRA_TOOL_ROUND_ALLOWANCE = 5
-WORST_CASE_PHYSICAL_CALLS = 63
+
 HARD_PHYSICAL_CALL_CAP = 64
 
-# A mutation case may legitimately consume its full request/turn deadline, and
-# the six provider-backed cases run sequentially.  Keep that deadline separate
-# from the parent process guard so a healthy matrix is not terminated merely
-# because its cumulative latency exceeds one case timeout.
-DEFAULT_MATRIX_TIMEOUT_SECONDS = 600.0
-MIN_MATRIX_TIMEOUT_SECONDS = 300.0
-MAX_MATRIX_TIMEOUT_SECONDS = 900.0
-DEFAULT_CASE_TIMEOUT_SECONDS = 120.0
 
 _ANNOTATION_TOOLS = (
     "document_apply",
@@ -169,63 +146,11 @@ _ANNOTATION_TOOLS = (
     "document_patch",
     "document_read",
 )
-_REPORT_KEYS = frozenset(
-    {
-        "schemaVersion",
-        "certification",
-        "provider",
-        "featureDefaultEnabled",
-        "featureDefaults",
-        "physicalCallBudget",
-        "securityChecks",
-        "cases",
-        "reasonCodes",
-    }
-)
-_BUDGET_KEYS = frozenset(
-    {"expected", "retryAllowance", "ensembleExtraAllowance", "worstCase", "hardCap", "observed"}
-)
-_SECURITY_KEYS = frozenset(
-    {
-        "isolatedChildEnvironment",
-        "registryEndpointPinned",
-        "rawPayloadPersistenceDisabled",
-        "syntheticBridgeAuthenticated",
-        "temporaryTreeMode",
-        "reportMode",
-    }
-)
-_CASE_KEYS = frozenset(
-    {
-        "case",
-        "mode",
-        "tier",
-        "modelSlot",
-        "expectedTools",
-        "expectedPhysicalCalls",
-        "observedPhysicalCalls",
-        "providerCalls",
-        "loopContinuationCalls",
-        "providerCalled",
-        "beforeHashVerified",
-        "afterHashVerified",
-        "singleRevisionVerified",
-        "singleChangeSetVerified",
-        "acceptedAnnotationsVerified",
-        "modeVerified",
-        "routerTierVerified",
-        "observedTools",
-        "writerCalls",
-        "writerAttempts",
-        "proposerToolCalls",
-        "aggregatorToolsVerified",
-        "revertVerified",
-        "passed",
-        "status",
-        "reasonCode",
-    }
-)
+
+
 _ALLOWED_TOOLS = frozenset(_ANNOTATION_TOOLS)
+
+
 _WINDOWS_PROCESS_ENV_ALLOWLIST = frozenset(
     {
         "ALLUSERSPROFILE",
@@ -247,24 +172,6 @@ _WINDOWS_PROCESS_ENV_ALLOWLIST = frozenset(
         "USERNAME",
     }
 )
-_ALLOWED_STATUSES = frozenset({"not_run", "passed", "failed"})
-_ALLOWED_REASON_CODES = frozenset(
-    {
-        "artifact_invariant_failed",
-        "gateway_setup_failed",
-        "live_gateway_executor_failed",
-        "none",
-        "physical_call_accounting_ambiguous",
-        "preflight_rejection_mismatch",
-        "provider_projection_failed",
-        "routing_evidence_failed",
-        "tool_boundary_failed",
-    }
-)
-_FEATURE_DEFAULT_FALSE_RE = {
-    "artifactPromptAnnotations": re.compile(r"artifactPromptAnnotations\s*:\s*false\b"),
-    "documentWorkbenchResources": re.compile(r"documentWorkbenchResources\s*:\s*false\b"),
-}
 
 
 @dataclass(frozen=True)
@@ -291,123 +198,10 @@ SCENARIOS = (
 )
 
 
-def _expected_writer_name(scenario: Scenario) -> str:
-    return "document_patch" if scenario.case == "direct_single_annotation" else "document_apply"
-
-
 def _expected_writer_calls(scenario: Scenario) -> int:
     """The source-fallback fixture deliberately stages one repair candidate."""
 
     return 2 if scenario.case == "direct_single_annotation" else 1
-
-
-def _assert_scenario_plan() -> None:
-    cases = [scenario.case for scenario in SCENARIOS]
-    if len(cases) != len(set(cases)):
-        raise RuntimeError("live certification cases must be unique")
-    if sum(scenario.expected_physical_calls for scenario in SCENARIOS) != EXPECTED_PHYSICAL_CALLS:
-        raise RuntimeError("live certification expected-call plan changed")
-    if (
-        EXPECTED_PHYSICAL_CALLS
-        + TRANSIENT_RETRY_ALLOWANCE
-        + ENSEMBLE_EXTRA_TOOL_ROUND_ALLOWANCE
-        != WORST_CASE_PHYSICAL_CALLS
-    ):
-        raise RuntimeError("live certification worst-case budget changed")
-    if WORST_CASE_PHYSICAL_CALLS >= HARD_PHYSICAL_CALL_CAP:
-        # Leave at least one request of headroom without allowing it to be used.
-        if WORST_CASE_PHYSICAL_CALLS != HARD_PHYSICAL_CALL_CAP - 1:
-            raise RuntimeError("live certification hard-call guard changed")
-
-
-@dataclass
-class PhysicalCallBudget:
-    """Case-level reservation for every physical provider request.
-
-    A live case is admitted only after its configured maximum has been
-    reserved.  Gateway limits then make that reservation a real upper bound;
-    raw traces reconcile the number actually started after the turn. Browser,
-    finish, and finalizer requests are included in this reservation;
-    ``loopContinuationCalls`` is diagnostic evidence only.
-    """
-
-    hard_cap: int = HARD_PHYSICAL_CALL_CAP
-    baseline_used: int = 0
-    retry_used: int = 0
-    ensemble_extra_used: int = 0
-    baseline_reserved: int = 0
-    retry_reserved: int = 0
-    ensemble_extra_reserved: int = 0
-
-    def __post_init__(self) -> None:
-        if not WORST_CASE_PHYSICAL_CALLS <= self.hard_cap <= HARD_PHYSICAL_CALL_CAP:
-            raise ValueError(
-                f"physical call cap must be between {WORST_CASE_PHYSICAL_CALLS} "
-                f"and {HARD_PHYSICAL_CALL_CAP}"
-            )
-
-    @property
-    def observed(self) -> int:
-        return self.baseline_used + self.retry_used + self.ensemble_extra_used
-
-    def ensure_full_matrix_fits(self) -> None:
-        if WORST_CASE_PHYSICAL_CALLS > self.hard_cap:
-            raise RuntimeError("insufficient physical-call budget for the remaining matrix")
-
-    @property
-    def reserved(self) -> int:
-        return self.baseline_reserved + self.retry_reserved + self.ensemble_extra_reserved
-
-    def reserve(
-        self,
-        kind: Literal["baseline", "retry", "ensemble_extra"],
-        count: int,
-    ) -> None:
-        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
-            raise ValueError("physical call reservation must be a positive integer")
-        limits = {
-            "baseline": EXPECTED_PHYSICAL_CALLS,
-            "retry": TRANSIENT_RETRY_ALLOWANCE,
-            "ensemble_extra": ENSEMBLE_EXTRA_TOOL_ROUND_ALLOWANCE,
-        }
-        field_names = {
-            "baseline": "baseline_reserved",
-            "retry": "retry_reserved",
-            "ensemble_extra": "ensemble_extra_reserved",
-        }
-        field_name = field_names[kind]
-        updated = getattr(self, field_name) + count
-        if updated > limits[kind] or self.reserved + count > self.hard_cap:
-            raise RuntimeError("physical-call hard cap or reservation allowance exceeded")
-        setattr(self, field_name, updated)
-
-    def claim(
-        self,
-        kind: Literal["baseline", "retry", "ensemble_extra"],
-        count: int = 1,
-    ) -> None:
-        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
-            raise ValueError("physical call count must be a positive integer")
-        limits = {
-            "baseline": EXPECTED_PHYSICAL_CALLS,
-            "retry": TRANSIENT_RETRY_ALLOWANCE,
-            "ensemble_extra": ENSEMBLE_EXTRA_TOOL_ROUND_ALLOWANCE,
-        }
-        field_names = {
-            "baseline": "baseline_used",
-            "retry": "retry_used",
-            "ensemble_extra": "ensemble_extra_used",
-        }
-        field_name = field_names[kind]
-        updated = getattr(self, field_name) + count
-        reserved = getattr(self, field_name.replace("_used", "_reserved"))
-        if (
-            updated > limits[kind]
-            or updated > reserved
-            or self.observed + count > self.hard_cap
-        ):
-            raise RuntimeError("physical-call hard cap or allowance exceeded")
-        setattr(self, field_name, updated)
 
 
 @dataclass(frozen=True, slots=True)
@@ -434,33 +228,11 @@ class CaseEvidence:
     reason_code: str = "live_gateway_executor_failed"
 
 
-class CertificationDriver(Protocol):
-    async def start(self) -> None: ...
-
-    async def run_case(self, scenario: Scenario) -> CaseEvidence: ...
-
-    async def close(self) -> None: ...
-
-
-def _feature_defaults() -> dict[str, bool]:
-    source = (REPO_ROOT / "opensquilla-webui" / "src" / "stores" / "app.ts").read_text(
-        encoding="utf-8"
-    )
-    # Missing or non-literal defaults are reported as enabled. Record each
-    # default independently so the release state remains visible without
-    # coupling it to live-provider certification.
-    return {
-        name: pattern.search(source) is None
-        for name, pattern in _FEATURE_DEFAULT_FALSE_RE.items()
-    }
-
-def _worker_environment(api_key: str) -> dict[str, str]:
-    if not api_key.strip():
-        raise ValueError("rotated TokenRhythm key is required")
+def _worker_environment() -> dict[str, str]:
     env: dict[str, str] = dict(
         child_environment(
             PROVIDER_ID,
-            {KEY_ENV: api_key},
+            {KEY_ENV: "synthetic-key-for-loopback-provider-only"},
             base_environment=os.environ,
         )
     )
@@ -549,340 +321,6 @@ def _wait_for_router_preload(
             return f"owned Gateway exited before router preload (exit={return_code})"
         time.sleep(0.1)
     return "owned Gateway router preload did not finish before timeout"
-
-
-def _case_payload(scenario: Scenario, evidence: CaseEvidence | None = None) -> dict[str, Any]:
-    observed = evidence if evidence is not None else CaseEvidence(status="not_run")
-    provider_calls = observed.provider_calls or observed.observed_physical_calls
-    return {
-        "case": scenario.case,
-        "mode": scenario.mode,
-        "tier": scenario.tier,
-        "modelSlot": scenario.model_slot,
-        "expectedTools": list(scenario.expected_tools),
-        "expectedPhysicalCalls": scenario.expected_physical_calls,
-        "observedPhysicalCalls": observed.observed_physical_calls,
-        "providerCalls": provider_calls,
-        "loopContinuationCalls": observed.loop_continuation_calls,
-        "providerCalled": observed.provider_called,
-        "beforeHashVerified": observed.before_hash_verified,
-        "afterHashVerified": observed.after_hash_verified,
-        "singleRevisionVerified": observed.single_revision_verified,
-        "singleChangeSetVerified": observed.single_change_set_verified,
-        "acceptedAnnotationsVerified": observed.accepted_annotations_verified,
-        "modeVerified": observed.mode_verified,
-        "routerTierVerified": observed.router_tier_verified,
-        "observedTools": list(observed.observed_tools),
-        "writerCalls": observed.writer_calls,
-        "writerAttempts": observed.writer_attempts,
-        "proposerToolCalls": observed.proposer_tool_calls,
-        "aggregatorToolsVerified": observed.aggregator_tools_verified,
-        "revertVerified": observed.revert_verified,
-        "passed": observed.passed,
-        "status": observed.status,
-        "reasonCode": observed.reason_code,
-    }
-
-
-def _report(
-    *,
-    hard_cap: int,
-    evidences: Mapping[str, CaseEvidence] | None = None,
-) -> dict[str, Any]:
-    _assert_scenario_plan()
-    evidence_by_case = dict(evidences or {})
-    feature_defaults = _feature_defaults()
-    rows = [
-        _case_payload(scenario, evidence_by_case.get(scenario.case))
-        for scenario in SCENARIOS
-    ]
-    observed_calls = sum(int(row["observedPhysicalCalls"]) for row in rows)
-    reason_codes = sorted(
-        {
-            str(row["reasonCode"])
-            for row in rows
-            if row["reasonCode"] != "none"
-        }
-    )
-    complete = bool(
-        len(evidence_by_case) == len(SCENARIOS)
-        and all(row["passed"] is True for row in rows)
-    )
-    return {
-        "schemaVersion": 1,
-        "certification": "complete" if complete else "incomplete",
-        "provider": PROVIDER_ID,
-        "featureDefaultEnabled": any(feature_defaults.values()),
-        "featureDefaults": feature_defaults,
-        "physicalCallBudget": {
-            "expected": EXPECTED_PHYSICAL_CALLS,
-            "retryAllowance": TRANSIENT_RETRY_ALLOWANCE,
-            "ensembleExtraAllowance": ENSEMBLE_EXTRA_TOOL_ROUND_ALLOWANCE,
-            "worstCase": WORST_CASE_PHYSICAL_CALLS,
-            "hardCap": hard_cap,
-            "observed": observed_calls,
-        },
-        "securityChecks": {
-            "isolatedChildEnvironment": True,
-            "registryEndpointPinned": True,
-            "rawPayloadPersistenceDisabled": True,
-            "syntheticBridgeAuthenticated": True,
-            "temporaryTreeMode": "0700",
-            "reportMode": "0600",
-        },
-        "cases": rows,
-        "reasonCodes": reason_codes,
-    }
-
-
-def _incomplete_report(*, hard_cap: int) -> dict[str, Any]:
-    """Return the fail-closed pre-execution report used by validation tests."""
-
-    return _report(hard_cap=hard_cap)
-
-
-async def _run_certification(
-    driver: CertificationDriver,
-    *,
-    hard_cap: int,
-) -> dict[str, Any]:
-    """Run the finite matrix with case-level call reservations.
-
-    No retry is implicit here.  A future controlled retry must reserve from
-    the dedicated allowance before invoking the driver again.
-    """
-
-    budget = PhysicalCallBudget(hard_cap=hard_cap)
-    budget.ensure_full_matrix_fits()
-    evidences: dict[str, CaseEvidence] = {}
-    provider_calls_observed = 0
-    try:
-        await driver.start()
-        for scenario in SCENARIOS:
-            if scenario.expected_physical_calls:
-                budget.reserve("baseline", scenario.expected_physical_calls)
-            evidence = await driver.run_case(scenario)
-            provider_calls_observed += evidence.provider_calls or evidence.observed_physical_calls
-            if provider_calls_observed > hard_cap:
-                raise RuntimeError("live certification exceeded its raw provider-call hard cap")
-            if evidence.observed_physical_calls > scenario.expected_physical_calls:
-                raise RuntimeError("live case exceeded its reserved physical-call budget")
-            if evidence.observed_physical_calls:
-                budget.claim("baseline", evidence.observed_physical_calls)
-            evidences[scenario.case] = evidence
-    finally:
-        await driver.close()
-    report = _report(hard_cap=hard_cap, evidences=evidences)
-    if report["physicalCallBudget"]["observed"] != budget.observed:
-        raise RuntimeError("live certification call evidence did not reconcile")
-    reported_provider_calls = sum(
-        int(row.get("providerCalls") or 0) for row in report["cases"]
-    )
-    if reported_provider_calls > hard_cap:
-        raise RuntimeError("live certification raw provider-call evidence exceeded its cap")
-    return report
-
-
-def _assert_report_safe(report: Any, secrets: Mapping[str, str]) -> None:
-    if not isinstance(report, dict) or set(report) != _REPORT_KEYS:
-        raise RuntimeError("live certification report has an invalid top-level schema")
-    if report.get("schemaVersion") != 1 or report.get("provider") != PROVIDER_ID:
-        raise RuntimeError("live certification report has an invalid identity")
-    if report.get("certification") not in {"complete", "incomplete"}:
-        raise RuntimeError("live certification report has an invalid status")
-    if not isinstance(report.get("featureDefaultEnabled"), bool):
-        raise RuntimeError("live certification feature-default evidence is invalid")
-    feature_defaults = report.get("featureDefaults")
-    if (
-        not isinstance(feature_defaults, dict)
-        or set(feature_defaults) != set(_FEATURE_DEFAULT_FALSE_RE)
-        or any(not isinstance(value, bool) for value in feature_defaults.values())
-        or report["featureDefaultEnabled"] != any(feature_defaults.values())
-    ):
-        raise RuntimeError("live certification feature-default gates are invalid")
-
-    budget = report.get("physicalCallBudget")
-    if not isinstance(budget, dict) or set(budget) != _BUDGET_KEYS:
-        raise RuntimeError("live certification report has an invalid budget schema")
-    if any(isinstance(value, bool) or not isinstance(value, int) for value in budget.values()):
-        raise RuntimeError("live certification budget values must be integers")
-    if budget["hardCap"] > HARD_PHYSICAL_CALL_CAP or budget["observed"] > budget["hardCap"]:
-        raise RuntimeError("live certification report exceeds its physical-call cap")
-    if (
-        budget["expected"] != EXPECTED_PHYSICAL_CALLS
-        or budget["worstCase"] != WORST_CASE_PHYSICAL_CALLS
-    ):
-        raise RuntimeError("live certification report changed the approved call budget")
-
-    security = report.get("securityChecks")
-    if not isinstance(security, dict) or set(security) != _SECURITY_KEYS:
-        raise RuntimeError("live certification report has an invalid security schema")
-    if security.get("temporaryTreeMode") != "0700" or security.get("reportMode") != "0600":
-        raise RuntimeError("live certification report has unsafe filesystem modes")
-    if not all(
-        security.get(name) is True
-        for name in (
-            "isolatedChildEnvironment",
-            "registryEndpointPinned",
-            "rawPayloadPersistenceDisabled",
-            "syntheticBridgeAuthenticated",
-        )
-    ):
-        raise RuntimeError("live certification security evidence is incomplete")
-
-    cases = report.get("cases")
-    if not isinstance(cases, list) or len(cases) != len(SCENARIOS):
-        raise RuntimeError("live certification report has an invalid case matrix")
-    expected_cases = {scenario.case: scenario for scenario in SCENARIOS}
-    observed_calls = 0
-    observed_provider_calls = 0
-    for row in cases:
-        if not isinstance(row, dict) or set(row) != _CASE_KEYS:
-            raise RuntimeError("live certification case has an invalid schema")
-        case_name = row.get("case")
-        if not isinstance(case_name, str):
-            raise RuntimeError("live certification case identity is invalid")
-        scenario = expected_cases.get(case_name)
-        if scenario is None or row.get("mode") != scenario.mode or row.get("tier") != scenario.tier:
-            raise RuntimeError("live certification case identity is invalid")
-        if row.get("modelSlot") != scenario.model_slot:
-            raise RuntimeError("live certification model slot is invalid")
-        if row.get("expectedTools") != list(scenario.expected_tools) or any(
-            tool not in _ALLOWED_TOOLS for tool in row.get("expectedTools", [])
-        ):
-            raise RuntimeError("live certification tool evidence is invalid")
-        if row.get("expectedPhysicalCalls") != scenario.expected_physical_calls:
-            raise RuntimeError("live certification expected-call evidence is invalid")
-        physical_calls = row.get("observedPhysicalCalls")
-        provider_calls = row.get("providerCalls")
-        loop_calls = row.get("loopContinuationCalls")
-        if (
-            isinstance(physical_calls, bool)
-            or not isinstance(physical_calls, int)
-            or physical_calls < 0
-            or physical_calls > scenario.expected_physical_calls
-        ):
-            raise RuntimeError("live certification observed-call evidence is invalid")
-        if (
-            isinstance(provider_calls, bool)
-            or not isinstance(provider_calls, int)
-            or provider_calls != physical_calls
-            or isinstance(loop_calls, bool)
-            or not isinstance(loop_calls, int)
-            or not 0 <= loop_calls <= provider_calls
-        ):
-            raise RuntimeError("live certification provider-call evidence is invalid")
-        if row.get("providerCalled") is not (physical_calls > 0):
-            raise RuntimeError("live certification provider-call evidence is inconsistent")
-        observed_calls += physical_calls
-        observed_provider_calls += provider_calls
-        for field in (
-            "providerCalled",
-            "beforeHashVerified",
-            "afterHashVerified",
-            "singleRevisionVerified",
-            "singleChangeSetVerified",
-            "acceptedAnnotationsVerified",
-            "modeVerified",
-            "routerTierVerified",
-            "aggregatorToolsVerified",
-            "revertVerified",
-            "passed",
-        ):
-            if not isinstance(row.get(field), bool):
-                raise RuntimeError("live certification boolean evidence is invalid")
-        observed_tools = row.get("observedTools")
-        if (
-            not isinstance(observed_tools, list)
-            or any(
-                not isinstance(tool, str) or tool not in _ALLOWED_TOOLS
-                for tool in observed_tools
-            )
-            or observed_tools != sorted(set(observed_tools))
-        ):
-            raise RuntimeError("live certification observed tools are invalid")
-        for field in (
-            "writerCalls",
-            "writerAttempts",
-            "proposerToolCalls",
-        ):
-            value = row.get(field)
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise RuntimeError("live certification count evidence is invalid")
-        if row.get("status") not in _ALLOWED_STATUSES:
-            raise RuntimeError("live certification case status is invalid")
-        if row.get("reasonCode") not in _ALLOWED_REASON_CODES:
-            raise RuntimeError("live certification case reason is invalid")
-        if scenario.zero_call_preflight and (
-            physical_calls != 0 or row.get("providerCalled") is not False
-        ):
-            raise RuntimeError("zero-call preflight contacted a provider")
-        if row.get("passed") is True and row.get("status") != "passed":
-            raise RuntimeError("passed case must have passed status")
-        if row.get("status") == "passed" and row.get("passed") is not True:
-            raise RuntimeError("passed status requires complete passing evidence")
-        if row.get("status") == "failed" and row.get("reasonCode") == "none":
-            raise RuntimeError("failed case must include a bounded reason")
-        if row.get("passed") is True:
-            if scenario.zero_call_preflight:
-                if not all(
-                    row.get(field) is True
-                    for field in (
-                        "beforeHashVerified",
-                        "modeVerified",
-                        "routerTierVerified",
-                    )
-                ):
-                    raise RuntimeError("passed preflight lacks required evidence")
-            elif (
-                physical_calls != scenario.expected_physical_calls
-                or row.get("providerCalled") is not True
-                or not all(
-                    row.get(field) is True
-                    for field in (
-                        "beforeHashVerified",
-                        "afterHashVerified",
-                        "singleRevisionVerified",
-                        "singleChangeSetVerified",
-                        "acceptedAnnotationsVerified",
-                        "modeVerified",
-                        "routerTierVerified",
-                        "aggregatorToolsVerified",
-                        "revertVerified",
-                    )
-                )
-                or row.get("writerCalls") != _expected_writer_calls(scenario)
-                or row.get("writerAttempts") != _expected_writer_calls(scenario)
-                or row.get("proposerToolCalls") != 0
-                or _expected_writer_name(scenario) not in observed_tools
-                or row.get("reasonCode") != "none"
-            ):
-                raise RuntimeError("passed mutation lacks required certification evidence")
-
-    if observed_calls != budget["observed"]:
-        raise RuntimeError("live certification physical-call accounting does not reconcile")
-    if observed_provider_calls > budget["hardCap"]:
-        raise RuntimeError("live certification raw provider-call evidence exceeds its cap")
-    evidence_complete = all(row.get("passed") is True for row in cases)
-    expected_certification = "complete" if evidence_complete else "incomplete"
-    if report["certification"] != expected_certification:
-        raise RuntimeError("live certification status is inconsistent with case evidence")
-    reasons = report.get("reasonCodes")
-    if not isinstance(reasons, list) or any(
-        reason not in _ALLOWED_REASON_CODES for reason in reasons
-    ):
-        raise RuntimeError("live certification reason codes are invalid")
-    expected_reasons = sorted(
-        {
-            str(row["reasonCode"])
-            for row in cases
-            if row["reasonCode"] != "none"
-        }
-    )
-    if reasons != expected_reasons:
-        raise RuntimeError("live certification reason summary is inconsistent")
-    if report_contains_secret(report, secrets):
-        raise RuntimeError("credential detected in live certification report")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1714,7 +1152,7 @@ def _write_gateway_config(
     allow_local_test_model_overrides: bool = False,
     preload_router: bool = True,
 ) -> None:
-    """Write the finite live-gate profile without embedding credentials."""
+    """Write an isolated profile for the loopback provider fixture."""
 
     lines = [
         'host = "127.0.0.1"',
@@ -1743,7 +1181,7 @@ def _write_gateway_config(
         "persist_transcripts = true",
         "",
         "[tools]",
-        # The live gate deliberately starts from the broad owner profile.  The
+        # The fixture starts from the broad owner profile.  The
         # PromptAnnotation exclusive ceiling must still surface the complete
         # ten-tool document-agent surface in every tool-enabled request and at
         # dispatch.
@@ -1753,8 +1191,8 @@ def _write_gateway_config(
         'source = "state"',
         "",
         "[naming]",
-        # Auxiliary auto-title requests are outside the approved 42-call turn
-        # matrix and must never consume the live credential.
+        # Auxiliary auto-title requests would add unrelated provider work
+        # to the deterministic mutation trace.
         "enabled = false",
         "",
         "[model_catalog]",
@@ -1826,31 +1264,34 @@ def _source_proofs(source: str, element_path: str) -> tuple[str, str]:
 
 
 class GatewayCertificationDriver:
-    """Owned-Gateway executor for the real PromptAnnotation live matrix.
+    """Run offline document scenarios through an owned loopback Gateway.
 
-    Construction and import are side-effect free.  Network-capable work starts
-    only when the private worker explicitly calls :meth:`start`; the public CLI
-    requires ``--execute-live-matrix`` in addition to the cost/key attestations.
-    Tests may pin ``provider_endpoint`` to a local fake server without weakening
-    the worker's official-registry endpoint policy.
+    The provider endpoint is checked before any bridge or Gateway starts.
+    Only a fixed synthetic provider credential enters the isolated child.
     """
 
     def __init__(
         self,
         *,
         temp_root: Path,
-        api_key: str,
         timeout_seconds: float,
         provider_endpoint: str,
         allow_local_test_model_overrides: bool = False,
         preload_router: bool = True,
     ) -> None:
-        if allow_local_test_model_overrides and not provider_endpoint.startswith(
-            ("http://127.0.0.1:", "http://localhost:")
+        endpoint = urlsplit(provider_endpoint)
+        if (
+            endpoint.scheme != "http"
+            or endpoint.hostname != "127.0.0.1"
+            or endpoint.port is None
+            or endpoint.path != "/v1"
+            or endpoint.username is not None
+            or endpoint.password is not None
+            or endpoint.query
+            or endpoint.fragment
         ):
-            raise ValueError("test model capability overrides require a loopback provider")
+            raise ValueError("offline Workbench tests require an IPv4 loopback provider")
         self.temp_root = temp_root
-        self.api_key = api_key
         self.timeout_seconds = timeout_seconds
         self.provider_endpoint = provider_endpoint
         self.allow_local_test_model_overrides = allow_local_test_model_overrides
@@ -1891,7 +1332,7 @@ class GatewayCertificationDriver:
             allow_local_test_model_overrides=self.allow_local_test_model_overrides,
             preload_router=self.preload_router,
         )
-        env = _worker_environment(self.api_key)
+        env = _worker_environment()
         _apply_isolated_home_environment(env, self.user_state_dir)
         env.update(bridge_environment)
         env["OPENSQUILLA_DESKTOP"] = "1"
@@ -1952,7 +1393,6 @@ class GatewayCertificationDriver:
                     stream_tails.append(f"{label}={tail}")
             diagnostic = "; ".join((error, *stream_tails))
             for secret in (
-                self.api_key,
                 bridge_environment.get(DESKTOP_BRIDGE_TOKEN_ENV, ""),
             ):
                 if secret:
@@ -2122,7 +1562,7 @@ class GatewayCertificationDriver:
                 if match is not None and match.get("status") not in {"queued", "running"}:
                     return match
             await asyncio.sleep(0.25)
-        raise TimeoutError("owned Gateway task did not finish before the live-case deadline")
+        raise TimeoutError("owned Gateway task did not finish before the offline-case deadline")
 
     def _session_trace(self, session_key: str) -> list[Mapping[str, Any]]:
         return _records_for_session(_read_turn_call_records(self.turn_log_dir), session_key)
@@ -2444,233 +1884,60 @@ class GatewayCertificationDriver:
         return await self._run_mutation_case(scenario)
 
 
-def _worker_main(
-    *,
-    hard_cap: int,
-    timeout_seconds: float = 120.0,
-    execute_live_matrix: bool = False,
-) -> int:
-    api_key = os.environ.get(KEY_ENV, "").strip()
-    if not api_key:
-        return 2
-    if any(
-        os.environ.get(name)
-        for name in provider_secret_names()
-        if name != KEY_ENV
-    ):
-        return 2
-    if os.environ.get(BASE_URL_ENV):
-        return 2
-    endpoint = registry_endpoint(PROVIDER_ID)
-    if execute_live_matrix:
-        driver = GatewayCertificationDriver(
-            temp_root=Path.cwd(),
-            api_key=api_key,
-            timeout_seconds=timeout_seconds,
-            provider_endpoint=endpoint,
-        )
-        report = asyncio.run(_run_certification(driver, hard_cap=hard_cap))
-    else:
-        report = _incomplete_report(hard_cap=hard_cap)
-    _assert_report_safe(report, {KEY_ENV: api_key})
-    # stdout is a private 0600 file owned by the parent. No raw model or
-    # artifact data is ever emitted by this scaffold.
-    print(json.dumps(report, ensure_ascii=False, separators=(",", ":")))
-    return 0
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
-def _launch_worker(
-    *,
-    api_key: str,
-    hard_cap: int,
-    timeout_seconds: float,
-    matrix_timeout_seconds: float = DEFAULT_MATRIX_TIMEOUT_SECONDS,
-    execute_live_matrix: bool = False,
-) -> dict[str, Any]:
-    if not MIN_MATRIX_TIMEOUT_SECONDS <= matrix_timeout_seconds <= MAX_MATRIX_TIMEOUT_SECONDS:
-        raise ValueError(
-            "matrix timeout must remain within the bounded certification window"
-        )
-    temp_root = Path(
-        tempfile.mkdtemp(prefix="opensquilla-artifact-prompt-annotations-e2e-")
-    )
-    os.chmod(temp_root, 0o700)
-    stdout_path = temp_root / "worker.stdout.json"
-    stderr_path = temp_root / "worker.stderr.log"
-    stdout_path.touch(mode=0o600)
-    stderr_path.touch(mode=0o600)
-    os.chmod(stdout_path, 0o600)
-    os.chmod(stderr_path, 0o600)
-    worker_home = temp_root / "user-state"
-    worker_home.mkdir(mode=0o700)
-    worker_environment = _worker_environment(api_key)
-    _apply_isolated_home_environment(worker_environment, worker_home)
-    secrets = {KEY_ENV: api_key}
-    try:
-        with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open(
-            "w", encoding="utf-8"
-        ) as stderr:
-            command = [
-                sys.executable,
-                str(Path(__file__).resolve()),
-                "--_worker",
-                "--physical-call-cap",
-                str(hard_cap),
-                "--timeout-seconds",
-                str(timeout_seconds),
-            ]
-            if execute_live_matrix:
-                command.append("--_execute-live-matrix")
-            completed = subprocess.run(
-                command,
-                cwd=temp_root,
-                env=worker_environment,
-                stdout=stdout,
-                stderr=stderr,
-                text=True,
-                timeout=matrix_timeout_seconds,
-                check=False,
-            )
-        if completed.returncode != 0:
-            raise RuntimeError("isolated live certification worker failed")
-        report = json.loads(stdout_path.read_text(encoding="utf-8"))
-        if not isinstance(report, dict):
-            raise RuntimeError("isolated live certification worker returned invalid JSON")
-        _assert_report_safe(report, secrets)
-        return report
-    finally:
-        scan_and_remove_temporary_tree(temp_root, secrets)
+def _read_json(url: str, timeout: float = 1.0) -> dict[str, Any]:
+    with urllib.request.urlopen(url, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
 
 
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Validate the isolated PromptAnnotation live-certification boundary. "
-            "It is dry-run by default; --execute-live-matrix starts the owned Gateway "
-            "and can incur TokenRhythm charges."
-        )
-    )
-    parser.add_argument("--output")
-    parser.add_argument(
-        "--timeout-seconds",
-        type=float,
-        default=DEFAULT_CASE_TIMEOUT_SECONDS,
-    )
-    parser.add_argument(
-        "--matrix-timeout-seconds",
-        type=float,
-        default=DEFAULT_MATRIX_TIMEOUT_SECONDS,
-        help=(
-            "whole-matrix worker deadline; independent from the per-case "
-            "--timeout-seconds deadline"
-        ),
-    )
-    parser.add_argument(
-        "--physical-call-cap",
-        type=int,
-        default=HARD_PHYSICAL_CALL_CAP,
-    )
-    parser.add_argument("--confirm-live-cost", action="store_true")
-    parser.add_argument("--confirm-rotated-key", action="store_true")
-    parser.add_argument(
-        "--execute-live-matrix",
-        action="store_true",
-        help="run the owned-Gateway live matrix after both attestations",
-    )
-    parser.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--_execute-live-matrix", action="store_true", help=argparse.SUPPRESS)
-    return parser
+def _read_turn_call_records(log_dir: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for path in sorted(log_dir.glob("turn-calls-*.jsonl")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return records
 
 
-def main() -> int:
-    parser = _parser()
-    args = parser.parse_args()
-    if args._worker:
+def _wait_for_gateway_health(
+    proc: subprocess.Popen,
+    port: int,
+) -> tuple[dict[str, Any] | None, str | None]:
+    deadline = time.monotonic() + 45
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            stdout, stderr = proc.communicate(timeout=1)
+            return None, f"gateway exited early with code {proc.returncode}: {stderr or stdout}"
         try:
-            return _worker_main(
-                hard_cap=args.physical_call_cap,
-                timeout_seconds=args.timeout_seconds,
-                execute_live_matrix=args._execute_live_matrix,
-            )
-        except (OSError, RuntimeError, ValueError):
-            return 2
+            return _read_json(f"http://127.0.0.1:{port}/health"), None
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+            time.sleep(0.25)
+    return None, "gateway did not become healthy before timeout"
 
-    if not args.output:
-        parser.error("--output is required")
-    output = Path(args.output)
-    if not is_temporary_report_path(output):
-        parser.error("--output must be inside the system temporary directory")
-    output.unlink(missing_ok=True)
-    if not args.confirm_live_cost:
-        print("live certification requires --confirm-live-cost", file=sys.stderr)
-        return 2
-    if not args.confirm_rotated_key:
-        print("live certification requires --confirm-rotated-key", file=sys.stderr)
-        return 2
-    if not WORST_CASE_PHYSICAL_CALLS <= args.physical_call_cap <= HARD_PHYSICAL_CALL_CAP:
-        print(
-            f"--physical-call-cap must be between {WORST_CASE_PHYSICAL_CALLS} "
-            f"and {HARD_PHYSICAL_CALL_CAP}",
-            file=sys.stderr,
-        )
-        return 2
-    if not 5.0 <= args.timeout_seconds <= 120.0:
-        print("--timeout-seconds must be between 5 and 120", file=sys.stderr)
-        return 2
-    if not MIN_MATRIX_TIMEOUT_SECONDS <= args.matrix_timeout_seconds <= MAX_MATRIX_TIMEOUT_SECONDS:
-        print(
-            f"--matrix-timeout-seconds must be between "
-            f"{MIN_MATRIX_TIMEOUT_SECONDS:g} and {MAX_MATRIX_TIMEOUT_SECONDS:g}",
-            file=sys.stderr,
-        )
-        return 2
-    if os.environ.get(BASE_URL_ENV):
-        print(f"{BASE_URL_ENV} overrides are forbidden for certification", file=sys.stderr)
-        return 2
-    api_key = os.environ.get(KEY_ENV, "").strip()
-    if not api_key:
-        print(f"{KEY_ENV} must contain a rotated live certification key", file=sys.stderr)
-        return 2
 
-    secrets = {KEY_ENV: api_key}
+def _stop_gateway(proc: subprocess.Popen) -> tuple[str, str]:
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
     try:
-        report = _launch_worker(
-            api_key=api_key,
-            hard_cap=args.physical_call_cap,
-            timeout_seconds=args.timeout_seconds,
-            matrix_timeout_seconds=args.matrix_timeout_seconds,
-            execute_live_matrix=args.execute_live_matrix,
-        )
-        report = sanitize_report(report, secrets)
-        _assert_report_safe(report, secrets)
-        report = write_safe_report(output, report, secrets)
-        _assert_report_safe(report, secrets)
-    except Exception as exc:  # noqa: BLE001 - never emit provider or artifact bodies
-        output.unlink(missing_ok=True)
-        print(
-            json.dumps(
-                {
-                    "status": "failed",
-                    "failureClass": classify_failure(type(exc).__name__),
-                    "exceptionClass": type(exc).__name__,
-                },
-                sort_keys=True,
-            ),
-            file=sys.stderr,
-        )
-        return 2
-
-    print(
-        json.dumps(
-            {
-                "status": report["certification"],
-                "observedPhysicalCalls": report["physicalCallBudget"]["observed"],
-            },
-            sort_keys=True,
-        )
-    )
-    return 0 if report["certification"] == "complete" else 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+        stdout_tail = (proc.stdout.read() if proc.stdout else "")[-2000:]
+    except ValueError:
+        stdout_tail = ""
+    try:
+        stderr_tail = (proc.stderr.read() if proc.stderr else "")[-2000:]
+    except ValueError:
+        stderr_tail = ""
+    return stdout_tail, stderr_tail

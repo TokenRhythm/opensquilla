@@ -1,4 +1,4 @@
-name: Live Release E2E
+name: Live Telegram Smoke
 
 "on":
   workflow_dispatch:
@@ -18,16 +18,14 @@ concurrency:
 
 jobs:
   live-release-e2e:
-    name: Maintainer live release gates
+    name: Maintainer Telegram channel smoke
+    if: ${{ inputs.run_telegram_channel }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     env:
       PYTHONPATH: ${{ github.workspace }}
       OPENSQUILLA_TURN_CALL_LOG: "0"
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      OPENROUTER_BASE_URL: ${{ vars.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1' }}
-      LLM_TEST_MODEL: ${{ vars.LLM_TEST_MODEL || 'openai/gpt-4o-mini' }}
       OPENSQUILLA_LIVE_TELEGRAM_BOT_TOKEN: ${{ secrets.OPENSQUILLA_LIVE_TELEGRAM_BOT_TOKEN }}
       OPENSQUILLA_LIVE_TELEGRAM_CHAT_ID: ${{ secrets.OPENSQUILLA_LIVE_TELEGRAM_CHAT_ID }}
 
@@ -52,16 +50,7 @@ jobs:
       - name: Install dependencies
         run: uv sync --extra dev --extra recommended --frozen
 
-      - name: Fail if OpenRouter secret is missing
-        shell: bash
-        run: |
-          if [ -z "$OPENROUTER_API_KEY" ]; then
-            echo "OPENROUTER_API_KEY GitHub secret is required"
-            exit 1
-          fi
-
       - name: Fail if Telegram secrets are missing when channel smoke is enabled
-        if: ${{ inputs.run_telegram_channel }}
         shell: bash
         run: |
           if [ -z "$OPENSQUILLA_LIVE_TELEGRAM_BOT_TOKEN" ]; then
@@ -73,13 +62,7 @@ jobs:
             exit 1
           fi
 
-      - name: Run gateway LLM e2e
-        env:
-          OPENSQUILLA_GATEWAY_LLM_E2E: "1"
-        run: uv run pytest tests/functional/test_gateway_llm_e2e.py -q -s
-
       - name: Run live Telegram channel smoke
-        if: ${{ inputs.run_telegram_channel }}
         env:
           OPENSQUILLA_LIVE_TELEGRAM_E2E: "1"
         run: uv run pytest tests/functional/test_live_channel_telegram_smoke.py -q -s

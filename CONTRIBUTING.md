@@ -85,7 +85,11 @@ Default tests must be offline, deterministic, credential-free, and safe for fork
 
 Add or update public regression tests for behavior changes and bug fixes. Prefer focused unit or integration tests unless the behavior crosses the gateway, browser UI, provider, or channel boundary.
 
-Live checks are maintainer-only gates. The `Live Release E2E` workflow covers real provider, browser, and optional channel smoke tests with GitHub secrets and explicit opt-in inputs.
+Live checks are maintainer-only gates. The manually triggered `LLM Smoke`,
+`Live Search E2E`, and `Live Telegram Smoke` workflows cover model API
+connectivity, search providers, and Telegram delivery respectively. They use
+GitHub secrets and explicit opt-in inputs; they do not provide full Agent or
+Gateway model E2E coverage.
 
 ## Private Materials
 

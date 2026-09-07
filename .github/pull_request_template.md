@@ -40,7 +40,7 @@ Maintainer live check: no | yes
 
 Surface: N/A | provider | browser | gateway | channel | release
 
-Maintainer-only note: contributors are not expected to provide secrets or run credentialed live checks. Maintainers may run `Live Release E2E` for provider, browser, gateway, channel, or release smoke coverage.
+Maintainer-only note: contributors are not expected to provide secrets or run credentialed live checks. Maintainers may manually run `LLM Smoke`, `Live Search E2E`, or `Live Telegram Smoke` for model API connectivity, search providers, or Telegram delivery. These workflows do not provide full Agent or Gateway model E2E coverage.
 
 ## Safety
 
