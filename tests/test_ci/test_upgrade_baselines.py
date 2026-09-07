@@ -15,6 +15,54 @@ DRIVER = ROOT / "desktop/electron/scripts/test-packaged-real-update-flow.mjs"
 
 
 @pytest.mark.parametrize(
+    ("workflow_name", "job_name", "windows"),
+    [
+        ("desktop-fault-injection.yml", "windows-release-upgrade-audit", True),
+        ("wheelhouse-release.yml", "audit-downloaded-macos-release", False),
+        ("wheelhouse-release.yml", "audit-downloaded-windows-release", True),
+        ("wheelhouse-release.yml", "audit-internal-windows-artifact", True),
+    ],
+)
+def test_fresh_release_audits_build_and_import_harness_before_installing(
+    workflow_name: str, job_name: str, windows: bool
+) -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows" / workflow_name).read_text(encoding="utf-8")
+    )
+    steps = workflow["jobs"][job_name]["steps"]
+    preparation = [
+        (index, step)
+        for index, step in enumerate(steps)
+        if "release verification dependencies" in step.get("name", "")
+    ]
+    assert len(preparation) == 1
+    preparation_index, step = preparation[0]
+    assert step["working-directory"] == "desktop/electron"
+    script = step["run"]
+    install_dependencies = script.index("npm ci")
+    build = script.index("npm run build")
+    import_probe = script.index("node --input-type=module -e")
+    assert install_dependencies < build < import_probe
+    assert "await import('./scripts/packaged-first-send-cleanup.mjs')" in script
+    assert "|| true" not in script
+    if windows:
+        assert step["shell"] == "pwsh"
+        for start, stop in ((install_dependencies, build), (build, import_probe)):
+            assert "if ($LASTEXITCODE -ne 0) { throw" in script[start:stop]
+        assert "if ($LASTEXITCODE -ne 0) { throw" in script[import_probe:]
+    else:
+        # The default GitHub-hosted macOS run shell is bash -e.
+        assert step.get("shell", "bash") == "bash"
+    installer_indices = [
+        index
+        for index, candidate in enumerate(steps)
+        if ".github/scripts/verify-release-" in candidate.get("run", "")
+    ]
+    assert installer_indices
+    assert preparation_index < min(installer_indices)
+
+
+@pytest.mark.parametrize(
     ("overrides", "expected_error"),
     [
         ({}, None),

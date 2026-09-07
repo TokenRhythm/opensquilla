@@ -85,6 +85,36 @@ export async function installQuitDiagnosticProbe(app, diagnosticFile, { extended
             writableLength: stream.writableLength,
           })
           detail.activeRequestTypes = activeRequestTypes
+          detail.webContents = webContents.getAllWebContents().map(contents => {
+            const metadata = { id: contents.id }
+            try {
+              return {
+                ...metadata,
+                type: contents.getType(),
+                destroyed: contents.isDestroyed(),
+                osProcessId: contents.getOSProcessId(),
+                electronDebuggerAttached: contents.debugger.isAttached(),
+              }
+            } catch (error) {
+              return { ...metadata, diagnosticError: String(error?.message || error).slice(0, 500) }
+            }
+          })
+          const childStreamState = stream => stream ? {
+            destroyed: stream.destroyed,
+            readableEnded: stream.readableEnded,
+            writableFinished: stream.writableFinished,
+          } : null
+          detail.activeChildProcesses = (process._getActiveHandles?.() || [])
+            .filter(handle => handle?.constructor?.name === 'ChildProcess')
+            .map(child => ({
+              pid: child.pid,
+              exitCode: child.exitCode,
+              signalCode: child.signalCode,
+              connected: child.connected,
+              stdin: childStreamState(child.stdin),
+              stdout: childStreamState(child.stdout),
+              stderr: childStreamState(child.stderr),
+            }))
           detail.stdio = {
             stdout: streamState(process.stdout),
             stderr: streamState(process.stderr),
@@ -105,6 +135,11 @@ export async function installQuitDiagnosticProbe(app, diagnosticFile, { extended
           // Observe whether the main event loop runs again without keeping it
           // alive or changing the application's requested exit behavior.
           setImmediate(() => log('app-exit-next-turn', resourceSnapshot())).unref()
+          for (const delayMs of [100, 1_000]) {
+            setTimeout(() => log('app-exit-after-delay', {
+              delayMs, ...resourceSnapshot(),
+            }), delayMs).unref()
+          }
         }
         return result
       } catch (error) {
@@ -117,6 +152,10 @@ export async function installQuitDiagnosticProbe(app, diagnosticFile, { extended
       app.once('will-quit', () => log('will-quit', resourceSnapshot()))
       process.once('beforeExit', exitCode => log('process-before-exit', { exitCode, ...resourceSnapshot() }))
       process.once('exit', exitCode => log('process-exit', { exitCode, ...resourceSnapshot() }))
+      for (const contents of webContents.getAllWebContents()) {
+        const webContentsId = contents.id
+        contents.once('destroyed', () => log('web-contents-destroyed', { webContentsId }))
+      }
     }
     for (const window of BrowserWindow.getAllWindows()) {
       const windowId = window.id

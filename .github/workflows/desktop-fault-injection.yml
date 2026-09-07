@@ -483,7 +483,14 @@ jobs:
           cache-dependency-path: desktop/electron/package-lock.json
       - name: Install release verification dependencies
         working-directory: desktop/electron
-        run: npm ci
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'Verification dependency installation failed.' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'Verification harness build failed.' }
+          node --input-type=module -e "await import('./scripts/packaged-first-send-cleanup.mjs')"
+          if ($LASTEXITCODE -ne 0) { throw 'Verification harness import failed.' }
       - name: Record signed artifact and harness source
         shell: pwsh
         env:

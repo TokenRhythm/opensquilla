@@ -711,10 +711,10 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
         assert "actions/setup-node@v4" in audit
         assert "desktop/electron/package-lock.json" in audit
         assert "working-directory: desktop/electron" in audit
-        assert "run: npm ci" in audit
-        assert audit.index("run: npm ci") < audit.index(
-            "verify-release-", audit.index("run: npm ci")
-        )
+        assert audit.index("npm ci") < audit.index("npm run build")
+        assert audit.index("npm run build") < audit.index(
+            "await import('./scripts/packaged-first-send-cleanup.mjs')"
+        ) < audit.index("verify-release-", audit.index("npm ci"))
     assert "codesign --verify --deep --strict" in mac_audit
     assert "spctl -a -vv -t exec" in mac_audit
     assert "xcrun stapler validate" in mac_audit
