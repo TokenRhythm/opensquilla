@@ -383,6 +383,7 @@ try {
     'cli-pass',
     'cli-fail',
   ])
+  await import('./test-packaged-first-send-cleanup.mjs')
   console.log('Desktop E2E case telemetry checks passed')
 } finally {
   await rm(root, { recursive: true, force: true })

@@ -36,6 +36,13 @@ preservation, and uninstallation without access to KeyLocker credentials.
 When the candidate version equals a baseline, that case demonstrates
 reinstallation, not an upgrade to a newer release.
 
+Internal runs also retain a separate signed diagnostic candidate for seven days
+before the first-send gate, so a failed runtime test does not require signing
+again just to inspect the bytes. This diagnostic artifact is not a validated
+release and is never consumed by publication or the successful-build audit
+matrix. First-send failures retain only the isolated synthetic desktop log;
+client authentication material is excluded.
+
 Internal artifacts do not publish a GitHub Release or exercise OSS prestaging
 and real updater downloads. Before publishing a new version, the tag workflow
 must also pass the Draft download and real updater audit matrix. Draft upload

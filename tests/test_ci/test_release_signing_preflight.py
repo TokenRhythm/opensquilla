@@ -400,3 +400,36 @@ def test_empty_tag_runs_independent_windows_artifact_audit_matrix() -> None:
     assert "-BaselineVersion $env:BASELINE_VERSION" in verify["run"]
     assert "-InstallMode $env:INSTALL_MODE" in verify["run"]
     assert "secrets." not in json.dumps(audit)
+
+
+def test_internal_diagnostics_preserve_signed_bytes_without_feeding_publication() -> None:
+    jobs = yaml.safe_load((ROOT / ".github/workflows/wheelhouse-release.yml").read_text())["jobs"]
+    steps = jobs["build-desktop-windows"]["steps"]
+    by_name = {step.get("name"): step for step in steps}
+    diagnostic = by_name["Retain internal signed candidate for diagnosis"]
+    assert diagnostic["if"] == jobs["audit-internal-windows-artifact"]["if"]
+    assert (
+        steps.index(by_name["Verify Windows Authenticode signatures and timestamps"])
+        < steps.index(diagnostic)
+        < steps.index(by_name["Gate packaged first-send renderer"])
+    )
+    assert diagnostic["with"]["path"].splitlines() == [
+        "dist/desktop-electron/*.exe",
+        "dist/desktop-electron/*.blockmap",
+        "dist/desktop-electron/latest.yml",
+    ]
+    assert by_name["Gate packaged first-send renderer"]["timeout-minutes"] == 15
+    failure_log = by_name["Retain Windows first-send failure log"]
+    assert failure_log["if"] == "${{ failure() }}"
+    assert failure_log["with"]["path"].endswith("/logs/desktop.log")
+    assert (
+        "p1-5-first-send-${{ github.run_id }}-${{ github.run_attempt }}"
+        in failure_log["with"]["path"]
+    )
+    assert steps.index(by_name["Remove DigiCert client authentication material"]) < steps.index(
+        failure_log
+    )
+    for job in jobs.values():
+        for step in job.get("steps", []):
+            if step.get("uses", "").startswith("actions/download-artifact@"):
+                assert "windows-signed-candidate-diagnostics" not in json.dumps(step)

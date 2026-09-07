@@ -10,6 +10,11 @@ import {
   requiredOption,
   waitFor,
 } from './packaged-smoke-helpers.mjs'
+import {
+  closeHttpServerWithDeadline,
+  trackHttpServerConnections,
+} from './e2e-shutdown-helpers.mjs'
+import { cleanupPackagedFirstSend } from './packaged-first-send-cleanup.mjs'
 import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
 
 const DEFAULT_ITERATIONS = 20
@@ -131,6 +136,7 @@ async function startSyntheticOllama() {
       }) + '\n')
     })
   })
+  const sockets = trackHttpServerConnections(server)
 
   await new Promise((resolveListen, rejectListen) => {
     server.once('error', rejectListen)
@@ -141,9 +147,9 @@ async function startSyntheticOllama() {
   return {
     baseUrl: `http://127.0.0.1:${address.port}`,
     counts: () => ({ requestCount, chatRequestCount }),
-    close: () => new Promise((resolveClose, rejectClose) => {
-      server.closeIdleConnections?.()
-      server.close((error) => error ? rejectClose(error) : resolveClose())
+    close: options => closeHttpServerWithDeadline(server, sockets, {
+      label: 'packaged-first-send synthetic provider shutdown',
+      ...options,
     }),
   }
 }
@@ -227,6 +233,20 @@ const outboundNetwork = []
 const rpcSendCounts = new Map()
 const rpcSessions = new Map()
 let desktopLogSummary
+const startedAt = Date.now()
+let currentPhase = 'initializing'
+
+function reportPhase(phase, details = {}) {
+  currentPhase = phase
+  // Phase records contain only counts and lifecycle metadata, never messages,
+  // provider credentials, environment values, or conversation contents.
+  console.log(JSON.stringify({
+    event: 'packaged_first_send_phase',
+    phase,
+    elapsedMs: Date.now() - startedAt,
+    ...details,
+  }))
+}
 
 async function browserRpcSnapshot(page) {
   return await page.evaluate(() => {
@@ -359,8 +379,10 @@ async function establishStableHeaderIdentity(header, iteration) {
 }
 
 try {
+  reportPhase('validating-isolated-profile', { iterations })
   await assertIsolatedUserData(userDataDir)
   provider = await startSyntheticOllama()
+  reportPhase('electron-launch-start')
   app = await launchPackagedCandidate({
     executablePath,
     userDataDir,
@@ -376,6 +398,7 @@ try {
       no_proxy: '127.0.0.1,localhost,::1',
     },
   })
+  reportPhase('electron-launch-complete')
 
   await app.context().route((url) => {
     return (url.protocol === 'http:' || url.protocol === 'https:') && !isLoopbackUrl(url.toString())
@@ -384,6 +407,7 @@ try {
     await route.abort('blockedbyclient')
   })
   const page = await app.firstWindow({ timeout: 60_000 })
+  reportPhase('renderer-window-ready')
   await waitFor(
     () => page.url().startsWith('opensquilla-app://desktop/chat'),
     'candidate Desktop renderer',
@@ -393,10 +417,12 @@ try {
   // visible can interrupt that promise and strand startup before inspection.
   // Prove the initial document and Gateway are settled before installing the
   // page-level WebSocket probe.
+  reportPhase('gateway-connection-start')
   await page.locator('.conn-pill.connected').waitFor({
     state: 'visible',
     timeout: INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS,
   })
+  reportPhase('gateway-connected')
   page.on('pageerror', (error) => pageErrors.push(String(error?.message || error)))
   page.on('console', (message) => {
     if (message.type() === 'error') consoleErrors.push(message.text())
@@ -410,6 +436,7 @@ try {
   await page.evaluate(installBrowserRpcProbe)
 
   for (let iteration = 1; iteration <= iterations; iteration += 1) {
+    reportPhase('iteration-start', { iteration, iterations, completedChatSends: rpcSendCounts.size })
     await page.setViewportSize(iteration % 2 === 1 ? WIDE_VIEWPORT : TIGHT_VIEWPORT)
     const draftUrl = new URL(page.url())
     const alreadyOnEmptyDraft = draftUrl.pathname === '/chat/new'
@@ -481,6 +508,7 @@ try {
       SEND_TIMEOUT_MS,
     )
     await assertSettledMessageReceipt(page)
+    reportPhase('first-turn-complete', { iteration, completedChatSends: rpcSendCounts.size })
 
     const followupMessage = `Synthetic follow-up ${String(iteration).padStart(2, '0')}`
     await composer.fill(followupMessage)
@@ -508,6 +536,7 @@ try {
     assert.equal(await page.locator('#app-route-header').count(), 1)
     assert.equal(await page.locator('.chat').count(), 1)
     assert.equal(await page.locator('.chat-textarea').count(), 1)
+    reportPhase('iteration-complete', { iteration, completedChatSends: rpcSendCounts.size })
   }
 
   assert.equal(pageErrors.length, 0, `renderer page errors: ${pageErrors.length}`)
@@ -523,12 +552,31 @@ try {
     iterations,
     'each new-task iteration must materialize one distinct session',
   )
+  reportPhase('renderer-checks-complete', { completedChatSends: rpcSendCounts.size })
 } catch (error) {
   runError = error
+  // Report the original failure before attempting any potentially slow cleanup.
+  console.error(JSON.stringify({
+    event: 'packaged_first_send_failed_before_cleanup',
+    phase: currentPhase,
+    completedChatSends: rpcSendCounts.size,
+    error: error?.stack || error?.message || String(error),
+  }))
 } finally {
-  await app?.close().catch(() => {})
-  await provider?.close().catch(() => {})
+  reportPhase('cleanup-start', { failed: Boolean(runError) })
+  try {
+    await cleanupPackagedFirstSend({
+      app,
+      provider,
+      diagnostics: () => readDesktopLogSummary(userDataDir),
+      onPhase: reportPhase,
+    })
+  } catch (error) {
+    console.error(error)
+    runError ??= error
+  }
   desktopLogSummary = await readDesktopLogSummary(userDataDir)
+  reportPhase('cleanup-complete', { failed: Boolean(runError) })
 }
 
 if (runError) {

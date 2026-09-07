@@ -681,7 +681,21 @@ jobs:
           OPENSQUILLA_REQUIRE_PACKAGED_GATEWAY_SMOKE: "1"
         run: npm run verify:gateway-smoke
 
+      - name: Retain internal signed candidate for diagnosis
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag == '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-signed-candidate-diagnostics
+          overwrite: true
+          path: |
+            dist/desktop-electron/*.exe
+            dist/desktop-electron/*.blockmap
+            dist/desktop-electron/latest.yml
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Gate packaged first-send renderer
+        timeout-minutes: 15
         working-directory: desktop/electron
         shell: pwsh
         run: |
@@ -723,6 +737,16 @@ jobs:
           }
           $msi = Join-Path $env:RUNNER_TEMP 'Keylockertools-windows-x64.msi'
           if (Test-Path -LiteralPath $msi) { Remove-Item -LiteralPath $msi -Force }
+
+      - name: Retain Windows first-send failure log
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-first-send-failure-log
+          overwrite: true
+          path: ${{ runner.temp }}/p1-5-first-send-${{ github.run_id }}-${{ github.run_attempt }}/logs/desktop.log
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: List Windows artifacts
         shell: bash
