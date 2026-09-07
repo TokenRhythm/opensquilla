@@ -386,7 +386,7 @@ jobs:
             --quit-diagnostics-file $diagnostics
           if ($LASTEXITCODE -ne 0) { throw 'Signed installed first-send audit failed.' }
 
-      - name: Diagnose routed quit of the signed candidate
+      - name: Diagnose native teardown of the signed candidate
         if: ${{ failure() && steps.first_send.outcome == 'failure' && inputs.run_windows_release_audit }}
         timeout-minutes: 5
         working-directory: desktop/electron
@@ -395,12 +395,12 @@ jobs:
           CANDIDATE_EXE: ${{ steps.stage.outputs.app }}
           AUDIT_STAGE: ${{ steps.stage.outputs.stage }}
         run: |
-          $userData = Join-Path $env:AUDIT_STAGE 'unrouted-quit-user-data'
+          $userData = Join-Path $env:AUDIT_STAGE 'native-quit-user-data'
           $diagnostics = Join-Path $env:AUDIT_STAGE 'quit-diagnostics.jsonl'
           node scripts/test-packaged-first-send-renderer.mjs `
             --executable $env:CANDIDATE_EXE --user-data-dir $userData `
-            --iterations 1 --unroute-before-quit --quit-diagnostics-file $diagnostics
-          if ($LASTEXITCODE -ne 0) { throw 'Routed quit diagnostic failed.' }
+            --iterations 1 --extended-quit-diagnostics --quit-diagnostics-file $diagnostics
+          if ($LASTEXITCODE -ne 0) { throw 'Native teardown diagnostic failed.' }
 
       - name: Run fault-injection scenarios
         if: ${{ !inputs.run_windows_release_audit }}
@@ -449,7 +449,7 @@ jobs:
             ${{ steps.stage.outputs.stage }}/scenarios/*/user-data/logs/gateway.log
             ${{ steps.stage.outputs.stage }}/scenarios/*/launch-stdio.log
             ${{ steps.stage.outputs.stage }}/first-send-user-data/logs/*.log
-            ${{ steps.stage.outputs.stage }}/unrouted-quit-user-data/logs/*.log
+            ${{ steps.stage.outputs.stage }}/native-quit-user-data/logs/*.log
             ${{ steps.stage.outputs.stage }}/quit-diagnostics.jsonl
             ${{ steps.stage.outputs.stage }}/playwright-quit-diagnostics.jsonl
           if-no-files-found: warn

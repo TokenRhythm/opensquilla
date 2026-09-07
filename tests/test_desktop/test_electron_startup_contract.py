@@ -2655,7 +2655,15 @@ def test_packaged_session_recovery_gate_uses_installed_electron_and_real_gateway
     assert "server.send(message)" in recovery
     assert "client.send(message)" in recovery
     assert "page.clock" not in recovery
-    assert "socketCount > 1" in recovery
+    assert "assertConcurrentRecoveryTransport" in recovery
+    assert "socketPolicies.get(recoverySocketIndex)?.concurrent_history_reads" in recovery
+    assert "newSocketCount: nextSocketIndex - recoverySocketCountBaseline" in recovery
+    assert "closeCount: physicalCloseCount - recoveryCloseCountBaseline" in recovery
+    assert "const terminalTransport = recoveryTransportSample()" in recovery
+    assert "const recoveredTransport = recoveryTransportSample()" in recovery
+    assert "await cleanupPackagedFirstSend" in recovery
+    assert "processesAfterCleanup: electronProcessSnapshot(processIdentity)" in recovery
+    assert "app?.close().catch(() => {})" not in recovery
     assert "healthyNavigationSocketIds.size" in recovery
     assert "expectedLastMessage" in recovery
     assert "preservedDraft" in recovery

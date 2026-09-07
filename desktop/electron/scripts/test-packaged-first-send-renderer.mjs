@@ -237,9 +237,10 @@ const userDataDir = resolve(requiredOption('--user-data-dir'))
 const iterations = optionalIntegerOption('--iterations', DEFAULT_ITERATIONS)
 const deferQuit = process.argv.includes('--defer-quit')
 const unrouteBeforeQuit = process.argv.includes('--unroute-before-quit')
+const extendedQuitDiagnostics = process.argv.includes('--extended-quit-diagnostics')
 assert.equal(deferQuit && unrouteBeforeQuit, false, 'quit diagnostic modes must be selected separately')
 const quitMode = deferQuit ? 'deferred-diagnostic' : unrouteBeforeQuit ? 'unroute-diagnostic' : 'playwright-close'
-const quitDiagnosticFile = deferQuit || unrouteBeforeQuit || process.argv.includes('--quit-diagnostics-file')
+const quitDiagnosticFile = deferQuit || unrouteBeforeQuit || extendedQuitDiagnostics || process.argv.includes('--quit-diagnostics-file')
   ? resolve(requiredOption('--quit-diagnostics-file'))
   : null
 if (quitDiagnosticFile) {
@@ -463,7 +464,9 @@ try {
   })
   const page = await app.firstWindow({ timeout: 60_000 })
   rendererPage = page
-  if (quitDiagnosticFile) await installQuitDiagnosticProbe(app, quitDiagnosticFile)
+  if (quitDiagnosticFile) {
+    await installQuitDiagnosticProbe(app, quitDiagnosticFile, { extended: extendedQuitDiagnostics })
+  }
   reportPhase('renderer-window-ready')
   await waitFor(
     () => page.url().startsWith('opensquilla-app://desktop/chat'),
@@ -657,6 +660,7 @@ if (runError) {
     provider: provider?.counts(),
     quitMode,
     quitDiagnosticFile,
+    extendedQuitDiagnostics,
     renderer: {
       pageErrors: pageErrors.length,
       consoleErrors: consoleErrors.length,
@@ -688,6 +692,7 @@ console.log(JSON.stringify({
   iterations,
   quitMode,
   quitDiagnosticFile,
+  extendedQuitDiagnostics,
   viewports: { wide: Math.ceil(iterations / 2), tight: Math.floor(iterations / 2) },
   rpc: { chatSend: rpcSendCounts.size, uniqueSessions: new Set(rpcSessions.values()).size },
   provider: provider?.counts(),

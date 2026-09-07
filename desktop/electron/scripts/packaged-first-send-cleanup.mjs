@@ -55,8 +55,8 @@ export function electronProcessSnapshot(identity) {
   return snapshot
 }
 
-export async function installQuitDiagnosticProbe(app, diagnosticFile) {
-  await app.evaluate(({ app, BrowserWindow, webContents }, file) => {
+export async function installQuitDiagnosticProbe(app, diagnosticFile, { extended = false } = {}) {
+  await app.evaluate(({ app, BrowserWindow, webContents }, { file, extended }) => {
     const fs = process.getBuiltinModule('fs')
     const log = (event, detail = {}) => fs.appendFileSync(file, JSON.stringify({
       event, at: new Date().toISOString(), pid: process.pid, ...detail,
@@ -67,11 +67,30 @@ export async function installQuitDiagnosticProbe(app, diagnosticFile) {
         for (const type of process.getActiveResourcesInfo()) {
           resourceTypes[type] = (resourceTypes[type] || 0) + 1
         }
-        return {
+        const detail = {
           resourceTypes,
           windowCount: BrowserWindow.getAllWindows().length,
           webContentsCount: webContents.getAllWebContents().length,
         }
+        if (extended) {
+          const activeRequestTypes = {}
+          for (const request of process._getActiveRequests?.() || []) {
+            const type = request?.constructor?.name || 'Unknown'
+            activeRequestTypes[type] = (activeRequestTypes[type] || 0) + 1
+          }
+          const streamState = stream => ({
+            destroyed: stream.destroyed,
+            writableEnded: stream.writableEnded,
+            writableFinished: stream.writableFinished,
+            writableLength: stream.writableLength,
+          })
+          detail.activeRequestTypes = activeRequestTypes
+          detail.stdio = {
+            stdout: streamState(process.stdout),
+            stderr: streamState(process.stderr),
+          }
+        }
+        return detail
       } catch (error) {
         return { resourceDiagnosticError: String(error?.message || error).slice(0, 500) }
       }
@@ -82,6 +101,11 @@ export async function installQuitDiagnosticProbe(app, diagnosticFile) {
       try {
         const result = originalExit.apply(this, args)
         log('app-exit-returned', resourceSnapshot())
+        if (extended) {
+          // Observe whether the main event loop runs again without keeping it
+          // alive or changing the application's requested exit behavior.
+          setImmediate(() => log('app-exit-next-turn', resourceSnapshot())).unref()
+        }
         return result
       } catch (error) {
         log('app-exit-threw', { error: String(error?.message || error).slice(0, 500) })
@@ -89,12 +113,17 @@ export async function installQuitDiagnosticProbe(app, diagnosticFile) {
       }
     }
     app.once('quit', (_event, exitCode) => log('quit', { exitCode }))
+    if (extended) {
+      app.once('will-quit', () => log('will-quit', resourceSnapshot()))
+      process.once('beforeExit', exitCode => log('process-before-exit', { exitCode, ...resourceSnapshot() }))
+      process.once('exit', exitCode => log('process-exit', { exitCode, ...resourceSnapshot() }))
+    }
     for (const window of BrowserWindow.getAllWindows()) {
       const windowId = window.id
       window.once('closed', () => log('window-closed', { windowId }))
     }
     log('probe-installed', resourceSnapshot())
-  }, diagnosticFile)
+  }, { file: diagnosticFile, extended })
 }
 
 export async function quitElectronOnNextTurn(app, identity, timeoutMs) {
@@ -109,15 +138,20 @@ export async function quitElectronOnNextTurn(app, identity, timeoutMs) {
 }
 
 export async function closeElectronAfterRemovingRoutes(app, identity, timeoutMs) {
+  return closeElectronAndObserveExit(app, identity, timeoutMs, true)
+}
+
+export async function closeElectronAndObserveExit(app, identity, timeoutMs, removeRoutes = false) {
   if (!identity?.electronPid || !identity?.wrapperPid) {
-    throw new Error('Unroute quit diagnostic requires both observed process identities')
+    throw new Error('Electron shutdown requires both observed process identities')
   }
+  const deadline = Date.now() + timeoutMs
   // Playwright disposes its ElectronApplication dispatcher after close(), so
   // retain the child handle before asking it to close.
   const child = app.process()
-  await app.context().unrouteAll({ behavior: 'wait' })
+  if (removeRoutes) await app.context().unrouteAll({ behavior: 'wait' })
   await app.close()
-  await observeNaturalElectronExit(child, identity, timeoutMs)
+  await observeNaturalElectronExit(child, identity, Math.max(0, deadline - Date.now()))
 }
 
 async function observeNaturalElectronExit(child, identity, timeoutMs) {
@@ -151,14 +185,16 @@ export async function cleanupPackagedFirstSend({
   if (app) {
     onPhase('electron-cleanup-start')
     try {
-      const diagnosticChild = deferQuit || unrouteBeforeQuit ? app.process() : null
+      const child = app.process()
       const result = await closeElectronWithDeadline({
-        app: deferQuit || unrouteBeforeQuit ? {
-          process: () => diagnosticChild,
+        app: {
+          process: () => child,
           close: () => unrouteBeforeQuit
             ? closeElectronAfterRemovingRoutes(app, processIdentity, electronTimeoutMs)
-            : quitElectronOnNextTurn(app, processIdentity, electronTimeoutMs),
-        } : app,
+            : deferQuit
+              ? quitElectronOnNextTurn(app, processIdentity, electronTimeoutMs)
+              : closeElectronAndObserveExit(app, processIdentity, electronTimeoutMs),
+        },
         phase: 'packaged-first-send',
         diagnostics,
         emit,

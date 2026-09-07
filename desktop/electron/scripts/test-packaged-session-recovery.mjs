@@ -7,6 +7,11 @@ import {
   waitFor,
 } from './packaged-smoke-helpers.mjs'
 import { assertConcurrentRecoveryTransport } from './session-recovery-transport-contract.mjs'
+import {
+  captureElectronProcessIdentity,
+  cleanupPackagedFirstSend,
+  electronProcessSnapshot,
+} from './packaged-first-send-cleanup.mjs'
 
 const LONG_SESSION_MESSAGE_COUNT = 320
 const TERMINAL_RECOVERY_TIMEOUT_MS = 35_000
@@ -27,6 +32,9 @@ const expectedLastMessage =
 const preservedDraft = 'Synthetic draft preserved through packaged session recovery.'
 
 let app
+let processIdentity = {}
+let runError
+let recoveryResult
 let injectHang = false
 let socketCount = 0
 let nextSocketIndex = 0
@@ -51,6 +59,11 @@ try {
       OPENSQUILLA_TESTING: '0',
     },
   })
+  processIdentity = await captureElectronProcessIdentity(app)
+  console.error(JSON.stringify({
+    event: 'packaged_session_recovery_launched',
+    processes: electronProcessSnapshot(processIdentity),
+  }))
   await app.context().routeWebSocket(/\/ws$/, (client) => {
     const socketIndex = nextSocketIndex++
     let targetSocketCounted = false
@@ -355,7 +368,7 @@ try {
     'the retained message 0320 must remain inside the recovered conversation viewport',
   )
 
-  console.log(JSON.stringify({
+  recoveryResult = {
     ok: true,
     executable: basename(executablePath),
     sessionKey,
@@ -373,7 +386,32 @@ try {
     terminalTransport,
     recoveredTransport,
     recoveredViewportSample,
-  }, null, 2))
+  }
+} catch (error) {
+  runError = error
+  console.error(JSON.stringify({
+    event: 'packaged_session_recovery_failed_before_cleanup',
+    error: error?.stack || error?.message || String(error),
+  }))
 } finally {
-  await app?.close().catch(() => {})
+  try {
+    await cleanupPackagedFirstSend({
+      app,
+      processIdentity,
+      diagnostics: () => ({ processes: electronProcessSnapshot(processIdentity) }),
+      onPhase: (phase, detail = {}) => console.error(JSON.stringify({
+        event: 'packaged_session_recovery_cleanup', phase, ...detail,
+      })),
+    })
+  } catch (error) {
+    console.error(error)
+    // Keep the recovery failure primary when cleanup also fails.
+    runError ??= error
+  }
 }
+
+if (runError) throw runError
+console.log(JSON.stringify({
+  ...recoveryResult,
+  processesAfterCleanup: electronProcessSnapshot(processIdentity),
+}, null, 2))

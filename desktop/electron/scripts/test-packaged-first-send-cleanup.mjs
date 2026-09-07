@@ -13,6 +13,7 @@ import {
   captureElectronProcessIdentity,
   captureFirstSendDiagnostic,
   cleanupPackagedFirstSend,
+  closeElectronAndObserveExit,
   closeElectronAfterRemovingRoutes,
   electronProcessSnapshot,
   quitElectronOnNextTurn,
@@ -103,6 +104,11 @@ try {
   }, { wrapperPid: exitedWrapper.child.pid, electronPid: liveElectron.child.pid }, 25),
   /left an observed Electron or wrapper process alive/)
   assert.equal(liveElectron.child.exitCode, null, 'natural observation must never kill Electron')
+  await assert.rejects(closeElectronAndObserveExit({
+    process: () => exitedWrapper.child,
+    close: async () => {},
+  }, { wrapperPid: exitedWrapper.child.pid, electronPid: liveElectron.child.pid }, 25),
+  /left an observed Electron or wrapper process alive/)
   await assert.rejects(closeElectronAfterRemovingRoutes({
     process: () => exitedWrapper.child,
     context: () => ({ unrouteAll: async () => {} }),
@@ -155,17 +161,25 @@ try {
   await assertProcessExited(stuckRoute.child.pid)
 
   const { child } = await startChild()
+  const defaultElectron = await startChild()
   const provider = await startProvider()
   const phases = []
+  let defaultCloseCalled = false
   await cleanupPackagedFirstSend({
     app: {
       close: async () => {
+        defaultCloseCalled = true
         const exited = once(child, 'exit')
-        child.kill('SIGTERM')
+        defaultElectron.child.send('quit')
+        child.send('quit')
         await exited
       },
-      process: () => child,
+      process: () => {
+        assert.equal(defaultCloseCalled, false, 'default close must retain the child before dispatcher disposal')
+        return child
+      },
     },
+    processIdentity: { wrapperPid: child.pid, electronPid: defaultElectron.child.pid },
     provider,
     onPhase: (phase, details) => phases.push({ phase, ...details }),
     electronTimeoutMs: 5_000,
@@ -174,6 +188,19 @@ try {
   assert.equal(provider.server.listening, false)
   assert.equal(phases.find(event => event.phase === 'electron-cleanup-complete').closed, true)
   assert.equal(phases.find(event => event.phase === 'electron-cleanup-complete').forcedExitSucceeded, false)
+  assert.equal(child.exitCode, 0)
+  await assertProcessExited(defaultElectron.child.pid)
+
+  const signalled = await startChild()
+  await assert.rejects(closeElectronAndObserveExit({
+    process: () => signalled.child,
+    close: async () => {
+      const exited = once(signalled.child, 'exit')
+      signalled.child.kill('SIGTERM')
+      await exited
+    },
+  }, { wrapperPid: signalled.child.pid, electronPid: signalled.child.pid }, 5_000),
+  /did not produce a natural zero exit code/)
 
   const hanging = await startChild(process.platform === 'win32')
   const unaffected = await startChild()
@@ -202,6 +229,7 @@ try {
   const shutdownLogs = []
   await assert.rejects(cleanupPackagedFirstSend({
     app: { close: () => new Promise(() => {}), process: () => hanging.child },
+    processIdentity: { wrapperPid: hanging.child.pid, electronPid: hanging.child.pid },
     provider: hangingProvider,
     electronTimeoutMs: 25,
     providerTimeoutMs: 100,
@@ -228,7 +256,6 @@ try {
   const activeProvider = await startProvider()
   const activeSocket = await startActiveRequest(activeProvider)
   await assert.rejects(cleanupPackagedFirstSend({
-    app: { close: async () => {} },
     provider: activeProvider,
     providerTimeoutMs: 25,
   }), error => {
@@ -242,12 +269,21 @@ try {
   activeSocket.destroy()
 
   const rejectedProvider = await startProvider()
+  const rejectedChild = await startChild()
   await assert.rejects(cleanupPackagedFirstSend({
-    app: { close: async () => { throw new Error('Synthetic close rejection') }, process: () => null },
+    app: {
+      close: async () => { throw new Error('Synthetic close rejection') },
+      process: () => rejectedChild.child,
+    },
+    processIdentity: { wrapperPid: rejectedChild.child.pid, electronPid: rejectedChild.child.pid },
     provider: rejectedProvider,
     emit: () => {},
     providerTimeoutMs: 100,
-  }), AggregateError)
+  }), error => {
+    assert.ok(error instanceof AggregateError)
+    assert.equal(error.errors[0].cause.message, 'Synthetic close rejection')
+    return true
+  })
   assert.equal(rejectedProvider.server.listening, false)
   console.log('Packaged first-send cleanup checks passed: graceful, deferred/unroute natural exit, hung routes and Electron tree, active HTTP, close rejection')
 } finally {

@@ -63,6 +63,76 @@ def test_packaged_recovery_requires_concurrent_transport_continuity(
         assert json.loads(result.stdout) == sample
 
 
+@pytest.mark.parametrize(
+    ("launch_fails", "cleanup_fails"), [(False, False), (False, True), (True, False)]
+)
+def test_packaged_recovery_preserves_original_failure_after_cleanup(
+    tmp_path: Path, launch_fails: bool, cleanup_fails: bool
+) -> None:
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js is required for the packaged recovery harness")
+    scripts = ROOT / "desktop/electron/scripts"
+    for name in ("test-packaged-session-recovery.mjs", "session-recovery-transport-contract.mjs"):
+        shutil.copyfile(scripts / name, tmp_path / name)
+    (tmp_path / "packaged-smoke-helpers.mjs").write_text(
+        "export function requiredOption(name) {\n"
+        "return process.argv[process.argv.indexOf(name) + 1] }\n"
+        "export async function waitFor() { throw new Error('Unexpected fixture wait') }\n"
+        "export async function launchPackagedCandidate() {\n"
+        + ("throw new Error('synthetic recovery fault');\n" if launch_fails else "")
+        + "return { context() { return { routeWebSocket() {\n"
+        "throw new Error('synthetic recovery fault') } } } };\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "packaged-first-send-cleanup.mjs").write_text(
+        "import assert from 'node:assert/strict';\n"
+        "export async function captureElectronProcessIdentity() {\n"
+        "return { wrapperPid: 111, electronPid: 222 } }\n"
+        "export function electronProcessSnapshot(identity) { return { ...identity } }\n"
+        "export async function cleanupPackagedFirstSend(options) {\n"
+        "assert.equal(options.deferQuit, undefined);\n"
+        "assert.equal(options.unrouteBeforeQuit, undefined);\n"
+        "if (options.app) assert.deepEqual(\n"
+        "options.processIdentity, { wrapperPid: 111, electronPid: 222 });\n"
+        "assert.deepEqual(options.diagnostics(), { processes: options.processIdentity });\n"
+        "options.onPhase('synthetic-cleanup-ran');\n"
+        + ("throw new Error('synthetic cleanup fault');\n" if cleanup_fails else "")
+        + "}\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            node,
+            str(tmp_path / "test-packaged-session-recovery.mjs"),
+            "--executable",
+            str(tmp_path / "synthetic.exe"),
+            "--user-data-dir",
+            str(tmp_path / "profile"),
+            "--session-key",
+            "synthetic-main",
+            "--switch-session-key",
+            "synthetic-peer",
+            "--label",
+            "synthetic",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode != 0
+    assert "packaged_session_recovery_failed_before_cleanup" in result.stderr
+    assert "synthetic-cleanup-ran" in result.stderr
+    assert "Error: synthetic recovery fault" in result.stderr
+    assert not result.stdout
+    if cleanup_fails:
+        assert result.stderr.rindex("Error: synthetic recovery fault") > result.stderr.rindex(
+            "Error: synthetic cleanup fault"
+        )
+
+
 def test_downloaded_release_audits_cover_both_official_baselines() -> None:
     workflow = yaml.safe_load(
         (ROOT / ".github/workflows/wheelhouse-release.yml").read_text(encoding="utf-8")

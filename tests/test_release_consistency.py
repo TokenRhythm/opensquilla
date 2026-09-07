@@ -677,9 +677,19 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
         "closeCount: physicalCloseCount - recoveryCloseCountBaseline",
         "const terminalTransport = recoveryTransportSample()",
         "const recoveredTransport = recoveryTransportSample()",
+        "processIdentity = await captureElectronProcessIdentity(app)",
+        "await cleanupPackagedFirstSend({",
+        "processesAfterCleanup: electronProcessSnapshot(processIdentity)",
+        "runError ??= error",
     ):
         assert contract in session_recovery_smoke
     assert "page.clock" not in session_recovery_smoke
+    assert "app?.close().catch" not in session_recovery_smoke
+    assert "unrouteBeforeQuit:" not in session_recovery_smoke
+    assert "deferQuit:" not in session_recovery_smoke
+    assert session_recovery_smoke.index("await cleanupPackagedFirstSend({") < (
+        session_recovery_smoke.index("if (runError) throw runError")
+    ) < session_recovery_smoke.index("console.log(JSON.stringify({")
     assert "OPENSQUILLA_TESTING: '0'" in session_recovery_smoke
     assert "verify-runtime" not in mac_helper
     assert "verify-runtime" not in windows_helper
