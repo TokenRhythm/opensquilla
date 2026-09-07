@@ -14352,6 +14352,7 @@ class TurnRunner:
 
         from opensquilla.engine.history import reconstruct_messages_from_entry
         from opensquilla.provider import Message
+        from opensquilla.provider.types import ContentBlockImage, ContentBlockText
 
         history: list[Message] = []
         summary_markers: list[str] = []
@@ -14842,6 +14843,25 @@ class TurnRunner:
                     )
             if bound_attachment_history:
                 request_image_context.extend(bound_attachment_history)
+        for replay_message in request_image_context:
+            if isinstance(replay_message.content, list) and any(
+                isinstance(block, ContentBlockImage) for block in replay_message.content
+            ):
+                # This note belongs only to the request-local projection. A
+                # later text fallback may replace the blocks with markers.
+                replay_message.content = [
+                    ContentBlockText(
+                        text=(
+                            "Image replay context for this request: native image blocks below "
+                            "are preserved originals reattached from earlier conversation turns; "
+                            "no new upload is required. Determine current image availability "
+                            "from these blocks or their fallback markers, not prior assistant "
+                            "claims that an image was not analyzed."
+                        )
+                    ),
+                    *replay_message.content,
+                ]
+                break
         agent.set_request_image_context(request_image_context)
         if restricted_turn:
             # Context states, durable summaries, and legacy summary markers

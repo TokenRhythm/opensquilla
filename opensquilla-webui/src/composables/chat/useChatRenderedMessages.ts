@@ -31,6 +31,7 @@ import {
   toolSecondaryText,
 } from '@/utils/chat/toolDisplay'
 import {
+  IMAGE_TIER,
   normalizeRouterTextTier,
   normalizeRouterTier,
   sortRouterTiers,
@@ -703,7 +704,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         cells.length === 1
         && !fixedSessionRoute
         && !hasRequestSnapshot
-        && currentRouterCandidatePoolAvailable(requestKind)
+        && currentRouterCandidatePoolAvailable()
       )
     ) return null
     return {
@@ -1131,11 +1132,14 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     )
     if (snapshot?.request_kind === requestKind) {
       return routerCellsFromTierEntries(
-        snapshot.tiers.map(entry => ({
-          tier: entry.tier,
-          model: entry.model,
-          executionKind: entry.execution_kind,
-        })),
+        snapshot.tiers
+          // Keep a recorded legacy winner, never an implicit extra candidate.
+          .filter(entry => entry.tier !== IMAGE_TIER || entry.tier === winnerTier)
+          .map(entry => ({
+            tier: entry.tier,
+            model: entry.model,
+            executionKind: entry.execution_kind,
+          })),
         winnerTier,
         winnerModel,
         true,
@@ -1153,8 +1157,9 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       executionKind: 'single_model' | 'ensemble'
     }> = []
     for (const tier of sourceTiers) {
+      if (tier === IMAGE_TIER && tier !== winnerTier) continue
       const tierConfig = routerTierConfig(tier)
-      if (tier !== winnerTier && !routerTierMatchesRequestKind(tierConfig, requestKind)) continue
+      if (tier !== winnerTier && tierConfig.imageOnly) continue
       const model = tier === winnerTier && winnerModel
         ? winnerModel
         : tierConfig.model || options.routerModels.value[tier] || ''
@@ -1235,12 +1240,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     }
   }
 
-  function routerTierMatchesRequestKind(tierConfig: ChatRouterTierConfig, requestKind: ChatRouterRequestKind): boolean {
-    if (requestKind === 'image') return tierConfig.supportsImage || tierConfig.imageOnly
-    return !tierConfig.imageOnly
-  }
-
-  function currentRouterCandidatePoolAvailable(requestKind: ChatRouterRequestKind): boolean {
+  function currentRouterCandidatePoolAvailable(): boolean {
     const configuredTiers = options.routerSlots.value.length
       ? options.routerSlots.value
       : Object.keys(options.routerTierConfigs.value)
@@ -1248,7 +1248,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       const tier = normalizeRouterTier(rawTier)
       const config = routerTierConfig(tier)
       const model = config.model || options.routerModels.value[tier] || ''
-      return Boolean(model && routerTierMatchesRequestKind(config, requestKind))
+      return Boolean(tier !== IMAGE_TIER && model && !config.imageOnly)
     })
   }
 

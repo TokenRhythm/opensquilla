@@ -190,7 +190,7 @@ def _message_has_marker(message: Message, marker: str) -> bool:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("vision_support", "expects_image"),
-    [("supported", True), ("unsupported", False)],
+    [("supported", True), ("unknown", True), ("unsupported", False)],
 )
 async def test_bound_image_message_reprojects_after_model_switch(
     vision_support: str,
@@ -233,6 +233,10 @@ async def test_bound_image_message_reprojects_after_model_switch(
     assert any(_message_has_marker(message, "图片") for message in sent) is (
         not expects_image
     )
+    assert any(
+        _message_has_marker(message, "Image replay context for this request")
+        for message in sent
+    ) is expects_image
     assert manager._transcripts[key][0].content == envelope
 
 
