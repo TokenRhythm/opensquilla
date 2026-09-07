@@ -224,6 +224,33 @@ describe('SkillDetailDialog behavior contract', () => {
     )
   })
 
+  it('shows tool dependencies and live Gateway registration state', async () => {
+    const mounted = mountDialog({
+      name: 'meta-ptc-runner',
+      kind: 'meta',
+      tool_dependencies: [
+        { name: 'ptc_run', registered: true },
+        { name: 'read_file', registered: true },
+        { name: 'missing_tool', registered: false },
+        { name: 'unknown_tool', registered: null },
+      ],
+    })
+    await nextTick()
+
+    expect(mounted.dialog.textContent).toContain('Tool dependencies (2/4 registered)')
+    const chips = Array.from(
+      mounted.dialog.querySelectorAll<HTMLElement>('.sk-chip--tool'),
+    )
+    const byName = (name: string) => chips.find(chip => chip.textContent === name)
+
+    expect(byName('ptc_run')?.classList.contains('sk-chip--ok')).toBe(true)
+    expect(byName('ptc_run')?.title).toBe('Registered in Gateway')
+    expect(byName('missing_tool')?.classList.contains('sk-chip--warn')).toBe(true)
+    expect(byName('missing_tool')?.title).toBe('Not registered in Gateway')
+    expect(byName('unknown_tool')?.classList.contains('sk-chip--unverified')).toBe(true)
+    expect(byName('unknown_tool')?.title).toBe('Gateway registration status unavailable')
+  })
+
   it('shows provider-backed local readiness as a launch-time provider check', async () => {
     const mounted = mountDialog({
       name: 'meta-short-drama',
