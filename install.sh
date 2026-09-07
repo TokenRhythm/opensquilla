@@ -8,7 +8,7 @@
 set -euo pipefail
 
 default_version="v0.5.4"
-repo_slug="${OPENSQUILLA_REPOSITORY:-opensquilla/opensquilla}"
+repo_slug="${OPENSQUILLA_REPOSITORY:-TokenRhythm/opensquilla}"
 python_version="${OPENSQUILLA_PYTHON_VERSION:-3.12}"
 original_path="${PATH:-}"
 

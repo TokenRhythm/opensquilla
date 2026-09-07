@@ -293,6 +293,7 @@ async def run_standalone_chat(
 
     async def _build_authoritative_tool_ctx(active_session_key: str) -> object:
         from opensquilla.gateway.project_workspace_runtime import (
+            apply_run_context_route_metadata,
             authoritative_project_run_context,
         )
         from opensquilla.gateway.session_services import get_session_storage
@@ -317,11 +318,7 @@ async def run_standalone_chat(
             sender_id=cli_sender_id(),
             source_name="chat",
         )
-        from opensquilla.gateway.rpc_sessions import (
-            _apply_run_context_route_metadata,
-        )
-
-        _apply_run_context_route_metadata(
+        apply_run_context_route_metadata(
             route_envelope,
             run_context,
             principal_is_owner=True,

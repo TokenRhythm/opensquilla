@@ -66,12 +66,18 @@ export function createConversationSubscriptionLifecycle<TOutcome>(): Conversatio
 
   function cancel() {
     currentId += 1
-    active?.attempt.controller.abort()
+    const cancelled = active?.attempt
+    cancelled?.controller.abort()
+    if (cancelled?.lease.state === 'acquiring') leases.retire(cancelled.lease)
     active = null
   }
 
   function finish(attempt: ConversationSubscriptionAttempt) {
     if (active?.attempt.id === attempt.id) active = null
+    // A transport that activates the logical lease owns its later release.
+    // SessionRead uses this lifecycle only for attempt identity, so its lease
+    // remains acquiring and must be retired when the attempt settles.
+    if (attempt.lease.state === 'acquiring') leases.retire(attempt.lease)
   }
 
   function start(

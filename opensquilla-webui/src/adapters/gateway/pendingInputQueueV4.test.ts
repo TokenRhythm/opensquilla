@@ -38,7 +38,7 @@ describe('pending input queue v4 adapter', () => {
       supports: () => false,
       ready,
     })
-    await adapter.waitForConnection?.({ timeoutMs: 1000 })
+    await adapter.ready?.({ timeoutMs: 1000 })
     expect(ready).toHaveBeenCalledWith({ timeoutMs: 1000 })
   })
 

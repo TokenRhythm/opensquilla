@@ -1,36 +1,33 @@
 import { computed, toValue, type ComputedRef, type MaybeRefOrGetter, type Ref } from 'vue'
 import i18n from '@/i18n'
 import { nativeBillingDisplay } from '@/composables/usage/nativeBilling'
-import type { SessionRow, UsageTotals } from '@/types/usage'
+import type { UsageSession, UsageTotals } from '@/types/usage'
 
 const t = i18n.global.t
 
 export function useUsageTotals(options: {
-  visibleSessions: ComputedRef<SessionRow[]>
+  visibleSessions: ComputedRef<UsageSession[]>
   serverTotals?: ComputedRef<UsageTotals | null>
   currency: Ref<string>
   cnyRate: MaybeRefOrGetter<number>
-  rowVal: (row: Record<string, unknown>, ...keys: string[]) => unknown
   fmtCost: (
     usd: number | null | undefined,
-    opts?: { decimals?: number; source?: object },
+    opts?: { decimals?: number; source?: UsageTotals },
   ) => string
-  sourceCompositionHint: (rows: SessionRow[]) => string
+  sourceCompositionHint: (rows: UsageSession[]) => string
 }) {
   const usageTotals = computed((): UsageTotals => {
     if (options.serverTotals?.value) return options.serverTotals.value
     const totals = options.visibleSessions.value.reduce((acc: UsageTotals, row) => {
-      acc.input += Number(options.rowVal(row, 'input_tokens', 'inputTokens') || 0)
-      acc.output += Number(options.rowVal(row, 'output_tokens', 'outputTokens') || 0)
-      acc.cost += Number(options.rowVal(row, 'cost_usd', 'costUsd') || 0)
-      acc.cacheRead += Number(options.rowVal(row, 'cache_read_tokens', 'cacheReadTokens') || 0)
-      acc.cacheWrite += Number(options.rowVal(row, 'cache_write_tokens', 'cacheWriteTokens') || 0)
-      acc.billedCost += Number(options.rowVal(row, 'billed_cost_usd', 'billedCostUsd') || 0)
-      acc.estimatedCost += Number(options.rowVal(row, 'estimated_cost_usd', 'estimatedCostUsd') || 0)
-      acc.estimatedEventCount += Number(
-        options.rowVal(row, 'estimated_event_count', 'estimatedEventCount') || 0,
-      )
-      acc.missingCostEntries += Number(options.rowVal(row, 'missing_cost_entries', 'missingCostEntries') || 0)
+      acc.input += row.inputTokens ?? 0
+      acc.output += row.outputTokens ?? 0
+      acc.cost += row.costUsd ?? 0
+      acc.cacheRead += row.cacheReadTokens ?? 0
+      acc.cacheWrite += row.cacheWriteTokens ?? 0
+      acc.billedCost += row.billedCostUsd ?? 0
+      acc.estimatedCost += row.estimatedCostUsd ?? 0
+      acc.estimatedEventCount += row.estimatedEventCount ?? 0
+      acc.missingCostEntries += row.missingCostEntries ?? 0
       return acc
     }, {
       input: 0,
@@ -69,7 +66,7 @@ export function useUsageTotals(options: {
   })
 
   const nativeDisplay = computed(() => nativeBillingDisplay(
-    usageTotals.value as unknown as Record<string, unknown>,
+    usageTotals.value,
     usageTotals.value.cost,
   ))
 
@@ -77,7 +74,7 @@ export function useUsageTotals(options: {
     usageTotals.value.cost,
     {
       decimals: 4,
-      source: usageTotals.value as unknown as Record<string, unknown>,
+      source: usageTotals.value,
     },
   ))
 
@@ -134,7 +131,7 @@ export function useUsageTotals(options: {
     }
     return options.fmtCost(avg, {
       decimals: 4,
-      source: t as unknown as Record<string, unknown>,
+      source: t,
     })
   })
 

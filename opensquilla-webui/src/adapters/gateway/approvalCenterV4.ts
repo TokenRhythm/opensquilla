@@ -1,4 +1,7 @@
-import type { RpcCallOptions, RpcEventHandler } from '@/lib/rpc'
+import type {
+  TransportCallOptions as RpcCallOptions,
+  TransportEventHandler as RpcEventHandler,
+} from './transportTypes'
 import { HttpTransportError } from './privateHttpTransport'
 import type {
   ApprovalCenter,
@@ -256,6 +259,17 @@ export function createApprovalCenterV4(
   })
 
   return {
+    async setElevatedMode(sessionKey, mode, request) {
+      try {
+        await options.http.requestJson('/api/elevated-mode', {
+          method: 'POST',
+          json: { sessionKey, mode },
+          ...httpOptions(request),
+        })
+      } catch (error) {
+        throw mapApprovalError(error)
+      }
+    },
     async snapshot(request) {
       try {
         const value = await options.http.requestJson<unknown>('/api/approvals', {

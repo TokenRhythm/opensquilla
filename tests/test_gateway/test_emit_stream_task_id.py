@@ -41,7 +41,12 @@ from opensquilla.gateway.task_runtime import _task_identity_payload
 SESSION = "agent:main:webchat:issue344"
 
 
-def _make_envelope(session_key: str = SESSION) -> RouteEnvelope:
+def _make_envelope(
+    session_key: str = SESSION,
+    *,
+    session_id: str | None = None,
+    session_epoch: int | None = None,
+) -> RouteEnvelope:
     return RouteEnvelope(
         source_kind=SourceKind.WEB,
         source_name="test",
@@ -49,6 +54,8 @@ def _make_envelope(session_key: str = SESSION) -> RouteEnvelope:
         session_key=session_key,
         input_provenance={"kind": "test"},
         metadata={},
+        session_id=session_id,
+        session_epoch=session_epoch,
     )
 
 
@@ -67,6 +74,19 @@ def test_task_identity_keeps_client_and_durable_message_ids_distinct() -> None:
         "client_message_id": "client-message-A",
         "user_message_id": "durable-message-A",
         "surface_id": "web:browser",
+    }
+
+
+def test_task_identity_uses_durable_session_epoch_field() -> None:
+    payload = _task_identity_payload(
+        _make_envelope(session_id="session-A", session_epoch=0),
+        "turn-A",
+    )
+
+    assert payload == {
+        "turn_id": "turn-A",
+        "session_id": "session-A",
+        "session_epoch": 0,
     }
 
 
@@ -338,6 +358,7 @@ async def test_emit_stamps_cross_surface_turn_identity_on_every_stream_event() -
         heartbeat_interval=0.0,
         task_id="task-A",
         session_id="session-A",
+        session_epoch=7,
         client_message_id="client-message-A",
         user_message_id="durable-message-A",
         surface_id="tui:process-A",
@@ -348,6 +369,7 @@ async def test_emit_stamps_cross_surface_turn_identity_on_every_stream_event() -
     assert payload["task_id"] == "task-A"
     assert payload["turn_id"] == "task-A"
     assert payload["session_id"] == "session-A"
+    assert payload["epoch"] == 7
     assert payload["client_message_id"] == "client-message-A"
     assert payload["user_message_id"] == "durable-message-A"
     assert payload["surface_id"] == "tui:process-A"
@@ -399,6 +421,7 @@ async def test_emit_without_task_id_omits_field_for_old_clients() -> None:
 
     assert emitted
     assert "task_id" not in emitted[0][2]
+    assert "epoch" not in emitted[0][2]
 
 
 @pytest.mark.asyncio
@@ -535,9 +558,11 @@ async def test_context_bound_timeout_cannot_emit_second_terminal_error() -> None
 @pytest.mark.asyncio
 async def test_dispatch_threads_run_task_id_into_stream_events() -> None:
     emitted: list[tuple[str, str, dict[str, Any]]] = []
+    run_kwargs: dict[str, Any] = {}
 
     class _Runner:
         async def run(self, message: str, session_key: str, **kwargs: Any):  # noqa: ARG002
+            run_kwargs.update(kwargs)
             yield ToolUseStartEvent(tool_use_id="t1", tool_name="shell")
             yield TextDeltaEvent(text="hi")
 
@@ -548,8 +573,10 @@ async def test_dispatch_threads_run_task_id_into_stream_events() -> None:
         agent_id="main",
         task_id="task-77",
         session_key=SESSION,
+        session_id="session-77",
+        session_epoch=3,
         message="hello",
-        envelope=_make_envelope(),
+        envelope=_make_envelope(session_id="session-77", session_epoch=3),
         attachments=[],
         input_provenance={},
         run_kind="interactive",
@@ -574,3 +601,7 @@ async def test_dispatch_threads_run_task_id_into_stream_events() -> None:
     stream_events = [e for e in emitted if e[1].startswith("session.event.")]
     assert stream_events, "the dispatcher should have emitted stream events"
     assert all(payload.get("task_id") == "task-77" for _, _, payload in stream_events)
+    assert all(payload.get("session_id") == "session-77" for _, _, payload in stream_events)
+    assert all(payload.get("epoch") == 3 for _, _, payload in stream_events)
+    assert run_kwargs["expected_session_id"] == "session-77"
+    assert run_kwargs["expected_session_epoch"] == 3

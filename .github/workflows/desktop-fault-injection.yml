@@ -47,7 +47,7 @@ concurrency:
 jobs:
   macos-fault-injection:
     name: macOS packaged fault injection
-    if: github.repository == 'opensquilla/opensquilla' && github.actor == 'Open-Squilla'
+    if: github.repository == 'TokenRhythm/opensquilla' && github.actor == 'Open-Squilla'
     runs-on: macos-latest
     timeout-minutes: 60
 
@@ -150,7 +150,7 @@ jobs:
   macos-wedge-probe:
     name: macOS interrupted-consolidation probe (reported, not gating)
     if: >-
-      github.repository == 'opensquilla/opensquilla'
+      github.repository == 'TokenRhythm/opensquilla'
       && github.actor == 'Open-Squilla'
       && inputs.run_wedge_probe
     runs-on: macos-latest
@@ -255,7 +255,7 @@ jobs:
   windows-fault-injection:
     name: Windows packaged fault injection
     if: >-
-      github.repository == 'opensquilla/opensquilla'
+      github.repository == 'TokenRhythm/opensquilla'
       && github.actor == 'Open-Squilla'
       && inputs.windows_source_run_id != ''
     runs-on: windows-latest

@@ -515,13 +515,13 @@ async def generate_session_title(
         if naming_cfg is None or not getattr(naming_cfg, "enabled", False):
             return
 
-        # Local imports avoid a module-load cycle (rpc_sessions imports this module).
-        from opensquilla.gateway.model_routing import model_routing_snapshot
-        from opensquilla.gateway.rpc_chat import (
-            _effective_compaction_model,
-            _resolve_compaction_provider,
+        # Local imports keep the optional background path out of startup imports.
+        from opensquilla.gateway.compaction_target import (
+            effective_session_model,
+            resolve_selected_compaction_provider,
         )
-        from opensquilla.gateway.rpc_sessions import _emit_to_subscribers
+        from opensquilla.gateway.model_routing import model_routing_snapshot
+        from opensquilla.gateway.session_event_publisher import emit_session_event
         from opensquilla.gateway.session_events import build_sessions_changed_payload
         from opensquilla.gateway.session_services import get_session_storage
 
@@ -532,14 +532,14 @@ async def generate_session_title(
         if session is None or not title_slot_is_empty(session):
             return
 
-        provider = _resolve_compaction_provider(ctx, session)
+        provider = resolve_selected_compaction_provider(ctx, session)
         if provider is None:
             return
         target = resolve_naming_target(
             naming_cfg,
             getattr(config, "squilla_router", None),
             provider,
-            _effective_compaction_model(session),
+            effective_session_model(session),
             use_router_default_tier=(
                 model_routing_snapshot(config)["mode"] != "direct"
             ),
@@ -586,7 +586,7 @@ async def generate_session_title(
             return
         await updater(session_key, derived_title=title)
 
-        await _emit_to_subscribers(
+        await emit_session_event(
             ctx,
             session_key,
             "sessions.changed",

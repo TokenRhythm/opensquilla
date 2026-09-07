@@ -5,6 +5,13 @@ import {
   type WebSocketRoute,
 } from '@playwright/test'
 
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
+
 const CONTROL_URL = '/control/'
 const SESSION_A = 'agent:main:webchat:e2e-workspace-a'
 const SESSION_B = 'agent:main:webchat:e2e-workspace-b'
@@ -71,10 +78,8 @@ function session(key: string, title: string, workspaceId: string, path: string, 
 
 function subscriptionPayload(key: string) {
   const isA = key === SESSION_A
-  return {
-    subscribed: true,
+  return sessionMessagesSubscribePayload(key, {
     hydration_complete: true,
-    replay_complete: true,
     current_stream_seq: isA ? 10 : 20,
     stream_generation: 'workspace-switch-generation',
     run_status: 'idle',
@@ -82,17 +87,15 @@ function subscriptionPayload(key: string) {
     projectWorkspace: isA
       ? workspace(WORKSPACE_A, 'Workspace A', '/fixtures/workspace-a')
       : workspace(WORKSPACE_B, 'Workspace B', '/fixtures/workspace-b'),
-  }
+  })
 }
 
 function snapshotPayload(key: string) {
-  return {
-    key,
-    events: [],
+  return sessionMessagesSnapshotPayload(key, {
     current_stream_seq: key === SESSION_A ? 10 : 20,
     stream_generation: 'workspace-switch-generation',
     run_status: 'idle',
-  }
+  })
 }
 
 function basePayload(method: string): unknown {
@@ -255,16 +258,12 @@ test('workspace navigation keeps one transport while the target subscription rec
         return
       }
       if (method === 'chat.history') {
-        socket.send(response(frame.id, {
-          messages: [{
+        socket.send(response(frame.id, chatHistoryPayload([{
             role: 'user',
             text: key === SESSION_A ? 'Workspace A history' : 'Workspace B history',
             message_id: key === SESSION_A ? 'history-a' : 'history-b',
             timestamp: '2026-08-26T00:00:00.000Z',
-          }],
-          has_more: false,
-          canonical_complete: true,
-        }))
+          }])))
         return
       }
       if (method === 'sessions.messages.subscribe' && key === SESSION_A) {
@@ -296,7 +295,10 @@ test('workspace navigation keeps one transport while the target subscription rec
         return
       }
       if (method === 'sessions.messages.hydrate') {
-        socket.send(response(frame.id, subscriptionPayload(key)))
+        socket.send(response(frame.id, sessionMessagesHydratePayload(
+          key,
+          subscriptionPayload(key),
+        )))
         return
       }
       if (method === 'sessions.routing.get') {

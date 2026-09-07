@@ -1653,6 +1653,23 @@ async def test_edit_source_fails_closed_when_configured_backend_is_unavailable(
 
 
 @pytest.mark.asyncio
+async def test_read_file_fails_closed_when_configured_backend_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace-unavailable-read"
+    workspace.mkdir()
+    target = workspace / "target.txt"
+    target.write_text("host contents\n", encoding="utf-8")
+    runtime = get_runtime()
+    assert runtime is not None
+    runtime.backend = UnavailableBackend("native sandbox is unavailable")
+
+    with tool_context(workspace, run_mode="trusted"):
+        with pytest.raises(SandboxBackendError, match="must sandbox filesystem operations"):
+            await fs.read_file("target.txt")
+
+
+@pytest.mark.asyncio
 async def test_edit_source_post_gate_parent_swap_is_worker_owned(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

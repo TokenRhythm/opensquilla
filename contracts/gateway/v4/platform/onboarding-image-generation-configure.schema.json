@@ -1,0 +1,298 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opensquilla.dev/contracts/gateway/v4/platform/onboarding-image-generation-configure.schema.json",
+  "title": "OpenSquilla onboarding.imageGeneration.configure Contract",
+  "description": "Generated boundary Contract for the existing v4 onboarding.imageGeneration.configure behavior.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "request": {
+      "$ref": "#/$defs/OnboardingImageGenerationConfigureRequestFrame"
+    },
+    "response": {
+      "$ref": "#/$defs/OnboardingImageGenerationConfigureResponseFrame"
+    }
+  },
+  "x-opensquilla-wire": {
+    "protocol": "opensquilla-websocket-json",
+    "version": 4,
+    "compatibility": "exact-json-tree"
+  },
+  "x-opensquilla-codegen": {
+    "python": {
+      "tool": "datamodel-code-generator",
+      "version": "0.75.1",
+      "target": "pydantic_v2.BaseModel"
+    },
+    "typescript": {
+      "tool": "json-schema-to-typescript",
+      "version": "15.0.4"
+    },
+    "runtimeValidation": {
+      "tool": "ajv",
+      "version": "8.17.1",
+      "mode": "standalone-adapter-only"
+    }
+  },
+  "x-opensquilla-method": {
+    "name": "onboarding.imageGeneration.configure",
+    "kind": "command",
+    "scope": "operator.admin",
+    "guestAllowed": false,
+    "idempotency": "idempotent",
+    "timeout": {
+      "policy": "transport"
+    },
+    "capability": {
+      "kind": "method-availability",
+      "name": "onboarding.imageGeneration.configure"
+    },
+    "request": "#/$defs/OnboardingImageGenerationConfigureRequestFrame",
+    "params": "#/$defs/OnboardingImageGenerationConfigureParams",
+    "response": "#/$defs/OnboardingImageGenerationConfigureResponseFrame",
+    "result": "#/$defs/OnboardingImageGenerationConfigureResult",
+    "errors": [
+      {
+        "code": "INVALID_REQUEST"
+      },
+      {
+        "code": "UNAUTHORIZED"
+      },
+      {
+        "code": "UNAVAILABLE",
+        "retryable": true
+      },
+      {
+        "code": "INTERNAL_ERROR"
+      }
+    ]
+  },
+  "$defs": {
+    "OnboardingImageGenerationConfigureParams": {
+      "title": "onboarding.imageGeneration.configure params",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "providerId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "primary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "apiKey": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "apiKeyEnv": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "baseUrl": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "size": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "outputFormat": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fallbacks": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {}
+        },
+        "clearFallbacks": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "credentialMode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "providerId"
+      ]
+    },
+    "OnboardingImageGenerationConfigureRequestFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "method"
+      ],
+      "properties": {
+        "type": {
+          "const": "req"
+        },
+        "id": {
+          "type": "string"
+        },
+        "method": {
+          "const": "onboarding.imageGeneration.configure"
+        },
+        "params": {
+          "$ref": "#/$defs/OnboardingImageGenerationConfigureParams"
+        }
+      }
+    },
+    "OnboardingImageGenerationConfigureResult": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "changed",
+        "restartRequired",
+        "configPath",
+        "entry",
+        "warnings"
+      ],
+      "properties": {
+        "changed": {
+          "type": "boolean"
+        },
+        "restartRequired": {
+          "type": "boolean"
+        },
+        "configPath": {
+          "type": "string"
+        },
+        "entry": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "RpcError": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {},
+        "retryable": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "retry_after_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "OnboardingImageGenerationConfigureOkResponseFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "ok",
+        "payload"
+      ],
+      "properties": {
+        "type": {
+          "const": "res"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ok": {
+          "const": true
+        },
+        "payload": {
+          "$ref": "#/$defs/OnboardingImageGenerationConfigureResult"
+        },
+        "error": {
+          "type": "null"
+        }
+      }
+    },
+    "OnboardingImageGenerationConfigureErrorResponseFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "ok",
+        "error"
+      ],
+      "properties": {
+        "type": {
+          "const": "res"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ok": {
+          "const": false
+        },
+        "payload": {
+          "type": "null"
+        },
+        "error": {
+          "$ref": "#/$defs/RpcError"
+        }
+      }
+    },
+    "OnboardingImageGenerationConfigureResponseFrame": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/OnboardingImageGenerationConfigureOkResponseFrame"
+        },
+        {
+          "$ref": "#/$defs/OnboardingImageGenerationConfigureErrorResponseFrame"
+        }
+      ]
+    }
+  }
+}

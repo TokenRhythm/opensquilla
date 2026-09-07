@@ -1,4 +1,4 @@
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import type { PlanRevisionSnapshot } from '@/types/plans'
 
 /**

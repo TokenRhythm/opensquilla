@@ -1,5 +1,3 @@
-import type { RpcClientError } from '@/lib/rpc'
-
 export const ARTIFACT_PRODUCT_ERROR_CODES = [
   'DOCUMENT_CHANGED',
   'EDIT_SESSION_RENEWAL_REQUIRED',
@@ -38,7 +36,22 @@ export interface ArtifactProductErrorClassification {
   accepted: boolean | null
 }
 
-const CURRENT_CODES = new Set<string>(ARTIFACT_PRODUCT_ERROR_CODES)
+/** Product-owned failure shape; Gateway Adapters project transport failures here. */
+export class ArtifactProductFailure extends Error {
+  constructor(
+    readonly code: ArtifactProductErrorCode,
+    message: string,
+    readonly details?: unknown,
+    readonly retryable = false,
+    readonly retryAfterMs: number | null = null,
+    readonly accepted: boolean | null = null,
+    readonly outcomeUncertain = false,
+    readonly artifactScoped = true,
+  ) {
+    super(message)
+    this.name = 'ArtifactProductFailure'
+  }
+}
 
 const ARTIFACT_SCOPED_CURRENT_CODES = new Set<string>([
   'DOCUMENT_CHANGED',
@@ -53,49 +66,6 @@ const ARTIFACT_SCOPED_CURRENT_CODES = new Set<string>([
   'ANNOTATION_UNAVAILABLE',
   'ANNOTATION_BUSY',
 ])
-
-const LEGACY_CODE_ALIASES: Readonly<Record<string, ArtifactProductErrorCode>> = {
-  ARTIFACT_REVISION_CHANGED: 'DOCUMENT_CHANGED',
-  ARTIFACT_SOURCE_CHANGED: 'DOCUMENT_CHANGED',
-  ARTIFACT_DOCUMENT_CONFLICT: 'DOCUMENT_CHANGED',
-  ARTIFACT_CHANGE_NOT_HEAD: 'DOCUMENT_CHANGED',
-  ARTIFACT_CONFLICT: 'DOCUMENT_CHANGED',
-  ARTIFACT_PREVIEW_CHANGED: 'DOCUMENT_CHANGED',
-  ARTIFACT_SELECTION_CHANGED: 'DOCUMENT_CHANGED',
-  DOCUMENT_RESOURCE_CONFLICT: 'DOCUMENT_CHANGED',
-  DOCUMENT_MUTATION_CONFLICT: 'DOCUMENT_CHANGED',
-  WORKBENCH_CURSOR_STALE: 'DOCUMENT_CHANGED',
-  ARTIFACT_EDIT_SESSION_EXPIRED: 'EDIT_SESSION_RENEWAL_REQUIRED',
-  ARTIFACT_EDIT_SESSION_STALE: 'EDIT_SESSION_RENEWAL_REQUIRED',
-  ARTIFACT_EDIT_SESSION_CONFLICT: 'EDIT_SESSION_RENEWAL_REQUIRED',
-  ARTIFACT_WRITER_LEASE_CONFLICT: 'WRITE_BUSY',
-  STORAGE_BUSY: 'WRITE_BUSY',
-  ARTIFACT_CHANGE_NOT_APPLIED: 'MUTATION_NOT_APPLIED',
-  ARTIFACT_MUTATION_CLEANUP_AMBIGUOUS: 'MUTATION_OUTCOME_PENDING',
-  ARTIFACT_ANNOTATION_NOT_DRAFT: 'ANNOTATION_UNAVAILABLE',
-  ARTIFACT_FOCUS_UNAVAILABLE: 'ANNOTATION_UNAVAILABLE',
-  ARTIFACT_FOCUS_UNSUPPORTED: 'ANNOTATION_UNAVAILABLE',
-  ARTIFACT_SELECTION_UNAVAILABLE: 'ANNOTATION_UNAVAILABLE',
-  ARTIFACT_SELECTION_UNSUPPORTED: 'ANNOTATION_UNAVAILABLE',
-  ARTIFACT_SOURCE_ENCODING: 'RESOURCE_UNSUPPORTED',
-  ARTIFACT_SOURCE_TOO_LARGE: 'RESOURCE_UNSUPPORTED',
-  ARTIFACT_SOURCE_UNSUPPORTED: 'RESOURCE_UNSUPPORTED',
-  DOCUMENT_IMPORT_FORMAT_UNSUPPORTED: 'RESOURCE_UNSUPPORTED',
-  DOCUMENT_IMPORT_ENCODING_UNSUPPORTED: 'RESOURCE_UNSUPPORTED',
-  DOCUMENT_IMPORT_SIZE_UNSUPPORTED: 'RESOURCE_UNSUPPORTED',
-  DOCUMENT_IMPORT_HTML_INVALID: 'RESOURCE_UNSUPPORTED',
-  DOCUMENT_BUNDLE_UNSUPPORTED: 'RESOURCE_UNSUPPORTED',
-  DOCUMENT_PUBLISH_FORMAT_UNSUPPORTED: 'RESOURCE_UNSUPPORTED',
-  WORKBENCH_PREVIEW_ENCODING_UNSUPPORTED: 'RESOURCE_UNSUPPORTED',
-  WORKBENCH_PREVIEW_UNSUPPORTED: 'RESOURCE_UNSUPPORTED',
-  INVALID_PARAMS: 'INVALID_REQUEST',
-  BAD_REQUEST: 'INVALID_REQUEST',
-  NOT_FOUND: 'DOCUMENT_UNAVAILABLE',
-  UNAVAILABLE: 'DOCUMENT_UNAVAILABLE',
-  UNAUTHORIZED: 'PERMISSION_DENIED',
-  RPC_TRANSPORT_ERROR: 'DOCUMENT_UNAVAILABLE',
-  RPC_TIMEOUT: 'DOCUMENT_UNAVAILABLE',
-}
 
 const PRESENTATION: Readonly<Record<ArtifactProductErrorCode, {
   key: ArtifactProductErrorClassification['messageKey']
@@ -174,19 +144,6 @@ const PRESENTATION: Readonly<Record<ArtifactProductErrorCode, {
   },
 }
 
-function errorRecord(error: unknown): Partial<RpcClientError> & Record<string, unknown> {
-  return error !== null && typeof error === 'object'
-    ? error as Partial<RpcClientError> & Record<string, unknown>
-    : {}
-}
-
-function canonicalCode(error: unknown): ArtifactProductErrorCode {
-  const raw = errorRecord(error)
-  const candidate = typeof raw.code === 'string' ? raw.code.trim().toUpperCase() : ''
-  if (CURRENT_CODES.has(candidate)) return candidate as ArtifactProductErrorCode
-  return LEGACY_CODE_ALIASES[candidate] || 'INTERNAL_ERROR'
-}
-
 /**
  * True only for errors whose code itself identifies the Artifact product
  * surface. Generic chat codes such as INVALID_REQUEST and INTERNAL_ERROR keep
@@ -194,13 +151,7 @@ function canonicalCode(error: unknown): ArtifactProductErrorCode {
  */
 export function isKnownArtifactProductErrorCode(code: unknown): boolean {
   const candidate = typeof code === 'string' ? code.trim().toUpperCase() : ''
-  if (ARTIFACT_SCOPED_CURRENT_CODES.has(candidate)) return true
-  if (
-    candidate.startsWith('ARTIFACT_')
-    || candidate.startsWith('DOCUMENT_')
-    || candidate.startsWith('WORKBENCH_')
-  ) return candidate in LEGACY_CODE_ALIASES
-  return false
+  return ARTIFACT_SCOPED_CURRENT_CODES.has(candidate)
 }
 
 /**
@@ -210,41 +161,28 @@ export function isKnownArtifactProductErrorCode(code: unknown): boolean {
 export function classifyArtifactProductError(
   error: unknown,
 ): ArtifactProductErrorClassification {
-  const raw = errorRecord(error)
-  const code = canonicalCode(error)
+  const failure = error instanceof ArtifactProductFailure ? error : null
+  const code = failure?.code ?? 'INTERNAL_ERROR'
   const presentation = PRESENTATION[code]
-  const rawRetryAfter = raw.retry_after_ms
-  const retryAfter = Number(rawRetryAfter)
   return {
     code,
     messageKey: presentation.key,
     fallbackMessage: presentation.fallback,
     recovery: presentation.recovery,
-    retryable: raw.retryable === true,
-    retryAfterMs: rawRetryAfter !== null
-      && rawRetryAfter !== undefined
-      && Number.isFinite(retryAfter)
-      && retryAfter >= 0
-      ? retryAfter
-      : null,
-    accepted: typeof raw.accepted === 'boolean' ? raw.accepted : null,
+    retryable: failure?.retryable === true,
+    retryAfterMs: failure?.retryAfterMs ?? null,
+    accepted: failure?.accepted ?? null,
   }
 }
 
 /** A transport loss can hide a committed write even without a server code. */
 export function artifactMutationOutcomeMayBePending(error: unknown): boolean {
-  const raw = errorRecord(error)
-  if (raw.accepted === false) return false
-  const candidate = typeof raw.code === 'string' ? raw.code.trim().toUpperCase() : ''
-  return raw.accepted === null
-    || candidate === 'RPC_TRANSPORT_ERROR'
-    || candidate === 'RPC_TIMEOUT'
-    || candidate === 'MUTATION_OUTCOME_PENDING'
-    || candidate === 'ARTIFACT_MUTATION_CLEANUP_AMBIGUOUS'
+  if (!(error instanceof ArtifactProductFailure) || error.accepted === false) return false
+  return error.outcomeUncertain || error.code === 'MUTATION_OUTCOME_PENDING'
 }
 
 export function artifactProductReasonCode(error: unknown): string | null {
-  const details = errorRecord(error).details
+  const details = error instanceof ArtifactProductFailure ? error.details : null
   if (details === null || typeof details !== 'object') return null
   const reasonCode = (details as Record<string, unknown>).reasonCode
   return typeof reasonCode === 'string' && reasonCode.trim() ? reasonCode.trim() : null
@@ -254,8 +192,9 @@ export function artifactProductClientError(
   code: ArtifactProductErrorCode,
   options: { reasonCode?: string } = {},
 ): Error {
-  const error = new Error(PRESENTATION[code].fallback) as RpcClientError
-  error.code = code
-  if (options.reasonCode) error.details = { reasonCode: options.reasonCode }
-  return error
+  return new ArtifactProductFailure(
+    code,
+    PRESENTATION[code].fallback,
+    options.reasonCode ? { reasonCode: options.reasonCode } : undefined,
+  )
 }

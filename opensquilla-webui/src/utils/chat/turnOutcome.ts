@@ -6,7 +6,6 @@ import type {
   DocumentMutationRetryPolicy,
   DocumentMutationStatus,
 } from '@/types/chat'
-import type { ChatHistoryTurnOutcome } from '@/types/rpc'
 import {
   isUsageAccountingBarrier,
   terminalActivityStatusHistory,
@@ -198,7 +197,7 @@ function timestampMilliseconds(value: number | string | undefined): number {
 }
 
 export function normalizeTurnOutcome(
-  raw: ChatHistoryTurnOutcome | ChatRunTask | Record<string, unknown> | null | undefined,
+  raw: ChatRunTask | Readonly<Record<string, unknown>> | null | undefined,
 ): ChatTurnOutcome | undefined {
   if (!raw) return undefined
   const record = raw as RawOutcomeRecord

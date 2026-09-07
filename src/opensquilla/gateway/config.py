@@ -26,12 +26,28 @@ from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 from opensquilla import __version__
+from opensquilla.application.config_secrets import (
+    _PUBLIC_SECRET_EXACT_KEYS as _PUBLIC_SECRET_EXACT_KEYS,
+)
+from opensquilla.application.config_secrets import (
+    _PUBLIC_SECRET_SUFFIXES as _PUBLIC_SECRET_SUFFIXES,
+)
+from opensquilla.application.config_secrets import (
+    _REDACTED as _REDACTED,
+)
+from opensquilla.application.config_secrets import (
+    is_sensitive_config_key as is_sensitive_config_key,
+)
+from opensquilla.application.config_secrets import (
+    redact_public_config as redact_public_config,
+)
 from opensquilla.gateway.config_migration import (
     LATEST_CONFIG_VERSION,
     ConfigParseError,
     backup_and_write_migrated_config,
     handle_deprecated_skill_filter_env,
     migrate_config_payload,
+    strip_deprecated_skill_filter_settings,
 )
 from opensquilla.paths import default_opensquilla_home, native_io_path
 from opensquilla.provider.credentials import (
@@ -270,6 +286,12 @@ class SkillsConfig(BaseSettings):
     # "user_message" = legacy compact system-prompt index
     injection_mode: str = "system"
 
+    @model_validator(mode="before")
+    @classmethod
+    def _ignore_retired_filter_settings(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            return strip_deprecated_skill_filter_settings(data)
+        return data
 
 
 class ToolsConfig(BaseModel):
@@ -1482,6 +1504,7 @@ class MCPServerEntry(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_MCP_SERVER_")
 
     name: str = ""
+    description: str = ""
     transport: str = "stdio"  # "stdio" | "sse"
     command: str | None = None  # for stdio
     args: list[str] = Field(default_factory=list)  # for stdio
@@ -3410,50 +3433,6 @@ def resolve_listen_address(
 
 
 # --- Public config redaction (pilot) --------------------------------------
-
-_PUBLIC_SECRET_EXACT_KEYS = frozenset(
-    {
-        "token",
-        "password",
-        "api_key",
-        "authorization",
-        "signing_secret",
-        "app_secret",
-        "verification_token",
-        # Channel-crypto secrets that no generic suffix above catches:
-        # channels.feishu.encrypt_key (event decryption key) and
-        # channels.wecom.encoding_aes_key (callback AES key). Exact names on
-        # purpose — NOT a blanket "_key" suffix: key-NAME/reference fields
-        # must stay readable (llm.api_key_env and the other *_env fields name
-        # WHICH env var a secret loads from and clients render them), and a
-        # "_key" suffix would also swallow future non-secret identifiers
-        # (session/public/idempotency keys). Add further crypto-material
-        # fields here individually, never by widening the suffix set.
-        "encrypt_key",
-        "encoding_aes_key",
-    }
-)
-_PUBLIC_SECRET_SUFFIXES = ("_token", "_secret", "_password", "_api_key")
-_REDACTED = "[redacted]"
-
-
-def is_sensitive_config_key(key: str) -> bool:
-    normalized = key.lower().replace("-", "_")
-    return normalized in _PUBLIC_SECRET_EXACT_KEYS or normalized.endswith(_PUBLIC_SECRET_SUFFIXES)
-
-
-def redact_public_config(value: Any) -> Any:
-    if isinstance(value, dict):
-        redacted: dict[str, Any] = {}
-        for key, item in value.items():
-            if is_sensitive_config_key(key) and item:
-                redacted[key] = _REDACTED
-            else:
-                redacted[key] = redact_public_config(item)
-        return redacted
-    if isinstance(value, list):
-        return [redact_public_config(item) for item in value]
-    return value
 
 
 def _delete_path(obj: dict[str, Any], path: str) -> None:

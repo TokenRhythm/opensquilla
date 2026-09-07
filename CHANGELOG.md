@@ -6,6 +6,58 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Browser extensions can now reach state-changing HTTP and WebSocket endpoints
+  through a loopback request authority when their exact custom-scheme origin
+  (for example `chrome-extension://<id>`) is listed in `cors.allowed_origins`.
+  Non-loopback request authorities remain rejected by those guards, `"*"` is
+  never accepted, and existing CORS response-header behavior is unchanged.
+
+### Changed
+
+- The bundled Skill catalog now exposes eight ordinary entry points and three
+  stable Meta workflows, with coding instructions available in coding mode.
+  Internal helpers remain available to their owning workflows. The optional
+  relevance filter is retired; old filter settings are ignored during upgrade.
+- Redundant bundled wrappers, including `cron`, `memory`, `git-diff`, and
+  `http-fetch`, are retired while their native tools remain available. The
+  weather and tmux wrappers and the dedicated HTML-to-PDF/LaTeX wrappers are
+  also retired; generic tools remain available, but their former scripts and
+  output contracts are not preserved. PDF extraction, composition and
+  generation remain supported; arbitrary in-place PDF rewriting is no longer
+  a dedicated Skill capability.
+- In total, 31 bundled Skills are retired: four native-tool wrappers, five
+  audio wrappers, `summarize`, five weather/tmux/HTML-to-PDF/LaTeX/PDF-rewrite
+  wrappers, eight obsolete paper helpers, three creator helpers whose work
+  now runs in the creator runtime, and five stack-trace probes.
+- Catalog retirement takes effect when the upgraded Gateway restarts and
+  rebuilds its Skill snapshot. Personal, project and other user-installed
+  copies are not removed, and memory files and scheduled jobs stay in place.
+  Old Meta workflow definitions that reference retired Skills must be updated
+  by their authors; they are not automatically migrated.
+
+### Fixed
+
+- Skill and Meta catalog reads remain compatible when the Web UI and Gateway
+  are upgraded separately. Meta details fall back on older gateways; new
+  gateways preserve public Meta list and detail responses for older clients.
+  Managed instances keep their source and lifecycle identity, and dependency
+  status refreshes after setup without retaining old missing-dependency counts.
+- Retired nested Skill-filter environment variables no longer prevent Gateway
+  startup. Newly authored personal and project Meta SOPs receive the correct
+  invocation defaults, and command completion follows the public catalog.
+
+- Aborting a turn no longer leaves an orphan task that crashes while the turn
+  generator is finalized. The gateway now closes the runner stream when the
+  consuming task exits, and the turn scope stack (process ownership, sandbox
+  policy, Git run mode, runtime pack, and managed toolchain state) tolerates
+  being unwound from a different asyncio Context, such as asyncio's
+  async-generator finalizer. Previously every `chat.abort` logged
+  `Task exception was never retrieved` with a nested
+  `ValueError: ... was created in a different Context` chain, and the
+  subscriber-visible turn-terminal event could be lost.
+
 ## [0.5.4] - 2026-08-25
 
 ### Added

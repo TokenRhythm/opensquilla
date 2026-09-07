@@ -1,4 +1,5 @@
 import { computed, ref } from 'vue'
+import type { ConfigureAudio } from '@/modules/setupWorkflow'
 
 // Curated keys promoted into Settings beyond the classic wizard fields.
 // Timeout and memory capture persist through the config.patch RPC as
@@ -173,10 +174,10 @@ export function useSettingsPromotedForm() {
     return { 'memory.auto_capture_enabled': memoryAutoCapture.value }
   }
 
-  function audioPayload(): Record<string, unknown> {
+  function audioPayload(): ConfigureAudio {
     // Configuration implies enablement for new clients. Older clients may
     // continue sending an explicit `enabled` field to the compatible RPC.
-    const params: Record<string, unknown> = { providerId: audioProviderId }
+    const params: ConfigureAudio = { providerId: audioProviderId }
     // One-time paste only; never echo the redacted stored key back.
     if (audioApiKey.value) params.apiKey = audioApiKey.value
     else if (audioApiKeyEnv.value.trim()) params.apiKeyEnv = audioApiKeyEnv.value.trim()

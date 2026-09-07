@@ -107,6 +107,8 @@ class T3UpgradeCompactionPort(Protocol):
         consumer_admission: Any | None = None,
         consumer_admission_fingerprint: str = "",
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> str: ...
 
 @runtime_checkable
@@ -140,6 +142,8 @@ class PreflightCompactionPort(Protocol):
         consumer_admission: Any | None = None,
         consumer_admission_fingerprint: str = "",
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> None: ...
 
 @runtime_checkable
@@ -168,6 +172,8 @@ class HistoryLoaderPort(Protocol):
         bound_user_message_id: str | None = None,
         restricted_turn: bool = False,
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> str | None: ...
 
 @runtime_checkable
@@ -219,6 +225,8 @@ class CompactionAndHistoryStageInput:
     session_key: str
     agent_id: str
     history_has_persisted_user: bool
+    expected_session_id: str | None = None
+    expected_session_epoch: int | None = None
     compaction_context_window_tokens: int | None = None
     compaction_provider: Any | None = None
     compaction_model: str | None = None
@@ -366,6 +374,9 @@ class CompactionAndHistoryStage:
             t3_kwargs: dict[str, Any] = {}
             if inp.transcript_snapshot is not None:
                 t3_kwargs["transcript_snapshot"] = inp.transcript_snapshot
+            if inp.expected_session_id is not None or inp.expected_session_epoch is not None:
+                t3_kwargs["expected_session_id"] = inp.expected_session_id
+                t3_kwargs["expected_session_epoch"] = inp.expected_session_epoch
             t3_status = await self._t3_upgrade.maybe_compact(
                 session_key=inp.session_key,
                 turn=inp.turn,
@@ -398,6 +409,9 @@ class CompactionAndHistoryStage:
                 preflight_kwargs: dict[str, Any] = {}
                 if inp.transcript_snapshot is not None:
                     preflight_kwargs["transcript_snapshot"] = inp.transcript_snapshot
+                if inp.expected_session_id is not None or inp.expected_session_epoch is not None:
+                    preflight_kwargs["expected_session_id"] = inp.expected_session_id
+                    preflight_kwargs["expected_session_epoch"] = inp.expected_session_epoch
                 await self._preflight.maybe_compact(
                     session_key=inp.session_key,
                     context_window_tokens=compaction_context_window_tokens,
@@ -419,6 +433,9 @@ class CompactionAndHistoryStage:
         history_kwargs: dict[str, Any] = {}
         if inp.transcript_snapshot is not None:
             history_kwargs["transcript_snapshot"] = inp.transcript_snapshot
+        if inp.expected_session_id is not None or inp.expected_session_epoch is not None:
+            history_kwargs["expected_session_id"] = inp.expected_session_id
+            history_kwargs["expected_session_epoch"] = inp.expected_session_epoch
         loaded_compaction_summary_context = await self._history_loader.load(
             agent=inp.agent,
             session_key=inp.session_key,

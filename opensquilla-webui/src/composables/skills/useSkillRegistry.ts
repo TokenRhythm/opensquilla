@@ -1,6 +1,6 @@
 import { computed, ref, type ComputedRef, type Ref } from 'vue'
 import i18n from '@/i18n'
-import type { useRpcStore } from '@/stores/rpc'
+import type { SkillCatalog, SkillInstallResult } from '@/modules/skillCatalog'
 import { useToasts } from '@/composables/useToasts'
 import {
   createSkillMutationGate,
@@ -10,38 +10,9 @@ import type {
   RegistryResult,
   SkillDependencyInstallOutcome,
   SkillDiagnostic,
-  SkillLifecycle,
-  SkillSourceResolution,
 } from '@/types/skills'
 
-interface RegistrySearchData {
-  results?: RegistryResult[]
-  diagnostics?: SkillDiagnostic[]
-  message?: string
-}
-
-export interface InstallResult {
-  success: boolean
-  cancelled?: boolean
-  unchanged?: boolean
-  name?: string
-  message?: string
-  installed?: boolean
-  active?: boolean
-  instruction_usable?: boolean
-  installId?: string
-  lifecycle?: SkillLifecycle
-  resolution?: SkillSourceResolution
-  diagnostics?: SkillDiagnostic[]
-  rollbackPerformed?: boolean
-  catalogGeneration?: number
-  effectiveFrom?: 'next_turn' | 'next_start' | string
-  missing_still?: {
-    bins?: string[]
-    env?: string[]
-    env_any?: string[][]
-  }
-}
+export type InstallResult = SkillInstallResult
 
 export type SkillInstallQueueStatus =
   | 'queued'
@@ -240,7 +211,7 @@ export interface SkillRegistry {
 }
 
 export function useSkillRegistry(
-  rpc: ReturnType<typeof useRpcStore>,
+  catalog: SkillCatalog,
   loadData: () => Promise<boolean>,
   mutationGate: SkillMutationGate = createSkillMutationGate(),
 ): SkillRegistry {
@@ -260,8 +231,7 @@ export function useSkillRegistry(
   const runningSource = ref<SkillInstallSource | null>(null)
   const cancellingSource = ref<SkillInstallSource | null>(null)
   const installCancellationSupported = computed(() =>
-    typeof rpc.supportsMethod === 'function'
-    && rpc.supportsMethod('skills.install.cancel'))
+    catalog.supportsInstallCancellation())
   const activeInstallOperation = ref<{
     id: string
     itemId: string
@@ -287,14 +257,13 @@ export function useSkillRegistry(
     registryDiagnostics.value = []
     registrySearchError.value = ''
     try {
-      const data = await rpc.call<RegistrySearchData>('skills.search', {
-        query,
+      const data = await catalog.search(query, {
         limit: 20,
         source: 'clawhub',
       })
       if (requestId !== searchRequestId) return
-      registryResults.value = data.results || []
-      registryDiagnostics.value = data.diagnostics || []
+      registryResults.value = [...data.results]
+      registryDiagnostics.value = [...data.diagnostics]
       registrySearchError.value = data.message || ''
     } catch (err) {
       if (requestId !== searchRequestId) return
@@ -392,12 +361,12 @@ export function useSkillRegistry(
         }
       }
       try {
-        const res = await rpc.call<InstallResult>('skills.install', {
+        const res = await catalog.install({
           identifier: item.identifier,
           source: item.source,
           ...(operationId ? { operationId } : {}),
           ...(riskConfirmation
-            ? { force: true, riskConfirmation }
+            ? { riskConfirmation }
             : {}),
         })
         item.result = res
@@ -501,7 +470,7 @@ export function useSkillRegistry(
         installed: installResult.installed ?? installResult.success,
         lifecycle: installResult.lifecycle,
         instruction_usable: installResult.instruction_usable,
-        diagnostics: installResult.diagnostics,
+        diagnostics: installResult.diagnostics ? [...installResult.diagnostics] : undefined,
       }
     })
   }
@@ -556,9 +525,7 @@ export function useSkillRegistry(
       }
     }
     try {
-      await rpc.call<InstallResult>('skills.install.cancel', {
-        operationId: operation.id,
-      })
+      await catalog.cancelInstall(operation.id)
     } catch (err) {
       if (activeInstallOperation.value?.id === operation.id) {
         activeItem.status = 'installing'
@@ -590,19 +557,19 @@ export function useSkillRegistry(
     if (!name || !installId || !mutationGate.acquire('dependency_install')) return failed()
     installingDepsId.value = installId
     try {
-      const res = await rpc.call<InstallResult>('skills.deps.install', {
+      const res = await catalog.installDependencies({
         name,
-        install_id: installId,
-        ...(skillInstallId ? { installId: skillInstallId } : {}),
+        dependencyId: installId,
+        ...(skillInstallId ? { skillInstallId } : {}),
         ...(instanceId ? { instanceId } : {}),
       })
       if (res.success) {
         pushToast(res.message || t('cronSkills.registry.installed'), { tone: 'ok' })
         const still = res.missing_still || {}
         const missingStill = {
-          bins: still.bins || [],
-          env: still.env || [],
-          env_any: still.env_any || [],
+          bins: [...(still.bins || [])],
+          env: [...(still.env || [])],
+          env_any: (still.env_any || []).map(group => [...group]),
         }
         const stillMissing = missingStill.bins.length
           + missingStill.env.length
@@ -632,7 +599,7 @@ export function useSkillRegistry(
     if ((!name && !installId) || !mutationGate.acquire('uninstall')) return false
     uninstallingName.value = name
     try {
-      const res = await rpc.call<InstallResult>('skills.uninstall', {
+      const res = await catalog.uninstall({
         ...(name ? { name } : {}),
         ...(installId ? { installId } : {}),
       })

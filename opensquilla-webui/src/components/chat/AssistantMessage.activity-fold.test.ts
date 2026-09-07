@@ -15,6 +15,11 @@ import type {
 } from '@/types/chat'
 import type { ChatPart } from '@/types/parts'
 import AssistantMessage from './AssistantMessage.vue'
+import { ARTIFACT_WORKBENCH_KEY, type ArtifactWorkbench } from '@/modules/artifactWorkbench'
+import { GATEWAY_ACCESS_KEY, type GatewayAccess } from '@/modules/gatewayAccess'
+import { createV4ArtifactContentAccess } from '@/adapters/gateway/artifactAccessV4'
+import { createV4ArtifactPreviews } from '@/adapters/gateway/artifactPreviewsV4'
+import { httpTransportTestDouble } from '@/testing/httpTransport.test-helper'
 
 const mountedApps: App[] = []
 
@@ -248,6 +253,7 @@ function mountMessage(
   showTurnOutcome = false,
   extraProps: Record<string, unknown> = {},
 ): HTMLElement {
+  const http = httpTransportTestDouble()
   const el = document.createElement('div')
   document.body.appendChild(el)
   const app = createApp({
@@ -274,6 +280,13 @@ function mountMessage(
   mountedApps.push(app)
   app.use(i18n)
   app.use(createPinia())
+  app.provide(GATEWAY_ACCESS_KEY, {
+    isLocalOwner: false,
+  } as GatewayAccess)
+  app.provide(ARTIFACT_WORKBENCH_KEY, {
+    content: createV4ArtifactContentAccess(http),
+    previews: createV4ArtifactPreviews(http, { baseOrigin: () => 'http://localhost' }),
+  } as ArtifactWorkbench)
   app.mount(el)
   return el
 }

@@ -5,11 +5,9 @@ import { describe, expect, it, vi } from 'vitest'
 import type { ChatRenderedMessage } from '@/types/chat'
 import {
   createForkTransitionLifetime,
-  forkRpcRequest,
   forkNavigationPhase,
   forkRouteHandoffAction,
   snapshotForkPreviewMessages,
-  validatedForkChildKey,
 } from './forkTransition'
 
 function deferred<T>() {
@@ -53,35 +51,6 @@ describe('snapshotForkPreviewMessages', () => {
       'assistant-old',
     ])
     expect(preview[1]).not.toBe(source[1])
-  })
-
-  it('uses the dedicated through-turn method and exact payload', () => {
-    expect(forkRpcRequest('parent-key', 'turn-7')).toEqual({
-      method: 'sessions.forkThroughTurn',
-      params: { key: 'parent-key', throughTurnId: 'turn-7' },
-    })
-    expect(forkRpcRequest('parent-key')).toEqual({
-      method: 'sessions.fork',
-      params: { key: 'parent-key' },
-    })
-  })
-
-  it('requires a matching through-turn response echo before accepting the child', () => {
-    expect(validatedForkChildKey({
-      key: 'child-key',
-      forkMode: 'through_turn',
-      throughTurnId: 'turn-7',
-    }, 'turn-7')).toBe('child-key')
-    expect(() => validatedForkChildKey({
-      key: 'child-key',
-      forkMode: 'full',
-      throughTurnId: 'turn-7',
-    }, 'turn-7')).toThrow(/confirm the requested turn boundary/)
-    expect(() => validatedForkChildKey({
-      key: 'child-key',
-      forkMode: 'through_turn',
-      throughTurnId: 'turn-other',
-    }, 'turn-7')).toThrow(/confirm the requested turn boundary/)
   })
 
   it('keeps the preview in returning state until the parent target is ready', () => {

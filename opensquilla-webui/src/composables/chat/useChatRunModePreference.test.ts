@@ -8,29 +8,24 @@ import {
   useChatRunModePreference,
   type RunModePolicy,
 } from './useChatRunModePreference'
-import type { RpcCallOptions } from '@/lib/rpc'
 
-function createRpc() {
+function createSandbox() {
   return {
-    waitForConnection: vi.fn().mockResolvedValue(undefined),
-    call: vi.fn().mockResolvedValue({ runMode: 'full', source: 'preference' }),
+    preference: vi.fn().mockResolvedValue({ runMode: 'full' as const, source: 'preference' }),
+    selectMode: vi.fn().mockResolvedValue({ runMode: 'full' as const, source: 'preference' }),
   }
 }
 
 function runInScope(
   policy: ReturnType<typeof ref<RunModePolicy | null>>,
-  rpc = createRpc(),
-  hydrateCallOptions?: RpcCallOptions,
-  writeCallOptions?: RpcCallOptions,
+  sandbox = createSandbox(),
 ) {
   const scope = effectScope()
   const api = scope.run(() => useChatRunModePreference({
     runModePolicy: () => policy.value,
-    rpc,
-    hydrateCallOptions,
-    writeCallOptions,
+    sandbox,
   }))!
-  return { api, scope, rpc }
+  return { api, scope, sandbox }
 }
 
 afterEach(() => {
@@ -83,30 +78,13 @@ describe('useChatRunModePreference', () => {
       defaultRunMode: 'full',
       allowedRunModes: ['safe', 'full'],
     })
-    const rpc = createRpc()
-    const hydrateCallOptions: RpcCallOptions = {
-      timeoutMs: 2_000,
-      timeoutAction: 'reconnect',
-      abortAction: 'reconnect',
-    }
-    rpc.call.mockResolvedValueOnce({ runMode: 'trusted', source: 'preference' })
-    const { api, scope } = runInScope(policy, rpc, hydrateCallOptions)
+    const sandbox = createSandbox()
+    sandbox.preference.mockResolvedValueOnce({ runMode: 'safe', source: 'preference' })
+    const { api, scope } = runInScope(policy, sandbox)
 
     await api.hydrateRunModePreference()
 
-    expect(rpc.call).toHaveBeenCalledWith(
-      'sandbox.run_mode.preference.get',
-      undefined,
-      hydrateCallOptions,
-    )
-    expect(rpc.waitForConnection).toHaveBeenCalledWith(
-      2_000,
-      undefined,
-      {
-        timeoutAction: 'reject',
-        abortAction: 'reject',
-      },
-    )
+    expect(sandbox.preference).toHaveBeenCalledWith({ timeoutMs: 10_000 })
     expect(api.runMode.value).toBe('safe')
     expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('safe')
     scope.stop()
@@ -117,16 +95,14 @@ describe('useChatRunModePreference', () => {
       defaultRunMode: 'full',
       allowedRunModes: ['safe', 'full'],
     })
-    const rpc = createRpc()
-    rpc.call.mockResolvedValueOnce({ runMode: 'safe', source: 'preference' })
-    const { api, scope } = runInScope(policy, rpc)
+    const sandbox = createSandbox()
+    sandbox.selectMode.mockResolvedValueOnce({ runMode: 'safe', source: 'preference' })
+    const { api, scope } = runInScope(policy, sandbox)
 
     const selected = await api.setGlobalRunMode('safe')
 
     expect(selected).toBe('safe')
-    expect(rpc.call).toHaveBeenCalledWith('sandbox.run_mode.preference.set', {
-      runMode: 'safe',
-    })
+    expect(sandbox.selectMode).toHaveBeenCalledWith('safe', { timeoutMs: 5_000 })
     expect(api.runMode.value).toBe('safe')
     expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('safe')
     scope.stop()
@@ -137,37 +113,20 @@ describe('useChatRunModePreference', () => {
       defaultRunMode: 'full',
       allowedRunModes: ['safe', 'full'],
     })
-    const rpc = createRpc()
+    const sandbox = createSandbox()
     let resolveWrite!: (payload: unknown) => void
-    rpc.call.mockReturnValueOnce(new Promise(resolve => {
+    sandbox.selectMode.mockReturnValueOnce(new Promise(resolve => {
       resolveWrite = resolve
     }))
-    const writeCallOptions: RpcCallOptions = {
-      timeoutMs: 5_000,
-      timeoutAction: 'reject',
-      abortAction: 'reject',
-    }
-    const { api, scope } = runInScope(policy, rpc, undefined, writeCallOptions)
+    const { api, scope } = runInScope(policy, sandbox)
 
     const pending = api.setGlobalRunMode('safe')
 
     expect(api.runMode.value).toBe('safe')
-    expect(rpc.waitForConnection).toHaveBeenCalledWith(
-      5_000,
-      undefined,
-      {
-        timeoutAction: 'reject',
-        abortAction: 'reject',
-      },
-    )
     await Promise.resolve()
-    expect(rpc.call).toHaveBeenCalledWith(
-      'sandbox.run_mode.preference.set',
-      { runMode: 'safe' },
-      writeCallOptions,
-    )
+    expect(sandbox.selectMode).toHaveBeenCalledWith('safe', { timeoutMs: 5_000 })
 
-    resolveWrite({ runMode: 'trusted', source: 'preference' })
+    resolveWrite({ runMode: 'safe', source: 'preference' })
     await expect(pending).resolves.toBe('safe')
     expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('safe')
     scope.stop()
@@ -178,9 +137,9 @@ describe('useChatRunModePreference', () => {
       defaultRunMode: 'full',
       allowedRunModes: ['safe', 'full'],
     })
-    const rpc = createRpc()
-    rpc.call.mockRejectedValueOnce(new Error('write failed'))
-    const { api, scope } = runInScope(policy, rpc)
+    const sandbox = createSandbox()
+    sandbox.selectMode.mockRejectedValueOnce(new Error('write failed'))
+    const { api, scope } = runInScope(policy, sandbox)
 
     await expect(api.setGlobalRunMode('safe')).rejects.toThrow('write failed')
 

@@ -44,6 +44,93 @@ def _inventory(*releases: dict[str, object]) -> list[dict[str, object]]:
     return list(releases)
 
 
+@pytest.mark.parametrize("owner", ["opensquilla", "TokenRhythm"])
+@pytest.mark.parametrize("draft", [False, True])
+@pytest.mark.parametrize(
+    ("tag", "version", "prerelease", "targets"),
+    [
+        ("v0.5.5", "0.5.5", False, ("latest.json", "stable.json", "preview/0.5.5.json")),
+        ("v0.5.5rc1", "0.5.5-rc1", True, ("latest.json", "preview/0.5.5.json")),
+    ],
+)
+def test_repository_migration_preserves_legacy_v1_output(
+    owner: str,
+    draft: bool,
+    tag: str,
+    version: str,
+    prerelease: bool,
+    targets: tuple[str, ...],
+) -> None:
+    release = _release(tag, prerelease=prerelease)
+    release["url"] = f"https://github.com/{owner}/opensquilla/releases/tag/{tag}"
+    release["isDraft"] = draft
+
+    if draft:
+        manifest = build_draft_rehearsal_manifest(release, _assets(version))
+    else:
+        manifest, actual_targets = build_manifest(release, _assets(version))
+        assert actual_targets == targets
+
+    # Published clients require these literal v1 fields, even when skipping releases.
+    assert manifest == {
+        "schemaVersion": 1,
+        "tag": tag,
+        "version": version,
+        "baseVersion": "0.5.5",
+        "prerelease": prerelease,
+        "publishedAt": "2026-07-15T00:00:00Z",
+        "releaseUrl": f"https://github.com/opensquilla/opensquilla/releases/tag/{tag}",
+        "sha256sums": "SHA256SUMS",
+        "platforms": {
+            "darwin-arm64": {
+                "feed": "latest-mac.yml",
+                "archive": f"OpenSquilla-{version}-mac-arm64.zip",
+                "installer": f"OpenSquilla-{version}-mac-arm64.dmg",
+            },
+            "win32-x64": {
+                "feed": "latest.yml",
+                "installer": f"OpenSquilla-{version}-win-x64.exe",
+            },
+        },
+    }
+    assert validate_manifest(manifest) == manifest
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://github.com/TokenRhythm/another-repo/releases/tag/v0.5.5",
+        "https://github.com/another-owner/opensquilla/releases/tag/v0.5.5",
+        "https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.4",
+        "https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.5?download=1",
+        "https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.5/extra",
+        "https://github.com.example.test/TokenRhythm/opensquilla/releases/tag/v0.5.5",
+    ],
+)
+def test_repository_migration_rejects_other_release_urls(url: str) -> None:
+    release = _release("v0.5.5", prerelease=False)
+    release["url"] = url
+
+    with pytest.raises(ManifestError, match="canonical GitHub Release URL"):
+        build_manifest(release, _assets("0.5.5"))
+
+
+def test_new_repository_release_promotes_existing_legacy_channels() -> None:
+    current = _manifest("v0.5.4", "0.5.4", prerelease=False)
+    current["releaseUrl"] = "https://github.com/opensquilla/opensquilla/releases/tag/v0.5.4"
+    release = _release("v0.5.5", prerelease=False)
+    release["url"] = "https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.5"
+    candidate, _ = build_manifest(release, _assets("0.5.5"))
+
+    for channel in ("stable.json", "latest.json"):
+        assert should_promote(current, candidate, channel=channel) is True
+        assert should_promote(candidate, current, channel=channel) is False
+        assert release_is_channel_head([release], candidate, channel=channel) is True
+
+    preview = _manifest("v0.5.5rc1", "0.5.5-rc1", prerelease=True)
+    assert should_promote(preview, candidate, channel="preview/0.5.5.json") is True
+
+
 def test_builds_prerelease_manifest_and_scoped_targets() -> None:
     manifest, targets = build_manifest(_release("v0.5.0rc4", prerelease=True), _assets("0.5.0-rc4"))
 

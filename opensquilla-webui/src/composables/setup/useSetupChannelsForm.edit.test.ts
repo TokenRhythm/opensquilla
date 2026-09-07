@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { REDACTED_SENTINEL } from './channelRpc'
+import { REDACTED_SENTINEL } from '@/modules/channelSetup'
 import { useSetupChannelsForm } from './useSetupChannelsForm'
 
 const SLACK_SPEC = {

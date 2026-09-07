@@ -13,9 +13,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/opensquilla/opensquilla/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/opensquilla/opensquilla/ci.yml?style=for-the-badge" alt="CI"></a>
+  <a href="https://github.com/TokenRhythm/opensquilla/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/TokenRhythm/opensquilla/ci.yml?style=for-the-badge" alt="CI"></a>
   <a href="https://opensquilla.ai/"><img src="https://img.shields.io/badge/website-opensquilla.ai-blue?style=for-the-badge" alt="Website"></a>
-  <a href="https://github.com/opensquilla/opensquilla/releases"><img src="https://img.shields.io/github/v/release/opensquilla/opensquilla?include_prereleases&style=for-the-badge" alt="GitHub release"></a>
+  <a href="https://github.com/TokenRhythm/opensquilla/releases"><img src="https://img.shields.io/github/v/release/TokenRhythm/opensquilla?include_prereleases&style=for-the-badge" alt="GitHub release"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.12%2B-blue?style=for-the-badge" alt="Python 3.12+"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue?style=for-the-badge" alt="Apache 2.0 License"></a>
 </p>
@@ -93,8 +93,8 @@ macOS のターミナルインストールでは、SquillaRouter の LightGBM �
 
 0.5.4 のデスクトップインストーラーは、Vue 製コントロールコンソールとゲートウェイランタイムを Electron シェルにまとめています。
 
-- macOS Apple Silicon: <https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-mac-arm64.dmg>
-- Windows x64: <https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-win-x64.exe>
+- macOS Apple Silicon: <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-mac-arm64.dmg>
+- Windows x64: <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-win-x64.exe>
 
 中国本土からより高速にダウンロードするには、OSS の直接ダウンロード用エイリアスを使用してください。
 - macOS Apple Silicon: <https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/latest/OpenSquilla-mac-arm64.dmg>
@@ -131,7 +131,7 @@ $env:Path = "$env:USERPROFILE\.local\bin;" + $env:Path
 **2. OpenSquilla をインストールする**——どのプラットフォームでも同じコマンドです。
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
 ```
 
 これはリリース URL から OpenSquilla wheel をインストールし、続いて `uv` が、選択した extra が宣言する依存関係をダウンロードします。デフォルトの `recommended` extra には、ONNX Runtime、LightGBM、NumPy、tokenizers といった SquillaRouter のランタイム依存関係が含まれるため、これらの wheel がすでにキャッシュされていない限り、初回インストールにはネットワークアクセスが必要です。`uv` は macOS の `libomp` や Windows の Visual C++ Redistributable のようなシステムネイティブのランタイムはインストールしません。ルーターランタイムがネイティブライブラリの読み込みエラーを報告した場合は、[トラブルシューティング](#troubleshooting)を参照してください。
@@ -147,7 +147,7 @@ opensquilla gateway run
 > 新規の `uv` インストール直後に `opensquilla` が見つからない場合は、新しいターミナルを開くか、ステップ 1 の PATH 設定の行を再実行してください。
 
 完全にバージョンを固定したインストールには、バージョン付きの wheel URL を使ってください:
-`https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl`。
+`https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl`。
 
 <a id="install-from-source"></a>
 
@@ -159,7 +159,7 @@ opensquilla gateway run
 
    ```sh
    git lfs install
-   git clone https://github.com/opensquilla/opensquilla.git
+   git clone https://github.com/TokenRhythm/opensquilla.git
    cd opensquilla
    git lfs pull --include="src/opensquilla/squilla_router/models/**"
    ```
@@ -465,10 +465,10 @@ opensquilla gateway run --listen 0.0.0.0 --port 18791
 
 **Docker**
 
-ビルド済みのマルチアーキテクチャイメージ（`amd64`/`arm64`）は、リリースタグごとに `ghcr.io/opensquilla/opensquilla` に公開されます。コンテナ配備の完全なガイド（ホームサーバー/NAS、トークン認証つきの LAN 公開、アップグレード）は [`docs/docker.md`](docs/docker.md) を参照してください:
+ビルド済みのマルチアーキテクチャイメージ（`amd64`/`arm64`）は、リリースタグごとに `ghcr.io/tokenrhythm/opensquilla` に公開されます。コンテナ配備の完全なガイド（ホームサーバー/NAS、トークン認証つきの LAN 公開、アップグレード）は [`docs/docker.md`](docs/docker.md) を参照してください:
 
 ```sh
-OPENSQUILLA_GATEWAY_IMAGE=ghcr.io/opensquilla/opensquilla:latest docker compose up -d
+OPENSQUILLA_GATEWAY_IMAGE=ghcr.io/tokenrhythm/opensquilla:latest docker compose up -d
 ```
 
 `OPENSQUILLA_GATEWAY_IMAGE` を設定しない場合、compose 経路は自分でビルドした `opensquilla:local` イメージを実行します。Git LFS のルーターアセットを取得済みのソースチェックアウトからビルドしてください（クローンと `git lfs pull` については[ソースからのインストール](#install-from-source)を参照）:
@@ -572,8 +572,8 @@ OpenSquilla は [OpenClaw](https://github.com/openclaw/openclaw) に着想を得
 OpenSquilla に貢献してくださったすべての方に感謝します。
 
 <p align="center">
-  <a href="https://github.com/opensquilla/opensquilla/graphs/contributors">
-    <img src="https://contrib.rocks/image?repo=opensquilla/opensquilla&max=100&columns=10" alt="OpenSquilla contributors" />
+  <a href="https://github.com/TokenRhythm/opensquilla/graphs/contributors">
+    <img src="https://contrib.rocks/image?repo=TokenRhythm/opensquilla&max=100&columns=10" alt="OpenSquilla contributors" />
   </a>
 </p>
 
@@ -581,7 +581,7 @@ OpenSquilla に貢献してくださったすべての方に感謝します。
 
 ## 貢献する
 
-あらゆる種類の貢献を歓迎します——バグ報告、機能のアイデア、ドキュメント、新しいプロバイダやチャネルのアダプター、スキル、そしてコアランタイムの開発です。[`CONTRIBUTING.md`](CONTRIBUTING.md) を読んだうえで、[GitHub](https://github.com/opensquilla/opensquilla) で issue やプルリクエストを開いてください。
+あらゆる種類の貢献を歓迎します——バグ報告、機能のアイデア、ドキュメント、新しいプロバイダやチャネルのアダプター、スキル、そしてコアランタイムの開発です。[`CONTRIBUTING.md`](CONTRIBUTING.md) を読んだうえで、[GitHub](https://github.com/TokenRhythm/opensquilla) で issue やプルリクエストを開いてください。
 
 [行動規範](CODE_OF_CONDUCT.md) · [セキュリティ](SECURITY.md) ·
 [サポート](SUPPORT.md) · [ライセンス](LICENSE)（Apache-2.0）

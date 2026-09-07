@@ -8,11 +8,15 @@ import type {
   ChatRunStatus,
   ChatRunStatusSource,
 } from '@/types/chat'
+import type { SessionReadSnapshot } from '@/modules/sessionReadLifecycle'
 import {
   FINISHED_STREAM_TASK_ID,
   PENDING_STREAM_TASK_ID,
 } from '@/utils/chat/streamEvents'
-import { decodeConversationEvent } from '@/adapters/gateway/conversationEventsV4'
+import { createConversationEventTransport } from '@/adapters/gateway/conversationEventTransport'
+import type { TransportEventHandler } from '@/adapters/gateway/transportTypes'
+import type { ConversationCursorSignal } from '@/modules/conversationRuntime'
+import { steerUnavailableReason } from '@/utils/chat/steerAvailability'
 
 function createHarness(options: {
   messages?: ChatMessage[]
@@ -31,7 +35,7 @@ function createHarness(options: {
   stream?: ChatRpcStreamApi
   restoreSteerIntoComposer?: (text: string) => void
   getCompactionPlacement?: (compactionId: string) => 'activity' | 'standalone' | undefined
-  observeStreamGeneration?: (payload: unknown) => boolean
+  observeStreamGeneration?: (signal: ConversationCursorSignal) => boolean
   supportsTurnCommitted?: boolean
 } = {}) {
   const messages = ref<ChatMessage[]>(options.messages ?? [])
@@ -69,7 +73,6 @@ function createHarness(options: {
     showThinkingIndicator: vi.fn(),
     hideThinkingIndicator: vi.fn(),
     appendFrame: vi.fn(),
-    useReducer: ref(false),
   }
   const markEnsembleHandoff = vi.fn()
   const bindRouterDecisionToModelCall = vi.fn()
@@ -87,7 +90,7 @@ function createHarness(options: {
   const refreshRunModePreference = vi.fn(options.refreshRunModePreference ?? (() => {}))
   const restoreSteerIntoComposer = vi.fn(options.restoreSteerIntoComposer ?? (() => {}))
   const scope = effectScope()
-  const api = scope.run(() => useChatRpcEventHandlers({
+  const rawApi = scope.run(() => useChatRpcEventHandlers({
     sessionKey,
     currentEpoch: ref(0),
     lastStreamSeq,
@@ -134,6 +137,25 @@ function createHarness(options: {
     loadCurrentSessionUsage,
     refreshRunModePreference,
   }))!
+  let receive!: TransportEventHandler
+  const transport = createConversationEventTransport({
+    subscribe(eventName, listener) {
+      if (eventName === '*') receive = listener
+      return { close() {} }
+    },
+  })
+  const detach = transport.subscribe({ onEvent: rawApi.onConversationEvent })
+  const api = {
+    ...rawApi,
+    restoreLiveTurnSnapshot: (snapshot: SessionReadSnapshot) =>
+      rawApi.restoreLiveTurnSnapshot(snapshot),
+    handlers: {
+      ...rawApi.handlers,
+      onWireEventFixture: (eventName: string, payload: unknown) => {
+        receive(eventName, payload)
+      },
+    },
+  }
   return {
     api,
     messages,
@@ -157,16 +179,101 @@ function createHarness(options: {
     loadCurrentSessionUsage,
     refreshRunModePreference,
     restoreSteerIntoComposer,
-    stop: () => scope.stop(),
+    stop: () => { detach(); scope.stop() },
   }
 }
+
+describe('live task steer capability', () => {
+  const capability = {
+    mode: 'same_turn',
+    expected_turn_id: 'turn-live',
+    input_kinds: ['text'],
+    reason: null,
+  }
+
+  it.each([
+    { spelling: 'steer_capability', schemaVersion: 1 },
+    { spelling: 'steerCapability', schemaVersion: 1 },
+    { spelling: 'steer_capability', schemaVersion: undefined },
+    { spelling: 'steerCapability', schemaVersion: undefined },
+  ])('enables Steer from a live $spelling frame with schema version $schemaVersion', ({ spelling, schemaVersion }) => {
+    const subject = createHarness()
+    try {
+      subject.api.handlers.onWireEventFixture('task.running', {
+        session_key: 'agent:main:test',
+        task_id: 'turn-live',
+        ...(schemaVersion === undefined ? {} : { schema_version: schemaVersion }),
+        [spelling]: capability,
+      })
+
+      const calls = subject.applySessionRunState.mock.calls
+      const runState: ChatRunStatusSource | undefined = calls[calls.length - 1]?.[0]
+      expect(runState).toMatchObject({
+        run_status: 'running',
+        active_task: { task_id: 'turn-live', status: 'running', steer_capability: capability },
+      })
+      expect(runState?.active_task).not.toHaveProperty('steerCapability')
+      expect(steerUnavailableReason({
+        isStreaming: subject.stream.isStreaming.value,
+        methodAvailable: true,
+        modelRoutingMode: 'auto',
+        capability: runState?.active_task?.steer_capability ?? null,
+        activeTaskId: subject.activeStreamTaskId.value,
+      })).toBeNull()
+    } finally {
+      subject.stop()
+    }
+  })
+
+  it.each([
+    { taskField: 'active_task', capabilityField: 'steer_capability' },
+    { taskField: 'activeTask', capabilityField: 'steerCapability' },
+  ])('retains the nested $taskField capability in session task updates', ({ taskField, capabilityField }) => {
+    const subject = createHarness()
+    try {
+      subject.api.handlers.onWireEventFixture('sessions.changed', {
+        key: 'agent:main:test',
+        run_status: 'running',
+        [taskField]: { task_id: 'turn-live', status: 'running', [capabilityField]: capability },
+      })
+
+      expect(subject.applySessionRunState).toHaveBeenLastCalledWith(expect.objectContaining({
+        active_task: expect.objectContaining({ task_id: 'turn-live', steer_capability: capability }),
+      }))
+    } finally {
+      subject.stop()
+    }
+  })
+
+  it('keeps Steer unavailable when the live frame has no capability', () => {
+    const subject = createHarness()
+    try {
+      subject.api.handlers.onWireEventFixture('task.running', {
+        session_key: 'agent:main:test', task_id: 'turn-live',
+      })
+
+      const calls = subject.applySessionRunState.mock.calls
+      const runState: ChatRunStatusSource | undefined = calls[calls.length - 1]?.[0]
+      expect(runState?.active_task).not.toHaveProperty('steer_capability')
+      expect(steerUnavailableReason({
+        isStreaming: subject.stream.isStreaming.value,
+        methodAvailable: true,
+        modelRoutingMode: 'auto',
+        capability: runState?.active_task?.steer_capability ?? null,
+        activeTaskId: subject.activeStreamTaskId.value,
+      })).toBe('capabilityPending')
+    } finally {
+      subject.stop()
+    }
+  })
+})
 
 describe('useChatRpcEventHandlers route-card ownership', () => {
   it('binds text and thinking events to their physical provider calls', () => {
     const { api, stream, bindRouterDecisionToModelCall, stop } = createHarness()
     try {
       api.handlers.onTextDelta({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         turn_id: 'turn-1',
         stream_seq: 1,
         generation_epoch: 0,
@@ -175,14 +282,14 @@ describe('useChatRpcEventHandlers route-card ownership', () => {
         iteration: 1,
       })
       api.handlers.onAnswerGenerationReset({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         turn_id: 'turn-1',
         stream_seq: 2,
         old_generation_epoch: 0,
         new_generation_epoch: 1,
       })
       api.handlers.onTextDelta({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         turn_id: 'turn-1',
         stream_seq: 3,
         generation_epoch: 0,
@@ -190,8 +297,8 @@ describe('useChatRpcEventHandlers route-card ownership', () => {
         model_call_id: 'stale-call',
         iteration: 99,
       })
-      api.handlers.onAny('session.event.thinking', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.thinking', {
+        key: 'agent:main:test',
         turn_id: 'turn-1',
         stream_seq: 4,
         generation_epoch: 1,
@@ -215,10 +322,56 @@ describe('useChatRpcEventHandlers route-card ownership', () => {
 })
 
 describe('useChatRpcEventHandlers decoded conversation ingress', () => {
+  it('rejects invalid receipts and unknown additive frames before cursor or task mutation', () => {
+    const harness = createHarness({ supportsTurnCommitted: true })
+    let receive!: TransportEventHandler
+    const transport = createConversationEventTransport({
+      subscribe(name, handler) {
+        if (name === '*') receive = handler
+        return { close() {} }
+      },
+    })
+    const detach = transport.subscribe({ onEvent: harness.api.onConversationEvent })
+    try {
+      receive('session.event.done', {
+        session_key: harness.sessionKey.value, task_id: 'task-1', turn_id: 'turn-1',
+        stream_seq: 1, text: 'finished', reason: 'completed',
+      })
+      expect(harness.api.awaitingCommitTaskIds.value).toEqual(new Set(['task-1']))
+      harness.applySessionRunState.mockClear()
+      const receipt = {
+        schema_version: 1, session_key: harness.sessionKey.value, task_id: 'task-1', turn_id: 'turn-1',
+        stream_seq: 2, status: 'succeeded', terminal_reason: 'completed', finished_at: 123,
+      }
+      for (const invalid of [
+        { schema_version: 2 }, { stream_seq: -1 }, { stream_seq: 1.5 },
+        { emitted_at: -1 }, { finished_at: 1.5 }, { client_message_id: null },
+        { user_message_id: false }, { session_id: 7 }, { surface_id: [] },
+        { turn_id: '' }, { stream_generation: null },
+      ]) receive('session.event.turn_committed', { ...receipt, ...invalid })
+      receive('session.event.future_extension', {
+        session_key: harness.sessionKey.value, task_id: 'foreign-task', stream_seq: 999,
+        run_status: 'approval_pending', text: 'not an adopted business event',
+      })
+      expect(harness.lastStreamSeq.value).toBe(1)
+      expect(harness.api.awaitingCommitTaskIds.value).toEqual(new Set(['task-1']))
+      expect(harness.scheduleHistorySync).not.toHaveBeenCalled()
+      expect(harness.applySessionRunState).not.toHaveBeenCalled()
+
+      receive('session.event.turn_committed', receipt)
+      expect(harness.lastStreamSeq.value).toBe(2)
+      expect(harness.api.awaitingCommitTaskIds.value).toEqual(new Set())
+      expect(harness.scheduleHistorySync).toHaveBeenCalledExactlyOnceWith(true)
+    } finally {
+      detach()
+      harness.stop()
+    }
+  })
+
   it('routes a validated event through the named projection and wildcard reducer once', () => {
     const harness = createHarness()
     const payload = {
-      session_key: 'agent:main:test',
+      key: 'agent:main:test',
       turn_id: 'turn-decoded',
       stream_seq: 1,
       text: 'decoded answer',
@@ -228,10 +381,11 @@ describe('useChatRpcEventHandlers decoded conversation ingress', () => {
     try {
       harness.api.onConversationEvent({
         kind: 'conversation',
-        wireName: 'session.event.text_delta',
-        decoded: decodeConversationEvent('session.event.text_delta', payload, {}),
-        payload,
-        meta: {},
+        event: {
+          kind: 'known', semanticKind: 'text-delta', payload, meta: {},
+          sessionKey: payload.key, taskId: null, turnId: payload.turn_id,
+          streamGeneration: null, streamSeq: 1, connectionSeq: null, generationEpoch: null,
+        },
       })
 
       expect(harness.stream.appendDelta).toHaveBeenCalledTimes(1)
@@ -253,22 +407,21 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
     harness.stream.isStreaming.value = false
     try {
       harness.api.restoreLiveTurnSnapshot({
-        key: 'agent:main:test',
-        task_id: 'task-clock',
-        current_stream_seq: 2,
+        sessionKey: 'agent:main:test',
+        taskId: 'task-clock',
         events: [
           {
-            event: 'session.event.provider_activity',
+            semanticKind: 'provider-activity',
             payload: {
-              session_key: 'agent:main:test', task_id: 'task-clock',
-              stream_seq: 1, emitted_at: 2_000, phase: 'requesting',
+              key: 'agent:main:test', task_id: 'task-clock',
+              stream_seq: 1, emitted_at: 2_000, activityStartedAt: 2_000, phase: 'requesting',
             },
           },
           {
-            event: 'session.event.thinking',
+            semanticKind: 'thinking-delta',
             payload: {
-              session_key: 'agent:main:test', task_id: 'task-clock',
-              stream_seq: 2, emitted_at: 3_000, text: 'reasoning',
+              key: 'agent:main:test', task_id: 'task-clock',
+              stream_seq: 2, emitted_at: 3_000, activityStartedAt: 3_000, text: 'reasoning',
             },
           },
         ],
@@ -284,40 +437,39 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
     const { api, stream, stop } = createHarness()
     try {
       api.restoreLiveTurnSnapshot({
-        key: 'agent:main:test',
-        task_id: 'task-tool-timeline',
-        current_stream_seq: 3,
+        sessionKey: 'agent:main:test',
+        taskId: 'task-tool-timeline',
         events: [
           {
-            event: 'session.event.tool_use_start',
+            semanticKind: 'tool-use-started',
             payload: {
-              session_key: 'agent:main:test',
+              key: 'agent:main:test',
               task_id: 'task-tool-timeline',
               generation_epoch: 0,
-              tool_use_id: 'tool-1',
-              tool_name: 'lookup',
+              id: 'tool-1',
+              name: 'lookup',
               stream_seq: 1,
             },
           },
           {
-            event: 'session.event.tool_use_delta',
+            semanticKind: 'tool-use-delta',
             payload: {
-              session_key: 'agent:main:test',
+              key: 'agent:main:test',
               task_id: 'task-tool-timeline',
               generation_epoch: 0,
-              tool_use_id: 'tool-1',
-              json_fragment: '{"query":"answer"}',
+              id: 'tool-1',
+              input_delta: '{"query":"answer"}',
               stream_seq: 2,
             },
           },
           {
-            event: 'session.event.tool_use_end',
+            semanticKind: 'tool-use-ended',
             payload: {
-              session_key: 'agent:main:test',
+              key: 'agent:main:test',
               task_id: 'task-tool-timeline',
               generation_epoch: 0,
-              tool_use_id: 'tool-1',
-              tool_name: 'lookup',
+              id: 'tool-1',
+              name: 'lookup',
               arguments: { query: 'answer' },
               stream_seq: 3,
             },
@@ -328,7 +480,7 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
       expect(stream.appendToolCall).toHaveBeenCalledTimes(1)
       expect(stream.appendToolDelta).toHaveBeenCalledTimes(1)
       expect(stream.appendToolEnd).toHaveBeenCalledWith(expect.objectContaining({
-        tool_use_id: 'tool-1',
+        id: 'tool-1',
         arguments: { query: 'answer' },
       }))
     } finally {
@@ -345,14 +497,13 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
     } = createHarness()
     try {
       api.restoreLiveTurnSnapshot({
-        key: 'agent:main:test',
-        task_id: 'task-live',
-        current_stream_seq: 5,
+        sessionKey: 'agent:main:test',
+        taskId: 'task-live',
         events: [
           {
-            event: 'session.event.text_delta',
+            semanticKind: 'text-delta',
             payload: {
-              session_key: 'agent:main:test',
+              key: 'agent:main:test',
               task_id: 'task-live',
               generation_epoch: 0,
               text: 'partial old',
@@ -360,9 +511,9 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
             },
           },
           {
-            event: 'session.event.answer_generation_reset',
+            semanticKind: 'answer-generation-reset',
             payload: {
-              session_key: 'agent:main:test',
+              key: 'agent:main:test',
               task_id: 'task-live',
               assistant_message_id: 'assistant-1',
               old_generation_epoch: 0,
@@ -374,9 +525,9 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
             },
           },
           {
-            event: 'session.event.text_delta',
+            semanticKind: 'text-delta',
             payload: {
-              session_key: 'agent:main:test',
+              key: 'agent:main:test',
               task_id: 'task-live',
               generation_epoch: 0,
               text: 'late old',
@@ -384,9 +535,9 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
             },
           },
           {
-            event: 'session.event.text_delta',
+            semanticKind: 'text-delta',
             payload: {
-              session_key: 'agent:main:test',
+              key: 'agent:main:test',
               task_id: 'task-live',
               generation_epoch: 1,
               text: 'fixed',
@@ -420,14 +571,14 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
     try {
       activeStreamTaskId.value = 'task-live'
       api.handlers.onTextDelta({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         task_id: 'task-live',
         generation_epoch: 0,
         text: 'partial old',
         stream_seq: 1,
       })
       api.handlers.onAnswerGenerationReset({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         task_id: 'task-live',
         assistant_message_id: 'assistant-1',
         old_generation_epoch: 0,
@@ -439,14 +590,14 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
       })
 
       api.handlers.onTextDelta({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         task_id: 'task-live',
         generation_epoch: 0,
         text: 'late old',
         stream_seq: 3,
       })
-      api.handlers.onAny('session.event.done', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.done', {
+        key: 'agent:main:test',
         task_id: 'task-live',
         generation_epoch: 0,
         stream_seq: 4,
@@ -458,14 +609,14 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
       expect(stream.endStreaming).not.toHaveBeenCalled()
 
       api.handlers.onTextDelta({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         task_id: 'task-live',
         generation_epoch: 1,
         text: 'fixed',
         stream_seq: 5,
       })
-      api.handlers.onAny('session.event.done', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.done', {
+        key: 'agent:main:test',
         task_id: 'task-live',
         generation_epoch: 1,
         stream_seq: 6,
@@ -490,7 +641,7 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
     try {
       activeStreamTaskId.value = 'task-live'
       api.handlers.onAnswerGenerationReset({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         task_id: 'task-live',
         assistant_message_id: 'assistant-1',
         old_generation_epoch: 0,
@@ -509,8 +660,8 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
       expect(stream.setAssistantMessageId).toHaveBeenCalledWith('assistant-1')
       expect(activeStreamTaskId.value).toBe(FINISHED_STREAM_TASK_ID)
 
-      api.handlers.onAny('session.event.error', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.error', {
+        key: 'agent:main:test',
         generation_epoch: 1,
         stream_seq: 2,
         code: 'fixed_model_failed',
@@ -534,7 +685,7 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
       activeStreamTaskId.value = 'task-live'
 
       api.handlers.onSessionsChanged({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         reason: 'title_changed',
       })
 
@@ -544,7 +695,7 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
     }
   })
 
-  it('rebuilds the unfinished turn while advancing to the authoritative cursor', () => {
+  it('rebuilds the unfinished turn without owning the lease cursor', () => {
     const {
       api,
       stream,
@@ -555,23 +706,22 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
     try {
       lastStreamSeq.value = 900
       api.restoreLiveTurnSnapshot({
-        key: 'agent:main:test',
-        task_id: 'task-live',
-        current_stream_seq: 2400,
+        sessionKey: 'agent:main:test',
+        taskId: 'task-live',
         events: [
           {
-            event: 'session.event.thinking',
+            semanticKind: 'thinking-delta',
             payload: {
-              session_key: 'agent:main:test',
+              key: 'agent:main:test',
               task_id: 'task-live',
               text: 'Recovered reasoning',
               stream_seq: 10,
             },
           },
           {
-            event: 'session.event.tool_use_start',
+            semanticKind: 'tool-use-started',
             payload: {
-              session_key: 'agent:main:test',
+              key: 'agent:main:test',
               task_id: 'task-live',
               id: 'tool-1',
               name: 'exec',
@@ -579,9 +729,9 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
             },
           },
           {
-            event: 'session.event.text_delta',
+            semanticKind: 'text-delta',
             payload: {
-              session_key: 'agent:main:test',
+              key: 'agent:main:test',
               task_id: 'task-live',
               text: 'Recovered answer',
               presentation: 'answer',
@@ -592,7 +742,10 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
       })
 
       expect(stream.resetLiveTurnState).toHaveBeenCalledOnce()
-      expect(api.streamThinkingText.value).toBe('Recovered reasoning')
+      expect(stream.appendFrame).toHaveBeenCalledWith(expect.objectContaining({
+        kind: 'thinking',
+        text: 'Recovered reasoning',
+      }))
       expect(stream.appendToolCall).toHaveBeenCalledWith(expect.objectContaining({
         id: 'tool-1',
       }))
@@ -601,13 +754,13 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
       expect(stream.setAcceptedActivityOrder).toHaveBeenNthCalledWith(2, 11)
       expect(stream.setAcceptedActivityOrder).toHaveBeenNthCalledWith(3, 12)
       expect(activeStreamTaskId.value).toBe('task-live')
-      expect(lastStreamSeq.value).toBe(2400)
+      expect(lastStreamSeq.value).toBe(900)
     } finally {
       stop()
     }
   })
 
-  it('keeps a snapshot router sequence as identity without replaying it through the cursor', () => {
+  it('keeps a snapshot router sequence as identity without owning the cursor', () => {
     const {
       api,
       lastStreamSeq,
@@ -617,13 +770,12 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
     try {
       lastStreamSeq.value = 900
       api.restoreLiveTurnSnapshot({
-        key: 'agent:main:test',
-        task_id: 'task-live',
-        current_stream_seq: 2_400,
+        sessionKey: 'agent:main:test',
+        taskId: 'task-live',
         events: [{
-          event: 'session.event.router_decision',
+          semanticKind: 'router-decision',
           payload: {
-            session_key: 'agent:main:test',
+            key: 'agent:main:test',
             task_id: 'task-live',
             turn_id: 'turn-live',
             stream_seq: 17,
@@ -638,7 +790,7 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
       const [payload, identityStreamSeq] = queueRouterDecision.mock.calls[0]!
       expect(payload).not.toHaveProperty('stream_seq')
       expect(identityStreamSeq).toBe(17)
-      expect(lastStreamSeq.value).toBe(2_400)
+      expect(lastStreamSeq.value).toBe(900)
     } finally {
       stop()
     }
@@ -660,13 +812,12 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
       })
 
       api.restoreLiveTurnSnapshot({
-        key: 'agent:main:test',
-        task_id: 'task-live',
-        current_stream_seq: 4,
+        sessionKey: 'agent:main:test',
+        taskId: 'task-live',
         events: [{
-          event: 'session.event.provider_activity',
+          semanticKind: 'provider-activity',
           payload: {
-            session_key: 'agent:main:test',
+            key: 'agent:main:test',
             task_id: 'task-live',
             phase: 'requesting',
             reason: 'initial',
@@ -696,14 +847,13 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
     })
     try {
       api.restoreLiveTurnSnapshot({
-        key: 'agent:main:test',
-        task_id: 'task-live',
-        current_stream_seq: 12,
+        sessionKey: 'agent:main:test',
+        taskId: 'task-live',
         events: [
           {
-            event: 'session.event.text_delta',
+            semanticKind: 'text-delta',
             payload: {
-              session_key: 'agent:main:test',
+              key: 'agent:main:test',
               task_id: 'task-live',
               text: 'Second answer',
               model_call_id: '2.0',
@@ -712,9 +862,9 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
             },
           },
           {
-            event: 'session.event.input_disposition',
+            semanticKind: 'input-disposition',
             payload: {
-              session_key: 'agent:main:test',
+              key: 'agent:main:test',
               task_id: 'task-live',
               turn_id: 'task-live',
               user_message_id: 'steer-message-1',
@@ -726,9 +876,9 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
             },
           },
           {
-            event: 'session.event.text_delta',
+            semanticKind: 'text-delta',
             payload: {
-              session_key: 'agent:main:test',
+              key: 'agent:main:test',
               task_id: 'task-live',
               text: 'First answer',
               model_call_id: '1.0',
@@ -765,23 +915,22 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
     const { api, messages, stream, stop } = createHarness()
     try {
       api.restoreLiveTurnSnapshot({
-        key: 'agent:main:test',
-        task_id: 'task-live',
-        current_stream_seq: 12,
+        sessionKey: 'agent:main:test',
+        taskId: 'task-live',
         events: [
           {
-            event: 'session.event.text_delta',
+            semanticKind: 'text-delta',
             payload: {
-              session_key: 'agent:main:test',
+              key: 'agent:main:test',
               task_id: 'task-live',
               text: 'First answer',
               stream_seq: 10,
             },
           },
           {
-            event: 'session.event.input_disposition',
+            semanticKind: 'input-disposition',
             payload: {
-              session_key: 'agent:main:test',
+              key: 'agent:main:test',
               task_id: 'task-live',
               turn_id: 'task-live',
               user_message_id: 'steer-message-orphan',
@@ -791,9 +940,9 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
             },
           },
           {
-            event: 'session.event.text_delta',
+            semanticKind: 'text-delta',
             payload: {
-              session_key: 'agent:main:test',
+              key: 'agent:main:test',
               task_id: 'task-live',
               text: 'Second answer',
               stream_seq: 12,
@@ -848,23 +997,22 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
     })
     try {
       api.restoreLiveTurnSnapshot({
-        key: 'agent:main:test',
-        task_id: 'task-live',
-        current_stream_seq: 2,
+        sessionKey: 'agent:main:test',
+        taskId: 'task-live',
         events: [
           {
-            event: 'session.event.text_delta',
+            semanticKind: 'text-delta',
             payload: {
-              session_key: 'agent:main:test',
+              key: 'agent:main:test',
               task_id: 'task-live',
               text: 'First answer',
               stream_seq: 1,
             },
           },
           {
-            event: 'session.event.input_disposition',
+            semanticKind: 'input-disposition',
             payload: {
-              session_key: 'agent:main:test',
+              key: 'agent:main:test',
               task_id: 'task-live',
               turn_id: 'turn-live',
               user_message_id: 'steer-message-1',
@@ -905,14 +1053,13 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
         stream.isStreaming.value = true
       })
       api.restoreLiveTurnSnapshot({
-        key: 'agent:main:test',
-        task_id: 'task-live',
-        current_stream_seq: 2400,
+        sessionKey: 'agent:main:test',
+        taskId: 'task-live',
         events: [
           {
-            event: 'session.event.compaction',
+            semanticKind: 'compaction-progress',
             payload: {
-              session_key: 'agent:main:test',
+              key: 'agent:main:test',
               status: 'started',
               phase: 'summarizing',
               compaction_id: 'cmp-live',
@@ -942,7 +1089,7 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
       expect(stream.recordCompactionActivity).toHaveBeenCalledWith(expect.objectContaining({
         compaction_id: 'cmp-live',
       }))
-      expect(lastStreamSeq.value).toBe(2400)
+      expect(lastStreamSeq.value).toBe(0)
     } finally {
       stop()
     }
@@ -952,8 +1099,8 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
 describe('useChatRpcEventHandlers stream generation', () => {
   it('observes a restarted generation before rejecting its lower sequence', () => {
     let lastStreamSeqRef = ref(500)
-    const observeStreamGeneration = vi.fn((payload: unknown) => {
-      if ((payload as { stream_generation?: string }).stream_generation === 'new-generation') {
+    const observeStreamGeneration = vi.fn((signal: ConversationCursorSignal) => {
+      if (signal.streamGeneration === 'new-generation') {
         lastStreamSeqRef.value = 0
         return true
       }
@@ -964,7 +1111,7 @@ describe('useChatRpcEventHandlers stream generation', () => {
     harness.lastStreamSeq.value = 500
     try {
       harness.api.handlers.onTextDelta({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         task_id: 'task-new',
         stream_generation: 'new-generation',
         stream_seq: 1,
@@ -993,7 +1140,7 @@ describe('useChatRpcEventHandlers compaction ownership', () => {
     try {
       activeStreamTaskId.value = PENDING_STREAM_TASK_ID
       api.handlers.onCompaction({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         task_id: 'task-owned',
         stream_seq: 1,
         status: 'started',
@@ -1028,7 +1175,7 @@ describe('useChatRpcEventHandlers compaction ownership', () => {
     try {
       activeStreamTaskId.value = 'task-current'
       api.handlers.onCompaction({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         task_id: 'task-other',
         stream_seq: 7,
         status: 'completed',
@@ -1061,14 +1208,14 @@ describe('useChatRpcEventHandlers compaction ownership', () => {
         stream.isStreaming.value = false
       })
       activeStreamTaskId.value = PENDING_STREAM_TASK_ID
-      api.handlers.onAny('session.event.done', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.done', {
+        key: 'agent:main:test',
         task_id: 'task-race',
         stream_seq: 10,
         text: 'Finished before late maintenance.',
       })
       api.handlers.onCompaction({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         task_id: 'task-race',
         stream_seq: 11,
         status: 'completed',
@@ -1110,8 +1257,8 @@ describe('useChatRpcEventHandlers compaction ownership', () => {
       })
       try {
         activeStreamTaskId.value = 'task-failed'
-        api.handlers.onAny(event, {
-          session_key: 'agent:main:test',
+        api.handlers.onWireEventFixture(event, {
+          key: 'agent:main:test',
           task_id: 'task-failed',
           message: 'Provider failed',
         })
@@ -1135,15 +1282,15 @@ describe('useChatRpcEventHandlers compaction ownership', () => {
     try {
       activeStreamTaskId.value = PENDING_STREAM_TASK_ID
       api.handlers.onCompaction({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         task_id: 'task-shared-seq',
         stream_seq: 10,
         status: 'started',
         source: 'automatic',
         compaction_id: 'cmp-shared-seq',
       }, {})
-      api.handlers.onAny('session.event.done', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.done', {
+        key: 'agent:main:test',
         task_id: 'task-shared-seq',
         stream_seq: 10,
         text: 'Done on the shared sequence.',
@@ -1177,7 +1324,7 @@ describe('useChatRpcEventHandlers compaction ownership', () => {
       stream.isStreaming.value = false
 
       api.handlers.onCompaction({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         task_id: 'task-finished',
         stream_seq: 20,
         status: 'started',
@@ -1185,7 +1332,7 @@ describe('useChatRpcEventHandlers compaction ownership', () => {
         compaction_id: 'cmp-known',
       }, {})
       api.handlers.onCompaction({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         task_id: 'task-finished',
         stream_seq: 21,
         status: 'failed',
@@ -1193,7 +1340,7 @@ describe('useChatRpcEventHandlers compaction ownership', () => {
         compaction_id: 'cmp-known',
       }, {})
       api.handlers.onCompaction({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         task_id: 'task-finished',
         stream_seq: 22,
         status: 'failed',
@@ -1273,7 +1420,7 @@ describe('useChatRpcEventHandlers compaction ownership', () => {
         stream.isStreaming.value = false
 
         api.handlers.onCompaction({
-          session_key: 'agent:main:test',
+          key: 'agent:main:test',
           task_id: 'task-finished',
           stream_seq: 31,
           status,
@@ -1312,7 +1459,7 @@ describe('useChatRpcEventHandlers compaction ownership', () => {
         .mockReturnValueOnce('standalone')
         .mockReturnValueOnce(false)
       const payload = {
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         status: 'completed',
         source: 'manual',
         compaction_id: 'cmp-manual',
@@ -1332,18 +1479,18 @@ describe('useChatRpcEventHandlers durable out-of-band messages', () => {
     const { api, messages, scheduleHistorySync, applySessionRunState, stop } = createHarness()
     try {
       api.handlers.onCronResult({
-        sessionKey: 'agent:other:test',
+        key: 'agent:other:test',
         stream_seq: 1,
         message: { text: 'foreign', messageId: 'cron-foreign' },
       })
       api.handlers.onCronResult({
-        sessionKey: 'agent:main:test',
+        key: 'agent:main:test',
         epoch: -1,
         stream_seq: 1,
         message: { text: 'stale', messageId: 'cron-stale' },
       })
       const payload = {
-        sessionKey: 'agent:main:test',
+        key: 'agent:main:test',
         stream_seq: 2,
         message: {
           role: 'assistant',
@@ -1375,14 +1522,14 @@ describe('useChatRpcEventHandlers durable out-of-band messages', () => {
     const { api, messages, scheduleHistorySync, stop } = createHarness()
     try {
       api.handlers.onSubagentCompletion({
-        session_key: 'agent:other:test',
+        key: 'agent:other:test',
         stream_seq: 1,
         type: 'subagent_completion',
         child_session_key: 'agent:main:subagent:foreign',
         message_id: 'foreign',
       })
       api.handlers.onSubagentCompletion({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         epoch: -1,
         stream_seq: 1,
         type: 'subagent_completion',
@@ -1390,7 +1537,7 @@ describe('useChatRpcEventHandlers durable out-of-band messages', () => {
         message_id: 'stale',
       })
       const current = {
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         stream_seq: 2,
         type: 'subagent_completion' as const,
         child_session_key: 'agent:main:subagent:child',
@@ -1425,51 +1572,51 @@ describe('useChatRpcEventHandlers durable out-of-band messages', () => {
     const { api, showWarningToast, messages, lastStreamSeq, stop } = createHarness()
     try {
       api.handlers.onWarning({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         stream_seq: 1,
-        code: 'provider_reasoning_only_retry',
+        warningVisible: false,
         message: 'retrying',
       })
       api.handlers.onWarning({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         stream_seq: 1,
         message: 'replayed warning',
       })
       api.handlers.onWarning({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         stream_seq: 2,
-        code: 'provider_request_message_limit_recovery_success',
+        warningVisible: false,
         message: 'Older history was summarized for this provider request; retrying once.',
       })
       api.handlers.onWarning({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         stream_seq: 2,
         message: 'replayed compaction warning',
       })
       api.handlers.onWarning({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         stream_seq: 3,
-        code: 'context_auto_compaction_start',
+        warningVisible: false,
         message: 'Provider context limit reached; compacting older context before retrying.',
       })
       api.handlers.onWarning({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         stream_seq: 3,
         message: 'replayed automatic compaction start warning',
       })
       api.handlers.onWarning({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         stream_seq: 4,
-        code: 'context_auto_compaction_retry',
+        warningVisible: false,
         message: 'Stable context compacted; retrying the provider request.',
       })
       api.handlers.onWarning({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         stream_seq: 4,
         message: 'replayed automatic compaction warning',
       })
       api.handlers.onWarning({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         stream_seq: 5,
         message: 'Provider is degraded',
       })
@@ -1498,7 +1645,7 @@ describe('useChatRpcEventHandlers steer disposition', () => {
 
     try {
       api.handlers.onInputDisposition({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         stream_seq: 1,
         client_message_id: 'client-send',
         user_message_id: 'user-send',
@@ -1572,7 +1719,7 @@ describe('useChatRpcEventHandlers steer disposition', () => {
 
     try {
       api.handlers.onInputDisposition({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         stream_seq: 1,
         client_request_id: 'request-1',
         client_message_id: 'client-1',
@@ -1584,7 +1731,7 @@ describe('useChatRpcEventHandlers steer disposition', () => {
         revision: 2,
       })
       api.handlers.onInputDisposition({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         stream_seq: 2,
         client_request_id: 'request-1',
         turn_id: 'turn-old',
@@ -1641,7 +1788,7 @@ describe('useChatRpcEventHandlers steer disposition', () => {
 
     try {
       api.handlers.onInputDisposition({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         stream_seq: 1,
         client_request_id: 'request-restore',
         disposition,
@@ -1650,7 +1797,7 @@ describe('useChatRpcEventHandlers steer disposition', () => {
         revision: 2,
       })
       api.handlers.onInputDisposition({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         stream_seq: 2,
         client_request_id: 'request-restore',
         disposition,
@@ -1685,7 +1832,7 @@ describe('useChatRpcEventHandlers steer disposition', () => {
 
     try {
       api.handlers.onInputDisposition({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         stream_seq: 1,
         client_request_id: 'request-applied',
         disposition: 'applied',
@@ -1735,7 +1882,7 @@ describe('useChatRpcEventHandlers steer disposition', () => {
         [2, 'request-second'],
       ] as const) {
         api.handlers.onInputDisposition({
-          session_key: 'agent:main:test',
+          key: 'agent:main:test',
           stream_seq: streamSeq,
           client_request_id: clientRequestId,
           disposition: 'cancelled',
@@ -1760,12 +1907,12 @@ describe('useChatRpcEventHandlers task group lifecycle', () => {
 
     try {
       api.handlers.onTaskGroupWaiting({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         stream_seq: 1,
         group_id: 'group-live',
       })
       api.handlers.onSessionsChanged({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         reason: 'task_terminal',
         run_status: 'idle',
         last_task: { status: 'succeeded' },
@@ -1791,12 +1938,12 @@ describe('useChatRpcEventHandlers task group lifecycle', () => {
 
     try {
       api.handlers.onTaskGroupWaiting({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         stream_seq: 1,
         group_id: 'group-live',
       })
       api.handlers.onSessionsChanged({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         reason: 'task_terminal',
         run_status: 'cancelled',
         last_task: { status: 'cancelled' },
@@ -1821,12 +1968,12 @@ describe('useChatRpcEventHandlers task group lifecycle', () => {
 
     try {
       api.handlers.onTaskGroupWaiting({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         stream_seq: 1,
         group_id: 'group-live',
       })
       api.handlers.onTaskGroupDone({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         stream_seq: 2,
         group_id: 'group-live',
       })
@@ -1844,46 +1991,46 @@ describe('useChatRpcEventHandlers done usage attachment', () => {
     const { api, stream, stop } = createHarness()
 
     try {
-      api.handlers.onAny('session.event.done', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.done', {
+        key: 'agent:main:test',
         stream_seq: 1,
         text: 'legacy canonical',
       })
       expect(stream.reconcileFinalText).toHaveBeenLastCalledWith('legacy canonical')
 
-      api.handlers.onAny('session.event.done', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.done', {
+        key: 'agent:main:test',
         stream_seq: 2,
         text: 'legacy canonical with serialized null',
         text_snapshot: null,
       })
       expect(stream.reconcileFinalText).toHaveBeenLastCalledWith('legacy canonical with serialized null')
 
-      api.handlers.onAny('session.event.done', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.done', {
+        key: 'agent:main:test',
         stream_seq: 3,
         text: 'stale legacy aggregate',
         text_snapshot: '',
       })
       expect(stream.reconcileFinalText).toHaveBeenLastCalledWith('')
 
-      api.handlers.onAny('session.event.done', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.done', {
+        key: 'agent:main:test',
         stream_seq: 4,
         text: '',
       })
       expect(stream.reconcileFinalText).toHaveBeenLastCalledWith(null)
 
-      api.handlers.onAny('session.event.done', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.done', {
+        key: 'agent:main:test',
         stream_seq: 5,
         text_snapshot: 'outer canonical',
         usage: { text_snapshot: null },
       })
       expect(stream.reconcileFinalText).toHaveBeenLastCalledWith('outer canonical')
 
-      api.handlers.onAny('session.event.done', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.done', {
+        key: 'agent:main:test',
         stream_seq: 6,
         text: 'outer legacy canonical',
         usage: { text: '' },
@@ -1896,8 +2043,8 @@ describe('useChatRpcEventHandlers done usage attachment', () => {
         start_codepoint: 3,
         end_codepoint: 6,
       }]
-      api.handlers.onAny('session.event.done', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.done', {
+        key: 'agent:main:test',
         stream_seq: 7,
         text_snapshot: '前半段后半段',
         model_call_segments: segments,
@@ -1913,8 +2060,8 @@ describe('useChatRpcEventHandlers done usage attachment', () => {
     const { api, messages, stop } = createHarness({ messages: [previous] })
 
     try {
-      api.handlers.onAny('session.event.done', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.done', {
+        key: 'agent:main:test',
         stream_seq: 1,
         text: 'NO_REPLY',
         input_tokens: 10,
@@ -1937,8 +2084,8 @@ describe('useChatRpcEventHandlers done usage attachment', () => {
     const { api, messages, stream, stop } = createHarness({ messages: [previous] })
 
     try {
-      api.handlers.onAny('session.event.done', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.done', {
+        key: 'agent:main:test',
         stream_seq: 1,
         text_snapshot: 'stale streamed answer',
         delivery: 'suppressed',
@@ -1953,8 +2100,8 @@ describe('useChatRpcEventHandlers done usage attachment', () => {
       expect(messages.value).toEqual([previous])
       expect(previous.usage).toBeUndefined()
 
-      api.handlers.onAny('session.event.done', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.done', {
+        key: 'agent:main:test',
         stream_seq: 2,
         text_snapshot: 'visible despite diagnostic reason',
         suppression_reason: 'heartbeat_ack',
@@ -1978,15 +2125,15 @@ describe('useChatRpcEventHandlers done usage attachment', () => {
           role: 'assistant',
           text: '',
           ts: 'now',
-          tool_calls: [{ type: 'tool_use', name: 'web_search', tool_use_id: 'tool-1' }],
+          tool_calls: [{ type: 'tool_use', name: 'web_search', id: 'tool-1' }],
           artifacts: [{ id: 'artifact-1', name: 'result.txt' }],
         })
       },
     })
 
     try {
-      api.handlers.onAny('session.event.done', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.done', {
+        key: 'agent:main:test',
         stream_seq: 1,
         text_snapshot: '',
         delivery: 'suppressed',
@@ -2022,8 +2169,8 @@ describe('useChatRpcEventHandlers done usage attachment', () => {
     })
 
     try {
-      api.handlers.onAny('session.event.done', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.done', {
+        key: 'agent:main:test',
         stream_seq: 1,
         turn_id: 'goal-turn-1',
         text: 'current',
@@ -2099,8 +2246,8 @@ describe('useChatRpcEventHandlers done usage attachment', () => {
     })
 
     try {
-      api.handlers.onAny('session.event.done', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.done', {
+        key: 'agent:main:test',
         stream_seq: 1,
         task_id: 'stopped-turn-1',
         reason: 'aborted',
@@ -2126,24 +2273,22 @@ describe('useChatRpcEventHandlers reasoning timer replay', () => {
         list.push({ role: 'assistant', text: 'answer', ts: 'now' })
       },
     })
-    stream.useReducer.value = true
     stream.getThinkingText = vi.fn(() => 'folded reasoning')
     try {
-      api.handlers.onAny('session.event.thinking', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.thinking', {
+        key: 'agent:main:test',
         stream_seq: 1,
         text: 'folded ',
       })
-      api.handlers.onAny('session.event.thinking', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.thinking', {
+        key: 'agent:main:test',
         stream_seq: 2,
         text: 'reasoning',
       })
 
-      expect(api.streamThinkingText.value).toBe('')
       expect(stream.appendFrame).toHaveBeenCalledTimes(2)
-      api.handlers.onAny('session.event.done', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.done', {
+        key: 'agent:main:test',
         stream_seq: 3,
         text: 'answer',
       })
@@ -2153,28 +2298,27 @@ describe('useChatRpcEventHandlers reasoning timer replay', () => {
     }
   })
 
-  it('records structured start, delta, and end frames without losing legacy text', () => {
+  it('records structured start, delta, and end frames', () => {
     const { api, stream, stop } = createHarness()
-    stream.useReducer.value = 'shadow'
 
     try {
-      api.handlers.onAny('session.event.thinking_start', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.thinking_start', {
+        key: 'agent:main:test',
         stream_seq: 1,
         block_id: 'reasoning-1',
         block_index: 0,
         started_at: Date.now(),
       })
-      api.handlers.onAny('session.event.thinking', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.thinking', {
+        key: 'agent:main:test',
         stream_seq: 2,
         block_id: 'reasoning-1',
         block_index: 0,
         text: 'inspect',
         started_at: Date.now(),
       })
-      api.handlers.onAny('session.event.thinking_end', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.thinking_end', {
+        key: 'agent:main:test',
         stream_seq: 3,
         block_id: 'reasoning-1',
         block_index: 0,
@@ -2182,7 +2326,6 @@ describe('useChatRpcEventHandlers reasoning timer replay', () => {
         ended_at: Date.now(),
       })
 
-      expect(api.streamThinkingText.value).toBe('inspect')
       expect(stream.appendFrame).toHaveBeenNthCalledWith(1, expect.objectContaining({
         kind: 'thinking-start',
         blockId: 'reasoning-1',
@@ -2206,42 +2349,50 @@ describe('useChatRpcEventHandlers reasoning timer replay', () => {
   it('keeps elapsed time across A to B to A replay without leaking into B', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(105_000)
-    const { api, sessionKey, lastStreamSeq, stop } = createHarness()
+    const { api, sessionKey, lastStreamSeq, messages, stop } = createHarness({
+      endStreaming(list) {
+        list.push({ role: 'assistant', text: 'answer', ts: 'now' })
+      },
+    })
 
     try {
-      api.handlers.onAny('session.event.thinking', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.thinking', {
+        key: 'agent:main:test',
         stream_seq: 1,
         text: 'first',
         started_at: 100_000,
       })
-      expect(api.streamThinkingElapsedText.value).toBe('5s')
-
       vi.setSystemTime(108_000)
       sessionKey.value = 'agent:main:other'
       lastStreamSeq.value = 0
       await nextTick()
-      expect(api.streamThinkingText.value).toBe('')
-
       sessionKey.value = 'agent:main:test'
       lastStreamSeq.value = 0
       await nextTick()
-      api.handlers.onAny('session.event.thinking', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.thinking', {
+        key: 'agent:main:test',
         stream_seq: 1,
         text: 'first',
         started_at: 100_000,
       })
-      expect(api.streamThinkingElapsedText.value).toBe('8s')
-
       vi.setSystemTime(110_000)
-      api.handlers.onAny('session.event.thinking', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.thinking', {
+        key: 'agent:main:test',
         stream_seq: 2,
         text: ' second',
         started_at: 109_000,
       })
-      expect(api.streamThinkingElapsedText.value).toBe('10s')
+      api.handlers.onWireEventFixture('session.event.done', {
+        key: 'agent:main:test',
+        stream_seq: 3,
+        text: 'answer',
+        reasoning_content: 'first second',
+        emitted_at: 110_000,
+      })
+      expect(messages.value[0]?.reasoning).toEqual({
+        text: 'first second',
+        seconds: 10,
+      })
     } finally {
       stop()
       vi.useRealTimers()
@@ -2258,14 +2409,14 @@ describe('useChatRpcEventHandlers reasoning timer replay', () => {
     })
 
     try {
-      api.handlers.onAny('session.event.thinking', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.thinking', {
+        key: 'agent:main:test',
         stream_seq: 1,
         text: 'reasoning',
         started_at: 100_000,
       })
-      api.handlers.onAny('session.event.done', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.done', {
+        key: 'agent:main:test',
         stream_seq: 2,
         text: 'answer',
         reasoning_content: 'reasoning',
@@ -2293,15 +2444,18 @@ describe('useChatRpcEventHandlers reasoning timer replay', () => {
         5_000_000 - 60 * 60 * 1_000 - 1,
         Number.NaN,
       ]) {
-        const { api, stop } = createHarness()
+        const { api, stream, stop } = createHarness()
         try {
-          api.handlers.onAny('session.event.thinking', {
-            session_key: 'agent:main:test',
+          api.handlers.onWireEventFixture('session.event.thinking', {
+            key: 'agent:main:test',
             stream_seq: 1,
             text: 'reasoning',
             started_at: startedAt,
           })
-          expect(api.streamThinkingElapsedText.value).toBe('0s')
+          expect(stream.appendFrame).toHaveBeenCalledWith(expect.objectContaining({
+            kind: 'thinking',
+            at: 5_000_000,
+          }))
         } finally {
           stop()
         }
@@ -2321,14 +2475,14 @@ describe('useChatRpcEventHandlers reasoning timer replay', () => {
     })
 
     try {
-      api.handlers.onAny('session.event.thinking', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.thinking', {
+        key: 'agent:main:test',
         stream_seq: 1,
         text: 'reasoning',
         started_at: 100_000,
       })
-      api.handlers.onAny('session.event.done', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.done', {
+        key: 'agent:main:test',
         stream_seq: 2,
         text: 'answer',
         reasoning_content: 'reasoning',
@@ -2366,8 +2520,8 @@ describe('useChatRpcEventHandlers terminal activity retention', () => {
     })
 
     try {
-      api.handlers.onAny('session.event.done', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.done', {
+        key: 'agent:main:test',
         stream_seq: 1,
         turn_id: 'turn-reasoning-record',
         text: 'answer',
@@ -2409,8 +2563,8 @@ describe('useChatRpcEventHandlers terminal activity retention', () => {
     })
 
     try {
-      api.handlers.onAny('session.event.done', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.done', {
+        key: 'agent:main:test',
         stream_seq: 1,
         turn_id: 'turn-phase-record',
         text: 'answer',
@@ -2454,8 +2608,8 @@ describe('useChatRpcEventHandlers terminal activity retention', () => {
     })
 
     try {
-      api.handlers.onAny('session.event.done', {
-        session_key: 'agent:main:test',
+      api.handlers.onWireEventFixture('session.event.done', {
+        key: 'agent:main:test',
         stream_seq: 1,
         turn_id: 'turn-terminal-v2',
         text: 'answer',
@@ -2492,10 +2646,10 @@ describe('useChatRpcEventHandlers ensemble handoff', () => {
 
     try {
       api.handlers.onToolUseStart({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         stream_seq: 1,
-        tool_use_id: 'tool-1',
-        tool_name: 'write_file',
+        id: 'tool-1',
+        name: 'write_file',
       })
 
       expect(stream.appendToolCall).toHaveBeenCalledTimes(1)
@@ -2510,10 +2664,10 @@ describe('useChatRpcEventHandlers ensemble handoff', () => {
 
     try {
       api.handlers.onToolUseStart({
-        session_key: 'agent:main:test',
+        key: 'agent:main:test',
         stream_seq: -1,
-        tool_use_id: 'tool-1',
-        tool_name: 'write_file',
+        id: 'tool-1',
+        name: 'write_file',
       })
 
       expect(stream.appendToolCall).not.toHaveBeenCalled()
@@ -2595,21 +2749,21 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
     const { api, stream, stop } = createHarness()
 
     try {
-      api.handlers.onProviderActivity({
+      api.handlers.onWireEventFixture('session.event.provider_activity', {
         stream_seq: 1,
         schema_version: 1,
         phase: 'requesting',
         reason: 'initial',
         activity_id: 'activity-safe',
       })
-      api.handlers.onProviderActivity({
+      api.handlers.onWireEventFixture('session.event.provider_activity', {
         stream_seq: 2,
         schema_version: 1,
         phase: 'reasoning',
         reason: 'reasoning_only',
         activity_id: 'activity-safe',
       })
-      api.handlers.onProviderActivity({
+      api.handlers.onWireEventFixture('session.event.provider_activity', {
         stream_seq: 3,
         schema_version: 1,
         phase: 'retry_wait',
@@ -2617,8 +2771,8 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
         retry_after_ms: 8_000,
         activity_id: 'activity-safe',
         message: 'secret provider body',
-      } as never)
-      api.handlers.onProviderActivity({
+      })
+      api.handlers.onWireEventFixture('session.event.provider_activity', {
         stream_seq: 4,
         schema_version: 1,
         phase: 'retrying',
@@ -2627,7 +2781,7 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
         retry_limit: 3,
         activity_id: 'activity-safe',
       })
-      api.handlers.onProviderActivity({
+      api.handlers.onWireEventFixture('session.event.provider_activity', {
         stream_seq: 5,
         schema_version: 1,
         phase: 'fallback',
@@ -2829,6 +2983,39 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
       harness.stop()
     }
   })
+
+  it('does not leak an expected admission rejection from a superseded reconnect run', async () => {
+    let rejectCriticalRequestsQueued!: (error: Error) => void
+    const criticalRequestsQueued = new Promise<void>((_resolve, reject) => {
+      rejectCriticalRequestsQueued = reject
+    })
+    const run: SessionBootstrapRun = {
+      generation: 2,
+      criticalRequestsQueued,
+      history: Promise.resolve({ ok: false }),
+      live: Promise.resolve({
+        authoritative: false,
+        live: false,
+        backgroundOnly: false,
+        cancelled: true,
+      }),
+    }
+    const harness = createHarness({
+      handleSessionConnectionState: () => run,
+    })
+
+    try {
+      harness.api.handlers.onConnectionState('connected')
+      rejectCriticalRequestsQueued(new Error('superseded session read lease'))
+      await criticalRequestsQueued.catch(() => {})
+      await Promise.resolve()
+
+      expect(harness.loadCurrentSessionUsage).not.toHaveBeenCalled()
+      expect(harness.refreshRunModePreference).not.toHaveBeenCalled()
+    } finally {
+      harness.stop()
+    }
+  })
 })
 
 describe('useChatRpcEventHandlers durable turn receipts', () => {
@@ -2836,8 +3023,8 @@ describe('useChatRpcEventHandlers durable turn receipts', () => {
     vi.useFakeTimers()
     const harness = createHarness()
     try {
-      harness.api.handlers.onAny('session.event.done', {
-        session_key: harness.sessionKey.value,
+      harness.api.handlers.onWireEventFixture('session.event.done', {
+        key: harness.sessionKey.value,
         task_id: 'task-legacy',
         stream_seq: 1,
         reason: 'completed',
@@ -2848,7 +3035,7 @@ describe('useChatRpcEventHandlers durable turn receipts', () => {
       expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
       expect(harness.scheduleHistorySync).toHaveBeenCalledWith()
       expect(harness.api.awaitingCommitTaskIds.value).toEqual(new Set())
-      harness.api.handlers.onAny('session.event.turn_committed', {
+      harness.api.handlers.onWireEventFixture('session.event.turn_committed', {
         schema_version: 1,
         session_key: harness.sessionKey.value,
         task_id: 'task-legacy',
@@ -2871,8 +3058,8 @@ describe('useChatRpcEventHandlers durable turn receipts', () => {
     vi.useFakeTimers()
     const harness = createHarness({ supportsTurnCommitted: true })
     try {
-      harness.api.handlers.onAny('session.event.done', {
-        session_key: harness.sessionKey.value,
+      harness.api.handlers.onWireEventFixture('session.event.done', {
+        key: harness.sessionKey.value,
         task_id: 'task-durable',
         turn_id: 'turn-durable',
         stream_seq: 1,
@@ -2884,7 +3071,7 @@ describe('useChatRpcEventHandlers durable turn receipts', () => {
       expect(harness.scheduleHistorySync).not.toHaveBeenCalled()
       expect(harness.api.awaitingCommitTaskIds.value).toEqual(new Set(['task-durable']))
 
-      harness.api.handlers.onAny('session.event.turn_committed', {
+      harness.api.handlers.onWireEventFixture('session.event.turn_committed', {
         schema_version: 1,
         session_key: harness.sessionKey.value,
         task_id: 'task-durable',
@@ -2896,8 +3083,8 @@ describe('useChatRpcEventHandlers durable turn receipts', () => {
       expect(harness.lastStreamSeq.value).toBe(1)
       expect(harness.scheduleHistorySync).not.toHaveBeenCalled()
 
-      harness.api.handlers.onAny('task.succeeded', {
-        session_key: harness.sessionKey.value,
+      harness.api.handlers.onWireEventFixture('task.succeeded', {
+        key: harness.sessionKey.value,
         task_id: 'task-durable',
         stream_seq: 2,
         status: 'succeeded',
@@ -2905,7 +3092,7 @@ describe('useChatRpcEventHandlers durable turn receipts', () => {
       expect(harness.scheduleHistorySync).toHaveBeenCalledOnce()
       expect(harness.scheduleHistorySync).toHaveBeenLastCalledWith(true)
 
-      harness.api.handlers.onAny('session.event.turn_committed', {
+      harness.api.handlers.onWireEventFixture('session.event.turn_committed', {
         schema_version: 1,
         session_key: harness.sessionKey.value,
         task_id: 'task-durable',
@@ -2919,7 +3106,7 @@ describe('useChatRpcEventHandlers durable turn receipts', () => {
       expect(harness.scheduleHistorySync).toHaveBeenCalledTimes(2)
       expect(harness.scheduleHistorySync).toHaveBeenLastCalledWith(true)
 
-      harness.api.handlers.onAny('session.event.turn_committed', {
+      harness.api.handlers.onWireEventFixture('session.event.turn_committed', {
         schema_version: 1,
         session_key: harness.sessionKey.value,
         task_id: 'task-durable',
@@ -2943,8 +3130,8 @@ describe('useChatRpcEventHandlers durable turn receipts', () => {
     vi.useFakeTimers()
     const harness = createHarness({ supportsTurnCommitted: true })
     try {
-      harness.api.handlers.onAny('session.event.done', {
-        session_key: harness.sessionKey.value,
+      harness.api.handlers.onWireEventFixture('session.event.done', {
+        key: harness.sessionKey.value,
         task_id: 'task-delayed',
         turn_id: 'turn-delayed',
         stream_seq: 1,
@@ -2973,8 +3160,8 @@ describe('useChatRpcEventHandlers durable turn receipts', () => {
     vi.useFakeTimers()
     const harness = createHarness({ supportsTurnCommitted: true })
     try {
-      harness.api.handlers.onAny('session.event.done', {
-        session_key: harness.sessionKey.value,
+      harness.api.handlers.onWireEventFixture('session.event.done', {
+        key: harness.sessionKey.value,
         task_id: 'task-finalizer-failed',
         turn_id: 'turn-finalizer-failed',
         stream_seq: 1,
@@ -2985,8 +3172,8 @@ describe('useChatRpcEventHandlers durable turn receipts', () => {
         new Set(['task-finalizer-failed']),
       )
 
-      harness.api.handlers.onAny('task.failed', {
-        session_key: harness.sessionKey.value,
+      harness.api.handlers.onWireEventFixture('task.failed', {
+        key: harness.sessionKey.value,
         task_id: 'task-finalizer-failed',
         stream_seq: 2,
         status: 'failed',

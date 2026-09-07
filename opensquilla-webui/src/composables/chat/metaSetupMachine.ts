@@ -1,3 +1,4 @@
+import { MetaRunCenterError } from '@/modules/metaRunCenter'
 import type {
   MetaSetupJob,
   MetaSetupProviderHandoff,
@@ -77,8 +78,7 @@ export function metaSetupErrorMessage(error: unknown): string {
 }
 
 export function isMissingMetaSetupJobError(error: unknown): boolean {
-  return /(?:not found|404|unknown (?:meta )?setup job|setup job (?:is )?unknown)/i
-    .test(metaSetupErrorMessage(error))
+  return error instanceof MetaRunCenterError && error.code === 'not-found'
 }
 
 export function isBusyMetaSetupState(state: MetaSetupState): boolean {

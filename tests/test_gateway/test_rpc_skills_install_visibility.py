@@ -1075,7 +1075,7 @@ composition:
     from opensquilla.gateway.rpc_meta_runs import _handle_meta_inspect
 
     listed = await rpc_skills._handle_skills_list(None, ctx)
-    assert "parent-meta" not in {skill["name"] for skill in listed["skills"]}
+    assert "parent-meta" in {skill["name"] for skill in listed["skills"]}
     detail = await _handle_meta_inspect({"name": "parent-meta"}, ctx)
     assert [item["name"] for item in detail["dependencies"]] == ["child-needs-bin"]
     assert detail["ready"] is False

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { createServer } from 'node:http'
 import { createServer as createTcpServer } from 'node:net'
-import { cp, mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises'
+import { cp, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -15,6 +15,13 @@ import {
   environmentWithoutProviderSecrets,
   waitFor,
 } from './packaged-smoke-helpers.mjs'
+import {
+  canAcceptWindowsElectronShutdownFallback,
+  closeElectronWithDeadline,
+  closeHttpServerWithDeadline,
+  desktopShutdownEvidenceSince,
+  trackHttpServerConnections,
+} from './e2e-shutdown-helpers.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const electronRoot = join(scriptDir, '..')
@@ -70,6 +77,8 @@ const EXPECTED_CURRENT_DOCUMENT_TOOLS = [
   'document_read',
 ]
 const TIMEOUT_MS = 60_000
+const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000
+const PROVIDER_SHUTDOWN_TIMEOUT_MS = 15_000
 // A cold desktop profile performs recovery discovery before it starts the
 // source Gateway. Keep functional assertions at 60 seconds, but allow this
 // one-time startup phase to complete on slower CI and developer machines.
@@ -420,6 +429,7 @@ async function startDeterministicProvider() {
       response.end(body)
     })
   })
+  const connections = trackHttpServerConnections(server)
 
   await new Promise((resolveListen, rejectListen) => {
     server.once('error', rejectListen)
@@ -433,9 +443,9 @@ async function startDeterministicProvider() {
     documentPatchCalls: () => documentPatchCalls,
     contextualLocateCalls: () => contextualLocateCalls,
     contextualCandidateErrors: () => contextualCandidateErrors,
-    close: () => new Promise((resolveClose, rejectClose) => {
-      server.closeIdleConnections?.()
-      server.close(error => error ? rejectClose(error) : resolveClose())
+    close: () => closeHttpServerWithDeadline(server, connections, {
+      label: 'Synthetic provider shutdown',
+      timeoutMs: PROVIDER_SHUTDOWN_TIMEOUT_MS,
     }),
   }
 }
@@ -1467,6 +1477,29 @@ const evidence = {
   durableMutation: null,
 }
 
+async function closeDesktopApp(targetApp, phase) {
+  const desktopLogPath = join(userDataDir, 'logs', 'desktop.log')
+  const desktopLogCheckpoint = await readFile(desktopLogPath, 'utf8').catch(() => null)
+  const shutdown = await closeElectronWithDeadline({
+    app: targetApp,
+    phase,
+    timeoutMs: ELECTRON_SHUTDOWN_TIMEOUT_MS,
+  })
+  if (!shutdown.error) return
+  const desktopLog = await readFile(desktopLogPath, 'utf8').catch(() => null)
+  const shutdownEvidence = desktopShutdownEvidenceSince(desktopLogCheckpoint, desktopLog)
+  if (!canAcceptWindowsElectronShutdownFallback({
+    shutdown,
+    ...shutdownEvidence,
+  })) {
+    throw shutdown.error
+  }
+  console.warn(JSON.stringify({
+    event: 'desktop_e2e_windows_shell_wrapper_reaped_after_commit',
+    phase,
+  }))
+}
+
 try {
   desktopJourney: {
   app = await electron.launch({
@@ -2135,7 +2168,7 @@ try {
   assert.equal(pageErrors.length, 0, `renderer page errors: ${pageErrors.join(' | ')}`)
   assert.equal(consoleErrors.length, 0, `renderer console errors: ${consoleErrors.join(' | ')}`)
 
-  await app.close()
+  await closeDesktopApp(app, 'restart-electron-shutdown')
   app = undefined
   activePage = undefined
   await delay(1_000)
@@ -2229,6 +2262,17 @@ try {
     }
   }
   if (runError) {
+    // Emit the product/test failure before any best-effort cleanup. A stranded
+    // Windows HTTP or Electron handle must never replace the actionable cause
+    // with the outer 15-minute case watchdog.
+    console.error(JSON.stringify({
+      ok: false,
+      phase: 'run-error-before-cleanup',
+      error: String(runError?.stack || runError),
+      isolationRoot,
+    }, null, 2))
+  }
+  if (runError) {
     try {
       failureEvidence = await captureFailureEvidence({
         app,
@@ -2250,7 +2294,8 @@ try {
   }
   try {
     if (app) {
-      await diagnosticCall('Electron shutdown', () => app.close(), 15_000)
+      await closeDesktopApp(app, 'final-electron-shutdown')
+      app = undefined
     }
   } catch (error) {
     const shutdownError = new Error(
@@ -2283,7 +2328,26 @@ try {
       app?.process()?.kill()
     } catch {}
   }
-  await provider?.close().catch(() => {})
+  try {
+    await provider?.close()
+  } catch (error) {
+    const providerShutdownError = new Error(
+      `Synthetic provider did not shut down cleanly: ${String(error?.message || error)}`,
+      { cause: error },
+    )
+    console.error(JSON.stringify({
+      ok: false,
+      phase: 'synthetic-provider-shutdown',
+      error: String(providerShutdownError.stack || providerShutdownError),
+      isolationRoot,
+    }, null, 2))
+    if (!runError) runError = providerShutdownError
+    else if (failureEvidence) {
+      failureEvidence.providerShutdownError = String(
+        providerShutdownError.stack || providerShutdownError,
+      )
+    }
+  }
   await delay(100)
   if (runError) {
     console.error(JSON.stringify({

@@ -4,6 +4,9 @@ const CONTROL_URL = '/control/chat/new'
 
 test('clipboard paste restores send readiness after stale IME composition', async ({ context, page }) => {
   await context.grantPermissions(['clipboard-read', 'clipboard-write'])
+  await page.addInitScript(() => {
+    window.localStorage.setItem('opensquilla-locale', 'en')
+  })
   await page.goto(CONTROL_URL)
   await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
 

@@ -194,15 +194,15 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, inject, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import {
-  useArtifactPreviewResource,
+  ARTIFACT_WORKBENCH_KEY,
   type ArtifactPreviewResourceState,
   type NativeHtmlArtifactResource,
-} from '@/composables/workbench/useArtifactPreviewResource'
-import type { ArtifactPayload } from '@/types/rpc'
+} from '@/modules/artifactWorkbench'
+import type { ArtifactPayload } from '@/types/artifacts'
 import type { WorkbenchComponentEvent } from '@/workbench/types'
 import {
   artifactFileSubtitle,
@@ -214,7 +214,6 @@ import { ARTIFACT_PREVIEW_ESCAPE_MESSAGE } from '@/utils/workbench/artifactPrevi
 const props = withDefaults(defineProps<{
   agentEditInProgress?: boolean
   artifact: ArtifactPayload
-  authToken?: string
   baseOrigin?: string
   nativeHtml?: boolean
   nativeSurfaceState?: 'crashed' | 'error' | 'loading' | 'ready'
@@ -230,7 +229,6 @@ const props = withDefaults(defineProps<{
   suspended?: boolean
 }>(), {
   agentEditInProgress: false,
-  authToken: '',
   baseOrigin: '',
   nativeHtml: false,
   nativeSurfaceState: 'loading',
@@ -255,13 +253,13 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const artifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
+if (!artifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
 const previewFrameRef = ref<HTMLIFrameElement | null>(null)
 const htmlFrameGeneration = ref(0)
 
-const preview = useArtifactPreviewResource({
+const preview = artifactWorkbench.previews.createResource({
   artifact: () => props.artifact,
-  authToken: () => props.authToken,
-  baseOrigin: () => props.baseOrigin,
   htmlCollectionStatus: () => props.previewCollectionStatus,
   htmlLaunchUrl: () => props.previewLaunchUrl,
   htmlLeaseState: () => props.previewBlocked
@@ -282,7 +280,6 @@ const resourceSignature = computed(() => [
   props.artifact.mime || '',
   props.artifact.size || '',
   props.sessionKey,
-  props.authToken,
   props.baseOrigin,
   props.nativeHtml ? 'native' : 'web',
   props.previewBlocked ? 'blocked' : 'unblocked',
@@ -426,7 +423,10 @@ async function reloadPreview() {
 }
 
 onMounted(() => window.addEventListener('message', onPreviewFrameMessage))
-onBeforeUnmount(() => window.removeEventListener('message', onPreviewFrameMessage))
+onBeforeUnmount(() => {
+  window.removeEventListener('message', onPreviewFrameMessage)
+  preview.dispose()
+})
 
 const isFailureState = computed(() =>
   preview.state.value === 'crashed'

@@ -1,4 +1,7 @@
-import type { RpcCallOptions, RpcEventHandler } from '@/lib/rpc'
+import type {
+  TransportCallOptions as RpcCallOptions,
+  TransportEventHandler as RpcEventHandler,
+} from './transportTypes'
 import {
   GOALS_REATTACH_METHOD,
   type Params as GoalReattachParams,

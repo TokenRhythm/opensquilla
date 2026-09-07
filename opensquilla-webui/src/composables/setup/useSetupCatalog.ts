@@ -1,4 +1,4 @@
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { inject, ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import i18n from '@/i18n'
 import { useSetupCapabilitiesForm } from '@/composables/setup/useSetupCapabilitiesForm'
 import { useSetupBehaviorForm } from '@/composables/setup/useSetupBehaviorForm'
@@ -41,12 +41,22 @@ import { invalidateReadiness } from '@/composables/setup/useReadinessSummary'
 import { useSettingsPromotedForm, DEFAULT_LLM_TIMEOUT_SECONDS } from '@/composables/setup/useSettingsPromotedForm'
 import { useSettingsSection } from '@/composables/setup/useSettingsSection'
 import { SETTINGS_SECTIONS, type SettingsSectionId } from '@/composables/setup/settingsSections'
-import { useRpcStore } from '@/stores/rpc'
+import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 import { useToasts } from '@/composables/useToasts'
 import { useConfirm } from '@/composables/useConfirm'
-import { saveFailedMessage } from '@/lib/rpcErrors'
+import {
+  isSetupCapabilityUnsupported,
+  setupSaveFailedMessage as saveFailedMessage,
+} from '@/utils/setupErrorPresentation'
 import { copyTextWithFallback } from '@/utils/browser'
 import { TEXT_TIERS, normalizeRouterTier, routerTierLabelKey } from '@/utils/chat/routerTiers'
+import { APP_SETTINGS_KEY, type AppSettings, type SettingsValue } from '@/modules/appSettings'
+import {
+  SETUP_WORKFLOW_KEY,
+  type ConfigurePrimaryProvider,
+  type SetupWorkflow,
+} from '@/modules/setupWorkflow'
+import { PROVIDER_CONFIGURATION_KEY, type ProviderConfiguration } from '@/modules/providerConfiguration'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -447,7 +457,18 @@ export function useSetupCatalog() {
 // State
 // ---------------------------------------------------------------------------
 
-const rpc = useRpcStore()
+const injectedGatewayAccess = inject(GATEWAY_ACCESS_KEY)
+if (!injectedGatewayAccess) throw new Error('GatewayAccess was not provided')
+const gatewayAccess = injectedGatewayAccess
+const injectedAppSettings = inject(APP_SETTINGS_KEY)
+if (!injectedAppSettings) throw new Error('AppSettings was not provided')
+const appSettings: AppSettings = injectedAppSettings
+const injectedSetupWorkflow = inject(SETUP_WORKFLOW_KEY)
+if (!injectedSetupWorkflow) throw new Error('SetupWorkflow was not provided')
+const setupWorkflow: SetupWorkflow = injectedSetupWorkflow
+const injectedProviderConfiguration = inject(PROVIDER_CONFIGURATION_KEY)
+if (!injectedProviderConfiguration) throw new Error('ProviderConfiguration was not provided')
+const providerConfiguration: ProviderConfiguration = injectedProviderConfiguration
 const { pushToast } = useToasts()
 const { confirm } = useConfirm()
 const t = i18n.global.t
@@ -467,7 +488,7 @@ const modelStrategyRoutingBusy = ref(false)
 // same-microtask double-click window before the first save RPC can yield.
 let saveAllRequestPending = false
 
-const providerForm = useSetupProviderForm()
+const providerForm = useSetupProviderForm(setupWorkflow)
 const configuredProviderProbes = ref<Record<string, ConnectionState>>({})
 let configuredProbeEpoch = 0
 const providerActivation = ref<{
@@ -601,12 +622,7 @@ function discoverImageGenerationModels(providerId: string): Promise<void> {
       [provider]: curated,
     }
   }
-  if (
-    typeof rpc.supportsMethod === 'function'
-    && !rpc.supportsMethod('onboarding.imageGeneration.models.discover')
-  ) {
-    return Promise.resolve()
-  }
+  if (!setupWorkflow.capabilities.imageModelDiscovery) return Promise.resolve()
   const existing = imageModelDiscoveries.get(provider)
   if (existing) return existing
   if (imageModelDiscoveryCompleted.has(provider)) return Promise.resolve()
@@ -615,12 +631,7 @@ function discoverImageGenerationModels(providerId: string): Promise<void> {
   imageModelDiscoveryCompleted.add(provider)
   const request = (async () => {
     try {
-      const res = await rpc.call<{
-        ok?: boolean
-        providerId?: string
-        source?: string
-        models?: unknown
-      }>('onboarding.imageGeneration.models.discover', { providerId: provider })
+      const res = await setupWorkflow.discoverImageGenerationModels(provider)
       if (epoch !== imageModelDiscoveryEpoch) return
       const models = res?.ok ? normalizeDiscoveredModels(res.models) : []
       const source: ImageModelCatalogSource = (
@@ -678,39 +689,17 @@ function discoverTierProviderModels(providerId: string): Promise<void> {
     try {
       // Deliberately provider-only. Never forward the selected provider's
       // unsaved apiKey/baseUrl/proxy into another provider's request.
-      const discoverProfile = () => rpc.call<{
-        ok?: boolean
-        source?: string
-        models?: unknown
-        catalog?: unknown
-      }>('onboarding.llmProfile.models.discover', { providerId: provider })
-      let res: { ok?: boolean; source?: string; models?: unknown; catalog?: unknown }
+      let res
       if (provider === normalizeProviderId(config.value.llm?.provider)) {
         // The current provider lives in [llm], not llm_profiles. This branch
         // matters when Model Service is currently editing a different saved
         // profile: the fixed-model picker must still discover the active
         // provider through its primary deployment.
-        res = await rpc.call<{
-          ok?: boolean
-          source?: string
-          models?: unknown
-          catalog?: unknown
-        }>('onboarding.models.discover', { providerId: provider })
+        res = await setupWorkflow.provider.discoverPrimaryModels({ providerId: provider })
       } else {
-        try {
-          res = await discoverProfile()
-        } catch (err) {
-          if (!isRpcMethodUnavailableError(err)) throw err
-          // Compatibility with pre-profile gateways: the legacy endpoint can
-          // still resolve the provider's registry env key. Never send another
-          // provider's unsaved credentials in this fallback.
-          res = await rpc.call<{
-            ok?: boolean
-            source?: string
-            models?: unknown
-            catalog?: unknown
-          }>('onboarding.models.discover', { providerId: provider })
-        }
+        // The Adapter owns the legacy provider-discovery fallback so this
+        // consumer never branches on RPC method availability.
+        res = await setupWorkflow.profile.discoverProfileModels({ providerId: provider })
       }
       if (epoch !== tierModelDiscoveryEpoch) return
       const source = res?.ok && res.source === 'live' ? 'live' : 'none'
@@ -801,14 +790,13 @@ async function loadData(options: {
   throwOnError?: boolean
 } = {}) {
   try {
-    await rpc.waitForConnection()
     const [cat, st, cfg, effective] = await Promise.all([
-      rpc.call<OnboardingCatalog>('onboarding.catalog'),
-      rpc.call<OnboardingStatus>('onboarding.status'),
-      rpc.call<ConfigData>('config.get'),
+      setupWorkflow.catalog(),
+      setupWorkflow.status(),
+      appSettings.readAll(),
       // Optional on older gateways: effective metadata must never block the
       // settings surface or provider saves.
-      rpc.call<EffectiveConfigData>('config.effective').catch(() => ({ fields: {} })),
+      appSettings.readEffective().catch(() => ({ fields: {} })),
     ])
     // A Provider save owns only the Provider editor. Snapshot every other form
     // after the network round trip but before replacing the config refs. This
@@ -831,10 +819,10 @@ async function loadData(options: {
           audio: promotedForm.audioDirty.value,
         }
       : null
-    catalog.value = cat || {}
-    status.value = st || {}
-    config.value = cfg || {}
-    effectiveConfig.value = effective || {}
+    catalog.value = (cat || {}) as OnboardingCatalog
+    status.value = (st || {}) as OnboardingStatus
+    config.value = (cfg || {}) as ConfigData
+    effectiveConfig.value = (effective || {}) as EffectiveConfigData
     // A probe result describes one exact saved deployment. Any successful
     // reload may follow a key, endpoint, model, activation, or deletion
     // mutation, so stale results must never survive it.
@@ -1816,14 +1804,8 @@ const providerFormPanel = providerForm.createPanel({
   configuredProviderProbes,
   activation: providerActivation,
 })
-const profileSaveSupported = computed(() => (
-  typeof rpc.supportsMethod !== 'function'
-  || rpc.supportsMethod('onboarding.llmProfile.upsert')
-))
-const primaryProviderRemovalSupported = computed(() => (
-  typeof rpc.supportsMethod !== 'function'
-  || rpc.supportsMethod('onboarding.llmProfile.active.remove')
-))
+const profileSaveSupported = computed(() => setupWorkflow.capabilities.profileLifecycle)
+const primaryProviderRemovalSupported = computed(() => setupWorkflow.capabilities.primaryProviderRemoval)
 const providerPanel = computed(() => {
   const panel = providerFormPanel.value
   return {
@@ -2172,8 +2154,12 @@ function firstActionSection(): SettingsSectionId {
 
 function sectionStatus(sectionId: string): { label: string; tone: string } {
   if (sectionId === 'gateway') {
-    if (rpc.isConnected) return { label: t('setup.connection.connected'), tone: 'is-ok' }
-    if (rpc.isConnecting) return { label: t('setup.connection.connecting'), tone: 'is-muted' }
+    if (gatewayAccess.availability === 'available') {
+      return { label: t('setup.connection.connected'), tone: 'is-ok' }
+    }
+    if (gatewayAccess.availability === 'preparing') {
+      return { label: t('setup.connection.connecting'), tone: 'is-muted' }
+    }
     return { label: t('setup.connection.disconnected'), tone: 'is-warn' }
   }
   if (sectionId === 'provider') {
@@ -2489,7 +2475,7 @@ function providerRpcErrorMessage(err: unknown): string {
 }
 
 function isRpcMethodUnavailableError(err: unknown): boolean {
-  return /method.*not found|unknown method|not registered/i.test(saveFailedMessage(err))
+  return isSetupCapabilityUnsupported(err)
 }
 
 function representativeProviderModel(providerId: string): string {
@@ -2534,17 +2520,15 @@ async function probeConfiguredProvider(value: string) {
     ? String(currentModel.value || representativeProviderModel(providerId))
     : representativeProviderModel(providerId)
   try {
-    const res = await rpc.call<{
+    const probe = active ? setupWorkflow.provider.probePrimary : setupWorkflow.profile.probeProfile
+    const res = await probe({ providerId, model }) as {
       ok?: boolean
       failureKind?: string
       message?: string
       firstResponseMs?: number
       totalMs?: number
       latencyMs?: number
-    }>(
-      active ? 'onboarding.provider.probe' : 'onboarding.llmProfile.probe',
-      active ? { providerId, model } : { providerId, model },
-    )
+    }
     if (probeEpoch !== configuredProbeEpoch) return
     const timings = normalizeProbeTimings(res)
     configuredProviderProbes.value = {
@@ -2596,7 +2580,7 @@ async function activateProvider(value: string) {
       error: '',
     }
     try {
-      await rpc.call('onboarding.llmProfile.activate', {
+      await setupWorkflow.profile.activateProfile({
         providerId,
         ...(routerAction ? { routerAction } : {}),
         // Activating a stored profile is not controlled by the primary-provider
@@ -2746,7 +2730,7 @@ async function revealProviderCredential() {
   const providerId = String(providerForm.selectedProvider.value || '').trim()
   if (!providerId) return
   try {
-    const res = await rpc.call<{ ok?: boolean; apiKey?: string }>('onboarding.provider.credential.reveal', { providerId })
+    const res = await setupWorkflow.provider.revealActiveCredential(providerId)
     if (res?.ok && typeof res.apiKey === 'string' && res.apiKey.length > 0) {
       providerForm.setRevealedCredential(res.apiKey)
       return
@@ -2779,15 +2763,14 @@ async function removeProviderCredential() {
   providerCredentialRemovalPending.value = true
   providerForm.hideRevealedCredential()
   try {
-    const method = clearingPrimary
-      ? 'onboarding.provider.credential.clear'
-      : 'onboarding.llmProfile.credential.clear'
-    const response = await rpc.call<{
-      entry?: {
-        externalCredentialActive?: boolean
-        credentialEnv?: string
+    const response = (clearingPrimary
+      ? await setupWorkflow.provider.clearActiveCredential(provider)
+      : await setupWorkflow.profile.clearProfileCredential(provider)) as {
+        entry?: {
+          externalCredentialActive?: boolean
+          credentialEnv?: string
+        }
       }
-    }>(method, { providerId: provider })
     if (response?.entry?.externalCredentialActive) {
       pushToast(t('setup.toast.providerCredentialExternalStillActive', {
         provider: providerLabel,
@@ -2911,7 +2894,7 @@ async function removeProviderProfile(providerId: string) {
       // conflict up front and mirror activateProvider: keep the saved tiers,
       // turn the Router off, and let the operator re-enable it deliberately.
       routerAction = routerConflictsWithTarget(replacement.providerId) ? 'disable' : undefined
-      await rpc.call('onboarding.llmProfile.active.remove', {
+      await setupWorkflow.profile.removeActiveProfile({
         providerId: provider,
         replacementProviderId: replacement.providerId,
         ...(routerAction ? { routerAction } : {}),
@@ -2920,7 +2903,7 @@ async function removeProviderProfile(providerId: string) {
         }),
       })
     } else {
-      await rpc.call('onboarding.llmProfile.remove', { providerId: provider })
+      await setupWorkflow.profile.removeProfile(provider)
     }
     await loadData()
     const providerLabel = providerCatalogLabel(provider)
@@ -3009,10 +2992,7 @@ async function setModelStrategy(strategy: ModelStrategy) {
   )
   modelStrategyRoutingBusy.value = true
   try {
-    await rpc.waitForConnection()
-    const response = await rpc.call('models.routing.set', {
-      mode: routingModeForStrategy(strategy),
-    })
+    const response = await providerConfiguration.setRouting(routingModeForStrategy(strategy))
     ensembleForm.acceptRoutingModeChange(ensembleRoutingState, response)
     routerForm.setEnsembleContext(
       ensembleForm.selectionMode.value,
@@ -3347,9 +3327,7 @@ async function resetCapability(name: CapabilityId) {
 
   capabilityResetPending.value = name
   try {
-    const response = await rpc.call<{ restartRequired?: boolean }>('onboarding.capability.reset', {
-      capabilityId: name,
-    })
+    const response = await setupWorkflow.capability.resetCapability(name)
     // Refresh server-owned status while preserving unrelated drafts, then
     // reseed only the capability that the user explicitly reset.
     await loadData({ preserveFormDrafts: true, throwOnError: true })
@@ -3439,7 +3417,7 @@ function imageGenerationIntentPayload(
   }
 }
 
-function providerConfigurePayload(includeProviderModelDraft = false): Record<string, unknown> {
+function providerConfigurePayload(includeProviderModelDraft = false): ConfigurePrimaryProvider {
   const payload = providerForm.payload()
   if (editingPrimaryProvider.value && hasConfiguredPrimaryProvider.value) {
     // Model Routing owns the fixed-model draft. Provider saves must preserve
@@ -3473,13 +3451,19 @@ function providerConfigurePayload(includeProviderModelDraft = false): Record<str
 
 async function patchConfig(patches: Record<string, unknown>): Promise<boolean> {
   if (!Object.keys(patches).length) return false
-  const res = await rpc.call<{ restartRequired?: boolean }>('config.patch', { patches })
+  const res = await appSettings.patch(Object.entries(patches).map(([path, value]) => ({
+    path,
+    value: value as SettingsValue,
+  })))
   return res?.restartRequired === true
 }
 
 async function safePatchConfig(patches: Record<string, unknown>): Promise<boolean> {
   if (!Object.keys(patches).length) return false
-  const res = await rpc.call<{ restartRequired?: boolean }>('config.patch.safe', { patches })
+  const res = await appSettings.patchSafe(Object.entries(patches).map(([path, value]) => ({
+    path,
+    value: value as SettingsValue,
+  })))
   return res?.restartRequired === true
 }
 
@@ -3489,7 +3473,7 @@ async function safePatchConfig(patches: Record<string, unknown>): Promise<boolea
 // misparse as path separators.
 async function deepPatchConfig(patch: Record<string, unknown>): Promise<boolean> {
   if (!Object.keys(patch).length) return false
-  const res = await rpc.call<{ restartRequired?: boolean }>('config.patch', { patch })
+  const res = await appSettings.merge(patch as import('@/modules/appSettings').SettingsObject)
   return res?.restartRequired === true
 }
 
@@ -3573,7 +3557,7 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
       // it and the apparently-saved env choice would never take effect.
       if (payload.apiKeyEnv !== undefined) payload.apiKey = ''
       payload.keepCurrentSecret = selectedStoredProfile.value && !replacesCredential
-      await rpc.call('onboarding.llmProfile.upsert', payload)
+      await setupWorkflow.profile.upsertProfile(payload)
       if (options.reload !== false) {
         // Saving a routing-only profile refreshes its persisted status without
         // discarding drafts in any other Settings section. Provider-owned
@@ -3594,7 +3578,7 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
     // replace-primary flow: the legacy configure RPC atomically swaps the
     // provider, credential, endpoint, and default model after verification.
     const payload = providerConfigurePayload(options.includeProviderModelDraft === true)
-    await rpc.call('onboarding.provider.configure', payload)
+    await setupWorkflow.provider.configurePrimary(payload)
     const restart = await patchConfig(promotedForm.providerPatches())
     // The per-model context-window override rides the deep-merge patch form. Key
     // it on the CURRENT canonical model draft rather than payload.model (which
@@ -3696,7 +3680,7 @@ async function saveRouter() {
   }
   try {
     if (routerForm.routingDirty.value) {
-      await rpc.call('onboarding.router.configure', routerForm.payload())
+      await setupWorkflow.capability.configureRouter(routerForm.payload())
     }
     const restart = await safePatchConfig(routerForm.visualModePatches())
     pushToast(restart ? t('setup.toast.routerSavedRestart') : t('setup.toast.routerSaved'))
@@ -3713,7 +3697,7 @@ async function saveEnsemble() {
     // loop reads [llm_ensemble] live.
     const params = ensembleForm.payload()
     if (Object.keys(params).length) {
-      await rpc.call('onboarding.ensemble.configure', params)
+      await setupWorkflow.capability.configureEnsemble(params)
     }
     pushToast(t('setup.toast.ensembleSaved'))
     await loadData()
@@ -3747,7 +3731,7 @@ async function saveModelStrategy(options: SaveOptions & {
   try {
     if (hasRouterWork) {
       if (routerRoutingPayload) {
-        await rpc.call('onboarding.router.configure', routerRoutingPayload)
+        await setupWorkflow.capability.configureRouter(routerRoutingPayload)
       }
       const restart = await safePatchConfig(routerVisualPatches)
       pushToast(restart ? t('setup.toast.routerSavedRestart') : t('setup.toast.routerSaved'))
@@ -3755,7 +3739,7 @@ async function saveModelStrategy(options: SaveOptions & {
     }
 
     if (hasEnsembleWork) {
-      await rpc.call('onboarding.ensemble.configure', ensemblePayload)
+      await setupWorkflow.capability.configureEnsemble(ensemblePayload)
       pushToast(t('setup.toast.ensembleSaved'))
       savedAny = true
     }
@@ -3768,16 +3752,13 @@ async function saveModelStrategy(options: SaveOptions & {
           pushToast(t('setup.toast.chooseProvider'), { tone: 'danger' })
           return false
         }
-        const response = await rpc.call<{ restartRequired?: boolean }>(
-          'onboarding.llmProfile.activate',
-          {
-            providerId,
-            model: modelStrategyForm.fixedModel.value.trim(),
-            ...imageGenerationIntentPayload(providerId, {
-              respectProviderEditorChoice: false,
-            }),
-          },
-        )
+        const response = await setupWorkflow.profile.activateProfile({
+          providerId,
+          model: modelStrategyForm.fixedModel.value.trim(),
+          ...imageGenerationIntentPayload(providerId, {
+            respectProviderEditorChoice: false,
+          }),
+        })
         restart = response?.restartRequired === true
         if (!hasRouterWork) {
           pushToast(t('setup.toast.providerActivated', {
@@ -3808,7 +3789,7 @@ async function saveSearch(options: SaveOptions = {}): Promise<boolean> {
   }
   const params = capabilitiesForm.searchPayload()
   try {
-    await rpc.call('onboarding.search.configure', params)
+    await setupWorkflow.capability.configureSearch(params)
     pushToast(t('setup.toast.searchSaved'))
     if (options.reload !== false) await loadData()
     return true
@@ -3824,7 +3805,10 @@ async function saveMemory(options: SaveOptions = {}): Promise<boolean> {
     let envToastShown = false
     if (embeddingDirty) {
       const params = capabilitiesForm.memoryPayload()
-      const res = await rpc.call<{ entry?: { remote?: { api_key_env?: string; api_key?: string } }; restartRequired?: boolean }>('onboarding.memory_embedding.configure', params)
+      const res = await setupWorkflow.capability.configureMemoryEmbedding(params) as {
+        entry?: { remote?: { api_key_env?: string; api_key?: string } }
+        restartRequired?: boolean
+      }
       const remote = res?.entry?.remote || {}
       envToastShown = _toastEnvReferenceSave(t('setup.toast.memorySurface'), remote.api_key_env, '', remote.api_key ?? '', res?.restartRequired)
     }
@@ -3842,7 +3826,10 @@ async function saveMemory(options: SaveOptions = {}): Promise<boolean> {
 async function saveImage(options: SaveOptions = {}): Promise<boolean> {
   const params = capabilitiesForm.imagePayload()
   try {
-    const res = await rpc.call<{ entry?: { api_key_env?: string; api_key_source?: string; api_key?: string }; restartRequired?: boolean }>('onboarding.imageGeneration.configure', params)
+    const res = await setupWorkflow.capability.configureImageGeneration(params) as {
+      entry?: { api_key_env?: string; api_key_source?: string; api_key?: string }
+      restartRequired?: boolean
+    }
     const entry = res?.entry || {}
     if (!_toastEnvReferenceSave(t('setup.image.title'), entry.api_key_env, entry.api_key_source, entry.api_key, res?.restartRequired)) {
       pushToast(t('setup.toast.imageSaved'))
@@ -3861,7 +3848,10 @@ async function saveAudio(options: SaveOptions = {}): Promise<boolean> {
     return true
   }
   try {
-    const res = await rpc.call<{ entry?: { api_key_env?: string; api_key_source?: string; api_key?: string }; restartRequired?: boolean }>('onboarding.audio.configure', promotedForm.audioPayload())
+    const res = await setupWorkflow.capability.configureAudio(promotedForm.audioPayload()) as {
+      entry?: { api_key_env?: string; api_key_source?: string; api_key?: string }
+      restartRequired?: boolean
+    }
     const entry = res?.entry || {}
     if (!_toastEnvReferenceSave(t('setup.audio.title'), entry.api_key_env, entry.api_key_source, entry.api_key, res?.restartRequired)) {
       pushToast(res?.restartRequired ? t('setup.toast.audioSavedRestart') : t('setup.toast.audioSaved'))

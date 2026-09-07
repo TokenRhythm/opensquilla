@@ -1,20 +1,22 @@
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
+import { inject, ref } from 'vue'
 
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
 import {
-  ensureSandboxReady,
+  SANDBOX_RUNTIME_KEY,
+  type SandboxChatRuntime,
   type SandboxSetupOutcome,
-} from '@/composables/sandboxSetupCoordinator'
-import { useRpcStore } from '@/stores/rpc'
+} from '@/modules/sandboxRuntime'
 import type {
   SandboxRunMode,
   SandboxSetupStatusPayload,
 } from '@/types/sandbox'
 
 export const useSandboxSetupStore = defineStore('sandboxSetup', () => {
-  const rpc = useRpcStore()
+  const injectedSandbox = inject(SANDBOX_RUNTIME_KEY)
+  if (!injectedSandbox) throw new Error('SandboxRuntime was not provided')
+  const sandbox: Pick<SandboxChatRuntime, 'ensureReady' | 'selectMode'> = injectedSandbox
   const { pushToast } = useToasts()
   const ensuring = ref(false)
   const outcome = ref<SandboxSetupOutcome>('idle')
@@ -32,21 +34,18 @@ export const useSandboxSetupStore = defineStore('sandboxSetup', () => {
 
   async function runSetup(): Promise<boolean> {
     try {
-      const result = await ensureSandboxReady(
-        (method, params) => rpc.call(method, params),
-        null,
-        () => rpc.waitForConnection(10_000),
-      )
+      const result = await sandbox.ensureReady()
       status.value = result.status
       outcome.value = result.outcome
       if (!result.ready) {
+        if (result.outcome === 'in_progress') return false
         pushToast(String(i18n.global.t('settings.sandbox.setup.failedToast')), {
           tone: 'danger',
         })
         return false
       }
       if (intendedMode.value === 'safe') {
-        await rpc.call('sandbox.run_mode.preference.set', { runMode: 'safe' })
+        await sandbox.selectMode('safe')
       }
       pushToast(String(i18n.global.t('settings.sandbox.setup.readyToast')), {
         tone: 'ok',

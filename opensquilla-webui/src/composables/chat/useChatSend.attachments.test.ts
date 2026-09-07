@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { effectScope, nextTick, ref, watch } from 'vue'
 
-import { useChatSend, type UseChatSendOptions } from './useChatSend'
+import { useChatSend, type UseChatSendOptions as DomainUseChatSendOptions } from './useChatSend'
 import { createV4TurnCommandsFromRpcClient } from '@/adapters/gateway/turnCommandsV4'
 import { createLegacyPendingInputQueue } from '@/adapters/gateway/pendingInputQueueV4'
 import { useChatRpcEventHandlers } from './useChatRpcEventHandlers'
@@ -11,7 +11,6 @@ import {
 } from './useChatSteerDelivery'
 import { useChatTaskOwnership } from './useChatTaskOwnership'
 import { useChatMessageActions } from './useChatMessageActions'
-import type { FoldLiveTurnMode } from './useChatTurnLog'
 import type {
   Attachment,
   ChatMessage,
@@ -109,12 +108,24 @@ function memoryHandoffWal(): PendingInputWal {
   }
 }
 
-function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
-  const rpc = {
+interface UseChatSendOptions extends DomainUseChatSendOptions {
+  // Raw transport exists only inside this Adapter harness; production options
+  // contain the already-typed TurnCommands port.
+  rpc: { call: any }
+}
+
+type SendHarnessOverrides = Partial<UseChatSendOptions> & {
+  methodAvailability?: (method: string) => boolean
+}
+
+function makeOptions(overrides: SendHarnessOverrides = {}) {
+  const { rpc: rpcOverride, methodAvailability, ...sendOverrides } = overrides
+  const rpc = rpcOverride ?? {
     call: vi.fn().mockResolvedValue({ sessionKey: 'agent:main:webchat:test' }),
   }
+  const metaDiscardDraft = vi.fn().mockResolvedValue({ discarded: true, accepted: false })
   const turnCommands = overrides.turnCommands ?? createV4TurnCommandsFromRpcClient(
-    rpc as unknown as UseChatSendOptions['rpc'],
+    rpc as unknown as Parameters<typeof createV4TurnCommandsFromRpcClient>[0],
   )
   const stream: UseChatSendOptions['stream'] = {
     isStreaming: ref(false),
@@ -137,7 +148,6 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
     showThinkingIndicator: vi.fn(),
     hideThinkingIndicator: vi.fn(),
     appendFrame: vi.fn(),
-    useReducer: ref<FoldLiveTurnMode>(false),
   }
   const messages = overrides.messages ?? ref<ChatMessage[]>([])
   const pendingQueue = ref<ChatPendingItem[]>([])
@@ -168,6 +178,7 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
   const options: UseChatSendOptions = {
     rpc,
     turnCommands,
+    metaRunCenter: overrides.metaRunCenter ?? { discardDraft: metaDiscardDraft },
     inputText: ref('hello'),
     messages,
     sessionKey: ref('agent:main:webchat:test'),
@@ -206,22 +217,22 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
     closeSlashMenu: vi.fn(),
     autoResizeTextarea: vi.fn(),
     scrollToBottom: vi.fn(),
-    ...overrides,
+    ...sendOverrides,
   }
-  if (!overrides.turnCommands) {
+  if (!sendOverrides.turnCommands) {
     options.turnCommands = createV4TurnCommandsFromRpcClient(
-      options.rpc,
-      options.supportsMethod,
+      options.rpc as Parameters<typeof createV4TurnCommandsFromRpcClient>[0],
+      methodAvailability,
     )
   }
-  return { api: useChatSend(options), options, rpc, stream, pendingQueue }
+  return { api: useChatSend(options), options, rpc, stream, pendingQueue, metaDiscardDraft }
 }
 
 function sameTurnSteerOptions(
   expectedTurnId = 'turn-current',
-): Partial<UseChatSendOptions> {
+): SendHarnessOverrides {
   return {
-    supportsMethod: method => method === 'sessions.steer.v2',
+    methodAvailability: method => method === 'sessions.steer.v2',
     activeSteerCapability: ref({
       mode: 'same_turn',
       expected_turn_id: expectedTurnId,
@@ -1691,7 +1702,7 @@ describe('useChatSend attachment payloads', () => {
     )).toHaveLength(1)
 
     first.api.discardHiddenControl('agent:main:webchat:test', 'discarded-meta-request')
-    expect(first.rpc.call).toHaveBeenCalledWith('meta.drafts.discard', {
+    expect(first.metaDiscardDraft).toHaveBeenCalledWith({
       sessionKey: 'agent:main:webchat:test',
       clientRequestId: 'discarded-meta-request',
     })
@@ -1720,7 +1731,7 @@ describe('useChatSend attachment payloads', () => {
       '/meta meta-short-drama -- never launch after cancel',
       'lost-discard-response',
     )
-    first.rpc.call.mockRejectedValueOnce(new Error('response lost'))
+    first.metaDiscardDraft.mockRejectedValueOnce(new Error('response lost'))
     first.api.discardHiddenControl('agent:main:webchat:test', 'lost-discard-response')
     await Promise.resolve()
 
@@ -1730,14 +1741,14 @@ describe('useChatSend attachment payloads', () => {
       hiddenControlStorage: memoryStorage(),
       metaDiscardStorage: persistentDiscardStorage,
     })
-    remounted.rpc.call.mockResolvedValue({ discarded: true })
+    remounted.metaDiscardDraft.mockResolvedValue({ discarded: true, accepted: false })
     await expect(remounted.api.flushPendingMetaDiscards(
       'agent:main:webchat:test',
     )).resolves.toEqual([])
     await remounted.api.restoreHiddenControls('agent:main:webchat:test')
 
-    expect(remounted.rpc.call).toHaveBeenCalledTimes(1)
-    expect(remounted.rpc.call).toHaveBeenCalledWith('meta.drafts.discard', {
+    expect(remounted.metaDiscardDraft).toHaveBeenCalledTimes(1)
+    expect(remounted.metaDiscardDraft).toHaveBeenCalledWith({
       sessionKey: 'agent:main:webchat:test',
       clientRequestId: 'lost-discard-response',
     })
@@ -1757,14 +1768,14 @@ describe('useChatSend attachment payloads', () => {
       hiddenControlStorage: memoryStorage(),
       metaDiscardStorage: persistentDiscardStorage,
     })
-    remounted.rpc.call.mockResolvedValue({ discarded: false, accepted: true })
+    remounted.metaDiscardDraft.mockResolvedValue({ discarded: false, accepted: true })
 
     await expect(remounted.api.flushPendingMetaDiscards(
       'agent:main:webchat:test',
     )).resolves.toEqual([])
     await remounted.api.restoreHiddenControls('agent:main:webchat:test')
 
-    expect(remounted.rpc.call).toHaveBeenCalledTimes(1)
+    expect(remounted.metaDiscardDraft).toHaveBeenCalledTimes(1)
     expect(remounted.rpc.call).not.toHaveBeenCalledWith('chat.send', expect.anything())
     expect(listPendingMetaDiscards(
       'agent:main:webchat:test',
@@ -1871,17 +1882,17 @@ describe('useChatSend attachment payloads', () => {
   it.each([
     {
       name: 'an old gateway',
-      supportsMethod: () => false,
+      methodAvailability: () => false,
       capability: { mode: 'same_turn' as const, expected_turn_id: 'turn-current' },
     },
     {
       name: 'a queue-only active mode',
-      supportsMethod: (method: string) => method === 'sessions.steer.v2',
+      methodAvailability: (method: string) => method === 'sessions.steer.v2',
       capability: { mode: 'queue_only' as const, expected_turn_id: 'turn-current' },
     },
     {
       name: 'an unsupported input-kind snapshot',
-      supportsMethod: (method: string) => method === 'sessions.steer.v2',
+      methodAvailability: (method: string) => method === 'sessions.steer.v2',
       capability: {
         mode: 'same_turn' as const,
         expected_turn_id: 'turn-current',
@@ -1889,12 +1900,12 @@ describe('useChatSend attachment payloads', () => {
       },
     },
   ])('visibly queues instead of using legacy cancel-style steer for $name', async ({
-    supportsMethod,
+    methodAvailability,
     capability,
   }) => {
     const enqueuePendingInput = vi.fn(() => true)
     const { api, rpc, stream } = makeOptions({
-      supportsMethod,
+      methodAvailability,
       activeSteerCapability: ref(capability),
       busySendMode: ref<BusySendMode>('steer'),
       enqueuePendingInput,
@@ -3616,7 +3627,7 @@ describe('useChatSend attachment payloads', () => {
     }
     const { api, stream } = makeOptions({
       ...sameTurnSteerOptions(),
-      supportsMethod: method => (
+      methodAvailability: method => (
         method === 'sessions.steer.v2'
         || method === 'sessions.pending_inputs.steer'
       ),
@@ -5466,11 +5477,11 @@ describe('useChatSend attachment payloads', () => {
 
       rpcEvents.handlers.onTaskRunning({
         task_id: 'task-A',
-        session_key: 'agent:main:webchat:test',
+        key: 'agent:main:webchat:test',
       })
       rpcEvents.handlers.onTextDelta({
         task_id: 'task-A',
-        session_key: 'agent:main:webchat:test',
+        key: 'agent:main:webchat:test',
         stream_seq: 1,
         text: 'A token before B ACK',
       })
@@ -7197,7 +7208,7 @@ describe('useChatSend slash-prefixed input fall-through', () => {
       }
       const pendingInputQueue = createLegacyPendingInputQueue({
         request: <T = unknown>(method: string, params?: Record<string, unknown>) => (
-          rpc.call<T>(method, params)
+          rpc.call(method, params) as Promise<T>
         ),
         supports: method => method.startsWith('sessions.pending_inputs.'),
       })
@@ -7320,7 +7331,7 @@ describe('useChatSend slash-prefixed input fall-through', () => {
       }
       const pendingInputQueue = createLegacyPendingInputQueue({
         request: <T = unknown>(method: string, params?: Record<string, unknown>) => (
-          rpc.call<T>(method, params)
+          rpc.call(method, params) as Promise<T>
         ),
         supports: method => method.startsWith('sessions.pending_inputs.'),
       })

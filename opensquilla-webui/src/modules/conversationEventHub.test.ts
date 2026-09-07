@@ -25,8 +25,8 @@ function sourceHarness() {
     state(value: string) {
       active?.onConnectionState?.(value)
     },
-    any(event: string, payload: unknown) {
-      active?.onAny?.(event, payload)
+    decodeError(error: unknown) {
+      active?.onDecodeError?.(error)
     },
     counts() {
       return { subscriptions, detachments }
@@ -83,18 +83,19 @@ describe('conversation event hub', () => {
     const source = sourceHarness()
     const hub = createConversationEventHub(source)
     const state = vi.fn()
-    const any = vi.fn()
+    const decodeError = vi.fn()
     const offState = hub.observeConnectionState(state)
-    const offAny = hub.observeAny(any)
+    const offDecodeError = hub.observeDecodeError(decodeError)
 
     source.state('connected')
     expect(state).toHaveBeenCalledWith('connected')
-    source.any('presence', { value: true })
-    expect(any).toHaveBeenCalledWith('presence', { value: true })
+    const error = new Error('malformed event')
+    source.decodeError(error)
+    expect(decodeError).toHaveBeenCalledWith(error)
     offState()
     offState()
-    offAny()
-    offAny()
+    offDecodeError()
+    offDecodeError()
     expect(source.counts()).toEqual({ subscriptions: 1, detachments: 1 })
   })
 

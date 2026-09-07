@@ -172,6 +172,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     # transaction layer; recovery does not import migration back.
     ("migration", "recovery"),
     ("migration", "onboarding"),
+    # Setup mutations reuse the settings owner's secret-provenance rules.
+    # Application has no dependency back on onboarding or runtime packages.
+    ("onboarding", "application"),
     ("onboarding", "channels"),
     ("onboarding", "gateway"),
     ("onboarding", "provider"),

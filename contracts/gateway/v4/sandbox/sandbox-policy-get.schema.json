@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opensquilla.dev/contracts/gateway/v4/sandbox/sandbox-policy-get.schema.json",
+  "title": "OpenSquilla sandbox.policy.get Contract",
+  "type": "object", "additionalProperties": false,
+  "properties": {"request": {"$ref": "#/$defs/RequestFrame"}, "response": {"$ref": "#/$defs/ResponseFrame"}},
+  "x-opensquilla-wire": {"protocol": "opensquilla-websocket-json", "version": 4, "compatibility": "exact-json-tree"},
+  "x-opensquilla-codegen": {"python": {"tool": "datamodel-code-generator", "version": "0.75.1", "target": "pydantic_v2.BaseModel"}, "typescript": {"tool": "json-schema-to-typescript", "version": "15.0.4"}, "runtimeValidation": {"tool": "ajv", "version": "8.17.1", "mode": "standalone-adapter-only"}},
+  "x-opensquilla-method": {"name": "sandbox.policy.get", "kind": "query", "scope": "operator.read", "guestAllowed": false, "idempotency": "read-only", "timeout": {"policy": "transport"}, "capability": {"kind": "method-availability", "name": "sandbox.policy.get"}, "request": "#/$defs/RequestFrame", "params": "#/$defs/Params", "response": "#/$defs/ResponseFrame", "result": "#/$defs/Policy", "errors": [{"code": "INVALID_REQUEST"}, {"code": "UNAUTHORIZED"}, {"code": "UNAVAILABLE", "retryable": true}, {"code": "INTERNAL_ERROR"}]},
+  "$defs": {
+    "Params": {"type": "object", "additionalProperties": true},
+    "Files": {"type": "object", "additionalProperties": true, "required": ["customDenyWritePaths", "recursiveDeleteBackupEnabled", "backupQuotaBytes"], "properties": {"customDenyWritePaths": {"type": "array", "items": {"type": "string"}}, "recursiveDeleteBackupEnabled": {"type": "boolean"}, "backupQuotaBytes": {"type": "integer", "minimum": 1}}},
+    "Commands": {"type": "object", "additionalProperties": true, "required": ["requireApprovalPrefixes", "autoAllowPrefixes", "systemTools"], "properties": {"requireApprovalPrefixes": {"$ref": "#/$defs/CommandPrefixes"}, "autoAllowPrefixes": {"$ref": "#/$defs/CommandPrefixes"}, "systemTools": {"enum": ["auto", "prompt", "disabled"]}}},
+    "CommandPrefixes": {"type": "array", "items": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}},
+    "Network": {"type": "object", "additionalProperties": true, "required": ["blockAllNetwork", "allowDomains", "denyDomains"], "properties": {"blockAllNetwork": {"type": "boolean"}, "allowDomains": {"type": "array", "items": {"type": "string"}}, "denyDomains": {"type": "array", "items": {"type": "string"}}}},
+    "Runtimes": {"type": "object", "additionalProperties": true, "required": ["enabled", "python", "node", "gitBash"], "properties": {"enabled": {"type": "boolean"}, "python": {"type": "boolean"}, "node": {"type": "boolean"}, "gitBash": {"type": "boolean"}}},
+    "Policy": {"type": "object", "additionalProperties": true, "required": ["schemaVersion", "policyVersion", "files", "commands", "network", "runtimes"], "properties": {"schemaVersion": {"const": 2}, "policyVersion": {"type": "integer", "minimum": 0}, "files": {"$ref": "#/$defs/Files"}, "commands": {"$ref": "#/$defs/Commands"}, "network": {"$ref": "#/$defs/Network"}, "runtimes": {"$ref": "#/$defs/Runtimes"}}},
+    "RpcError": {"type": "object", "additionalProperties": true},
+    "RequestFrame": {"type": "object", "additionalProperties": true, "required": ["type", "id", "method"], "properties": {"type": {"const": "req"}, "id": {"type": "string"}, "method": {"const": "sandbox.policy.get"}, "params": {"anyOf": [{"$ref": "#/$defs/Params"}, {"type": "null"}]}}},
+    "ResponseFrame": {"type": "object", "additionalProperties": true, "required": ["type", "id", "ok"], "properties": {"type": {"const": "res"}, "id": {"type": "string"}, "method": {"const": "sandbox.policy.get"}, "ok": {"type": "boolean"}, "payload": {"$ref": "#/$defs/Policy"}, "error": {"$ref": "#/$defs/RpcError"}}}
+  }
+}

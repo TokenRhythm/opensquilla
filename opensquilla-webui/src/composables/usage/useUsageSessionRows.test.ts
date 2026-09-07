@@ -1,4 +1,5 @@
 import { computed, ref } from 'vue'
+import { usageSession } from '@/testing/usage.test-helper'
 import { describe, expect, it } from 'vitest'
 import { useUsageSessionRows } from './useUsageSessionRows'
 
@@ -8,12 +9,10 @@ describe('useUsageSessionRows', () => {
       visibleSessions: computed(() => [{
         sessionKey: 'agent:main:webchat:private-id',
         title: 'Inspect the long-running launch readiness checklist and summarize risks',
-      }]),
+      }].map(usageSession)),
       rangeHiddenHint: computed(() => ''),
       sortCol: ref('updated_at'),
       sortAsc: ref(false),
-      rowVal: (row, ...keys) => keys.map(key => row[key]).find(value => value != null),
-      numericRowVal: () => null,
       sessionTimestamp: () => null,
       relTime: () => '-',
       sortVal: () => 0,
@@ -35,12 +34,10 @@ describe('useUsageSessionRows', () => {
           { model: 'provider/primary-model' },
           { model: 'provider/helper-model' },
         ],
-      }]),
+      }].map(usageSession)),
       rangeHiddenHint: computed(() => ''),
       sortCol: ref('updated_at'),
       sortAsc: ref(false),
-      rowVal: (row, ...keys) => keys.map(key => row[key]).find(value => value != null),
-      numericRowVal: () => null,
       sessionTimestamp: () => null,
       relTime: () => '-',
       sortVal: () => 0,
@@ -60,15 +57,13 @@ describe('useUsageSessionRows', () => {
         },
         {
           sessionKey: '',
-          session_id: 'deleted-session-b',
+          sessionId: 'deleted-session-b',
           modelBreakdown: [{ model: 'provider/a' }, { model: 'provider/b' }],
         },
-      ]),
+      ].map(usageSession)),
       rangeHiddenHint: computed(() => ''),
       sortCol: ref('updated_at'),
       sortAsc: ref(false),
-      rowVal: (row, ...keys) => keys.map(key => row[key]).find(value => value != null),
-      numericRowVal: () => null,
       sessionTimestamp: () => null,
       relTime: () => '-',
       sortVal: () => 0,
@@ -95,13 +90,11 @@ describe('useUsageSessionRows', () => {
     const { sortedRows } = useUsageSessionRows({
       visibleSessions: computed(() => [
         { sessionKey: '', session: 'legacy-session' },
-        { key: 'legacy-key' },
-      ]),
+        { sessionKey: 'legacy-key' },
+      ].map(usageSession)),
       rangeHiddenHint: computed(() => ''),
       sortCol: ref('updated_at'),
       sortAsc: ref(false),
-      rowVal: (row, ...keys) => keys.map(key => row[key]).find(value => value != null),
-      numericRowVal: () => null,
       sessionTimestamp: () => null,
       relTime: () => '-',
       sortVal: () => 0,

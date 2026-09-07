@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick, type App as VueApp } from 'vue'
 import i18n from '@/i18n'
 import UpdateBanner from './UpdateBanner.vue'
+import { OBSERVABILITY_KEY, type UpdateNotice } from '@/modules/observability'
 
 const platformMocks = vi.hoisted(() => ({
   desktopUpdateManaged: vi.fn(),
@@ -75,6 +76,39 @@ async function mountBanner(): Promise<{ app: VueApp; el: HTMLDivElement }> {
   document.body.appendChild(el)
   const app = createApp(UpdateBanner)
   app.use(i18n)
+  app.provide(OBSERVABILITY_KEY, {
+    async updateNotice(options?: { signal?: AbortSignal }): Promise<UpdateNotice | null | undefined> {
+      const headers: Record<string, string> = {}
+      const token = sessionStorage.getItem('opensquilla.wsToken') || ''
+      if (token) headers.Authorization = `Bearer ${token}`
+      try {
+        const response = await fetch('/api/system/update', {
+          cache: 'no-store',
+          headers,
+          signal: options?.signal,
+        })
+        if (!response.ok) return undefined
+        const raw = await response.json() as Partial<UpdatePayload>
+        if (
+          typeof raw.current !== 'string'
+          || typeof raw.available !== 'boolean'
+          || (raw.latest !== null && typeof raw.latest !== 'string')
+          || (raw.url !== null && typeof raw.url !== 'string')
+          || (raw.checkedAt !== null && typeof raw.checkedAt !== 'string')
+        ) return undefined
+        if (!raw.available) return null
+        if (typeof raw.latest !== 'string' || !raw.latest.trim()) return undefined
+        return {
+          current: raw.current,
+          latest: raw.latest,
+          available: true,
+          url: typeof raw.url === 'string' && raw.url ? raw.url : undefined,
+        }
+      } catch {
+        return undefined
+      }
+    },
+  } as never)
   app.mount(el)
   apps.add(app)
   await flushAsync()
@@ -107,27 +141,29 @@ afterEach(() => {
 })
 
 describe('UpdateBanner live update polling', () => {
-  it('shows a newly published release on the next poll without remounting', async () => {
-    fetchMock
-      .mockResolvedValueOnce(jsonResponse(payload()))
-      .mockResolvedValueOnce(jsonResponse(payload({
-        latest: '0.5.0rc5',
-        available: true,
-        url: 'https://github.com/opensquilla/opensquilla/releases/tag/v0.5.0rc5',
-      })))
+  it.each(['TokenRhythm', 'opensquilla'])(
+    'shows a newly published %s release on the next poll without remounting',
+    async (owner) => {
+      const releaseUrl = `https://github.com/${owner}/opensquilla/releases/tag/v0.5.0rc5`
+      fetchMock
+        .mockResolvedValueOnce(jsonResponse(payload()))
+        .mockResolvedValueOnce(jsonResponse(payload({
+          latest: '0.5.0rc5',
+          available: true,
+          url: releaseUrl,
+        })))
 
-    const { el } = await mountBanner()
-    expect(el.querySelector('[data-testid="update-banner"]')).toBeNull()
+      const { el } = await mountBanner()
+      expect(el.querySelector('[data-testid="update-banner"]')).toBeNull()
 
-    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_MS)
-    await flushAsync()
+      await vi.advanceTimersByTimeAsync(POLL_INTERVAL_MS)
+      await flushAsync()
 
-    const banner = el.querySelector('[data-testid="update-banner"]')
-    expect(banner?.textContent).toContain('0.5.0rc5')
-    expect(el.querySelector('.update-banner__link')?.getAttribute('href')).toBe(
-      'https://github.com/opensquilla/opensquilla/releases/tag/v0.5.0rc5',
-    )
-  })
+      const banner = el.querySelector('[data-testid="update-banner"]')
+      expect(banner?.textContent).toContain('0.5.0rc5')
+      expect(el.querySelector('.update-banner__link')?.getAttribute('href')).toBe(releaseUrl)
+    },
+  )
 
   it('reads the current session token for every same-origin request', async () => {
     sessionStorage.setItem('opensquilla.wsToken', 'first-token')
@@ -333,7 +369,7 @@ describe('UpdateBanner live update polling', () => {
     const { el } = await mountBanner()
 
     expect(el.querySelector('.update-banner__link')?.getAttribute('href')).toBe(
-      'https://github.com/opensquilla/opensquilla/releases',
+      'https://github.com/TokenRhythm/opensquilla/releases',
     )
   })
 

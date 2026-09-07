@@ -17,6 +17,8 @@ from opensquilla.application.approval_rpc import (
     approval_status_rpc_payload,
     approval_wait_decision_rpc_payload,
 )
+from opensquilla.gateway.adapters.approval_contract import register_approval_contract
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
 from opensquilla.project_workspaces import ProjectWorkspaceStateError
 from opensquilla.sandbox.escalation import (
@@ -180,7 +182,6 @@ async def _handle_exec_approval_wait_decision(
     )
 
 
-@_d.method("exec.approval.status", scope="operator.approvals")
 async def _handle_exec_approval_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict) or not str(params.get("id") or "").strip():
         raise ValueError("params.id is required")
@@ -191,7 +192,6 @@ async def _handle_exec_approval_status(params: dict | None, ctx: RpcContext) -> 
     )
 
 
-@_d.method("exec.approval.snapshot", scope="operator.approvals")
 async def _handle_exec_approval_snapshot(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     """Return a diagnostic snapshot for approval state."""
     queue = get_approval_queue()
@@ -208,7 +208,6 @@ async def _handle_exec_approval_forget(params: dict | None, ctx: RpcContext) -> 
     return approval_forget_rpc_payload(target)
 
 
-@_d.method("exec.approval.resolve", scope="operator.approvals")
 async def _handle_exec_approval_resolve(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict) or "id" not in params:
         raise ValueError("params.id is required")
@@ -340,7 +339,6 @@ def _coerce_extend_seconds(raw: Any) -> float:
     return min(seconds, _EXTEND_MAX_SECONDS)
 
 
-@_d.method("exec.approval.extend", scope="operator.approvals")
 async def _handle_exec_approval_extend(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict) or "id" not in params:
         raise ValueError("params.id is required")
@@ -349,7 +347,6 @@ async def _handle_exec_approval_extend(params: dict | None, ctx: RpcContext) -> 
     return approval_extend_rpc_payload(queue, params["id"], seconds)
 
 
-@_d.method("plugin.approval.extend", scope="operator.approvals")
 async def _handle_plugin_approval_extend(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict) or "id" not in params:
         raise ValueError("params.id is required")
@@ -386,7 +383,6 @@ async def _handle_plugin_approval_wait_decision(
     )
 
 
-@_d.method("plugin.approval.status", scope="operator.approvals")
 async def _handle_plugin_approval_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict) or not str(params.get("id") or "").strip():
         raise ValueError("params.id is required")
@@ -397,7 +393,6 @@ async def _handle_plugin_approval_status(params: dict | None, ctx: RpcContext) -
     )
 
 
-@_d.method("plugin.approval.resolve", scope="operator.approvals")
 async def _handle_plugin_approval_resolve(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict) or "id" not in params:
         raise ValueError("params.id is required")
@@ -417,3 +412,25 @@ async def _handle_plugin_approval_resolve(params: dict | None, ctx: RpcContext) 
         if queue.get(approval_id).resolved:
             return approval_status_rpc_payload(queue, approval_id, queue.get_settings().mode)
         raise
+
+
+_EXEC_APPROVAL_CONTRACT_IMPLEMENTATIONS = {
+    "exec.approval.status": _handle_exec_approval_status,
+    "exec.approval.snapshot": _handle_exec_approval_snapshot,
+    "exec.approval.resolve": _handle_exec_approval_resolve,
+    "exec.approval.extend": _handle_exec_approval_extend,
+    "plugin.approval.status": _handle_plugin_approval_status,
+    "plugin.approval.resolve": _handle_plugin_approval_resolve,
+    "plugin.approval.extend": _handle_plugin_approval_extend,
+}
+
+_EXEC_APPROVAL_CONTRACT_HANDLERS = {
+    method: register_approval_contract(
+        _d,
+        method,
+        implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+    for method, implementation in _EXEC_APPROVAL_CONTRACT_IMPLEMENTATIONS.items()
+}

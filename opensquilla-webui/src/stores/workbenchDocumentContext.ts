@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { shallowRef } from 'vue'
 
-import type { ChatDocumentContext } from '@/types/rpc'
+import type { ChatDocumentContext } from '@/types/chat'
 
 export interface ActiveWorkbenchDocumentContext extends ChatDocumentContext {
   activeItemId: string

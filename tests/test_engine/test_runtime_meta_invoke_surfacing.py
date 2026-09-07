@@ -1,6 +1,6 @@
 """TurnRunner._build_tools surfaces meta_invoke when meta-skills are loaded.
 
-meta_invoke is registered with ``exposed_by_default=False`` so the tool
+meta_invoke is registered with ``default_access="deny"`` so the tool
 catalogue stays clean in deployments that don't ship meta-skills. When
 at least one ``kind=meta`` skill IS loaded, ``_build_tools`` must add
 ``"meta_invoke"`` to ``ctx.surfaced_tools`` so the registry's visibility
@@ -99,7 +99,7 @@ def test_build_tools_does_not_surface_meta_invoke_without_meta_skills(
     tmp_path: Path,
 ) -> None:
     """When no meta-skills are loaded, meta_invoke stays hidden — its
-    ``exposed_by_default=False`` keeps the catalogue tight for deployments
+    ``default_access="deny"`` keeps the catalogue tight for deployments
     that don't ship meta-skills."""
     registry = get_default_registry()
     loader = _make_loader_without_meta(tmp_path)

@@ -1,5 +1,4 @@
 import { computed, ref } from 'vue'
-import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
 
 const activeHolds = ref(0)
 let primedRelease: (() => void) | null = null
@@ -12,62 +11,15 @@ let primedRelease: (() => void) | null = null
  */
 export const optionalSessionRpcAllowed = computed(() => activeHolds.value === 0)
 
-export const OPTIONAL_SESSION_RPC_TIMEOUT_MS = 10_000
+export const OPTIONAL_SESSION_READ_TIMEOUT_MS = 10_000
 
-export const optionalSessionRpcCallOptions: RpcCallOptions = {
-  timeoutMs: OPTIONAL_SESSION_RPC_TIMEOUT_MS,
-  // Give ordinary metadata latency enough room to avoid interrupting an
-  // active stream. If a request is genuinely stuck, the Gateway's serialized
-  // dispatcher cannot serve later frames, so reconnect as a last resort.
-  timeoutAction: 'reconnect',
-  // Navigation owns this waiter/request, never the shared transport. A
-  // superseded Session may abandon its result without recycling the socket.
-  abortAction: 'reject',
+export interface OptionalSessionReadOptions {
+  readonly timeoutMs: number
+  readonly signal?: AbortSignal
 }
 
-// The first setup-status read can queue behind the live Windows capability
-// canary, whose own bounded probe may take up to 30 seconds. Treat this as a
-// slow diagnostic read: give it enough time to finish and never recycle the
-// shared chat socket merely because the read was abandoned.
-export const sandboxSetupRpcCallOptions: RpcCallOptions = {
-  timeoutMs: 45_000,
-  timeoutAction: 'reject',
-  abortAction: 'reject',
-}
-
-// A mode click is an interactive control, so it must never look frozen behind
-// an unrelated slow RPC on the connection. The composable updates the visible
-// selection optimistically; this bound only governs persistence/rollback.
-export const runModeWriteRpcCallOptions: RpcCallOptions = {
-  timeoutMs: 5_000,
-  timeoutAction: 'reject',
-  abortAction: 'reject',
-}
-
-type OptionalSessionRpcClient = {
-  waitForConnection: (
-    timeoutMs?: number,
-    signal?: AbortSignal,
-    actions?: RpcConnectionWaitOptions,
-  ) => Promise<unknown>
-}
-
-export function waitForSessionRpcConnection(
-  rpc: OptionalSessionRpcClient,
-  callOptions?: RpcCallOptions,
-): Promise<unknown> {
-  if (!callOptions) return rpc.waitForConnection()
-  return rpc.waitForConnection(
-    callOptions.timeoutMs,
-    callOptions.signal,
-    {
-      // The transport-owned challenge/Hello watchdogs decide when a handshake
-      // is unhealthy. Optional UI waiters timing out or being superseded must
-      // not preempt those generation-fenced watchdogs.
-      timeoutAction: 'reject',
-      abortAction: 'reject',
-    },
-  )
+export const optionalSessionReadOptions: OptionalSessionReadOptions = {
+  timeoutMs: OPTIONAL_SESSION_READ_TIMEOUT_MS,
 }
 
 function createSessionBootstrapAdmission(): () => void {

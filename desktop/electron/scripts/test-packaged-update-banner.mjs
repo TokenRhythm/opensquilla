@@ -90,7 +90,7 @@ const currentTag = `v${baseVersion}rc${currentRc}`
 const nextTag = `v${baseVersion}rc${nextRc}`
 const currentVersion = `${baseVersion}-rc${currentRc}`
 const nextVersion = `${baseVersion}-rc${nextRc}`
-const releaseUrl = `https://github.com/opensquilla/opensquilla/releases/tag/${nextTag}`
+const releaseUrl = `https://github.com/TokenRhythm/opensquilla/releases/tag/${nextTag}`
 
 let requestCount = 0
 let releasePublished = false

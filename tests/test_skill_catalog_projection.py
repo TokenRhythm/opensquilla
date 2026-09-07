@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.steps.skill_catalog_projection import resolve_skill_catalog
@@ -177,6 +178,66 @@ def test_legacy_filter_environment_is_ignored_and_warned(
     assert "filter_enabled" not in type(cfg.skills).model_fields
 
 
+@pytest.mark.parametrize("leaf", sorted(config_migration.DEPRECATED_SKILL_FILTER_LEAVES))
+@pytest.mark.parametrize("prefix", ["OPENSQUILLA_SKILLS_", "OPENSQUILLA_GATEWAY_SKILLS__"])
+@pytest.mark.parametrize("from_file", [False, True], ids=["constructor", "config-file"])
+def test_retired_filter_environment_does_not_block_gateway_start(
+    leaf: str,
+    prefix: str,
+    from_file: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config_migration, "_LEGACY_SKILL_FILTER_WARNED", False)
+    monkeypatch.setenv("OPENSQUILLA_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv(f"{prefix}{leaf.upper()}", "retired-value-do-not-parse")
+    path = tmp_path / "config.toml"
+    config_text = (
+        f"config_version = {config_migration.LATEST_CONFIG_VERSION}\n"
+        "[skills]\nmax_skills_prompt_chars = 1234\n"
+    )
+    path.write_text(config_text, encoding="utf-8")
+
+    with pytest.warns(DeprecationWarning, match="relevance-filter") as warnings:
+        config = (
+            GatewayConfig.load(path)
+            if from_file
+            else GatewayConfig(skills={"max_skills_prompt_chars": 1234})
+        )
+    assert len(warnings) == 1
+    assert config.skills.max_skills_prompt_chars == 1234
+    assert not set(config.skills.model_dump()).intersection(
+        config_migration.DEPRECATED_SKILL_FILTER_LEAVES
+    )
+    assert path.read_text(encoding="utf-8") == config_text
+
+
+@pytest.mark.parametrize("source", ["constructor", "config-file", "nested-env"])
+def test_retired_filter_cleanup_still_rejects_unknown_settings(
+    source: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(config_migration, "_LEGACY_SKILL_FILTER_WARNED", True)
+    payload = {"filter_enabled": "unused", "filter_stratgey": "hybrid"}
+    with pytest.raises(ValidationError, match="filter_stratgey"):
+        if source == "constructor":
+            GatewayConfig(skills=payload)
+        elif source == "config-file":
+            path = tmp_path / "config.toml"
+            path.write_text(
+                '[skills]\nfilter_enabled = "unused"\nfilter_stratgey = "hybrid"\n',
+                encoding="utf-8",
+            )
+            GatewayConfig.load(path)
+        else:
+            monkeypatch.setenv("OPENSQUILLA_GATEWAY_SKILLS__FILTER_ENABLED", "unused")
+            monkeypatch.setenv("OPENSQUILLA_GATEWAY_SKILLS__FILTER_STRATGEY", "hybrid")
+            GatewayConfig()
+    assert payload == {"filter_enabled": "unused", "filter_stratgey": "hybrid"}
+
+
 def test_user_owned_layers_remain_public_and_stably_sorted() -> None:
     def spec(name: str, layer: SkillLayer) -> SkillSpec:
         return SkillSpec(name, name, layer, False, [], "", instance_id=f"{layer}:{name}")
@@ -200,12 +261,14 @@ def test_user_owned_layers_remain_public_and_stably_sorted() -> None:
 
 
 @pytest.mark.asyncio
-async def test_rpc_separates_ordinary_and_meta_catalogs(tmp_path: Path) -> None:
+async def test_rpc_keeps_legacy_meta_catalog_and_adds_meta_inspection(tmp_path: Path) -> None:
     loader = _loader(tmp_path)
     ctx = RpcContext(conn_id="test", skill_loader=loader)
     ordinary = await _handle_skills_list(None, ctx)
     metas = await _handle_meta_list(None, ctx)
-    assert [row["name"] for row in ordinary["skills"]] == list(PUBLIC_BUNDLED_SKILLS)
+    assert [row["name"] for row in ordinary["skills"]] == [
+        *PUBLIC_BUNDLED_SKILLS, *STABLE_META_SKILLS,
+    ]
     assert [row["name"] for row in metas["skills"]] == list(STABLE_META_SKILLS)
 
     detail = await _handle_meta_inspect({"name": "meta-paper-write"}, ctx)

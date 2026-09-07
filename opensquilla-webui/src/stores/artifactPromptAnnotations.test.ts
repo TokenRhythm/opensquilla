@@ -6,7 +6,7 @@ import {
   PROMPT_ANNOTATION_MAX_COUNT,
   promptAnnotationBodyByteLength,
 } from '@/types/promptAnnotations'
-import type { ArtifactPromptAnnotationProvider } from '@/workbench/artifactPromptAnnotationProvider'
+import type { ArtifactPromptAnnotationProvider } from '@/modules/artifactWorkbench'
 import {
   PROMPT_ANNOTATION_CREATE_AMBIGUOUS,
   useArtifactPromptAnnotationsStore,

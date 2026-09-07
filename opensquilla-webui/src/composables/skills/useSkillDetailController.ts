@@ -1,7 +1,7 @@
 import { onUnmounted, ref, type Ref } from 'vue'
 import i18n from '@/i18n'
-import type { MetaSkillCatalog } from '@/modules/metaSkillCatalog'
 import type { Skill, SkillDependencyInstallOutcome } from '@/types/skills'
+import type { SkillCatalog } from '@/modules/skillCatalog'
 import {
   installActionsForCurrentDependencies,
   normalizeSkill,
@@ -9,13 +9,8 @@ import {
   skillDependencySummary,
 } from '@/composables/skills/useSkillsCatalog'
 
-interface SkillDetailRpc {
-  call(method: string, params?: Record<string, unknown>): Promise<unknown>
-}
-
 interface SkillDetailControllerOptions {
-  rpc: SkillDetailRpc
-  metaSkillCatalog: MetaSkillCatalog
+  catalog: SkillCatalog
   installDeps: (
     name: string,
     installId: string,
@@ -70,27 +65,7 @@ export function useSkillDetailController(
   }
 
   async function fetchLatest(seed: Skill): Promise<Skill> {
-    if (seed.kind === 'meta' || seed.kind === 'meta_sop') {
-      const detail = await options.metaSkillCatalog.inspect(seed.name)
-      const subSkills = (detail.dependencies || []).map(item => item.name)
-      return normalizeSkill({
-        ...seed,
-        ...detail,
-        name: seed.name,
-        kind: 'meta',
-        layer: seed.layer || 'bundled',
-        sub_skills: subSkills,
-      })
-    }
-    const params: Record<string, unknown> = {
-      name: seed.name,
-      includeLifecycle: true,
-    }
-    if (seed.instance_id) params.instanceId = seed.instance_id
-    if (seed.install_id) params.installId = seed.install_id
-    const detail = await options.rpc.call('skills.get', {
-      ...params,
-    }) as Skill
+    const detail = await options.catalog.detail(seed)
     // Eligible rows omit legacy missing_* fields. Clear the seed diagnostics
     // before merging so a transition to ready cannot retain stale list data.
     return normalizeSkill({

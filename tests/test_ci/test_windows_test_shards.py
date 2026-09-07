@@ -74,14 +74,21 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/contracts/test_gateway_contract_runner.py",
     "tests/contracts/test_gateway_contract_toolchain_integration.py",
     "tests/contracts/test_goals_contract.py",
+    "tests/contracts/test_sandbox_runtime_contract.py",
     "tests/contracts/test_sessions_changed_contract.py",
     "tests/contracts/test_sessions_list_contract.py",
     "tests/contracts/test_sessions_resolve_contract.py",
     "tests/contracts/test_sessions_search_contract.py",
+    "tests/test_application/test_app_settings.py",
+    "tests/test_application/test_provider_configuration.py",
+    "tests/test_application/test_sandbox_runtime.py",
+    "tests/test_application/test_session_lifecycle.py",
+    "tests/test_application/test_setup_workflow.py",
     "tests/test_gateway/test_session_preview_adapter.py",
     "tests/test_gateway/test_session_history_adapter.py",
     "tests/test_gateway/test_sessions_bootstrap_history_characterization.py",
     "tests/test_application/test_session_history.py",
+    "tests/test_application/test_session_read.py",
     "tests/test_application/test_session_transcript.py",
     "tests/test_artifact_session/test_html_anchors.py",
     "tests/test_ci/test_plan_ci.py",
@@ -118,6 +125,15 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_gateway/test_channel_session_and_busy_policy.py",
     "tests/test_gateway/test_capability_runtime.py",
     "tests/test_gateway/test_contract_method_adapter.py",
+    "tests/test_gateway/test_session_read_adapter.py",
+    "tests/test_gateway/test_session_read_contract_registration.py",
+    "tests/test_gateway/test_session_lifecycle_adapter.py",
+    "tests/test_gateway/test_sandbox_runtime_contract_registration.py",
+    "tests/contracts/test_turn_commands_contract.py",
+    "tests/test_application/test_conversation_runtime.py",
+    "tests/test_gateway/test_conversation_runtime_adapter.py",
+    "tests/test_gateway/test_goal_plan_contract_adapters.py",
+    "tests/test_scripts/test_stage_webui_artifact.py",
     "tests/test_gateway/test_meta_setup_launch_e2e.py",
     "tests/test_gateway/test_rpc_meta_setup.py",
     "tests/test_artifact_validation.py",
@@ -393,6 +409,14 @@ def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
     assert "pytest.mark.ci_serial" in _function_decorators(
         Path("tests/test_live_long_task_case_driver.py"),
         "test_fault_429_case_proves_retry_after_was_not_violated",
+    )
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_recovery/test_atomic_and_locking.py"),
+        "test_moved_legacy_lock_can_be_rebound_without_dropping_exclusion",
+    )
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_recovery/test_transaction.py"),
+        "test_transaction_recovery_locks_parked_backup_before_restoring_target",
     )
 
 

@@ -6,8 +6,8 @@ import { LEGACY_OPENROUTER_MODEL_OPTIONS } from './useSetupEnsembleForm'
 import { PROVIDER_CREDENTIAL_REVEAL_TIMEOUT_MS } from './useSetupProviderForm'
 
 const rpcCall = vi.hoisted(() => vi.fn())
-const waitForConnection = vi.hoisted(() => vi.fn(async () => {}))
-const supportsMethod = vi.hoisted(() => vi.fn((_method: string) => true))
+const ready = vi.hoisted(() => vi.fn(async () => {}))
+const hasRpcMethod = vi.hoisted(() => vi.fn((_method: string) => true))
 const pushToast = vi.hoisted(() => vi.fn())
 const confirmAction = vi.hoisted(() => vi.fn(async () => true))
 
@@ -15,8 +15,8 @@ vi.mock('@/stores/rpc', () => ({
   useRpcStore: () => ({
     isConnected: true,
     isConnecting: false,
-    waitForConnection,
-    supportsMethod,
+    ready,
+    hasRpcMethod,
     call: rpcCall,
   }),
 }))
@@ -39,6 +39,109 @@ async function mountCatalog() {
       return () => null
     },
   })
+  const { APP_SETTINGS_KEY } = await import('@/modules/appSettings')
+  const { SETUP_WORKFLOW_KEY } = await import('@/modules/setupWorkflow')
+  const { PROVIDER_CONFIGURATION_KEY } = await import('@/modules/providerConfiguration')
+  const { GATEWAY_ACCESS_KEY } = await import('@/modules/gatewayAccess')
+  app.provide(GATEWAY_ACCESS_KEY, {
+    availability: 'available',
+    connectionError: null,
+    isAvailable: true,
+    isLocalOwner: true,
+    isAuthenticated: true,
+    canManageProjectWorkspaces: true,
+    canChooseProject: true,
+    runModePolicy: null,
+    streamIdleTimeoutMs: null,
+    concurrentHistoryReads: false,
+    detachedSessionHydration: false,
+    turnCommittedEvents: false,
+    subscriptionEpoch: 0,
+    loadConnectionEndpoint: () => 'ws://example.invalid/ws',
+    connect: async () => undefined,
+    disconnect: () => undefined,
+    recoverSubscriptionEpoch: () => false,
+  })
+  app.provide(APP_SETTINGS_KEY, {
+    readAll: async () => await rpcCall('config.get') as import('@/modules/appSettings').SettingsObject,
+    read: async () => null,
+    readEffective: async () => await rpcCall('config.effective') as import('@/modules/appSettings').EffectiveSettings,
+    patch: async (changes: readonly { path: string; value: unknown }[]) => await rpcCall(
+      'config.patch',
+      { patches: Object.fromEntries(changes.map(change => [change.path, change.value])) },
+    ) as import('@/modules/appSettings').SettingsMutation,
+    patchSafe: async (changes: readonly { path: string; value: unknown }[]) => await rpcCall(
+      'config.patch.safe',
+      { patches: Object.fromEntries(changes.map(change => [change.path, change.value])) },
+    ) as import('@/modules/appSettings').SettingsMutation,
+    merge: async (patch: Record<string, unknown>) => await rpcCall(
+      'config.patch',
+      { patch },
+    ) as import('@/modules/appSettings').SettingsMutation,
+  } as unknown as import('@/modules/appSettings').AppSettings)
+  app.provide(SETUP_WORKFLOW_KEY, {
+    capabilities: {
+      get profileLifecycle() {
+        return hasRpcMethod('onboarding.llmProfile.upsert')
+      },
+      get primaryProviderRemoval() {
+        return hasRpcMethod('onboarding.llmProfile.active.remove')
+      },
+      get imageModelDiscovery() {
+        return hasRpcMethod('onboarding.imageGeneration.models.discover')
+      },
+    },
+    catalog: async () => await rpcCall('onboarding.catalog'),
+    status: async () => await rpcCall('onboarding.status'),
+    discoverImageGenerationModels: (providerId: string) => rpcCall(
+      'onboarding.imageGeneration.models.discover',
+      { providerId },
+    ),
+    provider: {
+      configurePrimary: async (payload: Record<string, unknown>) => await rpcCall('onboarding.provider.configure', payload),
+      probePrimary: (payload: Record<string, unknown>) => rpcCall('onboarding.provider.probe', payload),
+      discoverPrimaryModels: (payload: Record<string, unknown>) => rpcCall('onboarding.models.discover', payload),
+      revealActiveCredential: async (providerId: string) => await rpcCall('onboarding.provider.credential.reveal', { providerId }),
+      clearActiveCredential: async (providerId: string) => await rpcCall('onboarding.provider.credential.clear', { providerId }),
+    },
+    profile: {
+      upsertProfile: async (payload: Record<string, unknown>) => await rpcCall('onboarding.llmProfile.upsert', payload),
+      activateProfile: async (payload: Record<string, unknown>) => await rpcCall('onboarding.llmProfile.activate', payload),
+      probeProfile: (payload: Record<string, unknown>) => rpcCall('onboarding.llmProfile.probe', payload),
+      probeDraftProfile: (payload: Record<string, unknown>) => rpcCall('onboarding.llmProfile.draft.probe', payload),
+      discoverProfileModels: (payload: Record<string, unknown>) => rpcCall(
+        'onboarding.llmProfile.models.discover',
+        payload,
+      ).catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error)
+          if (!/method.*not found|unknown method|not registered/i.test(message)) throw error
+          return rpcCall('onboarding.models.discover', payload)
+        }),
+      discoverDraftProfileModels: (payload: Record<string, unknown>) => rpcCall('onboarding.llmProfile.draft.models.discover', payload),
+      removeProfile: async (providerId: string) => await rpcCall('onboarding.llmProfile.remove', { providerId }),
+      removeActiveProfile: async (payload: Record<string, unknown>) => await rpcCall('onboarding.llmProfile.active.remove', payload),
+      clearProfileCredential: async (providerId: string) => await rpcCall('onboarding.llmProfile.credential.clear', { providerId }),
+    },
+    capability: {
+      configureRouter: async (payload: Record<string, unknown>) => await rpcCall('onboarding.router.configure', payload),
+      configureEnsemble: async (payload: Record<string, unknown>) => await rpcCall('onboarding.ensemble.configure', payload),
+      configureSearch: async (payload: Record<string, unknown>) => await rpcCall('onboarding.search.configure', payload),
+      configureImageGeneration: async (payload: Record<string, unknown>) => await rpcCall('onboarding.imageGeneration.configure', payload),
+      configureMemoryEmbedding: async (payload: Record<string, unknown>) => await rpcCall('onboarding.memory_embedding.configure', payload),
+      configureAudio: async (payload: Record<string, unknown>) => await rpcCall('onboarding.audio.configure', payload),
+      resetCapability: async (capabilityId: string) => await rpcCall('onboarding.capability.reset', {
+        capabilityId,
+      }),
+    },
+  } as unknown as import('@/modules/setupWorkflow').SetupWorkflow)
+  app.provide(PROVIDER_CONFIGURATION_KEY, {
+    catalog: async () => [],
+    list: async () => ({ models: [], errors: [] }),
+    status: async () => ({ activeProvider: null, providerResolution: {}, providers: [], count: 0 }),
+    get: async () => ({ mode: 'direct' }),
+    setRouting: async (mode: string) => await rpcCall('models.routing.set', { mode }),
+    credentials: { reveal: async () => ({}), clear: async () => ({}) },
+  } as unknown as import('@/modules/providerConfiguration').ProviderConfiguration)
   app.mount(el)
   await nextTick()
   await Promise.resolve()
@@ -63,9 +166,9 @@ afterEach(() => {
   vi.useRealTimers()
   vi.restoreAllMocks()
   rpcCall.mockReset()
-  waitForConnection.mockClear()
-  supportsMethod.mockReset()
-  supportsMethod.mockReturnValue(true)
+  ready.mockClear()
+  hasRpcMethod.mockReset()
+  hasRpcMethod.mockReturnValue(true)
   pushToast.mockClear()
   confirmAction.mockReset()
   confirmAction.mockResolvedValue(true)
@@ -533,7 +636,7 @@ describe('useSetupCatalog image model catalog', () => {
   })
 
   it('uses curated image models when the gateway lacks discovery support', async () => {
-    supportsMethod.mockImplementation(
+    hasRpcMethod.mockImplementation(
       method => method !== 'onboarding.imageGeneration.models.discover',
     )
     rpcCall.mockImplementation(async (method: string) => {
@@ -3998,7 +4101,7 @@ describe('useSetupCatalog configured provider management', () => {
   it('replaces the active provider through the legacy configure RPC on an older Gateway', async () => {
     let activeProvider = 'openai'
     let activeModel = 'gpt-4.1-mini'
-    supportsMethod.mockImplementation(method => method !== 'onboarding.llmProfile.upsert')
+    hasRpcMethod.mockImplementation(method => method !== 'onboarding.llmProfile.upsert')
     rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
       if (method === 'onboarding.catalog') return { providers }
       if (method === 'onboarding.status') {
@@ -4402,8 +4505,9 @@ describe('useSetupCatalog configured provider management', () => {
       providerId: 'openai',
       model: 'gpt-4.1-mini',
     })
-    expect(api.routerPanel.value.discoveredModelsByProvider.deepseek?.models[0]?.id)
-      .toBe('deepseek-chat')
+    await vi.waitFor(() => expect(
+      api.routerPanel.value.discoveredModelsByProvider.deepseek?.models[0]?.id,
+    ).toBe('deepseek-chat'))
     app.unmount()
   })
 
@@ -4971,7 +5075,7 @@ describe('useSetupCatalog configured provider management', () => {
   })
 
   it('does not offer a two-RPC fallback when active removal is unsupported', async () => {
-    supportsMethod.mockImplementation(method => (
+    hasRpcMethod.mockImplementation(method => (
       method !== 'onboarding.llmProfile.active.remove'
     ))
     const status = {

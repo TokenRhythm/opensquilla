@@ -1,5 +1,5 @@
+import { loadContractValidators } from '../../../scripts/contracts/gateway_contract_verification.mjs'
 import { readFileSync } from 'node:fs'
-import { createRequire } from 'node:module'
 import { describe, expect, it } from 'vitest'
 import type { SessionRow, SessionTask } from './generated/v4/sessionsList'
 
@@ -22,8 +22,7 @@ interface FixtureDocument {
   cases: Array<{ id: string, wire?: unknown }>
 }
 
-const require = createRequire(import.meta.url)
-const validators = require('./generated/v4/sessionsListValidators.cjs') as {
+const validators = await loadContractValidators('sessions.list') as {
   validateSessionsListRequestFrame: ContractValidator
   validateSessionsListResponseFrame: ContractValidator
 }

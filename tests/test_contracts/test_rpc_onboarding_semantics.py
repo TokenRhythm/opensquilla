@@ -565,7 +565,9 @@ async def test_llm_profile_upsert_round_tripped_mask_keeps_stored_key(config_fil
 async def test_llm_profile_draft_resolves_stored_key_for_masked_payload(config_file):
     """The draft-probe path builds its config here: a masked apiKey must
     resolve to the stored credential, not a literal '***' bearer token."""
-    from opensquilla.gateway.rpc_onboarding import _draft_llm_profile_config
+    from opensquilla.application.profile_lifecycle import ProfileProbeCommand
+    from opensquilla.gateway.rpc_onboarding import _profile_draft_config
+    from opensquilla.onboarding.config_store import load_config
 
     config_file.write_text(
         "[llm]\n"
@@ -578,8 +580,12 @@ async def test_llm_profile_draft_resolves_stored_key_for_masked_payload(config_f
         encoding="utf-8",
     )
 
-    provider, draft = _draft_llm_profile_config(
-        {"providerId": "deepseek", "apiKey": "***"}, _admin_ctx()
+    provider, draft = _profile_draft_config(
+        ProfileProbeCommand(
+            provider_id="deepseek",
+            values={"providerId": "deepseek", "apiKey": "***"},
+        ),
+        load_config(config_file),
     )
 
     assert provider == "deepseek"

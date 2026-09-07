@@ -2,10 +2,38 @@ import type { InjectionKey } from 'vue'
 import type { GatewayModelRoutingMode } from '@/types/modelRouting'
 import type { CollaborationMode } from '@/types/plans'
 import type { SandboxRunMode } from '@/types/sandbox'
+import type { ArtifactProductFailure } from '@/utils/artifactProductErrors'
 
 /** Options shared by turn commands without exposing transport details. */
 export interface TurnCommandRequestOptions {
   signal?: AbortSignal
+}
+
+export type TurnCommandFailureKind =
+  | 'aborted'
+  | 'timeout'
+  | 'transport'
+  | 'queue-capacity'
+  | 'session-changed'
+  | 'conflict'
+  | 'unavailable'
+  | 'rejected'
+
+/** Semantic failure projected by the Gateway Adapter for turn recovery. */
+export class TurnCommandError extends Error {
+  constructor(
+    readonly kind: TurnCommandFailureKind,
+    message: string,
+    readonly failureCode?: string,
+    readonly accepted?: boolean | null,
+    readonly retryable?: boolean,
+    readonly retryAfterMs?: number,
+    readonly details?: unknown,
+    readonly artifactFailure?: ArtifactProductFailure,
+  ) {
+    super(message)
+    this.name = 'TurnCommandError'
+  }
 }
 
 /** Exact editable document head bound to one turn admission. */

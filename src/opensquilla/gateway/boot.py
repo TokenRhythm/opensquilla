@@ -269,22 +269,6 @@ def _desktop_router_preload_enabled() -> bool:
     return not _desktop_fast_start_enabled()
 
 
-def _make_auto_propose_tool_invoker(
-    registry: ToolRegistry,
-    *,
-    allowed_tools: frozenset[str] = _AUTO_PROPOSE_TOOL_ALLOWLIST,
-) -> Callable[[str, dict[str, Any]], Any]:
-    """Build the unattended auto-propose tool invoker through dispatch policy."""
-
-    from opensquilla.skills.meta.orchestrator import make_tool_invoker_from_handler
-    from opensquilla.tools.dispatch import build_tool_handler
-
-    ctx = _make_auto_propose_tool_context(allowed_tools=allowed_tools)
-    return make_tool_invoker_from_handler(
-        tool_handler=build_tool_handler(registry, ctx),
-    )
-
-
 def _make_auto_propose_tool_context(
     *,
     agent_id: str = "auto_propose",
@@ -1186,45 +1170,16 @@ def _desktop_ownership_profile_home(config: GatewayConfig) -> Path:
 
 
 async def _ensure_sandbox_setup_on_boot(config: GatewayConfig) -> Any | None:
-    """Inspect sandbox readiness without elevating during gateway startup."""
+    """Initialize the existing sandbox after gateway readiness, without self-tests."""
+    from opensquilla.sandbox.setup_runtime import initialize_sandbox_runtime
 
-    if not config.sandbox.auto_setup:
-        log.info("boot.sandbox_setup_auto_disabled")
-        return None
-
-    from opensquilla.sandbox.setup_runtime import (
-        current_sandbox_capability_report,
-        current_sandbox_setup_runtime_status,
-    )
-
-    result = await current_sandbox_setup_runtime_status(config)
+    result = await initialize_sandbox_runtime(config)
     log.info(
-        "boot.sandbox_setup_status_completed",
+        "boot.sandbox_initialization_completed",
         state=result.state.value,
         platform=result.platform,
-        requires_admin=result.requires_admin,
         detail=result.detail,
     )
-    if result.state.value == "ready":
-        try:
-            capability = await current_sandbox_capability_report(config)
-            log.info(
-                "boot.sandbox_capability_prewarm_completed",
-                available=getattr(capability, "available", False),
-                backend=getattr(capability, "backend", ""),
-                code=getattr(capability, "code", ""),
-            )
-        except Exception as exc:  # noqa: BLE001 - startup prewarm is best-effort.
-            log.warning(
-                "boot.sandbox_capability_prewarm_failed",
-                error=str(exc),
-            )
-    else:
-        log.info(
-            "boot.sandbox_setup_deferred",
-            state=result.state.value,
-            platform=result.platform,
-        )
     return result
 
 
@@ -1298,6 +1253,40 @@ def _task_runtime_envelope_host_execute(envelope: Any) -> bool:
     return _task_runtime_envelope_owner(envelope)
 
 
+def _task_runtime_wire_owner(run: Any) -> dict[str, Any]:
+    """Return the admitted owner using public session-event field names."""
+
+    payload: dict[str, Any] = {}
+    session_id = getattr(run, "session_id", None)
+    if isinstance(session_id, str) and session_id:
+        payload["session_id"] = session_id
+    session_epoch = getattr(run, "session_epoch", None)
+    if (
+        isinstance(session_epoch, int)
+        and not isinstance(session_epoch, bool)
+        and session_epoch >= 0
+    ):
+        payload["epoch"] = session_epoch
+    return payload
+
+
+def _validate_task_runtime_session_owner(run: Any, session: Any) -> None:
+    """Reject an admitted task whose session generation is no longer current."""
+
+    expected_session_id = getattr(run, "session_id", None)
+    expected_session_epoch = getattr(run, "session_epoch", None)
+    if (
+        expected_session_id is not None
+        and getattr(session, "session_id", None) != expected_session_id
+    ) or (
+        expected_session_epoch is not None
+        and getattr(session, "epoch", None) != expected_session_epoch
+    ):
+        from opensquilla.session.storage import StaleEpochError
+
+        raise StaleEpochError("Task session owner changed before provider dispatch")
+
+
 async def dispatch_task_runtime_turn(
     run: Any,
     *,
@@ -1330,6 +1319,7 @@ async def dispatch_task_runtime_turn(
         session = await storage.get_session(run.session_key)
         if session is None:
             raise KeyError(f"Session not found: {run.session_key}")
+        _validate_task_runtime_session_owner(run, session)
         try:
             run_context, _workspace_guard = await authoritative_project_run_context(
                 storage=storage,
@@ -1351,6 +1341,7 @@ async def dispatch_task_runtime_turn(
                     "code": mapped.code,
                     "details": mapped.details,
                     "task_id": getattr(run, "task_id", None),
+                    **_task_runtime_wire_owner(run),
                 },
             )
             raise
@@ -1397,6 +1388,8 @@ async def dispatch_task_runtime_turn(
         )
     ):
         session = await session_manager.get_session(run.session_key)
+        if session is not None:
+            _validate_task_runtime_session_owner(run, session)
     run_kwargs = build_task_runtime_run_kwargs(
         run,
         tool_context=tool_context,
@@ -1429,7 +1422,8 @@ async def dispatch_task_runtime_turn(
                 context_bound=is_context_bound_owner(turn_runner),
                 stream_event_sink=getattr(run, "stream_event_sink", None),
                 task_id=getattr(run, "task_id", None),
-                session_id=getattr(run.envelope, "session_id", None),
+                session_id=getattr(run, "session_id", None),
+                session_epoch=getattr(run, "session_epoch", None),
                 client_message_id=getattr(run.envelope, "metadata", {}).get("client_message_id"),
                 user_message_id=getattr(run, "persisted_user_message_id", None),
                 surface_id=getattr(run.envelope, "metadata", {}).get("surface_id"),
@@ -1603,6 +1597,17 @@ def build_task_runtime_run_kwargs(
         # Only forward when set so web/CLI legacy paths keep
         # ``TurnRunner.run`` falling back to ``message`` as semantic input.
         kwargs["semantic_message"] = run.semantic_message
+    expected_session_id = getattr(run, "session_id", None)
+    expected_session_epoch = getattr(run, "session_epoch", None)
+    if (
+        isinstance(expected_session_id, str)
+        and expected_session_id
+        and isinstance(expected_session_epoch, int)
+        and not isinstance(expected_session_epoch, bool)
+        and expected_session_epoch >= 0
+    ):
+        kwargs["expected_session_id"] = expected_session_id
+        kwargs["expected_session_epoch"] = expected_session_epoch
     provider_request_correlation = getattr(
         run,
         "provider_request_correlation",
@@ -1735,6 +1740,8 @@ def _make_task_session_lifecycle_listener(
                         if event.phase == "running"
                         else "task_terminal"
                     ),
+                    session_id=event.session_id,
+                    epoch=event.session_epoch,
                     changed_task=task_state,
                 ),
             )
@@ -1785,6 +1792,8 @@ def _make_task_session_lifecycle_listener(
             build_sessions_changed_payload(
                 event.session_key,
                 reason,
+                session_id=event.session_id,
+                epoch=event.session_epoch,
                 status=getattr(session_status, "value", session_status),
                 run_status=(
                     active_task["status"]
@@ -1842,6 +1851,7 @@ async def _emit_task_runtime_stream_events(
     stream_event_sink: Any = None,
     task_id: str | None = None,
     session_id: str | None = None,
+    session_epoch: int | None = None,
     client_message_id: str | None = None,
     user_message_id: str | None = None,
     surface_id: str | None = None,
@@ -2077,6 +2087,12 @@ async def _emit_task_runtime_stream_events(
                 event_dict["turn_id"] = task_id
         if session_id:
             event_dict["session_id"] = session_id
+        if (
+            isinstance(session_epoch, int)
+            and not isinstance(session_epoch, bool)
+            and session_epoch >= 0
+        ):
+            event_dict["epoch"] = session_epoch
         if client_message_id:
             event_dict["client_message_id"] = client_message_id
         if primary_user_message_id is not None:
@@ -2904,6 +2920,7 @@ async def build_services(
     session_db_path: str = ":memory:",
     extra_agent_ids: list[str] | None = None,
     seed_agent_workspaces: bool = True,
+    defer_sandbox_startup: bool = False,
 ) -> ServiceContainer:
     """Initialize reusable services without any gateway-specific side effects.
 
@@ -3026,13 +3043,12 @@ async def build_services(
             sandbox_settings,
             workspace=Path(config.workspace_dir) if config.workspace_dir else None,
             default_run_mode=config_run_mode(config),
+            defer_backend=defer_sandbox_startup,
         )
         log.info(
             "build_services.sandbox_ready",
             **effective.effective.as_dict(),
         )
-        if getattr(effective.effective, "sandbox_enabled", True) and sandbox_settings.auto_setup:
-            sandbox_setup_task = create_background_task(_ensure_sandbox_setup_on_boot(config))
     except Exception as e:  # pragma: no cover - boot diagnostics only
         log.exception("build_services.sandbox_configure_failed", error=str(e))
         raise
@@ -3114,17 +3130,14 @@ async def build_services(
     if session_storage is not None and callable(
         getattr(session_storage, "_write_transaction", None)
     ):
+        from opensquilla.application.artifact_workbench import ArtifactRecoveryApplication
         from opensquilla.artifact_session import ArtifactSessionService
         from opensquilla.artifacts import ArtifactStore
-        from opensquilla.gateway.artifact_mutation_recovery import (
-            reconcile_pending_artifact_mutations,
-            reject_orphaned_artifact_drafts,
-        )
-        from opensquilla.gateway.document_resource_recovery import (
-            reconcile_pending_document_resources,
+        from opensquilla.gateway.adapters.artifact_recovery import (
+            GatewayArtifactRecoveryPort,
         )
         from opensquilla.gateway.rpc import RpcContext
-        from opensquilla.gateway.rpc_workbench_resources import (
+        from opensquilla.gateway.workbench_resource_runtime import (
             resolve_recovery_import_source,
         )
         from opensquilla.paths import media_root_from_config
@@ -3137,17 +3150,8 @@ async def build_services(
             session_manager=session_manager,
             config=config,
         )
-
-        try:
-            draft_recovery_summary = await reject_orphaned_artifact_drafts(
-                artifact_recovery_service,
-                ArtifactStore(media_root_from_config(config)),
-            )
-            recovery_summary = await reconcile_pending_artifact_mutations(
-                artifact_recovery_service,
-                ArtifactStore(media_root_from_config(config)),
-            )
-            resource_recovery_summary = await reconcile_pending_document_resources(
+        artifact_recovery = ArtifactRecoveryApplication(
+            GatewayArtifactRecoveryPort(
                 artifact_recovery_service,
                 ArtifactStore(media_root_from_config(config)),
                 import_source_resolver=lambda attempt: resolve_recovery_import_source(
@@ -3155,38 +3159,50 @@ async def build_services(
                     attempt,
                 ),
             )
+        )
+
+        try:
+            recovery_report = await artifact_recovery.reconcile()
         finally:
             await artifact_recovery_service.close()
-        if recovery_summary.examined:
+        recovery_summary = recovery_report.mutations
+        draft_recovery_summary = recovery_report.drafts
+        resource_recovery_summary = recovery_report.resources
+        if recovery_summary.get("examined", 0):
             log.info(
                 "build_services.artifact_mutations_reconciled",
-                examined=recovery_summary.examined,
-                applied=recovery_summary.applied,
-                failed=recovery_summary.failed,
-                ambiguous=recovery_summary.ambiguous,
-                deleted_candidates=recovery_summary.deleted_candidates,
+                examined=recovery_summary.get("examined", 0),
+                applied=recovery_summary.get("applied", 0),
+                failed=recovery_summary.get("failed", 0),
+                ambiguous=recovery_summary.get("ambiguous", 0),
+                deleted_candidates=recovery_summary.get("deleted_candidates", 0),
             )
-        if draft_recovery_summary.examined:
+        if draft_recovery_summary.get("examined", 0):
             log.info(
                 "build_services.artifact_drafts_reconciled",
-                examined=draft_recovery_summary.examined,
-                rejected=draft_recovery_summary.rejected,
-                ambiguous=draft_recovery_summary.ambiguous,
-                deleted_candidates=draft_recovery_summary.deleted_candidates,
+                examined=draft_recovery_summary.get("examined", 0),
+                rejected=draft_recovery_summary.get("rejected", 0),
+                ambiguous=draft_recovery_summary.get("ambiguous", 0),
+                deleted_candidates=draft_recovery_summary.get("deleted_candidates", 0),
             )
-        if resource_recovery_summary.examined:
+        if (
+            resource_recovery_summary.get("imports_examined", 0)
+            + resource_recovery_summary.get("publishes_examined", 0)
+        ):
             log.info(
                 "build_services.document_resources_reconciled",
-                imports_examined=resource_recovery_summary.imports_examined,
-                imports_applied=resource_recovery_summary.imports_applied,
-                imports_failed=resource_recovery_summary.imports_failed,
-                imports_ambiguous=resource_recovery_summary.imports_ambiguous,
-                publishes_examined=resource_recovery_summary.publishes_examined,
-                publishes_applied=resource_recovery_summary.publishes_applied,
-                publishes_failed=resource_recovery_summary.publishes_failed,
-                publishes_ambiguous=resource_recovery_summary.publishes_ambiguous,
-                deleted_candidates=resource_recovery_summary.deleted_candidates,
-                promoted_deliverables=resource_recovery_summary.promoted_deliverables,
+                imports_examined=resource_recovery_summary.get("imports_examined", 0),
+                imports_applied=resource_recovery_summary.get("imports_applied", 0),
+                imports_failed=resource_recovery_summary.get("imports_failed", 0),
+                imports_ambiguous=resource_recovery_summary.get("imports_ambiguous", 0),
+                publishes_examined=resource_recovery_summary.get("publishes_examined", 0),
+                publishes_applied=resource_recovery_summary.get("publishes_applied", 0),
+                publishes_failed=resource_recovery_summary.get("publishes_failed", 0),
+                publishes_ambiguous=resource_recovery_summary.get("publishes_ambiguous", 0),
+                deleted_candidates=resource_recovery_summary.get("deleted_candidates", 0),
+                promoted_deliverables=resource_recovery_summary.get(
+                    "promoted_deliverables", 0
+                ),
             )
     from opensquilla.application.approval_queue import get_approval_queue
 
@@ -3667,6 +3683,7 @@ async def build_services(
             try:
                 mcp_cfg = MCPServerConfig(
                     name=entry.name,
+                    description=entry.description,
                     transport=entry.transport,
                     command=entry.command,
                     args=entry.args,
@@ -4206,6 +4223,7 @@ async def start_gateway_server(
             tool_registry=tool_registry,
             usage_tracker=usage_tracker,
             session_db_path=str(_state_path(config, "sessions.db")),
+            defer_sandbox_startup=True,
         )
     except BaseException:
         _pid_lock.release()
@@ -4221,7 +4239,7 @@ async def start_gateway_server(
     # HTTP server can observe a half-published batch. Recovery is deliberately
     # serial because every agent shares the same profile operation lock.
     try:
-        from opensquilla.gateway.rpc_memory_import import (
+        from opensquilla.gateway.profile_import_startup import (
             run_profile_import_startup_recovery,
         )
 
@@ -4281,7 +4299,7 @@ async def start_gateway_server(
     # refresh are best-effort and may continue after readiness.
     async def maintain_profile_imports() -> None:
         try:
-            from opensquilla.gateway.rpc_memory_import import (
+            from opensquilla.gateway.profile_import_startup import (
                 run_profile_import_startup_maintenance,
             )
 
@@ -4441,6 +4459,35 @@ async def start_gateway_server(
             run_kind=run_kind,
         )
 
+    async def _validate_task_acceptance(
+        envelope: Any,
+        accepted_run_mode_override: Any | None,
+    ) -> None:
+        from opensquilla.gateway.project_workspace_runtime import (
+            AcceptedRunModeOverride,
+        )
+        from opensquilla.run_mode import RunMode, config_run_mode, normalize_run_mode
+        from opensquilla.sandbox.mode_resolver import ModeResolutionError
+        from opensquilla.sandbox.setup_runtime import current_sandbox_capability_report
+
+        host_execute = _task_runtime_envelope_host_execute(envelope)
+        if isinstance(accepted_run_mode_override, AcceptedRunModeOverride):
+            desired_mode = accepted_run_mode_override.run_mode
+        else:
+            raw_mode = getattr(envelope, "metadata", {}).get("run_mode")
+            desired_mode = (
+                normalize_run_mode(raw_mode)
+                if raw_mode is not None
+                else config_run_mode(config) if host_execute else RunMode.SAFE
+            )
+        if desired_mode is RunMode.FULL:
+            if not host_execute:
+                raise ModeResolutionError("host_capability_required")
+            return
+        capability = await current_sandbox_capability_report(config)
+        if not capability.available:
+            raise ModeResolutionError("sandbox_unavailable")
+
     session_lifecycle_listener = _make_task_session_lifecycle_listener(
         session_manager=svc.session_manager,
         event_emitter=runtime_event_bridge.emit,
@@ -4458,6 +4505,7 @@ async def start_gateway_server(
         ),
         turn_hard_deadline_s=_task_runtime_turn_hard_deadline_s(config),
         accepted_config_provider=_capture_task_accepted_config,
+        acceptance_validator=_validate_task_acceptance,
         pending_overflow_policy=getattr(
             config.task_runtime, "pending_overflow_policy", "reject_newest"
         ),
@@ -4822,7 +4870,11 @@ async def start_gateway_server(
                 workspace_dir=workspace_str,
                 metadata=auto_metadata,
             )
-            tool_definitions = svc.tool_registry.to_tool_definitions(ctx)
+            authorized_tool_definitions = svc.tool_registry.to_tool_definitions(ctx)
+            tool_definitions = svc.tool_registry.to_model_tool_definitions(
+                authorized_tool_definitions,
+                ctx,
+            )
             auto_usage_context = _auto_propose_usage_execution_context(
                 agent_id,
                 usage_event_sink,
@@ -5200,7 +5252,9 @@ async def start_gateway_server(
         startup_started_at=startup_started_at,
         phase_started_at=startup_phase_started_at,
     )
-    listener_ready = False
+    # Embedded ``run=False`` callers have no listener to wait for. Their
+    # in-process app readiness is the final startup boundary.
+    listener_ready = not run
     runtime_state_ready = False
     gateway_ready_phase_emitted = False
     post_ready_observability_started = False
@@ -5244,6 +5298,9 @@ async def start_gateway_server(
             status="ready",
             duration_ms=_elapsed_monotonic_ms(gateway_ready_wait_started_at, ready_at),
             startup_elapsed_ms=_elapsed_monotonic_ms(startup_started_at, ready_at),
+        )
+        svc.sandbox_setup_task = create_background_task(
+            _ensure_sandbox_setup_on_boot(config)
         )
         _start_post_ready_observability()
 
@@ -5420,10 +5477,6 @@ async def start_gateway_server(
         phase_started_at=startup_phase_started_at,
     )
     _publish_gateway_ready_if_complete()
-    if not run:
-        # Embedders/tests without a network listener still retain the existing
-        # telemetry lifecycle, but only after in-process readiness is visible.
-        _start_post_ready_observability()
     usage_storage = get_session_storage(svc.session_manager)
     if usage_storage is not None and hasattr(usage_storage, "get_usage_backfill_batch"):
         from opensquilla.gateway.usage_backfill import run_usage_backfill

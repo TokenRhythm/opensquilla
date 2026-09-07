@@ -86,27 +86,28 @@
 </template>
 
 <script setup lang="ts">
-import { nextTick, ref, watch } from 'vue'
+import { inject, nextTick, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRoute, useRouter } from 'vue-router'
 import DiagnosticsBundleDialog from '@/components/DiagnosticsBundleDialog.vue'
 import Icon from '@/components/Icon.vue'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { useToasts } from '@/composables/useToasts'
-import { useRpcStore } from '@/stores/rpc'
 import {
   copyTextWithFallback,
   downloadBlob,
-  filenameFromContentDisposition,
 } from '@/utils/browser'
 import { normalizeHomePaths } from '@/utils/overviewDiagnostics'
+import { OBSERVABILITY_KEY } from '@/modules/observability'
 
 const SUPPORT_BUNDLE_DAYS = 1
 
 const { t } = useI18n()
 const route = useRoute()
 const router = useRouter()
-const rpc = useRpcStore()
+const injectedObservability = inject(OBSERVABILITY_KEY)
+if (!injectedObservability) throw new Error('Observability was not provided')
+const observability = injectedObservability
 const { pushToast } = useToasts()
 const menuOpen = ref(false)
 const bundleDialogOpen = ref(false)
@@ -196,8 +197,7 @@ async function copyReadinessReport() {
   await nextTick()
   triggerRef.value?.focus()
   try {
-    await rpc.waitForConnection()
-    const data = await rpc.call<Record<string, unknown>>('doctor.status', {
+    const data = await observability.readiness({
       agentId: 'main',
       deep: true,
     })
@@ -222,29 +222,11 @@ async function downloadBundle(options: { includeContent: boolean }) {
   closeBundleDialog()
   bundleInFlight.value = true
   try {
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-    // Match the owner-authenticated diagnostics route used by the prior Logs
-    // action. Some hardened/embedded contexts reject sessionStorage access.
-    let token = ''
-    try { token = sessionStorage.getItem('opensquilla.wsToken') || '' } catch {}
-    if (token) headers.Authorization = `Bearer ${token}`
-    const response = await fetch('/api/v1/diagnostics/bundle', {
-      method: 'POST',
-      headers,
-      credentials: 'same-origin',
-      body: JSON.stringify({
-        include_content: options.includeContent,
-        days: SUPPORT_BUNDLE_DAYS,
-      }),
+    const bundle = await observability.downloadSupportBundle({
+      includeContent: options.includeContent,
+      days: SUPPORT_BUNDLE_DAYS,
     })
-    if (!response.ok) {
-      pushToast(t('monitorSupport.bundleFailed'), { tone: 'danger' })
-      return
-    }
-    const blob = await response.blob()
-    const filename = filenameFromContentDisposition(response.headers.get('content-disposition'))
-      || 'opensquilla-bundle.zip'
-    downloadBlob(blob, filename)
+    downloadBlob(bundle.blob, bundle.filename)
     pushToast(t('monitorSupport.bundleReady'), { tone: 'ok' })
   } catch {
     pushToast(t('monitorSupport.bundleFailed'), { tone: 'danger' })

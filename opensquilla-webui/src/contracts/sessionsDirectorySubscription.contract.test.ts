@@ -1,3 +1,4 @@
+import { loadContractValidators } from '../../../scripts/contracts/gateway_contract_verification.mjs'
 import { describe, expect, it } from 'vitest'
 
 interface ContractValidator {
@@ -5,16 +6,12 @@ interface ContractValidator {
   errors?: readonly unknown[] | null
 }
 
-const subscribeValidators = await import(
-  './generated/v4/sessionsSubscribeValidators.mjs',
-) as {
+const subscribeValidators = await loadContractValidators('sessions.subscribe') as {
   validateSessionsSubscribeRequestFrame: ContractValidator
   validateSessionsSubscribeResponseFrame: ContractValidator
   validateSessionsSubscribeResult: ContractValidator
 }
-const unsubscribeValidators = await import(
-  './generated/v4/sessionsUnsubscribeValidators.mjs',
-) as {
+const unsubscribeValidators = await loadContractValidators('sessions.unsubscribe') as {
   validateSessionsUnsubscribeRequestFrame: ContractValidator
   validateSessionsUnsubscribeResponseFrame: ContractValidator
   validateSessionsUnsubscribeResult: ContractValidator

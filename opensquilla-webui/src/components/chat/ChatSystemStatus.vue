@@ -8,7 +8,7 @@ import { useDesktopUpdatePresentation } from '@/composables/useDesktopUpdatePres
 import { useDialogLayer } from '@/composables/useDialogA11y'
 import { useChatTopbarPopoverCoordination } from '@/composables/useChatTopbarPopoverCoordinator'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
-import type { ConnectionState } from '@/lib/rpc'
+import type { RpcConnectionState } from '@/utils/chat/chatConnectionState'
 import {
   highestSystemSeverity,
   type SystemHeaderLayout,
@@ -19,7 +19,7 @@ type SystemAction = 'connection' | 'approval' | 'update'
 
 const props = defineProps<{
   layout: SystemHeaderLayout
-  connectionState: ConnectionState
+  connectionState: RpcConnectionState
   connectionLabel: string
   approvalCount: number
   canManageConnection: boolean

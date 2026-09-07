@@ -1,8 +1,7 @@
 import { computed, onBeforeUnmount, ref, watch, type Ref } from 'vue'
-import type { SessionMessagesSubscribeResponse } from '@/types/rpc'
-import { localizeGoalRpcError } from '@/lib/rpcErrors'
+import { goalErrorMessage as localizeGoalRpcError } from '@/utils/goalErrorPresentation'
 import { createClientRequestId } from '@/utils/chat/messageIdentity'
-import type { GoalCenter } from '@/modules/goalCenter'
+import { GoalCenterError, type GoalCenter } from '@/modules/goalCenter'
 import type { GoalContinuity, GoalEvent } from '@/modules/goalContinuity'
 
 export type GoalStatus = 'active' | 'paused' | 'blocked' | 'usage_limited' | 'complete'
@@ -93,15 +92,7 @@ export interface GoalContinuityStorage {
   removeItem: (key: string) => void
 }
 
-type RpcClient = {
-  call: <T = unknown>(
-    method: string,
-    params?: Record<string, unknown>,
-  ) => Promise<T>
-}
-
 export interface UseChatGoalsOptions {
-  rpc: RpcClient
   /** Domain GoalCenter owns goals.status/set wire mapping. */
   goalCenter: GoalCenter
   /** Domain GoalContinuity owns lease reattachment and Goal event decoding. */
@@ -743,7 +734,7 @@ export function useChatGoals(options: UseChatGoalsOptions) {
     return applySnapshot(source, { allowClear: true })
   }
 
-  function applyHydration(value: SessionMessagesSubscribeResponse | unknown): boolean {
+  function applyHydration(value: unknown): boolean {
     const source = record(value)
     if (!source) return false
     observeTransportGeneration(source)
@@ -1026,13 +1017,22 @@ export function useChatGoals(options: UseChatGoalsOptions) {
     mutationOwner = owner
     busy.value = true
     try {
-      const response = await options.rpc.call<GoalMutationResponse>(method, {
+      const input = {
         sessionKey: key,
         clientRequestId: createClientRequestId(),
         expectedGoalId: current.goalId,
         expectedStateRevision: current.stateRevision,
         ...params,
-      })
+      }
+      const response = await (
+        method === 'goals.edit'
+          ? options.goalCenter.edit(input as never)
+          : method === 'goals.pause'
+            ? options.goalCenter.pause(input)
+            : method === 'goals.resume'
+              ? options.goalCenter.resume(input)
+              : options.goalCenter.clear(input)
+      )
       if (owner !== mutationOwner || key !== options.sessionKey.value) return false
       const applied = applyMutationResponse(response)
       if ((method === 'goals.resume' || method === 'goals.edit') && applied) {
@@ -1061,7 +1061,7 @@ export function useChatGoals(options: UseChatGoalsOptions) {
     const normalized = String(objective || '').trim()
     if (!goalObjectiveIsValid(normalized)) {
       options.notify?.(localizeGoalRpcError(
-        Object.assign(new Error(), { code: 'INVALID_GOAL_OBJECTIVE' }),
+        new GoalCenterError('invalid', '', { reason: 'invalid-objective' }),
       ))
       return Promise.resolve(false)
     }

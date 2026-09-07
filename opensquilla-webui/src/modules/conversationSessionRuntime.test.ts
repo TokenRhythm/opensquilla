@@ -117,6 +117,7 @@ describe('ConversationSessionRuntime', () => {
     await pending
 
     expect(aborted).toBe(true)
+    expect(services.subscriptions.leases.size).toBe(0)
     expect(harness.counts()).toEqual({ subscriptions: 1, detachments: 1 })
   })
 })

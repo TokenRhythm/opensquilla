@@ -1,13 +1,17 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { createPinia, setActivePinia } from 'pinia'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createPinia } from 'pinia'
+import { createApp, type App } from 'vue'
 
-const call = vi.hoisted(() => vi.fn())
-const waitForConnection = vi.hoisted(() => vi.fn(async () => {}))
+import {
+  SANDBOX_RUNTIME_KEY,
+  type SandboxRuntime,
+  type SandboxSetupResult,
+} from '@/modules/sandboxRuntime'
+import { useSandboxSetupStore } from './sandboxSetup'
+
+const ensureReady = vi.hoisted(() => vi.fn<() => Promise<SandboxSetupResult>>())
+const selectMode = vi.hoisted(() => vi.fn())
 const pushToast = vi.hoisted(() => vi.fn())
-
-vi.mock('@/stores/rpc', () => ({
-  useRpcStore: () => ({ call, waitForConnection }),
-}))
 
 vi.mock('@/composables/useToasts', () => ({
   useToasts: () => ({ pushToast }),
@@ -34,47 +38,75 @@ function deferred<T>() {
   return { promise, resolve, reject }
 }
 
-function readyStatus() {
+function readyResult(ready = true): SandboxSetupResult {
   return {
-    state: 'ready',
-    platform: 'win32',
-    message: 'Windows default sandbox is ready.',
-    requiresAdmin: false,
+    ready,
+    status: {
+      state: 'ready',
+      platform: 'win32',
+      message: 'Windows default sandbox is ready.',
+      requiresAdmin: false,
+    },
+    capability: { available: ready } as SandboxSetupResult['capability'],
+    outcome: ready ? 'ready' : 'verification_failed',
   }
 }
 
+function fakeRuntime(): SandboxRuntime {
+  return {
+    readiness: vi.fn(async () => ({ status: null, capability: null })),
+    ensureReady,
+    loadSettings: vi.fn(),
+    updatePolicy: vi.fn(),
+    preference: vi.fn(),
+    selectMode,
+    onPreferenceChanged: vi.fn(() => () => undefined),
+    runtimeStatus: vi.fn(),
+    installRuntime: vi.fn(),
+    cancelRuntime: vi.fn(),
+    removeRuntime: vi.fn(),
+    discardRuntimeDownload: vi.fn(),
+    resumeSession: vi.fn(),
+  }
+}
+
+const apps: App[] = []
+
+function createStore() {
+  const app = createApp({ template: '<div />' })
+  const pinia = createPinia()
+  app.use(pinia)
+  app.provide(SANDBOX_RUNTIME_KEY, fakeRuntime())
+  apps.push(app)
+  return app.runWithContext(() => useSandboxSetupStore(pinia))
+}
+
 beforeEach(() => {
-  setActivePinia(createPinia())
-  call.mockReset()
-  waitForConnection.mockClear()
+  ensureReady.mockReset()
+  selectMode.mockReset()
+  selectMode.mockResolvedValue({ runMode: 'safe', source: 'preference' })
   pushToast.mockClear()
+})
+
+afterEach(() => {
+  while (apps.length) apps.pop()!.unmount()
 })
 
 describe('sandbox setup store', () => {
   it('deduplicates setup and persists Safe after live verification', async () => {
-    const ensure = deferred<ReturnType<typeof readyStatus>>()
-    call.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
-      if (method === 'sandbox.setup.ensure') return ensure.promise
-      if (method === 'sandbox.capability.status') {
-        expect(params).toEqual({ refresh: true })
-        return { available: true }
-      }
-      if (method === 'sandbox.run_mode.preference.set') return { runMode: params?.runMode }
-      throw new Error(`unexpected method: ${method}`)
-    })
-    const { useSandboxSetupStore } = await import('./sandboxSetup')
-    const store = useSandboxSetupStore()
+    const ensure = deferred<SandboxSetupResult>()
+    ensureReady.mockReturnValue(ensure.promise)
+    const store = createStore()
 
     const first = store.startSafeSetup()
     const second = store.startSafeSetup()
 
     expect(store.ensuring).toBe(true)
-    expect(call.mock.calls.filter(([method]) => method === 'sandbox.setup.ensure')).toHaveLength(1)
-
-    ensure.resolve(readyStatus())
+    expect(ensureReady).toHaveBeenCalledOnce()
+    ensure.resolve(readyResult())
     await expect(Promise.all([first, second])).resolves.toEqual([true, true])
 
-    expect(call).toHaveBeenCalledWith('sandbox.run_mode.preference.set', { runMode: 'safe' })
+    expect(selectMode).toHaveBeenCalledWith('safe')
     expect(pushToast).toHaveBeenCalledTimes(1)
     expect(pushToast).toHaveBeenCalledWith('Safe mode is ready.', { tone: 'ok' })
     expect(store.ensuring).toBe(false)
@@ -82,37 +114,27 @@ describe('sandbox setup store', () => {
   })
 
   it('keeps Full when the user explicitly selects it while setup runs', async () => {
-    const ensure = deferred<ReturnType<typeof readyStatus>>()
-    call.mockImplementation(async (method: string) => {
-      if (method === 'sandbox.setup.ensure') return ensure.promise
-      if (method === 'sandbox.capability.status') return { available: true }
-      throw new Error(`unexpected method: ${method}`)
-    })
-    const { useSandboxSetupStore } = await import('./sandboxSetup')
-    const store = useSandboxSetupStore()
+    const ensure = deferred<SandboxSetupResult>()
+    ensureReady.mockReturnValue(ensure.promise)
+    const store = createStore()
 
     const pending = store.startSafeSetup()
     store.noteRunModeSelection('full')
-    ensure.resolve(readyStatus())
+    ensure.resolve(readyResult())
 
     await expect(pending).resolves.toBe(true)
-    expect(call.mock.calls.some(([method]) => method === 'sandbox.run_mode.preference.set')).toBe(false)
+    expect(selectMode).not.toHaveBeenCalled()
     expect(pushToast).toHaveBeenCalledWith('Safe mode is ready.', { tone: 'ok' })
   })
 
-  it('retains Full and reports one failure when verification fails', async () => {
-    call.mockImplementation(async (method: string) => {
-      if (method === 'sandbox.setup.ensure') return readyStatus()
-      if (method === 'sandbox.capability.status') return { available: false }
-      throw new Error(`unexpected method: ${method}`)
-    })
-    const { useSandboxSetupStore } = await import('./sandboxSetup')
-    const store = useSandboxSetupStore()
+  it('reports one failure when capability verification fails', async () => {
+    ensureReady.mockResolvedValue(readyResult(false))
+    const store = createStore()
 
     await expect(store.startSafeSetup()).resolves.toBe(false)
 
     expect(store.outcome).toBe('verification_failed')
-    expect(call.mock.calls.some(([method]) => method === 'sandbox.run_mode.preference.set')).toBe(false)
+    expect(selectMode).not.toHaveBeenCalled()
     expect(pushToast).toHaveBeenCalledTimes(1)
     expect(pushToast).toHaveBeenCalledWith(
       'Safe mode setup could not finish. Try again from Safe mode.',
@@ -120,20 +142,36 @@ describe('sandbox setup store', () => {
     )
   })
 
-  it('allows a fresh retry after a completed operation', async () => {
-    call.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
-      if (method === 'sandbox.setup.ensure') return readyStatus()
-      if (method === 'sandbox.capability.status') return { available: true }
-      if (method === 'sandbox.run_mode.preference.set') return { runMode: params?.runMode }
-      throw new Error(`unexpected method: ${method}`)
+  it('keeps an ambiguous server-side setup in progress without a failure toast', async () => {
+    ensureReady.mockResolvedValue({
+      ready: false,
+      status: {
+        state: 'setting_up',
+        platform: 'win32',
+        message: 'Sandbox initialization is running.',
+        requiresAdmin: true,
+      },
+      capability: null,
+      outcome: 'in_progress',
     })
-    const { useSandboxSetupStore } = await import('./sandboxSetup')
-    const store = useSandboxSetupStore()
+    const store = createStore()
 
-    await store.startSafeSetup()
-    await store.startSafeSetup()
+    await expect(store.startSafeSetup()).resolves.toBe(false)
 
-    expect(call.mock.calls.filter(([method]) => method === 'sandbox.setup.ensure')).toHaveLength(2)
+    expect(store.outcome).toBe('in_progress')
+    expect(pushToast).not.toHaveBeenCalled()
+    expect(selectMode).not.toHaveBeenCalled()
+  })
+
+  it('allows a fresh retry after a completed operation', async () => {
+    ensureReady.mockResolvedValue(readyResult())
+    const store = createStore()
+
+    await expect(store.startSafeSetup()).resolves.toBe(true)
+    await expect(store.startSafeSetup()).resolves.toBe(true)
+
+    expect(ensureReady).toHaveBeenCalledTimes(2)
+    expect(selectMode).toHaveBeenCalledTimes(2)
     expect(pushToast).toHaveBeenCalledTimes(2)
   })
 })

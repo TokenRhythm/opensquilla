@@ -7,7 +7,7 @@ import type {
   PendingSteerAttempt,
   PendingSteerPhase,
 } from '@/types/chat'
-import type { SessionSteerV2Params } from '@/types/rpc'
+import type { SessionSteerV2Params } from '@/types/chat'
 import { rehomePromotedSteerRows } from '@/utils/chat/historyMerge'
 
 export interface SteerDeliveryIdentity {

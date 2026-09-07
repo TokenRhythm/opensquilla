@@ -636,6 +636,44 @@ async def test_models_routing_set_persists_and_returns_canonical_snapshot(tmp_pa
     assert persisted["squilla_router"]["enabled"] is False
 
 
+async def test_models_routing_set_persist_failure_never_reconciles_live_runtime(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = GatewayConfig(
+        config_path=str(tmp_path / "routing-failure.toml"),
+        llm_ensemble={"enabled": False},
+        squilla_router={"enabled": False, "rollout_phase": "observe"},
+    )
+    selector_calls: list[Any] = []
+    media_calls: list[Any] = []
+    selector = SimpleNamespace(sync_primary=lambda value: selector_calls.append(value))
+    ctx = RpcContext(
+        conn_id="routing-persist-failure",
+        config=config,
+        provider_selector=selector,
+    )
+
+    def fail_persist(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError("synthetic disk failure")
+
+    monkeypatch.setattr(
+        "opensquilla.onboarding.config_store.persist_config",
+        fail_persist,
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.adapters.provider_configuration.sync_media_runtime",
+        lambda value: media_calls.append(value),
+    )
+
+    with pytest.raises(OSError, match="synthetic disk failure"):
+        await _handle_models_routing_set({"mode": "router"}, ctx)
+
+    assert model_routing_snapshot(config)["mode"] == "direct"
+    assert selector_calls == []
+    assert media_calls == []
+
+
 async def test_models_routing_set_first_tokenrhythm_activation_persists_plan(
     tmp_path,
 ) -> None:

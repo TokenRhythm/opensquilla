@@ -1,7 +1,6 @@
 import { computed, ref, type ComputedRef, type Ref } from 'vue'
 import i18n from '@/i18n'
-import type { MetaSkillCatalog } from '@/modules/metaSkillCatalog'
-import type { useRpcStore } from '@/stores/rpc'
+import type { SkillCatalog } from '@/modules/skillCatalog'
 import type {
   AutoEnabledSkill,
   ProposalsSettings,
@@ -12,10 +11,6 @@ import type {
   SkillLayerGroup,
   SkillStatTile,
 } from '@/types/skills'
-
-interface SkillsListData {
-  skills?: Skill[]
-}
 
 export interface SkillsCatalogOptions {
   proposals: Ref<unknown[]>
@@ -38,7 +33,7 @@ export interface SkillsCatalog {
   setStatusFilter: (key: string) => void
 }
 
-const LAYER_ORDER = ['bundled', 'personal', 'managed', 'project', 'workspace', 'extra']
+const LAYER_ORDER = ['workspace', 'bundled', 'managed', 'personal', 'project', 'extra']
 
 // Known layer keys; labels/help text resolve through i18n by key.
 const KNOWN_LAYERS = new Set(LAYER_ORDER)
@@ -456,8 +451,7 @@ export function skillLayerHelp(layer: string | undefined): string {
 }
 
 export function useSkillsCatalog(
-  rpc: ReturnType<typeof useRpcStore>,
-  metaSkillCatalog: MetaSkillCatalog,
+  catalog: SkillCatalog,
   options: SkillsCatalogOptions,
 ): SkillsCatalog {
   const t = i18n.global.t
@@ -540,27 +534,8 @@ export function useSkillsCatalog(
 
   async function loadData() {
     try {
-      await rpc.waitForConnection()
-    } catch {
-      return false
-    }
-    try {
-      const [data, metaData] = await Promise.all([
-        rpc.call<SkillsListData>('skills.list', { includeLifecycle: true }),
-        // Mixed-version desktop upgrades can briefly pair the new WebUI with
-        // an older Gateway. Ordinary Skills remain usable until meta.list is
-        // available; the next refresh will populate the separate Meta group.
-        metaSkillCatalog.list().catch(() => []),
-      ])
-      const ordinary = (data.skills || []).map(normalizeSkill)
-      const metas = metaData.map((skill) => normalizeSkill({
-        ...skill,
-        kind: 'meta',
-        layer: skill.layer || 'bundled',
-        eligible: skill.eligible ?? (skill as Skill & { ready?: boolean }).ready,
-        status: skill.status || ((skill as Skill & { ready?: boolean }).ready ? 'ready' : 'needs_setup'),
-      }))
-      allSkills.value = [...ordinary, ...metas]
+      const skills = await catalog.list()
+      allSkills.value = skills.map(normalizeSkill)
       await options.loadProposals()
       return true
     } catch (err) {

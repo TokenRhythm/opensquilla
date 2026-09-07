@@ -10,10 +10,10 @@
 // points and assert task-A's events no longer touch task-B's turn, while
 // task-B's own events (and legacy untagged events) still flow.
 import { describe, expect, it, vi } from 'vitest'
-import { effectScope, ref, type Ref } from 'vue'
+import { effectScope, onScopeDispose, ref, type Ref } from 'vue'
 import i18n, { loadLocaleMessages } from '@/i18n'
 import type { ChatMessage, ChatRunStatus, ChatRunStatusSource } from '@/types/chat'
-import type { ToolUsePayload } from '@/types/rpc'
+import type { ConversationEventData, ConversationToolContent } from '@/modules/conversationEventContent'
 import {
   useChatRpcEventHandlers,
   type ChatRpcStreamApi,
@@ -21,6 +21,8 @@ import {
 } from './useChatRpcEventHandlers'
 import { useChatTaskOwnership } from './useChatTaskOwnership'
 import { FINISHED_STREAM_TASK_ID, PENDING_STREAM_TASK_ID } from '@/utils/chat/streamEvents'
+import { createConversationEventTransport } from '@/adapters/gateway/conversationEventTransport'
+import type { TransportEventHandler } from '@/adapters/gateway/transportTypes'
 
 const SESSION = 'agent:main:webchat:issue344'
 
@@ -46,7 +48,6 @@ function makeStream(): ChatRpcStreamApi {
     showThinkingIndicator: vi.fn(),
     hideThinkingIndicator: vi.fn(),
     appendFrame: vi.fn(),
-    useReducer: ref(false),
   }
 }
 
@@ -93,21 +94,75 @@ function makeHarness(activeStreamTaskId = '') {
     loadCurrentSessionUsage: vi.fn(),
   }
   const scope = effectScope()
-  const api = scope.run(() => useChatRpcEventHandlers(options))!
+  const rawApi = scope.run(() => useChatRpcEventHandlers(options))!
+  let receive!: TransportEventHandler
+  const transport = createConversationEventTransport({
+    subscribe(name, handler) {
+      if (name === '*') receive = handler
+      return { close() {} }
+    },
+  })
+  scope.run(() => onScopeDispose(transport.subscribe({ onEvent: rawApi.onConversationEvent })))
+  const api = {
+    ...rawApi,
+    handlers: {
+      ...rawApi.handlers,
+      onWireEventFixture: (eventName: string, payload: unknown) => {
+        receive(eventName, payload)
+      },
+    },
+  }
   return { api, options, stream, messages, activeTaskId, scope }
 }
 
-function toolUse(taskId: string | undefined, toolName: string): ToolUsePayload {
+function toolUse(taskId: string | undefined, toolName: string): ConversationToolContent {
   return {
-    session_key: SESSION,
+    key: SESSION,
     stream_seq: 1,
     task_id: taskId,
-    tool_use_id: `${toolName}-id`,
-    tool_name: toolName,
-  } as unknown as ToolUsePayload
+    id: `${toolName}-id`,
+    name: toolName,
+  }
 }
 
 describe('issue #344 — live stream is bound to a single task', () => {
+  it.each([
+    { extra: {}, safe: true },
+    { extra: { noPriorProviderDispatch: null }, safe: false },
+    { extra: { usageCallIndex: 2 }, safe: false },
+    { extra: { replaySafe: false }, safe: false },
+    { extra: { outcome: null }, safe: false },
+    { extra: { userMessageId: 'different-user' }, safe: false },
+  ])('preserves terminal proof through the real transport without dropping conflicting evidence: %j', ({ extra, safe }) => {
+    const { api, messages, stream, scope } = makeHarness('task-B')
+    let receive!: TransportEventHandler
+    const transport = createConversationEventTransport({
+      subscribe(name, handler) {
+        if (name === '*') receive = handler
+        return { close() {} }
+      },
+    })
+    const detach = transport.subscribe({ onEvent: api.onConversationEvent })
+    try {
+      receive('session.event.error', {
+        session_key: SESSION, task_id: 'task-B', turn_id: 'task-B',
+        code: 'usage_accounting_busy', error_class: 'usage_accounting_busy',
+        terminal_message: 'not sent', usage_call_index: 1, no_prior_provider_dispatch: true,
+        replay_safe: true, user_message_id: 'user-primary',
+        activity_snapshot: { version: 1, task_id: 'task-B', turn_id: 'task-B', phases: [
+          { kind: 'router', phase: 'decided', at: 1_000 },
+          { kind: 'state', phase: 'thinking', at: 1_100 },
+        ] },
+        turn_outcome: { kind: 'blocked', reason: 'usage_accounting_busy' }, ...extra,
+      })
+      expect(messages.value[messages.value.length - 1]?.turnOutcome).toMatchObject({ replaySafe: safe })
+      expect(stream.restoreStatusHistory).toHaveBeenCalledWith([
+        expect.objectContaining({ action: 'router:decided', at: 1_000 }),
+        expect.objectContaining({ action: 'Planning next step', at: 1_100 }),
+      ])
+      if (!safe) expect(messages.value[messages.value.length - 1]?.text).not.toContain('safely retry')
+    } finally { detach(); scope.stop() }
+  })
   it("drops a stale task's tool_use_start while another task owns the live stream", () => {
     const { api, stream } = makeHarness('task-B')
     api.handlers.onToolUseStart(toolUse('task-A', 'create_pdf.py'))
@@ -128,7 +183,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
 
   it("does not end the current stream on a stale task's terminal error", () => {
     const { api, stream, messages } = makeHarness('task-B')
-    api.handlers.onAny('task.failed', {
+    api.handlers.onWireEventFixture('task.failed', {
       task_id: 'task-A',
       session_key: SESSION,
       terminal_message: '图片转文字PDF错误',
@@ -143,7 +198,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
 
     api.handlers.onRunHeartbeat({
       task_id: 'task-A',
-      session_key: SESSION,
+      key: SESSION,
       stream_seq: 1,
     })
 
@@ -155,7 +210,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
 
     api.handlers.onRouterControlReplay({
       task_id: 'task-A',
-      session_key: SESSION,
+      key: SESSION,
       stream_seq: 1,
     })
 
@@ -168,7 +223,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
       stream.isStreaming.value = false
     })
 
-    api.handlers.onAny('session.event.done', {
+    api.handlers.onWireEventFixture('session.event.done', {
       task_id: 'task-B',
       session_key: SESSION,
       stream_seq: 1,
@@ -176,7 +231,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
     })
     api.handlers.onRunHeartbeat({
       task_id: 'task-B',
-      session_key: SESSION,
+      key: SESSION,
       stream_seq: 2,
     })
 
@@ -190,7 +245,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
       messages.value.push({ role: 'assistant', text: 'finished answer', ts: 'now' })
     })
 
-    api.handlers.onAny('task.succeeded', {
+    api.handlers.onWireEventFixture('task.succeeded', {
       task_id: 'task-B',
       session_key: SESSION,
       terminal_reason: 'completed',
@@ -203,19 +258,19 @@ describe('issue #344 — live stream is bound to a single task', () => {
 
   it("does not end the current stream on a stale task's terminal sessions.changed", () => {
     const { api, stream, options } = makeHarness('task-B')
-    api.handlers.onSessionsChanged({
-      session_key: SESSION,
+    api.handlers.onWireEventFixture('sessions.changed', {
+      key: SESSION,
       reason: 'task_terminal',
       run_status: 'cancelled',
       last_task: { task_id: 'task-A', status: 'cancelled' },
-    } as never)
+    })
     expect(stream.endStreaming).not.toHaveBeenCalled()
     expect(options.applySessionRunState).not.toHaveBeenCalled()
   })
 
   it("ends the current stream on the active task's terminal error", () => {
     const { api, stream, messages } = makeHarness('task-B')
-    api.handlers.onAny('task.failed', {
+    api.handlers.onWireEventFixture('task.failed', {
       task_id: 'task-B',
       session_key: SESSION,
       terminal_message: 'HTML generation failed',
@@ -229,7 +284,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
     i18n.global.locale.value = 'zh-Hans'
     const { api, messages, scope } = makeHarness('task-B')
 
-    api.handlers.onAny('task.failed', {
+    api.handlers.onWireEventFixture('task.failed', {
       task_id: 'task-B',
       session_key: SESSION,
       code: 'ensemble_multimodal_unsupported',
@@ -257,7 +312,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
       ],
     }
 
-    api.handlers.onAny('session.event.error', {
+    api.handlers.onWireEventFixture('session.event.error', {
       task_id: 'task-B',
       session_key: SESSION,
       code: 'usage_accounting_busy',
@@ -280,7 +335,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
         user_message_id: 'user-primary',
       },
     })
-    api.handlers.onAny('task.failed', {
+    api.handlers.onWireEventFixture('task.failed', {
       task_id: 'task-B',
       session_key: SESSION,
       terminal_message: 'generic failure must not replace rich error',
@@ -308,7 +363,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
   it('drops a conflicting live primary-user identity', () => {
     const { api, messages, scope } = makeHarness('task-B')
 
-    api.handlers.onAny('session.event.error', {
+    api.handlers.onWireEventFixture('session.event.error', {
       task_id: 'task-B',
       session_key: SESSION,
       code: 'usage_accounting_busy',
@@ -335,7 +390,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
   it('keeps later-call barriers retryable without presenting them as replay safe', () => {
     const { api, messages, scope } = makeHarness('task-B')
 
-    api.handlers.onAny('session.event.error', {
+    api.handlers.onWireEventFixture('session.event.error', {
       task_id: 'task-B',
       session_key: SESSION,
       code: 'usage_accounting_busy',
@@ -371,7 +426,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
 
   it('binds activeStreamTaskId from task.running, then filters the prior task', () => {
     const { api, options, stream } = makeHarness('')
-    api.handlers.onTaskRunning({ task_id: 'task-B', session_key: SESSION })
+    api.handlers.onTaskRunning({ task_id: 'task-B', key: SESSION })
     expect(options.activeStreamTaskId.value).toBe('task-B')
     api.handlers.onToolUseStart(toolUse('task-A', 'create_pdf.py'))
     expect(stream.appendToolCall).not.toHaveBeenCalled()
@@ -380,10 +435,10 @@ describe('issue #344 — live stream is bound to a single task', () => {
   it('buffers early cancellation until the send response binds the queued task', () => {
     const { api, options, stream } = makeHarness(PENDING_STREAM_TASK_ID)
 
-    api.handlers.onTaskQueued({ task_id: 'task-B', session_key: SESSION })
+    api.handlers.onTaskQueued({ task_id: 'task-B', key: SESSION })
     expect(options.activeStreamTaskId.value).toBe(PENDING_STREAM_TASK_ID)
 
-    api.handlers.onAny('task.cancelled', {
+    api.handlers.onWireEventFixture('task.cancelled', {
       task_id: 'task-B',
       session_key: SESSION,
       terminal_message: 'The task was cancelled before it finished.',
@@ -399,7 +454,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
   it('buffers a tagged terminal event while the accepted task id is pending', () => {
     const { api, options, stream, messages, activeTaskId } = makeHarness(PENDING_STREAM_TASK_ID)
 
-    api.handlers.onAny('task.failed', {
+    api.handlers.onWireEventFixture('task.failed', {
       task_id: 'task-B',
       session_key: SESSION,
       terminal_message: 'The accepted task failed before the response arrived.',
@@ -419,15 +474,74 @@ describe('issue #344 — live stream is bound to a single task', () => {
     expect(activeTaskId.value).toBe(FINISHED_STREAM_TASK_ID)
   })
 
+  it.each([true, false])('preserves terminal proof through pending bind (safe=%s)', safe => {
+    const { api, options, stream, messages, activeTaskId, scope } = makeHarness(PENDING_STREAM_TASK_ID)
+    let receive!: TransportEventHandler
+    const transport = createConversationEventTransport({
+      subscribe(name, handler) {
+        if (name === '*') receive = handler
+        return { close() {} }
+      },
+    })
+    const detach = transport.subscribe({ onEvent: api.onConversationEvent })
+    const payload = {
+      session_key: SESSION,
+      task_id: 'task-B',
+      turn_id: 'task-B',
+      stream_seq: 1,
+      code: 'usage_accounting_busy',
+      error_class: 'usage_accounting_busy',
+      terminal_message: 'not sent',
+      usage_call_index: 1,
+      no_prior_provider_dispatch: true,
+      replay_safe: true,
+      user_message_id: 'user-primary',
+      turn_outcome: { kind: 'blocked', reason: 'usage_accounting_busy' },
+      ...(safe ? {} : { replaySafe: false }),
+    }
+    try {
+      receive('session.event.error', payload)
+
+      expect(messages.value).toEqual([])
+      expect(stream.endStreaming).not.toHaveBeenCalled()
+      expect(options.lastStreamSeq.value).toBe(0)
+      expect(activeTaskId.value).toBe(PENDING_STREAM_TASK_ID)
+
+      api.bindActiveStreamTask('task-B')
+
+      expect(messages.value.filter(message => message.role === 'error')).toHaveLength(1)
+      const outcome = messages.value[messages.value.length - 1]?.turnOutcome
+      expect(outcome).toMatchObject({
+        kind: 'blocked',
+        usageCallIndex: 1,
+        noPriorProviderDispatch: safe,
+        replaySafe: safe,
+      })
+      expect(outcome?.userMessageId).toBe(safe ? 'user-primary' : undefined)
+      expect(stream.endStreaming).toHaveBeenCalledTimes(1)
+      expect(options.lastStreamSeq.value).toBe(1)
+      expect(activeTaskId.value).toBe(FINISHED_STREAM_TASK_ID)
+
+      receive('session.event.error', payload)
+
+      expect(messages.value.filter(message => message.role === 'error')).toHaveLength(1)
+      expect(stream.endStreaming).toHaveBeenCalledTimes(1)
+      expect(options.lastStreamSeq.value).toBe(1)
+    } finally {
+      detach()
+      scope.stop()
+    }
+  })
+
   it('consumes only the buffered terminal event matching the response task id', () => {
     const { api, stream, messages, activeTaskId } = makeHarness(PENDING_STREAM_TASK_ID)
 
-    api.handlers.onAny('task.failed', {
+    api.handlers.onWireEventFixture('task.failed', {
       task_id: 'task-A',
       session_key: SESSION,
       terminal_message: 'Stale task A failed.',
     })
-    api.handlers.onAny('task.succeeded', {
+    api.handlers.onWireEventFixture('task.succeeded', {
       task_id: 'task-B',
       session_key: SESSION,
     })
@@ -442,7 +556,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
   it('drops a buffered stale terminal event when the response binds another task', () => {
     const { api, stream, messages, activeTaskId } = makeHarness(PENDING_STREAM_TASK_ID)
 
-    api.handlers.onAny('task.failed', {
+    api.handlers.onWireEventFixture('task.failed', {
       task_id: 'task-A',
       session_key: SESSION,
       terminal_message: 'Stale task A failed.',
@@ -458,8 +572,8 @@ describe('issue #344 — live stream is bound to a single task', () => {
   it('does not let another running task claim a pending send before its response', () => {
     const { api, stream, messages, activeTaskId } = makeHarness(PENDING_STREAM_TASK_ID)
 
-    api.handlers.onTaskRunning({ task_id: 'task-A', session_key: SESSION })
-    api.handlers.onAny('task.failed', {
+    api.handlers.onTaskRunning({ task_id: 'task-A', key: SESSION })
+    api.handlers.onWireEventFixture('task.failed', {
       task_id: 'task-A',
       session_key: SESSION,
       terminal_message: 'Unrelated task A failed.',
@@ -479,7 +593,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
     const { api, stream, activeTaskId } = makeHarness(PENDING_STREAM_TASK_ID)
     const earlyTool = toolUse('task-B', 'write_report')
 
-    api.handlers.onTaskRunning({ task_id: 'task-B', session_key: SESSION })
+    api.handlers.onTaskRunning({ task_id: 'task-B', key: SESSION })
     api.handlers.onToolUseStart(earlyTool)
 
     expect(activeTaskId.value).toBe(PENDING_STREAM_TASK_ID)
@@ -498,7 +612,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
     for (let index = 0; index < 70; index++) {
       api.handlers.onTextDelta({
         task_id: 'task-B',
-        session_key: SESSION,
+        key: SESSION,
         stream_seq: index + 1,
         text: `delta-${index}`,
       })
@@ -515,7 +629,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
   it('bounds pending terminal task buckets and retains the newest tasks', () => {
     const oldest = makeHarness(PENDING_STREAM_TASK_ID)
     for (let index = 0; index < 9; index++) {
-      oldest.api.handlers.onAny('task.failed', {
+      oldest.api.handlers.onWireEventFixture('task.failed', {
         task_id: `task-${index}`,
         session_key: SESSION,
         terminal_message: `Task ${index} failed.`,
@@ -527,7 +641,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
 
     const newest = makeHarness(PENDING_STREAM_TASK_ID)
     for (let index = 0; index < 9; index++) {
-      newest.api.handlers.onAny('task.failed', {
+      newest.api.handlers.onWireEventFixture('task.failed', {
         task_id: `task-${index}`,
         session_key: SESSION,
         terminal_message: `Task ${index} failed.`,
@@ -547,7 +661,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
     options.taskOwnership = taskOwnership
     stream.isStreaming.value = false
 
-    api.handlers.onAny('task.cancelled', {
+    api.handlers.onWireEventFixture('task.cancelled', {
       task_id: 'task-B',
       session_key: SESSION,
       terminal_message: 'The task was cancelled before it finished.',
@@ -570,11 +684,11 @@ describe('issue #344 — live stream is bound to a single task', () => {
     options.taskOwnership = taskOwnership
     stream.isStreaming.value = false
     const cancelledPayload = {
-      session_key: SESSION,
+      key: SESSION,
       reason: 'task_terminal',
       run_status: 'cancelled',
       last_task: { task_id: 'task-B', status: 'cancelled' },
-    } satisfies ChatRunStatusSource & { session_key: string; reason: string }
+    } satisfies ConversationEventData
     options.sessionRunStatus = vi.fn((source: ChatRunStatusSource | null | undefined): ChatRunStatus => {
       const isCancelled = source?.run_status === 'cancelled'
       return {
@@ -584,7 +698,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
       }
     })
 
-    api.handlers.onSessionsChanged(cancelledPayload as never)
+    api.handlers.onSessionsChanged(cancelledPayload)
 
     expect(options.applySessionRunState).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -610,11 +724,11 @@ describe('issue #344 — live stream is bound to a single task', () => {
     }))
 
     api.handlers.onSessionsChanged({
-      session_key: SESSION,
+      key: SESSION,
       reason: 'task_terminal',
       run_status: 'cancelled',
       last_task: { task_id: 'task-B', status: 'cancelled', finished_at: 2_000 },
-    } as never)
+    })
     messages.value.push({ role: 'user', text: 'next question', ts: 3_000, messageId: 'user-2' })
 
     expect(messages.value.map(message => [message.role, message.text])).toEqual([
@@ -646,7 +760,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
       task: source?.last_task ?? null,
     }))
 
-    api.handlers.onAny('task.cancelled', {
+    api.handlers.onWireEventFixture('task.cancelled', {
       task_id: 'task-B',
       session_key: SESSION,
       terminal_message: 'The task was cancelled before it finished.',

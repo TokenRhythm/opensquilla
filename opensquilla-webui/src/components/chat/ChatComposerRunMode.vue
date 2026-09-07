@@ -74,7 +74,7 @@ const selectedRunMode = computed(() => normalizeSandboxRunMode(props.runMode))
 
 const allowedRunModes = computed(() => {
   const allowed = props.allowedRunModes.filter(mode => SANDBOX_RUN_MODES.includes(mode))
-  return allowed.length > 0 ? allowed : [...SANDBOX_RUN_MODES]
+  return allowed
 })
 
 function isDisabled(mode: SandboxRunMode): boolean {

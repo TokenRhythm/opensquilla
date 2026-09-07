@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import opensquilla.gateway.rpc_workbench_resources as resource_rpc
+import opensquilla.gateway.workbench_resource_runtime as resource_rpc
 from opensquilla.artifact_session import (
     Actor,
     ActorKind,
@@ -117,33 +117,16 @@ def test_document_resource_capability_axes_are_independent(
         ("url", "urlId"),
     ),
 )
-def test_workbench_resource_refs_use_discriminated_ids_with_legacy_alias(
+def test_workbench_resource_payloads_use_discriminated_ids_with_legacy_alias(
     resource_type: str,
     id_field: str,
 ) -> None:
     resource_id = f"{resource_type}-fixture"
-    assert resource_rpc._resource_ref(
-        {"resource": {"type": resource_type, id_field: resource_id}}
-    ) == (resource_type, resource_id)
-    assert resource_rpc._resource_ref(
-        {"resource": {"type": resource_type, "id": resource_id}}
-    ) == (resource_type, resource_id)
     assert resource_rpc._resource_ref_payload(resource_type, resource_id) == {
         "type": resource_type,
         id_field: resource_id,
         "id": resource_id,
     }
-
-    with pytest.raises(ValueError, match="must match"):
-        resource_rpc._resource_ref(
-            {
-                "resource": {
-                    "type": resource_type,
-                    id_field: resource_id,
-                    "id": "different-fixture",
-                }
-            }
-        )
 
 
 @pytest.mark.asyncio

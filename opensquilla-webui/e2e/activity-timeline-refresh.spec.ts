@@ -1,4 +1,9 @@
 import { expect, test, type Locator, type Page } from '@playwright/test'
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-activity-refresh'
@@ -125,7 +130,7 @@ const snapshotEntries = [
     type: 'reasoning', id: 'reasoning-2', order: 52, block_index: 1,
     started_at: BASE_TIME + 5_200, ended_at: BASE_TIME + 5_400,
     status: 'completed', content_kind: 'reasoning',
-    text_start_utf16: 9, text_end_utf16: 18,
+    text_start_utf16: 10, text_end_utf16: 19,
   },
   {
     type: 'phase', id: 'write:2:60', order: 60,
@@ -145,22 +150,21 @@ function historyPayload(settled: boolean) {
     message_id: 'user-activity-refresh', timestamp: BASE_TIME - 1_000,
     turn_context: { turn_id: TURN_ID },
   }
-  if (!settled) return { messages: [user], has_more: false, canonical_complete: true }
-  return {
-    messages: [user, {
-      role: 'assistant', text: 'Final answer.', id: 'assistant-activity-refresh',
-      message_id: 'assistant-activity-refresh', timestamp: BASE_TIME + 6_100,
-      turn_context: { turn_id: TURN_ID },
-      reasoning_content: 'Think oneThink two',
-      tool_calls: [
-        { type: 'text', text: 'Inspect.' },
-        {
-          type: 'tool_use', tool_use_id: 'tool-1', name: 'skill_view',
-          input: {}, result: 'ok', execution_status: { status: 'success' },
-        },
-        { type: 'text', text: 'Final answer.' },
-      ],
-    }],
+  if (!settled) return chatHistoryPayload([user])
+  return chatHistoryPayload([user, {
+    role: 'assistant', text: 'Final answer.', id: 'assistant-activity-refresh',
+    message_id: 'assistant-activity-refresh', timestamp: BASE_TIME + 6_100,
+    turn_context: { turn_id: TURN_ID },
+    reasoning_content: 'Think one\nThink two',
+    tool_calls: [
+      { type: 'text', text: 'Inspect.' },
+      {
+        type: 'tool_use', tool_use_id: 'tool-1', name: 'skill_view',
+        input: {}, result: 'ok', execution_status: { status: 'success' },
+      },
+      { type: 'text', text: 'Final answer.' },
+    ],
+  }], {
     turn_outcomes: [{
       turn_id: TURN_ID,
       task_id: TURN_ID,
@@ -173,13 +177,11 @@ function historyPayload(settled: boolean) {
         task_id: TURN_ID,
         turn_id: TURN_ID,
         complete: true,
-        reasoning_utf16_length: 18,
+        reasoning_utf16_length: 19,
         entries: snapshotEntries,
       },
     }],
-    has_more: false,
-    canonical_complete: true,
-  }
+  })
 }
 
 async function installGatewayFixture(page: Page) {
@@ -189,13 +191,18 @@ async function installGatewayFixture(page: Page) {
   await page.addInitScript(({ fixedNow }) => {
     Date.now = () => fixedNow
     window.localStorage.setItem('opensquilla-locale', 'en')
-    window.localStorage.setItem('opensquilla.chat.foldLiveTurn', '1')
   }, { fixedNow: FIXED_NOW })
   await page.emulateMedia({ reducedMotion: 'reduce' })
+  await page.route('**/api/system/update', route => route.fulfill({ json: {} }))
+  await page.route('**/api/elevated-mode', route => route.fulfill({
+    json: { enabled: false },
+  }))
   await page.route('**/api/approvals', route => route.fulfill({
     status: 200,
     contentType: 'application/json',
-    body: JSON.stringify({ pending: [] }),
+    body: JSON.stringify({
+      pending: [], mode: 'prompt', allowPatterns: [], denyPatterns: [],
+    }),
   }))
   await page.routeWebSocket(/\/ws$/, ws => {
     ws.send(event('connect.challenge', {}))
@@ -242,20 +249,18 @@ async function installGatewayFixture(page: Page) {
         },
         'models.routing.get': { mode: 'direct' },
         'onboarding.status': { audioConfigured: false },
+        'sandbox.run_mode.preference.get': { runMode: 'full', source: 'config' },
         'sessions.list': { sessions: [], has_more: false },
-        'sessions.messages.subscribe': {
-          subscribed: true,
-          replay_complete: true,
+        'sessions.messages.subscribe': sessionMessagesSubscribePayload(SESSION_KEY, {
           stream_generation: generation,
           current_stream_seq: settled ? 0 : 60,
           run_status: settled ? 'idle' : 'running',
-        },
-        'sessions.messages.hydrate': {
-          hydration_complete: true,
+        }),
+        'sessions.messages.hydrate': sessionMessagesHydratePayload(SESSION_KEY, {
           stream_generation: generation,
           current_stream_seq: settled ? 0 : 60,
           run_status: settled ? 'idle' : 'running',
-        },
+        }),
         'usage.status': { sessions: [] },
       }
       ws.send(response(frame.id, payloads[method] ?? {}))

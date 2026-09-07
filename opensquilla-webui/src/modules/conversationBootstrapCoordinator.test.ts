@@ -1,10 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
-  createConversationBootstrapCriticalQueue,
   createConversationBootstrapPhase,
   createConversationBootstrapCoordinator,
-  rearmConversationBootstrapCriticalQueue,
   type ConversationBootstrapRunToken,
   waitForConversationBootstrapRetry,
 } from './conversationBootstrapCoordinator'
@@ -121,73 +119,6 @@ describe('ConversationBootstrapCoordinator', () => {
     }))
     run.abort()
     expect(abort).toHaveBeenCalledWith(1)
-  })
-
-  it('keeps queue sequence waiters alive across replacement epochs', async () => {
-    const first = createConversationBootstrapCriticalQueue(true)
-    const controller = new AbortController()
-    let settled = false
-    const waiter = first.waitForLiveSubscribeSent(
-      2,
-      Date.now() + 1_000,
-      controller.signal,
-      () => true,
-    ).then(ready => {
-      settled = true
-      return ready
-    })
-    const replacement = rearmConversationBootstrapCriticalQueue(first, true)
-
-    replacement.markLiveSubscribeSent(7)
-    await Promise.resolve()
-    expect(replacement.liveQueueSequence).toBe(1)
-    expect(settled).toBe(false)
-
-    replacement.markLiveSubscribeSent(7)
-    expect(await waiter).toBe(true)
-    replacement.markHistoryRequestSent(7)
-    await replacement.promise
-    await first.promise
-  })
-
-  it('releases queue waiters and the barrier on cancellation', async () => {
-    const queue = createConversationBootstrapCriticalQueue(true)
-    const controller = new AbortController()
-    const waiter = queue.waitForLiveSubscribeSent(
-      1,
-      Date.now() + 1_000,
-      controller.signal,
-      () => true,
-    )
-
-    queue.cancel()
-    expect(await waiter).toBe(false)
-    await queue.promise
-    expect(queue.released).toBe(true)
-  })
-
-  it('returns false when a live queue waiter reaches its deadline', async () => {
-    vi.useFakeTimers()
-    vi.setSystemTime(0)
-    const queue = createConversationBootstrapCriticalQueue(true)
-    const controller = new AbortController()
-    const waiter = queue.waitForLiveSubscribeSent(
-      1,
-      100,
-      controller.signal,
-      () => true,
-    )
-
-    await vi.advanceTimersByTimeAsync(100)
-    expect(await waiter).toBe(false)
-  })
-
-  it('opens a terminal barrier when critical phases cannot enqueue', async () => {
-    const queue = createConversationBootstrapCriticalQueue(true)
-    queue.markLiveTerminal()
-    queue.markHistoryTerminal()
-    await queue.promise
-    expect(queue.released).toBe(true)
   })
 
   it('bounds retry timers by deadline and abort/current ownership', async () => {

@@ -11,7 +11,7 @@ describe('pending approval navigation wiring', () => {
   })
 
   it('clears stale global approval attention while the gateway is disconnected', () => {
-    expect(appSource).toContain("if (state !== 'connected')")
+    expect(appSource).toContain("if (state !== 'available')")
     expect(appSource).toContain('appStore.setPendingApprovals([])')
   })
 

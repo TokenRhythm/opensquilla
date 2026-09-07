@@ -9,9 +9,8 @@
 
 export interface ConversationEventSourceHandlers<TEvent> {
   onEvent?: (event: TEvent) => void
-  onAny?: (rawEvent: string, rawPayload: unknown) => void
   onConnectionState?: (state: string) => void
-  onDecodeError?: (error: unknown, rawEvent: string, rawPayload: unknown) => void
+  onDecodeError?: (error: unknown) => void
 }
 
 export interface ConversationEventSource<TEvent> {
@@ -28,9 +27,8 @@ export interface ConversationEventHub<TEvent> {
   /** Open a logical stream. An empty key means “all events”. */
   open(key: string): ConversationEventHandle<TEvent>
   /** Observe transport diagnostics without owning a logical stream. */
-  observeAny(listener: (rawEvent: string, rawPayload: unknown) => void): () => void
   observeConnectionState(listener: (state: string) => void): () => void
-  observeDecodeError(listener: (error: unknown, rawEvent: string, rawPayload: unknown) => void): () => void
+  observeDecodeError(listener: (error: unknown) => void): () => void
   /** Explicitly release the source and all logical handles. */
   dispose(): void
 }
@@ -58,13 +56,8 @@ export function createConversationEventHub<TEvent>(
   options: ConversationEventHubOptions<TEvent> = {},
 ): ConversationEventHub<TEvent> {
   const handles = new Set<HandleState<TEvent>>()
-  const anyListeners = new Set<(rawEvent: string, rawPayload: unknown) => void>()
   const stateListeners = new Set<(state: string) => void>()
-  const decodeErrorListeners = new Set<(
-    error: unknown,
-    rawEvent: string,
-    rawPayload: unknown,
-  ) => void>()
+  const decodeErrorListeners = new Set<(error: unknown) => void>()
   let detachSource: (() => void) | null = null
   let disposed = false
 
@@ -85,16 +78,11 @@ export function createConversationEventHub<TEvent>(
           for (const listener of [...handle.listeners]) listener(event)
         }
       },
-      onAny: (rawEvent, rawPayload) => {
-        for (const listener of [...anyListeners]) listener(rawEvent, rawPayload)
-      },
       onConnectionState: (state) => {
         for (const listener of [...stateListeners]) listener(state)
       },
-      onDecodeError: (error, rawEvent, rawPayload) => {
-        for (const listener of [...decodeErrorListeners]) {
-          listener(error, rawEvent, rawPayload)
-        }
+      onDecodeError: (error) => {
+        for (const listener of [...decodeErrorListeners]) listener(error)
       },
     })
   }
@@ -102,7 +90,6 @@ export function createConversationEventHub<TEvent>(
   function maybeDetachSource() {
     if (
       handles.size > 0
-      || anyListeners.size > 0
       || stateListeners.size > 0
       || decodeErrorListeners.size > 0
     ) return
@@ -164,7 +151,6 @@ export function createConversationEventHub<TEvent>(
 
   return {
     open,
-    observeAny: listener => observeSet(anyListeners, listener),
     observeConnectionState: listener => observeSet(stateListeners, listener),
     observeDecodeError: listener => observeSet(decodeErrorListeners, listener),
     dispose() {
@@ -175,7 +161,6 @@ export function createConversationEventHub<TEvent>(
         handle.listeners.clear()
       }
       handles.clear()
-      anyListeners.clear()
       stateListeners.clear()
       decodeErrorListeners.clear()
       detachSource?.()

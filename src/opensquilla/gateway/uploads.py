@@ -34,16 +34,25 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from opensquilla.contracts.attachment_sniff import sniff_mime_from_bytes
+from opensquilla.application.artifact_workbench import (
+    AttachmentClaimError,
+    AttachmentEmptyError,
+    AttachmentOpaqueOversizeError,
+    AttachmentStage,
+    AttachmentStagingApplication,
+    AttachmentStagingPolicy,
+)
 from opensquilla.contracts.attachments import (
     ALLOWED_MEDIA_TYPES,
-    MSG_MIME,
     OPAQUE_ATTACHMENT_BYTES,
-    OPAQUE_MIME,
     attachment_category,
     attachment_size_limit_for_mime,
     can_stage_attachment_mime,
     normalize_attachment_mime,
+)
+from opensquilla.gateway.adapters.artifact_content import (
+    GatewayAttachmentMimePolicy,
+    GatewayAttachmentStagingPort,
 )
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.origin_guard import forbidden_origin_response, request_origin_allowed
@@ -128,9 +137,7 @@ class UploadStore:
         # without bound. While an operation is inside `async with lock` a strong
         # ref keeps the entry alive, so concurrent access to the same uuid still
         # serializes on the same lock.
-        self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
-            weakref.WeakValueDictionary()
-        )
+        self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._lock_for_locks = asyncio.Lock()
         if self.marker_dir is not None:
             native_io_path(self.marker_dir).mkdir(parents=True, exist_ok=True)
@@ -222,8 +229,7 @@ class UploadStore:
         max_bytes = min(self.max_file_bytes, mime_limit)
         if len(payload) > max_bytes:
             raise UploadOversizeError(
-                f"upload exceeds {max_bytes} byte cap for {normalized_mime} "
-                f"(got {len(payload)})"
+                f"upload exceeds {max_bytes} byte cap for {normalized_mime} (got {len(payload)})"
             )
         if len(payload) > self.max_total_bytes:
             # A payload larger than the aggregate cap can never be staged, so
@@ -395,6 +401,20 @@ def register_upload_routes(
 ) -> None:
     """Register POST /api/v1/files/upload on the given Starlette app."""
 
+    attachments_cfg = getattr(config, "attachments", None)
+    accept_opaque = bool(getattr(attachments_cfg, "accept_opaque", True))
+    opaque_cap = getattr(attachments_cfg, "opaque_max_bytes", None)
+    if not isinstance(opaque_cap, int) or opaque_cap <= 0:
+        opaque_cap = OPAQUE_ATTACHMENT_BYTES
+    staging = AttachmentStagingApplication(
+        GatewayAttachmentStagingPort(store),
+        AttachmentStagingPolicy(
+            accept_opaque=accept_opaque,
+            opaque_max_bytes=opaque_cap,
+        ),
+        GatewayAttachmentMimePolicy(),
+    )
+
     async def upload_handler(request: Request) -> JSONResponse:
         if not request_origin_allowed(request, config):
             return forbidden_origin_response()
@@ -403,8 +423,7 @@ def register_upload_routes(
                 return JSONResponse(
                     {
                         "error": (
-                            "Authorization header (Bearer …) required for "
-                            "/api/v1/files/upload"
+                            "Authorization header (Bearer …) required for /api/v1/files/upload"
                         ),
                         "code": "UNAUTHORIZED",
                     },
@@ -414,79 +433,34 @@ def register_upload_routes(
         try:
             form = await request.form()
         except Exception as exc:
-            return JSONResponse(
-                {"error": f"multipart/form-data required: {exc}"}, status_code=400
-            )
+            return JSONResponse({"error": f"multipart/form-data required: {exc}"}, status_code=400)
 
         upload = form.get("file")
         if upload is None or not hasattr(upload, "read"):
-            return JSONResponse(
-                {"error": "missing 'file' multipart field"}, status_code=400
-            )
+            return JSONResponse({"error": "missing 'file' multipart field"}, status_code=400)
 
         filename = getattr(upload, "filename", None) or "attachment"
         content_type = getattr(upload, "content_type", None) or form.get("mime") or ""
-        normalized_mime = normalize_attachment_mime(content_type)
-
-        attachments_cfg = getattr(config, "attachments", None)
-        accept_opaque = bool(getattr(attachments_cfg, "accept_opaque", True))
 
         # Legacy fail-closed admission rejects a missing/invalid claim before
         # the payload is read, preserving the strict-mode error precedence.
-        if not accept_opaque and normalized_mime is None:
+        try:
+            staging.validate_claim(str(content_type))
+        except AttachmentClaimError:
             return JSONResponse(
                 {"error": "missing or invalid 'mime' / content-type"}, status_code=400
             )
 
         payload = await upload.read()
-        if not isinstance(payload, bytes) or len(payload) == 0:
-            return JSONResponse(
-                {"error": "empty upload"}, status_code=400
-            )
-
-        if not accept_opaque:
-            if normalized_mime is None:
-                # Unreachable: rejected before the payload read; kept so the
-                # legacy branch below is well-typed.
-                return JSONResponse(
-                    {"error": "missing or invalid 'mime' / content-type"}, status_code=400
-                )
-            # Legacy fail-closed admission: the claimed mime alone decides.
-            resolved_mime = normalized_mime
-        elif normalized_mime in _ALLOWED_MIMES:
-            resolved_mime = normalized_mime
-        else:
-            # Unrendered or missing claim: adopt the sniffed rendered type when
-            # the bytes identify one (with the OLE carve-out mirroring ingest);
-            # otherwise stage as opaque under the claimed label.
-            sniffed = sniff_mime_from_bytes(payload)
-            if sniffed in _ALLOWED_MIMES and not (
-                sniffed == MSG_MIME and normalized_mime is not None
-            ):
-                resolved_mime = sniffed
-            else:
-                resolved_mime = normalized_mime or OPAQUE_MIME
-
-        if accept_opaque and attachment_category(resolved_mime) == "opaque":
-            opaque_cap = getattr(attachments_cfg, "opaque_max_bytes", None)
-            if not isinstance(opaque_cap, int) or opaque_cap <= 0:
-                opaque_cap = OPAQUE_ATTACHMENT_BYTES
-            if len(payload) > opaque_cap:
-                return JSONResponse(
-                    {
-                        "error": (
-                            f"upload exceeds {opaque_cap} byte cap for "
-                            f"{resolved_mime} (got {len(payload)})"
-                        ),
-                        "code": "TOO_LARGE",
-                    },
-                    status_code=413,
-                )
+        if not isinstance(payload, bytes):
+            return JSONResponse({"error": "empty upload"}, status_code=400)
 
         try:
-            file_uuid, expires_at = await store.put_with_expiry(
-                filename, resolved_mime, payload
-            )
+            staged = await staging.stage(AttachmentStage(filename, str(content_type), payload))
+        except AttachmentEmptyError:
+            return JSONResponse({"error": "empty upload"}, status_code=400)
+        except AttachmentOpaqueOversizeError as exc:
+            return JSONResponse({"error": str(exc), "code": "TOO_LARGE"}, status_code=413)
         except UploadOversizeError as exc:
             return JSONResponse({"error": str(exc), "code": "TOO_LARGE"}, status_code=413)
         except UploadUnsupportedMimeError as exc:
@@ -496,26 +470,22 @@ def register_upload_routes(
         except UploadStoreFullError as exc:
             # Retryable capacity condition (staged entries expire within the
             # TTL), distinct from per-file 413 and rate-limit 429.
-            return JSONResponse(
-                {"error": str(exc), "code": "UPLOAD_STORE_FULL"}, status_code=507
-            )
+            return JSONResponse({"error": str(exc), "code": "UPLOAD_STORE_FULL"}, status_code=507)
 
         return JSONResponse(
             {
-                "file_uuid": file_uuid,
-                "filename": filename,
-                "mime": resolved_mime,
-                "size": len(payload),
+                "file_uuid": staged.file_uuid,
+                "filename": staged.filename,
+                "mime": staged.mime,
+                "size": staged.size,
                 # Staged lifetime so a client can re-upload before a slow compose
                 # sends against an expired uuid (issue #468).
-                "expires_at": expires_at,
+                "expires_at": staged.expires_at,
                 "ttl_seconds": store.ttl_seconds,
             }
         )
 
-    app.router.routes.append(
-        Route("/api/v1/files/upload", upload_handler, methods=["POST"])
-    )
+    app.router.routes.append(Route("/api/v1/files/upload", upload_handler, methods=["POST"]))
 
 
 # ---------------------------------------------------------------------------

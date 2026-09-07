@@ -1,0 +1,466 @@
+import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
+import type { WorkbenchResourceProvider } from '@/modules/artifactWorkbench'
+
+interface V4RpcTransport {
+  request<T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions): Promise<T>
+  supports(method: string): boolean
+  markUnsupported(method: string): void
+}
+import type { ArtifactPayload } from '@/types/artifacts'
+import type {
+  DocumentOperationReceipt,
+  DocumentPublication,
+  DocumentSourceBinding,
+  WorkbenchResource,
+} from '@/types/workbenchResources'
+import { workbenchResourceRefId } from '@/types/workbenchResources'
+import {
+  normalizeArtifactDocument,
+  normalizeArtifactRevision,
+} from '@/workbench/artifactDocumentProvider'
+import {
+  acceptsWorkbenchResult,
+  workbenchResourceContracts,
+} from './artifactWorkbenchContracts'
+import { mapArtifactProductFailure } from './artifactErrorMapping'
+
+export const WORKBENCH_RESOURCE_RPC_METHODS = {
+  list: workbenchResourceContracts.list.method,
+  get: workbenchResourceContracts.get.method,
+  open: workbenchResourceContracts.open.method,
+  createPreview: workbenchResourceContracts.createPreview.method,
+  importDocument: workbenchResourceContracts.importDocument.method,
+  publishDocument: workbenchResourceContracts.publishDocument.method,
+  mutationResolve: workbenchResourceContracts.mutationResolve.method,
+} as const
+
+const WORKBENCH_RESOURCE_CONTRACTS_BY_METHOD = new Map(
+  Object.values(workbenchResourceContracts).map(contract => [contract.method, contract]),
+)
+
+type WorkbenchResourceRpc = {
+  hasRpcMethod?: (method: string) => boolean
+  rememberUnsupportedMethod?: (method: string) => void
+  call: (
+    method: string,
+    params?: Record<string, unknown>,
+    options?: RpcCallOptions,
+  ) => Promise<unknown>
+}
+
+import {
+  boolAt,
+  normalizeRef,
+  normalizeWorkbenchResource,
+  numberAt,
+  record,
+  serializeRef,
+  stringAt,
+  valueAt,
+} from '@/workbench/workbenchResourceProvider'
+function normalizeReceipt(value: unknown): DocumentOperationReceipt | null {
+  const raw = record(value)
+  if (!raw) return null
+  const attemptId = stringAt(raw, 'attemptId', 'attempt_id')
+  const idempotencyKey = stringAt(raw, 'idempotencyKey', 'idempotency_key')
+  const requestId = stringAt(raw, 'requestId', 'request_id') || idempotencyKey
+  const status = stringAt(raw, 'status') as DocumentOperationReceipt['status']
+  if (
+    !attemptId
+    || !requestId
+    || !idempotencyKey
+    || !['applied', 'failed', 'ambiguous'].includes(status)
+  ) {
+    return null
+  }
+  return {
+    attemptId,
+    requestId,
+    idempotencyKey,
+    status,
+    replayed: boolAt(raw, 'replayed'),
+    failureCode: stringAt(raw, 'failureCode', 'failure_code') || null,
+  }
+}
+
+function normalizeBinding(value: unknown): DocumentSourceBinding | null {
+  const raw = record(value)
+  if (!raw) return null
+  const source = normalizeRef(valueAt(raw, 'source'))
+  // V036 initially used the repository-native `id` field on the wire. Keep
+  // accepting it while preferring the explicit public DTO spelling.
+  const bindingId = stringAt(raw, 'bindingId', 'binding_id', 'id')
+  const documentId = stringAt(raw, 'documentId', 'document_id')
+  const sourceSha256 = stringAt(raw, 'sourceSha256', 'source_sha256')
+  if (!source || !bindingId || !documentId || !sourceSha256) return null
+  return { bindingId, documentId, source, sourceSha256, mode: 'copy' }
+}
+
+function isMethodNotFound(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code
+  return code === 'METHOD_NOT_FOUND'
+    || /method not found/i.test(error instanceof Error ? error.message : String(error || ''))
+}
+
+export function createRpcWorkbenchResourceProvider(
+  rpc: WorkbenchResourceRpc,
+): WorkbenchResourceProvider {
+  const supports = (method: string) => rpc.hasRpcMethod?.(method) !== false
+
+  async function call<T>(
+    method: string,
+    params: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    if (!supports(method)) throw new Error('Workbench resource API is unavailable.')
+    try {
+      const result = await rpc.call(method, params, { signal, timeoutMs: 15_000 })
+      const contract = WORKBENCH_RESOURCE_CONTRACTS_BY_METHOD.get(method)
+      if (!contract || !acceptsWorkbenchResult(contract, result)) {
+        throw new Error(`${method} returned an invalid response`)
+      }
+      return result as T
+    } catch (error) {
+      if (isMethodNotFound(error)) rpc.rememberUnsupportedMethod?.(method)
+      throw mapArtifactProductFailure(error)
+    }
+  }
+
+  return {
+    available: () => supports(WORKBENCH_RESOURCE_RPC_METHODS.list),
+    canImportDocuments: () => supports(WORKBENCH_RESOURCE_RPC_METHODS.importDocument),
+    async list(sessionKey, options = {}) {
+      if (!supports(WORKBENCH_RESOURCE_RPC_METHODS.list)) {
+        return { resources: [], totalCount: 0 }
+      }
+      const resources = new Map<string, WorkbenchResource>()
+      const visitedCursors = new Set<string>()
+      let cursor = ''
+      let totalCount = 0
+      while (true) {
+        const response = await call<Record<string, unknown>>(
+          WORKBENCH_RESOURCE_RPC_METHODS.list,
+          {
+            sessionKey,
+            ...(options.types?.length ? { types: options.types } : {}),
+            ...(options.limit ? { limit: options.limit } : {}),
+            ...(cursor ? { cursor } : {}),
+          },
+          options.signal,
+        )
+        const page = Array.isArray(response.resources)
+          ? response.resources
+              .map(normalizeWorkbenchResource)
+              .filter((item): item is WorkbenchResource => item !== null)
+          : []
+        for (const item of page) {
+          resources.set(
+            `${item.resource.type}:${workbenchResourceRefId(item.resource)}`,
+            item,
+          )
+        }
+        totalCount = Math.max(
+          totalCount,
+          numberAt(response, 'totalCount', 'total_count') ?? resources.size,
+        )
+        const hasMore = boolAt(response, 'hasMore', 'has_more')
+        const nextCursor = stringAt(response, 'nextCursor', 'next_cursor')
+        if (!hasMore) break
+        if (!nextCursor || visitedCursors.has(nextCursor)) {
+          throw new Error('Workbench resource pagination did not advance.')
+        }
+        visitedCursors.add(nextCursor)
+        cursor = nextCursor
+      }
+      return { resources: [...resources.values()], totalCount }
+    },
+    async get(sessionKey, resource, signal) {
+      if (!supports(WORKBENCH_RESOURCE_RPC_METHODS.get)) return null
+      const response = await call<Record<string, unknown>>(
+        WORKBENCH_RESOURCE_RPC_METHODS.get,
+        { sessionKey, resourceRef: serializeRef(resource) },
+        signal,
+      )
+      return normalizeWorkbenchResource(response.resource)
+    },
+    async open(sessionKey, resource, request, signal) {
+      if (!supports(WORKBENCH_RESOURCE_RPC_METHODS.open)) return null
+      let response: Record<string, unknown>
+      try {
+        response = await call<Record<string, unknown>>(
+          WORKBENCH_RESOURCE_RPC_METHODS.open,
+          {
+            sessionKey,
+            resourceRef: serializeRef(resource),
+            intent: request.intent,
+            ...(request.expectedSha256
+              ? { expectedSha256: request.expectedSha256 }
+              : {}),
+            idempotencyKey: request.idempotencyKey,
+          },
+          signal,
+        )
+      } catch (error) {
+        // Mixed-version Gateways keep the existing preview/import fallback.
+        if (isMethodNotFound(error)) return null
+        throw error
+      }
+      const resolved = normalizeWorkbenchResource(response.resource)
+      const resolution = record(response.resolution)
+      const resolutionStatus = resolution ? stringAt(resolution, 'status') : ''
+      const disposition = stringAt(response, 'disposition')
+        || (resolutionStatus === 'readonly' ? 'readonly' : 'document')
+      if (!resolved) throw new Error('The workbench open response is invalid.')
+      if (disposition === 'readonly') {
+        const reasonCode = stringAt(response, 'reasonCode', 'reason_code')
+          || resolved.capabilities.editReasonCode
+          || resolved.capabilities.reasonCode
+          || 'format_edit_not_supported'
+        return {
+          disposition,
+          resolution: { status: 'readonly' },
+          resource: {
+            ...resolved,
+            capabilities: {
+              ...resolved.capabilities,
+              manualEdit: false,
+              edit: resolved.capabilities.agentEdit,
+              editReasonCode: reasonCode,
+              reasonCode,
+            },
+          },
+          reasonCode,
+          materialized: false,
+        }
+      }
+      if (disposition !== 'document') {
+        throw new Error('The workbench open disposition is invalid.')
+      }
+      const document = normalizeArtifactDocument(response.document, undefined, sessionKey)
+      const revision = normalizeArtifactRevision(response.revision)
+      const binding = response.binding === undefined
+        ? null
+        : normalizeBinding(response.binding)
+      if (
+        !document
+        || !revision
+        || revision.documentId !== document.documentId
+        || revision.revisionId !== document.headRevisionId
+        || resolved.resource.type !== 'document'
+        || workbenchResourceRefId(resolved.resource) !== document.documentId
+        || (response.binding !== undefined && !binding)
+      ) {
+        throw new Error('The current workbench document response is invalid.')
+      }
+      return {
+        disposition,
+        resolution: {
+          status: resolutionStatus === 'materialized' ? 'materialized' : 'current',
+        },
+        resource: resolved,
+        document,
+        revision,
+        ...(binding ? { binding } : {}),
+        materialized: boolAt(response, 'materialized'),
+      }
+    },
+    async createPreview(sessionKey, resource, signal) {
+      if (!supports(WORKBENCH_RESOURCE_RPC_METHODS.createPreview)) {
+        const fallback = await this.get(sessionKey, resource, signal)
+        if (!fallback?.capabilities.preview) return null
+        return {
+          resource: fallback,
+          preview: {
+            protocolVersion: 0,
+            mode: 'isolated',
+            resource: fallback.resource,
+            launchUrl: fallback.downloadUrl,
+            sandboxProfile: 'opaque-offline',
+            network: false,
+            adapter: null,
+          },
+        }
+      }
+      let response: Record<string, unknown>
+      try {
+        response = await call<Record<string, unknown>>(
+          WORKBENCH_RESOURCE_RPC_METHODS.createPreview,
+          { sessionKey, resourceRef: serializeRef(resource), mode: 'isolated' },
+          signal,
+        )
+      } catch (error) {
+        if (!isMethodNotFound(error)) throw error
+        const fallback = await this.get(sessionKey, resource, signal)
+        if (!fallback?.capabilities.preview) return null
+        return {
+          resource: fallback,
+          preview: {
+            protocolVersion: 0,
+            mode: 'isolated',
+            resource: fallback.resource,
+            launchUrl: fallback.downloadUrl,
+            sandboxProfile: 'opaque-offline',
+            network: false,
+            adapter: null,
+          },
+        }
+      }
+      const resolved = normalizeWorkbenchResource(response.resource)
+      const preview = record(response.preview)
+      const previewResource = normalizeRef(preview?.resource)
+      if (
+        !resolved
+        || !resolved.capabilities.preview
+        || !preview
+        || !previewResource
+        || previewResource.type !== resolved.resource.type
+        || workbenchResourceRefId(previewResource)
+          !== workbenchResourceRefId(resolved.resource)
+        || stringAt(preview, 'mode') !== 'isolated'
+        || stringAt(preview, 'sandboxProfile', 'sandbox_profile') !== 'opaque-offline'
+        || valueAt(preview, 'network') !== false
+      ) {
+        throw new Error('The workbench preview descriptor is invalid.')
+      }
+      return {
+        resource: resolved,
+        preview: {
+          protocolVersion: numberAt(preview, 'protocolVersion', 'protocol_version') ?? 1,
+          mode: 'isolated',
+          resource: previewResource,
+          launchUrl: stringAt(preview, 'launchUrl', 'launch_url') || undefined,
+          sandboxProfile: 'opaque-offline',
+          network: false,
+          adapter: record(preview.adapter),
+        },
+      }
+    },
+    async importDocument(request, signal) {
+      const response = await call<Record<string, unknown>>(
+        WORKBENCH_RESOURCE_RPC_METHODS.importDocument,
+        {
+          sessionKey: request.sessionKey,
+          source: serializeRef(request.source),
+          mode: 'copy',
+          expectedSha256: request.expectedSha256,
+          clientRequestId: request.idempotencyKey,
+          idempotencyKey: request.idempotencyKey,
+          ...(request.name ? { name: request.name } : {}),
+        },
+        signal,
+      )
+      const document = normalizeArtifactDocument(response.document, undefined, request.sessionKey)
+      const revision = normalizeArtifactRevision(response.revision)
+      const binding = normalizeBinding(response.binding)
+      const receipt = normalizeReceipt(response.receipt)
+      if (!document || !revision || !binding || !receipt || receipt.status !== 'applied') {
+        throw new Error('The document import receipt is invalid.')
+      }
+      return { document, revision, binding, receipt }
+    },
+    async publishDocument(request, signal) {
+      const response = await call<Record<string, unknown>>(
+        WORKBENCH_RESOURCE_RPC_METHODS.publishDocument,
+        {
+          sessionKey: request.sessionKey,
+          documentId: request.documentId,
+          revisionId: request.revisionId,
+          clientRequestId: request.idempotencyKey,
+          idempotencyKey: request.idempotencyKey,
+          ...(request.name ? { name: request.name } : {}),
+        },
+        signal,
+      )
+      const deliverable = record(response.deliverable) as ArtifactPayload | null
+      const publicationRaw = record(response.publication)
+      const receipt = normalizeReceipt(response.receipt)
+      if (!deliverable || !publicationRaw || !receipt || receipt.status !== 'applied') {
+        throw new Error('The document publication receipt is invalid.')
+      }
+      const publication: DocumentPublication = {
+        // Accept the initial V036 repository-native aliases as well as the
+        // explicit public DTO fields so mixed desktop/gateway versions remain
+        // interoperable.
+        publicationId: stringAt(publicationRaw, 'publicationId', 'publication_id', 'id'),
+        documentId: stringAt(publicationRaw, 'documentId', 'document_id'),
+        revisionId: stringAt(publicationRaw, 'revisionId', 'revision_id'),
+        artifactId: stringAt(
+          publicationRaw,
+          'artifactId',
+          'artifact_id',
+          'deliverableId',
+          'deliverable_id',
+        ),
+        createdAt: valueAt(publicationRaw, 'createdAt', 'created_at') as (
+          number | string | null | undefined
+        ),
+      }
+      if (
+        !publication.publicationId
+        || !publication.documentId
+        || !publication.revisionId
+        || !publication.artifactId
+      ) throw new Error('The document publication is invalid.')
+      return { deliverable, publication, receipt }
+    },
+    async resolveMutation(request, signal) {
+      if (!supports(WORKBENCH_RESOURCE_RPC_METHODS.mutationResolve)) return null
+      let response: Record<string, unknown>
+      try {
+        response = await call<Record<string, unknown>>(
+          WORKBENCH_RESOURCE_RPC_METHODS.mutationResolve,
+          { ...request },
+          signal,
+        )
+      } catch (error) {
+        if (isMethodNotFound(error)) return null
+        throw error
+      }
+      const status = stringAt(response, 'status')
+      if (status !== 'applied' && status !== 'not_applied' && status !== 'pending') {
+        throw new Error('Invalid page update resolution response')
+      }
+      const rawResult = record(response.result)
+      const document = normalizeArtifactDocument(response.document, undefined, request.sessionKey)
+      const rawDocument = record(response.document)
+      const revision = normalizeArtifactRevision(rawDocument?.head)
+      const documentId = rawResult ? stringAt(rawResult, 'documentId') : ''
+      const revisionId = rawResult ? stringAt(rawResult, 'revisionId') : ''
+      const sha256 = rawResult ? stringAt(rawResult, 'sha256') : ''
+      const rawStateRevision = rawResult ? Number(rawResult.stateRevision) : NaN
+      const rawRetryAfterMs = valueAt(response, 'retryAfterMs')
+      const retryAfterMs = Number(rawRetryAfterMs)
+      return {
+        status,
+        retryAfterMs: rawRetryAfterMs !== null
+          && rawRetryAfterMs !== undefined
+          && Number.isFinite(retryAfterMs)
+          ? Math.max(0, retryAfterMs)
+          : null,
+        result: documentId
+          && revisionId
+          && /^[0-9a-f]{64}$/.test(sha256)
+          && Number.isFinite(rawStateRevision)
+          ? {
+              documentId,
+              revisionId,
+              sha256,
+              stateRevision: Math.max(1, rawStateRevision),
+            }
+          : null,
+        ...(document ? { document } : {}),
+        ...(revision ? { revision } : {}),
+      }
+    },
+  }
+}
+
+export function createV4WorkbenchResources(
+  transport: V4RpcTransport,
+): WorkbenchResourceProvider {
+  return createRpcWorkbenchResourceProvider({
+    call: (method, params, options) => transport.request(method, params, options),
+    hasRpcMethod: method => transport.supports(method),
+    rememberUnsupportedMethod: method => transport.markUnsupported(method),
+  })
+}

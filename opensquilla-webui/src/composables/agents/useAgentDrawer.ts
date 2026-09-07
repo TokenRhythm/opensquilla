@@ -1,6 +1,7 @@
 import { computed, ref, type Ref } from 'vue'
 import i18n from '@/i18n'
 import type { Agent, AgentForm } from '@/types/agents'
+import type { UpdateAgentCommand } from '@/modules/agentCatalog'
 
 export function isAgentBuiltin(agent: Agent): boolean {
   return agent.isBuiltin === true || agent.type === 'builtin'
@@ -18,15 +19,22 @@ export function agentToForm(agent: Agent): AgentForm {
   }
 }
 
-export function buildUpdatePayload(initial: AgentForm, current: AgentForm, id: string): Record<string, unknown> {
-  const p: Record<string, unknown> = { id }
-  for (const k of ['name', 'description', 'workspace', 'agentDir', 'enabled'] as const) {
-    if (initial[k] !== current[k]) p[k] = current[k]
+export function buildUpdatePayload(
+  initial: AgentForm,
+  current: AgentForm,
+  id: string,
+): UpdateAgentCommand {
+  return {
+    id,
+    ...(initial.name !== current.name ? { name: current.name } : {}),
+    ...(initial.description !== current.description ? { description: current.description } : {}),
+    ...(initial.workspace !== current.workspace ? { workspace: current.workspace } : {}),
+    ...(initial.agentDir !== current.agentDir ? { agentDir: current.agentDir } : {}),
+    ...(initial.enabled !== current.enabled ? { enabled: current.enabled } : {}),
+    ...(JSON.stringify(initial.tools || []) !== JSON.stringify(current.tools || [])
+      ? { tools: current.tools }
+      : {}),
   }
-  if (JSON.stringify(initial.tools || []) !== JSON.stringify(current.tools || [])) {
-    p.tools = current.tools
-  }
-  return p
 }
 
 function cloneForm(form: AgentForm): AgentForm {
@@ -134,7 +142,7 @@ export function useAgentDrawer(
     })
   }
 
-  function buildSavePayload(): Record<string, unknown> {
+  function buildSavePayload(): UpdateAgentCommand {
     return buildUpdatePayload(initialForm.value, form.value, drawerAgentId.value)
   }
 

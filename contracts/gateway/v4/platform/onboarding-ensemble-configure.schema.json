@@ -1,0 +1,272 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opensquilla.dev/contracts/gateway/v4/platform/onboarding-ensemble-configure.schema.json",
+  "title": "OpenSquilla onboarding.ensemble.configure Contract",
+  "description": "Generated boundary Contract for the existing v4 onboarding.ensemble.configure behavior.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "request": {
+      "$ref": "#/$defs/OnboardingEnsembleConfigureRequestFrame"
+    },
+    "response": {
+      "$ref": "#/$defs/OnboardingEnsembleConfigureResponseFrame"
+    }
+  },
+  "x-opensquilla-wire": {
+    "protocol": "opensquilla-websocket-json",
+    "version": 4,
+    "compatibility": "exact-json-tree"
+  },
+  "x-opensquilla-codegen": {
+    "python": {
+      "tool": "datamodel-code-generator",
+      "version": "0.75.1",
+      "target": "pydantic_v2.BaseModel"
+    },
+    "typescript": {
+      "tool": "json-schema-to-typescript",
+      "version": "15.0.4"
+    },
+    "runtimeValidation": {
+      "tool": "ajv",
+      "version": "8.17.1",
+      "mode": "standalone-adapter-only"
+    }
+  },
+  "x-opensquilla-method": {
+    "name": "onboarding.ensemble.configure",
+    "kind": "command",
+    "scope": "operator.admin",
+    "guestAllowed": false,
+    "idempotency": "idempotent",
+    "timeout": {
+      "policy": "transport"
+    },
+    "capability": {
+      "kind": "method-availability",
+      "name": "onboarding.ensemble.configure"
+    },
+    "request": "#/$defs/OnboardingEnsembleConfigureRequestFrame",
+    "params": "#/$defs/OnboardingEnsembleConfigureParams",
+    "response": "#/$defs/OnboardingEnsembleConfigureResponseFrame",
+    "result": "#/$defs/OnboardingEnsembleConfigureResult",
+    "errors": [
+      {
+        "code": "INVALID_REQUEST"
+      },
+      {
+        "code": "UNAUTHORIZED"
+      },
+      {
+        "code": "UNAVAILABLE",
+        "retryable": true
+      },
+      {
+        "code": "INTERNAL_ERROR"
+      }
+    ]
+  },
+  "$defs": {
+    "OnboardingEnsembleConfigureParams": {
+      "title": "onboarding.ensemble.configure params",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "selectionMode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "modelOptions": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {}
+        },
+        "candidates": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {}
+        },
+        "minSuccessfulProposers": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "proposerMaxRetries": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "allFailedPolicy": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "OnboardingEnsembleConfigureRequestFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "method"
+      ],
+      "properties": {
+        "type": {
+          "const": "req"
+        },
+        "id": {
+          "type": "string"
+        },
+        "method": {
+          "const": "onboarding.ensemble.configure"
+        },
+        "params": {
+          "$ref": "#/$defs/OnboardingEnsembleConfigureParams"
+        }
+      }
+    },
+    "OnboardingEnsembleConfigureResult": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "changed",
+        "restartRequired",
+        "configPath",
+        "entry",
+        "warnings"
+      ],
+      "properties": {
+        "changed": {
+          "type": "boolean"
+        },
+        "restartRequired": {
+          "type": "boolean"
+        },
+        "configPath": {
+          "type": "string"
+        },
+        "entry": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "RpcError": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {},
+        "retryable": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "retry_after_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "OnboardingEnsembleConfigureOkResponseFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "ok",
+        "payload"
+      ],
+      "properties": {
+        "type": {
+          "const": "res"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ok": {
+          "const": true
+        },
+        "payload": {
+          "$ref": "#/$defs/OnboardingEnsembleConfigureResult"
+        },
+        "error": {
+          "type": "null"
+        }
+      }
+    },
+    "OnboardingEnsembleConfigureErrorResponseFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "ok",
+        "error"
+      ],
+      "properties": {
+        "type": {
+          "const": "res"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ok": {
+          "const": false
+        },
+        "payload": {
+          "type": "null"
+        },
+        "error": {
+          "$ref": "#/$defs/RpcError"
+        }
+      }
+    },
+    "OnboardingEnsembleConfigureResponseFrame": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/OnboardingEnsembleConfigureOkResponseFrame"
+        },
+        {
+          "$ref": "#/$defs/OnboardingEnsembleConfigureErrorResponseFrame"
+        }
+      ]
+    }
+  }
+}

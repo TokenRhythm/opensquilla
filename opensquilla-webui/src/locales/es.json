@@ -559,7 +559,7 @@
       "builtin": "Integrado",
       "actions": { "add": "Añadir", "remove": "Quitar", "retry": "Reintentar", "copy": "Copiar", "saving": "Guardando…", "redetect": "Volver a detectar" },
       "mode": {
-        "title": "Modo de acceso predeterminado", "description": "Elige el modo inicial de las tareas nuevas. Seguro no se puede seleccionar si falla la comprobación.",
+        "title": "Modo de acceso predeterminado", "description": "Configura el modo de acceso global. Al elegir Seguro por primera vez se abre la configuración del entorno aislado; no se puede seleccionar si falla la inicialización o no es compatible.",
         "default": "Modo predeterminado", "safe": "Seguro", "full": "Acceso completo", "resetWarning": "Volver a mostrar el aviso al iniciar"
       },
       "setup": {
@@ -1638,9 +1638,6 @@
       "descReloadSuffix": "surten efecto tras actualizar la página.",
       "experimentsGroup": "Experimentos",
       "managementGroup": "Gestión",
-      "foldLabel": "Nuevo renderizado de turnos en vivo",
-      "foldDesc": "Construye la tarjeta de trabajo en streaming desde un registro ordenado de eventos. Desactívalo solo para restaurar temporalmente el renderizado compatible.",
-      "foldAria": "Nuevo renderizado de turnos en vivo (surte efecto tras recargar)",
       "revealLabel": "Ventana de revelado de la respuesta (ms)",
       "revealDesc": "Mantén el revelado de la respuesta en vivo en una ventana [mín., máx.] para que el enrutador pueda decidir primero. mín. ≤ máx.",
       "revealMinAria": "Milisegundos mínimos de revelado de la respuesta",
@@ -3346,6 +3343,7 @@
     "sendQueues": "Enviar (se pone en cola hasta después de la respuesta actual)",
     "sendSteers": "Enviar (redirige la respuesta actual ahora)",
     "sendQueuesUntilCompaction": "Enviar (se pone en cola hasta que termine la compactación)",
+    "cronSessionReadOnly": "Las sesiones de Cron son de solo lectura y no pueden recibir nuevos turnos.",
     "stopResponse": "Detener respuesta actual",
     "stopResponseEsc": "Detener respuesta actual (Esc)",
     "stoppingResponse": "Deteniendo de forma segura… Los mensajes nuevos se pondrán en cola.",

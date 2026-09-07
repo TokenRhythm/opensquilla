@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import {
   artifactFromWorkbenchItem,
   artifactWorkbenchItemId,

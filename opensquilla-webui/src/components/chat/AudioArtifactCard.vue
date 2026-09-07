@@ -56,13 +56,12 @@ import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { useInlineMediaArtifact } from '@/composables/chat/useInlineMediaArtifact'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import { artifactFileSubtitle, artifactFileTitle } from '@/utils/chat/artifacts'
 
 const props = defineProps<{
   artifact: ArtifactPayload
   sessionKey?: string
-  authToken?: string
 }>()
 
 const emit = defineEmits<{
@@ -79,7 +78,6 @@ const {
 } = useInlineMediaArtifact({
   artifact: () => props.artifact,
   sessionKey: () => props.sessionKey,
-  authToken: () => props.authToken,
   kind: 'audio',
   element: audioElement,
 })

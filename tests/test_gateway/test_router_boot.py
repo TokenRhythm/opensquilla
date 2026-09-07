@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+from dataclasses import fields
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
@@ -45,6 +46,7 @@ from opensquilla.gateway.model_routing import (
     model_routing_snapshot,
 )
 from opensquilla.gateway.routing import (
+    RouteEnvelope,
     build_channel_route_envelope,
     build_cli_route_envelope,
     build_cron_route_envelope,
@@ -63,9 +65,16 @@ from opensquilla.scheduler.types import CronJob, JobStatus
 from opensquilla.session.compaction import CompactionConfig
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import SessionIntent
-from opensquilla.session.storage import SessionStorage
+from opensquilla.session.storage import SessionStorage, StaleEpochError
 from opensquilla.tools.registry import ToolRegistry
 from opensquilla.tools.types import CallerKind, ToolContext, ToolSpec
+
+
+def test_route_envelope_session_epoch_is_append_only_for_positional_callers() -> None:
+    assert [field.name for field in fields(RouteEnvelope)][-2:] == [
+        "runtime_services",
+        "session_epoch",
+    ]
 
 
 def test_gateway_boot_bridges_compaction_notifications_to_session_stream() -> None:
@@ -494,6 +503,7 @@ def test_start_gateway_server_starts_telemetry_after_listener_and_runtime_are_re
 
     async def fake_build_services(**kwargs: Any) -> Any:
         call_order.append("build_services")
+        assert kwargs["defer_sandbox_startup"] is True
         config = kwargs["config"]
 
         async def close() -> None:
@@ -546,6 +556,16 @@ def test_start_gateway_server_starts_telemetry_after_listener_and_runtime_are_re
 
         return complete()
 
+    def fake_sandbox_startup(config: GatewayConfig) -> Any:
+        assert app_holder["app"].state.gateway_ready is True
+        assert "listener" in call_order
+        call_order.append("sandbox_startup")
+
+        async def complete() -> None:
+            return None
+
+        return complete()
+
     real_create_gateway_app = boot.create_gateway_app
 
     def capture_gateway_app(*args: Any, **kwargs: Any) -> Any:
@@ -561,6 +581,7 @@ def test_start_gateway_server_starts_telemetry_after_listener_and_runtime_are_re
     monkeypatch.setattr(boot.uvicorn, "Server", FakeUvicornServer)
     monkeypatch.setattr(boot, "_desktop_router_preload_enabled", lambda: False)
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
+    monkeypatch.setattr(boot, "_ensure_sandbox_setup_on_boot", fake_sandbox_startup)
     monkeypatch.setattr(
         "opensquilla.observability.install_telemetry.start_background_install_telemetry",
         fake_start_background_install_telemetry,
@@ -605,6 +626,7 @@ def test_start_gateway_server_starts_telemetry_after_listener_and_runtime_are_re
                 "listener_callback",
                 "listener",
                 "gateway_ready",
+                "sandbox_startup",
                 "install_telemetry",
                 "daily_usage",
             ]
@@ -650,6 +672,88 @@ def test_build_task_runtime_run_kwargs_forwards_task_id_as_root_turn() -> None:
     kwargs = build_task_runtime_run_kwargs(run, tool_context=object(), model="model")
 
     assert kwargs["root_turn_id"] == "task-turn-123"
+
+
+def test_build_task_runtime_run_kwargs_forwards_exact_session_owner() -> None:
+    run = SimpleNamespace(
+        task_id="task-turn-123",
+        agent_id="main",
+        attachments=[],
+        input_provenance=None,
+        run_kind="session_turn",
+        no_memory_capture=False,
+        fresh_user_session=False,
+        ingress_pipeline_steps=(),
+        semantic_message=None,
+        session_id="session-123",
+        session_epoch=0,
+    )
+
+    kwargs = build_task_runtime_run_kwargs(run, tool_context=object(), model="model")
+
+    assert kwargs["expected_session_id"] == "session-123"
+    assert kwargs["expected_session_epoch"] == 0
+
+
+def test_build_task_runtime_run_kwargs_omits_legacy_session_owner() -> None:
+    run = SimpleNamespace(
+        task_id="task-turn-legacy",
+        agent_id="main",
+        attachments=[],
+        input_provenance=None,
+        run_kind="session_turn",
+        no_memory_capture=False,
+        fresh_user_session=False,
+        ingress_pipeline_steps=(),
+        semantic_message=None,
+    )
+
+    kwargs = build_task_runtime_run_kwargs(run, tool_context=object(), model="model")
+
+    assert "expected_session_id" not in kwargs
+    assert "expected_session_epoch" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_task_runtime_rejects_stale_internal_owner_before_provider_dispatch() -> None:
+    class Storage:
+        async def get_session(self, _session_key: str) -> Any:
+            return SimpleNamespace(session_id="replacement-session", epoch=8)
+
+    class RecordingTurnRunner:
+        def __init__(self) -> None:
+            self.called = False
+
+        async def run(self, *_args: Any, **_kwargs: Any):
+            self.called = True
+            yield DoneEvent()
+
+    envelope = build_cron_route_envelope(
+        SimpleNamespace(id="owner-race", name="owner race"),
+        session_key="cron:owner-race",
+        session_id="admitted-session",
+        session_epoch=7,
+    )
+    run = SimpleNamespace(
+        agent_id="main",
+        task_id="task-owner-race",
+        session_key=envelope.session_key,
+        session_id=envelope.session_id,
+        session_epoch=envelope.session_epoch,
+        envelope=envelope,
+    )
+    runner = RecordingTurnRunner()
+
+    with pytest.raises(StaleEpochError, match="changed before provider dispatch"):
+        await dispatch_task_runtime_turn(
+            run,
+            config=GatewayConfig(),
+            session_manager=SimpleNamespace(_storage=Storage()),
+            turn_runner=runner,
+            event_emitter=lambda *_args, **_kwargs: None,
+        )
+
+    assert runner.called is False
 
 
 def test_build_task_runtime_run_kwargs_forwards_provider_correlation() -> None:
@@ -1006,7 +1110,7 @@ def test_gateway_home_falls_back_to_config_path_parent(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_boot_sandbox_setup_prewarms_an_existing_ready_setup(
+async def test_boot_sandbox_setup_initializes_without_capability_probes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from opensquilla.gateway import boot
@@ -1039,7 +1143,7 @@ async def test_boot_sandbox_setup_prewarms_an_existing_ready_setup(
         return object()
 
     monkeypatch.setattr(
-        "opensquilla.sandbox.setup_runtime.current_sandbox_setup_runtime_status",
+        "opensquilla.sandbox.setup_runtime.initialize_sandbox_runtime",
         fake_status,
     )
     monkeypatch.setattr(
@@ -1051,39 +1155,11 @@ async def test_boot_sandbox_setup_prewarms_an_existing_ready_setup(
 
     assert result is not None
     assert result.state is SandboxSetupState.READY
-    assert calls == ["status", "capability"]
+    assert calls == ["status"]
 
 
 @pytest.mark.asyncio
-async def test_boot_sandbox_setup_can_be_disabled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from opensquilla.gateway import boot
-
-    async def fail_if_called(config: GatewayConfig) -> object:
-        raise AssertionError("sandbox.auto_setup=false must not inspect setup")
-
-    monkeypatch.setattr(
-        "opensquilla.sandbox.setup_runtime.current_sandbox_setup_runtime_status",
-        fail_if_called,
-    )
-
-    result = await boot._ensure_sandbox_setup_on_boot(
-        GatewayConfig(
-            sandbox={
-                "auto_setup": False,
-                "run_mode": "trusted",
-                "sandbox": True,
-                "security_grading": True,
-            },
-        )
-    )
-
-    assert result is None
-
-
-@pytest.mark.asyncio
-async def test_boot_sandbox_setup_defers_incomplete_setup_for_full_host_access(
+async def test_boot_sandbox_failure_keeps_gateway_available(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from opensquilla.gateway import boot
@@ -1102,7 +1178,7 @@ async def test_boot_sandbox_setup_defers_incomplete_setup_for_full_host_access(
         calls.append("status")
         assert setup_config is config
         return SetupResult(
-            state=SandboxSetupState.NOT_SETUP,
+            state=SandboxSetupState.FAILED,
             platform="auto",
             message="Sandbox setup requires administrator approval.",
             requires_admin=True,
@@ -1114,7 +1190,7 @@ async def test_boot_sandbox_setup_defers_incomplete_setup_for_full_host_access(
         return object()
 
     monkeypatch.setattr(
-        "opensquilla.sandbox.setup_runtime.current_sandbox_setup_runtime_status",
+        "opensquilla.sandbox.setup_runtime.initialize_sandbox_runtime",
         fake_status,
     )
     monkeypatch.setattr(
@@ -1125,12 +1201,12 @@ async def test_boot_sandbox_setup_defers_incomplete_setup_for_full_host_access(
     result = await boot._ensure_sandbox_setup_on_boot(config)
 
     assert result is not None
-    assert result.state is SandboxSetupState.NOT_SETUP
+    assert result.state is SandboxSetupState.FAILED
     assert calls == ["status"]
 
 
 @pytest.mark.asyncio
-async def test_build_services_schedules_sandbox_setup_after_runtime(
+async def test_build_services_defers_sandbox_startup_until_gateway_ready(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1144,6 +1220,7 @@ async def test_build_services_schedules_sandbox_setup_after_runtime(
         events.append("setup")
 
     def fake_configure_runtime(*args: Any, **kwargs: Any) -> Any:
+        assert kwargs["defer_backend"] is True
         events.append("runtime")
         return SimpleNamespace(effective=SimpleNamespace(as_dict=lambda: {}))
 
@@ -1181,14 +1258,73 @@ async def test_build_services_schedules_sandbox_setup_after_runtime(
         config=config,
         session_db_path=str(tmp_path / "sessions.sqlite"),
         seed_agent_workspaces=False,
+        defer_sandbox_startup=True,
     )
     try:
         assert events == ["runtime"]
-        assert len(scheduled) == 1
-        assert services.sandbox_setup_task is background_task
+        assert scheduled == []
+        assert services.sandbox_setup_task is None
     finally:
         await services.close()
     assert events == ["runtime", "runtime_reset"]
+
+
+@pytest.mark.asyncio
+async def test_embedded_gateway_defers_sandbox_until_inprocess_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.gateway import boot
+    from opensquilla.sandbox.setup_state import SandboxSetupState, SetupResult
+
+    initialized = asyncio.Event()
+
+    def unexpected_backend_selection(_settings: SandboxSettings, **_kwargs: Any) -> Any:
+        raise AssertionError("embedded gateway startup must defer sandbox selection")
+
+    async def fake_initialize(config: GatewayConfig) -> SetupResult:
+        assert config.state_dir == str(tmp_path / "state")
+        initialized.set()
+        return SetupResult(
+            state=SandboxSetupState.READY,
+            platform="test",
+            message="Sandbox initialized.",
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.sandbox.integration.select_backend",
+        unexpected_backend_selection,
+    )
+    monkeypatch.setattr(
+        "opensquilla.sandbox.setup_runtime.initialize_sandbox_runtime",
+        fake_initialize,
+    )
+    monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
+    monkeypatch.setattr(
+        "opensquilla.gateway.pidlock.GatewayPidLock.acquire",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.pidlock.GatewayPidLock.release",
+        lambda self: None,
+    )
+
+    config = GatewayConfig(
+        state_dir=str(tmp_path / "state"),
+        workspace_dir=str(tmp_path / "workspace"),
+        control_ui={"enabled": False},
+        channels={"channels": []},
+        mcp={"enabled": False},
+        memory={"flush_enabled": False},
+    )
+
+    server = await boot.start_gateway_server(config=config, run=False)
+    try:
+        await asyncio.wait_for(initialized.wait(), timeout=1.0)
+        assert server.app.state.gateway_ready is True
+        assert server._services.sandbox_setup_task is not None
+    finally:
+        await server.close()
 
 
 @pytest.mark.asyncio
@@ -1264,7 +1400,6 @@ async def test_bare_full_default_boots_full_capability(
         channels={"channels": []},
         mcp={"enabled": False},
         memory={"flush_enabled": False},
-        sandbox={"auto_setup": False},
     )
 
     services = await boot.build_services(
@@ -2414,7 +2549,6 @@ async def test_build_services_registers_session_search_tool(
         channels={"channels": []},
         mcp={"enabled": False},
         memory={"flush_enabled": False},
-        sandbox={"auto_setup": False},
     )
 
     services = await build_services(
@@ -2508,7 +2642,6 @@ async def test_build_services_fails_fast_for_explicit_remote_memory_without_key(
         state_dir=str(tmp_path / "state"),
         workspace_dir=str(tmp_path / "workspace"),
         memory={"embedding": {"provider": "openai"}},
-        sandbox={"auto_setup": False},
     )
 
     with pytest.raises(ValueError, match="memory.embedding.remote.api_key"):

@@ -102,31 +102,3 @@ export interface MetaSetupState {
     | 'session_changed'
     | 'launch_failed'
 }
-
-export interface MetaSetupInstallResponse {
-  ok?: boolean
-  job?: MetaSetupJob
-  already_ready?: boolean
-  readiness?: MetaSetupReadiness
-  error?: string
-}
-
-export interface MetaSetupStatusResponse {
-  ok?: boolean
-  job?: MetaSetupJob
-  error?: string
-}
-
-export interface MetaSetupRunResponse {
-  ok?: boolean
-  setup_required?: boolean
-  readiness?: MetaSetupReadiness
-  error?: string
-}
-
-export interface MetaSetupPlanResponse {
-  ok?: boolean
-  name?: string
-  readiness?: MetaSetupReadiness
-  error?: string
-}

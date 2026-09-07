@@ -6,6 +6,7 @@ import {
   useChatGoals,
   type GoalContinuityStorage,
 } from './useChatGoals'
+import { GoalCenterError } from '@/modules/goalCenter'
 import type { GoalEvent, GoalReattachInput } from '@/modules/goalContinuity'
 
 const SESSION_KEY = 'agent:main:webchat:test'
@@ -137,6 +138,10 @@ function harness(continuityStorage?: GoalContinuityStorage) {
     }),
     status: async (sessionKey: string) => ({ sessionKey, sessionId: SESSION_ID, epoch: 1, goal: goalPayload() }),
     set: async (input: { sessionKey: string; objective: string; clientRequestId: string; clientMessageId: string }) => rpc.call('goals.set', input),
+    edit: async (input: any) => rpc.call('goals.edit', input),
+    pause: async (input: any) => rpc.call('goals.pause', input),
+    resume: async (input: any) => rpc.call('goals.resume', input),
+    clear: async (input: any) => rpc.call('goals.clear', input),
   }
   const goalContinuity = {
     reattach: vi.fn((input: GoalReattachInput) => rpc.call('goals.reattach', input)),
@@ -154,7 +159,6 @@ function harness(continuityStorage?: GoalContinuityStorage) {
   const ensureSessionKey = vi.fn(async () => sessionKey.value)
   const ensureSubscribed = vi.fn(async () => true)
   const api = useChatGoals({
-    rpc,
     goalCenter,
     goalContinuity,
     sessionKey,
@@ -1006,9 +1010,10 @@ describe('useChatGoals', () => {
         executionState: 'working',
       }),
     })
-    const error = Object.assign(
-      new Error('The Goal still owns an unsettled task'),
-      { code: 'GOAL_BUSY' },
+    const error = new GoalCenterError(
+      'conflict',
+      'The Goal still owns an unsettled task',
+      { reason: 'busy', retryable: true },
     )
     rpc.call.mockRejectedValueOnce(error)
 

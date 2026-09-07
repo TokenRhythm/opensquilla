@@ -10,7 +10,7 @@ import type {
   PendingInputWal,
   ResponseHandoffWalRecord,
 } from '@/utils/chat/pendingInputWal'
-import type { UseChatSendOptions } from './useChatSend'
+import type { UseChatSendOptions as DomainUseChatSendOptions } from './useChatSend'
 import { useChatSend } from './useChatSend'
 import { createV4TurnCommandsFromRpcClient } from '@/adapters/gateway/turnCommandsV4'
 
@@ -29,6 +29,10 @@ function snapshot(annotationId: string, sentOrder: number): PromptAnnotationSnap
     sourceExcerpt: null,
     sentOrder,
   }
+}
+
+interface UseChatSendOptions extends DomainUseChatSendOptions {
+  rpc: { call: any }
 }
 
 function createHarness(overrides: Partial<UseChatSendOptions> = {}) {
@@ -59,12 +63,11 @@ function createHarness(overrides: Partial<UseChatSendOptions> = {}) {
     showThinkingIndicator: vi.fn(),
     hideThinkingIndicator: vi.fn(),
     appendFrame: vi.fn(),
-    useReducer: ref(false),
   }
   const options: UseChatSendOptions = {
     rpc,
     turnCommands: createV4TurnCommandsFromRpcClient(
-      rpc as unknown as UseChatSendOptions['rpc'],
+      rpc as Parameters<typeof createV4TurnCommandsFromRpcClient>[0],
     ),
     inputText: ref(''),
     messages: ref<ChatMessage[]>([]),
@@ -118,10 +121,7 @@ function createHarness(overrides: Partial<UseChatSendOptions> = {}) {
     ...overrides,
   }
   if (!overrides.turnCommands) {
-    options.turnCommands = createV4TurnCommandsFromRpcClient(
-      options.rpc,
-      options.supportsMethod,
-    )
+    options.turnCommands = createV4TurnCommandsFromRpcClient(options.rpc)
   }
   return { api: useChatSend(options), options, rpc }
 }

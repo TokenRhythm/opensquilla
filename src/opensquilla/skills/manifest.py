@@ -658,8 +658,8 @@ def compile_skill_manifest(
     policy_tags = _string_list(frontmatter.get("policy_tags", []))
 
     file_path = os.path.abspath(skill_file)
-    default_visibility = "meta" if kind == "meta" else "public"
-    default_invocation = "meta_only" if kind == "meta" else "direct"
+    default_visibility = "meta" if kind in {"meta", "meta_sop"} else "public"
+    default_invocation = "meta_only" if kind in {"meta", "meta_sop"} else "direct"
     spec = SkillSpec(
         name=name,
         description=description,

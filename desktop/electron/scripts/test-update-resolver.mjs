@@ -4,7 +4,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { parseOpenSquillaReleaseTag } from '../dist/update-feed-resolver.js'
+import { GITHUB_UPDATE_OWNER, parseOpenSquillaReleaseTag } from '../dist/update-feed-resolver.js'
 import {
   candidateFromUpdateChannel,
   orderedUpdateSources,
@@ -13,6 +13,7 @@ import {
   updateChannelPathForVersion,
   updateFeedBaseUrl,
   validateUpdateChannelManifest,
+  UPDATE_GITHUB_RELEASES_API_URL,
 } from '../dist/update-channel.js'
 import {
   parseSha256SumsForAsset,
@@ -58,6 +59,43 @@ assert.equal(updateChannelPathForVersion('0.5.0-rc4'), 'preview/0.5.0.json')
 assert.equal(updateChannelPathForVersion('0.5.0'), 'stable.json')
 assert.equal(updateChannelPathForVersion('not-a-version'), null)
 
+// Existing v1 mirrors retain the old URL; new clients display and download from
+// the current repository while continuing to accept either exact spelling.
+assert.equal(GITHUB_UPDATE_OWNER, 'TokenRhythm')
+assert.equal(
+  UPDATE_GITHUB_RELEASES_API_URL,
+  'https://api.github.com/repos/TokenRhythm/opensquilla/releases?per_page=100',
+)
+for (const owner of ['opensquilla', 'TokenRhythm']) {
+  const manifest = channelManifest('v0.5.5', '0.5.5', false)
+  manifest.releaseUrl = `https://github.com/${owner}/opensquilla/releases/tag/v0.5.5`
+  for (const platform of ['darwin-arm64', 'win32-x64']) {
+    for (const currentVersion of ['0.5.3', '0.5.4']) {
+      const candidate = candidateFromUpdateChannel(currentVersion, manifest, platform)
+      assert.equal(candidate?.version, '0.5.5')
+      assert.equal(candidate?.releaseUrl, 'https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.5')
+      assert.equal(updateFeedBaseUrl(candidate, 'github'), 'https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.5')
+      assert.equal(updateFeedBaseUrl(candidate, 'oss'), 'https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/v0.5.5')
+    }
+  }
+  const preview = channelManifest('v0.5.5rc1', '0.5.5-rc1')
+  preview.releaseUrl = `https://github.com/${owner}/opensquilla/releases/tag/v0.5.5rc1`
+  assert.equal(candidateFromUpdateChannel('0.5.4', preview, 'darwin-arm64'), null)
+}
+for (const releaseUrl of [
+  'https://github.com/TokenRhythm/another-repo/releases/tag/v0.5.5',
+  'https://github.com/another-owner/opensquilla/releases/tag/v0.5.5',
+  'https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.4',
+  'https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.5?download=1',
+  'https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.5/extra',
+  'https://github.com.example.test/TokenRhythm/opensquilla/releases/tag/v0.5.5',
+]) {
+  assert.throws(
+    () => validateUpdateChannelManifest({ ...channelManifest('v0.5.5', '0.5.5', false), releaseUrl }),
+    /canonical/,
+  )
+}
+
 {
   const manifest = channelManifest('v0.5.0rc5', '0.5.0-rc5')
   assert.equal(validateUpdateChannelManifest(manifest).tag, 'v0.5.0rc5')
@@ -70,7 +108,7 @@ assert.equal(updateChannelPathForVersion('not-a-version'), null)
   )
   assert.equal(
     updateAssetUrl(mac, 'github'),
-    'https://github.com/opensquilla/opensquilla/releases/download/v0.5.0rc5/OpenSquilla-0.5.0-rc5-mac-arm64.dmg',
+    'https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.0rc5/OpenSquilla-0.5.0-rc5-mac-arm64.dmg',
   )
   const win = candidateFromUpdateChannel('0.5.0-rc4', manifest, 'win32-x64')
   assert.equal(win?.installer, 'OpenSquilla-0.5.0-rc5-win-x64.exe')
@@ -261,7 +299,7 @@ const inventoryRelease = (tag, version, overrides = {}) => ({
   assert.equal(candidate?.installer, 'OpenSquilla-0.5.1-win-x64.exe')
   assert.equal(
     updateAssetUrl(candidate, 'github'),
-    'https://github.com/opensquilla/opensquilla/releases/download/v0.5.1/OpenSquilla-0.5.1-win-x64.exe',
+    'https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.1/OpenSquilla-0.5.1-win-x64.exe',
   )
 }
 

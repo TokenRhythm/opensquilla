@@ -97,7 +97,7 @@ Before enabling Windows signing, maintainers must verify:
 
 ## Roles And Approval
 
-Repository: <https://github.com/opensquilla/opensquilla>
+Repository: <https://github.com/TokenRhythm/opensquilla>
 
 Initial committers and reviewers:
 

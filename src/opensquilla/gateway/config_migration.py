@@ -271,6 +271,20 @@ def _handle_deprecated_skill_filter_fields(
     logging.getLogger(__name__).warning(message)
 
 
+def strip_deprecated_skill_filter_settings(data: dict[str, object]) -> dict[str, object]:
+    """Discard only retired filter keys before nested settings validation."""
+
+    removed = {
+        f"skills.{key}": value
+        for key, value in data.items()
+        if key in DEPRECATED_SKILL_FILTER_LEAVES
+    }
+    if not removed:
+        return data
+    _handle_deprecated_skill_filter_fields(removed, "settings_validation")
+    return {key: value for key, value in data.items() if key not in DEPRECATED_SKILL_FILTER_LEAVES}
+
+
 def handle_deprecated_skill_filter_env() -> None:
     """Ignore and warn for legacy filter environment variables.
 
@@ -379,6 +393,7 @@ def migrate_config_payload(
     """
     builder = _MigrationBuilder(payload=copy.deepcopy(data))
 
+    _strip_removed_sandbox_fields(builder)
     _normalize_memory_fields(builder, emit_diagnostics=emit_diagnostics)
     _normalize_agent_token_saving_fields(
         builder,
@@ -416,6 +431,16 @@ def _payload_config_version(payload: dict[str, Any]) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         return 0
     return int(value)
+
+
+def _strip_removed_sandbox_fields(builder: _MigrationBuilder) -> None:
+    """Always-run: strip sandbox fields removed from the strict settings model."""
+    sandbox = builder.payload.get("sandbox")
+    if not isinstance(sandbox, dict):
+        return
+    if "auto_setup" in sandbox:
+        sandbox.pop("auto_setup")
+        builder.removed_fields.append("sandbox.auto_setup")
 
 
 def _normalize_memory_fields(

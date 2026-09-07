@@ -13,9 +13,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/opensquilla/opensquilla/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/opensquilla/opensquilla/ci.yml?style=for-the-badge" alt="CI"></a>
+  <a href="https://github.com/TokenRhythm/opensquilla/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/TokenRhythm/opensquilla/ci.yml?style=for-the-badge" alt="CI"></a>
   <a href="https://opensquilla.ai/"><img src="https://img.shields.io/badge/website-opensquilla.ai-blue?style=for-the-badge" alt="Website"></a>
-  <a href="https://github.com/opensquilla/opensquilla/releases"><img src="https://img.shields.io/github/v/release/opensquilla/opensquilla?include_prereleases&style=for-the-badge" alt="GitHub release"></a>
+  <a href="https://github.com/TokenRhythm/opensquilla/releases"><img src="https://img.shields.io/github/v/release/TokenRhythm/opensquilla?include_prereleases&style=for-the-badge" alt="GitHub release"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.12%2B-blue?style=for-the-badge" alt="Python 3.12+"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue?style=for-the-badge" alt="Apache 2.0 License"></a>
 </p>
@@ -136,8 +136,8 @@ Installationslinks: [Git](https://git-scm.com/downloads) ·
 Die 0.5.4-Desktop-Installationsprogramme bündeln die Vue-Steuerkonsole
 und die Gateway-Runtime in einer Electron-Hülle.
 
-- macOS Apple Silicon: <https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-mac-arm64.dmg>
-- Windows x64: <https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-win-x64.exe>
+- macOS Apple Silicon: <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-mac-arm64.dmg>
+- Windows x64: <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-win-x64.exe>
 
 Für schnellere Downloads in Festlandchina verwende die direkten OSS-Download-Aliasse:
 - macOS Apple Silicon: <https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/latest/OpenSquilla-mac-arm64.dmg>
@@ -187,7 +187,7 @@ $env:Path = "$env:USERPROFILE\.local\bin;" + $env:Path
 **2. OpenSquilla installieren** — derselbe Befehl auf jeder Plattform.
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
 ```
 
 Damit wird das OpenSquilla-Wheel von der Release-URL installiert;
@@ -215,7 +215,7 @@ opensquilla gateway run
 
 Für eine vollständig festgelegte Installation verwende die
 versionsbehaftete Wheel-URL:
-`https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl`.
+`https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl`.
 
 <a id="install-from-source"></a>
 
@@ -232,7 +232,7 @@ führe nicht `uv run` aus. Wähle stattdessen
 
    ```sh
    git lfs install
-   git clone https://github.com/opensquilla/opensquilla.git
+   git clone https://github.com/TokenRhythm/opensquilla.git
    cd opensquilla
    git lfs pull --include="src/opensquilla/squilla_router/models/**"
    ```
@@ -638,13 +638,13 @@ konfiguriere Token-Authentifizierung, bevor du an `0.0.0.0` bindest.
 **Docker**
 
 Vorgebaute Multi-Arch-Images (`amd64`/`arm64`) werden mit jedem
-Release-Tag auf `ghcr.io/opensquilla/opensquilla` veröffentlicht —
+Release-Tag auf `ghcr.io/tokenrhythm/opensquilla` veröffentlicht —
 [`docs/docker.md`](docs/docker.md) ist der vollständige
 Container-Leitfaden (Heimserver und NAS, LAN-Zugriff mit
 Token-Authentifizierung, Upgrades):
 
 ```sh
-OPENSQUILLA_GATEWAY_IMAGE=ghcr.io/opensquilla/opensquilla:latest docker compose up -d
+OPENSQUILLA_GATEWAY_IMAGE=ghcr.io/tokenrhythm/opensquilla:latest docker compose up -d
 ```
 
 Ohne `OPENSQUILLA_GATEWAY_IMAGE` führt der Compose-Weg ein
@@ -778,8 +778,8 @@ wiedergespielte Arbeit.
 Dank an alle, die zu OpenSquilla beitragen.
 
 <p align="center">
-  <a href="https://github.com/opensquilla/opensquilla/graphs/contributors">
-    <img src="https://contrib.rocks/image?repo=opensquilla/opensquilla&max=100&columns=10" alt="OpenSquilla contributors" />
+  <a href="https://github.com/TokenRhythm/opensquilla/graphs/contributors">
+    <img src="https://contrib.rocks/image?repo=TokenRhythm/opensquilla&max=100&columns=10" alt="OpenSquilla contributors" />
   </a>
 </p>
 
@@ -791,7 +791,7 @@ Beiträge jeder Art sind willkommen — Fehlerberichte, Funktionsideen,
 Dokumentation, neue Provider- oder Kanal-Adapter, Skills und Arbeit an
 der Kern-Runtime. Siehe [`CONTRIBUTING.md`](CONTRIBUTING.md) und
 eröffne dann ein Issue oder einen Pull Request auf
-[GitHub](https://github.com/opensquilla/opensquilla).
+[GitHub](https://github.com/TokenRhythm/opensquilla).
 
 [Verhaltenskodex](CODE_OF_CONDUCT.md) · [Sicherheit](SECURITY.md) ·
 [Support](SUPPORT.md) · [Lizenz](LICENSE) (Apache-2.0)

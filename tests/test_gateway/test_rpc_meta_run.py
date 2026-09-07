@@ -753,6 +753,61 @@ def test_meta_run_pending_capacity_is_retryable_and_not_accepted(
     assert raised.value.accepted is False
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_code"),
+    (
+        ("stage-capacity", "META_DRAFT_OUTBOX_FULL"),
+        ("promotion-unavailable", "META_DRAFT_UNAVAILABLE"),
+    ),
+)
+async def test_meta_run_contract_declares_durable_draft_failure_codes(
+    tmp_path: Path,
+    failure_kind: str,
+    expected_code: str,
+) -> None:
+    from opensquilla.session.storage import (
+        MetaLaunchDraftCapacityError,
+        MetaLaunchDraftUnavailableError,
+    )
+
+    async def is_discarded(**_kwargs: Any) -> bool:
+        return False
+
+    async def stage(**_kwargs: Any) -> tuple[object, str]:
+        if failure_kind == "stage-capacity":
+            raise MetaLaunchDraftCapacityError("MetaSkill draft outbox is full")
+        return object(), "created"
+
+    async def promote(**_kwargs: Any) -> tuple[object, str]:
+        raise MetaLaunchDraftUnavailableError("MetaSkill draft expired")
+
+    storage = SimpleNamespace(
+        is_meta_launch_discarded=is_discarded,
+        stage_meta_launch_draft=stage,
+        promote_meta_launch_draft=promote,
+    )
+    ctx = RpcContext(
+        conn_id="meta-contract-errors",
+        config=_enabled_cfg(),
+        skill_loader=_make_loader_with_meta(tmp_path),
+        session_manager=SimpleNamespace(storage=storage),
+    )
+
+    with pytest.raises(RpcHandlerError) as raised:
+        await _handle_meta_run(
+            {
+                "name": "meta-tiny",
+                "sessionKey": "agent:main:webchat:meta-contract-errors",
+                "clientRequestId": f"request-{failure_kind}",
+                "launchText": "/meta meta-tiny -- synthetic request",
+            },
+            ctx,
+        )
+
+    assert raised.value.code == expected_code
+
+
 def test_meta_run_accepts_key_alias(tmp_path: Path) -> None:
     _drain("sess-run-alias")
     loader = _make_loader_with_meta(tmp_path)

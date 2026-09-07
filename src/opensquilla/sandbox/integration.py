@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 from urllib.parse import urlparse
 
+from opensquilla.asyncio_utils import reset_contextvar_token
 from opensquilla.sandbox.backend import Backend, NoopBackend, UnavailableBackend, select_backend
 from opensquilla.sandbox.capability_profile import capability_profile_for_command
 from opensquilla.sandbox.config import EffectiveMode, SandboxSettings
@@ -160,7 +161,7 @@ def sandbox_policy_scope(policy: StoredSandboxPolicy):
     try:
         yield
     finally:
-        _ACTIVE_SANDBOX_POLICY.reset(token)
+        reset_contextvar_token(_ACTIVE_SANDBOX_POLICY, token)
 
 
 # ─── Approval queue / context protocols ──────────────────────────────────
@@ -221,6 +222,7 @@ def configure_runtime(
     stale_cache: StaleOutputCache | None = None,
     workspace: Path | None = None,
     default_run_mode: RunMode | str | None = None,
+    defer_backend: bool = False,
 ) -> SandboxRuntime:
     """Build the process-wide :class:`SandboxRuntime`.
 
@@ -244,6 +246,11 @@ def configure_runtime(
     backend: Backend
     if not effective.sandbox_enabled:
         backend = NoopBackend()
+    elif defer_backend:
+        from opensquilla.sandbox.setup_runtime import mark_sandbox_startup_pending
+
+        backend = UnavailableBackend("Sandbox initialization has not completed.")
+        mark_sandbox_startup_pending()
     else:
         try:
             backend = select_backend(settings)
@@ -305,6 +312,26 @@ def get_runtime() -> SandboxRuntime | None:
     than relying on the ``None`` branch.
     """
     return _runtime
+
+
+async def initialize_runtime_backend() -> Backend:
+    """Initialize without blocking the event loop or publishing after teardown."""
+    runtime = _runtime
+    if runtime is None:
+        raise SandboxBackendError("Sandbox runtime is not configured.")
+    if not runtime.effective.sandbox_enabled:
+        raise SandboxBackendError("Sandbox execution is disabled.")
+    if not isinstance(runtime.backend, UnavailableBackend):
+        return runtime.backend
+
+    backend = await asyncio.to_thread(select_backend, runtime.settings, verify_runtime=False)
+    if _runtime is not runtime:
+        raise SandboxBackendError("Sandbox runtime was replaced during initialization.")
+    if isinstance(backend, (NoopBackend, UnavailableBackend)):
+        raise SandboxBackendError("No real sandbox backend became available.")
+    runtime.backend = backend
+    log.info("sandbox.runtime_backend_initialized: backend=%s", backend.name)
+    return backend
 
 
 def refresh_runtime_backend_after_setup() -> Backend | None:
@@ -2313,6 +2340,7 @@ __all__ = [
     "gate_action",
     "get_runtime",
     "guard_in_process_network_action",
+    "initialize_runtime_backend",
     "managed_network_httpx_kwargs",
     "ManagedNetworkSubprocess",
     "preflight_subprocess_managed_network",

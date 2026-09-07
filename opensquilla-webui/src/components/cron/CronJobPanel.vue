@@ -179,7 +179,7 @@ import Icon from '@/components/Icon.vue'
 import ControlSwitch from '@/components/ControlSwitch.vue'
 import CronSelect, { type CronSelectOption } from '@/components/cron/CronSelect.vue'
 import type { CronJob, CronJobFormModel } from '@/types/cron'
-import type { ProjectWorkspaceItem } from '@/types/rpc'
+import type { WorkspaceItem as ProjectWorkspaceItem } from '@/modules/workspaceCatalog'
 import {
   atScheduleValueFromLocalInput,
   localDateTimeInputValue,
