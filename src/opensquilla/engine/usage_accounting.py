@@ -117,6 +117,7 @@ class UsageExecutionContext:
     session_epoch: int = 0
     agent_id: str = ""
     run_kind: str = "agent"
+    router_control_replay_depth: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,9 +213,11 @@ class UsageAccountingScope:
     def new_call(self, *, provider: str, model: str) -> UsageCallStart:
         self.call_index += 1
         context = self.context
+        # Include router_control_replay_depth in the event_id to avoid collision during replay
+        replay_depth = getattr(context, "router_control_replay_depth", 0)
         event_id = uuid.uuid5(
             uuid.NAMESPACE_URL,
-            f"opensquilla:usage:{context.execution_id}:{self.call_index}",
+            f"opensquilla:usage:{context.execution_id}:{self.call_index}:{replay_depth}",
         ).hex
         return UsageCallStart(
             event_id=event_id,

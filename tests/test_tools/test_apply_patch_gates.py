@@ -551,6 +551,80 @@ async def test_apply_patch_context_drift_still_rejects_real_mismatch(
 
 
 @pytest.mark.asyncio
+async def test_apply_patch_tolerates_crlf_line_endings(tmp_path: Path) -> None:
+    target = tmp_path / "src" / "feature.py"
+    target.parent.mkdir()
+    target.write_bytes(b"value = 1\r\nname = 'a'\r\n")
+    token = current_tool_context.set(ToolContext(workspace_dir=str(tmp_path)))
+    apply_patch = _original_async(patch_tool.apply_patch)
+    try:
+        result = await apply_patch(
+            """*** Begin Patch
+*** Update File: src/feature.py
+@@ -1,2 +1,2 @@
+-value = 1
++value = 2
+ name = 'a'
+*** End Patch"""
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert "1 file(s) modified" in result
+    assert target.read_text(encoding="utf-8") == "value = 2\nname = 'a'\n"
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_tolerates_trailing_whitespace_drift(tmp_path: Path) -> None:
+    target = tmp_path / "src" / "feature.py"
+    target.parent.mkdir()
+    target.write_text("value = 1  \nname = 'a'\n", encoding="utf-8")
+    token = current_tool_context.set(ToolContext(workspace_dir=str(tmp_path)))
+    apply_patch = _original_async(patch_tool.apply_patch)
+    try:
+        result = await apply_patch(
+            """*** Begin Patch
+*** Update File: src/feature.py
+@@ -1,2 +1,2 @@
+-value = 1
++value = 2
+ name = 'a'
+*** End Patch"""
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert "1 file(s) modified" in result
+    assert target.read_text(encoding="utf-8") == "value = 2\nname = 'a'\n"
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_context_drift_still_rejects_real_mismatch(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "src" / "feature.py"
+    target.parent.mkdir()
+    target.write_text("value = 1\n", encoding="utf-8")
+    token = current_tool_context.set(ToolContext(workspace_dir=str(tmp_path)))
+    apply_patch = _original_async(patch_tool.apply_patch)
+    try:
+        with pytest.raises(RetryableToolInputError) as exc_info:
+            await apply_patch(
+                """*** Begin Patch
+*** Update File: src/feature.py
+@@ -1,1 +1,1 @@
+-unrelated = 9
++value = 2
+*** End Patch"""
+            )
+    finally:
+        current_tool_context.reset(token)
+
+    assert "context mismatch" in exc_info.value.user_message
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
+
+
+@pytest.mark.asyncio
 async def test_apply_patch_allows_workspace_under_sensitive_parent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
