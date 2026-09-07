@@ -360,6 +360,18 @@ async def apply_vision_followup_gate(ctx: TurnContext) -> TurnContext:
     if _attachments_include_image(ctx.attachments):
         ctx.metadata["router_vision_followup_gate_decision"] = "current_image"
         return ctx
+    if ctx.metadata.get("image_intent_attachment_ids"):
+        if _current_text_explicitly_opts_out_image(ctx):
+            _apply_explicit_opt_out(ctx)
+        else:
+            _apply_explicit_previous_image_request(ctx)
+            ctx.metadata["router_vision_followup_gate_source"] = (
+                "explicit_attachment_id"
+            )
+            ctx.metadata["router_vision_followup_gate_reason"] = (
+                "current turn references a canonical attachment ID"
+            )
+        return ctx
     if ctx.metadata.get("router_history_has_recent_image") is not True:
         ctx.metadata["router_vision_followup_gate_decision"] = "not_applicable"
         return ctx

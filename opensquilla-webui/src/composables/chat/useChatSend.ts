@@ -851,10 +851,6 @@ export function useChatSend(options: UseChatSendOptions) {
     if (!hasModelInputImageAttachment(attachments)) return false
     return options.modelRoutingSettingsBusy.value
       || options.imageInputAdmission?.value === 'blocked'
-      || (
-        options.imageInputAdmission === undefined
-        && options.modelRoutingMode.value === 'llm_ensemble'
-      )
   }
 
   function activeSteerCapability(): ChatSteerCapability | null {
@@ -2628,10 +2624,6 @@ export function useChatSend(options: UseChatSendOptions) {
       }
       if (
         options.imageInputAdmission?.value === 'blocked'
-        || (
-          options.imageInputAdmission === undefined
-          && options.modelRoutingMode.value === 'llm_ensemble'
-        )
       ) {
         return preserveRetryState('not_sent')
       }

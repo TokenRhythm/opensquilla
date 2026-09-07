@@ -58,18 +58,30 @@ export function normalizeRouterTiers(
     const hasEnsembleEnabled = Object.prototype.hasOwnProperty.call(tier, 'ensembleEnabled')
       || Object.prototype.hasOwnProperty.call(tier, 'ensemble_enabled')
     const ensembleEnabled = tier.ensembleEnabled ?? tier.ensemble_enabled
-    out[name] = {
+    const hasSupportsImage = Object.prototype.hasOwnProperty.call(tier, 'supportsImage')
+      || Object.prototype.hasOwnProperty.call(tier, 'supports_image')
+    const supportsImage = tier.supportsImage ?? tier.supports_image
+    const normalizedTier: RouterTier = {
       ...out[name],
       provider,
       model,
       description: String(tier.description || out[name]?.description || ''),
-      supportsImage: Boolean(tier.supportsImage ?? tier.supports_image ?? out[name]?.supportsImage),
       imageOnly: Boolean(tier.imageOnly ?? tier.image_only ?? out[name]?.imageOnly),
       thinkingLevel: String(tier.thinkingLevel ?? tier.thinking_level ?? out[name]?.thinkingLevel ?? ''),
       ...(hasEnsembleEnabled
         ? { ensembleEnabled: normalizeBooleanSetting(ensembleEnabled, false) }
         : {}),
     }
+    if (hasSupportsImage) {
+      normalizedTier.supportsImage = normalizeBooleanSetting(supportsImage, false)
+    } else {
+      // A persisted row owns its deployment identity. Do not inherit a
+      // capability declaration from the managed fallback for a model whose
+      // config omitted that field; omission is probeable, while false is an
+      // authoritative operator declaration.
+      delete normalizedTier.supportsImage
+    }
+    out[name] = normalizedTier
   }
   return out
 }

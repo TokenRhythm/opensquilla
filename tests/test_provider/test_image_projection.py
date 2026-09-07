@@ -14,6 +14,7 @@ from opensquilla.provider import (
     VisionSupportEvidence,
     VisionSupportSource,
     assert_text_only_messages,
+    bind_image_attachment_ids,
     classify_image_failure,
     classify_image_input_error,
     count_image_blocks,
@@ -114,6 +115,47 @@ def test_marker_projection_recursively_replaces_typed_and_mapping_images() -> No
     assert isinstance(canonical[0].content[1], ContentBlockImage)
 
 
+def test_bound_image_ids_do_not_shift_across_history_current_or_nested_images() -> None:
+    history_id = "att_" + "a" * 16
+    current_id = "att_" + "b" * 16
+    canonical = [
+        Message(
+            role="user",
+            content=[
+                ContentBlockToolResult(
+                    tool_use_id="nested",
+                    content=[_image("tool-image")],
+                ),
+                ContentBlockImage(
+                    media_type="image/png",
+                    data="history-image",
+                    attachment_id=history_id,
+                ),
+            ],
+        ),
+        Message(role="user", content=[_image("current-image")]),
+    ]
+    canonical[1:] = bind_image_attachment_ids(canonical[1:], [current_id])
+
+    result = project_messages(
+        canonical,
+        mode="marker",
+        # Runtime metadata may contain only the current bound-envelope ID.
+        attachment_ids=(current_id,),
+    )
+
+    assert [decision.attachment_id for decision in result.decisions] == [
+        None,
+        history_id,
+        current_id,
+    ]
+    rendered = str(result.messages)
+    assert rendered.count(history_id) == 1
+    assert rendered.count(current_id) == 1
+    assert current_id not in canonical[0].model_dump_json()
+    assert current_id not in canonical[1].model_dump_json()
+
+
 def test_tool_use_arguments_are_not_mistaken_for_content_images() -> None:
     message = Message(
         role="assistant",
@@ -189,10 +231,25 @@ def test_marker_state_text_is_truthful_and_id_is_sanitized() -> None:
     assert failed.endswith("]")
 
 
+def test_marker_preserves_maximum_length_manifest_id() -> None:
+    attachment_id = "att_" + "a" * 160
+
+    assert attachment_id in image_marker(attachment_id=attachment_id)
+
+
 def test_image_error_classifier_only_caches_precise_unsupported_evidence() -> None:
     assert (
         classify_image_input_error(
             ErrorEvent(code="image_input_unsupported", message="vision unavailable")
+        )
+        is ImageFailureKind.UNSUPPORTED_INPUT
+    )
+    assert (
+        classify_image_input_error(
+            ErrorEvent(
+                code="image_input_unsupported",
+                message="This model does not support the supplied image format.",
+            )
         )
         is ImageFailureKind.UNSUPPORTED_INPUT
     )
@@ -237,6 +294,62 @@ def test_image_error_classifier_only_caches_precise_unsupported_evidence() -> No
     assert classified.is_unsupported
     assert classified.caches_unsupported
     assert classified.retry_without_image
+
+
+def test_image_error_classifier_prioritizes_media_and_provider_failures() -> None:
+    assert (
+        classify_image_input_error(
+            {
+                "status_code": 400,
+                "code": "invalid_image",
+                "message": "image unable decoded",
+            },
+            provider_name="openai",
+        )
+        is ImageFailureKind.INVALID_MEDIA
+    )
+
+    for status_code, expected in (
+        (401, ImageFailureKind.AUTHENTICATION),
+        (429, ImageFailureKind.RATE_LIMITED),
+        (503, ImageFailureKind.TRANSIENT),
+    ):
+        assert (
+            classify_image_input_error(
+                {
+                    "status_code": status_code,
+                    "code": "image_input_unsupported",
+                    "message": "This model does not support image input.",
+                },
+                provider_name="openai",
+            )
+            is expected
+        )
+
+        # Real provider adapters often expose the HTTP status only through the
+        # event's string ``code`` field.
+        assert (
+            classify_image_input_error(
+                ErrorEvent(
+                    code=str(status_code),
+                    message="This model does not support image input.",
+                ),
+                provider_name="openai",
+            )
+            is expected
+        )
+
+    invalid = classify_image_failure(
+        {
+            "status_code": 400,
+            "code": "invalid_image",
+            "message": "image decode failed",
+        },
+        provider_name="openai",
+    )
+    assert not invalid.is_unsupported
+    assert not invalid.caches_unsupported
+    assert not invalid.retry_without_image
 
 
 def test_chat_config_remains_importable_with_projection_types() -> None:

@@ -111,6 +111,11 @@ def _bounded_text(value: object, *, fallback: str, max_bytes: int) -> str:
 def normalize_attachment_name(value: object, *, fallback: str = "attachment") -> str:
     """Return a bounded display name safe for a model-visible descriptor."""
 
+    if isinstance(value, str):
+        # Persisted attachment names are display metadata, never storage
+        # locations. Treat both separators as path separators so manifests
+        # created on one platform cannot expose a path when read on another.
+        value = value.strip().replace("\\", "/").rsplit("/", 1)[-1]
     return _bounded_text(value, fallback=fallback, max_bytes=_MAX_NAME_BYTES)
 
 
@@ -154,15 +159,16 @@ def legacy_attachment_id(
 ) -> str:
     """Derive the stable ID used when an old envelope has no occurrence ID.
 
-    The input includes the logical session, source message, ordinal and
-    content hash.  It therefore remains stable across compaction and process
-    restarts while keeping the raw material out of the identifier.
+    The input uses the source message, ordinal and content hash.  Attachment
+    lookup remains session-scoped, while omitting the session identity keeps
+    the logical occurrence stable when a transcript is fully forked.  The
+    ``session_id`` argument is retained for call-site compatibility.
     """
 
     if isinstance(index, bool) or not isinstance(index, int) or index < 0:
         raise AttachmentManifestError("attachment index must be a non-negative integer")
     digest = hashlib.sha256(
-        f"{session_id}\0{message_id}\0{index}\0{sha256 or ''}".encode()
+        f"{message_id}\0{index}\0{sha256 or ''}".encode()
     ).digest()[:18]
     token = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
     return f"att_legacy_{token}"
@@ -463,11 +469,11 @@ class AttachmentOccurrence:
     def from_payload(cls, raw: object) -> AttachmentOccurrence:
         if not isinstance(raw, Mapping):
             raise AttachmentManifestError("attachment occurrence payload must be an object")
-        attachment_id = raw.get("attachment_id")
+        attachment_id = valid_attachment_id(raw.get("attachment_id"))
         source_message_id = raw.get("source_message_id")
         ordinal = raw.get("ordinal")
-        if not isinstance(attachment_id, str) or not attachment_id:
-            raise AttachmentManifestError("attachment occurrence ID is missing")
+        if attachment_id is None:
+            raise AttachmentManifestError("attachment occurrence ID is invalid")
         if not isinstance(source_message_id, str) or not source_message_id:
             raise AttachmentManifestError("attachment source message ID is missing")
         if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0:

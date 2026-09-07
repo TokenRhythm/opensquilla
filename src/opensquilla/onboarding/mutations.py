@@ -312,6 +312,19 @@ def _merge_router_tiers(
         tier_name = normalize_text_tier(name) or str(name)
         override = _normalize_tier_payload(tier_name, raw_override)
         current = dict(merged.get(tier_name, {}))
+        deployment_changed = any(
+            field_name in override
+            and str(override.get(field_name) or "").strip()
+            != str(current.get(field_name) or "").strip()
+            for field_name in ("provider", "model")
+        )
+        if deployment_changed and "supports_image" not in override:
+            # Capability evidence belongs to a deployment identity. A model-
+            # only/provider-only override must not inherit the managed preset's
+            # declaration for a different deployment. Omission stays unknown;
+            # an explicit false in the override remains authoritative.
+            current.pop("supports_image", None)
+            current.pop("supportsImage", None)
         # A pre-``ensemble_enabled`` client can still submit an explicit
         # per-tier selection mode.  That legacy field is an ownership
         # boundary: do not let a managed preset's new shared-plan flag turn
@@ -340,12 +353,18 @@ def _canonical_tier_value(tier: Mapping[str, Any]) -> dict[str, Any]:
     legacy_selection_mode = str(
         tier.get("ensemble_selection_mode", tier.get("ensembleSelectionMode", "")) or ""
     ).strip()
+    if "supports_image" in tier:
+        supports_image: bool | None = bool(tier.get("supports_image"))
+    elif "supportsImage" in tier:
+        supports_image = bool(tier.get("supportsImage"))
+    else:
+        supports_image = None
     return {
         "provider": str(tier.get("provider") or "").strip().lower(),
         "model": str(tier.get("model") or "").strip(),
         "description": str(tier.get("description") or "").strip(),
         "thinking_level": (str(thinking or "").strip() or None),
-        "supports_image": bool(tier.get("supports_image", tier.get("supportsImage", False))),
+        "supports_image": supports_image,
         "image_only": bool(tier.get("image_only", tier.get("imageOnly", False))),
         "ensemble_enabled": ensemble_enabled,
         # Once the new tri-state field exists it owns execution. Retained

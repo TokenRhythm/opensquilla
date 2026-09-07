@@ -27,6 +27,7 @@ from opensquilla.provider.types import (
     ContentBlockImage,
     ContentBlockText,
 )
+from opensquilla.session.attachment_manifest import legacy_attachment_id
 
 
 def _b64(payload: bytes) -> str:
@@ -215,6 +216,95 @@ def test_historical_inline_image_envelope_can_replay_for_vision() -> None:
     assert len(image_blocks) == 1
     assert image_blocks[0].media_type == "image/png"
     assert image_blocks[0].data == _b64(b"\x89PNG\r\n\x1a\n")
+
+
+def test_forked_legacy_historical_image_keeps_allowed_attachment_id() -> None:
+    payload = b"legacy-fork-image"
+    message_id = "message-legacy-fork-image"
+    content = json.dumps(
+        {
+            "text": "continue from this legacy image",
+            "attachments": [
+                {
+                    "type": "image/png",
+                    "data": _b64(payload),
+                    "name": "legacy.png",
+                }
+            ],
+        }
+    )
+    parent_attachment_id = legacy_attachment_id(
+        session_id="parent-session",
+        message_id=message_id,
+        index=0,
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+
+    out = TurnRunner._maybe_unpack_attachments(
+        content,
+        preserve_image_attachments=True,
+        allowed_image_attachment_ids=frozenset({parent_attachment_id}),
+        session_id="child-session",
+        source_message_id=message_id,
+    )
+
+    assert isinstance(out, list)
+    image_blocks = [block for block in out if isinstance(block, ContentBlockImage)]
+    assert len(image_blocks) == 1
+    assert image_blocks[0].data == _b64(payload)
+    assert image_blocks[0].attachment_id == parent_attachment_id
+    assert any(
+        isinstance(block, ContentBlockText)
+        and block.text == f"[historical image attachment_id={parent_attachment_id}]"
+        for block in out
+    )
+
+
+def test_explicit_multi_image_replay_exposes_stable_id_to_image_mapping() -> None:
+    first_id = "att_abcdefgh"
+    second_id = "att_ijklmnop"
+    first_payload = b"first-image"
+    second_payload = b"second-image"
+    content = json.dumps(
+        {
+            "text": "Compare the referenced images.",
+            "attachments": [
+                {
+                    "attachment_id": first_id,
+                    "type": "image/png",
+                    "data": _b64(first_payload),
+                    "name": "first.png",
+                },
+                {
+                    "attachment_id": second_id,
+                    "type": "image/png",
+                    "data": _b64(second_payload),
+                    "name": "second.png",
+                },
+            ],
+        }
+    )
+
+    out = TurnRunner._maybe_unpack_attachments(
+        content,
+        preserve_image_attachments=True,
+        # Reference order is intentionally the reverse of transcript order;
+        # adjacent labels make the mapping unambiguous on the provider wire.
+        allowed_image_attachment_ids=frozenset((second_id, first_id)),
+    )
+
+    assert isinstance(out, list)
+    mapped_blocks = [
+        (out[index].text, out[index + 1].data)
+        for index in range(len(out) - 1)
+        if isinstance(out[index], ContentBlockText)
+        and out[index].text.startswith("[historical image attachment_id=")
+        and isinstance(out[index + 1], ContentBlockImage)
+    ]
+    assert mapped_blocks == [
+        (f"[historical image attachment_id={first_id}]", _b64(first_payload)),
+        (f"[historical image attachment_id={second_id}]", _b64(second_payload)),
+    ]
 
 
 def test_historical_image_ref_envelope_can_replay_for_vision(tmp_path: Path) -> None:

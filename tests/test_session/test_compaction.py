@@ -1,21 +1,28 @@
 """Tests for context window compaction logic."""
 
 import asyncio
+import base64
 import json
 
 import pytest
 
 from opensquilla.provider.types import ProviderRequestCorrelation
+from opensquilla.session.attachment_manifest import (
+    extract_attachment_occurrences_from_envelope,
+)
 from opensquilla.session.compaction import (
     CompactionConfig,
     CompactionRequest,
     _api_round_groups,
+    _format_chunk_for_llm,
+    _summarize_chunk_fallback,
     arm_compaction_deadline,
     await_compaction_phase,
     build_compaction_config_from_provider,
     call_compaction_llm,
     compact_context,
     compaction_remaining_seconds,
+    compaction_replay_summary,
     estimate_entries_model_replay_chars,
     estimate_entry_model_replay_tokens,
     estimate_entry_replay_tokens,
@@ -36,6 +43,270 @@ def _make_entries(n: int, tokens_each: int = 100) -> list[dict]:
         }
         for i in range(n)
     ]
+
+
+def test_compaction_attachment_descriptor_is_safe_stable_and_not_truncated() -> None:
+    image_data = base64.b64encode(b"image-bytes").decode("ascii")
+    content = json.dumps(
+        {
+            # Deliberately put attachments first and pretty-print the object:
+            # legacy detection must not depend on a compact ``{"text":`` prefix.
+            "attachments": [
+                {
+                    "attachment_id": "/private/tmp/not-an-occurrence-id.png",
+                    "path": "/private/tmp/material/image.png",
+                    "name": "/private/tmp/upload/image.png",
+                    "type": "image/png",
+                    "data": image_data,
+                }
+            ],
+            "text": "long prompt " + "x" * 500,
+        },
+        indent=2,
+    )
+    [occurrence] = extract_attachment_occurrences_from_envelope(
+        content,
+        session_id="session-image",
+        source_message_id="message-image",
+    )
+    entry = {
+        "id": 1,
+        "session_id": "session-image",
+        "message_id": "message-image",
+        "role": "user",
+        "content": content,
+    }
+
+    llm_input = _format_chunk_for_llm([entry])
+    fallback = _summarize_chunk_fallback([entry], "strict")
+
+    for rendered in (llm_input, fallback):
+        assert occurrence.attachment_id in rendered
+        assert "image.png (image/png" in rendered
+        assert image_data not in rendered
+        assert "/private/tmp" not in rendered
+        assert '"path"' not in rendered
+        assert "not-an-occurrence-id" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_durable_attachment_summary_backfills_id_without_media_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_data = base64.b64encode(b"durable-image-bytes").decode("ascii")
+    content = json.dumps(
+        {
+            "attachments": [
+                {
+                    "attachment_id": "/private/tmp/not-an-occurrence-id.png",
+                    "path": "/private/tmp/material/image.png",
+                    "name": "/private/tmp/upload/image.png",
+                    "type": "image/png",
+                    "data": image_data,
+                }
+            ],
+            "text": "Inspect the archived image.",
+        },
+        indent=2,
+    )
+    [occurrence] = extract_attachment_occurrences_from_envelope(
+        content,
+        session_id="session-image",
+        source_message_id="message-image",
+    )
+    entries = [
+        {
+            "id": 1,
+            "session_id": "session-image",
+            "message_id": "message-image",
+            "role": "user",
+            "content": content,
+            "token_count": 5,
+        },
+        {
+            "id": 2,
+            "session_id": "session-image",
+            "message_id": "message-answer",
+            "role": "assistant",
+            "content": "Earlier answer.",
+            "token_count": 5,
+        },
+        {
+            "id": 3,
+            "session_id": "session-image",
+            "message_id": "message-current",
+            "role": "user",
+            "content": "Continue.",
+            "token_count": 5,
+        },
+        {
+            "id": 4,
+            "session_id": "session-image",
+            "message_id": "message-current-answer",
+            "role": "assistant",
+            "content": "Current answer.",
+            "token_count": 5,
+        },
+    ]
+
+    async def summary_without_attachment(**kwargs):  # noqa: ANN003
+        del kwargs
+        return "Safe summary without an attachment reference."
+
+    monkeypatch.setattr(
+        "opensquilla.session.compaction.call_compaction_llm",
+        summary_without_attachment,
+    )
+    result = await compact_context(
+        CompactionRequest(
+            session_id="session-image",
+            entries=entries,
+            context_window_tokens=2_000,
+            config=CompactionConfig(
+                model="test/model",
+                api_key="test-key",
+                safety_margin=1.0,
+                protected_recent_messages=2,
+            ),
+            forced_prefix_cut=2,
+            trigger="message_count",
+        )
+    )
+
+    assert result.removed_count == 2
+    assert result.summary_payload is not None
+    assert result.summary_payload["files_and_artifacts"] == []
+    assert occurrence.attachment_id in result.summary_payload["important_identifiers"]
+    serialized_payload = json.dumps(result.summary_payload, sort_keys=True)
+    replay = compaction_replay_summary(result)
+    for rendered in (serialized_payload, replay):
+        assert occurrence.attachment_id in rendered
+        assert image_data not in rendered
+        assert "/private/tmp" not in rendered
+        assert "not-an-occurrence-id" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_nested_tool_result_images_are_projected_out_of_compaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_data = base64.b64encode(b"nested-tool-image-bytes").decode("ascii")
+    image_path = "/private/tmp/tool-results/private-image.png"
+    nested_result = {
+        "items": [
+            {
+                "type": "image",
+                "path": image_path,
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": image_data,
+                },
+            },
+            {
+                "wrapper": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "path": image_path,
+                    "data": image_data,
+                }
+            },
+        ]
+    }
+    tool_calls = [
+        {
+            "type": "tool_use",
+            "id": "tool-image-result-1",
+            "name": "inspect_image",
+            "input": json.dumps({"payload": nested_result}),
+        },
+        {
+            "type": "tool_result",
+            "tool_use_id": "tool-image-result-1",
+            "result": json.dumps(nested_result),
+        },
+    ]
+    entries = [
+        {
+            "id": 1,
+            "session_id": "session-tool-image",
+            "message_id": "message-request",
+            "role": "user",
+            "content": "Inspect the tool image.",
+            "token_count": 5,
+        },
+        {
+            "id": 2,
+            "session_id": "session-tool-image",
+            "message_id": "message-tool-result",
+            "role": "assistant",
+            "content": "Tool completed.",
+            "tool_calls": tool_calls,
+            "token_count": 5,
+        },
+        {
+            "id": 3,
+            "session_id": "session-tool-image",
+            "message_id": "message-follow-up",
+            "role": "user",
+            "content": "Continue without replaying bytes.",
+            "token_count": 5,
+        },
+        {
+            "id": 4,
+            "session_id": "session-tool-image",
+            "message_id": "message-answer",
+            "role": "assistant",
+            "content": "Latest answer.",
+            "token_count": 5,
+        },
+    ]
+    captured_chunks: list[str] = []
+
+    async def safe_summary(**kwargs):  # noqa: ANN003
+        captured_chunks.append(kwargs["chunk_text"])
+        return "The tool returned an image for inspection."
+
+    monkeypatch.setattr(
+        "opensquilla.session.compaction.call_compaction_llm",
+        safe_summary,
+    )
+
+    llm_projection = _format_chunk_for_llm(entries[:2])
+    fallback_projection = _summarize_chunk_fallback(entries[:2], "strict")
+    result = await compact_context(
+        CompactionRequest(
+            session_id="session-tool-image",
+            entries=entries,
+            context_window_tokens=2_000,
+            config=CompactionConfig(
+                model="test/model",
+                api_key="test-key",
+                safety_margin=1.0,
+                protected_recent_messages=2,
+            ),
+            forced_prefix_cut=2,
+            trigger="message_count",
+        )
+    )
+
+    assert captured_chunks
+    assert result.removed_count == 2
+    assert result.summary_payload is not None
+    serialized_payload = json.dumps(result.summary_payload, sort_keys=True)
+    replay = compaction_replay_summary(result)
+    for rendered in (
+        llm_projection,
+        fallback_projection,
+        *captured_chunks,
+        serialized_payload,
+        replay,
+    ):
+        assert "image omitted from compaction input" in rendered
+        assert image_data not in rendered
+        assert image_path not in rendered
+        assert "/private/tmp" not in rendered
+    assert tool_calls[1]["result"] == json.dumps(nested_result)
 
 
 def test_api_round_groups_keep_user_role_tool_result_with_its_call() -> None:

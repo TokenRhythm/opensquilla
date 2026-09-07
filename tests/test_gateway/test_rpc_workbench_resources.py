@@ -29,6 +29,7 @@ from opensquilla.gateway.generated_artifact_adoption import GeneratedArtifactAdo
 from opensquilla.gateway.rpc import RpcContext, RpcUnavailableError, get_dispatcher
 from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
 from opensquilla.gateway.transcripts import build_transcript_attachment_envelope
+from opensquilla.session.attachment_manifest import legacy_attachment_id
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import TranscriptEntry
 from opensquilla.session.storage import SessionStorage
@@ -1240,7 +1241,8 @@ async def test_historical_attachment_ids_are_stable_per_message_occurrence(
 ) -> None:
     env = resource_env
     html = b"<h1>historical</h1>"
-    for message_id, name in (("legacy-one", "one.html"), ("legacy-two", "two.html")):
+    message_specs = (("legacy-one", "one.html"), ("legacy-two", "two.html"))
+    for message_id, name in message_specs:
         attachment = {
             "type": "text/html",
             "data": base64.b64encode(html).decode("ascii"),
@@ -1274,8 +1276,27 @@ async def test_historical_attachment_ids_are_stable_per_message_occurrence(
     first_ids = [item["resource"]["id"] for item in first.payload["resources"]]
     second_ids = [item["resource"]["id"] for item in second.payload["resources"]]
     assert first_ids == second_ids
+    assert first_ids == [
+        legacy_attachment_id(
+            session_id=env.session.session_id,
+            message_id=message_id,
+            index=0,
+            sha256=hashlib.sha256(html).hexdigest(),
+        )
+        for message_id, _name in message_specs
+    ]
     assert len(set(first_ids)) == 2
     assert all(item.startswith("att_legacy_") for item in first_ids)
+
+    child_key = "agent:main:webchat:workbench-resources-legacy-fork"
+    await env.manager.branch(SESSION_KEY, child_key, fork_transcript=True)
+    forked = await _dispatch(
+        env,
+        "workbench.resources.list",
+        {"sessionKey": child_key, "types": ["attachment"]},
+    )
+    assert forked.error is None, forked.error
+    assert [item["resource"]["id"] for item in forked.payload["resources"]] == first_ids
 
 
 @pytest.mark.asyncio

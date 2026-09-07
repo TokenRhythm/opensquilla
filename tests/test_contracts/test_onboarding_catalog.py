@@ -95,12 +95,14 @@ ROUTER_CATALOG_TOP_LEVEL_KEYS = frozenset({"defaultTier", "textTiers", "modes", 
 ROUTER_MODE_KEYS = frozenset({"mode", "label", "description"})
 ROUTER_PROFILE_KEYS = frozenset({"profileId", "providerId", "label", "tiers"})
 ROUTER_TIER_PAYLOAD_KEYS = frozenset(
-    {"provider", "model", "description", "thinkingLevel", "supportsImage"}
+    {"provider", "model", "description", "thinkingLevel"}
 )
 # Deliberate additive execution metadata. These keys are optional because only
 # tiers that opt into fusion need them; clients that predate the addition keep
 # receiving the frozen base shape for every other tier.
-ROUTER_TIER_OPTIONAL_KEYS = frozenset({"ensembleEnabled", "ensembleSelectionMode"})
+ROUTER_TIER_OPTIONAL_KEYS = frozenset(
+    {"supportsImage", "ensembleEnabled", "ensembleSelectionMode"}
+)
 
 
 def _assert_router_tier_payload_keys(tier: dict[str, object], context: object) -> None:

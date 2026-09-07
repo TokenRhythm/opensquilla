@@ -180,7 +180,7 @@ function imageSwitchDisabled(row: SetupTierRow): boolean {
 
 function displayedImageSupport(row: SetupTierRow): boolean {
   if (row.name === 'c3' && tierEnsembleActive(row)) return false
-  return row.supportsImage
+  return row.supportsImage === true
 }
 
 function modelChoiceValue(row: SetupTierRow): string {

@@ -325,7 +325,9 @@ async def test_image_attachments_bypass_text_hold(monkeypatch) -> None:
 
     assert out.metadata["routing_source"] == "image_route"
     assert out.metadata.get("router_control_hold_applied") is not True
-    assert out.model == "moonshotai/kimi-k2.6"
+    assert out.model == cfg.tiers["c1"]["model"]
+    assert out.metadata["image_input_mode"] == "marker"
+    assert out.metadata["router_image_capability_exhausted"] is True
 
 
 def test_prompt_block_contains_canonical_targets_not_aliases() -> None:

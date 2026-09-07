@@ -133,6 +133,8 @@ class _RecordingSelector:
         self,
         model: str,
         fallback_chain: list[object],  # noqa: ARG002
+        *,
+        preserve_existing_tail: bool = True,  # noqa: ARG002
     ) -> None:
         self.override_model(model)
 
@@ -230,11 +232,10 @@ def _configure_gateway(tmp_path: Path) -> GatewayConfig:
             "model": _TEXT_MODEL,
             "supports_image": False,
         },
-        "image_model": {
+        "c2": {
             "provider": "openrouter",
             "model": _VISION_MODEL,
             "supports_image": True,
-            "image_only": True,
         },
     }
     config.squilla_router.default_tier = "c1"
@@ -665,7 +666,7 @@ async def test_pdf_materialization_does_not_require_image_tier(
     _e2e_stack: dict[str, Any],
 ) -> None:
     config: GatewayConfig = _e2e_stack["config"]
-    config.squilla_router.tiers.pop("image_model", None)
+    config.squilla_router.tiers.pop("c2", None)
     manager: SessionManager = _e2e_stack["manager"]
     subscription_manager: SubscriptionManager = _e2e_stack["subscription_manager"]
     sink: _EventSink = _e2e_stack["sink"]

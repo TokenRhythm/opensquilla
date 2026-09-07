@@ -24,6 +24,7 @@ from opensquilla.session.attachment_manifest import (
     legacy_attachment_id,
     manifest_context_state,
     merge_attachment_occurrences,
+    normalize_attachment_name,
 )
 from opensquilla.session.models import SessionNode, TranscriptEntry
 from opensquilla.session.storage import SessionStorage
@@ -60,19 +61,53 @@ def test_legacy_attachment_id_matches_stable_algorithm() -> None:
         index=0,
         sha256="a" * 64,
     )
-    second = legacy_attachment_id(
+    forked = legacy_attachment_id(
+        session_id="session-b",
+        message_id="message-1",
+        index=0,
+        sha256="a" * 64,
+    )
+    different_index = legacy_attachment_id(
         session_id="session-a",
         message_id="message-1",
         index=1,
         sha256="a" * 64,
     )
+    different_message = legacy_attachment_id(
+        session_id="session-a",
+        message_id="message-2",
+        index=0,
+        sha256="a" * 64,
+    )
+    different_hash = legacy_attachment_id(
+        session_id="session-a",
+        message_id="message-1",
+        index=0,
+        sha256="b" * 64,
+    )
     digest = hashlib.sha256(
-        ("session-a\0message-1\0" + "0" + "\0" + "a" * 64).encode("utf-8")
+        ("message-1\0" + "0" + "\0" + "a" * 64).encode("utf-8")
     ).digest()[:18]
     expected = "att_legacy_" + base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
     assert first == expected
-    assert first != second
+    assert first == forked
+    assert len({first, different_index, different_message, different_hash}) == 4
     assert first.startswith("att_legacy_")
+
+
+@pytest.mark.parametrize(
+    ("raw_name", "expected"),
+    [
+        ("/private/tmp/uploads/diagram.png", "diagram.png"),
+        (r"C:\Temp\uploads\diagram.png", "diagram.png"),
+        ("/private/tmp/uploads/", "attachment"),
+    ],
+)
+def test_normalize_attachment_name_keeps_only_basename(
+    raw_name: str,
+    expected: str,
+) -> None:
+    assert normalize_attachment_name(raw_name) == expected
 
 
 def test_extracts_inline_ref_and_missing_occurrences_without_bytes_in_payload() -> None:
@@ -258,6 +293,32 @@ def test_manifest_payload_roundtrip_is_metadata_only() -> None:
     assert "data" not in serialized
     assert "path" not in serialized
     assert decoded.session_key == "agent:main:webchat:default"
+
+
+@pytest.mark.parametrize(
+    "invalid_id",
+    ["", "att_short", "../../private/image.png", "att_invalid/slash_123"],
+)
+def test_manifest_payload_rejects_invalid_attachment_id(invalid_id: str) -> None:
+    payload = {
+        "schema_version": 1,
+        "covered_through_id": 1,
+        "occurrences": [
+            {
+                "attachment_id": invalid_id,
+                "source_message_id": "message-1",
+                "ordinal": 0,
+                "material_state": MATERIAL_MISSING,
+            }
+        ],
+    }
+
+    with pytest.raises(AttachmentManifestError, match="occurrence ID is invalid"):
+        AttachmentManifest.from_payload(
+            payload,
+            session_id="session-a",
+            session_key="webchat:default",
+        )
 
 
 @pytest.mark.asyncio

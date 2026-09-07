@@ -264,7 +264,10 @@ def _safe_attachment_id(value: object) -> str:
     if not text:
         return ""
     sanitized = re.sub(r"[^A-Za-z0-9_.:-]", "_", text)
-    return sanitized[:128]
+    # Manifest IDs allow the ``att_`` prefix plus up to 160 payload
+    # characters. Preserve a valid maximum-length ID exactly so a marker can
+    # be used for a later explicit archive lookup.
+    return sanitized[:164]
 
 
 def image_marker(
@@ -454,20 +457,97 @@ def has_image_blocks(messages: Sequence[object]) -> bool:
     return count_image_blocks(messages) > 0
 
 
+def _bound_image_attachment_ids(value: object) -> set[str]:
+    if isinstance(value, ContentBlockImage):
+        return {value.attachment_id} if value.attachment_id else set()
+    if isinstance(value, ContentBlockToolResult):
+        return _bound_image_attachment_ids(value.content)
+    if isinstance(value, Message):
+        return _bound_image_attachment_ids(value.content)
+    if isinstance(value, (list, tuple)):
+        result: set[str] = set()
+        for item in value:
+            result.update(_bound_image_attachment_ids(item))
+        return result
+    if isinstance(value, Mapping):
+        if _is_image_mapping(value):
+            attachment_id = value.get("attachment_id")
+            return (
+                {attachment_id.strip()[:164]}
+                if isinstance(attachment_id, str) and attachment_id.strip()
+                else set()
+            )
+        if str(value.get("type", "")).strip().lower() == "tool_result":
+            return _bound_image_attachment_ids(value.get("content"))
+    return set()
+
+
+def bind_image_attachment_ids(
+    messages: Sequence[Message],
+    attachment_ids: Sequence[str],
+) -> list[Message]:
+    """Return a deep copy with IDs bound to otherwise-unbound typed images.
+
+    This is used for the current upload envelope after persistence assigned its
+    canonical occurrence IDs.  The field is internal/excluded from provider
+    serialization; it exists only to keep marker decisions correct when a
+    request also contains historical or nested tool-result images.
+    """
+
+    ids = [value.strip()[:164] for value in attachment_ids if value.strip()]
+    next_id = 0
+
+    def visit(value: object) -> object:
+        nonlocal next_id
+        if isinstance(value, ContentBlockImage):
+            attachment_id = value.attachment_id
+            if not attachment_id and next_id < len(ids):
+                attachment_id = ids[next_id]
+                next_id += 1
+            return value.model_copy(
+                deep=True,
+                update={"attachment_id": attachment_id},
+            )
+        if isinstance(value, ContentBlockToolResult):
+            return value.model_copy(deep=True, update={"content": visit(value.content)})
+        if isinstance(value, Message):
+            return value.model_copy(deep=True, update={"content": visit(value.content)})
+        if isinstance(value, list):
+            return [visit(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(visit(item) for item in value)
+        return copy.deepcopy(value)
+
+    return [cast(Message, visit(message)) for message in messages]
+
+
 @dataclass
 class _ProjectionContext:
     policy: ImageProjectionPolicy
     next_ordinal: int = 0
+    next_fallback_id: int = 0
+    reserved_attachment_ids: set[str] = field(default_factory=set)
     decisions: list[ImageProjectionDecision] = field(default_factory=list)
 
-    def occurrence(self) -> tuple[int, str | None, ImageMarkerState]:
+    def occurrence(
+        self,
+        explicit_attachment_id: object = None,
+    ) -> tuple[int, str | None, ImageMarkerState]:
         ordinal = self.next_ordinal
         self.next_ordinal += 1
         attachment_id = (
-            self.policy.attachment_ids[ordinal]
-            if ordinal < len(self.policy.attachment_ids)
+            str(explicit_attachment_id).strip()[:164]
+            if isinstance(explicit_attachment_id, str)
+            and explicit_attachment_id.strip()
             else None
         )
+        if attachment_id is None:
+            while self.next_fallback_id < len(self.policy.attachment_ids):
+                candidate = self.policy.attachment_ids[self.next_fallback_id]
+                self.next_fallback_id += 1
+                if candidate not in self.reserved_attachment_ids:
+                    attachment_id = candidate
+                    break
         state = self.policy.marker_state
         if attachment_id is not None:
             state = self.policy.marker_states.get(attachment_id, state)
@@ -478,7 +558,7 @@ def _project_content_value(value: object, context: _ProjectionContext) -> tuple[
     """Project a content value while preserving non-content tool arguments."""
 
     if isinstance(value, ContentBlockImage):
-        ordinal, attachment_id, state = context.occurrence()
+        ordinal, attachment_id, state = context.occurrence(value.attachment_id)
         mode = cast(ImageProjectionMode, context.policy.mode)
         if mode is ImageProjectionMode.NATIVE:
             cloned = value.model_copy(deep=True)
@@ -544,7 +624,9 @@ def _project_content_value(value: object, context: _ProjectionContext) -> tuple[
 
     if isinstance(value, Mapping):
         if _is_image_mapping(value):
-            ordinal, attachment_id, state = context.occurrence()
+            ordinal, attachment_id, state = context.occurrence(
+                value.get("attachment_id")
+            )
             mode = cast(ImageProjectionMode, context.policy.mode)
             surrogate = (
                 context.policy.surrogate_by_attachment_id.get(attachment_id or "")
@@ -566,7 +648,12 @@ def _project_content_value(value: object, context: _ProjectionContext) -> tuple[
                 )
             )
             if mode is ImageProjectionMode.NATIVE:
-                return copy.deepcopy(value), False
+                cloned_mapping = copy.deepcopy(dict(value))
+                # Mapping-shaped compatibility blocks cannot express a
+                # Pydantic excluded field, so remove request-local provenance
+                # explicitly before the native provider boundary.
+                cloned_mapping.pop("attachment_id", None)
+                return cloned_mapping, False
             # Keep dictionary-shaped content dictionary-shaped.  Adapters that
             # accept untyped tool-result blocks can serialize this naturally.
             return {"type": "text", "text": marker_text}, True
@@ -632,7 +719,13 @@ def project_messages(
         )
 
     input_count = count_image_blocks(messages)
-    context = _ProjectionContext(policy=policy)
+    reserved_attachment_ids: set[str] = set()
+    for message in messages:
+        reserved_attachment_ids.update(_bound_image_attachment_ids(message))
+    context = _ProjectionContext(
+        policy=policy,
+        reserved_attachment_ids=reserved_attachment_ids,
+    )
     projected_messages: list[Message] = []
     for message in messages:
         projected, _ = _project_content_value(message, context)
@@ -701,6 +794,7 @@ class ImageFailureKind(StrEnum):
     INVALID_MEDIA = "invalid_media"
     CONTEXT_OVERFLOW = "context_overflow"
     AUTHENTICATION = "authentication"
+    INSUFFICIENT_CREDITS = "insufficient_credits"
     RATE_LIMITED = "rate_limited"
     TRANSIENT = "transient"
     MODEL_NOT_FOUND = "model_not_found"
@@ -734,11 +828,20 @@ def _error_fields(error: object) -> tuple[int | None, str, str]:
         message = getattr(error, "message", "")
         if not message:
             message = str(error or "")
+    raw_code = str(code or "").strip().lower()
     try:
         status_code = int(status) if status is not None and str(status).strip() else None
     except (TypeError, ValueError):
         status_code = None
-    return status_code, str(code or "").strip().lower(), str(message or "").strip().lower()
+    # Provider adapters commonly normalize HTTP failures into ``ErrorEvent``
+    # and keep the status only in its string ``code`` field.  Preserve that
+    # stronger signal so an incidental "image unsupported" phrase in a
+    # 401/429/5xx body cannot poison the exact deployment's vision cache.
+    if status_code is None and raw_code.isascii() and raw_code.isdigit():
+        candidate = int(raw_code)
+        if 100 <= candidate <= 599:
+            status_code = candidate
+    return status_code, raw_code, str(message or "").strip().lower()
 
 
 _IMAGE_UNSUPPORTED_CODES = frozenset(
@@ -755,13 +858,28 @@ _IMAGE_UNSUPPORTED_CODES = frozenset(
 )
 _IMAGE_UNSUPPORTED_RE = re.compile(
     r"(?:image|images|vision|multimodal|picture|图片|图像|视觉).{0,80}"
-    r"(?:not supported|unsupported|does not support|cannot process|unable|不支持|无法处理|不能处理)"
+    r"(?:not supported|unsupported|does not support|cannot process|"
+    r"unable to (?:process|handle|accept|analy[sz]e|read)|不支持|无法处理|不能处理)"
     r"|(?:does not support|unsupported|not supported|不支持|无法处理).{0,80}"
     r"(?:image|images|vision|multimodal|picture|图片|图像|视觉)",
 )
 _INVALID_MEDIA_RE = re.compile(
     r"(?:image|images|picture|图片|图像).{0,80}"
-    r"(?:invalid|corrupt|malformed|decode|format|mime|media type|too large|尺寸|大小|损坏|格式)",
+    r"(?:invalid|corrupt|malformed|decode|format|mime|media type|too large|"
+    r"download|fetch|load|inaccessible|尺寸|大小|损坏|格式)",
+)
+
+_INVALID_MEDIA_CODES = frozenset(
+    {
+        "invalid_image",
+        "invalid_media",
+        "image_too_large",
+        "unsupported_media_type",
+    }
+)
+
+_TRANSIENT_STATUS_CODES = frozenset(
+    {408, 409, 425, 499, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529}
 )
 
 
@@ -780,15 +898,19 @@ def classify_image_input_error(
 
     status_code, raw_code, message = _error_fields(error)
     joined = f"{raw_code} {message}".strip()
-    if raw_code in _IMAGE_UNSUPPORTED_CODES or _IMAGE_UNSUPPORTED_RE.search(joined):
-        return ImageFailureKind.UNSUPPORTED_INPUT
-    if _INVALID_MEDIA_RE.search(joined) or raw_code in {
-        "invalid_image",
-        "invalid_media",
-        "image_too_large",
-        "unsupported_media_type",
-    }:
-        return ImageFailureKind.INVALID_MEDIA
+
+    # HTTP admission/transport status is stronger evidence than incidental
+    # image wording in a gateway message.  In particular, a 401/429/503 must
+    # never poison the exact deployment's vision-capability cache, even if the
+    # body repeats an upstream "image unsupported" sentence.
+    if status_code in {401, 403}:
+        return ImageFailureKind.AUTHENTICATION
+    if status_code == 402:
+        return ImageFailureKind.INSUFFICIENT_CREDITS
+    if status_code == 429:
+        return ImageFailureKind.RATE_LIMITED
+    if status_code in _TRANSIENT_STATUS_CODES:
+        return ImageFailureKind.TRANSIENT
 
     # Keep this import lazy: failures.py imports the provider registry, while
     # this low-level module is also imported by provider package initialisation.
@@ -800,10 +922,15 @@ def classify_image_input_error(
         provider_kind = None
 
     if provider_kind is not None:
+        # These provider-wide failures outrank all message-level image text.
+        # BAD_REQUEST is intentionally handled later: real vision capability
+        # rejections are commonly delivered as HTTP 400.
         if provider_kind is ProviderFailureKind.CONTEXT_OVERFLOW:
             return ImageFailureKind.CONTEXT_OVERFLOW
         if provider_kind is ProviderFailureKind.AUTH_INVALID:
             return ImageFailureKind.AUTHENTICATION
+        if provider_kind is ProviderFailureKind.INSUFFICIENT_CREDITS:
+            return ImageFailureKind.INSUFFICIENT_CREDITS
         if provider_kind is ProviderFailureKind.RATE_LIMITED:
             return ImageFailureKind.RATE_LIMITED
         if provider_kind is ProviderFailureKind.MODEL_NOT_FOUND:
@@ -815,6 +942,20 @@ def classify_image_input_error(
             ProviderFailureKind.TRANSPORT_TRANSIENT,
         }:
             return ImageFailureKind.TRANSIENT
+
+    # Invalid/corrupt input is not evidence that the configured model lacks
+    # multimodal capability.  Exact media codes therefore precede the
+    # unsupported-input matcher.
+    if raw_code in _INVALID_MEDIA_CODES:
+        return ImageFailureKind.INVALID_MEDIA
+    if raw_code in _IMAGE_UNSUPPORTED_CODES:
+        return ImageFailureKind.UNSUPPORTED_INPUT
+    if _INVALID_MEDIA_RE.search(joined):
+        return ImageFailureKind.INVALID_MEDIA
+    if _IMAGE_UNSUPPORTED_RE.search(joined):
+        return ImageFailureKind.UNSUPPORTED_INPUT
+
+    if provider_kind is not None:
         if provider_kind is ProviderFailureKind.BAD_REQUEST:
             return ImageFailureKind.BAD_REQUEST
     return ImageFailureKind.UNKNOWN
@@ -838,7 +979,6 @@ def classify_image_failure(
     if kind is ImageFailureKind.INVALID_MEDIA:
         return ImageFailureClassification(
             kind=kind,
-            retry_without_image=True,
             reason="the image material is invalid or exceeds media limits",
         )
     if kind is ImageFailureKind.CONTEXT_OVERFLOW:
@@ -874,6 +1014,7 @@ __all__ = [
     "ImageProjectionResult",
     "count_image_blocks",
     "has_image_blocks",
+    "bind_image_attachment_ids",
     "project_messages",
     "project_messages_for_model",
     "project_image_messages",

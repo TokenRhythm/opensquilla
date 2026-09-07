@@ -72,6 +72,7 @@ from opensquilla.gateway.session_services import (
 )
 from opensquilla.gateway.websocket import get_registry
 from opensquilla.paths import media_root_from_config, native_io_path
+from opensquilla.session.attachment_manifest import legacy_attachment_id
 from opensquilla.session.keys import canonicalize_session_key
 from opensquilla.tools.builtin.document_format_adapters import (
     DocumentAdapterError,
@@ -316,18 +317,6 @@ def _safe_mime(value: object) -> str:
     return normalized[:120]
 
 
-def _legacy_attachment_id(
-    *,
-    session_id: str,
-    message_id: str,
-    index: int,
-    sha256: str,
-) -> str:
-    digest = hashlib.sha256(f"{session_id}\0{message_id}\0{index}\0{sha256}".encode()).digest()[:18]
-    token = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
-    return f"att_legacy_{token}"
-
-
 def _attachment_download_url(
     *,
     session_key: str,
@@ -407,7 +396,7 @@ async def _attachment_occurrences(
                     continue
             attachment_id = str(item.get("attachment_id") or "")
             if not _ATTACHMENT_ID_RE.fullmatch(attachment_id):
-                attachment_id = _legacy_attachment_id(
+                attachment_id = legacy_attachment_id(
                     session_id=session_id,
                     message_id=message_id,
                     index=index,

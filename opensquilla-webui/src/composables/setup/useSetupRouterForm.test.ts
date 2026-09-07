@@ -153,6 +153,57 @@ describe('useSetupRouterForm — openrouter-mix round-trip', () => {
     })
   })
 
+  it('keeps omitted image support unknown through a model-only save', () => {
+    const f = useSetupRouterForm()
+    f.initFromConfig({
+      enabled: true,
+      tier_profile: null,
+      tiers: {
+        c0: {
+          provider: 'openrouter',
+          model: 'operator/custom-model',
+        },
+      },
+    }, {}, 'openrouter')
+
+    expect(f.payload()).not.toHaveProperty('tiers.c0.supportsImage')
+  })
+
+  it('clears inherited image support when the deployment model changes', () => {
+    const f = useSetupRouterForm()
+    f.initFromConfig({
+      enabled: true,
+      tier_profile: 'openai',
+    }, {
+      c0: {
+        provider: 'openai',
+        model: 'preset-model',
+        supportsImage: false,
+      },
+    }, 'openai', 'follow_primary')
+
+    f.updateTierField('c0', 'model', 'operator/custom-model')
+
+    expect(f.payload()).not.toHaveProperty('tiers.c0.supportsImage')
+  })
+
+  it('round-trips an explicit false image declaration unchanged', () => {
+    const f = useSetupRouterForm()
+    f.initFromConfig({
+      enabled: true,
+      tier_profile: null,
+      tiers: {
+        c0: {
+          provider: 'openrouter',
+          model: 'operator/text-model',
+          supports_image: false,
+        },
+      },
+    }, {}, 'openrouter')
+
+    expect(f.payload()).toHaveProperty('tiers.c0.supportsImage', false)
+  })
+
   it('round-trips a tier-managed ensemble profile from snake case', () => {
     const f = useSetupRouterForm()
     f.initFromConfig({

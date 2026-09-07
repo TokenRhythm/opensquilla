@@ -268,6 +268,16 @@ class _PhysicalLegProvider(_SequenceProvider):
     def __init__(self, name: str, events: list[Any]) -> None:
         super().__init__([events])
         self.provider_name = name
+        self.message_calls: list[list[Message]] = []
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        self.message_calls.append(messages)
+        return super().chat(messages, tools=tools, config=config)
 
 
 class _CorrelationCapturingPhysicalLegProvider(_PhysicalLegProvider):
@@ -380,7 +390,7 @@ class _CapturingTurnLog:
 
 
 @pytest.mark.asyncio
-async def test_selector_preflight_rejects_ensemble_image_before_usage_or_fallback() -> None:
+async def test_selector_projects_ensemble_image_and_accounts_fallback_call() -> None:
     sink = _RecordingSink()
     fallback = _PhysicalLegProvider(
         "anthropic",
@@ -395,12 +405,19 @@ async def test_selector_preflight_rejects_ensemble_image_before_usage_or_fallbac
     with bind_usage_accounting_scope(scope):
         events = [event async for event in wrapper.chat([_image_message()])]
 
-    assert [getattr(event, "code", "") for event in events] == [
-        "ensemble_multimodal_unsupported"
-    ]
-    assert fallback.calls == 0
-    assert sink.started == []
-    assert sink.finalized == []
+    assert not any(isinstance(event, ProviderError) for event in events)
+    assert any(isinstance(event, ProviderDone) for event in events)
+    assert fallback.calls == 1
+    assert len(fallback.message_calls) == 1
+    assert not any(
+        isinstance(block, ContentBlockImage)
+        for message in fallback.message_calls[0]
+        if isinstance(message.content, list)
+        for block in message.content
+    )
+    assert "图片未分析" in str(fallback.message_calls[0])
+    assert len(sink.started) == 1
+    assert len(sink.finalized) == 1
     assert sink.unknown == []
 
 
@@ -429,7 +446,7 @@ async def test_selector_does_not_project_usage_accounting_error_as_provider_fail
 @pytest.mark.asyncio
 @pytest.mark.parametrize("image_location", ["current", "history"])
 @pytest.mark.parametrize("wrapped_by_selector", [False, True])
-async def test_agent_preflight_rejects_ensemble_image_before_call_accounting(
+async def test_agent_projects_ensemble_image_and_accounts_physical_call(
     image_location: str,
     wrapped_by_selector: bool,
 ) -> None:
@@ -484,21 +501,27 @@ async def test_agent_preflight_rejects_ensemble_image_before_call_accounting(
         )
     ]
 
-    errors = [event for event in events if isinstance(event, ErrorEvent)]
-    assert [error.code for error in errors] == ["ensemble_multimodal_unsupported"]
-    assert fallback.calls == 0
-    assert sink.started == []
-    assert sink.finalized == []
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert any(isinstance(event, EngineDoneEvent) for event in events)
+    assert fallback.calls == 1
+    assert len(fallback.message_calls) == 1
+    assert not any(
+        isinstance(block, ContentBlockImage)
+        for sent_message in fallback.message_calls[0]
+        if isinstance(sent_message.content, list)
+        for block in sent_message.content
+    )
+    assert "图片未分析" in str(fallback.message_calls[0])
+    assert len(sink.started) == 1
+    assert len(sink.finalized) == 1
     assert sink.unknown == []
-    assert tracker.rows == []
-    assert observer_calls == []
+    assert len(tracker.rows) == 1
+    assert len(observer_calls) == 1
     assert "router_fallback_hops" not in turn_metadata
-    assert not any(record["kind"] == "llm_request" for record in turn_log.records)
-    [decision] = [
-        record for record in turn_log.records if record["kind"] == "turn_policy_decision"
-    ]
-    assert decision["payload"]["code"] == "ensemble_multimodal_unsupported"
-    assert "messages" not in decision["payload"]
+    kinds = [record["kind"] for record in turn_log.records]
+    assert "image_input_projection" in kinds
+    assert "llm_request" in kinds
+    assert "llm_response" in kinds
 
 
 @pytest.mark.asyncio

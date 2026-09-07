@@ -1629,6 +1629,65 @@ def test_upsert_router_no_warning_for_matching_tiers() -> None:
     assert res.warnings == []
 
 
+def test_upsert_router_model_override_keeps_omitted_vision_support_unknown() -> None:
+    cfg = GatewayConfig(llm={"provider": "openai", "model": "gpt-5.4-mini"})
+
+    res = upsert_router(
+        cfg,
+        mode="recommended",
+        tiers={"c2": {"provider": "openai", "model": "operator/custom-model"}},
+    )
+
+    tier = res.config.squilla_router.tiers["c2"]
+    assert tier["model"] == "operator/custom-model"
+    assert "supports_image" not in tier
+    assert res.config.squilla_router.preset_binding == "custom"
+
+    persisted = res.config.to_toml_dict()
+    persisted_tier = persisted["squilla_router"]["tiers"]["c2"]
+    assert "supports_image" not in persisted_tier
+    reloaded = GatewayConfig(**persisted)
+    assert "supports_image" not in reloaded.squilla_router.tiers["c2"]
+
+
+def test_upsert_router_explicit_false_vision_support_remains_authoritative() -> None:
+    cfg = GatewayConfig(llm={"provider": "openai", "model": "gpt-5.4-mini"})
+
+    res = upsert_router(
+        cfg,
+        mode="recommended",
+        tiers={
+            "c2": {
+                "provider": "openai",
+                "model": "operator/custom-model",
+                "supportsImage": False,
+            }
+        },
+    )
+
+    assert res.config.squilla_router.tiers["c2"]["supports_image"] is False
+    persisted = res.config.to_toml_dict()
+    assert persisted["squilla_router"]["tiers"]["c2"]["supports_image"] is False
+    reloaded = GatewayConfig(**persisted)
+    assert reloaded.squilla_router.tiers["c2"]["supports_image"] is False
+
+
+def test_synthesized_managed_preset_does_not_generate_negative_vision_claims() -> None:
+    cfg = GatewayConfig(
+        llm={"provider": "groq", "model": "llama-3.3-70b-versatile"}
+    )
+
+    res = upsert_router(cfg, mode="recommended")
+
+    for tier_name in ("c0", "c1", "c2", "c3"):
+        tier = res.config.squilla_router.tiers[tier_name]
+        assert tier["model"] == "llama-3.3-70b-versatile"
+        assert "supports_image" not in tier
+    persisted = res.config.to_toml_dict()
+    for tier_name in ("c0", "c1", "c2", "c3"):
+        assert "supports_image" not in persisted["squilla_router"]["tiers"][tier_name]
+
+
 def test_upsert_router_redacts_secret_like_tier_fields() -> None:
     # Tiers are untyped dicts: a hand-written api_key must not be echoed
     # back through the router-configure RPC response.

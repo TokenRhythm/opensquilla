@@ -311,6 +311,10 @@ class _TurnRunnerPipelineExecutionAdapter(PipelineExecutionPort):
             "usage_execution_context": request.usage_execution_context,
             "provider_request_correlation": request.provider_request_correlation,
             "router_history_replay_request": request.router_history_replay_request,
+            "bound_user_message_id": request.bound_user_message_id,
+            "transcript_snapshot": request.transcript_snapshot,
+            "expected_session_id": request.expected_session_id,
+            "expected_session_epoch": request.expected_session_epoch,
         }
         accepted_kwargs = {
             name: value

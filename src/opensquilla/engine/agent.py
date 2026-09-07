@@ -18,7 +18,7 @@ import re
 import stat
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -201,12 +201,19 @@ from opensquilla.provider import (
 )
 from opensquilla.provider.correlation_context import bind_provider_request_correlation
 from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
+from opensquilla.provider.image_projection import (
+    ImageMarkerState,
+    ImageProjectionMode,
+    assert_text_only_messages,
+    classify_image_failure,
+    project_messages,
+)
+from opensquilla.provider.image_projection import (
+    count_image_blocks as count_projected_image_blocks,
+)
 from opensquilla.provider.model_identity import is_deepseek_v4_model_id
 from opensquilla.provider.protocol import (
-    IMAGE_INPUT_UNSUPPORTED_CODE,
-    IMAGE_INPUT_UNSUPPORTED_MESSAGE,
     count_provider_image_blocks,
-    image_input_admission_error,
     project_provider_final_request,
     project_provider_message_count,
     provider_metadata,
@@ -2741,31 +2748,19 @@ def _strip_historical_image_blocks(
     from replaying stale image input to a text-only route.
     """
     if preserve_images:
+        # Keep the historical object graph intact for a vision-capable route.
+        # The outbound projection below still deep-copies it before a physical
+        # provider call, so callers cannot mutate the canonical transcript.
         return messages
 
-    sanitized: list[Message] = []
-    for msg in messages:
-        content = msg.content
-        if not isinstance(content, list):
-            sanitized.append(msg)
-            continue
-
-        kept: list[Any] = []
-        omitted: list[str] = []
-        for block in content:
-            if isinstance(block, ContentBlockImage):
-                media_type = block.media_type or "image"
-                omitted.append(f"[historical image omitted: {media_type}]")
-                continue
-            kept.append(block)
-
-        if not omitted:
-            sanitized.append(msg)
-            continue
-
-        kept.extend(ContentBlockText(text=marker) for marker in omitted)
-        sanitized.append(Message(role=msg.role, content=kept))
-    return sanitized
+    # Historical images are not silently deleted.  Project them into a
+    # truthful marker, recursively (including images nested in tool results),
+    # while keeping the original transcript available for a later vision turn.
+    return project_messages(
+        messages,
+        mode=ImageProjectionMode.MARKER,
+        marker_state=ImageMarkerState.NOT_REREAD,
+    ).messages
 
 
 def _trusted_meta_replay_seed_outputs(
@@ -3635,11 +3630,12 @@ class Agent:
             preserve_tool_call_reasoning=thinking_enabled,
             preserve_reasoning_content=preserve_reasoning_content,
         )
+        declared_vision_support = str(
+            getattr(self.config, "model_vision_support", "unknown") or "unknown"
+        ).strip().lower()
         preserve_historical_images = bool(
             self.config.preserve_historical_images
-            and getattr(effective_capabilities, "supports_vision", False)
-            if effective_capabilities is not None
-            else False
+            and declared_vision_support != "unsupported"
         )
         history = _strip_historical_image_blocks(
             history,
@@ -4226,6 +4222,142 @@ class Agent:
             messages=messages,
             **payload,
         )
+
+    @staticmethod
+    def _image_attachment_ids_from_metadata(metadata: Mapping[str, Any]) -> tuple[str, ...]:
+        """Read optional attachment IDs without making them part of ChatConfig.
+
+        Attachment IDs are session/runtime metadata, not provider wire data. A
+        few callers already use slightly different spellings, so accept the
+        known aliases while keeping the value bounded and deterministic.
+        """
+
+        values: list[str] = []
+        seen: set[str] = set()
+        for key in (
+            "image_attachment_ids",
+            "image_intent_attachment_ids",
+            "attachment_ids",
+        ):
+            raw = metadata.get(key)
+            if isinstance(raw, str):
+                raw_values: Sequence[Any] = (raw,)
+            elif isinstance(raw, Sequence) and not isinstance(raw, (bytes, bytearray)):
+                raw_values = raw
+            else:
+                continue
+            for value in raw_values:
+                if not isinstance(value, str) or not value.strip():
+                    continue
+                normalized = value.strip()[:164]
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                values.append(normalized)
+        return tuple(values)
+
+    def _active_model_vision_support_for_call(self, config: Any) -> str:
+        """Resolve tri-state evidence for the exact physical selector leg."""
+
+        support: Any = getattr(config, "model_vision_support", "unknown")
+        resolver = getattr(self.provider, "active_model_vision_support", None)
+        if callable(resolver):
+            try:
+                support = resolver(config)
+            except Exception:  # noqa: BLE001 - optional selector refinement
+                support = getattr(config, "model_vision_support", "unknown")
+        normalized = str(support or "unknown").strip().lower()
+        return (
+            normalized
+            if normalized in {"supported", "unsupported", "unknown"}
+            else "unknown"
+        )
+
+    def _project_image_input_for_provider(
+        self,
+        messages: list[Message],
+        *,
+        chat_config: ChatConfig | None = None,
+        force_marker: bool = False,
+        marker_state: ImageMarkerState | str = ImageMarkerState.NOT_ANALYZED,
+        stage: str = "primary",
+        reason_override: str | None = None,
+    ) -> tuple[list[Message], Any]:
+        """Build one physical request view without mutating canonical messages.
+
+        ``Agent`` owns the logical transcript while providers consume a
+        request-local view.  Explicitly unsupported deployments and the
+        Ensemble contract receive markers; unknown deployments remain native so
+        the exact configured provider gets one capability probe.  A subsequent
+        precise image rejection can call this helper again with ``force_marker``
+        to retry the same configured model.
+        """
+
+        config = chat_config or self.config
+        support = self._active_model_vision_support_for_call(config)
+        try:
+            identity = provider_metadata(self.provider)
+        except Exception:  # noqa: BLE001 - metadata is advisory at this boundary
+            identity = None
+        provider_name = str(
+            getattr(identity, "provider_name", "")
+            or getattr(self.provider, "provider_name", "")
+            or ""
+        ).strip().casefold()
+        provider_kind = str(
+            getattr(identity, "provider_kind", "")
+            or getattr(self.provider, "provider_kind", "")
+            or ""
+        ).strip().casefold()
+        is_ensemble = provider_name == "ensemble" or provider_kind == "ensemble"
+        mode = (
+            ImageProjectionMode.MARKER
+            if force_marker or is_ensemble or support == "unsupported"
+            else ImageProjectionMode.NATIVE
+        )
+        result = project_messages(
+            messages,
+            mode=mode,
+            marker_state=marker_state,
+            attachment_ids=self._image_attachment_ids_from_metadata(
+                self.config.metadata
+            ),
+        )
+        if result.input_image_count or force_marker or is_ensemble:
+            reason = (
+                "ensemble_text_only"
+                if is_ensemble
+                else reason_override
+                or str(
+                    self.config.metadata.get("image_input_forced_rejection_reason")
+                    or (
+                        "model_vision_unsupported"
+                        if support == "unsupported"
+                        else "image_capability_probe_failed"
+                    )
+                )
+            )
+            self.config.metadata["image_input_mode"] = mode.value
+            self.config.metadata["image_input_reason"] = reason
+            self.config.metadata["image_input_count"] = result.input_image_count
+            self.config.metadata["image_input_output_count"] = result.output_image_count
+            self.config.metadata["image_input_marker_count"] = result.marker_count
+            self.config.metadata["image_input_stage"] = stage
+            self._write_turn_call_log(
+                "image_input_projection",
+                action=("project" if result.marker_count else "preserve"),
+                mode=mode.value,
+                reason=reason,
+                stage=stage,
+                image_count=result.input_image_count,
+                marker_count=result.marker_count,
+            )
+        if mode is ImageProjectionMode.MARKER:
+            # Keep this assertion close to the physical boundary. It catches a
+            # future nested content shape that the pure projector forgot while
+            # guaranteeing text-only providers never receive an image block.
+            assert_text_only_messages(result.messages)
+        return result.messages, result
 
     def _switch_to_invalid_response_fallback(
         self,
@@ -4965,12 +5097,9 @@ class Agent:
 
     @staticmethod
     def _count_image_blocks(messages: list[Message]) -> int:
-        count = 0
-        for message in messages:
-            if not isinstance(message.content, list):
-                continue
-            count += sum(1 for block in message.content if isinstance(block, ContentBlockImage))
-        return count
+        # Use the same recursive accounting as request projection so images
+        # nested in tool-result content cannot bypass a text-only boundary.
+        return count_projected_image_blocks(messages)
 
     def _dedup_repeated_tool_results_for_provider(
         self,
@@ -6869,37 +6998,51 @@ class Agent:
             _ = terminates  # always terminates today; reserved for future
             return
 
-        current_turn_image_count = count_provider_image_blocks(extra_messages or [])
+        current_turn_image_count = count_projected_image_blocks(extra_messages or [])
         forced_image_rejection = str(
             self.config.metadata.get("image_input_forced_rejection_reason") or ""
         ).strip()
-        image_admission_error = image_input_admission_error(
-            extra_messages or [],
-            vision_support=(
-                "unsupported"
-                if forced_image_rejection
-                else self.config.model_vision_support
-            ),
+        # Unsupported capability is a request-shaping decision, not a terminal
+        # turn error. Keep the image in the canonical turn and project a
+        # marker into the physical request below. Unknown deployments remain
+        # native so the configured provider can be probed once.
+        try:
+            provider_identity = provider_metadata(self.provider)
+        except Exception:  # noqa: BLE001 - provider identity is advisory here
+            provider_identity = None
+        provider_is_ensemble = (
+            str(getattr(provider_identity, "provider_name", "") or "")
+            .strip()
+            .casefold()
+            == "ensemble"
+            or str(getattr(provider_identity, "provider_kind", "") or "")
+            .strip()
+            .casefold()
+            == "ensemble"
         )
-        if forced_image_rejection or image_admission_error is not None:
-            image_input_reason = forced_image_rejection or "model_vision_unsupported"
-            self.config.metadata["image_input_mode"] = "rejected"
+        image_projection_forced = bool(
+            forced_image_rejection
+            or self.config.model_vision_support == "unsupported"
+            or provider_is_ensemble
+        )
+        image_projection_marker_state: ImageMarkerState = ImageMarkerState.NOT_ANALYZED
+        if image_projection_forced:
+            image_input_reason = (
+                "ensemble_text_only"
+                if provider_is_ensemble and not forced_image_rejection
+                else forced_image_rejection or "model_vision_unsupported"
+            )
+            self.config.metadata["image_input_mode"] = ImageProjectionMode.MARKER.value
             self.config.metadata["image_input_reason"] = image_input_reason
             self.config.metadata["image_input_count"] = current_turn_image_count
             self.config.metadata["image_input_stage"] = "primary"
             self._write_turn_call_log(
                 "image_input_preflight",
-                action="reject",
+                action="project",
                 reason=image_input_reason,
                 model=self.config.model_id or "",
                 image_count=current_turn_image_count,
             )
-            yield self._transition(AgentState.ERROR)
-            yield ErrorEvent(
-                message=IMAGE_INPUT_UNSUPPORTED_MESSAGE,
-                code=IMAGE_INPUT_UNSUPPORTED_CODE,
-            )
-            return
 
         # Use the system prompt from config (wired by gateway via identity.prompt)
         if self._context is None:
@@ -6958,11 +7101,29 @@ class Agent:
             preserve_tool_call_reasoning=thinking_enabled,
             preserve_reasoning_content=preserve_reasoning_content,
         )
+        # Preserve the sanitized-but-still-image-bearing history separately
+        # from the physical text-model view.  The marker projection below is
+        # request-local; it must not become the Agent's canonical in-memory
+        # history and make a later vision-capable turn unable to recover the
+        # original attachment.
+        canonical_sanitized_history = list(sanitized_history)
+        declared_vision_support = str(
+            self.config.model_vision_support or "unknown"
+        ).strip().lower()
         preserve_historical_images = bool(
             self.config.preserve_historical_images
-            and getattr(self.config.model_capabilities, "supports_vision", False)
-            if self.config.model_capabilities is not None
-            else False
+            and declared_vision_support != "unsupported"
+            and (
+                declared_vision_support in {"supported", "unknown"}
+                or (
+                    self.config.model_capabilities is not None
+                    and getattr(
+                        self.config.model_capabilities,
+                        "supports_vision",
+                        False,
+                    )
+                )
+            )
         )
         sanitized_history = _strip_historical_image_blocks(
             sanitized_history,
@@ -6981,6 +7142,13 @@ class Agent:
         )
         history = limit_turns(sanitized_history, self.config.max_history_turns)
         history = repair_tool_pairing(history)
+        initial_provider_history = tuple(history)
+        canonical_history = repair_tool_pairing(
+            limit_turns(
+                canonical_sanitized_history,
+                self.config.max_history_turns,
+            )
+        )
         self._write_context_stage(
             "session:limited",
             history,
@@ -7146,6 +7314,12 @@ class Agent:
         # boundary. The usage call index supplies the durable half of this
         # proof; this flag supplies the live turn half.
         turn_irreversible_effect_started = False
+        # Image capability recovery has a stricter whole-turn boundary than
+        # ordinary provider retry accounting: once any model output becomes
+        # visible or any tool starts executing, replaying the image request
+        # (or replacing it with a marker request) could duplicate observable
+        # work.  Keep this latch across provider iterations and attempts.
+        turn_image_retry_barrier_crossed = False
         # A durable inline candidate is installed only after the rebuilt
         # request crosses the provider adapter's final admission boundary.
         self._pending_durable_compaction_event = None
@@ -7858,14 +8032,11 @@ class Agent:
                     execution_leg=leg_kind,
                 )
                 return False
-            if self._count_image_blocks(turn_messages) > 0 and not supports_vision:
-                self._write_turn_call_log(
-                    "same_turn_steer_admission",
-                    action="defer_to_follow_up",
-                    reason="vision_unsupported",
-                    execution_leg=leg_kind,
-                )
-                return False
+            # Image capability never blocks a same-turn continuation.  The
+            # next physical request is independently projected: supported
+            # deployments receive the canonical image, unknown deployments
+            # receive one probe, and text-only deployments receive a marker.
+            del supports_vision
 
             if message_count_request_view is not None:
                 base_messages = message_count_request_view.materialize(turn_messages)
@@ -8456,6 +8627,11 @@ class Agent:
                 _attempt_retries_used = _retry_policy.used_attempts()
                 _invalid_response_fallback_done = False
                 _message_limit_recovery_done = False
+                # A precise provider image-capability rejection gets one
+                # request-local marker retry on the same configured model. It
+                # must not consume the generic retry budget or select an
+                # unconfigured model.
+                _image_marker_retry_done = False
                 provider_activity_id = uuid.uuid4().hex
                 next_provider_activity_reason: _ProviderActivityReason = "initial"
                 while _retry_attempt <= _fallback.max_retries:
@@ -8717,12 +8893,110 @@ class Agent:
                         self._provider_call_tool_result_retrieval_available = (
                             previous_call_retrieval
                         )
+                    # Project only this physical request. ``turn_messages`` and
+                    # ``request_turn_messages`` remain image-bearing canonical
+                    # views so a later vision-capable turn can recover the
+                    # original attachment. The projection runs after all
+                    # provider-view sanitizers because tool-result adapters may
+                    # introduce nested image blocks of their own.
+                    active_vision_support = (
+                        self._active_model_vision_support_for_call(chat_cfg)
+                    )
+                    barrier_requires_image_marker = bool(
+                        turn_image_retry_barrier_crossed
+                        and active_vision_support == "unknown"
+                        and count_projected_image_blocks(request_messages) > 0
+                    )
+                    if barrier_requires_image_marker:
+                        # Once a tool has executed (or output has escaped), an
+                        # unknown-capability native probe cannot be retried
+                        # safely. Shape this request as text up front so the
+                        # same configured model can still finish the turn.
+                        self.config.metadata["image_input_mode"] = (
+                            ImageProjectionMode.MARKER.value
+                        )
+                        self.config.metadata["image_input_reason"] = (
+                            "image_probe_unsafe_after_irreversible_effect"
+                        )
+                        self.config.metadata["image_input_stage"] = "primary"
+                    request_messages, image_projection_result = (
+                        self._project_image_input_for_provider(
+                            request_messages,
+                            chat_config=chat_cfg,
+                            force_marker=(
+                                image_projection_forced
+                                or barrier_requires_image_marker
+                            ),
+                            marker_state=image_projection_marker_state,
+                            stage="primary",
+                            reason_override=(
+                                "image_probe_unsafe_after_irreversible_effect"
+                                if barrier_requires_image_marker
+                                else None
+                            ),
+                        )
+                    )
                     validation_error = validate_provider_chat_admission(
                         self.provider,
                         request_messages,
                         chat_cfg,
                     )
                     if validation_error is not None:
+                        validation_image_failure = classify_image_failure(
+                            validation_error,
+                            provider_name=getattr(
+                                self.provider,
+                                "provider_name",
+                                "",
+                            ),
+                        )
+                        if (
+                            validation_image_failure.is_unsupported
+                            and not _image_marker_retry_done
+                            and not turn_image_retry_barrier_crossed
+                        ):
+                            image_fallback = getattr(
+                                self.provider,
+                                "fallback_after_image_rejection",
+                                None,
+                            )
+                            if callable(image_fallback) and image_fallback(
+                                "provider preflight rejected image input"
+                            ):
+                                # Router owns an explicit c0-c3 probe chain.
+                                # Keep the canonical request image-bearing for
+                                # the next configured leg; the wrapper rebinds
+                                # capability and request budgets per call.
+                                image_projection_forced = False
+                                image_projection_marker_state = (
+                                    ImageMarkerState.NOT_ANALYZED
+                                )
+                                _call_attempt += 1
+                                continue
+                            # A provider-side preflight can know more than the
+                            # catalog (for example an unlisted deployment).
+                            # Retry once with a truthful marker before any
+                            # visible output or side effect is emitted.
+                            _image_marker_retry_done = True
+                            image_projection_forced = True
+                            self.config.metadata["image_input_mode"] = (
+                                ImageProjectionMode.MARKER.value
+                            )
+                            self.config.metadata["image_input_reason"] = (
+                                "image_capability_probe_failed"
+                            )
+                            self.config.metadata["image_input_stage"] = "preflight"
+                            self._write_turn_call_log(
+                                "image_input_projection",
+                                action="retry_marker",
+                                reason="provider_preflight_rejected_image",
+                                stage="preflight",
+                                image_count=count_projected_image_blocks(
+                                    request_messages
+                                ),
+                            )
+                            _call_attempt += 1
+                            continue
                         terminal_error = ErrorEvent(
                             message=validation_error.message,
                             code=validation_error.code,
@@ -8739,7 +9013,7 @@ class Agent:
                             terminal_error = None
                             yield TextDeltaEvent(text=response_text)
                         else:
-                            if terminal_error.code == IMAGE_INPUT_UNSUPPORTED_CODE:
+                            if validation_image_failure.is_unsupported:
                                 exact_image_count = count_provider_image_blocks(
                                     request_messages
                                 )
@@ -9595,6 +9869,7 @@ class Agent:
                                 if raw_ev.text and not buffer_document_finalizer:
                                     attempt_user_visible_emitted = True
                                     attempt_irreversible_output_emitted = True
+                                    turn_image_retry_barrier_crossed = True
                                 if buffer_document_finalizer:
                                     # A mutation finalizer is an untrusted presentation
                                     # call. Hold its complete response behind the runtime
@@ -9660,6 +9935,7 @@ class Agent:
                                 # boundary immediately and cannot later be
                                 # discarded in favour of another attempt.
                                 attempt_irreversible_output_emitted = True
+                                turn_image_retry_barrier_crossed = True
                                 now_monotonic = time.monotonic()
                                 first_reasoning_activity = reasoning_activity_started_at_ms == 0
                                 if first_reasoning_activity:
@@ -10507,11 +10783,22 @@ class Agent:
                                     turn_has_error_usage_receipt = True
                                 # One-shot thinking/reasoning fallback
                                 _err_lower = raw_ev.message.lower()
+                                _stream_image_failure = classify_image_failure(
+                                    raw_ev,
+                                    provider_name=getattr(
+                                        self.provider,
+                                        "provider_name",
+                                        "",
+                                    ),
+                                )
                                 if (
                                     thinking_enabled
                                     and not _thinking_fallback_done
                                     and self.config.provider_error_thinking_fallback
                                     and not goal_terminal_final_response_pending
+                                    and not _stream_image_failure.is_unsupported
+                                    and not attempt_irreversible_output_emitted
+                                    and not turn_image_retry_barrier_crossed
                                     and ("thinking" in _err_lower or "reasoning" in _err_lower)
                                 ):
                                     _thinking_fallback_done = True
@@ -11178,6 +11465,7 @@ class Agent:
                             assistant_text_parts.append(response_text)
                             attempt_user_visible_emitted = True
                             attempt_irreversible_output_emitted = True
+                            turn_image_retry_barrier_crossed = True
                             yield TextDeltaEvent(
                                 text=response_text,
                                 generation_epoch=generation_epoch,
@@ -12212,6 +12500,25 @@ class Agent:
                             )
 
                     if not _got_error:
+                        if (
+                            _got_done_event
+                            and image_projection_result.output_image_count > 0
+                        ):
+                            # A completed native image request is exact runtime
+                            # evidence for this deployment. Preserve it across
+                            # later tool iterations so the no-retry barrier
+                            # does not unnecessarily downgrade a proven leg.
+                            self.config.model_vision_support = "supported"
+                            chat_cfg = chat_cfg.model_copy(
+                                update={"model_vision_support": "supported"}
+                            )
+                            mark_vision_supported = getattr(
+                                self.provider,
+                                "mark_active_model_vision_supported",
+                                None,
+                            )
+                            if callable(mark_vision_supported):
+                                mark_vision_supported()
                         break  # stream OK, exit retry loop
 
                     if provider_error is None:
@@ -12228,6 +12535,10 @@ class Agent:
                             raw_code=provider_error.code,
                             message=provider_error.message,
                         )
+                        image_failure = classify_image_failure(
+                            provider_error,
+                            provider_name=getattr(self.provider, "provider_name", ""),
+                        )
                         safe_provider_error_code = safe_provider_failure_code(
                             provider_error.code,
                             failure_kind.value,
@@ -12238,6 +12549,102 @@ class Agent:
                             status_code=provider_error_status_code,
                             raw_code=provider_error.code,
                         )
+                        if (
+                            image_failure.is_unsupported
+                            and not _image_marker_retry_done
+                            and not attempt_irreversible_output_emitted
+                            and not turn_image_retry_barrier_crossed
+                        ):
+                            image_fallback = getattr(
+                                self.provider,
+                                "fallback_after_image_rejection",
+                                None,
+                            )
+                            if callable(image_fallback) and image_fallback(
+                                "provider rejected image input"
+                            ):
+                                image_projection_forced = False
+                                image_projection_marker_state = (
+                                    ImageMarkerState.NOT_ANALYZED
+                                )
+                                self.config.metadata["image_input_mode"] = (
+                                    ImageProjectionMode.NATIVE.value
+                                )
+                                self.config.metadata["image_input_reason"] = (
+                                    "router_next_configured_image_probe"
+                                )
+                                self.config.metadata["image_input_stage"] = "fallback"
+                                _got_error = False
+                                provider_error = None
+                                _call_attempt += 1
+                                continue
+                            # The model was not known to be text-only until the
+                            # physical request proved it. Keep the configured
+                            # deployment, preserve the canonical image, and
+                            # retry once with an analysis-failed marker. This
+                            # branch intentionally precedes generic fallback so
+                            # no unconfigured model is introduced.
+                            _image_marker_retry_done = True
+                            image_projection_forced = True
+                            image_projection_marker_state = (
+                                ImageMarkerState.ANALYSIS_FAILED
+                            )
+                            self.config.metadata["image_input_mode"] = (
+                                ImageProjectionMode.MARKER.value
+                            )
+                            self.config.metadata["image_input_reason"] = (
+                                "provider_image_capability_rejection"
+                            )
+                            self.config.metadata["image_input_stage"] = "provider"
+                            self.config.metadata["image_input_failure_code"] = str(
+                                provider_error.code or ""
+                            )[:128]
+                            self._write_turn_call_log(
+                                "image_input_projection",
+                                action="retry_marker",
+                                reason="provider_image_capability_rejection",
+                                stage="provider",
+                                image_count=count_projected_image_blocks(
+                                    request_messages
+                                ),
+                                provider_error_code=safe_provider_error_code,
+                            )
+                            _got_error = False
+                            provider_error = None
+                            _call_attempt += 1
+                            continue
+                        if image_failure.is_unsupported:
+                            # A precise image rejection is owned exclusively
+                            # by the image policy. Once its safe same-turn
+                            # recovery is unavailable, never let a coincident
+                            # generic classification (for example
+                            # ``empty_response``) replay the request after a
+                            # visible output or tool side effect.
+                            _log.warning(
+                                "provider.image_retry_suppressed",
+                                reason=(
+                                    "image_retry_barrier_crossed"
+                                    if turn_image_retry_barrier_crossed
+                                    or attempt_irreversible_output_emitted
+                                    else "image_marker_retry_exhausted"
+                                ),
+                                provider=getattr(
+                                    self.provider,
+                                    "provider_name",
+                                    "",
+                                ),
+                            )
+                            yield self._transition(AgentState.ERROR)
+                            terminal_error = ErrorEvent(
+                                message=_safe_provider_terminal_message(
+                                    failure_kind,
+                                    provider_error.code,
+                                ),
+                                code=safe_provider_error_code,
+                                failure_kind=failure_kind.value,
+                            )
+                            yield terminal_error
+                            break
                         if attempt_irreversible_output_emitted:
                             # Text, reasoning, and tool lifecycle frames are
                             # streamed to the client immediately and cannot be
@@ -13744,6 +14151,7 @@ class Agent:
                             provider_done_for_log,
                         )
                 for pending_tool_event in pending_tool_events:
+                    turn_image_retry_barrier_crossed = True
                     yield pending_tool_event
                 pending_tool_events.clear()
 
@@ -14938,6 +15346,7 @@ class Agent:
 
                 async def _run_one(tc: ToolCall) -> ToolResult:
                     nonlocal turn_irreversible_effect_started
+                    nonlocal turn_image_retry_barrier_crossed
                     nonlocal workspace_edit_gate_details
                     nonlocal workspace_edit_gate_recovery_read_paths
                     nonlocal workspace_edit_gate_recovery_reads_remaining
@@ -15048,6 +15457,7 @@ class Agent:
                         cancellation_started = False
                         try:
                             turn_irreversible_effect_started = True
+                            turn_image_retry_barrier_crossed = True
                             execution_task = asyncio.create_task(
                                 self._execute_tool(execution_tc)
                             )
@@ -15977,18 +16387,13 @@ class Agent:
                         if isinstance(media_by_call, dict)
                         else []
                     )
-                    vision_capabilities = getattr(self.config, "model_capabilities", None)
-                    vision_enabled = (
-                        self.config.model_vision_support == "supported"
-                        or getattr(vision_capabilities, "supports_vision", False) is True
-                    )
-                    provider_name = str(
-                        getattr(self.provider, "provider_name", "") or ""
-                    ).casefold()
-                    if provider_name == "ensemble":
-                        vision_enabled = False
                     image_blocks: list[ContentBlockImage] = []
-                    if vision_enabled and isinstance(raw_media, list):
+                    # Keep authenticated tool media in the logical turn for a
+                    # possible later vision-capable request.  The shared
+                    # physical-call projection, not tool execution, decides
+                    # whether this exact deployment receives image bytes or a
+                    # truthful marker.
+                    if isinstance(raw_media, list):
                         for item in raw_media[:1]:
                             if not isinstance(item, dict):
                                 continue
@@ -17022,6 +17427,15 @@ class Agent:
             # Persist successful turns into in-memory history. Error turns are
             # persisted by TurnRunner as system errors, while their usage still
             # flows through the final DoneEvent below when provider usage exists.
+            # Restore only the unchanged historical prefix from its canonical,
+            # sanitized image-bearing view.  This is deliberately conservative:
+            # compaction or recovery may replace a prefix, in which case its
+            # authoritative rebuilt form wins instead of being overwritten.
+            if len(turn_messages) >= len(initial_provider_history) and all(
+                turn_messages[index] is projected_message
+                for index, projected_message in enumerate(initial_provider_history)
+            ):
+                turn_messages[: len(history)] = canonical_history
             self._history = list(turn_messages)
             self._write_context_stage("session:after", self._history)
 

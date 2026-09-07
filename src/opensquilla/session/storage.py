@@ -15486,15 +15486,41 @@ class SessionStorage:
     # ── SessionContextState CRUD ─────────────────────────────────────────────
 
     async def save_context_state(
-        self, state: SessionContextState
+        self,
+        state: SessionContextState,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> SessionContextState:
         """Persist portable or provider-native context state for later replay."""
+        _validate_optional_session_owner(
+            session_id=expected_session_id,
+            session_epoch=expected_session_epoch,
+        )
+        if (expected_session_id is None) != (expected_session_epoch is None):
+            raise ValueError("context state write requires an exact session owner")
+        if expected_session_id is not None and state.session_id != expected_session_id:
+            raise ValueError("context state does not match the expected session owner")
         state.session_key = canonicalize_session_key(state.session_key)
         data = state.model_dump(exclude={"id"})
         cols = list(data.keys())
         placeholders = ", ".join("?" for _ in cols)
         values = [_serialize(data[c]) for c in cols]
         async with self._write_transaction("save_context_state") as conn:
+            if expected_session_id is not None:
+                assert expected_session_epoch is not None
+                if not await _matches_session_owner_on_conn(
+                    conn,
+                    session_key=state.session_key,
+                    session_id=expected_session_id,
+                    session_epoch=expected_session_epoch,
+                ):
+                    await self._raise_stale_epoch(
+                        conn,
+                        session_key=state.session_key,
+                        expected_epoch=expected_session_epoch,
+                        expected_session_id=expected_session_id,
+                    )
             async with conn.execute(
                 "INSERT INTO session_context_states "
                 f"({', '.join(cols)}) VALUES ({placeholders})",

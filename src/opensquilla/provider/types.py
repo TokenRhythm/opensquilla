@@ -677,6 +677,9 @@ class ContentBlockImage(BaseModel):
     source_type: Literal["base64", "url"] = "base64"
     media_type: str  # "image/png", "image/jpeg", etc.
     data: str  # base64 data or URL
+    # Request-local provenance only.  It binds marker/retry decisions to the
+    # canonical occurrence without ever entering a provider wire payload.
+    attachment_id: str | None = Field(default=None, exclude=True, repr=False)
 
 
 class ContentBlockDocument(BaseModel):

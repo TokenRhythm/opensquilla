@@ -1832,8 +1832,10 @@ def test_upsert_router_custom_accepts_explicit_tiers_for_synthesized_presets():
         "description": (
             "groq balanced route (synthesized default; no curated per-tier model ladder)."
         ),
-        "supports_image": False,
     }
+    # An omitted declaration remains probeable instead of becoming a false
+    # capability claim for an unknown custom deployment.
+    assert "supports_image" not in res.config.squilla_router.tiers["c1"]
     # Router tier selection is independent from the direct/fallback model.
     assert res.config.llm.model == "m"
 

@@ -12,6 +12,7 @@ import logging
 import os
 import threading
 import time
+from collections.abc import Mapping
 from inspect import Parameter, signature
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -57,7 +58,6 @@ from opensquilla.router_runtime_diagnostics import (
 from opensquilla.router_tiers import (
     DEFAULT_TEXT_TIER,
     HIGHEST_TEXT_TIER,
-    IMAGE_TIER,
     TEXT_TIERS,
     TierConfig,
     effective_ensemble_selection_mode,
@@ -161,6 +161,142 @@ def _router_text_fallback_chain(
             entry["provider"] = provider
         chain.append(entry)
     return chain
+
+
+def _configured_text_tiers(tiers: Mapping[str, Any] | object) -> list[str]:
+    """Return executable, user-configured ``c0``-``c3`` tier ids.
+
+    ``image_model`` is intentionally not part of this list.  It is retained in
+    the configuration contract for backwards compatibility, but Router image
+    execution must never manufacture a fifth deployment behind the user's
+    four-tier ladder.  A tier with a blank model is likewise not executable.
+    """
+
+    if not isinstance(tiers, Mapping):
+        return []
+    configured: list[str] = []
+    for tier_name in TEXT_TIERS:
+        raw = tiers.get(tier_name)
+        if not isinstance(raw, Mapping):
+            continue
+        if bool(raw.get("image_only", False)):
+            continue
+        if str(raw.get("model") or "").strip():
+            configured.append(tier_name)
+    return configured
+
+
+def _declared_tier_vision_support(raw: Mapping[str, Any]) -> str | None:
+    """Read an explicit Router tier declaration without collapsing omission.
+
+    The public ``supports_image`` field historically defaults to ``false`` in
+    serialized configs.  A missing key, however, means that the operator did
+    not make a capability claim and should remain probeable (``None`` here),
+    rather than being treated as a definitive text-only model.
+    """
+
+    if "supports_image" not in raw:
+        return None
+    value = raw.get("supports_image")
+    if value is True:
+        return "supported"
+    if value is False:
+        return "unsupported"
+    return None
+
+
+def _tier_deployment_vision_support(ctx: TurnContext, raw: Mapping[str, Any]) -> str:
+    """Resolve one configured c-tier's tri-state vision evidence.
+
+    An explicit Router declaration wins.  For omitted declarations, consult
+    the shared deployment catalog when available; resolver failures remain
+    ``unknown`` so the provider can be probed exactly once by the execution
+    layer.  This helper deliberately does not infer support from a model name.
+    """
+
+    declared = _declared_tier_vision_support(raw)
+    if declared is not None:
+        return declared
+    model = str(raw.get("model") or "").strip()
+    if not model:
+        return "unsupported"
+    llm = getattr(getattr(ctx, "config", None), "llm", None)
+    active_provider = str(getattr(llm, "provider", "") or "").strip()
+    provider = str(raw.get("provider") or active_provider).strip()
+    if not provider:
+        return "unknown"
+    resolver = getattr(shared_catalog(), "resolve_deployment_vision_support", None)
+    if not callable(resolver):
+        return "unknown"
+    # Credentials are only authoritative for the active provider.  Cross-
+    # provider tiers still get a catalog/snapshot answer, but must not inherit
+    # another deployment's secrets.
+    same_authority = provider.lower() == active_provider.lower()
+    try:
+        resolved = resolver(
+            model,
+            provider=provider,
+            api_key=str(getattr(llm, "api_key", "") or "") if same_authority else "",
+            base_url=str(getattr(llm, "base_url", "") or "") if same_authority else "",
+            proxy=str(getattr(llm, "proxy", "") or "") if same_authority else "",
+        )
+    except Exception:  # noqa: BLE001 - capability discovery is best effort
+        return "unknown"
+    return resolved if resolved in {"supported", "unsupported"} else "unknown"
+
+
+def _router_image_fallback_chain(
+    selected_tier: object,
+    tiers: Mapping[str, Any] | object,
+    *,
+    tier_support: Mapping[str, str] | None = None,
+    c3_fusion_active: bool = False,
+    minimum_tier: object | None = None,
+) -> list[dict[str, str]]:
+    """Build the remaining authorized native-image probe chain.
+
+    Image requests may start on a tier whose declaration is optimistic or
+    unknown.  Explicitly text-only tiers have already supplied a definitive
+    answer and therefore need no physical image request.  Supported and
+    unknown configured tiers remain probeable; after the last rejection the
+    Agent applies its Direct-style marker projection.  The chain is canonical
+    and deterministic, independent of TOML declaration order, and never
+    includes ``image_model``.
+    """
+
+    if not isinstance(tiers, Mapping):
+        return []
+    selected = normalize_text_tier(selected_tier)
+    minimum_index = (
+        tier_index(normalize_text_tier(minimum_tier))
+        if minimum_tier is not None
+        else -1
+    )
+    result: list[dict[str, str]] = []
+    for tier_name in _configured_text_tiers(tiers):
+        if tier_name == selected:
+            continue
+        if minimum_index >= 0 and tier_index(tier_name) < minimum_index:
+            continue
+        if c3_fusion_active and tier_name == HIGHEST_TEXT_TIER:
+            continue
+        if tier_support is not None and tier_support.get(tier_name) == "unsupported":
+            continue
+        raw = tiers.get(tier_name)
+        if not isinstance(raw, Mapping):
+            continue
+        model = str(raw.get("model") or "").strip()
+        if not model:
+            continue
+        entry = {"tier": tier_name, "model": model}
+        support = tier_support.get(tier_name) if tier_support is not None else None
+        if support in {"supported", "unsupported", "unknown"}:
+            entry["vision_support"] = support
+        provider = str(raw.get("provider") or "").strip()
+        if provider:
+            entry["provider"] = provider
+        result.append(entry)
+    return result
 
 
 class RoutingHistoryStore:
@@ -1260,29 +1396,68 @@ async def finalize_squilla_router_capacity(ctx: TurnContext) -> TurnContext:
     request_input_tokens = _complete_request_estimated_tokens(ctx, semantic_message)
     ctx.metadata["large_context_capacity_required"] = True
 
-    minimum_tier = normalize_text_tier(
+    minimum_context_tier = normalize_text_tier(
         ctx.metadata.get("large_context_floor_min_tier")
+    )
+    configured_text_tiers = _configured_text_tiers(tiers)
+    artifact_facts = _artifact_routing_facts_for_turn(ctx)
+    artifact_floor = effective_artifact_floor(artifact_facts, configured_text_tiers)
+    if artifact_facts is not None and artifact_floor is None:
+        raise ArtifactRoutingUnavailableError(artifact_facts, configured_text_tiers)
+    execution_floor_candidates = [
+        tier
+        for tier in (artifact_floor, minimum_context_tier)
+        if tier is not None
+    ]
+    minimum_tier = (
+        max(execution_floor_candidates, key=tier_index)
+        if execution_floor_candidates
+        else None
     )
     selected_raw = str(ctx.metadata.get("routed_tier") or "").strip()
     selected_tier = selected_raw if selected_raw in tiers else None
     requires_image = _attachments_include_image(ctx.attachments) or (
         ctx.metadata.get("router_vision_followup_needs_image") is True
     )
-    valid_tiers = [
-        name
-        for name, raw in tiers.items()
-        if isinstance(raw, dict)
-        and not raw.get("image_only", False)
-        and (not requires_image or raw.get("supports_image", False))
-    ]
-    if requires_image:
-        valid_tiers.extend(
+    # A marker downgrade is a text request from the capacity stage's point of
+    # view.  Keep compaction/capacity admission active and consider every
+    # configured c-tier, rather than filtering the ladder down to image-only
+    # declarations (which would incorrectly fail when all four are text-only).
+    projection_required = ctx.metadata.get("image_input_projection_required") is True
+    if requires_image and projection_required and minimum_tier is None:
+        # Without an Artifact or large-context floor, a marker-only request
+        # needs no special attachment-capacity revalidation; the ordinary
+        # provider admission path still checks its exact text payload.
+        return ctx
+    if requires_image and not projection_required:
+        support_facts = ctx.metadata.get("router_image_tier_support")
+        c3_fusion_active = bool(
+            getattr(getattr(ctx.config, "llm_ensemble", None), "enabled", False)
+        ) or tier_ensemble_active(tiers, HIGHEST_TEXT_TIER)
+        valid_tiers = [
+            name
+            for name in _configured_text_tiers(tiers)
+            if (
+                (
+                    not isinstance(support_facts, Mapping)
+                    or support_facts.get(name) in {"supported", "unknown"}
+                )
+                and not (c3_fusion_active and name == HIGHEST_TEXT_TIER)
+            )
+        ]
+        requires_image_for_capacity = False
+    elif requires_image and projection_required:
+        valid_tiers = _configured_text_tiers(tiers)
+        requires_image_for_capacity = False
+    else:
+        valid_tiers = [
             name
             for name, raw in tiers.items()
             if isinstance(raw, dict)
-            and raw.get("image_only", False)
-            and raw.get("supports_image", False)
-        )
+            and not raw.get("image_only", False)
+            and str(raw.get("model") or "").strip()
+        ]
+        requires_image_for_capacity = False
     valid_tiers = sorted(
         dict.fromkeys(valid_tiers),
         key=lambda name: (0, tier_index(name)) if tier_index(name) >= 0 else (1, 0),
@@ -1304,7 +1479,7 @@ async def finalize_squilla_router_capacity(ctx: TurnContext) -> TurnContext:
         minimum_tier=admission_minimum_tier,
         material_tokens=material_tokens,
         request_input_tokens=request_input_tokens,
-        requires_image=requires_image,
+        requires_image=requires_image_for_capacity,
         active_provider_only=_capacity_active_provider_only(router_cfg),
         thinking_mode=(thinking_mode if isinstance(thinking_mode, str) else None),
         rollout_phase=str(ctx.metadata.get("rollout_phase") or "full"),
@@ -1329,10 +1504,44 @@ async def finalize_squilla_router_capacity(ctx: TurnContext) -> TurnContext:
     ctx.metadata["routed_model"] = ctx.model
     ctx.metadata["routing_applied"] = True
     ctx.metadata["applied_model"] = ctx.model
-    ctx.metadata["router_fallback_chain"] = _router_text_fallback_chain(
-        capacity_tier,
-        tiers,
-        minimum_tier,
+    if requires_image:
+        raw_tier_support = ctx.metadata.get("router_image_tier_support")
+        selected_vision_support = (
+            raw_tier_support.get(capacity_tier, "unknown")
+            if isinstance(raw_tier_support, Mapping)
+            else "unknown"
+        )
+        ctx.metadata["routed_model_vision_support"] = (
+            selected_vision_support
+            if selected_vision_support
+            in {"supported", "unsupported", "unknown"}
+            and ctx.metadata.get("image_input_mode") != "marker"
+            else "unsupported"
+        )
+    ctx.metadata["router_fallback_chain"] = (
+        _router_image_fallback_chain(
+            capacity_tier,
+            tiers,
+            tier_support=(
+                ctx.metadata.get("router_image_tier_support")
+                if isinstance(
+                    ctx.metadata.get("router_image_tier_support"),
+                    Mapping,
+                )
+                else None
+            ),
+            c3_fusion_active=bool(
+                getattr(getattr(ctx.config, "llm_ensemble", None), "enabled", False)
+            )
+            or tier_ensemble_active(tiers, HIGHEST_TEXT_TIER),
+            minimum_tier=minimum_tier,
+        )
+        if requires_image
+        else _router_text_fallback_chain(
+            capacity_tier,
+            tiers,
+            minimum_tier,
+        )
     )
     ctx.metadata["large_context_thinking_budget_tokens"] = (
         _route_thinking_budget_tokens(
@@ -1348,6 +1557,7 @@ async def finalize_squilla_router_capacity(ctx: TurnContext) -> TurnContext:
         tiers,
         capacity_tier,
         routing_applied=True,
+        force_direct=requires_image and not projection_required,
     )
     stage_router_decision(
         ctx,
@@ -1581,6 +1791,7 @@ def _flag_tier_provider_mismatch(
     tier_name: str,
     *,
     routing_applied: bool,
+    force_direct: bool = False,
 ) -> None:
     """Record the routed tier's provider; warn on unexecutable mismatches.
 
@@ -1597,16 +1808,20 @@ def _flag_tier_provider_mismatch(
         getattr(getattr(ctx.config, "llm_ensemble", None), "enabled", False)
     )
     shared_selection_mode = effective_ensemble_selection_mode(ctx.config)
-    provider_role = tier_provider_role(
-        tier_name,
-        tiers.get(tier_name),
-        shared_selection_mode=shared_selection_mode,
-        router_dynamic_members_active=router_dynamic_tier_members_active(
-            tiers,
+    provider_role = (
+        "direct"
+        if force_direct
+        else tier_provider_role(
+            tier_name,
+            tiers.get(tier_name),
             shared_selection_mode=shared_selection_mode,
+            router_dynamic_members_active=router_dynamic_tier_members_active(
+                tiers,
+                shared_selection_mode=shared_selection_mode,
+                ensemble_globally_enabled=ensemble_globally_enabled,
+            ),
             ensemble_globally_enabled=ensemble_globally_enabled,
-        ),
-        ensemble_globally_enabled=ensemble_globally_enabled,
+        )
     )
     ctx.metadata["router_tier_provider_role"] = provider_role
     if provider_role in {"dormant_draft", "blocked"}:
@@ -1657,6 +1872,7 @@ def _apply_provider_mismatch_veto(
     prompt_policy: str | None,
     *,
     routing_applied: bool,
+    force_direct: bool = False,
 ) -> tuple[RoutingDecision, str | None, str | None]:
     """Rebind a mismatched classify-path decision when veto mode is on.
 
@@ -1682,12 +1898,16 @@ def _apply_provider_mismatch_veto(
         shared_selection_mode=shared_selection_mode,
         ensemble_globally_enabled=ensemble_globally_enabled,
     )
-    selected_role = tier_provider_role(
-        decision.tier,
-        tiers.get(decision.tier),
-        shared_selection_mode=shared_selection_mode,
-        router_dynamic_members_active=dynamic_members_active,
-        ensemble_globally_enabled=ensemble_globally_enabled,
+    selected_role = (
+        "direct"
+        if force_direct
+        else tier_provider_role(
+            decision.tier,
+            tiers.get(decision.tier),
+            shared_selection_mode=shared_selection_mode,
+            router_dynamic_members_active=dynamic_members_active,
+            ensemble_globally_enabled=ensemble_globally_enabled,
+        )
     )
     if selected_role in {"dormant_draft", "blocked"}:
         return decision, thinking_mode, prompt_policy
@@ -1698,12 +1918,16 @@ def _apply_provider_mismatch_veto(
     policy_tiers = {name: dict(value) for name, value in tiers.items()}
     policy_valid_tiers: list[str] = []
     for tier_name in valid_tiers:
-        role = tier_provider_role(
-            tier_name,
-            policy_tiers.get(tier_name),
-            shared_selection_mode=shared_selection_mode,
-            router_dynamic_members_active=dynamic_members_active,
-            ensemble_globally_enabled=ensemble_globally_enabled,
+        role = (
+            "direct"
+            if force_direct
+            else tier_provider_role(
+                tier_name,
+                policy_tiers.get(tier_name),
+                shared_selection_mode=shared_selection_mode,
+                router_dynamic_members_active=dynamic_members_active,
+                ensemble_globally_enabled=ensemble_globally_enabled,
+            )
         )
         if role == "blocked":
             continue
@@ -1874,10 +2098,12 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
                 proof_max_chars
             )
 
-    # Image-aware routing: skip ML and pick directly from supports_image tiers
-    # for current uploads. Historical images require the upstream semantic
-    # follow-up gate; recent-image/sticky metadata alone is observability and
-    # replay context, not enough to force vision.
+    # Image-aware routing: skip ML and pick directly from the user's
+    # configured c0-c3 deployments for current uploads. ``image_model`` is a
+    # legacy presentation/configuration field, not an executable fifth leg.
+    # Historical images require the upstream semantic follow-up gate;
+    # recent-image/sticky metadata alone is observability and replay context,
+    # not enough to force vision.
     #
     # This runs BEFORE the empty-text guard below: the image route is
     # deterministic and never consumes the message text, so an image turn with
@@ -1887,88 +2113,226 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
     history_gate_needs_image = (
         ctx.metadata.get("router_vision_followup_needs_image") is True
     )
-    # Computed once and reused below by both the bypass and the policy
-    # engine's capability gate (which must not recompute the signal). On the
-    # classify path this is always False today — the bypass routes or raises
-    # for every image turn — which is exactly the gate's no-op default.
+    # Computed once and reused below by both the bypass and the policy engine's
+    # capability gate (which must not recompute the signal).
     turn_needs_image = current_turn_has_image or history_gate_needs_image
     if turn_needs_image:
         c3_fusion_active = bool(
             getattr(getattr(ctx.config, "llm_ensemble", None), "enabled", False)
         ) or tier_ensemble_active(tiers, HIGHEST_TEXT_TIER)
-        image_capable_tiers = {
-            name: tier
-            for name, tier in tiers.items()
-            if tier.get("supports_image", False)
+        configured_tiers = _configured_text_tiers(tiers)
+        minimum_execution_index = tier_index(minimum_execution_tier)
+        execution_eligible_tiers = [
+            name
+            for name in configured_tiers
+            if minimum_execution_index < 0
+            or tier_index(name) >= minimum_execution_index
+        ]
+        tier_support: dict[str, str] = {}
+        for name in configured_tiers:
+            raw = tiers.get(name)
+            if isinstance(raw, Mapping):
+                tier_support[name] = _tier_deployment_vision_support(ctx, raw)
+
+        # A fusion C3 deployment is an Ensemble text leg and therefore cannot
+        # consume image blocks, even when its draft row says supports_image.
+        executable_image_tiers = [
+            name
+            for name in execution_eligible_tiers
+            if tier_support.get(name) in {"supported", "unknown"}
             and not (c3_fusion_active and name == HIGHEST_TEXT_TIER)
-        }
-        image_tiers = {
-            name: tier
-            for name, tier in image_capable_tiers.items()
-            if str(tier.get("model") or "").strip()
-        }
-        if not image_tiers:
-            log.warning(
-                "squilla_router.no_image_tier",
-                note="image detected but no executable supports_image tier",
-                c3_fusion_active=c3_fusion_active,
-                empty_model_tiers=sorted(image_capable_tiers),
+        ]
+        explicitly_unsupported = [
+            name
+            for name in execution_eligible_tiers
+            if tier_support.get(name) == "unsupported"
+        ]
+
+        image_route_reason = "current_turn" if current_turn_has_image else "gate_history"
+        history_turns = 1
+        if image_route_reason == "gate_history":
+            history_turns = max(
+                1,
+                int(getattr(router_cfg, "vision_history_lookback_turns", 8) or 1),
             )
-            ctx.metadata["image_input_forced_rejection_reason"] = (
-                "router_image_route_unavailable"
+        ctx.metadata["image_route_reason"] = image_route_reason
+        ctx.metadata["route_max_history_turns"] = history_turns
+        ctx.metadata["router_image_tier_support"] = dict(tier_support)
+        ctx.metadata["router_image_configured_tiers"] = list(configured_tiers)
+
+        if executable_image_tiers:
+            # Prefer declared/catalog-proven support over an unknown probe, then
+            # use canonical c0<c1<c2<c3 order for deterministic routing.
+            ordered_image_tiers = sorted(
+                executable_image_tiers,
+                key=lambda name: (
+                    tier_support.get(name) != "supported",
+                    tier_index(name),
+                ),
             )
-            ctx.metadata["image_input_mode"] = "rejected"
-            ctx.metadata["image_input_reason"] = "router_image_route_unavailable"
-            return ctx
-        ordered_image_tiers = sorted(
-            image_tiers,
-            key=lambda name: (
-                tier_index(name) < 0,
-                tier_index(name),
-            ),
-        )
-        if IMAGE_TIER in image_tiers:
-            ordered_image_tiers = [
-                IMAGE_TIER,
-                *(name for name in ordered_image_tiers if name != IMAGE_TIER),
-            ]
-        # The dedicated image tier owns image requests regardless of TOML
-        # declaration order. Other image-capable tiers remain deterministic
-        # fallbacks, while an active C3 fusion tier is never one of them.
-        tier_name = ordered_image_tiers[0]
-        if minimum_context_tier is not None:
-            safe_image_tier = _capacity_safe_tier(
-                ctx,
-                router_cfg,
-                tiers,
-                ordered_image_tiers,
-                minimum_tier=minimum_context_tier,
-                material_tokens=material_estimated_tokens,
-                request_input_tokens=material_estimated_tokens,
-                requires_image=True,
-                active_provider_only=_capacity_active_provider_only(router_cfg),
-                rollout_phase=rollout_phase,
-            )
-            if safe_image_tier is None:
-                return _block_large_context_route(
+            tier_name = ordered_image_tiers[0]
+            if minimum_context_tier is not None:
+                safe_image_tier = _capacity_safe_tier(
                     ctx,
-                    "No image-capable SquillaRouter deployment has proven capacity "
-                    "for this attachment request.",
+                    router_cfg,
+                    tiers,
+                    ordered_image_tiers,
+                    minimum_tier=minimum_execution_tier,
+                    material_tokens=material_estimated_tokens,
+                    request_input_tokens=material_estimated_tokens,
+                    # ``ordered_image_tiers`` has already been filtered by the
+                    # tri-state catalog/declaration facts above.  Passing
+                    # ``requires_image`` here would re-read the legacy boolean
+                    # field and reject an intentionally unknown (probeable)
+                    # declaration.
+                    requires_image=False,
+                    active_provider_only=_capacity_active_provider_only(router_cfg),
+                    rollout_phase=rollout_phase,
                 )
-            tier_name = safe_image_tier
-        decision = RoutingDecision(
-            tier=tier_name,
-            model=str(image_tiers[tier_name].get("model") or "").strip(),
-            confidence=1.0,
-            source="image_route",
+                if safe_image_tier is None:
+                    return _block_large_context_route(
+                        ctx,
+                        "No image-capable SquillaRouter deployment has proven capacity "
+                        "for this attachment request.",
+                    )
+                tier_name = safe_image_tier
+            tier_cfg = tiers[tier_name]
+            decision = RoutingDecision(
+                tier=tier_name,
+                model=str(tier_cfg.get("model") or "").strip(),
+                confidence=1.0,
+                source="image_route",
+            )
+            image_input_mode = "native"
+            image_input_reason = "configured_image_capable_tier"
+            log.debug(
+                "squilla_router.image_routed",
+                tier=decision.tier,
+                model=decision.model,
+                support=tier_support.get(tier_name),
+            )
+        else:
+            # Every configured c-tier is explicitly text-only (or no c-tier is
+            # configured). Keep execution on an already configured text model
+            # and ask the Direct projection layer to replace image blocks with
+            # a truthful marker. This is a graceful downgrade, never a router
+            # admission rejection and never a switch to image_model.
+            default_tier = normalize_text_tier(
+                getattr(router_cfg, "default_tier", DEFAULT_TEXT_TIER)
+            )
+            if default_tier not in execution_eligible_tiers:
+                default_tier = (
+                    execution_eligible_tiers[0]
+                    if execution_eligible_tiers
+                    else None
+                )
+            if default_tier is None:
+                # Keep the selector's already configured head, but still mark
+                # this as an applied strict route so the execution layer
+                # installs an empty fallback tail. Otherwise a generic
+                # provider failure could reintroduce a deployment outside the
+                # user's c0-c3 ladder.
+                tier_name = normalize_text_tier(
+                    getattr(router_cfg, "default_tier", DEFAULT_TEXT_TIER)
+                ) or DEFAULT_TEXT_TIER
+                tier_cfg = {}
+                decision = RoutingDecision(
+                    tier=tier_name,
+                    model=str(ctx.model or "").strip(),
+                    confidence=1.0,
+                    source="image_route",
+                )
+                image_input_mode = "marker"
+                image_input_reason = "router_no_configured_text_tier"
+                ctx.metadata["router_image_capability_exhausted"] = True
+                ctx.metadata["image_input_projection_required"] = True
+                log.warning(
+                    "squilla_router.image_projection_without_configured_tier",
+                    c3_fusion_active=c3_fusion_active,
+                )
+            else:
+                tier_name = default_tier
+                # The image bytes will not be sent to this deployment.
+                # Ordinary Agent admission still proves the final text
+                # request, so the image-specific attachment capacity gate must
+                # not strand a tiny marker request merely because a custom
+                # model lacks catalog capacity metadata. A genuine
+                # large-context floor remains authoritative.
+                if minimum_context_tier is not None:
+                    safe_text_tier = _capacity_safe_tier(
+                        ctx,
+                        router_cfg,
+                        tiers,
+                        execution_eligible_tiers,
+                        minimum_tier=minimum_execution_tier,
+                        material_tokens=material_estimated_tokens,
+                        request_input_tokens=material_estimated_tokens,
+                        requires_image=False,
+                        active_provider_only=_capacity_active_provider_only(
+                            router_cfg
+                        ),
+                        rollout_phase=rollout_phase,
+                    )
+                    if safe_text_tier is None:
+                        return _block_large_context_route(
+                            ctx,
+                            "No configured SquillaRouter deployment has proven capacity "
+                            "for this attachment request.",
+                        )
+                    tier_name = safe_text_tier
+                tier_cfg = tiers[tier_name]
+                decision = RoutingDecision(
+                    tier=tier_name,
+                    model=str(tier_cfg.get("model") or ctx.model).strip(),
+                    confidence=1.0,
+                    source="image_route",
+                )
+                image_input_mode = "marker"
+                image_input_reason = (
+                    "router_all_configured_tiers_unsupported"
+                    if explicitly_unsupported
+                    else "router_no_configured_image_capable_tier"
+                )
+            ctx.metadata["router_image_capability_exhausted"] = True
+            ctx.metadata["image_input_projection_required"] = True
+            log.info(
+                "squilla_router.image_projection_fallback",
+                tier=tier_name,
+                configured_tiers=configured_tiers,
+                support=tier_support,
+            )
+
+        # Image shortcuts bypass the ordinary policy engine, but they still
+        # obey the same provider-mismatch veto. Restrict the rebind candidates
+        # to tiers that can execute this image mode and satisfy the effective
+        # Artifact/context floor.
+        image_veto_candidates = (
+            ordered_image_tiers
+            if image_input_mode == "native"
+            else execution_eligible_tiers
         )
-        # Vision turns are not just a text-tier routing decision: they require a
-        # model that can consume image blocks. Apply this route even during
-        # observe rollout so multimodal requests do not remain on a text tier.
+        decision, _, _ = _apply_provider_mismatch_veto(
+            ctx,
+            router_cfg,
+            tiers,
+            image_veto_candidates,
+            decision,
+            None,
+            None,
+            routing_applied=True,
+            force_direct=image_input_mode == "native",
+        )
+        tier_name = decision.tier
+        rebound_tier_cfg = tiers.get(tier_name)
+        if isinstance(rebound_tier_cfg, dict):
+            tier_cfg = rebound_tier_cfg
+
+        # Vision turns are not merely text-tier preferences: apply this route
+        # even during observe rollout so the exact configured deployment is
+        # visible to the request projection layer.
         routing_applied = True
         ctx.metadata["baseline_model"] = ctx.model
-        if routing_applied:
-            ctx.model = decision.model
+        ctx.model = decision.model
         ctx.metadata["routed_tier"] = decision.tier
         ctx.metadata["routed_model"] = decision.model
         ctx.metadata["routing_applied"] = routing_applied
@@ -1976,44 +2340,46 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         ctx.metadata["applied_model"] = ctx.model
         ctx.metadata["routing_confidence"] = decision.confidence
         ctx.metadata["routing_source"] = decision.source
-        if attachment_capacity_required or minimum_context_tier is not None:
-            ctx.metadata["router_fallback_chain"] = [
-                entry
-                for entry in _router_text_fallback_chain(
-                    decision.tier,
-                    tiers,
-                    minimum_context_tier,
-                    allow_stronger_fallbacks=artifact_facts is not None,
-                )
-                if bool(tiers.get(entry["tier"], {}).get("supports_image", False))
-            ]
-        image_route_reason = "current_turn" if current_turn_has_image else "gate_history"
-        ctx.metadata["image_route_reason"] = image_route_reason
-        history_turns = 1
-        if image_route_reason == "gate_history":
-            history_turns = max(
-                1,
-                int(getattr(router_cfg, "vision_history_lookback_turns", 8) or 1),
-            )
-        ctx.metadata["route_max_history_turns"] = history_turns
+        ctx.metadata["image_input_mode"] = image_input_mode
+        ctx.metadata["image_input_reason"] = image_input_reason
+        selected_vision_support = tier_support.get(decision.tier, "unknown")
+        ctx.metadata["routed_model_vision_support"] = (
+            selected_vision_support
+            if image_input_mode == "native"
+            and selected_vision_support in {"supported", "unsupported", "unknown"}
+            else "unsupported"
+        )
+        # Image routes are strict: selector configuration must not append an
+        # unrelated default tail.  Only supported/unknown c-tier deployments
+        # remain physical probes; explicit denials already count toward the
+        # four-tier exhaustion decision.
+        ctx.metadata["router_fallback_strict"] = True
+        ctx.metadata["router_fallback_chain"] = _router_image_fallback_chain(
+            decision.tier,
+            tiers,
+            tier_support=tier_support,
+            c3_fusion_active=c3_fusion_active,
+            minimum_tier=minimum_execution_tier,
+        )
         ctx.metadata.update(_compute_savings(decision.model, tiers))
-        # Record the image tier's provider (and assess cross-provider/mismatch)
-        # like the hold and classify paths — without this, a vision tier that
-        # declares provider=X never executes the cross-provider switch and no
-        # mismatch telemetry is emitted.
-        _flag_tier_provider_mismatch(ctx, tiers, decision.tier, routing_applied=True)
-        _record_thinking_metadata(ctx, router_cfg, image_tiers[tier_name])
+        _flag_tier_provider_mismatch(
+            ctx,
+            tiers,
+            decision.tier,
+            routing_applied=True,
+            force_direct=True,
+        )
+        _record_thinking_metadata(ctx, router_cfg, tier_cfg)
         if attachment_capacity_required or minimum_context_tier is not None:
             ctx.metadata["large_context_thinking_budget_tokens"] = (
                 _route_thinking_budget_tokens(
                     ctx,
                     router_cfg,
-                    image_tiers[tier_name],
+                    tier_cfg,
                     rollout_phase=rollout_phase,
                 )
             )
         stage_router_decision(ctx, decision=decision)
-        log.debug("squilla_router.image_routed", tier=decision.tier, model=decision.model)
         return ctx
 
     # Empty routing text cannot be classified, but a validated Artifact mutation
@@ -2283,9 +2649,10 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         default = normalize_text_tier(getattr(router_cfg, "default_tier", DEFAULT_TEXT_TIER))
         if default is None:
             default = DEFAULT_TEXT_TIER
-        tier_name = default if default in tiers else next(iter(tiers), None)
-        if tier_name is None:
+        fallback_tier = default if default in tiers else next(iter(tiers), "")
+        if not fallback_tier:
             return ctx
+        tier_name = fallback_tier
         confidence = 0.0
         source = "default"
         probs = synthetic_one_hot(tier_name)

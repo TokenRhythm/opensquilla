@@ -37,10 +37,6 @@ from opensquilla.gateway.uploads import (
 )
 from opensquilla.gateway.websocket import SubscriptionManager, get_registry
 from opensquilla.provider import ChatConfig, DoneEvent, Message, ModelCapabilities
-from opensquilla.provider.protocol import (
-    IMAGE_INPUT_UNSUPPORTED_CODE,
-    IMAGE_INPUT_UNSUPPORTED_MESSAGE,
-)
 from opensquilla.provider.types import (
     ContentBlockImage,
     ContentBlockText,
@@ -115,6 +111,8 @@ class _RecordingSelector:
         self,
         model: str,
         fallback_chain: list[object],  # noqa: ARG002
+        *,
+        preserve_existing_tail: bool = True,  # noqa: ARG002
     ) -> None:
         self.override_model(model)
 
@@ -239,11 +237,10 @@ def _configure_gateway(tmp_path: Path) -> GatewayConfig:
             "model": _TEXT_MODEL,
             "supports_image": False,
         },
-        "image_model": {
+        "c2": {
             "provider": _PROVIDER_ID,
             "model": _VISION_MODEL,
             "supports_image": True,
-            "image_only": True,
         },
     }
     config.squilla_router.default_tier = "c1"
@@ -467,6 +464,7 @@ async def _e2e_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             "gate_provider": gate_provider,
             "manager": manager,
             "runner": runner,
+            "selector": selector,
             "sink": sink,
             "storage": storage,
             "store": store,
@@ -482,7 +480,7 @@ async def _e2e_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.asyncio
-async def test_gateway_single_text_model_returns_structured_error_without_provider_call(
+async def test_gateway_single_text_model_projects_marker_and_continues(
     _e2e_stack: dict[str, Any],
 ) -> None:
     config: GatewayConfig = _e2e_stack["config"]
@@ -495,7 +493,7 @@ async def test_gateway_single_text_model_returns_structured_error_without_provid
     usage_sink: _UsageSink = _e2e_stack["usage_sink"]
     config.squilla_router.enabled = False
     key = "agent:main:single-text-model-image"
-    await manager.create(session_key=key, agent_id="main")
+    session = await manager.create(session_key=key, agent_id="main")
     subscription_manager.subscribe_messages(sink.conn_id, key)
     for index in range(6):
         await manager.append_message(key, "user", f"history-{index}:" + "u" * 5_000)
@@ -514,23 +512,123 @@ async def test_gateway_single_text_model_returns_structured_error_without_provid
         sink=sink,
         message="请分析这张图片。",
         attachments=[_file_uuid_attachment(file_uuid)],
-        expected_error_code=IMAGE_INPUT_UNSUPPORTED_CODE,
     )
 
     assert len(gate_provider.calls) == gate_calls_before
-    assert len(text_provider.calls) == text_calls_before
+    assert len(text_provider.calls) == text_calls_before + 1
     assert len(vision_provider.calls) == vision_calls_before
-    assert len(usage_sink.started) == usage_started_before
-    assert len(usage_sink.finalized) == usage_finalized_before
+    assert len(usage_sink.started) == usage_started_before + 1
+    assert len(usage_sink.finalized) == usage_finalized_before + 1
     assert len(usage_sink.unknown) == usage_unknown_before
-    assert _event_payloads(sink, "session.event.text_delta") == []
-    errors = _event_payloads(sink, "session.event.error")
-    assert errors[-1]["code"] == IMAGE_INPUT_UNSUPPORTED_CODE
-    assert errors[-1]["message"] == IMAGE_INPUT_UNSUPPORTED_MESSAGE
-    assert _event_payloads(sink, "session.event.done") == []
+    sent_messages = text_provider.calls[-1]["messages"]
+    assert not any(_message_has_image(item) for item in sent_messages)
+    assert "图片未分析" in str(sent_messages)
+    assert _event_payloads(sink, "session.event.text_delta")[-1]["text"] == "text ok"
+    assert _event_payloads(sink, "session.event.error") == []
+    assert _event_payloads(sink, "session.event.done")
     transcript = await manager.get_transcript(key)
-    assert transcript[-1].role == "system"
-    assert IMAGE_INPUT_UNSUPPORTED_MESSAGE in str(transcript[-1].content or "")
+    assert transcript[-1].role == "assistant"
+    assert transcript[-1].content == "text ok"
+    canonical = await manager.get_canonical_transcript(key)
+    image_envelope = next(
+        json.loads(str(entry.content))
+        for entry in canonical
+        if '"attachments"' in str(entry.content or "")
+    )
+    sha = image_envelope["attachments"][0]["sha256_ref"]
+    material_path = transcript_material_path(
+        Path(config.attachments.media_root or ""),
+        session.session_id,
+        sha,
+    )
+    assert material_path.read_bytes() == _PNG_BYTES
+
+
+@pytest.mark.asyncio
+async def test_gateway_direct_model_switch_replays_canonical_history_image(
+    _e2e_stack: dict[str, Any],
+) -> None:
+    config: GatewayConfig = _e2e_stack["config"]
+    manager: SessionManager = _e2e_stack["manager"]
+    selector: _RecordingSelector = _e2e_stack["selector"]
+    subscription_manager: SubscriptionManager = _e2e_stack["subscription_manager"]
+    sink: _EventSink = _e2e_stack["sink"]
+    text_provider: _RecordingProvider = _e2e_stack["text_provider"]
+    vision_provider: _RecordingProvider = _e2e_stack["vision_provider"]
+    config.squilla_router.enabled = False
+    key = "agent:main:direct-text-to-vision-switch"
+    await manager.create(session_key=key, agent_id="main")
+    subscription_manager.subscribe_messages(sink.conn_id, key)
+
+    file_uuid = await _upload_png(_e2e_stack["app"])
+    await _send_session_turn(
+        ctx=_e2e_stack["ctx"],
+        key=key,
+        sink=sink,
+        message="先保存这张图片。",
+        attachments=[_file_uuid_attachment(file_uuid)],
+    )
+    assert "图片未分析" in str(text_provider.calls[-1]["messages"])
+
+    selector.model = _VISION_MODEL
+    config.llm.model = _VISION_MODEL
+    vision_calls_before = len(vision_provider.calls)
+    await _send_session_turn(
+        ctx=_e2e_stack["ctx"],
+        key=key,
+        sink=sink,
+        message="请重新分析上一张图片。",
+    )
+
+    assert len(vision_provider.calls) == vision_calls_before + 1
+    sent_messages = vision_provider.calls[-1]["messages"]
+    historical_images = [
+        block
+        for message in sent_messages[:-1]
+        for block in _message_image_blocks(message)
+    ]
+    assert len(historical_images) == 1
+    assert base64.b64decode(historical_images[0].data, validate=True) == _PNG_BYTES
+    assert _event_payloads(sink, "session.event.error") == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_current_upload_does_not_replay_older_history_image(
+    _e2e_stack: dict[str, Any],
+) -> None:
+    manager: SessionManager = _e2e_stack["manager"]
+    subscription_manager: SubscriptionManager = _e2e_stack["subscription_manager"]
+    sink: _EventSink = _e2e_stack["sink"]
+    vision_provider: _RecordingProvider = _e2e_stack["vision_provider"]
+    key = "agent:main:current-image-only"
+    await manager.create(session_key=key, agent_id="main")
+    subscription_manager.subscribe_messages(sink.conn_id, key)
+
+    first_uuid = await _upload_png(_e2e_stack["app"])
+    await _send_session_turn(
+        ctx=_e2e_stack["ctx"],
+        key=key,
+        sink=sink,
+        message="Describe the first image.",
+        attachments=[_file_uuid_attachment(first_uuid)],
+    )
+
+    second_uuid = await _upload_png(_e2e_stack["app"])
+    await _send_session_turn(
+        ctx=_e2e_stack["ctx"],
+        key=key,
+        sink=sink,
+        message="Describe only this new image.",
+        attachments=[_file_uuid_attachment(second_uuid)],
+    )
+
+    sent_messages = vision_provider.calls[-1]["messages"]
+    image_blocks = [
+        block
+        for message in sent_messages
+        for block in _message_image_blocks(message)
+    ]
+    assert len(image_blocks) == 1
 
 
 @pytest.mark.asyncio
@@ -731,7 +829,10 @@ async def test_gateway_current_image_capacity_uses_route_limited_media_history(
         for message in sent_messages[:-1]
         if message.role == "user" and _message_has_image(message)
     ]
-    assert len(historical_users) == 1
+    # A current upload does not request unrelated historical images. Router
+    # capacity replay may conservatively allow media, but execution filters
+    # the replay to the current occurrence IDs.
+    assert historical_users == []
     decoded_images = [
         base64.b64decode(block.data, validate=True)
         for message in sent_messages
@@ -739,8 +840,8 @@ async def test_gateway_current_image_capacity_uses_route_limited_media_history(
     ]
     assert payloads[0] not in decoded_images
     assert payloads[1] not in decoded_images
-    assert payloads[2] in decoded_images
-    assert payloads[3] in decoded_images
+    assert payloads[2] not in decoded_images
+    assert payloads[3] not in decoded_images
     assert _PNG_BYTES in decoded_images
 
     # The provider may receive typed image blocks, but legacy envelope/base64
@@ -832,6 +933,7 @@ async def test_historical_image_material_is_not_replayed_without_vision_support(
         provider=provider,
         config=AgentConfig(
             model_capabilities=ModelCapabilities(supports_vision=False),
+            model_vision_support="unsupported",
             preserve_historical_images=True,
         ),
     )
