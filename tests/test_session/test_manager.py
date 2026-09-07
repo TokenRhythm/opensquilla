@@ -1921,6 +1921,156 @@ async def test_branch_fork_transcript_copies_compacted_archive(manager):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fork_mode", ["before_message", "through_turn", "prepared"])
+@pytest.mark.parametrize("archived", [False, True])
+async def test_prefix_forks_preserve_legacy_attachment_ids_with_new_message_identity(
+    manager,
+    fork_mode: str,
+    archived: bool,
+) -> None:
+    parent = await manager.create("agent:main:prefix-attachment-parent")
+    image_content = json.dumps(
+        {
+            "text": "inspect the attachments",
+            "attachments": [
+                {"type": "image/png", "name": "first.png", "data": "cG5n"},
+                {"type": "image/png", "name": "duplicate.png", "data": "cG5n"},
+                {
+                    "attachment_id": "att_existing_prefix_123",
+                    "type": "image/png",
+                    "sha256_ref": "a" * 64,
+                    "name": "stored.png",
+                },
+            ],
+        }
+    )
+    image_entry = TranscriptEntry(
+        session_id=parent.session_id,
+        session_key=parent.session_key,
+        role="user",
+        content=image_content,
+        turn_context={"turn_id": "prefix-attachment-turn"},
+    )
+    await manager._storage.append_transcript_entry(image_entry)
+    parent_manifest = build_attachment_manifest(
+        [image_entry],
+        session_id=parent.session_id,
+        session_key=parent.session_key,
+    )
+    attachment_ids = [item.attachment_id for item in parent_manifest.occurrences]
+    assert len(set(attachment_ids)) == 3
+    reference_text = "Attachment references: " + ", ".join(attachment_ids)
+    answer_entry = TranscriptEntry(
+        session_id=parent.session_id,
+        session_key=parent.session_key,
+        role="assistant",
+        content=reference_text,
+        turn_context={"turn_id": "prefix-attachment-turn"},
+    )
+    await manager._storage.append_transcript_entry(answer_entry)
+    future = await manager.append_message(parent.session_key, "user", "later request")
+    await manager._storage.create_agent_task(
+        AgentTaskRecord(
+            task_id="prefix-attachment-turn",
+            session_key=parent.session_key,
+            status=AgentTaskStatus.SUCCEEDED,
+        )
+    )
+    if archived:
+        assert await manager.persist_compaction_result(
+            parent.session_key,
+            reference_text,
+            [{"role": "user", "content": future.content}],
+            compaction_id="cmp-prefix-attachment-parent",
+        )
+
+    child_key = "agent:main:prefix-attachment-child"
+    if fork_mode == "prepared":
+        plan = await manager.prepare_prefix_branch(
+            parent.session_key,
+            child_key,
+            fork_before_message_id=future.message_id,
+        )
+        child = plan.node
+        await manager._storage.upsert_session(child)
+        for entry in plan.initial_transcript_entries:
+            await manager._storage.append_transcript_entry(entry)
+    else:
+        options = (
+            {"fork_before_message_id": future.message_id}
+            if fork_mode == "before_message"
+            else {"fork_through_turn_id": "prefix-attachment-turn"}
+        )
+        child = await manager.branch(
+            parent.session_key,
+            child_key,
+            fork_transcript=True,
+            **options,
+        )
+
+    child_entries = await manager.get_canonical_transcript(child.session_key)
+    assert len(child_entries) == 2
+    assert {entry.message_id for entry in child_entries}.isdisjoint(
+        {image_entry.message_id, answer_entry.message_id, future.message_id}
+    )
+    assert child_entries[1].content == reference_text
+    copied_envelope = json.loads(child_entries[0].content)
+    original_envelope = json.loads(image_content)
+    for original, copied, attachment_id in zip(
+        original_envelope["attachments"],
+        copied_envelope["attachments"],
+        attachment_ids,
+        strict=True,
+    ):
+        assert copied == {**original, "attachment_id": attachment_id}
+    parent_entries = await manager.get_canonical_transcript(parent.session_key)
+    assert next(
+        entry.content for entry in parent_entries if entry.message_id == image_entry.message_id
+    ) == image_content
+    child_manifest = build_attachment_manifest(
+        child_entries,
+        session_id=child.session_id,
+        session_key=child.session_key,
+    )
+    assert [item.attachment_id for item in child_manifest.occurrences] == attachment_ids
+    assert all(
+        item.source_message_id == child_entries[0].message_id
+        for item in child_manifest.occurrences
+    )
+
+    child_tail = await manager.append_message(child.session_key, "user", "child continuation")
+    assert await manager.persist_compaction_result(
+        child.session_key,
+        reference_text,
+        [{"role": "user", "content": child_tail.content}],
+        compaction_id="cmp-prefix-attachment-child",
+    )
+    states = await manager.get_context_states(
+        child.session_key,
+        provider="portable",
+        state_kind=ATTACHMENT_MANIFEST_STATE_KIND,
+    )
+    compacted_manifest = attachment_manifest_from_context_state(
+        max(states, key=lambda state: (state.created_at, state.id or 0))
+    )
+    assert [item.attachment_id for item in compacted_manifest.occurrences] == attachment_ids
+    nested = await manager.branch(
+        child.session_key,
+        "agent:main:prefix-attachment-nested",
+        fork_transcript=True,
+        fork_before_message_id=child_tail.message_id,
+    )
+    nested_entries = await manager.get_canonical_transcript(nested.session_key)
+    nested_manifest = build_attachment_manifest(
+        nested_entries,
+        session_id=nested.session_id,
+        session_key=nested.session_key,
+    )
+    assert [item.attachment_id for item in nested_manifest.occurrences] == attachment_ids
+    assert nested_entries[0].message_id != child_entries[0].message_id
+
+
+@pytest.mark.asyncio
 async def test_full_fork_preserves_attachment_message_id_for_manifest_rebuild(
     manager,
 ) -> None:

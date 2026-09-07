@@ -19,6 +19,46 @@ function makePanel(form: ReturnType<typeof useSetupRouterForm>, isOpenrouter: bo
 }
 
 describe('useSetupRouterForm — openrouter-mix round-trip', () => {
+  it('preserves the inactive legacy image row without editing it or enabling cross-provider routing', () => {
+    const form = useSetupRouterForm()
+    form.initFromConfig({
+      enabled: true,
+      tiers: {
+        c0: { provider: 'openrouter', model: 'configured/text-model' },
+        image_model: {
+          provider: 'openai',
+          model: 'saved/vision-model',
+          thinking_level: 'high',
+          supports_image: true,
+        },
+      },
+    }, {}, 'openrouter', 'custom')
+    const saved = form.payload()
+
+    form.updateTierField('image_model', 'model', 'replacement/vision-model')
+    form.updateTierField('image_model', 'provider', 'openrouter')
+    form.updateTierField('image_model', 'supportsImage', false)
+    form.updateTierField('image_model', 'thinkingLevel', 'off')
+
+    expect(form.payload()).toEqual(saved)
+    expect(form.hasMixedTierProviders.value).toBe(false)
+    expect(form.payload()).not.toHaveProperty('crossProviderTiers')
+    expect(makePanel(form, true).value.tierRows).toContainEqual(expect.objectContaining({
+      name: 'image_model',
+      provider: 'openai',
+      model: 'saved/vision-model',
+      thinkingLevel: 'high',
+      supportsImage: true,
+    }))
+    form.updateTierField('c0', 'model', 'configured/new-text-model')
+    expect(form.payload()).toMatchObject({
+      tiers: {
+        c0: { model: 'configured/new-text-model' },
+        image_model: { model: 'saved/vision-model' },
+      },
+    })
+  })
+
   it('classifies legacy openrouter mix internally but saves canonical custom mode', () => {
     const f = useSetupRouterForm()
     f.initFromConfig({ enabled: true, tier_profile: null }, {}, 'openrouter')

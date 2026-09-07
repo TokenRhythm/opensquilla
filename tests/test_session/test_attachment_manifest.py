@@ -25,6 +25,7 @@ from opensquilla.session.attachment_manifest import (
     manifest_context_state,
     merge_attachment_occurrences,
     normalize_attachment_name,
+    preserve_attachment_occurrence_ids,
 )
 from opensquilla.session.models import SessionNode, TranscriptEntry
 from opensquilla.session.storage import SessionStorage
@@ -93,6 +94,26 @@ def test_legacy_attachment_id_matches_stable_algorithm() -> None:
     assert first == forked
     assert len({first, different_index, different_message, different_hash}) == 4
     assert first.startswith("att_legacy_")
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        None,
+        "ordinary message",
+        "{malformed JSON",
+        '{"text": "no attachment"}',
+        '{"text": "invalid list", "attachments": "not an array"}',
+        '{"text": "already bound", "attachments": '
+        '[{"attachment_id": "att_existing_123", "type": "image/png", "data": "cG5n"}]}',
+    ],
+)
+def test_preserve_occurrence_ids_keeps_nonlegacy_serialization(content: str | None) -> None:
+    assert preserve_attachment_occurrence_ids(
+        content,
+        session_id="parent-session",
+        source_message_id="parent-message",
+    ) == content
 
 
 @pytest.mark.parametrize(

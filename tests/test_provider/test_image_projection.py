@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from opensquilla.provider import (
     ChatConfig,
     ContentBlockImage,
@@ -350,6 +352,70 @@ def test_image_error_classifier_prioritizes_media_and_provider_failures() -> Non
     assert not invalid.is_unsupported
     assert not invalid.caches_unsupported
     assert not invalid.retry_without_image
+
+
+def test_image_endpoint_404_is_a_capability_rejection() -> None:
+    for error in (
+        ErrorEvent(
+            code="404",
+            message="No endpoints found that support image input.",
+        ),
+        {
+            "status_code": 404,
+            "code": "not_found",
+            "message": "No endpoints found that support image inputs.",
+        },
+    ):
+        failure = classify_image_failure(error, provider_name="openrouter")
+        assert failure.kind is ImageFailureKind.UNSUPPORTED_INPUT
+        assert failure.retry_without_image
+        assert failure.caches_unsupported
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "No endpoints found for configured/text-model.",
+        "No endpoints found that support tool use.",
+        "The requested image model does not exist.",
+    ],
+)
+def test_non_image_capability_404_remains_model_not_found(message: str) -> None:
+    failure = classify_image_failure(
+        ErrorEvent(code="404", message=message),
+        provider_name="openrouter",
+    )
+    assert failure.kind is ImageFailureKind.MODEL_NOT_FOUND
+    assert not failure.retry_without_image
+    assert not failure.caches_unsupported
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (401, ImageFailureKind.AUTHENTICATION),
+        (403, ImageFailureKind.AUTHENTICATION),
+        (402, ImageFailureKind.INSUFFICIENT_CREDITS),
+        (429, ImageFailureKind.RATE_LIMITED),
+        (500, ImageFailureKind.TRANSIENT),
+        (503, ImageFailureKind.TRANSIENT),
+        (504, ImageFailureKind.TRANSIENT),
+    ],
+)
+def test_image_endpoint_wording_does_not_override_provider_failures(
+    status: int,
+    expected: ImageFailureKind,
+) -> None:
+    failure = classify_image_failure(
+        ErrorEvent(
+            code=str(status),
+            message="No endpoints found that support image input.",
+        ),
+        provider_name="openrouter",
+    )
+    assert failure.kind is expected
+    assert not failure.retry_without_image
+    assert not failure.caches_unsupported
 
 
 def test_chat_config_remains_importable_with_projection_types() -> None:

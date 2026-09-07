@@ -2565,7 +2565,7 @@ describe('useSetupCatalog fresh-install provider semantics', () => {
     app.unmount()
   })
 
-  it('invalidates saved C3 readiness when an independent image-model row is edited', async () => {
+  it('keeps saved C3 readiness when an inactive legacy image row rejects an edit', async () => {
     mockProviderState(
       {
         ...configuredProviderStatus('tokenrhythm'),
@@ -2618,7 +2618,11 @@ describe('useSetupCatalog fresh-install provider semantics', () => {
     expect(api.modelStrategyPanel.value.router.tierEnsembleStatusFresh).toBe(true)
 
     api.updateTierField('image_model', 'model', 'vision-model-v2')
-    expect(api.modelStrategyPanel.value.router.tierEnsembleStatusFresh).toBe(false)
+    expect(api.modelStrategyPanel.value.router.tierEnsembleStatusFresh).toBe(true)
+    expect(api.modelStrategyPanel.value.router.tierRows).toContainEqual(expect.objectContaining({
+      name: 'image_model',
+      model: 'vision-model',
+    }))
     expect(api.modelStrategyPanel.value.router.tierEnsembleStatus).toMatchObject({
       runtimeStatus: 'blocked',
       fixedFallbackReady: false,

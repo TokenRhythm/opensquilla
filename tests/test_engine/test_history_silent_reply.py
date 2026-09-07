@@ -153,6 +153,7 @@ async def test_turn_runner_load_history_passes_goal_provenance_to_sanitizer() ->
             preserve_historical_images=False,
         ),
         set_history=MagicMock(),
+        set_request_image_context=MagicMock(),
     )
 
     await runner._load_history(agent, "agent:main:test", trim_last_user=False)

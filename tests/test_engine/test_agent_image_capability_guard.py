@@ -54,6 +54,9 @@ class _RecordingProvider:
 
 
 class _RejectImageOnceProvider(_RecordingProvider):
+    rejection_code = "image_input_unsupported"
+    rejection_message = "This model does not support image input."
+
     def chat(
         self,
         messages: list[Message],
@@ -71,8 +74,8 @@ class _RejectImageOnceProvider(_RecordingProvider):
 
     async def _rejection_stream(self) -> AsyncIterator[Any]:
         yield ProviderErrorEvent(
-            code="image_input_unsupported",
-            message="This model does not support image input.",
+            code=self.rejection_code,
+            message=self.rejection_message,
         )
 
 
@@ -339,9 +342,22 @@ async def test_unknown_model_capability_defers_to_provider() -> None:
     assert len(provider.calls) == 1
 
 
+@pytest.mark.parametrize(
+    ("rejection_code", "rejection_message"),
+    [
+        ("image_input_unsupported", "This model does not support image input."),
+        ("404", "No endpoints found that support image input."),
+    ],
+)
 @pytest.mark.asyncio
-async def test_unknown_model_retries_same_model_with_failure_marker() -> None:
+async def test_unknown_model_retries_same_model_with_failure_marker(
+    rejection_code: str,
+    rejection_message: str,
+) -> None:
     provider = _RejectImageOnceProvider()
+    provider.provider_name = "openrouter"
+    provider.rejection_code = rejection_code
+    provider.rejection_message = rejection_message
     original = _image_message()
     agent = Agent(
         provider=provider,
@@ -421,9 +437,22 @@ async def test_precise_preflight_rejection_retries_with_marker(
     assert not any(isinstance(event, ErrorEvent) for event in events)
 
 
+@pytest.mark.parametrize(
+    ("rejection_code", "rejection_message"),
+    [
+        ("image_input_unsupported", "This model does not support image input."),
+        ("404", "No endpoints found that support image input."),
+    ],
+)
 @pytest.mark.asyncio
-async def test_router_exhausts_four_configured_models_before_direct_marker() -> None:
+async def test_router_exhausts_four_configured_models_before_direct_marker(
+    rejection_code: str,
+    rejection_message: str,
+) -> None:
     provider = _RouterProbeProvider()
+    provider.provider_name = "openrouter"
+    provider.rejection_code = rejection_code
+    provider.rejection_message = rejection_message
     original = _image_message()
     agent = Agent(
         provider=provider,

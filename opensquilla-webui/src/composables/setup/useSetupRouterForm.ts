@@ -360,6 +360,7 @@ export function useSetupRouterForm() {
   const tierProviderIds = computed(() => {
     const ids = new Set<string>()
     Object.entries(tierValues.value).forEach(([name, tier]) => {
+      if (name === IMAGE_TIER) return
       if (!routerTierProviderParticipates(name, tier, routerProviderRoles.value)) return
       const provider = String(tier.provider || '').trim().toLowerCase()
       if (provider) ids.add(provider)
@@ -471,6 +472,7 @@ export function useSetupRouterForm() {
   }
 
   function updateTierField(name: string, key: keyof SetupTierValue, value: string | boolean) {
+    if (name === IMAGE_TIER) return
     const tier = tierValues.value[name]
     if (!tier) return
     if (key === 'ensembleEnabled' && (normalizeRouterTier(name) || name) !== 'c3') return

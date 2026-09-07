@@ -290,6 +290,98 @@ async def test_bound_plain_text_message_does_not_replay_unrelated_archived_image
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("archived", [False, True])
+@pytest.mark.parametrize("vision_support", ["supported", "unknown", "unsupported"])
+async def test_explicit_images_survive_a_full_history_window(
+    archived: bool,
+    vision_support: str,
+) -> None:
+    manager = _CanonicalSessionManager()
+    key = "agent:main:referenced-image-window"
+    config = GatewayConfig(llm={"provider": "openrouter"})
+    config.squilla_router.vision_history_lookback_turns = 0
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager, config=config)
+    node = await manager.create(key)
+    image_entries = [
+        _TranscriptEntry(
+            role="user",
+            content=_inline_image_envelope(f"Old instruction {index}.", bytes([index])),
+            message_id=f"historical-image-{index}",
+        )
+        for index in range(3)
+    ]
+    tail = [
+        _TranscriptEntry(role="user", content="Recent question.", message_id="recent-user"),
+        _TranscriptEntry(role="assistant", content="Recent answer.", message_id="recent-answer"),
+        _TranscriptEntry(role="user", content="Compare the selected images.", message_id="current"),
+        _TranscriptEntry(role="user", content="Queued future input.", message_id="queued"),
+    ]
+    manager._canonical[key] = [*image_entries, *tail]
+    manager._transcripts[key] = tail if archived else [*image_entries, *tail]
+    manifest = build_attachment_manifest(
+        image_entries, session_id=node.session_id, session_key=key,
+    )
+    requested_ids = [item.attachment_id for item in manifest.occurrences[:2]]
+    provider = _CapturingProvider()
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=1,
+            max_history_turns=1,
+            model_id="configured-model",
+            model_vision_support=vision_support,
+            metadata={"image_intent_attachment_ids": requested_ids},
+        ),
+    )
+
+    await runner._load_history(agent, key, bound_user_message_id="current")
+    # A second load replaces request context instead of accumulating images.
+    await runner._load_history(agent, key, bound_user_message_id="current")
+    admission_messages = agent._assemble_compaction_consumer_request(
+        replay_summary="Earlier conversation.",
+        kept_entries=[],
+        active_user_message=tail[2].content,
+        active_user_in_history=False,
+        bound_user_message_id=None,
+        attachment_messages=None,
+        runtime_context_message=Message(role="user", content="[Runtime context for this turn]"),
+    )
+    assert admission_messages is not None
+    assert all(attachment_id in str(admission_messages) for attachment_id in requested_ids)
+
+    events = [event async for event in agent.run_turn(tail[2].content)]
+
+    assert any(event.kind == "done" for event in events)
+    sent = provider.calls[0]["messages"]
+    image_blocks = [
+        block
+        for message in sent
+        if isinstance(message.content, list)
+        for block in message.content
+        if isinstance(block, ContentBlockImage)
+    ]
+    assert [block.data for block in image_blocks] == (
+        [] if vision_support == "unsupported" else [_b64(bytes([0])), _b64(bytes([1]))]
+    )
+    assert all(attachment_id in str(sent) for attachment_id in requested_ids)
+    assert manifest.occurrences[2].attachment_id not in str(sent)
+    assert "Recent question." in str(sent)
+    assert "Recent answer." in str(sent)
+    assert "Old instruction" not in str(sent)
+    assert "Queued future input." not in str(sent)
+    if vision_support == "unsupported":
+        assert "图片" in str(sent)
+    assert manager._canonical[key][0] is image_entries[0]
+    assert "attachment_id" not in image_entries[0].content
+
+    agent.clear_history()
+    async for _ in agent.run_turn("Answer without historical input."):
+        pass
+    assert not any(_message_has_image(message) for message in provider.calls[1]["messages"])
+    assert not any(attachment_id in str(provider.calls[1]) for attachment_id in requested_ids)
+
+
+@pytest.mark.asyncio
 async def test_explicit_attachment_id_rehydrates_image_from_compacted_archive() -> None:
     manager = _CanonicalSessionManager()
     key = "agent:main:compacted-image-id-replay"

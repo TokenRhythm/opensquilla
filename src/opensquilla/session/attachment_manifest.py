@@ -412,6 +412,48 @@ def extract_attachment_occurrences(
     return tuple(result)
 
 
+def preserve_attachment_occurrence_ids(
+    content: str | None,
+    *,
+    session_id: str,
+    source_message_id: str,
+) -> str | None:
+    """Bind legacy occurrence IDs before copying an envelope to a new message.
+
+    Prefix forks intentionally allocate new message identities.  Persist the
+    source occurrence identity in the copied envelope so existing attachment
+    references remain valid independently of the copied message's new ID.
+    Only missing or invalid attachment IDs change; material and user text are
+    retained, and an already bound envelope keeps its original serialization.
+    """
+
+    parsed = _envelope_from_content(content)
+    if parsed is None:
+        return content
+    attachments = parsed.get("attachments")
+    if not isinstance(attachments, list) or not any(
+        isinstance(item, Mapping) and valid_attachment_id(item.get("attachment_id")) is None
+        for item in attachments
+    ):
+        return content
+    occurrences = extract_attachment_occurrences_from_envelope(
+        parsed,
+        session_id=session_id,
+        source_message_id=source_message_id,
+    )
+    copied_attachments = list(attachments)
+    for occurrence in occurrences:
+        item = attachments[occurrence.ordinal]
+        copied_attachments[occurrence.ordinal] = {
+            **item,
+            "attachment_id": occurrence.attachment_id,
+        }
+    return json.dumps(
+        {**parsed, "attachments": copied_attachments},
+        ensure_ascii=False,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class AttachmentOccurrence:
     """One logical attachment occurrence in canonical session history."""
@@ -911,6 +953,7 @@ __all__ = [
     "merge_attachment_occurrences",
     "normalize_attachment_mime",
     "normalize_attachment_name",
+    "preserve_attachment_occurrence_ids",
     "valid_attachment_id",
     "valid_sha256",
 ]

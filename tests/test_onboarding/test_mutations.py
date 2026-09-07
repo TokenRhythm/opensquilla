@@ -1682,6 +1682,45 @@ def test_upsert_router_forces_image_model_role_invariants():
     assert image_tier["image_only"] is True
 
 
+def test_upsert_router_warns_and_round_trips_legacy_image_model():
+    cfg = GatewayConfig(llm={"provider": "openrouter", "model": "configured/text-model"})
+    tiers = {
+        name: {"provider": "openrouter", "model": f"configured/{name}", "supports_image": False}
+        for name in ("c0", "c1", "c2", "c3")
+    }
+    tiers["image_model"] = {
+        "provider": "openai",
+        "model": "saved/vision-model",
+        "description": "Saved legacy image setting",
+        "thinking_level": "high",
+        "supports_image": True,
+        "image_only": True,
+    }
+    cfg.squilla_router.tiers = tiers
+    cfg.squilla_router.tier_profile = None
+
+    saved = upsert_router(cfg, mode="custom")
+    assert len(saved.warnings) == 1
+    assert "image_model" in saved.warnings[0]
+    assert "not used for image input" in saved.warnings[0]
+    assert "c0-c3" in saved.warnings[0]
+    assert saved.config.squilla_router.tiers["image_model"] == tiers["image_model"]
+    assert saved.public_payload["tiers"]["image_model"] == tiers["image_model"]
+    assert all(
+        saved.config.squilla_router.tiers[name]["model"] == tiers[name]["model"]
+        for name in ("c0", "c1", "c2", "c3")
+    )
+
+    reloaded = GatewayConfig.model_validate(saved.config.to_toml_dict())
+    resaved = upsert_router(reloaded, mode="custom")
+    assert resaved.config.squilla_router.tiers["image_model"] == tiers["image_model"]
+    assert resaved.warnings == saved.warnings
+
+    disabled = upsert_router(resaved.config, mode="disabled")
+    assert disabled.warnings == []
+    assert disabled.config.squilla_router.tiers["image_model"] == tiers["image_model"]
+
+
 def test_upsert_router_can_disable():
     cfg = GatewayConfig(llm={"provider": "openrouter", "model": "deepseek/x"})
 

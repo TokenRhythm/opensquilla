@@ -14316,6 +14316,7 @@ class TurnRunner:
         assistant replies. When the id is absent or not found, fall back to the
         positional trim.
         """
+        agent.set_request_image_context([])
         if self._session_manager is None:
             return None
 
@@ -14557,7 +14558,7 @@ class TurnRunner:
             or 0
         )
         image_replay_entry_indexes: set[int] = set()
-        archived_image_replay_entries: list[Any] = []
+        request_image_replay_entries: list[Any] = []
         bound_image_replay_entries: list[Any] = []
         requested_source_message_ids: set[str] = set()
         image_replay_session_id: str | None = None
@@ -14592,11 +14593,6 @@ class TurnRunner:
             if image_replay_session_id is None:
                 image_replay_session_id = session_key
 
-            active_message_ids = {
-                str(getattr(entry, "message_id", "") or "")
-                for entry in transcript
-                if getattr(entry, "message_id", None)
-            }
             if bound_attachment_replay_requested:
                 bound_image_replay_entries = [
                     entry
@@ -14695,15 +14691,34 @@ class TurnRunner:
                     )
             else:
                 candidate_entries = candidate_entries[-lookback:]
-            archived_image_replay_entries = [
+            active_message_ids = {
+                str(getattr(entry, "message_id", "") or "")
+                for entry in transcript
+                if getattr(entry, "message_id", None)
+            }
+            replayed_active_message_ids = {
+                str(getattr(transcript[index], "message_id", "") or "")
+                for index in image_replay_entry_indexes
+            }
+            request_image_replay_entries = [
                 entry
                 for entry in candidate_entries
-                if (
-                    str(getattr(entry, "message_id", "") or "")
-                    and str(getattr(entry, "message_id", "") or "")
-                    not in active_message_ids
-                )
+                if requested_attachment_ids
+                or str(getattr(entry, "message_id", "") or "") not in active_message_ids
+                or str(getattr(entry, "message_id", "") or "") in replayed_active_message_ids
             ]
+            # Requested attachments are injected after ordinary history is
+            # limited. Do not also send their bytes from an active raw row.
+            request_image_message_ids = {
+                str(getattr(entry, "message_id", "") or "")
+                for entry in request_image_replay_entries
+            }
+            image_replay_entry_indexes.difference_update(
+                index
+                for index, entry in enumerate(transcript)
+                if str(getattr(entry, "message_id", "") or "")
+                in request_image_message_ids
+            )
         attachment_replay_session_id = image_replay_session_id
         history_has_image_envelope = any(
             getattr(entry, "role", None) == "user"
@@ -14760,15 +14775,13 @@ class TurnRunner:
         history = list(replay.messages)
         summary_markers.extend(replay.legacy_summary_markers)
 
-        # Rows moved to the compacted archive are not part of the ordinary
-        # provider replay.  When the route explicitly needs an image, add only
-        # the selected historical user envelopes here; summaries and the
-        # active tail remain the primary conversational context.  This keeps
-        # the archive authoritative for media without replaying every old
-        # message after each compaction.
-        if archived_image_replay_entries:
-            archived_history: list[Message] = []
-            for entry in archived_image_replay_entries:
+        # Image selection belongs to this request, even when its source row
+        # lives in the archive or outside the ordinary history window. Bind
+        # only attachment content as protected input; do not replay old user
+        # instructions as new instructions alongside it.
+        request_image_context: list[Message] = []
+        if request_image_replay_entries:
+            for entry in request_image_replay_entries:
                 raw_content = str(getattr(entry, "content", "") or "")
                 if not raw_content:
                     continue
@@ -14782,22 +14795,16 @@ class TurnRunner:
                     workspace_dir=workspace_dir,
                     historical_materializer=history_materializer,
                     source_message_id=getattr(entry, "message_id", None),
+                    include_envelope_text=False,
                 )
-                archived_history.extend(
+                request_image_context.extend(
                     reconstruct_messages_from_entry(
                         "user",
                         replay_content,
-                        getattr(entry, "tool_calls", None),
-                        getattr(entry, "reasoning_content", None),
-                        turn_context=(
-                            getattr(entry, "turn_context", None)
-                            if isinstance(getattr(entry, "turn_context", None), dict)
-                            else None
-                        ),
+                        None,
+                        None,
                     )
                 )
-            if archived_history:
-                history = archived_history + history
         if bound_image_replay_entries:
             # The caller re-appends the bound prompt text, so inject only its
             # attachment projection here.  This works for both active and
@@ -14829,7 +14836,8 @@ class TurnRunner:
                         )
                     )
             if bound_attachment_history:
-                history.extend(bound_attachment_history)
+                request_image_context.extend(bound_attachment_history)
+        agent.set_request_image_context(request_image_context)
         if restricted_turn:
             # Context states, durable summaries, and legacy summary markers
             # were produced before this turn's restricted provider projection.

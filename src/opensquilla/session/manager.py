@@ -28,6 +28,7 @@ from opensquilla.session.attachment_manifest import (
     attachment_manifest_from_context_state,
     build_attachment_manifest,
     manifest_context_state,
+    preserve_attachment_occurrence_ids,
 )
 from opensquilla.session.compaction import (
     CompactionConfig,
@@ -1914,7 +1915,15 @@ class SessionManager:
                             else str(uuid.uuid4())
                         ),
                         role=entry.role,
-                        content=entry.content,
+                        content=(
+                            preserve_attachment_occurrence_ids(
+                                entry.content,
+                                session_id=parent.session_id,
+                                source_message_id=entry.message_id,
+                            )
+                            if is_prefix_fork and entry.role == "user"
+                            else entry.content
+                        ),
                         tool_calls=entry.tool_calls,
                         tool_call_id=entry.tool_call_id,
                         reasoning_content=entry.reasoning_content,
@@ -2067,7 +2076,15 @@ class SessionManager:
                 session_id=child.session_id,
                 session_key=new_session_key,
                 role=entry.role,
-                content=entry.content,
+                content=(
+                    preserve_attachment_occurrence_ids(
+                        entry.content,
+                        session_id=parent.session_id,
+                        source_message_id=entry.message_id,
+                    )
+                    if entry.role == "user"
+                    else entry.content
+                ),
                 tool_calls=entry.tool_calls,
                 tool_call_id=entry.tool_call_id,
                 reasoning_content=entry.reasoning_content,

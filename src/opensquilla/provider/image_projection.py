@@ -863,6 +863,9 @@ _IMAGE_UNSUPPORTED_RE = re.compile(
     r"|(?:does not support|unsupported|not supported|不支持|无法处理).{0,80}"
     r"(?:image|images|vision|multimodal|picture|图片|图像|视觉)",
 )
+_IMAGE_ENDPOINT_UNAVAILABLE_RE = re.compile(
+    r"\bno endpoints found that support image inputs?\b",
+)
 _INVALID_MEDIA_RE = re.compile(
     r"(?:image|images|picture|图片|图像).{0,80}"
     r"(?:invalid|corrupt|malformed|decode|format|mime|media type|too large|"
@@ -934,6 +937,11 @@ def classify_image_input_error(
         if provider_kind is ProviderFailureKind.RATE_LIMITED:
             return ImageFailureKind.RATE_LIMITED
         if provider_kind is ProviderFailureKind.MODEL_NOT_FOUND:
+            # An aggregator can use 404 for a valid model whose endpoints
+            # cannot accept the requested modality. Only this precise image
+            # admission response overrides the ordinary missing-model path.
+            if status_code == 404 and _IMAGE_ENDPOINT_UNAVAILABLE_RE.search(message):
+                return ImageFailureKind.UNSUPPORTED_INPUT
             return ImageFailureKind.MODEL_NOT_FOUND
         if provider_kind is ProviderFailureKind.POLICY_REFUSAL:
             return ImageFailureKind.POLICY_REFUSAL

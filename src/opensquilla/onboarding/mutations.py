@@ -526,6 +526,8 @@ def _cross_provider_tier_warnings(
         ensemble_globally_enabled=ensemble_globally_enabled,
     )
     for tier_name in sorted(tiers):
+        if tier_name == "image_model":
+            continue
         tier = tiers.get(tier_name)
         if not isinstance(tier, dict):
             continue
@@ -1277,6 +1279,14 @@ def upsert_router(
             ),
             llm_profiles=getattr(config, "llm_profiles", None),
         )
+        legacy_image_tier = (router_payload.get("tiers") or {}).get("image_model")
+        if isinstance(legacy_image_tier, dict) and legacy_image_tier.get("model"):
+            warnings.append(
+                "The legacy image_model setting is preserved for compatibility "
+                "but is not used for image input. Configure an image-capable "
+                "model in c0-c3; if none can process images, the turn continues "
+                "with an image-not-analyzed marker and keeps the original image."
+            )
 
     new_cfg = _clone(config)
     new_cfg.squilla_router = SquillaRouterConfig(**router_payload)

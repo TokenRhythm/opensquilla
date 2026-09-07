@@ -3024,6 +3024,7 @@ class Agent:
 
         self._state: AgentState = AgentState.IDLE
         self._history: list[Message] = []
+        self._request_image_context: list[Message] = []
         self._context: ContextAssembly | None = None
         # Typed dependency surface. Either constructor injection or legacy
         # attribute assignment from the runtime is accepted; both reach the same
@@ -3675,6 +3676,7 @@ class Agent:
             turn_messages.append(skills_message)
         request_context_insert_index = len(turn_messages)
         runtime_context_insert_index = len(turn_messages)
+        turn_messages.extend(self._request_image_context)
         if attachment_messages:
             turn_messages.extend(attachment_messages)
         elif active_user_message:
@@ -6659,9 +6661,20 @@ class Agent:
 
     def clear_history(self) -> None:
         self._history = []
+        self._request_image_context = []
 
     def set_history(self, messages: list[Message]) -> None:
         self._history = list(messages)
+
+    def set_request_image_context(self, messages: list[Message]) -> None:
+        """Bind recovered attachments to the next request's protected input.
+
+        These messages are selected from the canonical transcript by the
+        runner. They share current-upload budgeting and projection, rather
+        than competing with ordinary history for the recent-turn window.
+        """
+
+        self._request_image_context = [message.model_copy(deep=True) for message in messages]
 
     def history_snapshot(self) -> list[Message]:
         """Return a detached history list for read-only session forks."""
@@ -6812,12 +6825,13 @@ class Agent:
             with bind_usage_accounting_scope(scope):
                 async for event in self._turn_generator(
                     message,
-                    extra_messages,
+                    [*self._request_image_context, *(extra_messages or [])] or None,
                     semantic_message,
                     pending_input_provider=pending_input_provider,
                 ):
                     yield event
         finally:
+            self._request_image_context = []
             # A staged candidate is never an implicit commit.  If the turn is
             # cancelled, times out, or exits without document_finish, reject
             # the draft before releasing the rest of the turn authorities.

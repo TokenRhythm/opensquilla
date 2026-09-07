@@ -220,7 +220,7 @@ describe('SetupTierTable — editable routing rows', () => {
     expect(tooltip.textContent).toContain('Current fusion plan is ready')
     expect(tooltip.textContent)
       .toContain('Fixed and fallback model: OpenRouter · deepseek/deepseek-v4-pro')
-    expect(tooltip.textContent).toContain('image requests still use the Image model configuration')
+    expect(tooltip.textContent).toContain('Router image processing uses only configured C0–C3 models')
     expect(details.dataset.open).toBe('false')
     details.parentElement?.dispatchEvent(new MouseEvent('mouseenter'))
     await nextTick()
@@ -703,7 +703,7 @@ describe('SetupTierTable — editable routing rows', () => {
     app.unmount()
   })
 
-  it('disables only C3 image input while keeping the dedicated image route editable', async () => {
+  it('keeps the legacy image row visible and disabled while explaining C0–C3 routing', async () => {
     const { app, el } = await mountTable({
       rows: [
         {
@@ -720,7 +720,11 @@ describe('SetupTierTable — editable routing rows', () => {
           supportsImage: true,
         },
       ],
-      providerOptions: [{ providerId: 'openai', label: 'OpenAI' }],
+      providerCredentialStatus: [{ provider: 'openai', available: false }],
+      providerOptions: [
+        { providerId: 'openai', label: 'OpenAI' },
+        { providerId: 'openrouter', label: 'OpenRouter' },
+      ],
     })
 
     const c3Image = el.querySelector<HTMLInputElement>('input[aria-label="c3 supports image"]')!
@@ -728,12 +732,18 @@ describe('SetupTierTable — editable routing rows', () => {
     expect(c3Image.disabled).toBe(true)
     const imageModel = el.querySelector<HTMLInputElement>('input[aria-label="image_model model"]')!
     expect(imageModel.value).toBe('vision-model')
-    expect(imageModel.disabled).toBe(false)
-    expect(el.querySelector<HTMLSelectElement>('select[aria-label="image_model thinking level"]')?.disabled).toBe(false)
+    expect(imageModel.disabled).toBe(true)
+    expect(imageModel.closest('[role="row"]')?.querySelector('.setup-tier-table__provider-warning')).toBeNull()
+    expect(el.querySelector('[aria-label="image_model request entry"]')?.getAttribute('aria-invalid')).toBeNull()
+    expect(el.querySelector<HTMLSelectElement>('select[aria-label="image_model request entry"]')?.disabled).toBe(true)
+    expect(el.querySelector<HTMLSelectElement>('select[aria-label="image_model thinking level"]')?.disabled).toBe(true)
+    expect(el.querySelector<HTMLSelectElement>('select[aria-label="c3 request entry"]')?.disabled).toBe(false)
     const imageModelSwitch = el.querySelector<HTMLInputElement>('input[aria-label="image_model supports image"]')!
     expect(imageModelSwitch.checked).toBe(true)
-    expect(imageModelSwitch.disabled).toBe(false)
-    expect(el.textContent).toContain('image requests still use the Image model configuration')
+    expect(imageModelSwitch.disabled).toBe(true)
+    expect(el.textContent).toContain('Router image processing uses only configured C0–C3 models')
+    expect(el.textContent).toContain('Legacy compatibility setting: this model is preserved but not used for image input')
+    expect(el.textContent).toContain('Configure an image-capable model in C0–C3')
     app.unmount()
   })
 

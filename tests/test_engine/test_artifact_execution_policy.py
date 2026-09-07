@@ -507,6 +507,9 @@ async def test_restricted_history_load_omits_durable_summary_plaintext() -> None
         def set_history(self, history: list[Any]) -> None:
             self.history = history
 
+        def set_request_image_context(self, messages: list[Any]) -> None:
+            assert messages == []
+
     restricted_agent = _HistoryCapture()
     restricted_summary = await runner._load_history(
         restricted_agent,
