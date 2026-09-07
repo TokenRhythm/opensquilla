@@ -343,7 +343,7 @@ Start-Sleep -Seconds 60
         if (process.env[name] !== undefined) debuggerEnv[name] = process.env[name]
       }
       const debuggerChild = spawn(debuggerPath, [
-        '-pvr', '-pd', '-noshell', '-nosqm', '-sins', '-ses', '-netsyms:no',
+        '-pvr', '-pd', '-noshell', '-nosqm', '-sins', '-ses', '-netsym:no',
         '-y', symbolDirectory, '-p', String(target.pid), '-c', '.echo OPENSQUILLA_NATIVE_TEST_READY',
       ], { cwd: workDirectory, env: debuggerEnv, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
       let rawBytes = 0
