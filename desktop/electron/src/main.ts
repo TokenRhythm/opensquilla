@@ -14048,8 +14048,11 @@ app.on('before-quit', (event) => {
     void drain.then((exited) => {
       if (exited) {
         setAppExitPhase('committed', 'all lifecycle-owned Gateways exited')
+        desktopLog('quit_commit_step', { step: 'exit-phase-set', pid: process.pid })
         destroyWindowsTray()
+        desktopLog('quit_commit_step', { step: 'tray-destroyed', pid: process.pid })
         void desktopArtifactBridgeLoopback.close()
+        desktopLog('quit_commit_step', { step: 'app-exit-requested', pid: process.pid })
         app.exit(0)
         return
       }

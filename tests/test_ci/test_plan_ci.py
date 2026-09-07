@@ -1335,6 +1335,7 @@ def test_signing_source_changes_select_contracts_and_release_packaging(
         ".github/scripts/release_signing_preflight.py",
         ".github/scripts/verify-windows-signatures.ps1",
         ".github/signing/windows-signing-policy.json",
+        ".github/workflows/desktop-fault-injection.yml",
         "desktop/electron/scripts/build-signed-windows.cjs",
         "desktop/electron/scripts/e2e-shutdown-helpers.mjs",
         "desktop/electron/scripts/packaged-first-send-cleanup.mjs",

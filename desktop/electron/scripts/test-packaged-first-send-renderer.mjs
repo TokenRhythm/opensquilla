@@ -14,7 +14,12 @@ import {
   closeHttpServerWithDeadline,
   trackHttpServerConnections,
 } from './e2e-shutdown-helpers.mjs'
-import { cleanupPackagedFirstSend } from './packaged-first-send-cleanup.mjs'
+import {
+  captureElectronProcessIdentity,
+  captureFirstSendDiagnostic,
+  cleanupPackagedFirstSend,
+  electronProcessSnapshot,
+} from './packaged-first-send-cleanup.mjs'
 import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
 
 const DEFAULT_ITERATIONS = 20
@@ -177,6 +182,7 @@ async function readDesktopLogSummary(userDataDir) {
   }
   const eventCounts = {}
   const rendererErrors = []
+  const quitSteps = []
   let malformedRecords = 0
   let forbiddenErrorCount = 0
   let playwrightSandboxErrorCount = 0
@@ -188,6 +194,9 @@ async function readDesktopLogSummary(userDataDir) {
       const record = JSON.parse(line)
       const event = typeof record?.event === 'string' ? record.event : 'unknown'
       eventCounts[event] = (eventCounts[event] || 0) + 1
+      if (event === 'quit_commit_step' && quitSteps.length < 10) {
+        quitSteps.push({ event, at: record.at, step: record.step, pid: record.pid })
+      }
       if (event === 'renderer_console' && rendererErrors.length < 10) {
         rendererErrors.push({
           level: record?.level,
@@ -211,6 +220,7 @@ async function readDesktopLogSummary(userDataDir) {
     bytes: Buffer.byteLength(source, 'utf8'),
     eventCounts,
     rendererErrors,
+    quitSteps,
     forbiddenErrorCount,
     playwrightSandboxErrorCount,
     unexpectedRendererErrorCount,
@@ -227,6 +237,9 @@ const iterations = optionalIntegerOption('--iterations', DEFAULT_ITERATIONS)
 let app
 let provider
 let runError
+let rendererPage
+let electronProcessIdentity
+let failureRendererSnapshot
 const pageErrors = []
 const consoleErrors = []
 const outboundNetwork = []
@@ -246,6 +259,23 @@ function reportPhase(phase, details = {}) {
     elapsedMs: Date.now() - startedAt,
     ...details,
   }))
+}
+
+async function captureRendererFailure(page) {
+  if (!page) return null
+  return captureFirstSendDiagnostic(() => page.evaluate(() => ({
+    pathname: location.pathname,
+    sessionMaterialized: new URL(location.href).searchParams.has('session'),
+    connected: Boolean(document.querySelector('.conn-pill.connected')),
+    sendButtonDisabled: document.querySelector('.chat-send-btn.btn--primary')?.disabled ?? null,
+    assistantMessages: document.querySelectorAll('.msg-ai').length,
+    assistantAnswers: document.querySelectorAll('.msg-ai-text').length,
+    errorBoundaries: document.querySelectorAll('.error-boundary').length,
+    // Only error-card text from this fresh synthetic profile is retained;
+    // exclude message bodies, inputs, session identifiers and URL queries.
+    sessionErrors: [...document.querySelectorAll('.msg-error-card__text')]
+      .slice(0, 5).map(element => (element.textContent || '').slice(0, 500)),
+  })))
 }
 
 async function browserRpcSnapshot(page) {
@@ -398,7 +428,8 @@ try {
       no_proxy: '127.0.0.1,localhost,::1',
     },
   })
-  reportPhase('electron-launch-complete')
+  electronProcessIdentity = await captureElectronProcessIdentity(app)
+  reportPhase('electron-launch-complete', { processes: electronProcessIdentity })
 
   await app.context().route((url) => {
     return (url.protocol === 'http:' || url.protocol === 'https:') && !isLoopbackUrl(url.toString())
@@ -407,6 +438,7 @@ try {
     await route.abort('blockedbyclient')
   })
   const page = await app.firstWindow({ timeout: 60_000 })
+  rendererPage = page
   reportPhase('renderer-window-ready')
   await waitFor(
     () => page.url().startsWith('opensquilla-app://desktop/chat'),
@@ -562,13 +594,23 @@ try {
     completedChatSends: rpcSendCounts.size,
     error: error?.stack || error?.message || String(error),
   }))
+  failureRendererSnapshot = await captureRendererFailure(rendererPage)
+  console.error(JSON.stringify({
+    event: 'packaged_first_send_failure_diagnostics',
+    processes: electronProcessSnapshot(electronProcessIdentity),
+    renderer: failureRendererSnapshot,
+  }))
 } finally {
   reportPhase('cleanup-start', { failed: Boolean(runError) })
   try {
     await cleanupPackagedFirstSend({
       app,
       provider,
-      diagnostics: () => readDesktopLogSummary(userDataDir),
+      diagnostics: async () => ({
+        processes: electronProcessSnapshot(electronProcessIdentity),
+        desktopLog: await readDesktopLogSummary(userDataDir),
+        rendererBeforeCleanup: failureRendererSnapshot,
+      }),
       onPhase: reportPhase,
     })
   } catch (error) {
@@ -589,6 +631,7 @@ if (runError) {
       pageErrors: pageErrors.length,
       consoleErrors: consoleErrors.length,
       consoleErrorMessages: consoleErrors.slice(0, 10),
+      failureSnapshot: failureRendererSnapshot,
     },
     externalRendererRequests: outboundNetwork.length,
     desktopLog: desktopLogSummary,

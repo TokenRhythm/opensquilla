@@ -433,3 +433,40 @@ def test_internal_diagnostics_preserve_signed_bytes_without_feeding_publication(
         for step in job.get("steps", []):
             if step.get("uses", "").startswith("actions/download-artifact@"):
                 assert "windows-signed-candidate-diagnostics" not in json.dumps(step)
+
+
+def test_reused_windows_audits_require_signatures_without_signing_credentials() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/desktop-fault-injection.yml").read_text())
+    jobs = workflow["jobs"]
+    assert workflow["permissions"] == {"actions": "read", "contents": "read"}
+    for name in ("macos-fault-injection", "macos-wedge-probe"):
+        assert "inputs.source_run_id != ''" in jobs[name]["if"]
+    audit = jobs["windows-release-upgrade-audit"]
+    assert "inputs.run_windows_release_audit" in audit["if"]
+    assert "inputs.windows_source_run_id != ''" in audit["if"]
+    assert "github.actor == 'Open-Squilla'" in audit["if"]
+    assert audit["strategy"]["matrix"] == {
+        "baseline-version": ["0.5.3", "0.5.4"],
+        "install-mode": ["default", "custom"],
+    }
+    assert audit["strategy"]["fail-fast"] is False
+    for name in ("windows-fault-injection", "windows-release-upgrade-audit"):
+        job = jobs[name]
+        assert "environment" not in job
+        encoded = json.dumps(job)
+        assert "secrets." not in encoded and "SM_" not in encoded
+        assert "build-signed-windows" not in encoded and "build:gateway" not in encoded
+        download = next(
+            step for step in job["steps"] if "download-artifact@" in step.get("uses", "")
+        )
+        assert download["with"]["run-id"] == "${{ inputs.windows_source_run_id }}"
+        assert download["with"]["repository"] == "${{ github.repository }}"
+        assert download["with"]["name"] == "${{ inputs.windows_artifact_name }}"
+        assert "verify-windows-signatures.ps1" in encoded
+    first_send = jobs["windows-fault-injection"]
+    gate = next(
+        step for step in first_send["steps"] if step["name"] == "Verify signed installed first-send"
+    )
+    assert gate["if"] == "inputs.run_windows_release_audit"
+    assert "test-packaged-first-send-renderer.mjs" in gate["run"]
+    assert gate["timeout-minutes"] == 15

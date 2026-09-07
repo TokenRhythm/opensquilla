@@ -1,9 +1,59 @@
+import { setTimeout as delay } from 'node:timers/promises'
 import { closeElectronWithDeadline } from './e2e-shutdown-helpers.mjs'
 
 // Preserve the production Gateway's shutdown request, 80s exit observation,
 // and 6s + 5s hard-kill backstops without changing any interaction budget.
 const ELECTRON_CLEANUP_TIMEOUT_MS = 100_000
 const PROVIDER_CLEANUP_TIMEOUT_MS = 15_000
+
+export async function captureFirstSendDiagnostic(operation, timeoutMs = 3_000) {
+  const controller = new AbortController()
+  try {
+    return await Promise.race([
+      Promise.resolve().then(operation),
+      delay(timeoutMs, undefined, { signal: controller.signal }).then(() => {
+        throw new Error(`First-send diagnostics timed out after ${timeoutMs}ms`)
+      }),
+    ])
+  } catch (error) {
+    return { diagnosticError: error?.message || String(error) }
+  } finally {
+    controller.abort()
+  }
+}
+
+export async function captureElectronProcessIdentity(app, timeoutMs = 3_000) {
+  // Playwright 1.60 launches cmd.exe on Windows. Its process() is the wrapper;
+  // capture the actual Electron PID while the main-process protocol is live.
+  const wrapperPid = app.process()?.pid ?? null
+  const result = await captureFirstSendDiagnostic(
+    () => app.evaluate(() => process.pid),
+    timeoutMs,
+  )
+  return {
+    wrapperPid,
+    electronPid: Number.isSafeInteger(result) && result > 0 ? result : null,
+    ...(result?.diagnosticError ? { diagnosticError: result.diagnosticError } : {}),
+  }
+}
+
+export function electronProcessSnapshot(identity) {
+  const snapshot = { ...identity }
+  for (const role of ['wrapper', 'electron']) {
+    const pid = identity?.[`${role}Pid`]
+    if (!Number.isSafeInteger(pid) || pid < 1) continue
+    // Signal 0 only checks existence. This diagnostic never terminates a PID
+    // or treats it as proof of process identity after possible PID reuse.
+    try {
+      process.kill(pid, 0)
+      snapshot[`${role}PidExists`] = true
+    } catch (error) {
+      snapshot[`${role}PidExists`] = error.code === 'ESRCH' ? false : null
+      if (error.code !== 'ESRCH') snapshot[`${role}ProbeError`] = error.code || String(error)
+    }
+  }
+  return snapshot
+}
 
 export async function cleanupPackagedFirstSend({
   app,

@@ -14,7 +14,8 @@ on:
     inputs:
       source_run_id:
         description: Completed Release Assets run holding opensquilla-electron-macos
-        required: true
+        required: false
+        default: ""
       scenarios:
         description: Space-separated scenario names (empty runs the whole catalogue)
         required: false
@@ -34,6 +35,11 @@ on:
         description: Windows artifact name to download
         required: false
         default: opensquilla-electron-windows
+      run_windows_release_audit:
+        description: Run first-send and the four Windows upgrade/reinstall audits against the original signed artifact
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   actions: read
@@ -46,7 +52,7 @@ concurrency:
 jobs:
   macos-fault-injection:
     name: macOS packaged fault injection
-    if: github.repository == 'TokenRhythm/opensquilla' && github.actor == 'Open-Squilla'
+    if: github.repository == 'TokenRhythm/opensquilla' && github.actor == 'Open-Squilla' && inputs.source_run_id != ''
     runs-on: macos-latest
     timeout-minutes: 60
 
@@ -152,6 +158,7 @@ jobs:
       github.repository == 'TokenRhythm/opensquilla'
       && github.actor == 'Open-Squilla'
       && inputs.run_wedge_probe
+      && inputs.source_run_id != ''
     runs-on: macos-latest
     timeout-minutes: 60
     # Two resume paths are known to refuse continuation once a recorded source
@@ -252,7 +259,7 @@ jobs:
           retention-days: 14
 
   windows-fault-injection:
-    name: Windows packaged fault injection
+    name: ${{ inputs.run_windows_release_audit && 'Windows signed first-send audit' || 'Windows packaged fault injection' }}
     if: >-
       github.repository == 'TokenRhythm/opensquilla'
       && github.actor == 'Open-Squilla'
@@ -271,6 +278,22 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Record signed artifact and harness source
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.windows_source_run_id }}
+          HARNESS_SHA: ${{ github.workflow_sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:SOURCE_RUN_ID -notmatch '^[0-9]+$') { throw 'Invalid Windows source run ID.' }
+          $source = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:SOURCE_RUN_ID" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $source.path -ne '.github/workflows/wheelhouse-release.yml') {
+            throw 'Windows artifacts must come from a Release Assets run.'
+          }
+          "Source Release workflow head: $($source.head_sha) (run $env:SOURCE_RUN_ID); verification harness: $env:HARNESS_SHA" |
+            Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
       - name: Download Windows installer
         uses: actions/download-artifact@v4
         with:
@@ -283,6 +306,8 @@ jobs:
       - name: Install into a controlled directory
         id: stage
         shell: pwsh
+        env:
+          STRICT_RELEASE_AUDIT: ${{ inputs.run_windows_release_audit }}
         run: |
           $ErrorActionPreference = 'Stop'
           $installers = @(Get-ChildItem packaged-windows -Filter *.exe -Recurse)
@@ -291,6 +316,10 @@ jobs:
             throw "expected exactly one installer .exe, found $($installers.Count)"
           }
           $installer = $installers[0].FullName
+          if ($env:STRICT_RELEASE_AUDIT -eq 'true') {
+            .github/scripts/verify-windows-signatures.ps1 -InstallerPath $installer
+            if ($LASTEXITCODE -ne 0) { throw 'Downloaded installer signature verification failed.' }
+          }
           # Report what the scenarios actually run against. An unsigned or
           # test-signed installer cannot exercise the real trust path, so say so
           # rather than implying full coverage.
@@ -306,7 +335,8 @@ jobs:
           $target = Join-Path $stage 'app'
           New-Item -ItemType Directory -Force -Path $target | Out-Null
           # electron-builder NSIS honours /S for silent and /D for the target.
-          Start-Process -FilePath $installer -ArgumentList '/S', "/D=$target" -Wait
+          $install = Start-Process -FilePath $installer -ArgumentList '/S', "/D=$target" -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Installer failed with exit code $($install.ExitCode)." }
           $exe = Get-ChildItem $target -Filter 'OpenSquilla.exe' -Recurse |
             Select-Object -First 1
           if (-not $exe) {
@@ -315,8 +345,44 @@ jobs:
           }
           "stage=$stage" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "app=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          if ($env:STRICT_RELEASE_AUDIT -eq 'true') {
+            .github/scripts/verify-windows-signatures.ps1 -InstalledRoot $target
+            if ($LASTEXITCODE -ne 0) { throw 'Installed executable signature verification failed.' }
+          }
+
+      - name: Set up Node.js for signed first-send audit
+        if: inputs.run_windows_release_audit
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.12.0"
+          cache: npm
+          cache-dependency-path: desktop/electron/package-lock.json
+
+      - name: Build the verification harness
+        if: inputs.run_windows_release_audit
+        working-directory: desktop/electron
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'Harness dependencies failed.' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'Harness compilation failed.' }
+
+      - name: Verify signed installed first-send
+        if: inputs.run_windows_release_audit
+        timeout-minutes: 15
+        working-directory: desktop/electron
+        shell: pwsh
+        env:
+          CANDIDATE_EXE: ${{ steps.stage.outputs.app }}
+          AUDIT_STAGE: ${{ steps.stage.outputs.stage }}
+        run: |
+          $userData = Join-Path $env:AUDIT_STAGE 'first-send-user-data'
+          node scripts/test-packaged-first-send-renderer.mjs --executable $env:CANDIDATE_EXE --user-data-dir $userData
+          if ($LASTEXITCODE -ne 0) { throw 'Signed installed first-send audit failed.' }
 
       - name: Run fault-injection scenarios
+        if: ${{ !inputs.run_windows_release_audit }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -330,8 +396,20 @@ jobs:
             --report '${{ steps.stage.outputs.stage }}\scenario-report.json' `
             @args
 
+      - name: Uninstall the signed first-send candidate
+        if: ${{ always() && inputs.run_windows_release_audit && steps.stage.outputs.app != '' }}
+        shell: pwsh
+        env:
+          CANDIDATE_EXE: ${{ steps.stage.outputs.app }}
+        run: |
+          $target = Split-Path -Parent $env:CANDIDATE_EXE
+          $uninstallers = @(Get-ChildItem -LiteralPath $target -Filter 'Uninstall*.exe' -File)
+          if ($uninstallers.Count -ne 1) { throw 'Expected one signed uninstaller.' }
+          $uninstall = Start-Process -FilePath $uninstallers[0].FullName -ArgumentList '/S' -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "Uninstaller failed with exit code $($uninstall.ExitCode)." }
+
       - name: Summarize scenarios
-        if: ${{ always() }}
+        if: ${{ always() && !inputs.run_windows_release_audit }}
         shell: pwsh
         run: |
           $report = '${{ steps.stage.outputs.stage }}\scenario-report.json'
@@ -349,5 +427,84 @@ jobs:
             ${{ steps.stage.outputs.stage }}/scenarios/*/user-data/logs/desktop.log
             ${{ steps.stage.outputs.stage }}/scenarios/*/user-data/logs/gateway.log
             ${{ steps.stage.outputs.stage }}/scenarios/*/launch-stdio.log
+            ${{ steps.stage.outputs.stage }}/first-send-user-data/logs/*.log
           if-no-files-found: warn
           retention-days: 14
+
+  windows-release-upgrade-audit:
+    name: Audit reused signed Windows artifact (v${{ matrix.baseline-version }}, ${{ matrix.install-mode }})
+    if: ${{ github.repository == 'TokenRhythm/opensquilla' && github.actor == 'Open-Squilla' && inputs.run_windows_release_audit && inputs.windows_source_run_id != '' }}
+    runs-on: windows-2022
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        baseline-version: ['0.5.3', '0.5.4']
+        install-mode: [default, custom]
+    steps:
+      - name: Checkout the fixed verification harness
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.workflow_sha }}
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.12.0"
+          cache: npm
+          cache-dependency-path: desktop/electron/package-lock.json
+      - name: Install release verification dependencies
+        working-directory: desktop/electron
+        run: npm ci
+      - name: Record signed artifact and harness source
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.windows_source_run_id }}
+          HARNESS_SHA: ${{ github.workflow_sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:SOURCE_RUN_ID -notmatch '^[0-9]+$') { throw 'Invalid Windows source run ID.' }
+          $source = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:SOURCE_RUN_ID" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $source.path -ne '.github/workflows/wheelhouse-release.yml') {
+            throw 'Windows artifacts must come from a Release Assets run.'
+          }
+          "Source Release workflow head: $($source.head_sha) (run $env:SOURCE_RUN_ID); verification harness: $env:HARNESS_SHA" |
+            Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+      - name: Download the original signed Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.windows_artifact_name }}
+          path: release-audit
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.windows_source_run_id }}
+      - name: Verify downloaded signature, install, launch, and uninstall
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASELINE_VERSION: ${{ matrix.baseline-version }}
+          INSTALL_MODE: ${{ matrix.install-mode }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidates = @(Get-ChildItem 'release-audit/OpenSquilla-*-win-x64.exe' -File)
+          if ($candidates.Count -ne 1) { throw 'Expected one signed test installer.' }
+          .github/scripts/verify-windows-signatures.ps1 -InstallerPath $candidates[0].FullName
+          if ($LASTEXITCODE -ne 0) { throw 'Downloaded installer signature verification failed.' }
+          .github/scripts/verify-release-windows-upgrade.ps1 `
+            -CandidateInstaller $candidates[0].FullName `
+            -Label "reused-$env:BASELINE_VERSION-$env:INSTALL_MODE" `
+            -InstallMode $env:INSTALL_MODE `
+            -BaselineVersion $env:BASELINE_VERSION
+      - name: Upload isolated Windows upgrade diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reused-windows-upgrade-${{ matrix.baseline-version }}-${{ matrix.install-mode }}
+          path: ${{ runner.temp }}/opensquilla-release-preservation-reused-${{ matrix.baseline-version }}-${{ matrix.install-mode }}-${{ matrix.install-mode }}-${{ matrix.baseline-version }}/appdata/OpenSquilla/logs/*.log
+          if-no-files-found: ignore
+          retention-days: 7

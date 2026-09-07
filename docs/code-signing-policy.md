@@ -43,6 +43,16 @@ release and is never consumed by publication or the successful-build audit
 matrix. First-send failures retain only the isolated synthetic desktop log;
 client authentication material is excluded.
 
+To repeat Windows validation without another signing operation, dispatch
+`Desktop Fault Injection` with `windows_source_run_id`, the retained
+`windows_artifact_name`, and `run_windows_release_audit: true`. Leave the macOS
+source empty for Windows-only validation. It runs the first-send gate and the
+four baseline/path audits on independent Windows runners using the original
+signed installer. The audit checkout identifies the verification harness;
+the selected Release Assets run identifies the packaged source. A harness-only
+repair may validate those existing bytes, while a runtime change requires a
+new signed candidate.
+
 Internal artifacts do not publish a GitHub Release or exercise OSS prestaging
 and real updater downloads. Before publishing a new version, the tag workflow
 must also pass the Draft download and real updater audit matrix. Draft upload

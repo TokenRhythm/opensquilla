@@ -9,7 +9,12 @@ import {
   closeHttpServerWithDeadline,
   trackHttpServerConnections,
 } from './e2e-shutdown-helpers.mjs'
-import { cleanupPackagedFirstSend } from './packaged-first-send-cleanup.mjs'
+import {
+  captureElectronProcessIdentity,
+  captureFirstSendDiagnostic,
+  cleanupPackagedFirstSend,
+  electronProcessSnapshot,
+} from './packaged-first-send-cleanup.mjs'
 
 const fixtureProcesses = []
 const fixtureServers = []
@@ -94,6 +99,26 @@ try {
 
   const hanging = await startChild(process.platform === 'win32')
   const unaffected = await startChild()
+  const identity = await captureElectronProcessIdentity({
+    process: () => hanging.child,
+    evaluate: async () => unaffected.child.pid,
+  })
+  assert.deepEqual(electronProcessSnapshot(identity), {
+    wrapperPid: hanging.child.pid,
+    electronPid: unaffected.child.pid,
+    wrapperPidExists: true,
+    electronPidExists: true,
+  })
+  const unavailableIdentity = await captureElectronProcessIdentity({
+    process: () => hanging.child,
+    evaluate: () => new Promise(() => {}),
+  }, 25)
+  assert.equal(unavailableIdentity.wrapperPid, hanging.child.pid)
+  assert.equal(unavailableIdentity.electronPid, null)
+  assert.match(unavailableIdentity.diagnosticError, /timed out after 25ms/)
+  assert.match((await captureFirstSendDiagnostic(() => {
+    throw new Error('Synthetic diagnostic failure')
+  })).diagnosticError, /Synthetic diagnostic failure/)
   const hangingProvider = await startProvider()
   const hangingPhases = []
   const shutdownLogs = []
@@ -116,6 +141,8 @@ try {
   assert.equal(hangingProvider.server.listening, false, 'provider cleanup must run after Electron failure')
   assert.equal(shutdownLogs[0].process.pid, hanging.child.pid)
   await assertProcessExited(hanging.child.pid)
+  assert.equal(electronProcessSnapshot(identity).wrapperPidExists, false)
+  assert.equal(electronProcessSnapshot(identity).electronPidExists, true)
   if (hanging.descendantPid) await assertProcessExited(hanging.descendantPid)
   assert.equal(unaffected.child.exitCode, null, 'cleanup must not kill another Node process')
   assert.equal(unaffected.child.signalCode, null)
