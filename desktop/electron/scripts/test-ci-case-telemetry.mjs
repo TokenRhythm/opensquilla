@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { EventEmitter, once } from 'node:events'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { createServer } from 'node:http'
@@ -197,58 +197,74 @@ try {
     error: 'taskkill exceeded 25ms',
   })
 
-  let killedWith = null
   const shutdownLogs = []
-  const hangingProcess = new EventEmitter()
-  Object.assign(hangingProcess, {
-    pid: 43,
-    exitCode: null,
-    signalCode: null,
-    killed: false,
+  // The production helper invokes real taskkill on Windows, so this fixture
+  // must own its PID rather than supplying a synthetic EventEmitter PID.
+  const hangingProcess = spawn(process.execPath, ['-e', `
+    process.on('disconnect', () => process.exit(0));
+    process.send({ type: 'ready', pid: process.pid });
+    setInterval(() => {}, 1000);
+  `], {
+    stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+    windowsHide: true,
   })
-  hangingProcess.kill = signal => {
-    killedWith = signal
-    hangingProcess.killed = true
-    hangingProcess.signalCode = signal
-    queueMicrotask(() => hangingProcess.emit('exit', null, signal))
-    return true
+  const hangingProcessClosed = new Promise(resolveClose => hangingProcess.once('close', resolveClose))
+  try {
+    const [ready] = await once(hangingProcess, 'message', { signal: AbortSignal.timeout(5_000) })
+    assert.deepEqual(ready, { type: 'ready', pid: hangingProcess.pid })
+    const hangingElectron = {
+      close: () => new Promise(() => {}),
+      process: () => hangingProcess,
+    }
+    const hangingShutdown = await closeElectronWithDeadline({
+      app: hangingElectron,
+      phase: 'unit-hanging-electron',
+      timeoutMs: 25,
+      diagnosticTimeoutMs: 25,
+      diagnostics: async () => ({ marker: 'bounded-diagnostic' }),
+      emit: line => shutdownLogs.push(line),
+    })
+    assert.equal(hangingShutdown.closed, false)
+    assert.equal(hangingShutdown.closeErrorCode, 'DESKTOP_E2E_SHUTDOWN_TIMEOUT')
+    assert.equal(hangingShutdown.forcedExitSucceeded, true)
+    assert.equal(hangingShutdown.processTreeReaped, true)
+    assert.match(hangingShutdown.error.message, /DESKTOP_E2E_ELECTRON_SHUTDOWN_FAILED/)
+    assert.ok(hangingProcess.exitCode !== null || hangingProcess.signalCode !== null)
+    assert.equal(shutdownLogs.length, 1)
+    const shutdownLog = JSON.parse(shutdownLogs[0])
+    assert.deepEqual({
+      ...shutdownLog,
+      error: String(shutdownLog.error).split('\n')[0],
+    }, {
+      event: 'desktop_e2e_electron_shutdown_failed',
+      phase: 'unit-hanging-electron',
+      timeoutMs: 25,
+      error: 'Error: unit-hanging-electron Electron shutdown timed out after 25ms',
+      process: {
+        pid: hangingProcess.pid,
+        exitCode: null,
+        signalCode: null,
+        killed: false,
+      },
+      diagnostics: { marker: 'bounded-diagnostic' },
+    })
+  } finally {
+    if (hangingProcess.exitCode === null && hangingProcess.signalCode === null) {
+      hangingProcess.kill('SIGKILL')
+    }
+    let closeTimer
+    try {
+      await Promise.race([
+        hangingProcessClosed,
+        new Promise((_, reject) => {
+          closeTimer = setTimeout(() => reject(new Error('Owned telemetry fixture did not close')), 5_000)
+        }),
+      ])
+    } finally {
+      clearTimeout(closeTimer)
+    }
   }
-  const hangingElectron = {
-    close: () => new Promise(() => {}),
-    process: () => hangingProcess,
-  }
-  const hangingShutdown = await closeElectronWithDeadline({
-    app: hangingElectron,
-    phase: 'unit-hanging-electron',
-    timeoutMs: 25,
-    diagnosticTimeoutMs: 25,
-    diagnostics: async () => ({ marker: 'bounded-diagnostic' }),
-    emit: line => shutdownLogs.push(line),
-  })
-  assert.equal(hangingShutdown.closed, false)
-  assert.equal(hangingShutdown.closeErrorCode, 'DESKTOP_E2E_SHUTDOWN_TIMEOUT')
-  assert.equal(hangingShutdown.forcedExitSucceeded, true)
-  assert.equal(hangingShutdown.processTreeReaped, true)
-  assert.match(hangingShutdown.error.message, /DESKTOP_E2E_ELECTRON_SHUTDOWN_FAILED/)
-  assert.equal(killedWith, 'SIGKILL')
-  assert.equal(shutdownLogs.length, 1)
-  const shutdownLog = JSON.parse(shutdownLogs[0])
-  assert.deepEqual({
-    ...shutdownLog,
-    error: String(shutdownLog.error).split('\n')[0],
-  }, {
-    event: 'desktop_e2e_electron_shutdown_failed',
-    phase: 'unit-hanging-electron',
-    timeoutMs: 25,
-    error: 'Error: unit-hanging-electron Electron shutdown timed out after 25ms',
-    process: {
-      pid: 43,
-      exitCode: null,
-      signalCode: null,
-      killed: false,
-    },
-    diagnostics: { marker: 'bounded-diagnostic' },
-  })
+  assert.throws(() => process.kill(hangingProcess.pid, 0), { code: 'ESRCH' })
 
   const shutdownCheckpoint = '{"event":"previous_launch"}\n'
   const cleanGatewayExit = JSON.stringify({
